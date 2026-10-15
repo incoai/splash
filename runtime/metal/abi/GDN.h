@@ -41,28 +41,29 @@ static_assert(sizeof(GDNGatePrefillParams) == 4,
 // A decode step leaves its rows on the lane's tape: one layer's holds, each
 // field for every row in turn, the rows' convolution inputs ([conv_dim]
 // bf16), their k then v rows ([key_width + value_width] bf16), decay
-// ([value_heads] fp32) and beta ([value_heads] bf16). The lane's next step
-// folds the rows it retained into the state before its own (GDN::addDecode).
+// ([value_heads] fp32) and beta ([value_heads] bf16), room for a lane's most
+// verify rows. The lane's next step folds the rows it retained into the
+// state before its own (GDN::addDecode).
 inline constexpr uint64_t gdn_tape_kv_offset(uint32_t conv_dim) {
-  return uint64_t(SPLASH_TARGET_VERIFY_ROWS) * conv_dim * 2;
+  return uint64_t(SPLASH_MAXIMUM_VERIFY_ROWS) * conv_dim * 2;
 }
 inline constexpr uint64_t gdn_tape_decay_offset(uint32_t conv_dim,
                                                 uint32_t kv_width) {
   return gdn_tape_kv_offset(conv_dim) +
-         uint64_t(SPLASH_TARGET_VERIFY_ROWS) * kv_width * 2;
+         uint64_t(SPLASH_MAXIMUM_VERIFY_ROWS) * kv_width * 2;
 }
 inline constexpr uint64_t gdn_tape_beta_offset(uint32_t conv_dim,
                                                uint32_t kv_width,
                                                uint32_t value_heads) {
   return gdn_tape_decay_offset(conv_dim, kv_width) +
-         uint64_t(SPLASH_TARGET_VERIFY_ROWS) * value_heads * 4;
+         uint64_t(SPLASH_MAXIMUM_VERIFY_ROWS) * value_heads * 4;
 }
 // One layer's tape, a multiple of 16 bytes.
 inline constexpr uint64_t gdn_tape_layer_bytes(uint32_t conv_dim,
                                                uint32_t kv_width,
                                                uint32_t value_heads) {
   return (gdn_tape_beta_offset(conv_dim, kv_width, value_heads) +
-          uint64_t(SPLASH_TARGET_VERIFY_ROWS) * value_heads * 2 + 15) /
+          uint64_t(SPLASH_MAXIMUM_VERIFY_ROWS) * value_heads * 2 + 15) /
          16 * 16;
 }
 

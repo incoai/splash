@@ -626,8 +626,7 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
       decodeOutputTokens > completedTokens) {
     throw std::runtime_error("decode throughput work accounting is invalid");
   }
-  if (draftedTokens != uint64_t{width} * decodeBatches *
-                           model::ExecutionLimits::draftProposalTokens ||
+  if (draftedTokens != uint64_t{width} * decodeBatches * (executor.verifyRows(width) - 1) ||
       acceptedDraftTokens > draftedTokens) {
     throw std::runtime_error("decode throughput DFlash accounting is invalid");
   }
@@ -1322,7 +1321,7 @@ int main(int argc, char **argv) {
               << ",\"ane_ffn_minimum_rows\":" << ranAneFfnMinimumRows
               << ",\"geometry\":{\"prefill_rows\":"
               << model::ExecutionLimits::prefillTokenBudget
-              << ",\"verify_rows\":" << model::ExecutionLimits::targetVerifyRows
+              << ",\"verify_rows\":" << model::ExecutionLimits::maximumVerifyRows
               << ",\"batch_width\":" << model::ExecutionLimits::maximumBatchWidth
               << ",\"kv_block_tokens\":"
               << kv::kPageTokens

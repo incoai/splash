@@ -99,10 +99,12 @@ protocol::ProtocolLimits protocolLimitsFor(
   protocol::ProtocolLimits limits;
   limits.maxPromptTokens = maxContext;
   limits.maxLogicalOutputTokens = maxContext;
+  // A constrained lane's mask request simulates its verify rows' inputs, the
+  // anchor and the draft's proposals, and takes a mask before and after each.
   limits.maxTokenBatch = model::ExecutionLimits::maximumStepTokens;
-  limits.maxSimulationTokens = model::ExecutionLimits::draftQueryRows;
+  limits.maxSimulationTokens = model::ExecutionLimits::maximumVerifyRows;
   limits.maxMaskWords = model::maskWordsPerToken(capabilities.vocabularySize) *
-                        (model::ExecutionLimits::draftQueryRows + 1);
+                        (model::ExecutionLimits::maximumVerifyRows + 1);
   return limits;
 }
 

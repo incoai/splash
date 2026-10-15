@@ -349,7 +349,7 @@ int main(int argc, char **argv) {
 
       // Enough Page32 pages for four lanes of prompt plus generated rows.
       const uint32_t pagesPerLane =
-          (promptTokens + 256 + model::ExecutionLimits::targetVerifyRows) /
+          (promptTokens + 256 + model::ExecutionLimits::maximumVerifyRows) /
               kv::kPageTokens +
           2;
       // Whole extents of the largest size the pool rule picks, as a large

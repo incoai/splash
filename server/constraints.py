@@ -24,9 +24,9 @@ from .tool_schema import (
 
 class TokenConstraint:
     VOCABULARY = 248320
-    # A mask request simulates at most the engine's target verify rows
-    # (ExecutionLimits::targetVerifyRows, 8: the pending anchor and seven
-    # draft proposals) and takes a mask before and after each.
+    # A mask request simulates at most a lane's verify rows
+    # (ExecutionLimits::maximumVerifyRows, 8: the pending anchor and the
+    # draft's proposals) and takes a mask before and after each.
     MAX_ROWS = 9
     EOS_TOKENS = (248044, 248046)
 

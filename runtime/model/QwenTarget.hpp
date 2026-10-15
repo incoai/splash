@@ -259,12 +259,12 @@ public:
 
   [[nodiscard]] const ops::Projection &
   vocabularyProjection() const noexcept;
-  // Lanes of storage the tensors of a decode step of `lanes` lanes bind: a
+  // Rows of storage the tensors of a decode step of `rows` rows bind: a
   // linear tile may hold more rows than the step (LinearPlan::storageRows;
-  // a three-lane GGUF step on the staged tile runs its 32-row tile over four
-  // lanes). Every op still processes the step's lanes; padding rows read
-  // stale activations and write results no active row reads.
-  [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
+  // a 24-row GGUF step on the staged tile runs its 32-row tile). Every op
+  // still processes the step's rows; padding rows read stale activations
+  // and write results no active row reads.
+  [[nodiscard]] uint32_t decodeStorageRows(uint32_t rows) const;
 
   // Returns the hidden buffer that holds the last layer's output rows. The
   // dense FFN of a chunk the split takes (AneFfn::splits) runs split with the
@@ -273,21 +273,23 @@ public:
       metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
       std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
       std::span<const SplashKvLayer> kvLayers, ops::AneFfn *aneFfn = nullptr) const;
+  // The verify of `lanes` lanes of `laneRows` rows each, lane by lane.
   void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       std::span<const SplashKvLayer> kvLayers,
       std::span<const kv::ChunkedPrefillParams> chunks,
-      uint32_t lanes) const;
-  // The final norm and LM head over `lanes` lanes of targetVerifyRows rows,
-  // as verify ends: one sweep of the vocabulary projection for every lane.
+      uint32_t lanes, uint32_t laneRows) const;
+  // The final norm and LM head over `rows` rows, as verify ends: one sweep
+  // of the vocabulary projection for every lane.
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                     metal::MetalBuffer finalHidden, metal::MetalBuffer logits,
-                    uint32_t lanes, ops::LinearScratch scratch) const;
+                    uint32_t rows, ops::LinearScratch scratch) const;
   // The verify input tokens addEmbedding then gathers: each lane's anchor,
-  // row 0 of its draft input, and the draft's proposals.
+  // row 0 of its draft input, and the draft's proposals, `laneRows` per lane.
   void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                       metal::MetalBuffer proposals,
-                      metal::MetalBuffer verifyInput, uint32_t lanes) const;
+                      metal::MetalBuffer verifyInput, uint32_t lanes,
+                      uint32_t laneRows) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
 

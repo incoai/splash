@@ -1345,11 +1345,16 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
 // generated `count` tokens or finished; each one's generated tokens, its
 // first, the prefill's selection, included, the decode cycle that returned
 // each, and each cycle's anchor, the first token it returned, by index, with
-// its drafted tokens.
+// the proposals its draft made and the tokens it counted as drafted.
 struct JointDecode final {
+  struct Draft final {
+    size_t anchor = 0;
+    uint32_t proposals = 0;
+    uint32_t drafted = 0;
+  };
   std::vector<uint32_t> tokens;
   std::vector<uint32_t> cycles;
-  std::vector<std::pair<size_t, uint32_t>> drafts;
+  std::vector<Draft> drafts;
 };
 std::vector<JointDecode>
 decodeTogether(model::Runtime &executor, std::span<const uint64_t> ids,
@@ -1379,7 +1384,9 @@ decodeTogether(model::Runtime &executor, std::span<const uint64_t> ids,
       require(results[index].acceptedDraftTokens <= results[index].draftedTokens,
               "a joint decode accepted more draft tokens than it drafted");
       JointDecode &decoded = generated[lanes[index]];
-      decoded.drafts.emplace_back(decoded.tokens.size(), results[index].draftedTokens);
+      decoded.drafts.push_back({decoded.tokens.size(),
+                                executor.verifyRows(static_cast<uint32_t>(items.size())) - 1,
+                                results[index].draftedTokens});
       decoded.tokens.insert(decoded.tokens.end(), results[index].outputTokens.begin(),
                             results[index].outputTokens.end());
       decoded.cycles.resize(decoded.tokens.size(), cycle);
@@ -1448,8 +1455,9 @@ void requireThinkingBudgetClosesThinking(model::Runtime &executor) {
                   "a thinking budget of " + std::to_string(first) +
                       " did not end thinking with its end tokens, then go on");
           // A cycle that cuts past its row 0 may return the end's first
-          // token alone; each cycle after it returns up to eight of them.
-          constexpr uint32_t rows = model::ExecutionLimits::targetVerifyRows;
+          // token alone; each cycle after it returns as many of them as it
+          // verifies rows, at least a row block.
+          constexpr uint32_t rows = model::ExecutionLimits::rowBlock;
           const std::vector<uint32_t> &cycles = generated[lane].cycles;
           const uint32_t endCycles = cycles[first + length - 1] - cycles[first] + 1;
           require(endCycles <= 1 + (length - 1 + rows - 1) / rows,
@@ -1458,13 +1466,12 @@ void requireThinkingBudgetClosesThinking(model::Runtime &executor) {
           // A cycle that starts with no thinking token left, its anchor the
           // budget's last thinking token or an end token before the close,
           // drafted the end tokens left in place of the draft's proposals.
-          for (const auto &[anchor, drafted] : generated[lane].drafts) {
+          for (const auto &[anchor, proposals, drafted] : generated[lane].drafts) {
             const uint32_t committed = static_cast<uint32_t>(anchor) + 1;
             const uint32_t replaced =
-                committed >= first && committed < first + length
-                    ? std::min(first + length - committed, model::ExecutionLimits::draftProposalTokens)
-                    : 0;
-            require(drafted == model::ExecutionLimits::draftProposalTokens - replaced,
+                committed >= first && committed < first + length ? std::min(first + length - committed, proposals)
+                                                                 : 0;
+            require(drafted == proposals - replaced,
                     "a cycle counted the end tokens it drafted as the draft's");
           }
         }
@@ -1529,7 +1536,9 @@ decodeConstrainedTogether(model::Runtime &executor, std::span<const uint64_t> id
       require(results[index].acceptedDraftTokens <= results[index].draftedTokens,
               "a constrained joint decode accepted more draft tokens than it drafted");
       JointDecode &decoded = generated[lanes[index]];
-      decoded.drafts.emplace_back(decoded.tokens.size(), results[index].draftedTokens);
+      decoded.drafts.push_back({decoded.tokens.size(),
+                                executor.verifyRows(static_cast<uint32_t>(items.size())) - 1,
+                                results[index].draftedTokens});
       decoded.tokens.insert(decoded.tokens.end(), results[index].outputTokens.begin(),
                             results[index].outputTokens.end());
       decoded.cycles.resize(decoded.tokens.size(), cycle);
@@ -1563,8 +1572,8 @@ void requireConstrainedThinkingEndWaitsForItsMask(model::Runtime &executor) {
   const std::array<std::vector<uint32_t>, 3> pageTables{
       pageRange(108, 4), pageRange(116, 4), pageRange(120, 4)};
   const std::array<uint64_t, 3> ids{311, 312, 313};
-  constexpr uint32_t rows = model::ExecutionLimits::targetVerifyRows;
-  constexpr uint32_t proposals = model::ExecutionLimits::draftProposalTokens;
+  // Each cycle returns at least a row block of the end's tokens.
+  constexpr uint32_t rows = model::ExecutionLimits::rowBlock;
   for (const std::vector<uint32_t> &end : ends) {
     const uint32_t length = static_cast<uint32_t>(end.size());
     for (const float temperature : {0.0F, 0.7F}) {
@@ -1612,7 +1621,7 @@ void requireConstrainedThinkingEndWaitsForItsMask(model::Runtime &executor) {
                   "a constrained thinking budget's end took a decode cycle per token");
           // Only a cycle whose anchor is the end's first token or one after
           // it, before the close, drafted the end tokens left.
-          for (const auto &[anchor, drafted] : generated[lane].drafts) {
+          for (const auto &[anchor, proposals, drafted] : generated[lane].drafts) {
             const uint32_t committed = static_cast<uint32_t>(anchor) + 1;
             const uint32_t replaced =
                 committed > start && committed < start + length ? std::min(start + length - committed, proposals) : 0;

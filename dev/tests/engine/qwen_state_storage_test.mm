@@ -872,7 +872,7 @@ void run(const std::string &metallib) {
     // its state, which neither a snapshot, a restore nor a prefill step reads.
     storage.updateLengths(0, {2'048, 0, 2'048, 2'048});
     const uint32_t parity = storage.metadata(0).activeParity;
-    for (const uint32_t retained : {0U, model::ExecutionLimits::targetVerifyRows + 1})
+    for (const uint32_t retained : {0U, model::ExecutionLimits::maximumVerifyRows + 1})
       rejects([&] { storage.swapDecodeParity(0, retained); }, "a decode step retains one to all of its rows",
               "a decode step retained no rows or more than its rows");
     storage.swapDecodeParity(0, 3);
@@ -886,8 +886,8 @@ void run(const std::string &metallib) {
             "Qwen lane state has decoded rows pending", "a restore overwrote a cell with pending rows");
     rejects([&] { storage.swapParity(0); }, "Qwen lane state has decoded rows pending",
             "a prefill step followed a decode step's pending rows");
-    storage.swapDecodeParity(0, model::ExecutionLimits::targetVerifyRows);
-    require(storage.metadata(0).pendingRows == model::ExecutionLimits::targetVerifyRows &&
+    storage.swapDecodeParity(0, model::ExecutionLimits::maximumVerifyRows);
+    require(storage.metadata(0).pendingRows == model::ExecutionLimits::maximumVerifyRows &&
                 storage.metadata(0).activeParity == parity,
             "the next decode step's swap did not take its own retained rows");
     rejects([&] { storage.releaseLane(0, 404); }, "Qwen lane owner mismatch",

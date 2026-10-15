@@ -63,9 +63,9 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // (Apple9), over an activation table, every request lane in one threadgroup,
 // optional K splits.
 enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister };
-// The decode tiles hold at most a full decode batch; prefill chunks of up to
-// this many rows run the staged tile (Linear::ggufBaseline).
-inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
+// The decode tiles hold at most a decode cycle's rows; prefill chunks of up
+// to this many rows run the staged tile (Linear::ggufBaseline).
+inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_CYCLE_ROWS;
 // The GGUF formats Apple9's staged tiles decode faster than its register
 // tiles, dense and MoE: IQ3_XXS, the IQ2 formats and IQ1, whose operands the
 // register tiles build from grid lookups beside their matrix operations
@@ -237,12 +237,13 @@ public:
   // layout its producer writes.
   [[nodiscard]] LinearPlan prefillPlan(const Projection &projection, uint32_t rows,
                                        LinearEpilogue epilogue) const;
-  [[nodiscard]] LinearPlan decodePlan(const Projection &projection, uint32_t lanes,
+  // A decode plan runs a cycle's `rows` rows, whole row blocks.
+  [[nodiscard]] LinearPlan decodePlan(const Projection &projection, uint32_t rows,
                                       LinearEpilogue epilogue = LinearEpilogue::None,
                                       const Projection *gate = nullptr) const;
-  // The scratch of every decode plan of a projection of `shape`: each lane
+  // The scratch of every decode plan of a projection of `shape`: each row
   // count, the None, Residual and GateUp epilogues and every tile the device
-  // may run them on, and the rotated rows of a full decode batch.
+  // may run them on, and the rotated rows of a full decode cycle.
   [[nodiscard]] LinearScratchSize decodeScratchSize(ProjectionShape shape) const;
   // The scratch of every prefill chunk and epilogue of a projection of
   // `shape`: the split partials and counters of the chunks that run the

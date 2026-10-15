@@ -130,7 +130,7 @@ template <class F> inline Coef<F> coefficient(CoefSource<F> src, uint u, uint j)
 }
 
 // One threadgroup: 4 simdgroups x GGUF_REGISTER_COLUMNS = GGUF_TILE_COLUMNS columns of one segment,
-// L request lanes of eight rows, one K partition (tg.y) of `splits`, into a destination of type Out.
+// L row blocks of eight rows, one K partition (tg.y) of `splits`, into a destination of type Out.
 template <class F, uint L, GgufEpilogue Ep, class Out>
 inline void decode(device const bfloat *table, device const float *sums, device uchar *w0,
                    device uchar *w1, device uchar *meta, device Out *out,

@@ -13,7 +13,7 @@ inline void full_qkv_decode_phase(
     uint simd_group) {
   constexpr uint HeadDim = 256, RotaryPairs = SPLASH_TARGET_ROPE_PAIRS, QStride = 2 * HeadDim;
   constexpr uint PackedStride = QHeads * QStride + 2 * KHeads * HeadDim;
-  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
+  constexpr uint Rows = SPLASH_ROW_BLOCK;
   constexpr uint Stride = SPLASH_VERIFY_CHUNK_STRIDE;
   uint batch = group.y;
   constexpr ulong kv_lane_stride = ulong(KHeads) * Stride * HeadDim;
@@ -59,7 +59,7 @@ template <uint QHeads, uint KHeads>
 inline bfloat verify_attention_gate_value(device const bfloat *packed_qkv,
                                           device const bfloat *attention,
                                           uint element) {
-  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
+  constexpr uint Rows = SPLASH_ROW_BLOCK;
   constexpr uint per_lane = Rows * QHeads * 256;
   uint batch = element / per_lane;
   return full_attention_gate_value<QHeads, KHeads>(
@@ -72,7 +72,7 @@ inline void full_attention_gate_decode_phase(
     device const bfloat *packed_qkv, device const bfloat *attention,
     device bfloat *hidden, constant FullDecodeBatchParams &params, uint index,
     uint grid_size) {
-  const uint count = params.lanes * SPLASH_TARGET_VERIFY_ROWS * QHeads * 256;
+  const uint count = params.lanes * SPLASH_ROW_BLOCK * QHeads * 256;
   for (uint element = index; element < count; element += grid_size)
     hidden[element] =
         verify_attention_gate_value<QHeads, KHeads>(packed_qkv, attention, element);

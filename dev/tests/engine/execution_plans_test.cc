@@ -89,7 +89,7 @@ void baselinePlans() {
       for (uint32_t rows = 1; rows <= 2048; ++rows)
         covers(memory, plans.prefillAttention(rows, queryHeads, kvLayout).workspace, 1,
                attentionFields);
-      const auto stride = plans.verifyAttentionWorkspacePerLane(queryHeads, kvLayout);
+      const auto stride = plans.verifyAttentionWorkspacePerRowBlock(queryHeads, kvLayout);
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         const std::array<uint32_t, 4> histories{0, 31, 2048, 8192};
         const auto selected = plans.verifyAttention(lanes, queryHeads, kvLayout,
@@ -107,12 +107,12 @@ void baselinePlans() {
       }
     }
     for (auto shape : draftShapes) {
-      const auto stride = plans.draftAttentionWorkspacePerLane(shape);
+      const auto stride = plans.draftAttentionWorkspacePerRowBlock(shape);
       for (uint32_t lanes = 1; lanes <= 4; ++lanes)
-        covers(stride, plans.draftAttention(shape, lanes).workspace(), lanes, draftFields);
+        covers(stride, plans.draftAttention(shape, lanes, 8).workspace(), lanes, draftFields);
     }
     for (auto shape : moeShapes) {
-      const auto stride = plans.moeDecodeWorkspacePerLane(shape);
+      const auto stride = plans.moeDecodeWorkspacePerRowBlock(shape);
       require(stride == plans.moeDecode(shape, 1).workspace(), "workspace bound changed");
       const auto prefill = plans.moePrefillWorkspace(shape, 2048);
       for (uint32_t rows = 1; rows <= 2048; ++rows)
@@ -144,7 +144,7 @@ void ggufMoePlans() {
       require(plan.workspace().groupedSumsBytes ==
                   (expected == MoeGgufTile::Register ? uint64_t{plan.maximumTiles()} * 2048 * 3 : 0),
               "GGUF register plan sums its Table16 tiles");
-      covers(plans.moeDecodeWorkspacePerLane(shape), plan.workspace(), lanes, kMoeWorkspaceFields);
+      covers(plans.moeDecodeWorkspacePerRowBlock(shape), plan.workspace(), lanes, kMoeWorkspaceFields);
     }
     // Apple9 stages experts mostly in a format it stages (IQ2_XS: UD-Q2_K_XL)
     // and keeps the register tile for the others (Q4_K: UD-Q4_K_M).
@@ -163,7 +163,7 @@ void ggufMoePlans() {
       const MoePlan plan = plans.moeDecode(staged, lanes);
       require(plan.configuration().ggufTile == MoeGgufTile::Staged && plan.workspace().groupedSumsBytes == 0,
               "GGUF MoE plan of staged experts took the register tile");
-      covers(plans.moeDecodeWorkspacePerLane(staged), plan.workspace(), lanes, kMoeWorkspaceFields);
+      covers(plans.moeDecodeWorkspacePerRowBlock(staged), plan.workspace(), lanes, kMoeWorkspaceFields);
     }
     // Prefill: the register tile's 8 rows, or staged 8-row tiles while the
     // routes average at most one row per expert (32 rows of 8 of 256
@@ -231,24 +231,24 @@ void workspaceBounds() {
       plans.verifyAttention(3, 24, attentionShapes[0].layout, std::span(histories).first(3));
   require(exact.laneSplits[3] == 0 && exact.splits == kv::verifyAttentionSplits(2049),
           "verify policy did not resolve one history per lane");
-  const auto verify = plans.verifyAttentionWorkspacePerLane(24, attentionShapes[0].layout);
+  const auto verify = plans.verifyAttentionWorkspacePerRowBlock(24, attentionShapes[0].layout);
   require(verify.partialsBytes ==
                   uint64_t{8} * kv::kVerifyMaximumSplits * 24 * 256 * 4 &&
               verify.statisticsBytes ==
                   uint64_t{8} * kv::kVerifyMaximumSplits * 24 * 2 * 4,
           "verify workspace does not cover the maximum split count");
-  // 65 tiles of 8 grouped rows per lane at every width.
-  const auto moe = plans.moeDecodeWorkspacePerLane(routedShape);
+  // 65 tiles of 8 grouped rows per row block at every width.
+  const auto moe = plans.moeDecodeWorkspacePerRowBlock(routedShape);
   require(moe.groupedInputBytes == 2129920 && moe.expertOutputBytes == 2129920 &&
               moe.expertIntermediateBytes == 532480 && moe.groupedRoutesBytes == 2080 &&
               moe.tileDescriptorsBytes == 520 && moe.tileCountBytes == 28,
-          "MoE decode workspace per lane changed");
+          "MoE decode workspace per row block changed");
   require(plans.gateUpWorkspace(gateUp(matrices[0])) == 1114112 &&
               plans.gateUpWorkspace(gateUp(matrices[1])) == 393216,
           "gate/up workspace omitted the B3/B4 gate pass");
-  const auto draft = plans.draftAttentionWorkspacePerLane(draftShapes[0]);
-  // Grouped queries per lane plus eight heads x four splits of 32 x 130 fp32
-  // attention partials behind them.
+  const auto draft = plans.draftAttentionWorkspacePerRowBlock(draftShapes[0]);
+  // Grouped queries per row block plus eight heads x four splits of 32 x 130
+  // fp32 attention partials behind them.
   require(draft.convolutionBytes == 81920 && draft.qkvBytes == 98304 &&
               draft.groupedQueriesBytes == 65536 + 8 * 4 * 16640 &&
               draft.queryKeysBytes == 16384 && draft.queryValuesBytes == 16384,
@@ -278,7 +278,7 @@ void invalidLookupsAndContextEdges() {
           "a MoE prefill workspace of no rows was accepted");
   rejects([&] { (void)plans.gateUpWorkspace({256, 64}); }, "invalid linear decode workload",
           "a gate/up workspace of a partial 256-input block was accepted");
-  rejects([&] { (void)plans.draftAttentionWorkspacePerLane({}); },
+  rejects([&] { (void)plans.draftAttentionWorkspacePerRowBlock({}); },
           "unsupported compiled draft attention shape", "a draft workspace of an empty shape was accepted");
   std::array<uint32_t, 1> edge{kv::kMaximumPhysicalTokens - 8};
   const auto finalVerify = plans.verifyAttention(1, 24, kvLayout, edge);

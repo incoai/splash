@@ -332,7 +332,7 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
       check(lanes * 8, plan.storageRows(), "decode B" + std::to_string(lanes),
             [&](CommandGraph &graph, MetalBuffer input, const Projection &p, MetalBuffer output) {
               static_cast<void>(linear.add(graph, {.input = input, .output = output, .scratch = scratch}, p,
-                                           linear.decodePlan(p, lanes)));
+                                           linear.decodePlan(p, lanes * 8)));
             });
     }
     for (const uint32_t rows : {1u, 24u, 33u, 263u}) {
@@ -364,7 +364,7 @@ int floatOnlyChain(MetalBackend &backend) {
   int failures = 0;
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     const uint64_t rows = lanes * 8, bytes = rows * N * 2;
-    const LinearPlan plan = linear.decodePlan(blocks, lanes);
+    const LinearPlan plan = linear.decodePlan(blocks, lanes * 8);
     const LinearScratchSize size = plan.scratchSize();
     const LinearScratch scratch{zeros(backend, size.input, "chain-table"), zeros(backend, size.sums, "chain-sums"),
                                 zeros(backend, size.partials, "chain-partials"),
@@ -374,7 +374,8 @@ int floatOnlyChain(MetalBackend &backend) {
                       alone = zeros(backend, bytes, "chain-reference");
     CommandGraph graph, reference;
     const PreparedInput prepared =
-        linear.add(graph, {.input = input, .output = scores, .scratch = scratch}, floats, linear.decodePlan(floats, lanes));
+        linear.add(graph, {.input = input, .output = scores, .scratch = scratch}, floats,
+                   linear.decodePlan(floats, lanes * 8));
     static_cast<void>(
         linear.add(graph, {.input = input, .output = chained, .scratch = scratch, .prepared = prepared}, blocks, plan));
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());

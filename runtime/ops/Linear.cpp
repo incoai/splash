@@ -24,17 +24,14 @@ void validate(LinearWorkload w) {
         w.epilogue == LinearEpilogue::GateUp)
       throw std::invalid_argument("invalid linear prefill workload");
   } else {
-    if (w.matrix.inputSize % 256 || !w.rows || w.rows % SPLASH_TARGET_VERIFY_ROWS ||
-        w.rows > SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH ||
-        w.epilogue == LinearEpilogue::UpWithGate)
+    if (w.matrix.inputSize % 256 || !w.rows || w.rows % SPLASH_ROW_BLOCK ||
+        w.rows > SPLASH_MAXIMUM_CYCLE_ROWS || w.epilogue == LinearEpilogue::UpWithGate)
       throw std::invalid_argument("invalid linear decode workload");
   }
 }
 
-LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilogue) {
-  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
-    throw std::invalid_argument("invalid linear decode batch width");
-  return {matrix, lanes * SPLASH_TARGET_VERIFY_ROWS, LinearPhase::Decode, epilogue};
+LinearWorkload decode(LinearMatrix matrix, uint32_t rows, LinearEpilogue epilogue) {
+  return {matrix, rows, LinearPhase::Decode, epilogue};
 }
 
 // LinearScratch::rotated bytes of `rows` bf16 rows of `width` inputs.
@@ -98,15 +95,15 @@ Projection Projection::leadingInputs(uint32_t inputs) const {
   return result;
 }
 
-// Table16 holds its sums per eight-row tile (metal/abi/Gguf.h), a lane's rows.
+// Table16 holds its sums per eight-row tile (metal/abi/Gguf.h), a row block.
 uint64_t tableSumsBytes(LinearInput layout, uint32_t width, uint64_t rows) noexcept {
   return layout == LinearInput::Table16
-             ? rows / SPLASH_TARGET_VERIFY_ROWS * table16_sums_per_tile(width) * sizeof(float)
+             ? rows / SPLASH_ROW_BLOCK * table16_sums_per_tile(width) * sizeof(float)
              : 0;
 }
 
 void requireTableScratch(const LinearScratch &scratch, LinearInput layout, uint32_t width, uint32_t rows) {
-  if (layout == LinearInput::Plain || !rows || rows % SPLASH_TARGET_VERIFY_ROWS || width % 64)
+  if (layout == LinearInput::Plain || !rows || rows % SPLASH_ROW_BLOCK || width % 64)
     throw std::invalid_argument("invalid linear table geometry");
   requireBytes(scratch.input, tableBytes(width, rows), "linear table");
   requireBytes(scratch.sums, tableSumsBytes(layout, width, rows), "linear table sums");
@@ -163,9 +160,9 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection 
   return plan;
 }
 
-LinearPlan Linear::decodePlan(const Projection &p, uint32_t lanes, LinearEpilogue epilogue,
+LinearPlan Linear::decodePlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue,
                               const Projection *gate) const {
-  return plan(decode({p.outputSize, p.inputSize}, lanes, epilogue), p, gate);
+  return plan(decode({p.outputSize, p.inputSize}, rows, epilogue), p, gate);
 }
 LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogue epilogue) const {
   return plan({{p.outputSize, p.inputSize}, rows, LinearPhase::Prefill, epilogue}, p);
@@ -173,10 +170,10 @@ LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogu
 
 LinearScratchSize Linear::decodeScratchSize(ProjectionShape shape) const {
   LinearScratchSize bound;
-  for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
+  for (uint32_t rows = SPLASH_ROW_BLOCK; rows <= SPLASH_MAXIMUM_CYCLE_ROWS; rows += SPLASH_ROW_BLOCK)
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
-      bound.include(ggufDecodeScratchSize(decode({shape.outputSize, shape.inputSize}, lanes, epilogue)));
-  // Decode plans store at most every lane's rows.
+      bound.include(ggufDecodeScratchSize(decode({shape.outputSize, shape.inputSize}, rows, epilogue)));
+  // Decode plans store at most a cycle's rows.
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, kMaximumDecodeTileRows);
   return bound;
 }

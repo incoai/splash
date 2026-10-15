@@ -42,12 +42,10 @@ struct ThinkingCutoff final {
   uint32_t alsoEnds = 0;
   bool waitsForMask = false;
 
-  // How many of the draft's proposals, from the first, the end replaces:
-  // tokens the draft did not propose.
-  [[nodiscard]] uint32_t replacedProposals() const noexcept {
-    return row || waitsForMask
-               ? 0
-               : static_cast<uint32_t>(std::min<size_t>(end.size(), SPLASH_DRAFT_PROPOSAL_TOKENS));
+  // How many of the draft's `proposals` proposals, from the first, the end
+  // replaces: tokens the draft did not propose.
+  [[nodiscard]] uint32_t replacedProposals(uint32_t proposals) const noexcept {
+    return row || waitsForMask ? 0 : static_cast<uint32_t>(std::min<size_t>(end.size(), proposals));
   }
 };
 
@@ -109,8 +107,8 @@ struct SamplingBuffers final {
   metal::MetalBuffer outputTokens;
   metal::MetalBuffer argmaxValues;
   metal::MetalBuffer argmaxIndices;
-  // Verify input tokens [rows]: row 0 of a lane is its anchor, rows 1..7 its
-  // draft tokens, which penalized and sampled verify rows read.
+  // Verify input tokens [rows]: row 0 of a lane is its anchor, its later
+  // rows its draft tokens, which penalized and sampled verify rows read.
   metal::MetalBuffer inputTokens;
   // The draft's candidates and their probabilities at each proposal
   // position (AcceptanceBuffers), which a sampled verify row draws its
@@ -168,13 +166,13 @@ public:
   // LM head's fresh output. Other lanes dispatch nothing new. A greedy lane
   // then takes each row's argmax and a sampled lane draws from each row's
   // distribution over the whole vocabulary, both among the tokens the lane
-  // admits: the first token after a prompt from each lane's row at
-  // rowOffset, and every verify row of a batch. Each selected row's token
-  // goes to the output tokens in order, one per lane for the first token
-  // and eight for verify; acceptance reads a sampled verify row's draft
-  // token probability from the vocabulary rows. A lane's rows from its
-  // thinking cutoff on then take the end of thinking. Both run the same
-  // kernels (addSelection).
+  // admits: the first token after a prompt from the row at rowOffset of each
+  // lane's row block, and every verify row of a batch of lanes of `rows`
+  // rows each. Each selected row's token goes to the output tokens in order,
+  // one per lane for the first token and `rows` for verify; acceptance reads
+  // a sampled verify row's draft token probability from the vocabulary rows.
+  // A lane's rows from its thinking cutoff on then take the end of thinking.
+  // Both run the same kernels (addSelection).
   void addInitial(metal::CommandGraph &graph,
                   std::span<const SamplingPolicy> policies,
                   SamplingBuffers buffers, uint32_t rowOffset,
@@ -182,26 +180,28 @@ public:
                   const PenaltyTable &penalties) const;
   void addVerify(metal::CommandGraph &graph,
                  std::span<const SamplingPolicy> policies,
-                 SamplingBuffers buffers, uint32_t stopToken0,
+                 SamplingBuffers buffers, uint32_t rows, uint32_t stopToken0,
                  uint32_t stopToken1, const PenaltyTable &penalties) const;
+  // Acceptance of the draft's proposals by verify rows of `rows` per lane.
   void addAcceptance(
       metal::CommandGraph &graph, AcceptanceBuffers buffers,
       std::span<const uint32_t> maximumRetained,
-      std::span<const SamplingPolicy> policies, uint32_t stopToken0,
-      uint32_t stopToken1) const;
-  // After the draft's selection and before the verify reads its proposals,
-  // the proposals of each lane whose thinking cutoff is at row 0, and whose
-  // end does not wait for its mask, take the end tokens its verify rows will
-  // select, so acceptance keeps them all. A batch without such a lane
-  // dispatches nothing.
+      std::span<const SamplingPolicy> policies, uint32_t rows,
+      uint32_t stopToken0, uint32_t stopToken1) const;
+  // After the draft's selection and before the verify of `rows` rows per
+  // lane reads its proposals, the proposals of each lane whose thinking
+  // cutoff is at row 0, and whose end does not wait for its mask, take the
+  // end tokens its verify rows will select, so acceptance keeps them all. A
+  // batch without such a lane dispatches nothing.
   void addThinkingDrafts(metal::CommandGraph &graph,
                          std::span<const SamplingPolicy> policies,
-                         metal::MetalBuffer proposedTokens) const;
+                         metal::MetalBuffer proposedTokens, uint32_t rows) const;
 
 private:
   // The rows a selection takes from each lane (metal/abi/Sampling.h
   // TargetSamplingParams).
   struct TargetRows final {
+    uint32_t laneRows = 0;
     uint32_t rows = 0;
     uint32_t logitsRow = 0;
     uint32_t maskRow = 0;
@@ -209,15 +209,15 @@ private:
     uint32_t draftedRows = 0;
   };
 
-  // Penalizes the row at rowOffset of each penalized lane or, for verify,
-  // all its rows, each also counting the draft tokens its context adds.
-  // Policies come from validated requests (Model.hpp
+  // Penalizes the rows `rows` selects of each penalized lane: for verify all
+  // its rows, each also counting the draft tokens its context adds. Policies
+  // come from validated requests (Model.hpp
   // SamplingParameters::validationError). It follows selection(), whose
   // check of every lane's logits covers those it rewrites.
   void addPenalties(metal::CommandGraph &graph,
                     std::span<const SamplingPolicy> policies,
                     const SamplingBuffers &buffers, const PenaltyTable &table,
-                    uint32_t rowOffset, bool verify) const;
+                    const TargetRows &rows, bool verify) const;
   // The parameters that select the rows `rows` names of every lane; throws
   // unless the buffers hold what the selection's kernels reach, before
   // addInitial or addVerify encodes anything.

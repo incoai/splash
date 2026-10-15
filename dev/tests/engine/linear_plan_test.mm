@@ -700,9 +700,9 @@ void rotatedRegisterInput(metal::MetalBackend &backend) {
   const NormWeights norm{allocate(backend, 17408 * 2)};
   const metal::MetalBuffer rows = allocate(backend, uint64_t{32} * 17408 * 2);
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-    const LinearPlan plan = m3.decodePlan(rotated, lanes);
+    const LinearPlan plan = m3.decodePlan(rotated, lanes * 8);
     require(plan.configuration().tile == LinearTile::GgufRegister && plan.input() == LinearInput::Plain &&
-                m3.decodePlan(plain, lanes).input() == LinearInput::Table16,
+                m3.decodePlan(plain, lanes * 8).input() == LinearInput::Table16,
             "a rotated register plan's producer writes a table it discards");
     metal::CommandGraph graph;
     (void)Normalization::addRms(graph, rows, norm, rows, 17408, lanes * 8, scratch, plan.input());
@@ -721,7 +721,7 @@ void blockExtents(metal::MetalBackend &backend) {
   constexpr uint32_t n = 256, k = 2048;
   Projection rotated(n, k, BlockWeights{{segmentPlanes(backend, GGUF_FMT_PQ20, n, k)}});
   rotated.rotation.signs = allocate(backend, k);
-  const LinearPlan plan = linear.decodePlan(rotated, 1);
+  const LinearPlan plan = linear.decodePlan(rotated, 8);
   const uint64_t rows = plan.storageRows();
   const LinearScratchSize scratch = plan.scratchSize();
   const LinearBuffers buffers{.input = allocate(backend, rows * k * 2),
@@ -772,7 +772,7 @@ void blockExtents(metal::MetalBackend &backend) {
   const std::array segments{segmentPlanes(backend, GGUF_FMT_Q5K, 320, k),
                             segmentPlanes(backend, GGUF_FMT_Q4K, 192, k, 320)};
   const Projection fused(512, k, BlockWeights{{segments[0], segments[1]}});
-  const LinearPlan fusedPlan = linear.decodePlan(fused, 1);
+  const LinearPlan fusedPlan = linear.decodePlan(fused, 8);
   const LinearScratchSize fusedScratch = fusedPlan.scratchSize();
   const LinearBuffers fusedBuffers{.input = allocate(backend, fusedPlan.storageRows() * k * 2),
                                    .output = allocate(backend, fusedPlan.storageRows() * 512 * 2),
@@ -887,7 +887,7 @@ void leadingInputViews(metal::MetalBackend &backend) {
             "a view of leading inputs ran on a plan without its instance");
     require(graph.empty(), "a refused view of leading inputs encoded a dispatch");
   };
-  refuses(gguf, linear.decodePlan(gguf, 1, LinearEpilogue::Residual));
+  refuses(gguf, linear.decodePlan(gguf, 8, LinearEpilogue::Residual));
   for (const LinearEpilogue epilogue : {LinearEpilogue::None, LinearEpilogue::UpWithGate})
     refuses(gguf, residualPrefill({.tile = LinearTile::GgufPrefill}, epilogue));
   refuses(gguf, Linear::plan({{n, k}, 32, LinearPhase::Prefill, LinearEpilogue::Residual},
@@ -933,7 +933,7 @@ void registerTileExtents(metal::MetalBackend &backend) {
   constexpr uint32_t n = 512, k = 2048, lanes = 2;
   constexpr uint64_t rows = lanes * 8;
   const Projection block(n, k, BlockWeights{{segmentPlanes(backend, GGUF_FMT_Q4K, n, k)}});
-  const LinearPlan plan = m3.decodePlan(block, lanes);
+  const LinearPlan plan = m3.decodePlan(block, rows);
   const LinearScratchSize scratch = plan.scratchSize();
   require(plan.configuration().tile == LinearTile::GgufRegister && scratch.input && scratch.sums &&
               scratch.partials && scratch.counters,

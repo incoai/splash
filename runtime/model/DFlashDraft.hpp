@@ -233,16 +233,20 @@ public:
                          std::span<const DFlashDraftRingLayer> ring,
                          uint32_t rows, uint32_t startPosition) const;
 
+  // A decode cycle's draft, selection and context commit over lanes of
+  // `laneRows` query rows each: the anchor and the positions it proposes.
   void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
                  const ops::Projection &vocabularyProjection,
-                 std::span<const uint32_t> cacheLengths) const;
+                 std::span<const uint32_t> cacheLengths, uint32_t laneRows) const;
   void addSelection(metal::CommandGraph &graph,
                     const ops::DraftSelectorBuffers &buffers,
                     std::span<const uint32_t> anchors,
-                    std::span<const ops::SamplingPolicy> policies) const;
+                    std::span<const ops::SamplingPolicy> policies,
+                    uint32_t laneRows) const;
   void addContextCommit(metal::CommandGraph &graph,
                         DFlashContextBuffers buffers,
-                        std::span<const uint32_t> startPositions) const;
+                        std::span<const uint32_t> startPositions,
+                        uint32_t laneRows) const;
 
 private:
   // Each layer's context keys and values of the `rows` context rows in the

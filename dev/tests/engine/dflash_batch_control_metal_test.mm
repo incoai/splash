@@ -30,9 +30,9 @@ using splash::ops::Embedding;
 using splash::ops::RowCopy;
 using splash::ops::RowRegion;
 
-constexpr uint32_t kRows = splash::model::ExecutionLimits::targetVerifyRows;
-constexpr uint32_t kProposals =
-    splash::model::ExecutionLimits::draftProposalTokens;
+// The cycles here verify one row block per lane.
+constexpr uint32_t kRows = splash::model::ExecutionLimits::rowBlock;
+constexpr uint32_t kProposals = kRows - 1;
 constexpr uint32_t kLanes =
     splash::model::ExecutionLimits::maximumBatchWidth;
 
@@ -105,6 +105,7 @@ void runWidth(MetalBackend &backend, uint32_t width,
   AcceptBatchParams params{};
   std::copy(remainingReference.begin(), remainingReference.end(),
             std::begin(params.remaining));
+  params.rows = kRows;
   params.stop_token_0 = kStopToken;
   params.stop_token_1 = 248046;
   ComputeDispatch dispatch;
@@ -220,7 +221,7 @@ void verifyInputExtents(MetalBackend &backend) {
     requireExtent(backend, buffers[index], bytes, 4, what, [&](CommandGraph &graph, const MetalBuffer &view) {
       auto changed = buffers;
       changed[index] = view;
-      Embedding::addVerifyInput(graph, changed[0], changed[1], changed[2], vocabulary, lanes);
+      Embedding::addVerifyInput(graph, changed[0], changed[1], changed[2], vocabulary, lanes, kRows);
     });
 }
 

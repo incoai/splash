@@ -173,6 +173,9 @@ public:
   model::ModelTelemetry telemetry() const noexcept override {
     return {};
   }
+  uint32_t verifyRows(uint32_t) const noexcept override {
+    return model::ExecutionLimits::rowBlock;
+  }
 
   std::vector<int> calls;
   uint32_t lastPrefillRows = 0;

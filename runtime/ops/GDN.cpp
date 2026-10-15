@@ -174,8 +174,9 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH || !state.valid() || buffers.tapeLanes.size() < lanes)
     throw std::invalid_argument("invalid GDN decode geometry");
   const KernelLayout kernel = kernelShape(shape);
-  // Lane l's rows of the packed and hidden rows are rows [8 l, 8 l + 8).
-  const uint64_t rows = uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS;
+  // The kernel takes one row block per lane: lane l's rows of the packed and
+  // hidden rows are rows [8 l, 8 l + 8).
+  const uint64_t rows = uint64_t{lanes} * SPLASH_ROW_BLOCK;
   requireBytes(buffers.packed, packedBytes(shape, rows), "GDN packed");
   requireMixerWeights(shape, buffers.convolutionWeights, buffers.decayWeights, buffers.timeBias);
   requireBytes(buffers.hidden, rows * valueWidth(shape) * 2, "GDN hidden");
@@ -204,7 +205,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
     params.pending_tape[lane] = tape.pendingSlot + layerOffset;
     params.step_tape[lane] = tape.stepSlot + layerOffset;
     params.pending_rows[lane] = tape.pendingRows;
-    if (tape.pendingRows > SPLASH_TARGET_VERIFY_ROWS || params.pending_tape[lane] % 16 ||
+    if (tape.pendingRows > SPLASH_ROW_BLOCK || params.pending_tape[lane] % 16 ||
         params.step_tape[lane] % 16)
       throw std::invalid_argument("invalid GDN decode tape");
     for (uint32_t other = 0; other <= lane; ++other)
@@ -219,7 +220,7 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   const bool prepare = input != LinearInput::Plain;
   if (prepare)
     requireTableScratch(buffers.linearScratch, input, shape.valueHeads * shape.headDimension,
-                        lanes * SPLASH_TARGET_VERIFY_ROWS);
+                        static_cast<uint32_t>(rows));
   bindings.reserve(prepare ? 17 : 15);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   requireStates(shape, state, layer, lanes, buffers.currentStates, buffers.nextStates);

@@ -150,7 +150,7 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
   // The grouped-queries tensor is sized by the plan so the split partials
   // behind the query rows end exactly at the allocation under validation.
   MetalBuffer queries = randomBfloat(
-      backend, DraftAttention::plan(shape, lanes).workspace().groupedQueriesBytes / 2,
+      backend, DraftAttention::plan(shape, lanes, kRows).workspace().groupedQueriesBytes / 2,
       random, "draft queries");
   std::vector<MetalBuffer> keys;
   std::vector<MetalBuffer> values;
@@ -182,7 +182,7 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
   CommandGraph graph;
   DraftAttention::addDecode(graph,
       {queries, keys, values, queryKeys, queryValues},
-      std::span(cacheLengths).first(lanes), DraftAttention::plan(shape, lanes));
+      std::span(cacheLengths).first(lanes), DraftAttention::plan(shape, lanes, kRows));
   const auto dispatches = graph.dispatches();
   require(dispatches.size() == 2 &&
               dispatches[0].threadgroups.x == kKvHeads &&
@@ -200,7 +200,7 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
         DraftAttention::addDecode(mismatched,
             {queries, keys, values, queryKeys, queryValues},
             std::span(cacheLengths).first(lanes - 1),
-            DraftAttention::plan(shape, lanes));
+            DraftAttention::plan(shape, lanes, kRows));
       },
       "invalid draft attention geometry", "fewer cache lengths than lanes were accepted");
   require(mismatched.empty(), "mismatched cache lengths encoded a graph");
@@ -246,7 +246,7 @@ void planGeometry() {
   for (const auto shape : kShapes) {
     for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
       const uint64_t rows = uint64_t{lanes} * kRows;
-      const auto plan = DraftAttention::plan(shape, lanes);
+      const auto plan = DraftAttention::plan(shape, lanes, kRows);
       const auto workspace = plan.workspace();
       require(plan.lanes() == lanes && plan.shape() == shape &&
                   workspace.convolutionBytes == rows * shape.hiddenSize * 2 &&
@@ -258,17 +258,20 @@ void planGeometry() {
                   workspace.queryValuesBytes == rows * 8 * 128 * 2,
               "draft plan padded lanes or changed tensor storage");
     }
-    rejects([&] { (void)DraftAttention::plan(shape, 0); }, "invalid draft batch width",
+    rejects([&] { (void)DraftAttention::plan(shape, 0, kRows); }, "invalid draft batch width",
             "a draft plan of no lanes was accepted");
-    rejects([&] { (void)DraftAttention::plan(shape, 5); }, "invalid draft batch width",
+    rejects([&] { (void)DraftAttention::plan(shape, 5, kRows); }, "invalid draft batch width",
             "a draft plan wider than a batch was accepted");
+    // The attention core is compiled for one row block per lane.
+    rejects([&] { (void)DraftAttention::plan(shape, 1, 2 * kRows); }, "unsupported draft query rows",
+            "a draft plan of rows the core is not compiled for was accepted");
   }
   auto unsupported = kShapes[0];
   unsupported.queryHeads = 16;
-  rejects([&] { (void)DraftAttention::plan(unsupported, 1); },
+  rejects([&] { (void)DraftAttention::plan(unsupported, 1, kRows); },
           "unsupported compiled draft attention shape",
           "a draft shape without a compiled kernel was accepted");
-  rejects([&] { (void)DraftAttention::plan({}, 1); }, "unsupported compiled draft attention shape",
+  rejects([&] { (void)DraftAttention::plan({}, 1, kRows); }, "unsupported compiled draft attention shape",
           "an empty draft shape was accepted");
 }
 
@@ -280,7 +283,7 @@ void fillDyadic(const MetalBuffer &buffer, uint32_t multiplier, uint32_t modulus
 
 void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
                        uint32_t lanes) {
-  const auto plan = DraftAttention::plan(shape, lanes);
+  const auto plan = DraftAttention::plan(shape, lanes, kRows);
   const auto workspace = plan.workspace();
   const uint64_t rows = uint64_t{lanes} * kRows;
   auto allocate = [&](uint64_t bytes) {
@@ -545,7 +548,7 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
   CommandGraph commit;
   DraftAttention::addContextCommit(commit, laneKv, keyNorm, laneCos, laneSin,
                                    laneKeys, laneValues, retainedCounts, starts,
-                                   shape);
+                                   kRows, shape);
   static_cast<void>(backend.submitCommandAsync(commit.dispatches()).wait());
   for (uint32_t lane = 0; lane < kCommitLanes; ++lane)
     check(laneKeys[lane], laneValues[lane],
@@ -567,7 +570,7 @@ void contextWriters(MetalBackend &backend, DraftAttentionShape shape) {
         [&] {
           DraftAttention::addContextCommit(invalid, laneKv, keyNorm, laneCos,
                                            laneSin, laneKeys, laneValues,
-                                           retainedCounts, positions, shape);
+                                           retainedCounts, positions, kRows, shape);
         },
         "invalid draft batch width",
         "a context commit of no lanes or more than a batch was accepted");
@@ -752,7 +755,7 @@ void contextWindowCapturedInside(MetalBackend &backend, uint32_t width) {
 // RoPE rows, rings and the commit's retained counts.
 void bufferExtents(MetalBackend &backend, DraftAttentionShape shape) {
   constexpr uint32_t lanes = 3, contextTokens = 37;
-  const auto plan = DraftAttention::plan(shape, lanes);
+  const auto plan = DraftAttention::plan(shape, lanes, kRows);
   const uint64_t rows = uint64_t{lanes} * kRows, hidden = rows * shape.hiddenSize * 2;
   const uint64_t queryRows = rows * kAttention * 2, current = rows * kKvHeads * kHeadDim * 2;
   const uint64_t ring = uint64_t{kKvHeads} * kWindow * kHeadDim * 2, norm = kHeadDim * 2;
@@ -829,7 +832,7 @@ void bufferExtents(MetalBackend &backend, DraftAttentionShape shape) {
   const std::array<uint32_t, lanes> starts{2044, 0, 4101};
   splash::test::requireExtents(backend, extents, [&](CommandGraph &graph, const Buffers &b) {
     DraftAttention::addContextCommit(graph, b[0], b[1], b[2], b[3], rings(b, 5), rings(b, 5 + lanes), b[4], starts,
-                                     shape);
+                                     kRows, shape);
   });
   const uint64_t windowBytes = DraftAttention::contextWindowBytes(shape.hiddenSize);
   const uint64_t contextRows = uint64_t{contextTokens} * shape.hiddenSize * 2;

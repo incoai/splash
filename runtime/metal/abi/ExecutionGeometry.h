@@ -2,25 +2,33 @@
 
 // C/Metal ABI constants shared by host and shader compilation. Startup
 // static assertions check the corresponding model and operator contracts.
-#define SPLASH_DRAFT_QUERY_ROWS 8u
-#define SPLASH_DRAFT_PROPOSAL_TOKENS 7u
-#define SPLASH_TARGET_VERIFY_ROWS 8u
+//
+// Every lane of a decode cycle verifies the same rows: its anchor and the
+// draft's proposals after it, as many as the draft's query rows. The rows of
+// a cycle come in blocks of SPLASH_ROW_BLOCK rows, the tile of its
+// projections and of the decode arena: a lane verifies whole blocks, at most
+// SPLASH_MAXIMUM_VERIFY_ROWS rows, and a cycle at most
+// SPLASH_MAXIMUM_CYCLE_ROWS rows over all its lanes.
+#define SPLASH_ROW_BLOCK 8u
+#define SPLASH_MAXIMUM_VERIFY_ROWS 8u
+#define SPLASH_MAXIMUM_BATCH_WIDTH 4u
+#define SPLASH_MAXIMUM_CYCLE_ROWS                                          \
+  (SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_ROW_BLOCK)
 #define SPLASH_MAXIMUM_CONTEXT_TOKENS 262144u
 #define SPLASH_SPECULATIVE_SCRATCH_TOKENS                                  \
-  (SPLASH_TARGET_VERIFY_ROWS - 1u)
+  (SPLASH_MAXIMUM_VERIFY_ROWS - 1u)
 #define SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS                                  \
   (SPLASH_MAXIMUM_CONTEXT_TOKENS + SPLASH_SPECULATIVE_SCRATCH_TOKENS)
-#define SPLASH_MAXIMUM_BATCH_WIDTH 4u
 #define SPLASH_PREFILL_TOKEN_BUDGET 2048u
 #define SPLASH_DRAFT_SLIDING_WINDOW 2048u
 #define SPLASH_TARGET_KV_BLOCK_TOKENS 32u
 // Rows per KV head (and per query group) of one lane's verify chunk staging:
-// one KV block, which holds the lane's SPLASH_TARGET_VERIFY_ROWS rows.
+// one KV block, which holds the lane's verify rows.
 #define SPLASH_VERIFY_CHUNK_STRIDE SPLASH_TARGET_KV_BLOCK_TOKENS
 #define SPLASH_PREFILL_ATTENTION_TILE_ROWS 8u
 #define SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS 32u
 // Draft attention deals the live ring tiles of one (lane, KV head)
-// round-robin to this many groups, the last of which also attends the eight
+// round-robin to this many groups, the last of which also attends the
 // current rows. Fixed rather than derived from the GPU so the combine order,
 // and with it the rounding, is the same on every machine and lane count.
 #define SPLASH_DRAFT_ATTENTION_SPLITS 4u
@@ -31,7 +39,7 @@
 // tokens is ordered in threadgroup memory, one token per thread.
 #define SPLASH_TARGET_VOCABULARY_THREADS 1024u
 // Groups that share such a row's draw, each over its own slice of the
-// vocabulary, so the eight rows of a lane spread over the GPU's cores.
+// vocabulary, so the rows of a lane spread over the GPU's cores.
 #define SPLASH_TARGET_VOCABULARY_GROUPS 8u
 // The ranges of the vocabulary such a row's draw sums: one per simdgroup of
 // the row's groups.
