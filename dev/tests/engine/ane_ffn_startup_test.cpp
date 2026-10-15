@@ -1,6 +1,6 @@
 // What a start makes of the prefill FFN's Neural Engine split (engine/AneFfnStartup.cpp) on a model the test plays:
-// each outcome, the memory plan it adopts, the automatic context, the calibration every start makes and the line it
-// logs.
+// each outcome, the memory plan it adopts, the automatic context, the calibration a start makes, remembers and checks
+// again, and the line it logs.
 
 #include "TestChecks.hpp"
 #include "TestModel.hpp"
@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <functional>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -25,6 +26,8 @@ namespace {
 using namespace splash;
 using namespace splash::engine;
 using Kind = AneFfnOutcome::Kind;
+using splash::ops::ane_ffn::Calibration;
+using splash::ops::ane_ffn::Check;
 using splash::ops::ane_ffn::ChunkTimings;
 using splash::ops::ane_ffn::Timings;
 using splash::test::rejects;
@@ -71,16 +74,20 @@ Timings measured() { return {{14.0 / 34, 11.699, 23.484}, {27.0 / 34, 5.033, 44.
 
 // The chunks of a split timed over its functions of 2048 down to 512 rows: the GPU alone 5 ms at 512 rows and 20 at
 // 2048, each function's split layer 0.8 of the GPU's at its rows but function 2048's at `most` ms and function 640's
-// at 5.5, which splits its chunks from 553 rows (ane_ffn_calibration_test).
+// at 5.5, which splits its chunks from 553 rows (ane_ffn_calibration_test); the Neural Engine's part 12 ms of function
+// 2048's, 0.8 of each other function's split layer.
 ChunkTimings timedChunks(double most) {
   const auto gpu = [](uint32_t rows) { return 5.0 + (rows - 512) * 15.0 / 1536; };
   ChunkTimings chunks;
   chunks.gpu = {{{512, gpu(512)}, {2048, gpu(2048)}}};
-  for (uint32_t rows = 2048; rows >= 512; rows -= 128)
-    chunks.functions.push_back({rows == 512 ? 512 : rows - 127, rows,
-                                rows == 2048 ? most : rows == 640 ? 5.5 : 0.8 * gpu(rows)});
+  for (uint32_t rows = 2048; rows >= 512; rows -= 128) {
+    const double split = rows == 2048 ? most : rows == 640 ? 5.5 : 0.8 * gpu(rows);
+    chunks.functions.push_back({rows == 512 ? 512 : rows - 127, rows, split, rows == 2048 ? 12.0 : 0.8 * split});
+  }
   return chunks;
 }
+// A check that matches the calibration of timedChunks(15.5).
+constexpr Check kMatching{20.0, 15.5, 12.0};
 
 // A model the test plays: a dense one of 34 units, each `unitBytes` of the split's memory, what its timings and its
 // prepared split return, and what the start asked of it.
@@ -90,16 +97,20 @@ struct Fake {
   std::optional<std::string> unavailable;
   uint64_t unitBytes = 256 * kMiB;
   std::function<Timings()> time = measured;
-  std::function<AneFfnPrepared(uint32_t, bool)> prepare = [](uint32_t, bool timed) {
+  // What a check of the split times, whatever split prepare() returns.
+  Check check = kMatching;
+  std::function<AneFfnPrepared(uint32_t, AneFfnTiming)> prepare = [](uint32_t, AneFfnTiming timing) {
     AneFfnPrepared prepared;
-    if (timed) prepared.chunks = timedChunks(15.5);
+    if (timing == AneFfnTiming::Chunks) prepared.chunks = timedChunks(15.5);
     prepared.error = 0.025;
     return prepared;
   };
   bool healthy = true;
+  // What this Mac remembers, as lines of text by the most units a plan held.
+  std::map<uint32_t, std::string> memory;
   // The calls the start made: of unavailable() and time(), and of prepare() with its arguments.
   uint32_t asked = 0, timings = 0;
-  std::optional<std::pair<uint32_t, bool>> prepared;
+  std::optional<std::pair<uint32_t, AneFfnTiming>> prepared;
 
   [[nodiscard]] uint64_t bytes(uint32_t aneUnits) const { return aneUnits * unitBytes; }
   // What the plan holds with the largest split the model could take, the most units whose plan holds any: the
@@ -124,10 +135,20 @@ struct Fake {
       ++timings;
       return time();
     };
-    result.prepare = [this](uint32_t aneUnits, bool timeChunks) {
-      prepared = {aneUnits, timeChunks};
-      return prepare(aneUnits, timeChunks);
+    result.prepare = [this](uint32_t aneUnits, AneFfnTiming timing) {
+      prepared = {aneUnits, timing};
+      AneFfnPrepared result = prepare(aneUnits, timing);
+      if (timing == AneFfnTiming::Check) result.check = check;
+      return result;
     };
+    result.recall = [this](uint32_t maxAneUnits) -> std::optional<Calibration> {
+      const auto found = memory.find(maxAneUnits);
+      return found == memory.end() ? std::nullopt : Calibration::parse(found->second);
+    };
+    result.remember = [this](uint32_t maxAneUnits, const Calibration &calibration) {
+      memory[maxAneUnits] = calibration.text();
+    };
+    result.forget = [this](uint32_t maxAneUnits) { memory.erase(maxAneUnits); };
     result.healthy = [this] { return healthy; };
     return result;
   }
@@ -241,7 +262,7 @@ void testAutomaticContext() {
   Fake fake;
   const Started started = start(fake);
   const AneFfnOutcome &outcome = started.start.outcome;
-  require(outcome.kind == Kind::Split && fake.timings == 1 && fake.prepared == std::pair(8u, true),
+  require(outcome.kind == Kind::Split && fake.timings == 1 && fake.prepared == std::pair(8u, AneFfnTiming::Chunks),
           "the split of 8 units was not calibrated and prepared");
   require(started.start.plan && started.start.plan->breakdown().aneFfnBytes == fake.bytes(8) &&
               started.start.plan->maximumContextTokens() == contextWith(fake.bytes(8)) &&
@@ -265,12 +286,12 @@ void testServedContext() {
     timings.gpuAlone = 14.0;
     return timings;
   };
-  const auto slowChunks = [](uint32_t, bool) {
+  const auto slowChunks = [](uint32_t, AneFfnTiming) {
     AneFfnPrepared prepared;
     prepared.chunks = timedChunks(21.0);
     return prepared;
   };
-  const auto fails = [](uint32_t, bool) -> AneFfnPrepared { throw std::runtime_error("an evaluation failed"); };
+  const auto fails = [](uint32_t, AneFfnTiming) -> AneFfnPrepared { throw std::runtime_error("an evaluation failed"); };
   const uint32_t most = Fake{}.largestSplitContext();
   require(most && most < contextWith(Fake{}.bytes(1)), "the largest split holds no less context");
   struct Case {
@@ -317,7 +338,7 @@ void testExplicitContext() {
   Fake fake;
   const uint32_t context = contextWith(fake.bytes(5));
   const Started started = start(fake, {}, context);
-  require(started.start.outcome.kind == Kind::Split && fake.prepared == std::pair(5u, true) && started.start.plan &&
+  require(started.start.outcome.kind == Kind::Split && fake.prepared == std::pair(5u, AneFfnTiming::Chunks) && started.start.plan &&
               started.start.plan->maximumContextTokens() >= context && !has(started.log, "with --disable-ane"),
           "the split took more units than the plan holds with the context asked for");
 }
@@ -336,7 +357,7 @@ void testFailures() {
               has(started.log, " with --disable-ane). --disable-ane silences this line."),
           "a timing that failed did not warn: " + started.log);
   fake = {};
-  fake.prepare = [](uint32_t, bool) -> AneFfnPrepared {
+  fake.prepare = [](uint32_t, AneFfnTiming) -> AneFfnPrepared {
     throw std::runtime_error("ANE FFN split of 640 rows failed (the Neural Engine's output or its scales were not "
                              "finite)");
   };
@@ -345,22 +366,22 @@ void testFailures() {
               has(started.log, "unavailable (ANE FFN split of 640 rows failed"),
           "a split that failed verify() was not unavailable");
   // Chunks that were not timed are not read.
-  fake.prepare = [](uint32_t, bool) { return AneFfnPrepared{}; };
+  fake.prepare = [](uint32_t, AneFfnTiming) { return AneFfnPrepared{}; };
   started = start(fake);
   require(started.start.outcome.kind == Kind::Unavailable && !started.start.plan &&
               has(started.log, "unavailable (the split's chunks were not timed)"),
           "a split of no chunks timed was not unavailable: " + started.log);
 
   bool cancelled = false;
-  fake.prepare = [&](uint32_t, bool) -> AneFfnPrepared {
+  fake.prepare = [&](uint32_t, AneFfnTiming) -> AneFfnPrepared {
     cancelled = true;
     throw std::runtime_error("the Metal command was not submitted");
   };
   rejects([&] { static_cast<void>(start(fake, {}, 0, [&] { return cancelled; })); }, "not submitted",
           "a cancelled start went on");
-  fake.prepare = [](uint32_t, bool) -> AneFfnPrepared { throw ane::Interrupted("the wait was interrupted"); };
+  fake.prepare = [](uint32_t, AneFfnTiming) -> AneFfnPrepared { throw ane::Interrupted("the wait was interrupted"); };
   rejects([&] { static_cast<void>(start(fake)); }, "interrupted", "an interrupted wait went on");
-  fake.prepare = [&](uint32_t, bool) -> AneFfnPrepared {
+  fake.prepare = [&](uint32_t, AneFfnTiming) -> AneFfnPrepared {
     fake.healthy = false;
     throw std::runtime_error("the backend stopped serving");
   };
@@ -381,7 +402,7 @@ void testNoGain() {
                                "2048-row FFN layer by enough (calibrated in "),
           "a share predicted to gain too little split: " + started.log);
   fake = {};
-  fake.prepare = [](uint32_t, bool) {
+  fake.prepare = [](uint32_t, AneFfnTiming) {
     AneFfnPrepared prepared;
     prepared.chunks = timedChunks(21.0);
     return prepared;
@@ -393,16 +414,92 @@ void testNoGain() {
           "a split of no chunk that gains split: " + started.log);
 }
 
-// Every start calibrates the split again: a second start of the model times it and prepares the chosen split
-// timed, as the first did, and serves what it chose.
-void testEveryStartCalibrates() {
+// A start takes this Mac's calibration, once remembered, while a check of it matches: a second start of the model
+// prepares the split the first chose, checked, times nothing else, and serves it over the same chunks at the same
+// context. A check whose GPU alone or split layer moved more than 5% either way, or whose Neural Engine ran more than
+// 10% faster, calibrates again and remembers what it finds; one whose Neural Engine runs slower, or that moved less,
+// takes the calibration.
+void testRemembered() {
   Fake fake;
   const Started first = start(fake);
+  require(first.start.outcome.kind == Kind::Split && fake.timings == 1 && fake.memory.size() == 1,
+          "the first start did not remember its calibration");
   const Started second = start(fake);
-  require(first.start.outcome.kind == Kind::Split && second.start.outcome.kind == Kind::Split && fake.timings == 2 &&
-              fake.prepared == std::pair(8u, true) && second.start.outcome.context == first.start.outcome.context &&
-              has(second.log, "(calibrated in "),
-          "a second start did not calibrate the split again: " + second.log);
+  require(second.start.outcome.kind == Kind::Split && fake.timings == 1 &&
+              fake.prepared == std::pair(8u, AneFfnTiming::Check) &&
+              second.start.outcome.context == first.start.outcome.context &&
+              has(second.log, "Neural Engine FFN split at share 0.24 for chunks of 553 rows or more: 15.5 ms per "
+                              "2048-row FFN layer against 20.0 on the GPU alone, 2.5% from the GPU alone on the "
+                              "Neural Engine's part (checked against this Mac's calibration in "),
+          "a second start did not take the calibration it checked: " + second.log);
+  struct Drift {
+    Check check;
+    std::string_view said;
+  };
+  for (const Drift &drift :
+       {Drift{{21.1, 15.5, 12.0}, "the GPU alone's full-chunk layer took 21.1 ms against 20.0"},
+        Drift{{20.0, 14.7, 12.0}, "the split's full-chunk layer took 14.7 ms against 15.5"},
+        Drift{{20.0, 15.5, 10.7}, "the Neural Engine's part of the split's full-chunk layer took 10.7 ms against 12.0"}}) {
+    Fake drifted;
+    static_cast<void>(start(drifted));
+    drifted.check = drift.check;
+    const Started again = start(drifted);
+    require(again.start.outcome.kind == Kind::Split && drifted.timings == 2 &&
+                drifted.prepared == std::pair(8u, AneFfnTiming::Chunks) && drifted.memory.size() == 1 &&
+                has(again.log, "Calibrating the Neural Engine FFN split again: " + std::string(drift.said) +
+                                   " when this Mac calibrated it.") &&
+                has(again.log, "(calibrated in "),
+            "a check that drifted did not calibrate again: " + again.log);
+  }
+  for (const Check &close : {Check{20.9, 15.5, 12.0}, Check{20.0, 16.2, 12.0}, Check{20.0, 15.5, 14.0}}) {
+    Fake kept;
+    static_cast<void>(start(kept));
+    kept.check = close;
+    const Started again = start(kept);
+    require(again.start.outcome.kind == Kind::Split && kept.timings == 1 && has(again.log, "(checked against "),
+            "a check within the drift did not take the calibration: " + again.log);
+  }
+}
+
+// A start remembers under the most units its plan holds, and takes nothing remembered under others; a calibration
+// that finds no gain forgets what was remembered, and a given share neither takes nor remembers one. A record of more
+// units than the plan holds is not taken.
+void testForgotten() {
+  Fake fake;
+  static_cast<void>(start(fake));
+  const uint32_t context = contextWith(fake.bytes(5));
+  const Started fewer = start(fake, {}, context);
+  require(fewer.start.outcome.kind == Kind::Split && fake.timings == 2 &&
+              fake.prepared == std::pair(5u, AneFfnTiming::Chunks) && fake.memory.size() == 2,
+          "a start of fewer units took a calibration of more: " + fewer.log);
+  fake.memory.erase(fake.memory.begin(), std::next(fake.memory.begin()));
+  fake.check = Check{25.0, 15.5, 12.0};
+  fake.time = [] {
+    Timings timings = measured();
+    timings.gpuAlone = 14.5;
+    return timings;
+  };
+  const Started none = start(fake);
+  require(none.start.outcome.kind == Kind::NoGain && fake.memory.empty(),
+          "a calibration that found no gain did not forget the one remembered: " + none.log);
+
+  Fake given;
+  static_cast<void>(start(given));
+  const std::map<uint32_t, std::string> remembered = given.memory;
+  const Started set = start(given, {.given = AneFfnSetting::Given{0.2}});
+  require(set.start.outcome.kind == Kind::Split && given.prepared == std::pair(7u, AneFfnTiming::None) &&
+              given.memory == remembered,
+          "a given share took or changed this Mac's calibration: " + set.log);
+
+  // A record of more units than the plan holds, which the fake remembers under fewer.
+  Fake more;
+  static_cast<void>(start(more));
+  const uint32_t five = contextWith(more.bytes(5));
+  more.memory[5] = more.memory.begin()->second;
+  const Started held = start(more, {}, five);
+  require(held.start.outcome.kind == Kind::Split && more.timings == 2 &&
+              more.prepared == std::pair(5u, AneFfnTiming::Chunks),
+          "a start took a calibration of more units than its plan holds: " + held.log);
 }
 
 // A given share runs the units nearest it, untimed, over the chunks given; a given split of no units or of rows no
@@ -410,7 +507,7 @@ void testEveryStartCalibrates() {
 void testGivenShare() {
   Fake fake;
   Started started = start(fake, {.given = AneFfnSetting::Given{0.2}});
-  require(started.start.outcome.kind == Kind::Split && !fake.timings && fake.prepared == std::pair(7u, false) &&
+  require(started.start.outcome.kind == Kind::Split && !fake.timings && fake.prepared == std::pair(7u, AneFfnTiming::None) &&
               started.start.plan &&
               started.start.plan->breakdown().aneFfnBytes == fake.bytes(7) &&
               has(started.log, "Neural Engine FFN split at the given share 0.21 for chunks of 512 rows or more, 2.5% "
@@ -448,7 +545,8 @@ int main() {
     testExplicitContext();
     testFailures();
     testNoGain();
-    testEveryStartCalibrates();
+    testRemembered();
+    testForgotten();
     testGivenShare();
     std::cout << "ane ffn startup tests passed\n";
     return EXIT_SUCCESS;

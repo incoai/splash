@@ -1784,9 +1784,10 @@ still holds that context, and if even the fewest do not, the GPU runs alone and
 the start warns how much context any split leaves. Without it the engine serves
 the automatic context, which while the split may run is what the plan holds
 with the split the start's calibration chose (below), the GPU alone's if it
-found no gain; a start whose calibration fails assumes the largest split the
-model could take (all its channel units but one, or the most whose plan holds
-any context), and the memory the split would hold stays with the KV cache.
+found no gain; a start whose calibration fails assumes the split this Mac's
+remembered calibration took, else the largest split the model could take (all
+its channel units but one, or the most whose plan holds any context), and the
+memory the split would hold stays with the KV cache.
 Starts whose calibrations choose different splits so serve different contexts.
 The log line names it beside the context without the split
 (`context 61,433 tokens (73,721 with --disable-ane)`); `--disable-ane`, a
@@ -1817,13 +1818,34 @@ and an M5 Pro the ANE's is the longer (1.7 ms a unit of the full-chunk layer
 against 0.6 and 1.1 ms), on an M6 the GPU's (1.9 against 1.2 ms). On
 Qwen3.8-27B that takes 8 of the 34 units on an M5 Max, 14-15 on an M5 Pro and
 25-26 on an M6, the best each Mac's sweeps measured. The split runs if T there
-gains 5% on the GPU alone. Every start calibrates the split afresh, which takes
-about 6 s on an M5 Max with Qwen3.8-27B once the programs are compiled (23 s
-for a start that compiles them), so that the share follows what the GPU and
-the ANE do at that start: a calibration kept from a start while another process
-loaded the ANE would hold every later start to a low share. A start whose
-timings stray can choose another share, whose program compiles once (half a
-minute on an M6) and is then kept like the others.
+gains 5% on the GPU alone. Timings that stray put the choice a unit either way
+(9 or 10 units on an M5 Max, 27 or 28 on an M4), and a program of other units
+compiles again (12 s on an M5 Max, 38-41 s on an M4), so units whose T at its
+longest lies within 2% of the choice's give way to the nearest whose program
+the ANE's service already holds, the fewer first (`AneFfn::compiled`, which
+asks the service and compiles nothing).
+
+A start remembers the calibration it made (`ane::remember`), in `splash-ane`
+of the per-user cache directory under the model's FFN layers, the Mac, its
+macOS and the most units its plan holds: the units, the least chunk, the GPU
+alone's FFN layer at 512 and 2048 rows, and the split's full-chunk layer with
+the ANE's part of it (`ops::ane_ffn::Calibration`). A later start builds and
+verifies the remembered split, then checks it (`Measurement::check`): the
+GPU's full-chunk layer alone and the split layer, with the ANE's own time, as
+calibration times them. It takes the calibration while the GPU alone and the
+split layer lie within 5% of it either way, past the ±3% they spread over
+starts on an M5 Max, and the ANE's part runs no more than 10% faster
+(`Calibration::drift`); otherwise it logs `Calibrating the Neural Engine FFN
+split again: ...` with the timing that moved, and calibrates as the first start
+did. The ANE's part is checked on its own because the GPU's part can bound the
+split layer: a calibration made while another process loaded the ANE takes a
+low share, and once that load is gone only the ANE's part runs faster. A check
+takes about 1.1 s on an M5 Max with Qwen3.8-27B against 6 s for a calibration
+whose programs are compiled (18 s for one that compiles another), and about
+7 s on an M4 (16 of its FFN layers) against 51 s. A calibration that finds no
+gain forgets what was remembered, as does a split that stops for losing to the
+GPU alone (below), so the next start calibrates again; a given share neither
+takes nor remembers a calibration.
 
 The start then builds the split that serves and checks every function of its
 program against the GPU alone (`AneFfn::verify`): at the function's own rows
@@ -1832,8 +1854,9 @@ ANE's output filled with NaN first so that rows it leaves unwritten show,
 against the leading rows of a full chunk on the GPU alone, which computes every
 row alike whatever the chunk's rows. The outputs must be finite and differ from
 the GPU's by at most 10% of what the ANE adds over the GPU's part; int8 leaves
-2.5-2.8% on Qwen3.8-27B. The start then times the GPU's FFN layer alone at 512
-and 2048 rows and the split layer of every function as above, and
+2.5-2.8% on Qwen3.8-27B. A start that calibrates then times the GPU's FFN layer
+alone at 512 and 2048 rows and the split layer of each function as above, from
+the most rows down to the first function in which a chunk does not split, and
 splits the chunks from the least rows from which every larger chunk's split
 layer takes at most 2% longer than the GPU's at the chunk's rows. Every row
 count is checked, since a batch's chunk sums its lanes' rows: an evaluation
@@ -1892,10 +1915,11 @@ on Qwen3.8-27B); `splash serve --disable-ane` keeps the FFN on the GPU, and
 `backend-benchmark --ane-ffn-share` runs a given share over chunks of
 `--ane-ffn-minimum-rows` rows or more (512 by default), which
 `backend_regression` pins to its first round's. `make test-engine-cpu` runs
-`ane-ffn-calibration`, the fit, the choice, the least chunk and the breaker on
-timings it is given, also under the sanitizers, and `ane-ffn-startup`, each
-outcome of a start on a model it plays, a second start that calibrates again
-among them, and the automatic context of each. `make test-engine-metal` runs `ane-ffn`: its kernels
+`ane-ffn-calibration`, the fit, the choice, the least chunk, the breaker and a
+remembered calibration's record and drift on timings it is given, also under
+the sanitizers, and `ane-ffn-startup`, each outcome of a start on a model it
+plays, a second start that takes the calibration the first remembered and each
+check that calibrates again among them, and the automatic context of each. `make test-engine-metal` runs `ane-ffn`: its kernels
 against CPU references for every image format under shader
 validation, then, without it, the split's memory and its output against the GPU
 alone, the same output once its program is unloaded and loaded again, a chunk's

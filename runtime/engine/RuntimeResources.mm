@@ -147,6 +147,17 @@ std::array<uint8_t, 32> parseSha256(std::string_view value) {
   return result;
 }
 
+// The layers' part of what ane::recall() keeps a calibration under: their
+// shapes and formats.
+std::string calibrationKey(std::span<const ops::SwiGluProjections> layers) {
+  std::string key = "ane-ffn calibration";
+  for (const ops::SwiGluProjections &layer : layers)
+    for (const ops::Projection *projection : {layer.gate, layer.up, layer.down})
+      key += " " + std::to_string(projection->outputSize) + "x" + std::to_string(projection->inputSize) + ":g" +
+             std::to_string(projection->blocks().segments.front().formatId);
+  return key;
+}
+
 } // namespace
 
 void requireLoadedModel(const model::LoadedModel &loaded) {
@@ -725,17 +736,33 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
       return false;
     }
   };
-  model.prepare = [&backend, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
+  model.prepare = [&backend, layers, cancelled, onArena](uint32_t aneUnits, AneFfnTiming timing) {
     AneFfnPrepared prepared;
     onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
       prepared.split = std::make_unique<ops::AneFfn>(backend, *layers, aneUnits, cancelled);
       prepared.error = prepared.split->verify(*layers, ffn, hidden);
-      if (timeChunks)
-        prepared.chunks =
-            ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled).chunks(*prepared.split);
+      if (timing == AneFfnTiming::None) return;
+      ops::ane_ffn::Measurement measurement(backend, *layers, ffn, hidden, cancelled);
+      if (timing == AneFfnTiming::Chunks)
+        prepared.chunks = measurement.chunks(*prepared.split);
+      else
+        prepared.check = measurement.check(*prepared.split);
     });
     return prepared;
   };
+  // A calibration is this Mac's, kept under the layers' shapes and formats,
+  // the device, the macOS version and the most units the plan holds: a
+  // build that changes how fast the split runs fails the start's check.
+  const std::string key = calibrationKey(*layers) + " device " + backend.capabilities().deviceName + " macos " +
+                          [[NSProcessInfo processInfo] operatingSystemVersionString].UTF8String + " most ";
+  model.recall = [key](uint32_t maxAneUnits) -> std::optional<ops::ane_ffn::Calibration> {
+    const std::optional<std::string> line = ane::recall(key + std::to_string(maxAneUnits));
+    return line ? ops::ane_ffn::Calibration::parse(*line) : std::nullopt;
+  };
+  model.remember = [key](uint32_t maxAneUnits, const ops::ane_ffn::Calibration &calibration) {
+    ane::remember(key + std::to_string(maxAneUnits), calibration.text());
+  };
+  model.forget = [key](uint32_t maxAneUnits) { ane::forget(key + std::to_string(maxAneUnits)); };
   model.healthy = [&backend] { return backend.healthy(); };
   return model;
 }

@@ -623,9 +623,10 @@ class BackendRegressionTests(unittest.TestCase):
             )
 
     def test_a_first_round_without_the_split_pins_the_gpu_alone(self):
-        # Each start calibrates afresh, so a candidate whose first round ran
-        # no split runs every later round on the GPU alone, as calibration
-        # found no gain, whose context is the GPU alone's too.
+        # A later start can calibrate again and find a gain the first did
+        # not, so a candidate whose first round ran no split runs every later
+        # round on the GPU alone, as calibration found no gain, whose context
+        # is the GPU alone's too.
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             self.fake_checkout(root, "baseline", "a" * 64, True)

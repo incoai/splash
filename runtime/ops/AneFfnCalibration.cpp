@@ -20,6 +20,12 @@ constexpr double kMinimumGain = 0.05;
 // a prefill, so a chunk that splits within this prefills at most about 1%
 // slower.
 constexpr double kChunkNoise = 0.02;
+// How far a check's full-chunk layers may lie from a calibration's and the
+// start still take it (Calibration::drift).
+constexpr double kCheckDrift = 0.05, kAneDrift = 0.10;
+// The first word of a Calibration's text, which a change to its fields
+// renumbers.
+constexpr std::string_view kCalibrationTag = "ane-ffn-calibration-2";
 // The GPU alone's milliseconds of a chunk's FFN layer by its rows: the line
 // through its timings, which the GPU follows within 1% between them.
 Line gpuAlone(const std::array<ChunkTimings::Gpu, 2> &gpu) {
@@ -139,6 +145,58 @@ std::optional<uint32_t> minimumRows(const ChunkTimings &timings) {
 bool splitsEvery(const ChunkTimings &timings, const ChunkTimings::Function &function) {
   // The GPU's layer takes the less the fewer rows: the least rows are the strictest.
   return function.split <= (1.0 + kChunkNoise) * gpuAlone(timings.gpu)(function.least);
+}
+
+std::string Calibration::text() const {
+  std::ostringstream text;
+  text << std::setprecision(9) << kCalibrationTag << ' ' << aneUnits << ' ' << minimumRows;
+  for (const ChunkTimings::Gpu &point : gpu) text << ' ' << point.rows << ' ' << point.milliseconds;
+  text << ' ' << split << ' ' << ane;
+  return text.str();
+}
+
+// A record holds units, least rows, the GPU alone at ascending rows and the
+// split at the most, of usable milliseconds.
+std::optional<Calibration> Calibration::parse(std::string_view text) {
+  std::istringstream in{std::string(text)};
+  std::string tag;
+  Calibration calibration;
+  in >> tag >> calibration.aneUnits >> calibration.minimumRows;
+  for (ChunkTimings::Gpu &point : calibration.gpu) in >> point.rows >> point.milliseconds;
+  in >> calibration.split >> calibration.ane;
+  std::string rest;
+  if (!in || tag != kCalibrationTag || (in >> rest)) return std::nullopt;
+  const auto &[low, high] = calibration.gpu;
+  const auto usableMilliseconds = [](double value) { return value > 0.0 && std::isfinite(value); };
+  if (!calibration.aneUnits || !calibration.minimumRows || !(low.rows < high.rows) ||
+      !usableMilliseconds(low.milliseconds) || !usableMilliseconds(high.milliseconds) ||
+      !usableMilliseconds(calibration.split) || !usableMilliseconds(calibration.ane))
+    return std::nullopt;
+  return calibration;
+}
+
+// Timings of a full chunk's layers repeat within 1-3% while a Mac runs as it
+// did when it calibrated (six of each split layer of Qwen3.8-27B on an M5 Max
+// spread over ±3%): a check more than kCheckDrift away recalibrates. The
+// Neural Engine's part can grow faster without the split layer, which the
+// GPU's part may bound: a calibration made beside other work on the Neural
+// Engine took fewer units than it would without, and a check whose Neural
+// Engine runs more than kAneDrift faster recalibrates. One that runs slower
+// costs the split only what the split layer shows.
+std::optional<std::string> Calibration::drift(const Check &check) const {
+  const auto away = [](double now, double then) { return !(std::fabs(now / then - 1.0) <= kCheckDrift); };
+  const auto said = [](const char *what, double now, double then) {
+    std::ostringstream text;
+    text << std::fixed << std::setprecision(1) << what << " took " << now << " ms against " << then
+         << " when this Mac calibrated it";
+    return text.str();
+  };
+  if (away(check.gpu, gpu[1].milliseconds))
+    return said("the GPU alone's full-chunk layer", check.gpu, gpu[1].milliseconds);
+  if (away(check.split, split)) return said("the split's full-chunk layer", check.split, split);
+  if (!(check.ane >= (1.0 - kAneDrift) * ane))
+    return said("the Neural Engine's part of the split's full-chunk layer", check.ane, ane);
+  return std::nullopt;
 }
 
 // Each layer the GPU waits for the Neural Engine's evaluation before it joins

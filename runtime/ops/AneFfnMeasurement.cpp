@@ -3,7 +3,9 @@
 #include "AwakeClock.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -59,8 +61,9 @@ Measurement::Measurement(metal::MetalBackend &backend, std::span<const SwiGluPro
 // gives a layer's milliseconds. Each layer timed stages the next one's
 // weights.
 double Measurement::layer(std::span<const SwiGluProjections> layers, uint32_t count, uint32_t rows, AneFfn *split,
-                          double standIn) {
+                          double standIn, double *ane) {
   if (!count || count >= layers.size()) throw std::invalid_argument("ANE FFN layers timed without one to stage");
+  std::vector<double> aneRuns;
   const auto command = [&] {
     metal::CommandGraph graph;
     if (split && !split->begin()) throw std::runtime_error("ANE FFN split stopped (" + split->reason() + ")");
@@ -75,15 +78,22 @@ double Measurement::layer(std::span<const SwiGluProjections> layers, uint32_t co
     const auto start = AwakeClock::now();
     if (split) {
       static_cast<void>(split->commit(graph, {}).wait());
-      if (!split->completed())
+      const std::optional<AwakeClock::duration> ran = split->completed();
+      if (!ran)
         throw std::runtime_error("ANE FFN split of " + std::to_string(rows) + " rows failed (" + split->reason() +
                                  ")");
+      aneRuns.push_back(std::chrono::duration<double, std::milli>(*ran).count() / count);
     } else {
       static_cast<void>(backend_.submitCommandAsync(graph.command()).wait());
     }
     return millisecondsSince(start) / count;
   };
-  return usable(median(command) - standIn);
+  const double milliseconds = usable(median(command) - standIn);
+  if (ane && split) {
+    std::ranges::nth_element(aneRuns, aneRuns.begin() + aneRuns.size() / 2);
+    *ane = usable(aneRuns[aneRuns.size() / 2]);
+  }
+  return milliseconds;
 }
 
 // Commands of all but the last of `layers` and of the first alone, of the
@@ -144,12 +154,25 @@ ChunkTimings Measurement::chunks(AneFfn &split) {
   // split: those of fewer rows decide nothing (minimumRows), and timing them
   // took a quarter of an M5 Max's calibration.
   for (size_t function = rows.size(); function-- > 0;) {
-    timings.functions.push_back({function ? rows[function - 1] + 1 : rows.front(), rows[function],
-                                 layer(layers_, count(rows[function]), rows[function], &split,
-                                       low.milliseconds + slope * (rows[function] - low.rows))});
-    if (!splitsEvery(timings, timings.functions.back())) break;
+    ChunkTimings::Function &timed = timings.functions.emplace_back();
+    timed.least = function ? rows[function - 1] + 1 : rows.front();
+    timed.rows = rows[function];
+    timed.split = layer(layers_, count(rows[function]), rows[function], &split,
+                        low.milliseconds + slope * (rows[function] - low.rows), &timed.ane);
+    if (!splitsEvery(timings, timed)) break;
   }
   return timings;
+}
+
+// As chunks() times its most rows: the GPU alone over them, which stands in
+// for the line through its least and its most rows there, and the split.
+Check Measurement::check(AneFfn &split) {
+  constexpr uint32_t kRows = AneFfn::kMaximumRows;
+  const auto count = static_cast<uint32_t>(std::clamp<size_t>(kCommandRows / kRows, 1, layers_.size() - 1));
+  Check check;
+  check.gpu = layer(layers_, count, kRows);
+  check.split = layer(layers_, count, kRows, &split, check.gpu, &check.ane);
+  return check;
 }
 
 } // namespace splash::ops::ane_ffn

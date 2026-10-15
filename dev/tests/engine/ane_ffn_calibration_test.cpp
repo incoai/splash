@@ -1,6 +1,6 @@
 // How the prefill FFN's Neural Engine split is calibrated (ops/AneFfnCalibration.cpp), from timings it is given: the
-// model's fit, the share it chooses, the timings it takes, the least chunk it splits and when a split that serves
-// stops for losing to the GPU alone.
+// model's fit, the share it chooses, the timings it takes, the least chunk it splits, when a split that serves stops
+// for losing to the GPU alone, and the calibration a Mac remembers and checks again.
 
 #include "TestChecks.hpp"
 #include "ops/AneFfnCalibration.hpp"
@@ -258,6 +258,45 @@ void testBreaker() {
   rejects([&] { static_cast<void>(Breaker(unusable.gpu)); }, "not usable", "a breaker took a GPU alone of 0 ms");
 }
 
+// A calibration's text reads back as it was written; a record of another tag, of fields missing, more or unusable,
+// is no calibration. A check takes it while its GPU alone and its split layer lie within 5% of the calibration's
+// either way and its Neural Engine's part runs no more than 10% faster, and otherwise names the first that moved.
+void testCalibration() {
+  const Calibration calibration{8, 1601, {{{512, 6.25}, {2048, 22.875}}}, 18.5, 14.4};
+  const std::string text = calibration.text();
+  const std::optional<Calibration> read = Calibration::parse(text);
+  require(read && read->aneUnits == 8 && read->minimumRows == 1601 && read->gpu[0].rows == 512 &&
+              read->gpu[0].milliseconds == 6.25 && read->gpu[1].rows == 2048 && read->gpu[1].milliseconds == 22.875 &&
+              read->split == 18.5 && read->ane == 14.4,
+          "a calibration did not read back as written: " + text);
+  const std::string tag = text.substr(0, text.find(' ')), fields = text.substr(text.find(' '));
+  for (const std::string &bad :
+       {std::string("ane-ffn-calibration-1") + fields, tag + " 8 1601 512 6.25 2048 22.875 18.5", text + " 1",
+        tag + " 0 1601 512 6.25 2048 22.875 18.5 14.4", tag + " 8 0 512 6.25 2048 22.875 18.5 14.4",
+        tag + " 8 1601 2048 6.25 512 22.875 18.5 14.4", tag + " 8 1601 512 6.25 2048 22.875 0 14.4",
+        tag + " 8 1601 512 6.25 2048 22.875 18.5 nan", tag + " 8 1601 512 6.25 2048 inf 18.5 14.4", std::string()})
+    require(!Calibration::parse(bad), "a record was read as a calibration: " + bad);
+
+  for (const Check &close : {Check{22.875, 18.5, 14.4}, Check{24.0, 17.6, 13.0}, Check{21.8, 19.4, 30.0}})
+    require(!calibration.drift(close), "a check within the drift was taken as drifted");
+  struct Drift {
+    Check check;
+    std::string_view said;
+  };
+  for (const Drift &drift :
+       {Drift{{24.1, 18.5, 14.4}, "the GPU alone's full-chunk layer took 24.1 ms against 22.9"},
+        Drift{{21.7, 18.5, 14.4}, "the GPU alone's full-chunk layer took 21.7 ms against 22.9"},
+        Drift{{22.875, 19.5, 14.4}, "the split's full-chunk layer took 19.5 ms against 18.5"},
+        Drift{{22.875, 18.5, 12.8}, "the Neural Engine's part of the split's full-chunk layer took 12.8 ms against "
+                                    "14.4"},
+        Drift{{22.875, 18.5, std::numeric_limits<double>::quiet_NaN()}, "the Neural Engine's part"},
+        Drift{{24.1, 17.0, 12.0}, "the GPU alone's"}}) {
+    const std::optional<std::string> said = calibration.drift(drift.check);
+    require(said && said->starts_with(drift.said) && said->ends_with(" when this Mac calibrated it"),
+            "a check that drifted was not named: " + said.value_or("taken"));
+  }
+}
+
 } // namespace
 
 int main() {
@@ -273,6 +312,7 @@ int main() {
     testNearestUnits();
     testMinimumRows();
     testBreaker();
+    testCalibration();
     std::cout << "ane ffn calibration tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

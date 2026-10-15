@@ -32,12 +32,18 @@ struct AneFfnSetting final {
   [[nodiscard]] static AneFfnSetting fromGiven(std::optional<double> share, std::optional<uint32_t> minimumRows);
 };
 
+// What a prepared split is timed for: nothing, its chunks
+// (ops::ane_ffn::Measurement::chunks) or a check of a calibration
+// (ops::ane_ffn::Measurement::check).
+enum class AneFfnTiming : uint8_t { None, Chunks, Check };
+
 // The split of a model, prepared: the split, taking every chunk its
-// functions hold; its chunks as timed, if they were; and what
+// functions hold; its chunks or its check as timed, if they were; and what
 // AneFfn::verify returned.
 struct AneFfnPrepared final {
   std::unique_ptr<ops::AneFfn> split;
   ops::ane_ffn::ChunkTimings chunks;
+  ops::ane_ffn::Check check;
   double error = 0.0;
 };
 
@@ -62,10 +68,14 @@ struct AneFfnModel final {
   // (ops::AneFfn::compiled), which calibration's choice prefers within its
   // timings' noise (ops::ane_ffn::choose); none for no preference.
   std::function<bool(uint32_t aneUnits)> compiled;
-  // The split that serves with the ANE taking `aneUnits`, verified, with its
-  // chunks timed (ops::ane_ffn::Measurement::chunks) when `timeChunks`. A
-  // model a test plays prepares no split.
-  std::function<AneFfnPrepared(uint32_t aneUnits, bool timeChunks)> prepare;
+  // The split that serves with the ANE taking `aneUnits`, verified, and
+  // timed for `timing`. A model a test plays prepares no split.
+  std::function<AneFfnPrepared(uint32_t aneUnits, AneFfnTiming timing)> prepare;
+  // This Mac's calibration of the split within `maxAneUnits` units, if one
+  // is remembered; remembering one; and forgetting it.
+  std::function<std::optional<ops::ane_ffn::Calibration>(uint32_t maxAneUnits)> recall;
+  std::function<void(uint32_t maxAneUnits, const ops::ane_ffn::Calibration &calibration)> remember;
+  std::function<void(uint32_t maxAneUnits)> forget;
   // Whether the Metal backend still serves.
   std::function<bool()> healthy;
 };
@@ -101,13 +111,18 @@ struct AneFfnStart final {
 // within the memory plan `planMemory` makes with the split's bytes set aside:
 // one whose plan still holds `requestedContextTokens`, or with zero the
 // automatic context (AneFfnOutcome::context). Every step is arithmetic until
-// the plan holds a split; then it logs that it sets the split up. Every start
-// calibrates the split within the units the plan holds: times it, chooses its
-// share (ops::ane_ffn::choose), prepares the split that serves, times its
-// chunks and finds the least it takes (ops::ane_ffn::minimumRows). The split
-// then judges itself against the GPU alone as calibrated
-// (ops::ane_ffn::Breaker); a given split takes the given least chunk and no
-// breaker. Logs the outcome. A failure leaves the GPU alone, unless `cancelled` returns true,
+// the plan holds a split; then it logs that it sets the split up. A start
+// takes this Mac's calibration of the model within the units the plan holds,
+// once remembered, while a check of it matches (ops::ane_ffn::Calibration::
+// drift): the split it chose, prepared and verified, timed over a full chunk
+// beside the GPU alone. Otherwise it calibrates the split: times it, chooses
+// its share (ops::ane_ffn::choose), prepares the split that serves, times its
+// chunks and finds the least it takes (ops::ane_ffn::minimumRows), and
+// remembers a split that gains enough, forgetting one that does not. The
+// split then judges itself against the GPU alone as calibrated
+// (ops::ane_ffn::Breaker), which forgets the calibration when it trips; a
+// given split takes the given least chunk, no breaker, and nothing
+// remembered. Logs the outcome. A failure leaves the GPU alone, unless `cancelled` returns true,
 // the wait for the ANE was interrupted or the backend no longer serves, which
 // the failure's exception reports. Throws std::invalid_argument for a given
 // split of no units or of least rows no function holds.
