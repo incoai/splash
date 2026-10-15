@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -59,8 +60,13 @@ struct Model final {
 // unit either way, is least at its longest (AneFfnCalibration.cpp); none if
 // `model` predicts no gain worth the split there on `gpuAlone` milliseconds
 // of the GPU alone.
+// With `compiled`, which tells whether the ANE's service holds the program
+// of a split of given units, a choice whose program it does not hold gives
+// way to the nearest units it does hold whose T at its longest is within
+// the timings' noise of the choice's.
 [[nodiscard]] std::optional<uint32_t> choose(const Model &model, double gpuAlone, uint32_t units,
-                                             uint32_t maxAneUnits);
+                                             uint32_t maxAneUnits,
+                                             const std::function<bool(uint32_t)> &compiled = {});
 
 // A chunk's FFN layer in milliseconds: the GPU's alone at the least and the
 // most rows of the split's functions, and the split's of each function, from
@@ -73,27 +79,50 @@ struct ChunkTimings final {
   struct Function final {
     uint32_t least = 0, rows = 0;
     double split = 0.0;
+    // The Neural Engine's own milliseconds a layer in that timing, each
+    // evaluation's from the GPU's signal to start it to its report.
+    double ane = 0.0;
   };
   std::array<Gpu, 2> gpu{};
   std::vector<Function> functions;
 };
 // The least rows of a chunk the split takes: those from which every larger
 // chunk of the functions splits (AneFfnCalibration.cpp); none when not even
-// a chunk of the most rows does.
+// a chunk of the most rows does. Functions past the first in which a chunk
+// does not split decide nothing, so `timings` may end there.
 [[nodiscard]] std::optional<uint32_t> minimumRows(const ChunkTimings &timings);
+// Whether every chunk `function` runs splits, against the GPU alone of
+// `timings`: when one does not, functions of fewer rows decide nothing.
+[[nodiscard]] bool splitsEvery(const ChunkTimings &timings, const ChunkTimings::Function &function);
 
-// What one calibration of the split on this Mac decided, which later starts
-// take again (engine::startAneFfn): the ANE's units and the least rows of a
-// chunk the split takes, none of either when no split gained enough; and the
-// GPU alone's layer at the least and the most rows of the split's functions,
-// which the breaker judges the split against.
+// The split's layer of a full chunk, the GPU alone's and the Neural
+// Engine's own part of the split's, as a start checks a remembered
+// calibration against them (Measurement::check).
+struct Check final {
+  double gpu = 0.0, split = 0.0, ane = 0.0;
+};
+
+// What a calibration of the split on this Mac decided, which later starts
+// take again while their check matches it (engine::startAneFfn): the ANE's
+// units and the least rows of a chunk the split takes; the GPU alone's layer
+// at the least and the most rows of the split's functions, which the breaker
+// judges the split against; and the split's layer of the most rows and the
+// Neural Engine's part of it, which with the GPU alone's there a check
+// compares.
 struct Calibration final {
   uint32_t aneUnits = 0, minimumRows = 0;
   std::array<ChunkTimings::Gpu, 2> gpu{};
+  double split = 0.0, ane = 0.0;
 
   // As one line of text, and back: none for text that is not such a line.
   [[nodiscard]] std::string text() const;
   [[nodiscard]] static std::optional<Calibration> parse(std::string_view text);
+  // Why `check` does not match the calibration: the GPU alone's or the
+  // split's layer of a full chunk more than 5% faster or slower than
+  // calibrated, or the Neural Engine's part more than 10% faster, as when the
+  // calibration ran beside other work on the Neural Engine; none when it
+  // matches.
+  [[nodiscard]] std::optional<std::string> drift(const Check &check) const;
 };
 
 // When a split that serves loses to the GPU alone (AneFfnCalibration.cpp):

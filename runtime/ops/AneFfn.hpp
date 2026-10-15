@@ -61,6 +61,12 @@ public:
   [[nodiscard]] static uint32_t units(std::span<const SwiGluProjections> layers);
   // The Metal memory of the split of `layers` with the ANE taking `aneUnits`.
   [[nodiscard]] static uint64_t plannedBytes(std::span<const SwiGluProjections> layers, uint32_t aneUnits);
+  // Whether the ANE's service holds the compiled program of that split, which
+  // constructing it then loads in about 0.1 s rather than compiling (9-40 s):
+  // asks the service, compiling and allocating nothing, waiting for it
+  // until `interrupted` returns true.
+  [[nodiscard]] static bool compiled(std::span<const SwiGluProjections> layers, uint32_t aneUnits,
+                                     std::function<bool()> interrupted);
 
   // The fraction of intermediate channels the ANE takes.
   [[nodiscard]] double share() const noexcept;

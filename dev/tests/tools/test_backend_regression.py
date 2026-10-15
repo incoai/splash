@@ -622,10 +622,11 @@ class BackendRegressionTests(unittest.TestCase):
                 args, "candidate", {"ane_ffn_share": 0.3, "ane_ffn_minimum_rows": 512}
             )
 
-    def test_a_first_round_without_the_split_pins_no_share(self):
-        # A candidate whose first round ran no split runs every later round
-        # as it is, not as --ane-ffn-share 0, which would serve another
-        # context.
+    def test_a_first_round_without_the_split_pins_the_gpu_alone(self):
+        # A later start can calibrate again and find a gain the first did
+        # not, so a candidate whose first round ran no split runs every later
+        # round on the GPU alone, as calibration found no gain, whose context
+        # is the GPU alone's too.
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             self.fake_checkout(root, "baseline", "a" * 64, True)
@@ -636,7 +637,7 @@ class BackendRegressionTests(unittest.TestCase):
                 for line in (root / "shares.jsonl").read_text().splitlines()
             ]
             self.assertEqual(
-                shares, [["candidate", None, None], ["candidate", None, None]]
+                shares, [["candidate", None, None], ["candidate", "0.0", None]]
             )
 
     def test_a_round_that_runs_another_ane_ffn_share_fails(self):

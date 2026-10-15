@@ -780,23 +780,26 @@ void stops(MetalBackend &backend, const Linear &linear, const Model &model, cons
     fail(label + ": the GPU's forward after the split stopped differs from the GPU's alone");
 }
 
-// A Neural Engine slower than the GPU alone, every evaluation starting kLag after its event reaches its wait: each
-// command's results are usable, the breaker given the GPU alone's layer as timed here stops the split after
+// A Neural Engine slower than the GPU alone, every evaluation starting a lag after its event reaches its wait of four
+// of the GPU alone's layers and no less than 200 ms, so that it loses on any Mac (an M4 takes 113 ms a layer), and
+// well within the handoff's 2 s for an evaluation to complete: each command's results are usable, the breaker given the GPU alone's layer as timed here stops the split after
 // ane_ffn::Breaker::kWindow commands and not before, for losing to the GPU alone, with the Neural Engine's time over
 // them counted, telling its owner once, and the GPU alone then computes, bit for bit, what it computes on its own;
 // idle, the stopped split unloads its program for good.
 void loses(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
-  constexpr auto kLag = std::chrono::milliseconds(200);
   constexpr uint32_t kRows = AneFfn::kMaximumRows, kWindow = ane_ffn::Breaker::kWindow;
   ane_ffn::ChunkTimings timings;
   for (const uint32_t index : {0u, 1u}) {
     const uint32_t rows = index ? AneFfn::kMaximumRows : AneFfn::kMinimumRows;
     timings.gpu[index] = {rows, forward(backend, linear, model, nullptr, chunk, rows).milliseconds / kLayers};
   }
-  if (!(timings.gpu[1].milliseconds < kLag.count() / 2.0))
+  const auto lag = std::max(std::chrono::milliseconds(200),
+                            std::chrono::milliseconds(
+                                static_cast<int64_t>(std::ceil(4.0 * timings.gpu[1].milliseconds))));
+  if (lag > std::chrono::milliseconds(1500))
     fail("a slow Neural Engine: the GPU alone's layer takes " + std::to_string(timings.gpu[1].milliseconds) +
-         " ms, too near the lag");
-  ane::ProgramInstrumentation::arm({.lag = kLag});
+         " ms, too long to lag the ANE four of them within the handoff's bound");
+  ane::ProgramInstrumentation::arm({.lag = lag});
   const auto split = std::make_unique<AneFfn>(backend, model.layers, kAneUnits, nullptr);
   uint32_t lost = 0;
   split->setBreaker(ane_ffn::Breaker(timings.gpu), [&] { ++lost; });
@@ -813,7 +816,7 @@ void loses(MetalBackend &backend, const Linear &linear, const Model &model, cons
     fail("a slow Neural Engine: stopped for " + split->reason());
   const AneFfn::Served served = split->served();
   if (served.commands != kWindow || served.evaluations != kWindow * kLayers ||
-      !(served.milliseconds >= 0.9 * kWindow * kLayers * kLag.count()))
+      !(served.milliseconds >= 0.9 * kWindow * kLayers * lag.count()))
     fail("a slow Neural Engine: served " + std::to_string(served.commands) + " commands, " +
          std::to_string(served.evaluations) + " evaluations in " + std::to_string(served.milliseconds) + " ms");
   const Forward alone = forward(backend, linear, model, nullptr, chunk, kRows);

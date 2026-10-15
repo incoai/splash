@@ -172,11 +172,10 @@ def run_round(tree: Path, model_root: Path, round_index: int, version: str, args
             "--progress",
             str(stem.with_suffix(".progress.jsonl")),
         ]
-        # A first round that ran no split pins none: later rounds take the
-        # outcome the build remembered, and the check holds them to it.
-        if (
-            args.ane_ffn_share_given or args.ane_ffn_share
-        ) and args.takes_ane_ffn_share[version]:
+        # A later start can calibrate the split again and find a gain the
+        # first did not, so later rounds run the first round's, the GPU alone
+        # (share 0) when it ran none.
+        if args.ane_ffn_share is not None and args.takes_ane_ffn_share[version]:
             command += ["--ane-ffn-share", repr(args.ane_ffn_share)]
             if args.ane_ffn_minimum_rows:
                 command += ["--ane-ffn-minimum-rows", str(args.ane_ffn_minimum_rows)]

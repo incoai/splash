@@ -2354,8 +2354,8 @@ int main(int argc, char **argv) {
     const uint32_t pageCount = budgetPages - budgetPages % extentPages;
     // A dense target's prefill FFN splits with the Neural Engine as a start
     // splits it (engine::startAneFfn), calibrated by the build's first run and
-    // remembered for the runs after it unless a share is given,
-    // within a plan that holds the oracle's pages. The split is allocated
+    // checked against that calibration by the runs after it unless a share is
+    // given, within a plan that holds the oracle's pages. The split is allocated
     // beside the weights, outside the governor's admissions, and its own
     // category of the plan bounds it, as the memory audit requires. A split
     // that fails fails the oracle; given share 0 runs the GPU alone. A fault

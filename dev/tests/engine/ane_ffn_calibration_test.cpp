@@ -1,6 +1,6 @@
 // How the prefill FFN's Neural Engine split is calibrated (ops/AneFfnCalibration.cpp), from timings it is given: the
-// model's fit, the share it chooses, the timings it takes, the least chunk it splits, the calibration later starts
-// take again and when a split that serves stops for losing to the GPU alone.
+// model's fit, the share it chooses, the timings it takes, the least chunk it splits, when a split that serves stops
+// for losing to the GPU alone, and the calibration a Mac remembers and checks again.
 
 #include "TestChecks.hpp"
 #include "ops/AneFfnCalibration.hpp"
@@ -97,6 +97,19 @@ void testChoice() {
           "the M6 without its bandwidth term did not choose 23 units");
 }
 
+// A choice whose program the ANE's service does not hold gives way to the nearest units it holds within 2% of the
+// choice's T at its longest: of 100 units, 33 (13.6) gives way to 32 (13.8, 1.5% longer), before 34 (14.0, 2.9% longer)
+// as near, and to nothing beyond it; a held choice, or one with no units held near it, stays.
+void testCompiledChoice() {
+  const Model model = fit({0.25, 15, 15}, {0.75, 5, 30});
+  const auto held = [&](std::vector<uint32_t> units) {
+    return choose(model, 20, 100, 99, [units](uint32_t aneUnits) { return std::ranges::count(units, aneUnits) > 0; });
+  };
+  require(held({33}) == 33u && held({}) == 33u && held({20, 50}) == 33u, "a held choice or one held near nothing moved");
+  require(held({32}) == 32u && held({32, 34}) == 32u, "the choice did not give way to units held within the noise");
+  require(held({34}) == 33u && held({31}) == 33u, "the choice gave way to units beyond the noise");
+}
+
 // Timings that put T at zero or below, or that are not numbers, choose nothing.
 void testUnusable() {
   require(!choose(fit({0.5, 1, 1}, {0.6, -0.1, 0.0}), 20, 34, 33), "T of zero chose units");
@@ -185,27 +198,18 @@ void testMinimumRows() {
            {ascending, "ascending functions"}, {gapped, "functions with a gap"}, {empty, "no functions"},
            {reversed, "GPU timings out of order"}})
     rejects([&] { static_cast<void>(minimumRows(timings)); }, "not those of its functions", what + " were taken");
-}
-
-// A calibration as a line of text comes back as it was, and one of no split as none; a line of another tag or
-// version, with more or fewer fields, units without least rows or the GPU alone out of order or unusable is not one.
-void testCalibrationText() {
-  const Calibration made{8, 655, {{{512, 5.25}, {2048, 19.375}}}};
-  const std::optional<Calibration> back = Calibration::parse(made.text());
-  require(back && back->aneUnits == 8 && back->minimumRows == 655 && back->gpu[0].rows == 512 &&
-              back->gpu[0].milliseconds == 5.25 && back->gpu[1].rows == 2048 && back->gpu[1].milliseconds == 19.375,
-          "a calibration did not come back as it was: " + made.text());
-  const std::optional<Calibration> none = Calibration::parse(Calibration{}.text());
-  require(none && !none->aneUnits && !none->minimumRows, "a calibration of no split did not come back");
-  for (const std::string_view line : {"", "ane-ffn-calibration-0 8 655 512 5.25 2048 19.375",
-                                      "ane-ffn-calibration-1 8 655 512 5.25 2048",
-                                      "ane-ffn-calibration-1 8 655 512 5.25 2048 19.375 1",
-                                      "ane-ffn-calibration-1 8 0 512 5.25 2048 19.375",
-                                      "ane-ffn-calibration-1 0 655 0 0 0 0",
-                                      "ane-ffn-calibration-1 8 655 2048 19.375 512 5.25",
-                                      "ane-ffn-calibration-1 8 655 512 0 2048 19.375",
-                                      "ane-ffn-calibration-1 8 655 512 nan 2048 19.375"})
-    require(!Calibration::parse(line), "\"" + std::string(line) + "\" was taken for a calibration");
+  // Every chunk of a function splits, or the functions below decide nothing: those timings may end there.
+  const ChunkTimings slow = functions(0.8, {{896, 1.2 * gpuAt(896)}});
+  const auto at = [&](uint32_t rows) {
+    return *std::ranges::find(slow.functions, rows, &ChunkTimings::Function::rows);
+  };
+  require(splitsEvery(slow, at(1024)) && !splitsEvery(slow, at(896)) && !splitsEvery(functions(0.8, {{640, 5.5}}),
+                                                                                       functions(0.8, {{640, 5.5}}).functions[11]),
+          "a function was not judged by its least chunk");
+  ChunkTimings ending = slow;
+  ending.functions.resize(10);
+  require(minimumRows(ending) == minimumRows(slow), "timings ending at the first function that does not split decide "
+                                                     "other least rows");
 }
 
 // The breaker against the GPU alone on the line through 8 ms at 512 rows and 20 at 2048, 4 ms + rows / 128: a window
@@ -254,6 +258,45 @@ void testBreaker() {
   rejects([&] { static_cast<void>(Breaker(unusable.gpu)); }, "not usable", "a breaker took a GPU alone of 0 ms");
 }
 
+// A calibration's text reads back as it was written; a record of another tag, of fields missing, more or unusable,
+// is no calibration. A check takes it while its GPU alone and its split layer lie within 5% of the calibration's
+// either way and its Neural Engine's part runs no more than 10% faster, and otherwise names the first that moved.
+void testCalibration() {
+  const Calibration calibration{8, 1601, {{{512, 6.25}, {2048, 22.875}}}, 18.5, 14.4};
+  const std::string text = calibration.text();
+  const std::optional<Calibration> read = Calibration::parse(text);
+  require(read && read->aneUnits == 8 && read->minimumRows == 1601 && read->gpu[0].rows == 512 &&
+              read->gpu[0].milliseconds == 6.25 && read->gpu[1].rows == 2048 && read->gpu[1].milliseconds == 22.875 &&
+              read->split == 18.5 && read->ane == 14.4,
+          "a calibration did not read back as written: " + text);
+  const std::string tag = text.substr(0, text.find(' ')), fields = text.substr(text.find(' '));
+  for (const std::string &bad :
+       {std::string("ane-ffn-calibration-1") + fields, tag + " 8 1601 512 6.25 2048 22.875 18.5", text + " 1",
+        tag + " 0 1601 512 6.25 2048 22.875 18.5 14.4", tag + " 8 0 512 6.25 2048 22.875 18.5 14.4",
+        tag + " 8 1601 2048 6.25 512 22.875 18.5 14.4", tag + " 8 1601 512 6.25 2048 22.875 0 14.4",
+        tag + " 8 1601 512 6.25 2048 22.875 18.5 nan", tag + " 8 1601 512 6.25 2048 inf 18.5 14.4", std::string()})
+    require(!Calibration::parse(bad), "a record was read as a calibration: " + bad);
+
+  for (const Check &close : {Check{22.875, 18.5, 14.4}, Check{24.0, 17.6, 13.0}, Check{21.8, 19.4, 30.0}})
+    require(!calibration.drift(close), "a check within the drift was taken as drifted");
+  struct Drift {
+    Check check;
+    std::string_view said;
+  };
+  for (const Drift &drift :
+       {Drift{{24.1, 18.5, 14.4}, "the GPU alone's full-chunk layer took 24.1 ms against 22.9"},
+        Drift{{21.7, 18.5, 14.4}, "the GPU alone's full-chunk layer took 21.7 ms against 22.9"},
+        Drift{{22.875, 19.5, 14.4}, "the split's full-chunk layer took 19.5 ms against 18.5"},
+        Drift{{22.875, 18.5, 12.8}, "the Neural Engine's part of the split's full-chunk layer took 12.8 ms against "
+                                    "14.4"},
+        Drift{{22.875, 18.5, std::numeric_limits<double>::quiet_NaN()}, "the Neural Engine's part"},
+        Drift{{24.1, 17.0, 12.0}, "the GPU alone's"}}) {
+    const std::optional<std::string> said = calibration.drift(drift.check);
+    require(said && said->starts_with(drift.said) && said->ends_with(" when this Mac calibrated it"),
+            "a check that drifted was not named: " + said.value_or("taken"));
+  }
+}
+
 } // namespace
 
 int main() {
@@ -261,14 +304,15 @@ int main() {
     testFit();
     testBandwidth();
     testChoice();
+    testCompiledChoice();
     testUnusable();
     testMostUnits();
     testNoGain();
     testUsable();
     testNearestUnits();
     testMinimumRows();
-    testCalibrationText();
     testBreaker();
+    testCalibration();
     std::cout << "ane ffn calibration tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

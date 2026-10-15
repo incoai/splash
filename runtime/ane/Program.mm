@@ -659,6 +659,30 @@ Program::~Program() {
   }
 }
 
+bool Program::compiled(std::string_view mil, std::span<const uint8_t> weights, Limits limits,
+                       const std::filesystem::path &cache) {
+  const std::string key = hex(fnv1a(weights, fnv1a(bytesOf(mil))));
+  const std::filesystem::path directory = cache / key;
+  if (!holds(directory / "model.mil", bytesOf(mil)) || !holds(directory / "weights.bin", weights)) return false;
+  // The state the service's work writes, which outlives a wait the limits end.
+  const auto impl = std::shared_ptr<Impl>(new Impl(api()), [](Impl *impl) {
+    dispatch_async(impl->api.queue, ^{
+      @autoreleasepool {
+        delete impl;
+      }
+    });
+  });
+  const auto found = std::make_shared<bool>(false);
+  runOnQueue(impl->api, limits, [impl, directory, key, found] {
+    impl->model = impl->guarded("model creation", [&] {
+      return [impl->api.model modelAtURL:[NSURL fileURLWithPath:@(directory.c_str()) isDirectory:YES]
+                                     key:@(key.c_str())];
+    });
+    *found = impl->model && impl->compiled();
+  });
+  return *found;
+}
+
 uint32_t Program::procedure(std::string_view function) const {
   const auto found = std::ranges::find(impl_->procedures, function, &Procedure::function);
   if (found == impl_->procedures.end())

@@ -908,14 +908,26 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
     });
     return timings;
   };
-  model.prepare = [&backend, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
+  model.compiled = [layers, cancelled](uint32_t aneUnits) {
+    try {
+      return ops::AneFfn::compiled(*layers, aneUnits, cancelled);
+    } catch (const ane::Interrupted &) {
+      throw;
+    } catch (const std::exception &) {
+      return false;
+    }
+  };
+  model.prepare = [&backend, layers, cancelled, onArena](uint32_t aneUnits, AneFfnTiming timing) {
     AneFfnPrepared prepared;
     onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
       prepared.split = std::make_unique<ops::AneFfn>(backend, *layers, aneUnits, cancelled);
       prepared.error = prepared.split->verify(*layers, ffn, hidden);
-      if (timeChunks)
-        prepared.chunks =
-            ops::ane_ffn::Measurement(backend, *layers, ffn, hidden, cancelled).chunks(*prepared.split);
+      if (timing == AneFfnTiming::None) return;
+      ops::ane_ffn::Measurement measurement(backend, *layers, ffn, hidden, cancelled);
+      if (timing == AneFfnTiming::Chunks)
+        prepared.chunks = measurement.chunks(*prepared.split);
+      else
+        prepared.check = measurement.check(*prepared.split);
     });
     return prepared;
   };

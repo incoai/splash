@@ -30,16 +30,20 @@ public:
   [[nodiscard]] Timings time();
   // The GPU alone over the least and the most rows of `split`'s functions,
   // and `split` over a chunk of the rows of each of its functions, on the
-  // first layers.
+  // first layers, from the most rows down to the first function in which a
+  // chunk does not split (splitsEvery).
   [[nodiscard]] ChunkTimings chunks(AneFfn &split);
+  // The GPU alone and `split` over a full chunk, as chunks() times them, with
+  // the Neural Engine's part: what a start checks a calibration against.
+  [[nodiscard]] Check check(AneFfn &split);
 
 private:
   // The per-layer milliseconds of `count` `rows`-row FFN layers of `layers`
   // from the first, fewer than all of them (AneFfnMeasurement.cpp): the
-  // GPU's alone without `split`, or `split`'s less `standIn`; and of
-  // `split`'s GPU part alone of full chunks.
+  // GPU's alone without `split`, or `split`'s less `standIn`, and in `ane`
+  // the Neural Engine's own; and of `split`'s GPU part alone of full chunks.
   [[nodiscard]] double layer(std::span<const SwiGluProjections> layers, uint32_t count, uint32_t rows,
-                             AneFfn *split = nullptr, double standIn = 0.0);
+                             AneFfn *split = nullptr, double standIn = 0.0, double *ane = nullptr);
   [[nodiscard]] double gpuPart(std::span<const SwiGluProjections> layers, AneFfn &split);
 
   metal::MetalBackend &backend_;
