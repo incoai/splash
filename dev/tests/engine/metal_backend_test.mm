@@ -2169,7 +2169,7 @@ void run(const std::string &metallibPath) {
             "recommended working set capability is missing");
     require(capabilities.maxBufferLengthBytes > 0,
             "maximum buffer length capability is missing");
-    require(capabilities.appleGpuFamily >= 9,
+    require(capabilities.appleGpuFamily >= 7,
             "Apple GPU family capability is missing");
     require(capabilities.maxThreadgroupMemoryBytes >= 32 * 1024,
             "threadgroup memory capability is insufficient");

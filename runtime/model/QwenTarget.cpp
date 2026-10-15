@@ -420,7 +420,7 @@ public:
       const metal::MetalBuffer residual = std::visit(
           [&](const auto &mixer) {
             const ops::PreparedInput normalized = ops::Normalization::addRms(
-                step.graph, input, layer.inputNorm, buffers.normalized, geometry_.hiddenSize, step.rows,
+                backend_, step.graph, input, layer.inputNorm, buffers.normalized, geometry_.hiddenSize, step.rows,
                 buffers.linearScratch, decodeInput(mixer.inputProjection, step.lanes));
             const BlockOutput block{mixerOutput(buffers, mixer), input};
             addVerifyMixer(step, mixer, normalized, block);
@@ -439,7 +439,7 @@ public:
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
                     metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const override {
     const ops::PreparedInput normalized = ops::Normalization::addRms(
-        graph, std::move(hidden), weights_.finalNorm, finalHidden, geometry_.hiddenSize, lanes * kVerifyRows,
+        backend_, graph, std::move(hidden), weights_.finalNorm, finalHidden, geometry_.hiddenSize, lanes * kVerifyRows,
         scratch, decodeInput(vocabularyProjection(), lanes));
     addDecodeProjection(graph, std::move(finalHidden), vocabularyProjection(), std::move(logits), lanes, scratch,
                         normalized);
@@ -457,7 +457,7 @@ private:
     const Layer &layer = weights_.layers[index];
     const QwenTargetPrefillBuffers &b = step.buffers;
     const metal::MetalBuffer input = b.hidden[index & 1];
-    ops::Normalization::addRms(step.graph, input, layer.inputNorm, b.normalized, geometry_.hiddenSize, step.rows);
+    ops::Normalization::addRms(backend_, step.graph, input, layer.inputNorm, b.normalized, geometry_.hiddenSize, step.rows);
     const metal::MetalBuffer residual = std::visit(
         [&](const auto &mixer) {
           const BlockOutput block{mixerOutput(b, mixer), input};
@@ -484,7 +484,7 @@ private:
   // routed work addPrefillExperts adds.
   void addPrefillFfn(PrefillStep &step, uint32_t index, const Qwen3_8LayerWeights &layer,
                      metal::MetalBuffer residual, metal::MetalBuffer output) const {
-    ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, step.buffers.normalized,
+    ops::Normalization::addRms(backend_, step.graph, residual, layer.postAttentionNorm, step.buffers.normalized,
                                geometry_.hiddenSize, step.rows);
     const ops::PrefillFfnBuffers ffn = step.buffers.ffn();
     if (step.aneFfn)
@@ -497,7 +497,7 @@ private:
   void addPrefillFfn(PrefillStep &step, uint32_t, const Qwen3_6MoeLayerWeights &layer,
                      metal::MetalBuffer residual, metal::MetalBuffer output) const {
     const QwenTargetPrefillBuffers &b = step.buffers;
-    ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize,
+    ops::Normalization::addRms(backend_, step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize,
                                step.rows);
     step.ffn = {b.normalized, residual, output, b.moe, {}};
     ops::MoE::addRouting(step.graph, step.ffn, layer.ffn, *step.moe);
@@ -510,7 +510,7 @@ private:
     const ops::LinearPlan gateUpPlan =
         linear.decodePlan(layer.upProjection, step.lanes, ops::LinearEpilogue::GateUp, &layer.gateProjection);
     const ops::PreparedInput normalized = ops::Normalization::addRms(
-        step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize, step.rows,
+        backend_, step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize, step.rows,
         b.linearScratch, gateUpPlan.input());
     linear.add(step.graph,
                {.input = b.normalized, .output = b.denseIntermediate, .gateScratch = b.denseGateScratch,
@@ -524,7 +524,7 @@ private:
   void addVerifyFfn(VerifyStep &step, const Qwen3_6MoeLayerWeights &layer, metal::MetalBuffer residual,
                     metal::MetalBuffer output) const {
     const QwenTargetVerifyBuffers &b = step.buffers;
-    ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize,
+    ops::Normalization::addRms(backend_, step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize,
                                step.rows);
     ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, b.verifyRows}, layer.ffn, *step.moe);
   }

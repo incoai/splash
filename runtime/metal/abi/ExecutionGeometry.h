@@ -65,3 +65,13 @@
 #define SPLASH_STAGED_NORM_WIDTH 2048u
 #define SPLASH_STAGED_NORM_ROWS 64u
 #define SPLASH_STAGED_NORM_THREADS 1024u
+
+// The staged RMS norm's parameters: the row's width and the thread count its
+// staging/output loops stride by. The driver caps the pipeline's total
+// threads below the design width on some families (under validation, on
+// Apple7), so the host passes the dispatch's width and the kernel strides by
+// it; the reduction uses the first 256 threads, which every width holds.
+struct NormParams {
+  unsigned int width;
+  unsigned int threads;
+};

@@ -1242,9 +1242,9 @@ class LauncherTests(unittest.TestCase):
 
     def test_unsupported_mac_is_refused_before_any_download(self):
         reason = (
-            "Splash needs Apple GPU family 9 or newer (M3 or later) on macOS 26.4 "
-            "or newer; this Mac has Apple M2 Max (Apple GPU family 8) on macOS "
-            "26.4.1 (apple_gpu_family_9_required)"
+            "Splash needs Apple GPU family 7 or newer (M1 or later) on macOS 26.4 "
+            "or newer; this Mac has Apple A13 GPU (Apple GPU family 6) on macOS "
+            "26.4.1 (apple_gpu_family_7_required)"
         )
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

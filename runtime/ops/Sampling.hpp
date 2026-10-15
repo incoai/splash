@@ -147,7 +147,7 @@ struct AcceptanceBuffers final {
 // stop tokens. The draft's own selector is ops::DraftSelector.
 class Sampling final {
 public:
-  explicit Sampling(uint32_t vocabulary);
+  Sampling(metal::MetalBackend &backend, uint32_t vocabulary);
 
   // Exact scratch/output bytes for the fixed precompiled sampling ABI.
   // Counts may cover one lane or a batch of lanes; the operator owns sharding.
@@ -235,6 +235,7 @@ private:
   void addSelection(metal::CommandGraph &graph, const TargetSamplingParams &selection,
                     std::span<const SamplingPolicy> policies, const SamplingBuffers &buffers) const;
 
+  metal::MetalBackend &backend_;
   uint32_t vocabulary_ = 0;
   uint32_t maskWords_ = 0;
 };

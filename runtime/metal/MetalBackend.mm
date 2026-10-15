@@ -1894,6 +1894,11 @@ void MetalBackend::preparePipelines(
     static_cast<void>(impl_->prepare(dispatches));
 }
 
+uint32_t MetalBackend::pipelineMaxThreads(std::string_view name) const {
+    checkOperation();
+    return impl_->pipeline(name).maxTotalThreadsPerThreadgroup;
+}
+
 MetalMemoryStats MetalBackend::memoryStats() const noexcept {
     // Reading MTLDevice.currentAllocatedSize can synchronize with an active
     // command on some Apple GPUs. Every allocation and command lifecycle

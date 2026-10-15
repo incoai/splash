@@ -349,10 +349,12 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
         : LinearConfig{.tile = LinearTile::GgufPrefill};
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging but for the projections apple9Stages names; Apple10
-  // runs it on narrow grids (apple10Registers).
+  // runs it on narrow grids (apple10Registers). The Legacy families never
+  // take the register tile and stage everywhere.
   const bool spreads = spreadsStagedDecode(family_, gpuCores_),
              onePass = spreads && w.epilogue == LinearEpilogue::GateUp && oneFormat(projections);
-  if (shape.registerFormats && everyQuantizedSegment(projections, registerTileTakes) &&
+  if (family_ != GpuFamilyClass::Legacy && shape.registerFormats &&
+      everyQuantizedSegment(projections, registerTileTakes) &&
       (family_ == GpuFamilyClass::Apple9
            ? !apple9Stages(w, projections)
            : apple10Registers(w.rows, onePass ? 2 * n : n, gpuCores_,

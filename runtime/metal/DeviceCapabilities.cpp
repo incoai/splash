@@ -31,7 +31,7 @@ std::optional<std::string> DeviceCapabilities::validationError() const {
         return "recommended_working_set_exceeds_physical_memory";
     }
     if (!maxBufferLengthBytes) return "max_buffer_length_unavailable";
-    if (appleGpuFamily < kMinimumAppleGpuFamily) return "apple_gpu_family_9_required";
+    if (appleGpuFamily < kMinimumAppleGpuFamily) return "apple_gpu_family_7_required";
     if (maxThreadgroupMemoryBytes < 32 * 1024) {
         return "threadgroup_memory_below_32_kib";
     }
@@ -46,13 +46,13 @@ std::optional<std::string> DeviceCapabilities::validationMessage() const {
     const std::optional<std::string> error = validationError();
     if (!error) return std::nullopt;
     // People know their chip, not its GPU family.
-    static_assert(kMinimumAppleGpuFamily == 9, "name the family's first chip");
+    static_assert(kMinimumAppleGpuFamily == 7, "name the family's first chip");
     const std::string family =
         appleGpuFamily ? "Apple GPU family " + std::to_string(appleGpuFamily)
                        : "no known Apple GPU family";
     return "Splash needs Apple GPU family " +
            std::to_string(kMinimumAppleGpuFamily) +
-           " or newer (M3 or later) on macOS " +
+           " or newer (M1 or later) on macOS " +
            std::to_string(kMinimumMacosMajor) + '.' +
            std::to_string(kMinimumMacosMinor) + " or newer; this Mac has " +
            deviceName + " (" + family + ") on macOS " + macosVersion() + " (" +
