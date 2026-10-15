@@ -26,12 +26,11 @@ static_assert(model::ExecutionLimits::maximumBatchWidth ==
               SPLASH_MAXIMUM_BATCH_WIDTH);
 static_assert(model::ExecutionLimits::prefillTokenBudget ==
               SPLASH_PREFILL_TOKEN_BUDGET);
-static_assert(model::ExecutionLimits::draftQueryRows ==
-              SPLASH_DRAFT_QUERY_ROWS);
-static_assert(model::ExecutionLimits::draftProposalTokens ==
-              SPLASH_DRAFT_PROPOSAL_TOKENS);
-static_assert(model::ExecutionLimits::targetVerifyRows ==
-              SPLASH_TARGET_VERIFY_ROWS);
+static_assert(model::ExecutionLimits::rowBlock == SPLASH_ROW_BLOCK);
+static_assert(model::ExecutionLimits::maximumVerifyRows ==
+              SPLASH_MAXIMUM_VERIFY_ROWS);
+static_assert(model::ExecutionLimits::maximumCycleRows ==
+              SPLASH_MAXIMUM_CYCLE_ROWS);
 static_assert(model::ExecutionLimits::draftContextTokens ==
               SPLASH_DRAFT_SLIDING_WINDOW);
 static_assert(model::ExecutionLimits::speculativeScratchTokens ==

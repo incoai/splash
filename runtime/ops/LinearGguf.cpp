@@ -108,9 +108,9 @@ bool oneFormat(std::span<const Projection *const> projections) {
 }
 
 // Whether Apple9 decodes a plan's projections (a gate/up plan's two) on the
-// staged tile: where it holds the lanes' rows unpadded, so the plan binds the
+// staged tile: where it holds the rows unpadded, so the plan binds the
 // register tile's rows, and every quantized segment is in a format of
-// apple9StagesFormat, or in Q2_K from two lanes. On a 40-core M3 Max at
+// apple9StagesFormat, or in Q2_K from two row blocks. On a 40-core M3 Max at
 // 17408x5120 and 5120x17408, best split of each tile, the staged tile takes
 // 6-21% less time on those formats at one lane, 2-11% at two and 2-9% at
 // four, and on Q2_K 24-33% less at two and four lanes but 5-8% more at one.
@@ -119,14 +119,14 @@ bool oneFormat(std::span<const Projection *const> projections) {
 // A segment in a format the register tile cannot take (quant_register_format)
 // stages the plan whatever its rows.
 bool apple9Stages(LinearWorkload w, std::span<const Projection *const> projections) {
-  const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
+  const uint32_t blocks = w.rows / SPLASH_ROW_BLOCK;
   bool quantized = false, faster = true;
   for (const Projection *p : projections) {
     if (!p) continue;
     for (const QuantizedSegment &s : p->blocks().segments) {
       if (s.isFloat()) continue;
       if (!quant_register_format(s.formatId)) return true;
-      faster &= apple9StagesFormat(s.formatId) || (s.formatId == GGUF_FMT_Q2K && lanes >= 2);
+      faster &= apple9StagesFormat(s.formatId) || (s.formatId == GGUF_FMT_Q2K && blocks >= 2);
       quantized = true;
     }
   }
@@ -490,15 +490,16 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
   }
 }
 
-// All lanes in each threadgroup, decode only: single tensors and gate/up
-// through addDecodeTensor, fused projections through fusedSegments.
+// All rows in each threadgroup, decode only: single tensors and gate/up
+// through addDecodeTensor, fused projections through fusedSegments. The
+// kernels hold the rows in blocks (gguf_decode_sg_*_l<blocks>).
 void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
                              const Projection &p, const LinearPlan &plan,
                              const Projection *gate) const {
   const LinearWorkload w = plan.workload();
   const LinearConfig config = plan.configuration();
   const auto [n, k] = w.matrix;
-  const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
+  const uint32_t blocks = w.rows / SPLASH_ROW_BLOCK;
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
   for (const Projection *q : {&p, gate})
     if (q)
@@ -507,9 +508,9 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
           throw std::invalid_argument(std::string("the register tile does not take ") + s.name() + " weights");
   if (b.prepared.layout != LinearInput::Table16 || !b.prepared.source.sameView(b.input))
     graph.add("decode_linear_gguf_prepare", {b.input, b.scratch.input, b.scratch.sums}, k,
-              {k / 32, lanes, 1}, {128, 1, 1});
+              {k / 32, blocks, 1}, {128, 1, 1});
   const metal::DispatchSize grid{segmentColumns(p) / GGUF_TILE_COLUMNS, config.splits, 1};
-  const std::string suffix = "_l" + std::to_string(lanes);
+  const std::string suffix = "_l" + std::to_string(blocks);
   const auto [partials, counters] = splitScratch(b, config.splits);
   if (segments.size() > 1) {
     std::vector<const QuantizedSegment *> order;

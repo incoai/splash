@@ -14,7 +14,6 @@ namespace splash::ops {
 namespace {
 
 constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-constexpr uint32_t kRows = SPLASH_DRAFT_QUERY_ROWS;
 constexpr uint32_t kWindow = SPLASH_DRAFT_SLIDING_WINDOW;
 constexpr uint32_t kThreads = metal::CommandGraph::kDefaultThreads;
 constexpr uint32_t kWindowThreads = SPLASH_DRAFT_CONTEXT_SIMDGROUPS * 32;
@@ -33,7 +32,7 @@ uint32_t phaseGroups(uint64_t elements, uint32_t tasks = 0) {
 
 // The grouped query rows alone, without the split partials behind them.
 uint64_t queryRowsBytes(const DraftAttentionPlan &plan) {
-  return uint64_t{plan.lanes()} * kRows * plan.shape().attentionSize * 2;
+  return uint64_t{plan.lanes()} * plan.rows() * plan.shape().attentionSize * 2;
 }
 
 // One lane's keys, or values, of one layer: the kernels place a position in
@@ -97,20 +96,24 @@ enum class KernelLayout : uint8_t { Hidden5120, Hidden2048 };
 
 } // namespace
 
+// The core leaves a partial per row block, KV head and split.
 DraftAttentionWorkspace DraftAttentionPlan::workspace() const noexcept {
-  const uint64_t rows = uint64_t{lanes_} * kRows;
+  const uint64_t rows = uint64_t{lanes_} * rows_;
   const uint64_t kvBytes = rows * shape_.kvHeads * shape_.headDimension * 2;
   const uint64_t partialBytes =
-      uint64_t{lanes_} * shape_.kvHeads * kSplits * kPartialBytes;
+      rows / SPLASH_ROW_BLOCK * shape_.kvHeads * kSplits * kPartialBytes;
   return {rows * shape_.hiddenSize * 2, rows * shape_.qkvSize * 2,
           rows * shape_.attentionSize * 2 + partialBytes, kvBytes, kvBytes};
 }
 
 DraftAttentionPlan DraftAttention::plan(DraftAttentionShape shape,
-                                        uint32_t lanes) {
+                                        uint32_t lanes, uint32_t rows) {
   requireLanes(lanes);
   static_cast<void>(kernelShape(shape));
-  return {shape, lanes};
+  // The attention core is compiled for one row block per lane.
+  if (rows != SPLASH_ROW_BLOCK)
+    throw std::invalid_argument("unsupported draft query rows");
+  return {shape, lanes, rows};
 }
 
 void DraftAttention::addConvolution(metal::CommandGraph &graph,
@@ -128,17 +131,17 @@ void DraftAttention::addConvolution(metal::CommandGraph &graph,
   }
   const auto shape = plan.shape();
   const auto workspace = plan.workspace();
-  const uint32_t groups = phaseGroups(uint64_t{kRows} * shape.hiddenSize);
+  const uint32_t groups = phaseGroups(uint64_t{plan.rows()} * shape.hiddenSize);
   const uint32_t lanes = plan.lanes();
   requireBytes(buffers.input, workspace.convolutionBytes, "draft convolution input");
   requireBytes(buffers.output, workspace.convolutionBytes, "draft convolution output");
   requireBytes(buffers.residual, workspace.convolutionBytes, "draft convolution residual");
-  requireBytes(buffers.dynamic, uint64_t{lanes} * kRows * shape.dynamicSize * 2, "draft dynamic convolution");
+  requireBytes(buffers.dynamic, uint64_t{lanes} * plan.rows() * shape.dynamicSize * 2, "draft dynamic convolution");
   requireBytes(buffers.weights,
                uint64_t{SPLASH_DRAFT_CONVOLUTION_STAGES} * SPLASH_DRAFT_CONVOLUTION_TAPS * shape.hiddenSize * 2,
                "draft convolution weight");
   const KernelLayout kernel = kernelShape(shape);
-  const DraftConvBatchParams params{finish};
+  const DraftConvBatchParams params{finish, plan.rows()};
   graph.add(kernel == KernelLayout::Hidden5120 ? "draft_conv"
                                                : "draft_conv_h2048",
             {std::move(buffers.input), std::move(buffers.dynamic),
@@ -154,9 +157,10 @@ void DraftAttention::addPrepare(metal::CommandGraph &graph,
   const auto workspace = plan.workspace();
   // The prepare kernel copies one element of the value rows per thread and
   // normalizes one (row, head) per group.
+  const uint32_t rows = plan.rows();
   const uint32_t groups = phaseGroups(
-      uint64_t{kRows} * shape.kvHeads * shape.headDimension,
-      kRows * (shape.queryHeads + shape.kvHeads));
+      uint64_t{rows} * shape.kvHeads * shape.headDimension,
+      rows * (shape.queryHeads + shape.kvHeads));
   const uint32_t lanes = plan.lanes();
   requireBytes(buffers.qkv, workspace.qkvBytes, "draft q/k/v");
   requireBytes(buffers.groupedQueries, queryRowsBytes(plan), "draft grouped queries");
@@ -164,7 +168,7 @@ void DraftAttention::addPrepare(metal::CommandGraph &graph,
   requireBytes(buffers.queryValues, workspace.queryValuesBytes, "draft query values");
   requireBytes(buffers.queryNorm, uint64_t{shape.headDimension} * 2, "draft query norm");
   requireBytes(buffers.keyNorm, uint64_t{shape.headDimension} * 2, "draft key norm");
-  const uint64_t ropeBytes = uint64_t{lanes} * kRows * SPLASH_DRAFT_ROPE_PAIRS * 4;
+  const uint64_t ropeBytes = uint64_t{lanes} * rows * SPLASH_DRAFT_ROPE_PAIRS * 4;
   requireBytes(buffers.ropeCos, ropeBytes, "draft RoPE cosine");
   requireBytes(buffers.ropeSin, ropeBytes, "draft RoPE sine");
   graph.add("draft_attention_qkv",
@@ -172,7 +176,7 @@ void DraftAttention::addPrepare(metal::CommandGraph &graph,
              std::move(buffers.queryNorm), std::move(buffers.keyNorm),
              std::move(buffers.ropeCos), std::move(buffers.ropeSin),
              std::move(buffers.queryKeys), std::move(buffers.queryValues)},
-            {groups, lanes, 1});
+            rows, {groups, lanes, 1});
 }
 
 void DraftAttention::addDecode(
@@ -215,12 +219,12 @@ void DraftAttention::addReorder(metal::CommandGraph &graph,
                                 const DraftAttentionPlan &plan) {
   const auto shape = plan.shape();
   const uint32_t groups =
-      phaseGroups(uint64_t{kRows} * shape.queryHeads * shape.headDimension);
+      phaseGroups(uint64_t{plan.rows()} * shape.queryHeads * shape.headDimension);
   const uint32_t lanes = plan.lanes();
   requireBytes(grouped, queryRowsBytes(plan), "draft grouped attention");
   requireBytes(rowMajor, queryRowsBytes(plan), "draft attention");
   graph.add("draft_attention_reorder", {std::move(grouped), std::move(rowMajor)},
-            {groups, lanes, 1});
+            plan.rows(), {groups, lanes, 1});
 }
 
 void DraftAttention::addContextPrefill(
@@ -249,16 +253,18 @@ void DraftAttention::addContextCommit(
     std::span<const metal::MetalBuffer> persistentKeys,
     std::span<const metal::MetalBuffer> persistentValues,
     metal::MetalBuffer retainedCounts,
-    std::span<const uint32_t> startPositions, DraftAttentionShape shape) {
+    std::span<const uint32_t> startPositions, uint32_t rows,
+    DraftAttentionShape shape) {
   const auto lanes = static_cast<uint32_t>(startPositions.size());
   requireLanes(lanes);
   static_cast<void>(kernelShape(shape));
   if (persistentKeys.size() != kMaximumLanes ||
-      persistentValues.size() != kMaximumLanes)
+      persistentValues.size() != kMaximumLanes || !rows ||
+      rows > SPLASH_MAXIMUM_VERIFY_ROWS)
     throw std::invalid_argument("invalid draft context commit geometry");
-  // Each lane commits up to its eight verify rows.
+  // Each lane commits up to its `rows` verify rows.
   requireContextInputs(contextKv, keyNorm, ropeCos, ropeSin,
-                       uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS, shape);
+                       uint64_t{lanes} * rows, shape);
   requireBytes(retainedCounts, uint64_t{lanes} * sizeof(uint32_t), "draft retained counts");
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     requireBytes(persistentKeys[lane], ringBytes(shape), "draft key ring");
@@ -267,6 +273,7 @@ void DraftAttention::addContextCommit(
   DraftContextBatchParams params{};
   std::copy(startPositions.begin(), startPositions.end(),
             std::begin(params.start_position));
+  params.rows = rows;
   std::vector<metal::MetalBuffer> bindings{
       std::move(contextKv), std::move(keyNorm), std::move(ropeCos),
       std::move(ropeSin)};
@@ -274,8 +281,7 @@ void DraftAttention::addContextCommit(
   appendLaneBindings(bindings, persistentKeys, persistentValues);
   bindings.push_back(std::move(retainedCounts));
   graph.add("draft_context_kv_commit", std::move(bindings), params,
-            {uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS * shape.kvHeads, 1,
-             1});
+            {uint64_t{lanes} * rows * shape.kvHeads, 1, 1});
 }
 
 uint64_t DraftAttention::contextWindowBytes(uint32_t width) {

@@ -53,11 +53,11 @@ inline TargetRow selected_row(device const float *logits,
                               constant TargetSamplingParams &params, uint s) {
   const uint lane = selected_lane(params, s);
   const uint index = s % params.rows;
-  return {logits + (ulong(lane) * SPLASH_TARGET_VERIFY_ROWS +
-                    params.logits_row + index) *
+  return {logits + (ulong(lane) * params.lane_rows + params.logits_row +
+                    index) *
                        params.vocabulary,
-          token_mask + (ulong(lane) * (SPLASH_TARGET_VERIFY_ROWS + 1) +
-                        params.mask_row + index) *
+          token_mask + (ulong(lane) * SPLASH_MASK_ROWS + params.mask_row +
+                        index) *
                            params.mask_words,
           (params.constrained_mask & (1u << lane)) != 0,
           (params.exclude_stop_mask & (1u << lane)) != 0,
@@ -900,12 +900,13 @@ kernel void decode_sample_vocabulary_draw(
   // A drafted row follows its draft token, the next verify input row.
   const bool drafted = index < params.drafted_rows;
   const ulong position =
-      ulong(batch) * SPLASH_DRAFT_PROPOSAL_TOKENS + (drafted ? index : 0);
+      ulong(batch) * (params.lane_rows - 1) + (drafted ? index : 0);
   uint token;
   float draft_probability;
   if (vocabulary_draw(
           row, {record.end_key, record.end_last}, drafted,
-          drafted ? input_tokens[s + 1] : 0u,
+          drafted ? input_tokens[ulong(batch) * params.lane_rows + index + 1]
+                  : 0u,
           draft_ids + position * kDraftCandidates,
           draft_probabilities + position * kDraftCandidates,
           uniforms[ulong(batch) * SPLASH_SAMPLING_UNIFORMS + params.uniform],
@@ -956,7 +957,7 @@ inline void penalize_token(device float *logits, device const uint *words,
     return;
   device float *column =
       logits +
-      (ulong(params.logits_lane[entry]) * SPLASH_TARGET_VERIFY_ROWS +
+      (ulong(params.logits_lane[entry]) * params.lane_rows +
        params.row_offset) * params.vocabulary +
       token;
   for (uint row = 0; row < params.rows; ++row) {
@@ -983,7 +984,7 @@ kernel void decode_sample_penalize(device float *logits [[buffer(0)]],
 }
 
 // The verify rows of each penalized lane, whose contexts add the lane's
-// draft tokens (verify input rows 1..7) one row at a time.
+// draft tokens (its verify input rows from 1) one row at a time.
 kernel void decode_sample_penalize_verify(
     device float *logits [[buffer(0)]], device const uint *words [[buffer(1)]],
     device const uint *input_tokens [[buffer(2)]],
@@ -994,9 +995,9 @@ kernel void decode_sample_penalize_verify(
   if (token >= params.vocabulary || entry >= params.entries)
     return;
   device const uint *inputs =
-      input_tokens + ulong(params.logits_lane[entry]) * SPLASH_TARGET_VERIFY_ROWS;
+      input_tokens + ulong(params.logits_lane[entry]) * params.lane_rows;
   uint drafted = 0;
-  for (uint row = 1; row < SPLASH_TARGET_VERIFY_ROWS; ++row)
+  for (uint row = 1; row < params.rows; ++row)
     drafted |= uint(inputs[row] == token) << row;
   penalize_token(logits, words, token, entry, drafted, params);
 }
@@ -1052,21 +1053,21 @@ kernel void draft_select_top16_sharded(
     device const float *logits [[buffer(0)]],
     device uint *partial_ids [[buffer(1)]],
     device float *partial_values [[buffer(2)]],
-    constant uint &vocabulary [[buffer(3)]],
+    constant SelectorBatchParams &params [[buffer(3)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
-  constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
   constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
   constexpr uint K = SPLASH_DRAFT_CANDIDATES;
   constexpr uint VectorTokens = 4, ChunkVectors = 16;
-  uint batch = group / (Positions * Shards);
-  uint local = group % (Positions * Shards);
+  const uint vocabulary = params.vocabulary;
+  const uint positions = params.rows - 1;
+  uint batch = group / (positions * Shards);
+  uint local = group % (positions * Shards);
   uint position = local / Shards;
   uint shard = local % Shards;
-  ulong row_start = (ulong(batch) * Rows + position + 1) * vocabulary;
+  ulong row_start = (ulong(batch) * params.rows + position + 1) * vocabulary;
   uint shard_tokens = (vocabulary + Shards - 1) / Shards;
   uint begin = min(shard * shard_tokens, vocabulary);
   uint end = min(begin + shard_tokens, vocabulary);
@@ -1229,13 +1230,12 @@ kernel void draft_select_edges(
     uint threads [[threads_per_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
-  constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
   constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
   constexpr uint Candidates = SPLASH_DRAFT_CANDIDATES;
   constexpr uint Rank = SPLASH_DRAFT_SELECTOR_RANK;
-  uint batch = row / Positions;
-  uint position = row % Positions;
+  const uint positions = params.rows - 1;
+  uint batch = row / positions;
+  uint position = row % positions;
   threadgroup uint successors[Candidates];
   threadgroup uint predecessors[Candidates];
   if (simd_group == 0) {
@@ -1265,10 +1265,10 @@ kernel void draft_select_edges(
   constexpr uint TaskCandidates = 8, Dims = Rank / 32;
   uint tasks = (position > 0 ? Candidates : 1) * (Candidates / TaskCandidates);
   device float *table = partial_values +
-                        ulong(params.lanes) * Positions * Shards * Candidates +
+                        ulong(params.lanes) * positions * Shards * Candidates +
                         ulong(row) * Candidates * Candidates;
   device const bfloat *row_hidden =
-      hidden + (ulong(batch) * Rows + position + 1) * Rank;
+      hidden + (ulong(batch) * params.rows + position + 1) * Rank;
   for (uint task = simd_group; task < tasks; task += threads / 32) {
     uint predecessor_index = task / (Candidates / TaskCandidates);
     uint first_candidate =
@@ -1302,8 +1302,8 @@ kernel void draft_select_edges(
   }
 }
 
-// One thread per lane walks the seven positions: the score of a candidate is
-// its unary score plus the edge from the previously chosen candidate, read
+// One thread per lane walks its proposal positions: the score of a candidate
+// is its unary score plus the edge from the previously chosen candidate, read
 // from the table draft_select_edges left in the partial-values scratch.
 kernel void draft_select_dflash(
     device const uint *candidates [[buffer(0)]],
@@ -1313,21 +1313,21 @@ kernel void draft_select_dflash(
     device uint *tokens [[buffer(4)]], device float *q_probs [[buffer(5)]],
     constant SelectorBatchParams &params [[buffer(6)]],
     uint batch [[thread_position_in_grid]]) {
-  constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
   constexpr ulong Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
   constexpr ulong Candidates = SPLASH_DRAFT_CANDIDATES;
-  candidates += batch * Positions * Candidates;
-  unary += batch * Positions * Candidates;
+  const ulong positions = params.rows - 1;
+  candidates += batch * positions * Candidates;
+  unary += batch * positions * Candidates;
   device const float *tables = partial_values +
-                               params.lanes * Positions * Shards * Candidates +
-                               batch * Positions * Candidates * Candidates;
+                               params.lanes * positions * Shards * Candidates +
+                               batch * positions * Candidates * Candidates;
   uniforms += batch * SPLASH_SAMPLING_UNIFORMS;
-  tokens += batch * Positions;
-  q_probs += batch * Positions * Candidates;
+  tokens += batch * positions;
+  q_probs += batch * positions * Candidates;
 
   const bool sampling = (params.sampling_mask & (1u << batch)) != 0;
   uint predecessor_index = 0;
-  for (uint position = 0; position < Positions; ++position) {
+  for (uint position = 0; position < positions; ++position) {
     device const float *edges =
         tables + (position * Candidates + predecessor_index) * Candidates;
     float scores[Candidates];
@@ -1380,6 +1380,7 @@ inline float sparse_lookup(device const uint *ids,
 // One lane's view of AcceptBatchParams, built by decode_accept_dflash.
 struct AcceptParams {
   uint remaining;
+  uint rows;
   uint stop_token_0;
   uint stop_token_1;
 };
@@ -1415,13 +1416,13 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
                                 device uint &accepted_count,
                                 AcceptParams params) {
   uint accepted = 0;
-  while (accepted < SPLASH_DRAFT_PROPOSAL_TOKENS) {
+  while (accepted < params.rows - 1) {
     uint token = draft_tokens[accepted];
     float q = sparse_lookup(draft_ids + accepted * kDraftCandidates,
                             draft_probs + accepted * kDraftCandidates,
                             kDraftCandidates, token);
     float p = target_rows[accepted].draft_probability;
-    if (!(uniforms[SPLASH_UNIFORM_ACCEPTANCE + accepted] * q < p))
+    if (!(uniforms[SPLASH_UNIFORM_ACCEPTANCE(params.rows) + accepted] * q < p))
       break;
     output_tokens[accepted] = token;
     ++accepted;
@@ -1537,8 +1538,7 @@ kernel void decode_sample_thinking_cutoff(
   if (params.waiting_mask & (1u << lane)) {
     // The lane's mask rows, as selected_row reads them.
     device const uint *masks =
-        token_mask + (ulong(lane) * (SPLASH_TARGET_VERIFY_ROWS + 1) +
-                      params.mask_row) *
+        token_mask + (ulong(lane) * SPLASH_MASK_ROWS + params.mask_row) *
                          params.mask_words;
     const uint start = params.tokens[lane][0];
     for (; row < params.rows; ++row) {
@@ -1569,7 +1569,7 @@ kernel void decode_sample_thinking_cutoff(
 // Before the verify, each lane whose thinking cutoff is at row 0
 // (ThinkingCutoffParams) and whose end does not wait for its mask, which
 // only the verify reads, drafts the end tokens its verify rows will select:
-// its draft token r is its row r's.
+// its draft token r is its row r's. A lane's proposals are its drafted rows.
 kernel void decode_draft_thinking_cutoff(
     device uint *proposed_tokens [[buffer(0)]],
     constant ThinkingCutoffParams &params [[buffer(1)]],
@@ -1577,8 +1577,7 @@ kernel void decode_draft_thinking_cutoff(
   if (params.row[lane] != 0 || (params.waiting_mask & (1u << lane)))
     return;
   for (uint r = 0; r < min(params.count[lane], params.drafted_rows); ++r)
-    proposed_tokens[lane * SPLASH_DRAFT_PROPOSAL_TOKENS + r] =
-        params.tokens[lane][r];
+    proposed_tokens[lane * params.drafted_rows + r] = params.tokens[lane][r];
 }
 
 inline void accept_greedy_lane(device const uint *draft_tokens,
@@ -1587,7 +1586,7 @@ inline void accept_greedy_lane(device const uint *draft_tokens,
                                device uint &accepted_count,
                                AcceptParams params) {
   uint accepted = 0;
-  while (accepted < SPLASH_DRAFT_PROPOSAL_TOKENS &&
+  while (accepted < params.rows - 1 &&
          draft_tokens[accepted] == target_tokens[accepted]) {
     ++accepted;
   }
@@ -1607,18 +1606,16 @@ kernel void decode_accept_dflash(
     constant AcceptBatchParams &params [[buffer(8)]],
     uint batch [[threadgroup_position_in_grid]]) {
   uint remaining = params.remaining[batch];
-  AcceptParams lane_params{remaining, params.stop_token_0,
+  AcceptParams lane_params{remaining, params.rows, params.stop_token_0,
                            params.stop_token_1};
-  device const uint *lane_draft =
-      draft_tokens + batch * SPLASH_DRAFT_PROPOSAL_TOKENS;
-  device uint *lane_target =
-      target_tokens + batch * SPLASH_TARGET_VERIFY_ROWS;
+  const uint proposals = params.rows - 1;
+  device const uint *lane_draft = draft_tokens + batch * proposals;
+  device uint *lane_target = target_tokens + batch * params.rows;
   if (params.sampling_mask & (1u << batch)) {
     accept_sampled_lane(
-        lane_draft,
-        draft_ids + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
-        draft_probs + batch * SPLASH_DRAFT_PROPOSAL_TOKENS * kDraftCandidates,
-        target_rows + batch * SPLASH_TARGET_VERIFY_ROWS,
+        lane_draft, draft_ids + batch * proposals * kDraftCandidates,
+        draft_probs + batch * proposals * kDraftCandidates,
+        target_rows + batch * params.rows,
         uniforms + batch * SPLASH_SAMPLING_UNIFORMS, lane_target,
         retained[batch], accepted_count[batch], lane_params);
   } else {

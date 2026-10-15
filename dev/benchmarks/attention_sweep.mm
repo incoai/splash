@@ -51,7 +51,7 @@ using test::AttentionFixturePlan;
 using test::AttentionShape;
 
 constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-constexpr uint32_t kVerifyRows = SPLASH_TARGET_VERIFY_ROWS;
+constexpr uint32_t kVerifyRows = SPLASH_ROW_BLOCK;
 constexpr uint32_t kPrefillRows = SPLASH_PREFILL_TOKEN_BUDGET;
 
 // The swept attention layer is the second of the extents' two.

@@ -1293,10 +1293,11 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     Request &active = request(scheduled.requestId);
     if (!active.lane)
       throw std::logic_error("scheduled request is not resident");
-    // A prefill command's KV reaches its first state boundary first; what
-    // lies past it follows once that state has its buffers
-    // (reserveCaptures).
-    uint64_t workEnd = active.exactTokens.size() + model::ExecutionLimits::targetVerifyRows;
+    // A decode cycle's KV reaches its lane's verify rows past the request's
+    // tokens, at most maximumVerifyRows at any width. A prefill command's KV
+    // reaches its first state boundary first; what lies past it follows once
+    // that state has its buffers (reserveCaptures).
+    uint64_t workEnd = active.exactTokens.size() + model::ExecutionLimits::maximumVerifyRows;
     if (prefill) {
       workEnd = scheduled.promptOffset + scheduled.tokenCount;
       if (active.stateBoundaryCursor < active.stateBoundaries.size())

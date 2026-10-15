@@ -19,8 +19,8 @@ struct FullPrefillParams {
 static_assert(sizeof(FullPrefillParams) == 8,
               "Full attention prefill parameters are 8 bytes on both sides");
 
-// Each lane holds SPLASH_TARGET_VERIFY_ROWS rows in a chunk staging of
-// SPLASH_VERIFY_CHUNK_STRIDE rows.
+// Each lane holds its verify rows, one row block (SPLASH_ROW_BLOCK), in a
+// chunk staging of SPLASH_VERIFY_CHUNK_STRIDE rows.
 struct FullDecodeBatchParams {
   uint32_t lanes;
 };
@@ -59,8 +59,9 @@ struct SplashPrefillAttentionParams {
 static_assert(sizeof(SplashPrefillAttentionParams) == 28,
               "Prefill attention parameters are 28 bytes on both sides");
 
-// A verify lane attends all its SPLASH_TARGET_VERIFY_ROWS rows, which its
-// queries and output hold in SPLASH_VERIFY_CHUNK_STRIDE rows per KV head.
+// A verify lane attends all its rows, one row block (SPLASH_ROW_BLOCK),
+// which its queries and output hold in SPLASH_VERIFY_CHUNK_STRIDE rows per KV
+// head.
 struct SplashVerifyAttentionParams {
   uint32_t committed_tokens;
   uint32_t page_table_entries;

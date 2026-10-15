@@ -11,8 +11,8 @@
 // The draft attention the kernels are compiled for, the only one
 // ops::DraftAttention accepts: 32 query heads over 8 KV heads of 128
 // dimensions, so a q|k|v row holds 6144 values and an attention row 4096.
-// The attention core runs a KV head's four query heads over the eight query
-// rows together, as 32 attention rows.
+// The attention core runs a KV head's four query heads over a lane's query
+// rows together, one row block of them, as 32 attention rows.
 #define SPLASH_DRAFT_QUERY_HEADS 32u
 #define SPLASH_DRAFT_KV_HEADS 8u
 #define SPLASH_DRAFT_HEAD_DIMENSION 128u
@@ -22,7 +22,7 @@
   (SPLASH_DRAFT_ATTENTION_WIDTH +                                              \
    2u * SPLASH_DRAFT_KV_HEADS * SPLASH_DRAFT_HEAD_DIMENSION)
 #define SPLASH_DRAFT_ATTENTION_ROWS                                            \
-  (SPLASH_DRAFT_QUERY_HEADS / SPLASH_DRAFT_KV_HEADS * SPLASH_DRAFT_QUERY_ROWS)
+  (SPLASH_DRAFT_QUERY_HEADS / SPLASH_DRAFT_KV_HEADS * SPLASH_ROW_BLOCK)
 
 // The dynamic convolutions of a draft layer (draft_conv), each run in two
 // stages, before its attention or MLP and after it with the residual: a
@@ -40,13 +40,15 @@ inline constexpr uint32_t draft_dynamic_width(uint32_t hidden) {
 
 // The batched draft kernels' grids cover exactly the dispatch's lanes:
 // per-lane arrays hold those lanes, and entries past them are zero and unread.
+// A lane's rows are its `rows` query rows, lane by lane.
 
 struct DraftConvBatchParams {
   uint32_t finish;
+  uint32_t rows;
 };
 
-static_assert(sizeof(DraftConvBatchParams) == 4,
-              "Draft convolution parameters are 4 bytes on both sides");
+static_assert(sizeof(DraftConvBatchParams) == 8,
+              "Draft convolution parameters are 8 bytes on both sides");
 
 // The attention core's split count (SPLASH_DRAFT_ATTENTION_SPLITS) and its
 // rings' slots per KV head (SPLASH_DRAFT_SLIDING_WINDOW) are compiled in.
@@ -74,12 +76,14 @@ struct DraftContextParams {
 static_assert(sizeof(DraftContextParams) == 8,
               "Draft context prefill parameters are 8 bytes on both sides");
 
+// Each lane commits up to its `rows` verify rows.
 struct DraftContextBatchParams {
   uint32_t start_position[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t rows;
 };
 
-static_assert(sizeof(DraftContextBatchParams) == 16,
-              "Draft context commit parameters are 16 bytes on both sides");
+static_assert(sizeof(DraftContextBatchParams) == 20,
+              "Draft context commit parameters are 20 bytes on both sides");
 
 // A context window holds, per ring slot, the draft's context row, from which
 // every layer's ring keys and values are computed: 4-bit codes over groups of

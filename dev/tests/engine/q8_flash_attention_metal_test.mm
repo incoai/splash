@@ -720,8 +720,8 @@ void checkReduce(id<MTLDevice> device, id<MTLCommandQueue> queue,
                       0xa5a5,
                   "attention merge wrote beyond its eight-row view");
   };
-  // The prefill tile holds as many rows as a verify lane.
-  static_assert(SPLASH_PREFILL_ATTENTION_TILE_ROWS == SPLASH_TARGET_VERIFY_ROWS);
+  // The prefill tile holds as many rows as a verify lane, a row block.
+  static_assert(SPLASH_PREFILL_ATTENTION_TILE_ROWS == SPLASH_ROW_BLOCK);
   const uint32_t committed = splits * 32 - activeRows;
   id<MTLBuffer> verify;
   if (activeRows == kRows) {

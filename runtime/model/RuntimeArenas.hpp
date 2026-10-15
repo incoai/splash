@@ -22,11 +22,20 @@
 namespace splash::model {
 
 inline constexpr uint32_t kLaneCount = ExecutionLimits::maximumBatchWidth;
-inline constexpr uint32_t kDecodeRows = ExecutionLimits::targetVerifyRows;
+inline constexpr uint32_t kRowBlock = ExecutionLimits::rowBlock;
+inline constexpr uint32_t kMaximumCycleRows = ExecutionLimits::maximumCycleRows;
+// The most proposal positions of a decode cycle: each of its lanes proposes
+// one fewer token than it verifies rows (cycleVerifyRows).
+inline constexpr uint32_t kMaximumCyclePositions = [] {
+  uint32_t positions = 0;
+  for (uint32_t lanes = 1; lanes <= kLaneCount; ++lanes)
+    positions = std::max(positions,
+                         lanes * (cycleVerifyRows(lanes, ExecutionLimits::maximumVerifyRows) - 1));
+  return positions;
+}();
 // Per-lane sampling uniforms handed to the sampler each cycle, in the
 // layout of metal/abi/Sampling.h.
 inline constexpr uint32_t kSamplingUniformCount = SPLASH_SAMPLING_UNIFORMS;
-inline constexpr uint32_t kDraftProposalTokens = ExecutionLimits::draftProposalTokens;
 inline constexpr uint32_t kPrefillRows = ExecutionLimits::prefillTokenBudget;
 inline constexpr uint32_t kTileRows = kv::kPageTokens;
 inline constexpr uint32_t kRaggedAttentionRows =
@@ -266,6 +275,53 @@ enum class DecodeTensor : uint32_t {
 constexpr uint32_t decodeTensorCount =
     static_cast<uint32_t>(DecodeTensor::Count);
 
+// How a decode tensor's extent follows a decode cycle, whose lanes each
+// verify the same rows (cycleVerifyRows): the cycle's rows, lane by lane, in
+// row blocks; its lanes' proposal positions, one fewer than their rows, lane
+// by lane; or one slot per lane, a batch lane's or, for the page and penalty
+// tables and the tapes, a state lane's.
+enum class DecodeExtent : uint8_t { Rows, Positions, Lanes };
+
+constexpr DecodeExtent decodeExtent(DecodeTensor tensor) noexcept {
+  switch (tensor) {
+  case DecodeTensor::Candidates:
+  case DecodeTensor::Unary:
+  case DecodeTensor::TopPartialIds:
+  case DecodeTensor::TopPartialValues:
+  case DecodeTensor::ProposalProbs:
+  case DecodeTensor::ProposedTokens:
+    return DecodeExtent::Positions;
+  case DecodeTensor::FullQueries:
+  case DecodeTensor::FullAttention:
+  case DecodeTensor::SamplingUniforms:
+  case DecodeTensor::ConstraintMasks:
+  case DecodeTensor::RetainedCount:
+  case DecodeTensor::AcceptedCount:
+  case DecodeTensor::PageTable:
+  case DecodeTensor::PenaltyState:
+  case DecodeTensor::GdnTape:
+  case DecodeTensor::ChunkKeysBase:
+  case DecodeTensor::ChunkValuesBase:
+    return DecodeExtent::Lanes;
+  default:
+    return DecodeExtent::Rows;
+  }
+}
+
+// The units of `extent` a decode tensor holds: a cycle's row blocks, its
+// proposal positions or its lanes, at most.
+constexpr uint32_t decodeCapacity(DecodeExtent extent) noexcept {
+  switch (extent) {
+  case DecodeExtent::Rows:
+    return kMaximumCycleRows / kRowBlock;
+  case DecodeExtent::Positions:
+    return kMaximumCyclePositions;
+  case DecodeExtent::Lanes:
+    return kLaneCount;
+  }
+  return 0;
+}
+
 // The attention layers' verify chunk staging, which holds a stride per lane
 // for each attention layer, layer by layer.
 constexpr bool isLayerMajorTensor(DecodeTensor tensor) noexcept {
@@ -277,12 +333,15 @@ constexpr bool isLayerMajorTensor(DecodeTensor tensor) noexcept {
 // every GDN layer (ops::GdnTapeLane). A lane holds two, one per state parity.
 [[nodiscard]] uint64_t gdnTapeSlotBytes(const RuntimeGeometry &geometry) noexcept;
 
+// Each tensor's bytes per unit of its extent: per row block, per proposal
+// position or per lane.
 [[nodiscard]] std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators);
-// A decode tensor is one M32 allocation.  B1/B2/B3/B4 are prefixes
-// containing 8/16/24/32 rows. Lanes are never separated by arena-alignment
-// holes; only whole tensor boundaries are aligned.
+// A decode tensor is one allocation of its capacity's units (decodeCapacity).
+// A cycle's rows are a prefix of whole row blocks, its positions a prefix of
+// positions and its lanes a prefix of slots. Units are never separated by
+// arena-alignment holes; only whole tensor boundaries are aligned.
 [[nodiscard]] uint64_t decodeArenaBaseBytes(const RuntimeGeometry &geometry,
                                             const ops::ExecutionPlans &operators);
 [[nodiscard]] uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
@@ -294,30 +353,21 @@ public:
                const ops::ExecutionPlans &operators)
       : backend_(backend), geometry_(std::move(geometry)) {
     const uint64_t baseBytes = decodeArenaBaseBytes(geometry_, operators);
-    auto sizes = decodeTensorBytes(geometry_, operators);
+    units_ = decodeTensorBytes(geometry_, operators);
     base_ = backend_.allocateBuffer(baseBytes, metal::BufferStorage::Shared,
                                     "qwen-shared-decode");
     uint64_t cursor = 0;
-    for (uint32_t tensor = 0; tensor < sizes.size(); ++tensor) {
-      uint64_t stride = sizes[tensor];
+    for (uint32_t tensor = 0; tensor < units_.size(); ++tensor) {
       offsets_[tensor] = cursor;
-      sizes_[tensor] = sizes[tensor];
-      const DecodeTensor kind = static_cast<DecodeTensor>(tensor);
-      if (sizes[tensor] && !isLayerMajorTensor(kind)) {
-        for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
-          tensors_[lane][tensor] = backend_.view(
-              base_, cursor + uint64_t{lane} * stride, sizes[tensor]);
-        }
-      }
-      cursor +=
-          alignUp(checkedMultiply(stride, kLaneCount, "decode tensor"));
+      const uint32_t capacity = decodeCapacity(decodeExtent(static_cast<DecodeTensor>(tensor)));
+      cursor += alignUp(checkedMultiply(units_[tensor], capacity, "decode tensor"));
     }
     if (cursor != baseBytes)
       throw std::logic_error("decode arena mismatch");
     // Sampled rows' draws return their arrival counts to zero; they start
     // there.
     const metal::MetalBuffer arrivals =
-        batchSlice(DecodeTensor::TargetVocabularyArrivals, kLaneCount);
+        rows(DecodeTensor::TargetVocabularyArrivals, 0, kMaximumCycleRows);
     std::memset(arrivals.contents(), 0, arrivals.sizeBytes());
 
     const uint64_t denseScratchBytes = gateScratchBytes(geometry_, operators);
@@ -343,38 +393,40 @@ public:
     bytes_ = plannedDecodeBytes(geometry_, operators);
   }
 
-  [[nodiscard]] metal::MetalBuffer get(uint32_t lane, DecodeTensor tensor) const {
+  // Rows [first, first + count) of a Rows tensor, whole row blocks of them.
+  [[nodiscard]] metal::MetalBuffer rows(DecodeTensor tensor, uint32_t first, uint32_t count) const {
+    if (first % kRowBlock || !count || count % kRowBlock || count > kMaximumCycleRows ||
+        first > kMaximumCycleRows - count)
+      throw std::out_of_range("invalid decode rows");
+    return units(tensor, DecodeExtent::Rows, first / kRowBlock, count / kRowBlock);
+  }
+
+  // Proposal positions [first, first + count) of a Positions tensor.
+  [[nodiscard]] metal::MetalBuffer positions(DecodeTensor tensor, uint32_t first,
+                                             uint32_t count) const {
+    if (!count || count > kMaximumCyclePositions || first > kMaximumCyclePositions - count)
+      throw std::out_of_range("invalid decode positions");
+    return units(tensor, DecodeExtent::Positions, first, count);
+  }
+
+  // Slot `lane` of a Lanes tensor, and its first `count` slots.
+  [[nodiscard]] metal::MetalBuffer lane(DecodeTensor tensor, uint32_t lane) const {
     if (lane >= kLaneCount)
       throw std::out_of_range("invalid decode lane");
-    if (isLayerMajorTensor(tensor)) {
-      throw std::logic_error(
-          "layer-major decode scratch requires a layer view");
-    }
-    return tensors_[lane][static_cast<uint32_t>(tensor)];
+    return units(tensor, DecodeExtent::Lanes, lane, 1);
   }
-
-  [[nodiscard]] metal::MetalBuffer batchSlice(DecodeTensor tensor, uint32_t lanes) const {
-    if (!lanes || lanes > kLaneCount)
+  [[nodiscard]] metal::MetalBuffer lanes(DecodeTensor tensor, uint32_t count) const {
+    if (!count || count > kLaneCount)
       throw std::out_of_range("invalid decode batch width");
-    if (isLayerMajorTensor(tensor)) {
-      throw std::logic_error(
-          "layer-major decode scratch requires a layer view");
-    }
-    const uint32_t index = static_cast<uint32_t>(tensor);
-    // Model-specific scratch is represented by an empty buffer.  The
-    // selected target graph consumes either dense-FFN or MoE tensors, never
-    // both, so no dummy allocation is needed for the inactive operator.
-    if (!sizes_[index])
-      return {};
-    return backend_.view(base_, offsets_[index],
-                         uint64_t{lanes} * sizes_[index]);
+    return units(tensor, DecodeExtent::Lanes, 0, count);
   }
 
-  [[nodiscard]] ops::MoeScratch moeScratch(uint32_t lanes) const {
+  // The MoE scratch of a cycle's `rows` rows.
+  [[nodiscard]] ops::MoeScratch moeScratch(uint32_t rows) const {
     ops::MoeScratch scratch;
     for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
       scratch.*ops::kMoeScratchFields[field].buffer =
-          batchSlice(moeScratchTensor<DecodeTensor>(field), lanes);
+          this->rows(moeScratchTensor<DecodeTensor>(field), 0, rows);
     return scratch;
   }
 
@@ -397,8 +449,8 @@ public:
     return std::max(target, draft);
   }
 
-  // The offset in batchSlice(DecodeTensor::GdnTape, kLaneCount) of state
-  // lane `stateLane`'s tape slot of parity `parity`.
+  // The offset in lanes(DecodeTensor::GdnTape, kLaneCount) of state lane
+  // `stateLane`'s tape slot of parity `parity`.
   [[nodiscard]] uint64_t gdnTapeSlot(uint32_t stateLane, uint32_t parity) const {
     if (stateLane >= kLaneCount || parity > 1)
       throw std::out_of_range("invalid GDN tape slot");
@@ -419,13 +471,28 @@ public:
   [[nodiscard]] uint64_t bytes() const noexcept { return bytes_; }
 
 private:
+  // Units [first, first + count) of a tensor whose extent is `extent`.
+  // Model-specific scratch is represented by an empty buffer: the selected
+  // target graph consumes either dense-FFN or MoE tensors, never both, so no
+  // dummy allocation is needed for the inactive operator.
+  [[nodiscard]] metal::MetalBuffer units(DecodeTensor tensor, DecodeExtent extent, uint32_t first,
+                                         uint32_t count) const {
+    if (decodeExtent(tensor) != extent || isLayerMajorTensor(tensor))
+      throw std::logic_error("decode tensor viewed in another extent");
+    const uint32_t index = static_cast<uint32_t>(tensor);
+    if (!units_[index])
+      return {};
+    return backend_.view(base_, offsets_[index] + uint64_t{first} * units_[index],
+                         uint64_t{count} * units_[index]);
+  }
+
   // A layer-major tensor holds one stride per lane for each of its `layers`
   // layers, layer by layer; the planner sized it as layers x stride, so the
   // stride is recovered here, not supplied.
   [[nodiscard]] metal::MetalBuffer layerBatchSlice(DecodeTensor base, uint32_t layers,
                                                    uint32_t layer, uint32_t lanes) const {
     const uint32_t index = static_cast<uint32_t>(base);
-    const uint64_t stride = sizes_[index] / layers;
+    const uint64_t stride = units_[index] / layers;
     return backend_.view(base_, offsets_[index] + uint64_t{layer} * kLaneCount * stride,
                          uint64_t{lanes} * stride);
   }
@@ -433,9 +500,8 @@ private:
   metal::MetalBackend &backend_;
   RuntimeGeometry geometry_;
   metal::MetalBuffer base_;
-  std::array<std::array<metal::MetalBuffer, decodeTensorCount>, kLaneCount> tensors_{};
   std::array<uint64_t, decodeTensorCount> offsets_{};
-  std::array<uint64_t, decodeTensorCount> sizes_{};
+  std::array<uint64_t, decodeTensorCount> units_{};
   metal::MetalBuffer gateScratch_;
   ops::LinearScratch linearScratch_;
   uint64_t bytes_ = 0;

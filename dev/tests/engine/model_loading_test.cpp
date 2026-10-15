@@ -111,11 +111,17 @@ void testStartupCapabilities() {
     using splash::model::ExecutionLimits;
     require(ExecutionLimits::maximumBatchWidth == 4 &&
                 ExecutionLimits::prefillTokenBudget == 2048 &&
-                ExecutionLimits::draftQueryRows == 8 &&
-                ExecutionLimits::draftProposalTokens == 7 &&
-                ExecutionLimits::targetVerifyRows == 8 &&
+                ExecutionLimits::draftBlockRows == 8 &&
+                ExecutionLimits::rowBlock == 8 &&
+                ExecutionLimits::maximumVerifyRows == 8 &&
+                ExecutionLimits::maximumCycleRows == 32 &&
                 ExecutionLimits::draftContextTokens == 2048,
             "DFlash execution contract changed");
+    // A cycle's lanes verify their most rows while the cycle's rows fit, else
+    // one row block.
+    require(splash::model::cycleVerifyRows(1, 16) == 16 && splash::model::cycleVerifyRows(2, 16) == 16 &&
+                splash::model::cycleVerifyRows(3, 16) == 8 && splash::model::cycleVerifyRows(4, 8) == 8,
+            "decode cycle rows changed");
 }
 
 uint64_t declaredBytes(std::span<const WeightFileRecord> records) {

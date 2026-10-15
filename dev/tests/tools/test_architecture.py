@@ -368,7 +368,7 @@ class ArchitectureTests(unittest.TestCase):
             model.write_text(
                 "auto bytes = PagedAttention::prefillWorkspace();\n"
                 "constexpr auto tileRows = kv::kPageTokens;\n"
-                "auto rows = ExecutionLimits::draftQueryRows;\n"
+                "auto rows = ExecutionLimits::maximumVerifyRows;\n"
                 "auto rank = layout.selectorRank;\n"
             )
             assembly.write_text(

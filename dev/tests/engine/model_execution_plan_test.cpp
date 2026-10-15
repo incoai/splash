@@ -99,8 +99,8 @@ void checkGateUpLayers() {
                 containsHead(geometry.target.decodeProjections),
             "vocabulary head must reserve workspace only in decode");
     const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
-    for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes) {
-      const auto plan = plans.linear().plan({{up.outputSize, up.inputSize}, lanes * model::kDecodeRows,
+    for (uint32_t rows = model::kRowBlock; rows <= model::kMaximumCycleRows; rows += model::kRowBlock) {
+      const auto plan = plans.linear().plan({{up.outputSize, up.inputSize}, rows,
           ops::LinearPhase::Decode, ops::LinearEpilogue::GateUp}, up);
       const auto required = plan.scratchSize();
       require(scratch.input >= required.input && scratch.sums >= required.sums &&
@@ -109,13 +109,13 @@ void checkGateUpLayers() {
       require(model::DecodeArena::gateScratchBytes(geometry, plans) >= plan.gateScratchBytes(),
               "the gate/up workspace is too small");
       // The F16 and Q8_0 pair stages, at rows the decode storage of the
-      // target's projections holds (QwenTarget::decodeStorageLanes).
-      const auto pair = plans.linear().decodePlan(mixed.upProjection, lanes, ops::LinearEpilogue::GateUp,
+      // target's projections holds (QwenTarget::decodeStorageRows).
+      const auto pair = plans.linear().decodePlan(mixed.upProjection, rows, ops::LinearEpilogue::GateUp,
                                                   &mixed.gateProjection);
       const auto paired = pair.scratchSize();
       uint32_t storage = 0;
       for (const auto &shape : geometry.target.decodeProjections)
-        storage = std::max(storage, plans.linear().decodeStorageRows(lanes * model::kDecodeRows, shape));
+        storage = std::max(storage, plans.linear().decodeStorageRows(rows, shape));
       require(pair.configuration().tile == ops::LinearTile::GgufStaged && pair.storageRows() <= storage,
               "a gate/up pair with an F16 gate did not stage within the decode storage");
       require(scratch.input >= paired.input && scratch.sums >= paired.sums && scratch.partials >= paired.partials &&
@@ -134,8 +134,8 @@ void checkGateUpLayers() {
   }
 }
 
-// One decode arena serves every lane count, and a staged plan's partials
-// grow with its rows. The arena must hold every lane's plan of every target
+// One decode arena serves every cycle's rows, and a staged plan's partials
+// grow with its rows. The arena must hold every cycle's plan of every target
 // and draft projection at the measured core counts.
 void checkLaneScratch(const model::LoadedModel &loaded) {
   const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
@@ -154,14 +154,14 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
       const ops::ExecutionPlans plans(device);
       const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
       for (const auto matrix : matrices)
-        for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes)
+        for (uint32_t rows = model::kRowBlock; rows <= model::kMaximumCycleRows; rows += model::kRowBlock)
           for (auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
                                 ops::LinearEpilogue::GateUp}) {
-            const auto need = plans.linear().plan({matrix, lanes * model::kDecodeRows,
+            const auto need = plans.linear().plan({matrix, rows,
                 ops::LinearPhase::Decode, epilogue}).scratchSize();
             require(scratch.input >= need.input && scratch.sums >= need.sums && scratch.partials >= need.partials &&
                         scratch.counters >= need.counters,
-                    "decode arena scratch below a lane's plan");
+                    "decode arena scratch below a cycle's plan");
           }
     }
 }

@@ -28,7 +28,8 @@ static_assert(std::is_trivially_copyable_v<VerifyAttentionParams>);
 static_assert(std::is_standard_layout_v<PrefillAttentionParams>);
 static_assert(std::is_trivially_copyable_v<PrefillAttentionParams>);
 
-inline constexpr uint32_t kVerifyRows = SPLASH_TARGET_VERIFY_ROWS;
+// The rows of a verify lane the attention kernels take: one row block.
+inline constexpr uint32_t kVerifyRows = SPLASH_ROW_BLOCK;
 inline constexpr uint32_t kVerifyMaximumSplits =
     SPLASH_VERIFY_ATTENTION_MAXIMUM_SPLITS;
 // Rows per KV head (and per query group) of one lane's verify chunk

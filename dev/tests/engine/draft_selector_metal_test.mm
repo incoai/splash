@@ -37,8 +37,9 @@ using namespace splash::ops;
 using splash::test::bf16ToFloat;
 using splash::test::floatToBf16;
 
-constexpr uint32_t kRows = SPLASH_DRAFT_QUERY_ROWS;
-constexpr uint32_t kPositions = SPLASH_DRAFT_PROPOSAL_TOKENS;
+// The lanes here have one row block of query rows each.
+constexpr uint32_t kRows = SPLASH_ROW_BLOCK;
+constexpr uint32_t kPositions = kRows - 1;
 constexpr uint32_t kCandidates = SPLASH_DRAFT_CANDIDATES;
 constexpr uint32_t kRank = SPLASH_DRAFT_SELECTOR_RANK;
 constexpr uint32_t kLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
@@ -175,7 +176,7 @@ void runCase(MetalBackend &backend, const Case &c) {
   }
 
   CommandGraph graph;
-  selector.add(graph, buffers, codebooks, anchors, policies);
+  selector.add(graph, buffers, codebooks, anchors, policies, kRows);
   require(graph.dispatches().size() == 3,
           "draft selector dispatch count changed");
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
@@ -317,7 +318,7 @@ void bufferExtents(MetalBackend &backend) {
     requireExtent(backend, buffers.*member, bytes, element, what, [&](CommandGraph &graph, const MetalBuffer &buffer) {
       DraftSelectorBuffers changed = buffers;
       changed.*member = buffer;
-      selector.add(graph, changed, codebooks, anchors, policies);
+      selector.add(graph, changed, codebooks, anchors, policies, kRows);
     });
   for (const auto &[member, what] :
        {std::pair{&DraftCodebooks::predecessor, "draft predecessor codebook"},
@@ -326,7 +327,7 @@ void bufferExtents(MetalBackend &backend) {
                   [&](CommandGraph &graph, const MetalBuffer &buffer) {
                     DraftCodebooks changed = codebooks;
                     changed.*member = buffer;
-                    selector.add(graph, buffers, changed, anchors, policies);
+                    selector.add(graph, buffers, changed, anchors, policies, kRows);
                   });
 }
 
@@ -350,8 +351,12 @@ void invalidRequests(MetalBackend &backend) {
   const std::array<uint32_t, 2> anchors{1, 2};
   const std::array<SamplingPolicy, 1> policies{SamplingPolicy{}};
   CommandGraph graph;
-  rejects([&] { selector.add(graph, buffers, codebooks, anchors, policies); },
+  rejects([&] { selector.add(graph, buffers, codebooks, anchors, policies, kRows); },
           "invalid draft selector batch", "anchors without a policy each were accepted");
+  const std::array<uint32_t, 1> anchor{1};
+  for (const uint32_t rows : {1U, SPLASH_MAXIMUM_VERIFY_ROWS + 1})
+    rejects([&] { selector.add(graph, buffers, codebooks, anchor, policies, rows); },
+            "invalid draft selector batch", "query rows without a proposal or past a lane's were accepted");
   require(graph.empty(), "invalid draft selector request encoded a graph");
 }
 

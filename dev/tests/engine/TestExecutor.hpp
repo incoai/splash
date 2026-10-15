@@ -395,10 +395,10 @@ public:
     std::vector<ModelStepResult> result;
     for (const auto &item : items) {
       requireRows(item, item.logicalPosition);
-      // The production runtime stores eight verify rows from the lane's
+      // The production runtime stores a lane's verify rows from its
       // position; the engine must have covered them with page-table entries.
       if (uint64_t{item.pageTable.size()} * engine::KvCache::pageTokens <
-          item.logicalPosition + model::ExecutionLimits::targetVerifyRows) {
+          item.logicalPosition + model::ExecutionLimits::maximumVerifyRows) {
         throw std::invalid_argument("page_table_too_short");
       }
       if (plan.decodeStage == DecodeStage::ApplyInitialMask) {

@@ -49,7 +49,8 @@ using splash::metal::MetalBuffer;
 using namespace splash::ops;
 using namespace splash::test;
 
-constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
+// The decode kernel takes one row block per lane.
+constexpr uint32_t kRows = SPLASH_ROW_BLOCK;
 constexpr uint32_t kMaxLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kHeadDim = 128;
 // The convolution's taps; a state carries the inputs of all but the current

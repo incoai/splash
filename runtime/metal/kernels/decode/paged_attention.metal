@@ -1,7 +1,8 @@
 #include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/paged_attention_tile.h"
 
-// Verify tiles process one lane's eight rows per KV head and history split.
+// Verify tiles process one lane's row block of eight rows per KV head and
+// history split.
 // Verify and prefill share the device-operand page loop in paged_attention_tile.h.
 
 // The tile one verify threadgroup owns: group.x is the KV head, group.y the
@@ -66,7 +67,7 @@ inline SplashVerifyTile splash_verify_attention_tile_at(
       uint thread_index [[thread_index_in_threadgroup]])
 
 #define PAGED_VERIFY_SCRATCH(Group)                                            \
-  constexpr uint M = Group * SPLASH_TARGET_VERIFY_ROWS;                        \
+  constexpr uint M = Group * SPLASH_ROW_BLOCK;                                 \
   constexpr uint N = SplashKvPageTokens;                                       \
   alignas(16) threadgroup float scores[M * N];                                 \
   alignas(16) threadgroup bfloat probabilities[M * N];                         \
@@ -87,10 +88,10 @@ inline SplashVerifyTile splash_verify_attention_tile_at(
   PAGED_VERIFY_SPLIT_SIGNATURE(Name) {                                         \
     PAGED_VERIFY_SCRATCH(Group)                                                \
     PAGED_VERIFY_TILE_AT(Heads, Group)                                         \
-    splash_paged_attention_tile<Heads, Group, SPLASH_TARGET_VERIFY_ROWS,       \
+    splash_paged_attention_tile<Heads, Group, SPLASH_ROW_BLOCK,                \
                                 CacheElement>(                                 \
         tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,       \
-        tile.committed_tokens, SPLASH_TARGET_VERIFY_ROWS, tile.splits,         \
+        tile.committed_tokens, SPLASH_ROW_BLOCK, tile.splits,                  \
         tile.split, partials, statistics, tile.slot, scores, probabilities,    \
         row_max, row_sum, previous_scale, &rescale, thread_index);             \
   }
@@ -111,7 +112,7 @@ inline void splash_verify_attention_reduce_phase(
     device bfloat *output,
     constant SplashVerifyAttentionParams *params, uint3 group,
     uint thread_index, threadgroup float *weights, threadgroup float *group_values) {
-  constexpr ushort M = SPLASH_TARGET_VERIFY_ROWS * QueryHeadsPerKVHead;
+  constexpr ushort M = SPLASH_ROW_BLOCK * QueryHeadsPerKVHead;
   constexpr ushort D = SplashKvHeadDimension;
   uint kv_head = group.x;
   uint fused_row = group.y;
@@ -122,11 +123,10 @@ inline void splash_verify_attention_reduce_phase(
     return;
   constexpr ulong group_stride =
       ulong(SPLASH_VERIFY_CHUNK_STRIDE) * QueryHeadsPerKVHead * D;
-  splash_attention_reduce_row<QueryHeadsPerKVHead,
-                                   SPLASH_TARGET_VERIFY_ROWS>(
+  splash_attention_reduce_row<QueryHeadsPerKVHead, SPLASH_ROW_BLOCK>(
       partials, statistics,
       output + (ulong(batch) * KVHeads + kv_head) * group_stride,
-      lane_params.committed_tokens, SPLASH_TARGET_VERIFY_ROWS,
+      lane_params.committed_tokens, SPLASH_ROW_BLOCK,
       lane_params.split_count,
       (ulong(batch) * KVHeads + kv_head) * lane_params.slot_splits, fused_row,
       thread_index, weights, group_values);

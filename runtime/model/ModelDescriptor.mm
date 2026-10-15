@@ -579,7 +579,7 @@ void validateDraftConfig(NSDictionary *draft, const DFlashDraftLayout &layout,
   NSDictionary *flash =
       requireObject(draft, @"dflash_config", "draft config dflash_config");
   requireNumbers(flash, "checkpoint", "draft config dflash_config",
-                 {{"block_size", ExecutionLimits::draftQueryRows},
+                 {{"block_size", ExecutionLimits::draftBlockRows},
                   {"conv_group_size", SPLASH_DRAFT_CONVOLUTION_GROUP},
                   {"conv_kernel_size", SPLASH_DRAFT_CONVOLUTION_TAPS},
                   {"selector_rank", layout.selectorRank},

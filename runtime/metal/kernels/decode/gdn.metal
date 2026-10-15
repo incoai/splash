@@ -23,22 +23,28 @@
 // state a step writes is the one before its rows: it leaves the rows on the
 // lane's tape, and the lane's next step folds the retained ones into the
 // state before its own rows. A step reads and writes the state once.
+//
+// A threadgroup takes one row block of its lane (ops::GDN::addDecode), and
+// folds the pending rows of a step of at most as many rows.
 constant uint kDecodeSimdgroups = 8;
+constant uint kDecodeRows = SPLASH_ROW_BLOCK;
+static_assert(SPLASH_MAXIMUM_VERIFY_ROWS <= kDecodeRows,
+              "a step's pending rows fit its own row block");
 
 // The threadgroup operands of one value head: the rows' prepared q/k, the
 // head's v, the gates and the recurrent output rows, and the k, v and gates
 // of the pending rows, which the head folds into its state first.
 template <uint HeadDim> struct GdnDecodeShared {
-  bfloat queries[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
-  bfloat keys[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
-  bfloat values[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
-  bfloat rows[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
-  float decay[SPLASH_TARGET_VERIFY_ROWS];
-  bfloat beta[SPLASH_TARGET_VERIFY_ROWS];
-  bfloat pending_keys[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
-  bfloat pending_values[SPLASH_TARGET_VERIFY_ROWS * HeadDim];
-  float pending_decay[SPLASH_TARGET_VERIFY_ROWS];
-  bfloat pending_beta[SPLASH_TARGET_VERIFY_ROWS];
+  bfloat queries[kDecodeRows * HeadDim];
+  bfloat keys[kDecodeRows * HeadDim];
+  bfloat values[kDecodeRows * HeadDim];
+  bfloat rows[kDecodeRows * HeadDim];
+  float decay[kDecodeRows];
+  bfloat beta[kDecodeRows];
+  bfloat pending_keys[kDecodeRows * HeadDim];
+  bfloat pending_values[kDecodeRows * HeadDim];
+  float pending_decay[kDecodeRows];
+  bfloat pending_beta[kDecodeRows];
 };
 
 // One layer's tape of one lane's step (metal/abi/GDN.h): the rows'
@@ -62,7 +68,7 @@ inline GdnTape gdn_tape(device uchar *tape, ulong offset) {
               layer + gdn_tape_beta_offset(ConvDim, KvWidth, ValueHeads))};
 }
 
-// Eight verify rows' conv+SiLU, q/k RMS norms and gates for one value head.
+// A row block's conv+SiLU, q/k RMS norms and gates for one value head.
 // One simdgroup per row holds channels 32g + lane (g = 0..3). RMS reduction
 // sums each 32-channel group, then adds the four partials in channel order.
 // The convolution reads the inputs before the rows from `history`: the
@@ -80,7 +86,7 @@ inline void gdn_decode_prologue(
     device const float *a_scale, device const bfloat *dt_bias,
     threadgroup GdnDecodeShared<HeadDim> &shared, uint value_head, uint lane,
     uint simd_group) {
-  constexpr uint Tokens = SPLASH_TARGET_VERIFY_ROWS;
+  constexpr uint Tokens = kDecodeRows;
   constexpr uint HeadsPerKey = ValueHeads / KeyHeads;
   constexpr uint KeyWidth = KeyHeads * HeadDim;
   constexpr uint ValueWidth = ValueHeads * HeadDim;
@@ -199,7 +205,7 @@ inline void gdn_decode_scan(device const State *state_in,
                             threadgroup GdnDecodeShared<HeadDim> &shared,
                             uint pending, uint value_head, uint lane,
                             uint simd_group) {
-  constexpr uint Tokens = SPLASH_TARGET_VERIFY_ROWS;
+  constexpr uint Tokens = kDecodeRows;
   constexpr uint Batches = HeadDim / kDecodeSimdgroups;
   static_assert(Batches % RowsInFlight == 0, "rows in flight tile the head");
   const auto base = [&](uint batch, uint r) {
@@ -347,7 +353,7 @@ inline void gdn_decode_batch_phase(
     uint2 group, uint lane, uint simd_group,
     threadgroup GdnDecodeShared<HeadDim> &shared,
     device bfloat *table, device float *sums) {
-  constexpr uint Rows = SPLASH_TARGET_VERIFY_ROWS;
+  constexpr uint Rows = kDecodeRows;
   constexpr uint ValueWidth = ValueHeads * HeadDim;
   uint batch = group.y;
   device const uchar *current = SPLASH_LANE_BINDING(batch, current0, current1, current2, current3);

@@ -235,7 +235,8 @@ struct MoeBuffers final {
 // Routes and executes grouped experts from immutable weight views.
 struct MoE final {
   [[nodiscard]] static MoePlan prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config);
-  [[nodiscard]] static MoePlan decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config);
+  // A decode cycle's rows, `blocks` row blocks of them.
+  [[nodiscard]] static MoePlan decodePlan(MoeShape shape, uint32_t blocks, MoeConfig config);
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                   const BlockMoeWeights &weights, const MoePlan &plan);
 };

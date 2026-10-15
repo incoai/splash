@@ -437,7 +437,7 @@ maskWordsPerToken(uint32_t vocabularySize) noexcept {
 }
 
 // Compile-time ceiling of the one native DFlash execution contract. A draft
-// must have been trained for blocks of draftQueryRows rows over
+// must have been trained for blocks of draftBlockRows rows over
 // draftContextTokens context tokens, which inspectModelRoot checks a DFlash2
 // checkpoint's config for; the other limits are the runtime's own. Cache-page
 // and attention-kernel geometry live with their operators.
@@ -448,24 +448,35 @@ struct ExecutionLimits final {
   // pool allocates when it is built.
   static constexpr uint32_t warmupKvPages =
       (prefillTokenBudget + kv::kPageTokens - 1) / kv::kPageTokens;
-  static constexpr uint32_t draftQueryRows = 8;
-  static constexpr uint32_t draftProposalTokens = 7;
-  static constexpr uint32_t targetVerifyRows = 8;
+  static constexpr uint32_t draftBlockRows = 8;
   static constexpr uint32_t draftContextTokens = 2048;
-  static constexpr uint32_t speculativeScratchTokens = targetVerifyRows - 1;
+  // A decode cycle's rows (metal/abi/ExecutionGeometry.h): each lane
+  // verifies whole blocks of rowBlock rows, its anchor and the draft's
+  // proposals, at most maximumVerifyRows, and a cycle at most
+  // maximumCycleRows over all its lanes.
+  static constexpr uint32_t rowBlock = 8;
+  static constexpr uint32_t maximumVerifyRows = 8;
+  static constexpr uint32_t maximumCycleRows = maximumBatchWidth * rowBlock;
+  static constexpr uint32_t speculativeScratchTokens = maximumVerifyRows - 1;
   // One step emits at most its retained verify rows plus a terminal anchor
   // (a stop token or the last budgeted token) that never receives a KV row.
-  static constexpr uint32_t maximumStepTokens = targetVerifyRows + 1;
+  static constexpr uint32_t maximumStepTokens = maximumVerifyRows + 1;
   // Direct finite-option scoring (SemIf/Jev): a score-only request carries
   // 2..255 distinct token ids and returns their raw final-position logits.
   static constexpr uint32_t minimumScoreOptions = 2;
   static constexpr uint32_t maximumScoreOptions = 255;
 };
 
-static_assert(ExecutionLimits::draftQueryRows ==
-              ExecutionLimits::draftProposalTokens + 1);
-static_assert(ExecutionLimits::targetVerifyRows ==
-              ExecutionLimits::draftQueryRows);
+static_assert(ExecutionLimits::maximumVerifyRows % ExecutionLimits::rowBlock == 0 &&
+              ExecutionLimits::maximumVerifyRows <= ExecutionLimits::maximumCycleRows);
+
+// The verify rows of each lane of a decode cycle of `lanes` lanes on a
+// runtime whose lanes verify at most `maximumRows` rows: all of them while
+// the cycle's rows fit maximumCycleRows, else one row block.
+[[nodiscard]] constexpr uint32_t cycleVerifyRows(uint32_t lanes, uint32_t maximumRows) noexcept {
+  return lanes * maximumRows <= ExecutionLimits::maximumCycleRows ? maximumRows
+                                                                  : ExecutionLimits::rowBlock;
+}
 
 // Shared accounting for model-owned state allocations.  Target and draft
 // implementations may allocate from separate physical pools while the engine
@@ -651,6 +662,9 @@ public:
   virtual WarmupStepResult warmupCompositeStateRestore() = 0;
   [[nodiscard]] virtual ModelMemoryActual actualRuntimeMemory() const = 0;
   [[nodiscard]] virtual ModelTelemetry telemetry() const noexcept = 0;
+  // The verify rows of each lane of a decode cycle of `width` lanes, its
+  // anchor and the draft's proposals after it (cycleVerifyRows).
+  [[nodiscard]] virtual uint32_t verifyRows(uint32_t width) const noexcept = 0;
 };
 
 } // namespace model

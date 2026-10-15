@@ -219,10 +219,10 @@ MoePlan MoE::prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config) {
   return MoePlan(shape, rows, config, MoePhase::Prefill);
 }
 
-MoePlan MoE::decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config) {
-  if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
+MoePlan MoE::decodePlan(MoeShape shape, uint32_t blocks, MoeConfig config) {
+  if (!blocks || blocks > SPLASH_MAXIMUM_CYCLE_ROWS / SPLASH_ROW_BLOCK)
     throw std::invalid_argument("invalid MoE decode batch width");
-  return MoePlan(shape, lanes * SPLASH_TARGET_VERIFY_ROWS, config, MoePhase::Decode);
+  return MoePlan(shape, blocks * SPLASH_ROW_BLOCK, config, MoePhase::Decode);
 }
 
 } // namespace splash::ops

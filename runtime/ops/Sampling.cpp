@@ -75,7 +75,7 @@ ThinkingCutoffs thinkingCutoffs(std::span<const SamplingPolicy> policies, uint32
     params.close[lane] = cutoff->end.back();
     params.also_ends[lane] = cutoff->alsoEnds;
     cutoffs.cutLanes = lane + 1;
-    if (cutoff->replacedProposals())
+    if (cutoff->replacedProposals(draftedRows))
       cutoffs.draftingLanes = lane + 1;
   }
   return cutoffs;
@@ -137,12 +137,13 @@ Sampling::Sampling(uint32_t vocabulary)
 void Sampling::addPenalties(metal::CommandGraph &graph,
                             std::span<const SamplingPolicy> policies,
                             const SamplingBuffers &buffers,
-                            const PenaltyTable &table, uint32_t rowOffset,
+                            const PenaltyTable &table, const TargetRows &rows,
                             bool verify) const {
   SamplingPenaltyParams params{};
   params.vocabulary = vocabulary_;
-  params.rows = verify ? SPLASH_TARGET_VERIFY_ROWS : 1;
-  params.row_offset = rowOffset;
+  params.lane_rows = rows.laneRows;
+  params.rows = rows.rows;
+  params.row_offset = rows.logitsRow;
   const uint64_t rowBytes = uint64_t{vocabulary_} * sizeof(uint32_t);
   for (uint32_t lane = 0; lane < policies.size(); ++lane) {
     const SamplingPenalties &penalties = policies[lane].penalties;
@@ -167,7 +168,7 @@ void Sampling::addPenalties(metal::CommandGraph &graph,
   // Entries follow the lanes, so the last one's lane is the highest.
   const uint64_t lanes = uint64_t{params.logits_lane[params.entries - 1]} + 1;
   if (verify)
-    requireBytes(buffers.inputTokens, lanes * SPLASH_TARGET_VERIFY_ROWS * sizeof(uint32_t), "verify input token");
+    requireBytes(buffers.inputTokens, lanes * rows.laneRows * sizeof(uint32_t), "verify input token");
   const metal::DispatchSize groups{
       (vocabulary_ + kPenaltyThreads - 1) / kPenaltyThreads, params.entries, 1};
   if (!verify) {
@@ -187,29 +188,29 @@ void Sampling::addInitial(metal::CommandGraph &graph,
                           const PenaltyTable &penalties) const {
   if (policies.empty() || policies.size() > kMaximumLanes)
     throw std::invalid_argument("invalid sampling batch width");
-  if (rowOffset >= SPLASH_TARGET_VERIFY_ROWS)
+  if (rowOffset >= SPLASH_ROW_BLOCK)
     throw std::invalid_argument("invalid initial sampling row");
-  const TargetSamplingParams params =
-      selection(policies, buffers, {1, rowOffset, 0, SPLASH_UNIFORM_INITIAL, 0}, stopToken0, stopToken1);
-  addPenalties(graph, policies, buffers, penalties, rowOffset, false);
+  const TargetRows rows{SPLASH_ROW_BLOCK, 1, rowOffset, 0, SPLASH_UNIFORM_INITIAL, 0};
+  const TargetSamplingParams params = selection(policies, buffers, rows, stopToken0, stopToken1);
+  addPenalties(graph, policies, buffers, penalties, rows, false);
   addSelection(graph, params, policies, buffers);
 }
 
 void Sampling::addVerify(metal::CommandGraph &graph,
                          std::span<const SamplingPolicy> policies,
-                         SamplingBuffers buffers, uint32_t stopToken0,
-                         uint32_t stopToken1,
+                         SamplingBuffers buffers, uint32_t rows,
+                         uint32_t stopToken0, uint32_t stopToken1,
                          const PenaltyTable &penalties) const {
   if (policies.empty() || policies.size() > kMaximumLanes)
     throw std::invalid_argument("invalid sampling batch width");
+  if (rows < 2 || rows > SPLASH_MAXIMUM_VERIFY_ROWS)
+    throw std::invalid_argument("invalid verify sampling rows");
   // Verify row r of a lane reads mask row r + 1 and, below the last row,
   // follows draft token r; every row draws with the lane's correction
   // uniform.
-  const TargetSamplingParams params =
-      selection(policies, buffers,
-                {SPLASH_TARGET_VERIFY_ROWS, 0, 1, SPLASH_UNIFORM_CORRECTION, SPLASH_DRAFT_PROPOSAL_TOKENS},
-                stopToken0, stopToken1);
-  addPenalties(graph, policies, buffers, penalties, 0, true);
+  const TargetRows verifyRows{rows, rows, 0, 1, SPLASH_UNIFORM_CORRECTION(rows), rows - 1};
+  const TargetSamplingParams params = selection(policies, buffers, verifyRows, stopToken0, stopToken1);
+  addPenalties(graph, policies, buffers, penalties, verifyRows, true);
   addSelection(graph, params, policies, buffers);
 }
 
@@ -219,6 +220,7 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
   TargetSamplingParams params{};
   params.vocabulary = vocabulary_;
   params.mask_words = maskWords_;
+  params.lane_rows = rows.laneRows;
   params.rows = rows.rows;
   params.logits_row = rows.logitsRow;
   params.mask_row = rows.maskRow;
@@ -253,11 +255,11 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
   };
   const SamplingWorkspace greedy = rowsWorkspace(greedyLanes), sampled = rowsWorkspace(sampledLanes);
   requireBytes(buffers.logits,
-               ((lanes - 1) * SPLASH_TARGET_VERIFY_ROWS + rows.logitsRow + rows.rows) * vocabulary_ * sizeof(float),
+               ((lanes - 1) * rows.laneRows + rows.logitsRow + rows.rows) * vocabulary_ * sizeof(float),
                "sampling logits");
   if (constrainedLanes)
     requireBytes(buffers.constraintMasks,
-                 ((constrainedLanes - 1) * (SPLASH_TARGET_VERIFY_ROWS + 1) + rows.maskRow + rows.rows) * maskWords_ *
+                 ((constrainedLanes - 1) * SPLASH_MASK_ROWS + rows.maskRow + rows.rows) * maskWords_ *
                      sizeof(uint32_t),
                  "constraint mask");
   requireBytes(buffers.outputTokens, lanes * rows.rows * sizeof(uint32_t), "sampled token");
@@ -274,8 +276,8 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
     // A drafted row reads its draft token, the next verify input row, and
     // its proposal position's candidates.
     if (drafted) {
-      requireBytes(buffers.inputTokens, (last * rows.rows + drafted + 1) * sizeof(uint32_t), "verify input token");
-      const uint64_t candidates = (last * SPLASH_DRAFT_PROPOSAL_TOKENS + drafted) * SPLASH_DRAFT_CANDIDATES;
+      requireBytes(buffers.inputTokens, (last * rows.laneRows + drafted + 1) * sizeof(uint32_t), "verify input token");
+      const uint64_t candidates = (last * (rows.laneRows - 1) + drafted) * SPLASH_DRAFT_CANDIDATES;
       requireBytes(buffers.draftCandidates, candidates * sizeof(uint32_t), "draft candidate");
       requireBytes(buffers.draftProbabilities, candidates * sizeof(float), "draft probability");
     }
@@ -333,18 +335,18 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
 }
 
 void Sampling::addThinkingDrafts(metal::CommandGraph &graph, std::span<const SamplingPolicy> policies,
-                                 metal::MetalBuffer proposedTokens) const {
+                                 metal::MetalBuffer proposedTokens, uint32_t rows) const {
   if (policies.empty() || policies.size() > kMaximumLanes)
     throw std::invalid_argument("invalid sampling batch width");
+  if (rows < 2 || rows > SPLASH_MAXIMUM_VERIFY_ROWS)
+    throw std::invalid_argument("invalid verify sampling rows");
   // The cutoffs of the verify that follows (addVerify), whose masks the
   // drafts do not read.
-  const ThinkingCutoffs cutoffs =
-      thinkingCutoffs(policies, vocabulary_, SPLASH_TARGET_VERIFY_ROWS, SPLASH_DRAFT_PROPOSAL_TOKENS, 1);
+  const ThinkingCutoffs cutoffs = thinkingCutoffs(policies, vocabulary_, rows, rows - 1, 1);
   if (!cutoffs.draftingLanes)
     return;
   // Such a lane writes its own proposals.
-  requireBytes(proposedTokens, uint64_t{cutoffs.draftingLanes} * SPLASH_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t),
-               "proposed token");
+  requireBytes(proposedTokens, uint64_t{cutoffs.draftingLanes} * (rows - 1) * sizeof(uint32_t), "proposed token");
   graph.add("decode_draft_thinking_cutoff", {std::move(proposedTokens)}, cutoffs.params, {policies.size(), 1, 1},
             {1, 1, 1});
 }
@@ -352,18 +354,19 @@ void Sampling::addThinkingDrafts(metal::CommandGraph &graph, std::span<const Sam
 void Sampling::addAcceptance(
     metal::CommandGraph &graph, AcceptanceBuffers buffers,
     std::span<const uint32_t> maximumRetained,
-    std::span<const SamplingPolicy> policies, uint32_t stopToken0,
-    uint32_t stopToken1) const {
+    std::span<const SamplingPolicy> policies, uint32_t rows,
+    uint32_t stopToken0, uint32_t stopToken1) const {
   if (maximumRetained.empty() || maximumRetained.size() != policies.size() ||
-      maximumRetained.size() > kMaximumLanes)
+      maximumRetained.size() > kMaximumLanes || rows < 2 ||
+      rows > SPLASH_MAXIMUM_VERIFY_ROWS)
     throw std::invalid_argument("invalid DFlash acceptance batch");
   const uint32_t lanes = static_cast<uint32_t>(maximumRetained.size());
   AcceptBatchParams params{};
+  params.rows = rows;
   params.stop_token_0 = stopToken0;
   params.stop_token_1 = stopToken1;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
-    if (!maximumRetained[lane] ||
-        maximumRetained[lane] > SPLASH_TARGET_VERIFY_ROWS)
+    if (!maximumRetained[lane] || maximumRetained[lane] > rows)
       throw std::invalid_argument("invalid DFlash retention limit");
     params.remaining[lane] = maximumRetained[lane];
     if (policies[lane].samples())
@@ -373,23 +376,23 @@ void Sampling::addAcceptance(
   // up to the longer of the draft and its retention limit; a sampling lane
   // also its draft's candidates and their probabilities, its rows' target
   // probabilities and its acceptance uniforms (metal/abi/Sampling.h).
-  constexpr uint64_t kProposals = SPLASH_DRAFT_PROPOSAL_TOKENS;
-  requireBytes(buffers.proposedTokens, lanes * kProposals * sizeof(uint32_t), "proposed token");
+  const uint64_t proposals = rows - 1;
+  requireBytes(buffers.proposedTokens, lanes * proposals * sizeof(uint32_t), "proposed token");
   requireBytes(buffers.outputTokens,
-               (uint64_t{lanes - 1} * SPLASH_TARGET_VERIFY_ROWS + std::max<uint64_t>(kProposals, maximumRetained.back())) *
+               (uint64_t{lanes - 1} * rows + std::max<uint64_t>(proposals, maximumRetained.back())) *
                    sizeof(uint32_t),
                "target token");
   requireBytes(buffers.retainedCounts, lanes * sizeof(uint32_t), "retained count");
   requireBytes(buffers.acceptedCounts, lanes * sizeof(uint32_t), "accepted count");
   if (const uint64_t sampledLanes = std::bit_width(params.sampling_mask)) {
-    const uint64_t candidates = sampledLanes * kProposals * SPLASH_DRAFT_CANDIDATES;
+    const uint64_t candidates = sampledLanes * proposals * SPLASH_DRAFT_CANDIDATES;
     requireBytes(buffers.candidates, candidates * sizeof(uint32_t), "draft candidate");
     requireBytes(buffers.proposalProbabilities, candidates * sizeof(float), "draft probability");
     requireBytes(buffers.targetVocabularyRows,
-                 ((sampledLanes - 1) * SPLASH_TARGET_VERIFY_ROWS + kProposals) * sizeof(TargetVocabularyRow),
+                 ((sampledLanes - 1) * rows + proposals) * sizeof(TargetVocabularyRow),
                  "target vocabulary row");
     requireBytes(buffers.uniforms,
-                 ((sampledLanes - 1) * SPLASH_SAMPLING_UNIFORMS + SPLASH_UNIFORM_ACCEPTANCE + kProposals) *
+                 ((sampledLanes - 1) * SPLASH_SAMPLING_UNIFORMS + SPLASH_UNIFORM_ACCEPTANCE(rows) + proposals) *
                      sizeof(float),
                  "acceptance uniform");
   }

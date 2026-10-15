@@ -36,14 +36,17 @@ class DraftAttentionPlan final {
 public:
   [[nodiscard]] DraftAttentionShape shape() const noexcept { return shape_; }
   [[nodiscard]] uint32_t lanes() const noexcept { return lanes_; }
+  // Each lane's query rows, lane by lane in every row tensor.
+  [[nodiscard]] uint32_t rows() const noexcept { return rows_; }
   [[nodiscard]] DraftAttentionWorkspace workspace() const noexcept;
 
 private:
-  DraftAttentionPlan(DraftAttentionShape shape, uint32_t lanes)
-      : shape_(shape), lanes_(lanes) {}
+  DraftAttentionPlan(DraftAttentionShape shape, uint32_t lanes, uint32_t rows)
+      : shape_(shape), lanes_(lanes), rows_(rows) {}
 
   DraftAttentionShape shape_;
   uint32_t lanes_;
+  uint32_t rows_;
 
   friend class DraftAttention;
 };
@@ -80,7 +83,7 @@ struct DraftDecodeAttentionBuffers final {
 class DraftAttention final {
 public:
   [[nodiscard]] static DraftAttentionPlan plan(DraftAttentionShape shape,
-                                               uint32_t lanes);
+                                               uint32_t lanes, uint32_t rows);
 
   static void addConvolution(metal::CommandGraph &graph,
                              DraftConvolutionBuffers buffers,
@@ -113,7 +116,8 @@ public:
       std::span<const metal::MetalBuffer> persistentKeys,
       std::span<const metal::MetalBuffer> persistentValues,
       metal::MetalBuffer retainedCounts,
-      std::span<const uint32_t> startPositions, DraftAttentionShape shape);
+      std::span<const uint32_t> startPositions, uint32_t rows,
+      DraftAttentionShape shape);
 
   // A context window: for each slot of a ring, the bf16 context row of
   // `width` values the slot's keys and values are computed from, in 4-bit

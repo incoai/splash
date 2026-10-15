@@ -273,7 +273,7 @@ void PagedAttention::addVerifyProjection(
             {std::move(packed), queryNorm.buffer, keyNorm.buffer,
              std::move(ropeCos), std::move(ropeSin), std::move(queries),
              std::move(chunkKeys), std::move(chunkValues)},
-            {uint64_t{SPLASH_TARGET_VERIFY_ROWS} * (queryHeads + layout.kvHeads),
+            {uint64_t{kv::kVerifyRows} * (queryHeads + layout.kvHeads),
              lanes, 1});
 }
 
@@ -285,7 +285,7 @@ PreparedInput PagedAttention::addVerifyGate(
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid paged verify gate geometry");
-  const uint32_t rows = lanes * SPLASH_TARGET_VERIFY_ROWS;
+  const uint32_t rows = lanes * kv::kVerifyRows;
   requireBytes(packed, gateBytes(rows, queryHeads, layout), "attention gate");
   requireBytes(attention, verifyStaging(lanes, layout).rowBytes(queryHeads / layout.kvHeads, layout.headDimension),
                "attention row");

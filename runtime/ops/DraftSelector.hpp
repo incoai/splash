@@ -41,8 +41,8 @@ struct DraftCodebooks final {
 // metal/kernels/decode/sampling.metal): each lane keeps the
 // SPLASH_DRAFT_CANDIDATES most likely draft tokens of every proposal
 // position, scores each candidate with its edge from the previous position's
-// choice, and walks the SPLASH_DRAFT_PROPOSAL_TOKENS positions greedily or,
-// for a sampling lane, drawing at its temperature.
+// choice, and walks its positions, one per query row after its first,
+// greedily or, for a sampling lane, drawing at its temperature.
 class DraftSelector final {
 public:
   explicit DraftSelector(uint32_t vocabulary);
@@ -50,9 +50,10 @@ public:
   // Exact scratch/output bytes for that many proposal positions.
   [[nodiscard]] static DraftSelectorWorkspace workspace(uint32_t positions);
 
+  // The proposals of lanes of `rows` query rows each.
   void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
            const DraftCodebooks &codebooks, std::span<const uint32_t> anchors,
-           std::span<const SamplingPolicy> policies) const;
+           std::span<const SamplingPolicy> policies, uint32_t rows) const;
 
 private:
   uint32_t vocabulary_ = 0;

@@ -67,6 +67,7 @@ public:
 
   [[nodiscard]] ModelTelemetry
   telemetry() const noexcept override;
+  [[nodiscard]] uint32_t verifyRows(uint32_t width) const noexcept override;
 
 private:
   // The state lane of a resident request; the storage checks that its
