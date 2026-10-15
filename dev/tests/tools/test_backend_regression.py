@@ -35,7 +35,7 @@ def benchmark_document(
     ]
     requests = (
         [(scenario, 14096) for scenario in regression.PARTIAL if "partial" in scenarios]
-        + [("short", rows + 1) for rows in regression.SHORT if "short" in scenarios]
+        + [("short", rows) for rows in regression.SHORT if "short" in scenarios]
         + [(name, 40) for name in regression.TRANSCRIPTS if "transcripts" in scenarios]
     )
     measurements = [
@@ -134,7 +134,7 @@ class BackendRegressionTests(unittest.TestCase):
             "partial_4k_hit_ttft_ms": slower("ttft_ms", 1.05, "partial_4k_hit"),
             # A prompt of a 512-row chunk 2.5% slower: beyond the 2% floor.
             "short_512_rows_prefill_gpu_ms": slower(
-                "prefill_gpu_ms", 1.025, "short", tokens=513
+                "prefill_gpu_ms", 1.025, "short", tokens=512
             ),
         }.items():
             with self.subTest(metric=name):
