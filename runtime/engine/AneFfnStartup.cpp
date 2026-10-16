@@ -36,6 +36,8 @@ std::optional<std::pair<Kind, std::string>> notRunning(const AneFfnModel &model,
   if (!model.dense) return std::pair{Kind::Unsupported, std::string("the target has no dense FFN layers")};
   if (!setting.enabled) return std::pair{Kind::Off, std::string("as given")};
   if (!model.unsupported.empty()) return std::pair{Kind::Unsupported, model.unsupported};
+  if (ops::gpuFamilyClass(model.appleGpuFamily) == ops::GpuFamilyClass::Legacy)
+    return std::pair{Kind::Unsupported, std::string("this Mac's Apple GPU family is below 9")};
   if (std::optional<std::string> reason = model.unavailable()) return std::pair{Kind::Unsupported, std::move(*reason)};
   return std::nullopt;
 }

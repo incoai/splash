@@ -286,7 +286,8 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
                        .splits = decodeSplits(n, k, gpuCores_, stagedTiers(family_))}
         : LinearConfig{.tile = LinearTile::GgufPrefill};
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
-  // kernel beats staging but for the projections apple9Stages names.
+  // kernel beats staging but for the projections apple9Stages names; the
+  // Legacy families never take the register tile and stage everywhere.
   if (family_ == GpuFamilyClass::Apple9 && registerFormats && !apple9Stages(w, projections))
     return registerDecode(n, k, gpuCores_);
   // Decode tiles walking K in lockstep all fetch the same slice of the input

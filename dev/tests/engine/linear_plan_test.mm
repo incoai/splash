@@ -366,6 +366,40 @@ void ggufPlans() {
                 chunk.configuration().splits == splits,
             "Apple9 staged split tiers");
   }
+  // The Legacy families (7 and 8: M1, M2) decode everywhere on the staged
+  // tile: the split tiers the Apple10 block pins, no register table or sums,
+  // the staged tile's 8, 16 or 32 storage rows even for register formats,
+  // walks in lockstep with the gate/up pair in two passes, and the
+  // simdgroup float tile at every row count.
+  const Linear m1 = gpu(7, 32);
+  for (const SplitAnchor &anchor : kStagedSplitAnchors)
+    requireAnchorSplits(anchorPlan(7, anchor), anchor, "Legacy GGUF staged split policy");
+  for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+    const LinearPlan q4k = m1.plan({down.matrix, lanes * 8, LinearPhase::Decode, LinearEpilogue::Residual},
+                                   blockProjection(5120, 17408, 1));
+    const uint32_t tile = lanes <= 2 ? lanes * 8 : 32;
+    require(q4k.configuration().tile == LinearTile::GgufStaged && q4k.input() == LinearInput::Plain &&
+                q4k.scratchSize().input == 0 && q4k.scratchSize().sums == 0 && q4k.storageRows() == tile &&
+                m1.decodeStorageRows(lanes * 8, downShape) == tile,
+            "Legacy GGUF decode of a register-format projection left the staged tile or its rows");
+  }
+  const LinearScratchSize m1Bound = m1.decodeScratchSize(downShape);
+  require(m1Bound.input == 0 && m1Bound.sums == 0 &&
+              m1Bound.partials ==
+                  m1.plan({down.matrix, 32, LinearPhase::Decode, LinearEpilogue::Residual},
+                          blockProjection(5120, 17408, 1)).scratchSize().partials,
+          "Legacy GGUF decode scratch bound");
+  const Projection m1Up = blockProjection(17408, 5120, 1), m1Gate = blockProjection(17408, 5120, 1);
+  const LinearPlan m1GateUp =
+      m1.plan({{17408, 5120}, 16, LinearPhase::Decode, LinearEpilogue::GateUp}, m1Up, &m1Gate);
+  require(!m1GateUp.configuration().spread && !m1GateUp.configuration().oneGateUpPass &&
+              m1GateUp.gateScratchBytes() == gateBytes(m1GateUp),
+          "Legacy GGUF gate/up spread its walks or ran one pass into no gate scratch");
+  require(m1.plan({{5120, 17408}, 100, LinearPhase::Prefill, LinearEpilogue::Residual},
+                  blockProjection(5120, 17408, 1)).configuration().tile == LinearTile::GgufPrefill,
+          "Legacy GGUF prefill stages");
+  require(m1.ggufFloatTile(16, 256) == FloatTile::Simdgroup && m1.ggufFloatTile(2048, 256) == FloatTile::Simdgroup,
+          "Legacy GGUF float projections left the simdgroup tile");
   for (const LinearConfig config : {LinearConfig{.tile = LinearTile::GgufRegister, .splits = 3},
                                     LinearConfig{.tile = LinearTile::GgufRegister, .splits = 16}})
     rejects([&] { (void)Linear::plan(down, config, FloatOutput::BFloat16); },
@@ -624,10 +658,10 @@ void producerTableContract(metal::MetalBackend &backend) {
   {
     const metal::MetalBuffer rows = allocate(backend, kRows * kHidden * 2);
     metal::CommandGraph graph;
-    rejects([&] { (void)Normalization::addRms(graph, rows, norm, rows, kHidden, kRows, {}, LinearInput::Table16); },
+    rejects([&] { (void)Normalization::addRms(backend, graph, rows, norm, rows, kHidden, kRows, {}, LinearInput::Table16); },
             "linear table buffer holds", "the norm wrote a table without scratch");
     require(graph.empty() &&
-                Normalization::addRms(graph, rows, norm, rows, kHidden, kRows).layout == LinearInput::Plain &&
+                Normalization::addRms(backend, graph, rows, norm, rows, kHidden, kRows).layout == LinearInput::Plain &&
                 plainKernel(graph, "norm_rms"),
             "the norm's table contract");
   }
@@ -705,7 +739,7 @@ void rotatedRegisterInput(metal::MetalBackend &backend) {
                 m3.decodePlan(plain, lanes).input() == LinearInput::Table16,
             "a rotated register plan's producer writes a table it discards");
     metal::CommandGraph graph;
-    (void)Normalization::addRms(graph, rows, norm, rows, 17408, lanes * 8, scratch, plan.input());
+    (void)Normalization::addRms(backend, graph, rows, norm, rows, 17408, lanes * 8, scratch, plan.input());
     require(graph.dispatches().back().pipelineName.find("_table") == std::string::npos,
             "a rotated register plan's input norm wrote a table");
   }

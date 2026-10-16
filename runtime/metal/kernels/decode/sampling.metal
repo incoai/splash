@@ -7,8 +7,8 @@
 // group per row finds the last token the distribution keeps in the order of
 // the logits (logit descending, id ascending) without sorting the
 // vocabulary, and the draw takes one pass over the kept tokens in id order,
-// shared by the row's kVocabularyGroups groups: each sums ranges of the
-// vocabulary, and the one that finishes last (split_arrive_last) draws.
+// shared by the row's draw slices: each sums ranges of the vocabulary, and
+// the one that finishes last (split_arrive_last) draws.
 // Every reduction runs in a fixed order, so a row selects the same token on
 // every run. The same kernels select the first token after a prompt and the
 // verify rows (TargetSamplingParams): each dispatch covers the selected rows
@@ -147,7 +147,6 @@ kernel void decode_sample_mass_sharded(
 // The groups that search and draw a sampled row.
 constant constexpr uint kVocabularyThreads = SPLASH_TARGET_VOCABULARY_THREADS;
 constant constexpr uint kVocabularySimdgroups = kVocabularyThreads / 32;
-constant constexpr uint kVocabularyGroups = SPLASH_TARGET_VOCABULARY_GROUPS;
 // The draw's ranges of the vocabulary; the last group loads them one per
 // thread.
 constant constexpr uint kVocabularyRanges = SPLASH_TARGET_VOCABULARY_RANGES;
@@ -321,7 +320,9 @@ template <bool Masses, uint Pivots, class Order>
 inline void measure_pivots(TargetRow row, Order order, OrderBoundary floor,
                            thread const uint (&pivots)[Pivots],
                            threadgroup VocabularyScratch &scratch,
-                           uint thread_index, uint lane, uint simd_group) {
+                           uint thread_index, uint lane, uint simd_group,
+                           uint threads) {
+  const uint groups = threads / 32;
   uint counts[Pivots];
   float masses[Pivots];
   uint lowest = pivots[0];
@@ -331,8 +332,7 @@ inline void measure_pivots(TargetRow row, Order order, OrderBoundary floor,
       masses[pivot] = 0.0f;
     lowest = min(lowest, pivots[pivot]);
   }
-  for (uint token = thread_index; token < row.vocabulary;
-       token += kVocabularyThreads) {
+  for (uint token = thread_index; token < row.vocabulary; token += threads) {
     const float value = row.logits[token];
     const uint key = order.key(value, token);
     // Tokens below every pivot add nothing.
@@ -364,12 +364,12 @@ inline void measure_pivots(TargetRow row, Order order, OrderBoundary floor,
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (thread_index < Pivots) {
     uint count = 0;
-    for (uint simd = 0; simd < kVocabularySimdgroups; ++simd)
+    for (uint simd = 0; simd < groups; ++simd)
       count += scratch.counts[simd][thread_index];
     scratch.total_counts[thread_index] = count;
     if constexpr (Masses) {
       float mass = 0.0f;
-      for (uint simd = 0; simd < kVocabularySimdgroups; ++simd)
+      for (uint simd = 0; simd < groups; ++simd)
         mass += scratch.masses[simd][thread_index];
       scratch.total_masses[thread_index] = mass;
     }
@@ -387,10 +387,10 @@ inline Measure measure_at_or_above(TargetRow row, OrderBoundary floor,
                                    uint key,
                                    threadgroup VocabularyScratch &scratch,
                                    uint thread_index, uint lane,
-                                   uint simd_group) {
+                                   uint simd_group, uint threads) {
   const uint pivots[1] = {key};
   measure_pivots<true>(row, LogitOrder{}, floor, pivots, scratch,
-                       thread_index, lane, simd_group);
+                       thread_index, lane, simd_group, threads);
   const Measure measure{scratch.total_counts[0], scratch.total_masses[0]};
   // Every thread reads the totals before the next pass rewrites them.
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -403,13 +403,14 @@ template <class Order, class Target>
 inline Bracket narrow(TargetRow row, Order order, OrderBoundary floor,
                       Bracket bracket, Target target,
                       threadgroup VocabularyScratch &scratch,
-                      uint thread_index, uint lane, uint simd_group) {
-  while (bracket.tokens() > kVocabularyThreads &&
+                      uint thread_index, uint lane, uint simd_group,
+                      uint threads) {
+  while (bracket.tokens() > threads &&
          bracket.hi - bracket.lo > 1) {
     uint pivots[kPivots];
     place_pivots(order, bracket, row.temperature, pivots);
     measure_pivots<Target::by_mass>(row, order, floor, pivots, scratch,
-                                    thread_index, lane, simd_group);
+                                    thread_index, lane, simd_group, threads);
     // The highest pivot whose measure exceeds the target and the lowest one
     // whose measure does not bound the new bracket. A pivot at lo never
     // becomes hi: lo's measure may come from another sum (the shards' masses,
@@ -448,16 +449,17 @@ template <class Order, class Target>
 inline Selection resolve(TargetRow row, Order order, OrderBoundary floor,
                          Bracket bracket, Target target,
                          threadgroup VocabularyScratch &scratch,
-                         uint thread_index, uint lane, uint simd_group) {
+                         uint thread_index, uint lane, uint simd_group,
+                         uint threads) {
+  const uint groups = threads / 32;
   constexpr bool unmeasured = Order::by_logit && !Target::by_mass;
-  const bool ranked = unmeasured && bracket.lo_count <= kVocabularyThreads;
+  const bool ranked = unmeasured && bracket.lo_count <= threads;
   const bool measures = unmeasured && !ranked;
   if (thread_index == 0)
     atomic_store_explicit(&scratch.gathered, 0u, memory_order_relaxed);
   threadgroup_barrier(mem_flags::mem_threadgroup);
   float above = 0.0f;
-  for (uint token = thread_index; token < row.vocabulary;
-       token += kVocabularyThreads) {
+  for (uint token = thread_index; token < row.vocabulary; token += threads) {
     const float value = row.logits[token];
     const uint key = order.key(value, token);
     if (key < bracket.lo || !row.admits(token) ||
@@ -470,7 +472,7 @@ inline Selection resolve(TargetRow row, Order order, OrderBoundary floor,
     }
     const uint slot = atomic_fetch_add_explicit(&scratch.gathered, 1u,
                                                 memory_order_relaxed);
-    if (slot < kVocabularyThreads) {
+    if (slot < threads) {
       scratch.keys[slot] = key;
       scratch.ids[slot] = token;
     }
@@ -483,7 +485,7 @@ inline Selection resolve(TargetRow row, Order order, OrderBoundary floor,
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const uint gathered = min(atomic_load_explicit(&scratch.gathered,
                                                  memory_order_relaxed),
-                            kVocabularyThreads);
+                            threads);
   uint key = 0;
   uint id = 0;
   uint rank = 0;
@@ -508,7 +510,7 @@ inline Selection resolve(TargetRow row, Order order, OrderBoundary floor,
     float mass = ranked ? 0.0f : bracket.hi_mass;
     if (measures) {
       mass = 0.0f;
-      for (uint simd = 0; simd < kVocabularySimdgroups; ++simd)
+      for (uint simd = 0; simd < groups; ++simd)
         mass += scratch.masses[simd][0];
     }
     // Rounding may leave a mass target unreached: keep the whole bracket.
@@ -536,12 +538,13 @@ template <class Target>
 inline Selection select_last(TargetRow row, OrderBoundary floor,
                              Bracket bracket, Target target,
                              threadgroup VocabularyScratch &scratch,
-                             uint thread_index, uint lane, uint simd_group) {
+                             uint thread_index, uint lane, uint simd_group,
+                             uint threads) {
   bracket = narrow(row, LogitOrder{}, floor, bracket, target, scratch,
-                   thread_index, lane, simd_group);
-  if (bracket.tokens() <= kVocabularyThreads)
+                   thread_index, lane, simd_group, threads);
+  if (bracket.tokens() <= threads)
     return resolve(row, LogitOrder{}, floor, bracket, target, scratch,
-                   thread_index, lane, simd_group);
+                   thread_index, lane, simd_group, threads);
   // More tokens tie at one logit than a group gathers: the target keeps its
   // first ones by id, each of the same weight, after the mass above them,
   // which a count search measures in one more pass.
@@ -555,7 +558,7 @@ inline Selection select_last(TargetRow row, OrderBoundary floor,
                            float(ties - 1)));
   } else {
     above = measure_at_or_above(row, floor, bracket.hi, scratch, thread_index,
-                                lane, simd_group)
+                                lane, simd_group, threads)
                 .mass;
     keep = target.count + 1 - bracket.hi_count;
   }
@@ -565,9 +568,9 @@ inline Selection select_last(TargetRow row, OrderBoundary floor,
     const CountTarget first{keep - 1};
     Bracket tied{1, row.vocabulary + 1, ties, 0, 0.0f, 0.0f};
     tied = narrow(row, order, floor, tied, first, scratch, thread_index, lane,
-                  simd_group);
+                  simd_group, threads);
     last = resolve(row, order, floor, tied, first, scratch, thread_index, lane,
-                   simd_group)
+                   simd_group, threads)
                .last.last;
   }
   return {{bracket.lo, last}, bracket.hi_count + keep,
@@ -585,7 +588,7 @@ inline OrderBoundary distribution_end(TargetRow row, float min_p, uint top_k,
                                       float top_p, float mass, uint admitted,
                                       threadgroup VocabularyScratch &scratch,
                                       uint thread_index, uint lane,
-                                      uint simd_group) {
+                                      uint simd_group, uint threads) {
   OrderBoundary end{kNoKey, 0};
   Bracket bracket{kLowestKey, logit_key(row.maximum) + 1, admitted, 0, mass,
                   0.0f};
@@ -596,7 +599,8 @@ inline OrderBoundary distribution_end(TargetRow row, float min_p, uint top_k,
     const uint lowest = logit_key(
         min(row.maximum + row.temperature * log(min_p), row.maximum));
     const Measure kept = measure_at_or_above(row, end, lowest, scratch,
-                                             thread_index, lane, simd_group);
+                                             thread_index, lane, simd_group,
+                                             threads);
     if (kept.count < admitted) {
       end = {lowest, 0xffffffffu};
       bracket.lo = lowest;
@@ -609,7 +613,7 @@ inline OrderBoundary distribution_end(TargetRow row, float min_p, uint top_k,
     // so this search needs no floor.
     const Selection top = select_last(row, {kNoKey, 0}, bracket,
                                       CountTarget{top_k - 1}, scratch,
-                                      thread_index, lane, simd_group);
+                                      thread_index, lane, simd_group, threads);
     end = top.last;
     if (top.ranked && top_p < 1.0f) {
       // Every thread reads the selection before the walk rewrites it.
@@ -636,7 +640,7 @@ inline OrderBoundary distribution_end(TargetRow row, float min_p, uint top_k,
   }
   if (top_p < 1.0f)
     end = select_last(row, end, bracket, MassTarget{top_p * bracket.lo_mass},
-                      scratch, thread_index, lane, simd_group)
+                      scratch, thread_index, lane, simd_group, threads)
               .last;
   return end;
 }
@@ -695,8 +699,8 @@ inline bool vocabulary_draw(
     device const uint *draft_ids, device const float *draft_probabilities,
     float uniform, device coherent(device) TargetVocabularyRange *ranges,
     device atomic_uint *arrivals, uint slice, threadgroup DrawScratch &scratch,
-    uint thread_index, uint lane, uint simd_group, thread uint &drawn,
-    thread float &draft_probability) {
+    uint thread_index, uint lane, uint simd_group, uint groups, uint slices,
+    thread uint &drawn, thread float &draft_probability) {
   const uint range_tokens = (row.vocabulary + kVocabularyRanges * 32 - 1) /
                             (kVocabularyRanges * 32) * 32;
   if (thread_index < kDraftCandidates) {
@@ -710,10 +714,11 @@ inline bool vocabulary_draw(
         id < row.vocabulary ? id / range_tokens : kVocabularyRanges;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const uint own = slice * kVocabularySimdgroups + simd_group;
-  const uint begin = min(own * range_tokens, row.vocabulary);
-  const uint finish = min(begin + range_tokens, row.vocabulary);
-  const uint held = range_candidates(own, scratch);
+  const uint own = slice * groups + simd_group;
+  const bool valid = own < kVocabularyRanges;
+  const uint begin = valid ? min(own * range_tokens, row.vocabulary) : 0u;
+  const uint finish = valid ? min(begin + range_tokens, row.vocabulary) : 0u;
+  const uint held = valid ? range_candidates(own, scratch) : 0u;
   float rest = 0.0f;
   uint after = 0;
   for (uint first = begin; first < finish; first += 32) {
@@ -726,9 +731,9 @@ inline bool vocabulary_draw(
   }
   rest = simd_sum(rest);
   after = simd_max(after);
-  if (lane == 0)
+  if (lane == 0 && valid)
     ranges[own] = {rest, after};
-  if (!split_arrive_last(arrivals, kVocabularyGroups, thread_index,
+  if (!split_arrive_last(arrivals, slices, thread_index,
                          &scratch.arrival))
     return false;
   if (thread_index < kVocabularyRanges) {
@@ -835,13 +840,14 @@ inline void search_row(TargetRow row, device const TargetShardMass *masses,
                        float min_p, uint top_k, float top_p,
                        device TargetVocabularyRow &record,
                        threadgroup VocabularyScratch &scratch,
-                       uint thread_index, uint lane, uint simd_group) {
+                       uint thread_index, uint lane, uint simd_group,
+                       uint threads) {
   const TargetShardMass merged =
       merge_masses(masses, SPLASH_TARGET_SAMPLING_SHARDS, row.temperature);
   row.maximum = merged.maximum;
   const OrderBoundary end =
       distribution_end(row, min_p, top_k, top_p, merged.sum, merged.admitted,
-                       scratch, thread_index, lane, simd_group);
+                       scratch, thread_index, lane, simd_group, threads);
   if (thread_index == 0)
     record = {merged.maximum, end.key, end.last, 0.0f};
 }
@@ -865,11 +871,12 @@ kernel void decode_sample_vocabulary_search(
   search_row(selected_row(logits, token_mask, params, s),
              partial_masses + ulong(s) * SPLASH_TARGET_SAMPLING_SHARDS,
              params.min_p[batch], params.top_k[batch], params.top_p[batch],
-             vocabulary_rows[s], scratch, thread_index, lane, simd_group);
+             vocabulary_rows[s], scratch, thread_index, lane, simd_group,
+             params.search_threads);
 }
 
-// The draw of each selected row of the sampled lanes, kVocabularyGroups
-// groups per row: the first token after a prompt, a verify row's draft
+// The draw of each selected row of the sampled lanes, its draw slices per
+// row: the first token after a prompt, a verify row's draft
 // token's probability and the correction a rejection takes or, for the last
 // verify row, which follows the whole draft, its bonus token.
 kernel void decode_sample_vocabulary_draw(
@@ -889,7 +896,9 @@ kernel void decode_sample_vocabulary_draw(
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup DrawScratch scratch;
-  const uint s = group / kVocabularyGroups;
+  const uint groups = params.draw_threads / 32;
+  const uint slices = (kVocabularyRanges + groups - 1) / groups;
+  const uint s = group / slices;
   if (!lane_samples(params, s))
     return;
   const uint batch = selected_lane(params, s);
@@ -910,8 +919,8 @@ kernel void decode_sample_vocabulary_draw(
           draft_probabilities + position * kDraftCandidates,
           uniforms[ulong(batch) * SPLASH_SAMPLING_UNIFORMS + params.uniform],
           ranges + ulong(s) * kVocabularyRanges, arrivals + s,
-          group % kVocabularyGroups, scratch, thread_index, lane, simd_group,
-          token, draft_probability) &&
+          group % slices, scratch, thread_index, lane, simd_group, groups,
+          slices, token, draft_probability) &&
       thread_index == 0) {
     tokens[s] = token;
     if (drafted)

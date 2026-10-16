@@ -51,10 +51,19 @@ struct TargetSamplingParams {
   uint32_t exclude_stop_mask;
   uint32_t stop_token_0;
   uint32_t stop_token_1;
+  // Threads of the vocabulary search's threadgroup: the kernel strides its
+  // token loops by them, and the driver caps a pipeline's total threads
+  // below the design width on some families (the search kernel on Apple7).
+  uint32_t search_threads;
+  // Threads of the vocabulary draw's threadgroups: each threadgroup's
+  // simdgroups cover that many of the row's ranges, and the row's slices
+  // (and its arrivals) follow. The driver caps the pipeline below the design
+  // width on some families (under validation, on Apple7).
+  uint32_t draw_threads;
 };
 
-static_assert(sizeof(TargetSamplingParams) == 112,
-              "Target sampling parameters are 112 bytes on both sides");
+static_assert(sizeof(TargetSamplingParams) == 120,
+              "Target sampling parameters are 120 bytes on both sides");
 
 // One shard's share of a sampled row's softmax denominator: the largest
 // logit it admits, the sum of exp((logit - maximum) / temperature) over its
