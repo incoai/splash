@@ -73,7 +73,7 @@
   .tile { flex: 1; display: flex; flex-direction: column; gap: 1px; background: var(--hover); border-radius: 8px; padding: 7px 10px }
   .tile-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em }
   .tile-value { font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums }
-  .tile-sub { font-size: 10px; color: var(--muted) }
+  .tile-sub { font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
   #gauges canvas, #cache canvas { max-width: 100%; height: auto }
   .cache-body { display: flex; gap: 18px; align-items: center; min-height: 210px }
   .cache-rows { flex: 1; min-width: 0 }
@@ -157,10 +157,10 @@
       <div class="kv-row"><span class="kv-label">ssd disk</span><div class="bar"><div class="seg-used" id="disk-used"></div></div><span class="kv-val" id="disk-counts">n/a</span><span class="kv-val dim" id="disk-extra">n/a</span><span class="kv-val dim" id="disk-io">n/a</span><span id="disk-gated" class="chip chip-na">n/a</span></div>
       <div class="kv-row"><span class="kv-label">process</span>
         <div class="proc-tiles">
-          <div class="tile"><span class="tile-label">tokenizer</span><span class="tile-value" id="pc-tok">n/a</span><span class="tile-sub">entries · hits · tokens</span></div>
-          <div class="tile"><span class="tile-label">image</span><span class="tile-value" id="pc-img">n/a</span><span class="tile-sub">entries · bytes</span></div>
-          <div class="tile"><span class="tile-label">grammar</span><span class="tile-value" id="pc-gram">n/a</span><span class="tile-sub">entries · bytes</span></div>
-          <div class="tile"><span class="tile-label">responses</span><span class="tile-value" id="pc-resp">n/a</span><span class="tile-sub">entries · bytes</span></div>
+          <div class="tile"><span class="tile-label">tokenizer</span><span class="tile-value" id="pc-tok">n/a</span><span class="tile-sub" title="entries · hits · tokens">entries · hits · tokens</span></div>
+          <div class="tile"><span class="tile-label">image</span><span class="tile-value" id="pc-img">n/a</span><span class="tile-sub" title="entries · bytes">entries · bytes</span></div>
+          <div class="tile"><span class="tile-label">grammar</span><span class="tile-value" id="pc-gram">n/a</span><span class="tile-sub" title="entries · bytes">entries · bytes</span></div>
+          <div class="tile"><span class="tile-label">responses</span><span class="tile-value" id="pc-resp">n/a</span><span class="tile-sub" title="entries · bytes">entries · bytes</span></div>
         </div>
       </div>
     </div>
@@ -417,7 +417,9 @@ function windowedRates(status) {
 }
 
 // Draws the needle (speedometer) or a center value (full circle), plus the
-// value and label text, on the gauge canvas. Text is pre-computed by set().
+// value+unit text, on the gauge canvas. Text is pre-computed by set(). The
+// phase/status word is the #gauge-note chip under the canvas — never a second
+// label inside the canvas (the owner reads that as a garbled duplicate).
 const needlePlugin = {
   id: 'dashNeedle',
   afterDraw(chart) {
@@ -452,9 +454,6 @@ const needlePlugin = {
       ctx.font = '600 16px -apple-system, BlinkMacSystemFont, sans-serif';
       ctx.fillStyle = pal.text;
       ctx.fillText(n.valueText || '', cx, cy + R * 0.55);
-      ctx.font = '11px -apple-system, BlinkMacSystemFont, sans-serif';
-      ctx.fillStyle = pal.muted;
-      ctx.fillText(n.labelText || '', cx, cy + R * 0.55 + 13);
     } else {
       ctx.font = '600 15px -apple-system, BlinkMacSystemFont, sans-serif';
       ctx.fillStyle = pal.text;
@@ -465,11 +464,14 @@ const needlePlugin = {
 };
 
 // Doughnut gauge: value segment over a track, needle/center readout.
-function makeGauge(canvas, { label, unit, mode, rotation = 240, circumference = 240, cutout = '74%', needle = true }) {
+// A full 360° ring must not round its ends: Chart.js rounds both ends of an
+// arc, and on a complete circle the two caps coincide at one point, leaving a
+// visible seam at the join (the owner's "gap at 12" on the acceptance ring).
+function makeGauge(canvas, { unit, mode, rotation = 240, circumference = 240, cutout = '74%', needle = true }) {
   const pal = palette();
   const chart = new Chart(canvas, {
     type: 'doughnut',
-    data: { datasets: [{ data: [0, 100], backgroundColor: [pal.link, pal.border], borderWidth: 0, borderRadius: 6 }] },
+    data: { datasets: [{ data: [0, 100], backgroundColor: [pal.link, pal.border], borderWidth: 0, borderRadius: circumference < 360 ? 6 : 0 }] },
     options: {
       rotation,
       circumference,
@@ -483,7 +485,7 @@ function makeGauge(canvas, { label, unit, mode, rotation = 240, circumference = 
   chart.$palette = pal;
   // n/a first: Chart.js renders on construction, and a key-required visitor
   // must not read fake zeros off the canvases.
-  chart.$needle = { needle, rotation, circumference, fraction: 0, valueText: 'n/a', labelText: '' };
+  chart.$needle = { needle, rotation, circumference, fraction: 0, valueText: 'n/a' };
   charts.push({
     kind: mode,
     chart,
@@ -496,17 +498,37 @@ function makeGauge(canvas, { label, unit, mode, rotation = 240, circumference = 
   });
   return {
     chart,
-    set(value, max, labelText) {
+    set(value, max) {
       const v = Number.isFinite(value) ? Math.max(0, value) : 0;
       const f = Math.max(0, Math.min(1, v / Math.max(max, 1e-6)));
       chart.data.datasets[0].data = [f * 100, 100 - f * 100];
       chart.$needle.fraction = f;
       chart.$needle.valueText = fmt.num(v) + ' ' + unit;
-      chart.$needle.labelText = labelText || label;
       chart.update();
     },
   };
 }
+
+// A faint floor line across the chart area. An empty ring draws nothing else,
+// and the TTFT/ITL labels under the canvases would otherwise float with no
+// visible anchor; with data it reads as the zero baseline.
+const sparkBasePlugin = {
+  id: 'dashSparkBase',
+  beforeDraw(chart) {
+    const area = chart.chartArea;
+    if (!area) return;
+    const ctx = chart.ctx;
+    const pal = chart.$palette || { border: '#888' };
+    ctx.save();
+    ctx.strokeStyle = pal.border;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(area.left, area.bottom);
+    ctx.lineTo(area.right, area.bottom);
+    ctx.stroke();
+    ctx.restore();
+  },
+};
 
 // 150-sample rolling line (p50 solid, p95 dashed); null samples gap out.
 function makeSparkline(canvas, colorKey, kind) {
@@ -526,12 +548,15 @@ function makeSparkline(canvas, colorKey, kind) {
       scales: { x: { display: false }, y: { display: false, beginAtZero: true, max: 100 } },
       plugins: { legend: { display: false }, tooltip: { enabled: false } },
     },
+    plugins: [sparkBasePlugin],
   });
+  chart.$palette = pal;
   charts.push({
     kind,
     chart,
     rebuild() {
       const p = palette();
+      chart.$palette = p;
       chart.data.datasets[0].borderColor = p[colorKey] || p.link;
       chart.data.datasets[1].borderColor = p.muted;
       chart.update('none');
@@ -653,7 +678,7 @@ function renderGauges(status) {
   const scale = phase === 'idle'
     ? niceMax(Math.max(10, maxSeen.prefill, maxSeen.decode))
     : niceMax(Math.max(10, maxSeen[phase], value));
-  speedGauge.set(value, scale, PHASE_LABEL[phase]);
+  speedGauge.set(value, scale);
   if (restarted) {
     chip(gaugeNote, 'warn', 'engine restarted');
   } else if (restartNote) {
@@ -751,12 +776,12 @@ function renderCache(status) {
   const st = s.state || {};
   const disk = s.disk || {};
   if (c.hit_rate == null || Number.isNaN(c.hit_rate)) {
-    hitRateGauge.set(0, 100, '');
+    hitRateGauge.set(0, 100);
     hitRateGauge.chart.$needle.valueText = 'n/a';
     hitRateGauge.chart.update('none');
     setVal(cacheHits, 'n/a');
   } else {
-    hitRateGauge.set(Math.max(0, Math.min(100, c.hit_rate * 100)), 100, '');
+    hitRateGauge.set(Math.max(0, Math.min(100, c.hit_rate * 100)), 100);
     setVal(cacheHits, c.hits == null || c.cold_misses == null
       ? 'n/a'
       : fmt.num(c.hits) + ' hits · ' + fmt.num(c.cold_misses) + ' cold misses');
@@ -1154,11 +1179,11 @@ else if (mediaQuery.addListener) mediaQuery.addListener(rethemeAll);
 state.palette = palette();
 
 // -------------------------------------------------------------- start
-const speedGauge = makeGauge(document.getElementById('gauge-speed'), { label: 'idle', unit: 'tok/s', mode: 'speedometer' });
-const acceptGauge = makeGauge(document.getElementById('gauge-accept'), { label: 'draft acceptance', unit: '%', mode: 'acceptance', rotation: 0, circumference: 360, cutout: '80%', needle: false });
+const speedGauge = makeGauge(document.getElementById('gauge-speed'), { unit: 'tok/s', mode: 'speedometer' });
+const acceptGauge = makeGauge(document.getElementById('gauge-accept'), { unit: '%', mode: 'acceptance', rotation: 0, circumference: 360, cutout: '80%', needle: false });
 const sparkTTFT = makeSparkline(document.getElementById('spark-ttft'), 'link', 'sparkline-ttft');
 const sparkITL = makeSparkline(document.getElementById('spark-itl'), 'ok', 'sparkline-itl');
-const hitRateGauge = makeGauge(document.getElementById('cache-hit'), { label: '', unit: '%', mode: 'hit-rate', rotation: 0, circumference: 360, cutout: '80%', needle: false });
+const hitRateGauge = makeGauge(document.getElementById('cache-hit'), { unit: '%', mode: 'hit-rate', rotation: 0, circumference: 360, cutout: '80%', needle: false });
 chip(cWaiting, 'warn', 'waiting for engine');
 cWaiting.hidden = false;
 pollOnce();
