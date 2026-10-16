@@ -61,6 +61,7 @@
   .card-title { margin: 0 0 10px; font-size: 12px; font-weight: 650; color: var(--muted); text-transform: uppercase; letter-spacing: .05em }
   .card-body { min-height: 140px }
   .card-placeholder { color: var(--muted); opacity: .6; font-size: 13px; padding: 44px 0; text-align: center }
+  #gauges canvas { max-width: 100%; height: auto }
   .gauges-body { display: flex; gap: 18px; align-items: center; min-height: 210px }
   .gauge-main { display: flex; flex-direction: column; align-items: center; gap: 6px }
   #gauge-note { font-size: 12px }
@@ -105,13 +106,13 @@
       </div>
       <div class="gauge-sparks">
         <canvas id="spark-ttft" width="160" height="46"></canvas>
-        <span class="spark-label">TTFT <span id="ttft-now"></span></span>
+        <span class="spark-label">TTFT <span id="ttft-now">n/a</span></span>
         <canvas id="spark-itl" width="160" height="46"></canvas>
-        <span class="spark-label">ITL <span id="itl-now"></span></span>
+        <span class="spark-label">ITL <span id="itl-now">n/a</span></span>
       </div>
       <div class="gauge-tiles">
-        <div class="tile"><span class="tile-label">prefill</span><span class="tile-value" id="tile-prefill"></span><span class="tile-sub">since start</span></div>
-        <div class="tile"><span class="tile-label">decode</span><span class="tile-value" id="tile-decode"></span><span class="tile-sub">since start</span></div>
+        <div class="tile"><span class="tile-label">prefill</span><span class="tile-value" id="tile-prefill">n/a</span><span class="tile-sub">since start</span></div>
+        <div class="tile"><span class="tile-label">decode</span><span class="tile-value" id="tile-decode">n/a</span><span class="tile-sub">since start</span></div>
       </div>
     </div>
   </div></section>
@@ -137,6 +138,9 @@ const state = {
   prevCounters: null, // last /status token counters (windowed diffs)
   prevPollAt: 0,      // Date.now() of the last windowed /status
   lastRestarts: 0,    // last seen transport.restarts
+  // Batch recency guard (see batchFallback): a content key per batch kind and
+  // a count of consecutive unchanged polls.
+  batchKeys: { dKey: null, pKey: null, dStale: 0, pStale: 0 },
 };
 
 // ------------------------------------------------------------- formatters
@@ -298,20 +302,25 @@ function windowedRates(status) {
   if (state.prevCounters) {
     const dt = (now - state.prevPollAt) / 1000;
     const restarted = t.restarts !== state.lastRestarts;
-    if (dt > 0 && dt < 120) {
-      const dPre = (m.prefill_input_tokens ?? 0) - state.prevCounters.prefill;
-      const dDec = (m.decode_output_tokens ?? 0) - state.prevCounters.decode;
-      if (!restarted && dPre >= 0 && dDec >= 0) {
-        out.prefill = dPre / dt;
-        out.decode = dDec / dt;
+    if (dt > 0 && dt < 120 && !restarted) {
+      const pre = m.prefill_input_tokens;
+      const dec = m.decode_output_tokens;
+      if (pre != null && pre - state.prevCounters.prefill >= 0) {
+        out.prefill = (pre - state.prevCounters.prefill) / dt;
+      }
+      if (dec != null && dec - state.prevCounters.decode >= 0) {
+        out.decode = (dec - state.prevCounters.decode) / dt;
       }
     }
   }
-  state.prevCounters = {
-    prefill: m.prefill_input_tokens ?? 0,
-    decode: m.decode_output_tokens ?? 0,
-  };
-  state.prevPollAt = now;
+  // One baseline per counter: a doc missing a counter must not re-zero the
+  // other, and a counterless doc must not advance the window clock.
+  if (m.prefill_input_tokens != null || m.decode_output_tokens != null) {
+    state.prevCounters = state.prevCounters || { prefill: 0, decode: 0 };
+    if (m.prefill_input_tokens != null) state.prevCounters.prefill = m.prefill_input_tokens;
+    if (m.decode_output_tokens != null) state.prevCounters.decode = m.decode_output_tokens;
+    state.prevPollAt = now;
+  }
   state.lastRestarts = t.restarts ?? state.lastRestarts;
   return out;
 }
@@ -334,7 +343,11 @@ const needlePlugin = {
     ctx.textAlign = 'center';
     if (n.needle !== false) {
       const frac = Number.isFinite(n.fraction) ? Math.max(0, Math.min(1, n.fraction)) : 0;
-      const ang = ((n.rotation || 240) + frac * (n.circumference || 240)) * Math.PI / 180;
+      // Follow the eased arc mid-animation. Where no arc angles exist (harness
+      // stubs), fall back to the static rotation formula.
+      const ang = typeof arc.endAngle === 'number'
+        ? arc.endAngle + Math.PI / 2
+        : ((n.rotation || 240) + frac * (n.circumference || 240)) * Math.PI / 180;
       ctx.beginPath();
       ctx.moveTo(cx, cy);
       ctx.lineTo(cx + Math.sin(ang) * R * 0.8, cy - Math.cos(ang) * R * 0.8);
@@ -472,6 +485,27 @@ const rings = { prefill: [], decode: [] };
 const maxSeen = { prefill: 0, decode: 0 };
 let restartNote = false;
 
+// The engine keeps the last completed batch's snapshot with `valid: true`
+// until the next same-kind batch completes; the flag never decays with idle
+// time (Status.hpp). A batch object unchanged across consecutive polls is
+// therefore stale. Track a content key per kind; N unchanged polls read as
+// idle. Cleared on an observed restart.
+const BATCH_STALE_POLLS = 5; // ~10 s at the 2 s poll cadence
+function batchFallback(m) {
+  const b = state.batchKeys;
+  const d = m.current_decode_batch && m.current_decode_batch.valid ? m.current_decode_batch : null;
+  const p = m.current_prefill_batch && m.current_prefill_batch.valid ? m.current_prefill_batch : null;
+  const dKey = d ? JSON.stringify(d) : null;
+  const pKey = p ? JSON.stringify(p) : null;
+  b.dStale = dKey !== null && dKey === b.dKey ? b.dStale + 1 : 0;
+  b.pStale = pKey !== null && pKey === b.pKey ? b.pStale + 1 : 0;
+  b.dKey = dKey;
+  b.pKey = pKey;
+  if (dKey !== null && b.dStale < BATCH_STALE_POLLS) return 'decode';
+  if (pKey !== null && b.pStale < BATCH_STALE_POLLS) return 'prefill';
+  return 'idle';
+}
+
 function renderGauges(status) {
   const s = status || {};
   const m = s.metrics || {};
@@ -482,7 +516,7 @@ function renderGauges(status) {
   const rates = live ? windowedRates(status) : { prefill: 0, decode: 0 };
   // An observed restart (field present and changed); a missing field is not
   // a restart, so it never clears the rings or fires the note.
-  const restarted = live && prevRestarts !== undefined && t.restarts != null && t.restarts !== prevRestarts;
+  const restarted = live && t.restarts != null && t.restarts !== prevRestarts;
   if (restarted) {
     rings.prefill.length = 0;
     rings.decode.length = 0;
@@ -490,6 +524,7 @@ function renderGauges(status) {
     maxSeen.decode = 0;
     sparkTTFT.clear();
     sparkITL.clear();
+    state.batchKeys = { dKey: null, pKey: null, dStale: 0, pStale: 0 };
     restartNote = true;
   }
   if (live) {
@@ -500,17 +535,27 @@ function renderGauges(status) {
     maxSeen.prefill = Math.max(maxSeen.prefill, rates.prefill);
     maxSeen.decode = Math.max(maxSeen.decode, rates.decode);
   }
-  // Active phase: scheduler occupancy first, then current batches, else idle.
+  // Active phase: scheduler occupancy first. Then the newest valid batch —
+  // recency-guarded, because the engine's valid flag never decays with idle.
   let phase = 'idle';
-  if ((sched.decoding ?? 0) > 0) phase = 'decode';
-  else if ((sched.prefilling ?? 0) > 0) phase = 'prefill';
-  else if ((m.current_decode_batch ?? 0) > 0) phase = 'decode';
-  else if ((m.current_prefill_batch ?? 0) > 0) phase = 'prefill';
+  let batchRate = 0;
+  if ((sched.decoding ?? 0) > 0) {
+    phase = 'decode';
+  } else if ((sched.prefilling ?? 0) > 0) {
+    phase = 'prefill';
+  } else if (live) {
+    phase = batchFallback(m);
+    if (phase === 'decode') batchRate = (m.current_decode_batch && m.current_decode_batch.tokens_per_second) || 0;
+    if (phase === 'prefill') batchRate = (m.current_prefill_batch && m.current_prefill_batch.tokens_per_second) || 0;
+  }
   const mean = (r) => (r.length ? r.reduce((a, b) => a + b, 0) / r.length : 0);
-  const value = phase === 'prefill' ? mean(rings.prefill) : phase === 'decode' ? mean(rings.decode) : 0;
+  const fromBatch = phase !== 'idle' && !(sched.decoding ?? 0) && !(sched.prefilling ?? 0);
+  const value = phase === 'idle' ? 0
+    : phase === 'prefill' ? (fromBatch ? batchRate : mean(rings.prefill))
+    : (fromBatch ? batchRate : mean(rings.decode));
   const scale = phase === 'idle'
     ? niceMax(Math.max(10, maxSeen.prefill, maxSeen.decode))
-    : niceMax(Math.max(10, maxSeen[phase]));
+    : niceMax(Math.max(10, maxSeen[phase], value));
   speedGauge.set(value, scale, PHASE_LABEL[phase]);
   if (restarted) {
     chip(gaugeNote, 'warn', 'engine restarted');
@@ -526,20 +571,27 @@ function renderGauges(status) {
   const rate = m.draft_acceptance_rate;
   if (drafted == null || drafted === 0 || accepted == null || rate == null || Number.isNaN(rate)) {
     acceptGauge.set(0, 100);
+    acceptGauge.chart.$needle.valueText = 'n/a';
+    acceptGauge.chart.update('none');
     acceptDetail.textContent = 'n/a';
   } else {
     acceptGauge.set(Math.max(0, Math.min(100, rate * 100)), 100);
     acceptDetail.textContent = fmt.num(accepted) + ' of ' + fmt.num(drafted) + ' drafts';
   }
-  // Lifetime averages: small tiles; the dial shows the current window.
-  tilePrefill.textContent = m.prefill_tokens_per_second == null ? 'n/a' : fmt.num(m.prefill_tokens_per_second) + ' tok/s';
-  tileDecode.textContent = m.decode_tokens_per_second == null ? 'n/a' : fmt.num(m.decode_tokens_per_second) + ' tok/s';
+  // Lifetime averages: small tiles; the dial shows the current window. A
+  // lifetime average of 0 means no tokens were counted: sentinel, not a rate.
+  tilePrefill.textContent = m.prefill_tokens_per_second == null || m.prefill_tokens_per_second === 0 ? 'n/a' : fmt.num(m.prefill_tokens_per_second) + ' tok/s';
+  tileDecode.textContent = m.decode_tokens_per_second == null || m.decode_tokens_per_second === 0 ? 'n/a' : fmt.num(m.decode_tokens_per_second) + ' tok/s';
+  // samples: 0 means the latency window held no request: the zeros are
+  // sentinels, so the sparkline gaps out and the label reads n/a.
   const ttft = m.ttft_ms;
   const itl = m.itl_ms;
-  sparkTTFT.push(ttft ? ttft.p50 : null, ttft ? ttft.p95 : null);
-  sparkITL.push(itl ? itl.p50 : null, itl ? itl.p95 : null);
-  ttftNow.textContent = ttft && ttft.p50 != null && !Number.isNaN(ttft.p50) ? fmt.ms(ttft.p50) : 'n/a';
-  itlNow.textContent = itl && itl.p50 != null && !Number.isNaN(itl.p50) ? fmt.ms(itl.p50) : 'n/a';
+  const ttftHas = !!ttft && ttft.samples > 0;
+  const itlHas = !!itl && itl.samples > 0;
+  sparkTTFT.push(ttftHas ? ttft.p50 : null, ttftHas ? ttft.p95 : null);
+  sparkITL.push(itlHas ? itl.p50 : null, itlHas ? itl.p95 : null);
+  ttftNow.textContent = ttftHas && ttft.p50 != null && !Number.isNaN(ttft.p50) ? fmt.ms(ttft.p50) : 'n/a';
+  itlNow.textContent = itlHas && itl.p50 != null && !Number.isNaN(itl.p50) ? fmt.ms(itl.p50) : 'n/a';
 }
 // --------------------------------------------------------------- polling
 async function pollOnce() {
