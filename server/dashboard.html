@@ -187,7 +187,7 @@ function refreshUpdated() {
     return;
   }
   const age = Math.max(0, Math.floor((Date.now() - state.lastOkAt) / 1000));
-  chip(updatedChip, age > 30 ? 'bad' : age > 10 ? 'warn' : 'ok', 'updated ' + age + 's ago');
+  chip(updatedChip, age > 30 ? 'bad' : age > 10 || state.failed > 0 ? 'warn' : 'ok', 'updated ' + age + 's ago');
   refreshStale();
 }
 
@@ -202,15 +202,15 @@ function renderStrip(status) {
   }
   cWaiting.hidden = true;
   dataChips.slice(0, 6).forEach((el) => { el.hidden = false; });
-  if (s.ready === undefined) na(cReady);
+  if (s.ready == null) na(cReady);
   else chip(cReady, s.ready ? 'ok' : 'bad', s.ready ? 'ready' : 'not ready');
   const thermal = s.thermal_state;
-  if (thermal === undefined) na(cThermal);
+  if (thermal == null) na(cThermal);
   else chip(cThermal, THERMAL[thermal] || 'na', thermal);
   const pressure = s.memory_pressure;
-  if (pressure === undefined) na(cPressure);
+  if (pressure == null) na(cPressure);
   else chip(cPressure, PRESSURE[pressure] || 'na', pressure);
-  if (!s.metal) na(cMetal);
+  if (!s.metal || s.metal.healthy == null) na(cMetal);
   else {
     chip(cMetal, s.metal.healthy ? 'ok' : 'bad', s.metal.healthy ? 'Metal' : 'Metal down');
     cMetal.title = s.metal.failure_reason || '';
@@ -268,7 +268,6 @@ async function pollOnce() {
     cWaiting.hidden = false;
     chip(cWaiting, 'bad', 'offline — retrying');
     hideDataChips();
-    chip(updatedChip, 'na', '—');
   } finally {
     scheduleNext();
   }
@@ -278,7 +277,7 @@ function scheduleNext() {
   if (state.pollTimer) clearTimeout(state.pollTimer);
   if (state.authBlocked) return;
   const interval = state.failed > 0
-    ? Math.min(2000 * Math.pow(2.5, state.failed), 10000) // 2s -> 5s -> 10s, capped
+    ? Math.min(2000 * Math.pow(2.5, state.failed - 1), 10000) // 2s -> 5s -> 10s, capped
     : (document.hidden ? 10000 : 2000);
   state.pollTimer = setTimeout(pollOnce, interval);
 }
