@@ -18,6 +18,8 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstring>
+#include <deque>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -416,6 +418,28 @@ struct BackendAsyncState {
     }
 };
 
+// Pre-encoding has its own queue so held, unsubmitted commands cannot
+// exhaust the ordinary submission queue. Reserve its aggregate capacity
+// before asking Metal for any command buffer.
+struct PreencodingPool {
+    __strong id<MTLCommandQueue> queue = nil;
+    std::atomic<NSUInteger> reserved{0};
+};
+
+struct CommandBufferReservation {
+    std::shared_ptr<PreencodingPool> pool;
+    NSUInteger count;
+    CommandBufferReservation(std::shared_ptr<PreencodingPool> pool, NSUInteger count)
+        : pool(std::move(pool)), count(count) {
+        NSUInteger held = this->pool->reserved.load();
+        do {
+            if (count > kMaximumCommandBuffers - held)
+                throw MetalBackendError("pre-encoded commands exceed the queue capacity");
+        } while (!this->pool->reserved.compare_exchange_weak(held, held + count));
+    }
+    ~CommandBufferReservation() { pool->reserved.fetch_sub(count); }
+};
+
 struct CommandTicket::State {
     std::shared_ptr<BackendAsyncState> backend;
     std::vector<std::shared_ptr<MetalAllocation>> retainedAllocations;
@@ -557,6 +581,14 @@ struct CommandTicket::State {
     }
 };
 
+// Command buffers encoded and not yet committed: the buffers before the
+// last, each ended by an event signal, and the last.
+struct EncodedBuffers {
+    std::shared_ptr<CommandBufferReservation> reservation;
+    std::vector<id<MTLCommandBuffer>> leading;
+    __strong id<MTLCommandBuffer> command = nil;
+};
+
 struct MetalBackend::Impl {
     explicit Impl(double commandTimeoutSeconds)
         : asyncState(std::make_shared<BackendAsyncState>(commandTimeoutSeconds)) {}
@@ -587,6 +619,7 @@ struct MetalBackend::Impl {
 #endif
     __strong id<MTLDevice> device = nil;
     __strong id<MTLCommandQueue> queue = nil;
+    std::shared_ptr<PreencodingPool> preencodingPool; // created only by encodeCommand
     // Runs the notify() callbacks of the backend's shared events, on a
     // serial dispatch queue.
     __strong MTLSharedEventListener *eventListener = nil;
@@ -789,6 +822,165 @@ struct MetalBackend::Impl {
         for (const std::shared_ptr<MetalAllocation> *owner : bound)
             command.retainedAllocations.push_back(*owner);
         return command;
+    }
+
+    // Encodes prepared dispatches and the event steps between them into
+    // command buffers of the queue, uncommitted. A failure is reported to
+    // `fail`, which throws.
+    template <class Fail>
+    EncodedBuffers encode(std::span<const PreparedDispatch> dispatches,
+                          std::span<const EventStep> events, Fail &&failBeforeCommit) {
+        EncodedBuffers result;
+        if (!preencodingPool) {
+            auto pool = std::make_shared<PreencodingPool>();
+            pool->queue = [device newCommandQueueWithMaxCommandBufferCount:kMaximumCommandBuffers];
+            if (!pool->queue) throw MetalBackendError("unable to create pre-encoding Metal command queue");
+            preencodingPool = std::move(pool);
+        }
+        const NSUInteger count = 1 + std::ranges::count_if(events, [](const EventStep &step) {
+            return step.kind == EventStep::Kind::Signal;
+        });
+        result.reservation = std::make_shared<CommandBufferReservation>(preencodingPool, count);
+        @autoreleasepool {
+            id<MTLCommandQueue> encodingQueue = preencodingPool->queue;
+            id<MTLCommandBuffer> command = [encodingQueue commandBuffer];
+            if (!command) {
+                failBeforeCommit("unable to create Metal command buffer");
+            }
+            residency->useFor(command);
+            // The buffers before `command`, each ended by an event signal.
+            std::vector<id<MTLCommandBuffer>> leading;
+            id<MTLComputeCommandEncoder> encoder = nil;
+            // Encodes the event steps that follow the first `encoded`
+            // dispatches.
+            auto step = events.begin();
+            const auto encodeSteps = [&](size_t encoded) {
+                for (; step != events.end() && step->before == encoded; ++step) {
+                    if (encoder) {
+                        [encoder endEncoding];
+                        encoder = nil;
+                    }
+                    id<MTLSharedEvent> event =
+                        (__bridge id<MTLSharedEvent>)step->event.nativeHandle();
+                    if (step->kind == EventStep::Kind::Wait) {
+                        [command encodeWaitForEvent:event value:step->value];
+                        continue;
+                    }
+                    [command encodeSignalEvent:event value:step->value];
+                    // A buffer that fails may end without its signal; the
+                    // work after it, waiting on an agent that waits on the
+                    // signal, would then stall until a timeout ends it. The
+                    // CPU delivers the signal instead, so the command ends
+                    // with the failure at once.
+                    const SharedEvent signaled = step->event;
+                    const uint64_t value = step->value;
+                    [command addCompletedHandler:^(id<MTLCommandBuffer> ended) {
+                        if (ended.status == MTLCommandBufferStatusError)
+                            signaled.signal(value);
+                    }];
+                    leading.push_back(command);
+                    command = [encodingQueue commandBuffer];
+                    if (!command) {
+                        failBeforeCommit("unable to create Metal command buffer");
+                    }
+                    residency->useFor(command);
+                }
+            };
+            // Indexed by argument table entry. The ticket and the dispatches
+            // keep the buffers alive.
+            __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
+            NSUInteger offsets[kBufferArgumentEntries];
+            for (size_t index = 0; index < dispatches.size(); ++index) {
+                encodeSteps(index);
+                const PreparedDispatch &item = dispatches[index];
+                const ComputeDispatch &dispatch = *item.source;
+                if (!encoder) {
+                    encoder = [command computeCommandEncoder];
+                    if (!encoder) {
+                        failBeforeCommit("unable to create Metal compute encoder");
+                    }
+                }
+                [encoder setComputePipelineState:item.pipeline];
+                for (const BufferBinding &binding : dispatch.buffers) {
+                    const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
+                    buffers[binding.index] = buffer.allocation->buffer;
+                    offsets[binding.index] = buffer.offsetBytes;
+                }
+                // One call per run of consecutive entries: a command graph's
+                // dispatch binds a single run.
+                for (uint32_t unbound = item.bufferIndices; unbound;) {
+                    const uint32_t first = std::countr_zero(unbound);
+                    const uint32_t count = std::countr_one(unbound >> first);
+                    [encoder setBuffers:buffers + first
+                                offsets:offsets + first
+                              withRange:NSMakeRange(first, count)];
+                    unbound &= ~(((uint32_t{1} << count) - 1) << first);
+                }
+                for (const BytesBinding &binding : dispatch.bytes) {
+                    [encoder setBytes:binding.data
+                               length:binding.sizeBytes
+                              atIndex:binding.index];
+                }
+                const IndirectGrid &grid = dispatch.indirectThreadgroups;
+                if (grid.buffer) {
+                    const MetalBuffer::Impl &arguments = *grid.buffer.impl_;
+                    [encoder
+                        dispatchThreadgroupsWithIndirectBuffer:
+                            arguments.allocation->buffer
+                                          indirectBufferOffset:
+                            arguments.offsetBytes + grid.offsetBytes
+                                         threadsPerThreadgroup:item.threads];
+                } else {
+                    [encoder dispatchThreadgroups:item.groups
+                             threadsPerThreadgroup:item.threads];
+                }
+            }
+            encodeSteps(dispatches.size());
+            if (encoder) [encoder endEncoding];
+            result.leading = std::move(leading);
+            result.command = command;
+        }
+        return result;
+    }
+
+    // Commits encoded command buffers as one submission; the ticket retains
+    // `retained` until it is consumed.
+    CommandTicket commitEncoded(EncodedBuffers buffers, size_t dispatchCount,
+                                std::vector<std::shared_ptr<MetalAllocation>> retained,
+                                CommandCompletion completion, AwakeClock::time_point wallStart) {
+        auto ticketState = std::make_shared<CommandTicket::State>();
+        ticketState->backend = asyncState;
+        // Retain the reservation through the existing completion field, so
+        // ordinary tickets keep exactly their original layout and lifecycle.
+        // Buffers keep their copy until destruction too, including rejection
+        // at beginSubmission; the ticket destroys its leading buffers first.
+        ticketState->completion = [reservation = buffers.reservation,
+                                   completion = std::move(completion)] {
+            static_cast<void>(reservation);
+            if (completion) completion();
+        };
+        ticketState->retainedAllocations = std::move(retained);
+        ticketState->sequence = asyncState->beginSubmission(dispatchCount);
+        ticketState->wallStart = wallStart;
+        @autoreleasepool {
+            ticketState->leadingCommands = buffers.leading;
+            // Driver callbacks only complete the ticket. Device-wide memory
+            // telemetry is sampled on the host when consuming the result. The
+            // handler holds the ticket's state strongly: once a waiter gives
+            // up on the command, it keeps the retained allocations until the
+            // GPU ends.
+            [buffers.command addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+                ticketState->finishCommand(completed);
+            }];
+            residency->use();
+            asyncState->commitSubmission(ticketState->sequence, buffers.leading, buffers.command,
+                [weakTicket = std::weak_ptr(ticketState)](
+                    id<MTLCommandBuffer> completed) {
+                    if (auto ticket = weakTicket.lock())
+                        ticket->finishCommand(completed);
+                });
+        }
+        return CommandTicket(std::move(ticketState));
     }
 
     // Encodes and commits prepared dispatches and the event steps between
@@ -1327,6 +1519,75 @@ CommandTicket MetalBackend::submitCommandAsync(const Command &command,
     return impl_->commit(prepared.dispatches, command.events,
                          std::move(prepared.retainedAllocations),
                          std::move(completion));
+}
+
+struct EncodedCommand::State {
+    std::shared_ptr<BackendAsyncState> owner;
+    EncodedBuffers buffers;
+    size_t dispatchCount = 0;
+    std::vector<std::shared_ptr<MetalAllocation>> retainedAllocations;
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+    // Dispatch profiling replays each dispatch on its own at submission.
+    bool dispatchProfiling = false; // the encode-time mode
+    std::vector<ComputeDispatch> profiled;
+    std::deque<std::vector<uint8_t>> payloads;
+#endif
+};
+
+EncodedCommand::EncodedCommand() = default;
+EncodedCommand::~EncodedCommand() = default;
+EncodedCommand::EncodedCommand(EncodedCommand &&) noexcept = default;
+EncodedCommand &EncodedCommand::operator=(EncodedCommand &&) noexcept = default;
+EncodedCommand::operator bool() const noexcept { return state_ != nullptr; }
+
+EncodedCommand MetalBackend::encodeCommand(const Command &command) {
+    checkOperation();
+    EncodedCommand encoded;
+    encoded.state_ = std::make_unique<EncodedCommand::State>();
+    encoded.state_->owner = impl_->asyncState;
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+    if (impl_->dispatchProfiling) {
+        if (!command.events.empty())
+            throw MetalBackendError(
+                "dispatch profiling does not replay event steps");
+        // Validate while the graph is alive, then copy every raw byte binding.
+        static_cast<void>(impl_->prepare(command.dispatches));
+        encoded.state_->dispatchProfiling = true;
+        encoded.state_->profiled.assign(command.dispatches.begin(), command.dispatches.end());
+        for (ComputeDispatch &dispatch : encoded.state_->profiled) {
+            for (BytesBinding &binding : dispatch.bytes) {
+                auto &payload = encoded.state_->payloads.emplace_back(binding.sizeBytes);
+                std::memcpy(payload.data(), binding.data, binding.sizeBytes);
+                binding.data = payload.data();
+            }
+        }
+        return encoded;
+    }
+#endif
+    checkEvents(command.events, command.dispatches.size());
+    Impl::PreparedCommand prepared = impl_->prepare(command.dispatches);
+    encoded.state_->buffers = impl_->encode(prepared.dispatches, command.events, [&](std::string message) {
+        impl_->markUnhealthy(message);
+        throw MetalBackendError(std::move(message));
+    });
+    encoded.state_->dispatchCount = prepared.dispatches.size();
+    encoded.state_->retainedAllocations = std::move(prepared.retainedAllocations);
+    return encoded;
+}
+
+CommandTicket MetalBackend::submitEncoded(EncodedCommand command, CommandCompletion completion) {
+    if (!command) throw MetalBackendError("an empty encoded command cannot be submitted");
+    checkOperation();
+    EncodedCommand::State &state = *command.state_;
+    if (state.owner != impl_->asyncState)
+        throw MetalBackendError("encoded command belongs to another Metal backend");
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+    if (state.dispatchProfiling)
+        return impl_->submitProfiled(state.profiled, std::move(completion));
+#endif
+    return impl_->commitEncoded(std::move(state.buffers), state.dispatchCount,
+                                std::move(state.retainedAllocations), std::move(completion),
+                                AwakeClock::now());
 }
 
 void MetalBackend::preparePipelines(

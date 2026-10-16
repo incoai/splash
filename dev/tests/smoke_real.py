@@ -124,6 +124,8 @@ class RealServer:
             command.extend(("--max-memory", arguments.max_memory))
         if arguments.max_cache_disk is not None:
             command.extend(("--max-cache-disk", arguments.max_cache_disk))
+        if getattr(arguments, "ple_ssd_cache", None) is not None:
+            command.extend(("--ple-ssd-cache", arguments.ple_ssd_cache))
         if cache_dir is not None:
             command.extend(("--persistent-cache", "--cache-dir", str(cache_dir)))
         if arguments.max_image_pixels is not None:
@@ -1688,6 +1690,11 @@ def add_server_arguments(parser):
     parser.add_argument("--max-context", type=int)
     parser.add_argument("--max-memory")
     parser.add_argument("--max-cache-disk")
+    parser.add_argument(
+        "--ple-ssd-cache",
+        help="serve Qwen3.8-Flash-Next's PLE table from its GGUF through a row "
+        "cache of this size (splash serve --ple-ssd-cache)",
+    )
     parser.add_argument("--max-image-pixels", type=int)
     parser.add_argument("--kv-format", choices=("int8", "bf16"), default="int8")
     parser.add_argument("--startup-timeout", type=float, default=1800)

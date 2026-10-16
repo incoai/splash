@@ -27,9 +27,16 @@ struct MoeShape final {
   bool registerFormats = true;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return hiddenSize && hiddenSize % 256 == 0 && experts && experts <= SPLASH_MOE_EXPERT_SLOTS &&
+    // Up to 512 experts (Qwen3.8-Flash-Next), whose width fills 64-column
+    // tiles.
+    return hiddenSize && hiddenSize % 256 == 0 && experts && experts <= 2 * SPLASH_MOE_EXPERT_SLOTS &&
            expertsPerToken && expertsPerToken <= experts &&
-           expertIntermediateSize && expertIntermediateSize % 256 == 0;
+           expertIntermediateSize && expertIntermediateSize % 64 == 0;
+  }
+  // The router's scores per row: one per thread of the select and group
+  // kernels (256, or 512 for more experts).
+  [[nodiscard]] constexpr uint32_t routerWidth() const noexcept {
+    return experts > 256 ? 512 : 256;
   }
   // Routed experts followed by the shared expert.
   [[nodiscard]] constexpr uint32_t routesPerToken() const noexcept {
@@ -236,8 +243,13 @@ struct MoeBuffers final {
 struct MoE final {
   [[nodiscard]] static MoePlan prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config);
   [[nodiscard]] static MoePlan decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config);
+  // With `firstRow`, a decode plan's lanes route their rows before it to no
+  // expert (MoeGroupParams::first_row); those rows' outputs are not theirs.
+  // With `lastRow`, the lanes' rows from it on route to no expert either
+  // (MoeGroupParams::last_row).
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
-                  const BlockMoeWeights &weights, const MoePlan &plan);
+                  const BlockMoeWeights &weights, const MoePlan &plan, uint32_t firstRow = 0,
+                  uint32_t lastRow = 0);
 };
 
 } // namespace splash::ops

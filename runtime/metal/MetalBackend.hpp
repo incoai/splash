@@ -226,6 +226,24 @@ private:
 
 using CommandCompletion = std::function<void()>;
 
+// A command encoded ahead of its submission (MetalBackend::encodeCommand).
+class EncodedCommand final {
+public:
+  EncodedCommand();
+  ~EncodedCommand();
+  EncodedCommand(const EncodedCommand &) = delete;
+  EncodedCommand &operator=(const EncodedCommand &) = delete;
+  EncodedCommand(EncodedCommand &&) noexcept;
+  EncodedCommand &operator=(EncodedCommand &&) noexcept;
+  [[nodiscard]] explicit operator bool() const noexcept;
+
+private:
+  struct State;
+  std::unique_ptr<State> state_;
+
+  friend class MetalBackend;
+};
+
 // Bytes one allocation added between two memoryStats() readings.
 [[nodiscard]] inline uint64_t allocationDelta(uint64_t before, uint64_t after) {
   if (after < before)
@@ -367,6 +385,19 @@ public:
   [[nodiscard]] CommandTicket
   submitCommandAsync(std::span<const ComputeDispatch> dispatches,
                      CommandCompletion completion = {});
+
+  // Encodes a command as submitCommandAsync does, but commits nothing: a
+  // command can be encoded while another is in flight, and submitted
+  // (submitEncoded) once that one is consumed. The buffers it binds are read
+  // when it runs, so the CPU may still write the contents of Shared ones
+  // before it submits it. Dropping it unsubmitted discards it. Pre-encoding
+  // uses a separate queue, with at most 512 command buffers reserved across
+  // held encoded commands and their tickets; exceeding it throws promptly.
+  [[nodiscard]] EncodedCommand encodeCommand(const Command &command);
+  // Commits an encoded command as submitCommandAsync commits, with the same
+  // one-in-flight rule. It belongs to the backend that encoded it and keeps
+  // the encode-time profiling mode and byte bindings. Consumes it.
+  [[nodiscard]] CommandTicket submitEncoded(EncodedCommand command, CommandCompletion completion = {});
 
   // Startup: compiles now the pipelines a later submission of these
   // dispatches would compile. Validates them as submission does and throws

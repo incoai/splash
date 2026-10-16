@@ -5,6 +5,7 @@
 #include "engine/DiskLabels.hpp"
 #include "engine/Engine.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "model/SparseRowStore.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/AneFfnMeasurement.hpp"
 
@@ -12,6 +13,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <iomanip>
 #include <limits>
 #include <optional>
@@ -21,6 +23,14 @@
 
 namespace splash::engine {
 namespace {
+
+// The threads that read a streamed PLE table's rows besides the staging
+// thread: SPLASH_PLE_SSD_READERS (0 to 64), 16 by default.
+uint32_t pleReadersFromEnvironment() {
+  const char *value = std::getenv("SPLASH_PLE_SSD_READERS");
+  if (!value || !*value) return model::ModelLoadOptions{}.pleReaders;
+  return static_cast<uint32_t>(std::clamp<long>(std::strtol(value, nullptr, 10), 0, 64));
+}
 
 static_assert(model::ExecutionLimits::maximumBatchWidth ==
               SPLASH_MAXIMUM_BATCH_WIDTH);
@@ -219,7 +229,7 @@ std::array<uint8_t, 32> parseSha256(std::string_view value) {
 
 void requireLoadedModel(const model::LoadedModel &loaded) {
   if (!loaded.targetActualAllocatedBytes() ||
-      !loaded.draft.actualAllocatedBytes ||
+      (loaded.hasDraft() && !loaded.draft.actualAllocatedBytes) ||
       (loaded.descriptor.hasVision() && !loaded.vision.actualAllocatedBytes) ||
       loaded.manifestFingerprintSha256.empty() ||
       loaded.targetManifestFingerprint().empty()) {
@@ -403,6 +413,15 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     logLine("SSD cache off: ", reason, "; no state staging is set aside.");
     stateStagingBytes = 0;
   };
+  // --ple-ssd-cache: a Qwen3.8-Flash-Next GGUF's PLE table streams from its
+  // file, so its image is not loaded, and the store's bytes (at most the
+  // option's) are charged in its place.
+  const auto *qwen4Layout = std::get_if<model::Qwen4ExpLayout>(&config.model.target);
+  const bool streamsPle = config.pleCacheBytes && qwen4Layout && qwen4Layout->pleLayer < qwen4Layout->layers &&
+                          config.model.targetSource == model::TargetSource::Gguf;
+  if (config.pleCacheBytes && !streamsPle)
+    logLine("--ple-ssd-cache ignored: ", config.model.name, " has no PLE table to stream");
+  const model::ModelLoadOptions loadOptions{streamsPle ? config.pleCacheBytes : 0, pleReadersFromEnvironment()};
   try {
     const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
         device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
@@ -412,11 +431,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // the arenas.
     kv::Layout kvLayout = config.model.targetKvLayout;
     kvLayout.format = config.kvFormat;
-    const uint64_t weightBytes = model::modelWeightBytes(config.modelRoot, config.model);
+    const uint64_t weightBytes = model::modelWeightBytes(config.modelRoot, config.model, loadOptions);
     const auto requiredFor = [&](uint64_t stagingBytes) {
       uint64_t fixedBytes = 0;
       for (const uint64_t bytes : {weightBytes, model::kPipelineReserveBytes,
-                                   model::kRuntimeOverheadReserveBytes, stagingBytes}) {
+                                   model::kRuntimeOverheadReserveBytes, stagingBytes, loadOptions.pleCacheBytes}) {
         if (!checkedAdd(fixedBytes, bytes, fixedBytes))
           fixedBytes = std::numeric_limits<uint64_t>::max();
       }
@@ -454,8 +473,14 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   model::LoadedModel loaded;
   try {
     const auto started = AwakeClock::now();
-    loaded = model::loadModel(*backend, config.modelRoot, config.model);
+    loaded = model::loadModel(*backend, config.modelRoot, config.model, loadOptions);
     requireLoadedModel(loaded);
+    if (const model::SparseRowStore *table = loaded.streamedTable()) {
+      const model::SparseRowStats stats = table->stats();
+      logLine("PLE table streams from its file: ", stats.tableBytes / kMiB, " MiB stay on the SSD; row cache of ",
+              stats.cacheCapacityRows, " rows in ", table->committedBytes() / kMiB, " MiB, ",
+              loadOptions.pleReaders, " readers.");
+    }
     const std::chrono::duration<double> loading = AwakeClock::now() - started;
     logLine("Weights loaded in ", std::fixed, std::setprecision(2),
             loading.count(), " s.");
@@ -491,6 +516,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         modelMemoryPlan,
         stagingBytes,
         aneFfnBytes,
+        loaded.streamedTable() ? loaded.streamedTable()->committedBytes() : 0,
     };
     ModelMemoryProfile modelProfile{
         loaded.name(), loaded.maximumContextTokens(),
@@ -557,7 +583,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     auto memoryGovernor = std::make_unique<MemoryGovernor>(
         *backend, memoryPlan.breakdown().hardBudgetBytes, hostReserveBytes,
         EngineMemoryPolicy::hostSpareReserveBytes(device.physicalMemoryBytes), config.hostMemory,
-        memoryPlan.breakdown().pipelineReserveBytes + memoryPlan.breakdown().runtimeOverheadReserveBytes);
+        memoryPlan.breakdown().pipelineReserveBytes + memoryPlan.breakdown().runtimeOverheadReserveBytes,
+        memoryPlan.breakdown().streamedTableBytes);
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
     // What the start allocates, the KV runway, the arenas and the warmup, is
@@ -841,6 +868,11 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       operators_,
       aneFfn_.get(),
   };
+}
+
+std::optional<model::SparseRowStats> RuntimeResources::streamedTableStats() const {
+  if (const model::SparseRowStore *table = model_.streamedTable()) return table->stats();
+  return std::nullopt;
 }
 
 AneFfnSnapshot RuntimeResources::aneFfnSnapshot() const {

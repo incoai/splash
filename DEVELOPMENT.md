@@ -200,6 +200,56 @@ aliases. Clients can impose a smaller limit. This is a capacity limit, not a
 guarantee of a fast first token for a long uncached prompt. If the model cannot
 fit, startup prints a memory budget breakdown and stops.
 
+### PLE table streaming
+
+Qwen3.8-Flash-Next's PLE n-gram table (`per_layer_token_embd.weight`, 320M rows
+of 160 values, 28.8 GB in IQ4_NL; other row widths come from GGUF metadata)
+is read by a handful of rows per token: 16 per position, hashed from the
+token and the two before it. With
+`--ple-ssd-cache SIZE`, such as `--ple-ssd-cache 2G`, the table stays in its
+GGUF on the SSD: no `ple.bin` image is written, and the weights shrink by the
+stored table size. Startup memory requirements also include the cache and
+Metal staging buffers. The rows each command gathers are read through a
+host cache with a SIZE-byte cache and working-memory reservation (at least
+64M). This reservation is not a strict bound on host allocations: prefetch
+scratch, excess vector capacity, job metadata, allocator overhead and
+reader stacks are additional, and oversized stages grow their scratch.
+Other models ignore the option with a warning; off by default.
+
+- Every command stages its rows before it is submitted: the CPU copies each
+  distinct row the command reads once into a small Shared buffer of the
+  command's arena, from the cache or, for the rows it lacks, with uncached
+  (`F_NOCACHE`) row reads (90 bytes for IQ4_NL, 170 for Q8_0) by 16 reader
+  threads and the staging thread itself (`SparseRowStore`,
+  `runtime/model/SparseRowStore.hpp`). The layer's
+  gather then reads them with the table's own kernel, so a row's values are
+  computed exactly as from the table.
+- Prefill and decode with looked-up proposals know their rows on the CPU. With
+  the MTP head the GPU hashes the proposals' rows: the draft's command ends
+  with the hash, and the verify becomes a second command (`StagedVerifyTicket`
+  in `Runtime.cpp`; a constrained cycle's target command waits for the rows
+  the same way). The verify is built with the draft and encoded into its
+  Metal command buffer while the draft runs (`MetalBackend::encodeCommand`),
+  so staging and submission wait for the draft. The verify is staged before
+  submission, without a CPU row-fill handshake inside the GPU command.
+- A prefill chunk reads ahead the rows of the prompt tokens after it while it
+  runs; the next chunk's stage finds them cached or finishes what is still in
+  flight. `SPLASH_PLE_SSD_READAHEAD=0` turns this off, and
+  `SPLASH_PLE_SSD_READERS` (0 to 64) sets the reader threads.
+- A row enters the cache only after the file was found unchanged since it was
+  read. The table is read from the descriptor its metadata was parsed from, so
+  a new file at its path changes nothing; a write to that file, a failed read
+  (after one retry) or a short file fails the step before the command that
+  requires those rows is submitted. The engine stops as it does for a weight
+  read error, and the server starts it again.
+- The cache counts as fixed runtime memory in the plan
+  (`streamed_table_bytes`) and is charged by the governor beside Metal's
+  allocations. It is not released while idle.
+- `/status` reports it under `streamed_table`: cache size and rows, per use
+  (`prefill`, `decode`) its stages, distinct rows, hits, reads, hit rate and
+  stage latencies (`p50_ms`, `p95_ms`, `p99_ms`, within a factor of two), the
+  reads' latency, the prefetches, and `poisoned` with the failure.
+
 ### KV cache precision
 
 Select the target KV format when starting the server:
@@ -1133,6 +1183,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `active_requests` | Each request the engine holds, ordered by `id`: its `id`, `phase` (`queued`, `waiting_resources`, `waiting_prefix`, `prefill`, `decode` or `waiting_mask`, and `failed` for one whose deadline passed while a cached state it restores was being read from disk, until that read drains), `priority`, `prompt_tokens` and how many of them are encoded (`prompt_processed`, cached ones included), `generated_tokens` of `max_new_tokens`, and `age_ms` since it arrived |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
 | `weights.idle_release_seconds`, `released`, `restoring`, `restores`, `restore_failures` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, whether a request's restore of it is under way (it stays `released` until the last image is back), the times it was restored for a request since engine start, and the restores that gave up for want of memory |
+| `streamed_table` | With `--ple-ssd-cache`, the [streamed PLE table](#ple-table-streaming)'s cache, stages, reads and prefetches; `null` otherwise |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
 | `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk run again adds the rerun's |

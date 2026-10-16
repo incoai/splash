@@ -146,6 +146,26 @@ def parse_max_cache_disk_writes(value):
     return size
 
 
+# The smallest row cache --ple-ssd-cache takes (NativeArguments.hpp
+# kMinimumPleCacheBytes).
+MINIMUM_PLE_CACHE_BYTES = 64 << 20
+
+
+def parse_ple_ssd_cache(value):
+    """'off' (None), or a byte count of at least 64M with a K, M or G suffix."""
+    if value.strip().lower() == "off":
+        return None
+    try:
+        size = parse_max_memory(value)
+    except argparse.ArgumentTypeError:
+        size = None
+    if size is None or size < MINIMUM_PLE_CACHE_BYTES:
+        raise argparse.ArgumentTypeError(
+            "use off, or a size of at least 64M such as 2G"
+        )
+    return size
+
+
 def parse_cache_dir(value):
     if not value.strip():
         raise argparse.ArgumentTypeError("must name a directory")
@@ -405,6 +425,18 @@ SERVE_OPTIONS = (
             help="context token limit, e.g. 100K (K = 1024 tokens); it can only "
             "lower the automatic limit, the model's native window when memory "
             "holds it (default: auto)",
+        ),
+    ),
+    ServeOption(
+        "--ple-ssd-cache",
+        "memory",
+        dict(
+            type=parse_ple_ssd_cache,
+            default=None,
+            metavar="SIZE",
+            help="stream the PLE n-gram table of a Qwen3.8-Flash-Next GGUF from "
+            "the SSD through a RAM row cache of SIZE, e.g. 2G, instead of "
+            "keeping its 28.8 GB in memory (default: off)",
         ),
     ),
     ServeOption(

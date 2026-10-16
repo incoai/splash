@@ -87,6 +87,44 @@ const char *writesGatedName(DiskWritesGate gate) noexcept {
 
 } // namespace
 
+// A streamed table's store (--ple-ssd-cache), or null: its memory, its cache,
+// per use (prefill, decode) its stages, rows and stage latencies, its reads
+// and prefetches, and whether a failure poisoned it.
+void appendLatency(std::ostringstream &out, const model::SparseRowLatency &latency) {
+  out << "{\"count\":" << latency.count << ",\"total_ms\":" << latency.totalMilliseconds
+      << ",\"max_ms\":" << latency.maximumMilliseconds << ",\"p50_ms\":" << latency.p50Milliseconds
+      << ",\"p95_ms\":" << latency.p95Milliseconds << ",\"p99_ms\":" << latency.p99Milliseconds << '}';
+}
+
+void appendStreamedTable(std::ostringstream &out, const std::optional<model::SparseRowStats> &table) {
+  if (!table) {
+    out << "null";
+    return;
+  }
+  out << "{\"tensor\":" << json::quote(table->table) << ",\"table_bytes\":" << table->tableBytes
+      << ",\"cache_bytes\":" << table->cacheBytes << ",\"cache_capacity_rows\":" << table->cacheCapacityRows
+      << ",\"cached_rows\":" << table->cachedRows << ",\"evictions\":" << table->evictions;
+  constexpr const char *kUses[model::kSparseRowUses] = {"prefill", "decode"};
+  for (uint32_t use = 0; use < model::kSparseRowUses; ++use) {
+    const model::SparseRowStats::Use &counters = table->uses[use];
+    out << ",\"" << kUses[use] << "\":{\"stages\":" << counters.stages
+        << ",\"requested_rows\":" << counters.requestedRows << ",\"unique_rows\":" << counters.uniqueRows
+        << ",\"hit_rows\":" << counters.hitRows << ",\"read_rows\":" << counters.readRows
+        << ",\"hit_rate\":"
+        << (counters.uniqueRows ? double(counters.hitRows) / double(counters.uniqueRows) : 0.0)
+        << ",\"stage\":";
+    appendLatency(out, counters.stage);
+    out << '}';
+  }
+  out << ",\"read_bytes\":" << table->readBytes << ",\"read_retries\":" << table->readRetries
+      << ",\"read_errors\":" << table->readErrors << ",\"read\":";
+  appendLatency(out, table->read);
+  out << ",\"prefetch_requested_rows\":" << table->prefetchRequestedRows
+      << ",\"prefetch_read_rows\":" << table->prefetchReadRows
+      << ",\"prefetch_dropped_rows\":" << table->prefetchDroppedRows
+      << ",\"poisoned\":" << boolean(table->poisoned) << ",\"failure\":" << json::quote(table->failure) << '}';
+}
+
 std::string runtimeStatusJson(
     const EngineMemoryPlan &plan, const engine::EngineSnapshot &core,
     const metal::MetalMemoryStats &metalMemory, const WarmupReport &warmup,
@@ -96,7 +134,8 @@ std::string runtimeStatusJson(
     const MemoryGovernorSnapshot &memoryGovernor, bool metalHealthy,
     std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait,
     const NativeLoopTiming &loop, const WeightsSnapshot &weights,
-    const AneFfnSnapshot &aneFfn, ThermalState thermalState) {
+    const AneFfnSnapshot &aneFfn, ThermalState thermalState,
+    const std::optional<model::SparseRowStats> &streamedTable) {
   const auto &resources = core.resources;
   const auto &scheduler = core.scheduler;
   const auto &pool = resources.pool;
@@ -173,6 +212,8 @@ std::string runtimeStatusJson(
       << ",\"memory_audit\":" << memoryAudit.toStatusJson()
       << ",\"weights\":";
   appendWeights(out, weights);
+  out << ",\"streamed_table\":";
+  appendStreamedTable(out, streamedTable);
   out << ",\"ane_ffn\":";
   appendAneFfn(out, aneFfn, executorTelemetry.aneFfnReruns);
   out << ",\"kv\":{\"block_tokens\":" << kv::kPageTokens

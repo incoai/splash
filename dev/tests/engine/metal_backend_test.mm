@@ -1,5 +1,6 @@
 #include "../../../runtime/metal/BackendInstrumentation.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
+#include "../../../runtime/metal/CommandGraph.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 
@@ -38,6 +39,7 @@ using splash::metal::BufferStorage;
 using splash::metal::BytesBinding;
 using splash::metal::Command;
 using splash::metal::CommandTicket;
+using splash::metal::EncodedCommand;
 using splash::metal::ComputeDispatch;
 using splash::metal::EventStep;
 using splash::metal::IndirectGrid;
@@ -1311,6 +1313,187 @@ void eventSteps(const std::string &metallibPath) {
     std::cout << "PASS event steps\n";
 }
 
+// A command encoded while another is in flight runs only once it is
+// submitted, after that one, and reads the Shared buffers it binds as the CPU
+// left them before the submission. Submitting it while another command is in
+// flight is refused, and dropping one unsubmitted is harmless.
+void encodedCommandsRunWhenSubmitted(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    MetalBuffer held = sharedBuffer(backend, sizeof(uint32_t));
+    MetalBuffer source = sharedBuffer(backend, sizeof(uint32_t));
+    MetalBuffer destination = sharedBuffer(backend, sizeof(uint32_t));
+    auto *heldValue = static_cast<volatile uint32_t *>(held.contents());
+    auto *sourceValue = static_cast<volatile uint32_t *>(source.contents());
+    auto *destinationValue = static_cast<volatile uint32_t *>(destination.contents());
+    *heldValue = 0;
+    *sourceValue = 7;
+    *destinationValue = 0;
+    const SharedEvent event = backend.newSharedEvent();
+    const uint32_t count = 1, one = 1;
+    // The first command waits for the CPU, so it stays in flight.
+    const std::vector<ComputeDispatch> first{addition(held, count, one)};
+    const std::vector<EventStep> wait{{0, event, 1, EventStep::Kind::Wait}};
+    CommandTicket running = backend.submitCommandAsync(Command{first, wait});
+    const std::vector<ComputeDispatch> copy{
+        {"test_copy_u32", {{0, source}, {1, destination}}, {{2, &count, sizeof(count)}}, {1, 1, 1}, {1, 1, 1}}};
+    EncodedCommand encoded = backend.encodeCommand(Command{copy, {}});
+    EncodedCommand refused = backend.encodeCommand(Command{copy, {}});
+    { EncodedCommand dropped = backend.encodeCommand(Command{copy, {}}); }
+    *sourceValue = 42;
+    bool rejected = false;
+    try {
+        (void)backend.submitEncoded(std::move(refused));
+    } catch (const MetalBackendError &error) {
+        rejected = std::string(error.what()).find("in-flight") != std::string::npos;
+    }
+    require(rejected && backend.healthy(), "an encoded command was submitted beside one in flight");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    require(*destinationValue == 0, "an encoded command ran before it was submitted");
+    event.signal(1);
+    (void)running.wait();
+    require(*heldValue == 1 && *destinationValue == 0, "an encoded command ran before it was submitted");
+    (void)backend.submitEncoded(std::move(encoded)).wait();
+    require(*destinationValue == 42, "an encoded command did not read what the CPU wrote before submitting it");
+    std::cout << "PASS encoded commands run when submitted\n";
+}
+
+// Deferred profiling owns graph payloads, even after the graph's heap is
+// reused. The encode-time mode determines how the command is submitted.
+void profiledEncodingOwnsBytesAndMode(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    auto source = sharedBuffer(backend, sizeof(uint32_t));
+    auto destination = sharedBuffer(backend, sizeof(uint32_t));
+    *static_cast<uint32_t *>(source.contents()) = 42;
+    auto *result = static_cast<uint32_t *>(destination.contents());
+    const auto encode = [&] {
+        splash::metal::CommandGraph graph;
+        graph.add("test_copy_u32", {source, destination}, uint32_t{1}, {1, 1, 1}, {1, 1, 1});
+        graph.add("test_add_u32", {destination}, uint32_t{1}, {}, uint32_t{13},
+                  {1, 1, 1}, {1, 1, 1});
+        return backend.encodeCommand(graph.command());
+    };
+    for (const bool profiling : {true, false}) {
+        *result = 0;
+        BackendInstrumentation::setDispatchProfiling(backend, profiling);
+        auto encoded = encode(); // graph and payload are destroyed here
+        std::vector<std::vector<uint8_t>> reused(4096, std::vector<uint8_t>(sizeof(uint32_t), 0));
+        BackendInstrumentation::setDispatchProfiling(backend, !profiling);
+        (void)backend.submitEncoded(std::move(encoded)).wait();
+        const auto profile = BackendInstrumentation::takeDispatchProfile(backend);
+        require(*result == 55 && profile.size() == (profiling ? 2 : 0),
+                "an encoded command lost its owned byte bindings or encode-time profiling mode");
+    }
+    std::cout << "PASS profiled encoding owns bytes and mode\n";
+}
+
+void encodedCommandsKeepTheirBackend(const std::string &metallibPath) {
+    MetalBackend owner(metallibPath), other(metallibPath);
+    auto buffer = sharedBuffer(owner, sizeof(uint32_t));
+    const uint32_t count = 1, one = 1;
+    const std::vector<ComputeDispatch> dispatches{addition(buffer, count, one)};
+    for (const bool profiling : {false, true}) {
+        BackendInstrumentation::setDispatchProfiling(owner, profiling);
+        auto encoded = owner.encodeCommand(Command{dispatches, {}});
+        rejects([&] { (void)other.submitEncoded(std::move(encoded)); }, "another Metal backend",
+                "an encoded command was submitted through another backend");
+    }
+    require(BackendInstrumentation::submittedCommands(owner) == 0 &&
+                BackendInstrumentation::submittedCommands(other) == 0 && owner.healthy() && other.healthy(),
+            "a foreign encoded command changed either backend's gate or health");
+    BackendInstrumentation::setDispatchProfiling(owner, false);
+    (void)owner.submitCommandAsync(Command{dispatches, {}}).wait();
+    auto otherBuffer = sharedBuffer(other, sizeof(uint32_t));
+    const std::vector<ComputeDispatch> otherDispatches{addition(otherBuffer, count, one)};
+    (void)other.submitCommandAsync(Command{otherDispatches, {}}).wait();
+    std::cout << "PASS encoded commands keep their backend\n";
+}
+
+// A full, gated ordinary submission must refuse a second one before Metal
+// allocation. An independent thread releases the event even on a regression.
+void fullQueueRejectsAnotherSubmission(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
+    const uint32_t count = 1, one = 1;
+    const std::vector<ComputeDispatch> dispatches{addition(buffer, count, one)};
+    const SharedEvent gate = backend.newSharedEvent(), signals = backend.newSharedEvent();
+    std::vector<EventStep> events{{0, gate, 1, EventStep::Kind::Wait}};
+    for (uint64_t value = 1; value <= 511; ++value)
+        events.push_back({0, signals, value, EventStep::Kind::Signal});
+    auto running = backend.submitCommandAsync(Command{dispatches, events});
+    std::promise<void> release;
+    auto released = release.get_future();
+    std::thread releaser([gate, released = std::move(released)]() mutable {
+        (void)released.wait_for(std::chrono::seconds(2));
+        gate.signal(1);
+    });
+    const auto start = std::chrono::steady_clock::now();
+    bool refused = false;
+    try {
+        (void)backend.submitCommandAsync(Command{dispatches, {}}).wait();
+    } catch (const MetalBackendError &error) {
+        refused = std::string(error.what()).find("in-flight") != std::string::npos;
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    release.set_value();
+    releaser.join();
+    (void)running.wait();
+    require(refused && elapsed < std::chrono::seconds(1) && backend.healthy(),
+            "a second submission did not promptly refuse a full gated queue");
+    std::cout << "PASS full queue rejects another submission promptly\n";
+}
+
+// Reservations cover all held pre-encoded commands, and dropping them gives
+// the capacity back. They cannot consume the ordinary submission queue.
+void boundsAggregatePreencoding(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
+    const uint32_t count = 1, one = 1;
+    const std::vector<ComputeDispatch> dispatches{addition(buffer, count, one)};
+    const SharedEvent event = backend.newSharedEvent();
+    std::vector<EventStep> events;
+    for (uint64_t value = 1; value <= 511; ++value)
+        events.push_back({0, event, value, EventStep::Kind::Signal});
+    const auto refusesWhileHeld = [&](std::vector<EncodedCommand> held, bool runOrdinary) {
+        std::promise<void> release;
+        auto released = release.get_future();
+        std::thread releaser([held = std::move(held), released = std::move(released)]() mutable {
+            (void)released.wait_for(std::chrono::seconds(2));
+            held.clear();
+        });
+        const auto start = std::chrono::steady_clock::now();
+        bool refused = false;
+        try {
+            // Start the independent release path before this too: a
+            // regression could send it to the full pre-encoding queue.
+            if (runOrdinary) (void)backend.submitCommandAsync(Command{dispatches, {}}).wait();
+            (void)backend.encodeCommand(Command{dispatches, {}});
+        } catch (const MetalBackendError &error) {
+            refused = std::string(error.what()).find("queue capacity") != std::string::npos;
+        }
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        release.set_value();
+        releaser.join();
+        require(refused && elapsed < std::chrono::seconds(1) && backend.healthy(),
+                "aggregate pre-encoding did not promptly refuse queue exhaustion");
+    };
+    std::vector<EncodedCommand> full;
+    full.push_back(backend.encodeCommand(Command{dispatches, events}));
+    refusesWhileHeld(std::move(full), true);
+    // Two 256-buffer reservations fill the same capacity in separate jobs.
+    events.resize(255);
+    std::vector<EncodedCommand> pair;
+    pair.push_back(backend.encodeCommand(Command{dispatches, events}));
+    pair.push_back(backend.encodeCommand(Command{dispatches, events}));
+    refusesWhileHeld(std::move(pair), false);
+    auto first = backend.encodeCommand(Command{dispatches, events});
+    auto second = backend.encodeCommand(Command{dispatches, events});
+    first = EncodedCommand{};
+    auto replacement = backend.encodeCommand(Command{dispatches, events});
+    second = EncodedCommand{};
+    (void)backend.submitEncoded(std::move(replacement)).wait();
+    std::cout << "PASS aggregate pre-encoding capacity\n";
+}
+
 // Submission refuses event steps it cannot encode before it submits anything:
 // a step without an event or a value, out of dispatch order or past the
 // dispatches, and a command of more signals than its queue holds command
@@ -1768,6 +1951,11 @@ int main(int argc, const char *argv[]) {
             wrappedMemory(argv[1]);
             sharedEventNotifies(argv[1]);
             eventSteps(argv[1]);
+            encodedCommandsRunWhenSubmitted(argv[1]);
+            fullQueueRejectsAnotherSubmission(argv[1]);
+            boundsAggregatePreencoding(argv[1]);
+            profiledEncodingOwnsBytesAndMode(argv[1]);
+            encodedCommandsKeepTheirBackend(argv[1]);
             eventPairsRunInOrder(argv[1]);
             malformedEventStepsRefused(argv[1]);
             failedBufferStillSignals(argv[1]);

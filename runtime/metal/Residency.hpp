@@ -22,8 +22,8 @@ namespace splash::metal {
 // kernel, whose pipeline the backend builds with its library, on a queue of
 // its own, as the runtime keeps exactly one command in flight on the command
 // queue. Destruction ends residency without GPU work: a backend being torn
-// down must not start any. The set is used only on the heartbeat's serial
-// queue.
+// down must not start any. Mutations of the set run only on the heartbeat's
+// serial queue.
 class Residency final {
 public:
   // A one-thread kernel that writes one word of its buffer 0
@@ -81,6 +81,11 @@ public:
       [set_ removeAllocation:buffer];
       [set_ commit];
     });
+  }
+
+  // Covers GPU-address-only allocations on a pre-encoded command too.
+  void useFor(id<MTLCommandBuffer> command) {
+    [command useResidencySet:set_];
   }
 
   // Marks a command. A lapsed set is requested again at once, off the

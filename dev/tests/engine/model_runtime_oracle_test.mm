@@ -1241,12 +1241,16 @@ bool ringsAreClear(const model::QwenStateStorage &states, uint32_t lane) {
 // or not, and a constrained prompt's last chunk among them, its last row is
 // not finite. The failed lanes emit nothing and the backend stays healthy. The
 // GDN cells they return to the pool are cleared or overwritten before a lane
-// reads them again, and their draft rings, where the failed cycle left rows
-// that are not finite, come back cleared.
+// reads them again, and their draft rings, where the failed cycle of a
+// DFlash2 draft left rows that are not finite, come back cleared. A target
+// without a draft (`hasDraft` false, model::nullDraftLayout) writes no rings:
+// its MTP head keeps its keys and values in the pages, which come cleared as
+// the target's do, and its carried streams in the GDN cell.
 void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
                                          kv::PageStorage &pages,
                                          const model::QwenStateStorage &states,
                                          const metal::MetalBackend &backend,
+                                         bool hasDraft,
                                          std::span<const uint32_t> chat,
                                          std::span<const uint32_t> prompt) {
   // The chat ends where the assistant starts reasoning, so a greedy lane does
@@ -1288,8 +1292,11 @@ void requireNonFiniteRowFailsOnlyItsLane(model::Runtime &executor,
   require(decoded[1].failure.empty() && !decoded[1].outputTokens.empty() &&
               !decoded[1].finished && inVocabulary(decoded[1]),
           "a non-finite lane disturbed its healthy neighbour");
-  require(ringsHoldNonFinite(states, 0),
-          "the failed decode left no row that is not finite in its draft rings");
+  if (hasDraft)
+    require(ringsHoldNonFinite(states, 0),
+            "the failed decode left no row that is not finite in its draft rings");
+  else
+    require(ringsAreClear(states, 0), "a target without a draft wrote its draft rings");
   executor.end(201);
   // The next start takes the rings the failed lane returned last.
   beginCold(executor, makeRequest(210, prompt40, 16), 0);
@@ -2276,9 +2283,13 @@ int main(int argc, char **argv) {
     // The evaluation of the split's program that fails, counted from 1 as
     // ane::ProgramInstrumentation counts them; 0 for none.
     uint64_t aneFfnFault = 0;
+    // --ple-ssd-cache BYTES: a Qwen3.8-Flash-Next target's PLE table streams
+    // from its file through a cache of BYTES, as splash serve's option does;
+    // its TOKENS line equals the resident table's.
+    model::ModelLoadOptions loadOptions;
     if (argc < 3)
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
-           "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION]");
+           "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-ssd-cache BYTES]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
@@ -2302,6 +2313,12 @@ int main(int argc, char **argv) {
         char *end = nullptr;
         aneFfnFault = std::strtoull(value, &end, 10);
         if (end == value || *end || !aneFfnFault) fail("--ane-ffn-fault takes an evaluation from 1");
+      } else if (option == "--ple-ssd-cache" && i + 1 < argc) {
+        const char *value = argv[++i];
+        char *end = nullptr;
+        loadOptions.pleCacheBytes = std::strtoull(value, &end, 10);
+        if (end == value || *end || loadOptions.pleCacheBytes < (64ULL << 20))
+          fail("--ple-ssd-cache takes a byte count of at least 67108864");
       } else fail("unknown model-runtime-oracle option");
     }
     metal::MetalBackend backend(argv[1]);
@@ -2322,13 +2339,15 @@ int main(int argc, char **argv) {
     // Metal operation while loading. This oracle has no such guard, so the
     // weights must fit in reclaimable memory above the macOS reserve before
     // any is loaded; it can refuse a model production starts.
-    const uint64_t weightBytes = model::modelWeightBytes(modelRoot, descriptor);
+    const uint64_t weightBytes = model::modelWeightBytes(modelRoot, descriptor, loadOptions) + loadOptions.pleCacheBytes;
     if (*hostAvailableBytes <= hostReserveBytes ||
         weightBytes > *hostAvailableBytes - hostReserveBytes)
       stopForHostMemory("the weights need " + mebibytes(weightBytes),
                         *hostAvailableBytes, hostReserveBytes);
     model::LoadedModel model =
-        model::loadModel(backend, modelRoot, descriptor);
+        model::loadModel(backend, modelRoot, descriptor, loadOptions);
+    if (loadOptions.pleCacheBytes)
+      std::cout << "ple_ssd_cache=" << (model.streamedTable() ? "streamed" : "ignored") << '\n';
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
         model::plannedRuntimeMemory(model, operators, format, stateFormat);
@@ -2339,7 +2358,8 @@ int main(int argc, char **argv) {
           model.targetActualAllocatedBytes(),
           model.draft.actualAllocatedBytes,
           model.vision.actualAllocatedBytes,
-          executorPlan, 0, aneFfnBytes};
+          executorPlan, 0, aneFfnBytes,
+          model.streamedTable() ? model.streamedTable()->committedBytes() : 0};
       ModelMemoryProfile profile{
           model.name(), model.maximumContextTokens(),
           model.targetKvLayout(format), footprint, stateFormat};
@@ -2405,7 +2425,7 @@ int main(int argc, char **argv) {
         budget.pipelineReserveBytes - budget.runtimeOverheadReserveBytes;
     MemoryGovernor governor(backend, elasticGrowthCeiling, hostReserveBytes,
                             EngineMemoryPolicy::hostSpareReserveBytes(device.physicalMemoryBytes),
-                            queryHostMemory, 0);
+                            queryHostMemory, 0, budget.streamedTableBytes);
     std::cout << "ane_ffn_share=" << (aneFfn ? aneFfn->share() : 0.0)
               << " ane_ffn_minimum_rows=" << (aneFfn ? aneFfn->minimumRows() : 0) << '\n';
     const metal::AllocationAdmission governed =
@@ -2555,9 +2575,13 @@ int main(int argc, char **argv) {
     const uint64_t beforeFirstDecode =
         BackendInstrumentation::submittedCommands(backend);
     ModelStepResult decoded = decodeOne(executor, 1, 128, pageTable);
+    // With a streamed PLE table the MTP head's draft is a command of its own:
+    // the CPU stages the rows it hashed before the verify's is encoded.
+    const auto *qwen4 = std::get_if<model::Qwen4ExpLayout>(&model.descriptor.target);
+    const uint64_t decodeCommands = model.streamedTable() && qwen4 && qwen4->mtpLayers ? 2 : 1;
     require(BackendInstrumentation::submittedCommands(backend) ==
-                beforeFirstDecode + 1,
-            "speculative verify and commit were not one Metal command");
+                beforeFirstDecode + decodeCommands,
+            "speculative verify and commit were not one Metal command (two with a streamed PLE table)");
     require(!decoded.outputTokens.empty(), "decode produced no tokens");
     require(states.metadata(0).lengths.targetTokens ==
                     128 + decoded.outputTokens.size() &&
@@ -2629,7 +2653,7 @@ int main(int argc, char **argv) {
               "decode request has no current anchor", "score request allowed a decode step");
       executor.end(99);
     }
-    requireNonFiniteRowFailsOnlyItsLane(executor, pages, states, backend,
+    requireNonFiniteRowFailsOnlyItsLane(executor, pages, states, backend, model.hasDraft(),
                                         samplingSeedTokens, prompt128);
     requireThinkingBudgetClosesThinking(executor);
     requireConstrainedThinkingEndWaitsForItsMask(executor);

@@ -215,6 +215,30 @@ class SmokeRealTests(unittest.TestCase):
                         command[index + 1 : index + 3], ["--cache-dir", "/tmp/cache"]
                     )
 
+    def test_a_streamed_ple_table_reaches_the_server(self):
+        model = ["--model", "unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS"]
+        self.assertIsNone(smoke_real.parse_args(model).ple_ssd_cache)
+        self.assertEqual(
+            smoke_real.parse_args([*model, "--ple-ssd-cache", "2G"]).ple_ssd_cache,
+            "2G",
+        )
+        with self.server():
+            command = smoke_real.subprocess.Popen.call_args.args[0]
+            self.assertNotIn("--ple-ssd-cache", command)
+        arguments = self.server_arguments()
+        arguments.ple_ssd_cache = "2G"
+        with (
+            mock.patch.object(smoke_real, "available_port", return_value=8000),
+            mock.patch.object(smoke_real.subprocess, "Popen") as popen,
+        ):
+            popen.return_value.poll.return_value = 0
+            server = smoke_real.RealServer(arguments)
+            try:
+                command = popen.call_args.args[0]
+                self.assertEqual(command[command.index("--ple-ssd-cache") + 1], "2G")
+            finally:
+                server.close()
+
     def test_persistent_cache_scenario_needs_the_ssd_cache(self):
         model = ["--model", "mlx-community/Qwen3.8-27B-4bit"]
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

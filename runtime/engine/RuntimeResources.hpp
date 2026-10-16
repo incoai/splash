@@ -11,6 +11,7 @@
 #include "ops/PageStorage.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/QwenState.hpp"
+#include "model/SparseRowStore.hpp"
 #include "engine/MemoryAudit.hpp"
 #include "engine/ReleasableMemory.hpp"
 #include "engine/Status.hpp"
@@ -128,6 +129,10 @@ struct RuntimeResourcesConfig {
   // Reclaimable host memory, sampled at every Metal operation during startup
   // and by the governor afterwards.
   MemoryGovernor::HostMemoryProvider hostMemory = queryHostMemory;
+  // --ple-ssd-cache: a Qwen3.8-Flash-Next GGUF's PLE table streams from its
+  // file through a row cache of this many bytes instead of loading into
+  // memory; zero loads it. Ignored, with a warning, for other models.
+  uint64_t pleCacheBytes = 0;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
@@ -247,6 +252,8 @@ public:
   [[nodiscard]] const AneFfnOutcome &aneFfnOutcome() const noexcept { return aneFfnOutcome_; }
   // The split as it stands now, for /status.
   [[nodiscard]] AneFfnSnapshot aneFfnSnapshot() const;
+  // The streamed PLE table's store (--ple-ssd-cache), if the model has one.
+  [[nodiscard]] std::optional<model::SparseRowStats> streamedTableStats() const;
 
   [[nodiscard]] model::RuntimeContext modelContext() noexcept;
   // What the engine gives back while idle (NativeLoopConfig::weights): the

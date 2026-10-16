@@ -571,6 +571,42 @@ void testWeightsStatus() {
           "an idle release that is off is not null");
 }
 
+// A streamed table's store (--ple-ssd-cache): null without one; with one its
+// memory, per use its stages, rows, hit rate and stage latencies, its reads,
+// prefetches and failure. An added field: the schema version stays.
+void testStreamedTableStatus() {
+  const auto memoryPlan = plan();
+  const auto status = [&](const std::optional<model::SparseRowStats> &table) {
+    return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, {}, {}, {}, {}, {}, table);
+  };
+  require(status(std::nullopt).find(",\"streamed_table\":null,") != std::string::npos,
+          "a model without a streamed table does not report null");
+  model::SparseRowStats table;
+  table.table = "per_layer_token_embd.weight";
+  table.tableBytes = 28800138240;
+  table.cacheBytes = 2147483648;
+  table.cacheCapacityRows = 18000000;
+  table.cachedRows = 1200;
+  table.uses[1] = {10, 1280, 1000, 750, 250, {10, 12.5, 3.25, 1.024, 2.048, 4.096}};
+  table.readBytes = 22500;
+  table.prefetchRequestedRows = 32768;
+  table.prefetchReadRows = 30000;
+  table.poisoned = true;
+  table.failure = "injected";
+  const std::string json = status(table);
+  require(json.find("\"streamed_table\":{\"tensor\":\"per_layer_token_embd.weight\",\"table_bytes\":28800138240,"
+                    "\"cache_bytes\":2147483648,\"cache_capacity_rows\":18000000,\"cached_rows\":1200,"
+                    "\"evictions\":0,\"prefill\":{\"stages\":0,") != std::string::npos &&
+              json.find("\"decode\":{\"stages\":10,\"requested_rows\":1280,\"unique_rows\":1000,"
+                        "\"hit_rows\":750,\"read_rows\":250,\"hit_rate\":0.75,\"stage\":{\"count\":10,"
+                        "\"total_ms\":12.5,\"max_ms\":3.25,\"p50_ms\":1.024,\"p95_ms\":2.048,"
+                        "\"p99_ms\":4.096}}") != std::string::npos &&
+              json.find("\"prefetch_read_rows\":30000,\"prefetch_dropped_rows\":0,\"poisoned\":true,"
+                        "\"failure\":\"injected\"}") != std::string::npos &&
+              json.find("\"schema_version\":6,") != std::string::npos,
+          "the streamed table's status is missing or inaccurate");
+}
+
 // The prefill FFN's Neural Engine split: off with the start's reason and no
 // share, serving with the start's, stopped with why, and what it ran beside
 // the chunks the GPU ran again.
@@ -701,6 +737,7 @@ int main(int argc, char **argv) {
     testResourceWaitDiagnostics();
     testWeightsStatus();
     testAneFfnStatus();
+    testStreamedTableStatus();
     testThermalStateStatus();
     testThermalStateTransitions();
     testStderrLinesStayWhole();

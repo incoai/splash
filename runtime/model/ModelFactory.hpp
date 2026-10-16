@@ -26,7 +26,16 @@ namespace splash::model {
 class QwenStateStorage;
 class VisionLoader;
 
-using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights>;
+using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights>;
+
+// How a model loads beside its descriptor: with pleCacheBytes, a Qwen3.8-
+// Flash-Next GGUF target's PLE table streams from its file through a row
+// cache of that many bytes, read by pleReaders threads, instead of loading
+// into memory (--ple-ssd-cache). Other models load as without it.
+struct ModelLoadOptions final {
+  uint64_t pleCacheBytes = 0;
+  uint32_t pleReaders = 16;
+};
 
 struct LoadedModel final {
   ModelDescriptor descriptor;
@@ -40,6 +49,8 @@ struct LoadedModel final {
   [[nodiscard]] const std::string &name() const noexcept {
     return descriptor.name;
   }
+  // Whether a DFlash2 draft runs (ModelDescriptor::hasDraft).
+  [[nodiscard]] bool hasDraft() const noexcept { return descriptor.hasDraft(); }
   [[nodiscard]] kv::Layout targetKvLayout(kv::Format format) const noexcept {
     auto layout = descriptor.targetKvLayout;
     layout.format = format;
@@ -62,6 +73,11 @@ struct LoadedModel final {
     return std::visit([](const auto &weights) -> const std::string & {
       return weights.manifestFingerprintSha256;
     }, target);
+  }
+  // The store a streamed PLE table is read through, or null.
+  [[nodiscard]] SparseRowStore *streamedTable() const noexcept {
+    const auto *qwen4 = std::get_if<Qwen4ExpWeights>(&target);
+    return qwen4 ? qwen4->pleStore.get() : nullptr;
   }
   [[nodiscard]] std::span<const WeightFileRecord> targetFiles() const noexcept {
     return std::visit([](const auto &weights) ->
@@ -88,7 +104,9 @@ struct RuntimeContext final {
 void requireCompatibleModel(const LoadedModel &model);
 
 // The bytes of every image the model's weights load into.
-[[nodiscard]] uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor);
+// The bytes of the images loadModel writes, without a PLE table that streams.
+[[nodiscard]] uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor,
+                                        const ModelLoadOptions &options = {});
 
 // The vision role's source, planned; null for a model without vision.
 [[nodiscard]] std::unique_ptr<VisionLoader> planVisionLoader(const std::filesystem::path &root,
@@ -103,7 +121,8 @@ void requireCompatibleModel(const LoadedModel &model);
 [[nodiscard]] LoadedModel
 loadModel(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
-                 const ModelDescriptor &descriptor);
+                 const ModelDescriptor &descriptor,
+                 const ModelLoadOptions &options = {});
 
 // The FFN layers of a dense target, which the prefill FFN's Neural Engine
 // split (ops::AneFfn) may take; none for another target.

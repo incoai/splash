@@ -53,7 +53,14 @@ struct NativeArguments final {
   // Neural Engine when that is faster (splash serve --disable-ane turns it
   // off).
   bool neuralEngine = true;
+  // --ple-ssd-cache BYTES: stream a Qwen3.8-Flash-Next GGUF's PLE table from
+  // its file through a host row cache of BYTES in all (at least
+  // kMinimumPleCacheBytes) instead of loading it; 0, without the option,
+  // loads it (RuntimeResourcesConfig::pleCacheBytes).
+  uint64_t pleCacheBytes = 0;
 };
+
+inline constexpr uint64_t kMinimumPleCacheBytes = 64ULL << 20;
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto
 // [MAX_CACHE_DISK_BYTES] [--name value]...` and inspects the model the
