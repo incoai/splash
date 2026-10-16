@@ -61,6 +61,20 @@
   .card-title { margin: 0 0 10px; font-size: 12px; font-weight: 650; color: var(--muted); text-transform: uppercase; letter-spacing: .05em }
   .card-body { min-height: 140px }
   .card-placeholder { color: var(--muted); opacity: .6; font-size: 13px; padding: 44px 0; text-align: center }
+  .gauges-body { display: flex; gap: 18px; align-items: center; min-height: 210px }
+  .gauge-main { display: flex; flex-direction: column; align-items: center; gap: 6px }
+  #gauge-note { font-size: 12px }
+  .gauge-side { flex: 1; display: grid; grid-template-columns: auto 1fr; gap: 16px; min-width: 0 }
+  .gauge-sub { display: flex; flex-direction: column; align-items: center; gap: 3px }
+  .gauge-sub-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em }
+  .gauge-sub-detail { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums }
+  .gauge-sparks { display: flex; flex-direction: column; gap: 1px; min-width: 0 }
+  .spark-label { font-size: 11px; color: var(--muted); margin-top: 3px; font-variant-numeric: tabular-nums }
+  .gauge-tiles { grid-column: 1 / -1; display: flex; gap: 12px }
+  .tile { flex: 1; display: flex; flex-direction: column; gap: 1px; background: var(--hover); border-radius: 8px; padding: 7px 10px }
+  .tile-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em }
+  .tile-value { font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums }
+  .tile-sub { font-size: 10px; color: var(--muted) }
 </style>
 <script src="/dashboard-assets/chart-4.5.1.min.js"></script>
 </head>
@@ -78,7 +92,29 @@
   <div id="strip"><span id="updated" class="chip chip-na">—</span></div>
 </header>
 <main class="grid">
-  <section class="card" id="gauges"><h2 class="card-title">Speed</h2><div class="card-body"><div class="card-placeholder">—</div></div></section>
+  <section class="card" id="gauges"><h2 class="card-title">Speed</h2><div class="card-body gauges-body">
+    <div class="gauge-main">
+      <canvas id="gauge-speed" width="220" height="200"></canvas>
+      <span id="gauge-note" class="chip chip-na">idle</span>
+    </div>
+    <div class="gauge-side">
+      <div class="gauge-sub">
+        <canvas id="gauge-accept" width="108" height="108"></canvas>
+        <span id="gauge-accept-label" class="gauge-sub-label">draft acceptance</span>
+        <span id="gauge-accept-detail" class="gauge-sub-detail">n/a</span>
+      </div>
+      <div class="gauge-sparks">
+        <canvas id="spark-ttft" width="160" height="46"></canvas>
+        <span class="spark-label">TTFT <span id="ttft-now"></span></span>
+        <canvas id="spark-itl" width="160" height="46"></canvas>
+        <span class="spark-label">ITL <span id="itl-now"></span></span>
+      </div>
+      <div class="gauge-tiles">
+        <div class="tile"><span class="tile-label">prefill</span><span class="tile-value" id="tile-prefill"></span><span class="tile-sub">since start</span></div>
+        <div class="tile"><span class="tile-label">decode</span><span class="tile-value" id="tile-decode"></span><span class="tile-sub">since start</span></div>
+      </div>
+    </div>
+  </div></section>
   <section class="card" id="cache"><h2 class="card-title">KV cache</h2><div class="card-body"><div class="card-placeholder">—</div></div></section>
   <section class="card" id="memory"><h2 class="card-title">Memory</h2><div class="card-body"><div class="card-placeholder">—</div></div></section>
   <section class="card" id="requests"><h2 class="card-title">Requests</h2><div class="card-body"><div class="card-placeholder">—</div></div></section>
@@ -98,6 +134,9 @@ const state = {
   pollTimer: 0,
   tickerTimer: 0,
   palette: null,
+  prevCounters: null, // last /status token counters (windowed diffs)
+  prevPollAt: 0,      // Date.now() of the last windowed /status
+  lastRestarts: 0,    // last seen transport.restarts
 };
 
 // ------------------------------------------------------------- formatters
@@ -228,7 +267,7 @@ function renderStrip(status) {
 }
 
 // --------------------------------------------------------- render dispatch
-const panels = { strip: renderStrip }; // Tasks 3-5 register the other panels
+const panels = { strip: renderStrip, gauges: renderGauges }; // Tasks 4-5 register the remaining panels
 
 function render(status) {
   state.lastStatus = status || null;
@@ -237,6 +276,270 @@ function render(status) {
   for (const fn of Object.values(panels)) {
     try { fn(status); } catch (err) { console.warn('dashboard panel error:', err); }
   }
+}
+// -------------------------------------------------------------- gauges
+// 1/2/5·10ⁿ scale ceiling, with a 10 tok/s floor so dials stay readable.
+function niceMax(x) {
+  if (!Number.isFinite(x) || x <= 0) return 10;
+  const exp = Math.floor(Math.log10(x));
+  const frac = x / Math.pow(10, exp);
+  const nice = frac <= 1 ? 1 : frac <= 2 ? 2 : frac <= 5 ? 5 : 10;
+  return nice * Math.pow(10, exp);
+}
+
+// The active-phase decision, made mechanical: tok/s for the current poll
+// window, from diffs of the engine's cumulative counters. A restart (counter
+// reset) or an over-long window yields 0 rather than a bogus spike.
+function windowedRates(status) {
+  const m = (status && status.metrics) || {};
+  const t = (status && status.transport) || {};
+  const now = Date.now();
+  const out = { prefill: 0, decode: 0 };
+  if (state.prevCounters) {
+    const dt = (now - state.prevPollAt) / 1000;
+    const restarted = t.restarts !== state.lastRestarts;
+    if (dt > 0 && dt < 120) {
+      const dPre = (m.prefill_input_tokens ?? 0) - state.prevCounters.prefill;
+      const dDec = (m.decode_output_tokens ?? 0) - state.prevCounters.decode;
+      if (!restarted && dPre >= 0 && dDec >= 0) {
+        out.prefill = dPre / dt;
+        out.decode = dDec / dt;
+      }
+    }
+  }
+  state.prevCounters = {
+    prefill: m.prefill_input_tokens ?? 0,
+    decode: m.decode_output_tokens ?? 0,
+  };
+  state.prevPollAt = now;
+  state.lastRestarts = t.restarts ?? state.lastRestarts;
+  return out;
+}
+
+// Draws the needle (speedometer) or a center value (full circle), plus the
+// value and label text, on the gauge canvas. Text is pre-computed by set().
+const needlePlugin = {
+  id: 'dashNeedle',
+  afterDraw(chart) {
+    const meta = chart.getDatasetMeta(0);
+    const arc = meta && meta.data && meta.data[0];
+    const n = chart.$needle;
+    if (!arc || !n) return;
+    const cx = arc.x;
+    const cy = arc.y;
+    const R = arc.outerRadius;
+    const pal = chart.$palette || { text: '#000', muted: '#888' };
+    const ctx = chart.ctx;
+    ctx.save();
+    ctx.textAlign = 'center';
+    if (n.needle !== false) {
+      const frac = Number.isFinite(n.fraction) ? Math.max(0, Math.min(1, n.fraction)) : 0;
+      const ang = ((n.rotation || 240) + frac * (n.circumference || 240)) * Math.PI / 180;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + Math.sin(ang) * R * 0.8, cy - Math.cos(ang) * R * 0.8);
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = pal.text;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(cx, cy, 3, 0, Math.PI * 2);
+      ctx.fillStyle = pal.text;
+      ctx.fill();
+      ctx.font = '600 16px -apple-system, BlinkMacSystemFont, sans-serif';
+      ctx.fillStyle = pal.text;
+      ctx.fillText(n.valueText || '', cx, cy + R * 0.55);
+      ctx.font = '11px -apple-system, BlinkMacSystemFont, sans-serif';
+      ctx.fillStyle = pal.muted;
+      ctx.fillText(n.labelText || '', cx, cy + R * 0.55 + 13);
+    } else {
+      ctx.font = '600 15px -apple-system, BlinkMacSystemFont, sans-serif';
+      ctx.fillStyle = pal.text;
+      ctx.fillText(n.valueText || '', cx, cy + 5);
+    }
+    ctx.restore();
+  },
+};
+
+// Doughnut gauge: value segment over a track, needle/center readout.
+function makeGauge(canvas, { label, unit, mode, rotation = 240, circumference = 240, cutout = '74%', needle = true }) {
+  const pal = palette();
+  const chart = new Chart(canvas, {
+    type: 'doughnut',
+    data: { datasets: [{ data: [0, 100], backgroundColor: [pal.link, pal.border], borderWidth: 0, borderRadius: 6 }] },
+    options: {
+      rotation,
+      circumference,
+      cutout,
+      responsive: false,
+      animation: { duration: 450, easing: 'easeOutQuad' },
+      plugins: { legend: { display: false }, tooltip: { enabled: false } },
+    },
+    plugins: [needlePlugin],
+  });
+  chart.$palette = pal;
+  chart.$needle = { needle, rotation, circumference, fraction: 0, valueText: '0 ' + unit, labelText: label };
+  charts.push({
+    kind: mode,
+    chart,
+    rebuild() {
+      const p = palette();
+      chart.$palette = p;
+      chart.data.datasets[0].backgroundColor = [p.link, p.border];
+      chart.update('none');
+    },
+  });
+  return {
+    chart,
+    set(value, max, labelText) {
+      const v = Number.isFinite(value) ? Math.max(0, value) : 0;
+      const f = Math.max(0, Math.min(1, v / Math.max(max, 1e-6)));
+      chart.data.datasets[0].data = [f * 100, 100 - f * 100];
+      chart.$needle.fraction = f;
+      chart.$needle.valueText = fmt.num(v) + ' ' + unit;
+      chart.$needle.labelText = labelText || label;
+      chart.update();
+    },
+  };
+}
+
+// 150-sample rolling line (p50 solid, p95 dashed); null samples gap out.
+function makeSparkline(canvas, colorKey, kind) {
+  const pal = palette();
+  const chart = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        { data: [], borderColor: pal[colorKey] || pal.link, borderWidth: 1.5, pointRadius: 0, tension: 0.3, spanGaps: false },
+        { data: [], borderColor: pal.muted, borderWidth: 1, borderDash: [3, 3], pointRadius: 0, tension: 0.3, spanGaps: false },
+      ],
+    },
+    options: {
+      responsive: false,
+      animation: false,
+      scales: { x: { display: false }, y: { display: false, beginAtZero: true, max: 100 } },
+      plugins: { legend: { display: false }, tooltip: { enabled: false } },
+    },
+  });
+  charts.push({
+    kind,
+    chart,
+    rebuild() {
+      const p = palette();
+      chart.data.datasets[0].borderColor = p[colorKey] || p.link;
+      chart.data.datasets[1].borderColor = p.muted;
+      chart.update('none');
+    },
+  });
+  const RING = 150;
+  const r50 = [];
+  const r95 = [];
+  return {
+    chart,
+    push(v50, v95) {
+      r50.push(v50 == null || Number.isNaN(v50) ? null : v50);
+      r95.push(v95 == null || Number.isNaN(v95) ? null : v95);
+      while (r50.length > RING) r50.shift();
+      while (r95.length > RING) r95.shift();
+      chart.data.datasets[0].data = r50;
+      chart.data.datasets[1].data = r95;
+      chart.data.labels = r50.map((_, i) => i);
+      const vals = r50.concat(r95).filter((v) => v != null);
+      chart.options.scales.y.max = niceMax(Math.max(1, ...vals));
+      chart.update('none');
+    },
+    clear() {
+      r50.length = 0;
+      r95.length = 0;
+      chart.data.datasets[0].data = [];
+      chart.data.datasets[1].data = [];
+      chart.data.labels = [];
+      chart.options.scales.y.max = 100;
+      chart.update('none');
+    },
+  };
+}
+
+// Gauge DOM + windowed state: 3-window rings, per-mode max since last restart.
+const gaugeNote = document.getElementById('gauge-note');
+const acceptDetail = document.getElementById('gauge-accept-detail');
+const tilePrefill = document.getElementById('tile-prefill');
+const tileDecode = document.getElementById('tile-decode');
+const ttftNow = document.getElementById('ttft-now');
+const itlNow = document.getElementById('itl-now');
+const PHASE_LABEL = { idle: 'idle', prefill: 'prefilling', decode: 'decoding' };
+const rings = { prefill: [], decode: [] };
+const maxSeen = { prefill: 0, decode: 0 };
+let restartNote = false;
+
+function renderGauges(status) {
+  const s = status || {};
+  const m = s.metrics || {};
+  const t = s.transport || {};
+  const sched = s.scheduler || {};
+  const live = !!s && s.ready !== false;
+  const prevRestarts = state.lastRestarts;
+  const rates = live ? windowedRates(status) : { prefill: 0, decode: 0 };
+  // An observed restart (field present and changed); a missing field is not
+  // a restart, so it never clears the rings or fires the note.
+  const restarted = live && prevRestarts !== undefined && t.restarts != null && t.restarts !== prevRestarts;
+  if (restarted) {
+    rings.prefill.length = 0;
+    rings.decode.length = 0;
+    maxSeen.prefill = 0;
+    maxSeen.decode = 0;
+    sparkTTFT.clear();
+    sparkITL.clear();
+    restartNote = true;
+  }
+  if (live) {
+    rings.prefill.push(rates.prefill);
+    rings.decode.push(rates.decode);
+    if (rings.prefill.length > 3) rings.prefill.shift();
+    if (rings.decode.length > 3) rings.decode.shift();
+    maxSeen.prefill = Math.max(maxSeen.prefill, rates.prefill);
+    maxSeen.decode = Math.max(maxSeen.decode, rates.decode);
+  }
+  // Active phase: scheduler occupancy first, then current batches, else idle.
+  let phase = 'idle';
+  if ((sched.decoding ?? 0) > 0) phase = 'decode';
+  else if ((sched.prefilling ?? 0) > 0) phase = 'prefill';
+  else if ((m.current_decode_batch ?? 0) > 0) phase = 'decode';
+  else if ((m.current_prefill_batch ?? 0) > 0) phase = 'prefill';
+  const mean = (r) => (r.length ? r.reduce((a, b) => a + b, 0) / r.length : 0);
+  const value = phase === 'prefill' ? mean(rings.prefill) : phase === 'decode' ? mean(rings.decode) : 0;
+  const scale = phase === 'idle'
+    ? niceMax(Math.max(10, maxSeen.prefill, maxSeen.decode))
+    : niceMax(Math.max(10, maxSeen[phase]));
+  speedGauge.set(value, scale, PHASE_LABEL[phase]);
+  if (restarted) {
+    chip(gaugeNote, 'warn', 'engine restarted');
+  } else if (restartNote && value > 0) {
+    restartNote = false;
+    chip(gaugeNote, 'ok', PHASE_LABEL[phase]);
+  } else if (!restarted) {
+    chip(gaugeNote, phase === 'idle' ? 'na' : 'ok', PHASE_LABEL[phase]);
+  }
+  // Draft acceptance (engine-computed rate; n/a until it exists).
+  const drafted = m.drafted_tokens;
+  const accepted = m.accepted_draft_tokens;
+  const rate = m.draft_acceptance_rate;
+  if (drafted == null || drafted === 0 || accepted == null || rate == null || Number.isNaN(rate)) {
+    acceptGauge.set(0, 100);
+    acceptDetail.textContent = 'n/a';
+  } else {
+    acceptGauge.set(Math.max(0, Math.min(100, rate * 100)), 100);
+    acceptDetail.textContent = fmt.num(accepted) + ' of ' + fmt.num(drafted) + ' drafts';
+  }
+  // Lifetime averages: small tiles; the dial shows the current window.
+  tilePrefill.textContent = m.prefill_tokens_per_second == null ? 'n/a' : fmt.num(m.prefill_tokens_per_second) + ' tok/s';
+  tileDecode.textContent = m.decode_tokens_per_second == null ? 'n/a' : fmt.num(m.decode_tokens_per_second) + ' tok/s';
+  const ttft = m.ttft_ms;
+  const itl = m.itl_ms;
+  sparkTTFT.push(ttft ? ttft.p50 : null, ttft ? ttft.p95 : null);
+  sparkITL.push(itl ? itl.p50 : null, itl ? itl.p95 : null);
+  ttftNow.textContent = ttft && ttft.p50 != null && !Number.isNaN(ttft.p50) ? fmt.ms(ttft.p50) : 'n/a';
+  itlNow.textContent = itl && itl.p50 != null && !Number.isNaN(itl.p50) ? fmt.ms(itl.p50) : 'n/a';
 }
 // --------------------------------------------------------------- polling
 async function pollOnce() {
@@ -325,6 +628,10 @@ else if (mediaQuery.addListener) mediaQuery.addListener(rethemeAll);
 state.palette = palette();
 
 // -------------------------------------------------------------- start
+const speedGauge = makeGauge(document.getElementById('gauge-speed'), { label: 'idle', unit: 'tok/s', mode: 'speedometer' });
+const acceptGauge = makeGauge(document.getElementById('gauge-accept'), { label: 'draft acceptance', unit: '%', mode: 'acceptance', rotation: 0, circumference: 360, cutout: '80%', needle: false });
+const sparkTTFT = makeSparkline(document.getElementById('spark-ttft'), 'link', 'sparkline-ttft');
+const sparkITL = makeSparkline(document.getElementById('spark-itl'), 'ok', 'sparkline-itl');
 chip(cWaiting, 'warn', 'waiting for engine');
 cWaiting.hidden = false;
 pollOnce();
