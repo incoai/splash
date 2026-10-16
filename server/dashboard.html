@@ -205,6 +205,7 @@
       <div class="kv-row"><span class="kv-label">uptime</span><span class="kv-val" id="model-uptime">n/a</span></div>
       <div class="kv-row"><span class="kv-label">context</span><span class="kv-val" id="model-ctx">n/a</span></div>
       <div class="kv-row"><span class="kv-label">kv cache</span><span class="kv-val" id="model-kv-dtype">n/a</span><span class="kv-val dim" id="model-kv-block">n/a</span></div>
+      <div class="kv-row"><span class="kv-label">build</span><span class="kv-val" id="model-build">n/a</span><span class="kv-val dim" id="model-layout">n/a</span></div>
       <div class="kv-row"><span class="kv-label">device</span><span class="kv-val" id="model-device">n/a</span></div>
       <div class="kv-row"><span class="kv-label">template</span><span class="kv-val" id="model-template">n/a</span></div>
     </div>
@@ -859,11 +860,16 @@ function buildReqRow(r) {
   const cell = (text) => {
     const td = document.createElement('td');
     td.textContent = text;
+    td.title = text; // a clamped cell recovers on hover
     return td;
   };
   tr.appendChild(cell(r.id == null ? 'n/a' : String(r.id)));
   const phaseTd = document.createElement('td');
-  phaseTd.appendChild(chip(document.createElement('span'), phaseTone(r.phase), r.phase == null ? 'n/a' : String(r.phase)));
+  const phaseChip = document.createElement('span');
+  const phaseText = r.phase == null ? 'n/a' : String(r.phase);
+  chip(phaseChip, phaseTone(r.phase), phaseText);
+  phaseChip.title = phaseText;
+  phaseTd.appendChild(phaseChip);
   tr.appendChild(phaseTd);
   tr.appendChild(cell(r.priority == null ? 'n/a' : String(r.priority)));
   const barTd = document.createElement('td');
@@ -1007,6 +1013,8 @@ const modelUptime = document.getElementById('model-uptime');
 const modelCtx = document.getElementById('model-ctx');
 const modelKvDtype = document.getElementById('model-kv-dtype');
 const modelKvBlock = document.getElementById('model-kv-block');
+const modelBuild = document.getElementById('model-build');
+const modelLayout = document.getElementById('model-layout');
 const modelDevice = document.getElementById('model-device');
 const modelTemplate = document.getElementById('model-template');
 const modChips = document.getElementById('model-modalities');
@@ -1028,6 +1036,8 @@ function renderModel(status) {
   setVal(modelCtx, s.maximum_context_tokens == null ? 'n/a' : fmt.num(s.maximum_context_tokens));
   setVal(modelKvDtype, ic && ic.dtype != null ? String(ic.dtype) : 'n/a');
   setVal(modelKvBlock, ic && ic.block_tokens != null ? fmt.num(ic.block_tokens) + ' blk' : 'n/a');
+  setVal(modelBuild, ic && ic.build_id != null ? String(ic.build_id) : 'n/a');
+  setVal(modelLayout, ic && ic.loaded_model_layout_sha256 != null ? String(ic.loaded_model_layout_sha256) : 'n/a');
   setVal(modelDevice, dev.device_name == null && dev.gpu_core_count == null && dev.physical_memory_bytes == null
     ? 'n/a'
     : (dev.device_name == null ? 'n/a' : String(dev.device_name)) + ' · ' + (dev.gpu_core_count == null ? 'n/a' : fmt.num(dev.gpu_core_count) + ' cores') + ' · ' + fmt.bytes(dev.physical_memory_bytes));
