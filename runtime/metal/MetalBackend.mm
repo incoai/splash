@@ -863,16 +863,29 @@ struct MetalBackend::Impl {
             // keep the buffers alive.
             __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
             NSUInteger offsets[kBufferArgumentEntries];
+            // A command with dispatches that may overlap encodes
+            // concurrently and puts a buffer barrier before every other
+            // dispatch (ComputeDispatch::concurrentWithPrevious).
+            const bool concurrent = std::any_of(dispatches.begin(), dispatches.end(), [](const PreparedDispatch &d) {
+                return d.source->concurrentWithPrevious;
+            });
+            bool encoded = false;
             for (size_t index = 0; index < dispatches.size(); ++index) {
                 encodeSteps(index);
                 const PreparedDispatch &item = dispatches[index];
                 const ComputeDispatch &dispatch = *item.source;
                 if (!encoder) {
-                    encoder = [command computeCommandEncoder];
+                    encoder = concurrent
+                        ? [command computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
+                        : [command computeCommandEncoder];
                     if (!encoder) {
                         failBeforeCommit("unable to create Metal compute encoder");
                     }
+                    encoded = false;
                 }
+                if (concurrent && encoded && !dispatch.concurrentWithPrevious)
+                    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                encoded = true;
                 [encoder setComputePipelineState:item.pipeline];
                 for (const BufferBinding &binding : dispatch.buffers) {
                     const MetalBuffer::Impl &buffer = *binding.buffer.impl_;

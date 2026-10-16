@@ -163,6 +163,11 @@ struct ComputeDispatch {
   DispatchSize threadgroups;
   DispatchSize threadsPerThreadgroup;
   IndirectGrid indirectThreadgroups = {};
+  // May overlap the dispatches since the last one without this flag: no
+  // memory barrier before it (CommandGraph::concurrentWithPrevious). A
+  // command holding such a dispatch encodes concurrently, with a buffer
+  // barrier before every other dispatch; other commands encode serially.
+  bool concurrentWithPrevious = false;
 };
 
 // Orders a command against another agent, such as the Neural Engine, after

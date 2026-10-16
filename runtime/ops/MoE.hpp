@@ -2,6 +2,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/Gguf.h"
 #include "metal/abi/MoE.h"
 #include "metal/abi/QuantFormat.h"
 #include "ops/Linear.hpp"
@@ -61,7 +62,8 @@ struct BlockMoeWeights final {
 
 // Grouped-row scratch. Routes are sorted by expert into tiles of tileRows
 // rows; every routed expert may leave one partially filled tile and no tile
-// is empty, and the shared expert fills one tile per tileRows rows. The gate
+// is empty, and the shared expert fills one tile per tileRows rows (or, with
+// MoePlan::sharedRowsBase, its outputs alone take those rows). The gate
 // pass parks its output in expertOutput before the down pass overwrites it,
 // so that field spans the wider of the two widths.
 [[nodiscard]] constexpr uint32_t moeMaximumTiles(uint32_t rows, MoeShape shape,
@@ -83,6 +85,9 @@ struct MoeWorkspace final {
   uint64_t expertOutputBytes = 0;
   // The row sums of the Table16 tiles the GGUF register expert tile reads.
   uint64_t groupedSumsBytes = 0;
+  // The shared expert's intermediate where it runs as dense projections
+  // (MoePlan::sharedRowsBase).
+  uint64_t sharedIntermediateBytes = 0;
   bool operator==(const MoeWorkspace &) const = default;
 };
 
@@ -105,6 +110,10 @@ struct MoeScratch final {
   metal::MetalBuffer expertOutput;
   // GGUF register plans: the row sums of the Table16 tiles in groupedInput.
   metal::MetalBuffer groupedSums;
+  // Plans with a sharedRowsBase: the shared expert's gate, then in place its
+  // silu(gate) * up, one row per row padded to the prefill tile's 32-row
+  // simdgroups.
+  metal::MetalBuffer sharedIntermediate;
 };
 
 // Each scratch buffer with the workspace field that sizes it, in field order.
@@ -113,7 +122,7 @@ struct MoeScratchField final {
   uint64_t MoeWorkspace::*bytes;
   const char *name;
 };
-inline constexpr std::array<MoeScratchField, 10> kMoeScratchFields{{
+inline constexpr std::array<MoeScratchField, 11> kMoeScratchFields{{
     {&MoeScratch::selectedExperts, &MoeWorkspace::selectedExpertsBytes, "MoE selected experts"},
     {&MoeScratch::routingWeights, &MoeWorkspace::routingWeightsBytes, "MoE routing weights"},
     {&MoeScratch::tileDescriptors, &MoeWorkspace::tileDescriptorsBytes, "MoE tile descriptors"},
@@ -124,6 +133,7 @@ inline constexpr std::array<MoeScratchField, 10> kMoeScratchFields{{
     {&MoeScratch::expertIntermediate, &MoeWorkspace::expertIntermediateBytes, "MoE expert intermediate"},
     {&MoeScratch::expertOutput, &MoeWorkspace::expertOutputBytes, "MoE expert output"},
     {&MoeScratch::groupedSums, &MoeWorkspace::groupedSumsBytes, "MoE grouped sums"},
+    {&MoeScratch::sharedIntermediate, &MoeWorkspace::sharedIntermediateBytes, "MoE shared intermediate"},
 }};
 static_assert(sizeof(MoeWorkspace) == kMoeScratchFields.size() * sizeof(uint64_t) &&
               sizeof(MoeScratch) == kMoeScratchFields.size() * sizeof(metal::MetalBuffer),
@@ -212,6 +222,22 @@ public:
   [[nodiscard]] bool rowsInPlace() const noexcept {
     return config_.expertTile == MoeExpertTile::M8 && rows_ == tileRows() &&
            config_.ggufTile == MoeGgufTile::Staged;
+  }
+  // The first grouped row of the shared expert's rows where it runs as dense
+  // GGUF prefill projections beside the routing (32-row prefill tiles), past
+  // every routed tile the plan can hold; 0 where it runs as tiles of the
+  // expert passes.
+  [[nodiscard]] uint32_t sharedRowsBase() const noexcept {
+    if (config_.expertTile != MoeExpertTile::M32) return 0;
+    const uint32_t routed = rows_ * shape_.expertsPerToken;
+    return std::min(routed / tileRows() + shape_.experts, routed) * tileRows();
+  }
+  // The rows of `input` the plan reads: the dense shared projections read
+  // whole 32-row simdgroups.
+  [[nodiscard]] uint32_t inputRows() const noexcept {
+    return sharedRowsBase() ? (rows_ + GGUF_PREFILL_SIMDGROUP_ROWS - 1) / GGUF_PREFILL_SIMDGROUP_ROWS *
+                                  GGUF_PREFILL_SIMDGROUP_ROWS
+                            : rows_;
   }
 
 private:

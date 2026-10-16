@@ -68,7 +68,9 @@ void attention() {
 // and activations bf16. The grouped input first holds the router's fp32
 // scores, one row of 256 per token. Every plan parks its gate in
 // expertOutput, so that field spans the wider of the hidden and intermediate
-// widths. Plans of the staged tiles hold no sums.
+// widths. Plans of the staged tiles hold no sums. Prefill plans of 32-row
+// tiles hold the shared expert's intermediate, which its dense projections
+// write in 32-row simdgroups.
 void checkMoe(splash::ops::MoeWorkspace workspace,
               splash::ops::MoeShape shape, uint32_t rows, uint32_t tileRows) {
   using splash::model::kBFloat16Bytes;
@@ -88,7 +90,10 @@ void checkMoe(splash::ops::MoeWorkspace workspace,
               workspace.expertIntermediateBytes ==
                   grouped * shape.expertIntermediateSize * kBFloat16Bytes &&
               workspace.expertOutputBytes == grouped * outputWidth * kBFloat16Bytes &&
-              workspace.groupedSumsBytes == 0,
+              workspace.groupedSumsBytes == 0 &&
+              workspace.sharedIntermediateBytes ==
+                  (tileRows == 32 ? uint64_t{(rows + 31) / 32 * 32} * shape.expertIntermediateSize * kBFloat16Bytes
+                                  : 0),
           "MoE workspace changed from baseline");
 }
 
