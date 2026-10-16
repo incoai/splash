@@ -28,5 +28,6 @@ image_patches_rounded | --max-image-pixels 1000000 | auto auto --max-image-patch
 image_patches_default | --max-image-pixels 4194304 | auto auto
 idle_sleep | --allow-idle-sleep | auto auto --idle-sleep allow
 disable_ane | --disable-ane | auto auto --ane off
+prefill_int8 | --prefill-int8 | auto auto --prefill-int8 on
 relaunch |  | auto auto --relaunch-context 61433
 relaunch_limits | --max-context 100K --max-memory 32G | 102400 34359738368

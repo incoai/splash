@@ -13,7 +13,8 @@ namespace splash::ops {
 // object and production models borrow it; it never changes after creation.
 class ExecutionPlans final {
 public:
-  explicit ExecutionPlans(const DeviceCapabilities &device);
+  // `prefillInt8`: splash serve --prefill-int8 (LinearConfig::prefillInt8).
+  explicit ExecutionPlans(const DeviceCapabilities &device, bool prefillInt8 = false);
   [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
 
   [[nodiscard]] PrefillAttentionPlan prefillAttention(

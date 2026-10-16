@@ -113,6 +113,7 @@ access.
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
 | `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](#neural-engine-prefill). |
+| `--prefill-int8` | Off | On Apple10 (M5 and later), prefill the projections of MLX affine 4- and 5-bit checkpoints in groups of 64 in int8 activations: faster, and outputs differ slightly from the default. See [INT8-activation prefill](#int8-activation-prefill). |
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
 Sizes (`--max-memory`, `--max-cache-disk`, `--max-cache-disk-writes`,
@@ -1865,6 +1866,27 @@ formats, a gate and an up simdgroup on the same columns, bitwise the two passes'
 The float router and alpha/beta projections run in `kernels/shared/gguf_float.metal`, and the
 token rows are gathered by one template in `kernels/shared/embedding.metal`. These plans are
 fixed rules of GPU family, core count, shape and format.
+
+#### INT8-activation prefill
+
+`splash serve --prefill-int8` (native `--prefill-int8 on`, `ops::LinearConfig::prefillInt8`) runs the Apple10
+prefill of a projection whose segments are all MLX affine 4- or 5-bit in groups of 64 (af4g64, af5g64) in int8
+activations instead of the bf16 tile, on the neural accelerator's int8 x int8 -> int32 path
+(`runtime/metal/kernels/shared/gguf_prefill_a8.metal`, ABI `runtime/metal/abi/GgufPrefillA8.h`). It is off by
+default because it is not exact: `prefill_a8_quantize` writes each row of the chunk as int8 with one fp32 scale per
+row and the int16 sums of each 64-input group of the quantized row, each 32-input group in the planes' slot order;
+`gguf_prefill_a8_<format>_<e>` (epilogues `a`, `r`, `g` as above) feeds the weights' codes from the 4-bit plane, and
+the fifth bits from plane1, straight into int8 16x32x16 `matmul2d` fragments and folds each group's correction,
+`s * sum(qa q) + z * sum(qa)`, once per 64 inputs, scaling by the row's scale at the store. The schedule is a port of
+oMLX's oQ A8 kernel (`THIRD_PARTY_NOTICES`): 32x64 tiles of one by two simdgroups for af4g64, 64x64 of two by two
+for af5g64. The quantized rows and their sums are the prefill arena's `LinearTable` and `LinearSums`
+(`LinearScratch::input` and `sums`), sized only with the option on; a plan whose scratch cannot hold them, another
+format, the Neural Engine split's leading-input down projection and Apple9 run the bf16 tile. On a 40-core M5 Max
+the 2048-row 27B projections run 1.6-1.9x the bf16 tile's speed at af4g64 and 1.2-1.4x at af5g64, and the Neural
+Engine split's calibration then usually keeps the FFN on the GPU. `gguf-projection` checks it against fp64: the
+error it adds over the bf16 tile on the same operands is at most 3% relative RMS (0.4% measured) for each epilogue,
+chunks ending inside a tile, the full budget and fused segments; `gguf-projection-benchmark` times it as
+`prefill128 int8` beside the bf16 tile.
 
 A rotated projection rotates its input once into `LinearScratch::rotated`
 (`gguf_rotate`, in fp32 and rounded once to bf16) before its quantized segments,

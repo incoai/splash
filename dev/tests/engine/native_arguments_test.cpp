@@ -152,6 +152,7 @@ void testServerCommandLines(const char *path) {
        [](NativeArguments &read) { read.maxImagePatches = 16384; }},
       {"idle_sleep", [](NativeArguments &read) { read.preventIdleSleep = false; }},
       {"disable_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
+      {"prefill_int8", [](NativeArguments &read) { read.prefillInt8 = true; }},
       // A relaunch keeps the first engine's context; with --max-context,
       // which every start holds, its command is the first one's.
       {"relaunch", [](NativeArguments &read) { read.relaunchContext = 61433; }},
@@ -175,7 +176,7 @@ void testServerCommandLines(const char *path) {
            read.maxImagePatches == meant.maxImagePatches &&
            read.idleReleaseSeconds == meant.idleReleaseSeconds &&
            read.preventIdleSleep == meant.preventIdleSleep &&
-           read.neuralEngine == meant.neuralEngine;
+           read.neuralEngine == meant.neuralEngine && read.prefillInt8 == meant.prefillInt8;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -199,6 +200,16 @@ void testNeuralEngine() {
               parse(model, {"auto", "auto", "--ane", "on"}).neuralEngine &&
               !parse(model, {"auto", "auto", "--ane", "off"}).neuralEngine,
           "--ane did not reach the arguments as given");
+}
+
+// The INT8-activation prefill is off unless --prefill-int8 on turns it on; --prefill-int8 off, which the server never
+// writes, keeps it off.
+void testPrefillInt8() {
+  const ModelDirectory model;
+  require(!parse(model, {"auto", "auto"}).prefillInt8 &&
+              parse(model, {"auto", "auto", "--prefill-int8", "on"}).prefillInt8 &&
+              !parse(model, {"auto", "auto", "--prefill-int8", "off"}).prefillInt8,
+          "--prefill-int8 did not reach the arguments as given");
 }
 
 // A command line the server never writes is refused with what is wrong.
@@ -229,6 +240,7 @@ void testRefusals() {
   refuses({"auto", "auto", "--idle-sleep", "never"},
           "--idle-sleep requires prevent or allow");
   refuses({"auto", "auto", "--ane", "gpu"}, "--ane requires on or off");
+  refuses({"auto", "auto", "--prefill-int8", "yes"}, "--prefill-int8 requires on or off");
   refuses({"auto", "auto", "--persistent-cache", "yes"}, "--persistent-cache requires on or off");
   refuses({"auto", "auto", "0", "--persistent-cache", "on"},
           "--persistent-cache requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
@@ -300,6 +312,7 @@ int main(int argc, char **argv) {
   try {
     testServerCommandLines(argv[1]);
     testNeuralEngine();
+    testPrefillInt8();
     testRefusals();
     std::cout << "native arguments tests passed\n";
     return EXIT_SUCCESS;

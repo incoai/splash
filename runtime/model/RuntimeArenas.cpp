@@ -117,6 +117,8 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   prefillProjections.push_back({draft.contextKvSize(), draft.hiddenSize});
   for (const auto &projection : prefillProjections) {
     const ops::LinearScratchSize linear = operators.linear().prefillScratchSize(projection);
+    put(PrefillTensor::LinearTable, linear.input);
+    put(PrefillTensor::LinearSums, linear.sums);
     put(PrefillTensor::LinearPartials, linear.partials);
     put(PrefillTensor::LinearCounters, linear.counters);
     put(PrefillTensor::LinearRotated, linear.rotated);

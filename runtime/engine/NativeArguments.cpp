@@ -146,6 +146,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");
       result.neuralEngine = value == "on";
+    } else if (option == "--prefill-int8") {
+      if (value != "on" && value != "off")
+        throw UsageError("--prefill-int8 requires on or off");
+      result.prefillInt8 = value == "on";
     } else if (option == "--relaunch-context") {
       relaunchContext = value;
     } else {

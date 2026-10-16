@@ -23,8 +23,8 @@ void include(Workspace &bound, const Workspace &required,
 
 } // namespace
 
-ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
-    : linear_(device), family_(gpuFamilyClass(device.appleGpuFamily)) {}
+ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, bool prefillInt8)
+    : linear_(device, prefillInt8), family_(gpuFamilyClass(device.appleGpuFamily)) {}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t rows, uint32_t queryHeads, kv::Layout layout) const {

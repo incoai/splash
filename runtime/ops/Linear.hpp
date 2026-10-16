@@ -94,6 +94,10 @@ struct LinearConfig final {
   // each stage both tensors' 32 columns (gguf_decode_<format>_m<rows>_gate_up,
   // gate and up in one format), instead of a gate pass and an up pass.
   bool oneGateUpPass = false;
+  // GgufPrefill on Apple10: projections whose segments are all MLX affine 4- or 5-bit in groups of 64 run the
+  // INT8-activation prefill (kernels/shared/gguf_prefill_a8.metal), which is lossy, instead of the bf16 tile; the
+  // others, and any whose scratch cannot hold its table, run the bf16 tile. Off unless splash serve --prefill-int8.
+  bool prefillInt8 = false;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
     return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
   }
@@ -216,6 +220,7 @@ inline constexpr uint32_t kAssumedGpuCores = 32;
 // and later: M5, M6), whose cores each hold a neural accelerator. Startup
 // refuses families below 9.
 enum class GpuFamilyClass : uint8_t { Apple9, Apple10 };
+
 [[nodiscard]] constexpr GpuFamilyClass gpuFamilyClass(uint32_t appleGpuFamily) noexcept {
   return appleGpuFamily >= 10 ? GpuFamilyClass::Apple10 : GpuFamilyClass::Apple9;
 }
@@ -224,7 +229,8 @@ enum class GpuFamilyClass : uint8_t { Apple9, Apple10 };
 // family class, core count and workload tile counts.
 class Linear final {
 public:
-  explicit Linear(const DeviceCapabilities &device) noexcept;
+  // `prefillInt8`: the device policy's prefill plans take LinearConfig::prefillInt8 on Apple10.
+  explicit Linear(const DeviceCapabilities &device, bool prefillInt8 = false) noexcept;
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
   // The plan of `workload` for the projection, into its destination type; a gate/up plan also runs `gate`.
@@ -303,6 +309,7 @@ private:
                             const Projection &projection, const LinearPlan &plan) const;
   GpuFamilyClass family_;
   uint32_t gpuCores_ = 0;
+  bool prefillInt8_ = false;
 };
 
 } // namespace splash::ops

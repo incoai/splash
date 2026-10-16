@@ -4,6 +4,7 @@
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
+#include "metal/abi/GgufPrefillA8.h"
 #include "ops/BufferExtent.hpp"
 
 #include <algorithm>
@@ -23,6 +24,18 @@ constexpr size_t kFusedSegments = std::extent_v<decltype(GgufDecodeFusedParams::
 // fragments, so the tile holds 8, 16 or 32 rows and a three-lane step runs
 // the 32-row tile over four lanes of storage.
 constexpr uint32_t stagedTileRows(uint32_t rows) noexcept { return rows <= 8 ? 8 : rows <= 16 ? 16 : 32; }
+
+
+// The INT8-activation prefill (kernels/shared/gguf_prefill_a8.metal, LinearConfig::prefillInt8): MLX affine 4- and
+// 5-bit groups of 64, every segment of the projection quantized in one of them, no leading-input view.
+bool prefillA8Format(uint32_t format) noexcept { return format == GGUF_FMT_AF4G64 || format == GGUF_FMT_AF5G64; }
+const char *prefillA8Name(uint32_t format) noexcept { return format == GGUF_FMT_AF4G64 ? "af4g64" : "af5g64"; }
+bool prefillA8Projection(const Projection &p) noexcept {
+  if (p.planeInputs() || p.inputSize % 64) return false;
+  for (const QuantizedSegment &s : p.blocks().segments)
+    if (!prefillA8Format(s.formatId) || s.outputSize % PREFILL_A8_COLUMNS) return false;
+  return !p.blocks().segments.empty();
+}
 
 std::string decodeKernel(const char *format, uint32_t rows, char epilogue) {
   return std::string("gguf_decode_") + format + "_m" + std::to_string(rows) + "_" + epilogue;
@@ -226,6 +239,8 @@ void LinearPlan::requireConfiguration() const {
       throw std::invalid_argument("the register block decode tile takes a K unit per split");
     return;
   }
+  if (c.prefillInt8 && c.tile != LinearTile::GgufPrefill)
+    throw std::invalid_argument("only the block prefill tile runs the INT8-activation prefill");
   if (c.tile == LinearTile::GgufPrefill) {
     if (decode || c.splits != 1) throw std::invalid_argument("invalid block prefill configuration");
     return;
@@ -256,6 +271,9 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
             config_.splits > 1 ? config_.splits * rows * n * sizeof(float) : 0,
             config_.splits > 1 ? uint64_t{n / GGUF_TILE_COLUMNS} * sizeof(uint32_t) : 0};
   }
+  // The INT8-activation prefill: int8 rows, row scales and quantized group sums over the stored rows.
+  if (config_.prefillInt8 && k % 64 == 0)
+    return {uint64_t{k} * storageRows(), PREFILL_A8_SUMS_BYTES(k, storageRows()), 0, 0};
   // Staged split-K: [split][row][column] fp32 partials over the tile's rows,
   // a one-pass gate/up's of both tensors, and one counter per column tile (a
   // tile covers every row of the dispatch): 64 columns, 32 in one pass. The
@@ -284,7 +302,7 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
     return w.rows <= kMaximumDecodeTileRows
         ? LinearConfig{.tile = LinearTile::GgufStaged,
                        .splits = decodeSplits(n, k, gpuCores_, stagedTiers(family_))}
-        : LinearConfig{.tile = LinearTile::GgufPrefill};
+        : LinearConfig{.tile = LinearTile::GgufPrefill, .prefillInt8 = prefillInt8_};
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging but for the projections apple9Stages names.
   if (family_ == GpuFamilyClass::Apple9 && registerFormats && !apple9Stages(w, projections))
@@ -448,6 +466,22 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
   const auto [n, k] = w.matrix;
   const char epilogue = epilogueSuffix(w.epilogue);
   const uint32_t rowTiles = plan.storageRows() / GGUF_PREFILL_ROWS;
+  const uint32_t storage = plan.storageRows();
+  if (plan.configuration().prefillInt8 && prefillA8Projection(p) &&
+      b.scratch.input.sizeBytes() >= uint64_t{k} * storage && b.scratch.sums.sizeBytes() >= PREFILL_A8_SUMS_BYTES(k, storage)) {
+    graph.add("prefill_a8_quantize", {b.input, b.scratch.input, b.scratch.sums},
+              PrefillA8QuantizeParams{k, w.rows, storage, 0}, {w.rows, 1, 1}, {PREFILL_A8_QUANTIZE_THREADS, 1, 1});
+    for (const QuantizedSegment &s : p.blocks().segments) {
+      const metal::MetalBuffer aux = w.epilogue == LinearEpilogue::None ? b.output : epilogueInput(b, w.epilogue);
+      const uint32_t wm = s.formatId == GGUF_FMT_AF4G64 ? PREFILL_A8_Q4_WM : PREFILL_A8_Q5_WM;
+      graph.add(std::string("gguf_prefill_a8_") + prefillA8Name(s.formatId) + "_" + epilogue,
+                {b.scratch.input, b.scratch.sums, s.plane0, s.plane1Slot(), s.meta, b.output, aux},
+                PrefillA8Params{k, w.rows, storage, n, s.columnOffset, {0, 0, 0}},
+                {s.outputSize / PREFILL_A8_COLUMNS, (w.rows + PREFILL_A8_ROWS(wm) - 1) / PREFILL_A8_ROWS(wm), 1},
+                {PREFILL_A8_THREADS(wm), 1, 1});
+    }
+    return;
+  }
   if (w.epilogue == LinearEpilogue::None && !p.planeInputs()) {
     const std::vector<QuantizedSegment> &segments = p.blocks().segments;
     std::vector<uint32_t> formats;

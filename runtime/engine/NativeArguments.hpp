@@ -53,6 +53,9 @@ struct NativeArguments final {
   // Neural Engine when that is faster (splash serve --disable-ane turns it
   // off).
   bool neuralEngine = true;
+  // --prefill-int8 on|off: whether Apple10 prefill runs MLX affine 4- and 5-bit
+  // projections in int8 activations (splash serve --prefill-int8 turns it on).
+  bool prefillInt8 = false;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

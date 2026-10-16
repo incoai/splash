@@ -611,6 +611,16 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--prefill-int8",
+        "requests",
+        dict(
+            action="store_true",
+            default=False,
+            help="on M5 and later, prefill MLX 4- and 5-bit projections in int8 "
+            "activations: faster, and outputs differ slightly (default: bf16)",
+        ),
+    ),
+    ServeOption(
         "--allow-idle-sleep",
         "requests",
         dict(

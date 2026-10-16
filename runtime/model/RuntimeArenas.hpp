@@ -112,6 +112,10 @@ enum class PrefillTensor : uint32_t {
   MoeScratchLast = MoeScratch + ops::kMoeScratchFields.size() - 1,
   LinearPartials,
   LinearCounters,
+  // The INT8-activation prefill's int8 rows and their scales and group sums (ops::LinearScratch::input, sums);
+  // empty unless splash serve --prefill-int8.
+  LinearTable,
+  LinearSums,
   // The rotated input of a rotated projection (ops::LinearScratch::rotated).
   LinearRotated,
   Count,

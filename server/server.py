@@ -1679,6 +1679,8 @@ def _native_command(args, relaunch_context=None):
         )
     if args.disable_ane:
         command.extend(("--ane", "off"))
+    if args.prefill_int8:
+        command.extend(("--prefill-int8", "on"))
     if args.decode_share is not None:
         command.extend(("--decode-share", str(args.decode_share)))
     if args.max_image_pixels != image_input.MAX_PIXELS:

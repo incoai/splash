@@ -470,7 +470,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
 
   // One plan owner is used both before allocation and during encoding. The
   // engine lends it to model execution without inspecting its plans.
-  ops::ExecutionPlans operators(device);
+  ops::ExecutionPlans operators(device, config.prefillInt8);
   model::ModelMemoryPlan modelMemoryPlan;
   try {
     modelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat,

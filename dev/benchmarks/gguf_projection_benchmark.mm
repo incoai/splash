@@ -5,7 +5,8 @@
 //                             [prefill=R[,R...]]
 // The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 256
 // columns. With prefill=, it times the 128-row prefill tile instead, one case per chunk of R rows (more than 32: the
-// decode tiles run the smaller chunks) of a single segment; gateup is then the up projection's gated epilogue. The
+// decode tiles run the smaller chunks) of a single segment, and on Apple10 for af4g64 and af5g64 also the
+// INT8-activation prefill (prefill128 int8); gateup is then the up projection's gated epilogue. The
 // weights stay DRAM-cold: a command streams every copy of a ring of at least 384 MiB once, each projection with the
 // next copy (decode gate/up: the gate and up weights of two copies). The cases run in ABBA order after a warm-up;
 // printed are the medians of `rounds` (20) commands in ms per projection, the device policy's choice marked with *.
@@ -130,6 +131,15 @@ int main(int argc, char **argv) {
         const LinearConfig config{.tile = LinearTile::GgufPrefill};
         cases.push_back({"R" + std::to_string(rows), "prefill128", Linear::plan(w, config, FloatOutput::BFloat16),
                          config == linear.plan(w, ring.front()).configuration(), {}});
+        // The INT8-activation prefill (LinearConfig::prefillInt8), on Apple10 for MLX affine 4/5-bit g64 segments.
+        if (backend.capabilities().appleGpuFamily >= 10 &&
+            std::all_of(images.begin(), images.end(), [](const Image &i) {
+              return i.format == GGUF_FMT_AF4G64 || i.format == GGUF_FMT_AF5G64;
+            })) {
+          const LinearConfig int8{.tile = LinearTile::GgufPrefill, .prefillInt8 = true};
+          cases.push_back({"R" + std::to_string(rows), "prefill128 int8", Linear::plan(w, int8, FloatOutput::BFloat16),
+                           false, {}});
+        }
       }
       for (uint32_t lanes = 1; lanes <= kMaximumLanes && !prefill; ++lanes) {
         const LinearWorkload w{{N, K}, lanes * kLaneRows, LinearPhase::Decode, epilogue};

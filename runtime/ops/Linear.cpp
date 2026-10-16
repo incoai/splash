@@ -1,4 +1,6 @@
 #include "Linear.hpp"
+#include "metal/abi/GgufPrefillA8.h"
+
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
@@ -138,9 +140,10 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   requireConfiguration();
 }
 
-Linear::Linear(const DeviceCapabilities &device) noexcept
+Linear::Linear(const DeviceCapabilities &device, bool prefillInt8) noexcept
     : family_(gpuFamilyClass(device.appleGpuFamily)),
-      gpuCores_(plannedGpuCores(device)) {}
+      gpuCores_(plannedGpuCores(device)),
+      prefillInt8_(prefillInt8 && family_ == GpuFamilyClass::Apple10) {}
 
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
   const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, LinearPhase::Decode, LinearEpilogue::None};
@@ -191,8 +194,13 @@ LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
   // Every prefill plan stores at most the token budget.
   static_assert(SPLASH_PREFILL_TOKEN_BUDGET % GGUF_PREFILL_ROWS == 0, "the prefill tiles cover the budget exactly");
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, SPLASH_PREFILL_TOKEN_BUDGET);
+  // The INT8-activation prefill's int8 rows, row scales and group sums over the token budget.
+  if (prefillInt8_ && shape.inputSize % 64 == 0)
+    bound.include({uint64_t{shape.inputSize} * SPLASH_PREFILL_TOKEN_BUDGET,
+                   PREFILL_A8_SUMS_BYTES(shape.inputSize, SPLASH_PREFILL_TOKEN_BUDGET), 0, 0, 0});
   return bound;
 }
+
 
 std::array<metal::MetalBuffer, 2> Linear::splitScratch(const LinearBuffers &buffers, uint32_t splits) {
   if (splits > 1) return {buffers.scratch.partials, buffers.scratch.counters};
@@ -213,8 +221,12 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   if (w.epilogue == LinearEpilogue::Residual) requireBytes(b.residual, rows * n * 2, "projection residual");
   requireBytes(b.gateScratch, selected.gateScratchBytes(), "projection gate scratch");
   const LinearScratchSize scratch = selected.scratchSize();
-  requireBytes(b.scratch.input, scratch.input, "projection scratch table");
-  requireBytes(b.scratch.sums, scratch.sums, "projection scratch sums");
+  // The INT8-activation prefill's table and sums are optional: a plan whose scratch cannot hold them runs the bf16
+  // prefill tile (LinearGguf.cpp).
+  if (!selected.configuration().prefillInt8) {
+    requireBytes(b.scratch.input, scratch.input, "projection scratch table");
+    requireBytes(b.scratch.sums, scratch.sums, "projection scratch sums");
+  }
   requireBytes(b.scratch.partials, scratch.partials, "projection partials");
   requireBytes(b.scratch.counters, scratch.counters, "projection counters");
   if (p.rotation) requireBytes(b.scratch.rotated, rotatedBytes(k, rows), "projection rotated input");

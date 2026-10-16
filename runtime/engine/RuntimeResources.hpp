@@ -92,6 +92,9 @@ struct CacheDiskQuota final {
 
 struct RuntimeResourcesConfig {
   kv::Format kvFormat = kv::Format::Int8;
+  // --prefill-int8 on|off: Apple10 prefill of MLX affine 4/5-bit projections in int8 activations
+  // (the prefill plans of ops::ExecutionPlans).
+  bool prefillInt8 = false;
   ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
   std::filesystem::path metallibPath;
   std::filesystem::path modelRoot;

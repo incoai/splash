@@ -65,6 +65,7 @@ OPTIONS = {
         "--state-format", {"fp32": "fp32", "bf16": "bf16"}, ("fp16", "int8")
     ),
     "--disable-ane": ([(["--disable-ane"], True)], []),
+    "--prefill-int8": ([(["--prefill-int8"], True)], []),
     "--max-memory": values(
         "--max-memory",
         {
