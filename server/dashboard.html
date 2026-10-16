@@ -1,5 +1,6 @@
 <!doctype html>
 <html lang="en">
+<head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Splash Dashboard</title>
@@ -18,6 +19,9 @@
     --composer: #fff;
     --border: #e5e5e5;
     --shadow: 0 8px 28px #00000012;
+    --ok: #16a34a;
+    --warn: #d97706;
+    --bad: #dc2626;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -31,25 +35,303 @@
       --composer: #2f2f2f;
       --border: #424242;
       --shadow: 0 8px 28px #0005;
+      --ok: #4ade80;
+      --warn: #fbbf24;
+      --bad: #f87171;
     }
   }
   body { margin: 0; color: var(--text); background: var(--bg); font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif }
-  header { display: flex; align-items: center; height: 56px; padding: 0 20px; background: var(--side); border-bottom: 1px solid var(--border) }
+  header { display: flex; align-items: center; gap: 14px; height: 56px; padding: 0 20px; background: var(--side); border-bottom: 1px solid var(--border) }
   .brand { display: flex; align-items: center; gap: 9px; font-size: 17px; font-weight: 650; letter-spacing: -.02em }
   .brand img { width: 19px; height: 19px }
-  main { min-height: calc(100vh - 56px); padding: 38px 20px }
-  #loading { text-align: center; color: var(--muted) }
+  #model-name { color: var(--muted); font-size: 13px; font-weight: 450; max-width: 40vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+  #key-form { display: flex; gap: 6px }
+  #key-form[hidden] { display: none }
+  #key-input { width: 170px; padding: 5px 9px; font: inherit; font-size: 13px; color: var(--text); background: var(--composer); border: 1px solid var(--border); border-radius: 7px }
+  #key-apply { padding: 5px 11px; font: inherit; font-size: 13px; color: var(--text); background: var(--hover); border: 1px solid var(--border); border-radius: 7px; cursor: pointer }
+  #strip { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-left: auto }
+  .chip { padding: 3px 10px; border-radius: 999px; font-size: 12px; font-variant-numeric: tabular-nums; color: var(--muted); background: var(--bg); border: 1px solid var(--border); white-space: nowrap }
+  .chip-ok { color: var(--ok) }
+  .chip-warn { color: var(--warn) }
+  .chip-bad { color: var(--bad) }
+  .chip-na { opacity: .65 }
+  main.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; align-content: start; min-height: calc(100vh - 56px); padding: 24px 20px; max-width: 1280px; margin: 0 auto }
+  @media (max-width: 900px) { main.grid { grid-template-columns: 1fr } #model-name { display: none } }
+  .card { background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; box-shadow: var(--shadow) }
+  .card-title { margin: 0 0 10px; font-size: 12px; font-weight: 650; color: var(--muted); text-transform: uppercase; letter-spacing: .05em }
+  .card-body { min-height: 140px }
+  .card-placeholder { color: var(--muted); opacity: .6; font-size: 13px; padding: 44px 0; text-align: center }
 </style>
-
+<script src="/dashboard-assets/chart-4.5.1.min.js"></script>
+</head>
+<body>
 <header>
   <div class="brand">
     <img src="/favicon.ico" alt="">
     Splash Dashboard
   </div>
+  <span id="model-name"></span>
+  <form id="key-form" hidden autocomplete="off">
+    <input id="key-input" type="password" placeholder="API key" autocomplete="off">
+    <button id="key-apply" type="button">Apply</button>
+  </form>
+  <div id="strip"><span id="updated" class="chip chip-na">—</span></div>
 </header>
-<main>
-  <div id="loading">Loading</div>
+<main class="grid">
+  <section class="card" id="gauges"><h2 class="card-title">Speed</h2><div class="card-body"><div class="card-placeholder">—</div></div></section>
+  <section class="card" id="cache"><h2 class="card-title">KV cache</h2><div class="card-body"><div class="card-placeholder">—</div></div></section>
+  <section class="card" id="memory"><h2 class="card-title">Memory</h2><div class="card-body"><div class="card-placeholder">—</div></div></section>
+  <section class="card" id="requests"><h2 class="card-title">Requests</h2><div class="card-body"><div class="card-placeholder">—</div></div></section>
+  <section class="card" id="ane"><h2 class="card-title">Neural engine</h2><div class="card-body"><div class="card-placeholder">—</div></div></section>
+  <section class="card" id="model"><h2 class="card-title">Model</h2><div class="card-body"><div class="card-placeholder">—</div></div></section>
 </main>
+<script>
+'use strict';
+// ------------------------------------------------------------------ state
+const state = {
+  key: null,          // in-memory only — never persisted
+  lastStatus: null,   // last successful /status document
+  lastOkAt: 0,        // Date.now() of the last successful /status
+  failed: 0,          // consecutive failed polls (drives the backoff)
+  authBlocked: false, // set on 401; polling stops until a key is applied
+  pollSeq: 0,         // superseded in-flight responses are ignored
+  pollTimer: 0,
+  tickerTimer: 0,
+  palette: null,
+};
 
-<script src="/dashboard-assets/chart-4.5.1.min.js"></script>
+// ------------------------------------------------------------- formatters
+const fmt = {
+  bytes(n) {
+    if (n === null || n === undefined || Number.isNaN(n)) return 'n/a';
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+    let i = 0;
+    let v = Number(n);
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
+    return (i === 0 ? String(Math.round(v)) : v.toFixed(1)) + ' ' + units[i];
+  },
+  num(n) {
+    if (n === null || n === undefined || Number.isNaN(n)) return 'n/a';
+    const a = Math.abs(n);
+    if (a >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
+    if (a >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, '') + 'K';
+    return String(Math.round(n));
+  },
+  ms(v) {
+    if (v === null || v === undefined || Number.isNaN(v)) return 'n/a';
+    return v < 1000 ? Math.round(v) + ' ms' : (v / 1000).toFixed(1) + ' s';
+  },
+  pct(v) {
+    if (v === null || v === undefined || Number.isNaN(v)) return 'n/a';
+    return Math.round(v * 100) + '%';
+  },
+  clock(sec) {
+    if (sec === null || sec === undefined || Number.isNaN(sec)) return 'n/a';
+    sec = Math.max(0, Math.round(sec));
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    if (h) return h + 'h ' + String(m).padStart(2, '0') + 'm';
+    if (m) return m + 'm ' + String(s).padStart(2, '0') + 's';
+    return s + 's';
+  },
+};
+
+// ----------------------------------------------------------------- chips
+function chip(node, level, text) {
+  node.className = 'chip chip-' + level;
+  node.textContent = text;
+  return node;
+}
+function na(node) { return chip(node, 'na', 'n/a'); }
+
+// Status strip: one persistent chip per engine signal, plus #updated.
+const strip = document.getElementById('strip');
+const updatedChip = document.getElementById('updated');
+function makeChip(name) {
+  const el = document.createElement('span');
+  el.dataset.name = name;
+  na(el);
+  el.hidden = true;
+  strip.appendChild(el);
+  return el;
+}
+const cWaiting = makeChip('waiting');
+const cReady = makeChip('ready');
+const cThermal = makeChip('thermal');
+const cPressure = makeChip('pressure');
+const cMetal = makeChip('metal');
+const cTransport = makeChip('transport');
+const cTick = makeChip('tick');
+const cStale = makeChip('stale');
+const dataChips = [cReady, cThermal, cPressure, cMetal, cTransport, cTick, cStale];
+// ------------------------------------------------------------- strip panel
+const THERMAL = { nominal: 'ok', fair: 'warn', serious: 'bad', critical: 'bad' };
+const PRESSURE = { normal: 'ok', warning: 'warn', critical: 'bad' };
+
+function hideDataChips() {
+  dataChips.forEach((el) => { el.hidden = true; na(el); });
+}
+
+function refreshStale() {
+  const t = state.lastStatus && state.lastStatus.transport;
+  const stale = !!(t && t.status_stale) ||
+    (state.lastOkAt > 0 && Date.now() - state.lastOkAt > 10000);
+  cStale.hidden = !stale;
+  if (stale) chip(cStale, 'bad', 'stale');
+}
+
+function refreshUpdated() {
+  if (!state.lastOkAt) {
+    chip(updatedChip, 'na', '—');
+    return;
+  }
+  const age = Math.max(0, Math.floor((Date.now() - state.lastOkAt) / 1000));
+  chip(updatedChip, age > 30 ? 'bad' : age > 10 ? 'warn' : 'ok', 'updated ' + age + 's ago');
+  refreshStale();
+}
+
+function renderStrip(status) {
+  const s = status || {};
+  if (!status || s.ready === false) {
+    cWaiting.hidden = false;
+    chip(cWaiting, 'warn', 'waiting for engine');
+    hideDataChips();
+    refreshUpdated();
+    return;
+  }
+  cWaiting.hidden = true;
+  dataChips.slice(0, 6).forEach((el) => { el.hidden = false; });
+  if (s.ready === undefined) na(cReady);
+  else chip(cReady, s.ready ? 'ok' : 'bad', s.ready ? 'ready' : 'not ready');
+  const thermal = s.thermal_state;
+  if (thermal === undefined) na(cThermal);
+  else chip(cThermal, THERMAL[thermal] || 'na', thermal);
+  const pressure = s.memory_pressure;
+  if (pressure === undefined) na(cPressure);
+  else chip(cPressure, PRESSURE[pressure] || 'na', pressure);
+  if (!s.metal) na(cMetal);
+  else {
+    chip(cMetal, s.metal.healthy ? 'ok' : 'bad', s.metal.healthy ? 'Metal' : 'Metal down');
+    cMetal.title = s.metal.failure_reason || '';
+  }
+  const t = s.transport;
+  if (!t) na(cTransport);
+  else if (t.stopped) chip(cTransport, 'bad', 'stopped');
+  else if (t.recovering) chip(cTransport, 'warn', 'recovering');
+  else if (t.ready) chip(cTransport, 'ok', 'ready');
+  else na(cTransport);
+  const tick = s.loop ? s.loop.max_tick_ms : undefined;
+  if (tick === null || tick === undefined) na(cTick);
+  else chip(cTick, tick > 1000 ? 'warn' : 'ok', fmt.ms(tick));
+  refreshUpdated();
+}
+
+// --------------------------------------------------------- render dispatch
+const panels = { strip: renderStrip }; // Tasks 3-5 register the other panels
+
+function render(status) {
+  state.lastStatus = status || null;
+  const model = status && status.instance && status.instance.model;
+  if (model) document.getElementById('model-name').textContent = model;
+  for (const fn of Object.values(panels)) {
+    try { fn(status); } catch (err) { console.warn('dashboard panel error:', err); }
+  }
+}
+// --------------------------------------------------------------- polling
+async function pollOnce() {
+  const seq = ++state.pollSeq;
+  try {
+    const headers = {};
+    if (state.key) headers.Authorization = 'Bearer ' + state.key;
+    const res = await fetch('/status', { headers });
+    if (seq !== state.pollSeq) return; // superseded
+    if (res.status === 401) {
+      state.authBlocked = true;
+      state.failed = 0;
+      keyForm.hidden = false;
+      cWaiting.hidden = false;
+      chip(cWaiting, 'warn', 'API key required');
+      hideDataChips();
+      chip(updatedChip, 'na', '—');
+      return;
+    }
+    if (!res.ok) throw new Error('status HTTP ' + res.status);
+    const status = await res.json();
+    if (seq !== state.pollSeq) return; // superseded
+    state.failed = 0;
+    state.lastOkAt = Date.now();
+    render(status);
+  } catch (err) {
+    if (seq !== state.pollSeq) return;
+    state.failed += 1;
+    cWaiting.hidden = false;
+    chip(cWaiting, 'bad', 'offline — retrying');
+    hideDataChips();
+    chip(updatedChip, 'na', '—');
+  } finally {
+    scheduleNext();
+  }
+}
+
+function scheduleNext() {
+  if (state.pollTimer) clearTimeout(state.pollTimer);
+  if (state.authBlocked) return;
+  const interval = state.failed > 0
+    ? Math.min(2000 * Math.pow(2.5, state.failed), 10000) // 2s -> 5s -> 10s, capped
+    : (document.hidden ? 10000 : 2000);
+  state.pollTimer = setTimeout(pollOnce, interval);
+}
+
+// 1s ticker: ages the "updated" chip and the stale flag.
+function tick() {
+  state.tickerTimer = setTimeout(tick, 1000);
+  if (state.lastOkAt) refreshUpdated();
+}
+
+// -------------------------------------------------------------- key form
+const keyForm = document.getElementById('key-form');
+const keyInput = document.getElementById('key-input');
+const keyApply = document.getElementById('key-apply');
+function applyKey() {
+  state.key = keyInput.value.trim() || null;
+  state.authBlocked = false;
+  keyForm.hidden = true;
+  keyInput.value = '';
+  state.pollSeq += 1; // supersede anything in flight
+  pollOnce();
+}
+keyApply.addEventListener('click', (e) => { e.preventDefault(); applyKey(); });
+keyForm.addEventListener('submit', (e) => { e.preventDefault(); applyKey(); });
+
+// ----------------------------------------------------------------- theme
+const charts = []; // Tasks 3-5 register { rebuild() } entries
+function palette() {
+  const cs = getComputedStyle(document.documentElement);
+  const v = (name) => cs.getPropertyValue(name).trim();
+  return {
+    text: v('--text'), muted: v('--muted'), link: v('--link'),
+    border: v('--border'), ok: v('--ok'), warn: v('--warn'), bad: v('--bad'),
+  };
+}
+function rethemeAll() {
+  state.palette = palette();
+  for (const c of charts) {
+    try { c.rebuild ? c.rebuild() : c.update(); } catch (err) { console.warn('retheme error:', err); }
+  }
+}
+const mediaQuery = matchMedia('(prefers-color-scheme: dark)');
+if (mediaQuery.addEventListener) mediaQuery.addEventListener('change', rethemeAll);
+else if (mediaQuery.addListener) mediaQuery.addListener(rethemeAll);
+state.palette = palette();
+
+// -------------------------------------------------------------- start
+chip(cWaiting, 'warn', 'waiting for engine');
+cWaiting.hidden = false;
+pollOnce();
+state.tickerTimer = setTimeout(tick, 1000);
+
+window.__dash = { state, pollOnce, scheduleNext, render, palette, rethemeAll, na, chip, fmt, panels, charts };
+</script>
+</body>
 </html>
