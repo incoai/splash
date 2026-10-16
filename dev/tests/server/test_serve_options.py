@@ -115,6 +115,7 @@ OPTIONS = {
         {"auto": None, "AUTO": None, "1200M": 1200 * 1024**2},
         ("0", "off", "bad", "-2G"),
     ),
+    "--prefill-int8": ([(["--prefill-int8"], True)], []),
     "--max-memory": values(
         "--max-memory",
         {

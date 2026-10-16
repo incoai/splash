@@ -34,9 +34,9 @@ double median(const std::function<double()> &run) {
 
 Measurement::Measurement(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers,
                          const PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden,
-                         std::function<bool()> interrupted)
+                         std::function<bool()> interrupted, bool prefillInt8)
     : backend_(backend), layers_(layers), ffn_(ffn), hidden_(hidden), interrupted_(std::move(interrupted)),
-      linear_(backend.capabilities()) {
+      linear_(backend.capabilities(), prefillInt8) {
   if (const char *reason = AneFfn::unsupported(layers)) throw std::invalid_argument(reason);
   if (layers.size() < 2) throw std::invalid_argument("ANE FFN split timed on fewer than two layers");
   // Timing does not depend on the values, but on their being finite.

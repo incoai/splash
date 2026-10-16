@@ -48,8 +48,9 @@ public:
   // program is compiled and loaded here, and the wait for the ANE's service
   // ends with ane::Interrupted once `interrupted` returns true. The split
   // takes every chunk its functions hold until setMinimumRows().
+  // `prefillInt8`: the GPU's part takes LinearConfig::prefillInt8 as ops::ExecutionPlans' prefill plans do.
   AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
-         std::function<bool()> interrupted);
+         std::function<bool()> interrupted, bool prefillInt8 = false);
   AneFfn(const AneFfn &) = delete;
   AneFfn &operator=(const AneFfn &) = delete;
 
@@ -219,7 +220,7 @@ private:
 
   // The split with a function of each of `functionRows` rows, ascending.
   AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
-         std::function<bool()> interrupted, std::span<const uint32_t> functionRows);
+         std::function<bool()> interrupted, std::span<const uint32_t> functionRows, bool prefillInt8 = false);
   [[nodiscard]] static Shape shapeOf(std::span<const SwiGluProjections> layers, uint32_t aneUnits);
   // Every allocation of the split, which `buffer` and `surface` make:
   // plannedBytes() counts them and the constructor allocates them.

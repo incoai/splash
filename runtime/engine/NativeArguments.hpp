@@ -79,6 +79,9 @@ struct NativeArguments final {
   // --verify-rows auto|all: the rows of the draft's block a decode
   // cycle verifies (RuntimeResourcesConfig::verifyRows).
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // --prefill-int8 on|off: whether Apple10 prefill runs MLX affine 4- and 5-bit
+  // projections in int8 activations (splash serve --prefill-int8 turns it on).
+  bool prefillInt8 = false;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto
