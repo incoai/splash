@@ -660,7 +660,8 @@ function renderGauges(status) {
     // Hold the visible note until the engine produces a nonzero window.
     // A terminal stopped engine never produces one (the server stops
     // restarting after a fatal error), so clear it there as well; the
-    // strip's stopped chip carries the signal.
+    // strip's waiting chip carries the signal (the data chips, including
+    // the stopped chip, are hidden while not ready).
     if (value > 0 || t.stopped) {
       restartNote = false;
       chip(gaugeNote, t.stopped ? 'na' : 'ok', PHASE_LABEL[phase]);
