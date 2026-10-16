@@ -60,7 +60,6 @@
   .card { background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; box-shadow: var(--shadow) }
   .card-title { margin: 0 0 10px; font-size: 12px; font-weight: 650; color: var(--muted); text-transform: uppercase; letter-spacing: .05em }
   .card-body { min-height: 140px }
-  .card-placeholder { color: var(--muted); opacity: .6; font-size: 13px; padding: 44px 0; text-align: center }
   .gauges-body { display: flex; gap: 18px; align-items: center; min-height: 210px }
   .gauge-main { display: flex; flex-direction: column; align-items: center; gap: 6px }
   #gauge-note { font-size: 12px }
@@ -91,7 +90,7 @@
   .bar .seg-used { background: var(--warn) }
   .proc-tiles { flex: 1; display: flex; gap: 8px; min-width: 0 }
   .proc-tiles .tile { padding: 5px 9px }
-  .proc-tiles .tile-value { font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis }
+  .proc-tiles .tile-value { font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
   .chip-link { color: var(--link) }
   .req-table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; table-layout: fixed; margin: 2px 0 6px }
   .req-table th { text-align: left; color: var(--muted); font-weight: 600; padding: 4px 8px 4px 0; white-space: nowrap }
@@ -103,7 +102,7 @@
   .ane-top { margin-bottom: 4px }
   .ane-caption { color: var(--muted); font-size: 11px; margin: 4px 0 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
   .model-name { font-size: 16px; font-weight: 650; margin-bottom: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
-  .model-corner { float: right; color: var(--muted); font-size: 11px; font-weight: 400 }
+  .model-corner { float: right; color: var(--muted); font-size: 11px; font-weight: 400; text-transform: none }
   .mod-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px }
 </style>
 <script src="/dashboard-assets/chart-4.5.1.min.js"></script>
@@ -315,7 +314,9 @@ function refreshStale() {
 }
 
 function refreshUpdated() {
-  if (!state.lastOkAt) {
+  // While the key is required (401) no data exists, so the age math must
+  // never return the ok band over a stale lastOkAt.
+  if (!state.lastOkAt || state.authBlocked) {
     chip(updatedChip, 'na', '—');
     return;
   }
@@ -657,9 +658,12 @@ function renderGauges(status) {
     chip(gaugeNote, 'warn', 'engine restarted');
   } else if (restartNote) {
     // Hold the visible note until the engine produces a nonzero window.
-    if (value > 0) {
+    // A terminal stopped engine never produces one (the server stops
+    // restarting after a fatal error), so clear it there as well; the
+    // strip's stopped chip carries the signal.
+    if (value > 0 || t.stopped) {
       restartNote = false;
-      chip(gaugeNote, 'ok', PHASE_LABEL[phase]);
+      chip(gaugeNote, t.stopped ? 'na' : 'ok', PHASE_LABEL[phase]);
     }
   } else {
     chip(gaugeNote, phase === 'idle' ? 'na' : 'ok', PHASE_LABEL[phase]);
