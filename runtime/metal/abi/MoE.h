@@ -43,6 +43,9 @@ static_assert(sizeof(MoeTileDescriptor) == 8,
 // writes (MoeTileCount). With `in_place` (ops::MoePlan::rowsInPlace: a plan
 // whose rows fill one 8-row tile on the staged tile), every expert's tile is
 // the plan's rows in place, and the gate/up pass reads them without a gather.
+// A nonzero `shared_base` (ops::MoePlan::sharedRowsBase: the shared expert
+// runs as dense projections) gives the shared expert no tiles: row r's shared
+// route is grouped row shared_base + r, past every routed tile.
 struct MoeGroupParams {
   uint32_t rows;
   uint32_t top_k;
@@ -51,10 +54,11 @@ struct MoeGroupParams {
   uint32_t gate_up_columns;
   uint32_t down_columns;
   uint32_t in_place;
+  uint32_t shared_base;
 };
 
-static_assert(sizeof(MoeGroupParams) == 28,
-              "MoE grouping parameters are 28 bytes on both sides");
+static_assert(sizeof(MoeGroupParams) == 32,
+              "MoE grouping parameters are 32 bytes on both sides");
 
 // What the grouping writes besides the tiles: their count, which every pass
 // over them reads first, and the grids (column tiles, tiles, 1) of the

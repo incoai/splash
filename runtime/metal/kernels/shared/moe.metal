@@ -125,7 +125,9 @@ kernel void moe_route_select_f32(
 // In place (a plan whose rows fill one tile) each expert gets one tile of the
 // plan's rows: a route's grouped row is its expert tile's row of the route's
 // own row, and the routed tiles' grouped routes go unwritten, as no gather
-// reads them.
+// reads them. With a shared_base, the shared expert gets no tiles: row r's
+// shared route is grouped row shared_base + r, which its dense projections
+// write (ops/MoE.cpp).
 kernel void moe_group_routes(
     device const uint *selected [[buffer(0)]],
     device MoeTileDescriptor *tiles [[buffer(1)]],
@@ -195,6 +197,14 @@ kernel void moe_group_routes(
     route_rows[route] = row;
   }
 
+  if (params.shared_base) {
+    for (uint row = thread_index; row < params.rows; row += Slots)
+      route_rows[row * routes_per_row + params.top_k] = params.shared_base + row;
+    if (thread_index == 0)
+      *tile_count = MoeTileCount{routed_tiles, {params.gate_up_columns, routed_tiles, 1},
+                                 {params.down_columns, routed_tiles, 1}};
+    return;
+  }
   const uint shared_tiles =
       (params.rows + params.tile_rows - 1) / params.tile_rows;
   const uint shared_base = routed_tiles * params.tile_rows;

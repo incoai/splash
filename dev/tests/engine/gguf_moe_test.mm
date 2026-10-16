@@ -22,7 +22,9 @@
 //   each expert's routes fill them, every route's grouped row naming it back,
 //   the padding a tile's matmul reads marked empty and the rows past it
 //   unwritten, or for a plan whose rows fill one 8-row staged tile, one tile
-//   of the plan's rows per expert and no gather. Concentrated and skewed
+//   of the plan's rows per expert and no gather. On the 32-row tiles the
+//   shared expert runs as dense projections beside the routing: no shared
+//   tiles, its routes at the plan's shared rows. Concentrated and skewed
 //   router loads on the staged 32-row tiles of one format, at ragged row
 //   counts.
 #include "../../../runtime/metal/CommandGraph.hpp"
@@ -92,6 +94,9 @@ constexpr uint32_t kExperts = 16;
 constexpr uint32_t kTopK = 4;
 constexpr uint32_t kRoutes = kTopK + 1;
 constexpr uint32_t kMaximumRows = 263;
+// The MoE input's rows: the dense shared-expert projections of a prefill
+// chunk read whole 32-row simdgroups (MoePlan::inputRows).
+constexpr uint32_t kInputRows = (kMaximumRows + 31) / 32 * 32;
 
 std::mt19937 rng(0x35);
 
@@ -484,6 +489,8 @@ std::vector<ComputeDispatch> fullGridsTwoPasses(const CommandGraph &graph, const
       pass.buffers.push_back({10, scratch.expertOutput});
       pass.bytes[0].index = 11;
       pass.threadgroups.x = dispatch.threadgroups.x * GGUF_STAGED_COLUMNS / GGUF_TILE_COLUMNS;
+      // The up pass reads the gate the gate pass parks: never beside it.
+      if (up) pass.concurrentWithPrevious = false;
       dispatches.push_back(std::move(pass));
     }
   }
@@ -553,10 +560,15 @@ void checkGrouping(const MoeScratch &scratch, const MoePlan &plan, const std::st
   const auto *tiles = static_cast<const MoeTileDescriptor *>(scratch.tileDescriptors.contents());
   const uint32_t tileCount = *static_cast<const uint32_t *>(scratch.tileCount.contents());
   std::array<uint32_t, kExperts + 1> routes{};
+  const uint32_t sharedBase = plan.sharedRowsBase();
   for (uint32_t route = 0; route < rows * kRoutes; ++route) {
     require(selected[route] <= kExperts, label + ": invalid selected expert");
-    ++routes[selected[route]];
     const uint32_t grouped = routeRows[route];
+    if (sharedBase && selected[route] == kExperts) {
+      require(grouped == sharedBase + route / kRoutes, label + ": a shared route is not its row's shared row");
+      continue;
+    }
+    ++routes[selected[route]];
     require(grouped < tileCount * tileRows && groupedRoutes[grouped] == route &&
                 tiles[grouped / tileRows].expert == selected[route],
             label + ": grouped route mapping does not round-trip");
@@ -597,6 +609,7 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
   const auto *routing = static_cast<const float *>(b.moe.scratch.routingWeights.contents());
   const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
   const auto *intermediate = static_cast<const __bf16 *>(b.moe.scratch.expertIntermediate.contents());
+  const auto *sharedIntermediate = static_cast<const __bf16 *>(b.moe.scratch.sharedIntermediate.contents());
   const auto *down = static_cast<const __bf16 *>(b.moe.scratch.expertOutput.contents());
   const auto *output = static_cast<const __bf16 *>(b.moe.output.contents());
   const uint32_t tiles = *static_cast<const uint32_t *>(b.moe.scratch.tileCount.contents());
@@ -613,8 +626,9 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
                 (!grid || (grid[0] == dispatch.threadgroups.x && grid[1] == tiles && grid[2] == 1 &&
                            dispatch.threadgroups.y == plan.maximumTiles())),
             label + ": " + dispatch.pipelineName + " runs another grid than its live tiles");
-    gateUpPasses += dispatch.pipelineName.ends_with("_gate_up");
-    upPasses += dispatch.pipelineName.ends_with("_g");
+    const bool expert = dispatch.pipelineName.starts_with("moe_expert_gguf");
+    gateUpPasses += expert && dispatch.pipelineName.ends_with("_gate_up");
+    upPasses += expert && dispatch.pipelineName.ends_with("_g");
   }
   require(gateUpPasses == oneGateUp && upPasses == !oneGateUp,
           label + (oneGateUp ? ": gate and up run in two passes" : ": gate and up run in one pass"));
@@ -689,7 +703,10 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
             hi = std::max(hi, uc * sc);
           }
         const double slack = std::ldexp(std::max(std::fabs(lo), std::fabs(hi)), -8) + 1e-7;
-        const float got = float(intermediate[uint64_t{grouped} * kIntermediate + n]);
+        // The dense shared projections keep the shared expert's intermediate apart, a row per row.
+        const float got = float(isShared && plan.sharedRowsBase()
+                                    ? sharedIntermediate[uint64_t{r} * kIntermediate + n]
+                                    : intermediate[uint64_t{grouped} * kIntermediate + n]);
         h[n] = got;
         const double exact = double(bf16(u.value)) * silu(bf16(g.value));
         if (!(got >= bf16(lo - slack) && got <= bf16(hi + slack)))
@@ -797,6 +814,7 @@ int moe(MetalBackend &backend) {
   b.input = activations(uint64_t{kMaximumRows} * kHidden);
   b.residual = activations(uint64_t{kMaximumRows} * kHidden);
   for (float &v : b.residual) v = bf16(0.1f * v);
+  b.input.resize(uint64_t{kInputRows} * kHidden);
   b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
   b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
   b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
