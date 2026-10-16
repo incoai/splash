@@ -194,6 +194,9 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
             {scratch.selectedExperts, scratch.tileDescriptors,
              scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
             group, {1, 1, 1}, {SPLASH_MOE_EXPERT_SLOTS, 1, 1});
+  // Gather and combine: four columns per thread, 1024 per threadgroup where
+  // the width allows (256 otherwise).
+  const uint32_t copyThreads = shape.hiddenSize % 1024 ? 64 : 256;
   const MoeGatherParams gather{tileRows, shape.hiddenSize, shape.routesPerToken()};
   if (plan.configuration().ggufTile == MoeGgufTile::Register)
     graph.add("moe_gather_table16",
@@ -204,13 +207,13 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
     graph.add("moe_gather_rows",
               {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
                scratch.tileCount, scratch.groupedInput},
-              gather, {tiles, shape.hiddenSize / 256, 1});
+              gather, {tiles, shape.hiddenSize / (4 * copyThreads), 1}, {copyThreads, 1, 1});
   addExperts(graph, scratch, weights, plan, group, group.in_place ? buffers.input : scratch.groupedInput);
   graph.add("moe_combine",
             {scratch.expertOutput, scratch.routeRows, scratch.routingWeights,
              buffers.residual, buffers.output},
             MoeCombineParams{rows, shape.hiddenSize, shape.routesPerToken()},
-            {rows, shape.hiddenSize / 256, 1});
+            {rows, shape.hiddenSize / (4 * copyThreads), 1}, {copyThreads, 1, 1});
 }
 
 MoePlan MoE::prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config) {

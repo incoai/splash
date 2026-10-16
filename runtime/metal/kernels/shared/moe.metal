@@ -224,8 +224,10 @@ kernel void moe_group_routes(
 }
 
 // Copies each grouped row's input so every expert tile is a dense matrix,
-// over the rows its matmul reads (moe_matmul_rows): padding rows among them
-// are zero and their outputs are never read.
+// four columns per thread, over the tile's live rows: the padding rows its
+// matmul also reads (moe_matmul_rows) keep what they held, as a matmul's rows
+// are independent and their outputs are never read. Grid (tiles, width /
+// (4 * threads)).
 kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
                             device const uint *grouped_routes [[buffer(1)]],
                             device const MoeTileDescriptor *tiles [[buffer(2)]],
@@ -233,19 +235,18 @@ kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
                             device bfloat *grouped_input [[buffer(4)]],
                             constant MoeGatherParams &params [[buffer(5)]],
                             uint2 group [[threadgroup_position_in_grid]],
-                            uint thread_index [[thread_index_in_threadgroup]]) {
+                            uint thread_index [[thread_index_in_threadgroup]],
+                            uint2 threads [[threads_per_threadgroup]]) {
   if (group.x >= *tile_count)
     return;
-  uint column = group.y * 256 + thread_index;
-  const uint rows = moe_matmul_rows(tiles[group.x].rows, params.tile_rows);
+  const uint column = (group.y * threads.x + thread_index) * 4;
+  const uint rows = tiles[group.x].rows;
   for (uint local = 0; local < rows; ++local) {
-    uint row = group.x * params.tile_rows + local;
-    uint route = grouped_routes[row];
-    grouped_input[ulong(row) * params.input_size + column] =
-        route == ~0u
-            ? bfloat(0.0f)
-            : input[ulong(route / params.routes_per_row) * params.input_size +
-                    column];
+    const uint row = group.x * params.tile_rows + local;
+    const uint route = grouped_routes[row];
+    *reinterpret_cast<device bfloat4 *>(grouped_input + ulong(row) * params.input_size + column) =
+        *reinterpret_cast<device const bfloat4 *>(input + ulong(route / params.routes_per_row) * params.input_size +
+                                                  column);
   }
 }
 
@@ -310,6 +311,8 @@ kernel void moe_prepare_table16(device const bfloat *rows [[buffer(0)]],
       table, sums, width, group, simd_lane, simd_group);
 }
 
+// Each row's routes weighted into its residual, four columns per thread, in
+// route order. Grid (rows, hidden_size / (4 * threads)).
 kernel void moe_combine(
     device const bfloat *expert_output [[buffer(0)]],
     device const uint *route_rows [[buffer(1)]],
@@ -318,18 +321,23 @@ kernel void moe_combine(
     device bfloat *output [[buffer(4)]],
     constant MoeCombineParams &params [[buffer(5)]],
     uint2 group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]]) {
-  uint row = group.x;
-  uint dimension = group.y * 256 + thread_index;
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint2 threads [[threads_per_threadgroup]]) {
+  const uint row = group.x;
+  const uint dimension = (group.y * threads.x + thread_index) * 4;
   if (row >= params.rows || dimension >= params.hidden_size)
     return;
-  float value = float(residual[ulong(row) * params.hidden_size + dimension]);
-  ulong route = ulong(row) * params.routes_per_row;
+  const ulong at = ulong(row) * params.hidden_size + dimension;
+  float4 value = float4(*reinterpret_cast<device const bfloat4 *>(residual + at));
+  const ulong route = ulong(row) * params.routes_per_row;
   for (uint slot = 0; slot < params.routes_per_row; ++slot) {
-    value += routing_weights[route + slot] *
-             float(expert_output[ulong(route_rows[route + slot]) *
-                                     params.hidden_size +
-                                 dimension]);
+    const float weight = routing_weights[route + slot];
+    const float4 expert = float4(*reinterpret_cast<device const bfloat4 *>(
+        expert_output + ulong(route_rows[route + slot]) * params.hidden_size + dimension));
+    value.x += weight * expert.x;
+    value.y += weight * expert.y;
+    value.z += weight * expert.z;
+    value.w += weight * expert.w;
   }
-  output[ulong(row) * params.hidden_size + dimension] = bfloat(value);
+  *reinterpret_cast<device bfloat4 *>(output + at) = bfloat4(value);
 }
