@@ -515,10 +515,11 @@ function renderGauges(status) {
   const sched = s.scheduler || {};
   const live = !!s && s.ready !== false;
   // Baseline bookkeeping: the first doc with a restarts counter only sets the
-  // baseline. An engine that restarted before the tab opened is not a restart
-  // this tab witnessed, so it never fires the note. Compare before
-  // windowedRates overwrites the stored value.
-  const restarted = live && state.lastRestarts !== null && t.restarts != null && t.restarts !== state.lastRestarts;
+  // baseline (an engine that restarted before the tab opened is not a restart
+  // this tab witnessed). A crash samples as ready:false docs carrying the
+  // increment, so the note fires on that doc, not only on live docs.
+  // Compare before windowedRates overwrites the stored value.
+  const restarted = state.lastRestarts !== null && t.restarts != null && t.restarts !== state.lastRestarts;
   const rates = live ? windowedRates(status) : { prefill: 0, decode: 0 };
   if (t.restarts != null) state.lastRestarts = t.restarts;
   // An observed restart clears the rings/sparklines and fires the note.
