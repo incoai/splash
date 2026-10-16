@@ -92,6 +92,19 @@
   .proc-tiles { flex: 1; display: flex; gap: 8px; min-width: 0 }
   .proc-tiles .tile { padding: 5px 9px }
   .proc-tiles .tile-value { font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis }
+  .chip-link { color: var(--link) }
+  .req-table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; table-layout: fixed; margin: 2px 0 6px }
+  .req-table th { text-align: left; color: var(--muted); font-weight: 600; padding: 4px 8px 4px 0; white-space: nowrap }
+  .req-table td { padding: 5px 8px 5px 0; border-top: 1px solid var(--border); white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+  .req-table .cell-bar { width: 100%; height: 6px }
+  .req-none td { color: var(--muted); opacity: .65; text-align: center }
+  .bar .dw-seg { background: var(--link) }
+  .bar .seg-ane { background: var(--link) }
+  .ane-top { margin-bottom: 4px }
+  .ane-caption { color: var(--muted); font-size: 11px; margin: 4px 0 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+  .model-name { font-size: 16px; font-weight: 650; margin-bottom: 8px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+  .model-corner { float: right; color: var(--muted); font-size: 11px; font-weight: 400 }
+  .mod-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px }
 </style>
 <script src="/dashboard-assets/chart-4.5.1.min.js"></script>
 </head>
@@ -155,15 +168,48 @@
   </div></section>
   <section class="card" id="memory"><h2 class="card-title">Memory</h2><div class="card-body">
     <div class="kv-rows">
-      <div class="kv-row"><span class="kv-label">governor</span><div class="bar"><div class="seg-charged" id="mem-charged"></div></div><span class="kv-val" id="mem-counts">n/a</span><span class="kv-val dim" id="mem-headroom">n/a</span></div>
+      <div class="kv-row"><span class="kv-label">governor</span><div class="bar"><div class="seg-charged" id="mem-charged"></div></div><span class="kv-val" id="mem-counts">n/a</span><span class="kv-val dim" id="mem-headroom">n/a</span><span id="mem-pressure" class="chip chip-na">n/a</span></div>
       <div class="kv-row"><span class="kv-label">actual</span><span class="kv-val" id="mem-actual">n/a</span><span class="kv-val dim" id="mem-host">n/a</span></div>
       <div class="kv-row"><span class="kv-label">reservations</span><span class="kv-val" id="mem-denied">n/a</span><span id="mem-denied-chip" class="chip chip-na">n/a</span></div>
       <div class="kv-row"><span class="kv-label">weights</span><span id="w-state" class="chip chip-na">n/a</span><span class="kv-val" id="w-counts">n/a</span><span class="kv-val dim" id="w-idle">n/a</span></div>
     </div>
   </div></section>
-  <section class="card" id="requests"><h2 class="card-title">Requests</h2><div class="card-body"><div class="card-placeholder">—</div></div></section>
-  <section class="card" id="ane"><h2 class="card-title">Neural engine</h2><div class="card-body"><div class="card-placeholder">—</div></div></section>
-  <section class="card" id="model"><h2 class="card-title">Model</h2><div class="card-body"><div class="card-placeholder">—</div></div></section>
+  <section class="card" id="requests"><h2 class="card-title">Requests</h2><div class="card-body">
+    <table class="req-table"><thead><tr><th>id</th><th>phase</th><th>priority</th><th>prompt</th><th>generated</th><th>age</th></tr></thead><tbody id="req-rows"><tr class="req-none"><td colspan="6">n/a</td></tr></tbody></table>
+    <div class="kv-rows">
+      <div class="kv-row"><span class="kv-label">lifetime</span><span class="kv-val" id="req-lifetime">n/a</span></div>
+      <div class="kv-row"><span class="kv-label">scheduler</span><span class="kv-val" id="sched-counts">n/a</span></div>
+      <div class="kv-row"><span class="kv-label">batch width</span><div class="bar"><div class="dw-seg" id="dw-b1"></div><div class="dw-seg" id="dw-b2"></div><div class="dw-seg" id="dw-b3"></div><div class="dw-seg" id="dw-b4"></div></div><span class="kv-val" id="dw-counts">n/a</span></div>
+      <div class="kv-row"><span class="kv-label">admission</span><span class="kv-val" id="adm-wait">n/a</span><span class="kv-val dim" id="adm-extra">n/a</span><span id="adm-chip" class="chip chip-na">n/a</span></div>
+      <div class="kv-row"><span class="kv-label">http</span><span class="kv-val" id="http-counts">n/a</span></div>
+    </div>
+  </div></section>
+  <section class="card" id="ane"><h2 class="card-title">Neural engine</h2><div class="card-body">
+    <div class="ane-top"><span id="ane-state" class="chip chip-na">n/a</span></div>
+    <div class="ane-caption" id="ane-reason"></div>
+    <div class="kv-rows">
+      <div class="kv-row"><span class="kv-label">share</span><div class="bar"><div class="seg-ane" id="ane-share-bar"></div></div><span class="kv-val" id="ane-share">n/a</span></div>
+      <div class="kv-row"><span class="kv-label">chunks</span><span class="kv-val" id="ane-min">n/a</span></div>
+      <div class="kv-row"><span class="kv-label">lifetime</span><span class="kv-val" id="ane-cum">n/a</span></div>
+      <div class="kv-row"><span class="kv-label">prefill</span><div class="bar"><div class="seg-ane" id="ane-prefill-bar"></div></div><span class="kv-val" id="ane-prefill">n/a</span></div>
+      <div class="kv-row"><span class="kv-label">per eval</span><span class="kv-val" id="ane-mseval">n/a</span></div>
+      <div class="kv-row"><span class="kv-label">per cmd</span><span class="kv-val" id="ane-evalcmd">n/a</span></div>
+      <div class="kv-row"><span class="kv-label">reruns</span><span class="kv-val" id="ane-rerun">n/a</span><span id="ane-rerun-chip" class="chip chip-na">n/a</span></div>
+    </div>
+  </div></section>
+  <section class="card" id="model"><h2 class="card-title">Model <span class="model-corner" id="model-schema">n/a</span></h2><div class="card-body">
+    <div class="model-name" id="model-card-name">n/a</div>
+    <div class="kv-rows">
+      <div class="kv-row"><span class="kv-label">endpoint</span><span class="kv-val" id="model-endpoint">n/a</span></div>
+      <div class="kv-row"><span class="kv-label">instance</span><span class="kv-val" id="model-instance">n/a</span></div>
+      <div class="kv-row"><span class="kv-label">uptime</span><span class="kv-val" id="model-uptime">n/a</span></div>
+      <div class="kv-row"><span class="kv-label">context</span><span class="kv-val" id="model-ctx">n/a</span></div>
+      <div class="kv-row"><span class="kv-label">kv cache</span><span class="kv-val" id="model-kv-dtype">n/a</span><span class="kv-val dim" id="model-kv-block">n/a</span></div>
+      <div class="kv-row"><span class="kv-label">device</span><span class="kv-val" id="model-device">n/a</span></div>
+      <div class="kv-row"><span class="kv-label">template</span><span class="kv-val" id="model-template">n/a</span></div>
+    </div>
+    <div class="mod-chips" id="model-modalities"><span class="chip chip-na">n/a</span><span class="chip chip-na">n/a</span></div>
+  </div></section>
 </main>
 <script>
 'use strict';
@@ -314,7 +360,7 @@ function renderStrip(status) {
 }
 
 // --------------------------------------------------------- render dispatch
-const panels = { strip: renderStrip, gauges: renderGauges, cache: renderCache, memory: renderMemory }; // Task 5 registers the remaining panels
+const panels = { strip: renderStrip, gauges: renderGauges, cache: renderCache, memory: renderMemory, requests: renderRequests, ane: renderAne, model: renderModel };
 
 function render(status) {
   state.lastStatus = status || null;
@@ -670,6 +716,7 @@ const pcResp = document.getElementById('pc-resp');
 const memCharged = document.getElementById('mem-charged');
 const memCounts = document.getElementById('mem-counts');
 const memHeadroom = document.getElementById('mem-headroom');
+const memPressure = document.getElementById('mem-pressure');
 const memActual = document.getElementById('mem-actual');
 const memHost = document.getElementById('mem-host');
 const memDenied = document.getElementById('mem-denied');
@@ -756,6 +803,12 @@ function renderMemory(status) {
     ? 'n/a'
     : fmt.bytes(gov.charged_bytes) + ' of ' + fmt.bytes(gov.limit_bytes));
   setVal(memHeadroom, 'headroom ' + fmt.bytes(gov.headroom_bytes));
+  // The spec's Memory row names system_pressure (the raw pressure, not the strip's effective one).
+  if (gov.system_pressure == null) na(memPressure);
+  else if (gov.system_pressure === 'normal') chip(memPressure, 'ok', 'normal');
+  else if (gov.system_pressure === 'warning') chip(memPressure, 'warn', 'warning');
+  else if (gov.system_pressure === 'critical') chip(memPressure, 'bad', 'critical');
+  else chip(memPressure, 'na', String(gov.system_pressure));
   setVal(memActual, act.current_bytes == null || act.peak_bytes == null
     ? 'n/a'
     : fmt.bytes(act.current_bytes) + ' current · ' + fmt.bytes(act.peak_bytes) + ' peak');
@@ -779,6 +832,226 @@ function renderMemory(status) {
     : fmt.num(w.restores) + ' restores' + (w.restore_failures ? ' · ' + fmt.num(w.restore_failures) + ' failed' : ''));
   setVal(wIdle, w.idle_release_seconds == null ? 'n/a' : 'release after ' + fmt.num(w.idle_release_seconds) + ' s idle');
 }
+// ----------------------------------------------------------------- requests
+const reqLifetime = document.getElementById('req-lifetime');
+const schedCounts = document.getElementById('sched-counts');
+const dwCounts = document.getElementById('dw-counts');
+const dwSegs = ['dw-b1', 'dw-b2', 'dw-b3', 'dw-b4'].map((id) => document.getElementById(id));
+const admWait = document.getElementById('adm-wait');
+const admExtra = document.getElementById('adm-extra');
+const admChip = document.getElementById('adm-chip');
+const httpCounts = document.getElementById('http-counts');
+const reqRows = document.getElementById('req-rows');
+
+// Phase → chip tone. queued + waiting_* are neutral, prefill a link tone,
+// decode/completed healthy, cancelled/failed bad; anything else stays muted.
+function phaseTone(phase) {
+  if (phase == null) return 'na';
+  if (phase === 'queued' || phase.startsWith('waiting_')) return 'na';
+  if (phase === 'prefill') return 'link';
+  if (phase === 'decode' || phase === 'completed') return 'ok';
+  if (phase === 'cancelled' || phase === 'failed') return 'bad';
+  return 'na';
+}
+
+function buildReqRow(r) {
+  const tr = document.createElement('tr');
+  const cell = (text) => {
+    const td = document.createElement('td');
+    td.textContent = text;
+    return td;
+  };
+  tr.appendChild(cell(r.id == null ? 'n/a' : String(r.id)));
+  const phaseTd = document.createElement('td');
+  phaseTd.appendChild(chip(document.createElement('span'), phaseTone(r.phase), r.phase == null ? 'n/a' : String(r.phase)));
+  tr.appendChild(phaseTd);
+  tr.appendChild(cell(r.priority == null ? 'n/a' : String(r.priority)));
+  const barTd = document.createElement('td');
+  const bar = document.createElement('div');
+  bar.className = 'bar cell-bar';
+  const seg = document.createElement('div');
+  seg.style.width = pct(r.prompt_processed, r.prompt_tokens) + '%';
+  bar.appendChild(seg);
+  barTd.appendChild(bar);
+  tr.appendChild(barTd);
+  tr.appendChild(cell([r.generated_tokens, r.max_new_tokens].some((v) => v == null) ? 'n/a' : fmt.num(r.generated_tokens) + ' of ' + fmt.num(r.max_new_tokens)));
+  tr.appendChild(cell(r.age_ms == null ? 'n/a' : fmt.ms(r.age_ms)));
+  return tr;
+}
+
+function renderRequests(status) {
+  const s = status || {};
+  const req = s.requests || {};
+  setVal(reqLifetime, [req.submitted, req.completed, req.cancelled, req.failed].some((v) => v == null)
+    ? 'n/a'
+    : fmt.num(req.submitted) + ' sub · ' + fmt.num(req.completed) + ' done · ' + fmt.num(req.cancelled) + ' cancelled · ' + fmt.num(req.failed) + ' failed');
+  // null → n/a row; an empty array is a real zero → "none active".
+  const list = s.active_requests;
+  while (reqRows.firstChild) reqRows.removeChild(reqRows.firstChild);
+  const blank = (text) => {
+    const tr = document.createElement('tr');
+    tr.className = 'req-none';
+    const td = document.createElement('td');
+    td.colSpan = 6;
+    td.textContent = text;
+    tr.appendChild(td);
+    return tr;
+  };
+  if (list == null) reqRows.appendChild(blank('n/a'));
+  else if (list.length === 0) reqRows.appendChild(blank('none active'));
+  else for (const r of list) reqRows.appendChild(buildReqRow(r));
+  const sc = s.scheduler || {};
+  const dw = sc.decode_batches_by_width || {};
+  const dwVals = [dw.b1, dw.b2, dw.b3, dw.b4];
+  const dwTotal = dwVals.reduce((a, v) => a + (Number.isFinite(v) ? v : 0), 0);
+  dwSegs.forEach((seg, i) => { seg.style.width = pct(dwVals[i], dwTotal) + '%'; });
+  setVal(schedCounts, ['queued', 'waiting_resources', 'waiting_prefix', 'waiting_mask', 'prefilling', 'decoding'].some((k) => sc[k] == null)
+    ? 'n/a'
+    : fmt.num(sc.queued) + ' queued · ' + fmt.num(sc.waiting_resources) + ' wait-res · ' + fmt.num(sc.waiting_prefix) + ' wait-prefix · ' + fmt.num(sc.waiting_mask) + ' wait-mask · ' + fmt.num(sc.prefilling) + ' prefill · ' + fmt.num(sc.decoding) + ' decode');
+  setVal(dwCounts, dwVals.some((v) => v == null) ? 'n/a' : dwVals.map((v, i) => fmt.num(v) + ' b' + (i + 1)).join(' · '));
+  const ad = s.admission;
+  if (ad == null) {
+    setVal(admWait, 'n/a');
+    setVal(admExtra, 'n/a');
+    na(admChip);
+  } else {
+    setVal(admWait, ad.waiting == null || ad.oldest_wait_ms == null ? 'n/a' : fmt.num(ad.waiting) + ' waiting · oldest ' + fmt.ms(ad.oldest_wait_ms));
+    setVal(admExtra, [ad.held_behind_refusal, ad.restoring, ad.suspended].some((v) => v == null)
+      ? 'n/a'
+      : fmt.num(ad.held_behind_refusal) + ' held · ' + fmt.num(ad.restoring) + ' restoring · ' + fmt.num(ad.suspended) + ' suspended');
+    if (ad.draining == null) na(admChip);
+    else if (ad.draining) chip(admChip, 'warn', 'draining');
+    else chip(admChip, 'ok', 'open');
+  }
+  const h = s.http;
+  if (h == null) setVal(httpCounts, 'n/a');
+  else {
+    const rq = h.requests || {};
+    const co = h.connections || {};
+    setVal(httpCounts, [rq.active, rq.capacity, co.active, co.capacity].some((v) => v == null)
+      ? 'n/a'
+      : fmt.num(rq.active) + '/' + fmt.num(rq.capacity) + ' req · ' + fmt.num(co.active) + '/' + fmt.num(co.capacity) + ' conns');
+  }
+}
+
+// ----------------------------------------------------------------- ane
+const aneState = document.getElementById('ane-state');
+const aneReason = document.getElementById('ane-reason');
+const aneShareBar = document.getElementById('ane-share-bar');
+const aneShare = document.getElementById('ane-share');
+const aneMin = document.getElementById('ane-min');
+const aneCum = document.getElementById('ane-cum');
+const anePrefillBar = document.getElementById('ane-prefill-bar');
+const anePrefill = document.getElementById('ane-prefill');
+const aneMseval = document.getElementById('ane-mseval');
+const aneEvalcmd = document.getElementById('ane-evalcmd');
+const aneRerun = document.getElementById('ane-rerun');
+const aneRerunChip = document.getElementById('ane-rerun-chip');
+
+function renderAne(status) {
+  const s = status || {};
+  const a = s.ane_ffn;
+  const pre = (s.model_timing || {}).prefill || {};
+  if (a == null) {
+    na(aneState);
+    setVal(aneReason, 'n/a');
+    aneShareBar.style.width = '0%';
+    setVal(aneShare, 'n/a');
+    setVal(aneMin, 'n/a');
+    setVal(aneCum, 'n/a');
+    anePrefillBar.style.width = '0%';
+    setVal(anePrefill, 'n/a');
+    setVal(aneMseval, 'n/a');
+    setVal(aneEvalcmd, 'n/a');
+    setVal(aneRerun, 'n/a');
+    na(aneRerunChip);
+    return;
+  }
+  if (a.state == null) na(aneState);
+  else if (a.state === 'split') chip(aneState, 'ok', 'split');
+  else if (a.state === 'off') chip(aneState, 'na', 'off');
+  else if (a.state === 'stopped') chip(aneState, 'bad', 'stopped');
+  else chip(aneState, 'na', String(a.state));
+  setVal(aneReason, a.reason == null ? 'n/a' : String(a.reason));
+  const share = Number(a.share);
+  const shareOk = a.share != null && Number.isFinite(share);
+  aneShareBar.style.width = shareOk ? Math.max(0, Math.min(100, share * 100)) + '%' : '0%';
+  setVal(aneShare, shareOk ? fmt.pct(share) : 'n/a');
+  setVal(aneMin, a.minimum_rows == null ? 'n/a' : 'chunks ≥ ' + a.minimum_rows + ' rows');
+  setVal(aneCum, [a.split_commands, a.evaluations, a.ane_ms].some((v) => v == null)
+    ? 'n/a'
+    : fmt.num(a.split_commands) + ' commands · ' + fmt.num(a.evaluations) + ' evals · ' + fmt.ms(a.ane_ms));
+  // Derived figures: a zero or absent denominator reads n/a, never a fake 0.
+  const aneMs = Number(a.ane_ms);
+  const preMs = Number(pre.total_wall_ms);
+  const preOk = a.ane_ms != null && Number.isFinite(aneMs) && pre.total_wall_ms != null && Number.isFinite(preMs) && preMs > 0;
+  anePrefillBar.style.width = preOk ? Math.min(100, (aneMs / preMs) * 100) + '%' : '0%';
+  setVal(anePrefill, preOk ? fmt.pct(aneMs / preMs) : 'n/a');
+  const evals = Number(a.evaluations);
+  setVal(aneMseval, a.ane_ms != null && Number.isFinite(aneMs) && Number.isFinite(evals) && evals > 0 ? fmt.ms(aneMs / evals) : 'n/a');
+  setVal(aneEvalcmd, a.evaluations != null && a.split_commands != null && a.split_commands > 0 ? fmt.num(a.evaluations / a.split_commands) : 'n/a');
+  const reruns = Number(a.reruns);
+  const rr = a.reruns != null && Number.isFinite(reruns) && a.split_commands != null && a.split_commands > 0 ? reruns / a.split_commands : null;
+  setVal(aneRerun, rr == null ? 'n/a' : fmt.pct(rr));
+  if (rr == null) na(aneRerunChip);
+  else if (rr > 0) chip(aneRerunChip, 'warn', 'rerun');
+  else chip(aneRerunChip, 'ok', 'none');
+}
+
+// ----------------------------------------------------------------- model
+const modelName = document.getElementById('model-card-name');
+const modelSchema = document.getElementById('model-schema');
+const modelEndpoint = document.getElementById('model-endpoint');
+const modelInstance = document.getElementById('model-instance');
+const modelUptime = document.getElementById('model-uptime');
+const modelCtx = document.getElementById('model-ctx');
+const modelKvDtype = document.getElementById('model-kv-dtype');
+const modelKvBlock = document.getElementById('model-kv-block');
+const modelDevice = document.getElementById('model-device');
+const modelTemplate = document.getElementById('model-template');
+const modChips = document.getElementById('model-modalities');
+
+function renderModel(status) {
+  const s = status || {};
+  const inst = s.instance;
+  const mp = s.memory_plan || {};
+  const dev = mp.device || {};
+  const ic = s.identity && s.identity.cache;
+  // instance first; fall back to the memory plan's model (disclosed in the report).
+  const planName = mp.model && mp.model.model_name != null ? mp.model.model_name : null;
+  const name = inst && inst.model != null ? inst.model : planName;
+  setVal(modelName, name == null ? 'n/a' : String(name));
+  setVal(modelSchema, s.schema_version == null ? 'n/a' : 'v' + s.schema_version);
+  setVal(modelEndpoint, !inst || inst.host == null || inst.port == null ? 'n/a' : inst.host + ':' + inst.port);
+  setVal(modelInstance, !inst || inst.pid == null || inst.id == null ? 'n/a' : String(inst.pid) + ' · ' + String(inst.id).slice(0, 8));
+  setVal(modelUptime, !inst || inst.started_at == null ? 'n/a' : fmt.clock(Date.now() / 1000 - inst.started_at));
+  setVal(modelCtx, s.maximum_context_tokens == null ? 'n/a' : fmt.num(s.maximum_context_tokens));
+  setVal(modelKvDtype, ic && ic.dtype != null ? String(ic.dtype) : 'n/a');
+  setVal(modelKvBlock, ic && ic.block_tokens != null ? fmt.num(ic.block_tokens) + ' blk' : 'n/a');
+  setVal(modelDevice, dev.device_name == null && dev.gpu_core_count == null && dev.physical_memory_bytes == null
+    ? 'n/a'
+    : (dev.device_name == null ? 'n/a' : String(dev.device_name)) + ' · ' + (dev.gpu_core_count == null ? 'n/a' : fmt.num(dev.gpu_core_count) + ' cores') + ' · ' + fmt.bytes(dev.physical_memory_bytes));
+  const mods = s.input_modalities;
+  while (modChips.firstChild) modChips.removeChild(modChips.firstChild);
+  if (mods == null) modChips.appendChild(chip(document.createElement('span'), 'na', 'n/a'));
+  else if (mods.length === 0) modChips.appendChild(chip(document.createElement('span'), 'na', 'none'));
+  else for (const m of mods) {
+    const el = document.createElement('span');
+    el.className = 'chip';
+    el.textContent = String(m);
+    modChips.appendChild(el);
+  }
+  if (s.vision == null) modChips.appendChild(chip(document.createElement('span'), 'na', 'n/a'));
+  else if (s.vision === true) modChips.appendChild(chip(document.createElement('span'), 'ok', 'vision'));
+  else modChips.appendChild(chip(document.createElement('span'), 'na', 'no vision'));
+  const ls = s.chat_template && s.chat_template.later_system;
+  if (ls == null) setVal(modelTemplate, 'n/a');
+  else if (typeof ls === 'object') {
+    const parts = Object.entries(ls).map(([k, v]) => k + ': ' + v);
+    setVal(modelTemplate, parts.length ? parts.join(' · ') : 'n/a');
+  } else setVal(modelTemplate, String(ls));
+}
+
 // --------------------------------------------------------------- polling
 async function pollOnce() {
   const seq = ++state.pollSeq;

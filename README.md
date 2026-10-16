@@ -36,6 +36,9 @@ splash opencode    # or: splash claude / splash codex / splash hermes / splash p
 
 For a server started with another `--port`, pass the same `--port` to the agent.
 
+The site shows the chat page at `/` and a read-only performance dashboard at
+`/dashboard`.
+
 Press Ctrl+C in the server terminal to stop Splash.
 For LM Studio Bionic, follow its [Splash setup guide](https://lmstudio.ai/blog/splash-engine).
 

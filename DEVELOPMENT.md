@@ -1198,6 +1198,19 @@ retains at most four prefixes and 8 MiB of text/token storage; it falls back to
 full encoding for other tokenizer pipelines. `/status.tokenizer_cache` reports
 its usage. It does not alter prompt text, token IDs or the GPU KV cache.
 
+### Dashboard
+
+`GET /dashboard` serves a read-only performance dashboard. The page is public
+like the chat page, and `--no-webui` hides it. It polls `/status` every 2 s
+while the tab is visible (10 s while hidden) and renders the status document
+as gauges, bars and tables: a speed gauge with draft acceptance and TTFT/ITL
+sparklines, the KV-cache and memory panels, the request queue with its active
+requests, the ANE split's usage and derived prefill-time share, and a model
+card. With `--api-key`, the page asks for the key in the header; the key stays
+in memory for the tab's life and never persists. Every figure is the status
+document's own — the page invents nothing, and a value the engine does not
+report reads `n/a`.
+
 ### Errors
 
 An error is answered as the API of its path answers it, whatever the method
