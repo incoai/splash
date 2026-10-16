@@ -69,6 +69,13 @@ public:
     step(std::move(event), value, EventStep::Kind::Wait);
   }
 
+  // Lets the last dispatch added overlap the ones since the last dispatch
+  // without this flag (ComputeDispatch::concurrentWithPrevious): it must
+  // neither read what they write nor write what they read or write.
+  void concurrentWithPrevious() {
+    if (!dispatches_.empty()) dispatches_.back().concurrentWithPrevious = true;
+  }
+
   [[nodiscard]] bool empty() const noexcept { return dispatches_.empty(); }
   // The dispatches alone; command() has the event steps too.
   [[nodiscard]] std::span<const ComputeDispatch> dispatches() const noexcept {
