@@ -114,6 +114,13 @@ CHAT_ASSETS = {
 # The chat page's brand mark, in its text colors, which the page shows too.
 # Browsers, and other clients, ask for a site's icon at /favicon.ico.
 FAVICON_SVG = Path(__file__).with_name("favicon.svg").read_bytes()
+DASHBOARD_HTML = Path(__file__).with_name("dashboard.html").read_bytes()
+DASHBOARD_ASSETS = {
+    f"/dashboard-assets/{name}": (
+        Path(__file__).parent / "dashboard-assets" / name
+    ).read_bytes()
+    for name in ("chart-4.5.1.min.js",)
+}
 
 
 def _content_length(value):
@@ -334,8 +341,16 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self.command in ("GET", "HEAD")
                 and (
                     self.route
-                    in ("/", "/index.html", "/favicon.ico", "/health", "/ready")
+                    in (
+                        "/",
+                        "/index.html",
+                        "/favicon.ico",
+                        "/health",
+                        "/ready",
+                        "/dashboard",
+                    )
                     or self.route in CHAT_ASSETS
+                    or self.route in DASHBOARD_ASSETS
                 )
             )
             if not public:
@@ -539,7 +554,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.route
-        if path in ("/", "/index.html", "/favicon.ico") or path in CHAT_ASSETS:
+        if (
+            path in ("/", "/index.html", "/favicon.ico", "/dashboard")
+            or path in CHAT_ASSETS
+            or path in DASHBOARD_ASSETS
+        ):
             if not self.server.webui:
                 self._safe_error(APIError(404, "not found", "not_found"))
             elif path == "/favicon.ico":
@@ -547,6 +566,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
             elif path in CHAT_ASSETS:
                 mime = "text/css" if path.endswith(".css") else "text/javascript"
                 self._send(200, CHAT_ASSETS[path], f"{mime}; charset=utf-8")
+            elif path in DASHBOARD_ASSETS:
+                self._send(
+                    200, DASHBOARD_ASSETS[path], "text/javascript; charset=utf-8"
+                )
+            elif path == "/dashboard":
+                self._send(200, DASHBOARD_HTML, "text/html; charset=utf-8")
             else:
                 self._send(200, CHAT_HTML, "text/html; charset=utf-8")
             return

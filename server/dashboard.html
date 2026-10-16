@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Splash Dashboard</title>
+<link rel="icon" href="/favicon.ico" type="image/svg+xml">
+<style>
+  * { box-sizing: border-box }
+  :root {
+    color-scheme: light dark;
+    --bg: #fff;
+    --side: #f9f9f9;
+    --text: #171717;
+    --muted: #727272;
+    --link: #2563eb;
+    --hover: #ececec;
+    --bubble: #f1f1f1;
+    --composer: #fff;
+    --border: #e5e5e5;
+    --shadow: 0 8px 28px #00000012;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #212121;
+      --side: #181818;
+      --text: #ececec;
+      --muted: #9b9b9b;
+      --link: #60a5fa;
+      --hover: #2b2b2b;
+      --bubble: #303030;
+      --composer: #2f2f2f;
+      --border: #424242;
+      --shadow: 0 8px 28px #0005;
+    }
+  }
+  body { margin: 0; color: var(--text); background: var(--bg); font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif }
+  header { display: flex; align-items: center; height: 56px; padding: 0 20px; background: var(--side); border-bottom: 1px solid var(--border) }
+  .brand { display: flex; align-items: center; gap: 9px; font-size: 17px; font-weight: 650; letter-spacing: -.02em }
+  .brand img { width: 19px; height: 19px }
+  main { min-height: calc(100vh - 56px); padding: 38px 20px }
+  #loading { text-align: center; color: var(--muted) }
+</style>
+
+<header>
+  <div class="brand">
+    <img src="/favicon.ico" alt="">
+    Splash Dashboard
+  </div>
+</header>
+<main>
+  <div id="loading">Loading</div>
+</main>
+
+<script src="/dashboard-assets/chart-4.5.1.min.js"></script>
+</html>
