@@ -96,7 +96,7 @@
   <section class="card" id="gauges"><h2 class="card-title">Speed</h2><div class="card-body gauges-body">
     <div class="gauge-main">
       <canvas id="gauge-speed" width="220" height="200"></canvas>
-      <span id="gauge-note" class="chip chip-na">idle</span>
+      <span id="gauge-note" class="chip chip-na">n/a</span>
     </div>
     <div class="gauge-side">
       <div class="gauge-sub">
@@ -137,7 +137,7 @@ const state = {
   palette: null,
   prevCounters: null, // last /status token counters (windowed diffs)
   prevPollAt: 0,      // Date.now() of the last windowed /status
-  lastRestarts: 0,    // last seen transport.restarts
+  lastRestarts: null, // last seen transport.restarts (null = no baseline yet)
   // Batch recency guard (see batchFallback): a content key per batch kind and
   // a count of consecutive unchanged polls.
   batchKeys: { dKey: null, pKey: null, dStale: 0, pStale: 0 },
@@ -390,7 +390,9 @@ function makeGauge(canvas, { label, unit, mode, rotation = 240, circumference = 
     plugins: [needlePlugin],
   });
   chart.$palette = pal;
-  chart.$needle = { needle, rotation, circumference, fraction: 0, valueText: '0 ' + unit, labelText: label };
+  // n/a first: Chart.js renders on construction, and a key-required visitor
+  // must not read fake zeros off the canvases.
+  chart.$needle = { needle, rotation, circumference, fraction: 0, valueText: 'n/a', labelText: '' };
   charts.push({
     kind: mode,
     chart,
@@ -512,11 +514,14 @@ function renderGauges(status) {
   const t = s.transport || {};
   const sched = s.scheduler || {};
   const live = !!s && s.ready !== false;
-  const prevRestarts = state.lastRestarts;
+  // Baseline bookkeeping: the first doc with a restarts counter only sets the
+  // baseline. An engine that restarted before the tab opened is not a restart
+  // this tab witnessed, so it never fires the note. Compare before
+  // windowedRates overwrites the stored value.
+  const restarted = live && state.lastRestarts !== null && t.restarts != null && t.restarts !== state.lastRestarts;
   const rates = live ? windowedRates(status) : { prefill: 0, decode: 0 };
-  // An observed restart (field present and changed); a missing field is not
-  // a restart, so it never clears the rings or fires the note.
-  const restarted = live && t.restarts != null && t.restarts !== prevRestarts;
+  if (t.restarts != null) state.lastRestarts = t.restarts;
+  // An observed restart clears the rings/sparklines and fires the note.
   if (restarted) {
     rings.prefill.length = 0;
     rings.decode.length = 0;
@@ -559,10 +564,13 @@ function renderGauges(status) {
   speedGauge.set(value, scale, PHASE_LABEL[phase]);
   if (restarted) {
     chip(gaugeNote, 'warn', 'engine restarted');
-  } else if (restartNote && value > 0) {
-    restartNote = false;
-    chip(gaugeNote, 'ok', PHASE_LABEL[phase]);
-  } else if (!restarted) {
+  } else if (restartNote) {
+    // Hold the visible note until the engine produces a nonzero window.
+    if (value > 0) {
+      restartNote = false;
+      chip(gaugeNote, 'ok', PHASE_LABEL[phase]);
+    }
+  } else {
     chip(gaugeNote, phase === 'idle' ? 'na' : 'ok', PHASE_LABEL[phase]);
   }
   // Draft acceptance (engine-computed rate; n/a until it exists).
