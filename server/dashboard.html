@@ -82,7 +82,7 @@
   .kv-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px; font-variant-numeric: tabular-nums }
   .kv-row:last-child { border-bottom: none }
   .kv-label { width: 76px; flex: none; color: var(--muted); font-weight: 600 }
-  .kv-val { color: var(--text); white-space: nowrap }
+  .kv-val { color: var(--text); white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis }
   .kv-val.dim { color: var(--muted) }
   .bar { display: flex; flex: 1; height: 8px; border-radius: 4px; background: var(--border); overflow: hidden; min-width: 60px }
   .bar > div { height: 100%; width: 0 }
@@ -91,7 +91,7 @@
   .bar .seg-used { background: var(--warn) }
   .proc-tiles { flex: 1; display: flex; gap: 8px; min-width: 0 }
   .proc-tiles .tile { padding: 5px 9px }
-  .proc-tiles .tile-value { font-size: 13px }
+  .proc-tiles .tile-value { font-size: 13px; min-width: 0; overflow: hidden; text-overflow: ellipsis }
 </style>
 <script src="/dashboard-assets/chart-4.5.1.min.js"></script>
 </head>
@@ -685,6 +685,12 @@ function pct(v, total) {
     : 0;
 }
 
+// Set a value span's text plus a title, so a clipped value is recoverable on hover.
+function setVal(el, t) {
+  el.textContent = t;
+  el.title = t;
+}
+
 function renderCache(status) {
   const s = status || {};
   const c = s.cache || {};
@@ -695,46 +701,49 @@ function renderCache(status) {
     hitRateGauge.set(0, 100, '');
     hitRateGauge.chart.$needle.valueText = 'n/a';
     hitRateGauge.chart.update('none');
-    cacheHits.textContent = 'n/a';
+    setVal(cacheHits, 'n/a');
   } else {
     hitRateGauge.set(Math.max(0, Math.min(100, c.hit_rate * 100)), 100, '');
-    cacheHits.textContent = c.hits == null || c.cold_misses == null
+    setVal(cacheHits, c.hits == null || c.cold_misses == null
       ? 'n/a'
-      : fmt.num(c.hits) + ' hits · ' + fmt.num(c.cold_misses) + ' cold misses';
+      : fmt.num(c.hits) + ' hits · ' + fmt.num(c.cold_misses) + ' cold misses');
   }
-  cacheReused.textContent = c.reused_tokens == null ? 'n/a' : fmt.num(c.reused_tokens) + ' tokens';
-  cacheDedup.textContent = c.deduplicated_state_publications == null ? 'n/a' : fmt.num(c.deduplicated_state_publications) + ' dedup states';
+  setVal(cacheReused, c.reused_tokens == null ? 'n/a' : fmt.num(c.reused_tokens) + ' tokens');
+  setVal(cacheDedup, c.deduplicated_state_publications == null ? 'n/a' : fmt.num(c.deduplicated_state_publications) + ' dedup states');
   kvActive.style.width = pct(kv.pages_active, kv.pages_allocated) + '%';
   kvCached.style.width = pct(kv.pages_cache, kv.pages_allocated) + '%';
-  kvCounts.textContent = [kv.pages_active, kv.pages_cache, kv.pages_free, kv.pages_allocated].some((v) => v == null)
+  setVal(kvCounts, [kv.pages_active, kv.pages_cache, kv.pages_free, kv.pages_allocated].some((v) => v == null)
     ? 'n/a'
-    : fmt.num(kv.pages_active) + ' active · ' + fmt.num(kv.pages_cache) + ' cached · ' + fmt.num(kv.pages_free) + ' free of ' + fmt.num(kv.pages_allocated);
-  kvBytes.textContent = kv.allocated_bytes == null
+    : fmt.num(kv.pages_active) + ' active · ' + fmt.num(kv.pages_cache) + ' cached · ' + fmt.num(kv.pages_free) + ' free of ' + fmt.num(kv.pages_allocated));
+  setVal(kvBytes, kv.allocated_bytes == null
     ? 'n/a'
-    : fmt.bytes(kv.allocated_bytes) + ' alloc · ' + fmt.bytes(kv.reclaimable_bytes) + ' reclaim';
-  stateEnt.textContent = st.entries == null || st.bytes == null
+    : fmt.bytes(kv.allocated_bytes) + ' alloc · ' + fmt.bytes(kv.reclaimable_bytes) + ' reclaim');
+  setVal(stateEnt, st.entries == null || st.bytes == null
     ? 'n/a'
-    : fmt.num(st.entries) + ' entries · ' + fmt.bytes(st.bytes);
-  stateCkpt.textContent = st.checkpoint_entries == null || st.checkpoint_bytes == null
+    : fmt.num(st.entries) + ' entries · ' + fmt.bytes(st.bytes));
+  setVal(stateCkpt, st.checkpoint_entries == null || st.checkpoint_bytes == null
     ? 'n/a'
-    : fmt.num(st.checkpoint_entries) + ' ckpt · ' + fmt.bytes(st.checkpoint_bytes);
+    : fmt.num(st.checkpoint_entries) + ' ckpt · ' + fmt.bytes(st.checkpoint_bytes));
   diskUsed.style.width = pct(disk.used_bytes, disk.capacity_bytes) + '%';
-  diskCounts.textContent = disk.used_bytes == null || disk.capacity_bytes == null
+  setVal(diskCounts, disk.used_bytes == null || disk.capacity_bytes == null
     ? 'n/a'
-    : fmt.bytes(disk.used_bytes) + ' of ' + fmt.bytes(disk.capacity_bytes);
-  diskExtra.textContent = 'vol free ' + fmt.bytes(disk.volume_available_bytes) + ' · budget ' + fmt.bytes(disk.write_budget_bytes);
-  diskIo.textContent = 'reads ' + fmt.bytes(disk.read_bytes) + ' · writes ' + fmt.bytes(disk.written_bytes);
-  if (disk.writes_gated == null) chip(diskGated, 'ok', 'open');
+    : fmt.bytes(disk.used_bytes) + ' of ' + fmt.bytes(disk.capacity_bytes));
+  setVal(diskExtra, 'vol free ' + fmt.bytes(disk.volume_available_bytes) + ' · budget ' + fmt.bytes(disk.write_budget_bytes));
+  setVal(diskIo, 'reads ' + fmt.bytes(disk.read_bytes) + ' · writes ' + fmt.bytes(disk.written_bytes));
+  // The engine emits "no" for the normal (ungated) state (Status.cpp:81);
+  // only "budget" / "closed" are degraded. "no" must read ok, not warn.
+  if (disk.writes_gated == null || disk.writes_gated === 'no') chip(diskGated, 'ok', 'open');
+  else if (disk.writes_gated === 'closed') chip(diskGated, 'bad', 'closed');
   else chip(diskGated, 'warn', String(disk.writes_gated));
   const tok = s.tokenizer_cache;
   const img = s.image_cache;
   const gram = s.grammar_cache;
   const resp = s.response_store;
-  pcTok.textContent = tok ? fmt.num(tok.entries) + ' · ' + fmt.num(tok.hits) + ' · ' + fmt.num(tok.reused_tokens) : 'n/a';
-  pcImg.textContent = img ? fmt.num(img.entries) + ' · ' + fmt.bytes(img.bytes) : 'n/a';
+  setVal(pcTok, tok ? fmt.num(tok.entries) + ' · ' + fmt.num(tok.hits) + ' · ' + fmt.num(tok.reused_tokens) : 'n/a');
+  setVal(pcImg, img ? fmt.num(img.entries) + ' · ' + fmt.bytes(img.bytes) : 'n/a');
   // The live grammar shape carries source_bytes, not a plain bytes field.
-  pcGram.textContent = gram ? fmt.num(gram.entries) + ' · ' + fmt.bytes(gram.bytes ?? gram.source_bytes) : 'n/a';
-  pcResp.textContent = resp ? fmt.num(resp.entries) + ' · ' + fmt.bytes(resp.bytes) : 'n/a';
+  setVal(pcGram, gram ? fmt.num(gram.entries) + ' · ' + fmt.bytes(gram.bytes ?? gram.source_bytes) : 'n/a');
+  setVal(pcResp, resp ? fmt.num(resp.entries) + ' · ' + fmt.bytes(resp.bytes) : 'n/a');
 }
 
 function renderMemory(status) {
@@ -743,32 +752,32 @@ function renderMemory(status) {
   const act = s.memory_actual || {};
   const w = s.weights || {};
   memCharged.style.width = pct(gov.charged_bytes, gov.limit_bytes) + '%';
-  memCounts.textContent = gov.charged_bytes == null || gov.limit_bytes == null
+  setVal(memCounts, gov.charged_bytes == null || gov.limit_bytes == null
     ? 'n/a'
-    : fmt.bytes(gov.charged_bytes) + ' of ' + fmt.bytes(gov.limit_bytes);
-  memHeadroom.textContent = 'headroom ' + fmt.bytes(gov.headroom_bytes);
-  memActual.textContent = act.current_bytes == null || act.peak_bytes == null
+    : fmt.bytes(gov.charged_bytes) + ' of ' + fmt.bytes(gov.limit_bytes));
+  setVal(memHeadroom, 'headroom ' + fmt.bytes(gov.headroom_bytes));
+  setVal(memActual, act.current_bytes == null || act.peak_bytes == null
     ? 'n/a'
-    : fmt.bytes(act.current_bytes) + ' current · ' + fmt.bytes(act.peak_bytes) + ' peak';
-  memHost.textContent = 'host free ' + fmt.bytes(gov.host_available_bytes);
+    : fmt.bytes(act.current_bytes) + ' current · ' + fmt.bytes(act.peak_bytes) + ' peak');
+  setVal(memHost, 'host free ' + fmt.bytes(gov.host_available_bytes));
   if (gov.denied_reservations == null) {
-    memDenied.textContent = 'n/a';
+    setVal(memDenied, 'n/a');
     na(memDeniedChip);
   } else if (gov.denied_reservations > 0) {
-    memDenied.textContent = fmt.num(gov.denied_reservations) + ' denied';
+    setVal(memDenied, fmt.num(gov.denied_reservations) + ' denied');
     chip(memDeniedChip, 'warn', 'denied');
   } else {
-    memDenied.textContent = '0 denied';
+    setVal(memDenied, '0 denied');
     chip(memDeniedChip, 'ok', 'none');
   }
   if (w.released == null && w.restoring == null) na(wState);
   else if (w.restoring === true) chip(wState, 'warn', 'restoring');
   else if (w.released === true) chip(wState, 'warn', 'released');
   else chip(wState, 'ok', 'in memory');
-  wCounts.textContent = w.restores == null && w.restore_failures == null
+  setVal(wCounts, w.restores == null && w.restore_failures == null
     ? 'n/a'
-    : fmt.num(w.restores) + ' restores' + (w.restore_failures ? ' · ' + fmt.num(w.restore_failures) + ' failed' : '');
-  wIdle.textContent = w.idle_release_seconds == null ? 'n/a' : 'release after ' + fmt.num(w.idle_release_seconds) + ' s idle';
+    : fmt.num(w.restores) + ' restores' + (w.restore_failures ? ' · ' + fmt.num(w.restore_failures) + ' failed' : ''));
+  setVal(wIdle, w.idle_release_seconds == null ? 'n/a' : 'release after ' + fmt.num(w.idle_release_seconds) + ' s idle');
 }
 // --------------------------------------------------------------- polling
 async function pollOnce() {
