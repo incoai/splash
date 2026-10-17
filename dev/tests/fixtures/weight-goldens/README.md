@@ -5,9 +5,9 @@
   `ggml_bf16_to_fp32_row` and `ggml_fp16_to_fp32_row`), and of block_nvfp4
   rows of llama.cpp's NVFP4 (`ggml-nvfp4`, which the loader converts into
   NVFP4's native rows) (`gguf-reference`). They pin the CPU reference
-  (`dev/tests/engine/GgufFormatReference.hpp`) to llama.cpp 7ab4ee7, and
-  PQ2_0, which upstream GGML lacks, to PrismML-Eng/llama.cpp 01ae597, so no
-  Splash change touches them.
+  (`dev/tests/engine/GgufFormatReference.hpp`) to llama.cpp 7ab4ee7 (Q2_0
+  too), and PQ2_0, which upstream GGML lacks, to PrismML-Eng/llama.cpp
+  01ae597, so no Splash change touches them.
 - `gguf_images`: every image `gguf-preparation` writes from its dense and MoE
   GGUF fixtures.
 - `draft_images`: every image `draft-preparation` writes from the DFlash2

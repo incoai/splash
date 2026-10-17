@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -69,7 +70,9 @@ class Target:
 
 def _root_ggufs(files):
     """The GGUF files at a repository's root, named *.gguf as the native
-    loader finds a target; subfolders (split BF16, MTP heads) never count."""
+    loader finds a target. Files in a subfolder count only as the parts of a
+    split GGUF in its VARIANT/ folder (split_gguf); others (MTP heads) never
+    do."""
     return sorted(n for n in files if "/" not in n and n.endswith(".gguf"))
 
 
@@ -80,7 +83,8 @@ def _projector_named(name):
 
 
 def select_gguf(files, variant):
-    """The target GGUF among a repository's root files, and whether it was
+    """The target GGUF among a repository's root files, as the list of its
+    files (one, or a split GGUF's parts, split_gguf), and whether it was
     taken by its -VARIANT ending from several, which the caller reports.
     :VARIANT names the file whose name is the model name all of them share,
     then -VARIANT (X-Q4_K_M for Q4_K_M, not X-UD-Q4_K_M); failing that, the
@@ -91,7 +95,7 @@ def select_gguf(files, variant):
     candidates = [n for n in _root_ggufs(files) if not _projector_named(n)]
     if variant is None:
         if len(candidates) == 1:
-            return candidates[0], False
+            return [candidates[0]], False
         choice = "select a GGUF with OWNER/REPO:VARIANT"
     else:
         parts = [Path(name).stem.split("-") for name in candidates]
@@ -102,14 +106,57 @@ def select_gguf(files, variant):
             if "-".join(words[shared:]).lower() == variant.lower()
         ]
         if len(exact) == 1:
-            return exact[0], False
+            return [exact[0]], False
         suffix = "-" + variant.lower()
         ending = [n for n in candidates if Path(n).stem.lower().endswith(suffix)]
         if len(ending) == 1:
-            return ending[0], len(candidates) > 1
+            return [ending[0]], len(candidates) > 1
         choice = "no single GGUF matches :" + variant
+        if split := split_gguf(files, variant):
+            return split, False
     listed = ", ".join(candidates) or "none"
     raise models.ModelError(f"{choice} (files in the repository root: {listed})")
+
+
+SPLIT_NAME = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
+
+
+def split_gguf(files, variant):
+    """The split files of a target GGUF that a repository keeps in a folder
+    named after its variant, as Unsloth publishes the files too large for
+    one (VARIANT/MODEL-VARIANT-00001-of-0000N.gguf ...), in split order; None
+    when there is no such folder. Every part from 1 to N must be present."""
+    prefix = variant.lower() + "/"
+    names = [
+        n
+        for n in files
+        if n.lower().startswith(prefix)
+        and n.count("/") == 1
+        and n.endswith(".gguf")
+        and not _projector_named(n)
+    ]
+    if not names:
+        return None
+    parts = {}
+    for name in names:
+        match = SPLIT_NAME.search(name)
+        if not match:
+            raise models.ModelError(
+                f"{name} is not one part of a split GGUF (NAME-0000K-of-0000N.gguf)"
+            )
+        number = int(match.group(1))
+        if number in parts:
+            raise models.ModelError(
+                f"{parts[number][1]} and {name} are both part {number} of the "
+                f"split GGUF in {variant}/"
+            )
+        parts[number] = (int(match.group(2)), name)
+    counts = {count for count, _ in parts.values()}
+    if len(counts) != 1 or sorted(parts) != list(range(1, counts.pop() + 1)):
+        raise models.ModelError(
+            f"the split GGUF in {variant}/ is incomplete: " + ", ".join(sorted(names))
+        )
+    return [parts[number][1] for number in sorted(parts)]
 
 
 def select_vision(repo):
@@ -185,16 +232,22 @@ def inspect_target(repo, variant, language_only, scratch):
 
 
 def _gguf_target(repo, variant, language_only, scratch):
-    name, by_ending = select_gguf(repo.files, variant)
+    names, by_ending = select_gguf(repo.files, variant)
+    name = names[0] if len(names) == 1 else f"{len(names)} split files {names[0]} ..."
     if by_ending:
         print(
             f"No GGUF is named for :{variant} alone; using {name}, the only one "
             f"whose name ends in -{variant}.",
             flush=True,
         )
-    with repo.open(name) as stream:
-        header = gguf.Metadata(stream, tensors=True)
-    files = {"target/" + name: name}
+    headers = []
+    for part in names:
+        with repo.open(part) as stream:
+            headers.append(gguf.Metadata(stream, tensors=True))
+    header = gguf.merged_split(headers)
+    # A split GGUF's parts lie side by side in target/, where the native
+    # loader finds them by their -0000K-of-0000N names.
+    files = {"target/" + Path(part).name: part for part in names}
     config, metadata = scratch / "config.json", scratch / "gguf-metadata.json"
     config.write_bytes(models.json_bytes(gguf.model_config(header)))
     metadata.write_bytes(models.json_bytes(gguf.scalar_metadata(header)))
