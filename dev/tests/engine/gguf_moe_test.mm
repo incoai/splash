@@ -21,13 +21,14 @@
 //   bitwise equal at every lane count and chunk of one tile where its routes
 //   run the same tile kinds (the staged expert passes run an expert's only
 //   tile of at most MOE_GGUF_COLUMN_ROWS live rows on the column tile; the
-//   rows so compared are counted) and at every repeat of a run, the output of
-//   the live tiles' grids bitwise that of every tile's with two gate/up
-//   passes, and the grouping: tiles as each expert's routes fill them, every
-//   route's grouped row naming it back, the padding a tile's matmul reads
-//   marked empty and the rows past it unwritten. Concentrated and skewed
-//   router loads on the staged 32-row tiles of one format, at ragged row
-//   counts.
+//   rows so compared are counted) and at every repeat of a run (a set's
+//   first plan also on fresh scratch, where every row must compare), the
+//   output of the live tiles' grids bitwise that of every tile's with two
+//   gate/up passes, and the grouping: tiles as each expert's routes fill
+//   them, every route's grouped row naming it back, the padding a tile's
+//   matmul reads marked empty and the rows past it unwritten. Concentrated and
+//   skewed router loads on the staged 32-row tiles of one format, at ragged
+//   row counts.
 // Streamed experts (model::ExpertStore) run in expert_store_test.mm.
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
@@ -547,11 +548,18 @@ RowComparison compareChunks(const MoeRun &run, const MoeRun &widest, const MoeRu
   }
   return sum;
 }
-// Comparisons whose rows all ran other tile kinds in their two runs compared no row bitwise, which leaves those runs
-// the fp64 bound alone; returns the failures.
-int requireCompared(uint32_t compared, const std::string &comparisons) {
-  if (compared) return 0;
-  printf("  %s: no row ran the same tile kinds in two runs, so none compared bitwise FAIL\n", comparisons.c_str());
+// A set's first run against its partner of the same tile kinds by construction: the same plan run again on fresh
+// scratch, whose grouping orders each expert's routes anew but routes every row as before, so each route runs the
+// tile kind it ran and every row must compare bitwise. The set's runs of other rows compare only the rows whose
+// routes happen to run the same kinds, which a shape need not have (a 512-expert block's narrow chunks run the column
+// tile where its widest runs staged); this pair keeps the comparison from testing nothing. Returns the failures.
+int compareRepeat(const MoeRun &first, const MoeRun &again, const std::string &label) {
+  const uint32_t rows = uint32_t(first.output.size() / kHidden);
+  const RowComparison c =
+      again.output.size() == first.output.size() ? compareRows(again, first, rows) : RowComparison{};
+  if (c.compared == rows && !c.differ) return 0;
+  printf("  %s: a repeat of the run compared %u of its %u rows bitwise, %u differ FAIL\n", label.c_str(), c.compared,
+         rows, c.differ);
   return 1;
 }
 
@@ -803,6 +811,9 @@ int moe(MetalBackend &backend) {
                                   (router == FloatTile::NeuralAccelerator ? " (accelerator router)" : "");
         const MoeRun result = runPlan(backend, m, b, plan, true, products, stats, label);
         if (widest.output.empty()) {
+          Stats repeat;
+          failures += compareRepeat(result, runPlan(backend, m, b, plan, true, products, repeat, label + " repeat"),
+                                    label);
           widest = previous = result;
           continue;
         }
@@ -812,7 +823,6 @@ int moe(MetalBackend &backend) {
         failures += c.differ > 0;
         previous = result;
       }
-      failures += requireCompared(compared, formats + " prefill 263/33/16");
       printf("%-20s staged   prefill 263/33/16 (32-row tiles, %s router): gate/up %.2f%% and down %.2f%% of outputs "
              "differ from bf16(fp64), errors at most %.1e/%.1e of sum|x w|, %u rows compared bitwise, %u across tile "
              "kinds %s\n",
@@ -855,8 +865,15 @@ int moe(MetalBackend &backend) {
           // A row's result depends on its own routes and the tile kinds they
           // run only, not on the rows it is batched with (the tile rows of one
           // expert are independent).
-          if (widest.output.empty()) widest = run;
-          else compareWidest(run, label);
+          if (widest.output.empty()) {
+            Stats repeat;
+            failures += compareRepeat(
+                run, runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, repeat, label + " repeat"),
+                label);
+            widest = run;
+          } else {
+            compareWidest(run, label);
+          }
         }
         // Prefill chunks on the same 8-row tiles (ExecutionPlans::moePrefill).
         for (const uint32_t chunk : {kMaximumRows, 27u, 9u, 8u}) {
@@ -868,7 +885,6 @@ int moe(MetalBackend &backend) {
           compareWidest(runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, stats, label),
                         label);
         }
-        failures += requireCompared(compared, formats + " decode B1-4, prefill 263/27/9/8");
         printf("%-20s %s decode B1-4, prefill 263/27/9/8: gate/up %.2f%% and down %.2f%% of outputs differ from bf16(fp64), "
                "errors at most %.1e/%.1e of sum|x w|, %u rows compared bitwise, %u across tile kinds %s\n",
                formats.c_str(), tile == MoeGgufTile::Register ? "register" : "staged  ",
@@ -936,6 +952,9 @@ int routingLoads(MetalBackend &backend) {
                 label + ": fixture routes to its intended first two experts");
       }
       if (widest.output.empty()) {
+        Stats repeat;
+        failures +=
+            compareRepeat(result, runPlan(backend, m, b, plan, true, products, repeat, label + " repeat"), label);
         widest = previous = result;
         continue;
       }
@@ -945,7 +964,6 @@ int routingLoads(MetalBackend &backend) {
       failures += c.differ > 0;
       previous = result;
     }
-    failures += requireCompared(compared, formats + " " + name + " prefill 256/48/12/1");
     printf("%-20s staged   prefill 256/48/12/1 (32-row tiles, %s routing): gate/up %.2f%% and down %.2f%% of "
            "outputs differ from bf16(fp64), errors at most %.1e/%.1e of sum|x w|, %u rows compared bitwise, %u across "
            "tile kinds %s\n",
