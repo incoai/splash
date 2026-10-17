@@ -145,7 +145,7 @@ Linear::Linear(const DeviceCapabilities &device) noexcept
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
   const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, LinearPhase::Decode, LinearEpilogue::None};
   validate(w);
-  return LinearPlan(w, ggufBaseline(w, {}, shape.registerFormats)).storageRows();
+  return LinearPlan(w, ggufBaseline(w, {}, shape.registerFormats, shape.fourBits)).storageRows();
 }
 
 LinearPlan Linear::plan(LinearWorkload workload) const {

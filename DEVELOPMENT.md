@@ -1854,7 +1854,10 @@ stages at every lane count, and its decode storage holds the staged tile's rows.
 (M5) the staged tile (`LinearTile::GgufStaged`) runs the kernels of
 `runtime/metal/kernels/shared/gguf_linear.metal`, which dequantize each weight once to half in
 threadgroup memory (`kernels/common/gguf_staged.h`) for MPP `matmul2d`, the neural accelerator's
-path, on bf16 activations. A step's weights, and
+path, on bf16 activations. A decode step whose grid is narrow there, fewer than one and a half
+threadgroups per core (half that in formats of fewer than four bits per weight), runs on the
+register tile instead, whose 128 threads per column tile keep more of its cores' loads in flight
+than the staged tile's 64 (`apple10Registers`). A step's weights, and
 its meta unit when it enters a new one, load while the previous step's matmul runs
 (`gguf_staged_steps`): their DRAM round trips overlap a matmul. On Apple10 from 16 cores each
 column tile of a decode projection starts its walk over its K partition at its own step

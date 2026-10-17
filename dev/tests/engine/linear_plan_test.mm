@@ -12,6 +12,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <iostream>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -129,20 +130,22 @@ void requireAnchorSplits(const LinearPlan &plan, const SplitAnchor &anchor, cons
 constexpr auto kNone = LinearEpilogue::None, kResidual = LinearEpilogue::Residual, kGateUp = LinearEpilogue::GateUp;
 
 // Six threadgroups per core, at least 512 inputs per partition, for every
-// projection kind.
+// projection kind; the narrow grids at 32 rows, where Apple10 stages them
+// (its register tile takes the steps whose grid of column tiles and lanes
+// holds fewer than 1.5 threadgroups per core).
 constexpr std::array kStagedSplitAnchors{
     SplitAnchor{"27B down", 16, 5120, 17408, 8, kResidual, 1, 2},
     SplitAnchor{"27B down", 20, 5120, 17408, 8, kResidual, 1, 2},
     SplitAnchor{"27B down", 10, 5120, 17408, 8, kResidual, 1, 1},
     SplitAnchor{"27B down", 40, 5120, 17408, 8, kResidual, 1, 4},
     SplitAnchor{"35B output projection", 16, 2048, 4096, 8, kResidual, 1, 4},
-    SplitAnchor{"35B shared-expert gate/up", 16, 512, 2048, 8, kGateUp, 1, 4},
+    SplitAnchor{"35B shared-expert gate/up", 16, 512, 2048, 32, kGateUp, 1, 4},
     SplitAnchor{"27B gate/up", 16, 17408, 5120, 8, kGateUp, 1, 1},
     SplitAnchor{"two-segment fused projection", 16, 4096, 5120, 8, kNone, 2, 2},
     SplitAnchor{"27B three-segment GDN input", 40, 16640, 5120, 8, kNone, 3, 1},
     SplitAnchor{"27B vocabulary head", 16, 248320, 5120, 8, kNone, 1, 1},
-    SplitAnchor{"narrow 1024 x 256 tensor", 16, 1024, 256, 8, kNone, 1, 1},
-    SplitAnchor{"narrow 1024 x 3072 tensor", 16, 1024, 3072, 8, kNone, 1, 4}};
+    SplitAnchor{"narrow 1024 x 256 tensor", 16, 1024, 256, 32, kNone, 1, 1},
+    SplitAnchor{"narrow 1024 x 3072 tensor", 16, 1024, 3072, 32, kNone, 1, 4}};
 
 // One wave (four threadgroups per core) down to one 256-input unit per
 // partition, eight waves while partitions keep 1024 inputs, at most eight.
@@ -214,7 +217,7 @@ void ggufPlans() {
           "GGUF single-tensor decode plan");
   for (const SplitAnchor &anchor : kStagedSplitAnchors)
     requireAnchorSplits(anchorPlan(10, anchor), anchor, "GGUF staged split policy");
-  const LinearPlan gateUpPlan = linear.plan({{512, 2048}, 16, LinearPhase::Decode, LinearEpilogue::GateUp},
+  const LinearPlan gateUpPlan = linear.plan({{512, 2048}, 32, LinearPhase::Decode, LinearEpilogue::GateUp},
                                             blockProjection(512, 2048, 1));
   require(gateUpPlan.configuration().splits == 4 && gateUpPlan.gateScratchBytes() == gateBytes(gateUpPlan) &&
               gateUpPlan.scratchSize().partials == splitPartialsBytes(gateUpPlan),
@@ -355,6 +358,51 @@ void ggufPlans() {
   require(linear.plan({{5120, 17408}, 24, LinearPhase::Decode, LinearEpilogue::Residual},
                       blockProjection(5120, 17408, 1, GGUF_FMT_IQ2XXS)).configuration().tile == LinearTile::GgufStaged,
           "Apple10 stages every format");
+  // Apple10 registers decode steps on grids of fewer than 1.5 threadgroups
+  // per core (64 columns and lane each), half that in formats of fewer than
+  // four bits, a one-pass gate/up pair on both tensors' columns. Its decode
+  // storage follows the shape's formats, and the decode scratch bound covers
+  // every plan.
+  {
+    struct Anchor {
+      const char *projection;
+      uint32_t cores, n, k, rows, format;
+      LinearTile tile;
+    };
+    constexpr Anchor kAnchors[] = {
+        {"Q4_K 2560 x 6144", 32, 2560, 6144, 8, GGUF_FMT_Q4K, LinearTile::GgufRegister},
+        {"Q4_K 2560 x 6144, 20 cores", 20, 2560, 6144, 8, GGUF_FMT_Q4K, LinearTile::GgufStaged},
+        {"IQ2_XXS 2560 x 6144", 32, 2560, 6144, 8, GGUF_FMT_IQ2XXS, LinearTile::GgufStaged},
+        {"IQ2_XXS 1024 x 5120", 32, 1024, 5120, 8, GGUF_FMT_IQ2XXS, LinearTile::GgufRegister},
+        {"IQ2_XXS 1024 x 5120, 16 rows", 32, 1024, 5120, 16, GGUF_FMT_IQ2XXS, LinearTile::GgufStaged},
+        {"Q2_0 512 x 2560, 20 cores", 20, 512, 2560, 8, GGUF_FMT_Q20, LinearTile::GgufRegister},
+        {"BF16 320 x 10240", 32, 320, 10240, 8, GGUF_FMT_BF16, LinearTile::GgufRegister},
+    };
+    for (const Anchor &a : kAnchors)
+      require(gpu(10, a.cores).plan({{a.n, a.k}, a.rows, LinearPhase::Decode, kNone},
+                                    blockProjection(a.n, a.k, 1, a.format)).configuration().tile == a.tile,
+              std::string("Apple10 register policy: ") + a.projection);
+    const auto pair = [](uint32_t cores, uint32_t n, uint32_t k) {
+      const Projection up = blockProjection(n, k, 1), gate = blockProjection(n, k, 1);
+      return gpu(10, cores).plan({{n, k}, 8, LinearPhase::Decode, kGateUp}, up, &gate).configuration();
+    };
+    require(pair(20, 1024, 5120).oneGateUpPass && pair(32, 1024, 5120).tile == LinearTile::GgufRegister &&
+                pair(20, 512, 2560).tile == LinearTile::GgufRegister,
+            "Apple10 registers a one-pass gate/up pair on both tensors' columns");
+    const Linear m5 = gpu(10, 32);
+    for (const uint32_t format : {GGUF_FMT_Q4K, GGUF_FMT_IQ2XXS, GGUF_FMT_Q20})
+      for (const auto [n, k] : {std::pair{1024U, 5120U}, {512U, 2560U}, {2560U, 6144U}, {320U, 10240U}}) {
+        const Projection p = blockProjection(n, k, 1, format);
+        const LinearScratchSize bound = m5.decodeScratchSize(p.shape());
+        for (uint32_t rows = 8; rows <= 32; rows += 8) {
+          const LinearPlan plan = m5.plan({{n, k}, rows, LinearPhase::Decode, kNone}, p);
+          const LinearScratchSize need = plan.scratchSize();
+          require(plan.storageRows() == m5.decodeStorageRows(rows, p.shape()) && bound.input >= need.input &&
+                      bound.sums >= need.sums && bound.partials >= need.partials && bound.counters >= need.counters,
+                  "Apple10 decode storage and scratch bound follow the formats");
+        }
+      }
+  }
   // Apple9's staged tile, in decode and in prefill chunks, splits K by the
   // register tile's tiers: on 40 cores 17408 x 5120 in four, 5120 x 17408 in
   // eight.
@@ -461,15 +509,19 @@ void scratchBoundsRotated() {
 // The GGUF decode split rules are per-core laws, checked at every core count
 // (zero is the fallback), both families and a grid of widths, inputs, epilogues
 // and segment counts rather than at the measured machines:
-// - a request's sums do not depend on the requests it is batched with: the whole
-//   plan is the same at every batch width;
+// - a request's sums do not depend on the requests it is batched with on one
+//   tile: every batch width runs the register tile's plan (Apple9; Apple10
+//   where the grid of column tiles and lanes holds fewer than 1.5 per core,
+//   Q4_K's) or the staged tile's, the same at every width, over its tile's
+//   rows;
 // - a split count is a power of two up to eight whose partitions keep the kernel's
 //   floor (register: one 256-input unit, staged: 512 inputs in whole 32-input
 //   groups);
 // - the staged tile spreads its walks from 16 planned cores, the register tile
 //   never;
 // - it depends on the grid per core only: doubling the width and the core count
-//   keeps it, more cores never lower it and a wider grid never raises it;
+//   keeps it, more cores never lower it and a wider grid never raises it, on
+//   one tile;
 // - the arena bound (the single-tensor plan) covers every segment count.
 void ggufCoreLaws() {
   constexpr std::array<uint32_t, 16> widths{256, 512, 768, 1024, 1536, 2048, 3072, 4096, 5120,
@@ -486,36 +538,52 @@ void ggufCoreLaws() {
               const auto plan = [&](const Linear &l, uint32_t width, uint32_t rows) {
                 return l.plan({{width, k}, rows, LinearPhase::Decode, epilogue}, blockProjection(width, k, segments));
               };
-              const LinearPlan one = plan(linear, n, 8);
-              const LinearConfig c = one.configuration();
-              for (const uint32_t rows : {16U, 24U, 32U}) {
-                const LinearPlan wider = plan(linear, n, rows);
-                require(wider.configuration() == c && wider.input() == one.input(),
+              const uint32_t planned = plannedGpuCores(simulatedDevice(family, cores));
+              const auto registers = [&](uint32_t lanes) {
+                return family == 9 || 2 * uint64_t{n / 64} * lanes < uint64_t{3} * planned;
+              };
+              // Every batch width takes its tile's configuration and binds its
+              // tile's rows.
+              std::optional<LinearConfig> registerConfig, stagedConfig;
+              for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+                const uint32_t rows = lanes * 8;
+                const LinearPlan other = plan(linear, n, rows);
+                const LinearConfig c = other.configuration();
+                const bool staged = !registers(lanes);
+                std::optional<LinearConfig> &first = staged ? stagedConfig : registerConfig;
+                if (!first) first = c;
+                require(c.tile == (staged ? LinearTile::GgufStaged : LinearTile::GgufRegister) && c == *first &&
+                            other.input() == (staged ? LinearInput::Plain : LinearInput::Table16) &&
+                            other.storageRows() == (staged && rows == 24 ? 32U : rows),
                         "GGUF decode plan depends on the batch width");
+                const uint32_t s = c.splits;
+                require(s >= 1 && s <= 8 && (s & (s - 1)) == 0 && c.spread == (staged && planned >= 16),
+                        "GGUF decode plan split count or walk");
+                require(s == 1 || (staged ? k / s >= 512 && (k / 32) % s == 0 : k / 256 / s >= 1),
+                        "GGUF decode partition below the kernel floor");
               }
-              const uint32_t s = c.splits;
-              const bool staged = c.tile == LinearTile::GgufStaged;
-              require(c.tile == (family == 9 ? LinearTile::GgufRegister : LinearTile::GgufStaged) &&
-                          s >= 1 && s <= 8 && (s & (s - 1)) == 0 &&
-                          c.spread == (staged && plannedGpuCores(simulatedDevice(family, cores)) >= 16),
-                      "GGUF decode plan tile, split count or walk");
-              require(s == 1 || (staged ? k / s >= 512 && (k / 32) % s == 0 : k / 256 / s >= 1),
-                      "GGUF decode partition below the kernel floor");
-              require(one.storageRows() == 8 && plan(linear, n, 24).storageRows() == (staged ? 32U : 24U),
-                      "GGUF decode tile rows");
               if (cores) {
-                require(plan(twice, 2 * n, 8).configuration().splits == s,
-                        "GGUF split count depends on more than the grid per core");
-                require(plan(more, n, 8).configuration().splits >= s,
-                        "GGUF split count falls with more cores");
-                require(plan(linear, 2 * n, 8).configuration().splits <= s,
-                        "GGUF split count rises with the width");
+                for (const uint32_t rows : {8U, 32U}) {
+                  const LinearConfig at = plan(linear, n, rows).configuration();
+                  // The tile and its split; the staged walk follows the core count (spreadsStagedDecode).
+                  const LinearConfig doubled = plan(twice, 2 * n, rows).configuration();
+                  require(doubled.tile == at.tile && doubled.splits == at.splits,
+                          "GGUF decode plan depends on more than the grid per core");
+                  const LinearConfig withMore = plan(more, n, rows).configuration(),
+                                     wider = plan(linear, 2 * n, rows).configuration();
+                  require(withMore.tile != at.tile || withMore.splits >= at.splits,
+                          "GGUF split count falls with more cores");
+                  require(wider.tile != at.tile || wider.splits <= at.splits, "GGUF split count rises with the width");
+                }
               }
-              const LinearScratchSize bound = linear.decodeScratchSize({n, k}),
-                                      need = linear.plan({{n, k}, 32, LinearPhase::Decode, epilogue}, p).scratchSize();
-              require(bound.input >= need.input && bound.sums >= need.sums && bound.partials >= need.partials &&
-                          bound.counters >= need.counters,
-                      "GGUF decode arena bound below a plan");
+              const LinearScratchSize bound = linear.decodeScratchSize({n, k});
+              for (const uint32_t rows : {8U, 16U, 24U, 32U}) {
+                const LinearScratchSize need =
+                    linear.plan({{n, k}, rows, LinearPhase::Decode, epilogue}, p).scratchSize();
+                require(bound.input >= need.input && bound.sums >= need.sums && bound.partials >= need.partials &&
+                            bound.counters >= need.counters,
+                        "GGUF decode arena bound below a plan");
+              }
             }
     }
   // The float tile follows the grid per core: once a chunk takes the neural

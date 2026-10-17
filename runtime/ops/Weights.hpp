@@ -21,6 +21,10 @@ struct ProjectionShape final {
   // (quant_register_tensor); a projection with one it does not take stages
   // whatever its rows (Linear::decodeStorageRows).
   bool registerFormats = true;
+  // Its quantized segments store at least four bits per weight
+  // (quant_four_bits); Apple10 runs the register tile on narrower grids of
+  // fewer (Linear::decodeStorageRows).
+  bool fourBits = true;
   auto operator<=>(const ProjectionShape &) const = default;
 };
 
@@ -106,10 +110,12 @@ public:
 
   [[nodiscard]] const BlockWeights &blocks() const noexcept { return weights_; }
   [[nodiscard]] ProjectionShape shape() const noexcept {
-    bool registerFormats = true;
-    for (const QuantizedSegment &s : weights_.segments)
+    bool registerFormats = true, fourBits = true;
+    for (const QuantizedSegment &s : weights_.segments) {
       registerFormats &= s.isFloat() || quant_register_tensor(s.formatId, s.inputSize);
-    return {outputSize, inputSize, static_cast<bool>(rotation), registerFormats};
+      fourBits &= s.isFloat() || quant_four_bits(s.formatId);
+    }
+    return {outputSize, inputSize, static_cast<bool>(rotation), registerFormats, fourBits};
   }
 
   // Views of a projection of one unrotated quantized tensor (Linear.cpp):

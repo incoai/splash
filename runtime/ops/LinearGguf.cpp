@@ -89,6 +89,49 @@ LinearConfig stagedDecode(uint32_t n, uint32_t k, uint32_t cores, GpuFamilyClass
   return {.tile = LinearTile::GgufStaged, .splits = decodeSplits(n, k, cores, stagedTiers(family))};
 }
 
+// Whether every quantized segment of the projections satisfies `holds`.
+template <class Predicate>
+bool everyQuantizedSegment(std::span<const Projection *const> projections, Predicate holds) {
+  for (const Projection *p : projections)
+    if (p)
+      for (const QuantizedSegment &s : p->blocks().segments)
+        if (!s.isFloat() && !holds(s)) return false;
+  return true;
+}
+// Whether the register tile takes a segment (quant_register_tensor).
+bool registerTileTakes(const QuantizedSegment &s) { return quant_register_tensor(s.formatId, s.inputSize); }
+// Whether a segment stores at least four bits per weight (quant_four_bits).
+bool fourBitsPerWeight(const QuantizedSegment &s) { return quant_four_bits(s.formatId); }
+
+// Apple10 runs decode steps on the register tile on narrow grids: where the
+// grid, a threadgroup per 64 columns (a gate/up pair's that runs in one pass
+// staged) and lane, holds fewer than one and a half threadgroups per core,
+// half that in formats of fewer than four bits per weight. There the staged
+// tile's 64 threads per column tile leave its cores' loads too few and the
+// register tile's 128 run more of them; its time grows with each lane, where
+// the staged tile's matmuls take up to 16 rows at the cost of 8, and with its
+// decode, where fewer bits leave the staged tile less to stream. Register
+// against staged time on one lane's 8-row tile, best split of each tile:
+// - 32-core M5 Max: 13-43% less below the bound (BF16 and Q8_0 320 x 10240,
+//   Q4_K and Q5_K 512 x 2560, Q8_0 512 x 2048, Q6_K 1024 x 5120, Q4_K and
+//   Q6_K 2048 x 4096); at 2560 x 6144 (1.25 per core) 6-9% less in Q4_K, Q5_K,
+//   Q6_K, IQ4_XS, IQ4_NL and MXFP4, BF16 2%, Q8_0 the same, and 2-20% more in
+//   Q3_K, IQ3_S, IQ3_XXS, Q2_K, Q2_0, IQ2_XS, IQ2_XXS and IQ1_M, which take
+//   7-41% less below theirs (IQ2_XXS and Q3_K 1024 x 5120, IQ3_XXS, Q3_K and
+//   Q2_K 512 x 2560, Q3_K 320 x 10240) and as much at 1.0 (Q3_K 2048 x 4096);
+// - 20-core M5 Pro: 18-33% less at 320 and 512 columns, 4-9% more past the
+//   bound (Q4_K and Q6_K 2560 x 6144, Q4_K 2048 x 4096); in fewer bits 23-33%
+//   less below theirs (Q3_K, Q2_K, Q2_0 512 x 2560, Q3_K 320 x 10240), 3% and
+//   14% more past (Q3_K and IQ2_XXS 1024 x 5120).
+// A one-pass gate/up pair of 1024 x 5120 takes 3% (Q4_K) and 23% (IQ2_XXS)
+// less time staged than in the register tile's two passes on the M5 Pro, 11%
+// more (Q4_K, 1.0 per core) and 10% less (IQ2_XXS) on the M5 Max; one of
+// 512 x 2560 (Q4_K) takes 17% and 25% less in the two.
+constexpr bool apple10Registers(uint32_t rows, uint32_t columns, uint32_t cores, bool fourBits) noexcept {
+  const uint32_t lanes = rows / SPLASH_TARGET_VERIFY_ROWS;
+  return uint64_t{fourBits ? 2u : 4u} * (columns / GGUF_TILE_COLUMNS) * lanes < uint64_t{3} * cores;
+}
+
 // Whether the staged decode tiles on `cores` cores of `family` spread their
 // walks and run a gate/up pair of one format in one pass (Linear::ggufBaseline):
 // Apple10 and later from 16 cores.
@@ -271,7 +314,7 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
 }
 
 LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *const> projections,
-                                  bool registerFormats) const {
+                                  bool registerFormats, bool fourBits) const {
   const auto [n, k] = w.matrix;
   // Prefill: 128-row tiles. A chunk of up to 32 rows runs the staged tile
   // of its rows (8, 16 or 32, two simdgroups) with the decode split rule:
@@ -288,8 +331,15 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
                        .splits = decodeSplits(n, k, gpuCores_, stagedTiers(family_))}
         : LinearConfig{.tile = LinearTile::GgufPrefill};
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
-  // kernel beats staging but for the projections apple9Stages names.
-  if (family_ == GpuFamilyClass::Apple9 && registerFormats && !apple9Stages(w, projections))
+  // kernel beats staging but for the projections apple9Stages names; Apple10
+  // runs it on narrow grids (apple10Registers).
+  const bool spreads = spreadsStagedDecode(family_, gpuCores_),
+             onePass = spreads && w.epilogue == LinearEpilogue::GateUp && oneFormat(projections);
+  if (registerFormats && everyQuantizedSegment(projections, registerTileTakes) &&
+      (family_ == GpuFamilyClass::Apple9
+           ? !apple9Stages(w, projections)
+           : apple10Registers(w.rows, onePass ? 2 * n : n, gpuCores_,
+                              fourBits && everyQuantizedSegment(projections, fourBitsPerWeight))))
     return registerDecode(n, k, gpuCores_);
   // Decode tiles walking K in lockstep all fetch the same slice of the input
   // at each step, just written by the operator before and in no cache yet,
@@ -311,17 +361,19 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // Pro); 8-bit, whose pair streams near DRAM's rate either way, takes 0.1-0.6%
   // more. A 12-core M6 holds 45 chains of the pair per core, saturated, where
   // one pass took 2-11% more.
+  if (onePass) return oneGateUpPassDecode(n, k, gpuCores_, family_);
   LinearConfig config = stagedDecode(n, k, gpuCores_, family_);
-  config.spread = spreadsStagedDecode(family_, gpuCores_);
-  if (config.spread && w.epilogue == LinearEpilogue::GateUp && oneFormat(projections))
-    return oneGateUpPassDecode(n, k, gpuCores_, family_);
+  config.spread = spreads;
   return config;
 }
 
 LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
   const auto [n, k] = w.matrix;
   LinearScratchSize size = LinearPlan(w, ggufBaseline(w)).scratchSize();
-  if (family_ == GpuFamilyClass::Apple9) size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, family_)).scratchSize());
+  // A projection of segments the register tile does not take, or of fewer
+  // bits, stages where the device registers.
+  if (family_ == GpuFamilyClass::Apple9 || apple10Registers(w.rows, n, gpuCores_, true))
+    size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, family_)).scratchSize());
   if (w.epilogue == LinearEpilogue::GateUp && spreadsStagedDecode(family_, gpuCores_))
     size.include(LinearPlan(w, oneGateUpPassDecode(n, k, gpuCores_, family_)).scratchSize());
   return size;
