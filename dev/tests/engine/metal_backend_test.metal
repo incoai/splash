@@ -43,3 +43,8 @@ kernel void addressed_check_u32(device const ulong *table [[buffer(0)]],
         atomic_fetch_add_explicit(mismatches, 1u, memory_order_relaxed);
     }
 }
+
+// A host_step_wait that ends without seeing its release, as a spin would on a
+// Metal that stopped honoring its memory scope: the test of the backend's
+// spin check names this library host-step.metallib.
+kernel void host_step_wait() {}

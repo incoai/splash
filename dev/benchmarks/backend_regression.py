@@ -35,7 +35,9 @@ otherwise idle:
 - weight bytes: after the rounds both builds load the model's weight images
   once more and must hold the same images with the same bytes
   (weights.compare_builds). A baseline of an earlier release prepares into a
-  cache of its own, <output dir>/baseline-weights.
+  cache of its own, <output dir>/baseline-weights. With
+  --expect-image-change (or EXPECT_IMAGE_CHANGE=1), for a change of the image
+  layout, the images that differ are reported and fail nothing.
 
 The candidate's own benchmark invariants must hold too, and the baseline must
 be another build: one with the candidate's build_id compares nothing. The
@@ -472,6 +474,12 @@ def parse_args(argv=None):
         help="allow changed outputs with acceptance within 0.02 (EXPECT_OUTPUT_CHANGE=1)",
     )
     parser.add_argument(
+        "--expect-image-change",
+        action="store_true",
+        default=os.environ.get("EXPECT_IMAGE_CHANGE", "") not in ("", "0"),
+        help="report changed weight images without failing (EXPECT_IMAGE_CHANGE=1)",
+    )
+    parser.add_argument(
         "--ane-ffn-share",
         type=ane_ffn_share,
         metavar="SHARE",
@@ -526,6 +534,7 @@ def main(argv=None) -> int:
         "trees": {name: str(tree) for name, tree in trees.items()},
         "samples": args.samples,
         "scenario_invocations": invocations(args.combined, args.scenarios),
+        "expect_image_change": args.expect_image_change,
         "pass": False,
     }
     try:
@@ -554,8 +563,8 @@ def main(argv=None) -> int:
             args.model_root,
             environments["baseline"],
         )
-        document["pass"] = (
-            document["comparison"]["pass"] and document["weights"]["pass"]
+        document["pass"] = document["comparison"]["pass"] and (
+            document["weights"]["pass"] or args.expect_image_change
         )
     except Exception as error:
         document["error"] = str(error)
@@ -593,7 +602,13 @@ def report(document: dict) -> None:
     images = document["weights"]
     print(
         f"weight bytes: {len(images['images'])} images "
-        + ("PASS" if images["pass"] else f"FAIL {images['failures']}")
+        + (
+            "PASS"
+            if images["pass"]
+            else f"CHANGED, as expected {images['failures']}"
+            if document["expect_image_change"]
+            else f"FAIL {images['failures']}"
+        )
     )
     for failure in comparison["failures"]:
         print(f"FAIL: {failure}")

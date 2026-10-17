@@ -136,7 +136,8 @@ std::string RuntimeBootstrap::statusJson(const RuntimeMetricsSnapshot &metrics,
       resources_->cacheIdentity(), resources_->memoryGovernor().snapshot(),
       healthy, healthy ? std::string{} : backend.unhealthyReason(),
       nativeLoop_->resourceWaitSnapshot(), loop, nativeLoop_->weightsSnapshot(),
-      resources_->aneFfnSnapshot(), thermalState_.state());
+      resources_->aneFfnSnapshot(), thermalState_.state(), resources_->streamedTableStats(),
+      resources_->streamedExpertStats());
 }
 
 void RuntimeBootstrap::sampleThermalState() {
@@ -189,7 +190,7 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
             return modelRuntime.warmupPrefill(model::ExecutionLimits::prefillTokenBudget);
           });
   nativeLoop.observePrefill(model::ExecutionLimits::prefillTokenBudget,
-                           maximumPrefill.wallSeconds * 1000.0);
+                           maximumPrefill.wallSeconds * 1000.0, maximumPrefill.hostSeconds * 1000.0);
   report.warmup.maximumPrefillDetail = maximumPrefill.detail;
   const auto &budget = memoryPlan.breakdown();
   // Startup exercises only widths that fit this budget. This is not a
@@ -293,6 +294,12 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
              (memoryCapped ? "--max-memory" : "this Mac's memory") +
              " allow; omit it or pass at most " + std::to_string(planContext));
   }
+  // YaRN changes every answer, which only a context past the native window
+  // pays for.
+  if (const model::RopeScaling &rope = config.resources.model.ropeScaling;
+      rope.yarn() && config.nativeLoop.engine.maxContext <= rope.originalContextTokens)
+    logLine("YaRN serves ", config.nativeLoop.engine.maxContext, " tokens of context, which the native window of ",
+            rope.originalContextTokens, " holds: it changes every answer for no more context; omit --yarn-factor.");
   config.nativeLoop.engine.vocabularySize =
       config.resources.model.capabilities.vocabularySize;
   // Images are admitted up to the server's pixel cap; a model without vision

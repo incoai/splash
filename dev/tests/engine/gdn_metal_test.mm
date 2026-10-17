@@ -85,6 +85,11 @@ double bf16Ulp(double value) {
   return std::max(std::fabs(value), 1e-30) * 0.0078125;
 }
 double silu(double value) { return value / (1.0 + std::exp(-value)); }
+// The output gate of a GDN of `shape`: sigmoid(z) (Qwen3.8-Flash-Next) or
+// silu(z).
+double outputGate(const GdnShape &shape, double z) {
+  return shape.sigmoidGate ? 1.0 / (1.0 + std::exp(-z)) : silu(z);
+}
 
 MetalBuffer shared(MetalBackend &backend, uint64_t bytes, const char *label) {
   MetalBuffer buffer = backend.allocateBuffer(bytes, BufferStorage::Shared, label);
@@ -159,8 +164,15 @@ GdnPrefillBuffers randomPrefill(MetalBackend &backend, const GdnShape &shape,
 
   Random random(0x9E3779B97F4A7C15ULL ^ (uint64_t{valueHeads} << 32) ^ tokens);
   auto *packed = data<uint16_t>(buffers.packed);
-  for (uint64_t i = 0; i < uint64_t{tokens} * packedWidth; ++i)
-    packed[i] = toBf16(random.gauss());
+  // Qwen3.8-Flash-Next's 16512-column rows hold the first 16512 values of the
+  // 16640-column rows, so its _p16512 kernels see the same values, and the
+  // same bounds hold for them.
+  const uint32_t drawn = packedWidth == 16512 ? 16640 : packedWidth;
+  for (uint64_t token = 0; token < tokens; ++token)
+    for (uint32_t column = 0; column < drawn; ++column) {
+      const uint16_t value = toBf16(random.gauss());
+      if (column < packedWidth) packed[token * packedWidth + column] = value;
+    }
   auto *convWeights = data<uint16_t>(buffers.convolutionWeights);
   for (uint64_t i = 0; i < uint64_t{convDim} * kTaps; ++i)
     convWeights[i] = toBf16(0.3 * random.gauss());
@@ -379,7 +391,7 @@ void runCase(MetalBackend &backend, const GdnShape &shape, uint32_t tokens,
       for (uint32_t dim = 0; dim < kHeadDim; ++dim) {
         const double z = fromBf16(packed[uint64_t{token} * packedWidth + convDim +
                                          head * kHeadDim + dim]);
-        const double ref = roundBf16(roundBf16(normalized[dim]) * silu(z));
+        const double ref = roundBf16(roundBf16(normalized[dim]) * outputGate(shape, z));
         const double got = fromBf16(hidden[base + dim]);
         require(std::isfinite(got), label + "gated output is not finite");
         hiddenUlps = std::max(hiddenUlps, std::fabs(got - ref) / bf16Ulp(ref));
@@ -760,7 +772,8 @@ void bufferExtents(MetalBackend &backend, const GdnShape &shape, bool float32,
 void run(const std::string &metallib) {
   MetalBackend backend(metallib);
   for (const GdnShape &shape :
-       {GdnShape{16, 48, 128, 10240, 16640}, GdnShape{16, 32, 128, 8192, 12544}}) {
+       {GdnShape{16, 48, 128, 10240, 16640}, GdnShape{16, 32, 128, 8192, 12544},
+        GdnShape{16, 48, 128, 10240, 16512, true}}) {
     for (bool float32 : {false, true})
       bufferExtents(backend, shape, float32, GdnStateFormat::Float32);
     bufferExtents(backend, shape, false, GdnStateFormat::BFloat16);

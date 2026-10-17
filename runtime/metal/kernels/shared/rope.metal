@@ -1,4 +1,5 @@
 #include "metal/abi/KernelABI.h"
+#include "metal/kernels/common/target_rope.h"
 
 kernel void rope_build_tables(
     device const uint *target_positions [[buffer(0)]],
@@ -12,16 +13,17 @@ kernel void rope_build_tables(
     constant RopeTableParams &params [[buffer(8)]],
     uint index [[thread_position_in_grid]],
     uint grid_size [[threads_per_grid]]) {
-  // Target rows carry (t, h, w) positions; Qwen3.5's interleaved M-RoPE
-  // assigns frequency i to axis i % 3. Text rows repeat one position.
+  // Target rows carry (t, h, w) positions; text rows repeat one position.
+  // YaRN scales the rotated dimensions of the target's queries and keys by
+  // its attention factor, so their cosines and sines (target_scale).
   const uint target_elements = params.target_rows * SPLASH_TARGET_ROPE_PAIRS;
   for (uint element = index; element < target_elements; element += grid_size) {
     const uint row = element / SPLASH_TARGET_ROPE_PAIRS;
-    const uint dim = element % SPLASH_TARGET_ROPE_PAIRS;
-    const float angle = float(target_positions[row * 3 + dim % 3]) *
-                        target_inverse_frequencies[dim];
-    target_cosine[element] = cos(angle);
-    target_sine[element] = sin(angle);
+    device const uint *position = target_positions + row * 3;
+    const float2 rope = target_rope_pair(uint3(position[0], position[1], position[2]), target_inverse_frequencies,
+                                         element % SPLASH_TARGET_ROPE_PAIRS, params.target_scale);
+    target_cosine[element] = rope.x;
+    target_sine[element] = rope.y;
   }
   const uint draft_elements = params.draft_rows * SPLASH_DRAFT_ROPE_PAIRS;
   for (uint element = index; element < draft_elements; element += grid_size) {

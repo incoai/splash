@@ -1,5 +1,6 @@
 #pragma once
 
+#include "model/ExpertStore.hpp"
 #include "model/GgufTarget.hpp"
 #include "model/QwenHybridLayout.hpp"
 #include "model/QwenTarget.hpp"
@@ -10,14 +11,17 @@
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 
-#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <string>
 #include <string_view>
 #include <variant>
 
 namespace splash::model {
+
+// The bytes of an F32 value in a target's images.
+inline constexpr uint64_t kFloat32Bytes = 4;
 
 // How a target's block images store its tensors; loadQwenTarget pairs each
 // source's images with their format. Block images hold each tensor as one
@@ -54,15 +58,33 @@ struct BlockTargetFormat final {
                                              const QwenTargetDimensions &target,
                                              bool fullAttention);
 
+// How a MoE target's blocks reach their routed experts: through a store when
+// they stream (its files' loader streamsExperts()), the target's layers its
+// blocks; else from their images through `resident`, the identity table of
+// `experts` slots.
+struct MoeExperts final {
+  std::shared_ptr<ExpertStore> store;
+  metal::MetalBuffer resident;
+  uint32_t experts = 0;
+};
+[[nodiscard]] MoeExperts openMoeExperts(metal::MetalBackend &backend, const QwenTargetFiles &files,
+                                        const QwenTargetDimensions &target);
+
+// A MoE block's sections in image order: its router, its routed experts'
+// gate, up and down (none when they stream), its shared expert's gate, up
+// and down and its scalar gate. Block `block` of the store when its experts
+// stream.
+[[nodiscard]] ops::BlockMoeWeights readMoeBlock(WeightFile &file, const MoeExperts &experts, uint32_t block);
+
 // Reads a target through the files of its images, written from an upstream
 // source, in their format: per layer the input norm, mixer,
-// post-attention norm and the architecture's FFN through readFfn, then the
-// head and the token embedding. Weights is the architecture's weight struct.
+// post-attention norm and the architecture's FFN through readFfn (called
+// with the file, the layer's weights, the format and the layer's index),
+// then the head and the token embedding. Weights is the architecture's
+// weight struct.
 template <class Weights, class Layout, class Files, class ReadFfn>
 [[nodiscard]] Weights
-readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files &&files,
-                      const BlockTargetFormat &format, ReadFfn readFfn) {
-  const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
+readQwenTargetWeights(const Layout &layout, Files &&files, const BlockTargetFormat &format, ReadFfn readFfn) {
   Weights result;
   result.layout = layout;
   result.layers.reserve(layout.layers);
@@ -74,7 +96,7 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
     layer.inputNorm = format.norm(file, layout.hiddenSize, "input-norm");
     layer.mixer = readQwenMixer(file, format, layout, fullAttention);
     layer.postAttentionNorm = format.norm(file, layout.hiddenSize, "post-attention-norm");
-    readFfn(file, layer, format);
+    readFfn(file, layer, format, layerIndex);
     file.finish();
     result.files.push_back(file.record());
   }
@@ -96,10 +118,6 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
     file.finish();
     result.files.push_back(file.record());
   }
-
-  result.manifestFingerprintSha256 = weightManifestFingerprint(result.files);
-  result.actualAllocatedBytes = metal::allocationDelta(
-      allocationBaseline, backend.memoryStats().allocatedBytes);
   return result;
 }
 
@@ -113,7 +131,7 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
   const bool ffnZero = dense ? zero(ffnWidth) : zero(layout.experts, layout.expertsPerToken, ffnWidth);
   const bool routingInconsistent = !dense && layout.expertsPerToken > layout.experts;
   if (ffnZero || !(layout.rotaryTheta > 0.0F) ||
-      zero(layout.maximumContextTokens, layout.layers, layout.hiddenSize, layout.vocabularySize,
+      zero(layout.nativeContextTokens, layout.layers, layout.hiddenSize, layout.vocabularySize,
            layout.packedGdnWidth, layout.packedFullWidth, layout.convolutionDimension, layout.gdnKeyHeads,
            layout.gdnValueHeads, layout.gdnHeadDimension, layout.attentionWidth, layout.attentionQueryHeads,
            layout.attentionKvHeads, layout.attentionHeadDimension, layout.rotaryPairs,
@@ -126,25 +144,38 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
       layout.gdnValueHeads * layout.gdnHeadDimension != layout.attentionWidth ||
       layout.packedFullWidth !=
           2 * layout.attentionWidth + 2 * layout.attentionKvHeads * layout.attentionHeadDimension ||
-      std::ranges::any_of(layout.hiddenCaptureLayers, [&](uint32_t layer) { return layer >= layout.layers; }) ||
       !layout.kvLayout().valid() || !layout.gdnStateLayout().valid())
     throw WeightStoreError("Qwen target layout is inconsistent");
 }
 
-// Checks the layout and loads a target from its files. The architecture
-// reads its FFN through readFfn, called with the file, the layer and the
-// format.
-template <class Weights, class Layout, class ReadFfn>
+// Checks the layout and loads a target from its files: a MoE target's routed
+// experts open first (openMoeExperts), then `read` reads the weights, called
+// with the files' loader, their format and the experts (readQwenTargetWeights,
+// or a family's own order). The target's allocations are all that loading it
+// allocates, its expert store's among them, and its fingerprint is its
+// files'. A family whose weights load from a GGUF only (loadsSafetensors
+// false) reads a GGUF's loader alone.
+template <class Weights, class Layout, class Read>
 [[nodiscard]] Weights
-loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTargetFiles &files,
-               ReadFfn readFfn) {
+loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTargetFiles &files, Read read) {
   requireQwenLayout(layout);
-  if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
-    return readQwenTargetWeights<Weights>(backend, layout, gguf->get(), BlockTargetFormat{}, readFfn);
-  SafetensorsTargetLoader &safetensors = std::get<std::reference_wrapper<SafetensorsTargetLoader>>(files).get();
-  return readQwenTargetWeights<Weights>(backend, layout, safetensors,
-                                        BlockTargetFormat{safetensors.float32Norms(), ops::GdnHeadOrder::Grouped},
-                                        readFfn);
+  const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
+  const MoeExperts experts =
+      layout.ffnKind == QwenFfnKind::SparseMoe ? openMoeExperts(backend, files, layout) : MoeExperts{};
+  Weights weights = [&] {
+    if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
+      return read(gguf->get(), BlockTargetFormat{}, experts);
+    if constexpr (Layout::loadsSafetensors) {
+      SafetensorsTargetLoader &safetensors = std::get<std::reference_wrapper<SafetensorsTargetLoader>>(files).get();
+      return read(safetensors, BlockTargetFormat{safetensors.float32Norms(), ops::GdnHeadOrder::Grouped}, experts);
+    } else {
+      throw WeightStoreError(std::string(Layout::family) + " loads from a GGUF only");
+    }
+  }();
+  weights.experts = experts.store;
+  weights.manifestFingerprintSha256 = weightManifestFingerprint(weights.files);
+  weights.actualAllocatedBytes = metal::allocationDelta(allocationBaseline, backend.memoryStats().allocatedBytes);
+  return weights;
 }
 
 } // namespace splash::model

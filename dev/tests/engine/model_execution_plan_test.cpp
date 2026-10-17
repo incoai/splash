@@ -1,4 +1,6 @@
 #include "TestChecks.hpp"
+#include "TestDrafts.hpp"
+#include "model/ModelDescriptor.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/QwenTargetLoader.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -9,6 +11,7 @@
 #include <array>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -23,9 +26,8 @@ template <class Weights>
 model::LoadedModel loadedModel() {
   model::LoadedModel result;
   Weights target;
-  const model::DFlashDraftLayout draft = std::is_same_v<Weights, model::Qwen3_6MoeWeights>
-                                             ? model::kQwen3_6MoeDraftLayout
-                                             : model::kQwen3_8DraftLayout;
+  const model::DFlashDraftLayout draft =
+      std::is_same_v<Weights, model::Qwen3_6MoeWeights> ? test::qwen3_6MoeDraft() : test::qwen3_8Draft();
   const auto projection = [](uint32_t n, uint32_t k) {
     return ops::Projection(n, k, ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_Q4K, n, k, {}, {}, {})}});
   };
@@ -73,7 +75,7 @@ void checkGateUpLayers() {
   target.layers.front().upProjection = ops::Projection(
       up.outputSize, up.inputSize + 256,
       ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_Q4K, up.outputSize, up.inputSize + 256, {}, {}, {})}});
-  rejects([&] { static_cast<void>(model::qwenTargetGeometry(target)); },
+  rejects([&] { static_cast<void>(model::qwenTargetGeometry(target, dense.draft.layout.targetLayerIds())); },
           "fused gate/up projections must have matching shapes", "mismatched fused gate/up shapes reached execution");
   target.layers.front().upProjection = up;
   // The last layer's gate in F16 and its up in Q8_0.
@@ -144,7 +146,7 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
       {d.dynamicSize, d.hiddenSize}, {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
       {d.hiddenSize, d.attentionSize},
       {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
-      {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize}};
+      {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize()}};
   for (const auto &p : geometry.target.decodeProjections) matrices.push_back({p.outputSize, p.inputSize});
   for (uint32_t family : {9U, 10U, 11U})
     for (uint32_t cores : {12U, 20U, 40U}) {
@@ -166,6 +168,22 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
     }
 }
 
+// A model served with YaRN reaches the runtime's geometry with its scaling
+// and the window it serves, which everything sized by the context follows; a
+// descriptor whose window is not the one its scaling serves is refused.
+void checkYarnGeometry() {
+  auto loaded = loadedModel<model::Qwen3_6MoeWeights>();
+  loaded.descriptor = model::withYarn(std::move(loaded.descriptor), 2.0);
+  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  require(geometry.target.ropeScaling == loaded.descriptor.ropeScaling &&
+              geometry.target.contextTokens() == 524'288 && geometry.target.nativeContextTokens == 262'144,
+          "the runtime's geometry does not serve YaRN's window");
+  loaded.descriptor.capabilities.maximumContextTokens = 262'144;
+  rejects([&] {
+    static_cast<void>(model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32));
+  }, "invalid model runtime geometry", "a geometry serving another window than the model's was accepted");
+}
+
 // Arenas are sized from the projections the weights hold, so each must have
 // sizes; an empty one would drop its workspace from the bound silently.
 void checkUnsizedProjection() {
@@ -174,6 +192,20 @@ void checkUnsizedProjection() {
   rejects([&] {
     static_cast<void>(model::RuntimeGeometry::from(broken, kv::Format::Int8, ops::GdnStateFormat::Float32));
   }, "invalid model runtime geometry", "a target projection without sizes reached arena sizing");
+}
+
+// The target layers the draft reads are the target's, ascending: arena
+// sizing refuses a draft reading past the last one or one twice.
+void checkCaptureLayers() {
+  const auto refuses = [](uint32_t index, uint32_t layer, const std::string &what) {
+    auto model = loadedModel<model::Qwen3_8Weights>();
+    model.draft.layout.targetLayers[index] = layer;
+    rejects([&] {
+      static_cast<void>(model::RuntimeGeometry::from(model, kv::Format::Int8, ops::GdnStateFormat::Float32));
+    }, "invalid model runtime geometry", what + " reached arena sizing");
+  };
+  refuses(4, 64, "a draft reading past the target's last layer");
+  refuses(1, 5, "a draft reading a layer twice");
 }
 
 // The GDN value rows are sized with attentionWidth, so a layout whose value
@@ -200,17 +232,14 @@ void checkGdnWidths() {
   withoutGates.packedGdnWidth = shipped.convolutionDimension + shipped.attentionWidth;
   rejects([&] { sizeArenas(withoutGates); }, "invalid model runtime geometry",
           "packed GDN rows without the gates reached arena sizing");
-  // The dense layout is checked like the sparse one: its capture layers and
-  // its convolution width against its GDN heads.
+  // The dense layout is checked like the sparse one: its convolution width
+  // against its GDN heads.
   const model::Qwen3_8Layout dense;
   model::requireQwenLayout(dense);
-  auto capturePastLastLayer = dense;
-  capturePastLastLayer.hiddenCaptureLayers.back() = dense.layers;
   auto convolutionMismatch = dense;
   convolutionMismatch.convolutionDimension += dense.gdnHeadDimension;
-  for (const model::Qwen3_8Layout &broken : {capturePastLastLayer, convolutionMismatch})
-    rejects([&] { model::requireQwenLayout(broken); }, "Qwen target layout is inconsistent",
-            "an inconsistent dense layout was accepted");
+  rejects([&] { model::requireQwenLayout(convolutionMismatch); }, "Qwen target layout is inconsistent",
+          "an inconsistent dense layout was accepted");
 }
 
 } // namespace
@@ -218,8 +247,10 @@ void checkGdnWidths() {
 int main() {
   try {
     checkUnsizedProjection();
+    checkCaptureLayers();
     checkGdnWidths();
     checkGateUpLayers();
+    checkYarnGeometry();
     const auto dense = loadedModel<model::Qwen3_8Weights>();
     const auto sparse = loadedModel<model::Qwen3_6MoeWeights>();
     checkLaneScratch(dense);

@@ -278,16 +278,17 @@ public:
 private:
   // The device's configuration of the workload; the tile may follow the
   // formats of the projections it runs (LinearGguf.cpp), or without them
-  // whether those formats are all the register tile's.
+  // whether those formats are all the register tile's and of four bits.
   [[nodiscard]] LinearConfig ggufBaseline(LinearWorkload workload,
                                           std::span<const Projection *const> projections = {},
-                                          bool registerFormats = true) const;
+                                          bool registerFormats = true, bool fourBits = true) const;
   // The partials and counters a dispatch of `splits` K partitions binds: the
   // scratch's, or for one partition, which reads neither, the output.
   [[nodiscard]] static std::array<metal::MetalBuffer, 2> splitScratch(const LinearBuffers &buffers,
                                                                       uint32_t splits);
-  // The scratch of every tile a decode plan of the workload may take.
-  [[nodiscard]] LinearScratchSize ggufDecodeScratchSize(LinearWorkload workload) const;
+  // The scratch of every tile a decode plan of the workload may take, the
+  // register tile's where it takes the projection's formats.
+  [[nodiscard]] LinearScratchSize ggufDecodeScratchSize(LinearWorkload workload, bool registerFormats) const;
   void addGguf(metal::CommandGraph &graph, const LinearBuffers &buffers,
                const Projection &projection, const LinearPlan &plan,
                const Projection *gate) const;

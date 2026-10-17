@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <span>
 
 namespace splash::ops {
 
@@ -22,14 +23,21 @@ struct MoeShape final {
   // The format of most routed expert weights, which picks the expert tile on
   // Apple9 (moeGgufTile).
   uint32_t expertFormat = GGUF_FMT_COUNT;
-  // Whether every routed and shared expert weight is in a format the
-  // register tile takes (quant_register_format).
+  // Whether the register tile takes every routed and shared expert weight
+  // (quant_register_tensor).
   bool registerFormats = true;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return hiddenSize && hiddenSize % 256 == 0 && experts && experts <= SPLASH_MOE_EXPERT_SLOTS &&
+    // Experts the routing kernels' slots hold, of an intermediate width
+    // that fills 64-column tiles.
+    return hiddenSize && hiddenSize % 256 == 0 && experts && experts <= SPLASH_MOE_WIDE_EXPERT_SLOTS &&
            expertsPerToken && expertsPerToken <= experts &&
-           expertIntermediateSize && expertIntermediateSize % 256 == 0;
+           expertIntermediateSize && expertIntermediateSize % 64 == 0;
+  }
+  // The router's scores per row: the expert slots of the select and group
+  // kernels that route the block (metal/abi/MoE.h), one thread each.
+  [[nodiscard]] constexpr uint32_t routerWidth() const noexcept {
+    return experts > SPLASH_MOE_EXPERT_SLOTS ? SPLASH_MOE_WIDE_EXPERT_SLOTS : SPLASH_MOE_EXPERT_SLOTS;
   }
   // Routed experts followed by the shared expert.
   [[nodiscard]] constexpr uint32_t routesPerToken() const noexcept {
@@ -38,25 +46,59 @@ struct MoeShape final {
   bool operator==(const MoeShape &) const = default;
 };
 
-// A GGUF expert projection: every routed expert in one segment of experts *
-// N rows, expert e's planes from tile e * N / 256 on (moe_gguf_segment in
-// kernels/common/moe_expert_slab.h), and the shared expert's segment, whose
-// format may differ.
+// A GGUF expert projection: the routed experts in one segment of slots * N
+// rows, routed expert e's planes from tile slot(e) * N / QUANT_TILE_ROWS on
+// (moe_gguf_segment in kernels/common/moe_expert_slab.h, slot(e) from the
+// block's slot table), and the shared expert's segment, whose format may
+// differ.
 struct BlockExpertProjection final {
   QuantizedSegment routed;
   QuantizedSegment shared;
 };
 
+struct MoeScratch;
+struct MoeBuffers;
+class MoePlan;
+class MoeExpertStream;
+enum class MoePhase : uint8_t { Prefill, Decode };
+
 // The weights of one sparse MoE block, which the loaded model owns. The
 // router and the shared expert's scalar gate are float tensors (llama.cpp
 // keeps a GGUF's unquantized; an MLX target's load as their F32 values), and
-// they run in fp32.
+// they run in fp32. The routed segments hold `slots` experts, routed expert e
+// in slot slotTable[e] (one uint32 per expert): every expert and the identity
+// table when they are all resident, or an expert store's slots and the
+// block's table there when they stream (`stream`, the block's index in it
+// `streamBlock`).
 struct BlockMoeWeights final {
   QuantizedSegment router;           // [experts][hidden]
   QuantizedSegment sharedScalarGate; // [1][hidden]
   BlockExpertProjection gate;
   BlockExpertProjection up;
   BlockExpertProjection down;
+  metal::MetalBuffer slotTable;
+  uint32_t slots = 0;
+  const MoeExpertStream *stream = nullptr;
+  uint32_t streamBlock = 0;
+};
+
+// One MoE step of a block a load serves: its plan, and its buffers once the
+// grouping wrote their tiles (MoeScratch::tileDescriptors and tileCount).
+struct MoeLoadPart final {
+  const MoeBuffers *buffers = nullptr;
+  const MoePlan *plan = nullptr;
+};
+
+// Routed experts that stream into the slots of a store (model::ExpertStore),
+// which owns the blocks' slot tables. addLoad adds, after the grouping of
+// block `block`'s steps `parts` (all of one phase) and before their expert
+// passes, what makes the experts their tiles name resident and the block's
+// table name their slots; it may read a step's input (MoeBuffers::input).
+// Several steps' parts load the union of their experts at once.
+class MoeExpertStream {
+public:
+  virtual ~MoeExpertStream() = default;
+  virtual void addLoad(metal::CommandGraph &graph, std::span<const MoeLoadPart> parts, uint32_t block) const = 0;
 };
 
 // Grouped-row scratch. Routes are sorted by expert into tiles of tileRows
@@ -141,8 +183,8 @@ inline constexpr auto kMoeWorkspaceFields = [] {
 enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 
 // The expert tile of GGUF plans, which run grouped passes (gate, up with
-// silu(gate), down; the staged tile runs gate and up in one pass where they
-// share their formats) over the GGUF image: the half-staged tiles of
+// silu(gate), down; the staged tile runs gate and up in one pass) over the
+// GGUF image: the half-staged tiles of
 // kernels/shared/moe_gguf.metal, or Register, the exact register tile of
 // kernels/decode/linear_gguf_sgmatrix.metal over Table16 tiles of the
 // grouped rows (8-row tiles only). Apple9 runs Register in both phases but
@@ -176,8 +218,6 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
              : MoeExpertTile::M32;
 }
 
-enum class MoePhase : uint8_t { Prefill, Decode };
-
 // The device's policy for a MoE plan, which the execution plans derive.
 struct MoeConfig final {
   // M8 for decode plans; a prefill plan takes moeGgufPrefillTile's.
@@ -195,6 +235,7 @@ class MoePlan final {
 public:
   [[nodiscard]] MoeShape shape() const noexcept { return shape_; }
   [[nodiscard]] uint32_t rows() const noexcept { return rows_; }
+  [[nodiscard]] MoePhase phase() const noexcept { return phase_; }
   [[nodiscard]] MoeConfig configuration() const noexcept { return config_; }
   [[nodiscard]] uint32_t tileRows() const noexcept {
     return static_cast<uint32_t>(config_.expertTile);
@@ -203,16 +244,6 @@ public:
   [[nodiscard]] const MoeWorkspace &workspace() const noexcept {
     return workspace_;
   }
-  // Whether every expert's tile reads the plan's rows in place, so no gather
-  // runs (MoeGroupParams::in_place): rows that fill one 8-row tile on the
-  // staged tile, a one-lane decode step or an 8-row prefill chunk. An 8-row
-  // tile runs the 8-row matmul whatever rows it holds, so only the gather's
-  // copy and dispatch go. Plans of more rows keep grouped tiles, which run
-  // each expert on its routed rows alone.
-  [[nodiscard]] bool rowsInPlace() const noexcept {
-    return config_.expertTile == MoeExpertTile::M8 && rows_ == tileRows() &&
-           config_.ggufTile == MoeGgufTile::Staged;
-  }
 
 private:
   friend struct MoE;
@@ -220,6 +251,7 @@ private:
 
   MoeShape shape_;
   uint32_t rows_;
+  MoePhase phase_;
   MoeConfig config_;
   uint32_t maximumTiles_;
   MoeWorkspace workspace_;
@@ -236,8 +268,38 @@ struct MoeBuffers final {
 struct MoE final {
   [[nodiscard]] static MoePlan prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config);
   [[nodiscard]] static MoePlan decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config);
+  // A step's routing (addRouting: the router, the selection and the
+  // grouping into tiles), the load of its streamed experts, and its routed
+  // work (addRouted: the gather, the expert passes and the combine). Steps
+  // that share a load run their routings, one load of the union, then their
+  // routed work, each in its own scratch.
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                   const BlockMoeWeights &weights, const MoePlan &plan);
+  static void addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                         const BlockMoeWeights &weights, const MoePlan &plan);
+  static void addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                        const BlockMoeWeights &weights, const MoePlan &plan);
+  // The routing of `rows` rows of `input` by a block's `router` and
+  // `sharedScalarGate`: the router's fp32 scores in `scores` (rows of
+  // shape.routerWidth()), then each row's top-k experts and the shared
+  // expert with their routing weights in `selected` and `routingWeights`
+  // (shape.routesPerToken() per row).
+  static void addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input, const QuantizedSegment &router,
+                        const QuantizedSegment &sharedScalarGate, const metal::MetalBuffer &scores,
+                        const metal::MetalBuffer &selected, const metal::MetalBuffer &routingWeights, uint32_t rows,
+                        MoeShape shape, FloatTile routerTile);
+  // A streamed experts' load (MoeExpertStream::addLoad): the gate, up and
+  // down projections of up to `jobs` experts, job j's projection z's native
+  // rows in `staging` from sources[3j + z] (bytes) on, repacked into the
+  // planes of slot slots[j] of `arena` as `params` lays them out. The host
+  // step before it writes the sources, the slots and the grid
+  // (expertLoadGroups threadgroups, the jobs it staged, 3) into `grid`.
+  static void addExpertLoad(metal::CommandGraph &graph, const metal::MetalBuffer &staging,
+                            const metal::MetalBuffer &arena, const metal::MetalBuffer &slots,
+                            const metal::MetalBuffer &sources, const MoeExpertLoadParams &params, uint32_t jobs,
+                            const metal::IndirectGrid &grid);
+  // The threadgroups that repack one job's largest projection.
+  [[nodiscard]] static uint32_t expertLoadGroups(const MoeExpertLoadParams &params) noexcept;
 };
 
 } // namespace splash::ops
