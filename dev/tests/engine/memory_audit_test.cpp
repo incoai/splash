@@ -15,7 +15,8 @@ namespace {
 using splash::test::require;
 
 EngineMemoryPlan plan(uint64_t visionBytes = kGiB,
-                      uint64_t stateStagingBytes = 0, uint64_t aneFfnBytes = 0) {
+                      uint64_t stateStagingBytes = 0, uint64_t aneFfnBytes = 0,
+                      uint64_t streamedTableBytes = 0) {
   DeviceCapabilities device;
   device.deviceName = "test";
   device.appleGpuFamily = 9;
@@ -31,6 +32,7 @@ EngineMemoryPlan plan(uint64_t visionBytes = kGiB,
       test::modelMemoryProfile(2 * kGiB, 1 * kGiB, visionBytes);
   model.footprint.stateStagingBytes = stateStagingBytes;
   model.footprint.aneFfnBytes = aneFfnBytes;
+  model.footprint.streamedTableBytes = streamedTableBytes;
   return test::requireMemoryPlan(device, model);
 }
 
@@ -162,6 +164,35 @@ void testNeuralEngineSplitHasItsOwnBound() {
   require(audit(0, 0).valid, "a start without the split failed its audit");
 }
 
+// The streamed table's row cache is host memory the plan sets aside: the
+// audit bounds it by that plan and counts it toward the hard budget beside
+// Metal's footprint, not toward Metal's categories.
+void testStreamedTableHasItsOwnBound() {
+  // Flash-Next's PLE table cached in 2 GiB (DEVELOPMENT.md, PLE table streaming).
+  const uint64_t table = 2 * kGiB;
+  const auto memoryPlan = plan(kGiB, 0, 0, table);
+  const auto &budget = memoryPlan.breakdown();
+  ActualMemoryReport actual = report(memoryPlan);
+  actual.streamedTableBytes = table;
+  const auto held = auditActualMemory(memoryPlan, actual);
+  require(held.valid && held.backendUnclassifiedBytes == 0 &&
+              held.actualHeadroomBytes ==
+                  budget.hardBudgetBytes - table - actual.devicePeakAllocatedBytes,
+          "the streamed table was counted in Metal's categories or left out "
+          "of the hard budget");
+  actual.streamedTableBytes = table + 1;
+  require(auditActualMemory(memoryPlan, actual).error ==
+              MemoryAuditError::CategoryExceedsPlan,
+          "a streamed table beyond its plan was accepted");
+  actual = report(memoryPlan);
+  actual.streamedTableBytes = table;
+  actual.devicePeakAllocatedBytes = budget.hardBudgetBytes - table + 1;
+  actual.backendPeakAllocatedBytes = actual.devicePeakAllocatedBytes;
+  require(auditActualMemory(memoryPlan, actual).error ==
+              MemoryAuditError::HardBudgetExceeded,
+          "a Metal peak that leaves the streamed table no room was accepted");
+}
+
 void testFixedCategoryAndPeakFailures() {
   EngineMemoryPlan memoryPlan = plan();
   ActualMemoryReport actual = report(memoryPlan);
@@ -243,6 +274,7 @@ int main() {
     testUnreportedAllocationsCountAgainstReserves();
     testStateStagingHasItsOwnBound();
     testNeuralEngineSplitHasItsOwnBound();
+    testStreamedTableHasItsOwnBound();
     testFixedCategoryAndPeakFailures();
     testDevicePeakDeviationExcludesReserves();
     std::cout << "elastic memory audit tests passed\n";

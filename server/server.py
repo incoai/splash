@@ -1689,6 +1689,8 @@ def _native_command(args, relaunch_context=None):
         command.extend(("--idle-sleep", "allow"))
     if relaunch_context is not None and args.max_context is None:
         command.extend(("--relaunch-context", str(relaunch_context)))
+    if args.expert_memory is not None:
+        command.extend(("--expert-memory", str(args.expert_memory)))
     return command
 
 

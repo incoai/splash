@@ -8,12 +8,15 @@
 
 namespace splash::model {
 
+class RuntimeInstrumentation;
+
 class Runtime final : public RuntimeModel {
 public:
   explicit Runtime(RuntimeContext context);
   ~Runtime() override;
   void checkHealth() override;
   [[nodiscard]] uint32_t statesToActivate() const noexcept override;
+  [[nodiscard]] uint32_t prefillGroupRows() const noexcept override;
 
   Runtime(const Runtime &) = delete;
   Runtime &operator=(const Runtime &) = delete;
@@ -83,6 +86,7 @@ private:
   decodeAsync(const BatchPlan &plan, std::span<const ModelBatchItem> items,
               std::function<void()> completion);
 
+  friend class RuntimeInstrumentation;
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

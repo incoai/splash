@@ -32,8 +32,9 @@ std::string headName(ModuleNames names) {
 class Builder {
 public:
   Builder(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry, ModuleNames names,
-          std::string name, uint32_t layer, uint32_t type)
-      : checkpoint_(checkpoint), geometry_(geometry), names_(names), image_(std::move(name), layer, type) {}
+          std::string name, uint32_t layer, uint32_t type, gguf::PlanOptions options = {})
+      : checkpoint_(checkpoint), geometry_(geometry), names_(names),
+        image_(std::move(name), layer, type, options.streamExperts) {}
 
   // An RMSNorm's weight, which the norm kernels read (ops::NormWeights): as
   // stored (bf16) from MLX names, or the F32 1 + w of the w transformers
@@ -77,18 +78,19 @@ public:
   }
 
   // The routed experts' [rows, columns] tensors of one projection (gate_proj,
-  // up_proj or down_proj) under the MLP prefix `mlp`, as the planes of one
-  // tensor of experts * rows rows: MLX's one stacked tensor, or the experts'
-  // modules of their own transformers names, which must share a format.
+  // up_proj or down_proj) under the MLP prefix `mlp`, as one tensor of
+  // experts * rows rows (gguf::ImageBuilder::expertPlanes): MLX's one stacked
+  // tensor, or the experts' modules of their own transformers names, which
+  // must share a format.
   void experts(const std::string &mlp, const std::string &projection, uint64_t rows, uint64_t columns) {
     const uint64_t count = geometry_.experts;
     if (names_ == ModuleNames::Mlx) {
       const std::string module = mlp + "switch_mlp." + projection;
       const std::optional<TensorRows> source = quantized(module, rows, columns, count);
       if (!source) throw WeightStoreError(module + " is unquantized; Splash loads quantized projections");
-      Repack repack = image_.planes(gguf_format_of(source->type), count * rows, columns, module);
+      Repack repack = image_.expertPlanes(gguf_format_of(source->type), count * rows, columns, module);
       repack.sources.push_back(*source);
-      image_.repack(std::move(repack));
+      image_.expertRepack(std::move(repack));
       return;
     }
     std::vector<TensorRows> sources;
@@ -97,19 +99,19 @@ public:
       if (sources.back().type != sources.front().type)
         throw WeightStoreError(sources.back().name + " is in another format than its layer's first expert");
     }
-    Repack repack = image_.planes(gguf_format_of(sources.front().type), count * rows, columns, mlp + "experts");
+    Repack repack = image_.expertPlanes(gguf_format_of(sources.front().type), count * rows, columns, mlp + "experts");
     repack.sources = std::move(sources);
-    image_.repack(std::move(repack));
+    image_.expertRepack(std::move(repack));
   }
 
-  // beta (value heads rows) | alpha (value heads rows): one 256-row tensor
-  // of their shared format padded with zero rows, or else one F32 tensor.
+  // beta (value heads rows) | alpha (value heads rows): one tensor of their
+  // shared format padded with zero rows to whole plane tiles, or else one F32
+  // tensor.
   void alphaBeta(const std::string &beta, const std::string &alpha) {
     const uint32_t heads = geometry_.gdnValueHeads, hidden = geometry_.hiddenSize;
     const std::optional<TensorRows> b = quantized(beta, heads, hidden), a = quantized(alpha, heads, hidden);
     if (b && a && b->type == a->type) {
-      if (2 * heads > QUANT_TILE_ROWS) throw WeightStoreError("alpha/beta rows exceed one 256-row tile");
-      Repack repack = image_.planes(gguf_format_of(b->type), QUANT_TILE_ROWS, hidden, alpha);
+      Repack repack = image_.planes(gguf_format_of(b->type), gguf::tiledRows(2ull * heads), hidden, alpha);
       repack.sources = {*b, *a};
       image_.repack(std::move(repack));
       return;
@@ -384,12 +386,13 @@ ModuleNames moduleNames(const SafetensorsCheckpoint &checkpoint) {
                                                                                          : ModuleNames::Mlx;
 }
 
-std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry) {
+std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry,
+                                   gguf::PlanOptions options) {
   const ModuleNames names = moduleNames(checkpoint);
   std::vector<gguf::Image> images;
   for (uint32_t layer = 0; layer < geometry.layers; ++layer) {
     Builder b(checkpoint, geometry, names, "layer-" + std::to_string(layer) + ".bin", layer,
-              geometry.isFullAttentionLayer(layer) ? 1u : 0u);
+              geometry.isFullAttentionLayer(layer) ? 1u : 0u, options);
     walkLayer(b, geometry, names, layer);
     images.push_back(b.finish());
   }

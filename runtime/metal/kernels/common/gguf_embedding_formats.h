@@ -116,10 +116,10 @@ using GgufEmbedQ41 = GgufEmbedQ4<true, false>;
 using GgufEmbedQ50 = GgufEmbedQ4<false, true>;
 using GgufEmbedQ51 = GgufEmbedQ4<true, true>;
 
-// block_pq2_0: half d | uchar qs[32], element l in bits 2 (l % 4) of qs[l / 4]; zero point 1. The rotated gather
-// (shared/gguf_rotation.metal) transforms its decode before it rounds.
-struct GgufEmbedPQ20 {
-  enum : uint { Weights = 128, Bytes = 34, D = 0, Codes = 2 };
+// block_pq2_0 and block_q2_0: half d | uchar qs[Weights / 4], element l in bits 2 (l % 4) of qs[l / 4]; zero point
+// 1. The rotated gather (shared/gguf_rotation.metal) transforms PQ2_0's decode before it rounds.
+template <uint W> struct GgufEmbedTwoBit {
+  enum : uint { Weights = W, Bytes = 2 + W / 4, D = 0, Codes = 2 };
   __attribute__((always_inline)) static float decode(device const uchar *block, uint dim) {
 #pragma clang fp reassociate(off)
     const uint l = dim % Weights;
@@ -127,6 +127,8 @@ struct GgufEmbedPQ20 {
     return float(int(q) - 1) * float(gguf_half(block, D));
   }
 };
+using GgufEmbedPQ20 = GgufEmbedTwoBit<128>;
+using GgufEmbedQ20 = GgufEmbedTwoBit<64>;
 // block_iq4_nl: block_q4_0's layout, whose codes index the IQ4_NL values.
 struct GgufEmbedIQ4NL {
   enum : uint { Weights = 32, Bytes = 18, D = 0, Codes = 2 };

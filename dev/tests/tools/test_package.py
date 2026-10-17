@@ -81,7 +81,7 @@ class PackageTests(unittest.TestCase):
                 ("install", package.INSTALL_FILES),
                 ("server", package.SERVER_FILES),
                 ("server/chat-assets", package.CHAT_ASSET_FILES),
-                ("build", ("splash", "splash.metallib")),
+                ("build", (*package.ENGINE_FILES, *package.OPTIONAL_ENGINE_FILES)),
             ):
                 (root / folder).mkdir(parents=True)
                 for name in names:
@@ -133,6 +133,10 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(
                 {p.name for p in (stage / "server").iterdir()},
                 {*package.SERVER_FILES, "chat-assets"},
+            )
+            self.assertEqual(
+                {p.name for p in (stage / "engine").iterdir()},
+                {*package.ENGINE_FILES, *package.OPTIONAL_ENGINE_FILES},
             )
             assets = stage / "server/chat-assets"
             self.assertEqual(

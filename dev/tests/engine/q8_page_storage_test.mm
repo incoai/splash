@@ -28,25 +28,31 @@ constexpr kv::Layout kvLayout{16, 4, 256};
 constexpr kv::Layout compactLayout{10, 2, 256};
 constexpr kv::Layout bf16Layout{16, 4, 256, kv::Format::BFloat16};
 constexpr kv::Layout compactBf16Layout{10, 2, 256, kv::Format::BFloat16};
+// Qwen3.8-Flash-Next's: token-major values and a QSA index of 128-wide pooled
+// keys.
+constexpr kv::Layout indexedLayout{12, 2, 256, kv::Format::Int8, 128, true};
+constexpr kv::Layout indexedBf16Layout{12, 2, 256, kv::Format::BFloat16, 128, true};
 
 // The host reaches a page through spans of its tensors, layer by layer as
-// keys, key scales, values and value scales, BF16 without scales. Kernels
-// find a page's keys at the page's slab in the layer's region, so that is
-// where each layer's spans start, and the spans of an extent's pages cover
-// the extent once, without gaps or overlaps.
+// keys, key scales, values and value scales, BF16 without scales, then each
+// layer's QSA pooled keys. Kernels find a page's keys at the page's slab in
+// the layer's region and its pooled keys at its slab of the layer's index
+// region, so that is where those spans start, and the spans of an extent's
+// pages cover the extent once, without gaps or overlaps.
 void requireSpansTileExtent(const kv::PageStorage &storage, uint32_t firstPage) {
     const kv::Layout layout = storage.layout();
     const bool scaled = layout.format == kv::Format::Int8;
-    const uint32_t tensors = scaled ? 4 : 2;
+    const uint32_t tensors = scaled ? 4 : 2, kvSpans = layout.attentionLayers * tensors;
     std::byte *const extent = storage.spans(firstPage).front().data();
     std::vector<std::span<std::byte>> all;
     for (uint32_t index = 0; index < storage.extentPages(); ++index) {
         const auto spans = storage.spans(firstPage + index);
-        require(spans.size() == layout.attentionLayers * tensors,
+        require(spans.size() == kvSpans + (layout.indexDimension ? layout.attentionLayers : 0),
                 "a page does not have one span per tensor of every layer");
         for (uint32_t span = 0; span < spans.size(); ++span) {
-            const uint64_t bytes = scaled && span % 2 ? layout.scaleBytesPerLayerPage()
-                                                      : layout.dataBytesPerLayerPage();
+            const uint64_t bytes = span >= kvSpans                ? layout.indexBytesPerLayerPage()
+                                   : scaled && span % 2 ? layout.scaleBytesPerLayerPage()
+                                                        : layout.dataBytesPerLayerPage();
             require(spans[span].size() == bytes, "a page's span holds another tensor's bytes");
         }
         for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer) {
@@ -54,6 +60,10 @@ void requireSpansTileExtent(const kv::PageStorage &storage, uint32_t firstPage) 
                         extent + storage.layers()[layer].offset +
                             uint64_t{index} * layout.dataBytesPerLayerPage(),
                     "a layer's spans do not start at the page's keys in its region");
+            if (layout.indexDimension)
+                require(spans[kvSpans + layer].data() == extent + storage.indexOffset(layer) +
+                                                             uint64_t{index} * layout.indexBytesPerLayerPage(),
+                        "a layer's index span is not the page's pooled keys in its index region");
         }
         all.insert(all.end(), spans.begin(), spans.end());
     }
@@ -311,6 +321,40 @@ void run(const std::string &metallib) {
         require(!bf16.isAllocated(extent) && bf16.allocateExtent(1),
                 "BF16 extent could not be allocated again after release");
     }
+    // A QSA index: 2 KiB of pooled keys per layer page after every layer's
+    // K/V, which a copy moves and a clear zeroes with the rest of the page.
+    for (const auto layout : {indexedLayout, indexedBf16Layout}) {
+        const uint32_t extent = layout.minimumExtentPages();
+        require(layout.indexBytesPerLayerPage() == 2048 &&
+                    layout.bytesPerModelPage() == 12 * (layout.bytesPerLayerPage() + 2048) &&
+                    extent % layout.extentAlignmentPages() == 0,
+                "a QSA index's page bytes or alignment changed");
+        kv::PageStorage indexed(backend, governor.allocationAdmission(), layout, 2 * extent, extent);
+        require(indexed.allocateExtent(0) && indexed.allocateExtent(1) &&
+                    indexed.indexOffset(0) == uint64_t{12} * extent * layout.bytesPerLayerPage() &&
+                    indexed.indexOffset(11) == indexed.indexOffset(0) + uint64_t{11} * extent * 2048 &&
+                    indexed.indexOffset(0) % kv::kExtentRegionAlignmentBytes == 0,
+                "a QSA index region is misplaced");
+        rejects([&] { (void)indexed.indexOffset(12); }, "KV layer has no index region",
+                "a layer past the layout had an index region");
+        requireSpansTileExtent(indexed, 0);
+        const auto fill = [&](uint32_t page, std::byte value) {
+            for (const auto span : indexed.spans(page)) std::fill(span.begin(), span.end(), value);
+        };
+        const auto holdsAll = [&](uint32_t page, std::byte value) {
+            return std::ranges::all_of(indexed.spans(page), [&](auto span) {
+                return std::ranges::all_of(span, [&](std::byte byte) { return byte == value; });
+            });
+        };
+        fill(3, std::byte{0x3c});
+        fill(extent + 1, std::byte{0});
+        indexed.copyPages(std::array{kv::PageCopy{3, extent + 1}});
+        require(holdsAll(extent + 1, std::byte{0x3c}), "a copied page left its pooled keys behind");
+        indexed.clearPages(std::array<uint32_t, 1>{3});
+        require(holdsAll(3, std::byte{0}), "a cleared page kept its pooled keys");
+    }
+    rejects([&] { (void)kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 256, 128).indexOffset(0); },
+            "KV layer has no index region", "a layout without an index had an index region");
     std::cout << "KV page storage tests passed\n";
 }
 
