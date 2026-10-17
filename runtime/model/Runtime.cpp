@@ -303,6 +303,10 @@ struct Runtime::Impl {
     // its lane's draft rings may hold such rows, so the lane returns them
     // cleared (QwenStateStorage::clearDraftRings).
     bool resultInvalid = false;
+    // Every token the model has read or will read before the pending one:
+    // the prompt (with any replayed generation) and the emitted output, which
+    // the target may read (QwenTargetRequest).
+    std::vector<uint32_t> tokens;
   };
 
   struct DecodeLaneResult final {
@@ -369,7 +373,7 @@ struct Runtime::Impl {
   std::array<PageTableBinding, kLaneCount> pageTableBindings{};
   ModelTelemetry counters;
   ops::Sampling sampling;
-  QwenTarget targetModel;
+  std::unique_ptr<QwenTarget> targetModel;
   DFlashDraft draftModel;
   ops::AneFfn *aneFfn;
   explicit Impl(RuntimeContext value)
@@ -383,8 +387,8 @@ struct Runtime::Impl {
         sampling(geometry.target.vocabularySize),
         targetModel(std::visit(
                         [&](const auto &weights) {
-                          return QwenTarget(weights, geometry.target,
-                                            value.backend, operators);
+                          return makeQwenTarget(weights, geometry.target, value.backend, operators,
+                                                geometry.prefillChunks);
                         },
                         value.model.target)),
         draftModel(value.model.draft, value.backend, operators),
@@ -1008,6 +1012,10 @@ struct Runtime::Impl {
       else if (!thinkingEndWaits(entry))
         throw std::logic_error("thinking went past its budget");
     }
+    // The previous anchor and every selection before the new one are now
+    // read (Request::tokens).
+    if (entry.pendingToken) entry.tokens.push_back(*entry.pendingToken);
+    entry.tokens.insert(entry.tokens.end(), tokens.begin(), tokens.end() - 1);
     entry.pendingToken = tokens.back();
   }
 
@@ -1067,11 +1075,11 @@ struct Runtime::Impl {
   void encodeInitialSelections(CommandGraph &graph,
                                std::span<const InitialSelection> lanes,
                                uint32_t width) {
-    const uint32_t storage = targetModel.decodeStorageLanes(width);
+    const uint32_t storage = targetModel->decodeStorageLanes(width);
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->batchSlice(tensor, storage);
     };
-    targetModel.addHeadBatch(graph, d(DecodeTensor::Hidden0),
+    targetModel->addHeadBatch(graph, d(DecodeTensor::Hidden0),
                              d(DecodeTensor::FinalHidden),
                              d(DecodeTensor::Logits), width,
                              decodeArena->linearScratch());
@@ -1295,6 +1303,12 @@ struct Runtime::Impl {
     }
   }
 
+  // A request as the target reads it beyond a step's rows: its tokens, a
+  // prefill's its prompt, and their RoPE positions.
+  static QwenTargetRequest targetRequest(const Request &entry) {
+    return {entry.tokens, [&entry](uint64_t logical) { return ropePosition(entry, logical); }};
+  }
+
   // The states a sequence of `rows` rows captures inside them, in their
   // reservations' cells; one at its end is the cell the sequence writes.
   static std::vector<QwenTargetStateCapture> insideStateCaptures(std::span<const PrefillStateCapture> captures,
@@ -1303,7 +1317,7 @@ struct Runtime::Impl {
     for (const PrefillStateCapture &capture : captures) {
       if (capture.row == rows) continue;
       const GdnParityBuffers &cell = capture.reservation->buffers().gdn->buffers();
-      inside.push_back({capture.row, cell.convolutionLayers, cell.recurrentLayers});
+      inside.push_back({capture.row, cell.convolutionLayers, cell.recurrentLayers, cell.auxiliary});
     }
     return inside;
   }
@@ -1488,7 +1502,7 @@ struct Runtime::Impl {
   // its own tensors; the target's layers over the chunks
   // (QwenTarget::addPrefill); the draft's context of each chunk's captured
   // rows; and the first token of each lane whose rows end its prompt. A
-  // lane's GDN state passes from its current cell through its
+  // lane's GDN and auxiliary state pass from its current cell through its
   // parts to its next cell, which its last part writes; a part that ends at
   // a state it captures writes that state's cell, another the next cell or
   // the arena's scratch cell, whichever the part after it does not write. So
@@ -1553,7 +1567,7 @@ struct Runtime::Impl {
       addRopeTables(graph, p(PrefillTensor::TargetPositions), chunk.rows, p(PrefillTensor::DraftPositions),
                     chunk.capturedRows, model.buffers.ropeCos, model.buffers.ropeSin, p(PrefillTensor::DraftRopeCos),
                     p(PrefillTensor::DraftRopeSin));
-      targetModel.addEmbedding(graph, p(PrefillTensor::InputTokens), model.buffers.hidden[0], chunk.rows);
+      targetModel->addEmbedding(graph, p(PrefillTensor::InputTokens), model.buffers.hidden[0], chunk.rows);
       for (uint32_t s = 0; s < chunk.sequences.size(); ++s) {
         const PrefillSequence &sequence = chunk.sequences[s];
         const ModelBatchItem &part = sequence.part;
@@ -1561,8 +1575,19 @@ struct Runtime::Impl {
         const GdnParityBuffers &in = *from[sequence.lane], &out = *written[c][s];
         from[sequence.lane] = &out;
         QwenTargetPrefillSequence &destination = sequences[c].emplace_back();
+        destination.lane = sequence.lane;
         destination.rowBegin = sequence.rowBegin;
         destination.rows = part.tokenCount;
+        destination.tokens = part.inputTokens;
+        destination.request = targetRequest(*sequence.entry);
+        // The part's tokens are its request's history from the chunk's
+        // committed tokens on (QwenTargetPrefillSequence).
+        const std::span<const uint32_t> history = destination.request.tokens;
+        const uint64_t committed = sequence.chunk.committed_tokens;
+        if (part.inputTokens.size() != part.tokenCount || committed > history.size() ||
+            part.tokenCount > history.size() - committed ||
+            !std::ranges::equal(part.inputTokens, history.subspan(committed, part.tokenCount)))
+          throw std::logic_error("prefill tokens are not the request's history");
         destination.attentionStride = sequence.attentionStride;
         destination.queryOffset = sequence.queryOffset;
         destination.kvOffset = sequence.kvOffset;
@@ -1572,6 +1597,8 @@ struct Runtime::Impl {
         destination.convolutionOut = out.convolutionLayers;
         destination.recurrentIn = in.recurrentLayers;
         destination.recurrentOut = out.recurrentLayers;
+        destination.auxiliaryIn = in.auxiliary;
+        destination.auxiliaryOut = out.auxiliary;
         // A state at the part's end is the cell it writes.
         destination.stateCaptures = inside.emplace_back(insideStateCaptures(sequence.stateCaptures, part.tokenCount));
         // The rows the draft's context reads.
@@ -1585,7 +1612,7 @@ struct Runtime::Impl {
       }
       model.sequences = sequences[c];
     }
-    const std::vector<MetalBuffer> finalHidden = targetModel.addPrefill(graph, modelChunks, kvPages.layers(), aneFfn);
+    const std::vector<MetalBuffer> finalHidden = targetModel->addPrefill(graph, modelChunks, kvPages, aneFfn);
     for (uint32_t c = 0; c < chunks.size(); ++c) addDraftContext(graph, chunks, c);
 
     PrefillOutputs outputs;
@@ -1612,6 +1639,11 @@ struct Runtime::Impl {
     return outputs;
   }
 
+  // Writes a lane's inputs that the CPU makes: the anchor at row 0 of the
+  // lane's draft input rows (whose other rows the draft's block fills with
+  // mask tokens, and which the verify reads its anchor from), the RoPE
+  // positions of its rows, and the target's own inputs of its verify rows
+  // (QwenTarget::prepareVerifyLane).
   void prepareDecodeLane(Request &entry, const ModelBatchItem &item,
                          uint32_t lane) {
     if (!entry.resident || !entry.promptComplete || !entry.pendingToken) {
@@ -1622,6 +1654,11 @@ struct Runtime::Impl {
         !metadata.lengths.hasCompleteDraftWindow(kDraftCacheStride)) {
       throw std::logic_error("decode state length is not exact");
     }
+    // The target reads the history before the pending token from the
+    // request (QwenTargetRequest), which commitSelected keeps beside the
+    // engine's.
+    if (entry.tokens.size() != item.logicalPosition)
+      throw std::logic_error("decode token history is not exact");
     static_cast<void>(synchronizedPageTable(entry, item));
     auto *draftInput = contents<uint32_t>(
         decodeArena->get(lane, DecodeTensor::DraftInputTokens),
@@ -1629,6 +1666,7 @@ struct Runtime::Impl {
     draftInput[0] = *entry.pendingToken;
     std::fill(draftInput + 1, draftInput + kDecodeRows,
               geometry.target.maskToken);
+    targetModel->prepareVerifyLane(lane, item.logicalPosition, targetRequest(entry));
 
     auto *positions =
         contents<uint32_t>(decodeArena->get(lane, DecodeTensor::Positions),
@@ -1679,7 +1717,7 @@ struct Runtime::Impl {
     }
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
     // The draft shares the target's vocabulary head and its storage rows.
-    const uint32_t storage = targetModel.decodeStorageLanes(lanes);
+    const uint32_t storage = targetModel->decodeStorageLanes(lanes);
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->batchSlice(tensor, storage);
     };
@@ -1711,7 +1749,7 @@ struct Runtime::Impl {
     buffers.gateScratch = decodeArena->gateScratch();
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
     draftModel.addDecode(graph, std::move(buffers),
-                         targetModel.vocabularyProjection(),
+                         targetModel->vocabularyProjection(),
                          std::span(cacheLengths).first(lanes));
     std::array<uint32_t, kLaneCount> anchors{};
     std::array<ops::SamplingPolicy, kLaneCount> policies{};
@@ -1742,7 +1780,7 @@ struct Runtime::Impl {
       throw std::invalid_argument("invalid target verify batch");
     }
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
-    const uint32_t storage = targetModel.decodeStorageLanes(lanes);
+    const uint32_t storage = targetModel->decodeStorageLanes(lanes);
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->batchSlice(tensor, storage);
     };
@@ -1787,6 +1825,7 @@ struct Runtime::Impl {
           decodeArena->get(entry.stateLane, DecodeTensor::PageTable);
       buffers.currentGdnStates[lane] = states.current(entry.stateLane).stateBase;
       buffers.nextGdnStates[lane] = states.next(entry.stateLane).stateBase;
+      buffers.auxiliary[lane] = states.current(entry.stateLane).auxiliary;
     }
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       const uint32_t stateLane = entries[lane]->stateLane;
@@ -1801,7 +1840,7 @@ struct Runtime::Impl {
       chunkValues[layer] = decodeArena->attentionBatchSlice(
           DecodeTensor::ChunkValuesBase, layer, storage);
     }
-    targetModel.addVerify(graph, std::move(buffers), kvPages.layers(),
+    targetModel->addVerify(graph, std::move(buffers), kvPages,
                           std::span(chunks).first(lanes), lanes);
   }
 
@@ -1834,7 +1873,7 @@ struct Runtime::Impl {
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
     // The draft's projections take the target's storage rows, as in its
     // decode (encodeDraftBatchGraph).
-    const uint32_t storage = targetModel.decodeStorageLanes(lanes);
+    const uint32_t storage = targetModel->decodeStorageLanes(lanes);
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->batchSlice(tensor, storage);
     };
@@ -1886,19 +1925,49 @@ struct Runtime::Impl {
         geometry.target.stopTokens[0], geometry.target.stopTokens[1]);
   }
 
+  // The target's commit after acceptance (QwenTarget::addStateCommit): each
+  // lane's auxiliary state after its retained rows. The GDN state folds the
+  // retained rows into the lane's next step instead.
+  void encodeTargetStateCommit(CommandGraph &graph,
+                               std::span<Request *const> lanes) {
+    if (lanes.empty() || lanes.size() > kLaneCount)
+      throw std::invalid_argument("invalid target state commit batch");
+    const uint32_t width = static_cast<uint32_t>(lanes.size());
+    QwenTargetCommitBuffers buffers;
+    buffers.retainedCounts = decodeArena->batchSlice(DecodeTensor::RetainedCount, width);
+    for (uint32_t lane = 0; lane < width; ++lane) {
+      Request &entry = laneEntry(lanes, lane);
+      buffers.auxiliaryIn[lane] = states.current(entry.stateLane).auxiliary;
+      buffers.auxiliaryOut[lane] = states.next(entry.stateLane).auxiliary;
+    }
+    targetModel->addStateCommit(graph, std::move(buffers), width);
+  }
+
+  // A verify's selection, acceptance and commits, which end its cycle's last
+  // command: the target's state commit and the DFlash2 draft's, whose rings
+  // take the rows the lanes retained.
+  void encodeVerifyCommit(CommandGraph &graph, std::span<Request *const> entries,
+                          std::span<const ModelBatchItem> items,
+                          std::span<const uint32_t> maximumRetained) {
+    encodeTargetVerifyBatchPolicy(graph, entries);
+    encodeBatchAcceptance(graph, entries, maximumRetained);
+    encodeTargetStateCommit(graph, entries);
+    encodeDraftStateCommitBatch(graph, entries, items);
+  }
+
   void encodeBatchEmbedding(CommandGraph &graph, DecodeTensor tokens,
                             DecodeTensor output, uint32_t lanes) {
     if (!lanes || lanes > kLaneCount)
       throw std::invalid_argument("invalid embedding batch width");
     const uint32_t rows = lanes * kDecodeRows;
-    targetModel.addEmbedding(graph, decodeArena->batchSlice(tokens, lanes),
+    targetModel->addEmbedding(graph, decodeArena->batchSlice(tokens, lanes),
                              decodeArena->batchSlice(output, lanes), rows);
   }
 
   void encodeBatchVerifyInput(CommandGraph &graph, uint32_t lanes) {
     if (!lanes || lanes > kLaneCount)
       throw std::invalid_argument("invalid verify-input batch width");
-    targetModel.addVerifyInput(
+    targetModel->addVerifyInput(
         graph, decodeArena->batchSlice(DecodeTensor::DraftInputTokens, lanes),
         decodeArena->batchSlice(DecodeTensor::ProposedTokens, lanes),
         decodeArena->batchSlice(DecodeTensor::InputTokens, lanes), lanes);
@@ -2092,12 +2161,8 @@ struct Runtime::Impl {
           }
 
           CommandGraph commit;
-          impl_.encodeTargetVerifyBatchPolicy(commit,
-                                              {entries.data(), lanes_.size()});
-          impl_.encodeBatchAcceptance(commit, {entries.data(), lanes_.size()},
-                                      {maximumRetained.data(), lanes_.size()});
-          impl_.encodeDraftStateCommitBatch(
-              commit, {entries.data(), lanes_.size()}, items_);
+          impl_.encodeVerifyCommit(commit, {entries.data(), lanes_.size()}, items_,
+                                   {maximumRetained.data(), lanes_.size()});
           submit(commit);
           stage_ = Stage::Commit;
         }
@@ -2276,6 +2341,7 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
     entry.stateLane = *admission.lane;
     entry.resident = true;
     entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
+    entry.tokens.assign(request.prompt.begin(), request.prompt.end());
     entry.images = std::move(images);
     entry.restoredTokens = request.restoredTokens;
     impl_->bindPenalties(entry, request.prompt);
@@ -2294,6 +2360,7 @@ StateAdmission Runtime::beginAt(const ModelRequest &request, uint32_t stateLane)
   Impl::Request entry;
   entry.id = request.id;
   entry.promptTokens = static_cast<uint32_t>(request.prompt.size());
+  entry.tokens.assign(request.prompt.begin(), request.prompt.end());
   entry.maxNewTokens = request.maxNewTokens;
   entry.sampling = request.sampling;
   entry.constraint = request.constraint;
@@ -2710,10 +2777,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::InputTokens,
                               DecodeTensor::Hidden0, width);
   impl_->encodeTargetVerifyBatchForward(commandGraph, entries, items);
-  impl_->encodeTargetVerifyBatchPolicy(commandGraph, entries);
-  impl_->encodeBatchAcceptance(commandGraph, entries,
-                               {maximumRetained.data(), width});
-  impl_->encodeDraftStateCommitBatch(commandGraph, entries, items);
+  impl_->encodeVerifyCommit(commandGraph, entries, items, {maximumRetained.data(), width});
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();
@@ -3073,8 +3137,9 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
 }
 
 ModelMemoryActual Runtime::actualRuntimeMemory() const {
-  return {impl_->states.actualAllocatedBytes(), impl_->prefillArena->bytes(),
-          impl_->decodeArena->bytes(), impl_->states.stagingBytes()};
+  const QwenTargetScratchBytes target = impl_->targetModel->allocatedScratchBytes();
+  return {impl_->states.actualAllocatedBytes(), impl_->prefillArena->bytes() + target.prefill,
+          impl_->decodeArena->bytes() + target.decode, impl_->states.stagingBytes()};
 }
 
 ModelTelemetry Runtime::telemetry() const noexcept {

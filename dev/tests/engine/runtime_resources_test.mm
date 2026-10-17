@@ -176,14 +176,17 @@ void testPersistentCacheNamespace() {
               persistentCacheNamespace(identity('a', "build", kv::Format::Int8), states) != name &&
               persistentCacheNamespace(identity('a', "build", kv::Format::Int8), bfloatStates) != name,
           "other models, layouts or state formats shared a cache namespace");
-  // A sparse-attention layout's pages hold token-major values and an index of
-  // pooled keys.
+  // A QSA layout's pages hold token-major values and the index's pooled
+  // keys, and its states the PLE history and the index's pending keys.
   RuntimeCacheIdentity tokenMajor = identity('a', "build", kv::Format::Int8), indexed = tokenMajor;
   tokenMajor.kvLayout.valuesTokenMajor = true;
   indexed.kvLayout.indexDimension = 128;
+  model::CompositeStateLayout auxiliary = model.stateLayout;
+  auxiliary.target.auxiliaryBytes = 9216;
   require(persistentCacheNamespace(tokenMajor, model.stateLayout) != name &&
-              persistentCacheNamespace(indexed, model.stateLayout) != name,
-          "token-major values or an index shared a dense layout's cache namespace");
+              persistentCacheNamespace(indexed, model.stateLayout) != name &&
+              persistentCacheNamespace(identity('a', "build", kv::Format::Int8), auxiliary) != name,
+          "token-major values, an index or auxiliary state shared a dense layout's cache namespace");
 }
 
 void testWeightBudgetBeforeLoading(const char *metallibPath) {

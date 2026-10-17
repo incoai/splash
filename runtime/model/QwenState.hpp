@@ -21,10 +21,12 @@ struct GdnParityBuffers final {
   metal::MetalBuffer stateBase;
   std::vector<metal::MetalBuffer> convolutionLayers;
   std::vector<metal::MetalBuffer> recurrentLayers;
+  // GdnStateLayout::auxiliaryBytes after the GDN layers' state; empty when 0.
+  metal::MetalBuffer auxiliary;
 };
 
 // A cell of `layout` in `base` (layout.cellBytes()): every layer's
-// convolution state, then every layer's recurrent state.
+// convolution state, then every layer's recurrent state, then the auxiliary.
 [[nodiscard]] GdnParityBuffers gdnCellBuffers(metal::MetalBackend &backend, metal::MetalBuffer base,
                                               const GdnStateLayout &layout);
 

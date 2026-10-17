@@ -19,6 +19,9 @@
 
 namespace splash::model {
 
+// The bytes of an F32 value in a target's images.
+inline constexpr uint64_t kFloat32Bytes = 4;
+
 // How a target's block images store its tensors; loadQwenTarget pairs each
 // source's images with their format. Block images hold each tensor as one
 // block-quantized segment, a fused projection as its tensors in output column

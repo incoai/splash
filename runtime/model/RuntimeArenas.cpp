@@ -4,6 +4,7 @@
 #include "ops/Sampling.hpp"
 
 namespace splash::model {
+
 std::array<uint64_t, prefillTensorCount>
 prefillTensorBytes(const RuntimeGeometry &geometry,
                    const ops::ExecutionPlans &operators) {
@@ -139,13 +140,20 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   return result;
 }
 
-uint64_t plannedPrefillBytes(const RuntimeGeometry &geometry,
-                            const ops::ExecutionPlans &operators) {
+uint64_t prefillArenaBytes(const RuntimeGeometry &geometry,
+                          const ops::ExecutionPlans &operators) {
   uint64_t bytes = 0;
   for (uint64_t value : prefillTensorBytes(geometry, operators)) {
     bytes = checkedAdd(bytes, alignUp(value), "prefill arena");
   }
   return bytes;
+}
+
+uint64_t plannedPrefillBytes(const RuntimeGeometry &geometry,
+                            const ops::ExecutionPlans &operators) {
+  return checkedAdd(prefillArenaBytes(geometry, operators),
+                    geometry.targetScratch.prefill,
+                    "prefill scratch");
 }
 
 static uint64_t gdnPackedStride(const RuntimeGeometry &geometry) noexcept {
@@ -324,13 +332,20 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   return result;
 }
 
-uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
-                           const ops::ExecutionPlans &operators) {
+uint64_t decodeArenaBytes(const RuntimeGeometry &geometry,
+                         const ops::ExecutionPlans &operators) {
   return checkedAdd(decodeArenaBaseBytes(geometry, operators),
                     checkedAdd(DecodeArena::gateScratchBytes(geometry, operators),
                                DecodeArena::linearScratchSize(geometry, operators).bytes(),
                                "linear decode scratch"),
                     "planned gate scratch");
+}
+
+uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
+                           const ops::ExecutionPlans &operators) {
+  return checkedAdd(decodeArenaBytes(geometry, operators),
+                    geometry.targetScratch.decode,
+                    "decode scratch");
 }
 
 } // namespace splash::model

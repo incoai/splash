@@ -20,7 +20,6 @@ ops::Projection BlockTargetFormat::fused(WeightFile &file, uint32_t outputSize, 
 
 QwenMixerWeights readQwenMixer(WeightFile &file, const BlockTargetFormat &format,
                                const QwenTargetDimensions &target, bool fullAttention) {
-  constexpr uint64_t kFloat32Bytes = 4;
   if (fullAttention) {
     QwenAttentionWeights attention;
     attention.inputProjection =

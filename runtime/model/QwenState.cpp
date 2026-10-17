@@ -105,6 +105,9 @@ GdnParityBuffers gdnCellBuffers(metal::MetalBackend &backend, metal::MetalBuffer
         backend.view(cell.stateBase, layout.convolutionBytes() + uint64_t{layer} * layout.recurrentLayerBytes(),
                      layout.recurrentLayerBytes());
   }
+  if (layout.auxiliaryBytes)
+    cell.auxiliary = backend.view(cell.stateBase, layout.convolutionBytes() + layout.recurrentBytes(),
+                                  layout.auxiliaryBytes);
   return cell;
 }
 
