@@ -3,6 +3,7 @@
 #include "metal/kernels/common/kv_extent.h"
 #include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/rms_inverse.h"
+#include "metal/kernels/common/target_rope.h"
 
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>
@@ -128,12 +129,12 @@ kernel void block_indexer_pool(device const BlockIndexerBlock *blocks [[buffer(0
       SPLASH_LANE_BINDING(batch, index_table0, index_table1, index_table2, index_table3);
   device const bfloat *pending = SPLASH_LANE_BINDING(batch, pending0, pending1, pending2, pending3);
   const BlockIndexerBlock block = blocks[ulong(batch) * p.lane_records + index];
-  // The block's table row as rope_build_tables computes one: frequency i
-  // on axis i % 3 (interleaved M-RoPE).
+  // The block's row of the target's RoPE table, scaled as the queries' are.
   if (tid < kPairs) {
-    const float angle = float(block.rope[tid % 3]) * inverse_frequencies[tid];
-    cosine[tid] = cos(angle);
-    sine[tid] = sin(angle);
+    const float2 rope =
+        target_rope_pair(uint3(block.rope[0], block.rope[1], block.rope[2]), inverse_frequencies, tid, p.rope_scale);
+    cosine[tid] = rope.x;
+    sine[tid] = rope.y;
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const uint first = p.first_position[batch];

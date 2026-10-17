@@ -56,6 +56,7 @@ struct Qwen4ExpLayout final : QwenHybridLayout {
 
   constexpr Qwen4ExpLayout()
       : QwenHybridLayout{{.nativeContextTokens = 262'144,
+                          .yarnContextTokens = 1'010'000,
                           .layers = 48,
                           .hiddenSize = 2560,
                           .vocabularySize = 248320,

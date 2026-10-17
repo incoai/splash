@@ -13,14 +13,18 @@
 //   step complete, the pending keys a step and a verify's commit keep, a
 //   block a rejected row completed, and each row's block bitmap (dense below
 //   the budget; above it the top blocks, ties towards the earlier block, and
-//   the tail block after the row's complete ones);
+//   the tail block after the row's complete ones), with YaRN too, to the end
+//   of its window; the scratch a target's window takes;
 // - the capture of a layer's output for the DFlash2 draft (the mean of its
 //   streams); the GPU PLE hash against the CPU's.
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
+#include "../../../runtime/model/Qwen4Exp.hpp"
+#include "../../../runtime/model/Qwen4Steps.hpp"
 #include "../../../runtime/ops/BlockIndexer.hpp"
 #include "../../../runtime/ops/HyperConnection.hpp"
 #include "../../../runtime/ops/NgramEmbedding.hpp"
+#include "../../../runtime/ops/RoPE.hpp"
 #include "../../../runtime/ops/Sampling.hpp"
 #include "LinearInputReference.hpp"
 #include "metal/abi/BlockIndexer.h"
@@ -42,6 +46,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -52,6 +57,7 @@ using splash::metal::CommandGraph;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 using splash::ops::NormWeights;
+namespace model = splash::model;
 namespace ops = splash::ops;
 
 int failures = 0;
@@ -479,12 +485,12 @@ void pleTest(MetalBackend &backend) {
   }
 }
 
-// A QSA lane: its tokens' raw keys, its pages in one extent of the index in
-// a shuffled table of its own, and its pending keys, which the GPU passes
-// from one of its steps to the next.
+// A QSA lane: its tokens' raw keys, its pages of the index in a shuffled
+// table of its own, and its pending keys, which the GPU passes from one of
+// its steps to the next.
 struct QsaLane final {
   uint32_t tokens = 0, first = 0;
-  std::vector<uint32_t> table; // the lane's page ids in the extent
+  std::vector<uint32_t> table; // the lane's page ids
   std::vector<float> raw;      // every token's raw key
   MetalBuffer tableBuffer;
   std::array<MetalBuffer, 2> pending; // pending[0] before the next step
@@ -513,13 +519,13 @@ std::vector<BlockIndexerBlock> qsaRecords(uint32_t from, uint32_t rows) {
 // does from the step's keys and the lane's pending keys, which it then
 // replaces with the step's.
 void qsaPrefillStep(MetalBackend &backend, CommandGraph &graph, QsaLane &lane, uint32_t from, uint32_t rows,
-                    const NormWeights &keyNorm, const MetalBuffer &invFreq, uint32_t indexOffset) {
+                    const NormWeights &keyNorm, const MetalBuffer &invFreq, float ropeScale, uint32_t indexOffset) {
   const MetalBuffer keys = upload(backend, qsaKeys(lane, from, rows));
   const std::vector<BlockIndexerBlock> records = qsaRecords(from, rows);
   const std::array<uint32_t, 1> firsts{from}, counts{static_cast<uint32_t>(records.size())};
   const ops::IndexerRows qsaRows{rows, firsts, {{&lane.tableBuffer, 1}, indexOffset}, 512, 0, 0};
   ops::BlockIndexer::addPool(graph, {upload(backend, records), counts, 0, keys, {&lane.pending[0], 1}}, keyNorm,
-                             invFreq, qsaRows);
+                             invFreq, ropeScale, qsaRows);
   ops::BlockIndexer::addPending(graph, keys, lane.pending[0], lane.pending[1], from, rows);
   std::swap(lane.pending[0], lane.pending[1]);
 }
@@ -532,6 +538,9 @@ void qsaPrefillStep(MetalBackend &backend, CommandGraph &graph, QsaLane &lane, u
 // dimensions, so that their pooled keys and every row's scores of them are
 // equal. One lane's rows are scored 8 at a time; several lanes' at once.
 // Each lane's commit then keeps the pending keys after a few of its rows.
+// The queries rotate by the target's RoPE tables (rope_build_tables), with
+// YaRN by 4 when `yarn`: its frequencies, and its attention factor scaling
+// queries and pooled keys alike, as the reference does.
 struct QsaCase final {
   uint32_t tokens;
   uint32_t rows;
@@ -539,6 +548,7 @@ struct QsaCase final {
   uint32_t tied;
   uint32_t lanes;
   uint32_t chunk;
+  bool yarn = false;
 };
 
 void qsaTest(MetalBackend &backend, QsaCase c) {
@@ -564,20 +574,27 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
     for (MetalBuffer &pending : x.pending) pending = upload(backend, std::vector<uint16_t>(kQsaPendingBytes / 2, 0));
   }
   const uint32_t words = (mostTokens / 4 + 2 + 31) / 32, stride = words * 32;
-  // One extent holding the layer's index past a region of other bytes, the
-  // pooled keys of every page; each lane's index table holds its pages'
-  // entries.
-  const uint32_t indexOffset = 64 * 1024;
-  const uint64_t pooledBytes = uint64_t{pages} * (page / 4) * D * 2;
-  MetalBuffer extent = backend.allocateBuffer(indexOffset + pooledBytes, BufferStorage::Shared, "qwen4-test-extent",
+  // Extents of at most the pages an entry indexes, back to back, each
+  // holding the layer's index past a region of other bytes: the pooled keys
+  // of its pages. Each lane's index table holds its pages' entries.
+  constexpr uint32_t kExtentPages = SPLASH_KV_PAGE_INDEX_MASK + 1;
+  const uint32_t indexOffset = 64 * 1024, extents = (pages + kExtentPages - 1) / kExtentPages;
+  const uint64_t pageBytes = uint64_t{page / 4} * D * 2,
+                 extentBytes = indexOffset + std::min(pages, kExtentPages) * pageBytes;
+  MetalBuffer extent = backend.allocateBuffer(extents * extentBytes, BufferStorage::Shared, "qwen4-test-extent",
                                               BufferReach::Addressed);
-  check(!(extent.gpuAddress() & SPLASH_KV_PAGE_INDEX_MASK), "QSA extent leaves room for the page index");
-  MetalBuffer pooled = backend.view(extent, indexOffset, pooledBytes);
+  check(!((extent.gpuAddress() | (extents > 1 ? extentBytes : 0)) & SPLASH_KV_PAGE_INDEX_MASK),
+        "QSA extents leave room for the page index");
+  // A page's pooled keys, in bf16 values from the first extent's start.
+  const auto pooledAt = [&](uint32_t index) {
+    return (index / kExtentPages * extentBytes + indexOffset + index % kExtentPages * pageBytes) / 2;
+  };
   std::vector<MetalBuffer> tables;
   std::vector<uint32_t> firstPositions;
   for (QsaLane &x : lane) {
     std::vector<uint64_t> entries;
-    for (uint32_t index : x.table) entries.push_back(extent.gpuAddress() | index);
+    for (uint32_t index : x.table)
+      entries.push_back((extent.gpuAddress() + index / kExtentPages * extentBytes) | index % kExtentPages);
     x.tableBuffer = upload(backend, entries);
     tables.push_back(x.tableBuffer);
     firstPositions.push_back(x.first);
@@ -585,7 +602,9 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
   const auto qn = randoms(rng, D, 0.2f), kn = randoms(rng, D, 0.2f);
   std::vector<float> qnP(D), knP(D), invFreq(32);
   for (uint32_t d = 0; d < D; ++d) qnP[d] = 1 + qn[d], knP[d] = 1 + kn[d];
-  for (uint32_t i = 0; i < 32; ++i) invFreq[i] = std::pow(10'000'000.0f, -float(i) / 32);
+  const model::RopeScaling scaling = c.yarn ? model::RopeScaling{4.0, 262144} : model::RopeScaling{};
+  model::rotaryInverseFrequencies(10'000'000.0f, 32, scaling, invFreq);
+  const float ropeScale = scaling.attentionFactor();
   const NormWeights keyNorm{upload(backend, knP), true};
   const MetalBuffer invFreqBuffer = upload(backend, invFreq);
 
@@ -594,21 +613,21 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
   for (QsaLane &x : lane)
     for (uint32_t from = 0; from < x.first; from += c.chunk)
       qsaPrefillStep(backend, history, x, from, std::min(c.chunk, x.first - from), keyNorm, invFreqBuffer,
-                     indexOffset);
+                     ropeScale, indexOffset);
   if (!history.empty()) run(backend, history);
 
   // The step: every lane's rows in one dispatch of each kernel.
   const auto query = randoms(rng, uint64_t{laneRows} * H * D, 1.0f);
-  std::vector<float> stepKeys(uint64_t{laneRows} * D), cosT(laneRows * 32), sinT(laneRows * 32);
+  std::vector<float> stepKeys(uint64_t{laneRows} * D);
+  std::vector<uint32_t> ropePositions;
   for (uint32_t l = 0; l < lanes; ++l)
     for (uint32_t r = 0; r < rows; ++r) {
       const uint32_t row = l * rows + r, position = lane[l].first + r;
       for (uint32_t d = 0; d < D; ++d) stepKeys[uint64_t{row} * D + d] = lane[l].raw[uint64_t{position} * D + d];
-      for (uint32_t i = 0; i < 32; ++i) {
-        cosT[row * 32 + i] = std::cos(float(position) * invFreq[i]);
-        sinT[row * 32 + i] = std::sin(float(position) * invFreq[i]);
-      }
+      ropePositions.insert(ropePositions.end(), 3, position);
     }
+  const MetalBuffer cosT = scratch(backend, uint64_t{laneRows} * 32 * 4), sinT = scratch(backend, uint64_t{laneRows} * 32 * 4),
+                    draftRope = scratch(backend, SPLASH_DRAFT_ROPE_PAIRS * 4);
   MetalBuffer queries = scratch(backend, uint64_t{laneRows} * H * D * 2), keys = scratch(backend, uint64_t{laneRows} * D * 2);
   const ops::IndexerRows qsaRows{rows, firstPositions, {tables, indexOffset}, top, words, stride};
   // Each lane's records `laneRecords` records apart.
@@ -623,10 +642,12 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
     pendingBefore.push_back(lane[l].pending[0]);
   }
   CommandGraph graph;
+  ops::RoPE::addTables(graph, upload(backend, ropePositions), draftRope, invFreqBuffer, draftRope, cosT, sinT,
+                       draftRope, draftRope, {laneRows, 0, ropeScale}, laneRows);
   ops::BlockIndexer::addProject(graph, upload(backend, query), upload(backend, stepKeys), {upload(backend, qnP), true},
-                                upload(backend, cosT), upload(backend, sinT), queries, keys, qsaRows);
+                                cosT, sinT, queries, keys, qsaRows);
   ops::BlockIndexer::addPool(graph, {upload(backend, blocks), counts, laneRecords, keys, pendingBefore}, keyNorm,
-                             invFreqBuffer, qsaRows);
+                             invFreqBuffer, ropeScale, qsaRows);
   const uint32_t scoreRows = lanes > 1 ? laneRows : 8;
   // Poisoned bitmaps: the select writes every word a tile's lists read.
   MetalBuffer scores = scratch(backend, uint64_t{scoreRows} * stride * 4),
@@ -643,12 +664,13 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
                                pendingAfter);
   run(backend, graph);
 
-  // A rotation's angle is the fp32 product the RoPE tables take (the host's
-  // above, the pool's own): at thousands of tokens its rounding moves a value
-  // by more than a bf16 tolerance.
+  // A rotation's angle is the fp32 product the RoPE tables take (the
+  // queries' and the pool's alike): at thousands of tokens its rounding moves
+  // a value by more than a bf16 tolerance. YaRN scales the rotated
+  // dimensions of queries and keys alike.
   auto rotate = [&](std::vector<double> v, uint32_t position) {
     for (uint32_t i = 0; i < 32; ++i) {
-      const double a = float(position) * invFreq[i], c = std::cos(a), s = std::sin(a);
+      const double a = float(position) * invFreq[i], c = std::cos(a) * ropeScale, s = std::sin(a) * ropeScale;
       const double x0 = v[i], x1 = v[i + 32];
       v[i] = x0 * c - x1 * s;
       v[i + 32] = x1 * c + x0 * s;
@@ -668,7 +690,7 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
   std::vector<float> gotQ;
   for (const uint16_t value : download<uint16_t>(queries, uint64_t{laneRows} * H * D)) gotQ.push_back(f32(value));
   std::vector<float> gotP;
-  for (const uint16_t value : download<uint16_t>(pooled, uint64_t{pages} * (page / 4) * D)) gotP.push_back(f32(value));
+  for (const uint16_t value : download<uint16_t>(extent, extents * extentBytes / 2)) gotP.push_back(f32(value));
   const auto gotKeys = download<uint16_t>(keys, uint64_t{laneRows} * D);
   const auto gotMask = download<uint32_t>(mask, uint64_t{laneRows} * words);
   bool okQ = true, okKeys = true, okP = true, okMask = true, okCommit = true;
@@ -683,7 +705,7 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
       }
     const std::vector<uint16_t> wantKeys = qsaKeys(x, x.first, rows);
     okKeys &= std::equal(wantKeys.begin(), wantKeys.end(), gotKeys.begin() + uint64_t{l} * rows * D);
-    const auto pooledKey = [&](uint32_t b) { return &gotP[(uint64_t{x.table[b / 8]} * 8 + b % 8) * D]; };
+    const auto pooledKey = [&](uint32_t b) { return &gotP[pooledAt(x.table[b / 8]) + (b % 8) * D]; };
     for (uint32_t b = 0; b < x.tokens / 4; ++b) {
       std::vector<double> mean(D, 0);
       for (uint32_t t = 4 * b; t < 4 * b + 4; ++t)
@@ -734,7 +756,8 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
       okMask &= taken == top;
     }
   }
-  const std::string scope = std::to_string(lanes) + " lane(s) of " + std::to_string(c.tokens) + " tokens";
+  const std::string scope =
+      std::to_string(lanes) + " lane(s) of " + std::to_string(c.tokens) + " tokens" + (c.yarn ? " with YaRN" : "");
   check(okQ, "QSA project of " + scope + ": normalized, rotated query heads");
   check(okKeys, "QSA project of " + scope + ": the rows' raw keys");
   check(okP, "QSA pool of " + scope + " in prefill steps of " + std::to_string(c.chunk) +
@@ -742,6 +765,46 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
   check(okMask, "QSA select of " + scope + ": dense below the budget, top blocks and the tail block above it" +
                     (c.tied ? ", ties towards the earlier block" : ""));
   check(okCommit, "QSA commit of " + scope + ": the pending keys after each lane's retained rows");
+}
+
+// A target's QSA scratch (model::Qwen4Steps) takes rows to the end of the
+// window it serves: a prefill chunk's and a verify step's last rows at the
+// native window, or at the 1,010,000 tokens YaRN by 4 serves, whose prefill
+// scores keep the native window's scratch; the native window's scratch
+// refuses rows at the end of YaRN's.
+void qsaScratchCoversWindow(MetalBackend &backend) {
+  constexpr uint32_t kChunk = 2048, kVerify = 8, kLanes = 4;
+  const model::Qwen4ExpWeights weights;
+  const std::array<uint32_t, 1> captured{47};
+  const model::QwenTargetGeometry native(model::Qwen4ExpLayout{}, captured);
+  model::QwenTargetGeometry scaled = native;
+  scaled.ropeScaling = {4.0, 262144};
+  const model::QwenTargetGeometry &yarn = scaled;
+  const MetalBuffer table = scratch(backend, 8);
+  const auto selects = [&](const model::Qwen4Scratch &s, uint32_t rows, std::vector<uint32_t> firsts) {
+    const std::vector<MetalBuffer> tables(firsts.size(), table);
+    CommandGraph graph;
+    try {
+      ops::BlockIndexer::addSelect(graph, s.qsaQueries, s.qsaScores, s.scoreRows, s.qsaMask,
+                               {rows, firsts, {tables, 0}, 512, s.maskWords, s.scoreStride});
+    } catch (const std::invalid_argument &) {
+      return false;
+    }
+    return !graph.empty();
+  };
+  uint64_t nativeScores = 0;
+  for (const auto &[geometry, window] : {std::pair{&native, 262'144U}, std::pair{&yarn, 1'010'000U}}) {
+    const model::Qwen4Steps steps(weights, *geometry, backend, 1);
+    const model::Qwen4Scratch prefill = steps.prefillScratch(0), verify = steps.verifyScratch(kLanes * kVerify);
+    const uint64_t scores = uint64_t{prefill.scoreRows} * prefill.scoreStride;
+    if (!nativeScores) nativeScores = scores;
+    check(geometry->contextTokens() == window && selects(prefill, kChunk, {window - kChunk}) &&
+              selects(verify, kVerify, std::vector<uint32_t>(kLanes, window - kVerify)) && scores <= nativeScores,
+          "QSA scratch of a " + std::to_string(window) + "-token window: its last rows, within the native scores");
+  }
+  const model::Qwen4Steps steps(weights, native, backend, 1);
+  check(!selects(steps.prefillScratch(0), kChunk, {1'010'000 - kChunk}),
+        "QSA scratch of the native window refuses the rows of YaRN's");
 }
 
 // A verify step whose rows complete a block and whose lane retains fewer of
@@ -771,7 +834,7 @@ void qsaRollbackTest(MetalBackend &backend) {
     const MetalBuffer invFreqBuffer = upload(backend, invFreq);
     // The tokens before the first verify step.
     CommandGraph history;
-    qsaPrefillStep(backend, history, lane, 0, first, keyNorm, invFreqBuffer, 0);
+    qsaPrefillStep(backend, history, lane, 0, first, keyNorm, invFreqBuffer, 1.0F, 0);
     run(backend, history);
     // A step of draft keys that retains one row, then the step after it
     // with the committed keys, which are other keys from its first row on.
@@ -783,7 +846,7 @@ void qsaRollbackTest(MetalBackend &backend) {
       CommandGraph graph;
       const ops::IndexerRows qsaRows{rows, firsts, {{&lane.tableBuffer, 1}, 0}, 512, 0, 0};
       ops::BlockIndexer::addPool(graph, {upload(backend, records), counts, 0, keyBuffer, {&lane.pending[0], 1}},
-                                 keyNorm, invFreqBuffer, qsaRows);
+                                 keyNorm, invFreqBuffer, 1.0F, qsaRows);
       ops::BlockIndexer::addCommit(graph, keyBuffer, 1, rows, rows, firsts,
                                    upload(backend, std::vector<uint32_t>{retained}), {&lane.pending[0], 1},
                                    {&lane.pending[1], 1});
@@ -952,6 +1015,11 @@ int main(int argc, const char *argv[]) {
         qsaTest(backend, {2047, 8, 512, 0, 4, 509});
         // Past 32 768 blocks, where each select thread owns two bitmap words.
         qsaTest(backend, {140000, 8, 512, 0, 1, 2047});
+        // With YaRN: a verify step's lanes, and a row at the end of the
+        // 1,010,000 tokens it serves, past 252,000 blocks.
+        qsaTest(backend, {2050, 8, 512, 0, 4, 1021, true});
+        qsaTest(backend, {1'010'000, 8, 512, 0, 1, 2047, true});
+        qsaScratchCoversWindow(backend);
         qsaRollbackTest(backend);
         qsaSelectRefusesNarrowScratch(backend);
         streamMeanTest(backend);

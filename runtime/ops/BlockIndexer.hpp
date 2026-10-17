@@ -68,9 +68,11 @@ struct BlockIndexer final {
   static void addProject(metal::CommandGraph &graph, metal::MetalBuffer query, metal::MetalBuffer key,
                          const NormWeights &queryNorm, metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
                          metal::MetalBuffer queries, metal::MetalBuffer keys, const IndexerRows &rows);
-  // The pooled keys of the blocks the lanes' rows complete, into the index.
+  // The pooled keys of the blocks the lanes' rows complete, into the index,
+  // rotated by the target's RoPE of `inverseFrequencies` scaled by ropeScale,
+  // as the queries' tables are: YaRN's attention factor, 1 without YaRN.
   static void addPool(metal::CommandGraph &graph, const IndexerBlocks &blocks, const NormWeights &keyNorm,
-                      metal::MetalBuffer inverseFrequencies, const IndexerRows &rows);
+                      metal::MetalBuffer inverseFrequencies, float ropeScale, const IndexerRows &rows);
   // The rows' scores of their complete blocks' pooled keys and, from them,
   // their bitmaps. A dispatch of one lane scores its rows in batches of the
   // score scratch's scoreRows rows; one of several lanes scores every lane's

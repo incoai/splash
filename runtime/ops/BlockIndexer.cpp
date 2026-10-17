@@ -32,7 +32,8 @@ BlockIndexerParams indexerParams(const IndexerRows &rows) {
                             .top_blocks = rows.topBlocks,
                             .mask_words = rows.maskWords,
                             .score_stride = rows.scoreStride,
-                            .index_offset = rows.index.offset};
+                            .index_offset = rows.index.offset,
+                            .rope_scale = 0.0F};
   std::ranges::copy(rows.firstPositions, std::begin(params.first_position));
   return params;
 }
@@ -59,12 +60,14 @@ void BlockIndexer::addProject(metal::CommandGraph &graph, metal::MetalBuffer que
 }
 
 void BlockIndexer::addPool(metal::CommandGraph &graph, const IndexerBlocks &blocks, const NormWeights &keyNorm,
-                           metal::MetalBuffer inverseFrequencies, const IndexerRows &rows) {
+                           metal::MetalBuffer inverseFrequencies, float ropeScale, const IndexerRows &rows) {
   BlockIndexerParams params = indexerParams(rows);
   if (blocks.counts.size() != params.lanes || blocks.pending.size() != params.lanes ||
       (params.lanes > 1 && !blocks.laneRecords))
     throw std::invalid_argument("invalid indexer blocks");
+  if (!(ropeScale > 0.0F)) throw std::invalid_argument("invalid indexer RoPE scale");
   params.lane_records = blocks.laneRecords;
+  params.rope_scale = ropeScale;
   uint32_t most = 0;
   for (uint32_t lane = 0; lane < params.lanes; ++lane) {
     const uint32_t count = blocks.counts[lane];

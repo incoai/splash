@@ -1044,9 +1044,9 @@ void attentionBlocks(metal::MetalBackend &backend) {
 // tile's history that one of its rows' masks names, with the bits of those
 // rows; mask bits past the tile's history and words past its last block stay
 // unlisted. One dispatch lists the tiles of several sequences, each from its
-// own mask row, history and list, in tiles of eight rows, the last partial;
-// a list keeps to its stride, and the dispatch refuses a mask shorter than its
-// sequences' rows.
+// own mask row, history and list, in tiles of eight rows, the last partial,
+// up to the end of the 1,010,000 tokens YaRN serves; a list keeps to its
+// stride, and the dispatch refuses a mask shorter than its sequences' rows.
 void blockListsMatchMasks(metal::MetalBackend &backend) {
   constexpr uint32_t rowBits = SPLASH_ATTENTION_BLOCK_ROW_BITS, blockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
   constexpr uint32_t tileRows = kv::kVerifyRows;
@@ -1058,7 +1058,7 @@ void blockListsMatchMasks(metal::MetalBackend &backend) {
   };
   const auto buffer = [&](uint64_t bytes) { return test::sharedBuffer(backend, bytes); };
   for (Case c : {Case{4096, {{3, 8, 4095}, {11, 37, 100}, {48, 8, 4096}}}, Case{4096, {{0, 70, 9000}, {70, 5, 0}}},
-                 Case{5, {{0, 8, 4096}}}}) {
+                 Case{5, {{0, 8, 4096}}}, Case{4104, {{0, 8, 1'009'992}}}}) {
     uint32_t maskRows = 0, words = 0, lists = 0;
     for (ops::BlockListRows &sequence : c.sequences) {
       maskRows = std::max(maskRows, sequence.maskRow + sequence.rows);

@@ -52,7 +52,9 @@
 // row_offset. A dispatch of one lane selects a long sequence's rows in
 // batches of the score scratch's rows: the batch from row `row_offset` of its
 // queries and bitmaps, scored into the scratch's first rows. The pool pools
-// lane l's counts[l] blocks, its records lane_records records apart.
+// lane l's counts[l] blocks, its records lane_records records apart, and
+// rotates their keys by the target's RoPE scaled by rope_scale, as the
+// queries' tables are (RopeTableParams::target_scale).
 struct BlockIndexerParams {
   uint32_t lanes;
   uint32_t rows;
@@ -64,9 +66,10 @@ struct BlockIndexerParams {
   uint32_t mask_words;   // 32-bit words of a row's block bitmap
   uint32_t score_stride; // scores per row of the score scratch
   uint32_t index_offset; // the layer's index in every index entry's extent, in bytes
+  float rope_scale;
 };
 
-static_assert(sizeof(BlockIndexerParams) == 32 + 8 * SPLASH_MAXIMUM_BATCH_WIDTH,
+static_assert(sizeof(BlockIndexerParams) == 36 + 8 * SPLASH_MAXIMUM_BATCH_WIDTH,
               "block indexer parameters are the same size on both sides");
 
 // The pending keys of each of `lanes` lanes after the first retained[l] of

@@ -20,9 +20,10 @@ constexpr uint32_t kChunkRows = ExecutionLimits::prefillTokenBudget;
 constexpr uint32_t kVerifyRows = ExecutionLimits::targetVerifyRows;
 // A decode step's most rows: every lane's verify rows, packed.
 constexpr uint32_t kStepRows = kLanes * kVerifyRows;
-// The QSA selection scores a prefill chunk's rows in batches of this many,
-// which bounds its score scratch (a row scores every block of the context);
-// a verify scores every lane's rows at once.
+// The QSA selection scores a prefill chunk's rows in batches, which bounds
+// its score scratch (a row scores every block of the context): of this many
+// rows at the native window (prefillScoreRows); a verify scores every lane's
+// rows at once.
 constexpr uint32_t kPrefillScoreRows = 256;
 constexpr uint32_t kIndexWidth = BLOCK_INDEXER_HEADS * BLOCK_INDEXER_DIMENSION;
 
@@ -39,11 +40,20 @@ constexpr uint64_t kChunkBlockBytes = (kChunkRows / BLOCK_INDEXER_BLOCK + kLanes
 constexpr uint64_t kLaneBlockBytes =
     (kVerifyRows + BLOCK_INDEXER_BLOCK - 1) / BLOCK_INDEXER_BLOCK * sizeof(BlockIndexerBlock);
 
-// The words of a row's QSA bitmap: a bit per block of the context, the
-// partial block at its end and the current one included.
-uint32_t maskWords(const QwenTargetGeometry &g) { return (g.contextTokens() / BLOCK_INDEXER_BLOCK + 2 + 31) / 32; }
-// A row's scores: one per block its bitmap covers.
+// The words of a row's QSA bitmap in a window of `contextTokens`: a bit per
+// block of the context, the partial block at its end and the current one
+// included. A row's scores: one per block its bitmap covers. Both follow the
+// window the target serves.
+constexpr uint32_t maskWords(uint32_t contextTokens) { return (contextTokens / BLOCK_INDEXER_BLOCK + 2 + 31) / 32; }
+uint32_t maskWords(const QwenTargetGeometry &g) { return maskWords(g.contextTokens()); }
 uint32_t scoreStride(const QwenTargetGeometry &g) { return maskWords(g) * 32; }
+// The rows of a prefill chunk a batch of the selection scores: those whose
+// scores take the native window's kPrefillScoreRows rows' scratch, in whole
+// tiles of the score kernel, fewer at a window YaRN stretches.
+uint32_t prefillScoreRows(const QwenTargetGeometry &g) {
+  const uint64_t nativeScores = uint64_t{kPrefillScoreRows} * maskWords(g.nativeContextTokens) * 32;
+  return static_cast<uint32_t>(nativeScores / scoreStride(g) / BLOCK_INDEXER_SCORE_ROWS * BLOCK_INDEXER_SCORE_ROWS);
+}
 
 // The attention's tiles of rows, whose block masks become a block list each
 // (ops::PagedAttention::addBlockLists): a verify lane's rows, or a prefill
@@ -79,7 +89,7 @@ uint64_t keyFixedBytes(const QwenTargetGeometry &g, bool decode) {
 // A prefill chunk's or a decode step's tensors; a streamed PLE table's rows
 // are `pleRowBytes` each (zero for a table in memory).
 std::vector<Tensor> tensors(const QwenTargetGeometry &g, uint64_t pleRowBytes, bool decode) {
-  const uint32_t scoreRows = decode ? kStepRows : kPrefillScoreRows;
+  const uint32_t scoreRows = decode ? kStepRows : prefillScoreRows(g);
   std::vector<Tensor> result{
       {&Qwen4Scratch::streams, bytesFor<float>(g.streamWidth()), 0, true},
       {&Qwen4Scratch::normalized, bytesFor<uint16_t>(g.streamWidth()), 0, false},
@@ -201,7 +211,7 @@ QwenTargetScratchBytes Qwen4Steps::allocatedBytes() const noexcept {
 
 Qwen4Scratch Qwen4Steps::prefillScratch(uint32_t index) const {
   if (index >= prefillChunks_) throw std::out_of_range("Qwen3.8-Flash-Next prefill chunk");
-  Qwen4Scratch scratch{.scoreRows = kPrefillScoreRows,
+  Qwen4Scratch scratch{.scoreRows = prefillScoreRows(geometry_),
                        .scoreStride = scoreStride(geometry_),
                        .maskWords = maskWords(geometry_),
                        .listStride = listStride(geometry_)};

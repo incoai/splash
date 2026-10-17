@@ -329,7 +329,7 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, bool prefill, con
                              indexer->ropeSin, indexer->queries, indexer->keys, rows);
     BlockIndexer::addPool(graph,
                           {indexer->records, indexer->counts, indexer->laneRecords, indexer->keys, indexer->pending},
-                          {indexer->norm, true}, indexer->inverseFrequencies, rows);
+                          {indexer->norm, true}, indexer->inverseFrequencies, 1.0F, rows);
     BlockIndexer::addSelect(graph, indexer->queries, indexer->scores, indexer->scoreRows, qsa.bitmaps, rows);
   }
   if (qsa.words) {

@@ -2150,7 +2150,13 @@ are its state's (after the PLE history in a state cell,
 `QwenTargetDimensions::indexerPendingBytes`): a prefill writes them after its
 rows and at each state it captures, and a verify's commit after the rows the
 lane retained, so a block a rejected row completed is pooled again by the
-next step from the committed tokens. No page holds a raw key.
+next step from the committed tokens. No page holds a raw key. Queries and
+pooled keys rotate by the same target RoPE row (`target_rope_pair`, the
+queries' from the step's tables, a pooled key's at its block's first token),
+with YaRN's frequencies and attention factor under `--yarn-factor`. A row's
+scores and bitmap cover every block of the window the model serves; a prefill
+chunk scores its rows in batches that keep the native window's score scratch,
+256 rows at 256K, 64 at 1,010,000.
 
 A layout that keeps values token-major (`kv::Layout::valuesTokenMajor`)
 attends sparsely, on kernels compiled for 24 query heads over two KV heads

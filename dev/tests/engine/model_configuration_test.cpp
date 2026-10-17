@@ -656,7 +656,7 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
 
 } // namespace
 
-// --yarn-factor stretches either family's 262,144-token window by its factor
+// --yarn-factor stretches every family's 262,144-token window by its factor
 // (withYarn), up to four times, to at most the 1,010,000 tokens Qwen
 // validates; a family that states no YaRN window refuses it. YaRN's rotary
 // frequencies follow its reference computation (beta_fast 32, beta_slow 1),
@@ -664,8 +664,10 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
 // correction range runs from pair 14 to pair 22: below it each frequency is
 // kept, above it divided by the factor, between them blended.
 void testYarn(const std::filesystem::path &fixtures) {
-  for (const std::string_view family : {"qwen3.8-27b", "qwen3.6-35b-a3b"}) {
-    const model::ModelDescriptor native = inspect(mlxModel(fixtures, family));
+  for (const SourceModel &source :
+       {mlxModel(fixtures, "qwen3.8-27b"), mlxModel(fixtures, "qwen3.6-35b-a3b"),
+        mlxModel(fixtures, "qwen3.8-flash-next").with(&SourceModel::record, R"("mlx-affine")", R"("gguf")")}) {
+    const model::ModelDescriptor native = inspect(source);
     require(native.capabilities.maximumContextTokens == 262144 && !native.ropeScaling.yarn(),
             "a model served without YaRN has another window or a RoPE scaling");
     for (const auto [factor, window] :
