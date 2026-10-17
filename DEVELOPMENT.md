@@ -1372,8 +1372,11 @@ and lists every unsupported tensor in one error:
   Q5_0, Q5_1, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,
   IQ4_NL, MXFP4, NVFP4, PQ2_0, Q2_0, BF16 or F16;
 - token embeddings: any of the linears' formats;
-- norms, the MoE router and shared-expert scalar gate, and the GDN
-  convolution, decay and time-step bias: F32;
+- norms: F32, BF16 or F16, loaded as the F32 values they hold;
+- the MoE router: F32 or BF16, which the float projection runs as stored;
+- the shared-expert scalar gate: F32, BF16 or Q8_0, loaded as the F32 values
+  it holds;
+- the GDN convolution, decay and time-step bias: F32;
 - GDN alpha and beta: each any of the linears' formats or F32. Two of one
   quantized type other than BF16 and F16 load as one segment of the GDN input
   projection in that format; any other pair loads as one F32 tensor of the

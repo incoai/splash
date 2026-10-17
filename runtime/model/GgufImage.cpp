@@ -39,14 +39,24 @@ uint32_t imageFormat(uint32_t type) { return type == ggml::kNVFP4 ? GGUF_FMT_NVF
 
 bool quantizedType(uint32_t type) { return imageFormat(type) != GGUF_FMT_COUNT; }
 bool floatType(uint32_t type) { return type == ggml::kF32; }
-// The 16-bit float types, whose alpha/beta pairs widen to F32 (alphaBeta).
+// The 16-bit float types: a norm of one widens to F32 (floatNorm), and an
+// alpha/beta pair of them is a float tensor (alphaBeta).
 bool float16Type(uint32_t type) { return type == ggml::kBF16 || type == ggml::kF16; }
 // The token rows the embedding kernels gather: native rows of a format.
 bool embeddingType(uint32_t type) { return gguf_embedding_format(imageFormat(type)); }
 // alpha/beta run as one segment: of their format when both are of one
-// quantized type but BF16 and F16 (one repacked tensor), else F32 (one float
-// tensor).
+// quantized type but BF16 and F16 (one repacked tensor), else one float
+// tensor, of a BF16 pair's rows as stored or of F32.
 bool alphaBetaType(uint32_t type) { return quantizedType(type) || type == ggml::kF32; }
+// A vector the kernels read as F32 (floatNorm): F32, or a 16-bit float type
+// that widens to it.
+bool normType(uint32_t type) { return floatType(type) || float16Type(type); }
+// A tensor the float projection runs in fp32 (floatTensor): F32, or BF16 as
+// stored.
+bool floatProjectionType(uint32_t type) { return floatType(type) || type == ggml::kBF16; }
+// A tensor of F32 rows (floatRows): F32, or BF16 or Q8_0, which widen or
+// decode to it.
+bool floatRowType(uint32_t type) { return floatProjectionType(type) || type == ggml::kQ8_0; }
 
 // A repack of a [rows, columns] tensor in format, of no image section yet;
 // throws unless the shape is whole plane tiles.
@@ -69,10 +79,15 @@ public:
           std::string name, uint32_t layer, uint32_t type)
       : file_(file), geometry_(geometry), problems_(problems), image_(std::move(name), layer, type) {}
 
-  // A norm as stored: F32, which the norm kernels read unrounded, as
-  // llama.cpp does (ops::NormWeights).
+  // A norm the kernels read as F32 unrounded, as llama.cpp does
+  // (ops::NormWeights): as stored, or the F32 values a BF16 or F16 one widens
+  // to exactly.
   void floatNorm(const std::string &name, uint64_t elements) {
-    if (const GgufTensor *tensor = floatVector(name, elements)) image_.copy(tensorRows(*tensor, 1, tensor->bytes));
+    const GgufTensor *tensor = find(name, normType);
+    if (!tensor) return;
+    if (tensor->elements() != elements) throw GgufError("unexpected shape for " + name);
+    image_.copy(tensorRows(*tensor, 1, tensor->bytes),
+                floatType(tensor->type) ? Conversion::None : Conversion::WidenToFloat32);
   }
 
   // Quantized rows [N, K] repacked into planes, rows in `order`.
@@ -118,10 +133,11 @@ public:
 
   // beta (value heads rows) | alpha (value heads rows), rows in grouped head
   // order: one tensor of their format padded with zero rows to whole plane
-  // tiles when both are of one quantized type, else one F32 tensor of the
-  // values each holds: F32 as stored, any other type decoded, all exactly. A
-  // pair of BF16 or F16 is one F32 tensor too: a float segment reads the
-  // input unrotated
+  // tiles when both are of one quantized type, else one float tensor of the
+  // values each holds, all exactly: a BF16 pair as stored (the float
+  // projection reads BF16 weights as it reads their F32 values), any other
+  // pair as F32, F32 as stored and any other type decoded. A pair of BF16 or
+  // F16 is a float tensor too: a float segment reads the input unrotated
   // (requireRotation), as Prism's BF16 alpha/beta need, and leaves the GDN
   // input projection on Apple9's register tile, which takes no F16.
   void alphaBeta(const std::string &betaName, const std::string &alphaName) {
@@ -132,11 +148,13 @@ public:
       if (t->rows() != heads || t->columns() != hidden)
         throw GgufError("alpha/beta must be [" + std::to_string(heads) + ", hidden]: " + t->name);
     if (beta->type != alpha->type || !quantizedType(beta->type) || float16Type(beta->type)) {
-      const uint64_t rowBytes = uint64_t{hidden} * sizeof(float);
-      image_.descriptor(ggml::kF32, 2ull * heads, hidden, {}, {2 * heads * rowBytes, 0, 0}, betaName);
+      const bool bfloat16 = beta->type == ggml::kBF16 && alpha->type == ggml::kBF16;
+      const uint64_t rowBytes = uint64_t{hidden} * (bfloat16 ? sizeof(uint16_t) : sizeof(float));
+      image_.descriptor(bfloat16 ? ggml::kBF16 : ggml::kF32, 2ull * heads, hidden, {}, {2 * heads * rowBytes, 0, 0},
+                        betaName);
       uint64_t destination = image_.section(2 * heads * rowBytes);
       for (const GgufTensor *t : {beta, alpha}) {
-        if (quantizedType(t->type)) {
+        if (quantizedType(t->type) && !bfloat16) {
           const uint64_t native = ggufRowBytes(kQuantFormats[imageFormat(t->type)], hidden);
           image_.copyAt(destination, tensorRows(*t, heads, native, grouped(0, 1)), Conversion::DequantizeToFloat32);
         } else {
@@ -177,18 +195,41 @@ public:
     if (!tensor) return;
     if (tensor->rows() != geometry_.vocabularySize || tensor->columns() != geometry_.hiddenSize)
       throw GgufError("unexpected shape for " + name);
-    copiedRows(*tensor);
+    copiedRows(*tensor, nativeRowBytes(*tensor));
   }
 
-  // An F32 tensor [rows, columns] as stored (the MoE router and the
-  // shared-expert scalar gate, which llama.cpp keeps unquantized).
+  // An F32 or BF16 tensor [rows, columns] as stored, which the float
+  // projection runs in fp32 (the MoE router, which llama.cpp keeps
+  // unquantized and some GGUFs store as BF16).
   void floatTensor(const std::string &name, uint64_t rows, uint64_t columns) {
-    const GgufTensor *tensor = find(name, floatType);
+    const GgufTensor *tensor = find(name, floatProjectionType);
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns)
-      throw GgufError("expected an F32 [" + std::to_string(rows) + ", " + std::to_string(columns) +
+      throw GgufError("expected an F32 or BF16 [" + std::to_string(rows) + ", " + std::to_string(columns) +
                       "] tensor: " + name);
-    copiedRows(*tensor);
+    // Rows of values as stored, never BF16's native rows: a row need not be
+    // whole blocks of 256 values.
+    copiedRows(*tensor, columns * (tensor->type == ggml::kBF16 ? sizeof(uint16_t) : sizeof(float)));
+  }
+
+  // An F32, BF16 or Q8_0 tensor [rows, columns] as F32 rows: as stored, or
+  // the F32 values BF16 widens to and Q8_0 decodes to exactly (the MoE
+  // shared-expert scalar gate, which the select kernel reads).
+  // withDescriptor makes it a float tensor a projection or the MoE block
+  // reads, else it is its rows alone.
+  void floatRows(const std::string &name, uint64_t rows, uint64_t columns, bool withDescriptor) {
+    const GgufTensor *tensor = find(name, floatRowType);
+    if (!tensor) return;
+    if (tensor->rows() != rows || tensor->columns() != columns)
+      throw GgufError("expected an F32, BF16 or Q8_0 [" + std::to_string(rows) + ", " + std::to_string(columns) +
+                      "] tensor: " + name);
+    const bool widen = tensor->type == ggml::kBF16, dequantize = tensor->type == ggml::kQ8_0;
+    if (withDescriptor)
+      image_.descriptor(ggml::kF32, rows, columns, {}, {rows * columns * sizeof(float), 0, 0}, name);
+    image_.copy(tensorRows(*tensor, rows, tensor->bytes / rows),
+                widen        ? Conversion::WidenToFloat32
+                : dequantize ? Conversion::DequantizeToFloat32
+                             : Conversion::None);
   }
 
   // Value heads of headRows rows from row `from` on, in grouped order.
@@ -253,12 +294,14 @@ private:
     return rows;
   }
 
-  // A tensor's rows as the image holds them (tensorRows), after their
-  // descriptor.
-  void copiedRows(const GgufTensor &tensor) {
-    const uint64_t rowBytes = quantizedType(tensor.type)
-                                  ? ggufRowBytes(kQuantFormats[imageFormat(tensor.type)], tensor.columns())
-                                  : tensor.bytes / tensor.rows();
+  // The bytes of a row of a tensor's native blocks.
+  static uint64_t nativeRowBytes(const GgufTensor &tensor) {
+    return ggufRowBytes(kQuantFormats[imageFormat(tensor.type)], tensor.columns());
+  }
+
+  // A tensor's rows as the image holds them (tensorRows), rowBytes each,
+  // after their descriptor.
+  void copiedRows(const GgufTensor &tensor, uint64_t rowBytes) {
     const TensorRows rows = tensorRows(tensor, tensor.rows(), rowBytes);
     image_.descriptor(rows.type, tensor.rows(), tensor.columns(), {}, {rows.rows * rows.rowBytes, 0, 0}, tensor.name);
     image_.copy(rows);
@@ -308,7 +351,7 @@ Image layerImage(const GgufFile &file, const QwenTargetDimensions &g, std::vecto
     b.quantized(p + "ffn_gate_shexp.weight", width, g.hiddenSize);
     b.quantized(p + "ffn_up_shexp.weight", width, g.hiddenSize);
     b.quantized(p + "ffn_down_shexp.weight", g.hiddenSize, width);
-    b.floatTensor(p + "ffn_gate_inp_shexp.weight", 1, g.hiddenSize);
+    b.floatRows(p + "ffn_gate_inp_shexp.weight", 1, g.hiddenSize, true);
   } else {
     b.quantized(p + "ffn_gate.weight", g.intermediateSize, g.hiddenSize);
     b.quantized(p + "ffn_up.weight", g.intermediateSize, g.hiddenSize);
@@ -319,9 +362,10 @@ Image layerImage(const GgufFile &file, const QwenTargetDimensions &g, std::vecto
 
 // A rotated GGUF (GgufRotation) must name exactly what the loader rotates:
 // every tensor the images of a dense target repack, whose segments read
-// H (D x) (ops::InputRotation) while float segments (alpha/beta in F32) read
-// x as it is, and the token table, which the rotated gather decodes from
-// PQ2_0 rows, with the GDN value heads of the rotated inputs grouped.
+// H (D x) (ops::InputRotation) while float segments (alpha/beta as one float
+// tensor) read x as it is, and the token table, which the rotated gather
+// decodes from PQ2_0 rows, with the GDN value heads of the rotated inputs
+// grouped.
 void requireRotation(const GgufFile &file, const QwenTargetDimensions &g, const std::vector<Image> &images) {
   const GgufRotation &rotation = *file.rotation();
   if (g.ffnKind == QwenFfnKind::SparseMoe) throw GgufError("rotated weights are supported for dense targets only");

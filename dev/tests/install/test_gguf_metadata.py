@@ -440,9 +440,17 @@ class GgufMetadataTests(unittest.TestCase):
         tensors |= {"blk.5.ffn_gate_exps.weight": GGML["BF16"]}
         tensors |= {"blk.5.ssm_alpha.weight": GGML["F16"]}
         tensors |= {"blk.5.ssm_beta.weight": GGML["F16"]}
-        # llama.cpp's Q2_0 (type 42), one d per 64 weights, as some GGUFs
-        # store their experts.
+        # 16-bit floats where the loader reads floats, as ISTA-DASLab's GGUFs
+        # store them: a BF16 router, which the float projection runs as
+        # stored, and a BF16 shared-expert scalar gate and BF16 and F16 norms,
+        # which preparation widens to F32; and their Q2_0 experts.
+        tensors |= {"blk.1.ffn_gate_inp.weight": GGML["BF16"]}
+        tensors |= {"blk.1.ffn_gate_inp_shexp.weight": GGML["BF16"]}
+        tensors |= {"blk.2.attn_norm.weight": GGML["F16"]}
+        tensors |= {"output_norm.weight": GGML["BF16"]}
         tensors |= {"blk.1.ffn_down_exps.weight": GGML["Q2_0"]}
+        # A Q8_0 shared-expert scalar gate, which preparation decodes to F32.
+        tensors |= {"blk.2.ffn_gate_inp_shexp.weight": GGML["Q8_0"]}
         path = write_gguf(self.root / "ok.gguf", values, tensors.items())
         gguf.require_loadable(gguf.Metadata(path, tensors=True))
         for changes, reason in (
@@ -462,14 +470,16 @@ class GgufMetadataTests(unittest.TestCase):
                 {"blk.7.ffn_gate_up_exps.weight": GGML["F32"]},
                 "ffn_gate_up_exps.weight F32 [(]1 tensor[)]",
             ),
-            # F32 only where the loader reads floats: not a projection, not
-            # a quantized router or norm.
+            # Floats only where the loader reads floats: not a projection, an
+            # F32 or BF16 router and an F32, BF16 or F16 norm, never a
+            # quantized one.
             ({"blk.3.attn_q.weight": GGML["F32"]}, "attn_q.weight F32"),
             (
                 {"blk.0.ffn_gate_inp.weight": GGML["Q8_0"]},
                 "ffn_gate_inp.weight Q8_0",
             ),
-            ({"output_norm.weight": GGML["F16"]}, "output_norm.weight F16"),
+            ({"blk.0.ffn_gate_inp.weight": GGML["F16"]}, "ffn_gate_inp.weight F16"),
+            ({"output_norm.weight": GGML["Q8_0"]}, "output_norm.weight Q8_0"),
             (
                 {
                     "blk.1.ssm_alpha.weight": GGML["TQ2_0"],

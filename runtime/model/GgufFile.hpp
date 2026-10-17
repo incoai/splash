@@ -31,7 +31,7 @@ public:
 // rest are looked up in kGgmlTypes. llama.cpp's NVFP4 (kNVFP4) loads into
 // the NVFP4 format's native rows (model/GgufImage.cpp, imageFormat).
 namespace ggml {
-inline constexpr uint32_t kF32 = 0, kF16 = 1, kBF16 = 30, kNVFP4 = 40, kPQ2_0 = 142;
+inline constexpr uint32_t kF32 = 0, kF16 = 1, kQ8_0 = 8, kBF16 = 30, kNVFP4 = 40, kPQ2_0 = 142;
 }
 
 struct GgmlTypeTraits {

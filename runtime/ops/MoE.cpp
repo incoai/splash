@@ -30,6 +30,8 @@ void validate(const BlockMoeWeights &weights, MoeShape shape) {
   requireSegment(weights.router, shape.experts, hidden, true, "MoE router");
   requireSegment(weights.sharedScalarGate, 1, hidden, true, "MoE shared scalar gate");
   // The select kernel reads the scalar gate's fp32 weights.
+  if (weights.sharedScalarGate.formatId != QuantizedSegment::kFloat32)
+    throw std::invalid_argument("the MoE shared scalar gate is not F32");
   requireBytes(weights.sharedScalarGate.plane0, uint64_t{hidden} * sizeof(float), "MoE shared scalar gate weight");
   for (const auto &[projection, name, output, input] :
        {std::tuple{&weights.gate, "gate", intermediate, hidden}, std::tuple{&weights.up, "up", intermediate, hidden},

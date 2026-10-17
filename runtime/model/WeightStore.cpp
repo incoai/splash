@@ -116,12 +116,16 @@ GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label
 
 ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view label) {
     const GgufTensorDescriptor d = readGgufDescriptor(file, label);
-    if (d.type == ggml::kF32) {
+    // A float tensor's rows as stored, which no meta unit describes: F32, or
+    // BF16 (a MoE router a GGUF stores so; a repacked BF16 tensor has planes).
+    if (d.type == ggml::kF32 || (d.type == ggml::kBF16 && !d.metaGroups)) {
+        const bool bfloat16 = d.type == ggml::kBF16;
         if (d.p0 || d.p1 || d.metaBytes || d.metaGroups || d.plane1Bytes || d.metaTotalBytes ||
-            d.plane0Bytes != uint64_t{d.outputSize} * d.inputSize * sizeof(float))
+            d.plane0Bytes != uint64_t{d.outputSize} * d.inputSize * (bfloat16 ? sizeof(uint16_t) : sizeof(float)))
             throw WeightStoreError("GGUF float section sizes are inconsistent: " + std::string(label));
-        return ops::QuantizedSegment::floats(d.outputSize, d.inputSize,
-                                             file.section(d.plane0Bytes, std::string(label) + "-floats"));
+        return ops::QuantizedSegment::floats(
+            d.outputSize, d.inputSize, file.section(d.plane0Bytes, std::string(label) + "-floats"),
+            bfloat16 ? ops::QuantizedSegment::kBFloat16 : ops::QuantizedSegment::kFloat32);
     }
     const uint32_t format = gguf_format_of(d.type);
     if (format == GGUF_FMT_COUNT)

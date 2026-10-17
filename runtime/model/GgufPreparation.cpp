@@ -207,6 +207,11 @@ void quantizeRows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, 
   }
 }
 
+// The float the bits of a BF16 or, with float16, an F16 value hold.
+float widenFloat16(uint16_t bits, bool float16) {
+  return float16 ? static_cast<float>(std::bit_cast<__fp16>(bits)) : widenBfloat16(bits);
+}
+
 // Native NVFP4 bytes [column, column + span) of `count` rows of llama.cpp's
 // NVFP4 from source row `start` on, back to back: per 256 elements the 16
 // UE4M3 scales of four block_nvfp4 as the E4M3 scales they are (llama.cpp
@@ -282,12 +287,12 @@ void narrowToBfloat16(const uint8_t *values, uint64_t count, uint8_t *to, const 
   }
 }
 
-// Writes the F32 values `count` BF16 values equal.
-void widenToFloat32(const uint8_t *values, uint64_t count, uint8_t *to) {
+// Writes the F32 values `count` BF16 (or, with float16, F16) values equal.
+void widenToFloat32(const uint8_t *values, uint64_t count, bool float16, uint8_t *to) {
   for (uint64_t i = 0; i < count; ++i) {
-    uint16_t value;
-    std::memcpy(&value, values + 2 * i, 2);
-    const uint32_t widened = uint32_t{value} << 16;
+    uint16_t bits;
+    std::memcpy(&bits, values + 2 * i, 2);
+    const float widened = widenFloat16(bits, float16);
     std::memcpy(to + 4 * i, &widened, 4);
   }
 }
@@ -338,7 +343,9 @@ void addCopyTasks(uint8_t *image, const gguf::Copy &copy,
         case gguf::Conversion::NarrowToBfloat16:
           narrowToBfloat16(staging.data(), count * width / 4, to, rows.name);
           break;
-        case gguf::Conversion::WidenToFloat32: widenToFloat32(staging.data(), count * width / 2, to); break;
+        case gguf::Conversion::WidenToFloat32:
+          widenToFloat32(staging.data(), count * width / 2, rows.type == ggml::kF16, to);
+          break;
         case gguf::Conversion::CenteredNorm: centeredNorm(staging.data(), count * width / 2, to); break;
         case gguf::Conversion::Decay: {
           const bool bfloat16 = rows.type == ggml::kBF16;
