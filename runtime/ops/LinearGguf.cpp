@@ -34,9 +34,9 @@ std::string prefillKernel(const char *format, char epilogue) {
 // K splits of a decode tile, one rule for both tiles. A tier asks for more
 // partitions while the grid holds fewer than `threadgroups` threadgroups per
 // core and each partition would still keep `inputs` inputs; the split count
-// doubles, up to the maximum, while some tier asks. Decode K is a multiple of 256,
-// so eight partitions always hold whole 32-input groups. The rule ignores the
-// batch width: bounds that depended on it did not pay on either family.
+// doubles, up to the maximum and in whole 32-input groups per partition, while
+// some tier asks. The rule ignores the batch width: bounds that depended on it
+// did not pay on either family.
 struct SplitTier {
   uint32_t threadgroups;
   uint32_t inputs;
@@ -47,7 +47,9 @@ uint32_t decodeSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const Sp
   const auto asks = [&](const SplitTier &t) {
     return grid * splits < uint64_t{t.threadgroups} * cores && k / (2 * splits) >= t.inputs;
   };
-  while (splits < LinearConfig::kMaximumSplits && std::any_of(tiers.begin(), tiers.end(), asks)) splits *= 2;
+  while (splits < LinearConfig::kMaximumSplits && (k / 32) % (2 * splits) == 0 &&
+         std::any_of(tiers.begin(), tiers.end(), asks))
+    splits *= 2;
   return splits;
 }
 
@@ -116,8 +118,8 @@ bool oneFormat(std::span<const Projection *const> projections) {
 // four, and on Q2_K 24-33% less at two and four lanes but 5-8% more at one.
 // Three lanes pad its 24 rows to 32, where it takes 16-47% more for every
 // format; the other formats keep the register tile, 6-44% faster at one lane.
-// A segment in a format the register tile cannot take (quant_register_format)
-// stages the plan whatever its rows.
+// A segment the register tile cannot take (quant_register_tensor) stages the
+// plan whatever its rows.
 bool apple9Stages(LinearWorkload w, std::span<const Projection *const> projections) {
   const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
   bool quantized = false, faster = true;
@@ -125,7 +127,7 @@ bool apple9Stages(LinearWorkload w, std::span<const Projection *const> projectio
     if (!p) continue;
     for (const QuantizedSegment &s : p->blocks().segments) {
       if (s.isFloat()) continue;
-      if (!quant_register_format(s.formatId)) return true;
+      if (!quant_register_tensor(s.formatId, s.inputSize)) return true;
       faster &= apple9StagesFormat(s.formatId) || (s.formatId == GGUF_FMT_Q2K && lanes >= 2);
       quantized = true;
     }
@@ -503,8 +505,9 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
   for (const Projection *q : {&p, gate})
     if (q)
       for (const QuantizedSegment &s : q->blocks().segments)
-        if (!quant_register_format(s.formatId))
-          throw std::invalid_argument(std::string("the register tile does not take ") + s.name() + " weights");
+        if (!quant_register_tensor(s.formatId, s.inputSize))
+          throw std::invalid_argument(std::string("the register tile does not take ") + s.name() + " weights of " +
+                                      std::to_string(s.inputSize) + " inputs");
   if (b.prepared.layout != LinearInput::Table16 || !b.prepared.source.sameView(b.input))
     graph.add("decode_linear_gguf_prepare", {b.input, b.scratch.input, b.scratch.sums}, k,
               {k / 32, lanes, 1}, {128, 1, 1});

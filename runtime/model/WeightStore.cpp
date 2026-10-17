@@ -126,10 +126,10 @@ ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view la
     const uint32_t format = gguf_format_of(d.type);
     if (format == GGUF_FMT_COUNT)
         throw WeightStoreError("unsupported GGUF tensor type " + std::to_string(d.type));
-    // Quantized planes fill whole tiles; float tensors are rows as stored.
-    if (d.outputSize % QUANT_TILE_ROWS || d.inputSize % kGgufBlockColumns)
-        throw WeightStoreError("GGUF tensor shape is not tile aligned: " + std::string(label));
     const QuantFormat &layout = kQuantFormats[format];
+    // Quantized planes fill whole tiles; float tensors are rows as stored.
+    if (d.outputSize % QUANT_TILE_ROWS || d.inputSize % ggufColumnUnit(layout))
+        throw WeightStoreError("GGUF tensor shape is not tile aligned: " + std::string(label));
     const GgufPlaneBytes planes = ggufPlaneBytes(layout, d.outputSize, d.inputSize);
     if (d.p0 != layout.plane0_bytes || d.p1 != layout.plane1_bytes ||
         d.metaBytes != layout.meta_bytes || d.metaGroups != layout.meta_groups ||

@@ -16,14 +16,16 @@
 
 namespace splash::model {
 
-// The single .gguf in a target directory (shards are not supported).
-[[nodiscard]] std::filesystem::path findTargetGguf(const std::filesystem::path &directory);
+// The .gguf files of a target directory: its one GGUF, or every part of a
+// split one (NAME-0000K-of-0000N.gguf, K = 1..N) in split order.
+[[nodiscard]] std::vector<std::filesystem::path> findTargetGgufs(const std::filesystem::path &directory);
 
 class GgufTargetLoader final {
 public:
-  // Plans every image from the GGUF's metadata once.
-  GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images, const std::filesystem::path &path,
-                   const QwenTargetDimensions &geometry);
+  // Plans every image from the GGUF's metadata once: of its one file, or of
+  // every part of a split one in split order (findTargetGgufs).
+  GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
+                   const std::vector<std::filesystem::path> &paths, const QwenTargetDimensions &geometry);
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
 
@@ -35,10 +37,10 @@ public:
   [[nodiscard]] const std::optional<GgufRotation> &rotation() const noexcept { return rotation_; }
 
 private:
-  // The GGUF and its images, which their writers share.
+  // The GGUF's files and its images, which their writers share.
   struct Planned {
-    explicit Planned(const std::filesystem::path &path) : source(path) {}
-    WeightSource source;
+    explicit Planned(const std::vector<std::filesystem::path> &paths) : source(paths) {}
+    OpenGguf source;
     std::vector<gguf::Image> images; // layers, head, embedding
   };
   [[nodiscard]] WeightFile open(size_t index);

@@ -143,7 +143,7 @@ class UpstreamTest(unittest.TestCase):
         ):
             upstream.check_model("mlx-affine", "none", config)
 
-    def test_gguf_selection_is_exact_and_ignores_subfolders(self):
+    def test_gguf_selection_is_exact_and_takes_split_variant_folders(self):
         files = {
             "Qwen3.8-27B-UD-Q4_K_M.gguf",
             "Qwen3.8-27B-Q4_0.gguf",
@@ -155,20 +155,20 @@ class UpstreamTest(unittest.TestCase):
         }
         self.assertEqual(
             upstream.select_gguf(files, "UD-Q4_K_M"),
-            ("Qwen3.8-27B-UD-Q4_K_M.gguf", False),
+            (["Qwen3.8-27B-UD-Q4_K_M.gguf"], False),
         )
         self.assertEqual(
-            upstream.select_gguf(files, "q4_0"), ("Qwen3.8-27B-Q4_0.gguf", False)
+            upstream.select_gguf(files, "q4_0"), (["Qwen3.8-27B-Q4_0.gguf"], False)
         )
         # Q4_K_M names the plain file; without one, the one file ending so,
         # which the caller reports, and never one of several.
         both = files | {"Qwen3.8-27B-Q4_K_M.gguf"}
         self.assertEqual(
-            upstream.select_gguf(both, "Q4_K_M"), ("Qwen3.8-27B-Q4_K_M.gguf", False)
+            upstream.select_gguf(both, "Q4_K_M"), (["Qwen3.8-27B-Q4_K_M.gguf"], False)
         )
         self.assertEqual(
             upstream.select_gguf(files, "Q4_K_M"),
-            ("Qwen3.8-27B-UD-Q4_K_M.gguf", True),
+            (["Qwen3.8-27B-UD-Q4_K_M.gguf"], True),
         )
         with self.assertRaisesRegex(
             models.ModelError,
@@ -179,16 +179,41 @@ class UpstreamTest(unittest.TestCase):
         # A projector is never a target, however its publisher names it.
         self.assertEqual(
             upstream.select_gguf({"Model-PQ2_0.gguf", "Model-mmproj-BF16.gguf"}, None),
-            ("Model-PQ2_0.gguf", False),
+            (["Model-PQ2_0.gguf"], False),
         )
+        # A variant no root file names may be a folder of a split GGUF's
+        # parts, which must all be present.
+        self.assertEqual(
+            upstream.select_gguf(
+                files | {"BF16/Qwen3.8-27B-BF16-00002-of-00002.gguf"}, "BF16"
+            ),
+            (
+                [
+                    "BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf",
+                    "BF16/Qwen3.8-27B-BF16-00002-of-00002.gguf",
+                ],
+                False,
+            ),
+        )
+        with self.assertRaisesRegex(models.ModelError, "incomplete"):
+            upstream.select_gguf(files, "BF16")
+        # Two files of one part number are not one GGUF's parts.
+        parts = {
+            "BF16/Qwen3.8-27B-BF16-00002-of-00002.gguf",
+            "BF16/Qwen3.8-27B-BF16-copy-00001-of-00002.gguf",
+        }
+        with self.assertRaisesRegex(
+            models.ModelError, "are both part 1 of the split GGUF in BF16/"
+        ):
+            upstream.select_gguf(files | parts, "BF16")
         # A repository of one GGUF has no shared name to strip, and needs no
         # variant.
         for variant in ("UD-Q4_K_M", "Q4_K_M", None):
             self.assertEqual(
                 upstream.select_gguf({"Qwen3.8-27B-UD-Q4_K_M.gguf"}, variant),
-                ("Qwen3.8-27B-UD-Q4_K_M.gguf", False),
+                (["Qwen3.8-27B-UD-Q4_K_M.gguf"], False),
             )
-        for variant in (None, "Q4", "BF16", "missing"):
+        for variant in (None, "Q4", "missing"):
             with (
                 self.subTest(variant=variant),
                 self.assertRaisesRegex(models.ModelError, "Qwen3.8-27B-Q8_0.gguf"),

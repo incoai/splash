@@ -389,7 +389,7 @@ RepackChunk repackChunk(const gguf::Repack &repack) {
 // shape, sources of its row width and planes inside the image.
 void requireRepack(const gguf::Repack &repack, uint64_t imageBytes) {
   if (repack.format >= GGUF_FMT_COUNT || !repack.rows || repack.rows % QUANT_TILE_ROWS || !repack.columns ||
-      repack.columns % kGgufBlockColumns)
+      repack.columns % ggufColumnUnit(kQuantFormats[repack.format]))
     throw GgufError("invalid prepared weight repack");
   const QuantFormat &format = kQuantFormats[repack.format];
   const uint64_t rowBytes = ggufRowBytes(format, repack.columns);
@@ -462,8 +462,12 @@ void writeRepack(metal::MetalBackend &backend, const metal::MetalBuffer &image, 
       params.src_row_bytes = static_cast<uint32_t>(chunkRowBytes);
       params.dst_plane1 = lengths[1] ? static_cast<uint32_t>(at[1] - at[0]) : 0;
       params.dst_meta = static_cast<uint32_t>(at[2] - at[0]);
+      // One thread per row and 32-column group, rounded up to whole
+      // threadgroups: an odd number of 64-row tiles by an odd number of
+      // 64-column spans leaves half a threadgroup, which the kernel bounds.
+      const uint64_t items = rows * (columns / 32);
       static_cast<void>(backend.submit({"gguf_repack", {{0, input}, {1, backend.view(image, at[0], extent)}},
-                                        {{2, &params, sizeof(params)}}, {rows * (columns / 32) / 256, 1, 1},
+                                        {{2, &params, sizeof(params)}}, {(items + 255) / 256, 1, 1},
                                         {256, 1, 1}}));
     }
   }
