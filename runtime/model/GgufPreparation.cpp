@@ -45,12 +45,14 @@ void requireRange(uint64_t offset, uint64_t bytes, uint64_t available) {
 
 // How readRows reads a tensor's rows: as stored, or as its format's native
 // rows, which it builds from a quantized safetensors tensor's tensors, from
-// llama.cpp's NVFP4 rows, or by quantizing a BF16 weight.
-enum class RowReader : uint8_t { Stored, Safetensors, GgufNvfp4, QuantizedBfloat16 };
+// llama.cpp's NVFP4 rows, or by quantizing a BF16 weight (into af4g64) or a
+// GGUF tensor of BF16 or F16 values (into Q8_0).
+enum class RowReader : uint8_t { Stored, Safetensors, GgufNvfp4, QuantizedBfloat16, QuantizedGgufFloat };
 RowReader rowReader(const gguf::TensorRows &rows) {
   if (rows.safetensors.codes) return RowReader::Safetensors;
   if (rows.ggufNvfp4RowBytes) return RowReader::GgufNvfp4;
   if (rows.safetensors.bfloat16) return RowReader::QuantizedBfloat16;
+  if (rows.ggufFloatRowBytes) return RowReader::QuantizedGgufFloat;
   return RowReader::Stored;
 }
 
@@ -207,9 +209,61 @@ void quantizeRows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, 
   }
 }
 
+// The values of a block_q8_0.
+constexpr uint32_t kQ8_0BlockValues = kQuantFormats[GGUF_FMT_Q80].block_elements;
+
 // The float the bits of a BF16 or, with float16, an F16 value hold.
 float widenFloat16(uint16_t bits, bool float16) {
   return float16 ? static_cast<float>(std::bit_cast<__fp16>(bits)) : widenBfloat16(bits);
+}
+
+// A block's values as llama.cpp's quantize_row_q8_0_ref writes them into a
+// block_q8_0, as llama-quantize makes Q8_0: d = max |x| / 127, stored as the
+// nearest fp16, and each q = roundf(x * (1 / d)) of the unrounded d (0 when
+// d is 0), halves away from zero. A value or a d fp16 does not hold is
+// refused.
+void quantizeQ8_0Block(const float *values, uint8_t *block, const std::string &name) {
+  float maximum = 0.0F;
+  bool finite = true;
+  for (uint32_t i = 0; i < kQ8_0BlockValues; ++i) {
+    finite &= std::isfinite(values[i]);
+    maximum = std::max(maximum, std::fabs(values[i]));
+  }
+  const float d = maximum / 127, inverse = d != 0.0F ? 1.0F / d : 0.0F;
+  const __fp16 scale = static_cast<__fp16>(d);
+  if (!finite || !std::isfinite(static_cast<float>(scale)))
+    throw GgufError(name + " holds a value Q8_0 cannot hold");
+  std::memcpy(block, &scale, 2);
+  for (uint32_t i = 0; i < kQ8_0BlockValues; ++i)
+    block[2 + i] = static_cast<uint8_t>(static_cast<int8_t>(std::round(values[i] * inverse)));
+}
+
+// Native Q8_0 bytes [column, column + span) of `count` rows of a GGUF tensor
+// of BF16 or F16 values from source row `start` on, back to back, each 32
+// values quantized as quantizeQ8_0Block rounds them. One read per run of rows
+// when they are read whole, else per row.
+void quantizeQ8_0Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, uint64_t column, uint64_t span,
+                      uint8_t *to) {
+  const QuantFormat &format = kQuantFormats[GGUF_FMT_Q80];
+  if (column % format.block_bytes || span % format.block_bytes)
+    throw GgufError("Q8_0 rows are built by whole blocks: " + rows.name);
+  const bool float16 = rows.ggufFloatType == ggml::kF16;
+  const uint64_t perRead = span == rows.rowBytes ? count : 1, blocks = span / format.block_bytes;
+  std::vector<uint8_t> source(perRead * blocks * format.block_elements * 2);
+  std::vector<float> values(source.size() / 2);
+  for (uint64_t row = 0; row < count; row += perRead) {
+    rows.file->readData(rows.offset + (start + row) * rows.ggufFloatRowBytes +
+                            column / format.block_bytes * format.block_elements * 2,
+                        source);
+    for (size_t i = 0; i < values.size(); ++i) {
+      uint16_t bits;
+      std::memcpy(&bits, source.data() + 2 * i, 2);
+      values[i] = widenFloat16(bits, float16);
+    }
+    for (uint64_t b = 0; b < perRead * blocks; ++b)
+      quantizeQ8_0Block(values.data() + b * format.block_elements, to + row * span + b * format.block_bytes,
+                        rows.name);
+  }
 }
 
 // Native NVFP4 bytes [column, column + span) of `count` rows of llama.cpp's
@@ -270,6 +324,7 @@ void readRows(const gguf::TensorRows &rows, uint64_t first, uint64_t count, uint
     case RowReader::Safetensors: readSafetensorsRows(rows, start, run, column, span, out); break;
     case RowReader::GgufNvfp4: readGgufNvfp4Rows(rows, start, run, column, span, out); break;
     case RowReader::QuantizedBfloat16: quantizeRows(rows, start, run, column, span, out); break;
+    case RowReader::QuantizedGgufFloat: quantizeQ8_0Rows(rows, start, run, column, span, out); break;
     }
     row += run;
   }

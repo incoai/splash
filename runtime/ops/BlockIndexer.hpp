@@ -3,7 +3,7 @@
 // The block indexer of a block-sparse attention (Qwen3.8-Flash-Next's QSA,
 // for one), which picks the blocks a full-attention layer's rows attend
 // (kernels/shared/block_indexer.metal). Its projections run through
-// ops::Linear.
+// ops::Linear; a target composes them (model/Qwen4ExpTarget.cpp).
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/BlockIndexer.h"

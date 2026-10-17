@@ -1,17 +1,18 @@
 #pragma once
 
-// Plans the images (model/GgufImageLayout.hpp) of a Qwen3.8 (qwen35)
-// or Qwen3.6 MoE (qwen35moe) target read straight from a llama.cpp GGUF, from
-// its metadata alone: section offsets, the header and descriptor bytes, and
-// the source rows each tensor section is written from
-// (model/GgufPreparation.hpp). A 3-D expert tensor is one quantized tensor of
-// experts * N rows.
+// Plans the images (model/GgufImageLayout.hpp) of a target read straight
+// from a llama.cpp GGUF of its family's architecture (each layout's
+// ggufArchitecture: qwen35, qwen35moe or qwen4exp), from its metadata alone:
+// section offsets, the header and descriptor bytes, and the source rows each
+// tensor section is written from (model/GgufPreparation.hpp). A 3-D expert
+// tensor is one quantized tensor of experts * N rows.
 
 #include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "model/GgufFile.hpp"
@@ -23,11 +24,6 @@ namespace splash::model::gguf {
 // `rows` rows and the zero rows that pad them to whole plane tiles.
 [[nodiscard]] constexpr uint64_t tiledRows(uint64_t rows) noexcept {
   return (rows + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS * QUANT_TILE_ROWS;
-}
-
-// The general.architecture of a GGUF of a target with this FFN.
-[[nodiscard]] constexpr const char *architecture(QwenFfnKind ffn) noexcept {
-  return ffn == QwenFfnKind::SparseMoe ? "qwen35moe" : "qwen35";
 }
 
 // The order of a tensor's rows in the image. Rows below `from` keep their
@@ -77,9 +73,11 @@ struct TensorScale {
 // Rows [first, first + rows) of one source tensor in image order, read from
 // `file`: rows of rowBytes bytes at `offset` of its tensor data, or its
 // format's native rows, which the writer builds from a quantized safetensors
-// tensor's tensors (safetensors.codes or safetensors.bfloat16 set) or from
+// tensor's tensors (safetensors.codes or safetensors.bfloat16 set), from
 // llama.cpp's NVFP4 rows (ggufNvfp4RowBytes set: rows of block_nvfp4 that long
-// from `offset` on).
+// from `offset` on) or by quantizing a GGUF tensor of BF16 or F16 values into
+// Q8_0 (ggufFloatRowBytes set: rows of ggufFloatType values that long from
+// `offset` on).
 struct TensorRows {
   std::string name;
   uint32_t type = 0;   // ggml type, or a loader's (metal/abi/QuantFormat.h)
@@ -91,6 +89,8 @@ struct TensorRows {
   SafetensorsSource safetensors{};
   TensorScale scale{};
   uint64_t ggufNvfp4RowBytes = 0;
+  uint32_t ggufFloatType = 0;
+  uint64_t ggufFloatRowBytes = 0;
   uint64_t first = 0; // the source row of image row 0
 };
 
@@ -107,10 +107,10 @@ struct Fill {
 // native rows, which the GPU decodes as the format's gather does
 // (kernels/common/gguf_embedding_formats.h) and the kernels read unquantized
 // (a safetensors MoE router and shared-expert gate, GDN alpha and beta of two
-// types or of F16, and a GGUF's Q8_0 shared-expert scalar gate), or as the F32
-// 1 + w of a BF16 RMSNorm weight w, which transformers stores 1 below the
-// weight the norm multiplies by (exact but where |w| < 2^-16 or |w| >= 2^24,
-// which it may round once).
+// types or of F16, and a GGUF's Q8_0 hyper-connection injection weights and
+// shared-expert scalar gate), or as the F32 1 + w of a BF16 RMSNorm weight w,
+// which transformers stores 1 below the weight the norm multiplies by (exact
+// but where |w| < 2^-16 or |w| >= 2^24, which it may round once).
 enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32, Decay, DequantizeToFloat32, CenteredNorm };
 // Rows written back to back, each value converted as `conversion` says.
 struct Copy {
@@ -146,7 +146,7 @@ struct StreamedRows final {
   uint32_t format = 0; // its gguf_embedding_format (GGUF_FMT_*)
 };
 struct Image {
-  std::string name; // layer-N.bin, head.bin, embedding.bin
+  std::string name; // layer-N.bin, head.bin, embedding.bin, a family's table's (ple.bin)
   std::string magic; // kGgufImageMagic
   uint32_t layer = 0;
   uint32_t type = 0;
@@ -228,18 +228,24 @@ private:
   uint32_t expertProjections_ = 0;
 };
 
-// The target geometry a GGUF's metadata declares, its architecture included,
+// The target geometry a GGUF of `architecture` (its family's layout's
+// ggufArchitecture) declares in its metadata, the architecture included,
 // with the rotary embedding and norms the kernels compute: the RoPE base and
-// rotated dimensions, the RMS epsilon and no RoPE scaling. planImages checks
-// the file's first, and model-check the installer's copy before any weight
-// download. Throws GgufError naming every mismatch.
-void requireMetadata(const GgufMetadata &metadata, const QwenTargetDimensions &geometry);
+// rotated dimensions, the RMS epsilon and no RoPE scaling; and the keys of
+// what the family adds. planImages checks the file's first, and model-check
+// the installer's copy before any weight download. Throws GgufError naming
+// every mismatch.
+void requireMetadata(const GgufMetadata &metadata, std::string_view architecture,
+                     const QwenTargetDimensions &geometry);
 
-// The layers' images, then the head's and the embedding's. Checks the
-// metadata (requireMetadata) and each tensor's shape; throws GgufError naming
-// every missing tensor and every tensor of a type this build cannot load.
-[[nodiscard]] std::vector<Image> planImages(const GgufFile &file, const QwenTargetDimensions &geometry,
-                                            PlanOptions options = {});
+// The images of a target from its GGUF of `architecture`: each layer's, then
+// the head's and the embedding's, then those of the tables its family adds
+// (Qwen3.8-Flash-Next's PLE n-gram table, ple.bin). Checks the metadata
+// (requireMetadata, and the arrays a family's file declares) and each
+// tensor's shape; throws GgufError naming every missing tensor and every
+// tensor of a type this build cannot load.
+[[nodiscard]] std::vector<Image> planImages(const GgufFile &file, std::string_view architecture,
+                                            const QwenTargetDimensions &geometry, PlanOptions options = {});
 
 // Where the GGUF holds the rows of the tensor `name`, a table of `columns`
 // values a row whose image copies its native rows as stored (a family's

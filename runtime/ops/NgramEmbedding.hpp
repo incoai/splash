@@ -5,7 +5,8 @@
 // rows, and the gate and dilated convolution through which the rows'
 // projections reach each stream of a hyper-connected residual
 // (ops/HyperConnection.hpp). Its table's gather is ops::Embedding's and its
-// projections run through ops::Linear.
+// projections run through ops::Linear; model/Qwen4ExpTarget.cpp composes
+// them.
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/NgramEmbedding.h"

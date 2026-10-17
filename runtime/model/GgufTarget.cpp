@@ -30,12 +30,12 @@ std::vector<std::filesystem::path> findTargetGgufs(const std::filesystem::path &
 }
 
 GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
-                                   const std::vector<std::filesystem::path> &paths,
+                                   const std::vector<std::filesystem::path> &paths, std::string_view architecture,
                                    const QwenTargetDimensions &geometry, SparseRowStoreOptions table,
                                    ExpertStoreOptions experts)
     : backend_(backend), images_(images), planned_(std::make_shared<Planned>(paths)) {
   planned_->images =
-      gguf::planImages(planned_->source.file(), geometry,
+      gguf::planImages(planned_->source.file(), architecture, geometry,
                        {.streamExperts = experts.memoryBytes != 0, .streamTable = table.cacheBytes != 0});
   planned_->layers = geometry.layers;
   planned_->table = table;

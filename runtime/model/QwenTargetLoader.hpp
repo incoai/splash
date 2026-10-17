@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <string>
 #include <string_view>
 #include <variant>
 
@@ -149,10 +150,11 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
 
 // Checks the layout and loads a target from its files: a MoE target's routed
 // experts open first (openMoeExperts), then `read` reads the weights, called
-// with the files' loader, their format and the experts
-// (readQwenTargetWeights). The target's allocations are all that loading it
+// with the files' loader, their format and the experts (readQwenTargetWeights,
+// or a family's own order). The target's allocations are all that loading it
 // allocates, its expert store's among them, and its fingerprint is its
-// files'.
+// files'. A family whose weights load from a GGUF only (loadsSafetensors
+// false) reads a GGUF's loader alone.
 template <class Weights, class Layout, class Read>
 [[nodiscard]] Weights
 loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTargetFiles &files, Read read) {
@@ -163,8 +165,12 @@ loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTar
   Weights weights = [&] {
     if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
       return read(gguf->get(), BlockTargetFormat{}, experts);
-    SafetensorsTargetLoader &safetensors = std::get<std::reference_wrapper<SafetensorsTargetLoader>>(files).get();
-    return read(safetensors, BlockTargetFormat{safetensors.float32Norms(), ops::GdnHeadOrder::Grouped}, experts);
+    if constexpr (Layout::loadsSafetensors) {
+      SafetensorsTargetLoader &safetensors = std::get<std::reference_wrapper<SafetensorsTargetLoader>>(files).get();
+      return read(safetensors, BlockTargetFormat{safetensors.float32Norms(), ops::GdnHeadOrder::Grouped}, experts);
+    } else {
+      throw WeightStoreError(std::string(Layout::family) + " loads from a GGUF only");
+    }
   }();
   weights.experts = experts.store;
   weights.manifestFingerprintSha256 = weightManifestFingerprint(weights.files);

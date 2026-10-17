@@ -39,8 +39,9 @@ uint32_t imageFormat(uint32_t type) { return type == ggml::kNVFP4 ? GGUF_FMT_NVF
 
 bool quantizedType(uint32_t type) { return imageFormat(type) != GGUF_FMT_COUNT; }
 bool floatType(uint32_t type) { return type == ggml::kF32; }
-// The 16-bit float types: a norm of one widens to F32 (floatNorm), and an
-// alpha/beta pair of them is a float tensor (alphaBeta).
+// The 16-bit float types: a norm of one widens to F32 (floatNorm), a
+// hyper-connection projection of one is prepared as Q8_0 (quantizedOrQ8_0),
+// and an alpha/beta pair of them is a float tensor (alphaBeta).
 bool float16Type(uint32_t type) { return type == ggml::kBF16 || type == ggml::kF16; }
 // The token rows the embedding kernels gather: native rows of a format.
 bool embeddingType(uint32_t type) { return gguf_embedding_format(imageFormat(type)); }
@@ -57,6 +58,10 @@ bool floatProjectionType(uint32_t type) { return floatType(type) || type == ggml
 // A tensor of F32 rows (floatRows): F32, or BF16 or Q8_0, which widen or
 // decode to it.
 bool floatRowType(uint32_t type) { return floatProjectionType(type) || type == ggml::kQ8_0; }
+
+// The header type of the image of a table a family adds (planImages), beside
+// the layers' 0 and 1 (GDN and full attention) and the head's 2.
+constexpr uint32_t kTableImageType = 3;
 
 // A repack of a [rows, columns] tensor in format, of no image section yet;
 // throws unless the shape is whole plane tiles.
@@ -80,9 +85,9 @@ public:
       : file_(file), geometry_(geometry), problems_(problems),
         image_(std::move(name), layer, type, options.streamExperts) {}
 
-  // A norm the kernels read as F32 unrounded, as llama.cpp does
-  // (ops::NormWeights): as stored, or the F32 values a BF16 or F16 one widens
-  // to exactly.
+  // A vector the kernels read as F32 unrounded, as llama.cpp does: a norm
+  // (ops::NormWeights) or Qwen3.8-Flash-Next's PLE convolution. As stored, or
+  // the F32 values a BF16 or F16 one widens to exactly.
   void floatNorm(const std::string &name, uint64_t elements) {
     const GgufTensor *tensor = find(name, normType);
     if (!tensor) return;
@@ -99,6 +104,23 @@ public:
     const uint32_t format = imageFormat(tensor->type);
     Repack repack = image_.planes(format, rows, columns, name);
     repack.sources.push_back(tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], columns), order));
+    image_.repack(std::move(repack));
+  }
+
+  // Rows [N, K] as quantized() repacks them, but of a BF16 or F16 tensor
+  // as the Q8_0 rows llama.cpp's quantize_row_q8_0_ref writes from its
+  // values, which the writer quantizes (TensorRows::ggufFloatRowBytes).
+  void quantizedOrQ8_0(const std::string &name, uint64_t rows, uint64_t columns) {
+    const GgufTensor *tensor = file_.find(name);
+    if (!tensor || !float16Type(tensor->type)) return quantized(name, rows, columns);
+    if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
+    Repack repack = image_.planes(GGUF_FMT_Q80, rows, columns, name);
+    TensorRows source = tensorRows(*tensor, rows, tensor->bytes / rows);
+    source.ggufFloatType = source.type;
+    source.ggufFloatRowBytes = source.rowBytes;
+    source.type = ggml::kQ8_0;
+    source.rowBytes = ggufRowBytes(kQuantFormats[GGUF_FMT_Q80], columns);
+    repack.sources.push_back(std::move(source));
     image_.repack(std::move(repack));
   }
 
@@ -212,7 +234,8 @@ public:
 
   // An F32 or BF16 tensor [rows, columns] as stored, which the float
   // projection runs in fp32 (the MoE router, which llama.cpp keeps
-  // unquantized and some GGUFs store as BF16).
+  // unquantized and some GGUFs store as BF16, and the QSA indexer's
+  // projections).
   void floatTensor(const std::string &name, uint64_t rows, uint64_t columns) {
     const GgufTensor *tensor = find(name, floatProjectionType);
     if (!tensor) return;
@@ -225,10 +248,10 @@ public:
   }
 
   // An F32, BF16 or Q8_0 tensor [rows, columns] as F32 rows: as stored, or
-  // the F32 values BF16 widens to and Q8_0 decodes to exactly (the MoE
-  // shared-expert scalar gate, which the select kernel reads).
-  // withDescriptor makes it a float tensor a projection or the MoE block
-  // reads, else it is its rows alone.
+  // the F32 values BF16 widens to and Q8_0 decodes to exactly (the
+  // hyper-connections' injection weights and the MoE shared-expert scalar
+  // gate, which the select kernel reads). withDescriptor makes it a float
+  // tensor a projection or the MoE block reads, else it is its rows alone.
   void floatRows(const std::string &name, uint64_t rows, uint64_t columns, bool withDescriptor) {
     const GgufTensor *tensor = find(name, floatRowType);
     if (!tensor) return;
@@ -242,6 +265,16 @@ public:
                 widen        ? Conversion::WidenToFloat32
                 : dequantize ? Conversion::DequantizeToFloat32
                              : Conversion::None);
+  }
+
+  // A table's native rows [rows, columns] in an embedding format, after their
+  // descriptor (a family's table, which no projection reads), as stored but
+  // for llama.cpp's NVFP4 (tableRows).
+  void nativeTable(const std::string &name, uint64_t columns) {
+    const GgufTensor *tensor = find(name, embeddingType);
+    if (!tensor) return;
+    if (tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
+    copiedRows(*tensor, nativeRowBytes(*tensor));
   }
 
   // Value heads of headRows rows from row `from` on, in grouped order.
@@ -327,12 +360,8 @@ private:
 
 std::string prefix(uint32_t layer) { return "blk." + std::to_string(layer) + "."; }
 
-Image layerImage(const GgufFile &file, const QwenTargetDimensions &g, std::vector<std::string> &problems,
-                 uint32_t index, PlanOptions options) {
-  const std::string p = prefix(index);
-  const bool full = g.isFullAttentionLayer(index);
-  Builder b(file, g, problems, "layer-" + std::to_string(index) + ".bin", index, full ? 1u : 0u, options);
-  b.floatNorm(p + "attn_norm.weight", g.hiddenSize);
+// A layer's GDN or full-attention mixer, which every family's layers hold.
+void mixerImage(Builder &b, const QwenTargetDimensions &g, const std::string &p, bool full) {
   if (full) {
     b.quantized(p + "attn_q.weight", 2ull * g.attentionHeadDimension * (g.attentionWidth / g.attentionHeadDimension),
                 g.hiddenSize);
@@ -354,7 +383,10 @@ Image layerImage(const GgufFile &file, const QwenTargetDimensions &g, std::vecto
     b.floatNorm(p + "ssm_norm.weight", g.gdnHeadDimension);
     b.quantized(p + "ssm_out.weight", g.hiddenSize, valueRows);
   }
-  b.floatNorm(p + "post_attention_norm.weight", g.hiddenSize);
+}
+
+// A layer's dense FFN or sparse MoE, which every family's layers hold.
+void ffnImage(Builder &b, const QwenTargetDimensions &g, const std::string &p) {
   if (g.ffnKind == QwenFfnKind::SparseMoe) {
     const uint64_t routed = g.experts, width = g.expertIntermediateSize;
     b.floatTensor(p + "ffn_gate_inp.weight", routed, g.hiddenSize);
@@ -368,7 +400,154 @@ Image layerImage(const GgufFile &file, const QwenTargetDimensions &g, std::vecto
     b.quantized(p + "ffn_up.weight", g.intermediateSize, g.hiddenSize);
     b.quantized(p + "ffn_down.weight", g.hiddenSize, g.intermediateSize);
   }
-  return b.finish();
+}
+
+// One hyper-connection mix (model/Qwen4Exp.hpp Qwen4HyperWeights): its norm,
+// down and up projections and, when it injects, its injection weights. The
+// projections of BF16 or F16 (ISTA-DASLab's GGUFs keep them BF16) are
+// prepared as Q8_0, the type Unsloth's GGUFs store them in, in the rows
+// llama.cpp quantizes from their values (Builder::quantizedOrQ8_0): every
+// decode cycle reads all of them, bandwidth-bound, and Q8_0 holds a value in
+// little more than half the bytes of a 16-bit float.
+void hyperImage(Builder &b, const QwenTargetDimensions &g, const std::string &stem, bool inject) {
+  const uint64_t streams = g.streamWidth();
+  b.floatNorm(stem + "_norm.weight", streams);
+  b.quantizedOrQ8_0(stem + "_down.weight", g.hyperRank, streams);
+  b.quantizedOrQ8_0(stem + "_up.weight", streams, g.hyperRank);
+  if (inject) b.floatRows(stem + "_inject.weight", g.hyperConnections, streams, false);
+}
+
+// What a family's GGUFs hold beside the mixers and FFNs every family's layers
+// hold, which requireMetadata and planImages take once from a GGUF's
+// architecture (withFamily): the metadata keys they add, the arrays they
+// declare, each layer's sections around its mixer and FFN, the head's before
+// the logits, and the images of the tables they add after the embedding's.
+//
+// The Qwen3.5 hybrid's GGUFs (qwen35, qwen35moe): a norm before each layer's
+// mixer and FFN and before the logits.
+struct HybridGguf final {
+  template <class Expect> static void metadata(const Expect &, const QwenTargetDimensions &) {}
+  static void arrays(const GgufFile &, const QwenTargetDimensions &) {}
+  static void layer(Builder &b, const QwenTargetDimensions &g, uint32_t index) {
+    const std::string p = prefix(index);
+    b.floatNorm(p + "attn_norm.weight", g.hiddenSize);
+    mixerImage(b, g, p, g.isFullAttentionLayer(index));
+    b.floatNorm(p + "post_attention_norm.weight", g.hiddenSize);
+    ffnImage(b, g, p);
+  }
+  static void head(Builder &b, const QwenTargetDimensions &g) { b.floatNorm("output_norm.weight", g.hiddenSize); }
+  static void tables(const GgufFile &, const QwenTargetDimensions &, PlanOptions, std::vector<std::string> &,
+                     std::vector<Image> &) {}
+};
+
+// Qwen3.8-Flash-Next's GGUFs (qwen4exp): hyper-connection mixes in place of
+// the hybrid's norms, a QSA indexer after each full-attention mixer, and the
+// PLE n-gram embedding: its projections, norms and convolution after its
+// layer's FFN, and its table in an image of its own.
+struct Qwen4ExpGguf final {
+  static constexpr std::string_view architecture = "qwen4exp";
+
+  template <class Expect> static void metadata(const Expect &expect, const QwenTargetDimensions &g) {
+    expect("hyper_connection.count", g.hyperConnections);
+    expect("hyper_connection.low_rank", g.hyperRank);
+    expect("attention.indexer.head_count", g.indexerHeads);
+    expect("attention.indexer.key_length", g.indexerHeadDimension);
+    expect("attention.indexer.top_k", g.indexerTokens());
+    expect("ple.ngram_size", g.pleNgram);
+    expect("ple.heads_per_ngram", g.pleHeadsPerNgram);
+    expect("ple.conv_kernel", g.pleConvolutionTaps);
+    expect("embedding_length_per_layer_input", g.pleHeadDimension);
+  }
+
+  // The arrays the installer's copy of the scalar metadata leaves out
+  // (requireMetadata checks the scalars): each layer's QSA compress ratio and
+  // the PLE layer. One error names every mismatch.
+  static void arrays(const GgufFile &file, const QwenTargetDimensions &g) {
+    const std::string arch(architecture);
+    std::string mismatched;
+    const auto ratios = file.numericArray(arch + ".attention.compress_ratios");
+    bool ratiosMatch = ratios && ratios->size() >= g.layers;
+    for (uint32_t layer = 0; ratiosMatch && layer < g.layers; ++layer)
+      ratiosMatch = (*ratios)[layer] == (g.isFullAttentionLayer(layer) ? g.indexerBlockTokens : 0);
+    if (!ratiosMatch) mismatched += "attention.compress_ratios";
+    const auto layers = file.numericArray(arch + ".ple.layers");
+    if (!layers || layers->size() != 1 || (*layers)[0] != g.pleLayer)
+      mismatched += (mismatched.empty() ? "" : ", ") + std::string("ple.layers");
+    if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
+  }
+
+  static void layer(Builder &b, const QwenTargetDimensions &g, uint32_t index) {
+    const std::string p = prefix(index);
+    const bool full = g.isFullAttentionLayer(index);
+    hyperImage(b, g, p + "hc_attn", true);
+    mixerImage(b, g, p, full);
+    if (full) {
+      b.floatTensor(p + "indexer.q_proj.weight", uint64_t{g.indexerHeads} * g.indexerHeadDimension, g.hiddenSize);
+      b.floatTensor(p + "indexer.k_proj.weight", g.indexerHeadDimension, g.hiddenSize);
+      b.floatNorm(p + "indexer.q_norm.weight", g.indexerHeadDimension);
+      b.floatNorm(p + "indexer.k_norm.weight", g.indexerHeadDimension);
+    }
+    hyperImage(b, g, p + "hc_ffn", true);
+    ffnImage(b, g, p);
+    if (index != g.pleLayer) return;
+    const uint64_t streams = g.streamWidth();
+    b.quantized(p + "ple_key.weight", streams, g.pleWidth());
+    b.quantized(p + "ple_value.weight", g.hiddenSize, g.pleWidth());
+    b.floatNorm(p + "ple_norm_key.weight", streams);
+    b.floatNorm(p + "ple_norm_query.weight", streams);
+    b.floatNorm(p + "ple_norm_conv.weight", streams);
+    b.floatNorm(p + "ple_conv1d.weight", streams * g.pleConvolutionTaps);
+  }
+
+  static void head(Builder &b, const QwenTargetDimensions &g) { hyperImage(b, g, "output_hc", false); }
+
+  // The PLE table's native rows in an image of their own (ple.bin), whose
+  // rows stream from the file instead with streamTable once every tensor
+  // the plan reads was found (planImages names those it misses first).
+  static void tables(const GgufFile &file, const QwenTargetDimensions &g, PlanOptions options,
+                     std::vector<std::string> &problems, std::vector<Image> &images) {
+    const std::string table = "per_layer_token_embd.weight";
+    Builder b(file, g, problems, "ple.bin", g.pleLayer, kTableImageType);
+    b.nativeTable(table, g.pleHeadDimension);
+    Image image = b.finish();
+    if (options.streamTable && problems.empty()) image.streamedRows = tableRows(file, table, g.pleHeadDimension);
+    images.push_back(std::move(image));
+  }
+};
+
+// Calls `use` with what the GGUFs of `architecture` hold: Qwen3.8-Flash-Next's
+// (Qwen4ExpGguf), or else the Qwen3.5 hybrid's (HybridGguf).
+template <class Use> decltype(auto) withFamily(std::string_view architecture, Use &&use) {
+  if (architecture == Qwen4ExpGguf::architecture) return use(Qwen4ExpGguf{});
+  return use(HybridGguf{});
+}
+
+// The images of a target from a GGUF of Family (planImages).
+template <class Family>
+std::vector<Image> familyImages(const GgufFile &file, const QwenTargetDimensions &g, PlanOptions options) {
+  Family::arrays(file, g);
+  std::vector<std::string> problems;
+  std::vector<Image> images;
+  for (uint32_t index = 0; index < g.layers; ++index) {
+    Builder layer(file, g, problems, "layer-" + std::to_string(index) + ".bin", index,
+                  g.isFullAttentionLayer(index) ? 1u : 0u, options);
+    Family::layer(layer, g, index);
+    images.push_back(layer.finish());
+  }
+  Builder head(file, g, problems, "head.bin", g.layers, 2);
+  Family::head(head, g);
+  head.quantized("output.weight", g.vocabularySize, g.hiddenSize);
+  images.push_back(head.finish());
+  Builder embedding(file, g, problems, "embedding.bin", g.vocabularySize, g.hiddenSize);
+  embedding.embeddingRows("token_embd.weight");
+  images.push_back(embedding.finish());
+  Family::tables(file, g, options, problems, images);
+  if (!problems.empty()) {
+    std::string names;
+    for (const std::string &problem : problems) names += (names.empty() ? "" : ", ") + problem;
+    throw GgufError("GGUF tensors this build cannot load: " + names);
+  }
+  return images;
 }
 
 // A rotated GGUF (GgufRotation) must name exactly what the loader rotates:
@@ -511,8 +690,9 @@ Image ImageBuilder::finish() {
   return std::move(image_);
 }
 
-void requireMetadata(const GgufMetadata &metadata, const QwenTargetDimensions &geometry) {
-  const std::string arch = architecture(geometry.ffnKind);
+void requireMetadata(const GgufMetadata &metadata, std::string_view architecture,
+                     const QwenTargetDimensions &geometry) {
+  const std::string arch(architecture);
   if (metadata.architecture() != arch)
     throw GgufError("GGUF architecture is " + metadata.architecture() + ", but the model's target is " + arch);
   std::string mismatched;
@@ -550,6 +730,7 @@ void requireMetadata(const GgufMetadata &metadata, const QwenTargetDimensions &g
   expect("ssm.time_step_rank", geometry.gdnValueHeads);
   expect("ssm.state_size", geometry.gdnHeadDimension);
   expect("ssm.inner_size", uint64_t{geometry.gdnValueHeads} * geometry.gdnHeadDimension);
+  withFamily(architecture, [&](auto family) { family.metadata(expect, geometry); });
   if (geometry.ffnKind == QwenFfnKind::SparseMoe) {
     expect("expert_count", geometry.experts);
     expect("expert_used_count", geometry.expertsPerToken);
@@ -561,25 +742,11 @@ void requireMetadata(const GgufMetadata &metadata, const QwenTargetDimensions &g
   if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
 }
 
-// No family of this build holds a table, so options.streamTable plans nothing yet.
-std::vector<Image> planImages(const GgufFile &file, const QwenTargetDimensions &geometry, PlanOptions options) {
-  requireMetadata(file.metadata(), geometry);
-  std::vector<std::string> problems;
-  std::vector<Image> images;
-  for (uint32_t layer = 0; layer < geometry.layers; ++layer)
-    images.push_back(layerImage(file, geometry, problems, layer, options));
-  Builder head(file, geometry, problems, "head.bin", geometry.layers, 2);
-  head.floatNorm("output_norm.weight", geometry.hiddenSize);
-  head.quantized("output.weight", geometry.vocabularySize, geometry.hiddenSize);
-  images.push_back(head.finish());
-  Builder embedding(file, geometry, problems, "embedding.bin", geometry.vocabularySize, geometry.hiddenSize);
-  embedding.embeddingRows("token_embd.weight");
-  images.push_back(embedding.finish());
-  if (!problems.empty()) {
-    std::string names;
-    for (const std::string &problem : problems) names += (names.empty() ? "" : ", ") + problem;
-    throw GgufError("GGUF tensors this build cannot load: " + names);
-  }
+std::vector<Image> planImages(const GgufFile &file, std::string_view architecture,
+                              const QwenTargetDimensions &geometry, PlanOptions options) {
+  requireMetadata(file.metadata(), architecture, geometry);
+  std::vector<Image> images = withFamily(
+      architecture, [&](auto family) { return familyImages<decltype(family)>(file, geometry, options); });
   if (file.rotation()) requireRotation(file, geometry, images);
   return images;
 }

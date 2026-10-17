@@ -9,9 +9,9 @@
 
 using namespace metal;
 
-// Hyper-connections (metal/abi/HyperConnection.h), Qwen3.8-Flash-Next's. The
-// residual streams are fp32 [rows][streams][hidden]; the projections between
-// these kernels read and write bf16 rows.
+// Hyper-connections (metal/abi/HyperConnection.h, Qwen3.8-Flash-Next's:
+// model/Qwen4Exp.hpp). The residual streams are fp32 [rows][streams][hidden];
+// the projections between these kernels read and write bf16 rows.
 
 // Writes the lane's two values of span `span` of row `row` into the row's
 // 8-row tile of the Table16 table the register-tile projection reading the

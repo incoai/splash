@@ -65,7 +65,7 @@ std::vector<uint8_t> slice(const std::vector<uint8_t> &bytes, uint64_t offset, u
 // and the embedding's.
 void loadImages(MetalBackend &backend, model::WeightImages &images, const std::filesystem::path &path,
                 const model::QwenTargetDimensions &geometry) {
-  model::GgufTargetLoader loader(backend, images, {path}, geometry);
+  model::GgufTargetLoader loader(backend, images, {path}, architecture(geometry), geometry);
   for (uint32_t layer = 0; layer < geometry.layers; ++layer) static_cast<void>(loader.layer(layer));
   static_cast<void>(loader.head());
   static_cast<void>(loader.embedding());
@@ -89,7 +89,7 @@ std::vector<model::gguf::Image> planned(const std::filesystem::path &path,
                                         const model::QwenTargetDimensions &geometry) {
   model::WeightSource source(path);
   const model::GgufFile gguf(source);
-  return model::gguf::planImages(gguf, geometry);
+  return model::gguf::planImages(gguf, architecture(geometry), geometry);
 }
 
 // Every image the loader writes from the GGUF at path against the goldens of
@@ -211,7 +211,7 @@ void checkQuantizedAlphaBeta(MetalBackend &backend, const std::filesystem::path 
         const std::vector<uint8_t> ordered = grouped(store(name, format, *values), stride);
         rows.insert(rows.end(), ordered.begin(), ordered.end());
       }
-      const std::string arch = model::gguf::architecture(g.ffnKind);
+      const std::string arch = architecture(g);
       // A pair of one 16-bit float type is a float tensor (checkFloatAlphaBeta).
       if (!float16(f)) {
         rows.resize(QUANT_TILE_ROWS * stride);
@@ -455,7 +455,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
                                    {"token_embd.weight", kIQ4_XS}}),
             layout);
   model::WeightImages images(backend, "fixture");
-  model::GgufTargetLoader files(backend, images, model::findTargetGgufs(target), layout);
+  model::GgufTargetLoader files(backend, images, model::findTargetGgufs(target), layout.ggufArchitecture, layout);
   const model::Qwen3_8Weights weights = model::loadQwen3_8Weights(backend, layout, files);
   check(weights.layers.size() == layout.layers, "GGUF target: every layer");
   check(weights.finalNorm.float32, "GGUF target: F32 final norm");

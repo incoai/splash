@@ -237,7 +237,7 @@ Case oneExtentCopy(id<MTLDevice> device, const Case &data) {
 }
 
 // Blocks a QSA row attends past kQsaTopBlocks complete blocks; up to there
-// every block up to its own.
+// every block up to its own, as block_indexer_select writes them.
 constexpr uint32_t kQsaTopBlocks = 40;
 // Block lists of every block for every row ahead of a dispatch's lists, and
 // after them, which a tile reading another list than its own would attend.

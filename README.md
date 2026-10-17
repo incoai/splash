@@ -69,6 +69,15 @@ one released for the family, selected automatically, or the one
 | --- | --- | --- |
 | Qwen3.8-27B | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` | `mlx-community/Qwen3.8-27B-4bit` |
 | Qwen3.6-35B-A3B | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` | `mlx-community/Qwen3.6-35B-A3B-4bit` |
+| Qwen3.8-Flash-Next | `unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ3_XXS` | — |
+
+No DFlash2 draft of Qwen3.8-Flash-Next is released yet: its installation
+names one with `--draft-model`, a Hub repository or a local directory
+([Drafts](DEVELOPMENT.md#drafts)).
+
+```bash
+splash serve --model unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ3_XXS --draft-model ./Qwen3.8-Flash-Next-DFlash2
+```
 
 Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats
 up to `UD-Q8_K_XL`, whose BF16 tensors load too. Whole-BF16 and F16 models are
@@ -81,7 +90,8 @@ including mixed precision, mxfp4 or nvfp4. NVIDIA's and unsloth's NVFP4
 checkpoints and NVFP4 GGUFs also load. Smaller variants run on
 [24 GB Macs](docs/performance.md#smaller-ggufs-on-24-gb-macs).
 [27B variants](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/tree/main) ·
-[35B variants](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/tree/main)
+[35B variants](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/tree/main) ·
+[Flash-Next variants](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main)
 
 Vision and the tokenizer come from the target model's source.
 [Model loading and compatibility](DEVELOPMENT.md#upstream-model-loading) ·

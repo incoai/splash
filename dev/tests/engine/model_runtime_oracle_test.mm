@@ -4,9 +4,13 @@
 #include "engine/RuntimeResources.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
+#include "engine/NativeArguments.hpp"
 #include "engine/Types.hpp"
 #include "metal/BackendInstrumentation.hpp"
 #include "model/Runtime.hpp"
+#include "model/Qwen4Exp.hpp"
+#include "model/Qwen4Steps.hpp"
+#include "model/RuntimeInstrumentation.hpp"
 #include "model/QwenState.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/Sampling.hpp"
@@ -1219,13 +1223,14 @@ void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::
 
 // A prefill group (a lane's command of more than a chunk's rows, which a
 // target whose experts stream runs layer by layer) leaves what commands of
-// its chunks leave, bit for bit: the same score logits, KV, GDN cell, draft
-// rings and window and lengths, and the same states captured inside a
-// chunk, at a chunk's end and at the group's end. One prompt of three
-// chunks (2048, 2048 and 512 rows; the middle one carries its state through
-// the group's scratch cell) is prefilled in three commands, then on the same
-// pages and lane in one; then two lanes, one of whose rows end in the
-// group's first chunk, each against commands of the group's chunks.
+// its chunks leave, bit for bit: the same score logits, KV, GDN cell (with
+// Qwen3.8-Flash-Next's PLE history), draft rings and window and lengths, and
+// the same states captured inside a chunk, at a chunk's end and at the
+// group's end. One prompt of three chunks (2048, 2048 and 512 rows; the
+// middle one carries its state through the group's scratch cell) is
+// prefilled in three commands, then on the same pages and lane in one; then
+// two lanes, one of whose rows end in the group's first chunk, each against
+// commands of the group's chunks.
 void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::PageStorage &pages,
                                          const model::QwenStateStorage &states, std::span<const uint32_t> chat) {
   constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
@@ -1290,7 +1295,7 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
   require(group.scoreLogits == last.scoreLogits, "a prefill group's score logits differ from its chunks'");
   require(kvBytes() == chunkedKv, "a prefill group's KV differs from its chunks'");
   require(states.metadata(0).lengths == chunkedLengths && bytesOf(states.current(0).stateBase) == chunkedCell,
-          "a prefill group's GDN cell or lengths differ from its chunks'");
+          "a prefill group's GDN cell, PLE history or lengths differ from its chunks'");
   require(committedState(executor, states, 0).rings == chunkedRings && bytesOf(states.window(0)) == chunkedWindow,
           "a prefill group's draft rings or window differ from its chunks'");
   executor.end(502);
@@ -1391,7 +1396,7 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
     require(!state.scores.empty() && state.scores == chunked.scores,
             which + ": its score logits differ from its chunks'");
     require(state.kv == chunked.kv && state.lengths == chunked.lengths && state.cell == chunked.cell,
-            which + ": its KV, GDN cell or lengths differ from its chunks'");
+            which + ": its KV, GDN cell, PLE history or lengths differ from its chunks'");
     require(state.rings == chunked.rings && state.windowRows == chunked.windowRows,
             which + ": its draft rings or window rows differ from its chunks'");
   }
@@ -1652,6 +1657,24 @@ decodeTogether(model::Runtime &executor, std::span<const uint64_t> ids,
   }
 }
 
+// "<|im_start|>user\nList every prime number between 1 and 60, then check each
+// one by trial division before you answer.<|im_end|>\n<|im_start|>assistant\n
+// <think>\n", which both models think through for well over the tokens the
+// thinking tests decode.
+const std::vector<uint32_t> kThinkingPrompt{
+    248045, 846,  198,  826,   1396, 9944,  1324, 1881,   220,   16,   321,
+    220,    21,   15,   11,    1179, 1716,  1754, 799,    539,   8818, 12436,
+    1518,   488,  4087, 13,    248046, 198, 248045, 74455, 198,   248068, 198};
+// The Qwen tokenizer's </think>.
+constexpr uint32_t kThinkEnd = 248069;
+// The ends the thinking tests close thinking with: the close alone, and
+// "Considering the limited time, I have to give the solution based on the
+// thinking directly now.\n</think>".
+const std::array<std::vector<uint32_t>, 2> kThinkingEnds{
+    std::vector<uint32_t>{kThinkEnd},
+    std::vector<uint32_t>{79939, 279, 6973, 854, 11, 353, 599, 310, 2873, 279, 6093, 3018, 383, 279, 7047, 5774, 1381,
+                          13, 198, kThinkEnd}};
+
 // A thinking budget ends thinking with its end tokens whatever the model's
 // logits: from the first generated token for a budget of 0, else from the
 // one after that many thinking tokens, greedy and sampled, while the draft
@@ -1660,27 +1683,12 @@ decodeTogether(model::Runtime &executor, std::span<const uint64_t> ids,
 // it verifies, and those proposals are not counted as drafted. Lanes decoded
 // together end at their own budgets, and one without a budget thinks on.
 void requireThinkingBudgetClosesThinking(model::Runtime &executor) {
-  // "<|im_start|>user\nList every prime number between 1 and 60, then check
-  // each one by trial division before you answer.<|im_end|>\n<|im_start|>
-  // assistant\n<think>\n", which both models think through for well over the
-  // tokens decoded here.
-  const std::vector<uint32_t> prompt{
-      248045, 846,  198,  826,   1396, 9944,  1324, 1881,   220,   16,   321,
-      220,    21,   15,   11,    1179, 1716,  1754, 799,    539,   8818, 12436,
-      1518,   488,  4087, 13,    248046, 198, 248045, 74455, 198,   248068, 198};
-  // The Qwen tokenizer's </think>.
-  constexpr uint32_t kThinkEnd = 248069;
-  // The close alone, and "Considering the limited time, I have to give the
-  // solution based on the thinking directly now.\n</think>".
-  const std::array<std::vector<uint32_t>, 2> ends{
-      std::vector<uint32_t>{kThinkEnd},
-      std::vector<uint32_t>{79939, 279, 6973, 854, 11, 353, 599, 310, 2873, 279, 6093, 3018, 383, 279,
-                            7047, 5774, 1381, 13, 198, kThinkEnd}};
+  const std::vector<uint32_t> &prompt = kThinkingPrompt;
   const std::array<std::vector<uint32_t>, 3> pageTables{
       pageRange(108, 4), pageRange(116, 4), pageRange(120, 4)};
   const std::array<uint64_t, 3> ids{301, 302, 303};
   uint32_t mostEndCycles = 0;
-  for (const std::vector<uint32_t> &end : ends) {
+  for (const std::vector<uint32_t> &end : kThinkingEnds) {
     const uint32_t length = static_cast<uint32_t>(end.size());
     for (const float temperature : {0.0F, 0.7F}) {
       for (const uint32_t budget : {0U, 1U, 5U, 12U}) {
@@ -1813,23 +1821,14 @@ decodeConstrainedTogether(model::Runtime &executor, std::span<const uint64_t> id
 // is selected, the end replaces no draft proposals, as only the verify reads
 // the masks; its other tokens replace them as for any request.
 void requireConstrainedThinkingEndWaitsForItsMask(model::Runtime &executor) {
-  // The prompt of requireThinkingBudgetClosesThinking.
-  const std::vector<uint32_t> prompt{
-      248045, 846,  198,  826,   1396, 9944,  1324, 1881,   220,   16,   321,
-      220,    21,   15,   11,    1179, 1716,  1754, 799,    539,   8818, 12436,
-      1518,   488,  4087, 13,    248046, 198, 248045, 74455, 198,   248068, 198};
-  constexpr uint32_t kThinkEnd = 248069;
+  const std::vector<uint32_t> &prompt = kThinkingPrompt;
   constexpr std::array<uint32_t, 3> kCharacter{172, 61084, 222};
-  const std::array<std::vector<uint32_t>, 2> ends{
-      std::vector<uint32_t>{kThinkEnd},
-      std::vector<uint32_t>{79939, 279, 6973, 854, 11, 353, 599, 310, 2873, 279, 6093, 3018, 383, 279,
-                            7047, 5774, 1381, 13, 198, kThinkEnd}};
   const std::array<std::vector<uint32_t>, 3> pageTables{
       pageRange(108, 4), pageRange(116, 4), pageRange(120, 4)};
   const std::array<uint64_t, 3> ids{311, 312, 313};
   constexpr uint32_t rows = model::ExecutionLimits::targetVerifyRows;
   constexpr uint32_t proposals = model::ExecutionLimits::draftProposalTokens;
-  for (const std::vector<uint32_t> &end : ends) {
+  for (const std::vector<uint32_t> &end : kThinkingEnds) {
     const uint32_t length = static_cast<uint32_t>(end.size());
     for (const float temperature : {0.0F, 0.7F}) {
       for (const uint32_t budget : {0U, 1U, 5U, 12U}) {
@@ -1890,6 +1889,36 @@ void requireConstrainedThinkingEndWaitsForItsMask(model::Runtime &executor) {
     }
   }
   std::cout << "constrained_thinking_budget=PASS\n";
+}
+
+// A thinking budget of 0 ends thinking from the first token: the first cycle
+// verifies the end's first token and every row after it, whose proposals the
+// end's tokens replace. Qwen3.8-Flash-Next's GPU hashes the PLE rows of a
+// verify's rows from their tokens and the ones before them, which must be the
+// rows the CPU hashes for a prompt of the same tokens (model::qwen4PleRows).
+void requireThinkingEndVerifiesItsTokens(model::Runtime &executor, const model::LoadedModel &model) {
+  const std::vector<uint32_t> &prompt = kThinkingPrompt;
+  const std::vector<uint32_t> &end = kThinkingEnds[1];
+  constexpr uint32_t rows = model::ExecutionLimits::targetVerifyRows;
+  const uint32_t length = static_cast<uint32_t>(prompt.size());
+  const std::vector<uint32_t> pages = pageRange(108, 4);
+  EngineRequest request = makeRequest(321, prompt, 64);
+  request.thinkingBudget = ThinkingBudget{0, end, kThinkEnd};
+  beginCold(executor, request, 0);
+  requireOpen(prefillChunk(executor, 321, 0, prompt, pages), "thinking end fixture");
+  const ModelStepResult cycle = decodeOne(executor, 321, length, pages);
+  const std::vector<uint32_t> gathered = model::RuntimeInstrumentation::lastPleRows(executor, 0);
+  executor.end(321);
+  require(std::ranges::equal(cycle.outputTokens, std::span(end).first(rows)),
+          "a thinking end did not verify its tokens in every row of a cycle");
+  uint32_t heads = 0;
+  if (const auto *weights = std::get_if<model::Qwen4ExpWeights>(&model.target)) {
+    heads = weights->layout.pleHeads();
+    std::vector<uint32_t> hashed(uint64_t{rows} * heads);
+    model::qwen4PleRows(*weights, length, std::span(end).first(rows), prompt, hashed.data());
+    require(gathered == hashed, "a thinking end's verify gathered other PLE rows than a prompt of its tokens");
+  }
+  std::cout << "thinking_end_rows=PASS ple_heads=" << heads << '\n';
 }
 
 // A 64-token request with one image of the given span, its pixels a pattern.
@@ -2987,6 +3016,7 @@ int main(int argc, char **argv) {
                                         samplingSeedTokens, prompt128);
     requireThinkingBudgetClosesThinking(executor);
     requireConstrainedThinkingEndWaitsForItsMask(executor);
+    requireThinkingEndVerifiesItsTokens(executor, model);
     requireStatesCapturedInsideCommands(executor, backend, pages, states, aneFfn.get(), samplingSeedTokens);
     requireCapturesOutliveTheirItems(executor, states, samplingSeedTokens);
     requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens);

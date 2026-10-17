@@ -29,7 +29,7 @@ class VisionLoader;
 // The store a streamed table is read through (LoadedModel::streamedTable).
 class SparseRowStore;
 
-using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights>;
+using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights>;
 
 // How a model loads beside its descriptor: with streamedTableBytes, the rows
 // of a table the target's GGUF holds (streamableTableBytes) stream from its

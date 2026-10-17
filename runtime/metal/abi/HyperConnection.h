@@ -17,7 +17,7 @@
 #define HYPER_CONNECTION_MAXIMUM_STREAMS 4u
 // The mix norm's kernels, compiled for HYPER_CONNECTION_MAXIMUM_STREAMS
 // streams of HYPER_CONNECTION_NORM_HIDDEN values (ops::HyperConnection::addNorm,
-// Qwen3.8-Flash-Next's shape):
+// Qwen3.8-Flash-Next's shape, which model/Qwen4Exp.hpp asserts):
 // hyper_connection_norm_quarters, a threadgroup of
 // HYPER_CONNECTION_NORM_QUARTER_THREADS threads per row, for an injecting mix
 // of at most HYPER_CONNECTION_NORM_QUARTER_ROWS rows, and

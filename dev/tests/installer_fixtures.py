@@ -19,10 +19,14 @@ from install import families, hub, models
 
 DENSE = families.named("Qwen3.8-27B")
 MOE = families.named("Qwen3.6-35B-A3B")
+FLASH_NEXT = families.named("Qwen3.8-Flash-Next")
+# The families whose targets the engine loads from a GGUF only.
+GGUF_ONLY = (FLASH_NEXT,)
 MODEL = "mlx-community/Qwen3.8-27B-4bit"
-# An MLX config.json, a DFlash2 draft config and the scalar metadata of a
-# GGUF (gguf.scalar_metadata) built like each family's, in its lower-case
-# name, which the native configuration test reads too.
+# An MLX config.json (of a GGUF_ONLY family, the one the installer derives
+# from its GGUF), a DFlash2 draft config and the scalar metadata of a GGUF
+# (gguf.scalar_metadata) built like each family's, in its lower-case name,
+# which the native configuration test reads too.
 CONFIGS = Path(__file__).resolve().parent / "fixtures" / "model-configs"
 # The commit the main branch of every family's draft repository names.
 DRAFT_COMMIT = "d" * 40

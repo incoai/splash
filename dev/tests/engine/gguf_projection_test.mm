@@ -874,7 +874,7 @@ void tokenGather(MetalBackend &backend) {
           "bf16 of the stored one");
 }
 
-// A streamed table's gather (QwenTarget::addPleGather): a SparseRowStore
+// A streamed table's gather (Qwen4ExpTarget::addPleGather): a SparseRowStore
 // stages each distinct row a step reads once, with each row id's slot, and the
 // same gather over the staging as a table gives, byte for byte, what it gives
 // over the whole table, for every embedding format, ids repeated and in any

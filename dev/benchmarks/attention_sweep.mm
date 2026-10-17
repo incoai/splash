@@ -15,17 +15,25 @@
 // usage: attention-sweep METALLIB [--histories 0,2048,...] [--shapes 27b,35b,fn]
 //                        [--lanes 1,4] [--repeat N] [--phases both|verify|prefill]
 //                        [--compare-metallib PATH] [--kv-format int8|bf16]
-//                        [--extent-pages N] [--qsa shared|independent|pages]
+//                        [--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer]
 //
 // fn is Qwen3.8-Flash-Next's GQA-12 attention, whose rows attend past 512
 // complete blocks of four tokens only to the 512 blocks their QSA bitmap
-// names and their own; its tiles attend the
+// names and their own (kernels/shared/block_indexer.metal); its tiles attend the
 // union of their rows' blocks, which the graph lists from the bitmaps first
 // (ops::PagedAttention::addBlockLists). --qsa makes such bitmaps: blocks
 // scattered alike for every row (shared), independently per row
-// (independent), or whole pages alike for every row (pages). The selection is
-// synthetic; the real indexer's lies somewhere between these. Without --qsa
-// the fn tiles attend every block.
+// (independent), independently per row of a set three times a row's alike
+// for every row (overlapping, the unions real selections make), or whole
+// pages alike for every row (pages). --qsa indexer
+// runs the QSA indexer itself before the attention, as a Flash-Next attention
+// layer does (model/Qwen4ExpTarget.cpp): its rows' query heads and keys, the
+// pooled keys of the blocks they complete, every row's scores of every complete
+// block and its bitmap, over random pooled keys of the history, a lane's rows'
+// indexer queries sharing most of their direction as consecutive tokens' do.
+// Every case with lists reports their mean entries (the union of a tile's
+// rows' blocks, which its attention reads). Without --qsa the fn tiles attend
+// every block.
 //
 // The comparison library loads into a MetalBackend of its own, which needs
 // residency_kick (kernels/shared/residency.metal) in every library it loads:
@@ -34,10 +42,14 @@
 #include "DispatchReplay.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/BlockIndexer.h"
+#include "metal/abi/RoPE.h"
+#include "ops/BlockIndexer.hpp"
 #include "ops/PagedAttention.hpp"
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -45,6 +57,8 @@
 #include <iomanip>
 #include <map>
 #include <memory>
+#include <numeric>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -73,6 +87,10 @@ constexpr uint32_t kLayer = 1;
 constexpr uint32_t kModelLayers27b = 16, kModelLayers35b = 10, kModelLayersFn = 12;
 // Qwen3.8-Flash-Next's QSA: the indexer's top_k of 2048 tokens in blocks of 4.
 constexpr uint32_t kQsaTopBlocks = 512, kQsaBlockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
+// --qsa overlapping: the blocks a tile's rows choose theirs from, three times
+// a row's, which makes unions of about 1,500 blocks, those Flash-Next's
+// verify steps make at 126K-252K tokens of real text and code.
+constexpr uint32_t kQsaOverlapBlocks = 3 * kQsaTopBlocks;
 
 AttentionShape shapeOf(const std::string &shape, kv::Format format) {
   if (shape == "fn") return AttentionShape{24, 2, 256, format, true};
@@ -101,12 +119,17 @@ uint32_t mix(uint32_t value) {
 // row 8 l, a prefill chunk's from row 0. A row with at most kQsaTopBlocks
 // complete blocks attends causally; past that to the kQsaTopBlocks of them
 // whose mix under `pattern` is least, and to its own block.
-std::vector<uint32_t> qsaBitmaps(const AttentionFixturePlan &plan, const std::string &pattern,
-                                 uint32_t &words) {
+// The words of a case's QSA bitmaps per row: a bit per block of its longest
+// lane and its tail block.
+uint32_t qsaWords(const AttentionFixturePlan &plan) {
   uint32_t visible = 0;
   for (uint32_t lane = 0; lane < plan.lanes; ++lane)
     visible = std::max(visible, plan.histories[lane] + plan.rows);
-  words = visible / kQsaBlockTokens / 32 + 2;
+  return visible / kQsaBlockTokens / 32 + 2;
+}
+
+std::vector<uint32_t> qsaBitmaps(const AttentionFixturePlan &plan, const std::string &pattern) {
+  const uint32_t words = qsaWords(plan);
   std::vector<uint32_t> bits(uint64_t{plan.lanes} * plan.rows * words, 0u);
   std::vector<std::pair<uint32_t, uint32_t>> keyed;
   for (uint32_t lane = 0; lane < plan.lanes; ++lane)
@@ -120,13 +143,19 @@ std::vector<uint32_t> qsaBitmaps(const AttentionFixturePlan &plan, const std::st
         continue;
       }
       // Pages: whole pages alike for every row; shared: blocks alike for
-      // every row; independent: blocks of each row's own.
+      // every row; independent: blocks of each row's own; overlapping: each
+      // row's own of the kQsaOverlapBlocks blocks alike for every row.
       keyed.clear();
       for (uint32_t block = 0; block < complete; ++block)
         keyed.emplace_back(pattern == "pages"         ? mix(block / 8)
                            : pattern == "independent" ? mix(block ^ mix(row + lane * 65536))
                                                       : mix(block),
                            block);
+      if (pattern == "overlapping" && keyed.size() > kQsaOverlapBlocks) {
+        std::nth_element(keyed.begin(), keyed.begin() + kQsaOverlapBlocks, keyed.end());
+        keyed.resize(kQsaOverlapBlocks);
+        for (auto &[key, block] : keyed) key = mix(block ^ mix(row + lane * 65536));
+      }
       std::nth_element(keyed.begin(), keyed.begin() + kQsaTopBlocks, keyed.end());
       for (uint32_t index = 0; index < kQsaTopBlocks; ++index) take(keyed[index].second);
     }
@@ -152,37 +181,157 @@ AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes
                                     histories, scratch, {kLayer + 1, kLayer, extentPages});
 }
 
-// A case's QSA bitmaps (qsaBitmaps) and the block lists its tiles attend
-// through: one per verify lane, or per prefill tile.
+// The QSA indexer of a case's rows (--qsa indexer): its inputs, as the
+// indexer's projections write them, and its scratch, as model/Qwen4Steps
+// sizes it. The index of every lane's pages is one extent of random pooled
+// keys, lane after lane.
+struct QsaIndexer final {
+  metal::MetalBuffer index;
+  std::vector<metal::MetalBuffer> tables;
+  std::vector<metal::MetalBuffer> pending;
+  std::vector<uint32_t> firstPositions;
+  std::vector<uint32_t> counts;
+  uint32_t laneRecords = 0;
+  // A prefill chunk's rows score in batches of model/Qwen4Steps.cpp's
+  // kPrefillScoreRows, a verify's all at once.
+  uint32_t scoreRows = 0;
+  metal::MetalBuffer records, query, key, norm, ropeCos, ropeSin, inverseFrequencies, queries, keys, scores;
+};
+
+// A value in [-1, 1) of `index` under `seed`.
+float noise(uint64_t index, uint32_t seed) {
+  return float(mix(uint32_t(index) ^ mix(uint32_t(index >> 32) + seed))) * 0x1p-31f - 1.0f;
+}
+
+uint16_t bfloat16(float value) {
+  uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  return uint16_t((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
+}
+
+template <class T> metal::MetalBuffer sharedBuffer(metal::MetalBackend &backend, uint64_t count, const char *label) {
+  return backend.allocateBuffer(std::max<uint64_t>(count * sizeof(T), 16), metal::BufferStorage::Shared, label);
+}
+
+QsaIndexer qsaIndexer(metal::MetalBackend &backend, const AttentionFixturePlan &plan, bool prefill,
+                      uint32_t stride) {
+  constexpr uint32_t D = BLOCK_INDEXER_DIMENSION, H = BLOCK_INDEXER_HEADS;
+  constexpr uint32_t pageBlocks = kv::kPageTokens / kQsaBlockTokens;
+  QsaIndexer result;
+  const uint32_t lanes = plan.lanes, rows = plan.rows, laneRows = lanes * rows;
+  uint64_t pages = 0;
+  for (uint32_t lane = 0; lane < lanes; ++lane) pages += plan.pages[lane];
+  result.index = backend.allocateBuffer(pages * pageBlocks * D * 2, metal::BufferStorage::Shared,
+                                        "attention-sweep-index", metal::BufferReach::Addressed);
+  auto *pooled = static_cast<uint16_t *>(result.index.contents());
+  for (uint64_t value = 0; value < pages * pageBlocks * D; ++value) pooled[value] = bfloat16(noise(value, 1));
+  uint64_t page = 0;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    metal::MetalBuffer table = sharedBuffer<uint64_t>(backend, plan.pages[lane], "attention-sweep-index-table");
+    auto *entries = static_cast<uint64_t *>(table.contents());
+    for (uint32_t index = 0; index < plan.pages[lane]; ++index) entries[index] = result.index.gpuAddress() | page++;
+    result.tables.push_back(std::move(table));
+    metal::MetalBuffer pending = sharedBuffer<uint16_t>(backend, BLOCK_INDEXER_PENDING * D, "attention-sweep-pending");
+    std::memset(pending.contents(), 0, pending.sizeBytes());
+    result.pending.push_back(std::move(pending));
+    result.firstPositions.push_back(plan.histories[lane]);
+  }
+  // The blocks each lane's rows complete, each rotated to its first token.
+  result.laneRecords = rows / kQsaBlockTokens + 1;
+  result.records =
+      sharedBuffer<BlockIndexerBlock>(backend, uint64_t{lanes} * result.laneRecords, "attention-sweep-blocks");
+  auto *records = static_cast<BlockIndexerBlock *>(result.records.contents());
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    uint32_t count = 0;
+    for (uint32_t last = plan.histories[lane]; last < plan.histories[lane] + rows; ++last)
+      if (last % kQsaBlockTokens == kQsaBlockTokens - 1) {
+        const uint32_t first = last + 1 - kQsaBlockTokens;
+        records[lane * result.laneRecords + count++] = {first, {first, first, first}};
+      }
+    result.counts.push_back(count);
+  }
+  // A lane's rows' query heads: the lane's own direction and a third as much
+  // of the row's.
+  result.query = sharedBuffer<float>(backend, uint64_t{laneRows} * H * D, "attention-sweep-indexer-query");
+  auto *query = static_cast<float *>(result.query.contents());
+  for (uint32_t row = 0; row < laneRows; ++row)
+    for (uint32_t value = 0; value < H * D; ++value)
+      query[uint64_t{row} * H * D + value] =
+          noise(uint64_t{row / rows} * H * D + value, 2) + noise(uint64_t{row} * H * D + value, 3) / 3;
+  result.key = sharedBuffer<float>(backend, uint64_t{laneRows} * D, "attention-sweep-indexer-key");
+  for (uint64_t value = 0; value < uint64_t{laneRows} * D; ++value)
+    static_cast<float *>(result.key.contents())[value] = noise(value, 4);
+  result.norm = sharedBuffer<float>(backend, D, "attention-sweep-indexer-norm");
+  std::fill_n(static_cast<float *>(result.norm.contents()), D, 1.0f);
+  result.inverseFrequencies = sharedBuffer<float>(backend, SPLASH_TARGET_ROPE_PAIRS, "attention-sweep-frequencies");
+  auto *frequencies = static_cast<float *>(result.inverseFrequencies.contents());
+  for (uint32_t pair = 0; pair < SPLASH_TARGET_ROPE_PAIRS; ++pair)
+    frequencies[pair] = std::pow(10'000'000.0f, -float(pair) / SPLASH_TARGET_ROPE_PAIRS);
+  result.ropeCos = sharedBuffer<float>(backend, uint64_t{laneRows} * SPLASH_TARGET_ROPE_PAIRS, "attention-sweep-cos");
+  result.ropeSin = sharedBuffer<float>(backend, uint64_t{laneRows} * SPLASH_TARGET_ROPE_PAIRS, "attention-sweep-sin");
+  for (uint32_t row = 0; row < laneRows; ++row)
+    for (uint32_t pair = 0; pair < SPLASH_TARGET_ROPE_PAIRS; ++pair) {
+      const float angle = float(plan.histories[row / rows] + row % rows) * frequencies[pair];
+      static_cast<float *>(result.ropeCos.contents())[row * SPLASH_TARGET_ROPE_PAIRS + pair] = std::cos(angle);
+      static_cast<float *>(result.ropeSin.contents())[row * SPLASH_TARGET_ROPE_PAIRS + pair] = std::sin(angle);
+    }
+  result.queries = sharedBuffer<uint16_t>(backend, uint64_t{laneRows} * H * D, "attention-sweep-indexer-queries");
+  result.keys = sharedBuffer<uint16_t>(backend, uint64_t{laneRows} * D, "attention-sweep-indexer-keys");
+  result.scoreRows = prefill ? 256 : laneRows;
+  result.scores = backend.allocateBuffer(uint64_t{result.scoreRows} * stride * sizeof(float),
+                                         metal::BufferStorage::Private, "attention-sweep-scores");
+  return result;
+}
+
+// A case's QSA bitmaps (qsaBitmaps, or the indexer's) and the block lists its
+// tiles attend through: one per verify lane, or per prefill tile.
 struct QsaBlocks final {
   metal::MetalBuffer bitmaps;
   uint32_t words = 0;
   AttentionBlocks blocks;
+  uint32_t lists = 0;
+  std::optional<QsaIndexer> indexer;
 };
 
 QsaBlocks qsaBlocks(metal::MetalBackend &backend, const AttentionFixturePlan &plan, bool prefill,
-                    const std::vector<uint32_t> &bitmaps, uint32_t words) {
+                    const std::vector<uint32_t> &bitmaps, uint32_t words, bool indexer) {
   QsaBlocks result;
   if (!words) return result;
-  const uint32_t lists = prefill ? kv::prefillAttentionTiles(plan.rows) : plan.lanes;
+  result.lists = prefill ? kv::prefillAttentionTiles(plan.rows) : plan.lanes;
   const uint32_t stride = kVerifyRows * (kQsaTopBlocks + 1);
-  result.bitmaps = backend.allocateBuffer(bitmaps.size() * sizeof(uint32_t),
-                                          metal::BufferStorage::Shared, "attention-sweep-qsa");
-  std::memcpy(result.bitmaps.contents(), bitmaps.data(), bitmaps.size() * sizeof(uint32_t));
+  result.bitmaps = sharedBuffer<uint32_t>(backend, uint64_t{plan.lanes} * plan.rows * words, "attention-sweep-qsa");
+  std::ranges::copy(bitmaps, static_cast<uint32_t *>(result.bitmaps.contents()));
   result.words = words;
-  result.blocks = {backend.allocateBuffer(uint64_t{lists} * stride * sizeof(uint32_t),
+  result.blocks = {backend.allocateBuffer(uint64_t{result.lists} * stride * sizeof(uint32_t),
                                           metal::BufferStorage::Private, "attention-sweep-lists"),
-                   backend.allocateBuffer(uint64_t{lists} * sizeof(uint32_t),
-                                          metal::BufferStorage::Private, "attention-sweep-counts"),
-                   stride, 0};
+                   sharedBuffer<uint32_t>(backend, result.lists, "attention-sweep-counts"), stride, 0};
+  if (indexer) result.indexer = qsaIndexer(backend, plan, prefill, words * 32);
   return result;
 }
 
+// The mean entries of a case's lists, as its last run left them.
+double listEntries(const QsaBlocks &qsa) {
+  if (!qsa.words) return 0.0;
+  const auto *counts = static_cast<const uint32_t *>(qsa.blocks.counts.contents());
+  return std::accumulate(counts, counts + qsa.lists, 0.0) / qsa.lists;
+}
+
 // The store and attention graph the runtime encodes for a case, after its
-// block lists when it has QSA bitmaps.
+// block lists when it has QSA bitmaps, and the indexer that selects them
+// with --qsa indexer.
 metal::CommandGraph caseGraph(const AttentionFixture &fixture, bool prefill, const QsaBlocks &qsa) {
   const AttentionFixturePlan &plan = fixture.plan();
   metal::CommandGraph graph;
+  if (const QsaIndexer *indexer = qsa.indexer ? &*qsa.indexer : nullptr) {
+    const ops::IndexerRows rows{plan.rows, indexer->firstPositions, {indexer->tables, 0}, kQsaTopBlocks, qsa.words,
+                                qsa.words * 32};
+    BlockIndexer::addProject(graph, indexer->query, indexer->key, {indexer->norm, true}, indexer->ropeCos,
+                             indexer->ropeSin, indexer->queries, indexer->keys, rows);
+    BlockIndexer::addPool(graph,
+                          {indexer->records, indexer->counts, indexer->laneRecords, indexer->keys, indexer->pending},
+                          {indexer->norm, true}, indexer->inverseFrequencies, rows);
+    BlockIndexer::addSelect(graph, indexer->queries, indexer->scores, indexer->scoreRows, qsa.bitmaps, rows);
+  }
   if (qsa.words) {
     std::vector<BlockListRows> sequences;
     for (uint32_t lane = 0; lane < plan.lanes; ++lane)
@@ -229,6 +378,7 @@ struct Case final {
   std::map<std::string, double> pipelineMilliseconds;
   uint64_t kvBytes = 0;
   uint64_t outputDigest = 0;
+  double listEntries = 0.0;
 };
 
 double median(std::vector<double> values) {
@@ -245,14 +395,15 @@ std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
   std::vector<QsaBlocks> blocks;
   std::vector<metal::CommandGraph> graphs;
   std::vector<Case> results(backends.size());
-  uint32_t words = 0;
+  // The indexer writes its own bitmaps.
+  const uint32_t words = qsa.empty() ? 0 : qsaWords(plan);
   const std::vector<uint32_t> bitmaps =
-      qsa.empty() ? std::vector<uint32_t>{} : qsaBitmaps(plan, qsa, words);
+      qsa.empty() || qsa == "indexer" ? std::vector<uint32_t>{} : qsaBitmaps(plan, qsa);
   for (size_t i = 0; i < backends.size(); ++i) {
     fixtures.push_back(
         std::make_unique<AttentionFixture>(*backends[i], plan, "attention-sweep-fixture"));
     fixtures.back()->fill();
-    blocks.push_back(qsaBlocks(*backends[i], plan, prefill, bitmaps, words));
+    blocks.push_back(qsaBlocks(*backends[i], plan, prefill, bitmaps, words, qsa == "indexer"));
     graphs.push_back(caseGraph(*fixtures.back(), prefill, blocks.back()));
     results[i].kvBytes = historyBytes(plan);
   }
@@ -264,8 +415,10 @@ std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
   for (size_t i = 1; i < fixtures.size(); ++i)
     if (!std::ranges::equal(outputBytes(*fixtures[0]), outputBytes(*fixtures[i])))
       throw std::runtime_error("comparison metallib changed attention output bits");
-  for (size_t i = 0; i < fixtures.size(); ++i)
+  for (size_t i = 0; i < fixtures.size(); ++i) {
     results[i].outputDigest = outputDigest(*fixtures[i]);
+    results[i].listEntries = listEntries(blocks[i]);
+  }
   std::vector<std::vector<double>> fused(backends.size());
   std::vector<std::map<std::string, std::vector<double>>> perPipeline(backends.size());
   for (uint32_t round = 0; round < repeat; ++round)
@@ -330,6 +483,7 @@ std::string json(const Case &item, const std::string &shape, uint32_t history,
                     ",\"kind\":\"" + kind + "\",\"lanes\":" + std::to_string(lanes) +
                     ",\"fused_ms\":" + std::to_string(item.fusedMilliseconds) +
                     ",\"kv_bytes\":" + std::to_string(item.kvBytes) +
+                    ",\"list_entries\":" + std::to_string(item.listEntries) +
                     ",\"output_digest\":\"" + hex(item.outputDigest) + "\",\"pipelines\":{";
   bool first = true;
   for (const auto &[name, milliseconds] : item.pipelineMilliseconds) {
@@ -347,7 +501,7 @@ int main(int argc, const char *argv[]) {
       std::cerr << "usage: attention-sweep METALLIB [--histories LIST] [--shapes 27b,35b,fn] "
                    "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] "
                    "[--compare-metallib PATH] [--kv-format int8|bf16] "
-                   "[--extent-pages N] [--qsa shared|independent|pages]\n";
+                   "[--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer]\n";
       return 64;
     }
     std::vector<uint32_t> histories{0, 2048, 8192, 16384, 32768, 65536, 131072};
@@ -381,8 +535,8 @@ int main(int argc, const char *argv[]) {
       else if (option == "--compare-metallib") comparisonLibrary = argv[index + 1];
       else if (option == "--qsa") {
         qsa = argv[index + 1];
-        if (qsa != "shared" && qsa != "independent" && qsa != "pages")
-          throw std::invalid_argument("--qsa takes shared, independent or pages");
+        if (qsa != "shared" && qsa != "independent" && qsa != "overlapping" && qsa != "pages" && qsa != "indexer")
+          throw std::invalid_argument("--qsa takes shared, independent, overlapping, pages or indexer");
       }
       else if (option == "--phases") {
         phases = argv[index + 1];
@@ -455,7 +609,9 @@ int main(int argc, const char *argv[]) {
             std::cerr << history << " " << (prefill ? "prefill" : "verify")
                       << " lanes=" << lane << " variant=" << i << " fused="
                       << cases[i].fusedMilliseconds << " ms digest="
-                      << hex(cases[i].outputDigest) << "\n";
+                      << hex(cases[i].outputDigest);
+            if (cases[i].listEntries) std::cerr << " list_entries=" << cases[i].listEntries;
+            std::cerr << "\n";
           }
         };
         if (phases != "verify") report(true, 1);

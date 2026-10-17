@@ -37,7 +37,7 @@ for option in --histories --lanes --repeat --shapes --phases --compare-metallib 
     reject "$option requires a value" "$option"
 done
 reject '--phases takes both, verify or prefill' --phases typo
-reject '--qsa takes shared, independent or pages' --qsa typo
+reject '--qsa takes shared, independent, overlapping, pages or indexer' --qsa typo
 reject '--qsa needs --shapes with fn' --qsa shared --shapes 27b,35b
 reject 'unknown option --unknown' --unknown 1
 # The 27B's INT8 extents hold whole 128-page alignment units.

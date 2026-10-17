@@ -501,7 +501,7 @@ std::vector<uint16_t> qsaKeys(const QsaLane &lane, uint32_t from, uint32_t rows)
 }
 
 // The records of the blocks whose last token is one of `rows` from `from`
-// (a text step's, whose RoPE positions repeat the logical one).
+// (a step's, as model/Qwen4Steps writes them for text).
 std::vector<BlockIndexerBlock> qsaRecords(uint32_t from, uint32_t rows) {
   std::vector<BlockIndexerBlock> records;
   for (uint32_t last = from; last < from + rows; ++last)
@@ -869,7 +869,8 @@ void streamMeanTest(MetalBackend &backend) {
   check(ok, "stream mean: each row's streams' mean, bf16, in its slot of wider rows");
 }
 
-// The PLE hash on the GPU against a CPU reference, of three lanes of
+// The PLE hash on the GPU against the same hash on the CPU, as
+// model/Qwen4Steps.cpp's qwen4PleRows computes it, of three lanes of
 // SPLASH_TARGET_VERIFY_ROWS rows each.
 void pleHashTest(MetalBackend &backend) {
   const uint32_t lanes = 3, laneRows = SPLASH_TARGET_VERIFY_ROWS, ngram = 3, perNgram = 8, heads = 16, eos = 248044;

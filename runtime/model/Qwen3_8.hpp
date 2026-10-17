@@ -16,6 +16,11 @@ namespace splash::model {
 struct Qwen3_8Layout final : QwenHybridLayout {
   // The family's name, as the installer pairs its draft (install/families.py).
   static constexpr std::string_view family = "Qwen3.8-27B";
+  // Its config's text model type (transformers') and its GGUFs' architecture
+  // (llama.cpp's); a safetensors checkpoint of it loads too.
+  static constexpr std::string_view modelType = "qwen3_5_text";
+  static constexpr std::string_view ggufArchitecture = "qwen35";
+  static constexpr bool loadsSafetensors = true;
 
   constexpr Qwen3_8Layout()
       : QwenHybridLayout{{.maximumContextTokens = 262'144,

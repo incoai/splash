@@ -144,6 +144,27 @@ inline std::vector<float> blockNvfp4Values(const std::vector<uint8_t> &rows) {
   return values;
 }
 
+// The block_q8_0 rows llama.cpp's quantize_row_q8_0_ref (ggml-quants.c, llama-quantize's Q8_0) writes from
+// fp32 values, as it computes them: per 32, d = amax / 127 of their largest magnitude, stored by
+// GGML_FP32_TO_FP16, and each q = roundf(x * id) with id = 1 / d of the fp32 d, or 0 when d is 0.
+inline std::vector<uint8_t> quantizeQ8_0(const std::vector<float> &x) {
+  std::vector<uint8_t> blocks(x.size() / 32 * kQuantFormats[Q80].block_bytes);
+  for (size_t i = 0; i < x.size() / 32; ++i) {
+    float amax = 0.0f;
+    for (int j = 0; j < 32; ++j) {
+      const float v = x[i * 32 + j];
+      amax = amax > fabsf(v) ? amax : fabsf(v);
+    }
+    const float d = amax / ((1 << 7) - 1);
+    const float id = d ? 1.0f / d : 0.0f;
+    uint8_t *y = blocks.data() + i * kQuantFormats[Q80].block_bytes;
+    const uint16_t h = f2h(d);
+    memcpy(y, &h, 2);
+    for (int j = 0; j < 32; ++j) y[2 + j] = uint8_t(int8_t(roundf(x[i * 32 + j] * id)));
+  }
+  return blocks;
+}
+
 // Whether a format holds 16-bit float values, BF16 or F16.
 inline bool float16(Fmt f) { return f == BF16 || f == F16; }
 // N native rows of BF16 or F16 values: per 256 a normal draw of deviation 8 h2f(scale()), the magnitudes of a

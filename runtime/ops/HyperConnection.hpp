@@ -3,8 +3,9 @@
 // Hyper-connections (kernels/shared/hyper_connection.metal): a residual of
 // several parallel fp32 streams per row, which a mix (norm, low, mix) joins
 // into a block's input in place of a norm, and to which the block's output
-// is added back, scaled by each stream's injection weight (combine). The
-// mixes' projections run through ops::Linear.
+// is added back, scaled by each stream's injection weight (combine).
+// Qwen3.8-Flash-Next's (model/Qwen4ExpTarget.cpp) composes them with the
+// mixes' projections, which run through ops::Linear.
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/HyperConnection.h"

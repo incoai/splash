@@ -8,8 +8,9 @@
 
 using namespace metal;
 
-// The n-gram embedding (metal/abi/NgramEmbedding.h), Qwen3.8-Flash-Next's PLE,
-// over a row's fp32 hyper-connected streams [rows][streams][hidden].
+// The n-gram embedding (metal/abi/NgramEmbedding.h), Qwen3.8-Flash-Next's PLE
+// (model/Qwen4Exp.hpp), over a row's fp32 hyper-connected streams
+// [rows][streams][hidden].
 
 // The gate of a row: per stream the scaled dot product of the normalized
 // key (the gathered n-gram rows' key projection) and the normalized stream,
@@ -154,9 +155,9 @@ kernel void ngram_embedding_commit(device const bfloat *input [[buffer(0)]],
   ngram_history_rows(input, history_in, history_out, p, retained[0], group, tid);
 }
 
-// The table rows of each lane's verify rows: heads of the 2- to ngram-gram
-// hashes of the row's token and those before it, cut at EOS or the
-// sequence's start.
+// The table rows of each lane's verify rows (model/Qwen4Steps.cpp qwen4PleRows
+// on the CPU): heads of the 2- to ngram-gram hashes of the row's token and
+// those before it, cut at EOS or the sequence's start.
 kernel void ngram_embedding_hash(device const uint *tokens [[buffer(0)]],
                                  device const uint *before [[buffer(1)]],
                                  device uint *indices [[buffer(2)]],

@@ -26,6 +26,9 @@
     "q20": "648a8e2b505cda5bb5a7ec1243293e04feeb61a1be719df952a0cd44953d984a",
     "ggml-nvfp4": "957ccd043df3c08f72196aa488af08e87578ed3203e277a41fc8f6bae26cc86f"
   },
+  "gguf_quantization": {
+    "q8_0": "1b386ebca183fb7123c051e01998dfc950f8a6ac257530ba576bcb98eaff04be"
+  },
   "gguf_images": {
     "dense": {
       "target/layer-0.bin": "c03f94f50978577a794cb120ae56594317e4c276400e79da7814ac76ee5feace",

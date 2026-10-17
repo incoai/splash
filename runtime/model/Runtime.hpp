@@ -8,6 +8,8 @@
 
 namespace splash::model {
 
+class RuntimeInstrumentation;
+
 class Runtime final : public RuntimeModel {
 public:
   explicit Runtime(RuntimeContext context);
@@ -84,6 +86,7 @@ private:
   decodeAsync(const BatchPlan &plan, std::span<const ModelBatchItem> items,
               std::function<void()> completion);
 
+  friend class RuntimeInstrumentation;
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

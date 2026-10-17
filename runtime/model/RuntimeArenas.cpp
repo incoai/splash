@@ -47,8 +47,6 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   put(PrefillTensor::GdnHidden,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
                          geometry.target.attentionWidth));
-  put(PrefillTensor::GdnOutput,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
   put(PrefillTensor::GateIntermediate,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
                          geometry.target.intermediateSize));
@@ -75,8 +73,10 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   put(PrefillTensor::AttentionHidden,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
                          geometry.target.attentionWidth));
-  put(PrefillTensor::AttentionOutput,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
+  // The rows a mixer adds its output to, which the FFN adds to.
+  if (geometry.target.mixersAddToHidden())
+    for (const PrefillTensor tensor : {PrefillTensor::GdnOutput, PrefillTensor::AttentionOutput})
+      put(tensor, bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
   // Three rotary axes per row (Qwen3.5 M-RoPE); text rows repeat one value.
   put(PrefillTensor::TargetPositions,
       bytesFor<uint32_t>(uint64_t{kPrefillRows} * 3));

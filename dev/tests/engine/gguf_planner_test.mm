@@ -1,14 +1,20 @@
-// The GGUF image planner on the small dense and MoE targets and a rotated
-// dense one: where each tensor goes and in which row order, which F32 tensors
-// it narrows to bf16, where a streamed table's rows are, and the sources it
-// refuses.
+// The GGUF image planner on the small dense and MoE targets, a rotated dense
+// one and a small Flash-Next one: where each tensor goes and in which row
+// order, which F32 tensors it narrows to bf16, which float projections it
+// quantizes to Q8_0, where a streamed table's rows are, which part of a split
+// GGUF each tensor is read from, and the sources it refuses.
 //   gguf-planner
 #include "GgufFixtures.hpp"
 #include "metal/abi/Gguf.h"
+#include "model/GgufPreparation.hpp"
+#include "model/GgufTarget.hpp"
+#include "model/Qwen4Exp.hpp"
 
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <bit>
+#include <memory>
 #include <optional>
 
 using namespace gguf_fixtures;
@@ -30,7 +36,7 @@ Plan plan(const std::filesystem::path &path, const model::QwenTargetDimensions &
   try {
     model::WeightSource source(path);
     const model::GgufFile gguf(source);
-    return {model::gguf::planImages(gguf, geometry, options), std::nullopt};
+    return {model::gguf::planImages(gguf, architecture(geometry), geometry, options), std::nullopt};
   } catch (const model::GgufError &error) {
     return {{}, error.what()};
   }
@@ -198,7 +204,7 @@ void checkQuantizedAlphaBeta(const std::filesystem::path &directory) {
                 pair->sources.size() == 2 && heads(pair->sources[0], "blk.0.ssm_beta.weight") &&
                 heads(pair->sources[1], "blk.0.ssm_alpha.weight"),
             "planner alpha/beta: one plane tile of " + model::ggmlTypeName(type) + " beta then alpha rows (" +
-                model::gguf::architecture(g.ffnKind) + ")" + (result.error ? ": " + *result.error : ""));
+                architecture(g) + ")" + (result.error ? ": " + *result.error : ""));
     }
     using model::gguf::Conversion;
     for (const auto &[beta, alpha] : {std::pair{kIQ4_XS, kQ8_0}, std::pair{kQ4_K, model::ggml::kF32},
@@ -242,8 +248,7 @@ void checkMoe(const std::filesystem::path &directory) {
   dense.ffnKind = model::QwenFfnKind::Dense;
   dense.intermediateSize = g.expertIntermediateSize;
   writeGguf(path, target.tensors, dense);
-  check(names(plan(path, g),
-              {"architecture", model::gguf::architecture(dense.ffnKind), model::gguf::architecture(g.ffnKind)}),
+  check(names(plan(path, g), {"architecture", architecture(dense), architecture(g)}),
         "planner checks the architecture against the model's target");
 
   writeGguf(path, target.tensors, g);
@@ -384,7 +389,7 @@ void checkRotary(const std::filesystem::path &directory) {
     splash::test::writeFile(path, test_gguf::file(keys, target.tensors));
     return plan(path, g);
   };
-  const std::string scaling = model::gguf::architecture(g.ffnKind) + std::string(".rope.scaling.type");
+  const std::string scaling = architecture(g) + ".rope.scaling.type";
   std::vector<test_gguf::Key> keys = metadata(g);
   keys.push_back(test_gguf::stringKey(scaling, "none"));
   check(!planned(keys).error, "planner accepts a GGUF that declares no RoPE scaling");
@@ -476,12 +481,11 @@ void checkRotation(const std::filesystem::path &directory) {
   }
 }
 
-// The rows of a table that streams (gguf::tableRows), such as Flash-Next's
-// PLE table: where the file holds them, as its image copies them; refused for
-// a type its image does not copy as stored and for another width.
+// The rows of a table that streams (gguf::tableRows), Flash-Next's PLE
+// table: where the file holds them, as its image copies them; refused for a
+// type its image does not copy as stored and for another width.
 void checkPleTableRows(const std::filesystem::path &directory) {
-  // Rows of 160 values, as Qwen3.8-Flash-Next's PLE table's.
-  const uint32_t columns = 160;
+  const uint32_t columns = model::Qwen4ExpLayout{}.pleHeadDimension;
   std::mt19937 rng(7);
   const auto planned = [&](uint32_t type, uint64_t tableColumns, uint64_t rows, uint64_t rowBytes,
                            std::optional<model::gguf::StreamedRows> &out, test_gguf::Bytes &table) {
@@ -527,6 +531,240 @@ void checkPleTableRows(const std::filesystem::path &directory) {
         "a PLE table of another width does not stream");
 }
 
+// The plan's repack of the named tensor in any image, or nullptr.
+const model::gguf::Repack *repackIn(const Plan &result, const std::string &name) {
+  for (const model::gguf::Image &image : result.images)
+    if (const auto *repack = repackOf(image, name)) return repack;
+  return nullptr;
+}
+
+// Qwen3.8-Flash-Next's hyper-connection projections (GgufImage.cpp
+// hyperImage) on the small qwen4exp target (qwen4ExpGeometry): of BF16 or
+// F16, Q8_0 planes whose rows the reader builds as llama.cpp's
+// quantize_row_q8_0_ref does from the values (gguf_reference::quantizeQ8_0,
+// which gguf-reference pins to GGML); of Q8_0, the rows as stored; of F32,
+// refused.
+void checkHyperConnections(const std::filesystem::path &directory) {
+  const model::QwenTargetDimensions g = qwen4ExpGeometry();
+  const auto path = directory / "hyper.gguf";
+  // The plan's rows read `source`, which the last plan opened.
+  std::unique_ptr<model::WeightSource> source;
+  const auto planned = [&](const TensorTypes &hyperTypes, std::vector<Tensor> &tensors) -> Plan {
+    TensorTypes types = qwen4ExpTypes();
+    types.insert(hyperTypes.begin(), hyperTypes.end());
+    tensors = targetTensors(g, types);
+    // Random native blocks and F32 values, and BF16 or F16 ones of q8_0Values.
+    uint32_t seed = 1300;
+    for (Tensor &tensor : tensors) {
+      uint64_t count = 1;
+      for (uint64_t dim : tensor.dims) count *= dim;
+      const uint32_t format = gguf_format_of(tensor.type);
+      tensor.data.clear();
+      if (tensor.type == model::ggml::kBF16 || tensor.type == model::ggml::kF16)
+        for (float value : q8_0Values(count, ++seed)) {
+          const uint16_t bits =
+              tensor.type == model::ggml::kF16 ? gguf_reference::f2h(value) : splash::test::floatToBf16(value);
+          tensor.data.insert(tensor.data.end(), {uint8_t(bits), uint8_t(bits >> 8)});
+        }
+      else if (format == GGUF_FMT_COUNT) tensor.data = floatValues(count, ++seed, readAsBfloat16(tensor));
+      else tensor.data = fixture(Fmt(format), uint32_t(count / tensor.dims[0]), uint32_t(tensor.dims[0]), ++seed);
+    }
+    source.reset();
+    writeGguf(path, tensors, g);
+    try {
+      source = std::make_unique<model::WeightSource>(path);
+      const model::GgufFile gguf(*source);
+      return {model::gguf::planImages(gguf, architecture(g), g), std::nullopt};
+    } catch (const model::GgufError &error) {
+      return {{}, error.what()};
+    }
+  };
+  std::vector<Tensor> tensors;
+  const Plan mixed = planned({{"hc_attn_down.weight", model::ggml::kBF16}, {"hc_attn_up.weight", model::ggml::kBF16},
+                              {"hc_ffn_down.weight", model::ggml::kF16}, {"hc_ffn_up.weight", model::ggml::kF16},
+                              {"output_hc_down.weight", kQ8_0}, {"output_hc_up.weight", kQ8_0}},
+                             tensors);
+  check(!mixed.error, "planner plans a target of BF16, F16 and Q8_0 hyper-connections" +
+                          (mixed.error ? ": " + *mixed.error : ""));
+  if (mixed.error) return;
+  std::vector<std::string> projections{"output_hc_down.weight", "output_hc_up.weight"};
+  for (uint32_t layer = 0; layer < g.layers; ++layer)
+    for (const char *stem : {"hc_attn_down", "hc_attn_up", "hc_ffn_down", "hc_ffn_up"})
+      projections.push_back("blk." + std::to_string(layer) + "." + stem + ".weight");
+  for (const std::string &name : projections) {
+    const Tensor &tensor = tensorNamed(tensors, name);
+    const uint64_t rows = tensor.dims[1], columns = tensor.dims[0];
+    const model::gguf::Repack *repack = repackIn(mixed, name);
+    const bool stored = tensor.type == kQ8_0;
+    // The Q8_0 rows of the values the tensor holds, or its rows as stored.
+    std::vector<uint8_t> expected = tensor.data;
+    if (!stored) {
+      std::vector<float> values(rows * columns);
+      for (size_t i = 0; i < values.size(); ++i) {
+        const uint16_t bits = uint16_t(tensor.data[2 * i] | tensor.data[2 * i + 1] << 8);
+        values[i] = tensor.type == model::ggml::kF16 ? gguf_reference::h2f(bits)
+                                                     : std::bit_cast<float>(uint32_t(bits) << 16);
+      }
+      expected = gguf_reference::quantizeQ8_0(values);
+    }
+    std::vector<uint8_t> rowsRead(expected.size());
+    const bool shaped = repack && repack->format == GGUF_FMT_Q80 && repack->rows == rows &&
+                        repack->columns == columns && repack->sources.size() == 1 &&
+                        repack->sources[0].type == kQ8_0 &&
+                        repack->sources[0].rowBytes == gguf_reference::rowBytes(Fmt(GGUF_FMT_Q80), uint32_t(columns)) &&
+                        (stored ? !repack->sources[0].ggufFloatRowBytes
+                                : repack->sources[0].ggufFloatType == tensor.type &&
+                                      repack->sources[0].ggufFloatRowBytes == columns * 2);
+    if (shaped) model::readRepackRows(*repack, 0, rows, rowsRead.data());
+    check(shaped && rowsRead == expected, "planner repacks " + model::ggmlTypeName(tensor.type) + " " + name +
+                                              (stored ? " as stored" : " as llama.cpp's Q8_0 of its values"));
+  }
+  check(names(planned({{"hc_ffn_up.weight", model::ggml::kF32}}, tensors),
+              {"blk.0.hc_ffn_up.weight (F32)", "blk.1.hc_ffn_up.weight (F32)"}),
+        "planner refuses an F32 hyper-connection projection by name");
+}
+
+// Qwen3.8-Flash-Next's PLE embedding on the small qwen4exp target
+// (qwen4ExpGeometry): its projections, norms and convolution in the layer it
+// feeds, and its table's rows as stored in an image of their own after the
+// embedding's. With the table streamed, that image loads none of its bytes
+// but stays planned, for the weights' records, its rows where the file holds
+// them, and every other image is the same. A GGUF that declares another PLE
+// layer is refused.
+void checkPleTable(const std::filesystem::path &directory) {
+  const model::QwenTargetDimensions g = qwen4ExpGeometry();
+  TensorTypes types = qwen4ExpTypes();
+  for (const char *name : {"hc_attn_down.weight", "hc_attn_up.weight", "hc_ffn_down.weight", "hc_ffn_up.weight",
+                           "output_hc_down.weight", "output_hc_up.weight"})
+    types[name] = kQ8_0;
+  std::vector<Tensor> tensors = targetTensors(g, types);
+  const auto path = directory / "ple.gguf";
+  writeGguf(path, tensors, g);
+  const Plan loaded = plan(path, g), streamed = plan(path, g, {.streamTable = true});
+  for (const Plan *result : {&loaded, &streamed})
+    check(!result->error, "planner plans the PLE embedding" + (result->error ? ": " + *result->error : ""));
+  if (loaded.error || streamed.error) return;
+  const std::string p = "blk." + std::to_string(g.pleLayer) + ".";
+  const model::gguf::Image &layer = loaded.images[g.pleLayer];
+  check(repackOf(layer, p + "ple_key.weight") && repackOf(layer, p + "ple_value.weight") &&
+            copyOf(layer, p + "ple_norm_key.weight") && copyOf(layer, p + "ple_norm_query.weight") &&
+            copyOf(layer, p + "ple_norm_conv.weight") && copyOf(layer, p + "ple_conv1d.weight"),
+        "planner plans the PLE projections, norms and convolution in the layer they feed");
+  const model::gguf::Image &table = loaded.images.back();
+  check(loaded.images.size() == g.layers + 3 && table.name == "ple.bin" && !table.streamedRows &&
+            model::gguf::loadedBytes(table) == table.bytes &&
+            asStored(copyOf(table, "per_layer_token_embd.weight"),
+                     tensorNamed(tensors, "per_layer_token_embd.weight").data),
+        "planner copies the PLE table's rows as stored into an image after the embedding's");
+  const model::gguf::Image &streamedTable = streamed.images.back();
+  const std::optional<model::gguf::StreamedRows> &rows = streamedTable.streamedRows;
+  bool same = streamed.images.size() == loaded.images.size();
+  for (size_t index = 0; same && index + 1 < loaded.images.size(); ++index)
+    same = !streamed.images[index].streamedRows && streamed.images[index].bytes == loaded.images[index].bytes;
+  check(same && rows && rows->tensor == "per_layer_token_embd.weight" && rows->rows == kPleTableRows &&
+            rows->rowBytes == gguf_reference::rowBytes(Fmt(GGUF_FMT_Q80), g.pleHeadDimension) &&
+            rows->format == GGUF_FMT_Q80 &&
+            model::gguf::streamedTableBytes(streamedTable) == kPleTableRows * rows->rowBytes &&
+            model::gguf::loadedBytes(streamedTable) == 0 && streamedTable.bytes == table.bytes,
+        "planner streams the PLE table's rows instead of loading its image, which its record keeps");
+  model::QwenTargetDimensions other = g;
+  other.pleLayer = 1;
+  splash::test::writeFile(path, test_gguf::file(metadata(other), tensors));
+  check(names(plan(path, g), {"ple.layers"}), "planner refuses a GGUF that declares another PLE layer");
+}
+
+// The dense target split in two as llama.cpp's gguf-split writes it, half
+// its tensors in each part, last part written first: findTargetGgufs takes
+// the parts in split order, past a file that is not a GGUF, and refuses
+// another GGUF beside them or parts of another count. The plan of the parts
+// writes the whole file's images, each tensor read from the part that holds
+// it, at its offset in that part.
+void checkSplit(const std::filesystem::path &directory) {
+  SmallTarget target = smallTarget(false);
+  const model::QwenTargetDimensions &g = target.geometry;
+  const auto whole = directory / "whole.gguf";
+  writeGguf(whole, target.tensors, g);
+  const auto split = directory / "split";
+  std::filesystem::create_directory(split);
+  const std::vector<std::filesystem::path> parts{split / "target-00001-of-00002.gguf",
+                                                 split / "target-00002-of-00002.gguf"};
+  const auto half = target.tensors.begin() + target.tensors.size() / 2;
+  const std::vector<Tensor> held[2]{{target.tensors.begin(), half}, {half, target.tensors.end()}};
+  std::map<std::string, uint32_t> partOf;
+  for (uint16_t number : {1, 0}) {
+    std::vector<test_gguf::Key> keys = number ? std::vector<test_gguf::Key>{} : metadata(g);
+    for (test_gguf::Key &key : test_gguf::splitKeys(number, 2, int32_t(target.tensors.size())))
+      keys.push_back(std::move(key));
+    splash::test::writeFile(parts[number], test_gguf::file(keys, held[number]));
+    for (const Tensor &tensor : held[number]) partOf[tensor.name] = number;
+  }
+  splash::test::writeFile(split / "target-00002-of-00002.gguf.incomplete", "a download in progress");
+  check(model::findTargetGgufs(split) == parts, "findTargetGgufs takes a split GGUF's parts in split order");
+  const auto refused = [&] {
+    try {
+      (void)model::findTargetGgufs(split);
+    } catch (const model::GgufError &error) {
+      return std::string_view(error.what()).find("not the parts of one split GGUF") != std::string_view::npos;
+    }
+    return false;
+  };
+  std::filesystem::copy_file(whole, split / "whole.gguf");
+  check(refused(), "findTargetGgufs refuses another GGUF beside a split GGUF's parts");
+  std::filesystem::remove(split / "whole.gguf");
+  std::filesystem::rename(parts[1], split / "target-00002-of-00003.gguf");
+  check(refused(), "findTargetGgufs refuses the parts of a split GGUF of another count");
+  std::filesystem::rename(split / "target-00002-of-00003.gguf", parts[1]);
+
+  // Both plans read their files, which stay open.
+  const model::OpenGguf wholeGguf({whole}), splitGguf(model::findTargetGgufs(split));
+  const model::GgufFile &file = splitGguf.file();
+  const std::vector<model::gguf::Image> reference = model::gguf::planImages(wholeGguf.file(), architecture(g), g),
+                                        images = model::gguf::planImages(file, architecture(g), g);
+  // Whether a source of the parts' plan reads the part that holds its
+  // tensor, whose bytes are at the source's offset in that part.
+  bool partRead[2]{};
+  const auto fromItsPart = [&](const model::gguf::TensorRows &rows) {
+    const uint32_t number = partOf.at(rows.name);
+    const test_gguf::Bytes &data = target.data(rows.name);
+    test_gguf::Bytes read(data.size());
+    if (rows.file != &file.source(number)) return false;
+    rows.file->readData(rows.offset, read);
+    partRead[number] = true;
+    return read == data;
+  };
+  bool same = images.size() == reference.size();
+  for (size_t index = 0; same && index < images.size(); ++index) {
+    const model::gguf::Image &image = images[index], &expected = reference[index];
+    same = image.name == expected.name && image.bytes == expected.bytes &&
+           image.fills.size() == expected.fills.size() && image.copies.size() == expected.copies.size() &&
+           image.repacks.size() == expected.repacks.size();
+    for (size_t fill = 0; same && fill < image.fills.size(); ++fill)
+      same = image.fills[fill].offset == expected.fills[fill].offset &&
+             image.fills[fill].bytes == expected.fills[fill].bytes;
+    for (size_t copy = 0; same && copy < image.copies.size(); ++copy)
+      same = image.copies[copy].destination == expected.copies[copy].destination &&
+             image.copies[copy].source.name == expected.copies[copy].source.name &&
+             fromItsPart(image.copies[copy].source);
+    for (size_t at = 0; same && at < image.repacks.size(); ++at) {
+      const model::gguf::Repack &repack = image.repacks[at], &wholeRepack = expected.repacks[at];
+      uint64_t rows = 0;
+      for (const model::gguf::TensorRows &source : repack.sources) rows += source.rows;
+      same = repack.format == wholeRepack.format && repack.columns == wholeRepack.columns &&
+             repack.plane0 == wholeRepack.plane0 && repack.sources.size() == wholeRepack.sources.size() &&
+             std::all_of(repack.sources.begin(), repack.sources.end(), fromItsPart);
+      if (!same) break;
+      // The rows the GPU repacks, which each source reads from its file.
+      std::vector<uint8_t> read(rows * model::ggufRowBytes(kQuantFormats[repack.format], repack.columns)),
+          wholeRead(read.size());
+      model::readRepackRows(repack, 0, rows, read.data());
+      model::readRepackRows(wholeRepack, 0, rows, wholeRead.data());
+      same = read == wholeRead;
+    }
+  }
+  check(same && partRead[0] && partRead[1],
+        "planner reads each tensor of a split GGUF from its part into the whole file's images");
+}
+
 } // namespace
 
 int main() {
@@ -538,6 +776,9 @@ int main() {
     guarded("planner on the rotary metadata", [&] { checkRotary(directory.path()); });
     guarded("planner on a rotated target", [&] { checkRotation(directory.path()); });
     guarded("planner on a streamed PLE table", [&] { checkPleTableRows(directory.path()); });
+    guarded("planner on Flash-Next hyper-connections", [&] { checkHyperConnections(directory.path()); });
+    guarded("planner on Flash-Next's PLE table", [&] { checkPleTable(directory.path()); });
+    guarded("planner on a split GGUF", [&] { checkSplit(directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF planner tests FAILED" : "GGUF planner tests passed", failures);
     return failures ? 1 : 0;
   }

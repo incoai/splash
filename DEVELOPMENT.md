@@ -1479,7 +1479,12 @@ selection stores alpha and beta in the file type's format (Q4_K in a Q4_K_M),
 as in lmstudio-community's files, so those load too. A format's image takes
 the bits per weight of its GGUF blocks, but for Q3_K's and Q6_K's padded meta
 units (1/16 bit more), IQ3_S's chunk words (4.06 bits for its 3.44) and BF16's
-and F16's scales (1/8 bit more).
+and F16's scales (1/8 bit more). Qwen3.8-Flash-Next's hyper-connection
+projections are the exception to loading a GGUF's formats as stored: those of
+BF16 or F16 (ISTA-DASLab's files keep them so) load as Q8_0, the type Unsloth's
+files store them in, quantized from their values as llama.cpp quantizes:
+every decode cycle reads all of them, and Q8_0 holds a value in little more
+than half the bytes. The gates they make move by less than one bf16 step.
 
 A MoE layer may hold its routed experts' gate and up weights in llama.cpp's
 fused `ffn_gate_up_exps` (`create_tensor_gate_up_exps`, as byteshape's files
@@ -1523,8 +1528,8 @@ the parameters, `GgufFile` and the planner check the rest).
 Every model decodes with a DFlash2 draft. Each family names the repository
 of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
 it as the release publishes it: `config.json` and BF16 `model.safetensors`
-(or the shards its index names); a family whose draft is not released yet
-names none, and its installation names one with `--draft-model`. Installation
+(or the shards its index names); no draft of Qwen3.8-Flash-Next is released
+yet, so its installation names one with `--draft-model`. Installation
 downloads only those files and follows the repository's default branch as it
 follows the target's ([Revisions](#revisions)); `--draft-model` accepts
 another repository, followed the same way, or a local directory that holds
@@ -1541,7 +1546,13 @@ kernels are built for (`readDraftLayout` in `ModelDescriptor.mm`); the
 kernels take any hidden width of whole 16-channel convolution groups. Every
 family loads and runs its draft alike: a decode cycle verifies every row of
 the draft's block, the anchor and its seven proposals. The target writes the
-outputs of the layers the draft reads for each row it reads. Native loading validates the
+outputs of the layers the draft reads for each row it reads;
+Qwen3.8-Flash-Next's, whose layers carry four hyper-connection streams, as
+the streams' mean, summed in fp32 and stored as bf16, as the draft was
+trained on it. `dflash_config.target_hidden_reduction` states that reduction
+(`stream_mean` for a hyper-connected target, `none` for another); a config
+without it takes its target's, and one that names another is refused.
+Native loading validates the
 configuration against the target again and loads the draft like a target
 ([Weight loading](#weight-loading)):
 `DraftCheckpointLoader` (`DraftCheckpoint.cpp`) plans the draft's `MDGG0001`
@@ -1782,14 +1793,16 @@ for the draft, `GgufTargetLoader` (`GgufTarget.cpp`, planned by
 `GgufImage.cpp`) and `GgufPreparation` for a GGUF target, `VisionLoader` and
 `VisionPreparation` for a safetensors or GGUF vision tower. `GgufPreparation`
 repacks GGUF blocks ([GGUF targets](#gguf-targets)) and safetensors tensors
-without requantization, quantizes the draft's BF16 projections
+without requantization, but for the Q8_0 of Flash-Next's BF16 or F16
+hyper-connection projections, quantizes the draft's BF16 projections
 ([Drafts](#drafts)), and computes a safetensors target's GDN decay as
 `float(-exp(double(A_log)))`, which may differ by one float ULP from MLX's float
 exponential.
 
 Loading never rounds a target or vision weight but in the F32 values of
-quantized tensors the kernels read unquantized, and in two conversions: the
-GDN decay above and the RMSNorm weights below. The first are a safetensors
+quantized tensors the kernels read unquantized, in the Q8_0 of Flash-Next's
+BF16 or F16 hyper-connection projections ([GGUF targets](#gguf-targets)), and
+in two conversions: the GDN decay above and the RMSNorm weights below. The first are a safetensors
 target's quantized router and shared-expert gate, and its quantized GDN alpha
 or beta beside one of another format or an unquantized one, an MLX target's
 ([MLX targets](#mlx-targets)) or a Model Optimizer or compressed-tensors
@@ -2044,6 +2057,27 @@ other GGUF tile.
 
 ### Sparse attention
 
+Qwen3.8-Flash-Next's full-attention layers attend sparsely (QSA): past 512
+complete blocks of 4 tokens, a query row attends only to the 512 blocks its
+indexer scores highest and to its tokens after its last complete block. The
+indexer (four query heads and one key head of 128) keeps each block's pooled
+key, bf16, in an index region of the KV pages (`PageStorage::indexOffset`),
+which its kernels reach through index tables of their own (`ops::BlockIndex`,
+today the lanes' page tables). A step projects its rows' indexer queries and
+keys, pools the blocks they complete from its rows' keys and, for the tokens
+of a block before its first row, the sequence's pending keys, scores every
+complete block for each row in one MPP product per tile of 8 rows by 32
+blocks, and selects each row's blocks into a bitmap by a radix select of its
+scores, 11 bits a pass, the first over the row and the later ones over the
+threshold bin's scores in threadgroup memory, the bitmap written a word per
+simdgroup from ballots (`kernels/shared/block_indexer.metal`). The pending keys,
+the raw keys of the up to 3 tokens of the block a sequence has not completed,
+are its state's (after the PLE history in a state cell,
+`QwenTargetDimensions::indexerPendingBytes`): a prefill writes them after its
+rows and at each state it captures, and a verify's commit after the rows the
+lane retained, so a block a rejected row completed is pooled again by the
+next step from the committed tokens. No page holds a raw key.
+
 A layout that keeps values token-major (`kv::Layout::valuesTokenMajor`)
 attends sparsely, on kernels compiled for 24 query heads over two KV heads
 (Qwen3.8-Flash-Next's): a query row attends only to the blocks of 4 tokens its
@@ -2067,7 +2101,9 @@ every layer's K/V region (`kv::Layout::indexDimension`,
 the page wherever the host copies or clears it (`PageStorage::spans`).
 `make benchmark-attention-sweep ATTENTION_SWEEP_ARGS='--shapes fn --qsa shared'`
 times the sparse kernels over synthetic selections (`--qsa` also takes
-`independent` and `pages`).
+`independent`, `overlapping`, whose unions are the ~1,500 blocks real
+selections make, and `pages`), and `--qsa indexer` the indexer itself before
+them; each case reports the mean entries of its lists.
 
 ### Neural Engine prefill
 
@@ -2965,6 +3001,15 @@ A change of the weight images' layout (`EXPECT_IMAGE_CHANGE=1`) makes
 `backend_regression` report the images it changed instead of failing on them.
 `decode-profile --dispatch-list FILE` writes the profiled B1 cycles'
 dispatches in order with their GPU time.
+
+To compare the model's numerics with another engine on the same weights,
+`make teacher-logits MODEL=... TEACHER_LOGITS_ARGS='TOKENS OUTPUT --window END:ROWS ...'`
+writes the installed model's teacher-forced next-token logits over windows of
+a file of uint32 token ids (`dev/benchmarks/teacher_logits.mm`): for each
+window, the fp32 logits of the prefill's final position and of ROWS decode
+positions after it, each computed by a verify row forced to the true next
+token, in `OUTPUT-END.f32`, and prints how well they predict the true ids. It
+also takes `--kv-format`, `--state-format` and `--expert-memory`.
 
 `benchmark-backend` lists the contexts the memory plan cannot hold in its
 report. Its cache checks reuse each context's cached prefix, so they need that

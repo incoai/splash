@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 #include "model/ExpertStore.hpp"
@@ -34,15 +35,16 @@ public:
     WeightFileRecord record;
   };
 
-  // Plans every image from the GGUF's metadata once: of its one file, or of
-  // every part of a split one in split order (findTargetGgufs). With a table
-  // store (table.cacheBytes), the rows of a table the GGUF holds stream
+  // Plans every image of the GGUF of `architecture` (its family's layout's
+  // ggufArchitecture) from its metadata once. With a table store
+  // (table.cacheBytes), the rows of a table the family's GGUF holds stream
   // through it (streamTable()) instead of loading (table()). With expert
   // memory (experts.memoryBytes), a MoE target's routed experts stream
   // (streamedExperts()) instead of loading with their layers.
   GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
-                   const std::vector<std::filesystem::path> &paths, const QwenTargetDimensions &geometry,
-                   SparseRowStoreOptions table = {}, ExpertStoreOptions experts = {});
+                   const std::vector<std::filesystem::path> &paths, std::string_view architecture,
+                   const QwenTargetDimensions &geometry, SparseRowStoreOptions table = {},
+                   ExpertStoreOptions experts = {});
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
 

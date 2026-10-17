@@ -192,11 +192,22 @@ void requireLayerTypes(NSArray *types, const QwenTargetDimensions &target,
   }
 }
 
+// Calls `use` with each family's layout, in TargetLayout's order.
+template <class Use> constexpr void forEachFamily(Use use) {
+  [&]<size_t... Family>(std::index_sequence<Family...>) {
+    (use(std::variant_alternative_t<Family, TargetLayout>{}), ...);
+  }(std::make_index_sequence<std::variant_size_v<TargetLayout>>{});
+}
+
 // Each family's native window, which its config's max_position_embeddings
 // states, fits the runtime's KV ceiling.
-static_assert(Qwen3_8Layout{}.maximumContextTokens <= kv::kMaximumLogicalTokens &&
-                  Qwen3_6MoeLayout{}.maximumContextTokens <= kv::kMaximumLogicalTokens,
-              "a family's native window exceeds the runtime's KV ceiling");
+static_assert([] {
+  bool fits = true;
+  forEachFamily([&](const auto &layout) {
+    fits = fits && layout.maximumContextTokens <= kv::kMaximumLogicalTokens;
+  });
+  return fits;
+}(), "a family's native window exceeds the runtime's KV ceiling");
 
 // The name errors give an upstream target's source: its format, safetensors
 // for MLX, Model Optimizer and compressed-tensors checkpoints alike.
@@ -207,8 +218,12 @@ std::string_view sourceName(TargetSource source) {
 // The refusal of a model of none of the families Splash serves: what tells it
 // from the family its config's model type names, or that it names none.
 std::invalid_argument unsupportedModel(const std::string &difference) {
+  std::string supported;
+  forEachFamily([&](const auto &layout) {
+    supported += (supported.empty() ? "" : ", ") + std::string(layout.family);
+  });
   return std::invalid_argument("no supported model has this architecture (" + difference + "); supported: " +
-                               std::string(Qwen3_8Layout::family) + ", " + std::string(Qwen3_6MoeLayout::family));
+                               supported);
 }
 
 // The target's text configuration, of the family its model type names. Every
@@ -554,6 +569,15 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
                   {"selector_rank", SPLASH_DRAFT_SELECTOR_RANK},
                   {"selector_top_k", SPLASH_DRAFT_CANDIDATES},
                   {"mask_token_id", target.maskToken}});
+  // How a target layer's output row becomes the hidden values the draft reads
+  // of it, as the draft was trained (target_hidden_reduction): a
+  // hyper-connected target's streams by their mean (Qwen4ExpTarget's
+  // capture), another's row as it is. A config without it states its
+  // target's.
+  const std::string_view reduction = target.hyperConnected() ? "stream_mean" : "none";
+  if (flash[@"target_hidden_reduction"])
+    requireEqual(requireString(flash, @"target_hidden_reduction", "draft config target_hidden_reduction"),
+                 reduction, "checkpoint", "draft config dflash_config target_hidden_reduction");
   NSArray *ids = requireArray(flash, @"target_layer_ids", "draft config target_layer_ids");
   std::vector<uint32_t> targetLayers;
   for (id value : ids) {
@@ -604,8 +628,11 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   NSDictionary *text = config[@"text_config"];
   if (![text isKindOfClass:[NSDictionary class]]) throw unsupportedModel("its config has no text_config");
   const auto type = requireString(text, @"model_type", "text model type");
-  const bool moe = type == "qwen3_5_moe_text";
-  if (!moe && type != "qwen3_5_text") throw unsupportedModel("text model type " + type);
+  std::optional<TargetLayout> target;
+  forEachFamily([&](const auto &layout) {
+    if (layout.modelType == type) target = layout;
+  });
+  if (!target) throw unsupportedModel("text model type " + type);
   TargetSource targetSource;
   // "mlx-affine" names every safetensors target, as installations record it.
   if (targetFormat == "mlx-affine") targetSource = TargetSource::Safetensors;
@@ -619,16 +646,17 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   // Without a draft config the descriptor names the family but has no draft
   // (inspectSourceConfiguration), and is not valid; a model root always
   // holds its draft's.
-  const TargetLayout target = moe ? TargetLayout{Qwen3_6MoeLayout{}} : TargetLayout{Qwen3_8Layout{}};
   DFlashDraftLayout dflashLayout;
   std::visit([&](const auto &layout) {
+    if (targetSource == TargetSource::Safetensors && !layout.loadsSafetensors)
+      throw std::invalid_argument(std::string(layout.family) + " loads from a GGUF only");
     validateTextConfig(text, layout, layout.family, targetSource);
     if (targetSource == TargetSource::Safetensors) requireQuantization(config, layout);
     if (draft) dflashLayout = readDraftLayout(draft, layout);
-  }, target);
-  ModelDescriptor result = makeModelDescriptor(std::move(name), target, dflashLayout,
+  }, *target);
+  ModelDescriptor result = makeModelDescriptor(std::move(name), *target, dflashLayout,
                                                {.outputHiddenSize = std::visit(
-                                                    [](const auto &layout) { return layout.hiddenSize; }, target)},
+                                                    [](const auto &layout) { return layout.hiddenSize; }, *target)},
                                                targetSource, visionSource);
   if (result.hasVision())
     validateVisionConfig(requireObject(config, @"vision_config", "vision config"), result.vision,
@@ -746,7 +774,8 @@ std::string_view inspectSourceConfiguration(std::string_view targetFormat, std::
     if (descriptor.targetSource == TargetSource::Gguf) {
       if (!ggufMetadata) throw std::invalid_argument("a GGUF target is checked with its metadata");
       const GgufMetadata metadata = readGgufMetadata(*ggufMetadata);
-      std::visit([&](const auto &layout) { gguf::requireMetadata(metadata, layout); }, descriptor.target);
+      std::visit([&](const auto &layout) { gguf::requireMetadata(metadata, layout.ggufArchitecture, layout); },
+                 descriptor.target);
     }
     return descriptor.family();
   }

@@ -34,10 +34,10 @@ struct NgramEmbeddingParams {
 static_assert(sizeof(NgramEmbeddingParams) == 24,
               "n-gram embedding parameters are 24 bytes on both sides");
 
-// The table rows (the n-gram hash) of each lane's SPLASH_TARGET_VERIFY_ROWS
-// verify rows on the GPU (ngram_embedding_hash), from the rows' tokens and
-// the ngram - 1 tokens before a lane's first row, nearest first
-// (NGRAM_EMBEDDING_NONE for none). The hash mixes the n-grams
+// The table rows (the n-gram hash, model/Qwen4Steps.hpp qwen4PleRows) of each
+// lane's SPLASH_TARGET_VERIFY_ROWS verify rows on the GPU (ngram_embedding_hash),
+// from the rows' tokens and the ngram - 1 tokens before a lane's first row,
+// nearest first (NGRAM_EMBEDDING_NONE for none). The hash mixes the n-grams
 // of 2 to `ngram` tokens, at most NGRAM_EMBEDDING_MAXIMUM_NGRAM, with a
 // multiplier per n-gram position; each n-gram's heads_per_ngram heads take
 // its hash modulo their row counts (`vocabularies`) past their `offsets`.

@@ -15,8 +15,10 @@ import httpx
 from huggingface_hub.errors import IncompleteSnapshotError
 
 from dev.tests.installer_fixtures import (
+    CONFIGS,
     DENSE,
     DRAFT_COMMIT,
+    GGUF_ONLY,
     MODEL,
     MOE,
     PROCESSOR,
@@ -36,7 +38,7 @@ from install import assembly, families, hub, models, paths, upstream
 # tells it apart.
 UNSUPPORTED = (
     "no supported model has this architecture [(]{}[)]; "
-    "supported: Qwen3.8-27B, Qwen3.6-35B-A3B"
+    "supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next"
 )
 
 
@@ -66,8 +68,10 @@ class UpstreamTest(unittest.TestCase):
 
     def test_family_is_identified_by_architecture_not_name(self):
         # The engine's check (its model-check command), with and without the
-        # draft.
+        # draft, of each family an MLX checkpoint serves.
         for family in families.FAMILIES:
+            if family in GGUF_ONLY:
+                continue
             config = mlx_target(self.root / family.name, family) / "config.json"
             draft = draft_dir(self.root / family.name / "draft", family)
             for arguments in ({}, {"draft": draft / "config.json"}):
@@ -77,6 +81,29 @@ class UpstreamTest(unittest.TestCase):
                     ),
                     family,
                 )
+        # Qwen3.8-Flash-Next loads from a GGUF: the config and metadata the
+        # installer derives from it name it, with and without its draft, and
+        # another family's draft is refused.
+        flash = families.named("Qwen3.8-Flash-Next")
+        configs = CONFIGS / flash.name.lower()
+        gguf_check = {"gguf_metadata": configs / "gguf-metadata.json"}
+        for arguments in ({}, {"draft": configs / "draft" / "config.json"}):
+            self.assertIs(
+                upstream.check_model(
+                    "gguf", "none", configs / "config.json", **gguf_check, **arguments
+                ),
+                flash,
+            )
+        with self.assertRaisesRegex(
+            models.ModelError, "draft config hidden_size mismatch: checkpoint 5120"
+        ):
+            upstream.check_model(
+                "gguf",
+                "none",
+                configs / "config.json",
+                draft=draft_dir(self.root / "draft", DENSE) / "config.json",
+                **gguf_check,
+            )
         # A differing size or model type is another model, whatever the
         # repository is called; the engine names it. A field a family's
         # fine-tune could change is refused as a mismatch.
@@ -1025,7 +1052,7 @@ class UpstreamTest(unittest.TestCase):
             f"Warning: keeping the installed {MODEL}@{'a' * 12}; cannot install "
             f"{MODEL}@{'b' * 40}: no supported model has this architecture (text "
             "config head_dim: safetensors 128, Qwen3.8-27B 256); supported: Qwen3.8-27B, "
-            "Qwen3.6-35B-A3B",
+            "Qwen3.6-35B-A3B, Qwen3.8-Flash-Next",
             warnings,
         )
         self.assertEqual(chosen.link.resolve(), installed)
