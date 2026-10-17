@@ -7,8 +7,10 @@
 // (model/GgufPreparation.hpp). A 3-D expert tensor is one quantized tensor of
 // experts * N rows.
 
+#include <array>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -125,6 +127,13 @@ struct Repack {
   uint64_t plane0 = 0, plane1 = 0, meta = 0; // image offsets; plane1 when the format has one
   std::vector<TensorRows> sources;
 };
+// A layer's routed experts when they stream from their source instead of
+// loading with the layer (PlanOptions::streamExperts, model/ExpertStore.hpp):
+// the repacks of gate, up and down, each of experts * N rows and of no image
+// section, whose rows the store reads an expert at a time.
+struct StreamedExperts {
+  std::array<Repack, 3> projections; // gate, up, down
+};
 // Where a table's rows are in its GGUF (tableRows), for reading them from the
 // file (model/SparseRowStore.hpp) instead of loading the table's image: the
 // rows exactly as the image would hold them.
@@ -145,19 +154,30 @@ struct Image {
   std::vector<Fill> fills;
   std::vector<Copy> copies;
   std::vector<Repack> repacks;
+  // A MoE layer's routed experts, when they stream: then not in the image.
+  std::optional<StreamedExperts> experts;
   // A table's rows, when they stream (PlanOptions::streamTable): then the
   // image does not load, and stands in the weights' records as when it does,
   // as the rows read are its rows.
   std::optional<StreamedRows> streamedRows;
 };
 
-// How a target's images are planned: with streamTable, the rows of a table
-// the family's GGUF holds after the embedding (Qwen3.8-Flash-Next's PLE n-gram
-// table) stream (Image::streamedRows) instead of loading as its image.
+// How a target's images are planned: with streamExperts, every MoE layer's
+// routed experts stream (Image::experts) instead of loading with it; with
+// streamTable, the rows of a table the family's GGUF holds after the
+// embedding (Qwen3.8-Flash-Next's PLE n-gram table) stream
+// (Image::streamedRows) instead of loading as its image.
 struct PlanOptions {
+  bool streamExperts = false;
   bool streamTable = false;
 };
 
+// The routed experts each layer's image streams (Image::experts), in layer
+// order; throws unless every layer's do.
+[[nodiscard]] std::vector<StreamedExperts> streamedExperts(std::span<const Image> layers);
+// The bytes of the planes of the routed experts an image streams
+// (Image::experts), 0 for none.
+[[nodiscard]] uint64_t streamedExpertBytes(const Image &image);
 // The bytes of the table rows an image streams (Image::streamedRows), 0 for
 // none.
 [[nodiscard]] uint64_t streamedTableBytes(const Image &image);
@@ -175,7 +195,8 @@ struct PlanOptions {
 // (model/SafetensorsImage.hpp) build their images with it.
 class ImageBuilder {
 public:
-  ImageBuilder(std::string name, uint32_t layer, uint32_t type);
+  // With streamExperts, routed experts stream (expertPlanes).
+  ImageBuilder(std::string name, uint32_t layer, uint32_t type, bool streamExperts = false);
 
   // A section of `bytes` bytes after the last one, and its offset.
   [[nodiscard]] uint64_t section(uint64_t bytes);
@@ -191,11 +212,20 @@ public:
   // sources the caller adds before repack() takes it.
   [[nodiscard]] Repack planes(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name);
   void repack(Repack repack);
+  // A layer's routed experts' projection of experts * N rows, gate, up and
+  // down in this order: as planes() and repack() lay out a tensor, or, when
+  // the builder streams experts, a repack of no image section, which
+  // expertRepack() keeps in Image::experts.
+  [[nodiscard]] Repack expertPlanes(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name);
+  void expertRepack(Repack repack);
   [[nodiscard]] Image finish();
 
 private:
   Image image_;
   uint64_t cursor_ = 0;
+  bool streamExperts_ = false;
+  // The routed experts' projections expertRepack() took.
+  uint32_t expertProjections_ = 0;
 };
 
 // The target geometry a GGUF's metadata declares, its architecture included,

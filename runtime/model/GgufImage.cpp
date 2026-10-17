@@ -76,8 +76,9 @@ Repack tiledRepack(uint32_t format, uint64_t rows, uint64_t columns, const std::
 class Builder {
 public:
   Builder(const GgufFile &file, const QwenTargetDimensions &geometry, std::vector<std::string> &problems,
-          std::string name, uint32_t layer, uint32_t type)
-      : file_(file), geometry_(geometry), problems_(problems), image_(std::move(name), layer, type) {}
+          std::string name, uint32_t layer, uint32_t type, PlanOptions options = {})
+      : file_(file), geometry_(geometry), problems_(problems),
+        image_(std::move(name), layer, type, options.streamExperts) {}
 
   // A norm the kernels read as F32 unrounded, as llama.cpp does
   // (ops::NormWeights): as stored, or the F32 values a BF16 or F16 one widens
@@ -101,34 +102,45 @@ public:
     image_.repack(std::move(repack));
   }
 
-  // The routed experts' gate and up tensors, of `experts` * width rows each:
-  // ffn_gate_exps and ffn_up_exps, or llama.cpp's fused ffn_gate_up_exps
-  // (create_tensor_gate_up_exps), each expert's gate rows then its up rows,
-  // which the two tensors take expert by expert.
-  void gateUpExperts(const std::string &prefix, uint64_t experts, uint64_t width, uint64_t columns) {
+  // One routed experts' tensor [experts * N, K] (routedExperts).
+  void expertTensor(const std::string &name, uint64_t rows, uint64_t columns) {
+    const GgufTensor *tensor = find(name, quantizedType);
+    if (!tensor) return;
+    if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
+    const uint32_t format = imageFormat(tensor->type);
+    Repack repack = image_.expertPlanes(format, rows, columns, name);
+    repack.sources.push_back(tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], columns)));
+    image_.expertRepack(std::move(repack));
+  }
+
+  // A layer's routed experts (ImageBuilder::expertPlanes): gate and up, of
+  // `experts` * width rows each, from ffn_gate_exps and ffn_up_exps or
+  // llama.cpp's fused ffn_gate_up_exps (create_tensor_gate_up_exps), each
+  // expert's gate rows then its up rows, which the two take expert by expert;
+  // then down, of `experts` * hidden rows, from ffn_down_exps.
+  void routedExperts(const std::string &prefix, uint64_t experts, uint64_t width, uint64_t hidden) {
     const std::string fusedName = prefix + "ffn_gate_up_exps.weight";
     if (!file_.find(fusedName)) {
-      quantized(prefix + "ffn_gate_exps.weight", experts * width, columns);
-      quantized(prefix + "ffn_up_exps.weight", experts * width, columns);
-      return;
-    }
-    const GgufTensor *fused = find(fusedName, quantizedType);
-    if (!fused) return;
-    if (fused->rows() != 2 * experts * width || fused->columns() != columns)
-      throw GgufError("unexpected shape for " + fusedName);
-    const uint32_t format = imageFormat(fused->type);
-    const TensorRows rows = tensorRows(*fused, 2 * experts * width, ggufRowBytes(kQuantFormats[format], columns));
-    // Expert e's gate rows are rows 2e width.. of the fused tensor, its up rows the next width.
-    for (const uint64_t up : {0, 1}) {
-      Repack repack = image_.planes(format, experts * width, columns, fusedName);
-      for (uint64_t expert = 0; expert < experts; ++expert) {
-        TensorRows expertRows = rows;
-        expertRows.first = (2 * expert + up) * width;
-        expertRows.rows = width;
-        repack.sources.push_back(std::move(expertRows));
+      expertTensor(prefix + "ffn_gate_exps.weight", experts * width, hidden);
+      expertTensor(prefix + "ffn_up_exps.weight", experts * width, hidden);
+    } else if (const GgufTensor *fused = find(fusedName, quantizedType)) {
+      if (fused->rows() != 2 * experts * width || fused->columns() != hidden)
+        throw GgufError("unexpected shape for " + fusedName);
+      const uint32_t format = imageFormat(fused->type);
+      const TensorRows rows = tensorRows(*fused, 2 * experts * width, ggufRowBytes(kQuantFormats[format], hidden));
+      // Expert e's gate rows are rows 2e width.. of the fused tensor, its up rows the next width.
+      for (const uint64_t up : {0, 1}) {
+        Repack repack = image_.expertPlanes(format, experts * width, hidden, fusedName);
+        for (uint64_t expert = 0; expert < experts; ++expert) {
+          TensorRows expertRows = rows;
+          expertRows.first = (2 * expert + up) * width;
+          expertRows.rows = width;
+          repack.sources.push_back(std::move(expertRows));
+        }
+        image_.expertRepack(std::move(repack));
       }
-      image_.repack(std::move(repack));
     }
+    expertTensor(prefix + "ffn_down_exps.weight", experts * hidden, width);
   }
 
   // beta (value heads rows) | alpha (value heads rows), rows in grouped head
@@ -316,10 +328,10 @@ private:
 std::string prefix(uint32_t layer) { return "blk." + std::to_string(layer) + "."; }
 
 Image layerImage(const GgufFile &file, const QwenTargetDimensions &g, std::vector<std::string> &problems,
-                 uint32_t index) {
+                 uint32_t index, PlanOptions options) {
   const std::string p = prefix(index);
   const bool full = g.isFullAttentionLayer(index);
-  Builder b(file, g, problems, "layer-" + std::to_string(index) + ".bin", index, full ? 1u : 0u);
+  Builder b(file, g, problems, "layer-" + std::to_string(index) + ".bin", index, full ? 1u : 0u, options);
   b.floatNorm(p + "attn_norm.weight", g.hiddenSize);
   if (full) {
     b.quantized(p + "attn_q.weight", 2ull * g.attentionHeadDimension * (g.attentionWidth / g.attentionHeadDimension),
@@ -346,8 +358,7 @@ Image layerImage(const GgufFile &file, const QwenTargetDimensions &g, std::vecto
   if (g.ffnKind == QwenFfnKind::SparseMoe) {
     const uint64_t routed = g.experts, width = g.expertIntermediateSize;
     b.floatTensor(p + "ffn_gate_inp.weight", routed, g.hiddenSize);
-    b.gateUpExperts(p, routed, width, g.hiddenSize);
-    b.quantized(p + "ffn_down_exps.weight", routed * g.hiddenSize, width);
+    b.routedExperts(p, routed, width, g.hiddenSize);
     b.quantized(p + "ffn_gate_shexp.weight", width, g.hiddenSize);
     b.quantized(p + "ffn_up_shexp.weight", width, g.hiddenSize);
     b.quantized(p + "ffn_down_shexp.weight", g.hiddenSize, width);
@@ -384,6 +395,25 @@ void requireRotation(const GgufFile &file, const QwenTargetDimensions &g, const 
 
 } // namespace
 
+std::vector<StreamedExperts> streamedExperts(std::span<const Image> layers) {
+  std::vector<StreamedExperts> result;
+  for (const Image &layer : layers) {
+    if (!layer.experts) throw GgufError("a target layer's experts do not stream");
+    result.push_back(*layer.experts);
+  }
+  return result;
+}
+
+uint64_t streamedExpertBytes(const Image &image) {
+  uint64_t bytes = 0;
+  if (image.experts)
+    for (const Repack &repack : image.experts->projections) {
+      const GgufPlaneBytes planes = ggufPlaneBytes(kQuantFormats[repack.format], repack.rows, repack.columns);
+      bytes += planes.plane0 + planes.plane1 + planes.meta;
+    }
+  return bytes;
+}
+
 uint64_t streamedTableBytes(const Image &image) {
   return image.streamedRows ? image.streamedRows->rows * image.streamedRows->rowBytes : 0;
 }
@@ -405,7 +435,8 @@ uint64_t convertedBytes(const TensorRows &source, Conversion conversion, uint64_
   return sourceBytes;
 }
 
-ImageBuilder::ImageBuilder(std::string name, uint32_t layer, uint32_t type) {
+ImageBuilder::ImageBuilder(std::string name, uint32_t layer, uint32_t type, bool streamExperts)
+    : streamExperts_(streamExperts) {
   image_.name = std::move(name);
   image_.magic = kGgufImageMagic;
   image_.layer = layer;
@@ -462,6 +493,19 @@ Repack ImageBuilder::planes(uint32_t format, uint64_t rows, uint64_t columns, co
 
 void ImageBuilder::repack(Repack repack) { image_.repacks.push_back(std::move(repack)); }
 
+Repack ImageBuilder::expertPlanes(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name) {
+  return streamExperts_ ? tiledRepack(format, rows, columns, name) : planes(format, rows, columns, name);
+}
+
+void ImageBuilder::expertRepack(Repack repack) {
+  if (!streamExperts_) return this->repack(std::move(repack));
+  if (!image_.experts) image_.experts.emplace();
+  auto &projections = image_.experts->projections;
+  if (expertProjections_ == projections.size())
+    throw GgufError("a layer has more than three routed expert tensors: " + image_.name);
+  projections[expertProjections_++] = std::move(repack);
+}
+
 Image ImageBuilder::finish() {
   image_.bytes = alignWeightOffset(cursor_);
   return std::move(image_);
@@ -517,13 +561,13 @@ void requireMetadata(const GgufMetadata &metadata, const QwenTargetDimensions &g
   if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
 }
 
-// No family of this build holds a table, so PlanOptions plans nothing yet.
-std::vector<Image> planImages(const GgufFile &file, const QwenTargetDimensions &geometry, PlanOptions) {
+// No family of this build holds a table, so options.streamTable plans nothing yet.
+std::vector<Image> planImages(const GgufFile &file, const QwenTargetDimensions &geometry, PlanOptions options) {
   requireMetadata(file.metadata(), geometry);
   std::vector<std::string> problems;
   std::vector<Image> images;
   for (uint32_t layer = 0; layer < geometry.layers; ++layer)
-    images.push_back(layerImage(file, geometry, problems, layer));
+    images.push_back(layerImage(file, geometry, problems, layer, options));
   Builder head(file, geometry, problems, "head.bin", geometry.layers, 2);
   head.floatNorm("output_norm.weight", geometry.hiddenSize);
   head.quantized("output.weight", geometry.vocabularySize, geometry.hiddenSize);

@@ -85,8 +85,8 @@ const char *writesGatedName(DiskWritesGate gate) noexcept {
   return "unknown";
 }
 
-// What a streamed store counts by, in the order of its uses
-// (model::SparseRowUse).
+// What the streamed stores count by, in the order of their uses
+// (model::SparseRowUse, and ops::MoePhase for model::ExpertStoreStats::uses).
 constexpr std::string_view kStreamedUses[] = {"prefill", "decode"};
 static_assert(std::size(kStreamedUses) == model::kSparseRowUses);
 
@@ -129,6 +129,38 @@ void appendStreamedTable(std::ostringstream &out, const std::optional<model::Spa
       << ",\"poisoned\":" << boolean(table->poisoned) << ",\"failure\":" << json::quote(table->failure) << '}';
 }
 
+// Streamed routed experts' store (--expert-memory), or null: its arena,
+// staging and slots, the experts resident in them, per use (prefill,
+// decode) its loads: the distinct
+// experts they routed, those not resident (read) and of them those read
+// ahead (prefetched), the experts read ahead whole, the bytes read from the
+// sources and their host steps' round trips, one per round (pickup, work,
+// resume); and why a load failed, which fails every later load.
+void appendStreamedExperts(std::ostringstream &out, const std::optional<model::ExpertStoreStats> &experts) {
+  if (!experts) {
+    out << "null";
+    return;
+  }
+  out << "{\"arena_bytes\":" << experts->arenaBytes << ",\"staging_bytes\":" << experts->stagingBytes
+      << ",\"slots\":" << experts->slots << ",\"experts\":" << experts->experts
+      << ",\"resident\":" << experts->resident;
+  for (size_t use = 0; use < std::size(kStreamedUses); ++use) {
+    const model::ExpertStoreStats::Use &counters = experts->uses[use];
+    out << ",\"" << kStreamedUses[use] << "\":{\"loads\":" << counters.loads << ",\"routed\":" << counters.routed
+        << ",\"read\":" << counters.read << ",\"prefetched\":" << counters.prefetched
+        << ",\"read_ahead\":" << counters.readAhead << ",\"hit_rate\":"
+        << (counters.routed ? double(counters.routed - counters.read) / double(counters.routed) : 0.0)
+        << ",\"read_bytes\":" << counters.readBytes << ",\"host_steps\":{\"pickup_ms\":";
+    appendLatency(out, counters.pickup);
+    out << ",\"work_ms\":";
+    appendLatency(out, counters.work);
+    out << ",\"resume_ms\":";
+    appendLatency(out, counters.resume);
+    out << "}}";
+  }
+  out << ",\"failure\":" << json::quote(experts->failure) << '}';
+}
+
 } // namespace
 
 std::string runtimeStatusJson(
@@ -141,7 +173,8 @@ std::string runtimeStatusJson(
     std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait,
     const NativeLoopTiming &loop, const WeightsSnapshot &weights,
     const AneFfnSnapshot &aneFfn, ThermalState thermalState,
-    const std::optional<model::SparseRowStats> &streamedTable) {
+    const std::optional<model::SparseRowStats> &streamedTable,
+    const std::optional<model::ExpertStoreStats> &streamedExperts) {
   const auto &resources = core.resources;
   const auto &scheduler = core.scheduler;
   const auto &pool = resources.pool;
@@ -220,6 +253,8 @@ std::string runtimeStatusJson(
   appendWeights(out, weights);
   out << ",\"streamed_table\":";
   appendStreamedTable(out, streamedTable);
+  out << ",\"streamed_experts\":";
+  appendStreamedExperts(out, streamedExperts);
   out << ",\"ane_ffn\":";
   appendAneFfn(out, aneFfn, executorTelemetry.aneFfnReruns);
   out << ",\"kv\":{\"block_tokens\":" << kv::kPageTokens

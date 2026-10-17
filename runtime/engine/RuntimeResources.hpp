@@ -129,6 +129,12 @@ struct RuntimeResourcesConfig {
   // Reclaimable host memory, sampled at every Metal operation during startup
   // and by the governor afterwards.
   MemoryGovernor::HostMemoryProvider hostMemory = queryHostMemory;
+  // --expert-memory: a MoE target's routed experts stream from their files
+  // through a store of this many bytes (its slots, staging and tables)
+  // instead of loading with their layers; zero loads them. Ignored, with a
+  // warning, for a dense target, and for bytes that hold every routed
+  // expert, which then load with their layers.
+  uint64_t expertMemoryBytes = 0;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
@@ -250,6 +256,8 @@ public:
   [[nodiscard]] AneFfnSnapshot aneFfnSnapshot() const;
   // The streamed table's store, if the model has one.
   [[nodiscard]] std::optional<model::SparseRowStats> streamedTableStats() const;
+  // The streamed routed experts' store (--expert-memory), if the model has one.
+  [[nodiscard]] std::optional<model::ExpertStoreStats> streamedExpertStats() const;
 
   [[nodiscard]] model::RuntimeContext modelContext() noexcept;
   // What the engine gives back while idle (NativeLoopConfig::weights): the
@@ -293,7 +301,7 @@ private:
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
   std::unique_ptr<ops::AneFfn> aneFfn_;
-  // Over model_'s images and aneFfn_.
+  // Over model_'s images, its expert store if it has one, and aneFfn_.
   ReleasableMemory releasableMemory_;
   AneFfnOutcome aneFfnOutcome_;
   // Ends a probation once it has lasted, unless the process stops first.

@@ -125,6 +125,35 @@ struct MoeGgufGateUpParams {
 static_assert(sizeof(MoeGgufGateUpParams) == 28,
               "MoE GGUF gate/up parameters are 28 bytes on both sides");
 
+// One projection (gate, up or down) of the experts a load writes into their
+// slots (moe_expert_load, model/ExpertStore.cpp): rows x columns in `format`,
+// job j's native rows of row_bytes each staged from wherever the job's source
+// names, and its plane0, plane1 and meta planes in the arena from planes[i]
+// on, slot_bytes[i] bytes per slot.
+struct MoeExpertLoadProjection {
+  uint32_t format;
+  uint32_t rows;
+  uint32_t columns;
+  uint32_t row_bytes;
+  uint64_t planes[3];
+  uint64_t slot_bytes[3];
+};
+
+static_assert(sizeof(MoeExpertLoadProjection) == 64,
+              "MoE expert load projections are 64 bytes on both sides");
+
+// The gate, up and down projections of one load.
+struct MoeExpertLoadParams {
+  struct MoeExpertLoadProjection projections[3];
+};
+
+static_assert(sizeof(MoeExpertLoadParams) == 192,
+              "MoE expert load parameters are 192 bytes on both sides");
+
+// The threads of a moe_expert_load threadgroup, each of which repacks one
+// (row, 32-wide K group) pair.
+#define MOE_EXPERT_LOAD_THREADS 256u
+
 struct MoeCombineParams {
   uint32_t rows;
   uint32_t hidden_size;

@@ -124,6 +124,8 @@ class RealServer:
             command.extend(("--max-memory", arguments.max_memory))
         if arguments.max_cache_disk is not None:
             command.extend(("--max-cache-disk", arguments.max_cache_disk))
+        if arguments.expert_memory is not None:
+            command.extend(("--expert-memory", arguments.expert_memory))
         if cache_dir is not None:
             command.extend(("--persistent-cache", "--cache-dir", str(cache_dir)))
         if arguments.max_image_pixels is not None:
@@ -1688,6 +1690,11 @@ def add_server_arguments(parser):
     parser.add_argument("--max-context", type=int)
     parser.add_argument("--max-memory")
     parser.add_argument("--max-cache-disk")
+    parser.add_argument(
+        "--expert-memory",
+        help="serve a MoE model's routed experts from RAM slots of this size in "
+        "all, reading the others from the SSD (splash serve --expert-memory)",
+    )
     parser.add_argument("--max-image-pixels", type=int)
     parser.add_argument("--kv-format", choices=("int8", "bf16"), default="int8")
     parser.add_argument("--startup-timeout", type=float, default=1800)

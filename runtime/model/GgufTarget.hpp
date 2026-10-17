@@ -9,6 +9,7 @@
 #include <optional>
 #include <vector>
 
+#include "model/ExpertStore.hpp"
 #include "model/GgufFile.hpp"
 #include "model/GgufImage.hpp"
 #include "model/QwenHybridLayout.hpp"
@@ -36,10 +37,12 @@ public:
   // Plans every image from the GGUF's metadata once: of its one file, or of
   // every part of a split one in split order (findTargetGgufs). With a table
   // store (table.cacheBytes), the rows of a table the GGUF holds stream
-  // through it (streamTable()) instead of loading (table()).
+  // through it (streamTable()) instead of loading (table()). With expert
+  // memory (experts.memoryBytes), a MoE target's routed experts stream
+  // (streamedExperts()) instead of loading with their layers.
   GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
                    const std::vector<std::filesystem::path> &paths, const QwenTargetDimensions &geometry,
-                   SparseRowStoreOptions table = {});
+                   SparseRowStoreOptions table = {}, ExpertStoreOptions experts = {});
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
 
@@ -59,6 +62,11 @@ public:
   // The input rotation of a Prism ML GGUF, which planImages checked names
   // every quantized tensor of the target and its token table.
   [[nodiscard]] const std::optional<GgufRotation> &rotation() const noexcept { return file().rotation(); }
+  // Whether the routed experts stream, then the store's options and every
+  // layer's experts, which read the open files the metadata was parsed from.
+  [[nodiscard]] bool streamsExperts() const noexcept { return planned_->experts.memoryBytes != 0; }
+  [[nodiscard]] const ExpertStoreOptions &expertStoreOptions() const noexcept { return planned_->experts; }
+  [[nodiscard]] StreamedBlocks streamedExperts() const;
 
 private:
   // The GGUF's files and its images, which their writers share.
@@ -70,6 +78,7 @@ private:
     std::vector<gguf::Image> images;
     uint32_t layers = 0;
     SparseRowStoreOptions table;
+    ExpertStoreOptions experts;
   };
   [[nodiscard]] WeightFile open(size_t index);
   // The plan of the table's image, or null for a family without one.

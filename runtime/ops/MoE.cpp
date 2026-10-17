@@ -257,6 +257,22 @@ void MoE::addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input,
             {width, 1, 1});
 }
 
+uint32_t MoE::expertLoadGroups(const MoeExpertLoadParams &params) noexcept {
+  uint64_t groups = 0;
+  for (const MoeExpertLoadProjection &projection : params.projections)
+    groups = std::max(groups, (uint64_t{projection.rows} * (projection.columns / 32) + MOE_EXPERT_LOAD_THREADS - 1) /
+                                  MOE_EXPERT_LOAD_THREADS);
+  return static_cast<uint32_t>(groups);
+}
+
+void MoE::addExpertLoad(metal::CommandGraph &graph, const metal::MetalBuffer &staging,
+                        const metal::MetalBuffer &arena, const metal::MetalBuffer &slots,
+                        const metal::MetalBuffer &sources, const MoeExpertLoadParams &params, uint32_t jobs,
+                        const metal::IndirectGrid &grid) {
+  graph.add("moe_expert_load", {staging, arena, slots, sources}, params, {expertLoadGroups(params), jobs, 3}, grid,
+            {MOE_EXPERT_LOAD_THREADS, 1, 1});
+}
+
 MoePlan MoE::prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config) {
   if (!rows || rows > SPLASH_PREFILL_TOKEN_BUDGET)
     throw std::invalid_argument("invalid MoE prefill rows");

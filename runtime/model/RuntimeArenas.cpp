@@ -128,6 +128,14 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       put(moeScratchTensor<PrefillTensor>(field),
           workspace.*ops::kMoeScratchFields[field].bytes);
   }
+  // A prefill group's tensors hold every chunk's rows, each chunk's aligned,
+  // and its chain's scratch cell.
+  if (geometry.prefillChunks > 1) {
+    for (uint32_t index = 0; index < result.size(); ++index)
+      if (result[index] && prefillGroupTensor(static_cast<PrefillTensor>(index)))
+        result[index] = alignUp(result[index]) * geometry.prefillChunks;
+    put(PrefillTensor::GroupCell, geometry.target.stateLayout.cellBytes());
+  }
   return result;
 }
 

@@ -89,12 +89,12 @@ struct MoeLoadPart final {
   const MoePlan *plan = nullptr;
 };
 
-// Routed experts that stream into the slots of a store, which owns the
-// blocks' slot tables. addLoad adds, after the grouping of block `block`'s
-// steps `parts` (all of one phase) and before their expert passes, what
-// makes the experts their tiles name resident and the block's table name
-// their slots; it may read a step's input (MoeBuffers::input). Several
-// steps' parts load the union of their experts at once.
+// Routed experts that stream into the slots of a store (model::ExpertStore),
+// which owns the blocks' slot tables. addLoad adds, after the grouping of
+// block `block`'s steps `parts` (all of one phase) and before their expert
+// passes, what makes the experts their tiles name resident and the block's
+// table name their slots; it may read a step's input (MoeBuffers::input).
+// Several steps' parts load the union of their experts at once.
 class MoeExpertStream {
 public:
   virtual ~MoeExpertStream() = default;
@@ -288,6 +288,18 @@ struct MoE final {
                         const QuantizedSegment &sharedScalarGate, const metal::MetalBuffer &scores,
                         const metal::MetalBuffer &selected, const metal::MetalBuffer &routingWeights, uint32_t rows,
                         MoeShape shape, FloatTile routerTile);
+  // A streamed experts' load (MoeExpertStream::addLoad): the gate, up and
+  // down projections of up to `jobs` experts, job j's projection z's native
+  // rows in `staging` from sources[3j + z] (bytes) on, repacked into the
+  // planes of slot slots[j] of `arena` as `params` lays them out. The host
+  // step before it writes the sources, the slots and the grid
+  // (expertLoadGroups threadgroups, the jobs it staged, 3) into `grid`.
+  static void addExpertLoad(metal::CommandGraph &graph, const metal::MetalBuffer &staging,
+                            const metal::MetalBuffer &arena, const metal::MetalBuffer &slots,
+                            const metal::MetalBuffer &sources, const MoeExpertLoadParams &params, uint32_t jobs,
+                            const metal::IndirectGrid &grid);
+  // The threadgroups that repack one job's largest projection.
+  [[nodiscard]] static uint32_t expertLoadGroups(const MoeExpertLoadParams &params) noexcept;
 };
 
 } // namespace splash::ops

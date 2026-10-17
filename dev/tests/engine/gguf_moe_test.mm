@@ -28,6 +28,7 @@
 //   marked empty and the rows past it unwritten. Concentrated and skewed
 //   router loads on the staged 32-row tiles of one format, at ragged row
 //   counts.
+// Streamed experts (model::ExpertStore) run in expert_store_test.mm.
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/ops/Linear.hpp"

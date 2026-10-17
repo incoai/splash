@@ -17,6 +17,7 @@ void WeightReaders::Batch::end(size_t index, std::exception_ptr failure) {
     const std::lock_guard lock(mutex_);
     failures_.emplace_back(index, std::move(failure));
   }
+  ends_[index].store(true, std::memory_order_release);
   const size_t done = done_.fetch_add(1, std::memory_order_acq_rel) + 1;
   // stop() may lower the limit to the tasks taken after this check; it then
   // finds them all done itself.
@@ -105,11 +106,15 @@ std::shared_ptr<WeightReaders::Batch> WeightReaders::start(size_t count, Task ta
   return batch;
 }
 
-void WeightReaders::stop(Batch &batch) {
-  // A stopped batch keeps the tasks taken before.
+void WeightReaders::halt(Batch &batch) {
+  // A halted batch keeps the tasks taken before.
   const size_t taken = batch.next_.exchange(batch.count_, std::memory_order_acq_rel);
   batch.limit_.store(std::min({taken, batch.count_, batch.limit_.load(std::memory_order_acquire)}),
                      std::memory_order_release);
+}
+
+void WeightReaders::stop(Batch &batch) {
+  halt(batch);
   batch.wait();
   const std::lock_guard lock(mutex_);
   std::erase_if(background_, [&](const std::shared_ptr<Batch> &queued) { return queued.get() == &batch; });

@@ -77,19 +77,22 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   const auto vision = planVisionLoader(root, result.descriptor);
   DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
   // The weights that stream from their files read on one set of readers.
-  const auto readers = options.streamedTableBytes ? std::make_shared<WeightReaders>(kWeightReaders) : nullptr;
+  const auto readers = options.streamedTableBytes || options.expertMemoryBytes
+                           ? std::make_shared<WeightReaders>(kWeightReaders)
+                           : nullptr;
+  const ExpertStoreOptions experts{.memoryBytes = options.expertMemoryBytes, .readers = readers};
   result.target = std::visit(
       [&](const auto &layout) -> TargetWeights {
         const std::filesystem::path directory = root / "target";
         switch (result.descriptor.targetSource) {
         case TargetSource::Safetensors: {
-          SafetensorsTargetLoader loader(backend, images, directory, layout);
+          SafetensorsTargetLoader loader(backend, images, directory, layout, experts);
           return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {
           // A streamed table's store (ModelLoadOptions::streamedTableBytes).
           const SparseRowStoreOptions table{.cacheBytes = options.streamedTableBytes, .readers = readers};
-          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout, table);
+          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout, table, experts);
           return readTarget(backend, layout, std::ref(loader));
         }
         }
@@ -110,6 +113,16 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   return result;
 }
 
+uint64_t routedExpertBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
+  return std::visit(
+      [&](const auto &layout) -> uint64_t {
+        if (layout.ffnKind != QwenFfnKind::SparseMoe) return 0;
+        if (descriptor.targetSource != TargetSource::Gguf) return safetensorsRoutedExpertBytes(root / "target", layout);
+        return ggufTargetBytes(root, layout, {.streamExperts = true}, gguf::streamedExpertBytes);
+      },
+      descriptor.target);
+}
+
 uint64_t streamableTableBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
   if (descriptor.targetSource != TargetSource::Gguf) return 0;
   return std::visit(
@@ -121,14 +134,19 @@ uint64_t streamableTableBytes(const std::filesystem::path &root, const ModelDesc
 
 uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor,
                           const ModelLoadOptions &options) {
-  const gguf::PlanOptions plan{.streamTable = options.streamedTableBytes != 0};
+  const gguf::PlanOptions plan{.streamExperts = options.expertMemoryBytes != 0,
+                               .streamTable = options.streamedTableBytes != 0};
   uint64_t bytes = std::visit(
       [&](const auto &layout) {
         return descriptor.targetSource == TargetSource::Gguf
                    ? ggufTargetBytes(root, layout, plan, gguf::loadedBytes)
-                   : safetensorsTargetImageBytes(root / "target", layout);
+                   : safetensorsTargetImageBytes(root / "target", layout, plan);
       },
       descriptor.target);
+  // A store allocates at most its memory (ExpertStoreOptions::memoryBytes).
+  if (plan.streamExperts &&
+      std::visit([](const auto &layout) { return layout.ffnKind == QwenFfnKind::SparseMoe; }, descriptor.target))
+    bytes += options.expertMemoryBytes;
   bytes += draftImageBytes(root / "draft", descriptor.draft);
   if (descriptor.hasVision())
     bytes += visionImageBytes(descriptor.vision);

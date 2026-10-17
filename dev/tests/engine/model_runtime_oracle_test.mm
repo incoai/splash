@@ -990,6 +990,24 @@ StateBytes restoredBytes(model::Runtime &executor, const model::QwenStateStorage
   return bytes;
 }
 
+// The rows of the positions a context window holds at `boundary`, the last
+// 2048 before it (slot position % 2048): each slot's codes, then its group
+// parameters. The window's other slots hold nothing a restore reads.
+std::vector<uint8_t> windowRows(const std::vector<uint8_t> &window, uint32_t width, uint64_t boundary) {
+  constexpr uint64_t slots = model::ExecutionLimits::draftContextTokens;
+  const uint64_t codeBytes = width / 2;
+  const uint64_t groupBytes = uint64_t{width} / SPLASH_DRAFT_CONTEXT_GROUP * 4;
+  const uint64_t parameters = draft_context_codes_bytes(width);
+  std::vector<uint8_t> rows;
+  for (uint64_t position = boundary - std::min(boundary, slots); position < boundary; ++position) {
+    const auto codes = window.begin() + static_cast<std::ptrdiff_t>((position % slots) * codeBytes);
+    const auto groups = window.begin() + static_cast<std::ptrdiff_t>(parameters + (position % slots) * groupBytes);
+    rows.insert(rows.end(), codes, codes + static_cast<std::ptrdiff_t>(codeBytes));
+    rows.insert(rows.end(), groups, groups + static_cast<std::ptrdiff_t>(groupBytes));
+  }
+  return rows;
+}
+
 // The context window of a state captured at `boundary` inside a command over
 // [begin, end) holds, in the slot of each position of its window, the row
 // the lane's window held as the command found it where the command's rows
@@ -1197,6 +1215,191 @@ void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::
   while (executor.reclaimIdleState(false, IdleMemory::Buffers)) {
   }
   std::cout << "states_captured_inside_commands=PASS\n";
+}
+
+// A prefill group (a lane's command of more than a chunk's rows, which a
+// target whose experts stream runs layer by layer) leaves what commands of
+// its chunks leave, bit for bit: the same score logits, KV, GDN cell, draft
+// rings and window and lengths, and the same states captured inside a
+// chunk, at a chunk's end and at the group's end. One prompt of three
+// chunks (2048, 2048 and 512 rows; the middle one carries its state through
+// the group's scratch cell) is prefilled in three commands, then on the same
+// pages and lane in one; then two lanes, one of whose rows end in the
+// group's first chunk, each against commands of the group's chunks.
+void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::PageStorage &pages,
+                                         const model::QwenStateStorage &states, std::span<const uint32_t> chat) {
+  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
+  if (executor.prefillGroupRows() <= chunk) {
+    std::cout << "prefill_group=SKIP (the target runs no prefill groups)\n";
+    return;
+  }
+  constexpr uint32_t rows = 2 * chunk + 512;
+  const std::vector<uint32_t> pageTable = pageRange(0, rows / kv::kPageTokens);
+  require(pages.pageCount() >= pageTable.size(), "the KV pool cannot hold the prefill group fixture");
+  // The requests prefill `rows` of it; a restore probe needs a prompt past
+  // the last captured state.
+  std::vector<uint32_t> prompt(rows + kv::kPageTokens);
+  for (uint32_t index = 0; index < prompt.size(); ++index) prompt[index] = chat[index % chat.size()];
+  const std::span<const uint32_t> tokens(prompt);
+  const auto scoring = [&](uint64_t id) {
+    EngineRequest request = makeRequest(id, {prompt.begin(), prompt.begin() + rows}, 0);
+    for (uint32_t option = 0; option < model::ExecutionLimits::maximumScoreOptions; ++option)
+      request.scoreTokens.push_back(1000 + 37 * option);
+    return request;
+  };
+  constexpr std::array<uint32_t, 4> capturedAt{1024, chunk, chunk + 1024, rows};
+  const auto prefill = [&](uint64_t id, uint32_t begin, uint32_t end) {
+    std::vector<uint32_t> captures;
+    for (const uint32_t boundary : capturedAt)
+      if (boundary > begin && boundary <= end) captures.push_back(boundary);
+    ModelStepResult result =
+        prefillChunk(executor, id, begin, tokens.subspan(begin, end - begin), pageTable, {}, captures);
+    require(result.failure.empty(), "a prefill group fixture's prefill failed: " + result.failure);
+    return result;
+  };
+  // What a prefill left on the pages and in the lane.
+  const auto kvBytes = [&] {
+    std::vector<std::vector<uint8_t>> bytes;
+    for (const uint32_t page : pageTable)
+      for (const auto &tensor : pages.spans(page)) {
+        const auto *data = reinterpret_cast<const uint8_t *>(tensor.data());
+        bytes.emplace_back(data, data + tensor.size());
+      }
+    return bytes;
+  };
+  // Every captured state holds a whole draft window (planDraftContext).
+  const auto start = [&](uint64_t id) {
+    beginCold(executor, scoring(id), 0);
+    executor.setDraftContextPlan(id, planDraftContext(0, rows, capturedAt));
+  };
+  start(501);
+  std::vector<std::shared_ptr<const CompositeState>> chunked;
+  ModelStepResult last;
+  for (uint32_t begin = 0; begin < rows; begin += chunk) {
+    last = prefill(501, begin, std::min(rows, begin + chunk));
+    chunked.insert(chunked.end(), last.capturedStates.begin(), last.capturedStates.end());
+  }
+  const std::vector<std::vector<uint8_t>> chunkedKv = kvBytes();
+  const model::QwenLogicalLengths chunkedLengths = states.metadata(0).lengths;
+  const std::vector<uint8_t> chunkedCell = bytesOf(states.current(0).stateBase);
+  const std::vector<std::vector<uint16_t>> chunkedRings = committedState(executor, states, 0).rings;
+  const std::vector<uint8_t> chunkedWindow = bytesOf(states.window(0));
+  executor.end(501);
+  start(502);
+  const ModelStepResult group = prefill(502, 0, rows);
+  require(group.scoreLogits == last.scoreLogits, "a prefill group's score logits differ from its chunks'");
+  require(kvBytes() == chunkedKv, "a prefill group's KV differs from its chunks'");
+  require(states.metadata(0).lengths == chunkedLengths && bytesOf(states.current(0).stateBase) == chunkedCell,
+          "a prefill group's GDN cell or lengths differ from its chunks'");
+  require(committedState(executor, states, 0).rings == chunkedRings && bytesOf(states.window(0)) == chunkedWindow,
+          "a prefill group's draft rings or window differ from its chunks'");
+  executor.end(502);
+  require(chunked.size() == capturedAt.size() && group.capturedStates.size() == capturedAt.size(),
+          "a prefill group or its chunks did not capture every state");
+  // A state's window holds the rows of the positions below its boundary; a
+  // state captured before a whole window's rows keeps in its other slots
+  // what its lane held, which differs between the requests.
+  const uint32_t width = states.layout().draft.contextWidth;
+  for (size_t index = 0; index < capturedAt.size(); ++index) {
+    const StateBytes left = restoredBytes(executor, states, 510, 2, tokens, capturedAt[index], chunked[index]);
+    const StateBytes right =
+        restoredBytes(executor, states, 510, 2, tokens, capturedAt[index], group.capturedStates[index]);
+    const std::string at = std::to_string(capturedAt[index]);
+    require(left.cell == right.cell, "the GDN cell of the state a prefill group captured at " + at +
+                                         " differs from its chunks'");
+    require(windowRows(left.window, width, capturedAt[index]) == windowRows(right.window, width, capturedAt[index]),
+            "the window of the state a prefill group captured at " + at + " differs from its chunks'");
+  }
+
+  // Two lanes in one group, the first lane's rows all in its first chunk:
+  // each lane leaves what it leaves in commands of the group's chunks, the
+  // first lane's command the first chunk's.
+  constexpr uint32_t firstRows = chunk / 2, secondRows = chunk + chunk / 2;
+  const std::array<std::vector<uint32_t>, 2> lanePages{pageRange(0, firstRows / kv::kPageTokens),
+                                                       pageRange(firstRows / kv::kPageTokens,
+                                                                 secondRows / kv::kPageTokens)};
+  struct Part final {
+    uint32_t lane;
+    uint32_t begin;
+    uint32_t end;
+  };
+  // One command of the parts of the requests `ids` (by lane): their score
+  // results by lane.
+  const auto command = [&](std::array<uint64_t, 2> ids, std::span<const Part> parts) {
+    BatchPlan plan{.kind = WorkKind::Prefill, .decodeStage = DecodeStage::Regular};
+    std::vector<ModelBatchItem> items;
+    for (const Part &part : parts) {
+      plan.items.push_back({ids[part.lane], part.end - part.begin});
+      ModelBatchItem item = withRevision({ids[part.lane], part.begin, part.end - part.begin, lanePages[part.lane]});
+      item.inputTokens = tokens.subspan(part.begin, part.end - part.begin);
+      items.push_back(std::move(item));
+    }
+    std::vector<ModelStepResult> results = executor.submit(plan, items, {})->wait();
+    require(results.size() == parts.size() &&
+                std::ranges::all_of(results, [](const ModelStepResult &result) { return result.failure.empty(); }),
+            "a two-lane prefill group fixture's prefill failed");
+    return results;
+  };
+  // A lane's window rows are those of its positions: a lane of fewer rows
+  // than a window keeps in its other slots what it held before, which
+  // differs between the requests.
+  struct LaneState final {
+    std::vector<float> scores;
+    std::vector<std::vector<uint8_t>> kv;
+    model::QwenLogicalLengths lengths;
+    std::vector<uint8_t> cell;
+    std::vector<std::vector<uint16_t>> rings;
+    std::vector<uint8_t> windowRows;
+  };
+  const auto laneState = [&](uint32_t lane, std::vector<float> scores) {
+    std::vector<std::vector<uint8_t>> bytes;
+    for (const uint32_t page : lanePages[lane])
+      for (const auto &tensor : pages.spans(page)) {
+        const auto *data = reinterpret_cast<const uint8_t *>(tensor.data());
+        bytes.emplace_back(data, data + tensor.size());
+      }
+    const model::QwenLogicalLengths lengths = states.metadata(lane).lengths;
+    return LaneState{std::move(scores), std::move(bytes), lengths,
+                     bytesOf(states.current(lane).stateBase), committedState(executor, states, lane).rings,
+                     windowRows(bytesOf(states.window(lane)), width, lengths.targetTokens)};
+  };
+  const auto startLanes = [&](std::array<uint64_t, 2> ids) {
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+      const uint32_t laneRows = lane ? secondRows : firstRows;
+      EngineRequest request = makeRequest(ids[lane], {prompt.begin(), prompt.begin() + laneRows}, 0);
+      request.scoreTokens = scoring(ids[lane]).scoreTokens;
+      beginCold(executor, request, lane);
+      executor.setDraftContextPlan(ids[lane], planDraftContext(0, laneRows, {}));
+    }
+  };
+  startLanes({511, 512});
+  const std::array<Part, 2> firstChunk{{{0, 0, firstRows}, {1, 0, chunk - firstRows}}};
+  const std::array<Part, 1> secondChunk{{{1, chunk - firstRows, secondRows}}};
+  const std::vector<ModelStepResult> firstCommand = command({511, 512}, firstChunk);
+  const std::vector<ModelStepResult> secondCommand = command({511, 512}, secondChunk);
+  const std::array<LaneState, 2> chunkedLanes{laneState(0, firstCommand[0].scoreLogits),
+                                              laneState(1, secondCommand[0].scoreLogits)};
+  executor.end(511);
+  executor.end(512);
+  startLanes({521, 522});
+  const std::array<Part, 2> together{{{0, 0, firstRows}, {1, 0, secondRows}}};
+  const std::vector<ModelStepResult> grouped = command({521, 522}, together);
+  for (uint32_t lane = 0; lane < 2; ++lane) {
+    const LaneState state = laneState(lane, grouped[lane].scoreLogits);
+    const LaneState &chunked = chunkedLanes[lane];
+    const std::string which = "lane " + std::to_string(lane) + " of a two-lane prefill group";
+    require(!state.scores.empty() && state.scores == chunked.scores,
+            which + ": its score logits differ from its chunks'");
+    require(state.kv == chunked.kv && state.lengths == chunked.lengths && state.cell == chunked.cell,
+            which + ": its KV, GDN cell or lengths differ from its chunks'");
+    require(state.rings == chunked.rings && state.windowRows == chunked.windowRows,
+            which + ": its draft rings or window rows differ from its chunks'");
+  }
+  executor.end(521);
+  executor.end(522);
+  while (executor.reclaimIdleState(false, IdleMemory::Buffers)) {
+  }
+  std::cout << "prefill_group_matches_its_chunks=PASS\n";
 }
 
 // A command's ticket holds the buffers of the states it captures once the
@@ -2402,20 +2605,27 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
 
 int main(int argc, char **argv) {
   try {
-    bool imagesOnly = false, warmupEosOnly = false;
+    bool imagesOnly = false, warmupEosOnly = false, prefillGroupsOnly = false;
     kv::Format format = kv::Format::Int8;
     ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
     std::optional<double> givenAneFfnShare;
     // The evaluation of the split's program that fails, counted from 1 as
     // ane::ProgramInstrumentation counts them; 0 for none.
     uint64_t aneFfnFault = 0;
+    // --expert-memory BYTES: its routed experts stream from the file into an
+    // arena of BYTES, as splash serve's --expert-memory does.
+    // --prefill-groups-only: a prefill group against its chunks' commands
+    // (requirePrefillGroupMatchesItsChunks), then stop.
+    model::ModelLoadOptions loadOptions;
     if (argc < 3)
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
-           "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION]");
+           "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--expert-memory BYTES] "
+           "[--images-only | --warmup-eos-only | --prefill-groups-only]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
       else if (option == "--warmup-eos-only") warmupEosOnly = true;
+      else if (option == "--prefill-groups-only") prefillGroupsOnly = true;
       else if (option == "--kv-format" && i + 1 < argc) {
         const std::string_view value(argv[++i]);
         if (value != "int8" && value != "bf16") fail("invalid KV format");
@@ -2435,6 +2645,11 @@ int main(int argc, char **argv) {
         char *end = nullptr;
         aneFfnFault = std::strtoull(value, &end, 10);
         if (end == value || *end || !aneFfnFault) fail("--ane-ffn-fault takes an evaluation from 1");
+      } else if (option == "--expert-memory" && i + 1 < argc) {
+        const char *value = argv[++i];
+        char *end = nullptr;
+        loadOptions.expertMemoryBytes = std::strtoull(value, &end, 10);
+        if (end == value || *end || !loadOptions.expertMemoryBytes) fail("--expert-memory takes a byte count");
       } else fail("unknown model-runtime-oracle option");
     }
     metal::MetalBackend backend(argv[1]);
@@ -2455,13 +2670,13 @@ int main(int argc, char **argv) {
     // Metal operation while loading. This oracle has no such guard, so the
     // weights must fit in reclaimable memory above the macOS reserve before
     // any is loaded; it can refuse a model production starts.
-    const uint64_t weightBytes = model::modelWeightBytes(modelRoot, descriptor);
+    const uint64_t weightBytes = model::modelWeightBytes(modelRoot, descriptor, loadOptions);
     if (*hostAvailableBytes <= hostReserveBytes ||
         weightBytes > *hostAvailableBytes - hostReserveBytes)
       stopForHostMemory("the weights need " + mebibytes(weightBytes),
                         *hostAvailableBytes, hostReserveBytes);
     model::LoadedModel model =
-        model::loadModel(backend, modelRoot, descriptor);
+        model::loadModel(backend, modelRoot, descriptor, loadOptions);
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
         model::plannedRuntimeMemory(model, operators, format, stateFormat);
@@ -2660,6 +2875,12 @@ int main(int argc, char **argv) {
         321,    60445,  55404, 11,     27224,  11,    321,    30246, 303,
         279,    1534,   4087,  13,     248046, 198,   248045, 846,   198,
         9419,   248046, 198,   248045, 74455,  198,   248068, 198};
+    if (prefillGroupsOnly) {
+      requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens);
+      std::cout << "PASS model-runtime-oracle scope=prefill-groups-only model=" << model.name()
+                << " (a prefill group leaves what its chunks' commands leave)\n";
+      return 0;
+    }
     // A natural token pattern: a run of zero tokens can make the target select
     // a stop token right after prefill, which leaves no decode cycle to test.
     std::vector<uint32_t> prompt128(128);
@@ -2768,6 +2989,7 @@ int main(int argc, char **argv) {
     requireConstrainedThinkingEndWaitsForItsMask(executor);
     requireStatesCapturedInsideCommands(executor, backend, pages, states, aneFfn.get(), samplingSeedTokens);
     requireCapturesOutliveTheirItems(executor, states, samplingSeedTokens);
+    requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens);
     requireBatchedLanesMatchReordered(executor, states, samplingSeedTokens);
 
 

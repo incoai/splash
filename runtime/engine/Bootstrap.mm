@@ -136,7 +136,8 @@ std::string RuntimeBootstrap::statusJson(const RuntimeMetricsSnapshot &metrics,
       resources_->cacheIdentity(), resources_->memoryGovernor().snapshot(),
       healthy, healthy ? std::string{} : backend.unhealthyReason(),
       nativeLoop_->resourceWaitSnapshot(), loop, nativeLoop_->weightsSnapshot(),
-      resources_->aneFfnSnapshot(), thermalState_.state(), resources_->streamedTableStats());
+      resources_->aneFfnSnapshot(), thermalState_.state(), resources_->streamedTableStats(),
+      resources_->streamedExpertStats());
 }
 
 void RuntimeBootstrap::sampleThermalState() {

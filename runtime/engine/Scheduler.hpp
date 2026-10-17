@@ -32,6 +32,9 @@ struct RequestSpec final {
   // replayed history.
   uint32_t prefillTokens = 0;
   double deadlineMilliseconds = 0.0;
+  // The most rows of one of its prefill commands (Model::prefillGroupRows): a
+  // prefill group's, which runs it alone, or a chunk's.
+  uint32_t prefillGroupRows = model::ExecutionLimits::prefillTokenBudget;
 };
 
 struct PrefillAdmission final {

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <regex>
+#include <span>
 #include <string>
 
 namespace splash::model {
@@ -30,11 +31,20 @@ std::vector<std::filesystem::path> findTargetGgufs(const std::filesystem::path &
 
 GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
                                    const std::vector<std::filesystem::path> &paths,
-                                   const QwenTargetDimensions &geometry, SparseRowStoreOptions table)
+                                   const QwenTargetDimensions &geometry, SparseRowStoreOptions table,
+                                   ExpertStoreOptions experts)
     : backend_(backend), images_(images), planned_(std::make_shared<Planned>(paths)) {
-  planned_->images = gguf::planImages(planned_->source.file(), geometry, {.streamTable = table.cacheBytes != 0});
+  planned_->images =
+      gguf::planImages(planned_->source.file(), geometry,
+                       {.streamExperts = experts.memoryBytes != 0, .streamTable = table.cacheBytes != 0});
   planned_->layers = geometry.layers;
   planned_->table = table;
+  planned_->experts = experts;
+}
+
+StreamedBlocks GgufTargetLoader::streamedExperts() const {
+  return {gguf::streamedExperts(std::span(planned_->images).first(planned_->layers)), planned_,
+          {[planned = planned_] { planned->source.checkUnchanged(); }}};
 }
 
 const gguf::Image *GgufTargetLoader::tablePlan() const noexcept {

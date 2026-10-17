@@ -34,9 +34,13 @@ using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights>;
 // How a model loads beside its descriptor: with streamedTableBytes, the rows
 // of a table the target's GGUF holds (streamableTableBytes) stream from its
 // file through a row cache of that many bytes instead of loading into memory
-// (model/SparseRowStore.hpp). Other models load as without it.
+// (model/SparseRowStore.hpp). With expertMemoryBytes, a MoE target's routed
+// experts stream from their files through a store of that many bytes
+// (model/ExpertStore.hpp, --expert-memory). Other models load as without
+// them.
 struct ModelLoadOptions final {
   uint64_t streamedTableBytes = 0;
+  uint64_t expertMemoryBytes = 0;
 };
 
 struct LoadedModel final {
@@ -74,6 +78,10 @@ struct LoadedModel final {
       return weights.manifestFingerprintSha256;
     }, target);
   }
+  // The store streamed routed experts are read through, or null.
+  [[nodiscard]] ExpertStore *expertStore() const noexcept {
+    return std::visit([](const auto &weights) -> ExpertStore * { return weights.experts.get(); }, target);
+  }
   // The store a streamed table is read through, or null.
   [[nodiscard]] SparseRowStore *streamedTable() const noexcept {
     return std::visit([](const auto &weights) -> SparseRowStore * { return weights.streamedTable.get(); }, target);
@@ -102,9 +110,13 @@ struct RuntimeContext final {
 // architectures. Each architecture validates its own tensor and state layout.
 void requireCompatibleModel(const LoadedModel &model);
 
-// The bytes of the images loadModel writes, without a table that streams.
+// The bytes of the images loadModel writes, without a table or routed experts
+// that stream, and of the store streamed experts load into.
 [[nodiscard]] uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor,
                                         const ModelLoadOptions &options = {});
+// The bytes of the planes of a MoE target's routed experts, which an expert
+// store holding them all takes; 0 for a dense target.
+[[nodiscard]] uint64_t routedExpertBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor);
 // The bytes of the rows of the table a target's GGUF holds, which stream from
 // it instead of loading with streamedTableBytes (gguf::PlanOptions::streamTable);
 // 0 for a target without one. Throws for a table that cannot stream

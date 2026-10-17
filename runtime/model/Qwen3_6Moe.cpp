@@ -15,8 +15,8 @@ loadQwen3_6MoeWeights(metal::MetalBackend &backend, Qwen3_6MoeLayout layout,
       backend, layout, files, [&](auto &loader, const BlockTargetFormat &format, const MoeExperts &experts) {
         return readQwenTargetWeights<Qwen3_6MoeWeights>(
             layout, loader, format,
-            [&](WeightFile &file, Qwen3_6MoeLayerWeights &layer, const BlockTargetFormat &) {
-              layer.ffn = readMoeBlock(file, experts);
+            [&](WeightFile &file, Qwen3_6MoeLayerWeights &layer, const BlockTargetFormat &, uint32_t index) {
+              layer.ffn = readMoeBlock(file, experts, index);
             });
       });
 }

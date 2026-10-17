@@ -55,22 +55,42 @@ QwenMixerWeights readQwenMixer(WeightFile &file, const BlockTargetFormat &format
   return gdn;
 }
 
-MoeExperts openMoeExperts(metal::MetalBackend &backend, const QwenTargetDimensions &target) {
-  return {residentExpertSlots(backend, target.experts), target.experts};
+MoeExperts openMoeExperts(metal::MetalBackend &backend, const QwenTargetFiles &files,
+                          const QwenTargetDimensions &target) {
+  return std::visit(
+      [&](const auto &source) {
+        const auto &loader = source.get();
+        MoeExperts result{.experts = target.experts};
+        if (!loader.streamsExperts()) {
+          result.resident = residentExpertSlots(backend, target.experts);
+          return result;
+        }
+        result.store = std::make_shared<ExpertStore>(
+            backend, loader.streamedExperts(),
+            ops::MoeShape{target.hiddenSize, target.experts, target.expertsPerToken, target.expertIntermediateSize},
+            loader.expertStoreOptions());
+        return result;
+      },
+      files);
 }
 
-ops::BlockMoeWeights readMoeBlock(WeightFile &file, const MoeExperts &experts) {
+ops::BlockMoeWeights readMoeBlock(WeightFile &file, const MoeExperts &experts, uint32_t block) {
   ops::BlockMoeWeights ffn;
   ffn.router = readQuantizedSegment(file, "router");
-  ffn.gate.routed = readQuantizedSegment(file, "experts-gate");
-  ffn.up.routed = readQuantizedSegment(file, "experts-up");
-  ffn.down.routed = readQuantizedSegment(file, "experts-down");
-  ffn.slotTable = experts.resident;
-  ffn.slots = experts.experts;
+  if (!experts.store) {
+    ffn.gate.routed = readQuantizedSegment(file, "experts-gate");
+    ffn.up.routed = readQuantizedSegment(file, "experts-up");
+    ffn.down.routed = readQuantizedSegment(file, "experts-down");
+    ffn.slotTable = experts.resident;
+    ffn.slots = experts.experts;
+  }
   ffn.gate.shared = readQuantizedSegment(file, "shared-expert-gate");
   ffn.up.shared = readQuantizedSegment(file, "shared-expert-up");
   ffn.down.shared = readQuantizedSegment(file, "shared-expert-down");
   ffn.sharedScalarGate = readQuantizedSegment(file, "shared-expert-scalar-gate");
+  // The store keeps the block's router and scalar gate, which predict its
+  // routes.
+  if (experts.store) experts.store->bind(block, ffn);
   return ffn;
 }
 

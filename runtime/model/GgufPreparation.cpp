@@ -516,6 +516,36 @@ void writeDecoded(metal::MetalBackend &backend, const metal::MetalBuffer &image,
 
 } // namespace
 
+void readRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count, uint8_t *to) {
+  uint64_t sourceRows = 0;
+  for (const gguf::TensorRows &tensor : repack.sources) sourceRows += tensor.rows;
+  if (first > sourceRows || count > sourceRows - first) throw GgufError("repack rows are out of bounds");
+  const uint64_t rowBytes = ggufRowBytes(kQuantFormats[repack.format], repack.columns);
+  uint64_t start = 0;
+  for (const gguf::TensorRows &tensor : repack.sources) {
+    const uint64_t begin = std::max(first, start), end = std::min(first + count, start + tensor.rows);
+    if (begin < end) readRows(tensor, begin - start, end - begin, 0, rowBytes, to + (begin - first) * rowBytes);
+    start += tensor.rows;
+  }
+}
+
+std::optional<StoredRows> storedRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count) {
+  const uint64_t rowBytes = ggufRowBytes(kQuantFormats[repack.format], repack.columns);
+  uint64_t start = 0;
+  for (const gguf::TensorRows &tensor : repack.sources) {
+    if (first >= start && first - start < tensor.rows) {
+      const uint64_t row = first - start;
+      // A permutation (RowOrder) leaves single rows where they are.
+      if (count > tensor.rows - row || rowReader(tensor) != RowReader::Stored || tensor.rowBytes != rowBytes ||
+          !tensor.file || (count > 1 && tensor.order.from < row + count))
+        return std::nullopt;
+      return StoredRows{tensor.file, tensor.file->dataOffset() + tensor.offset + sourceRow(tensor, row) * rowBytes};
+    }
+    start += tensor.rows;
+  }
+  throw GgufError("repack rows are out of bounds");
+}
+
 void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &image, const gguf::Image &plan) {
   const std::span<uint8_t> destination = contentsOf(image);
   if (destination.size() != plan.bytes) throw GgufError("GGUF image size differs from its plan");

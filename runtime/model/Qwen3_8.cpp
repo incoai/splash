@@ -50,7 +50,7 @@ void rotateInputs(metal::MetalBackend &backend, Qwen3_8Weights &weights, const G
 
 Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend, Qwen3_8Layout layout,
                                   const QwenTargetFiles &files) {
-  const auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer, const BlockTargetFormat &format) {
+  const auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer, const BlockTargetFormat &format, uint32_t) {
     layer.gateProjection =
         format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
     layer.upProjection =

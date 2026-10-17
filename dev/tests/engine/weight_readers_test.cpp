@@ -3,10 +3,11 @@
 // background batch on at most its readers; a failed task is tried once more,
 // and a second failure is the batch's (a batch that runs now throws it once
 // every task ended); stop() leaves the tasks no reader took unrun and
-// returns once those taken ended, finish() runs the rest now and returns
-// once the batch's end has; a batch that runs now never waits behind a
-// background batch's queue; and several threads run, start, stop and finish
-// batches at once. Built under TSan too.
+// returns once those taken ended, halt() returns at once and each taken
+// task tells when it ended, finish() runs the rest now and returns once the
+// batch's end has; a batch that runs now never waits behind a background
+// batch's queue; and several threads run, start, stop and finish batches at
+// once. Built under TSan too.
 #include "TestChecks.hpp"
 #include "model/WeightReaders.hpp"
 
@@ -183,6 +184,33 @@ void stopLeavesTheRestUnread() {
   require(batch->taken() == taken, "stopping a stopped batch changed it");
 }
 
+void haltLeavesTheTakenRunning() {
+  WeightReaders pool(4);
+  Runs runs(100);
+  Gate gate;
+  std::atomic<int> began = 0;
+  const auto batch = pool.start(
+      runs.counts.size(),
+      [&](size_t index) {
+        ++began;
+        gate.wait();
+        ++runs.counts[index];
+      },
+      3);
+  while (began.load() < 3) std::this_thread::yield();
+  pool.halt(*batch);
+  const size_t taken = batch->taken();
+  require(taken >= 3 && taken < runs.counts.size(), "a halted batch reports other tasks taken");
+  for (size_t index = 0; index < taken; ++index)
+    require(!batch->ended(index) && !runs.counts[index].load(), "a halted batch waited for a task a reader took");
+  gate.open();
+  for (size_t index = 0; index < taken; ++index)
+    while (!batch->ended(index)) std::this_thread::yield();
+  require(runs.eachOnce(0, taken), "a task a reader took did not end after halt()");
+  pool.stop(*batch);
+  require(batch->taken() == taken && runs.noneFrom(taken), "a halted batch ran more tasks, or stop() changed it");
+}
+
 void runNowPassesTheBackground() {
   WeightReaders pool(4);
   Runs background(400), now(32);
@@ -239,6 +267,7 @@ int main() {
     backgroundRunsOnItsReaders();
     finishWaitsForTheEnd();
     stopLeavesTheRestUnread();
+    haltLeavesTheTakenRunning();
     runNowPassesTheBackground();
     threadsShareTheReaders();
   } catch (const std::exception &error) {

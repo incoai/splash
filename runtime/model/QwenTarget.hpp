@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -54,11 +55,14 @@ struct QwenAttentionWeights final {
 
 using QwenMixerWeights = std::variant<QwenGdnWeights, QwenAttentionWeights>;
 
+class ExpertStore;
 class SparseRowStore;
 
 // A Qwen target's weights outside its layers and the record of every file
-// its weights were read from. A target whose table streams from its file
-// reads its rows through `streamedTable` (model/SparseRowStore.hpp).
+// its weights were read from. A MoE target whose routed experts stream reads
+// them through `experts` (model/ExpertStore.hpp), and a target whose table
+// streams from its file reads its rows through `streamedTable`
+// (model/SparseRowStore.hpp).
 struct QwenTargetWeightsBase {
   ops::NormWeights finalNorm;
   ops::Projection logitsProjection;
@@ -66,6 +70,7 @@ struct QwenTargetWeightsBase {
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
   std::string manifestFingerprintSha256;
+  std::shared_ptr<ExpertStore> experts;
   std::shared_ptr<SparseRowStore> streamedTable;
 };
 
@@ -225,6 +230,14 @@ struct QwenTargetPrefillBuffers final {
   }
 };
 
+// A chunk of a prefill command: `rows` rows of its lanes' sequences, packed
+// in sequence order, in its own buffers.
+struct QwenTargetPrefillChunk final {
+  QwenTargetPrefillBuffers buffers;
+  std::span<const QwenTargetPrefillSequence> sequences;
+  uint32_t rows = 0;
+};
+
 struct QwenTargetVerifyBuffers final {
   ops::LinearScratch linearScratch{};
   std::array<metal::MetalBuffer, 2> hidden;
@@ -283,13 +296,17 @@ public:
   // stale activations and write results no active row reads.
   [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
 
-  // Returns the hidden buffer that holds the last layer's output rows. The
-  // dense FFN of a chunk the split takes (AneFfn::splits) runs split with the
-  // Neural Engine on `aneFfn`, when given.
-  [[nodiscard]] metal::MetalBuffer addPrefill(
-      metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
-      std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-      std::span<const SplashKvLayer> kvLayers, ops::AneFfn *aneFfn = nullptr) const;
+  // A prefill command of one or more chunks (a prefill group), run layer by
+  // layer: a layer of each chunk in turn, then the next layer, so that a
+  // layer whose experts stream loads the union of the chunks' experts once.
+  // A chunk's sequences read the states and KV that the chunks before it
+  // wrote. The dense FFN of a command of one chunk the split takes
+  // (AneFfn::splits) runs split with the Neural Engine on `aneFfn`, when
+  // given. Returns each chunk's buffer of its last layer's output rows.
+  [[nodiscard]] std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph,
+                                                           std::span<const QwenTargetPrefillChunk> chunks,
+                                                           std::span<const SplashKvLayer> kvLayers,
+                                                           ops::AneFfn *aneFfn = nullptr) const;
   void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       std::span<const SplashKvLayer> kvLayers,
@@ -315,9 +332,13 @@ private:
   struct PrefillStep;
   struct VerifyStep;
 
-  // A prefill layer of a step (addPrefill): addPrefillLayer runs it through
-  // its FFN's routing, then, after the layer's load of streamed experts,
-  // addPrefillExperts its routed work.
+  // A prefill's layers over its chunks' steps (addPrefill): per layer, each
+  // step through its FFN's routing (addPrefillLayer), the layer's load of
+  // streamed experts, and each step's routed work (addPrefillExperts); then
+  // each step's last layer's output rows.
+  template <class Weights>
+  [[nodiscard]] std::vector<metal::MetalBuffer> addPrefillLayers(std::span<PrefillStep> steps,
+                                                                 const Weights &weights) const;
   template <class Layout, class Layer>
   void addPrefillLayer(PrefillStep &step, const QwenTargetWeights<Layout, Layer> &weights, uint32_t index) const;
   template <class Layout, class Layer>

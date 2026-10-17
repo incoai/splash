@@ -1,5 +1,6 @@
 #pragma clang fp reassociate(off)
 #include "metal/abi/GgufRepack.h"
+#include "metal/abi/MoE.h"
 #include <metal_stdlib>
 
 using namespace metal;
@@ -32,22 +33,21 @@ static inline void gguf_copy_native(device const uchar *blk, uint j, constant Qu
   for (uint i = 0; i < f.plane1_bytes; ++i) out1[i] = blk[at1 + f.plane1_bytes * j + i];
   if (j == 0) for (uint i = 0; i < f.meta_bytes; ++i) meta[i] = blk[atMeta + i];
 }
-kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
-                      constant GgufRepackParams &p [[buffer(2)]], uint t [[thread_position_in_grid]]) {
-  const uint G = p.input_size / 32;
-  if (t >= p.rows * G) return;
-  const uint n = t / G, g = t % G;
-  constant QuantFormat &f = kQuantFormats[p.fmt];
+// Group g (32 wide) of row n of a tensor of G groups a row in format fmt: its native row from `row` on, written
+// into its plane0, plane1 and meta planes, each [rows / QUANT_TILE_ROWS][units][QUANT_TILE_ROWS].
+static inline void gguf_repack_group(device const uchar *row, uint fmt, uint G, uint n, uint g, device uchar *plane0,
+                                     device uchar *plane1, device uchar *meta_plane) {
+  constant QuantFormat &f = kQuantFormats[fmt];
   const uint b = g / f.meta_groups, j = g % f.meta_groups;   // native block b holds meta unit b
-  device const uchar *blk = src + ulong(n) * p.src_row_bytes + ulong(b) * f.block_bytes;
-  device uchar *out0 = dst + quant_tile_index(n, g, G) * f.plane0_bytes;
-  device uchar *out1 = dst + p.dst_plane1 + quant_tile_index(n, g, G) * f.plane1_bytes;
-  device uchar *meta = dst + p.dst_meta + quant_tile_index(n, b, G / f.meta_groups) * f.meta_bytes;
+  device const uchar *blk = row + ulong(b) * f.block_bytes;
+  device uchar *out0 = plane0 + quant_tile_index(n, g, G) * f.plane0_bytes;
+  device uchar *out1 = plane1 + quant_tile_index(n, g, G) * f.plane1_bytes;
+  device uchar *meta = meta_plane + quant_tile_index(n, b, G / f.meta_groups) * f.meta_bytes;
   uchar lo[32], hi[32];   // per slot: the (low) code and its high bits
-  if (quant_affine_format(p.fmt)) {
+  if (quant_affine_format(fmt)) {
     // MLX affine {s, z, codes}: element e of group j is code 32 j + e of the codes' bit string. The planes keep its
     // low 2 (2, 3 bits) or 4 bits (4, 5, 6) and the rest as Q2_K, Q3_K, Q4_K, Q5_K and Q6_K do; 8 bits as Q8_0.
-    const uint bits = quant_affine_bits(p.fmt), low = bits == 8 ? 8 : bits <= 3 ? 2 : 4;
+    const uint bits = quant_affine_bits(fmt), low = bits == 8 ? 8 : bits <= 3 ? 2 : 4;
     device const uchar *codes = blk + 4;
     for (uint e = 0; e < 32; ++e) {
       const uint at = (32 * j + e) * bits, shift = at % 8;
@@ -61,7 +61,7 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
     if (j == 0) for (uint i = 0; i < 4; ++i) meta[i] = blk[i];
     return;
   }
-  switch (p.fmt) {
+  switch (fmt) {
     case GGUF_FMT_Q4K: {
       for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = (blk[16 + (j / 2) * 32 + e] >> (4 * (j % 2))) & 15;
       gguf_store_pairs(lo, out0);
@@ -127,7 +127,7 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
     }
     case GGUF_FMT_IQ4NL: case GGUF_FMT_Q40: case GGUF_FMT_Q41: case GGUF_FMT_MXFP4: {   // the meta unit, then qs[16]
       for (uint l = 0; l < 16; ++l) { const uchar q = blk[f.meta_bytes + l]; lo[quant_slot(l)] = q & 15; lo[quant_slot(16 + l)] = q >> 4; }
-      if (p.fmt == GGUF_FMT_Q40 || p.fmt == GGUF_FMT_Q41) gguf_store_pairs(lo, out0); else gguf_store_bits(lo, 4, out0);
+      if (fmt == GGUF_FMT_Q40 || fmt == GGUF_FMT_Q41) gguf_store_pairs(lo, out0); else gguf_store_bits(lo, 4, out0);
       for (uint i = 0; i < f.meta_bytes; ++i) meta[i] = blk[i];
       break;
     }
@@ -186,4 +186,31 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
       break;
     }
   }
+}
+
+kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
+                        constant GgufRepackParams &p [[buffer(2)]], uint t [[thread_position_in_grid]]) {
+  const uint G = p.input_size / 32;
+  if (t >= p.rows * G) return;
+  const uint n = t / G, g = t % G;
+  gguf_repack_group(src + ulong(n) * p.src_row_bytes, p.fmt, G, n, g, dst, dst + p.dst_plane1, dst + p.dst_meta);
+}
+
+// Streamed experts into their slots (model/ExpertStore.cpp): threadgroup (x, y, z) repacks MOE_EXPERT_LOAD_THREADS
+// (row, 32-wide K group) pairs of projection z of job y, as gguf_repack does, from the native rows the host staged
+// for it from staging + sources[3y + z] on into the planes of slot slots[y]. The grid's jobs are the host's (an
+// indirect grid it writes in the step before).
+kernel void moe_expert_load(device const uchar *staging [[buffer(0)]], device uchar *arena [[buffer(1)]],
+                            device const uint *slots [[buffer(2)]], device const ulong *sources [[buffer(3)]],
+                            constant MoeExpertLoadParams &p [[buffer(4)]],
+                            uint3 group [[threadgroup_position_in_grid]],
+                            uint index [[thread_index_in_threadgroup]]) {
+  constant MoeExpertLoadProjection &q = p.projections[group.z];
+  const uint G = q.columns / 32, t = group.x * MOE_EXPERT_LOAD_THREADS + index;
+  if (t >= q.rows * G) return;
+  const uint n = t / G, g = t % G;
+  const ulong slot = slots[group.y];
+  gguf_repack_group(staging + sources[group.y * 3 + group.z] + ulong(n) * q.row_bytes, q.format, G, n, g,
+                    arena + q.planes[0] + slot * q.slot_bytes[0], arena + q.planes[1] + slot * q.slot_bytes[1],
+                    arena + q.planes[2] + slot * q.slot_bytes[2]);
 }

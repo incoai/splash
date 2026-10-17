@@ -150,6 +150,20 @@ void requireLayerPartition(const QwenTargetGeometry &geometry, uint32_t gdnLayer
     throw std::logic_error("Qwen target layer partition mismatch");
 }
 
+// A prefill sequence binds every GDN layer's state cells, in and out, and so
+// does each state it captures.
+void requirePrefillStates(const QwenTargetGeometry &geometry, const QwenTargetPrefillSequence &sequence) {
+  const auto everyLayer = [&](std::span<const metal::MetalBuffer> views) {
+    return views.size() == geometry.stateLayout.layers;
+  };
+  if (!everyLayer(sequence.convolutionIn) || !everyLayer(sequence.convolutionOut) ||
+      !everyLayer(sequence.recurrentIn) || !everyLayer(sequence.recurrentOut) ||
+      !std::ranges::all_of(sequence.stateCaptures, [&](const QwenTargetStateCapture &capture) {
+        return everyLayer(capture.convolution) && everyLayer(capture.recurrent);
+      }))
+    throw std::invalid_argument("Qwen prefill state layer mismatch");
+}
+
 // Copies `rows` rows of a capture layer's output, from row `sourceRow`, into
 // capture slot `slot` of the captured hidden rows from row `destinationRow`.
 void addCapture(metal::CommandGraph &graph, const QwenTargetGeometry &geometry, uint32_t slot,
@@ -168,9 +182,9 @@ template <class Layer> const ops::BlockMoeWeights *moeOf(const Layer &layer) { r
 
 } // namespace
 
-// The state a prefill command's layers share: its inputs, the buffers the
-// layer's MoE routes and runs through, and the next GDN and attention layer
-// of the step.
+// The state a prefill command's layers share for one of its chunks: its
+// rows, their buffers and plans, the buffers the layer's MoE routes and runs
+// through, and the next GDN and attention layer of the step.
 struct QwenTarget::PrefillStep {
   metal::CommandGraph &graph;
   const QwenTargetPrefillBuffers &buffers;
@@ -201,47 +215,52 @@ struct QwenTarget::VerifyStep {
   uint32_t attentionLayer = 0;
 };
 
-metal::MetalBuffer QwenTarget::addPrefill(
-    metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
-    std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-    std::span<const SplashKvLayer> kvLayers, ops::AneFfn *aneFfn) const {
-  if (sequences.empty() ||
-      sequences.size() > ExecutionLimits::maximumBatchWidth || !rows ||
-      rows > ExecutionLimits::prefillTokenBudget ||
-      kvLayers.size() != geometry_.kvLayout.attentionLayers) {
-    throw std::invalid_argument("invalid Qwen ragged prefill batch");
+std::vector<metal::MetalBuffer> QwenTarget::addPrefill(metal::CommandGraph &graph,
+                                                       std::span<const QwenTargetPrefillChunk> chunks,
+                                                       std::span<const SplashKvLayer> kvLayers,
+                                                       ops::AneFfn *aneFfn) const {
+  // The Neural Engine splits a dense target's commands, which are one chunk.
+  if (chunks.empty() || kvLayers.size() != geometry_.kvLayout.attentionLayers || (aneFfn && chunks.size() > 1)) {
+    throw std::invalid_argument("invalid Qwen prefill");
   }
-  const auto everyLayer = [&](std::span<const metal::MetalBuffer> views) {
-    return views.size() == geometry_.stateLayout.layers;
-  };
-  for (const QwenTargetPrefillSequence &sequence : sequences) {
-    if (!everyLayer(sequence.convolutionIn) || !everyLayer(sequence.convolutionOut) ||
-        !everyLayer(sequence.recurrentIn) || !everyLayer(sequence.recurrentOut) ||
-        !std::ranges::all_of(sequence.stateCaptures, [&](const QwenTargetStateCapture &capture) {
-          return everyLayer(capture.convolution) && everyLayer(capture.recurrent);
-        })) {
-      throw std::invalid_argument("Qwen prefill state layer mismatch");
+  std::vector<PrefillStep> steps;
+  steps.reserve(chunks.size());
+  for (const QwenTargetPrefillChunk &chunk : chunks) {
+    if (chunk.sequences.empty() || chunk.sequences.size() > ExecutionLimits::maximumBatchWidth || !chunk.rows ||
+        chunk.rows > ExecutionLimits::prefillTokenBudget)
+      throw std::invalid_argument("invalid Qwen prefill chunk");
+    PrefillStep &step = steps.emplace_back(PrefillStep{graph, chunk.buffers, chunk.sequences, chunk.rows, kvLayers});
+    if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moePrefill(geometry_.moeShape(), chunk.rows);
+    if (aneFfn && aneFfn->splits(chunk.rows)) step.aneFfn = aneFfn;
+    for (const QwenTargetPrefillSequence &sequence : chunk.sequences) {
+      requirePrefillStates(geometry_, sequence);
+      step.attention.push_back(
+          operators_.prefillAttention(sequence.rows, geometry_.attentionQueryHeads, geometry_.kvLayout));
     }
   }
-  PrefillStep step{graph, buffers, sequences, rows, kvLayers};
-  for (const QwenTargetPrefillSequence &sequence : sequences)
-    step.attention.push_back(operators_.prefillAttention(
-        sequence.rows, geometry_.attentionQueryHeads, geometry_.kvLayout));
-  if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moePrefill(geometry_.moeShape(), rows);
-  if (aneFfn && aneFfn->splits(rows)) step.aneFfn = aneFfn;
-  std::visit([&](const auto *weights) {
-    for (uint32_t index = 0; index < geometry_.layers; ++index) {
-      addPrefillLayer(step, *weights, index);
-      // Streamed experts: the load of those the step's rows route.
-      if (const ops::BlockMoeWeights *ffn = moeOf(weights->layers[index]); ffn && ffn->stream) {
-        const ops::MoeLoadPart part{&step.ffn, &*step.moe};
-        ffn->stream->addLoad(graph, {&part, 1}, ffn->streamBlock);
-      }
-      addPrefillExperts(step, *weights, index);
-    }
-  }, weights_);
-  requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
-  return buffers.hidden[geometry_.layers & 1];
+  return std::visit([&](const auto *weights) { return addPrefillLayers(steps, *weights); }, weights_);
+}
+
+template <class Weights>
+std::vector<metal::MetalBuffer> QwenTarget::addPrefillLayers(std::span<PrefillStep> steps,
+                                                             const Weights &weights) const {
+  std::vector<ops::MoeLoadPart> parts;
+  if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
+    for (const PrefillStep &step : steps) parts.push_back({&step.ffn, &*step.moe});
+  for (uint32_t index = 0; index < geometry_.layers; ++index) {
+    for (PrefillStep &step : steps) addPrefillLayer(step, weights, index);
+    // Streamed experts: one load of those any step's rows route.
+    if (const ops::BlockMoeWeights *ffn = moeOf(weights.layers[index]); ffn && ffn->stream)
+      ffn->stream->addLoad(steps.front().graph, parts, ffn->streamBlock);
+    for (PrefillStep &step : steps) addPrefillExperts(step, weights, index);
+  }
+  std::vector<metal::MetalBuffer> outputs;
+  outputs.reserve(steps.size());
+  for (PrefillStep &step : steps) {
+    requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
+    outputs.push_back(step.buffers.hidden[geometry_.layers & 1]);
+  }
+  return outputs;
 }
 
 // Qwen3.5 and Qwen3.6 (model/Qwen3_8.hpp, model/Qwen3_6Moe.hpp). Layer l

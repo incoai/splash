@@ -13,14 +13,14 @@ namespace splash::engine {
 
 // What the engine gives back while idle (NativeLoopConfig::weights): the
 // weight memory's parts in the order they come back, the weights' images
-// first, then any store of streamed weights, and, when the prefill FFN
-// splits with the Neural Engine, the split's program in the ANE service
-// (ops::AneFfn::release). release() releases every part, then the program;
-// restore() takes back the first part released, a call at a time as the part
-// does (the images an image per call, a store in one), then loads the
-// program in one call more, so a release during a restore gives back what
-// came back. Without a split it is the parts; a split that stopped gives its
-// program back once more, and then nothing (ops::AneFfn::release).
+// first, then any store of streamed weights (model::ExpertStore), and, when
+// the prefill FFN splits with the Neural Engine, the split's program in the
+// ANE service (ops::AneFfn::release). release() releases every part, then
+// the program; restore() takes back the first part released, a call at a
+// time as the part does (the images an image per call, a store in one), then
+// loads the program in one call more, so a release during a restore gives
+// back what came back. Without a split it is the parts; a split that stopped
+// gives its program back once more, and then nothing (ops::AneFfn::release).
 class ReleasableMemory final : public model::WeightMemory {
 public:
   // The split's part: `release` unloads its program between commands, true

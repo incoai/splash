@@ -97,6 +97,7 @@ access.
 | `--max-context` | Auto | Set the context limit, e.g. `100K`. See [memory and context](#memory-and-context). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
+| `--expert-memory` | Off | MoE targets: hold routed experts in this much memory, e.g. `16G`, and read the others from the SSD when a step routes them. See [streamed experts](#streamed-experts). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](#weight-loading). |
 | `--max-cache-disk` | `auto` | SSD quota for cached KV pages and states: `auto` follows the volume's free space up to 32 GiB, a size such as `16G` sets the quota, `0` turns the cache off. Kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
 | `--max-cache-disk-writes` | `0` (no limit) | The most the SSD cache writes a day, e.g. `200G`. See [SSD cache](#ssd-cache). |
@@ -116,7 +117,7 @@ access.
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
 Sizes (`--max-memory`, `--max-cache-disk`, `--max-cache-disk-writes`,
-`--max-request-size`) are a whole number of bytes, or one with a `K`, `M` or
+`--max-request-size`, `--expert-memory`) are a whole number of bytes, or one with a `K`, `M` or
 `G` suffix in binary units: `28G` is 28 GiB, and `28GB`, `28GiB` and `28g` say
 the same. Token counts (`--max-context`) are a whole number, or one with a `K`
 suffix of 1024 tokens: `100K` is 102,400 tokens. `--max-memory`, `--max-context` and `--max-cache-disk`
@@ -199,6 +200,60 @@ context limit. `/v1/models` and `/v1/models/{id}` report the same limit as
 aliases. Clients can impose a smaller limit. This is a capacity limit, not a
 guarantee of a fast first token for a long uncached prompt. If the model cannot
 fit, startup prints a memory budget breakdown and stops.
+
+### Streamed experts
+
+With `--expert-memory SIZE`, such as `--expert-memory 16G`, a MoE target's
+routed experts stay in their files on the SSD, and a store of SIZE bytes holds
+as many of them as fit (`ExpertStore`, `runtime/model/ExpertStore.hpp`): the
+weights shrink by the routed experts' bytes, and the store counts in their
+place (`target_weights_bytes`). Off by default.
+
+- Each MoE layer of a command loads the experts its rows route that are not
+  resident: after the layer's routing, a host step of the command claims
+  slots for them, recycled by adaptive replacement (ARC: the experts decode
+  steps route again stay while the others pass through, and a prompt's
+  experts go first), and reads them from their
+  files into a staging of a decode cycle's experts on the model's weight
+  readers, and a repack kernel writes them into their slots before the expert
+  passes run. A decode step's load is one such round; a prefill command's
+  loads take as many rounds as its rows may route experts, each staging half
+  of the staging while the other half is read ahead. The kernels read every
+  routed expert through the layer's slot table, so resident and streamed
+  experts run the same kernels.
+- An expert's rows a GGUF stores as they are are read straight into the
+  staging (`F_NOCACHE`, widened to whole 16 KiB pages, which the kernel reads
+  without the buffer cache: an M5 Pro reads 460 KiB pieces from four threads
+  at 9.3 GB/s instead of 8.1, with less than half the CPU).
+- While the GPU repacks a round or runs a layer, the next round's experts or
+  the next block's likely experts are read ahead: those the next block's
+  router picks from this block's input in a decode step; after a long prefill
+  chunk's last repack, one more host step reads nearly all of the next
+  block's into the whole staging. A load takes the read-ahead over without
+  waiting for its reads of experts it does not route, and a read ahead of an
+  expert no load routes may fail without failing anything.
+- Experts of one format share an arena of slots; when it would take more than
+  the device's largest buffer (`maxBufferLength`), their layers are split
+  between arenas that each fit, each recycling its own slots.
+- A decode step's loads keep the GPU awake through their host steps
+  ([Host steps](#host-steps)), so the work after a load starts at once and at
+  full clocks rather than after the GPU's wake-up.
+- A prefill command runs a group of up to four chunks of 2048 rows layer by
+  layer, so each layer's experts are read once for all of them; a prompt with
+  images runs one chunk per command. A contended prefill command's slice
+  counts the time its GPU work waited on the reads as a fixed cost
+  ([Admission and eviction](#admission-and-eviction)).
+- A load checks its files unchanged after it read them. A read is tried once
+  more when it fails. A load that fails (a routed expert cannot be read, or
+  a file was written) fails its command, and every later load fails too.
+- The store's memory is released while idle with the weights and restored
+  with them ([Weight loading](#weight-loading)).
+- `/status` reports the store under `streamed_experts`: its arena and
+  staging bytes, slots, its experts and those resident; per use (`prefill`,
+  `decode`) its loads, the distinct experts they routed, those read and of
+  them those read ahead, the experts read ahead whole, the hit rate, the bytes
+  read and the host steps' round trips, one per round (`host_steps`:
+  `pickup_ms`, `work_ms`, `resume_ms`); and the `failure` that stopped it.
 
 ### KV cache precision
 
@@ -1140,6 +1195,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `active_requests` | Each request the engine holds, ordered by `id`: its `id`, `phase` (`queued`, `waiting_resources`, `waiting_prefix`, `prefill`, `decode` or `waiting_mask`, and `failed` for one whose deadline passed while a cached state it restores was being read from disk, until that read drains), `priority`, `prompt_tokens` and how many of them are encoded (`prompt_processed`, cached ones included), `generated_tokens` of `max_new_tokens`, and `age_ms` since it arrived |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
 | `weights.idle_release_seconds`, `released`, `restoring`, `restores`, `restore_failures` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, whether a request's restore of it is under way (it stays `released` until the last image is back), the times it was restored for a request since engine start, and the restores that gave up for want of memory |
+| `streamed_experts` | With `--expert-memory`, the [streamed experts](#streamed-experts)' store: its slots and resident experts, per use its loads, reads, read-ahead and host-step round trips, and its failure; `null` otherwise |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
 | `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk run again adds the rerun's |
@@ -2205,8 +2261,9 @@ the next command wires them again. The command queue holds only a set of the KV
 extents, which kernels reach by address: Metal makes them resident for every
 command buffer, as it does each buffer a dispatch binds. A queue that held every
 buffer would have each command buffer wait for all of them before it starts,
-which with memory nearly full takes 100-170 ms for 1-2% of them.
-`--idle-release off` keeps every buffer wired, and the
+which with memory nearly full takes 100-170 ms for 1-2% of them; a streamed
+decode command, whose host steps start about a hundred a cycle, would wait at
+nearly every cycle. `--idle-release off` keeps every buffer wired, and the
 weight images allocated unless an [explicit release](#explicit-weights-release)
 gives them back, while the engine runs; KV extents return only through the
 reclaims below, memory pressure among them. Memory returns to macOS when the
@@ -2384,9 +2441,11 @@ request's own too, and a full quota makes room for one by dropping the oldest
 copy, perhaps an older conversation's restore point.
 Contended prefill adapts toward a 500 ms slice, keeping
 2048-token chunks for long unopposed work. A command's estimated cost is a fixed
-part, the time its GPU work waited on host steps (`metal::EventStep`), and a
-part per row; the slice grows to twice the fixed part, so a command's rows take
-at least as long as its host steps. Without contention, a prompt that can
+part, the time its GPU work waited on host steps (a streamed target's expert
+reads), and a part per row; the slice grows to twice the fixed part, so a
+command's rows take at least as long as its reads. Unopposed, a target whose
+experts stream runs its remaining chunks in as few prefill groups of up to four
+as hold them, evenly split. Without contention, a prompt that can
 finish within one 2048-token chunk ends its chunk at its last row instead of
 sharing it with a longer prompt. While requests of the same or a higher priority
 decode (a lane waiting for its token mask is owed nothing), each slice owes them

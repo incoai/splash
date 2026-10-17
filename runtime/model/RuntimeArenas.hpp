@@ -4,6 +4,7 @@
 
 #include "model/DFlashDraft.hpp"
 #include "model/ModelFactory.hpp"
+#include "model/QwenState.hpp"
 #include "model/QwenTarget.hpp"
 
 #include "Checked.hpp"
@@ -17,7 +18,9 @@
 #include <array>
 #include <cstring>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
+#include <vector>
 
 namespace splash::model {
 
@@ -28,6 +31,14 @@ inline constexpr uint32_t kDecodeRows = ExecutionLimits::targetVerifyRows;
 inline constexpr uint32_t kSamplingUniformCount = SPLASH_SAMPLING_UNIFORMS;
 inline constexpr uint32_t kDraftProposalTokens = ExecutionLimits::draftProposalTokens;
 inline constexpr uint32_t kPrefillRows = ExecutionLimits::prefillTokenBudget;
+// A prefill group (QwenTarget::addPrefill): a command of up to this many
+// chunks of kPrefillRows rows, run layer by layer, so that a target whose
+// experts stream reads each layer's once for all of them. A group holds the
+// tensors its chunks carry from layer to layer once per chunk
+// (prefillGroupTensor), and requests that arrive while it runs wait for the
+// whole command: four chunks read a layer's experts once per 8192 rows and
+// keep both bounded.
+inline constexpr uint32_t kPrefillGroupChunks = 4;
 inline constexpr uint32_t kTileRows = kv::kPageTokens;
 inline constexpr uint32_t kRaggedAttentionRows =
     kPrefillRows + kLaneCount * (kTileRows - 1);
@@ -38,6 +49,9 @@ inline constexpr uint32_t kMaximumPageTableEntries =
 struct RuntimeGeometry final {
   QwenTargetGeometry target;
   DFlashDraftLayout draft;
+  // The chunks of a prefill command: a group's for a target whose experts
+  // stream, otherwise one.
+  uint32_t prefillChunks = 1;
 
   [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model,
                                             kv::Format kvFormat,
@@ -49,6 +63,7 @@ struct RuntimeGeometry final {
         model.target);
     result.target.kvLayout = model.targetKvLayout(kvFormat);
     result.target.stateLayout = model.stateLayout(stateFormat).target;
+    if (model.expertStore()) result.prefillChunks = kPrefillGroupChunks;
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
         result.target.hiddenSize != result.draft.hiddenSize ||
         result.target.vocabularySize != result.draft.vocabularySize ||
@@ -114,6 +129,9 @@ enum class PrefillTensor : uint32_t {
   LinearCounters,
   // The rotated input of a rotated projection (ops::LinearScratch::rotated).
   LinearRotated,
+  // A prefill group's scratch GDN cell, which carries the state from a chunk
+  // to the next when the lane's cells cannot (Runtime's prefill groups).
+  GroupCell,
   Count,
 };
 
@@ -126,6 +144,41 @@ constexpr Tensor moeScratchTensor(size_t field) noexcept {
   return static_cast<Tensor>(static_cast<uint32_t>(Tensor::MoeScratch) + field);
 }
 
+// Whether a prefill tensor's rows outlive a layer of a prefill group, which
+// then holds every chunk's: the rows the layers carry (tokens and positions,
+// RoPE, the hidden rows), those of the FFN its routed experts read after the
+// layer's load (input, the mixer's output they add to, the MoE's routing),
+// and those the draft's context reads once every layer ran (the captured
+// target rows, their draft positions and RoPE). A tensor a family does not
+// use holds no rows.
+[[nodiscard]] constexpr bool prefillGroupTensor(PrefillTensor tensor) noexcept {
+  switch (tensor) {
+  case PrefillTensor::Hidden0:
+  case PrefillTensor::Hidden1:
+  case PrefillTensor::InputTokens:
+  case PrefillTensor::TargetPositions:
+  case PrefillTensor::RopeCos:
+  case PrefillTensor::RopeSin:
+  case PrefillTensor::Captured:
+  case PrefillTensor::DraftPositions:
+  case PrefillTensor::DraftRopeCos:
+  case PrefillTensor::DraftRopeSin:
+  case PrefillTensor::Normalized:
+  case PrefillTensor::GdnOutput:
+  case PrefillTensor::AttentionOutput:
+    return true;
+  default:
+    break;
+  }
+  for (const auto routing : {&ops::MoeScratch::selectedExperts, &ops::MoeScratch::routingWeights,
+                             &ops::MoeScratch::tileDescriptors, &ops::MoeScratch::tileCount,
+                             &ops::MoeScratch::groupedRoutes, &ops::MoeScratch::routeRows})
+    for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
+      if (ops::kMoeScratchFields[field].buffer == routing && tensor == moeScratchTensor<PrefillTensor>(field))
+        return true;
+  return false;
+}
+
 // Sizes depend on the geometry and the device's operator plans.
 [[nodiscard]] std::array<uint64_t, prefillTensorCount>
 prefillTensorBytes(const RuntimeGeometry &geometry,
@@ -133,20 +186,30 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
 [[nodiscard]] uint64_t plannedPrefillBytes(const RuntimeGeometry &geometry,
                                            const ops::ExecutionPlans &operators);
 
+// A group's tensors (prefillGroupTensor) hold chunk c's rows from c times a
+// chunk's (aligned) bytes on, which get(tensor, c) views.
 class PrefillArena final {
 public:
   PrefillArena(metal::MetalBackend &backend, const RuntimeGeometry &geometry,
                 const ops::ExecutionPlans &operators)
-      : bytes_(plannedPrefillBytes(geometry, operators)) {
+      : bytes_(plannedPrefillBytes(geometry, operators)), chunks_(geometry.prefillChunks) {
     const auto sizes = prefillTensorBytes(geometry, operators);
     base_ = backend.allocateBuffer(bytes_, metal::BufferStorage::Shared,
                                    "qwen-shared-prefill");
     uint64_t cursor = 0;
     for (uint32_t index = 0; index < sizes.size(); ++index) {
-      if (sizes[index])
+      if (sizes[index]) {
         tensors_[index] = backend.view(base_, cursor, sizes[index]);
+        if (chunks_ > 1 && prefillGroupTensor(static_cast<PrefillTensor>(index))) {
+          const uint64_t chunkBytes = sizes[index] / chunks_;
+          for (uint32_t chunk = 0; chunk < chunks_; ++chunk)
+            chunkViews_[index].push_back(backend.view(base_, cursor + chunk * chunkBytes, chunkBytes));
+        }
+      }
       cursor += alignUp(sizes[index]);
     }
+    if (const metal::MetalBuffer cell = get(PrefillTensor::GroupCell))
+      groupCell_ = gdnCellBuffers(backend, cell, geometry.target.stateLayout);
     if (cursor != bytes_)
       throw std::logic_error("prefill arena mismatch");
     auto *target = static_cast<float *>(
@@ -169,14 +232,29 @@ public:
       std::memset(counters.contents(), 0, counters.sizeBytes());
   }
 
-  [[nodiscard]] metal::MetalBuffer get(PrefillTensor tensor) const {
-    return tensors_[static_cast<uint32_t>(tensor)];
+  // Chunk `chunk`'s view of a group's tensor (prefillGroupTensor), or the
+  // tensor of an arena of one chunk.
+  [[nodiscard]] metal::MetalBuffer get(PrefillTensor tensor, uint32_t chunk) const {
+    const uint32_t index = static_cast<uint32_t>(tensor);
+    if (chunk >= chunks_) throw std::out_of_range("prefill arena chunk");
+    return chunkViews_[index].empty() ? tensors_[index] : chunkViews_[index][chunk];
   }
-  [[nodiscard]] ops::MoeScratch moeScratch() const {
+  // A tensor no chunk holds its own of: a group's is bound by its chunk.
+  [[nodiscard]] metal::MetalBuffer get(PrefillTensor tensor) const {
+    const uint32_t index = static_cast<uint32_t>(tensor);
+    if (!chunkViews_[index].empty()) throw std::logic_error("a prefill group's tensor is bound by its chunk");
+    return tensors_[index];
+  }
+  [[nodiscard]] uint32_t chunks() const noexcept { return chunks_; }
+  // A group's scratch cell (PrefillTensor::GroupCell); null without groups.
+  [[nodiscard]] const GdnParityBuffers *groupCell() const noexcept {
+    return groupCell_ ? &*groupCell_ : nullptr;
+  }
+  [[nodiscard]] ops::MoeScratch moeScratch(uint32_t chunk) const {
     ops::MoeScratch scratch;
     for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
       scratch.*ops::kMoeScratchFields[field].buffer =
-          get(moeScratchTensor<PrefillTensor>(field));
+          get(moeScratchTensor<PrefillTensor>(field), chunk);
     return scratch;
   }
   [[nodiscard]] uint64_t bytes() const noexcept { return bytes_; }
@@ -184,7 +262,10 @@ public:
 private:
   metal::MetalBuffer base_;
   std::array<metal::MetalBuffer, prefillTensorCount> tensors_{};
+  std::array<std::vector<metal::MetalBuffer>, prefillTensorCount> chunkViews_{};
+  std::optional<GdnParityBuffers> groupCell_;
   uint64_t bytes_ = 0;
+  uint32_t chunks_ = 1;
 };
 
 enum class DecodeTensor : uint32_t {

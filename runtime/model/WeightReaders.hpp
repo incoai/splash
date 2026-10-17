@@ -11,7 +11,8 @@
 // while no batch runs now, so a read ahead never delays a step's reads. The
 // store that started a background batch ends it: finish() runs the rest of it
 // now, and stop() leaves the rest unread and returns once the tasks readers
-// took ended, the batch's first taken() tasks.
+// took ended, the batch's first taken() tasks; halt() leaves the rest unread
+// at once, and its taken tasks end on their own (Batch::ended).
 //
 // A task that throws is tried once more, for a transient I/O error; a second
 // failure is the task's. A batch that runs now throws its first failure once
@@ -57,7 +58,9 @@ public:
     // The tasks readers took before stop(): [0, taken()) ran, each once;
     // after finish(), every task.
     [[nodiscard]] size_t taken() const noexcept { return limit_.load(std::memory_order_acquire); }
-    // Whether task `index` failed twice; call after stop() or finish().
+    // Whether task `index` ended, its last try.
+    [[nodiscard]] bool ended(size_t index) const noexcept { return ends_[index].load(std::memory_order_acquire); }
+    // Whether task `index` failed twice; call once it ended.
     [[nodiscard]] bool failed(size_t index) const;
     // Its first failure, or null.
     [[nodiscard]] std::exception_ptr failure() const;
@@ -66,7 +69,8 @@ public:
   private:
     friend class WeightReaders;
     Batch(size_t count, Task task, unsigned readers, std::function<void(const Batch &)> ended)
-        : count_(count), task_(std::move(task)), readers_(readers), ended_(std::move(ended)), limit_(count) {}
+        : count_(count), task_(std::move(task)), readers_(readers), ended_(std::move(ended)),
+          ends_(std::make_unique<std::atomic<bool>[]>(count)), limit_(count) {}
     // Takes the next task; false once none is left.
     bool claim(size_t &index) noexcept;
     // Task `index` ended, `failure` if it failed.
@@ -84,6 +88,8 @@ public:
     // wait() returns once it has (endedReturned_, under mutex_).
     const std::function<void(const Batch &)> ended_;
     bool endedReturned_ = false;
+    // Each task's end (ended).
+    const std::unique_ptr<std::atomic<bool>[]> ends_;
     std::atomic<size_t> next_{0}, done_{0};
     // count_, or the tasks taken before stop().
     std::atomic<size_t> limit_;
@@ -115,6 +121,9 @@ public:
   // Readers take no more of the batch's tasks; returns once those they took
   // ended (Batch::taken).
   void stop(Batch &batch);
+  // Readers take no more of the batch's tasks; returns at once, while those
+  // they took may still run (Batch::ended). stop() then waits for them.
+  void halt(Batch &batch);
   // Runs the batch's remaining tasks now, and returns once all of them
   // ended (none, once stopped) and its `ended` returned; its failures stay
   // its own (Batch::failed).

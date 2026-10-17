@@ -125,7 +125,11 @@ void Engine::submit(EngineRequest value) {
        .priority = stored.request.priority,
        .constrained = stored.request.constraint == ConstraintMode::TokenMask,
        .prefillTokens = stored.promptTokens,
-       .deadlineMilliseconds = stored.request.deadlineMilliseconds});
+       .deadlineMilliseconds = stored.request.deadlineMilliseconds,
+       // A prompt with images runs chunk commands: the oracle checks a prefill
+       // group against its chunks' commands on text prompts only.
+       .prefillGroupRows = stored.request.images.empty() ? model_.prefillGroupRows()
+                                                         : model::ExecutionLimits::prefillTokenBudget});
   ++counters_.submitted;
 }
 

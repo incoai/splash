@@ -1,8 +1,9 @@
 #pragma once
 
-// A GGUF sparse MoE block for the MoE tests (gguf_moe_test.mm, the kernels):
-// weights in GGUF formats with GGML's values of them
-// (GgufFormatReference.hpp), bf16 rows, and the buffers a plan runs in.
+// A GGUF sparse MoE block for the MoE tests (gguf_moe_test.mm, the kernels;
+// expert_store_test.mm, streamed experts): weights in GGUF formats with
+// GGML's values of them (GgufFormatReference.hpp), bf16 rows, and the buffers
+// a plan runs in.
 
 #include "GgufFormatReference.hpp"
 #include "metal/MetalBackend.hpp"
@@ -58,20 +59,21 @@ inline splash::ops::QuantizedSegment floatSegment(splash::metal::MetalBackend &b
                                                                "gguf-floats"));
 }
 
-// A GGUF tensor [rows, K]: its segment and GGML's fp32 values of it.
+// A GGUF tensor [rows, K]: its segment, GGML's fp32 values of it and, quantized, its native rows.
 struct Tensor {
   splash::ops::QuantizedSegment segment;
   std::vector<float> values;
+  std::vector<uint8_t> native;
   uint32_t rows = 0, columns = 0;
   [[nodiscard]] const float *row(uint64_t n) const { return values.data() + n * columns; }
 };
 
 inline Tensor quantized(splash::metal::MetalBackend &backend, gguf_reference::Fmt f, uint32_t rows, uint32_t K) {
-  const std::vector<uint8_t> native = gguf_reference::makeNative(f, rows, K, rng);
   Tensor t;
+  t.native = gguf_reference::makeNative(f, rows, K, rng);
   t.rows = rows;
   t.columns = K;
-  t.segment = planeSegment(backend, f, gguf_reference::repack(f, native, rows, K, &t.values), rows, K);
+  t.segment = planeSegment(backend, f, gguf_reference::repack(f, t.native, rows, K, &t.values), rows, K);
   return t;
 }
 
