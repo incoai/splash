@@ -10,7 +10,6 @@
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 
-#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
@@ -126,7 +125,6 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
       layout.gdnValueHeads * layout.gdnHeadDimension != layout.attentionWidth ||
       layout.packedFullWidth !=
           2 * layout.attentionWidth + 2 * layout.attentionKvHeads * layout.attentionHeadDimension ||
-      std::ranges::any_of(layout.hiddenCaptureLayers, [&](uint32_t layer) { return layer >= layout.layers; }) ||
       !layout.kvLayout().valid() || !layout.gdnStateLayout().valid())
     throw WeightStoreError("Qwen target layout is inconsistent");
 }

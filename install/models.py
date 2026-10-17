@@ -335,7 +335,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--draft-model",
         type=parse_draft_model,
-        help="override the automatically selected DFlash2 repository or local directory",
+        help="the DFlash2 draft's repository or local directory, in place of the "
+        "family's released one (required for a family without one)",
     )
     parser.add_argument(
         "--language-only",

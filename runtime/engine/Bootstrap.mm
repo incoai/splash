@@ -189,7 +189,7 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
             return modelRuntime.warmupPrefill(model::ExecutionLimits::prefillTokenBudget);
           });
   nativeLoop.observePrefill(model::ExecutionLimits::prefillTokenBudget,
-                           maximumPrefill.wallSeconds * 1000.0);
+                           maximumPrefill.wallSeconds * 1000.0, maximumPrefill.hostSeconds * 1000.0);
   report.warmup.maximumPrefillDetail = maximumPrefill.detail;
   const auto &budget = memoryPlan.breakdown();
   // Startup exercises only widths that fit this budget. This is not a

@@ -43,16 +43,16 @@ struct RuntimeGeometry final {
                                             kv::Format kvFormat,
                                             ops::GdnStateFormat stateFormat) {
     RuntimeGeometry result;
+    result.draft = model.draft.layout;
     result.target = std::visit(
-        [](const auto &weights) { return qwenTargetGeometry(weights); },
+        [&](const auto &weights) { return qwenTargetGeometry(weights, result.draft.targetLayerIds()); },
         model.target);
     result.target.kvLayout = model.targetKvLayout(kvFormat);
     result.target.stateLayout = model.stateLayout(stateFormat).target;
-    result.draft = model.draft.layout;
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
         result.target.hiddenSize != result.draft.hiddenSize ||
         result.target.vocabularySize != result.draft.vocabularySize ||
-        result.target.capturedHiddenSize() != result.draft.targetHiddenSize) {
+        result.target.capturedHiddenSize() != result.draft.targetHiddenSize()) {
       throw std::invalid_argument("invalid model runtime geometry");
     }
     return result;

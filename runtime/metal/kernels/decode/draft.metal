@@ -3,38 +3,37 @@
 #include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/rms_inverse.h"
 
-template <uint Hidden>
 inline void draft_conv_phase(device const bfloat *input,
                              device const bfloat *dynamic,
                              device const bfloat *base,
                              device const bfloat *residual,
-                             device bfloat *output, bool finish, uint group,
-                             uint thread_index) {
+                             device bfloat *output, bool finish, uint hidden,
+                             uint group, uint thread_index) {
   constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS,
                  Taps = SPLASH_DRAFT_CONVOLUTION_TAPS;
   static_assert(SPLASH_DRAFT_CONVOLUTION_STAGES == 2 && Taps == 2,
                 "a stage prepares or finishes; its taps are a row and the "
                 "row before");
-  constexpr uint ConvGroups = Hidden / SPLASH_DRAFT_CONVOLUTION_GROUP;
-  constexpr uint Dynamic = draft_dynamic_width(Hidden);
+  const uint conv_groups = hidden / SPLASH_DRAFT_CONVOLUTION_GROUP;
+  const uint dynamic_width = draft_dynamic_width(hidden);
   const uint element = group * 256 + thread_index;
-  if (element >= Rows * Hidden)
+  if (element >= Rows * hidden)
     return;
-  uint row = element / Hidden;
-  uint channel = element % Hidden;
+  uint row = element / hidden;
+  uint channel = element % hidden;
   uint conv_group = channel / SPLASH_DRAFT_CONVOLUTION_GROUP;
   uint kind = finish ? 1 : 0;
   float value =
       float(input[element]) *
-      (float(base[(kind * Taps) * Hidden + channel]) +
-       float(dynamic[row * Dynamic + (kind * Taps) * ConvGroups +
+      (float(base[(kind * Taps) * hidden + channel]) +
+       float(dynamic[row * dynamic_width + (kind * Taps) * conv_groups +
                      conv_group]));
   if (row > 0) {
     value +=
-        float(input[(row - 1) * Hidden + channel]) *
-        (float(base[(kind * Taps + 1) * Hidden + channel]) +
+        float(input[(row - 1) * hidden + channel]) *
+        (float(base[(kind * Taps + 1) * hidden + channel]) +
          float(
-             dynamic[row * Dynamic + (kind * Taps + 1) * ConvGroups +
+             dynamic[row * dynamic_width + (kind * Taps + 1) * conv_groups +
                      conv_group]));
   }
   if (finish)
@@ -447,39 +446,23 @@ inline void draft_attention_reorder_phase(device const bfloat *grouped,
   row_major[element] = grouped[grouped_index];
 }
 
-template <uint Hidden>
-inline void draft_conv_decode_batch_impl(
-    device const bfloat *input, device const bfloat *dynamic,
-    device const bfloat *base, device const bfloat *residual,
-    device bfloat *output, constant DraftConvBatchParams &params, uint2 group,
-    uint thread_index) {
+kernel void draft_conv(device const bfloat *input [[buffer(0)]],
+                       device const bfloat *dynamic [[buffer(1)]],
+                       device const bfloat *base [[buffer(2)]],
+                       device const bfloat *residual [[buffer(3)]],
+                       device bfloat *output [[buffer(4)]],
+                       constant DraftConvBatchParams &params [[buffer(5)]],
+                       uint2 group [[threadgroup_position_in_grid]],
+                       uint thread_index [[thread_index_in_threadgroup]]) {
   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
-  constexpr ulong Dynamic = draft_dynamic_width(Hidden);
+  const ulong hidden = params.hidden, dynamic_width = draft_dynamic_width(params.hidden);
   uint batch = group.y;
-  draft_conv_phase<Hidden>(input + batch * Rows * Hidden,
-                           dynamic + batch * Rows * Dynamic, base,
-                           residual + batch * Rows * Hidden,
-                           output + batch * Rows * Hidden,
-                           params.finish != 0, group.x, thread_index);
+  draft_conv_phase(input + batch * Rows * hidden,
+                   dynamic + batch * Rows * dynamic_width, base,
+                   residual + batch * Rows * hidden,
+                   output + batch * Rows * hidden, params.finish != 0,
+                   params.hidden, group.x, thread_index);
 }
-
-// One entry per compiled draft hidden size.
-#define DRAFT_CONV_ENTRY(Name, Hidden)                                         \
-  kernel void Name(                                                            \
-      device const bfloat *input [[buffer(0)]],                                \
-      device const bfloat *dynamic [[buffer(1)]],                              \
-      device const bfloat *base [[buffer(2)]],                                 \
-      device const bfloat *residual [[buffer(3)]],                             \
-      device bfloat *output [[buffer(4)]],                                     \
-      constant DraftConvBatchParams &params [[buffer(5)]],                     \
-      uint2 group [[threadgroup_position_in_grid]],                            \
-      uint thread_index [[thread_index_in_threadgroup]]) {                     \
-    draft_conv_decode_batch_impl<Hidden>(input, dynamic, base, residual,       \
-                                         output, params, group, thread_index); \
-  }
-DRAFT_CONV_ENTRY(draft_conv, 5120)
-DRAFT_CONV_ENTRY(draft_conv_h2048, 2048)
-#undef DRAFT_CONV_ENTRY
 
 kernel void draft_attention_qkv(
     device const bfloat *proposal_qkv [[buffer(0)]],

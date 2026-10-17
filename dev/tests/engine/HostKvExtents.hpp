@@ -65,15 +65,16 @@ public:
     return {extentPages, (pages + extentPages - 1) / extentPages};
   }
 
-  // Shared buffers of the backend, zero-filled, resident for every command
-  // like every backend buffer.
+  // Shared buffers of the backend, zero-filled and addressed
+  // (metal::BufferReach), as the pool's extents: resident for every command
+  // buffer.
   HostKvExtents(metal::MetalBackend &backend, kv::Layout layout,
                 uint32_t extentPages, uint32_t extents)
       : layout_(layout), extentPages_(extentPages) {
     for (uint32_t index = 0; index < extents; ++index) {
       metal::MetalBuffer buffer = backend.allocateBuffer(
           extentBytes(layout, extentPages), metal::BufferStorage::Shared,
-          "host-kv-extent");
+          "host-kv-extent", metal::BufferReach::Addressed);
       auto *contents = static_cast<std::byte *>(buffer.contents());
       std::fill_n(contents, buffer.sizeBytes(), std::byte{0});
       extents_.push_back({contents, buffer.gpuAddress()});
