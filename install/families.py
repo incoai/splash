@@ -1,4 +1,4 @@
-"""The model families Splash serves and the DFlash2 draft trained for each.
+"""The model families Splash serves and the DFlash2 draft released for each.
 
 A target's family is the one the engine finds its configuration to describe,
 by the rules it holds every start to (upstream.check_model), never its
@@ -15,10 +15,12 @@ class ModelFamily:
     # The family's name, as the engine names it (each target layout's family,
     # runtime/model/Qwen3_8.hpp and Qwen3_6Moe.hpp).
     name: str
-    # The repository of the DFlash2 checkpoint trained for the family, as its
-    # release publishes it: config.json and BF16 safetensors. Installations
-    # follow its default branch as they follow the target's.
-    draft_repo: str
+    # The repository of the DFlash2 draft released for the family, as its
+    # release publishes it (config.json and BF16 safetensors). Installations
+    # follow its default branch as they follow the target's. None while no
+    # draft is released for the family: an installation names one with
+    # --draft-model.
+    draft_repo: str | None
 
 
 FAMILIES = (

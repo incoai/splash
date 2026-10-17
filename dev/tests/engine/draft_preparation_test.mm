@@ -40,7 +40,7 @@ model::DFlashDraftLayout tinyDraftLayout() {
   layout.intermediateSize = 256;
   layout.attentionHeadDimension = 64;
   layout.rotaryTheta = 10'000'000.0F;
-  layout.targetHiddenSize = 256;
+  layout.targetLayerCount = 1;
   layout.selectorRank = 256;
   layout.kvHeads = 2;
   return layout;
@@ -124,7 +124,7 @@ int main(int argc, char **argv) {
                p.blocks().segments.front().formatId == GGUF_FMT_AF4G64;
       };
       bool read = draft.layers.size() == layout.layers && draft.files.size() == layout.layers + 1 &&
-                  projection(draft.contextProjection, layout.hiddenSize, layout.targetHiddenSize) &&
+                  projection(draft.contextProjection, layout.hiddenSize, layout.targetHiddenSize()) &&
                   projection(draft.selectorProjection, layout.selectorRank, layout.hiddenSize);
       for (const auto &layer : draft.layers)
         read = read && projection(layer.attentionDynamic, layout.dynamicSize, layout.hiddenSize) &&

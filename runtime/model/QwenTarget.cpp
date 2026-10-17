@@ -82,28 +82,24 @@ uint32_t routedExpertFormat(std::span<const Qwen3_6MoeLayerWeights> layers) {
   const auto most = std::max_element(weights.begin(), weights.end());
   return *most ? uint32_t(most - weights.begin()) : GGUF_FMT_COUNT;
 }
-// Whether every routed and shared expert weight of a target's MoE blocks is in
-// a format the register tile takes (ops::MoeShape::registerFormats).
+// Whether the register tile takes every routed and shared expert weight of a
+// target's MoE blocks (ops::MoeShape::registerFormats).
 bool expertRegisterFormats(std::span<const Qwen3_8LayerWeights>) { return true; }
 bool expertRegisterFormats(std::span<const Qwen3_6MoeLayerWeights> layers) {
   for (const Qwen3_6MoeLayerWeights &layer : layers)
     for (const ops::BlockExpertProjection *projection : {&layer.ffn.gate, &layer.ffn.up, &layer.ffn.down})
       for (const ops::QuantizedSegment *s : {&projection->routed, &projection->shared})
-        if (!s->isFloat() && !quant_register_format(s->formatId)) return false;
+        if (!s->isFloat() && !quant_register_tensor(s->formatId, s->inputSize)) return false;
   return true;
 }
 
 } // namespace
 
 template <class Layout, class Layer>
-QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &weights) {
+QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &weights,
+                                      std::span<const uint32_t> captureLayers) {
   const Layout &layout = weights.layout;
-  static_assert(std::tuple_size_v<decltype(Layout::hiddenCaptureLayers)> <=
-                QwenTargetGeometry::maximumCaptureLayers);
-  QwenTargetGeometry geometry(layout);
-  geometry.captureLayerCount = static_cast<uint32_t>(layout.hiddenCaptureLayers.size());
-  std::copy(layout.hiddenCaptureLayers.begin(), layout.hiddenCaptureLayers.end(),
-            geometry.captureLayerValues.begin());
+  QwenTargetGeometry geometry(layout, captureLayers);
   geometry.kvLayout = layout.kvLayout();
   geometry.stateLayout = layout.gdnStateLayout();
   for (const auto &layer : weights.layers) {
@@ -125,8 +121,8 @@ QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &we
   return geometry;
 }
 
-template QwenTargetGeometry qwenTargetGeometry(const Qwen3_8Weights &);
-template QwenTargetGeometry qwenTargetGeometry(const Qwen3_6MoeWeights &);
+template QwenTargetGeometry qwenTargetGeometry(const Qwen3_8Weights &, std::span<const uint32_t>);
+template QwenTargetGeometry qwenTargetGeometry(const Qwen3_6MoeWeights &, std::span<const uint32_t>);
 
 const ops::Projection &QwenTarget::vocabularyProjection() const noexcept {
   return weightsBase_.logitsProjection;

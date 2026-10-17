@@ -61,8 +61,9 @@ in Chat. Anthropic Messages requests reason only when they set `thinking`.
 
 ## Models
 
-Splash supports these model families, with a matching DFlash2 draft selected
-automatically:
+Splash supports these model families, each decoding with a DFlash2 draft: the
+one released for the family, selected automatically, or the one
+`--draft-model` names.
 
 | Model | GGUF example | MLX 4-bit |
 | --- | --- | --- |

@@ -68,7 +68,7 @@ metal::AllocationResult PageStorage::allocateExtent(uint32_t extent) {
     return admitAllocation_(bytes, [&] {
         metal::MetalBuffer allocated = backend_.allocateBuffer(
             bytes, metal::BufferStorage::Shared,
-            "kv-extent-" + std::to_string(extent * extentPages_));
+            "kv-extent-" + std::to_string(extent * extentPages_), metal::BufferReach::Addressed);
         if (allocated.gpuAddress() & SPLASH_KV_PAGE_INDEX_MASK) {
             throw std::logic_error(
                 "KV extent address leaves no room for the page index");

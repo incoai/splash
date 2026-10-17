@@ -317,7 +317,7 @@ RuntimeResources::RuntimeResources(
       stateStorage_(std::move(stateStorage)), kvTier_(std::move(kvTier)),
       diskSpace_(std::move(diskSpace)), kvPool_(std::move(kvPool)),
       cache_(std::move(cache)), aneFfn_(std::move(aneFfn)),
-      releasableMemory_(*model_.images, idleSplit(aneFfn_.get())),
+      releasableMemory_({model_.images.get()}, idleSplit(aneFfn_.get())),
       aneFfnOutcome_(std::move(aneFfnOutcome)) {}
 
 std::unique_ptr<RuntimeResources>
@@ -491,6 +491,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         modelMemoryPlan,
         stagingBytes,
         aneFfnBytes,
+        loaded.streamedTable() ? loaded.streamedTable()->committedBytes() : 0,
     };
     ModelMemoryProfile modelProfile{
         loaded.name(), loaded.maximumContextTokens(),
@@ -557,7 +558,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     auto memoryGovernor = std::make_unique<MemoryGovernor>(
         *backend, memoryPlan.breakdown().hardBudgetBytes, hostReserveBytes,
         EngineMemoryPolicy::hostSpareReserveBytes(device.physicalMemoryBytes), config.hostMemory,
-        memoryPlan.breakdown().pipelineReserveBytes + memoryPlan.breakdown().runtimeOverheadReserveBytes);
+        memoryPlan.breakdown().pipelineReserveBytes + memoryPlan.breakdown().runtimeOverheadReserveBytes,
+        memoryPlan.breakdown().streamedTableBytes);
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
     // What the start allocates, the KV runway, the arenas and the warmup, is
@@ -843,6 +845,11 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
   };
 }
 
+std::optional<model::SparseRowStats> RuntimeResources::streamedTableStats() const {
+  if (const model::SparseRowStore *table = model_.streamedTable()) return table->stats();
+  return std::nullopt;
+}
+
 AneFfnSnapshot RuntimeResources::aneFfnSnapshot() const {
   if (!aneFfn_)
     return {.reason = aneFfnOutcome_.reason};
@@ -872,6 +879,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   report.kvAllocatedBytes = kvPool_->allocatedBytes();
   report.stateStagingBytes = modelMemory.stateStagingBytes;
   report.aneFfnBytes = aneFfn_ ? aneFfn_->allocatedBytes() : 0;
+  if (const auto table = streamedTableStats()) report.streamedTableBytes = table->cacheBytes;
   // Optional warmup may end with a rolled-back allocation and no subsequent
   // command. Refresh the current counts after that rollback; peaks stay intact.
   metal::MetalMemoryStats memory = backend_->refreshMemoryStats();

@@ -17,10 +17,14 @@ struct ProjectionShape final {
   // Its quantized segments multiply the rotated input (InputRotation), which
   // takes LinearScratch::rotated.
   bool rotated = false;
-  // Its quantized segments are all in formats the Apple9 register tile takes
-  // (quant_register_format); a projection with one in another format stages
+  // The Apple9 register tile takes all its quantized segments
+  // (quant_register_tensor); a projection with one it does not take stages
   // whatever its rows (Linear::decodeStorageRows).
   bool registerFormats = true;
+  // Its quantized segments store at least four bits per weight
+  // (quant_four_bits); Apple10 runs the register tile on narrower grids of
+  // fewer (Linear::decodeStorageRows).
+  bool fourBits = true;
   auto operator<=>(const ProjectionShape &) const = default;
 };
 
@@ -44,19 +48,21 @@ enum class FloatOutput : uint8_t { BFloat16, Float32 };
 // A prepared GGUF tensor occupying a projection's output columns
 // [columnOffset, columnOffset + outputSize): repacked planes in the GGUF_FMT_*
 // format formatId (metal/abi/QuantFormat.h), or a float tensor the GGUF keeps
-// unquantized (F32, as llama.cpp keeps the MoE router), whose plane0 holds
-// [outputSize][inputSize] floats multiplied unrounded in fp32
-// (kernels/shared/gguf_float.metal). The source container is not part of it.
+// unquantized (as llama.cpp keeps the MoE router: F32, or BF16 as some GGUFs
+// store it), whose plane0 holds [outputSize][inputSize] values multiplied
+// unrounded in fp32 (kernels/shared/gguf_float.metal). The source container
+// is not part of it.
 struct QuantizedSegment final {
-  // The formatId of a float segment.
-  static constexpr uint32_t kFloat32 = 0xffffffff;
+  // The formatIds of a float segment of F32 and of BF16 values.
+  static constexpr uint32_t kFloat32 = 0xffffffff, kBFloat16 = 0xfffffffe;
 
   [[nodiscard]] static QuantizedSegment planes(uint32_t formatId, uint32_t outputSize, uint32_t inputSize,
                                                metal::MetalBuffer plane0, metal::MetalBuffer plane1,
                                                metal::MetalBuffer meta);
-  [[nodiscard]] static QuantizedSegment floats(uint32_t outputSize, uint32_t inputSize,
-                                               metal::MetalBuffer values) {
-    return {std::move(values), {}, {}, outputSize, inputSize, 0, kFloat32};
+  // `type` kFloat32 or kBFloat16.
+  [[nodiscard]] static QuantizedSegment floats(uint32_t outputSize, uint32_t inputSize, metal::MetalBuffer values,
+                                               uint32_t type = kFloat32) {
+    return {std::move(values), {}, {}, outputSize, inputSize, 0, type};
   }
 
   metal::MetalBuffer plane0;
@@ -67,10 +73,13 @@ struct QuantizedSegment final {
   uint32_t columnOffset = 0;
   uint32_t formatId = kFloat32;
 
-  [[nodiscard]] bool isFloat() const noexcept { return formatId == kFloat32; }
+  [[nodiscard]] bool isFloat() const noexcept { return formatId == kFloat32 || formatId == kBFloat16; }
+  // The bytes of a float segment's value.
+  [[nodiscard]] uint32_t floatBytes() const noexcept { return formatId == kBFloat16 ? 2 : 4; }
   // The plane geometry of a quantized segment.
   [[nodiscard]] const QuantFormat &format() const noexcept;
-  // The kernel name suffix of its format ("f32" for a float segment).
+  // The kernel name suffix of its format ("f32" or "bf16" for a float
+  // segment).
   [[nodiscard]] const char *name() const noexcept;
   // The buffer bound in plane1's slot: a format without a second plane binds
   // its meta plane there, which its kernels never read as plane1.
@@ -101,10 +110,12 @@ public:
 
   [[nodiscard]] const BlockWeights &blocks() const noexcept { return weights_; }
   [[nodiscard]] ProjectionShape shape() const noexcept {
-    bool registerFormats = true;
-    for (const QuantizedSegment &s : weights_.segments)
-      registerFormats &= s.isFloat() || quant_register_format(s.formatId);
-    return {outputSize, inputSize, static_cast<bool>(rotation), registerFormats};
+    bool registerFormats = true, fourBits = true;
+    for (const QuantizedSegment &s : weights_.segments) {
+      registerFormats &= s.isFloat() || quant_register_tensor(s.formatId, s.inputSize);
+      fourBits &= s.isFloat() || quant_four_bits(s.formatId);
+    }
+    return {outputSize, inputSize, static_cast<bool>(rotation), registerFormats, fourBits};
   }
 
   // Views of a projection of one unrotated quantized tensor (Linear.cpp):

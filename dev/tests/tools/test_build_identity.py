@@ -454,6 +454,25 @@ class CompileConfigurationTests(unittest.TestCase):
             self.assertEqual(self.query(*options, *targets), 0)
             self.assertEqual(rebuild(*targets), set())
 
+    def test_refused_host_step_kernel_leaves_the_build_a_warning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.build_files(root)
+            source = root / "runtime/metal/kernels/host_step.metal"
+            source.parent.mkdir(parents=True)
+            source.write_text("// fixture\n")
+            compiler, _ = self.recording_compiler(root)
+            refusing = root / "refusing.py"
+            refusing.write_text("raise SystemExit(1)\n")
+            build = root / "build"
+            library = build / "host-step.metallib"
+            options = ["-C", str(root), f"BUILD={build}", str(library)]
+            refused = self.build(*options, f"METAL={sys.executable} {refusing}")
+            self.assertIn("awake host steps will run as plain ones", refused.stderr)
+            self.assertFalse(library.exists())
+            self.build(*options, f"METAL={sys.executable} {compiler}")
+            self.assertTrue(library.exists())
+
     def test_failed_compiler_invalidates_previous_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "output"
