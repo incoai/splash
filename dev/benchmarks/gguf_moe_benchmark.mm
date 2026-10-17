@@ -5,7 +5,8 @@
 //   gguf-moe-benchmark <metallib> [35b|flash-next] [rounds] [gate/up format] [down format] [shared format]
 // - decode steps of one to four lanes of 8 rows on the device's plan and on the other GGUF tile, each row routed to
 //   top-k experts drawn at random from all of them (random) or, per lane of 8 rows, from a pool of three times top-k
-//   (pooled: the rows of a verify sharing their experts);
+//   (pooled: the rows of a verify sharing their experts), with the share of the plan's expert tiles that run the
+//   column tile (an expert's only tile of MOE_GGUF_COLUMN_ROWS live rows or fewer);
 // - prefill chunks of 64 to 2048 rows routed at random, on both tiles;
 // - every dispatch of the 2048-row chunk and of the 8- and 32-row steps replayed as its own command.
 // Each command runs layers of their own routes and buffers over one set of weights larger than the system cache, so a
@@ -15,6 +16,7 @@
 #include "DispatchReplay.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/MoE.h"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/MoE.hpp"
 
@@ -103,7 +105,7 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
     }
     return x;
   };
-  // Layers of one plan in one command, each of its own routes.
+  // Layers of one plan in one command, each of its own routes; the share of expert tiles on the column tile.
   struct Layers {
     std::vector<MoeBuffers> buffers;
     CommandGraph graph;
@@ -128,6 +130,18 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
     }
     std::sort(samples.begin(), samples.end());
     return samples[samples.size() / 2];
+  };
+  const auto columnShare = [&](const Layers &l, const MoePlan &plan) {
+    if (plan.configuration().ggufTile == MoeGgufTile::Register) return 0.0;
+    uint64_t tiles = 0, column = 0;
+    for (const MoeBuffers &b : l.buffers) {
+      const uint32_t count = *static_cast<const uint32_t *>(b.scratch.tileCount.contents());
+      const auto *descriptors = static_cast<const MoeTileDescriptor *>(b.scratch.tileDescriptors.contents());
+      tiles += count;
+      for (uint32_t t = 0; t < count; ++t)
+        column += moe_column_tile(descriptors, t);
+    }
+    return 100.0 * column / tiles;
   };
   const splash::ops::ExecutionPlans plans(backend.capabilities());
   const auto otherTile = [](MoeGgufTile tile) {
@@ -160,12 +174,16 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
       const MoeGgufTile device = plan.configuration().ggufTile, other = otherTile(device);
       MoeConfig config = plan.configuration();
       config.ggufTile = other;
-      const double ms = time(layers(plan, routing));
-      printf(" | %s %s %.4f", routing == Routing::Random ? "random" : "pooled", tileName(device), ms);
+      const Layers mine = layers(plan, routing);
+      const double ms = time(mine);
+      printf(" | %s %s %.4f (%2.0f%% column)", routing == Routing::Random ? "random" : "pooled", tileName(device), ms,
+             columnShare(mine, plan));
       // The register tile takes the weights of quant_register_tensor only.
       if (other == MoeGgufTile::Register && !shape.registerFormats) continue;
-      const double otherMs = time(layers(MoE::decodePlan(shape, lanes, config), routing));
-      printf(", %s %.4f", tileName(other), otherMs);
+      const MoePlan otherPlan = MoE::decodePlan(shape, lanes, config);
+      const Layers theirs = layers(otherPlan, routing);
+      const double otherMs = time(theirs);
+      printf(", %s %.4f (%2.0f%% column)", tileName(other), otherMs, columnShare(theirs, otherPlan));
     }
     printf("\n");
   }

@@ -18,7 +18,10 @@
 //   tiles, which run gate and up in one pass, also with up in the gate's
 //   formats; routes and weights against the fp64 router, each pass inside the
 //   fp64 interval its numerics allow, the block's output, a row's output
-//   bitwise equal at every lane count and chunk of one tile, the output of
+//   bitwise equal at every lane count and chunk of one tile where its routes
+//   run the same tile kinds (the staged expert passes run an expert's only
+//   tile of at most MOE_GGUF_COLUMN_ROWS live rows on the column tile; the
+//   rows so compared are counted) and at every repeat of a run, the output of
 //   the live tiles' grids bitwise that of every tile's with two gate/up
 //   passes, and the grouping: tiles as each expert's routes fill them, every
 //   route's grouped row naming it back, the padding a tile's matmul reads
@@ -441,7 +444,9 @@ bool untouched(const void *data, uint64_t bytes) {
 // (moe_matmul_rows: the smallest of 8, 16 and the tile's rows that holds its
 // live rows) marked empty, and the rows past them written neither by the
 // grouping nor by the gather, but where the router's scores, which come first
-// in the grouped input, overwrote them.
+// in the grouped input, overwrote them; on the staged tile, whose passes run
+// their column tiles (columnTile) over the live rows alone, the gather writes
+// no padding row of those.
 void checkGrouping(const MoeScratch &scratch, const MoePlan &plan, const std::string &label) {
   const uint32_t rows = plan.rows(), tileRows = plan.tileRows();
   const auto *selected = static_cast<const uint32_t *>(scratch.selectedExperts.contents());
@@ -468,22 +473,89 @@ void checkGrouping(const MoeScratch &scratch, const MoePlan &plan, const std::st
     const uint32_t live = tiles[tile].rows;
     require(live > 0 && live <= tileRows, label + ": invalid tile live row count");
     const uint32_t matmul = std::min(tileRows, live <= 8 ? 8u : live <= 16 ? 16u : tileRows);
+    const uint32_t read =
+        plan.configuration().ggufTile == MoeGgufTile::Staged && moe_column_tile(tiles, tile) ? live : matmul;
     for (uint32_t row = live; row < matmul; ++row)
       require(groupedRoutes[tile * tileRows + row] == UINT32_MAX,
               label + ": padding a tile's matmul reads is not marked empty");
-    for (uint32_t row = matmul; row < tileRows; ++row) {
+    for (uint32_t row = matmul; row < tileRows; ++row)
+      require(untouched(groupedRoutes + uint64_t{tile} * tileRows + row, sizeof(uint32_t)),
+              label + ": the grouping wrote past a tile's matmul rows");
+    for (uint32_t row = read; row < tileRows; ++row) {
       const uint64_t grouped = uint64_t{tile} * tileRows + row;
-      require(untouched(groupedRoutes + grouped, sizeof(uint32_t)) &&
-                  (grouped * rowBytes < scoreBytes || untouched(groupedInput + grouped * rowBytes, rowBytes)),
-              label + ": grouping or gather wrote past a tile's matmul rows");
+      require(grouped * rowBytes < scoreBytes || untouched(groupedInput + grouped * rowBytes, rowBytes),
+              label + ": the gather wrote past the rows a tile's passes read");
     }
   }
 }
 
-// One plan's run checked against the fp64 model, gate and up in one pass on the staged tiles; returns its output rows.
-std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan &plan, bool staged,
-                              std::map<std::pair<uint32_t, uint32_t>, GateUp> &products, Stats &stats,
-                              const std::string &label) {
+// A run's output rows and, per route, whether its expert tile ran the column tile (columnTile, on the staged expert
+// passes).
+struct MoeRun {
+  std::vector<uint16_t> output;
+  std::vector<bool> column;
+};
+std::vector<bool> columnRoutes(const MoeScratch &scratch, const MoePlan &plan) {
+  const uint32_t routes = plan.rows() * kRoutes, tileRows = plan.tileRows();
+  const auto *routeRows = static_cast<const uint32_t *>(scratch.routeRows.contents());
+  const auto *tiles = static_cast<const MoeTileDescriptor *>(scratch.tileDescriptors.contents());
+  std::vector<bool> column(routes);
+  if (plan.configuration().ggufTile == MoeGgufTile::Staged)
+    for (uint32_t route = 0; route < routes; ++route)
+      column[route] = moe_column_tile(tiles, routeRows[route] / tileRows);
+  return column;
+}
+// The first `rows` rows of two runs: rows whose routes ran the same tile kinds are bitwise equal, as a row's output
+// depends on its own routes only and a route's on its tile kind only (the rows of one expert tile are independent);
+// of the `compared` rows that ran them, `differ` counts the rows that are not. Rows whose routes ran other tile kinds,
+// which lie within fp64 in both runs (runPlan), are counted in `acrossKinds`.
+struct RowComparison {
+  uint32_t compared = 0, differ = 0, acrossKinds = 0;
+};
+RowComparison compareRows(const MoeRun &a, const MoeRun &b, uint32_t rows) {
+  RowComparison c;
+  for (uint32_t r = 0; r < rows; ++r) {
+    const auto routes = [&](const MoeRun &run) { return run.column.begin() + uint64_t{r} * kRoutes; };
+    if (!std::equal(routes(a), routes(a) + kRoutes, routes(b))) {
+      ++c.acrossKinds;
+      continue;
+    }
+    const auto row = [&](const MoeRun &run) { return run.output.begin() + uint64_t{r} * kHidden; };
+    ++c.compared;
+    c.differ += !std::equal(row(a), row(a) + kHidden, row(b));
+  }
+  return c;
+}
+// The first `rows` rows of a prefill chunk against the widest chunk and against the chunk before it, which holds more
+// rows than it but whose routes run more of its own tile kinds than the widest's do (a lone row's routes run the
+// column tile, a wide chunk's mostly the staged tile, so the widest chunk can compare none of a narrow chunk's rows).
+RowComparison compareChunks(const MoeRun &run, const MoeRun &widest, const MoeRun &previous, uint32_t rows,
+                            const std::string &label) {
+  RowComparison sum;
+  for (const MoeRun *other : {&widest, &previous}) {
+    if (other == &previous && previous.output.size() == widest.output.size()) continue;
+    const RowComparison c = compareRows(run, *other, rows);
+    if (c.differ)
+      printf("  %s: %u rows differ from the %u-row chunk FAIL\n", label.c_str(), c.differ,
+             uint32_t(other->output.size() / kHidden));
+    sum.compared += c.compared;
+    sum.differ += c.differ;
+    sum.acrossKinds += c.acrossKinds;
+  }
+  return sum;
+}
+// Comparisons whose rows all ran other tile kinds in their two runs compared no row bitwise, which leaves those runs
+// the fp64 bound alone; returns the failures.
+int requireCompared(uint32_t compared, const std::string &comparisons) {
+  if (compared) return 0;
+  printf("  %s: no row ran the same tile kinds in two runs, so none compared bitwise FAIL\n", comparisons.c_str());
+  return 1;
+}
+
+// One plan's run checked against the fp64 model, gate and up in one pass on the staged tiles; returns its output rows
+// and the tile kinds of its routes.
+MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan &plan, bool staged,
+               std::map<std::pair<uint32_t, uint32_t>, GateUp> &products, Stats &stats, const std::string &label) {
   const uint32_t rows = plan.rows();
   allocate(backend, b, plan);
   std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
@@ -627,14 +699,21 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
                                                std::to_string(c) + " differs from the weighted expert sum");
     }
   }
-  std::vector<uint16_t> result(uint64_t{rows} * kHidden);
-  std::memcpy(result.data(), output, result.size() * 2);
-  // Bitwise the output of every tile's threadgroups and of two gate/up passes.
+  MoeRun result{std::vector<uint16_t>(uint64_t{rows} * kHidden), columnRoutes(b.moe.scratch, plan)};
+  std::memcpy(result.output.data(), output, result.output.size() * 2);
+  // Bitwise the output of the same dispatches again, whose grouping orders each expert's routes anew (its atomics),
+  // and of every tile's threadgroups and two gate/up passes.
+  for (int repeat = 0; repeat < 2; ++repeat) {
+    std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    require(!std::memcmp(result.output.data(), output, result.output.size() * 2),
+            label + ": the output differs from a repeat of the run");
+  }
   std::deque<MoeGgufExpertParams> passes;
   const std::vector<ComputeDispatch> reference = fullGridsTwoPasses(graph, b.moe.scratch, passes);
   std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
   static_cast<void>(backend.submitCommandAsync(reference).wait());
-  require(!std::memcmp(result.data(), output, result.size() * 2),
+  require(!std::memcmp(result.output.data(), output, result.output.size() * 2),
           label + ": the output differs from the full grids' and two gate/up passes'");
   return result;
 }
@@ -711,25 +790,32 @@ int moe(MetalBackend &backend) {
     for (const FloatTile router : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
       const int before = failures;
       Stats stats;
-      std::vector<uint16_t> widest;
+      MoeRun widest, previous;
+      uint32_t compared = 0, acrossKinds = 0;
       for (const uint32_t rows : {kMaximumRows, 33u, 16u}) {
         MoeConfig config{MoeExpertTile::M32};
         config.ggufRouterTile = router;
         const MoePlan plan = MoE::prefillPlan(shape, rows, config);
         const std::string label = formats + " prefill rows=" + std::to_string(rows) +
                                   (router == FloatTile::NeuralAccelerator ? " (accelerator router)" : "");
-        const std::vector<uint16_t> result = runPlan(backend, m, b, plan, true, products, stats, label);
-        if (widest.empty()) widest = result;
-        else if (!std::equal(result.begin(), result.end(), widest.begin())) {
-          printf("  %s: rows differ from the %u-row chunk FAIL\n", label.c_str(), kMaximumRows);
-          ++failures;
+        const MoeRun result = runPlan(backend, m, b, plan, true, products, stats, label);
+        if (widest.output.empty()) {
+          widest = previous = result;
+          continue;
         }
+        const RowComparison c = compareChunks(result, widest, previous, rows, label);
+        compared += c.compared;
+        acrossKinds += c.acrossKinds;
+        failures += c.differ > 0;
+        previous = result;
       }
+      failures += requireCompared(compared, formats + " prefill 263/33/16");
       printf("%-20s staged   prefill 263/33/16 (32-row tiles, %s router): gate/up %.2f%% and down %.2f%% of outputs "
-             "differ from bf16(fp64), errors at most %.1e/%.1e of sum|x w| %s\n",
+             "differ from bf16(fp64), errors at most %.1e/%.1e of sum|x w|, %u rows compared bitwise, %u across tile "
+             "kinds %s\n",
              formats.c_str(), router == FloatTile::NeuralAccelerator ? "accelerator" : "simdgroup",
              100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs, stats.gateUpWorst,
-             stats.downWorst, failures > before ? "FAIL" : "ok");
+             stats.downWorst, compared, acrossKinds, failures > before ? "FAIL" : "ok");
     }
   };
   // Each tile runs the models of the formats it takes (makeModel).
@@ -742,22 +828,32 @@ int moe(MetalBackend &backend) {
         const std::string formats = formatNames(m);
         const int before = failures;
         Stats stats;
-        std::vector<uint16_t> widest;
+        MoeRun widest;
+        uint32_t compared = 0, acrossKinds = 0;
+        // The rows of a run that differ from the four-lane dispatch's where their routes ran the same tile kinds.
+        const auto compareWidest = [&](const MoeRun &run, const std::string &label) {
+          const RowComparison c =
+              compareRows(run, widest, uint32_t(std::min(run.output.size(), widest.output.size()) / kHidden));
+          compared += c.compared;
+          acrossKinds += c.acrossKinds;
+          if (c.differ) {
+            printf("  %s: %u rows differ from the four-lane dispatch FAIL\n", label.c_str(), c.differ);
+            ++failures;
+          }
+        };
         for (uint32_t lanes = 4; lanes >= 1; --lanes) {
           const MoePlan plan = MoE::decodePlan(
               shape, lanes,
               MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = tile});
           const std::string label = formats + (tile == MoeGgufTile::Register ? " register" : " staged") + " decode B" +
                                     std::to_string(lanes);
-          const std::vector<uint16_t> rows =
+          const MoeRun run =
               runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, stats, label);
-          // A row's result depends on its own routes only, not on the lanes it
-          // is batched with (the tile rows of one expert are independent).
-          if (widest.empty()) widest = rows;
-          else if (!std::equal(rows.begin(), rows.end(), widest.begin())) {
-            printf("  %s: rows differ from the four-lane dispatch FAIL\n", label.c_str());
-            ++failures;
-          }
+          // A row's result depends on its own routes and the tile kinds they
+          // run only, not on the rows it is batched with (the tile rows of one
+          // expert are independent).
+          if (widest.output.empty()) widest = run;
+          else compareWidest(run, label);
         }
         // Prefill chunks on the same 8-row tiles (ExecutionPlans::moePrefill).
         for (const uint32_t chunk : {kMaximumRows, 27u, 9u, 8u}) {
@@ -766,18 +862,15 @@ int moe(MetalBackend &backend) {
               MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = tile});
           const std::string label = formats + (tile == MoeGgufTile::Register ? " register" : " staged") + " prefill rows=" +
                                     std::to_string(chunk);
-          const std::vector<uint16_t> rows =
-              runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, stats, label);
-          if (!std::equal(rows.begin(), rows.begin() + std::min(rows.size(), widest.size()), widest.begin())) {
-            printf("  %s: rows differ from the four-lane dispatch FAIL\n", label.c_str());
-            ++failures;
-          }
+          compareWidest(runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, products, stats, label),
+                        label);
         }
+        failures += requireCompared(compared, formats + " decode B1-4, prefill 263/27/9/8");
         printf("%-20s %s decode B1-4, prefill 263/27/9/8: gate/up %.2f%% and down %.2f%% of outputs differ from bf16(fp64), "
-               "errors at most %.1e/%.1e of sum|x w| %s\n",
+               "errors at most %.1e/%.1e of sum|x w|, %u rows compared bitwise, %u across tile kinds %s\n",
                formats.c_str(), tile == MoeGgufTile::Register ? "register" : "staged  ",
                100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs,
-               stats.gateUpWorst, stats.downWorst, failures > before ? "FAIL" : "ok");
+               stats.gateUpWorst, stats.downWorst, compared, acrossKinds, failures > before ? "FAIL" : "ok");
         if (tile == MoeGgufTile::Staged) prefill32(m, products, formats);
       }
   return failures;
@@ -826,28 +919,35 @@ int routingLoads(MetalBackend &backend) {
     b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
     std::map<std::pair<uint32_t, uint32_t>, GateUp> products;
     Stats stats;
-    std::vector<uint16_t> widest;
+    MoeRun widest, previous;
+    uint32_t compared = 0, acrossKinds = 0;
     const int before = failures;
     for (const uint32_t rows : {256u, 48u, 12u, 1u}) {
       const MoePlan plan = MoE::prefillPlan(shape, rows, MoeConfig{MoeExpertTile::M32});
       const std::string label = formats + " " + name + " prefill rows=" + std::to_string(rows);
-      const std::vector<uint16_t> result = runPlan(backend, m, b, plan, true, products, stats, label);
+      const MoeRun result = runPlan(backend, m, b, plan, true, products, stats, label);
       const auto *selected = static_cast<const uint32_t *>(b.moe.scratch.selectedExperts.contents());
       for (uint32_t r = 0; r < rows; ++r) {
         const uint32_t first = load == Load::Concentrated || r % 8 < 6 ? 0 : r % kExperts;
         require(selected[r * kRoutes] == first && selected[r * kRoutes + 1] == (first + 1) % kExperts,
                 label + ": fixture routes to its intended first two experts");
       }
-      if (widest.empty()) widest = result;
-      else if (!std::equal(result.begin(), result.end(), widest.begin())) {
-        printf("  %s: rows differ from the 256-row chunk FAIL\n", label.c_str());
-        ++failures;
+      if (widest.output.empty()) {
+        widest = previous = result;
+        continue;
       }
+      const RowComparison c = compareChunks(result, widest, previous, rows, label);
+      compared += c.compared;
+      acrossKinds += c.acrossKinds;
+      failures += c.differ > 0;
+      previous = result;
     }
+    failures += requireCompared(compared, formats + " " + name + " prefill 256/48/12/1");
     printf("%-20s staged   prefill 256/48/12/1 (32-row tiles, %s routing): gate/up %.2f%% and down %.2f%% of "
-           "outputs differ from bf16(fp64), errors at most %.1e/%.1e of sum|x w| %s\n",
+           "outputs differ from bf16(fp64), errors at most %.1e/%.1e of sum|x w|, %u rows compared bitwise, %u across "
+           "tile kinds %s\n",
            formats.c_str(), name.c_str(), 100.0 * stats.gateUpFlips / (stats.outputs / 2),
-           100.0 * stats.downFlips / stats.outputs, stats.gateUpWorst, stats.downWorst,
+           100.0 * stats.downFlips / stats.outputs, stats.gateUpWorst, stats.downWorst, compared, acrossKinds,
            failures > before ? "FAIL" : "ok");
   }
   return failures;

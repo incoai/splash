@@ -793,7 +793,11 @@ it is one more cut of the target distribution, which acceptance and
 correction read as they read the others, so sampling stays exact.
 
 A lane's arithmetic can depend on the batch it decodes in and on how its prompt
-is chunked. Concurrent requests change both, and chunk boundaries also come from
+is chunked. On a GGUF MoE target's staged expert tiles, an expert that a step
+routes at most two rows to runs them on the column tile, which sums in another
+order than the staged matmul, so a row's result also depends on the rows
+decoded or prefilled beside it. Concurrent requests change both, and chunk
+boundaries also come from
 the cached boundary a request resumes from, from a boundary another request
 waits to resume from, and from one whose state, or the KV past it, memory could
 not hold. With `--state-format bf16` the state is also rounded at each state a
@@ -1884,6 +1888,11 @@ count, and the pass reads it as an indirect dispatch (`ComputeDispatch::indirect
 The staged tile runs gate and up in one pass, a gate and an up simdgroup on the same columns,
 bitwise the two passes' intermediate; the simdgroups share one pair table where gate and up share
 their routed and their shared formats.
+An expert's only tile of at most `MOE_GGUF_COLUMN_ROWS` live rows runs on the column tile
+(`kernels/common/gguf_column_tile.h`) rather than the staged one, and the two sum a row's
+products in different orders: a route's output depends on how many rows the step routes to its
+expert, so decode results of GGUF MoE targets on the staged tile, the 35B's included, are not
+invariant to the batch (`kernels/common/moe_expert_slab.h`).
 The float router and alpha/beta projections run in `kernels/shared/gguf_float.metal`, and the
 token rows are gathered by one template in `kernels/shared/embedding.metal`. These plans are
 fixed rules of GPU family, core count, shape and format.
