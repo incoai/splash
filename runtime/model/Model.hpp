@@ -414,6 +414,10 @@ public:
   [[nodiscard]] virtual bool ready() const noexcept = 0;
   [[nodiscard]] virtual std::vector<ModelStepResult> wait() = 0;
   [[nodiscard]] virtual double wallMilliseconds() const noexcept = 0;
+  // Of wallMilliseconds, the time the command's GPU work waited on its host
+  // steps: a streamed target's expert reads, which a prefill command pays
+  // about whole whatever its rows.
+  [[nodiscard]] virtual double hostMilliseconds() const noexcept { return 0.0; }
   // Fixed auxiliary work remains in wall latency but must not train the
   // text-prefill throughput estimate.
   [[nodiscard]] virtual bool prefillTimingIsRepresentative() const noexcept {
@@ -452,6 +456,8 @@ struct ExecutionLimits final {
   static constexpr uint32_t draftProposalTokens = 7;
   static constexpr uint32_t targetVerifyRows = 8;
   static constexpr uint32_t draftContextTokens = 2048;
+  // The most target layers a DFlash2 draft reads (its target_layer_ids).
+  static constexpr uint32_t maximumDraftTargetLayers = 8;
   static constexpr uint32_t speculativeScratchTokens = targetVerifyRows - 1;
   // One step emits at most its retained verify rows plus a terminal anchor
   // (a stop token or the last budgeted token) that never receives a KV row.
@@ -560,6 +566,9 @@ struct WarmupStepResult final {
   double wallSeconds = 0.0;
   // Those two warmups return one observation per lane in batch-plan order.
   std::vector<WarmupLaneResult> lanes;
+  // For prefill warmup, of wallSeconds the time its GPU work waited on host
+  // steps (ModelBatchTicket::hostMilliseconds).
+  double hostSeconds = 0.0;
 };
 
 // What a reclaim step may release of the model's idle memory.
@@ -625,6 +634,9 @@ public:
   // buffers, and the maximum when no number of states does (a buffer no
   // cached state holds, such as Qwen's draft rings).
   [[nodiscard]] virtual uint32_t statesToActivate() const noexcept { return 0; }
+  // The most rows of one lane's prefill command: a prefill group's when the
+  // model runs them (one lane's chunks, layer by layer), else a chunk's.
+  [[nodiscard]] virtual uint32_t prefillGroupRows() const noexcept { return ExecutionLimits::prefillTokenBudget; }
   // Releases one unit of idle model memory and returns its bytes; zero when
   // nothing in scope is idle. A unit is one pooled state buffer (keepLane
   // keeps those one lane starts from); with BuffersThenCaches, once no

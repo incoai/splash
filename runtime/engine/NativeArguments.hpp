@@ -53,6 +53,11 @@ struct NativeArguments final {
   // Neural Engine when that is faster (splash serve --disable-ane turns it
   // off).
   bool neuralEngine = true;
+  // --expert-memory BYTES: stream a MoE target's routed experts from their
+  // files through a store of BYTES (model/ExpertStore.hpp) instead of loading
+  // them; 0, without the option, loads them
+  // (RuntimeResourcesConfig::expertMemoryBytes).
+  uint64_t expertMemoryBytes = 0;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto
