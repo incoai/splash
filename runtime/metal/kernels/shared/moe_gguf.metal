@@ -22,7 +22,7 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
   if (group.y >= *tile_count) return;
   const MoeTileDescriptor tile = tiles[group.y];
   const MoeGgufSegment s = moe_gguf_segment(tile.expert, p, w0, w1, meta, sw0, sw1, smeta);
-  device bfloat *x = p.in_place ? input : input + ulong(group.y) * Rows * p.input_size;
+  device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
   const ulong out = ulong(group.y) * Rows * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
@@ -108,7 +108,7 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
   const MoeGgufSegment s = up ? us : gs;
   threadgroup half2 *table = tl + (Tables == 2 && up ? kQuantPairTableEntries : 0);
   const uint K = p.input_size, N = p.output_size;
-  device bfloat *x = p.in_place ? input : input + ulong(group.y) * Rows * K;
+  device bfloat *x = input + ulong(group.y) * Rows * K;
   const ulong out = ulong(group.y) * Rows * N;
   const uint origin = group.x * GGUF_STAGED_COLUMNS;
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;

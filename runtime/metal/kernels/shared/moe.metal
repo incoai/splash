@@ -129,10 +129,6 @@ MOE_ROUTE_SELECT_ENTRY(moe_route_select_f32_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS)
 // and thread e owns expert e's count, offsets and tile descriptors. The
 // shared expert's tiles follow the routed tiles and hold every row in order.
 // It writes the tile count with the expert passes' grids (MoeTileCount).
-// In place (a plan whose rows fill one tile) each expert gets one tile of the
-// plan's rows: a route's grouped row is its expert tile's row of the route's
-// own row, and the routed tiles' grouped routes go unwritten, as no gather
-// reads them.
 // Slots threads, one per expert slot.
 template <uint Slots>
 inline void moe_group_routes_phase(
@@ -168,9 +164,9 @@ inline void moe_group_routes_phase(
     routed_tiles = tile_offset + expert_tiles;
   for (uint tile = 0; tile < expert_tiles; ++tile) {
     tiles[tile_offset + tile] = MoeTileDescriptor{
-        thread_index, params.in_place ? params.rows : min(params.tile_rows, count - tile * params.tile_rows)};
+        thread_index, min(params.tile_rows, count - tile * params.tile_rows)};
   }
-  if (expert_tiles && !params.in_place) {
+  if (expert_tiles) {
     const uint last = tile_offset + expert_tiles - 1;
     const uint live = count - (expert_tiles - 1) * params.tile_rows;
     for (uint row = tile_offset * params.tile_rows + count;
@@ -183,10 +179,6 @@ inline void moe_group_routes_phase(
     if (route % routes_per_row == params.top_k)
       continue;
     uint expert = selected[route];
-    if (params.in_place) {
-      route_rows[route] = tile_offsets[expert] * params.tile_rows + route / routes_per_row;
-      continue;
-    }
     uint slot =
         atomic_fetch_add_explicit(&cursors[expert], 1u, memory_order_relaxed);
     uint row = tile_offsets[expert] * params.tile_rows + slot;
@@ -249,7 +241,10 @@ MOE_GROUP_ROUTES_ENTRY(moe_group_routes_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS)
 
 // Copies each grouped row's input so every expert tile is a dense matrix,
 // over the rows its matmul reads (moe_matmul_rows): padding rows among them
-// are zero and their outputs are never read.
+// are zero and their outputs are never read. Threadgroup (tile,
+// part) copies the part's 256 columns of the tile's rows, eight rows at once,
+// each thread eight columns (16 bytes, rows of whole 256 columns starting
+// 16-byte aligned) of one row.
 kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
                             device const uint *grouped_routes [[buffer(1)]],
                             device const MoeTileDescriptor *tiles [[buffer(2)]],
@@ -260,16 +255,15 @@ kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
                             uint thread_index [[thread_index_in_threadgroup]]) {
   if (group.x >= *tile_count)
     return;
-  uint column = group.y * 256 + thread_index;
+  const uint column = group.y * 256 + (thread_index % 32) * 8;
   const uint rows = moe_matmul_rows(tiles[group.x].rows, params.tile_rows);
-  for (uint local = 0; local < rows; ++local) {
-    uint row = group.x * params.tile_rows + local;
-    uint route = grouped_routes[row];
-    grouped_input[ulong(row) * params.input_size + column] =
-        route == ~0u
-            ? bfloat(0.0f)
-            : input[ulong(route / params.routes_per_row) * params.input_size +
-                    column];
+  for (uint local = thread_index / 32; local < rows; local += 8) {
+    const uint row = group.x * params.tile_rows + local;
+    const uint route = grouped_routes[row];
+    *reinterpret_cast<device uint4 *>(grouped_input + ulong(row) * params.input_size + column) =
+        route == ~0u ? uint4(0)
+                     : *reinterpret_cast<device const uint4 *>(
+                           input + ulong(route / params.routes_per_row) * params.input_size + column);
   }
 }
 
