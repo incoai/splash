@@ -355,6 +355,25 @@ void ggufPlans() {
                   bound.counters >= size.counters,
               "Apple9 GGUF decode scratch bound covers both tiles");
   }
+  // Apple9 registers projections of whole 64-input spans in a format of one group per meta unit, of fewer inputs
+  // than 256 or no multiple of it (Qwen3.8-Flash-Next's Q8_0 hyper-connection projections take 320), and its decode
+  // scratch bound covers them. A format of several groups per meta unit (Q2_0) stages such a projection, and its bound
+  // holds no table.
+  for (const uint32_t k : {64U, 192U, 320U, 640U}) {
+    const Projection q80 = blockProjection(1024, k, 1, GGUF_FMT_Q80), q20 = blockProjection(1024, k, 1, GGUF_FMT_Q20);
+    const LinearScratchSize narrow = m3.decodeScratchSize(q80.shape());
+    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+      const LinearWorkload w{{1024, k}, lanes * 8, LinearPhase::Decode, kNone};
+      const LinearPlan plan = m3.plan(w, q80);
+      const LinearScratchSize need = plan.scratchSize();
+      require(plan.configuration().tile == LinearTile::GgufRegister && narrow.input >= need.input &&
+                  narrow.sums >= need.sums && narrow.partials >= need.partials && narrow.counters >= need.counters,
+              "Apple9 registers Q8_0 projections of " + std::to_string(k) + " inputs within the scratch bound");
+      require(m3.plan(w, q20).configuration().tile == LinearTile::GgufStaged &&
+                  m3.decodeScratchSize(q20.shape()).input == 0,
+              "Apple9 registers a Q2_0 projection of " + std::to_string(k) + " inputs");
+    }
+  }
   require(linear.plan({{5120, 17408}, 24, LinearPhase::Decode, LinearEpilogue::Residual},
                       blockProjection(5120, 17408, 1, GGUF_FMT_IQ2XXS)).configuration().tile == LinearTile::GgufStaged,
           "Apple10 stages every format");
@@ -1025,6 +1044,38 @@ void registerTileExtents(metal::MetalBackend &backend) {
                   });
 }
 
+// The register tile splits K into whole coefficient units of each segment's format (quant_register_unit), where a
+// plan, which knows no format, bounds the splits by the fewest inputs a unit holds, 64: 512 Q4_K inputs, two units,
+// take two splits but not four, 512 Q8_0 inputs four, 192 two, and Q2_K's 256 inputs, two 128-input units, two but
+// not four. A refused projection encodes nothing.
+void registerSplitUnits(metal::MetalBackend &backend) {
+  const Linear m3 = gpu(9, 40);
+  constexpr uint32_t n = 512, rows = 8;
+  for (const auto [format, k, splits, takes] :
+       {std::tuple{GGUF_FMT_Q4K, 512U, 2U, true}, {GGUF_FMT_Q4K, 512U, 4U, false}, {GGUF_FMT_Q80, 512U, 4U, true},
+        {GGUF_FMT_Q80, 192U, 2U, true}, {GGUF_FMT_Q2K, 256U, 2U, true}, {GGUF_FMT_Q2K, 256U, 4U, false}}) {
+    const Projection block(n, k, BlockWeights{{segmentPlanes(backend, format, n, k)}});
+    const LinearPlan plan = Linear::plan({{n, k}, rows, LinearPhase::Decode, kNone},
+                                         {.tile = LinearTile::GgufRegister, .splits = splits}, FloatOutput::BFloat16);
+    const LinearScratchSize scratch = plan.scratchSize();
+    const LinearBuffers buffers{.input = allocate(backend, uint64_t{rows} * k * 2),
+                                .output = allocate(backend, uint64_t{rows} * n * 2),
+                                .scratch = {allocate(backend, scratch.input), allocate(backend, scratch.sums),
+                                            allocate(backend, scratch.partials), allocate(backend, scratch.counters)}};
+    const std::string what = std::string(kQuantFormats[format].name) + " weights of " + std::to_string(k) +
+                             " inputs in " + std::to_string(splits) + " splits";
+    metal::CommandGraph graph;
+    if (takes) {
+      (void)m3.add(graph, buffers, block, plan);
+      require(!graph.empty(), "the register tile encoded nothing for " + what);
+    } else {
+      rejects([&] { (void)m3.add(graph, buffers, block, plan); }, "the register tile takes a coefficient unit per split",
+              "the register tile took " + what);
+      require(graph.empty(), "the register tile encoded refused " + what);
+    }
+  }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1045,6 +1096,7 @@ int main(int argc, char **argv) {
     blockExtents(backend);
     leadingInputViews(backend);
     registerTileExtents(backend);
+    registerSplitUnits(backend);
     std::cout << "Linear plans: PASS\n";
   } catch (const std::exception &error) {
     std::cerr << "Linear plans: FAIL: " << error.what() << '\n';
