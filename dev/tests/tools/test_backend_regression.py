@@ -552,6 +552,19 @@ class BackendRegressionTests(unittest.TestCase):
                 [f"target/layer-0.bin: the baseline loaded {a}, the candidate {b}"],
             )
 
+        # A change of the image layout reports the images it changed and
+        # fails nothing.
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self.fake_checkout(root, "baseline", a, True)
+            self.fake_checkout(root, "candidate", b, True)
+            self.assertEqual(self.run_main(root, "--expect-image-change"), 0)
+            document = json.loads(
+                (root / "release/backend-regression.json").read_text()
+            )
+            self.assertTrue(document["pass"] and document["expect_image_change"])
+            self.assertFalse(document["weights"]["pass"])
+
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             self.fake_checkout(root, "baseline", a, True)

@@ -49,6 +49,7 @@ GGML = {
     "TQ2_0": 35,
     "MXFP4": 39,
     "NVFP4": 40,
+    "Q2_0": 42,
     "PQ2_0": 142,
 }
 
@@ -220,6 +221,55 @@ class GgufMetadataTests(unittest.TestCase):
         with self.assertRaisesRegex(models.ModelError, "duplicate GGUF tensor: t"):
             gguf.Metadata(path, tensors=True)
 
+    def test_split_headers_merge_in_split_order_or_are_refused(self):
+        # A GGUF split in two as llama.cpp's gguf-split writes it: every
+        # part's split keys, the first part's other keys, tensors in both.
+        def part(number, tensors, *, count=2, total=4):
+            values = {"general.architecture": "qwen35"} if number == 0 else {}
+            values |= {"split.no": number, "split.count": count}
+            values["split.tensors.count"] = total
+            path = write_gguf(self.root / "part.gguf", values, tensors.items())
+            return gguf.Metadata(path, tensors=True)
+
+        first = {"a": GGML["Q4_K"], "b": GGML["F32"]}
+        second = {"c": GGML["Q8_0"], "d": GGML["F32"]}
+        merged = gguf.merged_split([part(0, first), part(1, second)])
+        self.assertEqual(merged.values["general.architecture"], "qwen35")
+        self.assertEqual(merged.tensors, first | second)
+        for case, headers, reason in (
+            ("a lone part", [part(0, first)], "do not match its split.count"),
+            (
+                "parts out of order",
+                [part(1, second), part(0, first)],
+                "GGUF split file 1 is out of order",
+            ),
+            (
+                "a wrong split.no",
+                [part(0, first), part(2, second)],
+                "GGUF split file 2 is out of order",
+            ),
+            (
+                "a part of another split.count",
+                [part(0, first), part(1, second, count=3)],
+                "GGUF split file 2 is out of order",
+            ),
+            (
+                "a tensor in both parts",
+                [part(0, first), part(1, {"b": GGML["F32"]} | second)],
+                "duplicate GGUF tensor across split files: b",
+            ),
+            (
+                "a split.tensors.count the parts do not hold",
+                [part(0, first, total=5), part(1, second, total=5)],
+                "the GGUF's split files hold another number of tensors",
+            ),
+        ):
+            with (
+                self.subTest(case),
+                self.assertRaisesRegex(models.ModelError, reason),
+            ):
+                gguf.merged_split(headers)
+
     def test_bpe_ids_special_tokens_normalization_and_local_reload(self):
         metadata = self.metadata(fixture())
         files = gguf.tokenizer_files(metadata)
@@ -390,6 +440,17 @@ class GgufMetadataTests(unittest.TestCase):
         tensors |= {"blk.5.ffn_gate_exps.weight": GGML["BF16"]}
         tensors |= {"blk.5.ssm_alpha.weight": GGML["F16"]}
         tensors |= {"blk.5.ssm_beta.weight": GGML["F16"]}
+        # 16-bit floats where the loader reads floats, as ISTA-DASLab's GGUFs
+        # store them: a BF16 router, which the float projection runs as
+        # stored, and a BF16 shared-expert scalar gate and BF16 and F16 norms,
+        # which preparation widens to F32; and their Q2_0 experts.
+        tensors |= {"blk.1.ffn_gate_inp.weight": GGML["BF16"]}
+        tensors |= {"blk.1.ffn_gate_inp_shexp.weight": GGML["BF16"]}
+        tensors |= {"blk.2.attn_norm.weight": GGML["F16"]}
+        tensors |= {"output_norm.weight": GGML["BF16"]}
+        tensors |= {"blk.1.ffn_down_exps.weight": GGML["Q2_0"]}
+        # A Q8_0 shared-expert scalar gate, which preparation decodes to F32.
+        tensors |= {"blk.2.ffn_gate_inp_shexp.weight": GGML["Q8_0"]}
         path = write_gguf(self.root / "ok.gguf", values, tensors.items())
         gguf.require_loadable(gguf.Metadata(path, tensors=True))
         for changes, reason in (
@@ -409,14 +470,16 @@ class GgufMetadataTests(unittest.TestCase):
                 {"blk.7.ffn_gate_up_exps.weight": GGML["F32"]},
                 "ffn_gate_up_exps.weight F32 [(]1 tensor[)]",
             ),
-            # F32 only where the loader reads floats: not a projection, not
-            # a quantized router or norm.
+            # Floats only where the loader reads floats: not a projection, an
+            # F32 or BF16 router and an F32, BF16 or F16 norm, never a
+            # quantized one.
             ({"blk.3.attn_q.weight": GGML["F32"]}, "attn_q.weight F32"),
             (
                 {"blk.0.ffn_gate_inp.weight": GGML["Q8_0"]},
                 "ffn_gate_inp.weight Q8_0",
             ),
-            ({"output_norm.weight": GGML["F16"]}, "output_norm.weight F16"),
+            ({"blk.0.ffn_gate_inp.weight": GGML["F16"]}, "ffn_gate_inp.weight F16"),
+            ({"output_norm.weight": GGML["Q8_0"]}, "output_norm.weight Q8_0"),
             (
                 {
                     "blk.1.ssm_alpha.weight": GGML["TQ2_0"],
