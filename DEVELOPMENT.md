@@ -1691,6 +1691,19 @@ PEP 366 header. `serve_options.py` defines the options
 help and help group, and how the launcher passes it on; it imports only the
 standard library, since the launcher parses them before `.venv` exists.
 
+Flash-Next's two hyper-connection norm kernels, which split a mix's rows
+between them, must write the same bits, which only an uninstrumented run of
+the production metallib on the release GPU and toolchain shows
+(`build/engine-tests/qwen4-kernels build/splash.metallib bitwise`, which
+`make test-engine-metal` runs). Shader validation is a separate bounds and
+numerical-closeness gate; it does not establish bitwise equality of
+production code. Before release,
+compare full-model greedy outputs at the same prompts, cached prefixes and
+batch schedule against the base. Repeat seeded sampled requests within each
+build, and explicitly check base-versus-candidate seeded output when preserving
+a drafting policy. These are measured gates, not a guarantee across arbitrary
+compiler versions or GPUs.
+
 The values the native runtime holds constant (the Metal command timeout, the
 KV tier's transfers, the input queue's bound, the latency window, the
 write-behind budget, the prefill checkpoint interval and the resource wait),

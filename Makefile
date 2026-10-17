@@ -252,6 +252,9 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/LinearGguf.cpp \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \
+	runtime/ops/HyperConnection.cpp \
+	runtime/ops/NgramEmbedding.cpp \
+	runtime/ops/BlockIndexer.cpp \
 	runtime/ops/PagedAttention.cpp \
 	runtime/ops/PageStorage.cpp \
 	runtime/ops/RoPE.cpp \
