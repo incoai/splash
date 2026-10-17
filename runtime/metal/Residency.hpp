@@ -14,16 +14,23 @@
 namespace splash::metal {
 
 // Holds every buffer of a backend in one residency set, wired between the
-// commands of its command queue. Metal wires them while a command runs and
-// lets them go a few seconds later, and one request holds them only about two
+// commands of its command queue. One request holds them only about two
 // seconds, so a heartbeat requests residency every 500 ms. After keepAlive
 // without a command, never when it is infinite, it ends residency, which Metal
 // applies at its next GPU operation on any queue: one dispatch of the kick
 // kernel, whose pipeline the backend builds with its library, on a queue of
 // its own, as the runtime keeps exactly one command in flight on the command
 // queue. Destruction ends residency without GPU work: a backend being torn
-// down must not start any. The set is used only on the heartbeat's serial
+// down must not start any. The sets are used only on the heartbeat's serial
 // queue.
+//
+// The command queue holds a set of its own, of the buffers kernels reach only
+// through their GPU addresses (BufferReach::Addressed): Metal makes it
+// resident for every command buffer, as it does each buffer a dispatch binds.
+// Holding every buffer there would make each command buffer wait for all of
+// them first: with memory nearly full, 1-2% of command buffers waited
+// 100-170 ms before they started (M5 Max with 36 GB), so a command of many
+// buffers waited at nearly every command.
 class Residency final {
 public:
   // A one-thread kernel that writes one word of its buffer 0
@@ -35,12 +42,14 @@ public:
       : commands_(commands), kick_(kick), keepAlive_(keepAliveSeconds) {
     set_ = [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new]
                                            error:nil];
+    addressed_ = [device newResidencySetWithDescriptor:[MTLResidencySetDescriptor new]
+                                                 error:nil];
     kickQueue_ = [device newCommandQueue];
     kickTarget_ = [device newBufferWithLength:sizeof(uint32_t)
                                       options:MTLResourceStorageModePrivate];
-    if (!set_ || !kickQueue_ || !kickTarget_)
+    if (!set_ || !addressed_ || !kickQueue_ || !kickTarget_)
       throw MetalBackendError("unable to create the Metal residency set");
-    [commands_ addResidencySet:set_];
+    [commands_ addResidencySet:addressed_];
     queue_ = dispatch_queue_create(
         "splash.metal.residency",
         dispatch_queue_attr_make_with_autorelease_frequency(
@@ -56,7 +65,7 @@ public:
     // Metal applies the end at the process's next GPU operation, or frees
     // the set at exit.
     dispatch_sync(queue_, ^{
-      [commands_ removeResidencySet:set_];
+      [commands_ removeResidencySet:addressed_];
       std::lock_guard lock(mutex_);
       if (held_) [set_ endResidency];
     });
@@ -65,21 +74,29 @@ public:
   Residency(const Residency &) = delete;
   Residency &operator=(const Residency &) = delete;
 
-  // Adds the buffer to the set and restarts the keep-alive: a held set wires
-  // it at the commit, and a lapsed one is requested again off the caller's
-  // thread (use()).
-  void add(id<MTLBuffer> buffer) {
+  // Adds the buffer to the set, and an addressed one to the queue's too, and
+  // restarts the keep-alive: a held set wires it at the commit, and a lapsed
+  // one is requested again off the caller's thread (use()).
+  void add(id<MTLBuffer> buffer, BufferReach reach) {
     dispatch_sync(queue_, ^{
       [set_ addAllocation:buffer];
       [set_ commit];
+      if (reach == BufferReach::Addressed) {
+        [addressed_ addAllocation:buffer];
+        [addressed_ commit];
+      }
     });
     use();
   }
 
-  void remove(id<MTLBuffer> buffer) {
+  void remove(id<MTLBuffer> buffer, BufferReach reach) {
     dispatch_sync(queue_, ^{
       [set_ removeAllocation:buffer];
       [set_ commit];
+      if (reach == BufferReach::Addressed) {
+        [addressed_ removeAllocation:buffer];
+        [addressed_ commit];
+      }
     });
   }
 
@@ -132,6 +149,8 @@ private:
   __strong id<MTLCommandQueue> commands_ = nil;
   __strong id<MTLComputePipelineState> kick_ = nil;
   __strong id<MTLResidencySet> set_ = nil;
+  // The command queue's: the addressed buffers.
+  __strong id<MTLResidencySet> addressed_ = nil;
   __strong id<MTLCommandQueue> kickQueue_ = nil;
   __strong id<MTLBuffer> kickTarget_ = nil;
   __strong dispatch_queue_t queue_ = nil;

@@ -262,6 +262,21 @@ void testReservationsAndAdmissionClasses() {
           "a backend defect leaked its reservation");
 }
 
+// Host memory the engine holds outside Metal (a streamed table's row cache)
+// is charged in full beside the backend's buffers.
+void testHostHeldBytesAreCharged() {
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 64 * 1024;
+  const uint64_t limit = 64 * 1024, held = 16 * 1024;
+  MemoryGovernor governor(backend, limit, hostReserve, hostReserve, [] {
+    return hostMemory(hostReserve + 3 * kGiB);
+  }, 0, held);
+  require(static_cast<bool>(admit(governor, limit - held)) && !admit(governor, limit - held + 1),
+          "memory governor did not charge the host memory the engine holds");
+  require(governor.snapshot().chargedBytes == held, "the host memory the engine holds is not in its charge");
+}
+
 // Critical pressure stops all growth. Host headroom below the warning margin
 // stops it too, as warning pressure, which sheds cache in paced passes and
 // lasts until the headroom crosses the recovery margin; with no request
@@ -782,6 +797,7 @@ int main() {
     testHostAvailabilityCountsReclaimablePages();
     testAdvertisedContextIsGrantable();
     testReservationsAndAdmissionClasses();
+    testHostHeldBytesAreCharged();
     testHostHeadroomHysteresis();
     testReclaimablePagesReopenGrowth();
     testSnapshotLeavesTheHysteresis();

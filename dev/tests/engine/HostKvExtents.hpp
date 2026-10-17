@@ -65,15 +65,16 @@ public:
     return {extentPages, (pages + extentPages - 1) / extentPages};
   }
 
-  // Shared buffers of the backend, zero-filled, resident for every command
-  // like every backend buffer.
+  // Shared buffers of the backend, zero-filled and addressed
+  // (metal::BufferReach), as the pool's extents: resident for every command
+  // buffer.
   HostKvExtents(metal::MetalBackend &backend, kv::Layout layout,
                 uint32_t extentPages, uint32_t extents)
       : layout_(layout), extentPages_(extentPages) {
     for (uint32_t index = 0; index < extents; ++index) {
       metal::MetalBuffer buffer = backend.allocateBuffer(
           extentBytes(layout, extentPages), metal::BufferStorage::Shared,
-          "host-kv-extent");
+          "host-kv-extent", metal::BufferReach::Addressed);
       auto *contents = static_cast<std::byte *>(buffer.contents());
       std::fill_n(contents, buffer.sizeBytes(), std::byte{0});
       extents_.push_back({contents, buffer.gpuAddress()});
@@ -123,6 +124,12 @@ public:
     auto *entries = static_cast<SplashKvPage *>(table);
     for (size_t index = 0; index < pages.size(); ++index)
       entries[index] = entry(pages[index]);
+  }
+  // Where one value of a KV head sits in a page's slab of values, in the
+  // layout's value order (kv::Layout::valuesTokenMajor).
+  [[nodiscard]] uint64_t valueElement(uint32_t head, uint32_t token, uint32_t dimension) const noexcept {
+    return layout_.valuesTokenMajor ? splash_kv_key_element(head, token, dimension)
+                                    : splash_kv_value_element(head, token, dimension);
   }
   // The host address of one tensor of one page in one layer.
   template <typename T>

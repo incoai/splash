@@ -16,6 +16,7 @@ import collections
 import contextlib
 import math
 import struct
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import models
@@ -64,9 +65,12 @@ class Metadata:
     def __init__(self, source, *, tensors=False):
         """Read a local path, or a binary stream at the start of the file such
         as a Hub range reader, which its caller closes. tensors also reads
-        each tensor's type."""
+        each tensor's type, its extents (innermost first, as GGUF lists them)
+        and its offset in the file's data section."""
         self.values = {}
         self.tensors = {}
+        self.extents = {}
+        self.offsets = {}
         self.consumed = 0
         with (
             Path(source).open("rb")
@@ -89,12 +93,16 @@ class Metadata:
                 dimensions = self.scalar("I")
                 if dimensions > self.MAX_DIMENSIONS:
                     raise ModelError("invalid GGUF tensor rank: " + name)
-                self.read(dimensions * struct.calcsize("<Q"))  # Its extents.
+                extents = struct.unpack(
+                    f"<{dimensions}Q", self.read(dimensions * struct.calcsize("<Q"))
+                )
                 kind = self.scalar("I")
-                self.scalar("Q")  # Data offset; the payload is never read here.
+                offset = self.scalar("Q")  # The payload is never read here.
                 if name in self.tensors:
                     raise ModelError("duplicate GGUF tensor: " + name)
                 self.tensors[name] = kind
+                self.extents[name] = extents
+                self.offsets[name] = offset
 
     def read(self, size):
         if size > self.MAX_BYTES - self.consumed:
@@ -279,14 +287,9 @@ def tokenizer_files(metadata):
     }
 
 
-# The GGUF text architectures Splash serves, and the model type of each one's
-# text configuration.
-TEXT_MODEL_TYPES = {"qwen35": "qwen3_5_text", "qwen35moe": "qwen3_5_moe_text"}
-
-
 def text_architecture(metadata):
     arch = metadata.require("general.architecture", str)
-    if arch not in TEXT_MODEL_TYPES:
+    if arch not in ARCHITECTURES:
         raise ModelError("unsupported GGUF model architecture: " + arch)
     return arch
 
@@ -303,11 +306,11 @@ def model_config(metadata, vision=None):
     text = {name: metadata.positive(arch + "." + key) for name, key in fields.items()}
     text.update(
         num_hidden_layers=loaded_layers(metadata, arch),
-        model_type=TEXT_MODEL_TYPES[arch],
+        model_type=ARCHITECTURES[arch].model_type,
         vocab_size=len(metadata.require("tokenizer.ggml.tokens", list)),
     )
     config = {
-        "model_type": TEXT_MODEL_TYPES[arch].removesuffix("_text"),
+        "model_type": ARCHITECTURES[arch].model_type.removesuffix("_text"),
         "text_config": text,
     }
     if vision is not None:
@@ -419,6 +422,7 @@ TENSOR_TYPES = {
     30: "BF16",
     39: "MXFP4",
     40: "NVFP4",
+    42: "Q2_0",
     142: "PQ2_0",
 }
 QUANTIZED_TYPES = {
@@ -443,6 +447,7 @@ QUANTIZED_TYPES = {
     "IQ4_XS",
     "MXFP4",
     "NVFP4",
+    "Q2_0",
     "PQ2_0",
 }
 FORMAT_TYPES = QUANTIZED_TYPES | {"BF16", "F16"}
@@ -454,24 +459,34 @@ UNQUANTIZED_TYPES = {"BF16", "F16", "F32"}
 # (gguf_embedding_format in runtime/metal/abi/Gguf.h).
 EMBEDDING_TYPES = FORMAT_TYPES
 # The tensors the native loader reads from a target, and the types it accepts
-# for each (runtime/model/GgufImage.cpp): projections of a format; F32 norms,
-# small GDN vectors and MoE routers, which llama.cpp keeps unquantized and
-# which run unrounded; GDN alpha and beta, each of a format or F32, which
-# preparation widens to the F32 values they hold unless both are of one
-# quantized type.
+# for each (runtime/model/GgufImage.cpp): projections of a format; the tensors
+# llama.cpp keeps unquantized, which run unrounded: small GDN vectors of F32,
+# norms (and Qwen3.8-Flash-Next's PLE convolution) of F32 or the BF16 and F16
+# that widen to it (floatNorm), float projections (MoE routers, the QSA
+# indexer) of F32 or BF16, which run as stored (floatTensor), and
+# shared-expert scalar gates of F32, BF16 or Q8_0, which preparation turns
+# into the F32 values they hold (floatRows); GDN alpha and beta, each of a
+# format or F32, which preparation widens to the F32 values they hold unless
+# both are of one quantized type or both BF16.
 F32 = {"F32"}
+NORM_TYPES = {"F32", "BF16", "F16"}
+FLOAT_PROJECTION_TYPES = {"F32", "BF16"}
+FLOAT_ROW_TYPES = {"F32", "BF16", "Q8_0"}
 MODEL_TENSORS = {
     "token_embd.weight": EMBEDDING_TYPES,
-    "output_norm.weight": F32,
+    "output_norm.weight": NORM_TYPES,
     "output.weight": FORMAT_TYPES,
 }
-LAYER_TENSORS = {"attn_norm.weight": F32, "post_attention_norm.weight": F32}
+LAYER_TENSORS = {
+    "attn_norm.weight": NORM_TYPES,
+    "post_attention_norm.weight": NORM_TYPES,
+}
 ATTENTION_TENSORS = {
     "attn_q.weight": FORMAT_TYPES,
     "attn_k.weight": FORMAT_TYPES,
     "attn_v.weight": FORMAT_TYPES,
-    "attn_q_norm.weight": F32,
-    "attn_k_norm.weight": F32,
+    "attn_q_norm.weight": NORM_TYPES,
+    "attn_k_norm.weight": NORM_TYPES,
     "attn_output.weight": FORMAT_TYPES,
 }
 GDN_TENSORS = {
@@ -482,7 +497,7 @@ GDN_TENSORS = {
     "ssm_conv1d.weight": F32,
     "ssm_a": F32,
     "ssm_dt.bias": F32,
-    "ssm_norm.weight": F32,
+    "ssm_norm.weight": NORM_TYPES,
     "ssm_out.weight": FORMAT_TYPES,
 }
 DENSE_TENSORS = {
@@ -491,11 +506,11 @@ DENSE_TENSORS = {
     "ffn_down.weight": FORMAT_TYPES,
 }
 MOE_TENSORS = {
-    "ffn_gate_inp.weight": F32,
+    "ffn_gate_inp.weight": FLOAT_PROJECTION_TYPES,
     "ffn_gate_exps.weight": FORMAT_TYPES,
     "ffn_up_exps.weight": FORMAT_TYPES,
     "ffn_down_exps.weight": FORMAT_TYPES,
-    "ffn_gate_inp_shexp.weight": F32,
+    "ffn_gate_inp_shexp.weight": FLOAT_ROW_TYPES,
     "ffn_gate_shexp.weight": FORMAT_TYPES,
     "ffn_up_shexp.weight": FORMAT_TYPES,
     "ffn_down_shexp.weight": FORMAT_TYPES,
@@ -509,26 +524,168 @@ FUSED_MOE_TENSORS = {
 } | {"ffn_gate_up_exps.weight": FORMAT_TYPES}
 
 
+# Qwen3.8-Flash-Next (qwen4exp): hyper-connections replace every norm, so a
+# layer has none of its own and the model no output norm; its full-attention
+# layers carry the QSA indexer, whose projections are float tensors; its PLE
+# layer carries the n-gram embedding's projections, norms and convolution,
+# and the model the embedding's table.
+QWEN4_MODEL_TENSORS = {
+    "token_embd.weight": EMBEDDING_TYPES,
+    "per_layer_token_embd.weight": EMBEDDING_TYPES,
+    "output.weight": FORMAT_TYPES,
+    "output_hc_norm.weight": NORM_TYPES,
+    "output_hc_down.weight": FORMAT_TYPES,
+    "output_hc_up.weight": FORMAT_TYPES,
+}
+QWEN4_LAYER_TENSORS = {
+    f"hc_{part}_{name}.weight": types
+    for part in ("attn", "ffn")
+    for name, types in (
+        ("norm", NORM_TYPES),
+        ("down", FORMAT_TYPES),
+        ("up", FORMAT_TYPES),
+        ("inject", FLOAT_ROW_TYPES),
+    )
+}
+QWEN4_INDEXER_TENSORS = {
+    "indexer.q_proj.weight": FLOAT_PROJECTION_TYPES,
+    "indexer.k_proj.weight": FLOAT_PROJECTION_TYPES,
+    "indexer.q_norm.weight": NORM_TYPES,
+    "indexer.k_norm.weight": NORM_TYPES,
+}
+QWEN4_PLE_TENSORS = {
+    "ple_key.weight": FORMAT_TYPES,
+    "ple_value.weight": FORMAT_TYPES,
+    "ple_norm_key.weight": NORM_TYPES,
+    "ple_norm_query.weight": NORM_TYPES,
+    "ple_norm_conv.weight": NORM_TYPES,
+    "ple_conv1d.weight": NORM_TYPES,
+}
+
+
+@dataclass(frozen=True)
+class Architecture:
+    """A GGUF text architecture Splash serves, as the native loader reads it
+    (runtime/model/GgufImage.cpp planImages)."""
+
+    # The model type of its text configuration.
+    model_type: str
+    # The model's tensors, and each layer's beside its mixer's and FFN's.
+    model_tensors: dict
+    layer_tensors: dict
+    # Whether its FFN is a sparse MoE, else dense.
+    moe: bool
+    # A full-attention layer's tensors beside ATTENTION_TENSORS.
+    attention_tensors: dict = field(default_factory=dict)
+    # The tokens of a QSA block: a full-attention layer's entry of
+    # attention.compress_ratios, where a GDN layer's is 0. None without QSA.
+    qsa_block: int | None = None
+    # The one layer its PLE n-gram embedding feeds, which ple.layers names
+    # alone; it reads QWEN4_PLE_TENSORS. None without one.
+    ple_layer: int | None = None
+
+
+# The GGUF text architectures Splash serves, by general.architecture; the
+# QSA block and PLE layer of qwen4exp are Qwen4ExpLayout's
+# indexerBlockTokens and pleLayer (runtime/model/Qwen4Exp.hpp).
+ARCHITECTURES = {
+    "qwen35": Architecture("qwen3_5_text", MODEL_TENSORS, LAYER_TENSORS, moe=False),
+    "qwen35moe": Architecture(
+        "qwen3_5_moe_text", MODEL_TENSORS, LAYER_TENSORS, moe=True
+    ),
+    "qwen4exp": Architecture(
+        "qwen4_exp_text",
+        QWEN4_MODEL_TENSORS,
+        QWEN4_LAYER_TENSORS,
+        moe=True,
+        attention_tensors=QWEN4_INDEXER_TENSORS,
+        qsa_block=4,
+        ple_layer=1,
+    ),
+}
+
+
 def loaded_tensors(metadata):
     """Each tensor the native loader reads from the target that metadata
     describes, with the types it accepts. MTP layers are not loaded; every
     full_attention_interval-th layer is full attention, the others GDN. A MoE
     layer whose header lists the fused gate/up experts tensor reads it in place
-    of the two."""
+    of the two. A PLE layer reads the n-gram embedding's tensors too."""
     arch = text_architecture(metadata)
+    architecture = ARCHITECTURES[arch]
     period = metadata.positive(arch + ".full_attention_interval")
-    tensors = dict(MODEL_TENSORS)
+    tensors = dict(architecture.model_tensors)
     for layer in range(loaded_layers(metadata, arch)):
-        mixer = ATTENTION_TENSORS if (layer + 1) % period == 0 else GDN_TENSORS
-        if arch != "qwen35moe":
+        if (layer + 1) % period == 0:
+            mixer = ATTENTION_TENSORS | architecture.attention_tensors
+        else:
+            mixer = GDN_TENSORS
+        if not architecture.moe:
             ffn = DENSE_TENSORS
         elif f"blk.{layer}.ffn_gate_up_exps.weight" in metadata.tensors:
             ffn = FUSED_MOE_TENSORS
         else:
             ffn = MOE_TENSORS
-        for name, types in (LAYER_TENSORS | mixer | ffn).items():
+        parts = architecture.layer_tensors | mixer | ffn
+        if layer == architecture.ple_layer:
+            parts |= QWEN4_PLE_TENSORS
+        for name, types in parts.items():
             tensors[f"blk.{layer}.{name}"] = types
     return tensors
+
+
+def require_arrays(metadata):
+    """Reject a target whose metadata arrays, which scalar_metadata leaves out
+    of the engine's model check, are not those the native planner requires
+    at every start (Qwen4ExpGguf::arrays in runtime/model/GgufImage.cpp): with
+    QSA, attention.compress_ratios, from its first entry the QSA block for
+    each loaded full-attention layer and 0 for each other; with a PLE layer,
+    ple.layers, that layer alone. One error names every mismatch."""
+    arch = text_architecture(metadata)
+    architecture = ARCHITECTURES[arch]
+    mismatched = []
+    if architecture.qsa_block is not None:
+        period = metadata.positive(arch + ".full_attention_interval")
+        ratios = [
+            architecture.qsa_block if (layer + 1) % period == 0 else 0
+            for layer in range(loaded_layers(metadata, arch))
+        ]
+        found = metadata.values.get(arch + ".attention.compress_ratios")
+        if type(found) is not list or found[: len(ratios)] != ratios:
+            mismatched.append("attention.compress_ratios")
+    ple = architecture.ple_layer
+    if ple is not None and metadata.values.get(arch + ".ple.layers") != [ple]:
+        mismatched.append("ple.layers")
+    if mismatched:
+        raise ModelError(
+            "GGUF metadata does not match the target: " + ", ".join(mismatched)
+        )
+
+
+def merged_split(headers):
+    """One target's metadata from the headers of its split files (llama.cpp's
+    gguf-split), in split order: the first file's keys, whose split.* keys
+    must describe these files, and every file's tensor types."""
+    first = headers[0]
+    count = first.values.get("split.count", 1)
+    if type(count) is not int or count != len(headers):
+        raise ModelError("the GGUF's split files do not match its split.count")
+    tensors = {}
+    for number, header in enumerate(headers):
+        if len(headers) > 1 and (
+            header.values.get("split.no") != number
+            or header.values.get("split.count") != count
+        ):
+            raise ModelError(f"GGUF split file {number + 1} is out of order")
+        for name, kind in header.tensors.items():
+            if name in tensors:
+                raise ModelError("duplicate GGUF tensor across split files: " + name)
+            tensors[name] = kind
+    total = first.values.get("split.tensors.count", len(tensors))
+    if total != len(tensors):
+        raise ModelError("the GGUF's split files hold another number of tensors")
+    first.tensors = tensors
+    return first
 
 
 # Prism ML's input rotation of a dense target: the parameters and keys
@@ -574,11 +731,13 @@ def require_rotation(metadata):
 
 def require_loadable(metadata):
     """Reject a target Splash does not load, from its header alone, so an
-    unusable file is never downloaded: a whole-BF16, F16 or F32 model, whose
-    projections and experts are all unquantized, or a file the native loader
-    cannot read, missing a tensor it reads or storing one in a type it does
-    not accept for that tensor."""
+    unusable file is never downloaded: metadata arrays of another model
+    (require_arrays), a whole-BF16, F16 or F32 model, whose projections and
+    experts are all unquantized, or a file the native loader cannot read,
+    missing a tensor it reads or storing one in a type it does not accept for
+    that tensor."""
     require_rotation(metadata)
+    require_arrays(metadata)
     loaded = loaded_tensors(metadata)
     # The projections and experts are the tensors read only in a format, but
     # the token table; one missing or of a type the loader does not know is

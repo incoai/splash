@@ -56,6 +56,8 @@ public:
 
   // Allocates the image's buffer, writes it and returns its file.
   [[nodiscard]] WeightFile load(ImagePlan image);
+  // What every image's file records the sources hold.
+  [[nodiscard]] const std::string &contentIdentity() const noexcept { return contentIdentity_; }
   [[nodiscard]] bool released() const noexcept override { return released_; }
   void release() override;
   [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override;
