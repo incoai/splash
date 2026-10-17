@@ -544,6 +544,11 @@ void run(const std::string &metallib) {
     roundTrip(backend, governor, kv::Layout{16, 4, 256, format}); // Qwen3.8-27B
     persistentRoundTrip(backend, governor, kv::Layout{10, 2, 256, format});
     persistentRoundTrip(backend, governor, kv::Layout{16, 4, 256, format});
+    // Qwen3.8-Flash-Next's token-major values and QSA index, whose pooled
+    // keys a page's slot carries with its K/V.
+    const kv::Layout flashNext{12, 2, 256, format, 128, true};
+    roundTrip(backend, governor, flashNext);
+    persistentRoundTrip(backend, governor, flashNext);
     limits(backend, governor, format);
     allocationFailure(backend, governor, format);
     demotionsPassTheWriteBudget(backend, governor, format);

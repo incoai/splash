@@ -1,6 +1,7 @@
 #include "engine/MemoryAudit.hpp"
 #include "Checked.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <sstream>
 #include <utility>
@@ -58,8 +59,8 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
   // The plan takes the weight categories from what loaded, so they are
   // counted but have no bound of their own. A buffer a loader does not report
   // is unclassified backend memory, which the pipeline and runtime reserves
-  // bound; only the arenas, KV storage, the disk tier's state staging and the
-  // Neural Engine split have planned category bounds.
+  // bound; only the arenas, KV storage, the disk tier's state staging, the
+  // Neural Engine split and the streamed table have planned category bounds.
   uint64_t categorized = 0;
   for (const uint64_t weights : {actual.targetWeightsBytes,
                                  actual.draftWeightsBytes,
@@ -93,6 +94,18 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
                   "categorized memory sum overflowed", actual);
     }
   }
+  // The streamed table's row cache is host memory: bounded by its plan like
+  // the categories, but outside Metal's footprint, beside which it takes its
+  // part of the hard budget.
+  if (actual.streamedTableBytes > budget.streamedTableBytes) {
+    std::ostringstream message;
+    message << "streamed table actual bytes " << actual.streamedTableBytes
+            << " exceed planned bytes " << budget.streamedTableBytes;
+    return fail(MemoryAuditError::CategoryExceedsPlan, message.str(), actual);
+  }
+  const uint64_t metalBudget =
+      budget.hardBudgetBytes -
+      std::min(budget.hardBudgetBytes, actual.streamedTableBytes);
   uint64_t dynamic = 0;
   if (!checkedAdd(actual.stateAllocatedBytes, actual.kvAllocatedBytes, dynamic) ||
       !checkedAdd(categorized, actual.stateAllocatedBytes, categorized)) {
@@ -124,9 +137,9 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
     return fail(MemoryAuditError::ArithmeticOverflow,
                 "backend peak with the reserves overflowed", actual);
   }
-  if (actual.deviceCurrentAllocatedBytes > budget.hardBudgetBytes ||
-      actual.devicePeakAllocatedBytes > budget.hardBudgetBytes ||
-      backendPeakWithReserves > budget.hardBudgetBytes) {
+  if (actual.deviceCurrentAllocatedBytes > metalBudget ||
+      actual.devicePeakAllocatedBytes > metalBudget ||
+      backendPeakWithReserves > metalBudget) {
     return fail(MemoryAuditError::HardBudgetExceeded,
                 "actual Metal footprint or the backend's peak with the "
                 "reserves exceeds hard budget",
@@ -171,8 +184,7 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
   result.backendUnclassifiedBytes = backendUnclassified;
   result.deviceUntrackedBytes = deviceUntracked;
   result.devicePeakDeviationBasisPoints = static_cast<uint32_t>(basisPoints);
-  result.actualHeadroomBytes =
-      budget.hardBudgetBytes - actual.devicePeakAllocatedBytes;
+  result.actualHeadroomBytes = metalBudget - actual.devicePeakAllocatedBytes;
   return result;
 }
 

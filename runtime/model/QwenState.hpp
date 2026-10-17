@@ -23,6 +23,11 @@ struct GdnParityBuffers final {
   std::vector<metal::MetalBuffer> recurrentLayers;
 };
 
+// A cell of `layout` in `base` (layout.cellBytes()): every layer's
+// convolution state, then every layer's recurrent state.
+[[nodiscard]] GdnParityBuffers gdnCellBuffers(metal::MetalBackend &backend, metal::MetalBuffer base,
+                                              const GdnStateLayout &layout);
+
 class QwenGdnCell final {
 public:
   ~QwenGdnCell();

@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -54,8 +55,14 @@ struct QwenAttentionWeights final {
 
 using QwenMixerWeights = std::variant<QwenGdnWeights, QwenAttentionWeights>;
 
+class ExpertStore;
+class SparseRowStore;
+
 // A Qwen target's weights outside its layers and the record of every file
-// its weights were read from.
+// its weights were read from. A MoE target whose routed experts stream reads
+// them through `experts` (model/ExpertStore.hpp), and a target whose table
+// streams from its file reads its rows through `streamedTable`
+// (model/SparseRowStore.hpp).
 struct QwenTargetWeightsBase {
   ops::NormWeights finalNorm;
   ops::Projection logitsProjection;
@@ -63,6 +70,8 @@ struct QwenTargetWeightsBase {
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
   std::string manifestFingerprintSha256;
+  std::shared_ptr<ExpertStore> experts;
+  std::shared_ptr<SparseRowStore> streamedTable;
 };
 
 // The weights of a target of Layout, whose layers the family keeps in Layer.
@@ -76,17 +85,23 @@ template <class Layout, class Layer> struct QwenTargetWeights final : QwenTarget
 // loaded weights add. It describes semantics only; operators remain
 // responsible for choosing device-specific Metal pipelines and compute tiles.
 struct QwenTargetGeometry final : QwenTargetDimensions {
-  static constexpr uint32_t maximumCaptureLayers = 8;
-
   QwenTargetGeometry() = default;
-  explicit QwenTargetGeometry(const QwenTargetDimensions &dimensions) : QwenTargetDimensions(dimensions) {}
+  // A target of `dimensions` whose DFlash2 draft reads the output rows of
+  // `captureLayers` (DFlashDraftLayout::targetLayerIds); more than the
+  // geometry holds leave it invalid.
+  QwenTargetGeometry(const QwenTargetDimensions &dimensions, std::span<const uint32_t> captureLayers)
+      : QwenTargetDimensions(dimensions), captureLayerCount(static_cast<uint32_t>(captureLayers.size())) {
+    if (captureLayerCount <= captureLayerValues.size())
+      std::ranges::copy(captureLayers, captureLayerValues.begin());
+  }
 
   // The format of most of the sparse MoE blocks' routed expert weights, and
   // whether every routed and shared expert weight is in a format the register
   // tile takes (ops::MoeShape).
   uint32_t moeExpertFormat = GGUF_FMT_COUNT;
   bool moeRegisterFormats = true;
-  std::array<uint32_t, maximumCaptureLayers> captureLayerValues{};
+  // The layers whose output rows the DFlash2 draft reads, ascending.
+  std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> captureLayerValues{};
   uint32_t captureLayerCount = 0;
   // The target's KV layout in the format the runtime stores KV in, and its
   // GDN state layout.
@@ -122,16 +137,21 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
             convolutionDimension, packedGdnWidth};
   }
   // The layout itself was checked by requireQwenLayout when the target
-  // loaded. The projection lists hold every projection the weights dispatch,
-  // which each have sizes.
+  // loaded. The draft reads 1 to ExecutionLimits::maximumDraftTargetLayers
+  // of its layers, ascending. The projection lists hold every projection the
+  // weights dispatch, which each have sizes.
   [[nodiscard]] bool valid() const noexcept {
     const auto sized = [](const std::vector<ops::ProjectionShape> &shapes) {
       return !shapes.empty() && std::all_of(shapes.begin(), shapes.end(), [](const auto &shape) {
         return shape.outputSize && shape.inputSize;
       });
     };
-    return captureLayerCount && captureLayerCount <= maximumCaptureLayers &&
-           stateLayout.layers + kvLayout.attentionLayers == layers &&
+    const auto captured = [&] {
+      if (!captureLayerCount || captureLayerCount > ExecutionLimits::maximumDraftTargetLayers) return false;
+      const auto ids = captureLayers();
+      return std::ranges::adjacent_find(ids, std::ranges::greater_equal{}) == ids.end() && ids.back() < layers;
+    };
+    return captured() && stateLayout.layers + kvLayout.attentionLayers == layers &&
            gdnShape().valid() &&
            kvLayout.kvHeads == attentionKvHeads &&
            kvLayout.headDimension == attentionHeadDimension &&
@@ -210,6 +230,14 @@ struct QwenTargetPrefillBuffers final {
   }
 };
 
+// A chunk of a prefill command: `rows` rows of its lanes' sequences, packed
+// in sequence order, in its own buffers.
+struct QwenTargetPrefillChunk final {
+  QwenTargetPrefillBuffers buffers;
+  std::span<const QwenTargetPrefillSequence> sequences;
+  uint32_t rows = 0;
+};
+
 struct QwenTargetVerifyBuffers final {
   ops::LinearScratch linearScratch{};
   std::array<metal::MetalBuffer, 2> hidden;
@@ -245,9 +273,11 @@ struct QwenTargetVerifyBuffers final {
   ops::MoeScratch moe;
 };
 
+// The geometry of a target whose DFlash2 draft reads the output rows of
+// `captureLayers` (DFlashDraftLayout::targetLayerIds).
 template <class Layout, class Layer>
-[[nodiscard]] QwenTargetGeometry
-qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &weights);
+[[nodiscard]] QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &weights,
+                                                    std::span<const uint32_t> captureLayers);
 
 // Builds the shared Qwen GDN/attention layer graph with the target's dense
 // or sparse-MoE FFN. Architecture-specific loaders supply the model's tensors.
@@ -266,13 +296,17 @@ public:
   // stale activations and write results no active row reads.
   [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
 
-  // Returns the hidden buffer that holds the last layer's output rows. The
-  // dense FFN of a chunk the split takes (AneFfn::splits) runs split with the
-  // Neural Engine on `aneFfn`, when given.
-  [[nodiscard]] metal::MetalBuffer addPrefill(
-      metal::CommandGraph &graph, QwenTargetPrefillBuffers buffers,
-      std::span<const QwenTargetPrefillSequence> sequences, uint32_t rows,
-      std::span<const SplashKvLayer> kvLayers, ops::AneFfn *aneFfn = nullptr) const;
+  // A prefill command of one or more chunks (a prefill group), run layer by
+  // layer: a layer of each chunk in turn, then the next layer, so that a
+  // layer whose experts stream loads the union of the chunks' experts once.
+  // A chunk's sequences read the states and KV that the chunks before it
+  // wrote. The dense FFN of a command of one chunk the split takes
+  // (AneFfn::splits) runs split with the Neural Engine on `aneFfn`, when
+  // given. Returns each chunk's buffer of its last layer's output rows.
+  [[nodiscard]] std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph,
+                                                           std::span<const QwenTargetPrefillChunk> chunks,
+                                                           std::span<const SplashKvLayer> kvLayers,
+                                                           ops::AneFfn *aneFfn = nullptr) const;
   void addVerify(
       metal::CommandGraph &graph, QwenTargetVerifyBuffers buffers,
       std::span<const SplashKvLayer> kvLayers,
@@ -298,8 +332,20 @@ private:
   struct PrefillStep;
   struct VerifyStep;
 
+  // A prefill's layers over its chunks' steps (addPrefill): per layer, each
+  // step through its FFN's routing (addPrefillLayer), the layer's load of
+  // streamed experts, and each step's routed work (addPrefillExperts); then
+  // each step's last layer's output rows.
+  template <class Weights>
+  [[nodiscard]] std::vector<metal::MetalBuffer> addPrefillLayers(std::span<PrefillStep> steps,
+                                                                 const Weights &weights) const;
+  template <class Layout, class Layer>
+  void addPrefillLayer(PrefillStep &step, const QwenTargetWeights<Layout, Layer> &weights, uint32_t index) const;
+  template <class Layout, class Layer>
+  void addPrefillExperts(PrefillStep &step, const QwenTargetWeights<Layout, Layer> &weights, uint32_t index) const;
   // A layer's parts in dispatch order: the mixer normalizes its input and
-  // returns the residual rows the FFN normalizes and adds to into `output`.
+  // returns the residual rows the FFN normalizes and adds to into `output`
+  // (a MoE's routing, whose routed work addPrefillExperts adds).
   void addPrefillNorm(PrefillStep &step, metal::MetalBuffer input, const ops::NormWeights &norm) const;
   void addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden, const ops::Projection &projection,
                         metal::MetalBuffer input, metal::MetalBuffer output) const;

@@ -90,8 +90,8 @@ public:
     core_.setCompletionNotifier(std::move(notifier));
   }
 
-  void observePrefill(uint32_t rows, double wallMilliseconds) {
-    core_.observePrefill(rows, wallMilliseconds);
+  void observePrefill(uint32_t rows, double wallMilliseconds, double hostMilliseconds) {
+    core_.observePrefill(rows, wallMilliseconds, hostMilliseconds);
   }
 
   void announceReady();

@@ -92,6 +92,22 @@ private:
 
 } // namespace
 
+GdnParityBuffers gdnCellBuffers(metal::MetalBackend &backend, metal::MetalBuffer base, const GdnStateLayout &layout) {
+  if (base.sizeBytes() < layout.cellBytes()) throw std::invalid_argument("a GDN cell is larger than its buffer");
+  GdnParityBuffers cell;
+  cell.stateBase = std::move(base);
+  cell.convolutionLayers.resize(layout.layers);
+  cell.recurrentLayers.resize(layout.layers);
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    cell.convolutionLayers[layer] = backend.view(cell.stateBase, uint64_t{layer} * layout.convolutionLayerBytes(),
+                                                 layout.convolutionLayerBytes());
+    cell.recurrentLayers[layer] =
+        backend.view(cell.stateBase, layout.convolutionBytes() + uint64_t{layer} * layout.recurrentLayerBytes(),
+                     layout.recurrentLayerBytes());
+  }
+  return cell;
+}
+
 QwenGdnCell::QwenGdnCell(metal::MetalBackend &backend,
                          std::shared_ptr<StateAllocationTracker> tracker,
                          GdnStateLayout layout, std::string_view label)
@@ -101,23 +117,8 @@ QwenGdnCell::QwenGdnCell(metal::MetalBackend &backend,
   if (!layout.valid())
     throw std::invalid_argument("Qwen GDN state layout is invalid");
   const uint64_t before = backend.memoryStats().allocatedBytes;
-  buffers_.stateBase = backend.allocateBuffer(
-      layout.cellBytes(), metal::BufferStorage::Shared, label);
-  // The cell holds every layer's convolution state, then every layer's
-  // recurrent state.
-  buffers_.convolutionLayers.resize(layout.layers);
-  buffers_.recurrentLayers.resize(layout.layers);
-  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    buffers_.convolutionLayers[layer] =
-        backend.view(buffers_.stateBase,
-                     uint64_t{layer} * layout.convolutionLayerBytes(),
-                     layout.convolutionLayerBytes());
-    buffers_.recurrentLayers[layer] = backend.view(
-        buffers_.stateBase,
-        layout.convolutionBytes() +
-            uint64_t{layer} * layout.recurrentLayerBytes(),
-        layout.recurrentLayerBytes());
-  }
+  buffers_ = gdnCellBuffers(backend, backend.allocateBuffer(layout.cellBytes(), metal::BufferStorage::Shared, label),
+                            layout);
   actualAllocatedBytes_ =
       metal::allocationDelta(before, backend.memoryStats().allocatedBytes);
   if (actualAllocatedBytes_ < layout.cellBytes()) {

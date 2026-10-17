@@ -71,8 +71,11 @@ uint64_t WeightSource::dataOffset() const noexcept { return impl_->dataOffset; }
 void WeightSource::readData(uint64_t offset, std::span<uint8_t> bytes) const {
   if (offset > std::numeric_limits<uint64_t>::max() - impl_->dataOffset)
     throw std::overflow_error("weight read offset overflow");
+  readFile(impl_->dataOffset + offset, bytes);
+}
+void WeightSource::readFile(uint64_t offset, std::span<uint8_t> bytes) const {
   try {
-    readWeightBytes(impl_->file, impl_->dataOffset + offset, bytes);
+    readWeightBytes(impl_->file, offset, bytes);
   } catch (const std::exception &error) {
     throw std::runtime_error(std::string(error.what()) + ": " + impl_->path.string());
   }

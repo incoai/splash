@@ -13,10 +13,12 @@ constexpr uint32_t kMaximumOvertakes =
     model::ExecutionLimits::maximumBatchWidth - 1;
 
 // The slice a contended prefill command aims for: while peers of its
-// priority decode, the budget halves until its measured cost fits, so they
+// priority decode, the budget halves until its estimated cost fits, so they
 // wait about this long between steps. A latency target, not a deadline: the
-// first command has no measurement, and the budget stops at
-// kMinimumPrefillRows.
+// first command has no measurement, the budget stops at kMinimumPrefillRows,
+// and the slice grows to twice a command's fixed cost (a streamed target's
+// expert reads), so the rows of a command always take at least as long as
+// its fixed part.
 constexpr double kContendedPrefillMilliseconds = 500.0;
 // The fewest rows a contended prefill command is cut to, and the fewest whose
 // time measures prefill throughput: below it a command's fixed costs dominate.
@@ -29,6 +31,20 @@ constexpr double kPrefillTimeWeight = 0.25;
 // A command excludes at most the lanes of a full batch: a linear search.
 bool listed(std::span<const uint64_t> ids, uint64_t id) noexcept {
   return std::find(ids.begin(), ids.end(), id) != ids.end();
+}
+
+// The rows of an uncontended command of a lane with `remaining` rows to
+// prefill: up to a chunk, or for a lane whose commands may be prefill groups
+// of up to `groupRows` rows, its remaining chunks split evenly over the
+// fewest groups that hold them (a short last group would pay a whole pass
+// over a target's streamed experts for a few rows).
+uint32_t uncontendedRows(uint32_t remaining, uint32_t groupRows) noexcept {
+  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
+  if (remaining <= chunk || groupRows <= chunk)
+    return std::min(remaining, chunk);
+  const uint32_t chunks = (remaining + chunk - 1) / chunk;
+  const uint32_t groups = (chunks + groupRows / chunk - 1) / (groupRows / chunk);
+  return std::min(remaining, (chunks + groups - 1) / groups * chunk);
 }
 
 } // namespace
@@ -318,11 +334,12 @@ uint32_t Scheduler::prefillBudget(
     const PrefillRequestView &leader,
     std::span<const PrefillRequestView> ready) const {
   const uint32_t maximum = model::ExecutionLimits::prefillTokenBudget;
-  if (prefillMillisecondsPerToken_ <= 0.0)
+  if (prefillMillisecondsPerToken_ <= 0.0 && prefillFixedMilliseconds_ <= 0.0)
     return maximum;
   uint32_t rows = maximum;
+  const double slice = std::max(kContendedPrefillMilliseconds, 2.0 * prefillFixedMilliseconds_);
   while (rows > kMinimumPrefillRows &&
-         rows * prefillMillisecondsPerToken_ > kContendedPrefillMilliseconds)
+         prefillFixedMilliseconds_ + rows * prefillMillisecondsPerToken_ > slice)
     rows /= 2;
   const uint32_t leaderRemaining =
       leader.request->spec.prefillTokens - leader.promptProcessed;
@@ -348,8 +365,9 @@ uint32_t Scheduler::prefillBudget(
   // A leader that finishes within the full budget ends the command at its
   // last row: prefill cost is linear above the slice, so shortest-first
   // sequential commands minimise first-token latency. Long prefills share a
-  // command only when no lane finishes.
-  return std::min(leaderRemaining, maximum);
+  // command only when no lane finishes; one that runs prefill groups takes
+  // a group alone.
+  return uncontendedRows(leaderRemaining, leader.request->spec.prefillGroupRows);
 }
 
 std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> excluded) const {
@@ -438,7 +456,8 @@ void Scheduler::commit(const BatchPlan &plan, std::span<const uint64_t> excluded
 void Scheduler::complete(const BatchPlan &plan,
                          std::span<const StepResult> results,
                          double wallMilliseconds,
-                         bool representativePrefillTiming) {
+                         bool representativePrefillTiming,
+                         double hostMilliseconds) {
   if (!active_ || active_->kind != plan.kind ||
       active_->items.size() != plan.items.size() ||
       results.size() != plan.items.size()) {
@@ -478,7 +497,7 @@ void Scheduler::complete(const BatchPlan &plan,
     uint32_t rows = 0;
     for (const BatchItem &item : plan.items)
       rows += item.tokenCount;
-    observePrefill(rows, wallMilliseconds);
+    observePrefill(rows, wallMilliseconds, hostMilliseconds);
   }
   // While requests of the same or a higher priority decode, lanes this
   // prefill finished included, it owes decode a share of its time; decode
@@ -518,17 +537,25 @@ void Scheduler::dropStaleDecodeDebt() noexcept {
     decodeDebtMilliseconds_ = 0.0;
 }
 
-void Scheduler::observePrefill(uint32_t rows, double wallMilliseconds) {
+void Scheduler::observePrefill(uint32_t rows, double wallMilliseconds,
+                               double hostMilliseconds) {
   // Tiny tails are dominated by fixed command costs, not prefill throughput.
   if (rows < kMinimumPrefillRows || !std::isfinite(wallMilliseconds) ||
       wallMilliseconds <= 0.0)
     return;
-  const double observed = wallMilliseconds / rows;
-  prefillMillisecondsPerToken_ =
-      prefillMillisecondsPerToken_ > 0.0
-          ? (1.0 - kPrefillTimeWeight) * prefillMillisecondsPerToken_ +
-                kPrefillTimeWeight * observed
-          : observed;
+  const double fixed = std::isfinite(hostMilliseconds)
+                           ? std::clamp(hostMilliseconds, 0.0, wallMilliseconds)
+                           : 0.0;
+  const double perToken = (wallMilliseconds - fixed) / rows;
+  const bool measured =
+      prefillMillisecondsPerToken_ > 0.0 || prefillFixedMilliseconds_ > 0.0;
+  const auto mix = [&](double estimate, double observed) {
+    return measured ? (1.0 - kPrefillTimeWeight) * estimate +
+                          kPrefillTimeWeight * observed
+                    : observed;
+  };
+  prefillFixedMilliseconds_ = mix(prefillFixedMilliseconds_, fixed);
+  prefillMillisecondsPerToken_ = mix(prefillMillisecondsPerToken_, perToken);
 }
 
 Phase Scheduler::phase(uint64_t id) const { return get(id).phase; }

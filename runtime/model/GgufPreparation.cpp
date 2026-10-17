@@ -207,6 +207,11 @@ void quantizeRows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, 
   }
 }
 
+// The float the bits of a BF16 or, with float16, an F16 value hold.
+float widenFloat16(uint16_t bits, bool float16) {
+  return float16 ? static_cast<float>(std::bit_cast<__fp16>(bits)) : widenBfloat16(bits);
+}
+
 // Native NVFP4 bytes [column, column + span) of `count` rows of llama.cpp's
 // NVFP4 from source row `start` on, back to back: per 256 elements the 16
 // UE4M3 scales of four block_nvfp4 as the E4M3 scales they are (llama.cpp
@@ -282,12 +287,12 @@ void narrowToBfloat16(const uint8_t *values, uint64_t count, uint8_t *to, const 
   }
 }
 
-// Writes the F32 values `count` BF16 values equal.
-void widenToFloat32(const uint8_t *values, uint64_t count, uint8_t *to) {
+// Writes the F32 values `count` BF16 (or, with float16, F16) values equal.
+void widenToFloat32(const uint8_t *values, uint64_t count, bool float16, uint8_t *to) {
   for (uint64_t i = 0; i < count; ++i) {
-    uint16_t value;
-    std::memcpy(&value, values + 2 * i, 2);
-    const uint32_t widened = uint32_t{value} << 16;
+    uint16_t bits;
+    std::memcpy(&bits, values + 2 * i, 2);
+    const float widened = widenFloat16(bits, float16);
     std::memcpy(to + 4 * i, &widened, 4);
   }
 }
@@ -338,7 +343,9 @@ void addCopyTasks(uint8_t *image, const gguf::Copy &copy,
         case gguf::Conversion::NarrowToBfloat16:
           narrowToBfloat16(staging.data(), count * width / 4, to, rows.name);
           break;
-        case gguf::Conversion::WidenToFloat32: widenToFloat32(staging.data(), count * width / 2, to); break;
+        case gguf::Conversion::WidenToFloat32:
+          widenToFloat32(staging.data(), count * width / 2, rows.type == ggml::kF16, to);
+          break;
         case gguf::Conversion::CenteredNorm: centeredNorm(staging.data(), count * width / 2, to); break;
         case gguf::Conversion::Decay: {
           const bool bfloat16 = rows.type == ggml::kBF16;
@@ -389,7 +396,7 @@ RepackChunk repackChunk(const gguf::Repack &repack) {
 // shape, sources of its row width and planes inside the image.
 void requireRepack(const gguf::Repack &repack, uint64_t imageBytes) {
   if (repack.format >= GGUF_FMT_COUNT || !repack.rows || repack.rows % QUANT_TILE_ROWS || !repack.columns ||
-      repack.columns % kGgufBlockColumns)
+      repack.columns % ggufColumnUnit(kQuantFormats[repack.format]))
     throw GgufError("invalid prepared weight repack");
   const QuantFormat &format = kQuantFormats[repack.format];
   const uint64_t rowBytes = ggufRowBytes(format, repack.columns);
@@ -462,8 +469,12 @@ void writeRepack(metal::MetalBackend &backend, const metal::MetalBuffer &image, 
       params.src_row_bytes = static_cast<uint32_t>(chunkRowBytes);
       params.dst_plane1 = lengths[1] ? static_cast<uint32_t>(at[1] - at[0]) : 0;
       params.dst_meta = static_cast<uint32_t>(at[2] - at[0]);
+      // One thread per row and 32-column group, rounded up to whole
+      // threadgroups: an odd number of 64-row tiles by an odd number of
+      // 64-column spans leaves half a threadgroup, which the kernel bounds.
+      const uint64_t items = rows * (columns / 32);
       static_cast<void>(backend.submit({"gguf_repack", {{0, input}, {1, backend.view(image, at[0], extent)}},
-                                        {{2, &params, sizeof(params)}}, {rows * (columns / 32) / 256, 1, 1},
+                                        {{2, &params, sizeof(params)}}, {(items + 255) / 256, 1, 1},
                                         {256, 1, 1}}));
     }
   }
@@ -504,6 +515,36 @@ void writeDecoded(metal::MetalBackend &backend, const metal::MetalBuffer &image,
 }
 
 } // namespace
+
+void readRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count, uint8_t *to) {
+  uint64_t sourceRows = 0;
+  for (const gguf::TensorRows &tensor : repack.sources) sourceRows += tensor.rows;
+  if (first > sourceRows || count > sourceRows - first) throw GgufError("repack rows are out of bounds");
+  const uint64_t rowBytes = ggufRowBytes(kQuantFormats[repack.format], repack.columns);
+  uint64_t start = 0;
+  for (const gguf::TensorRows &tensor : repack.sources) {
+    const uint64_t begin = std::max(first, start), end = std::min(first + count, start + tensor.rows);
+    if (begin < end) readRows(tensor, begin - start, end - begin, 0, rowBytes, to + (begin - first) * rowBytes);
+    start += tensor.rows;
+  }
+}
+
+std::optional<StoredRows> storedRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count) {
+  const uint64_t rowBytes = ggufRowBytes(kQuantFormats[repack.format], repack.columns);
+  uint64_t start = 0;
+  for (const gguf::TensorRows &tensor : repack.sources) {
+    if (first >= start && first - start < tensor.rows) {
+      const uint64_t row = first - start;
+      // A permutation (RowOrder) leaves single rows where they are.
+      if (count > tensor.rows - row || rowReader(tensor) != RowReader::Stored || tensor.rowBytes != rowBytes ||
+          !tensor.file || (count > 1 && tensor.order.from < row + count))
+        return std::nullopt;
+      return StoredRows{tensor.file, tensor.file->dataOffset() + tensor.offset + sourceRow(tensor, row) * rowBytes};
+    }
+    start += tensor.rows;
+  }
+  throw GgufError("repack rows are out of bounds");
+}
 
 void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &image, const gguf::Image &plan) {
   const std::span<uint8_t> destination = contentsOf(image);

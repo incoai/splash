@@ -4,50 +4,6 @@
 // Verify tiles process one lane's eight rows per KV head and history split.
 // Verify and prefill share the device-operand page loop in paged_attention_tile.h.
 
-// The tile one verify threadgroup owns: group.x is the KV head, group.y the
-// history split and group.z the lane, whose parameters select the page table
-// and the query tile. A threadgroup past its lane's split count, or whose
-// lane fails the contract, is inactive and does nothing.
-struct SplashVerifyTile {
-  device bfloat *queries;
-  device const SplashKvPage *page_table;
-  ulong slot;
-  uint kv_head;
-  uint split;
-  uint splits;
-  uint committed_tokens;
-  bool active;
-};
-
-template <uint KVHeads, uint QueryHeadsPerKVHead>
-inline SplashVerifyTile splash_verify_attention_tile_at(
-    device bfloat *queries, device const SplashKvPage *page_table0,
-    device const SplashKvPage *page_table1, device const SplashKvPage *page_table2,
-    device const SplashKvPage *page_table3,
-    constant SplashVerifyAttentionParams *params, uint3 group) {
-  constexpr uint D = SplashKvHeadDimension;
-  SplashVerifyTile tile{};
-  uint kv_head = group.x;
-  uint split = group.y;
-  uint batch = group.z;
-  constant SplashVerifyAttentionParams &lane_params = params[batch];
-  if (!splash_verify_attention_contract_valid(lane_params) ||
-      kv_head >= KVHeads || split >= lane_params.split_count)
-    return tile;
-  constexpr ulong group_stride =
-      ulong(SPLASH_VERIFY_CHUNK_STRIDE) * QueryHeadsPerKVHead * D;
-  tile.queries = queries + (ulong(batch) * KVHeads + kv_head) * group_stride;
-  tile.page_table = SPLASH_LANE_BINDING(batch, page_table0, page_table1, page_table2, page_table3);
-  tile.slot =
-      (ulong(batch) * KVHeads + kv_head) * lane_params.slot_splits + split;
-  tile.kv_head = kv_head;
-  tile.split = split;
-  tile.splits = lane_params.split_count;
-  tile.committed_tokens = lane_params.committed_tokens;
-  tile.active = true;
-  return tile;
-}
-
 // Verify entries: one lane per group.z, eight rows, one configured history
 // partition, with scratch for scores, probabilities and row statistics.
 // INT8 and BF16 entries share one signature: pages are reached through the
@@ -75,12 +31,13 @@ inline SplashVerifyTile splash_verify_attention_tile_at(
   threadgroup float previous_scale[M];                                         \
   threadgroup atomic_uint rescale;
 
+// group.x is the KV head, group.y the history split and group.z the lane,
+// whose parameters select the page table and the query tile.
 #define PAGED_VERIFY_TILE_AT(Heads, Group)                                     \
-  const SplashVerifyTile tile =                                                \
-      splash_verify_attention_tile_at<Heads, Group>(                           \
-          queries, page_table0, page_table1, page_table2, page_table3, params, \
-          group);                                                              \
-  if (!tile.active)                                                            \
+  const SplashAttentionTile tile =                                             \
+      splash_verify_attention_tile<Heads, Group>(params[group.z], group.x,     \
+                                                 group.z);                     \
+  if (!tile.active || group.y >= tile.splits)                                  \
     return;
 
 #define PAGED_VERIFY_SPLIT(Name, Heads, Group, CacheElement)                   \
@@ -89,10 +46,13 @@ inline SplashVerifyTile splash_verify_attention_tile_at(
     PAGED_VERIFY_TILE_AT(Heads, Group)                                         \
     splash_paged_attention_tile<Heads, Group, SPLASH_TARGET_VERIFY_ROWS,       \
                                 CacheElement>(                                 \
-        tile.queries, tile.page_table, params[group.z].kv, tile.kv_head,       \
-        tile.committed_tokens, SPLASH_TARGET_VERIFY_ROWS, tile.splits,         \
-        tile.split, partials, statistics, tile.slot, scores, probabilities,    \
-        row_max, row_sum, previous_scale, &rescale, thread_index);             \
+        queries + tile.offset,                                                 \
+        SPLASH_LANE_BINDING(group.z, page_table0, page_table1, page_table2,    \
+                            page_table3),                                      \
+        params[group.z].kv, group.x, tile.first_position, tile.active_rows,    \
+        tile.splits, group.y, partials, statistics, tile.first_slot + group.y, \
+        scores, probabilities, row_max, row_sum, previous_scale, &rescale,     \
+        thread_index);                                                         \
   }
 
 PAGED_VERIFY_SPLIT(verify_attention_q8_split, 4, 6, int8_t)
@@ -113,23 +73,16 @@ inline void splash_verify_attention_reduce_phase(
     uint thread_index, threadgroup float *weights, threadgroup float *group_values) {
   constexpr ushort M = SPLASH_TARGET_VERIFY_ROWS * QueryHeadsPerKVHead;
   constexpr ushort D = SplashKvHeadDimension;
-  uint kv_head = group.x;
-  uint fused_row = group.y;
-  uint batch = group.z;
-  constant SplashVerifyAttentionParams &lane_params = params[batch];
-  if (!splash_verify_attention_contract_valid(lane_params) ||
-      kv_head >= KVHeads || fused_row >= M || thread_index >= D)
+  const uint fused_row = group.y;
+  const SplashAttentionTile tile =
+      splash_verify_attention_tile<KVHeads, QueryHeadsPerKVHead>(params[group.z],
+                                                                group.x, group.z);
+  if (!tile.active || fused_row >= M || thread_index >= D)
     return;
-  constexpr ulong group_stride =
-      ulong(SPLASH_VERIFY_CHUNK_STRIDE) * QueryHeadsPerKVHead * D;
-  splash_attention_reduce_row<QueryHeadsPerKVHead,
-                                   SPLASH_TARGET_VERIFY_ROWS>(
-      partials, statistics,
-      output + (ulong(batch) * KVHeads + kv_head) * group_stride,
-      lane_params.committed_tokens, SPLASH_TARGET_VERIFY_ROWS,
-      lane_params.split_count,
-      (ulong(batch) * KVHeads + kv_head) * lane_params.slot_splits, fused_row,
-      thread_index, weights, group_values);
+  splash_attention_reduce_row<QueryHeadsPerKVHead, SPLASH_TARGET_VERIFY_ROWS>(
+      partials, statistics, output + tile.offset, tile.first_position,
+      tile.active_rows, tile.splits, tile.first_slot, fused_row, thread_index,
+      weights, group_values);
 }
 
 #define PAGED_VERIFY_REDUCE(Name, Heads, Group)                                \
