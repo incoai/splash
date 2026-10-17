@@ -452,6 +452,8 @@ struct ExecutionLimits final {
   static constexpr uint32_t draftProposalTokens = 7;
   static constexpr uint32_t targetVerifyRows = 8;
   static constexpr uint32_t draftContextTokens = 2048;
+  // The most target layers a DFlash2 draft reads (its target_layer_ids).
+  static constexpr uint32_t maximumDraftTargetLayers = 8;
   static constexpr uint32_t speculativeScratchTokens = targetVerifyRows - 1;
   // One step emits at most its retained verify rows plus a terminal anchor
   // (a stop token or the last budgeted token) that never receives a KV row.

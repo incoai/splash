@@ -19,8 +19,9 @@ namespace splash::kv {
 // startup warmup keeps one. Inside an extent every attention layer has a
 // region that holds the keys of all its pages, then their key scales, values
 // and value scales (abi/KvExtent.h). Kernels reach a page through its entry
-// in a request's GPU page table, and the backend's residency set keeps every
-// extent resident for every command; the host reaches the same bytes through
+// in a request's GPU page table, so extents are allocated
+// metal::BufferReach::Addressed: the command queue's residency set keeps them
+// resident for every command buffer. The host reaches the same bytes through
 // the page's spans(). Active requests may overwrite slots at or beyond their
 // logical commit index. Cached KV blocks reference only fully committed
 // pages, which are immutable while shared.

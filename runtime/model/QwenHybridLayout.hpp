@@ -4,7 +4,6 @@
 #include "ops/PagedKv.hpp"
 
 #include <array>
-#include <cstddef>
 #include <cstdint>
 #include <string_view>
 
@@ -62,12 +61,9 @@ struct QwenTargetDimensions {
   bool operator==(const QwenTargetDimensions &) const = default;
 };
 
-// A family's layout: its dimensions, the CaptureLayers layers whose hidden
-// states the draft reads, and the cache layouts they make. A family sets
-// every value its FFN uses and adds its file magics.
-template <size_t CaptureLayers> struct QwenHybridLayout : QwenTargetDimensions {
-  std::array<uint32_t, CaptureLayers> hiddenCaptureLayers{};
-
+// A family's layout: its dimensions and the cache layouts they make. A
+// family sets every value its FFN uses and adds its file magics.
+struct QwenHybridLayout : QwenTargetDimensions {
   [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
     return {attentionLayerCount(), attentionKvHeads,
             attentionHeadDimension};
@@ -76,9 +72,6 @@ template <size_t CaptureLayers> struct QwenHybridLayout : QwenTargetDimensions {
     return {layers - attentionLayerCount(), kGdnConvolutionTaps - 1,
             convolutionDimension,
             gdnValueHeads, gdnHeadDimension, gdnHeadDimension};
-  }
-  [[nodiscard]] constexpr uint32_t capturedHiddenSize() const noexcept {
-    return hiddenSize * hiddenCaptureLayers.size();
   }
   bool operator==(const QwenHybridLayout &) const = default;
 };

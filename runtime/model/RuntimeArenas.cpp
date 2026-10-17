@@ -113,7 +113,7 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   // prefill plan, the draft's context projections' too.
   const auto &draft = geometry.draft;
   std::vector<ops::ProjectionShape> prefillProjections = geometry.target.prefillProjections;
-  prefillProjections.push_back({draft.hiddenSize, draft.targetHiddenSize});
+  prefillProjections.push_back({draft.hiddenSize, draft.targetHiddenSize()});
   prefillProjections.push_back({draft.contextKvSize(), draft.hiddenSize});
   for (const auto &projection : prefillProjections) {
     const ops::LinearScratchSize linear = operators.linear().prefillScratchSize(projection);
@@ -212,7 +212,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::ContextKv,
       bytesFor<uint16_t>(r * geometry.draft.contextKvSize()));
   put(DecodeTensor::CapturedTargetHidden,
-      bytesFor<uint16_t>(r * geometry.draft.targetHiddenSize));
+      bytesFor<uint16_t>(r * geometry.draft.targetHiddenSize()));
   put(DecodeTensor::DraftQueryKeys, draftWorkspace.queryKeysBytes);
   put(DecodeTensor::DraftQueryValues, draftWorkspace.queryValuesBytes);
   // Proposal attention and accepted target-hidden injection use the same
@@ -311,7 +311,7 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
        {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
        {d.hiddenSize, d.attentionSize},
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
-       {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize}})
+       {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize()}})
     result.include(operators.linear().decodeScratchSize(shape));
   return result;
 }

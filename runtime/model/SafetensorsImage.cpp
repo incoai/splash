@@ -102,14 +102,14 @@ public:
     image_.repack(std::move(repack));
   }
 
-  // beta (value heads rows) | alpha (value heads rows): one 256-row tensor
-  // of their shared format padded with zero rows, or else one F32 tensor.
+  // beta (value heads rows) | alpha (value heads rows): one tensor of their
+  // shared format padded with zero rows to whole plane tiles, or else one F32
+  // tensor.
   void alphaBeta(const std::string &beta, const std::string &alpha) {
     const uint32_t heads = geometry_.gdnValueHeads, hidden = geometry_.hiddenSize;
     const std::optional<TensorRows> b = quantized(beta, heads, hidden), a = quantized(alpha, heads, hidden);
     if (b && a && b->type == a->type) {
-      if (2 * heads > QUANT_TILE_ROWS) throw WeightStoreError("alpha/beta rows exceed one 256-row tile");
-      Repack repack = image_.planes(gguf_format_of(b->type), QUANT_TILE_ROWS, hidden, alpha);
+      Repack repack = image_.planes(gguf_format_of(b->type), gguf::tiledRows(2ull * heads), hidden, alpha);
       repack.sources = {*b, *a};
       image_.repack(std::move(repack));
       return;
