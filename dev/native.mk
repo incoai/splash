@@ -65,6 +65,7 @@ TEST_ANE_PROGRAM_FAULTS := $(ENGINE_TEST_BUILD)/ane-program-faults
 TEST_GGUF_DEQUANT := $(ENGINE_TEST_BUILD)/gguf-dequant
 TEST_GGUF_ROTATION := $(ENGINE_TEST_BUILD)/gguf-rotation
 TEST_GGUF_MOE := $(ENGINE_TEST_BUILD)/gguf-moe
+TEST_GGUF_MOE_E512 := $(ENGINE_TEST_BUILD)/gguf-moe-e512
 TEST_GGUF_REFERENCE := $(ENGINE_TEST_BUILD)/gguf-reference
 TEST_GGUF_PLANNER := $(ENGINE_TEST_BUILD)/gguf-planner
 TEST_GGUF_PREPARATION := $(ENGINE_TEST_BUILD)/gguf-preparation
@@ -179,6 +180,7 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_GGUF_DEQUANT) \
 	$(TEST_GGUF_ROTATION) \
 	$(TEST_GGUF_MOE) \
+	$(TEST_GGUF_MOE_E512) \
 	$(TEST_GGUF_PREPARATION) \
 	$(TEST_ATTENTION_PLAN) \
 	$(TEST_LINEAR_PLAN) \
@@ -333,6 +335,12 @@ $(TEST_Q8_PREFILL_TEST): dev/tests/engine/q8_chunked_prefill_metal_test.mm \
 		$(ENGINE_LIBRARY) $(TEST_Q8_ATTENTION_LIB)
 $(TEST_GGUF_MOE): dev/tests/engine/gguf_moe_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
+# The same test at Qwen3.8-Flash-Next's 512 experts, 10 per token and expert
+# width 640.
+$(TEST_GGUF_MOE_E512): dev/tests/engine/gguf_moe_test.mm \
+		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_GGUF_MOE_E512): ENGINE_TEST_CXXFLAGS += -DGGUF_MOE_HIDDEN=256 -DGGUF_MOE_INTERMEDIATE=640 \
+		-DGGUF_MOE_EXPERTS=512 -DGGUF_MOE_TOP_K=10
 $(TEST_GDN_METAL_TEST): dev/tests/engine/gdn_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_ATTENTION_PLAN): dev/tests/engine/paged_attention_plan_test.mm \
@@ -380,7 +388,7 @@ $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(TEST_ANE_FFN) \
 		$(TEST_GGUF_REFERENCE) $(TEST_GGUF_PLANNER) $(TEST_GGUF_PREPARATION) \
 		$(TEST_BOOTSTRAP_TEST) $(TEST_RESOURCES_TEST) \
 		$(TEST_KV_PAGE_TIER_TEST) $(TEST_QWEN_STATE_TEST) $(TEST_Q8_ATTENTION_TEST) \
-		$(TEST_Q8_PREFILL_TEST) $(TEST_GGUF_MOE) \
+		$(TEST_Q8_PREFILL_TEST) $(TEST_GGUF_MOE) $(TEST_GGUF_MOE_E512) \
 		$(TEST_GDN_METAL_TEST) $(TEST_ATTENTION_PLAN) $(TEST_LINEAR_PLAN) \
 		$(TEST_DFLASH_BATCH_CONTROL_TEST) $(TEST_DRAFT_ATTENTION_TEST) \
 		$(TEST_GDN_DECODE_TEST) $(TEST_DRAFT_SELECTOR_TEST) \
@@ -507,6 +515,7 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(TEST_ANE_FFN) $(LIB) program
 	$(TEST_ANE_PROGRAM_FAULTS) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_GGUF_MOE) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_GGUF_MOE_E512) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_PLAN) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_LINEAR_PLAN) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_RESOURCES_TEST) $(LIB)
@@ -532,6 +541,9 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 # The vision fixture is named after the installed model's family, which its
 # model.json records. Nothing is printed when the installation serves no
 # vision (vision_format none: --language-only, or a GGUF without an mmproj).
+# ORACLE_ARGS: options every run of the runtime oracle takes besides its own,
+# as the oracle takes them (model_runtime_oracle_test.mm).
+ORACLE_ARGS ?=
 VISION_FIXTURE_FAMILY := import json, pathlib, sys; \
 	model = json.loads((pathlib.Path(sys.argv[1]) / "model.json").read_text()); \
 	print("" if model["vision_format"] == "none" else model["family"].lower())
@@ -542,9 +554,9 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 			$(METAL_TEST_ENV) $(TEST_VISION_ENCODER_TEST) $(LIB) "$(MODEL_ROOT)" \
 				dev/tests/fixtures/vision-parity/$$family; \
 		else echo "vision parity: skipped, the installation serves text only"; fi
-	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0
-	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --state-format bf16
-	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)"
+	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 $(ORACLE_ARGS)
+	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --state-format bf16 $(ORACLE_ARGS)
+	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" $(ORACLE_ARGS)
 
 .PHONY: benchmark-backend \
 	benchmark-decode-profile benchmark-attention-sweep \

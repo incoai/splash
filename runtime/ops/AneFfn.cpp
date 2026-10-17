@@ -36,7 +36,8 @@ static_assert(kSegment % ANE_FFN_INPUT_BLOCK == 0 && kSegment % ANE_FFN_INTERMED
 // The hidden channels ane_ffn_rotate's simdgroups rotate a block each of.
 constexpr uint32_t kRotateGroup = ANE_FFN_INPUT_BLOCK * (ANE_FFN_ROTATE_THREADS / 32);
 // The channels a split moves in: whole blocks of the intermediate rotation
-// for the ANE, whole 256-row tiles of the weight planes for the GPU.
+// for the ANE, whole plane tiles of the weight planes (QUANT_TILE_ROWS) for
+// the GPU.
 constexpr uint32_t kChannelUnit = std::max(QUANT_TILE_ROWS, ANE_FFN_INTERMEDIATE_BLOCK);
 static_assert(kChannelUnit % ANE_FFN_WEIGHT_ROWS == 0 && kSegment % ANE_FFN_WEIGHT_ROWS == 0,
               "the weight kernels' threadgroups take whole rows of every matrix the split stages");

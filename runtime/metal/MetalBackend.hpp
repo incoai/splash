@@ -56,6 +56,13 @@ enum class BufferStorage {
   Private,
 };
 
+// How kernels reach a buffer: bound to the dispatches that use it, or only
+// through its GPU address held in another buffer, as they reach KV extents.
+enum class BufferReach {
+  Bound,
+  Addressed,
+};
+
 class MetalBackend;
 class CommandTicket;
 
@@ -80,8 +87,10 @@ public:
   // (MetalBackend::releaseMemory). The pointer covers this view only.
   [[nodiscard]] void *contents() const noexcept;
   // GPU address of the view's first byte, for kernels that reach a buffer
-  // through an address another buffer holds.
-  [[nodiscard]] uint64_t gpuAddress() const noexcept;
+  // through an address another buffer holds; zero for released memory. Only
+  // a buffer allocated BufferReach::Addressed has one: no command names the
+  // buffers kernels reach that way, so only that keeps them resident.
+  [[nodiscard]] uint64_t gpuAddress() const;
   // Allocation identity and exact view range, including Private storage.
   // This compares metadata only; it never maps or reads device contents.
   [[nodiscard]] bool sameView(const MetalBuffer &other) const noexcept;
@@ -313,20 +322,21 @@ public:
 
   [[nodiscard]] const DeviceCapabilities &capabilities() const noexcept;
 
-  // Every buffer the backend allocates belongs to one residency set, attached
-  // to the command queue, until its memory is released or its last view is
-  // gone. Metal by itself wires a buffer only while a command uses it and a
-  // few seconds after, so memory pressure could compress idle state and the
-  // next request would wait to get it back. A member is wired from
-  // its allocation on until the keep-alive passes without a command, and
-  // again from the next command: memory goes back to macOS when the engine
-  // releases it, not when macOS chooses. Kernels may also reach a Shared
-  // buffer only through its GPU address held in another buffer, as they
-  // reach KV extents: residency makes it resident for every command, so no
-  // command names it.
+  // Every buffer the backend allocates belongs to one residency set until its
+  // memory is released or its last view is gone. Metal by itself wires a
+  // buffer only while a command uses it and a few seconds after, so memory
+  // pressure could compress idle state and the next request would wait to get
+  // it back. A member is wired from its allocation on until the keep-alive
+  // passes without a command, and again from the next command: memory goes
+  // back to macOS when the engine releases it, not when macOS chooses. A
+  // Shared buffer that kernels reach only through its GPU address
+  // (BufferReach::Addressed), as they reach KV extents, also belongs to the
+  // set the command queue holds, which makes it resident for every command
+  // buffer though no command names it (Residency).
   [[nodiscard]] MetalBuffer
   allocateBuffer(uint64_t bytes, BufferStorage storage,
-                 std::string_view label);
+                 std::string_view label,
+                 BufferReach reach = BufferReach::Bound);
   // A Shared buffer over whole pages of memory another agent also reads or
   // writes, such as an IOSurface of the Neural Engine, without a copy. Metal
   // keeps `owner` until it lets the buffer go; the memory is the owner's, so
