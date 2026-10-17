@@ -610,8 +610,14 @@ def _resolve_draft(family, selection, installed, target):
     for the target, made only when the Hub answered for the target. Else the
     installed draft stands in, unlisted, or without one a commit the Hub
     cache holds for this selection; the installed draft also stands in, with
-    the reason, when the draft cannot be resolved."""
+    the reason, when the draft cannot be resolved. A family no draft is
+    released for takes --draft-model's."""
     name = selection.draft_model or family.draft_repo
+    if name is None:
+        raise models.ModelError(
+            f"no DFlash2 draft is released for {family.name}; "
+            "name one with --draft-model"
+        )
     recorded = installed and installed["sources"]["draft"]
     asked = _answered(target)
     if recorded and not asked:
@@ -671,12 +677,12 @@ def _at(repo):
 
 
 def _draft_files(repo, target):
-    """The DFlash2 checkpoint in repo for target's family, downloaded, by
-    assembly path: config.json and the safetensors weights,
-    model.safetensors or the shards its index names, at the root of the
-    repository or --draft-model directory, as a DFlash2 release holds them.
-    The weights download only once the engine accepts its configuration with
-    the target's (check_model)."""
+    """The DFlash2 draft in repo for target's family, downloaded, by assembly
+    path: its config.json and safetensors weights, model.safetensors or the
+    shards its index names, at the root of the repository or --draft-model
+    directory, as a DFlash2 release holds them. The weights download only
+    once the engine accepts its configuration with the target's
+    (check_model)."""
     family = target.family
     try:
         if "config.json" not in repo.files:

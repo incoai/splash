@@ -84,7 +84,7 @@ access.
 | --- | --- | --- |
 | `--model` | Required | The upstream model, `OWNER/REPO`, or a GGUF's `OWNER/REPO:VARIANT`. See [upstream model loading](#upstream-model-loading). |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
-| `--draft-model` | Matching DFlash2 checkpoint | Override the draft with a compatible repository or local directory. See [drafts](#drafts). |
+| `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place; required for a family without a released draft. See [drafts](#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](#vision). |
 | `--offline` | Off | Start the installed model without asking the Hub, as `HF_HUB_OFFLINE=1` does. See [revisions](#revisions). |
 | `--port` | `SPLASH_PORT` or `8000` | HTTP port. |
@@ -1461,15 +1461,28 @@ the parameters, `GgufFile` and the planner check the rest).
 
 ### Drafts
 
-Each family names the repository of the DFlash2 checkpoint trained for it
-(`families.FAMILIES`), which holds it as the release publishes it:
-`config.json` and BF16 `model.safetensors` (or the shards its index names).
-Installation downloads only those files and follows the repository's default
-branch as it follows the target's ([Revisions](#revisions)); `--draft-model`
-accepts another repository, followed the same way, or a local directory that
-holds them. A checkpoint is installed only when the engine accepts its
+Every model decodes with a DFlash2 draft. Each family names the repository
+of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
+it as the release publishes it: `config.json` and BF16 `model.safetensors`
+(or the shards its index names); a family whose draft is not released yet
+names none, and its installation names one with `--draft-model`. Installation
+downloads only those files and follows the repository's default branch as it
+follows the target's ([Revisions](#revisions)); `--draft-model` accepts
+another repository, followed the same way, or a local directory that holds
+them. A checkpoint is installed only when the engine accepts its
 configuration with the target's (its `model-check`), so a draft of another
-architecture never replaces one that loads. Native loading validates the
+architecture never replaces one that loads.
+
+A draft's `config.json` states its layers, intermediate size, rotary base and
+the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
+ascending, at most eight); its hidden size, vocabulary and mask token are its
+target's, and its attention (32 query and 8 KV heads of 128), selector (rank
+256, 16 candidates), block of 8 rows and 2048-token window are those the
+kernels are built for (`readDraftLayout` in `ModelDescriptor.mm`); the
+kernels take any hidden width of whole 16-channel convolution groups. Every
+family loads and runs its draft alike: a decode cycle verifies every row of
+the draft's block, the anchor and its seven proposals. The target writes the
+outputs of the layers the draft reads for each row it reads. Native loading validates the
 configuration against the target again and loads the draft like a target
 ([Weight loading](#weight-loading)):
 `DraftCheckpointLoader` (`DraftCheckpoint.cpp`) plans the draft's `MDGG0001`

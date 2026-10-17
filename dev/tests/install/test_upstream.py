@@ -58,7 +58,7 @@ class UpstreamTest(unittest.TestCase):
         return output.getvalue(), warnings.getvalue()
 
     def test_every_family_names_its_own_draft_repository(self):
-        repos = [family.draft_repo for family in families.FAMILIES]
+        repos = [family.draft_repo for family in families.FAMILIES if family.draft_repo]
         for repo in repos:
             with self.subTest(repo=repo):
                 self.assertEqual(models.validate_repo_id(repo), repo)
@@ -1284,11 +1284,11 @@ class UpstreamTest(unittest.TestCase):
 
     def test_an_incompatible_draft_is_an_error_not_a_crash(self):
         fake_hub(self, self.cache)
-        local = draft_dir(self.root / "draft", DENSE, num_hidden_layers=6)
+        local = draft_dir(self.root / "draft", DENSE, hidden_size=2048)
         with self.assertRaisesRegex(
             models.ModelError,
             "draft configuration is incompatible with Qwen3.8-27B: draft config "
-            "num_hidden_layers mismatch: checkpoint 6, runtime 5",
+            "hidden_size mismatch: checkpoint 2048, runtime 5120",
         ):
             self.prepare(selection(self.root, draft_model=str(local)))
 
@@ -1435,6 +1435,7 @@ class UpstreamTest(unittest.TestCase):
             lambda r: r.update(metadata="0" * 64),
             lambda r: r.update(target_format="safetensors"),
             lambda r: r.update(version=True),
+            lambda r: r["sources"].pop("draft"),
             lambda r: r["sources"]["draft"].update(revision="main"),
             lambda r: r["files"]["config.json"].pop("mtime_ns"),
             lambda r: r["files"]["config.json"].update(digest="z" * 64),

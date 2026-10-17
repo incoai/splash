@@ -434,7 +434,6 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
   layout.attentionHeadDimension = 128;
   layout.packedFullWidth = 1024;     // q and its gate | k | v
   layout.intermediateSize = 512;
-  layout.hiddenCaptureLayers.fill(layout.layers - 1);
   const uint32_t hidden = layout.hiddenSize, valueRows = layout.gdnValueHeads * layout.gdnHeadDimension;
   const uint32_t kvRows = layout.attentionKvHeads * layout.attentionHeadDimension;
   const auto target = directory / "target";
@@ -467,7 +466,8 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
   check(weights.tokenEmbedding.blocks().formatId == GGUF_FMT_IQ4XS &&
             weights.tokenEmbedding.outputSize == layout.vocabularySize && weights.tokenEmbedding.inputSize == hidden,
         "GGUF target: token table IQ4_XS blocks of vocabulary x hidden");
-  check(model::qwenTargetGeometry(weights).valid(), "GGUF target: a valid target geometry");
+  const std::array<uint32_t, 2> captured{1, layout.layers - 1};
+  check(model::qwenTargetGeometry(weights, captured).valid(), "GGUF target: a valid target geometry");
   for (uint32_t index = 0; index < weights.layers.size(); ++index) {
     const auto &layer = weights.layers[index];
     const std::string at = "GGUF target layer " + std::to_string(index) + ": ";
