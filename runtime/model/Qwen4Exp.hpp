@@ -55,7 +55,7 @@ struct Qwen4ExpLayout final : QwenHybridLayout {
   uint32_t pleImageToken = 248056;
 
   constexpr Qwen4ExpLayout()
-      : QwenHybridLayout{{.maximumContextTokens = 262'144,
+      : QwenHybridLayout{{.nativeContextTokens = 262'144,
                           .layers = 48,
                           .hiddenSize = 2560,
                           .vocabularySize = 248320,

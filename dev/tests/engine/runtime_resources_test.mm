@@ -7,6 +7,7 @@
 #include "engine/RuntimeResources.hpp"
 #include "engine/Engine.hpp"
 #include "engine/MemoryPlan.hpp"
+#include "model/RuntimeArenas.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -16,6 +17,7 @@
 #include <array>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -147,7 +149,7 @@ uint64_t minimumBytes(const RuntimeResourcesConfig &config) {
 
 // A persistent cache's directory is named for what its copies hold: the same
 // models and layouts name the same one under any build, and a change to any
-// of them names another.
+// of them, or to the RoPE scaling its keys went through, names another.
 void testPersistentCacheNamespace() {
   const model::ModelDescriptor model = model::makeModelDescriptor(
       "namespace-test", model::Qwen3_8Layout{}, test::qwen3_8Draft(),
@@ -157,7 +159,7 @@ void testPersistentCacheNamespace() {
     kv::Layout layout = model.targetKvLayout;
     layout.format = format;
     return makeRuntimeCacheIdentity(std::string(64, models), std::string(64, 'b'), build,
-                                    layout);
+                                    layout, {});
   };
   const std::string name =
       persistentCacheNamespace(identity('a', "build", kv::Format::Int8), model.stateLayout);
@@ -187,6 +189,18 @@ void testPersistentCacheNamespace() {
               persistentCacheNamespace(indexed, model.stateLayout) != name &&
               persistentCacheNamespace(identity('a', "build", kv::Format::Int8), auxiliary) != name,
           "token-major values, an index or auxiliary state shared a dense layout's cache namespace");
+  const auto scaled = [&](double factor) {
+    kv::Layout layout = model.targetKvLayout;
+    layout.format = kv::Format::Int8;
+    return persistentCacheNamespace(makeRuntimeCacheIdentity(std::string(64, 'a'), std::string(64, 'b'), "build",
+                                                             layout, {factor, 262144}),
+                                    model.stateLayout);
+  };
+  require(scaled(1.0) == name && scaled(4.0) != name && scaled(2.0) != name && scaled(2.0) != scaled(4.0),
+          "YaRN's keys shared a cache namespace with another scaling's");
+  // Factors that print alike to six digits still rotate keys differently.
+  require(scaled(3.9999999) != scaled(4.0) && scaled(1.0000001) != scaled(1.0000004),
+          "factors alike to six digits shared a cache namespace");
 }
 
 void testWeightBudgetBeforeLoading(const char *metallibPath) {
@@ -514,6 +528,45 @@ void testStartGrowsThroughHostPressure(const char *metallibPath) {
   }
 }
 
+// A model served with YaRN starts and runs as any other, with YaRN all the
+// way into its runtime: the start names the window it serves, the runtime's
+// geometry serves that window, its arenas hold YaRN's rotary frequencies, and
+// its prefill and decode build the target's RoPE tables with the attention
+// factor.
+void testYarnRuntime(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-yarn");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "yarn-test");
+  config.model = model::withYarn(std::move(config.model), 4.0);
+  std::unique_ptr<RuntimeResources> resources;
+  const std::string started =
+      test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); });
+  require(started.find("YaRN scales the target's RoPE by 4: a window of 1010000 tokens instead of the native "
+                       "262144.") != std::string::npos,
+          "a start with YaRN did not name the window it serves");
+  const model::RuntimeContext context = resources->modelContext();
+  const auto geometry = model::RuntimeGeometry::from(context.model, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  require(geometry.target.ropeScaling == config.model.ropeScaling && geometry.target.contextTokens() == 1'010'000,
+          "the runtime's geometry lost YaRN or its window");
+  std::array<float, SPLASH_TARGET_ROPE_PAIRS> expected{};
+  model::rotaryInverseFrequencies(geometry.target.rotaryTheta, geometry.target.rotaryPairs,
+                                  geometry.target.ropeScaling, expected);
+  const metal::AllocationAdmission admit = resources->memoryGovernor().allocationAdmission();
+  const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+  std::unique_ptr<model::RuntimeModel> runtime;
+  require(static_cast<bool>(admit(budget.sharedPrefillBytes + budget.sharedDecodeBytes, [&] {
+            const model::PrefillArena arena(context.backend, geometry, context.operators);
+            require(std::memcmp(arena.get(model::PrefillTensor::TargetInverseFrequencies).contents(),
+                                expected.data(), sizeof(expected)) == 0,
+                    "the prefill arena does not hold YaRN's frequencies");
+          })),
+          "the YaRN prefill arena was refused");
+  require(static_cast<bool>(admit(budget.sharedPrefillBytes + budget.sharedDecodeBytes,
+                                  [&] { runtime = model::createRuntime(context); })),
+          "the YaRN runtime's arenas were refused");
+  static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
+  static_cast<void>(runtime->warmupDecodeBatch(1));
+}
+
 // The SSD cache holds no write back unless a write budget is set; one that
 // is set starts with a quarter of a day's.
 void testWriteBudgetOnlyWhenSet(const char *metallibPath) {
@@ -748,6 +801,7 @@ int main(int argc, char **argv) {
       testStartupAdmissionIgnoresModelSize(argv[1]);
       testFailedStepIsNamed(argv[1]);
       testStartGrowsThroughHostPressure(argv[1]);
+      testYarnRuntime(argv[1]);
       testWriteBudgetOnlyWhenSet(argv[1]);
       testStaleCachesGoAtEveryStart(argv[1]);
       testMadeCacheRootStaysOutOfBackups(argv[1]);

@@ -52,6 +52,9 @@ struct RuntimeCacheIdentity {
   std::string modelLayoutSha256;
   std::string buildId;
   kv::Layout kvLayout;
+  // The target's RoPE scaling, which every key the KV pages hold went
+  // through.
+  model::RopeScaling ropeScaling;
   // The target model's manifest.
   std::string targetModelSha256;
 };
@@ -60,12 +63,14 @@ struct RuntimeCacheIdentity {
 makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
                          std::string_view targetManifestSha256,
                          std::string_view buildId,
-                         kv::Layout targetKvLayout);
+                         kv::Layout targetKvLayout,
+                         model::RopeScaling ropeScaling);
 
 // The name of the directory a persistent cache tier keeps its files in:
 // what its copies hold, from the models that computed them, the KV and
-// state layouts and the format of the cache's files. The build is not part
-// of it; a change to what a copy holds bumps the cache's format instead.
+// state layouts, the target's RoPE scaling and the format of the cache's
+// files. The build is not part of it; a change to what a copy holds bumps
+// the cache's format instead.
 [[nodiscard]] std::string
 persistentCacheNamespace(const RuntimeCacheIdentity &identity,
                          const model::CompositeStateLayout &states);

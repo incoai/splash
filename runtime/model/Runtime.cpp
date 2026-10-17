@@ -830,7 +830,11 @@ struct Runtime::Impl {
         prefillArena->get(PrefillTensor::TargetInverseFrequencies),
         prefillArena->get(PrefillTensor::DraftInverseFrequencies),
         std::move(targetCos), std::move(targetSin), std::move(draftCos),
-        std::move(draftSin), {targetRows, draftRows}, kPrefillRows);
+        std::move(draftSin),
+        {.target_rows = targetRows,
+         .draft_rows = draftRows,
+         .target_scale = geometry.target.ropeScaling.attentionFactor()},
+        kPrefillRows);
   }
 
   // A constrained lane keeps its final prompt row, which prefill leaves at

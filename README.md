@@ -111,6 +111,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--max-memory 28G` | Cap Metal memory use. |
 | `--idle-release off` | Keep the model in memory while idle (default: release after 10m). |
 | `--max-context 100K` | Set the context limit. |
+| `--yarn-factor 4` | Stretch the 256K window up to 1,010,000 tokens with YaRN. Off by default. |
 | `--language-only` | Skip vision; serve text only. |
 | `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
 | `--state-format bf16` | Use BF16 recurrent states, half the size. Default: FP32. |

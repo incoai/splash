@@ -1,5 +1,6 @@
 #include "TestChecks.hpp"
 #include "TestDrafts.hpp"
+#include "model/ModelDescriptor.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/QwenTargetLoader.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -167,6 +168,22 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
     }
 }
 
+// A model served with YaRN reaches the runtime's geometry with its scaling
+// and the window it serves, which everything sized by the context follows; a
+// descriptor whose window is not the one its scaling serves is refused.
+void checkYarnGeometry() {
+  auto loaded = loadedModel<model::Qwen3_6MoeWeights>();
+  loaded.descriptor = model::withYarn(std::move(loaded.descriptor), 2.0);
+  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  require(geometry.target.ropeScaling == loaded.descriptor.ropeScaling &&
+              geometry.target.contextTokens() == 524'288 && geometry.target.nativeContextTokens == 262'144,
+          "the runtime's geometry does not serve YaRN's window");
+  loaded.descriptor.capabilities.maximumContextTokens = 262'144;
+  rejects([&] {
+    static_cast<void>(model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32));
+  }, "invalid model runtime geometry", "a geometry serving another window than the model's was accepted");
+}
+
 // Arenas are sized from the projections the weights hold, so each must have
 // sizes; an empty one would drop its workspace from the bound silently.
 void checkUnsizedProjection() {
@@ -233,6 +250,7 @@ int main() {
     checkCaptureLayers();
     checkGdnWidths();
     checkGateUpLayers();
+    checkYarnGeometry();
     const auto dense = loadedModel<model::Qwen3_8Weights>();
     const auto sparse = loadedModel<model::Qwen3_6MoeWeights>();
     checkLaneScratch(dense);

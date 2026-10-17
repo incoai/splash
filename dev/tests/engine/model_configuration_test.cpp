@@ -4,7 +4,8 @@
 // supported family's: the MLX target's config.json and its DFlash2 draft's,
 // read from FIXTURES (dev/tests/fixtures/model-configs/<family>), and the
 // config the installer derives from a GGUF's metadata with the metadata it
-// copies (gguf-metadata.json there).
+// copies (gguf-metadata.json there). Also the descriptor --yarn-factor makes
+// of one, and YaRN's rotary frequencies.
 //
 //   model-configuration FIXTURES
 
@@ -12,10 +13,13 @@
 #include "TestDrafts.hpp"
 #include "TestFiles.hpp"
 #include "model/ModelDescriptor.hpp"
+#include "model/RopeScaling.hpp"
 #include "model/WeightStore.hpp"
 
 #include <array>
+#include <cmath>
 #include <filesystem>
+#include <limits>
 #include <initializer_list>
 #include <iostream>
 #include <optional>
@@ -652,6 +656,60 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
 
 } // namespace
 
+// --yarn-factor stretches either family's 262,144-token window by its factor
+// (withYarn), up to four times, to at most the 1,010,000 tokens Qwen
+// validates; a family that states no YaRN window refuses it. YaRN's rotary
+// frequencies follow its reference computation (beta_fast 32, beta_slow 1),
+// here for the targets' 32 pairs of base 10^7, whose
+// correction range runs from pair 14 to pair 22: below it each frequency is
+// kept, above it divided by the factor, between them blended.
+void testYarn(const std::filesystem::path &fixtures) {
+  for (const std::string_view family : {"qwen3.8-27b", "qwen3.6-35b-a3b"}) {
+    const model::ModelDescriptor native = inspect(mlxModel(fixtures, family));
+    require(native.capabilities.maximumContextTokens == 262144 && !native.ropeScaling.yarn(),
+            "a model served without YaRN has another window or a RoPE scaling");
+    for (const auto [factor, window] :
+         {std::pair{4.0, 1010000U}, {3.9, 1010000U}, {3.8, 996147U}, {2.0, 524288U}, {2.5, 655360U}}) {
+      const model::ModelDescriptor scaled = model::withYarn(native, factor);
+      require(scaled.valid() && scaled.capabilities.maximumContextTokens == window &&
+                  scaled.ropeScaling == model::RopeScaling{factor, 262144},
+              "YaRN by " + std::to_string(factor) + " did not stretch the window to " + std::to_string(window));
+      rejects([&] { static_cast<void>(model::withYarn(scaled, 2.0)); }, "already scaled",
+              "a model's RoPE was scaled twice");
+    }
+    for (const double factor : {1.0, 0.5, 4.5, -2.0, std::numeric_limits<double>::quiet_NaN()})
+      rejects([&] { static_cast<void>(model::withYarn(native, factor)); }, "above 1 and at most 4",
+              "YaRN by " + std::to_string(factor) + " was accepted");
+    model::ModelDescriptor unserved = native;
+    std::visit([](auto &layout) { layout.yarnContextTokens = 0; }, unserved.target);
+    rejects([&] { static_cast<void>(model::withYarn(unserved, 2.0)); }, "is not served with YaRN",
+            "a family without a YaRN window was served with YaRN");
+  }
+
+  constexpr uint32_t kPairs = 32;
+  constexpr float kTheta = 1.0e7F;
+  std::array<float, kPairs> plain{}, scaled{};
+  model::rotaryInverseFrequencies(kTheta, kPairs, {}, plain);
+  for (uint32_t pair = 0; pair < kPairs; ++pair)
+    require(plain[pair] == std::pow(kTheta, -static_cast<float>(pair) / kPairs),
+            "the frequencies without YaRN changed");
+  const model::RopeScaling yarn{4.0, 262144};
+  model::rotaryInverseFrequencies(kTheta, kPairs, yarn, scaled);
+  for (uint32_t pair = 0; pair < kPairs; ++pair) {
+    if (pair <= 14)
+      require(scaled[pair] == plain[pair], "YaRN changed a frequency it keeps");
+    else if (pair >= 22)
+      require(scaled[pair] == plain[pair] / 4.0F, "YaRN did not divide a frequency it interpolates");
+  }
+  // The reference computation's float32 values of the blended pairs.
+  for (const auto [pair, expected] : {std::pair{15U, 4.7423981595784426e-04}, {18U, 7.217386882985011e-05},
+                                      {21U, 8.759770025790203e-06}})
+    require(std::abs(scaled[pair] - expected) <= 1e-6 * expected,
+            "YaRN blended pair " + std::to_string(pair) + " to another frequency");
+  require(yarn.attentionFactor() == 1.13862943649292F && model::RopeScaling{}.attentionFactor() == 1.0F,
+          "YaRN's attention factor is not 0.1 ln(factor) + 1");
+}
+
 int main(int argc, char **argv) {
   try {
     if (argc != 2) throw std::invalid_argument("usage: model-configuration FIXTURES");
@@ -661,8 +719,9 @@ int main(int argc, char **argv) {
     testQuantization(argv[1]);
     testVisionConfig(argv[1]);
     testConfigurationCheck(argv[1]);
+    testYarn(argv[1]);
     std::cout << "model configuration: every family, sources, one rule per value, quantization, vision, the "
-                 "installer's check PASS\n";
+                 "installer's check, YaRN PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

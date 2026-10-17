@@ -32,3 +32,5 @@ relaunch |  | auto auto --relaunch-context 61433
 relaunch_limits | --max-context 100K --max-memory 32G | 102400 34359738368
 ple_memory | --ple-memory 2G | auto auto --ple-memory 2147483648
 expert_memory | --expert-memory 16G | auto auto --expert-memory 17179869184
+yarn | --yarn-factor 4 | auto auto --yarn-factor 4.0
+yarn_context | --yarn-factor 2.5 --max-context 640K | 655360 auto --yarn-factor 2.5

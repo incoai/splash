@@ -200,14 +200,15 @@ template <class Use> constexpr void forEachFamily(Use use) {
 }
 
 // Each family's native window, which its config's max_position_embeddings
-// states, fits the runtime's KV ceiling.
+// states, and the window YaRN stretches it to fit the runtime's KV ceiling.
 static_assert([] {
   bool fits = true;
   forEachFamily([&](const auto &layout) {
-    fits = fits && layout.maximumContextTokens <= kv::kMaximumLogicalTokens;
+    fits = fits && layout.nativeContextTokens <= kv::kMaximumLogicalTokens &&
+           layout.yarnContextTokens <= kv::kMaximumLogicalTokens;
   });
   return fits;
-}(), "a family's native window exceeds the runtime's KV ceiling");
+}(), "a family's window exceeds the runtime's KV ceiling");
 
 // The name errors give an upstream target's source: its format, safetensors
 // for MLX, Model Optimizer and compressed-tensors checkpoints alike.
@@ -239,7 +240,7 @@ void validateTextConfig(NSDictionary *text, const QwenTargetDimensions &target, 
            {"hidden_size", target.hiddenSize},
            {"num_hidden_layers", target.layers},
            {"vocab_size", target.vocabularySize},
-           {"max_position_embeddings", target.maximumContextTokens},
+           {"max_position_embeddings", target.nativeContextTokens},
            {"num_attention_heads", target.attentionQueryHeads},
            {"num_key_value_heads", target.attentionKvHeads},
            {"head_dim", target.attentionHeadDimension}}) {
@@ -711,7 +712,7 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
   std::visit(
       [&](const auto &layout) {
         result.capabilities = {layout.vocabularySize,
-                               layout.maximumContextTokens};
+                               layout.nativeContextTokens};
         result.targetKvLayout = layout.kvLayout();
         result.stateLayout = {layout.gdnStateLayout(), draft.stateLayout()};
       },
@@ -731,8 +732,10 @@ bool ModelDescriptor::valid() const noexcept {
   return std::visit(
       [&](const auto &layout) {
         return layout.vocabularySize == capabilities.vocabularySize &&
-               layout.maximumContextTokens ==
+               layout.servedContextTokens(ropeScaling) ==
                    capabilities.maximumContextTokens &&
+               (!ropeScaling.yarn() ||
+                ropeScaling.originalContextTokens == layout.nativeContextTokens) &&
                layout.hiddenSize == draft.hiddenSize &&
                draft.targetLayerCount && draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
                draft.targetLayers[draft.targetLayerCount - 1] < layout.layers &&
@@ -740,6 +743,23 @@ bool ModelDescriptor::valid() const noexcept {
                layout.gdnStateLayout() == stateLayout.target;
       },
       target);
+}
+
+ModelDescriptor withYarn(ModelDescriptor model, double factor) {
+  static_assert(RopeScaling::kMaximumFactor == 4.0, "the message names the maximum factor");
+  if (!(factor > 1.0 && factor <= RopeScaling::kMaximumFactor))
+    throw std::invalid_argument("the YaRN factor must be above 1 and at most 4");
+  if (model.ropeScaling.yarn())
+    throw std::invalid_argument("the target's RoPE is already scaled");
+  std::visit(
+      [&](const auto &layout) {
+        if (!layout.yarnContextTokens)
+          throw std::invalid_argument(std::string(layout.family) + " is not served with YaRN");
+        model.ropeScaling = {.factor = factor, .originalContextTokens = layout.nativeContextTokens};
+        model.capabilities.maximumContextTokens = layout.servedContextTokens(model.ropeScaling);
+      },
+      model.target);
+  return model;
 }
 
 ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {

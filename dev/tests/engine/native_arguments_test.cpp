@@ -162,10 +162,18 @@ void testServerCommandLines(const char *path) {
        }},
       {"ple_memory", [](NativeArguments &read) { read.streamedTableBytes = 2 * kGiB; }},
       {"expert_memory", [](NativeArguments &read) { read.expertMemoryBytes = 16 * kGiB; }},
+      {"yarn", [](NativeArguments &read) { read.model.ropeScaling = {4.0, 262144}; }},
+      {"yarn_context",
+       [](NativeArguments &read) {
+         read.maxContext = 655360;
+         read.model.ropeScaling = {2.5, 262144};
+       }},
   };
-  // Every field but the model inspected from the directory.
+  // Every field but the model inspected from the directory, whose RoPE
+  // scaling --yarn-factor sets.
   const auto same = [](const NativeArguments &read, const NativeArguments &meant) {
     return read.modelRoot == meant.modelRoot && read.maxContext == meant.maxContext &&
+           read.model.ropeScaling == meant.model.ropeScaling &&
            read.relaunchContext == meant.relaunchContext &&
            read.maxMemoryBytes == meant.maxMemoryBytes &&
            read.maxCacheDisk.automatic == meant.maxCacheDisk.automatic &&
@@ -280,6 +288,29 @@ void testRefusals() {
   require(parse(model, {"auto", "auto", "--relaunch-context", maximum}).relaunchContext ==
               std::stoul(maximum),
           "the model's whole context was refused a relaunch");
+  // --yarn-factor stretches the window MAX_CONTEXT and a relaunch's context
+  // may ask for, by more than 1 and at most 4.
+  for (const char *factor : {"1", "0.5", "4.5", "-2"})
+    refuses({"auto", "auto", "--yarn-factor", factor},
+            "--yarn-factor: the YaRN factor must be above 1 and at most 4");
+  for (const char *factor : {"four", "", "inf", "nan"})
+    refuses({"auto", "auto", "--yarn-factor", factor}, "--yarn-factor requires a number");
+  const std::string stretched = std::to_string(2 * std::stoull(maximum));
+  refuses({stretched, "auto"}, "MAX_CONTEXT must be auto or an integer in [1, " + maximum + "]");
+  const NativeArguments yarn = parse(model, {stretched, "auto", "--yarn-factor", "2"});
+  require(yarn.maxContext == 2 * std::stoul(maximum) &&
+              yarn.model.capabilities.maximumContextTokens == 2 * std::stoul(maximum) &&
+              yarn.model.ropeScaling == model::RopeScaling{2.0, static_cast<uint32_t>(std::stoul(maximum))},
+          "--yarn-factor 2 did not double the window");
+  refuses({std::to_string(2 * std::stoull(maximum) + 1), "auto", "--yarn-factor", "2"},
+          "MAX_CONTEXT must be auto or an integer in [1, " + stretched + "]");
+  require(parse(model, {"auto", "auto", "--yarn-factor", "2", "--relaunch-context", stretched})
+                  .relaunchContext == 2 * std::stoul(maximum),
+          "a relaunch was refused the stretched window");
+  // By 4 the window stops at the 1,010,000 tokens Qwen validates.
+  require(parse(model, {"1010000", "auto", "--yarn-factor", "4"}).maxContext == 1010000,
+          "--yarn-factor 4 did not serve 1,010,000 tokens");
+  refuses({"1010001", "auto", "--yarn-factor", "4"}, "MAX_CONTEXT must be auto or an integer in [1, 1010000]");
 
   const auto commandRefused = [](const std::vector<std::string> &command,
                                  std::string_view expected) {

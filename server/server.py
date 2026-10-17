@@ -1687,6 +1687,8 @@ def _native_command(args, relaunch_context=None):
         )
     if args.allow_idle_sleep:
         command.extend(("--idle-sleep", "allow"))
+    if args.yarn_factor is not None:
+        command.extend(("--yarn-factor", str(args.yarn_factor)))
     if relaunch_context is not None and args.max_context is None:
         command.extend(("--relaunch-context", str(relaunch_context)))
     if args.ple_memory is not None:
@@ -1775,7 +1777,9 @@ def main():
         readiness = runtime.readiness
         if (
             readiness is None
-            or not 1 <= readiness.max_context_tokens <= serve_options.MAX_CONTEXT_TOKENS
+            or not 1
+            <= readiness.max_context_tokens
+            <= serve_options.context_window(args.yarn_factor)
             or (
                 args.max_context is not None
                 and readiness.max_context_tokens != args.max_context

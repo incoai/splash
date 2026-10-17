@@ -24,7 +24,7 @@ done
 for value in 0 -1 4294967296 1x ''; do
     reject '--repeat requires integers' --repeat "$value"
 done
-for value in -1 262144 4294967296 10x '' '0,'; do
+for value in -1 1048576 4294967296 10x '' '0,'; do
     reject '--histories requires integers' --histories "$value"
 done
 for value in typo '' '27b,' '27b,typo' ',35b'; do

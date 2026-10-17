@@ -1,6 +1,7 @@
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "ops/PagedAttention.hpp"
+#include "model/RopeScaling.hpp"
 #include "ops/RoPE.hpp"
 
 #include "HostKvExtents.hpp"
@@ -1137,7 +1138,7 @@ void blockListsMatchMasks(metal::MetalBackend &backend) {
 // target rows' three positions and the draft rows' one, each kind's inverse
 // frequencies, and its rows of cosines and sines.
 void ropeExtents(metal::MetalBackend &backend) {
-  constexpr RopeTableParams rows{37, 24};
+  constexpr RopeTableParams rows{37, 24, 1.0F};
   test::requireExtents(backend,
                        std::initializer_list<test::BufferExtent>{
                            {0, rows.target_rows * 3 * 4, 4, "target RoPE position"},
@@ -1183,7 +1184,7 @@ void ropeRangeMatchesPositions(metal::MetalBackend &backend) {
     metal::CommandGraph graph;
     ops::RoPE::addTables(graph, targetPositions, draftPositions,
                          buffer(SPLASH_TARGET_ROPE_PAIRS * 4), inverse, targetTable,
-                         buffer(SPLASH_TARGET_ROPE_PAIRS * 4), cosine, sine, {1, rows}, kMaximumRows);
+                         buffer(SPLASH_TARGET_ROPE_PAIRS * 4), cosine, sine, {1, rows, 1.0F}, kMaximumRows);
     ops::RoPE::addDraftRangeTables(graph, inverse, rangeCosine, rangeSine, rows, start, kMaximumRows);
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     require(std::memcmp(cosine.contents(), rangeCosine.contents(), tableBytes) == 0 &&
@@ -1198,6 +1199,61 @@ void ropeRangeMatchesPositions(metal::MetalBackend &backend) {
           },
           "invalid RoPE table row count", "a draft RoPE range past its rows was accepted");
   require(invalid.empty(), "an invalid draft RoPE range encoded a dispatch");
+}
+
+// The target's tables hold the cosine and sine of each row's position on the
+// axis its pair takes (interleaved M-RoPE: pair i reads axis i % 3) times the
+// pair's inverse frequency, scaled by the factor given: YaRN's attention
+// factor, or 1, which leaves them as they were. Positions run up to the KV
+// ceiling, where the angles are largest, with and without YaRN's frequencies.
+void ropeTargetScaling(metal::MetalBackend &backend) {
+  const auto buffer = [&](uint64_t bytes) { return test::sharedBuffer(backend, bytes); };
+  constexpr uint32_t kPairs = SPLASH_TARGET_ROPE_PAIRS, kMaximumRows = 2048;
+  constexpr uint32_t kLast = kv::kMaximumLogicalTokens - 1;
+  const std::vector<std::array<uint32_t, 3>> positions{
+      {0, 0, 0}, {1, 1, 1}, {4097, 4097, 4097}, {262143, 262143, 262143}, {262144, 262144, 262144},
+      {700001, 699990, 699995}, {kLast - 7, kLast - 7, kLast - 7}, {kLast, kLast, kLast}};
+  const auto rows = static_cast<uint32_t>(positions.size());
+  const metal::MetalBuffer targetPositions = buffer(rows * 3 * 4);
+  std::memcpy(targetPositions.contents(), positions.data(), rows * 3 * 4);
+  const metal::MetalBuffer inverse = buffer(kPairs * 4), draft = buffer(SPLASH_DRAFT_ROPE_PAIRS * 4);
+  const uint64_t tableBytes = uint64_t{rows} * kPairs * 4;
+  double largestError = 0.0;
+  for (const model::RopeScaling scaling : {model::RopeScaling{}, model::RopeScaling{4.0, 262144}}) {
+    auto *frequencies = static_cast<float *>(inverse.contents());
+    model::rotaryInverseFrequencies(1.0e7F, kPairs, scaling, {frequencies, kPairs});
+    const float factor = scaling.attentionFactor();
+    std::array<metal::MetalBuffer, 4> tables{buffer(tableBytes), buffer(tableBytes), buffer(tableBytes),
+                                             buffer(tableBytes)};
+    metal::CommandGraph graph;
+    ops::RoPE::addTables(graph, targetPositions, draft, inverse, draft, tables[0], tables[1], draft, draft,
+                         {rows, 0, 1.0F}, kMaximumRows);
+    ops::RoPE::addTables(graph, targetPositions, draft, inverse, draft, tables[2], tables[3], draft, draft,
+                         {rows, 0, factor}, kMaximumRows);
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    const auto value = [&](uint32_t table, uint32_t element) {
+      return static_cast<const float *>(tables[table].contents())[element];
+    };
+    for (uint32_t row = 0; row < rows; ++row) {
+      for (uint32_t pair = 0; pair < kPairs; ++pair) {
+        const uint32_t element = row * kPairs + pair;
+        const float angle = static_cast<float>(positions[row][pair % 3]) * frequencies[pair];
+        largestError = std::max({largestError, std::abs(value(0, element) - std::cos(double{angle})),
+                                 std::abs(value(1, element) - std::sin(double{angle}))});
+        require(value(2, element) == value(0, element) * factor && value(3, element) == value(1, element) * factor,
+                "the target RoPE tables are not the unscaled ones times the scale");
+      }
+    }
+  }
+  std::cout << "target RoPE tables to position " << kLast << ": largest error " << largestError << '\n';
+  require(largestError < 1e-6, "the target RoPE tables lost precision at large positions");
+  metal::CommandGraph invalid;
+  rejects([&] {
+            ops::RoPE::addTables(invalid, targetPositions, draft, inverse, draft, inverse, inverse, draft, draft,
+                                 {rows, 0, 0.0F}, kMaximumRows);
+          },
+          "invalid target RoPE scale", "a target RoPE scale of zero was accepted");
+  require(invalid.empty(), "an invalid RoPE table encoded a dispatch");
 }
 
 } // namespace
@@ -1216,6 +1272,7 @@ int main(int argc, char **argv) {
     checkBf16StoreEdges(backend);
     ropeExtents(backend);
     ropeRangeMatchesPositions(backend);
+    ropeTargetScaling(backend);
     for (const Geometry geometry : kGeometries)
       bufferExtents(backend, geometry.queryHeads, geometry.layout(kv::Format::Int8));
     attentionBlocks(backend);

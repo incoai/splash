@@ -23,7 +23,8 @@ struct Qwen3_6MoeLayout final : QwenHybridLayout {
   static constexpr bool loadsSafetensors = true;
 
   constexpr Qwen3_6MoeLayout()
-      : QwenHybridLayout{{.maximumContextTokens = 262'144,
+      : QwenHybridLayout{{.nativeContextTokens = 262'144,
+                          .yarnContextTokens = 1'010'000,
                           .layers = 40,
                           .hiddenSize = 2048,
                           .vocabularySize = 248320,

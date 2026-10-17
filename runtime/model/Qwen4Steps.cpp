@@ -41,7 +41,7 @@ constexpr uint64_t kLaneBlockBytes =
 
 // The words of a row's QSA bitmap: a bit per block of the context, the
 // partial block at its end and the current one included.
-uint32_t maskWords(const QwenTargetGeometry &g) { return (g.maximumContextTokens / BLOCK_INDEXER_BLOCK + 2 + 31) / 32; }
+uint32_t maskWords(const QwenTargetGeometry &g) { return (g.contextTokens() / BLOCK_INDEXER_BLOCK + 2 + 31) / 32; }
 // A row's scores: one per block its bitmap covers.
 uint32_t scoreStride(const QwenTargetGeometry &g) { return maskWords(g) * 32; }
 
