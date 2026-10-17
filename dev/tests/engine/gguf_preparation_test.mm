@@ -65,7 +65,7 @@ std::vector<uint8_t> slice(const std::vector<uint8_t> &bytes, uint64_t offset, u
 // and the embedding's.
 void loadImages(MetalBackend &backend, model::WeightImages &images, const std::filesystem::path &path,
                 const model::QwenTargetDimensions &geometry) {
-  model::GgufTargetLoader loader(backend, images, path, geometry);
+  model::GgufTargetLoader loader(backend, images, {path}, geometry);
   for (uint32_t layer = 0; layer < geometry.layers; ++layer) static_cast<void>(loader.layer(layer));
   static_cast<void>(loader.head());
   static_cast<void>(loader.embedding());
@@ -398,7 +398,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
                                    {"token_embd.weight", kIQ4_XS}}),
             layout);
   model::WeightImages images(backend, "fixture");
-  model::GgufTargetLoader files(backend, images, model::findTargetGguf(target), layout);
+  model::GgufTargetLoader files(backend, images, model::findTargetGgufs(target), layout);
   const model::Qwen3_8Weights weights = model::loadQwen3_8Weights(backend, layout, files);
   check(weights.layers.size() == layout.layers, "GGUF target: every layer");
   check(weights.finalNorm.float32, "GGUF target: F32 final norm");
@@ -516,6 +516,13 @@ void checkExecutor(MetalBackend &backend, const std::filesystem::path &directory
   const Shape shapes[] = {{512, 1024, {}}, {768, 1280, {256, 16, 8, 4}}, {768, 8448, {128, 16, 8, 5}}};
   for (int s = 0; s < 3; ++s)
     for (int f = 0; f < FMT_COUNT; ++f) checkRepack(backend, directory, Fmt(f), shapes[s], 100 + 8 * s + f);
+  // Widths of 64-column spans not a whole superblock, in every format whose
+  // width is a multiple of 64; an odd number of 64-row tiles by an odd number
+  // of spans leaves half a threadgroup of (row, group) items in the last one.
+  for (int f = 0; f < FMT_COUNT; ++f)
+    if (model::ggufColumnUnit(kQuantFormats[f]) == 64)
+      for (const Shape &shape : {Shape{192, 320, {}}, Shape{64, 64, {}}, Shape{192, 640, {}}})
+        checkRepack(backend, directory, Fmt(f), shape, 300 + f + shape.K);
   // Several bounded row batches, and rows wider than one staging step.
   for (Fmt format : {Q3K, Q80}) {
     checkRepack(backend, directory, format, {8704, 2048, {}}, 741);

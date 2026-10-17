@@ -419,6 +419,7 @@ TENSOR_TYPES = {
     30: "BF16",
     39: "MXFP4",
     40: "NVFP4",
+    42: "Q2_0",
     142: "PQ2_0",
 }
 QUANTIZED_TYPES = {
@@ -443,6 +444,7 @@ QUANTIZED_TYPES = {
     "IQ4_XS",
     "MXFP4",
     "NVFP4",
+    "Q2_0",
     "PQ2_0",
 }
 FORMAT_TYPES = QUANTIZED_TYPES | {"BF16", "F16"}
@@ -529,6 +531,32 @@ def loaded_tensors(metadata):
         for name, types in (LAYER_TENSORS | mixer | ffn).items():
             tensors[f"blk.{layer}.{name}"] = types
     return tensors
+
+
+def merged_split(headers):
+    """One target's metadata from the headers of its split files (llama.cpp's
+    gguf-split), in split order: the first file's keys, whose split.* keys
+    must describe these files, and every file's tensor types."""
+    first = headers[0]
+    count = first.values.get("split.count", 1)
+    if type(count) is not int or count != len(headers):
+        raise ModelError("the GGUF's split files do not match its split.count")
+    tensors = {}
+    for number, header in enumerate(headers):
+        if len(headers) > 1 and (
+            header.values.get("split.no") != number
+            or header.values.get("split.count") != count
+        ):
+            raise ModelError(f"GGUF split file {number + 1} is out of order")
+        for name, kind in header.tensors.items():
+            if name in tensors:
+                raise ModelError("duplicate GGUF tensor across split files: " + name)
+            tensors[name] = kind
+    total = first.values.get("split.tensors.count", len(tensors))
+    if total != len(tensors):
+        raise ModelError("the GGUF's split files hold another number of tensors")
+    first.tensors = tensors
+    return first
 
 
 # Prism ML's input rotation of a dense target: the parameters and keys

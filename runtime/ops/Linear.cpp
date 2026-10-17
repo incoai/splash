@@ -14,8 +14,8 @@
 namespace splash::ops {
 namespace {
 
-// Matrices of whole 64-row tiles (GGUF_TILE_COLUMNS) of whole 64-input spans;
-// a decode step's inputs are whole 256-input units.
+// Matrices of whole 64-row tiles (GGUF_TILE_COLUMNS) of whole 64-input spans,
+// whose K is a multiple of a 64-input span (or of its format's superblock).
 void validate(LinearWorkload w) {
   if (!w.matrix.outputSize || w.matrix.outputSize % 64 || !w.matrix.inputSize || w.matrix.inputSize % 64)
     throw std::invalid_argument("invalid linear matrix");
@@ -24,7 +24,7 @@ void validate(LinearWorkload w) {
         w.epilogue == LinearEpilogue::GateUp)
       throw std::invalid_argument("invalid linear prefill workload");
   } else {
-    if (w.matrix.inputSize % 256 || !w.rows || w.rows % SPLASH_TARGET_VERIFY_ROWS ||
+    if (!w.rows || w.rows % SPLASH_TARGET_VERIFY_ROWS ||
         w.rows > SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH ||
         w.epilogue == LinearEpilogue::UpWithGate)
       throw std::invalid_argument("invalid linear decode workload");

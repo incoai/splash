@@ -17,8 +17,8 @@ struct ProjectionShape final {
   // Its quantized segments multiply the rotated input (InputRotation), which
   // takes LinearScratch::rotated.
   bool rotated = false;
-  // Its quantized segments are all in formats the Apple9 register tile takes
-  // (quant_register_format); a projection with one in another format stages
+  // The Apple9 register tile takes all its quantized segments
+  // (quant_register_tensor); a projection with one it does not take stages
   // whatever its rows (Linear::decodeStorageRows).
   bool registerFormats = true;
   auto operator<=>(const ProjectionShape &) const = default;
@@ -103,7 +103,7 @@ public:
   [[nodiscard]] ProjectionShape shape() const noexcept {
     bool registerFormats = true;
     for (const QuantizedSegment &s : weights_.segments)
-      registerFormats &= s.isFloat() || quant_register_format(s.formatId);
+      registerFormats &= s.isFloat() || quant_register_tensor(s.formatId, s.inputSize);
     return {outputSize, inputSize, static_cast<bool>(rotation), registerFormats};
   }
 

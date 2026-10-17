@@ -1370,7 +1370,7 @@ and lists every unsupported tensor in one error:
 
 - linears and experts: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1,
   Q5_0, Q5_1, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,
-  IQ4_NL, MXFP4, NVFP4, PQ2_0, BF16 or F16;
+  IQ4_NL, MXFP4, NVFP4, PQ2_0, Q2_0, BF16 or F16;
 - token embeddings: any of the linears' formats;
 - norms, the MoE router and shared-expert scalar gate, and the GDN
   convolution, decay and time-step bias: F32;
@@ -1382,6 +1382,15 @@ and lists every unsupported tensor in one error:
   pair stays such a float segment: it reads the input unrotated, as Prism's
   BF16 alpha and beta need, and leaves the GDN input projection on Apple9's
   register tile, which takes no F16.
+
+A variant no root file names may be a folder of a split GGUF's parts, as
+Unsloth publishes files too large for one
+(`VARIANT/MODEL-VARIANT-00001-of-0000N.gguf`, `upstream.split_gguf`): every
+part from 1 to N must be present. The parts install side by side in
+`target/`, and the native loader reads them as one GGUF (`findTargetGgufs`,
+`OpenGguf`): the first part's metadata, whose `split.count` and
+`split.tensors.count` must describe the parts, and every part's tensors. The
+installer screens the merged header (`gguf.merged_split`).
 
 BF16 and F16 are formats of the image like the quantized ones, for the tensors
 a quantized file keeps unquantized: UD-Q8_K_XL keeps the 27B's attention
@@ -1422,6 +1431,10 @@ Model Optimizer's NVFP4 does
 ([Model Optimizer targets](#model-optimizer-targets)): four blocks make one
 256-element NVFP4 block, whose meta unit holds the `.scale` value as its `g`
 (1 without one), at 4.625 bits per weight for the file's 4.5.
+
+Q2_0 is llama.cpp's type 42, `block_q2_0`, as in ISTA-DASLab's GSQ-RCO files:
+2-bit codes q worth d (q - 1) with one half d per 64 weights. Its planes are
+PQ2_0's ([PQ2_0](#pq2_0)), with a meta unit per 64 weights.
 
 ### PQ2_0
 
@@ -1831,12 +1844,14 @@ rounding of its fp32-accumulated sum. They read their activations as the Table16
 grid lookups, IQ3_XXS, the IQ2 formats and IQ1 (`apple9StagesFormat`), and Q2_K from two lanes
 decode faster on the staged tile there, which a projection all of whose segments are in them
 takes wherever the tile holds its lanes' rows unpadded. F16, whose 11-bit significands bf16 does
-not hold, has no register kernels (`quant_register_format`): a projection with an F16 segment, or
-a gate/up pair with one, stages at every lane count, and its decode storage holds the staged
-tile's rows. On Apple10 (M5) the staged tile
-(`LinearTile::GgufStaged`) runs the kernels of `runtime/metal/kernels/shared/gguf_linear.metal`,
-which dequantize each weight once to half in threadgroup memory (`kernels/common/gguf_staged.h`)
-for MPP `matmul2d`, the neural accelerator's path, on bf16 activations. A step's weights, and
+not hold, has no register kernels (`quant_register_format`), and they read a tensor in rows of
+whole coefficient units (`quant_register_tensor`: 256 inputs for a format of several groups per
+meta unit, else 64): a projection with a segment they do not take, or a gate/up pair with one,
+stages at every lane count, and its decode storage holds the staged tile's rows. On Apple10
+(M5) the staged tile (`LinearTile::GgufStaged`) runs the kernels of
+`runtime/metal/kernels/shared/gguf_linear.metal`, which dequantize each weight once to half in
+threadgroup memory (`kernels/common/gguf_staged.h`) for MPP `matmul2d`, the neural accelerator's
+path, on bf16 activations. A step's weights, and
 its meta unit when it enters a new one, load while the previous step's matmul runs
 (`gguf_staged_steps`): their DRAM round trips overlap a matmul. On Apple10 from 16 cores each
 column tile of a decode projection starts its walk over its K partition at its own step

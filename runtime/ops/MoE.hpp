@@ -22,8 +22,8 @@ struct MoeShape final {
   // The format of most routed expert weights, which picks the expert tile on
   // Apple9 (moeGgufTile).
   uint32_t expertFormat = GGUF_FMT_COUNT;
-  // Whether every routed and shared expert weight is in a format the
-  // register tile takes (quant_register_format).
+  // Whether the register tile takes every routed and shared expert weight
+  // (quant_register_tensor).
   bool registerFormats = true;
 
   [[nodiscard]] constexpr bool valid() const noexcept {

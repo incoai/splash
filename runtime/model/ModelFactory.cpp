@@ -79,7 +79,7 @@ LoadedModel loadModel(metal::MetalBackend &backend,
           return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {
-          GgufTargetLoader loader(backend, images, findTargetGguf(directory), layout);
+          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout);
           return readTarget(backend, layout, std::ref(loader));
         }
         }
@@ -103,10 +103,9 @@ LoadedModel loadModel(metal::MetalBackend &backend,
 uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
   uint64_t bytes = 0;
   if (descriptor.targetSource == TargetSource::Gguf) {
-    WeightSource source(findTargetGguf(root / "target"));
-    const GgufFile file(source);
+    const OpenGguf target(findTargetGgufs(root / "target"));
     bytes = std::visit(
-        [&](const auto &layout) { return imageBytes(gguf::planImages(file, layout)); },
+        [&](const auto &layout) { return imageBytes(gguf::planImages(target.file(), layout)); },
         descriptor.target);
   } else {
     bytes = std::visit([&](const auto &layout) { return safetensorsTargetImageBytes(root / "target", layout); },

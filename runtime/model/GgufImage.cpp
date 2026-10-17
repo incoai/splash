@@ -51,7 +51,8 @@ bool alphaBetaType(uint32_t type) { return quantizedType(type) || type == ggml::
 // A repack of a [rows, columns] tensor in format, of no image section yet;
 // throws unless the shape is whole plane tiles.
 Repack tiledRepack(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name) {
-  if (rows % QUANT_TILE_ROWS || columns % kGgufBlockColumns) throw GgufError("tensor is not tile aligned: " + name);
+  if (rows % QUANT_TILE_ROWS || columns % ggufColumnUnit(kQuantFormats[format]))
+    throw GgufError("tensor is not tile aligned: " + name);
   Repack result;
   result.format = format;
   result.rows = rows;
@@ -231,7 +232,7 @@ private:
         throw GgufError(scale->name + " scales a " + ggmlTypeName(tensor.type) +
                         " tensor; Splash reads a .scale tensor beside an NVFP4 weight only");
       if (!count || count * rowBytes != tensor.bytes) throw GgufError("unexpected size for " + tensor.name);
-      return {tensor.name, tensor.type, tensor.offset, count, rowBytes, order, &file_.source()};
+      return {tensor.name, tensor.type, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
     }
     const QuantFormat &format = kQuantFormats[GGUF_FMT_NVFP4];
     const GgmlTypeTraits &blocks = *ggmlTypeTraits(ggml::kNVFP4);
@@ -240,14 +241,14 @@ private:
     if (!count || rowBytes % format.block_bytes || count * sourceRowBytes != tensor.bytes)
       throw GgufError(tensor.name + "'s rows are not whole nvfp4 blocks of " + std::to_string(format.block_elements) +
                       " elements");
-    TensorRows rows{tensor.name, QUANT_NVFP4_TYPE, tensor.offset, count, rowBytes, order, &file_.source()};
+    TensorRows rows{tensor.name, QUANT_NVFP4_TYPE, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
     rows.ggufNvfp4RowBytes = sourceRowBytes;
     if (scale) {
       const uint64_t values = stem.ends_with("_exps") ? geometry_.experts : 1;
       if (scale->type != ggml::kF32 || scale->elements() != values || count % values)
         throw GgufError(scale->name + " must hold " + (values == 1 ? "one F32 value" : "one F32 value per expert") +
                         " for " + tensor.name);
-      rows.scale = {&file_.source(), scale->offset, scale->bytes, count / values};
+      rows.scale = {&file_.source(scale->file), scale->offset, scale->bytes, count / values};
     }
     return rows;
   }
