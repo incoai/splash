@@ -22,8 +22,8 @@ struct MoeShape final {
   // The format of most routed expert weights, which picks the expert tile on
   // Apple9 (moeGgufTile).
   uint32_t expertFormat = GGUF_FMT_COUNT;
-  // Whether every routed and shared expert weight is in a format the
-  // register tile takes (quant_register_format).
+  // Whether the register tile takes every routed and shared expert weight
+  // (quant_register_tensor).
   bool registerFormats = true;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
@@ -39,9 +39,9 @@ struct MoeShape final {
 };
 
 // A GGUF expert projection: every routed expert in one segment of experts *
-// N rows, expert e's planes from tile e * N / 256 on (moe_gguf_segment in
-// kernels/common/moe_expert_slab.h), and the shared expert's segment, whose
-// format may differ.
+// N rows, expert e's planes from tile e * N / QUANT_TILE_ROWS on
+// (moe_gguf_segment in kernels/common/moe_expert_slab.h), and the shared
+// expert's segment, whose format may differ.
 struct BlockExpertProjection final {
   QuantizedSegment routed;
   QuantizedSegment shared;

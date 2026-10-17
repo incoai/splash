@@ -82,14 +82,14 @@ uint32_t routedExpertFormat(std::span<const Qwen3_6MoeLayerWeights> layers) {
   const auto most = std::max_element(weights.begin(), weights.end());
   return *most ? uint32_t(most - weights.begin()) : GGUF_FMT_COUNT;
 }
-// Whether every routed and shared expert weight of a target's MoE blocks is in
-// a format the register tile takes (ops::MoeShape::registerFormats).
+// Whether the register tile takes every routed and shared expert weight of a
+// target's MoE blocks (ops::MoeShape::registerFormats).
 bool expertRegisterFormats(std::span<const Qwen3_8LayerWeights>) { return true; }
 bool expertRegisterFormats(std::span<const Qwen3_6MoeLayerWeights> layers) {
   for (const Qwen3_6MoeLayerWeights &layer : layers)
     for (const ops::BlockExpertProjection *projection : {&layer.ffn.gate, &layer.ffn.up, &layer.ffn.down})
       for (const ops::QuantizedSegment *s : {&projection->routed, &projection->shared})
-        if (!s->isFloat() && !quant_register_format(s->formatId)) return false;
+        if (!s->isFloat() && !quant_register_tensor(s->formatId, s->inputSize)) return false;
   return true;
 }
 

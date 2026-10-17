@@ -5,7 +5,8 @@
 //   accelerator on three exact bf16 parts per weight): every row count a
 //   decode or prefill dispatch takes (with ragged tile tails), the router and
 //   alpha/beta widths, bf16 and fp32 destinations at a column offset of a
-//   wider row; neighbours stay untouched.
+//   wider row; neighbours stay untouched. BF16 weights (a router a GGUF
+//   stores so) give the outputs of the F32 tensor of their values bit for bit.
 // - Float segments of a fused GGUF projection (Linear), the 35B's and the
 //   27B's F32 alpha/beta widths, on either float tile: the quantized
 //   segments' outputs unchanged, the padding past the segments unwritten.
@@ -255,6 +256,55 @@ int floatProjection(MetalBackend &backend) {
         printf("float %-11s K=%u N=%3u: rows %u-2048, bf16/f32 at a column offset: |error| / sum|x w| mean %.2e "
                "worst %.2e %s\n", accelerator ? "accelerator" : "simdgroup", K, N, accelerator ? 16u : 1u,
                sum / outputs, worst, tileFailures ? "FAIL" : "ok");
+        failures += tileFailures;
+      }
+    }
+  return failures;
+}
+
+// BF16 weights, as some GGUFs store the MoE router: on both tiles, at every
+// row count and destination floatProjection takes, the outputs of the F32
+// tensor of their values bit for bit, the bytes outside the tile untouched.
+int bfloat16Weights(MetalBackend &backend) {
+  int failures = 0;
+  for (const uint32_t K : {512u, 2048u})
+    for (const uint32_t N : {16u, 256u}) {
+      std::normal_distribution<float> normal(0.0f, 0.05f);
+      std::vector<float> values(uint64_t{N} * K);
+      for (float &v : values) v = bf16(normal(rng));
+      const std::vector<__bf16> bits(values.begin(), values.end());
+      const QuantizedSegment f32 = floatSegment(backend, values, N, K);
+      const QuantizedSegment b16 = QuantizedSegment::floats(
+          N, K, upload(backend, bits.data(), bits.size() * 2, "gguf-bf16"), QuantizedSegment::kBFloat16);
+      for (const FloatTile tile : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
+        const bool accelerator = tile == FloatTile::NeuralAccelerator;
+        int tileFailures = 0;
+        for (const uint32_t rows : {1u, 7u, 16u, 33u, 263u, 2048u}) {
+          if (rows == 2048 && (K != 2048 || N != 256)) continue;
+          if (accelerator && rows < 16) continue;
+          const MetalBuffer input = bfloatBuffer(backend, activations(uint64_t{rows} * K), "float-input");
+          for (const FloatOutput type : {FloatOutput::BFloat16, FloatOutput::Float32}) {
+            const uint32_t stride = N + 96, offset = 32;
+            const uint64_t bytes = uint64_t{rows + 1} * stride * (type == FloatOutput::Float32 ? 4 : 2);
+            const auto run = [&](const QuantizedSegment &weights) {
+              MetalBuffer output = backend.allocateBuffer(bytes, BufferStorage::Shared, "float-output");
+              std::memset(output.contents(), 0x7F, bytes);
+              CommandGraph graph;
+              splash::ops::addGgufFloat(graph, input, weights, output, rows, stride, offset, type, tile);
+              static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+              return output;
+            };
+            const MetalBuffer want = run(f32), got = run(b16);
+            if (std::memcmp(want.contents(), got.contents(), bytes)) {
+              printf("  float %s K=%u N=%u rows=%u %s: BF16 weights' outputs differ from the F32 tensor's FAIL\n",
+                     accelerator ? "accelerator" : "simdgroup", K, N, rows,
+                     type == FloatOutput::Float32 ? "f32" : "bf16");
+              ++tileFailures;
+            }
+          }
+        }
+        printf("float %-11s K=%u N=%3u: BF16 weights give the F32 tensor's outputs bit for bit, bf16/f32 %s\n",
+               accelerator ? "accelerator" : "simdgroup", K, N, tileFailures ? "FAIL" : "ok");
         failures += tileFailures;
       }
     }
@@ -951,8 +1001,9 @@ int main(int argc, const char *argv[]) {
     try {
       MetalBackend backend(argv[1]);
       bufferExtents(backend);
-      const int failures = floatProjection(backend) + floatSegments(backend, 64) + floatSegments(backend, 96) +
-                           floatOnlyChain(backend) + moe(backend) + routingLoads(backend);
+      const int failures = floatProjection(backend) + bfloat16Weights(backend) + floatSegments(backend, 64) +
+                           floatSegments(backend, 96) + floatOnlyChain(backend) + moe(backend) +
+                           routingLoads(backend);
       if (failures) {
         std::cerr << "gguf_moe_test: " << failures << " failures\n";
         return 1;
