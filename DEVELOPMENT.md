@@ -2029,6 +2029,33 @@ prefill tile at each chunk of `R` rows (more than 32);
 `make benchmark-gguf-moe` times one MoE layer at the 35B shape on the device's plans and the
 other GGUF tile.
 
+### Sparse attention
+
+A layout that keeps values token-major (`kv::Layout::valuesTokenMajor`)
+attends sparsely, on kernels compiled for 24 query heads over two KV heads
+(Qwen3.8-Flash-Next's): a query row attends only to the blocks of 4 tokens its
+block mask names within its causal history, the mask a bitmap per row over the
+history's blocks (`metal/abi/PagedAttention.h`). The rows of a tile (a verify
+lane's 8, or 8 of a prefill chunk's) attend through one list, the union of
+their blocks in block order, each entry a block and the rows of the tile that
+attend it (`attention_block_lists`, `ops::PagedAttention::addBlockLists`).
+The split kernels (`kernels/shared/sparse_attention.metal`) share a list out
+among their splits in units of 8 blocks, at least 48 a split
+(`SPLASH_SPARSE_SPLIT_BLOCKS`), so that a lane's split count follows its own
+list; each step gathers 8 blocks of keys (4 in BF16), and then their values,
+into threadgroup memory for the MPP QK and PV of the page loop, and the
+softmax masks each row's tokens in blocks the row does not attend and past its
+causal end. A tile without a list attends every block of its history.
+Token-major values make a block's values one contiguous run as its keys are;
+the dense page loop keeps them dimension-major, on which its PV runs faster. A
+layout may also keep an index of its keys in regions of the KV pages after
+every layer's K/V region (`kv::Layout::indexDimension`,
+`PageStorage::indexOffset`): per layer each block's bf16 pooled key, part of
+the page wherever the host copies or clears it (`PageStorage::spans`).
+`make benchmark-attention-sweep ATTENTION_SWEEP_ARGS='--shapes fn --qsa shared'`
+times the sparse kernels over synthetic selections (`--qsa` also takes
+`independent` and `pages`).
+
 ### Neural Engine prefill
 
 Prefill chunks of a dense target split each layer's FFN by intermediate

@@ -220,7 +220,8 @@ std::string runtimeStatusJson(
       << "\"loaded_model_layout_sha256\":"
       << json::quote(cacheIdentity.modelLayoutSha256)
       << ",\"build_id\":" << json::quote(cacheIdentity.buildId)
-      << ",\"dtype\":" << json::quote(kv::storageFormatName(kvFormat))
+      << ",\"dtype\":"
+      << json::quote(kv::storageFormatName(kvFormat, cacheIdentity.kvLayout.valuesTokenMajor))
       << ",\"block_tokens\":" << kv::kPageTokens
       << "},\"kv\":{\"target_model_sha256\":"
       << json::quote(cacheIdentity.targetModelSha256)
@@ -229,7 +230,8 @@ std::string runtimeStatusJson(
       << json::quote(kvFormat == kv::Format::Int8 ? "symmetric_int8" : "none")
       << ",\"scale_type\":" << json::quote(kvFormat == kv::Format::Int8 ? "float32" : "none")
       << ",\"key_layout\":\"token_major\""
-      << ",\"value_layout\":\"dimension_major\"}},"
+      << ",\"value_layout\":"
+      << json::quote(cacheIdentity.kvLayout.valuesTokenMajor ? "token_major" : "dimension_major") << "}},"
       << "\"memory_plan\":" << plan.toStatusJson()
       << ",\"memory_actual\":{\"allocated_bytes\":" << metalMemory.allocatedBytes
       << ",\"current_bytes\":" << currentBytes

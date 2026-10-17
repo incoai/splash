@@ -268,6 +268,15 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   require(bf16Status.find("\"format\":\"bf16\"") != std::string::npos &&
               bf16Status.find("\"scale_type\":\"none\"") != std::string::npos,
           "BF16 cache identity advertised INT8 storage");
+  auto tokenMajorIdentity = identity;
+  tokenMajorIdentity.kvLayout.valuesTokenMajor = true;
+  const auto tokenMajorStatus = runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
+                        metrics, executorTelemetry, tokenMajorIdentity, governor, true,
+                        {}, {}, {}, {}, {}, {});
+  require(tokenMajorStatus.find("\"dtype\":\"q8s8_f32_scale_per_token_head_k_token_major_v_token_major\"") !=
+                  std::string::npos &&
+              tokenMajorStatus.find("\"value_layout\":\"token_major\"") != std::string::npos,
+          "token-major values were reported dimension-major");
   require(json.find("\"schema_version\":6") != std::string::npos &&
               json.find("\"ready\":true") != std::string::npos,
           "status readiness/schema is wrong");

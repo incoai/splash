@@ -126,6 +126,14 @@ void PageStorage::clearPages(std::span<const uint32_t> pages) {
     }
 }
 
+uint32_t PageStorage::indexOffset(uint32_t layer) const {
+    if (!layout_.indexDimension || layer >= layout_.attentionLayers)
+        throw std::out_of_range("KV layer has no index region");
+    // After every layer's K/V region, a region per layer.
+    const uint64_t first = uint64_t{extentPages_} * layout_.attentionLayers * layout_.bytesPerLayerPage();
+    return static_cast<uint32_t>(first + uint64_t{extentPages_} * layer * layout_.indexBytesPerLayerPage());
+}
+
 SplashKvPage PageStorage::entry(uint32_t page) const {
     const size_t extent = extentIndex(page);
     const uint64_t address = extentAddresses_[extent];
@@ -164,7 +172,7 @@ std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page) const {
     const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
     const uint32_t index = page % extentPages_;
     std::vector<std::span<std::byte>> result;
-    result.reserve(size_t{layout_.attentionLayers} * (scale ? 4 : 2));
+    result.reserve(size_t{layout_.attentionLayers} * ((scale ? 4 : 2) + (layout_.indexDimension ? 1 : 0)));
     for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
         for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES;
              ++tensor) {
@@ -175,6 +183,11 @@ std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page) const {
                                     bytes);
             }
         }
+    }
+    if (layout_.indexDimension) {
+        const uint64_t bytes = layout_.indexBytesPerLayerPage();
+        for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
+            result.emplace_back(extent + indexOffset(layer) + index * bytes, bytes);
     }
     return result;
 }

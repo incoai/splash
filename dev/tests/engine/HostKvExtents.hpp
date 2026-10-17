@@ -125,6 +125,12 @@ public:
     for (size_t index = 0; index < pages.size(); ++index)
       entries[index] = entry(pages[index]);
   }
+  // Where one value of a KV head sits in a page's slab of values, in the
+  // layout's value order (kv::Layout::valuesTokenMajor).
+  [[nodiscard]] uint64_t valueElement(uint32_t head, uint32_t token, uint32_t dimension) const noexcept {
+    return layout_.valuesTokenMajor ? splash_kv_key_element(head, token, dimension)
+                                    : splash_kv_value_element(head, token, dimension);
+  }
   // The host address of one tensor of one page in one layer.
   template <typename T>
   [[nodiscard]] T *slab(uint32_t layer, uint32_t tensor, uint32_t page) const {
