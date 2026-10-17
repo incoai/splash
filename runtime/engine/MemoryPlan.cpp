@@ -87,6 +87,7 @@ std::string modelStatusJson(const ModelMemoryProfile &model) {
       << "\"pipeline_reserve_bytes\":" << model::kPipelineReserveBytes << ','
       << "\"runtime_overhead_reserve_bytes\":"
       << model::kRuntimeOverheadReserveBytes << ','
+      << "\"streamed_table_bytes\":" << model.footprint.streamedTableBytes << ','
       << "\"ane_ffn_bytes\":" << model.footprint.aneFfnBytes << ','
       << "\"state_staging_bytes\":" << model.footprint.stateStagingBytes << "}}";
   return out.str();
@@ -143,7 +144,7 @@ uint64_t ModelMemoryProfile::fixedRuntimeBytes() const {
            footprint.runtime.sharedPrefillPlannedAllocatedBytes,
            footprint.runtime.sharedDecodePlannedAllocatedBytes,
            model::kPipelineReserveBytes, model::kRuntimeOverheadReserveBytes,
-           footprint.stateStagingBytes, footprint.aneFfnBytes}) {
+           footprint.streamedTableBytes, footprint.aneFfnBytes, footprint.stateStagingBytes}) {
     if (!checkedAdd(result, value, result)) {
       throw std::overflow_error("fixed runtime cost overflow");
     }
@@ -168,7 +169,8 @@ std::string EngineMemoryBreakdown::toStatusJson() const {
       << "\"shared_decode_bytes\":" << sharedDecodeBytes << ','
       << "\"pipeline_reserve_bytes\":" << pipelineReserveBytes << ','
       << "\"runtime_overhead_reserve_bytes\":" << runtimeOverheadReserveBytes
-      << ',' << "\"ane_ffn_bytes\":" << aneFfnBytes << ','
+      << ',' << "\"streamed_table_bytes\":" << streamedTableBytes << ','
+      << "\"ane_ffn_bytes\":" << aneFfnBytes << ','
       << "\"state_staging_bytes\":" << stateStagingBytes << ','
       << "\"fixed_runtime_bytes\":" << fixedRuntimeBytes << ','
       << "\"dynamic_budget_bytes\":" << dynamicBudgetBytes << ','
@@ -207,6 +209,7 @@ std::string EngineMemoryBreakdown::describe() const {
       << "pipeline reserve: " << bytesAndMiB(pipelineReserveBytes) << '\n'
       << "allocator/runtime reserve: "
       << bytesAndMiB(runtimeOverheadReserveBytes) << '\n'
+      << "streamed table cache: " << bytesAndMiB(streamedTableBytes) << '\n'
       << "Neural Engine split: " << bytesAndMiB(aneFfnBytes) << '\n'
       << "SSD cache state staging: " << bytesAndMiB(stateStagingBytes) << '\n'
       << "fixed runtime: " << bytesAndMiB(fixedRuntimeBytes) << '\n'
@@ -279,6 +282,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   breakdown.runtimeOverheadReserveBytes = model::kRuntimeOverheadReserveBytes;
   breakdown.stateStagingBytes = model.footprint.stateStagingBytes;
   breakdown.aneFfnBytes = model.footprint.aneFfnBytes;
+  breakdown.streamedTableBytes = model.footprint.streamedTableBytes;
   breakdown.kvPageTokens = kv::kPageTokens;
 
   if (auto error = device.validationError()) {

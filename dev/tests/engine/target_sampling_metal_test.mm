@@ -2048,6 +2048,14 @@ void ties(MetalBackend &backend) {
   }
 }
 
+// A policy that keeps only its most likely token selects greedily.
+void onlyTheMostLikelyIsGreedy() {
+  require(SamplingPolicy{0, 0.8F}.samples() && !SamplingPolicy{}.samples() &&
+              !SamplingPolicy{1, 0.8F}.samples() &&
+              !SamplingPolicy{.temperature = 0.8F, .minP = 1.0F}.samples(),
+          "a policy that keeps one token sampled");
+}
+
 // Where min_p cuts, on rows whose weights are known: the heaviest token
 // weighs 1, ten weigh 0.3, twenty 0.1 and a hundred 0.01 at temperature 1.
 // min_p keeps the classes that weigh at least it, each tie whole; top_k then
@@ -2097,8 +2105,7 @@ void minPCuts(MetalBackend &backend) {
         Case{"min_p 0.2 then top_k 5",
              {5, 1.0F, 1.0F, false, false, {}, 0.2F}, 5, 103, 104},
         Case{"min_p 0.05 then top_p 0.5 of what it kept",
-             {0, 1.0F, 0.5F, false, false, {}, 0.05F}, 8, 106, 107},
-        Case{"min_p 1", {0, 1.0F, 1.0F, false, false, {}, 1.0F}, 1, 5, 100}}) {
+             {0, 1.0F, 0.5F, false, false, {}, 0.05F}, 8, 106, 107}}) {
     const Distribution target =
         referenceDistribution(batch.row(0), vocabulary, c.policy);
     require(target.order.size() == c.kept && target.ambiguousMass == 0.0 &&
@@ -2599,6 +2606,8 @@ int main(int argc, char **argv) {
     penaltyWords();
     stage = "penalty lifecycle";
     penaltyLifecycle();
+    stage = "policies that keep one token";
+    onlyTheMostLikelyIsGreedy();
     MetalBackend backend(argv[1]);
     stage = "invalid penalties";
     invalidPenalties(backend);

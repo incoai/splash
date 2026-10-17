@@ -1,11 +1,13 @@
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
 #include "TestCheckpoint.hpp"
+#include "TestDrafts.hpp"
 #include "TestStderr.hpp"
 #include "engine/Bootstrap.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "engine/Engine.hpp"
 #include "engine/MemoryPlan.hpp"
+#include "model/RuntimeArenas.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -15,6 +17,7 @@
 #include <array>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -35,11 +38,12 @@ using splash::test::require;
 
 // A small model whose weights load and whose geometry the runtime plans:
 // four target and two draft layers of the 2048-wide hidden state a compiled
-// draft attention takes, with Qwen3.8-27B's attention and GDN heads and a
-// two-block vision tower.
+// draft attention takes, the draft reading a GDN layer and the attention
+// layer, with Qwen3.8-27B's attention and GDN heads and a two-block vision
+// tower.
 struct PlannedModel final {
   model::Qwen3_8Layout target;
-  model::DFlashDraftLayout draft = model::kQwen3_8DraftLayout;
+  model::DFlashDraftLayout draft;
   ops::VisionLayout vision;
 };
 
@@ -50,14 +54,8 @@ PlannedModel plannedModel() {
   target.hiddenSize = 2048;
   target.vocabularySize = 1024;
   target.intermediateSize = 1024;
-  target.hiddenCaptureLayers.fill(target.layers - 1);
-  model::DFlashDraftLayout &draft = result.draft;
-  draft.layers = 2;
-  draft.hiddenSize = target.hiddenSize;
-  draft.vocabularySize = target.vocabularySize;
-  draft.dynamicSize = 512;
-  draft.intermediateSize = 1024;
-  draft.targetHiddenSize = target.capturedHiddenSize();
+  constexpr std::array<uint32_t, 2> draftReads{1, 3};
+  result.draft = model::draftLayout(target.hiddenSize, target.vocabularySize, 2, 1024, 10'000'000.0F, draftReads);
   ops::VisionLayout &vision = result.vision;
   vision.depth = 2;
   vision.hiddenSize = 128;
@@ -151,17 +149,17 @@ uint64_t minimumBytes(const RuntimeResourcesConfig &config) {
 
 // A persistent cache's directory is named for what its copies hold: the same
 // models and layouts name the same one under any build, and a change to any
-// of them names another.
+// of them, or to the RoPE scaling its keys went through, names another.
 void testPersistentCacheNamespace() {
   const model::ModelDescriptor model = model::makeModelDescriptor(
-      "namespace-test", model::Qwen3_8Layout{}, model::kQwen3_8DraftLayout,
-      model::kQwen3_8VisionLayout, model::TargetSource::Safetensors,
+      "namespace-test", model::Qwen3_8Layout{}, test::qwen3_8Draft(),
+      test::qwen3_8Vision(), model::TargetSource::Safetensors,
       model::VisionSource::Safetensors);
   const auto identity = [&](char models, std::string_view build, kv::Format format) {
     kv::Layout layout = model.targetKvLayout;
     layout.format = format;
     return makeRuntimeCacheIdentity(std::string(64, models), std::string(64, 'b'), build,
-                                    layout);
+                                    layout, {});
   };
   const std::string name =
       persistentCacheNamespace(identity('a', "build", kv::Format::Int8), model.stateLayout);
@@ -180,6 +178,29 @@ void testPersistentCacheNamespace() {
               persistentCacheNamespace(identity('a', "build", kv::Format::Int8), states) != name &&
               persistentCacheNamespace(identity('a', "build", kv::Format::Int8), bfloatStates) != name,
           "other models, layouts or state formats shared a cache namespace");
+  // A QSA layout's pages hold token-major values and the index's pooled
+  // keys, and its states the PLE history and the index's pending keys.
+  RuntimeCacheIdentity tokenMajor = identity('a', "build", kv::Format::Int8), indexed = tokenMajor;
+  tokenMajor.kvLayout.valuesTokenMajor = true;
+  indexed.kvLayout.indexDimension = 128;
+  model::CompositeStateLayout auxiliary = model.stateLayout;
+  auxiliary.target.auxiliaryBytes = 9216;
+  require(persistentCacheNamespace(tokenMajor, model.stateLayout) != name &&
+              persistentCacheNamespace(indexed, model.stateLayout) != name &&
+              persistentCacheNamespace(identity('a', "build", kv::Format::Int8), auxiliary) != name,
+          "token-major values, an index or auxiliary state shared a dense layout's cache namespace");
+  const auto scaled = [&](double factor) {
+    kv::Layout layout = model.targetKvLayout;
+    layout.format = kv::Format::Int8;
+    return persistentCacheNamespace(makeRuntimeCacheIdentity(std::string(64, 'a'), std::string(64, 'b'), "build",
+                                                             layout, {factor, 262144}),
+                                    model.stateLayout);
+  };
+  require(scaled(1.0) == name && scaled(4.0) != name && scaled(2.0) != name && scaled(2.0) != scaled(4.0),
+          "YaRN's keys shared a cache namespace with another scaling's");
+  // Factors that print alike to six digits still rotate keys differently.
+  require(scaled(3.9999999) != scaled(4.0) && scaled(1.0000001) != scaled(1.0000004),
+          "factors alike to six digits shared a cache namespace");
 }
 
 void testWeightBudgetBeforeLoading(const char *metallibPath) {
@@ -334,8 +355,8 @@ void testHostMemoryProbeIsRequired(const char *metallibPath) {
 void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-budget");
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root.path());
-  config.model = model::makeModelDescriptor("budget-test", model::Qwen3_8Layout{}, model::kQwen3_8DraftLayout,
-                                            model::kQwen3_8VisionLayout, model::TargetSource::Safetensors,
+  config.model = model::makeModelDescriptor("budget-test", model::Qwen3_8Layout{}, test::qwen3_8Draft(),
+                                            test::qwen3_8Vision(), model::TargetSource::Safetensors,
                                             model::VisionSource::Safetensors);
   writeCheckpoints(root.path(), config.model);
   config.maximumMemoryBytes = model::modelWeightBytes(root.path(), config.model) + kGiB / 2;
@@ -360,10 +381,10 @@ void testStartupAdmissionIgnoresModelSize(const char *metallibPath) {
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root.path());
   model::Qwen3_8Layout target;
   target.layers = 16;
-  target.hiddenCaptureLayers = {1, 4, 7, 10, 13};
-  config.model = model::makeModelDescriptor("budget-test", target, model::kQwen3_8DraftLayout,
-                                            model::kQwen3_8VisionLayout, model::TargetSource::Safetensors,
-                                            model::VisionSource::Safetensors);
+  model::DFlashDraftLayout draft = test::qwen3_8Draft();
+  draft.targetLayers = {1, 4, 7, 10, 13};
+  config.model = model::makeModelDescriptor("budget-test", target, draft, test::qwen3_8Vision(),
+                                            model::TargetSource::Safetensors, model::VisionSource::Safetensors);
   writeCheckpoints(root.path(), config.model);
   require(model::modelWeightBytes(root.path(), config.model) > 3 * kGiB, "the model must exceed the sample");
   config.hostMemory = [] { return std::optional<HostMemory>(HostMemory{3 * kGiB, 3 * kGiB}); };
@@ -396,8 +417,8 @@ void testStartupAdmissionIgnoresModelSize(const char *metallibPath) {
 void testLoadedVisionIsRequiredOnlyWithVision() {
   model::LoadedModel loaded;
   loaded.descriptor = model::makeModelDescriptor(
-      "loaded-test", model::Qwen3_8Layout{}, model::kQwen3_8DraftLayout,
-      model::kQwen3_8VisionLayout, model::TargetSource::Safetensors,
+      "loaded-test", model::Qwen3_8Layout{}, test::qwen3_8Draft(),
+      test::qwen3_8Vision(), model::TargetSource::Safetensors,
       model::VisionSource::Safetensors);
   model::Qwen3_8Weights target;
   target.actualAllocatedBytes = 1;
@@ -505,6 +526,45 @@ void testStartGrowsThroughHostPressure(const char *metallibPath) {
     require(!grown && grown.failure == metal::AllocationFailure::HostPressure,
             "growth that no request in service needs went on " + host + " once serving began");
   }
+}
+
+// A model served with YaRN starts and runs as any other, with YaRN all the
+// way into its runtime: the start names the window it serves, the runtime's
+// geometry serves that window, its arenas hold YaRN's rotary frequencies, and
+// its prefill and decode build the target's RoPE tables with the attention
+// factor.
+void testYarnRuntime(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-yarn");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "yarn-test");
+  config.model = model::withYarn(std::move(config.model), 4.0);
+  std::unique_ptr<RuntimeResources> resources;
+  const std::string started =
+      test::capturedStderr([&] { resources = RuntimeResources::create(config, 0); });
+  require(started.find("YaRN scales the target's RoPE by 4: a window of 1010000 tokens instead of the native "
+                       "262144.") != std::string::npos,
+          "a start with YaRN did not name the window it serves");
+  const model::RuntimeContext context = resources->modelContext();
+  const auto geometry = model::RuntimeGeometry::from(context.model, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  require(geometry.target.ropeScaling == config.model.ropeScaling && geometry.target.contextTokens() == 1'010'000,
+          "the runtime's geometry lost YaRN or its window");
+  std::array<float, SPLASH_TARGET_ROPE_PAIRS> expected{};
+  model::rotaryInverseFrequencies(geometry.target.rotaryTheta, geometry.target.rotaryPairs,
+                                  geometry.target.ropeScaling, expected);
+  const metal::AllocationAdmission admit = resources->memoryGovernor().allocationAdmission();
+  const EngineMemoryBreakdown &budget = resources->memoryPlan().breakdown();
+  std::unique_ptr<model::RuntimeModel> runtime;
+  require(static_cast<bool>(admit(budget.sharedPrefillBytes + budget.sharedDecodeBytes, [&] {
+            const model::PrefillArena arena(context.backend, geometry, context.operators);
+            require(std::memcmp(arena.get(model::PrefillTensor::TargetInverseFrequencies).contents(),
+                                expected.data(), sizeof(expected)) == 0,
+                    "the prefill arena does not hold YaRN's frequencies");
+          })),
+          "the YaRN prefill arena was refused");
+  require(static_cast<bool>(admit(budget.sharedPrefillBytes + budget.sharedDecodeBytes,
+                                  [&] { runtime = model::createRuntime(context); })),
+          "the YaRN runtime's arenas were refused");
+  static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
+  static_cast<void>(runtime->warmupDecodeBatch(1));
 }
 
 // The SSD cache holds no write back unless a write budget is set; one that
@@ -741,6 +801,7 @@ int main(int argc, char **argv) {
       testStartupAdmissionIgnoresModelSize(argv[1]);
       testFailedStepIsNamed(argv[1]);
       testStartGrowsThroughHostPressure(argv[1]);
+      testYarnRuntime(argv[1]);
       testWriteBudgetOnlyWhenSet(argv[1]);
       testStaleCachesGoAtEveryStart(argv[1]);
       testMadeCacheRootStaysOutOfBackups(argv[1]);

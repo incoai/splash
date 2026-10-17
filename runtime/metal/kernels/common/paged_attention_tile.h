@@ -56,6 +56,47 @@ inline bool splash_verify_attention_contract_valid(
          params.slot_splits <= SplashVerifyMaximumSplits;
 }
 
+// The query tile a threadgroup owns, of one KV head: the offset of its fused
+// rows in the queries and the output, the position of its first row, its
+// active rows, its history splits and the partial slot of its first split. A
+// verify tile is a lane's eight rows, a prefill tile SplashPrefillTileRows
+// rows of the chunk; a tile whose parameters fail the contract, or past the
+// chunk's rows, is inactive. Split and reduce entries, dense and sparse, take
+// their tiles from here, so they agree on every offset.
+struct SplashAttentionTile {
+  ulong offset;
+  ulong first_slot;
+  uint first_position;
+  uint active_rows;
+  uint splits;
+  bool active;
+};
+
+template <uint KVHeads, uint QueryHeadsPerKVHead>
+inline SplashAttentionTile splash_verify_attention_tile(
+    constant SplashVerifyAttentionParams &lane, uint kv_head, uint batch) {
+  if (!splash_verify_attention_contract_valid(lane) || kv_head >= KVHeads)
+    return {};
+  const ulong head = ulong(batch) * KVHeads + kv_head;
+  return {head * SPLASH_VERIFY_CHUNK_STRIDE * QueryHeadsPerKVHead * SplashKvHeadDimension,
+          head * lane.slot_splits, lane.committed_tokens, SPLASH_TARGET_VERIFY_ROWS,
+          lane.split_count, true};
+}
+
+template <uint KVHeads, uint QueryHeadsPerKVHead>
+inline SplashAttentionTile splash_prefill_attention_tile(
+    constant SplashPrefillAttentionParams &params, uint kv_head, uint tile) {
+  const uint start = tile * SplashPrefillTileRows;
+  if (!splash_prefill_attention_contract_valid(params) || kv_head >= KVHeads ||
+      start >= params.rows)
+    return {};
+  return {(ulong(kv_head) * params.chunk_stride + start) * QueryHeadsPerKVHead *
+              SplashKvHeadDimension,
+          (ulong(tile) * KVHeads + kv_head) * params.split_count,
+          params.committed_tokens + start, min(SplashPrefillTileRows, params.rows - start),
+          params.split_count, true};
+}
+
 // Split and reduce derive the same balanced partition of each query tile's
 // visible pages. Causal masking remains per query row inside each split.
 inline uint splash_attention_pages(uint visible_tokens) {
@@ -289,17 +330,16 @@ inline void splash_paged_attention_tile(
 // Partials are [slot][fused row][dimension]; statistics are
 // [slot][fused row]{max, sum}. The callers lay slots out as
 // [tile][KV head][split] (prefill) and [lane][KV head][split] (verify).
-// Combines the splits of one fused row in split order. Only splits that own
-// at least one page were written; the partition is recomputed here. The
+// Combines the first `written` splits of one fused row in split order. The
 // statistics are shared by all 256 output dimensions: their weights are
 // computed once per row, then each lane streams one dimension of the
 // partials. A row past the tile's active rows is written as zeros; a
 // threadgroup owns one fused row, so it returns uniformly.
 template <uint QueryHeadsPerKVHead, uint RowsPerTile>
-inline void splash_attention_reduce_row(
+inline void splash_attention_combine_splits(
     device const float *partials, device const float *statistics,
-    device bfloat *tile_output, uint committed_tokens, uint active_rows,
-    uint splits, ulong head_slot, uint fused_row, uint thread_index,
+    device bfloat *tile_output, uint active_rows, uint written,
+    ulong head_slot, uint fused_row, uint thread_index,
     threadgroup float *weights, threadgroup float *group_values) {
   constexpr uint M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr uint D = SplashKvHeadDimension;
@@ -307,9 +347,6 @@ inline void splash_attention_reduce_row(
     tile_output[fused_row * D + thread_index] = bfloat(0.0f);
     return;
   }
-  const uint pages = splash_attention_pages(committed_tokens + active_rows);
-  const uint per_split = splash_attention_pages_per_split(pages, splits);
-  const uint written = (pages + per_split - 1) / per_split;
   const uint lane = thread_index % 32, sg = thread_index / 32;
   const ulong stat = ((head_slot + thread_index) * M + fused_row) * 2;
   const float maximum = thread_index < written ? statistics[stat] : -INFINITY;
@@ -332,4 +369,20 @@ inline void splash_attention_reduce_row(
   }
   tile_output[fused_row * D + thread_index] =
       bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
+}
+
+// The splits of a page loop that own at least one page wrote their
+// partials; the partition is recomputed here.
+template <uint QueryHeadsPerKVHead, uint RowsPerTile>
+inline void splash_attention_reduce_row(
+    device const float *partials, device const float *statistics,
+    device bfloat *tile_output, uint committed_tokens, uint active_rows,
+    uint splits, ulong head_slot, uint fused_row, uint thread_index,
+    threadgroup float *weights, threadgroup float *group_values) {
+  const uint pages = splash_attention_pages(committed_tokens + active_rows);
+  const uint per_split = splash_attention_pages_per_split(pages, splits);
+  const uint written = (pages + per_split - 1) / per_split;
+  splash_attention_combine_splits<QueryHeadsPerKVHead, RowsPerTile>(
+      partials, statistics, tile_output, active_rows, written, head_slot,
+      fused_row, thread_index, weights, group_values);
 }

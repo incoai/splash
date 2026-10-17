@@ -21,6 +21,8 @@ public:
 // pins the lines both sides agree on.
 struct NativeArguments final {
   std::filesystem::path modelRoot;
+  // The model the directory holds, served with YaRN by --yarn-factor FACTOR
+  // (model::withYarn), which stretches the window MAX_CONTEXT may ask for.
   model::ModelDescriptor model;
   // Zero for auto.
   uint32_t maxContext = 0;
@@ -53,6 +55,15 @@ struct NativeArguments final {
   // Neural Engine when that is faster (splash serve --disable-ane turns it
   // off).
   bool neuralEngine = true;
+  // --ple-memory BYTES: stream a Qwen3.8-Flash-Next GGUF's PLE table from
+  // its file through a host row cache of BYTES in all instead of loading it;
+  // 0, without the option, loads it (RuntimeResourcesConfig::streamedTableBytes).
+  uint64_t streamedTableBytes = 0;
+  // --expert-memory BYTES: stream a MoE target's routed experts from their
+  // files through a store of BYTES (model/ExpertStore.hpp) instead of loading
+  // them; 0, without the option, loads them
+  // (RuntimeResourcesConfig::expertMemoryBytes).
+  uint64_t expertMemoryBytes = 0;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

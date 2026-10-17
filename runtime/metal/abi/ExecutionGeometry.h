@@ -5,7 +5,10 @@
 #define SPLASH_DRAFT_QUERY_ROWS 8u
 #define SPLASH_DRAFT_PROPOSAL_TOKENS 7u
 #define SPLASH_TARGET_VERIFY_ROWS 8u
-#define SPLASH_MAXIMUM_CONTEXT_TOKENS 262144u
+// The KV ceiling: four times the targets' native window of 262,144 tokens,
+// which holds the most context YaRN serves them
+// (QwenTargetDimensions::yarnContextTokens).
+#define SPLASH_MAXIMUM_CONTEXT_TOKENS 1048576u
 #define SPLASH_SPECULATIVE_SCRATCH_TOKENS                                  \
   (SPLASH_TARGET_VERIFY_ROWS - 1u)
 #define SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS                                  \
