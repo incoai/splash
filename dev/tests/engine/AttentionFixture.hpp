@@ -24,13 +24,14 @@
 // with its queries, and the production store and attention graph over them.
 namespace splash::test {
 
-// The target attention layer a fixture holds: its query and KV heads and its
-// cache format.
+// The target attention layer a fixture holds: its query and KV heads, its
+// cache format and its value order (kv::Layout::valuesTokenMajor).
 struct AttentionShape final {
   uint32_t queryHeads = 0;
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
   kv::Format format = kv::Format::Int8;
+  bool valuesTokenMajor = false;
 };
 
 // Where a fixture's attention layer sits: layer `layer` of a pool of
@@ -156,12 +157,8 @@ struct AttentionFixturePlan final {
     return (bytes + kAlignment - 1) & ~(kAlignment - 1);
   }
   // Attention plans are per layer.
-  [[nodiscard]] kv::Layout layout() const noexcept {
-    return {1, shape.kvHeads, shape.headDimension, shape.format};
-  }
-  [[nodiscard]] kv::Layout poolLayout() const noexcept {
-    return {geometry.poolLayers, shape.kvHeads, shape.headDimension, shape.format};
-  }
+  [[nodiscard]] kv::Layout layout() const noexcept { return layoutOf(1); }
+  [[nodiscard]] kv::Layout poolLayout() const noexcept { return layoutOf(geometry.poolLayers); }
   // Queries and output are [lane][KV head][row][query head in group][dimension].
   [[nodiscard]] uint64_t queryIndex(uint32_t lane, uint32_t head, uint32_t row,
                                     uint32_t dimension) const noexcept {
@@ -171,15 +168,23 @@ struct AttentionFixturePlan final {
   }
 
 private:
+  [[nodiscard]] kv::Layout layoutOf(uint32_t layers) const noexcept {
+    return {.attentionLayers = layers,
+            .kvHeads = shape.kvHeads,
+            .headDimension = shape.headDimension,
+            .format = shape.format,
+            .valuesTokenMajor = shape.valuesTokenMajor};
+  }
   void size(Tensor tensor, uint64_t value) noexcept {
     sizes[static_cast<size_t>(tensor)] = value;
   }
 };
 
 // A fixture's extents start its one allocation and its tensors are views of
-// the rest, resident for every command like every backend buffer; kernels
-// reach the extents only through the lanes' page tables. Lanes past the
-// plan's lanes bind lane 0's page table, as the runtime's padded lanes do.
+// the rest; kernels reach the extents only through the lanes' page tables, so
+// the allocation is addressed (metal::BufferReach), resident for every
+// command buffer. Lanes past the plan's lanes bind lane 0's page table, as the
+// runtime's padded lanes do.
 class AttentionFixture final {
 public:
   using Tensor = AttentionFixturePlan::Tensor;
@@ -187,7 +192,8 @@ public:
   AttentionFixture(metal::MetalBackend &backend, AttentionFixturePlan plan,
                    std::string_view label)
       : plan_(std::move(plan)),
-        base_(backend.allocateBuffer(plan_.bytes, metal::BufferStorage::Shared, label)),
+        base_(backend.allocateBuffer(plan_.bytes, metal::BufferStorage::Shared, label,
+                                     metal::BufferReach::Addressed)),
         pages_(HostKvExtents::contiguous(plan_.poolLayout(), plan_.geometry.extentPages,
                                          plan_.extents,
                                          static_cast<std::byte *>(base_.contents()),
@@ -236,17 +242,15 @@ public:
             *scale(lane, SPLASH_KV_KEY_SCALES, head, token) = 0.006f;
             *scale(lane, SPLASH_KV_VALUE_SCALES, head, token) = 0.007f;
             auto *keys = keyRow<int8_t>(lane, head, token);
-            auto *values = valueColumn<int8_t>(lane, head, token);
             for (uint32_t d = 0; d < dimensions; ++d) {
               keys[d] = key(d);
-              values[d * kv::kPageTokens] = value(d);
+              *valueOf<int8_t>(lane, head, token, d) = value(d);
             }
           } else {
             auto *keys = keyRow<uint16_t>(lane, head, token);
-            auto *values = valueColumn<uint16_t>(lane, head, token);
             for (uint32_t d = 0; d < dimensions; ++d) {
               keys[d] = floatToBf16(key(d) * 0.006f);
-              values[d * kv::kPageTokens] = floatToBf16(value(d) * 0.007f);
+              *valueOf<uint16_t>(lane, head, token, d) = floatToBf16(value(d) * 0.007f);
             }
           }
         }
@@ -274,8 +278,9 @@ public:
   }
 
   // One store and attention of the fixture's rows, encoded as the runtime
-  // encodes them.
-  void addGraph(metal::CommandGraph &graph, const ops::PrefillAttentionPlan &attention) const {
+  // encodes them, through block lists (sparse plans) when `blocks` has them.
+  void addGraph(metal::CommandGraph &graph, const ops::PrefillAttentionPlan &attention,
+                const ops::AttentionBlocks &blocks = {}) const {
     const kv::ChunkedPrefillParams chunk = ops::PagedAttention::prefillParams(
         plan_.histories[0], plan_.rows, plan_.stride, plan_.pages[0]);
     ops::PagedAttention::addPrefillStore(graph, layer_, buffer(Tensor::ChunkKeys),
@@ -283,10 +288,12 @@ public:
                                          plan_.layout());
     ops::PagedAttention::addPrefill(graph, layer_, buffer(Tensor::Queries),
                                     buffer(Tensor::Output), buffer(Tensor::Partials),
-                                    buffer(Tensor::Statistics), tables_[0], chunk, attention);
+                                    buffer(Tensor::Statistics), tables_[0], chunk, attention,
+                                    blocks);
   }
   // Each lane's rows are its verify rows, in the verify chunk stride.
-  void addGraph(metal::CommandGraph &graph, const ops::VerifyAttentionPlan &attention) const {
+  void addGraph(metal::CommandGraph &graph, const ops::VerifyAttentionPlan &attention,
+                const ops::AttentionBlocks &blocks = {}) const {
     if (plan_.rows != kv::kVerifyRows || plan_.stride != kv::kVerifyChunkStride)
       throw std::logic_error(
           "a verify fixture stages its lanes' verify rows in the verify chunk stride");
@@ -298,7 +305,7 @@ public:
         graph, layer_,
         {buffer(Tensor::ChunkKeys), buffer(Tensor::ChunkValues), buffer(Tensor::Queries),
          buffer(Tensor::Partials), buffer(Tensor::Statistics), buffer(Tensor::Output), tables_},
-        std::span(chunks).first(attention.lanes), attention);
+        std::span(chunks).first(attention.lanes), attention, blocks);
   }
 
   [[nodiscard]] const AttentionFixturePlan &plan() const noexcept { return plan_; }
@@ -306,8 +313,8 @@ public:
     return buffers_[static_cast<size_t>(tensor)];
   }
 
-  // A lane's token in its page: one KV head's row of keys, its column of
-  // values (one element every page token), and its scale of keys or values
+  // A lane's token in its page: one KV head's row of keys, one of its values
+  // in the layout's value order, and its scale of keys or values
   // (SPLASH_KV_KEY_SCALES or SPLASH_KV_VALUE_SCALES), INT8 only.
   template <typename T>
   [[nodiscard]] T *keyRow(uint32_t lane, uint32_t head, uint32_t token) const {
@@ -315,9 +322,9 @@ public:
            splash_kv_key_element(head, token % kv::kPageTokens, 0);
   }
   template <typename T>
-  [[nodiscard]] T *valueColumn(uint32_t lane, uint32_t head, uint32_t token) const {
+  [[nodiscard]] T *valueOf(uint32_t lane, uint32_t head, uint32_t token, uint32_t dimension) const {
     return slab<T>(lane, SPLASH_KV_VALUES, token) +
-           splash_kv_value_element(head, token % kv::kPageTokens, 0);
+           pages_.valueElement(head, token % kv::kPageTokens, dimension);
   }
   [[nodiscard]] float *scale(uint32_t lane, uint32_t tensor, uint32_t head,
                              uint32_t token) const {

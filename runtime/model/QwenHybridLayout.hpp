@@ -4,7 +4,6 @@
 #include "ops/PagedKv.hpp"
 
 #include <array>
-#include <cstddef>
 #include <cstdint>
 #include <string_view>
 
@@ -30,6 +29,9 @@ struct QwenTargetDimensions {
   uint32_t gdnKeyHeads = 0;
   uint32_t gdnValueHeads = 0;
   uint32_t gdnHeadDimension = 0;
+  // Whether the GDN output gate is sigmoid(z) (Qwen3.8-Flash-Next) rather
+  // than silu(z).
+  bool gdnSigmoidGate = false;
   uint32_t attentionWidth = 0;
   uint32_t attentionQueryHeads = 0;
   uint32_t attentionKvHeads = 0;
@@ -48,6 +50,24 @@ struct QwenTargetDimensions {
   uint32_t experts = 0;
   uint32_t expertsPerToken = 0;
   uint32_t expertIntermediateSize = 0;
+  // What a family may add, zero where it has none (Qwen3.8-Flash-Next,
+  // model/Qwen4Exp.hpp, has all three): hyper-connected streams
+  // (hyperConnected), the residual's streams and the mixes' low rank; a QSA
+  // indexer (hasIndexer), its heads of indexerHeadDimension values, past
+  // indexerTopBlocks blocks of indexerBlockTokens tokens of which a row
+  // attends sparsely; and a PLE n-gram embedding (hasPle), its layer, n-gram
+  // size, heads per n-gram, head width and convolution taps.
+  uint32_t hyperConnections = 0;
+  uint32_t hyperRank = 0;
+  uint32_t indexerHeads = 0;
+  uint32_t indexerHeadDimension = 0;
+  uint32_t indexerTopBlocks = 0;
+  uint32_t indexerBlockTokens = 0;
+  uint32_t pleLayer = 0;
+  uint32_t pleNgram = 0;
+  uint32_t pleHeadsPerNgram = 0;
+  uint32_t pleHeadDimension = 0;
+  uint32_t pleConvolutionTaps = 0;
 
   [[nodiscard]] constexpr bool
   isFullAttentionLayer(uint32_t layer) const noexcept {
@@ -59,26 +79,58 @@ struct QwenTargetDimensions {
   [[nodiscard]] constexpr uint32_t actualGdnWidth() const noexcept {
     return convolutionDimension + attentionWidth + 2 * gdnValueHeads;
   }
+  // Whether the residual is hyperConnections streams, which a mix joins
+  // before each mixer, each FFN and the logits in place of a norm.
+  [[nodiscard]] constexpr bool hyperConnected() const noexcept { return hyperConnections != 0; }
+  // Whether each full-attention layer has a QSA indexer.
+  [[nodiscard]] constexpr bool hasIndexer() const noexcept { return indexerHeads != 0; }
+  // Whether a PLE n-gram embedding feeds layer pleLayer from a table of its
+  // own.
+  [[nodiscard]] constexpr bool hasPle() const noexcept { return pleNgram != 0; }
+  [[nodiscard]] constexpr uint32_t streamWidth() const noexcept { return hyperConnections * hiddenSize; }
+  [[nodiscard]] constexpr uint32_t pleHeads() const noexcept {
+    return pleNgram ? (pleNgram - 1) * pleHeadsPerNgram : 0;
+  }
+  [[nodiscard]] constexpr uint32_t pleWidth() const noexcept { return pleHeads() * pleHeadDimension; }
+  // The PLE convolution's history: (taps - 1) * dilation rows, the dilation
+  // being the n-gram size.
+  [[nodiscard]] constexpr uint32_t pleHistory() const noexcept {
+    return pleConvolutionTaps ? (pleConvolutionTaps - 1) * pleNgram : 0;
+  }
+  // Its bytes in a state cell: bf16 rows of the streams.
+  [[nodiscard]] constexpr uint64_t pleHistoryBytes() const noexcept {
+    return uint64_t{pleHistory()} * streamWidth() * GdnStateLayout::bfloat16Bytes;
+  }
+  // The tokens a QSA row attends to sparsely past (the indexer's top_k).
+  [[nodiscard]] constexpr uint32_t indexerTokens() const noexcept { return indexerTopBlocks * indexerBlockTokens; }
   bool operator==(const QwenTargetDimensions &) const = default;
 };
 
-// A family's layout: its dimensions, the CaptureLayers layers whose hidden
-// states the draft reads, and the cache layouts they make. A family sets
-// every value its FFN uses and adds its file magics.
-template <size_t CaptureLayers> struct QwenHybridLayout : QwenTargetDimensions {
-  std::array<uint32_t, CaptureLayers> hiddenCaptureLayers{};
-
+// A family's layout: its dimensions and the cache layouts they make. A
+// family sets every value its FFN uses and states what names it among the
+// families: its name, its config's model type, the architecture of its GGUFs
+// and whether a safetensors checkpoint of it loads (family, modelType,
+// ggufArchitecture, loadsSafetensors).
+struct QwenHybridLayout : QwenTargetDimensions {
+  // The KV pages, which also hold a QSA indexer's keys; a QSA target's
+  // sparse attention gathers blocks of tokens, so its values are token-major.
   [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
-    return {attentionLayerCount(), attentionKvHeads,
-            attentionHeadDimension};
+    return {.attentionLayers = attentionLayerCount(),
+            .kvHeads = attentionKvHeads,
+            .headDimension = attentionHeadDimension,
+            .indexDimension = indexerHeadDimension,
+            .valuesTokenMajor = hasIndexer()};
   }
+  // The GDN layers' state and, after it in a cell, a PLE convolution's
+  // history.
   [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {
-    return {layers - attentionLayerCount(), kGdnConvolutionTaps - 1,
-            convolutionDimension,
-            gdnValueHeads, gdnHeadDimension, gdnHeadDimension};
-  }
-  [[nodiscard]] constexpr uint32_t capturedHiddenSize() const noexcept {
-    return hiddenSize * hiddenCaptureLayers.size();
+    return {.layers = layers - attentionLayerCount(),
+            .convolutionHistory = kGdnConvolutionTaps - 1,
+            .convolutionChannels = convolutionDimension,
+            .recurrentGroups = gdnValueHeads,
+            .recurrentRows = gdnHeadDimension,
+            .recurrentColumns = gdnHeadDimension,
+            .auxiliaryBytes = pleHistoryBytes()};
   }
   bool operator==(const QwenHybridLayout &) const = default;
 };

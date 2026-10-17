@@ -51,6 +51,13 @@ struct EngineConfig final {
   double decodeShare = 0.5;
   // The prefill checkpoint interval and the resource wait limit.
   uint32_t prefillCheckpointTokens = kPrefillCheckpointTokens;
+  // A grid of retained states every this many tokens of a prompt
+  // (retainedCheckpoints), zero for none: cached states like a prompt's
+  // replay point, which the rolling checkpoints never retire (the cache may
+  // still evict them), so a conversation edited deep in its history resumes
+  // from the grid point below the edit instead of prefilling from the start.
+  // SPLASH_GDN_CHECKPOINT_TOKENS (NativeArguments.hpp).
+  uint32_t retainedCheckpointTokens = 0;
   double resourceWaitTimeoutMilliseconds = kResourceWaitTimeoutMilliseconds;
   // Host growth admission, supplied by the runtime governor. Queried while
   // resident lanes drain after a suspension, and when a boundary's state
@@ -104,6 +111,20 @@ plannedCheckpoints(uint32_t resumeBoundary, uint32_t replayBoundary, uint32_t in
            (uint64_t{resumeBoundary} + chunk + interval - 1) / interval * interval;
        boundary + chunk <= replayBoundary; boundary += interval)
     checkpoints.push_back(static_cast<uint32_t>(boundary));
+  return checkpoints;
+}
+
+// The grid points of `interval` tokens a prefill from resumeBoundary to
+// replayBoundary crosses, every one of them: a short append across a point
+// takes it too, where the rolling checkpoints' near-end exclusion would
+// leave a conversation that grows in small turns without a point for good.
+[[nodiscard]] inline std::vector<uint32_t>
+retainedCheckpoints(uint32_t resumeBoundary, uint32_t replayBoundary, uint32_t interval) {
+  std::vector<uint32_t> checkpoints;
+  if (interval)
+    for (uint64_t boundary = (uint64_t{resumeBoundary} / interval + 1) * interval; boundary <= replayBoundary;
+         boundary += interval)
+      checkpoints.push_back(static_cast<uint32_t>(boundary));
   return checkpoints;
 }
 
@@ -204,8 +225,8 @@ public:
   // the engine knows: vocabulary, context window, and vision with the
   // server's per-image patch cap.
   void submit(EngineRequest request);
-  void observePrefill(uint32_t rows, double wallMilliseconds) {
-    scheduler_.observePrefill(rows, wallMilliseconds);
+  void observePrefill(uint32_t rows, double wallMilliseconds, double hostMilliseconds) {
+    scheduler_.observePrefill(rows, wallMilliseconds, hostMilliseconds);
   }
   void cancel(uint64_t requestId);
   void failRequest(uint64_t requestId, LaneOutcome outcome, std::string message);
@@ -629,8 +650,8 @@ private:
   void signalResourceProgress() noexcept;
   void apply(const BatchPlan &plan, std::span<const std::vector<Capture>> captures,
              std::span<const ModelStepResult> results, double wallMilliseconds,
-             double cycleMilliseconds, bool representativePrefillTiming,
-             double nowMilliseconds);
+             double hostMilliseconds, double cycleMilliseconds,
+             bool representativePrefillTiming, double nowMilliseconds);
   // Whether the command in flight holds the request's lane.
   [[nodiscard]] bool inFlight(uint64_t requestId) const;
   // Ends a request early. While its command or restore runs, the first end

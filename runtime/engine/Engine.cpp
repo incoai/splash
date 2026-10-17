@@ -68,6 +68,10 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
     throw std::invalid_argument("the engine needs the governor's growth pause and serving mark");
   if (!std::isfinite(config_.decodeShare) || config_.decodeShare < 0.0)
     throw std::invalid_argument("decode share must be nonnegative and finite");
+  if (config_.retainedCheckpointTokens &&
+      (config_.retainedCheckpointTokens < 2 * model::ExecutionLimits::prefillTokenBudget ||
+       config_.retainedCheckpointTokens % model::ExecutionLimits::prefillTokenBudget))
+    throw std::invalid_argument("retained checkpoint interval must be zero or a multiple of 2048 at least 4096");
 }
 
 void Engine::submit(EngineRequest value) {
@@ -125,7 +129,11 @@ void Engine::submit(EngineRequest value) {
        .priority = stored.request.priority,
        .constrained = stored.request.constraint == ConstraintMode::TokenMask,
        .prefillTokens = stored.promptTokens,
-       .deadlineMilliseconds = stored.request.deadlineMilliseconds});
+       .deadlineMilliseconds = stored.request.deadlineMilliseconds,
+       // A prompt with images runs chunk commands: the oracle checks a prefill
+       // group against its chunks' commands on text prompts only.
+       .prefillGroupRows = stored.request.images.empty() ? model_.prefillGroupRows()
+                                                         : model::ExecutionLimits::prefillTokenBudget});
   ++counters_.submitted;
 }
 
@@ -254,7 +262,7 @@ bool Engine::tick(double now) {
     pending_.reset();
     std::vector<ModelStepResult> results = command.ticket->wait();
     apply(command.plan, command.captures, results, command.ticket->wallMilliseconds(),
-          now - command.startedMilliseconds,
+          command.ticket->hostMilliseconds(), now - command.startedMilliseconds,
           command.ticket->prefillTimingIsRepresentative(), now);
     busySinceMilliseconds_ = now;
     sweepTerminal();
@@ -1012,6 +1020,13 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   for (const uint32_t checkpoint : plannedCheckpoints(
            stateBoundary, latestReplayBoundary, config_.prefillCheckpointTokens)) {
     addStateBoundary(active, stateBoundary, checkpoint, true, true);
+  }
+  // The retained grid's points, captured as the rolling checkpoints are
+  // (a point both name is upgraded to a kept one), with every target's state
+  // of the row (Qwen3.8-Flash-Next's auxiliary state included).
+  for (const uint32_t checkpoint : retainedCheckpoints(
+           stateBoundary, latestReplayBoundary, config_.retainedCheckpointTokens)) {
+    addStateBoundary(active, stateBoundary, checkpoint, false, true);
   }
   if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
     addStateBoundary(active, stateBoundary, junctionBoundary, false, true);
@@ -1825,8 +1840,8 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
 
 void Engine::apply(const BatchPlan &plan, std::span<const std::vector<Capture>> captures,
                    std::span<const ModelStepResult> results, double wallMilliseconds,
-                   double cycleMilliseconds, bool representativePrefillTiming,
-                   double now) {
+                   double hostMilliseconds, double cycleMilliseconds,
+                   bool representativePrefillTiming, double now) {
   if (results.size() != plan.items.size()) {
     throw std::logic_error("model result count changed");
   }
@@ -1974,7 +1989,7 @@ void Engine::apply(const BatchPlan &plan, std::span<const std::vector<Capture>> 
     }
   }
   scheduler_.complete(plan, schedulerResults, wallMilliseconds,
-                      representativePrefillTiming);
+                      representativePrefillTiming, hostMilliseconds);
   events_.batchCompleted(plan.kind, plan.width(), inputTokens, outputTokens,
                          draftedTokens, acceptedDraftTokens, wallMilliseconds,
                          cycleMilliseconds);

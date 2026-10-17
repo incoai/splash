@@ -806,6 +806,8 @@ def main_args(**overrides):
             "max_request_size": serve_options.DEFAULT_MAX_REQUEST_BYTES,
             "port": 0,
             "binary": "splash",
+            "ple_ssd_cache": None,
+            "expert_memory": None,
             "kv_format": "int8",
             "state_format": "fp32",
             **overrides,

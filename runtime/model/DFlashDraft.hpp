@@ -68,8 +68,11 @@ private:
   uint64_t actualAllocatedBytes_ = 0;
 };
 
-// The dimensions of a DFlash2 draft. Each target's draft is defined beside
-// the target (Qwen3_8.hpp, Qwen3_6Moe.hpp).
+// The dimensions of a DFlash2 draft, as its checkpoint's config.json gives
+// them (ModelDescriptor.mm readDraftLayout): every draft's attention widths
+// and selector are those the kernels are built for; its layers, intermediate
+// size, rotary base and the target layers it reads are its own, and its
+// hidden size and vocabulary its target's.
 struct DFlashDraftLayout final {
   uint32_t layers = 0;
   uint32_t hiddenSize = 0;
@@ -80,13 +83,21 @@ struct DFlashDraftLayout final {
   uint32_t intermediateSize = 0;
   uint32_t attentionHeadDimension = 0;
   float rotaryTheta = 0.0F;
-  uint32_t targetHiddenSize = 0;
   uint32_t selectorRank = 0;
   uint32_t kvHeads = 0;
+  // The target layers whose output rows the draft reads, ascending: the
+  // first targetLayerCount of targetLayers, targetHiddenSize() values a row.
+  std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> targetLayers{};
+  uint32_t targetLayerCount = 0;
 
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
     return {layers, kvHeads, attentionHeadDimension, hiddenSize};
   }
+  [[nodiscard]] constexpr std::span<const uint32_t> targetLayerIds() const noexcept {
+    return {targetLayers.data(), targetLayerCount};
+  }
+  // A row of the target rows it reads: one of hiddenSize values per layer.
+  [[nodiscard]] constexpr uint32_t targetHiddenSize() const noexcept { return hiddenSize * targetLayerCount; }
   [[nodiscard]] constexpr ops::DraftAttentionShape attentionShape() const noexcept {
     return {hiddenSize, dynamicSize, qkvSize, attentionSize,
             attentionSize / attentionHeadDimension, kvHeads,
@@ -100,6 +111,15 @@ struct DFlashDraftLayout final {
 
   bool operator==(const DFlashDraftLayout &) const = default;
 };
+
+// The layout of a DFlash2 draft of a target of `hiddenSize` and
+// `vocabularySize` with `layers` layers of `intermediateSize`, rotary base
+// `rotaryTheta`, reading the target's layers `targetLayers` (ascending, 1 to
+// ExecutionLimits::maximumDraftTargetLayers): its attention widths and
+// selector are those the kernels are built for.
+[[nodiscard]] DFlashDraftLayout draftLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint32_t layers,
+                                            uint32_t intermediateSize, float rotaryTheta,
+                                            std::span<const uint32_t> targetLayers);
 
 struct DFlashDecodeBuffers final {
   ops::LinearScratch linearScratch{};

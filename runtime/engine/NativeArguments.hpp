@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <stdexcept>
+#include <string_view>
 
 namespace splash::engine {
 
@@ -53,6 +54,15 @@ struct NativeArguments final {
   // Neural Engine when that is faster (splash serve --disable-ane turns it
   // off).
   bool neuralEngine = true;
+  // --ple-ssd-cache BYTES: stream a Qwen3.8-Flash-Next GGUF's PLE table from
+  // its file through a host row cache of BYTES in all instead of loading it;
+  // 0, without the option, loads it (RuntimeResourcesConfig::pleCacheBytes).
+  uint64_t pleCacheBytes = 0;
+  // --expert-memory BYTES: stream a MoE target's routed experts from their
+  // files through a store of BYTES (model/ExpertStore.hpp) instead of loading
+  // them; 0, without the option, loads them
+  // (RuntimeResourcesConfig::expertMemoryBytes).
+  uint64_t expertMemoryBytes = 0;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto
@@ -61,5 +71,10 @@ struct NativeArguments final {
 // refuses.
 [[nodiscard]] NativeArguments parseNativeArguments(int argc,
                                                    const char *const *argv);
+
+// SPLASH_GDN_CHECKPOINT_TOKENS, read once when serving starts
+// (EngineConfig::retainedCheckpointTokens): 0, or a multiple of the prefill
+// chunk of at least two chunks.
+[[nodiscard]] uint32_t parseRetainedCheckpointTokens(std::string_view value);
 
 } // namespace splash::engine

@@ -14,6 +14,8 @@
 #define SPLASH_TARGET_ROPE_PAIRS 32u
 #define SPLASH_DRAFT_ROPE_PAIRS (SPLASH_DRAFT_HEAD_DIMENSION / 2u)
 
+// A step's tables (ops::RoPE::addTables): its target rows and its draft
+// rows.
 struct RopeTableParams {
   uint32_t target_rows;
   uint32_t draft_rows;

@@ -22,6 +22,7 @@ namespace {
 
 using namespace splash;
 using engine::NativeArguments;
+using engine::parseRetainedCheckpointTokens;
 using splash::test::rejects;
 using splash::test::require;
 
@@ -160,6 +161,8 @@ void testServerCommandLines(const char *path) {
          read.maxContext = 102400;
          read.maxMemoryBytes = 32 * kGiB;
        }},
+      {"ple_ssd_cache", [](NativeArguments &read) { read.pleCacheBytes = 2 * kGiB; }},
+      {"expert_memory", [](NativeArguments &read) { read.expertMemoryBytes = 16 * kGiB; }},
   };
   // Every field but the model inspected from the directory.
   const auto same = [](const NativeArguments &read, const NativeArguments &meant) {
@@ -175,7 +178,8 @@ void testServerCommandLines(const char *path) {
            read.maxImagePatches == meant.maxImagePatches &&
            read.idleReleaseSeconds == meant.idleReleaseSeconds &&
            read.preventIdleSleep == meant.preventIdleSleep &&
-           read.neuralEngine == meant.neuralEngine;
+           read.neuralEngine == meant.neuralEngine && read.pleCacheBytes == meant.pleCacheBytes &&
+           read.expertMemoryBytes == meant.expertMemoryBytes;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -201,8 +205,37 @@ void testNeuralEngine() {
           "--ane did not reach the arguments as given");
 }
 
+// A model directory holds draft/ or, for a model drafting with its MTP head
+// (Qwen3.8-Flash-Next from a GGUF), mtp/ beside target/; one with neither
+// is refused, as is mtp/ for a family without the head.
+void testModelDirectoryRoles() {
+  const ModelDirectory model;
+  std::filesystem::remove_all(model.path() / "draft");
+  rejects([&] { static_cast<void>(parse(model, {"auto", "auto"})); }, "target/ and draft/ directories",
+          "a model directory without draft/ or mtp/ was accepted");
+  std::filesystem::create_directory(model.path() / "mtp");
+  rejects([&] { static_cast<void>(parse(model, {"auto", "auto"})); }, "has no MTP head",
+          "a family without an MTP head accepted mtp/ in place of its draft");
+  const test::TemporaryDirectory flash{"splash-native-arguments-flash"};
+  for (const char *directory : {"target", "mtp"})
+    std::filesystem::create_directory(flash.path() / directory);
+  test::writeFile(flash.path() / "model.json",
+                  R"({"version":1,"model":"unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL",)"
+                  R"("target_format":"gguf","vision_format":"none"})");
+  std::filesystem::copy_file(modelConfigs / "qwen3.8-flash-next" / "config.json", flash.path() / "config.json");
+  const NativeArguments parsed = parseCommand({"serve-native", flash.path().string(), "auto", "auto"});
+  require(parsed.modelRoot == std::filesystem::canonical(flash.path()) && !parsed.model.hasDraft(),
+          "a Flash-Next directory with mtp/ in place of draft/ was refused");
+}
+
 // A command line the server never writes is refused with what is wrong.
 void testRefusals() {
+  require(parseRetainedCheckpointTokens("0") == 0 && parseRetainedCheckpointTokens("8192") == 8192 &&
+              parseRetainedCheckpointTokens("16384") == 16384,
+          "the retained checkpoint grid was not parsed");
+  for (const char *grid : {"", "-1", "2048", "8193", "4294967296", "8K", "8192x"})
+    rejects([&] { static_cast<void>(parseRetainedCheckpointTokens(grid)); },
+            "SPLASH_GDN_CHECKPOINT_TOKENS requires", "an invalid retained checkpoint grid was accepted");
   const ModelDirectory model;
   const auto refuses = [&](const std::vector<std::string> &arguments,
                            std::string_view expected) {
@@ -229,6 +262,11 @@ void testRefusals() {
   refuses({"auto", "auto", "--idle-sleep", "never"},
           "--idle-sleep requires prevent or allow");
   refuses({"auto", "auto", "--ane", "gpu"}, "--ane requires on or off");
+  // The server passes bytes.
+  for (const char *size : {"0", "2G", ""})
+    refuses({"auto", "auto", "--ple-ssd-cache", size}, "--ple-ssd-cache requires a positive byte count");
+  for (const char *size : {"0", "16G", ""})
+    refuses({"auto", "auto", "--expert-memory", size}, "--expert-memory requires a positive byte count");
   refuses({"auto", "auto", "--persistent-cache", "yes"}, "--persistent-cache requires on or off");
   refuses({"auto", "auto", "0", "--persistent-cache", "on"},
           "--persistent-cache requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
@@ -301,6 +339,7 @@ int main(int argc, char **argv) {
     testServerCommandLines(argv[1]);
     testNeuralEngine();
     testRefusals();
+    testModelDirectoryRoles();
     std::cout << "native arguments tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

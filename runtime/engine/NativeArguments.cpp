@@ -84,15 +84,25 @@ std::filesystem::path requireModelRoot(std::string_view argument) {
       std::filesystem::canonical(std::filesystem::path(argument), error);
   if (error || !std::filesystem::is_directory(root, error))
     throw UsageError("MODEL_DIRECTORY must name an existing directory");
-  for (const char *role : {"target", "draft"}) {
-    if (!std::filesystem::is_directory(root / role, error))
-      throw UsageError(
-          "MODEL_DIRECTORY must hold the model's target/ and draft/ directories");
-  }
+  // A model without a DFlash2 draft (Qwen3.8-Flash-Next drafting with its
+  // MTP head) has mtp/ in place of draft/; its descriptor checks which.
+  if (!std::filesystem::is_directory(root / "target", error) ||
+      !(std::filesystem::is_directory(root / "draft", error) || std::filesystem::is_directory(root / "mtp", error)))
+    throw UsageError(
+        "MODEL_DIRECTORY must hold the model's target/ and draft/ directories");
   return root;
 }
 
 } // namespace
+
+uint32_t parseRetainedCheckpointTokens(std::string_view value) {
+  if (value == "0") return 0;
+  uint32_t result = 0;
+  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
+  if (!parsePositive(value, result) || result < 2 * chunk || result % chunk)
+    throw UsageError("SPLASH_GDN_CHECKPOINT_TOKENS requires 0 or a multiple of 2048 at least 4096");
+  return result;
+}
 
 NativeArguments parseNativeArguments(int argc, const char *const *argv) {
   if (argc < 5 || std::string_view(argv[1]) != "serve-native") {
@@ -142,6 +152,12 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "prevent" && value != "allow")
         throw UsageError("--idle-sleep requires prevent or allow");
       result.preventIdleSleep = value == "prevent";
+    } else if (option == "--ple-ssd-cache") {
+      if (!parsePositive(value, result.pleCacheBytes))
+        throw UsageError("--ple-ssd-cache requires a positive byte count");
+    } else if (option == "--expert-memory") {
+      if (!parsePositive(value, result.expertMemoryBytes))
+        throw UsageError("--expert-memory requires a positive byte count");
     } else if (option == "--ane") {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");

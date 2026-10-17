@@ -1,0 +1,188 @@
+#pragma once
+
+// Qwen3.8-Flash-Next's own operators: the hyper-connection mixes around every
+// block and the PLE n-gram embedding's gate and dilated convolution
+// (kernels/shared/qwen4.metal), and the QSA indexer that picks the blocks its
+// full-attention layers attend (kernels/shared/qwen4_qsa.metal). The
+// projections between them run through ops::Linear; model/QwenTarget.cpp
+// composes them.
+
+#include "metal/CommandGraph.hpp"
+#include "metal/abi/Qwen4.h"
+#include "ops/Normalization.hpp"
+#include "ops/Weights.hpp"
+#include "ops/RowCopy.hpp"
+
+#include <cstdint>
+#include <span>
+
+namespace splash::ops {
+
+struct HyperShape final {
+  uint32_t hidden = 0;
+  uint32_t streams = 0;
+  uint32_t rank = 0;
+  [[nodiscard]] constexpr uint32_t width() const noexcept { return hidden * streams; }
+};
+
+struct PleShape final {
+  uint32_t hidden = 0;
+  uint32_t streams = 0;
+  uint32_t taps = 0;
+  uint32_t dilation = 0;
+  [[nodiscard]] constexpr uint32_t width() const noexcept { return hidden * streams; }
+  [[nodiscard]] constexpr uint32_t history() const noexcept { return (taps - 1) * dilation; }
+};
+
+// QSA of a dispatch's lanes (a verify step's, or a prefill sequence as one):
+// `rows` query rows of each lane, lane l's from logical position
+// firstPositions[l] and its KV through pageTables[l], which attend sparsely
+// past topBlocks complete blocks; bitmaps of maskWords words and scores of
+// scoreStride per row, which cover each row's complete blocks and its tail.
+struct QsaRows final {
+  uint32_t rows = 0;
+  std::span<const uint32_t> firstPositions;
+  std::span<const metal::MetalBuffer> pageTables;
+  uint32_t topBlocks = 0;
+  uint32_t maskWords = 0;
+  uint32_t scoreStride = 0;
+};
+
+// The QSA blocks a dispatch's lanes complete, which the pool pools: lane l's
+// counts[l] Qwen4QsaBlock records from record l * laneRecords of `records`,
+// its KV through pageTables[l].
+struct QsaBlocks final {
+  metal::MetalBuffer records;
+  std::span<const uint32_t> counts;
+  uint32_t laneRecords = 0;
+  std::span<const metal::MetalBuffer> pageTables;
+};
+
+// Where a layer's QSA index tensors sit in every KV extent, in bytes
+// (kv::PageStorage::indexPlacement). Page tables hold SplashKvPage entries.
+struct QsaIndex final {
+  uint32_t keysOffset = 0;
+  uint32_t pooledOffset = 0;
+};
+
+struct Qwen4 final {
+  // The complete blocks of QWEN4_QSA_BLOCK tokens before the last of `rows`
+  // rows from `firstPosition`, its own included.
+  [[nodiscard]] static constexpr uint64_t qsaCompleteBlocks(uint64_t firstPosition, uint32_t rows) noexcept {
+    return (firstPosition + rows) / QWEN4_QSA_BLOCK;
+  }
+  // Whether any row of `rows` from `firstPosition` attends sparsely: has
+  // more than topBlocks complete blocks.
+  [[nodiscard]] static bool qsaSparse(uint32_t firstPosition, uint32_t rows, uint32_t topBlocks) noexcept {
+    return qsaCompleteBlocks(firstPosition, rows) > topBlocks;
+  }
+  // The indexer's query heads, normalized and rotated (bf16 rows of
+  // QWEN4_QSA_HEADS heads), and the raw keys stored at the rows' slots.
+  static void addQsaProject(metal::CommandGraph &graph, metal::MetalBuffer query, metal::MetalBuffer key,
+                            const NormWeights &queryNorm, metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
+                            QsaIndex index, metal::MetalBuffer queries, const QsaRows &rows);
+  // The pooled keys of the lanes' blocks.
+  static void addQsaPool(metal::CommandGraph &graph, const QsaBlocks &blocks, const NormWeights &keyNorm,
+                         metal::MetalBuffer inverseFrequencies, QsaIndex index);
+  // The rows' scores of their complete blocks' pooled keys and, from them,
+  // their bitmaps. A dispatch of one lane scores its rows in batches of the
+  // score scratch's scoreRows rows; one of several lanes scores every lane's
+  // rows at once, which the scratch must hold.
+  static void addQsaSelect(metal::CommandGraph &graph, metal::MetalBuffer queries, QsaIndex index,
+                           metal::MetalBuffer scores, uint32_t scoreRows, metal::MetalBuffer mask,
+                           const QsaRows &rows);
+
+  // streams[r] = rows of fp32 [streams][hidden], each a copy of embedding[r].
+  static void addInit(metal::CommandGraph &graph, metal::MetalBuffer embedding, metal::MetalBuffer streams,
+                      HyperShape shape, uint32_t rows);
+  // The normalized streams (bf16) and, with inject, the injection weights
+  // (fp32 [rows][streams]), of Flash-Next's shape, for which its kernels are
+  // compiled (QWEN4_NORM_HIDDEN). With a table `layout` (decode rows), also
+  // the table in `scratch` that the projection reading the output takes,
+  // which then prepares none (ops::Linear PreparedInput).
+  static PreparedInput addNorm(metal::CommandGraph &graph, metal::MetalBuffer streams, const NormWeights &norm,
+                               metal::MetalBuffer inject, metal::MetalBuffer normalized, metal::MetalBuffer weights,
+                               HyperShape shape, uint32_t rows, LinearScratch scratch = {},
+                               LinearInput layout = LinearInput::Plain);
+  // silu(low / streams) in place or, with a table layout, into the table
+  // alone, leaving `low` as it was.
+  static PreparedInput addLow(metal::CommandGraph &graph, metal::MetalBuffer low, HyperShape shape, uint32_t rows,
+                              LinearScratch scratch = {}, LinearInput layout = LinearInput::Plain);
+  static PreparedInput addMix(metal::CommandGraph &graph, metal::MetalBuffer normalized, metal::MetalBuffer gate,
+                              metal::MetalBuffer mixed, HyperShape shape, uint32_t rows, LinearScratch scratch = {},
+                              LinearInput layout = LinearInput::Plain);
+  static void addCombine(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer branch,
+                         metal::MetalBuffer weights, HyperShape shape, uint32_t rows);
+
+  static void addPleGate(metal::CommandGraph &graph, metal::MetalBuffer key, metal::MetalBuffer value,
+                         metal::MetalBuffer streams, const NormWeights &keyNorm, const NormWeights &queryNorm,
+                         const NormWeights &convolutionNorm, metal::MetalBuffer gated,
+                         metal::MetalBuffer convolutionInput, PleShape shape, uint32_t rows);
+  // One sequence's rows; writes the history after them unless historyOut is empty.
+  static void addPleConvolution(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
+                                metal::MetalBuffer historyIn, metal::MetalBuffer historyOut,
+                                metal::MetalBuffer taps, metal::MetalBuffer gated, metal::MetalBuffer streams,
+                                PleShape shape, uint32_t rows);
+  // The mean of each of `rows` rows' streams, as bf16 into `destination` at
+  // `to`: the capture of a layer's output for the DFlash2 draft.
+  static void addStreamMean(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer destination,
+                            RowRegion to, HyperShape shape, uint32_t rows);
+  static void addPleHash(metal::CommandGraph &graph, metal::MetalBuffer tokens, metal::MetalBuffer before,
+                         metal::MetalBuffer indices, const Qwen4PleHashParams &params, uint32_t heads);
+
+  // The MTP head (metal/abi/Qwen4.h Qwen4MtpParams). A draft step's tokens:
+  // each lane's anchor and its first limit - 1 proposals, then repeats.
+  static void addMtpTokens(metal::CommandGraph &graph, metal::MetalBuffer anchors, metal::MetalBuffer proposals,
+                           metal::MetalBuffer tokens, uint32_t lanes, uint32_t laneRows, uint32_t proposalsPerLane,
+                           uint32_t limit);
+  // One lane's (or sequence's) `rows` eh-projection inputs, rows rowOffset..
+  // of each stream's `totalRows` rows of `output`.
+  static void addMtpInput(metal::CommandGraph &graph, metal::MetalBuffer embedding, metal::MetalBuffer carried,
+                          metal::MetalBuffer history, const NormWeights &embedNorm, const NormWeights &hiddenNorm,
+                          metal::MetalBuffer output, HyperShape shape, uint32_t rows, uint32_t limit,
+                          uint32_t rowOffset, uint32_t totalRows);
+  // fp32 streams [rows][streams][hidden] from the eh projection's
+  // stream-major bf16 rows [streams][rows][hidden].
+  static void addMtpWiden(metal::CommandGraph &graph, metal::MetalBuffer projected, metal::MetalBuffer streams,
+                          HyperShape shape, uint32_t rows, uint32_t stride);
+  // Each lane's argmax of its logits row `row` (`vocabulary` logits per row)
+  // as its proposal `row` and, `last`, every later one. With `tokens`, the
+  // logits are a draft vocabulary's, ascending token ids of which `tokens`
+  // holds (uint32 each), and the proposal is the argmax's token.
+  static void addMtpArgmax(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
+                           metal::MetalBuffer candidates, uint32_t lanes, uint32_t laneRows, uint32_t vocabulary,
+                           uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last,
+                           metal::MetalBuffer tokens = {});
+  // The same over the draft vocabulary (`tokens`, `vocabulary` logits) and,
+  // beside it, each lane's context rows: `contextLogits` (logitsSlot floats
+  // per lane, `capacity` per row), the state lanes' `contextTokens`
+  // (`capacity` each) and each lane's Qwen4MtpContextLane in `lanesInfo`.
+  // Ties go toward the lower token.
+  static void addMtpArgmaxContext(metal::CommandGraph &graph, metal::MetalBuffer logits, metal::MetalBuffer proposals,
+                                  metal::MetalBuffer candidates, metal::MetalBuffer tokens,
+                                  metal::MetalBuffer contextLogits, metal::MetalBuffer contextTokens,
+                                  metal::MetalBuffer lanesInfo, uint32_t lanes, uint32_t laneRows,
+                                  uint32_t vocabulary, uint32_t capacity, uint32_t logitsSlot,
+                                  uint32_t proposalsPerLane, uint32_t candidatesPerProposal, uint32_t row, bool last);
+  // Rows of `source` (one quantized tensor) copied to rows of `target` (one
+  // of the same format and width): `count` (source row, destination row)
+  // uint32 pairs in `pairs`.
+  static void addCopyHeadRows(metal::CommandGraph &graph, const QuantizedSegment &source,
+                              const QuantizedSegment &target, metal::MetalBuffer pairs, uint32_t count);
+  // Row retained - 1 of `streams` (retained a GPU count) or, without
+  // `retained`, row `rows` - 1.
+  static void addMtpCarry(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer carried,
+                          metal::MetalBuffer retained, HyperShape shape, uint32_t rows);
+
+  // The history after the first `rows` rows of one sequence's prefill (a
+  // state captured inside its command).
+  static void addPleHistory(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
+                            metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, PleShape shape,
+                            uint32_t rows);
+  // The history after a lane's `retained` (a GPU count) rows.
+  static void addPleCommit(metal::CommandGraph &graph, metal::MetalBuffer convolutionInput,
+                           metal::MetalBuffer historyIn, metal::MetalBuffer historyOut,
+                           metal::MetalBuffer retained, PleShape shape);
+};
+
+} // namespace splash::ops

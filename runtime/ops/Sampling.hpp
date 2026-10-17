@@ -74,7 +74,10 @@ struct SamplingPolicy final {
   // cutoff's row selects the end of thinking whatever the lane's logits.
   std::optional<ThinkingCutoff> thinkingCutoff{};
 
-  [[nodiscard]] bool samples() const noexcept { return temperature > 0.0F; }
+  // A lane samples unless it keeps only its most likely token, at a
+  // temperature of 0, a minP of 1 or a topK of 1: such a lane selects
+  // greedily, its draft's proposals too (the lowest id among equal logits).
+  [[nodiscard]] bool samples() const noexcept { return temperature > 0.0F && minP < 1.0F && topK != 1; }
 };
 
 // The penalty words of every state lane, one row of vocabulary words each,

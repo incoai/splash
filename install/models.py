@@ -147,9 +147,16 @@ def split_model_id(value: str) -> tuple[str, str | None]:
         raise ModelError(str(error)) from None
 
 
+# --draft-model's name for the MTP head a family's model carries
+# (families.ModelFamily.mtp_head), in place of a DFlash2 draft.
+MTP_HEAD = "mtp"
+
+
 def parse_draft_model(value: str) -> str:
     # A local draft directory is recorded as an absolute path, so the
     # installation it selects does not depend on the working directory.
+    if value == MTP_HEAD:
+        return value
     if value and (local := Path(value).expanduser()).is_dir():
         return str(local.resolve())
     try:
@@ -157,7 +164,7 @@ def parse_draft_model(value: str) -> str:
     except ModelError:
         raise argparse.ArgumentTypeError(
             "must be a local DFlash2 draft directory or a Hugging Face "
-            "repository ID (owner/repo)"
+            "repository ID (owner/repo), or mtp, the model's own MTP head"
         ) from None
 
 
@@ -335,7 +342,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--draft-model",
         type=parse_draft_model,
-        help="override the automatically selected DFlash2 repository or local directory",
+        help="the DFlash2 draft's repository or local directory, in place of the "
+        "family's released one (required for a family without one)",
     )
     parser.add_argument(
         "--language-only",

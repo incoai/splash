@@ -44,6 +44,11 @@ struct ModelMemoryFootprint final {
   // The prefill FFN's Neural Engine split (ops::AneFfn::plannedBytes); zero
   // without one.
   uint64_t aneFfnBytes = 0;
+  // A streamed table's host memory, its row cache above all
+  // (SparseRowStore::committedBytes): not Metal memory, but the engine's for
+  // as long as it runs, so the plan and the governor charge it like the
+  // weights it stands in for. Zero without one.
+  uint64_t streamedTableBytes = 0;
 };
 
 struct ModelMemoryProfile final {
@@ -131,6 +136,7 @@ struct EngineMemoryBreakdown {
   uint64_t runtimeOverheadReserveBytes = 0;
   uint64_t aneFfnBytes = 0;
   uint64_t stateStagingBytes = 0;
+  uint64_t streamedTableBytes = 0;
   uint64_t fixedRuntimeBytes = 0;
 
   // All lanes' state, cached composite states, and KV extents grow from this

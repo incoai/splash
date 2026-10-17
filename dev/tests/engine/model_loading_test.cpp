@@ -455,24 +455,26 @@ template <class Layout = Qwen3_8Layout> Layout syntheticTarget() {
     else
         target.intermediateSize = 256;
     target.fullAttentionPeriod = 4;
-    target.hiddenCaptureLayers.fill(target.layers - 1);
     return target;
 }
 
+// The draft's hidden size and vocabulary are its target's.
 template <class Layout> DFlashDraftLayout syntheticDraft(const Layout &target) {
     DFlashDraftLayout draft;
     draft.layers = 2;
-    draft.hiddenSize = 256;
-    draft.vocabularySize = 256;
+    draft.hiddenSize = target.hiddenSize;
+    draft.vocabularySize = target.vocabularySize;
     draft.dynamicSize = 256;
     draft.qkvSize = 512;
     draft.attentionSize = 256;
     draft.intermediateSize = 256;
     draft.attentionHeadDimension = 64;
     draft.rotaryTheta = 10'000'000.0F;
-    draft.targetHiddenSize = target.capturedHiddenSize();
     draft.selectorRank = 256;
     draft.kvHeads = 2;
+    // It reads a GDN layer and the attention layer.
+    draft.targetLayers = {1, 3};
+    draft.targetLayerCount = 2;
     return draft;
 }
 

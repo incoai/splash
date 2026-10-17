@@ -44,7 +44,8 @@ enum class ModuleNames : uint8_t { Mlx, Transformers };
 // The layers' images, then the head's and the embedding's. The checkpoint
 // outlives them: their rows read its tensors.
 [[nodiscard]] std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint,
-                                                  const QwenTargetDimensions &geometry);
+                                                  const QwenTargetDimensions &geometry,
+                                                  gguf::PlanOptions options = {});
 
 // The modules the images read only quantized, in their order and by `names`:
 // the layers' projections, the routed experts' (as a configuration names

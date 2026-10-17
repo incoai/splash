@@ -76,6 +76,10 @@ int main() {
     rejects("truncated tensor", truncated, pastEnd);
     const gguf::Tensor block{"weight", {256, 1}, kQ4_K, gguf::Bytes(kQ4KBlockBytes)};
     rejects("duplicate name", gguf::file({}, {block, block}), "duplicate GGUF tensor: weight");
+    // The first part of a split GGUF read alone, whose split.count names the
+    // others.
+    rejects("lone split part", gguf::file({gguf::uint32Key("split.count", 3)}, {block}),
+            "the GGUF's split.count does not match its 1 file");
     // Whatever the types of the two values, and for an array too.
     rejects("duplicate key",
             gguf::file({gguf::uint32Key("fixture.block_count", 2), gguf::stringKey("fixture.block_count", "2")}, {}),

@@ -12,10 +12,20 @@
 // case prints a digest of its output: two builds that fill the same pages must
 // print the same digests, whatever their storage.
 //
-// usage: attention-sweep METALLIB [--histories 0,2048,...] [--shapes 27b,35b]
+// usage: attention-sweep METALLIB [--histories 0,2048,...] [--shapes 27b,35b,fn]
 //                        [--lanes 1,4] [--repeat N] [--phases both|verify|prefill]
 //                        [--compare-metallib PATH] [--kv-format int8|bf16]
-//                        [--extent-pages N]
+//                        [--extent-pages N] [--qsa shared|independent|pages]
+//
+// fn is Qwen3.8-Flash-Next's GQA-12 attention, whose rows attend past 512
+// complete blocks of four tokens only to the 512 blocks their QSA bitmap
+// names and their own (kernels/shared/qwen4_qsa.metal); its tiles attend the
+// union of their rows' blocks, which the graph lists from the bitmaps first
+// (ops::PagedAttention::addBlockLists). --qsa makes such bitmaps: blocks
+// scattered alike for every row (shared), independently per row
+// (independent), or whole pages alike for every row (pages). The selection is
+// synthetic; the real indexer's lies somewhere between these. Without --qsa
+// the fn tiles attend every block.
 //
 // The comparison library loads into a MetalBackend of its own, which needs
 // residency_kick (kernels/shared/residency.metal) in every library it loads:
@@ -29,6 +39,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <iomanip>
@@ -39,6 +50,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -56,12 +68,69 @@ constexpr uint32_t kPrefillRows = SPLASH_PREFILL_TOKEN_BUDGET;
 
 // The swept attention layer is the second of the extents' two.
 constexpr uint32_t kLayer = 1;
-// The memory plan's extents of the full models: 16 and 10 attention layers.
-constexpr uint32_t kModelLayers27b = 16, kModelLayers35b = 10;
+// The memory plan's extents of the full models: 16, 10 and 12 attention
+// layers.
+constexpr uint32_t kModelLayers27b = 16, kModelLayers35b = 10, kModelLayersFn = 12;
+// Qwen3.8-Flash-Next's QSA: the indexer's top_k of 2048 tokens in blocks of 4.
+constexpr uint32_t kQsaTopBlocks = 512, kQsaBlockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
 
 AttentionShape shapeOf(const std::string &shape, kv::Format format) {
+  if (shape == "fn") return AttentionShape{24, 2, 256, format, true};
   return shape == "27b" ? AttentionShape{24, 4, 256, format}
                         : AttentionShape{16, 2, 256, format};
+}
+
+uint32_t modelLayers(const std::string &shape) {
+  return shape == "27b" ? kModelLayers27b : shape == "35b" ? kModelLayers35b : kModelLayersFn;
+}
+
+std::string modelName(const std::string &shape) {
+  return shape == "27b" ? "qwen3.8-27b" : shape == "35b" ? "qwen3.6-35b-a3b" : "qwen3.8-flash-next";
+}
+
+// A 32-bit mix of a block (and a row), uniform enough to scatter selections.
+uint32_t mix(uint32_t value) {
+  value ^= value >> 16;
+  value *= 0x7feb352dU;
+  value ^= value >> 15;
+  value *= 0x846ca68bU;
+  return value ^ (value >> 16);
+}
+
+// The QSA bitmaps of a case's rows, words per row: lane l's verify rows from
+// row 8 l, a prefill chunk's from row 0. A row with at most kQsaTopBlocks
+// complete blocks attends causally; past that to the kQsaTopBlocks of them
+// whose mix under `pattern` is least, and to its own block.
+std::vector<uint32_t> qsaBitmaps(const AttentionFixturePlan &plan, const std::string &pattern,
+                                 uint32_t &words) {
+  uint32_t visible = 0;
+  for (uint32_t lane = 0; lane < plan.lanes; ++lane)
+    visible = std::max(visible, plan.histories[lane] + plan.rows);
+  words = visible / kQsaBlockTokens / 32 + 2;
+  std::vector<uint32_t> bits(uint64_t{plan.lanes} * plan.rows * words, 0u);
+  std::vector<std::pair<uint32_t, uint32_t>> keyed;
+  for (uint32_t lane = 0; lane < plan.lanes; ++lane)
+    for (uint32_t row = 0; row < plan.rows; ++row) {
+      uint32_t *out = bits.data() + (uint64_t{lane} * plan.rows + row) * words;
+      const auto take = [&](uint32_t block) { out[block / 32] |= 1u << (block % 32); };
+      const uint32_t complete = (plan.histories[lane] + row + 1) / kQsaBlockTokens;
+      take(complete);
+      if (complete <= kQsaTopBlocks) {
+        for (uint32_t block = 0; block < complete; ++block) take(block);
+        continue;
+      }
+      // Pages: whole pages alike for every row; shared: blocks alike for
+      // every row; independent: blocks of each row's own.
+      keyed.clear();
+      for (uint32_t block = 0; block < complete; ++block)
+        keyed.emplace_back(pattern == "pages"         ? mix(block / 8)
+                           : pattern == "independent" ? mix(block ^ mix(row + lane * 65536))
+                                                      : mix(block),
+                           block);
+      std::nth_element(keyed.begin(), keyed.begin() + kQsaTopBlocks, keyed.end());
+      for (uint32_t index = 0; index < kQsaTopBlocks; ++index) take(keyed[index].second);
+    }
+  return bits;
 }
 
 // The prefill chunk on one lane, or the verify rows of `lanes` lanes, all
@@ -82,22 +151,59 @@ AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes
                                     histories, scratch, {kLayer + 1, kLayer, extentPages});
 }
 
-// The store and attention graph the runtime encodes for a case.
-metal::CommandGraph caseGraph(const AttentionFixture &fixture, bool prefill) {
+// A case's QSA bitmaps (qsaBitmaps) and the block lists its tiles attend
+// through: one per verify lane, or per prefill tile.
+struct QsaBlocks final {
+  metal::MetalBuffer bitmaps;
+  uint32_t words = 0;
+  AttentionBlocks blocks;
+};
+
+QsaBlocks qsaBlocks(metal::MetalBackend &backend, const AttentionFixturePlan &plan, bool prefill,
+                    const std::vector<uint32_t> &bitmaps, uint32_t words) {
+  QsaBlocks result;
+  if (!words) return result;
+  const uint32_t lists = prefill ? kv::prefillAttentionTiles(plan.rows) : plan.lanes;
+  const uint32_t stride = kVerifyRows * (kQsaTopBlocks + 1);
+  result.bitmaps = backend.allocateBuffer(bitmaps.size() * sizeof(uint32_t),
+                                          metal::BufferStorage::Shared, "attention-sweep-qsa");
+  std::memcpy(result.bitmaps.contents(), bitmaps.data(), bitmaps.size() * sizeof(uint32_t));
+  result.words = words;
+  result.blocks = {backend.allocateBuffer(uint64_t{lists} * stride * sizeof(uint32_t),
+                                          metal::BufferStorage::Private, "attention-sweep-lists"),
+                   backend.allocateBuffer(uint64_t{lists} * sizeof(uint32_t),
+                                          metal::BufferStorage::Private, "attention-sweep-counts"),
+                   stride, 0};
+  return result;
+}
+
+// The store and attention graph the runtime encodes for a case, after its
+// block lists when it has QSA bitmaps.
+metal::CommandGraph caseGraph(const AttentionFixture &fixture, bool prefill, const QsaBlocks &qsa) {
   const AttentionFixturePlan &plan = fixture.plan();
   metal::CommandGraph graph;
+  if (qsa.words) {
+    std::vector<BlockListRows> sequences;
+    for (uint32_t lane = 0; lane < plan.lanes; ++lane)
+      sequences.push_back({lane * plan.rows, plan.rows, plan.histories[lane], lane});
+    PagedAttention::addBlockLists(graph, qsa.bitmaps, qsa.words, sequences,
+                                  prefill ? kv::kPrefillAttentionTileRows : kVerifyRows, qsa.blocks);
+  }
   if (prefill)
-    fixture.addGraph(graph, PagedAttention::prefillPlan(plan.rows, plan.shape.queryHeads,
-                                                        plan.layout()));
+    fixture.addGraph(graph,
+                     PagedAttention::prefillPlan(plan.rows, plan.shape.queryHeads, plan.layout()),
+                     qsa.blocks);
   else
-    fixture.addGraph(graph, PagedAttention::verifyPlan(
-                                plan.lanes, plan.shape.queryHeads, plan.layout(),
-                                std::span(plan.histories).first(plan.lanes)));
+    fixture.addGraph(graph,
+                     PagedAttention::verifyPlan(plan.lanes, plan.shape.queryHeads, plan.layout(),
+                                                std::span(plan.histories).first(plan.lanes)),
+                     qsa.blocks);
   return graph;
 }
 
 // Both cache payloads of every lane's history and rows, including scales
-// only for INT8.
+// only for INT8: what the page loop reads, of which a sparse selection reads
+// its blocks only.
 uint64_t historyBytes(const AttentionFixturePlan &plan) {
   uint64_t tokens = 0;
   for (uint32_t lane = 0; lane < plan.lanes; ++lane)
@@ -134,15 +240,20 @@ double median(std::vector<double> values) {
 // a run also brings an idle GPU up to its clocks.
 std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
                           const AttentionFixturePlan &plan, bool prefill, uint32_t repeat,
-                          double warmupSeconds) {
+                          double warmupSeconds, const std::string &qsa) {
   std::vector<std::unique_ptr<AttentionFixture>> fixtures;
+  std::vector<QsaBlocks> blocks;
   std::vector<metal::CommandGraph> graphs;
   std::vector<Case> results(backends.size());
+  uint32_t words = 0;
+  const std::vector<uint32_t> bitmaps =
+      qsa.empty() ? std::vector<uint32_t>{} : qsaBitmaps(plan, qsa, words);
   for (size_t i = 0; i < backends.size(); ++i) {
     fixtures.push_back(
         std::make_unique<AttentionFixture>(*backends[i], plan, "attention-sweep-fixture"));
     fixtures.back()->fill();
-    graphs.push_back(caseGraph(*fixtures.back(), prefill));
+    blocks.push_back(qsaBlocks(*backends[i], plan, prefill, bitmaps, words));
+    graphs.push_back(caseGraph(*fixtures.back(), prefill, blocks.back()));
     results[i].kvBytes = historyBytes(plan);
   }
   // Warm every variant, then alternate order to limit clock/thermal drift.
@@ -212,8 +323,10 @@ std::string hex(uint64_t value) {
 }
 
 std::string json(const Case &item, const std::string &shape, uint32_t history,
-                 const std::string &kind, uint32_t lanes, size_t variant) {
-  std::string out = "{\"variant\":" + std::to_string(variant) + ",\"shape\":\"" + shape + "\",\"history\":" + std::to_string(history) +
+                 const std::string &kind, uint32_t lanes, size_t variant,
+                 const std::string &qsa) {
+  std::string out = "{\"variant\":" + std::to_string(variant) + ",\"shape\":\"" + shape + "\",\"qsa\":\"" + qsa +
+                    "\",\"history\":" + std::to_string(history) +
                     ",\"kind\":\"" + kind + "\",\"lanes\":" + std::to_string(lanes) +
                     ",\"fused_ms\":" + std::to_string(item.fusedMilliseconds) +
                     ",\"kv_bytes\":" + std::to_string(item.kvBytes) +
@@ -231,20 +344,21 @@ std::string json(const Case &item, const std::string &shape, uint32_t history,
 int main(int argc, const char *argv[]) {
   try {
     if (argc < 2) {
-      std::cerr << "usage: attention-sweep METALLIB [--histories LIST] [--shapes 27b,35b] "
+      std::cerr << "usage: attention-sweep METALLIB [--histories LIST] [--shapes 27b,35b,fn] "
                    "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] "
                    "[--compare-metallib PATH] [--kv-format int8|bf16] "
-                   "[--extent-pages N]\n";
+                   "[--extent-pages N] [--qsa shared|independent|pages]\n";
       return 64;
     }
     std::vector<uint32_t> histories{0, 2048, 8192, 16384, 32768, 65536, 131072};
     std::vector<uint32_t> lanes{1, 4};
     std::vector<std::string> shapes{"27b", "35b"};
     uint32_t repeat = 5;
-    // Zero: the largest extent the memory plan picks for the model.
+    // Zero: the largest extent the memory plan picks for the model's K/V
+    // pages (Flash-Next's without its index regions, which no case reads).
     uint32_t extentPages = 0;
     kv::Format format = kv::Format::Int8;
-    std::string comparisonLibrary, phases = "both";
+    std::string comparisonLibrary, phases = "both", qsa;
     for (int index = 2; index < argc; index += 2) {
       const std::string option(argv[index]);
       if (index + 1 >= argc)
@@ -265,6 +379,11 @@ int main(int argc, const char *argv[]) {
         format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
       }
       else if (option == "--compare-metallib") comparisonLibrary = argv[index + 1];
+      else if (option == "--qsa") {
+        qsa = argv[index + 1];
+        if (qsa != "shared" && qsa != "independent" && qsa != "pages")
+          throw std::invalid_argument("--qsa takes shared, independent or pages");
+      }
       else if (option == "--phases") {
         phases = argv[index + 1];
         if (phases != "both" && phases != "verify" && phases != "prefill")
@@ -278,14 +397,16 @@ int main(int argc, const char *argv[]) {
           const size_t comma = text.find(',', start);
           const std::string shape =
               text.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-          if (shape != "27b" && shape != "35b")
-            throw std::invalid_argument("--shapes takes 27b or 35b");
+          if (shape != "27b" && shape != "35b" && shape != "fn")
+            throw std::invalid_argument("--shapes takes 27b, 35b or fn");
           shapes.push_back(shape);
           if (comma == std::string::npos) break;
           start = comma + 1;
         }
       } else throw std::invalid_argument("unknown option " + option);
     }
+    if (!qsa.empty() && std::ranges::find(shapes, std::string("fn")) == shapes.end())
+      throw std::invalid_argument("--qsa needs --shapes with fn");
     for (const std::string &shape : shapes) {
       const AttentionShape geometry = shapeOf(shape, format);
       if (extentPages % kv::Layout{1, geometry.kvHeads, geometry.headDimension, format}
@@ -308,24 +429,28 @@ int main(int argc, const char *argv[]) {
     bool firstCase = true;
     for (const std::string &shape : shapes) {
       const AttentionShape geometry = shapeOf(shape, format);
-      const std::string name = shape == "27b" ? "qwen3.8-27b" : "qwen3.6-35b-a3b";
+      const std::string name = modelName(shape);
       const uint32_t shapeExtentPages =
           extentPages ? extentPages
-                      : kv::Layout{shape == "27b" ? kModelLayers27b : kModelLayers35b,
-                                   geometry.kvHeads, geometry.headDimension, format}
+                      : kv::Layout{modelLayers(shape), geometry.kvHeads,
+                                   geometry.headDimension, format}
                             .maximumExtentPages();
+      // Only the GQA-12 kernels attend sparsely.
+      const std::string shapeQsa = shape == "fn" ? qsa : std::string();
       std::cerr << "\n" << name << "  (" << geometry.queryHeads << " query heads, "
                 << geometry.kvHeads << " KV heads, d=" << geometry.headDimension
-                << ", extents of " << shapeExtentPages << " pages)\n";
+                << ", extents of " << shapeExtentPages << " pages"
+                << (shapeQsa.empty() ? "" : ", QSA " + shapeQsa) << ")\n";
       for (uint32_t history : histories) {
         auto report = [&](bool prefill, uint32_t lane) {
           const auto cases =
               measure(backends, casePlan(geometry, prefill, lane, history, shapeExtentPages),
-                      prefill, repeat, warmupSeconds);
+                      prefill, repeat, warmupSeconds, shapeQsa);
           warmupSeconds = 0.1;
           for (size_t i = 0; i < cases.size(); ++i) {
             std::cout << (firstCase ? "" : ",")
-                      << json(cases[i], name, history, prefill ? "prefill" : "verify", lane, i);
+                      << json(cases[i], name, history, prefill ? "prefill" : "verify", lane, i,
+                              shapeQsa);
             firstCase = false;
             std::cerr << history << " " << (prefill ? "prefill" : "verify")
                       << " lanes=" << lane << " variant=" << i << " fused="

@@ -85,6 +85,82 @@ const char *writesGatedName(DiskWritesGate gate) noexcept {
   return "unknown";
 }
 
+// What the streamed stores count by, in the order of their uses
+// (model::SparseRowUse, and ops::MoePhase for model::ExpertStoreStats::uses).
+constexpr std::string_view kStreamedUses[] = {"prefill", "decode"};
+static_assert(std::size(kStreamedUses) == model::kSparseRowUses);
+
+// A latency histogram (model::LatencyStats) in milliseconds, as ttft_ms is:
+// its quantiles, maximum and total, and its samples.
+void appendLatency(std::ostringstream &out, const model::LatencyStats &latency) {
+  out << "{\"p50\":" << latency.p50Milliseconds << ",\"p95\":" << latency.p95Milliseconds
+      << ",\"p99\":" << latency.p99Milliseconds << ",\"max\":" << latency.maximumMilliseconds
+      << ",\"total\":" << latency.totalMilliseconds << ",\"samples\":" << latency.count << '}';
+}
+
+// A streamed table's store (--ple-ssd-cache), or null: its memory, its cache,
+// per use (prefill, decode) its stages, rows and stage latencies, its reads
+// and prefetches, and whether a failure poisoned it.
+void appendStreamedTable(std::ostringstream &out, const std::optional<model::SparseRowStats> &table) {
+  if (!table) {
+    out << "null";
+    return;
+  }
+  out << "{\"table\":" << json::quote(table->table) << ",\"table_bytes\":" << table->tableBytes
+      << ",\"cache_bytes\":" << table->cacheBytes << ",\"cache_capacity_rows\":" << table->cacheCapacityRows
+      << ",\"cached_rows\":" << table->cachedRows << ",\"evictions\":" << table->evictions;
+  for (uint32_t use = 0; use < model::kSparseRowUses; ++use) {
+    const model::SparseRowStats::Use &counters = table->uses[use];
+    out << ",\"" << kStreamedUses[use] << "\":{\"stages\":" << counters.stages
+        << ",\"requested_rows\":" << counters.requestedRows << ",\"unique_rows\":" << counters.uniqueRows
+        << ",\"hit_rows\":" << counters.hitRows << ",\"read_rows\":" << counters.readRows
+        << ",\"hit_rate\":"
+        << (counters.uniqueRows ? double(counters.hitRows) / double(counters.uniqueRows) : 0.0)
+        << ",\"stage_ms\":";
+    appendLatency(out, counters.stage);
+    out << '}';
+  }
+  out << ",\"read_bytes\":" << table->readBytes << ",\"read_retries\":" << table->readRetries
+      << ",\"read_errors\":" << table->readErrors << ",\"read_ms\":";
+  appendLatency(out, table->read);
+  out << ",\"prefetch_requested_rows\":" << table->prefetchRequestedRows
+      << ",\"prefetch_read_rows\":" << table->prefetchReadRows
+      << ",\"prefetch_dropped_rows\":" << table->prefetchDroppedRows
+      << ",\"poisoned\":" << boolean(table->poisoned) << ",\"failure\":" << json::quote(table->failure) << '}';
+}
+
+// Streamed routed experts' store (--expert-memory), or null: its arena and
+// slots, of them those prefill loads borrow to stage in (borrowed_slots), the
+// experts resident in them, per use (prefill, decode) its loads: the
+// distinct experts they routed, those not resident (read) and of them those
+// read ahead (prefetched), the experts read ahead whole, the bytes read from
+// the sources and their host steps' round trips (pickup, work, resume); and
+// why a load failed, which fails every later load.
+void appendStreamedExperts(std::ostringstream &out, const std::optional<model::ExpertStoreStats> &experts) {
+  if (!experts) {
+    out << "null";
+    return;
+  }
+  out << "{\"arena_bytes\":" << experts->arenaBytes << ",\"slots\":" << experts->slots
+      << ",\"borrowed_slots\":" << experts->borrowed << ",\"experts\":" << experts->experts
+      << ",\"resident\":" << experts->resident;
+  for (size_t use = 0; use < std::size(kStreamedUses); ++use) {
+    const model::ExpertStoreStats::Use &counters = experts->uses[use];
+    out << ",\"" << kStreamedUses[use] << "\":{\"loads\":" << counters.loads << ",\"routed\":" << counters.routed
+        << ",\"read\":" << counters.read << ",\"prefetched\":" << counters.prefetched
+        << ",\"read_ahead\":" << counters.readAhead << ",\"hit_rate\":"
+        << (counters.routed ? double(counters.routed - counters.read) / double(counters.routed) : 0.0)
+        << ",\"read_bytes\":" << counters.readBytes << ",\"host_steps\":{\"pickup_ms\":";
+    appendLatency(out, counters.pickup);
+    out << ",\"work_ms\":";
+    appendLatency(out, counters.work);
+    out << ",\"resume_ms\":";
+    appendLatency(out, counters.resume);
+    out << "}}";
+  }
+  out << ",\"failure\":" << json::quote(experts->failure) << '}';
+}
+
 } // namespace
 
 std::string runtimeStatusJson(
@@ -96,7 +172,9 @@ std::string runtimeStatusJson(
     const MemoryGovernorSnapshot &memoryGovernor, bool metalHealthy,
     std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait,
     const NativeLoopTiming &loop, const WeightsSnapshot &weights,
-    const AneFfnSnapshot &aneFfn, ThermalState thermalState) {
+    const AneFfnSnapshot &aneFfn, ThermalState thermalState,
+    const std::optional<model::SparseRowStats> &streamedTable,
+    const std::optional<model::ExpertStoreStats> &streamedExperts) {
   const auto &resources = core.resources;
   const auto &scheduler = core.scheduler;
   const auto &pool = resources.pool;
@@ -142,7 +220,8 @@ std::string runtimeStatusJson(
       << "\"loaded_model_layout_sha256\":"
       << json::quote(cacheIdentity.modelLayoutSha256)
       << ",\"build_id\":" << json::quote(cacheIdentity.buildId)
-      << ",\"dtype\":" << json::quote(kv::storageFormatName(kvFormat))
+      << ",\"dtype\":"
+      << json::quote(kv::storageFormatName(kvFormat, cacheIdentity.kvLayout.valuesTokenMajor))
       << ",\"block_tokens\":" << kv::kPageTokens
       << "},\"kv\":{\"target_model_sha256\":"
       << json::quote(cacheIdentity.targetModelSha256)
@@ -151,7 +230,8 @@ std::string runtimeStatusJson(
       << json::quote(kvFormat == kv::Format::Int8 ? "symmetric_int8" : "none")
       << ",\"scale_type\":" << json::quote(kvFormat == kv::Format::Int8 ? "float32" : "none")
       << ",\"key_layout\":\"token_major\""
-      << ",\"value_layout\":\"dimension_major\"}},"
+      << ",\"value_layout\":"
+      << json::quote(cacheIdentity.kvLayout.valuesTokenMajor ? "token_major" : "dimension_major") << "}},"
       << "\"memory_plan\":" << plan.toStatusJson()
       << ",\"memory_actual\":{\"allocated_bytes\":" << metalMemory.allocatedBytes
       << ",\"current_bytes\":" << currentBytes
@@ -173,6 +253,10 @@ std::string runtimeStatusJson(
       << ",\"memory_audit\":" << memoryAudit.toStatusJson()
       << ",\"weights\":";
   appendWeights(out, weights);
+  out << ",\"streamed_table\":";
+  appendStreamedTable(out, streamedTable);
+  out << ",\"streamed_experts\":";
+  appendStreamedExperts(out, streamedExperts);
   out << ",\"ane_ffn\":";
   appendAneFfn(out, aneFfn, executorTelemetry.aneFfnReruns);
   out << ",\"kv\":{\"block_tokens\":" << kv::kPageTokens

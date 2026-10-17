@@ -1,0 +1,13 @@
+{
+  "ranking_sha256": "7f771e0d32a7491222e82b02247a72e9bfdec8f2d4b6c223ed68cee1352579e3",
+  "ranking_source": "saved out-rank2.npy; top 32768 exactly matches the original bitmap",
+  "procedure": "dev/tools/draft_vocabulary.py rank; ascending top K bitmap",
+  "input_revisions": "not recorded by original ranking; no new provenance claim",
+  "selected_tokens": [
+    32768,
+    65536
+  ],
+  "source_sha256": "e5121132c25350e15ad3a5bb450e3bb79631d37a3e895b9ed45fb1c20b67bc5a",
+  "exact_expansion_invocation": "python dev/tools/expand_draft_vocabulary.py",
+  "note": "The 49152-token set of the same ranking was dropped from the checked-in source; the ranking (out-rank2.npy) is kept outside the repository."
+}
