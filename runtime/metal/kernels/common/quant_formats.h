@@ -70,11 +70,19 @@ struct QuantCoef {
 constant constexpr uint kQuantPairTableEntries = 256;
 // Fills the threadgroup table of format F's value pairs, as half2 (staged tiles) or bfloat2 (register tiles), entry
 // b = (F::value(b & 15), F::value(b >> 4)) for the index byte b of a pair, when F is a codebook format; called by all
-// threads of the threadgroup.
+// threads of the threadgroup. quant_pair_entries writes the entries alone and returns whether F has a table, for a
+// threadgroup that fills several tables before one barrier.
+template <class F, class T>
+inline bool quant_pair_entries(threadgroup T *table, uint thread_index, uint threads) {
+  if constexpr (F::Kind == QuantCodebook)
+    for (uint i = thread_index; i < kQuantPairTableEntries; i += threads)
+      table[i] = T(float2(F::value(i & 15), F::value(i >> 4)));
+  return F::Kind == QuantCodebook;
+}
 template <class F, class T>
 inline void quant_pair_table(threadgroup T *table, uint thread_index, uint threads) {
   if constexpr (F::Kind == QuantCodebook) {
-    for (uint i = thread_index; i < kQuantPairTableEntries; i += threads) table[i] = T(float2(F::value(i & 15), F::value(i >> 4)));
+    quant_pair_entries<F>(table, thread_index, threads);
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 }

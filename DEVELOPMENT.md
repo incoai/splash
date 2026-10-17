@@ -1881,8 +1881,9 @@ MoE layers, so one F16 routed or shared expert tensor in any layer stages every 
 there. Their
 passes launch the live tiles alone: the grouping kernel writes each pass's grid with the tile
 count, and the pass reads it as an indirect dispatch (`ComputeDispatch::indirectThreadgroups`).
-The staged tile runs gate and up in one pass where they share their routed and their shared
-formats, a gate and an up simdgroup on the same columns, bitwise the two passes' intermediate.
+The staged tile runs gate and up in one pass, a gate and an up simdgroup on the same columns,
+bitwise the two passes' intermediate; the simdgroups share one pair table where gate and up share
+their routed and their shared formats.
 The float router and alpha/beta projections run in `kernels/shared/gguf_float.metal`, and the
 token rows are gathered by one template in `kernels/shared/embedding.metal`. These plans are
 fixed rules of GPU family, core count, shape and format.

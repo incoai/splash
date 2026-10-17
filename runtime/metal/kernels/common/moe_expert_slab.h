@@ -42,14 +42,22 @@ struct MoeGgufSegment {
   uint format;
 };
 
+inline MoeGgufSegment moe_gguf_segment(uint expert, uint experts, uint input_size, uint output_size,
+                                       uint routed_format, uint shared_format,
+                                       device uchar *w0, device uchar *w1, device uchar *meta,
+                                       device uchar *shared_w0, device uchar *shared_w1,
+                                       device uchar *shared_meta) {
+  if (expert == experts)
+    return {shared_w0, shared_w1, shared_meta, shared_format};
+  constant QuantFormat &f = kQuantFormats[routed_format];
+  const ulong rows = ulong(expert) * output_size, groups = input_size / 32;
+  return {w0 + rows * groups * f.plane0_bytes, w1 + rows * groups * f.plane1_bytes,
+          meta + rows * (groups / f.meta_groups) * f.meta_bytes, routed_format};
+}
 inline MoeGgufSegment moe_gguf_segment(uint expert, constant MoeGgufExpertParams &p,
                                        device uchar *w0, device uchar *w1, device uchar *meta,
                                        device uchar *shared_w0, device uchar *shared_w1,
                                        device uchar *shared_meta) {
-  if (expert == p.experts)
-    return {shared_w0, shared_w1, shared_meta, p.shared_format};
-  constant QuantFormat &f = kQuantFormats[p.routed_format];
-  const ulong rows = ulong(expert) * p.output_size, groups = p.input_size / 32;
-  return {w0 + rows * groups * f.plane0_bytes, w1 + rows * groups * f.plane1_bytes,
-          meta + rows * (groups / f.meta_groups) * f.meta_bytes, p.routed_format};
+  return moe_gguf_segment(expert, p.experts, p.input_size, p.output_size, p.routed_format, p.shared_format,
+                          w0, w1, meta, shared_w0, shared_w1, shared_meta);
 }
