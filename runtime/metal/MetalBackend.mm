@@ -224,10 +224,12 @@ struct MetalAllocation {
     // What the buffer adds to the accounting: its allocated size, or zero
     // while released.
     uint64_t bytes = 0;
-    // The length, storage and label a restored buffer is allocated with.
+    // The length, storage and label a restored buffer is allocated with, and
+    // how kernels reach it.
     uint64_t length = 0;
     BufferStorage storage = BufferStorage::Shared;
     __strong NSString *label = nil;
+    BufferReach reach = BufferReach::Bound;
     // The owner of wrapped memory (MetalBackend::wrapSharedMemory), which is
     // never released: our views keep it as well as Metal's deallocator.
     std::shared_ptr<void> owner;
@@ -240,7 +242,7 @@ struct MetalAllocation {
     void attach(id<MTLBuffer> allocated) {
         buffer = allocated;
         bytes = allocated.allocatedSize;
-        if (auto kept = residency.lock()) kept->add(buffer);
+        if (auto kept = residency.lock()) kept->add(buffer, reach);
         raisePeak(accounting->peakAllocatedBytes,
                   accounting->allocatedBytes.fetch_add(
                       bytes, std::memory_order_relaxed) + bytes);
@@ -248,7 +250,7 @@ struct MetalAllocation {
     // Lets the buffer go: it leaves the residency set and the accounting.
     void detach() noexcept {
         if (!buffer) return;
-        if (auto kept = residency.lock()) kept->remove(buffer);
+        if (auto kept = residency.lock()) kept->remove(buffer, reach);
         accounting->allocatedBytes.fetch_sub(bytes, std::memory_order_relaxed);
         buffer = nil;
         bytes = 0;
@@ -814,8 +816,8 @@ struct MetalBackend::Impl {
         // Metal may autorelease the command and its encoder, and the serving
         // loop's pool never drains, so their temporary ownership ends with
         // this submission (under the validation layer an autoreleased
-        // command holds every member of the residency set). The command
-        // retains everything the GPU still needs.
+        // command holds every member of its queue's residency set). The
+        // command retains everything the GPU still needs.
         @autoreleasepool {
             id<MTLCommandBuffer> command = [queue commandBuffer];
             if (!command) {
@@ -1028,7 +1030,9 @@ void *MetalBuffer::contents() const noexcept {
            impl_->offsetBytes;
 }
 
-uint64_t MetalBuffer::gpuAddress() const noexcept {
+uint64_t MetalBuffer::gpuAddress() const {
+    if (impl_ && impl_->allocation->reach != BufferReach::Addressed)
+        throw MetalBackendError("only a Metal buffer allocated BufferReach::Addressed has a GPU address");
     if (!impl_ || !impl_->allocation->buffer) return 0;
     return impl_->allocation->buffer.gpuAddress + impl_->offsetBytes;
 }
@@ -1185,16 +1189,20 @@ void MetalBackend::setWaitInterrupt(std::function<bool()> shuttingDown) {
 
 MetalBuffer MetalBackend::allocateBuffer(uint64_t bytes,
                                          BufferStorage storage,
-                                         std::string_view label) {
+                                         std::string_view label,
+                                         BufferReach reach) {
     checkOperation();
     if (!bytes) throw MetalBackendError("Metal buffer size must be positive");
     if (bytes > impl_->capabilities.maxBufferLengthBytes) {
         throw MetalBackendError("Metal buffer exceeds maxBufferLength");
     }
+    if (reach == BufferReach::Addressed && storage != BufferStorage::Shared)
+        throw MetalBackendError("only a Shared Metal buffer is reached by its address");
     auto allocation = std::make_shared<MetalAllocation>();
     allocation->accounting = impl_->accounting;
     allocation->length = bytes;
     allocation->storage = storage;
+    allocation->reach = reach;
     if (!label.empty()) allocation->label = checkedNSString(label, "buffer label");
     allocation->residency = impl_->residency;
     allocation->attach(impl_->newBuffer(bytes, storage, allocation->label));

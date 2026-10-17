@@ -706,8 +706,9 @@ void leadingInputs(MetalBackend &backend, const Linear &linear) {
 
 // ---------------------------------------------------------------- split visibility
 // Two projections of a decode step run back to back and share one split scratch, as every GGUF projection of a step
-// does, at each pair of K splits the tile's policy (Apple9: register, Apple10: staged) picks for 8-80 cores. The
-// partials are overwritten before each projection, with a large finite value and in another run with NaN, so a
+// does, at each pair of K splits the tile's policy (Apple9: register, Apple10: staged) picks for 8-80 cores where it
+// plans the tile for both (Apple10 registers the 5120-column grids at one lane from 54 cores). The partials are
+// overwritten before each projection, with a large finite value and in another run with NaN, so a
 // partial read before its writer published it changes the output. Every output must lie within fp64, as the
 // unsplit outputs must, and not depend on the poison or the run; every counter must return to zero.
 struct SplitOperand {
@@ -745,8 +746,7 @@ void splitVisibility(MetalBackend &backend, const Linear &linear, LinearTile til
     const Linear policy(device);
     const LinearConfig a = policy.plan(workloads[0], weights[0][0]).configuration();
     const LinearConfig b = policy.plan(workloads[1], weights[1][0]).configuration();
-    if (a.tile != tile || b.tile != tile) fail("GPU family " + std::to_string(family) + " plans another tile");
-    if (std::max(a.splits, b.splits) > 1) splitPairs.insert({a.splits, b.splits});
+    if (a.tile == tile && b.tile == tile && std::max(a.splits, b.splits) > 1) splitPairs.insert({a.splits, b.splits});
   }
   const auto matrix = [](LinearMatrix m) { return std::to_string(m.outputSize) + "x" + std::to_string(m.inputSize); };
   const std::string shape = std::string(tileName(tile)) + " " + std::to_string(lanes) + " lanes, " +
