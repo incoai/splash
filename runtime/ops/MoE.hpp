@@ -22,14 +22,21 @@ struct MoeShape final {
   // The format of most routed expert weights, which picks the expert tile on
   // Apple9 (moeGgufTile).
   uint32_t expertFormat = GGUF_FMT_COUNT;
-  // Whether every routed and shared expert weight is in a format the
-  // register tile takes (quant_register_format).
+  // Whether the register tile takes every routed and shared expert weight
+  // (quant_register_tensor).
   bool registerFormats = true;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return hiddenSize && hiddenSize % 256 == 0 && experts && experts <= SPLASH_MOE_EXPERT_SLOTS &&
+    // Experts the routing kernels' slots hold, of an intermediate width
+    // that fills 64-column tiles.
+    return hiddenSize && hiddenSize % 256 == 0 && experts && experts <= SPLASH_MOE_WIDE_EXPERT_SLOTS &&
            expertsPerToken && expertsPerToken <= experts &&
-           expertIntermediateSize && expertIntermediateSize % 256 == 0;
+           expertIntermediateSize && expertIntermediateSize % 64 == 0;
+  }
+  // The router's scores per row: the expert slots of the select and group
+  // kernels that route the block (metal/abi/MoE.h), one thread each.
+  [[nodiscard]] constexpr uint32_t routerWidth() const noexcept {
+    return experts > SPLASH_MOE_EXPERT_SLOTS ? SPLASH_MOE_WIDE_EXPERT_SLOTS : SPLASH_MOE_EXPERT_SLOTS;
   }
   // Routed experts followed by the shared expert.
   [[nodiscard]] constexpr uint32_t routesPerToken() const noexcept {
@@ -39,9 +46,9 @@ struct MoeShape final {
 };
 
 // A GGUF expert projection: every routed expert in one segment of experts *
-// N rows, expert e's planes from tile e * N / 256 on (moe_gguf_segment in
-// kernels/common/moe_expert_slab.h), and the shared expert's segment, whose
-// format may differ.
+// N rows, expert e's planes from tile e * N / QUANT_TILE_ROWS on
+// (moe_gguf_segment in kernels/common/moe_expert_slab.h), and the shared
+// expert's segment, whose format may differ.
 struct BlockExpertProjection final {
   QuantizedSegment routed;
   QuantizedSegment shared;
@@ -141,8 +148,8 @@ inline constexpr auto kMoeWorkspaceFields = [] {
 enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 
 // The expert tile of GGUF plans, which run grouped passes (gate, up with
-// silu(gate), down; the staged tile runs gate and up in one pass where they
-// share their formats) over the GGUF image: the half-staged tiles of
+// silu(gate), down; the staged tile runs gate and up in one pass) over the
+// GGUF image: the half-staged tiles of
 // kernels/shared/moe_gguf.metal, or Register, the exact register tile of
 // kernels/decode/linear_gguf_sgmatrix.metal over Table16 tiles of the
 // grouped rows (8-row tiles only). Apple9 runs Register in both phases but
@@ -195,6 +202,7 @@ class MoePlan final {
 public:
   [[nodiscard]] MoeShape shape() const noexcept { return shape_; }
   [[nodiscard]] uint32_t rows() const noexcept { return rows_; }
+  [[nodiscard]] MoePhase phase() const noexcept { return phase_; }
   [[nodiscard]] MoeConfig configuration() const noexcept { return config_; }
   [[nodiscard]] uint32_t tileRows() const noexcept {
     return static_cast<uint32_t>(config_.expertTile);
@@ -220,6 +228,7 @@ private:
 
   MoeShape shape_;
   uint32_t rows_;
+  MoePhase phase_;
   MoeConfig config_;
   uint32_t maximumTiles_;
   MoeWorkspace workspace_;

@@ -9,9 +9,12 @@
 
 // The expert slots of the routing kernels (ops::MoE): a row's router scores
 // take this many floats, the block's experts first, and the select and
-// grouping kernels run one thread per slot, so a MoE block routes at most
-// this many experts.
+// grouping kernels run one thread per slot. A MoE block of at most
+// SPLASH_MOE_EXPERT_SLOTS experts routes on their instances of that many
+// slots, one of more on their wide instances (_e512), so a block routes at
+// most SPLASH_MOE_WIDE_EXPERT_SLOTS experts.
 #define SPLASH_MOE_EXPERT_SLOTS 256u
+#define SPLASH_MOE_WIDE_EXPERT_SLOTS 512u
 
 struct MoeRouteParams {
   uint32_t rows;
@@ -96,6 +99,23 @@ struct MoeGgufExpertParams {
 
 static_assert(sizeof(MoeGgufExpertParams) == 24,
               "MoE GGUF expert parameters are 24 bytes on both sides");
+
+// The gate and up passes in one (moe_expert_gguf_m<rows>_gate_up[_mixed]): their
+// sizes, expert count and in_place, as MoeGgufExpertParams holds them, and
+// each pass's routed and shared formats.
+struct MoeGgufGateUpParams {
+  uint32_t input_size;
+  uint32_t output_size; // per expert
+  uint32_t experts;
+  uint32_t gate_routed_format;
+  uint32_t gate_shared_format;
+  uint32_t up_routed_format;
+  uint32_t up_shared_format;
+  uint32_t in_place;
+};
+
+static_assert(sizeof(MoeGgufGateUpParams) == 32,
+              "MoE GGUF gate/up parameters are 32 bytes on both sides");
 
 struct MoeCombineParams {
   uint32_t rows;

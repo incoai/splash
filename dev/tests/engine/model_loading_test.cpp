@@ -431,7 +431,7 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
 }
 
 // The small layouts the synthetic models load: a target and its draft of
-// every projection in whole 256-row tiles of a multiple of 256 inputs, as
+// every projection in whole plane tiles of a multiple of 256 inputs, as
 // block images hold them, and a vision tower. A MoE target keeps its family's
 // 256 experts, 8 per token.
 template <class Layout = Qwen3_8Layout> Layout syntheticTarget() {

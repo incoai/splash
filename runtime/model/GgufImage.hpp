@@ -17,6 +17,11 @@
 
 namespace splash::model::gguf {
 
+// `rows` rows and the zero rows that pad them to whole plane tiles.
+[[nodiscard]] constexpr uint64_t tiledRows(uint64_t rows) noexcept {
+  return (rows + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS * QUANT_TILE_ROWS;
+}
+
 // The general.architecture of a GGUF of a target with this FFN.
 [[nodiscard]] constexpr const char *architecture(QwenFfnKind ffn) noexcept {
   return ffn == QwenFfnKind::SparseMoe ? "qwen35moe" : "qwen35";
@@ -93,15 +98,16 @@ struct Fill {
 };
 // How a copy writes each value: as stored, narrowed from F32 to the bf16
 // value it equals exactly (rows the kernels read as bf16), widened from BF16
-// to the F32 value it equals (rows the kernels read as F32), as the F32 decay
-// -exp(A_log) of a safetensors GDN's A_log, BF16 or F32, which
+// or F16 to the F32 value it equals (rows the kernels read as F32), as the F32
+// decay -exp(A_log) of a safetensors GDN's A_log, BF16 or F32, which
 // float(-exp(double)) rounds once, as the F32 values of a quantized tensor's
 // native rows, which the GPU decodes as the format's gather does
 // (kernels/common/gguf_embedding_formats.h) and the kernels read unquantized
 // (a safetensors MoE router and shared-expert gate, GDN alpha and beta of two
-// types or of BF16 or F16), or as the F32 1 + w of a BF16 RMSNorm
-// weight w, which transformers stores 1 below the weight the norm multiplies
-// by (exact but where |w| < 2^-16 or |w| >= 2^24, which it may round once).
+// types or of F16, and a GGUF's Q8_0 shared-expert scalar gate), or as the F32
+// 1 + w of a BF16 RMSNorm weight w, which transformers stores 1 below the
+// weight the norm multiplies by (exact but where |w| < 2^-16 or |w| >= 2^24,
+// which it may round once).
 enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32, Decay, DequantizeToFloat32, CenteredNorm };
 // Rows written back to back, each value converted as `conversion` says.
 struct Copy {

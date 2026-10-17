@@ -35,7 +35,7 @@ template <class F> struct Shape {
     // Linear codes past 127 (MLX affine 8-bit), which enter the MMA as the code itself: no bf16 128 + code holds them
     Wide = QuantWideCodes<F>::value,
     // Linear codes chained from the table's seed of their 16 inputs: s (code - zero) with a zero point (Q6_K, Q3_K,
-    // Q4_0, Q5_0, IQ1, PQ2_0), and Q2_K's min per 16 inputs
+    // Q4_0, Q5_0, IQ1, PQ2_0, Q2_0), and Q2_K's min per 16 inputs
     Seeded = Linear && (!HasMin || F::Group == 16),
     // bf16 bits of the operand of code 0: 128, or 160 - zero when seeded
     Operand = 0x4300 + (Seeded ? kZeroPointOffset - 128 - F::Zero : 0),
@@ -46,7 +46,8 @@ template <class F> struct Shape {
     J = 2 * UnitSpans * CG,                                   // coefficients per column and unit
   };
   // Each coefficient reads its own group's meta unit (coefficient_source), so a unit of two or four groups (MLX
-  // affine's 64 or 128 elements, PQ2_0's 128) splits a coefficient unit of four spans.
+  // affine's 64 or 128 elements, PQ2_0's 128, Q2_0's 64) splits a coefficient unit of four spans: such a format takes
+  // rows of whole 256 inputs here (quant_register_tensor).
   static_assert(F::MetaGroups == 8 || F::MetaGroups == 4 || F::MetaGroups == 2 || F::MetaGroups == 1,
                 "a meta unit is one, two, four or eight groups");
   static_assert(!Wide || (HasMin && !Seeded), "wide codes have a min per 32 inputs");
