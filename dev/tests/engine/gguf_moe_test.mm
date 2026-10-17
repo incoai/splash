@@ -407,7 +407,8 @@ std::vector<ComputeDispatch> fullGridsTwoPasses(const CommandGraph &graph, const
       continue;
     }
     // Input, tiles, tile count, gate's and up's routed and shared planes,
-    // output; a pass binds one projection's planes, its output and the gate.
+    // output, slot table; a pass binds one projection's planes, its output,
+    // the gate and the slot table.
     for (const bool up : {false, true}) {
       ComputeDispatch pass = dispatch;
       pass.pipelineName = dispatch.pipelineName.substr(0, merged) + (up ? "_g" : "_a");
@@ -416,13 +417,14 @@ std::vector<ComputeDispatch> fullGridsTwoPasses(const CommandGraph &graph, const
         pass.buffers.push_back({3 + plane, dispatch.buffers[(up ? 9 : 3) + plane].buffer});
       pass.buffers.push_back({9, up ? dispatch.buffers[15].buffer : scratch.expertOutput});
       pass.buffers.push_back({10, scratch.expertOutput});
+      pass.buffers.push_back({11, dispatch.buffers[16].buffer});
       // The pass's own parameters: the passes' sizes and this pass's formats.
       MoeGgufGateUpParams both;
       std::memcpy(&both, dispatch.bytes[0].data, sizeof(both));
       const MoeGgufExpertParams &params = passes.emplace_back(MoeGgufExpertParams{
           both.input_size, both.output_size, both.experts, up ? both.up_routed_format : both.gate_routed_format,
           up ? both.up_shared_format : both.gate_shared_format});
-      pass.bytes[0] = {11, &params, sizeof(params)};
+      pass.bytes[0] = {12, &params, sizeof(params)};
       pass.threadgroups.x = dispatch.threadgroups.x * GGUF_STAGED_COLUMNS / GGUF_TILE_COLUMNS;
       dispatches.push_back(std::move(pass));
     }

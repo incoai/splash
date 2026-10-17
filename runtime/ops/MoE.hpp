@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <span>
 
 namespace splash::ops {
 
@@ -45,25 +46,59 @@ struct MoeShape final {
   bool operator==(const MoeShape &) const = default;
 };
 
-// A GGUF expert projection: every routed expert in one segment of experts *
-// N rows, expert e's planes from tile e * N / QUANT_TILE_ROWS on
-// (moe_gguf_segment in kernels/common/moe_expert_slab.h), and the shared
-// expert's segment, whose format may differ.
+// A GGUF expert projection: the routed experts in one segment of slots * N
+// rows, routed expert e's planes from tile slot(e) * N / QUANT_TILE_ROWS on
+// (moe_gguf_segment in kernels/common/moe_expert_slab.h, slot(e) from the
+// block's slot table), and the shared expert's segment, whose format may
+// differ.
 struct BlockExpertProjection final {
   QuantizedSegment routed;
   QuantizedSegment shared;
 };
 
+struct MoeScratch;
+struct MoeBuffers;
+class MoePlan;
+class MoeExpertStream;
+enum class MoePhase : uint8_t { Prefill, Decode };
+
 // The weights of one sparse MoE block, which the loaded model owns. The
 // router and the shared expert's scalar gate are float tensors (llama.cpp
 // keeps a GGUF's unquantized; an MLX target's load as their F32 values), and
-// they run in fp32.
+// they run in fp32. The routed segments hold `slots` experts, routed expert e
+// in slot slotTable[e] (one uint32 per expert): every expert and the identity
+// table when they are all resident, or an expert store's slots and the
+// block's table there when they stream (`stream`, the block's index in it
+// `streamBlock`).
 struct BlockMoeWeights final {
   QuantizedSegment router;           // [experts][hidden]
   QuantizedSegment sharedScalarGate; // [1][hidden]
   BlockExpertProjection gate;
   BlockExpertProjection up;
   BlockExpertProjection down;
+  metal::MetalBuffer slotTable;
+  uint32_t slots = 0;
+  const MoeExpertStream *stream = nullptr;
+  uint32_t streamBlock = 0;
+};
+
+// One MoE step of a block a load serves: its plan, and its buffers once the
+// grouping wrote their tiles (MoeScratch::tileDescriptors and tileCount).
+struct MoeLoadPart final {
+  const MoeBuffers *buffers = nullptr;
+  const MoePlan *plan = nullptr;
+};
+
+// Routed experts that stream into the slots of a store, which owns the
+// blocks' slot tables. addLoad adds, after the grouping of block `block`'s
+// steps `parts` (all of one phase) and before their expert passes, what
+// makes the experts their tiles name resident and the block's table name
+// their slots; it may read a step's input (MoeBuffers::input). Several
+// steps' parts load the union of their experts at once.
+class MoeExpertStream {
+public:
+  virtual ~MoeExpertStream() = default;
+  virtual void addLoad(metal::CommandGraph &graph, std::span<const MoeLoadPart> parts, uint32_t block) const = 0;
 };
 
 // Grouped-row scratch. Routes are sorted by expert into tiles of tileRows
@@ -183,8 +218,6 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
              : MoeExpertTile::M32;
 }
 
-enum class MoePhase : uint8_t { Prefill, Decode };
-
 // The device's policy for a MoE plan, which the execution plans derive.
 struct MoeConfig final {
   // M8 for decode plans; a prefill plan takes moeGgufPrefillTile's.
@@ -235,8 +268,26 @@ struct MoeBuffers final {
 struct MoE final {
   [[nodiscard]] static MoePlan prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config);
   [[nodiscard]] static MoePlan decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config);
+  // A step's routing (addRouting: the router, the selection and the
+  // grouping into tiles), the load of its streamed experts, and its routed
+  // work (addRouted: the gather, the expert passes and the combine). Steps
+  // that share a load run their routings, one load of the union, then their
+  // routed work, each in its own scratch.
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                   const BlockMoeWeights &weights, const MoePlan &plan);
+  static void addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                         const BlockMoeWeights &weights, const MoePlan &plan);
+  static void addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                        const BlockMoeWeights &weights, const MoePlan &plan);
+  // The routing of `rows` rows of `input` by a block's `router` and
+  // `sharedScalarGate`: the router's fp32 scores in `scores` (rows of
+  // shape.routerWidth()), then each row's top-k experts and the shared
+  // expert with their routing weights in `selected` and `routingWeights`
+  // (shape.routesPerToken() per row).
+  static void addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input, const QuantizedSegment &router,
+                        const QuantizedSegment &sharedScalarGate, const metal::MetalBuffer &scores,
+                        const metal::MetalBuffer &selected, const metal::MetalBuffer &routingWeights, uint32_t rows,
+                        MoeShape shape, FloatTile routerTile);
 };
 
 } // namespace splash::ops

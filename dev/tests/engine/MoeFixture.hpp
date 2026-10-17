@@ -6,6 +6,7 @@
 
 #include "GgufFormatReference.hpp"
 #include "metal/MetalBackend.hpp"
+#include "model/ExpertStore.hpp"
 #include "ops/MoE.hpp"
 
 #include <algorithm>
@@ -100,8 +101,8 @@ inline splash::metal::MetalBuffer bfloatBuffer(splash::metal::MetalBackend &back
 }
 
 // A block of `shape`: its router, shared expert scalar gate, routed experts'
-// and shared expert's gate, up and down, their weights, and the formats of
-// the six projections.
+// and shared expert's gate, up and down, their weights with expert e in slot
+// e, and the formats of the six projections.
 struct Model {
   splash::ops::MoeShape shape;
   Tensor router, sharedGate;
@@ -168,6 +169,8 @@ inline Model makeModel(splash::metal::MetalBackend &backend, const splash::ops::
   gguf.gate = {m.routed[0].segment, m.shared[0].segment};
   gguf.up = {m.routed[1].segment, m.shared[1].segment};
   gguf.down = {m.routed[2].segment, m.shared[2].segment};
+  gguf.slotTable = splash::model::residentExpertSlots(backend, shape.experts);
+  gguf.slots = shape.experts;
   m.weights = gguf;
   return m;
 }

@@ -93,9 +93,10 @@ struct MoeGatherParams {
 static_assert(sizeof(MoeGatherParams) == 12,
               "MoE gather parameters are 12 bytes on both sides");
 
-// A GGUF expert pass (ops/MoE.cpp): every routed expert of the projection
-// is one image segment of experts * output_size rows, expert e's planes
-// starting at tile e * output_size / QUANT_TILE_ROWS; the shared expert (id `experts`)
+// A GGUF expert pass (ops/MoE.cpp): the routed experts of the projection are
+// one segment of slots * output_size rows, routed expert e's planes starting
+// at tile slots[e] * output_size / QUANT_TILE_ROWS of it, where slots is the
+// block's slot table (ops::BlockMoeWeights); the shared expert (id `experts`)
 // has a segment of its own. Formats are GGUF_FMT_* (metal/abi/QuantFormat.h).
 struct MoeGgufExpertParams {
   uint32_t input_size;

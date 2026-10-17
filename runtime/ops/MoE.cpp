@@ -33,10 +33,12 @@ void validate(const BlockMoeWeights &weights, MoeShape shape) {
   if (weights.sharedScalarGate.formatId != QuantizedSegment::kFloat32)
     throw std::invalid_argument("the MoE shared scalar gate is not F32");
   requireBytes(weights.sharedScalarGate.plane0, uint64_t{hidden} * sizeof(float), "MoE shared scalar gate weight");
+  if (!weights.slots) throw std::invalid_argument("MoE routed experts have no slots");
+  requireBytes(weights.slotTable, uint64_t{shape.experts} * sizeof(uint32_t), "MoE slot table");
   for (const auto &[projection, name, output, input] :
        {std::tuple{&weights.gate, "gate", intermediate, hidden}, std::tuple{&weights.up, "up", intermediate, hidden},
         std::tuple{&weights.down, "down", hidden, intermediate}}) {
-    requireSegment(projection->routed, shape.experts * output, input, false, std::string("MoE expert ") + name);
+    requireSegment(projection->routed, weights.slots * output, input, false, std::string("MoE expert ") + name);
     requireSegment(projection->shared, output, input, false, std::string("MoE shared ") + name);
   }
 }
@@ -113,7 +115,7 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
                      projection.routed.plane0, projection.routed.plane1Slot(),
                      projection.routed.meta, projection.shared.plane0,
                      projection.shared.plane1Slot(), projection.shared.meta, output,
-                     scratch.expertOutput});
+                     scratch.expertOutput, weights.slotTable});
     graph.add(kernel + (up ? "_g" : "_a"), std::move(bindings), params(projection, n, k), {columns, tiles, 1}, grid,
               {threads, 1, 1});
   };
@@ -129,7 +131,7 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
                gate.shared.plane0, gate.shared.plane1Slot(), gate.shared.meta,
                up.routed.plane0, up.routed.plane1Slot(), up.routed.meta,
                up.shared.plane0, up.shared.plane1Slot(), up.shared.meta,
-               scratch.expertIntermediate},
+               scratch.expertIntermediate, weights.slotTable},
               MoeGgufGateUpParams{hidden, intermediate, shape.experts, gate.routed.formatId, gate.shared.formatId,
                                   up.routed.formatId, up.shared.formatId},
               {group.gate_up_columns, tiles, 1}, gateUpGrid, {threads, 1, 1});
@@ -164,13 +166,36 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
   maximumTiles_ = moeMaximumTiles(rows, shape, tileRows());
 }
 
+namespace {
+
+// A step's grouping into tiles, which its expert passes read: the gate and up
+// passes' column tiles of a staged GGUF plan that runs them in one pass are
+// its staged columns.
+MoeGroupParams groupParams(const MoePlan &plan) {
+  const MoeShape shape = plan.shape();
+  const bool oneGateUp = oneGateUpPass(plan);
+  return {plan.rows(), shape.expertsPerToken, plan.tileRows(), shape.experts,
+          shape.expertIntermediateSize / (oneGateUp ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS),
+          shape.hiddenSize / GGUF_TILE_COLUMNS};
+}
+
+} // namespace
+
 void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
               const BlockMoeWeights &weights, const MoePlan &plan) {
+  addRouting(graph, buffers, weights, plan);
+  if (weights.stream) {
+    const MoeLoadPart part{&buffers, &plan};
+    weights.stream->addLoad(graph, {&part, 1}, weights.streamBlock);
+  }
+  addRouted(graph, buffers, weights, plan);
+}
+
+void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                     const BlockMoeWeights &weights, const MoePlan &plan) {
   const MoeShape shape = plan.shape();
   const uint32_t rows = plan.rows();
-  const uint32_t tileRows = plan.tileRows();
   validate(weights, shape);
-  const uint32_t tiles = plan.maximumTiles();
   const MoeWorkspace &required = plan.workspace();
   const uint64_t hiddenRows = uint64_t{rows} * shape.hiddenSize * sizeof(uint16_t);
   requireBytes(buffers.input, hiddenRows, "MoE input");
@@ -179,30 +204,26 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
   const MoeScratch &scratch = buffers.scratch;
   for (const MoeScratchField &field : kMoeScratchFields)
     requireBytes(scratch.*field.buffer, required.*field.bytes, field.name);
-  const MoeRouteParams routeParams{rows, shape.hiddenSize, shape.experts,
-                                   shape.expertsPerToken};
-  // fp32 scores of the F32 router in rows of routerWidth() expert slots, as
-  // the select kernel of that width reads.
-  addGgufFloat(graph, buffers.input, weights.router, scratch.groupedInput, rows,
-               shape.routerWidth(), 0, FloatOutput::Float32, plan.configuration().ggufRouterTile);
-  graph.add(routingKernel("moe_route_select_f32", shape),
-            {scratch.groupedInput, buffers.input,
-             weights.sharedScalarGate.plane0, scratch.selectedExperts,
-             scratch.routingWeights},
-            routeParams, {rows, 1, 1}, {shape.routerWidth(), 1, 1});
+  addRoutes(graph, buffers.input, weights.router, weights.sharedScalarGate, scratch.groupedInput,
+            scratch.selectedExperts, scratch.routingWeights, rows, shape, plan.configuration().ggufRouterTile);
   // The expert passes launch the live tiles alone, on grids the grouping
   // writes with the tile count. Over every tile a step could fill, a 35B
   // decode step of one lane launched 65 tiles' threadgroups for a median of
   // 30 live ones; the rest return at once yet cost a 40-core M5 Max 0.8-4.1%
   // of a decode cycle, a 12-core M6 0.1-1.0% and a 40-core M3 Max up to 4.8%.
-  const bool oneGateUp = oneGateUpPass(plan);
-  const MoeGroupParams group{rows, shape.expertsPerToken, tileRows, shape.experts,
-                             shape.expertIntermediateSize / (oneGateUp ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS),
-                             shape.hiddenSize / GGUF_TILE_COLUMNS};
   graph.add(routingKernel("moe_group_routes", shape),
             {scratch.selectedExperts, scratch.tileDescriptors,
              scratch.tileCount, scratch.groupedRoutes, scratch.routeRows},
-            group, {1, 1, 1}, {shape.routerWidth(), 1, 1});
+            groupParams(plan), {1, 1, 1}, {shape.routerWidth(), 1, 1});
+}
+
+void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
+                    const BlockMoeWeights &weights, const MoePlan &plan) {
+  const MoeShape shape = plan.shape();
+  const uint32_t rows = plan.rows();
+  const uint32_t tileRows = plan.tileRows();
+  const uint32_t tiles = plan.maximumTiles();
+  const MoeScratch &scratch = buffers.scratch;
   const MoeGatherParams gather{tileRows, shape.hiddenSize, shape.routesPerToken()};
   if (plan.configuration().ggufTile == MoeGgufTile::Register)
     graph.add("moe_gather_table16",
@@ -214,12 +235,26 @@ void MoE::add(metal::CommandGraph &graph, const MoeBuffers &buffers,
               {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
                scratch.tileCount, scratch.groupedInput},
               gather, {tiles, shape.hiddenSize / 256, 1});
-  addExperts(graph, scratch, weights, plan, group);
+  addExperts(graph, scratch, weights, plan, groupParams(plan));
   graph.add("moe_combine",
             {scratch.expertOutput, scratch.routeRows, scratch.routingWeights,
              buffers.residual, buffers.output},
             MoeCombineParams{rows, shape.hiddenSize, shape.routesPerToken()},
             {rows, shape.hiddenSize / 256, 1});
+}
+
+void MoE::addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input, const QuantizedSegment &router,
+                    const QuantizedSegment &sharedScalarGate, const metal::MetalBuffer &scores,
+                    const metal::MetalBuffer &selected, const metal::MetalBuffer &routingWeights, uint32_t rows,
+                    MoeShape shape, FloatTile routerTile) {
+  // fp32 scores of the F32 router in rows of routerWidth() expert slots, as
+  // the select kernel of that width reads.
+  const uint32_t width = shape.routerWidth();
+  addGgufFloat(graph, input, router, scores, rows, width, 0, FloatOutput::Float32, routerTile);
+  graph.add(routingKernel("moe_route_select_f32", shape),
+            {scores, input, sharedScalarGate.plane0, selected, routingWeights},
+            MoeRouteParams{rows, shape.hiddenSize, shape.experts, shape.expertsPerToken}, {rows, 1, 1},
+            {width, 1, 1});
 }
 
 MoePlan MoE::prefillPlan(MoeShape shape, uint32_t rows, MoeConfig config) {

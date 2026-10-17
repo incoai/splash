@@ -315,8 +315,16 @@ private:
   struct PrefillStep;
   struct VerifyStep;
 
+  // A prefill layer of a step (addPrefill): addPrefillLayer runs it through
+  // its FFN's routing, then, after the layer's load of streamed experts,
+  // addPrefillExperts its routed work.
+  template <class Layout, class Layer>
+  void addPrefillLayer(PrefillStep &step, const QwenTargetWeights<Layout, Layer> &weights, uint32_t index) const;
+  template <class Layout, class Layer>
+  void addPrefillExperts(PrefillStep &step, const QwenTargetWeights<Layout, Layer> &weights, uint32_t index) const;
   // A layer's parts in dispatch order: the mixer normalizes its input and
-  // returns the residual rows the FFN normalizes and adds to into `output`.
+  // returns the residual rows the FFN normalizes and adds to into `output`
+  // (a MoE's routing, whose routed work addPrefillExperts adds).
   void addPrefillNorm(PrefillStep &step, metal::MetalBuffer input, const ops::NormWeights &norm) const;
   void addPrefillOutput(PrefillStep &step, metal::MetalBuffer hidden, const ops::Projection &projection,
                         metal::MetalBuffer input, metal::MetalBuffer output) const;

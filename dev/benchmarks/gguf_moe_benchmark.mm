@@ -17,6 +17,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/MoE.h"
+#include "model/ExpertStore.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/MoE.hpp"
 
@@ -87,7 +88,8 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
   const BlockMoeWeights gguf{routerSegment, sharedGateSegment,
                              {planes(gateUpFormat, E * I, H), planes(sharedFormat, I, H)},
                              {planes(gateUpFormat, E * I, H), planes(sharedFormat, I, H)},
-                             {planes(downFormat, E * H, I), planes(sharedFormat, H, I)}};
+                             {planes(downFormat, E * H, I), planes(sharedFormat, H, I)},
+                             splash::model::residentExpertSlots(backend, E), E};
   // Rows whose expert e scores 4 x[e]: the first E inputs rank the experts, the row's routes at 1 - 0.05 rank and the
   // others below 0.05.
   const auto input = [&](uint32_t rows, Routing routing) {

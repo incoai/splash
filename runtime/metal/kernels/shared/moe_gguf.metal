@@ -18,14 +18,15 @@
 // simdgroup's columns over the live rows: routes spread over many experts leave most decode tiles at one or two rows,
 // where the staged tile's padded matmul steps bound it.
 template <ushort Rows, GgufEpilogue Ep>
-inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescriptor *tiles, device const uint *tile_count,
-                                 device uchar *w0, device uchar *w1, device uchar *meta, device uchar *sw0, device uchar *sw1,
-                                 device uchar *smeta, device bfloat *output, device bfloat *aux,
-                                 constant MoeGgufExpertParams &p, uint2 group, uint simd_lane, uint simd_group,
-                                 threadgroup half *stage, threadgroup half2 *tl) {
+inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescriptor *tiles,
+                                 device const uint *tile_count, device uchar *w0, device uchar *w1, device uchar *meta,
+                                 device uchar *sw0, device uchar *sw1, device uchar *smeta, device bfloat *output,
+                                 device bfloat *aux, device const uint *slots, constant MoeGgufExpertParams &p,
+                                 uint2 group, uint simd_lane, uint simd_group, threadgroup half *stage,
+                                 threadgroup half2 *tl) {
   if (group.y >= *tile_count) return;
   const MoeTileDescriptor tile = tiles[group.y];
-  const MoeGgufSegment s = moe_gguf_segment(tile.expert, p, w0, w1, meta, sw0, sw1, smeta);
+  const MoeGgufSegment s = moe_gguf_segment(tile.expert, p, slots, w0, w1, meta, sw0, sw1, smeta);
   device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
   const ulong out = ulong(group.y) * Rows * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
@@ -60,15 +61,17 @@ kernel void moe_expert_gguf(device bfloat *input [[buffer(0)]], device const Moe
                             device uchar *w1 [[buffer(4)]], device uchar *meta [[buffer(5)]], device uchar *sw0 [[buffer(6)]],
                             device uchar *sw1 [[buffer(7)]], device uchar *smeta [[buffer(8)]],
                             device bfloat *output [[buffer(9)]], device bfloat *aux [[buffer(10)]],
-                            constant MoeGgufExpertParams &p [[buffer(11)]], uint2 group [[threadgroup_position_in_grid]],
-                            uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) {
+                            device const uint *slots [[buffer(11)]], constant MoeGgufExpertParams &p [[buffer(12)]],
+                            uint2 group [[threadgroup_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
+                            uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup half stage[kStagedStages]; threadgroup half2 tl[kQuantPairTableEntries];
-  moe_gguf_expert_tile<Rows, Ep>(input, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, output, aux, p, group,
+  moe_gguf_expert_tile<Rows, Ep>(input, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, output, aux, slots, p, group,
                                  simd_lane, simd_group, stage, tl);
 }
 using MoeExpertGgufKernel = void(device bfloat *, device const MoeTileDescriptor *, device const uint *, device uchar *,
                                  device uchar *, device uchar *, device uchar *, device uchar *, device uchar *,
-                                 device bfloat *, device bfloat *, constant MoeGgufExpertParams &, uint2, uint, uint);
+                                 device bfloat *, device bfloat *, device const uint *, constant MoeGgufExpertParams &,
+                                 uint2, uint, uint);
 template [[host_name("moe_expert_gguf_m8_a")]] kernel MoeExpertGgufKernel moe_expert_gguf<8, EpNone>;
 template [[host_name("moe_expert_gguf_m8_g")]] kernel MoeExpertGgufKernel moe_expert_gguf<8, EpUpWithGate>;
 template [[host_name("moe_expert_gguf_m32_a")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpNone>;
@@ -99,17 +102,19 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
                                     device uchar *uw1 [[buffer(10)]], device uchar *umeta [[buffer(11)]],
                                     device uchar *usw0 [[buffer(12)]], device uchar *usw1 [[buffer(13)]],
                                     device uchar *usmeta [[buffer(14)]], device bfloat *output [[buffer(15)]],
-                                    constant MoeGgufGateUpParams &p [[buffer(16)]],
-                                    uint2 group [[threadgroup_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],
+                                    device const uint *slots [[buffer(16)]],
+                                    constant MoeGgufGateUpParams &p [[buffer(17)]],
+                                    uint2 group [[threadgroup_position_in_grid]],
+                                    uint simd_lane [[thread_index_in_simdgroup]],
                                     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup half stage[kStagedStages]; threadgroup half2 tl[Tables * kQuantPairTableEntries];
   if (group.y >= *tile_count) return;
   const MoeTileDescriptor tile = tiles[group.y];
   const bool up = simd_group == 1;
   const MoeGgufSegment gs = moe_gguf_segment(tile.expert, p.experts, p.input_size, p.output_size, p.gate_routed_format,
-                                             p.gate_shared_format, gw0, gw1, gmeta, gsw0, gsw1, gsmeta);
+                                             p.gate_shared_format, slots, gw0, gw1, gmeta, gsw0, gsw1, gsmeta);
   const MoeGgufSegment us = moe_gguf_segment(tile.expert, p.experts, p.input_size, p.output_size, p.up_routed_format,
-                                             p.up_shared_format, uw0, uw1, umeta, usw0, usw1, usmeta);
+                                             p.up_shared_format, slots, uw0, uw1, umeta, usw0, usw1, usmeta);
   const uint thread_index = simd_group * 32 + simd_lane;
   bool tables = false;
   quant_format_switch(gs.format, [&](auto f) {
@@ -166,8 +171,8 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
 using MoeExpertGgufGateUpKernel = void(device bfloat *, device const MoeTileDescriptor *, device const uint *,
                                        device uchar *, device uchar *, device uchar *, device uchar *, device uchar *,
                                        device uchar *, device uchar *, device uchar *, device uchar *, device uchar *,
-                                       device uchar *, device uchar *, device bfloat *, constant MoeGgufGateUpParams &,
-                                       uint2, uint, uint);
+                                       device uchar *, device uchar *, device bfloat *, device const uint *,
+                                       constant MoeGgufGateUpParams &, uint2, uint, uint);
 template [[host_name("moe_expert_gguf_m8_gate_up")]] kernel MoeExpertGgufGateUpKernel moe_expert_gguf_gate_up<8, 1>;
 template [[host_name("moe_expert_gguf_m32_gate_up")]] kernel MoeExpertGgufGateUpKernel moe_expert_gguf_gate_up<32, 1>;
 template [[host_name("moe_expert_gguf_m8_gate_up_mixed")]] kernel MoeExpertGgufGateUpKernel
