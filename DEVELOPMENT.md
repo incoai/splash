@@ -2164,6 +2164,37 @@ state (`--state-format bf16`), and with the split as a start makes it, which
 must not be unavailable, and whose automatic context must be what the plan
 holds with the split it runs.
 
+### Host steps
+
+A command can run CPU work between its GPU work. A host step
+(`metal::EventStep`, `CommandGraph::host`) runs once all the work before it
+has completed, on one thread of the backend's, and holds the work after it
+until it returns, through a shared event of its command's: it reads what the
+GPU wrote before it and writes Shared buffers the GPU reads after it, and it
+must not call the backend. A step after a failed command buffer is skipped,
+and one that throws fails its command with its message. A step's `then`, if
+any, runs on the same thread once the step let the work after it go: CPU work
+the GPU need not wait for, such as starting reads that would hold the GPU's
+start back if they began as the step ends. It does not run after work that
+threw, and must not throw: the command may have completed by then, so a
+`then` that throws marks the backend unhealthy. A step's work may run after
+its command's wait() threw (the watchdog or a shutdown gave the command up,
+or its encoding failed after its first buffers were committed), so the work
+owns what it touches.
+
+A step about as short as the GPU's wake-up can keep the GPU awake: one GPU
+thread spins through it until the CPU ends it, so the work after it starts at
+once and at full clocks. The spin sees the CPU end it only through a memory
+scope Metal's public headers leave out (`runtime/metal/kernels/host_step.metal`),
+so it builds apart from the metallib, into `build/host-step.metallib`, and a
+Metal compiler that refuses it only warns. Before the first command with such
+a step, the backend checks that the spin sees the CPU end it; without the
+library, or if it does not, the steps run without the spin, with a warning.
+A completed command reports each step's round trip (`HostStepTiming`) and the
+time its GPU work waited on its steps (`CommandTiming::hostSeconds`), which the
+scheduler counts as the command's fixed cost
+([Admission and eviction](#admission-and-eviction)).
+
 ### Residency and KV extents
 
 Every buffer the backend allocates belongs to one residency set
@@ -2352,7 +2383,10 @@ write budget when one is set, which drops them while it is spent, a suspended
 request's own too, and a full quota makes room for one by dropping the oldest
 copy, perhaps an older conversation's restore point.
 Contended prefill adapts toward a 500 ms slice, keeping
-2048-token chunks for long unopposed work. Without contention, a prompt that can
+2048-token chunks for long unopposed work. A command's estimated cost is a fixed
+part, the time its GPU work waited on host steps (`metal::EventStep`), and a
+part per row; the slice grows to twice the fixed part, so a command's rows take
+at least as long as its host steps. Without contention, a prompt that can
 finish within one 2048-token chunk ends its chunk at its last row instead of
 sharing it with a longer prompt. While requests of the same or a higher priority
 decode (a lane waiting for its token mask is owed nothing), each slice owes them

@@ -414,6 +414,10 @@ public:
   [[nodiscard]] virtual bool ready() const noexcept = 0;
   [[nodiscard]] virtual std::vector<ModelStepResult> wait() = 0;
   [[nodiscard]] virtual double wallMilliseconds() const noexcept = 0;
+  // Of wallMilliseconds, the time the command's GPU work waited on its host
+  // steps: a streamed target's expert reads, which a prefill command pays
+  // about whole whatever its rows.
+  [[nodiscard]] virtual double hostMilliseconds() const noexcept { return 0.0; }
   // Fixed auxiliary work remains in wall latency but must not train the
   // text-prefill throughput estimate.
   [[nodiscard]] virtual bool prefillTimingIsRepresentative() const noexcept {
@@ -562,6 +566,9 @@ struct WarmupStepResult final {
   double wallSeconds = 0.0;
   // Those two warmups return one observation per lane in batch-plan order.
   std::vector<WarmupLaneResult> lanes;
+  // For prefill warmup, of wallSeconds the time its GPU work waited on host
+  // steps (ModelBatchTicket::hostMilliseconds).
+  double hostSeconds = 0.0;
 };
 
 // What a reclaim step may release of the model's idle memory.

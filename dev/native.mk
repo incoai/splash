@@ -133,6 +133,10 @@ TEST_Q8_KERNEL_AIRS := $(patsubst runtime/metal/kernels/%.metal,$(ENGINE_TEST_BU
 # Every library a MetalBackend loads has the kernel that ends its residency;
 # the test libraries built without the production kernels link it in.
 TEST_RESIDENCY_AIR := $(ENGINE_TEST_BUILD)/kernels/shared/residency.air
+# The host-step library beside the test libraries (HOST_STEP_LIB), which
+# unlike the engine's must build: the Metal suite checks the spin.
+TEST_HOST_STEP_AIR := $(ENGINE_TEST_BUILD)/kernels/host_step.air
+TEST_HOST_STEP_LIB := $(ENGINE_TEST_BUILD)/host-step.metallib
 TEST_Q8_ATTENTION_LIB := $(ENGINE_TEST_BUILD)/q8-attention.metallib
 TEST_METAL_BACKEND_TEST := $(ENGINE_TEST_BUILD)/metal-backend
 TEST_HANDOFF_TEST := $(ENGINE_TEST_BUILD)/handoff
@@ -202,16 +206,16 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_VISION_ATTENTION_TEST) \
 	$(TEST_METAL_BACKEND_TEST) \
 	$(TEST_HANDOFF_TEST) \
-	$(LIB) $(TEST_METAL_BACKEND_LIB) $(TEST_PRODUCTION_LIB) $(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB) \
-	$(TEST_GGUF_DEQUANT_LIB)
+	$(LIB) $(HOST_STEP_LIB) $(TEST_METAL_BACKEND_LIB) $(TEST_PRODUCTION_LIB) $(TEST_HOST_STEP_LIB) \
+	$(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB) $(TEST_GGUF_DEQUANT_LIB)
 
 # Keep every output that uses a flag set together, including standalone
 # benchmarks, real-model tests and intermediate test AIRs/metallibs.
-TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))) \
+TEST_CONFIG_TARGETS := $(filter-out $(LIB) $(HOST_STEP_LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) \
 	$(TEST_DECODE_PROFILE) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
-	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) $(TEST_METAL_BACKEND_AIR) \
+	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) $(TEST_HOST_STEP_AIR) $(TEST_METAL_BACKEND_AIR) \
 	$(TEST_GGUF_DEQUANT_AIR)
 # Benchmarks and tools that build with the production flags.
 PRODUCTION_FLAG_TOOLS := $(TEST_BACKEND_BENCHMARK) $(WEIGHT_DIGESTS)
@@ -442,13 +446,14 @@ $(TEST_GGUF_DEQUANT_LIB): $(TEST_GGUF_DEQUANT_AIR) $(TEST_RESIDENCY_AIR)
 $(TEST_Q8_LIB): $(TEST_Q8_AIR) $(TEST_RESIDENCY_AIR)
 $(TEST_Q8_ATTENTION_LIB): $(TEST_Q8_KERNEL_AIRS)
 $(TEST_METAL_BACKEND_LIB): $(TEST_METAL_BACKEND_AIR) $(TEST_RESIDENCY_AIR)
+$(TEST_HOST_STEP_LIB): $(TEST_HOST_STEP_AIR)
 # The production kernels and the test kernels of metal_backend_test.metal in
 # one library, for the kernel tests that order a test copy between production
 # dispatches. It relinks whenever the production library does.
 $(TEST_PRODUCTION_LIB): $(PRODUCTION_AIRS) $(TEST_METAL_BACKEND_AIR) $(LIB)
 
 $(TEST_GGUF_DEQUANT_LIB) $(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB) $(TEST_METAL_BACKEND_LIB) \
-		$(TEST_PRODUCTION_LIB):
+		$(TEST_PRODUCTION_LIB) $(TEST_HOST_STEP_LIB):
 	$(RUN_CONFIGURED) $(METALLIB) $(filter %.air,$^) -o $@
 
 .PHONY: verify-build-identity

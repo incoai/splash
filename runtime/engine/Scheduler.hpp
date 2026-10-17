@@ -66,7 +66,10 @@ public:
   explicit Scheduler(double decodeShare) noexcept : decodeShare_(decodeShare) {}
 
   void submit(RequestSpec request);
-  void observePrefill(uint32_t rows, double wallMilliseconds);
+  // A prefill command of `rows` rows took wallMilliseconds, of which its GPU
+  // work waited hostMilliseconds on host steps: a fixed part (a streamed
+  // target's expert reads), the rest per row.
+  void observePrefill(uint32_t rows, double wallMilliseconds, double hostMilliseconds = 0.0);
   void deferAdmission(uint64_t requestId);
   void waitForResources(uint64_t requestId);
   void waitForPrefix(uint64_t requestId);
@@ -96,7 +99,8 @@ public:
   // passed over, so they lose nothing to it.
   void commit(const BatchPlan &plan, std::span<const uint64_t> excluded);
   void complete(const BatchPlan &plan, std::span<const StepResult> results,
-                double wallMilliseconds, bool representativePrefillTiming);
+                double wallMilliseconds, bool representativePrefillTiming,
+                double hostMilliseconds = 0.0);
 
   [[nodiscard]] Phase phase(uint64_t requestId) const;
   // Suspended by suspendForResources and not resumed since; a terminal
@@ -153,6 +157,8 @@ private:
   std::vector<uint64_t> excluded_;
   uint64_t order_ = 0;
   uint64_t decodeDispatchOrder_ = 0;
+  // A prefill command's estimated cost: fixed, plus per row.
+  double prefillFixedMilliseconds_ = 0.0;
   double prefillMillisecondsPerToken_ = 0.0;
   double decodeShare_;
   // Decode time that prefill still owes the lanes that decoded beside it

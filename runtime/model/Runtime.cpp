@@ -66,6 +66,7 @@ public:
     Completion completion = std::move(completion_);
     std::vector<ModelStepResult> results = completion(timing);
     wallMilliseconds_ = timing.wallSeconds * 1000.0;
+    hostMilliseconds_ = timing.hostSeconds * 1000.0;
     // Work the completion added takes wall time, but is no sample of the
     // command's rows.
     if (timing.wallSeconds != commandSeconds)
@@ -76,6 +77,7 @@ public:
   double wallMilliseconds() const noexcept override {
     return wallMilliseconds_;
   }
+  double hostMilliseconds() const noexcept override { return hostMilliseconds_; }
   bool prefillTimingIsRepresentative() const noexcept override {
     return representativePrefillTiming_;
   }
@@ -87,6 +89,7 @@ private:
   Completion completion_;
   CommandTicket ticket_;
   double wallMilliseconds_ = 0.0;
+  double hostMilliseconds_ = 0.0;
   bool representativePrefillTiming_;
 };
 
@@ -1121,7 +1124,7 @@ struct Runtime::Impl {
     CommandGraph graph;
     encodeInitialSelections(graph, std::span(selections).first(width), width);
     CommandTicket command =
-        backend.submitCommandAsync(graph.dispatches(), std::move(completion));
+        backend.submitCommandAsync(graph.command(), std::move(completion));
     auto finish = [this, selections, width](CommandTiming) {
       std::vector<ModelStepResult> results;
       results.reserve(width);
@@ -2090,7 +2093,7 @@ struct Runtime::Impl {
     };
 
     void submit(const CommandGraph &graph) {
-      command_ = impl_.backend.submitCommandAsync(graph.dispatches(), wake_);
+      command_ = impl_.backend.submitCommandAsync(graph.command(), wake_);
     }
 
     void addTiming(CommandTiming value) noexcept {
@@ -2396,6 +2399,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
       const CommandTiming rerun = impl->backend.submitCommandAsync(again.command()).wait();
       timing.gpuSeconds += rerun.gpuSeconds;
       timing.wallSeconds += rerun.wallSeconds;
+      timing.hostSeconds += rerun.hostSeconds;
       ++impl->counters.aneFfnReruns;
     }
     // A row that is not finite, of the chunk or of the state it computed
@@ -2650,7 +2654,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
     return impl->finalizeDecode(lanes, items, timing);
   };
   CommandTicket command = impl_->backend.submitCommandAsync(
-      commandGraph.dispatches(), std::move(completion));
+      commandGraph.command(), std::move(completion));
   return std::make_unique<DeferredMetalTicket>(std::move(command),
                                                std::move(finish));
 }
@@ -2803,7 +2807,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
   if (!rows || rows > kPrefillRows)
     throw std::invalid_argument("invalid prefill warmup row count");
   constexpr uint64_t id = std::numeric_limits<uint64_t>::max() - 100;
-  double wallSeconds = 0.0;
+  double wallSeconds = 0.0, hostSeconds = 0.0;
   std::vector<WarmupLaneResult> lanes;
   std::vector<uint32_t> warmupPrompt(rows, 0);
   ModelRequest request;
@@ -2821,8 +2825,10 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
     ModelBatchItem item = warmupItem(id, 0, rows, pages);
     item.inputTokens = request.prompt;
     const auto phaseStart = AwakeClock::now();
-    auto result = prefill(plan, std::span<const ModelBatchItem>(&item, 1));
+    const std::unique_ptr<ModelBatchTicket> ticket = prefillAsync(plan, std::span<const ModelBatchItem>(&item, 1), {});
+    auto result = ticket->wait();
     wallSeconds = std::chrono::duration<double>(AwakeClock::now() - phaseStart).count();
+    hostSeconds = ticket->hostMilliseconds() / 1000.0;
     requireLanesSucceeded(result);
     if (result.size() != 1 || result[0].consumedPromptTokens != rows) {
       throw std::runtime_error("prefill warmup result mismatch");
@@ -2836,7 +2842,7 @@ WarmupStepResult Runtime::warmupPrefill(uint32_t rows) {
   }
   return {"real " + std::to_string(rows) +
               "-row KV target+draft prefill [M32]",
-          wallSeconds, std::move(lanes)};
+          wallSeconds, std::move(lanes), hostSeconds};
 }
 
 WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
