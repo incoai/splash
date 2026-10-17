@@ -26,7 +26,18 @@ namespace splash::model {
 class QwenStateStorage;
 class VisionLoader;
 
+// The store a streamed table is read through (LoadedModel::streamedTable).
+class SparseRowStore;
+
 using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights>;
+
+// How a model loads beside its descriptor: with streamedTableBytes, the rows
+// of a table the target's GGUF holds (streamableTableBytes) stream from its
+// file through a row cache of that many bytes instead of loading into memory
+// (model/SparseRowStore.hpp). Other models load as without it.
+struct ModelLoadOptions final {
+  uint64_t streamedTableBytes = 0;
+};
 
 struct LoadedModel final {
   ModelDescriptor descriptor;
@@ -63,6 +74,10 @@ struct LoadedModel final {
       return weights.manifestFingerprintSha256;
     }, target);
   }
+  // The store a streamed table is read through, or null.
+  [[nodiscard]] SparseRowStore *streamedTable() const noexcept {
+    return std::visit([](const auto &weights) -> SparseRowStore * { return weights.streamedTable.get(); }, target);
+  }
   [[nodiscard]] std::span<const WeightFileRecord> targetFiles() const noexcept {
     return std::visit([](const auto &weights) ->
                           std::span<const WeightFileRecord> {
@@ -87,8 +102,14 @@ struct RuntimeContext final {
 // architectures. Each architecture validates its own tensor and state layout.
 void requireCompatibleModel(const LoadedModel &model);
 
-// The bytes of every image the model's weights load into.
-[[nodiscard]] uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor);
+// The bytes of the images loadModel writes, without a table that streams.
+[[nodiscard]] uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor,
+                                        const ModelLoadOptions &options = {});
+// The bytes of the rows of the table a target's GGUF holds, which stream from
+// it instead of loading with streamedTableBytes (gguf::PlanOptions::streamTable);
+// 0 for a target without one. Throws for a table that cannot stream
+// (gguf::tableRows).
+[[nodiscard]] uint64_t streamableTableBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor);
 
 // The vision role's source, planned; null for a model without vision.
 [[nodiscard]] std::unique_ptr<VisionLoader> planVisionLoader(const std::filesystem::path &root,
@@ -103,7 +124,8 @@ void requireCompatibleModel(const LoadedModel &model);
 [[nodiscard]] LoadedModel
 loadModel(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
-                 const ModelDescriptor &descriptor);
+                 const ModelDescriptor &descriptor,
+                 const ModelLoadOptions &options = {});
 
 // The FFN layers of a dense target, which the prefill FFN's Neural Engine
 // split (ops::AneFfn) may take; none for another target.

@@ -1,9 +1,13 @@
 // The GGUF image planner on the small dense and MoE targets and a rotated
 // dense one: where each tensor goes and in which row order, which F32 tensors
-// it narrows to bf16, and the sources it refuses.
+// it narrows to bf16, where a streamed table's rows are, and the sources it
+// refuses.
 //   gguf-planner
 #include "GgufFixtures.hpp"
 #include "metal/abi/Gguf.h"
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <optional>
 
@@ -431,6 +435,57 @@ void checkRotation(const std::filesystem::path &directory) {
   }
 }
 
+// The rows of a table that streams (gguf::tableRows), such as Flash-Next's
+// PLE table: where the file holds them, as its image copies them; refused for
+// a type its image does not copy as stored and for another width.
+void checkPleTableRows(const std::filesystem::path &directory) {
+  // Rows of 160 values, as Qwen3.8-Flash-Next's PLE table's.
+  const uint32_t columns = 160;
+  std::mt19937 rng(7);
+  const auto planned = [&](uint32_t type, uint64_t tableColumns, uint64_t rows, uint64_t rowBytes,
+                           std::optional<model::gguf::StreamedRows> &out, test_gguf::Bytes &table) {
+    table.resize(rows * rowBytes);
+    for (uint8_t &byte : table) byte = uint8_t(rng());
+    const auto path = directory / "ple.gguf";
+    // A tensor before the table, so that it starts past the data's start.
+    test_gguf::Bytes before(4 * 90);
+    splash::test::writeFile(path,
+                            test_gguf::file({}, {{"token_embd.weight", {columns, 4}, kIQ4_NL, before},
+                                                 {"per_layer_token_embd.weight", {tableColumns, rows}, type, table}}));
+    model::WeightSource source(path);
+    const model::GgufFile gguf(source);
+    try {
+      out = model::gguf::tableRows(gguf, "per_layer_token_embd.weight", columns);
+      return std::string();
+    } catch (const model::GgufError &error) {
+      return std::string(error.what());
+    }
+  };
+  std::optional<model::gguf::StreamedRows> rows;
+  test_gguf::Bytes table;
+  check(planned(kIQ4_NL, columns, 1000, 90, rows, table).empty() && rows && rows->rows == 1000 &&
+            rows->rowBytes == 90 && rows->format == GGUF_FMT_IQ4NL && rows->file == 0 &&
+            rows->tensor == "per_layer_token_embd.weight",
+        "an IQ4_NL PLE table streams as 90-byte rows");
+  if (rows) {
+    test_gguf::Bytes read(table.size());
+    const int file = open((directory / "ple.gguf").c_str(), O_RDONLY);
+    const bool same = file >= 0 && pread(file, read.data(), read.size(), off_t(rows->offset)) == ssize_t(read.size()) &&
+                      read == table;
+    if (file >= 0) close(file);
+    check(same, "the streamed PLE rows are where the file holds the table");
+  }
+  rows.reset();
+  check(planned(kQ8_0, columns, 100, 170, rows, table).empty() && rows && rows->rowBytes == 170 &&
+            rows->format == GGUF_FMT_Q80,
+        "a Q8_0 PLE table streams as 170-byte rows");
+  rows.reset();
+  check(planned(0, columns, 10, uint64_t{columns} * 4, rows, table).find("does not stream") != std::string::npos,
+        "an F32 PLE table does not stream");
+  check(planned(kIQ4_NL, 128, 10, 72, rows, table).find("unexpected shape") != std::string::npos,
+        "a PLE table of another width does not stream");
+}
+
 } // namespace
 
 int main() {
@@ -441,6 +496,7 @@ int main() {
     guarded("planner on quantized alpha/beta", [&] { checkQuantizedAlphaBeta(directory.path()); });
     guarded("planner on the rotary metadata", [&] { checkRotary(directory.path()); });
     guarded("planner on a rotated target", [&] { checkRotation(directory.path()); });
+    guarded("planner on a streamed PLE table", [&] { checkPleTableRows(directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF planner tests FAILED" : "GGUF planner tests passed", failures);
     return failures ? 1 : 0;
   }

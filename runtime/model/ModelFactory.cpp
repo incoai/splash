@@ -49,9 +49,14 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &l
   return loadQwen3_6MoeWeights(backend, layout, files);
 }
 
-uint64_t imageBytes(const std::vector<gguf::Image> &images) {
+// The sum of `bytes` over the images of the GGUF target in root's target/,
+// planned for `geometry`.
+uint64_t ggufTargetBytes(const std::filesystem::path &root, const QwenTargetDimensions &geometry,
+                         gguf::PlanOptions options, uint64_t (*bytes)(const gguf::Image &)) {
+  const OpenGguf target(findTargetGgufs(root / "target"));
   uint64_t total = 0;
-  for (const gguf::Image &image : images) total += image.bytes;
+  for (const gguf::Image &image : gguf::planImages(target.file(), geometry, options))
+    total += bytes(image);
   return total;
 }
 
@@ -59,7 +64,8 @@ uint64_t imageBytes(const std::vector<gguf::Image> &images) {
 
 LoadedModel loadModel(metal::MetalBackend &backend,
                               const std::filesystem::path &root,
-                              const ModelDescriptor &descriptor) {
+                              const ModelDescriptor &descriptor,
+                              const ModelLoadOptions &options) {
   LoadedModel result;
   result.descriptor = descriptor;
   if (!result.descriptor.valid())
@@ -70,6 +76,8 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   // the vision tower's and the draft's here, the target's by its loader.
   const auto vision = planVisionLoader(root, result.descriptor);
   DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
+  // The weights that stream from their files read on one set of readers.
+  const auto readers = options.streamedTableBytes ? std::make_shared<WeightReaders>(kWeightReaders) : nullptr;
   result.target = std::visit(
       [&](const auto &layout) -> TargetWeights {
         const std::filesystem::path directory = root / "target";
@@ -79,7 +87,9 @@ LoadedModel loadModel(metal::MetalBackend &backend,
           return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {
-          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout);
+          // A streamed table's store (ModelLoadOptions::streamedTableBytes).
+          const SparseRowStoreOptions table{.cacheBytes = options.streamedTableBytes, .readers = readers};
+          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout, table);
           return readTarget(backend, layout, std::ref(loader));
         }
         }
@@ -100,17 +110,25 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   return result;
 }
 
-uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
-  uint64_t bytes = 0;
-  if (descriptor.targetSource == TargetSource::Gguf) {
-    const OpenGguf target(findTargetGgufs(root / "target"));
-    bytes = std::visit(
-        [&](const auto &layout) { return imageBytes(gguf::planImages(target.file(), layout)); },
-        descriptor.target);
-  } else {
-    bytes = std::visit([&](const auto &layout) { return safetensorsTargetImageBytes(root / "target", layout); },
-                       descriptor.target);
-  }
+uint64_t streamableTableBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
+  if (descriptor.targetSource != TargetSource::Gguf) return 0;
+  return std::visit(
+      [&](const auto &layout) {
+        return ggufTargetBytes(root, layout, {.streamTable = true}, gguf::streamedTableBytes);
+      },
+      descriptor.target);
+}
+
+uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor,
+                          const ModelLoadOptions &options) {
+  const gguf::PlanOptions plan{.streamTable = options.streamedTableBytes != 0};
+  uint64_t bytes = std::visit(
+      [&](const auto &layout) {
+        return descriptor.targetSource == TargetSource::Gguf
+                   ? ggufTargetBytes(root, layout, plan, gguf::loadedBytes)
+                   : safetensorsTargetImageBytes(root / "target", layout);
+      },
+      descriptor.target);
   bytes += draftImageBytes(root / "draft", descriptor.draft);
   if (descriptor.hasVision())
     bytes += visionImageBytes(descriptor.vision);

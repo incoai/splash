@@ -12,6 +12,7 @@
 #include "model/GgufFile.hpp"
 #include "model/GgufImage.hpp"
 #include "model/QwenHybridLayout.hpp"
+#include "model/SparseRowStore.hpp"
 #include "model/WeightImages.hpp"
 
 namespace splash::model {
@@ -22,33 +23,61 @@ namespace splash::model {
 
 class GgufTargetLoader final {
 public:
+  // A table whose rows stream from the GGUF (streamTable()): the store that
+  // reads them, their format (GGUF_FMT_*), and the record of its image, which
+  // the weights' fingerprint takes as when the table loads, as the rows
+  // gathered are the same.
+  struct StreamedTable final {
+    std::shared_ptr<SparseRowStore> store;
+    uint32_t format = 0;
+    WeightFileRecord record;
+  };
+
   // Plans every image from the GGUF's metadata once: of its one file, or of
-  // every part of a split one in split order (findTargetGgufs).
+  // every part of a split one in split order (findTargetGgufs). With a table
+  // store (table.cacheBytes), the rows of a table the GGUF holds stream
+  // through it (streamTable()) instead of loading (table()).
   GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
-                   const std::vector<std::filesystem::path> &paths, const QwenTargetDimensions &geometry);
+                   const std::vector<std::filesystem::path> &paths, const QwenTargetDimensions &geometry,
+                   SparseRowStoreOptions table = {});
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
 
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile head();
   [[nodiscard]] WeightFile embedding();
+  // The image of the table the family's GGUF holds after the embedding
+  // (gguf::planImages: Qwen3.8-Flash-Next's PLE n-gram table), refused when
+  // its rows stream.
+  [[nodiscard]] WeightFile table();
+  // The streamed table, its store reading the open file the metadata was
+  // parsed from; none when the table loads.
+  [[nodiscard]] std::optional<StreamedTable> streamTable() const;
+  // The GGUF's header, for what a family reads beside its images (Flash-Next's
+  // PLE hash).
+  [[nodiscard]] const GgufFile &file() const noexcept { return planned_->source.file(); }
   // The input rotation of a Prism ML GGUF, which planImages checked names
   // every quantized tensor of the target and its token table.
-  [[nodiscard]] const std::optional<GgufRotation> &rotation() const noexcept { return rotation_; }
+  [[nodiscard]] const std::optional<GgufRotation> &rotation() const noexcept { return file().rotation(); }
 
 private:
   // The GGUF's files and its images, which their writers share.
   struct Planned {
     explicit Planned(const std::vector<std::filesystem::path> &paths) : source(paths) {}
     OpenGguf source;
-    std::vector<gguf::Image> images; // layers, head, embedding
+    // Each layer's image, then the head's, the embedding's and a table's
+    // (gguf::planImages).
+    std::vector<gguf::Image> images;
+    uint32_t layers = 0;
+    SparseRowStoreOptions table;
   };
   [[nodiscard]] WeightFile open(size_t index);
+  // The plan of the table's image, or null for a family without one.
+  [[nodiscard]] const gguf::Image *tablePlan() const noexcept;
 
   metal::MetalBackend &backend_;
   WeightImages &images_;
   std::shared_ptr<Planned> planned_;
-  std::optional<GgufRotation> rotation_;
 };
 
 } // namespace splash::model

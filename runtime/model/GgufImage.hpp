@@ -8,6 +8,7 @@
 // experts * N rows.
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -124,6 +125,17 @@ struct Repack {
   uint64_t plane0 = 0, plane1 = 0, meta = 0; // image offsets; plane1 when the format has one
   std::vector<TensorRows> sources;
 };
+// Where a table's rows are in its GGUF (tableRows), for reading them from the
+// file (model/SparseRowStore.hpp) instead of loading the table's image: the
+// rows exactly as the image would hold them.
+struct StreamedRows final {
+  std::string tensor;
+  uint32_t file = 0;   // the part of a split GGUF that holds it
+  uint64_t offset = 0; // of row 0, from the start of that file
+  uint64_t rows = 0;
+  uint32_t rowBytes = 0;
+  uint32_t format = 0; // its gguf_embedding_format (GGUF_FMT_*)
+};
 struct Image {
   std::string name; // layer-N.bin, head.bin, embedding.bin
   std::string magic; // kGgufImageMagic
@@ -133,7 +145,24 @@ struct Image {
   std::vector<Fill> fills;
   std::vector<Copy> copies;
   std::vector<Repack> repacks;
+  // A table's rows, when they stream (PlanOptions::streamTable): then the
+  // image does not load, and stands in the weights' records as when it does,
+  // as the rows read are its rows.
+  std::optional<StreamedRows> streamedRows;
 };
+
+// How a target's images are planned: with streamTable, the rows of a table
+// the family's GGUF holds after the embedding (Qwen3.8-Flash-Next's PLE n-gram
+// table) stream (Image::streamedRows) instead of loading as its image.
+struct PlanOptions {
+  bool streamTable = false;
+};
+
+// The bytes of the table rows an image streams (Image::streamedRows), 0 for
+// none.
+[[nodiscard]] uint64_t streamedTableBytes(const Image &image);
+// The bytes an image takes once loaded: none for a table whose rows stream.
+[[nodiscard]] uint64_t loadedBytes(const Image &image);
 
 // The destination bytes of `sourceBytes` bytes of rows copied with
 // `conversion`: halved when narrowed, doubled when widened (and for the decay
@@ -179,6 +208,14 @@ void requireMetadata(const GgufMetadata &metadata, const QwenTargetDimensions &g
 // The layers' images, then the head's and the embedding's. Checks the
 // metadata (requireMetadata) and each tensor's shape; throws GgufError naming
 // every missing tensor and every tensor of a type this build cannot load.
-[[nodiscard]] std::vector<Image> planImages(const GgufFile &file, const QwenTargetDimensions &geometry);
+[[nodiscard]] std::vector<Image> planImages(const GgufFile &file, const QwenTargetDimensions &geometry,
+                                            PlanOptions options = {});
+
+// Where the GGUF holds the rows of the tensor `name`, a table of `columns`
+// values a row whose image copies its native rows as stored (a family's
+// table), for reading them from the file. Throws GgufError for a tensor of a
+// type its image does not copy as stored, of another width or of a rotated
+// GGUF.
+[[nodiscard]] StreamedRows tableRows(const GgufFile &file, const std::string &name, uint64_t columns);
 
 } // namespace splash::model::gguf

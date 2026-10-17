@@ -54,8 +54,11 @@ struct QwenAttentionWeights final {
 
 using QwenMixerWeights = std::variant<QwenGdnWeights, QwenAttentionWeights>;
 
+class SparseRowStore;
+
 // A Qwen target's weights outside its layers and the record of every file
-// its weights were read from.
+// its weights were read from. A target whose table streams from its file
+// reads its rows through `streamedTable` (model/SparseRowStore.hpp).
 struct QwenTargetWeightsBase {
   ops::NormWeights finalNorm;
   ops::Projection logitsProjection;
@@ -63,6 +66,7 @@ struct QwenTargetWeightsBase {
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
   std::string manifestFingerprintSha256;
+  std::shared_ptr<SparseRowStore> streamedTable;
 };
 
 // The weights of a target of Layout, whose layers the family keeps in Layer.

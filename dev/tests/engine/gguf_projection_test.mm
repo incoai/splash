@@ -23,6 +23,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Gguf.h"
+#include "model/SparseRowStore.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/Linear.hpp"
 
@@ -873,6 +874,73 @@ void tokenGather(MetalBackend &backend) {
           "bf16 of the stored one");
 }
 
+// A streamed table's gather (QwenTarget::addPleGather): a SparseRowStore
+// stages each distinct row a step reads once, with each row id's slot, and the
+// same gather over the staging as a table gives, byte for byte, what it gives
+// over the whole table, for every embedding format, ids repeated and in any
+// order, the table's first and last rows, and rows read or cached; and so at
+// Qwen3.8-Flash-Next's PLE rows of 160 values in the formats its GGUFs hold
+// them in, IQ4_NL (90-byte rows) and Q8_0 (170-byte rows).
+void stagedGather(MetalBackend &backend) {
+  constexpr uint32_t kRows = 4096, kCount = 640;
+  // Rows read from memory, as from the table's file.
+  class MemoryRows final : public model::RowReader {
+  public:
+    explicit MemoryRows(const std::vector<uint8_t> &bytes) : bytes_(bytes) {}
+    void read(uint64_t offset, std::span<uint8_t> out) override {
+      std::memcpy(out.data(), bytes_.data() + offset, out.size());
+    }
+    void checkUnchanged() override {}
+    [[nodiscard]] uint64_t size() const override { return bytes_.size(); }
+
+  private:
+    const std::vector<uint8_t> &bytes_;
+  };
+  const auto check = [&](const Fmt f, const uint32_t hidden) {
+    const std::string name = std::string(fmtName(f)) + " at " + std::to_string(hidden) + " values";
+    const uint32_t bytesPerRow = uint32_t(rowBytes(f, hidden));
+    const std::vector<uint8_t> native = makeNative(f, kRows, hidden, rng);
+    model::SparseRowStore store({"table", kRows, bytesPerRow, 0}, std::make_unique<MemoryRows>(native),
+                                {model::SparseRowStore::cacheBytesFor(kRows / 2, bytesPerRow) +
+                                     model::SparseRowStore::workingBytes(bytesPerRow, 1024, 0),
+                                 std::make_shared<model::WeightReaders>(2), 1024});
+    const EmbeddingWeights table(kRows, hidden, NativeRows(upload(backend, native), f));
+    for (int step = 0; step < 2; ++step) {
+      std::vector<uint32_t> ids(kCount);
+      for (uint32_t &id : ids) id = uint32_t(rng() % (step ? kRows : 64)); // the second step repeats rows
+      ids[0] = 0;
+      ids[1] = kRows - 1;
+      ids[2] = ids[1];
+      const Guarded indices(backend, kCount * 4, 0), slots(backend, kCount * 4, 0),
+          staging(backend, uint64_t{kCount} * bytesPerRow, 0x5A),
+          resident(backend, uint64_t{kCount} * hidden * 2, 0xFF), staged(backend, uint64_t{kCount} * hidden * 2, 0xFF);
+      std::memcpy(indices.view.contents(), ids.data(), indices.bytes);
+      store.stage(ids, {static_cast<uint8_t *>(staging.view.contents()), staging.bytes},
+                  {static_cast<uint32_t *>(slots.view.contents()), kCount}, model::SparseRowUse::Prefill);
+      CommandGraph graph;
+      Embedding::add(graph, indices.view, table, resident.view, kCount);
+      Embedding::add(graph, slots.view, EmbeddingWeights(kCount, hidden, NativeRows(staging.view, f)), staged.view,
+                     kCount);
+      static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+      if (!staged.intact() || !resident.intact()) fail(name + " staged gather writes past its output");
+      if (resident.halves() != staged.halves()) fail(name + " staged gather differs from the table's");
+    }
+  };
+  int formats = 0;
+  for (int fi = 0; fi < FMT_COUNT; ++fi) {
+    if (!gguf_embedding_format(fi)) continue;
+    ++formats;
+    check(Fmt(fi), 512);
+  }
+  for (const Fmt f : {IQ4NL, Q80}) {
+    if (rowBytes(f, 160) != (f == Q80 ? 170u : 90u)) fail(std::string(fmtName(f)) + " PLE rows have another width");
+    check(f, 160);
+  }
+  section("staged gather: " + std::to_string(formats) +
+          " embedding formats, and IQ4_NL and Q8_0 PLE rows of 160 values, byte-equal to the table's gather of the "
+          "same rows");
+}
+
 // Each buffer the token gathers reach, at its extent and one element short:
 // the rows' token ids and bf16 output rows, every token's native blocks (of
 // Q8_0, PQ2_0, MLX's af4g64 and nvfp4, BF16 and F16), and the rotation signs
@@ -951,6 +1019,7 @@ int main(int argc, char **argv) {
       section("split visibility: both tiles, 1 and 4 lanes, every split pair the policy picks for 8-80 cores, "
               "independent of poisoned partials and within fp64");
       tokenGather(backend);
+      stagedGather(backend);
       gatherExtents(backend);
     } catch (const std::exception &e) {
       std::cerr << "gguf-projection: FAIL: " << e.what() << '\n';

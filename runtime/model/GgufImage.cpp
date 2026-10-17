@@ -384,6 +384,12 @@ void requireRotation(const GgufFile &file, const QwenTargetDimensions &g, const 
 
 } // namespace
 
+uint64_t streamedTableBytes(const Image &image) {
+  return image.streamedRows ? image.streamedRows->rows * image.streamedRows->rowBytes : 0;
+}
+
+uint64_t loadedBytes(const Image &image) { return image.streamedRows ? 0 : image.bytes; }
+
 uint64_t convertedBytes(const TensorRows &source, Conversion conversion, uint64_t sourceBytes) {
   switch (conversion) {
   case Conversion::NarrowToBfloat16: return sourceBytes / 2;
@@ -511,7 +517,8 @@ void requireMetadata(const GgufMetadata &metadata, const QwenTargetDimensions &g
   if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
 }
 
-std::vector<Image> planImages(const GgufFile &file, const QwenTargetDimensions &geometry) {
+// No family of this build holds a table, so PlanOptions plans nothing yet.
+std::vector<Image> planImages(const GgufFile &file, const QwenTargetDimensions &geometry, PlanOptions) {
   requireMetadata(file.metadata(), geometry);
   std::vector<std::string> problems;
   std::vector<Image> images;
@@ -531,6 +538,32 @@ std::vector<Image> planImages(const GgufFile &file, const QwenTargetDimensions &
   }
   if (file.rotation()) requireRotation(file, geometry, images);
   return images;
+}
+
+StreamedRows tableRows(const GgufFile &file, const std::string &name, uint64_t columns) {
+  const GgufTensor &tensor = file.require(name);
+  if (file.rotation()) throw GgufError("the tables of a rotated GGUF do not stream: " + name);
+  // A table's image holds its rows as stored (Builder::nativeTable,
+  // copiedRows), but for NVFP4's, which the writer rebuilds.
+  if (!embeddingType(tensor.type) || tensor.type == ggml::kNVFP4)
+    throw GgufError("a table of type " + ggmlTypeName(tensor.type) + " does not stream: " + name);
+  if (tensor.columns() != columns || !tensor.rows()) throw GgufError("unexpected shape for " + name);
+  const uint32_t format = imageFormat(tensor.type);
+  const uint64_t rowBytes = ggufRowBytes(kQuantFormats[format], tensor.columns());
+  if (!rowBytes || rowBytes > UINT32_MAX || tensor.rows() * rowBytes != tensor.bytes)
+    throw GgufError("unexpected size for " + name);
+  const WeightSource &source = file.source(tensor.file);
+  if (tensor.offset > source.bytes() - source.dataOffset() ||
+      tensor.bytes > source.bytes() - source.dataOffset() - tensor.offset)
+    throw GgufError(name + " lies outside its file");
+  StreamedRows rows;
+  rows.tensor = name;
+  rows.file = tensor.file;
+  rows.offset = source.dataOffset() + tensor.offset;
+  rows.rows = tensor.rows();
+  rows.rowBytes = static_cast<uint32_t>(rowBytes);
+  rows.format = format;
+  return rows;
 }
 
 } // namespace splash::model::gguf

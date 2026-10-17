@@ -288,6 +288,8 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/SafetensorsTarget.cpp \
 	runtime/model/DraftCheckpoint.cpp \
 	runtime/model/WeightSource.cpp \
+	runtime/model/WeightReaders.cpp \
+	runtime/model/SparseRowStore.cpp \
 	runtime/model/WeightImages.cpp \
 	runtime/model/GgufPreparation.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
