@@ -120,7 +120,7 @@ void checkDense(const std::filesystem::path &directory) {
 }
 
 // alpha/beta of any one GGUF tensor type of a format but BF16 and F16
-// (llama.cpp's NVFP4 as NVFP4), on either architecture: one 256-row tensor of
+// (llama.cpp's NVFP4 as NVFP4), on either architecture: one plane tile of rows of
 // that format, the beta then the alpha rows at its native row bytes in grouped
 // head order; a pair of two types or of BF16 or F16, one F32 tensor of the
 // beta then the alpha rows, each decoded unless F32; a type the loader does
@@ -155,7 +155,7 @@ void checkQuantizedAlphaBeta(const std::filesystem::path &directory) {
       check(pair && pair->format == format && pair->rows == QUANT_TILE_ROWS && pair->columns == g.hiddenSize &&
                 pair->sources.size() == 2 && heads(pair->sources[0], "blk.0.ssm_beta.weight") &&
                 heads(pair->sources[1], "blk.0.ssm_alpha.weight"),
-            "planner alpha/beta: one 256-row " + model::ggmlTypeName(type) + " tensor of beta then alpha rows (" +
+            "planner alpha/beta: one plane tile of " + model::ggmlTypeName(type) + " beta then alpha rows (" +
                 model::gguf::architecture(g.ffnKind) + ")" + (result.error ? ": " + *result.error : ""));
     }
     using model::gguf::Conversion;

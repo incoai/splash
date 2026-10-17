@@ -226,7 +226,9 @@ inline constexpr uint32_t quant_affine_format_of(uint32_t bits, uint32_t group) 
 // The chunk order slot of element e (0..31) of a group.
 inline constexpr uint32_t quant_slot(uint32_t e) { return 8 * ((e >> 2) & 3) + 4 * (e >> 4) + (e & 3); }
 
-#define QUANT_TILE_ROWS 256u
+// A plane tile holds one GGUF_TILE_COLUMNS column tile of every kernel, so
+// any projection or expert of a multiple of 64 rows starts on a tile.
+#define QUANT_TILE_ROWS 64u
 
 // Index of (row, block) in a [rows / T][blocks][T] plane (blocks = G) or meta
 // plane (blocks = meta units per row).

@@ -17,6 +17,11 @@
 
 namespace splash::model::gguf {
 
+// `rows` rows and the zero rows that pad them to whole plane tiles.
+[[nodiscard]] constexpr uint64_t tiledRows(uint64_t rows) noexcept {
+  return (rows + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS * QUANT_TILE_ROWS;
+}
+
 // The general.architecture of a GGUF of a target with this FFN.
 [[nodiscard]] constexpr const char *architecture(QwenFfnKind ffn) noexcept {
   return ffn == QwenFfnKind::SparseMoe ? "qwen35moe" : "qwen35";

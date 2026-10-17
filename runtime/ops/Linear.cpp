@@ -14,10 +14,10 @@
 namespace splash::ops {
 namespace {
 
-// Matrices of whole 256-row tiles of whole 64-input spans; a decode step's
-// inputs are whole 256-input units.
+// Matrices of whole 64-row tiles (GGUF_TILE_COLUMNS) of whole 64-input spans;
+// a decode step's inputs are whole 256-input units.
 void validate(LinearWorkload w) {
-  if (!w.matrix.outputSize || w.matrix.outputSize % 256 || !w.matrix.inputSize || w.matrix.inputSize % 64)
+  if (!w.matrix.outputSize || w.matrix.outputSize % 64 || !w.matrix.inputSize || w.matrix.inputSize % 64)
     throw std::invalid_argument("invalid linear matrix");
   if (w.phase == LinearPhase::Prefill) {
     if (!w.rows || w.rows > SPLASH_PREFILL_TOKEN_BUDGET ||
