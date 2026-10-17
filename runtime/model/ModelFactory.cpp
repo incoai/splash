@@ -55,6 +55,12 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen4ExpLayout &lay
   return loadQwen4ExpWeights(backend, layout, files);
 }
 
+// The rows of a family's streamed table that a step stages and prefetches
+// (SparseRowStoreOptions); the Qwen3.5 families have no table to stream.
+SparseRowStoreOptions tableRows(const Qwen3_8Layout &) { return {}; }
+SparseRowStoreOptions tableRows(const Qwen3_6MoeLayout &) { return {}; }
+SparseRowStoreOptions tableRows(const Qwen4ExpLayout &layout) { return streamedTableRows(layout); }
+
 // The sum of `bytes` over the images of the GGUF target in root's target/,
 // planned for a layout of `architecture` and `geometry`.
 uint64_t ggufTargetBytes(const std::filesystem::path &root, std::string_view architecture,
@@ -97,8 +103,11 @@ LoadedModel loadModel(metal::MetalBackend &backend,
           return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {
-          // A streamed table's store (ModelLoadOptions::streamedTableBytes).
-          const SparseRowStoreOptions table{.cacheBytes = options.streamedTableBytes, .readers = readers};
+          // A streamed table's store: its memory and readers here, the rows
+          // a step stages and prefetches from the family.
+          SparseRowStoreOptions table = tableRows(layout);
+          table.cacheBytes = options.streamedTableBytes;
+          table.readers = readers;
           GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout.ggufArchitecture, layout, table,
                                   experts);
           return readTarget(backend, layout, std::ref(loader));

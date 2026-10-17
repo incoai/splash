@@ -6,8 +6,11 @@
 // PLE layer and its QSA attention, and the inputs it makes of a step's tokens
 // on the CPU. Those are the PLE rows of prompt rows (the n-gram hashes of
 // their tokens), the tokens before a decode lane's rows (from which the GPU
-// hashes the rows' PLE rows, since only it has their proposals) and the QSA
-// blocks a step's rows complete.
+// hashes the rows' PLE rows, since only it has their proposals), the QSA
+// blocks a step's rows complete, and, when the PLE table streams from its
+// file (--ple-memory), each step's PLE rows staged from the table: a
+// prefill's before its command is submitted, a verify's in a host step of its
+// command, between the hash and the gather.
 
 #include "model/QwenTarget.hpp"
 
@@ -19,6 +22,7 @@
 namespace splash::model {
 
 struct Qwen4ExpWeights;
+class SparseRowStore;
 
 // The scratch of a step's rows (a prefill chunk's or a decode step's): the
 // fp32 residual streams, a mix's normalized streams, low-rank and gate rows
@@ -29,7 +33,9 @@ struct Qwen4ExpWeights;
 // keyLayerRows rows apart, which its commit reads), scores of scoreRows rows
 // of scoreStride each, block bitmaps of maskWords words per row, and the
 // block lists of the attention's tiles of rows (listStride entries each,
-// ops::AttentionBlocks) with their counts.
+// ops::AttentionBlocks) with their counts. A streamed PLE
+// table's step also stages each distinct row it gathers once (pleStaging)
+// and each row id's row there (pleSlots).
 struct Qwen4Scratch final {
   metal::MetalBuffer streams;
   metal::MetalBuffer normalized;
@@ -39,6 +45,8 @@ struct Qwen4Scratch final {
   metal::MetalBuffer branch;
   metal::MetalBuffer zeros;
   metal::MetalBuffer pleIndices;
+  metal::MetalBuffer pleSlots;
+  metal::MetalBuffer pleStaging;
   metal::MetalBuffer pleRows;
   metal::MetalBuffer pleValue;
   metal::MetalBuffer pleGated;
@@ -86,16 +94,24 @@ public:
   // Scratch for prefill commands of up to `prefillChunks` chunks.
   Qwen4Steps(const Qwen4ExpWeights &weights, const QwenTargetGeometry &geometry, metal::MetalBackend &backend,
              uint32_t prefillChunks);
-  [[nodiscard]] static QwenTargetScratchBytes scratchBytes(const QwenTargetGeometry &geometry,
+  [[nodiscard]] static QwenTargetScratchBytes scratchBytes(const Qwen4ExpWeights &weights,
+                                                           const QwenTargetGeometry &geometry,
                                                            uint32_t prefillChunks);
   // What the constructor allocated, scratchBytes' of its geometry.
   [[nodiscard]] QwenTargetScratchBytes allocatedBytes() const noexcept;
 
   // Chunk `index`'s scratch of a prefill command.
   [[nodiscard]] Qwen4Scratch prefillScratch(uint32_t index) const;
-  // Writes the PLE rows and QSA blocks of chunk `index`'s sequences. Returns
-  // each sequence's blocks.
+  // Writes the PLE rows and QSA blocks of chunk `index`'s sequences and,
+  // when the table streams, stages the chunk's PLE rows. Returns each
+  // sequence's blocks.
   [[nodiscard]] std::vector<Qwen4Blocks> preparePrefill(uint32_t index, const QwenTargetPrefillChunk &chunk);
+  // When the table streams, starts reading the PLE rows of the prompt rows
+  // that follow each lane's rows of a prefill command, at most a command's
+  // chunks' worth and its lanes' in order: the readers bring them into the
+  // table's cache while the command runs, where the next command's first
+  // stage finishes them for all of its chunks.
+  void readAhead(std::span<const QwenTargetPrefillChunk> chunks);
 
   // The scratch of a decode step's first `rows` rows (the target's storage
   // rows of the step, QwenTarget::decodeStorageLanes).
@@ -113,7 +129,8 @@ public:
   [[nodiscard]] metal::MetalBuffer qsaPending(const metal::MetalBuffer &auxiliary, uint32_t layer,
                                               uint32_t layers = 1) const;
   // The GPU's PLE rows of `lanes` lanes' verify rows, from their tokens and
-  // the tokens before each lane's.
+  // the tokens before each lane's, and, when the table streams, the host step
+  // that stages them.
   void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer tokens, uint32_t lanes) const;
   // The PLE rows of batch lane `lane`'s verify rows of the last step, each
   // row's heads' in order.
@@ -129,6 +146,11 @@ private:
     uint64_t offset;
   };
 
+  // Stages from `store` the rows, of rowBytes each, of the first `count` row
+  // ids of `scratch`. A static function, so that a host step that stages
+  // holds what it uses rather than this object.
+  static void stage(SparseRowStore &store, uint64_t rowBytes, const Qwen4Scratch &scratch, uint32_t count,
+                    bool prefill);
   // Each lane's tokens before its verify rows, which the hash reads.
   [[nodiscard]] metal::MetalBuffer priorTokens() const;
 
@@ -136,6 +158,9 @@ private:
   QwenTargetGeometry geometry_;
   metal::MetalBackend &backend_;
   uint32_t prefillChunks_ = 0;
+  // The bytes of a row of a streamed PLE table, which a step stages; zero
+  // for a table in memory.
+  uint64_t pleRowBytes_ = 0;
   // The prefill scratch: its tensors, a carried one's per chunk, then each
   // chunk's QSA blocks from byte prefillBlocksOffset_. The decode scratch:
   // its tensors for a step's most rows, then each lane's QSA blocks from byte
@@ -150,6 +175,8 @@ private:
   uint64_t decodePriorOffset_ = 0;
   // The position each lane's verify inputs were prepared for.
   std::array<uint64_t, ExecutionLimits::maximumBatchWidth> preparedPositions_{};
+  // Row ids of a read-ahead, kept between commands for their allocation.
+  std::vector<uint32_t> ahead_;
 };
 
 } // namespace splash::model

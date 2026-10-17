@@ -38,8 +38,9 @@ public:
   // The hidden rows are the final mix, which the head reads as they are.
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
                     metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const override;
-  // The GPU hashes the verify rows' PLE rows before the verify that gathers
-  // them.
+  // The GPU hashes the verify rows' PLE rows, and when the table streams a
+  // host step of the command stages them, between the hash and the verify
+  // that gathers them.
   void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput, metal::MetalBuffer proposals,
                       metal::MetalBuffer verifyInput, uint32_t lanes) const override;
   // Each lane's PLE history and QSA pending keys after its retained rows,
@@ -97,7 +98,8 @@ private:
                                                                 const Qwen4IndexerWeights &indexer) const;
   [[nodiscard]] ops::AttentionBlocks addVerifyQsa(VerifyStep &step, const Qwen4IndexerWeights &indexer) const;
   // The PLE layer's `count` rows into scratch.pleRows: from the table by
-  // scratch.pleIndices.
+  // scratch.pleIndices, or, when the table streams, from the rows staged by
+  // scratch.pleSlots, with the table's own gather.
   void addPleGather(metal::CommandGraph &graph, const Qwen4Scratch &scratch, uint32_t count) const;
 
   const Qwen4ExpWeights &weights_;

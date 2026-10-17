@@ -37,8 +37,8 @@ struct ActualMemoryReport {
     uint64_t stateStagingBytes = 0;
     // The prefill FFN's Neural Engine split; zero without one.
     uint64_t aneFfnBytes = 0;
-    // The streamed table's row cache, host memory outside Metal's; zero
-    // without one.
+    // The streamed table's row cache (--ple-memory), host memory outside
+    // Metal's; zero without one.
     uint64_t streamedTableBytes = 0;
 
     uint64_t backendAllocatedBytes = 0;

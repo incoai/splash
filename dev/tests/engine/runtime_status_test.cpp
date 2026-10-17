@@ -622,7 +622,7 @@ void testStreamedExpertsStatus() {
           "streamed experts' status differs");
 }
 
-// A streamed table's store: null without one; with one its
+// A streamed table's store (--ple-memory): null without one; with one its
 // memory, per use its stages, rows, hit rate and stage latencies, its reads,
 // prefetches and failure. An added field: the schema version stays.
 void testStreamedTableStatus() {

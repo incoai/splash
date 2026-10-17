@@ -26,18 +26,15 @@ namespace splash::model {
 class QwenStateStorage;
 class VisionLoader;
 
-// The store a streamed table is read through (LoadedModel::streamedTable).
-class SparseRowStore;
-
 using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights>;
 
 // How a model loads beside its descriptor: with streamedTableBytes, the rows
 // of a table the target's GGUF holds (streamableTableBytes) stream from its
 // file through a row cache of that many bytes instead of loading into memory
-// (model/SparseRowStore.hpp). With expertMemoryBytes, a MoE target's routed
-// experts stream from their files through a store of that many bytes
-// (model/ExpertStore.hpp, --expert-memory). Other models load as without
-// them.
+// (model/SparseRowStore.hpp, --ple-memory). With expertMemoryBytes, a MoE
+// target's routed experts stream from their files through a store of that
+// many bytes (model/ExpertStore.hpp, --expert-memory). Other models load as
+// without them.
 struct ModelLoadOptions final {
   uint64_t streamedTableBytes = 0;
   uint64_t expertMemoryBytes = 0;

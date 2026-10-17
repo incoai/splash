@@ -407,8 +407,10 @@ public:
   // given. Returns each chunk's buffer of its last layer's output rows.
   //
   // It first writes the inputs the target makes of the chunks' tokens on
-  // the CPU: the command is submitted once it returns, while no other
-  // command reading the target's prefill scratch is in flight.
+  // the CPU and stages a streamed table's rows of them, and starts reading
+  // ahead the rows of the prompt rows after them: the command is submitted
+  // once it returns, while no other command reading the target's prefill
+  // scratch is in flight.
   [[nodiscard]] virtual std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph,
                                                                    std::span<const QwenTargetPrefillChunk> chunks,
                                                                    const kv::PageStorage &kv,

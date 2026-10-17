@@ -235,9 +235,9 @@ void testNeuralEngineSplitIsBudgeted() {
           "the split is missing from the memory plan status");
 }
 
-// A streamed table's host memory is fixed runtime memory of its own
-// category, which the KV cache gives up; the status and the description
-// report it.
+// A streamed table's host memory (--ple-memory) is fixed runtime memory
+// of its own category, which the KV cache gives up; the status and the
+// description report it.
 void testStreamedTableIsBudgeted() {
   const EngineMemoryPlan without = test::requireMemoryPlan(device(), model());
   ModelMemoryProfile streamed = model();

@@ -98,7 +98,7 @@ void appendLatency(std::ostringstream &out, const model::LatencyStats &latency) 
       << ",\"total\":" << latency.totalMilliseconds << ",\"samples\":" << latency.count << '}';
 }
 
-// A streamed table's store, or null: its memory, its cache,
+// A streamed table's store (--ple-memory), or null: its memory, its cache,
 // per use (prefill, decode) its stages, rows and stage latencies, its reads
 // and prefetches, and whether a failure poisoned it.
 void appendStreamedTable(std::ostringstream &out, const std::optional<model::SparseRowStats> &table) {

@@ -139,6 +139,7 @@ class SmokeRealTests(unittest.TestCase):
                         max_context=None,
                         max_memory=None,
                         max_cache_disk=None,
+                        ple_memory=None,
                         expert_memory=None,
                         max_image_pixels=None,
                         kv_format="bf16" if absolute else "int8",
@@ -184,6 +185,7 @@ class SmokeRealTests(unittest.TestCase):
             max_context=None,
             max_memory=None,
             max_cache_disk="4G",
+            ple_memory=None,
             expert_memory=None,
             max_image_pixels=None,
             kv_format="int8",
@@ -218,16 +220,19 @@ class SmokeRealTests(unittest.TestCase):
                     )
 
     def test_ssd_streaming_options_reach_the_server(self):
-        model = ["--model", "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M"]
+        model = ["--model", "unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS"]
         parsed = smoke_real.parse_args(model)
-        self.assertIsNone(parsed.expert_memory)
-        parsed = smoke_real.parse_args([*model, "--expert-memory", "16G"])
-        self.assertEqual(parsed.expert_memory, "16G")
+        self.assertEqual((parsed.ple_memory, parsed.expert_memory), (None, None))
+        parsed = smoke_real.parse_args(
+            [*model, "--ple-memory", "2G", "--expert-memory", "16G"]
+        )
+        self.assertEqual((parsed.ple_memory, parsed.expert_memory), ("2G", "16G"))
         with self.server():
             command = smoke_real.subprocess.Popen.call_args.args[0]
+            self.assertNotIn("--ple-memory", command)
             self.assertNotIn("--expert-memory", command)
         arguments = self.server_arguments()
-        arguments.expert_memory = "16G"
+        arguments.ple_memory, arguments.expert_memory = "2G", "16G"
         with (
             mock.patch.object(smoke_real, "available_port", return_value=8000),
             mock.patch.object(smoke_real.subprocess, "Popen") as popen,
@@ -236,6 +241,7 @@ class SmokeRealTests(unittest.TestCase):
             server = smoke_real.RealServer(arguments)
             try:
                 command = popen.call_args.args[0]
+                self.assertEqual(command[command.index("--ple-memory") + 1], "2G")
                 self.assertEqual(command[command.index("--expert-memory") + 1], "16G")
             finally:
                 server.close()

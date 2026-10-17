@@ -97,6 +97,7 @@ access.
 | `--max-context` | Auto | Set the context limit, e.g. `100K`. See [memory and context](#memory-and-context). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
+| `--ple-memory` | Off | Qwen3.8-Flash-Next: read the PLE n-gram table from the SSD through a host row cache of this size, e.g. `2G`, instead of loading it. See [PLE table streaming](#ple-table-streaming). |
 | `--expert-memory` | Off | MoE targets: hold routed experts in this much memory, e.g. `16G`, and read the others from the SSD when a step routes them. See [streamed experts](#streamed-experts). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](#weight-loading). |
 | `--max-cache-disk` | `auto` | SSD quota for cached KV pages and states: `auto` follows the volume's free space up to 32 GiB, a size such as `16G` sets the quota, `0` turns the cache off. Kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
@@ -117,7 +118,7 @@ access.
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
 Sizes (`--max-memory`, `--max-cache-disk`, `--max-cache-disk-writes`,
-`--max-request-size`, `--expert-memory`) are a whole number of bytes, or one with a `K`, `M` or
+`--max-request-size`, `--ple-memory`, `--expert-memory`) are a whole number of bytes, or one with a `K`, `M` or
 `G` suffix in binary units: `28G` is 28 GiB, and `28GB`, `28GiB` and `28g` say
 the same. Token counts (`--max-context`) are a whole number, or one with a `K`
 suffix of 1024 tokens: `100K` is 102,400 tokens. `--max-memory`, `--max-context` and `--max-cache-disk`
@@ -200,6 +201,61 @@ context limit. `/v1/models` and `/v1/models/{id}` report the same limit as
 aliases. Clients can impose a smaller limit. This is a capacity limit, not a
 guarantee of a fast first token for a long uncached prompt. If the model cannot
 fit, startup prints a memory budget breakdown and stops.
+
+### PLE table streaming
+
+Qwen3.8-Flash-Next's PLE n-gram table (`per_layer_token_embd.weight`, 320M rows
+of 160 values, 28.8 GB in IQ4_NL; other row widths come from GGUF metadata)
+is read by a handful of rows per token: 16 per position, eight heads each of
+the 2- and 3-gram hashes of the token and the tokens before it. With
+`--ple-memory SIZE`, such as `--ple-memory 2G`, the table stays in its
+GGUF on the SSD: no `ple.bin` image is written, and the weights shrink by the
+stored table size. Startup memory requirements also include the cache and
+Metal staging buffers. The rows each command gathers are read through a
+host cache with a SIZE-byte cache and working-memory reservation; the engine
+refuses a SIZE that holds no row. This reservation is not a strict bound on
+host allocations: prefetch scratch, excess vector capacity, job metadata,
+allocator overhead and reader stacks are additional, and oversized stages
+grow their scratch. Other models ignore the option with a warning; off by
+default.
+
+- A step's rows are staged before its PLE layer gathers them: the CPU copies
+  each distinct row the step reads once into a small Shared buffer of the
+  step's scratch, from the cache or, for the rows it lacks, with uncached
+  (`F_NOCACHE`) row reads (90 bytes for IQ4_NL, 170 for Q8_0) by the model's
+  16 weight readers, which streamed experts share (`WeightReaders`,
+  `runtime/model/WeightReaders.hpp`), and the staging thread itself
+  (`SparseRowStore`, `runtime/model/SparseRowStore.hpp`). The gather then
+  reads them with the table's own kernel, so a row's values are computed
+  exactly as from the table.
+- A prefill knows its rows on the CPU and stages them before its command is
+  submitted. A decode cycle's rows are those of the draft's proposals, which
+  only the GPU has: the verify hashes them on the GPU, and a host step of the
+  same command stages them between the hash and the gather, keeping the GPU
+  awake through it ([Streamed experts](#streamed-experts)).
+- A prefill command reads ahead the rows of the prompt tokens that follow its
+  rows, as many as a command holds, while it runs; the next command's first
+  stage finds them cached or finishes what is still in flight. A read ahead
+  runs only while no stage or expert load reads.
+- A row enters the cache only after the file was found unchanged since it was
+  read. The table is read from the source its metadata was parsed from, so a
+  new file at its path changes nothing; a write to that file, a failed read
+  (after one retry) or a short file fails the step before the command that
+  requires those rows is submitted. The engine stops as it does for a weight
+  read error, and the server starts it again. A row a read-ahead fails to
+  read is dropped, and the stage that needs it reads it again.
+- The cache counts as fixed runtime memory in the plan
+  (`streamed_table_bytes`): the governor charges it beside Metal's
+  allocations, and the startup memory audit bounds it by the plan and counts
+  it toward the hard budget beside Metal's footprint. It is not released
+  while idle.
+- `/status` reports it under `streamed_table`: the table and its bytes, the
+  cache's size, capacity, rows and evictions; per use (`prefill`, `decode`)
+  its stages, requested and distinct rows, hits, reads, hit rate and stage
+  latency (`stage_ms`); the reads' bytes, retries, errors and latency
+  (`read_ms`); the prefetches; and `poisoned` with the `failure`. A latency is
+  a histogram in milliseconds: `p50`, `p95` and `p99` (within a factor of
+  two), `max`, `total` and `samples`.
 
 ### Streamed experts
 
@@ -1195,6 +1251,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `active_requests` | Each request the engine holds, ordered by `id`: its `id`, `phase` (`queued`, `waiting_resources`, `waiting_prefix`, `prefill`, `decode` or `waiting_mask`, and `failed` for one whose deadline passed while a cached state it restores was being read from disk, until that read drains), `priority`, `prompt_tokens` and how many of them are encoded (`prompt_processed`, cached ones included), `generated_tokens` of `max_new_tokens`, and `age_ms` since it arrived |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
 | `weights.idle_release_seconds`, `released`, `restoring`, `restores`, `restore_failures` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, whether a request's restore of it is under way (it stays `released` until the last image is back), the times it was restored for a request since engine start, and the restores that gave up for want of memory |
+| `streamed_table` | With `--ple-memory`, the [streamed PLE table](#ple-table-streaming)'s cache, stages, reads and prefetches; `null` otherwise |
 | `streamed_experts` | With `--expert-memory`, the [streamed experts](#streamed-experts)' store: its slots and resident experts, per use its loads, reads, read-ahead and host-step round trips, and its failure; `null` otherwise |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
@@ -3009,7 +3066,8 @@ a file of uint32 token ids (`dev/benchmarks/teacher_logits.mm`): for each
 window, the fp32 logits of the prefill's final position and of ROWS decode
 positions after it, each computed by a verify row forced to the true next
 token, in `OUTPUT-END.f32`, and prints how well they predict the true ids. It
-also takes `--kv-format`, `--state-format` and `--expert-memory`.
+also takes `--kv-format`, `--state-format`, `--expert-memory` and
+`--ple-memory`.
 
 `benchmark-backend` lists the contexts the memory plan cannot hold in its
 report. Its cache checks reuse each context's cached prefix, so they need that

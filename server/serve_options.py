@@ -161,6 +161,10 @@ def _store_size(value, example):
     return size
 
 
+def parse_ple_memory(value):
+    return _store_size(value, "2G")
+
+
 def parse_expert_memory(value):
     return _store_size(value, "16G")
 
@@ -424,6 +428,18 @@ SERVE_OPTIONS = (
             help="context token limit, e.g. 100K (K = 1024 tokens); it can only "
             "lower the automatic limit, the model's native window when memory "
             "holds it (default: auto)",
+        ),
+    ),
+    ServeOption(
+        "--ple-memory",
+        "memory",
+        dict(
+            type=parse_ple_memory,
+            default=None,
+            metavar="SIZE",
+            help="stream the PLE n-gram table of a Qwen3.8-Flash-Next GGUF from "
+            "the SSD through a RAM row cache of SIZE, e.g. 2G, instead of "
+            "keeping the whole table, tens of GB, in memory (default: off)",
         ),
     ),
     ServeOption(

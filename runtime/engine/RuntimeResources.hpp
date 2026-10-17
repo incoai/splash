@@ -129,6 +129,11 @@ struct RuntimeResourcesConfig {
   // Reclaimable host memory, sampled at every Metal operation during startup
   // and by the governor afterwards.
   MemoryGovernor::HostMemoryProvider hostMemory = queryHostMemory;
+  // --ple-memory: a target's PLE n-gram table, which its GGUF holds,
+  // streams from the file through a row cache of this many bytes instead of
+  // loading into memory (model::streamableTableBytes); zero loads it.
+  // Ignored, with a warning, for a target without one.
+  uint64_t streamedTableBytes = 0;
   // --expert-memory: a MoE target's routed experts stream from their files
   // through a store of this many bytes (its slots, staging and tables)
   // instead of loading with their layers; zero loads them. Ignored, with a
@@ -254,7 +259,7 @@ public:
   [[nodiscard]] const AneFfnOutcome &aneFfnOutcome() const noexcept { return aneFfnOutcome_; }
   // The split as it stands now, for /status.
   [[nodiscard]] AneFfnSnapshot aneFfnSnapshot() const;
-  // The streamed table's store, if the model has one.
+  // The streamed PLE table's store (--ple-memory), if the model has one.
   [[nodiscard]] std::optional<model::SparseRowStats> streamedTableStats() const;
   // The streamed routed experts' store (--expert-memory), if the model has one.
   [[nodiscard]] std::optional<model::ExpertStoreStats> streamedExpertStats() const;

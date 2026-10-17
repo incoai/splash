@@ -3,7 +3,7 @@
 //
 //   teacher-logits METALLIB MODEL_ROOT TOKENS OUTPUT --window END:ROWS [--window END:ROWS...]
 //                  [--kv-format int8|bf16] [--state-format fp32|bf16]
-//                  [--expert-memory BYTES]
+//                  [--expert-memory BYTES] [--ple-memory BYTES]
 //
 // TOKENS holds little-endian uint32 token ids, read as they are: no BOS, no
 // chat template. For each window a cold request prefills ids [0, END - ROWS)
@@ -204,7 +204,7 @@ int main(int argc, char **argv) {
       if (argc < 5) {
         std::cerr << "usage: teacher-logits METALLIB MODEL_ROOT TOKENS OUTPUT --window END:ROWS "
                      "[--window END:ROWS...] [--kv-format int8|bf16] [--state-format fp32|bf16] "
-                     "[--expert-memory BYTES]\n";
+                     "[--expert-memory BYTES] [--ple-memory BYTES]\n";
         return 2;
       }
       std::vector<Window> windows;
@@ -228,6 +228,8 @@ int main(int argc, char **argv) {
           stateFormat = value == "fp32" ? ops::GdnStateFormat::Float32 : ops::GdnStateFormat::BFloat16;
         } else if (option == "--expert-memory")
           loadOptions.expertMemoryBytes = parseNumber(value, "--expert-memory");
+        else if (option == "--ple-memory")
+          loadOptions.streamedTableBytes = parseNumber(value, "--ple-memory");
         else
           throw std::invalid_argument("unknown option " + std::string(option));
       }

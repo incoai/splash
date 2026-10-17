@@ -37,6 +37,8 @@
 
 namespace splash::model {
 
+struct SparseRowStoreOptions;
+
 struct Qwen4ExpLayout final : QwenHybridLayout {
   // The family's name, as the installer pairs its draft (install/families.py).
   static constexpr std::string_view family = "Qwen3.8-Flash-Next";
@@ -166,8 +168,11 @@ struct Qwen4ExpWeights final : QwenTargetWeightsBase {
   std::vector<Qwen4ExpLayerWeights> layers;
   // The last mix, which feeds the head in place of a final norm.
   Qwen4HyperWeights finalHyper;
-  // The PLE table's native rows of pleHeadDimension values.
+  // The PLE table's native rows of pleHeadDimension values; empty when the
+  // table streams from its file (--ple-memory), where streamedTable reads
+  // the rows of pleFormat a step gathers.
   ops::EmbeddingWeights pleTable;
+  uint32_t pleFormat = 0;
   Qwen4PleHash pleHash;
 };
 
@@ -187,5 +192,9 @@ struct Qwen4ExpWeights final : QwenTargetWeightsBase {
                                                             const QwenTargetGeometry &geometry,
                                                             uint32_t prefillChunks);
 void includeFamilyProjections(QwenTargetGeometry &geometry, const Qwen4ExpWeights &weights);
+// The rows of its PLE table, when it streams, that a step stages and the
+// read-ahead may have queued (SparseRowStoreOptions::stageRows and
+// prefetchRows; Qwen4Steps).
+[[nodiscard]] SparseRowStoreOptions streamedTableRows(const Qwen4ExpLayout &layout);
 
 } // namespace splash::model

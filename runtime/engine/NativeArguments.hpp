@@ -53,6 +53,10 @@ struct NativeArguments final {
   // Neural Engine when that is faster (splash serve --disable-ane turns it
   // off).
   bool neuralEngine = true;
+  // --ple-memory BYTES: stream a Qwen3.8-Flash-Next GGUF's PLE table from
+  // its file through a host row cache of BYTES in all instead of loading it;
+  // 0, without the option, loads it (RuntimeResourcesConfig::streamedTableBytes).
+  uint64_t streamedTableBytes = 0;
   // --expert-memory BYTES: stream a MoE target's routed experts from their
   // files through a store of BYTES (model/ExpertStore.hpp) instead of loading
   // them; 0, without the option, loads them

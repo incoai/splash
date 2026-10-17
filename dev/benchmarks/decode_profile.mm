@@ -1,7 +1,7 @@
 // Per-kernel GPU time attribution for the production executor.
 //
 //   decode-profile METALLIB MODEL_ROOT [--prompt-tokens N] [--cycles K] [--kv-format int8|bf16]
-//                  [--state-format fp32|bf16] [--expert-memory BYTES]
+//                  [--state-format fp32|bf16] [--expert-memory BYTES] [--ple-memory BYTES]
 //                  [--dispatch-list FILE]
 //   decode-profile METALLIB MODEL_ROOT --images HxW[,HxW...] [--cycles K]
 //
@@ -306,7 +306,7 @@ int main(int argc, char **argv) {
       if (argc < 3) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
-                     "[--state-format fp32|bf16] [--expert-memory BYTES] "
+                     "[--state-format fp32|bf16] [--expert-memory BYTES] [--ple-memory BYTES] "
                      "[--dispatch-list FILE]\n"
                      "       decode-profile METALLIB MODEL_ROOT "
                      "--images HxW[,HxW...] [--cycles K]\n";
@@ -317,7 +317,7 @@ int main(int argc, char **argv) {
       kv::Format format = kv::Format::Int8;
       ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
       std::vector<ops::ImageGrid> grids;
-      // Streamed routed experts, as serve-native's option.
+      // Streamed routed experts and PLE table, as serve-native's options.
       model::ModelLoadOptions loadOptions;
       bool textOptions = false;
       std::string dispatchList;
@@ -344,6 +344,9 @@ int main(int argc, char **argv) {
           textOptions = true;
         } else if (option == "--expert-memory") {
           loadOptions.expertMemoryBytes = parseBytes(argv[index + 1], "--expert-memory");
+          textOptions = true;
+        } else if (option == "--ple-memory") {
+          loadOptions.streamedTableBytes = parseBytes(argv[index + 1], "--ple-memory");
           textOptions = true;
         } else if (option == "--dispatch-list") {
           dispatchList = argv[index + 1];

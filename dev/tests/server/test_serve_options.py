@@ -65,6 +65,11 @@ OPTIONS = {
         "--state-format", {"fp32": "fp32", "bf16": "bf16"}, ("fp16", "int8")
     ),
     "--disable-ane": ([(["--disable-ane"], True)], []),
+    "--ple-memory": values(
+        "--ple-memory",
+        {"off": None, "OFF": None, "1M": 1024**2, "2G": 2 * 1024**3},
+        ("0", "auto", "bad", "-2G"),
+    ),
     "--expert-memory": values(
         "--expert-memory",
         {"off": None, "OFF": None, "512M": 512 * 1024**2, "16G": 16 * 1024**3},

@@ -481,9 +481,10 @@ void checkRotation(const std::filesystem::path &directory) {
   }
 }
 
-// The rows of a table that streams (gguf::tableRows), Flash-Next's PLE
-// table: where the file holds them, as its image copies them; refused for a
-// type its image does not copy as stored and for another width.
+// The rows of a table that streams (gguf::tableRows), Flash-Next's PLE table
+// (--ple-memory): where the file holds them, as its image copies them;
+// refused for a type its image does not copy as stored and for another
+// width.
 void checkPleTableRows(const std::filesystem::path &directory) {
   const uint32_t columns = model::Qwen4ExpLayout{}.pleHeadDimension;
   std::mt19937 rng(7);

@@ -4,6 +4,7 @@
 #include "metal/abi/BlockIndexer.h"
 #include "metal/abi/NgramEmbedding.h"
 #include "model/Qwen4Exp.hpp"
+#include "model/SparseRowStore.hpp"
 #include "ops/NgramEmbedding.hpp"
 
 #include <algorithm>
@@ -75,8 +76,9 @@ uint64_t keyFixedBytes(const QwenTargetGeometry &g, bool decode) {
   return decode ? bytesFor<uint16_t>(uint64_t{g.attentionLayerCount()} * kStepRows * BLOCK_INDEXER_DIMENSION) : 0;
 }
 
-// A prefill chunk's or a decode step's tensors.
-std::vector<Tensor> tensors(const QwenTargetGeometry &g, bool decode) {
+// A prefill chunk's or a decode step's tensors; a streamed PLE table's rows
+// are `pleRowBytes` each (zero for a table in memory).
+std::vector<Tensor> tensors(const QwenTargetGeometry &g, uint64_t pleRowBytes, bool decode) {
   const uint32_t scoreRows = decode ? kStepRows : kPrefillScoreRows;
   std::vector<Tensor> result{
       {&Qwen4Scratch::streams, bytesFor<float>(g.streamWidth()), 0, true},
@@ -104,6 +106,12 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, bool decode) {
        bytesFor<uint32_t>(uint64_t{kLanes} * listStride(g)), false},
       {&Qwen4Scratch::qsaListCounts, bytesFor<uint32_t>(1), bytesFor<uint32_t>(kLanes), false},
   };
+  // A streamed table's step stages up to every row id's row, each distinct
+  // one once, and each id's slot.
+  if (pleRowBytes) {
+    result.push_back({&Qwen4Scratch::pleSlots, bytesFor<uint32_t>(g.pleHeads()), 0, true});
+    result.push_back({&Qwen4Scratch::pleStaging, uint64_t{g.pleHeads()} * pleRowBytes, 0, true});
+  }
   return result;
 }
 
@@ -118,12 +126,12 @@ struct Layout final {
   uint64_t decodeBytes = 0;
 };
 
-Layout layout(const QwenTargetGeometry &g, uint32_t chunks) {
+Layout layout(const QwenTargetGeometry &g, uint64_t pleRowBytes, uint32_t chunks) {
   Layout result;
-  for (const Tensor &tensor : tensors(g, false))
+  for (const Tensor &tensor : tensors(g, pleRowBytes, false))
     result.prefillBlocks += alignUp(bytesOf(tensor, kChunkRows)) * (tensor.carried ? chunks : 1);
   result.prefillBytes = result.prefillBlocks + alignUp(kChunkBlockBytes) * chunks;
-  for (const Tensor &tensor : tensors(g, true)) result.decodeBlocks += alignUp(bytesOf(tensor, kStepRows));
+  for (const Tensor &tensor : tensors(g, pleRowBytes, true)) result.decodeBlocks += alignUp(bytesOf(tensor, kStepRows));
   result.decodePrior = result.decodeBlocks + alignUp(kLanes * kLaneBlockBytes);
   result.decodeBytes = result.decodePrior + alignUp(bytesFor<uint32_t>(kLanes * priorCount(g)));
   return result;
@@ -145,27 +153,34 @@ void writeBlocks(uint64_t position, uint32_t rows, const QwenTargetRequest &requ
   }
 }
 
+// The bytes of a row the PLE table streams, which a step stages; none for a
+// table in memory.
+uint64_t pleRowBytes(const Qwen4ExpWeights &weights) {
+  return weights.streamedTable ? weights.streamedTable->table().rowBytes : 0;
+}
+
 } // namespace
 
 Qwen4Steps::Qwen4Steps(const Qwen4ExpWeights &weights, const QwenTargetGeometry &geometry,
                        metal::MetalBackend &backend, uint32_t prefillChunks)
-    : weights_(weights), geometry_(geometry), backend_(backend), prefillChunks_(prefillChunks) {
+    : weights_(weights), geometry_(geometry), backend_(backend), prefillChunks_(prefillChunks),
+      pleRowBytes_(pleRowBytes(weights)) {
   // The hash keeps at most NGRAM_EMBEDDING_MAXIMUM_NGRAM tokens of a row's n-grams.
   if (!prefillChunks_ || geometry_.pleNgram < 2 || geometry_.pleNgram > NGRAM_EMBEDDING_MAXIMUM_NGRAM)
     throw std::invalid_argument("invalid Qwen3.8-Flash-Next step geometry");
-  const Layout bytes = layout(geometry_, prefillChunks_);
+  const Layout bytes = layout(geometry_, pleRowBytes_, prefillChunks_);
   prefill_ = backend_.allocateBuffer(bytes.prefillBytes, metal::BufferStorage::Shared, "qwen4-prefill-scratch");
   decode_ = backend_.allocateBuffer(bytes.decodeBytes, metal::BufferStorage::Shared, "qwen4-decode-scratch");
   prefillBlocksOffset_ = bytes.prefillBlocks;
   decodeBlocksOffset_ = bytes.decodeBlocks;
   decodePriorOffset_ = bytes.decodePrior;
   uint64_t cursor = 0;
-  for (const Tensor &tensor : tensors(geometry_, false)) {
+  for (const Tensor &tensor : tensors(geometry_, pleRowBytes_, false)) {
     prefillTensors_.push_back({tensor.field, tensor.rowBytes, tensor.fixedBytes, tensor.carried, cursor});
     cursor += alignUp(bytesOf(tensor, kChunkRows)) * (tensor.carried ? prefillChunks_ : 1);
   }
   cursor = 0;
-  for (const Tensor &tensor : tensors(geometry_, true)) {
+  for (const Tensor &tensor : tensors(geometry_, pleRowBytes_, true)) {
     decodeTensors_.push_back({tensor.field, tensor.rowBytes, tensor.fixedBytes, tensor.carried, cursor});
     cursor += alignUp(bytesOf(tensor, kStepRows));
   }
@@ -174,8 +189,9 @@ Qwen4Steps::Qwen4Steps(const Qwen4ExpWeights &weights, const QwenTargetGeometry 
     std::memset(zeros.contents(), 0, zeros.sizeBytes());
 }
 
-QwenTargetScratchBytes Qwen4Steps::scratchBytes(const QwenTargetGeometry &geometry, uint32_t prefillChunks) {
-  const Layout bytes = layout(geometry, prefillChunks);
+QwenTargetScratchBytes Qwen4Steps::scratchBytes(const Qwen4ExpWeights &weights, const QwenTargetGeometry &geometry,
+                                                uint32_t prefillChunks) {
+  const Layout bytes = layout(geometry, pleRowBytes(weights), prefillChunks);
   return {bytes.prefillBytes, bytes.decodeBytes};
 }
 
@@ -222,7 +238,38 @@ std::vector<Qwen4Blocks> Qwen4Steps::preparePrefill(uint32_t index, const QwenTa
     blocks.push_back({view, count});
     written += bytes;
   }
+  // A chunk's rows at once, so that its lanes share their rows.
+  if (weights_.streamedTable)
+    stage(*weights_.streamedTable, pleRowBytes_, scratch, chunk.rows * geometry_.pleHeads(), true);
   return blocks;
+}
+
+void Qwen4Steps::readAhead(std::span<const QwenTargetPrefillChunk> chunks) {
+  if (!weights_.streamedTable) return;
+  // Each lane's last sequence of the command, which ends its rows there.
+  std::array<const QwenTargetPrefillSequence *, kLanes> last{};
+  for (const QwenTargetPrefillChunk &chunk : chunks)
+    for (const QwenTargetPrefillSequence &sequence : chunk.sequences) {
+      if (sequence.lane >= kLanes) throw std::invalid_argument("invalid Qwen3.8-Flash-Next prefill lane");
+      last[sequence.lane] = &sequence;
+    }
+  const uint32_t heads = geometry_.pleHeads();
+  ahead_.clear();
+  // The next command's rows: a command's chunks of rows at most.
+  uint64_t budget = uint64_t{prefillChunks_} * kChunkRows;
+  for (const QwenTargetPrefillSequence *sequence : last) {
+    if (!sequence) continue;
+    const std::span<const uint32_t> prompt = sequence->request.tokens;
+    const uint64_t from = sequence->chunk.committed_tokens + sequence->rows;
+    const uint64_t end = std::min<uint64_t>(prompt.size(), from + budget);
+    if (from >= end) continue;
+    const size_t base = ahead_.size();
+    ahead_.resize(base + (end - from) * heads);
+    qwen4PleRows(weights_, from, prompt.subspan(from, end - from), prompt, ahead_.data() + base);
+    budget -= end - from;
+    if (!budget) break;
+  }
+  if (!ahead_.empty()) weights_.streamedTable->prefetch(ahead_);
 }
 
 Qwen4Scratch Qwen4Steps::verifyScratch(uint32_t rows) const {
@@ -302,6 +349,13 @@ void Qwen4Steps::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer t
   std::copy(hash.headOffsets.begin(), hash.headOffsets.end(), params.offsets);
   const Qwen4Scratch scratch = verifyScratch(params.rows);
   ops::NgramEmbedding::addHash(graph, std::move(tokens), priorTokens(), scratch.pleIndices, params, heads);
+  // A verify step stages a few rows per lane, most of them already in the
+  // cache, so its host step is short and keeps the GPU awake
+  // (metal::HostStepGpu::Awake).
+  if (weights_.streamedTable)
+    graph.host([store = weights_.streamedTable, rowBytes = pleRowBytes_, scratch,
+                count = params.rows * heads] { stage(*store, rowBytes, scratch, count, false); },
+               {}, metal::HostStepGpu::Awake);
 }
 
 std::vector<uint32_t> Qwen4Steps::verifyPleRows(uint32_t lane) const {
@@ -338,6 +392,22 @@ void qwen4PleRows(const Qwen4ExpWeights &weights, uint64_t position, std::span<c
       }
     }
   }
+}
+
+// The command that reads the staged rows waits for the stage: a prefill's is
+// submitted after it returns, a verify's continues past its host step. No
+// other command reading the scratch is in flight: the engine runs one command
+// at a time. A row that cannot be read throws, before a prefill's command is
+// submitted or as its host step's failure, which stops the engine. A
+// prefill's stage takes the rows its command's read-ahead brought in.
+void Qwen4Steps::stage(SparseRowStore &store, uint64_t rowBytes, const Qwen4Scratch &scratch, uint32_t count,
+                       bool prefill) {
+  if (scratch.pleIndices.sizeBytes() < bytesFor<uint32_t>(count) ||
+      scratch.pleSlots.sizeBytes() < bytesFor<uint32_t>(count) || scratch.pleStaging.sizeBytes() < count * rowBytes)
+    throw std::logic_error("PLE staging is smaller than its step");
+  store.stage({contents<const uint32_t>(scratch.pleIndices), count},
+              {contents<uint8_t>(scratch.pleStaging), count * rowBytes}, {contents<uint32_t>(scratch.pleSlots), count},
+              prefill ? SparseRowUse::Prefill : SparseRowUse::Decode, prefill);
 }
 
 } // namespace splash::model

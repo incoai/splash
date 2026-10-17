@@ -2,6 +2,7 @@
 #include "model/GgufFile.hpp"
 #include "model/GgufTarget.hpp"
 #include "model/QwenTargetLoader.hpp"
+#include "model/SparseRowStore.hpp"
 
 #include <cmath>
 #include <optional>
@@ -147,7 +148,13 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend, Qwen4ExpLayout
           file.finish();
           result.files.push_back(file.record());
         }
-        {
+        if (std::optional<GgufTargetLoader::StreamedTable> table = gguf.streamTable()) {
+          if (table->store->table().rows != result.pleHash.tableRows)
+            throw WeightStoreError("the GGUF's PLE table does not match its hash");
+          result.streamedTable = std::move(table->store);
+          result.pleFormat = table->format;
+          result.files.push_back(std::move(table->record));
+        } else {
           WeightFile file = gguf.table();
           result.pleTable = readBlockEmbedding(file, static_cast<uint32_t>(result.pleHash.tableRows),
                                                layout.pleHeadDimension, "ple-table");

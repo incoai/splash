@@ -73,10 +73,14 @@ one released for the family, selected automatically, or the one
 
 No DFlash2 draft of Qwen3.8-Flash-Next is released yet: its installation
 names one with `--draft-model`, a Hub repository or a local directory
-([Drafts](DEVELOPMENT.md#drafts)).
+([Drafts](DEVELOPMENT.md#drafts)). Its routed experts and PLE n-gram table
+can stay on the SSD: `UD-IQ3_XXS` ran on a 36 GB M5 Max with
+`--expert-memory 12G --ple-memory 2G` (about 23 tokens/s on one request), and on a 64 GB Mac
+`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0` keeps every expert in
+memory with `--ple-memory 2G`.
 
 ```bash
-splash serve --model unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ3_XXS --draft-model ./Qwen3.8-Flash-Next-DFlash2
+splash serve --model unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ3_XXS --draft-model ./Qwen3.8-Flash-Next-DFlash2 --expert-memory 12G --ple-memory 2G
 ```
 
 Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats
@@ -113,6 +117,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--disable-ane` | Prefill on the GPU alone. Default: the 27B also uses the Neural Engine. |
 | `--max-cache-disk 16G` | Cap the SSD cache (default: auto, up to 32 GiB; `0` turns it off). |
 | `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
+| `--ple-memory 2G` | Qwen3.8-Flash-Next: read its PLE n-gram table (28.8 GB in IQ4_NL) from the SSD through a 2 GiB RAM cache instead of holding it in memory. Off by default. |
 | `--expert-memory 16G` | MoE models: hold routed experts in 16 GiB and read the others from the SSD when a token routes them. Off by default. |
 
 Use `--max-memory` to leave room for other applications.
@@ -122,6 +127,7 @@ access, authentication, browser apps on other origins, and other options, see
 `splash serve --help`.
 [KV precision](DEVELOPMENT.md#kv-cache-precision) ·
 [SSD cache](DEVELOPMENT.md#ssd-cache) ·
+[PLE table streaming](DEVELOPMENT.md#ple-table-streaming) ·
 [Streamed experts](DEVELOPMENT.md#streamed-experts)
 
 ## Performance

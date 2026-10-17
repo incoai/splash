@@ -423,6 +423,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // stage, as loading them does.
   model::ModelLoadOptions loadOptions;
   try {
+    // --ple-memory: a table the target's GGUF holds streams from its file,
+    // so its image is not loaded, and the store's bytes (at most the
+    // option's) are charged in its place.
+    const bool streamsTable = config.streamedTableBytes && model::streamableTableBytes(config.modelRoot, config.model);
+    if (config.streamedTableBytes && !streamsTable)
+      logLine("--ple-memory ignored: ", config.model.name, " has no PLE table to stream");
     // --expert-memory: a MoE target's routed experts stream through a store
     // of that many bytes, which modelWeightBytes counts with the images,
     // unless they would hold every one of them.
@@ -436,7 +442,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         logLine("--expert-memory ignored: its ", config.expertMemoryBytes / kMiB, " MiB hold every routed expert (",
                 expertBytes / kMiB, " MiB), which load with their layers");
     }
-    loadOptions = {.expertMemoryBytes = streamsExperts ? config.expertMemoryBytes : 0};
+    loadOptions = {.streamedTableBytes = streamsTable ? config.streamedTableBytes : 0,
+                   .expertMemoryBytes = streamsExperts ? config.expertMemoryBytes : 0};
     const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
         device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
     // Reject a model that cannot fit before loading its weights. Beside
@@ -449,7 +456,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     const auto requiredFor = [&](uint64_t stagingBytes) {
       uint64_t fixedBytes = 0;
       for (const uint64_t bytes : {weightBytes, model::kPipelineReserveBytes,
-                                   model::kRuntimeOverheadReserveBytes, stagingBytes}) {
+                                   model::kRuntimeOverheadReserveBytes, stagingBytes, loadOptions.streamedTableBytes}) {
         if (!checkedAdd(fixedBytes, bytes, fixedBytes))
           fixedBytes = std::numeric_limits<uint64_t>::max();
       }
@@ -489,6 +496,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     const auto started = AwakeClock::now();
     loaded = model::loadModel(*backend, config.modelRoot, config.model, loadOptions);
     requireLoadedModel(loaded);
+    if (const model::SparseRowStore *table = loaded.streamedTable()) {
+      const model::SparseRowStats stats = table->stats();
+      logLine("Table ", stats.table, " streams from its file: ", stats.tableBytes / kMiB,
+              " MiB stay on the SSD; row cache of ", stats.cacheCapacityRows, " rows in ",
+              table->committedBytes() / kMiB, " MiB, ", model::kWeightReaders, " readers.");
+    }
     if (const model::ExpertStore *experts = loaded.expertStore()) {
       const model::ExpertStoreStats stats = experts->stats();
       logLine("Routed experts stream from their files: ", stats.slots, " slots for ", stats.experts, " experts (",
