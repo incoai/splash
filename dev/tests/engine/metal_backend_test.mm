@@ -34,6 +34,7 @@ using splash::metal::AllocationFailure;
 using splash::metal::BackendInstrumentation;
 using splash::metal::MetalAllocationError;
 using splash::metal::BufferBinding;
+using splash::metal::BufferReach;
 using splash::metal::BufferStorage;
 using splash::metal::BytesBinding;
 using splash::metal::Command;
@@ -1013,12 +1014,65 @@ void residencyRacesTheHeartbeat(const std::string &metallibPath) {
               << " lapses=" << lapses << '\n';
 }
 
+// Records the residency sets added to command queues.
+class QueueSets final {
+public:
+    QueueSets() {
+        original = replacement_.original;
+        added.clear();
+    }
+
+    static inline std::vector<id<MTLResidencySet>> added;
+
+private:
+    static inline IMP original = nullptr;
+
+    static void recordAdd(id queue, SEL selector, id<MTLResidencySet> set) {
+        added.push_back(set);
+        reinterpret_cast<void (*)(id, SEL, id)>(original)(queue, selector, set);
+    }
+
+    id<MTLCommandQueue> queue_ = [MTLCreateSystemDefaultDevice() newCommandQueue];
+    MethodReplacement replacement_{queue_, @selector(addResidencySet:),
+                                   reinterpret_cast<IMP>(recordAdd)};
+};
+
+// The command queue holds one residency set, of the buffers kernels reach
+// only through their addresses, and none other: a command buffer waits for
+// its queue's set to be resident before it starts (Residency). Only a Shared
+// buffer is reached by its address, and only such a buffer has one, zero
+// while its memory is released.
+void queueHoldsAddressedBuffers(const std::string &metallibPath) {
+    QueueSets sets;
+    MetalBackend backend(metallibPath);
+    require(sets.added.size() == 1, "the command queue does not hold exactly one residency set");
+    const uint64_t page = static_cast<uint64_t>(getpagesize());
+    MetalBuffer bound = backend.allocateBuffer(page, BufferStorage::Shared, "bound");
+    MetalBuffer addressed = backend.allocateBuffer(page, BufferStorage::Shared, "addressed",
+                                                   BufferReach::Addressed);
+    NSArray<id<MTLAllocation>> *held = sets.added.front().allAllocations;
+    require(held.count == 1 && [((id<MTLBuffer>)held.firstObject).label isEqualToString:@"addressed"],
+            "the command queue's set does not hold exactly the addressed buffer");
+    rejects([&] {
+                (void)backend.allocateBuffer(page, BufferStorage::Private, "private", BufferReach::Addressed);
+            },
+            "only a Shared Metal buffer is reached by its address",
+            "a Private buffer was reached by its address");
+    rejects([&] { (void)bound.gpuAddress(); }, "allocated BufferReach::Addressed has a GPU address",
+            "a buffer kernels reach bound had a GPU address");
+    require(addressed.gpuAddress(), "an addressed buffer has no GPU address");
+    backend.releaseMemory(addressed);
+    require(!addressed.gpuAddress(), "released memory kept its GPU address");
+    std::cout << "PASS the command queue holds the addressed buffers\n";
+}
+
 // Kernels reach shared buffers only through GPU addresses in a table, as
-// they reach KV extents. The residency set makes the buffers resident for
-// every command, also once its keep-alive has lapsed; one dispatch reads
-// what the previous one wrote through them; the CPU reads what kernels wrote
-// and kernels read what the CPU wrote between commands; and buffers released
-// and allocated again between commands work at once.
+// they reach KV extents (BufferReach::Addressed). The command queue's
+// residency set makes the buffers resident for every command, also once the
+// backend's set has lapsed; one dispatch reads what the previous one wrote
+// through them; the CPU reads what kernels wrote and kernels read what the CPU
+// wrote between commands; and buffers released and allocated again between
+// commands work at once.
 void buffersReachedThroughTables(const std::string &metallibPath) {
     constexpr double kKeepAliveSeconds = 0.2;
     constexpr uint32_t kBuffers = 6, kWords = 16384, kRounds = 60;
@@ -1028,8 +1082,11 @@ void buffersReachedThroughTables(const std::string &metallibPath) {
     MetalBuffer table = sharedBuffer(backend, kBuffers * sizeof(uint64_t));
     MetalBuffer mismatches = sharedBuffer(backend, sizeof(uint32_t));
     const uint64_t before = backend.memoryStats().allocatedBytes;
+    const auto addressedBuffer = [&] {
+        return backend.allocateBuffer(kBytes, BufferStorage::Shared, "addressed", BufferReach::Addressed);
+    };
     std::vector<MetalBuffer> buffers(kBuffers);
-    for (MetalBuffer &buffer : buffers) buffer = sharedBuffer(backend, kBytes);
+    for (MetalBuffer &buffer : buffers) buffer = addressedBuffer();
     require(buffers[0].storage() == BufferStorage::Shared && buffers[0].contents() &&
                 buffers[0].sizeBytes() == kBytes &&
                 backend.memoryStats().allocatedBytes == before + kBuffers * kBytes,
@@ -1064,7 +1121,7 @@ void buffersReachedThroughTables(const std::string &metallibPath) {
             require(backend.memoryStats().allocatedBytes ==
                         before + (kBuffers - 1) * kBytes,
                     "a released buffer is still counted");
-            buffers[index] = sharedBuffer(backend, kBytes);
+            buffers[index] = addressedBuffer();
             entries[index] = buffers[index].gpuAddress();
             ++regrown;
         }
@@ -1104,9 +1161,10 @@ void buffersReachedThroughTables(const std::string &metallibPath) {
         }
     }
     buffers.clear();
+    // Each released buffer leaves both the backend's set and the queue's.
     require(backend.memoryStats().allocatedBytes == before &&
-                calls.removals == kBuffers + regrown,
-            "released buffers stayed counted or in the residency set");
+                calls.removals == 2 * (kBuffers + regrown),
+            "released buffers stayed counted or in the residency sets");
     std::cout << "PASS buffers reached through tables rounds=" << kRounds
               << " regrown=" << regrown << " lapsed_round=" << lapsedRound << '\n';
 }
@@ -1199,7 +1257,7 @@ void releasedMemory(const std::string &metallibPath) {
     rejects([&] { backend.restoreMemory(buffer); }, "not released", "allocated memory was restored");
     const unsigned removals = calls.removals;
     backend.releaseMemory(buffer);
-    require(!buffer.contents() && !view.contents() && !view.gpuAddress() &&
+    require(!buffer.contents() && !view.contents() &&
                 backend.memoryStats().allocatedBytes == before && calls.removals == removals + 1,
             "released memory kept its contents, its accounting or its residency");
     rejects([&] { backend.releaseMemory(buffer); }, "already released", "memory was released twice");
@@ -1775,6 +1833,7 @@ int main(int argc, const char *argv[]) {
             residencyRacesTheHeartbeat(argv[1]);
             residencyEndsWithoutBlits(argv[1]);
             residencyReturnsRemovedBuffers(argv[1]);
+            queueHoldsAddressedBuffers(argv[1]);
             buffersReachedThroughTables(argv[1]);
             run(argv[1]);
         } catch (const std::exception &error) {

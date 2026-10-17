@@ -2150,17 +2150,22 @@ holds with the split it runs.
 
 ### Residency and KV extents
 
-Every buffer the backend allocates belongs to one residency set attached to its
-command queue (`MetalBackend::allocateBuffer`): weights, KV extents, state
-buffers and scratch alike stay wired between requests until the idle
+Every buffer the backend allocates belongs to one residency set
+(`MetalBackend::allocateBuffer`, `metal/Residency.hpp`): weights, KV extents,
+state buffers and scratch alike stay wired between requests until the idle
 release (`--idle-release`, 10 minutes by default) passes without a command, and
-the next command wires them again. `--idle-release off` keeps every buffer
-wired, and the weight images allocated unless an
-[explicit release](#explicit-weights-release) gives them back, while the engine
-runs; KV extents return only through the reclaims below, memory pressure among
-them. Memory returns to macOS when the engine releases it, never because macOS
-compressed or dropped an idle buffer. macOS page cache, driver allocations and
-other applications still affect memory pressure and swap.
+the next command wires them again. The command queue holds only a set of the KV
+extents, which kernels reach by address: Metal makes them resident for every
+command buffer, as it does each buffer a dispatch binds. A queue that held every
+buffer would have each command buffer wait for all of them before it starts,
+which with memory nearly full takes 100-170 ms for 1-2% of them.
+`--idle-release off` keeps every buffer wired, and the
+weight images allocated unless an [explicit release](#explicit-weights-release)
+gives them back, while the engine runs; KV extents return only through the
+reclaims below, memory pressure among them. Memory returns to macOS when the
+engine releases it, never because macOS compressed or dropped an idle buffer.
+macOS page cache, driver allocations and other applications still affect memory
+pressure and swap.
 
 KV pages live in extents: ordinary shared Metal buffers of one size per pool,
 between half and one and a half times 128 MiB, in which every tensor region of
@@ -2172,8 +2177,8 @@ pool allocates or releases an extent. An extent whose last page is free stays
 allocated until a reclaim releases it, at once and only between commands: memory
 pressure, an admission the budget denies, the publication of a replay point in
 use or a junction, or startup cleanup. Kernels reach a page through the GPU
-address in its request's page table, so no command binds KV; the residency set
-makes extents resident for every command. The host reaches the same memory
+address in its request's page table, so no command binds KV; the command
+queue's residency set makes extents resident for every command buffer. The host reaches the same memory
 (`PageStorage::spans`), which is how the disk tier moves pages. A reclaim
 returns free pages before it evicts anything: an empty extent as it is, and the
 free pages scattered over the others as soon as they cover the extent that holds

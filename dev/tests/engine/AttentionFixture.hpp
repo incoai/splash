@@ -177,9 +177,10 @@ private:
 };
 
 // A fixture's extents start its one allocation and its tensors are views of
-// the rest, resident for every command like every backend buffer; kernels
-// reach the extents only through the lanes' page tables. Lanes past the
-// plan's lanes bind lane 0's page table, as the runtime's padded lanes do.
+// the rest; kernels reach the extents only through the lanes' page tables, so
+// the allocation is addressed (metal::BufferReach), resident for every
+// command buffer. Lanes past the plan's lanes bind lane 0's page table, as the
+// runtime's padded lanes do.
 class AttentionFixture final {
 public:
   using Tensor = AttentionFixturePlan::Tensor;
@@ -187,7 +188,8 @@ public:
   AttentionFixture(metal::MetalBackend &backend, AttentionFixturePlan plan,
                    std::string_view label)
       : plan_(std::move(plan)),
-        base_(backend.allocateBuffer(plan_.bytes, metal::BufferStorage::Shared, label)),
+        base_(backend.allocateBuffer(plan_.bytes, metal::BufferStorage::Shared, label,
+                                     metal::BufferReach::Addressed)),
         pages_(HostKvExtents::contiguous(plan_.poolLayout(), plan_.geometry.extentPages,
                                          plan_.extents,
                                          static_cast<std::byte *>(base_.contents()),
