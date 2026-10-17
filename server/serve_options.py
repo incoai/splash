@@ -146,6 +146,25 @@ def parse_max_cache_disk_writes(value):
     return size
 
 
+def _store_size(value, example):
+    """'off' (None), or a byte count with an optional K, M or G suffix: the
+    memory of a store that streams weights from the SSD. The engine refuses a
+    size that holds nothing the store reads."""
+    if value.strip().lower() == "off":
+        return None
+    try:
+        size = parse_max_memory(value)
+    except argparse.ArgumentTypeError:
+        size = None
+    if not size:
+        raise argparse.ArgumentTypeError(f"use off, or a size such as {example}")
+    return size
+
+
+def parse_expert_memory(value):
+    return _store_size(value, "16G")
+
+
 def parse_cache_dir(value):
     if not value.strip():
         raise argparse.ArgumentTypeError("must name a directory")
@@ -405,6 +424,18 @@ SERVE_OPTIONS = (
             help="context token limit, e.g. 100K (K = 1024 tokens); it can only "
             "lower the automatic limit, the model's native window when memory "
             "holds it (default: auto)",
+        ),
+    ),
+    ServeOption(
+        "--expert-memory",
+        "memory",
+        dict(
+            type=parse_expert_memory,
+            default=None,
+            metavar="SIZE",
+            help="keep the routed experts of a MoE model in RAM slots of SIZE in "
+            "all, e.g. 16G, and read the others from the SSD when a token routes "
+            "them, instead of loading every expert (default: off)",
         ),
     ),
     ServeOption(

@@ -1,7 +1,7 @@
 #include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/paged_store_row.h"
 
-template <uint KVHeads, typename CacheElement>
+template <uint KVHeads, typename CacheElement, bool ValuesTokenMajor>
 inline void splash_store_verify_phase(
     device const bfloat *chunk_keys, device const bfloat *chunk_values,
     device const SplashKvPage *page_table0, device const SplashKvPage *page_table1,
@@ -31,12 +31,12 @@ inline void splash_store_verify_phase(
   uint row = value_tensor ? local_group - rows : local_group;
   uint chunk_token = row % Rows;
   uint head = row / Rows;
-  splash_store_kv_row<KVHeads, CacheElement>(
+  splash_store_kv_row<KVHeads, CacheElement, ValuesTokenMajor>(
       chunk_keys, chunk_values, page_table, lane_params, maxima, value_tensor,
       head, chunk_token, thread_index, simd_lane, simd_group);
 }
 
-#define PAGED_VERIFY_STORE(Name, Heads, CacheElement)                          \
+#define PAGED_VERIFY_STORE(Name, Heads, CacheElement, ValuesTokenMajor)        \
   kernel void Name(                                                            \
       device const bfloat *chunk_keys [[buffer(0)]],                           \
       device const bfloat *chunk_values [[buffer(1)]],                         \
@@ -50,13 +50,16 @@ inline void splash_store_verify_phase(
       uint simd_lane [[thread_index_in_simdgroup]],                            \
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                    \
     SPLASH_STORE_MAXIMA_##CacheElement                                         \
-    splash_store_verify_phase<Heads, CacheElement>(                            \
+    splash_store_verify_phase<Heads, CacheElement, ValuesTokenMajor>(          \
         chunk_keys, chunk_values, page_table0, page_table1, page_table2,       \
         page_table3, params, maxima, group, thread_index, simd_lane,           \
         simd_group);                                                           \
   }
-PAGED_VERIFY_STORE(verify_attention_q8_store, 4, int8_t)
-PAGED_VERIFY_STORE(verify_attention_q8_store_kv2_g8, 2, int8_t)
-PAGED_VERIFY_STORE(verify_attention_bf16_store, 4, bfloat)
-PAGED_VERIFY_STORE(verify_attention_bf16_store_kv2_g8, 2, bfloat)
+PAGED_VERIFY_STORE(verify_attention_q8_store, 4, int8_t, false)
+PAGED_VERIFY_STORE(verify_attention_q8_store_kv2_g8, 2, int8_t, false)
+PAGED_VERIFY_STORE(verify_attention_bf16_store, 4, bfloat, false)
+PAGED_VERIFY_STORE(verify_attention_bf16_store_kv2_g8, 2, bfloat, false)
+// Two KV heads whose values are token-major (sparse attention).
+PAGED_VERIFY_STORE(verify_attention_q8_store_kv2_vt, 2, int8_t, true)
+PAGED_VERIFY_STORE(verify_attention_bf16_store_kv2_vt, 2, bfloat, true)
 #undef PAGED_VERIFY_STORE

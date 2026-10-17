@@ -101,7 +101,7 @@ inline std::vector<SyntheticTensor> draftTensors(const model::DFlashDraftLayout 
     add(prefix + "mlp.up_proj.weight", {layout.intermediateSize, hidden});
     add(prefix + "mlp.down_proj.weight", {hidden, layout.intermediateSize});
   }
-  add("fc.weight", {hidden, layout.targetHiddenSize});
+  add("fc.weight", {hidden, layout.targetHiddenSize()});
   add("hidden_norm.weight", {hidden});
   add("norm.weight", {hidden});
   add("candidate_selector.hidden_projection.weight", {layout.selectorRank, hidden});

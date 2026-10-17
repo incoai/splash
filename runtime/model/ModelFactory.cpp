@@ -49,9 +49,14 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &l
   return loadQwen3_6MoeWeights(backend, layout, files);
 }
 
-uint64_t imageBytes(const std::vector<gguf::Image> &images) {
+// The sum of `bytes` over the images of the GGUF target in root's target/,
+// planned for `geometry`.
+uint64_t ggufTargetBytes(const std::filesystem::path &root, const QwenTargetDimensions &geometry,
+                         gguf::PlanOptions options, uint64_t (*bytes)(const gguf::Image &)) {
+  const OpenGguf target(findTargetGgufs(root / "target"));
   uint64_t total = 0;
-  for (const gguf::Image &image : images) total += image.bytes;
+  for (const gguf::Image &image : gguf::planImages(target.file(), geometry, options))
+    total += bytes(image);
   return total;
 }
 
@@ -59,7 +64,8 @@ uint64_t imageBytes(const std::vector<gguf::Image> &images) {
 
 LoadedModel loadModel(metal::MetalBackend &backend,
                               const std::filesystem::path &root,
-                              const ModelDescriptor &descriptor) {
+                              const ModelDescriptor &descriptor,
+                              const ModelLoadOptions &options) {
   LoadedModel result;
   result.descriptor = descriptor;
   if (!result.descriptor.valid())
@@ -70,16 +76,23 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   // the vision tower's and the draft's here, the target's by its loader.
   const auto vision = planVisionLoader(root, result.descriptor);
   DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
+  // The weights that stream from their files read on one set of readers.
+  const auto readers = options.streamedTableBytes || options.expertMemoryBytes
+                           ? std::make_shared<WeightReaders>(kWeightReaders)
+                           : nullptr;
+  const ExpertStoreOptions experts{.memoryBytes = options.expertMemoryBytes, .readers = readers};
   result.target = std::visit(
       [&](const auto &layout) -> TargetWeights {
         const std::filesystem::path directory = root / "target";
         switch (result.descriptor.targetSource) {
         case TargetSource::Safetensors: {
-          SafetensorsTargetLoader loader(backend, images, directory, layout);
+          SafetensorsTargetLoader loader(backend, images, directory, layout, experts);
           return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {
-          GgufTargetLoader loader(backend, images, findTargetGguf(directory), layout);
+          // A streamed table's store (ModelLoadOptions::streamedTableBytes).
+          const SparseRowStoreOptions table{.cacheBytes = options.streamedTableBytes, .readers = readers};
+          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout, table, experts);
           return readTarget(backend, layout, std::ref(loader));
         }
         }
@@ -100,18 +113,40 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   return result;
 }
 
-uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
-  uint64_t bytes = 0;
-  if (descriptor.targetSource == TargetSource::Gguf) {
-    WeightSource source(findTargetGguf(root / "target"));
-    const GgufFile file(source);
-    bytes = std::visit(
-        [&](const auto &layout) { return imageBytes(gguf::planImages(file, layout)); },
-        descriptor.target);
-  } else {
-    bytes = std::visit([&](const auto &layout) { return safetensorsTargetImageBytes(root / "target", layout); },
-                       descriptor.target);
-  }
+uint64_t routedExpertBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
+  return std::visit(
+      [&](const auto &layout) -> uint64_t {
+        if (layout.ffnKind != QwenFfnKind::SparseMoe) return 0;
+        if (descriptor.targetSource != TargetSource::Gguf) return safetensorsRoutedExpertBytes(root / "target", layout);
+        return ggufTargetBytes(root, layout, {.streamExperts = true}, gguf::streamedExpertBytes);
+      },
+      descriptor.target);
+}
+
+uint64_t streamableTableBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
+  if (descriptor.targetSource != TargetSource::Gguf) return 0;
+  return std::visit(
+      [&](const auto &layout) {
+        return ggufTargetBytes(root, layout, {.streamTable = true}, gguf::streamedTableBytes);
+      },
+      descriptor.target);
+}
+
+uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor,
+                          const ModelLoadOptions &options) {
+  const gguf::PlanOptions plan{.streamExperts = options.expertMemoryBytes != 0,
+                               .streamTable = options.streamedTableBytes != 0};
+  uint64_t bytes = std::visit(
+      [&](const auto &layout) {
+        return descriptor.targetSource == TargetSource::Gguf
+                   ? ggufTargetBytes(root, layout, plan, gguf::loadedBytes)
+                   : safetensorsTargetImageBytes(root / "target", layout, plan);
+      },
+      descriptor.target);
+  // A store allocates at most its memory (ExpertStoreOptions::memoryBytes).
+  if (plan.streamExperts &&
+      std::visit([](const auto &layout) { return layout.ffnKind == QwenFfnKind::SparseMoe; }, descriptor.target))
+    bytes += options.expertMemoryBytes;
   bytes += draftImageBytes(root / "draft", descriptor.draft);
   if (descriptor.hasVision())
     bytes += visionImageBytes(descriptor.vision);

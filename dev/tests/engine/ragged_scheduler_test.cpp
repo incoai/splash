@@ -170,6 +170,65 @@ void testWarmupTimingSeedsFirstContendedCommand() {
   }
 }
 
+// A command's wait on its host steps (a streamed target's expert reads) is
+// fixed whatever its rows: the contended slice fits fixed plus per-row cost,
+// and grows to twice the fixed part, so a command's rows take at least as
+// long as its fixed part and the slice has no step where the fixed part
+// alone fills it.
+void testFixedPrefillCostSizesContendedSlice() {
+  const auto slice = [](double wallMilliseconds, double hostMilliseconds) {
+    Scheduler scheduler(0.0);
+    scheduler.observePrefill(2048, wallMilliseconds, hostMilliseconds);
+    scheduler.submit(request(1, 20'000));
+    scheduler.resourcesReady(1, 0);
+    scheduler.submit(request(2, 1));
+    scheduler.resourcesReady(2, 1);
+    completeDecode(scheduler);
+    const BatchPlan plan = *scheduler.next({});
+    require(plan.kind == WorkKind::Prefill && plan.items[0].requestId == 1,
+            "expected the contended prefill");
+    return plan.items[0].tokenCount;
+  };
+  // 0.3 ms a row after the fixed part.
+  const auto wall = [](double fixed) { return fixed + 2048 * 0.3; };
+  require(slice(wall(0.0), 0.0) == 1024, "a prefill without host waits lost its per-row slice");
+  require(slice(wall(200.0), 200.0) == 512, "the contended slice ignored the fixed prefill cost");
+  require(slice(wall(490.0), 490.0) == 1024 && slice(wall(510.0), 510.0) == 1024,
+          "the contended slice jumped where the fixed part fills it");
+  require(slice(4900.0, 3400.0) == 2048, "a streamed prefill was cut below its fixed cost");
+}
+
+// A lane whose commands may be prefill groups takes one alone when nothing
+// contends: its remaining chunks split evenly over the fewest groups that
+// hold them. Beside a decoding peer it runs chunks, and a lane without groups
+// (a model without them, or a request with images) keeps to chunks.
+void testPrefillGroupsRunUncontended() {
+  const auto first = [](uint32_t prompt, uint32_t groupRows, bool contended) {
+    Scheduler scheduler(0.0);
+    // A streamed target's command: 3.4 s of its 4.9 s waiting on expert reads.
+    scheduler.observePrefill(2048, 4900.0, 3400.0);
+    RequestSpec spec = request(1, prompt);
+    spec.prefillGroupRows = groupRows;
+    scheduler.submit(spec);
+    scheduler.resourcesReady(1, 0);
+    if (contended) {
+      scheduler.submit(request(2, 1));
+      scheduler.resourcesReady(2, 1);
+      completeDecode(scheduler);
+    }
+    const BatchPlan plan = *scheduler.next({});
+    require(plan.kind == WorkKind::Prefill && plan.width() == 1 && plan.items[0].requestId == 1,
+            "expected the long prefill alone");
+    return plan.items[0].tokenCount;
+  };
+  require(first(10'000, 8192, false) == 6144, "five chunks did not split into two even prefill groups");
+  require(first(8192, 8192, false) == 8192, "four chunks did not run as one prefill group");
+  require(first(3000, 8192, false) == 3000, "a prompt of two chunks did not run as one prefill group");
+  require(first(2048, 8192, false) == 2048, "a prompt of one chunk did not run as a chunk");
+  require(first(10'000, 2048, false) == 2048, "a lane without prefill groups took more than a chunk");
+  require(first(10'000, 8192, true) == 2048, "a prefill group ran beside a decoding peer");
+}
+
 void testShortestRemainingFirstUsesActualRows() {
   engine::Scheduler scheduler(0.0);
   scheduler.submit(request(1, 17));
@@ -1053,6 +1112,8 @@ int main() {
     testHighestRunnablePriority();
     testQueuedPrefillCannotBeOvertakenIndefinitely();
     testWarmupTimingSeedsFirstContendedCommand();
+    testFixedPrefillCostSizesContendedSlice();
+    testPrefillGroupsRunUncontended();
     testShortestRemainingFirstUsesActualRows();
     testShortenedPrefillResumesFromItsRows();
     testEqualPromptsFinishInArrivalOrder();

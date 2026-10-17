@@ -1,18 +1,20 @@
 // GPU time of one GGUF projection through ops::Linear on both decode tiles (the Apple9 register tile and the staged
-// tile, on the device policy's walk) at one to four lanes and every K split, the measurements behind the split tiers
-// of runtime/ops/LinearGguf.cpp:
+// tile, on the device policy's walk) at one to four lanes and every K split, the measurements behind the tile rule and
+// split tiers of runtime/ops/LinearGguf.cpp:
 //   gguf-projection-benchmark <metallib> <fmt[+fmt+fmt]> <N[+N+N]> <K> [none|residual|gateup] [rounds]
 //                             [prefill=R[,R...]]
-// The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 256
+// The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 64
 // columns. With prefill=, it times the 128-row prefill tile instead, one case per chunk of R rows (more than 32: the
 // decode tiles run the smaller chunks) of a single segment; gateup is then the up projection's gated epilogue. The
 // weights stay DRAM-cold: a command streams every copy of a ring of at least 384 MiB once, each projection with the
-// next copy (decode gate/up: the gate and up weights of two copies). The cases run in ABBA order after a warm-up;
-// printed are the medians of `rounds` (20) commands in ms per projection, the device policy's choice marked with *.
-// Widths emulate core counts: the policy's tiers count threadgroups per core.
+// next copy (decode gate/up: the gate and up weights of two copies). The register tile reads the activation table its
+// producers write alongside their output (LinearBuffers::prepared), prepared once and not timed. The cases run in
+// ABBA order after a warm-up; printed are the medians of `rounds` (20) commands in ms per projection, the device
+// policy's choice marked with *. Widths emulate core counts: the policy's tiers count threadgroups per core.
 #include "../tests/engine/GgufFormatReference.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/Gguf.h"
 #include "ops/Linear.hpp"
 
 #include <algorithm>
@@ -101,7 +103,8 @@ int main(int argc, char **argv) {
       for (size_t i = 0; i < formats.size(); ++i) {
         const Fmt f = fmtNamed(formats[i]);
         const uint32_t n = uint32_t(std::stoul(widths[i]));
-        if (f == FMT_COUNT || !n || n % 256 || !K || K % 256) throw std::invalid_argument("bad segment " + formats[i]);
+        if (f == FMT_COUNT || !n || n % GGUF_TILE_COLUMNS || !K || K % 64)
+          throw std::invalid_argument("bad segment " + formats[i]);
         images.push_back({f, n, N, repack(f, makeNative(f, n, K, rng), n, K, nullptr)});
         N += n;
         for (const std::vector<uint8_t> *plane : {&images.back().planes.w0, &images.back().planes.w1,
@@ -133,16 +136,23 @@ int main(int argc, char **argv) {
       }
       for (uint32_t lanes = 1; lanes <= kMaximumLanes && !prefill; ++lanes) {
         const LinearWorkload w{{N, K}, lanes * kLaneRows, LinearPhase::Decode, epilogue};
-        const LinearConfig policy = linear.plan(w, ring.front()).configuration();
+        const LinearConfig policy =
+            linear.plan(w, ring.front(), epilogue == LinearEpilogue::GateUp ? &ring.front() : nullptr).configuration();
+        // The staged tile walks K and runs gate/up as the policy's staged plans do (where the device registers a
+        // step, those it runs on more lanes).
+        const LinearConfig wide =
+            linear.plan({{N, K}, kMaximumDecodeTileRows, LinearPhase::Decode, epilogue}, ring.front(),
+                        epilogue == LinearEpilogue::GateUp ? &ring.front() : nullptr).configuration();
         for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged})
           for (uint32_t splits = 1; splits <= LinearConfig::kMaximumSplits; splits *= 2) {
             const bool registerTile = tile == LinearTile::GgufRegister;
-            // The register tile takes the formats of quant_register_format only.
+            // The register tile takes the weights of quant_register_tensor only.
             if (registerTile && !std::all_of(images.begin(), images.end(),
-                                             [](const Image &i) { return quant_register_format(i.format); }))
+                                             [&](const Image &i) { return quant_register_tensor(i.format, K); }))
               continue;
             if (registerTile ? K / 256 < splits : (K / 32) % splits) continue;
-            const LinearConfig config{.tile = tile, .splits = splits, .spread = !registerTile && policy.spread};
+            const LinearConfig config{.tile = tile, .splits = splits, .spread = !registerTile && wide.spread,
+                                      .oneGateUpPass = !registerTile && wide.oneGateUpPass};
             cases.push_back({"L" + std::to_string(lanes),
                              std::string(registerTile ? "register" : "staged") + " S" + std::to_string(splits),
                              Linear::plan(w, config, FloatOutput::BFloat16), config == policy, {}});
@@ -169,12 +179,26 @@ int main(int argc, char **argv) {
         for (uint64_t i = 0; i < rows * K; ++i) x[i] = __bf16(unit(rng));
       }
       const LinearScratch scratch{zeros(size.input), zeros(size.sums), zeros(size.partials), zeros(size.counters)};
+      // The register tile's table, prepared by its widest plan, whose plans of fewer rows read its leading tiles.
+      PreparedInput table;
+      const Case *widest = nullptr;
+      for (const Case &c : cases)
+        if (c.plan.input() == LinearInput::Table16 && (!widest || c.plan.storageRows() > widest->plan.storageRows()))
+          widest = &c;
+      if (widest) {
+        CommandGraph graph;
+        table = linear.add(graph, {.input = input, .output = output, .residual = residual, .gateScratch = gate,
+                                   .scratch = scratch}, ring.front(), widest->plan,
+                           epilogue == LinearEpilogue::GateUp ? &ring.front() : nullptr);
+        static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+      }
       uint32_t next = 0;
       const auto time = [&](Case &c) {
         CommandGraph graph;
         const LinearBuffers b{.input = input, .output = output,
                               .residual = epilogue == LinearEpilogue::Residual ? residual : MetalBuffer{},
-                              .gateScratch = gate, .scratch = scratch};
+                              .gateScratch = gate, .scratch = scratch,
+                              .prepared = c.plan.input() == LinearInput::Table16 ? table : PreparedInput{}};
         const uint32_t step = epilogue == LinearEpilogue::GateUp ? 2 : 1;
         for (uint32_t i = 0; i < copies / step; ++i, next += step)
           static_cast<void>(linear.add(graph, b, ring[next % copies], c.plan,
