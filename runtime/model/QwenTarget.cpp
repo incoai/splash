@@ -82,28 +82,24 @@ uint32_t routedExpertFormat(std::span<const Qwen3_6MoeLayerWeights> layers) {
   const auto most = std::max_element(weights.begin(), weights.end());
   return *most ? uint32_t(most - weights.begin()) : GGUF_FMT_COUNT;
 }
-// Whether every routed and shared expert weight of a target's MoE blocks is in
-// a format the register tile takes (ops::MoeShape::registerFormats).
+// Whether the register tile takes every routed and shared expert weight of a
+// target's MoE blocks (ops::MoeShape::registerFormats).
 bool expertRegisterFormats(std::span<const Qwen3_8LayerWeights>) { return true; }
 bool expertRegisterFormats(std::span<const Qwen3_6MoeLayerWeights> layers) {
   for (const Qwen3_6MoeLayerWeights &layer : layers)
     for (const ops::BlockExpertProjection *projection : {&layer.ffn.gate, &layer.ffn.up, &layer.ffn.down})
       for (const ops::QuantizedSegment *s : {&projection->routed, &projection->shared})
-        if (!s->isFloat() && !quant_register_format(s->formatId)) return false;
+        if (!s->isFloat() && !quant_register_tensor(s->formatId, s->inputSize)) return false;
   return true;
 }
 
 } // namespace
 
 template <class Layout, class Layer>
-QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &weights) {
+QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &weights,
+                                      std::span<const uint32_t> captureLayers) {
   const Layout &layout = weights.layout;
-  static_assert(std::tuple_size_v<decltype(Layout::hiddenCaptureLayers)> <=
-                QwenTargetGeometry::maximumCaptureLayers);
-  QwenTargetGeometry geometry(layout);
-  geometry.captureLayerCount = static_cast<uint32_t>(layout.hiddenCaptureLayers.size());
-  std::copy(layout.hiddenCaptureLayers.begin(), layout.hiddenCaptureLayers.end(),
-            geometry.captureLayerValues.begin());
+  QwenTargetGeometry geometry(layout, captureLayers);
   geometry.kvLayout = layout.kvLayout();
   geometry.stateLayout = layout.gdnStateLayout();
   for (const auto &layer : weights.layers) {
@@ -125,8 +121,8 @@ QwenTargetGeometry qwenTargetGeometry(const QwenTargetWeights<Layout, Layer> &we
   return geometry;
 }
 
-template QwenTargetGeometry qwenTargetGeometry(const Qwen3_8Weights &);
-template QwenTargetGeometry qwenTargetGeometry(const Qwen3_6MoeWeights &);
+template QwenTargetGeometry qwenTargetGeometry(const Qwen3_8Weights &, std::span<const uint32_t>);
+template QwenTargetGeometry qwenTargetGeometry(const Qwen3_6MoeWeights &, std::span<const uint32_t>);
 
 const ops::Projection &QwenTarget::vocabularyProjection() const noexcept {
   return weightsBase_.logitsProjection;
@@ -166,10 +162,15 @@ void addCapture(metal::CommandGraph &graph, const QwenTargetGeometry &geometry, 
                     {destinationRow, capturedWidth, slot * width}, rows, width);
 }
 
+// A layer's MoE block, null for a dense FFN.
+const ops::BlockMoeWeights *moeOf(const Qwen3_8LayerWeights &) { return nullptr; }
+template <class Layer> const ops::BlockMoeWeights *moeOf(const Layer &layer) { return &layer.ffn; }
+
 } // namespace
 
-// The state a prefill command's layers share: its inputs and the next GDN
-// and attention layer of the step.
+// The state a prefill command's layers share: its inputs, the buffers the
+// layer's MoE routes and runs through, and the next GDN and attention layer
+// of the step.
 struct QwenTarget::PrefillStep {
   metal::CommandGraph &graph;
   const QwenTargetPrefillBuffers &buffers;
@@ -179,6 +180,9 @@ struct QwenTarget::PrefillStep {
   // Each sequence's attention plan, which every attention layer runs.
   std::vector<ops::PrefillAttentionPlan> attention{};
   std::optional<ops::MoePlan> moe{};
+  // The layer's MoE buffers, which its routing (addPrefillLayer), the layer's
+  // load and its routed work (addPrefillExperts) share.
+  ops::MoeBuffers ffn{};
   ops::AneFfn *aneFfn = nullptr;
   uint32_t gdnLayer = 0;
   uint32_t attentionLayer = 0;
@@ -227,23 +231,47 @@ metal::MetalBuffer QwenTarget::addPrefill(
   if (aneFfn && aneFfn->splits(rows)) step.aneFfn = aneFfn;
   std::visit([&](const auto *weights) {
     for (uint32_t index = 0; index < geometry_.layers; ++index) {
-      const auto &layer = weights->layers[index];
-      const metal::MetalBuffer input = buffers.hidden[index & 1];
-      const metal::MetalBuffer output = buffers.hidden[(index & 1) ^ 1];
-      const metal::MetalBuffer residual = std::visit(
-          [&](const auto &mixer) { return addPrefillMixer(step, mixer, layer.inputNorm, input); }, layer.mixer);
-      addPrefillFfn(step, index, layer, residual, output);
-      if (const auto slot = geometry_.captureSlot(index))
-        for (const QwenTargetPrefillSequence &sequence : sequences)
-          for (uint32_t capture = 0; capture < sequence.captureCount; ++capture) {
-            const QwenTargetPrefillCapture &c = sequence.captures[capture];
-            addCapture(graph, geometry_, *slot, output, c.sourceStart, buffers.captured, c.destinationStart,
-                       c.rows);
-          }
+      addPrefillLayer(step, *weights, index);
+      // Streamed experts: the load of those the step's rows route.
+      if (const ops::BlockMoeWeights *ffn = moeOf(weights->layers[index]); ffn && ffn->stream) {
+        const ops::MoeLoadPart part{&step.ffn, &*step.moe};
+        ffn->stream->addLoad(graph, {&part, 1}, ffn->streamBlock);
+      }
+      addPrefillExperts(step, *weights, index);
     }
   }, weights_);
   requireLayerPartition(geometry_, step.gdnLayer, step.attentionLayer);
   return buffers.hidden[geometry_.layers & 1];
+}
+
+// Qwen3.5 and Qwen3.6 (model/Qwen3_8.hpp, model/Qwen3_6Moe.hpp). Layer l
+// reads its input rows from buffers.hidden[l & 1] and adds its mixer's and
+// its FFN's output to them into the other; the layers the draft reads copy
+// their output rows into buffers.captured.
+template <class Layout, class Layer>
+void QwenTarget::addPrefillLayer(PrefillStep &step, const QwenTargetWeights<Layout, Layer> &weights,
+                                 uint32_t index) const {
+  const Layer &layer = weights.layers[index];
+  const QwenTargetPrefillBuffers &b = step.buffers;
+  const metal::MetalBuffer input = b.hidden[index & 1];
+  const metal::MetalBuffer residual = std::visit(
+      [&](const auto &mixer) { return addPrefillMixer(step, mixer, layer.inputNorm, input); }, layer.mixer);
+  addPrefillFfn(step, index, layer, residual, b.hidden[(index & 1) ^ 1]);
+}
+
+template <class Layout, class Layer>
+void QwenTarget::addPrefillExperts(PrefillStep &step, const QwenTargetWeights<Layout, Layer> &weights,
+                                   uint32_t index) const {
+  const QwenTargetPrefillBuffers &b = step.buffers;
+  if (const ops::BlockMoeWeights *ffn = moeOf(weights.layers[index]))
+    ops::MoE::addRouted(step.graph, step.ffn, *ffn, *step.moe);
+  if (const auto slot = geometry_.captureSlot(index))
+    for (const QwenTargetPrefillSequence &sequence : step.sequences)
+      for (uint32_t capture = 0; capture < sequence.captureCount; ++capture) {
+        const QwenTargetPrefillCapture &c = sequence.captures[capture];
+        addCapture(step.graph, geometry_, *slot, b.hidden[(index & 1) ^ 1], c.sourceStart, b.captured,
+                   c.destinationStart, c.rows);
+      }
 }
 
 // The normalized rows a layer's prefill projections read.
@@ -345,9 +373,9 @@ void QwenTarget::addPrefillFfn(PrefillStep &step, uint32_t index, const Qwen3_8L
 void QwenTarget::addPrefillFfn(PrefillStep &step, uint32_t, const Qwen3_6MoeLayerWeights &layer,
                                metal::MetalBuffer residual, metal::MetalBuffer output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
-  ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize,
-                             step.rows);
-  ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe}, layer.ffn, *step.moe);
+  addPrefillNorm(step, residual, layer.postAttentionNorm);
+  step.ffn = {b.normalized, residual, output, b.moe};
+  ops::MoE::addRouting(step.graph, step.ffn, layer.ffn, *step.moe);
 }
 
 void QwenTarget::addVerify(

@@ -1565,7 +1565,7 @@ void testIdleWeightsAreReleasedAndRestored(bool releasable) {
   constexpr double kIdleReleaseSeconds = 2.0;
   constexpr double idleRelease = 1000.0 * kIdleReleaseSeconds;
   Weights weights;
-  ReleasableMemory memory(weights, std::nullopt);
+  ReleasableMemory memory({&weights}, std::nullopt);
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
   config.weights = releasable ? static_cast<model::WeightMemory *>(&memory) : &weights;
@@ -1659,7 +1659,7 @@ void testIdleReleaseRestoresTheSplitLast() {
   bool loaded = true, released = false, stopped = false, failLoad = false;
   uint32_t loads = 0;
   ReleasableMemory memory(
-      weights, ReleasableMemory::Split{
+      {&weights}, ReleasableMemory::Split{
                    [&] {
                      require(weights.released(),
                              "the split's program was unloaded before the images were released");
@@ -1770,7 +1770,7 @@ void testRefusedRestoreWaitsForMemory() {
                           [&] { return hostMemory(hostAvailable); }, 0);
   Weights weights;
   uint32_t programReleases = 0, programLoads = 0;
-  ReleasableMemory memory(weights, ReleasableMemory::Split{[&] {
+  ReleasableMemory memory({&weights}, ReleasableMemory::Split{[&] {
                                                              ++programReleases;
                                                              return true;
                                                            },
@@ -1926,7 +1926,7 @@ void testIdleReleaseOffReleasesOnlyOnRequest() {
 // request restores them as after the idle release.
 void testReleaseRequestGivesTheWeightsBackWhenIdle() {
   Weights weights;
-  ReleasableMemory memory(weights, std::nullopt);
+  ReleasableMemory memory({&weights}, std::nullopt);
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
   config.weights = &memory;

@@ -254,7 +254,7 @@ bool Engine::tick(double now) {
     pending_.reset();
     std::vector<ModelStepResult> results = command.ticket->wait();
     apply(command.plan, command.captures, results, command.ticket->wallMilliseconds(),
-          now - command.startedMilliseconds,
+          command.ticket->hostMilliseconds(), now - command.startedMilliseconds,
           command.ticket->prefillTimingIsRepresentative(), now);
     busySinceMilliseconds_ = now;
     sweepTerminal();
@@ -1825,8 +1825,8 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
 
 void Engine::apply(const BatchPlan &plan, std::span<const std::vector<Capture>> captures,
                    std::span<const ModelStepResult> results, double wallMilliseconds,
-                   double cycleMilliseconds, bool representativePrefillTiming,
-                   double now) {
+                   double hostMilliseconds, double cycleMilliseconds,
+                   bool representativePrefillTiming, double now) {
   if (results.size() != plan.items.size()) {
     throw std::logic_error("model result count changed");
   }
@@ -1974,7 +1974,7 @@ void Engine::apply(const BatchPlan &plan, std::span<const std::vector<Capture>> 
     }
   }
   scheduler_.complete(plan, schedulerResults, wallMilliseconds,
-                      representativePrefillTiming);
+                      representativePrefillTiming, hostMilliseconds);
   events_.batchCompleted(plan.kind, plan.width(), inputTokens, outputTokens,
                          draftedTokens, acceptedDraftTokens, wallMilliseconds,
                          cycleMilliseconds);

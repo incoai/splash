@@ -6,6 +6,7 @@
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryAudit.hpp"
 #include "engine/ThermalState.hpp"
+#include "model/SparseRowStore.hpp"
 
 #include <algorithm>
 #include <array>
@@ -289,6 +290,7 @@ struct AneFfnSnapshot {
     const MemoryGovernorSnapshot &memoryGovernor, bool metalHealthy,
     std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait,
     const NativeLoopTiming &loop, const WeightsSnapshot &weights,
-    const AneFfnSnapshot &aneFfn, ThermalState thermalState);
+    const AneFfnSnapshot &aneFfn, ThermalState thermalState,
+    const std::optional<model::SparseRowStats> &streamedTable = std::nullopt);
 
 } // namespace splash::engine

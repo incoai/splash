@@ -136,7 +136,7 @@ std::string RuntimeBootstrap::statusJson(const RuntimeMetricsSnapshot &metrics,
       resources_->cacheIdentity(), resources_->memoryGovernor().snapshot(),
       healthy, healthy ? std::string{} : backend.unhealthyReason(),
       nativeLoop_->resourceWaitSnapshot(), loop, nativeLoop_->weightsSnapshot(),
-      resources_->aneFfnSnapshot(), thermalState_.state());
+      resources_->aneFfnSnapshot(), thermalState_.state(), resources_->streamedTableStats());
 }
 
 void RuntimeBootstrap::sampleThermalState() {
@@ -189,7 +189,7 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
             return modelRuntime.warmupPrefill(model::ExecutionLimits::prefillTokenBudget);
           });
   nativeLoop.observePrefill(model::ExecutionLimits::prefillTokenBudget,
-                           maximumPrefill.wallSeconds * 1000.0);
+                           maximumPrefill.wallSeconds * 1000.0, maximumPrefill.hostSeconds * 1000.0);
   report.warmup.maximumPrefillDetail = maximumPrefill.detail;
   const auto &budget = memoryPlan.breakdown();
   // Startup exercises only widths that fit this budget. This is not a

@@ -55,4 +55,23 @@ QwenMixerWeights readQwenMixer(WeightFile &file, const BlockTargetFormat &format
   return gdn;
 }
 
+MoeExperts openMoeExperts(metal::MetalBackend &backend, const QwenTargetDimensions &target) {
+  return {residentExpertSlots(backend, target.experts), target.experts};
+}
+
+ops::BlockMoeWeights readMoeBlock(WeightFile &file, const MoeExperts &experts) {
+  ops::BlockMoeWeights ffn;
+  ffn.router = readQuantizedSegment(file, "router");
+  ffn.gate.routed = readQuantizedSegment(file, "experts-gate");
+  ffn.up.routed = readQuantizedSegment(file, "experts-up");
+  ffn.down.routed = readQuantizedSegment(file, "experts-down");
+  ffn.slotTable = experts.resident;
+  ffn.slots = experts.experts;
+  ffn.gate.shared = readQuantizedSegment(file, "shared-expert-gate");
+  ffn.up.shared = readQuantizedSegment(file, "shared-expert-up");
+  ffn.down.shared = readQuantizedSegment(file, "shared-expert-down");
+  ffn.sharedScalarGate = readQuantizedSegment(file, "shared-expert-scalar-gate");
+  return ffn;
+}
+
 } // namespace splash::model
