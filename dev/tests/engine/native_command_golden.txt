@@ -30,3 +30,5 @@ idle_sleep | --allow-idle-sleep | auto auto --idle-sleep allow
 disable_ane | --disable-ane | auto auto --ane off
 relaunch |  | auto auto --relaunch-context 61433
 relaunch_limits | --max-context 100K --max-memory 32G | 102400 34359738368
+ple_ssd_cache | --ple-ssd-cache 2G | auto auto --ple-ssd-cache 2147483648
+expert_memory | --expert-memory 16G | auto auto --expert-memory 17179869184

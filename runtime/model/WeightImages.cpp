@@ -68,7 +68,7 @@ std::vector<WeightImages::Contents> WeightImages::contents() const {
 
 unsigned loadThreads() noexcept { return std::max(1u, std::thread::hardware_concurrency()); }
 
-void parallelFor(size_t count, const std::function<void(size_t index, unsigned thread)> &task) {
+void parallelFor(size_t count, const std::function<void(size_t index, unsigned thread)> &task, unsigned workers) {
   struct Work {
     Work(const std::function<void(size_t, unsigned)> &task, size_t count) : task(task), count(count) {}
     const std::function<void(size_t, unsigned)> &task;
@@ -80,7 +80,8 @@ void parallelFor(size_t count, const std::function<void(size_t index, unsigned t
   } work(task, count);
   // Each worker takes indices until none is left; libdispatch runs the
   // workers on its own threads.
-  dispatch_apply_f(std::min<size_t>(count, loadThreads()), DISPATCH_APPLY_AUTO, &work, [](void *context, size_t thread) {
+  const size_t threads = std::min<size_t>(count, std::max(workers, 1u));
+  dispatch_apply_f(threads, DISPATCH_APPLY_AUTO, &work, [](void *context, size_t thread) {
     auto &work = *static_cast<Work *>(context);
     for (size_t index; !work.failed.load(std::memory_order_relaxed) && (index = work.next++) < work.count;) {
       try {

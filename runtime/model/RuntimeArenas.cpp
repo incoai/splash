@@ -4,6 +4,7 @@
 #include "ops/Sampling.hpp"
 
 namespace splash::model {
+
 std::array<uint64_t, prefillTensorCount>
 prefillTensorBytes(const RuntimeGeometry &geometry,
                    const ops::ExecutionPlans &operators) {
@@ -46,8 +47,6 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   put(PrefillTensor::GdnHidden,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
                          geometry.target.attentionWidth));
-  put(PrefillTensor::GdnOutput,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
   put(PrefillTensor::GateIntermediate,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
                          geometry.target.intermediateSize));
@@ -74,8 +73,10 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   put(PrefillTensor::AttentionHidden,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
                          geometry.target.attentionWidth));
-  put(PrefillTensor::AttentionOutput,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
+  // The rows a mixer adds its output to, which the FFN adds to.
+  if (geometry.target.mixersAddToHidden())
+    for (const PrefillTensor tensor : {PrefillTensor::GdnOutput, PrefillTensor::AttentionOutput})
+      put(tensor, bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
   // Three rotary axes per row (Qwen3.5 M-RoPE); text rows repeat one value.
   put(PrefillTensor::TargetPositions,
       bytesFor<uint32_t>(uint64_t{kPrefillRows} * 3));
@@ -113,7 +114,7 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   // prefill plan, the draft's context projections' too.
   const auto &draft = geometry.draft;
   std::vector<ops::ProjectionShape> prefillProjections = geometry.target.prefillProjections;
-  prefillProjections.push_back({draft.hiddenSize, draft.targetHiddenSize});
+  prefillProjections.push_back({draft.hiddenSize, draft.targetHiddenSize()});
   prefillProjections.push_back({draft.contextKvSize(), draft.hiddenSize});
   for (const auto &projection : prefillProjections) {
     const ops::LinearScratchSize linear = operators.linear().prefillScratchSize(projection);
@@ -128,16 +129,31 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       put(moeScratchTensor<PrefillTensor>(field),
           workspace.*ops::kMoeScratchFields[field].bytes);
   }
+  // A prefill group's tensors hold every chunk's rows, each chunk's aligned,
+  // and its chain's scratch cell.
+  if (geometry.prefillChunks > 1) {
+    for (uint32_t index = 0; index < result.size(); ++index)
+      if (result[index] && prefillGroupTensor(static_cast<PrefillTensor>(index)))
+        result[index] = alignUp(result[index]) * geometry.prefillChunks;
+    put(PrefillTensor::GroupCell, geometry.target.stateLayout.cellBytes());
+  }
   return result;
 }
 
-uint64_t plannedPrefillBytes(const RuntimeGeometry &geometry,
-                            const ops::ExecutionPlans &operators) {
+uint64_t prefillArenaBytes(const RuntimeGeometry &geometry,
+                          const ops::ExecutionPlans &operators) {
   uint64_t bytes = 0;
   for (uint64_t value : prefillTensorBytes(geometry, operators)) {
     bytes = checkedAdd(bytes, alignUp(value), "prefill arena");
   }
   return bytes;
+}
+
+uint64_t plannedPrefillBytes(const RuntimeGeometry &geometry,
+                            const ops::ExecutionPlans &operators) {
+  return checkedAdd(prefillArenaBytes(geometry, operators),
+                    QwenTarget::scratchBytes(geometry.target, geometry.prefillChunks).prefill,
+                    "prefill scratch");
 }
 
 static uint64_t gdnPackedStride(const RuntimeGeometry &geometry) noexcept {
@@ -212,7 +228,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::ContextKv,
       bytesFor<uint16_t>(r * geometry.draft.contextKvSize()));
   put(DecodeTensor::CapturedTargetHidden,
-      bytesFor<uint16_t>(r * geometry.draft.targetHiddenSize));
+      bytesFor<uint16_t>(r * geometry.draft.targetHiddenSize()));
   put(DecodeTensor::DraftQueryKeys, draftWorkspace.queryKeysBytes);
   put(DecodeTensor::DraftQueryValues, draftWorkspace.queryValuesBytes);
   // Proposal attention and accepted target-hidden injection use the same
@@ -311,18 +327,25 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
        {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
        {d.hiddenSize, d.attentionSize},
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
-       {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize}})
+       {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize()}})
     result.include(operators.linear().decodeScratchSize(shape));
   return result;
 }
 
-uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
-                           const ops::ExecutionPlans &operators) {
+uint64_t decodeArenaBytes(const RuntimeGeometry &geometry,
+                         const ops::ExecutionPlans &operators) {
   return checkedAdd(decodeArenaBaseBytes(geometry, operators),
                     checkedAdd(DecodeArena::gateScratchBytes(geometry, operators),
                                DecodeArena::linearScratchSize(geometry, operators).bytes(),
                                "linear decode scratch"),
                     "planned gate scratch");
+}
+
+uint64_t plannedDecodeBytes(const RuntimeGeometry &geometry,
+                           const ops::ExecutionPlans &operators) {
+  return checkedAdd(decodeArenaBytes(geometry, operators),
+                    QwenTarget::scratchBytes(geometry.target, geometry.prefillChunks).decode,
+                    "decode scratch");
 }
 
 } // namespace splash::model

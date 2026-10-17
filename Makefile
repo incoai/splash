@@ -228,6 +228,9 @@ ENGINE_INSTRUMENTED_METAL_OBJECT := $(ENGINE_BUILD)/metal/MetalBackendInstrument
 # Program with the fault seam ane/ProgramInstrumentation.hpp declares, linked
 # the same way.
 ENGINE_INSTRUMENTED_ANE_OBJECT := $(ENGINE_BUILD)/ane/ProgramInstrumented.o
+# Runtime with the test seam model/RuntimeInstrumentation.hpp declares, linked
+# the same way.
+ENGINE_INSTRUMENTED_RUNTIME_OBJECT := $(ENGINE_BUILD)/model/RuntimeInstrumented.o
 ENGINE_CPP_SOURCES := \
 	runtime/ops/AneFfn.cpp \
 	runtime/ops/AneFfnCalibration.cpp \
@@ -241,6 +244,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/LinearGguf.cpp \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \
+	runtime/ops/Qwen4.cpp \
 	runtime/ops/PagedAttention.cpp \
 	runtime/ops/PageStorage.cpp \
 	runtime/ops/RoPE.cpp \
@@ -277,10 +281,14 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/SafetensorsTarget.cpp \
 	runtime/model/DraftCheckpoint.cpp \
 	runtime/model/WeightSource.cpp \
+	runtime/model/SparseRowStore.cpp \
 	runtime/model/WeightImages.cpp \
 	runtime/model/GgufPreparation.cpp \
+	runtime/model/ExpertStore.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \
+	runtime/model/Qwen4Exp.cpp \
+	runtime/model/Qwen4Steps.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/VisionPreparation.cpp \
 	runtime/model/VisionLoader.cpp \
@@ -306,9 +314,11 @@ ENGINE_OBJECTS := \
 	$(ENGINE_METAL_RUNTIME_OBJECT)
 PRODUCTION_CONFIG_TARGETS := $(ENGINE_OBJECTS) $(ENGINE_MAIN_OBJECT) \
 	$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_INSTRUMENTED_ANE_OBJECT) \
+	$(ENGINE_INSTRUMENTED_RUNTIME_OBJECT) \
 	$(ENGINE_LIBRARY) $(PRODUCTION_AIRS) $(LIB) $(TARGET)
 ENGINE_DEPFILES := $(ENGINE_OBJECTS:.o=.d) $(ENGINE_MAIN_OBJECT:.o=.d) \
-	$(ENGINE_INSTRUMENTED_METAL_OBJECT:.o=.d) $(ENGINE_INSTRUMENTED_ANE_OBJECT:.o=.d)
+	$(ENGINE_INSTRUMENTED_METAL_OBJECT:.o=.d) $(ENGINE_INSTRUMENTED_ANE_OBJECT:.o=.d) \
+	$(ENGINE_INSTRUMENTED_RUNTIME_OBJECT:.o=.d)
 
 -include $(ENGINE_DEPFILES)
 
@@ -346,6 +356,11 @@ $(ENGINE_INSTRUMENTED_ANE_OBJECT): runtime/ane/Program.mm
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_DEPFLAGS) \
 		-DSPLASH_ANE_INSTRUMENTATION=1 -c $< -o $@
+
+$(ENGINE_INSTRUMENTED_RUNTIME_OBJECT): runtime/model/Runtime.cpp
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_CXXFLAGS) $(ENGINE_DEPFLAGS) \
+		-DSPLASH_RUNTIME_INSTRUMENTATION=1 -c $< -o $@
 
 $(ENGINE_MAIN_OBJECT): runtime/main.mm $(BUILD_ID_HEADER)
 	@mkdir -p $(dir $@)

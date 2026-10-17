@@ -9,6 +9,8 @@ namespace splash::ops {
 
 class RoPE final {
 public:
+  // A step's tables (RopeTableParams): its target rows' and its draft
+  // rows'.
   static void addTables(
       metal::CommandGraph &graph, metal::MetalBuffer targetPositions,
       metal::MetalBuffer draftPositions,

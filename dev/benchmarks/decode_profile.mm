@@ -1,7 +1,8 @@
 // Per-kernel GPU time attribution for the production executor.
 //
 //   decode-profile METALLIB MODEL_ROOT [--prompt-tokens N] [--cycles K] [--kv-format int8|bf16]
-//                  [--state-format fp32|bf16]
+//                  [--state-format fp32|bf16] [--expert-memory BYTES] [--ple-ssd-cache BYTES]
+//                  [--dispatch-list FILE]
 //   decode-profile METALLIB MODEL_ROOT --images HxW[,HxW...] [--cycles K]
 //
 // Drives the real model runtime with Metal dispatch profiling enabled, so
@@ -9,7 +10,8 @@
 // is replayed as its own command and attributed to its pipeline.
 // The fused (unprofiled) GPU time of the same work is reported alongside, so
 // the gap between the sum of parts and the fused command shows how much a
-// cycle pays in dispatch boundaries rather than kernel work.
+// cycle pays in dispatch boundaries rather than kernel work. --dispatch-list
+// writes the attributed B1 cycles' dispatches in order, one line each.
 // With --images it profiles the vision encoder instead, loading only the
 // model's vision role: K encodes of a synthetic image per patch grid (height
 // x width in patches), fused and then attributed.
@@ -124,6 +126,14 @@ uint32_t parseCount(std::string_view text, std::string_view label) {
       !value) {
     throw std::invalid_argument(std::string(label) + " must be positive");
   }
+  return value;
+}
+
+uint64_t parseBytes(std::string_view text, std::string_view label) {
+  uint64_t value = 0;
+  auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+  if (result.ec != std::errc{} || result.ptr != text.data() + text.size() || !value)
+    throw std::invalid_argument(std::string(label) + " must be a positive byte count");
   return value;
 }
 
@@ -295,7 +305,8 @@ int main(int argc, char **argv) {
       if (argc < 3) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
-                     "[--state-format fp32|bf16]\n"
+                     "[--state-format fp32|bf16] [--expert-memory BYTES] [--ple-ssd-cache BYTES] "
+                     "[--dispatch-list FILE]\n"
                      "       decode-profile METALLIB MODEL_ROOT "
                      "--images HxW[,HxW...] [--cycles K]\n";
         return 2;
@@ -305,7 +316,10 @@ int main(int argc, char **argv) {
       kv::Format format = kv::Format::Int8;
       ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
       std::vector<ops::ImageGrid> grids;
+      // Streamed routed experts and PLE table, as serve-native's options.
+      model::ModelLoadOptions loadOptions;
       bool textOptions = false;
+      std::string dispatchList;
       for (int index = 3; index < argc; index += 2) {
         const std::string_view option(argv[index]);
         if (index + 1 >= argc)
@@ -327,6 +341,15 @@ int main(int argc, char **argv) {
             throw std::invalid_argument("--state-format takes fp32 or bf16");
           stateFormat = value == "fp32" ? ops::GdnStateFormat::Float32 : ops::GdnStateFormat::BFloat16;
           textOptions = true;
+        } else if (option == "--expert-memory") {
+          loadOptions.expertMemoryBytes = parseBytes(argv[index + 1], "--expert-memory");
+          textOptions = true;
+        } else if (option == "--ple-ssd-cache") {
+          loadOptions.pleCacheBytes = parseBytes(argv[index + 1], "--ple-ssd-cache");
+          textOptions = true;
+        } else if (option == "--dispatch-list") {
+          dispatchList = argv[index + 1];
+          textOptions = true;
         } else if (option == "--images")
           grids = parseGrids(argv[index + 1]);
         else
@@ -344,7 +367,7 @@ int main(int argc, char **argv) {
         return 0;
       }
       model::LoadedModel model =
-          model::loadModel(backend, root, model::inspectModelRoot(root));
+          model::loadModel(backend, root, model::inspectModelRoot(root), loadOptions);
       ops::ExecutionPlans operators(backend.capabilities());
 
       // Enough Page32 pages for four lanes of prompt plus generated rows.
@@ -422,9 +445,18 @@ int main(int argc, char **argv) {
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
           static_cast<void>(decodeCycle(backend, executor, active));
         BackendInstrumentation::setDispatchProfiling(backend, false);
+        const std::vector<metal::DispatchTiming> timings =
+            BackendInstrumentation::takeDispatchProfile(backend);
+        if (!dispatchList.empty() && active.size() == 1) {
+          FILE *file = std::fopen(dispatchList.c_str(), "w");
+          if (!file) throw std::runtime_error("cannot write " + dispatchList);
+          for (size_t index = 0; index < timings.size(); ++index)
+            std::fprintf(file, "%zu %s %.2f\n", index, timings[index].pipelineName.c_str(),
+                         timings[index].gpuSeconds * 1e6);
+          std::fclose(file);
+        }
         Table table;
-        accumulate(table,
-                   BackendInstrumentation::takeDispatchProfile(backend));
+        accumulate(table, timings);
         print(title, table, cycles, median.gpuSeconds);
       };
       profileWidth("B1 decode cycle", std::span<Lane>(&lanes[0], 1));

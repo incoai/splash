@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -15,10 +16,10 @@
 namespace splash::metal {
 
 // An ordered dispatch list for one command, with the event steps that order
-// it against another agent (EventStep); MetalBackend splits a command into
-// Metal command buffers at its event signals. Buffers bind at indices
-// 0..n-1; an optional parameter struct binds at index n and is copied into
-// graph-owned storage until submission.
+// it against another agent or the CPU (EventStep); MetalBackend splits a
+// command into Metal command buffers at its event signals and host steps.
+// Buffers bind at indices 0..n-1; an optional parameter struct binds at
+// index n and is copied into graph-owned storage until submission.
 class CommandGraph final {
 public:
   static constexpr uint32_t kDefaultThreads = 256;
@@ -67,6 +68,15 @@ public:
   }
   void wait(SharedEvent event, uint64_t value) {
     step(std::move(event), value, EventStep::Kind::Wait);
+  }
+  // A host step after the dispatches added so far (EventStep::Kind::Host):
+  // `work` runs on the CPU between the work before and the work after it,
+  // `timed` gets its round trip once the command completed, and with `awake`
+  // the GPU spins through it.
+  void host(std::function<void()> work, std::function<void(const HostStepTiming &)> timed = {},
+            bool awake = false) {
+    events_.push_back(
+        {dispatches_.size(), {}, 0, EventStep::Kind::Host, std::move(work), std::move(timed), awake});
   }
 
   [[nodiscard]] bool empty() const noexcept { return dispatches_.empty(); }

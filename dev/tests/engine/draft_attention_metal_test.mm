@@ -51,8 +51,11 @@ constexpr uint32_t kAttention = kKvHeads * kQueryHeadsPerKv * kHeadDim;
 constexpr uint32_t kGroupRows = kQueryHeadsPerKv * kRows;
 constexpr float kScale = 0.08838834765F;
 
+// The drafts of Qwen3.8-27B, Qwen3.8-Flash-Next and Qwen3.6-35B-A3B: one
+// convolution kernel takes every hidden width.
 constexpr std::array kShapes{
     DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128},
+    DraftAttentionShape{2560, 640, 6144, 4096, 32, 8, 128},
     DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128}};
 
 using splash::test::rejects;
@@ -268,6 +271,11 @@ void planGeometry() {
   rejects([&] { (void)DraftAttention::plan(unsupported, 1); },
           "unsupported compiled draft attention shape",
           "a draft shape without a compiled kernel was accepted");
+  // A hidden width of a partial convolution group.
+  const DraftAttentionShape partialGroup{2056, 512, 6144, 4096, 32, 8, 128};
+  rejects([&] { (void)DraftAttention::plan(partialGroup, 1); },
+          "unsupported compiled draft attention shape",
+          "a draft of a partial convolution group was accepted");
   rejects([&] { (void)DraftAttention::plan({}, 1); }, "unsupported compiled draft attention shape",
           "an empty draft shape was accepted");
 }
@@ -330,10 +338,10 @@ void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
     DraftAttention::addConvolution(graph,
         {input, dynamic, weights, residual, output}, plan, stage);
     const bool finish = stage == DraftConvolutionStage::Residual;
-    uint32_t params = 0;
-    std::memcpy(&params, graph.dispatches()[0].bytes[0].data, sizeof(params));
+    std::array<uint32_t, 2> params{};
+    std::memcpy(params.data(), graph.dispatches()[0].bytes[0].data, sizeof(params));
     require(graph.dispatches()[0].threadgroups.x == (kRows * shape.hiddenSize + 255) / 256 &&
-                params == (finish ? 1U : 0U),
+                params[0] == (finish ? 1U : 0U) && params[1] == shape.hiddenSize,
             "convolution dispatch does not cover each element once");
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     const auto *actual = static_cast<const uint16_t *>(output.contents());

@@ -370,14 +370,16 @@ class CompileConfigurationTests(unittest.TestCase):
                 for name in ("paged_attention.metal", "paged_attention_store.metal")
             ]
             # Every test library a MetalBackend loads links the kernel that
-            # ends residency; q8-attention.metallib is loaded by raw MTLDevice
-            # tests.
+            # ends residency, and metal-backend.metallib the host step's;
+            # q8-attention.metallib is loaded by raw MTLDevice tests.
             residency_source = kernel_root / "shared/residency.metal"
+            host_step_source = kernel_root / "shared/host_step.metal"
             removed_source = kernel_root / "shared/removed.metal"
             removed_header = kernel_root / "common/removed.h"
             for relative in (
                 *paged_sources,
                 residency_source,
+                host_step_source,
                 removed_source,
                 removed_header,
                 Path("runtime/engine/Status.cpp"),
@@ -404,7 +406,12 @@ class CompileConfigurationTests(unittest.TestCase):
                     / "metal"
                     / source.relative_to(kernel_root).with_suffix(".air")
                 )
-                for source in (*paged_sources, residency_source, removed_source)
+                for source in (
+                    *paged_sources,
+                    residency_source,
+                    host_step_source,
+                    removed_source,
+                )
             }
             test_airs = {
                 str(

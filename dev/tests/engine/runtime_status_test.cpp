@@ -268,6 +268,15 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   require(bf16Status.find("\"format\":\"bf16\"") != std::string::npos &&
               bf16Status.find("\"scale_type\":\"none\"") != std::string::npos,
           "BF16 cache identity advertised INT8 storage");
+  auto tokenMajorIdentity = identity;
+  tokenMajorIdentity.kvLayout.valuesTokenMajor = true;
+  const auto tokenMajorStatus = runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
+                        metrics, executorTelemetry, tokenMajorIdentity, governor, true,
+                        {}, {}, {}, {}, {}, {});
+  require(tokenMajorStatus.find("\"dtype\":\"q8s8_f32_scale_per_token_head_k_token_major_v_token_major\"") !=
+                  std::string::npos &&
+              tokenMajorStatus.find("\"value_layout\":\"token_major\"") != std::string::npos,
+          "token-major values were reported dimension-major");
   require(json.find("\"schema_version\":6") != std::string::npos &&
               json.find("\"ready\":true") != std::string::npos,
           "status readiness/schema is wrong");
@@ -571,6 +580,87 @@ void testWeightsStatus() {
           "an idle release that is off is not null");
 }
 
+// Streamed routed experts' store (--expert-memory): null without one; with
+// one its arena, slots, borrowed slots, residency, loads, hit rate, the
+// latencies of its host steps' round trips and its failure. An added field:
+// the schema version stays.
+void testStreamedExpertsStatus() {
+  const auto memoryPlan = plan();
+  const auto status = [&](const std::optional<model::ExpertStoreStats> &experts) {
+    return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, {}, {}, {}, {}, {}, std::nullopt,
+                             experts);
+  };
+  require(status(std::nullopt).find(",\"streamed_experts\":null,") != std::string::npos,
+          "a model without streamed experts does not report null");
+  model::ExpertStoreStats experts{
+      .arenaBytes = 17179869184, .slots = 8192, .borrowed = 1040, .experts = 25088, .resident = 8000};
+  experts.uses[1] = {.loads = 480,
+                     .routed = 4000,
+                     .read = 1000,
+                     .prefetched = 600,
+                     .readAhead = 900,
+                     .readBytes = 1973000000,
+                     .pickup = {.count = 500, .totalMilliseconds = 11.5, .maximumMilliseconds = 0.09,
+                                .p50Milliseconds = 0.032, .p95Milliseconds = 0.032, .p99Milliseconds = 0.064},
+                     .work = {.count = 500, .totalMilliseconds = 240, .maximumMilliseconds = 9.5,
+                              .p50Milliseconds = 0.512, .p95Milliseconds = 2.048, .p99Milliseconds = 8.192},
+                     .resume = {.count = 500, .totalMilliseconds = 48.5, .maximumMilliseconds = 12.5,
+                                .p50Milliseconds = 0.128, .p95Milliseconds = 0.128, .p99Milliseconds = 16.384}};
+  experts.failure = "injected";
+  const std::string none = "{\"p50\":0,\"p95\":0,\"p99\":0,\"max\":0,\"total\":0,\"samples\":0}";
+  require(status(experts).find(
+              "\"streamed_experts\":{\"arena_bytes\":17179869184,\"slots\":8192,\"borrowed_slots\":1040,"
+              "\"experts\":25088,"
+              "\"resident\":8000,\"prefill\":{\"loads\":0,\"routed\":0,\"read\":0,\"prefetched\":0,"
+              "\"read_ahead\":0,\"hit_rate\":0,\"read_bytes\":0,\"host_steps\":{\"pickup_ms\":" +
+              none + ",\"work_ms\":" + none + ",\"resume_ms\":" + none +
+              "}},\"decode\":{\"loads\":480,\"routed\":4000,\"read\":1000,\"prefetched\":600,"
+              "\"read_ahead\":900,\"hit_rate\":0.75,\"read_bytes\":1973000000,\"host_steps\":"
+              "{\"pickup_ms\":{\"p50\":0.032,\"p95\":0.032,\"p99\":0.064,\"max\":0.09,\"total\":11.5,"
+              "\"samples\":500},\"work_ms\":{\"p50\":0.512,\"p95\":2.048,\"p99\":8.192,\"max\":9.5,"
+              "\"total\":240,\"samples\":500},\"resume_ms\":{\"p50\":0.128,\"p95\":0.128,\"p99\":16.384,"
+              "\"max\":12.5,\"total\":48.5,\"samples\":500}}},\"failure\":\"injected\"}") != std::string::npos,
+          "streamed experts' status differs");
+}
+
+// A streamed table's store (--ple-ssd-cache): null without one; with one its
+// memory, per use its stages, rows, hit rate and stage latencies, its reads,
+// prefetches and failure. An added field: the schema version stays.
+void testStreamedTableStatus() {
+  const auto memoryPlan = plan();
+  const auto status = [&](const std::optional<model::SparseRowStats> &table) {
+    return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, {}, {}, {}, {}, {}, table);
+  };
+  require(status(std::nullopt).find(",\"streamed_table\":null,") != std::string::npos,
+          "a model without a streamed table does not report null");
+  model::SparseRowStats table;
+  table.table = "per_layer_token_embd.weight";
+  table.tableBytes = 28800138240;
+  table.cacheBytes = 2147483648;
+  table.cacheCapacityRows = 18000000;
+  table.cachedRows = 1200;
+  table.uses[1] = {10, 1280, 1000, 750, 250, {10, 12.5, 3.25, 1.024, 2.048, 4.096}};
+  table.readBytes = 22500;
+  table.prefetchRequestedRows = 32768;
+  table.prefetchReadRows = 30000;
+  table.poisoned = true;
+  table.failure = "injected";
+  const std::string json = status(table);
+  require(json.find("\"streamed_table\":{\"table\":\"per_layer_token_embd.weight\",\"table_bytes\":28800138240,"
+                    "\"cache_bytes\":2147483648,\"cache_capacity_rows\":18000000,\"cached_rows\":1200,"
+                    "\"evictions\":0,\"prefill\":{\"stages\":0,") != std::string::npos &&
+              json.find("\"decode\":{\"stages\":10,\"requested_rows\":1280,\"unique_rows\":1000,"
+                        "\"hit_rows\":750,\"read_rows\":250,\"hit_rate\":0.75,\"stage_ms\":{\"p50\":1.024,"
+                        "\"p95\":2.048,\"p99\":4.096,\"max\":3.25,\"total\":12.5,\"samples\":10}}") !=
+                  std::string::npos &&
+              json.find("\"read_errors\":0,\"read_ms\":{\"p50\":0,\"p95\":0,\"p99\":0,\"max\":0,\"total\":0,"
+                        "\"samples\":0},\"prefetch_requested_rows\":32768,") != std::string::npos &&
+              json.find("\"prefetch_read_rows\":30000,\"prefetch_dropped_rows\":0,\"poisoned\":true,"
+                        "\"failure\":\"injected\"}") != std::string::npos &&
+              json.find("\"schema_version\":6,") != std::string::npos,
+          "the streamed table's status is missing or inaccurate");
+}
+
 // The prefill FFN's Neural Engine split: off with the start's reason and no
 // share, serving with the start's, stopped with why, and what it ran beside
 // the chunks the GPU ran again.
@@ -701,6 +791,8 @@ int main(int argc, char **argv) {
     testResourceWaitDiagnostics();
     testWeightsStatus();
     testAneFfnStatus();
+    testStreamedTableStatus();
+    testStreamedExpertsStatus();
     testThermalStateStatus();
     testThermalStateTransitions();
     testStderrLinesStayWhole();

@@ -27,11 +27,15 @@ public:
   // While profiling, submitCommandAsync() commits every dispatch as its own
   // command and waits for it, recording its GPU time, then invokes
   // completion inline and returns an already-completed ticket with the
-  // summed timing; it refuses a command with event steps (EventStep).
+  // summed timing. It runs a command's host steps between its dispatches and
+  // refuses a command with any other event step (EventStep).
   // takeDispatchProfile() reads and clears the timings.
   static void setDispatchProfiling(MetalBackend &backend, bool enabled);
   [[nodiscard]] static std::vector<DispatchTiming>
   takeDispatchProfile(MetalBackend &backend);
+  // Whether awake host steps spin (EventStep::awake): the backend's check
+  // that a GPU spin sees the CPU end it, run now if no command ran it.
+  [[nodiscard]] static bool awakeHostStepsSpin(MetalBackend &backend);
 };
 
 } // namespace splash::metal

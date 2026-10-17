@@ -18,4 +18,10 @@ inline constexpr uint64_t kGgufRepackStagingBytes = 32 << 20;
 // tensors).
 void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &image, const gguf::Image &plan);
 
+// Rows [first, first + count) of a repack (its sources' rows in order), whole
+// and back to back into `to`, count * ggufRowBytes(format, columns) bytes:
+// the native rows the GPU repacks into those rows' planes. A streamed
+// expert's rows are read with it (model/ExpertStore.hpp), from any thread.
+void readRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count, uint8_t *to);
+
 } // namespace splash::model

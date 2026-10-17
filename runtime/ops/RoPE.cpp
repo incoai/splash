@@ -38,9 +38,8 @@ void RoPE::addTables(
   graph.add("rope_build_tables",
             {std::move(targetPositions), std::move(draftPositions),
              std::move(targetInverseFrequencies),
-             std::move(draftInverseFrequencies), std::move(targetCosine),
-             std::move(targetSine), std::move(draftCosine),
-             std::move(draftSine)},
+             std::move(draftInverseFrequencies), targetCosine, targetSine,
+             std::move(draftCosine), std::move(draftSine)},
             rows, {(elements + 255) / 256, 1, 1}, {256, 1, 1});
 }
 

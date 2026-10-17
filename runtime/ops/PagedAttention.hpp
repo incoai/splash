@@ -112,17 +112,19 @@ struct PrefillAttentionPlan final {
   const std::string_view reducePipeline;
   const metal::DispatchSize splitGroups;
   const metal::DispatchSize reduceGroups;
+  // Whether the kernels attend through block lists (AttentionBlocks).
+  const bool sparse;
 
 private:
   friend class PagedAttention;
   PrefillAttentionPlan(uint32_t rows, uint32_t splits, AttentionWorkspace workspace,
                        std::string_view splitPipeline, std::string_view reducePipeline,
                        metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
-                       kv::Layout layout, uint32_t queryHeads)
+                       bool sparse, kv::Layout layout, uint32_t queryHeads)
       : layout(layout), queryHeads(queryHeads), rows(rows),
         splits(splits), workspace(workspace),
         splitPipeline(splitPipeline), reducePipeline(reducePipeline),
-        splitGroups(splitGroups), reduceGroups(reduceGroups) {}
+        splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse) {}
 };
 
 struct VerifyAttentionPlan final {
@@ -139,6 +141,8 @@ struct VerifyAttentionPlan final {
   const std::string_view reducePipeline;
   const metal::DispatchSize splitGroups;
   const metal::DispatchSize reduceGroups;
+  // Whether the kernels attend through block lists (AttentionBlocks).
+  const bool sparse;
 
 private:
   friend class PagedAttention;
@@ -150,13 +154,35 @@ private:
                       uint32_t splits, AttentionWorkspace workspace,
                       std::string_view splitPipeline, std::string_view reducePipeline,
                       metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
-                      std::string_view storePipeline, metal::DispatchSize storeGroups,
+                      bool sparse, std::string_view storePipeline, metal::DispatchSize storeGroups,
                       metal::DispatchSize storeThreads, kv::Layout layout, uint32_t queryHeads)
       : layout(layout), queryHeads(queryHeads), lanes(lanes), laneSplits(laneSplits),
         splits(splits), workspace(workspace),
         splitPipeline(splitPipeline), reducePipeline(reducePipeline),
-        splitGroups(splitGroups), reduceGroups(reduceGroups),
+        splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse),
         storePipeline_(storePipeline), storeGroups_(storeGroups), storeThreads_(storeThreads) {}
+};
+
+// The block lists a sparse plan's tiles attend through (metal/abi/
+// PagedAttention.h, PagedAttention::addBlockLists): lists of `stride` entries,
+// each list's count in `counts`; a verify lane's tile reads list `list` +
+// lane, a prefill tile list `list` + tile. Without a stride every tile
+// attends to every block of its history. Only a sparse plan takes lists.
+struct AttentionBlocks final {
+  metal::MetalBuffer lists;
+  metal::MetalBuffer counts;
+  uint32_t stride = 0;
+  uint32_t list = 0;
+};
+
+// Rows whose block masks become block lists (PagedAttention::addBlockLists):
+// `rows` rows from row `maskRow` of the masks, the first at position
+// `firstPosition`, whose tiles take the lists from `list` on.
+struct BlockListRows final {
+  uint32_t maskRow = 0;
+  uint32_t rows = 0;
+  uint32_t firstPosition = 0;
+  uint32_t list = 0;
 };
 
 struct PagedVerifyBuffers final {
@@ -169,9 +195,9 @@ struct PagedVerifyBuffers final {
   std::span<const metal::MetalBuffer> pageTables;
 };
 
-// Target attention over paged INT8 or BF16 history. Prefill and verify both
-// read the history one Page32 at a time; neither changes cache ownership or
-// commit semantics.
+// Target attention over paged INT8 or BF16 history. Prefill and verify read
+// the history one Page32 at a time, or, sparse, the blocks of their lists a
+// few at a time; neither changes cache ownership or commit semantics.
 class PagedAttention final {
 public:
   // The kernels read a sequence's history from its chunk parameters, so a
@@ -251,13 +277,22 @@ public:
                          metal::MetalBuffer statistics,
                          metal::MetalBuffer pageTable,
                          const kv::ChunkedPrefillParams &chunk,
-                         const PrefillAttentionPlan &plan);
+                         const PrefillAttentionPlan &plan, AttentionBlocks blocks = {});
   // Stores each lane's chunk (verifyParams, one per plan lane) and attends
   // its verify rows with the plan's split counts.
   static void addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
                         PagedVerifyBuffers buffers,
                         std::span<const kv::ChunkedPrefillParams> chunks,
-                        const VerifyAttentionPlan &plan);
+                        const VerifyAttentionPlan &plan, AttentionBlocks blocks = {});
+  // One dispatch of the block lists of up to a batch of sequences of query
+  // rows, whose block masks are rows of `mask`, `maskWords` words each
+  // (metal/abi/PagedAttention.h) that cover each sequence's history: each
+  // sequence's tiles of `tileRows` rows, its tile t's list into list
+  // blocks.list + its list + t. A list holds at most blocks.stride entries,
+  // which the masks' rows must keep to.
+  static void addBlockLists(metal::CommandGraph &graph, const metal::MetalBuffer &mask, uint32_t maskWords,
+                            std::span<const BlockListRows> sequences, uint32_t tileRows,
+                            const AttentionBlocks &blocks);
 };
 
 } // namespace splash::ops

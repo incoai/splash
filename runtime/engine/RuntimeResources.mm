@@ -5,6 +5,7 @@
 #include "engine/DiskLabels.hpp"
 #include "engine/Engine.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "model/ExpertStore.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/AneFfnMeasurement.hpp"
 
@@ -276,7 +277,13 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
   canonical << "splash-persistent-cache-v" << kPersistentCacheFormat << '\n'
             << identity.modelLayoutSha256 << '\n'
             << "kv " << kv::kPageTokens << ' ' << kv.attentionLayers << ' ' << kv.kvHeads << ' '
-            << kv.headDimension << ' ' << kv::formatName(kv.format) << '\n'
+            << kv.headDimension << ' ' << kv::formatName(kv.format)
+            // Dimension-major values add nothing, so dense layouts keep the
+            // caches they wrote.
+            << (kv.valuesTokenMajor ? " values-token-major" : "");
+  // A QSA index's raw and pooled keys, both bf16 (kv::Layout::indexDimension).
+  if (kv.indexDimension) canonical << " index " << kv.indexDimension << " bf16";
+  canonical << '\n'
             << "gdn " << gdn.layers << ' ' << gdn.convolutionHistory << ' '
             << gdn.convolutionChannels << ' ' << gdn.recurrentGroups << ' ' << gdn.recurrentRows
             << ' ' << gdn.recurrentColumns
@@ -317,7 +324,7 @@ RuntimeResources::RuntimeResources(
       stateStorage_(std::move(stateStorage)), kvTier_(std::move(kvTier)),
       diskSpace_(std::move(diskSpace)), kvPool_(std::move(kvPool)),
       cache_(std::move(cache)), aneFfn_(std::move(aneFfn)),
-      releasableMemory_(*model_.images, idleSplit(aneFfn_.get())),
+      releasableMemory_({model_.images.get(), model_.expertStore()}, idleSplit(aneFfn_.get())),
       aneFfnOutcome_(std::move(aneFfnOutcome)) {}
 
 std::unique_ptr<RuntimeResources>
@@ -403,7 +410,32 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     logLine("SSD cache off: ", reason, "; no state staging is set aside.");
     stateStagingBytes = 0;
   };
+  // What streams from the model's files instead of loading. Deciding it reads
+  // the files, so a file that cannot be read fails at the model loading
+  // stage, as loading them does.
+  model::ModelLoadOptions loadOptions;
   try {
+    // --ple-ssd-cache: a table the target's GGUF holds streams from its file,
+    // so its image is not loaded, and the store's bytes (at most the
+    // option's) are charged in its place.
+    const bool streamsTable = config.pleCacheBytes && model::streamableTableBytes(config.modelRoot, config.model);
+    if (config.pleCacheBytes && !streamsTable)
+      logLine("--ple-ssd-cache ignored: ", config.model.name, " has no PLE table to stream");
+    // --expert-memory: a MoE target's routed experts stream through a store
+    // of that many bytes, which modelWeightBytes counts with the images,
+    // unless they would hold every one of them.
+    bool streamsExperts = false;
+    if (config.expertMemoryBytes) {
+      const uint64_t expertBytes = model::routedExpertBytes(config.modelRoot, config.model);
+      streamsExperts = config.expertMemoryBytes < expertBytes;
+      if (!expertBytes)
+        logLine("--expert-memory ignored: ", config.model.name, " has no routed experts to stream");
+      else if (!streamsExperts)
+        logLine("--expert-memory ignored: its ", config.expertMemoryBytes / kMiB, " MiB hold every routed expert (",
+                expertBytes / kMiB, " MiB), which load with their layers");
+    }
+    loadOptions = {.pleCacheBytes = streamsTable ? config.pleCacheBytes : 0,
+                   .expertMemoryBytes = streamsExperts ? config.expertMemoryBytes : 0};
     const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
         device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
     // Reject a model that cannot fit before loading its weights. Beside
@@ -412,11 +444,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // the arenas.
     kv::Layout kvLayout = config.model.targetKvLayout;
     kvLayout.format = config.kvFormat;
-    const uint64_t weightBytes = model::modelWeightBytes(config.modelRoot, config.model);
+    const uint64_t weightBytes = model::modelWeightBytes(config.modelRoot, config.model, loadOptions);
     const auto requiredFor = [&](uint64_t stagingBytes) {
       uint64_t fixedBytes = 0;
       for (const uint64_t bytes : {weightBytes, model::kPipelineReserveBytes,
-                                   model::kRuntimeOverheadReserveBytes, stagingBytes}) {
+                                   model::kRuntimeOverheadReserveBytes, stagingBytes, loadOptions.pleCacheBytes}) {
         if (!checkedAdd(fixedBytes, bytes, fixedBytes))
           fixedBytes = std::numeric_limits<uint64_t>::max();
       }
@@ -454,8 +486,19 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   model::LoadedModel loaded;
   try {
     const auto started = AwakeClock::now();
-    loaded = model::loadModel(*backend, config.modelRoot, config.model);
+    loaded = model::loadModel(*backend, config.modelRoot, config.model, loadOptions);
     requireLoadedModel(loaded);
+    if (const model::SparseRowStore *table = loaded.streamedTable()) {
+      const model::SparseRowStats stats = table->stats();
+      logLine("PLE table streams from its file: ", stats.tableBytes / kMiB, " MiB stay on the SSD; row cache of ",
+              stats.cacheCapacityRows, " rows in ", table->committedBytes() / kMiB, " MiB, ",
+              model::SparseRowStoreOptions{}.readers, " readers.");
+    }
+    if (const model::ExpertStore *experts = loaded.expertStore()) {
+      const model::ExpertStoreStats stats = experts->stats();
+      logLine("Routed experts stream from their files: ", stats.slots, " slots for ", stats.experts, " experts (",
+              stats.slots * 100 / std::max<uint64_t>(stats.experts, 1), "%) in ", stats.arenaBytes / kMiB, " MiB.");
+    }
     const std::chrono::duration<double> loading = AwakeClock::now() - started;
     logLine("Weights loaded in ", std::fixed, std::setprecision(2),
             loading.count(), " s.");
@@ -491,6 +534,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         modelMemoryPlan,
         stagingBytes,
         aneFfnBytes,
+        loaded.streamedTable() ? loaded.streamedTable()->committedBytes() : 0,
     };
     ModelMemoryProfile modelProfile{
         loaded.name(), loaded.maximumContextTokens(),
@@ -557,7 +601,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     auto memoryGovernor = std::make_unique<MemoryGovernor>(
         *backend, memoryPlan.breakdown().hardBudgetBytes, hostReserveBytes,
         EngineMemoryPolicy::hostSpareReserveBytes(device.physicalMemoryBytes), config.hostMemory,
-        memoryPlan.breakdown().pipelineReserveBytes + memoryPlan.breakdown().runtimeOverheadReserveBytes);
+        memoryPlan.breakdown().pipelineReserveBytes + memoryPlan.breakdown().runtimeOverheadReserveBytes,
+        memoryPlan.breakdown().streamedTableBytes);
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
     // What the start allocates, the KV runway, the arenas and the warmup, is
@@ -843,6 +888,16 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
   };
 }
 
+std::optional<model::SparseRowStats> RuntimeResources::streamedTableStats() const {
+  if (const model::SparseRowStore *table = model_.streamedTable()) return table->stats();
+  return std::nullopt;
+}
+
+std::optional<model::ExpertStoreStats> RuntimeResources::streamedExpertStats() const {
+  if (const model::ExpertStore *experts = model_.expertStore()) return experts->stats();
+  return std::nullopt;
+}
+
 AneFfnSnapshot RuntimeResources::aneFfnSnapshot() const {
   if (!aneFfn_)
     return {.reason = aneFfnOutcome_.reason};
@@ -872,6 +927,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
   report.kvAllocatedBytes = kvPool_->allocatedBytes();
   report.stateStagingBytes = modelMemory.stateStagingBytes;
   report.aneFfnBytes = aneFfn_ ? aneFfn_->allocatedBytes() : 0;
+  if (const auto table = streamedTableStats()) report.streamedTableBytes = table->cacheBytes;
   // Optional warmup may end with a rolled-back allocation and no subsequent
   // command. Refresh the current counts after that rollback; peaks stay intact.
   metal::MetalMemoryStats memory = backend_->refreshMemoryStats();

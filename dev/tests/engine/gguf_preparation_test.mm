@@ -65,7 +65,7 @@ std::vector<uint8_t> slice(const std::vector<uint8_t> &bytes, uint64_t offset, u
 // and the embedding's.
 void loadImages(MetalBackend &backend, model::WeightImages &images, const std::filesystem::path &path,
                 const model::QwenTargetDimensions &geometry) {
-  model::GgufTargetLoader loader(backend, images, path, geometry);
+  model::GgufTargetLoader loader(backend, images, {path}, architecture(geometry), geometry);
   for (uint32_t layer = 0; layer < geometry.layers; ++layer) static_cast<void>(loader.layer(layer));
   static_cast<void>(loader.head());
   static_cast<void>(loader.embedding());
@@ -89,7 +89,7 @@ std::vector<model::gguf::Image> planned(const std::filesystem::path &path,
                                         const model::QwenTargetDimensions &geometry) {
   model::WeightSource source(path);
   const model::GgufFile gguf(source);
-  return model::gguf::planImages(gguf, geometry);
+  return model::gguf::planImages(gguf, architecture(geometry), geometry);
 }
 
 // Every image the loader writes from the GGUF at path against the goldens of
@@ -211,8 +211,8 @@ void checkQuantizedAlphaBeta(MetalBackend &backend, const std::filesystem::path 
         const std::vector<uint8_t> ordered = grouped(store(name, format, *values), stride);
         rows.insert(rows.end(), ordered.begin(), ordered.end());
       }
-      const std::string arch = model::gguf::architecture(g.ffnKind);
-      // A pair of one 16-bit float type widens to F32 (checkWidenedAlphaBeta).
+      const std::string arch = architecture(g);
+      // A pair of one 16-bit float type is a float tensor (checkFloatAlphaBeta).
       if (!float16(f)) {
         rows.resize(QUANT_TILE_ROWS * stride);
         const Packed expected = repack(f, rows, QUANT_TILE_ROWS, g.hiddenSize, nullptr);
@@ -306,20 +306,73 @@ void checkMoe(MetalBackend &backend, const std::filesystem::path &directory, con
   }
 }
 
-// The MoE layer with BF16 or F16 alpha/beta, which preparation decodes on the
-// GPU into one F32 tensor of the values they equal.
-void checkWidenedAlphaBeta(MetalBackend &backend, const std::filesystem::path &directory) {
+// The MoE layer with its router, shared-expert scalar gate and norms in 16-bit
+// floats, as some GGUFs store them: the BF16 router's rows as stored, which the
+// float projection runs, and the F32 values the BF16 scalar gate and the F16
+// and BF16 norms hold.
+void checkSixteenBitFloats(MetalBackend &backend, const std::filesystem::path &directory) {
+  SmallTarget target = smallTarget(true);
+  const model::QwenTargetDimensions &g = target.geometry;
+  const auto path = directory / "moe-16-bit-floats.gguf";
+  const struct Case {
+    std::string name;
+    Fmt format;
+    uint32_t rows;
+    bool asStored;
+  } cases[] = {{"blk.0.ffn_gate_inp.weight", BF16, g.experts, true},
+               {"blk.0.ffn_gate_inp_shexp.weight", BF16, 1, false},
+               {"blk.0.attn_norm.weight", F16, 1, false},
+               {"blk.0.post_attention_norm.weight", BF16, 1, false}};
+  std::map<std::string, std::vector<uint8_t>> expected;
+  uint32_t seed = 980;
+  for (const Case &c : cases) {
+    Tensor &tensor = tensorNamed(target.tensors, c.name);
+    tensor.type = *ggufType(c.format);
+    tensor.data = fixture(c.format, c.rows, g.hiddenSize, ++seed);
+    std::vector<uint8_t> &bytes = expected[c.name];
+    if (c.asStored) {
+      bytes = tensor.data;
+      continue;
+    }
+    bytes.resize(uint64_t{c.rows} * g.hiddenSize * sizeof(float));
+    for (uint32_t row = 0; row < c.rows; ++row)
+      rowValues(c.format, tensor.data.data() + row * uint64_t{rowBytes(c.format, g.hiddenSize)}, g.hiddenSize,
+                reinterpret_cast<float *>(bytes.data()) + uint64_t{row} * g.hiddenSize);
+  }
+  writeGguf(path, target.tensors, g);
+  const std::vector<model::gguf::Image> images = planned(path, g);
+  const std::vector<uint8_t> image = preparedImages(backend, path, g).front();
+  for (const Case &c : cases) {
+    const auto *copy = copyOf(images[0], c.name);
+    const auto conversion = c.asStored ? model::gguf::Conversion::None : model::gguf::Conversion::WidenToFloat32;
+    check(copy && copy->conversion == conversion && slice(image, copy->destination, expected[c.name].size()) ==
+                                                         expected[c.name],
+          std::string("prepared ") + fmtName(c.format) + " " + c.name +
+              (c.asStored ? ": its rows as stored" : ": the F32 values it holds"));
+  }
+}
+
+// The MoE layer with BF16 or F16 alpha/beta: a BF16 pair stays one BF16
+// tensor of their rows as stored, which the float projection reads as it
+// reads their F32 values; preparation decodes an F16 pair on the GPU into
+// one F32 tensor of the values they equal.
+void checkFloatAlphaBeta(MetalBackend &backend, const std::filesystem::path &directory) {
   for (const Fmt f : {BF16, F16}) {
     SmallTarget target = smallTarget(true);
     const model::QwenTargetDimensions &g = target.geometry;
     const auto path = directory / (std::string("moe-") + fmtName(f) + ".gguf");
-    std::map<std::string, std::vector<uint8_t>> floats; // the F32 values of the 16-bit tensors
+    const bool stored = f == BF16;
+    std::map<std::string, std::vector<uint8_t>> rows; // the BF16 rows as stored, or the F32 values of the F16 ones
     uint32_t seed = 960;
     for (const std::string name : {"blk.0.ssm_beta.weight", "blk.0.ssm_alpha.weight"}) {
       Tensor &tensor = tensorNamed(target.tensors, name);
       tensor.type = *ggufType(f);
       tensor.data = fixture(f, g.gdnValueHeads, g.hiddenSize, ++seed);
-      std::vector<uint8_t> &values = floats[name];
+      std::vector<uint8_t> &values = rows[name];
+      if (stored) {
+        values = tensor.data;
+        continue;
+      }
       values.resize(uint64_t{g.gdnValueHeads} * g.hiddenSize * sizeof(float));
       for (uint32_t row = 0; row < g.gdnValueHeads; ++row)
         rowValues(f, tensor.data.data() + row * uint64_t{rowBytes(f, g.hiddenSize)}, g.hiddenSize,
@@ -329,17 +382,18 @@ void checkWidenedAlphaBeta(MetalBackend &backend, const std::filesystem::path &d
     const std::vector<model::gguf::Image> images = planned(path, g);
     const auto *beta = copyOf(images[0], "blk.0.ssm_beta.weight"), *alpha = copyOf(images[0], "blk.0.ssm_alpha.weight");
     if (!beta || !alpha) throw std::runtime_error("the plan has no alpha/beta tensor");
-    check(beta->conversion == model::gguf::Conversion::DequantizeToFloat32 &&
-              alpha->conversion == model::gguf::Conversion::DequantizeToFloat32 &&
-              alpha->destination == beta->destination + floats[beta->source.name].size(),
-          std::string("planner widens ") + fmtName(f) + " alpha/beta into one F32 tensor");
+    const auto conversion = stored ? model::gguf::Conversion::None : model::gguf::Conversion::DequantizeToFloat32;
+    check(beta->conversion == conversion && alpha->conversion == conversion &&
+              alpha->destination == beta->destination + rows[beta->source.name].size(),
+          std::string("planner makes ") + fmtName(f) + " alpha/beta one " + (stored ? "BF16" : "F32") + " tensor");
     const std::vector<uint8_t> image = preparedImages(backend, path, g).front();
-    const uint64_t floatRowBytes = uint64_t{g.hiddenSize} * sizeof(float);
-    std::vector<uint8_t> gates = orderedRows(floats[beta->source.name], floatRowBytes, beta->source.order);
-    const auto alphaRows = orderedRows(floats[alpha->source.name], floatRowBytes, alpha->source.order);
+    const uint64_t rowSize = uint64_t{g.hiddenSize} * (stored ? sizeof(uint16_t) : sizeof(float));
+    std::vector<uint8_t> gates = orderedRows(rows[beta->source.name], rowSize, beta->source.order);
+    const auto alphaRows = orderedRows(rows[alpha->source.name], rowSize, alpha->source.order);
     gates.insert(gates.end(), alphaRows.begin(), alphaRows.end());
     check(slice(image, beta->destination, gates.size()) == gates,
-          std::string("prepared ") + fmtName(f) + " alpha/beta: their F32 values, beta then alpha rows in grouped order");
+          std::string("prepared ") + fmtName(f) + " alpha/beta: " +
+              (stored ? "their rows as stored" : "their F32 values") + ", beta then alpha rows in grouped order");
   }
 }
 
@@ -376,7 +430,6 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
   layout.attentionHeadDimension = 128;
   layout.packedFullWidth = 1024;     // q and its gate | k | v
   layout.intermediateSize = 512;
-  layout.hiddenCaptureLayers.fill(layout.layers - 1);
   const uint32_t hidden = layout.hiddenSize, valueRows = layout.gdnValueHeads * layout.gdnHeadDimension;
   const uint32_t kvRows = layout.attentionKvHeads * layout.attentionHeadDimension;
   const auto target = directory / "target";
@@ -398,7 +451,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
                                    {"token_embd.weight", kIQ4_XS}}),
             layout);
   model::WeightImages images(backend, "fixture");
-  model::GgufTargetLoader files(backend, images, model::findTargetGguf(target), layout);
+  model::GgufTargetLoader files(backend, images, model::findTargetGgufs(target), layout.ggufArchitecture, layout);
   const model::Qwen3_8Weights weights = model::loadQwen3_8Weights(backend, layout, files);
   check(weights.layers.size() == layout.layers, "GGUF target: every layer");
   check(weights.finalNorm.float32, "GGUF target: F32 final norm");
@@ -409,7 +462,8 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
   check(weights.tokenEmbedding.blocks().formatId == GGUF_FMT_IQ4XS &&
             weights.tokenEmbedding.outputSize == layout.vocabularySize && weights.tokenEmbedding.inputSize == hidden,
         "GGUF target: token table IQ4_XS blocks of vocabulary x hidden");
-  check(model::qwenTargetGeometry(weights).valid(), "GGUF target: a valid target geometry");
+  const std::array<uint32_t, 2> captured{1, layout.layers - 1};
+  check(model::qwenTargetGeometry(weights, captured).valid(), "GGUF target: a valid target geometry");
   for (uint32_t index = 0; index < weights.layers.size(); ++index) {
     const auto &layer = weights.layers[index];
     const std::string at = "GGUF target layer " + std::to_string(index) + ": ";
@@ -594,6 +648,8 @@ void checkFloatSources(MetalBackend &backend, const std::filesystem::path &direc
     for (const Fmt f : {NVFP4, FP8}) {
       const QuantFormat &layout = kQuantFormats[f];
       const uint32_t rows = 96, K = 1280, blocks = K / layout.block_elements;
+      // The rows padded with zero rows to whole tiles.
+      const uint32_t tiled = (rows + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS * QUANT_TILE_ROWS;
       std::vector<uint8_t> native = makeNative(f, rows, K, rng);
       // compressed-tensors' g in every block: the F32 reciprocal of a global
       // scale (NVFP4), or each row's bf16 scale (FP8).
@@ -646,13 +702,13 @@ void checkFloatSources(MetalBackend &backend, const std::filesystem::path &direc
       source.scale = {g.file, g.offset, g.bytes, compressed && f == FP8 ? 1 : rows, g.dtype == "BF16",
                       compressed && f == NVFP4};
       std::vector<uint8_t> tile = native;
-      tile.resize(size_t(QUANT_TILE_ROWS) * rowBytes(f, K), 0);
+      tile.resize(size_t(tiled) * rowBytes(f, K), 0);
       std::vector<float> reference;
-      const Packed expected = repack(f, tile, QUANT_TILE_ROWS, K, &reference);
+      const Packed expected = repack(f, tile, tiled, K, &reference);
       reference.resize(size_t(rows) * K);
 
       model::gguf::ImageBuilder builder("float.bin", 0, 0);
-      model::gguf::Repack planes = builder.planes(f, QUANT_TILE_ROWS, K, "m");
+      model::gguf::Repack planes = builder.planes(f, tiled, K, "m");
       planes.sources.push_back(source);
       const model::gguf::Repack step = planes;
       builder.repack(std::move(planes));
@@ -813,7 +869,9 @@ int main(int argc, char **argv) {
     checkExecutor(backend, directory.path());
     guarded("preparation of the dense target", [&] { checkDense(backend, directory.path(), hashes); });
     guarded("preparation of the MoE target", [&] { checkMoe(backend, directory.path(), hashes); });
-    guarded("preparation of BF16 alpha/beta", [&] { checkWidenedAlphaBeta(backend, directory.path()); });
+    guarded("preparation of BF16 and F16 alpha/beta", [&] { checkFloatAlphaBeta(backend, directory.path()); });
+    guarded("preparation of 16-bit float routers, gates and norms",
+            [&] { checkSixteenBitFloats(backend, directory.path()); });
     guarded("preparation of quantized alpha/beta", [&] { checkQuantizedAlphaBeta(backend, directory.path()); });
     guarded("llama.cpp NVFP4", [&] { checkGgufNvfp4(backend, directory.path()); });
     guarded("the target loader", [&] { checkDenseTarget(backend, directory.path()); });

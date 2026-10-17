@@ -9,10 +9,12 @@
 //   model-configuration FIXTURES
 
 #include "TestChecks.hpp"
+#include "TestDrafts.hpp"
 #include "TestFiles.hpp"
 #include "model/ModelDescriptor.hpp"
 #include "model/WeightStore.hpp"
 
+#include <array>
 #include <filesystem>
 #include <initializer_list>
 #include <iostream>
@@ -88,7 +90,7 @@ void testFamilies(const std::filesystem::path &fixtures) {
   require(denseDescriptor.name == "community/fine-tune" &&
               std::holds_alternative<model::Qwen3_8Layout>(denseDescriptor.target) &&
               denseDescriptor.targetSource == model::TargetSource::Safetensors && !denseDescriptor.hasVision() &&
-              denseDescriptor.draft == model::kQwen3_8DraftLayout,
+              denseDescriptor.draft == test::qwen3_8Draft(),
           "an MLX Qwen3.8-27B made another descriptor");
   // The sources' identity is the digest of the record naming them.
   require(denseDescriptor.sourceIdentity == model::weightDigest(dense.record) &&
@@ -103,12 +105,37 @@ void testFamilies(const std::filesystem::path &fixtures) {
       inspect(moe.with(&SourceModel::record, R"("none")", R"("safetensors")"));
   require(std::holds_alternative<model::Qwen3_6MoeLayout>(moeDescriptor.target) &&
               moeDescriptor.visionSource == model::VisionSource::Safetensors &&
-              moeDescriptor.draft == model::kQwen3_6MoeDraftLayout,
+              moeDescriptor.draft == test::qwen3_6MoeDraft(),
           "an MLX Qwen3.6-35B-A3B made another descriptor");
+  // Qwen3.8-Flash-Next's GGUF config, with its draft's.
+  const model::ModelDescriptor flashDescriptor =
+      inspect(mlxModel(fixtures, "qwen3.8-flash-next").with(&SourceModel::record, R"("mlx-affine")", R"("gguf")"));
+  require(std::holds_alternative<model::Qwen4ExpLayout>(flashDescriptor.target) &&
+              flashDescriptor.targetSource == model::TargetSource::Gguf &&
+              flashDescriptor.draft == test::flashNextDraft(),
+          "a GGUF Qwen3.8-Flash-Next made another descriptor");
+  // Its KV pages also hold the QSA indexer's keys and its states the PLE
+  // convolution's history, which another family's do not.
+  const model::Qwen4ExpLayout flash;
+  require(flashDescriptor.targetKvLayout.indexDimension == flash.indexerHeadDimension &&
+              flashDescriptor.stateLayout.target.auxiliaryBytes == flash.pleHistoryBytes() &&
+              flash.pleHistoryBytes() && !denseDescriptor.targetKvLayout.indexDimension &&
+              !denseDescriptor.stateLayout.target.auxiliaryBytes,
+          "a family's cache layouts do not hold what it adds");
+  // A draft states its own layers, intermediate size, rotary base and the
+  // target layers it reads.
+  constexpr std::array<uint32_t, 6> ownLayers{5, 19, 33, 47, 61, 63};
+  require(inspect(dense.with(&SourceModel::draft, R"("num_hidden_layers": 5)", R"("num_hidden_layers": 3)")
+                      .with(&SourceModel::draft, R"("intermediate_size": 17408)", R"("intermediate_size": 8192)")
+                      .with(&SourceModel::draft, R"("rope_theta": 10000000)", R"("rope_theta": 1000000)")
+                      .with(&SourceModel::draft, "61\n", "61,\n      63\n"))
+                  .draft == model::draftLayout(5120, 248320, 3, 8192, 1e6F, ownLayers),
+          "a draft's own sizes were not its descriptor's");
   // The model type names the family; the sizes every source's config states
   // tell its target from other models of the architecture, which Splash does
   // not serve, such as Qwen3.5-4B.
-  constexpr std::string_view supported = "; supported: Qwen3.8-27B, Qwen3.6-35B-A3B";
+  constexpr std::string_view supported =
+      "; supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next";
   struct Refused final {
     std::string_view from, to, difference;
   };
@@ -126,17 +153,24 @@ void testFamilies(const std::filesystem::path &fixtures) {
 }
 
 // A descriptor states where its weights come from: one that leaves either
-// source unset, which hasVision would read as a vision tower, is not valid.
+// source unset, which hasVision would read as a vision tower, is not valid;
+// nor is one whose draft reads past the target's last layer.
 void testSources() {
-  const auto described = [](model::TargetSource target, model::VisionSource vision) {
-    return model::makeModelDescriptor("sources", model::Qwen3_8Layout{}, model::kQwen3_8DraftLayout,
-                                      model::kQwen3_8VisionLayout, target, vision);
+  const auto described = [](model::TargetSource target, model::VisionSource vision,
+                            const model::DFlashDraftLayout &draft = test::qwen3_8Draft()) {
+    return model::makeModelDescriptor("sources", model::Qwen3_8Layout{}, draft, test::qwen3_8Vision(), target,
+                                      vision);
   };
   require(described(model::TargetSource::Safetensors, model::VisionSource::None).valid(),
           "a descriptor of its sources was not valid");
   require(!described(model::TargetSource{}, model::VisionSource::None).valid() &&
               !described(model::TargetSource::Safetensors, model::VisionSource{}).valid(),
           "a descriptor without a source was valid");
+  constexpr std::array<uint32_t, 2> pastLastLayer{5, 64};
+  require(!described(model::TargetSource::Safetensors, model::VisionSource::None,
+                     model::draftLayout(5120, 248320, 5, 17408, 1e7F, pastLastLayer))
+               .valid(),
+          "a descriptor whose draft reads past the target's last layer was valid");
 }
 
 // Each config is checked where the descriptor is made, once, and each number
@@ -178,11 +212,14 @@ void testOneRulePerValue(const std::filesystem::path &fixtures) {
            {&SourceModel::config, R"("full_attention")", R"("linear_attention")",
             "text config layer_types 3 must be full_attention"},
            {&SourceModel::draft, "[\n      5,", "[\n      5.9,",
-            "draft config target_layer_ids 0 mismatch: checkpoint 5.9, runtime 5"},
-           {&SourceModel::draft, "61\n", "61,\n      1\n",
-            "draft config target_layer_ids count mismatch: checkpoint 6, runtime 5"},
-           {&SourceModel::draft, R"("rope_theta": 10000000)", R"("rope_theta": 1000000)",
-            "draft config rope_parameters rope_theta mismatch"},
+            "draft config target_layer_ids 0 must be a whole number"},
+           {&SourceModel::draft, "61\n", "61,\n      1\n", "a DFlash2 draft reads 1 to 8 target layers, ascending"},
+           {&SourceModel::draft, "61\n", "61,\n      64\n",
+            "draft config target_layer_ids names a layer past the target's"},
+           {&SourceModel::draft, R"("intermediate_size": 17408)", R"("intermediate_size": 17416)",
+            "draft config intermediate_size must be a multiple of 64"},
+           {&SourceModel::draft, R"("num_attention_heads": 32)", R"("num_attention_heads": 16)",
+            "draft config num_attention_heads mismatch: checkpoint 16, runtime 32"},
            {&SourceModel::draft, R"("selector_top_k": 16)", R"("selector_top_k": 8)",
             "draft config dflash_config selector_top_k mismatch"},
            {&SourceModel::draft, R"("is_causal": false)", R"("is_causal": 0)", "draft config is_causal must be false"},
@@ -500,7 +537,7 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
   require(check("mlx-affine", "none", moe.config, std::nullopt, std::nullopt) == "Qwen3.6-35B-A3B",
           "a target without its draft was refused");
   rejects([&] { static_cast<void>(check("mlx-affine", "none", moe.config, std::nullopt, dense.draft)); },
-          "draft config num_hidden_layers mismatch: checkpoint 5, runtime 6", "another family's draft was accepted");
+          "draft config hidden_size mismatch: checkpoint 5120, runtime 2048", "another family's draft was accepted");
   // A GGUF's config with the metadata the installer copies from its header,
   // which the planner checks in the GGUF at every start: what the config
   // does not hold, such as the RoPE scaling, the epsilon, the FFN widths and
@@ -517,6 +554,30 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
     require(at != std::string::npos, "the GGUF metadata has no " + std::string(from));
     return metadata.replace(at, from.size(), to);
   };
+  // Qwen3.8-Flash-Next loads from a GGUF only; its metadata also states the
+  // hyper-connections, the QSA indexer and the PLE n-gram embedding.
+  const std::string flashConfig = text(fixtures / "qwen3.8-flash-next" / "config.json");
+  const std::string flashMetadata = text(fixtures / "qwen3.8-flash-next" / "gguf-metadata.json");
+  const std::string flashDraft = text(fixtures / "qwen3.8-flash-next" / "draft" / "config.json");
+  require(check("gguf", "none", flashConfig, flashMetadata, std::nullopt) == "Qwen3.8-Flash-Next" &&
+              check("gguf", "none", flashConfig, flashMetadata, flashDraft) == "Qwen3.8-Flash-Next",
+          "Qwen3.8-Flash-Next's GGUF config and metadata were not found to be its family");
+  rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, flashMetadata, dense.draft)); },
+          "draft config hidden_size mismatch: checkpoint 5120, runtime 2560", "another family's draft was accepted");
+  rejects([&] { static_cast<void>(check("mlx-affine", "none", flashConfig, std::nullopt, std::nullopt)); },
+          "Qwen3.8-Flash-Next loads from a GGUF only", "Qwen3.8-Flash-Next was accepted from MLX");
+  for (const auto &[from, to, error] : std::initializer_list<std::array<std::string_view, 3>>{
+           {R"("qwen4exp.hyper_connection.count": 4)", R"("qwen4exp.hyper_connection.count": 2)",
+            "GGUF metadata does not match the target: hyper_connection.count 2 (expected 4)"},
+           {R"("qwen4exp.attention.indexer.top_k": 2048)", R"("qwen4exp.attention.indexer.top_k": 1024)",
+            "GGUF metadata does not match the target: attention.indexer.top_k 1024 (expected 2048)"}}) {
+    std::string metadata = flashMetadata;
+    const size_t at = metadata.find(from);
+    require(at != std::string::npos, "the GGUF metadata has no " + std::string(from));
+    metadata.replace(at, from.size(), to);
+    rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, metadata, std::nullopt)); }, error,
+            "Qwen3.8-Flash-Next accepted metadata the kernels do not compute");
+  }
   struct RefusedMetadata final {
     std::string_view config;
     const std::string &metadata;
@@ -577,7 +638,7 @@ int main(int argc, char **argv) {
     testQuantization(argv[1]);
     testVisionConfig(argv[1]);
     testConfigurationCheck(argv[1]);
-    std::cout << "model configuration: both families, sources, one rule per value, quantization, vision, the "
+    std::cout << "model configuration: every family, sources, one rule per value, quantization, vision, the "
                  "installer's check PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

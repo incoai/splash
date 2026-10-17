@@ -4,9 +4,13 @@
 #include "engine/RuntimeResources.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
+#include "engine/NativeArguments.hpp"
 #include "engine/Types.hpp"
 #include "metal/BackendInstrumentation.hpp"
 #include "model/Runtime.hpp"
+#include "model/Qwen4Exp.hpp"
+#include "model/Qwen4Steps.hpp"
+#include "model/RuntimeInstrumentation.hpp"
 #include "model/QwenState.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/Sampling.hpp"
@@ -153,42 +157,73 @@ Similarity compareFloat(const metal::MetalBuffer &left,
   return accumulator.result();
 }
 
+// The state a decode step leaves a lane: its lengths, its GDN cell, which
+// holds the state before the step's rows, and the rows it retained, which wait
+// on its tape for the next step to fold in, and its draft rings' rows of the
+// positions they hold, each layer's keys then values.
+struct CommittedState final {
+  model::QwenLogicalLengths lengths;
+  uint32_t pendingRows = 0;
+  std::vector<uint8_t> cell;
+  std::vector<uint8_t> retained;
+  std::vector<std::vector<uint16_t>> rings;
+};
+
+CommittedState committedState(const model::Runtime &executor, const model::QwenStateStorage &states,
+                              uint32_t lane) {
+  const auto &metadata = states.metadata(lane);
+  const metal::MetalBuffer &cell = states.current(lane).stateBase;
+  require(static_cast<bool>(cell.contents()), "a committed GDN cell is not CPU-visible");
+  const auto *cellBytes = static_cast<const uint8_t *>(cell.contents());
+  CommittedState state{metadata.lengths, metadata.pendingRows, {cellBytes, cellBytes + cell.sizeBytes()},
+                       executor.pendingGdnRows(metadata.requestId), {}};
+  // A ring's keys are [head][slot][dimension] and its values [head][dimension]
+  // [slot]; position p is slot p % window.
+  const auto layout = states.layout().draft;
+  constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
+  for (const auto &ring : states.draft(lane)) {
+    const uint16_t *keys = bfloatContents(ring.keys, "draft keys");
+    const uint16_t *values = bfloatContents(ring.values, "draft values");
+    std::vector<uint16_t> keyRows, valueRows;
+    for (uint32_t head = 0; head < layout.kvHeads; ++head)
+      for (uint64_t position = metadata.lengths.draftBase; position < metadata.lengths.draftEnd(); ++position)
+        for (uint32_t dimension = 0; dimension < layout.headDimension; ++dimension) {
+          const uint64_t slot = position % window;
+          keyRows.push_back(keys[(uint64_t{head} * window + slot) * layout.headDimension + dimension]);
+          valueRows.push_back(values[(uint64_t{head} * layout.headDimension + dimension) * window + slot]);
+        }
+    state.rings.push_back(std::move(keyRows));
+    state.rings.push_back(std::move(valueRows));
+  }
+  return state;
+}
+
+// Two commits of the same rows by the same target arithmetic leave the same
+// bytes: the cells, the retained counts and the retained rows must match, so
+// that the next step of either lane folds the same state, and so must the
+// draft rings. The GDN kernel tests independently check the fold of each
+// retained count against FP64.
+void requireSameCommittedState(const CommittedState &left, const CommittedState &right,
+                               const std::string &label) {
+  require(left.lengths == right.lengths && left.pendingRows && left.pendingRows == right.pendingRows,
+          label + ": the logical state differs");
+  require(left.cell == right.cell, label + ": the GDN cell differs");
+  require(!left.retained.empty() && left.retained == right.retained, label + ": the retained GDN rows differ");
+  for (size_t ring = 0; ring < left.rings.size(); ++ring)
+    require(ring < right.rings.size() && left.rings[ring] == right.rings[ring],
+            label + ": the draft " + (ring % 2 ? "values" : "keys") + " of layer " + std::to_string(ring / 2) +
+                " differ");
+}
+
 // Budgeted greedy decoding and masked verification of the same prefix must
-// commit identical state. Both use the same target arithmetic; compare bytes.
-// The GDN state a decode step leaves is its lane's cell, which holds the state
-// before the step's rows, and the rows it retained, which wait on its tape for
-// the next step to fold in: the cells, the retained counts and the retained
-// rows must match, so that the next step of either lane folds the same state.
-// The GDN kernel tests independently check the fold of each retained count
-// against FP64.
+// commit identical state.
 void requireCommittedStateIdentical(const model::Runtime &executor,
                                     const model::QwenStateStorage &states,
                                     uint32_t budgetLane, uint32_t maskedLane,
                                     const std::string &label) {
-  const auto &budget = states.metadata(budgetLane);
-  const auto &masked = states.metadata(maskedLane);
-  require(budget.lengths == masked.lengths && budget.pendingRows &&
-              budget.pendingRows == masked.pendingRows,
-          label + " logical state differs between budget and mask commits");
-  auto identical = [&](const metal::MetalBuffer &a, const metal::MetalBuffer &b,
-                       const std::string &part) {
-    require(a.sizeBytes() == b.sizeBytes() && a.contents() && b.contents() &&
-                std::memcmp(a.contents(), b.contents(), a.sizeBytes()) == 0,
-            label + " " + part + " differs between budget and mask commits");
-  };
-  identical(states.current(budgetLane).stateBase, states.current(maskedLane).stateBase,
-            "GDN cell");
-  const std::vector<uint8_t> retained = executor.pendingGdnRows(budget.requestId);
-  require(!retained.empty() && retained == executor.pendingGdnRows(masked.requestId),
-          label + " retained GDN rows differ between budget and mask commits");
-  const auto &left = states.draft(budgetLane);
-  const auto &right = states.draft(maskedLane);
-  for (uint32_t layer = 0; layer < states.layout().draft.layers; ++layer) {
-    identical(left[layer].keys, right[layer].keys,
-              "draft keys layer=" + std::to_string(layer));
-    identical(left[layer].values, right[layer].values,
-              "draft values layer=" + std::to_string(layer));
-  }
+  requireSameCommittedState(committedState(executor, states, budgetLane),
+                            committedState(executor, states, maskedLane),
+                            label + " between budget and mask commits");
 }
 
 EngineRequest makeRequest(uint64_t id, std::vector<uint32_t> prompt,
@@ -929,6 +964,24 @@ StateBytes restoredBytes(model::Runtime &executor, const model::QwenStateStorage
   return bytes;
 }
 
+// The rows of the positions a context window holds at `boundary`, the last
+// 2048 before it (slot position % 2048): each slot's codes, then its group
+// parameters. The window's other slots hold nothing a restore reads.
+std::vector<uint8_t> windowRows(const std::vector<uint8_t> &window, uint32_t width, uint64_t boundary) {
+  constexpr uint64_t slots = model::ExecutionLimits::draftContextTokens;
+  const uint64_t codeBytes = width / 2;
+  const uint64_t groupBytes = uint64_t{width} / SPLASH_DRAFT_CONTEXT_GROUP * 4;
+  const uint64_t parameters = draft_context_codes_bytes(width);
+  std::vector<uint8_t> rows;
+  for (uint64_t position = boundary - std::min(boundary, slots); position < boundary; ++position) {
+    const auto codes = window.begin() + static_cast<std::ptrdiff_t>((position % slots) * codeBytes);
+    const auto groups = window.begin() + static_cast<std::ptrdiff_t>(parameters + (position % slots) * groupBytes);
+    rows.insert(rows.end(), codes, codes + static_cast<std::ptrdiff_t>(codeBytes));
+    rows.insert(rows.end(), groups, groups + static_cast<std::ptrdiff_t>(groupBytes));
+  }
+  return rows;
+}
+
 // The context window of a state captured at `boundary` inside a command over
 // [begin, end) holds, in the slot of each position of its window, the row
 // the lane's window held as the command found it where the command's rows
@@ -1136,6 +1189,192 @@ void requireStatesCapturedInsideCommands(model::Runtime &executor, const metal::
   while (executor.reclaimIdleState(false, IdleMemory::Buffers)) {
   }
   std::cout << "states_captured_inside_commands=PASS\n";
+}
+
+// A prefill group (a lane's command of more than a chunk's rows, which a
+// target whose experts stream runs layer by layer) leaves what commands of
+// its chunks leave, bit for bit: the same score logits, KV, GDN cell (with
+// Qwen3.8-Flash-Next's PLE history), draft rings and window and lengths, and
+// the same states captured inside a chunk, at a chunk's end and at the
+// group's end. One prompt of three chunks (2048, 2048 and 512 rows; the
+// middle one carries its state through the group's scratch cell) is
+// prefilled in three commands, then on the same pages and lane in one; then
+// two lanes, one of whose rows end in the group's first chunk, each against
+// commands of the group's chunks.
+void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::PageStorage &pages,
+                                         const model::QwenStateStorage &states, std::span<const uint32_t> chat) {
+  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
+  if (executor.prefillGroupRows() <= chunk) {
+    std::cout << "prefill_group=SKIP (the target runs no prefill groups)\n";
+    return;
+  }
+  constexpr uint32_t rows = 2 * chunk + 512;
+  const std::vector<uint32_t> pageTable = pageRange(0, rows / kv::kPageTokens);
+  require(pages.pageCount() >= pageTable.size(), "the KV pool cannot hold the prefill group fixture");
+  // The requests prefill `rows` of it; a restore probe needs a prompt past
+  // the last captured state.
+  std::vector<uint32_t> prompt(rows + kv::kPageTokens);
+  for (uint32_t index = 0; index < prompt.size(); ++index) prompt[index] = chat[index % chat.size()];
+  const std::span<const uint32_t> tokens(prompt);
+  const auto scoring = [&](uint64_t id) {
+    EngineRequest request = makeRequest(id, {prompt.begin(), prompt.begin() + rows}, 0);
+    for (uint32_t option = 0; option < model::ExecutionLimits::maximumScoreOptions; ++option)
+      request.scoreTokens.push_back(1000 + 37 * option);
+    return request;
+  };
+  constexpr std::array<uint32_t, 4> capturedAt{1024, chunk, chunk + 1024, rows};
+  const auto prefill = [&](uint64_t id, uint32_t begin, uint32_t end) {
+    std::vector<uint32_t> captures;
+    for (const uint32_t boundary : capturedAt)
+      if (boundary > begin && boundary <= end) captures.push_back(boundary);
+    ModelStepResult result =
+        prefillChunk(executor, id, begin, tokens.subspan(begin, end - begin), pageTable, {}, captures);
+    require(result.failure.empty(), "a prefill group fixture's prefill failed: " + result.failure);
+    return result;
+  };
+  // What a prefill left on the pages and in the lane.
+  const auto kvBytes = [&] {
+    std::vector<std::vector<uint8_t>> bytes;
+    for (const uint32_t page : pageTable)
+      for (const auto &tensor : pages.spans(page)) {
+        const auto *data = reinterpret_cast<const uint8_t *>(tensor.data());
+        bytes.emplace_back(data, data + tensor.size());
+      }
+    return bytes;
+  };
+  // Every captured state holds a whole draft window (planDraftContext).
+  const auto start = [&](uint64_t id) {
+    beginCold(executor, scoring(id), 0);
+    executor.setDraftContextPlan(id, planDraftContext(0, rows, capturedAt));
+  };
+  start(501);
+  std::vector<std::shared_ptr<const CompositeState>> chunked;
+  ModelStepResult last;
+  for (uint32_t begin = 0; begin < rows; begin += chunk) {
+    last = prefill(501, begin, std::min(rows, begin + chunk));
+    chunked.insert(chunked.end(), last.capturedStates.begin(), last.capturedStates.end());
+  }
+  const std::vector<std::vector<uint8_t>> chunkedKv = kvBytes();
+  const model::QwenLogicalLengths chunkedLengths = states.metadata(0).lengths;
+  const std::vector<uint8_t> chunkedCell = bytesOf(states.current(0).stateBase);
+  const std::vector<std::vector<uint16_t>> chunkedRings = committedState(executor, states, 0).rings;
+  const std::vector<uint8_t> chunkedWindow = bytesOf(states.window(0));
+  executor.end(501);
+  start(502);
+  const ModelStepResult group = prefill(502, 0, rows);
+  require(group.scoreLogits == last.scoreLogits, "a prefill group's score logits differ from its chunks'");
+  require(kvBytes() == chunkedKv, "a prefill group's KV differs from its chunks'");
+  require(states.metadata(0).lengths == chunkedLengths && bytesOf(states.current(0).stateBase) == chunkedCell,
+          "a prefill group's GDN cell, PLE history or lengths differ from its chunks'");
+  require(committedState(executor, states, 0).rings == chunkedRings && bytesOf(states.window(0)) == chunkedWindow,
+          "a prefill group's draft rings or window differ from its chunks'");
+  executor.end(502);
+  require(chunked.size() == capturedAt.size() && group.capturedStates.size() == capturedAt.size(),
+          "a prefill group or its chunks did not capture every state");
+  // A state's window holds the rows of the positions below its boundary; a
+  // state captured before a whole window's rows keeps in its other slots
+  // what its lane held, which differs between the requests.
+  const uint32_t width = states.layout().draft.contextWidth;
+  for (size_t index = 0; index < capturedAt.size(); ++index) {
+    const StateBytes left = restoredBytes(executor, states, 510, 2, tokens, capturedAt[index], chunked[index]);
+    const StateBytes right =
+        restoredBytes(executor, states, 510, 2, tokens, capturedAt[index], group.capturedStates[index]);
+    const std::string at = std::to_string(capturedAt[index]);
+    require(left.cell == right.cell, "the GDN cell of the state a prefill group captured at " + at +
+                                         " differs from its chunks'");
+    require(windowRows(left.window, width, capturedAt[index]) == windowRows(right.window, width, capturedAt[index]),
+            "the window of the state a prefill group captured at " + at + " differs from its chunks'");
+  }
+
+  // Two lanes in one group, the first lane's rows all in its first chunk:
+  // each lane leaves what it leaves in commands of the group's chunks, the
+  // first lane's command the first chunk's.
+  constexpr uint32_t firstRows = chunk / 2, secondRows = chunk + chunk / 2;
+  const std::array<std::vector<uint32_t>, 2> lanePages{pageRange(0, firstRows / kv::kPageTokens),
+                                                       pageRange(firstRows / kv::kPageTokens,
+                                                                 secondRows / kv::kPageTokens)};
+  struct Part final {
+    uint32_t lane;
+    uint32_t begin;
+    uint32_t end;
+  };
+  // One command of the parts of the requests `ids` (by lane): their score
+  // results by lane.
+  const auto command = [&](std::array<uint64_t, 2> ids, std::span<const Part> parts) {
+    BatchPlan plan{.kind = WorkKind::Prefill, .decodeStage = DecodeStage::Regular};
+    std::vector<ModelBatchItem> items;
+    for (const Part &part : parts) {
+      plan.items.push_back({ids[part.lane], part.end - part.begin});
+      ModelBatchItem item = withRevision({ids[part.lane], part.begin, part.end - part.begin, lanePages[part.lane]});
+      item.inputTokens = tokens.subspan(part.begin, part.end - part.begin);
+      items.push_back(std::move(item));
+    }
+    std::vector<ModelStepResult> results = executor.submit(plan, items, {})->wait();
+    require(results.size() == parts.size() &&
+                std::ranges::all_of(results, [](const ModelStepResult &result) { return result.failure.empty(); }),
+            "a two-lane prefill group fixture's prefill failed");
+    return results;
+  };
+  // A lane's window rows are those of its positions: a lane of fewer rows
+  // than a window keeps in its other slots what it held before, which
+  // differs between the requests.
+  struct LaneState final {
+    std::vector<float> scores;
+    std::vector<std::vector<uint8_t>> kv;
+    model::QwenLogicalLengths lengths;
+    std::vector<uint8_t> cell;
+    std::vector<std::vector<uint16_t>> rings;
+    std::vector<uint8_t> windowRows;
+  };
+  const auto laneState = [&](uint32_t lane, std::vector<float> scores) {
+    std::vector<std::vector<uint8_t>> bytes;
+    for (const uint32_t page : lanePages[lane])
+      for (const auto &tensor : pages.spans(page)) {
+        const auto *data = reinterpret_cast<const uint8_t *>(tensor.data());
+        bytes.emplace_back(data, data + tensor.size());
+      }
+    const model::QwenLogicalLengths lengths = states.metadata(lane).lengths;
+    return LaneState{std::move(scores), std::move(bytes), lengths,
+                     bytesOf(states.current(lane).stateBase), committedState(executor, states, lane).rings,
+                     windowRows(bytesOf(states.window(lane)), width, lengths.targetTokens)};
+  };
+  const auto startLanes = [&](std::array<uint64_t, 2> ids) {
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+      const uint32_t laneRows = lane ? secondRows : firstRows;
+      EngineRequest request = makeRequest(ids[lane], {prompt.begin(), prompt.begin() + laneRows}, 0);
+      request.scoreTokens = scoring(ids[lane]).scoreTokens;
+      beginCold(executor, request, lane);
+      executor.setDraftContextPlan(ids[lane], planDraftContext(0, laneRows, {}));
+    }
+  };
+  startLanes({511, 512});
+  const std::array<Part, 2> firstChunk{{{0, 0, firstRows}, {1, 0, chunk - firstRows}}};
+  const std::array<Part, 1> secondChunk{{{1, chunk - firstRows, secondRows}}};
+  const std::vector<ModelStepResult> firstCommand = command({511, 512}, firstChunk);
+  const std::vector<ModelStepResult> secondCommand = command({511, 512}, secondChunk);
+  const std::array<LaneState, 2> chunkedLanes{laneState(0, firstCommand[0].scoreLogits),
+                                              laneState(1, secondCommand[0].scoreLogits)};
+  executor.end(511);
+  executor.end(512);
+  startLanes({521, 522});
+  const std::array<Part, 2> together{{{0, 0, firstRows}, {1, 0, secondRows}}};
+  const std::vector<ModelStepResult> grouped = command({521, 522}, together);
+  for (uint32_t lane = 0; lane < 2; ++lane) {
+    const LaneState state = laneState(lane, grouped[lane].scoreLogits);
+    const LaneState &chunked = chunkedLanes[lane];
+    const std::string which = "lane " + std::to_string(lane) + " of a two-lane prefill group";
+    require(!state.scores.empty() && state.scores == chunked.scores,
+            which + ": its score logits differ from its chunks'");
+    require(state.kv == chunked.kv && state.lengths == chunked.lengths && state.cell == chunked.cell,
+            which + ": its KV, GDN cell, PLE history or lengths differ from its chunks'");
+    require(state.rings == chunked.rings && state.windowRows == chunked.windowRows,
+            which + ": its draft rings or window rows differ from its chunks'");
+  }
+  executor.end(521);
+  executor.end(522);
+  while (executor.reclaimIdleState(false, IdleMemory::Buffers)) {
+  }
+  std::cout << "prefill_group_matches_its_chunks=PASS\n";
 }
 
 // A command's ticket holds the buffers of the states it captures once the
@@ -1388,6 +1627,24 @@ decodeTogether(model::Runtime &executor, std::span<const uint64_t> ids,
   }
 }
 
+// "<|im_start|>user\nList every prime number between 1 and 60, then check each
+// one by trial division before you answer.<|im_end|>\n<|im_start|>assistant\n
+// <think>\n", which both models think through for well over the tokens the
+// thinking tests decode.
+const std::vector<uint32_t> kThinkingPrompt{
+    248045, 846,  198,  826,   1396, 9944,  1324, 1881,   220,   16,   321,
+    220,    21,   15,   11,    1179, 1716,  1754, 799,    539,   8818, 12436,
+    1518,   488,  4087, 13,    248046, 198, 248045, 74455, 198,   248068, 198};
+// The Qwen tokenizer's </think>.
+constexpr uint32_t kThinkEnd = 248069;
+// The ends the thinking tests close thinking with: the close alone, and
+// "Considering the limited time, I have to give the solution based on the
+// thinking directly now.\n</think>".
+const std::array<std::vector<uint32_t>, 2> kThinkingEnds{
+    std::vector<uint32_t>{kThinkEnd},
+    std::vector<uint32_t>{79939, 279, 6973, 854, 11, 353, 599, 310, 2873, 279, 6093, 3018, 383, 279, 7047, 5774, 1381,
+                          13, 198, kThinkEnd}};
+
 // A thinking budget ends thinking with its end tokens whatever the model's
 // logits: from the first generated token for a budget of 0, else from the
 // one after that many thinking tokens, greedy and sampled, while the draft
@@ -1396,27 +1653,12 @@ decodeTogether(model::Runtime &executor, std::span<const uint64_t> ids,
 // it verifies, and those proposals are not counted as drafted. Lanes decoded
 // together end at their own budgets, and one without a budget thinks on.
 void requireThinkingBudgetClosesThinking(model::Runtime &executor) {
-  // "<|im_start|>user\nList every prime number between 1 and 60, then check
-  // each one by trial division before you answer.<|im_end|>\n<|im_start|>
-  // assistant\n<think>\n", which both models think through for well over the
-  // tokens decoded here.
-  const std::vector<uint32_t> prompt{
-      248045, 846,  198,  826,   1396, 9944,  1324, 1881,   220,   16,   321,
-      220,    21,   15,   11,    1179, 1716,  1754, 799,    539,   8818, 12436,
-      1518,   488,  4087, 13,    248046, 198, 248045, 74455, 198,   248068, 198};
-  // The Qwen tokenizer's </think>.
-  constexpr uint32_t kThinkEnd = 248069;
-  // The close alone, and "Considering the limited time, I have to give the
-  // solution based on the thinking directly now.\n</think>".
-  const std::array<std::vector<uint32_t>, 2> ends{
-      std::vector<uint32_t>{kThinkEnd},
-      std::vector<uint32_t>{79939, 279, 6973, 854, 11, 353, 599, 310, 2873, 279, 6093, 3018, 383, 279,
-                            7047, 5774, 1381, 13, 198, kThinkEnd}};
+  const std::vector<uint32_t> &prompt = kThinkingPrompt;
   const std::array<std::vector<uint32_t>, 3> pageTables{
       pageRange(108, 4), pageRange(116, 4), pageRange(120, 4)};
   const std::array<uint64_t, 3> ids{301, 302, 303};
   uint32_t mostEndCycles = 0;
-  for (const std::vector<uint32_t> &end : ends) {
+  for (const std::vector<uint32_t> &end : kThinkingEnds) {
     const uint32_t length = static_cast<uint32_t>(end.size());
     for (const float temperature : {0.0F, 0.7F}) {
       for (const uint32_t budget : {0U, 1U, 5U, 12U}) {
@@ -1549,23 +1791,14 @@ decodeConstrainedTogether(model::Runtime &executor, std::span<const uint64_t> id
 // is selected, the end replaces no draft proposals, as only the verify reads
 // the masks; its other tokens replace them as for any request.
 void requireConstrainedThinkingEndWaitsForItsMask(model::Runtime &executor) {
-  // The prompt of requireThinkingBudgetClosesThinking.
-  const std::vector<uint32_t> prompt{
-      248045, 846,  198,  826,   1396, 9944,  1324, 1881,   220,   16,   321,
-      220,    21,   15,   11,    1179, 1716,  1754, 799,    539,   8818, 12436,
-      1518,   488,  4087, 13,    248046, 198, 248045, 74455, 198,   248068, 198};
-  constexpr uint32_t kThinkEnd = 248069;
+  const std::vector<uint32_t> &prompt = kThinkingPrompt;
   constexpr std::array<uint32_t, 3> kCharacter{172, 61084, 222};
-  const std::array<std::vector<uint32_t>, 2> ends{
-      std::vector<uint32_t>{kThinkEnd},
-      std::vector<uint32_t>{79939, 279, 6973, 854, 11, 353, 599, 310, 2873, 279, 6093, 3018, 383, 279,
-                            7047, 5774, 1381, 13, 198, kThinkEnd}};
   const std::array<std::vector<uint32_t>, 3> pageTables{
       pageRange(108, 4), pageRange(116, 4), pageRange(120, 4)};
   const std::array<uint64_t, 3> ids{311, 312, 313};
   constexpr uint32_t rows = model::ExecutionLimits::targetVerifyRows;
   constexpr uint32_t proposals = model::ExecutionLimits::draftProposalTokens;
-  for (const std::vector<uint32_t> &end : ends) {
+  for (const std::vector<uint32_t> &end : kThinkingEnds) {
     const uint32_t length = static_cast<uint32_t>(end.size());
     for (const float temperature : {0.0F, 0.7F}) {
       for (const uint32_t budget : {0U, 1U, 5U, 12U}) {
@@ -1626,6 +1859,36 @@ void requireConstrainedThinkingEndWaitsForItsMask(model::Runtime &executor) {
     }
   }
   std::cout << "constrained_thinking_budget=PASS\n";
+}
+
+// A thinking budget of 0 ends thinking from the first token: the first cycle
+// verifies the end's first token and every row after it, whose proposals the
+// end's tokens replace. Qwen3.8-Flash-Next's GPU hashes the PLE rows of a
+// verify's rows from their tokens and the ones before them, which must be the
+// rows the CPU hashes for a prompt of the same tokens (model::qwen4PleRows).
+void requireThinkingEndVerifiesItsTokens(model::Runtime &executor, const model::LoadedModel &model) {
+  const std::vector<uint32_t> &prompt = kThinkingPrompt;
+  const std::vector<uint32_t> &end = kThinkingEnds[1];
+  constexpr uint32_t rows = model::ExecutionLimits::targetVerifyRows;
+  const uint32_t length = static_cast<uint32_t>(prompt.size());
+  const std::vector<uint32_t> pages = pageRange(108, 4);
+  EngineRequest request = makeRequest(321, prompt, 64);
+  request.thinkingBudget = ThinkingBudget{0, end, kThinkEnd};
+  beginCold(executor, request, 0);
+  requireOpen(prefillChunk(executor, 321, 0, prompt, pages), "thinking end fixture");
+  const ModelStepResult cycle = decodeOne(executor, 321, length, pages);
+  const std::vector<uint32_t> gathered = model::RuntimeInstrumentation::lastPleRows(executor, 0);
+  executor.end(321);
+  require(std::ranges::equal(cycle.outputTokens, std::span(end).first(rows)),
+          "a thinking end did not verify its tokens in every row of a cycle");
+  uint32_t heads = 0;
+  if (const auto *weights = std::get_if<model::Qwen4ExpWeights>(&model.target)) {
+    heads = weights->layout.pleHeads();
+    std::vector<uint32_t> hashed(uint64_t{rows} * heads);
+    model::qwen4PleRows(*weights, length, std::span(end).first(rows), prompt, hashed.data());
+    require(gathered == hashed, "a thinking end's verify gathered other PLE rows than a prompt of its tokens");
+  }
+  std::cout << "thinking_end_rows=PASS ple_heads=" << heads << '\n';
 }
 
 // A 64-token request with one image of the given span, its pixels a pattern.
@@ -2204,6 +2467,78 @@ void requireCapturedStateKeepsItsImageRows(model::Runtime &executor,
   std::cout << "captured_state_keeps_its_image_rows=PASS\n";
 }
 
+// A batch of distinct requests packs its lanes' rows lane by lane: each
+// request must decode the same tokens and commit the same state, bit for bit,
+// in whichever lane and state lane it sits, two cycles on, as every row
+// computes alike wherever it is packed and a step's rows take the same tiles
+// in any order (an expert's tile kind follows the routes the whole step makes
+// to it).
+void requireBatchedLanesMatchReordered(model::Runtime &executor, const model::QwenStateStorage &states,
+                                       std::span<const uint32_t> seed) {
+  constexpr uint32_t kCycles = 2;
+  constexpr uint32_t kPromptTokens = 160;
+  // Request r's prompt, from its own offset into the seed, and its pages,
+  // wherever it sits.
+  const auto prompt = [&](uint32_t request) {
+    std::vector<uint32_t> tokens(kPromptTokens);
+    for (uint32_t index = 0; index < kPromptTokens; ++index)
+      tokens[index] = seed[(index + 11 * request) % seed.size()];
+    return tokens;
+  };
+  const auto pages = [](uint32_t request) { return pageRange(40 + 6 * request, 6); };
+  // A batch's tokens per request and cycle, and each request's committed
+  // state.
+  struct Batch final {
+    std::vector<std::vector<std::vector<uint32_t>>> outputs;
+    std::vector<CommittedState> committed;
+  };
+  // Request r in lane r, or in lane width - 1 - r `reversed`, its state lane
+  // its lane.
+  const auto decodeBatch = [&](uint32_t width, bool reversed, const std::string &label) {
+    const auto laneOf = [&](uint32_t request) { return reversed ? width - 1 - request : request; };
+    for (uint32_t request = 0; request < width; ++request) {
+      EngineRequest engineRequest = makeRequest(700 + request, prompt(request), 64);
+      engineRequest.flags = RequestIgnoreEndOfSequence;
+      beginCold(executor, engineRequest, laneOf(request));
+      requireOpen(prefillChunk(executor, 700 + request, 0, engineRequest.prompt, pages(request)), "batched lanes");
+    }
+    Batch batch{std::vector<std::vector<std::vector<uint32_t>>>(width), {}};
+    std::vector<uint64_t> positions(width, kPromptTokens);
+    for (uint32_t cycle = 0; cycle < kCycles; ++cycle) {
+      BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
+      std::vector<ModelBatchItem> items(width);
+      for (uint32_t request = 0; request < width; ++request)
+        items[laneOf(request)] = withRevision({700 + request, positions[request], 0, pages(request)});
+      for (const ModelBatchItem &item : items) plan.items.push_back({item.requestId, 0});
+      const std::vector<ModelStepResult> results = executor.decode(plan, items);
+      require(results.size() == width, label + ": the batch lost a lane");
+      for (uint32_t request = 0; request < width; ++request) {
+        const ModelStepResult &result = results[laneOf(request)];
+        require(result.failure.empty() && !result.finished &&
+                    result.draftedTokens == model::ExecutionLimits::draftProposalTokens,
+                label + ": a lane did not verify the draft's block");
+        batch.outputs[request].push_back(result.outputTokens);
+        positions[request] += result.outputTokens.size() - result.outputTokensWithoutKv;
+      }
+    }
+    for (uint32_t request = 0; request < width; ++request)
+      batch.committed.push_back(committedState(executor, states, laneOf(request)));
+    for (uint32_t request = 0; request < width; ++request) executor.end(700 + request);
+    return batch;
+  };
+  for (const uint32_t width : {2U, 3U, 4U}) {
+    const std::string label = "B" + std::to_string(width);
+    const Batch ordered = decodeBatch(width, false, label);
+    const Batch reversed = decodeBatch(width, true, label + " in reversed lanes");
+    for (uint32_t request = 0; request < width; ++request) {
+      const std::string which = label + ": request " + std::to_string(request);
+      require(ordered.outputs[request] == reversed.outputs[request], which + " decoded other tokens in another lane");
+      requireSameCommittedState(ordered.committed[request], reversed.committed[request], which + " in two lanes");
+    }
+  }
+  std::cout << "batched_lanes_reordered=PASS widths=2,3,4\n";
+}
+
 void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
   uint32_t prefillStop = 0;
   uint32_t decodeStop = 0;
@@ -2269,20 +2604,30 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
 
 int main(int argc, char **argv) {
   try {
-    bool imagesOnly = false, warmupEosOnly = false;
+    bool imagesOnly = false, warmupEosOnly = false, prefillGroupsOnly = false;
     kv::Format format = kv::Format::Int8;
     ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
     std::optional<double> givenAneFfnShare;
     // The evaluation of the split's program that fails, counted from 1 as
     // ane::ProgramInstrumentation counts them; 0 for none.
     uint64_t aneFfnFault = 0;
+    // --ple-ssd-cache BYTES: a Qwen3.8-Flash-Next target's PLE table streams
+    // from its file through a cache of BYTES, as splash serve's option does;
+    // its TOKENS line equals the resident table's. --expert-memory BYTES: its
+    // routed experts stream from the file into an arena of BYTES, as splash
+    // serve's --expert-memory does. --prefill-groups-only: a prefill group
+    // against its chunks' commands (requirePrefillGroupMatchesItsChunks),
+    // then stop.
+    model::ModelLoadOptions loadOptions;
     if (argc < 3)
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
-           "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION]");
+           "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-ssd-cache BYTES] "
+           "[--expert-memory BYTES] [--images-only | --warmup-eos-only | --prefill-groups-only]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
       else if (option == "--warmup-eos-only") warmupEosOnly = true;
+      else if (option == "--prefill-groups-only") prefillGroupsOnly = true;
       else if (option == "--kv-format" && i + 1 < argc) {
         const std::string_view value(argv[++i]);
         if (value != "int8" && value != "bf16") fail("invalid KV format");
@@ -2302,6 +2647,16 @@ int main(int argc, char **argv) {
         char *end = nullptr;
         aneFfnFault = std::strtoull(value, &end, 10);
         if (end == value || *end || !aneFfnFault) fail("--ane-ffn-fault takes an evaluation from 1");
+      } else if (option == "--ple-ssd-cache" && i + 1 < argc) {
+        const char *value = argv[++i];
+        char *end = nullptr;
+        loadOptions.pleCacheBytes = std::strtoull(value, &end, 10);
+        if (end == value || *end || !loadOptions.pleCacheBytes) fail("--ple-ssd-cache takes a positive byte count");
+      } else if (option == "--expert-memory" && i + 1 < argc) {
+        const char *value = argv[++i];
+        char *end = nullptr;
+        loadOptions.expertMemoryBytes = std::strtoull(value, &end, 10);
+        if (end == value || *end || !loadOptions.expertMemoryBytes) fail("--expert-memory takes a byte count");
       } else fail("unknown model-runtime-oracle option");
     }
     metal::MetalBackend backend(argv[1]);
@@ -2322,13 +2677,16 @@ int main(int argc, char **argv) {
     // Metal operation while loading. This oracle has no such guard, so the
     // weights must fit in reclaimable memory above the macOS reserve before
     // any is loaded; it can refuse a model production starts.
-    const uint64_t weightBytes = model::modelWeightBytes(modelRoot, descriptor);
+    const uint64_t weightBytes =
+        model::modelWeightBytes(modelRoot, descriptor, loadOptions) + loadOptions.pleCacheBytes;
     if (*hostAvailableBytes <= hostReserveBytes ||
         weightBytes > *hostAvailableBytes - hostReserveBytes)
       stopForHostMemory("the weights need " + mebibytes(weightBytes),
                         *hostAvailableBytes, hostReserveBytes);
     model::LoadedModel model =
-        model::loadModel(backend, modelRoot, descriptor);
+        model::loadModel(backend, modelRoot, descriptor, loadOptions);
+    if (loadOptions.pleCacheBytes)
+      std::cout << "ple_ssd_cache=" << (model.streamedTable() ? "streamed" : "ignored") << '\n';
     ops::ExecutionPlans operators(backend.capabilities());
     model::ModelMemoryPlan executorPlan =
         model::plannedRuntimeMemory(model, operators, format, stateFormat);
@@ -2339,7 +2697,8 @@ int main(int argc, char **argv) {
           model.targetActualAllocatedBytes(),
           model.draft.actualAllocatedBytes,
           model.vision.actualAllocatedBytes,
-          executorPlan, 0, aneFfnBytes};
+          executorPlan, 0, aneFfnBytes,
+          model.streamedTable() ? model.streamedTable()->committedBytes() : 0};
       ModelMemoryProfile profile{
           model.name(), model.maximumContextTokens(),
           model.targetKvLayout(format), footprint, stateFormat};
@@ -2405,7 +2764,7 @@ int main(int argc, char **argv) {
         budget.pipelineReserveBytes - budget.runtimeOverheadReserveBytes;
     MemoryGovernor governor(backend, elasticGrowthCeiling, hostReserveBytes,
                             EngineMemoryPolicy::hostSpareReserveBytes(device.physicalMemoryBytes),
-                            queryHostMemory, 0);
+                            queryHostMemory, 0, budget.streamedTableBytes);
     std::cout << "ane_ffn_share=" << (aneFfn ? aneFfn->share() : 0.0)
               << " ane_ffn_minimum_rows=" << (aneFfn ? aneFfn->minimumRows() : 0) << '\n';
     const metal::AllocationAdmission governed =
@@ -2527,6 +2886,12 @@ int main(int argc, char **argv) {
         321,    60445,  55404, 11,     27224,  11,    321,    30246, 303,
         279,    1534,   4087,  13,     248046, 198,   248045, 846,   198,
         9419,   248046, 198,   248045, 74455,  198,   248068, 198};
+    if (prefillGroupsOnly) {
+      requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens);
+      std::cout << "PASS model-runtime-oracle scope=prefill-groups-only model=" << model.name()
+                << " (a prefill group leaves what its chunks' commands leave)\n";
+      return 0;
+    }
     // A natural token pattern: a run of zero tokens can make the target select
     // a stop token right after prefill, which leaves no decode cycle to test.
     std::vector<uint32_t> prompt128(128);
@@ -2633,8 +2998,11 @@ int main(int argc, char **argv) {
                                         samplingSeedTokens, prompt128);
     requireThinkingBudgetClosesThinking(executor);
     requireConstrainedThinkingEndWaitsForItsMask(executor);
+    requireThinkingEndVerifiesItsTokens(executor, model);
     requireStatesCapturedInsideCommands(executor, backend, pages, states, aneFfn.get(), samplingSeedTokens);
     requireCapturesOutliveTheirItems(executor, states, samplingSeedTokens);
+    requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens);
+    requireBatchedLanesMatchReordered(executor, states, samplingSeedTokens);
 
 
     // Compare the active GDN state from one 16-row chunk and two M8 commits
@@ -3606,9 +3974,21 @@ int main(int argc, char **argv) {
     // lane must select what it selected and a score lane must read the same
     // logits, and a lane whose prompt the command does not finish must stay
     // out of the head and end its prompt as it did. With every other lane's
-    // prompt changed, a score lane must still read the same logits.
+    // prompt changed, a score lane must still read the same logits where its
+    // rows computed alike, which a dense target's always do: a MoE target's
+    // expert tiles follow the routes the command makes to them (an expert's
+    // tile of few rows sums in the column tile's order), which the other
+    // prompts move.
     {
       constexpr uint32_t kScoredRow = 0, kGreedy = 1, kOpen = 2, kSampled = 3;
+      // The score lane's KV pages (pageRange(52, 2)) as a command left them.
+      const auto scoredKv = [&storage = pages] {
+        std::vector<std::byte> bytes;
+        for (const uint32_t page : {52U, 53U})
+          for (const std::span<std::byte> tensor : storage.spans(page))
+            bytes.insert(bytes.end(), tensor.begin(), tensor.end());
+        return bytes;
+      };
       constexpr std::array<uint32_t, 4> rows{33, 40, 64, 72};
       constexpr uint32_t openPromptTokens = 200;
       // A lane's prompt, or another one of the same length.
@@ -3671,7 +4051,7 @@ int main(int argc, char **argv) {
                                       pages[kOpen]);
         for (const EngineRequest &request : requests)
           executor.end(request.id);
-        return results;
+        return std::pair{results, scoredKv()};
       };
       const auto sameScores = [](const ModelStepResult &left,
                                  const ModelStepResult &right,
@@ -3683,10 +4063,10 @@ int main(int argc, char **argv) {
                       1e-3F * std::max(1.0F, std::fabs(right.scoreLogits[option])),
                   message);
       };
-      const auto inOrder =
+      const auto [inOrder, inOrderKv] =
           prefillInOrder({kScoredRow, kGreedy, kOpen, kSampled}, false);
       const auto reversed =
-          prefillInOrder({kSampled, kOpen, kGreedy, kScoredRow}, false);
+          prefillInOrder({kSampled, kOpen, kGreedy, kScoredRow}, false).first;
       for (const uint32_t lane : {kGreedy, kOpen, kSampled}) {
         require(reversed[lane].outputTokens == inOrder[lane].outputTokens &&
                     inOrder[lane].outputTokens.size() == 1,
@@ -3696,10 +4076,16 @@ int main(int argc, char **argv) {
       sameScores(reversed[kScoredRow], inOrder[kScoredRow],
                  "a score lane read other logits beside the lanes in another "
                  "order");
-      const auto others =
+      const auto [others, othersKv] =
           prefillInOrder({kScoredRow, kGreedy, kOpen, kSampled}, true);
-      sameScores(others[kScoredRow], inOrder[kScoredRow],
-                 "a score lane's logits changed with the other lanes' prompts");
+      const bool alike = othersKv == inOrderKv;
+      const bool sparseMoe = std::visit(
+          [](const auto &weights) { return weights.layout.ffnKind == model::QwenFfnKind::SparseMoe; }, model.target);
+      require(alike || sparseMoe, "a dense target's score lane computed its rows otherwise beside other prompts");
+      if (alike)
+        sameScores(others[kScoredRow], inOrder[kScoredRow],
+                   "a score lane's logits changed with the other lanes' prompts");
+      std::cout << "shared_head other_prompts_kv_alike=" << alike << '\n';
     }
 
     constexpr std::array<uint64_t, 4> productionB4Ids{71, 72, 73, 74};
@@ -4302,7 +4688,8 @@ int main(int argc, char **argv) {
     // Sampled requests that min_p alone cuts (top_k and top_p keep every
     // token) keep the preemption guarantees and repeat under a fixed seed. At
     // min_p 1 each row keeps its most likely token only, so the request
-    // selects what a greedy one does, draft tokens and corrections included.
+    // decodes as a greedy one does (ops::SamplingPolicy::samples), draft
+    // tokens and corrections included.
     {
       const auto run = [&](uint32_t preemptionMode, float minP) {
         return runPreemption(RequestKind::Sampling, preemptionMode, {}, 0, 1.0F,

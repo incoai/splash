@@ -204,8 +204,8 @@ public:
   // the engine knows: vocabulary, context window, and vision with the
   // server's per-image patch cap.
   void submit(EngineRequest request);
-  void observePrefill(uint32_t rows, double wallMilliseconds) {
-    scheduler_.observePrefill(rows, wallMilliseconds);
+  void observePrefill(uint32_t rows, double wallMilliseconds, double hostMilliseconds) {
+    scheduler_.observePrefill(rows, wallMilliseconds, hostMilliseconds);
   }
   void cancel(uint64_t requestId);
   void failRequest(uint64_t requestId, LaneOutcome outcome, std::string message);
@@ -629,8 +629,8 @@ private:
   void signalResourceProgress() noexcept;
   void apply(const BatchPlan &plan, std::span<const std::vector<Capture>> captures,
              std::span<const ModelStepResult> results, double wallMilliseconds,
-             double cycleMilliseconds, bool representativePrefillTiming,
-             double nowMilliseconds);
+             double hostMilliseconds, double cycleMilliseconds,
+             bool representativePrefillTiming, double nowMilliseconds);
   // Whether the command in flight holds the request's lane.
   [[nodiscard]] bool inFlight(uint64_t requestId) const;
   // Ends a request early. While its command or restore runs, the first end
