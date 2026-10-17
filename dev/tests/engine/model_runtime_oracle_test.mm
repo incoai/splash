@@ -4529,7 +4529,8 @@ int main(int argc, char **argv) {
     // Sampled requests that min_p alone cuts (top_k and top_p keep every
     // token) keep the preemption guarantees and repeat under a fixed seed. At
     // min_p 1 each row keeps its most likely token only, so the request
-    // selects what a greedy one does, draft tokens and corrections included.
+    // decodes as a greedy one does (ops::SamplingPolicy::samples), draft
+    // tokens and corrections included.
     {
       const auto run = [&](uint32_t preemptionMode, float minP) {
         return runPreemption(RequestKind::Sampling, preemptionMode, {}, 0, 1.0F,

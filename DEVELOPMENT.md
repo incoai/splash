@@ -790,7 +790,10 @@ sums each row's softmax denominator, finds where its distribution ends
 without sorting the vocabulary, and draws over every token the distribution
 keeps. vLLM itself refuses a nonzero `min_p` with speculative decoding; here
 it is one more cut of the target distribution, which acceptance and
-correction read as they read the others, so sampling stays exact.
+correction read as they read the others, so sampling stays exact. A request
+that keeps only its most likely token, at a `min_p` of 1 or a `top_k` of 1,
+decodes greedily, its draft's proposals too: it selects what sampling would
+but for equally likely tokens, of which it takes the lowest id.
 
 A lane's arithmetic can depend on the batch it decodes in and on how its prompt
 is chunked. On a GGUF MoE target's staged expert tiles, an expert that a step

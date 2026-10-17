@@ -435,7 +435,7 @@ struct Runtime::Impl {
   }
 
   static bool samplingEnabled(const Request &entry) noexcept {
-    return entry.sampling.temperature > 0.0F;
+    return samplingPolicy(entry).samples();
   }
 
   // Qwen3.5 M-RoPE: text rows advance one counter shared by all three axes;
