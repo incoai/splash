@@ -146,11 +146,13 @@ int main(int argc, char **argv) {
         for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged})
           for (uint32_t splits = 1; splits <= LinearConfig::kMaximumSplits; splits *= 2) {
             const bool registerTile = tile == LinearTile::GgufRegister;
-            // The register tile takes the weights of quant_register_tensor only.
-            if (registerTile && !std::all_of(images.begin(), images.end(),
-                                             [&](const Image &i) { return quant_register_tensor(i.format, K); }))
+            // The register tile takes the weights of quant_register_tensor only, a coefficient unit of each format
+            // per split (quant_register_unit); the staged tile whole 32-input groups.
+            if (registerTile && !std::all_of(images.begin(), images.end(), [&](const Image &i) {
+                  return quant_register_tensor(i.format, K) && K / quant_register_unit(i.format) >= splits;
+                }))
               continue;
-            if (registerTile ? K / 256 < splits : (K / 32) % splits) continue;
+            if (!registerTile && (K / 32) % splits) continue;
             const LinearConfig config{.tile = tile, .splits = splits, .spread = !registerTile && wide.spread,
                                       .oneGateUpPass = !registerTile && wide.oneGateUpPass};
             cases.push_back({"L" + std::to_string(lanes),

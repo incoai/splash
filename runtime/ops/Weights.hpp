@@ -19,7 +19,7 @@ struct ProjectionShape final {
   bool rotated = false;
   // The Apple9 register tile takes all its quantized segments
   // (quant_register_tensor); a projection with one it does not take stages
-  // whatever its rows (Linear::decodeStorageRows).
+  // whatever its rows (Linear::decodeStorageRows, decodeScratchSize).
   bool registerFormats = true;
   // Its quantized segments store at least four bits per weight
   // (quant_four_bits); Apple10 runs the register tile on narrower grids of

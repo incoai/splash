@@ -50,6 +50,8 @@ template <class F> struct Shape {
   // rows of whole 256 inputs here (quant_register_tensor).
   static_assert(F::MetaGroups == 8 || F::MetaGroups == 4 || F::MetaGroups == 2 || F::MetaGroups == 1,
                 "a meta unit is one, two, four or eight groups");
+  static_assert(UnitSpans * GGUF_TABLE16_SPAN_INPUTS == quant_register_unit(F::Id),
+                "the host splits K in the coefficient units of quant_register_unit");
   static_assert(!Wide || (HasMin && !Seeded), "wide codes have a min per 32 inputs");
 };
 template <class F> using Coef = metal::conditional_t<Shape<F>::HasMin != 0, float2, float>;

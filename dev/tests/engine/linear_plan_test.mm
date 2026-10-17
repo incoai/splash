@@ -419,14 +419,14 @@ void ggufPlans() {
     rejects([&] { (void)Linear::plan(down, config, FloatOutput::BFloat16); },
             "the register block decode tile takes a K unit per split",
             "the register tile took a K split that is not a power of two up to eight");
-  // Split boundaries fall on 256-input units, and prefill has no register tile.
+  // Split boundaries fall on coefficient units, of 64 inputs at the fewest, and prefill has no register tile.
   const LinearWorkload chunk{{5120, 17408}, 128, LinearPhase::Prefill, LinearEpilogue::None};
   rejects(
       [&] {
-        (void)Linear::plan({{5120, 512}, 8, LinearPhase::Decode, LinearEpilogue::None},
+        (void)Linear::plan({{5120, 192}, 8, LinearPhase::Decode, LinearEpilogue::None},
                            {.tile = LinearTile::GgufRegister, .splits = 4}, FloatOutput::BFloat16);
       },
-      "the register block decode tile takes a K unit per split", "the register tile split two K units four ways");
+      "the register block decode tile takes a K unit per split", "the register tile split three K units four ways");
   rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufRegister}, FloatOutput::BFloat16); },
           "the register block decode tile takes a K unit per split", "a prefill plan took the register tile");
   // The prefill tile runs prefill chunks on their matrix grid, unsplit.

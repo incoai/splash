@@ -248,6 +248,13 @@ inline constexpr uint32_t quant_column_unit(uint32_t block_elements) {
 inline constexpr bool quant_register_tensor(uint32_t format, uint64_t columns) {
   return quant_register_format(format) && columns % (kQuantFormats[format].meta_groups > 1 ? 256 : 64) == 0;
 }
+// The inputs of the register tile's coefficient unit in `format`, of which
+// each K partition takes whole ones: one 64-input span for a format of one
+// group per meta unit, else four, and Q2_K's two, whose coefficients per span
+// take twice Q4_K's storage.
+inline constexpr uint32_t quant_register_unit(uint32_t format) {
+  return kQuantFormats[format].meta_groups == 1 ? 64 : format == GGUF_FMT_Q2K ? 128 : 256;
+}
 
 // Whether a format stores at least four bits per weight.
 inline constexpr bool quant_four_bits(uint32_t format) {

@@ -2025,8 +2025,9 @@ decode faster on the staged tile there, which a projection all of whose segments
 takes wherever the tile holds its lanes' rows unpadded. F16, whose 11-bit significands bf16 does
 not hold, has no register kernels (`quant_register_format`), and they read a tensor in rows of
 whole coefficient units (`quant_register_tensor`: 256 inputs for a format of several groups per
-meta unit, else 64): a projection with a segment they do not take, or a gate/up pair with one,
-stages at every lane count, and its decode storage holds the staged tile's rows. On Apple10
+meta unit, else 64), each K partition whole units (`quant_register_unit`): a projection with a
+segment they do not take, or a gate/up pair with one, stages at every lane count, and its decode
+storage holds the staged tile's rows. On Apple10
 (M5) the staged tile (`LinearTile::GgufStaged`) runs the kernels of
 `runtime/metal/kernels/shared/gguf_linear.metal`, which dequantize each weight once to half in
 threadgroup memory (`kernels/common/gguf_staged.h`) for MPP `matmul2d`, the neural accelerator's

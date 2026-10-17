@@ -175,7 +175,8 @@ LinearScratchSize Linear::decodeScratchSize(ProjectionShape shape) const {
   LinearScratchSize bound;
   for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
-      bound.include(ggufDecodeScratchSize(decode({shape.outputSize, shape.inputSize}, lanes, epilogue)));
+      bound.include(
+          ggufDecodeScratchSize(decode({shape.outputSize, shape.inputSize}, lanes, epilogue), shape.registerFormats));
   // Decode plans store at most every lane's rows.
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, kMaximumDecodeTileRows);
   return bound;
