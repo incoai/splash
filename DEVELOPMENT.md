@@ -229,7 +229,8 @@ GGUF on the SSD: no `ple.bin` image is written, and the weights shrink by the
 stored table size. Startup memory requirements also include the cache and
 Metal staging buffers. The rows each command gathers are read through a
 host cache with a SIZE-byte cache and working-memory reservation; the engine
-refuses a SIZE that holds no row. This reservation is not a strict bound on
+refuses a SIZE that holds no row, and a SIZE that holds the whole table loads
+it with the weights instead. This reservation is not a strict bound on
 host allocations: prefetch scratch, excess vector capacity, job metadata,
 allocator overhead and reader stacks are additional, and oversized stages
 grow their scratch. Other models ignore the option with a warning; off by

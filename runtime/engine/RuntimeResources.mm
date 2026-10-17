@@ -433,10 +433,16 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   try {
     // --ple-memory: a table the target's GGUF holds streams from its file,
     // so its image is not loaded, and the store's bytes (at most the
-    // option's) are charged in its place.
-    const bool streamsTable = config.streamedTableBytes && model::streamableTableBytes(config.modelRoot, config.model);
-    if (config.streamedTableBytes && !streamsTable)
+    // option's) are charged in its place, unless they would hold the whole
+    // table, which then loads with the weights.
+    const uint64_t tableBytes =
+        config.streamedTableBytes ? model::streamableTableBytes(config.modelRoot, config.model) : 0;
+    const bool streamsTable = config.streamedTableBytes < tableBytes;
+    if (config.streamedTableBytes && !tableBytes)
       logLine("--ple-memory ignored: ", config.model.name, " has no PLE table to stream");
+    else if (config.streamedTableBytes && !streamsTable)
+      logLine("--ple-memory ignored: its ", config.streamedTableBytes / kMiB, " MiB hold the whole PLE table (",
+              tableBytes / kMiB, " MiB), which loads with the weights");
     // --expert-memory: a MoE target's routed experts stream through a store
     // of that many bytes, which modelWeightBytes counts with the images,
     // unless they would hold every one of them.
