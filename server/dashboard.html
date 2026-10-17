@@ -81,7 +81,7 @@
   .kv-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px; font-variant-numeric: tabular-nums }
   .kv-row:last-child { border-bottom: none }
   .kv-label { width: 76px; flex: none; color: var(--muted); font-weight: 600 }
-  .kv-val { color: var(--text); white-space: nowrap; min-width: 0; overflow: hidden; text-overflow: ellipsis }
+  .kv-val { color: var(--text); min-width: 20px; overflow-wrap: break-word }
   .kv-val.dim { color: var(--muted) }
   .bar { display: flex; flex: 1; height: 8px; border-radius: 4px; background: var(--border); overflow: hidden; min-width: 60px }
   .bar > div { height: 100%; width: 0 }
