@@ -9,10 +9,12 @@
 //   model-configuration FIXTURES
 
 #include "TestChecks.hpp"
+#include "TestDrafts.hpp"
 #include "TestFiles.hpp"
 #include "model/ModelDescriptor.hpp"
 #include "model/WeightStore.hpp"
 
+#include <array>
 #include <filesystem>
 #include <initializer_list>
 #include <iostream>
@@ -88,7 +90,7 @@ void testFamilies(const std::filesystem::path &fixtures) {
   require(denseDescriptor.name == "community/fine-tune" &&
               std::holds_alternative<model::Qwen3_8Layout>(denseDescriptor.target) &&
               denseDescriptor.targetSource == model::TargetSource::Safetensors && !denseDescriptor.hasVision() &&
-              denseDescriptor.draft == model::kQwen3_8DraftLayout,
+              denseDescriptor.draft == test::qwen3_8Draft(),
           "an MLX Qwen3.8-27B made another descriptor");
   // The sources' identity is the digest of the record naming them.
   require(denseDescriptor.sourceIdentity == model::weightDigest(dense.record) &&
@@ -103,8 +105,17 @@ void testFamilies(const std::filesystem::path &fixtures) {
       inspect(moe.with(&SourceModel::record, R"("none")", R"("safetensors")"));
   require(std::holds_alternative<model::Qwen3_6MoeLayout>(moeDescriptor.target) &&
               moeDescriptor.visionSource == model::VisionSource::Safetensors &&
-              moeDescriptor.draft == model::kQwen3_6MoeDraftLayout,
+              moeDescriptor.draft == test::qwen3_6MoeDraft(),
           "an MLX Qwen3.6-35B-A3B made another descriptor");
+  // A draft states its own layers, intermediate size, rotary base and the
+  // target layers it reads.
+  constexpr std::array<uint32_t, 6> ownLayers{5, 19, 33, 47, 61, 63};
+  require(inspect(dense.with(&SourceModel::draft, R"("num_hidden_layers": 5)", R"("num_hidden_layers": 3)")
+                      .with(&SourceModel::draft, R"("intermediate_size": 17408)", R"("intermediate_size": 8192)")
+                      .with(&SourceModel::draft, R"("rope_theta": 10000000)", R"("rope_theta": 1000000)")
+                      .with(&SourceModel::draft, "61\n", "61,\n      63\n"))
+                  .draft == model::draftLayout(5120, 248320, 3, 8192, 1e6F, ownLayers),
+          "a draft's own sizes were not its descriptor's");
   // The model type names the family; the sizes every source's config states
   // tell its target from other models of the architecture, which Splash does
   // not serve, such as Qwen3.5-4B.
@@ -126,17 +137,24 @@ void testFamilies(const std::filesystem::path &fixtures) {
 }
 
 // A descriptor states where its weights come from: one that leaves either
-// source unset, which hasVision would read as a vision tower, is not valid.
+// source unset, which hasVision would read as a vision tower, is not valid;
+// nor is one whose draft reads past the target's last layer.
 void testSources() {
-  const auto described = [](model::TargetSource target, model::VisionSource vision) {
-    return model::makeModelDescriptor("sources", model::Qwen3_8Layout{}, model::kQwen3_8DraftLayout,
-                                      model::kQwen3_8VisionLayout, target, vision);
+  const auto described = [](model::TargetSource target, model::VisionSource vision,
+                            const model::DFlashDraftLayout &draft = test::qwen3_8Draft()) {
+    return model::makeModelDescriptor("sources", model::Qwen3_8Layout{}, draft, test::qwen3_8Vision(), target,
+                                      vision);
   };
   require(described(model::TargetSource::Safetensors, model::VisionSource::None).valid(),
           "a descriptor of its sources was not valid");
   require(!described(model::TargetSource{}, model::VisionSource::None).valid() &&
               !described(model::TargetSource::Safetensors, model::VisionSource{}).valid(),
           "a descriptor without a source was valid");
+  constexpr std::array<uint32_t, 2> pastLastLayer{5, 64};
+  require(!described(model::TargetSource::Safetensors, model::VisionSource::None,
+                     model::draftLayout(5120, 248320, 5, 17408, 1e7F, pastLastLayer))
+               .valid(),
+          "a descriptor whose draft reads past the target's last layer was valid");
 }
 
 // Each config is checked where the descriptor is made, once, and each number
@@ -178,11 +196,18 @@ void testOneRulePerValue(const std::filesystem::path &fixtures) {
            {&SourceModel::config, R"("full_attention")", R"("linear_attention")",
             "text config layer_types 3 must be full_attention"},
            {&SourceModel::draft, "[\n      5,", "[\n      5.9,",
-            "draft config target_layer_ids 0 mismatch: checkpoint 5.9, runtime 5"},
-           {&SourceModel::draft, "61\n", "61,\n      1\n",
-            "draft config target_layer_ids count mismatch: checkpoint 6, runtime 5"},
-           {&SourceModel::draft, R"("rope_theta": 10000000)", R"("rope_theta": 1000000)",
-            "draft config rope_parameters rope_theta mismatch"},
+            "draft config target_layer_ids 0 must be a whole number"},
+           {&SourceModel::draft, "61\n", "61,\n      1\n", "a DFlash2 draft reads 1 to 8 target layers, ascending"},
+           {&SourceModel::draft, "61\n", "61,\n      64\n",
+            "draft config target_layer_ids names a layer past the target's"},
+           {&SourceModel::draft, R"("intermediate_size": 17408)", R"("intermediate_size": 17416)",
+            "a DFlash2 draft's intermediate size is a positive multiple of 64"},
+           {&SourceModel::draft, R"("num_hidden_layers": 5)", R"("num_hidden_layers": 0)",
+            "a DFlash2 draft has at least one layer"},
+           {&SourceModel::draft, R"("rope_theta": 10000000)", R"("rope_theta": -1)",
+            "a DFlash2 draft's rotary theta is positive"},
+           {&SourceModel::draft, R"("num_attention_heads": 32)", R"("num_attention_heads": 16)",
+            "draft config num_attention_heads mismatch: checkpoint 16, runtime 32"},
            {&SourceModel::draft, R"("selector_top_k": 16)", R"("selector_top_k": 8)",
             "draft config dflash_config selector_top_k mismatch"},
            {&SourceModel::draft, R"("is_causal": false)", R"("is_causal": 0)", "draft config is_causal must be false"},
@@ -500,7 +525,7 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
   require(check("mlx-affine", "none", moe.config, std::nullopt, std::nullopt) == "Qwen3.6-35B-A3B",
           "a target without its draft was refused");
   rejects([&] { static_cast<void>(check("mlx-affine", "none", moe.config, std::nullopt, dense.draft)); },
-          "draft config num_hidden_layers mismatch: checkpoint 5, runtime 6", "another family's draft was accepted");
+          "draft config hidden_size mismatch: checkpoint 5120, runtime 2048", "another family's draft was accepted");
   // A GGUF's config with the metadata the installer copies from its header,
   // which the planner checks in the GGUF at every start: what the config
   // does not hold, such as the RoPE scaling, the epsilon, the FFN widths and

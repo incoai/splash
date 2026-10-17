@@ -139,6 +139,7 @@ class SmokeRealTests(unittest.TestCase):
                         max_context=None,
                         max_memory=None,
                         max_cache_disk=None,
+                        expert_memory=None,
                         max_image_pixels=None,
                         kv_format="bf16" if absolute else "int8",
                     )
@@ -183,6 +184,7 @@ class SmokeRealTests(unittest.TestCase):
             max_context=None,
             max_memory=None,
             max_cache_disk="4G",
+            expert_memory=None,
             max_image_pixels=None,
             kv_format="int8",
         )
@@ -214,6 +216,29 @@ class SmokeRealTests(unittest.TestCase):
                     self.assertEqual(
                         command[index + 1 : index + 3], ["--cache-dir", "/tmp/cache"]
                     )
+
+    def test_ssd_streaming_options_reach_the_server(self):
+        model = ["--model", "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M"]
+        parsed = smoke_real.parse_args(model)
+        self.assertIsNone(parsed.expert_memory)
+        parsed = smoke_real.parse_args([*model, "--expert-memory", "16G"])
+        self.assertEqual(parsed.expert_memory, "16G")
+        with self.server():
+            command = smoke_real.subprocess.Popen.call_args.args[0]
+            self.assertNotIn("--expert-memory", command)
+        arguments = self.server_arguments()
+        arguments.expert_memory = "16G"
+        with (
+            mock.patch.object(smoke_real, "available_port", return_value=8000),
+            mock.patch.object(smoke_real.subprocess, "Popen") as popen,
+        ):
+            popen.return_value.poll.return_value = 0
+            server = smoke_real.RealServer(arguments)
+            try:
+                command = popen.call_args.args[0]
+                self.assertEqual(command[command.index("--expert-memory") + 1], "16G")
+            finally:
+                server.close()
 
     def test_persistent_cache_scenario_needs_the_ssd_cache(self):
         model = ["--model", "mlx-community/Qwen3.8-27B-4bit"]

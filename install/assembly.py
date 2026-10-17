@@ -17,7 +17,8 @@ The paths an assembly links, and what reads each:
                          which a release check runs on this installation
   target/<shard>         the MLX safetensors shards except those holding only
                          vision_tower.* (SafetensorsCheckpoint.mm)
-  target/<name>.gguf     the GGUF target (GgufTarget.cpp findTargetGguf)
+  target/<name>.gguf     the GGUF target, or the parts of a split one
+                         (GgufTarget.cpp findTargetGgufs)
   tokenizer/config.json  the same configuration again, from which the
                          server's AutoTokenizer.from_pretrained chooses the
                          tokenizer class
@@ -275,12 +276,16 @@ def derived_metadata(models_root: Path, files):
     """The key and the files, by assembly path, of the metadata derived from
     the GGUF files among files (assembly path -> source file): derived once,
     and again when its entry is damaged. Call it under the installation lock."""
-    inputs = [files[name] for name in _metadata_inputs(files)]
+    names = _metadata_inputs(files)
+    inputs = [files[name] for name in names]
     sources = [file_record(path) for path in inputs]
     key = _metadata_key(sources)
+    # A split target's metadata is its first file's (split order is name
+    # order); the vision projector comes last.
+    derive = [inputs[0]] + ([files[GGUF_VISION]] if GGUF_VISION in files else [])
 
     def write(stage):
-        contents = gguf.derived_files(*inputs)
+        contents = gguf.derived_files(*derive)
         if [file_record(path) for path in inputs] != sources:
             raise models.ModelError("GGUF source changed while reading metadata")
         for name, data in contents.items():

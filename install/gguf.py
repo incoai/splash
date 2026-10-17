@@ -419,6 +419,7 @@ TENSOR_TYPES = {
     30: "BF16",
     39: "MXFP4",
     40: "NVFP4",
+    42: "Q2_0",
     142: "PQ2_0",
 }
 QUANTIZED_TYPES = {
@@ -443,6 +444,7 @@ QUANTIZED_TYPES = {
     "IQ4_XS",
     "MXFP4",
     "NVFP4",
+    "Q2_0",
     "PQ2_0",
 }
 FORMAT_TYPES = QUANTIZED_TYPES | {"BF16", "F16"}
@@ -454,24 +456,33 @@ UNQUANTIZED_TYPES = {"BF16", "F16", "F32"}
 # (gguf_embedding_format in runtime/metal/abi/Gguf.h).
 EMBEDDING_TYPES = FORMAT_TYPES
 # The tensors the native loader reads from a target, and the types it accepts
-# for each (runtime/model/GgufImage.cpp): projections of a format; F32 norms,
-# small GDN vectors and MoE routers, which llama.cpp keeps unquantized and
-# which run unrounded; GDN alpha and beta, each of a format or F32, which
+# for each (runtime/model/GgufImage.cpp): projections of a format; the tensors
+# llama.cpp keeps unquantized, which run unrounded: small GDN vectors of F32,
+# norms of F32 or the BF16 and F16 that widen to it (floatNorm), MoE routers
+# of F32 or BF16, which run as stored (floatTensor), and shared-expert scalar
+# gates of F32, BF16 or Q8_0, which preparation turns into the F32 values they
+# hold (floatRows); GDN alpha and beta, each of a format or F32, which
 # preparation widens to the F32 values they hold unless both are of one
-# quantized type.
+# quantized type or both BF16.
 F32 = {"F32"}
+NORM_TYPES = {"F32", "BF16", "F16"}
+FLOAT_PROJECTION_TYPES = {"F32", "BF16"}
+FLOAT_ROW_TYPES = {"F32", "BF16", "Q8_0"}
 MODEL_TENSORS = {
     "token_embd.weight": EMBEDDING_TYPES,
-    "output_norm.weight": F32,
+    "output_norm.weight": NORM_TYPES,
     "output.weight": FORMAT_TYPES,
 }
-LAYER_TENSORS = {"attn_norm.weight": F32, "post_attention_norm.weight": F32}
+LAYER_TENSORS = {
+    "attn_norm.weight": NORM_TYPES,
+    "post_attention_norm.weight": NORM_TYPES,
+}
 ATTENTION_TENSORS = {
     "attn_q.weight": FORMAT_TYPES,
     "attn_k.weight": FORMAT_TYPES,
     "attn_v.weight": FORMAT_TYPES,
-    "attn_q_norm.weight": F32,
-    "attn_k_norm.weight": F32,
+    "attn_q_norm.weight": NORM_TYPES,
+    "attn_k_norm.weight": NORM_TYPES,
     "attn_output.weight": FORMAT_TYPES,
 }
 GDN_TENSORS = {
@@ -482,7 +493,7 @@ GDN_TENSORS = {
     "ssm_conv1d.weight": F32,
     "ssm_a": F32,
     "ssm_dt.bias": F32,
-    "ssm_norm.weight": F32,
+    "ssm_norm.weight": NORM_TYPES,
     "ssm_out.weight": FORMAT_TYPES,
 }
 DENSE_TENSORS = {
@@ -491,11 +502,11 @@ DENSE_TENSORS = {
     "ffn_down.weight": FORMAT_TYPES,
 }
 MOE_TENSORS = {
-    "ffn_gate_inp.weight": F32,
+    "ffn_gate_inp.weight": FLOAT_PROJECTION_TYPES,
     "ffn_gate_exps.weight": FORMAT_TYPES,
     "ffn_up_exps.weight": FORMAT_TYPES,
     "ffn_down_exps.weight": FORMAT_TYPES,
-    "ffn_gate_inp_shexp.weight": F32,
+    "ffn_gate_inp_shexp.weight": FLOAT_ROW_TYPES,
     "ffn_gate_shexp.weight": FORMAT_TYPES,
     "ffn_up_shexp.weight": FORMAT_TYPES,
     "ffn_down_shexp.weight": FORMAT_TYPES,
@@ -529,6 +540,32 @@ def loaded_tensors(metadata):
         for name, types in (LAYER_TENSORS | mixer | ffn).items():
             tensors[f"blk.{layer}.{name}"] = types
     return tensors
+
+
+def merged_split(headers):
+    """One target's metadata from the headers of its split files (llama.cpp's
+    gguf-split), in split order: the first file's keys, whose split.* keys
+    must describe these files, and every file's tensor types."""
+    first = headers[0]
+    count = first.values.get("split.count", 1)
+    if type(count) is not int or count != len(headers):
+        raise ModelError("the GGUF's split files do not match its split.count")
+    tensors = {}
+    for number, header in enumerate(headers):
+        if len(headers) > 1 and (
+            header.values.get("split.no") != number
+            or header.values.get("split.count") != count
+        ):
+            raise ModelError(f"GGUF split file {number + 1} is out of order")
+        for name, kind in header.tensors.items():
+            if name in tensors:
+                raise ModelError("duplicate GGUF tensor across split files: " + name)
+            tensors[name] = kind
+    total = first.values.get("split.tensors.count", len(tensors))
+    if total != len(tensors):
+        raise ModelError("the GGUF's split files hold another number of tensors")
+    first.tensors = tensors
+    return first
 
 
 # Prism ML's input rotation of a dense target: the parameters and keys

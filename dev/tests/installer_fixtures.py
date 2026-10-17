@@ -194,12 +194,15 @@ class FakeHub:
 
 
 def fake_hub(test, cache, *, target=DENSE, commit="a" * 40):
-    """A FakeHub publishing MODEL at commit on main and every family's
-    draft repository at DRAFT_COMMIT on main."""
+    """A FakeHub publishing MODEL at commit on main and the DFlash2 draft
+    released for each family at DRAFT_COMMIT on main."""
     fake = FakeHub(test, cache)
     fake.publish(MODEL, commit, lambda p: mlx_target(p, target))
     for family in families.FAMILIES:
-        fake.publish(family.draft_repo, DRAFT_COMMIT, lambda p: draft_dir(p, family))
+        if family.draft_repo:
+            fake.publish(
+                family.draft_repo, DRAFT_COMMIT, lambda p: draft_dir(p, family)
+            )
     return fake
 
 

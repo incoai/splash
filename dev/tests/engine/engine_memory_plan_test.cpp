@@ -235,6 +235,26 @@ void testNeuralEngineSplitIsBudgeted() {
           "the split is missing from the memory plan status");
 }
 
+// A streamed table's host memory is fixed runtime memory of its own
+// category, which the KV cache gives up; the status and the description
+// report it.
+void testStreamedTableIsBudgeted() {
+  const EngineMemoryPlan without = test::requireMemoryPlan(device(), model());
+  ModelMemoryProfile streamed = model();
+  const uint64_t cache = 2 * kGiB;
+  streamed.footprint.streamedTableBytes = cache;
+  const EngineMemoryPlan with = test::requireMemoryPlan(device(), streamed);
+  const auto &budget = with.breakdown();
+  require(budget.streamedTableBytes == cache &&
+              budget.fixedRuntimeBytes == without.breakdown().fixedRuntimeBytes + cache &&
+              with.maximumContextTokens() <= without.maximumContextTokens(),
+          "a streamed table's cache was not planned as fixed runtime memory");
+  require(with.toStatusJson().find("\"streamed_table_bytes\":" + std::to_string(cache) + ",\"ane_ffn_bytes\"") !=
+                  std::string::npos &&
+              budget.describe().find("streamed table cache: " + std::to_string(cache)) != std::string::npos,
+          "a streamed table's cache is missing from the memory plan status");
+}
+
 // The pipeline and runtime reserves are the model constants rather than part
 // of a model's plan, and a model's plan without one of its arenas is refused.
 void testReservesAreTheModelConstants() {
@@ -384,6 +404,7 @@ int main() {
     testUserCeilingAndFailure();
     testDiskTierStateStagingIsBudgeted();
     testNeuralEngineSplitIsBudgeted();
+    testStreamedTableIsBudgeted();
     testReservesAreTheModelConstants();
     testHardBudgetBoundaries();
     testModelProvidedKvGeometry();

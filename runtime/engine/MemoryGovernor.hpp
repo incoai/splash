@@ -180,9 +180,11 @@ public:
   // must exceed hostReserveBytes, which macOS keeps; growth that no request
   // in service needs keeps hostSpareReserveBytes of its spare memory, and
   // the warning margin above them, for other applications.
+  // hostHeldBytes, host memory held outside Metal (the streamed table's
+  // row cache), is charged in full.
   MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
                  uint64_t hostReserveBytes, uint64_t hostSpareReserveBytes,
-                 HostMemoryProvider hostMemory, uint64_t untrackedReserveBytes);
+                 HostMemoryProvider hostMemory, uint64_t untrackedReserveBytes, uint64_t hostHeldBytes = 0);
 
   // The only way to reserve memory. Low-level storage/model components
   // receive only this transactional callback, so allocation stays governed
@@ -287,6 +289,7 @@ private:
   uint64_t hostSpareReserveBytes_ = 0;
   HostMemoryProvider hostMemory_;
   uint64_t untrackedReserveBytes_ = 0;
+  uint64_t hostHeldBytes_ = 0;
   uint64_t reservedBytes_ = 0;
   bool serving_ = false;
   bool requestWaiting_ = false;

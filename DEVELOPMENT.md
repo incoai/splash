@@ -84,7 +84,7 @@ access.
 | --- | --- | --- |
 | `--model` | Required | The upstream model, `OWNER/REPO`, or a GGUF's `OWNER/REPO:VARIANT`. See [upstream model loading](#upstream-model-loading). |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
-| `--draft-model` | Matching DFlash2 checkpoint | Override the draft with a compatible repository or local directory. See [drafts](#drafts). |
+| `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place; required for a family without a released draft. See [drafts](#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](#vision). |
 | `--offline` | Off | Start the installed model without asking the Hub, as `HF_HUB_OFFLINE=1` does. See [revisions](#revisions). |
 | `--port` | `SPLASH_PORT` or `8000` | HTTP port. |
@@ -97,6 +97,7 @@ access.
 | `--max-context` | Auto | Set the context limit, e.g. `100K`. See [memory and context](#memory-and-context). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
+| `--expert-memory` | Off | MoE targets: hold routed experts in this much memory, e.g. `16G`, and read the others from the SSD when a step routes them. See [streamed experts](#streamed-experts). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](#weight-loading). |
 | `--max-cache-disk` | `auto` | SSD quota for cached KV pages and states: `auto` follows the volume's free space up to 32 GiB, a size such as `16G` sets the quota, `0` turns the cache off. Kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
 | `--max-cache-disk-writes` | `0` (no limit) | The most the SSD cache writes a day, e.g. `200G`. See [SSD cache](#ssd-cache). |
@@ -116,7 +117,7 @@ access.
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
 Sizes (`--max-memory`, `--max-cache-disk`, `--max-cache-disk-writes`,
-`--max-request-size`) are a whole number of bytes, or one with a `K`, `M` or
+`--max-request-size`, `--expert-memory`) are a whole number of bytes, or one with a `K`, `M` or
 `G` suffix in binary units: `28G` is 28 GiB, and `28GB`, `28GiB` and `28g` say
 the same. Token counts (`--max-context`) are a whole number, or one with a `K`
 suffix of 1024 tokens: `100K` is 102,400 tokens. `--max-memory`, `--max-context` and `--max-cache-disk`
@@ -199,6 +200,60 @@ context limit. `/v1/models` and `/v1/models/{id}` report the same limit as
 aliases. Clients can impose a smaller limit. This is a capacity limit, not a
 guarantee of a fast first token for a long uncached prompt. If the model cannot
 fit, startup prints a memory budget breakdown and stops.
+
+### Streamed experts
+
+With `--expert-memory SIZE`, such as `--expert-memory 16G`, a MoE target's
+routed experts stay in their files on the SSD, and a store of SIZE bytes holds
+as many of them as fit (`ExpertStore`, `runtime/model/ExpertStore.hpp`): the
+weights shrink by the routed experts' bytes, and the store counts in their
+place (`target_weights_bytes`). Off by default.
+
+- Each MoE layer of a command loads the experts its rows route that are not
+  resident: after the layer's routing, a host step of the command claims
+  slots for them, recycled by adaptive replacement (ARC: the experts decode
+  steps route again stay while the others pass through, and a prompt's
+  experts go first), and reads them from their
+  files into a staging of a decode cycle's experts on the model's weight
+  readers, and a repack kernel writes them into their slots before the expert
+  passes run. A decode step's load is one such round; a prefill command's
+  loads take as many rounds as its rows may route experts, each staging half
+  of the staging while the other half is read ahead. The kernels read every
+  routed expert through the layer's slot table, so resident and streamed
+  experts run the same kernels.
+- An expert's rows a GGUF stores as they are are read straight into the
+  staging (`F_NOCACHE`, widened to whole 16 KiB pages, which the kernel reads
+  without the buffer cache: an M5 Pro reads 460 KiB pieces from four threads
+  at 9.3 GB/s instead of 8.1, with less than half the CPU).
+- While the GPU repacks a round or runs a layer, the next round's experts or
+  the next block's likely experts are read ahead: those the next block's
+  router picks from this block's input in a decode step; after a long prefill
+  chunk's last repack, one more host step reads nearly all of the next
+  block's into the whole staging. A load takes the read-ahead over without
+  waiting for its reads of experts it does not route, and a read ahead of an
+  expert no load routes may fail without failing anything.
+- Experts of one format share an arena of slots; when it would take more than
+  the device's largest buffer (`maxBufferLength`), their layers are split
+  between arenas that each fit, each recycling its own slots.
+- A decode step's loads keep the GPU awake through their host steps
+  ([Host steps](#host-steps)), so the work after a load starts at once and at
+  full clocks rather than after the GPU's wake-up.
+- A prefill command runs a group of up to four chunks of 2048 rows layer by
+  layer, so each layer's experts are read once for all of them; a prompt with
+  images runs one chunk per command. A contended prefill command's slice
+  counts the time its GPU work waited on the reads as a fixed cost
+  ([Admission and eviction](#admission-and-eviction)).
+- A load checks its files unchanged after it read them. A read is tried once
+  more when it fails. A load that fails (a routed expert cannot be read, or
+  a file was written) fails its command, and every later load fails too.
+- The store's memory is released while idle with the weights and restored
+  with them ([Weight loading](#weight-loading)).
+- `/status` reports the store under `streamed_experts`: its arena and
+  staging bytes, slots, its experts and those resident; per use (`prefill`,
+  `decode`) its loads, the distinct experts they routed, those read and of
+  them those read ahead, the experts read ahead whole, the hit rate, the bytes
+  read and the host steps' round trips, one per round (`host_steps`:
+  `pickup_ms`, `work_ms`, `resume_ms`); and the `failure` that stopped it.
 
 ### KV cache precision
 
@@ -790,10 +845,17 @@ sums each row's softmax denominator, finds where its distribution ends
 without sorting the vocabulary, and draws over every token the distribution
 keeps. vLLM itself refuses a nonzero `min_p` with speculative decoding; here
 it is one more cut of the target distribution, which acceptance and
-correction read as they read the others, so sampling stays exact.
+correction read as they read the others, so sampling stays exact. A request
+that keeps only its most likely token, at a `min_p` of 1 or a `top_k` of 1,
+decodes greedily, its draft's proposals too: it selects what sampling would
+but for equally likely tokens, of which it takes the lowest id.
 
 A lane's arithmetic can depend on the batch it decodes in and on how its prompt
-is chunked. Concurrent requests change both, and chunk boundaries also come from
+is chunked. On a GGUF MoE target's staged expert tiles, an expert that a step
+routes at most two rows to runs them on the column tile, which sums in another
+order than the staged matmul, so a row's result also depends on the rows
+decoded or prefilled beside it. Concurrent requests change both, and chunk
+boundaries also come from
 the cached boundary a request resumes from, from a boundary another request
 waits to resume from, and from one whose state, or the KV past it, memory could
 not hold. With `--state-format bf16` the state is also rounded at each state a
@@ -1133,6 +1195,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `active_requests` | Each request the engine holds, ordered by `id`: its `id`, `phase` (`queued`, `waiting_resources`, `waiting_prefix`, `prefill`, `decode` or `waiting_mask`, and `failed` for one whose deadline passed while a cached state it restores was being read from disk, until that read drains), `priority`, `prompt_tokens` and how many of them are encoded (`prompt_processed`, cached ones included), `generated_tokens` of `max_new_tokens`, and `age_ms` since it arrived |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
 | `weights.idle_release_seconds`, `released`, `restoring`, `restores`, `restore_failures` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, whether a request's restore of it is under way (it stays `released` until the last image is back), the times it was restored for a request since engine start, and the restores that gave up for want of memory |
+| `streamed_experts` | With `--expert-memory`, the [streamed experts](#streamed-experts)' store: its slots and resident experts, per use its loads, reads, read-ahead and host-step round trips, and its failure; `null` otherwise |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
 | `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk run again adds the rerun's |
@@ -1370,10 +1433,13 @@ and lists every unsupported tensor in one error:
 
 - linears and experts: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1,
   Q5_0, Q5_1, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,
-  IQ4_NL, MXFP4, NVFP4, PQ2_0, BF16 or F16;
+  IQ4_NL, MXFP4, NVFP4, PQ2_0, Q2_0, BF16 or F16;
 - token embeddings: any of the linears' formats;
-- norms, the MoE router and shared-expert scalar gate, and the GDN
-  convolution, decay and time-step bias: F32;
+- norms: F32, BF16 or F16, loaded as the F32 values they hold;
+- the MoE router: F32 or BF16, which the float projection runs as stored;
+- the shared-expert scalar gate: F32, BF16 or Q8_0, loaded as the F32 values
+  it holds;
+- the GDN convolution, decay and time-step bias: F32;
 - GDN alpha and beta: each any of the linears' formats or F32. Two of one
   quantized type other than BF16 and F16 load as one segment of the GDN input
   projection in that format; any other pair loads as one F32 tensor of the
@@ -1382,6 +1448,15 @@ and lists every unsupported tensor in one error:
   pair stays such a float segment: it reads the input unrotated, as Prism's
   BF16 alpha and beta need, and leaves the GDN input projection on Apple9's
   register tile, which takes no F16.
+
+A variant no root file names may be a folder of a split GGUF's parts, as
+Unsloth publishes files too large for one
+(`VARIANT/MODEL-VARIANT-00001-of-0000N.gguf`, `upstream.split_gguf`): every
+part from 1 to N must be present. The parts install side by side in
+`target/`, and the native loader reads them as one GGUF (`findTargetGgufs`,
+`OpenGguf`): the first part's metadata, whose `split.count` and
+`split.tensors.count` must describe the parts, and every part's tensors. The
+installer screens the merged header (`gguf.merged_split`).
 
 BF16 and F16 are formats of the image like the quantized ones, for the tensors
 a quantized file keeps unquantized: UD-Q8_K_XL keeps the 27B's attention
@@ -1423,6 +1498,10 @@ Model Optimizer's NVFP4 does
 256-element NVFP4 block, whose meta unit holds the `.scale` value as its `g`
 (1 without one), at 4.625 bits per weight for the file's 4.5.
 
+Q2_0 is llama.cpp's type 42, `block_q2_0`, as in ISTA-DASLab's GSQ-RCO files:
+2-bit codes q worth d (q - 1) with one half d per 64 weights. Its planes are
+PQ2_0's ([PQ2_0](#pq2_0)), with a meta unit per 64 weights.
+
 ### PQ2_0
 
 PQ2_0 is Prism ML's type 142, `block_pq2_0` of PrismML-Eng/llama.cpp, which
@@ -1441,15 +1520,28 @@ the parameters, `GgufFile` and the planner check the rest).
 
 ### Drafts
 
-Each family names the repository of the DFlash2 checkpoint trained for it
-(`families.FAMILIES`), which holds it as the release publishes it:
-`config.json` and BF16 `model.safetensors` (or the shards its index names).
-Installation downloads only those files and follows the repository's default
-branch as it follows the target's ([Revisions](#revisions)); `--draft-model`
-accepts another repository, followed the same way, or a local directory that
-holds them. A checkpoint is installed only when the engine accepts its
+Every model decodes with a DFlash2 draft. Each family names the repository
+of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
+it as the release publishes it: `config.json` and BF16 `model.safetensors`
+(or the shards its index names); a family whose draft is not released yet
+names none, and its installation names one with `--draft-model`. Installation
+downloads only those files and follows the repository's default branch as it
+follows the target's ([Revisions](#revisions)); `--draft-model` accepts
+another repository, followed the same way, or a local directory that holds
+them. A checkpoint is installed only when the engine accepts its
 configuration with the target's (its `model-check`), so a draft of another
-architecture never replaces one that loads. Native loading validates the
+architecture never replaces one that loads.
+
+A draft's `config.json` states its layers, intermediate size, rotary base and
+the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
+ascending, at most eight); its hidden size, vocabulary and mask token are its
+target's, and its attention (32 query and 8 KV heads of 128), selector (rank
+256, 16 candidates), block of 8 rows and 2048-token window are those the
+kernels are built for (`readDraftLayout` in `ModelDescriptor.mm`); the
+kernels take any hidden width of whole 16-channel convolution groups. Every
+family loads and runs its draft alike: a decode cycle verifies every row of
+the draft's block, the anchor and its seven proposals. The target writes the
+outputs of the layers the draft reads for each row it reads. Native loading validates the
 configuration against the target again and loads the draft like a target
 ([Weight loading](#weight-loading)):
 `DraftCheckpointLoader` (`DraftCheckpoint.cpp`) plans the draft's `MDGG0001`
@@ -1598,6 +1690,19 @@ PEP 366 header. `serve_options.py` defines the options
 `splash serve` shares with the server once, each with its check, default,
 help and help group, and how the launcher passes it on; it imports only the
 standard library, since the launcher parses them before `.venv` exists.
+
+Flash-Next's two hyper-connection norm kernels, which split a mix's rows
+between them, must write the same bits, which only an uninstrumented run of
+the production metallib on the release GPU and toolchain shows
+(`build/engine-tests/qwen4-kernels build/splash.metallib bitwise`, which
+`make test-engine-metal` runs). Shader validation is a separate bounds and
+numerical-closeness gate; it does not establish bitwise equality of
+production code. Before release,
+compare full-model greedy outputs at the same prompts, cached prefixes and
+batch schedule against the base. Repeat seeded sampled requests within each
+build, and explicitly check base-versus-candidate seeded output when preserving
+a drafting policy. These are measured gates, not a guarantee across arbitrary
+compiler versions or GPUs.
 
 The values the native runtime holds constant (the Metal command timeout, the
 KV tier's transfers, the input queue's bound, the latency window, the
@@ -1831,12 +1936,17 @@ rounding of its fp32-accumulated sum. They read their activations as the Table16
 grid lookups, IQ3_XXS, the IQ2 formats and IQ1 (`apple9StagesFormat`), and Q2_K from two lanes
 decode faster on the staged tile there, which a projection all of whose segments are in them
 takes wherever the tile holds its lanes' rows unpadded. F16, whose 11-bit significands bf16 does
-not hold, has no register kernels (`quant_register_format`): a projection with an F16 segment, or
-a gate/up pair with one, stages at every lane count, and its decode storage holds the staged
-tile's rows. On Apple10 (M5) the staged tile
-(`LinearTile::GgufStaged`) runs the kernels of `runtime/metal/kernels/shared/gguf_linear.metal`,
-which dequantize each weight once to half in threadgroup memory (`kernels/common/gguf_staged.h`)
-for MPP `matmul2d`, the neural accelerator's path, on bf16 activations. A step's weights, and
+not hold, has no register kernels (`quant_register_format`), and they read a tensor in rows of
+whole coefficient units (`quant_register_tensor`: 256 inputs for a format of several groups per
+meta unit, else 64): a projection with a segment they do not take, or a gate/up pair with one,
+stages at every lane count, and its decode storage holds the staged tile's rows. On Apple10
+(M5) the staged tile (`LinearTile::GgufStaged`) runs the kernels of
+`runtime/metal/kernels/shared/gguf_linear.metal`, which dequantize each weight once to half in
+threadgroup memory (`kernels/common/gguf_staged.h`) for MPP `matmul2d`, the neural accelerator's
+path, on bf16 activations. A decode step whose grid is narrow there, fewer than one and a half
+threadgroups per core (half that in formats of fewer than four bits per weight), runs on the
+register tile instead, whose 128 threads per column tile keep more of its cores' loads in flight
+than the staged tile's 64 (`apple10Registers`). A step's weights, and
 its meta unit when it enters a new one, load while the previous step's matmul runs
 (`gguf_staged_steps`): their DRAM round trips overlap a matmul. On Apple10 from 16 cores each
 column tile of a decode projection starts its walk over its K partition at its own step
@@ -1860,8 +1970,14 @@ MoE layers, so one F16 routed or shared expert tensor in any layer stages every 
 there. Their
 passes launch the live tiles alone: the grouping kernel writes each pass's grid with the tile
 count, and the pass reads it as an indirect dispatch (`ComputeDispatch::indirectThreadgroups`).
-The staged tile runs gate and up in one pass where they share their routed and their shared
-formats, a gate and an up simdgroup on the same columns, bitwise the two passes' intermediate.
+The staged tile runs gate and up in one pass, a gate and an up simdgroup on the same columns,
+bitwise the two passes' intermediate; the simdgroups share one pair table where gate and up share
+their routed and their shared formats.
+An expert's only tile of at most `MOE_GGUF_COLUMN_ROWS` live rows runs on the column tile
+(`kernels/common/gguf_column_tile.h`) rather than the staged one, and the two sum a row's
+products in different orders: a route's output depends on how many rows the step routes to its
+expert, so decode results of GGUF MoE targets on the staged tile, the 35B's included, are not
+invariant to the batch (`kernels/common/moe_expert_slab.h`).
 The float router and alpha/beta projections run in `kernels/shared/gguf_float.metal`, and the
 token rows are gathered by one template in `kernels/shared/embedding.metal`. These plans are
 fixed rules of GPU family, core count, shape and format.
@@ -1925,6 +2041,33 @@ a trailing `prefill=R[,R...]` after the epilogue and the round count, one format
 prefill tile at each chunk of `R` rows (more than 32);
 `make benchmark-gguf-moe` times one MoE layer at the 35B shape on the device's plans and the
 other GGUF tile.
+
+### Sparse attention
+
+A layout that keeps values token-major (`kv::Layout::valuesTokenMajor`)
+attends sparsely, on kernels compiled for 24 query heads over two KV heads
+(Qwen3.8-Flash-Next's): a query row attends only to the blocks of 4 tokens its
+block mask names within its causal history, the mask a bitmap per row over the
+history's blocks (`metal/abi/PagedAttention.h`). The rows of a tile (a verify
+lane's 8, or 8 of a prefill chunk's) attend through one list, the union of
+their blocks in block order, each entry a block and the rows of the tile that
+attend it (`attention_block_lists`, `ops::PagedAttention::addBlockLists`).
+The split kernels (`kernels/shared/sparse_attention.metal`) share a list out
+among their splits in units of 8 blocks, at least 48 a split
+(`SPLASH_SPARSE_SPLIT_BLOCKS`), so that a lane's split count follows its own
+list; each step gathers 8 blocks of keys (4 in BF16), and then their values,
+into threadgroup memory for the MPP QK and PV of the page loop, and the
+softmax masks each row's tokens in blocks the row does not attend and past its
+causal end. A tile without a list attends every block of its history.
+Token-major values make a block's values one contiguous run as its keys are;
+the dense page loop keeps them dimension-major, on which its PV runs faster. A
+layout may also keep an index of its keys in regions of the KV pages after
+every layer's K/V region (`kv::Layout::indexDimension`,
+`PageStorage::indexOffset`): per layer each block's bf16 pooled key, part of
+the page wherever the host copies or clears it (`PageStorage::spans`).
+`make benchmark-attention-sweep ATTENTION_SWEEP_ARGS='--shapes fn --qsa shared'`
+times the sparse kernels over synthetic selections (`--qsa` also takes
+`independent` and `pages`).
 
 ### Neural Engine prefill
 
@@ -2117,19 +2260,56 @@ state (`--state-format bf16`), and with the split as a start makes it, which
 must not be unavailable, and whose automatic context must be what the plan
 holds with the split it runs.
 
+### Host steps
+
+A command can run CPU work between its GPU work. A host step
+(`metal::EventStep`, `CommandGraph::host`) runs once all the work before it
+has completed, on one thread of the backend's, and holds the work after it
+until it returns, through a shared event of its command's: it reads what the
+GPU wrote before it and writes Shared buffers the GPU reads after it, and it
+must not call the backend. A step after a failed command buffer is skipped,
+and one that throws fails its command with its message. A step's `then`, if
+any, runs on the same thread once the step let the work after it go: CPU work
+the GPU need not wait for, such as starting reads that would hold the GPU's
+start back if they began as the step ends. It does not run after work that
+threw, and must not throw: the command may have completed by then, so a
+`then` that throws marks the backend unhealthy. A step's work may run after
+its command's wait() threw (the watchdog or a shutdown gave the command up,
+or its encoding failed after its first buffers were committed), so the work
+owns what it touches.
+
+A step about as short as the GPU's wake-up can keep the GPU awake: one GPU
+thread spins through it until the CPU ends it, so the work after it starts at
+once and at full clocks. The spin sees the CPU end it only through a memory
+scope Metal's public headers leave out (`runtime/metal/kernels/host_step.metal`),
+so it builds apart from the metallib, into `build/host-step.metallib`, and a
+Metal compiler that refuses it only warns. Before the first command with such
+a step, the backend checks that the spin sees the CPU end it; without the
+library, or if it does not, the steps run without the spin, with a warning.
+A completed command reports each step's round trip (`HostStepTiming`) and the
+time its GPU work waited on its steps (`CommandTiming::hostSeconds`), which the
+scheduler counts as the command's fixed cost
+([Admission and eviction](#admission-and-eviction)).
+
 ### Residency and KV extents
 
-Every buffer the backend allocates belongs to one residency set attached to its
-command queue (`MetalBackend::allocateBuffer`): weights, KV extents, state
-buffers and scratch alike stay wired between requests until the idle
+Every buffer the backend allocates belongs to one residency set
+(`MetalBackend::allocateBuffer`, `metal/Residency.hpp`): weights, KV extents,
+state buffers and scratch alike stay wired between requests until the idle
 release (`--idle-release`, 10 minutes by default) passes without a command, and
-the next command wires them again. `--idle-release off` keeps every buffer
-wired, and the weight images allocated unless an
-[explicit release](#explicit-weights-release) gives them back, while the engine
-runs; KV extents return only through the reclaims below, memory pressure among
-them. Memory returns to macOS when the engine releases it, never because macOS
-compressed or dropped an idle buffer. macOS page cache, driver allocations and
-other applications still affect memory pressure and swap.
+the next command wires them again. The command queue holds only a set of the KV
+extents, which kernels reach by address: Metal makes them resident for every
+command buffer, as it does each buffer a dispatch binds. A queue that held every
+buffer would have each command buffer wait for all of them before it starts,
+which with memory nearly full takes 100-170 ms for 1-2% of them; a streamed
+decode command, whose host steps start about a hundred a cycle, would wait at
+nearly every cycle. `--idle-release off` keeps every buffer wired, and the
+weight images allocated unless an [explicit release](#explicit-weights-release)
+gives them back, while the engine runs; KV extents return only through the
+reclaims below, memory pressure among them. Memory returns to macOS when the
+engine releases it, never because macOS compressed or dropped an idle buffer.
+macOS page cache, driver allocations and other applications still affect memory
+pressure and swap.
 
 KV pages live in extents: ordinary shared Metal buffers of one size per pool,
 between half and one and a half times 128 MiB, in which every tensor region of
@@ -2141,8 +2321,8 @@ pool allocates or releases an extent. An extent whose last page is free stays
 allocated until a reclaim releases it, at once and only between commands: memory
 pressure, an admission the budget denies, the publication of a replay point in
 use or a junction, or startup cleanup. Kernels reach a page through the GPU
-address in its request's page table, so no command binds KV; the residency set
-makes extents resident for every command. The host reaches the same memory
+address in its request's page table, so no command binds KV; the command
+queue's residency set makes extents resident for every command buffer. The host reaches the same memory
 (`PageStorage::spans`), which is how the disk tier moves pages. A reclaim
 returns free pages before it evicts anything: an empty extent as it is, and the
 free pages scattered over the others as soon as they cover the extent that holds
@@ -2300,7 +2480,12 @@ write budget when one is set, which drops them while it is spent, a suspended
 request's own too, and a full quota makes room for one by dropping the oldest
 copy, perhaps an older conversation's restore point.
 Contended prefill adapts toward a 500 ms slice, keeping
-2048-token chunks for long unopposed work. Without contention, a prompt that can
+2048-token chunks for long unopposed work. A command's estimated cost is a fixed
+part, the time its GPU work waited on host steps (a streamed target's expert
+reads), and a part per row; the slice grows to twice the fixed part, so a
+command's rows take at least as long as its reads. Unopposed, a target whose
+experts stream runs its remaining chunks in as few prefill groups of up to four
+as hold them, evenly split. Without contention, a prompt that can
 finish within one 2048-token chunk ends its chunk at its last row instead of
 sharing it with a longer prompt. While requests of the same or a higher priority
 decode (a lane waiting for its token mask is owed nothing), each slice owes them
@@ -2602,7 +2787,7 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | Target | Runs |
 | --- | --- |
 | `verify-models` | the installer's restarts without the Hub, `verify --full`, and the record of the weight images (`dev/tools/installer_restarts.py`, `weight-digests`, [Release check](#release-check)) |
-| `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle |
+| `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle, each of its three runs with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"`) |
 | `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`); with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
@@ -2754,6 +2939,32 @@ plan holds. The second compares this build with a retained checkout's in ABBA
 order, as the release check does ([Release check](#release-check)), and writes
 `backend-regression.json` there. Neither is a comparison with another engine
 or a test of agent task quality.
+
+A change of arithmetic that moves outputs (`EXPECT_OUTPUT_CHANGE=1`) is
+measured by its next-token distributions instead. The benchmark's `logits`
+scenario dumps the full-vocabulary logits after 16 prefixes of each of the six
+transcript requests' 256-token greedy answers, the score-only requests cold and
+`--logits-width` at once so that they prefill beside each other, and
+`dev/benchmarks/logit_compare.py` compares a dump with one whose prefixes it
+scored (`--logits-from`): top-1 agreement, mean and p99 KL and the next-token
+NLL change, failing past `--min-top1`, `--max-mean-kl` and `--max-p99-kl`. A
+dump is three files, `sequences.txt`, `records.txt` and `logits.f32` (fp32
+rows, as llama.cpp's model-conversion scripts write logits), so that another
+engine's logits after the same prefixes compare the same way:
+
+```sh
+build/engine-tests/backend-benchmark build/splash.metallib "$MODEL_ROOT" --scenario logits --logits /tmp/base
+build/engine-tests/backend-benchmark build/splash.metallib "$MODEL_ROOT" --scenario logits --logits /tmp/b4 --logits-from /tmp/base --logits-width 4
+.venv/bin/python -m dev.benchmarks.logit_compare /tmp/base /tmp/b4
+```
+
+The second line also measures this build's noise floor: the same prefixes
+prefilled four at a time.
+
+A change of the weight images' layout (`EXPECT_IMAGE_CHANGE=1`) makes
+`backend_regression` report the images it changed instead of failing on them.
+`decode-profile --dispatch-list FILE` writes the profiled B1 cycles'
+dispatches in order with their GPU time.
 
 `benchmark-backend` lists the contexts the memory plan cannot hold in its
 report. Its cache checks reuse each context's cached prefix, so they need that

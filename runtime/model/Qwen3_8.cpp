@@ -50,7 +50,7 @@ void rotateInputs(metal::MetalBackend &backend, Qwen3_8Weights &weights, const G
 
 Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend, Qwen3_8Layout layout,
                                   const QwenTargetFiles &files) {
-  const auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer, const BlockTargetFormat &format) {
+  const auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer, const BlockTargetFormat &format, uint32_t) {
     layer.gateProjection =
         format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
     layer.upProjection =
@@ -58,7 +58,10 @@ Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend, Qwen3_8Layout la
     layer.downProjection =
         format.projection(file, layout.hiddenSize, layout.intermediateSize, "mlp-down");
   };
-  Qwen3_8Weights weights = loadQwenTarget<Qwen3_8Weights>(backend, layout, files, readFfn);
+  Qwen3_8Weights weights = loadQwenTarget<Qwen3_8Weights>(
+      backend, layout, files, [&](auto &loader, const BlockTargetFormat &format, const MoeExperts &) {
+        return readQwenTargetWeights<Qwen3_8Weights>(layout, loader, format, readFfn);
+      });
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
     if (const std::optional<GgufRotation> &rotation = gguf->get().rotation()) rotateInputs(backend, weights, *rotation);
   return weights;

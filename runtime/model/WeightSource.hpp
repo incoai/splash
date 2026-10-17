@@ -33,6 +33,8 @@ public:
   [[nodiscard]] uint64_t dataOffset() const noexcept;
   // Bytes [offset, offset + size) of the tensor data.
   void readData(uint64_t offset, std::span<uint8_t> bytes) const;
+  // Bytes [offset, offset + size) of the file, from its start.
+  void readFile(uint64_t offset, std::span<uint8_t> bytes) const;
   void checkUnchanged() const;
 
 private:
