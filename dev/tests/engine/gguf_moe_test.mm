@@ -958,6 +958,51 @@ int routingLoads(MetalBackend &backend) {
 
 } // namespace
 
+// The kernels read each routed expert from the slot its table names: the
+// experts in slots permuted by sigma, with each expert's router row moved to
+// match (expert e routes as e' did where sigma(e) = e'), give the identity
+// table's output bit for bit, in decode and in prefill.
+int permutedSlots(MetalBackend &backend) {
+  const MoeShape shape{kHidden, kExperts, kTopK, kIntermediate};
+  const Model m = makeModel(backend, shape, tileFormats(MoeGgufTile::Staged).front(), false);
+  const auto sigma = [](uint32_t expert) { return (expert * 7 + 3) % kExperts; };
+  Model permuted = m;
+  MetalBuffer table = backend.allocateBuffer(uint64_t{kExperts} * sizeof(uint32_t), BufferStorage::Shared,
+                                             "permuted-slots");
+  std::vector<float> router(m.router.values.size());
+  for (uint32_t expert = 0; expert < kExperts; ++expert) {
+    static_cast<uint32_t *>(table.contents())[expert] = sigma(expert);
+    std::copy_n(m.router.row(sigma(expert)), kHidden, router.begin() + uint64_t{expert} * kHidden);
+  }
+  permuted.weights.slotTable = table;
+  permuted.weights.router = floatSegment(backend, router, kExperts, kHidden);
+  Buffers b;
+  b.input = activations(uint64_t{kMaximumRows} * kHidden);
+  b.residual = activations(uint64_t{kMaximumRows} * kHidden);
+  b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
+  b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
+  b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
+  const auto run = [&](const Model &model, const MoePlan &plan) {
+    allocate(backend, b, plan);
+    std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
+    CommandGraph graph;
+    MoE::add(graph, b.moe, model.weights, plan);
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    const auto *output = static_cast<const uint16_t *>(b.moe.output.contents());
+    return std::vector<uint16_t>(output, output + uint64_t{plan.rows()} * kHidden);
+  };
+  int failures = 0;
+  for (const MoePlan &plan : {MoE::decodePlan(shape, 4, MoeConfig{.expertTile = MoeExpertTile::M8}),
+                              MoE::prefillPlan(shape, kMaximumRows, MoeConfig{MoeExpertTile::M32})})
+    if (run(m, plan) != run(permuted, plan)) {
+      printf("  permuted slots, %u rows: the output differs from the identity table's FAIL\n", plan.rows());
+      ++failures;
+    }
+  printf("%-20s permuted slot table, decode B4 and prefill %u: %s\n", formatNames(m).c_str(), kMaximumRows,
+         failures ? "FAIL" : "ok");
+  return failures;
+}
+
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     if (argc != 2) {
@@ -969,7 +1014,7 @@ int main(int argc, const char *argv[]) {
       bufferExtents(backend);
       const int failures = floatProjection(backend) + bfloat16Weights(backend) + floatSegments(backend, 64) +
                            floatSegments(backend, 96) + floatOnlyChain(backend) + moe(backend) +
-                           routingLoads(backend);
+                           routingLoads(backend) + permutedSlots(backend);
       if (failures) {
         std::cerr << "gguf_moe_test: " << failures << " failures\n";
         return 1;
