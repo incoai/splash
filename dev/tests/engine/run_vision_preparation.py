@@ -21,9 +21,12 @@ from dev.tests.fixture_files import (  # noqa: E402
 )
 
 DTYPES = ("BF16", "F16", "F32")
-# The name prefix of each safetensors source's tower: MLX's, and transformers'
-# (as Model Optimizer keeps it).
-TOWER = {"mlx": "vision_tower.", "transformers": "model.visual."}
+# MLX-VLM, the complete MLX-LM export, and transformers/Model Optimizer.
+TOWER = {
+    "mlx": "vision_tower.",
+    "mlx-full": "visual.",
+    "transformers": "model.visual.",
+}
 GGML_TYPES = {"F32": 0, "F16": 1, "Q4_0": 2, "BF16": 30}
 VISION_SHARD = "model-00001-of-00002.safetensors"
 TEXT_SHARD = "model-00002-of-00002.safetensors"
@@ -42,12 +45,42 @@ def encode(values, dtype):
     return struct.pack("<" + code * len(values), *values)
 
 
-def fixture(root, source, shift=0, case=None):
-    """Writes a tiny tower (depth 2, width 8, 2x2 patches) of source "mlx",
-    "transformers" or "gguf" whose tensors cycle through BF16, F16 and F32,
-    and the vision/model.bin it must prepare."""
+def affine_matrix(name, rows, columns, bits, group):
+    """Pack independent integer codes and BF16 affine parameters; the oracle
+    rounds their scalar values to nearest BF16, including halfway cases."""
+    packed, scales, biases, values = bytearray(), [], [], []
+    groups = columns // group
+    for row in range(rows):
+        scale = [(1, -3, 3, -1)[(row + g) % 4] / 256 for g in range(groups)]
+        bias = [(1, -1, 0.5, -0.5)[(row * 3 + g) % 4] for g in range(groups)]
+        codes = 0
+        for column in range(columns):
+            code = (row * 7 + column * 11) % (1 << bits)
+            codes |= code << (column * bits)
+            value = scale[column // group] * code + bias[column // group]
+            word = struct.unpack("<I", struct.pack("<f", value))[0]
+            upper, lower = divmod(word, 65536)
+            if lower > 32768 or (lower == 32768 and upper % 2):
+                upper += 1
+            values.append(struct.unpack("<f", struct.pack("<I", upper << 16))[0])
+        packed.extend(codes.to_bytes(columns * bits // 8, "little"))
+        scales.extend(scale)
+        biases.extend(bias)
+    stem = name.removesuffix(".weight")
+    return {
+        name: ([rows, columns * bits // 32], "U32", bytes(packed)),
+        stem + ".scales": ([rows, groups], "BF16", bfloat16(scales)),
+        stem + ".biases": ([rows, groups], "BF16", bfloat16(biases)),
+    }, values
+
+
+def fixture(root, source, shift=0, case=None, quantization=None):
+    """Write a two-block tower and its independently serialized BF16 image.
+    Affine fixtures widen the matrices to exercise every bit/group size."""
     tensors = {}
     sections = []
+    width = 128 if quantization else 8
+    intermediate, padded = (160, 256) if quantization else (10, 16)
 
     def add(mlx, gguf_name, rows, columns=1, padded_rows=None, padded_columns=None):
         index = len(sections)
@@ -75,7 +108,7 @@ def fixture(root, source, shift=0, case=None):
                 for frame in range(2)
                 for pixel in range(4)
             ]
-            if source == "mlx":
+            if source in ("mlx", "mlx-full"):
                 tensors[TOWER[source] + mlx] = (
                     [rows, 2, 2, 2, 3],
                     dtype,
@@ -109,8 +142,17 @@ def fixture(root, source, shift=0, case=None):
                 shape = [rows, columns] if source in TOWER else [columns, rows]
             if case == "dtype" and mlx == "merger.linear_fc1.weight":
                 dtype = "F64" if source in TOWER else "Q4_0"
-            raw = encode(values, "F32" if dtype == "Q4_0" else dtype)
-            tensors[name] = (shape, dtype, raw)
+            if (
+                quantization
+                and columns > 1
+                and columns % quantization[1] == 0
+                and mlx.endswith(".weight")
+            ):
+                quantized, values = affine_matrix(name, rows, columns, *quantization)
+                tensors.update(quantized)
+            else:
+                raw = encode(values, "F32" if dtype == "Q4_0" else dtype)
+                tensors[name] = (shape, dtype, raw)
         output = []
         for row in range(padded_rows or rows):
             output.extend(
@@ -133,22 +175,30 @@ def fixture(root, source, shift=0, case=None):
         add(mlx + ".bias", gguf_name + ".bias", rows, padded_rows=padded_rows)
 
     def norm(mlx, gguf_name):
-        add(mlx + ".weight", gguf_name + ".weight", 8)
-        add(mlx + ".bias", gguf_name + ".bias", 8)
+        add(mlx + ".weight", gguf_name + ".weight", width)
+        add(mlx + ".bias", gguf_name + ".bias", width)
 
-    affine("patch_embed.proj", "v.patch_embd", 8, 24)
-    add("pos_embed.weight", "v.position_embd.weight", 4, 8)
+    affine("patch_embed.proj", "v.patch_embd", width, 24)
+    add("pos_embed.weight", "v.position_embd.weight", 4, width)
     for layer in range(2):
         m, g = f"blocks.{layer}.", f"v.blk.{layer}."
         norm(m + "norm1", g + "ln1")
-        affine(m + "attn.qkv", g + "attn_qkv", 24, 8)
-        affine(m + "attn.proj", g + "attn_out", 8, 8)
+        affine(m + "attn.qkv", g + "attn_qkv", 3 * width, width)
+        affine(m + "attn.proj", g + "attn_out", width, width)
         norm(m + "norm2", g + "ln2")
-        affine(m + "mlp.linear_fc1", g + "ffn_up", 10, 8, padded_rows=16)
-        affine(m + "mlp.linear_fc2", g + "ffn_down", 8, 10, padded_columns=16)
+        affine(
+            m + "mlp.linear_fc1", g + "ffn_up", intermediate, width, padded_rows=padded
+        )
+        affine(
+            m + "mlp.linear_fc2",
+            g + "ffn_down",
+            width,
+            intermediate,
+            padded_columns=padded,
+        )
     norm("merger.norm", "v.post_ln")
-    affine("merger.linear_fc1", "mm.0", 32, 32)
-    affine("merger.linear_fc2", "mm.2", 8, 32)
+    affine("merger.linear_fc1", "mm.0", 4 * width, 4 * width)
+    affine("merger.linear_fc2", "mm.2", width, 4 * width)
     first = next(iter(tensors))
     if case == "shape":
         shape, dtype, raw = tensors[first]
@@ -159,11 +209,26 @@ def fixture(root, source, shift=0, case=None):
         # Optimizer's weight_scale beside its codes.
         if case == "quantized":
             tensors[quantized_scales(source)] = ([24, 1], "BF16", bytes(48))
+        if quantization:
+            stem = TOWER[source] + "pos_embed"
+            if case == "missing-bias":
+                del tensors[stem + ".biases"]
+            elif case in ("affine-shape", "affine-dtype"):
+                shape, dtype, raw = tensors[stem + ".scales"]
+                tensors[stem + ".scales"] = (
+                    list(reversed(shape)) if case == "affine-shape" else shape,
+                    "F16" if case == "affine-dtype" else dtype,
+                    raw,
+                )
         write_safetensors(root / VISION_SHARD, tensors)
-        norm = {"mlx": "language_model.model.norm.weight"}.get(
-            source, "model.language_model.norm.weight"
+        text_norm = (
+            "model.language_model.norm.weight"
+            if source == "transformers"
+            else "language_model.model.norm.weight"
         )
-        write_safetensors(root / TEXT_SHARD, {norm: ([8], "BF16", bytes(16))})
+        write_safetensors(
+            root / TEXT_SHARD, {text_norm: ([width], "BF16", bytes(2 * width))}
+        )
         return
     metadata = {
         "general.architecture": "clip",
@@ -199,13 +264,13 @@ def fixture(root, source, shift=0, case=None):
 
 
 def quantized_scales(source):
-    scales = "scales" if source == "mlx" else "weight_scale"
+    scales = "weight_scale" if source == "transformers" else "scales"
     return TOWER[source] + "blocks.0.attn.qkv." + scales
 
 
-def prepare(binary, directory, source):
-    # MLX's and transformers' towers are both the loader's safetensors source.
-    loader = "gguf" if source == "gguf" else "safetensors"
+def prepare(binary, directory, source, affine=False):
+    # Every checkpoint name convention uses the safetensors source.
+    loader = "gguf" if source == "gguf" else "affine" if affine else "safetensors"
     command = [binary, loader, str(directory), str(directory / "expected.bin")]
     return subprocess.run(command, text=True, capture_output=True)
 
@@ -217,7 +282,7 @@ def main():
     golden = json.loads(Path(sys.argv[2]).read_text())["vision_image"]
     with tempfile.TemporaryDirectory(prefix="splash-vision-preparation-") as temp:
         root = Path(temp)
-        for source in ("mlx", "transformers", "gguf"):
+        for source in (*TOWER, "gguf"):
             safetensors = source in TOWER
             file = VISION_SHARD if safetensors else "mmproj.gguf"
             # Every tensor as BF16, F16 and F32; BF16 is copied and exact F32
@@ -251,13 +316,13 @@ def main():
                 ("shape", 0): (patch, "shape"),
                 ("dtype", 0): (merger, "{}", dtype),
             }
-            if safetensors:
+            if source == "transformers":
                 rejected[("quantized", 0)] = (
                     "quantized",
                     quantized_scales(source),
                     "{}",
                 )
-            else:
+            elif not safetensors:
                 rejected |= {
                     ("epsilon", 0): ("epsilon",),
                     ("deepstack", 0): ("deepstack", "unsupported"),
@@ -279,6 +344,29 @@ def main():
                     result.stderr,
                 )
 
+        for source in ("mlx", "mlx-full"):
+            for bits in (2, 3, 4, 5, 6, 8):
+                for group in (32, 64, 128):
+                    directory = root / f"{source}-affine-{bits}-{group}"
+                    directory.mkdir()
+                    fixture(directory, source, quantization=(bits, group))
+                    result = prepare(binary, directory, source, affine=True)
+                    assert result.returncode == 0, (source, bits, group, result.stderr)
+
+        for case, quantization in (
+            ("missing-bias", (4, 64)),
+            ("affine-shape", (4, 64)),
+            ("affine-dtype", (4, 64)),
+            ("unsupported-bits", (7, 64)),
+            ("unsupported-group", (4, 16)),
+        ):
+            directory = root / case
+            directory.mkdir()
+            fixture(directory, "mlx-full", case=case, quantization=quantization)
+            result = prepare(binary, directory, "mlx-full", affine=True)
+            assert result.returncode == 1, (case, result.stdout, result.stderr)
+            assert "visual.pos_embed" in result.stderr, (case, result.stderr)
+
         directory = root / "padding"
         directory.mkdir()
         result = subprocess.run(
@@ -286,8 +374,8 @@ def main():
         )
         assert result.returncode == 0, result.stderr
         print(
-            "Vision layouts from MLX, transformers and GGUF, exact BF16 conversion, "
-            "rejected sources and zero padding PASS"
+            "Vision layouts from MLX, transformers and GGUF, affine BF16 decoding, "
+            "exact floating conversion, rejected sources and zero padding PASS"
         )
 
 

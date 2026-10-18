@@ -709,6 +709,43 @@ class UpstreamTest(unittest.TestCase):
             ):
                 self.prepare(selection(self.root, model, language_only=False))
 
+    def test_complete_mlx_tower_is_selected_but_not_downloaded_for_language_only(self):
+        def target(root):
+            mlx_target(root, DENSE)
+            shards = {
+                "visual.pos_embed.weight": "vision.safetensors",
+                "visual.pos_embed.scales": "vision.safetensors",
+                "visual.pos_embed.biases": "vision.safetensors",
+                "language_model.lm_head.weight": "text.safetensors",
+                "mtp.pre_fc_norm_embedding.weight": "text.safetensors",
+            }
+            (root / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": shards})
+            )
+            for name in set(shards.values()):
+                (root / name).write_text(name)
+            (root / "preprocessor_config.json").write_text(json.dumps(PROCESSOR))
+
+        fake = fake_hub(self, self.cache)
+        fake.publish(MODEL, "a" * 40, target)
+        for language_only in (True, False):
+            with self.subTest(language_only=language_only):
+                chosen = selection(self.root, language_only=language_only)
+                self.prepare(chosen)
+                record = assembly.verify(chosen.link)
+                self.assertEqual(
+                    record["vision_format"],
+                    "none" if language_only else "safetensors",
+                )
+                self.assertFalse((chosen.link / "target/vision.safetensors").exists())
+                if language_only:
+                    self.assertNotIn(f"{MODEL}/vision.safetensors", fake.downloads)
+                else:
+                    self.assertIn(f"{MODEL}/vision.safetensors", fake.downloads)
+                    self.assertTrue(
+                        (chosen.link / "vision/vision.safetensors").exists()
+                    )
+
     def test_mlx_vision_reads_the_image_processor_of_processor_config(self):
         # Newer Transformers releases save no preprocessor_config.json: the
         # image processor's configuration is an object of processor_config.json,
@@ -833,19 +870,24 @@ class UpstreamTest(unittest.TestCase):
             return build
 
         fake = fake_hub(self, self.cache)
-        fake.publish(
-            MODEL,
-            "b" * 40,
-            checkpoint(
-                ["vision_tower.patch_embed.weight", "language_model.lm_head.weight"]
-            ),
-        )
-        chosen = selection(self.root, language_only=False)
-        self.prepare(chosen)
-        self.assertEqual(
-            sorted(p.name for p in (chosen.link / "vision").iterdir()),
-            ["config.json", "model.safetensors"],
-        )
+        for index, prefix in enumerate(
+            ("vision_tower.", "model.visual.", "visual."), 1
+        ):
+            model = f"someone/tower-{index}"
+            fake.publish(
+                model,
+                str(index) * 40,
+                checkpoint(
+                    [prefix + "patch_embed.weight", "language_model.lm_head.weight"]
+                ),
+            )
+            with self.subTest(prefix=prefix):
+                chosen = selection(self.root, model, language_only=False)
+                self.prepare(chosen)
+                self.assertEqual(
+                    sorted(p.name for p in (chosen.link / "vision").iterdir()),
+                    ["config.json", "model.safetensors"],
+                )
         fake.publish(
             "someone/text", "c" * 40, checkpoint(["language_model.lm_head.weight"])
         )

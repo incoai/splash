@@ -8,17 +8,19 @@
 // tensors hold: MLX affine (metal/abi/QuantFormat.h), mxfp4 or nvfp4 as MLX
 // infers it, or NVFP4 or FP8 as the other two store them: projections and
 // experts as planes, a quantized token table as native rows. An unquantized
-// token table is copied as its bf16 rows. Norms are bf16 as MLX stores them, or the F32 1 + w of the w
-// transformers stores; the convolution and dt_bias are copied as stored, and
-// the GDN decay is float(-exp(double(A_log))). The MoE router and the
-// shared-expert gate, which the block kernels read in F32, become the F32
-// values of their quantization (or of their bf16 weights), and so do GDN
-// alpha and beta unless both are quantized in one format.
+// token table is copied as its bf16 rows. Ordinary MLX norms stay bf16;
+// complete MLX-LM and transformers exports' zero-centered RMSNorms become
+// F32 1 + w, and their gated norms are widened without an offset. Convolution
+// and dt_bias are copied as stored; the GDN decay is float(-exp(double(A_log))).
+// The MoE router and shared-expert gate become the F32 values of their
+// quantization (or of their bf16 weights), as do GDN alpha and beta unless both
+// are quantized in one format.
 
 #include "model/GgufImage.hpp"
 #include "model/QwenHybridLayout.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -26,20 +28,26 @@ namespace splash::model::safetensors {
 
 // The names a checkpoint's language-model modules take: MLX's (mlx-lm,
 // mlx-vlm: language_model.model.*, the routed experts stacked under
-// mlp.switch_mlp), or transformers' (as NVIDIA's Model Optimizer keeps them:
-// model.language_model.*, lm_head, each routed expert a module mlp.experts.<e>
-// of its own), whose RMSNorm weights are stored 1 below the weights the norm
-// multiplies by, but the GDN's gated norm's.
-enum class ModuleNames : uint8_t { Mlx, Transformers };
+// mlp.switch_mlp), the complete MLX-LM export's same names with retained MTP
+// offset norms, or transformers' (model.language_model.*, lm_head, each
+// routed expert a module mlp.experts.<e>). The latter two keep zero-centered
+// RMSNorm weights, but the GDN's gated norm's weight is already multiplicative.
+enum class ModuleNames : uint8_t { Mlx, MlxFull, Transformers };
 
-// The names the checkpoint's tensors take: transformers' when it holds
-// lm_head.weight (or compressed-tensors' NVFP4 lm_head.weight_packed).
+// Transformers names have a root lm_head; complete MLX-LM exports retain
+// mtp.pre_fc_norm_embedding.weight and mtp.pre_fc_norm_hidden.weight.
 [[nodiscard]] ModuleNames moduleNames(const SafetensorsCheckpoint &checkpoint);
 
-// Whether the images hold the norms as F32, as they hold a checkpoint's of
-// transformers names (their 1 + w, the GDN's gated norm widened), rather than
-// MLX's bf16 norms as stored.
-[[nodiscard]] constexpr bool float32Norms(ModuleNames names) noexcept { return names == ModuleNames::Transformers; }
+// Zero-centered norms become F32 1 + w; the gated norm is widened without
+// adding an offset. Ordinary MLX checkpoints keep their BF16 norms as stored.
+[[nodiscard]] constexpr bool float32Norms(ModuleNames names) noexcept { return names != ModuleNames::Mlx; }
+
+// The native rows of an MLX quantized module, inferred from its codes,
+// scales and biases and validated against its dimensions; none when it has
+// no scales. The checkpoint outlives the returned rows.
+[[nodiscard]] std::optional<gguf::TensorRows>
+mlxQuantizedRows(const SafetensorsCheckpoint &checkpoint, const std::string &module,
+                 uint64_t rows, uint64_t columns, uint64_t experts = 1);
 
 // The layers' images, then the head's and the embedding's. The checkpoint
 // outlives them: their rows read its tensors.

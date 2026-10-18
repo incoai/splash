@@ -1262,9 +1262,8 @@ draft's `config.json` once the family's draft is chosen.
 A model the engine refuses is refused with its reason, and so is a GGUF with
 tensors of types the loader cannot read or with every projection and expert
 unquantized (`gguf.require_loadable`, [GGUF targets](#gguf-targets)); no
-weight file is downloaded for either. Tensor shapes, and an MLX vision tower's
-weights, which must not be quantized (`VisionLoader.cpp`), are checked only
-when the model loads.
+weight file is downloaded for either. Tensor shapes and an MLX vision tower's
+weight formats (`VisionLoader.cpp`) are checked only when the model loads.
 `families.FAMILIES` names the draft trained for each family; repository names
 and model-card `base_model` fields play no part. An MLX target must declare
 `quantization` in `config.json` in formats it loads ([MLX
@@ -1308,8 +1307,15 @@ stored once per 256 weights); projections and experts as block planes, a
 quantized token table as native rows and an unquantized one as its bf16 rows.
 The block MoE kernels read the router and the shared-expert gate in F32, so
 these load as the F32 values of their quantization, and so do GDN alpha and
-beta unless both are in one format. Norms stay bf16 and the GDN value heads in
-MLX's grouped order.
+beta unless both are in one format. The GDN value heads keep MLX's grouped
+order. Ordinary MLX checkpoints keep their BF16 norms as stored.
+
+Complete MLX-LM exports, such as Swift 1.5, retain
+`mtp.pre_fc_norm_embedding.weight` and `mtp.pre_fc_norm_hidden.weight`.
+These exports preserve zero-centered RMSNorm weights rather than adding 1
+when converting: preparation writes their F32 `1 + w` without rounding it to
+BF16, and widens the GDN's gated norm without adding an offset. The MTP modules
+themselves are not used; the target still pairs with its family's DFlash2 draft.
 
 ### Model Optimizer targets
 
@@ -1460,10 +1466,12 @@ runs on the block kernels its target's projections run on.
 
 ### Vision
 
-Vision comes from the target repository: MLX's `vision_tower.*` tensors (or
-transformers' `model.visual.*`, as Model Optimizer keeps them, whose patch
-embedding is already in the image's order), linking
-only `config.json` and the shards holding them, or the GGUF repository's root
+Vision comes from the target repository. An MLX target links only `config.json`
+and the shards holding `vision_tower.*` (MLX-VLM), `visual.*` (complete
+MLX-LM exports), or `model.visual.*` (transformers/Model Optimizer).
+Both MLX conventions store the patch embedding in channel-last order;
+transformers stores it in the image's channel-first order already.
+A GGUF target uses its repository's root
 projector, a GGUF whose name holds `mmproj` (as `mmproj-BF16.gguf` or
 `MODEL-mmproj-BF16.gguf`), chosen by its header: a `clip` projector whose
 weights are BF16, F32 or F16, preferred in that order. An F16 projector made
@@ -1475,14 +1483,20 @@ releases save it; the GGUF's `clip.vision` metadata) must describe the one
 preprocessing Splash implements (`server/images.py`); it is checked before any
 weight download and not installed.
 
-Both sources are written into one image, which the one BF16 vision operator
-reads: BF16 tensors are
-copied, and F32 or F16 tensors are converted under the exact-BF16 rule of
-[weight loading](#weight-loading).
+Both sources are written into one image, which the BF16 vision operator reads.
+BF16 tensors are copied, and unquantized F32 or F16 tensors are converted under
+the exact-BF16 rule of [weight loading](#weight-loading).
 Unsloth's mmproj stores its 1-D tensors, patch embedding and position table as
-F32, all of them BF16-exact, and loads byte-identical to the MLX tower.
-Quantized MLX towers, deepstack projectors and mmproj tensors the tower does not
-use are rejected.
+F32, all of them BF16-exact, and loads byte-identical to an unquantized MLX tower.
+
+MLX affine vision matrices, including the position table, load in the same
+2-, 3-, 4-, 5-, 6- or 8-bit formats and groups of 32, 64 or 128 as the text
+target. Their format is inferred from U32 codes and BF16 scales/biases;
+each value `s * q + z` is decoded
+to nearest BF16, ties to even, while writing the image. Quantized and
+unquantized matrices may be mixed. Checkpoint files are never rewritten.
+Other quantized vision formats, quantized patch embeddings or norms,
+deepstack projectors and mmproj tensors the tower does not use are rejected.
 
 `--language-only` links and loads no vision weights and removes them from
 memory accounting. It skips a GGUF's mmproj download and an MLX shard that

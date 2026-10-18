@@ -724,6 +724,49 @@ void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path 
             "a bf16 token table did not load as its bf16 rows");
 }
 
+// Complete MLX-LM exports retain the MTP's offset norms and the text model's
+// zero-centered RMSNorm weights, even though their text names are MLX's.
+void testSyntheticCompleteMlxModel(MetalBackend &backend, const std::filesystem::path &root) {
+    const Qwen3_8Layout target = syntheticTarget();
+    auto tensors = splash::test::mlxTargetTensors(
+        target, [](const std::string &) -> std::pair<uint32_t, uint32_t> { return {4, 64}; });
+    for (SyntheticTensor &tensor : tensors) {
+        if (tensor.dtype != "BF16" || tensor.shape.size() != 1 || tensor.name.find("norm") == std::string::npos)
+            continue;
+        tensor.data.resize(tensor.shape.front() * sizeof(uint16_t));
+        const std::array<uint16_t, 3> values{0x3B80, 0x3F00, 0xBB80}; // 1/256, 1/2, -1/256
+        std::memcpy(tensor.data.data(), values.data(), sizeof(values));
+    }
+    for (const std::string name : {"mtp.pre_fc_norm_embedding.weight", "mtp.pre_fc_norm_hidden.weight"})
+        tensors.push_back({name, "BF16", {target.hiddenSize}});
+    const ModelDescriptor descriptor = writeBlockModel(root, target, tensors);
+    const uint64_t planned = modelWeightBytes(root, descriptor);
+    auto model = loadModel(backend, root, descriptor);
+    const auto &weights = std::get<Qwen3_8Weights>(model.target);
+    const auto check = [&](const splash::ops::NormWeights &norm, bool centered) {
+        require(norm.float32, "a complete MLX checkpoint's norm lost its F32 precision");
+        const auto *values = static_cast<const float *>(norm.buffer.contents());
+        const std::array<float, 3> expected = centered ? std::array<float, 3>{1.00390625F, 1.5F, 0.99609375F}
+                                                      : std::array<float, 3>{0.00390625F, 0.5F, -0.00390625F};
+        require(std::equal(expected.begin(), expected.end(), values),
+                "a complete MLX checkpoint's norm has the wrong offset or was rounded to BF16");
+    };
+    for (const auto &layer : weights.layers) {
+        check(layer.inputNorm, true);
+        check(layer.postAttentionNorm, true);
+        if (const auto *gdn = std::get_if<QwenGdnWeights>(&layer.mixer)) {
+            check(gdn->mixerNorm, false);
+        } else {
+            const auto &attention = std::get<QwenAttentionWeights>(layer.mixer);
+            check(attention.queryNorm, true);
+            check(attention.keyNorm, true);
+        }
+    }
+    check(weights.finalNorm, true);
+    require(declaredBytes(weights.files) + declaredBytes(model.draft.files) == planned,
+            "modelWeightBytes is not what a complete MLX checkpoint loads");
+}
+
 // The name of a convention of NVFP4 and FP8 checkpoints.
 std::string checkpointName(splash::test::FloatCheckpoint checkpoint) {
     return checkpoint == splash::test::FloatCheckpoint::ModelOptimizer ? "Model Optimizer" : "compressed-tensors";
@@ -914,6 +957,7 @@ int main(int argc, const char *argv[]) {
         MetalBackend production(argv[2]);
         testSyntheticModel(production, temporary.path() / "model");
         testSyntheticBlockModel(production, temporary.path() / "block-model");
+        testSyntheticCompleteMlxModel(production, temporary.path() / "complete-mlx-model");
         testSyntheticBlockMoeModel(production, temporary.path() / "block-moe-model");
         for (const auto checkpoint : {splash::test::FloatCheckpoint::ModelOptimizer,
                                       splash::test::FloatCheckpoint::CompressedTensors}) {
