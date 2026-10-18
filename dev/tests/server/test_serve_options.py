@@ -31,6 +31,16 @@ def values(flag, accepted, refused, repeatable=False):
     )
 
 
+ACCEPTED_CONTEXTS = {
+    "auto": None,
+    "100K": 102400,
+    "256k": 262144,
+    "262144": 262144,
+    "1": 1,
+}
+# Past the native window without --yarn-factor, or past the 1010000 tokens it
+# stretches it to.
+REFUSED_CONTEXTS = ("0", "-1", "257K", "262145", "1010001", "bad")
 # Every shared option: accepted arguments with the value they parse to, and
 # refused arguments.
 OPTIONS = {
@@ -121,10 +131,27 @@ OPTIONS = {
             ["--cache-dir=", "--persistent-cache", "--max-cache-disk=5G"],
         ],
     ),
-    "--max-context": values(
-        "--max-context",
-        {"auto": None, "100K": 102400, "256k": 262144, "262144": 262144, "1": 1},
-        ("0", "-1", "257K", "262145", "bad"),
+    "--max-context": (
+        [
+            *values("--max-context", ACCEPTED_CONTEXTS, ())[0],
+            # Past the native window with --yarn-factor, up to the window it
+            # stretches the native one to.
+            (["--max-context=1010000", "--yarn-factor=4"], 1010000),
+            (["--max-context=655360", "--yarn-factor=2.5"], 655360),
+        ],
+        [
+            *values("--max-context", {}, REFUSED_CONTEXTS)[1],
+            ["--max-context=512K", "--yarn-factor=1.5"],
+            ["--max-context=655361", "--yarn-factor=2.5"],
+            ["--max-context=1024K", "--yarn-factor=4"],
+        ],
+    ),
+    "--yarn-factor": values(
+        "--yarn-factor",
+        # The last, which the forwarding test combines with --max-context's
+        # last, holds its 655360 tokens.
+        {"4": 4.0, "2": 2.0, "1.01": 1.01, "2.5": 2.5},
+        ("1", "0.5", "4.01", "-2", "inf", "nan", "four"),
     ),
     "--decode-share": values(
         "--decode-share",

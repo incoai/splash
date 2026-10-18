@@ -20,7 +20,8 @@ struct Qwen3_6MoeLayout final : QwenHybridLayout<8> {
   static constexpr std::string_view family = "Qwen3.6-35B-A3B";
 
   constexpr Qwen3_6MoeLayout()
-      : QwenHybridLayout{{.maximumContextTokens = 262'144,
+      : QwenHybridLayout{{.nativeContextTokens = 262'144,
+                          .yarnContextTokens = 1'010'000,
                           .layers = 40,
                           .hiddenSize = 2048,
                           .vocabularySize = 248320,

@@ -161,6 +161,53 @@ class ServerMainTests(unittest.TestCase):
                     status.call_args_list,
                 )
 
+    def test_main_serves_the_window_yarn_stretches(self):
+        # The engine announces the window --yarn-factor stretched; without it
+        # a window past the native one is no engine the server started.
+        for factor, window, served in (
+            (4.0, 1010000, True),
+            (4.0, 1010001, False),
+            (2.5, 655360, True),
+            (2.5, 655361, False),
+            (None, 262145, False),
+        ):
+            with self.subTest(factor=factor, window=window):
+                runtime = mock.Mock()
+                runtime.readiness = native_wire.ReadyEvent(4, window, False)
+                with (
+                    mock.patch.object(
+                        api, "parse_args", return_value=main_args(yarn_factor=factor)
+                    ),
+                    mock.patch.object(api, "load_thinking_key", return_value=None),
+                    mock.patch.object(
+                        api.AutoTokenizer, "from_pretrained", return_value=object()
+                    ),
+                    mock.patch.object(api, "validate_tokenizer"),
+                    mock.patch.object(api, "ChatTemplates"),
+                    mock.patch.object(
+                        api.engine_runtime, "MultiplexedRuntime", return_value=runtime
+                    ),
+                    mock.patch.object(api, "NativeBackend"),
+                    mock.patch.object(api, "ConstraintFactory"),
+                    mock.patch.object(api, "Frontend") as app_type,
+                    mock.patch.object(
+                        api, "FrontendServer", return_value=mock.Mock(server_port=8000)
+                    ),
+                    mock.patch.object(api.signal, "signal"),
+                    mock.patch.object(api, "print_status") as status,
+                ):
+                    if served:
+                        api.main()
+                        self.assertEqual(app_type.call_args.args[3], window)
+                    else:
+                        with self.assertRaises(SystemExit):
+                            api.main()
+                        status.assert_any_call(
+                            "Error · native runtime reported an invalid context window",
+                            error=True,
+                        )
+                        app_type.assert_not_called()
+
     def test_main_wires_allowed_origins_and_warns_without_a_key(self):
         warning = mock.call(
             "Warning · --allowed-origin '*' without --api-key lets every web "

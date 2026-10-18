@@ -2,6 +2,7 @@
 
 #include "Model.hpp"
 #include "QwenHybridLayout.hpp"
+#include "RopeScaling.hpp"
 #include "StateLayout.hpp"
 #include "WeightStore.hpp"
 #include "ops/GDN.hpp"
@@ -92,11 +93,17 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   // GDN state layout.
   kv::Layout kvLayout{};
   GdnStateLayout stateLayout{};
+  // The scaling of the attention layers' RoPE the model is served with
+  // (ModelDescriptor::ropeScaling).
+  RopeScaling ropeScaling{};
   // Distinct operator requirements, collected from the loaded weights.
   std::vector<ops::ProjectionShape> prefillProjections;
   std::vector<ops::ProjectionShape> decodeProjections;
   std::vector<ops::ProjectionShape> gateUpProjections;
 
+  // The window the target serves with its RoPE scaling, which everything
+  // sized by the context follows (ModelDescriptor::capabilities).
+  [[nodiscard]] uint32_t contextTokens() const noexcept { return servedContextTokens(ropeScaling); }
   [[nodiscard]] constexpr uint32_t gdnKeyWidth() const noexcept {
     return gdnKeyHeads * gdnHeadDimension;
   }

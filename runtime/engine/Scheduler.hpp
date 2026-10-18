@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -63,7 +64,18 @@ class Scheduler final {
 public:
   // Decode time owed for each unit of time a prefill runs while requests of
   // equal or higher priority decode; zero alternates one command of each kind.
-  explicit Scheduler(double decodeShare) noexcept : decodeShare_(decodeShare) {}
+  // A prefill command's attention computes at most maximumAttentionPairs
+  // query-key pairs (attentionPairs): its lanes' rows halve until they fit.
+  explicit Scheduler(double decodeShare,
+                     uint64_t maximumAttentionPairs = std::numeric_limits<uint64_t>::max()) noexcept
+      : decodeShare_(decodeShare), maximumAttentionPairs_(maximumAttentionPairs) {}
+
+  // The query-key pairs the attention of `rows` prompt rows from `position`
+  // computes: each row attends to its history and itself, so the pairs, and
+  // a command's time, grow with the depth of its rows.
+  [[nodiscard]] static constexpr uint64_t attentionPairs(uint64_t position, uint32_t rows) noexcept {
+    return rows * position + uint64_t{rows} * (rows + 1) / 2;
+  }
 
   void submit(RequestSpec request);
   void observePrefill(uint32_t rows, double wallMilliseconds);
@@ -155,6 +167,7 @@ private:
   uint64_t decodeDispatchOrder_ = 0;
   double prefillMillisecondsPerToken_ = 0.0;
   double decodeShare_;
+  uint64_t maximumAttentionPairs_;
   // Decode time that prefill still owes the lanes that decoded beside it
   // (not those waiting for a mask): equal-priority decode runs until its
   // commands' wall time has worked it off.

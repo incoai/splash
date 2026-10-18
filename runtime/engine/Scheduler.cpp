@@ -301,12 +301,24 @@ Scheduler::planPrefill(std::vector<PrefillRequestView> ready) const {
   BatchPlan plan;
   plan.kind = WorkKind::Prefill;
   uint32_t budget = prefillBudget(ready.front(), ready);
+  uint64_t pairs = 0;
   for (const PrefillRequestView &view : ready) {
     if (!budget || view.request->spec.priority != selectedPriority ||
         plan.width() == model::ExecutionLimits::maximumBatchWidth)
       break;
-    const uint32_t rows =
+    uint32_t rows =
         std::min(view.request->spec.prefillTokens - view.promptProcessed, budget);
+    // The command's attention stays within maximumAttentionPairs_: a lane's
+    // rows halve until they fit, and one that does not fit at
+    // kMinimumPrefillRows waits for a command of its own.
+    const auto exceeds = [&](uint32_t candidate) {
+      return pairs + attentionPairs(view.promptProcessed, candidate) > maximumAttentionPairs_;
+    };
+    while (rows > kMinimumPrefillRows && exceeds(rows))
+      rows /= 2;
+    if (!plan.items.empty() && exceeds(rows))
+      break;
+    pairs += attentionPairs(view.promptProcessed, rows);
     plan.items.push_back(
         {view.request->spec.id, rows, view.promptProcessed});
     budget -= rows;

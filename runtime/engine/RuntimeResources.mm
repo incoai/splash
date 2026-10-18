@@ -250,7 +250,8 @@ RuntimeCacheIdentity
 makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
                          std::string_view targetManifestSha256,
                          std::string_view buildId,
-                         kv::Layout targetKvLayout) {
+                         kv::Layout targetKvLayout,
+                         model::RopeScaling ropeScaling) {
   if (buildId.empty()) {
     throw std::invalid_argument("runtime build id is required");
   }
@@ -263,6 +264,7 @@ makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
   result.modelLayoutSha256 = model::digestHex(parseSha256(combinedManifestSha256));
   result.buildId = buildId;
   result.kvLayout = targetKvLayout;
+  result.ropeScaling = ropeScaling;
   result.targetModelSha256 = model::digestHex(parseSha256(targetManifestSha256));
   return result;
 }
@@ -286,6 +288,12 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
             << "draft " << draft.layers << ' ' << draft.kvHeads << ' ' << draft.headDimension << ' '
             << SPLASH_DRAFT_SLIDING_WINDOW << '\n'
             << "context " << draft.contextWidth << " q4 " << SPLASH_DRAFT_CONTEXT_GROUP << '\n';
+  // Without YaRN the line is left out, so the caches written before it
+  // existed stay valid. The factor takes the digits that read back as the
+  // same double, so no two factors share a namespace.
+  if (const model::RopeScaling &rope = identity.ropeScaling; rope.yarn())
+    canonical << "rope yarn " << std::setprecision(std::numeric_limits<double>::max_digits10) << rope.factor
+              << ' ' << rope.originalContextTokens << '\n';
   // 128 bits name it.
   return model::weightDigest(canonical.str()).substr(0, CacheDirectory::kNamespaceDigits);
 }
@@ -540,7 +548,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     cacheIdentity = makeRuntimeCacheIdentity(
         loaded.manifestFingerprintSha256,
         loaded.targetManifestFingerprint(), config.buildId,
-        loaded.targetKvLayout(config.kvFormat));
+        loaded.targetKvLayout(config.kvFormat), loaded.descriptor.ropeScaling);
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                 error.what(),
@@ -568,6 +576,10 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     memoryGovernor->setServing(true);
     logLine("Kernel policy for GPU family ", device.appleGpuFamily,
             " with ", device.gpuCoreCount, " cores.");
+    if (const model::RopeScaling &rope = config.model.ropeScaling; rope.yarn())
+      logLine("YaRN scales the target's RoPE by ", rope.factor, ": a window of ",
+              config.model.capabilities.maximumContextTokens, " tokens instead of the native ",
+              rope.originalContextTokens, ".");
     // The split leaves the context asked for, else a relaunch's.
     const RequestedContext splitContext =
         requestedContextTokens ? RequestedContext{.tokens = requestedContextTokens}

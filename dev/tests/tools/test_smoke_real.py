@@ -139,6 +139,7 @@ class SmokeRealTests(unittest.TestCase):
                         max_context=None,
                         max_memory=None,
                         max_cache_disk=None,
+                        yarn_factor=None,
                         max_image_pixels=None,
                         kv_format="bf16" if absolute else "int8",
                     )
@@ -183,6 +184,7 @@ class SmokeRealTests(unittest.TestCase):
             max_context=None,
             max_memory=None,
             max_cache_disk="4G",
+            yarn_factor=None,
             max_image_pixels=None,
             kv_format="int8",
         )
@@ -214,6 +216,31 @@ class SmokeRealTests(unittest.TestCase):
                     self.assertEqual(
                         command[index + 1 : index + 3], ["--cache-dir", "/tmp/cache"]
                     )
+
+    def test_yarn_factor_reaches_the_server(self):
+        model = ["--model", "mlx-community/Qwen3.8-27B-4bit"]
+        self.assertIsNone(smoke_real.parse_args(model).yarn_factor)
+        self.assertEqual(
+            smoke_real.parse_args([*model, "--yarn-factor", "4"]).yarn_factor, 4.0
+        )
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            smoke_real.parse_args([*model, "--yarn-factor", "5"])
+        with self.server():
+            command = smoke_real.subprocess.Popen.call_args.args[0]
+            self.assertNotIn("--yarn-factor", command)
+        arguments = self.server_arguments()
+        arguments.yarn_factor = 4.0
+        with (
+            mock.patch.object(smoke_real, "available_port", return_value=8000),
+            mock.patch.object(smoke_real.subprocess, "Popen") as popen,
+        ):
+            popen.return_value.poll.return_value = 0
+            server = smoke_real.RealServer(arguments)
+            try:
+                command = popen.call_args.args[0]
+                self.assertEqual(command[command.index("--yarn-factor") + 1], "4.0")
+            finally:
+                server.close()
 
     def test_persistent_cache_scenario_needs_the_ssd_cache(self):
         model = ["--model", "mlx-community/Qwen3.8-27B-4bit"]

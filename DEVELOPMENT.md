@@ -95,6 +95,7 @@ access.
 | `--no-webui` | Off | Disable the chat page. |
 | `--max-memory` | Auto | Lower the ceiling on Metal allocations, e.g. `28G`; not combined process RSS. See [memory and context](#memory-and-context). |
 | `--max-context` | Auto | Set the context limit, e.g. `100K`. See [memory and context](#memory-and-context). |
+| `--yarn-factor` | Off | Stretch the 256K window by a factor of up to 4 (1,010,000 tokens) with YaRN. See [memory and context](#memory-and-context). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](#weight-loading). |
@@ -192,6 +193,24 @@ model takes, and otherwise as much as the budget holds beside them.
 holds without the split: beyond what the split leaves, the split takes fewer
 channels or the GPU runs alone, with a warning. A larger value stops startup
 with the most the model and memory allow.
+
+`--yarn-factor FACTOR` stretches the native window by FACTOR, above 1 and at
+most 4, with YaRN RoPE scaling, as Qwen describes for these models: `2` gives a
+window of 524,288 tokens, `4` the 1,010,000 Qwen validates them to. The
+context limit then follows the same rule up to that window, so it is what the
+budget holds: about a million tokens of the 27B's int8 KV on a 64 GB Mac, more
+of the 35B's, whose KV per token is a third of the 27B's. The scaling is
+YaRN's defaults and static: every request, short or long, takes the same
+factor, so turn it on only for prompts past 256K; a start whose context the
+native window holds says so. It scales the target's attention RoPE alone; the draft
+keeps its own, which keeps its acceptance at a million tokens. A long uncached
+prompt is slow to prefill, as attention grows with depth. Past the native
+window a prefill command takes fewer rows, so that its attention does no more
+than a full chunk's at the native window's end, which keeps it well within the
+120 s command watchdog on every supported Mac: 512 rows at a million tokens. On an M5 Max the
+35B prefills a million tokens in about 45 minutes and then decodes at about a
+quarter of its short-context speed, and the 27B takes about half an hour for
+512K. The KV of one long request also leaves the cache little room.
 
 The startup summary and `maximum_context_tokens` in `/status` show the effective
 context limit. `/v1/models` and `/v1/models/{id}` report the same limit as
@@ -318,8 +337,9 @@ refused.
 Files live in `~/Library/Caches/Splash/prefix-cache/<namespace>/` (mode 0700;
 `--cache-dir` sets the root, which the engine keeps out of Time Machine when it
 creates it). The namespace digests the model manifests, the KV and state
-layouts and the cache format, so no model reads another's cache. One engine
-holds a directory at a time; another waits 20 s, then uses temporary files, as
+layouts, the YaRN factor (`--yarn-factor`) and the cache format, so no model
+reads another's cache. One engine holds a directory at a time; another waits
+20 s, then uses temporary files, as
 `auto` does when the root's volume is not local or leaves the cache too little
 room.
 One limit, the quota or what the volume leaves, bounds the whole root, and this
@@ -1133,6 +1153,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `active_requests` | Each request the engine holds, ordered by `id`: its `id`, `phase` (`queued`, `waiting_resources`, `waiting_prefix`, `prefill`, `decode` or `waiting_mask`, and `failed` for one whose deadline passed while a cached state it restores was being read from disk, until that read drains), `priority`, `prompt_tokens` and how many of them are encoded (`prompt_processed`, cached ones included), `generated_tokens` of `max_new_tokens`, and `age_ms` since it arrived |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
 | `weights.idle_release_seconds`, `released`, `restoring`, `restores`, `restore_failures` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, whether a request's restore of it is under way (it stays `released` until the last image is back), the times it was restored for a request since engine start, and the restores that gave up for want of memory |
+| `identity.cache.rope_scaling` | With `--yarn-factor`, the target's RoPE scaling, which every cached key went through: `type` `yarn`, its `factor` and `original_context_tokens`; `null` otherwise |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
 | `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk run again adds the rerun's |

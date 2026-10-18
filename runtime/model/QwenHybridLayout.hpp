@@ -1,9 +1,12 @@
 #pragma once
 
+#include "model/RopeScaling.hpp"
 #include "model/StateLayout.hpp"
 #include "ops/PagedKv.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -18,9 +21,12 @@ enum class QwenFfnKind : uint8_t { Dense, SparseMoe };
 // and every view of a target reads them from there: the target loaders, the
 // GGUF planner and the runtime's QwenTargetGeometry.
 struct QwenTargetDimensions {
-  // The native window, the context max_position_embeddings states, which
-  // must fit the runtime's KV ceiling (kv::kMaximumLogicalTokens).
-  uint32_t maximumContextTokens = 0;
+  // The native window, the context max_position_embeddings states, and the
+  // most context YaRN (--yarn-factor) stretches it to, as the family's model
+  // card validates it: zero for a family YaRN does not serve. Both fit the
+  // runtime's KV ceiling (kv::kMaximumLogicalTokens).
+  uint32_t nativeContextTokens = 0;
+  uint32_t yarnContextTokens = 0;
   uint32_t layers = 0;
   uint32_t hiddenSize = 0;
   uint32_t vocabularySize = 0;
@@ -58,6 +64,13 @@ struct QwenTargetDimensions {
   }
   [[nodiscard]] constexpr uint32_t actualGdnWidth() const noexcept {
     return convolutionDimension + attentionWidth + 2 * gdnValueHeads;
+  }
+  // The window the target serves with `scaling`: the native one, or YaRN's,
+  // the native one stretched by its factor up to yarnContextTokens.
+  [[nodiscard]] uint32_t servedContextTokens(const RopeScaling &scaling) const noexcept {
+    if (!scaling.yarn())
+      return nativeContextTokens;
+    return std::min(static_cast<uint32_t>(std::floor(nativeContextTokens * scaling.factor)), yarnContextTokens);
   }
   bool operator==(const QwenTargetDimensions &) const = default;
 };

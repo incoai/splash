@@ -21,6 +21,8 @@ public:
 // pins the lines both sides agree on.
 struct NativeArguments final {
   std::filesystem::path modelRoot;
+  // The model the directory holds, served with YaRN by --yarn-factor FACTOR
+  // (model::withYarn), which stretches the window MAX_CONTEXT may ask for.
   model::ModelDescriptor model;
   // Zero for auto.
   uint32_t maxContext = 0;

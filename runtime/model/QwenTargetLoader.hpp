@@ -113,7 +113,7 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
   const bool ffnZero = dense ? zero(ffnWidth) : zero(layout.experts, layout.expertsPerToken, ffnWidth);
   const bool routingInconsistent = !dense && layout.expertsPerToken > layout.experts;
   if (ffnZero || !(layout.rotaryTheta > 0.0F) ||
-      zero(layout.maximumContextTokens, layout.layers, layout.hiddenSize, layout.vocabularySize,
+      zero(layout.nativeContextTokens, layout.layers, layout.hiddenSize, layout.vocabularySize,
            layout.packedGdnWidth, layout.packedFullWidth, layout.convolutionDimension, layout.gdnKeyHeads,
            layout.gdnValueHeads, layout.gdnHeadDimension, layout.attentionWidth, layout.attentionQueryHeads,
            layout.attentionKvHeads, layout.attentionHeadDimension, layout.rotaryPairs,

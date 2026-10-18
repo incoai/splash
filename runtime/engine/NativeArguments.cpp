@@ -101,6 +101,7 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
   NativeArguments result;
   // Read once the model's own context is known.
   std::optional<std::string_view> relaunchContext;
+  std::optional<double> yarnFactor;
   int next = 5;
   if (next < argc && !std::string_view(argv[next]).starts_with("--")) {
     const std::string_view quota(argv[next++]);
@@ -148,6 +149,11 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       result.neuralEngine = value == "on";
     } else if (option == "--relaunch-context") {
       relaunchContext = value;
+    } else if (option == "--yarn-factor") {
+      double factor = 0.0;
+      if (!parseFinite(value, factor))
+        throw UsageError("--yarn-factor requires a number");
+      yarnFactor = factor;
     } else {
       throw UsageError("unexpected argument " + std::string(option));
     }
@@ -160,6 +166,13 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
     throw UsageError("--cache-dir requires --persistent-cache on");
   result.modelRoot = requireModelRoot(argv[2]);
   result.model = model::inspectModelRoot(result.modelRoot);
+  if (yarnFactor) {
+    try {
+      result.model = model::withYarn(std::move(result.model), *yarnFactor);
+    } catch (const std::invalid_argument &error) {
+      throw UsageError(std::string("--yarn-factor: ") + error.what());
+    }
+  }
   result.maxContext = parseMaxContext(argv[3], result.model.capabilities);
   if (relaunchContext) {
     if (result.maxContext)

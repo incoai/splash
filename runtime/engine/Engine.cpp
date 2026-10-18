@@ -60,7 +60,7 @@ std::string resourceTimeoutMessage(metal::AllocationFailure failure) {
 Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
                EngineEventSink &events)
     : config_(config), cache_(cache), writeBehind_(cache), model_(model),
-      events_(events), scheduler_(config_.decodeShare) {
+      events_(events), scheduler_(config_.decodeShare, config_.maximumPrefillAttentionPairs) {
   if (!config_.maxContext || !config_.vocabularySize) {
     throw std::invalid_argument("context and vocabulary sizes must be positive");
   }

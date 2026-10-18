@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -49,6 +50,12 @@ struct EngineConfig final {
   // its solo rate through a long prefill, which meanwhile takes 1.5x as long;
   // zero alternates one command of each kind.
   double decodeShare = 0.5;
+  // The query-key pairs a prefill command's attention may compute
+  // (Scheduler::attentionPairs): the bootstrap sets those of a full chunk at
+  // the end of the model's native window, so that a command past it, which
+  // only YaRN serves, takes fewer rows and no longer than the deepest native
+  // one, well within the command watchdog.
+  uint64_t maximumPrefillAttentionPairs = std::numeric_limits<uint64_t>::max();
   // The prefill checkpoint interval and the resource wait limit.
   uint32_t prefillCheckpointTokens = kPrefillCheckpointTokens;
   double resourceWaitTimeoutMilliseconds = kResourceWaitTimeoutMilliseconds;

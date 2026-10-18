@@ -19,7 +19,12 @@ from .http_security import validate_api_key
 from .protocol import MAX_THINKING_END_TOKENS
 
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+# The targets' native window, the most --yarn-factor stretches it by, and the
+# most context it stretches it to, which Qwen validates
+# (QwenTargetDimensions::yarnContextTokens).
 MAX_CONTEXT_TOKENS = 262144
+MAX_YARN_FACTOR = 4.0
+MAX_YARN_CONTEXT_TOKENS = 1010000
 DEFAULT_MAX_REQUEST_BYTES = 128 * 1024 * 1024
 DEFAULT_QUEUE_SIZE = 32
 # The port both commands serve on unless --port names another, or for the
@@ -81,7 +86,8 @@ def parse_model_id(value):
 
 
 def parse_max_context(value):
-    """'auto' (None), or a token count; K is 1024 tokens."""
+    """'auto' (None), or a token count; K is 1024 tokens. One above the native
+    window needs --yarn-factor (check_serve_arguments)."""
     normalized = value.strip().upper()
     if normalized == "AUTO":
         return None
@@ -91,11 +97,34 @@ def parse_max_context(value):
         )
     except ValueError:
         tokens = 0
-    if not 1 <= tokens <= MAX_CONTEXT_TOKENS:
+    if not 1 <= tokens <= context_window(MAX_YARN_FACTOR):
         raise argparse.ArgumentTypeError(
-            "must be 'auto' or a token count up to 256K, such as 100K"
+            "must be 'auto' or a token count up to 256K, or 1010000 with "
+            "--yarn-factor 4, such as 100K"
         )
     return tokens
+
+
+def parse_yarn_factor(value):
+    """YaRN's scaling factor, above 1 and at most MAX_YARN_FACTOR."""
+    try:
+        factor = float(value)
+    except ValueError:
+        factor = math.nan
+    if not 1 < factor <= MAX_YARN_FACTOR:
+        raise argparse.ArgumentTypeError(
+            "must be above 1 and at most 4, such as 4 for a window of 1010000 tokens"
+        )
+    return factor
+
+
+def context_window(yarn_factor=None):
+    """The most context the engine serves: the native window, stretched by
+    --yarn-factor as the engine stretches it
+    (QwenTargetDimensions::servedContextTokens)."""
+    if not yarn_factor:
+        return MAX_CONTEXT_TOKENS
+    return min(math.floor(MAX_CONTEXT_TOKENS * yarn_factor), MAX_YARN_CONTEXT_TOKENS)
 
 
 def parse_max_memory(value):
@@ -408,6 +437,18 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--yarn-factor",
+        "memory",
+        dict(
+            type=parse_yarn_factor,
+            default=None,
+            metavar="FACTOR",
+            help="stretch the model's 256K window by FACTOR with YaRN RoPE "
+            "scaling, up to 4 for 1010000 tokens; static, so it applies to short "
+            "prompts too (default: off)",
+        ),
+    ),
+    ServeOption(
         "--kv-format",
         "memory",
         dict(
@@ -657,6 +698,12 @@ def check_serve_arguments(parser, args):
         )
     if args.cache_dir is not None and not args.persistent_cache:
         parser.error("--cache-dir needs --persistent-cache")
+    window = context_window(args.yarn_factor)
+    if args.max_context is not None and args.max_context > window:
+        parser.error(
+            f"--max-context {args.max_context} exceeds the {window}-token window"
+            + ("" if args.yarn_factor else "; --yarn-factor stretches it")
+        )
 
 
 def serve_argv(args):

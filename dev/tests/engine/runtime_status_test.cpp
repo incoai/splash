@@ -256,7 +256,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
           "INT8 status lost its KV identity");
   require(json.find("\"cache\":{\"loaded_model_layout_sha256\":\"" + std::string(64, 'a') +
                     "\",\"build_id\":\"build\",\"dtype\":\"q8s8_f32_scale_per_token_"
-                    "head_k_token_major_v_dimension_major\",\"block_tokens\":32}") !=
+                    "head_k_token_major_v_dimension_major\",\"block_tokens\":32,\"rope_scaling\":null}") !=
                   std::string::npos &&
               json.find("runtime_cache_namespace") == std::string::npos,
           "status lost the cache identity or reported a cache namespace");
@@ -268,6 +268,14 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   require(bf16Status.find("\"format\":\"bf16\"") != std::string::npos &&
               bf16Status.find("\"scale_type\":\"none\"") != std::string::npos,
           "BF16 cache identity advertised INT8 storage");
+  // YaRN's factor and original window, which every key went through.
+  auto yarnIdentity = identity;
+  yarnIdentity.ropeScaling = {2.5, 262144};
+  const auto yarnStatus = runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan), metrics,
+                                            executorTelemetry, yarnIdentity, governor, true, {}, {}, {}, {}, {}, {});
+  require(yarnStatus.find("\"block_tokens\":32,\"rope_scaling\":{\"type\":\"yarn\",\"factor\":2.5,"
+                          "\"original_context_tokens\":262144}}") != std::string::npos,
+          "the cache identity did not report YaRN");
   require(json.find("\"schema_version\":6") != std::string::npos &&
               json.find("\"ready\":true") != std::string::npos,
           "status readiness/schema is wrong");

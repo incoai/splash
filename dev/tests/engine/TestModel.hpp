@@ -21,7 +21,8 @@ modelMemoryFootprint(uint64_t targetWeightsBytes,
 modelMemoryProfile(uint64_t targetWeightsBytes,
                    uint64_t draftWeightsBytes,
                    uint64_t visionWeightsBytes) {
-  return {"Qwen3.8-27B", kv::kMaximumLogicalTokens,
+  // Qwen3.8-27B's native window.
+  return {"Qwen3.8-27B", 262'144,
           kv::Layout{16, 4, 256},
           modelMemoryFootprint(targetWeightsBytes, draftWeightsBytes,
                                visionWeightsBytes)};

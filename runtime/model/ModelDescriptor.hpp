@@ -4,6 +4,7 @@
 #include "Model.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
+#include "RopeScaling.hpp"
 #include "ops/Vision.hpp"
 
 #include <cstdint>
@@ -43,6 +44,9 @@ struct ModelDescriptor final {
   // (inspectModelRoot): what every image is written from
   // (WeightFileRecord).
   std::string sourceIdentity;
+  // The target's RoPE scaling (withYarn), which stretches the window
+  // capabilities states beyond the layout's native one.
+  RopeScaling ropeScaling;
 
   // A model installed with --language-only has no vision tower: it loads no
   // vision weights and serves no image requests.
@@ -65,6 +69,12 @@ struct ModelDescriptor final {
                                                   VisionSource visionSource);
 [[nodiscard]] ModelDescriptor
 inspectModelRoot(const std::filesystem::path &root);
+// `model` served with YaRN by `factor` (RopeScaling): its window, the native
+// one stretched by the factor up to the family's YaRN window
+// (QwenTargetDimensions::servedContextTokens). std::invalid_argument for a
+// factor outside (1, RopeScaling::kMaximumFactor], a family YaRN does not
+// serve or a model that is already scaled.
+[[nodiscard]] ModelDescriptor withYarn(ModelDescriptor model, double factor);
 
 // The family of an upstream model's configuration, checked by the rules
 // inspectModelRoot holds its assembly to: config, the target's config.json

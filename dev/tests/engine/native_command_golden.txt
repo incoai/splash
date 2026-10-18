@@ -30,3 +30,5 @@ idle_sleep | --allow-idle-sleep | auto auto --idle-sleep allow
 disable_ane | --disable-ane | auto auto --ane off
 relaunch |  | auto auto --relaunch-context 61433
 relaunch_limits | --max-context 100K --max-memory 32G | 102400 34359738368
+yarn | --yarn-factor 4 | auto auto --yarn-factor 4.0
+yarn_context | --yarn-factor 2.5 --max-context 640K | 655360 auto --yarn-factor 2.5

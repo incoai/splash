@@ -150,6 +150,36 @@ void testQueuedPrefillCannotBeOvertakenIndefinitely() {
           "queued long prefill starved behind short arrivals");
 }
 
+// A prefill command's attention stays within a full chunk's at the end of a
+// 262,144-token native window: below it every command takes a whole chunk;
+// past it, at depths only YaRN serves, a lane's rows halve until they fit
+// (512 at a million tokens, after a cached prefix too), and another deep lane
+// joins the command only within what is left. Without a bound every command
+// takes a whole chunk.
+void testDeepPrefillKeepsANativeChunksAttention() {
+  const uint64_t native = Scheduler::attentionPairs(262'144 - 2048, 2048);
+  const auto rows = [](uint64_t bound, std::initializer_list<uint32_t> positions) {
+    Scheduler scheduler(0.0, bound);
+    uint64_t id = 0;
+    for (const uint32_t position : positions) {
+      scheduler.submit(request(++id, 1'010'000));
+      scheduler.resourcesReady(id, position);
+    }
+    const BatchPlan plan = *scheduler.next({});
+    std::vector<uint32_t> result;
+    for (const BatchItem &item : plan.items)
+      result.push_back(item.tokenCount);
+    return result;
+  };
+  using Rows = std::vector<uint32_t>;
+  require(rows(native, {0}) == Rows{2048} && rows(native, {260'096}) == Rows{2048} &&
+              rows(native, {300'000}) == Rows{1024} && rows(native, {1'000'000}) == Rows{512} &&
+              rows(std::numeric_limits<uint64_t>::max(), {1'000'000}) == Rows{2048},
+          "a prefill command's attention left a native chunk's");
+  require(rows(native, {600'000, 600'000}) == Rows({512, 192}),
+          "a second deep lane overran the command's attention");
+}
+
 void testWarmupTimingSeedsFirstContendedCommand() {
   for (double sample : {0.0, -1.0, std::numeric_limits<double>::infinity(),
                         std::numeric_limits<double>::quiet_NaN(), 6144.0}) {
@@ -1053,6 +1083,7 @@ int main() {
     testHighestRunnablePriority();
     testQueuedPrefillCannotBeOvertakenIndefinitely();
     testWarmupTimingSeedsFirstContendedCommand();
+    testDeepPrefillKeepsANativeChunksAttention();
     testShortestRemainingFirstUsesActualRows();
     testShortenedPrefillResumesFromItsRows();
     testEqualPromptsFinishInArrivalOrder();
