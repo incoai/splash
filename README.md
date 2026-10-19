@@ -164,6 +164,7 @@ ship precompiled, with no Xcode or local tuning required.
 
 ## More
 
+- [Experimental DFlash2 training](docs/dflash2-training.md): optional source-checkout fine-tuning.
 - [Development](DEVELOPMENT.md): configuration, API, internals, building, and testing.
 - [Issues and feedback](https://github.com/incoai/splash/issues)
 - [Apache-2.0](LICENSE). GGUF kernels include MIT-licensed material from
