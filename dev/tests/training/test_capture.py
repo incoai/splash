@@ -220,3 +220,62 @@ class CaptureTests(unittest.TestCase):
         self.assertTrue((output / "baseline-validation.json").exists())
         self.assertTrue(selection["implementation"])
         write_json(output / "fixture-result.json", {"passed": True})
+
+    def test_changed_execution_context_is_rejected_before_test_data_is_opened(self):
+        import argparse
+        from unittest import mock
+
+        from draft_training.__main__ import (
+            execution_context,
+            implementation_identity,
+            run_evaluation,
+        )
+        from draft_training.config import checkpoint_identity, write_json
+        from draft_training.export import export_model
+
+        model, _, _ = tiny_components()
+        draft = self.root / "draft"
+        export_model(model, draft, {}, family=False)
+        selection = {
+            "export_identity": checkpoint_identity(draft),
+            "teacher_identity": checkpoint_identity(self.target),
+            "initial_draft_identity": checkpoint_identity(draft),
+            "recipe": self.recipe.to_dict(),
+            "implementation": implementation_identity(),
+            "execution": {
+                **execution_context(self.torch, "cpu"),
+                "device": "different",
+            },
+            "versions": {},
+        }
+        path = self.root / "selection.json"
+        write_json(path, selection)
+        args = argparse.Namespace(
+            target=self.target,
+            draft=draft,
+            baseline_draft=draft,
+            selection_manifest=path,
+            test_data=self.root / "unopened-test.jsonl",
+            output=self.root / "test-output",
+            device="cpu",
+        )
+        with (
+            mock.patch("draft_training.__main__.validate_target"),
+            mock.patch(
+                "draft_training.__main__.validate_draft", return_value=model.raw_config
+            ),
+        ):
+            with self.assertRaisesRegex(TrainingError, "device context"):
+                run_evaluation(args)
+        selection["execution"] = execution_context(self.torch, "cpu")
+        selection["implementation"]["evaluate.py"] = "changed"
+        write_json(path, selection)
+        with (
+            mock.patch("draft_training.__main__.validate_target"),
+            mock.patch(
+                "draft_training.__main__.validate_draft", return_value=model.raw_config
+            ),
+        ):
+            with self.assertRaisesRegex(TrainingError, "implementation"):
+                run_evaluation(args)
+        self.assertFalse(args.output.exists())

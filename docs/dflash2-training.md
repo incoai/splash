@@ -118,7 +118,8 @@ selection.json              # frozen selection and export digests
 ```
 
 Use the identical arguments and recipe with `--resume` after interruption.
-The command rejects changes to inputs, implementation, versions, or settings.
+The command rejects changes to inputs, implementation, library versions, device
+context, or settings.
 Resume restores the latest committed checkpoint, optimizer, RNG, and absolute
 block cursor in a deterministically shuffled epoch. Nonempty run directories require explicit resume. Exports use
 new directories and are published only after finite-value and format checks.
@@ -128,7 +129,9 @@ An independent `export` subcommand can export a local trainer checkpoint.
 
 Checkpoint selection uses validation trace replay only. It maximizes mean
 consecutive matching proposals; the earlier checkpoint wins ties. The export,
-recipe, input identities, and split fingerprints are frozen before final tests.
+recipe, input identities, implementation, library versions, device context,
+and split fingerprints are frozen before final tests. Evaluation checks these
+before opening the test data.
 
 ```bash
 python -m draft_training evaluate \

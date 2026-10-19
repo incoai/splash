@@ -3,6 +3,7 @@
 import argparse
 import importlib.metadata
 import json
+import platform
 import sys
 from pathlib import Path
 
@@ -20,6 +21,24 @@ from .config import (
 from .data import disjoint, split_manifest
 
 REFERENCE_REVISION = "07ebd93db9f472af339b644bb70221ad8428328a"
+
+
+def implementation_identity():
+    return {p.name: file_digest(p) for p in sorted(Path(__file__).parent.glob("*.py"))}
+
+
+def execution_context(torch, device):
+    return {
+        "device": device,
+        "device_name": torch.cuda.get_device_name()
+        if device == "cuda"
+        else platform.machine(),
+        "cuda_version": torch.version.cuda,
+        "torch_threads": torch.get_num_threads(),
+        "forward_precision": "BF16 autocast; FP32 rotary frequencies",
+        "optimizer_precision": "FP32 trainable masters and Adam moments",
+        "attention": "sdpa",
+    }
 
 
 def add_train_arguments(parser):
@@ -266,9 +285,8 @@ def run_training(args, *, family=True):
                 "runtime/metal/abi/DraftAttention.h",
             )
         },
-        "implementation": {
-            p.name: file_digest(p) for p in sorted(Path(__file__).parent.glob("*.py"))
-        },
+        "implementation": implementation_identity(),
+        "execution": execution_context(torch, args.device),
         "versions": {
             name: importlib.metadata.version(name)
             for name in ("torch", "transformers", "safetensors")
@@ -293,6 +311,7 @@ def run_training(args, *, family=True):
         },
         "layers": config["dflash_config"]["target_layer_ids"],
         "versions": provenance["versions"],
+        "execution": provenance["execution"],
     }
     training_dir, validation_dir = (
         args.output / "features/train",
@@ -355,10 +374,25 @@ def run_evaluation(args):
         raise TrainingError(
             "evaluation output already exists; final reports are not overwritten"
         )
+    torch = require_torch(args.device)
+    if selection["implementation"] != implementation_identity():
+        raise TrainingError(
+            "evaluator implementation differs from the frozen selection"
+        )
+    if selection["execution"] != execution_context(torch, args.device):
+        raise TrainingError(
+            "evaluation device context differs from the frozen selection"
+        )
+    if any(
+        importlib.metadata.version(name) != version
+        for name, version in selection["versions"].items()
+    ):
+        raise TrainingError(
+            "evaluation library versions differ from the frozen selection"
+        )
     test = split_manifest(args.test_data)
     for split in ("training_split", "validation_split"):
         disjoint(selection[split], test)
-    require_torch(args.device)
     from .capture import TargetAdapter, capture_dataset
     from .evaluate import evaluate_cached, write_test_report
     from .model import load_draft

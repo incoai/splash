@@ -29,7 +29,7 @@ fixtures exercise the same components without downloading production weights.
 
 Verified locally on 2026-10-20:
 
-- 34 optional training tests pass on Python 3.12.11 with PyTorch 2.13.0 and
+- 35 optional training tests pass on Python 3.12.11 with PyTorch 2.13.0 and
   Transformers 5.15.1, including the actual tiny Qwen3.5 target adapter and
   pinned Z Lab reference forward/selector parity.
 - Tests cover future-token isolation through the loss, FP32 rotary frequencies
@@ -37,9 +37,13 @@ Verified locally on 2026-10-20:
   validation budget distribution, and interrupted resume across shuffled epochs.
 - The repository Python suite passed 1,298 tests with 21 expected skips under
   the ordinary environment without PyTorch. Ruff and architecture checks pass.
-- The full native check remains in progress; the shader-validated GGUF
-  projection check spends substantial time compiling Metal pipelines. Do not
-  record `make check` as passing until that process completes.
+- The aggregate native check stopped at an unchanged Neural Engine timing
+  assertion: the GPU layer measured 151 ms against a required <100 ms. An
+  isolated probe using baseline test code reproduced the assertion at 116 ms.
+  Remaining Metal tests are being checked separately. Do not record the
+  aggregate `make check` as passing or relax its timing threshold for this PR.
+- Final evaluation now checks implementation, library versions, and device
+  context against the frozen selection before reading test examples.
 
 Remaining gates: a production CUDA run with the actual BF16 target and released
 initial draft, unchanged-checkpoint native loading, trained-checkpoint native
