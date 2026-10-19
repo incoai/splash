@@ -27,6 +27,7 @@ class PackageTests(unittest.TestCase):
                 ("install/completions", package.COMPLETION_FILES),
                 ("server", package.SERVER_FILES),
                 ("server/chat-assets", package.CHAT_ASSET_FILES),
+                ("server/dashboard-assets", package.DASHBOARD_ASSET_FILES),
                 ("build", ("splash", "splash.metallib")),
             ):
                 (root / folder).mkdir(parents=True)
@@ -81,6 +82,7 @@ class PackageTests(unittest.TestCase):
                 ("install", package.INSTALL_FILES),
                 ("server", package.SERVER_FILES),
                 ("server/chat-assets", package.CHAT_ASSET_FILES),
+                ("server/dashboard-assets", package.DASHBOARD_ASSET_FILES),
                 ("build", ("splash", "splash.metallib")),
             ):
                 (root / folder).mkdir(parents=True)
@@ -132,7 +134,7 @@ class PackageTests(unittest.TestCase):
                 )
             self.assertEqual(
                 {p.name for p in (stage / "server").iterdir()},
-                {*package.SERVER_FILES, "chat-assets"},
+                {*package.SERVER_FILES, "chat-assets", "dashboard-assets"},
             )
             assets = stage / "server/chat-assets"
             self.assertEqual(
@@ -142,6 +144,16 @@ class PackageTests(unittest.TestCase):
                 self.assertEqual(
                     (assets / name).read_bytes(),
                     (root / "server/chat-assets" / name).read_bytes(),
+                )
+            assets = stage / "server/dashboard-assets"
+            self.assertEqual(
+                {p.name for p in assets.iterdir()},
+                set(package.DASHBOARD_ASSET_FILES),
+            )
+            for name in package.DASHBOARD_ASSET_FILES:
+                self.assertEqual(
+                    (assets / name).read_bytes(),
+                    (root / "server/dashboard-assets" / name).read_bytes(),
                 )
             self.assertNotIn(
                 "hf_testdistributiontoken", (stage / "release.json").read_text()

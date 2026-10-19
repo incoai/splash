@@ -91,8 +91,8 @@ access.
 | `--host` | `127.0.0.1` | HTTP bind address. See [network and authentication](#network-and-authentication). |
 | `--allowed-host` | No extra names | Additional HTTP Host name, e.g. `mymac.local`; repeatable. |
 | `--allowed-origin` | No other origin | Origin whose pages may call the API from a browser or webview, e.g. `tauri://localhost`; `'*'` for any; repeatable. |
-| `--api-key` | `SPLASH_API_KEY` or none | Require this key, as a bearer token or `x-api-key`, on every route but the chat page, `/health` and `/ready`. |
-| `--no-webui` | Off | Disable the chat page. |
+| `--api-key` | `SPLASH_API_KEY` or none | Require this key, as a bearer token or `x-api-key`, on every route but the chat page, the dashboard, `/health` and `/ready`. |
+| `--no-webui` | Off | Disable the chat page and the dashboard. |
 | `--max-memory` | Auto | Lower the ceiling on Metal allocations, e.g. `28G`; not combined process RSS. See [memory and context](#memory-and-context). |
 | `--max-context` | Auto | Set the context limit, e.g. `100K`. See [memory and context](#memory-and-context). |
 | `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
@@ -146,7 +146,7 @@ Set `SPLASH_API_KEY` in the server and agent shells to require authentication;
 `serve --api-key KEY` overrides the server's environment value. Every request
 then needs `Authorization: Bearer KEY` or `x-api-key: KEY` (one that sends both
 needs the key in both), `/status` and `/metrics` included; only the chat page,
-`/health`, `/ready` and browsers' `OPTIONS` preflights stay public. Enter the
+the dashboard, `/health`, `/ready` and browsers' `OPTIONS` preflights stay public. Enter the
 key in the chat page to send requests; the page does not persist it. Use
 `serve --no-webui` to disable the page. Authentication is off by default, and
 the server then ignores any key a client sends, so a client that insists on
@@ -594,6 +594,7 @@ Messages requires it.
 | `POST /v1/judgments`, `/v1/systemone` | Scores over fixed answers ([judgment contracts](#judgment-contracts)) |
 | `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](#explicit-weights-release)). It takes no body (or `{}`); `200` with `{"released": true, "weights": …}`, `409 engine_busy` while the engine serves a request or restores its weights, `503 engine_busy` when the engine does not answer within 5 s, and `503 engine_recovering` or `server_shutdown` while the engine restarts or the server stops |
 | `GET /status`, `/metrics` | JSON status and Prometheus metrics ([status](#status-readiness-and-metrics)) |
+| `GET /dashboard` | The dashboard page (its vendored asset at /dashboard-assets/…); public, and gone with `--no-webui` |
 | `GET /health` | 200 while the server answers; public |
 | `GET /ready` | 200 while the engine is ready, else 503; public |
 | `GET /` | The chat page; public, and gone with `--no-webui` |
@@ -1196,6 +1197,19 @@ when the tokenizer supports independent encoding there. This process-local cache
 retains at most four prefixes and 8 MiB of text/token storage; it falls back to
 full encoding for other tokenizer pipelines. `/status.tokenizer_cache` reports
 its usage. It does not alter prompt text, token IDs or the GPU KV cache.
+
+### Dashboard
+
+`GET /dashboard` serves a read-only performance dashboard. The page is public
+like the chat page, and `--no-webui` hides it. It polls `/status` every 2 s
+while the tab is visible (10 s while hidden) and renders the status document
+as gauges, bars and tables: a speed gauge with draft acceptance and TTFT/ITL
+sparklines, the KV-cache and memory panels, the request queue with its active
+requests, the ANE split's usage and derived prefill-time share, and a model
+card. With `--api-key`, the page asks for the key in the header; the key stays
+in memory for the tab's life and never persists. Every figure is the status
+document's own — the page invents nothing, and a value the engine does not
+report reads `n/a`.
 
 ### Errors
 

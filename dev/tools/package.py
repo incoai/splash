@@ -70,6 +70,7 @@ SERVER_FILES = (
     "schema_validation.py",
     "crash_trace.py",
     "chat.html",
+    "dashboard.html",
     "favicon.svg",
 )
 CHAT_ASSET_FILES = (
@@ -78,6 +79,7 @@ CHAT_ASSET_FILES = (
     "github-11.12.0.min.css",
     "github-dark-11.12.0.min.css",
 )
+DASHBOARD_ASSET_FILES = ("chart-4.5.1.min.js",)
 # Splash's license and the notices of the third-party code it ships.
 LICENSE_FILES = ("LICENSE", "THIRD_PARTY_NOTICES")
 
@@ -93,6 +95,7 @@ def stage_runtime(destination, version):
         ("install/completions", COMPLETION_FILES),
         ("server", SERVER_FILES),
         ("server/chat-assets", CHAT_ASSET_FILES),
+        ("server/dashboard-assets", DASHBOARD_ASSET_FILES),
         ("engine", ("splash", "splash.metallib")),
     ):
         (destination / folder).mkdir()

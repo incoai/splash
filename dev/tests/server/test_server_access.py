@@ -394,6 +394,8 @@ class ServerAccessTests(unittest.TestCase):
         self.assertEqual(json.loads(payload)["object"], "list")
         self.assertEqual(harness.request("GET", "/v1/../status")[0], 401)
         self.assertEqual(harness.request("GET", "/v1/../status", headers=key)[0], 200)
+        self.assertEqual(harness.request("GET", "/./dashboard")[0], 200)
+        self.assertEqual(harness.request("GET", "/dashboard/../dashboard")[0], 200)
 
     def test_public_probes_and_optional_webui(self):
         harness = self.harness(api_key="test-server-key", webui=False)
@@ -404,7 +406,9 @@ class ServerAccessTests(unittest.TestCase):
                 "/",
                 "/index.html?test=1",
                 "/favicon.ico",
+                "/dashboard",
                 *server.CHAT_ASSETS,
+                *server.DASHBOARD_ASSETS,
             ):
                 self.assertEqual(harness.request(method, path)[0], 404)
         default = self.harness()
@@ -437,6 +441,43 @@ class ServerAccessTests(unittest.TestCase):
                 self.assertEqual(harness.request("HEAD", route)[0], 200)
         key = {"Authorization": "Bearer test-server-key"}
         for path in ("/chat-assets/../server.py", "/chat-assets/missing.js"):
+            self.assertEqual(harness.request("GET", path, headers=key)[0], 404)
+
+    def test_dashboard_page_is_public_but_gated_like_the_chat_page(self):
+        disabled = self.harness(api_key="test-server-key", webui=False)
+        for method in ("GET", "HEAD"):
+            self.assertEqual(disabled.request(method, "/dashboard")[0], 404)
+            self.assertEqual(
+                disabled.request(method, "/dashboard-assets/chart-4.5.1.min.js")[0],
+                404,
+            )
+        default = self.harness()
+        status, content_type, html = default.request("GET", "/dashboard")
+        self.assertEqual((status, content_type), (200, "text/html; charset=utf-8"))
+        self.assertIn(b"Splash Dashboard", html)
+        self.assertIn(b"/dashboard-assets/chart-4.5.1.min.js", html)
+        protected = self.harness(api_key="test-server-key")
+        status, _, html = protected.request("GET", "/dashboard")
+        self.assertEqual(status, 200)
+        self.assertNotIn(b"test-server-key", html)
+        self.assertEqual(protected.request("HEAD", "/dashboard")[0], 200)
+
+    def test_dashboard_assets_are_public_but_do_not_expose_other_files(self):
+        harness = self.harness(api_key="test-server-key")
+        for route in server.DASHBOARD_ASSETS:
+            with self.subTest(route=route):
+                status, content_type, payload = harness.request("GET", route)
+                self.assertEqual(status, 200)
+                self.assertEqual(content_type, "text/javascript; charset=utf-8")
+                self.assertEqual(
+                    payload, (server.ROOT / "server" / route[1:]).read_bytes()
+                )
+                self.assertEqual(harness.request("HEAD", route)[0], 200)
+        key = {"Authorization": "Bearer test-server-key"}
+        for path in (
+            "/dashboard-assets/../server.py",
+            "/dashboard-assets/missing.js",
+        ):
             self.assertEqual(harness.request("GET", path, headers=key)[0], 404)
 
     def test_cli_takes_origins_as_browsers_send_them(self):
