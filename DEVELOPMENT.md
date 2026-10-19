@@ -1262,9 +1262,8 @@ draft's `config.json` once the family's draft is chosen.
 A model the engine refuses is refused with its reason, and so is a GGUF with
 tensors of types the loader cannot read or with every projection and expert
 unquantized (`gguf.require_loadable`, [GGUF targets](#gguf-targets)); no
-weight file is downloaded for either. Tensor shapes, and an MLX vision tower's
-weights, which must not be quantized (`VisionLoader.cpp`), are checked only
-when the model loads.
+weight file is downloaded for either. Tensor shapes and an MLX vision tower's
+weight formats (`VisionLoader.cpp`) are checked only when the model loads.
 `families.FAMILIES` names the draft trained for each family; repository names
 and model-card `base_model` fields play no part. An MLX target must declare
 `quantization` in `config.json` in formats it loads ([MLX
@@ -1308,8 +1307,19 @@ stored once per 256 weights); projections and experts as block planes, a
 quantized token table as native rows and an unquantized one as its bf16 rows.
 The block MoE kernels read the router and the shared-expert gate in F32, so
 these load as the F32 values of their quantization, and so do GDN alpha and
-beta unless both are in one format. Norms stay bf16 and the GDN value heads in
-MLX's grouped order.
+beta unless both are in one format. The GDN value heads keep MLX's grouped
+order, and the norms stay bf16 where the checkpoint stores each RMSNorm
+weight as the `1 + w` the norm multiplies by, as MLX conversions do. A
+checkpoint that stores the zero-centered `w` instead, as transformers does,
+loads its RMSNorms as the F32 `1 + w` and the GDN's gated norm, whose weight
+both store as it multiplies, widened to F32 (`safetensors::normEncoding`).
+Every layer's input norm tells the two apart: a norm's multipliers stay near
+1, so at most a quarter of a stored `1 + w`'s values are below 1/2 and at least
+three quarters of a stored `w`'s (in Qwen3.8-27B and Qwen3.6-35B-A3B, at most
+6% of an input norm's multipliers are below 1/2). An input norm in between, or
+input norms of both kinds, fail the load, naming them. The other norms follow
+the input norms: their multipliers run well above 1 (the final norm's average
+up to 2.6), where a `w` can look like a `1 + w`.
 
 ### Model Optimizer targets
 
@@ -1460,10 +1470,10 @@ runs on the block kernels its target's projections run on.
 
 ### Vision
 
-Vision comes from the target repository: MLX's `vision_tower.*` tensors (or
-transformers' `model.visual.*`, as Model Optimizer keeps them, whose patch
-embedding is already in the image's order), linking
-only `config.json` and the shards holding them, or the GGUF repository's root
+Vision comes from the target repository: MLX's `vision_tower.*` or `visual.*`
+tensors (or transformers' `model.visual.*`, as Model Optimizer keeps them),
+linking only `config.json` and the shards holding them, or the GGUF
+repository's root
 projector, a GGUF whose name holds `mmproj` (as `mmproj-BF16.gguf` or
 `MODEL-mmproj-BF16.gguf`), chosen by its header: a `clip` projector whose
 weights are BF16, F32 or F16, preferred in that order. An F16 projector made
@@ -1476,12 +1486,17 @@ preprocessing Splash implements (`server/images.py`); it is checked before any
 weight download and not installed.
 
 Both sources are written into one image, which the one BF16 vision operator
-reads: BF16 tensors are
-copied, and F32 or F16 tensors are converted under the exact-BF16 rule of
-[weight loading](#weight-loading).
+reads: BF16 tensors are copied, F32 or F16 tensors are converted under the
+exact-BF16 rule of [weight loading](#weight-loading), and an MLX affine matrix
+(the position table among them), in a text target's affine formats of 2, 3,
+4, 5, 6 or 8 bits in groups of 32, 64 or 128, is decoded into the nearest BF16
+of each `s * q + z`, ties to even; a tower may mix affine and unquantized
+matrices. A safetensors patch embedding is in MLX's order, which the writer
+reorders, or in the image's, as transformers stores it; its shape tells which.
 Unsloth's mmproj stores its 1-D tensors, patch embedding and position table as
-F32, all of them BF16-exact, and loads byte-identical to the MLX tower.
-Quantized MLX towers, deepstack projectors and mmproj tensors the tower does not
+F32, all of them BF16-exact, and loads byte-identical to the unquantized MLX
+tower. Any other quantized vision tensor (mxfp4, nvfp4, a quantized patch
+embedding or norm), deepstack projectors and mmproj tensors the tower does not
 use are rejected.
 
 `--language-only` links and loads no vision weights and removes them from
@@ -1683,17 +1698,20 @@ without requantization, quantizes the draft's BF16 projections
 exponential.
 
 Loading never rounds a target or vision weight but in the F32 values of
-quantized tensors the kernels read unquantized, and in two conversions: the
-GDN decay above and the RMSNorm weights below. The first are a safetensors
+quantized tensors the kernels read unquantized, in the BF16 values of an MLX
+vision tower's affine matrices, each the nearest BF16 of its `s * q + z`
+([Vision](#vision)), and in two conversions: the GDN decay above and the
+RMSNorm weights below. The first are a safetensors
 target's quantized router and shared-expert gate, and its quantized GDN alpha
 or beta beside one of another format or an unquantized one, an MLX target's
 ([MLX targets](#mlx-targets)) or a Model Optimizer or compressed-tensors
 target's in NVFP4 or FP8, and a GGUF's quantized alpha or beta beside one of
-another type, which the GPU decodes as GGML does. In the second conversion, a
-Model Optimizer or compressed-tensors target's RMSNorm weight `w`, stored 1
-below the weight the norm multiplies by, loads as
-the F32 `1 + w` ([Model Optimizer targets](#model-optimizer-targets)), which
-can round where `|w| < 2^-16` or `|w| >= 2^24`. Loading rounds the draft's
+another type, which the GPU decodes as GGML does. In the second conversion, an
+RMSNorm weight `w` stored 1 below the weight the norm multiplies by, as Model
+Optimizer and compressed-tensors targets and some MLX targets store it ([MLX
+targets](#mlx-targets)), loads as the F32 `1 + w` ([Model Optimizer
+targets](#model-optimizer-targets)), which can round where `|w| < 2^-16` or
+`|w| >= 2^24`. Loading rounds the draft's
 projections only as MLX's affine quantization does ([Drafts](#drafts)). A
 tensor it converts to BF16 (vision tensors stored as F32 or F16, a GGUF's
 convolution taps and time-step bias) must be exactly representable in BF16;
@@ -1800,7 +1818,8 @@ curl -X POST http://127.0.0.1:8000/v1/memory/release
 (`QwenTargetFiles`: the images `SafetensorsTargetLoader` or `GgufTargetLoader` plans)
 through `BlockTargetFormat`, which reads each tensor as one block-quantized
 `QuantizedSegment` (a fused projection's tensors in output column order), the
-norms as F32 (bf16 for an MLX checkpoint), and keeps the GDN output projection's
+norms as F32 (bf16 for an MLX checkpoint storing the `1 + w` they multiply by),
+and keeps the GDN output projection's
 input in the source's value-head order, llama.cpp's tiled or MLX's grouped.
 Both Qwen families share one layout
 (`QwenHybridLayout`) and its validator.

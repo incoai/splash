@@ -12,8 +12,9 @@
   GGUF fixtures.
 - `draft_images`: every image `draft-preparation` writes from the DFlash2
   draft checkpoint `run_draft_preparation.py` writes.
-- `vision_image`: the image written from every `run_vision_preparation.py`
-  tower.
+- `vision_image`: the image written from every unquantized
+  `run_vision_preparation.py` tower; the driver compares its towers of MLX
+  affine matrices, 128 wide, with their oracles alone.
 
 An image hash fails on any change of the image's bytes. When a change means
 to change them:

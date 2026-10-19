@@ -1,7 +1,7 @@
-// Writes the tiny vision source run_vision_preparation.py writes (depth 2,
-// width 8, 2x2 patches) and prints its image's SHA-256.
+// Writes the tiny vision sources run_vision_preparation.py writes (depth 2,
+// width 8 or 128, 2x2 patches) and prints the image's SHA-256.
 //
-//   vision-preparation safetensors|gguf DIRECTORY EXPECTED
+//   vision-preparation safetensors|affine|gguf DIRECTORY EXPECTED
 //   vision-preparation padding DIRECTORY
 //
 // EXPECTED is an independently serialized file the image and the size
@@ -61,11 +61,12 @@ int main(int argc, char **argv) {
       return 0;
     }
     if (argc != 4)
-      throw std::runtime_error("usage: vision-preparation safetensors|gguf DIRECTORY EXPECTED | padding DIRECTORY");
+      throw std::runtime_error(
+          "usage: vision-preparation safetensors|affine|gguf DIRECTORY EXPECTED | padding DIRECTORY");
     const std::string format = argv[1];
-    if (format != "safetensors" && format != "gguf") throw std::runtime_error("invalid vision-preparation arguments");
-    const auto source = format == "safetensors" ? model::VisionSource::Safetensors
-                                        : model::VisionSource::Gguf;
+    if (format != "safetensors" && format != "affine" && format != "gguf")
+      throw std::runtime_error("invalid vision-preparation arguments");
+    const auto source = format == "gguf" ? model::VisionSource::Gguf : model::VisionSource::Safetensors;
     ops::VisionLayout layout;
     layout.depth = 2;
     layout.hiddenSize = 8;
@@ -78,6 +79,14 @@ int main(int argc, char **argv) {
     layout.heads = 2;
     layout.headDimension = 4;
     layout.positionGridSide = 2;
+    if (format == "affine") {
+      layout.hiddenSize = 128;
+      layout.intermediateSize = 160;
+      layout.paddedIntermediateSize = 256;
+      layout.mergedHiddenSize = 512;
+      layout.outputHiddenSize = 128;
+      layout.heads = 32;
+    }
     const model::ImagePlan image = model::VisionLoader(argv[2], source, layout).image();
     std::vector<uint8_t> bytes(image.bytes);
     image.write(bytes, {});

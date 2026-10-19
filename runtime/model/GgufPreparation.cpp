@@ -138,12 +138,6 @@ void readSafetensorsRows(const gguf::TensorRows &rows, uint64_t start, uint64_t 
   }
 }
 
-// The BF16 nearest a finite value, ties to even.
-uint16_t nearestBfloat16(float value) {
-  const uint32_t bits = std::bit_cast<uint32_t>(value);
-  return static_cast<uint16_t>((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16);
-}
-
 // A group of 64 BF16 weights as MLX's affine quantization rounds it to 4 bits
 // (mlx.core.quantize, its Metal kernel), in float, into a native af4g64
 // block: the range runs from the minimum to the maximum or 0, whichever is
@@ -271,7 +265,7 @@ void readRows(const gguf::TensorRows &rows, uint64_t first, uint64_t count, uint
 }
 
 // Writes the bf16 values `count` F32 values equal: the kernels read these
-// tensors as bf16, and loading never rounds a weight.
+// tensors as bf16, and this conversion requires exact representation.
 void narrowToBfloat16(const uint8_t *values, uint64_t count, uint8_t *to, const std::string &name) {
   for (uint64_t i = 0; i < count; ++i) {
     float value;

@@ -6,12 +6,19 @@
 
 namespace splash::model {
 
-// The bf16 bits of value when it is exactly a bf16: preparation never rounds
-// a weight.
+// The bf16 bits of value when it is exactly a bf16.
 [[nodiscard]] inline std::optional<uint16_t> exactBfloat16(float value) {
   const auto bits = std::bit_cast<uint32_t>(value);
   if (bits & 0xFFFFu) return std::nullopt;
   return static_cast<uint16_t>(bits >> 16);
+}
+
+// The bits of the bf16 nearest value, ties to even; a NaN stays a NaN rather
+// than rounding into an infinity.
+[[nodiscard]] inline uint16_t nearestBfloat16(float value) {
+  const auto bits = std::bit_cast<uint32_t>(value);
+  if ((bits & 0x7FFFFFFFu) > 0x7F800000u) return static_cast<uint16_t>((bits >> 16) | 0x40u);
+  return static_cast<uint16_t>((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
 }
 
 // The float a bf16's bits hold.

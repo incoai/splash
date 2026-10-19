@@ -15,8 +15,8 @@ The paths an assembly links, and what reads each:
                          the MLX config.json again, as each checkpoint
                          directory's own config, read by engines up to 1.2,
                          which a release check runs on this installation
-  target/<shard>         the MLX safetensors shards except those holding only
-                         vision_tower.* (SafetensorsCheckpoint.mm)
+  target/<shard>         the safetensors shards except those holding only
+                         vision tower tensors (SafetensorsCheckpoint.mm)
   target/<name>.gguf     the GGUF target (GgufTarget.cpp findTargetGguf)
   tokenizer/config.json  the same configuration again, from which the
                          server's AutoTokenizer.from_pretrained chooses the
@@ -27,7 +27,7 @@ The paths an assembly links, and what reads each:
   draft/config.json, draft/<name>.safetensors
                          the DFlash2 checkpoint (ModelDescriptor.mm,
                          DraftCheckpoint.cpp)
-  vision/<shard>         the MLX shards holding vision_tower.*
+  vision/<shard>         the safetensors shards holding vision tower tensors
                          (VisionLoader.cpp, through SafetensorsCheckpoint.mm)
   vision/mmproj.gguf     the GGUF vision projector (VisionLoader.cpp)
 """

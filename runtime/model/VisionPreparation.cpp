@@ -37,6 +37,48 @@ bool convert(const SourceTensor &tensor, const uint8_t *source, uint16_t *destin
   return true;
 }
 
+// The source bytes of one row of `columns` values of in: an affine matrix's
+// codes and its groups' scales and biases, or the values in their dtype.
+uint64_t sourceRowBytes(const Input &in, uint32_t columns) {
+  if (in.bits) return uint64_t(columns) * in.bits / 8 + uint64_t(columns / in.group) * 4;
+  return uint64_t(columns) * elementBytes(in.tensor);
+}
+
+// Converts count rows of an affine matrix from row `first` to rows of stride
+// BF16 values, each s * q + z rounded to the nearest BF16: the rows' codes,
+// packed in.bits each from the lowest bit up, scales and biases are read once
+// into staging.
+void convertAffine(const Input &in, uint32_t first, uint32_t count, uint32_t columns,
+                   uint16_t *destination, uint32_t stride, std::vector<uint8_t> &staging) {
+  const uint64_t codeRowBytes = uint64_t(columns) * in.bits / 8;
+  const uint32_t groups = columns / in.group, mask = (1u << in.bits) - 1;
+  const uint64_t parameterRowBytes = uint64_t(groups) * sizeof(uint16_t);
+  const uint64_t codeBytes = count * codeRowBytes, parameterBytes = count * parameterRowBytes;
+  const uint64_t bytes = codeBytes + 2 * parameterBytes;
+  if (staging.size() < bytes) staging.resize(bytes);
+  in.tensor.read(first * codeRowBytes, std::span(staging).first(codeBytes));
+  in.scales->read(first * parameterRowBytes, std::span(staging).subspan(codeBytes, parameterBytes));
+  in.biases->read(first * parameterRowBytes, std::span(staging).subspan(codeBytes + parameterBytes, parameterBytes));
+  for (uint32_t row = 0; row < count; ++row) {
+    const uint8_t *codes = staging.data() + row * codeRowBytes;
+    uint16_t *out = destination + uint64_t(row) * stride;
+    uint32_t bit = 0;
+    for (uint32_t group = 0; group < groups; ++group) {
+      uint16_t scaleBits, biasBits;
+      const uint64_t parameter = uint64_t(row) * parameterRowBytes + group * sizeof(uint16_t);
+      std::memcpy(&scaleBits, staging.data() + codeBytes + parameter, sizeof(scaleBits));
+      std::memcpy(&biasBits, staging.data() + codeBytes + parameterBytes + parameter, sizeof(biasBits));
+      const float scale = widenBfloat16(scaleBits), bias = widenBfloat16(biasBits);
+      for (uint32_t column = 0; column < in.group; ++column, bit += in.bits) {
+        const uint32_t shift = bit % 8;
+        uint32_t code = uint32_t(codes[bit / 8]) >> shift;
+        if (shift + in.bits > 8) code |= uint32_t(codes[bit / 8 + 1]) << (8 - shift);
+        out[group * in.group + column] = nearestBfloat16(scale * float(code & mask) + bias);
+      }
+    }
+  }
+}
+
 // Source bytes and patch values of one task.
 struct Staging {
   std::vector<uint8_t> source;
@@ -52,9 +94,9 @@ void addSectionTasks(uint8_t *image, const Section &s, uint32_t pixels,
                      std::vector<std::function<void(Staging &)>> &tasks) {
   const auto frames = static_cast<uint32_t>(s.inputs.size());
   const uint32_t columns = s.columns / frames;
-  uint32_t widest = 0;
-  for (const auto &in : s.inputs) widest = std::max(widest, elementBytes(in.tensor));
-  const uint64_t stagedRowBytes = uint64_t(columns) * widest + (s.patch ? uint64_t(s.columns) * kBFloat16Bytes : 0);
+  uint64_t stagedRowBytes = 0;
+  for (const auto &in : s.inputs) stagedRowBytes = std::max(stagedRowBytes, sourceRowBytes(in, columns));
+  if (s.patch) stagedRowBytes += uint64_t(s.columns) * kBFloat16Bytes;
   const auto batchRows = static_cast<uint32_t>(std::clamp<uint64_t>(kLoadStepBytes / stagedRowBytes, 1, s.rows));
   for (uint32_t row = 0; row < s.rows; row += batchRows) {
     const uint32_t count = std::min(batchRows, s.rows - row);
@@ -62,6 +104,10 @@ void addSectionTasks(uint8_t *image, const Section &s, uint32_t pixels,
     tasks.push_back([&s, pixels, frames, columns, row, count, output](Staging &staging) {
       // Converts count rows of one input to rows of stride BF16 values.
       const auto convertRows = [&](const Input &in, uint16_t *to, uint32_t stride) {
+        if (in.bits) {
+          convertAffine(in, row, count, columns, to, stride, staging.source);
+          return;
+        }
         const uint64_t bytes = uint64_t(columns) * elementBytes(in.tensor);
         if (staging.source.size() < count * bytes) staging.source.resize(count * bytes);
         in.tensor.read(row * bytes, std::span(staging.source).first(count * bytes));

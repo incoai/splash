@@ -9,7 +9,7 @@ SafetensorsTargetLoader::SafetensorsTargetLoader(metal::MetalBackend &backend, W
                                                  const QwenTargetDimensions &geometry)
     : backend_(backend), images_(images), planned_(std::make_shared<Planned>(directory)) {
   planned_->images = safetensors::planImages(planned_->checkpoint, geometry);
-  float32Norms_ = safetensors::float32Norms(safetensors::moduleNames(planned_->checkpoint));
+  float32Norms_ = safetensors::float32Norms(safetensors::normEncoding(planned_->checkpoint, geometry));
 }
 
 WeightFile SafetensorsTargetLoader::open(size_t index) {

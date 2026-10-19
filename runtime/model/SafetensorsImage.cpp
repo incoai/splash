@@ -1,14 +1,17 @@
 #include "model/SafetensorsImage.hpp"
 
 #include "metal/abi/Gguf.h"
+#include "model/Bfloat16.hpp"
 #include "model/StateLayout.hpp"
 #include "model/WeightLayout.hpp"
 #include "model/WeightStore.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <initializer_list>
 #include <optional>
 #include <string_view>
+#include <utility>
 
 namespace splash::model::safetensors {
 namespace {
@@ -32,17 +35,17 @@ std::string headName(ModuleNames names) {
 class Builder {
 public:
   Builder(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry, ModuleNames names,
-          std::string name, uint32_t layer, uint32_t type)
-      : checkpoint_(checkpoint), geometry_(geometry), names_(names), image_(std::move(name), layer, type) {}
+          NormEncoding norms, std::string name, uint32_t layer, uint32_t type)
+      : checkpoint_(checkpoint), geometry_(geometry), names_(names), norms_(norms),
+        image_(std::move(name), layer, type) {}
 
-  // An RMSNorm's weight, which the norm kernels read (ops::NormWeights): as
-  // stored (bf16) from MLX names, or the F32 1 + w of the w transformers
-  // stores.
+  // An RMSNorm's weight, which the norm kernels read (ops::NormWeights): a
+  // stored 1 + w as stored (bf16), or the F32 1 + w of a stored w.
   void norm(const std::string &name, uint64_t elements) { normWeight(name, elements, Conversion::CenteredNorm); }
 
-  // The GDN's gated norm, whose weight both store as the norm multiplies by:
-  // as stored (bf16) from MLX names, or widened to F32 as the other norms of
-  // a transformers checkpoint's images are.
+  // The GDN's gated norm, whose weight every checkpoint stores as the norm
+  // multiplies by: as stored (bf16) beside stored 1 + w norms, or widened to
+  // F32 as the other norms of a checkpoint storing w are.
   void gatedNorm(const std::string &name, uint64_t elements) {
     normWeight(name, elements, Conversion::WidenToFloat32);
   }
@@ -167,12 +170,12 @@ private:
     image_.copy(rows(name, tensor, ggml::kBF16, 1, tensor.bytes));
   }
 
-  // A norm's bf16 weight, as stored from MLX names, or converted to F32 as
-  // `transformers` says from transformers names.
-  void normWeight(const std::string &name, uint64_t elements, Conversion transformers) {
-    if (!float32Norms(names_)) return stored(name + ".weight", {"BF16"}, {elements});
+  // A norm's bf16 weight, as stored when the checkpoint stores 1 + w, or
+  // converted to F32 as `centered` says when it stores w.
+  void normWeight(const std::string &name, uint64_t elements, Conversion centered) {
+    if (!float32Norms(norms_)) return stored(name + ".weight", {"BF16"}, {elements});
     const SourceTensor &tensor = require(name + ".weight", {"BF16"}, {elements});
-    image_.copy(rows(name + ".weight", tensor, ggml::kBF16, 1, tensor.bytes), transformers);
+    image_.copy(rows(name + ".weight", tensor, ggml::kBF16, 1, tensor.bytes), centered);
   }
 
   // The module's native rows, which must be quantized.
@@ -185,45 +188,22 @@ private:
   // The module's native rows when the checkpoint holds it quantized, in the
   // format its tensors hold (metal/abi/QuantFormat.h); none when the
   // checkpoint holds the module's weight unquantized; a module without a
-  // weight is a missing source tensor. MLX's format is the one
-  // MLX infers from codes [experts, rows, columns * bits / 32] (U32) and
-  // scales [experts, rows, columns / group size]: bf16 with bf16 biases
-  // (affine), uint8 E8M0 exponents (mxfp4, 4 bits in groups of 32) or uint8
-  // E4M3 scales (nvfp4, 4 bits in groups of 16). Model Optimizer's and
-  // compressed-tensors' (floatQuantized) is the one their tensor types state.
+  // weight is a missing source tensor. MLX's format is the one MLX infers
+  // (mlxQuantization), Model Optimizer's and compressed-tensors'
+  // (floatQuantized) the one their tensor types state.
   std::optional<TensorRows> quantized(const std::string &module, uint64_t rows, uint64_t columns,
                                       uint64_t experts = 1) const {
     if (experts == 1 && checkpoint_.find(module + ".weight_scale")) return floatQuantized(module, rows, columns);
-    const SourceTensor &codes = checkpoint_.require(module + ".weight");
-    const SourceTensor *scales = checkpoint_.find(module + ".scales");
-    if (!scales) return std::nullopt;
-    std::vector<uint64_t> leading{rows};
-    if (experts > 1) leading.insert(leading.begin(), experts);
-    const auto shaped = [&](const SourceTensor &tensor) {
-      return tensor.shape.size() == leading.size() + 1 &&
-             std::equal(leading.begin(), leading.end(), tensor.shape.begin()) && tensor.shape.back();
-    };
-    if (codes.dtype != "U32" || !shaped(codes) || !shaped(*scales) || columns % scales->shape.back() ||
-        codes.shape.back() * 32 % columns)
-      throw WeightStoreError("source tensor type or shape does not match: " + module);
-    const uint64_t group = columns / scales->shape.back(), bits = codes.shape.back() * 32 / columns;
-    uint32_t format = GGUF_FMT_COUNT;
-    const SourceTensor *biases = nullptr;
-    if (scales->dtype == "BF16") {
-      format = quant_affine_format_of(uint32_t(bits), uint32_t(group));
-      biases = &require(module + ".biases", {"BF16"}, scales->shape);
-    } else if (scales->dtype == "U8" && bits == 4 && group == 32) {
-      format = GGUF_FMT_MXFP4;
-    } else if (scales->dtype == "U8" && bits == 4 && group == 16) {
-      format = GGUF_FMT_NVFP4;
-    }
-    if (format == GGUF_FMT_COUNT)
-      throw WeightStoreError(module + " is " + std::to_string(bits) + "-bit in groups of " + std::to_string(group) +
-                             " with " + scales->dtype + " scales; MLX weights load as affine 2, 3, 4, 5, 6 or 8 "
-                             "bits in groups of 32, 64 or 128 with bf16 scales, or as mxfp4 or nvfp4");
-    requireWholeBlocks(module, format, columns);
-    return TensorRows{module, kQuantFormats[format].ggml_type, 0, experts * rows,
-                      ggufRowBytes(kQuantFormats[format], columns), {}, codes.file, {&codes, scales, biases}};
+    const std::optional<MlxQuantization> mlx = mlxQuantization(checkpoint_, module, rows, columns, experts);
+    if (!mlx) return std::nullopt;
+    if (mlx->format == GGUF_FMT_COUNT)
+      throw WeightStoreError(module + " is " + std::to_string(mlx->bits) + "-bit in groups of " +
+                             std::to_string(mlx->group) + " with " + mlx->tensors.scales->dtype +
+                             " scales; MLX weights load as affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64 or "
+                             "128 with bf16 scales, or as mxfp4 or nvfp4");
+    requireWholeBlocks(module, mlx->format, columns);
+    return TensorRows{module, kQuantFormats[mlx->format].ggml_type, 0, experts * rows,
+                      ggufRowBytes(kQuantFormats[mlx->format], columns), {}, mlx->tensors.codes->file, mlx->tensors};
   }
 
   // A module's native rows in NVFP4 or FP8 as Model Optimizer and
@@ -295,6 +275,7 @@ private:
   const SafetensorsCheckpoint &checkpoint_;
   const QwenTargetDimensions &geometry_;
   const ModuleNames names_;
+  const NormEncoding norms_;
   gguf::ImageBuilder image_;
 };
 
@@ -384,19 +365,83 @@ ModuleNames moduleNames(const SafetensorsCheckpoint &checkpoint) {
                                                                                          : ModuleNames::Mlx;
 }
 
+NormEncoding normEncoding(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry) {
+  const ModuleNames names = moduleNames(checkpoint);
+  if (names == ModuleNames::Transformers) return NormEncoding::Centered;
+  const uint64_t elements = geometry.hiddenSize;
+  std::vector<uint8_t> weight(elements * sizeof(uint16_t));
+  // The encoding the input norm of `layer` shows, and that norm's name.
+  const auto encodingOf = [&](uint32_t layer) {
+    const std::string name = modelPrefix(names) + "layers." + std::to_string(layer) + ".input_layernorm.weight";
+    const SourceTensor &tensor = checkpoint.require(name);
+    if (tensor.dtype != "BF16" || tensor.shape != std::vector<uint64_t>{elements})
+      throw WeightStoreError("source tensor type or shape does not match: " + name);
+    tensor.read(0, weight);
+    uint64_t below = 0;
+    for (uint64_t i = 0; i < elements; ++i) {
+      uint16_t bits;
+      std::memcpy(&bits, weight.data() + i * sizeof(bits), sizeof(bits));
+      below += widenBfloat16(bits) < 0.5F;
+    }
+    if (4 * below > elements && 4 * below < 3 * elements)
+      throw WeightStoreError(name + " is neither an RMSNorm's 1 + w nor its w: " + std::to_string(below) + " of its " +
+                             std::to_string(elements) + " values are below 1/2");
+    return std::pair{4 * below <= elements ? NormEncoding::Multiplier : NormEncoding::Centered, name};
+  };
+  const auto [encoding, first] = encodingOf(0);
+  for (uint32_t layer = 1; layer < geometry.layers; ++layer)
+    if (const auto [other, name] = encodingOf(layer); other != encoding) {
+      const auto form = [](NormEncoding e) { return e == NormEncoding::Multiplier ? "1 + w" : "w"; };
+      throw WeightStoreError(first + " stores an RMSNorm's " + form(encoding) + " but " + name + " its " + form(other));
+    }
+  return encoding;
+}
+
+std::optional<MlxQuantization> mlxQuantization(const SafetensorsCheckpoint &checkpoint, const std::string &module,
+                                               uint64_t rows, uint64_t columns, uint64_t experts) {
+  const SourceTensor &codes = checkpoint.require(module + ".weight");
+  const SourceTensor *scales = checkpoint.find(module + ".scales");
+  if (!scales) return std::nullopt;
+  std::vector<uint64_t> leading{rows};
+  if (experts > 1) leading.insert(leading.begin(), experts);
+  const auto shaped = [&](const SourceTensor &tensor) {
+    return tensor.shape.size() == leading.size() + 1 &&
+           std::equal(leading.begin(), leading.end(), tensor.shape.begin()) && tensor.shape.back();
+  };
+  if (codes.dtype != "U32" || !shaped(codes) || !shaped(*scales) || columns % scales->shape.back() ||
+      codes.shape.back() * 32 % columns)
+    throw WeightStoreError("source tensor type or shape does not match: " + module);
+  MlxQuantization result{GGUF_FMT_COUNT, codes.shape.back() * 32 / columns, columns / scales->shape.back(),
+                         {&codes, scales}};
+  if (scales->dtype == "BF16") {
+    result.format = quant_affine_format_of(uint32_t(result.bits), uint32_t(result.group));
+    const SourceTensor &biases = checkpoint.require(module + ".biases");
+    if (biases.dtype != "BF16" || biases.shape != scales->shape)
+      throw WeightStoreError("source tensor type or shape does not match: " + module + ".biases");
+    result.tensors.biases = &biases;
+  } else if (scales->dtype == "U8" && result.bits == 4 && result.group == 32) {
+    result.format = GGUF_FMT_MXFP4;
+  } else if (scales->dtype == "U8" && result.bits == 4 && result.group == 16) {
+    result.format = GGUF_FMT_NVFP4;
+  }
+  return result;
+}
+
 std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry) {
   const ModuleNames names = moduleNames(checkpoint);
+  const NormEncoding norms = normEncoding(checkpoint, geometry);
   std::vector<gguf::Image> images;
   for (uint32_t layer = 0; layer < geometry.layers; ++layer) {
-    Builder b(checkpoint, geometry, names, "layer-" + std::to_string(layer) + ".bin", layer,
+    Builder b(checkpoint, geometry, names, norms, "layer-" + std::to_string(layer) + ".bin", layer,
               geometry.isFullAttentionLayer(layer) ? 1u : 0u);
     walkLayer(b, geometry, names, layer);
     images.push_back(b.finish());
   }
-  Builder head(checkpoint, geometry, names, "head.bin", geometry.layers, 2);
+  Builder head(checkpoint, geometry, names, norms, "head.bin", geometry.layers, 2);
   walkHead(head, geometry, names);
   images.push_back(head.finish());
-  Builder embedding(checkpoint, geometry, names, "embedding.bin", geometry.vocabularySize, geometry.hiddenSize);
+  Builder embedding(checkpoint, geometry, names, norms, "embedding.bin", geometry.vocabularySize,
+                    geometry.hiddenSize);
   walkEmbedding(embedding, names);
   images.push_back(embedding.finish());
   return images;

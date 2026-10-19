@@ -36,9 +36,9 @@ TOKENIZER_FILES = (
     "added_tokens.json",
     "special_tokens_map.json",
 )
-# The name prefixes of a safetensors checkpoint's vision tower tensors: MLX's,
-# and transformers' (as NVIDIA's Model Optimizer keeps them).
-VISION_TOWER = ("vision_tower.", "model.visual.")
+# The name prefixes of a safetensors checkpoint's vision tower tensors: MLX's
+# two, and transformers' (as NVIDIA's Model Optimizer keeps them).
+VISION_TOWER = ("vision_tower.", "visual.", "model.visual.")
 # Where an MLX repository keeps its image processor's configuration: a file of
 # its own, or the image_processor object of processor_config.json, where newer
 # Transformers releases save it.

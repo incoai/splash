@@ -724,6 +724,93 @@ void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path 
             "a bf16 token table did not load as its bf16 rows");
 }
 
+// An MLX target's RMSNorm weights load by what its input norms hold: as
+// stored (bf16) where they hold the 1 + w the norms multiply by, or as the F32
+// 1 + w where they hold w, the GDN's gated norm then widened as stored;
+// modelWeightBytes plans what either loads, and a MoE target's experts load
+// under either. Input norms that hold neither, or of both kinds, are refused,
+// naming them.
+template <class Layout, class Weights>
+void testSyntheticMlxNorms(MetalBackend &backend, const std::filesystem::path &root) {
+    const auto target = syntheticTarget<Layout>();
+    // A bf16 weight of `elements` values: `first`, then `rest`.
+    const auto weight = [](uint64_t elements, std::span<const uint16_t> first, uint16_t rest) {
+        std::vector<uint16_t> values(elements, rest);
+        std::copy(first.begin(), first.end(), values.begin());
+        std::vector<uint8_t> bytes(elements * sizeof(uint16_t));
+        std::memcpy(bytes.data(), values.data(), bytes.size());
+        return bytes;
+    };
+    // w = 1/128, 1/2 and -1/256, then 0, and the 1 + w of each.
+    constexpr std::array<uint16_t, 3> w{0x3C00, 0x3F00, 0xBB80}, multiplier{0x3F81, 0x3FC0, 0x3F7F};
+    constexpr uint16_t one = 0x3F80;
+    // The target's tensors: each RMSNorm holding w (centered) or 1 + w and each
+    // gated norm w, then `edit` applied to each input norm.
+    const auto tensors = [&](bool centered, const std::function<void(SyntheticTensor &)> &edit = {}) {
+        std::vector<SyntheticTensor> result =
+            splash::test::mlxTargetTensors(target, [](const std::string &) { return std::pair{4u, 64u}; });
+        for (SyntheticTensor &tensor : result) {
+            if (tensor.name.ends_with("linear_attn.norm.weight"))
+                tensor.data = weight(tensor.shape[0], w, 0);
+            else if (tensor.name.ends_with("norm.weight"))
+                tensor.data = centered ? weight(tensor.shape[0], w, 0) : weight(tensor.shape[0], multiplier, one);
+            if (edit && tensor.name.ends_with("input_layernorm.weight")) edit(tensor);
+        }
+        return result;
+    };
+    for (const bool centered : {false, true}) {
+        const std::string kind = centered ? "w" : "1 + w";
+        const ModelDescriptor descriptor = writeBlockModel(root, target, tensors(centered));
+        const uint64_t planned = modelWeightBytes(root, descriptor);
+        const auto model = loadModel(backend, root, descriptor);
+        const auto &weights = std::get<Weights>(model.target);
+        // Whether a norm's first four values are those loaded from w or 1 + w.
+        const auto holds = [&](const splash::ops::NormWeights &norm, bool gated) {
+            const void *values = norm.buffer.contents();
+            if (norm.float32 != centered) return false;
+            if (!centered) {
+                const std::array<uint16_t, 4> expected =
+                    gated ? std::array<uint16_t, 4>{w[0], w[1], w[2], 0}
+                          : std::array<uint16_t, 4>{multiplier[0], multiplier[1], multiplier[2], one};
+                return std::equal(expected.begin(), expected.end(), static_cast<const uint16_t *>(values));
+            }
+            const std::array<float, 4> expected = gated ? std::array<float, 4>{0.0078125F, 0.5F, -0.00390625F, 0.0F}
+                                                        : std::array<float, 4>{1.0078125F, 1.5F, 0.99609375F, 1.0F};
+            return std::equal(expected.begin(), expected.end(), static_cast<const float *>(values));
+        };
+        for (const auto &layer : weights.layers) {
+            const auto *gdn = std::get_if<QwenGdnWeights>(&layer.mixer);
+            const auto *attention = std::get_if<QwenAttentionWeights>(&layer.mixer);
+            require(holds(layer.inputNorm, false) && holds(layer.postAttentionNorm, false) &&
+                        (gdn ? holds(gdn->mixerNorm, true)
+                             : holds(attention->queryNorm, false) && holds(attention->keyNorm, false)),
+                    "an MLX target whose norms hold " + kind + " did not load them as such");
+        }
+        require(holds(weights.finalNorm, false), "an MLX target whose norms hold " + kind +
+                                                     " did not load its final norm as such");
+        require(declaredBytes(weights.files) + declaredBytes(model.draft.files) == planned,
+                "modelWeightBytes is not what an MLX target whose norms hold " + kind + " loads");
+    }
+    // Layer 1's input norm half 0 and half 1, neither w nor 1 + w, and layer
+    // 2's 1 + w beside the other layers' w.
+    const std::vector<uint16_t> zeros(target.hiddenSize / 2, 0);
+    const auto neither = [&](SyntheticTensor &tensor) {
+        if (tensor.name.find(".layers.1.") != std::string::npos) tensor.data = weight(tensor.shape[0], zeros, one);
+    };
+    const auto both = [&](SyntheticTensor &tensor) {
+        if (tensor.name.find(".layers.2.") != std::string::npos) tensor.data = weight(tensor.shape[0], multiplier, one);
+    };
+    const ModelDescriptor descriptor = writeBlockModel(root, target, tensors(true, neither));
+    rejects([&] { static_cast<void>(loadModel(backend, root, descriptor)); },
+            "language_model.model.layers.1.input_layernorm.weight is neither an RMSNorm's 1 + w nor its w",
+            "an input norm holding neither w nor 1 + w was accepted");
+    splash::test::writeSyntheticShard(root / "target" / "model.safetensors", tensors(true, both));
+    rejects([&] { static_cast<void>(loadModel(backend, root, descriptor)); },
+            "language_model.model.layers.0.input_layernorm.weight stores an RMSNorm's w but "
+            "language_model.model.layers.2.input_layernorm.weight its 1 + w",
+            "input norms holding w and 1 + w were accepted");
+}
+
 // The name of a convention of NVFP4 and FP8 checkpoints.
 std::string checkpointName(splash::test::FloatCheckpoint checkpoint) {
     return checkpoint == splash::test::FloatCheckpoint::ModelOptimizer ? "Model Optimizer" : "compressed-tensors";
@@ -915,6 +1002,8 @@ int main(int argc, const char *argv[]) {
         testSyntheticModel(production, temporary.path() / "model");
         testSyntheticBlockModel(production, temporary.path() / "block-model");
         testSyntheticBlockMoeModel(production, temporary.path() / "block-moe-model");
+        testSyntheticMlxNorms<Qwen3_8Layout, Qwen3_8Weights>(production, temporary.path() / "mlx-norms");
+        testSyntheticMlxNorms<Qwen3_6MoeLayout, Qwen3_6MoeWeights>(production, temporary.path() / "mlx-moe-norms");
         for (const auto checkpoint : {splash::test::FloatCheckpoint::ModelOptimizer,
                                       splash::test::FloatCheckpoint::CompressedTensors}) {
             const std::string at = checkpoint == splash::test::FloatCheckpoint::ModelOptimizer ? "model-optimizer"

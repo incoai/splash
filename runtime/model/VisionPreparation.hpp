@@ -2,8 +2,8 @@
 
 // The image of a vision tower (MDFV0001, every tensor BF16), as
 // model/VisionLoader.cpp plans it from an MLX checkpoint or a GGUF mmproj, and
-// its writer. A BF16 tensor is copied; an F32 or F16 tensor is converted only
-// when every value is exactly a BF16, and loading fails otherwise.
+// its writer. BF16 is copied; F32 and F16 require exact BF16 values. An MLX
+// affine matrix is decoded to nearest BF16 from its packed codes and parameters.
 
 #include "model/WeightSource.hpp"
 
@@ -14,10 +14,13 @@
 
 namespace splash::model::vision {
 
-// A source tensor and the name it has in its file.
+// A source tensor and its name; for an affine matrix, tensor holds its U32
+// codes and scales/biases supply one BF16 parameter per group of columns.
 struct Input {
   std::string name;
   SourceTensor tensor;
+  const SourceTensor *scales = nullptr, *biases = nullptr;
+  uint32_t bits = 0, group = 0;
 };
 
 // A section of rows x columns values, stored as storedRows x storedColumns
