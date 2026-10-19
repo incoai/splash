@@ -1308,14 +1308,18 @@ quantized token table as native rows and an unquantized one as its bf16 rows.
 The block MoE kernels read the router and the shared-expert gate in F32, so
 these load as the F32 values of their quantization, and so do GDN alpha and
 beta unless both are in one format. The GDN value heads keep MLX's grouped
-order. Ordinary MLX checkpoints keep their BF16 norms as stored.
-
-Complete MLX-LM exports, such as Swift 1.5, retain
-`mtp.pre_fc_norm_embedding.weight` and `mtp.pre_fc_norm_hidden.weight`.
-These exports preserve zero-centered RMSNorm weights rather than adding 1
-when converting: preparation writes their F32 `1 + w` without rounding it to
-BF16, and widens the GDN's gated norm without adding an offset. The MTP modules
-themselves are not used; the target still pairs with its family's DFlash2 draft.
+order, and the norms stay bf16 where the checkpoint stores each RMSNorm
+weight as the `1 + w` the norm multiplies by, as MLX conversions do. A
+checkpoint that stores the zero-centered `w` instead, as transformers does,
+loads its RMSNorms as the F32 `1 + w` and the GDN's gated norm, whose weight
+both store as it multiplies, widened to F32 (`safetensors::normEncoding`).
+Every layer's input norm tells the two apart: a norm's multipliers stay near
+1, so at most a quarter of a stored `1 + w`'s values are below 1/2 and at least
+three quarters of a stored `w`'s (in Qwen3.8-27B and Qwen3.6-35B-A3B, at most
+6% of an input norm's multipliers are below 1/2). An input norm in between, or
+input norms of both kinds, fail the load, naming them. The other norms follow
+the input norms: their multipliers run well above 1 (the final norm's average
+up to 2.6), where a `w` can look like a `1 + w`.
 
 ### Model Optimizer targets
 
@@ -1703,11 +1707,12 @@ target's quantized router and shared-expert gate, and its quantized GDN alpha
 or beta beside one of another format or an unquantized one, an MLX target's
 ([MLX targets](#mlx-targets)) or a Model Optimizer or compressed-tensors
 target's in NVFP4 or FP8, and a GGUF's quantized alpha or beta beside one of
-another type, which the GPU decodes as GGML does. In the second conversion, a
-Model Optimizer or compressed-tensors target's RMSNorm weight `w`, stored 1
-below the weight the norm multiplies by, loads as
-the F32 `1 + w` ([Model Optimizer targets](#model-optimizer-targets)), which
-can round where `|w| < 2^-16` or `|w| >= 2^24`. Loading rounds the draft's
+another type, which the GPU decodes as GGML does. In the second conversion, an
+RMSNorm weight `w` stored 1 below the weight the norm multiplies by, as Model
+Optimizer and compressed-tensors targets and some MLX targets store it ([MLX
+targets](#mlx-targets)), loads as the F32 `1 + w` ([Model Optimizer
+targets](#model-optimizer-targets)), which can round where `|w| < 2^-16` or
+`|w| >= 2^24`. Loading rounds the draft's
 projections only as MLX's affine quantization does ([Drafts](#drafts)). A
 tensor it converts to BF16 (vision tensors stored as F32 or F16, a GGUF's
 convolution taps and time-step bias) must be exactly representable in BF16;
@@ -1814,7 +1819,8 @@ curl -X POST http://127.0.0.1:8000/v1/memory/release
 (`QwenTargetFiles`: the images `SafetensorsTargetLoader` or `GgufTargetLoader` plans)
 through `BlockTargetFormat`, which reads each tensor as one block-quantized
 `QuantizedSegment` (a fused projection's tensors in output column order), the
-norms as F32 (bf16 for an MLX checkpoint), and keeps the GDN output projection's
+norms as F32 (bf16 for an MLX checkpoint storing the `1 + w` they multiply by),
+and keeps the GDN output projection's
 input in the source's value-head order, llama.cpp's tiled or MLX's grouped.
 Both Qwen families share one layout
 (`QwenHybridLayout`) and its validator.

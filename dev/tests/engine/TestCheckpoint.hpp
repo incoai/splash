@@ -111,14 +111,20 @@ inline std::vector<SyntheticTensor> draftTensors(const model::DFlashDraftLayout 
 }
 
 // The tensors of an MLX target of layout as mlx-lm saves it, which
-// model/SafetensorsImage.cpp reads: bf16 norms, convolution, A_log and
-// dt_bias, and each quantized module's codes, scales and biases in the bits
-// and group size quantization(module) gives, as MLX packs them.
+// model/SafetensorsImage.cpp reads: bf16 norms (each RMSNorm the 1 + w it
+// multiplies by, of w = 0), convolution, A_log and dt_bias, and each quantized
+// module's codes, scales and biases in the bits and group size
+// quantization(module) gives, as MLX packs them.
 template <class Layout, class Quantization>
 std::vector<SyntheticTensor> mlxTargetTensors(const Layout &layout, Quantization quantization) {
   std::vector<SyntheticTensor> result;
   const auto bfloat16 = [&](const std::string &name, std::vector<uint64_t> shape) {
     result.push_back({name, "BF16", std::move(shape)});
+  };
+  const auto norm = [&](const std::string &name, uint64_t elements) {
+    std::vector<uint8_t> ones;
+    for (uint64_t i = 0; i < elements; ++i) ones.insert(ones.end(), {0x80, 0x3F});
+    result.push_back({name, "BF16", {elements}, std::move(ones)});
   };
   const auto quantized = [&](const std::string &module, uint64_t rows, uint64_t columns, uint64_t experts = 1) {
     const auto [bits, group] = quantization(module);
@@ -132,15 +138,15 @@ std::vector<SyntheticTensor> mlxTargetTensors(const Layout &layout, Quantization
   const uint64_t hidden = layout.hiddenSize;
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     const std::string prefix = "language_model.model.layers." + std::to_string(layer) + ".";
-    bfloat16(prefix + "input_layernorm.weight", {hidden});
+    norm(prefix + "input_layernorm.weight", hidden);
     if (layout.isFullAttentionLayer(layer)) {
       const std::string attention = prefix + "self_attn.";
       const uint64_t kv = uint64_t{layout.attentionKvHeads} * layout.attentionHeadDimension;
       quantized(attention + "q_proj", 2ull * layout.attentionWidth, hidden);
       quantized(attention + "k_proj", kv, hidden);
       quantized(attention + "v_proj", kv, hidden);
-      bfloat16(attention + "q_norm.weight", {layout.attentionHeadDimension});
-      bfloat16(attention + "k_norm.weight", {layout.attentionHeadDimension});
+      norm(attention + "q_norm.weight", layout.attentionHeadDimension);
+      norm(attention + "k_norm.weight", layout.attentionHeadDimension);
       quantized(attention + "o_proj", hidden, layout.attentionWidth);
     } else {
       const std::string gdn = prefix + "linear_attn.";
@@ -154,7 +160,7 @@ std::vector<SyntheticTensor> mlxTargetTensors(const Layout &layout, Quantization
       bfloat16(gdn + "norm.weight", {layout.gdnHeadDimension});
       quantized(gdn + "out_proj", hidden, layout.attentionWidth);
     }
-    bfloat16(prefix + "post_attention_layernorm.weight", {hidden});
+    norm(prefix + "post_attention_layernorm.weight", hidden);
     const std::string mlp = prefix + "mlp.";
     const auto ffn = [&](const std::string &projections, uint64_t width, uint64_t experts) {
       quantized(projections + "gate_proj", width, hidden, experts);
@@ -170,7 +176,7 @@ std::vector<SyntheticTensor> mlxTargetTensors(const Layout &layout, Quantization
       ffn(mlp, layout.intermediateSize, 1);
     }
   }
-  bfloat16("language_model.model.norm.weight", {hidden});
+  norm("language_model.model.norm.weight", hidden);
   quantized("language_model.lm_head", layout.vocabularySize, hidden);
   quantized("language_model.model.embed_tokens", layout.vocabularySize, hidden);
   return result;

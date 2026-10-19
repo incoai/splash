@@ -709,7 +709,8 @@ class UpstreamTest(unittest.TestCase):
             ):
                 self.prepare(selection(self.root, model, language_only=False))
 
-    def test_complete_mlx_tower_is_selected_but_not_downloaded_for_language_only(self):
+    def test_a_visual_tower_is_linked_but_not_downloaded_for_language_only(self):
+        # An MLX tower named visual.*, here of affine matrices.
         def target(root):
             mlx_target(root, DENSE)
             shards = {
@@ -717,7 +718,6 @@ class UpstreamTest(unittest.TestCase):
                 "visual.pos_embed.scales": "vision.safetensors",
                 "visual.pos_embed.biases": "vision.safetensors",
                 "language_model.lm_head.weight": "text.safetensors",
-                "mtp.pre_fc_norm_embedding.weight": "text.safetensors",
             }
             (root / "model.safetensors.index.json").write_text(
                 json.dumps({"weight_map": shards})

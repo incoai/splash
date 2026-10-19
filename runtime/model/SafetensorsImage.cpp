@@ -1,14 +1,17 @@
 #include "model/SafetensorsImage.hpp"
 
 #include "metal/abi/Gguf.h"
+#include "model/Bfloat16.hpp"
 #include "model/StateLayout.hpp"
 #include "model/WeightLayout.hpp"
 #include "model/WeightStore.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <initializer_list>
 #include <optional>
 #include <string_view>
+#include <utility>
 
 namespace splash::model::safetensors {
 namespace {
@@ -38,17 +41,17 @@ void requireWholeBlocks(const std::string &module, uint32_t format, uint64_t col
 class Builder {
 public:
   Builder(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry, ModuleNames names,
-          std::string name, uint32_t layer, uint32_t type)
-      : checkpoint_(checkpoint), geometry_(geometry), names_(names), image_(std::move(name), layer, type) {}
+          NormEncoding norms, std::string name, uint32_t layer, uint32_t type)
+      : checkpoint_(checkpoint), geometry_(geometry), names_(names), norms_(norms),
+        image_(std::move(name), layer, type) {}
 
-  // An RMSNorm's weight, which the norm kernels read (ops::NormWeights): as
-  // stored (bf16) from MLX names, or the F32 1 + w of the w transformers
-  // stores.
+  // An RMSNorm's weight, which the norm kernels read (ops::NormWeights): a
+  // stored 1 + w as stored (bf16), or the F32 1 + w of a stored w.
   void norm(const std::string &name, uint64_t elements) { normWeight(name, elements, Conversion::CenteredNorm); }
 
-  // The GDN's gated norm, whose weight both store as the norm multiplies by:
-  // as stored (bf16) from MLX names, or widened to F32 as the other norms of
-  // a transformers checkpoint's images are.
+  // The GDN's gated norm, whose weight every checkpoint stores as the norm
+  // multiplies by: as stored (bf16) beside stored 1 + w norms, or widened to
+  // F32 as the other norms of a checkpoint storing w are.
   void gatedNorm(const std::string &name, uint64_t elements) {
     normWeight(name, elements, Conversion::WidenToFloat32);
   }
@@ -60,7 +63,7 @@ public:
   void convolution(const std::string &name) {
     const uint64_t channels = geometry_.convolutionDimension, taps = kGdnConvolutionTaps;
     stored(name + ".weight", {"BF16"},
-           names_ != ModuleNames::Transformers ? std::vector<uint64_t>{channels, taps, 1}
+           names_ == ModuleNames::Mlx ? std::vector<uint64_t>{channels, taps, 1}
                                       : std::vector<uint64_t>{channels, 1, taps});
   }
 
@@ -88,7 +91,7 @@ public:
   // modules of their own transformers names, which must share a format.
   void experts(const std::string &mlp, const std::string &projection, uint64_t rows, uint64_t columns) {
     const uint64_t count = geometry_.experts;
-    if (names_ != ModuleNames::Transformers) {
+    if (names_ == ModuleNames::Mlx) {
       const std::string module = mlp + "switch_mlp." + projection;
       const std::optional<TensorRows> source = quantized(module, rows, columns, count);
       if (!source) throw WeightStoreError(module + " is unquantized; Splash loads quantized projections");
@@ -173,12 +176,12 @@ private:
     image_.copy(rows(name, tensor, ggml::kBF16, 1, tensor.bytes));
   }
 
-  // Stored BF16 norms, or the centered F32 norms of a complete MLX-LM or
-  // transformers export (with no offset for the GDN's gated norm).
-  void normWeight(const std::string &name, uint64_t elements, Conversion conversion) {
-    if (!float32Norms(names_)) return stored(name + ".weight", {"BF16"}, {elements});
+  // A norm's bf16 weight, as stored when the checkpoint stores 1 + w, or
+  // converted to F32 as `centered` says when it stores w.
+  void normWeight(const std::string &name, uint64_t elements, Conversion centered) {
+    if (!float32Norms(norms_)) return stored(name + ".weight", {"BF16"}, {elements});
     const SourceTensor &tensor = require(name + ".weight", {"BF16"}, {elements});
-    image_.copy(rows(name + ".weight", tensor, ggml::kBF16, 1, tensor.bytes), conversion);
+    image_.copy(rows(name + ".weight", tensor, ggml::kBF16, 1, tensor.bytes), centered);
   }
 
   // The module's native rows, which must be quantized.
@@ -265,6 +268,7 @@ private:
   const SafetensorsCheckpoint &checkpoint_;
   const QwenTargetDimensions &geometry_;
   const ModuleNames names_;
+  const NormEncoding norms_;
   gguf::ImageBuilder image_;
 };
 
@@ -282,7 +286,7 @@ struct QuantizedModules {
   void decay(const std::string &) {}
   void projection(const std::string &module, uint64_t, uint64_t) { modules.push_back(module); }
   void experts(const std::string &mlp, const std::string &projection, uint64_t, uint64_t) {
-    const std::string module = names == ModuleNames::Transformers ? mlp + "experts" : mlp + "switch_mlp." + projection;
+    const std::string module = names == ModuleNames::Mlx ? mlp + "switch_mlp." + projection : mlp + "experts";
     if (modules.empty() || modules.back() != module) modules.push_back(module);
   }
   void alphaBeta(const std::string &, const std::string &) {}
@@ -350,10 +354,40 @@ template <class Walk> void walkEmbedding(Walk &b, ModuleNames names) {
 } // namespace
 
 ModuleNames moduleNames(const SafetensorsCheckpoint &checkpoint) {
-  if (checkpoint.find("lm_head.weight") || checkpoint.find("lm_head.weight_packed")) return ModuleNames::Transformers;
-  if (checkpoint.find("mtp.pre_fc_norm_embedding.weight") && checkpoint.find("mtp.pre_fc_norm_hidden.weight"))
-    return ModuleNames::MlxFull;
-  return ModuleNames::Mlx;
+  return checkpoint.find("lm_head.weight") || checkpoint.find("lm_head.weight_packed") ? ModuleNames::Transformers
+                                                                                         : ModuleNames::Mlx;
+}
+
+NormEncoding normEncoding(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry) {
+  const ModuleNames names = moduleNames(checkpoint);
+  if (names == ModuleNames::Transformers) return NormEncoding::Centered;
+  const uint64_t elements = geometry.hiddenSize;
+  std::vector<uint8_t> weight(elements * sizeof(uint16_t));
+  // The encoding the input norm of `layer` shows, and that norm's name.
+  const auto encodingOf = [&](uint32_t layer) {
+    const std::string name = modelPrefix(names) + "layers." + std::to_string(layer) + ".input_layernorm.weight";
+    const SourceTensor &tensor = checkpoint.require(name);
+    if (tensor.dtype != "BF16" || tensor.shape != std::vector<uint64_t>{elements})
+      throw WeightStoreError("source tensor type or shape does not match: " + name);
+    tensor.read(0, weight);
+    uint64_t below = 0;
+    for (uint64_t i = 0; i < elements; ++i) {
+      uint16_t bits;
+      std::memcpy(&bits, weight.data() + i * sizeof(bits), sizeof(bits));
+      below += widenBfloat16(bits) < 0.5F;
+    }
+    if (4 * below > elements && 4 * below < 3 * elements)
+      throw WeightStoreError(name + " is neither an RMSNorm's 1 + w nor its w: " + std::to_string(below) + " of its " +
+                             std::to_string(elements) + " values are below 1/2");
+    return std::pair{4 * below <= elements ? NormEncoding::Multiplier : NormEncoding::Centered, name};
+  };
+  const auto [encoding, first] = encodingOf(0);
+  for (uint32_t layer = 1; layer < geometry.layers; ++layer)
+    if (const auto [other, name] = encodingOf(layer); other != encoding) {
+      const auto form = [](NormEncoding e) { return e == NormEncoding::Multiplier ? "1 + w" : "w"; };
+      throw WeightStoreError(first + " stores an RMSNorm's " + form(encoding) + " but " + name + " its " + form(other));
+    }
+  return encoding;
 }
 
 std::optional<gguf::TensorRows> mlxQuantizedRows(const SafetensorsCheckpoint &checkpoint, const std::string &module,
@@ -393,17 +427,19 @@ std::optional<gguf::TensorRows> mlxQuantizedRows(const SafetensorsCheckpoint &ch
 
 std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry) {
   const ModuleNames names = moduleNames(checkpoint);
+  const NormEncoding norms = normEncoding(checkpoint, geometry);
   std::vector<gguf::Image> images;
   for (uint32_t layer = 0; layer < geometry.layers; ++layer) {
-    Builder b(checkpoint, geometry, names, "layer-" + std::to_string(layer) + ".bin", layer,
+    Builder b(checkpoint, geometry, names, norms, "layer-" + std::to_string(layer) + ".bin", layer,
               geometry.isFullAttentionLayer(layer) ? 1u : 0u);
     walkLayer(b, geometry, names, layer);
     images.push_back(b.finish());
   }
-  Builder head(checkpoint, geometry, names, "head.bin", geometry.layers, 2);
+  Builder head(checkpoint, geometry, names, norms, "head.bin", geometry.layers, 2);
   walkHead(head, geometry, names);
   images.push_back(head.finish());
-  Builder embedding(checkpoint, geometry, names, "embedding.bin", geometry.vocabularySize, geometry.hiddenSize);
+  Builder embedding(checkpoint, geometry, names, norms, "embedding.bin", geometry.vocabularySize,
+                    geometry.hiddenSize);
   walkEmbedding(embedding, names);
   images.push_back(embedding.finish());
   return images;
