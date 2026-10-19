@@ -29,7 +29,7 @@
 // Threads of each group that selects a sampled row over the whole
 // vocabulary (decode_sample_vocabulary*); a bracket of at most this many
 // tokens is ordered in threadgroup memory, one token per thread.
-#define SPLASH_TARGET_VOCABULARY_THREADS 1024u
+#define SPLASH_TARGET_VOCABULARY_THREADS 256u
 // Groups that share such a row's draw, each over its own slice of the
 // vocabulary, so the eight rows of a lane spread over the GPU's cores.
 #define SPLASH_TARGET_VOCABULARY_GROUPS 8u

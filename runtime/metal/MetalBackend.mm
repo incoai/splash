@@ -759,13 +759,22 @@ struct MetalBackend::Impl {
             command.dispatches.push_back(item);
         }
 
+        // Name every dispatch whose group outgrows its pipeline, so a GPU
+        // with less room per group shows all it must shrink at once.
+        std::string oversized;
         for (PreparedDispatch &item : command.dispatches) {
             item.pipeline = pipeline(item.source->pipelineName);
             if (item.threadCount >
                 item.pipeline.maxTotalThreadsPerThreadgroup) {
-                throw MetalBackendError(
-                    "threadsPerThreadgroup exceeds pipeline capability");
+                oversized += (oversized.empty() ? "" : ", ") +
+                             item.source->pipelineName + " " +
+                             std::to_string(item.threadCount) + ">" +
+                             std::to_string(item.pipeline.maxTotalThreadsPerThreadgroup);
             }
+        }
+        if (!oversized.empty()) {
+            throw MetalBackendError(
+                "threadsPerThreadgroup exceeds pipeline capability: " + oversized);
         }
 
         // Each allocation the command binds, once.
