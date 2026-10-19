@@ -373,6 +373,9 @@ private:
                             const Projection &projection, const LinearPlan &plan) const;
   KernelCalibration calibration_;
   Int8Activations int8Activations_;
+  // Apple8 (M2) prefills from a half copy of each chunk's activations: its
+  // matmul2d runs half x half about 1.5x as fast as bfloat x half.
+  bool halfPrefillInput_ = false;
 };
 
 } // namespace splash::ops
