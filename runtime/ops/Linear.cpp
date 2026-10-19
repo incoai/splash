@@ -139,7 +139,8 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   requireConfiguration();
 }
 
-Linear::Linear(const DeviceCapabilities &device) noexcept : calibration_(KernelCalibration::of(device)) {}
+Linear::Linear(const DeviceCapabilities &device) noexcept
+    : calibration_(KernelCalibration::of(device)), halfPrefillInput_(device.appleGpuFamily < 9) {}
 
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
   // The None and Residual plans share a tile; a gate/up pair of one format
@@ -205,7 +206,10 @@ LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
       bound.include(plan({{shape.outputSize, shape.inputSize}, rows, LinearPhase::Prefill, epilogue}).scratchSize());
   // Every prefill plan stores at most the token budget.
   static_assert(SPLASH_PREFILL_TOKEN_BUDGET % GGUF_PREFILL_ROWS == 0, "the prefill tiles cover the budget exactly");
-  if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, SPLASH_PREFILL_TOKEN_BUDGET);
+  // The half copy of a chunk's activations on Apple8 (LinearGguf.cpp) takes
+  // the rotated rows' buffer, the same size.
+  if (shape.rotated || halfPrefillInput_)
+    bound.rotated = rotatedBytes(shape.inputSize, SPLASH_PREFILL_TOKEN_BUDGET);
   return bound;
 }
 

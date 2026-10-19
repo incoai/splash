@@ -337,7 +337,10 @@ int main(int argc, char **argv) {
         auto *x = static_cast<__bf16 *>(input.contents());
         for (uint64_t i = 0; i < rows * K; ++i) x[i] = __bf16(unit(rng));
       }
-      const LinearScratch scratch{zeros(size.input), zeros(size.sums), zeros(size.partials), zeros(size.counters)};
+      // The rotated rows' buffer as the runtime sizes it: Apple8's prefill tiles read their half input there.
+      if (prefill) size.include(linear.prefillScratchSize({N, K}));
+      const LinearScratch scratch{zeros(size.input), zeros(size.sums), zeros(size.partials), zeros(size.counters),
+                                  zeros(size.rotated)};
       // The register tile's table, prepared by its widest plan, whose plans of fewer rows read its leading tiles.
       PreparedInput table;
       const Case *widest = nullptr;
