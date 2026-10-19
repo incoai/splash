@@ -14,7 +14,7 @@ It reuses cached prefixes and batches concurrent requests automatically.
 
 ## Quick start
 
-Apple M3 or newer, macOS 26.4 or later, and [Homebrew](https://brew.sh).
+Apple M2 or newer, macOS 26.4 or later, and [Homebrew](https://brew.sh).
 The 4-bit examples need at least 36 GB of unified memory (48 GB recommended);
 24 GB Macs can use [smaller GGUF variants](#models).
 
