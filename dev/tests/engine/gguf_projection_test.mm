@@ -269,19 +269,22 @@ std::vector<uint16_t> storageRows(const std::vector<float> &x, uint32_t width, u
   return rows;
 }
 
-// A plan's split scratch, as LinearPlan::scratchSize sizes it (the largest of several plans that share it).
+// A plan's split scratch, as LinearPlan::scratchSize sizes it (the largest of several plans that share it), and the
+// rotated rows' buffer a prefill plan takes as Linear::prefillScratchSize sizes it (Apple8's half input).
 struct Scratch {
-  Guarded table, sums, partials, counters;
+  Guarded table, sums, partials, counters, rotated;
   Scratch(MetalBackend &backend, LinearScratchSize size)
       : table(backend, size.input, 0), sums(backend, size.sums, 0), partials(backend, size.partials, 0),
-        counters(backend, size.counters, 0) {}
-  [[nodiscard]] LinearScratch bindings() const { return {table.view, sums.view, partials.view, counters.view}; }
+        counters(backend, size.counters, 0), rotated(backend, size.rotated, 0) {}
+  [[nodiscard]] LinearScratch bindings() const {
+    return {table.view, sums.view, partials.view, counters.view, rotated.view};
+  }
   void poison(uint32_t bits) const {
     if (partials.bytes) std::fill_n(static_cast<uint32_t *>(partials.view.contents()), partials.bytes / 4, bits);
   }
   [[nodiscard]] bool intact() const {
     const auto *count = static_cast<const uint32_t *>(counters.view.contents());
-    return table.intact() && sums.intact() && partials.intact() && counters.intact() &&
+    return table.intact() && sums.intact() && partials.intact() && counters.intact() && rotated.intact() &&
            std::all_of(count, count + counters.bytes / 4, [](uint32_t c) { return c == 0; });
   }
 };
@@ -314,11 +317,25 @@ struct Outcome {
 Outcome run(MetalBackend &backend, const Linear &linear, const LinearPlan &plan, const Projection &p,
             const Projection *gate, const std::vector<uint16_t> &x, const std::vector<uint16_t> &aux, uint32_t poison,
             uint32_t covered, const std::string &label) {
-  const Scratch scratch(backend, plan.scratchSize());
+  LinearScratchSize size = plan.scratchSize();
+  const LinearWorkload w = plan.workload();
+  if (w.phase == LinearPhase::Prefill) size.include(linear.prefillScratchSize({w.matrix.outputSize, w.matrix.inputSize}));
+  const Scratch scratch(backend, size);
   const Operands o(backend, plan, x, aux);
   scratch.poison(poison);
   CommandGraph graph;
   static_cast<void>(linear.add(graph, o.bindings(plan, scratch), p, plan, gate));
+  // Apple8's prefill tiles read the half copy of their rows (LinearGguf.cpp), the other families' the bf16 rows.
+  if (plan.configuration().tile == LinearTile::GgufPrefill) {
+    const bool apple8 = backend.capabilities().appleGpuFamily < 9;
+    for (const ComputeDispatch &dispatch : graph.dispatches()) {
+      const std::string &name = dispatch.pipelineName;
+      if (name.rfind("gguf_prefill_", 0) || name == "gguf_prefill_input_half") continue;
+      const bool half = name.find("_h_leading_inputs") != std::string::npos ||
+                        (name.size() > 2 && name.compare(name.size() - 2, 2, "_h") == 0);
+      if (half != apple8) fail(label + ": " + name + (apple8 ? " reads bf16 rows on Apple8" : " reads half rows"));
+    }
+  }
   // A spread plan's dispatches are staged decode tiles, each binding its parameters with spread set.
   if (plan.configuration().spread)
     for (const ComputeDispatch &dispatch : graph.dispatches()) {

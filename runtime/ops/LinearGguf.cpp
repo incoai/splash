@@ -27,8 +27,8 @@ constexpr uint32_t stagedTileRows(uint32_t rows) noexcept { return rows <= 8 ? 8
 std::string decodeKernel(const char *format, uint32_t rows, char epilogue) {
   return std::string("gguf_decode_") + format + "_m" + std::to_string(rows) + "_" + epilogue;
 }
-std::string prefillKernel(const char *format, char epilogue) {
-  return std::string("gguf_prefill_") + format + "_" + epilogue;
+std::string prefillKernel(const char *format, char epilogue, bool halfInput = false) {
+  return std::string("gguf_prefill_") + format + "_" + epilogue + (halfInput ? "_h" : "");
 }
 
 // K splits of a decode tile, one rule for both tiles. A tier asks for more
@@ -448,6 +448,19 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
   const auto [n, k] = w.matrix;
   const char epilogue = epilogueSuffix(w.epilogue);
   const uint32_t rowTiles = plan.storageRows() / GGUF_PREFILL_ROWS;
+  // On Apple8 the tiles read a half copy of the chunk's rows in the rotated
+  // rows' buffer: in place when the input is that buffer already (a rotated
+  // projection), each thread converting its own values. The padding rows keep
+  // what they held, whose outputs the tiles discard as they do the bfloat
+  // padding's. Without the buffer, the bfloat tiles run.
+  const uint64_t inputValues = uint64_t{w.rows} * k;
+  const bool halfInput = halfPrefillInput_ && b.scratch.rotated.sizeBytes() >= inputValues * 2;
+  const metal::MetalBuffer input = halfInput ? b.scratch.rotated : b.input;
+  if (halfInput) {
+    const uint32_t count = static_cast<uint32_t>(inputValues / 4);
+    graph.add("gguf_prefill_input_half", {b.input, b.scratch.rotated}, count, {(count + 255) / 256, 1, 1},
+              {256, 1, 1});
+  }
   if (w.epilogue == LinearEpilogue::None && !p.planeInputs()) {
     const std::vector<QuantizedSegment> &segments = p.blocks().segments;
     std::vector<uint32_t> formats;
@@ -459,7 +472,7 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
         if (s.formatId == format) group.push_back(&s);
       if (group.size() > kFusedSegments) throw std::invalid_argument("a block prefill takes at most three segments");
       GgufPrefillSegmentsParams params{k, w.rows, n, {0, 0, 0}, {0, 0, 0}};
-      std::vector<metal::MetalBuffer> bindings{b.input};
+      std::vector<metal::MetalBuffer> bindings{input};
       uint32_t columns = 0;
       for (size_t i = 0; i < kFusedSegments; ++i) {
         // Slots past the group's last segment bind its planes, which no tile reads.
@@ -472,21 +485,22 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
         bindings.insert(bindings.end(), {s.plane0, s.plane1Slot(), s.meta});
       }
       bindings.push_back(b.output);
-      graph.add(prefillKernel(group.front()->name(), epilogue), std::move(bindings), params,
+      graph.add(prefillKernel(group.front()->name(), epilogue, halfInput), std::move(bindings), params,
                 {rowTiles, columns / GGUF_TILE_COLUMNS, 1}, {GGUF_PREFILL_THREADS, 1, 1});
     }
     return;
   }
   for (const QuantizedSegment &s : p.blocks().segments) {
-    std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
+    std::vector<metal::MetalBuffer> bindings{input, s.plane0, s.plane1Slot(), s.meta, b.output};
     if (w.epilogue != LinearEpilogue::None) bindings.push_back(epilogueInput(b, w.epilogue));
     const GgufPrefillParams params{k, w.rows, n, s.columnOffset};
     const metal::DispatchSize groups{rowTiles, s.outputSize / GGUF_TILE_COLUMNS, 1};
     if (p.planeInputs())
-      graph.add(leadingInputsInstance(prefillKernel(s.name(), epilogue)), std::move(bindings),
+      graph.add(leadingInputsInstance(prefillKernel(s.name(), epilogue, halfInput)), std::move(bindings),
                 GgufPrefillLeadingParams{params, p.planeInputs()}, groups, {GGUF_PREFILL_THREADS, 1, 1});
     else
-      graph.add(prefillKernel(s.name(), epilogue), std::move(bindings), params, groups, {GGUF_PREFILL_THREADS, 1, 1});
+      graph.add(prefillKernel(s.name(), epilogue, halfInput), std::move(bindings), params, groups,
+                {GGUF_PREFILL_THREADS, 1, 1});
   }
 }
 

@@ -18,8 +18,9 @@ constant constexpr uint kStagedStages = GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS 
 
 // The destination of a Rows-row tile, zeroed by the caller: returning an initialized cooperative tensor loses its
 // initial values on Apple9 in runtime-format kernels (also with shader validation).
-template <ushort Rows, ushort Cols, ushort KS>
-inline auto staged_accumulator(device bfloat *input, uint input_size, threadgroup half *stage) {
+// In is the activations' type: bfloat, or half for the Apple8 prefill tile (kernels/shared/gguf_linear.metal).
+template <ushort Rows, ushort Cols, ushort KS, class In>
+inline auto staged_accumulator(device In *input, uint input_size, threadgroup half *stage) {
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
   constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<descriptor, execution_simdgroups<1>> operation;
@@ -61,8 +62,8 @@ inline uint staged_first_step(uint tile, uint step_begin, uint step_end, uint sp
 // payload while the step's matmul runs, and so its meta unit when the next step enters a new one (a unit spans
 // F::MetaGroups groups): both DRAM round trips overlap a matmul. Both go to the registers the step has just
 // dequantized from, so the prefetch holds no second meta unit.
-template <class F, ushort Rows, ushort Cols, ushort KS, ushort Threads, class Acc>
-inline void gguf_staged_steps(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size,
+template <class F, ushort Rows, ushort Cols, ushort KS, ushort Threads, class Acc, class In>
+inline void gguf_staged_steps(device In *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size,
                               uint output_origin, threadgroup half *stage, threadgroup half2 *tl, uint thread_index,
                               uint step_begin, uint step_end, uint step_first, bool matmuls, thread Acc &acc) {
   constexpr ushort GPS = KS / 32, Items = Cols * GPS, IPT = (Items + Threads - 1) / Threads;

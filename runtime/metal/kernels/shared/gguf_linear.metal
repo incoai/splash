@@ -1,4 +1,4 @@
-// GGUF quantized GEMMs (K-quants, i-quants, Q8_0) for Apple9 and Apple10.
+// GGUF quantized GEMMs (K-quants, i-quants, Q8_0) for Apple8, Apple9 and Apple10.
 // Decode weights with FP32 group coefficients, then round once to the half tile,
 // matching llama.cpp Metal dequantize.h / mul_mm.metal (MIT notice in THIRD_PARTY_NOTICES). Keep activations BF16.
 // Weight planes and meta in the MDGG0001 layout (metal/abi/QuantFormat.h), decoded by kernels/common/quant_formats.h.
@@ -32,13 +32,14 @@ inline void gguf_store_sums(thread Acc &acc, uint splits, uint split, device coh
 // rows. `rows` counts the chunk's rows from the tile's first: simdgroups past them (the last tile of a chunk that is not
 // a multiple of the tile) skip their matmuls and stores, so a chunk costs its rows rounded up to RowsPerSG rather than
 // to the tile (a 33-row Q4_K 17408 x 5120 chunk: 1.7x faster on M5 and M3 than a 128-row tile). Full tiles run this
-// loop too; a branch-free copy for them is no faster (M3 Max, M5 Max).
-template <class F, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, GgufEpilogue Ep = EpNone>
-inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
+// loop too; a branch-free copy for them is no faster (M3 Max, M5 Max). In is bfloat, or half on Apple8, whose
+// matmul2d runs half x half about 1.5x as fast as bfloat x half (gguf_prefill_input_half below).
+template <class F, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, GgufEpilogue Ep = EpNone, class In>
+inline void gguf_prefill_tile(device In *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
                     uint input_size, uint output_origin, uint rows, threadgroup half *stage, threadgroup half2 *tl,
                     uint simd_lane, uint simd_group, uint out_stride, uint out_offset, device bfloat *aux = nullptr) {
   const bool owns_rows = simd_group * RowsPerSG < rows;   // uniform per simdgroup
-  device bfloat *rows_input = input + ulong(simd_group) * RowsPerSG * input_size;
+  device In *rows_input = input + ulong(simd_group) * RowsPerSG * input_size;
   auto acc = staged_accumulator<RowsPerSG, TileN, KS>(rows_input, input_size, stage);
   gguf_zero(acc);
   gguf_staged_steps<F, RowsPerSG, TileN, KS, Simdgroups * 32>(rows_input, w0, w1, meta, input_size, output_origin, stage, tl,
@@ -232,8 +233,8 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32)
 
 // The prefill kernels: grid (GGUF_PREFILL_ROWS-row tiles of the chunk, column tiles), four simdgroups; the residual
 // and gate kernels run one tensor and read aux at buffer 5.
-#define GGUF_PREFILL_BUFFERS                                                                                       \
-  device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]], device uchar *w1 [[buffer(2)]],             \
+#define GGUF_PREFILL_BUFFERS(In)                                                                                   \
+  device In *input [[buffer(0)]], device uchar *w0 [[buffer(1)]], device uchar *w1 [[buffer(2)]],             \
       device uchar *meta [[buffer(3)]], device bfloat *output [[buffer(4)]]
 #define GGUF_PREFILL_THREAD                                                                                        \
   uint2 group [[threadgroup_position_in_grid]], uint simd_lane [[thread_index_in_simdgroup]],                      \
@@ -244,8 +245,8 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32)
   threadgroup half stage[kPrefillStages]
 // The plain kernel takes up to three segments of its format (GgufPrefillSegmentsParams), so the segments of a fused
 // projection that share a format run as one dispatch, grid.y over their column tiles in segment order.
-#define GGUF_PREFILL(F, f)                                                                                         \
-  kernel void gguf_prefill_##f##_a(device bfloat *input [[buffer(0)]], GGUF_SEGMENTS,                            \
+#define GGUF_PREFILL(F, f, In, S)                                                                                  \
+  kernel void gguf_prefill_##f##_a##S(device In *input [[buffer(0)]], GGUF_SEGMENTS,                             \
                                    device bfloat *output [[buffer(10)]],                                          \
                                    constant GgufPrefillSegmentsParams &p [[buffer(11)]], GGUF_PREFILL_THREAD) {    \
     GGUF_PREFILL_TABLES(F);                                                                                        \
@@ -256,8 +257,8 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32)
                                          local * GGUF_TILE_COLUMNS, rows, stage, tl, simd_lane, simd_group,        \
                                          p.out_stride, p.offset[s]);                                               \
   }
-#define GGUF_PREFILL_EPILOGUE(F, f, ep, Ep)                                                                        \
-  kernel void gguf_prefill_##f##_##ep(GGUF_PREFILL_BUFFERS, device bfloat *aux [[buffer(5)]],                    \
+#define GGUF_PREFILL_EPILOGUE(F, f, ep, Ep, In, S)                                                                 \
+  kernel void gguf_prefill_##f##_##ep##S(GGUF_PREFILL_BUFFERS(In), device bfloat *aux [[buffer(5)]],             \
                                       constant GgufPrefillParams &p [[buffer(6)]], GGUF_PREFILL_THREAD) {          \
     GGUF_PREFILL_TABLES(F);                                                                                        \
     const uint first = group.x * GGUF_PREFILL_ROWS, rows = p.rows > first ? p.rows - first : 0;                    \
@@ -266,17 +267,37 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32)
                                              group.y * GGUF_TILE_COLUMNS, rows, stage, tl, simd_lane, simd_group,  \
                                              p.out_stride, p.out_offset, aux + ulong(first) * p.out_stride);       \
   }
-#define GGUF_PREFILL_FORMAT(F, f) \
-  GGUF_PREFILL(F, f) GGUF_PREFILL_EPILOGUE(F, f, r, EpResidual) GGUF_PREFILL_EPILOGUE(F, f, g, EpUpWithGate)
+#define GGUF_PREFILL_FORMAT(F, f)                                                                                  \
+  GGUF_PREFILL(F, f, bfloat, ) GGUF_PREFILL_EPILOGUE(F, f, r, EpResidual, bfloat, )                              \
+  GGUF_PREFILL_EPILOGUE(F, f, g, EpUpWithGate, bfloat, )
 QUANT_FORMATS(GGUF_PREFILL_FORMAT)
 #undef GGUF_PREFILL_FORMAT
+// The Apple8 instances, which read the chunk's activations as half (gguf_prefill_input_half).
+#define GGUF_PREFILL_FORMAT_HALF(F, f)                                                                             \
+  GGUF_PREFILL(F, f, half, _h) GGUF_PREFILL_EPILOGUE(F, f, r, EpResidual, half, _h)                              \
+  GGUF_PREFILL_EPILOGUE(F, f, g, EpUpWithGate, half, _h)
+QUANT_FORMATS(GGUF_PREFILL_FORMAT_HALF)
+#undef GGUF_PREFILL_FORMAT_HALF
+
+// bf16 activations to half for the Apple8 prefill instances, four per thread. Every bf16 value of half's normal range
+// converts exactly (8 significand bits in 11), so half x half products, exact in fp32, equal the bfloat x half ones;
+// finite magnitudes past half's largest finite value saturate rather than turn infinite, and those below 2^-17 round.
+// NaN and infinities pass through, so a non-finite row still fails its lane (model_runtime_oracle_test).
+kernel void gguf_prefill_input_half(device const bfloat4 *input [[buffer(0)]], device half4 *output [[buffer(1)]],
+                                    constant uint &count [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+  if (i >= count) return;
+  const float4 x = float4(input[i]);
+  // The exponent's bits, not isnan/isinf, which fast math may fold.
+  const bool4 nonFinite = (as_type<uint4>(x) & 0x7f800000u) == 0x7f800000u;
+  output[i] = select(half4(clamp(x, -65504.0f, 65504.0f)), half4(x), nonFinite);
+}
 
 // The residual kernels over a view of the leading inputs of wider weight rows, for the Neural Engine FFN split's down
 // projection, one per format. Each runs the tile of its residual kernel on the planes advanced past the groups and
 // meta units the view leaves unread in the rows of the plane tiles before its column tile, which the tile then
 // addresses as rows of input_size inputs.
-#define GGUF_PREFILL_LEADING_INPUTS(F, f)                                                                          \
-  kernel void gguf_prefill_##f##_r_leading_inputs(GGUF_PREFILL_BUFFERS, device bfloat *aux [[buffer(5)]],          \
+#define GGUF_PREFILL_LEADING_INPUTS(F, f, In, S)                                                                   \
+  kernel void gguf_prefill_##f##_r##S##_leading_inputs(GGUF_PREFILL_BUFFERS(In), device bfloat *aux [[buffer(5)]], \
                                                   constant GgufPrefillLeadingParams &leading [[buffer(6)]],        \
                                                   GGUF_PREFILL_THREAD) {                                           \
     GGUF_PREFILL_TABLES(F);                                                                                        \
@@ -292,7 +313,12 @@ QUANT_FORMATS(GGUF_PREFILL_FORMAT)
                                   p.input_size, group.y * GGUF_TILE_COLUMNS, rows, stage, tl, simd_lane,           \
                                   simd_group, p.out_stride, p.out_offset, aux + ulong(first) * p.out_stride);      \
   }
-QUANT_FORMATS(GGUF_PREFILL_LEADING_INPUTS)
+#define GGUF_PREFILL_LEADING_INPUTS_BF16(F, f) GGUF_PREFILL_LEADING_INPUTS(F, f, bfloat, )
+#define GGUF_PREFILL_LEADING_INPUTS_HALF(F, f) GGUF_PREFILL_LEADING_INPUTS(F, f, half, _h)
+QUANT_FORMATS(GGUF_PREFILL_LEADING_INPUTS_BF16)
+QUANT_FORMATS(GGUF_PREFILL_LEADING_INPUTS_HALF)
+#undef GGUF_PREFILL_LEADING_INPUTS_HALF
+#undef GGUF_PREFILL_LEADING_INPUTS_BF16
 #undef GGUF_PREFILL_LEADING_INPUTS
 #undef GGUF_PREFILL_EPILOGUE
 #undef GGUF_PREFILL
