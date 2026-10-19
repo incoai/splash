@@ -56,12 +56,25 @@ enum class NormEncoding : uint8_t { Multiplier, Centered };
 // stored, in bf16.
 [[nodiscard]] constexpr bool float32Norms(NormEncoding norms) noexcept { return norms == NormEncoding::Centered; }
 
-// The native rows of an MLX quantized module, inferred from its codes,
-// scales and biases and validated against its dimensions; none when it has
-// no scales. The checkpoint outlives the returned rows.
-[[nodiscard]] std::optional<gguf::TensorRows>
-mlxQuantizedRows(const SafetensorsCheckpoint &checkpoint, const std::string &module,
-                 uint64_t rows, uint64_t columns, uint64_t experts = 1);
+// How MLX quantizes a module, as it infers it from the module's codes
+// [experts, rows, columns * bits / 32] (U32) and scales [experts, rows, columns
+// / group size]: bf16 scales beside bf16 biases (affine), uint8 E8M0 exponents
+// (mxfp4, 4 bits in groups of 32) or uint8 E4M3 scales (nvfp4, 4 bits in
+// groups of 16). format is GGUF_FMT_COUNT for any other bits, group size or
+// scales.
+struct MlxQuantization {
+  uint32_t format;
+  uint64_t bits, group;
+  gguf::SafetensorsSource tensors; // its codes, scales and an affine module's biases
+};
+
+// The quantization of an MLX module of rows x columns weights (of each of
+// `experts`); none when the checkpoint holds its weight unquantized, without
+// scales. Codes, scales or biases of other types or shapes are refused. The
+// checkpoint outlives the tensors.
+[[nodiscard]] std::optional<MlxQuantization> mlxQuantization(const SafetensorsCheckpoint &checkpoint,
+                                                             const std::string &module, uint64_t rows,
+                                                             uint64_t columns, uint64_t experts = 1);
 
 // The layers' images, then the head's and the embedding's. The checkpoint
 // outlives them: their rows read its tensors.

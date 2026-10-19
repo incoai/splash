@@ -66,52 +66,57 @@ vision::Input input(std::string name, SourceTensor tensor) {
   return {std::move(name), std::move(tensor)};
 }
 
-// MLX-VLM's vision_tower.* and complete MLX-LM exports' visual.* use Conv3d
-// weights [output, frame, patch-row, patch-col, channel]. Transformers keeps
-// model.visual.* in [output, channel, frame, patch-row, patch-col] order.
+// A safetensors checkpoint's tower: MLX's vision_tower.* or visual.*, or
+// transformers' model.visual.* (as Model Optimizer keeps it). Its patch
+// embedding is one Conv3d weight, [output, frame, patch-row, patch-col,
+// channel] as MLX stores it, or [output, channel, frame, patch-row, patch-col]
+// as transformers does, the image's order, which the writer copies as stored.
+// Every other tensor is BF16, F16 or F32, but a matrix may be MLX affine: U32
+// codes beside bf16 scales and biases.
 void bindCheckpoint(const SafetensorsCheckpoint &checkpoint, const ops::VisionLayout &layout, Plan &plan) {
   const uint64_t p = layout.patchSize;
-  const std::string mlxPrefix = "vision_tower.", transformersPrefix = "model.visual.";
-  const bool transformers = checkpoint.find("model.visual.patch_embed.proj.weight") != nullptr;
+  const std::string mlxPrefix = "vision_tower.";
+  // The first prefix whose patch embedding the checkpoint holds, or MLX's,
+  // which a checkpoint without a tower then lacks.
   std::string prefix = mlxPrefix;
-  if (transformers) prefix = transformersPrefix;
-  else if (!checkpoint.find("vision_tower.patch_embed.proj.weight") &&
-           checkpoint.find("visual.patch_embed.proj.weight"))
-    prefix = "visual.";
+  for (const std::string candidate : {"vision_tower.", "visual.", "model.visual."})
+    if (checkpoint.find(candidate + "patch_embed.proj.weight")) {
+      prefix = candidate;
+      break;
+    }
   for (auto &s : plan.sections) {
-    std::string name = prefix;
-    name.append(s.mlx, mlxPrefix.size(), std::string::npos);
+    const std::string name = prefix + s.mlx.substr(mlxPrefix.size());
+    const SourceTensor &tensor = checkpoint.require(name);
     if (name.ends_with(".weight")) {
-      const auto stem = name.substr(0, name.rfind('.'));
-      std::string scaleName = stem + ".scales";
-      const SourceTensor *scales = checkpoint.find(scaleName);
-      if (scales && !s.patch && s.columns > 1) {
-        const auto source = safetensors::mlxQuantizedRows(checkpoint, stem, s.rows, s.columns);
-        const uint32_t format = gguf_format_of(source->type);
-        if (quant_affine_format(format)) {
-          s.inputs.push_back({std::move(name), *source->safetensors.codes, source->safetensors.scales,
-                              source->safetensors.biases, quant_affine_bits(format),
-                              kQuantFormats[format].block_elements});
+      const std::string module = name.substr(0, name.rfind('.'));
+      if (tensor.dtype == "U32" && s.columns > 1 && !s.patch)
+        if (const auto mlx = safetensors::mlxQuantization(checkpoint, module, s.rows, s.columns)) {
+          if (!quant_affine_format(mlx->format))
+            throw WeightStoreError("vision tensor " + name + " in " + tensor.file->path().string() + " is " +
+                                   std::to_string(mlx->bits) + "-bit in groups of " + std::to_string(mlx->group) +
+                                   " with " + mlx->tensors.scales->dtype + " scales; preparation decodes MLX "
+                                   "affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64 or 128");
+          s.inputs.push_back({name, tensor, mlx->tensors.scales, mlx->tensors.biases, uint32_t(mlx->bits),
+                              uint32_t(mlx->group)});
           continue;
         }
-      }
-      if (!scales) {
-        scaleName = stem + ".weight_scale";
-        scales = checkpoint.find(scaleName);
-      }
-      if (scales)
-        throw WeightStoreError("unsupported quantized vision tensor (" + scaleName + " in " +
-                               scales->file->path().string() + "); preparation reads MLX affine matrices "
-                               "or BF16, F16 and F32 tensors");
+      // Any other quantized weight keeps its scales beside it too.
+      for (const auto &scales : {module + ".scales", module + ".weight_scale"})
+        if (const SourceTensor *quantized = checkpoint.find(scales))
+          throw WeightStoreError("unsupported quantized vision tensor (" + scales + " in " +
+                                 quantized->file->path().string() + "); preparation reads BF16, F16 or F32 "
+                                 "tensors and MLX affine matrices");
     }
-    const auto &tensor = checkpoint.require(name);
-    const std::vector<uint64_t> shape = s.patch          ? transformers ? std::vector<uint64_t>{s.rows, 3, 2, p, p}
-                                                                        : std::vector<uint64_t>{s.rows, 2, p, p, 3}
+    const std::vector<uint64_t> imageOrder{s.rows, 3, 2, p, p};
+    const bool copied = s.patch && tensor.shape == imageOrder;
+    const std::vector<uint64_t> shape = copied           ? imageOrder
+                                        : s.patch        ? std::vector<uint64_t>{s.rows, 2, p, p, 3}
                                         : s.columns == 1 ? std::vector<uint64_t>{s.rows}
                                                          : std::vector<uint64_t>{s.rows, s.columns};
     if (tensor.shape != shape) throw WeightStoreError("vision tensor shape mismatch: " + name);
-    if (transformers) s.patch = false;
-    s.inputs.push_back(input(std::move(name), tensor));
+    // A patch embedding in the image's order needs no reordering.
+    if (copied) s.patch = false;
+    s.inputs.push_back(input(name, tensor));
   }
 }
 

@@ -37,13 +37,17 @@ bool convert(const SourceTensor &tensor, const uint8_t *source, uint16_t *destin
   return true;
 }
 
+// The source bytes of one row of `columns` values of in: an affine matrix's
+// codes and its groups' scales and biases, or the values in their dtype.
 uint64_t sourceRowBytes(const Input &in, uint32_t columns) {
   if (in.bits) return uint64_t(columns) * in.bits / 8 + uint64_t(columns / in.group) * 4;
   return uint64_t(columns) * elementBytes(in.tensor);
 }
 
-// Read each affine plane once for a batch, then decode directly into the
-// image's strided BF16 rows. The thread reuses its one staging allocation.
+// Converts count rows of an affine matrix from row `first` to rows of stride
+// BF16 values, each s * q + z rounded to the nearest BF16: the rows' codes,
+// packed in.bits each from the lowest bit up, scales and biases are read once
+// into staging.
 void convertAffine(const Input &in, uint32_t first, uint32_t count, uint32_t columns,
                    uint16_t *destination, uint32_t stride, std::vector<uint8_t> &staging) {
   const uint64_t codeRowBytes = uint64_t(columns) * in.bits / 8;

@@ -61,7 +61,8 @@ int main(int argc, char **argv) {
       return 0;
     }
     if (argc != 4)
-      throw std::runtime_error("usage: vision-preparation safetensors|affine|gguf DIRECTORY EXPECTED | padding DIRECTORY");
+      throw std::runtime_error(
+          "usage: vision-preparation safetensors|affine|gguf DIRECTORY EXPECTED | padding DIRECTORY");
     const std::string format = argv[1];
     if (format != "safetensors" && format != "affine" && format != "gguf")
       throw std::runtime_error("invalid vision-preparation arguments");

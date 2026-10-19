@@ -13,8 +13,8 @@ namespace splash::model {
   return static_cast<uint16_t>(bits >> 16);
 }
 
-// Nearest BF16, ties to even; keep NaNs as NaNs rather than rounding a
-// payload into an infinity. MLX affine dequantization returns this BF16.
+// The bits of the bf16 nearest value, ties to even; a NaN stays a NaN rather
+// than rounding into an infinity.
 [[nodiscard]] inline uint16_t nearestBfloat16(float value) {
   const auto bits = std::bit_cast<uint32_t>(value);
   if ((bits & 0x7FFFFFFFu) > 0x7F800000u) return static_cast<uint16_t>((bits >> 16) | 0x40u);

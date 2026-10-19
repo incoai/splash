@@ -30,12 +30,6 @@ std::string headName(ModuleNames names) {
   return names == ModuleNames::Transformers ? "lm_head" : "language_model.lm_head";
 }
 
-void requireWholeBlocks(const std::string &module, uint32_t format, uint64_t columns) {
-  if (columns % kQuantFormats[format].block_elements)
-    throw WeightStoreError(module + "'s rows are not whole " + kQuantFormats[format].name + " blocks of " +
-                           std::to_string(kQuantFormats[format].block_elements) + " elements");
-}
-
 // Plans one image from the checkpoint's tensors, which must have the dtypes
 // and shapes its target reads.
 class Builder {
@@ -194,16 +188,22 @@ private:
   // The module's native rows when the checkpoint holds it quantized, in the
   // format its tensors hold (metal/abi/QuantFormat.h); none when the
   // checkpoint holds the module's weight unquantized; a module without a
-  // weight is a missing source tensor. MLX's format is the one
-  // MLX infers from codes [experts, rows, columns * bits / 32] (U32) and
-  // scales [experts, rows, columns / group size]: bf16 with bf16 biases
-  // (affine), uint8 E8M0 exponents (mxfp4, 4 bits in groups of 32) or uint8
-  // E4M3 scales (nvfp4, 4 bits in groups of 16). Model Optimizer's and
-  // compressed-tensors' (floatQuantized) is the one their tensor types state.
+  // weight is a missing source tensor. MLX's format is the one MLX infers
+  // (mlxQuantization), Model Optimizer's and compressed-tensors'
+  // (floatQuantized) the one their tensor types state.
   std::optional<TensorRows> quantized(const std::string &module, uint64_t rows, uint64_t columns,
                                       uint64_t experts = 1) const {
     if (experts == 1 && checkpoint_.find(module + ".weight_scale")) return floatQuantized(module, rows, columns);
-    return mlxQuantizedRows(checkpoint_, module, rows, columns, experts);
+    const std::optional<MlxQuantization> mlx = mlxQuantization(checkpoint_, module, rows, columns, experts);
+    if (!mlx) return std::nullopt;
+    if (mlx->format == GGUF_FMT_COUNT)
+      throw WeightStoreError(module + " is " + std::to_string(mlx->bits) + "-bit in groups of " +
+                             std::to_string(mlx->group) + " with " + mlx->tensors.scales->dtype +
+                             " scales; MLX weights load as affine 2, 3, 4, 5, 6 or 8 bits in groups of 32, 64 or "
+                             "128 with bf16 scales, or as mxfp4 or nvfp4");
+    requireWholeBlocks(module, mlx->format, columns);
+    return TensorRows{module, kQuantFormats[mlx->format].ggml_type, 0, experts * rows,
+                      ggufRowBytes(kQuantFormats[mlx->format], columns), {}, mlx->tensors.codes->file, mlx->tensors};
   }
 
   // A module's native rows in NVFP4 or FP8 as Model Optimizer and
@@ -251,6 +251,13 @@ private:
                    checkpoint_.require(name).shape.empty() ? std::vector<uint64_t>{} : std::vector<uint64_t>{1});
   }
 
+  // Native rows hold whole native blocks of the module's format; only nvfp4's
+  // and fp8's, of 256 elements, are wider than its groups.
+  static void requireWholeBlocks(const std::string &module, uint32_t format, uint64_t columns) {
+    if (columns % kQuantFormats[format].block_elements)
+      throw WeightStoreError(module + "'s rows are not whole " + kQuantFormats[format].name + " blocks of " +
+                             std::to_string(kQuantFormats[format].block_elements) + " elements");
+  }
 
   // The F32 values of a [rows, columns] module at `destination`: its
   // quantization's values, or its bf16 or F32 weight.
@@ -390,39 +397,34 @@ NormEncoding normEncoding(const SafetensorsCheckpoint &checkpoint, const QwenTar
   return encoding;
 }
 
-std::optional<gguf::TensorRows> mlxQuantizedRows(const SafetensorsCheckpoint &checkpoint, const std::string &module,
+std::optional<MlxQuantization> mlxQuantization(const SafetensorsCheckpoint &checkpoint, const std::string &module,
                                                uint64_t rows, uint64_t columns, uint64_t experts) {
   const SourceTensor &codes = checkpoint.require(module + ".weight");
   const SourceTensor *scales = checkpoint.find(module + ".scales");
   if (!scales) return std::nullopt;
-  const size_t dimensions = experts > 1 ? 3 : 2;
+  std::vector<uint64_t> leading{rows};
+  if (experts > 1) leading.insert(leading.begin(), experts);
   const auto shaped = [&](const SourceTensor &tensor) {
-    return tensor.shape.size() == dimensions && tensor.shape[dimensions - 2] == rows &&
-           (experts == 1 || tensor.shape.front() == experts) && tensor.shape.back();
+    return tensor.shape.size() == leading.size() + 1 &&
+           std::equal(leading.begin(), leading.end(), tensor.shape.begin()) && tensor.shape.back();
   };
   if (codes.dtype != "U32" || !shaped(codes) || !shaped(*scales) || columns % scales->shape.back() ||
       codes.shape.back() * 32 % columns)
     throw WeightStoreError("source tensor type or shape does not match: " + module);
-  const uint64_t group = columns / scales->shape.back(), bits = codes.shape.back() * 32 / columns;
-  uint32_t format = GGUF_FMT_COUNT;
-  const SourceTensor *biases = nullptr;
+  MlxQuantization result{GGUF_FMT_COUNT, codes.shape.back() * 32 / columns, columns / scales->shape.back(),
+                         {&codes, scales}};
   if (scales->dtype == "BF16") {
-    format = quant_affine_format_of(uint32_t(bits), uint32_t(group));
-    biases = &checkpoint.require(module + ".biases");
-    if (biases->dtype != "BF16" || biases->shape != scales->shape)
+    result.format = quant_affine_format_of(uint32_t(result.bits), uint32_t(result.group));
+    const SourceTensor &biases = checkpoint.require(module + ".biases");
+    if (biases.dtype != "BF16" || biases.shape != scales->shape)
       throw WeightStoreError("source tensor type or shape does not match: " + module + ".biases");
-  } else if (scales->dtype == "U8" && bits == 4 && group == 32) {
-    format = GGUF_FMT_MXFP4;
-  } else if (scales->dtype == "U8" && bits == 4 && group == 16) {
-    format = GGUF_FMT_NVFP4;
+    result.tensors.biases = &biases;
+  } else if (scales->dtype == "U8" && result.bits == 4 && result.group == 32) {
+    result.format = GGUF_FMT_MXFP4;
+  } else if (scales->dtype == "U8" && result.bits == 4 && result.group == 16) {
+    result.format = GGUF_FMT_NVFP4;
   }
-  if (format == GGUF_FMT_COUNT)
-    throw WeightStoreError(module + " is " + std::to_string(bits) + "-bit in groups of " + std::to_string(group) +
-                           " with " + scales->dtype + " scales; MLX weights load as affine 2, 3, 4, 5, 6 or 8 "
-                           "bits in groups of 32, 64 or 128 with bf16 scales, or as mxfp4 or nvfp4");
-  requireWholeBlocks(module, format, columns);
-  return gguf::TensorRows{module, kQuantFormats[format].ggml_type, 0, experts * rows,
-                         ggufRowBytes(kQuantFormats[format], columns), {}, codes.file, {&codes, scales, biases}};
+  return result;
 }
 
 std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry) {

@@ -138,7 +138,6 @@ void readSafetensorsRows(const gguf::TensorRows &rows, uint64_t start, uint64_t 
   }
 }
 
-
 // A group of 64 BF16 weights as MLX's affine quantization rounds it to 4 bits
 // (mlx.core.quantize, its Metal kernel), in float, into a native af4g64
 // block: the range runs from the minimum to the maximum or 0, whichever is
