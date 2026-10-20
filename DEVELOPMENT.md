@@ -113,6 +113,7 @@ access.
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
 | `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](#neural-engine-prefill). |
+| `--moe-numerics` | `invariant` | MoE expert numerics: `invariant`, a token's result independent of the rows decoded with it, or `fast`, which decodes one request's experts of few rows with a register GEMV, so a token's result also depends on the draft tokens verified with it. See [kernels](#kernels). |
 | `--allow-idle-sleep` | Off | Let the Mac sleep automatically while requests run; by default it stays awake until they finish (the display may still sleep). |
 
 Sizes (`--max-memory`, `--max-cache-disk`, `--max-cache-disk-writes`,
@@ -1863,7 +1864,7 @@ count, and the pass reads it as an indirect dispatch (`ComputeDispatch::indirect
 The staged tile runs gate and up in one pass where they share their routed and their shared
 formats, a gate and an up simdgroup on the same columns, bitwise the two passes' intermediate.
 A step whose 8 rows fill one staged tile reads them in place, one tile per expert, which runs the
-8-row matmul whatever rows route to the expert. With the Fast numerics tier (`MoeNumerics::Fast`,
+8-row matmul whatever rows route to the expert. With `--moe-numerics fast` (`MoeNumerics::Fast`,
 `MoePlan::smallTilesInPlace`) a one-lane decode step's grouping also counts and lists each
 expert's rows, and `moe_expert_gguf_fast_m8_<e>` and `moe_expert_gguf_fast_m8_gate_up` run an
 expert of at most `moe_fast_gemv_rows` rows for its pass's format through a register GEMV on those

@@ -132,6 +132,9 @@ struct RuntimeResourcesConfig {
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
   AneFfnSetting aneFfn;
+  // The MoE expert passes' numerics tier (--moe-numerics), which the
+  // execution plans take.
+  ops::MoeNumerics moeNumerics = ops::MoeNumerics::BatchInvariant;
   // A relaunch's context (--relaunch-context): the context the server's
   // first engine served without --max-context, which the server passes to
   // every relaunch. The relaunch decides the rest as an automatic start, as

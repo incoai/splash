@@ -152,6 +152,7 @@ void testServerCommandLines(const char *path) {
        [](NativeArguments &read) { read.maxImagePatches = 16384; }},
       {"idle_sleep", [](NativeArguments &read) { read.preventIdleSleep = false; }},
       {"disable_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
+      {"moe_numerics_fast", [](NativeArguments &read) { read.moeNumerics = ops::MoeNumerics::Fast; }},
       // A relaunch keeps the first engine's context; with --max-context,
       // which every start holds, its command is the first one's.
       {"relaunch", [](NativeArguments &read) { read.relaunchContext = 61433; }},
@@ -175,7 +176,7 @@ void testServerCommandLines(const char *path) {
            read.maxImagePatches == meant.maxImagePatches &&
            read.idleReleaseSeconds == meant.idleReleaseSeconds &&
            read.preventIdleSleep == meant.preventIdleSleep &&
-           read.neuralEngine == meant.neuralEngine;
+           read.neuralEngine == meant.neuralEngine && read.moeNumerics == meant.moeNumerics;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -201,6 +202,17 @@ void testNeuralEngine() {
           "--ane did not reach the arguments as given");
 }
 
+// The MoE numerics are BatchInvariant unless --moe-numerics fast opts in;
+// --moe-numerics invariant, which the server never writes, keeps them.
+void testMoeNumerics() {
+  const ModelDirectory model;
+  require(parse(model, {"auto", "auto"}).moeNumerics == ops::MoeNumerics::BatchInvariant &&
+              parse(model, {"auto", "auto", "--moe-numerics", "invariant"}).moeNumerics ==
+                  ops::MoeNumerics::BatchInvariant &&
+              parse(model, {"auto", "auto", "--moe-numerics", "fast"}).moeNumerics == ops::MoeNumerics::Fast,
+          "--moe-numerics did not reach the arguments as given");
+}
+
 // A command line the server never writes is refused with what is wrong.
 void testRefusals() {
   const ModelDirectory model;
@@ -211,6 +223,7 @@ void testRefusals() {
   };
   refuses({"auto", "auto", "--kv-format", "fp16"},
           "--kv-format requires int8 or bf16");
+  refuses({"auto", "auto", "--moe-numerics", "exact"}, "--moe-numerics requires invariant or fast");
   // An option's missing value fails its check.
   refuses({"auto", "auto", "--kv-format"}, "--kv-format requires int8 or bf16");
   refuses({"auto", "auto", "--state-format", "fp16"},
@@ -300,6 +313,7 @@ int main(int argc, char **argv) {
   try {
     testServerCommandLines(argv[1]);
     testNeuralEngine();
+    testMoeNumerics();
     testRefusals();
     std::cout << "native arguments tests passed\n";
     return EXIT_SUCCESS;

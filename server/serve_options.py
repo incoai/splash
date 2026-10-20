@@ -611,6 +611,17 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--moe-numerics",
+        "requests",
+        dict(
+            choices=("invariant", "fast"),
+            default="invariant",
+            help="MoE expert numerics (default: invariant, a token's result does "
+            "not depend on the rows decoded with it); fast decodes one request's "
+            "experts of few rows faster in another summation order",
+        ),
+    ),
+    ServeOption(
         "--allow-idle-sleep",
         "requests",
         dict(
