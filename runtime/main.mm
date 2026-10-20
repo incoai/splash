@@ -7,6 +7,15 @@
 #include "engine/Status.hpp"
 #include "model/ModelDescriptor.hpp"
 
+#ifdef SPLASH_NATIVE_TRACE
+#include "Trace.hpp"
+#include "metal/BackendInstrumentation.hpp"
+#include "ops/AneFfn.hpp"
+#include <cmath>
+#include <fstream>
+#include <iomanip>
+#endif
+
 #include <IOKit/pwr_mgt/IOPMLib.h>
 #include <dispatch/dispatch.h>
 #include <mach-o/dyld.h>
@@ -289,6 +298,18 @@ int runNative(const engine::NativeArguments &arguments) {
   MemoryPressureMonitor pressureMonitor(transport.controlNotifier());
   IdleSleepAssertion idleSleep;
   engine::RuntimeMetrics metrics;
+#ifdef SPLASH_NATIVE_TRACE
+  // Only the development serving-profile executable reads this option.
+  // Open now to report an invalid destination before starting any workload.
+  std::shared_ptr<TraceBuffer> trace;
+  std::ofstream traceOutput;
+  const double traceOrigin = traceSeconds();
+  if (const char *path = std::getenv("SPLASH_SERVING_TRACE"); path && *path) {
+    traceOutput.open(path);
+    if (!traceOutput) throw std::runtime_error("cannot open SPLASH_SERVING_TRACE");
+    trace = std::make_shared<TraceBuffer>();
+  }
+#endif
   engine::RuntimeBootstrap *published = nullptr;
   auto statusProvider = [&] {
     return published->statusJson(
@@ -306,6 +327,9 @@ int runNative(const engine::NativeArguments &arguments) {
     config.resources.memoryPressure = [&] { return pressureMonitor.pressure(); };
     config.resources.cancelled = [&] { return transport.shutdownRequested(); };
     config.nativeLoop.metrics = &metrics;
+#ifdef SPLASH_NATIVE_TRACE
+    config.nativeLoop.engine.trace = trace.get();
+#endif
     if (arguments.preventIdleSleep)
       config.nativeLoop.holdingRequests = [&](bool held) { idleSleep.hold(held); };
     try {
@@ -333,6 +357,16 @@ int runNative(const engine::NativeArguments &arguments) {
   if (transport.shutdownRequested())
     return static_cast<int>(engine::NativeProcessExit::CleanEof);
   published = bootstrap.get();
+#ifdef SPLASH_NATIVE_TRACE
+  if (trace) {
+    auto &backend = bootstrap->resources().backend();
+    metal::BackendInstrumentation::setCommandTracing(backend, true);
+    const auto context = bootstrap->resources().modelContext();
+    if (context.aneFfn) context.aneFfn->setTraceSink(trace);
+    const double ready = traceSeconds();
+    trace->record({"serving.ready", 1, ready, ready});
+  }
+#endif
 
   transport.setControlHandler([&pressureMonitor, published] {
     return published->controlPass(pressureMonitor.pressure());
@@ -368,6 +402,43 @@ int runNative(const engine::NativeArguments &arguments) {
         transport.failure() + ")");
     break;
   }
+#ifdef SPLASH_NATIVE_TRACE
+  if (trace) {
+    auto &backend = bootstrap->resources().backend();
+    metal::BackendInstrumentation::setCommandTracing(backend, false);
+    const bool commandInFlightAtStop = backend.commandInFlight();
+    for (const auto &command : metal::BackendInstrumentation::takeCommandTrace(backend)) {
+      trace->record({"backend.prepare", 1, command.prepareStart, command.encodeStart,
+                      command.sequence});
+      trace->record({"metal.encode", 1, command.encodeStart, command.commit, command.sequence});
+      trace->record({"metal.command_span", 2, command.gpuStart, command.gpuEnd,
+                      command.sequence});
+      for (const auto &segment : command.segments)
+        trace->record({"gpu.segment", 2, segment.begin, segment.end, command.sequence});
+      trace->record({"metal.completion", 1, command.gpuEnd, command.complete, command.sequence});
+    }
+    traceOutput << std::setprecision(17) << "{\"traceEvents\":[";
+    bool first = true;
+    for (const TraceEvent &event : trace->snapshot()) {
+      if (!std::isfinite(event.begin) || !std::isfinite(event.end) || event.end < event.begin)
+        continue;
+      traceOutput << (first ? "\n" : ",\n") << "{\"name\":\"" << event.name
+          << "\",\"ph\":\"X\",\"pid\":1,\"tid\":" << event.track
+          << ",\"ts\":" << (event.begin - traceOrigin) * 1e6
+          << ",\"dur\":" << (event.end - event.begin) * 1e6
+          << ",\"args\":{\"id\":" << event.id << ",\"width\":" << event.width
+          << ",\"rows\":" << event.rows << ",\"context\":" << event.context
+          << ",\"flags\":" << event.flags << ",\"value\":" << event.value << "}}";
+      first = false;
+    }
+    traceOutput << "\n],\"dropped_host_events\":" << trace->dropped()
+        << ",\"dropped_commands\":" << metal::BackendInstrumentation::droppedCommandTraces(backend)
+        << ",\"exit_status\":" << static_cast<int>(exit)
+        << ",\"command_in_flight_at_stop\":" << (commandInFlightAtStop ? "true" : "false")
+        << "}\n";
+    traceOutput.close();
+  }
+#endif
   return static_cast<int>(exit);
 }
 

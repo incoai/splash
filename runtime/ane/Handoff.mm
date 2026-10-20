@@ -26,6 +26,7 @@ struct Job final {
   Phase phase = Phase::Queued;
   AwakeClock::time_point started{};
   AwakeClock::duration ran{};
+  double queued = 0.0;
 };
 
 std::string seconds(AwakeClock::duration duration) {
@@ -63,6 +64,9 @@ struct Handoff::State final {
       if (job == state->jobs.end() || job->second.phase != Phase::Queued) return;
       job->second.phase = Phase::Started;
       job->second.started = AwakeClock::now();
+      if (state->trace)
+        state->trace->record({"ane.queue_to_ready", 4, job->second.queued,
+                               traceSeconds(), id});
     }
     // dispatch_time(DISPATCH_TIME_NOW, ...) counts mach absolute time, which
     // stops while the Mac sleeps, as AwakeClock's CLOCK_UPTIME_RAW does.
@@ -96,12 +100,20 @@ struct Handoff::State final {
         state->fail(job.phase, "an evaluation failed");
         return;
       }
-      if (job.phase == Phase::Started) job.ran = AwakeClock::now() - job.started;
+      if (job.phase == Phase::Started) {
+        const auto now = AwakeClock::now();
+        job.ran = now - job.started;
+        if (state->trace)
+          state->trace->record({"ane.ready_to_report", 4,
+              std::chrono::duration<double>(job.started.time_since_epoch()).count(),
+              std::chrono::duration<double>(now.time_since_epoch()).count(), id});
+      }
       job.phase = Phase::Succeeded;
     } catch (...) {
     }
   }
 
+  std::shared_ptr<TraceSink> trace;
   std::mutex mutex;
   std::condition_variable changed;
   const metal::SharedEvent event;
@@ -129,6 +141,11 @@ Handoff::~Handoff() {
 
 const metal::SharedEvent &Handoff::event() const noexcept { return state_->event; }
 
+void Handoff::setTraceSink(std::shared_ptr<TraceSink> sink) {
+  std::lock_guard lock(state_->mutex);
+  state_->trace = std::move(sink);
+}
+
 uint64_t Handoff::next() {
   std::lock_guard lock(state_->mutex);
   ++state_->value;
@@ -146,6 +163,7 @@ void Handoff::queue(uint64_t ready, uint64_t done, const Start &start) {
       return;
     }
     state_->jobs.emplace(id, Job{});
+    if (state_->trace) state_->jobs.at(id).queued = traceSeconds();
     state_->outstanding.insert(id);
   }
   std::string failure;

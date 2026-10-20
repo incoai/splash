@@ -50,6 +50,7 @@ public:
   // takes every chunk its functions hold until setMinimumRows().
   AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
          std::function<bool()> interrupted);
+  void setTraceSink(std::shared_ptr<TraceSink> sink) { handoff_.setTraceSink(std::move(sink)); }
   AneFfn(const AneFfn &) = delete;
   AneFfn &operator=(const AneFfn &) = delete;
 

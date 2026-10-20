@@ -253,6 +253,8 @@ void behaves(MetalBackend &backend, Behaviour behaviour, uint32_t faulty) {
   const std::string label = std::string(name(behaviour)) + " at job " + std::to_string(faulty);
   const bool fails = behaviour != Behaviour::Succeed && behaviour != Behaviour::Twice;
   ane::Handoff handoff(backend, kBound);
+  auto trace = std::make_shared<TraceBuffer>(1024);
+  handoff.setTraceSink(trace);
   const MetalBuffer markers = zeroed(backend);
   Agent agent(behaviour, faulty, markers);
   Layers layers(backend, markers);
@@ -261,6 +263,9 @@ void behaves(MetalBackend &backend, Behaviour behaviour, uint32_t faulty) {
           label + ": the command took " + std::to_string(first) + " ms, past the bound");
   require(backend.healthy(), label + ": the backend is unhealthy: " + backend.unhealthyReason());
   require(handoff.finish().has_value() == !fails, label + ": finish() reported " + (fails ? "success" : "failure"));
+  for (const auto &event : trace->snapshot())
+    require(event.begin > 0.0 && event.end >= event.begin,
+            "handoff trace contains invalid callback timestamps");
   require(handoff.retired() == fails && handoff.reason().empty() == !fails,
           label + ": retired " + std::to_string(handoff.retired()) + " for " + handoff.reason());
   // While the agent behaves, the GPU waits for each layer's done; a failure as the jobs start releases every wait

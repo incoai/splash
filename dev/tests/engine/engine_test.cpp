@@ -147,6 +147,73 @@ void tickUntil(engine::Engine &engine, double &now, const std::function<bool()> 
   require(done(), message);
 }
 
+void testTraceDoesNotCountCancelledOutput() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model;
+  Events events;
+  TraceBuffer trace(1024);
+  auto config = test::engineConfig();
+  config.trace = &trace;
+  engine::Engine engine(config, cache, model, events);
+  guardReleases(storage, engine);
+  model.holdPrefillUntil = std::make_shared<std::atomic<bool>>(false);
+  engine.submit(request(1, std::vector<uint32_t>(193, 7)));
+  require(engine.tick(0) && engine.commandInFlight(), "cancel fixture did not submit");
+  engine.cancel(1);
+  *model.holdPrefillUntil = true;
+  runUntilIdle(engine);
+  require(events.emitted == 0 && engine.snapshot().cancelled == 1,
+          "cancelled request emitted output");
+  uint32_t observations = 0;
+  for (const auto &event : trace.snapshot()) {
+    if (std::string_view(event.name) == "batch.counters") {
+      ++observations;
+      require(event.rows == 0 && event.context == 0 && event.flags == 0,
+              "trace counted provisional cancelled output as committed");
+    }
+  }
+  require(observations == 1, "cancelled command omitted its counter record");
+}
+
+void testTraceCannotChangeExecution() {
+  const auto run = [](TraceSink *trace) {
+    test::TestKvStorage storage(64, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache cache(pool, nullptr, nullptr);
+    Executor model;
+    Events events;
+    auto config = test::engineConfig();
+    config.trace = trace;
+    engine::Engine engine(config, cache, model, events);
+    guardReleases(storage, engine);
+    auto input = request(1, std::vector<uint32_t>(193, 7));
+    input.maxNewTokens = 4;
+    engine.submit(input);
+    runUntilIdle(engine);
+    require(events.completedCount == 1 && events.failedCount == 0,
+            "traced request did not complete");
+    return events.outputs;
+  };
+  const auto baseline = run(nullptr);
+  TraceBuffer trace(1024);
+  require(run(&trace) == baseline, "tracing changed generated tokens");
+  const auto events = trace.snapshot();
+  for (const char *name : {"scheduler.plan", "engine.prepare", "runtime.prefill_submit",
+                           "engine.apply", "runtime.decode_submit"})
+    require(std::any_of(events.begin(), events.end(), [&](const auto &event) {
+              return std::string_view(event.name) == name;
+            }), "trace omitted an execution phase");
+  for (const auto &event : events)
+    require(event.begin > 0.0 && event.end >= event.begin,
+            "trace contains an invalid host-clock interval");
+  require(trace.dropped() == 0, "short trace exceeded its storage");
+  TraceBuffer bounded(2);
+  require(run(&bounded) == baseline && bounded.snapshot().size() == 2 && bounded.dropped() > 0,
+          "trace overflow changed execution or grew past its bound");
+}
+
 void testConcurrentColdPrefixesComputeOnce() {
   test::TestKvStorage storage(64, 4096, 4);
   KvPool pool(storage, 0);
@@ -1737,7 +1804,10 @@ void testRefusedKvPastABoundaryEndsTheCommandThere() {
   engine::Cache resources(pool, nullptr, nullptr);
   Executor executor(1);
   Events events;
-  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  TraceBuffer trace(1024);
+  auto config = test::engineConfig();
+  config.trace = &trace;
+  engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
   // The extent the last token's page needs comes once the first command ran.
   storage.growthAllowed = [&](uint32_t extent) {
@@ -1755,6 +1825,12 @@ void testRefusedKvPastABoundaryEndsTheCommandThere() {
               counters.replayStatePublications == 1 && events.completedCount == 1 &&
               events.failedCount == 0,
           "refused KV past a boundary made the lane wait, yield or fail");
+  std::vector<uint32_t> measuredRows;
+  for (const auto &event : trace.snapshot())
+    if (std::string_view(event.name) == "batch.observation" && (event.flags & 1))
+      measuredRows.push_back(event.rows);
+  require(measuredRows == std::vector<uint32_t>{128, 1},
+          "trace recorded planned rows instead of the cut command's actual rows");
 }
 
 // A checkpoint the command passes on its way to a state that retires it is
@@ -10309,6 +10385,8 @@ void testImpossibleSpeculativeCountsFailOnlyTheirOwnLane() {
 
 int main() {
   try {
+    testTraceCannotChangeExecution();
+    testTraceDoesNotCountCancelledOutput();
     testSpeculativeCountsStayWithEachConcurrentRequest();
     testImpossibleSpeculativeCountsFailOnlyTheirOwnLane();
     testUnusableThinkingBudgetIsRefused();

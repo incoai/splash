@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AwakeClock.hpp"
+#include "Trace.hpp"
 #include "metal/MetalBackend.hpp"
 
 #include <cstdint>
@@ -51,6 +52,8 @@ public:
   Handoff &operator=(const Handoff &) = delete;
 
   [[nodiscard]] const metal::SharedEvent &event() const noexcept;
+  // Configure between commands. Shared ownership keeps late callbacks safe.
+  void setTraceSink(std::shared_ptr<TraceSink> sink);
 
   // A value of the event no step has taken, for a step of the command being
   // encoded; once retired, one the event has reached.

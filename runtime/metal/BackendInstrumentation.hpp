@@ -18,6 +18,8 @@ struct DispatchTiming {
 // Host and GPU instants in system mach time, in seconds. A command with
 // event steps spans the first through last Metal command buffer.
 struct CommandTrace {
+  struct Segment { double begin = 0.0, end = 0.0; };
+  std::vector<Segment> segments;
   uint64_t sequence = 0;
   uint64_t dispatches = 0;
   double prepareStart = 0.0;
@@ -50,6 +52,7 @@ public:
   static void setCommandTracing(MetalBackend &backend, bool enabled);
   [[nodiscard]] static std::vector<CommandTrace>
   takeCommandTrace(MetalBackend &backend);
+  [[nodiscard]] static uint64_t droppedCommandTraces(MetalBackend &backend);
 };
 
 } // namespace splash::metal

@@ -370,6 +370,7 @@ struct Runtime::Impl {
   DFlashDraft draftModel;
   float liveVerifyThreshold = 0.0F;
   ops::AneFfn *aneFfn;
+  TraceSink *trace = nullptr;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         model(value.model),
@@ -387,6 +388,7 @@ struct Runtime::Impl {
                         value.model.target)),
         draftModel(value.model.draft, value.backend, operators),
         aneFfn(value.aneFfn) {
+    trace = value.trace;
     if (states.layout() != model.stateLayout(states.layout().target.format) ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format)) {
       throw std::invalid_argument(
@@ -1965,8 +1967,23 @@ struct Runtime::Impl {
           decodeArena->batchSlice(DecodeTensor::LiveRows, counters.lastDecodeWidth),
           "live verify rows");
       counters.lastDecodeLiveRows = 0;
-      for (uint32_t lane = 0; lane < counters.lastDecodeWidth; ++lane)
+      for (uint32_t lane = 0; lane < counters.lastDecodeWidth; ++lane) {
         counters.lastDecodeLiveRows += budgets[lane].count;
+        const auto &result = lanes[lane];
+        if (trace && result.request->sampling.temperature <= 0.0F && result.failure.empty()) {
+          const double instant = traceSeconds();
+          for (uint32_t position = 0; position < kDraftProposalTokens; ++position) {
+            // A rejection labels every later prefix false. Full acceptance
+            // of a truncated prefix leaves its suffix censored, not rejected.
+            const bool accepted = position < result.accepted;
+            const bool observed = accepted || result.accepted < budgets[lane].count - 1;
+            trace->record({"draft.confidence", 6, instant, instant, result.request->id,
+                counters.lastDecodeWidth, position + 1, budgets[lane].count,
+                uint32_t{observed} | (uint32_t{accepted} << 1),
+                budgets[lane].prefix_confidence[position]});
+          }
+        }
+      }
     }
     counters.lastDecodeGpuSeconds = timing.gpuSeconds;
     counters.totalDecodeGpuSeconds += timing.gpuSeconds;
@@ -2046,9 +2063,13 @@ struct Runtime::Impl {
                                       !lanes_[lane].request->maskWords.empty());
         }
         if (masksReady) {
+          const auto maskReady = AwakeClock::now();
           maskWaitSeconds_ +=
-              std::chrono::duration<double>(AwakeClock::now() - *maskWaitStarted_)
-                  .count();
+              std::chrono::duration<double>(maskReady - *maskWaitStarted_).count();
+          if (impl_.trace)
+            impl_.trace->record({"constraint.mask_tail_wait", 3,
+                std::chrono::duration<double>(maskWaitStarted_->time_since_epoch()).count(),
+                std::chrono::duration<double>(maskReady.time_since_epoch()).count()});
           maskWaitStarted_.reset();
           std::array<Request *, kLaneCount> entries{};
           std::array<uint32_t, kLaneCount> maximumRetained{};

@@ -707,6 +707,9 @@ void commandTracingPreservesExecution(const std::string &metallibPath) {
     require(trace.size() == 1 && trace.front().dispatches == 1 && *value == 1,
             "tracing changed command execution or lost its completion");
     const auto &sample = trace.front();
+    require(sample.segments.size() == 1 && sample.segments[0].begin == sample.gpuStart &&
+                sample.segments[0].end == sample.gpuEnd,
+            "ordinary trace lost its GPU segment");
     require(sample.prepareStart <= sample.encodeStart && sample.encodeStart <= sample.commit &&
                 sample.commit <= sample.complete && sample.gpuEnd >= sample.gpuStart &&
                 sample.gpuStart >= sample.commit - 0.001 && sample.gpuEnd <= sample.complete + 0.001 &&
@@ -716,6 +719,21 @@ void commandTracingPreservesExecution(const std::string &metallibPath) {
     (void)backend.submitCommandAsync({&dispatch, 1}).wait();
     require(BackendInstrumentation::takeCommandTrace(backend).empty() && *value == 2,
             "disabled tracing recorded or changed a command");
+    BackendInstrumentation::setCommandTracing(backend, true);
+    const auto event = backend.newSharedEvent();
+    const std::vector<ComputeDispatch> pair(2, dispatch);
+    const std::vector<EventStep> steps{{1, event, 1, EventStep::Kind::Signal},
+                                     {1, event, 1, EventStep::Kind::Wait}};
+    (void)backend.submitCommandAsync(Command{pair, steps}).wait();
+    const auto split = BackendInstrumentation::takeCommandTrace(backend);
+    require(split.size() == 1 && split[0].segments.size() == 2 && *value == 4,
+            "event-split trace changed execution or lost a GPU segment");
+    require(split[0].segments.front().begin == split[0].gpuStart &&
+                split[0].segments.back().end == split[0].gpuEnd &&
+                split[0].segments[0].end <= split[0].segments[1].begin &&
+                BackendInstrumentation::droppedCommandTraces(backend) == 0,
+            "event-split trace intervals are inconsistent");
+    BackendInstrumentation::setCommandTracing(backend, false);
     std::cout << "PASS command tracing preserves execution\n";
 }
 

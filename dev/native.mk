@@ -214,7 +214,8 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_MET
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) $(TEST_METAL_BACKEND_AIR) \
 	$(TEST_GGUF_DEQUANT_AIR)
 # Benchmarks and tools that build with the production flags.
-PRODUCTION_FLAG_TOOLS := $(TEST_BACKEND_BENCHMARK) $(WEIGHT_DIGESTS)
+SERVING_PROFILE := $(BUILD)/serving-profile
+PRODUCTION_FLAG_TOOLS := $(TEST_BACKEND_BENCHMARK) $(WEIGHT_DIGESTS) $(SERVING_PROFILE)
 PRODUCTION_CONFIG_TARGETS += $(PRODUCTION_FLAG_TOOLS)
 SANITIZER_CONFIG_TARGETS := $(TEST_SLOT_FILE_ASAN) $(TEST_SLOT_FILE_TSAN) \
 	$(TEST_CACHE_DIRECTORY_ASAN) $(TEST_CACHE_DIRECTORY_TSAN) \
@@ -370,6 +371,14 @@ $(TEST_MODEL_RUNTIME_ORACLE): dev/tests/engine/model_runtime_oracle_test.mm \
 $(TEST_MODEL_RUNTIME_ORACLE): ENGINE_TEST_CXXFLAGS += -include $(BUILD_ID_HEADER)
 $(TEST_DECODE_PROFILE): dev/benchmarks/decode_profile.mm \
 		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(LIB)
+
+# The native protocol entry point with development-only Chrome tracing. Keep
+# it beside its metallib so the regular HTTP harness can run it as a server.
+$(SERVING_PROFILE): runtime/main.mm $(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(LIB) $(BUILD_ID_HEADER)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) -DSPLASH_NATIVE_TRACE=1 \
+		-include $(BUILD_ID_HEADER) $< $(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) \
+		$(ENGINE_LINKFLAGS) -o $@
+
 $(TEST_ATTENTION_SWEEP): dev/benchmarks/attention_sweep.mm \
 		dev/benchmarks/DispatchReplay.hpp \
 		$(ENGINE_LIBRARY) $(LIB)

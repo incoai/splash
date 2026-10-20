@@ -420,6 +420,8 @@ struct BackendAsyncState {
 struct CommandTraceLog {
     std::mutex mutex;
     std::vector<CommandTrace> records;
+    uint64_t dropped = 0;
+    static constexpr size_t capacity = 65536;
 };
 
 double traceSeconds() noexcept {
@@ -487,8 +489,19 @@ struct CommandTicket::State {
                 trace.complete = traceSeconds();
                 trace.gpuStart = gpuStart;
                 trace.gpuEnd = command.GPUEndTime;
+                size_t segment = 0;
+                for (id<MTLCommandBuffer> earlier : leadingCommands)
+                    trace.segments[segment++] = {earlier.GPUStartTime, earlier.GPUEndTime};
+                trace.segments[segment] = {command.GPUStartTime, command.GPUEndTime};
                 std::lock_guard traceLock(traceLog->mutex);
-                traceLog->records.push_back(trace);
+                try {
+                    if (traceLog->records.size() < CommandTraceLog::capacity)
+                        traceLog->records.push_back(std::move(trace));
+                    else
+                        ++traceLog->dropped;
+                } catch (...) {
+                    ++traceLog->dropped;
+                }
             }
         }
 #endif
@@ -952,6 +965,17 @@ struct MetalBackend::Impl {
             encodeSteps(dispatches.size());
             if (encoder) [encoder endEncoding];
             ticketState->leadingCommands = leading;
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+            if (ticketState->traceLog) {
+                try {
+                    ticketState->trace.segments.resize(leading.size() + 1);
+                } catch (...) {
+                    std::lock_guard lock(ticketState->traceLog->mutex);
+                    ++ticketState->traceLog->dropped;
+                    ticketState->traceLog.reset();
+                }
+            }
+#endif
 
             // Driver callbacks only complete the ticket. Device-wide memory
             // telemetry is sampled on the host when consuming the result. The
@@ -1445,6 +1469,11 @@ void BackendInstrumentation::setCommandTracing(MetalBackend &backend, bool enabl
     if (enabled && backend.impl_->dispatchProfiling)
         throw MetalBackendError("command tracing requires ordinary execution");
     backend.impl_->commandTracing = enabled;
+}
+
+uint64_t BackendInstrumentation::droppedCommandTraces(MetalBackend &backend) {
+    std::lock_guard lock(backend.impl_->traceLog->mutex);
+    return backend.impl_->traceLog->dropped;
 }
 
 std::vector<CommandTrace>

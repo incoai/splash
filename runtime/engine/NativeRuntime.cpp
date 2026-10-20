@@ -41,6 +41,7 @@ NativeRuntime::NativeRuntime(NativeLoopConfig config, double idleReleaseSeconds,
 }
 
 bool NativeRuntime::receive(std::span<const uint8_t> bytes) {
+  TraceScope trace(config_.engine.trace, "frontend.receive");
   if (closeConnection_)
     return false;
   try {
@@ -90,6 +91,7 @@ bool NativeRuntime::finishInput() {
 }
 
 bool NativeRuntime::tick() {
+  TraceScope trace(config_.engine.trace, "native.tick");
   if (closeConnection_ || !engineHealthy_)
     return false;
   try {
@@ -105,6 +107,7 @@ bool NativeRuntime::tick() {
 }
 
 bool NativeRuntime::runControl(const std::function<bool()> &control) {
+  TraceScope trace(config_.engine.trace, "native.control");
   if (closeConnection_ || !engineHealthy_)
     return false;
   try {

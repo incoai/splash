@@ -114,6 +114,7 @@ void Engine::submit(EngineRequest value) {
     requests_.erase(found);
   }
   Request requestState;
+  if (config_.trace) requestState.traceStarted = traceSeconds();
   requestState.exactTokens = std::move(value.prompt);
   requestState.promptTokens = static_cast<uint32_t>(requestState.exactTokens.size());
   requestState.replayTokens = requestState.promptTokens;
@@ -152,6 +153,12 @@ void Engine::provideMask(uint64_t id, std::span<const uint32_t> words) {
     settle(active, {LaneOutcome::InvalidMask, std::move(*rejected)});
     return;
   }
+  if (config_.trace && active.traceMaskStarted) {
+    config_.trace->record({ownedByActiveBatch ? "constraint.mask_roundtrip"
+                                               : "constraint.initial_mask_roundtrip",
+                           3, *active.traceMaskStarted, traceSeconds(), id});
+    active.traceMaskStarted.reset();
+  }
   active.maskRequestedMilliseconds.reset();
   if (!ownedByActiveBatch)
     scheduler_.maskReady(id);
@@ -168,6 +175,7 @@ bool Engine::flushRestorePoints() {
 }
 
 bool Engine::tick(double now) {
+  TraceScope tickTrace(config_.trace, "engine.tick");
   model_.checkHealth();
   nextHealthCheckMilliseconds_ = now + kHealthCheckIntervalMilliseconds;
   bool progressed = scheduler_.expireDeadlines(now);
@@ -232,6 +240,8 @@ bool Engine::tick(double now) {
   if (pending_) {
     auto forwardMaskRequests = [&] {
       for (ModelMaskRequest &asked : pending_->ticket->takeMaskRequests()) {
+        if (config_.trace)
+          request(asked.requestId).traceMaskStarted = traceSeconds();
         events_.maskRequested(asked.requestId, asked.simulationTokens);
         request(asked.requestId).maskRequestedMilliseconds = now;
         progressed = true;
@@ -252,10 +262,32 @@ bool Engine::tick(double now) {
       return progressed;
     Pending command = std::move(*pending_);
     pending_.reset();
-    std::vector<ModelStepResult> results = command.ticket->wait();
-    apply(command.plan, command.captures, results, command.ticket->wallMilliseconds(),
-          now - command.startedMilliseconds,
-          command.ticket->prefillTimingIsRepresentative(), now);
+    std::vector<ModelStepResult> results;
+    {
+      TraceScope trace(config_.trace, "engine.result", 1, command.traceId);
+      results = command.ticket->wait();
+    }
+    if (config_.trace) {
+      const double instant = traceSeconds();
+      const uint32_t flags = (command.plan.kind == WorkKind::Prefill ? 1u : 0u) |
+          (command.ticket->prefillTimingIsRepresentative() ? 2u : 0u) |
+          (command.plan.constrained ? 4u : 0u);
+      config_.trace->record({"batch.observation", 1, instant, instant, command.traceId,
+          command.plan.width(), command.traceRows, command.traceContext, flags,
+          command.ticket->wallMilliseconds()});
+      config_.trace->record({"batch.cycle", 1, instant, instant, command.traceId,
+          command.plan.width(), command.traceRows, command.traceContext, flags,
+          now - command.startedMilliseconds});
+
+    }
+    {
+      TraceScope trace(config_.trace, "engine.apply", 1, command.traceId,
+                        command.plan.width(), 0, 0,
+                        command.ticket->prefillTimingIsRepresentative() ? 1 : 0);
+      apply(command.plan, command.captures, results, command.ticket->wallMilliseconds(),
+            now - command.startedMilliseconds,
+            command.ticket->prefillTimingIsRepresentative(), now, command.traceId);
+    }
     busySinceMilliseconds_ = now;
     sweepTerminal();
     return true;
@@ -271,13 +303,42 @@ bool Engine::tick(double now) {
     if (active.lane && active.resourceWait.pending && !resourceRetryReady(active, now))
       excluded.push_back(id);
   }
-  while (auto plan = scheduler_.next(excluded)) {
+  while (auto plan = [&] {
+    TraceScope trace(config_.trace, "scheduler.plan");
+    return scheduler_.next(excluded);
+  }()) {
+    const uint64_t traceId = config_.trace ? ++traceSequence_ : 0;
+    uint32_t rows = 0;
+    if (config_.trace) {
+      for (const BatchItem &item : plan->items)
+        rows += plan->kind == WorkKind::Prefill ? item.tokenCount
+                                               : model::ExecutionLimits::targetVerifyRows;
+    }
     std::vector<ModelBatchItem> items;
     std::vector<std::vector<Capture>> captures;
-    switch (prepare(*plan, items, captures, now)) {
+    switch ([&] {
+      TraceScope trace(config_.trace, "engine.prepare", 1, traceId,
+                        plan->width(), rows);
+      return prepare(*plan, items, captures, now);
+    }()) {
     case Prepared::Runnable: {
-      std::unique_ptr<ModelBatchTicket> ticket =
-          model_.submit(*plan, items, completionNotifier_);
+      uint64_t context = 0;
+      if (config_.trace) {
+        rows = 0; // prepare may cut a chunk at a capture/resource boundary.
+        for (const BatchItem &item : plan->items)
+          rows += plan->kind == WorkKind::Prefill ? item.tokenCount
+                                                 : model::ExecutionLimits::targetVerifyRows;
+        for (const ModelBatchItem &item : items)
+          context = std::max(context, item.logicalPosition);
+      }
+      std::unique_ptr<ModelBatchTicket> ticket;
+      {
+        TraceScope trace(config_.trace,
+                          plan->kind == WorkKind::Prefill ? "runtime.prefill_submit"
+                                                         : "runtime.decode_submit",
+                          1, traceId, plan->width(), rows, context);
+        ticket = model_.submit(*plan, items, completionNotifier_);
+      }
       if (!ticket) {
         throw std::logic_error("model returned an empty command ticket");
       }
@@ -292,7 +353,7 @@ bool Engine::tick(double now) {
         counters_.deduplicatedKvTokens += std::exchange(lane.unreadDeduplicatedKvTokens, 0);
       }
       pending_ = Pending{std::move(*plan), std::move(captures), std::move(ticket),
-                         busySinceMilliseconds_.value_or(now)};
+                         busySinceMilliseconds_.value_or(now), traceId, rows, context};
       return true;
     }
     case Prepared::Yielded:
@@ -441,6 +502,7 @@ ResourceWaitSnapshot Engine::resourceWaitSnapshot(double now) const {
 }
 
 bool Engine::admitQueued(double now) {
+  TraceScope trace(config_.trace, "engine.admit");
   const std::optional<RequestPriority> tier = suspendedTier();
   // Once pressure has preempted work, let resident lanes finish while memory
   // is still short before spending their released headroom on a retry or a
@@ -1826,7 +1888,7 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
 void Engine::apply(const BatchPlan &plan, std::span<const std::vector<Capture>> captures,
                    std::span<const ModelStepResult> results, double wallMilliseconds,
                    double cycleMilliseconds, bool representativePrefillTiming,
-                   double now) {
+                   double now, uint64_t traceId) {
   if (results.size() != plan.items.size()) {
     throw std::logic_error("model result count changed");
   }
@@ -1969,12 +2031,18 @@ void Engine::apply(const BatchPlan &plan, std::span<const std::vector<Capture>> 
     schedulerResults.push_back({active.request.id, result.consumedPromptTokens,
                                 complete, result.nextDecodeStage});
     if (waitsForMask(result.nextDecodeStage)) {
+      if (config_.trace) active.traceMaskStarted = traceSeconds();
       events_.maskRequested(active.request.id, {});
       active.maskRequestedMilliseconds = now;
     }
   }
   scheduler_.complete(plan, schedulerResults, wallMilliseconds,
                       representativePrefillTiming);
+  if (config_.trace) {
+    const double instant = traceSeconds();
+    config_.trace->record({"batch.counters", 1, instant, instant, traceId,
+                           plan.width(), outputTokens, draftedTokens, acceptedDraftTokens});
+  }
   events_.batchCompleted(plan.kind, plan.width(), inputTokens, outputTokens,
                          draftedTokens, acceptedDraftTokens, wallMilliseconds,
                          cycleMilliseconds);
@@ -1999,6 +2067,11 @@ bool Engine::inFlight(uint64_t id) const {
 }
 
 void Engine::settle(Request &active, LaneEnd end) {
+  if (config_.trace && active.traceMaskStarted) {
+    config_.trace->record({"constraint.mask_abandoned", 3, *active.traceMaskStarted,
+                           traceSeconds(), active.request.id});
+    active.traceMaskStarted.reset();
+  }
   if (active.finalized)
     return;
   if (active.restore || inFlight(active.request.id)) {
@@ -2068,6 +2141,11 @@ void Engine::vacateLane(Request &active, bool keepContinuation) {
 }
 
 void Engine::release(Request &active) {
+  if (config_.trace && active.traceStarted > 0.0) {
+    config_.trace->record({"request.active", 5, active.traceStarted, traceSeconds(),
+                           active.request.id, 1, active.promptTokens});
+    active.traceStarted = 0.0;
+  }
   active.resourceWait = {};
   active.maskRequestedMilliseconds.reset();
   if (active.lane || scheduler_.suspended(active.request.id)) {

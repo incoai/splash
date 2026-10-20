@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Trace.hpp"
 #include "ops/Vision.hpp"
 #include "engine/Cache.hpp"
 #include "engine/MemoryGovernor.hpp"
@@ -61,6 +62,9 @@ struct EngineConfig final {
   // which the pause does not hold back, or clears the mark, and returns the
   // mark it replaced (MemoryGovernor::setServing).
   std::function<bool(bool)> serving;
+  // Optional development trace. The owner outlives the engine; null does
+  // not read an instrumentation clock or allocate trace storage.
+  TraceSink *trace = nullptr;
 };
 
 // While an active one lives, allocations are memory a request in service
@@ -356,6 +360,8 @@ private:
     // When the engine asked the server for this lane's token mask, until the
     // model takes one.
     std::optional<double> maskRequestedMilliseconds;
+    std::optional<double> traceMaskStarted;
+    double traceStarted = 0.0;
     bool replaying = false;
     // Captured once the final prompt chunk completes; emitted with Done.
     std::vector<float> scoreLogits;
@@ -403,6 +409,9 @@ private:
     // Where the engine's time for this command starts: the previous
     // command's retirement when the engine stayed busy, else its plan.
     double startedMilliseconds = 0.0;
+    uint64_t traceId = 0;
+    uint32_t traceRows = 0;
+    uint64_t traceContext = 0;
   };
   enum class Prepared : uint8_t {
     // Some lanes were admitted and the plan runs with them.
@@ -630,7 +639,7 @@ private:
   void apply(const BatchPlan &plan, std::span<const std::vector<Capture>> captures,
              std::span<const ModelStepResult> results, double wallMilliseconds,
              double cycleMilliseconds, bool representativePrefillTiming,
-             double nowMilliseconds);
+             double nowMilliseconds, uint64_t traceId);
   // Whether the command in flight holds the request's lane.
   [[nodiscard]] bool inFlight(uint64_t requestId) const;
   // Ends a request early. While its command or restore runs, the first end
@@ -685,6 +694,7 @@ private:
   // finalized nor started since.
   [[nodiscard]] bool holdsBack(std::optional<uint64_t> refused) const;
   std::function<void()> completionNotifier_;
+  uint64_t traceSequence_ = 0;
   std::optional<Pending> pending_;
   // When the latest command retired, until a tick finds nothing to do.
   std::optional<double> busySinceMilliseconds_;

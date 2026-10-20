@@ -312,7 +312,9 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
         resources->memoryGovernor().allocationAdmission()(
             budget.sharedPrefillBytes + budget.sharedDecodeBytes, [&] {
               try {
-                modelRuntime = model::createRuntime(resources->modelContext());
+                auto context = resources->modelContext();
+                context.trace = config.nativeLoop.engine.trace;
+                modelRuntime = model::createRuntime(context);
               } catch (const metal::MetalAllocationError &error) {
                 refusal = error.what();
                 throw;

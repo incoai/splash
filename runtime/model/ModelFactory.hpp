@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Trace.hpp"
+
 #include "ops/Vision.hpp"
 #include "DFlashDraft.hpp"
 #include "ModelDescriptor.hpp"
@@ -81,6 +83,8 @@ struct RuntimeContext final {
   const ops::ExecutionPlans &operators;
   // The prefill FFN's Neural Engine split (engine::startAneFfn), if any.
   ops::AneFfn *aneFfn = nullptr;
+  // Optional startup-configured observer, owned longer than all tickets.
+  TraceSink *trace = nullptr;
 };
 
 // Validates only the interface between independently defined target and draft
