@@ -81,6 +81,7 @@ SERVER_FILES = (
     "thinking.py",
     "schema_validation.py",
     "crash_trace.py",
+    "videos.py",
     "chat.html",
     "favicon.svg",
 )
