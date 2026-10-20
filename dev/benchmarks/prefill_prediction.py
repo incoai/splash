@@ -16,10 +16,10 @@ from pathlib import Path
 from dev.benchmarks import trace_report
 
 
-def bucket(rows, history):
+def bucket(rows, history, ane=False):
     row_bucket = sum(rows > boundary for boundary in (128, 512))
     history_bucket = sum(history > boundary for boundary in (1023, 4095, 16383))
-    return row_bucket, history_bucket
+    return row_bucket, history_bucket, ane
 
 
 def evaluate(observations, minimum_samples=3, seed=None):
@@ -48,7 +48,7 @@ def evaluate(observations, minimum_samples=3, seed=None):
         rows, history, actual = row["rows"], row["maximum_history"], row["wall_ms"]
         if history < 0 or rows > 2048 or not math.isfinite(actual) or actual <= 0:
             raise ValueError("invalid prefill observation")
-        key = bucket(rows, history)
+        key = bucket(rows, history, row.get("predicted_ane", False))
         count, cost = buckets.get(key, (0, 0.0))
         if global_cost is not None:
             local = cost if count >= minimum_samples else global_cost

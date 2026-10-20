@@ -65,6 +65,10 @@ struct EngineConfig final {
   // Optional development trace. The owner outlives the engine; null does
   // not read an instrumentation clock or allocate trace storage.
   TraceSink *trace = nullptr;
+  // Experimental bounded prefill cost buckets, disabled by default. The
+  // callback follows the runtime's currently available ANE split.
+  bool bucketedPrefill = false;
+  std::function<bool(uint32_t)> prefillUsesAne;
 };
 
 // While an active one lives, allocations are memory a request in service

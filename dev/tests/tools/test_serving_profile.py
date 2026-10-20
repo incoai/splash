@@ -67,6 +67,7 @@ class TraceReportTests(unittest.TestCase):
             {
                 "traceEvents": [
                     event("prefill.seed", 0, 0, rows=2048, value=256),
+                    event("prefill.prediction", 1, 0, id=9, flags=1, value=45),
                     event("prefill.lane", 1, 0, id=9, flags=1, rows=64, context=8192),
                     event("prefill.lane", 1, 0, id=9, flags=0, rows=128, context=32),
                     event(
@@ -84,6 +85,8 @@ class TraceReportTests(unittest.TestCase):
             }
         )
         self.assertEqual(report["prefill_seeds"], [{"rows": 2048, "wall_ms": 256}])
+        self.assertEqual(report["prefill_observations"][0]["predicted_wall_ms"], 45)
+        self.assertTrue(report["prefill_observations"][0]["predicted_ane"])
         self.assertEqual(
             report["prefill_observations"][0]["lanes"],
             [

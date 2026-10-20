@@ -60,7 +60,7 @@ std::string resourceTimeoutMessage(metal::AllocationFailure failure) {
 Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
                EngineEventSink &events)
     : config_(config), cache_(cache), writeBehind_(cache), model_(model),
-      events_(events), scheduler_(config_.decodeShare) {
+      events_(events), scheduler_(config_.decodeShare, config_.bucketedPrefill, config_.prefillUsesAne) {
   if (!config_.maxContext || !config_.vocabularySize) {
     throw std::invalid_argument("context and vocabulary sizes must be positive");
   }
@@ -328,6 +328,13 @@ bool Engine::tick(double now) {
         for (const BatchItem &item : plan->items)
           rows += plan->kind == WorkKind::Prefill ? item.tokenCount
                                                  : model::ExecutionLimits::targetVerifyRows;
+        if (plan->kind == WorkKind::Prefill) {
+          const double instant = traceSeconds();
+          config_.trace->record({"prefill.prediction", 1, instant, instant, traceId,
+                                 plan->width(), rows, 0,
+                                 uint32_t{config_.prefillUsesAne && config_.prefillUsesAne(rows)},
+                                 scheduler_.predictPrefill(*plan)});
+        }
         for (uint32_t lane = 0; lane < items.size(); ++lane) {
           const ModelBatchItem &item = items[lane];
           context = std::max(context, item.logicalPosition);

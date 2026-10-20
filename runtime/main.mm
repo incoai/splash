@@ -221,6 +221,12 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.relaunchContext = arguments.relaunchContext;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
+  if (const char *value = std::getenv("SPLASH_PREFILL_COST_MODEL")) {
+    const std::string_view model(value);
+    if (model != "ema" && model != "bucketed")
+      throw engine::UsageError("SPLASH_PREFILL_COST_MODEL must be ema or bucketed");
+    config.nativeLoop.engine.bucketedPrefill = model == "bucketed";
+  }
   return config;
 }
 

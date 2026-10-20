@@ -320,9 +320,23 @@ uint32_t Scheduler::prefillBudget(
   const uint32_t maximum = model::ExecutionLimits::prefillTokenBudget;
   if (prefillMillisecondsPerToken_ <= 0.0)
     return maximum;
+  const auto prediction = [&](uint32_t budget) {
+    if (!bucketedPrefill_) return budget * prefillMillisecondsPerToken_;
+    std::array<BatchItem, model::ExecutionLimits::maximumBatchWidth> items{};
+    uint32_t count = 0, remaining = budget;
+    for (const PrefillRequestView &view : ready) {
+      if (!remaining || view.request->spec.priority != leader.request->spec.priority || count == items.size())
+        break;
+      const uint32_t take = std::min(view.request->spec.prefillTokens - view.promptProcessed, remaining);
+      items[count++] = {view.request->spec.id, take, view.promptProcessed};
+      remaining -= take;
+    }
+    // With insufficient matching history, preserve the old capacity-based
+    // estimate exactly, even when a short leader uses fewer actual rows.
+    return predictPrefill(std::span(items).first(count), budget);
+  };
   uint32_t rows = maximum;
-  while (rows > kMinimumPrefillRows &&
-         rows * prefillMillisecondsPerToken_ > kContendedPrefillMilliseconds)
+  while (rows > kMinimumPrefillRows && prediction(rows) > kContendedPrefillMilliseconds)
     rows /= 2;
   const uint32_t leaderRemaining =
       leader.request->spec.prefillTokens - leader.promptProcessed;
@@ -405,6 +419,8 @@ void Scheduler::commit(const BatchPlan &plan, std::span<const uint64_t> excluded
   }
   excluded_.assign(excluded.begin(), excluded.end());
   active_ = plan;
+  activePrefillAne_ = bucketedPrefill_ && plan.kind == WorkKind::Prefill &&
+                       prefillUsesAne_ && prefillUsesAne_(prefillRows(plan.items));
   lastCommittedKind_ = plan.kind;
   if (plan.kind == WorkKind::Prefill) {
     ++counters_.prefillBatches;
@@ -479,6 +495,15 @@ void Scheduler::complete(const BatchPlan &plan,
     for (const BatchItem &item : plan.items)
       rows += item.tokenCount;
     observePrefill(rows, wallMilliseconds);
+    if (bucketedPrefill_ && rows >= kMinimumPrefillRows &&
+        std::isfinite(wallMilliseconds) && wallMilliseconds > 0.0) {
+      PrefillCost &cost = prefillCosts_[prefillCostKey(plan.items, activePrefillAne_)];
+      const double observed = wallMilliseconds / rows;
+      cost.millisecondsPerToken = cost.samples
+          ? (1.0 - kPrefillTimeWeight) * cost.millisecondsPerToken + kPrefillTimeWeight * observed
+          : observed;
+      cost.samples = std::min<uint8_t>(3, cost.samples + 1);
+    }
   }
   // While requests of the same or a higher priority decode, lanes this
   // prefill finished included, it owes decode a share of its time; decode
@@ -516,6 +541,46 @@ void Scheduler::dropStaleDecodeDebt() noexcept {
       });
   if (!decoding)
     decodeDebtMilliseconds_ = 0.0;
+}
+
+uint32_t Scheduler::prefillRows(std::span<const BatchItem> items) {
+  if (items.size() > model::ExecutionLimits::maximumBatchWidth)
+    throw std::invalid_argument("invalid prefill prediction geometry");
+  uint64_t rows = 0;
+  for (const BatchItem &item : items) {
+    if (!item.tokenCount) throw std::invalid_argument("invalid prefill prediction geometry");
+    rows += item.tokenCount;
+  }
+  if (rows > model::ExecutionLimits::prefillTokenBudget)
+    throw std::invalid_argument("invalid prefill prediction geometry");
+  return static_cast<uint32_t>(rows);
+}
+
+uint32_t Scheduler::prefillCostKey(std::span<const BatchItem> items, bool ane) {
+  const uint32_t rows = prefillRows(items);
+  double weightedHistory = 0.0;
+  for (const BatchItem &item : items)
+    weightedHistory += double(item.tokenCount) * item.promptOffset;
+  const double history = rows ? weightedHistory / rows : 0.0;
+  const uint32_t rowBand = uint32_t{rows > 128} + uint32_t{rows > 512};
+  const uint32_t historyBand = uint32_t{history > 1023} + uint32_t{history > 4095} + uint32_t{history > 16383};
+  return (((rowBand * 4 + historyBand) * model::ExecutionLimits::maximumBatchWidth +
+            items.size() - 1) * 2) + ane;
+}
+
+double Scheduler::predictPrefill(std::span<const BatchItem> items, uint32_t fallbackRows) const {
+  if (bucketedPrefill_ && !items.empty()) {
+    const uint32_t rows = prefillRows(items);
+    const bool ane = prefillUsesAne_ && prefillUsesAne_(rows);
+    const PrefillCost &cost = prefillCosts_[prefillCostKey(items, ane)];
+    if (cost.samples >= 3) return rows * cost.millisecondsPerToken;
+  }
+  return fallbackRows * prefillMillisecondsPerToken_;
+}
+
+double Scheduler::predictPrefill(const BatchPlan &plan) const {
+  if (plan.kind != WorkKind::Prefill || plan.items.empty()) return 0.0;
+  return predictPrefill(plan.items, prefillRows(plan.items));
 }
 
 void Scheduler::observePrefill(uint32_t rows, double wallMilliseconds) {

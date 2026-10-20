@@ -46,6 +46,7 @@ def summarize(document):
     counters = {}
     prefill_lanes = collections.defaultdict(list)
     seeds = []
+    predictions = {}
     confidence = []
     active = []
     for event in document["traceEvents"]:
@@ -66,6 +67,12 @@ def summarize(document):
             active.append((event["ts"], event["ts"] + event["dur"]))
         if event["name"] == "metal.command_span":
             commands.append(event)
+        if event["name"] == "prefill.prediction":
+            values = event["args"]
+            predictions[values["id"]] = {
+                "predicted_wall_ms": values["value"],
+                "predicted_ane": bool(values["flags"] & 1),
+            }
         if event["name"] == "prefill.lane":
             values = event["args"]
             prefill_lanes[values["id"]].append(
@@ -140,6 +147,7 @@ def summarize(document):
             {
                 **row,
                 **counters.get(row["batch_id"], {}),
+                **predictions.get(row["batch_id"], {}),
                 "lanes": sorted(
                     prefill_lanes.get(row["batch_id"], []),
                     key=lambda lane: lane["lane"],

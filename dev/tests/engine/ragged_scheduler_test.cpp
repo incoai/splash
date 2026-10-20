@@ -410,8 +410,8 @@ void testConstrainedDecodeRemainsSeparate() {
           "constrained decode lost its independent mask pipeline");
 }
 
-void testPrefillAndDecodeAlternateWithoutStarvation() {
-  engine::Scheduler scheduler(0.0);
+void testPrefillAndDecodeAlternateWithoutStarvation(bool bucketed = false) {
+  engine::Scheduler scheduler(0.0, bucketed);
   scheduler.submit(request(1, 1));
   scheduler.submit(request(2, 10'000));
   scheduler.resourcesReady(1, 1);
@@ -451,9 +451,9 @@ void runContendedPrefill(engine::Scheduler &scheduler) {
   completePrefill(scheduler, prefill, 500.0);
 }
 
-void testDecodeRepaysItsShareOfContendedPrefill() {
+void testDecodeRepaysItsShareOfContendedPrefill(bool bucketed = false) {
   for (const double share : {0.0, 0.5}) {
-    engine::Scheduler scheduler(share);
+    engine::Scheduler scheduler(share, bucketed);
     runContendedPrefill(scheduler);
     // At 0.5 the prefill owes 250 ms, five 50 ms decode commands; with no
     // share the kinds alternate one command each.
@@ -545,8 +545,8 @@ void testDecodeDebtLeavesWithTheLastDecoder() {
   }
 }
 
-void testHigherPriorityPrefillPrecedesDecodeDebt() {
-  engine::Scheduler scheduler(0.5);
+void testHigherPriorityPrefillPrecedesDecodeDebt(bool bucketed = false) {
+  engine::Scheduler scheduler(0.5, bucketed);
   runContendedPrefill(scheduler);
   scheduler.submit(request(3, 20'000, false, RequestPriority::Foreground));
   scheduler.resourcesReady(3, 0);
@@ -613,8 +613,8 @@ void testMeasuredBudgetUsesActualRowsAndRecovers() {
           "prefill budget did not adapt when measured execution became faster");
 }
 
-void testMeasuredBudgetPreservesPriority() {
-  engine::Scheduler scheduler(0.0);
+void testMeasuredBudgetPreservesPriority(bool bucketed = false) {
+  engine::Scheduler scheduler(0.0, bucketed);
   scheduler.submit(request(1, 20'000, false, RequestPriority::Foreground));
   scheduler.resourcesReady(1, 0);
   completePrefill(scheduler, *scheduler.next({}), 4096.0);
@@ -765,8 +765,8 @@ void testShortArrivalBesideLongPrefillEndsAtItsLastRow() {
           "two short arrivals shared a command instead of finishing in turn");
 }
 
-void testMeasuredBudgetRetainsOvertakingBound() {
-  engine::Scheduler scheduler(0.0);
+void testMeasuredBudgetRetainsOvertakingBound(bool bucketed = false) {
+  engine::Scheduler scheduler(0.0, bucketed);
   scheduler.submit(request(1, 20'000));
   scheduler.resourcesReady(1, 0);
   completePrefill(scheduler, *scheduler.next({}), 4096.0);
@@ -1044,10 +1044,121 @@ void testReplayKeepsHeldInitialMask() {
           "the replay dropped the held first mask's selection");
 }
 
+// Resource cuts can produce any valid actual shape. Feed those actual
+// plans through commit/complete, rather than training on capacity or looking
+// at the command whose cost is being predicted.
+void trainCost(Scheduler &scheduler, uint64_t id, uint32_t history,
+               double milliseconds, bool representative = true) {
+  scheduler.submit(request(id, history + 2048));
+  scheduler.resourcesReady(id, history);
+  BatchPlan plan{.kind = WorkKind::Prefill, .items = {{id, 2048, history}}};
+  completePrefill(scheduler, plan, milliseconds, representative);
+  scheduler.cancel(id);
+  scheduler.remove(id);
+}
+
+void testBucketedCostRequiresEarlierMatchingSamples() {
+  Scheduler current(0.0), candidate(0.0, true);
+  const BatchPlan geometry{.kind = WorkKind::Prefill, .items = {{1, 2048, 0}}};
+  for (uint64_t id = 1; id <= 3; ++id) {
+    trainCost(current, id, 0, 200);
+    trainCost(candidate, id, 0, 200);
+    if (id < 3) {
+      current.observePrefill(2048, 800);
+      candidate.observePrefill(2048, 800);
+      require(candidate.predictPrefill(geometry) == current.predictPrefill(geometry),
+              "insufficient bucket samples changed the EMA fallback");
+    }
+  }
+  require(candidate.predictPrefill(geometry) == 200 && current.predictPrefill(geometry) > 300,
+          "matching samples did not learn their own cost regime");
+  BatchPlan unfamiliar = geometry;
+  unfamiliar.items.front().promptOffset = 32768;
+  require(candidate.predictPrefill(unfamiliar) == current.predictPrefill(unfamiliar),
+          "an unseen history borrowed a different bucket's cost");
+  unfamiliar.items.resize(5, {1, 1, 0});
+  rejects([&] { (void)candidate.predictPrefill(unfamiliar); },
+          "invalid prefill prediction geometry", "prediction accepted more than four lanes");
+}
+
+void testBucketedCostSeparatesAneAndRejectsAuxiliaryTiming() {
+  bool ane = true;
+  Scheduler scheduler(0.0, true, [&](uint32_t rows) { return ane && rows >= 512; });
+  const BatchPlan geometry{.kind = WorkKind::Prefill, .items = {{1, 2048, 0}}};
+  for (uint64_t id = 1; id <= 3; ++id) trainCost(scheduler, id, 0, 200);
+  ane = false;
+  for (uint64_t id = 4; id <= 6; ++id) trainCost(scheduler, id, 0, 800);
+  require(scheduler.predictPrefill(geometry) == 800, "GPU timing reused the split's faster samples");
+  trainCost(scheduler, 7, 0, 10000, false);
+  require(scheduler.predictPrefill(geometry) == 800, "auxiliary/rerun time trained a text bucket");
+  ane = true;
+  require(scheduler.predictPrefill(geometry) == 200, "split timing reused the GPU-only samples");
+}
+
+void testBucketedCostKeepsTheSubmittedPathWhenTheSplitRetires() {
+  bool split = true;
+  Scheduler scheduler(0.0, true, [&](uint32_t) { return split; });
+  const BatchPlan geometry{.kind = WorkKind::Prefill, .items = {{1, 2048, 0}}};
+  for (uint64_t id = 1; id <= 3; ++id) {
+    split = true;
+    scheduler.submit(request(id, 2048));
+    scheduler.resourcesReady(id, 0);
+    const BatchPlan plan{.kind = WorkKind::Prefill, .items = {{id, 2048, 0}}};
+    scheduler.commit(plan, {});
+    split = false; // A successful command's breaker can retire it at finish.
+    const std::array result{StepResult{id, 2048, false, DecodeStage::Regular}};
+    scheduler.complete(plan, result, 200, true);
+    scheduler.cancel(id);
+    scheduler.remove(id);
+  }
+  for (uint32_t i = 0; i < 20; ++i) scheduler.observePrefill(2048, 800);
+  require(scheduler.predictPrefill(geometry) > 790,
+          "retirement filed a split command under the subsequent GPU path");
+  split = true;
+  require(scheduler.predictPrefill(geometry) == 200,
+          "submitted split timing was lost when its availability changed at completion");
+}
+
+void testBucketedCostUsesEveryRaggedLaneAndPreservesTheCeiling() {
+  Scheduler scheduler(0.0, true);
+  for (uint64_t round = 0; round < 3; ++round) {
+    const uint64_t shortId = 2 * round + 1, longId = shortId + 1;
+    scheduler.submit(request(shortId, 128));
+    scheduler.resourcesReady(shortId, 0);
+    scheduler.submit(request(longId, 65536));
+    scheduler.resourcesReady(longId, 32768);
+    const BatchPlan plan{.kind = WorkKind::Prefill,
+                         .items = {{shortId, 128, 0}, {longId, 1920, 32768}}};
+    completePrefill(scheduler, plan, 819.2);
+    for (uint64_t id : {shortId, longId}) { scheduler.cancel(id); scheduler.remove(id); }
+  }
+  // Make the global fallback fast. The learned high-history ragged bucket
+  // must still bound a batch whose leading lane has no history.
+  for (uint32_t i = 0; i < 20; ++i) scheduler.observePrefill(2048, 200);
+  scheduler.submit(request(100, 1));
+  scheduler.resourcesReady(100, 1);
+  completeDecode(scheduler);
+  scheduler.submit(request(101, 128));
+  scheduler.resourcesReady(101, 0);
+  scheduler.submit(request(102, 65536));
+  scheduler.resourcesReady(102, 32768);
+  const BatchPlan plan = *scheduler.next({});
+  require(plan.kind == WorkKind::Prefill && plan.width() == 2 &&
+              plan.items[0].requestId == 101 && plan.items[0].tokenCount == 128 &&
+              plan.items[1].requestId == 102 && plan.items[1].tokenCount == 896,
+          "bucketed planning ignored a non-leading lane's history or changed shortest-first order");
+  require(scheduler.predictPrefill(plan) > 400 && scheduler.predictPrefill(plan) < 500,
+          "ragged prediction used the leader instead of actual per-lane rows/history");
+}
+
 } // namespace
 
 int main() {
   try {
+    testBucketedCostRequiresEarlierMatchingSamples();
+    testBucketedCostSeparatesAneAndRejectsAuxiliaryTiming();
+    testBucketedCostKeepsTheSubmittedPathWhenTheSplitRetires();
+    testBucketedCostUsesEveryRaggedLaneAndPreservesTheCeiling();
     testAdmissionSharesDispatchOrderAndBudget();
     testAdmissionRespectsContendedBudgetAndDecodePriority();
     testHighestRunnablePriority();
@@ -1065,15 +1176,19 @@ int main() {
     testRejectedCommitCountsNothing();
     testConstrainedDecodeRemainsSeparate();
     testPrefillAndDecodeAlternateWithoutStarvation();
+    testPrefillAndDecodeAlternateWithoutStarvation(true);
     testDecodeRepaysItsShareOfContendedPrefill();
+    testDecodeRepaysItsShareOfContendedPrefill(true);
     testMaskWaitAccruesNoDecodeDebt();
     testExcludedLanesAreNotPlanned();
     testDecodeDebtLeavesWithTheLastDecoder();
     testHigherPriorityPrefillPrecedesDecodeDebt();
+    testHigherPriorityPrefillPrecedesDecodeDebt(true);
     testMeasuredBudgetOnlyLimitsContendedWork();
     testAuxiliaryWorkDoesNotTrainTextPrefillTiming();
     testMeasuredBudgetUsesActualRowsAndRecovers();
     testMeasuredBudgetPreservesPriority();
+    testMeasuredBudgetPreservesPriority(true);
     testUnavailableTimingAndMinimumBudget();
     testMeasuredBudgetDoesNotCountBlockedPeers();
     testMeasuredBudgetPreservesPurePrefillThroughput();
@@ -1081,6 +1196,7 @@ int main() {
     testMeasuredBudgetFinishesShortPrefillPromptly();
     testShortArrivalBesideLongPrefillEndsAtItsLastRow();
     testMeasuredBudgetRetainsOvertakingBound();
+    testMeasuredBudgetRetainsOvertakingBound(true);
     testPriorityPrecedesWorkKindAlternation();
     testPrefillCommandContainsOnePriorityTier();
     testDecodeCommandContainsOnePriorityTier();

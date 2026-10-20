@@ -301,6 +301,11 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
       config.resources.model.hasVision() ? config.resources.maximumImagePatches
                                          : 0;
 
+  if (config.nativeLoop.engine.bucketedPrefill || config.nativeLoop.engine.trace) {
+    auto *split = resources->modelContext().aneFfn;
+    if (split) config.nativeLoop.engine.prefillUsesAne = [split](uint32_t rows) { return split->splits(rows); };
+  }
+
   std::unique_ptr<model::RuntimeModel> modelRuntime;
   try {
     // The plan's fixed bytes already proved the arenas' sum fits.

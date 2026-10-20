@@ -5,6 +5,8 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
+#include <utility>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -63,10 +65,15 @@ class Scheduler final {
 public:
   // Decode time owed for each unit of time a prefill runs while requests of
   // equal or higher priority decode; zero alternates one command of each kind.
-  explicit Scheduler(double decodeShare) noexcept : decodeShare_(decodeShare) {}
+  explicit Scheduler(double decodeShare, bool bucketedPrefill = false,
+                     std::function<bool(uint32_t)> prefillUsesAne = {})
+      : decodeShare_(decodeShare), bucketedPrefill_(bucketedPrefill),
+        prefillUsesAne_(std::move(prefillUsesAne)) {}
 
   void submit(RequestSpec request);
   void observePrefill(uint32_t rows, double wallMilliseconds);
+  // Actual command geometry, after resource/capture cuts; zero before a seed.
+  [[nodiscard]] double predictPrefill(const BatchPlan &plan) const;
   void deferAdmission(uint64_t requestId);
   void waitForResources(uint64_t requestId);
   void waitForPrefix(uint64_t requestId);
@@ -147,6 +154,14 @@ private:
   // last one leaves, a later decoder starts without it.
   void dropStaleDecodeDebt() noexcept;
 
+  struct PrefillCost final {
+    double millisecondsPerToken = 0.0;
+    uint8_t samples = 0;
+  };
+  [[nodiscard]] static uint32_t prefillCostKey(std::span<const BatchItem> items, bool ane);
+  [[nodiscard]] double predictPrefill(std::span<const BatchItem> items, uint32_t fallbackRows) const;
+  [[nodiscard]] static uint32_t prefillRows(std::span<const BatchItem> items);
+
   std::unordered_map<uint64_t, Request> requests_;
   std::optional<BatchPlan> active_;
   // The lanes the active command was planned without.
@@ -155,6 +170,12 @@ private:
   uint64_t decodeDispatchOrder_ = 0;
   double prefillMillisecondsPerToken_ = 0.0;
   double decodeShare_;
+  bool bucketedPrefill_ = false;
+  std::function<bool(uint32_t)> prefillUsesAne_;
+  bool activePrefillAne_ = false;
+  // Three actual-row bands, four row-weighted history bands, four widths
+  // and the GPU/ANE path. Per-runtime storage never grows or persists.
+  std::array<PrefillCost, 3 * 4 * 4 * 2> prefillCosts_{};
   // Decode time that prefill still owes the lanes that decoded beside it
   // (not those waiting for a mask): equal-priority decode runs until its
   // commands' wall time has worked it off.
