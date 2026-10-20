@@ -93,5 +93,9 @@ clear `max(2%, 2 * measured noise)` without correctness/latency regressions;
 spread above 5% is inconclusive. Other Apple GPU families remain unexecuted
 until the [maintainer package](https://github.com/incoai/splash/pull/510) runs there.
 
-Local performance qualification is in progress. This document states the
-implementation and test contract; it does not claim a qualified gain.
+Local performance qualification is complete. The [M5 Pro evidence bundle](results/qwen-gdn-live-prefixes-m5-pro/README.md)
+contains 4,096 native cycle samples, production HTTP comparisons, disabled-path
+controls, source/model/build identities and five passing shader/oracle logs.
+Stable native gains are 0.11–1.20%; none clears the 2% minimum. No HTTP trial
+clears its noise-adjusted gate. Keep the flag off and PR #511 in draft as a
+reviewable experiment; this is a measured decision against promoting it.

@@ -1,0 +1,146 @@
+2026-10-20 23:19:49.463 gdn-decode[1163:5828582] Metal GPU Validation Enabled
+bf16 state vh48 lanes 1 plain: the fp32 decode's rows and its state rounded
+bf16 state vh48 lanes 1 Table16: the fp32 decode's rows and its state rounded
+bf16 state vh48 lanes 1 plain f32 norm: the fp32 decode's rows and its state rounded
+bf16 state vh48 lanes 1 Table16 f32 norm: the fp32 decode's rows and its state rounded
+bf16 state vh48 lanes 4 plain: the fp32 decode's rows and its state rounded
+bf16 state vh48 lanes 4 Table16: the fp32 decode's rows and its state rounded
+bf16 state vh48 lanes 4 plain f32 norm: the fp32 decode's rows and its state rounded
+bf16 state vh48 lanes 4 Table16 f32 norm: the fp32 decode's rows and its state rounded
+bf16 state vh32 lanes 1 plain: the fp32 decode's rows and its state rounded
+bf16 state vh32 lanes 1 Table16: the fp32 decode's rows and its state rounded
+bf16 state vh32 lanes 1 plain f32 norm: the fp32 decode's rows and its state rounded
+bf16 state vh32 lanes 1 Table16 f32 norm: the fp32 decode's rows and its state rounded
+bf16 state vh32 lanes 4 plain: the fp32 decode's rows and its state rounded
+bf16 state vh32 lanes 4 Table16: the fp32 decode's rows and its state rounded
+bf16 state vh32 lanes 4 plain f32 norm: the fp32 decode's rows and its state rounded
+bf16 state vh32 lanes 4 Table16 f32 norm: the fp32 decode's rows and its state rounded
+live prefixes vh48 lanes 1 plain bf16 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 1 Table16 bf16 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 1 plain bf16 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 1 Table16 bf16 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 1 plain bf16 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 1 Table16 bf16 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 1 plain bf16 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 1 Table16 bf16 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 1 plain f32 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 1 Table16 f32 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 1 plain f32 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 1 Table16 f32 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 1 plain f32 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 1 Table16 f32 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 1 plain f32 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 1 Table16 f32 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 2 plain bf16 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 2 Table16 bf16 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 2 plain bf16 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 2 Table16 bf16 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 2 plain bf16 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 2 Table16 bf16 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 2 plain bf16 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 2 Table16 bf16 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 2 plain f32 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 2 Table16 f32 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 2 plain f32 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 2 Table16 f32 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 2 plain f32 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 2 Table16 f32 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 2 plain f32 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 2 Table16 f32 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 3 plain bf16 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 3 Table16 bf16 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 3 plain bf16 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 3 Table16 bf16 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 3 plain bf16 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 3 Table16 bf16 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 3 plain bf16 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 3 Table16 bf16 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 3 plain f32 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 3 Table16 f32 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 3 plain f32 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 3 Table16 f32 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 3 plain f32 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 3 Table16 f32 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 3 plain f32 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 3 Table16 f32 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 4 plain bf16 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 4 Table16 bf16 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 4 plain bf16 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 4 Table16 bf16 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 4 plain bf16 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 4 Table16 bf16 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 4 plain bf16 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 4 Table16 bf16 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 4 plain f32 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 4 Table16 f32 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 4 plain f32 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 4 Table16 f32 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 4 plain f32 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 4 Table16 f32 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 4 plain f32 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh48 lanes 4 Table16 f32 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 1 plain bf16 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 1 Table16 bf16 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 1 plain bf16 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 1 Table16 bf16 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 1 plain bf16 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 1 Table16 bf16 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 1 plain bf16 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 1 Table16 bf16 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 1 plain f32 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 1 Table16 f32 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 1 plain f32 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 1 Table16 f32 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 1 plain f32 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 1 Table16 f32 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 1 plain f32 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 1 Table16 f32 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 2 plain bf16 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 2 Table16 bf16 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 2 plain bf16 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 2 Table16 bf16 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 2 plain bf16 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 2 Table16 bf16 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 2 plain bf16 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 2 Table16 bf16 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 2 plain f32 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 2 Table16 f32 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 2 plain f32 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 2 Table16 f32 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 2 plain f32 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 2 Table16 f32 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 2 plain f32 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 2 Table16 f32 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 3 plain bf16 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 3 Table16 bf16 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 3 plain bf16 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 3 Table16 bf16 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 3 plain bf16 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 3 Table16 bf16 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 3 plain bf16 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 3 Table16 bf16 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 3 plain f32 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 3 Table16 f32 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 3 plain f32 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 3 Table16 f32 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 3 plain f32 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 3 Table16 f32 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 3 plain f32 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 3 Table16 f32 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 4 plain bf16 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 4 Table16 bf16 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 4 plain bf16 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 4 Table16 bf16 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 4 plain bf16 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 4 Table16 bf16 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 4 plain bf16 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 4 Table16 bf16 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 4 plain f32 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 4 Table16 f32 norm fp32 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 4 plain f32 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 4 Table16 f32 norm fp32 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 4 plain f32 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 4 Table16 f32 norm bf16 state grouped: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 4 plain f32 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+live prefixes vh32 lanes 4 Table16 f32 norm bf16 state tiled: all live/retained prefixes and pending transitions match
+gdn_decode_metal_test: PASS

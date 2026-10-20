@@ -1,0 +1,149 @@
+2026-10-20 23:17:10.569 model-runtime-oracle[986:5826890] Metal GPU Validation Enabled
+ane_ffn_outcome=unsupported the target has no dense FFN layers
+ane_ffn_context=262144 no_ane_context=262144
+ane_ffn_share=0 ane_ffn_minimum_rows=0
+image scenarios: skipped, the model serves text only
+TOKENS 11 2814 47675 25605 11 321 60445 55404
+accepted=7 drafted=7 target_length=136
+prefill_wall_seconds=0.223849 decode_cycle_wall_seconds=0.0506091
+non_finite_rows=PASS
+thinking_budget=PASS most_end_cycles=3
+constrained_thinking_budget=PASS
+captured_state_partition captured_conv_cos=1 captured_recurrent_cos=1 continued_conv_cos=1 continued_recurrent_cos=1 logits_cos=1 split=0/0/0/0 kv_alike=1
+states_captured_inside_commands=PASS
+captures_outlive_their_items=PASS
+partition_equivalence conv_cos=0.998507 parity=1/0 conv_norms=963.896/963.818 partition_other_conv_norm=973.198 recurrent_cos=0.999835 recurrent_norms=20.0134/20.0161
+partition_decisions tokens_equal=1 baseline_rows=1 partitioned_rows=1 accepted=0/0
+budget_mask_commits=PASS retained=2,3,4,5,6,7,8
+batch_decisions b4_tokens_equal_b1=1 accepted=0/0 rows=1/1
+multi_cycle_decisions b4_tokens_equal_b1=1 b4_acceptance_equal_b1=1 b2_tokens_equal_b1=1 b2_acceptance_equal_b1=1 b1_rows=16 b2_rows=16 b4_rows=16 b1_cycles=2 b2_cycles=2 b4_cycles=2
+preemption_decisions kind=0 transcript_equal=1 reference_rows=24 resumed_rows=24 preserved_prefix_rows=9
+preemption_sampling mode=0 cycle=0 rows=8 accepted=7
+preemption_sampling mode=0 cycle=1 rows=8 accepted=7
+preemption_sampling mode=0 cycle=2 rows=6 accepted=5
+preemption_sampling mode=0 cycle=3 rows=2 accepted=1
+preemption_sampling mode=1 cycle=0 rows=8 accepted=7
+preemption_sampling mode=1 cycle=1 rows=8 accepted=7
+preemption_sampling mode=1 cycle=2 rows=6 accepted=5
+preemption_sampling mode=1 cycle=3 rows=2 accepted=1
+preemption_sampling mode=2 cycle=0 rows=8 accepted=7
+preemption_sampling mode=2 cycle=1 rows=8 accepted=7
+preemption_sampling mode=2 cycle=2 rows=6 accepted=5
+preemption_sampling mode=2 cycle=3 rows=2 accepted=1
+preemption_sampling mode=2 cycle=0 rows=8 accepted=7
+preemption_sampling mode=2 cycle=1 rows=8 accepted=7
+preemption_sampling mode=2 cycle=2 rows=6 accepted=5
+preemption_sampling mode=2 cycle=3 rows=2 accepted=1
+preemption_decisions kind=1 transcript_equal=1 reference_rows=24 resumed_rows=24 preserved_prefix_rows=9
+preemption_decisions kind=2 transcript_equal=1 reference_rows=24 resumed_rows=24 preserved_prefix_rows=2
+penalty_probe control_drift=0 tolerance=0.1
+penalty_probe presence=-2 frequency=-2 repetition=1 changed=1 reference_loss=0 resumed_loss=0
+penalty_probe presence=1.5 frequency=0 repetition=1 changed=0 reference_loss=0 resumed_loss=0
+penalty_probe presence=1.5 frequency=0 repetition=1.3 changed=1 reference_loss=0 resumed_loss=0
+penalty_probe presence=0 frequency=0 repetition=3 changed=1 reference_loss=0 resumed_loss=0
+preemption_sampling mode=0 cycle=0 rows=8 accepted=7
+preemption_sampling mode=0 cycle=1 rows=8 accepted=7
+preemption_sampling mode=0 cycle=2 rows=6 accepted=5
+preemption_sampling mode=0 cycle=3 rows=2 accepted=1
+preemption_sampling mode=1 cycle=0 rows=8 accepted=7
+preemption_sampling mode=1 cycle=1 rows=8 accepted=7
+preemption_sampling mode=1 cycle=2 rows=6 accepted=5
+preemption_sampling mode=1 cycle=3 rows=2 accepted=1
+preemption_sampling mode=2 cycle=0 rows=8 accepted=7
+preemption_sampling mode=2 cycle=1 rows=8 accepted=7
+preemption_sampling mode=2 cycle=2 rows=6 accepted=5
+preemption_sampling mode=2 cycle=3 rows=2 accepted=1
+preemption_sampling mode=2 cycle=0 rows=8 accepted=7
+preemption_sampling mode=2 cycle=1 rows=8 accepted=7
+preemption_sampling mode=2 cycle=2 rows=6 accepted=5
+preemption_sampling mode=2 cycle=3 rows=2 accepted=1
+preemption_sampling mode=0 cycle=0 rows=8 accepted=7
+preemption_sampling mode=0 cycle=1 rows=8 accepted=7
+preemption_sampling mode=0 cycle=2 rows=6 accepted=5
+preemption_sampling mode=0 cycle=3 rows=2 accepted=1
+preemption_sampling mode=1 cycle=0 rows=8 accepted=7
+preemption_sampling mode=1 cycle=1 rows=8 accepted=7
+preemption_sampling mode=1 cycle=2 rows=6 accepted=5
+preemption_sampling mode=1 cycle=3 rows=2 accepted=1
+preemption_sampling mode=2 cycle=0 rows=8 accepted=7
+preemption_sampling mode=2 cycle=1 rows=8 accepted=7
+preemption_sampling mode=2 cycle=2 rows=6 accepted=5
+preemption_sampling mode=2 cycle=3 rows=2 accepted=1
+preemption_sampling mode=2 cycle=0 rows=8 accepted=7
+preemption_sampling mode=2 cycle=1 rows=8 accepted=7
+preemption_sampling mode=2 cycle=2 rows=6 accepted=5
+preemption_sampling mode=2 cycle=3 rows=2 accepted=1
+top_k -1 top_p=0.95 transcript_equal=1 rows=24
+preemption_sampling mode=0 cycle=0 rows=1 accepted=0
+preemption_sampling mode=0 cycle=1 rows=1 accepted=0
+preemption_sampling mode=0 cycle=2 rows=2 accepted=1
+preemption_sampling mode=0 cycle=3 rows=1 accepted=0
+preemption_sampling mode=0 cycle=4 rows=3 accepted=2
+preemption_sampling mode=0 cycle=5 rows=1 accepted=0
+preemption_sampling mode=0 cycle=6 rows=4 accepted=3
+preemption_sampling mode=0 cycle=7 rows=3 accepted=2
+preemption_sampling mode=0 cycle=8 rows=4 accepted=3
+preemption_sampling mode=0 cycle=9 rows=4 accepted=2
+preemption_sampling mode=1 cycle=0 rows=1 accepted=0
+preemption_sampling mode=1 cycle=1 rows=1 accepted=0
+preemption_sampling mode=1 cycle=2 rows=2 accepted=1
+preemption_sampling mode=1 cycle=3 rows=1 accepted=0
+preemption_sampling mode=1 cycle=4 rows=3 accepted=2
+preemption_sampling mode=1 cycle=5 rows=1 accepted=0
+preemption_sampling mode=1 cycle=6 rows=4 accepted=3
+preemption_sampling mode=1 cycle=7 rows=3 accepted=2
+preemption_sampling mode=1 cycle=8 rows=4 accepted=3
+preemption_sampling mode=1 cycle=9 rows=4 accepted=2
+preemption_sampling mode=2 cycle=0 rows=1 accepted=0
+preemption_sampling mode=2 cycle=1 rows=1 accepted=0
+preemption_sampling mode=2 cycle=2 rows=4 accepted=3
+preemption_sampling mode=2 cycle=3 rows=8 accepted=7
+preemption_sampling mode=2 cycle=4 rows=5 accepted=4
+preemption_sampling mode=2 cycle=5 rows=5 accepted=4
+preemption_sampling mode=2 cycle=0 rows=1 accepted=0
+preemption_sampling mode=2 cycle=1 rows=1 accepted=0
+preemption_sampling mode=2 cycle=2 rows=4 accepted=3
+preemption_sampling mode=2 cycle=3 rows=8 accepted=7
+preemption_sampling mode=2 cycle=4 rows=5 accepted=4
+preemption_sampling mode=2 cycle=5 rows=5 accepted=4
+top_k -1 top_p=1 transcript_equal=0 rows=24
+preemption_sampling mode=0 cycle=0 rows=8 accepted=7
+preemption_sampling mode=0 cycle=1 rows=8 accepted=7
+preemption_sampling mode=0 cycle=2 rows=6 accepted=5
+preemption_sampling mode=0 cycle=3 rows=2 accepted=1
+preemption_sampling mode=1 cycle=0 rows=8 accepted=7
+preemption_sampling mode=1 cycle=1 rows=8 accepted=7
+preemption_sampling mode=1 cycle=2 rows=6 accepted=5
+preemption_sampling mode=1 cycle=3 rows=2 accepted=1
+preemption_sampling mode=2 cycle=0 rows=8 accepted=7
+preemption_sampling mode=2 cycle=1 rows=8 accepted=7
+preemption_sampling mode=2 cycle=2 rows=6 accepted=5
+preemption_sampling mode=2 cycle=3 rows=2 accepted=1
+preemption_sampling mode=2 cycle=0 rows=8 accepted=7
+preemption_sampling mode=2 cycle=1 rows=8 accepted=7
+preemption_sampling mode=2 cycle=2 rows=6 accepted=5
+preemption_sampling mode=2 cycle=3 rows=2 accepted=1
+preemption_sampling mode=0 cycle=0 rows=8 accepted=7
+preemption_sampling mode=0 cycle=1 rows=8 accepted=7
+preemption_sampling mode=0 cycle=2 rows=6 accepted=5
+preemption_sampling mode=0 cycle=3 rows=2 accepted=1
+min_p 0.1 transcript_equal=1 rows=24 min_p 1 greedy_rows=24
+draft_telemetry_follows_plan=PASS
+discontinuous_capture_fails=PASS
+restored_ring draft_key_0 cosine=0.998994 maximum_absolute=0.367188
+restored_ring draft_value_0 cosine=0.992366 maximum_absolute=1.26172
+restored_ring draft_key_1 cosine=0.997203 maximum_absolute=0.392578
+restored_ring draft_value_1 cosine=0.995058 maximum_absolute=1.43164
+restored_ring draft_key_2 cosine=0.99733 maximum_absolute=0.425781
+restored_ring draft_value_2 cosine=0.995887 maximum_absolute=1.61719
+restored_ring draft_key_3 cosine=0.995822 maximum_absolute=0.431641
+restored_ring draft_value_3 cosine=0.997258 maximum_absolute=1.8125
+restored_ring draft_key_4 cosine=0.99707 maximum_absolute=0.519531
+restored_ring draft_value_4 cosine=0.996164 maximum_absolute=1.94141
+restored_ring draft_key_5 cosine=0.994666 maximum_absolute=0.40625
+restored_ring draft_value_5 cosine=0.996736 maximum_absolute=2.4375
+full_window_restore=PASS
+prefill_2048_wall_seconds=1.67497 b1_cycle_wall_seconds=0.0470869 b2_cycle_wall_seconds=0.0625435 b3_cycle_wall_seconds=0.0765815 b4_cycle_wall_seconds=0.0808848
+cache_restore_prefill_wall_seconds=0.040795 cache_restore_b1_cycle_wall_seconds=0.043467
+ane_ffn_reruns=0
+model_runtime_oracle_test: PASS
