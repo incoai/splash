@@ -2737,6 +2737,50 @@ version while its layout changes.
 
 ### Local benchmarks
 
+Experimental live verification for greedy MoE requests is off by default.
+`SPLASH_LIVE_VERIFY_THRESHOLD=0.1 ./splash serve --model <model>` enables it;
+values must be in `[0, 1]`, and zero retains the original graph. Each request
+keeps its anchor and a contiguous prefix whose cumulative draft confidence
+meets the threshold. Inactive rows contribute no routed or shared expert
+routes; matrix tiles can still compute padded rows. Sampled requests,
+constrained batches, forced thinking-end cycles and dense targets retain full verification.
+The fixed eight-row layout and existing draft files stay compatible.
+
+To evaluate a threshold, pass `DECODE_PROFILE_ARGS='--live-verify-threshold 0.1'`
+to `make benchmark-decode-profile MODEL=<model>`. The profiler reports live
+rows, tokens per cycle and fused throughput alongside kernel timings. The
+native runtime oracle also accepts `--live-verify-threshold`. Choose a
+threshold from end-to-end comparisons on the intended model, device, weight
+format and workload; confidence is a heuristic and no speedup is guaranteed.
+Dense-row packing needs separate measurements before implementation.
+
+For ordinary execution without dispatch attribution, add `--attribution off`.
+`--json-output PATH` saves each measured cycle's GPU/wall time, committed
+tokens, eligible expert rows, proposed/accepted tokens and prefix survival
+counts. `--trace-output PATH` saves a Chrome trace with host graph construction,
+backend preparation, Metal encoding, GPU execution and result finalization.
+Tracing is available only in instrumented benchmark builds. Each width warms
+its pipelines before measurement; attributed dispatch replays remain separate
+from fused throughput measurements.
+
+Run an off/on/on/off threshold sweep against one installed model with:
+
+```sh
+.venv/bin/python -m dev.benchmarks.verification_sweep \
+  --profile build/engine-tests/decode-profile \
+  --metallib build/splash.metallib --model-root /path/to/model \
+  --output build/verification-sweep --contexts 2048,8192 --cycles 16
+```
+
+The sweep records power and thermal conditions and applies the existing ABBA
+noise rule. Native runs may advance through different numbers of output
+tokens, so confirm any gain with matched HTTP workloads before selecting a
+default. Eligible expert rows do not count the unchanged full-width dense
+projections, attention or GDN work.
+
+See the [local Qwen evaluation](dev/benchmarks/deepinfer-qwen-results.md) for
+measured gains, correctness coverage and remaining qualification work.
+
 From a source checkout with the model installed, use the native benchmark for
 prefill, decode and batch measurements:
 
