@@ -13,7 +13,10 @@ namespace splash::ops {
 // object and production models borrow it; it never changes after creation.
 class ExecutionPlans final {
 public:
-  explicit ExecutionPlans(const DeviceCapabilities &device);
+  // `moeNumerics`: the MoE plans' numerics tier (MoeNumerics; splash serve
+  // --moe-numerics), BatchInvariant unless the engine opts in.
+  explicit ExecutionPlans(const DeviceCapabilities &device,
+                          MoeNumerics moeNumerics = MoeNumerics::BatchInvariant);
   [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
 
   [[nodiscard]] PrefillAttentionPlan prefillAttention(
@@ -47,6 +50,7 @@ private:
 
   Linear linear_;
   GpuFamilyClass family_;
+  MoeNumerics moeNumerics_;
 };
 
 } // namespace splash::ops

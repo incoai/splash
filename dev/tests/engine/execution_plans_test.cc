@@ -201,6 +201,31 @@ void ggufMoePlans() {
           "invalid MoE expert tile configuration", "a decode plan took 32-row tiles");
 }
 
+// The Fast numerics tier (ExecutionPlans' MoeNumerics) reaches the one-lane
+// decode plan on the staged tile alone: wider steps, prefill chunks (the
+// 8-row chunk among them, which also reads its rows in place) and Apple9's
+// register tile run as BatchInvariant, and no plan's workspace changes.
+void moeNumerics() {
+  for (uint32_t family : {9U, 10U, 11U}) {
+    const ExecutionPlans invariant(device(family)), fast(device(family), MoeNumerics::Fast);
+    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+      const MoePlan plan = fast.moeDecode(routedShape, lanes);
+      require(plan.configuration().numerics == MoeNumerics::Fast &&
+                  !invariant.moeDecode(routedShape, lanes).smallTilesInPlace() &&
+                  plan.smallTilesInPlace() == (lanes == 1 && family != 9),
+              "the Fast tier left the one-lane staged decode plan");
+      require(plan.workspace() == invariant.moeDecode(routedShape, lanes).workspace(),
+              "the Fast tier changed a decode workspace");
+    }
+    for (uint32_t rows : {1U, 8U, 9U, 2048U})
+      require(!fast.moePrefill(routedShape, rows).smallTilesInPlace() &&
+                  fast.moePrefill(routedShape, rows).workspace() == invariant.moePrefill(routedShape, rows).workspace(),
+              "the Fast tier reached a prefill plan");
+    require(fast.moeDecodeWorkspacePerLane(routedShape) == invariant.moeDecodeWorkspacePerLane(routedShape),
+            "the Fast tier changed the decode workspace bound");
+  }
+}
+
 // A device that reports no core count gets the plans of kAssumedGpuCores
 // cores, Linear and MoE alike.
 void unknownCoreCount() {
@@ -295,6 +320,7 @@ int main() {
   try {
     baselinePlans();
     ggufMoePlans();
+    moeNumerics();
     unknownCoreCount();
     workspaceBounds();
     invalidLookupsAndContextEdges();

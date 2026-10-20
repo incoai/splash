@@ -1862,6 +1862,15 @@ passes launch the live tiles alone: the grouping kernel writes each pass's grid 
 count, and the pass reads it as an indirect dispatch (`ComputeDispatch::indirectThreadgroups`).
 The staged tile runs gate and up in one pass where they share their routed and their shared
 formats, a gate and an up simdgroup on the same columns, bitwise the two passes' intermediate.
+A step whose 8 rows fill one staged tile reads them in place, one tile per expert, which runs the
+8-row matmul whatever rows route to the expert. With the Fast numerics tier (`MoeNumerics::Fast`,
+`MoePlan::smallTilesInPlace`) a one-lane decode step's grouping also counts and lists each
+expert's rows, and `moe_expert_gguf_fast_m8_<e>` and `moe_expert_gguf_fast_m8_gate_up` run an
+expert of at most `moe_fast_gemv_rows` rows for its pass's format through a register GEMV on those
+rows alone (`kernels/common/gguf_live_rows.h`), every other tile, the shared expert's always,
+through the default tile. A row's result then depends on how many of the step's rows share its
+expert: deterministic for a step's routes and inside the same fp64 bound, but not batch-invariant,
+so the default tier stays `invariant`; wider steps and prefill chunks run it under either.
 The float router and alpha/beta projections run in `kernels/shared/gguf_float.metal`, and the
 token rows are gathered by one template in `kernels/shared/embedding.metal`. These plans are
 fixed rules of GPU family, core count, shape and format.
@@ -1913,7 +1922,9 @@ format's up and the prefill tiles, each output inside the fp64 bound of
 split; and `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
 plan, the staged 8- and 32-row tiles and the Apple9 register tile whatever GPU runs it, each in
 every format it takes as each routed and shared expert tensor, against fp64, and bitwise against
-the full grids and two gate/up passes. The goldens and how to regenerate them are
+the full grids and two gate/up passes, and the Fast tier's one-lane plan on routes that give
+experts one, two, three and eight rows: a second run bitwise the first, and the shared expert's
+rows bitwise the default tier's. The goldens and how to regenerate them are
 in `dev/tests/fixtures/weight-goldens/`; with `SPLASH_GGML_ORACLE=<libggml-base.dylib>`,
 `gguf-reference` also compares the reference with GGML directly and prints GGML's hashes.
 
