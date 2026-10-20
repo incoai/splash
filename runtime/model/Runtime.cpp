@@ -6,6 +6,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/GDN.h"
+#include "metal/abi/LiveRows.h"
 #include "ops/AneFfn.hpp"
 #include "ops/Linear.hpp"
 #include "ops/PagedAttention.hpp"
@@ -22,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <list>
 #include <numeric>
@@ -308,6 +310,7 @@ struct Runtime::Impl {
     // The draft proposals the lane's thinking end replaced, which its
     // speculation counts leave out.
     uint32_t endDrafts = 0;
+    bool liveVerify = false;
     // Why the lane's selection is unusable (invalidSelection), found before
     // any lane commits.
     std::string failure;
@@ -365,6 +368,7 @@ struct Runtime::Impl {
   ops::Sampling sampling;
   QwenTarget targetModel;
   DFlashDraft draftModel;
+  float liveVerifyThreshold = 0.0F;
   ops::AneFfn *aneFfn;
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
@@ -424,6 +428,11 @@ struct Runtime::Impl {
     sampling.addVerify(graph, policies, samplingBuffers(2),
                        geometry.target.stopTokens[0],
                        geometry.target.stopTokens[1], penalties);
+    // Greedy warmup may take live acceptance. Sampled and constrained
+    // requests still need the ordinary acceptance pipeline ready at startup.
+    const std::array<uint32_t, 2> retained{kDecodeRows, kDecodeRows};
+    sampling.addAcceptance(graph, acceptanceBuffers(2, false), retained, policies,
+                           geometry.target.stopTokens[0], geometry.target.stopTokens[1]);
     backend.preparePipelines(graph.dispatches());
   }
 
@@ -1599,6 +1608,20 @@ struct Runtime::Impl {
     }
   }
 
+  bool useLiveVerifyRows(std::span<Request *const> entries) const noexcept {
+    return liveVerifyThreshold > 0.0F &&
+           geometry.target.ffnKind == QwenFfnKind::SparseMoe &&
+           std::any_of(entries.begin(), entries.end(), [](const Request *entry) {
+             return entry->sampling.temperature <= 0.0F;
+           }) &&
+           std::none_of(entries.begin(), entries.end(), [](const Request *entry) {
+             // Forced thinking-end tokens are not predictions. Preserve the
+             // existing full-block transition when a budget ends in this cycle.
+             const auto cutoff = samplingPolicy(*entry).thinkingCutoff;
+             return entry->constraint != ConstraintMode::None || (cutoff && cutoff->row < kDecodeRows);
+           });
+  }
+
   void encodeDraftBatchGraph(CommandGraph &graph,
                              std::span<Request *const> entries,
                              std::span<const uint64_t> logicalPositions) {
@@ -1651,16 +1674,20 @@ struct Runtime::Impl {
       anchors[lane] = *entry.pendingToken;
       policies[lane] = samplingPolicy(entry);
     }
-    draftModel.addSelection(
-        graph,
-        {d(DecodeTensor::Logits), d(DecodeTensor::TopPartialIds),
+    const ops::DraftSelectorBuffers selection{
+         d(DecodeTensor::Logits), d(DecodeTensor::TopPartialIds),
          d(DecodeTensor::TopPartialValues), d(DecodeTensor::Candidates),
          d(DecodeTensor::Unary), d(DecodeTensor::SelectorHidden),
          d(DecodeTensor::SamplingUniforms), d(DecodeTensor::ProposedTokens),
-         d(DecodeTensor::ProposalProbs)},
-        std::span(anchors).first(lanes), std::span(policies).first(lanes));
+         d(DecodeTensor::ProposalProbs)};
+    draftModel.addSelection(graph, selection, std::span(anchors).first(lanes),
+                             std::span(policies).first(lanes));
     sampling.addThinkingDrafts(graph, std::span(policies).first(lanes),
                                d(DecodeTensor::ProposedTokens));
+    if (useLiveVerifyRows(entries))
+      ops::DraftSelector(geometry.target.vocabularySize).addLiveRows(
+          graph, selection, d(DecodeTensor::LiveRows),
+          std::span(policies).first(lanes), liveVerifyThreshold);
   }
 
   void encodeTargetVerifyBatchForward(CommandGraph &graph,
@@ -1706,6 +1733,7 @@ struct Runtime::Impl {
     buffers.chunkKeys = chunkKeys;
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
+    if (useLiveVerifyRows(entries)) buffers.liveRows = d(DecodeTensor::LiveRows);
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chunks[lane] = ops::PagedAttention::verifyParams(
           items[lane].logicalPosition,
@@ -1785,6 +1813,18 @@ struct Runtime::Impl {
                                 std::span(startPositions).first(lanes));
   }
 
+  ops::AcceptanceBuffers acceptanceBuffers(uint32_t width, bool live) const {
+    return {decodeArena->batchSlice(DecodeTensor::ProposedTokens, width),
+            decodeArena->batchSlice(DecodeTensor::Candidates, width),
+            decodeArena->batchSlice(DecodeTensor::ProposalProbs, width),
+            decodeArena->batchSlice(DecodeTensor::TargetVocabularyRows, width),
+            decodeArena->batchSlice(DecodeTensor::SamplingUniforms, width),
+            decodeArena->batchSlice(DecodeTensor::OutputTokens, width),
+            decodeArena->batchSlice(DecodeTensor::RetainedCount, width),
+            decodeArena->batchSlice(DecodeTensor::AcceptedCount, width),
+            live ? decodeArena->batchSlice(DecodeTensor::LiveRows, width) : MetalBuffer{}};
+  }
+
   void encodeBatchAcceptance(CommandGraph &graph,
                              std::span<Request *const> lanes,
                              std::span<const uint32_t> maximumRetained) {
@@ -1803,14 +1843,7 @@ struct Runtime::Impl {
     const uint32_t width = static_cast<uint32_t>(lanes.size());
     sampling.addAcceptance(
         graph,
-        {decodeArena->batchSlice(DecodeTensor::ProposedTokens, width),
-         decodeArena->batchSlice(DecodeTensor::Candidates, width),
-         decodeArena->batchSlice(DecodeTensor::ProposalProbs, width),
-         decodeArena->batchSlice(DecodeTensor::TargetVocabularyRows, width),
-         decodeArena->batchSlice(DecodeTensor::SamplingUniforms, width),
-         decodeArena->batchSlice(DecodeTensor::OutputTokens, width),
-         decodeArena->batchSlice(DecodeTensor::RetainedCount, width),
-         decodeArena->batchSlice(DecodeTensor::AcceptedCount, width)},
+        acceptanceBuffers(width, useLiveVerifyRows(lanes)),
         maximumRetained, std::span(policies).first(width),
         geometry.target.stopTokens[0], geometry.target.stopTokens[1]);
   }
@@ -1925,6 +1958,16 @@ struct Runtime::Impl {
         emitTerminalAnchor(entry, result);
     }
 
+    counters.lastDecodeWidth = static_cast<uint32_t>(items.size());
+    counters.lastDecodeLiveRows = counters.lastDecodeWidth * kDecodeRows;
+    if (lanes.front().liveVerify) {
+      const auto *budgets = contents<VerifyLiveRows>(
+          decodeArena->batchSlice(DecodeTensor::LiveRows, counters.lastDecodeWidth),
+          "live verify rows");
+      counters.lastDecodeLiveRows = 0;
+      for (uint32_t lane = 0; lane < counters.lastDecodeWidth; ++lane)
+        counters.lastDecodeLiveRows += budgets[lane].count;
+    }
     counters.lastDecodeGpuSeconds = timing.gpuSeconds;
     counters.totalDecodeGpuSeconds += timing.gpuSeconds;
     counters.lastDecodeWallSeconds = timing.wallSeconds;
@@ -2118,6 +2161,12 @@ Runtime::Runtime(RuntimeContext context)
 Runtime::~Runtime() = default;
 
 void Runtime::checkHealth() { impl_->backend.checkHealth(); }
+
+void Runtime::setLiveVerifyThreshold(float threshold) {
+  if (!std::isfinite(threshold) || threshold < 0.0F || threshold > 1.0F)
+    throw std::invalid_argument("live verify threshold must be in [0, 1]");
+  impl_->liveVerifyThreshold = threshold;
+}
 
 void Runtime::beginColdRequest(const ModelRequest &request,
                                uint32_t stateLane) {
@@ -2616,6 +2665,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   }
 
   const std::span<Impl::Request *const> entries(requests.data(), width);
+  for (auto &lane : lanes) lane.liveVerify = impl_->useLiveVerifyRows(entries);
   const uint32_t ropeRows = width * kDecodeRows;
   CommandGraph commandGraph;
   impl_->addRopeTables(
@@ -3047,7 +3097,16 @@ ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
 }
 
 std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {
-  return std::make_unique<Runtime>(std::move(context));
+  float threshold = 0.0F;
+  if (const char *value = std::getenv("SPLASH_LIVE_VERIFY_THRESHOLD")) {
+    char *end = nullptr;
+    threshold = std::strtof(value, &end);
+    if (end == value || *end || !std::isfinite(threshold) || threshold < 0.0F || threshold > 1.0F)
+      throw std::invalid_argument("SPLASH_LIVE_VERIFY_THRESHOLD must be a number in [0, 1]");
+  }
+  auto runtime = std::make_unique<Runtime>(std::move(context));
+  runtime->setLiveVerifyThreshold(threshold);
+  return runtime;
 }
 
 } // namespace splash::model

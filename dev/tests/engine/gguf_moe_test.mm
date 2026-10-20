@@ -33,6 +33,7 @@
 #include "MoeExtents.hpp"
 #include "metal/abi/Gguf.h"
 #include "metal/abi/MoE.h"
+#include "metal/abi/LiveRows.h"
 
 #import <Foundation/Foundation.h>
 
@@ -791,7 +792,7 @@ void bufferExtents(MetalBackend &backend) {
                       [](BlockMoeWeights &changed, const MetalBuffer &view) { changed.sharedScalarGate.plane0 = view; });
 }
 
-int moe(MetalBackend &backend) {
+int moe(MetalBackend &backend, bool liveOnly = false) {
   int failures = 0;
   Buffers b;
   b.input = activations(uint64_t{kMaximumRows} * kHidden);
@@ -849,8 +850,58 @@ int moe(MetalBackend &backend) {
               MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = tile});
           const std::string label = formats + (tile == MoeGgufTile::Register ? " register" : " staged") + " decode B" +
                                     std::to_string(lanes);
-          const std::vector<uint16_t> rows =
-              runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, oneGateUp, products, stats, label);
+          std::vector<uint16_t> rows;
+          if (liveOnly) {
+            // The ordinary GPU graph is the independent bitwise reference
+            // for pruning; the default test also checks its FP64 numerics.
+            allocate(backend, b, plan);
+            CommandGraph graph;
+            MoE::add(graph, b.moe, m.weights, plan);
+            static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+            const auto *output = static_cast<const uint16_t *>(b.moe.output.contents());
+            rows.assign(output, output + uint64_t{plan.rows()} * kHidden);
+          } else {
+            rows = runPlan(backend, m, b, plan, tile == MoeGgufTile::Staged, oneGateUp, products, stats, label);
+          }
+          // Every GGUF expert format and both decode tiles must preserve the
+          // exact bits of live rows after routed and shared routes are compacted.
+          for (uint32_t cutoff = 1; cutoff <= 9; ++cutoff) {
+            b.moe.liveRows = zeros(backend, lanes * sizeof(VerifyLiveRows), "live rows");
+            auto *budgets = static_cast<VerifyLiveRows *>(b.moe.liveRows.contents());
+            uint32_t liveCount = 0;
+            for (uint32_t lane = 0; lane < lanes; ++lane) {
+              budgets[lane].count = cutoff == 9 ? 8 : (cutoff + lane - 1) % 8 + 1;
+              liveCount += budgets[lane].count;
+            }
+            allocate(backend, b, plan);
+            CommandGraph graph;
+            MoE::add(graph, b.moe, m.weights, plan);
+            static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+            const auto *actual = static_cast<const uint16_t *>(b.moe.output.contents());
+            const auto *residual = static_cast<const uint16_t *>(b.moe.residual.contents());
+            const auto *descriptors = static_cast<const MoeTileDescriptor *>(b.moe.scratch.tileDescriptors.contents());
+            const uint32_t tiles = *static_cast<const uint32_t *>(b.moe.scratch.tileCount.contents());
+            uint32_t routedRows = 0, sharedRows = 0;
+            for (uint32_t tileIndex = 0; tileIndex < tiles; ++tileIndex) {
+              routedRows += descriptors[tileIndex].rows;
+              if (descriptors[tileIndex].expert == kExperts) sharedRows += descriptors[tileIndex].rows;
+            }
+            const uint32_t expectedRows = plan.rowsInPlace() ? (tiles - 1) * plan.tileRows() + liveCount
+                                                            : liveCount * (kTopK + 1);
+            bool equal = routedRows == expectedRows && sharedRows == liveCount;
+            for (uint32_t row = 0; row < lanes * 8; ++row) {
+              const bool live = row % 8 < budgets[row / 8].count;
+              for (uint32_t column = 0; column < kHidden; ++column) {
+                const uint32_t index = row * kHidden + column;
+                equal = equal && actual[index] == (live ? rows[index] : residual[index]);
+              }
+            }
+            if (!equal) {
+              printf("  %s: live cutoff %u differs bitwise or retains inactive expert routes FAIL\n", label.c_str(), cutoff);
+              ++failures;
+            }
+            b.moe.liveRows = {};
+          }
           // A row's result depends on its own routes only, not on the lanes it
           // is batched with (the tile rows of one expert are independent).
           if (widest.empty()) widest = rows;
@@ -858,6 +909,11 @@ int moe(MetalBackend &backend) {
             printf("  %s: rows differ from the four-lane dispatch FAIL\n", label.c_str());
             ++failures;
           }
+        }
+        if (liveOnly) {
+          printf("%-20s %s live prefixes B1-4 %s\n", formats.c_str(),
+                 tile == MoeGgufTile::Register ? "register" : "staged", failures > before ? "FAIL" : "ok");
+          continue;
         }
         // Prefill chunks on the same 8-row tiles (ExecutionPlans::moePrefill);
         // a chunk of 8 rows reads them in place on the staged tile.
@@ -944,14 +1000,16 @@ int routingLoads(MetalBackend &backend) {
 
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
-    if (argc != 2) {
-      std::cerr << "usage: gguf_moe_test <metallib>\n";
+    const bool liveOnly = argc == 3 && std::string_view(argv[2]) == "--live-only";
+    if (argc != 2 && !liveOnly) {
+      std::cerr << "usage: gguf_moe_test <metallib> [--live-only]\n";
       return 2;
     }
     try {
       MetalBackend backend(argv[1]);
-      bufferExtents(backend);
-      const int failures = floatProjection(backend) + floatSegments(backend, 64) + floatSegments(backend, 96) +
+      if (!liveOnly) bufferExtents(backend);
+      const int failures = liveOnly ? moe(backend, true) :
+                           floatProjection(backend) + floatSegments(backend, 64) + floatSegments(backend, 96) +
                            floatOnlyChain(backend) + moe(backend) + routingLoads(backend);
       if (failures) {
         std::cerr << "gguf_moe_test: " << failures << " failures\n";

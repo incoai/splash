@@ -243,6 +243,7 @@ struct QwenTargetVerifyBuffers final {
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth>
       pageTables;
   ops::MoeScratch moe;
+  metal::MetalBuffer liveRows{};
 };
 
 template <class Layout, class Layer>
