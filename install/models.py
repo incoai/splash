@@ -141,6 +141,8 @@ def validate_repo_id(value: str) -> str:
 
 def split_model_id(value: str) -> tuple[str, str | None]:
     """owner/repo[:variant] -> (repository ID, variant or None)."""
+    if isinstance(value, str) and Path(value).is_absolute():
+        return value, None
     try:
         return serve_options.split_model_id(value)
     except ValueError as error:
@@ -199,7 +201,7 @@ def selection_link(
     OWNER/REPO[:VARIANT] under models for the model alone, else
     .selections/<hash of the selection>."""
     repo_id, variant = split_model_id(model_id)
-    if revision or language_only or draft_model:
+    if Path(repo_id).is_absolute() or revision or language_only or draft_model:
         selection = json.dumps(
             [model_id, revision, language_only, draft_model], separators=(",", ":")
         )
@@ -232,6 +234,12 @@ class Selection:
         cls, models_root, model, *, revision=None, language_only=False, draft_model=None
     ):
         repo_id, variant = split_model_id(model)
+        if Path(repo_id).is_absolute():
+            if revision is not None:
+                raise ModelError(
+                    "--revision cannot be used with a local target directory"
+                )
+            model = repo_id = str(Path(repo_id).resolve())
         models_root = Path(models_root).resolve()
         link = selection_link(
             models_root,
@@ -325,11 +333,17 @@ def link_selection(link: Path, target: Path):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Install Splash runtime weights")
     parser.add_argument("--models", type=Path, default=MODELS)
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
         "--model",
-        required=True,
         type=serve_options.parse_model_id,
         help="Hugging Face repository ID (owner/repo[:variant])",
+    )
+    source.add_argument(
+        "--modeldir",
+        dest="model",
+        type=serve_options.parse_model_directory,
+        help="local target model directory",
     )
     parser.add_argument("--revision", help="optional upstream branch, tag or commit")
     parser.add_argument(
@@ -346,7 +360,10 @@ def parse_args(argv=None):
     commands.add_parser("prepare")
     commands.add_parser("verify").add_argument("--full", action="store_true")
     commands.add_parser("link", help="print the selection link")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if Path(args.model).is_absolute() and args.revision is not None:
+        parser.error("--revision cannot be used with --modeldir")
+    return args
 
 
 def main(argv=None):

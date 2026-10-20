@@ -20,6 +20,15 @@ make -j4
 ./splash serve --model mlx-community/Qwen3.8-27B-4bit
 ```
 
+`--modeldir DIRECTORY` selects a local target directory (including spaces);
+relative paths and `~` are resolved before starting. It is mutually exclusive
+with `--model`, which continues to accept only Hugging Face model IDs.
+Local targets use hashed selection links under `.selections`, are re-inspected
+on every start, and reject `--revision`. Weights are linked, never copied or
+modified. The matching DFlash2 draft is still required; use `--draft-model`
+for a local draft, or allow its normal Hub download. Local GGUF variant
+syntax is not supported.
+
 `--model` names an upstream Hugging Face model: an MLX repository
 ([MLX targets](#mlx-targets)) such as `mlx-community/Qwen3.8-27B-4bit`, an NVFP4
 repository of Model Optimizer ([Model Optimizer targets](#model-optimizer-targets))

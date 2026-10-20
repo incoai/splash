@@ -125,7 +125,7 @@ def _ensure_installed(selection):
         str(ROOT / "install/models.py"),
         "--models",
         str(selection.models_root),
-        "--model",
+        "--modeldir" if Path(selection.model).is_absolute() else "--model",
         selection.model,
         "prepare",
     ]
@@ -251,7 +251,7 @@ def serve(args):
             str(root),
             "--tokenizer",
             str(root / "tokenizer"),
-            "--model",
+            "--modeldir" if Path(args.model).is_absolute() else "--model",
             args.model,
             "--binary",
             str(paths.BINARY),
@@ -397,12 +397,19 @@ def parse_args(argv=None):
     # options first, --port among the network options.
     groups = serve_options.option_groups(server)
     model = groups["model"]
-    model.add_argument(
+    source = model.add_mutually_exclusive_group(required=True)
+    source.add_argument(
         "--model",
         type=serve_options.parse_model_id,
-        required=True,
         metavar="OWNER/REPO[:VARIANT]",
         help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. :UD-Q4_K_M)",
+    )
+    source.add_argument(
+        "--modeldir",
+        dest="model",
+        type=serve_options.parse_model_directory,
+        metavar="DIRECTORY",
+        help="local target model directory",
     )
     model.add_argument(
         "--revision",
@@ -463,6 +470,8 @@ def parse_args(argv=None):
             parser.error(f"SPLASH_PORT: {error}")
     if args.command == "serve":
         serve_options.check_serve_arguments(parser, args)
+        if Path(args.model).is_absolute() and args.revision is not None:
+            parser.error("--revision cannot be used with --modeldir")
     if client_args and args.command == "serve":
         parser.error("arguments after -- are only supported for coding clients")
     args.client_args = client_args
