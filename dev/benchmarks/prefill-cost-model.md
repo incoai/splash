@@ -27,6 +27,10 @@ absolute relative prediction error from 9.67–10.40% to 5.89–7.34%, and p95 e
 from 24.44–27.31% to 13.95–17.92%. Every prediction uses only earlier samples.
 This motivates the experiment; prediction accuracy is not latency benefit.
 The control serving runs themselves are noisy and do not qualify a gain.
+The [evidence bundle](results/qwen-prefill-cost-m5-pro/) retains those controls,
+all prediction records and prefill-only trace excerpts with source-trace hashes.
+The excerpts deliberately omit GPU events and cannot reconstruct a full timeline;
+they can reproduce the estimator errors with `prefill_prediction.py`.
 
 ## Runtime contract
 

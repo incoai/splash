@@ -1,0 +1,54 @@
+00:18:30 Memory: growth paused; waiting=0; suspended=0
+00:18:30 Memory: growth available; resource wait cleared
+00:18:30 Memory: growth paused; waiting=0; suspended=0
+00:18:30 Memory: growth paused; waiting=0; suspended=0
+00:18:30 Memory: growth available; resource wait cleared
+00:18:30 Memory: growth paused; waiting=1; suspended=0
+00:18:30 Memory: growth available; resource wait cleared
+00:18:30 Weights released after 2 s without a request; the next request restores them
+00:18:30 Weights restored in 0.00 s
+00:18:30 Weights released after 2 s without a request; the next request restores them
+00:18:30 Weights restored in 0.00 s
+00:18:30 Weights released after 2 s without a request; the next request restores them
+00:18:30 Weights released after 2 s without a request; the next request restores them
+00:18:30 Weights restored in 0.00 s
+00:18:30 Weights released after 2 s without a request; the next request restores them
+00:18:30 Weights restored in 0.00 s
+00:18:30 Weights released after 2 s without a request; the next request restores them
+00:18:30 Weights released after 2 s without a request; the next request restores them
+00:18:30 Weights restored in 0.00 s
+00:18:30 Weights released after 2 s without a request; the next request restores them
+00:18:30 Weights restored in 0.00 s
+00:18:30 Weights released after 2 s without a request; the next request restores them
+00:18:30 Weights restored in 0.00 s
+00:18:30 Weights released after 2 s without a request; the next request restores them
+00:18:30 Weights restored in 0.00 s
+00:18:30 Weights released after 2 s without a request; the next request restores them
+00:18:30 Memory: growth paused; waiting=0; suspended=0
+00:18:30 Weights wait for memory to be restored: host memory reserve protected
+00:18:30 Memory: growth available; waiting=1; suspended=0
+00:18:30 Weights restored in 0.40 s
+00:18:30 Weights released after 2 s without a request; the next request restores them
+00:18:30 Memory: growth available; resource wait cleared
+00:18:30 Memory: growth paused; waiting=0; suspended=0
+00:18:30 Weights wait for memory to be restored: host memory reserve protected
+00:18:30 Memory: growth available; waiting=2; suspended=0
+00:18:30 Memory: growth paused; waiting=0; suspended=0
+00:18:30 Weights wait for memory to be restored: host memory reserve protected
+00:18:30 Weights not restored, 2 waiting requests failed: memory did not become available within the resource wait limit: macOS is short of memory; close memory-heavy applications; the next request restores them
+00:18:30 Memory: growth available; resource wait cleared
+00:18:30 Memory: growth paused; waiting=0; suspended=0
+00:18:30 Weights wait for memory to be restored: host memory reserve protected
+00:18:30 Memory: growth available; waiting=1; suspended=0
+00:18:30 Weights restored in 0.00 s
+00:18:30 Weights released after 2 s without a request; the next request restores them
+00:18:30 Memory: growth available; resource wait cleared
+00:18:30 Memory: growth paused; waiting=0; suspended=0
+00:18:30 Weights wait for memory to be restored: host memory reserve protected
+00:18:30 Weights not restored: no request waits for them
+00:18:30 Weights released on request; the next request restores them
+00:18:30 Weights restored in 0.00 s
+00:18:30 Weights released on request; the next request restores them
+00:18:30 Weights restored in 0.00 s
+00:18:30 Weights released on request; the next request restores them
+native engine loop tests passed
