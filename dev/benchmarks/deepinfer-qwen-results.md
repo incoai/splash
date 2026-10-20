@@ -120,14 +120,17 @@ These finite checks do not establish universal output equivalence.
 
 ## Correctness checks
 
-The native build, CPU engine suite, architecture checks and whitespace checks
-pass. Focused Metal tests ran with `MTL_SHADER_VALIDATION=1`:
+The full `make -j8 check` gate passes, including the CPU and shader-validated
+Metal suites, all native test/tool builds, full Python discovery, compileall
+and Ruff checks. Architecture and whitespace checks also pass. Focused Metal
+tests ran with `MTL_SHADER_VALIDATION=1`:
 
 - Live-row selection and acceptance: cutoffs, invalid confidence, sampled
   fallback and mixed lanes.
 - GGUF MoE: existing FP64 numerical checks, plus bitwise live-prefix comparisons
   for every supported expert format, staged/register paths, B1–B4 and every
-  cutoff. The final in-place refinement passed the all-format live-only suite.
+  cutoff. The final in-place refinement passed both the all-format live-only
+  suite and the full numerical suite repeated during `make check`.
 - Target sampling, draft selector, GDN decode and Metal backend, including
   trace execution and clock-order checks.
 

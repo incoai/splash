@@ -3,6 +3,9 @@
 Machine: Apple M5 Pro, 20 GPU cores, 48 GiB, macOS 26.6.0. Metal compiler
 32023.921. Base commit: `be3b083c5f413673d44e44881042e875e674e333`.
 This records local results; it does not represent a multi-device release gate.
+Runtime/policy implementation: `c5bde8f`; measurement instrumentation:
+`1894964`. Subsequent commits publish documentation and evidence. The runtime
+source is unchanged from the measured candidate.
 
 ## Source and native checks
 
@@ -12,11 +15,14 @@ This records local results; it does not represent a multi-device release gate.
 | `make -j8 BUILD=build/deepinfer-candidate test-engine-cpu` | PASS |
 | `.venv/bin/python dev/tools/check_architecture.py` | PASS |
 | `git diff --check` and `git diff --cached --check` | PASS |
-| `make -j8 check` | In progress during PR preparation; final result will be recorded before submission |
+| `make -j8 check` | PASS, exit 0; complete CPU/Metal suites, all native test/tool builds, full Python discovery, compileall, Ruff lint and format |
+| `make check-source` after packaging the evidence | PASS, exit 0 |
 
 The full check builds all native tests/tools, runs the CPU and Metal suites,
 runs Python discovery, compiles Python sources and checks Ruff lint/format.
 Its Metal suite uses `MTL_SHADER_VALIDATION=1`.
+The final full gate includes the numerical MoE suite after the in-place
+refinement, not only its fast live-prefix qualification.
 
 ## Focused shader-validated checks
 
@@ -25,7 +31,7 @@ All completed with `MTL_SHADER_VALIDATION=1`, using the candidate Metal library.
 | Native executable | Result | Coverage relevant to this change |
 | --- | --- | --- |
 | `live-verify-rows` | PASS | Chosen-path confidence, invalid inputs, one-to-eight-row limits, acceptance/continuation, stops, limits and sampled/mixed fallback |
-| `gguf-moe` | PASS | Existing FP64 checks and bitwise live-prefix comparisons across expert formats and B1–B4; this full run preceded the final in-place refinement |
+| `gguf-moe` | PASS | Final implementation: existing FP64 checks and bitwise live-prefix comparisons across expert formats and B1–B4, repeated in the full `make check` gate |
 | `gguf-moe --live-only` | PASS | Final in-place refinement, every supported expert format, staged/register paths, B1–B4 and all cutoff lengths; inactive outputs preserve the residual |
 | `target-sampling` | PASS | Existing greedy/sampled acceptance and distribution checks |
 | `draft-selector` | PASS | Existing selector numerical/selection contracts |
@@ -120,3 +126,8 @@ qualification and contended p50/p95 latency are not established here. ANE
 prefill acceleration is not a claimed benefit. Enabled short-prompt HTTP
 comparisons are inconclusive and do not qualify a default threshold. The
 original feature is disabled unless explicitly enabled.
+
+`make check` does not include the separate `make test-sanitizers` target; that
+target was not run locally for this publication. GitHub's native CI job runs
+the sanitizer suite. Its status is reported by the PR checks, independently of
+these completed local results.
