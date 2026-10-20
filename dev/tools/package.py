@@ -31,8 +31,19 @@ INSTALL_FILES = (
     "upstream.py",
     "local.py",
     "gguf.py",
+    "video.py",
     "requirements.txt",
 )
+# The video model's converters, vendored with its engine
+# (runtime/video/VENDORED).
+VIDEO_CONVERTER_FILES = (
+    "convert_audio.py",
+    "convert_dit.py",
+    "convert_prep.py",
+    "convert_preview.py",
+    "convert_vae.py",
+)
+VIDEO_CONVERTER_MODULES = ("__init__.py", "common.py", "config.py", "safetensors.py")
 COMPLETION_FILES = (
     "models",
     "_splash",
@@ -98,6 +109,8 @@ def stage_runtime(destination, version):
     for folder, names in (
         ("install", INSTALL_FILES),
         ("install/completions", COMPLETION_FILES),
+        ("install/video", VIDEO_CONVERTER_FILES),
+        ("install/video/h3", VIDEO_CONVERTER_MODULES),
         ("server", SERVER_FILES),
         ("server/chat-assets", CHAT_ASSET_FILES),
         ("engine", ENGINE_FILES),

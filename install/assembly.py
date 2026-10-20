@@ -1,13 +1,16 @@
 """Assemblies: the directories upstream models are served from.
 
 An assembly is models/.resolved/<SHA-256 of its record>: links to its source
-snapshots' files (hub.py) and to metadata derived from a GGUF
-(models/.metadata/<key>), and model.json, the record naming its sources and
-the identity of every linked file. It never changes once published.
-Selection links point to assemblies; one that no selection links and no
-server holds is collected.
+snapshots' files (hub.py) and to what is derived from them, metadata derived
+from a GGUF (models/.metadata/<key>) or a video model's converted images
+(models/.converted/<key>, video.py), and model.json, the record naming its
+sources and the identity of every linked file. It never changes once
+published. Selection links point to assemblies; one that no selection links
+and no server holds is collected, and so is a derived entry no assembly
+links.
 
-The paths an assembly links, and what reads each:
+The paths a language model's assembly links, and what reads each (a video
+model's: video.py):
   config.json            the target configuration: the MLX config.json, or
                          the one derived from the GGUF (ModelDescriptor.mm
                          inspectSourceModel)
@@ -45,8 +48,17 @@ from pathlib import Path
 from . import gguf, hub, models
 
 GGUF_VISION = "vision/mmproj.gguf"
-TARGET_FORMATS = ("mlx-affine", "gguf")
+# Each target format's record: the keys it adds and the sources it names, a
+# language model's target and DFlash2 draft, or a video model's target and
+# text encoder (video.py).
+TARGET_FORMATS = {
+    "mlx-affine": (set(), {"target", "draft"}),
+    "gguf": ({"metadata"}, {"target", "draft"}),
+    "h3-video": ({"video"}, {"target", "encoder"}),
+}
 VISION_FORMATS = ("none", "safetensors", "gguf")
+# The entries derived from sources, under the models root.
+DERIVED = (".metadata", ".converted")
 RECORD_KEYS = {
     "version",
     "model",
@@ -174,19 +186,21 @@ def verify(assembly: Path, *, full=False):
 
 def _well_formed(record):
     gguf_target = record.get("target_format") == "gguf"
+    extra, source_names = TARGET_FORMATS.get(record.get("target_format"), (None, None))
     sources = record.get("sources")
     files = record.get("files")
     return (
-        set(record) == RECORD_KEYS | ({"metadata"} if gguf_target else set())
+        extra is not None
+        and set(record) == RECORD_KEYS | extra
         and type(record["version"]) is int
         and record["version"] == 1
         and isinstance(record["model"], str)
         and isinstance(record["family"], str)
-        and record["target_format"] in TARGET_FORMATS
         and record["vision_format"] in VISION_FORMATS
         and (not gguf_target or models.is_hex_digest(record["metadata"], 64))
+        and isinstance(record.get("video", {}), dict)
         and isinstance(sources, dict)
-        and set(sources) == {"target", "draft"}
+        and set(sources) == source_names
         and all(
             isinstance(source, dict)
             and set(source) == {"repo", "revision"}
@@ -355,7 +369,9 @@ def hold(path: Path):
 
 
 def is_held(assembly: Path) -> bool:
-    """Whether a server holds the assembly (hold)."""
+    """Whether a process holds the entry by its model.json: a server the
+    assembly it serves (hold), or an installation the images it converted
+    until an assembly links them (video.py)."""
     try:
         with (assembly / "model.json").open("rb") as record:
             fcntl.flock(record, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -368,10 +384,11 @@ def is_held(assembly: Path) -> bool:
 
 def collect_garbage(models_root: Path):
     """Remove what no installation uses: assemblies that no selection links
-    and no server holds, metadata entries the remaining assemblies do not
+    and no server holds, derived entries the remaining assemblies do not
     link, and staging an interrupted installation left. Call it under the
     installation lock, where all of these are written."""
-    resolved, derived = models_root / ".resolved", models_root / ".metadata"
+    resolved = models_root / ".resolved"
+    derived = [models_root / name for name in DERIVED]
     linked = {link.resolve() for link in models.selection_links(models_root)}
     used = set()
     for assembly in sorted(resolved.iterdir()) if resolved.is_dir() else ():
@@ -385,10 +402,12 @@ def collect_garbage(models_root: Path):
             continue
         for entry in files.values() if isinstance(files, dict) else ():
             path = Path(entry.get("path", "")) if isinstance(entry, dict) else None
-            if path and path.is_relative_to(derived):
-                used.add(path.relative_to(derived).parts[0])
-    for entry in sorted(derived.iterdir()) if derived.is_dir() else ():
-        if entry.name not in used:
-            shutil.rmtree(entry)
+            for root in derived if path else ():
+                if path.is_relative_to(root):
+                    used.add(root / path.relative_to(root).parts[0])
+    for root in derived:
+        for entry in sorted(root.iterdir()) if root.is_dir() else ():
+            if entry not in used and not is_held(entry):
+                shutil.rmtree(entry)
     for stage in models_root.glob(f"*/{models.LINK_STAGING}*"):
         shutil.rmtree(stage)
