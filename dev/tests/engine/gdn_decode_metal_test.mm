@@ -18,6 +18,7 @@
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/GDN.h"
+#include "metal/abi/LiveRows.h"
 #include "model/StateLayout.hpp"
 #include "ops/GDN.hpp"
 
@@ -1122,6 +1123,14 @@ void rejectsInvalid(MetalBackend &backend) {
                        LinearInput::Plain);
       },
       "norm weight buffer holds", "bf16 norm weights were read as F32");
+  rejects(
+      [&] {
+        auto buffers = fixture.decodeBuffers(0);
+        buffers.liveRows = sharedBuffer(backend, sizeof(VerifyLiveRows) - 1);
+        GDN::addDecode(graph, buffers, shape, 1, 0, fixture.cell.strides(), GdnHeadOrder::Grouped,
+                       LinearInput::Plain);
+      },
+      "GDN live rows buffer holds", "a GDN decode read short live-row metadata");
   require(graph.empty(), "invalid GDN request partially encoded a graph");
 }
 
@@ -1237,6 +1246,113 @@ void bfloatState(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, b
   std::cout << where << ": the fp32 decode's rows and its state rounded\n";
 }
 
+// Compare the selective shader with the full shader already checked against
+// the independent recurrence above. Both histories evolve through the same
+// retained prefixes. Poison the unconsumable suffix, and compare the complete
+// folded cell rather than just current outputs (notably pending 8/current 1).
+void livePrefixes(MetalBackend &backend, const GdnShape &shape, uint32_t lanes,
+                  bool float32, GdnStateFormat format, GdnHeadOrder order,
+                  LinearInput layout) {
+  Fixture full(backend, shape, lanes, float32), live(backend, shape, lanes, float32);
+  const std::string what = caseName("live prefixes", shape, lanes, layout) +
+                           (float32 ? " f32 norm" : " bf16 norm") +
+                           (format == GdnStateFormat::Float32 ? " fp32 state" : " bf16 state") +
+                           (order == GdnHeadOrder::Tiled ? " tiled" : " grouped");
+  if (format == GdnStateFormat::BFloat16) {
+    for (Fixture *fixture : {&full, &live}) {
+      const Cell narrow(shape, format);
+      for (uint32_t lane = 0; lane < kMaxLanes; ++lane) {
+        MetalBuffer current = sharedBuffer(backend, narrow.bytes);
+        std::memcpy(current.contents(), fixture->current[lane].contents(), narrow.convBytes);
+        for (uint32_t layer = 0; layer < kLayers; ++layer) {
+          const float *source = fixture->cell.recurrent(fixture->cellBytes(fixture->current[lane]), layer);
+          auto *destination = reinterpret_cast<uint16_t *>(static_cast<uint8_t *>(current.contents()) +
+                                 narrow.convBytes + layer * narrow.recurrentLayerBytes);
+          const uint64_t elements = uint64_t{shape.valueHeads} * kHeadDim * kHeadDim;
+          for (uint64_t i = 0; i < elements; ++i) destination[i] = floatToBf16(source[i]);
+        }
+        fixture->current[lane] = current;
+        fixture->next[lane] = sharedBuffer(backend, narrow.bytes);
+      }
+      fixture->cell = narrow;
+    }
+  }
+  const uint32_t width = shape.valueHeads * kHeadDim;
+  MetalBuffer counts = sharedBuffer(backend, lanes * sizeof(VerifyLiveRows));
+  auto *budgets = static_cast<VerifyLiveRows *>(counts.contents());
+  std::optional<PreparedTables> tables;
+  if (layout != LinearInput::Plain) tables.emplace(backend, layout, width, lanes);
+  // Alternating full and each short prefix covers 8/1 and 1/8. Retention
+  // rotates over every valid prefix, separately per lane and both parities.
+  for (uint32_t cycle = 0; cycle < 130; ++cycle) {
+    full.fillPacked();
+    live.fillPacked();
+    full.clear();
+    live.clear();
+    std::array<uint32_t, kMaxLanes> retained{};
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      const uint32_t length = cycle % 2 == 0 ? kRows : 1 + (cycle / 2 + lane) % kRows;
+      // Invalid metadata must conservatively execute all eight rows.
+      budgets[lane].count = cycle == 128 ? 0 : cycle == 129 ? 99 : length;
+      const uint32_t active = cycle >= 128 ? kRows : length;
+      retained[lane] = 1 + (cycle / 16 + lane) % active;
+      // A full step immediately before length 1 retains all eight.
+      if (cycle % 2 == 0) retained[lane] = kRows;
+      for (uint32_t layer = 0; layer < kLayers; ++layer) {
+        auto *packed = static_cast<uint16_t *>(live.packedLayer[layer].contents()) +
+                        lane * live.packedStride + active * shape.packedWidth;
+        std::memset(packed, 0xFF, (kRows - active) * shape.packedWidth * 2);
+        const uint64_t slot = live.tapeLanes[lane].stepSlot;
+        std::memset(static_cast<uint8_t *>(live.tape.contents()) + slot + layer * live.tapeBytes,
+                    0xFF, live.tapeBytes);
+      }
+    }
+    std::memset(live.hidden.contents(), 0xFF, live.hidden.sizeBytes());
+    CommandGraph reference, selective;
+    PreparedInput prepared;
+    for (uint32_t layer = 0; layer < kLayers; ++layer) {
+      (void)GDN::addDecode(reference, full.decodeBuffers(layer), shape, lanes, layer,
+                           full.cell.strides(), order, LinearInput::Plain);
+      auto buffers = live.decodeBuffers(layer);
+      buffers.liveRows = counts;
+      if (tables) buffers.linearScratch = tables->scratch();
+      prepared = GDN::addDecode(selective, buffers, shape, lanes, layer, live.cell.strides(), order, layout);
+    }
+    if (tables) tables->addReference(selective, live.hidden);
+    (void)backend.submitCommandAsync(reference.dispatches()).wait();
+    (void)backend.submitCommandAsync(selective.dispatches()).wait();
+    if (tables) tables->requireWritten(prepared, live.hidden, what);
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      const uint32_t active = budgets[lane].count >= 1 && budgets[lane].count <= kRows ? budgets[lane].count : kRows;
+      require(!std::memcmp(full.next[lane].contents(), live.next[lane].contents(), full.cell.bytes),
+              what + ": pending-prefix state mismatch at cycle " + std::to_string(cycle));
+      require(!std::memcmp(full.hiddenRow(lane, 0, 0), live.hiddenRow(lane, 0, 0), uint64_t{active} * width * 2),
+              what + ": active hidden mismatch");
+      const uint16_t *inactive = live.hiddenRow(lane, active, 0);
+      for (uint64_t i = 0; i < uint64_t{kRows - active} * width; ++i)
+        require(inactive[i] == 0, what + ": inactive hidden is not zero");
+      for (uint32_t layer = 0; layer < kLayers; ++layer) {
+        const uint64_t slot = live.tapeLanes[lane].stepSlot;
+        auto *tape = static_cast<uint8_t *>(live.tape.contents()) + slot + layer * live.tapeBytes;
+        for (const auto &[offset, rowBytes] :
+             {std::pair{uint64_t{0}, uint64_t{shape.convolutionDimension} * 2},
+              std::pair{gdn_tape_kv_offset(shape.convolutionDimension), live.kvWidth * 2},
+              std::pair{gdn_tape_decay_offset(shape.convolutionDimension, live.kvWidth), uint64_t{shape.valueHeads} * 4},
+              std::pair{gdn_tape_beta_offset(shape.convolutionDimension, live.kvWidth, shape.valueHeads), uint64_t{shape.valueHeads} * 2}}) {
+          require(!std::memcmp(full.tapeLayer(slot, layer) + offset, tape + offset, active * rowBytes),
+                  what + ": active tape mismatch");
+          // Neither the next pending fold nor convolution history may read
+          // the rejected suffix, including rows computed by this step.
+          std::memset(tape + offset + retained[lane] * rowBytes, 0xFF, (kRows - retained[lane]) * rowBytes);
+        }
+      }
+    }
+    full.advance(retained);
+    live.advance(retained);
+  }
+  std::cout << what << ": all live/retained prefixes and pending transitions match\n";
+}
+
 int main(int argc, char **argv) {
   try {
     if (argc != 2)
@@ -1276,6 +1392,13 @@ int main(int argc, char **argv) {
         for (bool float32 : {false, true})
           for (LinearInput layout : {LinearInput::Plain, LinearInput::Table16})
             bfloatState(backend, shape, lanes, float32, layout);
+    for (const GdnShape &shape : kShapes)
+      for (uint32_t lanes = 1; lanes <= kMaxLanes; ++lanes)
+        for (bool float32 : {false, true})
+          for (GdnStateFormat format : {GdnStateFormat::Float32, GdnStateFormat::BFloat16})
+            for (GdnHeadOrder order : {GdnHeadOrder::Grouped, GdnHeadOrder::Tiled})
+              for (LinearInput layout : {LinearInput::Plain, LinearInput::Table16})
+                livePrefixes(backend, shape, lanes, float32, format, order, layout);
     std::cout << "gdn_decode_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

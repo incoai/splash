@@ -2,6 +2,7 @@
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/GDN.h"
+#include "metal/abi/LiveRows.h"
 #include "ops/BufferExtent.hpp"
 #include "ops/LaneBindings.hpp"
 
@@ -220,7 +221,9 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   if (prepare)
     requireTableScratch(buffers.linearScratch, input, shape.valueHeads * shape.headDimension,
                         lanes * SPLASH_TARGET_VERIFY_ROWS);
-  bindings.reserve(prepare ? 17 : 15);
+  const bool live = static_cast<bool>(buffers.liveRows);
+  if (live) requireBytes(buffers.liveRows, uint64_t{lanes} * sizeof(VerifyLiveRows), "GDN live rows");
+  bindings.reserve((prepare ? 17 : 15) + live);
   appendLaneBindings(bindings, buffers.currentStates, buffers.nextStates);
   requireStates(shape, state, layer, lanes, buffers.currentStates, buffers.nextStates);
   bindings.insert(bindings.end(),
@@ -229,8 +232,10 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   if (prepare)
     bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
   const std::string name = std::string("verify_gdn_fused") + tableSuffix(input) + kernelName(kernel, "", "_vh32");
-  graph.add(stateKernel(normKernel(name, buffers.mixerNorm, shape.headDimension), state.format),
-            std::move(bindings), params, {shape.valueHeads, lanes, 1});
+  if (live) bindings.push_back(buffers.liveRows);
+  std::string entry = stateKernel(normKernel(name, buffers.mixerNorm, shape.headDimension), state.format);
+  if (live) entry += "_live_rows";
+  graph.add(entry, std::move(bindings), params, {shape.valueHeads, lanes, 1});
   if (!prepare) return {};
   return {buffers.hidden, input};
 }

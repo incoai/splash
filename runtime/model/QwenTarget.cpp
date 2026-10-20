@@ -383,6 +383,7 @@ void QwenTarget::addVerify(
   }, weights_);
   addHeadBatch(graph, buffers.hidden[geometry_.layers & 1], buffers.finalHidden, buffers.logits, lanes,
                buffers.linearScratch);
+  if (buffers.gdnLiveRows) fullGdnPrepared_[lanes - 1] = true;
 }
 
 // Each producer emits the table (if any) its consumer's plan reads.
@@ -400,12 +401,22 @@ metal::MetalBuffer QwenTarget::addVerifyMixer(VerifyStep &step, const QwenGdnWei
              mixer.inputProjection, inputPlan);
   const ops::LinearPlan outputPlan =
       linear.decodePlan(mixer.outputProjection, step.lanes, ops::LinearEpilogue::Residual);
+  ops::GdnDecodeBuffers gdnBuffers{
+      b.gdnPacked, mixer.convolutionWeights, b.currentGdnStates, b.nextGdnStates, b.gdnTape,
+      std::span(b.gdnTapeLanes).first(step.lanes), mixer.decay, mixer.timeBias, mixer.mixerNorm, b.gdnHidden,
+      b.linearScratch};
+  if (b.gdnLiveRows && !fullGdnPrepared_[step.lanes - 1]) {
+    // Ordinary requests can follow a live greedy warmup, including direct
+    // runtime callers. Prepare their kernels now without executing a second
+    // graph or changing state/tape parity.
+    metal::CommandGraph fallback;
+    (void)ops::GDN::addDecode(fallback, gdnBuffers, geometry_.gdnShape(), step.lanes, layer,
+                             geometry_.stateLayout.strides(), mixer.outputHeadOrder, outputPlan.input());
+    backend_.preparePipelines(fallback.dispatches());
+  }
+  gdnBuffers.liveRows = b.gdnLiveRows;
   const ops::PreparedInput hidden = ops::GDN::addDecode(
-      step.graph,
-      {b.gdnPacked, mixer.convolutionWeights, b.currentGdnStates, b.nextGdnStates, b.gdnTape,
-       std::span(b.gdnTapeLanes).first(step.lanes), mixer.decay, mixer.timeBias, mixer.mixerNorm, b.gdnHidden,
-       b.linearScratch},
-      geometry_.gdnShape(), step.lanes, layer, geometry_.stateLayout.strides(),
+      step.graph, gdnBuffers, geometry_.gdnShape(), step.lanes, layer, geometry_.stateLayout.strides(),
       mixer.outputHeadOrder, outputPlan.input());
   linear.add(step.graph,
              {.input = b.gdnHidden, .output = b.gdnOutput, .residual = input, .scratch = b.linearScratch,

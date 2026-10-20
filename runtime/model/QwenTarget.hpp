@@ -244,6 +244,7 @@ struct QwenTargetVerifyBuffers final {
       pageTables;
   ops::MoeScratch moe;
   metal::MetalBuffer liveRows{};
+  metal::MetalBuffer gdnLiveRows{};
 };
 
 template <class Layout, class Layer>
@@ -326,6 +327,8 @@ private:
   const QwenTargetWeightsBase &weightsBase_;
   QwenTargetGeometry geometry_;
   metal::MetalBackend &backend_;
+  // Compile full-width GDN fallback variants alongside the first live graph.
+  mutable std::array<bool, ExecutionLimits::maximumBatchWidth> fullGdnPrepared_{};
   const ops::ExecutionPlans &operators_;
 };
 

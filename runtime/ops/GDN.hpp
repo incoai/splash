@@ -126,6 +126,8 @@ struct GdnDecodeBuffers final {
   NormWeights mixerNorm;
   metal::MetalBuffer hidden;
   LinearScratch linearScratch{};
+  // Optional GPU-produced prefix; pending rows are always consumed in full.
+  metal::MetalBuffer liveRows{};
 };
 
 class GDN final {

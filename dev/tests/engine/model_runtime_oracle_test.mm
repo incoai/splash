@@ -2273,18 +2273,23 @@ int main(int argc, char **argv) {
     kv::Format format = kv::Format::Int8;
     ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
     float liveVerifyThreshold = 0.0F;
+    bool liveGdn = false;
     std::optional<double> givenAneFfnShare;
     // The evaluation of the split's program that fails, counted from 1 as
     // ane::ProgramInstrumentation counts them; 0 for none.
     uint64_t aneFfnFault = 0;
     if (argc < 3)
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
-           "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--live-verify-threshold Q]");
+           "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--live-verify-threshold Q] [--live-gdn on|off]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
       else if (option == "--warmup-eos-only") warmupEosOnly = true;
-      else if (option == "--live-verify-threshold" && i + 1 < argc) {
+      else if (option == "--live-gdn" && i + 1 < argc) {
+        const std::string_view value(argv[++i]);
+        if (value != "on" && value != "off") fail("--live-gdn takes on or off");
+        liveGdn = value == "on";
+      } else if (option == "--live-verify-threshold" && i + 1 < argc) {
         size_t consumed = 0;
         const std::string value(argv[++i]);
         liveVerifyThreshold = std::stof(value, &consumed);
@@ -2481,6 +2486,7 @@ int main(int argc, char **argv) {
     }
     model::Runtime &executor = *runtime;
     executor.setLiveVerifyThreshold(liveVerifyThreshold);
+    executor.setLiveGdn(liveGdn);
     // Warmup runs on the KV runway and never allocates: without it, after
     // actual state activation, warmupPrefill fails and cleans up.
     pages.releaseExtent(0);

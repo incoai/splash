@@ -369,6 +369,7 @@ struct Runtime::Impl {
   QwenTarget targetModel;
   DFlashDraft draftModel;
   float liveVerifyThreshold = 0.0F;
+  bool liveGdn = false;
   ops::AneFfn *aneFfn;
   TraceSink *trace = nullptr;
   explicit Impl(RuntimeContext value)
@@ -1735,7 +1736,10 @@ struct Runtime::Impl {
     buffers.chunkKeys = chunkKeys;
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
-    if (useLiveVerifyRows(entries)) buffers.liveRows = d(DecodeTensor::LiveRows);
+    if (useLiveVerifyRows(entries)) {
+      buffers.liveRows = d(DecodeTensor::LiveRows);
+      if (liveGdn) buffers.gdnLiveRows = buffers.liveRows;
+    }
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chunks[lane] = ops::PagedAttention::verifyParams(
           items[lane].logicalPosition,
@@ -2188,6 +2192,8 @@ void Runtime::setLiveVerifyThreshold(float threshold) {
     throw std::invalid_argument("live verify threshold must be in [0, 1]");
   impl_->liveVerifyThreshold = threshold;
 }
+
+void Runtime::setLiveGdn(bool enabled) { impl_->liveGdn = enabled; }
 
 void Runtime::beginColdRequest(const ModelRequest &request,
                                uint32_t stateLane) {
@@ -3127,6 +3133,11 @@ std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {
   }
   auto runtime = std::make_unique<Runtime>(std::move(context));
   runtime->setLiveVerifyThreshold(threshold);
+  if (const char *value = std::getenv("SPLASH_LIVE_GDN")) {
+    if (std::string_view(value) != "0" && std::string_view(value) != "1")
+      throw std::invalid_argument("SPLASH_LIVE_GDN must be 0 or 1");
+    runtime->setLiveGdn(std::string_view(value) == "1");
+  }
   return runtime;
 }
 

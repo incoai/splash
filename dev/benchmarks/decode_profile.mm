@@ -320,7 +320,7 @@ int main(int argc, char **argv) {
       if (argc < 3) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
-                     "[--state-format fp32|bf16] [--live-verify-threshold Q] "
+                     "[--state-format fp32|bf16] [--live-verify-threshold Q] [--live-gdn on|off] "
                      "[--attribution on|off] [--json-output PATH] [--trace-output PATH]\n"
                      "       decode-profile METALLIB MODEL_ROOT "
                      "--images HxW[,HxW...] [--cycles K]\n";
@@ -333,6 +333,7 @@ int main(int argc, char **argv) {
       std::vector<ops::ImageGrid> grids;
       bool textOptions = false;
       float liveVerifyThreshold = 0.0F;
+      bool liveGdn = false;
       bool attribution = true;
       std::string jsonPath, tracePath;
       for (int index = 3; index < argc; index += 2) {
@@ -344,7 +345,12 @@ int main(int argc, char **argv) {
           textOptions = true;
         } else if (option == "--cycles")
           cycles = parseCount(argv[index + 1], "--cycles");
-        else if (option == "--live-verify-threshold") {
+        else if (option == "--live-gdn") {
+          const std::string_view value(argv[index + 1]);
+          if (value != "on" && value != "off")
+            throw std::invalid_argument("--live-gdn takes on or off");
+          liveGdn = value == "on";
+        } else if (option == "--live-verify-threshold") {
           textOptions = true;
           size_t consumed = 0;
           const std::string value(argv[index + 1]);
@@ -446,6 +452,7 @@ int main(int argc, char **argv) {
       model::RuntimeContext context{backend, model, pages, states, operators};
       model::Runtime executor(context);
       executor.setLiveVerifyThreshold(liveVerifyThreshold);
+      executor.setLiveGdn(liveGdn);
       std::printf("live verify threshold %.6g (greedy MoE only)\n", liveVerifyThreshold);
 
       std::printf("device %s, %u prompt tokens, %u cycles per width, %s state\n",
@@ -497,6 +504,7 @@ int main(int argc, char **argv) {
           if (json.is_open()) {
             json << (firstSample ? "" : ",\n") << "{\"width\":" << active.size()
                  << ",\"sample\":" << sample << ",\"prompt_tokens\":" << promptTokens
+                 << ",\"live_gdn\":" << (liveGdn ? "true" : "false")
                  << ",\"threshold\":" << liveVerifyThreshold
                  << ",\"gpu_seconds\":" << cycle.gpuSeconds
                  << ",\"wall_seconds\":" << cycle.wallSeconds

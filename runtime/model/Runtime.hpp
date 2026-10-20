@@ -17,6 +17,9 @@ public:
   // graph; sampled, constrained and dense requests retain full verification.
   // Configure before submitting work; no ticket may be in flight.
   void setLiveVerifyThreshold(float threshold);
+  // Separately opt into GDN prefix arithmetic under the same eligibility
+  // rules. Storage stays full width; all previous pending rows are folded.
+  void setLiveGdn(bool enabled);
   [[nodiscard]] uint32_t statesToActivate() const noexcept override;
 
   Runtime(const Runtime &) = delete;
