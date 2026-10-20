@@ -96,6 +96,7 @@ until the [maintainer package](https://github.com/incoai/splash/pull/510) runs t
 Local performance qualification is complete. The [M5 Pro evidence bundle](results/qwen-gdn-live-prefixes-m5-pro/README.md)
 contains 4,096 native cycle samples, production HTTP comparisons, disabled-path
 controls, source/model/build identities and five passing shader/oracle logs.
-Stable native gains are 0.11–1.20%; none clears the 2% minimum. No HTTP trial
+GGUF and warmed MLX native gains are 0.11–1.20%, below the 2% minimum; the
+initial MLX series also has no gain above its noise-adjusted gate. No HTTP trial
 clears its noise-adjusted gate. Keep the flag off and PR #511 in draft as a
 reviewable experiment; this is a measured decision against promoting it.

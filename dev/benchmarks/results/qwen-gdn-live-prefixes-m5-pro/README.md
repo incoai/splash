@@ -27,10 +27,11 @@ state are used for timing. Tracing and shader validation are off.
 | MLX 4-bit / 0.1, warmed repeat | 64 | 0.54% | 0.75% | 0.66% | 0.61% |
 | MLX 4-bit / 0.2, warmed repeat | 64 | 1.20% | 0.98% | 0.81% | 1.04% |
 
-GGUF noise is at most 1.75%; warmed MLX noise is at most 0.90%. All stable
-gains are below the 2% minimum. The initial 32-cycle MLX series includes
+GGUF noise is at most 1.75%; warmed MLX noise is at most 0.90%. Gains in these
+series are below the 2% minimum. The initial 32-cycle MLX series includes
 inconclusive cells with apparent 8–10% gains and 13–17% noise. It is retained
-in full, rather than counted as evidence of a win. A separate unmeasured
+in full, rather than counted as evidence of a win. Its B2/0.1 cell gains 2.50%
+at 3.44% noise, below its 6.88% promotion threshold. A separate unmeasured
 16-cycle-per-width warmup preceded the 64-cycle MLX series.
 
 `native-cycles.csv` contains all **4,096 individual cycle samples**, including
