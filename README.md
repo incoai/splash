@@ -62,7 +62,7 @@ in Chat. Anthropic Messages requests reason only when they set `thinking`.
 Local MLX targets can also be served from an absolute directory:
 
 ```sh
-./splash serve --modeldir /path/to/local/model
+./splash serve --model-dir /path/to/local/model
 ```
 
 Splash links the existing target files without copying or downloading them.

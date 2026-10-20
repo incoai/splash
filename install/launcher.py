@@ -125,7 +125,7 @@ def _ensure_installed(selection):
         str(ROOT / "install/models.py"),
         "--models",
         str(selection.models_root),
-        "--modeldir" if Path(selection.model).is_absolute() else "--model",
+        "--model-dir" if Path(selection.model).is_absolute() else "--model",
         selection.model,
         "prepare",
     ]
@@ -251,7 +251,7 @@ def serve(args):
             str(root),
             "--tokenizer",
             str(root / "tokenizer"),
-            "--modeldir" if Path(args.model).is_absolute() else "--model",
+            "--model-dir" if Path(args.model).is_absolute() else "--model",
             args.model,
             "--binary",
             str(paths.BINARY),
@@ -405,7 +405,7 @@ def parse_args(argv=None):
         help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. :UD-Q4_K_M)",
     )
     source.add_argument(
-        "--modeldir",
+        "--model-dir",
         dest="model",
         type=serve_options.parse_model_directory,
         metavar="DIRECTORY",
@@ -471,7 +471,7 @@ def parse_args(argv=None):
     if args.command == "serve":
         serve_options.check_serve_arguments(parser, args)
         if Path(args.model).is_absolute() and args.revision is not None:
-            parser.error("--revision cannot be used with --modeldir")
+            parser.error("--revision cannot be used with --model-dir")
     if client_args and args.command == "serve":
         parser.error("arguments after -- are only supported for coding clients")
     args.client_args = client_args

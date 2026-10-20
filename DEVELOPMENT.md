@@ -20,7 +20,7 @@ make -j4
 ./splash serve --model mlx-community/Qwen3.8-27B-4bit
 ```
 
-`--modeldir DIRECTORY` selects a local target directory (including spaces);
+`--model-dir DIRECTORY` selects a local target directory (including spaces);
 relative paths and `~` are resolved before starting. It is mutually exclusive
 with `--model`, which continues to accept only Hugging Face model IDs.
 Local targets use hashed selection links under `.selections`, are re-inspected

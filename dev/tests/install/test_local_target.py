@@ -38,11 +38,11 @@ class LocalTargetTest(unittest.TestCase):
 
     def test_launcher_and_installer_accept_local_target(self):
         self.assertEqual(
-            launcher.parse_args(["serve", "--modeldir", str(self.target)]).model,
+            launcher.parse_args(["serve", "--model-dir", str(self.target)]).model,
             str(self.target),
         )
         self.assertEqual(
-            models.parse_args(["--modeldir", str(self.target), "prepare"]).model,
+            models.parse_args(["--model-dir", str(self.target), "prepare"]).model,
             str(self.target),
         )
 
@@ -53,8 +53,8 @@ class LocalTargetTest(unittest.TestCase):
         ):
             for flags in (
                 ["--model", str(self.target)],
-                ["--model", "owner/repo", "--modeldir", str(self.target)],
-                ["--modeldir", str(self.target), "--revision", "main"],
+                ["--model", "owner/repo", "--model-dir", str(self.target)],
+                ["--model-dir", str(self.target), "--revision", "main"],
             ):
                 with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
                     parse(prefix + flags + suffix)
@@ -62,7 +62,7 @@ class LocalTargetTest(unittest.TestCase):
             serve_options.parse_model_directory(str(self.target)), str(self.target)
         )
 
-    def test_launcher_passes_modeldir_to_installer(self):
+    def test_launcher_passes_model_dir_to_installer(self):
         chosen = self.selection()
         with (
             mock.patch.object(launcher.paths, "PACKAGED", True),
@@ -71,7 +71,7 @@ class LocalTargetTest(unittest.TestCase):
         ):
             launcher._ensure_installed(chosen)
         command = run.call_args.args[0]
-        self.assertIn("--modeldir", command)
+        self.assertIn("--model-dir", command)
         self.assertNotIn("--model", command)
         self.assertEqual(models.parse_args(command[2:]).model, str(self.target))
 

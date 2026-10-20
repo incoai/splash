@@ -340,7 +340,7 @@ def parse_args(argv=None):
         help="Hugging Face repository ID (owner/repo[:variant])",
     )
     source.add_argument(
-        "--modeldir",
+        "--model-dir",
         dest="model",
         type=serve_options.parse_model_directory,
         help="local target model directory",
@@ -362,7 +362,7 @@ def parse_args(argv=None):
     commands.add_parser("link", help="print the selection link")
     args = parser.parse_args(argv)
     if Path(args.model).is_absolute() and args.revision is not None:
-        parser.error("--revision cannot be used with --modeldir")
+        parser.error("--revision cannot be used with --model-dir")
     return args
 
 

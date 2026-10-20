@@ -1641,7 +1641,7 @@ def parse_args(argv=None):
         metavar="OWNER/REPO",
     )
     source.add_argument(
-        "--modeldir",
+        "--model-dir",
         dest="model",
         type=serve_options.parse_model_directory,
         metavar="DIRECTORY",
