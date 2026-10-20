@@ -59,6 +59,17 @@ in Chat. Anthropic Messages requests reason only when they set `thinking`.
 [Tool calls](DEVELOPMENT.md#tool-calls) ·
 [API details](DEVELOPMENT.md#api)
 
+Local MLX targets can also be served from an absolute directory:
+
+```sh
+./splash serve --model-dir /path/to/local/model
+```
+
+Splash links the existing target files without copying or downloading them.
+Keep the directory available and unchanged while serving. The matching DFlash2
+draft is still downloaded if needed; `--draft-model /absolute/draft` selects
+a local draft. `--revision` applies only to Hub targets.
+
 ## Models
 
 Splash supports these model families, with a matching DFlash2 draft selected

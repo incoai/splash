@@ -368,7 +368,10 @@ def prepare(selection):
         with hub.as_model_errors(f"cannot install {selection.model}"):
             manifest = models.read_json(target.file("manifest.json"))
         models.refuse_package(selection.model, manifest)
-    if installed is not None and target.revision == installed_commit:
+    if target.revision is None:
+        # Local files have no immutable commit: inspect and assemble every start.
+        _install(selection, target, installed)
+    elif installed is not None and target.revision == installed_commit:
         _start_installed(selection, target, installed)
     else:
         _install_commit(selection, target, installed)

@@ -1634,11 +1634,18 @@ def parse_args(argv=None):
         help="installed model directory holding target/ and draft/",
     )
     parser.add_argument("--tokenizer", required=True)
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
         "--model",
         type=serve_options.parse_model_id,
-        required=True,
         metavar="OWNER/REPO",
+    )
+    source.add_argument(
+        "--model-dir",
+        dest="model",
+        type=serve_options.parse_model_directory,
+        metavar="DIRECTORY",
+        help="local target model directory",
     )
     parser.add_argument("--port", type=int, default=serve_options.DEFAULT_PORT)
     parser.add_argument("--binary", default=str(ROOT / "build" / "splash"))

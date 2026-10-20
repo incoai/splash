@@ -80,6 +80,13 @@ def parse_model_id(value):
     return value
 
 
+def parse_model_directory(value):
+    path = Path(value).expanduser()
+    if not path.is_dir():
+        raise argparse.ArgumentTypeError(f"local model directory not found: {value}")
+    return str(path.resolve())
+
+
 def parse_max_context(value):
     """'auto' (None), or a token count; K is 1024 tokens."""
     normalized = value.strip().upper()
