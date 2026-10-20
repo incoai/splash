@@ -111,6 +111,39 @@ class TraceReportTests(unittest.TestCase):
 
 
 class PairedServingTests(unittest.TestCase):
+    def test_warmup_uses_equal_matched_rounds_until_both_arms_are_ready(self):
+        import argparse
+
+        args = argparse.Namespace(
+            warmup_context=2048, warmup_tokens=512, warmup_seconds=3
+        )
+        with (
+            patch.object(
+                serving_regression, "prepared_prompt", side_effect=["a", "b", "c"]
+            ),
+            patch.object(serving_regression, "completion") as complete,
+            patch.object(
+                serving_regression.time,
+                "monotonic",
+                side_effect=[0, 3, 3, 4, 4, 7, 7, 8, 8, 11, 11, 12],
+            ),
+        ):
+            result = serving_regression.warm_servers(["base", "candidate"], args, None)
+        self.assertEqual(
+            result, {"rounds_per_arm": 3, "request_wall_seconds_by_arm": [9, 3]}
+        )
+        self.assertEqual(
+            [(call.args[0], call.args[2]) for call in complete.call_args_list],
+            [
+                ("base", "a"),
+                ("candidate", "a"),
+                ("base", "b"),
+                ("candidate", "b"),
+                ("base", "c"),
+                ("candidate", "c"),
+            ],
+        )
+
     def test_noisy_speedup_and_changed_outputs_do_not_disappear(self):
         rows = [
             {"seconds_per_token": value, "responses": [{"message_sha256": output}]}
