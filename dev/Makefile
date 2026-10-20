@@ -126,6 +126,35 @@ test-release-real: preflight $(TARGET) agent-preflight verify-build-identity
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/agent_real.py $(AGENT_ARGS) \
 		--http-smoke
 
+# The video model (DEVELOPMENT.md, Video): VIDEO_ROOT, the MiniMax-H3 a
+# selection prepared (by default `splash serve --model VIDEO_MODEL`'s), or
+# VIDEO_CONVERTED, images converted before, which the tests prepare first;
+# and VIDEO_REFERENCES, the directory of the h3 engine's references (its
+# golden prompt's hidden states, latents and frames). VIDEO_SECONDS=15 also
+# runs a 15 s clip through the server.
+VIDEO_MODEL ?= MiniMaxAI/MiniMax-H3
+VIDEO_ROOT ?= $(shell $(PYTHON) install/models.py --model "$(VIDEO_MODEL)" link)
+VIDEO_CONVERTED ?=
+VIDEO_REFERENCES ?=
+VIDEO_SECONDS ?= 3
+VIDEO_ARGS = --model "$(VIDEO_MODEL)" --references "$(VIDEO_REFERENCES)" \
+	$(if $(VIDEO_CONVERTED),--converted "$(VIDEO_CONVERTED)",--model-root "$(VIDEO_ROOT)")
+
+.PHONY: video-references test-video-real test-video-http-real
+video-references:
+	@test -d "$(VIDEO_REFERENCES)" || { \
+		echo "error: set VIDEO_REFERENCES to the h3 engine's reference directory" >&2; \
+		exit 1; \
+	}
+
+test-video-real: install-development $(TARGET) video-references
+	$(PYTHON) dev/tests/video_real.py engine $(VIDEO_ARGS) \
+		--output build/release/video-engine.json
+
+test-video-http-real: install-development $(TARGET) video-references
+	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/video_real.py http $(VIDEO_ARGS) \
+		--seconds "$(VIDEO_SECONDS)" --output build/release/video-http.json
+
 # BASELINE is a checkout whose build/ holds another build's splash.metallib,
 # engine-tests/backend-benchmark and, for a build that loads the weights into
 # memory, engine-tests/weight-digests: this build is compared with it on this
