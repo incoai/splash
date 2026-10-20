@@ -18,6 +18,11 @@ and likewise for media, metal, model and ops; "metal/abi/" ->
 "h3/h3.h" -> "video/h3/h3.h"). Code and kernel arithmetic are otherwise
 unchanged.
 
+Splash's own files beside the copy: VideoRuntime.* (the engine process of a
+video model, which drives the engine through its C ABI), TextEncoder.* and
+TextEncoderABI.h with kernels/video/text_encoder.metal (the prompt's text
+encoder), and this note.
+
 Build (Makefile): the kernels compile into splash.metallib as its video
 group with Splash's production Metal flags, the prep kernels also without
 fast math, as h3 builds them, since they reproduce MLX's arithmetic bit for
