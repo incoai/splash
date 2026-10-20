@@ -119,6 +119,15 @@ prompt after 50 ms, then a 512-token interactive request after another 50 ms.
 Both arriving peers request 32 output tokens. `--arrival-delay` changes those
 offsets. The harness requires actual stream/prefill overlap.
 
+`--cache-mode cached` primes the complete long prompt before the measurement.
+`--cache-mode prefix-resume` primes its leading half by character count, then
+extends that shared prefix in the measured request. Each arm uses a fresh salt;
+the primer must be cold, the measured long request must reuse cached tokens,
+and active/interactive peers remain cold. Actual cached counts are retained.
+These are RAM-prefix reuse/continuation scenarios; they do not simulate a
+request suspended under memory pressure. Priming is outside the measured
+interval, while restore and suffix prefill in the arriving request are inside.
+
 The primary mixed metric is total workload wall seconds per output token,
 including prefill and frontend work. It also records short/long HTTP TTFT and
 p95/maximum content-chunk gaps during the contended interval. A content chunk

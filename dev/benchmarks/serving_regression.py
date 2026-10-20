@@ -255,7 +255,9 @@ def fallback_probes(server, args):
     return {"sampled": sampled, "constrained": constrained}
 
 
-def streamed(server, args, prompt, tokens, first=None):
+def streamed(
+    server, args, prompt, tokens, first=None, *, cache_salt=None, expect_cached=False
+):
     """Client arrival/chunk timestamps, including HTTP/tokenization latency."""
     connection = http.client.HTTPConnection(
         "127.0.0.1", server.port, timeout=args.request_timeout
@@ -269,7 +271,7 @@ def streamed(server, args, prompt, tokens, first=None):
             max_completion_tokens=tokens,
             stream=True,
             stream_options={"include_usage": True},
-            cache_salt="mixed-regression-" + uuid.uuid4().hex,
+            cache_salt=cache_salt or "mixed-regression-" + uuid.uuid4().hex,
         )
         connection.request(
             "POST",
@@ -298,9 +300,10 @@ def streamed(server, args, prompt, tokens, first=None):
         smoke.require(
             chunks and usage is not None, "stream omitted content or final usage"
         )
+        cached = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
         smoke.require(
-            usage.get("prompt_tokens_details", {}).get("cached_tokens", 0) == 0,
-            "mixed workload reused a cached prompt",
+            cached > 0 if expect_cached else cached == 0,
+            "mixed workload cache reuse does not match the requested scenario",
         )
         return {
             "started": started,
@@ -316,7 +319,25 @@ def streamed(server, args, prompt, tokens, first=None):
         connection.close()
 
 
+def prepare_mixed_cache(server, args, long_prompt):
+    if args.cache_mode == "cold":
+        return None
+    salt = "mixed-primer-" + uuid.uuid4().hex
+    primer = (
+        long_prompt
+        if args.cache_mode == "cached"
+        else long_prompt[: len(long_prompt) // 2]
+    )
+    response = completion(server, args, primer, tokens=1, cache_salt=salt)
+    smoke.require(
+        response["usage"].get("prompt_tokens_details", {}).get("cached_tokens", 0) == 0,
+        "a fresh cache primer unexpectedly reused earlier work",
+    )
+    return salt
+
+
 def measure_mixed(server, args, active_prompt, long_prompt, short_prompt):
+    long_salt = prepare_mixed_cache(server, args, long_prompt)
     before = status(server, args)
     started = time.monotonic()
     first = threading.Event()
@@ -332,7 +353,15 @@ def measure_mixed(server, args, active_prompt, long_prompt, short_prompt):
                 "active stream ended before the contended arrivals"
             )
         time.sleep(args.arrival_delay)
-        long = pool.submit(streamed, server, args, long_prompt, 32)
+        long = pool.submit(
+            streamed,
+            server,
+            args,
+            long_prompt,
+            32,
+            cache_salt=long_salt,
+            expect_cached=args.cache_mode != "cold",
+        )
         time.sleep(args.arrival_delay)
         short = pool.submit(streamed, server, args, short_prompt, 32)
         responses = [
@@ -401,6 +430,9 @@ def parse_args():
     )
     parser.add_argument("--scenario", choices=("decode", "mixed"), default="decode")
     parser.add_argument("--arrival-delay", type=float, default=0.05)
+    parser.add_argument(
+        "--cache-mode", choices=("cold", "cached", "prefix-resume"), default="cold"
+    )
     parser.add_argument("--output", type=Path, required=True)
     args = smoke.resolve_server_arguments(parser.parse_args())
     args.contexts = [int(value) for value in args.contexts.split(",")]
@@ -430,6 +462,8 @@ def parse_args():
         or args.warmup_context + args.warmup_tokens > args.max_context
     ):
         parser.error("invalid warmup duration/context/output budget")
+    if args.scenario != "mixed" and args.cache_mode != "cold":
+        parser.error("cached and prefix-resume modes require --scenario mixed")
     args.environments = []
     for values in (args.baseline_env, args.candidate_env):
         env = {
@@ -480,6 +514,7 @@ def main():
             "tokens": args.tokens,
             "batch": args.batch,
             "samples": args.samples,
+            "cache_mode": args.cache_mode,
             "warmup_context": args.warmup_context,
             "warmup_tokens": args.warmup_tokens,
             "warmup_seconds_per_arm": args.warmup_seconds,

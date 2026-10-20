@@ -144,6 +144,32 @@ class PairedServingTests(unittest.TestCase):
             ],
         )
 
+    def test_cached_and_prefix_resume_primers_share_only_the_intended_prefix(self):
+        import argparse
+
+        for mode, expected in (
+            ("cold", None),
+            ("cached", "abcdefgh"),
+            ("prefix-resume", "abcd"),
+        ):
+            with (
+                self.subTest(mode=mode),
+                patch.object(serving_regression, "completion") as complete,
+            ):
+                complete.return_value = {
+                    "usage": {"prompt_tokens_details": {"cached_tokens": 0}}
+                }
+                salt = serving_regression.prepare_mixed_cache(
+                    "server", argparse.Namespace(cache_mode=mode), "abcdefgh"
+                )
+                if expected is None:
+                    self.assertIsNone(salt)
+                    complete.assert_not_called()
+                else:
+                    self.assertEqual(complete.call_args.args[2], expected)
+                    self.assertEqual(complete.call_args.kwargs["cache_salt"], salt)
+                    self.assertEqual(complete.call_args.kwargs["tokens"], 1)
+
     def test_noisy_speedup_and_changed_outputs_do_not_disappear(self):
         rows = [
             {"seconds_per_token": value, "responses": [{"message_sha256": output}]}
