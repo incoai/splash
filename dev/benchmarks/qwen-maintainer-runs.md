@@ -47,7 +47,7 @@ For each of the four model/storage cells, the full package prepares:
 - The real-model oracle with INT8/BF16 KV crossed with FP32/BF16 recurrent state,
   including shader validation, snapshot/restore, lane movement, preemption,
   masks, thinking limits and sampled-path checks already in that oracle.
-- Three paired ABBA trials for code, math and prose at B1 and exact prompt
+- Three single-resident ABBA trials for code, math and prose at B1 and exact prompt
   contexts 2,048, 8,192 and 31,744, each with 512 committed output tokens.
 - B2/B3/B4 at 2,048 prompt rows, and a B1 mixed streaming/long-prefill/interactive
   workload at the three context sizes, plus seeded sampling and strict JSON.
@@ -59,10 +59,15 @@ diagnostics. The package's `complete` field means all jobs executed successfully
 not that every policy passed a promotion gate. Incomplete jobs and failures
 retain their logs and do not become passing results.
 
-The paired harness needs room for two resident servers. The example's 26 GiB
-per-server limit for the MoE safetensors target is not suitable for every Mac.
-If the machine cannot admit both, report that cell as unexecuted and use the
-repository's sequential HTTP release harness as a separately identified run.
+The default `--residency sequential` starts one server per complete ABBA round
+and closes it before starting the next, with four matched 2k/512-token warmup
+requests per round. This avoids the observed second-server Metal out-of-memory
+failure for the MoE safetensors model and admission serialization for dense ANE
+workloads on the 48 GiB Mac. `--residency paired` remains available when there is
+enough memory for both; record that method separately. Native progress checks
+must still prove actual long-prefill contention rather than HTTP overlap.
+Per-model memory limits are upper bounds and must fit the runner's capacity.
+If a cell cannot run at the chosen settings, report it as unexecuted.
 Do not silently lower model quality or compare unlike memory/ANE settings.
 B2–B4 at 8K/32K and long-context limits are additional memory qualification,
 not claimed by the initial 2K multi-lane matrix.

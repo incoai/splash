@@ -20,6 +20,7 @@ class QualificationMatrixTests(unittest.TestCase):
                 "tokens": 512,
                 "samples": 3,
                 "max_memory": "20G",
+                "residency": "sequential",
                 **changes,
             }
         )
@@ -51,12 +52,21 @@ class QualificationMatrixTests(unittest.TestCase):
         for job in serving:
             self.assertNotIn("--trace", job["command"])
             self.assertNotIn("MTL_SHADER_VALIDATION", job["environment"])
+            self.assertEqual(
+                job["command"][job["command"].index("--residency") + 1], "sequential"
+            )
+            self.assertEqual(
+                job["command"][job["command"].index("--warmup-seconds") + 1], "0"
+            )
+            self.assertEqual(
+                job["command"][job["command"].index("--warmup-rounds") + 1], "4"
+            )
         self.assertEqual(sum("mixed" in job["id"] for job in serving), 1)
         self.assertEqual(len({job["id"] for job in jobs}), len(jobs))
 
     def test_memory_override_and_ordinary_binary_capability(self):
         jobs = matrix.jobs(
-            self.arguments(suite="serving", live_gdn=False),
+            self.arguments(suite="serving", live_gdn=False, residency="paired"),
             [
                 {
                     "label": "moe-mlx",
@@ -70,6 +80,7 @@ class QualificationMatrixTests(unittest.TestCase):
             command = job["command"]
             self.assertEqual(command[command.index("--max-memory") + 1], "26G")
             self.assertNotIn("SPLASH_LIVE_GDN=1", command)
+            self.assertEqual(command[command.index("--residency") + 1], "paired")
 
 
 if __name__ == "__main__":

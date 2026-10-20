@@ -78,6 +78,12 @@ def jobs(args, models):
                         "code,math,prose",
                         "--scenario",
                         scenario,
+                        "--residency",
+                        args.residency,
+                        "--warmup-seconds",
+                        "0",
+                        "--warmup-rounds",
+                        "4",
                         "--tokens",
                         str(args.tokens),
                         "--samples",
@@ -118,6 +124,9 @@ def main():
     parser.add_argument("--tokens", type=int, default=512)
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--max-memory", default="20G")
+    parser.add_argument(
+        "--residency", choices=("sequential", "paired"), default="sequential"
+    )
     parser.add_argument("--timeout", type=float, default=14400)
     parser.add_argument("--execute", action="store_true")
     args = parser.parse_args()
@@ -185,6 +194,8 @@ def main():
                 "SPLASH_SERVING_TRACE",
                 "SPLASH_LIVE_VERIFY_THRESHOLD",
                 "SPLASH_LIVE_GDN",
+                "SPLASH_PREFILL_COST_MODEL",
+                "SPLASH_BENCH_FIXED_VERIFY_ROWS",
             ):
                 environment.pop(key, None)
             environment.update(record["environment"])
