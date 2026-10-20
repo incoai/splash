@@ -346,6 +346,8 @@ def prepare_mixed_cache(server, args, long_prompt):
 
 def native_sample(server, args, before_short=False):
     value = status(server, args)
+    smoke.require(not value.get("transport", {}).get("status_stale", False),
+                  "stale native status cannot prove work overlap")
     return {
         "at": time.monotonic(),
         "before_short": before_short,
