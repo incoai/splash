@@ -693,6 +693,32 @@ void dispatchProfilingCoversEveryCommand(const std::string &metallibPath) {
     std::cout << "PASS dispatch profiling covers every command\n";
 }
 
+void commandTracingPreservesExecution(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
+    const uint32_t count = 1, increment = 1;
+    auto *value = static_cast<uint32_t *>(buffer.contents());
+    *value = 0;
+    const ComputeDispatch dispatch = addition(buffer, count, increment);
+    BackendInstrumentation::setCommandTracing(backend, true);
+    auto ticket = backend.submitCommandAsync({&dispatch, 1});
+    const auto timing = ticket.wait();
+    const auto trace = BackendInstrumentation::takeCommandTrace(backend);
+    require(trace.size() == 1 && trace.front().dispatches == 1 && *value == 1,
+            "tracing changed command execution or lost its completion");
+    const auto &sample = trace.front();
+    require(sample.prepareStart <= sample.encodeStart && sample.encodeStart <= sample.commit &&
+                sample.commit <= sample.complete && sample.gpuEnd >= sample.gpuStart &&
+                sample.gpuStart >= sample.commit - 0.001 && sample.gpuEnd <= sample.complete + 0.001 &&
+                std::abs(sample.gpuEnd - sample.gpuStart - timing.gpuSeconds) < 1e-6,
+            "command trace clocks or intervals are inconsistent");
+    BackendInstrumentation::setCommandTracing(backend, false);
+    (void)backend.submitCommandAsync({&dispatch, 1}).wait();
+    require(BackendInstrumentation::takeCommandTrace(backend).empty() && *value == 2,
+            "disabled tracing recorded or changed a command");
+    std::cout << "PASS command tracing preserves execution\n";
+}
+
 // Preparing a dispatch compiles its pipeline without submitting anything, so
 // its submission compiles nothing, and rejects what submission would.
 void preparedPipelinesCompileAhead(const std::string &metallibPath) {
@@ -1761,6 +1787,7 @@ int main(int argc, const char *argv[]) {
             shutdownLeavesTicketTeardownToTheCommand(argv[1]);
             shutdownSparesACommandThatCompletes(argv[1]);
             dispatchProfilingCoversEveryCommand(argv[1]);
+            commandTracingPreservesExecution(argv[1]);
             preparedPipelinesCompileAhead(argv[1]);
             buffersStayResident(argv[1]);
             infiniteKeepAliveHoldsResidency(argv[1]);

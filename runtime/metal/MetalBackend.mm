@@ -416,6 +416,17 @@ struct BackendAsyncState {
     }
 };
 
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+struct CommandTraceLog {
+    std::mutex mutex;
+    std::vector<CommandTrace> records;
+};
+
+double traceSeconds() noexcept {
+    return std::chrono::duration<double>(AwakeClock::now().time_since_epoch()).count();
+}
+#endif
+
 struct CommandTicket::State {
     std::shared_ptr<BackendAsyncState> backend;
     std::vector<std::shared_ptr<MetalAllocation>> retainedAllocations;
@@ -430,6 +441,11 @@ struct CommandTicket::State {
     std::string error;
     bool completed = false;
     bool released = false;
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+    std::shared_ptr<CommandTraceLog> traceLog;
+    CommandTrace trace;
+    bool tracePublished = false;
+#endif
 
     void finishCommand(id<MTLCommandBuffer> command) {
         auto wallEnd = AwakeClock::now();
@@ -463,6 +479,19 @@ struct CommandTicket::State {
             error = message.str();
         }
 
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+        if (traceLog) {
+            std::lock_guard lock(mutex);
+            if (!tracePublished) {
+                tracePublished = true;
+                trace.complete = traceSeconds();
+                trace.gpuStart = gpuStart;
+                trace.gpuEnd = command.GPUEndTime;
+                std::lock_guard traceLock(traceLog->mutex);
+                traceLog->records.push_back(trace);
+            }
+        }
+#endif
         finish(timing, std::move(error));
     }
 
@@ -584,6 +613,9 @@ struct MetalBackend::Impl {
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
     bool dispatchProfiling = false;
     std::vector<DispatchTiming> dispatchProfile;
+    bool commandTracing = false;
+    double tracePrepareStart = 0.0;
+    std::shared_ptr<CommandTraceLog> traceLog = std::make_shared<CommandTraceLog>();
 #endif
     __strong id<MTLDevice> device = nil;
     __strong id<MTLCommandQueue> queue = nil;
@@ -803,6 +835,15 @@ struct MetalBackend::Impl {
         ticketState->retainedAllocations = std::move(retained);
         ticketState->sequence =
             asyncState->beginSubmission(dispatches.size());
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+        if (commandTracing) {
+            ticketState->traceLog = traceLog;
+            ticketState->trace.sequence = ticketState->sequence;
+            ticketState->trace.dispatches = dispatches.size();
+            ticketState->trace.prepareStart = tracePrepareStart;
+            ticketState->trace.encodeStart = traceSeconds();
+        }
+#endif
 
         auto failBeforeCommit = [&](std::string message) {
             markUnhealthy(message);
@@ -921,6 +962,10 @@ struct MetalBackend::Impl {
                 ticketState->finishCommand(completed);
             }];
             residency->use();
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+            if (ticketState->traceLog)
+                ticketState->trace.commit = traceSeconds();
+#endif
             asyncState->commitSubmission(ticketState->sequence, leading, command,
                 [weakTicket = std::weak_ptr(ticketState)](
                     id<MTLCommandBuffer> completed) {
@@ -1323,6 +1368,9 @@ CommandTicket MetalBackend::submitCommandAsync(const Command &command,
     }
 #endif
     checkEvents(command.events, command.dispatches.size());
+#ifdef SPLASH_BACKEND_INSTRUMENTATION
+    if (impl_->commandTracing) impl_->tracePrepareStart = traceSeconds();
+#endif
     Impl::PreparedCommand prepared = impl_->prepare(command.dispatches);
     return impl_->commit(prepared.dispatches, command.events,
                          std::move(prepared.retainedAllocations),
@@ -1391,6 +1439,18 @@ void BackendInstrumentation::setDispatchProfiling(MetalBackend &backend,
 std::vector<DispatchTiming>
 BackendInstrumentation::takeDispatchProfile(MetalBackend &backend) {
     return std::exchange(backend.impl_->dispatchProfile, {});
+}
+
+void BackendInstrumentation::setCommandTracing(MetalBackend &backend, bool enabled) {
+    if (enabled && backend.impl_->dispatchProfiling)
+        throw MetalBackendError("command tracing requires ordinary execution");
+    backend.impl_->commandTracing = enabled;
+}
+
+std::vector<CommandTrace>
+BackendInstrumentation::takeCommandTrace(MetalBackend &backend) {
+    std::lock_guard lock(backend.impl_->traceLog->mutex);
+    return std::exchange(backend.impl_->traceLog->records, {});
 }
 #endif
 

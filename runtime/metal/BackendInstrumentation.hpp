@@ -15,6 +15,19 @@ struct DispatchTiming {
   double gpuSeconds = 0.0;
 };
 
+// Host and GPU instants in system mach time, in seconds. A command with
+// event steps spans the first through last Metal command buffer.
+struct CommandTrace {
+  uint64_t sequence = 0;
+  uint64_t dispatches = 0;
+  double prepareStart = 0.0;
+  double encodeStart = 0.0;
+  double commit = 0.0;
+  double complete = 0.0;
+  double gpuStart = 0.0;
+  double gpuEnd = 0.0;
+};
+
 // What tests and benchmarks observe of a MetalBackend beyond its serving
 // API. Only the instrumented build of MetalBackend.mm
 // (SPLASH_BACKEND_INSTRUMENTATION) defines these; production binaries never
@@ -32,6 +45,11 @@ public:
   static void setDispatchProfiling(MetalBackend &backend, bool enabled);
   [[nodiscard]] static std::vector<DispatchTiming>
   takeDispatchProfile(MetalBackend &backend);
+  // Optional ordinary-command tracing; it does not split dispatches or
+  // wait for additional work. Take only after the measured tickets complete.
+  static void setCommandTracing(MetalBackend &backend, bool enabled);
+  [[nodiscard]] static std::vector<CommandTrace>
+  takeCommandTrace(MetalBackend &backend);
 };
 
 } // namespace splash::metal

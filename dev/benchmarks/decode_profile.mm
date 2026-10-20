@@ -1,7 +1,7 @@
 // Per-kernel GPU time attribution for the production executor.
 //
 //   decode-profile METALLIB MODEL_ROOT [--prompt-tokens N] [--cycles K] [--kv-format int8|bf16]
-//                  [--state-format fp32|bf16]
+//                  [--state-format fp32|bf16] [--live-verify-threshold Q]
 //   decode-profile METALLIB MODEL_ROOT --images HxW[,HxW...] [--cycles K]
 //
 // Drives the real model runtime with Metal dispatch profiling enabled, so
@@ -15,6 +15,7 @@
 // x width in patches), fused and then attributed.
 
 #include "engine/Types.hpp"
+#include "AwakeClock.hpp"
 #include "model/Runtime.hpp"
 #include "ops/PageStorage.hpp"
 #include "ops/Vision.hpp"
@@ -33,9 +34,12 @@
 #include <array>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <span>
@@ -222,11 +226,11 @@ struct Lane final {
 };
 
 void prefill(model::Runtime &executor, Lane &lane,
-             std::span<const uint32_t> prompt) {
+             std::span<const uint32_t> prompt, uint32_t generatedBudget) {
   EngineRequest request;
   request.id = lane.id;
   request.prompt.assign(prompt.begin(), prompt.end());
-  request.maxNewTokens = 256;
+  request.maxNewTokens = generatedBudget;
   executor.beginColdRequest(request.modelView(), lane.stateLane);
   uint32_t offset = 0;
   while (offset < prompt.size()) {
@@ -254,6 +258,14 @@ struct CycleTiming final {
   double gpuSeconds = 0.0;
   double wallSeconds = 0.0;
   uint64_t commands = 0;
+  uint32_t liveRows = 0;
+  uint32_t tokens = 0;
+  uint32_t proposed = 0;
+  uint32_t accepted = 0;
+  std::array<uint32_t, model::ExecutionLimits::draftProposalTokens> survival{};
+  double start = 0.0;
+  double end = 0.0;
+  std::vector<metal::CommandTrace> trace;
 };
 
 CycleTiming decodeCycle(metal::MetalBackend &backend,
@@ -261,7 +273,7 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
                         std::span<Lane> lanes) {
   const uint64_t submissionsBefore =
       BackendInstrumentation::submittedCommands(backend);
-  const auto started = std::chrono::steady_clock::now();
+  const auto started = AwakeClock::now();
   BatchPlan plan;
   plan.kind = WorkKind::Decode;
   std::vector<ModelBatchItem> items;
@@ -273,18 +285,30 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
   auto results = executor.decode(plan, items);
   if (results.size() != lanes.size())
     throw std::runtime_error("decode width changed");
+  uint32_t tokens = 0;
+  uint32_t proposed = 0, accepted = 0;
+  std::array<uint32_t, model::ExecutionLimits::draftProposalTokens> survival{};
   for (size_t index = 0; index < lanes.size(); ++index) {
     if (!results[index].failure.empty())
       throw std::runtime_error(results[index].failure);
     if (results[index].finished)
       throw std::runtime_error("the answer ended before profiling finished");
+    tokens += static_cast<uint32_t>(results[index].outputTokens.size());
+    proposed += results[index].draftedTokens;
+    accepted += results[index].acceptedDraftTokens;
+    for (uint32_t position = 0; position < results[index].acceptedDraftTokens; ++position)
+      ++survival.at(position);
     lanes[index].position += results[index].outputTokens.size() -
                              results[index].outputTokensWithoutKv;
   }
-  const auto finished = std::chrono::steady_clock::now();
+  const auto finished = AwakeClock::now();
   return {executor.telemetry().lastDecodeGpuSeconds,
           std::chrono::duration<double>(finished - started).count(),
-          BackendInstrumentation::submittedCommands(backend) - submissionsBefore};
+          BackendInstrumentation::submittedCommands(backend) - submissionsBefore,
+          executor.telemetry().lastDecodeLiveRows, tokens, proposed, accepted, survival,
+          std::chrono::duration<double>(started.time_since_epoch()).count(),
+          std::chrono::duration<double>(finished.time_since_epoch()).count(),
+          BackendInstrumentation::takeCommandTrace(backend)};
 }
 
 } // namespace
@@ -292,10 +316,12 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
 int main(int argc, char **argv) {
   @autoreleasepool {
     try {
+      std::setvbuf(stdout, nullptr, _IOLBF, 0);
       if (argc < 3) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
-                     "[--state-format fp32|bf16]\n"
+                     "[--state-format fp32|bf16] [--live-verify-threshold Q] "
+                     "[--attribution on|off] [--json-output PATH] [--trace-output PATH]\n"
                      "       decode-profile METALLIB MODEL_ROOT "
                      "--images HxW[,HxW...] [--cycles K]\n";
         return 2;
@@ -306,6 +332,9 @@ int main(int argc, char **argv) {
       ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
       std::vector<ops::ImageGrid> grids;
       bool textOptions = false;
+      float liveVerifyThreshold = 0.0F;
+      bool attribution = true;
+      std::string jsonPath, tracePath;
       for (int index = 3; index < argc; index += 2) {
         const std::string_view option(argv[index]);
         if (index + 1 >= argc)
@@ -315,7 +344,24 @@ int main(int argc, char **argv) {
           textOptions = true;
         } else if (option == "--cycles")
           cycles = parseCount(argv[index + 1], "--cycles");
-        else if (option == "--kv-format") {
+        else if (option == "--live-verify-threshold") {
+          textOptions = true;
+          size_t consumed = 0;
+          const std::string value(argv[index + 1]);
+          liveVerifyThreshold = std::stof(value, &consumed);
+          if (consumed != value.size() || !std::isfinite(liveVerifyThreshold) ||
+              liveVerifyThreshold < 0.0F || liveVerifyThreshold > 1.0F)
+            throw std::invalid_argument("invalid live verify threshold");
+        } else if (option == "--attribution") {
+          const std::string_view value(argv[index + 1]);
+          if (value != "on" && value != "off")
+            throw std::invalid_argument("--attribution takes on or off");
+          attribution = value == "on";
+          textOptions = true;
+        } else if (option == "--json-output" || option == "--trace-output") {
+          (option == "--json-output" ? jsonPath : tracePath) = argv[index + 1];
+          textOptions = true;
+        } else if (option == "--kv-format") {
           const std::string_view value(argv[index + 1]);
           if (value != "int8" && value != "bf16")
             throw std::invalid_argument("--kv-format takes int8 or bf16");
@@ -335,6 +381,33 @@ int main(int argc, char **argv) {
       if (!grids.empty() && textOptions)
         throw std::invalid_argument("--images takes no other option than --cycles");
 
+      const uint64_t generatedBound = std::max<uint64_t>(256,
+          uint64_t{4} * (uint64_t{cycles} * 2 + 2) * model::ExecutionLimits::targetVerifyRows + 1);
+      if (uint64_t{promptTokens} + generatedBound + model::ExecutionLimits::targetVerifyRows >
+          kv::kMaximumPhysicalTokens)
+        throw std::invalid_argument("profile prompt and cycle budget exceed physical context");
+      const uint32_t generatedBudget = static_cast<uint32_t>(generatedBound);
+      std::ofstream json, trace;
+      if (!jsonPath.empty()) {
+        json.open(jsonPath);
+        if (!json) throw std::runtime_error("cannot open JSON output");
+        json << std::setprecision(17) << "[\n";
+      }
+      if (!tracePath.empty()) {
+        trace.open(tracePath);
+        if (!trace) throw std::runtime_error("cannot open trace output");
+        trace << std::setprecision(17) << "{\"traceEvents\":[\n";
+      }
+      bool firstSample = true, firstEvent = true;
+      const double traceOrigin = std::chrono::duration<double>(AwakeClock::now().time_since_epoch()).count();
+      auto event = [&](const char *name, uint32_t tid, double begin, double end) {
+        if (!trace.is_open() || !std::isfinite(begin) || !std::isfinite(end) || end < begin) return;
+        trace << (firstEvent ? "" : ",\n") << "{\"name\":\"" << name
+              << "\",\"ph\":\"X\",\"pid\":1,\"tid\":" << tid
+              << ",\"ts\":" << (begin - traceOrigin) * 1e6 << ",\"dur\":" << (end - begin) * 1e6 << '}';
+        firstEvent = false;
+      };
+
       metal::MetalBackend backend(argv[1]);
       const std::filesystem::path root(argv[2]);
       if (!grids.empty()) {
@@ -349,7 +422,7 @@ int main(int argc, char **argv) {
 
       // Enough Page32 pages for four lanes of prompt plus generated rows.
       const uint32_t pagesPerLane =
-          (promptTokens + 256 + model::ExecutionLimits::targetVerifyRows) /
+          (promptTokens + generatedBudget + model::ExecutionLimits::targetVerifyRows) /
               kv::kPageTokens +
           2;
       // Whole extents of the largest size the pool rule picks, as a large
@@ -372,6 +445,8 @@ int main(int argc, char **argv) {
                                       model.stateLayout(stateFormat), nullptr);
       model::RuntimeContext context{backend, model, pages, states, operators};
       model::Runtime executor(context);
+      executor.setLiveVerifyThreshold(liveVerifyThreshold);
+      std::printf("live verify threshold %.6g (greedy MoE only)\n", liveVerifyThreshold);
 
       std::printf("device %s, %u prompt tokens, %u cycles per width, %s state\n",
                   backend.capabilities().deviceName.c_str(), promptTokens,
@@ -385,30 +460,66 @@ int main(int argc, char **argv) {
       const std::vector<uint32_t> prompt = chatPrompt(promptTokens);
 
       // Warm prefill and B1 decode with real work before measuring.
-      prefill(executor, lanes[0], prompt);
+      prefill(executor, lanes[0], prompt, generatedBudget);
       static_cast<void>(decodeCycle(backend, executor, std::span<Lane>(&lanes[0], 1)));
       executor.end(lanes[0].id);
 
       // Prefill: fused timing first, then the attributed replay. Both cover
       // every chunk of the prompt.
       const double prefillBefore = executor.telemetry().totalPrefillGpuSeconds;
-      prefill(executor, lanes[0], prompt);
+      prefill(executor, lanes[0], prompt, generatedBudget);
       const double prefillFused =
           executor.telemetry().totalPrefillGpuSeconds - prefillBefore;
       executor.end(lanes[0].id);
-      BackendInstrumentation::setDispatchProfiling(backend, true);
-      prefill(executor, lanes[0], prompt);
-      BackendInstrumentation::setDispatchProfiling(backend, false);
-      Table prefillTable;
-      accumulate(prefillTable,
-                 BackendInstrumentation::takeDispatchProfile(backend));
-      print("prefill " + std::to_string(promptTokens) + " rows", prefillTable,
-            1.0, prefillFused);
+      if (attribution) {
+        BackendInstrumentation::setDispatchProfiling(backend, true);
+        prefill(executor, lanes[0], prompt, generatedBudget);
+        BackendInstrumentation::setDispatchProfiling(backend, false);
+        Table prefillTable;
+        accumulate(prefillTable,
+                   BackendInstrumentation::takeDispatchProfile(backend));
+        print("prefill " + std::to_string(promptTokens) + " rows", prefillTable,
+              1.0, prefillFused);
+      } else {
+        prefill(executor, lanes[0], prompt, generatedBudget);
+      }
 
       auto profileWidth = [&](const char *title, std::span<Lane> active) {
+        // Compile each width's pipelines before measuring or tracing it.
+        static_cast<void>(decodeCycle(backend, executor, active));
+        BackendInstrumentation::setCommandTracing(backend, !tracePath.empty());
         std::vector<CycleTiming> fused;
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
           fused.push_back(decodeCycle(backend, executor, active));
+        BackendInstrumentation::setCommandTracing(backend, false);
+        for (uint32_t sample = 0; sample < fused.size(); ++sample) {
+          const CycleTiming &cycle = fused[sample];
+          if (json.is_open()) {
+            json << (firstSample ? "" : ",\n") << "{\"width\":" << active.size()
+                 << ",\"sample\":" << sample << ",\"prompt_tokens\":" << promptTokens
+                 << ",\"threshold\":" << liveVerifyThreshold
+                 << ",\"gpu_seconds\":" << cycle.gpuSeconds
+                 << ",\"wall_seconds\":" << cycle.wallSeconds
+                 << ",\"commands\":" << cycle.commands << ",\"eligible_rows\":" << cycle.liveRows
+                 << ",\"committed_tokens\":" << cycle.tokens << ",\"proposed_tokens\":" << cycle.proposed
+                 << ",\"accepted_tokens\":" << cycle.accepted << ",\"prefix_survival\":[";
+            for (uint32_t position = 0; position < cycle.survival.size(); ++position)
+              json << (position ? "," : "") << cycle.survival[position];
+            json << "]}";
+            firstSample = false;
+          }
+          event(title, 0, cycle.start, cycle.end);
+          double begin = cycle.start;
+          for (const metal::CommandTrace &command : cycle.trace) {
+            event("graph construction", 1, begin, command.prepareStart);
+            event("backend preparation", 1, command.prepareStart, command.encodeStart);
+            event("Metal encoding", 1, command.encodeStart, command.commit);
+            event("GPU execution", 2, command.gpuStart, command.gpuEnd);
+            event("completion notification", 1, command.gpuEnd, command.complete);
+            begin = command.complete;
+          }
+          event("result finalization", 1, begin, cycle.end);
+        }
         std::sort(fused.begin(), fused.end(),
                   [](const CycleTiming &left, const CycleTiming &right) {
                     return left.gpuSeconds < right.gpuSeconds;
@@ -418,25 +529,45 @@ int main(int argc, char **argv) {
                     "command(s) per cycle\n",
                     title, median.gpuSeconds * 1e3, median.wallSeconds * 1e3,
                     static_cast<unsigned long long>(median.commands));
-        BackendInstrumentation::setDispatchProfiling(backend, true);
-        for (uint32_t cycle = 0; cycle < cycles; ++cycle)
-          static_cast<void>(decodeCycle(backend, executor, active));
-        BackendInstrumentation::setDispatchProfiling(backend, false);
-        Table table;
-        accumulate(table,
-                   BackendInstrumentation::takeDispatchProfile(backend));
-        print(title, table, cycles, median.gpuSeconds);
+        uint64_t liveRows = 0, produced = 0;
+        double wall = 0.0;
+        for (const CycleTiming &cycle : fused) {
+          liveRows += cycle.liveRows;
+          produced += cycle.tokens;
+          wall += cycle.wallSeconds;
+        }
+        std::printf("mean live rows %.2f/%zu, tokens/cycle %.2f, fused wall %.2f tok/s\n",
+                    double(liveRows) / cycles, active.size() * model::ExecutionLimits::targetVerifyRows,
+                    double(produced) / cycles, double(produced) / wall);
+        if (attribution) {
+          BackendInstrumentation::setDispatchProfiling(backend, true);
+          for (uint32_t cycle = 0; cycle < cycles; ++cycle)
+            static_cast<void>(decodeCycle(backend, executor, active));
+          BackendInstrumentation::setDispatchProfiling(backend, false);
+          Table table;
+          accumulate(table,
+                     BackendInstrumentation::takeDispatchProfile(backend));
+          print(title, table, cycles, median.gpuSeconds);
+        }
       };
       profileWidth("B1 decode cycle", std::span<Lane>(&lanes[0], 1));
       // Add one lane at a time so M16 and M24 paths are measured too.
       for (uint32_t index = 1; index < lanes.size(); ++index) {
-        prefill(executor, lanes[index], prompt);
+        prefill(executor, lanes[index], prompt, generatedBudget);
         const std::string title = "B" + std::to_string(index + 1) + " decode cycle";
         profileWidth(title.c_str(), std::span<Lane>(lanes.data(), index + 1));
       }
 
       for (Lane &lane : lanes)
         executor.end(lane.id);
+      if (json.is_open()) {
+        json << "\n]\n";
+        if (!json) throw std::runtime_error("cannot write JSON output");
+      }
+      if (trace.is_open()) {
+        trace << "\n]}\n";
+        if (!trace) throw std::runtime_error("cannot write trace output");
+      }
       return 0;
     } catch (const std::exception &error) {
       std::cerr << "decode-profile: " << error.what() << '\n';
