@@ -61,6 +61,9 @@ class QualificationMatrixTests(unittest.TestCase):
             self.assertEqual(
                 job["command"][job["command"].index("--warmup-rounds") + 1], "4"
             )
+            self.assertEqual(
+                job["command"][job["command"].index("--warmup-tokens") + 1], "512"
+            )
         self.assertEqual(sum("mixed" in job["id"] for job in serving), 1)
         self.assertEqual(len({job["id"] for job in jobs}), len(jobs))
 
