@@ -145,7 +145,9 @@ def status(server, args):
 def warm_servers(servers, args, tokenizer):
     elapsed = [0.0] * len(servers)
     rounds = 0
-    while rounds < 2 or min(elapsed) < args.warmup_seconds:
+    while (
+        rounds < getattr(args, "warmup_rounds", 2) or min(elapsed) < args.warmup_seconds
+    ):
         prompt = WORKLOADS["code"]
         if args.warmup_context:
             prompt = prepared_prompt(
@@ -199,8 +201,14 @@ def measure(server, args, prompts, context):
         "responses": responses,
         "thermal_before": before.get("thermal_state"),
         "thermal_after": after.get("thermal_state"),
-        "memory_before": before.get("memory"),
-        "memory_after": after.get("memory"),
+        "memory_before": before.get("memory_actual"),
+        "memory_after": after.get("memory_actual"),
+        "memory_pressure_before": before.get("memory_pressure"),
+        "memory_pressure_after": after.get("memory_pressure"),
+        "decode_batches_by_width": {
+            key: value - before["scheduler"]["decode_batches_by_width"][key]
+            for key, value in after["scheduler"]["decode_batches_by_width"].items()
+        },
     }
 
 
@@ -336,7 +344,58 @@ def prepare_mixed_cache(server, args, long_prompt):
     return salt
 
 
-def measure_mixed(server, args, active_prompt, long_prompt, short_prompt):
+def native_sample(server, args, before_short=False):
+    value = status(server, args)
+    return {
+        "at": time.monotonic(),
+        "before_short": before_short,
+        "prefill_rows": value["scheduler"]["prefill_rows"],
+        "memory_pressure": value["memory_pressure"],
+        "requests": value["active_requests"],
+    }
+
+
+def native_overlap(
+    samples, active_id, context, cached, long_response, active_response, initial_rows
+):
+    """Prove native work overlap; concurrent HTTP lifetimes alone are insufficient."""
+    long_id = None
+    for sample in samples:
+        if sample["at"] >= active_response["ended"]:
+            continue
+        active = any(
+            row["id"] == active_id and row["phase"] == "decode"
+            for row in sample["requests"]
+        )
+        if not active:
+            continue
+        peers = [
+            row
+            for row in sample["requests"]
+            if row["id"] != active_id
+            and row["prompt_tokens"] == context
+            and row["max_new_tokens"] == 32
+        ]
+        if sample["before_short"]:
+            if peers:
+                long_id = peers[0]["id"]
+            # No other request can have added prefill rows in this interval.
+            if sample["prefill_rows"] > initial_rows:
+                return "long-prefill"
+        for row in peers:
+            if (context != 512 or row["id"] == long_id) and row[
+                "prompt_processed"
+            ] > cached:
+                return "long-prefill"
+        if (
+            cached >= long_response["usage"]["prompt_tokens"]
+            and long_response["ended"] <= sample["at"]
+        ):
+            return "cached-continuation-without-prefill"
+    return None
+
+
+def measure_mixed(server, args, active_prompt, long_prompt, short_prompt, context):
     long_salt = prepare_mixed_cache(server, args, long_prompt)
     before = status(server, args)
     started = time.monotonic()
@@ -352,6 +411,16 @@ def measure_mixed(server, args, active_prompt, long_prompt, short_prompt):
             raise smoke.SmokeFailure(
                 "active stream ended before the contended arrivals"
             )
+        initial = native_sample(server, args, before_short=True)
+        active_rows = [
+            row for row in initial["requests"] if row["max_new_tokens"] == args.tokens
+        ]
+        smoke.require(
+            len(active_rows) == 1 and active_rows[0]["phase"] == "decode",
+            "the initial native request is no longer decoding",
+        )
+        active_id = active_rows[0]["id"]
+        native_samples = []
         time.sleep(args.arrival_delay)
         long = pool.submit(
             streamed,
@@ -363,7 +432,11 @@ def measure_mixed(server, args, active_prompt, long_prompt, short_prompt):
             expect_cached=args.cache_mode != "cold",
         )
         time.sleep(args.arrival_delay)
+        native_samples.append(native_sample(server, args, before_short=True))
         short = pool.submit(streamed, server, args, short_prompt, 32)
+        while not active.done():
+            native_samples.append(native_sample(server, args))
+            time.sleep(args.status_interval)
         responses = [
             future.result(timeout=args.request_timeout)
             for future in (active, long, short)
@@ -379,6 +452,21 @@ def measure_mixed(server, args, active_prompt, long_prompt, short_prompt):
         "mixed requests left resources active",
     )
     active, long, short = responses
+    cached = long["usage"].get("prompt_tokens_details", {}).get("cached_tokens", 0)
+    overlap = native_overlap(
+        native_samples,
+        active_id,
+        context,
+        cached,
+        long,
+        active,
+        initial["prefill_rows"],
+    )
+    smoke.require(
+        overlap is not None,
+        "requests overlapped but native long prefill/continuation did not overlap decoding; "
+        "inspect memory/admission limits or use --residency sequential",
+    )
     gaps = [
         (right - left) * 1000
         for left, right in zip(active["chunks"], active["chunks"][1:])
@@ -391,6 +479,12 @@ def measure_mixed(server, args, active_prompt, long_prompt, short_prompt):
     return {
         "seconds_per_token": elapsed / total,
         "wall_seconds": elapsed,
+        "native_overlap": overlap,
+        "native_samples": native_samples,
+        "decode_batches_by_width": {
+            key: value - before["scheduler"]["decode_batches_by_width"][key]
+            for key, value in after["scheduler"]["decode_batches_by_width"].items()
+        },
         "short_ttft_ms": short["ttft_ms"],
         "long_ttft_ms": long["ttft_ms"],
         "active_gap_p95_ms": percentile(gaps, 0.95),
@@ -415,6 +509,11 @@ def parse_args():
     parser.add_argument("--workloads", default="code,math,prose")
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument("--warmup-context", type=int, default=0)
+    parser.add_argument("--warmup-rounds", type=int, default=2)
+    parser.add_argument(
+        "--residency", choices=("paired", "sequential"), default="paired"
+    )
+    parser.add_argument("--status-interval", type=float, default=0.1)
     parser.add_argument("--warmup-tokens", type=int, default=128)
     parser.add_argument("--warmup-seconds", type=float, default=0)
     parser.add_argument("--tokens", type=int, default=512)
@@ -464,6 +563,16 @@ def parse_args():
         parser.error("invalid warmup duration/context/output budget")
     if args.scenario != "mixed" and args.cache_mode != "cold":
         parser.error("cached and prefix-resume modes require --scenario mixed")
+    if (
+        args.warmup_rounds < 1
+        or not math.isfinite(args.status_interval)
+        or args.status_interval <= 0
+    ):
+        parser.error("need positive warmup rounds and status interval")
+    if args.residency == "sequential" and args.warmup_seconds:
+        parser.error(
+            "sequential residency uses fixed --warmup-rounds with --warmup-seconds 0"
+        )
     args.environments = []
     for values in (args.baseline_env, args.candidate_env):
         env = {
@@ -480,6 +589,103 @@ def parse_args():
     return args
 
 
+def case_specs(args, tokenizer):
+    for context in args.contexts:
+        for workload in args.workloads:
+            for sample in range(args.samples):
+                yield {
+                    "context": context,
+                    "workload": workload,
+                    "sample": sample,
+                    "prompts": [
+                        prepared_prompt(
+                            tokenizer,
+                            WORKLOADS[workload],
+                            context,
+                            [workload, sample, lane],
+                        )
+                        for lane in range(args.batch)
+                    ],
+                    "rounds": [],
+                }
+
+
+def measure_case(server, args, tokenizer, case):
+    if args.scenario != "mixed":
+        return measure(server, args, case["prompts"], case["context"])
+    active_prompt = prepared_prompt(
+        tokenizer, WORKLOADS["code"], 2048, ["active", case["sample"]]
+    )
+    short_prompt = prepared_prompt(
+        tokenizer, WORKLOADS["prose"], 512, ["short", case["sample"]]
+    )
+    return measure_mixed(
+        server, args, active_prompt, case["prompts"][0], short_prompt, case["context"]
+    )
+
+
+def run_sequential(args, tokenizer, report, binaries):
+    """Ordinary ABBA rounds with one owned resident server at a time."""
+    report["method"] = (
+        "one resident server at a time; full workload rounds in ABBA order; cold salts"
+    )
+    report["cases"] = list(case_specs(args, tokenizer))
+    report["server_runs"] = []
+    report["final_status"] = []
+    if args.probes:
+        report["probes"] = []
+    path = args.output / "report.json"
+    try:
+        for arm, index in enumerate((0, 1, 1, 0), 1):
+            settings = argparse.Namespace(**{**vars(args), "binary": binaries[index]})
+            env = dict(args.environments[index])
+            if args.trace:
+                env["SPLASH_SERVING_TRACE"] = str(
+                    (args.output / f"round-{arm}-trace.json").resolve()
+                )
+            record = {"arm": arm, "server": index}
+            report["server_runs"].append(record)
+            with contextlib.ExitStack() as cleanup:
+                with child_environment(env):
+                    server = smoke.RealServer(settings)
+                cleanup.callback(server.close)
+                try:
+                    print(
+                        f"Starting round {arm} ({'baseline' if index == 0 else 'candidate'})",
+                        flush=True,
+                    )
+                    record["initial_status"] = server.wait_ready(args.startup_timeout)
+                    report["initial_status"].append(record["initial_status"])
+                    record["warmup"] = warm_servers([server], args, tokenizer)
+                    for case in report["cases"]:
+                        row = measure_case(server, args, tokenizer, case)
+                        row.update(arm=arm, server=index)
+                        case["rounds"].append(row)
+                        if len(case["rounds"]) == 4:
+                            case["comparison"] = summarize(case["rounds"])
+                            print(
+                                f"{case['workload']} c{case['context']} B{args.batch} sample{case['sample']}: "
+                                f"{abba.describe(case['comparison'])}",
+                                flush=True,
+                            )
+                        path.write_text(json.dumps(report, indent=2) + "\n")
+                    if args.probes:
+                        report["probes"].append(fallback_probes(server, args))
+                    record["final_status"] = status(server, args)
+                    report["final_status"].append(record["final_status"])
+                finally:
+                    server.stop()
+                    server.log.seek(0)
+                    (args.output / f"round-{arm}.log").write_text(server.log.read())
+        report["final_environment"] = environment()
+        report["complete"] = True
+    except BaseException as error:
+        report["error"] = str(error)
+        raise
+    finally:
+        path.write_text(json.dumps(report, indent=2) + "\n")
+
+
 def main():
     args = parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
@@ -493,6 +699,7 @@ def main():
     report = {
         "method": "two resident servers, serial cold requests with unique cache salts, paired ABBA",
         "scenario": args.scenario,
+        "residency": args.residency,
         "tool_sha256": fingerprint(Path(__file__)),
         "primary_metric": "native decode cycle seconds/token"
         if args.scenario == "decode"
@@ -515,6 +722,8 @@ def main():
             "batch": args.batch,
             "samples": args.samples,
             "cache_mode": args.cache_mode,
+            "warmup_rounds": args.warmup_rounds,
+            "status_interval_seconds": args.status_interval,
             "warmup_context": args.warmup_context,
             "warmup_tokens": args.warmup_tokens,
             "warmup_seconds_per_arm": args.warmup_seconds,
@@ -528,6 +737,9 @@ def main():
         "cases": [],
         "complete": False,
     }
+    if args.residency == "sequential":
+        run_sequential(args, tokenizer, report, binaries)
+        return
     servers = []
     cleanup = contextlib.ExitStack()
     try:
@@ -579,6 +791,7 @@ def main():
                                 active_prompt,
                                 prompts[0],
                                 short_prompt,
+                                context,
                             )
                         else:
                             row = measure(servers[server_index], args, prompts, context)
