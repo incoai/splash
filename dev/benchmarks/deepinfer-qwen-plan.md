@@ -16,7 +16,7 @@ decisions for the conditional optimizations.
 
 | Step | Current status | Remaining gate |
 | --- | --- | --- |
-| 1. Runtime measurement | Native profiling complete; serving instrumentation and paired HTTP measurement in progress | Full engine/mask/ANE timeline and repeatable workload results |
+| 1. Runtime measurement | Native profiling complete; serving trace/HTTP tools in #509 | Full engine/mask/ANE timeline and repeatable workload results |
 | 2. Greedy MoE prefixes | Implemented and locally tested in #507 | Expanded formats/contexts and repeatable HTTP qualification |
 | 3. Pending-tape GDN pruning | Experiment pending | Recurrence/state correctness and whole-cycle benefit |
 | 4. Cost-aware policy | Fixed sweeps complete; adaptive evaluation pending | Held-out comparison with the best fixed policy; coordinate with #487 |
@@ -24,7 +24,7 @@ decisions for the conditional optimizations.
 | 6. Mixed prefill/decode | Measurement and estimator experiment pending | Contended latency/throughput and fairness checks |
 
 Only this M5 Pro is available for local runs. Other GPU families will receive
-a repeatable maintainer-run package; those tests remain unexecuted until their
+[a repeatable maintainer-run package](qwen-maintainer-runs.md); those tests remain unexecuted until their
 results exist. Completing the local experiments does not qualify a shared
 default or establish missing hardware coverage.
 

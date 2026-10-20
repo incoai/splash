@@ -1,0 +1,53 @@
+diff --git a/runtime/model/Runtime.cpp b/runtime/model/Runtime.cpp
+index 6cdd6a1b..3218d1ce 100644
+--- a/runtime/model/Runtime.cpp
++++ b/runtime/model/Runtime.cpp
+@@ -419,6 +419,8 @@ struct Runtime::Impl {
+   // (verifyEveryRow).
+   VerifyBudget verifyBudget;
+   bool everyVerifyRow = false;
++  // Qualification-only control, carried in the published benchmark patch.
++  uint32_t benchmarkFixedRows = 0;
+   ops::AneFfn *aneFfn;
+   // The readers of spilled K/V, when the target's K/V spills.
+   KvBlockCache *blockCache;
+@@ -444,6 +446,13 @@ struct Runtime::Impl {
+                         value.model.target)),
+         draftModel(value.model.draft, value.backend, operators),
+         aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream) {
++    if (const char *value = std::getenv("SPLASH_BENCH_FIXED_VERIFY_ROWS")) {
++      char *end = nullptr;
++      const unsigned long count = std::strtoul(value, &end, 10);
++      if (end == value || *end || count < 1 || count > kDecodeRows)
++        throw std::invalid_argument("SPLASH_BENCH_FIXED_VERIFY_ROWS must be 1 through 8");
++      benchmarkFixedRows = static_cast<uint32_t>(count);
++    }
+     if (states.layout() != model.stateLayout(states.layout().target.format) ||
+         kvPages.layout() != model.targetKvLayout(kvPages.layout().format) || !blockCache != !historyStream) {
+       throw std::invalid_argument(
+@@ -1887,6 +1896,16 @@ struct Runtime::Impl {
+       throw std::invalid_argument("invalid draft decode batch");
+     }
+     const uint32_t lanes = static_cast<uint32_t>(entries.size());
++    std::array<uint32_t, kLaneCount> fixedMaximum{};
++    const bool fixed = benchmarkFixedRows && budgetsVerifyRows(geometry) && !constrained &&
++        std::all_of(entries.begin(), entries.end(), [](const Request *entry) {
++          return entry->sampling.temperature <= 0.0F;
++        });
++    if (fixed) {
++      for (uint32_t lane = 0; lane < lanes; ++lane)
++        fixedMaximum[lane] = std::min(maximumRows[lane], benchmarkFixedRows);
++      maximumRows = std::span(fixedMaximum).first(lanes);
++    }
+     // The draft shares the target's vocabulary head and its storage rows.
+     const uint32_t storage = targetModel->decodeStorageLanes(lanes);
+     auto d = [&](DecodeTensor tensor) {
+@@ -1940,7 +1959,7 @@ struct Runtime::Impl {
+          d(DecodeTensor::ProposalProbs), d(DecodeTensor::VerifyConfidence)},
+         std::span(anchors).first(lanes), std::span(policies).first(lanes));
+     ops::VerifyRowsModel verify;
+-    if (budgetsVerifyRows(geometry) && !everyVerifyRow && !verifyBudget.explores(lanes, constrained)) {
++    if (budgetsVerifyRows(geometry) && !everyVerifyRow && !fixed && !verifyBudget.explores(lanes, constrained)) {
+       const VerifyBudget::Acceptance &acceptance = verifyBudget.acceptance();
+       verify = {acceptance.slope, acceptance.intercepts, verifyBudget.costs(lanes, constrained), false};
+     }
