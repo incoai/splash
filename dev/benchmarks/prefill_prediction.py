@@ -1,8 +1,8 @@
 """Compare prefill timing predictions using only earlier trace observations.
 
 This is an offline estimator experiment, not a latency or scheduling result.
-Current traces retain exact history for B1; ragged widths are excluded until
-per-lane geometry is present rather than fitting them to the leading lane.
+Ragged batches require exact per-lane geometry and use row-weighted history.
+Execution paths and batch widths have separate bounded sample histories.
 """
 
 from __future__ import annotations
@@ -16,10 +16,10 @@ from pathlib import Path
 from dev.benchmarks import trace_report
 
 
-def bucket(rows, history, ane=False):
+def bucket(rows, history):
     row_bucket = sum(rows > boundary for boundary in (128, 512))
     history_bucket = sum(history > boundary for boundary in (1023, 4095, 16383))
-    return row_bucket, history_bucket, ane
+    return row_bucket, history_bucket
 
 
 def evaluate(observations, minimum_samples=3, seed=None):
@@ -42,13 +42,33 @@ def evaluate(observations, minimum_samples=3, seed=None):
         if row["rows"] < 64:
             excluded["small"] += 1
             continue
-        if row["width"] != 1:
+        rows, history, actual = row["rows"], row["maximum_history"], row["wall_ms"]
+        width = row["width"]
+        if not 1 <= width <= 4:
+            raise ValueError("invalid prefill width")
+        lanes = row.get("lanes", [])
+        if lanes:
+            if (
+                len(lanes) != width
+                or {lane["lane"] for lane in lanes} != set(range(width))
+                or sum(lane["rows"] for lane in lanes) != rows
+                or any(lane["rows"] <= 0 or lane["history"] < 0 for lane in lanes)
+            ):
+                raise ValueError("invalid ragged prefill geometry")
+            history = sum(lane["rows"] * lane["history"] for lane in lanes) / rows
+        elif width != 1:
             excluded["ragged"] += 1
             continue
-        rows, history, actual = row["rows"], row["maximum_history"], row["wall_ms"]
-        if history < 0 or rows > 2048 or not math.isfinite(actual) or actual <= 0:
+        if (
+            not math.isfinite(history)
+            or history < 0
+            or rows > 2048
+            or not math.isfinite(actual)
+            or actual <= 0
+        ):
             raise ValueError("invalid prefill observation")
-        key = bucket(rows, history, row.get("predicted_ane", False))
+        path = row.get("predicted_ane")
+        key = (*bucket(rows, history), width, path)
         count, cost = buckets.get(key, (0, 0.0))
         if global_cost is not None:
             local = cost if count >= minimum_samples else global_cost
@@ -56,10 +76,13 @@ def evaluate(observations, minimum_samples=3, seed=None):
                 {
                     "rows": rows,
                     "history": history,
+                    "width": width,
+                    "predicted_ane": path,
                     "actual_ms": actual,
                     "ema_ms": rows * global_cost,
                     "bucketed_ms": rows * local,
                     "uses_bucket": count >= minimum_samples,
+                    "recorded_prediction_ms": row.get("predicted_wall_ms"),
                 }
             )
         observed = actual / rows
@@ -87,6 +110,8 @@ def evaluate(observations, minimum_samples=3, seed=None):
         "excluded": excluded,
         "minimum_prior_bucket_samples": minimum_samples,
         "note": "A recorded startup seed is used when present; otherwise the first observation seeds both estimators. "
+        "Ragged history is row-weighted across every lane; width and GPU/ANE path have separate cells. "
+        "Missing execution-path metadata is kept separate from known GPU/ANE paths. "
         "Prediction error is not measured latency or throughput benefit.",
     }
 

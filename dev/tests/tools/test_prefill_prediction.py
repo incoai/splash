@@ -63,6 +63,34 @@ class PrefillPredictionTests(unittest.TestCase):
         )
         self.assertTrue(report["predictions"][-1]["uses_bucket"])
 
+    def test_ragged_history_includes_nonleading_lane_and_width_has_own_cell(self):
+        lanes = [
+            {"lane": 0, "rows": 128, "history": 0},
+            {"lane": 1, "rows": 896, "history": 32000},
+        ]
+        rows = [
+            observation(rows=1024, history=32000, wall_ms=800, width=2, lanes=lanes)
+        ] * 4
+        rows += [observation(rows=1024, history=28000, wall_ms=800)]
+        report = evaluate(rows)
+        self.assertTrue(report["predictions"][-2]["uses_bucket"])
+        self.assertEqual(report["predictions"][-2]["history"], 28000)
+        self.assertFalse(report["predictions"][-1]["uses_bucket"])
+        self.assertEqual(report["excluded"]["ragged"], 0)
+        rows[0] = {**rows[0], "lanes": [lanes[0]]}
+        with self.assertRaisesRegex(ValueError, "ragged"):
+            evaluate(rows)
+
+    def test_gpu_and_ane_costs_use_distinct_prior_samples(self):
+        rows = [observation(predicted_ane=True)] * 3
+        rows += [
+            observation(predicted_ane=False, wall_ms=800),
+            observation(predicted_ane=True),
+        ]
+        report = evaluate(rows)
+        self.assertFalse(report["predictions"][-2]["uses_bucket"])
+        self.assertTrue(report["predictions"][-1]["uses_bucket"])
+
 
 if __name__ == "__main__":
     unittest.main()
