@@ -40,20 +40,28 @@ BUILD := build
 TARGET := $(BUILD)/splash
 METAL_BUILD := $(BUILD)/metal
 # Production kernels are grouped by execution phase under
-# runtime/metal/kernels/{prefill,decode,shared}; every .metal file there is
-# compiled into the metallib. Templates both phases instantiate live in
-# kernels/common/, the host/shader contract in runtime/metal/abi/;
-# kernels/host_step.metal builds into a library of its own (HOST_STEP_LIB).
+# runtime/metal/kernels/{prefill,decode,shared}, and the video engine's
+# (runtime/video) under kernels/video, by model part; every .metal file there
+# is compiled into the metallib. Templates both phases instantiate live in
+# kernels/common/ (kernels/video/common/), the host/shader contract in
+# runtime/metal/abi/ (abi/video/); kernels/host_step.metal builds into a
+# library of its own (HOST_STEP_LIB).
 PRODUCTION_KERNEL_SOURCES := $(sort $(wildcard \
 	runtime/metal/kernels/prefill/*.metal \
 	runtime/metal/kernels/decode/*.metal \
-	runtime/metal/kernels/shared/*.metal))
+	runtime/metal/kernels/shared/*.metal \
+	runtime/metal/kernels/video/*.metal \
+	runtime/metal/kernels/video/*/*.metal))
 PRODUCTION_KERNEL_NAMES := \
 	$(patsubst runtime/metal/kernels/%.metal,%,$(PRODUCTION_KERNEL_SOURCES))
 PRODUCTION_AIRS := $(addprefix $(METAL_BUILD)/, \
 	$(addsuffix .air,$(PRODUCTION_KERNEL_NAMES)))
 KERNEL_HEADERS := $(sort $(wildcard runtime/metal/abi/*.h \
-	runtime/metal/kernels/common/*.h))
+	runtime/metal/kernels/common/*.h runtime/metal/abi/video/*.h \
+	runtime/metal/kernels/video/common/*.h runtime/video/*.h))
+# The video engine's request preparation reproduces MLX's arithmetic bit for
+# bit, and compiles as MLX's metallib does, without fast math.
+VIDEO_PREP_AIRS := $(filter $(METAL_BUILD)/video/prep/%,$(PRODUCTION_AIRS))
 # macOS 26.4 is the tested floor: the engine refuses older systems at
 # startup, and every binary and metallib records it. The MPP kernels need
 # macOS 26.2 or newer, and MPP chooses its code path by this target.
@@ -64,6 +72,13 @@ PROD_METALFLAGS := -std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime \
 ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
 ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
+# The video engine's host arithmetic (the Euler update, the latents' scaling)
+# compiles op by op, as numpy computes it, so that its latents and frames
+# stay byte-identical to its references; its mp4 writer uses AVFoundation.
+VIDEO_CXXFLAGS := $(ENGINE_CXXFLAGS) -ffp-contract=off
+VIDEO_OBJCXXFLAGS := $(VIDEO_CXXFLAGS) -fobjc-arc
+VIDEO_LINKFLAGS := -framework AVFoundation -framework CoreMedia \
+	-framework CoreVideo
 LIB := $(BUILD)/splash.metallib
 # The spin of awake host steps reaches a memory scope through Metal's internals
 # (#pragma METAL internals), which a later Metal compiler may refuse. It builds
@@ -190,6 +205,11 @@ $(METAL_BUILD)/%.air: runtime/metal/kernels/%.metal $(KERNEL_HEADERS) \
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -c $< -o $@
 
+$(VIDEO_PREP_AIRS): $(METAL_BUILD)/%.air: runtime/metal/kernels/%.metal \
+		$(KERNEL_HEADERS) | $(METAL_BUILD)
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) -fno-fast-math -c $< -o $@
+
 $(LIB): $(PRODUCTION_AIRS)
 	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
 
@@ -212,6 +232,7 @@ CONFIG_DIGEST := $(shell printf '%s\0' $(BUILD_RULES_DIGEST) \
 	$(call shell-quote,$(CXX)) $(call shell-quote,$(ENGINE_CXXFLAGS)) \
 	$(call shell-quote,$(ENGINE_OBJCXXFLAGS)) $(call shell-quote,$(ENGINE_DEPFLAGS)) \
 	$(call shell-quote,$(ENGINE_LINKFLAGS)) $(call shell-quote,$(AR)) \
+	$(call shell-quote,$(VIDEO_OBJCXXFLAGS)) $(call shell-quote,$(VIDEO_LINKFLAGS)) \
 	$(call shell-quote,$(METAL)) $(call shell-quote,$(PROD_METALFLAGS)) \
 	$(call shell-quote,$(METALLIB)) | shasum -a 256 | cut -c1-16)
 RUN_CONFIGURED = $(BUILD_ID_PYTHON) $(BUILD_CONFIG_TOOL) record \
@@ -335,13 +356,23 @@ ENGINE_OBJECTS := \
 	$(patsubst runtime/%.cpp,$(ENGINE_BUILD)/%.o,$(ENGINE_CPP_SOURCES)) \
 	$(patsubst runtime/%.mm,$(ENGINE_BUILD)/%.o,$(ENGINE_MM_SOURCES)) \
 	$(ENGINE_METAL_RUNTIME_OBJECT)
+# The video engine is an archive of its own: its objects share basenames with
+# the engine's (Engine.o, MetalBackend.o), which one archive cannot hold.
+VIDEO_LIBRARY := $(ENGINE_BUILD)/libsplash-video.a
+VIDEO_SOURCES := $(sort $(wildcard runtime/video/*.mm runtime/video/h3/*/*.cpp \
+	runtime/video/h3/*/*.mm))
+VIDEO_CPP_OBJECTS := $(patsubst runtime/%.cpp,$(ENGINE_BUILD)/%.o, \
+	$(filter %.cpp,$(VIDEO_SOURCES)))
+VIDEO_MM_OBJECTS := $(patsubst runtime/%.mm,$(ENGINE_BUILD)/%.o, \
+	$(filter %.mm,$(VIDEO_SOURCES)))
+VIDEO_OBJECTS := $(VIDEO_CPP_OBJECTS) $(VIDEO_MM_OBJECTS)
 PRODUCTION_CONFIG_TARGETS := $(ENGINE_OBJECTS) $(ENGINE_MAIN_OBJECT) \
 	$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_INSTRUMENTED_ANE_OBJECT) \
-	$(ENGINE_INSTRUMENTED_RUNTIME_OBJECT) \
+	$(ENGINE_INSTRUMENTED_RUNTIME_OBJECT) $(VIDEO_OBJECTS) $(VIDEO_LIBRARY) \
 	$(ENGINE_LIBRARY) $(PRODUCTION_AIRS) $(LIB) $(HOST_STEP_LIB) $(TARGET)
 ENGINE_DEPFILES := $(ENGINE_OBJECTS:.o=.d) $(ENGINE_MAIN_OBJECT:.o=.d) \
 	$(ENGINE_INSTRUMENTED_METAL_OBJECT:.o=.d) $(ENGINE_INSTRUMENTED_ANE_OBJECT:.o=.d) \
-	$(ENGINE_INSTRUMENTED_RUNTIME_OBJECT:.o=.d)
+	$(ENGINE_INSTRUMENTED_RUNTIME_OBJECT:.o=.d) $(VIDEO_OBJECTS:.o=.d)
 
 -include $(ENGINE_DEPFILES)
 
@@ -365,6 +396,14 @@ $(ENGINE_BUILD)/%.o: runtime/%.cpp
 $(ENGINE_BUILD)/%.o: runtime/%.mm
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_DEPFLAGS) -c $< -o $@
+
+$(VIDEO_CPP_OBJECTS): $(ENGINE_BUILD)/%.o: runtime/%.cpp
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(CXX) $(VIDEO_CXXFLAGS) $(ENGINE_DEPFLAGS) -c $< -o $@
+
+$(VIDEO_MM_OBJECTS): $(ENGINE_BUILD)/%.o: runtime/%.mm
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(CXX) $(VIDEO_OBJCXXFLAGS) $(ENGINE_DEPFLAGS) -c $< -o $@
 
 $(ENGINE_METAL_RUNTIME_OBJECT): runtime/metal/MetalBackend.mm
 	@mkdir -p $(dir $@)
@@ -395,10 +434,15 @@ $(ENGINE_LIBRARY): $(ENGINE_OBJECTS)
 	$(RM) $@
 	$(RUN_CONFIGURED) $(AR) rcs $@ $(BUILD_INPUTS)
 
-$(TARGET): $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) $(LIB) \
+$(VIDEO_LIBRARY): $(VIDEO_OBJECTS)
+	@mkdir -p $(dir $@)
+	$(RM) $@
+	$(RUN_CONFIGURED) $(AR) rcs $@ $(BUILD_INPUTS)
+
+$(TARGET): $(ENGINE_MAIN_OBJECT) $(VIDEO_LIBRARY) $(ENGINE_LIBRARY) $(LIB) \
 		| $(BUILD) $(HOST_STEP_LIB)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) \
-		$(ENGINE_LINKFLAGS) -o $@
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_MAIN_OBJECT) $(VIDEO_LIBRARY) \
+		$(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) $(VIDEO_LINKFLAGS) -o $@
 
 clean:
 	rm -rf $(BUILD)

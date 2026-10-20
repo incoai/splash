@@ -1,0 +1,32 @@
+MiniMax-H3 video engine (h3), vendored
+
+Source: the h3 engine repository, branch main, commit 5b55ab7 (ABI v2:
+h3_prep, h3_denoise, h3_decode, h3_decode_audio, h3_preview, h3_write_mp4).
+A plain copy without its history, by dev/tools/vendor_video.sh:
+
+  h3 runtime/{engine,media,model,ops}/   -> runtime/video/h3/{engine,media,model,ops}/
+  h3 runtime/metal/MetalBackend.*        -> runtime/video/h3/metal/
+  h3 include/h3/h3.h (C ABI)             -> runtime/video/h3/h3.h
+  h3 runtime/metal/abi/                  -> runtime/metal/abi/video/
+  h3 runtime/metal/kernels/GROUP/        -> runtime/metal/kernels/video/GROUP/
+  h3 tools/convert_*.py, h3/{__init__,common,config,safetensors}.py
+                                         -> install/video/
+
+Include paths are rewritten for these places ("engine/" -> "video/h3/engine/"
+and likewise for media, metal, model and ops; "metal/abi/" ->
+"metal/abi/video/"; "metal/kernels/common/" -> "metal/kernels/video/common/";
+"h3/h3.h" -> "video/h3/h3.h"). Code and kernel arithmetic are otherwise
+unchanged.
+
+Build (Makefile): the kernels compile into splash.metallib as its video
+group with Splash's production Metal flags, the prep kernels also without
+fast math, as h3 builds them, since they reproduce MLX's arithmetic bit for
+bit. The host code compiles with Splash's flags plus -ffp-contract=off, as h3
+builds it, into build/engine/libsplash-video.a; the mp4 writer links
+AVFoundation, CoreMedia and CoreVideo.
+
+Licenses: THIRD_PARTY_NOTICES. No model weights are vendored; the installer
+downloads them under the MiniMax H3 Community License Agreement.
+
+To update: dev/tools/vendor_video.sh H3_CHECKOUT, record its commit here,
+rebuild, and run make test-engine-metal and make test-video-real.

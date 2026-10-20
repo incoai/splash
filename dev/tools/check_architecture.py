@@ -197,6 +197,9 @@ def check() -> list[str]:
     )
     concrete_model_symbols = re.compile(r"\bmodel::(?:Qwen\w*|DFlash\w*|Runtime)\b")
     client_names = re.compile(r"\b(?:Claude Code|OpenCode|Codex|Hermes)\b", re.I)
+    # The vendored video engine (runtime/video/VENDORED) keeps its own clocks,
+    # which time its phases for its statistics alone.
+    vendored_video = "runtime/video/h3/"
 
     for path in production_sources():
         name = relative(path)
@@ -251,7 +254,7 @@ def check() -> list[str]:
             )
         # Every timeout and duration counts time the Mac is awake, as the
         # server's time.monotonic() does.
-        if SLEEP_COUNTING_CLOCK.search(text):
+        if SLEEP_COUNTING_CLOCK.search(text) and not name.startswith(vendored_video):
             errors.append(f"{name}: measures time on a clock that counts sleep")
     return errors
 

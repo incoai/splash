@@ -236,3 +236,90 @@ NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
 LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
 OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+MiniMax H3 (https://huggingface.co/MiniMaxAI/MiniMax-H3)
+
+The video engine (runtime/video, runtime/metal/kernels/video, install/video)
+runs MiniMax H3 and the VDN-H3 weights derived from it. No model weights are
+part of Splash: the installer downloads them after the user acknowledges the
+MiniMax H3 Community License Agreement, Copyright (c) 2026 MiniMax. All Rights
+Reserved. The agreement grants rights only within its Applicable Territory,
+which excludes the European Union, the United Kingdom, the Republic of Korea
+and the United States of America, and incorporates an Acceptable Use Policy;
+it is published with the model at the URL above.
+
+OpenVDN vdn-minimax-h3 (https://huggingface.co/OpenVDN/vdn-minimax-h3)
+
+The video DiT's window-softmax attention and linear branch
+(runtime/metal/kernels/video/dit/window_attention.metal and
+linear_branch.metal, runtime/video/h3/engine/WindowTable.mm) and its converter
+(install/video/convert_dit.py) implement VDN-H3's hybrid attention from
+OpenVDN's code, licensed under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0). Its NOTICE:
+
+VDN — Video DeltaNet
+Copyright 2026 the VDN authors.
+
+This repository contains the VDN-H3 training and inference code, licensed
+under the Apache License, Version 2.0 (see LICENSE). It does not contain model
+weights.
+
+FastVideo (https://github.com/hao-ai-lab/FastVideo)
+
+The TAEH3 preview decoder (runtime/metal/kernels/video/preview,
+runtime/video/h3/ops/PreviewDecoder.mm, install/video/convert_preview.py)
+follows FastVideo's TAEH3 port (fastvideo/mlx_runtime/minimax_h3_taeh3.py).
+Licensed under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0).
+
+minimax-h3-mlx (https://github.com/PipeNetwork/minimax-h3-mlx)
+
+The video VAE tile plan (runtime/video/h3/model/Geometry.cpp), the rotary tables
+of install/video/convert_vae.py, the request preparation
+(runtime/video/h3/model/Prep.mm) and the audio VAE decoder
+(runtime/video/h3/ops/AudioDecoder.mm, install/video/convert_audio.py) follow
+this MLX port of MiniMax H3, which the VAE converter also imports. Licensed
+under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0).
+
+BigVGAN (https://github.com/NVIDIA/BigVGAN)
+
+MiniMax H3's audio VAE decoder is a BigVGAN generator; its kernels
+(runtime/metal/kernels/video/audio) implement BigVGAN's anti-aliased
+SnakeBeta activations and Kaiser-windowed sinc resampling. MIT License,
+Copyright (c) 2024 NVIDIA CORPORATION, under the permission notice below.
+
+MLX (https://github.com/ml-explore/mlx)
+
+The video request preparation (runtime/metal/kernels/video/prep,
+runtime/video/h3/ops/PrepOps.mm, runtime/video/h3/model/Prep.mm) reproduces the
+arithmetic of MLX 0.32.1's primitives, so that the prepared inputs equal
+MLX's bit for bit: its GEMM and attention fragment orders, its GEMV, RMS norm
+and sigmoid, and the threefry2x32 keys and erfinv polynomial of its
+random.normal. No MLX code is linked or loaded.
+
+TAEH3 / taehv (https://github.com/madebyollin/taehv)
+
+The preview decoder runs the TAEH3 tiny decoder, whose weights the installer
+downloads and install/video/convert_preview.py converts.
+
+MLX: Copyright © 2023 Apple Inc. taehv: Copyright (c) 2025 Ollin Boer Bohan.
+Both, and BigVGAN above, under the MIT License:
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
