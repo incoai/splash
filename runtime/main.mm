@@ -209,6 +209,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.maximumImagePatches = arguments.maxImagePatches;
   config.resources.idleReleaseSeconds = arguments.idleReleaseSeconds;
   config.resources.aneFfn.enabled = arguments.neuralEngine;
+  config.resources.moeNumerics = arguments.moeNumerics;
   config.resources.relaunchContext = arguments.relaunchContext;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;

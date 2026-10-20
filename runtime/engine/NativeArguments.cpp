@@ -146,6 +146,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");
       result.neuralEngine = value == "on";
+    } else if (option == "--moe-numerics") {
+      if (value != "invariant" && value != "fast")
+        throw UsageError("--moe-numerics requires invariant or fast");
+      result.moeNumerics = value == "fast" ? ops::MoeNumerics::Fast : ops::MoeNumerics::BatchInvariant;
     } else if (option == "--relaunch-context") {
       relaunchContext = value;
     } else {

@@ -794,6 +794,7 @@ def main_args(**overrides):
             "cache_dir": None,
             "decode_share": None,
             "disable_ane": False,
+            "moe_numerics": "invariant",
             "max_image_pixels": images.MAX_PIXELS,
             "request_timeout": None,
             "queue_size": 1,

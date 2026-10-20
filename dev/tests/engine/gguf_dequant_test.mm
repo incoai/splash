@@ -1,6 +1,8 @@
 // The staged GGUF tile's dequantization (dequant32, kernels/shared/gguf_linear.metal, which the test kernels of
 // gguf_dequant_test.metal expose before the matmul): every weight of every format is the half rounding of its
-// GGML fp32 value, the CPU reference that gguf-reference pins to llama.cpp's golden hashes.
+// GGML fp32 value, the CPU reference that gguf-reference pins to llama.cpp's golden hashes. So too the register
+// form of the MoE Fast tier's GEMV (kernels/common/gguf_live_rows.h), with each grid format's grid in constant
+// memory and in its threadgroup copy.
 #include "GgufFormatReference.hpp"
 #include "TestBuffers.hpp"
 #include "metal/CommandGraph.hpp"
@@ -52,13 +54,23 @@ int main(int argc, char **argv) {
         CommandGraph graph;
         graph.add(std::string("gguf_test_dequant_") + fmtName(f), {w0, w1, meta, output}, GgufDecodeParams{K, 1, N, 0, 0},
                   {N * (K / kGroup) / kThreads, 1, 1}, {kThreads, 1, 1});
+        const MetalBuffer registers = sharedBuffer(backend, uint64_t{N} * K * 2);
+        const MetalBuffer tgGrid = sharedBuffer(backend, uint64_t{N} * K * 2);
+        graph.add(std::string("gguf_test_live_rows_") + fmtName(f), {w0, w1, meta, registers, tgGrid},
+                  GgufDecodeParams{K, 1, N, 0, 0}, {N * (K / kGroup) / kThreads, 1, 1}, {kThreads, 1, 1});
         static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
         const auto *got = static_cast<const uint16_t *>(output.contents());
-        size_t differ = 0;
-        for (size_t i = 0; i < values.size(); ++i) differ += got[i] != f2h(values[i]);
+        const auto *reg = static_cast<const uint16_t *>(registers.contents());
+        const auto *tg = static_cast<const uint16_t *>(tgGrid.contents());
+        size_t differ = 0, registerDiffer = 0;
+        for (size_t i = 0; i < values.size(); ++i) {
+          differ += got[i] != f2h(values[i]);
+          registerDiffer += reg[i] != f2h(values[i]) || tg[i] != f2h(values[i]);
+        }
         std::cout << fmtName(f) << ": " << differ << " of " << values.size()
-                  << " weights differ from FP16(GGML fp32 dequantization) " << (differ ? "FAIL" : "ok") << '\n';
-        failures += differ != 0;
+                  << " weights differ from FP16(GGML fp32 dequantization), " << registerDiffer
+                  << " in the register form " << (differ || registerDiffer ? "FAIL" : "ok") << '\n';
+        failures += differ != 0 || registerDiffer != 0;
       }
     } catch (const std::exception &e) {
       std::cerr << "gguf-dequant: FAIL: " << e.what() << '\n';

@@ -65,6 +65,9 @@ OPTIONS = {
         "--state-format", {"fp32": "fp32", "bf16": "bf16"}, ("fp16", "int8")
     ),
     "--disable-ane": ([(["--disable-ane"], True)], []),
+    "--moe-numerics": values(
+        "--moe-numerics", {"invariant": "invariant", "fast": "fast"}, ("exact",)
+    ),
     "--max-memory": values(
         "--max-memory",
         {

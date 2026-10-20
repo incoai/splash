@@ -53,6 +53,9 @@ struct NativeArguments final {
   // Neural Engine when that is faster (splash serve --disable-ane turns it
   // off).
   bool neuralEngine = true;
+  // --moe-numerics invariant|fast: the MoE expert passes' numerics tier
+  // (ops::MoeNumerics; splash serve --moe-numerics).
+  ops::MoeNumerics moeNumerics = ops::MoeNumerics::BatchInvariant;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

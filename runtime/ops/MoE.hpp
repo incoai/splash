@@ -178,6 +178,16 @@ enum class MoeGgufTile : uint8_t { Staged, Register };
 
 enum class MoePhase : uint8_t { Prefill, Decode };
 
+// The numerics of the expert passes. BatchInvariant: a row's result depends
+// on its own routes alone, whatever rows it runs with (gguf-moe checks it at
+// one to four lanes and in every prefill chunk). Fast, an engine's opt-in
+// (splash serve --moe-numerics fast): a one-lane decode step's in-place
+// tiles of few live rows run the register GEMV on those rows instead of the
+// 8-row matmul (MoePlan::smallTilesInPlace), so a row's result also depends
+// on how many of the step's rows share its expert; deterministic for a step's
+// routes and inside the same fp64 bound. Other plans run as BatchInvariant.
+enum class MoeNumerics : uint8_t { BatchInvariant, Fast };
+
 // The device's policy for a MoE plan, which the execution plans derive.
 struct MoeConfig final {
   // M8 for decode plans; a prefill plan takes moeGgufPrefillTile's.
@@ -187,6 +197,8 @@ struct MoeConfig final {
   // The tile of the F32 router; the execution plans derive it from the
   // device and the plan's rows (Linear::ggufFloatTile).
   FloatTile ggufRouterTile = FloatTile::Simdgroup;
+  // The engine's numerics tier (ExecutionPlans).
+  MoeNumerics numerics = MoeNumerics::BatchInvariant;
   bool operator==(const MoeConfig &) const = default;
 };
 
@@ -213,6 +225,16 @@ public:
     return config_.expertTile == MoeExpertTile::M8 && rows_ == tileRows() &&
            config_.ggufTile == MoeGgufTile::Staged;
   }
+  [[nodiscard]] MoePhase phase() const noexcept { return phase_; }
+  // Whether the expert passes run the Fast tier's kernels: a one-lane decode
+  // step in place (rowsInPlace) with MoeNumerics::Fast. The grouping counts
+  // and lists each routed tile's live rows (MoeGroupParams::in_place 2), and
+  // a routed tile of at most moe_fast_gemv_rows live rows for its pass's
+  // format runs the register GEMV on them; the others, and every tile of a
+  // prefill chunk or a wider step, run as BatchInvariant.
+  [[nodiscard]] bool smallTilesInPlace() const noexcept {
+    return config_.numerics == MoeNumerics::Fast && phase_ == MoePhase::Decode && rowsInPlace();
+  }
 
 private:
   friend struct MoE;
@@ -221,6 +243,7 @@ private:
   MoeShape shape_;
   uint32_t rows_;
   MoeConfig config_;
+  MoePhase phase_;
   uint32_t maximumTiles_;
   MoeWorkspace workspace_;
 };

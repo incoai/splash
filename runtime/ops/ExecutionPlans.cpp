@@ -23,8 +23,8 @@ void include(Workspace &bound, const Workspace &required,
 
 } // namespace
 
-ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
-    : linear_(device), family_(gpuFamilyClass(device.appleGpuFamily)) {}
+ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, MoeNumerics moeNumerics)
+    : linear_(device), family_(gpuFamilyClass(device.appleGpuFamily)), moeNumerics_(moeNumerics) {}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t rows, uint32_t queryHeads, kv::Layout layout) const {
@@ -42,9 +42,11 @@ DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
   return DraftAttention::plan(shape, lanes);
 }
 
-// The expert tiles and their rows, and the router's tile.
+// The expert tiles and their rows, the router's tile and the numerics tier,
+// which a plan applies where it takes it (MoePlan::smallTilesInPlace).
 MoeConfig ExecutionPlans::moeConfig(MoeShape shape, uint32_t rows, MoePhase phase) const {
   MoeConfig config;
+  config.numerics = moeNumerics_;
   config.ggufTile = moeGgufTile(family_, shape);
   config.expertTile =
       phase == MoePhase::Prefill ? moeGgufPrefillTile(shape, rows, config.ggufTile) : MoeExpertTile::M8;
