@@ -88,6 +88,28 @@ Vision and the tokenizer come from the target model's source.
 [Model loading and compatibility](DEVELOPMENT.md#upstream-model-loading) ·
 [Supported formats](DEVELOPMENT.md#gguf-targets)
 
+## Video
+
+`splash serve --model MiniMaxAI/MiniMax-H3` serves MiniMax-H3, text to video
+with audio (1344×768, 24 fps, 3, 10 or 15 s), through OpenAI's video API, as
+an instance of its own: run a language model beside it on another `--port`.
+It needs an M5 with 48 GB. The first start quotes the MiniMax H3 Community
+License Agreement, which limits use to its Applicable Territory, asks you to
+acknowledge it, then downloads and converts the model once (about 100 GB).
+
+```bash
+curl http://127.0.0.1:8000/v1/videos -H 'Content-Type: application/json' \
+  -d '{"prompt": "A golden retriever runs along a beach at sunset.", "seconds": "3"}'
+curl http://127.0.0.1:8000/v1/videos/VIDEO_ID/content -o clip.mp4
+```
+
+| Turbo clip, M5 Pro 48 GB | Wall | Denoising | Video VAE | Engine peak |
+| --- | ---: | ---: | ---: | ---: |
+| 3 s | 5.8 min | 313 s | 27 s | 14.4 GB |
+| 15 s | 31.9 min | 1,764 s | 142 s | 18.0 GB |
+
+[Video](DEVELOPMENT.md#video)
+
 ## Settings
 
 Memory and context are sized automatically, up to the model's native context

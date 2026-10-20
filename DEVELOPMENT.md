@@ -1,9 +1,9 @@
 # Development
 
 This document runs from using Splash to working on it: running and
-configuring the server, the [API](#api), the [models](#models) it loads, its
-[internals](#internals), then [validation](#validate) and
-[packaging](#package).
+configuring the server, the [API](#api), the [models](#models) it loads, the
+[video model](#video), its [internals](#internals), then
+[validation](#validate) and [packaging](#package).
 
 Building from source needs Apple Silicon with macOS 26.4+, Xcode 26 or newer,
 Python 3.12–3.14, and a Metal 4 compiler with `uint4b_format` tensor support.
@@ -2040,7 +2040,9 @@ model's source options (`--revision`, `--draft-model`, `--language-only`,
 
 - `target`: a GGUF file, any part of a split GGUF naming all its parts,
   which lie beside it; or a directory whose root holds an MLX model or else
-  a single GGUF target, whole or split, beside any projectors named `mmproj`.
+  a single GGUF target, whole or split, beside any projectors named `mmproj`;
+  or a directory of the video model ([Video](#video)), which takes no other
+  argument.
 - `draft`: the directory of a DFlash2 draft ([Drafts](#drafts)). Without
   one, the family's released draft is taken from the Hugging Face cache, at
   the commit a download of its default branch last recorded there, as
@@ -2086,6 +2088,116 @@ byte but for the 27B's GDN decay vectors, each within a float ULP. For an
 installed package it also names the Hub cache folder holding the package's
 files, which nothing reads any more and can be deleted. A package is
 recognized by its `manifest.json`, which names the package format.
+
+## Video
+
+`splash serve --model MiniMaxAI/MiniMax-H3` serves MiniMax-H3, a text to
+video and audio model, as its own instance: its server answers
+[OpenAI's video API](https://platform.openai.com/docs/api-reference/videos)
+and no language model's routes, which answer 404; chat and video together
+are two instances on two ports. The two share the model layer, the
+installer's inspection, publication and assemblies, and the server's HTTP
+handling; the video model has an engine process of its own
+([figure](runtime/video/docs/video-serving.svg)). It runs on an M5 (Apple10 GPU) with
+48 GB.
+
+### Video API
+
+| Route | Answer |
+| --- | --- |
+| `POST /v1/videos` | a queued video object |
+| `GET /v1/videos/{id}` | the video object |
+| `GET /v1/videos/{id}/content` | the mp4; `?variant=preview` the TAEH3 preview once decoded |
+| `GET /v1/videos` | a list (`limit` up to 100, `order`, `after`) |
+| `DELETE /v1/videos/{id}` | forgets the job, cancelling it at its next step |
+
+`POST` takes JSON, or the multipart form OpenAI's SDK sends: `prompt`,
+`model`, `seconds` (`3`, `10` or `15`; 73, 243 or 362 frames at 24 fps) and
+`size` (`1344x768`), and Splash's `variant` (`turbo`, 8 steps, or `default`,
+50), `seed`, `steps` (0 for the variant's), `preview` (false) and `audio`
+(true); `input_reference` is refused. The video object has OpenAI's fields,
+and `phase`, `variant`, `seed`, `preview` (ready) and `phases`, each
+completed phase's seconds and the engine's peak footprint. Errors have the
+OpenAI shape: `video_queue_full` (503) past four queued jobs,
+`video_not_ready` (409) for content not yet decoded, `not_found` and
+`model_not_found` (404). Jobs run one at a time in their order of arrival;
+the mp4s and previews of finished jobs stay in a 4 GB store, the oldest
+evicted first.
+
+### Video installation
+
+The model's assembly is of target format `h3-video` (`install/video.py`).
+Its sources are `MiniMaxAI/MiniMax-H3` (FL2VA's transformer, VAEs and
+tokenizer), `OpenVDN/vdn-minimax-h3` (the VDN-H3 DiT stages),
+`madebyollin/taehv` (TAEH3) and `mlx-community/Qwen3-VL-32B-Instruct-4bit`
+(the text encoder), each at its default branch's commit, as a draft is.
+Before any weight download the installer quotes the MiniMax H3 Community
+License Agreement's territory clauses and asks for its acknowledgement on the
+terminal, or takes `SPLASH_ACCEPT_LICENSE=minimax-h3`; it records it once per
+license text in the models directory's `.licenses.json`. The vendored
+converters then write the engine's images, about 100 GB, once into
+`.converted/<key>` of the models directory; the video VAE's needs MLX in
+Splash's environment and `H3_MLX_PORT` naming a checkout of
+[minimax-h3-mlx](https://github.com/PipeNetwork/minimax-h3-mlx). The
+assembly links the images, FL2VA's transformer shards (whose adaLN bases
+each request reads), the tokenizer, the encoder's checkpoint and the license.
+
+`prepare_local_model` takes a directory of images converted before (as h3
+lays them out: `dit-turbo/`, `dit-default/`, `vae/`, `audio/`, `preview/`
+and `fl2va/`, a link to FL2VA), which prepares without converting, or the
+`MiniMaxAI/MiniMax-H3` repository's layout, converted with the companions
+the Hugging Face cache holds; the encoder comes from the cache too.
+
+### Video engine
+
+The engine process of an h3-video assembly (`runtime/video/VideoRuntime.hpp`)
+speaks the native protocol and announces `FeatureVideo`. A `VideoRequest`
+(the clip's variant, frames, size, steps, seed, outputs and the prompt's
+token ids) runs every phase in this process, one request at a time:
+the text encoder, Qwen3-VL-32B through decoder layer 50, loaded for the
+request (`runtime/video/TextEncoder.hpp`); then, through the vendored h3
+engine's C ABI (`runtime/video/h3`, `runtime/video/VENDORED`), request
+preparation, the DiT streamed from SSD in 8 slots, the TAEH3 preview, the
+video VAE, the audio VAE and the mp4. `VideoProgress` reports each phase's
+start and end and each denoising step, `VideoOutput` delivers the preview
+and then the clip, which ends the request; a `Cancel` stops it at the next
+step or phase. A language model's engine refuses a `VideoRequest`.
+
+On an M5 Pro (48 GB), through `/v1/videos`:
+
+| Turbo clip | Encoder | Prep | Denoising | Preview | Video VAE | Audio | mp4 | Wall | Engine peak |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3 s | 3.0 s | 2.2 s | 313 s | 0.7 s | 27.1 s | 0.1 s | 0.2 s | 347 s | 14.4 GB |
+| 15 s | 2.4 s | 2.3 s | 1,764 s | 2.4 s | 141.5 s | 0.4 s | 0.9 s | 1,914 s | 18.0 GB |
+
+The engine's peak is in the encoder, whose 14 GB of weights load for the
+request, for 3 s, and in the DiT for 15 s. On the golden prompt the encoder's
+hidden states are 0.44% relative RMS from MLX's; the clip diverges from the
+golden one along the denoising (latents 27% relative RMS, frames 22.9 dB
+PSNR), as any change of its conditioning does, while the golden hidden states
+reproduce the golden clip byte for byte.
+
+### Video tests
+
+`make test-engine-metal` runs the encoder's attention kernels against a CPU
+reference and one DiT block on synthetic weights against h3's references.
+With the weights, `VIDEO_REFERENCES` naming h3's reference directory, and
+`VIDEO_ROOT` a prepared model (by default `splash serve`'s) or
+`VIDEO_CONVERTED` a directory of converted images, which the tests prepare
+first:
+
+```sh
+make test-video-real VIDEO_REFERENCES=... VIDEO_CONVERTED=...
+make test-video-http-real VIDEO_REFERENCES=... VIDEO_CONVERTED=... VIDEO_SECONDS=15
+```
+
+`test-video-real` drives the engine with the golden prompt's saved hidden
+states (the engine's `--hidden-states`) and requires the 3 s golden clip's
+latents and frames (`--keep`) byte-identical, then cancels a clip.
+`test-video-http-real` does the same through `/v1/videos`, deletes a running
+job, then runs the clip of the server's tokenizer and the engine's encoder
+and reports its distance from the golden clip, and with `VIDEO_SECONDS=15` a
+15 s clip; the reports go to `build/release/video-*.json`.
 
 ## Internals
 
@@ -3305,6 +3417,11 @@ counters include:
   past what the cache changed.
 
 ### Native protocol
+
+A video model's engine takes `VideoRequest` and `Cancel` frames and answers
+with `VideoProgress`, `VideoOutput` and `Error` events ([Video
+engine](#video-engine)); its Ready sets `FeatureVideo` in the features byte,
+beside `FeatureVision`.
 
 The engine receives `ignore_eos` as bit 0 of the request frame's flags word and
 `return_progress` as bit 1; the word rejects undefined bits.
