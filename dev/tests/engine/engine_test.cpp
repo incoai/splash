@@ -190,6 +190,7 @@ void testTraceCannotChangeExecution() {
     guardReleases(storage, engine);
     auto input = request(1, std::vector<uint32_t>(193, 7));
     input.maxNewTokens = 4;
+    engine.observePrefill(2048, 256.0);
     engine.submit(input);
     runUntilIdle(engine);
     require(events.completedCount == 1 && events.failedCount == 0,
@@ -200,7 +201,7 @@ void testTraceCannotChangeExecution() {
   TraceBuffer trace(1024);
   require(run(&trace) == baseline, "tracing changed generated tokens");
   const auto events = trace.snapshot();
-  for (const char *name : {"scheduler.plan", "engine.prepare", "runtime.prefill_submit",
+  for (const char *name : {"prefill.seed", "prefill.lane", "scheduler.plan", "engine.prepare", "runtime.prefill_submit",
                            "engine.apply", "runtime.decode_submit"})
     require(std::any_of(events.begin(), events.end(), [&](const auto &event) {
               return std::string_view(event.name) == name;
@@ -1826,9 +1827,15 @@ void testRefusedKvPastABoundaryEndsTheCommandThere() {
               events.failedCount == 0,
           "refused KV past a boundary made the lane wait, yield or fail");
   std::vector<uint32_t> measuredRows;
-  for (const auto &event : trace.snapshot())
+  std::vector<std::pair<uint32_t, uint64_t>> laneGeometry;
+  for (const auto &event : trace.snapshot()) {
     if (std::string_view(event.name) == "batch.observation" && (event.flags & 1))
       measuredRows.push_back(event.rows);
+    if (std::string_view(event.name) == "prefill.lane")
+      laneGeometry.emplace_back(event.rows, event.context);
+  }
+  require(laneGeometry == std::vector<std::pair<uint32_t, uint64_t>>{{128, 0}, {1, 128}},
+          "trace lost actual per-lane rows/history after a resource cut");
   require(measuredRows == std::vector<uint32_t>{128, 1},
           "trace recorded planned rows instead of the cut command's actual rows");
 }

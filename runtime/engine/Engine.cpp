@@ -328,8 +328,16 @@ bool Engine::tick(double now) {
         for (const BatchItem &item : plan->items)
           rows += plan->kind == WorkKind::Prefill ? item.tokenCount
                                                  : model::ExecutionLimits::targetVerifyRows;
-        for (const ModelBatchItem &item : items)
+        for (uint32_t lane = 0; lane < items.size(); ++lane) {
+          const ModelBatchItem &item = items[lane];
           context = std::max(context, item.logicalPosition);
+          if (plan->kind == WorkKind::Prefill) {
+            const double instant = traceSeconds();
+            config_.trace->record({"prefill.lane", 1, instant, instant, traceId,
+                                   plan->width(), plan->items[lane].tokenCount,
+                                   item.logicalPosition, lane});
+          }
+        }
       }
       std::unique_ptr<ModelBatchTicket> ticket;
       {

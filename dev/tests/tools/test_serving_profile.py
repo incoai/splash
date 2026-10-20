@@ -62,6 +62,36 @@ class TraceReportTests(unittest.TestCase):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 trace_report.summarize({"traceEvents": [], **values})
 
+    def test_ragged_geometry_and_startup_seed_are_retained(self):
+        report = trace_report.summarize(
+            {
+                "traceEvents": [
+                    event("prefill.seed", 0, 0, rows=2048, value=256),
+                    event("prefill.lane", 1, 0, id=9, flags=1, rows=64, context=8192),
+                    event("prefill.lane", 1, 0, id=9, flags=0, rows=128, context=32),
+                    event(
+                        "batch.observation",
+                        2,
+                        0,
+                        id=9,
+                        flags=3,
+                        rows=192,
+                        width=2,
+                        context=8192,
+                        value=50,
+                    ),
+                ]
+            }
+        )
+        self.assertEqual(report["prefill_seeds"], [{"rows": 2048, "wall_ms": 256}])
+        self.assertEqual(
+            report["prefill_observations"][0]["lanes"],
+            [
+                {"lane": 0, "rows": 128, "history": 32},
+                {"lane": 1, "rows": 64, "history": 8192},
+            ],
+        )
+
     def test_prefill_observations_keep_the_representative_flag(self):
         report = trace_report.summarize(
             {

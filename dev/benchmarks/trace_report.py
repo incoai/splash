@@ -44,6 +44,8 @@ def summarize(document):
     commands = []
     observations = []
     counters = {}
+    prefill_lanes = collections.defaultdict(list)
+    seeds = []
     confidence = []
     active = []
     for event in document["traceEvents"]:
@@ -64,6 +66,18 @@ def summarize(document):
             active.append((event["ts"], event["ts"] + event["dur"]))
         if event["name"] == "metal.command_span":
             commands.append(event)
+        if event["name"] == "prefill.lane":
+            values = event["args"]
+            prefill_lanes[values["id"]].append(
+                {
+                    "lane": values["flags"],
+                    "rows": values["rows"],
+                    "history": values["context"],
+                }
+            )
+        if event["name"] == "prefill.seed":
+            values = event["args"]
+            seeds.append({"rows": values["rows"], "wall_ms": values["value"]})
         if event["name"] == "batch.counters":
             values = event["args"]
             counters[values["id"]] = {
@@ -121,8 +135,17 @@ def summarize(document):
         "gpu_gaps_with_a_request_active": distribution(busy_gaps)
         if busy_gaps
         else None,
+        "prefill_seeds": seeds,
         "prefill_observations": [
-            {**row, **counters.get(row["batch_id"], {})} for row in observations
+            {
+                **row,
+                **counters.get(row["batch_id"], {}),
+                "lanes": sorted(
+                    prefill_lanes.get(row["batch_id"], []),
+                    key=lambda lane: lane["lane"],
+                ),
+            }
+            for row in observations
         ],
         "confidence_observations": confidence,
         "notes": [

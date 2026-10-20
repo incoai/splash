@@ -210,6 +210,11 @@ public:
   void submit(EngineRequest request);
   void observePrefill(uint32_t rows, double wallMilliseconds) {
     scheduler_.observePrefill(rows, wallMilliseconds);
+    if (config_.trace) {
+      const double instant = traceSeconds();
+      config_.trace->record({"prefill.seed", 1, instant, instant, 0, 1,
+                             rows, 0, 0, wallMilliseconds});
+    }
   }
   void cancel(uint64_t requestId);
   void failRequest(uint64_t requestId, LaneOutcome outcome, std::string message);
