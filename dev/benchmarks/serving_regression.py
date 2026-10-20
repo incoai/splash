@@ -15,6 +15,7 @@ import contextlib
 import hashlib
 import http.client
 import json
+import math
 import os
 import subprocess
 import threading
@@ -139,6 +140,23 @@ def status(server, args):
     smoke.require(code == 200, "status request failed")
     smoke.validate_status(result, args.kv_format)
     return result
+
+
+def warm_servers(servers, args, tokenizer):
+    elapsed = [0.0] * len(servers)
+    rounds = 0
+    while rounds < 2 or min(elapsed) < args.warmup_seconds:
+        prompt = WORKLOADS["code"]
+        if args.warmup_context:
+            prompt = prepared_prompt(
+                tokenizer, prompt, args.warmup_context, ["warmup", rounds]
+            )
+        for index, server in enumerate(servers):
+            started = time.monotonic()
+            completion(server, args, prompt, tokens=args.warmup_tokens)
+            elapsed[index] += time.monotonic() - started
+        rounds += 1
+    return {"rounds_per_arm": rounds, "request_wall_seconds_by_arm": elapsed}
 
 
 def measure(server, args, prompts, context):
@@ -367,6 +385,9 @@ def parse_args():
     parser.add_argument("--contexts", default="2048,8192,31744")
     parser.add_argument("--workloads", default="code,math,prose")
     parser.add_argument("--samples", type=int, default=3)
+    parser.add_argument("--warmup-context", type=int, default=0)
+    parser.add_argument("--warmup-tokens", type=int, default=128)
+    parser.add_argument("--warmup-seconds", type=float, default=0)
     parser.add_argument("--tokens", type=int, default=512)
     parser.add_argument("--batch", type=int, default=1, choices=range(1, 5))
     parser.add_argument("--request-timeout", type=float, default=1200)
@@ -401,6 +422,14 @@ def parse_args():
         parser.error(
             "mixed workloads need batch=1, tokens>=128 and a nonnegative arrival delay"
         )
+    if (
+        not math.isfinite(args.warmup_seconds)
+        or args.warmup_seconds < 0
+        or args.warmup_context < 0
+        or args.warmup_tokens < 1
+        or args.warmup_context + args.warmup_tokens > args.max_context
+    ):
+        parser.error("invalid warmup duration/context/output budget")
     args.environments = []
     for values in (args.baseline_env, args.candidate_env):
         env = {
@@ -430,6 +459,7 @@ def main():
     report = {
         "method": "two resident servers, serial cold requests with unique cache salts, paired ABBA",
         "scenario": args.scenario,
+        "tool_sha256": fingerprint(Path(__file__)),
         "primary_metric": "native decode cycle seconds/token"
         if args.scenario == "decode"
         else "total workload wall seconds/output token",
@@ -450,6 +480,9 @@ def main():
             "tokens": args.tokens,
             "batch": args.batch,
             "samples": args.samples,
+            "warmup_context": args.warmup_context,
+            "warmup_tokens": args.warmup_tokens,
+            "warmup_seconds_per_arm": args.warmup_seconds,
             "arrival_delay_seconds": args.arrival_delay,
             "mixed_active_context": 2048,
             "mixed_short_context": 512,
@@ -480,10 +513,9 @@ def main():
             cleanup.callback(server.close)
             report["initial_status"].append(server.wait_ready(args.startup_timeout))
             print(f"Server {index} ready", flush=True)
-        # Alternate warmups too. No other measured request overlaps GPU work.
-        for _ in range(2):
-            for server in servers:
-                completion(server, args, WORKLOADS["code"], tokens=128)
+        # Alternate complete matched warmup rounds; the faster arm never
+        # receives extra requests merely because it reaches the time first.
+        report["warmup"] = warm_servers(servers, args, tokenizer)
         for context in args.contexts:
             for workload in args.workloads:
                 for sample in range(args.samples):

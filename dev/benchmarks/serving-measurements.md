@@ -90,6 +90,16 @@ For final speed comparisons use production binaries **without `--trace`**:
   --output build/paired-serving
 ```
 
+For a sustained warmup, add `--warmup-context 2048 --warmup-tokens 512
+--warmup-seconds 10` (on one command line). Complete matched rounds alternate
+between both servers until each has accumulated at least that much request
+wall time. The faster arm receives the same number of warmup requests.
+Warmups use unique cache salts and remain outside measured metric deltas;
+counts, durations, settings and the harness source hash are recorded. This
+helps investigate startup transients; it does not excuse an inconclusive
+spread or establish the cause of observed noise. The default retains two
+128-token warmups per arm for short functional diagnostics.
+
 The default per-server memory limit is 20 GiB. Set `--max-memory` as appropriate;
 the existing engine admission/reserve rules remain in force. Widths 2–4 use
 `--batch`, preferably with the smaller contexts on this machine. A requested
