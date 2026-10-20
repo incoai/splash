@@ -100,6 +100,14 @@ helps investigate startup transients; it does not excuse an inconclusive
 spread or establish the cause of observed noise. The default retains two
 128-token warmups per arm for short functional diagnostics.
 
+Use `--residency sequential --warmup-seconds 0 --warmup-rounds 4` when two
+resident models cause memory pressure. This starts one server per complete
+ABBA round, runs the same workload sequence and fixed number of warmup
+requests, and closes it before the next arm starts. It trades longer time
+between corresponding cases for natural single-server memory conditions.
+Actual warmup times and per-round statuses are retained. Do not interpret
+paired-resident memory-pressure results as isolated production latency.
+
 The default per-server memory limit is 20 GiB. Set `--max-memory` as appropriate;
 the existing engine admission/reserve rules remain in force. Widths 2–4 use
 `--batch`, preferably with the smaller contexts on this machine. A requested
@@ -117,7 +125,11 @@ Add `--scenario mixed --batch 1 --tokens 512`. Each arm starts an active
 2,048-token streaming request, waits for content, introduces the selected long
 prompt after 50 ms, then a 512-token interactive request after another 50 ms.
 Both arriving peers request 32 output tokens. `--arrival-delay` changes those
-offsets. The harness requires actual stream/prefill overlap.
+offsets. The harness polls native request progress every 100 ms and requires actual
+long-prefill progress while the original native request still decodes. HTTP
+request overlap by itself is insufficient. Fully cached continuations with no
+new prefill are labelled separately. The samples and polling interval are
+retained, and the same control traffic is present in both arms.
 
 `--cache-mode cached` primes the complete long prompt before the measurement.
 `--cache-mode prefix-resume` primes its leading half by character count, then
@@ -154,3 +166,15 @@ not qualify a policy speedup. The mixed smoke ran alongside installation and
 sanitizer activity and is execution validation, not latency evidence. Quiet
 production comparisons, dense-model ANE traces and the expanded model matrix
 are the next qualification runs.
+
+## Overlap guard audit
+
+The first dense ANE diagnostic used two resident servers. Both exercised real
+ANE handoffs, but memory pressure serialized admission: no long prefill command
+was submitted before the original decode request ended. The former client
+lifetime check accepted that case. It is now rejected by native-progress
+checks, with unit coverage for serialized admission and cache-restore-only
+progress. That earlier capture validates handoffs/execution, not contended
+prefill latency. Single-resident runs are required for this dense configuration.
+Per-round memory snapshots now use the actual status schema, and scheduled
+decode-width histograms are retained separately from requested concurrency.

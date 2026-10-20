@@ -170,6 +170,116 @@ class PairedServingTests(unittest.TestCase):
                     self.assertEqual(complete.call_args.kwargs["cache_salt"], salt)
                     self.assertEqual(complete.call_args.kwargs["tokens"], 1)
 
+    def test_native_overlap_rejects_serial_admission_and_cache_restore_only(self):
+        active = {"ended": 10}
+        long = {"ended": 20, "usage": {"prompt_tokens": 8192}}
+        decoder = {
+            "id": 1,
+            "phase": "decode",
+            "max_new_tokens": 512,
+            "prompt_tokens": 2048,
+        }
+        peer = {
+            "id": 2,
+            "phase": "prefill",
+            "max_new_tokens": 32,
+            "prompt_tokens": 8192,
+            "prompt_processed": 0,
+        }
+        sample = {
+            "at": 4,
+            "before_short": False,
+            "prefill_rows": 2048,
+            "requests": [decoder, peer],
+        }
+        self.assertIsNone(
+            serving_regression.native_overlap([sample], 1, 8192, 0, long, active, 2048)
+        )
+        peer["prompt_processed"] = 4096
+        sample["prefill_rows"] = 6144
+        self.assertEqual(
+            serving_regression.native_overlap([sample], 1, 8192, 0, long, active, 2048),
+            "long-prefill",
+        )
+        self.assertIsNone(
+            serving_regression.native_overlap(
+                [sample], 1, 8192, 4096, long, active, 2048
+            )
+        )
+        sample["at"] = 12
+        self.assertIsNone(
+            serving_regression.native_overlap([sample], 1, 8192, 0, long, active, 2048)
+        )
+
+    def test_sequential_residency_closes_each_server_before_starting_the_next(self):
+        import argparse
+        import io
+        import tempfile
+        from pathlib import Path
+
+        live, order = [], []
+
+        class Server:
+            def __init__(self, settings):
+                self.side = str(settings.binary)
+                if live:
+                    raise AssertionError("two servers were resident")
+                live.append(self)
+                order.append(self.side)
+                self.log = io.StringIO("server log")
+
+            def wait_ready(self, timeout):
+                return {}
+
+            def stop(self):
+                if self in live:
+                    live.remove(self)
+
+            def close(self):
+                self.stop()
+                self.log.close()
+
+        with tempfile.TemporaryDirectory() as directory:
+            args = argparse.Namespace(
+                output=Path(directory),
+                trace=False,
+                probes=False,
+                environments=[{}, {}],
+                startup_timeout=1,
+                batch=1,
+            )
+            report = {"initial_status": [], "complete": False}
+            case = {
+                "context": 2048,
+                "workload": "code",
+                "sample": 0,
+                "prompts": ["p"],
+                "rounds": [],
+            }
+            with (
+                patch.object(
+                    serving_regression, "case_specs", return_value=iter([case])
+                ),
+                patch.object(serving_regression.smoke, "RealServer", Server),
+                patch.object(serving_regression, "warm_servers", return_value={}),
+                patch.object(serving_regression, "status", return_value={}),
+                patch.object(serving_regression, "environment", return_value={}),
+                patch.object(
+                    serving_regression,
+                    "measure_case",
+                    side_effect=lambda *a: {"seconds_per_token": 1, "responses": []},
+                ),
+            ):
+                serving_regression.run_sequential(
+                    args, None, report, [Path("base"), Path("candidate")]
+                )
+            self.assertTrue(report["complete"])
+            self.assertEqual(
+                [row["arm"] for row in report["cases"][0]["rounds"]], [1, 2, 3, 4]
+            )
+        self.assertEqual(order, ["base", "candidate", "candidate", "base"])
+        self.assertFalse(live)
+
     def test_noisy_speedup_and_changed_outputs_do_not_disappear(self):
         rows = [
             {"seconds_per_token": value, "responses": [{"message_sha256": output}]}
