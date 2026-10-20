@@ -91,7 +91,7 @@ work and state traffic remain. A kernel speedup alone cannot establish a useful
 serving gain. The experimental flag stays off unless complete serving runs
 clear `max(2%, 2 * measured noise)` without correctness/latency regressions;
 spread above 5% is inconclusive. Other Apple GPU families remain unexecuted
-until the [maintainer package](qwen-maintainer-runs.md) runs there.
+until the [maintainer package](https://github.com/incoai/splash/pull/510) runs there.
 
 Local performance qualification is in progress. This document states the
 implementation and test contract; it does not claim a qualified gain.
