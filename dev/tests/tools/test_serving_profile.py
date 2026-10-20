@@ -1,0 +1,137 @@
+"""Validity boundaries of the serving trace/paired benchmark reports."""
+
+import math
+import os
+import unittest
+from unittest.mock import patch
+
+from dev.benchmarks import serving_regression, trace_report
+
+
+def event(name, start, duration, **values):
+    return {"name": name, "ph": "X", "ts": start, "dur": duration, "args": values}
+
+
+class TraceReportTests(unittest.TestCase):
+    def test_idle_time_is_not_a_busy_gpu_gap(self):
+        report = trace_report.summarize(
+            {
+                "traceEvents": [
+                    event("request.active", 0, 10),
+                    event("metal.command_span", 1, 1),
+                    event("metal.command_span", 3, 1),
+                    event("request.active", 100, 10),
+                    event("metal.command_span", 101, 1),
+                ]
+            }
+        )
+        self.assertEqual(report["gpu_inter_command_gaps"]["count"], 2)
+        self.assertEqual(report["gpu_gaps_with_a_request_active"]["count"], 1)
+        self.assertEqual(report["gpu_gaps_with_a_request_active"]["median_ms"], 0.001)
+
+    def test_overlapping_requests_keep_the_whole_gap_active(self):
+        report = trace_report.summarize(
+            {
+                "traceEvents": [
+                    event("request.active", 0, 3),
+                    event("request.active", 2, 3),
+                    event("metal.command_span", 1, 0.5),
+                    event("metal.command_span", 4, 0.5),
+                ]
+            }
+        )
+        self.assertEqual(report["gpu_gaps_with_a_request_active"]["count"], 1)
+        self.assertEqual(report["gpu_gaps_with_a_request_active"]["median_ms"], 0.0025)
+
+    def test_partial_overflowing_and_invalid_traces_are_rejected(self):
+        for values in (
+            {"dropped_host_events": 1},
+            {"dropped_commands": 1},
+            {"command_in_flight_at_stop": True},
+            {"exit_status": 70},
+            {"traceEvents": [event("host", -1, 1)]},
+            {"traceEvents": [event("host", 0, -1)]},
+            {"traceEvents": [event("host", math.nan, 1)]},
+            {
+                "traceEvents": [
+                    event("metal.command_span", 0, 5),
+                    event("metal.command_span", 2, 5),
+                ]
+            },
+        ):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                trace_report.summarize({"traceEvents": [], **values})
+
+    def test_prefill_observations_keep_the_representative_flag(self):
+        report = trace_report.summarize(
+            {
+                "traceEvents": [
+                    event(
+                        "batch.observation",
+                        1,
+                        0,
+                        id=1,
+                        flags=3,
+                        rows=2048,
+                        width=1,
+                        context=8192,
+                        value=40,
+                    ),
+                    event(
+                        "batch.observation",
+                        2,
+                        0,
+                        id=2,
+                        flags=1,
+                        rows=128,
+                        width=2,
+                        context=32,
+                        value=5,
+                    ),
+                    event(
+                        "batch.observation",
+                        3,
+                        0,
+                        id=3,
+                        flags=2,
+                        rows=8,
+                        width=1,
+                        context=8192,
+                        value=2,
+                    ),
+                ]
+            }
+        )
+        rows = report["prefill_observations"]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(rows[0]["representative"])
+        self.assertFalse(rows[1]["representative"])
+        self.assertEqual(rows[0]["maximum_history"], 8192)
+        self.assertEqual(rows[0]["wall_ms"], 40)
+
+
+class PairedServingTests(unittest.TestCase):
+    def test_noisy_speedup_and_changed_outputs_do_not_disappear(self):
+        rows = [
+            {"seconds_per_token": value, "responses": [{"message_sha256": output}]}
+            for value, output in [(1, "a"), (0.8, "a"), (0.8, "b"), (1.2, "a")]
+        ]
+        report = serving_regression.summarize(rows)
+        self.assertEqual(report["verdict"], "inconclusive")
+        self.assertFalse(report["output_equal"])
+
+    def test_child_environment_is_restored_after_failure(self):
+        with patch.dict(os.environ, {"TRACE_TEST_EXISTING": "original"}):
+            os.environ.pop("TRACE_TEST_NEW", None)
+            with self.assertRaises(RuntimeError):
+                with serving_regression.child_environment(
+                    {"TRACE_TEST_EXISTING": "temporary", "TRACE_TEST_NEW": "yes"}
+                ):
+                    self.assertEqual(os.environ["TRACE_TEST_NEW"], "yes")
+                    raise RuntimeError("startup failed")
+            self.assertEqual(os.environ["TRACE_TEST_EXISTING"], "original")
+            self.assertNotIn("TRACE_TEST_NEW", os.environ)
+
+
+if __name__ == "__main__":
+    unittest.main()

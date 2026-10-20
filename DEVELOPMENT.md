@@ -2780,6 +2780,9 @@ projections, attention or GDN work.
 
 See the [local Qwen evaluation](dev/benchmarks/deepinfer-qwen-results.md) for
 measured gains, correctness coverage and remaining qualification work.
+The [serving measurement tools](dev/benchmarks/serving-measurements.md) add
+an instrumented native server, cold paired HTTP comparisons and a mixed
+prefill/decode workload with client TTFT and streaming-gap measurements.
 
 From a source checkout with the model installed, use the native benchmark for
 prefill, decode and batch measurements:
