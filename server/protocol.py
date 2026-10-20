@@ -15,7 +15,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 11
+PROTOCOL_VERSION = 12
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -60,6 +60,9 @@ _MASK_REQUEST = struct.Struct("<QQII")
 _DONE = struct.Struct("<QBBIIQQQIIIII")
 _ERROR = struct.Struct("<BBIQII")
 _STATUS_JSON = struct.Struct("<Q")
+_VIDEO_REQUEST = struct.Struct("<QBBIIIIQI")
+_VIDEO_PROGRESS = struct.Struct("<QBIIQQ")
+_VIDEO_OUTPUT = struct.Struct("<QBIQ")
 
 assert (
     array.array("I").itemsize == 4
@@ -74,6 +77,9 @@ assert _START.size == 16
 assert _DONE.size == 62
 assert _ERROR.size == 22
 assert _STATUS_JSON.size == 8
+assert _VIDEO_REQUEST.size == 38
+assert _VIDEO_PROGRESS.size == 33
+assert _VIDEO_OUTPUT.size == 21
 
 REQUEST_FIXED_BYTES = _REQUEST.size
 IMAGE_SPAN_BYTES = _IMAGE_SPAN.size
@@ -85,6 +91,7 @@ class FrameType(IntEnum):
     MASK_RESPONSE = 0x0003
     STATUS_REQUEST = 0x0004
     RELEASE_REQUEST = 0x0005
+    VIDEO_REQUEST = 0x0006
 
     READY = 0x0100
     START = 0x0101
@@ -94,6 +101,8 @@ class FrameType(IntEnum):
     ERROR = 0x0105
     STATUS_JSON = 0x0107
     PROMPT_PROGRESS = 0x0108
+    VIDEO_PROGRESS = 0x0109
+    VIDEO_OUTPUT = 0x010A
 
 
 # The frame types the engine sends; the others are the server's.
@@ -107,6 +116,8 @@ _EVENT_TYPES = frozenset(
         FrameType.ERROR,
         FrameType.STATUS_JSON,
         FrameType.PROMPT_PROGRESS,
+        FrameType.VIDEO_PROGRESS,
+        FrameType.VIDEO_OUTPUT,
     }
 )
 
@@ -315,12 +326,91 @@ class ReleaseRequestFrame:
     correlation_id: int
 
 
+class ReadyFeature(IntFlag):
+    VISION = 1 << 0
+    VIDEO = 1 << 1
+
+
 @dataclass(slots=True, frozen=True)
 class ReadyEvent:
     max_concurrent_requests: int
     max_context_tokens: int
     # Requests may carry image spans; false for a model serving without vision.
     vision: bool
+    # The engine serves a video model: it takes VideoRequestFrames and
+    # cancels, and max_context_tokens bounds a video prompt's tokens.
+    video: bool = False
+
+
+class VideoVariant(IntEnum):
+    TURBO = 0
+    DEFAULT = 1
+
+
+class VideoOutputFlag(IntFlag):
+    PREVIEW = 1 << 0
+    AUDIO = 1 << 1
+
+
+_VIDEO_OUTPUT_BITS = int(VideoOutputFlag.PREVIEW | VideoOutputFlag.AUDIO)
+
+
+@dataclass(slots=True, frozen=True)
+class VideoRequestFrame:
+    """One clip of a video model, of a prompt of the text encoder's token
+    ids. Answered by VideoProgressEvents, then the clip's VideoOutputEvent,
+    or an ErrorEvent."""
+
+    request_id: int
+    variant: VideoVariant
+    outputs: VideoOutputFlag
+    frames: int
+    width: int
+    height: int
+    # Denoising steps; 0 for the variant's.
+    steps: int
+    seed: int
+    prompt_tokens: tuple[int, ...]
+
+
+class VideoPhase(IntEnum):
+    ENCODE = 1
+    PREPARE = 2
+    DENOISE = 3
+    PREVIEW = 4
+    DECODE = 5
+    AUDIO = 6
+    MUX = 7
+
+
+@dataclass(slots=True, frozen=True)
+class VideoProgressEvent:
+    """A phase has done `step` of its `steps`: step 0 starts it, `steps`
+    completes it; its time so far and the engine's peak footprint."""
+
+    request_id: int
+    phase: VideoPhase
+    step: int
+    steps: int
+    elapsed_micros: int
+    peak_footprint_bytes: int
+
+
+class VideoOutputKind(IntEnum):
+    VIDEO = 0
+    PREVIEW = 1
+
+
+@dataclass(slots=True, frozen=True)
+class VideoOutputEvent:
+    """An mp4 of the request: the preview, or the clip, which ends it."""
+
+    request_id: int
+    output: VideoOutputKind
+    frames: int
+    # From the request's arrival.
+    wall_micros: int
+    mp4: bytes
 
 
 @dataclass(slots=True, frozen=True)
@@ -419,6 +509,7 @@ ClientMessage: TypeAlias = (
     | MaskResponseFrame
     | StatusRequestFrame
     | ReleaseRequestFrame
+    | VideoRequestFrame
 )
 EngineEvent: TypeAlias = (
     ReadyEvent
@@ -429,6 +520,8 @@ EngineEvent: TypeAlias = (
     | DoneEvent
     | ErrorEvent
     | StatusJsonEvent
+    | VideoProgressEvent
+    | VideoOutputEvent
 )
 
 
@@ -588,6 +681,12 @@ def _payload_bounds(frame_type: FrameType) -> tuple[int, int]:
             bounds = (_ERROR.size, _ERROR.size + MAX_ERROR_STRING_BYTES * 2)
         case FrameType.STATUS_JSON:
             bounds = (_STATUS_JSON.size, _STATUS_JSON.size + MAX_STATUS_JSON_BYTES)
+        case FrameType.VIDEO_REQUEST:
+            bounds = (_VIDEO_REQUEST.size, _VIDEO_REQUEST.size + MAX_PROMPT_TOKENS * 4)
+        case FrameType.VIDEO_PROGRESS:
+            bounds = (_VIDEO_PROGRESS.size, _VIDEO_PROGRESS.size)
+        case FrameType.VIDEO_OUTPUT:
+            bounds = (_VIDEO_OUTPUT.size, MAX_FRAME_PAYLOAD_BYTES)
     return bounds[0], min(bounds[1], MAX_FRAME_PAYLOAD_BYTES)
 
 
@@ -911,6 +1010,59 @@ def _release_request_frame(request: ReleaseRequestFrame) -> bytearray:
     return frame
 
 
+def _video_request_frame(request: VideoRequestFrame) -> bytearray:
+    try:
+        request_id = _u64(request.request_id, "video request id")
+        if not request_id:
+            raise ValueError("video request id must be non-zero")
+    except ValueError as error:
+        _fail_request(IssueCode.INVALID_REQUEST_ID, str(error))
+    try:
+        variant = _enum_value(request.variant, VideoVariant, "video variant")
+        outputs = request.outputs
+        if not isinstance(outputs, VideoOutputFlag) or outputs & ~_VIDEO_OUTPUT_BITS:
+            raise ValueError("video outputs are not defined by native protocol")
+        frames = _u32(request.frames, "video frames")
+        width = _u32(request.width, "video width")
+        height = _u32(request.height, "video height")
+        steps = _u32(request.steps, "video steps")
+        seed = _u64(request.seed, "video seed")
+        tokens = _words(request.prompt_tokens, "prompt tokens")
+    except ValueError as error:
+        _fail_request(IssueCode.INVALID_ENUM_VALUE, str(error), request_id)
+    if not frames or not width or not height:
+        _fail_request(
+            IssueCode.INVALID_COUNT,
+            "a video request needs frames, a width and a height",
+            request_id,
+        )
+    if not tokens or len(tokens) > MAX_PROMPT_TOKENS:
+        _fail_request(
+            IssueCode.LIMIT_EXCEEDED,
+            "a video prompt holds 1 token or more, within the prompt limit",
+            request_id,
+        )
+    payload_bytes = _VIDEO_REQUEST.size + 4 * len(tokens)
+    if issue := _payload_length_issue(FrameType.VIDEO_REQUEST, payload_bytes):
+        _fail_request(issue.code, issue.message, request_id)
+    frame = _frame(FrameType.VIDEO_REQUEST, payload_bytes)
+    _VIDEO_REQUEST.pack_into(
+        frame,
+        FRAME_HEADER_BYTES,
+        request_id,
+        int(variant),
+        int(outputs),
+        frames,
+        width,
+        height,
+        steps,
+        seed,
+        len(tokens),
+    )
+    frame[FRAME_HEADER_BYTES + _VIDEO_REQUEST.size :] = memoryview(tokens).cast("B")
+    return frame
+
+
 def serialize_message(message: ClientMessage) -> bytearray:
     """Validate and serialize one client message as a whole frame, built in
     one buffer: a request's image pixels are copied once."""
@@ -925,6 +1077,8 @@ def serialize_message(message: ClientMessage) -> bytearray:
             return _status_request_frame(message)
         if isinstance(message, ReleaseRequestFrame):
             return _release_request_frame(message)
+        if isinstance(message, VideoRequestFrame):
+            return _video_request_frame(message)
     except MemoryError as error:
         raise ProtocolError(
             _allocation_issue("allocation failed while serializing a client frame")
@@ -1015,12 +1169,17 @@ def _tail(
 def _decode_event(frame: Frame) -> EngineEvent:
     frame_type, payload = _checked_frame(frame)
     if frame_type is FrameType.READY:
-        concurrent, context, vision = _READY.unpack(payload)
-        if vision > 1:
-            _fatal(IssueCode.INVALID_ENUM_VALUE, "ready vision must be a boolean")
+        concurrent, context, features = _READY.unpack(payload)
+        if features & ~int(ReadyFeature.VISION | ReadyFeature.VIDEO):
+            _fatal(IssueCode.INVALID_ENUM_VALUE, "ready features are not defined")
         if not concurrent or not context:
             _fatal(IssueCode.INVALID_COUNT, "ready event capacities must be non-zero")
-        return ReadyEvent(concurrent, context, bool(vision))
+        return ReadyEvent(
+            concurrent,
+            context,
+            bool(features & ReadyFeature.VISION),
+            bool(features & ReadyFeature.VIDEO),
+        )
     if frame_type is FrameType.START:
         request_id, lane, matched = _START.unpack(payload)
         if not request_id:
@@ -1201,6 +1360,39 @@ def _decode_event(frame: Frame) -> EngineEvent:
         if not json:
             _fatal(IssueCode.LIMIT_EXCEEDED, "status JSON is empty")
         return StatusJsonEvent(correlation_id, json)
+    if frame_type is FrameType.VIDEO_PROGRESS:
+        request_id, phase, step, steps, elapsed, peak = _VIDEO_PROGRESS.unpack(payload)
+        if not request_id or phase not in VideoPhase._value2member_map_:
+            _fatal(
+                IssueCode.INVALID_ENUM_VALUE,
+                "video progress request id or phase is invalid",
+                request_id,
+            )
+        if not steps or step > steps:
+            _fatal(
+                IssueCode.INVALID_COUNT,
+                "video progress steps must be 1 or more, its step at most them",
+                request_id,
+            )
+        return VideoProgressEvent(
+            request_id, VideoPhase(phase), step, steps, elapsed, peak
+        )
+    if frame_type is FrameType.VIDEO_OUTPUT:
+        request_id, output, frames, wall = _VIDEO_OUTPUT.unpack_from(payload)
+        if not request_id or output not in VideoOutputKind._value2member_map_:
+            _fatal(
+                IssueCode.INVALID_ENUM_VALUE,
+                "video output request id or kind is invalid",
+                request_id,
+            )
+        mp4 = payload[_VIDEO_OUTPUT.size :]
+        if not frames or not mp4:
+            _fatal(
+                IssueCode.LIMIT_EXCEEDED,
+                "video output must hold frames and an mp4",
+                request_id,
+            )
+        return VideoOutputEvent(request_id, VideoOutputKind(output), frames, wall, mp4)
     _fatal(IssueCode.UNKNOWN_FRAME_TYPE, "frame type is not a native protocol event")
 
 

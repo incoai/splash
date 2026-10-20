@@ -18,7 +18,7 @@
 // pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 11;
+inline constexpr uint16_t kProtocolVersion = 12;
 // A frame is its header, the magic "SPLH", the u16 protocol version, the
 // u16 FrameType and the u64 payload length, then the payload.
 inline constexpr size_t kFrameHeaderBytes = 16;
@@ -36,6 +36,7 @@ enum class FrameType : uint16_t {
   MaskResponse = 0x0003,
   StatusRequest = 0x0004,
   ReleaseRequest = 0x0005,
+  VideoRequest = 0x0006,
 
   Ready = 0x0100,
   Start = 0x0101,
@@ -45,6 +46,8 @@ enum class FrameType : uint16_t {
   Error = 0x0105,
   StatusJson = 0x0107,
   PromptProgress = 0x0108,
+  VideoProgress = 0x0109,
+  VideoOutput = 0x010A,
 };
 
 // Request errors reject one request while preserving the stream.  An
@@ -192,7 +195,8 @@ struct RequestFrame {
 //   MaskResponse   u64 requestId, u64 maskRequestId, u32 count, u32 words
 //   StatusRequest  u64 correlationId
 //   ReleaseRequest u64 correlationId
-//   Ready          u32 maxConcurrentRequests, u32 maxContextTokens, u8 vision
+//   Ready          u32 maxConcurrentRequests, u32 maxContextTokens,
+//                  u8 features (ReadyFeature)
 //   Start          u64 requestId, u32 lane, u32 matchedPromptTokens
 //   PromptProgress u64 requestId, u32 processedTokens, u64 elapsedMicros
 //   Tokens         u64 requestId, u32 sequenceOffset, u32 count, u32 tokens
@@ -206,6 +210,13 @@ struct RequestFrame {
 //   Error          u8 failureClass, u8 retryable, u64 requestId, u32 code
 //                  bytes, u32 message bytes, the code, the message
 //   StatusJson     u64 correlationId, the JSON
+//   VideoRequest   u64 requestId, u8 variant, u8 outputs (VideoOutputFlag),
+//                  u32 frames, u32 width, u32 height, u32 steps, u64 seed,
+//                  u32 prompt token count, the prompt tokens
+//   VideoProgress  u64 requestId, u8 phase, u32 step, u32 steps,
+//                  u64 elapsedMicros, u64 peakFootprintBytes
+//   VideoOutput    u64 requestId, u8 output, u32 frames, u64 wallMicros,
+//                  the mp4
 struct CancelFrame {
   uint64_t requestId = 0;
 
@@ -236,12 +247,22 @@ struct ReleaseRequestFrame {
   bool operator==(const ReleaseRequestFrame &) const = default;
 };
 
+// The bits of a ReadyEvent's features byte.
+enum ReadyFeature : uint8_t {
+  FeatureVision = 1U << 0,
+  FeatureVideo = 1U << 1,
+};
+
 struct ReadyEvent {
   uint32_t maxConcurrentRequests = 0;
   uint32_t maxContextTokens = 0;
   // Requests may carry image spans. A model serving without vision rejects
   // each image request with a request error.
   bool vision = false;
+  // The engine serves a video model (runtime/video/VideoRuntime.hpp): it
+  // takes VideoRequests and Cancels, and maxContextTokens bounds a video
+  // prompt's tokens.
+  bool video = false;
 
   bool operator==(const ReadyEvent &) const = default;
 };
@@ -321,6 +342,70 @@ struct ErrorEvent {
   bool operator==(const ErrorEvent &) const = default;
 };
 
+// One clip of a video model, of a prompt of the text encoder's token ids.
+// Answered by VideoProgress events, then the clip's VideoOutput, or an Error.
+enum class VideoVariant : uint8_t { Turbo = 0, Default = 1 };
+enum VideoOutputFlag : uint8_t {
+  VideoOutputPreview = 1U << 0,
+  VideoOutputAudio = 1U << 1,
+};
+
+struct VideoRequestFrame {
+  uint64_t requestId = 0;
+  VideoVariant variant = VideoVariant::Turbo;
+  // VideoOutputFlag bits: also the preview; the clip with its audio.
+  uint8_t outputs = VideoOutputAudio;
+  uint32_t frames = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  // Denoising steps; zero for the variant's.
+  uint32_t steps = 0;
+  uint64_t seed = 0;
+  std::vector<uint32_t> promptTokens;
+
+  bool operator==(const VideoRequestFrame &) const = default;
+};
+
+// The phases of a video request, in their order.
+enum class VideoPhase : uint8_t {
+  Encode = 1,
+  Prepare,
+  Denoise,
+  Preview,
+  Decode,
+  Audio,
+  Mux,
+};
+
+// A phase has done `step` of its `steps` (one but the denoising's), the
+// phase's time so far and the process's peak footprint; step 0 starts it
+// and `steps` completes it.
+struct VideoProgressEvent {
+  uint64_t requestId = 0;
+  VideoPhase phase = VideoPhase::Encode;
+  uint32_t step = 0;
+  uint32_t steps = 1;
+  uint64_t elapsedMicros = 0;
+  uint64_t peakFootprintBytes = 0;
+
+  bool operator==(const VideoProgressEvent &) const = default;
+};
+
+// An mp4 of the request: the preview, once its phase completes, or the clip,
+// which ends the request.
+enum class VideoOutputKind : uint8_t { Video = 0, Preview = 1 };
+
+struct VideoOutputEvent {
+  uint64_t requestId = 0;
+  VideoOutputKind output = VideoOutputKind::Video;
+  uint32_t frames = 0;
+  // From the request's arrival.
+  uint64_t wallMicros = 0;
+  std::vector<uint8_t> mp4;
+
+  bool operator==(const VideoOutputEvent &) const = default;
+};
+
 // JSON is deliberately opaque to the transport: the document carries its
 // own schema_version, and the frame length carries the exact JSON byte count
 // (including whitespace) without line or C-string assumptions.
@@ -331,11 +416,13 @@ struct StatusJsonEvent {
   bool operator==(const StatusJsonEvent &) const = default;
 };
 
-using ClientMessage = std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
-                                   StatusRequestFrame, ReleaseRequestFrame>;
+using ClientMessage =
+    std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
+                 StatusRequestFrame, ReleaseRequestFrame, VideoRequestFrame>;
 using EngineEvent =
     std::variant<ReadyEvent, StartEvent, PromptProgressEvent, TokensEvent,
-                 MaskRequestEvent, DoneEvent, ErrorEvent, StatusJsonEvent>;
+                 MaskRequestEvent, DoneEvent, ErrorEvent, StatusJsonEvent,
+                 VideoProgressEvent, VideoOutputEvent>;
 
 struct Frame {
   FrameType type = FrameType::Request;

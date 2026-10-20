@@ -522,6 +522,35 @@ void testRequestErrorKeepsFraming() {
           "cut frame behind a rejected request was not reassembled");
 }
 
+// A language model's engine refuses a video request by itself and keeps
+// serving.
+void testVideoRequestIsRefused() {
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  loop.announceReady();
+  protocol::VideoRequestFrame video;
+  video.requestId = 9;
+  video.frames = 73;
+  video.width = 1344;
+  video.height = 768;
+  video.promptTokens = {5, 6};
+  require(loop.receive(protocol::peer::serialize(video)) &&
+              loop.receive(protocol::peer::serialize(request(1))),
+          "a video request closed the connection");
+  runUntilIdle(loop);
+  uint32_t refused = 0, done = 0;
+  for (const protocol::EngineEvent &message : fixture.events()) {
+    if (const auto *error = std::get_if<protocol::ErrorEvent>(&message))
+      refused += error->requestId == 9 && error->code == "unsupported_request" &&
+                 error->failureClass == protocol::FailureClass::RequestError;
+    done += std::holds_alternative<protocol::DoneEvent>(message);
+  }
+  require(refused == 1 && done == 1 && loop.engineHealthy(),
+          "a video request was not refused by itself");
+}
+
 void testCapacityFailureHasOneTerminalFrame() {
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
@@ -2092,6 +2121,7 @@ int main() {
     testInvalidLimitsAreRejectedAtConstruction();
     testLoopNeedsItsComponents();
     testRequestErrorKeepsFraming();
+    testVideoRequestIsRefused();
     testCommandWatchdogAndPendingHealthWake();
     testDuplicateLiveRequestClosesWithoutAmbiguousError();
     testCancelledIdIsReusableInTheSameInput();

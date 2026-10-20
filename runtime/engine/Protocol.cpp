@@ -36,6 +36,9 @@ constexpr uint64_t kMaskRequestFixedBytes = 24;
 constexpr uint64_t kDoneFixedBytes = 62;
 constexpr uint64_t kErrorFixedBytes = 22;
 constexpr uint64_t kStatusJsonFixedBytes = 8;
+constexpr uint64_t kVideoRequestFixedBytes = 38;
+constexpr uint64_t kVideoProgressFixedBytes = 33;
+constexpr uint64_t kVideoOutputFixedBytes = 21;
 
 struct PayloadBounds {
   uint64_t minimum = 0;
@@ -90,6 +93,9 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
     return bounded(kStatusRequestFixedBytes, kStatusRequestFixedBytes);
   case FrameType::ReleaseRequest:
     return bounded(kReleaseRequestFixedBytes, kReleaseRequestFixedBytes);
+  case FrameType::VideoRequest:
+    // As a request's: its prompt count is checked as the request's own.
+    return bounded(kVideoRequestFixedBytes, limits.maxFramePayloadBytes);
   default:
     // The engine never receives an event.
     return std::nullopt;
@@ -129,6 +135,7 @@ bool clientFrameType(uint16_t raw, FrameType &type) {
   case FrameType::MaskResponse:
   case FrameType::StatusRequest:
   case FrameType::ReleaseRequest:
+  case FrameType::VideoRequest:
     type = static_cast<FrameType>(raw);
     return true;
   default:
@@ -412,6 +419,26 @@ validateMaskResponse(const MaskResponseFrame &response,
   return std::nullopt;
 }
 
+std::optional<ProtocolIssue> validateVideoRequest(const VideoRequestFrame &request,
+                                                  const ProtocolLimits &limits) {
+  if (!request.requestId)
+    return requestIssue(IssueCode::InvalidRequestId, 0,
+                        "video request id must be non-zero");
+  if (!validEnum(static_cast<uint8_t>(request.variant),
+                 {VideoVariant::Turbo, VideoVariant::Default}) ||
+      (request.outputs & ~(VideoOutputPreview | VideoOutputAudio)))
+    return requestIssue(IssueCode::InvalidEnumValue, request.requestId,
+                        "video variant or outputs are not defined");
+  if (!request.frames || !request.width || !request.height)
+    return requestIssue(IssueCode::InvalidCount, request.requestId,
+                        "a video request needs frames, a width and a height");
+  if (request.promptTokens.empty() ||
+      request.promptTokens.size() > limits.maxPromptTokens)
+    return requestIssue(IssueCode::LimitExceeded, request.requestId,
+                        "a video prompt holds 1 token or more, within the prompt limit");
+  return std::nullopt;
+}
+
 ProtocolIssue invalidEvent(IssueCode code, uint64_t requestId,
                            std::string message) {
   return makeIssue(FailureClass::EngineUnhealthy, code, requestId,
@@ -562,6 +589,38 @@ std::optional<ProtocolIssue> validateError(const ErrorEvent &event,
   return std::nullopt;
 }
 
+std::optional<ProtocolIssue> validateVideoProgress(const VideoProgressEvent &event) {
+  if (!event.requestId)
+    return invalidEvent(IssueCode::InvalidRequestId, 0,
+                        "video progress request id must be non-zero");
+  if (!validEnum(static_cast<uint8_t>(event.phase),
+                 {VideoPhase::Encode, VideoPhase::Prepare, VideoPhase::Denoise,
+                  VideoPhase::Preview, VideoPhase::Decode, VideoPhase::Audio,
+                  VideoPhase::Mux}))
+    return invalidEvent(IssueCode::InvalidEnumValue, event.requestId,
+                        "video phase is not defined");
+  if (!event.steps || event.step > event.steps)
+    return invalidEvent(IssueCode::InvalidCount, event.requestId,
+                        "video progress steps must be 1 or more, its step at most them");
+  return std::nullopt;
+}
+
+std::optional<ProtocolIssue> validateVideoOutput(const VideoOutputEvent &event,
+                                                 const ProtocolLimits &limits) {
+  if (!event.requestId)
+    return invalidEvent(IssueCode::InvalidRequestId, 0,
+                        "video output request id must be non-zero");
+  if (!validEnum(static_cast<uint8_t>(event.output),
+                 {VideoOutputKind::Video, VideoOutputKind::Preview}))
+    return invalidEvent(IssueCode::InvalidEnumValue, event.requestId,
+                        "video output is not defined");
+  if (!event.frames || event.mp4.empty() ||
+      event.mp4.size() > limits.maxFramePayloadBytes - kVideoOutputFixedBytes)
+    return invalidEvent(IssueCode::LimitExceeded, event.requestId,
+                        "video output must hold frames and an mp4 within the frame limit");
+  return std::nullopt;
+}
+
 std::optional<ProtocolIssue> validateStatusJson(const StatusJsonEvent &event,
                                                 const ProtocolLimits &limits) {
   if (event.json.empty() || event.json.size() > limits.maxStatusJsonBytes) {
@@ -579,7 +638,8 @@ EncodedEvent encodeReady(const ReadyEvent &event) {
   Writer writer = frameWriter(FrameType::Ready, kReadyFixedBytes);
   writer.u32(event.maxConcurrentRequests);
   writer.u32(event.maxContextTokens);
-  writer.u8(event.vision);
+  writer.u8(static_cast<uint8_t>((event.vision ? FeatureVision : 0) |
+                                 (event.video ? FeatureVideo : 0)));
   return success(writer.take());
 }
 
@@ -690,6 +750,33 @@ EncodedEvent encodeStatusJson(const StatusJsonEvent &event,
   return success(writer.take());
 }
 
+EncodedEvent encodeVideoProgress(const VideoProgressEvent &event) {
+  if (auto issue = validateVideoProgress(event))
+    return failure<std::vector<uint8_t>>(std::move(*issue));
+  Writer writer = frameWriter(FrameType::VideoProgress, kVideoProgressFixedBytes);
+  writer.u64(event.requestId);
+  writer.u8(static_cast<uint8_t>(event.phase));
+  writer.u32(event.step);
+  writer.u32(event.steps);
+  writer.u64(event.elapsedMicros);
+  writer.u64(event.peakFootprintBytes);
+  return success(writer.take());
+}
+
+EncodedEvent encodeVideoOutput(const VideoOutputEvent &event,
+                               const ProtocolLimits &limits) {
+  if (auto issue = validateVideoOutput(event, limits))
+    return failure<std::vector<uint8_t>>(std::move(*issue));
+  Writer writer =
+      frameWriter(FrameType::VideoOutput, kVideoOutputFixedBytes + event.mp4.size());
+  writer.u64(event.requestId);
+  writer.u8(static_cast<uint8_t>(event.output));
+  writer.u32(event.frames);
+  writer.u64(event.wallMicros);
+  writer.raw(event.mp4);
+  return success(writer.take());
+}
+
 ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
                                             const ProtocolLimits &limits) {
   Reader reader(payload);
@@ -795,6 +882,33 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
   return success(ClientMessage{std::move(request)});
 }
 
+ProtocolResult<ClientMessage> decodeVideoRequest(const Frame &frame,
+                                                 const ProtocolLimits &limits) {
+  Reader reader(frame.payload);
+  VideoRequestFrame request;
+  uint8_t variant = 0;
+  uint32_t promptCount = 0;
+  if (!reader.u64(request.requestId) || !reader.u8(variant) ||
+      !reader.u8(request.outputs) || !reader.u32(request.frames) ||
+      !reader.u32(request.width) || !reader.u32(request.height) ||
+      !reader.u32(request.steps) || !reader.u64(request.seed) ||
+      !reader.u32(promptCount)) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                  0, "video request fixed payload is truncated"));
+  }
+  request.variant = static_cast<VideoVariant>(variant);
+  if (!reader.words(promptCount, request.promptTokens) || reader.remaining()) {
+    return failure<ClientMessage>(
+        requestIssue(IssueCode::InvalidPayloadLength, request.requestId,
+                     "video prompt count does not match the binary token payload"));
+  }
+  if (auto issue = validateVideoRequest(request, limits)) {
+    return failure<ClientMessage>(std::move(*issue));
+  }
+  return success(ClientMessage{std::move(request)});
+}
+
 ProtocolResult<ClientMessage> decodeCancel(const Frame &frame) {
   Reader reader(frame.payload);
   CancelFrame cancel;
@@ -889,6 +1003,12 @@ std::string_view frameTypeName(FrameType type) {
     return "error";
   case FrameType::StatusJson:
     return "status_json";
+  case FrameType::VideoRequest:
+    return "video_request";
+  case FrameType::VideoProgress:
+    return "video_progress";
+  case FrameType::VideoOutput:
+    return "video_output";
   }
   return "unknown";
 }
@@ -1006,6 +1126,8 @@ ProtocolResult<ClientMessage> decodeFrame(Frame &&frame,
       return decodeStatusRequest(frame);
     case FrameType::ReleaseRequest:
       return decodeReleaseRequest(frame);
+    case FrameType::VideoRequest:
+      return decodeVideoRequest(frame, limits);
     default:
       break;
     }
@@ -1043,6 +1165,10 @@ serializeEvent(const EngineEvent &event, const ProtocolLimits &limits) {
             return encodeDone(value);
           } else if constexpr (std::is_same_v<T, ErrorEvent>) {
             return encodeError(value, limits);
+          } else if constexpr (std::is_same_v<T, VideoProgressEvent>) {
+            return encodeVideoProgress(value);
+          } else if constexpr (std::is_same_v<T, VideoOutputEvent>) {
+            return encodeVideoOutput(value, limits);
           } else {
             return encodeStatusJson(value, limits);
           }

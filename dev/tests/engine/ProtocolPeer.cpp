@@ -144,6 +144,20 @@ FrameType write(Writer &out, const ReleaseRequestFrame &request) {
   return FrameType::ReleaseRequest;
 }
 
+FrameType write(Writer &out, const VideoRequestFrame &request) {
+  out.u64(request.requestId);
+  out.u8(static_cast<uint8_t>(request.variant));
+  out.u8(request.outputs);
+  out.u32(request.frames);
+  out.u32(request.width);
+  out.u32(request.height);
+  out.u32(request.steps);
+  out.u64(request.seed);
+  out.u32(static_cast<uint32_t>(request.promptTokens.size()));
+  out.words(request.promptTokens);
+  return FrameType::VideoRequest;
+}
+
 struct Header {
   FrameType type;
   uint64_t payloadBytes;
@@ -167,7 +181,9 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     ReadyEvent event;
     event.maxConcurrentRequests = in.u32();
     event.maxContextTokens = in.u32();
-    event.vision = in.u8() != 0;
+    const uint8_t features = in.u8();
+    event.vision = features & FeatureVision;
+    event.video = features & FeatureVideo;
     return event;
   }
   case FrameType::Start: {
@@ -232,6 +248,26 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     StatusJsonEvent event;
     event.correlationId = in.u64();
     event.json = in.rest();
+    return event;
+  }
+  case FrameType::VideoProgress: {
+    VideoProgressEvent event;
+    event.requestId = in.u64();
+    event.phase = static_cast<VideoPhase>(in.u8());
+    event.step = in.u32();
+    event.steps = in.u32();
+    event.elapsedMicros = in.u64();
+    event.peakFootprintBytes = in.u64();
+    return event;
+  }
+  case FrameType::VideoOutput: {
+    VideoOutputEvent event;
+    event.requestId = in.u64();
+    event.output = static_cast<VideoOutputKind>(in.u8());
+    event.frames = in.u32();
+    event.wallMicros = in.u64();
+    const std::string mp4 = in.rest();
+    event.mp4.assign(mp4.begin(), mp4.end());
     return event;
   }
   default:

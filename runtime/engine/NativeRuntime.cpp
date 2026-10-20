@@ -264,6 +264,10 @@ bool NativeRuntime::handle(protocol::ClientMessage &message) {
           return handleMask(typed);
         } else if constexpr (std::is_same_v<T, protocol::ReleaseRequestFrame>) {
           return handleRelease(typed);
+        } else if constexpr (std::is_same_v<T, protocol::VideoRequestFrame>) {
+          requestError(typed.requestId, "unsupported_request",
+                       "this engine serves a language model, not a video model");
+          return true;
         } else {
           return handleStatus(typed);
         }

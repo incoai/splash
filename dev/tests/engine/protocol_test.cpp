@@ -210,6 +210,28 @@ RequestFrame exampleIgnoreEosRequest() {
   return request;
 }
 
+VideoRequestFrame exampleVideoRequest() {
+  VideoRequestFrame request;
+  request.requestId = 92;
+  request.outputs = VideoOutputPreview | VideoOutputAudio;
+  request.frames = 73;
+  request.width = 1344;
+  request.height = 768;
+  request.seed = 42;
+  request.promptTokens = {5, 6, 7};
+  return request;
+}
+
+// The default variant's clip without audio or preview.
+VideoRequestFrame exampleVideoDefaultRequest() {
+  VideoRequestFrame request = exampleVideoRequest();
+  request.variant = VideoVariant::Default;
+  request.outputs = 0;
+  request.steps = 50;
+  request.promptTokens = {0xffffffffU};
+  return request;
+}
+
 RequestFrame exampleProgressRequest() {
   RequestFrame request = exampleRequest();
   request.flags = kReturnProgressFlag;
@@ -228,6 +250,8 @@ const std::vector<std::pair<std::string, ClientMessage>> &clientMessages() {
        MaskResponseFrame{91, 7, {0xffffffffU, 0, 0xa5a5a5a5U}}},
       {"status_request", StatusRequestFrame{808}},
       {"release_request", ReleaseRequestFrame{808}},
+      {"video_request", exampleVideoRequest()},
+      {"video_request_default", exampleVideoDefaultRequest()},
   };
   return messages;
 }
@@ -236,6 +260,7 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
   static const std::vector<std::pair<std::string, EngineEvent>> events{
       {"ready", ReadyEvent{4, 524'288, false}},
       {"ready_vision", ReadyEvent{4, 524'288, true}},
+      {"ready_video", ReadyEvent{1, 2048, false, true}},
       {"start", StartEvent{91, 2, 4096}},
       {"prompt_progress", PromptProgressEvent{91, 2048, 123456}},
       {"tokens", TokensEvent{91, 17, {10, 11, 12}}},
@@ -260,6 +285,10 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
                   "stream framing cannot be trusted"}},
       {"status_json",
        StatusJsonEvent{808, "{\n  \"schema_version\": 6, \"ready\": true\n}"}},
+      {"video_progress",
+       VideoProgressEvent{92, VideoPhase::Denoise, 3, 8, 312'000'000, 15'200'000'000}},
+      {"video_output",
+       VideoOutputEvent{92, VideoOutputKind::Video, 73, 345'000'000, {0, 0, 0, 24, 'f', 't', 'y', 'p'}}},
   };
   return events;
 }
@@ -341,6 +370,49 @@ void expectEventIssue(std::string_view test, const EngineEvent &invalid,
           serialized.issue->failureClass == FailureClass::EngineUnhealthy);
     CHECK(test, serialized.issue->code == code);
   }
+}
+
+// A video request holds a prompt and the clip's geometry; its events state a
+// phase, a step within its steps and an mp4.
+void testVideoFrames() {
+  constexpr std::string_view test = "video frames";
+  CHECK(test, roundTrip(exampleVideoRequest()) == exampleVideoRequest());
+  CHECK(test, roundTrip(exampleVideoDefaultRequest()) == exampleVideoDefaultRequest());
+  const auto expectIssue = [&](VideoRequestFrame invalid, IssueCode code,
+                               const ProtocolLimits &limits = kLimits) {
+    auto decoded = decodeClient(peer::serialize(invalid), limits);
+    CHECK(test, !decoded);
+    if (decoded.issue) {
+      CHECK(test, decoded.issue->failureClass == FailureClass::RequestError);
+      CHECK(test, decoded.issue->code == code);
+      CHECK(test, decoded.issue->requestId == invalid.requestId);
+    }
+  };
+  VideoRequestFrame empty = exampleVideoRequest();
+  empty.promptTokens.clear();
+  expectIssue(empty, IssueCode::LimitExceeded);
+  VideoRequestFrame noFrames = exampleVideoRequest();
+  noFrames.frames = 0;
+  expectIssue(noFrames, IssueCode::InvalidCount);
+  VideoRequestFrame outputs = exampleVideoRequest();
+  outputs.outputs = 4;
+  expectIssue(outputs, IssueCode::InvalidEnumValue);
+  VideoRequestFrame variant = exampleVideoRequest();
+  variant.variant = static_cast<VideoVariant>(2);
+  expectIssue(variant, IssueCode::InvalidEnumValue);
+  ProtocolLimits twoTokens;
+  twoTokens.maxPromptTokens = 2;
+  expectIssue(exampleVideoRequest(), IssueCode::LimitExceeded, twoTokens);
+
+  const VideoProgressEvent progress{92, VideoPhase::Decode, 1, 1, 27'000'000, 4'000'000'000};
+  CHECK(test, roundTripEvent(progress) == progress);
+  expectEventIssue(test, VideoProgressEvent{92, VideoPhase::Denoise, 9, 8}, IssueCode::InvalidCount);
+  expectEventIssue(test, VideoProgressEvent{92, static_cast<VideoPhase>(8), 0, 1},
+                   IssueCode::InvalidEnumValue);
+  expectEventIssue(test, VideoOutputEvent{92, VideoOutputKind::Preview, 73, 0, {}},
+                   IssueCode::LimitExceeded);
+  const ReadyEvent ready{1, 2048, false, true};
+  CHECK(test, roundTripEvent(ready) == ready);
 }
 
 void testScoreRequestAndDoneLogits() {
@@ -1156,6 +1228,7 @@ int main(int argc, char **argv) {
   try {
     testGoldenVectors(argv[1]);
     testRequestRoundTrip();
+    testVideoFrames();
     testScoreRequestAndDoneLogits();
     testClientAndEventStreams();
     testOneByteIncrementalParsing();

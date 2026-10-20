@@ -109,6 +109,31 @@ def example_progress_request():
     return replace(example_request(), flags=p.RequestFlag.RETURN_PROGRESS)
 
 
+def example_video_request():
+    return p.VideoRequestFrame(
+        92,
+        p.VideoVariant.TURBO,
+        p.VideoOutputFlag.PREVIEW | p.VideoOutputFlag.AUDIO,
+        73,
+        1344,
+        768,
+        0,
+        42,
+        (5, 6, 7),
+    )
+
+
+def example_video_default_request():
+    """The default variant's clip without audio or preview."""
+    return replace(
+        example_video_request(),
+        variant=p.VideoVariant.DEFAULT,
+        outputs=p.VideoOutputFlag(0),
+        steps=50,
+        prompt_tokens=(0xFFFFFFFF,),
+    )
+
+
 def client_messages():
     return {
         "request": example_request(),
@@ -122,6 +147,8 @@ def client_messages():
         ),
         "status_request": p.StatusRequestFrame(808),
         "release_request": p.ReleaseRequestFrame(808),
+        "video_request": example_video_request(),
+        "video_request_default": example_video_default_request(),
     }
 
 
@@ -129,6 +156,7 @@ def engine_events():
     return {
         "ready": p.ReadyEvent(4, 524_288, False),
         "ready_vision": p.ReadyEvent(4, 524_288, True),
+        "ready_video": p.ReadyEvent(1, 2048, False, True),
         "start": p.StartEvent(91, 2, 4096),
         "prompt_progress": p.PromptProgressEvent(91, 2048, 123456),
         "tokens": p.TokensEvent(91, 17, (10, 11, 12)),
@@ -174,6 +202,12 @@ def engine_events():
         ),
         "status_json": p.StatusJsonEvent(
             808, b'{\n  "schema_version": 6, "ready": true\n}'
+        ),
+        "video_progress": p.VideoProgressEvent(
+            92, p.VideoPhase.DENOISE, 3, 8, 312_000_000, 15_200_000_000
+        ),
+        "video_output": p.VideoOutputEvent(
+            92, p.VideoOutputKind.VIDEO, 73, 345_000_000, b"\x00\x00\x00\x18ftyp"
         ),
     }
 
@@ -284,6 +318,40 @@ class ProtocolPythonTests(unittest.TestCase):
         for name, event in engine_events().items():
             with self.subTest(name=name):
                 self.assertEqual(decode_event(golden[name]), event)
+
+    def test_video_request_needs_a_prompt_and_a_clip(self):
+        for code, change in (
+            (p.IssueCode.LIMIT_EXCEEDED, {"prompt_tokens": ()}),
+            (p.IssueCode.INVALID_COUNT, {"frames": 0}),
+            (p.IssueCode.INVALID_ENUM_VALUE, {"outputs": p.VideoOutputFlag(4)}),
+        ):
+            with self.subTest(change=change):
+                self.assert_protocol_error(
+                    p.FailureClass.REQUEST_ERROR,
+                    code,
+                    lambda: p.serialize_message(
+                        replace(example_video_request(), **change)
+                    ),
+                )
+        for request in (example_video_request(), example_video_default_request()):
+            with self.subTest(request=request.variant):
+                self.assertEqual(decode_client(p.serialize_message(request)), request)
+
+    def test_video_events_are_validated(self):
+        for event in (
+            p.VideoProgressEvent(92, p.VideoPhase.DENOISE, 9, 8, 0, 0),
+            p.VideoProgressEvent(92, p.VideoPhase.DENOISE, 0, 0, 0, 0),
+            p.VideoOutputEvent(92, p.VideoOutputKind.VIDEO, 73, 0, b""),
+        ):
+            with self.subTest(event=event):
+                self.assert_fatal_event(
+                    p.IssueCode.INVALID_COUNT
+                    if isinstance(event, p.VideoProgressEvent)
+                    else p.IssueCode.LIMIT_EXCEEDED,
+                    event,
+                )
+        ready = p.ReadyEvent(1, 2048, True, True)
+        self.assertEqual(decode_event(native_peer.serialize_event(ready)), ready)
 
     def test_progress_wire_validation(self):
         # A request asks for its prompt's progress with a flag bit.
@@ -1028,7 +1096,7 @@ class ProtocolPythonTests(unittest.TestCase):
         )
         self.assert_fatal_event(p.IssueCode.INVALID_COUNT, p.ReadyEvent(0, 4096, False))
         self.assert_fatal_event(
-            p.IssueCode.INVALID_ENUM_VALUE, p.ReadyEvent(4, 4096, 2)
+            p.IssueCode.INVALID_ENUM_VALUE, p.ReadyEvent(4, 4096, 4)
         )
 
     def test_unnamed_request_failures_are_fatal(self):
