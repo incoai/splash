@@ -31,8 +31,8 @@ underlying prefill/verify numerical difference has been located or repaired.
 
 The later reference-only edge fix `c20ea1e1` preserves prompt-only logits when
 repetition is inactive, including positive infinity. Its updated CPU unit
-and ASAN/UBSAN checks pass. Four representative final-patch model cells are
-queued separately; the initial run is not relabelled as a run of later source.
+and ASAN/UBSAN checks pass. Four representative final-patch model cells now
+pass separately; the initial run is not relabelled as a run of later source.
 
 ## What the assertion now checks
 
@@ -68,7 +68,8 @@ runtime behavior, shader code and defaults are unchanged.
 - [ASAN/UBSAN helper](penalty-oracle-asan.log): pass; [compile command](penalty-oracle-asan.json).
 - Shader-validated [target-sampling](target-sampling.log): pass.
 - Initial real-model fix run: pass, separately source-scoped above.
-- Final representative real-model coverage: queued, not a passing result yet.
+- Final representative real-model coverage: all four cells pass; commands,
+  manifests and binary hashes are in [final-jobs.json](final-jobs.json).
 
 The CPU fixture uses hand-calculated positive/negative logits and policies;
 it rejects wrong prompt repetition, stale output counts, a missing accepted
@@ -81,3 +82,29 @@ header so editing that reference rebuilds the test executable.
 Paths in exported logs use placeholders; source and exported hashes are kept
 separately. Full original local logs remain available. No model weights or
 generated serving answers are included.
+
+## Final-source model coverage
+
+All cells below use code patch `c20ea1e1`, oracle SHA256
+`f2b4cc0d5f2c94e6ee0de966722e9a237ad71ce59a0ab689d4865c4836103e28`,
+shader validation, ANE share 0 and maximum context 32,768. Each runs the full
+runtime oracle, including twelve strict penalty/preemption checks.
+
+| Model/storage | KV | State | Result | Strict policy rows | Maximum normalized arithmetic error |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3.6 MoE GGUF UD-IQ3_XXS | BF16 | FP32 | PASS | 248 | 5.90884e-08 |
+| Qwen3.6 MoE MLX 4-bit | INT8 | BF16 | PASS | 294 | 5.94946e-08 |
+| Qwen3.8 dense MLX 4-bit | BF16 | BF16 | PASS | 295 | 5.94595e-08 |
+| Qwen3.8 dense GGUF UD-Q4_K_M | INT8 | FP32 | PASS | 300 | 5.90713e-08 |
+
+The four final logs and [summary.json](summary.json) retain all pass markers
+and source/exported hashes. Total: 1,137 initial/retained policy rows, maximum
+normalized error `5.94946e-08`. These four representative combinations cover
+both families/formats and both KV/state types; they are not a rerun of all
+sixteen KV/state combinations with the corrected oracle. The separate #523
+frozen-upstream matrix executes all sixteen: fifteen pass and the original
+MoE GGUF BF16-KV/FP32-state failure remains explicitly failed.
+
+CI on code/evidence head `db737779` passes production/native/CPU/sanitizers
+and Python 3.12/3.13/3.14: [run 39565247341](https://github.com/incoai/splash/actions/runs/39565247341).
+This final attachment changes evidence only; its own CI is reported on the PR.

@@ -15,7 +15,7 @@
     "maximum_relative_error": 5.90884e-08,
     "original_cold_score_disagreement_reproduced": true
   },
-  "final_patch_model_matrix_status": "queued; four representative model/storage/KV/state cells after current-main functional checks",
+  "final_patch_model_matrix_status": "complete: four representative cells pass; not all sixteen KV/state combinations rerun with the correction",
   "sources": [
     {
       "file": "upstream-moe-gguf-bf16-fp32.log",
@@ -65,5 +65,60 @@
       "exported_sha256": "97fbe510f33ea4a7d874937147565382714386ee7fcc363b2331bdee0b2d7bdd",
       "normalization": "replace absolute workspace roots only"
     }
-  ]
+  ],
+  "final_matrix": {
+    "complete": true,
+    "source_patch": "c20ea1e1",
+    "repository_head": "db737779baa0b48507ea843222ecb65e32df5062",
+    "oracle_sha256": "f2b4cc0d5f2c94e6ee0de966722e9a237ad71ce59a0ab689d4865c4836103e28",
+    "metallib_sha256": "12539edddd82bd28b9fb8e4d9b61f3603a41fa46190b2c0e05cc92ec0623f1ec",
+    "results": [
+      {
+        "name": "moe-gguf-oracle-bf16-fp32",
+        "exit_status": 0,
+        "pass_marker": true,
+        "policy_runs": 12,
+        "initial_and_retained_rows": 248,
+        "maximum_relative_error": 5.90884e-08,
+        "log": "final-moe-gguf-oracle-bf16-fp32.log",
+        "source_log_sha256": "3592216e60c597accac5e8589f1dddd2526ae537dde683a8f652e3f877f33fdf",
+        "exported_log_sha256": "3592216e60c597accac5e8589f1dddd2526ae537dde683a8f652e3f877f33fdf"
+      },
+      {
+        "name": "moe-mlx-oracle-int8-bf16",
+        "exit_status": 0,
+        "pass_marker": true,
+        "policy_runs": 12,
+        "initial_and_retained_rows": 294,
+        "maximum_relative_error": 5.94946e-08,
+        "log": "final-moe-mlx-oracle-int8-bf16.log",
+        "source_log_sha256": "10bfe5bdd6f90178df7a812b07d9ed14954ee072575a61bba44843ec7b9b3502",
+        "exported_log_sha256": "10bfe5bdd6f90178df7a812b07d9ed14954ee072575a61bba44843ec7b9b3502"
+      },
+      {
+        "name": "dense-mlx-oracle-bf16-bf16",
+        "exit_status": 0,
+        "pass_marker": true,
+        "policy_runs": 12,
+        "initial_and_retained_rows": 295,
+        "maximum_relative_error": 5.94595e-08,
+        "log": "final-dense-mlx-oracle-bf16-bf16.log",
+        "source_log_sha256": "2b2ed61123828f0c6f06c398c95ba2ab2f2e876b459934874e3b95cb2704280f",
+        "exported_log_sha256": "2b2ed61123828f0c6f06c398c95ba2ab2f2e876b459934874e3b95cb2704280f"
+      },
+      {
+        "name": "dense-gguf-oracle-int8-fp32",
+        "exit_status": 0,
+        "pass_marker": true,
+        "policy_runs": 12,
+        "initial_and_retained_rows": 300,
+        "maximum_relative_error": 5.90713e-08,
+        "log": "final-dense-gguf-oracle-int8-fp32.log",
+        "source_log_sha256": "6549eb8611435cea27b81477f14c7932f27a838c508f4789336a94a8f7751c2c",
+        "exported_log_sha256": "6549eb8611435cea27b81477f14c7932f27a838c508f4789336a94a8f7751c2c"
+      }
+    ],
+    "total_policy_rows": 1137,
+    "maximum_relative_error": 5.94946e-08
+  }
 }
