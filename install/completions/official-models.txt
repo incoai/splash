@@ -1,2 +1,0 @@
-incoai/Qwen3.6-35B-A3B-Splash
-incoai/Qwen3.8-27B-Splash

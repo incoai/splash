@@ -8,6 +8,10 @@
 
 namespace splash::ops {
 
+// A vision tower's geometry. The defaults are the one tower the kernels are
+// specialized for, Qwen3.5's 27 blocks; outputHiddenSize, the width of the
+// text model its merger projects into, is each family's, stated beside its
+// target (Qwen3_8.hpp, Qwen3_6Moe.hpp).
 struct VisionLayout final {
   uint32_t depth = 27;
   uint32_t hiddenSize = 1152;
@@ -15,7 +19,7 @@ struct VisionLayout final {
   uint32_t intermediateSize = 4304;
   uint32_t paddedIntermediateSize = 4352;
   uint32_t mergedHiddenSize = 4608;
-  uint32_t outputHiddenSize = 5120;
+  uint32_t outputHiddenSize = 0;
   uint32_t heads = 16;
   uint32_t headDimension = 72;
   uint32_t positionGridSide = 48;
@@ -73,9 +77,12 @@ struct ImageGrid final {
   [[nodiscard]] bool valid() const noexcept {
     return height >= 2 && width >= 2 && height % 2 == 0 && width % 2 == 0;
   }
-  [[nodiscard]] uint32_t patches() const noexcept { return height * width; }
+  // Exact for any sides, so a grid past a patch limit cannot wrap under it.
+  [[nodiscard]] uint64_t patches() const noexcept {
+    return uint64_t{height} * width;
+  }
   [[nodiscard]] uint32_t mergedTokens() const noexcept {
-    return patches() / 4;
+    return (height / 2) * (width / 2);
   }
   [[nodiscard]] uint64_t pixelBytes() const noexcept {
     return imagePixelBytes(height, width);
@@ -84,8 +91,9 @@ struct ImageGrid final {
 
 // GPU vision encoder with one reusable scratch arena sized for maximumPatches.
 // encode() appends one image's dispatches, from resized uint8 RGB pixels to
-// bf16 language embeddings. Injection uses the encoded buffers independently,
-// so the arena can be released after encoding while later chunks inject rows.
+// bf16 language embeddings in the caller's buffer, so the arena can be
+// released after encoding while later chunks copy the image's rows into their
+// hidden rows (ops::RowCopy).
 class Vision final {
 public:
   // Scratch footprint before construction, so the caller can reserve it.
@@ -95,6 +103,7 @@ public:
   // this many rows of layout.outputHiddenSize bf16 values per image.
   [[nodiscard]] static uint32_t embeddingRows(ImageGrid grid) noexcept;
 
+  // Throws unless `model` holds every weight of the tower its layout names.
   Vision(metal::MetalBackend &backend, const VisionWeights &model,
          uint32_t maximumPatches);
   Vision(const Vision &) = delete;
@@ -103,23 +112,18 @@ public:
   [[nodiscard]] uint64_t arenaBytes() const noexcept {
     return arena_.sizeBytes();
   }
+  // The most patches an image it encodes may have.
+  [[nodiscard]] uint32_t maximumPatches() const noexcept {
+    return maximumPatches_;
+  }
 
   void encode(metal::CommandGraph &graph, ImageGrid grid,
               const metal::MetalBuffer &pixels,
               const metal::MetalBuffer &embeddings) const;
 
-  // Overwrites rows of a packed bf16 hidden buffer with embedding rows of
-  // hiddenSize values each.
-  static void inject(metal::CommandGraph &graph,
-                     const metal::MetalBuffer &embeddings,
-                     const metal::MetalBuffer &packedHidden,
-                     uint32_t hiddenSize, uint32_t sourceRow,
-                     uint32_t destinationRow, uint32_t rows);
-
 private:
   enum class Scratch : uint32_t {
     Patches,
-    Positions,
     RopeCos,
     RopeSin,
     Hidden,

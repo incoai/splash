@@ -1,6 +1,7 @@
 #pragma once
 
-#include "ops/Vision.hpp"
+#include "engine/Types.hpp"
+#include "model/Model.hpp"
 
 #include <array>
 #include <cstddef>
@@ -12,23 +13,29 @@
 #include <variant>
 #include <vector>
 
+// The engine decodes client frames and encodes engine events;
+// server/protocol.py does the reverse. dev/tests/engine/protocol_golden.txt
+// pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 6;
-inline constexpr size_t kFrameHeaderBytes = 24;
-inline constexpr uint32_t kStatusSchemaVersion = 5;
+inline constexpr uint16_t kProtocolVersion = 11;
+// A frame is its header, the magic "SPLH", the u16 protocol version, the
+// u16 FrameType and the u64 payload length, then the payload.
+inline constexpr size_t kFrameHeaderBytes = 16;
+inline constexpr uint32_t kStatusSchemaVersion = 6;
 // Image pixels travel inside the request frame; a multi-image agent turn can
 // carry well over 64 MiB of resized RGB bytes.
 inline constexpr uint64_t kAbsoluteMaxFramePayloadBytes =
     256ULL * 1024 * 1024;
 
 // Every integer, including binary prompt/token words, is little-endian on the
-// wire.  Header flags and reserved bytes must be zero in native protocol.
+// wire.
 enum class FrameType : uint16_t {
   Request = 0x0001,
   Cancel = 0x0002,
   MaskResponse = 0x0003,
   StatusRequest = 0x0004,
+  ReleaseRequest = 0x0005,
 
   Ready = 0x0100,
   Start = 0x0101,
@@ -36,15 +43,14 @@ enum class FrameType : uint16_t {
   MaskRequest = 0x0103,
   Done = 0x0104,
   Error = 0x0105,
-  CapacityExhausted = 0x0106,
   StatusJson = 0x0107,
   PromptProgress = 0x0108,
 };
 
 // Request errors reject one request while preserving the stream.  An
 // engine-unhealthy error asks the supervisor to replace the engine.  A
-// protocol-fatal error means framing is no longer trusted, so the stream must
-// close without attempting another framing mode.
+// protocol-fatal error means framing is no longer trusted, or a client frame
+// failed without naming its request, so the stream must close.
 enum class FailureClass : uint8_t {
   RequestError = 1,
   EngineUnhealthy = 2,
@@ -57,22 +63,17 @@ enum class IssueCode : uint16_t {
   None = 0,
   BadMagic,
   UnsupportedVersion,
-  InvalidHeaderSize,
   UnknownFrameType,
-  NonZeroHeaderFlags,
-  NonZeroReservedField,
   FrameTooLarge,
   InvalidPayloadLength,
   TruncatedFrame,
-  ParserAlreadyFailed,
   InvalidRequestId,
   InvalidEnumValue,
   InvalidDeadline,
   InvalidSampling,
   InvalidCount,
-  InvalidCohortConstraint,
+  InvalidConstraint,
   InvalidErrorClassification,
-  InvalidStatusSchema,
   LimitExceeded,
   IntegerOverflow,
   AllocationFailure,
@@ -99,6 +100,8 @@ template <typename T> struct ProtocolResult {
   }
 };
 
+// Valid as validateLimits checks them: NativeRuntime checks its limits once,
+// and the codec and the frame parser rely on that.
 struct ProtocolLimits {
   uint64_t maxFramePayloadBytes = kAbsoluteMaxFramePayloadBytes;
   uint64_t maxStatusJsonBytes = 32ULL * 1024 * 1024;
@@ -109,64 +112,44 @@ struct ProtocolLimits {
   uint32_t maxSimulationTokens = 32;
   uint32_t maxMaskWords = 1U << 20;
   uint32_t maxImageSpans = 64;
-  // Patches per image; the engine sizes its vision scratch from the same
-  // value, so a frame limit violation is never a late allocation failure.
-  uint32_t maxImagePatches = ops::kMaximumImagePatches;
-};
-// Direct finite-option scoring (SemIf/Jev System One): a request carrying
-// scoreTokens runs prefill only and returns the raw final-position logits at
-// those token ids in DoneEvent.optionLogits. The option count is bounded by
-// the wire contract; the engine additionally requires vocabulary bounds.
-inline constexpr uint32_t kMinimumScoreOptions = 2;
-inline constexpr uint32_t kMaximumScoreOptions = 255;
-
-enum class RequestPriority : uint8_t {
-  Foreground = 0,
-  Normal = 1,
-  Background = 2,
 };
 
-enum class Cohort : uint8_t {
-  Greedy = 0,
-  Sampling = 1,
-  Constrained = 2,
-};
+[[nodiscard]] std::optional<ProtocolIssue>
+validateLimits(const ProtocolLimits &limits);
 
-enum class ConstraintMode : uint8_t {
-  None = 0,
-  TokenMask = 1,
-};
+// A request payload starts with these fields, at these byte offsets:
+//    0 u64 requestId
+//    8 u8  priority
+//    9 u8  constraint
+//   10 u64 absoluteDeadlineUnixMicros
+//   18 u64 remainingDeadlineMicros
+//   26 u32 logicalMaxOutputTokens
+//   30 u32 prompt token count
+//   34 u32 image span count
+//   38 sampling: f32 temperature, f32 topP, u32 topK, f32 presencePenalty,
+//      f32 frequencyPenalty, f32 repetitionPenalty, f32 minP, u64 seed
+//   74 u32 score token count
+//   78 u32 generationPromptTokens
+//   82 u32 flags
+//   86 u64 cacheSalt.lo, u64 cacheSalt.hi
+//  102 u32 thinkingBudget.tokens, kNoThinkingBudget for none
+//  106 u32 thinking end token count, u32 thinkingBudget.alsoEnds, zero
+//      without a budget
+// then the prompt tokens, the 32-byte image spans, the image pixels, the
+// score tokens and the thinking end tokens.
+inline constexpr uint64_t kRequestFixedBytes = 114;
+inline constexpr uint32_t kNoThinkingBudget = 0xFFFFFFFFU;
+// A thinking budget's end holds 1 to this many tokens.
+inline constexpr uint32_t kMaximumThinkingEndTokens = 64;
 
-struct SamplingParameters {
-  float temperature = 0.0f;
-  float topP = 1.0f;
-  uint32_t topK = 0;
-
-  bool operator==(const SamplingParameters &) const = default;
-};
-
-// One image in the prompt: the run of placeholder tokens it occupies (one per
-// merged 2x2 patch group, row-major over the merged grid), the patch grid of
-// the frontend's resized pixels, and a 128-bit digest of that content.
-// Placeholder token ids are identical for every image, so cache identity keys
-// on the digest as well as the tokens.
-struct ImageSpanFrame {
-  uint32_t offset = 0;
-  uint32_t tokens = 0;
-  uint32_t gridHeight = 0;
-  uint32_t gridWidth = 0;
-  uint64_t digestLo = 0;
-  uint64_t digestHi = 0;
-
-  [[nodiscard]] uint64_t pixelBytes() const noexcept {
-    return ops::imagePixelBytes(gridHeight, gridWidth);
-  }
-  bool operator==(const ImageSpanFrame &) const = default;
-};
+// The request flags word holds the RequestFlag bits and this one, which asks
+// for PromptProgressEvents while the prompt prefills.
+inline constexpr uint32_t kReturnProgressFlag = 1U << 1;
+static_assert(!(kReturnProgressFlag & kRequestFlagBits));
 
 struct RequestFrame {
   uint64_t requestId = 0;
-  RequestPriority priority = RequestPriority::Normal;
+  engine::RequestPriority priority = engine::RequestPriority::Normal;
 
   // absoluteDeadlineUnixMicros is wall-clock UTC. remainingDeadlineMicros
   // is the sender's remaining budget at serialization time.  Admission
@@ -179,21 +162,50 @@ struct RequestFrame {
   // Sorted, non-overlapping image spans and their resized uint8 RGB pixels,
   // concatenated in span order (gridHeight*16 x gridWidth*16 x 3 each).
   // Both are empty for text-only requests.
-  std::vector<ImageSpanFrame> imageSpans;
+  std::vector<ImageSpan> imageSpans;
   std::vector<uint8_t> imagePixels;
+  // The defaults are greedy selection with nothing changing the logits,
+  // which score requests require (seed aside).
   SamplingParameters sampling;
-  uint64_t seed = 0;
-  Cohort cohort = Cohort::Greedy;
   ConstraintMode constraint = ConstraintMode::None;
-  bool returnProgress = false;
   // Empty selects ordinary generation. Nonempty selects score-only mode:
   // 2..255 distinct token ids, logicalMaxOutputTokens must be zero, and the
   // request must be text-only, unconstrained, and greedy.
   std::vector<uint32_t> scoreTokens{};
+  // Trailing prompt tokens of the chat template's generation prompt; zero
+  // when unknown. It must leave at least one prompt token.
+  uint32_t generationPromptTokens = 0;
+  // RequestFlag bits and kReturnProgressFlag.
+  uint32_t flags = 0;
+  // The request's cache_salt as the server hashed it; zero without one.
+  engine::CacheSalt cacheSalt;
+  // Only a request that generates inside a thinking block has one; a score
+  // request never does.
+  std::optional<ThinkingBudget> thinkingBudget;
 
   bool operator==(const RequestFrame &) const = default;
 };
 
+// The other payloads, in wire order; counts precede what they count, and
+// the variable parts come last:
+//   Cancel         u64 requestId
+//   MaskResponse   u64 requestId, u64 maskRequestId, u32 count, u32 words
+//   StatusRequest  u64 correlationId
+//   ReleaseRequest u64 correlationId
+//   Ready          u32 maxConcurrentRequests, u32 maxContextTokens, u8 vision
+//   Start          u64 requestId, u32 lane, u32 matchedPromptTokens
+//   PromptProgress u64 requestId, u32 processedTokens, u64 elapsedMicros
+//   Tokens         u64 requestId, u32 sequenceOffset, u32 count, u32 tokens
+//   MaskRequest    u64 requestId, u64 maskRequestId, u32 wordsPerMask,
+//                  u32 count, u32 simulation tokens
+//   Done           u64 requestId, u8 reason, u32 promptTokens,
+//                  u32 completionTokens, u64 prefillMicros, u64 decodeMicros,
+//                  u64 wallMicros, u32 deduplicatedTokens, u32 draftedTokens,
+//                  u32 acceptedDraftTokens, u32 speculative cycles, u32 count,
+//                  f32 option logits
+//   Error          u8 failureClass, u8 retryable, u64 requestId, u32 code
+//                  bytes, u32 message bytes, the code, the message
+//   StatusJson     u64 correlationId, the JSON
 struct CancelFrame {
   uint64_t requestId = 0;
 
@@ -214,42 +226,31 @@ struct StatusRequestFrame {
   bool operator==(const StatusRequestFrame &) const = default;
 };
 
-enum ReadyFeature : uint64_t {
-  FeatureCancellation = 1ULL << 0,
-  FeatureTokenMasks = 1ULL << 1,
-  FeatureStatusJson = 1ULL << 2,
-  FeatureMultiplexing = 1ULL << 3,
-  // Requests may carry image spans. A model serving without vision leaves it
-  // clear and rejects each image request with a request error.
-  FeatureVision = 1ULL << 4,
+// Asks the engine to give its weights back now, as the idle release does, when
+// it holds no request and restores none, with the idle release on or off. The
+// answer is a StatusJson with the same correlationId, whose `weights` section
+// says whether the weights are released: `released` and not `restoring`.
+struct ReleaseRequestFrame {
+  uint64_t correlationId = 0;
+
+  bool operator==(const ReleaseRequestFrame &) const = default;
 };
 
-// The native runtime implements every other feature; ReadyEvent announces
-// them all, and FeatureVision when the loaded model has vision.
-inline constexpr uint64_t kNativeFeatureBits =
-    FeatureCancellation | FeatureTokenMasks | FeatureStatusJson |
-    FeatureMultiplexing;
-
 struct ReadyEvent {
-  uint64_t engineInstanceId = 0;
   uint32_t maxConcurrentRequests = 0;
   uint32_t maxContextTokens = 0;
-  uint64_t featureBits = 0;
+  // Requests may carry image spans. A model serving without vision rejects
+  // each image request with a request error.
+  bool vision = false;
 
   bool operator==(const ReadyEvent &) const = default;
 };
 
-enum class CacheDisposition : uint8_t {
-  Miss = 0,
-  PrefixHit = 1,
-};
-
 struct StartEvent {
   uint64_t requestId = 0;
-  CacheDisposition cacheDisposition = CacheDisposition::Miss;
-  int32_t slotIndex = -1;
+  uint32_t lane = 0;
+  // The cached prefix the request starts from; zero for a cold start.
   uint32_t matchedPromptTokens = 0;
-  uint32_t capacityTokens = 0;
 
   bool operator==(const StartEvent &) const = default;
 };
@@ -282,15 +283,9 @@ struct MaskRequestEvent {
   bool operator==(const MaskRequestEvent &) const = default;
 };
 
-enum class FinishReason : uint8_t {
-  Stop = 0,
-  Length = 1,
-  Cancelled = 2,
-};
-
 struct DoneEvent {
   uint64_t requestId = 0;
-  FinishReason reason = FinishReason::Length;
+  engine::EngineFinishReason reason = engine::EngineFinishReason::Length;
   uint32_t promptTokens = 0;
   uint32_t completionTokens = 0;
   uint64_t prefillMicros = 0;
@@ -299,6 +294,16 @@ struct DoneEvent {
   // Raw final-prompt-position logits at the request's scoreTokens, in
   // requested order. Empty for generation and for cancelled/failed scoring.
   std::vector<float> optionLogits{};
+  // Tokens whose KV the request read from cached blocks another request
+  // computed, past the cached prefix it started from
+  // (engine::EngineEventSink::completed).
+  uint32_t deduplicatedTokens = 0;
+  // Its speculative decoding; zero without a draft and for scoring.
+  engine::SpeculativeCounts speculation{};
+  // A Length end short of the request's logical maximum, at a bound of the
+  // engine's own: the SSD cache's quota, or memory a lone lane could not
+  // grow past (engine::EngineEventSink::completed).
+  bool bounded = false;
 
   bool operator==(const DoneEvent &) const = default;
 };
@@ -309,35 +314,28 @@ struct ErrorEvent {
   bool retryable = false;
   std::string code;
   std::string message;
+  // For a retryable request error, the seconds after which a retry may
+  // succeed, as when the SSD cache's write budget refills; 0 for at once.
+  uint32_t retryAfterSeconds = 0;
 
   bool operator==(const ErrorEvent &) const = default;
 };
 
-struct CapacityExhaustedEvent {
-  uint64_t requestId = 0;
-  uint32_t requiredKvPages = 0;
-  uint32_t availableKvPages = 0;
-  uint64_t retryAfterMicros = 0;
-
-  bool operator==(const CapacityExhaustedEvent &) const = default;
-};
-
-// JSON is deliberately opaque to the transport.  Its independent schema
-// number is always present, and the frame length carries the exact JSON byte
-// count (including whitespace) without line or C-string assumptions.
+// JSON is deliberately opaque to the transport: the document carries its
+// own schema_version, and the frame length carries the exact JSON byte count
+// (including whitespace) without line or C-string assumptions.
 struct StatusJsonEvent {
   uint64_t correlationId = 0;
-  uint32_t schemaVersion = kStatusSchemaVersion;
   std::string json;
 
   bool operator==(const StatusJsonEvent &) const = default;
 };
 
-using Message =
-    std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
-                 StatusRequestFrame, ReadyEvent, StartEvent,
-                 PromptProgressEvent, TokensEvent, MaskRequestEvent, DoneEvent,
-                 ErrorEvent, CapacityExhaustedEvent, StatusJsonEvent>;
+using ClientMessage = std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
+                                   StatusRequestFrame, ReleaseRequestFrame>;
+using EngineEvent =
+    std::variant<ReadyEvent, StartEvent, PromptProgressEvent, TokensEvent,
+                 MaskRequestEvent, DoneEvent, ErrorEvent, StatusJsonEvent>;
 
 struct Frame {
   FrameType type = FrameType::Request;
@@ -346,12 +344,13 @@ struct Frame {
   bool operator==(const Frame &) const = default;
 };
 
-[[nodiscard]] ProtocolResult<Frame>
-encodeMessage(const Message &message, const ProtocolLimits &limits = {});
-[[nodiscard]] ProtocolResult<Message>
-decodeFrame(const Frame &frame, const ProtocolLimits &limits = {});
+// Takes the frame: a request's image pixels stay in its payload's buffer.
+[[nodiscard]] ProtocolResult<ClientMessage>
+decodeFrame(Frame &&frame, const ProtocolLimits &limits);
+// The whole frame, header included. An event that breaks its rules is the
+// engine's defect: the issue is EngineUnhealthy.
 [[nodiscard]] ProtocolResult<std::vector<uint8_t>>
-serializeMessage(const Message &message, const ProtocolLimits &limits = {});
+serializeEvent(const EngineEvent &event, const ProtocolLimits &limits);
 
 struct ParseStep {
   size_t consumedBytes = 0;
@@ -359,19 +358,17 @@ struct ParseStep {
   std::optional<ProtocolIssue> issue;
 };
 
-// Incremental one-frame-at-a-time parser.  consume() stops as soon as it
-// yields one complete frame, so callers can process arbitrarily long streams
-// without retaining a batch of frames.  finish() must be called at EOF to
-// turn a partial header or payload into a protocol-fatal truncation.
+// Incremental one-frame-at-a-time parser of client frames.  consume() stops
+// as soon as it yields one complete frame, so callers can process arbitrarily
+// long streams without retaining a batch of frames.  An event type is an
+// unknown frame type.  finish() must be called at EOF to turn a partial
+// header or payload into a protocol-fatal truncation.
 class FrameParser {
 public:
-  explicit FrameParser(ProtocolLimits limits = {});
+  explicit FrameParser(ProtocolLimits limits);
 
   [[nodiscard]] ParseStep consume(std::span<const uint8_t> bytes);
   [[nodiscard]] std::optional<ProtocolIssue> finish();
-  [[nodiscard]] bool failed() const noexcept {
-    return terminalIssue_.has_value();
-  }
 
 private:
   [[nodiscard]] std::optional<ProtocolIssue> parseHeader();
@@ -384,7 +381,6 @@ private:
   bool readingPayload_ = false;
   FrameType currentType_ = FrameType::Request;
   uint64_t expectedPayloadBytes_ = 0;
-  size_t payloadBytes_ = 0;
   std::vector<uint8_t> payload_;
   std::optional<ProtocolIssue> terminalIssue_;
 };

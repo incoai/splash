@@ -25,7 +25,9 @@ Apple10 M24 plain and residual projections use the existing eight-SIMD-group
 N128 kernel when there is at most one output tile per GPU core and K >= 4096.
 Other M24 workloads keep four SIMD groups. The conservative boundary excludes
 short dot products and grids that can benefit more from occupancy. This adds
-no kernel, scratch buffer or weight format. Apple9 policy is unchanged.
+no kernel, scratch buffer or weight format. Apple9 policy is unchanged. (The
+affine Q4 kernels measured here have since been removed: every target runs the
+block kernels.)
 
 `attention-sweep` can compare two libraries with alternating order, GPU warmup
 and medians, and can select verify or prefill. Its figures describe one layer's
@@ -127,6 +129,12 @@ measured the following medians of phase medians:
 | 3 | 45.005 | 44.890 | +0.26% |
 | 4 | 50.105 | 49.840 | +0.53% |
 
+Host work between decode commands (graph build, submission, completion,
+scheduling) does not show in GPU timings or in `metrics.decode_wall_ms`, which
+starts at submission. Judge changes to it by `metrics.decode_cycle_ms` of
+`/status`, which the HTTP ABBA decode verdict uses, or by decode-profile's
+wall minus fused GPU time.
+
 The M5 20-core machine has kernel/policy validation and microbenchmarks here;
 this table does not imply an end-to-end serving run on that machine. No new
 comparison against MLX Serve or Ollama was performed.
@@ -156,7 +164,3 @@ comparison against MLX Serve or Ollama was performed.
 
 Long-context attention remains a substantial optimization opportunity. The
 experiments above rule out these implementations, not every possible redesign.
-
-The subsequent [device-policy convergence pass](device-policy.md) preserves
-these defaults, removes superseded policy code and expands bounded offline
-calibration across core counts.

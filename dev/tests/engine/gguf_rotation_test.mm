@@ -3,6 +3,7 @@
 // one bf16 step of the fp64 transform.
 //   gguf-rotation <splash.metallib>
 #include "GgufFormatReference.hpp"
+#include "TestBuffers.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Gguf.h"
@@ -19,6 +20,7 @@ using namespace gguf_reference;
 using splash::metal::CommandGraph;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
+using splash::test::sharedBuffer;
 
 namespace {
 
@@ -58,7 +60,7 @@ void butterflies(double *v) {
 }
 
 template <class T> MetalBuffer upload(MetalBackend &backend, const std::vector<T> &values) {
-  MetalBuffer buffer = backend.allocateBuffer(values.size() * sizeof(T));
+  MetalBuffer buffer = sharedBuffer(backend, values.size() * sizeof(T));
   std::memcpy(buffer.contents(), values.data(), values.size() * sizeof(T));
   return buffer;
 }
@@ -112,11 +114,11 @@ int main(int argc, char **argv) {
             butterflies(d);
             for (uint32_t i = 0; i < kBlock; ++i) f[i] *= 1.0f / 32.0f, d[i] /= 32.0;
           }
-        const MetalBuffer in = upload(backend, input), out = backend.allocateBuffer(input.size() * 2);
+        const MetalBuffer in = upload(backend, input), out = sharedBuffer(backend, input.size() * 2);
         CommandGraph graph;
         graph.add("gguf_rotate", {in, signBuffer, out}, GgufRotationParams{width}, {width / kBlock, rows, 1},
                   {GGUF_ROTATION_THREADS, 1, 1});
-        static_cast<void>(backend.submitCommand(graph.dispatches()));
+        static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
         failures += check("gguf_rotate H (D x)", static_cast<const uint16_t *>(out.contents()), fp32, fp64);
       }
 
@@ -140,12 +142,12 @@ int main(int argc, char **argv) {
           }
         }
         const MetalBuffer tokenBuffer = upload(backend, tokens), rows = upload(backend, table);
-        const MetalBuffer out = backend.allocateBuffer(fp32.size() * 2);
+        const MetalBuffer out = sharedBuffer(backend, fp32.size() * 2);
         CommandGraph graph;
         graph.add("gguf_embed_rotated_pq20", {tokenBuffer, rows, signBuffer, out},
                   GgufEmbedParams{uint32_t(tokens.size()), vocabulary, hidden}, {hidden / kBlock, uint32_t(tokens.size()), 1},
                   {GGUF_ROTATION_THREADS, 1, 1});
-        static_cast<void>(backend.submitCommand(graph.dispatches()));
+        static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
         failures += check("gguf_embed_rotated_pq20 D (H r)", static_cast<const uint16_t *>(out.contents()), fp32, fp64);
       }
     } catch (const std::exception &e) {

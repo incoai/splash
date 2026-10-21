@@ -16,10 +16,42 @@ namespace {
 
 const char *boolean(bool value) noexcept { return value ? "true" : "false"; }
 
-uint64_t saturatingAdd(uint64_t left, uint64_t right) noexcept {
-  return right > std::numeric_limits<uint64_t>::max() - left
-             ? std::numeric_limits<uint64_t>::max()
-             : left + right;
+// The RoPE scaling every key of the cache went through: YaRN's factor, to the
+// digits that read back as it, over its original window; null without YaRN.
+// The rest of the document keeps its own precision.
+void appendRopeScaling(std::ostringstream &out, const model::RopeScaling &rope) {
+  if (!rope.yarn()) {
+    out << "null";
+    return;
+  }
+  const std::streamsize precision = out.precision(std::numeric_limits<double>::max_digits10);
+  out << "{\"type\":\"yarn\",\"factor\":" << rope.factor;
+  out.precision(precision);
+  out << ",\"original_context_tokens\":" << rope.originalContextTokens << '}';
+}
+
+// idle_release_seconds is null with --idle-release off.
+void appendWeights(std::ostringstream &out, const WeightsSnapshot &weights) {
+  out << "{\"idle_release_seconds\":";
+  if (std::isinf(weights.idleReleaseSeconds))
+    out << "null";
+  else
+    out << weights.idleReleaseSeconds;
+  out << ",\"released\":" << boolean(weights.released)
+      << ",\"restoring\":" << boolean(weights.restoring)
+      << ",\"restores\":" << weights.restores
+      << ",\"restore_failures\":" << weights.restoreFailures << '}';
+}
+
+// reruns: the chunks the GPU ran again alone once the split's work for them
+// failed (model::ModelTelemetry::aneFfnReruns).
+void appendAneFfn(std::ostringstream &out, const AneFfnSnapshot &split, uint64_t reruns) {
+  constexpr std::string_view kStates[] = {"off", "split", "stopped"};
+  out << "{\"state\":" << json::quote(kStates[static_cast<size_t>(split.state)])
+      << ",\"share\":" << split.share << ",\"minimum_rows\":" << split.minimumRows
+      << ",\"reason\":" << json::quote(split.reason) << ",\"split_commands\":" << split.commands
+      << ",\"reruns\":" << reruns << ",\"ane_ms\":" << split.aneMilliseconds
+      << ",\"evaluations\":" << split.evaluations << '}';
 }
 
 void appendBatch(std::ostringstream &out,
@@ -34,26 +66,199 @@ void appendBatch(std::ostringstream &out,
       << ",\"tokens_per_second\":" << batch.tokensPerSecond << '}';
 }
 
-} // namespace
-
-std::string MemoryStatusReporter::update(const ResourceWaitSnapshot &wait,
-                                         bool growthAllowed) {
-  const unsigned state = (!growthAllowed ? 1u : 0u) |
-                         (wait.memory ? 2u : 0u) |
-                         (wait.suspended ? 4u : 0u) |
-                         (wait.draining ? 8u : 0u);
-  if (state == state_)
-    return {};
-  state_ = state;
-  if (!state)
-    return "Memory: growth available; resource wait cleared";
-  std::ostringstream out;
-  out << "Memory: growth " << (growthAllowed ? "available" : "paused")
-      << "; waiting=" << wait.memory << "; suspended=" << wait.suspended;
-  if (wait.draining)
-    out << "; waiting for resident requests to finish";
-  return out.str();
+const char *phaseName(engine::Phase phase) noexcept {
+  switch (phase) {
+  case engine::Phase::Queued: return "queued";
+  case engine::Phase::WaitingResources: return "waiting_resources";
+  case engine::Phase::WaitingPrefix: return "waiting_prefix";
+  case engine::Phase::Prefill: return "prefill";
+  case engine::Phase::Decode: return "decode";
+  case engine::Phase::WaitingMask: return "waiting_mask";
+  case engine::Phase::Completed: return "completed";
+  case engine::Phase::Cancelled: return "cancelled";
+  case engine::Phase::Failed: return "failed";
+  }
+  return "unknown";
 }
+
+// The API's names (server REQUEST_PRIORITIES).
+const char *priorityName(engine::RequestPriority priority) noexcept {
+  switch (priority) {
+  case engine::RequestPriority::Foreground: return "foreground";
+  case engine::RequestPriority::Normal: return "normal";
+  case engine::RequestPriority::Background: return "background";
+  }
+  return "unknown";
+}
+
+const char *writesGatedName(DiskWritesGate gate) noexcept {
+  switch (gate) {
+  case DiskWritesGate::No: return "no";
+  case DiskWritesGate::Budget: return "budget";
+  case DiskWritesGate::Closed: return "closed";
+  }
+  return "unknown";
+}
+
+// What the streamed stores count by, in the order of their uses
+// (model::SparseRowUse, and ops::MoePhase for model::ExpertStoreStats::uses).
+constexpr std::string_view kStreamedUses[] = {"prefill", "decode"};
+static_assert(std::size(kStreamedUses) == model::kSparseRowUses);
+
+// A latency histogram (model::LatencyStats) in milliseconds, as ttft_ms is:
+// its quantiles, maximum and total, and its samples.
+void appendLatency(std::ostringstream &out, const model::LatencyStats &latency) {
+  out << "{\"p50\":" << latency.p50Milliseconds << ",\"p95\":" << latency.p95Milliseconds
+      << ",\"p99\":" << latency.p99Milliseconds << ",\"max\":" << latency.maximumMilliseconds
+      << ",\"total\":" << latency.totalMilliseconds << ",\"samples\":" << latency.count << '}';
+}
+
+// A streamed table's store (--ple-memory), or null: its memory, its cache,
+// per use (prefill, decode) its stages, rows and stage latencies, its reads
+// and prefetches, and whether a failure poisoned it.
+void appendStreamedTable(std::ostringstream &out, const std::optional<model::SparseRowStats> &table) {
+  if (!table) {
+    out << "null";
+    return;
+  }
+  out << "{\"table\":" << json::quote(table->table) << ",\"table_bytes\":" << table->tableBytes
+      << ",\"cache_bytes\":" << table->cacheBytes << ",\"cache_capacity_rows\":" << table->cacheCapacityRows
+      << ",\"cached_rows\":" << table->cachedRows << ",\"evictions\":" << table->evictions;
+  for (uint32_t use = 0; use < model::kSparseRowUses; ++use) {
+    const model::SparseRowStats::Use &counters = table->uses[use];
+    out << ",\"" << kStreamedUses[use] << "\":{\"stages\":" << counters.stages
+        << ",\"requested_rows\":" << counters.requestedRows << ",\"unique_rows\":" << counters.uniqueRows
+        << ",\"hit_rows\":" << counters.hitRows << ",\"read_rows\":" << counters.readRows
+        << ",\"hit_rate\":"
+        << (counters.uniqueRows ? double(counters.hitRows) / double(counters.uniqueRows) : 0.0)
+        << ",\"stage_ms\":";
+    appendLatency(out, counters.stage);
+    out << '}';
+  }
+  out << ",\"read_bytes\":" << table->readBytes << ",\"read_retries\":" << table->readRetries
+      << ",\"read_errors\":" << table->readErrors << ",\"read_ms\":";
+  appendLatency(out, table->read);
+  out << ",\"prefetch_requested_rows\":" << table->prefetchRequestedRows
+      << ",\"prefetch_read_rows\":" << table->prefetchReadRows
+      << ",\"prefetch_dropped_rows\":" << table->prefetchDroppedRows
+      << ",\"poisoned\":" << boolean(table->poisoned) << ",\"failure\":" << json::quote(table->failure) << '}';
+}
+
+// Streamed routed experts' store (--expert-memory), or null: its arena,
+// staging and slots, the experts resident in them, per use (prefill,
+// decode) its loads: the distinct
+// experts they routed, those not resident (read) and of them those read
+// ahead (prefetched), the experts read ahead whole, the bytes read from the
+// sources and their host steps' round trips, one per round (pickup, work,
+// resume); and why a load failed, which fails every later load.
+void appendStreamedExperts(std::ostringstream &out, const std::optional<model::ExpertStoreStats> &experts) {
+  if (!experts) {
+    out << "null";
+    return;
+  }
+  out << "{\"arena_bytes\":" << experts->arenaBytes << ",\"staging_bytes\":" << experts->stagingBytes
+      << ",\"slots\":" << experts->slots << ",\"experts\":" << experts->experts
+      << ",\"resident\":" << experts->resident;
+  for (size_t use = 0; use < std::size(kStreamedUses); ++use) {
+    const model::ExpertStoreStats::Use &counters = experts->uses[use];
+    out << ",\"" << kStreamedUses[use] << "\":{\"loads\":" << counters.loads << ",\"routed\":" << counters.routed
+        << ",\"read\":" << counters.read << ",\"prefetched\":" << counters.prefetched
+        << ",\"read_ahead\":" << counters.readAhead << ",\"hit_rate\":"
+        << (counters.routed ? double(counters.routed - counters.read) / double(counters.routed) : 0.0)
+        << ",\"read_bytes\":" << counters.readBytes << ",\"host_steps\":{\"pickup_ms\":";
+    appendLatency(out, counters.pickup);
+    out << ",\"work_ms\":";
+    appendLatency(out, counters.work);
+    out << ",\"resume_ms\":";
+    appendLatency(out, counters.resume);
+    out << "}}";
+  }
+  out << ",\"failure\":" << json::quote(experts->failure) << '}';
+}
+
+// What the resolves of spilled K/V did (model::KvReadStats): the entries of
+// their block lists, those of Full pages, the blocks found cached and those
+// read, as the expert store counts its own (appendStreamedExperts).
+void appendKvReads(std::ostringstream &out, const model::KvReadStats &reads) {
+  out << "\"resolves\":" << reads.resolves << ",\"entries\":" << reads.entries << ",\"paged\":" << reads.paged
+      << ",\"hits\":" << reads.hits << ",\"read\":" << reads.misses << ",\"hit_rate\":"
+      << (reads.hits + reads.misses ? double(reads.hits) / double(reads.hits + reads.misses) : 0.0)
+      << ",\"ghost_hits\":" << reads.ghostHits << ",\"read_bytes\":" << reads.readBytes
+      << ",\"read_failures\":" << reads.readFailures;
+}
+
+// A spill-capable target's KV on the SSD cache (kv_spill): the engine's
+// requests by KV mode, conversions, bounds, ends and refusals, and the starts
+// waiting for the quota; the pages that hold only their index, the pool's
+// pages of that form in use (each a spilled block's, which requests may hold
+// as the cache does), of `indexPageBytes` each, and those spilled; the
+// write-through of Spill requests' pages; the moves between page forms,
+// rewrites and restores; the quota of active KV; the Index runway, the free
+// pages of that form; and the readers' memory and reads, with the commands
+// that streamed a history beside decoders and the decoders' gaps across them.
+// A target that keeps its KV in memory has none: its /status is main's.
+void appendKvSpill(std::ostringstream &out, const KvSpillStatus &spill, uint64_t indexPageBytes,
+                   const engine::EngineSnapshot &core, const ResourceWaitSnapshot &resourceWait) {
+  const KvSpillSnapshot &cache = spill.cache;
+  const engine::SpillRequestsSnapshot &requests = core.spill;
+  const KvPoolFormSnapshot &index = core.resources.pool.index;
+  const uint32_t indexPages = index.pagesAllocated - index.pagesFree;
+  out << "{\"requests\":{\"spill\":" << requests.spill << ",\"resident\":" << requests.resident
+      << ",\"converted\":" << requests.converted << ",\"bounded\":" << requests.bounded
+      << ",\"length_ends\":" << requests.lengthEnds << ",\"refused\":{\"quota\":" << requests.refusedQuota
+      << ",\"write_budget\":" << requests.refusedWriteBudget << ",\"closed\":" << requests.refusedClosed
+      << "},\"waiting_quota\":" << resourceWait.diskQuota << '}'
+      << ",\"pages\":{\"index\":" << indexPages << ",\"index_bytes\":" << indexPages * indexPageBytes
+      << ",\"spilled\":" << cache.spilledPages << ",\"spilled_bytes\":" << cache.spilledBytes << '}'
+      << ",\"write_through\":{\"pages\":" << cache.writeThroughPages << ",\"bytes\":" << cache.writeThroughBytes
+      << ",\"in_flight\":" << cache.writeThroughInFlight << ",\"failures\":" << cache.writeThroughFailures
+      << ",\"paused\":" << boolean(cache.writeThroughPaused) << '}' << ",\"spill_moves\":" << cache.spillMoves
+      << ",\"unspills\":" << cache.unspills << ",\"rewrites\":" << cache.rewrites
+      << ",\"restores\":{\"index_pages\":" << cache.indexRestores << ",\"whole_pages\":" << cache.wholeRestores
+      << ",\"ms\":";
+  appendLatency(out, cache.restore);
+  out << "},\"quota\":{\"active_limit_bytes\":" << cache.activeLimitBytes << ",\"held_bytes\":" << cache.heldBytes
+      << ",\"committed_bytes\":" << cache.committedBytes << ",\"revoked\":" << cache.revokedCommitments << '}'
+      << ",\"index_runway_bytes\":" << index.pagesFree * indexPageBytes << ",\"block_cache\":";
+  if (const std::optional<model::KvBlockCacheStats> &hot = spill.blockCache) {
+    out << "{\"bytes\":" << hot->bytes << ",\"target_bytes\":" << hot->targetBytes
+        << ",\"floor_bytes\":" << hot->floorBytes << ",\"slots_per_layer\":" << hot->slotsPerLayer
+        << ",\"lanes\":" << hot->lanes << ',';
+    appendKvReads(out, hot->reads);
+    out << ",\"resolve_ms\":";
+    appendLatency(out, hot->resolve);
+    out << ",\"read_ms\":";
+    appendLatency(out, hot->read);
+    out << ",\"host_steps\":{\"pickup_ms\":";
+    appendLatency(out, hot->pickup);
+    out << ",\"work_ms\":";
+    appendLatency(out, hot->work);
+    out << ",\"resume_ms\":";
+    appendLatency(out, hot->resume);
+    out << "}}";
+  } else {
+    out << "null";
+  }
+  out << ",\"history_stream\":";
+  if (const std::optional<model::KvHistoryStreamStats> &stream = spill.historyStream) {
+    out << "{\"commands\":" << stream->commands
+        << ",\"contended_commands\":" << core.scheduler.contendedStreamingPrefillBatches
+        << ",\"layers\":" << stream->layers << ",\"pages\":" << stream->pages << ",\"bytes\":" << stream->bytes
+        << ",\"staging_bytes\":" << stream->stagingBytes << ",\"buffers\":" << stream->buffers
+        << ",\"read_ms\":";
+    appendLatency(out, stream->read);
+    out << ",\"wait_ms\":";
+    appendLatency(out, stream->wait);
+    out << ",\"decode_gap_ms\":";
+    appendLatency(out, core.scheduler.decodeGap);
+    out << '}';
+  } else {
+    out << "null";
+  }
+  out << '}';
+}
+
+} // namespace
 
 std::string runtimeStatusJson(
     const EngineMemoryPlan &plan, const engine::EngineSnapshot &core,
@@ -62,39 +267,34 @@ std::string runtimeStatusJson(
     const model::ModelTelemetry &executorTelemetry,
     const engine::RuntimeCacheIdentity &cacheIdentity,
     const MemoryGovernorSnapshot &memoryGovernor, bool metalHealthy,
-    std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait) {
+    std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait,
+    const NativeLoopTiming &loop, const WeightsSnapshot &weights,
+    const AneFfnSnapshot &aneFfn, ThermalState thermalState,
+    const std::optional<model::SparseRowStats> &streamedTable,
+    const std::optional<model::ExpertStoreStats> &streamedExperts, const std::optional<KvSpillStatus> &kvSpill) {
   const auto &resources = core.resources;
   const auto &scheduler = core.scheduler;
   const auto &pool = resources.pool;
   const auto &state = resources.stateCache;
   const auto &lookup = resources.lookup;
-  const uint64_t trackedPhysical = saturatingAdd(
-      metalMemory.allocatedBytes, metalMemory.sparseResidentBytes);
-  const uint64_t currentBytes =
-      std::max(trackedPhysical, metalMemory.deviceCurrentAllocatedBytes);
+  const uint64_t currentBytes = std::max(
+      metalMemory.allocatedBytes, metalMemory.deviceCurrentAllocatedBytes);
   const uint64_t peakBytes = std::max(
-      {currentBytes, metalMemory.peakResidentBytes,
+      {currentBytes, metalMemory.peakAllocatedBytes,
        metalMemory.devicePeakAllocatedBytes});
-  // Warning pressure pauses growth but permits serving; only the governor's
-  // critical verdict makes host pressure a readiness failure.
+  // Warning pressure sheds cache but permits serving; only the governor's
+  // critical verdict makes host pressure a readiness failure. A status exists
+  // only after warmup and the memory audit passed. The thermal state slows
+  // serving but never stops it, so it is reported and readiness ignores it.
   const bool hostSafe = memoryGovernor.pressure != MemoryPressure::Critical;
-  const bool ready = warmup.ready() && memoryAudit.valid && metalHealthy &&
-                     hostSafe && currentBytes <= plan.breakdown().hardBudgetBytes;
+  const bool ready = metalHealthy && hostSafe &&
+                     currentBytes <= plan.breakdown().hardBudgetBytes;
   const double hitRate =
       core.cacheHits + core.coldMisses
           ? double(core.cacheHits) / double(core.cacheHits + core.coldMisses)
           : 0.0;
 
-  std::ostringstream kvIdentity;
-  kvIdentity << "{\"target_model_sha256\":"
-      << json::quote(digestHex(cacheIdentity.kvLayout.modelArtifactSha256))
-      << ",\"format\":" << json::quote(kv::formatName(cacheIdentity.kvLayout.format()))
-      << ",\"quantization\":" << json::quote(
-          cacheIdentity.kvLayout.format() == kv::Format::Int8 ? "symmetric_int8" : "none")
-      << ",\"scale_type\":" << json::quote(
-          cacheIdentity.kvLayout.format() == kv::Format::Int8 ? "float32" : "none")
-      << ",\"key_layout\":\"token_major\""
-      << ",\"value_layout\":\"dimension_major\"}";
+  const kv::Format kvFormat = cacheIdentity.kvLayout.format;
 
   std::ostringstream out;
   out << std::setprecision(10) << '{' << "\"schema_version\":" << protocol::kStatusSchemaVersion << ','
@@ -102,37 +302,42 @@ std::string runtimeStatusJson(
       << ",\"maximum_context_tokens\":" << core.maximumContextTokens
       << ",\"memory_pressure\":"
       << json::quote(memoryPressureName(memoryGovernor.pressure))
+      << ",\"thermal_state\":" << json::quote(thermalStateName(thermalState))
       << ",\"admission\":{\"waiting\":"
       << resourceWait.memory + resourceWait.concurrency
       << ",\"waiting_memory\":" << resourceWait.memory
       << ",\"waiting_concurrency\":" << resourceWait.concurrency
+      << ",\"held_behind_refusal\":" << resourceWait.heldBehindRefusal
+      << ",\"restoring\":" << resourceWait.restoring
       << ",\"suspended\":" << resourceWait.suspended
       << ",\"draining\":" << boolean(resourceWait.draining)
       << ",\"oldest_wait_ms\":" << resourceWait.oldestWaitMilliseconds << "}"
+      << ",\"loop\":{\"max_tick_ms\":" << loop.maxTickMilliseconds << "}"
       << ",\"identity\":{\"cache\":{"
       << "\"loaded_model_layout_sha256\":"
       << json::quote(cacheIdentity.modelLayoutSha256)
-      << ",\"runtime_cache_namespace\":"
-      << json::quote(cacheIdentity.namespaceSha256)
       << ",\"build_id\":" << json::quote(cacheIdentity.buildId)
-      << ",\"dtype\":" << json::quote(kv::storageFormatName(cacheIdentity.kvLayout.format()))
-      << ",\"block_tokens\":" << kv::kPageTokens
-      << "},\"kv\":" << kvIdentity.str();
-  // Additive status evolution: retain the previous INT8 identity field.
-  if (cacheIdentity.kvLayout.format() == kv::Format::Int8)
-    out << ",\"q8\":" << kvIdentity.str();
-  out << "},"
+      << ",\"dtype\":"
+      << json::quote(kv::storageFormatName(kvFormat, cacheIdentity.kvLayout.valuesTokenMajor))
+      << ",\"block_tokens\":" << kv::kPageTokens << ",\"rope_scaling\":";
+  appendRopeScaling(out, cacheIdentity.ropeScaling);
+  out << "},\"kv\":{\"target_model_sha256\":"
+      << json::quote(cacheIdentity.targetModelSha256)
+      << ",\"format\":" << json::quote(kv::formatName(kvFormat))
+      << ",\"quantization\":"
+      << json::quote(kvFormat == kv::Format::Int8 ? "symmetric_int8" : "none")
+      << ",\"scale_type\":" << json::quote(kvFormat == kv::Format::Int8 ? "float32" : "none")
+      << ",\"key_layout\":\"token_major\""
+      << ",\"value_layout\":"
+      << json::quote(cacheIdentity.kvLayout.valuesTokenMajor ? "token_major" : "dimension_major") << "}},"
       << "\"memory_plan\":" << plan.toStatusJson()
-      << ",\"memory_actual\":{\"dense_bytes\":" << metalMemory.allocatedBytes
-      << ",\"sparse_virtual_bytes\":" << metalMemory.sparseVirtualBytes
-      << ",\"sparse_resident_bytes\":" << metalMemory.sparseResidentBytes
+      << ",\"memory_actual\":{\"allocated_bytes\":" << metalMemory.allocatedBytes
       << ",\"current_bytes\":" << currentBytes
       << ",\"peak_bytes\":" << peakBytes << "}"
       << ",\"memory_governor\":{\"limit_bytes\":" << memoryGovernor.limitBytes
-      << ",\"observed_resident_bytes\":" << memoryGovernor.observedResidentBytes
-      << ",\"reserved_bytes\":" << memoryGovernor.reservedBytes
+      << ",\"charged_bytes\":" << memoryGovernor.chargedBytes
       << ",\"headroom_bytes\":" << memoryGovernor.headroomBytes
-      << ",\"growth_allowed\":" << boolean(memoryGovernor.growthAllowed)
+      << ",\"growth_allowed\":" << boolean(memoryGovernor.hostGrowthAllowed)
       << ",\"denied_reservations\":" << memoryGovernor.deniedReservations
       << ",\"system_pressure\":"
       << json::quote(memoryPressureName(memoryGovernor.systemPressure))
@@ -140,46 +345,52 @@ std::string runtimeStatusJson(
       << boolean(memoryGovernor.hostMeasurementValid)
       << ",\"host_available_bytes\":" << memoryGovernor.hostAvailableBytes
       << ",\"host_reserve_bytes\":" << memoryGovernor.hostReserveBytes
+      << ",\"host_spare_bytes\":" << memoryGovernor.hostSpareBytes
+      << ",\"host_spare_reserve_bytes\":" << memoryGovernor.hostSpareReserveBytes
       << ",\"host_headroom_bytes\":" << memoryGovernor.hostHeadroomBytes << "}"
       << ",\"memory_audit\":" << memoryAudit.toStatusJson()
-      << ",\"kv\":{\"block_tokens\":" << kv::kPageTokens
-      << ",\"blocks\":" << resources.kvCache.blocks
-      << ",\"cache_bytes\":" << resources.kvCache.bytes
-      << ",\"pages_total\":" << pool.pagesTotal
+      << ",\"weights\":";
+  appendWeights(out, weights);
+  out << ",\"streamed_table\":";
+  appendStreamedTable(out, streamedTable);
+  out << ",\"streamed_experts\":";
+  appendStreamedExperts(out, streamedExperts);
+  if (kvSpill) {
+    out << ",\"kv_spill\":";
+    appendKvSpill(out, *kvSpill, plan.breakdown().kvIndexPageBytes, core, resourceWait);
+  }
+  out << ",\"ane_ffn\":";
+  appendAneFfn(out, aneFfn, executorTelemetry.aneFfnReruns);
+  out << ",\"kv\":{\"block_tokens\":" << kv::kPageTokens
+      << ",\"pages_allocated\":" << pool.pagesAllocated
       << ",\"pages_active\":" << pool.pagesActive
       << ",\"pages_cache\":" << pool.pagesPrefix
       << ",\"pages_free\":" << pool.pagesFree
-      << ",\"pages_free_resident\":" << pool.pagesFreeResident
-      << ",\"pages_resident\":" << pool.pagesResident
-      << ",\"resident_backing_bytes\":" << pool.residentBackingBytes
-      << ",\"reclaimable_backing_bytes\":" << pool.reclaimableBackingBytes
-      << ",\"sparse_tile_bytes\":" << metalMemory.sparseTileBytes
-      << ",\"pending_unmaps\":" << metalMemory.pendingSparseUnmaps
-      << ",\"pending_unmap_ms\":"
-      << metalMemory.pendingSparseUnmapSeconds * 1000.0
-      << ",\"unmaps_completed\":" << metalMemory.completedSparseUnmaps
-      << ",\"unmap_last_ms\":" << metalMemory.lastSparseUnmapSeconds * 1000.0
-      << ",\"unmap_max_ms\":" << metalMemory.maxSparseUnmapSeconds * 1000.0
-      << ",\"map_wait_event\":" << metalMemory.sparseMapWaitEvent
-      << ",\"pending_map_wait_ms\":" << metalMemory.pendingSparseMapWaitSeconds * 1000.0
-      << ",\"map_wait_last_ms\":" << metalMemory.lastSparseMapWaitSeconds * 1000.0
-      << ",\"map_wait_max_ms\":" << metalMemory.maxSparseMapWaitSeconds * 1000.0
+      << ",\"allocated_bytes\":" << pool.allocatedBytes
+      << ",\"reclaimable_bytes\":" << pool.reclaimableBytes
+      << ",\"extent_allocations\":" << pool.extentAllocations
+      << ",\"extent_releases\":" << pool.extentReleases
+      << ",\"extent_allocate_max_ms\":" << pool.extentAllocateMaxMilliseconds
+      << ",\"extent_release_max_ms\":" << pool.extentReleaseMaxMilliseconds
+      << ",\"extent_compactions\":" << pool.extentCompactions
+      << ",\"pages_moved\":" << pool.pagesMoved
+      << ",\"extent_compact_max_ms\":" << resources.extentCompactMaxMilliseconds
       << "}"
       << ",\"state\":{\"entries\":" << state.entries
-      << ",\"pinned\":" << state.pinned << ",\"bytes\":" << state.bytes
-      << ",\"resident_bytes\":" << executorTelemetry.stateResidentBytes
-      << ",\"active_cells\":" << resources.activeRequests
-      << ",\"warm_idle_cells\":" << executorTelemetry.warmIdleStateCells
-      << ",\"cell_ceiling\":" << model::ExecutionLimits::maximumBatchWidth
-      << ",\"hits\":" << state.hits << ",\"misses\":" << state.misses
+      << ",\"pinned\":" << state.pinned << ",\"in_use\":" << state.inUse
+      << ",\"in_use_evictions\":" << state.inUseEvictions << ",\"bytes\":" << state.bytes
+      << ",\"allocated_bytes\":" << executorTelemetry.stateAllocatedBytes
+      << ",\"active_lanes\":" << resources.activeRequests
+      << ",\"idle_gdn_cells\":" << executorTelemetry.idleGdnCells
+      << ",\"idle_draft_rings\":" << executorTelemetry.idleDraftRings
+      << ",\"idle_context_windows\":" << executorTelemetry.idleContextWindows
       << ",\"publications\":" << state.publications
-      << ",\"deduplicated_publications\":" << state.deduplicatedPublications
       << ",\"evictions\":" << state.evictions
       << ",\"checkpoint_entries\":" << state.checkpointEntries
       << ",\"checkpoint_bytes\":" << state.checkpointBytes
       << ",\"checkpoint_evictions\":" << state.checkpointEvictions
       << ",\"checkpoint_retirements\":" << state.checkpointRetirements
-      << ",\"disk_hits\":" << state.diskHits
+      << ",\"disk_hits\":" << lookup.stateDiskHits
       << ",\"disk_promotions\":" << state.promotions
       << ",\"disk_promotions_skipped\":" << state.promotionsSkipped
       << ",\"disk_bytes\":" << state.diskBytes
@@ -188,7 +399,13 @@ std::string runtimeStatusJson(
       << ",\"invalidations\":" << state.invalidations
       << "}"
       << ",\"disk\":{\"capacity_bytes\":" << resources.kvTier.capacityBytes
+      << ",\"limit_bytes\":" << resources.kvTier.limitBytes
       << ",\"used_bytes\":" << resources.kvTier.usedBytes
+      << ",\"file_bytes\":" << resources.kvTier.fileBytes
+      << ",\"volume_available_bytes\":" << resources.kvTier.volumeAvailableBytes
+      << ",\"writes_gated\":" << json::quote(writesGatedName(resources.kvTier.writesGated))
+      << ",\"write_budget_bytes\":" << resources.kvTier.writeBudgetBytes
+      << ",\"writes_deferred_ms\":" << resources.kvTier.writesDeferredMicroseconds / 1000.0
       << ",\"read_bytes\":" << resources.kvTier.readBytes
       << ",\"written_bytes\":" << resources.kvTier.writtenBytes
       << ",\"kv_blocks\":" << resources.kvTier.diskBlocks
@@ -199,21 +416,34 @@ std::string runtimeStatusJson(
       << ",\"kv_restores\":" << resources.kvTier.restores
       << ",\"kv_restore_failures\":" << resources.kvTier.restoreFailures
       << ",\"kv_pending_pages\":" << resources.kvTier.pendingPages
+      << ",\"persistent\":" << boolean(resources.persistent)
+      << ",\"kv_copies\":" << resources.kvTier.copies
+      << ",\"kv_copy_failures\":" << resources.kvTier.copyFailures
+      << ",\"taken_back\":{\"states\":" << resources.adoption.states
+      << ",\"kv_blocks\":" << resources.adoption.blocks
+      << ",\"bytes\":" << resources.adoption.bytes
+      << ",\"left_behind\":" << resources.adoption.dropped << "}"
+      << ",\"write_behind\":{\"waiting\":" << core.writeBehind.waiting
+      << ",\"durable\":" << core.writeBehind.durable
+      << ",\"unneeded\":" << core.writeBehind.unneeded
+      << ",\"refused\":" << core.writeBehind.refused << "}"
       << "}"
-      << ",\"cache\":{\"lookups\":" << lookup.lookups
+      << ",\"cache\":{\"probe_hashed_blocks\":" << lookup.probeHashedBlocks
       << ",\"hits\":" << core.cacheHits
       << ",\"cold_misses\":" << core.coldMisses << ",\"hit_rate\":" << hitRate
       << ",\"kv_hit_tokens\":" << lookup.kvHitTokens
       << ",\"kv_disk_hit_tokens\":" << resources.kvTier.restores * kv::kPageTokens
-      << ",\"state_hit_tokens\":" << lookup.stateHitTokens
       << ",\"lost_state_misses\":" << lookup.lostStateMisses
       << ",\"reused_tokens\":" << core.reusedTokens
+      << ",\"deduplicated_kv_tokens\":" << core.deduplicatedKvTokens
       << ",\"replay_state_publications\":" << core.replayStatePublications
       << ",\"deduplicated_state_publications\":"
       << core.deduplicatedStatePublications
       << ",\"recycled_state_publications\":"
       << core.recycledStatePublications
       << ",\"disk_state_publications\":" << core.diskStatePublications
+      << ",\"state_captures\":" << core.stateCaptures
+      << ",\"capture_cuts\":" << core.captureCuts
       << ",\"replay_state_publication_failures\":"
       << core.replayStatePublicationFailures
       << ",\"lazy_junctions\":" << lookup.lazyJunctions
@@ -224,6 +454,7 @@ std::string runtimeStatusJson(
       << ",\"checkpoint_publication_failures\":"
       << core.checkpointPublicationFailures
       << ",\"resource_suspensions\":" << core.resourceSuspensions
+      << ",\"priority_suspensions\":" << core.prioritySuspensions
       << ",\"resource_resumptions\":" << core.resourceResumptions
       << ",\"resource_replay_tokens\":" << core.resourceReplayTokens << "}"
       << ",\"draft_context\":{\"target_prefill_rows\":"
@@ -234,6 +465,10 @@ std::string runtimeStatusJson(
       << ",\"avoided_rows\":" << executorTelemetry.draftContextRowsAvoided
       << ",\"restore_skipped\":" << executorTelemetry.draftStateRestoreSkipped
       << ",\"resets\":" << executorTelemetry.draftStateResets << "}"
+      // The rows decode cycles verify (--verify-rows): auto where the verify
+      // budget chooses them, all where they are every row up to each lane's
+      // retention limit.
+      << ",\"verify_rows\":" << json::quote(executorTelemetry.verifyBudget ? "auto" : "all")
       // Model-lifetime timings include warmup; request metrics do not.
       << ",\"model_timing\":{\"scope\":\"model_lifetime\""
       << ",\"prefill\":{\"last_gpu_ms\":"
@@ -261,6 +496,11 @@ std::string runtimeStatusJson(
       << executorTelemetry.totalConstrainedMaskWaitSeconds * 1000.0 << "}"
       << ",\"images\":{\"encodes\":" << executorTelemetry.imageEncodes
       << ",\"embedding_reuses\":" << executorTelemetry.imageEmbeddingReuses
+      << ",\"embedding_evictions\":" << executorTelemetry.imageEmbeddingEvictions
+      << ",\"arena_bytes\":" << executorTelemetry.visionArenaBytes
+      << ",\"cached_bytes\":" << executorTelemetry.embeddingCacheBytes
+      << ",\"state_held_bytes\":" << executorTelemetry.stateHeldImageBytes
+      << ",\"rows_bytes\":" << executorTelemetry.imageRowsBytes
       << "}"
       << ",\"scheduler\":{\"queued\":" << scheduler.queued
       << ",\"waiting_resources\":" << scheduler.waitingResources
@@ -276,9 +516,23 @@ std::string runtimeStatusJson(
       << scheduler.decodeBatchesByWidth[0]
       << ",\"b2\":" << scheduler.decodeBatchesByWidth[1]
       << ",\"b3\":" << scheduler.decodeBatchesByWidth[2]
-      << ",\"b4\":" << scheduler.decodeBatchesByWidth[3] << "}"
-      << ",\"decode_mixed_greedy_sampling_batches\":"
-      << scheduler.decodeMixedGreedySamplingBatches << "}"
+      << ",\"b4\":" << scheduler.decodeBatchesByWidth[3] << "}}";
+  out << ",\"active_requests\":[";
+  for (size_t index = 0; index < core.activeRequests.size(); ++index) {
+    const engine::ActiveRequestSnapshot &request = core.activeRequests[index];
+    out << (index ? "," : "") << "{\"id\":" << request.id
+        << ",\"phase\":\"" << phaseName(request.phase)
+        << "\",\"priority\":\"" << priorityName(request.priority)
+        << "\",\"prompt_tokens\":" << request.promptTokens
+        << ",\"prompt_processed\":" << request.promptProcessed
+        << ",\"generated_tokens\":" << request.generatedTokens
+        << ",\"max_new_tokens\":" << request.maxNewTokens;
+    // Where a target's KV may spill, where each request's is kept.
+    if (kvSpill)
+      out << ",\"kv_mode\":" << (request.kvMode == engine::KvMode::Spill ? "\"spill\"" : "\"resident\"");
+    out << ",\"age_ms\":" << request.ageMilliseconds << '}';
+  }
+  out << "]"
       << ",\"requests\":{\"submitted\":" << core.submitted
       << ",\"completed\":" << core.completed
       << ",\"cancelled\":" << core.cancelled << ",\"failed\":" << core.failed
@@ -294,6 +548,7 @@ std::string runtimeStatusJson(
       << ",\"prefill_tokens_per_second\":" << metrics.prefillTokensPerSecond
       << ",\"decode_output_tokens\":" << metrics.decodeOutputTokens
       << ",\"decode_wall_ms\":" << metrics.decodeWallMilliseconds
+      << ",\"decode_cycle_ms\":" << metrics.decodeCycleMilliseconds
       << ",\"decode_tokens_per_second\":" << metrics.decodeTokensPerSecond
       << ",\"drafted_tokens\":" << metrics.draftedTokens
       << ",\"accepted_draft_tokens\":" << metrics.acceptedDraftTokens
@@ -312,7 +567,6 @@ std::string runtimeStatusJson(
       {"decode_b2", warmup.decodeBatches[1]},
       {"decode_b3", warmup.decodeBatches[2]},
       {"decode_b4", warmup.decodeBatches[3]},
-      {"draft_verify_commit", warmup.draftVerifyCommit},
       {"composite_state_restore", warmup.compositeStateRestore},
   };
   out << "},\"warmup\":{";
@@ -330,11 +584,7 @@ std::string runtimeStatusJson(
     out << json::quote(name);
     separator = true;
   }
-  out << "],\"memory_budget_validated\":"
-      << boolean(warmup.memoryBudgetValidated)
-      << ",\"actual_peak_bytes\":" << warmup.actualPeakBytes
-      << ",\"detail\":" << json::quote(warmup.maximumPrefillDetail)
-      << ",\"error\":" << json::quote(warmup.error) << "}"
+  out << "],\"detail\":" << json::quote(warmup.maximumPrefillDetail) << "}"
       << ",\"metal\":{\"healthy\":" << boolean(metalHealthy)
       << ",\"failure_reason\":" << json::quote(metalFailureReason) << "}}";
   return out.str();

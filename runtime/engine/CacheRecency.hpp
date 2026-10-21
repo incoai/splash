@@ -13,6 +13,12 @@ public:
       ++value_;
     return value_;
   }
+  // Continues after a value an earlier process handed out, for what a
+  // persistent tier takes back.
+  void continueAfter(uint64_t value) noexcept {
+    if (value > value_)
+      value_ = value;
+  }
 
 private:
   uint64_t value_ = 0;

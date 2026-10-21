@@ -151,11 +151,14 @@ case ":$PATH:" in
     *":$dir:"*) ;;
     *) echo "Add it to your PATH first:  export PATH=\"$dir:\$PATH\"" ;;
 esac
-echo "  splash serve --model incoai/Qwen3.6-35B-A3B-Splash"
+echo "  splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M"
 echo "  splash claude|opencode|codex|hermes|pi   connect a coding agent to it"
 if [ -f "$APP/current/install/completions/splash.bash" ] && [ -f "$APP/current/install/completions/_splash" ]; then
     echo "  Optional shell completion (Zsh needs compinit initialized):"
     echo '    Bash: source "$HOME/Library/Application Support/Splash/app/current/install/completions/splash.bash"'
     echo '    Zsh:  source "$HOME/Library/Application Support/Splash/app/current/install/completions/_splash"'
+    if [ -f "$APP/current/install/completions/splash.fish" ]; then
+        echo '    Fish: source "$HOME/Library/Application Support/Splash/app/current/install/completions/splash.fish"'
+    fi
 fi
 echo "  Upgrade: run this installer again.  Uninstall: rm -rf \"$APP\" \"$wrapper\""

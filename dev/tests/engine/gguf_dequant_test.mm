@@ -2,6 +2,7 @@
 // gguf_dequant_test.metal expose before the matmul): every weight of every format is the half rounding of its
 // GGML fp32 value, the CPU reference that gguf-reference pins to llama.cpp's golden hashes.
 #include "GgufFormatReference.hpp"
+#include "TestBuffers.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/Gguf.h"
@@ -17,11 +18,12 @@ using namespace gguf_reference;
 using splash::metal::CommandGraph;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
+using splash::test::sharedBuffer;
 
 namespace {
 
 MetalBuffer upload(MetalBackend &backend, const std::vector<uint8_t> &bytes) {
-  MetalBuffer buffer = backend.allocateBuffer(bytes.size());
+  MetalBuffer buffer = sharedBuffer(backend, bytes.size());
   std::memcpy(buffer.contents(), bytes.data(), bytes.size());
   return buffer;
 }
@@ -46,11 +48,11 @@ int main(int argc, char **argv) {
         const Packed planes = repack(f, makeNative(f, N, K, rng), N, K, &values);
         const MetalBuffer w0 = upload(backend, planes.w0), meta = upload(backend, planes.meta);
         const MetalBuffer w1 = kQuantFormats[f].plane1_bytes ? upload(backend, planes.w1) : meta;
-        const MetalBuffer output = backend.allocateBuffer(uint64_t{N} * K * 2);
+        const MetalBuffer output = sharedBuffer(backend, uint64_t{N} * K * 2);
         CommandGraph graph;
-        graph.add(std::string("gguf_test_dequant_") + fmtName(f), {w0, w1, meta, output}, GgufDecodeParams{K, 1, N, 0},
+        graph.add(std::string("gguf_test_dequant_") + fmtName(f), {w0, w1, meta, output}, GgufDecodeParams{K, 1, N, 0, 0},
                   {N * (K / kGroup) / kThreads, 1, 1}, {kThreads, 1, 1});
-        static_cast<void>(backend.submitCommand(graph.dispatches()));
+        static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
         const auto *got = static_cast<const uint16_t *>(output.contents());
         size_t differ = 0;
         for (size_t i = 0; i < values.size(); ++i) differ += got[i] != f2h(values[i]);

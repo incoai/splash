@@ -11,25 +11,24 @@ namespace splash::engine {
 
 // Members in last-used order. A member allocates its tree node once, when it
 // is published, and keeps it while unlinked, so linking and unlinking under
-// memory pressure never allocate.
+// memory pressure never allocate. Unlinking an unlinked member does nothing.
 class RecencyOrder final {
 public:
   class Node final {
-  public:
-    [[nodiscard]] bool linked() const noexcept { return owner_ != nullptr; }
-
   private:
     friend class RecencyOrder;
+    [[nodiscard]] bool linked() const noexcept { return owner_ != nullptr; }
+
     std::set<std::pair<uint64_t, uint64_t>>::node_type handle_;
     std::pair<uint64_t, uint64_t> key_{};
     RecencyOrder *owner_ = nullptr;
   };
 
-  // The only operation that allocates.
-  [[nodiscard]] static Node allocate(uint64_t id) {
+  // The only operation that allocates; link() sets the key.
+  [[nodiscard]] static Node allocate() {
     std::set<std::pair<uint64_t, uint64_t>> scratch;
     Node node;
-    node.handle_ = scratch.extract(scratch.emplace(0, id).first);
+    node.handle_ = scratch.extract(scratch.emplace(0, 0).first);
     return node;
   }
 
@@ -45,7 +44,7 @@ public:
 
   static void unlink(Node &node) noexcept {
     if (!node.linked())
-      std::terminate();
+      return;
     node.handle_ = node.owner_->order_.extract(node.key_);
     if (node.handle_.empty())
       std::terminate();
@@ -67,9 +66,13 @@ public:
     return CacheEvictionCandidate{position->second, position->first};
   }
 
-  [[nodiscard]] uint64_t newestId() const noexcept {
-    return order_.empty() ? 0 : order_.rbegin()->second;
+  [[nodiscard]] std::optional<CacheEvictionCandidate> newest() const noexcept {
+    if (order_.empty())
+      return std::nullopt;
+    return CacheEvictionCandidate{order_.rbegin()->second, order_.rbegin()->first};
   }
+
+  [[nodiscard]] size_t size() const noexcept { return order_.size(); }
 
 private:
   std::set<std::pair<uint64_t, uint64_t>> order_;

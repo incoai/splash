@@ -1,3 +1,7 @@
+#include "TestChecks.hpp"
+#include "TestDrafts.hpp"
+#include "TestModel.hpp"
+#include "model/ModelDescriptor.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/QwenTargetLoader.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -6,35 +10,44 @@
 
 #include <algorithm>
 #include <array>
+#include <initializer_list>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
+#include <vector>
 
 namespace {
 
 using namespace splash;
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
+using splash::test::rejects;
+using splash::test::require;
+
+template <class Weights>
+model::DFlashDraftLayout draftOf() {
+  if constexpr (std::is_same_v<Weights, model::Qwen3_6MoeWeights>)
+    return test::qwen3_6MoeDraft();
+  else if constexpr (std::is_same_v<Weights, model::Qwen4ExpWeights>)
+    return test::flashNextDraft();
+  else
+    return test::qwen3_8Draft();
 }
 
 template <class Weights>
-model::ModelPackage package() {
-  model::ModelPackage result;
+model::LoadedModel loadedModel() {
+  model::LoadedModel result;
   Weights target;
-  model::DFlashDraftLayout draft;
-  if constexpr (std::is_same_v<Weights, model::Qwen3_6MoeWeights>) {
-    draft.layers = 6;
-    draft.hiddenSize = 2048;
-    draft.dynamicSize = 512;
-    draft.intermediateSize = 6144;
-    draft.targetHiddenSize = target.layout.capturedHiddenSize();
-  }
+  const model::DFlashDraftLayout draft = draftOf<Weights>();
   const auto projection = [](uint32_t n, uint32_t k) {
-    return ops::Projection(n, k, ops::AffineWeights{});
+    return ops::Projection(n, k, ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_Q4K, n, k, {}, {}, {})}});
   };
   const auto &layout = target.layout;
+  // Qwen3.8-Flash-Next's hyper-connection mixes, QSA indexers and PLE layer.
+  const auto hyper = [&] {
+    return model::Qwen4HyperWeights{.norm = {}, .down = projection(layout.hyperRank, layout.streamWidth()),
+                                    .up = projection(layout.streamWidth(), layout.hyperRank), .inject = {}};
+  };
   target.logitsProjection = projection(layout.vocabularySize, layout.hiddenSize);
   target.layers.resize(layout.layers);
   for (uint32_t i = 0; i < layout.layers; ++i) {
@@ -55,109 +68,62 @@ model::ModelPackage package() {
       layer.upProjection = layer.gateProjection;
       layer.downProjection = projection(layout.hiddenSize, layout.intermediateSize);
     }
+    if constexpr (std::is_same_v<Weights, model::Qwen4ExpWeights>) {
+      layer.mixerHyper = hyper();
+      layer.ffnHyper = hyper();
+      if (layout.isFullAttentionLayer(i))
+        layer.indexer = model::Qwen4IndexerWeights{
+            .query = projection(layout.indexerHeads * layout.indexerHeadDimension, layout.hiddenSize),
+            .key = projection(layout.indexerHeadDimension, layout.hiddenSize), .queryNorm = {}, .keyNorm = {}};
+      if (i == layout.pleLayer)
+        layer.ple = model::Qwen4PleWeights{.key = projection(layout.hiddenSize, layout.pleWidth()),
+                                           .value = projection(layout.hiddenSize, layout.pleWidth()),
+                                           .keyNorm = {}, .queryNorm = {}, .convolutionNorm = {},
+                                           .convolution = {}};
+    }
   }
+  if constexpr (std::is_same_v<Weights, model::Qwen4ExpWeights>)
+    target.finalHyper = hyper();
   ops::VisionLayout vision;
   vision.outputHiddenSize = target.layout.hiddenSize;
   result.descriptor = model::makeModelDescriptor(
-      "operator workspace test", target.layout, draft, vision);
+      "operator workspace test", target.layout, draft, vision,
+      model::TargetSource::Safetensors, model::VisionSource::Safetensors);
   result.target = std::move(target);
   result.draft.layout = draft;
   return result;
 }
 
-void checkPackage(const model::ModelPackage &package, uint32_t family) {
-  DeviceCapabilities device;
-  device.appleGpuFamily = family;
-  ops::ExecutionPlans baseline(device);
-  const auto before = model::plannedRuntimeMemory(device, package, baseline);
-  const auto geometry = std::visit([](const auto &weights) {
-    return model::qwenTargetGeometry(weights);
-  }, package.target);
-  const ops::AttentionShape attention{geometry.attentionQueryHeads,
-                                      geometry.attentionKvHeads,
-                                      geometry.attentionHeadDimension};
-  ops::OperatorChoices choices;
-  choices.prefillAttention.push_back(
-      {{attention}, {ops::PrefillSplitMultiplier::Two}});
-  choices.draftAttention.push_back(
-      {{package.draft.layout.attentionShape(), 3}, {80}});
-  if (geometry.ffnKind == model::QwenFfnKind::SparseMoe)
-    choices.moe.push_back({{geometry.moeShape(), 24, ops::MoePhase::Decode},
-                           {ops::MoeExpertTile::M32}});
-  ops::ExecutionPlans selected(device);
-  selected.install(choices);
-  const auto after = model::plannedRuntimeMemory(device, package, selected);
-  const auto prefillBefore = baseline.prefillAttentionWorkspace(
-      2048, attention.queryHeads, geometry.kvLayout);
-  const auto prefillAfter = selected.prefillAttentionWorkspace(
-      2048, attention.queryHeads, geometry.kvLayout);
-  const uint64_t prefillGrowth =
-      model::alignArena(prefillAfter.partialsBytes) - model::alignArena(prefillBefore.partialsBytes) +
-      model::alignArena(prefillAfter.statisticsBytes) - model::alignArena(prefillBefore.statisticsBytes);
-  // The selected split count and the fallback baseline share an arena whose
-  // governed bound includes the larger candidate's exact scratch requirement.
-  require(prefillGrowth > 0 &&
-              after.sharedPrefillPlannedAllocatedBytes ==
-                  before.sharedPrefillPlannedAllocatedBytes + prefillGrowth,
-          "runtime prefill allocation lost the selected split workspace bound");
-  const auto selectedPrefill = selected.prefillAttention(
-      2048, attention.queryHeads, geometry.kvLayout, 131072);
-  require(selectedPrefill.configuration.splitMultiplier == ops::PrefillSplitMultiplier::Two &&
-              selectedPrefill.workspace.partialsBytes ==
-                  2 * baseline.prefillAttention(2048, attention.queryHeads,
-                                             geometry.kvLayout, 131072)
-                      .workspace.partialsBytes,
-          "runtime did not install the selected prefill split plan");
-
-  uint64_t decodeGrowth = 0;
-  if (geometry.ffnKind == model::QwenFfnKind::SparseMoe) {
-    const auto oldMoe = baseline.moeDecodeWorkspacePerLane(geometry.moeShape());
-    const auto newMoe = selected.moeDecodeWorkspacePerLane(geometry.moeShape());
-    for (const ops::MoeScratchField &field : ops::kMoeScratchFields)
-      decodeGrowth += model::alignArena(model::kLaneCount * (newMoe.*field.bytes)) -
-                      model::alignArena(model::kLaneCount * (oldMoe.*field.bytes));
-    require(decodeGrowth > 0, "M24 expert plan did not reserve larger scratch");
-  }
-  require(after.sharedDecodePlannedAllocatedBytes ==
-              before.sharedDecodePlannedAllocatedBytes + decodeGrowth,
-          "runtime decode allocation does not use all selected width bounds");
-  require(after.activeStateCellPlannedAllocatedBytes ==
-              before.activeStateCellPlannedAllocatedBytes &&
-              after.pipelineReserveBytes == before.pipelineReserveBytes &&
-              after.runtimeOverheadReserveBytes == before.runtimeOverheadReserveBytes,
-          "kernel selection changed state or unrelated memory reserves");
-  require(selected.draftAttention(package.draft.layout.attentionShape(), 3)
-                  .configuration().groups == 80,
-          "paired draft did not use the same selection owner");
-  selected.install({});
-  const auto reset = model::plannedRuntimeMemory(device, package, selected);
-  require(reset.sharedPrefillPlannedAllocatedBytes ==
-              before.sharedPrefillPlannedAllocatedBytes &&
-              reset.sharedDecodePlannedAllocatedBytes ==
-              before.sharedDecodePlannedAllocatedBytes,
-          "reset left stale selected workspace");
-}
-
-void checkMixedLayouts() {
-  auto mixed = package<model::Qwen3_8Weights>();
-  auto &target = std::get<model::Qwen3_8Weights>(mixed.target);
-  auto &up = target.layers.front().upProjection;
-  up = ops::Projection(up.outputSize, up.inputSize,
-                       ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_Q4K, up.outputSize,
-                                                                        up.inputSize, {}, {}, {})}});
-  bool mismatchRejected = false;
-  try { static_cast<void>(model::qwenTargetGeometry(target)); }
-  catch (const model::WeightStoreError &) { mismatchRejected = true; }
-  require(mismatchRejected, "incompatible fused gate/up layouts reached execution");
-  target.layers.front().gateProjection = up;
-  require(target.logitsProjection.layout() == ops::WeightLayout::Affine64,
-          "mixed fixture must keep an affine vocabulary head");
-  for (uint32_t family : {9U, 10U}) {
+// A layer's gate and up projections run as one gate/up plan, so their shapes
+// must match, though not their formats: a pair with an F16 tensor, which the
+// Apple9 register tile does not take, stages. The vocabulary head reserves
+// workspace only in decode, and the arenas hold a gate/up layer's decode and
+// short-prefill plans and a mixed pair's decode plans at the rows they store.
+void checkGateUpLayers() {
+  auto dense = loadedModel<model::Qwen3_8Weights>();
+  auto &target = std::get<model::Qwen3_8Weights>(dense.target);
+  const ops::Projection up = target.layers.front().upProjection;
+  target.layers.front().upProjection = ops::Projection(
+      up.outputSize, up.inputSize + 256,
+      ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_Q4K, up.outputSize, up.inputSize + 256, {}, {}, {})}});
+  rejects([&] { static_cast<void>(model::qwenTargetGeometry(target, dense.draft.layout.targetLayerIds())); },
+          "fused gate/up projections must have matching shapes", "mismatched fused gate/up shapes reached execution");
+  target.layers.front().upProjection = up;
+  // The last layer's gate in F16 and its up in Q8_0.
+  const auto planes = [&](uint32_t format) {
+    return ops::Projection(
+        up.outputSize, up.inputSize,
+        ops::BlockWeights{{ops::QuantizedSegment::planes(format, up.outputSize, up.inputSize, {}, {}, {})}});
+  };
+  auto &mixed = target.layers.back();
+  mixed.gateProjection = planes(GGUF_FMT_F16);
+  mixed.upProjection = planes(GGUF_FMT_Q80);
+  for (uint32_t family : {9U, 10U, 11U}) {
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = 16;
     ops::ExecutionPlans plans(device);
-    const auto geometry = model::RuntimeGeometry::from(mixed);
+    const auto geometry = model::RuntimeGeometry::from(dense, kv::Format::Int8, ops::GdnStateFormat::Float32);
     const auto head = target.logitsProjection.shape();
     const auto containsHead = [&](const auto &shapes) {
       return std::find(shapes.begin(), shapes.end(), head) != shapes.end();
@@ -172,9 +138,23 @@ void checkMixedLayouts() {
       const auto required = plan.scratchSize();
       require(scratch.input >= required.input && scratch.sums >= required.sums &&
                   scratch.partials >= required.partials && scratch.counters >= required.counters,
-              "affine head hid a block-quantized layer's scratch requirement");
+              "the decode arena is below a gate/up layer's scratch");
       require(model::DecodeArena::gateScratchBytes(geometry, plans) >= plan.gateScratchBytes(),
-              "mixed gate/up workspace is too small");
+              "the gate/up workspace is too small");
+      // The F16 and Q8_0 pair stages, at rows the decode storage of the
+      // target's projections holds (QwenTarget::decodeStorageLanes).
+      const auto pair = plans.linear().decodePlan(mixed.upProjection, lanes, ops::LinearEpilogue::GateUp,
+                                                  &mixed.gateProjection);
+      const auto paired = pair.scratchSize();
+      uint32_t storage = 0;
+      for (const auto &shape : geometry.target.decodeProjections)
+        storage = std::max(storage, plans.linear().decodeStorageRows(lanes * model::kDecodeRows, shape));
+      require(pair.configuration().tile == ops::LinearTile::GgufStaged && pair.storageRows() <= storage,
+              "a gate/up pair with an F16 gate did not stage within the decode storage");
+      require(scratch.input >= paired.input && scratch.sums >= paired.sums && scratch.partials >= paired.partials &&
+                  scratch.counters >= paired.counters &&
+                  model::DecodeArena::gateScratchBytes(geometry, plans) >= pair.gateScratchBytes(),
+              "the arenas are below a gate/up pair in two formats");
     }
     const auto sizes = model::prefillTensorBytes(geometry, plans);
     for (uint32_t rows : {1U, 8U, 17U, 32U}) {
@@ -182,65 +162,163 @@ void checkMixedLayouts() {
           ops::LinearPhase::Prefill, ops::LinearEpilogue::None}, up).scratchSize();
       require(sizes[uint32_t(model::PrefillTensor::LinearPartials)] >= required.partials &&
                   sizes[uint32_t(model::PrefillTensor::LinearCounters)] >= required.counters,
-              "mixed short-prefill split scratch is too small");
+              "the short-prefill split scratch is too small");
     }
   }
-  // Every MoE block of a target shares one layout, which the geometry's one
-  // MoE shape records: no source mixes them.
-  auto sparse = package<model::Qwen3_6MoeWeights>();
-  auto &moe = std::get<model::Qwen3_6MoeWeights>(sparse.target);
-  require(model::qwenTargetGeometry(moe).moeShape().weightLayout == ops::WeightLayout::Affine64,
-          "the MoE shape lost the blocks' layout");
-  for (auto &layer : moe.layers) layer.ffn = ops::BlockMoeWeights{};
-  require(model::qwenTargetGeometry(moe).moeShape().weightLayout == ops::WeightLayout::Block32 &&
-              moe.logitsProjection.layout() == ops::WeightLayout::Affine64,
-          "the MoE shape must follow the expert layers, not the head");
-  moe.layers.back().ffn = ops::AffineMoeWeights{};
-  bool mixedRejected = false;
-  try { static_cast<void>(model::qwenTargetGeometry(moe)); }
-  catch (const model::WeightStoreError &) { mixedRejected = true; }
-  require(mixedRejected, "a target mixing MoE layouts reached execution");
+}
+
+// One decode arena serves every lane count, and a staged plan's partials
+// grow with its rows. The arena must hold every lane's plan of every target
+// and draft projection at the measured core counts.
+void checkLaneScratch(const model::LoadedModel &loaded) {
+  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  const auto &d = geometry.draft;
+  std::vector<ops::LinearMatrix> matrices{
+      {d.dynamicSize, d.hiddenSize}, {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
+      {d.hiddenSize, d.attentionSize},
+      {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
+      {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize()}};
+  for (const auto &p : geometry.target.decodeProjections) matrices.push_back({p.outputSize, p.inputSize});
+  for (uint32_t family : {9U, 10U, 11U})
+    for (uint32_t cores : {12U, 20U, 40U}) {
+      DeviceCapabilities device;
+      device.appleGpuFamily = family;
+      device.gpuCoreCount = cores;
+      const ops::ExecutionPlans plans(device);
+      const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
+      for (const auto matrix : matrices)
+        for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes)
+          for (auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
+                                ops::LinearEpilogue::GateUp}) {
+            const auto need = plans.linear().plan({matrix, lanes * model::kDecodeRows,
+                ops::LinearPhase::Decode, epilogue}).scratchSize();
+            require(scratch.input >= need.input && scratch.sums >= need.sums && scratch.partials >= need.partials &&
+                        scratch.counters >= need.counters,
+                    "decode arena scratch below a lane's plan");
+          }
+    }
+}
+
+// A model served with YaRN reaches the runtime's geometry with its scaling
+// and the window it serves, which everything sized by the context follows; a
+// descriptor whose window is not the one its scaling serves is refused.
+void checkYarnGeometry() {
+  auto loaded = loadedModel<model::Qwen3_6MoeWeights>();
+  loaded.descriptor = model::servedFor(std::move(loaded.descriptor), 524'288);
+  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  require(geometry.target.ropeScaling == loaded.descriptor.ropeScaling &&
+              geometry.target.contextTokens() == 524'288 && geometry.target.nativeContextTokens == 262'144,
+          "the runtime's geometry does not serve YaRN's window");
+  loaded.descriptor.capabilities.maximumContextTokens = 262'144;
+  rejects([&] {
+    static_cast<void>(model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32));
+  }, "invalid model runtime geometry", "a geometry serving another window than the model's was accepted");
+}
+
+// A decode tensor's bytes per lane in a runtime of `geometry`, on an M5's
+// plans.
+uint64_t decodeBytes(const model::RuntimeGeometry &geometry, model::DecodeTensor tensor) {
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  return model::decodeTensorBytes(geometry, ops::ExecutionPlans(device))[static_cast<uint32_t>(tensor)];
+}
+
+// A block-sparse target selects its blocks through index tables of their
+// own, a lane's beside its page table (kv::PageStorage::writeIndexEntries);
+// a target without a block index has none, and its arenas are as they were.
+void checkIndexTables() {
+  const auto geometry = [](const model::LoadedModel &loaded) {
+    return model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  };
+  require(decodeBytes(geometry(loadedModel<model::Qwen4ExpWeights>()), model::DecodeTensor::IndexTable) ==
+                  model::kMaximumPageTableEntries * sizeof(SplashKvPage) &&
+              !decodeBytes(geometry(loadedModel<model::Qwen3_8Weights>()), model::DecodeTensor::IndexTable) &&
+              !decodeBytes(geometry(loadedModel<model::Qwen3_6MoeWeights>()), model::DecodeTensor::IndexTable),
+          "a lane's index table is not its block index's alone");
+}
+
+// A runtime whose K/V spills (one given the readers of spilled K/V,
+// model::RuntimeContext) runs its prefill commands as groups, which read an
+// attention layer's spilled history once each, and its decode arena holds
+// where its verify's listed blocks are: a lane's list, 8 rows of 512 blocks
+// and the block of each row's tail. The K/V of a target without a block
+// index cannot spill.
+void checkSpilledKvGeometry() {
+  const auto flash = loadedModel<model::Qwen4ExpWeights>();
+  const auto resident = model::RuntimeGeometry::from(flash, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  const auto spilled = model::RuntimeGeometry::from(flash, kv::Format::Int8, ops::GdnStateFormat::Float32,
+                                                    model::StreamedParts::loaded(flash, true));
+  require(resident.prefillChunks == 1 && !resident.spilledKv &&
+              spilled.prefillChunks == model::kPrefillGroupChunks && spilled.spilledKv == test::sparseKvShape(),
+          "a runtime's prefill groups do not follow whether its K/V spills");
+  require(!decodeBytes(resident, model::DecodeTensor::Locations) &&
+              decodeBytes(spilled, model::DecodeTensor::Locations) == uint64_t{8} * (512 + 1) * sizeof(uint32_t),
+          "a runtime's decode arena does not hold its spilled blocks' locations exactly when its K/V spills");
+  for (const model::LoadedModel &loaded :
+       {loadedModel<model::Qwen3_8Weights>(), loadedModel<model::Qwen3_6MoeWeights>()})
+    rejects([&] {
+      static_cast<void>(model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32,
+                                                     model::StreamedParts::loaded(loaded, true)));
+    }, "invalid model runtime geometry", "the K/V of a target without a block index was let spill");
 }
 
 // Arenas are sized from the projections the weights hold, so each must have
 // sizes; an empty one would drop its workspace from the bound silently.
 void checkUnsizedProjection() {
-  auto broken = package<model::Qwen3_8Weights>();
+  auto broken = loadedModel<model::Qwen3_8Weights>();
   std::get<model::Qwen3_8Weights>(broken.target).layers.back().downProjection = ops::Projection();
-  bool rejected = false;
-  try { static_cast<void>(model::RuntimeGeometry::from(broken)); }
-  catch (const std::invalid_argument &) { rejected = true; }
-  require(rejected, "a target projection without sizes reached arena sizing");
+  rejects([&] {
+    static_cast<void>(model::RuntimeGeometry::from(broken, kv::Format::Int8, ops::GdnStateFormat::Float32));
+  }, "invalid model runtime geometry", "a target projection without sizes reached arena sizing");
+}
+
+// The target layers the draft reads are the target's, ascending: arena
+// sizing refuses a draft reading past the last one or one twice.
+void checkCaptureLayers() {
+  const auto refuses = [](uint32_t index, uint32_t layer, const std::string &what) {
+    auto model = loadedModel<model::Qwen3_8Weights>();
+    model.draft.layout.targetLayers[index] = layer;
+    rejects([&] {
+      static_cast<void>(model::RuntimeGeometry::from(model, kv::Format::Int8, ops::GdnStateFormat::Float32));
+    }, "invalid model runtime geometry", what + " reached arena sizing");
+  };
+  refuses(4, 64, "a draft reading past the target's last layer");
+  refuses(1, 5, "a draft reading a layer twice");
 }
 
 // The GDN value rows are sized with attentionWidth, so a layout whose value
-// heads span another width is refused before loading and at arena sizing.
-// The packed GDN rows must also hold the two gates of every value head.
+// heads span another width is refused before loading. Arena sizing checks
+// the GDN shape, whose packed rows must also hold the two gates of every
+// value head.
 void checkGdnWidths() {
-  const auto sparse = package<model::Qwen3_6MoeWeights>();
-  const auto layoutRejected = [](const model::Qwen3_6MoeLayout &layout) {
-    try { model::requireQwenLayout(layout); }
-    catch (const model::WeightStoreError &) { return true; }
-    return false;
+  const auto sparse = loadedModel<model::Qwen3_6MoeWeights>();
+  const auto sizeArenas = [&](const model::Qwen3_6MoeLayout &layout) {
+    auto candidate = sparse;
+    std::get<model::Qwen3_6MoeWeights>(candidate.target).layout = layout;
+    static_cast<void>(model::RuntimeGeometry::from(candidate, kv::Format::Int8, ops::GdnStateFormat::Float32));
   };
-  const auto geometryRejected = [&](const model::Qwen3_6MoeLayout &layout) {
-    auto broken = sparse;
-    std::get<model::Qwen3_6MoeWeights>(broken.target).layout = layout;
-    try { static_cast<void>(model::RuntimeGeometry::from(broken)); }
-    catch (const std::invalid_argument &) { return true; }
-    return false;
-  };
+  // The shipped sparse layout passes both checks.
   const model::Qwen3_6MoeLayout shipped;
-  require(!layoutRejected(shipped) && !geometryRejected(shipped),
-          "the shipped sparse layout was refused");
+  model::requireQwenLayout(shipped);
+  sizeArenas(shipped);
   auto narrowValues = shipped;
   narrowValues.gdnValueHeads = narrowValues.gdnKeyHeads;
   narrowValues.convolutionDimension = 3 * narrowValues.gdnKeyHeads * narrowValues.gdnHeadDimension;
-  require(layoutRejected(narrowValues) && geometryRejected(narrowValues),
+  rejects([&] { model::requireQwenLayout(narrowValues); }, "Qwen target layout is inconsistent",
           "a GDN value width other than attentionWidth was accepted");
   auto withoutGates = shipped;
   withoutGates.packedGdnWidth = shipped.convolutionDimension + shipped.attentionWidth;
-  require(geometryRejected(withoutGates), "packed GDN rows without the gates reached arena sizing");
+  rejects([&] { sizeArenas(withoutGates); }, "invalid model runtime geometry",
+          "packed GDN rows without the gates reached arena sizing");
+  // The dense layout is checked like the sparse one: its convolution width
+  // against its GDN heads.
+  const model::Qwen3_8Layout dense;
+  model::requireQwenLayout(dense);
+  auto convolutionMismatch = dense;
+  convolutionMismatch.convolutionDimension += dense.gdnHeadDimension;
+  rejects([&] { model::requireQwenLayout(convolutionMismatch); }, "Qwen target layout is inconsistent",
+          "an inconsistent dense layout was accepted");
 }
 
 } // namespace
@@ -248,14 +326,16 @@ void checkGdnWidths() {
 int main() {
   try {
     checkUnsizedProjection();
+    checkCaptureLayers();
     checkGdnWidths();
-    checkMixedLayouts();
-    const auto dense = package<model::Qwen3_8Weights>();
-    const auto sparse = package<model::Qwen3_6MoeWeights>();
-    for (uint32_t family : {9U, 10U}) {
-      checkPackage(dense, family);
-      checkPackage(sparse, family);
-    }
+    checkGateUpLayers();
+    checkYarnGeometry();
+    checkIndexTables();
+    checkSpilledKvGeometry();
+    const auto dense = loadedModel<model::Qwen3_8Weights>();
+    const auto sparse = loadedModel<model::Qwen3_6MoeWeights>();
+    checkLaneScratch(dense);
+    checkLaneScratch(sparse);
     std::cout << "model execution plans: PASS (two paired geometries)\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

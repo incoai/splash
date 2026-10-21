@@ -7,10 +7,7 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
-if __package__:
-    from .errors import APIError
-else:
-    from errors import APIError
+from .errors import APIError
 
 
 class ThinkingKeyError(RuntimeError):
@@ -84,7 +81,9 @@ class ThinkingCodec:
         # Fernet adds 57 bytes and PKCS7 padding before base64 encoding.
         encoded_size = 4 * ((57 + 16 * (len(payload) // 16 + 1) + 2) // 3)
         if encoded_size > self.MAX_SIGNATURE_BYTES:
-            raise APIError(500, "thinking exceeds the signature size limit")
+            raise APIError(
+                500, "thinking exceeds the signature size limit", "thinking_too_large"
+            )
         return self.cipher.encrypt(payload).decode("ascii")
 
     def decode(self, signature):

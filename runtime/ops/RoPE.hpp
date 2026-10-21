@@ -1,18 +1,16 @@
 #pragma once
 
 #include "metal/CommandGraph.hpp"
+#include "metal/abi/RoPE.h"
 
 #include <cstdint>
 
 namespace splash::ops {
 
-struct RoPETableShape final {
-  uint32_t targetRows = 0;
-  uint32_t draftRows = 0;
-};
-
 class RoPE final {
 public:
+  // The cosine and sine tables of the target's and the draft's rows at their
+  // positions; the target's scaled by rows.target_scale.
   static void addTables(
       metal::CommandGraph &graph, metal::MetalBuffer targetPositions,
       metal::MetalBuffer draftPositions,
@@ -20,7 +18,14 @@ public:
       metal::MetalBuffer draftInverseFrequencies,
       metal::MetalBuffer targetCosine, metal::MetalBuffer targetSine,
       metal::MetalBuffer draftCosine, metal::MetalBuffer draftSine,
-      RoPETableShape shape, uint32_t maximumRows);
+      RopeTableParams rows, uint32_t maximumRows);
+  // The draft tables addTables writes, for `rows` rows of the consecutive
+  // positions from startPosition on.
+  static void addDraftRangeTables(metal::CommandGraph &graph,
+                                  metal::MetalBuffer draftInverseFrequencies,
+                                  metal::MetalBuffer draftCosine,
+                                  metal::MetalBuffer draftSine, uint32_t rows,
+                                  uint32_t startPosition, uint32_t maximumRows);
 };
 
 } // namespace splash::ops

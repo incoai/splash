@@ -121,8 +121,10 @@ void run(const char *libraryPath) {
                 BFloat16Bits valueBits = floatToBFloat16(value);
                 logicalKeys[logical] = bfloat16ToFloat(keyBits);
                 logicalValues[logical] = bfloat16ToFloat(valueBits);
-                physicalKeys[keyDataIndex(head, token, dimension)] = keyBits;
-                physicalValues[valueDataIndex(head, token, dimension)] = valueBits;
+                physicalKeys[splash_kv_key_element(head, token, dimension)] =
+                    keyBits;
+                physicalValues[splash_kv_value_element(head, token, dimension)] =
+                    valueBits;
             }
         }
     }
@@ -219,8 +221,10 @@ void run(const char *libraryPath) {
                     floatToBFloat16(decodedLogicalValues[logical]);
                 expectedLogicalKeys[logical] = key;
                 expectedLogicalValues[logical] = value;
-                expectedPhysicalKeys[keyDataIndex(head, token, dimension)] = key;
-                expectedPhysicalValues[valueDataIndex(head, token, dimension)] = value;
+                expectedPhysicalKeys[
+                    splash_kv_key_element(head, token, dimension)] = key;
+                expectedPhysicalValues[
+                    splash_kv_value_element(head, token, dimension)] = value;
             }
         }
     }
@@ -241,7 +245,7 @@ void run(const char *libraryPath) {
         for (uint32_t head = 0; head < kKvHeads; ++head) {
             for (uint32_t dimension = 0; dimension < kHeadDimension;
                  ++dimension) {
-                physicalValues[valueDataIndex(head, token, dimension)] =
+                physicalValues[splash_kv_value_element(head, token, dimension)] =
                     floatToBFloat16(1.0f);
             }
         }

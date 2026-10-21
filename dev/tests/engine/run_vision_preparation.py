@@ -1,11 +1,10 @@
-"""Prepare tiny MLX and GGUF vision towers and compare them with an independently
-serialized packed file; check the exact-BF16 rule, the MLX cache identity and
-that invalid sources fail naming what is wrong and publish nothing."""
+"""Prepare tiny vision towers of MLX's and transformers' safetensors names and of
+a GGUF and compare them with an independently serialized vision/model.bin;
+check the exact-BF16 rule, that invalid sources fail naming what is wrong, and
+that a padded section written after another keeps its padding zero."""
 
-import hashlib
 import json
 import math
-import os
 import struct
 import subprocess
 import sys
@@ -22,6 +21,9 @@ from dev.tests.fixture_files import (  # noqa: E402
 )
 
 DTYPES = ("BF16", "F16", "F32")
+# The name prefix of each safetensors source's tower: MLX's, and transformers'
+# (as Model Optimizer keeps it).
+TOWER = {"mlx": "vision_tower.", "transformers": "model.visual."}
 GGML_TYPES = {"F32": 0, "F16": 1, "Q4_0": 2, "BF16": 30}
 VISION_SHARD = "model-00001-of-00002.safetensors"
 TEXT_SHARD = "model-00002-of-00002.safetensors"
@@ -41,8 +43,9 @@ def encode(values, dtype):
 
 
 def fixture(root, source, shift=0, case=None):
-    """Writes a tiny tower (depth 2, width 8, 2x2 patches) whose tensors cycle
-    through BF16, F16 and F32, and the packed file it must prepare."""
+    """Writes a tiny tower (depth 2, width 8, 2x2 patches) of source "mlx",
+    "transformers" or "gguf" whose tensors cycle through BF16, F16 and F32,
+    and the vision/model.bin it must prepare."""
     tensors = {}
     sections = []
 
@@ -60,16 +63,29 @@ def fixture(root, source, shift=0, case=None):
             values[5] = 1 + 2.0**-10
         if index == 0:
             # One patch row is [frame, patch-row, patch-col, channel] in MLX and
-            # [channel, patch-row, patch-col] per frame in GGUF. Packed rows are
-            # [channel, frame, patch-row, patch-col].
+            # [channel, patch-row, patch-col] per frame in GGUF. The image's rows
+            # are [channel, frame, patch-row, patch-col], as transformers' are.
             def at(row, frame, pixel, channel):
                 return values[row * 24 + (frame * 4 + pixel) * 3 + channel]
 
+            image = [
+                at(row, frame, pixel, channel)
+                for row in range(rows)
+                for channel in range(3)
+                for frame in range(2)
+                for pixel in range(4)
+            ]
             if source == "mlx":
-                tensors["vision_tower." + mlx] = (
+                tensors[TOWER[source] + mlx] = (
                     [rows, 2, 2, 2, 3],
                     dtype,
                     encode(values, dtype),
+                )
+            elif source == "transformers":
+                tensors[TOWER[source] + mlx] = (
+                    [rows, 3, 2, 2, 2],
+                    dtype,
+                    encode(image, dtype),
                 )
             else:
                 for frame, suffix in enumerate(("", ".1")):
@@ -84,21 +100,15 @@ def fixture(root, source, shift=0, case=None):
                         dtype,
                         encode(frame_values, dtype),
                     )
-            values = [
-                at(row, frame, pixel, channel)
-                for row in range(rows)
-                for channel in range(3)
-                for frame in range(2)
-                for pixel in range(4)
-            ]
+            values = image
         else:
-            name = "vision_tower." + mlx if source == "mlx" else gguf_name
+            name = TOWER[source] + mlx if source in TOWER else gguf_name
             if columns == 1:
                 shape = [rows]
             else:
-                shape = [rows, columns] if source == "mlx" else [columns, rows]
+                shape = [rows, columns] if source in TOWER else [columns, rows]
             if case == "dtype" and mlx == "merger.linear_fc1.weight":
-                dtype = "F64" if source == "mlx" else "Q4_0"
+                dtype = "F64" if source in TOWER else "Q4_0"
             raw = encode(values, "F32" if dtype == "Q4_0" else dtype)
             tensors[name] = (shape, dtype, raw)
         output = []
@@ -144,17 +154,16 @@ def fixture(root, source, shift=0, case=None):
         shape, dtype, raw = tensors[first]
         tensors[first] = ([math.prod(shape)], dtype, raw)
     (root / "expected.bin").write_bytes(weight_file("MDFV0001", 2, 0, sections))
-    if source == "mlx":
+    if source in TOWER:
+        # A quantized module's scales: MLX's beside its packed weight, Model
+        # Optimizer's weight_scale beside its codes.
         if case == "quantized":
-            tensors["vision_tower.blocks.0.attn.qkv.scales"] = (
-                [24, 1],
-                "BF16",
-                bytes(48),
-            )
+            tensors[quantized_scales(source)] = ([24, 1], "BF16", bytes(48))
         write_safetensors(root / VISION_SHARD, tensors)
-        text = {"language_model.model.norm.weight": ([8], "BF16", bytes(16))}
-        write_safetensors(root / TEXT_SHARD, text)
-        (root / "config.json").write_text("{}")
+        norm = {"mlx": "language_model.model.norm.weight"}.get(
+            source, "model.language_model.norm.weight"
+        )
+        write_safetensors(root / TEXT_SHARD, {norm: ([8], "BF16", bytes(16))})
         return
     metadata = {
         "general.architecture": "clip",
@@ -189,16 +198,16 @@ def fixture(root, source, shift=0, case=None):
     write_gguf(root / "mmproj.gguf", metadata, gguf_tensors)
 
 
-def prepare(binary, directory, source, mode, expected=True):
-    command = [binary, source, str(directory), mode]
-    if expected:
-        command.append(str(directory / "expected.bin"))
-    env = {**os.environ, "SPLASH_WEIGHT_CACHE": str(directory / "cache")}
-    return subprocess.run(command, env=env, text=True, capture_output=True)
+def quantized_scales(source):
+    scales = "scales" if source == "mlx" else "weight_scale"
+    return TOWER[source] + "blocks.0.attn.qkv." + scales
 
 
-def published(directory):
-    return list((directory / "cache").glob("*/weights"))
+def prepare(binary, directory, source):
+    # MLX's and transformers' towers are both the loader's safetensors source.
+    loader = "gguf" if source == "gguf" else "safetensors"
+    command = [binary, loader, str(directory), str(directory / "expected.bin")]
+    return subprocess.run(command, text=True, capture_output=True)
 
 
 def main():
@@ -208,25 +217,30 @@ def main():
     golden = json.loads(Path(sys.argv[2]).read_text())["vision_image"]
     with tempfile.TemporaryDirectory(prefix="splash-vision-preparation-") as temp:
         root = Path(temp)
-        for source in ("mlx", "gguf"):
-            mlx = source == "mlx"
-            file = VISION_SHARD if mlx else "mmproj.gguf"
+        for source in ("mlx", "transformers", "gguf"):
+            safetensors = source in TOWER
+            file = VISION_SHARD if safetensors else "mmproj.gguf"
             # Every tensor as BF16, F16 and F32; BF16 is copied and exact F32
             # or F16 values become their BF16 bits.
             for shift in range(3):
                 directory = root / f"{source}-{shift}"
                 directory.mkdir()
                 fixture(directory, source, shift)
-                result = prepare(binary, directory, source, "cold")
+                result = prepare(binary, directory, source)
                 assert result.returncode == 0, (source, shift, result.stderr)
-                path = Path(result.stdout.split()[0])
-                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                digest = result.stdout.split()[0]
                 assert digest == golden, (source, shift, digest)
             patch = (
-                "vision_tower.patch_embed.proj.weight" if mlx else "v.patch_embd.weight"
+                TOWER[source] + "patch_embed.proj.weight"
+                if safetensors
+                else "v.patch_embd.weight"
             )
-            merger = "vision_tower.merger.linear_fc1.weight" if mlx else "mm.0.weight"
-            dtype = "F64" if mlx else "Q4_0"
+            merger = (
+                TOWER[source] + "merger.linear_fc1.weight"
+                if safetensors
+                else "mm.0.weight"
+            )
+            dtype = "F64" if safetensors else "Q4_0"
             # What each refusal names: the tensor or key, the kind of problem
             # and, as "{}", the source file.
             inexact = (patch, "{}", "BF16")
@@ -237,10 +251,10 @@ def main():
                 ("shape", 0): (patch, "shape"),
                 ("dtype", 0): (merger, "{}", dtype),
             }
-            if mlx:
+            if safetensors:
                 rejected[("quantized", 0)] = (
                     "quantized",
-                    "vision_tower.blocks.0.attn.qkv.scales",
+                    quantized_scales(source),
                     "{}",
                 )
             else:
@@ -254,7 +268,7 @@ def main():
                 directory = root / f"{source}-{case}"
                 directory.mkdir()
                 fixture(directory, source, shift, case)
-                result = prepare(binary, directory, source, "cold")
+                result = prepare(binary, directory, source)
                 errors = result.stderr.strip().splitlines()
                 assert result.returncode == 1 and errors, (source, case, result.stderr)
                 named = [part.format(directory / file) for part in parts]
@@ -264,28 +278,16 @@ def main():
                     named,
                     result.stderr,
                 )
-                assert not published(directory), (source, case)
 
-        # The MLX tower's identity is the tensors it reads: the language
-        # model's shard and config.json do not enter it, a tower byte does.
-        directory = root / "mlx-0"
-        cached = prepare(binary, directory, "mlx", "warm").stdout.split()
-        write_safetensors(
-            directory / TEXT_SHARD,
-            {"language_model.model.norm.weight": ([8], "BF16", bytes(range(16)))},
+        directory = root / "padding"
+        directory.mkdir()
+        result = subprocess.run(
+            [binary, "padding", str(directory)], text=True, capture_output=True
         )
-        (directory / "config.json").write_text('{"text_config": {}}')
-        result = prepare(binary, directory, "mlx", "warm")
-        assert result.returncode == 0 and result.stdout.split() == cached, result.stderr
-        data = bytearray((directory / VISION_SHARD).read_bytes())
-        data[-1] ^= 1
-        (directory / VISION_SHARD).write_bytes(data)
-        result = prepare(binary, directory, "mlx", "warm", expected=False)
-        errors = result.stderr.strip().splitlines()
-        assert errors[-1] == "unexpected warm conversion", result.stderr
+        assert result.returncode == 0, result.stderr
         print(
-            "Vision layouts from MLX and GGUF, exact BF16 conversion, MLX identity "
-            "and rejected sources PASS"
+            "Vision layouts from MLX, transformers and GGUF, exact BF16 conversion, "
+            "rejected sources and zero padding PASS"
         )
 
 

@@ -6,21 +6,18 @@ import io
 import math
 import threading
 import time
-from collections import OrderedDict
-from contextlib import closing
-from dataclasses import asdict, dataclass, replace
+from collections.abc import Callable
+from contextlib import closing, nullcontext
+from dataclasses import asdict, dataclass
 
-if __package__:
-    from .errors import APIError
-    from .protocol import ProtocolLimits
-else:
-    from errors import APIError
-    from protocol import ProtocolLimits
+from .errors import APIError
+from .lru import LRUCache
+from .protocol import MAX_IMAGE_SPANS
 
 MAX_REQUEST_DOCUMENT_BYTES = 64 * 1024 * 1024
 MAX_PDF_BYTES = MAX_REQUEST_DOCUMENT_BYTES
 # Every rendered page becomes one image in the native request.
-MAX_PAGES = ProtocolLimits().max_image_spans
+MAX_PAGES = MAX_IMAGE_SPANS
 MAX_PAGE_PIXELS = 1024 * 1024
 MAX_TEXT_CHARACTERS = 1_000_000
 MAX_RENDERED_BYTES = 32 * 1024 * 1024
@@ -31,13 +28,16 @@ PDF_DATA_URL_PREFIX = "data:application/pdf;base64,"
 
 @dataclass(slots=True)
 class DocumentBudget:
-    deadline: float | None = None
+    # The request's deadline; math.inf when it has none.
+    deadline: float
     remaining_bytes: int = MAX_REQUEST_DOCUMENT_BYTES
     remaining_pages: int = MAX_PAGES
+    # A context manager under which the request holds no preparation slot,
+    # to wait for and use the PDF worker; none to give back outside
+    # preparation.
+    without_slot: Callable = nullcontext
 
     def remaining_time(self):
-        if self.deadline is None:
-            return -1
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise APIError(504, "request timed out", "request_timeout")
@@ -74,32 +74,28 @@ class RenderLimits:
     page_pixels: int
     text_characters: int
     rendered_bytes: int
-    request_bytes: int = MAX_REQUEST_DOCUMENT_BYTES
+    request_bytes: int
 
 
-def _render_limits():
-    return RenderLimits(
-        MAX_PAGES, MAX_PAGE_PIXELS, MAX_TEXT_CHARACTERS, MAX_RENDERED_BYTES
-    )
-
-
-# Serialize cache misses so only one bounded PDF worker is active at a time.
-_pdf_lock = threading.Lock()
-_cache: OrderedDict[bytes, tuple[Page, ...]] = OrderedDict()
-_cache_bytes = 0
+# One bounded PDF worker runs at a time. A request decodes, hashes and looks
+# up its PDF before it waits for the worker, so a cached PDF never waits
+# behind another one's render, and waits for the worker and renders without
+# its preparation slot, so neither does another request's preparation.
+_render_lock = threading.Lock()
+# Rendered pages by the SHA-256 of their PDF.
+_cache_lock = threading.Lock()
+_cache = LRUCache(CACHE_BYTES, CACHE_ENTRIES)
 
 
 def _render(payload, budget):
-    if __package__:
-        from .document_worker import render
-    else:
-        from document_worker import render
+    from .document_worker import render
 
-    limits = _render_limits()
-    limits = replace(
-        limits,
-        pages=min(limits.pages, budget.remaining_pages),
-        request_bytes=budget.remaining_bytes,
+    limits = RenderLimits(
+        min(MAX_PAGES, budget.remaining_pages),
+        MAX_PAGE_PIXELS,
+        MAX_TEXT_CHARACTERS,
+        MAX_RENDERED_BYTES,
+        budget.remaining_bytes,
     )
     values = render(payload, asdict(limits), budget.remaining_time())
     pages = tuple(Page(**value) for value in values)
@@ -118,7 +114,6 @@ def render_pages(payload, budget, limits):
                 raise APIError(
                     400, f"PDF documents must contain 1–{limits.pages} pages"
                 )
-            budget.charge_pages(len(document))
             pages = []
             total_characters = total_bytes = 0
             for index in range(len(document)):
@@ -177,40 +172,53 @@ def render_pages(payload, budget, limits):
         raise APIError(400, "PDF document could not be rendered") from error
 
 
+def _cached(key, budget):
+    """The cached pages of the PDF with digest `key`, charged to `budget`;
+    None when none are cached."""
+    with _cache_lock:
+        pages = _cache.get(key)
+    if pages is None:
+        return None
+    budget.charge_pages(len(pages))
+    budget.charge(sum(page.size for page in pages))
+    return pages
+
+
+def _cache_pages(key, pages):
+    """Keep the rendered `pages` of the PDF with digest `key`, unless they
+    alone outgrow the cache."""
+    size = sum(page.size for page in pages)
+    with _cache_lock:
+        _cache.put(key, pages, size)
+
+
 def _pages(encoded, budget):
-    global _cache_bytes
-    if not _pdf_lock.acquire(
-        timeout=min(budget.remaining_time(), threading.TIMEOUT_MAX)
-    ):
-        raise APIError(504, "request timed out", "request_timeout")
+    budget.remaining_time()
     try:
-        budget.remaining_time()
-        try:
-            payload = base64.b64decode(encoded, validate=True)
-        except ValueError as error:
-            raise APIError(400, "PDF data is not valid base64") from error
-        if len(payload) > MAX_PDF_BYTES:
-            raise APIError(400, "PDF document exceeds the size limit")
-        budget.charge(len(payload))
-        key = hashlib.sha256(payload).digest()
-        cached = _cache.get(key)
-        if cached is not None:
-            budget.charge_pages(len(cached))
-            budget.charge(sum(page.size for page in cached))
-            _cache.move_to_end(key)
-            return cached
-        pages = _render(payload, budget)
-        budget.charge_pages(len(pages))
-        size = sum(page.size for page in pages)
-        if size <= CACHE_BYTES:
-            _cache[key] = pages
-            _cache_bytes += size
-            while _cache_bytes > CACHE_BYTES or len(_cache) > CACHE_ENTRIES:
-                _, evicted = _cache.popitem(last=False)
-                _cache_bytes -= sum(page.size for page in evicted)
+        payload = base64.b64decode(encoded, validate=True)
+    except ValueError as error:
+        raise APIError(400, "PDF data is not valid base64") from error
+    if len(payload) > MAX_PDF_BYTES:
+        raise APIError(400, "PDF document exceeds the size limit")
+    budget.charge(len(payload))
+    key = hashlib.sha256(payload).digest()
+    if (pages := _cached(key, budget)) is not None:
         return pages
-    finally:
-        _pdf_lock.release()
+    with budget.without_slot():
+        if not _render_lock.acquire(
+            timeout=min(budget.remaining_time(), threading.TIMEOUT_MAX)
+        ):
+            raise APIError(504, "request timed out", "request_timeout")
+        try:
+            # Another request may have rendered the same PDF meanwhile.
+            if (pages := _cached(key, budget)) is not None:
+                return pages
+            pages = _render(payload, budget)
+            budget.charge_pages(len(pages))
+            _cache_pages(key, pages)
+            return pages
+        finally:
+            _render_lock.release()
 
 
 def document_parts(block):

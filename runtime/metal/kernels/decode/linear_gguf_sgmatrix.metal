@@ -2,10 +2,11 @@
 // on the FP32 pipe there, so the kernel keeps every other FP32 operation to
 // the minimum a group scale needs, and does the rest on the integer pipe:
 // - weights enter the MMA as exact bf16: 128 + code for linear codes with a
-//   min, 160 + code - zero for seeded linear codes (one add), or the
-//   codebook, int8 or grid value;
+//   min, 160 + code - zero for seeded linear codes (one add), the code itself
+//   (converted) for 8-bit linear codes, or the codebook, int8 or grid value;
 // - one MMA chain per coefficient group, closed by the fp32 epilogue
-//   s * chain + b * sum (b = m - 128 s, formats with a min per 32 inputs) or
+//   s * chain + b * sum (b = m - 128 s, formats with a min per 32 inputs, or
+//   b = m for 8-bit codes) or
 //   s * chain with the chain seeded by -160 * sum from the table (formats
 //   with a zero point, and Q2_K, whose min per 16 inputs adds b * seed with
 //   b = m / -160);
@@ -30,9 +31,11 @@ namespace gguf_sg {
 template <class F> struct Shape {
   enum : uint {
     Linear = F::Kind == QuantLinear,
-    HasMin = Linear && F::Zero == 0,                          // Q4_K, Q5_K, Q4_1, Q2_K: s code + m
+    HasMin = Linear && F::Zero == 0,                          // Q4_K, Q5_K, Q4_1, Q5_1, Q2_K, MLX affine: s code + m
+    // Linear codes past 127 (MLX affine 8-bit), which enter the MMA as the code itself: no bf16 128 + code holds them
+    Wide = QuantWideCodes<F>::value,
     // Linear codes chained from the table's seed of their 16 inputs: s (code - zero) with a zero point (Q6_K, Q3_K,
-    // Q4_0, IQ1, PQ2_0), and Q2_K's min per 16 inputs
+    // Q4_0, Q5_0, IQ1, PQ2_0, Q2_0), and Q2_K's min per 16 inputs
     Seeded = Linear && (!HasMin || F::Group == 16),
     // bf16 bits of the operand of code 0: 128, or 160 - zero when seeded
     Operand = 0x4300 + (Seeded ? kZeroPointOffset - 128 - F::Zero : 0),
@@ -42,9 +45,14 @@ template <class F> struct Shape {
     UnitSpans = F::MetaGroups == 1 ? 1 : CG * (HasMin ? 2 : 1) <= 2 ? 4 : 2,
     J = 2 * UnitSpans * CG,                                   // coefficients per column and unit
   };
-  // Each coefficient reads its own group's meta unit (coefficient_source), so a unit of four groups (PQ2_0's 128
-  // elements) splits a coefficient unit of four spans in two.
-  static_assert(F::MetaGroups == 8 || F::MetaGroups == 4 || F::MetaGroups == 1, "a meta unit is one, four or eight groups");
+  // Each coefficient reads its own group's meta unit (coefficient_source), so a unit of two or four groups (MLX
+  // affine's 64 or 128 elements, PQ2_0's 128, Q2_0's 64) splits a coefficient unit of four spans: such a format takes
+  // rows of whole 256 inputs here (quant_register_tensor).
+  static_assert(F::MetaGroups == 8 || F::MetaGroups == 4 || F::MetaGroups == 2 || F::MetaGroups == 1,
+                "a meta unit is one, two, four or eight groups");
+  static_assert(UnitSpans * GGUF_TABLE16_SPAN_INPUTS == quant_register_unit(F::Id),
+                "the host splits K in the coefficient units of quant_register_unit");
+  static_assert(!Wide || (HasMin && !Seeded), "wide codes have a min per 32 inputs");
 };
 template <class F> using Coef = metal::conditional_t<Shape<F>::HasMin != 0, float2, float>;
 // The coefficients of a threadgroup's simdgroups for one unit; the run-time-format kernels hold every format's in
@@ -53,20 +61,30 @@ template <class F> constant constexpr uint kCoefs = GGUF_TILE_COLUMNS * Shape<F>
 static_assert(GGUF_REGISTER_COLUMNS == 2 * 8, "a simdgroup's columns are its two 8-column MMA fragments");
 constant constexpr uint kCoefFloat2s = kCoefs<FmtQ4K>;
 #define GGUF_SG_COEF_BYTES(F, f) static_assert(kCoefs<F> * sizeof(Coef<F>) <= kCoefFloat2s * sizeof(float2), #f " coefficients fit");
-QUANT_FORMATS(GGUF_SG_COEF_BYTES)
+QUANT_REGISTER_FORMATS(GGUF_SG_COEF_BYTES)
 #undef GGUF_SG_COEF_BYTES
 
 // The exact bf16 operand of pair f of a chunk.
 template <class F>
 inline bfloat2 operand(typename F::Chunk ch, uint f, threadgroup const bfloat2 *lut) {
   typedef Shape<F> S;
-  if constexpr (F::Kind == QuantLinear) {
+  if constexpr (F::Kind == QuantLinear && S::Wide) {
+    const uint pair = F::codes(ch)[f];
+    return bfloat2(float2(pair & 0xFFFFu, pair >> 16));   // exact: bf16 holds every integer to 256
+  } else if constexpr (F::Kind == QuantLinear) {
     return as_type<bfloat2>(F::codes(ch)[f] + S::Operand * 0x00010001u);   // Operand in both halves
   } else if constexpr (F::Kind == QuantCodebook) {
     return lut[(F::indices(ch) >> (8 * f)) & 0xFFu];
   } else if constexpr (F::Kind == QuantInt8) {
     const uint2 v = F::values(ch);
     return bfloat2(float2(as_type<char2>(ushort((f < 2 ? v.x : v.y) >> (16 * (f & 1))))));
+  } else if constexpr (F::Kind == QuantFloat8) {   // exact: an E4M3 value has four significant bits
+    const uint2 v = F::values(ch);
+    const uint pair = ((f < 2 ? v.x : v.y) >> (16 * (f & 1))) & 0xFFFFu;
+    return bfloat2(float2(quant_e4m3_pair(quant_byte_pairs(pair).x)));
+  } else if constexpr (F::Kind == QuantFloat16) {   // the bf16 values themselves (quant_register_format)
+    static_assert(is_same_v<typename F::Value, bfloat>, "the register tile takes bf16 values only");
+    return as_type<bfloat2>(F::values(ch)[f]);
   } else {
     const uint2 g = F::grid(ch);
     const uchar4 m = as_type<uchar4>(f < 2 ? g.x : g.y);
@@ -99,8 +117,8 @@ inline CoefSource<F> coefficient_source(device uchar *w0, device uchar *w1, devi
 }
 // Coefficient j of a column in coefficient unit u: group gi = j / CG of the
 // unit, 16-group half h = j % CG. Formats with a min return (s, m - 128 s),
-// or with a seeded min (s, m / -160), whose product with the seed is m times
-// the sum of the inputs.
+// (s, m) with wide codes, or with a seeded min (s, m / -160), whose product
+// with the seed is m times the sum of the inputs.
 template <class F> inline Coef<F> coefficient(CoefSource<F> src, uint u, uint j) {
   typedef Shape<F> S;
   const uint g = u * 2 * S::UnitSpans + j / S::CG, h = j % S::CG;
@@ -109,6 +127,7 @@ template <class F> inline Coef<F> coefficient(CoefSource<F> src, uint u, uint j)
   else k = F::coef(src.meta, ushort(g % F::MetaGroups));
   const float s = h ? k.s.y : k.s.x, m = h ? k.m.y : k.m.x;
   if constexpr (S::HasMin && S::Seeded) return float2(s, m * (-1.0f / kZeroPointOffset));
+  else if constexpr (S::HasMin && S::Wide) return float2(s, m);
   else if constexpr (S::HasMin) return float2(s, fma(-128.0f, s, m));
   else return s;
 }
@@ -165,10 +184,9 @@ inline void decode(device const bfloat *table, device const float *sums, device 
   load(cur);
   for (uint u = u0; u < u1; ++u) {
     // This unit's coefficients for the simdgroup's NC columns, each decoded
-    // once. Every source load is issued before the first decode waits for one:
-    // on the 40-core M3 the zero-point formats (16 coefficients per column and
-    // unit) gain at one to four lanes, Q6_K 5120x17408 2.5/3.8/3.1/1.1% and
-    // Q3_K 7.6/4.3/3.3/2.2%; the other formats stay within 0.7%.
+    // once. Every source load is issued before the first decode waits for one,
+    // which takes 1-8% off the zero-point formats (16 coefficients per column
+    // and unit) at one to four lanes on the 40-core M3 Max.
     constexpr uint I = (NC * S::J + 31) / 32;
     CoefSource<F> src[I];
 #pragma unroll
@@ -318,7 +336,7 @@ kernel void decode_linear_gguf_prepare(device const bfloat *input [[buffer(0)]],
   GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_g, F, L, EpUpWithGate, bfloat)
 #define GGUF_SG_FORMAT(F, f) \
   GGUF_SG_EPILOGUES(F, f, 1) GGUF_SG_EPILOGUES(F, f, 2) GGUF_SG_EPILOGUES(F, f, 3) GGUF_SG_EPILOGUES(F, f, 4)
-QUANT_FORMATS(GGUF_SG_FORMAT)
+QUANT_REGISTER_FORMATS(GGUF_SG_FORMAT)
 #undef GGUF_SG_FORMAT
 #undef GGUF_SG_EPILOGUES
 #undef GGUF_SG_KERNEL
@@ -340,9 +358,9 @@ inline void gguf_sg_fused(device const bfloat *table, device const float *sums, 
   device uchar *w0 = s == 0 ? w0a : s == 1 ? w0b : w0c;
   device uchar *w1 = s == 0 ? w1a : s == 1 ? w1b : w1c;
   device uchar *meta = s == 0 ? ma : s == 1 ? mb : mc;
-  const GgufDecodeParams q{p.input_size, p.splits, p.out_stride, p.offset[s]};
+  const GgufDecodeParams q{p.input_size, p.splits, p.out_stride, p.offset[s], 0};
   const uint2 local(tg.x - (s == 0 ? 0 : s == 1 ? t0 : t1), tg.y);
-  quant_format_switch(p.fmt[s], [&](auto format) {
+  quant_register_format_switch(p.fmt[s], [&](auto format) {
     typedef decltype(format) F;
     quant_pair_table<F>(lut, tid, GGUF_REGISTER_THREADS);
     gguf_sg::decode<F, L, EpNone>(table, sums, w0, w1, meta, out, partials, counters, out, q, local,
@@ -374,20 +392,21 @@ GGUF_SG_FUSED(4)
 // MoE experts (ops/MoE.cpp): threadgroup (x, y) computes 64 columns of grouped 8-row tile y from its Table16 tile
 // (kernels/shared/moe.metal) with the weights of the tile's expert (moe_gguf_segment), in the format the tile picks
 // at run time: on the 40-core M3 Max one run-time-format kernel is within +1.6% of the per-format kernels
-// (time-sg at 23040x2048 Q4_K and 92160x512 Q5_K, one to four lanes). No K splits, so no partials or counters.
+// (23040x2048 Q4_K and 92160x512 Q5_K, one to four lanes). No K splits, so no partials or counters.
 // aux is the gate of the up pass. Grid (column tiles, expert tiles), GGUF_REGISTER_THREADS threads.
 template <GgufEpilogue Ep>
 inline void gguf_sg_expert(device const bfloat *table, device const float *sums, device const MoeTileDescriptor *tiles,
                            device const uint *tile_count, device uchar *w0, device uchar *w1, device uchar *meta,
                            device uchar *sw0, device uchar *sw1, device uchar *smeta, device bfloat *out,
-                           device const bfloat *aux, constant MoeGgufExpertParams &p, uint2 tg, uint tid, uint sg,
-                           uint lane, threadgroup bfloat2 *lut, threadgroup float2 *coefs, threadgroup uint *arrival) {
+                           device const bfloat *aux, device const uint *slots, constant MoeGgufExpertParams &p,
+                           uint2 tg, uint tid, uint sg, uint lane, threadgroup bfloat2 *lut, threadgroup float2 *coefs,
+                           threadgroup uint *arrival) {
   if (tg.y >= *tile_count) return;
-  const MoeGgufSegment s = moe_gguf_segment(tiles[tg.y].expert, p, w0, w1, meta, sw0, sw1, smeta);
+  const MoeGgufSegment s = moe_gguf_segment(tiles[tg.y].expert, p, slots, w0, w1, meta, sw0, sw1, smeta);
   const uint K = p.input_size, N = p.output_size;
   const ulong rows = ulong(tg.y) * 8;
-  const GgufDecodeParams q{K, 1, N, 0};
-  quant_format_switch(s.format, [&](auto format) {
+  const GgufDecodeParams q{K, 1, N, 0, 0};
+  quant_register_format_switch(s.format, [&](auto format) {
     typedef decltype(format) F;
     quant_pair_table<F>(lut, tid, GGUF_REGISTER_THREADS);
     gguf_sg::decode<F, 1, Ep>(
@@ -402,14 +421,15 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
                    device uchar *w0 [[buffer(4)]], device uchar *w1 [[buffer(5)]], device uchar *meta [[buffer(6)]], \
                    device uchar *sw0 [[buffer(7)]], device uchar *sw1 [[buffer(8)]], device uchar *smeta [[buffer(9)]], \
                    device bfloat *out [[buffer(10)]], device const bfloat *aux [[buffer(11)]],                      \
-                   constant MoeGgufExpertParams &p [[buffer(12)]], uint2 tg [[threadgroup_position_in_grid]],       \
+                   device const uint *slots [[buffer(12)]], constant MoeGgufExpertParams &p [[buffer(13)]],         \
+                   uint2 tg [[threadgroup_position_in_grid]],                                                       \
                    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],            \
                    uint lane [[thread_index_in_simdgroup]]) {                                                       \
     threadgroup bfloat2 lut[kQuantPairTableEntries];                                                                \
     threadgroup float2 coefs[gguf_sg::kCoefFloat2s];                                                                \
     threadgroup uint arrival;                                                                                       \
-    gguf_sg_expert<EP>(table, sums, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, out, aux, p, tg, tid, sg, lane, \
-                       lut, coefs, &arrival);                                                                       \
+    gguf_sg_expert<EP>(table, sums, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, out, aux, slots, p, tg, tid, sg, \
+                       lane, lut, coefs, &arrival);                                                                 \
   }
 GGUF_SG_EXPERT(moe_expert_gguf_sg_a, EpNone)
 GGUF_SG_EXPERT(moe_expert_gguf_sg_g, EpUpWithGate)

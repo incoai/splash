@@ -20,8 +20,7 @@
 namespace splash::test {
 
 // A new directory under the system temporary directory, removed with its
-// contents when this is destroyed. A forked child must leave with _exit so it
-// does not remove the parent's directory.
+// contents when this is destroyed.
 class TemporaryDirectory final {
 public:
   explicit TemporaryDirectory(std::string_view name) {

@@ -1,40 +1,57 @@
-# RFC 193 — P-core work-interval hint + host-gap hiding
+# RFC 193: a scoped host scheduling experiment
 
-Upstream issue: https://github.com/incoai/splash/issues/193
+Related issue: [#193](https://github.com/incoai/splash/issues/193).
+Rechecked against main `1482f6bbc2abf12375332725302019594150b6cb`.
 
-Source: bonsai `CBv2EngineWorkInterval.swift` (`AudioWorkIntervalCreate`
-P-core hint, `MLXFAST_ENGINE_WORK_INTERVAL`, prompt-forward renew).
+## Current runtime and remaining proposal
 
-## Problem
+Main already reduces per-submit host work and batches buffer bindings.
+[`MetalBackend`](../../runtime/metal/MetalBackend.mm) has asynchronous command
+completion, host steps and a host-step worker that requests
+`QOS_CLASS_USER_INTERACTIVE`. Its worker QoS request is distinct from an
+engine-thread work interval around graph construction/submission. No
+WorkInterval integration or `SPLASH_ENGINE_WORK_INTERVAL` option is implemented.
 
-Host gap between verify-block build and GPU submit shows up as idle
-(`Engine.cpp`, `Scheduler.*`, `NativeRuntime.*`, `Bootstrap.mm`).
-Bonsai reports 11.4→3.1 ms verify build / 2.0→0.6 ms idle from a
-scheduling hint alone; Splash lists host-gap hiding as out-of-scope
-(`PLAN.md:26`) with no measurement.
+[Maintainer feedback](https://github.com/incoai/splash/issues/193#issuecomment-5975595014)
+keeps the work-interval proposal open while asking for measurement after the
+existing host improvements. Main has subsequently changed submission, host
+steps, streaming and decode scheduling further. Earlier third-party timings
+and the old RFC's host-gap assumptions are not Splash measurements of this
+revision. A scheduling hint does not establish a P-core placement guarantee.
 
-## Proposal
+The unused flag/configuration header and tests that only asserted its strings
+are removed from this documentation proposal. They did not call a scheduling
+API, wrap an engine scope or demonstrate a performance improvement.
 
-1. `runtime/engine/Rfc193WorkInterval.hpp` declares the flag + env var
-   (`SPLASH_ENGINE_WORK_INTERVAL`).
-2. Follow-up scopes an opt-in P-core / QoS hint to the
-   prompt-forward-submit + verify-build window only; renew on
-   `promptForwardBegan/Submitted`.
+## Experiment design
 
-## Contracts
+First measure graph preparation, submission, completion and the interval
+between commands with matching current builds. Keep GPU command spans and
+host scopes separate; subtracting GPU time from wall time does not isolate
+pure scheduler cost. Existing
+[`decode-profile`](../../dev/benchmarks/decode_profile.mm) supports native
+operator/cycle diagnostics, and the [engine](../../runtime/engine/Engine.cpp)
+and [scheduler](../../runtime/engine/Scheduler.cpp) define the serving loop.
 
-- Scheduling hint only; no numerics / protocol / memory-plan change;
-  must not starve UI/audio.
+If a material host scheduling delay remains, an opt-in implementation can
+compare a bounded hint around engine preparation/submission against the same
+code without the hint. API choice, supported OS behavior, ownership and
+cleanup remain design work. Include success, exception, cancellation and
+shutdown paths; do not retain a hint over blocking waits. Keep the native
+protocol, model geometry, memory plan and kernel code unchanged for the
+experiment.
 
-## Code change (landed)
+Use matched warmups and alternating controls, report B1 through B4 and full
+serving latency/throughput, and record power/thermal conditions. Include
+competing UI/audio work and both hint setup/teardown cost and host/GPU gaps.
+A host-phase improvement alone is insufficient to change a shared default.
+Output hashes should be reported; identical arithmetic kernels do not prove
+identical mixed-serving batches or output trajectories.
 
-`runtime/engine/Rfc193WorkInterval.hpp` now carries the scope contract
-(`IntervalScope`, `WorkIntervalConfig{enabled, maxRenewsPerWindow}`,
-`renewAllowed()`) as `constexpr` with `static_assert` cases. Host-only
-by design — a scheduling hint takes no kernel. `clang++ -fsyntax-only`
-clean.
+## Review and validation scope
 
-## Validation
-
-- `benchmark-decode-profile` verify-build ms + GPU idle ms B1–B4
-  (alternating, medians ≥31); ABBA neutral required. Easiest to revert.
+This is a documentation-only RFC. There is no implementation, active flag,
+new timing result or speedup claim in this PR. The current production path
+and defaults are unchanged. The proposal remains experimental until an
+implementation and measurements justify it; it is independent of main's
+adaptive MoE verify-row policy in #487.
