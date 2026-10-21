@@ -530,12 +530,8 @@ void testVideoRequestIsRefused() {
   LoopFixture fixture(config);
   engine::NativeRuntime &loop = fixture.loop;
   loop.announceReady();
-  protocol::VideoRequestFrame video;
-  video.requestId = 9;
-  video.frames = 73;
-  video.width = 1344;
-  video.height = 768;
-  video.promptTokens = {5, 6};
+  const protocol::VideoRequestFrame video{.requestId = 9, .frames = 73, .width = 1344,
+                                          .height = 768, .promptTokens = {5, 6}};
   require(loop.receive(protocol::peer::serialize(video)) &&
               loop.receive(protocol::peer::serialize(request(1))),
           "a video request closed the connection");

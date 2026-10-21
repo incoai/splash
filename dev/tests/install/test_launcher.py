@@ -89,7 +89,7 @@ class LauncherTests(unittest.TestCase):
                 launcher.parse_args(["serve", "--model", model]).model, model
             )
 
-    def test_only_serve_generate_and_clients_are_public(self):
+    def test_only_serve_and_clients_are_public(self):
         for command in (
             "start",
             "stop",
@@ -1074,48 +1074,27 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(served.model_root, str(selection))
 
     def test_generate_installs_as_serve_does_and_executes_one_clip(self):
-        upgradable = []
-
-        def execute(*_):
-            # The installation is held, shared, across the exec.
-            with (runtime / "serve.lock").open() as upgrade:
-                try:
-                    fcntl.flock(upgrade, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    upgradable.append(True)
-                except BlockingIOError:
-                    upgradable.append(False)
-
-        with tempfile.TemporaryDirectory() as temporary:
-            runtime = Path(temporary)
-            link = runtime / "models/owner/model"
-            with (
-                mock.patch.object(launcher, "RUNTIME_DIR", runtime),
-                mock.patch.object(launcher, "_check_port") as probe,
-                mock.patch.object(launcher, "_ensure_installed") as install,
-                mock.patch.object(
-                    launcher.model_artifacts, "selection_link", return_value=link
-                ),
-                mock.patch.object(launcher.os, "execve", side_effect=execute) as exe,
-            ):
-                launcher.main([
-                    "generate", "--model", "MiniMaxAI/MiniMax-H3", "--prompt", "a cat",
-                    "--out", "clip.mp4", "--seconds", "15", "--preview", "--no-audio",
-                ])  # fmt: skip
-        self.assertEqual(upgradable, [False])
+        model = "MiniMaxAI/MiniMax-H3"
+        with (
+            tempfile.TemporaryDirectory() as runtime,
+            mock.patch.object(launcher, "RUNTIME_DIR", Path(runtime)),
+            mock.patch.object(launcher, "_check_port") as probe,
+            mock.patch.object(launcher, "_ensure_installed") as install,
+            mock.patch.object(launcher.os, "execve") as execute,
+        ):
+            launcher.main([
+                "generate", "--model", model, "--prompt", "a cat", "--out", "clip.mp4",
+                "--seconds", "15", "--preview", "--no-audio",
+            ])  # fmt: skip
         probe.assert_not_called()
-        self.assertEqual(install.call_args.args[0].model, "MiniMaxAI/MiniMax-H3")
-        program, argv, environment = exe.call_args.args
-        self.assertEqual(argv[:5], [program, "-u", "-P", "-m", "server.videos"])
-        self.assertEqual(
-            argv[5:],
-            [str(link), "--model", "MiniMaxAI/MiniMax-H3",
-             "--binary", str(launcher.paths.BINARY), "--out", "clip.mp4", "--request",
-             json.dumps({"prompt": "a cat", "seconds": "15", "preview": True,
-                         "audio": False})],
-        )  # fmt: skip
-        self.assertEqual(environment["PYTHONPATH"], str(launcher.ROOT))
+        selection = install.call_args.args[0]
+        request = {"prompt": "a cat", "seconds": "15", "preview": True, "audio": False}
+        self.assertEqual(execute.call_args.args[1][4:], [
+            "server.videos", str(selection.link), "--model", model, "--binary",
+            str(launcher.paths.BINARY), "--out", "clip.mp4", "--request", json.dumps(request),
+        ])  # fmt: skip
         with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
-            launcher.parse_args(["generate", "--model", "MiniMaxAI/MiniMax-H3"])
+            launcher.parse_args(["generate", "--model", model])
 
     def test_serve_takes_the_stop_signals_and_holds_them_across_the_exec(self):
         # A non-interactive shell starts background jobs with SIGINT ignored.

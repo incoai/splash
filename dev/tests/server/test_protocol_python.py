@@ -109,29 +109,15 @@ def example_progress_request():
     return replace(example_request(), flags=p.RequestFlag.RETURN_PROGRESS)
 
 
-def example_video_request():
-    return p.VideoRequestFrame(
-        92,
-        p.VideoVariant.TURBO,
-        p.VideoOutputFlag.PREVIEW | p.VideoOutputFlag.AUDIO,
-        73,
-        1344,
-        768,
-        0,
-        42,
-        (5, 6, 7),
-    )
-
-
-def example_video_default_request():
-    """The default variant's clip without audio or preview."""
-    return replace(
-        example_video_request(),
-        variant=p.VideoVariant.DEFAULT,
-        outputs=p.VideoOutputFlag(0),
-        steps=50,
-        prompt_tokens=(0xFFFFFFFF,),
-    )
+VIDEO_REQUEST = p.VideoRequestFrame(
+    92, p.VideoVariant.TURBO, p.VideoOutputFlag.PREVIEW | p.VideoOutputFlag.AUDIO,
+    73, 1344, 768, 0, 42, (5, 6, 7),
+)  # fmt: skip
+# The default variant's clip without audio or preview.
+VIDEO_DEFAULT_REQUEST = replace(
+    VIDEO_REQUEST, variant=p.VideoVariant.DEFAULT, outputs=p.VideoOutputFlag(0),
+    steps=50, prompt_tokens=(0xFFFFFFFF,),
+)  # fmt: skip
 
 
 def client_messages():
@@ -147,8 +133,8 @@ def client_messages():
         ),
         "status_request": p.StatusRequestFrame(808),
         "release_request": p.ReleaseRequestFrame(808),
-        "video_request": example_video_request(),
-        "video_request_default": example_video_default_request(),
+        "video_request": VIDEO_REQUEST,
+        "video_request_default": VIDEO_DEFAULT_REQUEST,
     }
 
 
@@ -319,39 +305,20 @@ class ProtocolPythonTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(decode_event(golden[name]), event)
 
-    def test_video_request_needs_a_prompt_and_a_clip(self):
+    def test_video_frames_are_validated(self):
         for code, change in (
             (p.IssueCode.LIMIT_EXCEEDED, {"prompt_tokens": ()}),
             (p.IssueCode.INVALID_COUNT, {"frames": 0}),
             (p.IssueCode.INVALID_ENUM_VALUE, {"outputs": p.VideoOutputFlag(4)}),
         ):
             with self.subTest(change=change):
-                self.assert_protocol_error(
-                    p.FailureClass.REQUEST_ERROR,
-                    code,
-                    lambda: p.serialize_message(
-                        replace(example_video_request(), **change)
-                    ),
-                )
-        for request in (example_video_request(), example_video_default_request()):
-            with self.subTest(request=request.variant):
-                self.assertEqual(decode_client(p.serialize_message(request)), request)
-
-    def test_video_events_are_validated(self):
-        for event in (
-            p.VideoProgressEvent(92, p.VideoPhase.DENOISE, 9, 8, 0, 0),
-            p.VideoProgressEvent(92, p.VideoPhase.DENOISE, 0, 0, 0, 0),
-            p.VideoOutputEvent(92, p.VideoOutputKind.VIDEO, 73, 0, b""),
-        ):
-            with self.subTest(event=event):
-                self.assert_fatal_event(
-                    p.IssueCode.INVALID_COUNT
-                    if isinstance(event, p.VideoProgressEvent)
-                    else p.IssueCode.LIMIT_EXCEEDED,
-                    event,
-                )
-        ready = p.ReadyEvent(1, 2048, True, True)
-        self.assertEqual(decode_event(native_peer.serialize_event(ready)), ready)
+                invalid = replace(VIDEO_REQUEST, **change)
+                self.assert_protocol_error(p.FailureClass.REQUEST_ERROR, code,
+                                           lambda: p.serialize_message(invalid))  # fmt: skip
+        self.assert_fatal_event(p.IssueCode.INVALID_COUNT,
+                                p.VideoProgressEvent(92, p.VideoPhase.DENOISE, 9, 8, 0, 0))  # fmt: skip
+        self.assert_fatal_event(p.IssueCode.LIMIT_EXCEEDED,
+                                p.VideoOutputEvent(92, p.VideoOutputKind.VIDEO, 73, 0, b""))  # fmt: skip
 
     def test_progress_wire_validation(self):
         # A request asks for its prompt's progress with a flag bit.

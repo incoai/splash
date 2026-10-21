@@ -2195,11 +2195,11 @@ make test-video-http-real VIDEO_REFERENCES=... VIDEO_CONVERTED=... VIDEO_SECONDS
 
 `test-video-real` drives the engine with the golden prompt's saved hidden
 states (the engine's `--hidden-states`) and requires the 3 s golden clip's
-latents and frames (`--keep`) byte-identical, then cancels a clip.
-`test-video-http-real` does the same through `/v1/videos`, deletes a running
-job, then runs the clip of the server's tokenizer and the engine's encoder
-and reports its distance from the golden clip, and with `VIDEO_SECONDS=15` a
-15 s clip; the reports go to `build/release/video-*.json`.
+latents and frames (`--keep`) byte-identical to h3's references, as h3's
+own suite compares them, then cancels a clip. `test-video-http-real` does the
+same through `/v1/videos`, deletes a running job, then runs a clip of
+`VIDEO_SECONDS` from the server's tokenizer and the engine's encoder; the
+reports, each clip's phases, go to `build/release/video-*.json`.
 
 ## Internals
 

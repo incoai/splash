@@ -3,7 +3,7 @@ production is server/protocol.py."""
 
 import json
 import struct
-from dataclasses import replace
+from dataclasses import astuple, replace
 
 from server import protocol as wire
 
@@ -128,18 +128,11 @@ def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
             ) + event.json
         case wire.VideoProgressEvent():
             return wire.FrameType.VIDEO_PROGRESS, struct.pack(
-                "<QBIIQQ",
-                event.request_id,
-                event.phase,
-                event.step,
-                event.steps,
-                event.elapsed_micros,
-                event.peak_footprint_bytes,
+                "<QBIIQQ", *astuple(event)
             )
         case wire.VideoOutputEvent():
-            return wire.FrameType.VIDEO_OUTPUT, struct.pack(
-                "<QBIQ", event.request_id, event.output, event.frames, event.wall_micros
-            ) + event.mp4
+            *header, mp4 = astuple(event)
+            return wire.FrameType.VIDEO_OUTPUT, struct.pack("<QBIQ", *header) + mp4
     raise TypeError(f"{type(event).__name__} is not an engine event")
 
 
@@ -214,22 +207,6 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
     )
 
 
-def _decode_video_request(payload: bytes) -> wire.VideoRequestFrame:
-    (request_id, variant, outputs, frames, width, height, steps, seed,
-     count) = _VIDEO_REQUEST.unpack_from(payload)  # fmt: skip
-    return wire.VideoRequestFrame(
-        request_id,
-        wire.VideoVariant(variant),
-        wire.VideoOutputFlag(outputs),
-        frames,
-        width,
-        height,
-        steps,
-        seed,
-        _words(payload, _VIDEO_REQUEST.size, count),
-    )
-
-
 def decode_client_frame(frame_type: int, payload: bytes) -> wire.ClientMessage:
     """One client frame's message, read as the engine reads it but without
     checking the rules the server's encoder already enforced."""
@@ -247,7 +224,10 @@ def decode_client_frame(frame_type: int, payload: bytes) -> wire.ClientMessage:
         case wire.FrameType.RELEASE_REQUEST:
             return wire.ReleaseRequestFrame(*_ID.unpack(payload))
         case wire.FrameType.VIDEO_REQUEST:
-            return _decode_video_request(payload)
+            number, variant, outputs, *clip, count = _VIDEO_REQUEST.unpack_from(payload)
+            tokens = _words(payload, _VIDEO_REQUEST.size, count)
+            return wire.VideoRequestFrame(number, wire.VideoVariant(variant),
+                                          wire.VideoOutputFlag(outputs), *clip, tokens)  # fmt: skip
     raise ValueError(f"frame type {frame_type:#06x} is not a client frame")
 
 

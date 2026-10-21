@@ -129,13 +129,13 @@ test-release-real: preflight $(TARGET) agent-preflight verify-build-identity
 # The video model (DEVELOPMENT.md, Video): VIDEO_ROOT, the MiniMax-H3 a
 # selection prepared (by default `splash serve --model VIDEO_MODEL`'s), or
 # VIDEO_CONVERTED, images converted before, which the tests prepare first;
-# and VIDEO_REFERENCES, the directory of the h3 engine's references (its
-# golden prompt's hidden states, latents and frames). VIDEO_SECONDS=15 also
-# runs a 15 s clip through the server.
+# and VIDEO_REFERENCES, the h3 engine's references (its H3_REFS: the golden
+# prompt's hidden states, latents and frames). VIDEO_SECONDS is the length of
+# the clip of the server's own text encoder.
 VIDEO_MODEL ?= MiniMaxAI/MiniMax-H3
 VIDEO_ROOT ?= $(shell $(PYTHON) install/models.py --model "$(VIDEO_MODEL)" link)
 VIDEO_CONVERTED ?=
-VIDEO_REFERENCES ?=
+VIDEO_REFERENCES ?= $(H3_REFS)
 VIDEO_SECONDS ?= 3
 VIDEO_ARGS = --model "$(VIDEO_MODEL)" --references "$(VIDEO_REFERENCES)" \
 	$(if $(VIDEO_CONVERTED),--converted "$(VIDEO_CONVERTED)",--model-root "$(VIDEO_ROOT)")
