@@ -331,6 +331,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/LookupProposals.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \
+	runtime/model/ControlVector.cpp \
 	runtime/model/Qwen4Exp.cpp \
 	runtime/model/Qwen4Steps.cpp \
 	runtime/model/Qwen4ExpTarget.cpp \

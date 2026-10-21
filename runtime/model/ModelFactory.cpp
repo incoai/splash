@@ -12,6 +12,8 @@
 
 #include <array>
 #include <functional>
+#include <optional>
+#include <string>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -141,6 +143,17 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   result.descriptor = descriptor;
   if (!result.descriptor.valid())
     throw std::invalid_argument("model descriptor is invalid");
+  // A control vector's file is read before any weight: Qwen3.8-Flash-Next's
+  // forward pass applies one, no other family's does.
+  std::optional<ControlVectorTable> steering;
+  if (options.controlVector) {
+    const auto *layout = std::get_if<Qwen4ExpLayout>(&result.descriptor.target);
+    if (!layout)
+      throw std::invalid_argument("--control-vector steers " + std::string(Qwen4ExpLayout{}.family) +
+                                  " only, not " + result.descriptor.name);
+    steering = readControlVector(options.controlVector, Qwen4ExpLayout::ggufArchitecture, layout->layers,
+                                 layout->hiddenSize);
+  }
   result.images = std::make_shared<WeightImages>(backend, result.descriptor.sourceIdentity);
   WeightImages &images = *result.images;
   // Every source's metadata is checked before the first image is written:
@@ -148,6 +161,13 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   const auto vision = planVisionLoader(root, result.descriptor);
   DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
   result.target = loadTarget(backend, images, root, result.descriptor, options);
+  if (steering) {
+    // Its directions are the target's: its allocation counts with theirs.
+    Qwen4ExpWeights &target = std::get<Qwen4ExpWeights>(result.target);
+    const uint64_t before = backend.memoryStats().allocatedBytes;
+    target.controlVector = loadControlVector(backend, *steering);
+    target.actualAllocatedBytes += metal::allocationDelta(before, backend.memoryStats().allocatedBytes);
+  }
   result.draft = loadDFlashDraftWeights(backend, draft, result.descriptor.draft);
   result.vision = loadVisionWeights(backend, images, vision.get());
 
