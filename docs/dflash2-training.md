@@ -137,7 +137,7 @@ selection.json              # frozen selection and export digests
 
 Use the identical arguments and recipe with `--resume` after interruption.
 The command rejects changes to inputs, implementation, library versions, device
-context, or settings.
+context, or settings before allocating the teacher model.
 Resume restores the latest committed checkpoint, optimizer, RNG, and absolute
 block cursor in a deterministically shuffled epoch. Nonempty run directories
 require explicit resume. Exports use new directories and are published only
@@ -170,8 +170,11 @@ python -m draft_training evaluate \
 This compares original and trained drafts on the same untouched test traces.
 It reports unary CE, top-16 coverage, teacher-forced selector accuracy, and a
 histogram of consecutive matches along self-conditioned greedy paths. Anchor
-and bonus tokens are excluded. The configured block limit bounds evaluation and is distributed across
-continuations using the frozen seed; coverage counts are included in the report. Supplied-answer replay measures
+and bonus tokens are excluded. The configured block limit bounds evaluation
+and is distributed across scorable continuations using the frozen seed.
+Answers shorter than one full block are skipped, and unused per-continuation
+quotas are redistributed until the budget or available blocks are exhausted.
+Coverage counts are included in the report. Supplied-answer replay measures
 matches to those answers, not acceptance by the verifier.
 
 Replay is not a native throughput measurement or sampled verification test.

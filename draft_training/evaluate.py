@@ -4,9 +4,16 @@ import random
 from pathlib import Path
 
 import torch
+from safetensors import safe_open
 
 from .capture import load_sample
-from .config import TrainingError, checkpoint_identity, read_json, write_json
+from .config import (
+    TrainingError,
+    checkpoint_identity,
+    file_digest,
+    read_json,
+    write_json,
+)
 from .data import anchors, disjoint
 from .losses import block_loss
 
@@ -26,6 +33,48 @@ def evaluate_cached(model, embedding, head, directory, recipe, device):
             parameter.data = value
 
 
+def evaluation_plan(directory, manifest, block_size, recipe):
+    # Inspect only the small masks while planning. Keep feature tensors bounded
+    # to one continuation when scoring, and never spend budget on empty answers.
+    selected = []
+    shards = random.Random(recipe.seed).sample(
+        manifest["shards"], len(manifest["shards"])
+    )
+    for shard in shards:
+        path = Path(directory) / shard["file"]
+        with safe_open(path, framework="pt", device="cpu") as source:
+            mask = source.get_tensor("assistant_mask")
+        if mask.ndim != 1:
+            raise TrainingError("feature shard assistant mask must be one-dimensional")
+        choices = list(anchors({"assistant_mask": mask}, block_size))
+        if choices:
+            selected.append((shard, choices))
+            if len(selected) == recipe.max_validation_blocks:
+                break
+        elif file_digest(path) != shard["sha256"]:
+            # Scored shards are checked by load_sample. Check skipped shards
+            # here so a changed mask cannot silently remove an example.
+            raise TrainingError("feature shard digest mismatch")
+
+    quotas = [0] * len(selected)
+    remaining = recipe.max_validation_blocks
+    while remaining:
+        available = False
+        for i, (_, choices) in enumerate(selected):
+            if quotas[i] < len(choices):
+                available = True
+                quotas[i] += 1
+                remaining -= 1
+                if not remaining:
+                    break
+        if not available:
+            break
+    return [
+        (shard, random.Random(recipe.seed + i).sample(choices, quotas[i]))
+        for i, (shard, choices) in enumerate(selected)
+    ]
+
+
 def _evaluate_cached(model, embedding, head, directory, recipe, device):
     model.eval()
     manifest = read_json(Path(directory) / "manifest.json")
@@ -40,19 +89,10 @@ def _evaluate_cached(model, embedding, head, directory, recipe, device):
     histogram = [0] * model.flash["block_size"]
     # Spend the frozen block budget across conversations, rather than letting
     # the first long continuation consume the entire validation/test set.
-    selected = random.Random(recipe.seed).sample(
-        manifest["shards"], min(len(manifest["shards"]), recipe.max_validation_blocks)
-    )
+    selected = evaluation_plan(directory, manifest, model.flash["block_size"], recipe)
     totals["continuations_evaluated"] = 0
-    for shard_index, shard in enumerate(selected):
+    for shard, choices in selected:
         sample = load_sample(directory, shard, device)
-        choices = list(anchors(sample, model.flash["block_size"]))
-        quota = recipe.max_validation_blocks // len(selected) + (
-            shard_index < recipe.max_validation_blocks % len(selected)
-        )
-        choices = random.Random(recipe.seed + shard_index).sample(
-            choices, min(len(choices), quota)
-        )
         totals["continuations_evaluated"] += bool(choices)
         for anchor in choices:
             with torch.autocast(

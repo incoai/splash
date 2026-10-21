@@ -301,3 +301,55 @@ class CaptureTests(unittest.TestCase):
             with self.assertRaisesRegex(TrainingError, "implementation"):
                 run_evaluation(args)
         self.assertFalse(args.output.exists())
+
+    def test_resume_rejects_changed_identity_before_loading_teacher(self):
+        from unittest import mock
+
+        from draft_training.__main__ import parse_args, run_training
+        from draft_training.config import write_json
+        from draft_training.data import split_manifest
+        from draft_training.export import export_model
+
+        model, _, _ = tiny_components()
+        draft = self.root / "draft"
+        export_model(model, draft, {}, family=False)
+        training, validation = self.root / "train.jsonl", self.root / "validation.jsonl"
+        write_data(training, "w5 w6")
+        write_data(validation, "w7 w8")
+        output = self.root / "run"
+        output.mkdir()
+        write_json(output / "run.json", {"run_identity": "different"})
+        args = parse_args(
+            [
+                "train",
+                "--target",
+                str(self.target),
+                "--init-draft",
+                str(draft),
+                "--data",
+                str(training),
+                "--validation-data",
+                str(validation),
+                "--output",
+                str(output),
+                "--device",
+                "cpu",
+                "--resume",
+            ]
+        )
+        with (
+            mock.patch(
+                "draft_training.__main__.inspect_training",
+                return_value=(
+                    model.raw_config,
+                    self.recipe,
+                    split_manifest(training),
+                    split_manifest(validation),
+                ),
+            ),
+            mock.patch("draft_training.capture.TargetAdapter.load") as load,
+        ):
+            with self.assertRaisesRegex(TrainingError, "resume configuration"):
+                run_training(args, family=False)
+            load.assert_not_called()
+        self.assertEqual(read_json(output / "run.json"), {"run_identity": "different"})

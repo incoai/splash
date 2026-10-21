@@ -193,14 +193,14 @@ def run_training(args, *, family=True):
     torch.manual_seed(recipe.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(recipe.seed)
-    adapter = TargetAdapter.load(
-        args.target, config["dflash_config"]["target_layer_ids"], args.device
-    )
     if args.preflight:
         from .data import conversations, examples
         from .losses import block_loss
         from .trainer import configure_trainable
 
+        adapter = TargetAdapter.load(
+            args.target, config["dflash_config"]["target_layer_ids"], args.device
+        )
         messages, answer = next(examples(conversations(args.data), args.supervision))
         sample = {
             name: value.to(args.device)
@@ -299,6 +299,10 @@ def run_training(args, *, family=True):
             raise TrainingError(
                 "resume configuration or input files differ from the original run"
             )
+    # Reject an incompatible resume before allocating the full BF16 teacher.
+    adapter = TargetAdapter.load(
+        args.target, config["dflash_config"]["target_layer_ids"], args.device
+    )
     args.output.mkdir(parents=True, exist_ok=True)
     write_json(
         args.output / "run.json",

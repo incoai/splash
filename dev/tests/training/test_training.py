@@ -323,3 +323,59 @@ class TrainingTests(unittest.TestCase):
         )
         self.assertEqual(metrics["blocks"], 6)
         self.assertEqual(metrics["continuations_evaluated"], 3)
+
+    def validation_continuations(self, assistant_lengths):
+        from safetensors.torch import load_file, save_file
+
+        from draft_training.config import file_digest, write_json
+
+        sample = load_file(str(self.validation / "000000.safetensors"))
+        manifest = read_json(self.validation / "manifest.json")
+        manifest["shards"] = []
+        for i, length in enumerate(assistant_lengths):
+            sample["assistant_mask"] = self.torch.arange(24) >= 24 - length
+            path = self.validation / f"{i:06d}.safetensors"
+            save_file(sample, str(path))
+            manifest["shards"].append(
+                {"file": path.name, "sha256": file_digest(path), "tokens": 24}
+            )
+        write_json(self.validation / "manifest.json", manifest)
+
+    def test_evaluation_skips_short_continuations_before_spending_budget(self):
+        from draft_training.evaluate import evaluate_cached
+
+        # With seed 42, the old one-shard sample chose only the short answer.
+        self.validation_continuations([1, 12])
+        recipe = replace(self.recipe, max_validation_blocks=1)
+        first = evaluate_cached(
+            self.model, self.embedding, self.head, self.validation, recipe, "cpu"
+        )
+        self.assertEqual(first["blocks"], 1)
+        self.assertEqual(first["continuations_evaluated"], 1)
+        self.assertEqual(first["total_continuations"], 2)
+        self.assertEqual(
+            first,
+            evaluate_cached(
+                self.model, self.embedding, self.head, self.validation, recipe, "cpu"
+            ),
+        )
+
+    def test_evaluation_redistributes_unused_continuation_quota(self):
+        from draft_training.evaluate import evaluate_cached
+
+        # One answer supplies one block; the other supplies six. Both orders
+        # must fill the six-block budget without duplicating any anchors.
+        for lengths in ([7, 12], [12, 7]):
+            with self.subTest(lengths=lengths):
+                self.validation_continuations(lengths)
+                recipe = replace(self.recipe, max_validation_blocks=6)
+                metrics = evaluate_cached(
+                    self.model,
+                    self.embedding,
+                    self.head,
+                    self.validation,
+                    recipe,
+                    "cpu",
+                )
+                self.assertEqual(metrics["blocks"], 6)
+                self.assertEqual(metrics["continuations_evaluated"], 2)
