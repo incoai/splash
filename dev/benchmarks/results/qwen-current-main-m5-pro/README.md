@@ -13,7 +13,7 @@ is recorded independently of CI and legacy oracle logs.
 | --- | --- |
 | Current native build, CPU and ASAN/UBSAN/TSAN suites | PASS locally; complete build and CPU/sanitizer logs are attached. |
 | Current full Python/lint/format check | PASS locally: 1,348 tests, 27 skips; compileall, Ruff lint and format pass (188 files). |
-| Four models × INT8/BF16 KV × FP32/BF16 recurrent state | Fresh shader-validated matrix is in progress. One MoE GGUF BF16-KV/FP32-state cell fails the upstream cross-graph penalty assertion; its original failing log is retained. An isolated test-oracle correction is being verified. No legacy log is substituted. |
+| Four models × INT8/BF16 KV × FP32/BF16 recurrent state | Fresh shader-validated matrix is in progress. One MoE GGUF BF16-KV/FP32-state cell fails the upstream cross-graph penalty assertion; its original failing log is retained. The isolated test-oracle correction in [#526](https://github.com/incoai/splash/pull/526) passes that invocation; broader final-source checks are queued. No legacy log is substituted. |
 | MoE GGUF and dense MLX all/auto decode/mixed HTTP | Four functional reports queued; one trial each, not broad performance qualification. |
 | Other hardware | **Unexecuted.** `maintainer-prepared.json` is preparation, not a passing test. |
 
@@ -75,8 +75,15 @@ The frozen upstream oracle fails `moe-gguf-oracle-bf16-fp32` with
 compares incremental selections with logits recomputed through prefill.
 It therefore also depends on cross-graph numerical drift, whose bound cannot
 be inferred from a different unpenalized trajectory. A separate test-only
-patch is under verification: snapshot the same forward before penalties,
+patch in [#526](https://github.com/incoai/splash/pull/526) verifies: snapshot the same forward before penalties,
 independently calculate the policy from prompt/output/prefix counts in fp64,
 and check every actual policy logit and the greedy winner with an fp32
 arithmetic allowance. The original failure remains a failure in `summary.json`;
 it is not converted into a passing upstream run.
+
+The initial corrected invocation passes all original runtime scenarios and
+12 strict penalty/preemption checks covering 248 initial/retained rows,
+with maximum normalized fp64-reference error `5.90884e-08`. Its old cold-score
+loss remains `0.205502`. That evidence is independently source-scoped in #526;
+the frozen upstream result here remains failed. Existing issue [#437](https://github.com/incoai/splash/issues/437)
+contains the related earlier report on a different model/M5 configuration.

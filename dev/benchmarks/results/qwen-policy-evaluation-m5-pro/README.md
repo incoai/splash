@@ -98,7 +98,7 @@ The four held-out report intervals above are unaffected by the power audit.
 ## Evidence and interpretation
 
 `policy-summary.json` identifies selected controls, every training artifact,
-held-out counts, pending reference replacements and the control-patch hash.
+held-out counts, completed reference replacements and the control-patch hash.
 The 14 training reports and four held-out reports retain every arm and sample;
 generated answer text is removed and prompt text is represented by SHA-256.
 Raw `complete` means a harness executed; qualification validity and ABBA

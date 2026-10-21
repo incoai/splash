@@ -9,7 +9,7 @@ download was stopped throughout timing. Power/thermal snapshots accompany each
 job. No reported thermal warning is a frequency-stability guarantee; the ABBA
 noise check still applies. Builds and metallibs were frozen during all runs.
 
-**Decision: keep `SPLASH_LIVE_GDN=0` and PR #511 in draft.** The pending-tape
+**Decision: keep `SPLASH_LIVE_GDN=0`; PR #511 is closed as an archived experiment.** The pending-tape
 implementation passes the correctness gates exercised here, but no stable
 native or production HTTP comparison clears the promotion threshold. The
 experiment is complete on this machine; it does not establish a useful serving

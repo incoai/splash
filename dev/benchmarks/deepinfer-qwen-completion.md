@@ -2,6 +2,7 @@
 
 Tracking issue: [#508](https://github.com/incoai/splash/issues/508).
 Current-main contribution: [#523](https://github.com/incoai/splash/pull/523).
+Separate test-only penalty-oracle correction: [#526](https://github.com/incoai/splash/pull/526), related to existing [#437](https://github.com/incoai/splash/issues/437).
 This file records what the six-step [plan](deepinfer-qwen-plan.md) produced,
 which implementation was measured, and why each conditional change was kept
 or rejected. All six frozen-source local experiments now have complete measured decisions.
@@ -109,3 +110,19 @@ protocols and benchmark-only patches are not current-main instructions. The
 current [maintainer recipe](qwen-maintainer-runs.md) requires no private runtime
 patch. Other hardware results can be returned against #508/#523 without
 changing the interpretation of this Mac's measured decisions.
+
+## Fresh penalty-oracle correction
+
+The current-main matrix uncovered a MoE GGUF BF16-KV/FP32-state failure in
+the existing cold-prefill score comparison. That original failure remains in
+the unchanged-runtime bundle. PR #526 is separate from the tools/evidence
+contribution: its instrumented observer snapshots actual forward logits before
+penalties, then an independent fp64 reference checks prompt/output/accepted
+prefix counts, every vocabulary logit in the initial/retained rows and the
+actual greedy maximum. The initial correction passes the formerly failing
+complete invocation while the old cold-score loss `0.205502` still reproduces;
+248 policy rows have maximum normalized arithmetic error `5.90884e-08`.
+Four representative final-reference source cells are queued after the original
+matrix/HTTP runs. Production preprocessed Runtime.cpp is identical with the
+instrumentation macro unset. This test correction does not locate or repair
+the model’s cross-graph numerical drift.

@@ -21,7 +21,7 @@ The roadmap is tracked in [#508](https://github.com/incoai/splash/issues/508).
 Completing a conditional optimization means implementing and testing its
 experiment, measuring its gate, and recording the resulting decision. A failed
 speed or latency gate leaves that experiment out of the product. Historical
-runtime PRs #507/#509/#510/#511/#522 are preserved separately; #523 is the
+runtime PRs #507/#509/#510/#511/#522 are closed as archived experiments; #523 is the
 reviewable contribution based on current main.
 
 | Step | Current status | Remaining gate |
@@ -39,7 +39,8 @@ current-main native build, CPU/sanitizer suites and full Python check also pass
 matrix and four functional all/auto HTTP checks are still executing. A fresh
 MoE GGUF BF16-KV/FP32-state cell failed the upstream cold-score penalty
 assertion; the original failure is retained while a same-forward test oracle
-is verified separately. These results are not inferred from historical runs. The [review ledger](deepinfer-qwen-completion.md) links
+is verified separately in [#526](https://github.com/incoai/splash/pull/526),
+related to existing [#437](https://github.com/incoai/splash/issues/437). These results are not inferred from historical runs. The [review ledger](deepinfer-qwen-completion.md) links
 the scopes and evidence.
 
 Only this M5 Pro is available for local runs. Other GPU families will receive

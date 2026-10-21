@@ -1,6 +1,6 @@
 # Bounded context-aware prefill cost experiment
 
-**Versioned historical experiment:** runtime instructions and results below apply to their pinned legacy revisions. The runtime flags/build targets are not current-main settings. See [the October 21 current-main audit](current-main-audit.md) and [current qualification recipe](qwen-maintainer-runs.md). Replacement runs and final validation are still being completed.
+**Versioned historical experiment:** runtime instructions and results below apply to their pinned legacy revisions. The runtime flags/build targets are not current-main settings. See [the October 21 current-main audit](current-main-audit.md) and [current qualification recipe](qwen-maintainer-runs.md). The local experiment and awake replacements are complete; see the [completion ledger](deepinfer-qwen-completion.md) for measured decisions. Current-main validation is reported separately.
 
 
 This implements the conditional scheduler experiment in step 6 of

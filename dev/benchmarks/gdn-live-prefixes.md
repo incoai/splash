@@ -1,6 +1,6 @@
 # Optional GDN verification prefixes with pending tapes
 
-**Versioned historical experiment:** runtime instructions and results below apply to their pinned legacy revisions. The runtime flags/build targets are not current-main settings. See [the October 21 current-main audit](current-main-audit.md) and [current qualification recipe](qwen-maintainer-runs.md). Replacement runs and final validation are still being completed.
+**Versioned historical experiment:** runtime instructions and results below apply to their pinned legacy revisions. The runtime flags/build targets are not current-main settings. See [the October 21 current-main audit](current-main-audit.md) and [current qualification recipe](qwen-maintainer-runs.md). The local experiment and awake replacements are complete; see the [completion ledger](deepinfer-qwen-completion.md) for measured decisions. Current-main validation is reported separately.
 
 
 This is step 3 of the [Qwen roadmap](deepinfer-qwen-plan.md), tracked in
@@ -94,12 +94,12 @@ work and state traffic remain. A kernel speedup alone cannot establish a useful
 serving gain. The experimental flag stays off unless complete serving runs
 clear `max(2%, 2 * measured noise)` without correctness/latency regressions;
 spread above 5% is inconclusive. Other Apple GPU families remain unexecuted
-until the [maintainer package](https://github.com/incoai/splash/pull/510) runs there.
+until the [maintainer package](qwen-maintainer-runs.md) runs there.
 
 Local performance qualification is complete. The [M5 Pro evidence bundle](results/qwen-gdn-live-prefixes-m5-pro/README.md)
 contains 4,096 native cycle samples, production HTTP comparisons, disabled-path
 controls, source/model/build identities and five passing shader/oracle logs.
 GGUF and warmed MLX native gains are 0.11–1.20%, below the 2% minimum; the
 initial MLX series also has no gain above its noise-adjusted gate. No HTTP trial
-clears its noise-adjusted gate. Keep the flag off and PR #511 in draft as a
-reviewable experiment; this is a measured decision against promoting it.
+clears its noise-adjusted gate. Keep the historical flag off. PR #511 is closed as an archived experiment;
+#523 retains its evidence. This is a measured decision against promotion.

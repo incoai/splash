@@ -1,6 +1,6 @@
 # Qwen live verification on this Mac
 
-**Versioned historical experiment:** runtime instructions and results below apply to their pinned legacy revisions. The runtime flags/build targets are not current-main settings. See [the October 21 current-main audit](current-main-audit.md) and [current qualification recipe](qwen-maintainer-runs.md). Replacement runs and final validation are still being completed.
+**Versioned historical experiment:** runtime instructions and results below apply to their pinned legacy revisions. The runtime flags/build targets are not current-main settings. See [the October 21 current-main audit](current-main-audit.md) and [current qualification recipe](qwen-maintainer-runs.md). The local experiment and awake replacements are complete; see the [completion ledger](deepinfer-qwen-completion.md) for measured decisions. Current-main validation is reported separately.
 
 
 The first implementation improves native MoE decode throughput by 6–7% and
@@ -149,7 +149,12 @@ command and outcome are recorded
 in the measurement bundle's [validation record](results/qwen-live-verification-m5-pro/validation.md).
 Complete logs remain in the local ignored build directory.
 
-## Decisions and remaining work
+## Initial-phase decisions and next steps (historical)
+
+This section preserves the initial phase’s interpretation. The subsequent
+GDN, adaptive-policy, host and mixed-prefill experiments are complete in the
+[completion ledger](deepinfer-qwen-completion.md); the next steps below are
+not outstanding local work.
 
 Operator attribution places expert kernels at roughly 40–50% of decode time;
 GDN is roughly 4–7%. Attributed dispatches execute separately, so these shares
