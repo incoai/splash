@@ -145,15 +145,16 @@ std::array<uint64_t, prefillTensorCount> prefillTensorBytes(const RuntimeGeometr
                       geometry.draftRotaryPairs()));
   // The split partials and counters, the rotated rows, the register tile's
   // tables of the plans of up to 32 rows and the int8 tile's codes and scales
-  // of a full chunk: the target's, and the draft's context projections' on
+  // of a full chunk: the target's, and any draft's context projections' on
   // the draft's plans.
   ops::LinearScratchSize linear;
   for (const auto &projection : geometry.target.prefillProjections)
     linear.include(operators.linear().scratchSize(projection, rows));
   const auto &draft = geometry.draft;
-  for (const ops::ProjectionShape projection :
-       {ops::ProjectionShape{draft.hiddenSize, draft.targetHiddenSize()}, {draft.contextKvSize(), draft.hiddenSize}})
-    linear.include(operators.draftLinear().scratchSize(projection, rows));
+  if (draft.present())
+    for (const ops::ProjectionShape projection :
+         {ops::ProjectionShape{draft.hiddenSize, draft.targetHiddenSize()}, {draft.contextKvSize(), draft.hiddenSize}})
+      linear.include(operators.draftLinear().scratchSize(projection, rows));
   put(PrefillTensor::LinearPartials, linear.partials);
   put(PrefillTensor::LinearCounters, linear.counters);
   put(PrefillTensor::LinearTable, linear.input);
@@ -204,8 +205,11 @@ std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators) {
   std::array<uint64_t, decodeTensorCount> result{};
+  // A model without a draft has no draft tensors: the draft dimensions size
+  // them to nothing, and its attention none.
   const auto draftWorkspace =
-      operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape());
+      geometry.draft.present() ? operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape())
+                               : ops::DraftAttentionWorkspace{};
   const auto samplingWorkspace = ops::Sampling::workspace(kDecodeRows);
   const auto selectorWorkspace = ops::DraftSelector::workspace(kDraftProposalTokens);
   auto put = [&](DecodeTensor tensor, uint64_t bytes) {
@@ -329,6 +333,9 @@ ops::ProjectionShape draftShape(uint32_t outputSize, uint32_t inputSize) {
 uint32_t draftStepLanes(const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators, uint32_t lanes) {
   const auto &d = geometry.draft;
   const auto &t = geometry.target;
+  // A model without a draft runs no draft step: its lanes alone.
+  if (!d.present())
+    return lanes;
   const uint32_t rows = lanes * kDraftRows;
   uint32_t storage = rows;
   for (const auto &[output, input] : {std::pair{d.dynamicSize, d.hiddenSize}, {d.qkvSize, d.hiddenSize},
@@ -369,9 +376,11 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   const auto &d = geometry.draft;
   ops::LinearScratchSize result;
   // A step's rows: the target's projections, the vocabulary head shared with
-  // the draft among them, and the draft's context projections.
+  // any draft among them, and the draft's context projections.
   for (const auto &p : geometry.target.decodeProjections)
     result.include(operators.decodeLinear().scratchSize(p, geometry.target.stepRows()));
+  if (!d.present())
+    return result;
   for (const ops::ProjectionShape shape :
        {ops::ProjectionShape{d.hiddenSize, d.targetHiddenSize()}, {d.contextKvSize(), d.hiddenSize}})
     result.include(operators.draftDecodeLinear().scratchSize(shape, geometry.target.stepRows()));

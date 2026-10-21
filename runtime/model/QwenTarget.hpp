@@ -194,8 +194,8 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   // The layout itself was checked by requireQwenLayout when the target
   // loaded. The draft reads 1 to ExecutionLimits::maximumDraftTargetLayers
   // of its layers, ascending, or its head's rows past them where it reads
-  // layer inputs (draftReadableLayers). A target without GDN layers has no
-  // GDN shape.
+  // layer inputs (draftReadableLayers), and a target without a draft none. A
+  // target without GDN layers has no GDN shape.
   // The projection lists hold every projection the weights dispatch, which
   // each have sizes; a target with dense FFNs, a MoE target's leading layers
   // too, holds their gate and up projections.
@@ -206,7 +206,8 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
       });
     };
     const auto captured = [&] {
-      if (!captureLayerCount || captureLayerCount > ExecutionLimits::maximumDraftTargetLayers) return false;
+      if (!captureLayerCount) return true;
+      if (captureLayerCount > ExecutionLimits::maximumDraftTargetLayers) return false;
       const auto ids = captureLayers();
       return std::ranges::adjacent_find(ids, std::ranges::greater_equal{}) == ids.end() &&
              ids.back() < draftReadableLayers();

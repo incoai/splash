@@ -420,9 +420,13 @@ void reportStreamedStores(const model::LoadedModel &loaded, const model::Streama
 
 // The rows the target's decode cycles verify (--verify-rows), and why: those
 // its cycles' cost line's floor passes where its experts stream
-// (model::CostLine).
-void reportVerifyRows(model::VerifyRows rows, bool streamed) {
-  if (rows == model::VerifyRows::All)
+// (model::CostLine); a model installed without a draft verifies its anchors
+// alone, whatever --verify-rows says.
+void reportVerifyRows(const model::LoadedModel &loaded, model::VerifyRows rows, bool streamed) {
+  if (!loaded.descriptor.draft.present())
+    logLine("Decode cycles select one token each: ", loaded.name(),
+            " was installed without a draft (--draft-model none).");
+  else if (rows == model::VerifyRows::All)
     logLine("Decode cycles verify every row of the draft's block (--verify-rows all).");
   else
     logLine("Decode cycles verify the rows ",
@@ -481,7 +485,7 @@ std::array<uint8_t, 32> parseSha256(std::string_view value) {
 
 void requireLoadedModel(const model::LoadedModel &loaded) {
   if (!loaded.targetActualAllocatedBytes() ||
-      !loaded.draft.actualAllocatedBytes ||
+      (loaded.descriptor.draft.present() && !loaded.draft.actualAllocatedBytes) ||
       (loaded.descriptor.hasVision() && !loaded.vision.actualAllocatedBytes) ||
       loaded.manifestFingerprintSha256.empty() ||
       loaded.targetManifestFingerprint().empty()) {
@@ -1072,7 +1076,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   };
 
   ready();
-  reportVerifyRows(config.verifyRows, loaded.expertStore() != nullptr);
+  reportVerifyRows(loaded, config.verifyRows, loaded.expertStore() != nullptr);
 
   // The automatic tier keeps its staging only where the plan holds the model
   // and the requested context beside it, the parts as they load, or where

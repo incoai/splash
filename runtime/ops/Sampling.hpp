@@ -203,11 +203,14 @@ public:
                   SamplingBuffers buffers, std::span<const uint32_t> rows,
                   const StopTokens &stopTokens,
                   const PenaltyTable &penalties) const;
+  // The verify of a model without a draft (`drafted` false) tests no draft
+  // children: each lane's one row, its anchor's, draws from the target's
+  // distribution alone, which acceptance then keeps.
   void addVerify(metal::CommandGraph &graph,
                  std::span<const SamplingPolicy> policies,
                  SamplingBuffers buffers, const StepRows &step,
                  const StopTokens &stopTokens,
-                 const PenaltyTable &penalties) const;
+                 const PenaltyTable &penalties, bool drafted = true) const;
   // Each lane's acceptance of its rows of a decode step (addVerify's) as a
   // tree: the path its rows' selections follow from its anchor, of which
   // it retains at most maximumRetained[lane] rows (metal/abi/Sampling.h

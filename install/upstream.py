@@ -960,7 +960,8 @@ def _install(
     """Assemble repo's target and its draft, and publish the assembly at the
     selection link. draft is the draft's repository as this start resolved
     it, or None to resolve it here, asking the Hub only when it answered for
-    repo. language_only, when given, takes the selection's place, and
+    repo; a selection without a draft (--draft-model none) assembles none.
+    language_only, when given, takes the selection's place, and
     keep_tower publishes nothing over an assembly another start gave its
     tower since (_reassemble, publish)."""
     # Every Hub request (header reads, downloads) happens here.
@@ -978,13 +979,15 @@ def _install(
         # holding the tower and text tensors, downloads once.
         names = set(target.files.values())
         following = sum(size for size, _ in repo.missing(names))
-        draft, files = _draft(target, installed, draft, following)
+        draft, files = (
+            _draft(target, installed, draft, following) if draft else (None, {})
+        )
         vision = "disabled" if target.vision_format == "none" else "enabled"
         if target.vision_note:
             vision += f" ({target.vision_note})"
         print(
             f"Installing {selection.model} as {target.family.name} ({target.format}); "
-            f"draft {draft.name}; vision {vision}.",
+            f"draft {draft.name if draft else models.NO_DRAFT}; vision {vision}.",
             flush=True,
         )
         downloaded = repo.download(names)
@@ -1017,17 +1020,17 @@ def _install(
 
 def assembly_record(model, target, repo, draft, installed=None):
     """The record of model's assembly of target, inspected in repo, and the
-    draft repository draft, but for the files it links (publish). A text
-    target records why it serves no images where the Hub's listing of its
-    commit said so: now (paths None: not the Hub cache's), or as installed,
-    the assembly of the same commit it replaces, records it."""
+    draft repository draft, or None for none, but for the files it links
+    (publish). A text target records why it serves no images where the Hub's
+    listing of its commit said so: now (paths None: not the Hub cache's), or
+    as installed, the assembly of the same commit it replaces, records it."""
     record = {
         "version": 1,
         "model": model,
         "family": target.family.name,
         "target_format": target.format,
         "vision_format": target.vision_format,
-        "sources": {"target": repo.identity(), "draft": draft.identity()},
+        "sources": {"target": repo.identity(), "draft": draft and draft.identity()},
     }
     if target.vision_note and repo.paths is None:
         record["vision_unavailable"] = target.vision_note
@@ -1120,7 +1123,9 @@ def _changes(installed, family, draft):
         return [f"no supported family is named {installed['family']}"]
     changes = []
     recorded = installed["sources"]["draft"]
-    if draft.identity() != recorded:
+    # A selection's draft source, a draft or none, is the selection's own:
+    # only a draft's commit or its family's repository changes.
+    if draft and draft.identity() != recorded:
         changes.append(
             f"{draft.name} moved from {recorded['revision'][:12]} to {draft.revision[:12]}"
             if draft.name == recorded["repo"]
@@ -1138,7 +1143,16 @@ def _resolve_draft(family, selection, installed, target):
     release, at its default branch's commit: one Hub request, made only when
     the Hub answered for the target. Otherwise, or when it cannot be
     resolved, the installed draft stands in; without one, a commit the Hub
-    cache holds, else it fails with the target's reason and class."""
+    cache holds, else it fails with the target's reason and class. None for
+    a selection without a draft (--draft-model none), which asks the Hub
+    nothing for one, of a family that serves without one."""
+    if selection.draft_model == models.NO_DRAFT:
+        if not family.draftless:
+            raise models.ModelError(
+                f"{family.name} serves only with a DFlash2 draft; "
+                f"--draft-model {models.NO_DRAFT} cannot be used for it"
+            )
+        return None
     name = selection.draft_model or family.draft_repo
     recorded = installed and installed["sources"]["draft"]
     asked = _answered(target)
