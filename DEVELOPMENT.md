@@ -1619,7 +1619,10 @@ it describes. For a GGUF the check also takes the scalar metadata of its
 header, which the installer copies (`gguf.scalar_metadata`), and holds it to
 the rules every start's planner holds the file to (`gguf::requireMetadata`):
 its sizes, RoPE base, dimensions and scaling, RMS epsilon, GDN sizes, FFN
-widths and experts. The target's text configuration is checked before its
+widths and experts. The routed experts' count is the family's or another
+count the family's kernels plan (`QwenTargetDimensions::supportedExperts`),
+as an expert-pruned release's header declares; any other is refused. The
+target's text configuration is checked before its
 vision tower (a GGUF's projector, an MLX target's processor and the shards
 holding its tower) and the tower's configuration, so a model of no family
 Splash serves is told so whatever its tower, and the check runs again with the

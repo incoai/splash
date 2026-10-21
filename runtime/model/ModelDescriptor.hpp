@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DFlashDraft.hpp"
+#include "GgufFile.hpp"
 #include "Model.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
@@ -70,6 +71,15 @@ struct ModelDescriptor final {
                                                   VisionSource visionSource);
 [[nodiscard]] ModelDescriptor
 inspectModelRoot(const std::filesystem::path &root);
+// The layout a GGUF target of `layout`'s family is planned, sized and loaded
+// with, given the scalar metadata of its header: the family's, with a
+// supported MoE expert count the GGUF itself declares in place of the
+// layout's (QwenTargetDimensions::supportedExperts). A GGUF whose count is
+// none of them keeps the layout, which the planner's check
+// (gguf::requireMetadata) then refuses, so every other dimension stays the
+// family's.
+[[nodiscard]] TargetLayout adaptedTargetLayout(const TargetLayout &layout,
+                                               const GgufMetadata &metadata);
 // `model` served for a context of `contextTokens`, zero for auto: as it is
 // within its native window, and past it with YaRN by the context over the
 // native window (RopeScaling), whose window is that context

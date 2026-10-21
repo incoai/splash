@@ -624,6 +624,27 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
     rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, metadata, std::nullopt)); }, error,
             "Qwen3.8-Flash-Next accepted metadata the kernels do not compute");
   }
+  // The family's expert-pruned Coder release, whose GGUF holds half the
+  // routed experts: its header's expert_count is one of the counts the
+  // kernels plan, which the layout takes; a count of no supported variant,
+  // and an expert count each token takes of the family's, are refused.
+  const std::string coderMetadata = text(fixtures / "qwen3.8-flash-next" / "coder-gguf-metadata.json");
+  require(check("gguf", "none", flashConfig, coderMetadata, std::nullopt) == "Qwen3.8-Flash-Next",
+          "the expert-pruned Coder GGUF's metadata was not found to be its family");
+  rejects([&] {
+    static_cast<void>(check("gguf", "none", flashConfig,
+                            replaced(coderMetadata, R"("qwen4exp.expert_count": 256)",
+                                     R"("qwen4exp.expert_count": 999)"),
+                            std::nullopt));
+  }, "GGUF metadata does not match the target: expert_count 999 (expected 512)",
+          "a GGUF of an unsupported expert count was accepted");
+  rejects([&] {
+    static_cast<void>(check("gguf", "none", flashConfig,
+                            replaced(coderMetadata, R"("qwen4exp.expert_used_count": 10)",
+                                     R"("qwen4exp.expert_used_count": 16)"),
+                            std::nullopt));
+  }, "GGUF metadata does not match the target: expert_used_count 16 (expected 10)",
+          "the Coder's metadata was accepted with another expert count each token takes");
   struct RefusedMetadata final {
     std::string_view config;
     const std::string &metadata;

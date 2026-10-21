@@ -1,5 +1,6 @@
 #include "ModelDescriptor.hpp"
 #include "GgufImage.hpp"
+#include "GgufTarget.hpp"
 #include "SafetensorsImage.hpp"
 #include "WeightStore.hpp"
 #include "metal/abi/DraftAttention.h"
@@ -800,10 +801,37 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
       throw std::invalid_argument("the model's root holds no draft/ for its DFlash2 draft");
     NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
     ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft);
+    // A GGUF target's MoE expert count is the family's or one of the other
+    // counts its kernels plan (adaptedTargetLayout), as a pruned release's
+    // header declares: the descriptor takes it, so what sizing plans and
+    // what loads agree with what the planner checks the file to.
+    if (result.targetSource == TargetSource::Gguf &&
+        std::filesystem::exists(root / "target")) {
+      const OpenGguf target(findTargetGgufs(root / "target"));
+      result.target = adaptedTargetLayout(result.target, target.file().metadata());
+    }
     result.sourceIdentity = std::move(sourceIdentity);
     if (!result.valid()) throw std::invalid_argument("incompatible target and draft model");
     return result;
   }
+}
+
+TargetLayout adaptedTargetLayout(const TargetLayout &layout, const GgufMetadata &metadata) {
+  return std::visit(
+      [&](const auto &family) -> TargetLayout {
+        if (family.ffnKind == QwenFfnKind::SparseMoe) {
+          const std::optional<uint64_t> declared =
+              metadata.unsignedValue(std::string(family.ggufArchitecture) + ".expert_count");
+          for (const uint32_t supported : family.supportedExperts)
+            if (supported && declared == uint64_t{supported} && family.experts != supported) {
+              auto adapted = family;
+              adapted.experts = supported;
+              return adapted;
+            }
+        }
+        return layout;
+      },
+      layout);
 }
 
 std::string_view inspectSourceConfiguration(std::string_view targetFormat, std::string_view visionFormat,
@@ -818,8 +846,9 @@ std::string_view inspectSourceConfiguration(std::string_view targetFormat, std::
     if (descriptor.targetSource == TargetSource::Gguf) {
       if (!ggufMetadata) throw std::invalid_argument("a GGUF target is checked with its metadata");
       const GgufMetadata metadata = readGgufMetadata(*ggufMetadata);
+      const TargetLayout layout = adaptedTargetLayout(descriptor.target, metadata);
       std::visit([&](const auto &layout) { gguf::requireMetadata(metadata, layout.ggufArchitecture, layout); },
-                 descriptor.target);
+                 layout);
     }
     return descriptor.family();
   }

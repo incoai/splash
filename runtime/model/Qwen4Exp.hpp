@@ -81,6 +81,9 @@ struct Qwen4ExpLayout final : QwenHybridLayout {
                           .experts = 512,
                           .expertsPerToken = 10,
                           .expertIntermediateSize = 640,
+                          // The unpruned model's and the Coder release's,
+                          // which prunes half of the routed experts.
+                          .supportedExperts = {512, 256},
                           .hyperConnections = 4,
                           .hyperRank = 320,
                           .indexerHeads = 4,

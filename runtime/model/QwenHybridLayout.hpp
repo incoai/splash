@@ -55,6 +55,11 @@ struct QwenTargetDimensions {
   uint32_t experts = 0;
   uint32_t expertsPerToken = 0;
   uint32_t expertIntermediateSize = 0;
+  // The expert counts a family's GGUFs whose MoE the kernels plan, the
+  // layout's among them (adaptedTargetLayout, ModelDescriptor.mm): a
+  // family's pruned release declares one of the others. Empty, and so
+  // unused, for a family of one shape.
+  std::array<uint32_t, 2> supportedExperts{};
   // Qwen3.8-Flash-Next's additions (model/Qwen4Exp.hpp), which its family
   // takes together and the Qwen3.5 families leave zero: hyper-connected
   // streams (hyperConnected), the residual's streams and the mixes' low rank;
