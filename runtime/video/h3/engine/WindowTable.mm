@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace h3 {
@@ -62,12 +64,12 @@ struct Window {
 
 } // namespace
 
-Status WindowTable::build(const model::SequenceLayout &lay, int32_t chunk, int32_t radius, WindowTable &out) {
-  if (lay.frames < 3) return error(Code::Argument, "window attention needs >= 3 latent frames");
-  if (radius < 0) return error(Code::Argument, "window radius must be >= 0");
+WindowTable::WindowTable(const model::SequenceLayout &lay, int32_t chunk, int32_t radius) {
+  if (lay.frames < 3) throw std::invalid_argument("window attention needs >= 3 latent frames");
+  if (radius < 0) throw std::invalid_argument("window radius must be >= 0");
   const Window window{lay, chunk, radius};
   const int32_t S = lay.rows(), nqb = (S + H3_TABLE_ROWS - 1) / H3_TABLE_ROWS;
-  WindowTable t;
+  WindowTable &t = *this;
   t.rows_ = S;
   t.nqb_ = nqb;
   t.chunk_ = chunk;
@@ -107,8 +109,9 @@ Status WindowTable::build(const model::SequenceLayout &lay, int32_t chunk, int32
     bool mixed = false;
     for (const Segment &s : segs) mixed |= rangesOf(s.cls) != rangesOf(segs[0].cls);
     if (u.size() > 3 || segs.size() > 2)
-      return error(Code::Argument, "key-range table block %d: %zu union ranges, %zu segments (kernel supports 3 / 2)",
-                   qb, u.size(), segs.size());
+      throw std::invalid_argument("key-range table block " + std::to_string(qb) + ": " + std::to_string(u.size()) +
+                                  " union ranges, " + std::to_string(segs.size()) +
+                                  " segments (the kernels take 3 / 2)");
     int32_t *rec = &t.words_[static_cast<size_t>(qb + 1) * H3_TABLE_RECORD];
     rec[0] = static_cast<int32_t>(u.size());
     rec[1] = mixed ? 1 : 0;
@@ -120,7 +123,9 @@ Status WindowTable::build(const model::SequenceLayout &lay, int32_t chunk, int32
       rec[2] = segs[1].begin;
       for (size_t s = 0; s < segs.size(); ++s) {
         const Ranges &sr = rangesOf(segs[s].cls);
-        if (sr.size() > 3) return error(Code::Argument, "key-range table block %d: segment with %zu ranges", qb, sr.size());
+        if (sr.size() > 3)
+          throw std::invalid_argument("key-range table block " + std::to_string(qb) + ": a segment of " +
+                                      std::to_string(sr.size()) + " ranges");
         rec[3 + s] = static_cast<int32_t>(sr.size());
         for (size_t j = 0; j < sr.size(); ++j) {
           rec[14 + 6 * s + 2 * j] = sr[j].first;
@@ -149,8 +154,6 @@ Status WindowTable::build(const model::SequenceLayout &lay, int32_t chunk, int32
   }
   t.density_ = allowed / (double(S) * S);
   t.buildItems();
-  out = std::move(t);
-  return {};
 }
 
 std::vector<std::array<int32_t, 2>> WindowTable::branchBounds() const {
@@ -199,12 +202,10 @@ void WindowTable::buildItems() {
   items_.insert(items_.end(), chunked.begin(), chunked.end());
 }
 
-Status WindowTable::upload(metal::MetalBackend &backend) {
-  H3_TRY(backend.upload(words_.data(), words_.size() * 4, table_, "key-range table"));
-  H3_TRY(backend.upload(items_.data(), items_.size() * sizeof(WindowItem), itemBuffer_, "window items"));
-  H3_TRY(backend.allocate(std::max<size_t>(1, groups_.size()) * 16, groupBuffer_, "window groups"));
-  if (!groups_.empty()) std::memcpy(groupBuffer_.contents, groups_.data(), groups_.size() * 16);
-  return {};
+void WindowTable::upload(metal::MetalBackend &backend) {
+  table_ = h3::upload(backend, words_.data(), words_.size() * 4, "key-range table");
+  itemBuffer_ = h3::upload(backend, items_.data(), items_.size() * sizeof(WindowItem), "window items");
+  groupBuffer_ = h3::upload(backend, groups_.data(), groups_.size() * 16, "window groups");
 }
 
 } // namespace h3

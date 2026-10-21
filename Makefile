@@ -357,7 +357,9 @@ ENGINE_OBJECTS := \
 	$(patsubst runtime/%.mm,$(ENGINE_BUILD)/%.o,$(ENGINE_MM_SOURCES)) \
 	$(ENGINE_METAL_RUNTIME_OBJECT)
 # The video engine is an archive of its own: its objects share basenames with
-# the engine's (Engine.o, MetalBackend.o), which one archive cannot hold.
+# the engine's (Engine.o, MemoryPlan.o, Scheduler.o), which one archive cannot
+# hold. It links before the engine's archive, whose Metal backend and weight
+# readers it runs on.
 VIDEO_LIBRARY := $(ENGINE_BUILD)/libsplash-video.a
 VIDEO_SOURCES := $(sort $(wildcard runtime/video/*.mm runtime/video/h3/*/*.cpp \
 	runtime/video/h3/*/*.mm))

@@ -12,40 +12,36 @@ DitIoParams params(const model::SequenceLayout &lay) {
 
 } // namespace
 
-std::vector<std::string> ioKernels() { return {"dit_io_embed", "dit_io_final"}; }
-
-void embed(id<MTLComputeCommandEncoder> e, const metal::MetalBackend &b, const model::SequenceLayout &lay,
-           const model::DitIoWeights &w, const IoBuffers &x) {
+void embed(Encoder &e, const model::SequenceLayout &lay, const model::DitIoWeights &w, const IoBuffers &x) {
   const DitIoParams p = params(lay);
-  [e setComputePipelineState:b.pipeline("dit_io_embed")];
-  metal::bind(e, x.residual, 0);
-  metal::bind(e, x.text, 1);
-  metal::bind(e, x.audioIn, 2);
-  metal::bind(e, x.videoIn, 3);
-  metal::bind(e, w.audioProj, 4);
-  metal::bind(e, w.audioProjBias, 5);
-  metal::bind(e, w.videoProj, 6);
-  metal::bind(e, w.videoProjBias, 7);
-  metal::bindBytes(e, p, 8);
-  metal::dispatch(e, MTLSizeMake(H3_DIT_HIDDEN / 256, lay.rows(), 1), MTLSizeMake(256, 1, 1));
+  e.pipeline("dit_io_embed");
+  e.bind(x.residual, 0);
+  e.bind(x.text, 1);
+  e.bind(x.audioIn, 2);
+  e.bind(x.videoIn, 3);
+  e.bind(w.audioProj, 4);
+  e.bind(w.audioProjBias, 5);
+  e.bind(w.videoProj, 6);
+  e.bind(w.videoProjBias, 7);
+  e.bytes(p, 8);
+  e.dispatch(size3(H3_DIT_HIDDEN / 256, lay.rows(), 1), size3(256, 1, 1));
 }
 
-void finalLayer(id<MTLComputeCommandEncoder> e, const metal::MetalBackend &b, const model::SequenceLayout &lay,
-                const model::DitIoWeights &w, const IoBuffers &x) {
+void finalLayer(Encoder &e, const model::SequenceLayout &lay, const model::DitIoWeights &w, const IoBuffers &x) {
   const DitIoParams p = params(lay);
-  [e setComputePipelineState:b.pipeline("dit_io_final")];
-  metal::bind(e, x.residual, 0);
-  metal::bind(e, x.tags, 1);
-  metal::bind(e, w.finalNorm, 2);
-  metal::bind(e, x.adaFinal, 3);
-  metal::bind(e, w.videoOut, 4);
-  metal::bind(e, w.videoOutBias, 5);
-  metal::bind(e, w.audioOut, 6);
-  metal::bind(e, w.audioOutBias, 7);
-  metal::bind(e, x.videoOut, 8);
-  metal::bind(e, x.audioOut, 9);
-  metal::bindBytes(e, p, 10);
-  metal::dispatch(e, MTLSizeMake(lay.audio + lay.frames * lay.tokensPerFrame, 1, 1), MTLSizeMake(256, 1, 1));
+  e.pipeline("dit_io_final");
+  e.bind(x.residual, 0);
+  e.bind(x.tags, 1);
+  e.bind(w.finalNorm, 2);
+  e.bind(x.adaFinal, 3);
+  e.bind(w.videoOut, 4);
+  e.bind(w.videoOutBias, 5);
+  e.bind(w.audioOut, 6);
+  e.bind(w.audioOutBias, 7);
+  e.bind(x.videoOut, 8);
+  e.bind(x.audioOut, 9);
+  e.bytes(p, 10);
+  e.dispatch(size3(lay.audio + lay.frames * lay.tokensPerFrame, 1, 1), size3(256, 1, 1));
 }
 
 } // namespace h3::ops

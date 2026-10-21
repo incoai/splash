@@ -2,19 +2,19 @@
 
 // Window-softmax attention of the DiT (kernels/dit/window_attention.metal, qkfix.metal): int8 preparation, the
 // table-driven window kernel (int8 QK or the QKFIX fp16 QK + exact split term) and the key-chunk merge.
-#import <Metal/Metal.h>
 
 #include "video/h3/engine/WindowTable.hpp"
-#include "video/h3/metal/MetalBackend.hpp"
+#include "video/h3/engine/Encoder.hpp"
 
 #include <string>
 #include <vector>
 
 namespace h3::ops {
 
-using metal::BufferView;
-
-[[nodiscard]] std::vector<std::string> attentionKernels();
+// Checks that the MPP cooperative-tensor register layout is the one the attention kernels address their slots by
+// (kernels/video/common/window.h): a library or OS change of it would silently corrupt them. Throws
+// splash::metal::MetalBackendError when it differs.
+void checkRegisterLayout(metal::MetalBackend &backend);
 
 struct AttentionBuffers {
   BufferView qHalf, kHalf, v;     // fp16 [56][Spad][128]
@@ -26,12 +26,11 @@ struct AttentionBuffers {
 };
 
 // Key mean, Hadamard(128) int8 Q (per row) and K - mean (per 32-key block).
-void quantize(id<MTLComputeCommandEncoder> e, const metal::MetalBackend &b, const AttentionBuffers &a);
+void quantize(Encoder &e, const AttentionBuffers &a);
 // int8 window attention -> bf16 O [M][7168] (+ combine of the key-chunk partials).
-void window(id<MTLComputeCommandEncoder> e, const metal::MetalBackend &b, const AttentionBuffers &a,
-            const WindowTable &table, BufferView out);
+void window(Encoder &e, const AttentionBuffers &a, const WindowTable &table, BufferView out);
 // QKFIX: fp16 Q / K window attention with the fp32 split-dimension term.
-void windowQkFix(id<MTLComputeCommandEncoder> e, const metal::MetalBackend &b, const AttentionBuffers &a,
-                 BufferView qExact, BufferView kExact, const WindowTable &table, BufferView out);
+void windowQkFix(Encoder &e, const AttentionBuffers &a, BufferView qExact, BufferView kExact, const WindowTable &table,
+                 BufferView out);
 
 } // namespace h3::ops

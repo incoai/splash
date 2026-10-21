@@ -470,11 +470,12 @@ $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(TEST_ANE_FFN) \
 		$(ENGINE_LINKFLAGS) -o $@
 
 # The video engine's synthetic forward compiles as the engine's host code
-# does (VIDEO_OBJCXXFLAGS) and links its mp4 writer's frameworks.
+# does (VIDEO_OBJCXXFLAGS) and links the engine library under it, whose Metal
+# backend and weight readers it runs on, and its mp4 writer's frameworks.
 $(TEST_VIDEO_SYNTHETIC_TEST): dev/tests/engine/video_synthetic_metal_test.mm \
-		$(VIDEO_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
+		$(VIDEO_LIBRARY) $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -ffp-contract=off -fobjc-arc $< \
-		$(VIDEO_LIBRARY) $(ENGINE_LINKFLAGS) $(VIDEO_LINKFLAGS) -o $@
+		$(VIDEO_LIBRARY) $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) $(VIDEO_LINKFLAGS) -o $@
 
 # Tools built with the production flags.
 $(WEIGHT_DIGESTS): dev/tools/weight_digests.mm \

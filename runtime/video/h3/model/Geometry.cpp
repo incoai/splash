@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
+#include <string>
 
 namespace h3::model {
 namespace {
@@ -18,8 +20,9 @@ int32_t pyMod(int32_t a, int32_t b) { return ((a % b) + b) % b; }
 
 // VideoVAE._split_tiles: smallest tile count covering length with overlaps >= min_overlap; slack distributed
 // round-robin over the overlaps in whole ratio steps.
-Status splitTiles(int32_t length, std::vector<int32_t> &starts, std::vector<int32_t> &overlaps) {
-  if (kTilePixels >= length) return error(Code::Argument, "frame side %d smaller than one 256 px tile", length);
+void splitTiles(int32_t length, std::vector<int32_t> &starts, std::vector<int32_t> &overlaps) {
+  if (kTilePixels >= length)
+    throw std::invalid_argument("frame side " + std::to_string(length) + " smaller than one 256 px tile");
   int32_t n = (length + kTilePixels - 1) / kTilePixels;
   while (kTilePixels * n - kTileMinOverlap * (n - 1) - length < 0) ++n;
   overlaps.assign(n - 1, kTileMinOverlap);
@@ -27,16 +30,16 @@ Status splitTiles(int32_t length, std::vector<int32_t> &starts, std::vector<int3
   for (int32_t i = 0; i < remaining / kSpatialRatio; ++i) overlaps[i % (n - 1)] += kSpatialRatio;
   starts.assign(1, 0);
   for (int32_t i = 0; i < n - 1; ++i) starts.push_back(starts.back() + kTilePixels - overlaps[i]);
-  return {};
 }
 
 } // namespace
 
-Status VideoGeometry::of(int32_t frames, int32_t width, int32_t height, VideoGeometry &out) {
+VideoGeometry VideoGeometry::of(int32_t frames, int32_t width, int32_t height) {
   if (frames < kFramesPerChunk + kLatentsPerChunk || frames % kFramesPerChunk != kLatentsPerChunk)
-    return error(Code::Argument, "frames must be 17 n + 5 (got %d)", frames);
+    throw std::invalid_argument("frames must be 17 n + 5 (got " + std::to_string(frames) + ")");
   if (width <= 0 || height <= 0 || width % 32 || height % 32)
-    return error(Code::Argument, "width and height must be multiples of 32 (got %d x %d)", width, height);
+    throw std::invalid_argument("width and height must be multiples of 32 (got " + std::to_string(width) + " x " +
+                                std::to_string(height) + ")");
   VideoGeometry g;
   g.frames = frames;
   g.width = width;
@@ -50,11 +53,10 @@ Status VideoGeometry::of(int32_t frames, int32_t width, int32_t height, VideoGeo
   // round() of the port is Python's (half to even): nearbyint in the default rounding mode
   const double audioLatents = std::nearbyint(static_cast<double>(frames) / kFps * kAudioLatentsPerSecond);
   g.audioRows = kAudioChannels * static_cast<int32_t>(audioLatents);
-  out = g;
-  return {};
+  return g;
 }
 
-Status planVaeDecode(const VideoGeometry &geometry, VaePlan &out) {
+VaePlan planVaeDecode(const VideoGeometry &geometry) {
   VaePlan p;
   p.ct = (kClipLength + kTemporalRatio - 1) / kTemporalRatio;
   p.tov = pyMod(-kTokenDrop, p.ct);
@@ -63,18 +65,16 @@ Status planVaeDecode(const VideoGeometry &geometry, VaePlan &out) {
   const int32_t tokens = geometry.latentFrames + kTokenDrop;
   p.padTokens = pyMod(-tokens, p.ct);
   p.chunks = (tokens + p.padTokens) / p.ct - (kTokenDrop > 0 ? 1 : 0);
-  if (p.chunks < 1) return error(Code::Argument, "too few latent frames for the VAE");
-  H3_TRY(splitTiles(geometry.latentHeight * kSpatialRatio, p.ys, p.ovy));
-  H3_TRY(splitTiles(geometry.latentWidth * kSpatialRatio, p.xs, p.ovx));
-  for (int32_t o : p.ovy)
-    if (o % kSpatialRatio) return error(Code::Argument, "tile overlap not latent-aligned");
-  for (int32_t o : p.ovx)
-    if (o % kSpatialRatio) return error(Code::Argument, "tile overlap not latent-aligned");
+  if (p.chunks < 1) throw std::invalid_argument("too few latent frames for the VAE");
+  splitTiles(geometry.latentHeight * kSpatialRatio, p.ys, p.ovy);
+  splitTiles(geometry.latentWidth * kSpatialRatio, p.xs, p.ovx);
+  for (const std::vector<int32_t> *overlaps : {&p.ovy, &p.ovx})
+    for (int32_t o : *overlaps)
+      if (o % kSpatialRatio) throw std::invalid_argument("tile overlap not latent-aligned");
   const int32_t intraTail = kClipLength % kTemporalRatio;
   for (int32_t k = 0; k < p.padTokens; ++k)
     p.padFrames += (intraTail && (geometry.latentFrames + k) % p.ct == 0) ? intraTail : kTemporalRatio;
-  out = std::move(p);
-  return {};
+  return p;
 }
 
 int32_t previewFrames(int32_t latentFrames) { return 4 * latentFrames - 3 * ((4 * latentFrames + 19) / 20); }

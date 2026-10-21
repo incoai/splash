@@ -4,10 +4,13 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 
+#include "AwakeClock.hpp"
+
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <memory>
+#include <stdexcept>
+#include <string>
 #include <sys/stat.h>
 #include <vector>
 
@@ -47,19 +50,20 @@ int32_t videoBitrate(int32_t width, int32_t height) {
   return static_cast<int32_t>(kBitsPerPixel * width * height * kFps);
 }
 
-Status writeMp4(const std::string &path, const uint8_t *rgb, int32_t frames, int32_t width, int32_t height,
-                const float *wav, int64_t samples, Mp4Stats &stats, int32_t bitrate) {
-  const auto t0 = std::chrono::steady_clock::now();
+void writeMp4(const std::string &path, const uint8_t *rgb, int32_t frames, int32_t width, int32_t height,
+              const float *wav, int64_t samples, Mp4Stats &stats, int32_t bitrate) {
+  const auto t0 = splash::AwakeClock::now();
   stats = Mp4Stats{};
   if (!rgb || frames < 1 || width < 16 || height < 16 || (width & 1) || (height & 1))
-    return error(Code::Argument, "mp4: bad frames (%d x %d x %d)", frames, width, height);
+    throw std::invalid_argument("mp4: bad frames (" + std::to_string(frames) + " x " + std::to_string(width) + " x " +
+                                std::to_string(height) + ")");
   if (bitrate <= 0) bitrate = videoBitrate(width, height);
   @autoreleasepool {
     NSURL *url = [NSURL fileURLWithPath:@(path.c_str())];
     [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
     NSError *err = nil;
     AVAssetWriter *writer = [AVAssetWriter assetWriterWithURL:url fileType:AVFileTypeMPEG4 error:&err];
-    if (!writer) return error(Code::Io, "mp4 %s: %s", path.c_str(), err.localizedDescription.UTF8String);
+    if (!writer) throw std::runtime_error("mp4 " + path + ": " + err.localizedDescription.UTF8String);
     NSDictionary *compression = @{
       AVVideoAverageBitRateKey : @(bitrate),
       AVVideoProfileLevelKey : AVVideoProfileLevelH264HighAutoLevel,
@@ -90,7 +94,7 @@ Status writeMp4(const std::string &path, const uint8_t *rgb, int32_t frames, int
     AVAssetWriterInputPixelBufferAdaptor *adaptor =
         [AVAssetWriterInputPixelBufferAdaptor assetWriterInputPixelBufferAdaptorWithAssetWriterInput:vin
                                                                          sourcePixelBufferAttributes:pixels];
-    if (![writer canAddInput:vin]) return error(Code::Io, "mp4: H.264 input rejected");
+    if (![writer canAddInput:vin]) throw std::runtime_error("mp4: H.264 input rejected");
     [writer addInput:vin];
     AVAssetWriterInput *ain = nil;
     CMAudioFormatDescriptionRef pcm = nullptr;
@@ -106,7 +110,7 @@ Status writeMp4(const std::string &path, const uint8_t *rgb, int32_t frames, int
       };
       ain = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:audioSettings];
       ain.expectsMediaDataInRealTime = NO;
-      if (![writer canAddInput:ain]) return error(Code::Io, "mp4: AAC input rejected");
+      if (![writer canAddInput:ain]) throw std::runtime_error("mp4: AAC input rejected");
       [writer addInput:ain];
       AudioStreamBasicDescription asbd{};
       asbd.mSampleRate = kSampleRate;
@@ -119,10 +123,10 @@ Status writeMp4(const std::string &path, const uint8_t *rgb, int32_t frames, int
       asbd.mBitsPerChannel = 32;
       if (CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &asbd, sizeof layout, &layout, 0, nullptr, nullptr,
                                          &pcm) != noErr)
-        return error(Code::Io, "mp4: PCM format description failed");
+        throw std::runtime_error("mp4: PCM format description failed");
     }
     if (![writer startWriting])
-      return error(Code::Io, "mp4 %s: %s", path.c_str(), writer.error.localizedDescription.UTF8String);
+      throw std::runtime_error("mp4 " + path + ": " + writer.error.localizedDescription.UTF8String);
     [writer startSessionAtSourceTime:kCMTimeZero];
     dispatch_group_t group = dispatch_group_create();
     auto failed = std::make_shared<std::atomic<bool>>(false);
@@ -197,8 +201,8 @@ Status writeMp4(const std::string &path, const uint8_t *rgb, int32_t frames, int
     dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
     if (pcm) CFRelease(pcm);
     if (*failed || writer.status != AVAssetWriterStatusCompleted)
-      return error(Code::Io, "mp4 %s: writing failed: %s", path.c_str(),
-                   writer.error ? writer.error.localizedDescription.UTF8String : "append rejected");
+      throw std::runtime_error("mp4 " + path + ": writing failed: " +
+                               (writer.error ? writer.error.localizedDescription.UTF8String : "append rejected"));
   }
   struct stat st {};
   stat(path.c_str(), &st);
@@ -208,8 +212,7 @@ Status writeMp4(const std::string &path, const uint8_t *rgb, int32_t frames, int
   stats.audioSeconds = wav ? double(samples) / kSampleRate : 0;
   stats.bytes = st.st_size;
   stats.videoBitrate = bitrate;
-  stats.wallS = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-  return {};
+  stats.wallS = splash::millisecondsSince(t0) / 1e3;
 }
 
 } // namespace h3::media

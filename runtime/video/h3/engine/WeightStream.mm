@@ -1,16 +1,19 @@
 #include "video/h3/engine/WeightStream.hpp"
 
+#include "AwakeClock.hpp"
 #include "video/h3/engine/DeviceProfile.hpp"
-
-#include <fcntl.h>
-#include <unistd.h>
+#include "metal/abi/video/Layout.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstring>
+#include <span>
+#include <stdexcept>
 
 namespace h3 {
 namespace {
+
+using splash::AwakeClock;
+using splash::millisecondsSince;
 
 // A slot starts free. libdispatch traps (SIGTRAP, "semaphore object deallocated while in use") when a semaphore is
 // released with a value below the one it was created with, which a stream torn down mid-ring (h3_dit_release after a
@@ -21,119 +24,77 @@ dispatch_semaphore_t freeSemaphore() {
   return s;
 }
 
+[[noreturn]] void malformed(const std::string &message) { throw std::runtime_error(message); }
+
 } // namespace
 
-
-Status WeightStream::open(metal::MetalBackend &backend, const std::string &image, int slots,
-                          std::unique_ptr<WeightStream> &out) {
-  if (slots < 1) return error(Code::Argument, "stream slots must be >= 1 (got %d)", slots);
-  auto stream = std::unique_ptr<WeightStream>(new WeightStream());
-  stream->path_ = image;
-  stream->fd_ = ::open(image.c_str(), O_RDONLY);
-  if (stream->fd_ < 0) return error(Code::Io, "cannot open stream image %s", image.c_str());
-  if (device::kStreamNoCache) fcntl(stream->fd_, F_NOCACHE, 1);
-  Header &h = stream->header_;
-  H3_TRY(model::readFully(stream->fd_, 0, sizeof h, &h, image));
+WeightStream::WeightStream(metal::MetalBackend &backend, const std::string &image, int slots) : image_(image) {
+  if (slots < 1) throw std::invalid_argument("stream slots must be >= 1 (got " + std::to_string(slots) + ")");
+  Header &h = header_;
+  image_.readFile(0, {reinterpret_cast<uint8_t *>(&h), sizeof h});
   if (std::memcmp(h.magic, "H3WSTRM1", 8) != 0 || h.version != 1 || h.tensors != kTensors)
-    return error(Code::Io, "%s: not an H3 weight-stream image", image.c_str());
-  stream->qkfixEntries_.resize(h.qkfixBlocks);
-  if (h.qkfixBlocks)
-    H3_TRY(model::readFully(stream->fd_, sizeof h, h.qkfixBlocks * sizeof(QkFixEntry), stream->qkfixEntries_.data(),
-                            image));
-  stream->slots_.resize(slots);
-  for (Slot &slot : stream->slots_) {
-    for (int t = 0; t < kTensors; ++t) H3_TRY(backend.allocate(h.tensorBytes[t], slot.tensor[t], "stream slot"));
+    malformed(image + ": not an H3 weight-stream image");
+  qkfixEntries_.resize(h.qkfixBlocks);
+  image_.readFile(sizeof h, {reinterpret_cast<uint8_t *>(qkfixEntries_.data()), h.qkfixBlocks * sizeof(QkFixEntry)});
+  slots_.resize(slots);
+  for (Slot &slot : slots_) {
+    for (int t = 0; t < kTensors; ++t) slot.tensor[t] = allocate(backend, h.tensorBytes[t], "stream slot");
     slot.ready = dispatch_semaphore_create(0);
     slot.free = freeSemaphore();
   }
-  stream->io_ = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
-  out = std::move(stream);
-  return {};
 }
 
 WeightStream::~WeightStream() {
-  if (started_) {
+  if (thread_.joinable()) {
     stop_ = true;
     for (Slot &slot : slots_) dispatch_semaphore_signal(slot.free);
     for (Slot &slot : qkfixSlots_) dispatch_semaphore_signal(slot.free);
     thread_.join();
   }
-  if (fd_ >= 0) ::close(fd_);
 }
 
 uint64_t WeightStream::tensorOffset(int block, Tensor t) const {
   return header_.blocksOffset + static_cast<uint64_t>(block) * header_.blockBytes + header_.tensorOffset[t];
 }
 
-Status WeightStream::qkfixOffset(int block, uint64_t &offset) const {
+uint64_t WeightStream::qkfixOffset(int block) const {
   for (const QkFixEntry &entry : qkfixEntries_)
-    if (entry.block == block) {
-      offset = entry.offset;
-      return {};
-    }
-  return error(Code::Io, "QKFIX block %d not in the stream image %s", block, path_.c_str());
+    if (entry.block == block) return entry.offset;
+  malformed("QKFIX block " + std::to_string(block) + " not in the stream image " + image_.path().string());
 }
 
-Status WeightStream::verify(const model::SafetensorsFile &file, uint64_t fileOffset, uint64_t bytes,
-                            uint64_t imageOffset, const char *what, int block) const {
-  const size_t n = std::min<uint64_t>(device::kStreamVerifyBytes, bytes);
+void WeightStream::verify(const model::SourceTensor &tensor, uint64_t imageOffset, const char *what, int block) const {
+  const size_t n = std::min<uint64_t>(device::kStreamVerifyBytes, tensor.bytes);
   std::vector<uint8_t> a(n), b(n);
-  for (uint64_t at : {uint64_t(0), bytes - n}) {
-    H3_TRY(file.readRange(fileOffset + at, n, a.data()));
-    H3_TRY(model::readFully(fd_, imageOffset + at, n, b.data(), path_));
-    if (std::memcmp(a.data(), b.data(), n) != 0)
-      return error(Code::Io, "stream image %s differs from the weights: block %d %s (rebuild it with "
-                             "tools/convert_dit.py stream)", path_.c_str(), block, what);
+  for (uint64_t at : {uint64_t(0), tensor.bytes - n}) {
+    tensor.read(at, a);
+    image_.readFile(imageOffset + at, b);
+    if (a != b)
+      malformed("stream image " + image_.path().string() + " differs from the weights: block " +
+                std::to_string(block) + " " + what + " (rebuild it with tools/convert_dit.py stream)");
   }
-  return {};
 }
 
-Status WeightStream::start(metal::MetalBackend &backend, int blocks, const std::set<int> &qkfixBlocks) {
+void WeightStream::start(metal::MetalBackend &backend, int blocks, const std::set<int> &qkfixBlocks) {
   if (header_.blocks < static_cast<uint32_t>(blocks))
-    return error(Code::Io, "stream image %s has %u blocks, the model %d", path_.c_str(), header_.blocks, blocks);
+    malformed("stream image " + image_.path().string() + " has " + std::to_string(header_.blocks) +
+              " blocks, the model " + std::to_string(blocks));
   blocksPerForward_ = blocks;
   qkfixRank_.assign(blocks, -1);
   qkfixPerForward_ = 0;
   for (int b : qkfixBlocks) {
-    uint64_t offset = 0;
-    H3_TRY(qkfixOffset(b, offset));
+    static_cast<void>(qkfixOffset(b));
     qkfixRank_[b] = qkfixPerForward_++;
   }
   if (qkfixPerForward_ > 0) {
     qkfixSlots_.resize(device::kStreamQkFixSlots);
     for (Slot &slot : qkfixSlots_) {
-      H3_TRY(backend.allocate(size_t(H3_DIT_QKV) * H3_DIT_HIDDEN * 2, slot.tensor[0], "stream QKFIX slot"));
+      slot.tensor[0] = allocate(backend, size_t(H3_DIT_QKV) * H3_DIT_HIDDEN * 2, "stream QKFIX slot");
       slot.ready = dispatch_semaphore_create(0);
       slot.free = freeSemaphore();
     }
   }
-  started_ = true;
   thread_ = std::thread([this] { reader(); });
-  return {};
-}
-
-// Parallel chunked pread of [offset, offset + bytes) into dst.
-bool WeightStream::readInto(void *dst, uint64_t offset, size_t bytes) {
-  const size_t chunk = device::kStreamChunkBytes, chunks = (bytes + chunk - 1) / chunk;
-  const int threads = device::kStreamReadThreads, fd = fd_;
-  std::atomic<int> failed{0};
-  std::atomic<int> *pFailed = &failed;
-  char *d = static_cast<char *>(dst);
-  dispatch_apply(static_cast<size_t>(threads), io_, ^(size_t t) {
-    for (size_t c = t; c < chunks; c += threads) {
-      const size_t o = c * chunk, m = std::min(chunk, bytes - o);
-      size_t got = 0;
-      while (got < m) {
-        const ssize_t r = pread(fd, d + o + got, m - got, static_cast<off_t>(offset + o + got));
-        if (r <= 0) {
-          *pFailed = 1;
-          return;
-        }
-        got += static_cast<size_t>(r);
-      }
-    }
-  });
-  return failed == 0;
 }
 
 bool WeightStream::waitFree(dispatch_semaphore_t semaphore) {
@@ -156,24 +117,24 @@ void WeightStream::reader() {
     if (!waitFree(slot.free)) break;
     Slot *qkfix = qkfixSlotOf(n);
     if (qkfix && !waitFree(qkfix->free)) break;
-    const auto t0 = std::chrono::steady_clock::now();
-    bool ok = true;
+    const auto t0 = AwakeClock::now();
     int64_t bytes = 0;
-    for (int t = 0; t < kTensors && ok; ++t) {
-      ok = readInto(slot.tensor[t].contents, tensorOffset(block, static_cast<Tensor>(t)), header_.tensorBytes[t]);
-      bytes += static_cast<int64_t>(header_.tensorBytes[t]);
-    }
-    if (ok && qkfix) {
-      uint64_t offset = 0;
-      ok = qkfixOffset(block, offset).ok() && readInto(qkfix->tensor[0].contents, offset, qkfix->tensor[0].length);
-      bytes += static_cast<int64_t>(qkfix->tensor[0].length);
-    }
-    if (!ok) {
-      fprintf(stderr, "h3: stream image read error, block %d\n", block);
+    try {
+      for (int t = 0; t < kTensors; ++t) {
+        model::read(image_, tensorOffset(block, static_cast<Tensor>(t)), header_.tensorBytes[t],
+                    slot.tensor[t].contents());
+        bytes += static_cast<int64_t>(header_.tensorBytes[t]);
+      }
+      if (qkfix) {
+        model::read(image_, qkfixOffset(block), qkfix->tensor[0].sizeBytes(), qkfix->tensor[0].contents());
+        bytes += static_cast<int64_t>(qkfix->tensor[0].sizeBytes());
+      }
+    } catch (...) {
+      failure_ = std::current_exception();
+      failed_ = true;
       stop_ = true;
     }
-    const int64_t us =
-        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    const auto us = static_cast<int64_t>(millisecondsSince(t0) * 1e3);
     readBytes_ += bytes;
     readUs_ += us;
     blocksRead_ += 1;
@@ -182,17 +143,25 @@ void WeightStream::reader() {
   }
 }
 
-WeightStream::Slot &WeightStream::acquire(Slot **qkfix) {
+WeightStream::Slot &WeightStream::next(Slot **qkfix) {
   const int64_t n = encoderSequence_++;
-  Slot &slot = slots_[static_cast<size_t>(n % static_cast<int64_t>(slots_.size()))];
-  const auto t0 = std::chrono::steady_clock::now();
+  *qkfix = qkfixSlotOf(n);
+  return slots_[static_cast<size_t>(n % static_cast<int64_t>(slots_.size()))];
+}
+
+void WeightStream::waitRead(Slot &slot) {
+  const auto t0 = AwakeClock::now();
   dispatch_semaphore_wait(slot.ready, DISPATCH_TIME_FOREVER);
-  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  if (failed_) std::rethrow_exception(failure_);
+  const double ms = millisecondsSince(t0);
   waitMs_ += ms;
   waitMaxMs_ = std::max(waitMaxMs_, ms);
   if (ms > 1.0) ++waits_;
-  *qkfix = qkfixSlotOf(n);
-  return slot;
+}
+
+void WeightStream::release(Slot &slot, Slot *qkfix) {
+  dispatch_semaphore_signal(slot.free);
+  if (qkfix) dispatch_semaphore_signal(qkfix->free);
 }
 
 void WeightStream::resetStats() {
@@ -219,8 +188,8 @@ StreamStats WeightStream::stats() const {
 size_t WeightStream::slotBytes() const {
   size_t total = 0;
   for (const Slot &slot : slots_)
-    for (int t = 0; t < kTensors; ++t) total += slot.tensor[t].length;
-  for (const Slot &slot : qkfixSlots_) total += slot.tensor[0].length;
+    for (int t = 0; t < kTensors; ++t) total += slot.tensor[t].sizeBytes();
+  for (const Slot &slot : qkfixSlots_) total += slot.tensor[0].sizeBytes();
   return total;
 }
 

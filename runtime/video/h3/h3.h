@@ -1,5 +1,6 @@
 /*
- * h3: MiniMax-H3 on-device engine (M5 Pro, macOS 27) -- C ABI of build/libh3.dylib.
+ * h3: MiniMax-H3 on-device engine (M5 Pro, macOS 27) -- its C ABI, which Splash's video engine process
+ * (runtime/video/VideoRuntime.mm) drives; the engine runs on Splash's Metal backend and weight readers.
  *
  * One engine per request. The host supplies the request options and the text-encoder hidden states (Qwen3-VL-32B,
  * layer 50); the engine owns the device, the weights, the activations and every kernel choice, and returns latents,
@@ -17,8 +18,8 @@
  *   h3_destroy
  *
  * Every call returns H3_OK or an error code; h3_error() has the message. Inputs are borrowed for the duration of the
- * call (h3_dit_load: until h3_dit_release). The only environment variable the engine reads is H3_LOG (0 quiet,
- * 1 phase summaries (default), 2 memory plan and details).
+ * call (h3_dit_load: until h3_dit_release). The engine reads no environment variable; its phase summaries and errors
+ * go to stderr as Splash's log lines.
  */
 #ifndef H3_H3_H
 #define H3_H3_H
@@ -48,7 +49,7 @@ typedef struct h3_engine h3_engine;
 
 /* Where the engine finds its files. */
 typedef struct h3_config {
-  const char *metallib; /* build/metal/h3.metallib */
+  const char *metallib; /* splash.metallib, whose video group holds the engine's kernels */
   const char *weights;  /* weights root: dit-turbo/, dit-default/, vae/, preview/ */
 } h3_config;
 
@@ -126,9 +127,9 @@ typedef struct h3_schedule {
 
 typedef struct h3_forward_stats {
   double wall_ms, embed_ms, blocks_span_ms, blocks_gpu_ms, final_ms;
-  double linear_ms, attention_ms, other_ms, branch_ms; /* GPU time by step class */
-  double gpu_busy_ms, gpu_idle_ms, gpu_gap_max_ms;
-  int32_t gpu_gaps, command_buffers;
+  double linear_ms, attention_ms, other_ms, branch_ms; /* 0: not measured (one command runs a block) */
+  double gpu_busy_ms, gpu_idle_ms, gpu_gap_max_ms;      /* GPU time of the block commands, the rest of their span; 0 */
+  int32_t gpu_gaps, command_buffers;                    /* 0; block commands */
   double stream_wait_ms, stream_wait_max_ms, stream_read_gb, stream_read_s, stream_read_max_ms;
   int32_t stream_waits, stream_blocks;
   double device_mb;

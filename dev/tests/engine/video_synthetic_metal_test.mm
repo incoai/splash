@@ -3,9 +3,8 @@
 // block 0 and final layer, whose video and audio velocities must hash to the
 // h3 engine's references (its synthetic_check, fwd/q1_video and fwd/q1_audio).
 // The int8 MPP kernels need an Apple10 GPU (M5); earlier GPUs skip the test.
-#import <Metal/Metal.h>
-
 #include "TestChecks.hpp"
+#include "metal/MetalBackend.hpp"
 #include "video/h3/engine/Engine.hpp"
 #include "video/h3/model/Synthetic.hpp"
 
@@ -32,23 +31,19 @@ std::string sha256(const std::vector<float> &values) {
   return hex;
 }
 
-void check(const h3::Status &status) { require(status.ok(), status.message()); }
-
 } // namespace
 
 int main(int argc, char **argv) {
   @autoreleasepool {
     try {
       require(argc == 2, "usage: video-synthetic METALLIB");
-      id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-      if (!device || ![device supportsFamily:MTLGPUFamilyApple10]) {
+      if (splash::metal::probeDeviceCapabilities().appleGpuFamily < 10) {
         std::cout << "video_synthetic_metal_test: SKIP (needs an Apple10 GPU)\n";
         return 0;
       }
       h3::Request request; // 3 s turbo, window 5 / 1, QKFIX 45, 48, 49
-      std::unique_ptr<h3::Engine> engine;
-      check(h3::Engine::create({argv[1], ""}, request, engine));
-      check(engine->loadDitSynthetic(32, 1));
+      auto engine = std::make_unique<h3::Engine>(h3::EngineConfig{argv[1], ""}, request);
+      engine->loadDitSynthetic(32, 1);
       const auto seed = [](int id) { return h3::model::syntheticSeed(h3::model::kSyntheticInputGroup, id); };
       const h3::model::VideoGeometry &g = engine->geometry();
       std::vector<uint16_t> blocks(size_t(50) * 3 * 6 * 5376), final(size_t(3) * 2 * 5376);
@@ -59,8 +54,8 @@ int main(int argc, char **argv) {
       h3::model::syntheticF32(seed(4), audio.size(), 1.7f, 0.0f, audio.data());
       std::vector<float> videoOut(video.size()), audioOut(audio.size());
       h3::ForwardStats stats;
-      check(engine->forward(blocks.data(), final.data(), video.data(), audio.data(), videoOut.data(),
-                            audioOut.data(), stats));
+      engine->forward(blocks.data(), final.data(), video.data(), audio.data(), videoOut.data(), audioOut.data(),
+                      stats);
       require(sha256(videoOut) == "48d1344755caf3081c03e3525a904b1e7b6b2cd345a70df97f2ff7f22da55da4" &&
                   sha256(audioOut) == "14835bdc152f36c39aaed79143a74f5a465b687a3b937176f6347aaa400d8ec7",
               "synthetic velocities differ from the h3 references");

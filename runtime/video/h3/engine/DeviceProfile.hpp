@@ -41,30 +41,24 @@ inline constexpr bool kDenseItemsLast = true;
 // QKFIX: post-RoPE dims kept in fp32 (manifest split, -1 padded) and fp16 V from the fp16 GEMM (QKFIX_V=1),
 // register-held Q (QKFIX_QREG=1), exact split term on (QKFIX_SPLIT=1)
 inline constexpr int32_t kQkFixSplitDims = H3_QKFIX_SPLIT;
-// Command queue depth (one command buffer per block step, ~1,400 per forward)
-inline constexpr int32_t kDitQueueDepth = 4096;
 
 // ---- SSD weight streaming ---------------------------------------------------------------------------------------
 inline constexpr int32_t kStreamQkFixSlots = 2;     // fp16 QKFIX weights ring (H3_STREAM_QKF_SLOTS)
-inline constexpr int32_t kStreamReadThreads = 4;    // parallel preads per tensor (H3_STREAM_THREADS)
-inline constexpr size_t kStreamChunkBytes = 8u << 20;  // pread size (H3_STREAM_CHUNK_MB)
-inline constexpr bool kStreamNoCache = true;         // F_NOCACHE on the image (H3_STREAM_NOCACHE)
 inline constexpr size_t kStreamVerifyBytes = 16384;  // image vs block files: first / last bytes of every streamed
                                                      // tensor compared at load (H3_STREAM_VERIFY=1)
 
 // ---- Video VAE --------------------------------------------------------------------------------------------------
-inline constexpr int32_t kVaeBatch = 7;  // tile-clips per command buffer (H3VAE_BATCH)
+inline constexpr int32_t kVaeBatch = 7;  // tile-clips per layer dispatch (H3VAE_BATCH)
 inline constexpr Tile kVaeQkvTile{H3_VAE_QKV_TM, H3_VAE_TN, H3_VAE_NSG};
 inline constexpr Tile kVaeTile{H3_VAE_TM, H3_VAE_TN, H3_VAE_NSG};  // out, fc1 (GLU), fc2, proj_out
 inline constexpr int32_t kVaeSwizzle = 0;
 inline constexpr int32_t kVaeAttentionSimdgroups = H3_VAE_ATTENTION_NSG;
-inline constexpr int32_t kVaeQueueDepth = 1024;
 // Producer groups per thread: K = 2048 -> 2, K = 8192 -> 4
 inline constexpr int32_t kVaeProducerGroups = 2;
 inline constexpr int32_t kVaeFfnProducerGroups = 4;
 
 // ---- TAEH3 preview ----------------------------------------------------------------------------------------------
-inline constexpr int32_t kPreviewChunk = 5;  // latent frames per command buffer (TAEH3_CHUNK)
+inline constexpr int32_t kPreviewChunk = 5;  // latent frames per command (TAEH3_CHUNK)
 inline constexpr Tile kPreviewTile256{32, 128, 4};  // conv tiles per channel level (TAE_T256 / T128 / T64 / TFIN)
 inline constexpr Tile kPreviewTile128{64, 128, 4};
 inline constexpr Tile kPreviewTile64{32, 64, 2};

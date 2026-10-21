@@ -1,6 +1,6 @@
 #pragma once
 
-// Request and statistics types of the engine (the C ABI in include/h3/h3.h mirrors them).
+// Request and statistics types of the engine (the C ABI in h3.h mirrors them).
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -26,9 +26,8 @@ struct Request {
 
 struct ForwardStats {
   double wallMs = 0, embedMs = 0, blocksSpanMs = 0, blocksGpuMs = 0, finalMs = 0;
-  double linearMs = 0, attentionMs = 0, otherMs = 0, branchMs = 0;  // GPU time by step class
-  double gpuBusyMs = 0, gpuIdleMs = 0, gpuGapMaxMs = 0;               // union of command-buffer intervals
-  int32_t gpuGaps = 0, commandBuffers = 0;
+  double gpuBusyMs = 0, gpuIdleMs = 0;  // GPU time of the block commands, and the rest of their span
+  int32_t commandBuffers = 0;           // block commands
   double streamWaitMs = 0, streamWaitMaxMs = 0, streamReadGb = 0, streamReadS = 0, streamReadMaxMs = 0;
   int32_t streamWaits = 0, streamBlocks = 0;
   double deviceMb = 0;

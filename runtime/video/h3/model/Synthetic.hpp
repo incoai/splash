@@ -1,16 +1,14 @@
 #pragma once
 
-// Deterministic synthetic weights and inputs (h3 bench --synthetic, dev/tests/synthetic_check.sh): no weight files,
+// Deterministic synthetic weights and inputs (dev/tests/engine/video_synthetic_metal_test.mm): no weight files,
 // the same shapes and memory as the converted VDN-H3 DiT, values from the hash of metal/abi/SyntheticABI.h. Tensor
 // seeds: syntheticSeed(group, id), group = block index for block tensors, kIoGroup for the io weights, kInputGroup
 // for the request inputs. Value ranges keep the 50-block forward finite (unit-gain linears, gates ~0.1).
-#import <Metal/Metal.h>
-
-#include "video/h3/engine/Status.hpp"
-#include "video/h3/metal/MetalBackend.hpp"
+#include "video/h3/engine/Encoder.hpp"
 #include "metal/abi/video/SyntheticABI.h"
 
 #include <cstdint>
+#include <string_view>
 #include <vector>
 
 namespace h3::model {
@@ -23,20 +21,20 @@ float syntheticFloat(uint64_t seed, uint64_t i, float scale, float offset);
 void syntheticF32(uint64_t seed, size_t n, float scale, float offset, float *out);
 void syntheticBf16(uint64_t seed, size_t n, float scale, float offset, uint16_t *out);
 
-// GPU fills batched into one command buffer.
+// GPU fills batched into one command.
 class SyntheticFiller {
 public:
   explicit SyntheticFiller(metal::MetalBackend &backend) : b_(backend) {}
-  Status allocate(size_t count, int type, uint64_t seed, float scale, float offset, __strong id<MTLBuffer> &out,
-                  const char *what);
-  void fill(id<MTLBuffer> buffer, size_t offsetBytes, size_t count, int type, uint64_t seed, float scale,
+  [[nodiscard]] metal::MetalBuffer allocate(size_t count, int type, uint64_t seed, float scale, float offset,
+                                            std::string_view what);
+  void fill(const metal::MetalBuffer &buffer, size_t offsetBytes, size_t count, int type, uint64_t seed, float scale,
             float offset);
-  Status run();
+  void run();
   [[nodiscard]] size_t bytes() const { return bytes_; }
 
 private:
   struct Job {
-    id<MTLBuffer> buffer;
+    metal::MetalBuffer buffer;
     size_t offset;
     SyntheticFill fill;
   };

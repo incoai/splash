@@ -2,8 +2,6 @@
 
 // MiniMax-H3 request geometry: latent shapes of a clip, the packed DiT sequence, the video VAE decode plan
 // (VideoVAE.decode chunking and _split_tiles tiling of the MLX port) and the latent unpatchify.
-#include "video/h3/engine/Status.hpp"
-
 #include <cstdint>
 #include <vector>
 
@@ -17,7 +15,7 @@ struct VideoGeometry {
   int32_t audioRows = 0;                                        // 2 x round(frames / 24 x 40)
 
   [[nodiscard]] int32_t videoRows() const { return latentFrames * tokensPerFrame; }
-  static Status of(int32_t frames, int32_t width, int32_t height, VideoGeometry &out);
+  static VideoGeometry of(int32_t frames, int32_t width, int32_t height);
 };
 
 // Packed DiT rows [text L | audio Na | video F x T], no pad rows. The linear branch covers the inner frames
@@ -44,7 +42,7 @@ struct VaePlan {
   [[nodiscard]] int32_t decodedFrames() const { return chunks * clipFrames() + fov; }
   [[nodiscard]] int32_t outputFrames() const { return decodedFrames() - padFrames; }
 };
-Status planVaeDecode(const VideoGeometry &geometry, VaePlan &out);
+[[nodiscard]] VaePlan planVaeDecode(const VideoGeometry &geometry);
 
 // TAEH3 output frames for L latent frames: 4 L - 3 ceil(4 L / 20).
 [[nodiscard]] int32_t previewFrames(int32_t latentFrames);

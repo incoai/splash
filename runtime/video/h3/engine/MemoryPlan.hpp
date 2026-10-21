@@ -4,10 +4,7 @@
 // of a physical buffer ("slab"), with its lifetime inside a block. Tensors whose lifetimes do not overlap share a slab,
 // which is what keeps a 15 s request at ~11 GB of activations (streaming) instead of ~19 GB. A slab is as large as its
 // largest view. The block order that makes these aliases safe is engine/Scheduler.mm encodeBlock.
-#import <Metal/Metal.h>
-
-#include "video/h3/engine/Status.hpp"
-#include "video/h3/metal/MetalBackend.hpp"
+#include "video/h3/engine/Encoder.hpp"
 #include "video/h3/model/Geometry.hpp"
 
 #include <array>
@@ -53,19 +50,17 @@ struct PlanEntry {
 class MemoryPlan {
 public:
   // partialSlots: window-attention key-chunk slots per head (0 = none); qkfix: any QKFIX block in the request.
-  static Status create(metal::MetalBackend &backend, const model::SequenceLayout &layout, int32_t partialSlots,
-                       bool qkfix, MemoryPlan &out);
+  MemoryPlan(metal::MetalBackend &backend, const model::SequenceLayout &layout, int32_t partialSlots, bool qkfix);
 
-  [[nodiscard]] metal::BufferView view(Tensor t) const;
+  [[nodiscard]] BufferView view(Tensor t) const;
   [[nodiscard]] const PlanEntry &entry(Tensor t) const { return entries_[static_cast<size_t>(t)]; }
   [[nodiscard]] size_t slabBytes(Slab s) const { return slabBytes_[static_cast<size_t>(s)]; }
   [[nodiscard]] size_t totalBytes() const;
-  void log(const Logger &logger) const;
 
 private:
   std::array<PlanEntry, static_cast<size_t>(Tensor::Count)> entries_{};
   std::array<size_t, static_cast<size_t>(Slab::Count)> slabBytes_{};
-  std::array<id<MTLBuffer>, static_cast<size_t>(Slab::Count)> slabs_{};
+  std::array<metal::MetalBuffer, static_cast<size_t>(Slab::Count)> slabs_{};
 };
 
 } // namespace h3

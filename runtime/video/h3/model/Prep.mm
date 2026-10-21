@@ -1,31 +1,26 @@
 #include "video/h3/model/Prep.hpp"
 
+#include "AwakeClock.hpp"
 #include "metal/abi/video/Layout.h"
-#include "video/h3/model/Json.hpp"
 #include "video/h3/model/Numpy.hpp"
-#include "video/h3/model/Safetensors.hpp"
+#include "video/h3/model/WeightFiles.hpp"
 #include "video/h3/ops/PrepOps.hpp"
 
 #include <dispatch/dispatch.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <map>
-#include <memory>
 #include <set>
-#include <thread>
+#include <stdexcept>
 
 namespace h3::model {
 namespace {
 
-using Clock = std::chrono::steady_clock;
-double since(Clock::time_point t0) { return std::chrono::duration<double>(Clock::now() - t0).count(); }
+using splash::AwakeClock;
+double since(AwakeClock::time_point t0) { return splash::millisecondsSince(t0) / 1e3; }
 
 constexpr int32_t kD = H3_DIT_HIDDEN, kTextDim = 5120, kTembIn = 256, kTembHidden = 5376, kTembDim = 2688;
 constexpr int32_t kAdaOut = H3_MODALITIES * H3_ADA_ROWS * kD, kFinalOut = 2 * kD;
@@ -98,90 +93,36 @@ void randomBits(uint32_t k0, uint32_t k1, size_t n, uint32_t *out) {
   });
 }
 
-// pread [offset, offset + bytes) with several threads
-Status parallelRead(int fd, uint64_t offset, size_t bytes, void *dst, const std::string &path) {
-  constexpr size_t kChunk = 16u << 20;
-  constexpr int kThreads = 4;
-  const size_t chunks = (bytes + kChunk - 1) / kChunk;
-  std::vector<Status> status(kThreads);
-  std::vector<std::thread> threads;
-  for (int t = 0; t < kThreads; ++t)
-    threads.emplace_back([&, t] {
-      for (size_t c = t; c < chunks; c += kThreads) {
-        const size_t off = c * kChunk, n = std::min(kChunk, bytes - off);
-        Status s = readFully(fd, offset + off, n, static_cast<uint8_t *>(dst) + off, path);
-        if (!s.ok()) {
-          status[t] = s;
-          return;
-        }
-      }
-    });
-  for (auto &th : threads) th.join();
-  for (const Status &s : status) H3_TRY(s);
-  return {};
-}
-
-struct Tensor {
-  const SafetensorsFile *file = nullptr;
-  TensorInfo info;
-};
-
-// A safetensors file read whole into one shared Metal buffer; views at tensor offsets.
-struct Blob {
-  SafetensorsFile file;
-  id<MTLBuffer> buffer = nil;
-  Status load(metal::MetalBackend &b, const std::string &path) {
-    H3_TRY(SafetensorsFile::open(path, file));
-    struct stat st {};
-    if (stat(path.c_str(), &st) != 0) return error(Code::Io, "cannot stat %s", path.c_str());
-    H3_TRY(b.allocate(static_cast<size_t>(st.st_size), buffer, "prep weights"));
-    const int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) return error(Code::Io, "cannot open %s", path.c_str());
-    Status s = parallelRead(fd, 0, static_cast<size_t>(st.st_size), buffer.contents, path);
-    ::close(fd);
-    return s;
-  }
-  Status view(const std::string &name, const char *dtype, const std::vector<int64_t> &shape, metal::BufferView &v) const {
-    TensorInfo info;
-    H3_TRY(file.find(name, dtype, shape, info));
-    v = {buffer, static_cast<size_t>(info.offset)};
-    return {};
-  }
-};
-
-// GPU scratch buffers by name (kept for the dumps)
+// GPU scratch buffers by name
 struct Buffers {
   metal::MetalBackend &b;
-  std::map<std::string, id<MTLBuffer>> m;
-  std::map<std::string, std::pair<std::string, std::vector<int64_t>>> meta;  // dtype, shape for dumps
-  Status make(const std::string &name, const char *dtype, std::vector<int64_t> shape, size_t elem) {
+  std::map<std::string, metal::MetalBuffer> m;
+  void make(const std::string &name, std::vector<int64_t> shape, size_t elem) {
     size_t n = 1;
     for (int64_t d : shape) n *= size_t(d);
-    id<MTLBuffer> buf;
-    H3_TRY(b.allocate(n * elem, buf, name.c_str()));
-    m[name] = buf;
-    meta[name] = {dtype, std::move(shape)};
-    return {};
+    m[name] = allocate(b, n * elem, name);
   }
-  metal::BufferView operator[](const std::string &name) const { return metal::BufferView{m.at(name)}; }
+  BufferView operator[](const std::string &name) const { return BufferView{m.at(name)}; }
   template <class T>
-  const T *host(const std::string &name) const { return static_cast<const T *>(m.at(name).contents); }
-  Status dump(const std::string &dir, const std::string &name, const std::string &as) const {
-    const auto &[dtype, shape] = meta.at(name);
-    size_t n = 1;
-    for (int64_t d : shape) n *= size_t(d);
-    const size_t elem = dtype == "<f4" || dtype == "<u4" ? 4 : 2;
-    const NpyArray a = NpyArray::of(dtype, shape, m.at(name).contents, n * elem);
-    return writeNpy(dir + "/" + as + ".npy", a);
-  }
+  const T *host(const std::string &name) const { return static_cast<const T *>(m.at(name).contents()); }
+  void *contents(const std::string &name) const { return m.at(name).contents(); }
 };
 
-Status readF32(const SafetensorsFile &f, const std::string &name, const std::vector<int64_t> &shape,
-               std::vector<float> &out) {
-  size_t n = 1;
-  for (int64_t d : shape) n *= size_t(d);
-  out.resize(n);
-  return f.read(name, "F32", shape, out.data(), n * 4);
+// A buffer holding the checkpoint's tensor `name`.
+metal::MetalBuffer resident(metal::MetalBackend &b, const SafetensorsCheckpoint &checkpoint, const std::string &name,
+                            const char *dtype, const std::vector<int64_t> &shape) {
+  const SourceTensor &source = tensor(checkpoint, name, dtype, shape);
+  metal::MetalBuffer buffer = allocate(b, source.bytes, name);
+  read(source, buffer.contents());
+  return buffer;
+}
+
+std::vector<float> readF32(const SafetensorsCheckpoint &checkpoint, const std::string &name,
+                           const std::vector<int64_t> &shape) {
+  const SourceTensor &source = tensor(checkpoint, name, "F32", shape);
+  std::vector<float> out(source.bytes / 4);
+  read(source, out.data());
+  return out;
 }
 
 // prep.py adaLN LoRA: tab = bf16(fp32(fp64(h) + (st @ A^T) @ B^T)) with numpy's sequential fused accumulation
@@ -262,8 +203,8 @@ void Prep::layout(const VideoGeometry &g, int32_t L, Prepared &p) {
   std::fill(p.tags.begin() + audioStart, p.tags.begin() + videoStart, uint8_t(2));
 }
 
-Status Prep::schedule(int32_t steps, Prepared &p) {
-  if (steps < 1) return error(Code::Argument, "prep: steps must be >= 1");
+void Prep::schedule(int32_t steps, Prepared &p) {
+  if (steps < 1) throw std::invalid_argument("prep: steps must be >= 1");
   // scheduler._linspace_1_to_0(steps + 1) and the exponential shift, float32 element ops as numpy
   auto sigmas = [&](float shift) {
     const int n = steps + 1;
@@ -295,7 +236,7 @@ Status Prep::schedule(int32_t steps, Prepared &p) {
   p.vSigmas = sigmas(12.0f);
   p.aSigmas = sigmas(3.0f);
   if (int(p.vSigmas.size()) != steps + 1 || int(p.aSigmas.size()) != steps + 1)
-    return error(Code::Argument, "prep: the shifted sigma grid collapses below %d steps", steps);
+    throw std::invalid_argument("prep: the shifted sigma grid collapses below " + std::to_string(steps) + " steps");
   p.steps = steps;
   auto timesteps = [](const std::vector<float> &s) {
     std::vector<float> t(s.size() - 1);
@@ -315,7 +256,6 @@ Status Prep::schedule(int32_t steps, Prepared &p) {
   };
   p.tv = index(p.vT);
   p.ta = index(p.aT);
-  return {};
 }
 
 void Prep::noiseBits(uint64_t seed, size_t videoCount, size_t audioCount, std::vector<uint32_t> &video,
@@ -340,94 +280,95 @@ void Prep::noiseBits(uint64_t seed, size_t videoCount, size_t audioCount, std::v
   randomBits(s0, s1, audioCount, audio.data());
 }
 
-Status Prep::run(metal::MetalBackend &b, const std::string &weights, Variant variant, const VideoGeometry &g,
-                 const PrepInputs &in, Prepared &p, const std::string &dump) {
-  const auto t0 = Clock::now();
-  if (!in.hidden || in.textRows < 2) return error(Code::Argument, "prep: text hidden states need >= 2 rows");
+void Prep::run(metal::MetalBackend &b, const std::string &weights, Variant variant, const VideoGeometry &g,
+               const PrepInputs &in, Prepared &p) {
+  const auto t0 = AwakeClock::now();
+  if (!in.hidden || in.textRows < 2) throw std::invalid_argument("prep: text hidden states need >= 2 rows");
   const int32_t L = in.textRows;
   const int32_t steps = in.steps > 0 ? in.steps : (variant == Variant::Turbo ? 8 : 50);
   layout(g, L, p);
-  H3_TRY(schedule(steps, p));
+  schedule(steps, p);
   p.layoutS = since(t0);
   const std::string ditDir = weights + (variant == Variant::Turbo ? "/dit-turbo" : "/dit-default");
-  H3_TRY(b.prepare(ops::PrepOps::kernels()));
-  ops::PrepOps op(b);
-  Blob w;
-  H3_TRY(w.load(b, ditDir + "/prep.safetensors"));
+  const SafetensorsCheckpoint dit(ditDir);
+  ops::PrepOps op;
   const int32_t T = static_cast<int32_t>(p.table.size()), M = p.rows;
-  Buffers buf{b, {}, {}};
-  // ---- one command buffer: RoPE, timestep MLP, final adaLN base, text path, noise
-  const auto t1 = Clock::now();
-  H3_TRY(buf.make("inv_freq", "<f4", {16}, 4));
-  H3_TRY(buf.make("pos", "<f4", {M, 3}, 4));
-  H3_TRY(buf.make("cos", "<f4", {M, 48}, 4));
-  H3_TRY(buf.make("sin", "<f4", {M, 48}, 4));
-  std::memcpy(buf.m["pos"].contents, p.pos.data(), p.pos.size() * 4);
-  H3_TRY(buf.make("table", "<f4", {T}, 4));
-  std::memcpy(buf.m["table"].contents, p.table.data(), size_t(T) * 4);
-  H3_TRY(buf.make("te_sin", "<f4", {T, kTembIn}, 4));
-  H3_TRY(buf.make("te_h", "<f4", {T, kTembHidden}, 4));
-  H3_TRY(buf.make("te_s", "<f4", {T, kTembHidden}, 4));
-  H3_TRY(buf.make("temb", "<f4", {T, kTembDim}, 4));
-  H3_TRY(buf.make("st", "<f4", {T, kTembDim}, 4));
-  H3_TRY(buf.make("st_bf", "<u2", {T, kTembDim}, 2));
-  H3_TRY(buf.make("fin", "<u2", {T, kFinalOut}, 2));
-  H3_TRY(buf.make("hidden", "<f4", {L, kTextDim}, 4));
-  std::memcpy(buf.m["hidden"].contents, in.hidden, size_t(L) * kTextDim * 4);
-  H3_TRY(buf.make("x0", "<u2", {L, kTextDim}, 2));
-  H3_TRY(buf.make("cp", "<u2", {L, kD}, 2));
+  Buffers buf{b, {}};
+  // ---- one command: RoPE, timestep MLP, final adaLN base, text path, noise
+  const auto t1 = AwakeClock::now();
+  buf.make("inv_freq", {16}, 4);
+  buf.make("pos", {M, 3}, 4);
+  buf.make("cos", {M, 48}, 4);
+  buf.make("sin", {M, 48}, 4);
+  std::memcpy(buf.contents("pos"), p.pos.data(), p.pos.size() * 4);
+  buf.make("table", {T}, 4);
+  std::memcpy(buf.contents("table"), p.table.data(), size_t(T) * 4);
+  buf.make("te_sin", {T, kTembIn}, 4);
+  buf.make("te_h", {T, kTembHidden}, 4);
+  buf.make("te_s", {T, kTembHidden}, 4);
+  buf.make("temb", {T, kTembDim}, 4);
+  buf.make("st", {T, kTembDim}, 4);
+  buf.make("st_bf", {T, kTembDim}, 2);
+  buf.make("fin", {T, kFinalOut}, 2);
+  buf.make("hidden", {L, kTextDim}, 4);
+  std::memcpy(buf.contents("hidden"), in.hidden, size_t(L) * kTextDim * 4);
+  buf.make("x0", {L, kTextDim}, 2);
+  buf.make("cp", {L, kD}, 2);
   for (int blk = 0; blk < kRefinerBlocks; ++blk) {
     const std::string s = "b" + std::to_string(blk) + "_";
-    H3_TRY(buf.make(s + "n1", "<u2", {L, kD}, 2));
-    H3_TRY(buf.make(s + "qkv", "<u2", {L, 3 * kInner}, 2));
-    H3_TRY(buf.make(s + "qn", "<u2", {L * kHeads, kHeadDim}, 2));
-    H3_TRY(buf.make(s + "kn", "<u2", {L * kHeads, kHeadDim}, 2));
-    H3_TRY(buf.make(s + "att", "<u2", {L, kInner}, 2));
-    H3_TRY(buf.make(s + "o", "<u2", {L, kD}, 2));
-    H3_TRY(buf.make(s + "x1", "<u2", {L, kD}, 2));
-    H3_TRY(buf.make(s + "n2", "<u2", {L, kD}, 2));
-    H3_TRY(buf.make(s + "f1", "<u2", {L, 2 * kFfn}, 2));
-    H3_TRY(buf.make(s + "act", "<u2", {L, kFfn}, 2));
-    H3_TRY(buf.make(s + "m", "<u2", {L, kD}, 2));
-    H3_TRY(buf.make(s + "x2", "<u2", {L, kD}, 2));
+    buf.make(s + "n1", {L, kD}, 2);
+    buf.make(s + "qkv", {L, 3 * kInner}, 2);
+    buf.make(s + "qn", {L * kHeads, kHeadDim}, 2);
+    buf.make(s + "kn", {L * kHeads, kHeadDim}, 2);
+    buf.make(s + "att", {L, kInner}, 2);
+    buf.make(s + "o", {L, kD}, 2);
+    buf.make(s + "x1", {L, kD}, 2);
+    buf.make(s + "n2", {L, kD}, 2);
+    buf.make(s + "f1", {L, 2 * kFfn}, 2);
+    buf.make(s + "act", {L, kFfn}, 2);
+    buf.make(s + "m", {L, kD}, 2);
+    buf.make(s + "x2", {L, kD}, 2);
   }
-  H3_TRY(buf.make("final", "<u2", {L, kD}, 2));
+  buf.make("final", {L, kD}, 2);
   const size_t videoCount = size_t(H3_VAE_LATENT) * p.latT * p.latH * p.latW, audioCount = size_t(p.audioRows) * 32;
   std::vector<uint32_t> vbits, abits;
   noiseBits(in.seed, videoCount, audioCount, vbits, abits);
-  H3_TRY(buf.make("bits_v", "<u4", {int64_t(videoCount)}, 4));
-  H3_TRY(buf.make("bits_a", "<u4", {int64_t(audioCount)}, 4));
-  std::memcpy(buf.m["bits_v"].contents, vbits.data(), videoCount * 4);
-  std::memcpy(buf.m["bits_a"].contents, abits.data(), audioCount * 4);
-  H3_TRY(buf.make("noise_v", "<f4", {1, H3_VAE_LATENT, p.latT, p.latH, p.latW}, 4));
-  H3_TRY(buf.make("noise_a", "<f4", {p.audioRows, 32}, 4));
+  buf.make("bits_v", {int64_t(videoCount)}, 4);
+  buf.make("bits_a", {int64_t(audioCount)}, 4);
+  std::memcpy(buf.contents("bits_v"), vbits.data(), videoCount * 4);
+  std::memcpy(buf.contents("bits_a"), abits.data(), audioCount * 4);
+  buf.make("noise_v", {1, H3_VAE_LATENT, p.latT, p.latH, p.latW}, 4);
+  buf.make("noise_a", {p.audioRows, 32}, 4);
 
-  metal::BufferView teInW, teInB, teOutW, teOutB, finW, finB, cpW, cpB, finalNorm;
-  H3_TRY(w.view("time_embedder.proj_in.weight", "F32", {kTembHidden, kTembIn}, teInW));
-  H3_TRY(w.view("time_embedder.proj_in.bias", "F32", {kTembHidden}, teInB));
-  H3_TRY(w.view("time_embedder.proj_out.weight", "F32", {kTembDim, kTembHidden}, teOutW));
-  H3_TRY(w.view("time_embedder.proj_out.bias", "F32", {kTembDim}, teOutB));
-  H3_TRY(w.view("final_layer.adaln_proj.linear.weight", "BF16", {kFinalOut, kTembDim}, finW));
-  H3_TRY(w.view("final_layer.adaln_proj.linear.bias", "BF16", {kFinalOut}, finB));
-  H3_TRY(w.view("condition_proj.weight", "BF16", {kD, kTextDim}, cpW));
-  H3_TRY(w.view("condition_proj.bias", "BF16", {kD}, cpB));
-  H3_TRY(w.view("token_refiner.final_norm.weight", "BF16", {kD}, finalNorm));
+  auto weight = [&](const std::string &name, const char *dtype, const std::vector<int64_t> &shape) {
+    return BufferView{resident(b, dit, name, dtype, shape)};
+  };
+  const BufferView teInW = weight("time_embedder.proj_in.weight", "F32", {kTembHidden, kTembIn});
+  const BufferView teInB = weight("time_embedder.proj_in.bias", "F32", {kTembHidden});
+  const BufferView teOutW = weight("time_embedder.proj_out.weight", "F32", {kTembDim, kTembHidden});
+  const BufferView teOutB = weight("time_embedder.proj_out.bias", "F32", {kTembDim});
+  const BufferView finW = weight("final_layer.adaln_proj.linear.weight", "BF16", {kFinalOut, kTembDim});
+  const BufferView finB = weight("final_layer.adaln_proj.linear.bias", "BF16", {kFinalOut});
+  const BufferView cpW = weight("condition_proj.weight", "BF16", {kD, kTextDim});
+  const BufferView cpB = weight("condition_proj.bias", "BF16", {kD});
+  const BufferView finalNorm = weight("token_refiner.final_norm.weight", "BF16", {kD});
   struct RefinerBlock {
-    metal::BufferView norm1, qkv, qNorm, kNorm, out, norm2, fc1, fc2;
+    BufferView norm1, qkv, qNorm, kNorm, out, norm2, fc1, fc2;
   } rb[kRefinerBlocks];
   for (int blk = 0; blk < kRefinerBlocks; ++blk) {
     const std::string s = "token_refiner.blocks." + std::to_string(blk) + ".";
-    H3_TRY(w.view(s + "norm1.weight", "BF16", {kD}, rb[blk].norm1));
-    H3_TRY(w.view(s + "attn.qkv_proj.weight", "BF16", {3 * kInner, kD}, rb[blk].qkv));
-    H3_TRY(w.view(s + "attn.q_norm.weight", "BF16", {kHeadDim}, rb[blk].qNorm));
-    H3_TRY(w.view(s + "attn.k_norm.weight", "BF16", {kHeadDim}, rb[blk].kNorm));
-    H3_TRY(w.view(s + "attn.out_proj.weight", "BF16", {kD, kInner}, rb[blk].out));
-    H3_TRY(w.view(s + "norm2.weight", "BF16", {kD}, rb[blk].norm2));
-    H3_TRY(w.view(s + "mlp.fc1.weight", "BF16", {2 * kFfn, kD}, rb[blk].fc1));
-    H3_TRY(w.view(s + "mlp.fc2.weight", "BF16", {kD, kFfn}, rb[blk].fc2));
+    rb[blk].norm1 = weight(s + "norm1.weight", "BF16", {kD});
+    rb[blk].qkv = weight(s + "attn.qkv_proj.weight", "BF16", {3 * kInner, kD});
+    rb[blk].qNorm = weight(s + "attn.q_norm.weight", "BF16", {kHeadDim});
+    rb[blk].kNorm = weight(s + "attn.k_norm.weight", "BF16", {kHeadDim});
+    rb[blk].out = weight(s + "attn.out_proj.weight", "BF16", {kD, kInner});
+    rb[blk].norm2 = weight(s + "norm2.weight", "BF16", {kD});
+    rb[blk].fc1 = weight(s + "mlp.fc1.weight", "BF16", {2 * kFfn, kD});
+    rb[blk].fc2 = weight(s + "mlp.fc2.weight", "BF16", {kD, kFfn});
   }
   const float attnScale = static_cast<float>(std::pow(double(kHeadDim), -0.5));
-  H3_TRY(b.runSync([&](id<MTLComputeCommandEncoder> e) {
+  {
+    Encoder e(b);
     op.ropeInvFreq(e, buf["inv_freq"]);
     op.ropeTrig(e, buf["pos"], buf["inv_freq"], buf["cos"], buf["sin"], M);
     op.tembSinusoid(e, buf["table"], buf["te_sin"], T);
@@ -464,7 +405,8 @@ Status Prep::run(metal::MetalBackend &b, const std::string &weights, Variant var
     op.rms(e, buf[x], finalNorm, buf["final"], L, kD, kD, kD, kEps);
     op.normal(e, buf["bits_v"], buf["noise_v"], int(videoCount));
     op.normal(e, buf["bits_a"], buf["noise_a"], int(audioCount));
-  }));
+    h3::run(b, e);
+  }
   p.textS = since(t1);
   // RoPE bf16 [M][96] = cos 48 | sin 48
   {
@@ -492,19 +434,17 @@ Status Prep::run(metal::MetalBackend &b, const std::string &weights, Variant var
     p.audioNoise.assign(buf.host<float>("noise_a"), buf.host<float>("noise_a") + audioCount);
   }
   // ---- adaLN tables
-  const auto t2 = Clock::now();
+  const auto t2 = AwakeClock::now();
   std::vector<double> st(size_t(T) * kTembDim);
   for (size_t i = 0; i < st.size(); ++i) st[i] = double(buf.host<float>("st")[i]);
   p.adaBlocks.assign(size_t(steps) * H3_DIT_BLOCKS * kAdaOut, 0);
   p.adaFinal.assign(size_t(steps) * H3_MODALITIES * kFinalOut, 0);
   {  // final layer (vdn-globals LoRA)
-    SafetensorsFile globals;
-    H3_TRY(SafetensorsFile::open(ditDir + "/vdn-globals.safetensors", globals));
     std::vector<float> A, B;
-    p.finalLora = globals.has("norm_out.linear.lora_A");
+    p.finalLora = dit.find("norm_out.linear.lora_A") != nullptr;
     if (p.finalLora) {
-      H3_TRY(readF32(globals, "norm_out.linear.lora_A", {16, kTembDim}, A));
-      H3_TRY(readF32(globals, "norm_out.linear.lora_B", {kFinalOut, 16}, B));
+      A = readF32(dit, "norm_out.linear.lora_A", {16, kTembDim});
+      B = readF32(dit, "norm_out.linear.lora_B", {kFinalOut, 16});
     }
     std::vector<uint16_t> tab;
     applyLora(buf.host<uint16_t>("fin"), st, p.finalLora ? A.data() : nullptr, p.finalLora ? B.data() : nullptr, T,
@@ -516,72 +456,39 @@ Status Prep::run(metal::MetalBackend &b, const std::string &weights, Variant var
       }
   }
   // block bases from the FL2VA shards, two slots: block i + 1 is read while the GPU evaluates block i
-  Json index;
-  const std::string tdir = weights + "/fl2va/transformer";
-  H3_TRY(Json::parseFile(tdir + "/model.safetensors.index.json", index));
-  const Json *map = index.get("weight_map");
-  if (!map) return error(Code::Io, "%s/model.safetensors.index.json: no weight_map", tdir.c_str());
-  std::map<std::string, std::unique_ptr<SafetensorsFile>> shards;
-  auto locate = [&](const std::string &key, const char *dtype, const std::vector<int64_t> &shape, Tensor &t) -> Status {
-    const Json *f = map->get(key);
-    if (!f) return error(Code::Io, "FL2VA transformer: %s missing", key.c_str());
-    auto &sh = shards[f->string()];
-    if (!sh) {
-      sh = std::make_unique<SafetensorsFile>();
-      H3_TRY(SafetensorsFile::open(tdir + "/" + f->string(), *sh));
-    }
-    t.file = sh.get();
-    return sh->find(key, dtype, shape, t.info);
-  };
-  id<MTLBuffer> wslot[2], bslot[2], hslot[2];
+  const SafetensorsCheckpoint transformer(weights + "/fl2va/transformer");
+  metal::MetalBuffer wslot[2], bslot[2], hslot[2];
   for (int s = 0; s < 2; ++s) {
-    H3_TRY(b.allocate(size_t(kAdaOut) * kTembDim * 2, wslot[s], "adaLN base slot"));
-    H3_TRY(b.allocate(size_t(kAdaOut) * 2, bslot[s], "adaLN bias slot"));
-    H3_TRY(b.allocate(size_t(T) * kAdaOut * 2, hslot[s], "adaLN output slot"));
+    wslot[s] = allocate(b, size_t(kAdaOut) * kTembDim * 2, "adaLN base slot");
+    bslot[s] = allocate(b, size_t(kAdaOut) * 2, "adaLN bias slot");
+    hslot[s] = allocate(b, size_t(T) * kAdaOut * 2, "adaLN output slot");
   }
-  auto readBlock = [&](int i, int s) -> Status {
-    Tensor wt, bt;
+  auto readBlock = [&](int i, int s) {
     const std::string k = "blocks." + std::to_string(i) + ".adaln_proj.linear.";
-    H3_TRY(locate(k + "weight", "BF16", {kAdaOut, kTembDim}, wt));
-    H3_TRY(locate(k + "bias", "BF16", {kAdaOut}, bt));
-    H3_TRY(bt.file->read(bt.info, bslot[s].contents));
-    const int fd = ::open(wt.file->path().c_str(), O_RDONLY);
-    if (fd < 0) return error(Code::Io, "cannot open %s", wt.file->path().c_str());
-    Status st2 = parallelRead(fd, wt.info.offset, wt.info.bytes, wslot[s].contents, wt.file->path());
-    ::close(fd);
-    p.adalnReadGb += (wt.info.bytes + bt.info.bytes) / 1e9;
-    return st2;
+    const SourceTensor &wt = tensor(transformer, k + "weight", "BF16", {kAdaOut, kTembDim});
+    const SourceTensor &bt = tensor(transformer, k + "bias", "BF16", {kAdaOut});
+    read(bt, bslot[s].contents());
+    read(wt, wslot[s].contents());
+    p.adalnReadGb += (wt.bytes + bt.bytes) / 1e9;
   };
-  H3_TRY(readBlock(0, 0));
+  readBlock(0, 0);
   std::vector<uint16_t> tab;
   for (int i = 0; i < H3_DIT_BLOCKS; ++i) {
     const int s = i & 1;
-    id<MTLCommandBuffer> cb = [b.queue() commandBuffer];
-    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
-    op.linear(e, false, buf["st_bf"], metal::BufferView{wslot[s]}, metal::BufferView{bslot[s]},
-              metal::BufferView{hslot[s]}, T, kAdaOut, kTembDim);
-    [e endEncoding];
-    [cb commit];
-    if (i + 1 < H3_DIT_BLOCKS) H3_TRY(readBlock(i + 1, s ^ 1));
-    SafetensorsFile bf;
-    char name[64];
-    snprintf(name, sizeof name, "/vdn-w8-block%02d.safetensors", i);
-    H3_TRY(SafetensorsFile::open(ditDir + name, bf));
+    Encoder e(b);
+    op.linear(e, false, buf["st_bf"], wslot[s], bslot[s], hslot[s], T, kAdaOut, kTembDim);
+    metal::CommandTicket ticket = submit(b, e);
+    if (i + 1 < H3_DIT_BLOCKS) readBlock(i + 1, s ^ 1);
     const std::string ka = "blocks." + std::to_string(i) + ".adaln_proj.lora_A";
     std::vector<float> A, B;
-    const bool lora = bf.has(ka);
+    const bool lora = dit.find(ka) != nullptr;
     if (lora) {
-      H3_TRY(readF32(bf, ka, {16, kTembDim}, A));
-      H3_TRY(readF32(bf, "blocks." + std::to_string(i) + ".adaln_proj.lora_B", {kAdaOut, 16}, B));
+      A = readF32(dit, ka, {16, kTembDim});
+      B = readF32(dit, "blocks." + std::to_string(i) + ".adaln_proj.lora_B", {kAdaOut, 16});
       ++p.adalnLoraBlocks;
     }
-    [cb waitUntilCompleted];
-    if (cb.error) return error(Code::Gpu, "prep adaLN: %s", cb.error.localizedDescription.UTF8String);
-    if (!dump.empty() && (i == 0 || i == 49)) {
-      const NpyArray a = NpyArray::of("<u2", {T, kAdaOut}, hslot[s].contents, size_t(T) * kAdaOut * 2);
-      H3_TRY(writeNpy(dump + "/ada" + std::to_string(i) + ".npy", a));
-    }
-    applyLora(static_cast<const uint16_t *>(hslot[s].contents), st, lora ? A.data() : nullptr,
+    wait(ticket);
+    applyLora(static_cast<const uint16_t *>(hslot[s].contents()), st, lora ? A.data() : nullptr,
               lora ? B.data() : nullptr, T, kTembDim, kAdaOut, tab);
     constexpr size_t kTag = size_t(H3_ADA_ROWS) * kD;
     for (int32_t sp = 0; sp < steps; ++sp)
@@ -592,34 +499,22 @@ Status Prep::run(metal::MetalBackend &b, const std::string &weights, Variant var
       }
   }
   p.adalnS = since(t2);
-  if (!dump.empty()) {
-    for (const char *n : {"inv_freq", "cos", "sin", "te_sin", "te_h", "te_s", "temb", "st", "fin", "x0", "cp", "final",
-                          "noise_v", "noise_a"})
-      H3_TRY(buf.dump(dump, n, n));
-    for (int blk = 0; blk < kRefinerBlocks; ++blk)
-      for (const char *n : {"n1", "qkv", "qn", "kn", "att", "o", "x1", "n2", "f1", "act", "m", "x2"}) {
-        const std::string name = "b" + std::to_string(blk) + "_" + n;
-        H3_TRY(buf.dump(dump, name, name));
-      }
-  }
   p.totalS = since(t0);
-  return {};
 }
 
-Status Prep::rope(metal::MetalBackend &b, Prepared &p) {
-  H3_TRY(b.prepare(ops::PrepOps::kernels()));
-  ops::PrepOps op(b);
+void Prep::rope(metal::MetalBackend &b, Prepared &p) {
+  ops::PrepOps op;
   const int32_t M = p.rows;
-  Buffers buf{b, {}, {}};
-  H3_TRY(buf.make("inv_freq", "<f4", {16}, 4));
-  H3_TRY(buf.make("pos", "<f4", {M, 3}, 4));
-  H3_TRY(buf.make("cos", "<f4", {M, 48}, 4));
-  H3_TRY(buf.make("sin", "<f4", {M, 48}, 4));
-  std::memcpy(buf.m["pos"].contents, p.pos.data(), p.pos.size() * 4);
-  H3_TRY(b.runSync([&](id<MTLComputeCommandEncoder> e) {
-    op.ropeInvFreq(e, buf["inv_freq"]);
-    op.ropeTrig(e, buf["pos"], buf["inv_freq"], buf["cos"], buf["sin"], M);
-  }));
+  Buffers buf{b, {}};
+  buf.make("inv_freq", {16}, 4);
+  buf.make("pos", {M, 3}, 4);
+  buf.make("cos", {M, 48}, 4);
+  buf.make("sin", {M, 48}, 4);
+  std::memcpy(buf.contents("pos"), p.pos.data(), p.pos.size() * 4);
+  Encoder e(b);
+  op.ropeInvFreq(e, buf["inv_freq"]);
+  op.ropeTrig(e, buf["pos"], buf["inv_freq"], buf["cos"], buf["sin"], M);
+  h3::run(b, e);
   const float *cs = buf.host<float>("cos"), *sn = buf.host<float>("sin");
   p.rope.resize(size_t(M) * 96);
   for (size_t r = 0; r < size_t(M); ++r)
@@ -627,13 +522,10 @@ Status Prep::rope(metal::MetalBackend &b, Prepared &p) {
       p.rope[r * 96 + c] = bf16Bits(cs[r * 48 + c]);
       p.rope[r * 96 + 48 + c] = bf16Bits(sn[r * 48 + c]);
     }
-  return {};
 }
 
-Status Prep::write(const std::string &dir, const Prepared &p, Variant variant, uint64_t seed, const std::string &source) {
-  std::error_code ec;
-  std::filesystem::create_directories(dir, ec);
-  if (ec) return error(Code::Io, "cannot create %s: %s", dir.c_str(), ec.message().c_str());
+void Prep::write(const std::string &dir, const Prepared &p, Variant variant, uint64_t seed, const std::string &source) {
+  std::filesystem::create_directories(dir);
   auto i64 = [](int64_t v) { return NpyArray::of("<i8", {}, &v, 8); };
   const int32_t M = p.rows;
   const NpyArray tags = NpyArray::of("|u1", {M}, p.tags.data(), p.tags.size());
@@ -641,25 +533,25 @@ Status Prep::write(const std::string &dir, const Prepared &p, Variant variant, u
   const NpyArray pos = NpyArray::of("<f4", {M, 3}, p.pos.data(), p.pos.size() * 4);
   const NpyArray L = i64(p.textRows), Na = i64(p.audioRows), Nv = i64(p.videoRows), latT = i64(p.latT),
                  latH = i64(p.latH), latW = i64(p.latW), nAud = i64(p.nAud), frames = i64(p.frames);
-  H3_TRY(writeNpz(dir + "/layout.npz", {{"tags", &tags}, {"rope", &rope}, {"pos", &pos}, {"L", &L}, {"Na", &Na},
-                                        {"Nv", &Nv}, {"lat_t", &latT}, {"lat_h", &latH}, {"lat_w", &latW},
-                                        {"n_aud", &nAud}, {"frames", &frames}}));
+  writeNpz(dir + "/layout.npz", {{"tags", &tags}, {"rope", &rope}, {"pos", &pos}, {"L", &L}, {"Na", &Na}, {"Nv", &Nv},
+                                 {"lat_t", &latT}, {"lat_h", &latH}, {"lat_w", &latW}, {"n_aud", &nAud},
+                                 {"frames", &frames}});
   const int64_t S = p.steps, T = static_cast<int64_t>(p.table.size());
   const NpyArray vs = NpyArray::of("<f4", {S + 1}, p.vSigmas.data(), (S + 1) * 4);
   const NpyArray as = NpyArray::of("<f4", {S + 1}, p.aSigmas.data(), (S + 1) * 4);
   const NpyArray vt = NpyArray::of("<f4", {S}, p.vT.data(), S * 4), at = NpyArray::of("<f4", {S}, p.aT.data(), S * 4);
   const NpyArray table = NpyArray::of("<f4", {T}, p.table.data(), T * 4);
   const NpyArray tv = NpyArray::of("<i8", {S}, p.tv.data(), S * 8), ta = NpyArray::of("<i8", {S}, p.ta.data(), S * 8);
-  H3_TRY(writeNpz(dir + "/sched.npz", {{"v_sigmas", &vs}, {"a_sigmas", &as}, {"v_t", &vt}, {"a_t", &at},
-                                       {"table", &table}, {"tv", &tv}, {"ta", &ta}}));
-  H3_TRY(writeNpy(dir + "/ada_blocks.npy", NpyArray::of("<u2", {S, H3_DIT_BLOCKS, H3_MODALITIES, H3_ADA_ROWS, kD},
-                                                         p.adaBlocks.data(), p.adaBlocks.size() * 2)));
-  H3_TRY(writeNpy(dir + "/ada_final.npy",
-                  NpyArray::of("<u2", {S, H3_MODALITIES, 2, kD}, p.adaFinal.data(), p.adaFinal.size() * 2)));
-  H3_TRY(writeNpy(dir + "/text_ref.npy", NpyArray::of("<u2", {p.textRows, kD}, p.text.data(), p.text.size() * 2)));
+  writeNpz(dir + "/sched.npz", {{"v_sigmas", &vs}, {"a_sigmas", &as}, {"v_t", &vt}, {"a_t", &at}, {"table", &table},
+                                {"tv", &tv}, {"ta", &ta}});
+  writeNpy(dir + "/ada_blocks.npy", NpyArray::of("<u2", {S, H3_DIT_BLOCKS, H3_MODALITIES, H3_ADA_ROWS, kD},
+                                                 p.adaBlocks.data(), p.adaBlocks.size() * 2));
+  writeNpy(dir + "/ada_final.npy",
+           NpyArray::of("<u2", {S, H3_MODALITIES, 2, kD}, p.adaFinal.data(), p.adaFinal.size() * 2));
+  writeNpy(dir + "/text_ref.npy", NpyArray::of("<u2", {p.textRows, kD}, p.text.data(), p.text.size() * 2));
   const NpyArray video = NpyArray::of("<f4", {p.videoRows, 96}, p.videoNoise.data(), p.videoNoise.size() * 4);
   const NpyArray audio = NpyArray::of("<f4", {p.audioRows, 32}, p.audioNoise.data(), p.audioNoise.size() * 4);
-  H3_TRY(writeNpz(dir + "/noise.npz", {{"video", &video}, {"audio", &audio}}));
+  writeNpz(dir + "/noise.npz", {{"video", &video}, {"audio", &audio}});
   auto list = [](const std::vector<float> &v) {
     std::string s = "[";
     char x[32];
@@ -680,10 +572,9 @@ Status Prep::write(const std::string &dir, const Prepared &p, Variant variant, u
            p.finalLora ? "true" : "false", source.c_str(), list(p.vSigmas).c_str(), list(p.aSigmas).c_str(), p.layoutS,
            p.textS, p.adalnS, p.adalnReadGb, p.totalS);
   FILE *f = fopen((dir + "/prep.json").c_str(), "w");
-  if (!f) return error(Code::Io, "cannot write %s/prep.json", dir.c_str());
+  if (!f) throw std::runtime_error("cannot write " + dir + "/prep.json");
   fputs(json, f);
   fclose(f);
-  return {};
 }
 
 } // namespace h3::model

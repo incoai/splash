@@ -8,9 +8,9 @@
 
 namespace h3 {
 
-Status MemoryPlan::create(metal::MetalBackend &backend, const model::SequenceLayout &lay, int32_t partialSlots,
-                          bool qkfix, MemoryPlan &out) {
-  MemoryPlan plan;
+MemoryPlan::MemoryPlan(metal::MetalBackend &backend, const model::SequenceLayout &lay, int32_t partialSlots,
+                       bool qkfix) {
+  MemoryPlan &plan = *this;
   const size_t M = lay.rows(), Spad = lay.paddedRows(), L = std::max(lay.text, 1), Na = std::max(lay.audio, 1);
   const size_t Fp = lay.innerFrames(), Nin = lay.innerRows(), Nv = static_cast<size_t>(lay.frames) * lay.tokensPerFrame;
   const size_t D = H3_DIT_HIDDEN, F = H3_DIT_FFN, H = H3_DIT_HEADS, HD = H3_DIT_HEAD_DIM, C = H3_DIT_INNER;
@@ -127,18 +127,14 @@ Status MemoryPlan::create(metal::MetalBackend &backend, const model::SequenceLay
     size_t &slab = plan.slabBytes_[static_cast<size_t>(e.slab)];
     slab = std::max(slab, e.offset + e.bytes);
   }
-  for (size_t s = 0; s < static_cast<size_t>(Slab::Count); ++s) {
-    if (plan.slabBytes_[s] == 0) continue;
-    H3_TRY(backend.allocate(plan.slabBytes_[s], plan.slabs_[s], "activation"));
-  }
+  for (size_t s = 0; s < static_cast<size_t>(Slab::Count); ++s)
+    if (plan.slabBytes_[s]) plan.slabs_[s] = allocate(backend, plan.slabBytes_[s], "activation");
   // pad rows of V must be finite (attention multiplies them by P = 0); QKFIX split dims start at 0
   for (Slab s : {Slab::Value, Slab::QkFixQueryExact, Slab::QkFixKeyExact})
-    if (id<MTLBuffer> b = plan.slabs_[static_cast<size_t>(s)]) std::memset(b.contents, 0, b.length);
-  out = std::move(plan);
-  return {};
+    if (const metal::MetalBuffer &b = plan.slabs_[static_cast<size_t>(s)]) std::memset(b.contents(), 0, b.sizeBytes());
 }
 
-metal::BufferView MemoryPlan::view(Tensor t) const {
+BufferView MemoryPlan::view(Tensor t) const {
   const PlanEntry &e = entries_[static_cast<size_t>(t)];
   return {slabs_[static_cast<size_t>(e.slab)], e.offset};
 }
@@ -147,14 +143,6 @@ size_t MemoryPlan::totalBytes() const {
   size_t total = 0;
   for (size_t b : slabBytes_) total += b;
   return total;
-}
-
-void MemoryPlan::log(const Logger &logger) const {
-  logger.info("H3 memory plan: %.1f MiB of activations in %d buffers", totalBytes() / 1048576.0,
-              static_cast<int>(std::count_if(slabBytes_.begin(), slabBytes_.end(), [](size_t b) { return b > 0; })));
-  for (const PlanEntry &e : entries_)
-    logger.debug("  %-48s slab %2d +%10.1f MiB %9.1f MiB  %s", e.name, static_cast<int>(e.slab), e.offset / 1048576.0,
-                 e.bytes / 1048576.0, e.lifetime);
 }
 
 } // namespace h3

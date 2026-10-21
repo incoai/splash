@@ -4,28 +4,30 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <stdexcept>
 
 namespace h3::model {
 namespace {
 
 constexpr int64_t kGrowthAxisMaxDigits = 21;  // numpy.lib.format: spare header space for the first axis
 
-Status readFile(const std::string &path, std::vector<uint8_t> &out) {
+[[noreturn]] void fail(const std::string &message) { throw std::runtime_error(message); }
+
+std::vector<uint8_t> readFile(const std::string &path) {
   std::ifstream file(path, std::ios::binary | std::ios::ate);
-  if (!file) return error(Code::Io, "cannot open %s", path.c_str());
+  if (!file) fail("cannot open " + path);
   const std::streamsize size = file.tellg();
   file.seekg(0);
-  out.resize(static_cast<size_t>(size));
-  if (size && !file.read(reinterpret_cast<char *>(out.data()), size)) return error(Code::Io, "cannot read %s", path.c_str());
-  return {};
+  std::vector<uint8_t> out(static_cast<size_t>(size));
+  if (size && !file.read(reinterpret_cast<char *>(out.data()), size)) fail("cannot read " + path);
+  return out;
 }
 
-Status writeFile(const std::string &path, const std::vector<uint8_t> &bytes) {
+void writeFile(const std::string &path, const std::vector<uint8_t> &bytes) {
   FILE *f = std::fopen(path.c_str(), "wb");
-  if (!f) return error(Code::Io, "cannot write %s", path.c_str());
+  if (!f) fail("cannot write " + path);
   const bool ok = std::fwrite(bytes.data(), 1, bytes.size(), f) == bytes.size();
-  if (std::fclose(f) != 0 || !ok) return error(Code::Io, "cannot write %s", path.c_str());
-  return {};
+  if (std::fclose(f) != 0 || !ok) fail("cannot write " + path);
 }
 
 template <class T>
@@ -53,8 +55,8 @@ uint32_t crc32(const uint8_t *data, size_t n) {
   return crc ^ 0xFFFFFFFFu;
 }
 
-Status parseNpy(const uint8_t *p, size_t n, const std::string &what, NpyArray &out) {
-  if (n < 10 || std::memcmp(p, "\x93NUMPY", 6) != 0) return error(Code::Io, "%s: not a .npy array", what.c_str());
+NpyArray parseNpy(const uint8_t *p, size_t n, const std::string &what) {
+  if (n < 10 || std::memcmp(p, "\x93NUMPY", 6) != 0) fail(what + ": not a .npy array");
   const uint8_t major = p[6];
   size_t headerLen = 0, start = 0;
   if (major == 1) {
@@ -64,7 +66,7 @@ Status parseNpy(const uint8_t *p, size_t n, const std::string &what, NpyArray &o
     headerLen = load<uint32_t>(p + 8);
     start = 12;
   }
-  if (start + headerLen > n) return error(Code::Io, "%s: truncated header", what.c_str());
+  if (start + headerLen > n) fail(what + ": truncated header");
   const std::string header(reinterpret_cast<const char *>(p + start), headerLen);
   auto field = [&](const char *key) -> std::string {
     const size_t k = header.find(std::string("'") + key + "'");
@@ -74,9 +76,9 @@ Status parseNpy(const uint8_t *p, size_t n, const std::string &what, NpyArray &o
   NpyArray a;
   std::string descr = field("descr");
   const size_t q0 = descr.find('\''), q1 = descr.find('\'', q0 + 1);
-  if (q0 == std::string::npos || q1 == std::string::npos) return error(Code::Io, "%s: bad descr", what.c_str());
+  if (q0 == std::string::npos || q1 == std::string::npos) fail(what + ": bad descr");
   a.dtype = descr.substr(q0 + 1, q1 - q0 - 1);
-  if (header.find("'fortran_order': True") != std::string::npos) return error(Code::Io, "%s: Fortran order", what.c_str());
+  if (header.find("'fortran_order': True") != std::string::npos) fail(what + ": Fortran order");
   const std::string shape = field("shape");
   const size_t s0 = shape.find('('), s1 = shape.find(')');
   std::stringstream dims(shape.substr(s0 + 1, s1 - s0 - 1));
@@ -84,10 +86,9 @@ Status parseNpy(const uint8_t *p, size_t n, const std::string &what, NpyArray &o
   while (std::getline(dims, d, ','))
     if (d.find_first_of("0123456789") != std::string::npos) a.shape.push_back(std::stoll(d));
   const size_t bytes = a.count() * a.itemSize();
-  if (a.itemSize() == 0 || start + headerLen + bytes > n) return error(Code::Io, "%s: unsupported or short data", what.c_str());
+  if (a.itemSize() == 0 || start + headerLen + bytes > n) fail(what + ": unsupported or short data");
   a.data.assign(p + start + headerLen, p + start + headerLen + bytes);
-  out = std::move(a);
-  return {};
+  return a;
 }
 
 std::vector<uint8_t> serializeNpy(const NpyArray &a) {
@@ -121,23 +122,6 @@ size_t NpyArray::itemSize() const {
   return 0;
 }
 
-Status NpyArray::toFloat32(std::vector<float> &out) const {
-  const size_t n = count();
-  out.resize(n);
-  if (dtype == "<f4") std::memcpy(out.data(), data.data(), n * 4);
-  else if (dtype == "<f8") for (size_t i = 0; i < n; ++i) out[i] = static_cast<float>(as<double>()[i]);
-  else return error(Code::Io, "expected a float array, got %s", dtype.c_str());
-  return {};
-}
-
-Status NpyArray::toInt64(int64_t &out) const {
-  if (count() != 1) return error(Code::Io, "expected a scalar");
-  if (dtype == "<i8") out = as<int64_t>()[0];
-  else if (dtype == "<i4") out = as<int32_t>()[0];
-  else return error(Code::Io, "expected an integer, got %s", dtype.c_str());
-  return {};
-}
-
 NpyArray NpyArray::of(const std::string &dtype, std::vector<int64_t> shape, const void *data, size_t bytes) {
   NpyArray a;
   a.dtype = dtype;
@@ -147,34 +131,27 @@ NpyArray NpyArray::of(const std::string &dtype, std::vector<int64_t> shape, cons
   return a;
 }
 
-Status readNpy(const std::string &path, NpyArray &out) {
-  std::vector<uint8_t> bytes;
-  H3_TRY(readFile(path, bytes));
-  return parseNpy(bytes.data(), bytes.size(), path, out);
-}
-
-Status readNpz(const std::string &path, std::map<std::string, NpyArray> &out) {
-  std::vector<uint8_t> z;
-  H3_TRY(readFile(path, z));
+std::map<std::string, NpyArray> readNpz(const std::string &path) {
+  const std::vector<uint8_t> z = readFile(path);
   int64_t eocd = -1;
   for (int64_t i = static_cast<int64_t>(z.size()) - 22; i >= 0; --i)
     if (load<uint32_t>(&z[static_cast<size_t>(i)]) == 0x06054b50u) {
       eocd = i;
       break;
     }
-  if (eocd < 0) return error(Code::Io, "%s: not a zip file", path.c_str());
+  if (eocd < 0) fail(path + ": not a zip file");
   const uint16_t entries = load<uint16_t>(&z[eocd + 10]);
   size_t cd = load<uint32_t>(&z[eocd + 16]);
-  out.clear();
+  std::map<std::string, NpyArray> out;
   for (uint16_t e = 0; e < entries; ++e) {
-    if (cd + 46 > z.size() || load<uint32_t>(&z[cd]) != 0x02014b50u) return error(Code::Io, "%s: bad central directory", path.c_str());
+    if (cd + 46 > z.size() || load<uint32_t>(&z[cd]) != 0x02014b50u) fail(path + ": bad central directory");
     const uint16_t method = load<uint16_t>(&z[cd + 10]);
     uint64_t size = load<uint32_t>(&z[cd + 24]);
     const uint16_t nameLen = load<uint16_t>(&z[cd + 28]), extraLen = load<uint16_t>(&z[cd + 30]),
                    commentLen = load<uint16_t>(&z[cd + 32]);
     uint64_t local = load<uint32_t>(&z[cd + 42]);
     const std::string name(reinterpret_cast<const char *>(&z[cd + 46]), nameLen);
-    if (method != 0) return error(Code::Io, "%s: compressed member %s", path.c_str(), name.c_str());
+    if (method != 0) fail(path + ": compressed member " + name);
     for (size_t x = cd + 46 + nameLen; x + 4 <= cd + 46 + nameLen + extraLen;) {  // zip64 extra
       const uint16_t id = load<uint16_t>(&z[x]), len = load<uint16_t>(&z[x + 2]);
       if (id == 1) {
@@ -185,19 +162,19 @@ Status readNpz(const std::string &path, std::map<std::string, NpyArray> &out) {
       }
       x += 4 + len;
     }
-    if (local + 30 > z.size()) return error(Code::Io, "%s: bad local header", path.c_str());
+    if (local + 30 > z.size()) fail(path + ": bad local header");
     const size_t data = local + 30 + load<uint16_t>(&z[local + 26]) + load<uint16_t>(&z[local + 28]);
-    if (data + size > z.size()) return error(Code::Io, "%s: truncated member %s", path.c_str(), name.c_str());
+    if (data + size > z.size()) fail(path + ": truncated member " + name);
     std::string key = name.size() > 4 && name.substr(name.size() - 4) == ".npy" ? name.substr(0, name.size() - 4) : name;
-    H3_TRY(parseNpy(&z[data], size, path + ":" + name, out[key]));
+    out[key] = parseNpy(&z[data], size, path + ":" + name);
     cd += 46 + nameLen + extraLen + commentLen;
   }
-  return {};
+  return out;
 }
 
-Status writeNpy(const std::string &path, const NpyArray &array) { return writeFile(path, serializeNpy(array)); }
+void writeNpy(const std::string &path, const NpyArray &array) { writeFile(path, serializeNpy(array)); }
 
-Status writeNpz(const std::string &path, const std::vector<std::pair<std::string, const NpyArray *>> &arrays) {
+void writeNpz(const std::string &path, const std::vector<std::pair<std::string, const NpyArray *>> &arrays) {
   std::vector<uint8_t> z, central;
   for (const auto &[key, array] : arrays) {
     const std::vector<uint8_t> member = serializeNpy(*array);
@@ -251,19 +228,7 @@ Status writeNpz(const std::string &path, const std::vector<std::pair<std::string
   put<uint32_t>(z, cdSize);
   put<uint32_t>(z, cdOffset);
   put<uint16_t>(z, 0);
-  return writeFile(path, z);
-}
-
-Status member(const std::map<std::string, NpyArray> &npz, const std::string &name, const char *dtype, size_t count,
-              const NpyArray *&out) {
-  auto it = npz.find(name);
-  if (it == npz.end()) return error(Code::Io, "npz member %s missing", name.c_str());
-  if (dtype && it->second.dtype != dtype)
-    return error(Code::Io, "npz member %s is %s, expected %s", name.c_str(), it->second.dtype.c_str(), dtype);
-  if (count && it->second.count() != count)
-    return error(Code::Io, "npz member %s has %zu elements, expected %zu", name.c_str(), it->second.count(), count);
-  out = &it->second;
-  return {};
+  writeFile(path, z);
 }
 
 } // namespace h3::model

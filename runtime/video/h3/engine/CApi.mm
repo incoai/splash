@@ -1,10 +1,14 @@
-// C ABI of libh3.dylib (include/h3/h3.h) over h3::Engine.
+// C ABI of the engine (h3.h) over h3::Engine: each call returns the class of the exception that ended it
+// (engine/Errors.hpp) as its h3_status.
 #include "video/h3/h3.h"
 
+#include "StderrLine.hpp"
 #include "video/h3/engine/Engine.hpp"
+#include "video/h3/engine/Errors.hpp"
 #include "video/h3/media/Mp4Writer.hpp"
 
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <string>
 
@@ -16,6 +20,11 @@ struct h3_engine {
 };
 
 namespace {
+
+// An exception of the step callback, which leaves h3_denoise as it was thrown.
+struct CallbackFailure {
+  std::exception_ptr error;
+};
 
 h3::Request toRequest(const h3_request &r) {
   h3::Request q;
@@ -34,20 +43,39 @@ h3::Request toRequest(const h3_request &r) {
   return q;
 }
 
-h3_status report(h3_engine *e, const h3::Status &s) {
-  if (s.ok()) return H3_OK;
-  if (e) e->error = s.message();
-  fprintf(stderr, "h3: %s\n", s.message().c_str());
-  return static_cast<h3_status>(s.code());
+h3_status report(h3_engine *e, h3_status status, const std::exception &failure) {
+  if (e) e->error = failure.what();
+  splash::logLine("h3: ", failure.what());
+  return status;
+}
+
+// Runs `call`, and returns H3_OK or the status of the exception it threw, its message kept for h3_error.
+template <class Call>
+h3_status guarded(h3_engine *e, Call &&call) {
+  try {
+    call();
+    return H3_OK;
+  } catch (const std::invalid_argument &failure) {
+    return report(e, H3_ERROR_ARGUMENT, failure);
+  } catch (const h3::StateError &failure) {
+    return report(e, H3_ERROR_STATE, failure);
+  } catch (const h3::GpuError &failure) {
+    return report(e, H3_ERROR_GPU, failure);
+  } catch (const splash::metal::MetalBackendError &failure) {
+    return report(e, H3_ERROR_METAL, failure);
+  } catch (const std::exception &failure) {
+    return report(e, H3_ERROR_IO, failure);
+  }
 }
 
 void copyStats(const h3::ForwardStats &s, h3_forward_stats *out) {
   if (!out) return;
-  *out = h3_forward_stats{s.wallMs,        s.embedMs,         s.blocksSpanMs, s.blocksGpuMs,    s.finalMs,
-                          s.linearMs,      s.attentionMs,     s.otherMs,      s.branchMs,       s.gpuBusyMs,
-                          s.gpuIdleMs,     s.gpuGapMaxMs,     s.gpuGaps,      s.commandBuffers, s.streamWaitMs,
-                          s.streamWaitMaxMs, s.streamReadGb, s.streamReadS, s.streamReadMaxMs, s.streamWaits,
-                          s.streamBlocks,  s.deviceMb};
+  // GPU time by step class and the gaps between command buffers are not measured: one command runs a block.
+  *out = h3_forward_stats{s.wallMs,          s.embedMs,      s.blocksSpanMs, s.blocksGpuMs,    s.finalMs,
+                          0,                 0,              0,              0,                s.gpuBusyMs,
+                          s.gpuIdleMs,       0,              0,              s.commandBuffers, s.streamWaitMs,
+                          s.streamWaitMaxMs, s.streamReadGb, s.streamReadS,  s.streamReadMaxMs, s.streamWaits,
+                          s.streamBlocks,    s.deviceMb};
 }
 
 } // namespace
@@ -76,24 +104,24 @@ h3_request h3_default_request(void) {
 
 h3_status h3_geometry_of(const h3_request *request, h3_geometry *out) {
   if (!request || !out) return H3_ERROR_ARGUMENT;
-  h3::model::VideoGeometry g;
-  h3::model::VaePlan plan;
-  h3::Status s = h3::model::VideoGeometry::of(request->frames, request->width, request->height, g);
-  if (s.ok()) s = h3::model::planVaeDecode(g, plan);
-  if (!s.ok()) return report(nullptr, s);
-  *out = h3_geometry{g.frames,       g.width,       g.height,           g.latentFrames,
-                     g.latentHeight, g.latentWidth, g.videoRows(),      g.audioRows,
-                     plan.outputFrames(), h3::model::previewFrames(g.latentFrames),
-                     static_cast<int32_t>(h3::ops::AudioDecoder::samples(g.audioRows / 2))};
-  return H3_OK;
+  return guarded(nullptr, [&] {
+    const h3::model::VideoGeometry g = h3::model::VideoGeometry::of(request->frames, request->width, request->height);
+    const h3::model::VaePlan plan = h3::model::planVaeDecode(g);
+    *out = h3_geometry{g.frames,       g.width,       g.height,           g.latentFrames,
+                       g.latentHeight, g.latentWidth, g.videoRows(),      g.audioRows,
+                       plan.outputFrames(), h3::model::previewFrames(g.latentFrames),
+                       static_cast<int32_t>(h3::ops::AudioDecoder::samples(g.audioRows / 2))};
+  });
 }
 
 int64_t h3_window_table(const h3_request *request, int32_t text_rows, int32_t *words, int64_t capacity) {
   if (!request) return -1;
-  h3::WindowTable table;
-  if (report(nullptr, h3::Engine::windowTable(toRequest(*request), text_rows, table)) != H3_OK) return -1;
-  const int64_t n = static_cast<int64_t>(table.words().size());
-  if (words && capacity >= n) std::memcpy(words, table.words().data(), static_cast<size_t>(n) * 4);
+  int64_t n = -1;
+  guarded(nullptr, [&] {
+    const h3::WindowTable table = h3::Engine::windowTable(toRequest(*request), text_rows);
+    n = static_cast<int64_t>(table.words().size());
+    if (words && capacity >= n) std::memcpy(words, table.words().data(), static_cast<size_t>(n) * 4);
+  });
   return n;
 }
 
@@ -101,8 +129,9 @@ h3_status h3_create(const h3_config *config, const h3_request *request, h3_engin
   if (!config || !request || !out || !config->metallib || !config->weights) return H3_ERROR_ARGUMENT;
   *out = nullptr;
   auto e = std::make_unique<h3_engine>();
-  const h3_status s = report(e.get(), h3::Engine::create({config->metallib, config->weights}, toRequest(*request),
-                                                         e->engine));
+  const h3_status s = guarded(e.get(), [&] {
+    e->engine = std::make_unique<h3::Engine>(h3::EngineConfig{config->metallib, config->weights}, toRequest(*request));
+  });
   if (s != H3_OK) return s;
   *out = e.release();
   return H3_OK;
@@ -114,24 +143,26 @@ const char *h3_error(const h3_engine *engine) { return engine ? engine->error.c_
 
 h3_status h3_prep(h3_engine *e, const h3_prep_inputs *in, h3_prepared *out) {
   if (!e || !in || !out) return H3_ERROR_ARGUMENT;
-  auto p = std::make_unique<h3::model::Prepared>();
-  const h3_status r = report(e, e->engine->prep({in->hidden, in->text_rows, in->steps, in->seed}, *p));
-  if (r != H3_OK) return r;
-  e->prepared = std::move(p);
-  e->seed = in->seed;
-  const h3::model::Prepared &q = *e->prepared;
-  *out = h3_prepared{q.textRows,        q.rows,           q.steps,          static_cast<int32_t>(q.table.size()),
-                     q.tags.data(),     q.rope.data(),    q.pos.data(),     q.text.data(),
-                     q.adaBlocks.data(), q.adaFinal.data(), q.vT.data(),      q.aT.data(),
-                     q.vSigmas.data(),  q.aSigmas.data(), q.table.data(),   q.tv.data(),
-                     q.ta.data(),       q.videoNoise.data(), q.audioNoise.data(), q.totalS};
-  return H3_OK;
+  return guarded(e, [&] {
+    auto p = std::make_unique<h3::model::Prepared>();
+    e->engine->prep({in->hidden, in->text_rows, in->steps, in->seed}, *p);
+    e->prepared = std::move(p);
+    e->seed = in->seed;
+    const h3::model::Prepared &q = *e->prepared;
+    *out = h3_prepared{q.textRows,        q.rows,           q.steps,          static_cast<int32_t>(q.table.size()),
+                       q.tags.data(),     q.rope.data(),    q.pos.data(),     q.text.data(),
+                       q.adaBlocks.data(), q.adaFinal.data(), q.vT.data(),      q.aT.data(),
+                       q.vSigmas.data(),  q.aSigmas.data(), q.table.data(),   q.tv.data(),
+                       q.ta.data(),       q.videoNoise.data(), q.audioNoise.data(), q.totalS};
+  });
 }
 
 h3_status h3_prep_write(h3_engine *e, const char *dir) {
   if (!e || !dir) return H3_ERROR_ARGUMENT;
-  if (!e->prepared) return report(e, h3::error(h3::Code::State, "h3_prep_write before h3_prep"));
-  return report(e, h3::model::Prep::write(dir, *e->prepared, e->engine->request().variant, e->seed, "h3_prep"));
+  return guarded(e, [&] {
+    if (!e->prepared) throw h3::StateError("h3_prep_write before h3_prep");
+    h3::model::Prep::write(dir, *e->prepared, e->engine->request().variant, e->seed, "h3_prep");
+  });
 }
 
 void h3_prep_release(h3_engine *e) {
@@ -140,26 +171,26 @@ void h3_prep_release(h3_engine *e) {
 
 h3_status h3_dit_load(h3_engine *e, const h3_dit_inputs *in) {
   if (!e || !in) return H3_ERROR_ARGUMENT;
-  return report(e, e->engine->loadDit({in->text_rows, in->tags, in->rope, in->text}));
+  return guarded(e, [&] { e->engine->loadDit({in->text_rows, in->tags, in->rope, in->text}); });
 }
 
 h3_status h3_dit_info_of(const h3_engine *e, h3_dit_info *out) {
   if (!e || !out) return H3_ERROR_ARGUMENT;
-  h3::DitInfo info;
-  const h3::Status s = e->engine->ditInfo(info);
-  if (!s.ok()) return static_cast<h3_status>(s.code());
-  const h3::model::SequenceLayout &lay = *e->engine->layout();
-  *out = h3_dit_info{info.rows,          info.paddedRows,  lay.text,          lay.audio,
-                     lay.frames * lay.tokensPerFrame,     info.windowItems, info.chunkedGroups, info.partialSlots,
-                     info.density,       info.streamSlots, info.weightsMb,   info.activationsMb, info.deviceMb};
-  return H3_OK;
+  return guarded(nullptr, [&] {
+    const h3::DitInfo info = e->engine->ditInfo();
+    const h3::model::SequenceLayout &lay = *e->engine->layout();
+    *out = h3_dit_info{info.rows,          info.paddedRows,  lay.text,          lay.audio,
+                       lay.frames * lay.tokensPerFrame,     info.windowItems, info.chunkedGroups, info.partialSlots,
+                       info.density,       info.streamSlots, info.weightsMb,   info.activationsMb, info.deviceMb};
+  });
 }
 
 h3_status h3_dit_forward(h3_engine *e, const uint16_t *ada_blocks, const uint16_t *ada_final, const float *video_in,
                          const float *audio_in, float *video_out, float *audio_out, h3_forward_stats *stats) {
   if (!e || !ada_blocks || !ada_final || !video_in || !video_out) return H3_ERROR_ARGUMENT;
   h3::ForwardStats s;
-  const h3_status r = report(e, e->engine->forward(ada_blocks, ada_final, video_in, audio_in, video_out, audio_out, s));
+  const h3_status r =
+      guarded(e, [&] { e->engine->forward(ada_blocks, ada_final, video_in, audio_in, video_out, audio_out, s); });
   copyStats(s, stats);
   return r;
 }
@@ -174,9 +205,17 @@ h3_status h3_denoise(h3_engine *e, const h3_schedule *schedule, const float *vid
     onStep = [&](int32_t step, const h3::ForwardStats &stats, const float *video, const float *audio) {
       h3_forward_stats c;
       copyStats(stats, &c);
-      callback(user, step, &c, video, audio);
+      try {
+        callback(user, step, &c, video, audio);
+      } catch (...) {
+        throw CallbackFailure{std::current_exception()};
+      }
     };
-  return report(e, e->engine->denoise(s, video_noise, audio_noise, video_out, audio_out, onStep));
+  try {
+    return guarded(e, [&] { e->engine->denoise(s, video_noise, audio_noise, video_out, audio_out, onStep); });
+  } catch (const CallbackFailure &failure) {
+    std::rethrow_exception(failure.error);
+  }
 }
 
 void h3_dit_release(h3_engine *e) {
@@ -186,7 +225,7 @@ void h3_dit_release(h3_engine *e) {
 h3_status h3_decode(h3_engine *e, const float *video_latents, uint8_t *frames, h3_decode_stats *stats) {
   if (!e || !video_latents || !frames) return H3_ERROR_ARGUMENT;
   h3::DecodeStats s;
-  const h3_status r = report(e, e->engine->decode(video_latents, frames, s));
+  const h3_status r = guarded(e, [&] { e->engine->decode(video_latents, frames, s); });
   if (stats) *stats = h3_decode_stats{s.wallS, s.gpuS, s.hostCopyS, s.uploadS, s.gpuSpanS, s.nonfinite, s.deviceMb};
   return r;
 }
@@ -195,7 +234,7 @@ h3_status h3_preview(h3_engine *e, const float *video_latents, uint8_t *frames, 
                      h3_preview_stats *stats) {
   if (!e || !video_latents || !frames) return H3_ERROR_ARGUMENT;
   h3::PreviewStats s;
-  const h3_status r = report(e, e->engine->preview(video_latents, frames, yuv420, s));
+  const h3_status r = guarded(e, [&] { e->engine->preview(video_latents, frames, yuv420, s); });
   if (stats) *stats = h3_preview_stats{s.wallS, s.gpuS, s.hostCopyS, s.nonfinite, s.chunks, s.frames, s.deviceMb};
   return r;
 }
@@ -203,7 +242,7 @@ h3_status h3_preview(h3_engine *e, const float *video_latents, uint8_t *frames, 
 h3_status h3_decode_audio(h3_engine *e, const float *audio_latents, float *wav, h3_audio_stats *stats) {
   if (!e || !audio_latents || !wav) return H3_ERROR_ARGUMENT;
   h3::AudioStats s;
-  const h3_status r = report(e, e->engine->decodeAudio(audio_latents, wav, s));
+  const h3_status r = guarded(e, [&] { e->engine->decodeAudio(audio_latents, wav, s); });
   if (stats) *stats = h3_audio_stats{s.wallS, s.gpuS, s.samples, s.nonfinite, s.deviceMb};
   return r;
 }
@@ -212,7 +251,8 @@ h3_status h3_write_mp4(const char *path, const uint8_t *frames, int32_t frame_co
                        const float *wav, int64_t samples, h3_mp4_stats *stats) {
   if (!path || !frames) return H3_ERROR_ARGUMENT;
   h3::media::Mp4Stats s;
-  const h3_status r = report(nullptr, h3::media::writeMp4(path, frames, frame_count, width, height, wav, samples, s));
+  const h3_status r =
+      guarded(nullptr, [&] { h3::media::writeMp4(path, frames, frame_count, width, height, wav, samples, s); });
   if (stats)
     *stats = h3_mp4_stats{s.wallS, s.frames, s.audioSamples, s.videoSeconds, s.audioSeconds, s.bytes, s.videoBitrate};
   return r;

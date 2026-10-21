@@ -3,10 +3,7 @@
 // Converted audio VAE decoder (tools/convert_audio.py from FL2VA/audio_vae): fp16 hi / lo conv weights W[tap][Cout][Cin],
 // fp32 biases, SnakeBeta parameters [2][C] (exp(alpha), 1 / (exp(beta) + 1e-9)), the 12-tap anti-aliasing filter and
 // the latent de-normalisation, in one blob audio_dec_f16.bin + manifest.json (byte offsets, 256-byte aligned).
-#import <Metal/Metal.h>
-
-#include "video/h3/engine/Status.hpp"
-#include "video/h3/metal/MetalBackend.hpp"
+#include "video/h3/engine/Encoder.hpp"
 
 #include <array>
 #include <memory>
@@ -15,7 +12,7 @@
 namespace h3::model {
 
 struct AudioConv {
-  metal::BufferView w, wl, b;  // b empty for conv_post
+  BufferView w, wl, b;  // b empty for conv_post
   int32_t taps = 0, cout = 0, cin = 0;
 };
 
@@ -24,7 +21,7 @@ struct AudioConv {
 struct AudioStageWeights {
   AudioConv up;
   std::array<std::array<AudioConv, 3>, 3> convs1, convs2;  // [block][dilation]
-  std::array<std::array<metal::BufferView, 6>, 3> acts;     // [block][activation]: convs1[d] <- 2d, convs2[d] <- 2d+1
+  std::array<std::array<BufferView, 6>, 3> acts;     // [block][activation]: convs1[d] <- 2d, convs2[d] <- 2d+1
 };
 
 class AudioWeights {
@@ -35,15 +32,15 @@ public:
   static constexpr int kDilations[3] = {1, 3, 5};
   static constexpr int kDecoderDim = 1024, kLatentDim = 2048, kSampleRate = 32000;
 
-  static Status load(metal::MetalBackend &backend, const std::string &dir, std::unique_ptr<AudioWeights> &out);
+  static std::unique_ptr<AudioWeights> load(metal::MetalBackend &backend, const std::string &dir);
 
   AudioConv decIn, convPre, convPost;
   std::array<AudioStageWeights, kStages> stages;
-  metal::BufferView postAct, filter, mean, std;
-  [[nodiscard]] size_t bytes() const { return blob_ ? blob_.length : 0; }
+  BufferView postAct, filter, mean, std;
+  [[nodiscard]] size_t bytes() const { return blob_.sizeBytes(); }
 
 private:
-  id<MTLBuffer> blob_ = nil;
+  metal::MetalBuffer blob_;
 };
 
 } // namespace h3::model

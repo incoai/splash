@@ -10,7 +10,6 @@
 #include "video/h3/model/Numpy.hpp"
 
 #import <Foundation/Foundation.h>
-#import <Metal/Metal.h>
 
 #include <mach/mach.h>
 #include <sysexits.h>
@@ -112,9 +111,12 @@ struct Options {
 
 std::vector<float> readHiddenStates(const std::filesystem::path &path) {
   std::map<std::string, h3::model::NpyArray> npz;
-  const h3::Status read = h3::model::readNpz(path.string(), npz);
+  try {
+    npz = h3::model::readNpz(path.string());
+  } catch (const std::runtime_error &) {
+  }
   const auto found = npz.find("hidden");
-  if (!read.ok() || found == npz.end() || found->second.dtype != "<f4" || found->second.shape.size() != 2 ||
+  if (found == npz.end() || found->second.dtype != "<f4" || found->second.shape.size() != 2 ||
       found->second.shape[1] != TextEncoder::kHiddenSize)
     throw std::invalid_argument(path.string() + " holds no f32 [L][5120] hidden");
   const auto *values = found->second.as<float>();
@@ -194,7 +196,7 @@ private:
 void write(const std::filesystem::path &path, const std::vector<std::pair<std::string, h3::model::NpyArray>> &arrays) {
   std::vector<std::pair<std::string, const h3::model::NpyArray *>> members;
   for (const auto &[name, array] : arrays) members.emplace_back(name, &array);
-  if (!h3::model::writeNpz(path.string(), members).ok()) throw std::runtime_error("cannot write " + path.string());
+  h3::model::writeNpz(path.string(), members);
 }
 
 void writeFile(const std::filesystem::path &path, const void *data, size_t bytes) {
@@ -469,22 +471,16 @@ bool servesVideo(const std::filesystem::path &modelRoot) {
 }
 
 int serve(const std::filesystem::path &metallib, int argc, char **argv) {
-  // The protocol keeps stdout's descriptor; the engine's log lines, which it
-  // writes to stdout, go to stderr.
-  const int events = dup(STDOUT_FILENO);
-  if (events < 0 || dup2(STDERR_FILENO, STDOUT_FILENO) < 0)
-    throw std::system_error(errno, std::generic_category(), "video engine output");
   struct sigaction action {};
   action.sa_handler = requestStop;
   sigemptyset(&action.sa_mask);
   for (const int number : {SIGTERM, SIGINT, SIGHUP}) sigaction(number, &action, nullptr);
   std::signal(SIGPIPE, SIG_IGN);
-  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-  if (!device || ![device supportsFamily:MTLGPUFamilyApple10]) {
+  if (metal::probeDeviceCapabilities().appleGpuFamily < 10) {
     writeStderrLine("error: the video engine runs on an Apple10 GPU (M5) or later");
     return EX_SOFTWARE;
   }
-  EventWriter writer(events);
+  EventWriter writer(STDOUT_FILENO);
   VideoServer server(parse(metallib, argc, argv), writer);
   return server.run(STDIN_FILENO);
 }

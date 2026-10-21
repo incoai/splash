@@ -13,10 +13,7 @@
 //
 // Work items for the window kernel: 64-row query groups whose 16-row blocks all see >= kDenseKeyMin keys are split
 // into kKeyChunk-key items writing partials (merged by dit_window_combine); window items first.
-#import <Metal/Metal.h>
-
-#include "video/h3/engine/Status.hpp"
-#include "video/h3/metal/MetalBackend.hpp"
+#include "video/h3/engine/Encoder.hpp"
 #include "metal/abi/video/AttentionABI.h"
 #include "video/h3/model/Geometry.hpp"
 
@@ -28,7 +25,8 @@ namespace h3 {
 
 class WindowTable {
 public:
-  static Status build(const model::SequenceLayout &layout, int32_t chunk, int32_t radius, WindowTable &out);
+  // Throws std::invalid_argument for a layout the kernels do not cover.
+  WindowTable(const model::SequenceLayout &layout, int32_t chunk, int32_t radius);
 
   [[nodiscard]] const std::vector<int32_t> &words() const { return words_; }
   [[nodiscard]] int32_t blocks() const { return nqb_; }
@@ -39,13 +37,13 @@ public:
   [[nodiscard]] std::vector<std::array<int32_t, 2>> branchBounds() const;
 
   // Work items and the GPU copies of table, items and chunked groups (qg, slot0, chunks, 0).
-  Status upload(metal::MetalBackend &backend);
+  void upload(metal::MetalBackend &backend);
   [[nodiscard]] const std::vector<WindowItem> &items() const { return items_; }
   [[nodiscard]] int32_t partialSlots() const { return slots_; }
   [[nodiscard]] int32_t chunkedGroups() const { return static_cast<int32_t>(groups_.size()); }
-  [[nodiscard]] id<MTLBuffer> tableBuffer() const { return table_; }
-  [[nodiscard]] id<MTLBuffer> itemBuffer() const { return itemBuffer_; }
-  [[nodiscard]] id<MTLBuffer> groupBuffer() const { return groupBuffer_; }
+  [[nodiscard]] const metal::MetalBuffer &tableBuffer() const { return table_; }
+  [[nodiscard]] const metal::MetalBuffer &itemBuffer() const { return itemBuffer_; }
+  [[nodiscard]] const metal::MetalBuffer &groupBuffer() const { return groupBuffer_; }
 
 private:
   void buildItems();
@@ -56,7 +54,7 @@ private:
   std::vector<WindowItem> items_;
   std::vector<std::array<int32_t, 4>> groups_;
   int32_t slots_ = 0;
-  id<MTLBuffer> table_ = nil, itemBuffer_ = nil, groupBuffer_ = nil;
+  metal::MetalBuffer table_, itemBuffer_, groupBuffer_;
 };
 
 } // namespace h3

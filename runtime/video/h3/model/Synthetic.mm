@@ -27,15 +27,15 @@ void syntheticBf16(uint64_t seed, size_t n, float scale, float offset, uint16_t 
   }
 }
 
-Status SyntheticFiller::allocate(size_t count, int type, uint64_t seed, float scale, float offset,
-                                 __strong id<MTLBuffer> &out, const char *what) {
+metal::MetalBuffer SyntheticFiller::allocate(size_t count, int type, uint64_t seed, float scale, float offset,
+                                             std::string_view what) {
   const size_t elem = type == H3_SYN_I8 ? 1 : type == H3_SYN_F32 ? 4 : 2;
-  H3_TRY(b_.allocate(count * elem, out, what));
+  metal::MetalBuffer out = h3::allocate(b_, count * elem, what);
   fill(out, 0, count, type, seed, scale, offset);
-  return {};
+  return out;
 }
 
-void SyntheticFiller::fill(id<MTLBuffer> buffer, size_t offsetBytes, size_t count, int type, uint64_t seed,
+void SyntheticFiller::fill(const metal::MetalBuffer &buffer, size_t offsetBytes, size_t count, int type, uint64_t seed,
                            float scale, float offset) {
   const size_t elem = type == H3_SYN_I8 ? 1 : type == H3_SYN_F32 ? 4 : 2;
   jobs_.push_back({buffer, offsetBytes,
@@ -44,18 +44,16 @@ void SyntheticFiller::fill(id<MTLBuffer> buffer, size_t offsetBytes, size_t coun
   bytes_ += count * elem;
 }
 
-Status SyntheticFiller::run() {
-  H3_TRY(b_.prepare({"synthetic_fill"}));
-  H3_TRY(b_.runSync([&](id<MTLComputeCommandEncoder> e) {
-    [e setComputePipelineState:b_.pipeline("synthetic_fill")];
-    for (const Job &j : jobs_) {
-      [e setBuffer:j.buffer offset:j.offset atIndex:0];
-      metal::bindBytes(e, j.fill, 1);
-      [e dispatchThreads:MTLSizeMake(j.fill.count, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    }
-  }));
+void SyntheticFiller::run() {
+  Encoder e(b_);
+  e.pipeline("synthetic_fill");
+  for (const Job &j : jobs_) {
+    e.bind({j.buffer, j.offset}, 0);
+    e.bytes(j.fill, 1);
+    e.dispatchThreads(size3(j.fill.count), size3(256));
+  }
+  h3::run(b_, e);
   jobs_.clear();
-  return {};
 }
 
 } // namespace h3::model

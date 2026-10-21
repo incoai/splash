@@ -14,9 +14,8 @@
 //            on (nextafter(-1, 0), 1), erfinv, x sqrt 2; video latents [24][F][48][84] patchified, then audio rows
 // GPU work runs on kernels/prep (MLX-identical arithmetic, see prep.metal); the 26 GB of adaLN bases are streamed
 // from <weights>/fl2va/transformer while the GPU evaluates the previous block.
-#include "video/h3/engine/Status.hpp"
+#include "video/h3/engine/Encoder.hpp"
 #include "video/h3/engine/Types.hpp"
-#include "video/h3/metal/MetalBackend.hpp"
 #include "video/h3/model/Geometry.hpp"
 
 #include <cstdint>
@@ -54,19 +53,17 @@ struct Prepared {
 
 class Prep {
 public:
-  // dump: directory for the op-level intermediates of the text and timestep paths (dev/tests prep_check)
-  static Status run(metal::MetalBackend &backend, const std::string &weights, Variant variant,
-                    const VideoGeometry &geometry, const PrepInputs &inputs, Prepared &out,
-                    const std::string &dump = "");
+  static void run(metal::MetalBackend &backend, const std::string &weights, Variant variant,
+                  const VideoGeometry &geometry, const PrepInputs &inputs, Prepared &out);
   // The prep directory of the former Python prep: layout.npz, sched.npz, ada_blocks.npy, ada_final.npy,
   // text_ref.npy, noise.npz, prep.json (same members, dtypes and bytes).
-  static Status write(const std::string &dir, const Prepared &p, Variant variant, uint64_t seed,
-                      const std::string &source);
+  static void write(const std::string &dir, const Prepared &p, Variant variant, uint64_t seed,
+                    const std::string &source);
   // CPU parts (no device)
-  static Status schedule(int32_t steps, Prepared &p);
+  static void schedule(int32_t steps, Prepared &p);
   static void layout(const VideoGeometry &geometry, int32_t textRows, Prepared &p);
   // RoPE of p.pos (p.rope), on the same kernels as run()
-  static Status rope(metal::MetalBackend &backend, Prepared &p);
+  static void rope(metal::MetalBackend &backend, Prepared &p);
   static void noiseBits(uint64_t seed, size_t videoCount, size_t audioCount, std::vector<uint32_t> &video,
                         std::vector<uint32_t> &audio);
 };

@@ -1,15 +1,14 @@
 #pragma once
 
-// One request: device and kernel library, request geometry, and the phases that run on them (DiT denoising, video
-// VAE decode, TAEH3 preview, audio VAE decode). Each phase loads its weights on first use; the DiT phase is released
-// explicitly so a single process can decode afterwards.
+// One request: Splash's Metal backend (device, queue, kernel library), request geometry, and the phases that run on
+// them (DiT denoising, video VAE decode, TAEH3 preview, audio VAE decode). Each phase loads its weights on first use;
+// the DiT phase is released explicitly so a single process can decode afterwards. Failures throw (Errors.hpp).
+#include "video/h3/engine/Encoder.hpp"
 #include "video/h3/engine/MemoryPlan.hpp"
 #include "video/h3/engine/Scheduler.hpp"
-#include "video/h3/engine/Status.hpp"
 #include "video/h3/engine/Types.hpp"
 #include "video/h3/engine/WeightStream.hpp"
 #include "video/h3/engine/WindowTable.hpp"
-#include "video/h3/metal/MetalBackend.hpp"
 #include "video/h3/model/DitWeights.hpp"
 #include "video/h3/model/Geometry.hpp"
 #include "video/h3/model/Prep.hpp"
@@ -19,7 +18,7 @@
 
 #include <functional>
 #include <memory>
-#include <set>
+#include <optional>
 #include <string>
 
 namespace h3 {
@@ -52,67 +51,61 @@ using StepCallback = std::function<void(int32_t step, const ForwardStats &, cons
 
 class Engine {
 public:
-  static Status create(const EngineConfig &config, const Request &request, std::unique_ptr<Engine> &out);
+  Engine(const EngineConfig &config, const Request &request);
   ~Engine();
+  Engine(const Engine &) = delete;
+  Engine &operator=(const Engine &) = delete;
 
   [[nodiscard]] const model::VideoGeometry &geometry() const { return geometry_; }
   [[nodiscard]] const Request &request() const { return request_; }
-  [[nodiscard]] const Logger &log() const { return log_; }
   [[nodiscard]] metal::MetalBackend &backend() { return *backend_; }
 
-  // ---- prep: request-constant DiT inputs from the text hidden states (model/Prep.hpp); dump: op-level intermediates
-  Status prep(const model::PrepInputs &inputs, model::Prepared &out, const std::string &dump = "");
+  // ---- prep: request-constant DiT inputs from the text hidden states (model/Prep.hpp)
+  void prep(const model::PrepInputs &inputs, model::Prepared &out);
 
   // ---- DiT
-  Status loadDit(const DitInputs &inputs);
+  void loadDit(const DitInputs &inputs);
   // Deterministic synthetic weights and request inputs (model/Synthetic.hpp; layout and RoPE of the request), no
-  // weight files: kernel and speed checks (h3 bench --synthetic, dev/tests/synthetic_check.sh). Forwards then run
-  // the first `blocks` blocks only (1: quick check), and only those blocks get weights.
-  Status loadDitSynthetic(int32_t textRows, int32_t blocks = H3_DIT_BLOCKS);
-  Status forward(const uint16_t *adaBlocks, const uint16_t *adaFinal, const float *videoIn, const float *audioIn,
-                 float *videoOut, float *audioOut, ForwardStats &stats);
-  Status denoise(const Schedule &schedule, const float *videoNoise, const float *audioNoise, float *videoOut,
-                 float *audioOut, const StepCallback &onStep);
-  [[nodiscard]] Status ditInfo(DitInfo &out) const;
+  // weight files: the kernel check of dev/tests/engine/video_synthetic_metal_test.mm. Forwards then run the first
+  // `blocks` blocks only (1: quick check), and only those blocks get weights.
+  void loadDitSynthetic(int32_t textRows, int32_t blocks = H3_DIT_BLOCKS);
+  void forward(const uint16_t *adaBlocks, const uint16_t *adaFinal, const float *videoIn, const float *audioIn,
+               float *videoOut, float *audioOut, ForwardStats &stats);
+  void denoise(const Schedule &schedule, const float *videoNoise, const float *audioNoise, float *videoOut,
+               float *audioOut, const StepCallback &onStep);
+  [[nodiscard]] DitInfo ditInfo() const;
   void releaseDit();
-  // Internals for the block check harness (dev/tests).
-  [[nodiscard]] Scheduler *scheduler() { return dit_ ? dit_->scheduler.get() : nullptr; }
   [[nodiscard]] const model::SequenceLayout *layout() const { return dit_ ? &dit_->layout : nullptr; }
 
   // ---- video VAE and preview (rows: final video latents [video_rows][96])
-  Status decode(const float *videoRows, uint8_t *frames, DecodeStats &stats);
+  void decode(const float *videoRows, uint8_t *frames, DecodeStats &stats);
   [[nodiscard]] int32_t decodeFrames() const { return vaePlan_.outputFrames(); }
-  // Per-stage GPU profile of the first `clips` temporal clips (one command buffer per dispatch; slow).
-  Status profileDecode(const float *videoRows, int32_t clips, DecodeStats &stats,
-                       std::vector<std::pair<std::string, double>> &stageMs);
-  Status preview(const float *videoRows, uint8_t *frames, uint8_t *yuv, PreviewStats &stats);
+  void preview(const float *videoRows, uint8_t *frames, uint8_t *yuv, PreviewStats &stats);
 
   // ---- audio VAE (rows: final audio latents [audio_rows][32]) -> waveform [2][audioSamples()] at 32 kHz
-  Status decodeAudio(const float *audioRows, float *wav, AudioStats &stats);
+  void decodeAudio(const float *audioRows, float *wav, AudioStats &stats);
   [[nodiscard]] int64_t audioSamples() const { return ops::AudioDecoder::samples(geometry_.audioRows / 2); }
   [[nodiscard]] int32_t previewFrames() const { return model::previewFrames(geometry_.latentFrames); }
 
   // Key-range table of a request (no device needed).
-  static Status windowTable(const Request &request, int32_t textRows, WindowTable &out);
+  [[nodiscard]] static WindowTable windowTable(const Request &request, int32_t textRows);
 
 private:
   struct DitState {
     model::SequenceLayout layout;
     std::unique_ptr<model::DitWeights> weights;
     std::unique_ptr<WeightStream> stream;
-    WindowTable table;
-    MemoryPlan plan;
+    std::optional<WindowTable> table;
+    std::optional<MemoryPlan> plan;
     std::unique_ptr<Scheduler> scheduler;
   };
 
-  Engine() = default;
-  Status loadDitWith(const DitInputs &inputs, std::unique_ptr<model::DitWeights> synthetic);
+  void loadDitWith(const DitInputs &inputs, std::unique_ptr<model::DitWeights> synthetic);
   [[nodiscard]] std::string ditDirectory() const;
-  Status loadVae();
+  void loadVae();
   // de-normalised channels-last latents, the last frame repeated over the plan's pad tokens
   void vaeLatents(const float *videoRows, std::vector<float> &z) const;
 
-  Logger log_;
   EngineConfig config_;
   Request request_;
   model::VideoGeometry geometry_;
