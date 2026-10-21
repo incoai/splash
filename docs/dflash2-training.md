@@ -139,14 +139,20 @@ Use the identical arguments and recipe with `--resume` after interruption.
 The command rejects changes to inputs, implementation, library versions, device
 context, or settings.
 Resume restores the latest committed checkpoint, optimizer, RNG, and absolute
-block cursor in a deterministically shuffled epoch. Nonempty run directories require explicit resume. Exports use
-new directories and are published only after finite-value and format checks.
-An independent `export` subcommand can export a local trainer checkpoint.
+block cursor in a deterministically shuffled epoch. Nonempty run directories
+require explicit resume. Exports use new directories and are published only
+after finite-value and format checks. If interruption occurs after export
+publication but before `selection.json` is written, resume verifies every
+exported tensor and its provenance against the selected checkpoint before
+finishing the manifest. It never replaces a published export. An independent
+`export` subcommand can export a local trainer checkpoint.
 
 ## Evaluation and native serving
 
 Checkpoint selection uses validation trace replay only. It maximizes mean
-consecutive matching proposals; the earlier checkpoint wins ties. The export,
+consecutive matching proposals; the earlier checkpoint wins ties. Validation
+uses the BF16 weights that will be exported and then restores the FP32 masters
+before training continues. The export,
 recipe, input identities, implementation, library versions, device context,
 and split fingerprints are frozen before final tests. Evaluation checks these
 before opening the test data.
@@ -186,6 +192,22 @@ acceptance, decode throughput, and latency against the released draft using
 identical target, sampling, cache, and memory settings with alternating runs.
 Exports remain experimental until these real-model gates pass. A compatible
 checkpoint or reduced loss alone does not establish a speedup.
+
+## Evidence required before leaving draft
+
+- Complete a CUDA preflight and short training run with the real BF16 target
+  and released initial draft. Record GPU, peak memory, step time, exact input
+  revisions, recipe, and split fingerprints.
+- Prepare and load both an unchanged round-trip export and the trained export
+  in native Splash on a supported Mac. Verify the deployment tokenizer and
+  token IDs against the training teacher.
+- Compare the released and trained drafts with alternating native runs on the
+  same deployment target. Report acceptance, decode throughput, and latency,
+  with sampling, cache, memory settings, hardware, and revisions held fixed.
+
+The CPU fixture tests establish implementation behavior at small dimensions.
+They do not satisfy these hardware gates. Fresh initialization, additional
+target families, and a Mac training backend are outside this PR's scope.
 
 ## Development tests
 

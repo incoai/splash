@@ -209,6 +209,94 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual(result["step"], self.recipe.max_steps)
         self.assertTrue((output / "selection.json").is_file())
 
+    def test_resume_finishes_selection_after_export_was_published(self):
+        from unittest import mock
+
+        from draft_training.config import checkpoint_identity, write_json
+
+        output = self.root / "interrupted-export"
+
+        def interrupt_selection(path, value):
+            if Path(path).name == "selection.json":
+                raise KeyboardInterrupt
+            write_json(path, value)
+
+        with mock.patch(
+            "draft_training.trainer.write_json", side_effect=interrupt_selection
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_train(self.model, output)
+        self.assertTrue((output / "export").is_dir())
+        self.assertFalse((output / "selection.json").exists())
+        published = checkpoint_identity(output / "export")
+        restored, _, _ = tiny_components()
+        with mock.patch(
+            "torch.optim.AdamW.step", side_effect=AssertionError("training repeated")
+        ):
+            self.run_train(restored, output, resume=True)
+        self.assertEqual(
+            read_json(output / "selection.json")["export_identity"], published
+        )
+        self.assertEqual(checkpoint_identity(output / "export"), published)
+        with mock.patch(
+            "draft_training.trainer.write_json",
+            side_effect=AssertionError("completed selection overwritten"),
+        ):
+            self.run_train(restored, output, resume=True)
+
+    def test_resume_rejects_changed_published_export(self):
+        from safetensors.torch import load_file, save_file
+
+        output = self.root / "changed-export"
+        self.run_train(self.model, output)
+        (output / "selection.json").unlink()
+        weights = output / "export/model.safetensors"
+        state = load_file(str(weights))
+        state["fc.weight"][0, 0] += 1
+        save_file(state, str(weights))
+        restored, _, _ = tiny_components()
+        with self.assertRaisesRegex(TrainingError, "export differs"):
+            self.run_train(restored, output, resume=True)
+        self.assertFalse((output / "selection.json").exists())
+
+    def test_validation_scores_exported_bf16_weights_and_restores_fp32_masters(self):
+        from draft_training.evaluate import evaluate_cached
+        from draft_training.export import export_model
+        from draft_training.model import load_draft
+        from draft_training.trainer import configure_trainable
+
+        configure_trainable(self.model, "all")
+        with self.torch.no_grad():
+            for parameter in self.model.parameters():
+                parameter.add_(0.0013)
+        masters = {name: p.clone() for name, p in self.model.named_parameters()}
+        export = self.root / "bf16-validation"
+        export_model(self.model, export, {}, family=False)
+        restored = load_draft(export, tiny_config())
+        expected = evaluate_cached(
+            restored, self.embedding, self.head, self.validation, self.recipe, "cpu"
+        )
+        actual = evaluate_cached(
+            self.model, self.embedding, self.head, self.validation, self.recipe, "cpu"
+        )
+        self.assertEqual(actual, expected)
+        for name, parameter in self.model.named_parameters():
+            self.assertEqual(parameter.dtype, self.torch.float32)
+            self.torch.testing.assert_close(parameter, masters[name], rtol=0, atol=0)
+
+        # A failed validation must also leave the optimizer's master values intact.
+        with self.assertRaises(OSError):
+            evaluate_cached(
+                self.model,
+                self.embedding,
+                self.head,
+                self.root / "missing",
+                self.recipe,
+                "cpu",
+            )
+        for name, parameter in self.model.named_parameters():
+            self.torch.testing.assert_close(parameter, masters[name], rtol=0, atol=0)
+
     def test_evaluation_budget_is_spread_across_continuations(self):
         import shutil
 

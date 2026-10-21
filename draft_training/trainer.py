@@ -10,7 +10,7 @@ from .capture import load_sample
 from .config import TrainingError, read_json, write_json
 from .data import anchors
 from .evaluate import evaluate_cached
-from .export import export_model, restore_checkpoint, save_checkpoint
+from .export import export_model, restore_checkpoint, save_checkpoint, verify_export
 from .losses import block_loss
 
 
@@ -185,16 +185,24 @@ def train(
     selected = output / "checkpoints" / progress["best_checkpoint"]
     model.load_state_dict(load_file(str(selected / "model.safetensors")))
     export_path = output / "export"
+    export_provenance = {
+        **provenance,
+        "selected_checkpoint": progress["best_checkpoint"],
+    }
     if export_path.exists():
-        raise TrainingError(
-            "final export already exists; this run has already completed"
+        if not resume:
+            raise TrainingError(
+                "final export already exists; use --resume to verify it"
+            )
+        # Export publication and selection publication are separate atomic
+        # operations. Recover the gap without replacing a published checkpoint.
+        export_identity = verify_export(
+            model, export_path, export_provenance, family=family
         )
-    export_identity = export_model(
-        model,
-        export_path,
-        {**provenance, "selected_checkpoint": progress["best_checkpoint"]},
-        family=family,
-    )
+    else:
+        export_identity = export_model(
+            model, export_path, export_provenance, family=family
+        )
     selection = {
         **provenance,
         "export_identity": export_identity,
@@ -204,5 +212,10 @@ def train(
         "native_validation": "not run",
         "status": "experimental",
     }
-    write_json(output / "selection.json", selection)
+    selection_path = output / "selection.json"
+    if selection_path.exists():
+        if read_json(selection_path) != selection:
+            raise TrainingError("selection manifest differs from the completed run")
+    else:
+        write_json(selection_path, selection)
     return progress
