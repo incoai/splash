@@ -74,8 +74,48 @@
     },
     {
       "name": "dense-mlx-oracle-bf16-bf16",
-      "status": "running",
-      "exit_status": null
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "dense-gguf-oracle-int8-fp32",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "dense-gguf-oracle-int8-bf16",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "dense-gguf-oracle-bf16-fp32",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "dense-gguf-oracle-bf16-bf16",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "current-moe-decode",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "current-moe-mixed",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "current-dense-decode",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "current-dense-mixed",
+      "status": "pass",
+      "exit_status": 0
     }
   ],
   "oracles": [
@@ -155,9 +195,160 @@
       "pass_marker": true,
       "log": "dense-mlx-oracle-bf16-fp32.log",
       "source_log_sha256": "47afa85cdaf188046852971c3ada882974c526364796daeea1a371c8918a6626"
+    },
+    {
+      "name": "dense-mlx-oracle-bf16-bf16",
+      "status": "pass",
+      "pass_marker": true,
+      "log": "dense-mlx-oracle-bf16-bf16.log",
+      "source_log_sha256": "819410144bf09f4e53ff5e34c270de2d2ff4e868430ecbd32fd53167a1e6e825"
+    },
+    {
+      "name": "dense-gguf-oracle-int8-fp32",
+      "status": "pass",
+      "pass_marker": true,
+      "log": "dense-gguf-oracle-int8-fp32.log",
+      "source_log_sha256": "25fd92184258621238f87209ff07aa8e97ba23ee3b92ba8d5a525b769d371435"
+    },
+    {
+      "name": "dense-gguf-oracle-int8-bf16",
+      "status": "pass",
+      "pass_marker": true,
+      "log": "dense-gguf-oracle-int8-bf16.log",
+      "source_log_sha256": "6d4cb9dd819f90c9491c8ed3ea8f966ba93aa58a8d978a5beab7966e5b6dd9ab"
+    },
+    {
+      "name": "dense-gguf-oracle-bf16-fp32",
+      "status": "pass",
+      "pass_marker": true,
+      "log": "dense-gguf-oracle-bf16-fp32.log",
+      "source_log_sha256": "a74cb46ab524baff53770041963a19097e8af5b28d0eb00310f9a88e946fa333"
+    },
+    {
+      "name": "dense-gguf-oracle-bf16-bf16",
+      "status": "pass",
+      "pass_marker": true,
+      "log": "dense-gguf-oracle-bf16-bf16.log",
+      "source_log_sha256": "cfd84146b29f14fd5f3edcba181545972c86f6a2f15b02fa9845885752846928"
     }
   ],
-  "serving": [],
+  "serving": [
+    {
+      "name": "current-moe-decode",
+      "complete": true,
+      "functional_only": true,
+      "cases": 1,
+      "requested_policies": [
+        "all",
+        "auto"
+      ],
+      "effective_policies": [
+        "all",
+        "auto",
+        "auto",
+        "all"
+      ],
+      "all_output_equal": false,
+      "native_overlaps": [
+        null,
+        null,
+        null,
+        null
+      ],
+      "unaccounted_wall_seconds": 0.040262103342683986
+    },
+    {
+      "name": "current-moe-mixed",
+      "complete": true,
+      "functional_only": true,
+      "cases": 1,
+      "requested_policies": [
+        "all",
+        "auto"
+      ],
+      "effective_policies": [
+        "all",
+        "auto",
+        "auto",
+        "all"
+      ],
+      "all_output_equal": false,
+      "native_overlaps": [
+        "long-prefill",
+        "long-prefill",
+        "long-prefill",
+        "long-prefill"
+      ],
+      "unaccounted_wall_seconds": 0.00030476946267299354
+    },
+    {
+      "name": "current-dense-decode",
+      "complete": true,
+      "functional_only": true,
+      "cases": 1,
+      "requested_policies": [
+        "all",
+        "auto"
+      ],
+      "effective_policies": [
+        "all",
+        "all",
+        "all",
+        "all"
+      ],
+      "all_output_equal": true,
+      "native_overlaps": [
+        null,
+        null,
+        null,
+        null
+      ],
+      "unaccounted_wall_seconds": 0.0002259229659102857
+    },
+    {
+      "name": "current-dense-mixed",
+      "complete": true,
+      "functional_only": true,
+      "cases": 1,
+      "requested_policies": [
+        "all",
+        "auto"
+      ],
+      "effective_policies": [
+        "all",
+        "all",
+        "all",
+        "all"
+      ],
+      "all_output_equal": false,
+      "native_overlaps": [
+        "long-prefill",
+        "long-prefill",
+        "long-prefill",
+        "long-prefill"
+      ],
+      "unaccounted_wall_seconds": -0.008916937775211409
+    }
+  ],
   "coverage_complete": false,
-  "note": "Current-main model/functional validation only. One-trial serving smoke is not broad speed or quality qualification. Other hardware remains unexecuted."
+  "note": "All planned local execution finished. Frozen upstream matrix has 15 passes and one retained cross-graph penalty-oracle failure; independently fixed/verified by PR526. All four functional HTTP reports complete. One-trial serving is not broad speed/quality qualification. Other hardware remains unexecuted.",
+  "execution_complete": true,
+  "upstream_oracle_counts": {
+    "pass": 15,
+    "fail": 1
+  },
+  "failed_assertion_resolution": {
+    "pull_request": "https://github.com/incoai/splash/pull/526",
+    "existing_issue": "https://github.com/incoai/splash/issues/437",
+    "test_code_patch": "c20ea1e1",
+    "evidence_commit": "d34b99fc",
+    "original_result_preserved": "fail",
+    "corrected_failing_invocation": "PASS",
+    "representative_models": 4,
+    "representative_passes": 4,
+    "strict_policy_rows": 1137,
+    "maximum_relative_error": 5.94946e-08,
+    "all_sixteen_corrected_cells_rerun": false,
+    "production_runtime_changes": false
+  }
 }

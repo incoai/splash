@@ -1,0 +1,28 @@
+{
+  "local_plan_complete": true,
+  "scope": "this M5 Pro only; prepare maintainer runs",
+  "historical_experiments_complete": 6,
+  "upstream_runtime": "1482f6bbc2abf12375332725302019594150b6cb",
+  "upstream_oracle_cells_executed": 16,
+  "upstream_oracle_passes": 15,
+  "upstream_oracle_failures": 1,
+  "retained_failure_resolution_pr": 526,
+  "corrected_oracle_code": "c20ea1e1",
+  "corrected_oracle_representative_passes": 4,
+  "corrected_oracle_all_sixteen_rerun": false,
+  "functional_http_reports_complete": 4,
+  "python_tests": 1348,
+  "python_skips": 27,
+  "shared_default_qualified": false,
+  "other_machine_jobs_prepared": 36,
+  "other_machine_jobs_executed": 0,
+  "superseded_closed_prs": [
+    507,
+    509,
+    510,
+    511,
+    522
+  ],
+  "preserved_original_branch": "1f82545359898626a84e1e1058253d6bc47f4557",
+  "preserved_original_stash": "440f39ba31e4d10ab260859370f1334f36c063f7"
+}

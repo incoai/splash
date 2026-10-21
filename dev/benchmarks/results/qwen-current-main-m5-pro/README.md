@@ -13,9 +13,17 @@ is recorded independently of CI and legacy oracle logs.
 | --- | --- |
 | Current native build, CPU and ASAN/UBSAN/TSAN suites | PASS locally; complete build and CPU/sanitizer logs are attached. |
 | Current full Python/lint/format check | PASS locally: 1,348 tests, 27 skips; compileall, Ruff lint and format pass (188 files). |
-| Four models × INT8/BF16 KV × FP32/BF16 recurrent state | Fresh shader-validated matrix is in progress. One MoE GGUF BF16-KV/FP32-state cell fails the upstream cross-graph penalty assertion; its original failing log is retained. The isolated test-oracle correction in [#526](https://github.com/incoai/splash/pull/526) passes that invocation; broader final-source checks are queued. No legacy log is substituted. |
-| MoE GGUF and dense MLX all/auto decode/mixed HTTP | Four functional reports queued; one trial each, not broad performance qualification. |
+| Four models × INT8/BF16 KV × FP32/BF16 recurrent state | All 16 executed: 15 PASS, one retained upstream penalty-oracle assertion failure. Its complete corrected invocation and four representative final-source model runs PASS in [#526](https://github.com/incoai/splash/pull/526). |
+| MoE GGUF and dense MLX all/auto decode/mixed HTTP | All four reports complete; native policy/budgets/probes/resource release pass, and both mixed reports prove native long-prefill overlap in every arm. One trial each, not broad performance qualification. |
 | Other hardware | **Unexecuted.** `maintainer-prepared.json` is preparation, not a passing test. |
+
+`execution_complete=true` records that all planned local jobs finished.
+The raw `complete=false` and `coverage_complete=false` remain intentionally
+unchanged because the frozen upstream oracle matrix includes a failure; the
+separate correction is never relabelled as a passing upstream run.
+`oracle-fix-interlude.json` records a parent-driver pause to run the isolated
+fix after an existing correctness child released the model; no serving
+measurements or resident models overlapped that interlude.
 
 The frozen build contains the unchanged native source from the revision above.
 `models.json` records all four installed manifests, source revisions and recorded
@@ -87,3 +95,25 @@ with maximum normalized fp64-reference error `5.90884e-08`. Its old cold-score
 loss remains `0.205502`. That evidence is independently source-scoped in #526;
 the frozen upstream result here remains failed. Existing issue [#437](https://github.com/incoai/splash/issues/437)
 contains the related earlier report on a different model/M5 configuration.
+
+## Completed functional results
+
+| Report | Effective ABBA policies | Hash equality | Native overlap |
+| --- | --- | --- | --- |
+| MoE decode | all / auto / auto / all | differs | not applicable |
+| MoE mixed | all / auto / auto / all | differs | long-prefill in all four arms |
+| Dense decode | all / all / all / all | equal | not applicable |
+| Dense mixed | all / all / all / all | differs | long-prefill in all four arms |
+
+Every report has four completed arms and fallback-probe sets; all requested
+output budgets finish. UTC/awake discrepancies are 0.040262, 0.000305,
+0.000226 and -0.008917 seconds respectively, below the one-second exclusion
+threshold. Hash differences remain visible, including dense mixed serving
+under the same effective policy; scheduler/batch numerical paths may differ.
+These functional checks do not establish exact mixed-serving reproducibility
+or sampling quality. There is no speed-promotion claim from these four trials.
+
+The source/evidence head `efc6c412` passes all four CI jobs
+([run 39565702343](https://github.com/incoai/splash/actions/runs/39565702343)).
+Final evidence attachments have their own PR checks. Full model pass/failure
+markers and all four complete HTTP reports are attached, not inferred from CI.

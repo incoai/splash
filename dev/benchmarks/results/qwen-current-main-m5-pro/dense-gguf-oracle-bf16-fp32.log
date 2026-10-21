@@ -1,0 +1,139 @@
+2026-10-21 13:41:16.765 model-runtime-oracle[58263:7682505] Metal GPU Validation Enabled
+13:41:20 The GPU runs the prefill FFN alone, as given.
+ane_ffn_outcome=off as given
+ane_ffn_context=262144 no_ane_context=262144 checks_context=35072
+ane_ffn_share=0 ane_ffn_minimum_rows=0
+image scenarios: skipped, the model serves text only
+TOKENS 11 2814 47675 25605 11 321 60445 55404
+accepted=7 drafted=7 target_length=136
+prefill_wall_seconds=0.637627 decode_cycle_wall_seconds=0.166339
+non_finite_rows=PASS
+thinking_budget=PASS most_end_cycles=3
+constrained_thinking_budget=PASS
+thinking_end_rows=PASS ple_heads=0
+captured_state_partition captured_conv_cos=1 captured_recurrent_cos=1 continued_conv_cos=1 continued_recurrent_cos=1 logits_cos=1 split=0/0/0/0 kv_alike=1
+states_captured_inside_commands=PASS
+captures_outlive_their_items=PASS
+prefill_group=SKIP (the target runs no prefill groups)
+prefill_passes=SKIP (the target runs its prefill commands whole)
+batched_lanes_reordered=PASS widths=2,3,4
+constrained_lane_shares_decode=PASS
+partition_equivalence conv_cos=1 parity=1/0 conv_norms=666.347/666.347 partition_other_conv_norm=683.793 recurrent_cos=1 recurrent_norms=20.5584/20.5584 kv_alike=0
+partition_decisions tokens_equal=1 baseline_rows=2 partitioned_rows=2 accepted=1/1
+budget_mask_commits=PASS retained=2,3,4,5,6,7,8
+batch_decisions b4_tokens_equal_b1=1 accepted=0/0 rows=1/1
+shared_head other_prompts_kv_alike=1 score_difference=0
+multi_cycle_decisions b4_tokens_equal_b1=1 b4_acceptance_equal_b1=1 b2_tokens_equal_b1=1 b2_acceptance_equal_b1=1 b1_rows=16 b2_rows=16 b4_rows=16 b1_cycles=2 b2_cycles=2 b4_cycles=2
+preemption_decisions kind=0 transcript_equal=1 reference_rows=24 resumed_rows=24 preserved_prefix_rows=9
+preemption_sampling mode=0 cycle=0 rows=8 accepted=7
+preemption_sampling mode=0 cycle=1 rows=8 accepted=7
+preemption_sampling mode=0 cycle=2 rows=5 accepted=4
+preemption_sampling mode=0 cycle=3 rows=3 accepted=2
+preemption_sampling mode=1 cycle=0 rows=8 accepted=7
+preemption_sampling mode=1 cycle=1 rows=8 accepted=7
+preemption_sampling mode=1 cycle=2 rows=5 accepted=4
+preemption_sampling mode=1 cycle=3 rows=3 accepted=2
+preemption_sampling mode=2 cycle=0 rows=8 accepted=7
+preemption_sampling mode=2 cycle=1 rows=8 accepted=7
+preemption_sampling mode=2 cycle=2 rows=5 accepted=4
+preemption_sampling mode=2 cycle=3 rows=3 accepted=2
+preemption_sampling mode=2 cycle=0 rows=8 accepted=7
+preemption_sampling mode=2 cycle=1 rows=8 accepted=7
+preemption_sampling mode=2 cycle=2 rows=5 accepted=4
+preemption_sampling mode=2 cycle=3 rows=3 accepted=2
+preemption_decisions kind=1 transcript_equal=1 reference_rows=24 resumed_rows=24 preserved_prefix_rows=9
+preemption_decisions kind=2 transcript_equal=1 reference_rows=24 resumed_rows=24 preserved_prefix_rows=2
+penalty_probe control_drift=0 tolerance=0.1
+penalty_probe presence=-2 frequency=-2 repetition=1 changed=0 reference_loss=0 resumed_loss=0
+penalty_probe presence=1.5 frequency=0 repetition=1 changed=0 reference_loss=0 resumed_loss=0
+penalty_probe presence=1.5 frequency=0 repetition=1.3 changed=1 reference_loss=0 resumed_loss=0
+penalty_probe presence=0 frequency=0 repetition=3 changed=1 reference_loss=0 resumed_loss=0
+preemption_sampling mode=0 cycle=0 rows=8 accepted=7
+preemption_sampling mode=0 cycle=1 rows=8 accepted=7
+preemption_sampling mode=0 cycle=2 rows=5 accepted=4
+preemption_sampling mode=0 cycle=3 rows=3 accepted=2
+preemption_sampling mode=1 cycle=0 rows=8 accepted=7
+preemption_sampling mode=1 cycle=1 rows=8 accepted=7
+preemption_sampling mode=1 cycle=2 rows=5 accepted=4
+preemption_sampling mode=1 cycle=3 rows=3 accepted=2
+preemption_sampling mode=2 cycle=0 rows=8 accepted=7
+preemption_sampling mode=2 cycle=1 rows=8 accepted=7
+preemption_sampling mode=2 cycle=2 rows=5 accepted=4
+preemption_sampling mode=2 cycle=3 rows=3 accepted=2
+preemption_sampling mode=2 cycle=0 rows=8 accepted=7
+preemption_sampling mode=2 cycle=1 rows=8 accepted=7
+preemption_sampling mode=2 cycle=2 rows=5 accepted=4
+preemption_sampling mode=2 cycle=3 rows=3 accepted=2
+preemption_sampling mode=0 cycle=0 rows=8 accepted=7
+preemption_sampling mode=0 cycle=1 rows=8 accepted=7
+preemption_sampling mode=0 cycle=2 rows=5 accepted=4
+preemption_sampling mode=0 cycle=3 rows=3 accepted=2
+preemption_sampling mode=1 cycle=0 rows=8 accepted=7
+preemption_sampling mode=1 cycle=1 rows=8 accepted=7
+preemption_sampling mode=1 cycle=2 rows=5 accepted=4
+preemption_sampling mode=1 cycle=3 rows=3 accepted=2
+preemption_sampling mode=2 cycle=0 rows=8 accepted=7
+preemption_sampling mode=2 cycle=1 rows=8 accepted=7
+preemption_sampling mode=2 cycle=2 rows=5 accepted=4
+preemption_sampling mode=2 cycle=3 rows=3 accepted=2
+preemption_sampling mode=2 cycle=0 rows=8 accepted=7
+preemption_sampling mode=2 cycle=1 rows=8 accepted=7
+preemption_sampling mode=2 cycle=2 rows=5 accepted=4
+preemption_sampling mode=2 cycle=3 rows=3 accepted=2
+top_k -1 top_p=0.95 transcript_equal=1 rows=24
+preemption_sampling mode=0 cycle=0 rows=8 accepted=7
+preemption_sampling mode=0 cycle=1 rows=8 accepted=7
+preemption_sampling mode=0 cycle=2 rows=5 accepted=4
+preemption_sampling mode=0 cycle=3 rows=3 accepted=2
+preemption_sampling mode=1 cycle=0 rows=8 accepted=7
+preemption_sampling mode=1 cycle=1 rows=8 accepted=7
+preemption_sampling mode=1 cycle=2 rows=5 accepted=4
+preemption_sampling mode=1 cycle=3 rows=3 accepted=2
+preemption_sampling mode=2 cycle=0 rows=8 accepted=7
+preemption_sampling mode=2 cycle=1 rows=8 accepted=7
+preemption_sampling mode=2 cycle=2 rows=5 accepted=4
+preemption_sampling mode=2 cycle=3 rows=3 accepted=2
+preemption_sampling mode=2 cycle=0 rows=8 accepted=7
+preemption_sampling mode=2 cycle=1 rows=8 accepted=7
+preemption_sampling mode=2 cycle=2 rows=5 accepted=4
+preemption_sampling mode=2 cycle=3 rows=3 accepted=2
+top_k -1 top_p=1 transcript_equal=1 rows=24
+preemption_sampling mode=0 cycle=0 rows=8 accepted=7
+preemption_sampling mode=0 cycle=1 rows=8 accepted=7
+preemption_sampling mode=0 cycle=2 rows=5 accepted=4
+preemption_sampling mode=0 cycle=3 rows=3 accepted=2
+preemption_sampling mode=1 cycle=0 rows=8 accepted=7
+preemption_sampling mode=1 cycle=1 rows=8 accepted=7
+preemption_sampling mode=1 cycle=2 rows=5 accepted=4
+preemption_sampling mode=1 cycle=3 rows=3 accepted=2
+preemption_sampling mode=2 cycle=0 rows=8 accepted=7
+preemption_sampling mode=2 cycle=1 rows=8 accepted=7
+preemption_sampling mode=2 cycle=2 rows=5 accepted=4
+preemption_sampling mode=2 cycle=3 rows=3 accepted=2
+preemption_sampling mode=2 cycle=0 rows=8 accepted=7
+preemption_sampling mode=2 cycle=1 rows=8 accepted=7
+preemption_sampling mode=2 cycle=2 rows=5 accepted=4
+preemption_sampling mode=2 cycle=3 rows=3 accepted=2
+preemption_sampling mode=0 cycle=0 rows=8 accepted=7
+preemption_sampling mode=0 cycle=1 rows=8 accepted=7
+preemption_sampling mode=0 cycle=2 rows=5 accepted=4
+preemption_sampling mode=0 cycle=3 rows=3 accepted=2
+min_p 0.1 transcript_equal=1 rows=24 min_p 1 greedy_rows=24
+draft_telemetry_follows_plan=PASS
+discontinuous_capture_fails=PASS
+restored_ring draft_key_0 cosine=0.999397 maximum_absolute=0.302734
+restored_ring draft_value_0 cosine=0.995357 maximum_absolute=1.84375
+restored_ring draft_key_1 cosine=0.997736 maximum_absolute=0.384766
+restored_ring draft_value_1 cosine=0.996284 maximum_absolute=1.78125
+restored_ring draft_key_2 cosine=0.998606 maximum_absolute=0.53125
+restored_ring draft_value_2 cosine=0.998161 maximum_absolute=2
+restored_ring draft_key_3 cosine=0.999028 maximum_absolute=0.46875
+restored_ring draft_value_3 cosine=0.997251 maximum_absolute=2.375
+restored_ring draft_key_4 cosine=0.997754 maximum_absolute=0.417969
+restored_ring draft_value_4 cosine=0.995528 maximum_absolute=3
+full_window_restore=PASS
+prefill_2048_wall_seconds=9.20614 b1_cycle_wall_seconds=0.180566 b2_cycle_wall_seconds=0.174897 b3_cycle_wall_seconds=0.232259 b4_cycle_wall_seconds=0.240706
+cache_restore_prefill_wall_seconds=0.1817 cache_restore_b1_cycle_wall_seconds=0.174994
+ane_ffn_reruns=0
+budgeted_cycles=SKIP (a dense target verifies every row; the verify budget does not apply)
+model_runtime_oracle_test: PASS

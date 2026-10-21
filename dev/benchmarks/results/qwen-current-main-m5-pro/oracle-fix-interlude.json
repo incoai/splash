@@ -1,0 +1,9 @@
+{
+  "driver_pid": 15492,
+  "paused_utc": 1792568617.452502,
+  "reason": "pause parent only while current dense correctness child finishes, then run isolated same-forward oracle fix; no model overlap and no serving measurements during interlude",
+  "driver_command": ".venv/bin/python -u build/deepinfer-plan/current_main_finish.py",
+  "previous_model_released_utc": 1792568746.608311,
+  "resumed_utc": 1792568975.038132,
+  "fix_complete": true
+}

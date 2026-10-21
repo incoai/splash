@@ -5,11 +5,13 @@ Current-main contribution: [#523](https://github.com/incoai/splash/pull/523).
 Separate test-only penalty-oracle correction: [#526](https://github.com/incoai/splash/pull/526), related to existing [#437](https://github.com/incoai/splash/issues/437).
 This file records what the six-step [plan](deepinfer-qwen-plan.md) produced,
 which implementation was measured, and why each conditional change was kept
-or rejected. All six frozen-source local experiments now have complete measured decisions.
-Fresh current-main model/HTTP validation remains explicit in its separate
-manifests. It uncovered a cross-graph penalty-oracle assertion; the original
-failure and a separately verified test-only correction will be reported
-independently.
+or rejected. **All authorized local plan work is complete.** Six frozen-source experiments
+have measured decisions; the current-main native/CPU/sanitizer/full Python
+checks and all four functional HTTP reports complete. The sixteen-cell
+upstream oracle matrix has fifteen passes and one retained cross-graph
+penalty assertion. Its separate test-only correction passes the failing
+invocation and four representative final-source model cells. This is not a
+claim that all sixteen corrected cells or other hardware were rerun.
 
 ## Scope and source identities
 
@@ -122,7 +124,33 @@ prefix counts, every vocabulary logit in the initial/retained rows and the
 actual greedy maximum. The initial correction passes the formerly failing
 complete invocation while the old cold-score loss `0.205502` still reproduces;
 248 policy rows have maximum normalized arithmetic error `5.90884e-08`.
-Four representative final-reference source cells are queued after the original
-matrix/HTTP runs. Production preprocessed Runtime.cpp is identical with the
+Four representative final-reference source cells pass after the original
+matrix/HTTP runs: both model families and formats, both KV/state types,
+1,137 strict policy rows and maximum normalized arithmetic error `5.94946e-08`. Production preprocessed Runtime.cpp is identical with the
 instrumentation macro unset. This test correction does not locate or repair
 the model’s cross-graph numerical drift.
+
+## Final local validation and review state
+
+| Scope | Actual result |
+| --- | --- |
+| Current native build and CPU/ASAN/UBSAN/TSAN suites | PASS |
+| Current full Python, compileall, Ruff lint/format | PASS: 1,348 tests, 27 skips, 188 formatted files |
+| Legacy full Python rerun | PASS: 1,298 tests, 27 skips; initial offline-fixture setup failure retained |
+| Focused current tool regression tests | PASS: 30 |
+| Frozen current-main real-model matrix | Executed all 16: 15 PASS; one original penalty-oracle assertion FAIL retained |
+| Corrected penalty oracle, final source `c20ea1e1` | PASS: four representative model/storage/KV/state cells, 1,137 strict policy rows |
+| Current all/auto functional HTTP | Four complete ABBA reports; every budget/probe passes and every mixed arm proves native long-prefill overlap |
+| Other-machine qualification | 36 prepared jobs, all explicitly unexecuted |
+
+The current-main bundle keeps `complete=false` for the original upstream
+oracle matrix and separately records `execution_complete=true` plus the
+resolution in #526. Dense mixed and both MoE serving reports have differing
+hashes; dense decode matches. Exact mixed-serving reproducibility, quality
+and a shared performance default are not inferred from these functional runs.
+
+Historical PRs #507/#509/#510/#511/#522 and issue #506 are closed with
+measured decisions and links to #523; source branches remain preserved.
+Review #523 for tools/source reconciliation and evidence, and #526 for the
+small test-only oracle correction. Issue #508 stays open for maintainer
+review and return of other-device results. No PR has been merged.
