@@ -162,6 +162,10 @@ class LocalServeTests(unittest.TestCase):
                 "--draft-model must be a local DFlash2 draft directory",
             ),
             (
+                ["--model-dir", "model", "--draft-model", "none"],
+                "--draft-model none cannot be used with --model-dir",
+            ),
+            (
                 ["--model-dir", "model", "--mmproj", "tower.gguf", "--language-only"],
                 "--mmproj cannot be used with --language-only",
             ),

@@ -741,6 +741,52 @@ class UpstreamTest(unittest.TestCase):
         with self.assertRaises(models.ModelError):
             assembly.verify(chosen.link)
 
+    def test_a_selection_without_a_draft_asks_for_and_links_none(self):
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root, draft_model=models.NO_DRAFT)
+        output, _ = self.prepare(chosen)
+        self.assertIn("; draft none;", output)
+        # The draft's repository is neither asked for nor downloaded.
+        self.assertEqual(fake.requests, [(MODEL, None)])
+        self.assertTrue(fake.downloads)
+        self.assertTrue(all(name.startswith(MODEL + "/") for name in fake.downloads))
+        record = assembly.verify(chosen.link)
+        self.assertEqual(
+            record["sources"],
+            {"target": {"repo": MODEL, "revision": "a" * 40}, "draft": None},
+        )
+        self.assertFalse((chosen.link / "draft").exists())
+        self.assertFalse(any(name.startswith("draft/") for name in record["files"]))
+        self.assertEqual(pins(self.cache), ["a" * 40])
+        # It is an installation of its own, beside the family draft's.
+        self.assertNotEqual(chosen.link, selection(self.root).link)
+        fake.requests.clear(), fake.downloads.clear()
+        output, _ = self.prepare(chosen)
+        self.assertIn("is already installed", output)
+        self.assertEqual((fake.requests, fake.downloads), ([(MODEL, None)], []))
+        # A family without a released draft is served without one too.
+        with mock.patch.object(
+            families, "FAMILIES", (dataclasses.replace(DENSE, draft_repo=None), MOE)
+        ):
+            shutil.rmtree(chosen.models_root)
+            fake.requests.clear()
+            self.prepare(chosen)
+            self.assertEqual(fake.requests, [(MODEL, None)])
+            with self.assertRaisesRegex(models.ModelError, "--draft-model none"):
+                self.prepare(selection(self.root))
+        # A family that serves only with a draft (Flint) is refused before
+        # anything downloads.
+        with mock.patch.object(
+            families, "FAMILIES", (dataclasses.replace(DENSE, draftless=False), MOE)
+        ):
+            shutil.rmtree(chosen.models_root)
+            fake.downloads.clear()
+            with self.assertRaisesRegex(
+                models.ModelError, "serves only with a DFlash2 draft"
+            ):
+                self.prepare(chosen)
+            self.assertEqual(fake.downloads, [])
+
     def test_mlx_vision_links_only_the_shards_holding_the_tower(self):
         shards = {
             "vision_tower.blocks.0.attn.qkv.weight": "model-00001-of-00002.safetensors",
