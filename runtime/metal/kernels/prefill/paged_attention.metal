@@ -4,12 +4,12 @@
 // (splash_paged_attention_tile) over eight query rows of one KV head.
 
 // Prefill split: KV heads vary first, then query tiles, then history splits.
-template <uint KVHeads, uint QueryHeadsPerKVHead, typename CacheElement>
+template <uint KVHeads, uint QueryHeadsPerKVHead, typename CacheElement, typename T>
 inline void splash_prefill_attention_split_phase(
-    device bfloat *queries, device float *partials,
+    device T *queries, device float *partials,
     device float *statistics, device const SplashKvPage *page_table,
     constant SplashPrefillAttentionParams &params,
-    threadgroup float *scores, threadgroup bfloat *probabilities,
+    threadgroup float *scores, threadgroup T *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale, uint3 group,
     uint thread_index) {
@@ -62,9 +62,10 @@ inline void splash_prefill_attention_reduce_phase(
       thread_index, weights, group_values);
 }
 
-#define PAGED_PREFILL_SPLIT(Name, Heads, Group, CacheElement)                  \
+// T: the queries' and probabilities' type, bfloat, or half on Apple8 (_h).
+#define PAGED_PREFILL_SPLIT(Name, Heads, Group, CacheElement, T)               \
   kernel void Name(                                                            \
-      device bfloat *queries [[buffer(0)]],                                    \
+      device T *queries [[buffer(0)]],                                         \
       device float *partials [[buffer(1)]],                                    \
       device float *statistics [[buffer(2)]],                                  \
       device const SplashKvPage *page_table [[buffer(3)]],                     \
@@ -74,7 +75,7 @@ inline void splash_prefill_attention_reduce_phase(
     constexpr uint M = Group * SPLASH_PREFILL_ATTENTION_TILE_ROWS;             \
     constexpr uint N = SplashKvPageTokens;                                     \
     alignas(16) threadgroup float scores[M * N];                               \
-    alignas(16) threadgroup bfloat probabilities[M * N];                       \
+    alignas(16) threadgroup T probabilities[M * N];                            \
     threadgroup float row_max[M];                                              \
     threadgroup float row_sum[M];                                              \
     threadgroup float previous_scale[M];                                       \
@@ -85,11 +86,13 @@ inline void splash_prefill_attention_reduce_phase(
         thread_index);                                                         \
   }
 
-PAGED_PREFILL_SPLIT(prefill_attention_q8_split, 4, 6, int8_t)
-PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv2_g8, 2, 8, int8_t)
+PAGED_PREFILL_SPLIT(prefill_attention_q8_split, 4, 6, int8_t, bfloat)
+PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv2_g8, 2, 8, int8_t, bfloat)
+PAGED_PREFILL_SPLIT(prefill_attention_q8_split_h, 4, 6, int8_t, half)
+PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv2_g8_h, 2, 8, int8_t, half)
 // BF16 shares the page loop and reduction, without quantization scales.
-PAGED_PREFILL_SPLIT(prefill_attention_bf16_split, 4, 6, bfloat)
-PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8, 2, 8, bfloat)
+PAGED_PREFILL_SPLIT(prefill_attention_bf16_split, 4, 6, bfloat, bfloat)
+PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8, 2, 8, bfloat, bfloat)
 #undef PAGED_PREFILL_SPLIT
 
 #define PAGED_PREFILL_REDUCE(Name, Heads, Group)                               \

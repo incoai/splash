@@ -8,8 +8,9 @@
 // history split and group.z the lane, whose parameters select the page table
 // and the query tile. A threadgroup past its lane's split count, or whose
 // lane fails the contract, is inactive and does nothing.
+template <typename T>
 struct SplashVerifyTile {
-  device bfloat *queries;
+  device T *queries;
   device const SplashKvPage *page_table;
   ulong slot;
   uint kv_head;
@@ -19,14 +20,14 @@ struct SplashVerifyTile {
   bool active;
 };
 
-template <uint KVHeads, uint QueryHeadsPerKVHead>
-inline SplashVerifyTile splash_verify_attention_tile_at(
-    device bfloat *queries, device const SplashKvPage *page_table0,
+template <uint KVHeads, uint QueryHeadsPerKVHead, typename T>
+inline SplashVerifyTile<T> splash_verify_attention_tile_at(
+    device T *queries, device const SplashKvPage *page_table0,
     device const SplashKvPage *page_table1, device const SplashKvPage *page_table2,
     device const SplashKvPage *page_table3,
     constant SplashVerifyAttentionParams *params, uint3 group) {
   constexpr uint D = SplashKvHeadDimension;
-  SplashVerifyTile tile{};
+  SplashVerifyTile<T> tile{};
   uint kv_head = group.x;
   uint split = group.y;
   uint batch = group.z;
@@ -52,9 +53,9 @@ inline SplashVerifyTile splash_verify_attention_tile_at(
 // partition, with scratch for scores, probabilities and row statistics.
 // INT8 and BF16 entries share one signature: pages are reached through the
 // tables, so no entry binds KV storage.
-#define PAGED_VERIFY_SPLIT_SIGNATURE(Name)                                     \
+#define PAGED_VERIFY_SPLIT_SIGNATURE(Name, T)                                  \
   kernel void Name(                                                            \
-      device bfloat *queries [[buffer(0)]],                                    \
+      device T *queries [[buffer(0)]],                                         \
       device float *partials [[buffer(1)]],                                    \
       device float *statistics [[buffer(2)]],                                  \
       device const SplashKvPage *page_table0 [[buffer(3)]],                    \
@@ -65,27 +66,28 @@ inline SplashVerifyTile splash_verify_attention_tile_at(
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]])
 
-#define PAGED_VERIFY_SCRATCH(Group)                                            \
+#define PAGED_VERIFY_SCRATCH(Group, T)                                         \
   constexpr uint M = Group * SPLASH_TARGET_VERIFY_ROWS;                        \
   constexpr uint N = SplashKvPageTokens;                                       \
   alignas(16) threadgroup float scores[M * N];                                 \
-  alignas(16) threadgroup bfloat probabilities[M * N];                         \
+  alignas(16) threadgroup T probabilities[M * N];                              \
   threadgroup float row_max[M];                                                \
   threadgroup float row_sum[M];                                                \
   threadgroup float previous_scale[M];                                         \
   threadgroup atomic_uint rescale;
 
 #define PAGED_VERIFY_TILE_AT(Heads, Group)                                     \
-  const SplashVerifyTile tile =                                                \
+  const auto tile =                                                            \
       splash_verify_attention_tile_at<Heads, Group>(                           \
           queries, page_table0, page_table1, page_table2, page_table3, params, \
           group);                                                              \
   if (!tile.active)                                                            \
     return;
 
-#define PAGED_VERIFY_SPLIT(Name, Heads, Group, CacheElement)                   \
-  PAGED_VERIFY_SPLIT_SIGNATURE(Name) {                                         \
-    PAGED_VERIFY_SCRATCH(Group)                                                \
+// T: the queries' and probabilities' type, bfloat, or half on Apple8 (_h).
+#define PAGED_VERIFY_SPLIT(Name, Heads, Group, CacheElement, T)                \
+  PAGED_VERIFY_SPLIT_SIGNATURE(Name, T) {                                      \
+    PAGED_VERIFY_SCRATCH(Group, T)                                             \
     PAGED_VERIFY_TILE_AT(Heads, Group)                                         \
     splash_paged_attention_tile<Heads, Group, SPLASH_TARGET_VERIFY_ROWS,       \
                                 CacheElement>(                                 \
@@ -95,11 +97,13 @@ inline SplashVerifyTile splash_verify_attention_tile_at(
         row_max, row_sum, previous_scale, &rescale, thread_index);             \
   }
 
-PAGED_VERIFY_SPLIT(verify_attention_q8_split, 4, 6, int8_t)
-PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8, 2, 8, int8_t)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split, 4, 6, int8_t, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8, 2, 8, int8_t, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_h, 4, 6, int8_t, half)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8_h, 2, 8, int8_t, half)
 // BF16 shares the page loop and reduction, without quantization scales.
-PAGED_VERIFY_SPLIT(verify_attention_bf16_split, 4, 6, bfloat)
-PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8, 2, 8, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split, 4, 6, bfloat, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8, 2, 8, bfloat, bfloat)
 #undef PAGED_VERIFY_SPLIT
 #undef PAGED_VERIFY_TILE_AT
 #undef PAGED_VERIFY_SCRATCH

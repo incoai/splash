@@ -334,6 +334,19 @@ std::vector<BFloat16Bits> cpuReference(const Case &data, bool quantized) {
   return output;
 }
 
+// Apple8 runs the split instances that read half queries and probabilities
+// (_h, PagedAttention::prefillPlan/verifyPlan): the cases' bf16 queries go in
+// as half, each value exact in half's range, against the same references.
+bool gHalfQueries = false;
+
+void toHalfQueries(void *bytes, uint64_t length) {
+  auto *values = static_cast<BFloat16Bits *>(bytes);
+  for (uint64_t i = 0; i < length / sizeof(BFloat16Bits); ++i) {
+    const _Float16 value = static_cast<_Float16>(bfloat16ToFloat(values[i]));
+    std::memcpy(values + i, &value, sizeof(value));
+  }
+}
+
 // The verify and prefill split of one geometry, each with its reduction.
 struct Pipelines {
   std::string splitName;
@@ -347,11 +360,13 @@ struct Pipelines {
 Pipelines makePipelines(id<MTLDevice> device, id<MTLLibrary> library,
                         Shape shape) {
   Pipelines result;
-  result.splitName = std::string("verify_attention_q8_split") + shape.suffix;
+  gHalfQueries = ![device supportsFamily:MTLGPUFamilyApple9];
+  const std::string half = gHalfQueries ? "_h" : "";
+  result.splitName = std::string("verify_attention_q8_split") + shape.suffix + half;
   result.split = makePipeline(device, library, result.splitName);
   result.reduce = makePipeline(
       device, library, std::string("verify_attention_reduce") + shape.suffix);
-  result.prefillSplitName = std::string("prefill_attention_q8_split") + shape.suffix;
+  result.prefillSplitName = std::string("prefill_attention_q8_split") + shape.suffix + half;
   result.prefillSplit = makePipeline(device, library, result.prefillSplitName);
   result.prefillReduce = makePipeline(
       device, library, std::string("prefill_attention_reduce") + shape.suffix);
@@ -398,6 +413,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
     std::memcpy(static_cast<uint8_t *>(queries.contents) + lane * laneBytes,
                 data.queries.contents, laneBytes);
   }
+  if (gHalfQueries) toHalfQueries(queries.contents, queries.length);
   std::array<VerifyAttentionParams, 4> params{};
   params.fill({data.params.committed_tokens, data.params.page_table_entries,
                data.params.kv, splits, splits});
@@ -443,10 +459,16 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
       device, slots * shape.fusedRows() * kHeadDimension * sizeof(float));
   id<MTLBuffer> statistics =
       makeBuffer(device, slots * shape.fusedRows() * 2 * sizeof(float));
+  id<MTLBuffer> queries = data.queries;
+  if (gHalfQueries) {
+    queries = makeBuffer(device, data.queries.length);
+    std::memcpy(queries.contents, data.queries.contents, data.queries.length);
+    toHalfQueries(queries.contents, queries.length);
+  }
   id<MTLCommandBuffer> command = [queue commandBuffer];
   id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
   [encoder setComputePipelineState:split];
-  [encoder setBuffer:data.queries offset:0 atIndex:0];
+  [encoder setBuffer:queries offset:0 atIndex:0];
   [encoder setBuffer:partials offset:0 atIndex:1];
   [encoder setBuffer:statistics offset:0 atIndex:2];
   [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:3];

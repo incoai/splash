@@ -112,6 +112,15 @@ void requirePageTable(const metal::MetalBuffer &table, const kv::ChunkedPrefillP
   requireBytes(table, uint64_t{kv::chunkedPrefillRequiredPages(chunk)} * sizeof(SplashKvPage), "page table");
 }
 
+// Apple8's split kernels read the queries as half: the bytes the tiles read,
+// converted in place, each thread its own four values (the kernel of
+// kernels/shared/gguf_linear.metal, which saturates finite values past half's
+// range and passes NaN and infinities). Nothing reads the bf16 queries after.
+void addHalfQueries(metal::CommandGraph &graph, const metal::MetalBuffer &queries, uint64_t bytes) {
+  const uint32_t count = static_cast<uint32_t>(bytes / 8);
+  graph.add("gguf_prefill_input_half", {queries, queries}, count, {(count + 255) / 256, 1, 1}, {256, 1, 1});
+}
+
 // Each query tile's history splits: the maximum shared out over the chunk's
 // tiles, at least one.
 uint32_t prefillSplits(uint32_t tiles) {
@@ -122,7 +131,7 @@ uint32_t prefillSplits(uint32_t tiles) {
 } // namespace
 
 PrefillAttentionPlan PagedAttention::prefillPlan(
-    uint32_t rows, uint32_t queryHeads, kv::Layout layout) {
+    uint32_t rows, uint32_t queryHeads, kv::Layout layout, bool halfQueries) {
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
   if (!rows || rows > kv::kChunkedPrefillMaximumRows)
     throw std::invalid_argument("invalid attention workspace rows");
@@ -130,22 +139,26 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
   const uint32_t splits = prefillSplits(tiles);
   const uint32_t fusedRows =
       kv::kPrefillAttentionTileRows * (queryHeads / layout.kvHeads);
+  const bool half = halfQueries && layout.format != kv::Format::BFloat16;
   return {rows, splits,
           attentionWorkspace(uint64_t{tiles} * splits * layout.kvHeads * fusedRows,
                              layout.headDimension),
           layout.format == kv::Format::BFloat16
               ? pipeline(kernel, "prefill_attention_bf16_split",
                          "prefill_attention_bf16_split_kv2_g8")
-              : pipeline(kernel, "prefill_attention_q8_split",
-                         "prefill_attention_q8_split_kv2_g8"),
+          : half ? pipeline(kernel, "prefill_attention_q8_split_h",
+                            "prefill_attention_q8_split_kv2_g8_h")
+                 : pipeline(kernel, "prefill_attention_q8_split",
+                            "prefill_attention_q8_split_kv2_g8"),
           pipeline(kernel, "prefill_attention_reduce",
                    "prefill_attention_reduce_kv2_g8"),
-          {layout.kvHeads, tiles, splits}, {layout.kvHeads, fusedRows, tiles}, layout, queryHeads};
+          {layout.kvHeads, tiles, splits}, {layout.kvHeads, fusedRows, tiles}, layout, queryHeads,
+          half};
 }
 
 VerifyAttentionPlan PagedAttention::verifyPlan(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-    std::span<const uint32_t> historyTokens) {
+    std::span<const uint32_t> historyTokens, bool halfQueries) {
   const KernelLayout kernel = attentionKernelLayout(queryHeads, layout);
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid attention workspace batch width");
@@ -161,13 +174,16 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
     laneSplits[lane] = kv::verifyAttentionSplits(historyTokens[lane]);
     splits = std::max(splits, laneSplits[lane]);
   }
+  const bool half = halfQueries && layout.format != kv::Format::BFloat16;
   return {lanes, laneSplits, splits,
           verifyWorkspaceBound(lanes, queryHeads, layout),
           layout.format == kv::Format::BFloat16
               ? pipeline(kernel, "verify_attention_bf16_split",
                          "verify_attention_bf16_split_kv2_g8")
-              : pipeline(kernel, "verify_attention_q8_split",
-                         "verify_attention_q8_split_kv2_g8"),
+          : half ? pipeline(kernel, "verify_attention_q8_split_h",
+                            "verify_attention_q8_split_kv2_g8_h")
+                 : pipeline(kernel, "verify_attention_q8_split",
+                            "verify_attention_q8_split_kv2_g8"),
           pipeline(kernel, "verify_attention_reduce",
                    "verify_attention_reduce_kv2_g8"),
           {layout.kvHeads, splits, lanes},
@@ -179,7 +195,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
               : pipeline(kernel, "verify_attention_q8_store",
                          "verify_attention_q8_store_kv2_g8"),
           {uint64_t{lanes} * 2 * kv::kVerifyRows * layout.kvHeads, 1, 1},
-          {layout.headDimension, 1, 1}, layout, queryHeads};
+          {layout.headDimension, 1, 1}, layout, queryHeads, half};
 }
 
 AttentionWorkspace PagedAttention::prefillWorkspace(
@@ -371,6 +387,7 @@ void PagedAttention::addPrefill(
   const kv::PrefillAttentionParams params{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
       chunk.page_table_entries, layer, plan.splits};
+  if (plan.halfQueries) addHalfQueries(graph, queries, rows);
   graph.add(std::string(plan.splitPipeline),
             {std::move(queries), partials, statistics, std::move(pageTable)},
             params, plan.splitGroups);
@@ -411,6 +428,7 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
                        plan.laneSplits[lane], plan.splits};
   }
   const auto &tables = buffers.pageTables;
+  if (plan.halfQueries) addHalfQueries(graph, buffers.queries, rows);
   graph.add(std::string(plan.storePipeline_),
             {buffers.chunkKeys, buffers.chunkValues, tables[0], tables[1], tables[2],
              tables[3]},

@@ -80,9 +80,9 @@ inline uint splash_attention_pages_per_split(uint pages, uint splits) {
 // flag. Existing threadgroup barriers separate reset, concurrent set, and
 // read; relaxed atomics make the same-value writes safe without changing
 // arithmetic.
-template <uint QueryHeadsPerKVHead, uint RowsPerTile, bool Quantized>
+template <uint QueryHeadsPerKVHead, uint RowsPerTile, bool Quantized, typename P>
 inline void splash_attention_page_softmax(
-    threadgroup const float *scores, threadgroup bfloat *probabilities,
+    threadgroup const float *scores, threadgroup P *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
     device const float4 *key_scales, device const float4 *value_scales,
@@ -164,10 +164,12 @@ inline void splash_attention_page_softmax(
                     token + 5 < limit ? probability[5] * high_scales.y : 0.0f,
                     token + 6 < limit ? probability[6] * high_scales.z : 0.0f,
                     token + 7 < limit ? probability[7] * high_scales.w : 0.0f);
-  threadgroup bfloat4 *probabilities4 = reinterpret_cast<threadgroup bfloat4 *>(
+  // Half probabilities (Apple8, P = half) hold the bf16 values, exactly from
+  // 2^-17 up, so PV's products are bf16's.
+  threadgroup vec<P, 4> *probabilities4 = reinterpret_cast<threadgroup vec<P, 4> *>(
       probabilities + fused_row * N + column);
-  probabilities4[0] = bfloat4(low);
-  probabilities4[1] = bfloat4(high);
+  probabilities4[0] = vec<P, 4>(bfloat4(low));
+  probabilities4[1] = vec<P, 4>(bfloat4(high));
 }
 
 // One tile over its split's pages, whose K/V (INT8 with their scales, or
@@ -178,14 +180,15 @@ inline void splash_attention_page_softmax(
 // form one contiguous M x D tensor. Each page is reached through its table
 // entry (kv_extent.h).
 // Three barriers per page order the score store, the softmax and the
-// probability reads of PV.
+// probability reads of PV. Q and P are bfloat, or half on Apple8, whose
+// matmul2d runs half operands about twice as fast as bfloat ones.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile,
-          typename CacheElement>
+          typename CacheElement, typename Q, typename P>
 inline void splash_paged_attention_tile(
-    device bfloat *tile_queries, device const SplashKvPage *page_table,
+    device Q *tile_queries, device const SplashKvPage *page_table,
     SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
     uint split, device float *partials, device float *statistics, ulong slot,
-    threadgroup float *scores, threadgroup bfloat *probabilities,
+    threadgroup float *scores, threadgroup P *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
     uint thread_index) {
@@ -209,13 +212,13 @@ inline void splash_paged_attention_tile(
   auto qt = tensor(tile_queries, dextents<int, 2>{D, M}, array<int, 2>{1, D});
   auto st = tensor(scores, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto pt = tensor(probabilities, dextents<int, 2>{N, M}, array<int, 2>{1, N});
-  auto p0 = pt.slice<N, M>(0, 0);
+  auto p0 = pt.template slice<N, M>(0, 0);
   auto key_type = tensor(static_cast<device CacheElement *>(nullptr),
                          dextents<int, 2>{D, N}, array<int, 2>{1, D});
   auto value_type = tensor(static_cast<device CacheElement *>(nullptr),
                            dextents<int, 2>{N, D}, array<int, 2>{1, N});
   const SplashKvAddressing<KVHeads, CacheElement> addressing(kv, kv_head);
-  auto q0 = qt.slice<D, M>(0, 0);
+  auto q0 = qt.template slice<D, M>(0, 0);
   auto k0 = key_type.template slice<D, N>(0, 0);
   auto v0 = value_type.template slice<N, D>(0, 0);
   // QK writes a complete page score tile, the softmax applies an INT8 page's

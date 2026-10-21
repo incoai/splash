@@ -112,17 +112,19 @@ struct PrefillAttentionPlan final {
   const std::string_view reducePipeline;
   const metal::DispatchSize splitGroups;
   const metal::DispatchSize reduceGroups;
+  // The split kernel reads half queries, converted in place before it (Apple8).
+  const bool halfQueries;
 
 private:
   friend class PagedAttention;
   PrefillAttentionPlan(uint32_t rows, uint32_t splits, AttentionWorkspace workspace,
                        std::string_view splitPipeline, std::string_view reducePipeline,
                        metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
-                       kv::Layout layout, uint32_t queryHeads)
+                       kv::Layout layout, uint32_t queryHeads, bool halfQueries)
       : layout(layout), queryHeads(queryHeads), rows(rows),
         splits(splits), workspace(workspace),
         splitPipeline(splitPipeline), reducePipeline(reducePipeline),
-        splitGroups(splitGroups), reduceGroups(reduceGroups) {}
+        splitGroups(splitGroups), reduceGroups(reduceGroups), halfQueries(halfQueries) {}
 };
 
 struct VerifyAttentionPlan final {
@@ -139,6 +141,8 @@ struct VerifyAttentionPlan final {
   const std::string_view reducePipeline;
   const metal::DispatchSize splitGroups;
   const metal::DispatchSize reduceGroups;
+  // The split kernel reads half queries, converted in place before it (Apple8).
+  const bool halfQueries;
 
 private:
   friend class PagedAttention;
@@ -151,11 +155,12 @@ private:
                       std::string_view splitPipeline, std::string_view reducePipeline,
                       metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
                       std::string_view storePipeline, metal::DispatchSize storeGroups,
-                      metal::DispatchSize storeThreads, kv::Layout layout, uint32_t queryHeads)
+                      metal::DispatchSize storeThreads, kv::Layout layout, uint32_t queryHeads,
+                      bool halfQueries)
       : layout(layout), queryHeads(queryHeads), lanes(lanes), laneSplits(laneSplits),
         splits(splits), workspace(workspace),
         splitPipeline(splitPipeline), reducePipeline(reducePipeline),
-        splitGroups(splitGroups), reduceGroups(reduceGroups),
+        splitGroups(splitGroups), reduceGroups(reduceGroups), halfQueries(halfQueries),
         storePipeline_(storePipeline), storeGroups_(storeGroups), storeThreads_(storeThreads) {}
 };
 
@@ -176,13 +181,15 @@ class PagedAttention final {
 public:
   // The kernels read a sequence's history from its chunk parameters, so a
   // plan depends on the rows only.
+  // halfQueries: Apple8's INT8 split kernels take half queries and
+  // probabilities (ExecutionPlans).
   [[nodiscard]] static PrefillAttentionPlan
-  prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout);
+  prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout, bool halfQueries = false);
   // historyTokens holds each lane's committed tokens before its verify rows,
   // one entry per lane.
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-             std::span<const uint32_t> historyTokens);
+             std::span<const uint32_t> historyTokens, bool halfQueries = false);
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences
