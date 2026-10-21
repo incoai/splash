@@ -1,0 +1,23 @@
+{
+  "implementation_commit": "46a074ee",
+  "base_commit": "bc09da81",
+  "binaries_sha256": {
+    "splash": "80d0c47b31709a62029dcf423c3d34edeb0aae426c34bf2d64f2d833ccf0acf3",
+    "splash.metallib": "b4e8ba1750e50ef037f505f08f68513e954eb4f76a8b14d207418a910910199d",
+    "engine-tests/decode-profile": "ae2604bfd39c8ae29f1e445d24cfcd6bfd208cb89e64231906f2b525421af12a",
+    "engine-tests/model-runtime-oracle": "480b9b5fc8b73bdb8c79f3a110160e997b45a7171688104035a4fbd60d68fea1",
+    "engine-tests/gdn-decode": "8015c7fd01d32fe3597ba0e87812da96293983f0e45edf0613def2109d12f39e"
+  },
+  "models": {
+    "gguf": {
+      "manifest_sha256": "fbd33ebb12696638784e67f8d0b6c7f9add5de557c39732d95de90a8194967d5",
+      "target_revision": "a483e9e6cbd595906af30beda3187c2663a1118c"
+    },
+    "mlx": {
+      "manifest_sha256": "3a1b291dc8b9e540488f002c99df9b34e29ad3b707b5f2501106609068cb7251",
+      "target_revision": "38740b847e4cb78f352aba30aa41c76e08e6eb46"
+    }
+  },
+  "draft_revision": "51ef7b6923ad6c14cb1bb41c37a9041446496ab6",
+  "native_cycles": 4096
+}

@@ -1,0 +1,31 @@
+2026-10-20 23:06:12.549 metal-backend[98327:5816348] Metal GPU Validation Enabled
+PASS GPU completion independent of memory telemetry
+PASS terminal command completes without its callback
+PASS late completion preserves the next watchdog
+PASS delayed GPU failure preserves its error
+PASS pending GPU command watchdog and resource lifetime
+PASS synchronous wait obeys the command watchdog
+PASS abandoned ticket returns after the command watchdog
+PASS stopped backend refuses submission
+PASS shutdown interrupts a command wait
+PASS shutdown leaves ticket teardown to the command
+PASS shutdown spares a command that completes
+PASS dispatch profiling covers every command
+PASS command tracing preserves execution
+PASS graph owns fixed bindings through growth and move
+PASS prepared pipelines compile ahead
+PASS buffers stay resident keep_alive_seconds=1 lapsed_after_seconds=1.03835
+PASS infinite keep-alive holds residency
+PASS released memory
+PASS wrapped memory
+PASS shared event notifies
+PASS event steps
+PASS 100 event pairs run in order
+PASS malformed event steps are refused
+PASS a failed command buffer still delivers its signal
+PASS allocation does not request residency allocations=20 requests=0
+PASS residency races the heartbeat rounds=24 lapses=8
+PASS residency ends without blits
+PASS residency returns removed buffers
+PASS buffers reached through tables rounds=60 regrown=12 lapsed_round=1
+PASS MetalBackend device="Apple M5 Pro" apple_gpu_family=10 gpu_core_count=20 macos=26.6.0 recommended_working_set=40200896512 last_wall_seconds=0.000738125

@@ -1,0 +1,133 @@
+diff --git a/dev/tests/engine/metal_backend_test.metal b/dev/tests/engine/metal_backend_test.metal
+index 51f10536..fa917867 100644
+--- a/dev/tests/engine/metal_backend_test.metal
++++ b/dev/tests/engine/metal_backend_test.metal
+@@ -43,3 +43,9 @@ kernel void addressed_check_u32(device const ulong *table [[buffer(0)]],
+         atomic_fetch_add_explicit(mismatches, 1u, memory_order_relaxed);
+     }
+ }
++
++// Checks graph-owned bindings and per-dispatch parameters after host growth.
++kernel void test_graph_params(device uint *values [[buffer(0)]],
++                              constant uint2 &params [[buffer(1)]]) {
++    values[params.x] = params.y;
++}
+diff --git a/dev/tests/engine/metal_backend_test.mm b/dev/tests/engine/metal_backend_test.mm
+index 60d94a32..e0352e1d 100644
+--- a/dev/tests/engine/metal_backend_test.mm
++++ b/dev/tests/engine/metal_backend_test.mm
+@@ -1,5 +1,6 @@
+ #include "../../../runtime/metal/BackendInstrumentation.hpp"
+ #include "../../../runtime/metal/MetalBackend.hpp"
++#include "metal/CommandGraph.hpp"
+ #include "TestBuffers.hpp"
+ #include "TestChecks.hpp"
+ 
+@@ -1786,6 +1787,25 @@ void run(const std::string &metallibPath) {
+ 
+ }  // namespace
+ 
++// The graph must own each fixed-list handle and parameter payload after the
++// caller's list/stack expires, vector growth, and moving the graph.
++void graphOwnsFixedBindings(const std::string &metallibPath) {
++    MetalBackend backend(metallibPath);
++    auto buffer = sharedBuffer(backend, 512 * sizeof(uint32_t));
++    std::memset(buffer.contents(), 0, buffer.sizeBytes());
++    splash::metal::CommandGraph graph;
++    for (uint32_t i = 0; i < 512; ++i) {
++        struct Params { uint32_t index, value; } params{i, i + 1};
++        graph.add("test_graph_params", {buffer}, params, {1, 1, 1}, {1, 1, 1});
++    }
++    auto moved = std::move(graph);
++    (void)backend.submitCommandAsync(moved.command()).wait();
++    for (uint32_t i = 0; i < 512; ++i)
++        require(static_cast<uint32_t *>(buffer.contents())[i] == i + 1,
++                "graph lost fixed-list bindings or parameters across growth/move");
++    std::cout << "PASS graph owns fixed bindings through growth and move\n";
++}
++
+ int main(int argc, const char *argv[]) {
+     @autoreleasepool {
+         if (argc != 2) {
+@@ -1806,6 +1826,7 @@ int main(int argc, const char *argv[]) {
+             shutdownSparesACommandThatCompletes(argv[1]);
+             dispatchProfilingCoversEveryCommand(argv[1]);
+             commandTracingPreservesExecution(argv[1]);
++            graphOwnsFixedBindings(argv[1]);
+             preparedPipelinesCompileAhead(argv[1]);
+             buffersStayResident(argv[1]);
+             infiniteKeepAliveHoldsResidency(argv[1]);
+diff --git a/runtime/metal/CommandGraph.hpp b/runtime/metal/CommandGraph.hpp
+index 446312a1..022924bc 100644
+--- a/runtime/metal/CommandGraph.hpp
++++ b/runtime/metal/CommandGraph.hpp
+@@ -6,6 +6,7 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <deque>
++#include <initializer_list>
+ #include <span>
+ #include <string>
+ #include <type_traits>
+@@ -35,18 +36,33 @@ public:
+     push(std::move(pipeline), std::move(buffers), groups, threads);
+   }
+ 
++  // Most operators bind a fixed list. Copy its buffer handles directly
++  // into the owned dispatch, without first allocating a temporary vector.
++  void add(std::string pipeline, std::initializer_list<MetalBuffer> buffers,
++           DispatchSize groups, DispatchSize threads = {kDefaultThreads, 1, 1}) {
++    push(std::move(pipeline), std::span(buffers), groups, threads);
++  }
++
++  template <class Params>
++  void add(std::string pipeline, std::initializer_list<MetalBuffer> buffers,
++           const Params &params, DispatchSize groups,
++           DispatchSize threads = {kDefaultThreads, 1, 1}) {
++    bindParams(push(std::move(pipeline), std::span(buffers), groups, threads), params);
++  }
++
++  template <class Params>
++  void add(std::string pipeline, std::initializer_list<MetalBuffer> buffers,
++           const Params &params, DispatchSize groups, IndirectGrid grid,
++           DispatchSize threads) {
++    add(std::move(pipeline), buffers, params, groups, threads);
++    dispatches_.back().indirectThreadgroups = std::move(grid);
++  }
++
+   template <class Params>
+   void add(std::string pipeline, std::vector<MetalBuffer> buffers,
+            const Params &params, DispatchSize groups,
+            DispatchSize threads = {kDefaultThreads, 1, 1}) {
+-    static_assert(std::is_trivially_copyable_v<Params>,
+-                  "dispatch parameters must be plain data");
+-    payloads_.emplace_back(sizeof(Params));
+-    std::memcpy(payloads_.back().data(), &params, sizeof(Params));
+-    ComputeDispatch &dispatch =
+-        push(std::move(pipeline), std::move(buffers), groups, threads);
+-    dispatch.bytes.push_back({static_cast<uint32_t>(dispatch.buffers.size()),
+-                              payloads_.back().data(), sizeof(Params)});
++    bindParams(push(std::move(pipeline), std::move(buffers), groups, threads), params);
+   }
+ 
+   // A dispatch of the grid in `grid`, which an earlier dispatch writes
+@@ -79,7 +95,18 @@ public:
+   }
+ 
+ private:
+-  ComputeDispatch &push(std::string pipeline, std::vector<MetalBuffer> buffers,
++  template <class Params>
++  void bindParams(ComputeDispatch &dispatch, const Params &params) {
++    static_assert(std::is_trivially_copyable_v<Params>,
++                  "dispatch parameters must be plain data");
++    payloads_.emplace_back(sizeof(Params));
++    std::memcpy(payloads_.back().data(), &params, sizeof(Params));
++    dispatch.bytes.push_back({static_cast<uint32_t>(dispatch.buffers.size()),
++                              payloads_.back().data(), sizeof(Params)});
++  }
++
++  template <class Buffers>
++  ComputeDispatch &push(std::string pipeline, Buffers &&buffers,
+                         DispatchSize groups, DispatchSize threads) {
+     ComputeDispatch dispatch;
+     dispatch.pipelineName = std::move(pipeline);

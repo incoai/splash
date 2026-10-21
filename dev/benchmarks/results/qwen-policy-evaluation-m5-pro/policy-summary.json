@@ -1,0 +1,215 @@
+{
+  "local_evaluation_complete": false,
+  "upstream_revision": "67bb94069179470125d393da5e5725e3f1501f9d",
+  "control_patch_sha256": "efe5ee2ce8a7820d5850b537ba85212aa3eabbd09df909feaf9dd5ac0ca972e5",
+  "selections": [
+    {
+      "model": "gguf",
+      "selected_fixed_rows": 8,
+      "training": [
+        {
+          "rows": 8,
+          "relative_cost": 1.0,
+          "source": "full-width reference"
+        },
+        {
+          "rows": 1,
+          "relative_cost": 2.7142591316780362,
+          "source": "$SPLASH/build/deepinfer-plan/quiet/adaptive-train-fixed-1/report.json"
+        },
+        {
+          "rows": 2,
+          "relative_cost": 1.582012015382551,
+          "source": "$SPLASH/build/deepinfer-plan/quiet/adaptive-train-fixed-2/report.json"
+        },
+        {
+          "rows": 4,
+          "relative_cost": 1.1306191098233116,
+          "source": "$SPLASH/build/deepinfer-plan/quiet/adaptive-train-fixed-4/report.json"
+        },
+        {
+          "rows": 6,
+          "relative_cost": 1.0015891365079046,
+          "source": "$SPLASH/build/deepinfer-plan/quiet/adaptive-train-fixed-6/report.json"
+        }
+      ]
+    },
+    {
+      "model": "mlx",
+      "selected_fixed_rows": 6,
+      "training": [
+        {
+          "rows": 8,
+          "relative_cost": 1.0,
+          "source": "full-width reference"
+        },
+        {
+          "rows": 1,
+          "relative_cost": 1.9132284890989644,
+          "source": "$SPLASH/build/deepinfer-plan/final/adaptive-train-mlx-fixed-1/report.json"
+        },
+        {
+          "rows": 2,
+          "relative_cost": 1.2810195053707338,
+          "source": "$SPLASH/build/deepinfer-plan/final/adaptive-train-mlx-fixed-2/report.json"
+        },
+        {
+          "rows": 3,
+          "relative_cost": 1.0576688726861998,
+          "source": "$SPLASH/build/deepinfer-plan/final/adaptive-train-mlx-fixed-3/report.json"
+        },
+        {
+          "rows": 4,
+          "relative_cost": 0.9664737212874792,
+          "source": "$SPLASH/build/deepinfer-plan/final/adaptive-train-mlx-fixed-4/report.json"
+        },
+        {
+          "rows": 5,
+          "relative_cost": 0.9765610328052399,
+          "source": "$SPLASH/build/deepinfer-plan/final/adaptive-train-mlx-fixed-5/report.json"
+        },
+        {
+          "rows": 6,
+          "relative_cost": 0.8935578146781875,
+          "source": "$SPLASH/build/deepinfer-plan/final/adaptive-train-mlx-fixed-6/report.json"
+        },
+        {
+          "rows": 7,
+          "relative_cost": 0.9372032186888204,
+          "source": "$SPLASH/build/deepinfer-plan/final/adaptive-train-mlx-fixed-7/report.json"
+        }
+      ]
+    }
+  ],
+  "training": [
+    {
+      "model": "gguf",
+      "rows": 1,
+      "eligible_for_selection": true,
+      "artifact": "adaptive-gguf-fixed-1-train.json"
+    },
+    {
+      "model": "gguf",
+      "rows": 2,
+      "eligible_for_selection": true,
+      "artifact": "adaptive-gguf-fixed-2-train.json"
+    },
+    {
+      "model": "gguf",
+      "rows": 3,
+      "eligible_for_selection": false,
+      "artifact": "adaptive-gguf-fixed-3-train.json"
+    },
+    {
+      "model": "gguf",
+      "rows": 4,
+      "eligible_for_selection": true,
+      "artifact": "adaptive-gguf-fixed-4-train.json"
+    },
+    {
+      "model": "gguf",
+      "rows": 5,
+      "eligible_for_selection": false,
+      "artifact": "adaptive-gguf-fixed-5-train.json"
+    },
+    {
+      "model": "gguf",
+      "rows": 6,
+      "eligible_for_selection": true,
+      "artifact": "adaptive-gguf-fixed-6-train.json"
+    },
+    {
+      "model": "gguf",
+      "rows": 7,
+      "eligible_for_selection": false,
+      "artifact": "adaptive-gguf-fixed-7-train.json"
+    },
+    {
+      "model": "mlx",
+      "rows": 1,
+      "eligible_for_selection": true,
+      "artifact": "adaptive-mlx-fixed-1-train.json"
+    },
+    {
+      "model": "mlx",
+      "rows": 2,
+      "eligible_for_selection": true,
+      "artifact": "adaptive-mlx-fixed-2-train.json"
+    },
+    {
+      "model": "mlx",
+      "rows": 3,
+      "eligible_for_selection": true,
+      "artifact": "adaptive-mlx-fixed-3-train.json"
+    },
+    {
+      "model": "mlx",
+      "rows": 4,
+      "eligible_for_selection": true,
+      "artifact": "adaptive-mlx-fixed-4-train.json"
+    },
+    {
+      "model": "mlx",
+      "rows": 5,
+      "eligible_for_selection": true,
+      "artifact": "adaptive-mlx-fixed-5-train.json"
+    },
+    {
+      "model": "mlx",
+      "rows": 6,
+      "eligible_for_selection": true,
+      "artifact": "adaptive-mlx-fixed-6-train.json"
+    },
+    {
+      "model": "mlx",
+      "rows": 7,
+      "eligible_for_selection": true,
+      "artifact": "adaptive-mlx-fixed-7-train.json"
+    }
+  ],
+  "heldout": [
+    {
+      "model": "gguf",
+      "context": 2048,
+      "artifact": "adaptive-heldout-gguf-c2048.json",
+      "trials": 6,
+      "qualified_speed_gains": 5,
+      "inconclusive": 1,
+      "regressions": 0,
+      "changed_output_hashes": 6
+    },
+    {
+      "model": "gguf",
+      "context": 8192,
+      "artifact": "adaptive-heldout-gguf-c8192.json",
+      "trials": 3,
+      "qualified_speed_gains": 0,
+      "inconclusive": 2,
+      "regressions": 1,
+      "changed_output_hashes": 3
+    },
+    {
+      "model": "mlx",
+      "context": 2048,
+      "artifact": "adaptive-heldout-mlx-c2048.json",
+      "trials": 6,
+      "qualified_speed_gains": 3,
+      "inconclusive": 2,
+      "regressions": 1,
+      "changed_output_hashes": 6
+    },
+    {
+      "model": "mlx",
+      "context": 8192,
+      "artifact": "adaptive-heldout-mlx-c8192.json",
+      "trials": 3,
+      "qualified_speed_gains": 0,
+      "inconclusive": 3,
+      "regressions": 0,
+      "changed_output_hashes": 3
+    }
+  ],
+  "pending": [
+    "adaptive-full-reference-mlx-awake"
+  ]
+}

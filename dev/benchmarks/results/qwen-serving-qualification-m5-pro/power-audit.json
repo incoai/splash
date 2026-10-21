@@ -1,0 +1,2008 @@
+{
+  "events": [
+    {
+      "timestamp": "2026-10-20 00:15:20 +0530",
+      "epoch": 1792435520.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 00:15:22 +0530",
+      "epoch": 1792435522.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 00:32:35 +0530",
+      "epoch": 1792436555.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 00:32:37 +0530",
+      "epoch": 1792436557.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 00:48:15 +0530",
+      "epoch": 1792437495.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 00:48:17 +0530",
+      "epoch": 1792437497.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 00:58:41 +0530",
+      "epoch": 1792438121.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 00:59:06 +0530",
+      "epoch": 1792438146.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 01:15:48 +0530",
+      "epoch": 1792439148.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 01:15:50 +0530",
+      "epoch": 1792439150.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 01:32:32 +0530",
+      "epoch": 1792440152.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 01:32:34 +0530",
+      "epoch": 1792440154.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 01:50:20 +0530",
+      "epoch": 1792441220.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 01:50:22 +0530",
+      "epoch": 1792441222.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 01:59:42 +0530",
+      "epoch": 1792441782.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 02:00:02 +0530",
+      "epoch": 1792441802.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 02:17:27 +0530",
+      "epoch": 1792442847.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 02:17:29 +0530",
+      "epoch": 1792442849.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 02:35:12 +0530",
+      "epoch": 1792443912.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 02:35:14 +0530",
+      "epoch": 1792443914.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 02:50:37 +0530",
+      "epoch": 1792444837.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 02:50:39 +0530",
+      "epoch": 1792444839.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 03:07:11 +0530",
+      "epoch": 1792445831.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 03:07:13 +0530",
+      "epoch": 1792445833.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 03:23:52 +0530",
+      "epoch": 1792446832.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 03:23:54 +0530",
+      "epoch": 1792446834.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 03:39:54 +0530",
+      "epoch": 1792447794.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 03:39:56 +0530",
+      "epoch": 1792447796.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 03:55:20 +0530",
+      "epoch": 1792448720.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 03:55:22 +0530",
+      "epoch": 1792448722.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 04:12:13 +0530",
+      "epoch": 1792449733.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 04:12:15 +0530",
+      "epoch": 1792449735.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 04:27:46 +0530",
+      "epoch": 1792450666.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 04:27:48 +0530",
+      "epoch": 1792450668.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 04:44:18 +0530",
+      "epoch": 1792451658.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 04:44:20 +0530",
+      "epoch": 1792451660.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 05:00:43 +0530",
+      "epoch": 1792452643.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 05:00:45 +0530",
+      "epoch": 1792452645.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 05:05:39 +0530",
+      "epoch": 1792452939.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 05:06:07 +0530",
+      "epoch": 1792452967.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 05:21:27 +0530",
+      "epoch": 1792453887.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 05:21:29 +0530",
+      "epoch": 1792453889.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 05:38:58 +0530",
+      "epoch": 1792454938.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 05:39:00 +0530",
+      "epoch": 1792454940.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 05:55:18 +0530",
+      "epoch": 1792455918.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 05:55:31 +0530",
+      "epoch": 1792455931.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 06:11:11 +0530",
+      "epoch": 1792456871.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 06:11:13 +0530",
+      "epoch": 1792456873.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 06:29:07 +0530",
+      "epoch": 1792457947.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 06:29:09 +0530",
+      "epoch": 1792457949.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 06:46:49 +0530",
+      "epoch": 1792459009.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 06:46:51 +0530",
+      "epoch": 1792459011.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 07:04:27 +0530",
+      "epoch": 1792460067.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 07:04:29 +0530",
+      "epoch": 1792460069.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 07:21:12 +0530",
+      "epoch": 1792461072.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 07:21:14 +0530",
+      "epoch": 1792461074.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 07:38:24 +0530",
+      "epoch": 1792462104.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 07:38:26 +0530",
+      "epoch": 1792462106.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 07:53:42 +0530",
+      "epoch": 1792463022.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 07:53:44 +0530",
+      "epoch": 1792463024.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 07:56:19 +0530",
+      "epoch": 1792463179.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 07:56:33 +0530",
+      "epoch": 1792463193.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 08:03:38 +0530",
+      "epoch": 1792463618.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 08:03:56 +0530",
+      "epoch": 1792463636.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 08:21:35 +0530",
+      "epoch": 1792464695.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 08:21:37 +0530",
+      "epoch": 1792464697.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 08:38:28 +0530",
+      "epoch": 1792465708.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 08:38:30 +0530",
+      "epoch": 1792465710.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 08:48:40 +0530",
+      "epoch": 1792466320.0,
+      "mode": "Wake"
+    },
+    {
+      "timestamp": "2026-10-20 08:48:47 +0530",
+      "epoch": 1792466327.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 08:51:00 +0530",
+      "epoch": 1792466460.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 08:51:36 +0530",
+      "epoch": 1792466496.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 09:07:18 +0530",
+      "epoch": 1792467438.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 09:07:20 +0530",
+      "epoch": 1792467440.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 09:24:27 +0530",
+      "epoch": 1792468467.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 09:24:29 +0530",
+      "epoch": 1792468469.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 09:39:40 +0530",
+      "epoch": 1792469380.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 09:40:01 +0530",
+      "epoch": 1792469401.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 09:57:29 +0530",
+      "epoch": 1792470449.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 09:57:31 +0530",
+      "epoch": 1792470451.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 10:13:26 +0530",
+      "epoch": 1792471406.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 10:13:28 +0530",
+      "epoch": 1792471408.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 10:28:33 +0530",
+      "epoch": 1792472313.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 10:28:53 +0530",
+      "epoch": 1792472333.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 10:28:55 +0530",
+      "epoch": 1792472335.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 10:29:22 +0530",
+      "epoch": 1792472362.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 10:46:29 +0530",
+      "epoch": 1792473389.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 10:46:31 +0530",
+      "epoch": 1792473391.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 10:49:43 +0530",
+      "epoch": 1792473583.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 10:49:59 +0530",
+      "epoch": 1792473599.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 11:06:26 +0530",
+      "epoch": 1792474586.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 11:06:28 +0530",
+      "epoch": 1792474588.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 11:12:27 +0530",
+      "epoch": 1792474947.0,
+      "mode": "Wake"
+    },
+    {
+      "timestamp": "2026-10-20 12:00:38 +0530",
+      "epoch": 1792477838.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 12:15:39 +0530",
+      "epoch": 1792478739.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 12:16:24 +0530",
+      "epoch": 1792478784.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 12:31:25 +0530",
+      "epoch": 1792479685.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 12:32:10 +0530",
+      "epoch": 1792479730.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 12:36:55 +0530",
+      "epoch": 1792480015.0,
+      "mode": "Wake"
+    },
+    {
+      "timestamp": "2026-10-20 12:37:00 +0530",
+      "epoch": 1792480020.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 12:37:40 +0530",
+      "epoch": 1792480060.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 12:52:41 +0530",
+      "epoch": 1792480961.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 12:53:41 +0530",
+      "epoch": 1792481021.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 13:08:42 +0530",
+      "epoch": 1792481922.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 13:09:27 +0530",
+      "epoch": 1792481967.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 13:18:39 +0530",
+      "epoch": 1792482519.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 13:19:24 +0530",
+      "epoch": 1792482564.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 13:35:08 +0530",
+      "epoch": 1792483508.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 13:35:54 +0530",
+      "epoch": 1792483554.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 13:51:21 +0530",
+      "epoch": 1792484481.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 13:52:21 +0530",
+      "epoch": 1792484541.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 14:07:23 +0530",
+      "epoch": 1792485443.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 14:08:08 +0530",
+      "epoch": 1792485488.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 14:08:11 +0530",
+      "epoch": 1792485491.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 14:08:56 +0530",
+      "epoch": 1792485536.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 14:24:44 +0530",
+      "epoch": 1792486484.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 14:25:29 +0530",
+      "epoch": 1792486529.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 14:38:01 +0530",
+      "epoch": 1792487281.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 14:38:46 +0530",
+      "epoch": 1792487326.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 14:54:01 +0530",
+      "epoch": 1792488241.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 14:55:01 +0530",
+      "epoch": 1792488301.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 15:10:58 +0530",
+      "epoch": 1792489258.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 15:11:43 +0530",
+      "epoch": 1792489303.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 15:27:11 +0530",
+      "epoch": 1792490231.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 15:27:56 +0530",
+      "epoch": 1792490276.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 15:39:02 +0530",
+      "epoch": 1792490942.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 15:39:47 +0530",
+      "epoch": 1792490987.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 15:56:29 +0530",
+      "epoch": 1792491989.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 15:57:14 +0530",
+      "epoch": 1792492034.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 16:13:30 +0530",
+      "epoch": 1792493010.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 16:14:15 +0530",
+      "epoch": 1792493055.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 16:29:21 +0530",
+      "epoch": 1792493961.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 16:30:06 +0530",
+      "epoch": 1792494006.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 16:40:03 +0530",
+      "epoch": 1792494603.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 16:41:03 +0530",
+      "epoch": 1792494663.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 16:57:09 +0530",
+      "epoch": 1792495629.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 16:57:54 +0530",
+      "epoch": 1792495674.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 17:14:16 +0530",
+      "epoch": 1792496656.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 17:15:01 +0530",
+      "epoch": 1792496701.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 17:31:44 +0530",
+      "epoch": 1792497704.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 17:32:29 +0530",
+      "epoch": 1792497749.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 17:41:04 +0530",
+      "epoch": 1792498264.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 17:42:04 +0530",
+      "epoch": 1792498324.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 17:46:02 +0530",
+      "epoch": 1792498562.0,
+      "mode": "Wake"
+    },
+    {
+      "timestamp": "2026-10-20 17:46:27 +0530",
+      "epoch": 1792498587.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 17:46:47 +0530",
+      "epoch": 1792498607.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 17:50:17 +0530",
+      "epoch": 1792498817.0,
+      "mode": "Wake"
+    },
+    {
+      "timestamp": "2026-10-20 18:02:45 +0530",
+      "epoch": 1792499565.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 18:07:12 +0530",
+      "epoch": 1792499832.0,
+      "mode": "Wake"
+    },
+    {
+      "timestamp": "2026-10-20 18:08:55 +0530",
+      "epoch": 1792499935.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 18:15:22 +0530",
+      "epoch": 1792500322.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 18:15:45 +0530",
+      "epoch": 1792500345.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 18:30:47 +0530",
+      "epoch": 1792501247.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 18:30:49 +0530",
+      "epoch": 1792501249.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 18:47:54 +0530",
+      "epoch": 1792502274.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 18:47:56 +0530",
+      "epoch": 1792502276.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 18:51:02 +0530",
+      "epoch": 1792502462.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 18:51:23 +0530",
+      "epoch": 1792502483.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 19:08:19 +0530",
+      "epoch": 1792503499.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 19:08:21 +0530",
+      "epoch": 1792503501.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 19:24:04 +0530",
+      "epoch": 1792504444.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 19:24:06 +0530",
+      "epoch": 1792504446.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 19:41:18 +0530",
+      "epoch": 1792505478.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-20 19:41:20 +0530",
+      "epoch": 1792505480.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 19:46:45 +0530",
+      "epoch": 1792505805.0,
+      "mode": "Wake"
+    },
+    {
+      "timestamp": "2026-10-20 19:58:21 +0530",
+      "epoch": 1792506501.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 19:59:33 +0530",
+      "epoch": 1792506573.0,
+      "mode": "Wake"
+    },
+    {
+      "timestamp": "2026-10-20 20:16:51 +0530",
+      "epoch": 1792507611.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 20:18:16 +0530",
+      "epoch": 1792507696.0,
+      "mode": "Wake"
+    },
+    {
+      "timestamp": "2026-10-20 23:53:01 +0530",
+      "epoch": 1792520581.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-20 23:53:18 +0530",
+      "epoch": 1792520598.0,
+      "mode": "Wake"
+    },
+    {
+      "timestamp": "2026-10-21 00:22:23 +0530",
+      "epoch": 1792522343.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 00:28:20 +0530",
+      "epoch": 1792522700.0,
+      "mode": "Wake"
+    },
+    {
+      "timestamp": "2026-10-21 01:05:44 +0530",
+      "epoch": 1792524944.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 01:21:04 +0530",
+      "epoch": 1792525864.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 01:21:49 +0530",
+      "epoch": 1792525909.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 01:38:13 +0530",
+      "epoch": 1792526893.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 01:39:30 +0530",
+      "epoch": 1792526970.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 01:56:02 +0530",
+      "epoch": 1792527962.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 01:56:47 +0530",
+      "epoch": 1792528007.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 02:13:05 +0530",
+      "epoch": 1792528985.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 02:13:50 +0530",
+      "epoch": 1792529030.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 02:29:09 +0530",
+      "epoch": 1792529949.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 02:29:54 +0530",
+      "epoch": 1792529994.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 02:46:21 +0530",
+      "epoch": 1792530981.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 02:47:21 +0530",
+      "epoch": 1792531041.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 03:01:27 +0530",
+      "epoch": 1792531887.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 03:02:12 +0530",
+      "epoch": 1792531932.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 03:18:47 +0530",
+      "epoch": 1792532927.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 03:19:32 +0530",
+      "epoch": 1792532972.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 03:34:41 +0530",
+      "epoch": 1792533881.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 03:35:26 +0530",
+      "epoch": 1792533926.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 03:51:39 +0530",
+      "epoch": 1792534899.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 03:52:39 +0530",
+      "epoch": 1792534959.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 04:08:10 +0530",
+      "epoch": 1792535890.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 04:08:55 +0530",
+      "epoch": 1792535935.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 04:25:33 +0530",
+      "epoch": 1792536933.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 04:26:18 +0530",
+      "epoch": 1792536978.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 04:42:09 +0530",
+      "epoch": 1792537929.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 04:42:54 +0530",
+      "epoch": 1792537974.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 04:57:59 +0530",
+      "epoch": 1792538879.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 04:58:44 +0530",
+      "epoch": 1792538924.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 05:14:11 +0530",
+      "epoch": 1792539851.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 05:14:56 +0530",
+      "epoch": 1792539896.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 05:28:41 +0530",
+      "epoch": 1792540721.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 05:29:26 +0530",
+      "epoch": 1792540766.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 05:44:31 +0530",
+      "epoch": 1792541671.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 05:45:31 +0530",
+      "epoch": 1792541731.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 06:00:50 +0530",
+      "epoch": 1792542650.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 06:01:35 +0530",
+      "epoch": 1792542695.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 06:18:06 +0530",
+      "epoch": 1792543686.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 06:18:51 +0530",
+      "epoch": 1792543731.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 06:33:59 +0530",
+      "epoch": 1792544639.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 06:34:44 +0530",
+      "epoch": 1792544684.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 06:50:16 +0530",
+      "epoch": 1792545616.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 06:51:16 +0530",
+      "epoch": 1792545676.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 06:56:41 +0530",
+      "epoch": 1792546001.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 06:57:26 +0530",
+      "epoch": 1792546046.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 07:12:51 +0530",
+      "epoch": 1792546971.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 07:13:36 +0530",
+      "epoch": 1792547016.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 07:29:11 +0530",
+      "epoch": 1792547951.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 07:29:56 +0530",
+      "epoch": 1792547996.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 07:45:34 +0530",
+      "epoch": 1792548934.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 07:46:34 +0530",
+      "epoch": 1792548994.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 08:03:27 +0530",
+      "epoch": 1792550007.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 08:04:12 +0530",
+      "epoch": 1792550052.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 08:19:29 +0530",
+      "epoch": 1792550969.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 08:20:14 +0530",
+      "epoch": 1792551014.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 08:37:00 +0530",
+      "epoch": 1792552020.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 08:37:45 +0530",
+      "epoch": 1792552065.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 08:52:50 +0530",
+      "epoch": 1792552970.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 08:53:50 +0530",
+      "epoch": 1792553030.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 08:57:42 +0530",
+      "epoch": 1792553262.0,
+      "mode": "DarkWake"
+    },
+    {
+      "timestamp": "2026-10-21 08:58:27 +0530",
+      "epoch": 1792553307.0,
+      "mode": "Sleep"
+    },
+    {
+      "timestamp": "2026-10-21 09:11:24 +0530",
+      "epoch": 1792554084.0,
+      "mode": "Wake"
+    }
+  ],
+  "stages": {
+    "quiet": [
+      {
+        "name": "gdn-final-shader-check",
+        "started": 1792518588.826441,
+        "finished": 1792518699.1686301,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-gguf-q0.1-r0",
+        "started": 1792518709.202094,
+        "finished": 1792518807.259051,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-gguf-q0.1-r1",
+        "started": 1792518807.2758038,
+        "finished": 1792518816.595147,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-gguf-q0.1-r2",
+        "started": 1792518816.609928,
+        "finished": 1792518825.805696,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-gguf-q0.1-r3",
+        "started": 1792518825.8202581,
+        "finished": 1792518835.1589692,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-gguf-q0.2-r0",
+        "started": 1792518835.173281,
+        "finished": 1792518844.489226,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-gguf-q0.2-r1",
+        "started": 1792518844.504147,
+        "finished": 1792518853.915574,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-gguf-q0.2-r2",
+        "started": 1792518853.9305768,
+        "finished": 1792518863.3739378,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-gguf-q0.2-r3",
+        "started": 1792518863.388416,
+        "finished": 1792518872.887979,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-mlx-q0.1-r0",
+        "started": 1792518872.9036129,
+        "finished": 1792518884.447347,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-mlx-q0.1-r1",
+        "started": 1792518884.4650948,
+        "finished": 1792518895.527195,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-mlx-q0.1-r2",
+        "started": 1792518895.5428429,
+        "finished": 1792518906.197721,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-mlx-q0.1-r3",
+        "started": 1792518906.214232,
+        "finished": 1792518917.413214,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-mlx-q0.2-r0",
+        "started": 1792518917.428071,
+        "finished": 1792518928.770457,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-mlx-q0.2-r1",
+        "started": 1792518928.786266,
+        "finished": 1792518940.32436,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-mlx-q0.2-r2",
+        "started": 1792518940.3396962,
+        "finished": 1792518952.116957,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-mlx-q0.2-r3",
+        "started": 1792518952.132916,
+        "finished": 1792518964.165455,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-http",
+        "started": 1792518964.180949,
+        "finished": 1792519215.212464,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "host-http",
+        "started": 1792519215.227694,
+        "finished": 1792519303.3558989,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "moe-timeline",
+        "started": 1792519303.3714418,
+        "finished": 1792519419.748992,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "dense-timeline",
+        "started": 1792519419.763681,
+        "finished": 1792520041.056721,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "adaptive-train-fixed-1",
+        "started": 1792520041.071166,
+        "finished": 1792520390.498092,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "adaptive-train-fixed-2",
+        "started": 1792520390.5128279,
+        "finished": 1792520432.307915,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "adaptive-train-fixed-3",
+        "started": 1792520432.3226008,
+        "finished": 1792520479.199074,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "adaptive-train-fixed-4",
+        "started": 1792520479.214135,
+        "finished": 1792520534.460165,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "adaptive-train-fixed-5",
+        "started": 1792520534.475761,
+        "finished": 1792520602.031397,
+        "started_power_mode": "Wake",
+        "power_transitions": [
+          {
+            "timestamp": "2026-10-20 23:53:01 +0530",
+            "epoch": 1792520581.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-20 23:53:18 +0530",
+            "epoch": 1792520598.0,
+            "mode": "Wake"
+          }
+        ],
+        "sleep_affected": true
+      },
+      {
+        "name": "adaptive-train-fixed-6",
+        "started": 1792520602.045619,
+        "finished": 1792520638.740479,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "adaptive-train-fixed-7",
+        "started": 1792520638.7547991,
+        "finished": 1792520676.494384,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      }
+    ],
+    "expanded": [
+      {
+        "name": "prefix-gguf-b1",
+        "started": 1792520688.854985,
+        "finished": 1792521904.019688,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "prefix-mlx-b1",
+        "started": 1792521904.04002,
+        "finished": 1792521921.583235,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-disabled-control",
+        "started": 1792521921.600118,
+        "finished": 1792521997.8366919,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      }
+    ],
+    "final": [
+      {
+        "name": "prefill-build",
+        "started": 1792522047.3990579,
+        "finished": 1792522110.326965,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "prefill-engine",
+        "started": 1792522110.343992,
+        "finished": 1792522110.387591,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "prefill-native",
+        "started": 1792522110.400712,
+        "finished": 1792522110.4176881,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "prefill-scheduler",
+        "started": 1792522110.429963,
+        "finished": 1792522110.444094,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-mlx-warm",
+        "started": 1792522130.479009,
+        "finished": 1792522140.0056782,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-mlx-q0.1-r0",
+        "started": 1792522140.022156,
+        "finished": 1792522154.1427,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-mlx-q0.1-r1",
+        "started": 1792522154.156596,
+        "finished": 1792522168.24464,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-mlx-q0.1-r2",
+        "started": 1792522168.258976,
+        "finished": 1792522182.350113,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-mlx-q0.1-r3",
+        "started": 1792522182.364674,
+        "finished": 1792522196.512546,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-mlx-q0.2-r0",
+        "started": 1792522196.526517,
+        "finished": 1792522210.33961,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-mlx-q0.2-r1",
+        "started": 1792522210.3536482,
+        "finished": 1792522224.1564941,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-mlx-q0.2-r2",
+        "started": 1792522224.170847,
+        "finished": 1792522238.0266619,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "gdn-native-mlx-q0.2-r3",
+        "started": 1792522238.041147,
+        "finished": 1792522251.984482,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "host-http-warmed",
+        "started": 1792522251.99917,
+        "finished": 1792522715.0804942,
+        "started_power_mode": "Wake",
+        "power_transitions": [
+          {
+            "timestamp": "2026-10-21 00:22:23 +0530",
+            "epoch": 1792522343.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 00:28:20 +0530",
+            "epoch": 1792522700.0,
+            "mode": "Wake"
+          }
+        ],
+        "sleep_affected": true
+      },
+      {
+        "name": "prefill-geometry",
+        "started": 1792522715.093718,
+        "finished": 1792523013.42079,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "confidence-gguf",
+        "started": 1792523013.434805,
+        "finished": 1792523123.606838,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "confidence-mlx",
+        "started": 1792523123.6217668,
+        "finished": 1792523141.0707881,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "adaptive-train-mlx-fixed-1",
+        "started": 1792523141.0902212,
+        "finished": 1792523302.4406688,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "adaptive-train-mlx-fixed-2",
+        "started": 1792523302.455122,
+        "finished": 1792523435.710589,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "adaptive-train-mlx-fixed-3",
+        "started": 1792523435.724579,
+        "finished": 1792523562.8742442,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "adaptive-train-mlx-fixed-4",
+        "started": 1792523562.889405,
+        "finished": 1792523684.1610298,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "adaptive-train-mlx-fixed-5",
+        "started": 1792523684.1752782,
+        "finished": 1792523806.2831302,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "adaptive-train-mlx-fixed-6",
+        "started": 1792523806.2995892,
+        "finished": 1792523927.503181,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "adaptive-train-mlx-fixed-7",
+        "started": 1792523927.5174432,
+        "finished": 1792524047.697239,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "adaptive-heldout-gguf-c2048",
+        "started": 1792524047.715043,
+        "finished": 1792524245.517101,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "adaptive-heldout-gguf-c8192",
+        "started": 1792524245.5312278,
+        "finished": 1792524423.842806,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "adaptive-heldout-mlx-c2048",
+        "started": 1792524423.866743,
+        "finished": 1792524609.133496,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "adaptive-heldout-mlx-c8192",
+        "started": 1792524609.148593,
+        "finished": 1792524783.728812,
+        "started_power_mode": "Wake",
+        "power_transitions": [],
+        "sleep_affected": false
+      },
+      {
+        "name": "adaptive-full-reference-mlx",
+        "started": 1792524783.7429912,
+        "finished": 1792525885.503127,
+        "started_power_mode": "Wake",
+        "power_transitions": [
+          {
+            "timestamp": "2026-10-21 01:05:44 +0530",
+            "epoch": 1792524944.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 01:21:04 +0530",
+            "epoch": 1792525864.0,
+            "mode": "DarkWake"
+          }
+        ],
+        "sleep_affected": true
+      },
+      {
+        "name": "prefix-mlx-b1-single",
+        "started": 1792525885.520853,
+        "finished": 1792545639.806089,
+        "started_power_mode": "DarkWake",
+        "power_transitions": [
+          {
+            "timestamp": "2026-10-21 01:21:49 +0530",
+            "epoch": 1792525909.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 01:38:13 +0530",
+            "epoch": 1792526893.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 01:39:30 +0530",
+            "epoch": 1792526970.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 01:56:02 +0530",
+            "epoch": 1792527962.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 01:56:47 +0530",
+            "epoch": 1792528007.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 02:13:05 +0530",
+            "epoch": 1792528985.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 02:13:50 +0530",
+            "epoch": 1792529030.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 02:29:09 +0530",
+            "epoch": 1792529949.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 02:29:54 +0530",
+            "epoch": 1792529994.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 02:46:21 +0530",
+            "epoch": 1792530981.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 02:47:21 +0530",
+            "epoch": 1792531041.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 03:01:27 +0530",
+            "epoch": 1792531887.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 03:02:12 +0530",
+            "epoch": 1792531932.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 03:18:47 +0530",
+            "epoch": 1792532927.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 03:19:32 +0530",
+            "epoch": 1792532972.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 03:34:41 +0530",
+            "epoch": 1792533881.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 03:35:26 +0530",
+            "epoch": 1792533926.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 03:51:39 +0530",
+            "epoch": 1792534899.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 03:52:39 +0530",
+            "epoch": 1792534959.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 04:08:10 +0530",
+            "epoch": 1792535890.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 04:08:55 +0530",
+            "epoch": 1792535935.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 04:25:33 +0530",
+            "epoch": 1792536933.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 04:26:18 +0530",
+            "epoch": 1792536978.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 04:42:09 +0530",
+            "epoch": 1792537929.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 04:42:54 +0530",
+            "epoch": 1792537974.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 04:57:59 +0530",
+            "epoch": 1792538879.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 04:58:44 +0530",
+            "epoch": 1792538924.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 05:14:11 +0530",
+            "epoch": 1792539851.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 05:14:56 +0530",
+            "epoch": 1792539896.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 05:28:41 +0530",
+            "epoch": 1792540721.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 05:29:26 +0530",
+            "epoch": 1792540766.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 05:44:31 +0530",
+            "epoch": 1792541671.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 05:45:31 +0530",
+            "epoch": 1792541731.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 06:00:50 +0530",
+            "epoch": 1792542650.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 06:01:35 +0530",
+            "epoch": 1792542695.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 06:18:06 +0530",
+            "epoch": 1792543686.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 06:18:51 +0530",
+            "epoch": 1792543731.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 06:33:59 +0530",
+            "epoch": 1792544639.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 06:34:44 +0530",
+            "epoch": 1792544684.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 06:50:16 +0530",
+            "epoch": 1792545616.0,
+            "mode": "DarkWake"
+          }
+        ],
+        "sleep_affected": true
+      },
+      {
+        "name": "prefill-cost-moe-cold",
+        "started": 1792545639.8237839,
+        "finished": 1792553292.817857,
+        "started_power_mode": "DarkWake",
+        "power_transitions": [
+          {
+            "timestamp": "2026-10-21 06:51:16 +0530",
+            "epoch": 1792545676.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 06:56:41 +0530",
+            "epoch": 1792546001.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 06:57:26 +0530",
+            "epoch": 1792546046.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 07:12:51 +0530",
+            "epoch": 1792546971.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 07:13:36 +0530",
+            "epoch": 1792547016.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 07:29:11 +0530",
+            "epoch": 1792547951.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 07:29:56 +0530",
+            "epoch": 1792547996.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 07:45:34 +0530",
+            "epoch": 1792548934.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 07:46:34 +0530",
+            "epoch": 1792548994.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 08:03:27 +0530",
+            "epoch": 1792550007.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 08:04:12 +0530",
+            "epoch": 1792550052.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 08:19:29 +0530",
+            "epoch": 1792550969.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 08:20:14 +0530",
+            "epoch": 1792551014.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 08:37:00 +0530",
+            "epoch": 1792552020.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 08:37:45 +0530",
+            "epoch": 1792552065.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 08:52:50 +0530",
+            "epoch": 1792552970.0,
+            "mode": "DarkWake"
+          },
+          {
+            "timestamp": "2026-10-21 08:53:50 +0530",
+            "epoch": 1792553030.0,
+            "mode": "Sleep"
+          },
+          {
+            "timestamp": "2026-10-21 08:57:42 +0530",
+            "epoch": 1792553262.0,
+            "mode": "DarkWake"
+          }
+        ],
+        "sleep_affected": true
+      }
+    ]
+  }
+}

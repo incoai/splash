@@ -1,0 +1,68 @@
+{
+  "local_matrix_complete": false,
+  "reports": [
+    {
+      "model": "gguf",
+      "width": 1,
+      "artifact": "prefix-gguf-b1.json",
+      "residency": "paired",
+      "contexts": [
+        {
+          "context": 2048,
+          "trials": 9,
+          "qualified_speed_gains": 3,
+          "inconclusive": 2,
+          "regressions": 0,
+          "changed_output_hashes": [],
+          "median_throughput_gain_descriptive_only": 0.027543260379144785
+        },
+        {
+          "context": 8192,
+          "trials": 9,
+          "qualified_speed_gains": 4,
+          "inconclusive": 1,
+          "regressions": 0,
+          "changed_output_hashes": [
+            {
+              "workload": "math",
+              "sample": 2
+            },
+            {
+              "workload": "prose",
+              "sample": 0
+            },
+            {
+              "workload": "prose",
+              "sample": 2
+            }
+          ],
+          "median_throughput_gain_descriptive_only": 0.034341678382163954
+        },
+        {
+          "context": 31744,
+          "trials": 9,
+          "qualified_speed_gains": 6,
+          "inconclusive": 0,
+          "regressions": 0,
+          "changed_output_hashes": [],
+          "median_throughput_gain_descriptive_only": 0.032163407872228156
+        }
+      ]
+    }
+  ],
+  "pending": [
+    "prefix-gguf-b2",
+    "prefix-gguf-b3",
+    "prefix-gguf-b4",
+    "prefix-mlx-b1",
+    "prefix-mlx-b2",
+    "prefix-mlx-b3",
+    "prefix-mlx-b4"
+  ],
+  "excluded": [
+    {
+      "source": "final/prefix-mlx-b1-single",
+      "reason": "sleep/dark-wake transitions; see power audit"
+    }
+  ]
+}

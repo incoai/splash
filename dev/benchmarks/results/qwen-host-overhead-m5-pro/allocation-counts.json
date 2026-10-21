@@ -1,0 +1,26 @@
+[
+  {
+    "version": "base",
+    "dispatches": 204800,
+    "allocations": 1027000,
+    "seconds": 0.022145208
+  },
+  {
+    "version": "host",
+    "dispatches": 204800,
+    "allocations": 822200,
+    "seconds": 0.017162209
+  },
+  {
+    "version": "host",
+    "dispatches": 204800,
+    "allocations": 822200,
+    "seconds": 0.018049417
+  },
+  {
+    "version": "base",
+    "dispatches": 204800,
+    "allocations": 1027000,
+    "seconds": 0.025130042
+  }
+]

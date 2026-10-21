@@ -1,0 +1,27 @@
+{
+  "complete": false,
+  "implementation_commit": "02a1162e",
+  "traces": [
+    {
+      "source_trace": "round-1-trace.json",
+      "sha256": "964bccb1a44ceb71400c99160a0cf542047ca476abe5e290c320f9c43ab1886c"
+    },
+    {
+      "source_trace": "round-2-trace.json",
+      "sha256": "88155190cc707a24755e69cca02d6fd6e0a04e6c36c040df23981fcbbb86424c"
+    },
+    {
+      "source_trace": "round-3-trace.json",
+      "sha256": "61a03b48fa14c0ba91638f05ffa00c6da72f3042e64468b3132d4495708335e3"
+    },
+    {
+      "source_trace": "round-4-trace.json",
+      "sha256": "f4a2a988239cf4cec6d569c74c710f932fb6e4daca0ed6590194b2b82e755309"
+    }
+  ],
+  "cpu_and_existing_sanitizers": "PASS",
+  "focused_engine_native_scheduler": "PASS",
+  "dedicated_scheduler_sanitizers": "pending; targets added after frozen build",
+  "latency_gate": "pending; no serving gain claimed",
+  "other_hardware": "unexecuted"
+}

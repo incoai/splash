@@ -1,0 +1,118 @@
+[
+  {
+    "name": "prefill-build",
+    "command": [
+      "make",
+      "-j8",
+      "build/splash",
+      "build/serving-profile",
+      "build/engine-tests/engine",
+      "build/engine-tests/native-engine-loop",
+      "test-engine-cpu",
+      "test-sanitizers"
+    ],
+    "cwd": "$PREFILL_WORKTREE",
+    "started": 1792522047.3990579,
+    "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+    "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+    "exit_status": 0,
+    "finished": 1792522110.326965,
+    "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+    "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+  },
+  {
+    "name": "prefill-engine",
+    "command": [
+      "$PREFILL_WORKTREE/build/engine-tests/engine"
+    ],
+    "cwd": "$PREFILL_WORKTREE",
+    "started": 1792522110.343992,
+    "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+    "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+    "exit_status": 0,
+    "finished": 1792522110.387591,
+    "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+    "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+  },
+  {
+    "name": "prefill-native",
+    "command": [
+      "$PREFILL_WORKTREE/build/engine-tests/native-engine-loop"
+    ],
+    "cwd": "$PREFILL_WORKTREE",
+    "started": 1792522110.400712,
+    "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+    "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+    "exit_status": 0,
+    "finished": 1792522110.4176881,
+    "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+    "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+  },
+  {
+    "name": "prefill-scheduler",
+    "command": [
+      "$PREFILL_WORKTREE/build/engine-tests/ragged-scheduler"
+    ],
+    "cwd": "$PREFILL_WORKTREE",
+    "started": 1792522110.429963,
+    "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+    "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+    "exit_status": 0,
+    "finished": 1792522110.444094,
+    "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+    "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+  },
+  {
+    "name": "prefill-geometry",
+    "command": [
+      "$SPLASH/.venv/bin/python",
+      "-m",
+      "dev.benchmarks.serving_regression",
+      "--model",
+      "unsloth/Qwen3.6-35B-A3B-GGUF",
+      "--model-root",
+      "$SPLASH/install/models/.resolved/fbd33ebb12696638784e67f8d0b6c7f9add5de557c39732d95de90a8194967d5",
+      "--baseline-binary",
+      "$PREFILL_WORKTREE/build/serving-profile",
+      "--binary",
+      "$PREFILL_WORKTREE/build/serving-profile",
+      "--contexts",
+      "8192,31744",
+      "--workloads",
+      "code",
+      "--samples",
+      "2",
+      "--tokens",
+      "512",
+      "--scenario",
+      "mixed",
+      "--max-memory",
+      "34G",
+      "--output",
+      "$SPLASH/build/deepinfer-plan/final/prefill-geometry",
+      "--batch",
+      "1",
+      "--residency",
+      "sequential",
+      "--cache-mode",
+      "cold",
+      "--warmup-context",
+      "2048",
+      "--warmup-tokens",
+      "512",
+      "--warmup-rounds",
+      "4",
+      "--warmup-seconds",
+      "0",
+      "--trace"
+    ],
+    "cwd": "$SPLASH",
+    "started": 1792522715.093718,
+    "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+    "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+    "exit_status": 0,
+    "finished": 1792523013.42079,
+    "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+    "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+  }
+]

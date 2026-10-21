@@ -1,0 +1,28 @@
+[
+  {
+    "model": "moe",
+    "widths": [
+      {
+        "width": 1,
+        "count": 306,
+        "median_submit_ms": 0.3228954883525148,
+        "median_remainder_ms": 0.16145849076099694,
+        "maximum_remainder_ms": 0.19237498054280877
+      }
+    ],
+    "method": "Per-parent duration minus the union of intersecting backend.prepare and metal.encode host intervals. Nested phase medians are not subtracted."
+  },
+  {
+    "model": "dense",
+    "widths": [
+      {
+        "width": 1,
+        "count": 510,
+        "median_submit_ms": 0.34745849552564323,
+        "median_remainder_ms": 0.16839599995315074,
+        "maximum_remainder_ms": 0.25645800632238386
+      }
+    ],
+    "method": "Per-parent duration minus the union of intersecting backend.prepare and metal.encode host intervals. Nested phase medians are not subtracted."
+  }
+]

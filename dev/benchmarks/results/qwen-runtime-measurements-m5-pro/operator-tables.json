@@ -1,0 +1,1694 @@
+{
+  "qualification_usable": false,
+  "purpose": "exploratory operator bottleneck classification only",
+  "power": "initial session transitioned from battery to AC; per-profile power not pinned",
+  "base_revision": "be3b083c5f413673d44e44881042e875e674e333",
+  "models": [
+    {
+      "model": "moe",
+      "source_log_sha256": "c9aa8b222bed71e7bab5842b78c8fb7381e0cb2184422f0f101dcf53c5145960",
+      "widths": [
+        {
+          "width": 1,
+          "fused_gpu_ms": 21.78,
+          "serial_gpu_ms": 22.24,
+          "dispatches": 643,
+          "pipelines": [
+            {
+              "name": "moe_expert_gguf_m8_gate_up",
+              "count": 40.0,
+              "gpu_ms": 5.661,
+              "printed_share_percent": 25.5
+            },
+            {
+              "name": "gguf_decode_fused_m8",
+              "count": 40.0,
+              "gpu_ms": 3.803,
+              "printed_share_percent": 17.1
+            },
+            {
+              "name": "moe_expert_gguf_m8_a",
+              "count": 40.0,
+              "gpu_ms": 3.05,
+              "printed_share_percent": 13.7
+            },
+            {
+              "name": "gguf_decode_q6k_m8_a_f32",
+              "count": 2.0,
+              "gpu_ms": 3.024,
+              "printed_share_percent": 13.6
+            },
+            {
+              "name": "gguf_decode_q6k_m8_r",
+              "count": 40.0,
+              "gpu_ms": 1.535,
+              "printed_share_percent": 6.9
+            },
+            {
+              "name": "gguf_decode_af4g64_m8_a",
+              "count": 38.0,
+              "gpu_ms": 1.018,
+              "printed_share_percent": 4.6
+            },
+            {
+              "name": "verify_gdn_fused_vh32_f32",
+              "count": 30.0,
+              "gpu_ms": 0.947,
+              "printed_share_percent": 4.3
+            },
+            {
+              "name": "gguf_float_f32",
+              "count": 40.0,
+              "gpu_ms": 0.472,
+              "printed_share_percent": 2.1
+            },
+            {
+              "name": "gguf_decode_af4g64_m8_gate_up",
+              "count": 6.0,
+              "gpu_ms": 0.388,
+              "printed_share_percent": 1.7
+            },
+            {
+              "name": "draft_attention_bf16_split",
+              "count": 6.0,
+              "gpu_ms": 0.329,
+              "printed_share_percent": 1.5
+            },
+            {
+              "name": "verify_attention_q8_split_kv2_g8",
+              "count": 10.0,
+              "gpu_ms": 0.306,
+              "printed_share_percent": 1.4
+            },
+            {
+              "name": "moe_route_select_f32",
+              "count": 40.0,
+              "gpu_ms": 0.247,
+              "printed_share_percent": 1.1
+            },
+            {
+              "name": "gguf_float_bf16",
+              "count": 30.0,
+              "gpu_ms": 0.247,
+              "printed_share_percent": 1.1
+            },
+            {
+              "name": "norm_rms_staged_f32",
+              "count": 81.0,
+              "gpu_ms": 0.245,
+              "printed_share_percent": 1.1
+            },
+            {
+              "name": "moe_combine",
+              "count": 40.0,
+              "gpu_ms": 0.198,
+              "printed_share_percent": 0.9
+            },
+            {
+              "name": "moe_group_routes",
+              "count": 40.0,
+              "gpu_ms": 0.166,
+              "printed_share_percent": 0.7
+            },
+            {
+              "name": "verify_attention_reduce_kv2_g8",
+              "count": 10.0,
+              "gpu_ms": 0.106,
+              "printed_share_percent": 0.5
+            },
+            {
+              "name": "draft_conv_h2048",
+              "count": 24.0,
+              "gpu_ms": 0.092,
+              "printed_share_percent": 0.4
+            },
+            {
+              "name": "draft_select_top16_sharded",
+              "count": 1.0,
+              "gpu_ms": 0.056,
+              "printed_share_percent": 0.3
+            },
+            {
+              "name": "verify_attention_qkv_kv2_g8_f32",
+              "count": 10.0,
+              "gpu_ms": 0.046,
+              "printed_share_percent": 0.2
+            },
+            {
+              "name": "verify_attention_q8_store_kv2_g8",
+              "count": 10.0,
+              "gpu_ms": 0.042,
+              "printed_share_percent": 0.2
+            },
+            {
+              "name": "norm_rms_staged",
+              "count": 14.0,
+              "gpu_ms": 0.042,
+              "printed_share_percent": 0.2
+            },
+            {
+              "name": "verify_attention_gate_kv2_g8",
+              "count": 10.0,
+              "gpu_ms": 0.036,
+              "printed_share_percent": 0.2
+            },
+            {
+              "name": "draft_attention_qkv",
+              "count": 6.0,
+              "gpu_ms": 0.031,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "decode_sample_argmax_sharded",
+              "count": 1.0,
+              "gpu_ms": 0.03,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "copy_rows_bf16",
+              "count": 8.0,
+              "gpu_ms": 0.024,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_attention_bf16_reduce",
+              "count": 6.0,
+              "gpu_ms": 0.023,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_context_kv_commit",
+              "count": 6.0,
+              "gpu_ms": 0.02,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_attention_reorder",
+              "count": 6.0,
+              "gpu_ms": 0.017,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_select_edges",
+              "count": 1.0,
+              "gpu_ms": 0.013,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_select_dflash",
+              "count": 1.0,
+              "gpu_ms": 0.009,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "gguf_embed_q6k",
+              "count": 2.0,
+              "gpu_ms": 0.006,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "decode_accept_dflash",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "rope_build_tables",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "decode_sample_argmax_reduce",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "verify_input_tokens",
+              "count": 1.0,
+              "gpu_ms": 0.002,
+              "printed_share_percent": 0.0
+            }
+          ],
+          "serial_gpu_shares": {
+            "expert": 0.39168165467625893,
+            "other_linear": 0.43920863309352526,
+            "gdn": 0.04258093525179856,
+            "other": 0.07495503597122301,
+            "target_attention": 0.024100719424460428,
+            "routing": 0.027473021582733813
+          }
+        },
+        {
+          "width": 2,
+          "fused_gpu_ms": 30.73,
+          "serial_gpu_ms": 30.1,
+          "dispatches": 683,
+          "pipelines": [
+            {
+              "name": "moe_expert_gguf_m8_gate_up",
+              "count": 40.0,
+              "gpu_ms": 9.041,
+              "printed_share_percent": 30.0
+            },
+            {
+              "name": "moe_expert_gguf_m8_a",
+              "count": 40.0,
+              "gpu_ms": 4.935,
+              "printed_share_percent": 16.4
+            },
+            {
+              "name": "gguf_decode_fused_m16",
+              "count": 40.0,
+              "gpu_ms": 3.804,
+              "printed_share_percent": 12.6
+            },
+            {
+              "name": "gguf_decode_q6k_m16_a_f32",
+              "count": 2.0,
+              "gpu_ms": 3.117,
+              "printed_share_percent": 10.4
+            },
+            {
+              "name": "gguf_decode_q6k_m16_r",
+              "count": 40.0,
+              "gpu_ms": 1.795,
+              "printed_share_percent": 6.0
+            },
+            {
+              "name": "verify_gdn_fused_vh32_f32",
+              "count": 30.0,
+              "gpu_ms": 1.559,
+              "printed_share_percent": 5.2
+            },
+            {
+              "name": "gguf_decode_af4g64_m16_a",
+              "count": 38.0,
+              "gpu_ms": 1.194,
+              "printed_share_percent": 4.0
+            },
+            {
+              "name": "verify_attention_q8_split_kv2_g8",
+              "count": 10.0,
+              "gpu_ms": 0.705,
+              "printed_share_percent": 2.3
+            },
+            {
+              "name": "draft_attention_bf16_split",
+              "count": 6.0,
+              "gpu_ms": 0.646,
+              "printed_share_percent": 2.1
+            },
+            {
+              "name": "gguf_float_f32",
+              "count": 40.0,
+              "gpu_ms": 0.5,
+              "printed_share_percent": 1.7
+            },
+            {
+              "name": "moe_gather_rows",
+              "count": 40.0,
+              "gpu_ms": 0.462,
+              "printed_share_percent": 1.5
+            },
+            {
+              "name": "gguf_decode_af4g64_m16_gate_up",
+              "count": 6.0,
+              "gpu_ms": 0.367,
+              "printed_share_percent": 1.2
+            },
+            {
+              "name": "gguf_float_bf16",
+              "count": 30.0,
+              "gpu_ms": 0.292,
+              "printed_share_percent": 1.0
+            },
+            {
+              "name": "norm_rms_staged_f32",
+              "count": 81.0,
+              "gpu_ms": 0.253,
+              "printed_share_percent": 0.8
+            },
+            {
+              "name": "moe_route_select_f32",
+              "count": 40.0,
+              "gpu_ms": 0.248,
+              "printed_share_percent": 0.8
+            },
+            {
+              "name": "moe_combine",
+              "count": 40.0,
+              "gpu_ms": 0.218,
+              "printed_share_percent": 0.7
+            },
+            {
+              "name": "verify_attention_reduce_kv2_g8",
+              "count": 10.0,
+              "gpu_ms": 0.188,
+              "printed_share_percent": 0.6
+            },
+            {
+              "name": "moe_group_routes",
+              "count": 40.0,
+              "gpu_ms": 0.173,
+              "printed_share_percent": 0.6
+            },
+            {
+              "name": "draft_select_top16_sharded",
+              "count": 1.0,
+              "gpu_ms": 0.108,
+              "printed_share_percent": 0.4
+            },
+            {
+              "name": "draft_conv_h2048",
+              "count": 24.0,
+              "gpu_ms": 0.085,
+              "printed_share_percent": 0.3
+            },
+            {
+              "name": "decode_sample_argmax_sharded",
+              "count": 1.0,
+              "gpu_ms": 0.061,
+              "printed_share_percent": 0.2
+            },
+            {
+              "name": "verify_attention_qkv_kv2_g8_f32",
+              "count": 10.0,
+              "gpu_ms": 0.054,
+              "printed_share_percent": 0.2
+            },
+            {
+              "name": "norm_rms_staged",
+              "count": 14.0,
+              "gpu_ms": 0.043,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "verify_attention_q8_store_kv2_g8",
+              "count": 10.0,
+              "gpu_ms": 0.042,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "verify_attention_gate_kv2_g8",
+              "count": 10.0,
+              "gpu_ms": 0.038,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_attention_qkv",
+              "count": 6.0,
+              "gpu_ms": 0.038,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_attention_bf16_reduce",
+              "count": 6.0,
+              "gpu_ms": 0.029,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "copy_rows_bf16",
+              "count": 8.0,
+              "gpu_ms": 0.026,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_context_kv_commit",
+              "count": 6.0,
+              "gpu_ms": 0.022,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_attention_reorder",
+              "count": 6.0,
+              "gpu_ms": 0.017,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_select_edges",
+              "count": 1.0,
+              "gpu_ms": 0.013,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_select_dflash",
+              "count": 1.0,
+              "gpu_ms": 0.009,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "gguf_embed_q6k",
+              "count": 2.0,
+              "gpu_ms": 0.007,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "rope_build_tables",
+              "count": 1.0,
+              "gpu_ms": 0.005,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "decode_accept_dflash",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "decode_sample_argmax_reduce",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "verify_input_tokens",
+              "count": 1.0,
+              "gpu_ms": 0.002,
+              "printed_share_percent": 0.0
+            }
+          ],
+          "serial_gpu_shares": {
+            "expert": 0.46431893687707637,
+            "other_linear": 0.34142857142857147,
+            "gdn": 0.051794019933554813,
+            "target_attention": 0.03411960132890366,
+            "other": 0.0718272425249169,
+            "routing": 0.03657807308970099
+          }
+        },
+        {
+          "width": 3,
+          "fused_gpu_ms": 38.01,
+          "serial_gpu_ms": 37.15,
+          "dispatches": 683,
+          "pipelines": [
+            {
+              "name": "moe_expert_gguf_m8_gate_up",
+              "count": 40.0,
+              "gpu_ms": 11.618,
+              "printed_share_percent": 31.3
+            },
+            {
+              "name": "moe_expert_gguf_m8_a",
+              "count": 40.0,
+              "gpu_ms": 6.344,
+              "printed_share_percent": 17.1
+            },
+            {
+              "name": "gguf_decode_fused_m32",
+              "count": 40.0,
+              "gpu_ms": 3.904,
+              "printed_share_percent": 10.5
+            },
+            {
+              "name": "gguf_decode_q6k_m32_a_f32",
+              "count": 2.0,
+              "gpu_ms": 3.228,
+              "printed_share_percent": 8.7
+            },
+            {
+              "name": "gguf_decode_q6k_m32_r",
+              "count": 40.0,
+              "gpu_ms": 2.371,
+              "printed_share_percent": 6.4
+            },
+            {
+              "name": "verify_gdn_fused_vh32_f32",
+              "count": 30.0,
+              "gpu_ms": 2.082,
+              "printed_share_percent": 5.6
+            },
+            {
+              "name": "gguf_decode_af4g64_m32_a",
+              "count": 38.0,
+              "gpu_ms": 1.739,
+              "printed_share_percent": 4.7
+            },
+            {
+              "name": "verify_attention_q8_split_kv2_g8",
+              "count": 10.0,
+              "gpu_ms": 1.008,
+              "printed_share_percent": 2.7
+            },
+            {
+              "name": "draft_attention_bf16_split",
+              "count": 6.0,
+              "gpu_ms": 0.908,
+              "printed_share_percent": 2.4
+            },
+            {
+              "name": "gguf_float_f32",
+              "count": 40.0,
+              "gpu_ms": 0.548,
+              "printed_share_percent": 1.5
+            },
+            {
+              "name": "moe_gather_rows",
+              "count": 40.0,
+              "gpu_ms": 0.545,
+              "printed_share_percent": 1.5
+            },
+            {
+              "name": "gguf_decode_af4g64_m32_gate_up",
+              "count": 6.0,
+              "gpu_ms": 0.455,
+              "printed_share_percent": 1.2
+            },
+            {
+              "name": "gguf_float_bf16",
+              "count": 30.0,
+              "gpu_ms": 0.336,
+              "printed_share_percent": 0.9
+            },
+            {
+              "name": "moe_combine",
+              "count": 40.0,
+              "gpu_ms": 0.328,
+              "printed_share_percent": 0.9
+            },
+            {
+              "name": "verify_attention_reduce_kv2_g8",
+              "count": 10.0,
+              "gpu_ms": 0.311,
+              "printed_share_percent": 0.8
+            },
+            {
+              "name": "norm_rms_staged_f32",
+              "count": 81.0,
+              "gpu_ms": 0.262,
+              "printed_share_percent": 0.7
+            },
+            {
+              "name": "moe_route_select_f32",
+              "count": 40.0,
+              "gpu_ms": 0.248,
+              "printed_share_percent": 0.7
+            },
+            {
+              "name": "moe_group_routes",
+              "count": 40.0,
+              "gpu_ms": 0.177,
+              "printed_share_percent": 0.5
+            },
+            {
+              "name": "draft_select_top16_sharded",
+              "count": 1.0,
+              "gpu_ms": 0.146,
+              "printed_share_percent": 0.4
+            },
+            {
+              "name": "decode_sample_argmax_sharded",
+              "count": 1.0,
+              "gpu_ms": 0.095,
+              "printed_share_percent": 0.3
+            },
+            {
+              "name": "draft_conv_h2048",
+              "count": 24.0,
+              "gpu_ms": 0.088,
+              "printed_share_percent": 0.2
+            },
+            {
+              "name": "verify_attention_qkv_kv2_g8_f32",
+              "count": 10.0,
+              "gpu_ms": 0.066,
+              "printed_share_percent": 0.2
+            },
+            {
+              "name": "draft_attention_qkv",
+              "count": 6.0,
+              "gpu_ms": 0.055,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "verify_attention_q8_store_kv2_g8",
+              "count": 10.0,
+              "gpu_ms": 0.045,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "norm_rms_staged",
+              "count": 14.0,
+              "gpu_ms": 0.044,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "verify_attention_gate_kv2_g8",
+              "count": 10.0,
+              "gpu_ms": 0.042,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_attention_bf16_reduce",
+              "count": 6.0,
+              "gpu_ms": 0.039,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_context_kv_commit",
+              "count": 6.0,
+              "gpu_ms": 0.03,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "copy_rows_bf16",
+              "count": 8.0,
+              "gpu_ms": 0.027,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_attention_reorder",
+              "count": 6.0,
+              "gpu_ms": 0.017,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_select_edges",
+              "count": 1.0,
+              "gpu_ms": 0.013,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_select_dflash",
+              "count": 1.0,
+              "gpu_ms": 0.009,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "gguf_embed_q6k",
+              "count": 2.0,
+              "gpu_ms": 0.008,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "decode_accept_dflash",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "rope_build_tables",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "decode_sample_argmax_reduce",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "verify_input_tokens",
+              "count": 1.0,
+              "gpu_ms": 0.002,
+              "printed_share_percent": 0.0
+            }
+          ],
+          "serial_gpu_shares": {
+            "expert": 0.48349932705248994,
+            "other_linear": 0.3148586810228802,
+            "gdn": 0.05604306864064603,
+            "target_attention": 0.03962314939434724,
+            "other": 0.0709555854643338,
+            "routing": 0.03493943472409152
+          }
+        },
+        {
+          "width": 4,
+          "fused_gpu_ms": 42.49,
+          "serial_gpu_ms": 41.93,
+          "dispatches": 683,
+          "pipelines": [
+            {
+              "name": "moe_expert_gguf_m8_gate_up",
+              "count": 40.0,
+              "gpu_ms": 13.486,
+              "printed_share_percent": 32.2
+            },
+            {
+              "name": "moe_expert_gguf_m8_a",
+              "count": 40.0,
+              "gpu_ms": 7.354,
+              "printed_share_percent": 17.5
+            },
+            {
+              "name": "gguf_decode_fused_m32",
+              "count": 40.0,
+              "gpu_ms": 3.936,
+              "printed_share_percent": 9.4
+            },
+            {
+              "name": "gguf_decode_q6k_m32_a_f32",
+              "count": 2.0,
+              "gpu_ms": 3.257,
+              "printed_share_percent": 7.8
+            },
+            {
+              "name": "verify_gdn_fused_vh32_f32",
+              "count": 30.0,
+              "gpu_ms": 2.936,
+              "printed_share_percent": 7.0
+            },
+            {
+              "name": "gguf_decode_q6k_m32_r",
+              "count": 40.0,
+              "gpu_ms": 2.381,
+              "printed_share_percent": 5.7
+            },
+            {
+              "name": "gguf_decode_af4g64_m32_a",
+              "count": 38.0,
+              "gpu_ms": 1.726,
+              "printed_share_percent": 4.1
+            },
+            {
+              "name": "verify_attention_q8_split_kv2_g8",
+              "count": 10.0,
+              "gpu_ms": 1.247,
+              "printed_share_percent": 3.0
+            },
+            {
+              "name": "draft_attention_bf16_split",
+              "count": 6.0,
+              "gpu_ms": 1.178,
+              "printed_share_percent": 2.8
+            },
+            {
+              "name": "moe_gather_rows",
+              "count": 40.0,
+              "gpu_ms": 0.644,
+              "printed_share_percent": 1.5
+            },
+            {
+              "name": "gguf_float_f32",
+              "count": 40.0,
+              "gpu_ms": 0.597,
+              "printed_share_percent": 1.4
+            },
+            {
+              "name": "gguf_decode_af4g64_m32_gate_up",
+              "count": 6.0,
+              "gpu_ms": 0.452,
+              "printed_share_percent": 1.1
+            },
+            {
+              "name": "verify_attention_reduce_kv2_g8",
+              "count": 10.0,
+              "gpu_ms": 0.415,
+              "printed_share_percent": 1.0
+            },
+            {
+              "name": "gguf_float_bf16",
+              "count": 30.0,
+              "gpu_ms": 0.384,
+              "printed_share_percent": 0.9
+            },
+            {
+              "name": "moe_combine",
+              "count": 40.0,
+              "gpu_ms": 0.356,
+              "printed_share_percent": 0.8
+            },
+            {
+              "name": "norm_rms_staged_f32",
+              "count": 81.0,
+              "gpu_ms": 0.265,
+              "printed_share_percent": 0.6
+            },
+            {
+              "name": "moe_route_select_f32",
+              "count": 40.0,
+              "gpu_ms": 0.252,
+              "printed_share_percent": 0.6
+            },
+            {
+              "name": "moe_group_routes",
+              "count": 40.0,
+              "gpu_ms": 0.192,
+              "printed_share_percent": 0.5
+            },
+            {
+              "name": "draft_select_top16_sharded",
+              "count": 1.0,
+              "gpu_ms": 0.186,
+              "printed_share_percent": 0.4
+            },
+            {
+              "name": "decode_sample_argmax_sharded",
+              "count": 1.0,
+              "gpu_ms": 0.133,
+              "printed_share_percent": 0.3
+            },
+            {
+              "name": "draft_conv_h2048",
+              "count": 24.0,
+              "gpu_ms": 0.091,
+              "printed_share_percent": 0.2
+            },
+            {
+              "name": "verify_attention_qkv_kv2_g8_f32",
+              "count": 10.0,
+              "gpu_ms": 0.081,
+              "printed_share_percent": 0.2
+            },
+            {
+              "name": "draft_attention_qkv",
+              "count": 6.0,
+              "gpu_ms": 0.06,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "verify_attention_q8_store_kv2_g8",
+              "count": 10.0,
+              "gpu_ms": 0.056,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_attention_bf16_reduce",
+              "count": 6.0,
+              "gpu_ms": 0.048,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "norm_rms_staged",
+              "count": 14.0,
+              "gpu_ms": 0.047,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "verify_attention_gate_kv2_g8",
+              "count": 10.0,
+              "gpu_ms": 0.046,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_context_kv_commit",
+              "count": 6.0,
+              "gpu_ms": 0.032,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "copy_rows_bf16",
+              "count": 8.0,
+              "gpu_ms": 0.029,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_attention_reorder",
+              "count": 6.0,
+              "gpu_ms": 0.018,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_select_edges",
+              "count": 1.0,
+              "gpu_ms": 0.014,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_select_dflash",
+              "count": 1.0,
+              "gpu_ms": 0.009,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "gguf_embed_q6k",
+              "count": 2.0,
+              "gpu_ms": 0.009,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "rope_build_tables",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "decode_accept_dflash",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "decode_sample_argmax_reduce",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "verify_input_tokens",
+              "count": 1.0,
+              "gpu_ms": 0.002,
+              "printed_share_percent": 0.0
+            }
+          ],
+          "serial_gpu_shares": {
+            "expert": 0.49701884092535176,
+            "other_linear": 0.2802766515621274,
+            "gdn": 0.07002146434533747,
+            "target_attention": 0.04400190794180778,
+            "other": 0.07419508704984497,
+            "routing": 0.034438349630336276
+          }
+        }
+      ]
+    },
+    {
+      "model": "dense",
+      "source_log_sha256": "0e8e1af097d195425f80d92d50bb71a0a7f5df804445008fe0e2a607ed56c110",
+      "widths": [
+        {
+          "width": 1,
+          "fused_gpu_ms": 69.33,
+          "serial_gpu_ms": 70.2,
+          "dispatches": 624,
+          "pipelines": [
+            {
+              "name": "gguf_decode_af4g64_m8_gate_up",
+              "count": 69.0,
+              "gpu_ms": 27.007,
+              "printed_share_percent": 38.5
+            },
+            {
+              "name": "gguf_decode_af4g64_m8_r",
+              "count": 128.0,
+              "gpu_ms": 17.384,
+              "printed_share_percent": 24.8
+            },
+            {
+              "name": "gguf_decode_fused_m8",
+              "count": 64.0,
+              "gpu_ms": 13.19,
+              "printed_share_percent": 18.8
+            },
+            {
+              "name": "gguf_decode_af4g64_m8_a_f32",
+              "count": 2.0,
+              "gpu_ms": 5.135,
+              "printed_share_percent": 7.3
+            },
+            {
+              "name": "gguf_decode_af4g64_m8_a",
+              "count": 32.0,
+              "gpu_ms": 2.403,
+              "printed_share_percent": 3.4
+            },
+            {
+              "name": "verify_gdn_fused",
+              "count": 48.0,
+              "gpu_ms": 1.935,
+              "printed_share_percent": 2.8
+            },
+            {
+              "name": "norm_rms",
+              "count": 141.0,
+              "gpu_ms": 1.063,
+              "printed_share_percent": 1.5
+            },
+            {
+              "name": "verify_attention_q8_split",
+              "count": 16.0,
+              "gpu_ms": 1.0,
+              "printed_share_percent": 1.4
+            },
+            {
+              "name": "draft_attention_bf16_split",
+              "count": 5.0,
+              "gpu_ms": 0.282,
+              "printed_share_percent": 0.4
+            },
+            {
+              "name": "verify_attention_reduce",
+              "count": 16.0,
+              "gpu_ms": 0.26,
+              "printed_share_percent": 0.4
+            },
+            {
+              "name": "verify_attention_qkv",
+              "count": 16.0,
+              "gpu_ms": 0.096,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_conv",
+              "count": 20.0,
+              "gpu_ms": 0.09,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "verify_attention_q8_store",
+              "count": 16.0,
+              "gpu_ms": 0.068,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "verify_attention_gate",
+              "count": 16.0,
+              "gpu_ms": 0.063,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_select_top16_sharded",
+              "count": 1.0,
+              "gpu_ms": 0.057,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "decode_sample_argmax_sharded",
+              "count": 1.0,
+              "gpu_ms": 0.031,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_attention_qkv",
+              "count": 5.0,
+              "gpu_ms": 0.026,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "copy_rows_bf16",
+              "count": 5.0,
+              "gpu_ms": 0.019,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_attention_bf16_reduce",
+              "count": 5.0,
+              "gpu_ms": 0.019,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_context_kv_commit",
+              "count": 5.0,
+              "gpu_ms": 0.016,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_attention_reorder",
+              "count": 5.0,
+              "gpu_ms": 0.014,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "gguf_embed_af4g64",
+              "count": 2.0,
+              "gpu_ms": 0.013,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_select_edges",
+              "count": 1.0,
+              "gpu_ms": 0.013,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_select_dflash",
+              "count": 1.0,
+              "gpu_ms": 0.009,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "decode_accept_dflash",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "rope_build_tables",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "decode_sample_argmax_reduce",
+              "count": 1.0,
+              "gpu_ms": 0.002,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "verify_input_tokens",
+              "count": 1.0,
+              "gpu_ms": 0.002,
+              "printed_share_percent": 0.0
+            }
+          ],
+          "serial_gpu_shares": {
+            "other_linear": 0.9276210826210826,
+            "gdn": 0.027564102564102563,
+            "other": 0.023675213675213663,
+            "target_attention": 0.021182336182336184
+          }
+        },
+        {
+          "width": 2,
+          "fused_gpu_ms": 74.07,
+          "serial_gpu_ms": 72.9,
+          "dispatches": 624,
+          "pipelines": [
+            {
+              "name": "gguf_decode_af4g64_m16_gate_up",
+              "count": 69.0,
+              "gpu_ms": 25.907,
+              "printed_share_percent": 35.5
+            },
+            {
+              "name": "gguf_decode_af4g64_m16_r",
+              "count": 128.0,
+              "gpu_ms": 18.472,
+              "printed_share_percent": 25.3
+            },
+            {
+              "name": "gguf_decode_fused_m16",
+              "count": 64.0,
+              "gpu_ms": 13.002,
+              "printed_share_percent": 17.8
+            },
+            {
+              "name": "gguf_decode_af4g64_m16_a_f32",
+              "count": 2.0,
+              "gpu_ms": 5.102,
+              "printed_share_percent": 7.0
+            },
+            {
+              "name": "verify_gdn_fused",
+              "count": 48.0,
+              "gpu_ms": 3.324,
+              "printed_share_percent": 4.6
+            },
+            {
+              "name": "gguf_decode_af4g64_m16_a",
+              "count": 32.0,
+              "gpu_ms": 2.599,
+              "printed_share_percent": 3.6
+            },
+            {
+              "name": "verify_attention_q8_split",
+              "count": 16.0,
+              "gpu_ms": 1.688,
+              "printed_share_percent": 2.3
+            },
+            {
+              "name": "norm_rms",
+              "count": 141.0,
+              "gpu_ms": 1.055,
+              "printed_share_percent": 1.4
+            },
+            {
+              "name": "draft_attention_bf16_split",
+              "count": 5.0,
+              "gpu_ms": 0.535,
+              "printed_share_percent": 0.7
+            },
+            {
+              "name": "verify_attention_reduce",
+              "count": 16.0,
+              "gpu_ms": 0.524,
+              "printed_share_percent": 0.7
+            },
+            {
+              "name": "verify_attention_qkv",
+              "count": 16.0,
+              "gpu_ms": 0.128,
+              "printed_share_percent": 0.2
+            },
+            {
+              "name": "draft_select_top16_sharded",
+              "count": 1.0,
+              "gpu_ms": 0.105,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_conv",
+              "count": 20.0,
+              "gpu_ms": 0.094,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "verify_attention_q8_store",
+              "count": 16.0,
+              "gpu_ms": 0.081,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "verify_attention_gate",
+              "count": 16.0,
+              "gpu_ms": 0.073,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "decode_sample_argmax_sharded",
+              "count": 1.0,
+              "gpu_ms": 0.061,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_attention_qkv",
+              "count": 5.0,
+              "gpu_ms": 0.032,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_attention_bf16_reduce",
+              "count": 5.0,
+              "gpu_ms": 0.025,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_context_kv_commit",
+              "count": 5.0,
+              "gpu_ms": 0.019,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "copy_rows_bf16",
+              "count": 5.0,
+              "gpu_ms": 0.018,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_attention_reorder",
+              "count": 5.0,
+              "gpu_ms": 0.014,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_select_edges",
+              "count": 1.0,
+              "gpu_ms": 0.013,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_select_dflash",
+              "count": 1.0,
+              "gpu_ms": 0.009,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "gguf_embed_af4g64",
+              "count": 2.0,
+              "gpu_ms": 0.009,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "rope_build_tables",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "decode_accept_dflash",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "decode_sample_argmax_reduce",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "verify_input_tokens",
+              "count": 1.0,
+              "gpu_ms": 0.002,
+              "printed_share_percent": 0.0
+            }
+          ],
+          "serial_gpu_shares": {
+            "other_linear": 0.8927572016460906,
+            "gdn": 0.045596707818930035,
+            "target_attention": 0.034211248285322356,
+            "other": 0.02743484224965705
+          }
+        },
+        {
+          "width": 3,
+          "fused_gpu_ms": 85.1,
+          "serial_gpu_ms": 84.01,
+          "dispatches": 624,
+          "pipelines": [
+            {
+              "name": "gguf_decode_af4g64_m32_gate_up",
+              "count": 69.0,
+              "gpu_ms": 29.281,
+              "printed_share_percent": 34.9
+            },
+            {
+              "name": "gguf_decode_af4g64_m32_r",
+              "count": 128.0,
+              "gpu_ms": 21.13,
+              "printed_share_percent": 25.2
+            },
+            {
+              "name": "gguf_decode_fused_m32",
+              "count": 64.0,
+              "gpu_ms": 14.236,
+              "printed_share_percent": 16.9
+            },
+            {
+              "name": "gguf_decode_af4g64_m32_a_f32",
+              "count": 2.0,
+              "gpu_ms": 5.581,
+              "printed_share_percent": 6.6
+            },
+            {
+              "name": "verify_gdn_fused",
+              "count": 48.0,
+              "gpu_ms": 4.99,
+              "printed_share_percent": 5.9
+            },
+            {
+              "name": "gguf_decode_af4g64_m32_a",
+              "count": 32.0,
+              "gpu_ms": 3.174,
+              "printed_share_percent": 3.8
+            },
+            {
+              "name": "verify_attention_q8_split",
+              "count": 16.0,
+              "gpu_ms": 2.145,
+              "printed_share_percent": 2.6
+            },
+            {
+              "name": "norm_rms",
+              "count": 141.0,
+              "gpu_ms": 1.051,
+              "printed_share_percent": 1.3
+            },
+            {
+              "name": "verify_attention_reduce",
+              "count": 16.0,
+              "gpu_ms": 0.753,
+              "printed_share_percent": 0.9
+            },
+            {
+              "name": "draft_attention_bf16_split",
+              "count": 5.0,
+              "gpu_ms": 0.725,
+              "printed_share_percent": 0.9
+            },
+            {
+              "name": "verify_attention_q8_store",
+              "count": 16.0,
+              "gpu_ms": 0.182,
+              "printed_share_percent": 0.2
+            },
+            {
+              "name": "verify_attention_qkv",
+              "count": 16.0,
+              "gpu_ms": 0.168,
+              "printed_share_percent": 0.2
+            },
+            {
+              "name": "draft_select_top16_sharded",
+              "count": 1.0,
+              "gpu_ms": 0.147,
+              "printed_share_percent": 0.2
+            },
+            {
+              "name": "draft_conv",
+              "count": 20.0,
+              "gpu_ms": 0.101,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "decode_sample_argmax_sharded",
+              "count": 1.0,
+              "gpu_ms": 0.094,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "verify_attention_gate",
+              "count": 16.0,
+              "gpu_ms": 0.083,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_attention_qkv",
+              "count": 5.0,
+              "gpu_ms": 0.04,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_attention_bf16_reduce",
+              "count": 5.0,
+              "gpu_ms": 0.032,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_context_kv_commit",
+              "count": 5.0,
+              "gpu_ms": 0.022,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "copy_rows_bf16",
+              "count": 5.0,
+              "gpu_ms": 0.02,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_attention_reorder",
+              "count": 5.0,
+              "gpu_ms": 0.015,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_select_edges",
+              "count": 1.0,
+              "gpu_ms": 0.014,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "gguf_embed_af4g64",
+              "count": 2.0,
+              "gpu_ms": 0.01,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_select_dflash",
+              "count": 1.0,
+              "gpu_ms": 0.009,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "decode_accept_dflash",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "rope_build_tables",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "decode_sample_argmax_reduce",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "verify_input_tokens",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            }
+          ],
+          "serial_gpu_shares": {
+            "other_linear": 0.8737293179383409,
+            "gdn": 0.05939769075110106,
+            "target_attention": 0.03965004166170694,
+            "other": 0.027282466373050825
+          }
+        },
+        {
+          "width": 4,
+          "fused_gpu_ms": 87.12,
+          "serial_gpu_ms": 86.81,
+          "dispatches": 624,
+          "pipelines": [
+            {
+              "name": "gguf_decode_af4g64_m32_gate_up",
+              "count": 69.0,
+              "gpu_ms": 29.362,
+              "printed_share_percent": 33.8
+            },
+            {
+              "name": "gguf_decode_af4g64_m32_r",
+              "count": 128.0,
+              "gpu_ms": 21.265,
+              "printed_share_percent": 24.5
+            },
+            {
+              "name": "gguf_decode_fused_m32",
+              "count": 64.0,
+              "gpu_ms": 14.256,
+              "printed_share_percent": 16.4
+            },
+            {
+              "name": "verify_gdn_fused",
+              "count": 48.0,
+              "gpu_ms": 6.167,
+              "printed_share_percent": 7.1
+            },
+            {
+              "name": "gguf_decode_af4g64_m32_a_f32",
+              "count": 2.0,
+              "gpu_ms": 5.616,
+              "printed_share_percent": 6.5
+            },
+            {
+              "name": "gguf_decode_af4g64_m32_a",
+              "count": 32.0,
+              "gpu_ms": 3.195,
+              "printed_share_percent": 3.7
+            },
+            {
+              "name": "verify_attention_q8_split",
+              "count": 16.0,
+              "gpu_ms": 2.79,
+              "printed_share_percent": 3.2
+            },
+            {
+              "name": "verify_attention_reduce",
+              "count": 16.0,
+              "gpu_ms": 1.087,
+              "printed_share_percent": 1.3
+            },
+            {
+              "name": "norm_rms",
+              "count": 141.0,
+              "gpu_ms": 1.065,
+              "printed_share_percent": 1.2
+            },
+            {
+              "name": "draft_attention_bf16_split",
+              "count": 5.0,
+              "gpu_ms": 0.969,
+              "printed_share_percent": 1.1
+            },
+            {
+              "name": "verify_attention_qkv",
+              "count": 16.0,
+              "gpu_ms": 0.206,
+              "printed_share_percent": 0.2
+            },
+            {
+              "name": "draft_select_top16_sharded",
+              "count": 1.0,
+              "gpu_ms": 0.179,
+              "printed_share_percent": 0.2
+            },
+            {
+              "name": "decode_sample_argmax_sharded",
+              "count": 1.0,
+              "gpu_ms": 0.125,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "verify_attention_q8_store",
+              "count": 16.0,
+              "gpu_ms": 0.119,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_conv",
+              "count": 20.0,
+              "gpu_ms": 0.115,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "verify_attention_gate",
+              "count": 16.0,
+              "gpu_ms": 0.097,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_attention_qkv",
+              "count": 5.0,
+              "gpu_ms": 0.048,
+              "printed_share_percent": 0.1
+            },
+            {
+              "name": "draft_attention_bf16_reduce",
+              "count": 5.0,
+              "gpu_ms": 0.04,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_context_kv_commit",
+              "count": 5.0,
+              "gpu_ms": 0.023,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "copy_rows_bf16",
+              "count": 5.0,
+              "gpu_ms": 0.023,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_attention_reorder",
+              "count": 5.0,
+              "gpu_ms": 0.015,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_select_edges",
+              "count": 1.0,
+              "gpu_ms": 0.014,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "gguf_embed_af4g64",
+              "count": 2.0,
+              "gpu_ms": 0.011,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "draft_select_dflash",
+              "count": 1.0,
+              "gpu_ms": 0.009,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "rope_build_tables",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "decode_accept_dflash",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "decode_sample_argmax_reduce",
+              "count": 1.0,
+              "gpu_ms": 0.003,
+              "printed_share_percent": 0.0
+            },
+            {
+              "name": "verify_input_tokens",
+              "count": 1.0,
+              "gpu_ms": 0.002,
+              "printed_share_percent": 0.0
+            }
+          ],
+          "serial_gpu_shares": {
+            "other_linear": 0.8489114157355142,
+            "gdn": 0.07104020274161962,
+            "target_attention": 0.04952194447644281,
+            "other": 0.030491878815804632
+          }
+        }
+      ]
+    }
+  ]
+}
