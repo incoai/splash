@@ -70,7 +70,9 @@ int main() {
     test::requirePenaltyLogits(infinite, infinite, seen, noOutput, {}, 0);
     const std::array<float, 2> saturated{std::numeric_limits<float>::max(), 1.0F};
     test::requirePenaltyLogits(infinite, saturated, seen, noOutput, {2.0F, 0.0F, 0.0F}, 0);
-    test::requirePenaltyLogits(infinite, saturated, seen, noOutput, {1.0F, 1.5F, 0.0F}, 0);
+    // Prompt bits are stored only when repetition is active; presence alone
+    // does not rewrite a prompt-only token, including a positive infinity.
+    test::requirePenaltyLogits(infinite, infinite, seen, noOutput, {1.0F, 1.5F, 0.0F}, 0);
     std::cout << "penalty oracle tests passed\n";
     return 0;
   } catch (const std::exception &error) {

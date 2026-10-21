@@ -37,7 +37,7 @@ inline double requirePenaltyLogits(std::span<const float> raw,
       continue;
     }
     const bool applies = penalties.active() &&
-        (counts[token] || prompt[token]);
+        (counts[token] || (prompt[token] && penalties.repetition != 1.0F));
     if (input == std::numeric_limits<float>::infinity()) {
       const float expected = applies ? std::numeric_limits<float>::max() : input;
       if (output != expected)
