@@ -44,6 +44,7 @@ using splash::metal::BytesBinding;
 using splash::metal::Command;
 using splash::metal::CommandTicket;
 using splash::metal::CommandTiming;
+using splash::metal::DispatchSize;
 using splash::metal::ComputeDispatch;
 using splash::metal::EventStep;
 using splash::metal::HostStepGpu;
@@ -1241,6 +1242,28 @@ void indirectGridsRunTheWrittenGrid(MetalBackend &backend) {
     }
 }
 
+// An exact grid runs that many threads, Metal trimming the last
+// threadgroup, where whole threadgroups would run them all; it does not
+// combine with an indirect grid.
+void exactGridsTrimTheLastThreadgroup(MetalBackend &backend) {
+    constexpr uint32_t kWords = 8, increment = 1;
+    MetalBuffer values = sharedBuffer(backend, kWords * sizeof(uint32_t));
+    std::fill_n(static_cast<uint32_t *>(values.contents()), kWords, 0u);
+    ComputeDispatch add{"test_add_u32", {{0, values}},
+        {{1, &kWords, sizeof(kWords)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {4, 1, 1}};
+    add.gridThreads = DispatchSize{5, 1, 1};
+    (void)backend.submit(add);
+    const auto *out = static_cast<const uint32_t *>(values.contents());
+    for (uint32_t word = 0; word < kWords; ++word) {
+        require(out[word] == (word < 5 ? increment : 0),
+                "an exact grid ran another number of threads");
+    }
+    add.indirectThreadgroups = {values, 0};
+    rejects([&] { (void)backend.submit(add); }, "an indirect grid and an exact one",
+            "a dispatch with an indirect and an exact grid was accepted");
+}
+
 // Released memory leaves the residency set and the accounting while the
 // buffer's views stay handles that no command may bind; a restore gives the
 // buffer memory again, which commands use as before. Only whole buffers with
@@ -2382,6 +2405,7 @@ void run(const std::string &metallibPath) {
 
     bindingRunsKeepOffsets(backend);
     indirectGridsRunTheWrittenGrid(backend);
+    exactGridsTrimTheLastThreadgroup(backend);
     require(capabilities.gpuCoreCount >= 1 && capabilities.gpuCoreCount <= 4096,
             "GPU core count was not read from the IORegistry");
     require(capabilities.meetsMinimumMacos(),
