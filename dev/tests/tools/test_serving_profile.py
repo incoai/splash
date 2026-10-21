@@ -111,6 +111,31 @@ class TraceReportTests(unittest.TestCase):
 
 
 class PairedServingTests(unittest.TestCase):
+    def test_suspend_is_rejected_even_when_abba_costs_could_be_stable(self):
+        report = {
+            "environment": {"unix_seconds": 100, "awake_seconds": 20},
+            "final_environment": {"unix_seconds": 110, "awake_seconds": 30},
+        }
+        serving_regression.validate_awake_period(report)
+        report["final_environment"]["unix_seconds"] += 600
+        with self.assertRaisesRegex(serving_regression.smoke.SmokeFailure, "suspend"):
+            serving_regression.validate_awake_period(report)
+        self.assertEqual(report["unaccounted_wall_seconds"], 600)
+
+    def test_sleep_assertion_is_released_on_failure(self):
+        from unittest.mock import Mock
+
+        keeper = Mock()
+        with (
+            patch.object(serving_regression.sys, "platform", "darwin"),
+            patch.object(serving_regression.subprocess, "Popen", return_value=keeper),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "workload failed"):
+                with serving_regression.keep_awake():
+                    raise RuntimeError("workload failed")
+        keeper.terminate.assert_called_once()
+        keeper.wait.assert_called_once_with(timeout=5)
+
     def test_mixed_stream_refuses_a_short_output_budget(self):
         import argparse
         import json
@@ -283,7 +308,11 @@ class PairedServingTests(unittest.TestCase):
                 startup_timeout=1,
                 batch=1,
             )
-            report = {"initial_status": [], "complete": False}
+            report = {
+                "initial_status": [],
+                "complete": False,
+                "environment": {"unix_seconds": 100, "awake_seconds": 20},
+            }
             case = {
                 "context": 2048,
                 "workload": "code",
@@ -298,7 +327,11 @@ class PairedServingTests(unittest.TestCase):
                 patch.object(serving_regression.smoke, "RealServer", Server),
                 patch.object(serving_regression, "warm_servers", return_value={}),
                 patch.object(serving_regression, "status", return_value={}),
-                patch.object(serving_regression, "environment", return_value={}),
+                patch.object(
+                    serving_regression,
+                    "environment",
+                    return_value={"unix_seconds": 100, "awake_seconds": 20},
+                ),
                 patch.object(
                     serving_regression,
                     "measure_case",
