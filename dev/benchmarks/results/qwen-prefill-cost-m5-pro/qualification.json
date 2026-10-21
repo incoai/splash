@@ -1,5 +1,5 @@
 {
-  "complete": false,
+  "complete": true,
   "implementation_commit": "02a1162e",
   "traces": [
     {
@@ -21,7 +21,15 @@
   ],
   "cpu_and_existing_sanitizers": "PASS",
   "focused_engine_native_scheduler": "PASS",
-  "dedicated_scheduler_sanitizers": "pending; targets added after frozen build",
-  "latency_gate": "pending; no serving gain claimed",
-  "other_hardware": "unexecuted"
+  "dedicated_scheduler_sanitizers": "PASS: ASAN/UBSAN and TSAN, exit 0",
+  "latency_gate": "FAIL: MoE 2k maximum stream-gap regressions 41.4\u201345.0%; keep baseline",
+  "other_hardware": "unexecuted",
+  "production_serving_complete": true,
+  "production_trials": 30,
+  "pending": "Current-main validation is separate; other hardware remains unexecuted",
+  "local_experiment_complete": true,
+  "trace_series": 3,
+  "validated_trace_rounds": 12,
+  "trace_status": "PASS: complete MoE-long, MoE-2k and dense repeat; zero dropped events; original interrupted dense capture excluded",
+  "archive_integrity": "PASS: all six full cleaned report archives hash and round-trip exactly after the documented array reduction"
 }

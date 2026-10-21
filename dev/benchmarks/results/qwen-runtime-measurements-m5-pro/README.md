@@ -48,4 +48,17 @@ scopes overlap, ANE ready/report spans are host notifications, and GPU command
 spans can include event waits. Do not sum those phase medians or mix their
 percentages with this serial replay table. The dense dual-server trace's
 serialized admission is excluded from contended-latency claims; an awake,
-single-resident ANE contention trace is queued separately.
+single-resident ANE trace is complete; see the [timeline bundle](../qwen-serving-timeline-m5-pro/README.md) and [prefill-path analysis](../qwen-prefill-cost-m5-pro/trace-analysis.json) for the distinction between uncontended handoffs and contended GPU-only chunks.
+
+## Legacy tool validation follow-up
+
+`python-validation.json` distinguishes full-suite results from setup failures.
+The first broad follow-up attempt ran 1,298 tests with 27 skips and one failure:
+the private benchmark driver inherited `HF_HUB_OFFLINE=1` into installer tests,
+bypassing a mocked Hub-resolution path. `excluded-python-offline.log` preserves
+that attempt. The isolated fixture passes with the benchmark-only variable
+removed. The full `env -u HF_HUB_OFFLINE make check-python` rerun now passes:
+**1,298 tests, 27 skips**, compileall, Ruff lint and formatting (176 files).
+`legacy-python-check.log` preserves the corrected complete run.
+Current-main full checks are recorded in their own bundle and use that corrected
+environment. Production benchmark runs still intentionally remain offline.

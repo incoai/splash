@@ -36,6 +36,8 @@ def main():
         raise ValueError("expected the frozen expanded GGUF report's three cases")
 
     def cases(args, tokenizer):
+        if args.tokens != original["settings"]["tokens"]:
+            raise ValueError("output budget differs from the source report")
         for case in selected:
             hashes = case["prompt_sha256"]
             if args.batch != len(hashes):
@@ -62,6 +64,16 @@ def main():
     serving.case_specs = cases
     sys.argv = [sys.argv[0], *remainder]
     serving.main()
+    destination = Path(remainder[remainder.index("--output") + 1]) / "report.json"
+    result = json.loads(destination.read_text())
+    result["exact_prompt_replay"] = {
+        "portable_source_sha256": hashlib.sha256(
+            own.source_report.read_bytes()
+        ).hexdigest(),
+        "driver_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "note": "The recorded three cases, not the Cartesian CLI grid, are authoritative.",
+    }
+    destination.write_text(json.dumps(result, indent=2) + "\n")
 
 
 if __name__ == "__main__":

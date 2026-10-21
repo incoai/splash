@@ -1,0 +1,99 @@
+[
+  {
+    "displayTimeUnit": "ms",
+    "excerpt": true,
+    "source_trace_sha256": "d77b35fe468abe6f4b3d69660c4a8b743e2b74c6972c71bd8f5829eb88f01921",
+    "runtime_revision": "02a1162e",
+    "source_filename": "replay/prefill-2k-regression-trace/round-2-trace.json",
+    "source_interval_us": [
+      22657549.2920063,
+      24857549.2920063
+    ],
+    "clipped_events": 8,
+    "source_completion_validated": true,
+    "source_dropped_host_events": 0,
+    "source_dropped_commands": 0,
+    "source_exit_status": 0,
+    "note": "Display-only window with timestamps rebased and crossing events clipped. Not a complete workload and not input for performance aggregates. ANE events are host notifications, not hardware timestamps.",
+    "artifact": "moe-2k.trace.json",
+    "events": 955
+  },
+  {
+    "displayTimeUnit": "ms",
+    "excerpt": true,
+    "source_trace_sha256": "e54472e1477c4585a57e7c81ba2551e74e6e2eaf15117736417414922e8ca162",
+    "runtime_revision": "02a1162e",
+    "source_filename": "postqueue/prefill-policy-trace/round-1-trace.json",
+    "source_interval_us": [
+      23702827.666985102,
+      25902827.666985102
+    ],
+    "clipped_events": 8,
+    "source_completion_validated": true,
+    "source_dropped_host_events": 0,
+    "source_dropped_commands": 0,
+    "source_exit_status": 0,
+    "note": "Display-only window with timestamps rebased and crossing events clipped. Not a complete workload and not input for performance aggregates. ANE events are host notifications, not hardware timestamps.",
+    "artifact": "moe.trace.json",
+    "events": 639
+  },
+  {
+    "displayTimeUnit": "ms",
+    "excerpt": true,
+    "source_trace_sha256": "417b640a434277448d82ed26835998ef217bfc0aa1448610c2eda22ffbec8885",
+    "runtime_revision": "02a1162e",
+    "source_filename": "replay/dense-native-contention-repeat/round-1-trace.json",
+    "source_interval_us": [
+      62245034.083008066,
+      64445034.083008066
+    ],
+    "clipped_events": 7,
+    "source_completion_validated": true,
+    "source_dropped_host_events": 0,
+    "source_dropped_commands": 0,
+    "source_exit_status": 0,
+    "note": "Display-only window with timestamps rebased and crossing events clipped. Not a complete workload and not input for performance aggregates. ANE events are host notifications, not hardware timestamps.",
+    "artifact": "dense.trace.json",
+    "events": 343
+  },
+  {
+    "displayTimeUnit": "ms",
+    "excerpt": true,
+    "source_trace_sha256": "417b640a434277448d82ed26835998ef217bfc0aa1448610c2eda22ffbec8885",
+    "runtime_revision": "02a1162e",
+    "source_filename": "replay/dense-native-contention-repeat/round-1-trace.json",
+    "source_interval_us": [
+      11609414.417017251,
+      14850341.45800746
+    ],
+    "clipped_events": 3,
+    "source_completion_validated": true,
+    "source_dropped_host_events": 0,
+    "source_dropped_commands": 0,
+    "source_exit_status": 0,
+    "note": "Display-only window with timestamps rebased and crossing events clipped. Not a complete workload and not input for performance aggregates. ANE events are host notifications, not hardware timestamps.",
+    "artifact": "dense-ane.trace.json",
+    "events": 286
+  },
+  {
+    "displayTimeUnit": "ms",
+    "excerpt": true,
+    "source_trace_sha256": "9c4a883c55b8e4049b26cb6b92f9f86a941a51c0274815fd43182a883c2c45b9",
+    "runtime_revision": "bc09da81",
+    "source_filename": "trace-final-contracts/server-1-trace.json",
+    "source_interval_us": [
+      15391986.12500797,
+      15596986.12500797
+    ],
+    "clipped_events": 5,
+    "source_completion_validated": true,
+    "source_dropped_host_events": 0,
+    "source_dropped_commands": 0,
+    "source_exit_status": 0,
+    "note": "Display-only window with timestamps rebased and crossing events clipped. Not a complete workload and not input for performance aggregates. ANE events are host notifications, not hardware timestamps.",
+    "full_source_archive": "masks.full.trace.json.gz",
+    "archive_sha256": "824fe29c636436bdf61a0cd7eb1e0288a1f3f17b57d616a37397e0314d18ff2e",
+    "artifact": "masks.trace.json",
+    "events": 474
+  }
+]

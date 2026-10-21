@@ -1,0 +1,43 @@
+{
+  "legacy_full_python_check": "PASS",
+  "excluded_attempt": {
+    "tests": 1298,
+    "skipped": 27,
+    "failures": 1,
+    "reason": "Driver injected HF_HUB_OFFLINE=1, bypassing the mocked Hub resolution in test_the_hub_must_resolve_a_commit.",
+    "source_log_sha256": "33dded31c8ce3d8b71b7eefa968fc2ab80f36a66890d830be381259d11391990",
+    "log": "excluded-python-offline.log"
+  },
+  "isolated_confirmation": {
+    "command": [
+      "env",
+      "-u",
+      "HF_HUB_OFFLINE",
+      ".venv/bin/python",
+      "-m",
+      "unittest",
+      "dev.tests.install.test_models.InstallerTest.test_the_hub_must_resolve_a_commit"
+    ],
+    "exit_status": 0,
+    "tests": 1
+  },
+  "corrected_command": [
+    "env",
+    "-u",
+    "HF_HUB_OFFLINE",
+    "make",
+    "check-python"
+  ],
+  "note": "Historical root checkout validation; not a current-main full Python result. Current-main broad checks run separately with this setting removed.",
+  "corrected_result": {
+    "exit_status": 0,
+    "tests": 1298,
+    "skipped": 27,
+    "seconds": 497.667,
+    "compileall": "PASS",
+    "ruff_lint": "PASS",
+    "ruff_format": "PASS (176 files)",
+    "log": "legacy-python-check.log",
+    "source_log_sha256": "3452509ca850b0a108c36a45db32daae048092840b45e849c950383cbc1fbf97"
+  }
+}

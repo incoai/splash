@@ -1,0 +1,163 @@
+{
+  "runtime_base": "1482f6bbc2abf12375332725302019594150b6cb",
+  "complete": false,
+  "jobs": [
+    {
+      "name": "current-build",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "current-cpu-sanitizers",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "current-python-check",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "moe-gguf-oracle-int8-fp32",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "moe-gguf-oracle-int8-bf16",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "moe-gguf-oracle-bf16-fp32",
+      "status": "fail",
+      "exit_status": 1
+    },
+    {
+      "name": "moe-gguf-oracle-bf16-bf16",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "moe-mlx-oracle-int8-fp32",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "moe-mlx-oracle-int8-bf16",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "moe-mlx-oracle-bf16-fp32",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "moe-mlx-oracle-bf16-bf16",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "dense-mlx-oracle-int8-fp32",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "dense-mlx-oracle-int8-bf16",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "dense-mlx-oracle-bf16-fp32",
+      "status": "pass",
+      "exit_status": 0
+    },
+    {
+      "name": "dense-mlx-oracle-bf16-bf16",
+      "status": "running",
+      "exit_status": null
+    }
+  ],
+  "oracles": [
+    {
+      "name": "moe-gguf-oracle-int8-fp32",
+      "status": "pass",
+      "pass_marker": true,
+      "log": "moe-gguf-oracle-int8-fp32.log",
+      "source_log_sha256": "996f5282587e3d4798c795d0709cefe576f9821a6cf2da86656e047647d4f45f"
+    },
+    {
+      "name": "moe-gguf-oracle-int8-bf16",
+      "status": "pass",
+      "pass_marker": true,
+      "log": "moe-gguf-oracle-int8-bf16.log",
+      "source_log_sha256": "12df659b71cac2490c7acd8d2f43151408230387ff68c52ce13691a495fb7fd9"
+    },
+    {
+      "name": "moe-gguf-oracle-bf16-fp32",
+      "status": "fail",
+      "pass_marker": false,
+      "log": "moe-gguf-oracle-bf16-fp32.log",
+      "source_log_sha256": "80e3be183c9f6badd451618dd2b62e37de41be40d88d35dee6211ab0edcb39e3"
+    },
+    {
+      "name": "moe-gguf-oracle-bf16-bf16",
+      "status": "pass",
+      "pass_marker": true,
+      "log": "moe-gguf-oracle-bf16-bf16.log",
+      "source_log_sha256": "bb47969bd3a5d9a08ebcd4a8edd305ba4562a2083271980a8df17de69c373a37"
+    },
+    {
+      "name": "moe-mlx-oracle-int8-fp32",
+      "status": "pass",
+      "pass_marker": true,
+      "log": "moe-mlx-oracle-int8-fp32.log",
+      "source_log_sha256": "805ccadd66a71ce7ae1f9b2de449bb8c84098a9f130747cc1df69a3a24315a06"
+    },
+    {
+      "name": "moe-mlx-oracle-int8-bf16",
+      "status": "pass",
+      "pass_marker": true,
+      "log": "moe-mlx-oracle-int8-bf16.log",
+      "source_log_sha256": "076a6d19decb1e7a333bcdc0138083c5d921072cb075b964bbe2fcb88b50ac7c"
+    },
+    {
+      "name": "moe-mlx-oracle-bf16-fp32",
+      "status": "pass",
+      "pass_marker": true,
+      "log": "moe-mlx-oracle-bf16-fp32.log",
+      "source_log_sha256": "d60d8a06c55094b4af89af6d78b0d028e3e69886f5ac588ad4706485ae519f3d"
+    },
+    {
+      "name": "moe-mlx-oracle-bf16-bf16",
+      "status": "pass",
+      "pass_marker": true,
+      "log": "moe-mlx-oracle-bf16-bf16.log",
+      "source_log_sha256": "f960f10ff63d8c5b087dfa9965e3d22f871d068cf6028d4afc415b1576ee3c40"
+    },
+    {
+      "name": "dense-mlx-oracle-int8-fp32",
+      "status": "pass",
+      "pass_marker": true,
+      "log": "dense-mlx-oracle-int8-fp32.log",
+      "source_log_sha256": "e5bdb7dabc6d4186546538ab8304999744ceb18bc92f5da13b31f9256a1e116d"
+    },
+    {
+      "name": "dense-mlx-oracle-int8-bf16",
+      "status": "pass",
+      "pass_marker": true,
+      "log": "dense-mlx-oracle-int8-bf16.log",
+      "source_log_sha256": "2fc64e76482252f1150eaa12c6fdd22e9a101603908ea22a3e699e36aaaf22d7"
+    },
+    {
+      "name": "dense-mlx-oracle-bf16-fp32",
+      "status": "pass",
+      "pass_marker": true,
+      "log": "dense-mlx-oracle-bf16-fp32.log",
+      "source_log_sha256": "47afa85cdaf188046852971c3ada882974c526364796daeea1a371c8918a6626"
+    }
+  ],
+  "serving": [],
+  "coverage_complete": false,
+  "note": "Current-main model/functional validation only. One-trial serving smoke is not broad speed or quality qualification. Other hardware remains unexecuted."
+}

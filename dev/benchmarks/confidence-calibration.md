@@ -49,5 +49,20 @@ This is evidence against interpreting selector confidence directly as calibrated
 acceptance probability. It does not predict the result of a cost-aware policy
 using another feature or estimate. That decision needs held-out total-cycle
 serving comparisons against the best fixed policy and full-width reference.
-The MLX capture is being repeated with one resident server after dual residency
-failed during model startup; the failed startup is not a calibration result.
+The completed MLX capture uses one resident server per complete ABBA round,
+after the paired attempt failed during second-model startup. Its **4,452
+reference labels are uncensored**; **4,466 candidate records include 52
+censored suffix labels**, excluded from calibration. Reference position 7:
+
+| Context / workload | Labels | Mean cumulative confidence | Prefix survival |
+| --- | ---: | ---: | ---: |
+| 2k code | 162 | 0.208 | 0.062 |
+| 2k prose | 146 | 0.236 | 0.096 |
+| 8k code | 170 | 0.216 | 0.094 |
+| 8k prose | 158 | 0.227 | 0.038 |
+
+The conclusion is the same descriptive mismatch. `confidence-mlx.json` in the
+[policy evidence bundle](results/qwen-policy-evaluation-m5-pro/) retains every
+bin, counts, Brier scores and trace/tool/model/build hashes. Sequential trace
+rounds 1/4 pool as reference and 2/3 as candidate; binary indices are not trace
+round numbers. The earlier failed paired startup supplies no calibration data.

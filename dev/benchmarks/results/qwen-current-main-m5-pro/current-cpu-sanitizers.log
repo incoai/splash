@@ -1,0 +1,636 @@
+python3 dev/tools/build_config.py record --output 'build/engine-tests/slot-file' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/model/SlotFile.cpp runtime/model/SsdReaders.cpp dev/tests/engine/slot_file_test.cpp -o build/engine-tests/slot-file
+python3 dev/tools/build_config.py record --output 'build/engine-tests/sparse-row-store' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/model/SparseRowStore.cpp runtime/model/SsdReaders.cpp runtime/model/WeightSource.cpp dev/tests/engine/sparse_row_store_test.cpp -o build/engine-tests/sparse-row-store
+python3 dev/tools/build_config.py record --output 'build/engine-tests/ssd-readers' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/model/SsdReaders.cpp dev/tests/engine/ssd_readers_test.cpp -o build/engine-tests/ssd-readers
+python3 dev/tools/build_config.py record --output 'build/engine-tests/slot-recycler' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/model/SlotRecycler.cpp dev/tests/engine/slot_recycler_test.cpp -o build/engine-tests/slot-recycler
+python3 dev/tools/build_config.py record --output 'build/engine-tests/verify-budget' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/verify_budget_test.cpp runtime/model/VerifyBudget.cpp -o build/engine-tests/verify-budget
+python3 dev/tools/build_config.py record --output 'build/engine-tests/cache-directory' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/engine/CacheDirectory.cpp dev/tests/engine/cache_directory_test.cpp -o build/engine-tests/cache-directory
+python3 dev/tools/build_config.py record --output 'build/engine-tests/disk-space' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/engine/DiskSpace.cpp runtime/engine/CacheDirectory.cpp runtime/model/SlotFile.cpp dev/tests/engine/disk_space_test.cpp -o build/engine-tests/disk-space
+python3 dev/tools/build_config.py record --output 'build/engine-tests/legacy-weight-cache' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/legacy_weight_cache_test.cpp -o build/engine-tests/legacy-weight-cache
+python3 dev/tools/build_config.py record --output 'build/engine-tests/vision-preparation' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/vision_preparation_test.cpp build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/vision-preparation
+python3 dev/tools/build_config.py record --output 'build/engine-tests/safetensors-checkpoint' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/safetensors_checkpoint_test.cpp build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/safetensors-checkpoint
+python3 dev/tools/build_config.py record --output 'build/engine-tests/weight-source' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/weight_source_test.cpp runtime/model/WeightSource.cpp -o build/engine-tests/weight-source
+python3 dev/tools/build_config.py record --output 'build/engine-tests/operator-workspace' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/operator_workspace_test.cc build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/operator-workspace
+python3 dev/tools/build_config.py record --output 'build/engine-tests/model-configuration' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/model_configuration_test.cpp build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/model-configuration
+python3 dev/tools/build_config.py record --output 'build/engine-tests/kv-slot-format' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/ops/KvSlotFormat.cpp dev/tests/engine/kv_slot_format_test.cpp -o build/engine-tests/kv-slot-format
+python3 dev/tools/build_config.py record --output 'build/engine-tests/kv-page-tier-host' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/ops/KvSlotFormat.cpp runtime/model/SlotFile.cpp runtime/model/SsdReaders.cpp runtime/model/KvCopyRead.cpp dev/tests/engine/kv_page_tier_host_test.cpp -o build/engine-tests/kv-page-tier-host
+python3 dev/tools/build_config.py record --output 'build/engine-tests/gguf-file' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/gguf_file_test.cpp runtime/model/GgufFile.cpp runtime/model/WeightSource.cpp -o build/engine-tests/gguf-file
+python3 dev/tools/build_config.py record --output 'build/engine-tests/gguf-reference' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fobjc-arc dev/tests/engine/gguf_reference_test.mm build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/gguf-reference
+python3 dev/tools/build_config.py record --output 'build/engine-tests/gguf-planner' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fobjc-arc dev/tests/engine/gguf_planner_test.mm build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/gguf-planner
+python3 dev/tools/build_config.py record --output 'build/engine-tests/linear-plan' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fobjc-arc dev/tests/engine/linear_plan_test.mm build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/linear-plan
+python3 dev/tools/build_config.py record --output 'build/engine-tests/ane-ffn-calibration' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/ops/AneFfnCalibration.cpp dev/tests/engine/ane_ffn_calibration_test.cpp -o build/engine-tests/ane-ffn-calibration
+python3 dev/tools/build_config.py record --output 'build/engine-tests/ane-ffn-startup' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/ane_ffn_startup_test.cpp build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/ane-ffn-startup
+python3 dev/tools/build_config.py record --output 'build/engine-tests/execution-plans' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/execution_plans_test.cc build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/execution-plans
+python3 dev/tools/build_config.py record --output 'build/engine-tests/model-execution-plans' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/model_execution_plan_test.cpp build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/model-execution-plans
+python3 dev/tools/build_config.py record --output 'build/engine-tests/engine-memory-plan' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/metal/DeviceCapabilities.cpp runtime/engine/MemoryPlan.cpp dev/tests/engine/engine_memory_plan_test.cpp -o build/engine-tests/engine-memory-plan
+python3 dev/tools/build_config.py record --output 'build/engine-tests/kv-page-cache' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/engine/KvPool.cpp runtime/engine/KvCache.cpp dev/tests/engine/kv_page_cache_test.cpp -o build/engine-tests/kv-page-cache
+python3 dev/tools/build_config.py record --output 'build/engine-tests/engine-cache' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/engine/KvPool.cpp runtime/engine/KvCache.cpp runtime/engine/StateCache.cpp runtime/engine/Cache.cpp runtime/engine/WriteBehind.cpp runtime/model/SlotFile.cpp dev/tests/engine/engine_cache_test.cpp -o build/engine-tests/engine-cache
+python3 dev/tools/build_config.py record --output 'build/engine-tests/cache-property' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/engine/KvPool.cpp runtime/engine/KvCache.cpp runtime/engine/StateCache.cpp runtime/engine/Cache.cpp runtime/engine/WriteBehind.cpp runtime/model/SlotFile.cpp dev/tests/engine/cache_property_test.cpp -o build/engine-tests/cache-property
+python3 dev/tools/build_config.py record --output 'build/engine-tests/persistent-cache' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/engine/KvPool.cpp runtime/engine/KvCache.cpp runtime/engine/StateCache.cpp runtime/engine/Cache.cpp runtime/engine/WriteBehind.cpp runtime/model/SlotFile.cpp dev/tests/engine/persistent_cache_test.cpp -o build/engine-tests/persistent-cache
+python3 dev/tools/build_config.py record --output 'build/engine-tests/draft-context-plan' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/model/DraftContextPlan.cpp dev/tests/engine/draft_context_plan_test.cpp -o build/engine-tests/draft-context-plan
+python3 dev/tools/build_config.py record --output 'build/engine-tests/ragged-scheduler' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/engine/Scheduler.cpp dev/tests/engine/ragged_scheduler_test.cpp -o build/engine-tests/ragged-scheduler
+python3 dev/tools/build_config.py record --output 'build/engine-tests/engine' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/engine/Scheduler.cpp runtime/model/DraftContextPlan.cpp runtime/engine/KvPool.cpp runtime/engine/KvCache.cpp runtime/engine/StateCache.cpp runtime/engine/Cache.cpp runtime/engine/WriteBehind.cpp runtime/engine/Engine.cpp runtime/engine/MemoryGovernor.cpp dev/tests/engine/engine_test.cpp -o build/engine-tests/engine
+python3 dev/tools/build_config.py record --output 'build/engine-tests/elastic-kv-pool' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/engine/KvPool.cpp dev/tests/engine/elastic_kv_pool_test.cpp -o build/engine-tests/elastic-kv-pool
+python3 dev/tools/build_config.py record --output 'build/engine-tests/protocol' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/engine/Protocol.cpp dev/tests/engine/ProtocolPeer.cpp dev/tests/engine/protocol_test.cpp -o build/engine-tests/protocol
+python3 dev/tools/build_config.py record --output 'build/engine-tests/native-engine-loop' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/engine/Scheduler.cpp runtime/model/DraftContextPlan.cpp runtime/engine/KvPool.cpp runtime/engine/KvCache.cpp runtime/engine/StateCache.cpp runtime/engine/Cache.cpp runtime/engine/WriteBehind.cpp runtime/engine/Engine.cpp runtime/engine/Protocol.cpp runtime/engine/NativeRuntime.cpp runtime/engine/MemoryGovernor.cpp runtime/engine/MemoryControl.cpp dev/tests/engine/ProtocolPeer.cpp dev/tests/engine/native_engine_loop_test.cpp -o build/engine-tests/native-engine-loop
+python3 dev/tools/build_config.py record --output 'build/engine-tests/native-fd-transport' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/engine/Scheduler.cpp runtime/model/DraftContextPlan.cpp runtime/engine/KvPool.cpp runtime/engine/KvCache.cpp runtime/engine/StateCache.cpp runtime/engine/Cache.cpp runtime/engine/WriteBehind.cpp runtime/engine/Engine.cpp runtime/engine/Protocol.cpp runtime/engine/NativeRuntime.cpp runtime/engine/FdTransport.cpp dev/tests/engine/ProtocolPeer.cpp dev/tests/engine/native_fd_transport_test.cpp -o build/engine-tests/native-fd-transport
+python3 dev/tools/build_config.py record --output 'build/engine-tests/runtime-bootstrap' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fobjc-arc dev/tests/engine/runtime_bootstrap_test.mm dev/tests/engine/ProtocolPeer.cpp build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/runtime-bootstrap
+python3 dev/tools/build_config.py record --output 'build/engine-tests/native-arguments' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/native_arguments_test.cpp build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/native-arguments
+python3 dev/tools/build_config.py record --output 'build/engine-tests/runtime-metrics' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/runtime_metrics_test.cpp -o build/engine-tests/runtime-metrics
+python3 dev/tools/build_config.py record --output 'build/engine-tests/memory-audit' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/metal/DeviceCapabilities.cpp runtime/engine/MemoryPlan.cpp runtime/engine/MemoryAudit.cpp dev/tests/engine/memory_audit_test.cpp -o build/engine-tests/memory-audit
+python3 dev/tools/build_config.py record --output 'build/engine-tests/memory-governor' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/metal/DeviceCapabilities.cpp runtime/engine/MemoryPlan.cpp runtime/engine/MemoryGovernor.cpp dev/tests/engine/memory_governor_test.cpp -o build/engine-tests/memory-governor
+python3 dev/tools/build_config.py record --output 'build/engine-tests/runtime-status' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 runtime/metal/DeviceCapabilities.cpp runtime/engine/MemoryPlan.cpp runtime/engine/MemoryAudit.cpp runtime/engine/Status.cpp dev/tests/engine/runtime_status_test.cpp -o build/engine-tests/runtime-status
+python3 dev/tools/build_config.py record --output 'build/engine-tests/q8-paged-kv' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 dev/tests/engine/q8_paged_kv_test.cc -o build/engine-tests/q8-paged-kv
+python3 dev/tools/build_config.py record --output 'build/engine-tests/attention-sweep' --config 37dcf779a1fe9cf2 -- xcrun -sdk macosx clang++ -std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fobjc-arc dev/benchmarks/attention_sweep.mm build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/attention-sweep
+mkdir -p build/sanitizers
+python3 dev/tools/build_config.py record --output 'build/engine-tests/backend-benchmark' --config 254a45c39c2c9e0d -- xcrun -sdk macosx clang++ -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime -mmacosx-version-min=26.4 -fobjc-arc -include build/engine/BuildIdentity.hpp dev/benchmarks/backend_benchmark.mm \
+		build/engine/libsplash.a \
+		-framework Foundation -framework Metal -framework IOKit -framework IOSurface -o build/engine-tests/backend-benchmark
+python3 dev/tools/build_config.py record --output 'build/sanitizers/slot-file-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/model/SlotFile.cpp runtime/model/SsdReaders.cpp dev/tests/engine/slot_file_test.cpp -o build/sanitizers/slot-file-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/slot-file-tsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=thread \
+		runtime/model/SlotFile.cpp runtime/model/SsdReaders.cpp dev/tests/engine/slot_file_test.cpp -o build/sanitizers/slot-file-tsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/kv-slot-format-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/ops/KvSlotFormat.cpp dev/tests/engine/kv_slot_format_test.cpp -o build/sanitizers/kv-slot-format-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/kv-page-tier-host-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/ops/KvSlotFormat.cpp runtime/model/SlotFile.cpp runtime/model/SsdReaders.cpp runtime/model/KvCopyRead.cpp dev/tests/engine/kv_page_tier_host_test.cpp -o build/sanitizers/kv-page-tier-host-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/kv-page-tier-host-tsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=thread \
+		runtime/ops/KvSlotFormat.cpp runtime/model/SlotFile.cpp runtime/model/SsdReaders.cpp runtime/model/KvCopyRead.cpp dev/tests/engine/kv_page_tier_host_test.cpp -o build/sanitizers/kv-page-tier-host-tsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/disk-space-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/engine/DiskSpace.cpp runtime/engine/CacheDirectory.cpp runtime/model/SlotFile.cpp dev/tests/engine/disk_space_test.cpp -o build/sanitizers/disk-space-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/disk-space-tsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=thread \
+		runtime/engine/DiskSpace.cpp runtime/engine/CacheDirectory.cpp runtime/model/SlotFile.cpp dev/tests/engine/disk_space_test.cpp -o build/sanitizers/disk-space-tsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/cache-directory-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/engine/CacheDirectory.cpp dev/tests/engine/cache_directory_test.cpp -o build/sanitizers/cache-directory-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/cache-directory-tsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=thread \
+		runtime/engine/CacheDirectory.cpp dev/tests/engine/cache_directory_test.cpp -o build/sanitizers/cache-directory-tsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/persistent-cache-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/engine/KvPool.cpp runtime/engine/KvCache.cpp runtime/engine/StateCache.cpp runtime/engine/Cache.cpp runtime/engine/WriteBehind.cpp runtime/model/SlotFile.cpp dev/tests/engine/persistent_cache_test.cpp -o build/sanitizers/persistent-cache-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/persistent-cache-tsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=thread \
+		runtime/engine/KvPool.cpp runtime/engine/KvCache.cpp runtime/engine/StateCache.cpp runtime/engine/Cache.cpp runtime/engine/WriteBehind.cpp runtime/model/SlotFile.cpp dev/tests/engine/persistent_cache_test.cpp -o build/sanitizers/persistent-cache-tsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/engine-cache-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/engine/KvPool.cpp runtime/engine/KvCache.cpp runtime/engine/StateCache.cpp runtime/engine/Cache.cpp runtime/engine/WriteBehind.cpp runtime/model/SlotFile.cpp dev/tests/engine/engine_cache_test.cpp -o build/sanitizers/engine-cache-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/engine-cache-tsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=thread \
+		runtime/engine/KvPool.cpp runtime/engine/KvCache.cpp runtime/engine/StateCache.cpp runtime/engine/Cache.cpp runtime/engine/WriteBehind.cpp runtime/model/SlotFile.cpp dev/tests/engine/engine_cache_test.cpp -o build/sanitizers/engine-cache-tsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/cache-property-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/engine/KvPool.cpp runtime/engine/KvCache.cpp runtime/engine/StateCache.cpp runtime/engine/Cache.cpp runtime/engine/WriteBehind.cpp runtime/model/SlotFile.cpp dev/tests/engine/cache_property_test.cpp -o build/sanitizers/cache-property-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/cache-property-tsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=thread \
+		runtime/engine/KvPool.cpp runtime/engine/KvCache.cpp runtime/engine/StateCache.cpp runtime/engine/Cache.cpp runtime/engine/WriteBehind.cpp runtime/model/SlotFile.cpp dev/tests/engine/cache_property_test.cpp -o build/sanitizers/cache-property-tsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/protocol-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/engine/Protocol.cpp dev/tests/engine/ProtocolPeer.cpp dev/tests/engine/protocol_test.cpp -o build/sanitizers/protocol-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/protocol-tsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=thread \
+		runtime/engine/Protocol.cpp dev/tests/engine/ProtocolPeer.cpp dev/tests/engine/protocol_test.cpp -o build/sanitizers/protocol-tsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/engine-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/engine/Scheduler.cpp runtime/model/DraftContextPlan.cpp runtime/engine/KvPool.cpp runtime/engine/KvCache.cpp runtime/engine/StateCache.cpp runtime/engine/Cache.cpp runtime/engine/WriteBehind.cpp runtime/engine/Engine.cpp runtime/engine/MemoryGovernor.cpp dev/tests/engine/engine_test.cpp -o build/sanitizers/engine-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/engine-tsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=thread \
+		runtime/engine/Scheduler.cpp runtime/model/DraftContextPlan.cpp runtime/engine/KvPool.cpp runtime/engine/KvCache.cpp runtime/engine/StateCache.cpp runtime/engine/Cache.cpp runtime/engine/WriteBehind.cpp runtime/engine/Engine.cpp runtime/engine/MemoryGovernor.cpp dev/tests/engine/engine_test.cpp -o build/sanitizers/engine-tsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/ragged-scheduler-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/engine/Scheduler.cpp dev/tests/engine/ragged_scheduler_test.cpp -o build/sanitizers/ragged-scheduler-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/ragged-scheduler-tsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=thread \
+		runtime/engine/Scheduler.cpp dev/tests/engine/ragged_scheduler_test.cpp -o build/sanitizers/ragged-scheduler-tsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/native-fd-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/engine/Scheduler.cpp runtime/model/DraftContextPlan.cpp runtime/engine/KvPool.cpp runtime/engine/KvCache.cpp runtime/engine/StateCache.cpp runtime/engine/Cache.cpp runtime/engine/WriteBehind.cpp runtime/engine/Engine.cpp runtime/engine/Protocol.cpp runtime/engine/NativeRuntime.cpp runtime/engine/FdTransport.cpp dev/tests/engine/ProtocolPeer.cpp dev/tests/engine/native_fd_transport_test.cpp -o build/sanitizers/native-fd-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/native-fd-tsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=thread \
+		runtime/engine/Scheduler.cpp runtime/model/DraftContextPlan.cpp runtime/engine/KvPool.cpp runtime/engine/KvCache.cpp runtime/engine/StateCache.cpp runtime/engine/Cache.cpp runtime/engine/WriteBehind.cpp runtime/engine/Engine.cpp runtime/engine/Protocol.cpp runtime/engine/NativeRuntime.cpp runtime/engine/FdTransport.cpp dev/tests/engine/ProtocolPeer.cpp dev/tests/engine/native_fd_transport_test.cpp -o build/sanitizers/native-fd-tsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/ane-ffn-calibration-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/ops/AneFfnCalibration.cpp dev/tests/engine/ane_ffn_calibration_test.cpp -o build/sanitizers/ane-ffn-calibration-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/ane-ffn-calibration-tsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=thread \
+		runtime/ops/AneFfnCalibration.cpp dev/tests/engine/ane_ffn_calibration_test.cpp -o build/sanitizers/ane-ffn-calibration-tsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/sparse-row-store-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/model/SparseRowStore.cpp runtime/model/SsdReaders.cpp runtime/model/WeightSource.cpp dev/tests/engine/sparse_row_store_test.cpp -o build/sanitizers/sparse-row-store-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/sparse-row-store-tsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=thread \
+		runtime/model/SparseRowStore.cpp runtime/model/SsdReaders.cpp runtime/model/WeightSource.cpp dev/tests/engine/sparse_row_store_test.cpp -o build/sanitizers/sparse-row-store-tsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/ssd-readers-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/model/SsdReaders.cpp dev/tests/engine/ssd_readers_test.cpp -o build/sanitizers/ssd-readers-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/ssd-readers-tsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=thread \
+		runtime/model/SsdReaders.cpp dev/tests/engine/ssd_readers_test.cpp -o build/sanitizers/ssd-readers-tsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/elastic-kv-pool-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/engine/KvPool.cpp dev/tests/engine/elastic_kv_pool_test.cpp -o build/sanitizers/elastic-kv-pool-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/elastic-kv-pool-tsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=thread \
+		runtime/engine/KvPool.cpp dev/tests/engine/elastic_kv_pool_test.cpp -o build/sanitizers/elastic-kv-pool-tsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/slot-recycler-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/model/SlotRecycler.cpp dev/tests/engine/slot_recycler_test.cpp -o build/sanitizers/slot-recycler-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/slot-recycler-tsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=thread \
+		runtime/model/SlotRecycler.cpp dev/tests/engine/slot_recycler_test.cpp -o build/sanitizers/slot-recycler-tsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/engine-memory-plan-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/metal/DeviceCapabilities.cpp runtime/engine/MemoryPlan.cpp dev/tests/engine/engine_memory_plan_test.cpp -o build/sanitizers/engine-memory-plan-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/memory-audit-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/metal/DeviceCapabilities.cpp runtime/engine/MemoryPlan.cpp runtime/engine/MemoryAudit.cpp dev/tests/engine/memory_audit_test.cpp -o build/sanitizers/memory-audit-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/runtime-status-asan-ubsan' --config 24ac22cf6bb9e49c -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/metal/DeviceCapabilities.cpp runtime/engine/MemoryPlan.cpp runtime/engine/MemoryAudit.cpp runtime/engine/Status.cpp dev/tests/engine/runtime_status_test.cpp -o build/sanitizers/runtime-status-asan-ubsan
+build/engine-tests/slot-file
+Slot file tests passed
+build/engine-tests/kv-slot-format
+kv_slot_format_test: PASS
+build/engine-tests/kv-page-tier-host
+round trips int8 slot format v0
+teardown int8
+round trips int8 slot format v1
+teardown int8
+round trips bf16 slot format v0
+teardown bf16
+round trips bf16 slot format v1
+teardown bf16
+kv page tier host tests passed
+build/engine-tests/sparse-row-store
+sparse row store tests passed (90- and 170-byte rows)
+build/engine-tests/ssd-readers
+ssd_readers_test: PASS
+build/engine-tests/slot-recycler dev/tests/fixtures/kv-selection-traces
+slot_recycler_test: code128.kvst: 51521 misses, 52949 least recently used
+slot_recycler_test: novel128.kvst: 54301 misses, 55585 least recently used
+slot_recycler_test: novel256.kvst: 76406 misses, 78716 least recently used
+slot_recycler_test: PASS
+build/engine-tests/verify-budget
+verify_budget_test: PASS
+build/engine-tests/cache-directory
+Cache directory tests passed
+build/engine-tests/disk-space
+11:48:57 SSD cache: a second write found /Volumes/Test full while it shows 100.0 GiB available; the cache keeps within the 0.0 GiB it holds while this server runs.
+11:48:57 SSD cache: a second write found /Volumes/Test full while it shows 100.0 GiB available; the cache keeps within the 0.0 GiB it holds while this server runs.
+11:48:57 SSD cache: a second write found /Volumes/Share full, a volume whose free space it does not follow; the cache keeps within the 0.0 GiB it holds while this server runs.
+11:48:57 Persistent cache: removed /var/folders/r4/wfklx__517g9yw3g0yxcrxs40000gp/T/splash-disk-space-root-aLSvT2/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (0.0 GiB), the oldest cache nobody holds, to keep the cache root within 0.0 GiB.
+11:48:57 Persistent cache: removed /var/folders/r4/wfklx__517g9yw3g0yxcrxs40000gp/T/splash-disk-space-root-jD9LQ1/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (0.0 GiB), the oldest cache nobody holds, to keep the cache root within 0.0 GiB.
+11:48:57 Persistent cache: removed /var/folders/r4/wfklx__517g9yw3g0yxcrxs40000gp/T/splash-disk-space-root-7WmikN/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (0.0 GiB), the oldest cache nobody holds, to keep the cache root within 0.0 GiB.
+Disk space tests passed
+build/engine-tests/legacy-weight-cache
+legacy weight cache tests passed
+python3 dev/tests/engine/run_vision_preparation.py build/engine-tests/vision-preparation dev/tests/fixtures/weight-goldens/goldens.json
+Vision layouts from MLX, transformers and GGUF, exact BF16 conversion, rejected sources and zero padding PASS
+build/engine-tests/safetensors-checkpoint
+safetensors checkpoint: bounded reads, metadata, written and malformed sources PASS
+build/engine-tests/model-configuration dev/tests/fixtures/model-configs
+model configuration: every family, sources, one rule per value, quantization, vision, the installer's check, YaRN PASS
+build/engine-tests/weight-source
+weight source: reads, writes to the open file, replacement and naming PASS
+build/engine-tests/gguf-file
+GGUF parser bounds tests passed
+build/engine-tests/gguf-reference dev/tests/fixtures/weight-goldens/goldens.json dev/tests/fixtures/mlx-quantization/fixture.json
+CPU reference matches the GGML golden hash: q4k                  ok
+CPU reference matches the GGML golden hash: iq4xs                ok
+CPU reference matches the GGML golden hash: iq4nl                ok
+CPU reference matches the GGML golden hash: q5k                  ok
+CPU reference matches the GGML golden hash: q6k                  ok
+CPU reference matches the GGML golden hash: q3k                  ok
+CPU reference matches the GGML golden hash: q80                  ok
+CPU reference matches the GGML golden hash: iq3s                 ok
+CPU reference matches the GGML golden hash: q2k                  ok
+CPU reference matches the GGML golden hash: iq3xxs               ok
+CPU reference matches the GGML golden hash: iq2xxs               ok
+CPU reference matches the GGML golden hash: iq2xs                ok
+CPU reference matches the GGML golden hash: iq2s                 ok
+CPU reference matches the GGML golden hash: iq1s                 ok
+CPU reference matches the GGML golden hash: iq1m                 ok
+CPU reference matches the GGML golden hash: q40                  ok
+CPU reference matches the GGML golden hash: q41                  ok
+CPU reference matches the GGML golden hash: mxfp4                ok
+CPU reference matches the GGML golden hash: pq20                 ok
+CPU reference matches the GGML golden hash: q50                  ok
+CPU reference matches the GGML golden hash: q51                  ok
+CPU reference matches the GGML golden hash: bf16                 ok
+CPU reference matches the GGML golden hash: f16                  ok
+CPU reference matches the GGML golden hash: q20                  ok
+CPU reference matches the GGML golden hash: llama.cpp's NVFP4    ok
+CPU reference matches the golden hash: Q8_0 quantization         ok
+MLX fixture holds every MLX affine format, mxfp4 and nvfp4       ok
+CPU reference reads MLX's codes: af2g32                          ok
+CPU reference matches MLX's values: af2g32                       ok
+CPU reference reads MLX's codes: af2g64                          ok
+CPU reference matches MLX's values: af2g64                       ok
+CPU reference reads MLX's codes: af2g128                         ok
+CPU reference matches MLX's values: af2g128                      ok
+CPU reference reads MLX's codes: af3g32                          ok
+CPU reference matches MLX's values: af3g32                       ok
+CPU reference reads MLX's codes: af3g64                          ok
+CPU reference matches MLX's values: af3g64                       ok
+CPU reference reads MLX's codes: af3g128                         ok
+CPU reference matches MLX's values: af3g128                      ok
+CPU reference reads MLX's codes: af4g32                          ok
+CPU reference matches MLX's values: af4g32                       ok
+CPU reference reads MLX's codes: af4g64                          ok
+CPU reference matches MLX's values: af4g64                       ok
+CPU reference reads MLX's codes: af4g128                         ok
+CPU reference matches MLX's values: af4g128                      ok
+CPU reference reads MLX's codes: af5g32                          ok
+CPU reference matches MLX's values: af5g32                       ok
+CPU reference reads MLX's codes: af5g64                          ok
+CPU reference matches MLX's values: af5g64                       ok
+CPU reference reads MLX's codes: af5g128                         ok
+CPU reference matches MLX's values: af5g128                      ok
+CPU reference reads MLX's codes: af6g32                          ok
+CPU reference matches MLX's values: af6g32                       ok
+CPU reference reads MLX's codes: af6g64                          ok
+CPU reference matches MLX's values: af6g64                       ok
+CPU reference reads MLX's codes: af6g128                         ok
+CPU reference matches MLX's values: af6g128                      ok
+CPU reference reads MLX's codes: af8g32                          ok
+CPU reference matches MLX's values: af8g32                       ok
+CPU reference reads MLX's codes: af8g64                          ok
+CPU reference matches MLX's values: af8g64                       ok
+CPU reference reads MLX's codes: af8g128                         ok
+CPU reference matches MLX's values: af8g128                      ok
+CPU reference matches MLX's values: mxfp4 (MLX mxfp4)            ok
+CPU reference matches MLX's values: nvfp4 (MLX nvfp4)            ok
+GGUF reference tests passed (0 failures)
+build/engine-tests/gguf-planner
+planner plans the dense target                                   ok
+planner keeps F32 values as stored: blk.0.attn_norm.weight       ok
+planner keeps F32 values as stored: blk.0.ssm_norm.weight        ok
+planner keeps F32 values as stored: blk.0.post_attention_norm.weight ok
+planner keeps F32 values as stored: blk.1.attn_norm.weight       ok
+planner keeps F32 values as stored: blk.1.attn_q_norm.weight     ok
+planner keeps F32 values as stored: blk.1.attn_k_norm.weight     ok
+planner keeps F32 values as stored: blk.1.post_attention_norm.weight ok
+planner keeps F32 values as stored: output_norm.weight           ok
+planner narrows the convolution to bf16 and groups its value heads ok
+planner keeps the decay F32 and groups its value heads           ok
+planner narrows the time bias to bf16 and groups its value heads ok
+planner copies a token table as stored: Q4_K                     ok
+planner copies a token table as stored: IQ4_XS                   ok
+planner copies a token table as stored: IQ4_NL                   ok
+planner copies a token table as stored: Q5_K                     ok
+planner copies a token table as stored: Q6_K                     ok
+planner copies a token table as stored: Q3_K                     ok
+planner copies a token table as stored: Q8_0                     ok
+planner copies a token table as stored: IQ3_S                    ok
+planner copies a token table as stored: Q2_K                     ok
+planner copies a token table as stored: IQ3_XXS                  ok
+planner copies a token table as stored: IQ2_XXS                  ok
+planner copies a token table as stored: IQ2_XS                   ok
+planner copies a token table as stored: IQ2_S                    ok
+planner copies a token table as stored: IQ1_S                    ok
+planner copies a token table as stored: IQ1_M                    ok
+planner copies a token table as stored: Q4_0                     ok
+planner copies a token table as stored: Q4_1                     ok
+planner copies a token table as stored: MXFP4                    ok
+planner copies a token table as stored: PQ2_0                    ok
+planner copies a token table as stored: Q5_0                     ok
+planner copies a token table as stored: Q5_1                     ok
+planner copies a token table as stored: BF16                     ok
+planner copies a token table as stored: F16                      ok
+planner copies a token table as stored: Q2_0                     ok
+planner refuses mismatched KV rows by name: blk.1.attn_k.weight rows=256 ok
+planner refuses mismatched KV rows by name: blk.1.attn_k.weight rows=768 ok
+planner refuses mismatched KV rows by name: blk.1.attn_v.weight rows=256 ok
+planner refuses mismatched KV rows by name: blk.1.attn_v.weight rows=768 ok
+planner names a metadata mismatch                                ok
+planner checks the architecture against the model's target       ok
+planner plans the MoE target                                     ok
+planner F32 alpha/beta tensor: beta then alpha rows in grouped order ok
+planner copies the F32 tensor as stored: blk.0.ffn_gate_inp.weight ok
+planner copies the F32 tensor as stored: blk.0.ffn_gate_inp_shexp.weight ok
+planner plans 16-bit float routers, gates and norms              ok
+planner keeps a BF16 router as stored                            ok
+planner widens the BF16 blk.0.ffn_gate_inp_shexp.weight to F32   ok
+planner widens the F16 blk.0.attn_norm.weight to F32             ok
+planner widens the BF16 blk.0.post_attention_norm.weight to F32  ok
+planner decodes a Q8_0 shared-expert scalar gate to F32          ok
+planner refuses an F16 router by name                            ok
+planner keeps a BF16 router of 320 columns as stored             ok
+planner repacks blk.0.attn_qkv.weight as 1024 rows of 512        ok
+planner repacks blk.0.attn_gate.weight as 512 rows of 512        ok
+planner repacks blk.0.ssm_out.weight as 512 rows of 512          ok
+planner repacks blk.0.ffn_gate_exps.weight as 1024 rows of 512   ok
+planner repacks blk.0.ffn_up_exps.weight as 1024 rows of 512     ok
+planner repacks blk.0.ffn_down_exps.weight as 2048 rows of 256   ok
+planner repacks blk.0.ffn_gate_shexp.weight as 256 rows of 512   ok
+planner repacks blk.0.ffn_up_shexp.weight as 256 rows of 512     ok
+planner repacks blk.0.ffn_down_shexp.weight as 512 rows of 256   ok
+planner repacks only the layer's quantized tensors               ok
+planner leaves streamed experts out of the layers' images, as the repacks it would write, and declares the images' bytes with them ok
+planner gives the weights the same manifest whether the experts stream or not ok
+planner splits llama.cpp's fused gate/up experts into each expert's gate and up rows ok
+planner streams fused gate/up experts as each expert's gate and up rows ok
+planner refuses a fused gate/up experts tensor of a type it does not read by name ok
+planner alpha/beta: one plane tile of Q4_K beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of IQ4_XS beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of IQ4_NL beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q5_K beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q6_K beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q3_K beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q8_0 beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of IQ3_S beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q2_K beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of IQ3_XXS beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of IQ2_XXS beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of IQ2_XS beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of IQ2_S beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of IQ1_S beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of IQ1_M beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q4_0 beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q4_1 beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of MXFP4 beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of PQ2_0 beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of NVFP4 beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q5_0 beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q5_1 beta then alpha rows (qwen35) ok
+planner alpha/beta: one plane tile of Q2_0 beta then alpha rows (qwen35) ok
+planner makes alpha/beta one F32 tensor: IQ4_XS beta, Q8_0 alpha ok
+planner makes alpha/beta one F32 tensor: Q4_K beta, F32 alpha    ok
+planner makes alpha/beta one F32 tensor: BF16 beta, NVFP4 alpha  ok
+planner makes alpha/beta one F32 tensor: F32 beta, BF16 alpha    ok
+planner makes alpha/beta one F32 tensor: F16 beta, Q8_0 alpha    ok
+planner makes alpha/beta one BF16 tensor: BF16 beta, BF16 alpha  ok
+planner makes alpha/beta one F32 tensor: F16 beta, F16 alpha     ok
+planner refuses an alpha of a type it does not read by its name alone ok
+planner alpha/beta: one plane tile of Q4_K beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of IQ4_XS beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of IQ4_NL beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q5_K beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q6_K beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q3_K beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q8_0 beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of IQ3_S beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q2_K beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of IQ3_XXS beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of IQ2_XXS beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of IQ2_XS beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of IQ2_S beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of IQ1_S beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of IQ1_M beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q4_0 beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q4_1 beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of MXFP4 beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of PQ2_0 beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of NVFP4 beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q5_0 beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q5_1 beta then alpha rows (qwen35moe) ok
+planner alpha/beta: one plane tile of Q2_0 beta then alpha rows (qwen35moe) ok
+planner makes alpha/beta one F32 tensor: IQ4_XS beta, Q8_0 alpha ok
+planner makes alpha/beta one F32 tensor: Q4_K beta, F32 alpha    ok
+planner makes alpha/beta one F32 tensor: BF16 beta, NVFP4 alpha  ok
+planner makes alpha/beta one F32 tensor: F32 beta, BF16 alpha    ok
+planner makes alpha/beta one F32 tensor: F16 beta, Q8_0 alpha    ok
+planner makes alpha/beta one BF16 tensor: BF16 beta, BF16 alpha  ok
+planner makes alpha/beta one F32 tensor: F16 beta, F16 alpha     ok
+planner refuses an alpha of a type it does not read by its name alone ok
+planner accepts a GGUF that declares no RoPE scaling             ok
+planner refuses RoPE scaling                                     ok
+planner names another rotated width, RoPE base and RMS epsilon   ok
+planner requires the rotary and norm metadata                    ok
+planner plans a rotation of F32 alpha/beta                       ok
+planner plans a rotation of BF16 alpha/beta                      ok
+planner plans a rotation of F16 alpha/beta                       ok
+planner plans a rotation that names Q8_0 alpha/beta              ok
+planner refuses a rotation that leaves out Q8_0 alpha/beta       ok
+planner plans a rotation that names IQ4_XS alpha/beta            ok
+planner refuses a rotation that leaves out IQ4_XS alpha/beta     ok
+an IQ4_NL PLE table streams as 90-byte rows                      ok
+the streamed PLE rows are where the file holds the table         ok
+a Q8_0 PLE table streams as 170-byte rows                        ok
+an F32 PLE table does not stream                                 ok
+a PLE table of another width does not stream                     ok
+planner plans a target of BF16, F16 and Q8_0 hyper-connections   ok
+planner repacks Q8_0 output_hc_down.weight as stored             ok
+planner repacks Q8_0 output_hc_up.weight as stored               ok
+planner repacks BF16 blk.0.hc_attn_down.weight as the reference Q8_0 of its values ok
+planner repacks BF16 blk.0.hc_attn_up.weight as the reference Q8_0 of its values ok
+planner repacks F16 blk.0.hc_ffn_down.weight as the reference Q8_0 of its values ok
+planner repacks F16 blk.0.hc_ffn_up.weight as the reference Q8_0 of its values ok
+planner repacks BF16 blk.1.hc_attn_down.weight as the reference Q8_0 of its values ok
+planner repacks BF16 blk.1.hc_attn_up.weight as the reference Q8_0 of its values ok
+planner repacks F16 blk.1.hc_ffn_down.weight as the reference Q8_0 of its values ok
+planner repacks F16 blk.1.hc_ffn_up.weight as the reference Q8_0 of its values ok
+planner refuses an F32 hyper-connection projection by name       ok
+planner plans the PLE embedding                                  ok
+planner plans the PLE embedding                                  ok
+planner plans the PLE projections, norms and convolution in the layer they feed ok
+planner copies the PLE table's rows as stored into an image after the embedding's ok
+planner streams the PLE table's rows instead of loading its image, which its record keeps ok
+planner loads an NVFP4 PLE table and refuses by name to stream it ok
+planner refuses a GGUF that declares another PLE layer           ok
+findTargetGgufs takes a split GGUF's parts in split order        ok
+findTargetGgufs refuses another GGUF beside a split GGUF's parts ok
+findTargetGgufs refuses the parts of a split GGUF of another count ok
+planner reads each tensor of a split GGUF from its part into the whole file's images ok
+GGUF planner tests passed (0 failures)
+build/engine-tests/linear-plan --cpu
+Linear CPU plans: PASS
+/bin/sh dev/tests/attention_sweep_cli.sh build/engine-tests/attention-sweep
+attention-sweep CLI validation: PASS
+/bin/sh dev/tests/backend_benchmark_cli.sh build/engine-tests/backend-benchmark dev/tests/fixtures/model-configs
+backend-benchmark CLI validation: PASS
+build/engine-tests/operator-workspace
+operator workspace: PASS
+build/engine-tests/ane-ffn-calibration
+ane ffn calibration tests passed
+build/engine-tests/ane-ffn-startup
+ane ffn startup tests passed
+build/engine-tests/execution-plans
+PASS execution plans: device policies, device MoE tiles, B1-B4 and prefill workspace bounds (CPU only)
+build/engine-tests/model-execution-plans
+model execution plans: PASS (two paired geometries)
+build/engine-tests/engine-memory-plan
+elastic memory plan tests passed
+build/engine-tests/kv-page-cache
+KV image identity ok
+KV block identities pinned ok
+KV page cache tests passed
+build/engine-tests/engine-cache
+engine cache tests passed
+build/engine-tests/cache-property
+cache property runs ok
+cache property tests passed
+build/engine-tests/persistent-cache
+Persistent cache tests passed
+build/engine-tests/draft-context-plan
+draft context plan tests passed
+build/engine-tests/ragged-scheduler
+ragged scheduler tests passed
+build/engine-tests/engine
+engine tests passed
+build/engine-tests/elastic-kv-pool
+elastic KV pool tests passed
+build/engine-tests/protocol dev/tests/engine/protocol_golden.txt
+native protocol tests passed
+build/engine-tests/native-engine-loop
+11:49:14 Memory: growth paused; waiting=0; suspended=0
+11:49:14 Memory: growth available; resource wait cleared
+11:49:14 Memory: growth paused; waiting=0; suspended=0
+11:49:14 Memory: growth paused; waiting=0; suspended=0
+11:49:14 Memory: growth available; resource wait cleared
+11:49:14 Memory: growth paused; waiting=1; suspended=0
+11:49:14 Memory: growth available; resource wait cleared
+11:49:14 Weights released after 2 s without a request; the next request restores them
+11:49:14 Weights restored in 0.00 s
+11:49:14 Weights released after 2 s without a request; the next request restores them
+11:49:14 Weights restored in 0.00 s
+11:49:14 Weights released after 2 s without a request; the next request restores them
+11:49:14 Weights released after 2 s without a request; the next request restores them
+11:49:14 Weights restored in 0.00 s
+11:49:14 Weights released after 2 s without a request; the next request restores them
+11:49:14 Weights restored in 0.00 s
+11:49:14 Weights released after 2 s without a request; the next request restores them
+11:49:14 Weights released after 2 s without a request; the next request restores them
+11:49:14 Weights restored in 0.00 s
+11:49:14 Weights released after 2 s without a request; the next request restores them
+11:49:14 Weights restored in 0.00 s
+11:49:14 Weights released after 2 s without a request; the next request restores them
+11:49:14 Weights restored in 0.00 s
+11:49:14 Weights released after 2 s without a request; the next request restores them
+11:49:14 Weights restored in 0.00 s
+11:49:14 Weights released after 2 s without a request; the next request restores them
+11:49:14 Memory: growth paused; waiting=0; suspended=0
+11:49:14 Weights wait for memory to be restored: host memory reserve protected
+11:49:14 Memory: growth available; waiting=1; suspended=0
+11:49:14 Weights restored in 0.40 s
+11:49:14 Weights released after 2 s without a request; the next request restores them
+11:49:14 Memory: growth available; resource wait cleared
+11:49:14 Memory: growth paused; waiting=0; suspended=0
+11:49:14 Weights wait for memory to be restored: host memory reserve protected
+11:49:14 Memory: growth available; waiting=2; suspended=0
+11:49:14 Memory: growth paused; waiting=0; suspended=0
+11:49:14 Weights wait for memory to be restored: host memory reserve protected
+11:49:14 Weights not restored, 2 waiting requests failed: memory did not become available within the resource wait limit: macOS is short of memory; close memory-heavy applications; the next request restores them
+11:49:14 Memory: growth available; resource wait cleared
+11:49:14 Memory: growth paused; waiting=0; suspended=0
+11:49:14 Weights wait for memory to be restored: host memory reserve protected
+11:49:14 Memory: growth available; waiting=1; suspended=0
+11:49:14 Weights restored in 0.00 s
+11:49:14 Weights released after 2 s without a request; the next request restores them
+11:49:14 Memory: growth available; resource wait cleared
+11:49:14 Memory: growth paused; waiting=0; suspended=0
+11:49:14 Weights wait for memory to be restored: host memory reserve protected
+11:49:14 Weights not restored: no request waits for them
+11:49:14 Weights released on request; the next request restores them
+11:49:14 Weights restored in 0.00 s
+11:49:14 Weights released on request; the next request restores them
+11:49:14 Weights restored in 0.00 s
+11:49:14 Weights released on request; the next request restores them
+native engine loop tests passed
+build/engine-tests/native-fd-transport
+native fd transport tests passed
+build/engine-tests/runtime-bootstrap
+native bootstrap tests passed
+build/engine-tests/native-arguments dev/tests/engine/native_command_golden.txt dev/tests/fixtures/model-configs
+native arguments tests passed
+build/engine-tests/runtime-metrics
+runtime metrics tests passed
+build/engine-tests/memory-audit
+elastic memory audit tests passed
+build/engine-tests/memory-governor
+memory governor tests passed
+build/engine-tests/runtime-status dev/tests/engine/status_golden.json
+runtime status tests passed
+build/engine-tests/q8-paged-kv
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/slot-file-asan-ubsan
+q8_paged_kv_test: ok
+Slot file tests passed
+TSAN_OPTIONS=halt_on_error=1 build/sanitizers/slot-file-tsan
+Slot file tests passed
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/kv-slot-format-asan-ubsan
+kv_slot_format_test: PASS
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/kv-page-tier-host-asan-ubsan
+round trips int8 slot format v0
+teardown int8
+round trips int8 slot format v1
+teardown int8
+round trips bf16 slot format v0
+teardown bf16
+round trips bf16 slot format v1
+teardown bf16
+kv page tier host tests passed
+TSAN_OPTIONS=halt_on_error=1 build/sanitizers/kv-page-tier-host-tsan
+round trips int8 slot format v0
+teardown int8
+round trips int8 slot format v1
+teardown int8
+round trips bf16 slot format v0
+teardown bf16
+round trips bf16 slot format v1
+teardown bf16
+kv page tier host tests passed
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/disk-space-asan-ubsan
+11:49:29 SSD cache: a second write found /Volumes/Test full while it shows 100.0 GiB available; the cache keeps within the 0.0 GiB it holds while this server runs.
+11:49:29 SSD cache: a second write found /Volumes/Test full while it shows 100.0 GiB available; the cache keeps within the 0.0 GiB it holds while this server runs.
+11:49:29 SSD cache: a second write found /Volumes/Share full, a volume whose free space it does not follow; the cache keeps within the 0.0 GiB it holds while this server runs.
+11:49:29 Persistent cache: removed /var/folders/r4/wfklx__517g9yw3g0yxcrxs40000gp/T/splash-disk-space-root-mxzqO4/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (0.0 GiB), the oldest cache nobody holds, to keep the cache root within 0.0 GiB.
+11:49:29 Persistent cache: removed /var/folders/r4/wfklx__517g9yw3g0yxcrxs40000gp/T/splash-disk-space-root-wd77zk/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (0.0 GiB), the oldest cache nobody holds, to keep the cache root within 0.0 GiB.
+11:49:29 Persistent cache: removed /var/folders/r4/wfklx__517g9yw3g0yxcrxs40000gp/T/splash-disk-space-root-n3y4s9/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (0.0 GiB), the oldest cache nobody holds, to keep the cache root within 0.0 GiB.
+Disk space tests passed
+TSAN_OPTIONS=halt_on_error=1 build/sanitizers/disk-space-tsan
+11:49:30 SSD cache: a second write found /Volumes/Test full while it shows 100.0 GiB available; the cache keeps within the 0.0 GiB it holds while this server runs.
+11:49:30 SSD cache: a second write found /Volumes/Test full while it shows 100.0 GiB available; the cache keeps within the 0.0 GiB it holds while this server runs.
+11:49:30 SSD cache: a second write found /Volumes/Share full, a volume whose free space it does not follow; the cache keeps within the 0.0 GiB it holds while this server runs.
+11:49:30 Persistent cache: removed /var/folders/r4/wfklx__517g9yw3g0yxcrxs40000gp/T/splash-disk-space-root-Vt51nM/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (0.0 GiB), the oldest cache nobody holds, to keep the cache root within 0.0 GiB.
+11:49:30 Persistent cache: removed /var/folders/r4/wfklx__517g9yw3g0yxcrxs40000gp/T/splash-disk-space-root-peAgEJ/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (0.0 GiB), the oldest cache nobody holds, to keep the cache root within 0.0 GiB.
+11:49:30 Persistent cache: removed /var/folders/r4/wfklx__517g9yw3g0yxcrxs40000gp/T/splash-disk-space-root-mykgiF/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (0.0 GiB), the oldest cache nobody holds, to keep the cache root within 0.0 GiB.
+Disk space tests passed
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/cache-directory-asan-ubsan
+Cache directory tests passed
+TSAN_OPTIONS=halt_on_error=1 build/sanitizers/cache-directory-tsan
+Cache directory tests passed
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/persistent-cache-asan-ubsan
+Persistent cache tests passed
+TSAN_OPTIONS=halt_on_error=1 build/sanitizers/persistent-cache-tsan
+Persistent cache tests passed
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/engine-cache-asan-ubsan
+engine cache tests passed
+TSAN_OPTIONS=halt_on_error=1 build/sanitizers/engine-cache-tsan
+engine cache tests passed
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/cache-property-asan-ubsan
+cache property runs ok
+cache property tests passed
+TSAN_OPTIONS=halt_on_error=1 build/sanitizers/cache-property-tsan
+cache property runs ok
+cache property tests passed
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/protocol-asan-ubsan dev/tests/engine/protocol_golden.txt
+native protocol tests passed
+TSAN_OPTIONS=halt_on_error=1 build/sanitizers/protocol-tsan dev/tests/engine/protocol_golden.txt
+native protocol tests passed
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/engine-asan-ubsan
+engine tests passed
+TSAN_OPTIONS=halt_on_error=1 build/sanitizers/engine-tsan
+engine tests passed
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/ragged-scheduler-asan-ubsan
+ragged scheduler tests passed
+TSAN_OPTIONS=halt_on_error=1 build/sanitizers/ragged-scheduler-tsan
+ragged scheduler tests passed
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/native-fd-asan-ubsan
+native fd transport tests passed
+TSAN_OPTIONS=halt_on_error=1 build/sanitizers/native-fd-tsan
+native fd transport tests passed
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/ane-ffn-calibration-asan-ubsan
+ane ffn calibration tests passed
+TSAN_OPTIONS=halt_on_error=1 build/sanitizers/ane-ffn-calibration-tsan
+ane ffn calibration tests passed
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/sparse-row-store-asan-ubsan
+sparse row store tests passed (90- and 170-byte rows)
+TSAN_OPTIONS=halt_on_error=1 build/sanitizers/sparse-row-store-tsan
+sparse row store tests passed (90- and 170-byte rows)
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/ssd-readers-asan-ubsan
+ssd_readers_test: PASS
+TSAN_OPTIONS=halt_on_error=1 build/sanitizers/ssd-readers-tsan
+ssd_readers_test: PASS
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/elastic-kv-pool-asan-ubsan
+elastic KV pool tests passed
+TSAN_OPTIONS=halt_on_error=1 build/sanitizers/elastic-kv-pool-tsan
+elastic KV pool tests passed
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/slot-recycler-asan-ubsan dev/tests/fixtures/kv-selection-traces
+slot_recycler_test: code128.kvst: 51521 misses, 52949 least recently used
+slot_recycler_test: novel128.kvst: 54301 misses, 55585 least recently used
+slot_recycler_test: novel256.kvst: 76406 misses, 78716 least recently used
+slot_recycler_test: PASS
+TSAN_OPTIONS=halt_on_error=1 build/sanitizers/slot-recycler-tsan dev/tests/fixtures/kv-selection-traces
+slot_recycler_test: code128.kvst: 51521 misses, 52949 least recently used
+slot_recycler_test: novel128.kvst: 54301 misses, 55585 least recently used
+slot_recycler_test: novel256.kvst: 76406 misses, 78716 least recently used
+slot_recycler_test: PASS
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/engine-memory-plan-asan-ubsan
+elastic memory plan tests passed
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/memory-audit-asan-ubsan
+elastic memory audit tests passed
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 build/sanitizers/runtime-status-asan-ubsan dev/tests/engine/status_golden.json
+runtime status tests passed

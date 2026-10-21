@@ -9,9 +9,11 @@ maintainer runs them; preparation never means a test passed.
 
 ## Freeze and identify the inputs
 
-Use isolated checkouts/builds. Build production `splash`,
-`engine-tests/model-runtime-oracle` and `engine-tests/decode-profile` with the
-same compiler flags; keep `splash.metallib` beside each executable. Never
+Use isolated checkouts and the repository build targets for production `splash`,
+`engine-tests/model-runtime-oracle` and `engine-tests/decode-profile`. Match
+toolchain, configuration and per-target flags between comparison arms. Keep
+`splash.metallib` beside each frozen production executable; oracle/profile
+commands pass the library path explicitly. Never
 rebuild files used by an active server. Record commits, dirty diffs, toolchain,
 OS, GPU/core count, memory and power conditions. The runner hashes executable,
 library and model-manifest bytes and refuses changes during execution.

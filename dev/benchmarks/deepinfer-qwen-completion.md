@@ -4,8 +4,11 @@ Tracking issue: [#508](https://github.com/incoai/splash/issues/508).
 Current-main contribution: [#523](https://github.com/incoai/splash/pull/523).
 This file records what the six-step [plan](deepinfer-qwen-plan.md) produced,
 which implementation was measured, and why each conditional change was kept
-or rejected. Final model validation and replacement-run status remain explicit
-in the linked manifests while execution is underway.
+or rejected. All six frozen-source local experiments now have complete measured decisions.
+Fresh current-main model/HTTP validation remains explicit in its separate
+manifests. It uncovered a cross-graph penalty-oracle assertion; the original
+failure and a separately verified test-only correction will be reported
+independently.
 
 ## Scope and source identities
 
@@ -38,12 +41,12 @@ it contains no production kernel, scheduler, protocol, model or default change.
 
 | Plan step | Deliverable and measured decision | Evidence |
 | --- | --- | --- |
-| 1. Measure runtime | Fused native profiles and per-width operator attribution, full-engine/mask/ANE diagnostics, native-overlap HTTP workloads. Dense profiles point predominantly to linear work; MoE also has substantial expert work. Attribution is diagnostic, not a fused speedup estimate. | [Operator tables](results/qwen-runtime-measurements-m5-pro/README.md), [trace diagnostics](results/qwen-serving-trace-m5-pro/diagnostics.json), [host bounds](results/qwen-host-overhead-m5-pro/host-bound.json). |
+| 1. Measure runtime | Fused native profiles and per-width operator attribution, full-engine/mask/ANE diagnostics, native-overlap HTTP workloads. Dense profiles point predominantly to linear work; MoE also has substantial expert work. Attribution is diagnostic, not a fused speedup estimate. | [Operator tables](results/qwen-runtime-measurements-m5-pro/README.md), [trace diagnostics](results/qwen-serving-trace-m5-pro/diagnostics.json), [full display timelines](results/qwen-serving-timeline-m5-pro/README.md), [host bounds](results/qwen-host-overhead-m5-pro/host-bound.json). |
 | 2. Greedy MoE prefixes | Ported the old opt-in prototype, retained the eight-row storage ABI and sampled/constrained fallback, and tested quantized formats, contexts and widths. Selective expert work improves some recorded legacy workloads. Merged #487 supersedes this runtime integration; the old threshold is not added to current main. | [Initial implementation/results](deepinfer-qwen-results.md), [expanded serving matrix](results/qwen-serving-qualification-m5-pro/README.md). |
 | 3. Pending-tape GDN | Reworked the stash idea for pending tapes, both state types and poisoned suffixes. Correctness passes, but native/HTTP gains do not meet promotion. Keep it out of production. | [Design/invariants](gdn-live-prefixes.md), [4,096 cycle records and oracles](results/qwen-gdn-live-prefixes-m5-pro/README.md). |
 | 4. Cost-aware policy | Calibrated the old cumulative selector heuristic; evaluated existing #487 rather than building a competing adaptive scheduler. Fourteen training reports select GGUF 8/MLX 6 row controls. Eighteen held-out comparisons include two stable regressions, so that recorded revision fails its local gate. This is not a regression claim about later main. | [Calibration](confidence-calibration.md), [fixed/adaptive held-out evidence](results/qwen-policy-evaluation-m5-pro/README.md). |
 | 5. Host work | A safe binding change removes one allocation per dispatch, with GPU ownership/growth tests. Awake production repeats show no qualified throughput gain. Retain the baseline; the measured opportunity does not justify a larger graph-reuse or future-step pipeline. | [Allocation probe, patch, tests and HTTP controls](results/qwen-host-overhead-m5-pro/README.md). |
-| 6. Mixed prefill/decode | Implemented a bounded optional estimator and tested ragged geometry/fairness, cold/cache/continuation workloads and actual native overlap. Prior-only prediction improves, but serving does not establish a repeatable promotion benefit; a dense cached trial regresses in maximum chunk gap. Keep the old estimator prototype experimental and do not replace current main's newer scheduler. | [Design](prefill-cost-model.md), [prediction and serving evidence](results/qwen-prefill-cost-m5-pro/README.md). |
+| 6. Mixed prefill/decode | Implemented a bounded optional estimator and tested ragged geometry/fairness, cold/cache/continuation workloads and actual native overlap. Prior-only prediction improves, but serving does not establish a repeatable promotion benefit; MoE 2k long TTFT improves 12.7–14.5% while maximum gaps regress 41.4–45.0%, and a dense cached trial also regresses in maximum gap. Dedicated scheduler ASAN/UBSAN and TSAN pass. Keep the old estimator prototype experimental and do not replace current main's newer scheduler. | [Design](prefill-cost-model.md), [prediction and serving evidence](results/qwen-prefill-cost-m5-pro/README.md). |
 
 ## Measurement validity
 
@@ -76,7 +79,9 @@ Initial ANE availability does not prove every contended command actually uses
 the split path. RAM-prefix continuation is not a memory-pressure suspension test.
 
 Greedy hashes can differ, including between repetitions of the same fixed
-policy. A dedicated exact-prompt replay investigates the affected GGUF cases.
+policy. The dedicated exact-prompt replay of all three affected GGUF cases completes
+with matching hashes across clean main and the disabled candidate. It does not
+reproduce the earlier differences or establish their cause.
 Timing, numerical correctness, output equality and quality are separate claims;
 none of these finite greedy/probe runs establishes a sampling distribution.
 Confidence labels are descriptive and correlated. Censored suffixes are

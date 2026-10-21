@@ -1,0 +1,263 @@
+{
+  "runtime_base": "1482f6bbc2abf12375332725302019594150b6cb",
+  "status": "all four installed; numerical oracle validation is reported separately",
+  "models": [
+    {
+      "label": "moe-gguf",
+      "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ3_XXS",
+      "family": "Qwen3.6-35B-A3B",
+      "target_format": "gguf",
+      "vision_format": "none",
+      "root": "$SPLASH/install/models/.resolved/fbd33ebb12696638784e67f8d0b6c7f9add5de557c39732d95de90a8194967d5",
+      "manifest_sha256": "fbd33ebb12696638784e67f8d0b6c7f9add5de557c39732d95de90a8194967d5",
+      "sources": {
+        "draft": {
+          "repo": "incoai/Qwen3.6-35B-A3B-DFlash2",
+          "revision": "51ef7b6923ad6c14cb1bb41c37a9041446496ab6"
+        },
+        "target": {
+          "repo": "unsloth/Qwen3.6-35B-A3B-GGUF",
+          "revision": "a483e9e6cbd595906af30beda3187c2663a1118c"
+        }
+      },
+      "files": {
+        "config.json": {
+          "bytes": 296,
+          "recorded_digest": "98a92a176f9daf4ad495a2aa789feac57942417bf2071e2280db3d2c0ffb24b9"
+        },
+        "draft/config.json": {
+          "bytes": 1291,
+          "recorded_digest": "8608b21225ca5368677b627f61eb2441c572e875"
+        },
+        "draft/model.safetensors": {
+          "bytes": 1052513456,
+          "recorded_digest": "d1f16c0ff85afbe6166fabfae998af3ec16fa11da87da4391b5e0e0a7c796a4d"
+        },
+        "target/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf": {
+          "bytes": 13211155424,
+          "recorded_digest": "9c964e657212fea1f24905dd7b0a89b82fd807d19fab0b41da14251b07b88fbe"
+        },
+        "tokenizer/chat_template.jinja": {
+          "bytes": 8057,
+          "recorded_digest": "55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c"
+        },
+        "tokenizer/config.json": {
+          "bytes": 296,
+          "recorded_digest": "98a92a176f9daf4ad495a2aa789feac57942417bf2071e2280db3d2c0ffb24b9"
+        },
+        "tokenizer/tokenizer.json": {
+          "bytes": 10085571,
+          "recorded_digest": "8e852142d8ab38bb7678f650bd504ba28c29d9c6357e6ed762bebdbd474689eb"
+        },
+        "tokenizer/tokenizer_config.json": {
+          "bytes": 6198,
+          "recorded_digest": "c0435ea80b819a4fb16914a820960ff7c38f9d48cb94e7e8a28780fe01e8dea0"
+        }
+      }
+    },
+    {
+      "label": "moe-mlx",
+      "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+      "family": "Qwen3.6-35B-A3B",
+      "target_format": "mlx-affine",
+      "vision_format": "none",
+      "root": "$SPLASH/install/models/.resolved/3a1b291dc8b9e540488f002c99df9b34e29ad3b707b5f2501106609068cb7251",
+      "manifest_sha256": "3a1b291dc8b9e540488f002c99df9b34e29ad3b707b5f2501106609068cb7251",
+      "sources": {
+        "draft": {
+          "repo": "incoai/Qwen3.6-35B-A3B-DFlash2",
+          "revision": "51ef7b6923ad6c14cb1bb41c37a9041446496ab6"
+        },
+        "target": {
+          "repo": "mlx-community/Qwen3.6-35B-A3B-4bit",
+          "revision": "38740b847e4cb78f352aba30aa41c76e08e6eb46"
+        }
+      },
+      "files": {
+        "config.json": {
+          "bytes": 23591,
+          "recorded_digest": "e3a2334ebf2df216742ef3ed4b784417bfffe6fc"
+        },
+        "draft/config.json": {
+          "bytes": 1291,
+          "recorded_digest": "8608b21225ca5368677b627f61eb2441c572e875"
+        },
+        "draft/model.safetensors": {
+          "bytes": 1052513456,
+          "recorded_digest": "d1f16c0ff85afbe6166fabfae998af3ec16fa11da87da4391b5e0e0a7c796a4d"
+        },
+        "target/config.json": {
+          "bytes": 23591,
+          "recorded_digest": "e3a2334ebf2df216742ef3ed4b784417bfffe6fc"
+        },
+        "target/model-00001-of-00004.safetensors": {
+          "bytes": 5288196018,
+          "recorded_digest": "09f3e6ecb0b7af6e6a38bc8169a134c821b0924c2679b2bb8f4426ad38d032b8"
+        },
+        "target/model-00002-of-00004.safetensors": {
+          "bytes": 5368472749,
+          "recorded_digest": "31dcdb1c49eebdb1505bd14e3cb33f9cf900bd2546b638f2464694ae763a033f"
+        },
+        "target/model-00003-of-00004.safetensors": {
+          "bytes": 5368324139,
+          "recorded_digest": "3e66de06a1f03dade16a612a368cfce4a4c9caa4efd7d28185454384082cec03"
+        },
+        "target/model-00004-of-00004.safetensors": {
+          "bytes": 4377211365,
+          "recorded_digest": "a5d0cf03519c26f8b506df6b0ba60526e5c08c8cea22d0c21ce92950e58a5422"
+        },
+        "tokenizer/chat_template.jinja": {
+          "bytes": 7764,
+          "recorded_digest": "a8755d827c0a7b614c246c4060dfd58ab352a8ff"
+        },
+        "tokenizer/config.json": {
+          "bytes": 23591,
+          "recorded_digest": "e3a2334ebf2df216742ef3ed4b784417bfffe6fc"
+        },
+        "tokenizer/tokenizer.json": {
+          "bytes": 19989343,
+          "recorded_digest": "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4"
+        },
+        "tokenizer/tokenizer_config.json": {
+          "bytes": 1139,
+          "recorded_digest": "a068e2468cff426a9b105006e74e044030a6faf4"
+        },
+        "tokenizer/vocab.json": {
+          "bytes": 6722759,
+          "recorded_digest": "0aa0ce0658d60ac4a5d609f4eadb0e8e43514176"
+        }
+      }
+    },
+    {
+      "label": "dense-mlx",
+      "model": "mlx-community/Qwen3.8-27B-4bit",
+      "family": "Qwen3.8-27B",
+      "target_format": "mlx-affine",
+      "vision_format": "safetensors",
+      "root": "$SPLASH/install/models/.resolved/edf6abe677ec8a2fa17ec73205cdd5d3d9a208cbd6c3053387b0e431de0f86ff",
+      "manifest_sha256": "edf6abe677ec8a2fa17ec73205cdd5d3d9a208cbd6c3053387b0e431de0f86ff",
+      "sources": {
+        "draft": {
+          "repo": "incoai/Qwen3.8-27B-DFlash2",
+          "revision": "015e795645c74b1a0eeef3b570031fb62e769bc5"
+        },
+        "target": {
+          "repo": "mlx-community/Qwen3.8-27B-4bit",
+          "revision": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818"
+        }
+      },
+      "files": {
+        "config.json": {
+          "bytes": 4932,
+          "recorded_digest": "3fb03e916f494e6745aa23df751da26f79e06470"
+        },
+        "draft/config.json": {
+          "bytes": 1239,
+          "recorded_digest": "79279cc5665bced6f3cdaa2095a2ffe819497b2e"
+        },
+        "draft/model.safetensors": {
+          "bytes": 3848817896,
+          "recorded_digest": "67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c"
+        },
+        "target/config.json": {
+          "bytes": 4932,
+          "recorded_digest": "3fb03e916f494e6745aa23df751da26f79e06470"
+        },
+        "target/model-00001-of-00003.safetensors": {
+          "bytes": 5343268662,
+          "recorded_digest": "6cc1508e96fb5d0865dfd5753a79f4ec60651bf3e2a82844a7e8ae9c60528c0d"
+        },
+        "target/model-00002-of-00003.safetensors": {
+          "bytes": 5354185130,
+          "recorded_digest": "83f2a20ca8058f486a3634a27faf99587f4cd3c156a83dee34fb99e6ac178670"
+        },
+        "target/model-00003-of-00003.safetensors": {
+          "bytes": 5357087557,
+          "recorded_digest": "31b8c91ef899f79efaaa69e3d2c096f6e2ebeb2ff20e29222abbd9ebc79e560a"
+        },
+        "tokenizer/chat_template.jinja": {
+          "bytes": 8952,
+          "recorded_digest": "c0c686f9c38d70d179fb7b5f5aa7530bc913dda3"
+        },
+        "tokenizer/config.json": {
+          "bytes": 4932,
+          "recorded_digest": "3fb03e916f494e6745aa23df751da26f79e06470"
+        },
+        "tokenizer/tokenizer.json": {
+          "bytes": 19989325,
+          "recorded_digest": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+        },
+        "tokenizer/tokenizer_config.json": {
+          "bytes": 1165,
+          "recorded_digest": "1d134cd298be1e3be25db393d93a1cefe80e3214"
+        },
+        "tokenizer/vocab.json": {
+          "bytes": 6722759,
+          "recorded_digest": "0aa0ce0658d60ac4a5d609f4eadb0e8e43514176"
+        },
+        "vision/config.json": {
+          "bytes": 4932,
+          "recorded_digest": "3fb03e916f494e6745aa23df751da26f79e06470"
+        },
+        "vision/model-00001-of-00003.safetensors": {
+          "bytes": 5343268662,
+          "recorded_digest": "6cc1508e96fb5d0865dfd5753a79f4ec60651bf3e2a82844a7e8ae9c60528c0d"
+        }
+      }
+    },
+    {
+      "label": "dense-gguf",
+      "model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M",
+      "family": "Qwen3.8-27B",
+      "target_format": "gguf",
+      "vision_format": "none",
+      "root": "$SPLASH/install/models/.resolved/5c93a8a7000ad299df2ed15b0411ac73ccea878ff5ce98dc00ab7a65f6e64813",
+      "manifest_sha256": "5c93a8a7000ad299df2ed15b0411ac73ccea878ff5ce98dc00ab7a65f6e64813",
+      "sources": {
+        "draft": {
+          "repo": "incoai/Qwen3.8-27B-DFlash2",
+          "revision": "015e795645c74b1a0eeef3b570031fb62e769bc5"
+        },
+        "target": {
+          "repo": "unsloth/Qwen3.8-27B-GGUF",
+          "revision": "4ca720788d1e01f1bff70c033e0d0028fd02e502"
+        }
+      },
+      "files": {
+        "config.json": {
+          "bytes": 288,
+          "recorded_digest": "db7d36a53e2797e27fd4e3614b9a234c7f3a10f0859e1b855c5f031e7cf3712c"
+        },
+        "draft/config.json": {
+          "bytes": 1239,
+          "recorded_digest": "79279cc5665bced6f3cdaa2095a2ffe819497b2e"
+        },
+        "draft/model.safetensors": {
+          "bytes": 3848817896,
+          "recorded_digest": "67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c"
+        },
+        "target/Qwen3.8-27B-UD-Q4_K_M.gguf": {
+          "bytes": 16464440224,
+          "recorded_digest": "322e194ff79741c7baa497c240f677f54b201b0efab44ca8e50f122b39123482"
+        },
+        "tokenizer/chat_template.jinja": {
+          "bytes": 9993,
+          "recorded_digest": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce"
+        },
+        "tokenizer/config.json": {
+          "bytes": 288,
+          "recorded_digest": "db7d36a53e2797e27fd4e3614b9a234c7f3a10f0859e1b855c5f031e7cf3712c"
+        },
+        "tokenizer/tokenizer.json": {
+          "bytes": 10085571,
+          "recorded_digest": "8e852142d8ab38bb7678f650bd504ba28c29d9c6357e6ed762bebdbd474689eb"
+        },
+        "tokenizer/tokenizer_config.json": {
+          "bytes": 6198,
+          "recorded_digest": "c0435ea80b819a4fb16914a820960ff7c38f9d48cb94e7e8a28780fe01e8dea0"
+        }
+      }
+    }
+  ],
+  "note": "File sizes/digests copied from installed manifests; this is not a separate full-file rehash. Manifest identities are local, while source revisions and recorded file digests identify reproducible bytes."
+}

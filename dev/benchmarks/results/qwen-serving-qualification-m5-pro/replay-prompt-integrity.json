@@ -1,0 +1,22 @@
+{
+  "scope": "Prompt reconstruction only; this check does not execute a model. Actual model replay is reported separately.",
+  "cases": [
+    {
+      "context": 8192,
+      "workload": "math",
+      "sample": 2
+    },
+    {
+      "context": 8192,
+      "workload": "prose",
+      "sample": 0
+    },
+    {
+      "context": 8192,
+      "workload": "prose",
+      "sample": 2
+    }
+  ],
+  "all_original_prompt_hashes_match": true,
+  "driver_metadata_written": true
+}

@@ -1,0 +1,4816 @@
+{
+  "complete": true,
+  "model": "mlx-community/Qwen3.6-35B-A3B-4bit",
+  "model_manifest_sha256": "3a1b291dc8b9e540488f002c99df9b34e29ad3b707b5f2501106609068cb7251",
+  "binaries": [
+    {
+      "sha256": "e49a2decd3cdc1f47ed98e68eb97fa46fd0bedb829a8b20a00b2623691c3d5ba",
+      "metallib_sha256": "53216b09444405aa1cc1aa717c7fd75bc5b292d1db4967641d4ab97a51bf8d2d"
+    },
+    {
+      "sha256": "e49a2decd3cdc1f47ed98e68eb97fa46fd0bedb829a8b20a00b2623691c3d5ba",
+      "metallib_sha256": "53216b09444405aa1cc1aa717c7fd75bc5b292d1db4967641d4ab97a51bf8d2d"
+    }
+  ],
+  "environments": [
+    {
+      "HF_HUB_OFFLINE": "1",
+      "MTL_SHADER_VALIDATION": null,
+      "SPLASH_SERVING_TRACE": null,
+      "SPLASH_LIVE_VERIFY_THRESHOLD": "1e-9"
+    },
+    {
+      "HF_HUB_OFFLINE": "1",
+      "MTL_SHADER_VALIDATION": null,
+      "SPLASH_SERVING_TRACE": null,
+      "SPLASH_LIVE_VERIFY_THRESHOLD": "0.1"
+    }
+  ],
+  "environment": {
+    "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true",
+    "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+    "unix_seconds": 1792560683.981327,
+    "awake_seconds": 213189.236630083
+  },
+  "serving_tool_sha256": "19b608ca830514b10015a63523d75441661d125f841e126c28ffead8121fed53",
+  "analysis_tool_sha256": "9965937815f44e449117f2c448c84b3a4c33195d65224adfaf6d3e6ed505b95c",
+  "settings": {
+    "max_context": 32768,
+    "max_memory": "26G",
+    "kv_format": "int8",
+    "tokens": 256,
+    "batch": 1,
+    "samples": 1,
+    "cache_mode": "cold",
+    "warmup_rounds": 4,
+    "status_interval_seconds": 0.1,
+    "warmup_context": 2048,
+    "warmup_tokens": 512,
+    "warmup_seconds_per_arm": 0.0,
+    "arrival_delay_seconds": 0.05,
+    "mixed_active_context": 2048,
+    "mixed_short_context": 512,
+    "mixed_peer_output_tokens": 32
+  },
+  "inputs": [
+    {
+      "trace": "round-1-trace.json",
+      "sha256": "c843091cee259e039b9f00a59dd1847aab0d5d14037a49eaca5bd46f1fa2d289",
+      "arm": 1,
+      "observations": 2226
+    },
+    {
+      "trace": "round-2-trace.json",
+      "sha256": "68f4ca3515c352839f4cfd9c1075323c08f3f4b0152a4892b93ebad69ff6f656",
+      "arm": 2,
+      "observations": 2233
+    },
+    {
+      "trace": "round-3-trace.json",
+      "sha256": "0a0ce6d3ddfed788bc6c39220723b92118cf1f53a6af4f2e15200a2e45539069",
+      "arm": 2,
+      "observations": 2233
+    },
+    {
+      "trace": "round-4-trace.json",
+      "sha256": "1536aa7c548a83768a94b887aed3424a9202f81f7dca710dd8260e635a796517",
+      "arm": 1,
+      "observations": 2226
+    }
+  ],
+  "arms": {
+    "1": [
+      {
+        "context": 2048,
+        "workload": "code",
+        "position": 1,
+        "total": 162,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 2,
+            "mean_confidence": 0.18308937549591064,
+            "prefix_survival": 0,
+            "brier_score": 0.033521719419482565
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 12,
+            "mean_confidence": 0.34476109345753986,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.230641288611204
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 8,
+            "mean_confidence": 0.4299335703253746,
+            "prefix_survival": 0.5,
+            "brier_score": 0.23929748265947492
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 18,
+            "mean_confidence": 0.5699838664796617,
+            "prefix_survival": 0.7777777777777778,
+            "brier_score": 0.2192828321653732
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 10,
+            "mean_confidence": 0.6258417725563049,
+            "prefix_survival": 0.6,
+            "brier_score": 0.263474600903816
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 10,
+            "mean_confidence": 0.7319239616394043,
+            "prefix_survival": 0.8,
+            "brier_score": 0.15284284323561934
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 4,
+            "mean_confidence": 0.8912038803100586,
+            "prefix_survival": 1,
+            "brier_score": 0.011882963770890598
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 98,
+            "mean_confidence": 0.9775445911349082,
+            "prefix_survival": 0.8979591836734694,
+            "brier_score": 0.09184605623470288
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "code",
+        "position": 2,
+        "total": 162,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 16,
+            "mean_confidence": 0.14926200732588768,
+            "prefix_survival": 0.25,
+            "brier_score": 0.18722598228320925
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 14,
+            "mean_confidence": 0.2531833222934178,
+            "prefix_survival": 0.14285714285714285,
+            "brier_score": 0.1250018857054473
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 26,
+            "mean_confidence": 0.35276517042746913,
+            "prefix_survival": 0.3076923076923077,
+            "brier_score": 0.20489188121263593
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 12,
+            "mean_confidence": 0.46823495129744214,
+            "prefix_survival": 0.5,
+            "brier_score": 0.24708458328908245
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 14,
+            "mean_confidence": 0.5514152135167804,
+            "prefix_survival": 0.42857142857142855,
+            "brier_score": 0.23751590370219944
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 12,
+            "mean_confidence": 0.6421780387560526,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.31552015796246974
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 10,
+            "mean_confidence": 0.7691579103469849,
+            "prefix_survival": 0.8,
+            "brier_score": 0.16125073802809312
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 10,
+            "mean_confidence": 0.8750862836837768,
+            "prefix_survival": 1,
+            "brier_score": 0.015925120833404093
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 48,
+            "mean_confidence": 0.960720106959343,
+            "prefix_survival": 0.8333333333333334,
+            "brier_score": 0.14348053746459635
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "code",
+        "position": 3,
+        "total": 162,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 8,
+            "mean_confidence": 0.08626682870090008,
+            "prefix_survival": 0.25,
+            "brier_score": 0.2122509364615955
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 18,
+            "mean_confidence": 0.14839972058931986,
+            "prefix_survival": 0,
+            "brier_score": 0.02248613246329508
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 12,
+            "mean_confidence": 0.25145769119262695,
+            "prefix_survival": 0,
+            "brier_score": 0.06408519513598547
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 44,
+            "mean_confidence": 0.3441354700110175,
+            "prefix_survival": 0.3181818181818182,
+            "brier_score": 0.21164956107218902
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 16,
+            "mean_confidence": 0.4646688140928745,
+            "prefix_survival": 0.125,
+            "brier_score": 0.21812357112298864
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 14,
+            "mean_confidence": 0.5447110618863787,
+            "prefix_survival": 0.2857142857142857,
+            "brier_score": 0.2634673467203389
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 8,
+            "mean_confidence": 0.6302599161863327,
+            "prefix_survival": 0.25,
+            "brier_score": 0.34528305721042596
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 6,
+            "mean_confidence": 0.7727478345235189,
+            "prefix_survival": 0,
+            "brier_score": 0.5977620538089639
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 12,
+            "mean_confidence": 0.8349917531013489,
+            "prefix_survival": 0.5,
+            "brier_score": 0.3412792856446056
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 24,
+            "mean_confidence": 0.9553203036387762,
+            "prefix_survival": 0.9166666666666666,
+            "brier_score": 0.0720667361996344
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "code",
+        "position": 4,
+        "total": 162,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 16,
+            "mean_confidence": 0.07772036455571651,
+            "prefix_survival": 0,
+            "brier_score": 0.006071877930219516
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 28,
+            "mean_confidence": 0.1504458071930068,
+            "prefix_survival": 0,
+            "brier_score": 0.02322075363681831
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 26,
+            "mean_confidence": 0.2500896923817121,
+            "prefix_survival": 0.07692307692307693,
+            "brier_score": 0.10565849586881658
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 30,
+            "mean_confidence": 0.33751570582389834,
+            "prefix_survival": 0.4,
+            "brier_score": 0.23888948201409696
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 12,
+            "mean_confidence": 0.4630441615978877,
+            "prefix_survival": 0,
+            "brier_score": 0.21504987452752097
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 18,
+            "mean_confidence": 0.5503745211495293,
+            "prefix_survival": 0.2222222222222222,
+            "brier_score": 0.2771429523535763
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 8,
+            "mean_confidence": 0.6538208574056625,
+            "prefix_survival": 0,
+            "brier_score": 0.4281475489419835
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 10,
+            "mean_confidence": 0.7398001432418824,
+            "prefix_survival": 0.2,
+            "brier_score": 0.46453423025328816
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 4,
+            "mean_confidence": 0.8730143010616302,
+            "prefix_survival": 1,
+            "brier_score": 0.016742705642068145
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 10,
+            "mean_confidence": 0.9662707805633545,
+            "prefix_survival": 0.8,
+            "brier_score": 0.18893728029225798
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "code",
+        "position": 5,
+        "total": 162,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 30,
+            "mean_confidence": 0.06494732896486918,
+            "prefix_survival": 0,
+            "brier_score": 0.004637069886790956
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 28,
+            "mean_confidence": 0.14150414243340492,
+            "prefix_survival": 0,
+            "brier_score": 0.02060120771874649
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 30,
+            "mean_confidence": 0.24931194881598154,
+            "prefix_survival": 0.06666666666666667,
+            "brier_score": 0.09051114438501522
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 20,
+            "mean_confidence": 0.32952243387699126,
+            "prefix_survival": 0.3,
+            "brier_score": 0.21659059590382315
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 20,
+            "mean_confidence": 0.4427561014890671,
+            "prefix_survival": 0.1,
+            "brier_score": 0.20067047070134486
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 16,
+            "mean_confidence": 0.5438246950507164,
+            "prefix_survival": 0.125,
+            "brier_score": 0.28910490060916905
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 2,
+            "mean_confidence": 0.6891283988952637,
+            "prefix_survival": 0,
+            "brier_score": 0.47489795016394964
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 6,
+            "mean_confidence": 0.7780957619349161,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.4108093743402061
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 6,
+            "mean_confidence": 0.8561004598935446,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.2595003132792435
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 4,
+            "mean_confidence": 0.9713138341903687,
+            "prefix_survival": 1,
+            "brier_score": 0.000859878112908774
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "code",
+        "position": 6,
+        "total": 162,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 44,
+            "mean_confidence": 0.05362679513001984,
+            "prefix_survival": 0,
+            "brier_score": 0.0035294675398724507
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 36,
+            "mean_confidence": 0.1385154181884395,
+            "prefix_survival": 0.1111111111111111,
+            "brier_score": 0.09902846938958092
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 30,
+            "mean_confidence": 0.2500896672407786,
+            "prefix_survival": 0.06666666666666667,
+            "brier_score": 0.0911740860173374
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 14,
+            "mean_confidence": 0.3543531426361629,
+            "prefix_survival": 0.14285714285714285,
+            "brier_score": 0.17404316898770908
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 12,
+            "mean_confidence": 0.43895378212134045,
+            "prefix_survival": 0,
+            "brier_score": 0.19312952479638712
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 12,
+            "mean_confidence": 0.5446256498495737,
+            "prefix_survival": 0.16666666666666666,
+            "brier_score": 0.2877268036040939
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 4,
+            "mean_confidence": 0.6516737639904022,
+            "prefix_survival": 0.5,
+            "brier_score": 0.3114101970528953
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 8,
+            "mean_confidence": 0.767261266708374,
+            "prefix_survival": 0.25,
+            "brier_score": 0.4439375184294949
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 2,
+            "mean_confidence": 0.8619915843009949,
+            "prefix_survival": 1,
+            "brier_score": 0.019046322803749405
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "code",
+        "position": 7,
+        "total": 162,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 54,
+            "mean_confidence": 0.04040584442447181,
+            "prefix_survival": 0.037037037037037035,
+            "brier_score": 0.03474867458590618
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 36,
+            "mean_confidence": 0.1336403472556008,
+            "prefix_survival": 0,
+            "brier_score": 0.01857355106923802
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 36,
+            "mean_confidence": 0.24786687228414747,
+            "prefix_survival": 0.1111111111111111,
+            "brier_score": 0.11441418785323888
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 14,
+            "mean_confidence": 0.3589546893324171,
+            "prefix_survival": 0.14285714285714285,
+            "brier_score": 0.17749808261117841
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 6,
+            "mean_confidence": 0.44197607040405273,
+            "prefix_survival": 0,
+            "brier_score": 0.19644448900409786
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 10,
+            "mean_confidence": 0.5481740355491638,
+            "prefix_survival": 0,
+            "brier_score": 0.3011289112769752
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 4,
+            "mean_confidence": 0.7355811893939972,
+            "prefix_survival": 0,
+            "brier_score": 0.5418113848439763
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 2,
+            "mean_confidence": 0.8297832608222961,
+            "prefix_survival": 1,
+            "brier_score": 0.028973738296290463
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "prose",
+        "position": 1,
+        "total": 146,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 6,
+            "mean_confidence": 0.35416773955027264,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.29789793911413714
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 10,
+            "mean_confidence": 0.4622911214828491,
+            "prefix_survival": 0.6,
+            "brier_score": 0.2350147824804985
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 12,
+            "mean_confidence": 0.5473192830880483,
+            "prefix_survival": 0.5,
+            "brier_score": 0.2623347505826074
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 12,
+            "mean_confidence": 0.6512047350406647,
+            "prefix_survival": 0.8333333333333334,
+            "brier_score": 0.15887083689362372
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 8,
+            "mean_confidence": 0.7298415303230286,
+            "prefix_survival": 0.25,
+            "brier_score": 0.4219794012601259
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 12,
+            "mean_confidence": 0.8367778658866882,
+            "prefix_survival": 0.8333333333333334,
+            "brier_score": 0.1453628371855006
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 86,
+            "mean_confidence": 0.9817735968634139,
+            "prefix_survival": 0.9302325581395349,
+            "brier_score": 0.06681934008769655
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "prose",
+        "position": 2,
+        "total": 146,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 6,
+            "mean_confidence": 0.12095942348241806,
+            "prefix_survival": 0,
+            "brier_score": 0.014795465309989412
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 12,
+            "mean_confidence": 0.238131915529569,
+            "prefix_survival": 0,
+            "brier_score": 0.057661874020342806
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 14,
+            "mean_confidence": 0.35742261580058504,
+            "prefix_survival": 0.2857142857142857,
+            "brier_score": 0.2017765312057888
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 12,
+            "mean_confidence": 0.45290371278921765,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.2373360335680208
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 16,
+            "mean_confidence": 0.5612680986523628,
+            "prefix_survival": 0.375,
+            "brier_score": 0.27957789225357876
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 12,
+            "mean_confidence": 0.6462376813093821,
+            "prefix_survival": 0.8333333333333334,
+            "brier_score": 0.180531615831906
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 10,
+            "mean_confidence": 0.7643516421318054,
+            "prefix_survival": 0.6,
+            "brier_score": 0.2630059866590365
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 22,
+            "mean_confidence": 0.867451629855416,
+            "prefix_survival": 0.8181818181818182,
+            "brier_score": 0.1629665811474158
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 42,
+            "mean_confidence": 0.9680620857647487,
+            "prefix_survival": 0.9523809523809523,
+            "brier_score": 0.04094357281215857
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "prose",
+        "position": 3,
+        "total": 146,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 6,
+            "mean_confidence": 0.07453872511784236,
+            "prefix_survival": 0,
+            "brier_score": 0.005736561385018528
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 8,
+            "mean_confidence": 0.1452105026692152,
+            "prefix_survival": 0,
+            "brier_score": 0.02194973071960095
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 24,
+            "mean_confidence": 0.2587784565985203,
+            "prefix_survival": 0.08333333333333333,
+            "brier_score": 0.10174726228786389
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 18,
+            "mean_confidence": 0.3390835788514879,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.21643718940632675
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 10,
+            "mean_confidence": 0.4404696702957153,
+            "prefix_survival": 0.6,
+            "brier_score": 0.2603827178296395
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 20,
+            "mean_confidence": 0.5568651258945465,
+            "prefix_survival": 0.2,
+            "brier_score": 0.2748432249632966
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 6,
+            "mean_confidence": 0.643670121828715,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.21855218269642052
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 14,
+            "mean_confidence": 0.7365579349654061,
+            "prefix_survival": 0.7142857142857143,
+            "brier_score": 0.19669280430686292
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 24,
+            "mean_confidence": 0.8646886348724365,
+            "prefix_survival": 0.5833333333333334,
+            "brier_score": 0.32295902916746755
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 16,
+            "mean_confidence": 0.9634269326925278,
+            "prefix_survival": 1,
+            "brier_score": 0.0022670764484731265
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "prose",
+        "position": 4,
+        "total": 146,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 16,
+            "mean_confidence": 0.06444791052490473,
+            "prefix_survival": 0,
+            "brier_score": 0.004662147740079264
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 22,
+            "mean_confidence": 0.1578338457779451,
+            "prefix_survival": 0,
+            "brier_score": 0.025694916538109614
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 26,
+            "mean_confidence": 0.2381058667714779,
+            "prefix_survival": 0.07692307692307693,
+            "brier_score": 0.10208627112754717
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 14,
+            "mean_confidence": 0.33506821734564646,
+            "prefix_survival": 0.2857142857142857,
+            "brier_score": 0.2222548598945198
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 10,
+            "mean_confidence": 0.4385715663433075,
+            "prefix_survival": 0.4,
+            "brier_score": 0.255443728326315
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 14,
+            "mean_confidence": 0.54434677532741,
+            "prefix_survival": 0,
+            "brier_score": 0.29690444154091217
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 16,
+            "mean_confidence": 0.6595574170351028,
+            "prefix_survival": 0.375,
+            "brier_score": 0.3148178747761641
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 6,
+            "mean_confidence": 0.7500609358151754,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.21778804529161397
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 16,
+            "mean_confidence": 0.8489561825990677,
+            "prefix_survival": 0.625,
+            "brier_score": 0.28401268966606263
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 6,
+            "mean_confidence": 0.9398727416992188,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.29437796329176774
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "prose",
+        "position": 5,
+        "total": 146,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 26,
+            "mean_confidence": 0.055773346326672114,
+            "prefix_survival": 0,
+            "brier_score": 0.0036047109891944717
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 44,
+            "mean_confidence": 0.14579744027419525,
+            "prefix_survival": 0.09090909090909091,
+            "brier_score": 0.08812610930543563
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 12,
+            "mean_confidence": 0.254136602083842,
+            "prefix_survival": 0,
+            "brier_score": 0.06547603027212445
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 6,
+            "mean_confidence": 0.3381670117378235,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.2063261163176584
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 8,
+            "mean_confidence": 0.4317278116941452,
+            "prefix_survival": 0.5,
+            "brier_score": 0.26539170010073887
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 16,
+            "mean_confidence": 0.5408446192741394,
+            "prefix_survival": 0,
+            "brier_score": 0.2934066105422408
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 10,
+            "mean_confidence": 0.6749155640602111,
+            "prefix_survival": 0.4,
+            "brier_score": 0.3194928990269794
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 8,
+            "mean_confidence": 0.7428789138793945,
+            "prefix_survival": 0.75,
+            "brier_score": 0.16727796123812588
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 10,
+            "mean_confidence": 0.8383979439735413,
+            "prefix_survival": 0.6,
+            "brier_score": 0.28620396528009523
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 6,
+            "mean_confidence": 0.9380991657574972,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.2911615694017951
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "prose",
+        "position": 6,
+        "total": 146,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 46,
+            "mean_confidence": 0.05350832969112241,
+            "prefix_survival": 0.043478260869565216,
+            "brier_score": 0.03875558125723636
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 28,
+            "mean_confidence": 0.1512754357286862,
+            "prefix_survival": 0,
+            "brier_score": 0.023606214917879564
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 14,
+            "mean_confidence": 0.23208261600562505,
+            "prefix_survival": 0,
+            "brier_score": 0.05452527662713164
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 8,
+            "mean_confidence": 0.3787824958562851,
+            "prefix_survival": 0.5,
+            "brier_score": 0.26313025151620506
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 14,
+            "mean_confidence": 0.45177192773137775,
+            "prefix_survival": 0.2857142857142857,
+            "brier_score": 0.2519855987772539
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 10,
+            "mean_confidence": 0.5323583960533143,
+            "prefix_survival": 0,
+            "brier_score": 0.2841541836484517
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 12,
+            "mean_confidence": 0.6723761260509491,
+            "prefix_survival": 0.16666666666666666,
+            "brier_score": 0.40276261576775535
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 6,
+            "mean_confidence": 0.7488983273506165,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.4033023940200036
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 4,
+            "mean_confidence": 0.814877837896347,
+            "prefix_survival": 0.5,
+            "brier_score": 0.344946413888211
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 4,
+            "mean_confidence": 0.94176185131073,
+            "prefix_survival": 1,
+            "brier_score": 0.0035948730295736198
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "prose",
+        "position": 7,
+        "total": 146,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 62,
+            "mean_confidence": 0.045620238573680964,
+            "prefix_survival": 0.03225806451612903,
+            "brier_score": 0.02908233395438951
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 24,
+            "mean_confidence": 0.13991218556960425,
+            "prefix_survival": 0,
+            "brier_score": 0.020346380787042345
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 20,
+            "mean_confidence": 0.24805392622947692,
+            "prefix_survival": 0.1,
+            "brier_score": 0.1164269088155303
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 6,
+            "mean_confidence": 0.36686838666598004,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.20403474060827312
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 10,
+            "mean_confidence": 0.46275670528411866,
+            "prefix_survival": 0,
+            "brier_score": 0.21418833844027638
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 6,
+            "mean_confidence": 0.5396448969841003,
+            "prefix_survival": 0,
+            "brier_score": 0.29161499183675826
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 8,
+            "mean_confidence": 0.6587529182434082,
+            "prefix_survival": 0.5,
+            "brier_score": 0.28613493499664777
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 6,
+            "mean_confidence": 0.7484614054361979,
+            "prefix_survival": 0,
+            "brier_score": 0.5606871308566236
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 2,
+            "mean_confidence": 0.8011276721954346,
+            "prefix_survival": 1,
+            "brier_score": 0.03955020276640653
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 2,
+            "mean_confidence": 0.9544030427932739,
+            "prefix_survival": 1,
+            "brier_score": 0.002079082506512009
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "code",
+        "position": 1,
+        "total": 170,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 6,
+            "mean_confidence": 0.2684727559487025,
+            "prefix_survival": 0,
+            "brier_score": 0.072493682679309
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 14,
+            "mean_confidence": 0.3498951494693756,
+            "prefix_survival": 0.14285714285714285,
+            "brier_score": 0.1574525278833027
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 8,
+            "mean_confidence": 0.4666924402117729,
+            "prefix_survival": 0.75,
+            "brier_score": 0.2735084301647335
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 26,
+            "mean_confidence": 0.5559409994345444,
+            "prefix_survival": 0.07692307692307693,
+            "brier_score": 0.2969731820526749
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 8,
+            "mean_confidence": 0.662413090467453,
+            "prefix_survival": 0.75,
+            "brier_score": 0.1932762484600996
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 18,
+            "mean_confidence": 0.752572238445282,
+            "prefix_survival": 1,
+            "brier_score": 0.061828374462585996
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 18,
+            "mean_confidence": 0.8544373181131151,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.24605674870803895
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 72,
+            "mean_confidence": 0.9922851605547799,
+            "prefix_survival": 0.9722222222222222,
+            "brier_score": 0.026981614306063148
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "code",
+        "position": 2,
+        "total": 170,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 2,
+            "mean_confidence": 0.07381588965654373,
+            "prefix_survival": 0,
+            "brier_score": 0.00544878556578704
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 16,
+            "mean_confidence": 0.15216712094843388,
+            "prefix_survival": 0.125,
+            "brier_score": 0.106645677939437
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 8,
+            "mean_confidence": 0.2495698668062687,
+            "prefix_survival": 0,
+            "brier_score": 0.0625286186960608
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 20,
+            "mean_confidence": 0.3367127597332001,
+            "prefix_survival": 0.1,
+            "brier_score": 0.15288306883636124
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 10,
+            "mean_confidence": 0.47346224188804625,
+            "prefix_survival": 0.4,
+            "brier_score": 0.2279089726609035
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 28,
+            "mean_confidence": 0.5425336233207158,
+            "prefix_survival": 0.2857142857142857,
+            "brier_score": 0.2848040684929852
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 18,
+            "mean_confidence": 0.6585708326763577,
+            "prefix_survival": 0.4444444444444444,
+            "brier_score": 0.28872925941245753
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 14,
+            "mean_confidence": 0.7503894397190639,
+            "prefix_survival": 0.8571428571428571,
+            "brier_score": 0.1465000891238424
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 8,
+            "mean_confidence": 0.8419093638658524,
+            "prefix_survival": 0.25,
+            "brier_score": 0.5321088450723606
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 46,
+            "mean_confidence": 0.9780859921289526,
+            "prefix_survival": 0.8695652173913043,
+            "brier_score": 0.12537737117770406
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "code",
+        "position": 3,
+        "total": 170,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 12,
+            "mean_confidence": 0.07516767332951228,
+            "prefix_survival": 0.16666666666666666,
+            "brier_score": 0.14625717546881103
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 14,
+            "mean_confidence": 0.1644811545099531,
+            "prefix_survival": 0.14285714285714285,
+            "brier_score": 0.12210559445420273
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 20,
+            "mean_confidence": 0.2540881887078285,
+            "prefix_survival": 0,
+            "brier_score": 0.06515054427928117
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 30,
+            "mean_confidence": 0.3480619192123413,
+            "prefix_survival": 0.13333333333333333,
+            "brier_score": 0.15736104914382879
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 18,
+            "mean_confidence": 0.45256603095266557,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.21759051754773365
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 18,
+            "mean_confidence": 0.5435744921366373,
+            "prefix_survival": 0.2222222222222222,
+            "brier_score": 0.29065743961021123
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 6,
+            "mean_confidence": 0.6792650620142618,
+            "prefix_survival": 1,
+            "brier_score": 0.10296027085745152
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 6,
+            "mean_confidence": 0.7191636164983114,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.22040431111273287
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 16,
+            "mean_confidence": 0.8405081778764725,
+            "prefix_survival": 0.25,
+            "brier_score": 0.5338359580466765
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 30,
+            "mean_confidence": 0.9805153489112854,
+            "prefix_survival": 0.8,
+            "brier_score": 0.19308289365627118
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "code",
+        "position": 4,
+        "total": 170,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 22,
+            "mean_confidence": 0.0716169552708214,
+            "prefix_survival": 0,
+            "brier_score": 0.005563706350778623
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 22,
+            "mean_confidence": 0.14773599871180274,
+            "prefix_survival": 0,
+            "brier_score": 0.022680994124214624
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 22,
+            "mean_confidence": 0.254965061491186,
+            "prefix_survival": 0,
+            "brier_score": 0.06581837523154789
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 28,
+            "mean_confidence": 0.3434110028403146,
+            "prefix_survival": 0,
+            "brier_score": 0.11843426395837955
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 16,
+            "mean_confidence": 0.4499914348125458,
+            "prefix_survival": 0.25,
+            "brier_score": 0.2068790429421361
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 18,
+            "mean_confidence": 0.5375944773356119,
+            "prefix_survival": 0.4444444444444444,
+            "brier_score": 0.2367022064471295
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 4,
+            "mean_confidence": 0.635690301656723,
+            "prefix_survival": 0.5,
+            "brier_score": 0.2389890273760873
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 8,
+            "mean_confidence": 0.7447193711996078,
+            "prefix_survival": 0.25,
+            "brier_score": 0.40620698798063604
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 12,
+            "mean_confidence": 0.8498830497264862,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.4985454366216491
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 18,
+            "mean_confidence": 0.9797191090053983,
+            "prefix_survival": 0.8888888888888888,
+            "brier_score": 0.10494551916218597
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "code",
+        "position": 5,
+        "total": 170,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 38,
+            "mean_confidence": 0.05762614996025437,
+            "prefix_survival": 0,
+            "brier_score": 0.004059034975074223
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 26,
+            "mean_confidence": 0.1484427830347648,
+            "prefix_survival": 0,
+            "brier_score": 0.02297547827078939
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 38,
+            "mean_confidence": 0.2575465244682212,
+            "prefix_survival": 0.05263157894736842,
+            "brier_score": 0.09642463335500158
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 18,
+            "mean_confidence": 0.34237322873539394,
+            "prefix_survival": 0,
+            "brier_score": 0.11797075180064365
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 16,
+            "mean_confidence": 0.4563043676316738,
+            "prefix_survival": 0.375,
+            "brier_score": 0.2308929705294417
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 4,
+            "mean_confidence": 0.556291788816452,
+            "prefix_survival": 0.5,
+            "brier_score": 0.24332003458504836
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 10,
+            "mean_confidence": 0.6513806939125061,
+            "prefix_survival": 0.2,
+            "brier_score": 0.35888202482553666
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 4,
+            "mean_confidence": 0.7620871067047119,
+            "prefix_survival": 0.5,
+            "brier_score": 0.29298675278016617
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 6,
+            "mean_confidence": 0.8560348351796468,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.49548057576638155
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 10,
+            "mean_confidence": 0.9730070114135743,
+            "prefix_survival": 1,
+            "brier_score": 0.0009883248489302332
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "code",
+        "position": 6,
+        "total": 170,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 62,
+            "mean_confidence": 0.05253596809662638,
+            "prefix_survival": 0,
+            "brier_score": 0.003478054301324368
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 26,
+            "mean_confidence": 0.146950085575764,
+            "prefix_survival": 0,
+            "brier_score": 0.02248410518517358
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 34,
+            "mean_confidence": 0.24892419313683228,
+            "prefix_survival": 0.058823529411764705,
+            "brier_score": 0.0932163625535805
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 16,
+            "mean_confidence": 0.3482660725712776,
+            "prefix_survival": 0,
+            "brier_score": 0.12202887688177633
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 6,
+            "mean_confidence": 0.43162769079208374,
+            "prefix_survival": 0,
+            "brier_score": 0.18661752772951523
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 4,
+            "mean_confidence": 0.5537164509296417,
+            "prefix_survival": 0,
+            "brier_score": 0.306661318279426
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 6,
+            "mean_confidence": 0.6709420283635458,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.33967493284185224
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 4,
+            "mean_confidence": 0.7491898536682129,
+            "prefix_survival": 1,
+            "brier_score": 0.06291803536886675
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 4,
+            "mean_confidence": 0.8396146297454834,
+            "prefix_survival": 0,
+            "brier_score": 0.7051047743835852
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 8,
+            "mean_confidence": 0.9714132100343704,
+            "prefix_survival": 1,
+            "brier_score": 0.0011296183209070776
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "code",
+        "position": 7,
+        "total": 170,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 76,
+            "mean_confidence": 0.04331001644267848,
+            "prefix_survival": 0,
+            "brier_score": 0.002770719855212107
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 28,
+            "mean_confidence": 0.14836515752332552,
+            "prefix_survival": 0.07142857142857142,
+            "brier_score": 0.07336401775421392
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 34,
+            "mean_confidence": 0.24947253044913797,
+            "prefix_survival": 0.058823529411764705,
+            "brier_score": 0.08862379178486798
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 8,
+            "mean_confidence": 0.33626164495944977,
+            "prefix_survival": 0,
+            "brier_score": 0.11365680649880128
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 2,
+            "mean_confidence": 0.42503923177719116,
+            "prefix_survival": 0,
+            "brier_score": 0.18065834854974483
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 2,
+            "mean_confidence": 0.514279842376709,
+            "prefix_survival": 0,
+            "brier_score": 0.26448375627501264
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 8,
+            "mean_confidence": 0.6509797126054764,
+            "prefix_survival": 0.5,
+            "brier_score": 0.2562418207348154
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 4,
+            "mean_confidence": 0.81907057762146,
+            "prefix_survival": 0,
+            "brier_score": 0.6709432063726695
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 8,
+            "mean_confidence": 0.971307784318924,
+            "prefix_survival": 1,
+            "brier_score": 0.0011365621635484047
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "prose",
+        "position": 1,
+        "total": 158,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 6,
+            "mean_confidence": 0.2832293212413788,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.3766055124515774
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 8,
+            "mean_confidence": 0.3578314632177353,
+            "prefix_survival": 0.25,
+            "brier_score": 0.18621449174080018
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 2,
+            "mean_confidence": 0.4756552278995514,
+            "prefix_survival": 1,
+            "brier_score": 0.2749374400290714
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 18,
+            "mean_confidence": 0.5510668688350253,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.2535024944294718
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 4,
+            "mean_confidence": 0.6297626197338104,
+            "prefix_survival": 1,
+            "brier_score": 0.13726617241952432
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 16,
+            "mean_confidence": 0.7553228661417961,
+            "prefix_survival": 0.5,
+            "brier_score": 0.3026694849579754
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 18,
+            "mean_confidence": 0.8501734866036309,
+            "prefix_survival": 0.7777777777777778,
+            "brier_score": 0.19212990570873167
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 86,
+            "mean_confidence": 0.989880692127139,
+            "prefix_survival": 0.9069767441860465,
+            "brier_score": 0.09211421537893984
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "prose",
+        "position": 2,
+        "total": 158,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 4,
+            "mean_confidence": 0.14144105464220047,
+            "prefix_survival": 0,
+            "brier_score": 0.020032037197483477
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 16,
+            "mean_confidence": 0.2541982978582382,
+            "prefix_survival": 0.125,
+            "brier_score": 0.11938652626635354
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 18,
+            "mean_confidence": 0.33876796232329476,
+            "prefix_survival": 0.1111111111111111,
+            "brier_score": 0.15247711106301004
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 10,
+            "mean_confidence": 0.4660450518131256,
+            "prefix_survival": 0.2,
+            "brier_score": 0.2277374208742023
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 12,
+            "mean_confidence": 0.550647646188736,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.22424105052710472
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 10,
+            "mean_confidence": 0.6548838496208191,
+            "prefix_survival": 0.4,
+            "brier_score": 0.3003213238365824
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 28,
+            "mean_confidence": 0.748607303415026,
+            "prefix_survival": 0.5714285714285714,
+            "brier_score": 0.2828855412894166
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 18,
+            "mean_confidence": 0.8527633878919814,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.2765722164080052
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 42,
+            "mean_confidence": 0.9865215761320931,
+            "prefix_survival": 0.8095238095238095,
+            "brier_score": 0.1776773295365415
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "prose",
+        "position": 3,
+        "total": 158,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 4,
+            "mean_confidence": 0.06805163249373436,
+            "prefix_survival": 0,
+            "brier_score": 0.004681614769404124
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 24,
+            "mean_confidence": 0.15275402925908566,
+            "prefix_survival": 0,
+            "brier_score": 0.024352449791007216
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 8,
+            "mean_confidence": 0.25785428658127785,
+            "prefix_survival": 0,
+            "brier_score": 0.06730677840972815
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 14,
+            "mean_confidence": 0.33847320079803467,
+            "prefix_survival": 0.14285714285714285,
+            "brier_score": 0.16411366797688082
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 16,
+            "mean_confidence": 0.4464451000094414,
+            "prefix_survival": 0.5,
+            "brier_score": 0.2416952983372873
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 20,
+            "mean_confidence": 0.5520420014858246,
+            "prefix_survival": 0.4,
+            "brier_score": 0.2595617443332177
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 16,
+            "mean_confidence": 0.6546604186296463,
+            "prefix_survival": 0.25,
+            "brier_score": 0.354012654516179
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 22,
+            "mean_confidence": 0.7389069849794562,
+            "prefix_survival": 0.5454545454545454,
+            "brier_score": 0.29512694908072845
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 16,
+            "mean_confidence": 0.8619797900319099,
+            "prefix_survival": 0.625,
+            "brier_score": 0.2818724560720258
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 18,
+            "mean_confidence": 0.9744256933530172,
+            "prefix_survival": 0.7777777777777778,
+            "brier_score": 0.20148318043873203
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "prose",
+        "position": 4,
+        "total": 158,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 14,
+            "mean_confidence": 0.061044818588665554,
+            "prefix_survival": 0,
+            "brier_score": 0.004181763697267998
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 28,
+            "mean_confidence": 0.1526692264846393,
+            "prefix_survival": 0.07142857142857142,
+            "brier_score": 0.06900806660683372
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 24,
+            "mean_confidence": 0.2576569492618243,
+            "prefix_survival": 0,
+            "brier_score": 0.06671336298865078
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 16,
+            "mean_confidence": 0.33709654957056046,
+            "prefix_survival": 0.25,
+            "brier_score": 0.20269182613514647
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 12,
+            "mean_confidence": 0.46428292493025464,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.2595008290431073
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 14,
+            "mean_confidence": 0.5593599932534354,
+            "prefix_survival": 0.2857142857142857,
+            "brier_score": 0.27387764164380407
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 8,
+            "mean_confidence": 0.6456231623888016,
+            "prefix_survival": 0,
+            "brier_score": 0.4179228001949786
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 20,
+            "mean_confidence": 0.7383241653442383,
+            "prefix_survival": 0.5,
+            "brier_score": 0.3109192991763514
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 8,
+            "mean_confidence": 0.8498359620571136,
+            "prefix_survival": 0.25,
+            "brier_score": 0.5429504821865248
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 14,
+            "mean_confidence": 0.97995183297566,
+            "prefix_survival": 0.8571428571428571,
+            "brier_score": 0.13569854521035044
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "prose",
+        "position": 5,
+        "total": 158,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 26,
+            "mean_confidence": 0.05173284789690605,
+            "prefix_survival": 0,
+            "brier_score": 0.0034160968866045914
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 38,
+            "mean_confidence": 0.15406360163500435,
+            "prefix_survival": 0.05263157894736842,
+            "brier_score": 0.05934096975295196
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 22,
+            "mean_confidence": 0.24119987135583704,
+            "prefix_survival": 0.09090909090909091,
+            "brier_score": 0.10449138961368268
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 14,
+            "mean_confidence": 0.36081258739743916,
+            "prefix_survival": 0.2857142857142857,
+            "brier_score": 0.20826634114629908
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 10,
+            "mean_confidence": 0.44796386957168577,
+            "prefix_survival": 0.2,
+            "brier_score": 0.2223239178644615
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 16,
+            "mean_confidence": 0.5552963018417358,
+            "prefix_survival": 0.375,
+            "brier_score": 0.2608303740561979
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 6,
+            "mean_confidence": 0.6456875999768575,
+            "prefix_survival": 0,
+            "brier_score": 0.41716740072027747
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 10,
+            "mean_confidence": 0.7468734383583069,
+            "prefix_survival": 0.6,
+            "brier_score": 0.27822265529442874
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 6,
+            "mean_confidence": 0.8309429883956909,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.45471050470811986
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 10,
+            "mean_confidence": 0.9648190021514893,
+            "prefix_survival": 0.8,
+            "brier_score": 0.18185099106975003
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "prose",
+        "position": 6,
+        "total": 158,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 38,
+            "mean_confidence": 0.047513142056567106,
+            "prefix_survival": 0.05263157894736842,
+            "brier_score": 0.04837412111424046
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 44,
+            "mean_confidence": 0.14557271112095227,
+            "prefix_survival": 0.045454545454545456,
+            "brier_score": 0.05305781469472543
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 20,
+            "mean_confidence": 0.23536931425333024,
+            "prefix_survival": 0.1,
+            "brier_score": 0.09864061776350012
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 16,
+            "mean_confidence": 0.3322354331612587,
+            "prefix_survival": 0.125,
+            "brier_score": 0.15373646462193857
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 8,
+            "mean_confidence": 0.4604777991771698,
+            "prefix_survival": 0.25,
+            "brier_score": 0.2186153526995147
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 4,
+            "mean_confidence": 0.5580228269100189,
+            "prefix_survival": 0,
+            "brier_score": 0.31141398805086773
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 8,
+            "mean_confidence": 0.6383722871541977,
+            "prefix_survival": 0,
+            "brier_score": 0.4088961818665089
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 12,
+            "mean_confidence": 0.7357430160045624,
+            "prefix_survival": 0.5,
+            "brier_score": 0.3187524291147117
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 4,
+            "mean_confidence": 0.8160158097743988,
+            "prefix_survival": 0,
+            "brier_score": 0.666123776339818
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 4,
+            "mean_confidence": 0.9713086783885956,
+            "prefix_survival": 1,
+            "brier_score": 0.0014577053010729202
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "prose",
+        "position": 7,
+        "total": 158,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 66,
+            "mean_confidence": 0.05339755570854653,
+            "prefix_survival": 0,
+            "brier_score": 0.003937936725955475
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 34,
+            "mean_confidence": 0.1470333241364535,
+            "prefix_survival": 0,
+            "brier_score": 0.022413575982990652
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 12,
+            "mean_confidence": 0.23939042538404465,
+            "prefix_survival": 0,
+            "brier_score": 0.05888236136138688
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 14,
+            "mean_confidence": 0.33796383653368267,
+            "prefix_survival": 0,
+            "brier_score": 0.11468888099747561
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 12,
+            "mean_confidence": 0.45688728988170624,
+            "prefix_survival": 0,
+            "brier_score": 0.20960025633570747
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 4,
+            "mean_confidence": 0.5767045021057129,
+            "prefix_survival": 0,
+            "brier_score": 0.3330240116743113
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 4,
+            "mean_confidence": 0.651863694190979,
+            "prefix_survival": 0,
+            "brier_score": 0.4254548372927758
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 8,
+            "mean_confidence": 0.7072882801294327,
+            "prefix_survival": 0.5,
+            "brier_score": 0.29091275365445757
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 2,
+            "mean_confidence": 0.8062349557876587,
+            "prefix_survival": 0,
+            "brier_score": 0.650014803933928
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 2,
+            "mean_confidence": 0.9962460994720459,
+            "prefix_survival": 1,
+            "brier_score": 1.4091769173774082e-05
+          }
+        ]
+      }
+    ],
+    "2": [
+      {
+        "context": 2048,
+        "workload": "code",
+        "position": 1,
+        "total": 160,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 2,
+            "mean_confidence": 0.18308937549591064,
+            "prefix_survival": 0,
+            "brier_score": 0.033521719419482565
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 12,
+            "mean_confidence": 0.34476109345753986,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.230641288611204
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 8,
+            "mean_confidence": 0.4299335703253746,
+            "prefix_survival": 0.5,
+            "brier_score": 0.23929748265947492
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 16,
+            "mean_confidence": 0.5714504644274712,
+            "prefix_survival": 0.75,
+            "brier_score": 0.22230042296585628
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 10,
+            "mean_confidence": 0.6258417725563049,
+            "prefix_survival": 0.6,
+            "brier_score": 0.263474600903816
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 10,
+            "mean_confidence": 0.7319239616394043,
+            "prefix_survival": 0.8,
+            "brier_score": 0.15284284323561934
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 6,
+            "mean_confidence": 0.8931246399879456,
+            "prefix_survival": 1,
+            "brier_score": 0.011460633287388333
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 96,
+            "mean_confidence": 0.9792515734831492,
+            "prefix_survival": 0.9166666666666666,
+            "brier_score": 0.07621611233433834
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "code",
+        "position": 2,
+        "total": 160,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 16,
+            "mean_confidence": 0.14926200732588768,
+            "prefix_survival": 0.25,
+            "brier_score": 0.18722598228320925
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 12,
+            "mean_confidence": 0.25207426647345227,
+            "prefix_survival": 0.16666666666666666,
+            "brier_score": 0.13458293197201346
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 26,
+            "mean_confidence": 0.35276517042746913,
+            "prefix_survival": 0.3076923076923077,
+            "brier_score": 0.20489188121263593
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 12,
+            "mean_confidence": 0.46823495129744214,
+            "prefix_survival": 0.5,
+            "brier_score": 0.24708458328908245
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 12,
+            "mean_confidence": 0.5522477428118387,
+            "prefix_survival": 0.5,
+            "brier_score": 0.228594573978557
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 14,
+            "mean_confidence": 0.6384028622082302,
+            "prefix_survival": 0.42857142857142855,
+            "brier_score": 0.2915382321047219
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 10,
+            "mean_confidence": 0.7691579103469849,
+            "prefix_survival": 0.8,
+            "brier_score": 0.16125073802809312
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 10,
+            "mean_confidence": 0.8750862836837768,
+            "prefix_survival": 1,
+            "brier_score": 0.015925120833404093
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 48,
+            "mean_confidence": 0.960720106959343,
+            "prefix_survival": 0.8333333333333334,
+            "brier_score": 0.14348053746459635
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "code",
+        "position": 3,
+        "total": 160,
+        "censored": 4,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 4,
+            "mean_confidence": 0.08658182248473167,
+            "prefix_survival": 0,
+            "brier_score": 0.0075027306498857416
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 18,
+            "mean_confidence": 0.14839972058931986,
+            "prefix_survival": 0,
+            "brier_score": 0.02248613246329508
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 10,
+            "mean_confidence": 0.25703944861888883,
+            "prefix_survival": 0,
+            "brier_score": 0.06690741166177934
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 42,
+            "mean_confidence": 0.34401712105387733,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.2179635410443309
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 16,
+            "mean_confidence": 0.4646688140928745,
+            "prefix_survival": 0.125,
+            "brier_score": 0.21812357112298864
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 14,
+            "mean_confidence": 0.5447110618863787,
+            "prefix_survival": 0.2857142857142857,
+            "brier_score": 0.2634673467203389
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 10,
+            "mean_confidence": 0.6269517540931702,
+            "prefix_survival": 0.4,
+            "brier_score": 0.3060690316254117
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 6,
+            "mean_confidence": 0.7727478345235189,
+            "prefix_survival": 0,
+            "brier_score": 0.5977620538089639
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 12,
+            "mean_confidence": 0.8349917531013489,
+            "prefix_survival": 0.5,
+            "brier_score": 0.3412792856446056
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 24,
+            "mean_confidence": 0.9553203036387762,
+            "prefix_survival": 0.9166666666666666,
+            "brier_score": 0.0720667361996344
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "code",
+        "position": 4,
+        "total": 160,
+        "censored": 6,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 12,
+            "mean_confidence": 0.07809680824478467,
+            "prefix_survival": 0,
+            "brier_score": 0.006116182489408327
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 28,
+            "mean_confidence": 0.1504458071930068,
+            "prefix_survival": 0,
+            "brier_score": 0.02322075363681831
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 24,
+            "mean_confidence": 0.25351529692610103,
+            "prefix_survival": 0.08333333333333333,
+            "brier_score": 0.11082389891377381
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 26,
+            "mean_confidence": 0.3417572562511151,
+            "prefix_survival": 0.38461538461538464,
+            "brier_score": 0.2321050780477955
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 12,
+            "mean_confidence": 0.4630441615978877,
+            "prefix_survival": 0,
+            "brier_score": 0.21504987452752097
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 20,
+            "mean_confidence": 0.5465843677520752,
+            "prefix_survival": 0.3,
+            "brier_score": 0.27319691594162665
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 8,
+            "mean_confidence": 0.6538208574056625,
+            "prefix_survival": 0,
+            "brier_score": 0.4281475489419835
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 10,
+            "mean_confidence": 0.7398001432418824,
+            "prefix_survival": 0.2,
+            "brier_score": 0.46453423025328816
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 4,
+            "mean_confidence": 0.8730143010616302,
+            "prefix_survival": 1,
+            "brier_score": 0.016742705642068145
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 10,
+            "mean_confidence": 0.9662707805633545,
+            "prefix_survival": 0.8,
+            "brier_score": 0.18893728029225798
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "code",
+        "position": 5,
+        "total": 160,
+        "censored": 6,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 24,
+            "mean_confidence": 0.06270201783627272,
+            "prefix_survival": 0,
+            "brier_score": 0.004368714793796958
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 26,
+            "mean_confidence": 0.14362841557997924,
+            "prefix_survival": 0,
+            "brier_score": 0.021188176675556395
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 30,
+            "mean_confidence": 0.24931194881598154,
+            "prefix_survival": 0.06666666666666667,
+            "brier_score": 0.09051114438501522
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 18,
+            "mean_confidence": 0.3313550353050232,
+            "prefix_survival": 0.2222222222222222,
+            "brier_score": 0.18821964812043943
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 22,
+            "mean_confidence": 0.4469787261702798,
+            "prefix_survival": 0.18181818181818182,
+            "brier_score": 0.20614693333085024
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 16,
+            "mean_confidence": 0.5438246950507164,
+            "prefix_survival": 0.125,
+            "brier_score": 0.28910490060916905
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 2,
+            "mean_confidence": 0.6891283988952637,
+            "prefix_survival": 0,
+            "brier_score": 0.47489795016394964
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 6,
+            "mean_confidence": 0.7780957619349161,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.4108093743402061
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 6,
+            "mean_confidence": 0.8561004598935446,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.2595003132792435
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 4,
+            "mean_confidence": 0.9713138341903687,
+            "prefix_survival": 1,
+            "brier_score": 0.000859878112908774
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "code",
+        "position": 6,
+        "total": 160,
+        "censored": 6,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 38,
+            "mean_confidence": 0.055588009571166414,
+            "prefix_survival": 0,
+            "brier_score": 0.0037062293717831773
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 32,
+            "mean_confidence": 0.140917151235044,
+            "prefix_survival": 0.0625,
+            "brier_score": 0.06349440789303439
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 30,
+            "mean_confidence": 0.2500896672407786,
+            "prefix_survival": 0.06666666666666667,
+            "brier_score": 0.0911740860173374
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 14,
+            "mean_confidence": 0.3543531426361629,
+            "prefix_survival": 0.14285714285714285,
+            "brier_score": 0.17404316898770908
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 14,
+            "mean_confidence": 0.44612101146153044,
+            "prefix_survival": 0.14285714285714285,
+            "brier_score": 0.2028244343175492
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 12,
+            "mean_confidence": 0.5446256498495737,
+            "prefix_survival": 0.16666666666666666,
+            "brier_score": 0.2877268036040939
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 4,
+            "mean_confidence": 0.6516737639904022,
+            "prefix_survival": 0.5,
+            "brier_score": 0.3114101970528953
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 8,
+            "mean_confidence": 0.767261266708374,
+            "prefix_survival": 0.25,
+            "brier_score": 0.4439375184294949
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 2,
+            "mean_confidence": 0.8619915843009949,
+            "prefix_survival": 1,
+            "brier_score": 0.019046322803749405
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "code",
+        "position": 7,
+        "total": 160,
+        "censored": 8,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 42,
+            "mean_confidence": 0.04275241862272933,
+            "prefix_survival": 0,
+            "brier_score": 0.002421493149722303
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 38,
+            "mean_confidence": 0.13633627091583453,
+            "prefix_survival": 0.05263157894736842,
+            "brier_score": 0.052566969276816033
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 36,
+            "mean_confidence": 0.24786687228414747,
+            "prefix_survival": 0.1111111111111111,
+            "brier_score": 0.11441418785323888
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 14,
+            "mean_confidence": 0.3589546893324171,
+            "prefix_survival": 0.14285714285714285,
+            "brier_score": 0.17749808261117841
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 6,
+            "mean_confidence": 0.44197607040405273,
+            "prefix_survival": 0,
+            "brier_score": 0.19644448900409786
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 10,
+            "mean_confidence": 0.5481740355491638,
+            "prefix_survival": 0,
+            "brier_score": 0.3011289112769752
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 4,
+            "mean_confidence": 0.7355811893939972,
+            "prefix_survival": 0,
+            "brier_score": 0.5418113848439763
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 2,
+            "mean_confidence": 0.8297832608222961,
+            "prefix_survival": 1,
+            "brier_score": 0.028973738296290463
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "prose",
+        "position": 1,
+        "total": 148,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 6,
+            "mean_confidence": 0.35416773955027264,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.29789793911413714
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 10,
+            "mean_confidence": 0.4622911214828491,
+            "prefix_survival": 0.6,
+            "brier_score": 0.2350147824804985
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 14,
+            "mean_confidence": 0.5504450116838727,
+            "prefix_survival": 0.5714285714285714,
+            "brier_score": 0.2513710964114608
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 12,
+            "mean_confidence": 0.6512047350406647,
+            "prefix_survival": 0.8333333333333334,
+            "brier_score": 0.15887083689362372
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 8,
+            "mean_confidence": 0.7298415303230286,
+            "prefix_survival": 0.25,
+            "brier_score": 0.4219794012601259
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 12,
+            "mean_confidence": 0.8367778658866882,
+            "prefix_survival": 0.8333333333333334,
+            "brier_score": 0.1453628371855006
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 86,
+            "mean_confidence": 0.9817735968634139,
+            "prefix_survival": 0.9302325581395349,
+            "brier_score": 0.06681934008769655
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "prose",
+        "position": 2,
+        "total": 148,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 8,
+            "mean_confidence": 0.13420535065233707,
+            "prefix_survival": 0,
+            "brier_score": 0.018660652289081994
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 12,
+            "mean_confidence": 0.238131915529569,
+            "prefix_survival": 0,
+            "brier_score": 0.057661874020342806
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 14,
+            "mean_confidence": 0.35742261580058504,
+            "prefix_survival": 0.2857142857142857,
+            "brier_score": 0.2017765312057888
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 12,
+            "mean_confidence": 0.45290371278921765,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.2373360335680208
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 16,
+            "mean_confidence": 0.5612680986523628,
+            "prefix_survival": 0.375,
+            "brier_score": 0.27957789225357876
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 12,
+            "mean_confidence": 0.6462376813093821,
+            "prefix_survival": 0.8333333333333334,
+            "brier_score": 0.180531615831906
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 10,
+            "mean_confidence": 0.7643516421318054,
+            "prefix_survival": 0.6,
+            "brier_score": 0.2630059866590365
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 22,
+            "mean_confidence": 0.867451629855416,
+            "prefix_survival": 0.8181818181818182,
+            "brier_score": 0.1629665811474158
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 42,
+            "mean_confidence": 0.9680620857647487,
+            "prefix_survival": 0.9523809523809523,
+            "brier_score": 0.04094357281215857
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "prose",
+        "position": 3,
+        "total": 148,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 8,
+            "mean_confidence": 0.07482977211475372,
+            "prefix_survival": 0,
+            "brier_score": 0.005735153801928156
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 8,
+            "mean_confidence": 0.1452105026692152,
+            "prefix_survival": 0,
+            "brier_score": 0.02194973071960095
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 24,
+            "mean_confidence": 0.2587784565985203,
+            "prefix_survival": 0.08333333333333333,
+            "brier_score": 0.10174726228786389
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 18,
+            "mean_confidence": 0.3390835788514879,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.21643718940632675
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 10,
+            "mean_confidence": 0.4404696702957153,
+            "prefix_survival": 0.6,
+            "brier_score": 0.2603827178296395
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 20,
+            "mean_confidence": 0.5568651258945465,
+            "prefix_survival": 0.2,
+            "brier_score": 0.2748432249632966
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 6,
+            "mean_confidence": 0.643670121828715,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.21855218269642052
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 14,
+            "mean_confidence": 0.7365579349654061,
+            "prefix_survival": 0.7142857142857143,
+            "brier_score": 0.19669280430686292
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 24,
+            "mean_confidence": 0.8646886348724365,
+            "prefix_survival": 0.5833333333333334,
+            "brier_score": 0.32295902916746755
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 16,
+            "mean_confidence": 0.9634269326925278,
+            "prefix_survival": 1,
+            "brier_score": 0.0022670764484731265
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "prose",
+        "position": 4,
+        "total": 148,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 18,
+            "mean_confidence": 0.06314648977584308,
+            "prefix_survival": 0,
+            "brier_score": 0.004453130577897706
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 22,
+            "mean_confidence": 0.1578338457779451,
+            "prefix_survival": 0,
+            "brier_score": 0.025694916538109614
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 26,
+            "mean_confidence": 0.2381058667714779,
+            "prefix_survival": 0.07692307692307693,
+            "brier_score": 0.10208627112754717
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 14,
+            "mean_confidence": 0.33506821734564646,
+            "prefix_survival": 0.2857142857142857,
+            "brier_score": 0.2222548598945198
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 10,
+            "mean_confidence": 0.4385715663433075,
+            "prefix_survival": 0.4,
+            "brier_score": 0.255443728326315
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 14,
+            "mean_confidence": 0.54434677532741,
+            "prefix_survival": 0,
+            "brier_score": 0.29690444154091217
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 16,
+            "mean_confidence": 0.6595574170351028,
+            "prefix_survival": 0.375,
+            "brier_score": 0.3148178747761641
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 6,
+            "mean_confidence": 0.7500609358151754,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.21778804529161397
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 16,
+            "mean_confidence": 0.8489561825990677,
+            "prefix_survival": 0.625,
+            "brier_score": 0.28401268966606263
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 6,
+            "mean_confidence": 0.9398727416992188,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.29437796329176774
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "prose",
+        "position": 5,
+        "total": 148,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 28,
+            "mean_confidence": 0.052761881944856474,
+            "prefix_survival": 0,
+            "brier_score": 0.003360468029143697
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 44,
+            "mean_confidence": 0.14579744027419525,
+            "prefix_survival": 0.09090909090909091,
+            "brier_score": 0.08812610930543563
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 12,
+            "mean_confidence": 0.254136602083842,
+            "prefix_survival": 0,
+            "brier_score": 0.06547603027212445
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 6,
+            "mean_confidence": 0.3381670117378235,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.2063261163176584
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 8,
+            "mean_confidence": 0.4317278116941452,
+            "prefix_survival": 0.5,
+            "brier_score": 0.26539170010073887
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 16,
+            "mean_confidence": 0.5408446192741394,
+            "prefix_survival": 0,
+            "brier_score": 0.2934066105422408
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 10,
+            "mean_confidence": 0.6749155640602111,
+            "prefix_survival": 0.4,
+            "brier_score": 0.3194928990269794
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 8,
+            "mean_confidence": 0.7428789138793945,
+            "prefix_survival": 0.75,
+            "brier_score": 0.16727796123812588
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 10,
+            "mean_confidence": 0.8383979439735413,
+            "prefix_survival": 0.6,
+            "brier_score": 0.28620396528009523
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 6,
+            "mean_confidence": 0.9380991657574972,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.2911615694017951
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "prose",
+        "position": 6,
+        "total": 148,
+        "censored": 2,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 46,
+            "mean_confidence": 0.04983707371613254,
+            "prefix_survival": 0,
+            "brier_score": 0.0032088765843259516
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 28,
+            "mean_confidence": 0.1512754357286862,
+            "prefix_survival": 0,
+            "brier_score": 0.023606214917879564
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 14,
+            "mean_confidence": 0.23208261600562505,
+            "prefix_survival": 0,
+            "brier_score": 0.05452527662713164
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 8,
+            "mean_confidence": 0.3787824958562851,
+            "prefix_survival": 0.5,
+            "brier_score": 0.26313025151620506
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 14,
+            "mean_confidence": 0.45177192773137775,
+            "prefix_survival": 0.2857142857142857,
+            "brier_score": 0.2519855987772539
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 10,
+            "mean_confidence": 0.5323583960533143,
+            "prefix_survival": 0,
+            "brier_score": 0.2841541836484517
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 12,
+            "mean_confidence": 0.6723761260509491,
+            "prefix_survival": 0.16666666666666666,
+            "brier_score": 0.40276261576775535
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 6,
+            "mean_confidence": 0.7488983273506165,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.4033023940200036
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 4,
+            "mean_confidence": 0.814877837896347,
+            "prefix_survival": 0.5,
+            "brier_score": 0.344946413888211
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 4,
+            "mean_confidence": 0.94176185131073,
+            "prefix_survival": 1,
+            "brier_score": 0.0035948730295736198
+          }
+        ]
+      },
+      {
+        "context": 2048,
+        "workload": "prose",
+        "position": 7,
+        "total": 148,
+        "censored": 2,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 62,
+            "mean_confidence": 0.04272959229626482,
+            "prefix_survival": 0,
+            "brier_score": 0.002616436160170263
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 24,
+            "mean_confidence": 0.13991218556960425,
+            "prefix_survival": 0,
+            "brier_score": 0.020346380787042345
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 20,
+            "mean_confidence": 0.24805392622947692,
+            "prefix_survival": 0.1,
+            "brier_score": 0.1164269088155303
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 6,
+            "mean_confidence": 0.36686838666598004,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.20403474060827312
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 10,
+            "mean_confidence": 0.46275670528411866,
+            "prefix_survival": 0,
+            "brier_score": 0.21418833844027638
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 6,
+            "mean_confidence": 0.5396448969841003,
+            "prefix_survival": 0,
+            "brier_score": 0.29161499183675826
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 8,
+            "mean_confidence": 0.6587529182434082,
+            "prefix_survival": 0.5,
+            "brier_score": 0.28613493499664777
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 6,
+            "mean_confidence": 0.7484614054361979,
+            "prefix_survival": 0,
+            "brier_score": 0.5606871308566236
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 2,
+            "mean_confidence": 0.8011276721954346,
+            "prefix_survival": 1,
+            "brier_score": 0.03955020276640653
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 2,
+            "mean_confidence": 0.9544030427932739,
+            "prefix_survival": 1,
+            "brier_score": 0.002079082506512009
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "code",
+        "position": 1,
+        "total": 172,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 6,
+            "mean_confidence": 0.2684727559487025,
+            "prefix_survival": 0,
+            "brier_score": 0.072493682679309
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 14,
+            "mean_confidence": 0.3498951494693756,
+            "prefix_survival": 0.14285714285714285,
+            "brier_score": 0.1574525278833027
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 8,
+            "mean_confidence": 0.4666924402117729,
+            "prefix_survival": 0.75,
+            "brier_score": 0.2735084301647335
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 28,
+            "mean_confidence": 0.556953638792038,
+            "prefix_survival": 0.07142857142857142,
+            "brier_score": 0.2989775602927183
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 8,
+            "mean_confidence": 0.662413090467453,
+            "prefix_survival": 0.75,
+            "brier_score": 0.1932762484600996
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 18,
+            "mean_confidence": 0.752572238445282,
+            "prefix_survival": 1,
+            "brier_score": 0.061828374462585996
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 18,
+            "mean_confidence": 0.8544373181131151,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.24605674870803895
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 72,
+            "mean_confidence": 0.9922851605547799,
+            "prefix_survival": 0.9722222222222222,
+            "brier_score": 0.026981614306063148
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "code",
+        "position": 2,
+        "total": 172,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 2,
+            "mean_confidence": 0.07381588965654373,
+            "prefix_survival": 0,
+            "brier_score": 0.00544878556578704
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 16,
+            "mean_confidence": 0.15216712094843388,
+            "prefix_survival": 0.125,
+            "brier_score": 0.106645677939437
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 8,
+            "mean_confidence": 0.2495698668062687,
+            "prefix_survival": 0,
+            "brier_score": 0.0625286186960608
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 20,
+            "mean_confidence": 0.3367127597332001,
+            "prefix_survival": 0.1,
+            "brier_score": 0.15288306883636124
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 12,
+            "mean_confidence": 0.4708851824204127,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.22488479300664452
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 28,
+            "mean_confidence": 0.5425336233207158,
+            "prefix_survival": 0.2857142857142857,
+            "brier_score": 0.2848040684929852
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 18,
+            "mean_confidence": 0.6585708326763577,
+            "prefix_survival": 0.4444444444444444,
+            "brier_score": 0.28872925941245753
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 14,
+            "mean_confidence": 0.7503894397190639,
+            "prefix_survival": 0.8571428571428571,
+            "brier_score": 0.1465000891238424
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 8,
+            "mean_confidence": 0.8419093638658524,
+            "prefix_survival": 0.25,
+            "brier_score": 0.5321088450723606
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 46,
+            "mean_confidence": 0.9780859921289526,
+            "prefix_survival": 0.8695652173913043,
+            "brier_score": 0.12537737117770406
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "code",
+        "position": 3,
+        "total": 172,
+        "censored": 2,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 10,
+            "mean_confidence": 0.07447995096445084,
+            "prefix_survival": 0,
+            "brier_score": 0.005715335011332872
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 14,
+            "mean_confidence": 0.1644811545099531,
+            "prefix_survival": 0.14285714285714285,
+            "brier_score": 0.12210559445420273
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 20,
+            "mean_confidence": 0.2540881887078285,
+            "prefix_survival": 0,
+            "brier_score": 0.06515054427928117
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 30,
+            "mean_confidence": 0.3480619192123413,
+            "prefix_survival": 0.13333333333333333,
+            "brier_score": 0.15736104914382879
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 20,
+            "mean_confidence": 0.4480147957801819,
+            "prefix_survival": 0.3,
+            "brier_score": 0.21240073557025152
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 18,
+            "mean_confidence": 0.5435744921366373,
+            "prefix_survival": 0.2222222222222222,
+            "brier_score": 0.29065743961021123
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 6,
+            "mean_confidence": 0.6792650620142618,
+            "prefix_survival": 1,
+            "brier_score": 0.10296027085745152
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 6,
+            "mean_confidence": 0.7191636164983114,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.22040431111273287
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 16,
+            "mean_confidence": 0.8405081778764725,
+            "prefix_survival": 0.25,
+            "brier_score": 0.5338359580466765
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 30,
+            "mean_confidence": 0.9805153489112854,
+            "prefix_survival": 0.8,
+            "brier_score": 0.19308289365627118
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "code",
+        "position": 4,
+        "total": 172,
+        "censored": 2,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 20,
+            "mean_confidence": 0.07352431584149599,
+            "prefix_survival": 0,
+            "brier_score": 0.005843996627515222
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 22,
+            "mean_confidence": 0.14773599871180274,
+            "prefix_survival": 0,
+            "brier_score": 0.022680994124214624
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 22,
+            "mean_confidence": 0.254965061491186,
+            "prefix_survival": 0,
+            "brier_score": 0.06581837523154789
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 30,
+            "mean_confidence": 0.34609968662261964,
+            "prefix_survival": 0,
+            "brier_score": 0.1203558033144958
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 16,
+            "mean_confidence": 0.4499914348125458,
+            "prefix_survival": 0.25,
+            "brier_score": 0.2068790429421361
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 18,
+            "mean_confidence": 0.5375944773356119,
+            "prefix_survival": 0.4444444444444444,
+            "brier_score": 0.2367022064471295
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 4,
+            "mean_confidence": 0.635690301656723,
+            "prefix_survival": 0.5,
+            "brier_score": 0.2389890273760873
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 8,
+            "mean_confidence": 0.7447193711996078,
+            "prefix_survival": 0.25,
+            "brier_score": 0.40620698798063604
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 12,
+            "mean_confidence": 0.8498830497264862,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.4985454366216491
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 18,
+            "mean_confidence": 0.9797191090053983,
+            "prefix_survival": 0.8888888888888888,
+            "brier_score": 0.10494551916218597
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "code",
+        "position": 5,
+        "total": 172,
+        "censored": 2,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 36,
+            "mean_confidence": 0.058772432514362864,
+            "prefix_survival": 0,
+            "brier_score": 0.004208509874628647
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 26,
+            "mean_confidence": 0.1484427830347648,
+            "prefix_survival": 0,
+            "brier_score": 0.02297547827078939
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 38,
+            "mean_confidence": 0.2575465244682212,
+            "prefix_survival": 0.05263157894736842,
+            "brier_score": 0.09642463335500158
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 20,
+            "mean_confidence": 0.3392945140600204,
+            "prefix_survival": 0,
+            "brier_score": 0.1158822652690474
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 16,
+            "mean_confidence": 0.4563043676316738,
+            "prefix_survival": 0.375,
+            "brier_score": 0.2308929705294417
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 4,
+            "mean_confidence": 0.556291788816452,
+            "prefix_survival": 0.5,
+            "brier_score": 0.24332003458504836
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 10,
+            "mean_confidence": 0.6513806939125061,
+            "prefix_survival": 0.2,
+            "brier_score": 0.35888202482553666
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 4,
+            "mean_confidence": 0.7620871067047119,
+            "prefix_survival": 0.5,
+            "brier_score": 0.29298675278016617
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 6,
+            "mean_confidence": 0.8560348351796468,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.49548057576638155
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 10,
+            "mean_confidence": 0.9730070114135743,
+            "prefix_survival": 1,
+            "brier_score": 0.0009883248489302332
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "code",
+        "position": 6,
+        "total": 172,
+        "censored": 4,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 58,
+            "mean_confidence": 0.052380105239692436,
+            "prefix_survival": 0,
+            "brier_score": 0.003416732959853492
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 26,
+            "mean_confidence": 0.146950085575764,
+            "prefix_survival": 0,
+            "brier_score": 0.02248410518517358
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 36,
+            "mean_confidence": 0.2504025242394871,
+            "prefix_survival": 0.05555555555555555,
+            "brier_score": 0.09225540182621222
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 16,
+            "mean_confidence": 0.3482660725712776,
+            "prefix_survival": 0,
+            "brier_score": 0.12202887688177633
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 6,
+            "mean_confidence": 0.43162769079208374,
+            "prefix_survival": 0,
+            "brier_score": 0.18661752772951523
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 4,
+            "mean_confidence": 0.5537164509296417,
+            "prefix_survival": 0,
+            "brier_score": 0.306661318279426
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 6,
+            "mean_confidence": 0.6709420283635458,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.33967493284185224
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 4,
+            "mean_confidence": 0.7491898536682129,
+            "prefix_survival": 1,
+            "brier_score": 0.06291803536886675
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 4,
+            "mean_confidence": 0.8396146297454834,
+            "prefix_survival": 0,
+            "brier_score": 0.7051047743835852
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 8,
+            "mean_confidence": 0.9714132100343704,
+            "prefix_survival": 1,
+            "brier_score": 0.0011296183209070776
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "code",
+        "position": 7,
+        "total": 172,
+        "censored": 4,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 72,
+            "mean_confidence": 0.04282910030128227,
+            "prefix_survival": 0,
+            "brier_score": 0.0027094247518540354
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 30,
+            "mean_confidence": 0.149587848285834,
+            "prefix_survival": 0.06666666666666667,
+            "brier_score": 0.07032579857406902
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 34,
+            "mean_confidence": 0.24947253044913797,
+            "prefix_survival": 0.058823529411764705,
+            "brier_score": 0.08862379178486798
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 8,
+            "mean_confidence": 0.33626164495944977,
+            "prefix_survival": 0,
+            "brier_score": 0.11365680649880128
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 2,
+            "mean_confidence": 0.42503923177719116,
+            "prefix_survival": 0,
+            "brier_score": 0.18065834854974483
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 2,
+            "mean_confidence": 0.514279842376709,
+            "prefix_survival": 0,
+            "brier_score": 0.26448375627501264
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 8,
+            "mean_confidence": 0.6509797126054764,
+            "prefix_survival": 0.5,
+            "brier_score": 0.2562418207348154
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 4,
+            "mean_confidence": 0.81907057762146,
+            "prefix_survival": 0,
+            "brier_score": 0.6709432063726695
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 8,
+            "mean_confidence": 0.971307784318924,
+            "prefix_survival": 1,
+            "brier_score": 0.0011365621635484047
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "prose",
+        "position": 1,
+        "total": 158,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 6,
+            "mean_confidence": 0.2832293212413788,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.3766055124515774
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 8,
+            "mean_confidence": 0.3578314632177353,
+            "prefix_survival": 0.25,
+            "brier_score": 0.18621449174080018
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 4,
+            "mean_confidence": 0.4838471859693527,
+            "prefix_survival": 1,
+            "brier_score": 0.26648083560877334
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 18,
+            "mean_confidence": 0.5510668688350253,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.2535024944294718
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 4,
+            "mean_confidence": 0.6297626197338104,
+            "prefix_survival": 1,
+            "brier_score": 0.13726617241952432
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 16,
+            "mean_confidence": 0.7553228661417961,
+            "prefix_survival": 0.5,
+            "brier_score": 0.3026694849579754
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 18,
+            "mean_confidence": 0.8501734866036309,
+            "prefix_survival": 0.7777777777777778,
+            "brier_score": 0.19212990570873167
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 84,
+            "mean_confidence": 0.9917424420515696,
+            "prefix_survival": 0.9047619047619048,
+            "brier_score": 0.09412171690049094
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "prose",
+        "position": 2,
+        "total": 158,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 4,
+            "mean_confidence": 0.14144105464220047,
+            "prefix_survival": 0,
+            "brier_score": 0.020032037197483477
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 16,
+            "mean_confidence": 0.2541982978582382,
+            "prefix_survival": 0.125,
+            "brier_score": 0.11938652626635354
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 20,
+            "mean_confidence": 0.34474540054798125,
+            "prefix_survival": 0.2,
+            "brier_score": 0.17340453108422507
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 10,
+            "mean_confidence": 0.4660450518131256,
+            "prefix_survival": 0.2,
+            "brier_score": 0.2277374208742023
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 12,
+            "mean_confidence": 0.550647646188736,
+            "prefix_survival": 0.6666666666666666,
+            "brier_score": 0.22424105052710472
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 10,
+            "mean_confidence": 0.6548838496208191,
+            "prefix_survival": 0.4,
+            "brier_score": 0.3003213238365824
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 28,
+            "mean_confidence": 0.748607303415026,
+            "prefix_survival": 0.5714285714285714,
+            "brier_score": 0.2828855412894166
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 16,
+            "mean_confidence": 0.8502877801656723,
+            "prefix_survival": 0.75,
+            "brier_score": 0.21597182466040543
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 42,
+            "mean_confidence": 0.9865215761320931,
+            "prefix_survival": 0.8095238095238095,
+            "brier_score": 0.1776773295365415
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "prose",
+        "position": 3,
+        "total": 158,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 4,
+            "mean_confidence": 0.06805163249373436,
+            "prefix_survival": 0,
+            "brier_score": 0.004681614769404124
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 24,
+            "mean_confidence": 0.15275402925908566,
+            "prefix_survival": 0,
+            "brier_score": 0.024352449791007216
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 8,
+            "mean_confidence": 0.25785428658127785,
+            "prefix_survival": 0,
+            "brier_score": 0.06730677840972815
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 16,
+            "mean_confidence": 0.33992623537778854,
+            "prefix_survival": 0.125,
+            "brier_score": 0.15892048994315777
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 16,
+            "mean_confidence": 0.4464451000094414,
+            "prefix_survival": 0.5,
+            "brier_score": 0.2416952983372873
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 18,
+            "mean_confidence": 0.5571079519059923,
+            "prefix_survival": 0.4444444444444444,
+            "brier_score": 0.25990304590556296
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 16,
+            "mean_confidence": 0.6546604186296463,
+            "prefix_survival": 0.25,
+            "brier_score": 0.354012654516179
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 22,
+            "mean_confidence": 0.7389069849794562,
+            "prefix_survival": 0.5454545454545454,
+            "brier_score": 0.29512694908072845
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 16,
+            "mean_confidence": 0.8619797900319099,
+            "prefix_survival": 0.625,
+            "brier_score": 0.2818724560720258
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 18,
+            "mean_confidence": 0.9744256933530172,
+            "prefix_survival": 0.7777777777777778,
+            "brier_score": 0.20148318043873203
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "prose",
+        "position": 4,
+        "total": 158,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 14,
+            "mean_confidence": 0.061044818588665554,
+            "prefix_survival": 0,
+            "brier_score": 0.004181763697267998
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 28,
+            "mean_confidence": 0.15243386370795114,
+            "prefix_survival": 0.07142857142857142,
+            "brier_score": 0.06892221664920616
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 24,
+            "mean_confidence": 0.2576569492618243,
+            "prefix_survival": 0,
+            "brier_score": 0.06671336298865078
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 16,
+            "mean_confidence": 0.33709654957056046,
+            "prefix_survival": 0.25,
+            "brier_score": 0.20269182613514647
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 12,
+            "mean_confidence": 0.46428292493025464,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.2595008290431073
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 14,
+            "mean_confidence": 0.5593599932534354,
+            "prefix_survival": 0.2857142857142857,
+            "brier_score": 0.27387764164380407
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 8,
+            "mean_confidence": 0.6456231623888016,
+            "prefix_survival": 0,
+            "brier_score": 0.4179228001949786
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 20,
+            "mean_confidence": 0.7383241653442383,
+            "prefix_survival": 0.5,
+            "brier_score": 0.3109192991763514
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 8,
+            "mean_confidence": 0.8498359620571136,
+            "prefix_survival": 0.25,
+            "brier_score": 0.5429504821865248
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 14,
+            "mean_confidence": 0.97995183297566,
+            "prefix_survival": 0.8571428571428571,
+            "brier_score": 0.13569854521035044
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "prose",
+        "position": 5,
+        "total": 158,
+        "censored": 0,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 24,
+            "mean_confidence": 0.04985608160495758,
+            "prefix_survival": 0,
+            "brier_score": 0.0032412997137139907
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 40,
+            "mean_confidence": 0.15232789628207682,
+            "prefix_survival": 0.05,
+            "brier_score": 0.05708613635808711
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 22,
+            "mean_confidence": 0.24119987135583704,
+            "prefix_survival": 0.09090909090909091,
+            "brier_score": 0.10449138961368268
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 14,
+            "mean_confidence": 0.36081258739743916,
+            "prefix_survival": 0.2857142857142857,
+            "brier_score": 0.20826634114629908
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 10,
+            "mean_confidence": 0.44796386957168577,
+            "prefix_survival": 0.2,
+            "brier_score": 0.2223239178644615
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 16,
+            "mean_confidence": 0.5552963018417358,
+            "prefix_survival": 0.375,
+            "brier_score": 0.2608303740561979
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 6,
+            "mean_confidence": 0.6456875999768575,
+            "prefix_survival": 0,
+            "brier_score": 0.41716740072027747
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 10,
+            "mean_confidence": 0.7468734383583069,
+            "prefix_survival": 0.6,
+            "brier_score": 0.27822265529442874
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 6,
+            "mean_confidence": 0.8309429883956909,
+            "prefix_survival": 0.3333333333333333,
+            "brier_score": 0.45471050470811986
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 10,
+            "mean_confidence": 0.9648190021514893,
+            "prefix_survival": 0.8,
+            "brier_score": 0.18185099106975003
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "prose",
+        "position": 6,
+        "total": 158,
+        "censored": 2,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 36,
+            "mean_confidence": 0.04664429921346406,
+            "prefix_survival": 0,
+            "brier_score": 0.002977965730223896
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 44,
+            "mean_confidence": 0.14557271112095227,
+            "prefix_survival": 0.045454545454545456,
+            "brier_score": 0.05305781469472543
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 20,
+            "mean_confidence": 0.23536931425333024,
+            "prefix_survival": 0.1,
+            "brier_score": 0.09864061776350012
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 16,
+            "mean_confidence": 0.3322354331612587,
+            "prefix_survival": 0.125,
+            "brier_score": 0.15373646462193857
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 8,
+            "mean_confidence": 0.4604777991771698,
+            "prefix_survival": 0.25,
+            "brier_score": 0.2186153526995147
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 4,
+            "mean_confidence": 0.5580228269100189,
+            "prefix_survival": 0,
+            "brier_score": 0.31141398805086773
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 8,
+            "mean_confidence": 0.6383722871541977,
+            "prefix_survival": 0,
+            "brier_score": 0.4088961818665089
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 12,
+            "mean_confidence": 0.7357430160045624,
+            "prefix_survival": 0.5,
+            "brier_score": 0.3187524291147117
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 4,
+            "mean_confidence": 0.8160158097743988,
+            "prefix_survival": 0,
+            "brier_score": 0.666123776339818
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 4,
+            "mean_confidence": 0.9713086783885956,
+            "prefix_survival": 1,
+            "brier_score": 0.0014577053010729202
+          }
+        ]
+      },
+      {
+        "context": 8192,
+        "workload": "prose",
+        "position": 7,
+        "total": 158,
+        "censored": 2,
+        "bins": [
+          {
+            "lower_confidence": 0.0,
+            "upper_confidence": 0.1,
+            "count": 64,
+            "mean_confidence": 0.05312697104818653,
+            "prefix_survival": 0,
+            "brier_score": 0.00394040677728684
+          },
+          {
+            "lower_confidence": 0.1,
+            "upper_confidence": 0.2,
+            "count": 34,
+            "mean_confidence": 0.1470333241364535,
+            "prefix_survival": 0,
+            "brier_score": 0.022413575982990652
+          },
+          {
+            "lower_confidence": 0.2,
+            "upper_confidence": 0.3,
+            "count": 12,
+            "mean_confidence": 0.23939042538404465,
+            "prefix_survival": 0,
+            "brier_score": 0.05888236136138688
+          },
+          {
+            "lower_confidence": 0.3,
+            "upper_confidence": 0.4,
+            "count": 14,
+            "mean_confidence": 0.33796383653368267,
+            "prefix_survival": 0,
+            "brier_score": 0.11468888099747561
+          },
+          {
+            "lower_confidence": 0.4,
+            "upper_confidence": 0.5,
+            "count": 12,
+            "mean_confidence": 0.45688728988170624,
+            "prefix_survival": 0,
+            "brier_score": 0.20960025633570747
+          },
+          {
+            "lower_confidence": 0.5,
+            "upper_confidence": 0.6,
+            "count": 4,
+            "mean_confidence": 0.5767045021057129,
+            "prefix_survival": 0,
+            "brier_score": 0.3330240116743113
+          },
+          {
+            "lower_confidence": 0.6,
+            "upper_confidence": 0.7,
+            "count": 4,
+            "mean_confidence": 0.651863694190979,
+            "prefix_survival": 0,
+            "brier_score": 0.4254548372927758
+          },
+          {
+            "lower_confidence": 0.7,
+            "upper_confidence": 0.8,
+            "count": 8,
+            "mean_confidence": 0.7072882801294327,
+            "prefix_survival": 0.5,
+            "brier_score": 0.29091275365445757
+          },
+          {
+            "lower_confidence": 0.8,
+            "upper_confidence": 0.9,
+            "count": 2,
+            "mean_confidence": 0.8062349557876587,
+            "prefix_survival": 0,
+            "brier_score": 0.650014803933928
+          },
+          {
+            "lower_confidence": 0.9,
+            "upper_confidence": 1.0,
+            "count": 2,
+            "mean_confidence": 0.9962460994720459,
+            "prefix_survival": 1,
+            "brier_score": 1.4091769173774082e-05
+          }
+        ]
+      }
+    ]
+  },
+  "note": "Descriptive greedy-prefix statistics; code/prose and context remain separate. Censored suffixes are excluded, not labelled rejected. Repeated deterministic requests and positions within a prefix are correlated; counts are not independent trials. This selected-path cumulative feature differs from PR #487's max-candidate feature."
+}

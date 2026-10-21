@@ -8,7 +8,11 @@ This implements the conditional scheduler experiment in step 6 of
 base `bc09da81`, with subsequent HTTP-harness fixes. Set
 `SPLASH_PREFILL_COST_MODEL=bucketed` to enable it; `ema` or an absent variable
 keeps the existing policy. Invalid values fail startup with a usage error.
-**The default stays EMA.** Local serving qualification is in progress.
+**The historical default stays EMA.** The completed local production matrix
+has 30 four-arm comparisons and no qualified throughput gain. MoE 2k long TTFT
+improves while maximum active-stream gaps regress by 41–45%, so the latency
+promotion gate fails. See [the complete evidence](results/qwen-prefill-cost-m5-pro/README.md).
+This prototype is not applied over current main's newer scheduler.
 
 ## Problem and evidence
 
@@ -72,10 +76,10 @@ geometry, and a non-leading long-history lane that lowers the budget from
 2,048 to 1,024 while preserving shortest-first order. Existing fairness,
 priority, debt and overtaking cases run under both policies.
 
-Dedicated ragged-scheduler ASAN/UBSAN and TSAN targets are now included in
-`make test-sanitizers`; their first local execution is queued after the frozen
-performance binaries finish. Building them during performance measurement
-would contaminate those results. Production/profile binaries remain frozen.
+Dedicated ragged-scheduler ASAN/UBSAN and TSAN targets are included in the
+historical branch's `make test-sanitizers`; both execute successfully after
+the production comparisons. Their logs are in the evidence bundle. The builds
+were serialized after timing, and the production/profile binaries stayed frozen.
 
 ```sh
 make -j8 test-engine-cpu test-sanitizers build/splash build/serving-profile

@@ -11,8 +11,18 @@
   "sdk_version": "27.0",
   "developer_directory": "/Applications/Xcode.app/Contents/Developer",
   "deployment_target": "26.4",
-  "cxx_flags": "-std=c++20 -O3 -Wall -Wextra -Werror -Iruntime -mmacosx-version-min=26.4",
   "objcxx_extra_flags": "-fobjc-arc",
   "metal_flags": "-std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime -mmacosx-version-min=26.4",
-  "note": "Tool versions read before the queued current-main native build. Exact build commands, exit results and output hashes accompany the executed ledger; this file alone is not a successful-build claim."
+  "note": "Tool versions read before the queued current-main native build. Exact build commands, exit results and output hashes accompany the executed ledger; this file alone is not a successful-build claim.",
+  "harness_python": "3.14.8 (main, Oct  5 2026, 23:55:50) [Clang 21.0.0 (clang-2100.3.34.2)]",
+  "python_packages": {
+    "transformers": "5.15.1",
+    "tokenizers": "0.22.2",
+    "huggingface_hub": "1.28.0",
+    "numpy": "2.5.2",
+    "ruff": "0.16.4"
+  },
+  "requirements_sha256": "e67b228e4f8964e355938d9085d22e09235285a3173d988dda5e39fde0723ff1",
+  "production_cxx_flags": "-std=c++20 -O3 -Wall -Wextra -Werror -Iruntime -mmacosx-version-min=26.4",
+  "oracle_test_cxx_flags": "-std=c++20 -O2 -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4"
 }

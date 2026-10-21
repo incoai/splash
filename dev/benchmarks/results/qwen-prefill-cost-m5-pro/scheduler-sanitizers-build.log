@@ -1,0 +1,4 @@
+python3 dev/tools/build_config.py record --output 'build/sanitizers/ragged-scheduler-asan-ubsan' --config 080ebd409da778c3 -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=address,undefined \
+		runtime/engine/Scheduler.cpp dev/tests/engine/ragged_scheduler_test.cpp -o build/sanitizers/ragged-scheduler-asan-ubsan
+python3 dev/tools/build_config.py record --output 'build/sanitizers/ragged-scheduler-tsan' --config 080ebd409da778c3 -- xcrun -sdk macosx clang++ -std=c++20 -O1 -g -fno-omit-frame-pointer -Wall -Wextra -Werror -Iruntime -Idev -mmacosx-version-min=26.4 -fsanitize=thread \
+		runtime/engine/Scheduler.cpp dev/tests/engine/ragged_scheduler_test.cpp -o build/sanitizers/ragged-scheduler-tsan

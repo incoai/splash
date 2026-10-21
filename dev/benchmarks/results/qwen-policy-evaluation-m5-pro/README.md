@@ -38,8 +38,10 @@ status, with decay 0.97, a five-cycle prior and bounded outlier updates.
 Every 32nd cycle explores full width. Model state is runtime-local.
 
 The confidence feature differs from this roadmap's cumulative selected-path
-heuristic; `confidence-gguf.json` is calibration of that heuristic, not the
-upstream adaptive model. The upstream cost input is command wall time; the
+heuristic; `confidence-gguf.json` and `confidence-mlx.json` calibrate that heuristic, not
+the upstream adaptive model. The reference has 4,676 GGUF and 4,452 MLX labels
+with no censoring; candidates have 22 and 52 censored records respectively.
+Candidate suffix censoring is excluded rather than labelled rejection. The upstream cost input is command wall time; the
 benchmark's primary metric includes complete native decode-cycle gaps too.
 The inspected cost table has no explicit context class. That is a possible
 reason to investigate transfer across contexts, not a demonstrated cause of

@@ -1,0 +1,429 @@
+{
+  "complete": false,
+  "runtime_base": "1482f6bbc2abf12375332725302019594150b6cb",
+  "jobs": [
+    {
+      "name": "current-build",
+      "command": [
+        "make",
+        "-j8",
+        "build/splash",
+        "build/engine-tests/model-runtime-oracle"
+      ],
+      "cwd": "$CURRENT_WORKTREE",
+      "started": 1792563118.785718,
+      "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "exit_status": 0,
+      "finished": 1792563147.767179,
+      "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+    },
+    {
+      "name": "current-cpu-sanitizers",
+      "command": [
+        "make",
+        "-j8",
+        "test-engine-cpu",
+        "test-sanitizers"
+      ],
+      "cwd": "$CURRENT_WORKTREE",
+      "started": 1792563483.491144,
+      "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "exit_status": 0,
+      "finished": 1792563608.332041,
+      "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+    },
+    {
+      "name": "current-python-check",
+      "command": [
+        "env",
+        "-u",
+        "HF_HUB_OFFLINE",
+        "make",
+        "check-python"
+      ],
+      "cwd": "$CURRENT_WORKTREE",
+      "started": 1792563608.347392,
+      "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "exit_status": 0,
+      "finished": 1792564120.109482,
+      "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+    },
+    {
+      "name": "moe-gguf-oracle-int8-fp32",
+      "command": [
+        "env",
+        "MTL_SHADER_VALIDATION=1",
+        "$CURRENT_WORKTREE/build/engine-tests/model-runtime-oracle",
+        "$CURRENT_WORKTREE/build/splash.metallib",
+        "$SPLASH/install/models/.resolved/fbd33ebb12696638784e67f8d0b6c7f9add5de557c39732d95de90a8194967d5",
+        "--kv-format",
+        "int8",
+        "--state-format",
+        "fp32",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
+      ],
+      "cwd": "$CURRENT_WORKTREE",
+      "started": 1792564621.730925,
+      "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "exit_status": 0,
+      "finished": 1792565013.2810931,
+      "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+    },
+    {
+      "name": "moe-gguf-oracle-int8-bf16",
+      "command": [
+        "env",
+        "MTL_SHADER_VALIDATION=1",
+        "$CURRENT_WORKTREE/build/engine-tests/model-runtime-oracle",
+        "$CURRENT_WORKTREE/build/splash.metallib",
+        "$SPLASH/install/models/.resolved/fbd33ebb12696638784e67f8d0b6c7f9add5de557c39732d95de90a8194967d5",
+        "--kv-format",
+        "int8",
+        "--state-format",
+        "bf16",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
+      ],
+      "cwd": "$CURRENT_WORKTREE",
+      "started": 1792565013.309396,
+      "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "exit_status": 0,
+      "finished": 1792565226.109146,
+      "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+    },
+    {
+      "name": "moe-gguf-oracle-bf16-fp32",
+      "command": [
+        "env",
+        "MTL_SHADER_VALIDATION=1",
+        "$CURRENT_WORKTREE/build/engine-tests/model-runtime-oracle",
+        "$CURRENT_WORKTREE/build/splash.metallib",
+        "$SPLASH/install/models/.resolved/fbd33ebb12696638784e67f8d0b6c7f9add5de557c39732d95de90a8194967d5",
+        "--kv-format",
+        "bf16",
+        "--state-format",
+        "fp32",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
+      ],
+      "cwd": "$CURRENT_WORKTREE",
+      "started": 1792565226.123629,
+      "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "exit_status": 1,
+      "finished": 1792565361.984355,
+      "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+    },
+    {
+      "name": "moe-gguf-oracle-bf16-bf16",
+      "command": [
+        "env",
+        "MTL_SHADER_VALIDATION=1",
+        "$CURRENT_WORKTREE/build/engine-tests/model-runtime-oracle",
+        "$CURRENT_WORKTREE/build/splash.metallib",
+        "$SPLASH/install/models/.resolved/fbd33ebb12696638784e67f8d0b6c7f9add5de557c39732d95de90a8194967d5",
+        "--kv-format",
+        "bf16",
+        "--state-format",
+        "bf16",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
+      ],
+      "cwd": "$CURRENT_WORKTREE",
+      "started": 1792565362.000444,
+      "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "exit_status": 0,
+      "finished": 1792565559.240949,
+      "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+    },
+    {
+      "name": "moe-mlx-oracle-int8-fp32",
+      "command": [
+        "env",
+        "MTL_SHADER_VALIDATION=1",
+        "$CURRENT_WORKTREE/build/engine-tests/model-runtime-oracle",
+        "$CURRENT_WORKTREE/build/splash.metallib",
+        "$SPLASH/install/models/.resolved/3a1b291dc8b9e540488f002c99df9b34e29ad3b707b5f2501106609068cb7251",
+        "--kv-format",
+        "int8",
+        "--state-format",
+        "fp32",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
+      ],
+      "cwd": "$CURRENT_WORKTREE",
+      "started": 1792565559.255362,
+      "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "exit_status": 0,
+      "finished": 1792565715.3162072,
+      "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+    },
+    {
+      "name": "moe-mlx-oracle-int8-bf16",
+      "command": [
+        "env",
+        "MTL_SHADER_VALIDATION=1",
+        "$CURRENT_WORKTREE/build/engine-tests/model-runtime-oracle",
+        "$CURRENT_WORKTREE/build/splash.metallib",
+        "$SPLASH/install/models/.resolved/3a1b291dc8b9e540488f002c99df9b34e29ad3b707b5f2501106609068cb7251",
+        "--kv-format",
+        "int8",
+        "--state-format",
+        "bf16",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
+      ],
+      "cwd": "$CURRENT_WORKTREE",
+      "started": 1792565715.331622,
+      "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "exit_status": 0,
+      "finished": 1792565868.47882,
+      "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+    },
+    {
+      "name": "moe-mlx-oracle-bf16-fp32",
+      "command": [
+        "env",
+        "MTL_SHADER_VALIDATION=1",
+        "$CURRENT_WORKTREE/build/engine-tests/model-runtime-oracle",
+        "$CURRENT_WORKTREE/build/splash.metallib",
+        "$SPLASH/install/models/.resolved/3a1b291dc8b9e540488f002c99df9b34e29ad3b707b5f2501106609068cb7251",
+        "--kv-format",
+        "bf16",
+        "--state-format",
+        "fp32",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
+      ],
+      "cwd": "$CURRENT_WORKTREE",
+      "started": 1792565868.494595,
+      "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "exit_status": 0,
+      "finished": 1792566023.7349892,
+      "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+    },
+    {
+      "name": "moe-mlx-oracle-bf16-bf16",
+      "command": [
+        "env",
+        "MTL_SHADER_VALIDATION=1",
+        "$CURRENT_WORKTREE/build/engine-tests/model-runtime-oracle",
+        "$CURRENT_WORKTREE/build/splash.metallib",
+        "$SPLASH/install/models/.resolved/3a1b291dc8b9e540488f002c99df9b34e29ad3b707b5f2501106609068cb7251",
+        "--kv-format",
+        "bf16",
+        "--state-format",
+        "bf16",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
+      ],
+      "cwd": "$CURRENT_WORKTREE",
+      "started": 1792566023.751638,
+      "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "exit_status": 0,
+      "finished": 1792566177.602526,
+      "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+    },
+    {
+      "name": "dense-mlx-oracle-int8-fp32",
+      "command": [
+        "env",
+        "MTL_SHADER_VALIDATION=1",
+        "$CURRENT_WORKTREE/build/engine-tests/model-runtime-oracle",
+        "$CURRENT_WORKTREE/build/splash.metallib",
+        "$SPLASH/install/models/mlx-community/Qwen3.8-27B-4bit",
+        "--kv-format",
+        "int8",
+        "--state-format",
+        "fp32",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
+      ],
+      "cwd": "$CURRENT_WORKTREE",
+      "started": 1792566177.6179972,
+      "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "exit_status": 0,
+      "finished": 1792566769.7893791,
+      "power_after": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=22478947)\t100%; discharging; (no estimate) present: true\n",
+      "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+    },
+    {
+      "name": "dense-mlx-oracle-int8-bf16",
+      "command": [
+        "env",
+        "MTL_SHADER_VALIDATION=1",
+        "$CURRENT_WORKTREE/build/engine-tests/model-runtime-oracle",
+        "$CURRENT_WORKTREE/build/splash.metallib",
+        "$SPLASH/install/models/mlx-community/Qwen3.8-27B-4bit",
+        "--kv-format",
+        "int8",
+        "--state-format",
+        "bf16",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
+      ],
+      "cwd": "$CURRENT_WORKTREE",
+      "started": 1792566769.804458,
+      "power_before": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=22478947)\t100%; discharging; (no estimate) present: true\n",
+      "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "exit_status": 0,
+      "finished": 1792567421.7785752,
+      "power_after": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=22478947)\t91%; discharging; 1:47 remaining present: true\n",
+      "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+    },
+    {
+      "name": "dense-mlx-oracle-bf16-fp32",
+      "command": [
+        "env",
+        "MTL_SHADER_VALIDATION=1",
+        "$CURRENT_WORKTREE/build/engine-tests/model-runtime-oracle",
+        "$CURRENT_WORKTREE/build/splash.metallib",
+        "$SPLASH/install/models/mlx-community/Qwen3.8-27B-4bit",
+        "--kv-format",
+        "bf16",
+        "--state-format",
+        "fp32",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
+      ],
+      "cwd": "$CURRENT_WORKTREE",
+      "started": 1792567421.7925901,
+      "power_before": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=22478947)\t91%; discharging; 1:47 remaining present: true\n",
+      "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "exit_status": 0,
+      "finished": 1792568102.147011,
+      "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t87%; charging; 0:49 remaining present: true\n",
+      "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+    },
+    {
+      "name": "dense-mlx-oracle-bf16-bf16",
+      "command": [
+        "env",
+        "MTL_SHADER_VALIDATION=1",
+        "$CURRENT_WORKTREE/build/engine-tests/model-runtime-oracle",
+        "$CURRENT_WORKTREE/build/splash.metallib",
+        "$SPLASH/install/models/mlx-community/Qwen3.8-27B-4bit",
+        "--kv-format",
+        "bf16",
+        "--state-format",
+        "bf16",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
+      ],
+      "cwd": "$CURRENT_WORKTREE",
+      "started": 1792568102.162122,
+      "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t87%; charging; 0:49 remaining present: true\n",
+      "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+    }
+  ],
+  "models": [
+    {
+      "label": "moe-gguf",
+      "root": "$SPLASH/install/models/.resolved/fbd33ebb12696638784e67f8d0b6c7f9add5de557c39732d95de90a8194967d5",
+      "manifest_sha256": "fbd33ebb12696638784e67f8d0b6c7f9add5de557c39732d95de90a8194967d5",
+      "sources": {
+        "draft": {
+          "repo": "incoai/Qwen3.6-35B-A3B-DFlash2",
+          "revision": "51ef7b6923ad6c14cb1bb41c37a9041446496ab6"
+        },
+        "target": {
+          "repo": "unsloth/Qwen3.6-35B-A3B-GGUF",
+          "revision": "a483e9e6cbd595906af30beda3187c2663a1118c"
+        }
+      }
+    },
+    {
+      "label": "moe-mlx",
+      "root": "$SPLASH/install/models/.resolved/3a1b291dc8b9e540488f002c99df9b34e29ad3b707b5f2501106609068cb7251",
+      "manifest_sha256": "3a1b291dc8b9e540488f002c99df9b34e29ad3b707b5f2501106609068cb7251",
+      "sources": {
+        "draft": {
+          "repo": "incoai/Qwen3.6-35B-A3B-DFlash2",
+          "revision": "51ef7b6923ad6c14cb1bb41c37a9041446496ab6"
+        },
+        "target": {
+          "repo": "mlx-community/Qwen3.6-35B-A3B-4bit",
+          "revision": "38740b847e4cb78f352aba30aa41c76e08e6eb46"
+        }
+      }
+    },
+    {
+      "label": "dense-mlx",
+      "root": "$SPLASH/install/models/mlx-community/Qwen3.8-27B-4bit",
+      "manifest_sha256": "edf6abe677ec8a2fa17ec73205cdd5d3d9a208cbd6c3053387b0e431de0f86ff",
+      "sources": {
+        "draft": {
+          "repo": "incoai/Qwen3.8-27B-DFlash2",
+          "revision": "015e795645c74b1a0eeef3b570031fb62e769bc5"
+        },
+        "target": {
+          "repo": "mlx-community/Qwen3.8-27B-4bit",
+          "revision": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818"
+        }
+      }
+    },
+    {
+      "label": "dense-gguf",
+      "root": "$SPLASH/install/models/.resolved/5c93a8a7000ad299df2ed15b0411ac73ccea878ff5ce98dc00ab7a65f6e64813",
+      "manifest_sha256": "5c93a8a7000ad299df2ed15b0411ac73ccea878ff5ce98dc00ab7a65f6e64813",
+      "sources": {
+        "draft": {
+          "repo": "incoai/Qwen3.8-27B-DFlash2",
+          "revision": "015e795645c74b1a0eeef3b570031fb62e769bc5"
+        },
+        "target": {
+          "repo": "unsloth/Qwen3.8-27B-GGUF",
+          "revision": "4ca720788d1e01f1bff70c033e0d0028fd02e502"
+        }
+      }
+    }
+  ],
+  "oracle_sha256": "2f0703f6a537aaf9fa3bd17bc47e88d76870c77ef0061a0a1ef66c525051b663"
+}

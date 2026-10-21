@@ -38,8 +38,10 @@ does not mean a speed gain. All failed/noisy comparisons remain in the reports.
 
 Three 8k trials change output hashes: math sample 2 and prose samples 0 and 2.
 Some differences occur between repeats of the same policy, including the
-full-width baseline. They do not isolate a pruning effect. An exact-prompt
-single-server replay against clean main and the disabled candidate is queued.
+full-width baseline. They do not isolate a pruning effect. The exact-prompt
+single-server replay against clean main and the disabled candidate is complete: all
+three cases match in all four arms, with matching fallback probes. It does not
+reproduce those original differences or establish their cause.
 No output-equality claim is made for those cases, and no quality assessment is
 inferred from timing. The independent operator/model state oracles exercise
 their existing numerical contract; they do not prove every autoregressive
@@ -104,3 +106,42 @@ package in PR #523; merged #487 supersedes this historical runtime prototype. No
 72 trials, 30 gains clear their per-trial bounds, six are inconclusive, no
 throughput regression exceeds its tolerance, and three GGUF B1 trials contain
 differing hashes. These counts are not a current-main or aggregate speed claim.
+
+## Exact-prompt replay
+
+`replay-clean-vs-disabled.json` compares clean main `be3b083c` with the frozen
+measurement candidate, **threshold 0 in both arms**. It runs only the original
+8k math sample 2 and prose samples 0/2, each with 512 output tokens. All four
+message hashes match within each case, all sampled/strict-JSON probes match,
+and no disabled-path throughput regression exceeds tolerance. The complete
+UTC/awake discrepancy is -0.001901 seconds. This isolated single-resident
+replay does not reproduce the earlier hash changes; it does not retrospectively
+prove their cause or equality of the enabled policy on every request.
+
+`replay_affected.py` reconstructs the prompts from the portable source report,
+checks every original SHA-256 before requesting the model, and enforces the
+original output budget. `replay-prompt-integrity.json` records a separate
+successful three-prompt reconstruction with no model execution. The real
+model replay above is a different, completed check.
+
+Run this helper **from the matching historical checkout**, using its server
+and protocol-compatible frozen binaries. Current-main protocol/server code
+cannot serve the archived protocol-10 executables. For example:
+
+```sh
+.venv/bin/python /path/to/this/bundle/replay_affected.py \
+  --source-report /path/to/this/bundle/prefix-gguf-b1.json \
+  --model unsloth/Qwen3.6-35B-A3B-GGUF --model-root /path/to/pinned-model \
+  --baseline-binary /path/to/clean-be3b083c/build/splash \
+  --binary /path/to/frozen-measurement/build/splash \
+  --baseline-env SPLASH_LIVE_VERIFY_THRESHOLD=0 \
+  --candidate-env SPLASH_LIVE_VERIFY_THRESHOLD=0 \
+  --contexts 8192 --workloads math,prose --samples 3 --tokens 512 \
+  --max-memory 26G --residency sequential \
+  --warmup-context 2048 --warmup-tokens 512 --warmup-seconds 0 \
+  --warmup-rounds 4 --probes --output build/exact-prompt-replay
+```
+
+The actual three recorded cases are authoritative over the Cartesian CLI grid.
+The replay report includes source/driver hashes; all frozen input and model
+fingerprints remain available for review. Other hardware is not executed here.

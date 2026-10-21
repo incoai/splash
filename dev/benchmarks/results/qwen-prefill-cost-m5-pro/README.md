@@ -35,6 +35,9 @@ answer that question.
 | `*.full.json.gz` | Complete cleaned reports, including every native poll and chunk timestamp. Each readable report records its archive hash and the original source-report hash. |
 | `excluded-*-sleep.json` | Invalid overnight MoE controls retained with explicit exclusion; their apparent gains are not evidence. |
 | `qualification.json`, `jobs.json`, `prefill-*.log` | Source identity and correctness execution status. |
+| `scheduler-*.log` | Dedicated ragged-scheduler ASAN/UBSAN and TSAN execution, both exit 0. |
+| `trace-analysis.json`, `*.trace.json.gz` | All twelve validated MoE/dense round traces, exact per-case submitted geometry, observed/predicted cost and ANE queue association. |
+| `excluded-dense-stale-status.json` | Interrupted earlier diagnostic: seven of eight arm-cases finished; a stale poll aborted the last, leaving an unfinished native command. The complete repeat is used instead. |
 
 The four geometry controls have 74–75 eligible observations each, including
 actual two-lane ragged commands. Mean absolute relative prediction error falls
@@ -69,7 +72,10 @@ short/long TTFT and p95/maximum active-stream chunk gaps are separate gates.
 
 Cold cases cover 2k/8k/31,744 contexts, three trials each. Cached and RAM-prefix
 continuation cases cover 8k, three trials each. Priming is outside measurement;
-restore/suffix work is inside. Continuation does not simulate suspension under
+restore/suffix work is inside. In these reports, cached cases reuse **8,160 of
+8,192** prompt tokens and continuation cases reuse **4,096**; every measured
+round proves native suffix-prefill progress during decode (`long-prefill`),
+rather than a fully cached no-prefill continuation. Continuation does not simulate suspension under
 memory pressure. Reports retain actual cached counts and native polling.
 
 Gains must exceed `max(2%,2*noise)`; noise above 5% is inconclusive. A throughput
@@ -79,6 +85,18 @@ high-confidence estimate of a production tail distribution.
 
 ## Measured decision
 
+The awake MoE cold series has no qualified throughput gain. At 2k it
+reduces long TTFT by **12.675%, 13.051%, 14.467%**, but increases the
+maximum active-stream gap by **45.015%, 44.985%, 41.448%** (noise
+1.270%, 0.682%, 4.112%). Every one of those gap regressions exceeds its
+noise-adjusted bound. Short TTFT also regresses in one trial per context.
+The 31,744 sample 2 has differing hashes. This is a measured latency tradeoff,
+not a repeatable improvement without harm. The focused 2k trace confirms that
+each EMA arm submits three contended prefill commands (1,024/1,024/512 rows),
+where each bucket arm submits two (1,024/1,536), including a larger ragged
+two-lane command. This is consistent with faster completion and a longer
+single stall. Timing claims use the production reports, not instrumented costs.
+
 The awake dense cold/cache/continuation series has no qualified throughput
 gain. One cached trial increases the maximum active-stream gap by **5.74%**
 at **2.04% noise**, beyond its **4.08%** cost bound. One continuation trial
@@ -86,15 +104,24 @@ reduces short TTFT and the maximum gap beyond its bound, but other trials do
 not repeat the latency win; that same trial also has differing output hashes.
 These isolated improvements do not clear a workload-wide promotion gate.
 The MoE continuation series is inconclusive at 10–13% throughput noise.
-Awake MoE cold/cache replacements and final diagnostic/sanitizer outputs are
-tracked explicitly in the manifests until they finish.
+All six production series are complete: **30 four-arm trials**, no qualified
+throughput gains, four inconclusive throughput comparisons and no throughput
+regressions beyond tolerance. All twelve final diagnostic traces validate with
+zero dropped events and successful native exits; dedicated scheduler
+ASAN/UBSAN and TSAN checks pass. The dense cold 31,744 sample 0 and dense
+continuation sample 0 also have differing hashes; three comparisons differ
+across the full matrix. Their complete requested token budgets still match.
 
 Initial ANE configuration is held constant per comparison: dense runs report
 share 0.4117647059 and minimum split rows 1801. This does not imply that every
 contended command uses ANE: halved budgets can fall below the minimum. The
-actual submitted path must be checked in diagnostic traces before attributing
-latency to an ANE handoff. Host ready/report events include callback delay and
-are not hardware ANE timing.
+actual submitted path must be checked before attributing latency to ANE.
+The complete dense repeat contains 2,048 queued ANE jobs, all matched to actual
+prefill submissions. Its measured active-decoding intervals instead contain
+304 GPU prefill commands of 128–256 rows and zero ANE jobs. Handoffs occur
+in warmups, initial prefill or after the active decoder finishes. This does
+not qualify contended ANE latency. Host ready/report events include callback
+delay and are not hardware ANE timing. See [the display timelines](../qwen-serving-timeline-m5-pro/README.md).
 
 The old prototype remains an experiment. Better offline prediction does not
 justify changing current main's estimator. Only this Mac is measured; the

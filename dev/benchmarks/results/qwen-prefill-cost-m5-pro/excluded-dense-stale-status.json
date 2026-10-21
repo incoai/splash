@@ -1,0 +1,55 @@
+{
+  "usable_for_qualification": false,
+  "reason": "stale native status cannot prove work overlap",
+  "complete": false,
+  "runtime_implementation": "02a1162e81b7251e343e4b72f788b5e586c7f969",
+  "model": "mlx-community/Qwen3.8-27B-4bit",
+  "model_manifest_sha256": "edf6abe677ec8a2fa17ec73205cdd5d3d9a208cbd6c3053387b0e431de0f86ff",
+  "serving_tool_sha256": "19b608ca830514b10015a63523d75441661d125f841e126c28ffead8121fed53",
+  "source_report_sha256": "062da019a5379d8a31a38f794294037b180c2b5b39f12247d54ca1e387e2fee5",
+  "residency": "sequential",
+  "rounds_started": 4,
+  "measured_arm_cases": 7,
+  "required_arm_cases": 8,
+  "traces": [
+    {
+      "name": "round-1-trace.json",
+      "sha256": "6c0eea030abf576beb3c9e0b5690ea1c880d0432e29504a26211b51f7e54dbbf",
+      "exit_status": 0,
+      "dropped_host_events": 0,
+      "dropped_commands": 0,
+      "command_in_flight_at_stop": false,
+      "native_trace_validated": true
+    },
+    {
+      "name": "round-2-trace.json",
+      "sha256": "17308e2deccd60fa4e5071f8f25333f1b914442d9135b1364c82eab1928e1658",
+      "exit_status": 0,
+      "dropped_host_events": 0,
+      "dropped_commands": 0,
+      "command_in_flight_at_stop": false,
+      "native_trace_validated": true
+    },
+    {
+      "name": "round-3-trace.json",
+      "sha256": "f07a196d03f4844c3d5c9324c6636ef1ea67ecf07b8a7afe48934b0e9e84a020",
+      "exit_status": 0,
+      "dropped_host_events": 0,
+      "dropped_commands": 0,
+      "command_in_flight_at_stop": false,
+      "native_trace_validated": true
+    },
+    {
+      "name": "round-4-trace.json",
+      "sha256": "25debdbdb582886cc5ba382a7cd342c9c1d20801898692bcab081cba79696707",
+      "exit_status": 0,
+      "dropped_host_events": 0,
+      "dropped_commands": 0,
+      "command_in_flight_at_stop": true,
+      "native_trace_validated": false,
+      "validation_error": "trace stopped before the workload completed"
+    }
+  ],
+  "replacement": "replay/dense-native-contention-repeat",
+  "note": "A zero native exit status is not a complete HTTP workload. The interrupted fourth trace also reports an in-flight command; neither a partial capture nor low noise is qualification."
+}

@@ -26,12 +26,21 @@ reviewable contribution based on current main.
 
 | Step | Current status | Remaining gate |
 | --- | --- | --- |
-| 1. Runtime measurement | Per-width operator tables, full-engine/mask traces and overlap-validating HTTP tools complete | Finish final single-resident ANE trace; current-main model checks |
-| 2. Greedy MoE prefixes | Both formats B1 context/workload and B2–B4 matrices complete: 72 ABBA trials | Exact-prompt hash replay; upstream #487 supersedes the prototype |
+| 1. Runtime measurement | Complete: per-width operator tables, full-engine/mask/ANE traces, full trace archives and five display windows | Current-main functional/model validation is a separate pending scope |
+| 2. Greedy MoE prefixes | Complete: 72 ABBA trials across both formats/contexts/widths; three exact-prompt disabled-path replays match | Upstream #487 supersedes the old runtime prototype; no current threshold flag |
 | 3. Pending-tape GDN pruning | Complete: 128 shader combinations, real-model oracles, native/HTTP controls; promotion gate not met | Keep historical prototype off; no current runtime change |
 | 4. Cost-aware policy | Complete: 14 training reports, 18 held-out trials and awake full-width reference against #487 revision `67bb9406`; held-out promotion fails | Later merged #487 has different code; no current-main regression claim |
 | 5. Host overhead | Complete: one allocation saved per dispatch, ownership/GPU checks and awake serving repeats; no qualified gain | Retain runtime baseline; no larger reuse pipeline justified |
-| 6. Mixed prefill/decode | Prototype, causal prediction analysis and dense cold/cache/continuation comparisons complete | Awake MoE replacements, actual policy trace and dedicated scheduler sanitizer runs |
+| 6. Mixed prefill/decode | Complete: 30 production comparisons, causal prediction analysis, cold/cache/continuation and actual-path traces; scheduler ASAN/UBSAN/TSAN pass | Latency gate fails: larger ragged commands improve long TTFT but worsen maximum stream gaps; retain baseline |
+
+All six historical local experiments now have measured decisions. The
+current-main native build, CPU/sanitizer suites and full Python check also pass
+(1,348 tests, 27 skips; lint/format pass). The fresh four-model KV/state oracle
+matrix and four functional all/auto HTTP checks are still executing. A fresh
+MoE GGUF BF16-KV/FP32-state cell failed the upstream cold-score penalty
+assertion; the original failure is retained while a same-forward test oracle
+is verified separately. These results are not inferred from historical runs. The [review ledger](deepinfer-qwen-completion.md) links
+the scopes and evidence.
 
 Only this M5 Pro is available for local runs. Other GPU families will receive
 [a repeatable maintainer-run package](qwen-maintainer-runs.md); those tests remain unexecuted until their

@@ -1,0 +1,6 @@
+{
+  "ordinary_current_binary_rejected": true,
+  "reason": "splash does not support --trace; use a matching instrumented checkout",
+  "binary_sha256": "15b4ac64d5f4f2070361fc0e94623f8a67d74f083632ccaa6a7b9acd4ed8cf79",
+  "scope": "Capability check only; no server or model was started."
+}
