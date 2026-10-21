@@ -63,6 +63,14 @@ analysis. Full traces remain ignored build artifacts.
 
 ## Paired cold HTTP throughput
 
+Each benchmark holds a process-scoped `caffeinate -is` assertion on macOS;
+it releases that assertion on success or failure. It does not change global
+power settings. Reports compare elapsed UTC and the Mac's awake monotonic
+clock, and reject a difference of one second or more as suspension or a wall
+clock adjustment, even if ABBA costs happen to look stable. A power-log audit
+invalidated several overnight captures; those are retained as excluded data
+and repeated while awake. Power/thermal snapshots alone do not detect sleep.
+
 The new harness keeps two servers resident, then issues serial requests in
 baseline/candidate/candidate/baseline order. It never contacts an existing
 server. The shorter separation between arms reduces one source of thermal
