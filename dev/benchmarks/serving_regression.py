@@ -308,6 +308,10 @@ def streamed(
         smoke.require(
             chunks and usage is not None, "stream omitted content or final usage"
         )
+        smoke.require(
+            usage["completion_tokens"] == tokens,
+            "stream ended before its requested output budget",
+        )
         cached = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
         smoke.require(
             cached > 0 if expect_cached else cached == 0,
@@ -456,6 +460,10 @@ def measure_mixed(server, args, active_prompt, long_prompt, short_prompt, contex
         "mixed requests left resources active",
     )
     active, long, short = responses
+    smoke.require(
+        [row["usage"]["prompt_tokens"] for row in responses] == [2048, context, 512],
+        "mixed prompt rows changed",
+    )
     cached = long["usage"].get("prompt_tokens_details", {}).get("cached_tokens", 0)
     overlap = native_overlap(
         native_samples,
@@ -500,8 +508,10 @@ def measure_mixed(server, args, active_prompt, long_prompt, short_prompt, contex
         },
         "thermal_before": before.get("thermal_state"),
         "thermal_after": after.get("thermal_state"),
-        "memory_before": before.get("memory"),
-        "memory_after": after.get("memory"),
+        "memory_before": before.get("memory_actual"),
+        "memory_after": after.get("memory_actual"),
+        "memory_pressure_before": before.get("memory_pressure"),
+        "memory_pressure_after": after.get("memory_pressure"),
     }
 
 
