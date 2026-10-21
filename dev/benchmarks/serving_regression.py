@@ -1,10 +1,10 @@
-"""Paired HTTP ABBA measurements on two resident servers.
+"""HTTP ABBA comparisons of verification policies and serving workloads.
 
-Only one server runs a measured request at a time. Alternating resident
-servers shortens the time between comparison arms without restarting or
-warming a model between them. This needs enough memory for both servers;
-memory pressure and their shared GPU still limit what the result generalizes
-to. Use the standard sequential release gate as the independent rollout check.
+Sequential residency keeps one server for each complete ABBA round. Optional
+paired residency alternates measured requests between two resident servers
+when memory permits. Both modes preserve matched workload/warmup histories;
+mixed workloads require native work overlap. Use the standard release gate
+as the independent rollout check.
 """
 
 from __future__ import annotations

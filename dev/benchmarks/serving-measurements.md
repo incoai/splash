@@ -1,10 +1,11 @@
 # Serving qualification tools
 
 `serving_regression.py` measures compatible frozen builds on the same Mac.
-The current-main recipe uses production `--verify-rows all|auto`, separately
-for each arm, and confirms effective behavior from native status. Historical
-DeepInfer-inspired runtime prototypes and trace captures have their own pinned
-sources; they are not current-main feature flags.
+The recipe uses production `--verify-rows all|auto`, separately for each arm,
+and confirms effective behavior from native status. It compares a setting in
+the same frozen build or two compatible builds; it does not change inference
+code. See [the experiment summary](qwen-serving-experiments.md) for the
+separate historical research archive.
 
 ```sh
 python -m dev.benchmarks.serving_regression \
@@ -50,20 +51,23 @@ latency/correctness gates; spread >5% is inconclusive.
 
 The benchmark temporarily prevents sleep on macOS, releases its assertion on
 failure too, and compares elapsed UTC against the awake monotonic clock. A
-discrepancy >=1 second rejects the run. Earlier sleep-affected captures are
-retained as excluded data and replaced. Stable ABBA costs alone do not prove
+discrepancy >=1 second rejects the run. Stable ABBA costs alone do not prove
 the machine remained awake or held a stable frequency.
 
-`trace_report.py`, `prefill_prediction.py` and `confidence_calibration.py`
-analyze the versioned historical trace format. Traces with dropped records,
-unfinished commands, failures or invalid clocks are rejected. Prefill estimates
-use only earlier observations, exact row-weighted ragged geometry and distinct
-width/path cells. Confidence analysis keeps censored suffixes out of rejection
-labels and separates workload/context/position. These prediction diagnostics
-do not establish latency benefit or current-main acceptance calibration.
+`trace_report.py` can inspect the versioned experimental trace format. It
+rejects dropped records, unfinished commands, failures and invalid clocks.
+Current production binaries do not emit that format. For an existing capture:
 
-Use [the full maintainer recipe](qwen-maintainer-runs.md) for the 36-job matrix
-and [the current source audit](current-main-audit.md) for what upstream already
-implements. `--trace` requires a matching instrumented checkout; current main's
+```sh
+python -m dev.benchmarks.trace_report /path/to/capture.trace.json \
+  --output build/trace-summary.json
+```
+
+The confidence/prefill analysis programs and their results are preserved in
+the [research archive](https://github.com/linson007/splash/tree/3e8911fc89a6ed009e7b0561bfa7c23e58ea594f/dev/benchmarks).
+Their results do not establish latency benefit or current acceptance calibration.
+
+Use [the full maintainer recipe](qwen-maintainer-runs.md) for the 36-job matrix.
+`--trace` requires a matching instrumented checkout; current main's
 production binary has no historical trace-output hook or `serving-profile`
 target, and the harness refuses to silently ignore that option.

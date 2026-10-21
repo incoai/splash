@@ -1,11 +1,10 @@
 # Repeatable Qwen qualification on maintainer Macs
 
-This recipe targets main `1482f6bbc2abf12375332725302019594150b6cb` and its
-supported `--verify-rows all|auto` control. See [the source audit](current-main-audit.md).
-The historical threshold/GDN flags are not current-main settings. Only the
-contributor's M5 Pro (20 GPU cores, 48 GiB, Apple10, macOS 26.6.0) is available.
-Other GPU families/core/memory configurations remain **unexecuted** until a
-maintainer runs them; preparation never means a test passed.
+This recipe uses the supported `--verify-rows all|auto` control, checked
+against main `1482f6bbc2abf12375332725302019594150b6cb`. The tools benchmark
+existing policies and make no inference-runtime changes. See
+[the serving guide](serving-measurements.md) for the measurement contract and
+[the experiment summary](qwen-serving-experiments.md) for archived results.
 
 ## Freeze and identify the inputs
 
@@ -102,3 +101,14 @@ Retain per-device/per-workload throughput, TTFT and streaming-gap results,
 actual counters, cache reuse, ANE configuration, memory, failures and output
 hash differences. Never promote from an aggregate hiding a regression. Return
 manifests, child reports and logs; omit model weights and generated answer text.
+
+## Coverage and returning results
+
+The historical investigation used one M5 Pro (20 GPU cores, 48 GiB, Apple10,
+macOS 26.6.0). Reports and model/build identities are available through
+[the research summary](qwen-serving-experiments.md). They are not a speedup
+claim for the benchmark tools or a qualification of every current policy.
+The prepared maintainer jobs on other Macs remain **unexecuted** until actual
+reports exist. Preparation is not a test pass or evidence of model capacity.
+Return device identities, manifests and complete reports against
+[#508](https://github.com/incoai/splash/issues/508).
