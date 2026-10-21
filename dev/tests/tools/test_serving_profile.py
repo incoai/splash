@@ -111,6 +111,41 @@ class TraceReportTests(unittest.TestCase):
 
 
 class PairedServingTests(unittest.TestCase):
+    def test_mixed_stream_refuses_a_short_output_budget(self):
+        import argparse
+        import json
+        from unittest.mock import Mock
+
+        args = argparse.Namespace(model="test/model", request_timeout=1)
+        for count in (31, 32):
+            usage = {"prompt_tokens": 2048, "completion_tokens": count}
+            frames = [
+                {"choices": [{"delta": {"content": "answer"}}]},
+                {"choices": [], "usage": usage},
+            ]
+            connection = Mock()
+            connection.getresponse.return_value.status = 200
+            connection.getresponse.return_value.readline.side_effect = [
+                *(b"data: " + json.dumps(frame).encode() + b"\n" for frame in frames),
+                b"data: [DONE]\n",
+            ]
+            with patch.object(
+                serving_regression.http.client,
+                "HTTPConnection",
+                return_value=connection,
+            ):
+                if count == 31:
+                    with self.assertRaisesRegex(
+                        serving_regression.smoke.SmokeFailure, "output budget"
+                    ):
+                        serving_regression.streamed(Mock(port=1234), args, "prompt", 32)
+                else:
+                    result = serving_regression.streamed(
+                        Mock(port=1234), args, "prompt", 32
+                    )
+                    self.assertEqual(result["usage"], usage)
+            connection.close.assert_called_once()
+
     def test_warmup_uses_equal_matched_rounds_until_both_arms_are_ready(self):
         import argparse
 
