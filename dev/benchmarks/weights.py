@@ -3,7 +3,9 @@
 A build's engine-tests/weight-digests loads a model as its engine does and
 prints the component, size and SHA-256 of every image it holds
 (dev/tools/weight_digests.mm). Both builds must load the same images with the
-same bytes.
+same bytes. Given --expert-memory SIZE or --ple-memory SIZE, it streams the
+routed experts or the PLE table from their files, as the engine does where
+memory cannot hold them, and their bytes are not among the images.
 
 Builds of earlier releases that have no weight-digests and prepared an
 assembly's images into a cache, <cache>/<key>/{weights, sha256,
@@ -34,12 +36,12 @@ def loads_in_memory(build: Path) -> bool:
     return (Path(build) / WEIGHT_DIGESTS).is_file()
 
 
-def digests(build: Path, model_root: Path) -> dict:
+def digests(build: Path, model_root: Path, options=()) -> dict:
     """The SHA-256 of each image, by component, that the build directory's
-    engine loads from model_root."""
+    engine loads from model_root, its weight-digests given options."""
     tool = Path(build) / WEIGHT_DIGESTS
     result = subprocess.run(
-        [str(tool), str(Path(build) / "splash.metallib"), str(model_root)],
+        [str(tool), str(Path(build) / "splash.metallib"), str(model_root), *options],
         capture_output=True,
         text=True,
     )
@@ -102,14 +104,15 @@ def compare(baseline: dict, candidate: dict) -> dict:
 
 
 def compare_builds(
-    baseline: Path, candidate: Path, model_root: Path, environment: dict
+    baseline: Path, candidate: Path, model_root: Path, environment: dict, options=()
 ) -> dict:
     """Compares the images the build directories load from model_root, which
-    both were given; environment started the baseline."""
+    both were given, each build's weight-digests given options; environment
+    started the baseline."""
     if loads_in_memory(baseline):
-        images = digests(baseline, model_root)
+        images = digests(baseline, model_root, options)
     elif (Path(baseline) / IDENTITY_HEADER).is_file():
         images = prepared(environment, model_root)
     else:
         raise RuntimeError(f"the baseline build has no {WEIGHT_DIGESTS}")
-    return compare(images, digests(candidate, model_root))
+    return compare(images, digests(candidate, model_root, options))

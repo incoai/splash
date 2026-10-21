@@ -3,8 +3,12 @@
 // Where KV pages live, shared by the host and the kernels. A pool's pages sit
 // in extents: ordinary shared Metal buffers that all hold the same number of
 // pages, allocated when the pool grows; an empty one is released by the next
-// reclaim pass between commands. Kernels reach them only through the page
-// entries of a request's table, never through a bound buffer.
+// reclaim pass between commands. With a block index, an extent holds its
+// pages' index after every layer's K/V region, as its index plane, and an
+// extent of pages that hold only their index (kv::PageForm::Index) holds only
+// that plane. Kernels reach extents only through the page entries of a
+// request's tables, never through a bound buffer: a page table's entries reach
+// the pages' K/V, an index table's their index plane.
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 #else
@@ -14,10 +18,16 @@
 #include "metal/abi/ExecutionGeometry.h"
 
 // One KV page as kernels address it: the GPU address of the extent that holds
-// it, 16 KiB-aligned, with the page's index in the extent in the low bits.
+// it, or of its index plane, 16 KiB-aligned, with the page's index in the
+// extent in the low bits.
 typedef uint64_t SplashKvPage;
 #define SPLASH_KV_PAGE_INDEX_BITS 14u
 #define SPLASH_KV_PAGE_INDEX_MASK ((1u << SPLASH_KV_PAGE_INDEX_BITS) - 1u)
+// The K/V entry of a page that holds only its blocks' index (kv::PageForm::
+// Index): no K/V to reach. A kernel that reads through it faults, loudly, on
+// the null address; the target's dense-history rule keeps every read that
+// goes through a page table off such pages.
+#define SPLASH_KV_PAGE_ABSENT ((SplashKvPage)0)
 
 // The dimension of every KV head a page holds.
 #define SPLASH_KV_HEAD_DIMENSION 256u

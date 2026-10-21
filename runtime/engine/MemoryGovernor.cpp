@@ -1,5 +1,7 @@
 #include "engine/MemoryGovernor.hpp"
 
+#include "engine/MemoryPlan.hpp"
+
 #include <dispatch/dispatch.h>
 #include <mach/mach.h>
 #include <mach/mach_host.h>
@@ -101,10 +103,10 @@ void MemoryGovernor::Reservation::release() noexcept {
 
 MemoryGovernor::MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes,
                                uint64_t hostReserveBytes, uint64_t hostSpareReserveBytes,
-                               HostMemoryProvider hostMemory, uint64_t untrackedReserveBytes)
+                               HostMemoryProvider hostMemory, uint64_t untrackedReserveBytes, uint64_t hostHeldBytes)
     : backend_(backend), limitBytes_(limitBytes), hostReserveBytes_(hostReserveBytes),
       hostSpareReserveBytes_(hostSpareReserveBytes), hostMemory_(std::move(hostMemory)),
-      untrackedReserveBytes_(untrackedReserveBytes) {
+      untrackedReserveBytes_(untrackedReserveBytes), hostHeldBytes_(hostHeldBytes) {
   if (!limitBytes_) {
     throw std::invalid_argument("memory governor limit must be positive");
   }
@@ -127,6 +129,13 @@ MemoryGovernor::MemoryGovernor(metal::MetalBackend &backend, uint64_t limitBytes
   }
 }
 
+MemoryGovernor::MemoryGovernor(metal::MetalBackend &backend, const EngineMemoryBreakdown &budget,
+                               HostMemoryProvider hostMemory)
+    : MemoryGovernor(backend, budget.hardBudgetBytes,
+                     EngineMemoryPolicy::hostAvailableReserveBytes(budget.physicalMemoryBytes),
+                     EngineMemoryPolicy::hostSpareReserveBytes(budget.physicalMemoryBytes), std::move(hostMemory),
+                     budget.pipelineReserveBytes + budget.runtimeOverheadReserveBytes, budget.streamedTableBytes) {}
+
 uint64_t
 MemoryGovernor::chargedBytes(bool refreshDevice) const noexcept {
   metal::MetalMemoryStats memory = refreshDevice
@@ -138,7 +147,8 @@ MemoryGovernor::chargedBytes(bool refreshDevice) const noexcept {
   const uint64_t accounted = untrackedReserveBytes_ <= limit - memory.allocatedBytes
       ? memory.allocatedBytes + untrackedReserveBytes_
       : limit;
-  return std::max(accounted, memory.deviceCurrentAllocatedBytes);
+  const uint64_t device = std::max(accounted, memory.deviceCurrentAllocatedBytes);
+  return hostHeldBytes_ <= limit - device ? device + hostHeldBytes_ : limit;
 }
 
 std::optional<HostMemory> MemoryGovernor::sampleHost() const noexcept {
@@ -336,10 +346,15 @@ std::optional<MemoryReclaimDirective> MemoryPressurePolicy::update(
   // discard cache nothing needs, on every pass while the host's idle headroom
   // stays below it. Such a pass also keeps the resume point, whose loss costs
   // the next request a replay of its whole prompt; a waiting request outranks
-  // it. macOS's warning asks caches to give memory back, whatever the
-  // headroom: while it lasts, every pass returns as much as a pass may, and
-  // keeps the resume point even for a waiting request, whose growth the
-  // warning refuses as well, so that what the pass frees would not reach it.
+  // it. Nor does such a pass take what is in use: the states of the requests
+  // in service and the KV they restore through. The replay point it would
+  // take is the next resume point, and what it would free goes back to those
+  // requests' growth, which neither the margin nor macOS's warning holds
+  // back. macOS's warning asks caches to give memory back, whatever the
+  // headroom: while it lasts, every pass returns as much as a pass may,
+  // still short of what is in use unless a request waits, and keeps the
+  // resume point even for a waiting request, whose growth the warning
+  // refuses as well, so that what the pass frees would not reach it.
   const bool warning = snapshot.systemPressure == MemoryPressure::Warning;
   const uint64_t margin = requestWaiting ? kHostRecoveryMarginBytes : kHostWarningMarginBytes;
   const uint64_t deficit =
@@ -353,7 +368,8 @@ std::optional<MemoryReclaimDirective> MemoryPressurePolicy::update(
     nextReclaimMilliseconds_ = nowMilliseconds + 1000.0;
   return MemoryReclaimDirective{
       .targetBytes = std::min(desired, kHostWarningMarginBytes),
-      .keepResumePoint = !requestWaiting || warning};
+      .keepResumePoint = !requestWaiting || warning,
+      .upTo = requestWaiting ? ReclaimClass::InUse : ReclaimClass::Ordinary};
 }
 
 void MemoryPressurePolicy::reclaimed(const MemoryReclaimDirective &directive,

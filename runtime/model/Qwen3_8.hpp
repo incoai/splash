@@ -1,10 +1,8 @@
 #pragma once
 
-#include "DFlashDraft.hpp"
 #include "QwenHybridLayout.hpp"
 #include "QwenTarget.hpp"
 #include "QwenTargetFiles.hpp"
-#include "metal/abi/DraftAttention.h"
 #include "metal/abi/RoPE.h"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
@@ -15,12 +13,18 @@
 
 namespace splash::model {
 
-struct Qwen3_8Layout final : QwenHybridLayout<5> {
+struct Qwen3_8Layout final : QwenHybridLayout {
   // The family's name, as the installer pairs its draft (install/families.py).
   static constexpr std::string_view family = "Qwen3.8-27B";
+  // Its config's text model type and its GGUFs' architecture; a safetensors
+  // checkpoint of it loads too.
+  static constexpr std::string_view modelType = "qwen3_5_text";
+  static constexpr std::string_view ggufArchitecture = "qwen35";
+  static constexpr bool loadsSafetensors = true;
 
   constexpr Qwen3_8Layout()
-      : QwenHybridLayout{{.maximumContextTokens = 262'144,
+      : QwenHybridLayout{{.nativeContextTokens = 262'144,
+                          .yarnContextTokens = 1'010'000,
                           .layers = 64,
                           .hiddenSize = 5120,
                           .vocabularySize = 248320,
@@ -40,27 +44,9 @@ struct Qwen3_8Layout final : QwenHybridLayout<5> {
                           .maskToken = 248070,
                           .stopTokens = {248044, 248046},
                           .ffnKind = QwenFfnKind::Dense,
-                          .intermediateSize = 17408},
-                         /* hiddenCaptureLayers */ {5, 19, 33, 47, 61}} {}
+                          .intermediateSize = 17408}} {}
   bool operator==(const Qwen3_8Layout &) const = default;
 };
-
-// The DFlash2 draft of Qwen3.8-27B.
-inline constexpr DFlashDraftLayout kQwen3_8DraftLayout{.layers = 5,
-                                                       .hiddenSize = 5120,
-                                                       .vocabularySize = 248320,
-                                                       .dynamicSize = draft_dynamic_width(5120),
-                                                       .qkvSize = SPLASH_DRAFT_QKV_WIDTH,
-                                                       .attentionSize = SPLASH_DRAFT_ATTENTION_WIDTH,
-                                                       .intermediateSize = 17408,
-                                                       .attentionHeadDimension = SPLASH_DRAFT_HEAD_DIMENSION,
-                                                       .rotaryTheta = 10'000'000.0F,
-                                                       .targetHiddenSize = 25600,
-                                                       .selectorRank = SPLASH_DRAFT_SELECTOR_RANK,
-                                                       .kvHeads = SPLASH_DRAFT_KV_HEADS};
-
-// The vision tower of Qwen3.8-27B, projecting into its hidden width.
-inline constexpr ops::VisionLayout kQwen3_8VisionLayout{.outputHiddenSize = Qwen3_8Layout{}.hiddenSize};
 
 struct Qwen3_8LayerWeights final {
   ops::NormWeights inputNorm;

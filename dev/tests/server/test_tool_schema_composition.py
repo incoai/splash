@@ -198,9 +198,10 @@ class ToolSchemaCompositionTests(HarnessTestCase):
         self.assertIn('("a" | "b")', arguments)
         self.check_arguments(schema, {"value": "b"})
 
-    def test_framing_is_bounded_across_the_tools_of_a_request(self):
+    def test_framing_is_bounded_across_the_strict_tools_of_a_request(self):
         # Composition and root copies can make the framed schemas quadratic or
-        # exponential in the tool schemas; one budget covers all tools.
+        # exponential in the tool schemas; one budget covers the strict tools,
+        # whose grammars are built together.
         wide = {
             "anyOf": [
                 {
@@ -235,6 +236,167 @@ class ToolSchemaCompositionTests(HarnessTestCase):
                 ):
                     tool_schema.tool_grammar(strict_policy(*schemas), False)
                 self.assertEqual(caught.exception.status, 400)
+
+    def test_tools_that_are_not_strict_are_framed_for_their_types_alone(self):
+        # A tool that is not strict is framed when a call first names it, for
+        # its parameters' types alone: no copy of its root schema goes into
+        # the parameters that refer to it, as into a strict tool's, so twenty
+        # that refer to a 400-value enum keep their types under a budget their
+        # copies exceed. The request's tools that are not strict share one
+        # budget, apart from the strict tools', as its output's calls name
+        # them: one whose composition exceeds what it has left declares no
+        # types, so its values stay text, as do those of a tool a call names
+        # once it is spent, while a strict tool keeps its grammar and its
+        # types.
+        choice = {"enum": [f"choice-{index:03d}" for index in range(400)]}
+        referring = {
+            "$defs": {"choice": choice},
+            "properties": {
+                "n": {"type": "integer"},
+                **{f"p{index}": {"$ref": "#/$defs/choice"} for index in range(20)},
+            },
+        }
+        composed = {
+            "properties": {"n": {"type": "integer"}},
+            "allOf": [
+                {"properties": {f"p{index}": {} for index in range(150)}}
+                for _ in range(150)
+            ],
+        }
+        plain = {"properties": {"n": {"type": "integer"}}}
+        call = (
+            "<tool_call>\n<function={}>\n<parameter=n>\n123\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        with mock.patch.object(tool_schema, "MAX_FRAMED_SCHEMA_BYTES", 20_000):
+            with self.assertRaisesRegex(APIError, "too complex"):
+                tool_schema.tool_grammar(strict_policy(referring), False)
+            tools = [
+                {"function": {"name": "referring", "parameters": referring}},
+                {"function": {"name": "composed", "parameters": composed}},
+                {"function": {"name": "plain", "parameters": plain}},
+                {"function": {"name": "strict", "parameters": plain, "strict": True}},
+            ]
+            policy = tool_schema.normalize_tools(tools, "auto", True)[1]
+            tool_schema.tool_grammar(policy, False)
+            names = ("referring", "composed", "plain", "strict")
+            _, calls, _ = project("".join(map(call.format, names)), policy)
+            self.assertEqual(
+                [json.loads(made["function"]["arguments"]) for made in calls],
+                [{"n": 123}, {"n": "123"}, {"n": "123"}, {"n": 123}],
+            )
+
+    def test_framing_reads_keywords_of_any_kind(self):
+        # A reference can reach data that is not a schema, an older dialect
+        # leaves newer keywords unchecked, and the schema of a tool that is
+        # not strict is not checked at all, so framing meets keywords of any
+        # kind. A keyword of another kind than it takes constrains nothing,
+        # as do a value that is not a schema, a type name that stands for no
+        # JSON type and a reference to nothing: a tool's parameters keep the
+        # types it declares, and a strict tool's grammar generates them. A
+        # cycle of references still cannot be framed, and a type that names
+        # JSON types alone, by their names in any case or common aliases, none
+        # of them object, allows no object.
+        a = {"a": {"type": "integer"}}
+
+        def reaching(data):
+            return {
+                "type": "object",
+                "default": data,
+                "allOf": [{"$ref": "#/default"}],
+                "properties": a,
+            }
+
+        for schema in (
+            reaching(5),
+            reaching({"$ref": [1]}),
+            reaching({"$ref": "#/nowhere"}),
+            reaching({"required": [["a"]]}),
+            reaching({"required": [1, "a"]}),
+            reaching({"enum": 5}),
+            reaching({"if": {}, "then": 5, "anyOf": None}),
+            {
+                "$schema": "http://json-schema.org/draft-03/schema#",
+                "type": "any",
+                "properties": a,
+            },
+            {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "$defs": 5,
+                "definitions": {"n": {"type": "integer"}},
+                "properties": {"a": {"$ref": "#/definitions/n"}},
+            },
+        ):
+            with self.subTest(schema=schema):
+                self.check_arguments(schema, {"a": 7})
+                policy = tool_policy({"t0": schema})
+                types, _ = tool_schema.ParameterTypes(policy).of("t0")
+                self.assertEqual(types, {"a": {"integer"}})
+        for schema in (
+            # Go writes a nil slice, map or pointer as null.
+            {"properties": a, "required": None},
+            {"properties": None, "allOf": [{"properties": a}]},
+            {"type": None, "properties": a},
+            {"type": "OBJECT", "properties": {"a": {"type": "INTEGER"}}},
+            {"type": ["Object", "null"], "properties": a},
+            {"properties": a, "allOf": [{"properties": {"a": {"type": "any"}}}]},
+            {"type": ["null", {"type": "object"}], "properties": a},
+            {"properties": a, "required": [1, {}, "a"]},
+            {"properties": a, "patternProperties": None, "allOf": [5]},
+            {"properties": a, "anyOf": None, "oneOf": None},
+            {"properties": a, "if": None, "then": 5, "else": None},
+            {"properties": a, "dependentSchemas": {"a": None}},
+            {"properties": a, "$ref": 5},
+            {"properties": a, "$ref": "#/$defs/missing"},
+            {"properties": a, "$ref": "https://example.com/arguments"},
+        ):
+            with self.subTest(schema=schema):
+                policy = tool_policy({"t0": schema})
+                types, _ = tool_schema.ParameterTypes(policy).of("t0")
+                self.assertEqual(types, {"a": {"integer"}})
+        for schema in (
+            {"properties": a, "allOf": [{"$ref": "#"}]},
+            {"type": ["string", "null"], "properties": a},
+            {"type": ["list", "null"], "properties": a},
+            {"type": ["String", "NULL"], "properties": a},
+        ):
+            with self.subTest(schema=schema):
+                policy = tool_policy({"t0": schema})
+                types = tool_schema.ParameterTypes(policy).of("t0")
+                self.assertEqual(types, ({}, None))
+
+    def test_a_strict_tool_generates_the_types_its_type_names_stand_for(self):
+        # Draft 3 takes any type name. A strict tool's grammar generates the
+        # JSON type a name stands for in any case or as a common alias, as
+        # the tool's values convert by it, and closes its arguments, typed
+        # "dict", to the parameters it declares.
+        call = (
+            "<tool_call>\n<function=t0>\n<parameter={}>\n{}\n</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        for parameter, value, other in (
+            ({"type": "int"}, 42, "4.5"),
+            ({"type": "INTEGER"}, 42, "x"),
+            ({"type": "float"}, 4.5, "x"),
+            ({"type": "bool"}, True, "1"),
+            ({"type": " Boolean "}, False, "x"),
+            ({"type": "list", "items": {"type": "Int"}}, [1, 2], '["a"]'),
+            ({"type": "dict", "properties": {"a": {"type": "int"}}}, {"a": 1}, "[]"),
+            ({"type": "str"}, "42", None),
+            ({"type": "text"}, "true", None),
+            ({"type": "STRING"}, "[1]", None),
+        ):
+            with self.subTest(parameter=parameter):
+                schema = {
+                    "$schema": "http://json-schema.org/draft-03/schema#",
+                    "type": "dict",
+                    "properties": {"v": parameter},
+                }
+                policy, _ = self.check_arguments(schema, {"v": value})
+                self.assertFalse(self.accepts(policy, call.format("w", "1")))
+                if other is not None:
+                    self.assertFalse(self.accepts(policy, call.format("v", other)))
 
     def test_recursive_objects_keep_json_framing(self):
         schema = {
@@ -290,7 +452,7 @@ class ToolSchemaCompositionTests(HarnessTestCase):
             },
             "$ref": "#/$defs/args",
         }
-        written = {"name": "123", "extra": True}
+        written = {"name": "123", "extra": "true"}
         self.check_arguments(schema, written)
         self.check_arguments(
             {
@@ -383,7 +545,7 @@ class ToolSchemaCompositionTests(HarnessTestCase):
         self.assertFalse(self.accepts(policy, xml.replace("</function>", extra)))
         self.check_arguments(
             {"type": "object", "not": {"required": ["forbidden"]}},
-            {"allowed": 123},
+            {"allowed": "123"},
         )
         self.check_arguments({"enum": [{"a": "123"}, {"b": 3}]}, {"a": "123"})
 
@@ -440,7 +602,7 @@ class ToolSchemaCompositionTests(HarnessTestCase):
                 "properties": {"a": {"type": "string", "const": "hello"}},
                 "additionalProperties": True,
             },
-            {"a": "hello", "ab": 3},
+            {"a": "hello", "ab": "3"},
         )
         bad = (
             '<tool_call>\n<function=t0>\n<parameter=a>\n"hello"\n'
@@ -465,7 +627,7 @@ class ToolSchemaCompositionTests(HarnessTestCase):
         self.assertFalse(self.accepts(policy, xml.replace("</function>", repeated)))
         policy, xml = self.check_arguments(
             {"properties": {"secret": False}, "additionalProperties": {}},
-            {"secrets": 1},
+            {"secrets": "1"},
         )
         self.assertFalse(self.accepts(policy, xml.replace("secrets", "secret")))
 

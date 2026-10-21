@@ -534,10 +534,13 @@ class SchemaFallbackTests(HarnessTestCase):
         )
         self.assertTrue(validator.is_valid({"value": 1}))
 
-    def test_unchecked_keywords_of_older_dialects_are_request_errors(self):
+    def test_unchecked_keywords_of_older_dialects_constrain_nothing(self):
         # An older declared dialect leaves newer keywords unchecked, so they
-        # can hold any value. That is the client's schema error, not a crash;
-        # a value's keyword that names nothing leaves the value unconstrained.
+        # can hold any value. One of another kind than the keyword takes
+        # constrains nothing, as the dialect, which does not define it, reads
+        # it: a value's keyword leaves the value unconstrained, and one of the
+        # arguments leaves them as their other keywords frame them. A $ref,
+        # which every dialect defines, must still be a string.
         schema = {
             "$schema": "http://json-schema.org/draft-03/schema#",
             "type": "object",
@@ -548,16 +551,26 @@ class SchemaFallbackTests(HarnessTestCase):
             ("draft-07", {"dependentSchemas": 5}),
             ("draft-03", {"allOf": 5}),
             ("draft-03", {"required": True}),
-            ("draft-04", {"$ref": {"a": 1}}),
         ):
             schema = {
                 "$schema": f"http://json-schema.org/{draft}/schema#",
                 "type": "object",
+                "properties": {"value": {"type": "integer"}},
                 **keywords,
             }
-            with self.subTest(schema=schema), self.assertRaises(api.APIError) as caught:
-                tool_schema.tool_grammar(self.policy(schema), False)
-            self.assertEqual(caught.exception.status, 400)
+            with self.subTest(schema=schema):
+                self.verify(schema, "7", ["seven"], 7)
+        schema = {
+            "$schema": "http://json-schema.org/draft-04/schema#",
+            "type": "object",
+            "$ref": {"a": 1},
+        }
+        with self.assertRaises(api.APIError) as caught:
+            self.policy(schema)
+        self.assertEqual(
+            (caught.exception.status, caught.exception.message),
+            (400, "$ref must be a string"),
+        )
 
     def test_tool_grammar_leaves_out_property_name_assertions(self):
         schema = {

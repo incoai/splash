@@ -56,6 +56,13 @@ enum class BufferStorage {
   Private,
 };
 
+// How kernels reach a buffer: bound to the dispatches that use it, or only
+// through its GPU address held in another buffer, as they reach KV extents.
+enum class BufferReach {
+  Bound,
+  Addressed,
+};
+
 class MetalBackend;
 class CommandTicket;
 
@@ -80,8 +87,10 @@ public:
   // (MetalBackend::releaseMemory). The pointer covers this view only.
   [[nodiscard]] void *contents() const noexcept;
   // GPU address of the view's first byte, for kernels that reach a buffer
-  // through an address another buffer holds.
-  [[nodiscard]] uint64_t gpuAddress() const noexcept;
+  // through an address another buffer holds; zero for released memory. Only
+  // a buffer allocated BufferReach::Addressed has one: no command names the
+  // buffers kernels reach that way, so only that keeps them resident.
+  [[nodiscard]] uint64_t gpuAddress() const;
   // Allocation identity and exact view range, including Private storage.
   // This compares metadata only; it never maps or reads device contents.
   [[nodiscard]] bool sameView(const MetalBuffer &other) const noexcept;
@@ -165,19 +174,81 @@ struct ComputeDispatch {
   IndirectGrid indirectThreadgroups = {};
 };
 
+// A host step's round trip on the host clock (AwakeClock, the time base of
+// the GPU's command buffer times): from the GPU end of the work before the
+// step to the runner taking it up, its work, and from its return to the GPU
+// start of the work after it.
+struct HostStepTiming {
+  double pickupSeconds = 0.0;
+  double workSeconds = 0.0;
+  double resumeSeconds = 0.0;
+};
+
+// What the GPU does through a host step (EventStep::Kind::Host): it idles,
+// or one GPU thread spins through the step and keeps it awake.
+enum class HostStepGpu : uint8_t {
+  Idle,
+  Awake,
+};
+
 // Orders a command against another agent, such as the Neural Engine, after
 // the first `before` of its dispatches. A Signal raises the event to `value`
 // once all earlier work has completed; a Wait holds all later work until the
 // event reaches `value`. A command is split into Metal command buffers at its
 // signals, so a signal is never held back behind the dispatches that follow
 // it, and a signal is delivered even when the work before it fails.
+//
+// A Host step runs `work` on the CPU once all earlier work has completed and
+// holds all later work until it returned, through two shared events the
+// backend creates for the command's host steps, one the GPU raises and one the
+// backend's runner raises, so that no write of one side puts back a value of
+// the other (the step's event and value are unused): the work reads what the
+// GPU wrote before it and writes Shared buffers the GPU reads after it. With
+// HostStepGpu::Awake, one GPU
+// thread spins through the step so the GPU stays awake and starts the work
+// after it at once and at full clocks: for steps about as short as the GPU's
+// wake-up (a streamed decode load), not for long ones, where the spin saves
+// little. The spin, host_step_wait of host-step.metallib beside the
+// backend's metallib, sees the CPU end it through a memory scope Metal's
+// public headers leave out, so the backend checks, before the first command
+// with an awake step, that it does; without that library, or if it does not,
+// awake steps run as plain ones, with a warning. The steps of the committed
+// commands run in order on one thread of the backend's while the submitting
+// thread goes on, so `work` must not call the backend: it touches buffer
+// contents and its own state only. It may also run after submitCommandAsync
+// or wait() threw (its encoding failed after its first buffers were committed,
+// or the watchdog or a shutdown gave the command up), so it owns what it
+// touches. A step is skipped when the command buffer before it failed, and
+// so is every later step of its command, as are those after a step whose
+// work threw: a later step may build on what an earlier one did (an expert
+// load's later rounds on its first), and a command that failed is given up.
+// The GPU work after a skipped step still runs, on what its buffers held, as
+// all work after a failed buffer runs on what it left, and the command fails
+// with the first failure; a step whose work threw names it (its ticket's
+// wait() throws its message). The failure also names, of the steps that ran,
+// the longest work and the longest pickup (from the end of the GPU work
+// before a step to its start), so that a buffer Metal timed out tells which
+// step held its wait. Once a command completed without a failure, `timed`
+// gets the round trip of each of its host steps (HostStepTiming) on Metal's
+// completion thread; one that throws marks the backend unhealthy, as a
+// completion callback that throws does. A command run under dispatch
+// profiling reports no round trip. Once the work returned, `then` runs on the
+// runner right after the step let the work after it go: short CPU work the
+// GPU need not wait for and that would slow its start, such as reads begun in
+// the background; the runner takes the next step once it returned. The
+// command may have completed by then, so `then` must not throw: one that does
+// marks the backend unhealthy.
 struct EventStep {
-  enum class Kind : uint8_t { Signal, Wait };
+  enum class Kind : uint8_t { Signal, Wait, Host };
 
   size_t before = 0;
   SharedEvent event;
   uint64_t value = 0;
   Kind kind = Kind::Signal;
+  std::function<void()> work{};
+  std::function<void(const HostStepTiming &)> timed{};
+  HostStepGpu gpu = HostStepGpu::Idle;
+  std::function<void()> then{};
 };
 
 // What one submission encodes: its dispatches in order, and the event steps
@@ -190,9 +261,12 @@ struct Command {
 struct CommandTiming {
   // From the GPU start of a command's first Metal command buffer to the end
   // of its last: a command split at event signals (EventStep) also counts the
-  // time its later buffers wait for the other agent.
+  // time its later buffers wait for the other agent or its host steps.
   double gpuSeconds = 0.0;
   double wallSeconds = 0.0;
+  // Of gpuSeconds, the time its work waited on its host steps: from the GPU
+  // end of the work before each step to the GPU start of the work after it.
+  double hostSeconds = 0.0;
 };
 
 // Move-only ownership of one submitted Metal command. Completion is signalled
@@ -237,15 +311,17 @@ struct MetalMemoryStats {
   // Sum of MTLResource.allocatedSize for live base buffers created through
   // this backend. Views share their base allocation and add no bytes.
   uint64_t allocatedBytes = 0;
+  // Its highest value since the backend was made or its peaks restarted
+  // (MetalBackend::restartPeaks).
   uint64_t peakAllocatedBytes = 0;
 
   // Most recently sampled Metal device-wide process counter. Allocation and
   // command lifecycle boundaries refresh it; status reads never synchronize
   // with an in-flight GPU command.
   uint64_t deviceCurrentAllocatedBytes = 0;
-  // Highest sampled device.currentAllocatedSize. Sampled after allocations
-  // and pipeline creation, on host-side retirement and whenever admission
-  // refreshes the stats.
+  // Highest sampled device.currentAllocatedSize since then. Sampled after
+  // allocations and pipeline creation, on host-side retirement and whenever
+  // admission refreshes the stats.
   uint64_t devicePeakAllocatedBytes = 0;
 };
 
@@ -272,8 +348,10 @@ private:
 // enough to refuse an unsupported Mac before a model is downloaded.
 [[nodiscard]] DeviceCapabilities probeDeviceCapabilities();
 
-// How long a command may run before the backend gives up on it by default,
-// in time the Mac is awake (AwakeClock).
+// How long a command may go without progress before the backend gives up on
+// it by default, in time the Mac is awake (AwakeClock): from its commit, and
+// then from each of its host steps as the GPU work before it ends and as it
+// returns (CommandWatchdog).
 inline constexpr double kCommandTimeoutSeconds = 120.0;
 // How long every buffer stays wired after the last command by default (see
 // allocateBuffer), also the default of the engine's idle release
@@ -289,7 +367,8 @@ class MetalBackend final {
 public:
   // Buffers stay wired for residencyKeepAliveSeconds after the last command;
   // an infinite keep-alive holds them while the backend lives. The watchdog
-  // gives up on a command that runs longer than commandTimeoutSeconds.
+  // gives up on a command that goes longer than commandTimeoutSeconds without
+  // progress (kCommandTimeoutSeconds).
   explicit MetalBackend(std::string metallibPath,
                         double residencyKeepAliveSeconds = kResidencyKeepAliveSeconds,
                         double commandTimeoutSeconds = kCommandTimeoutSeconds);
@@ -313,20 +392,21 @@ public:
 
   [[nodiscard]] const DeviceCapabilities &capabilities() const noexcept;
 
-  // Every buffer the backend allocates belongs to one residency set, attached
-  // to the command queue, until its memory is released or its last view is
-  // gone. Metal by itself wires a buffer only while a command uses it and a
-  // few seconds after, so memory pressure could compress idle state and the
-  // next request would wait to get it back. A member is wired from
-  // its allocation on until the keep-alive passes without a command, and
-  // again from the next command: memory goes back to macOS when the engine
-  // releases it, not when macOS chooses. Kernels may also reach a Shared
-  // buffer only through its GPU address held in another buffer, as they
-  // reach KV extents: residency makes it resident for every command, so no
-  // command names it.
+  // Every buffer the backend allocates belongs to one residency set until its
+  // memory is released or its last view is gone. Metal by itself wires a
+  // buffer only while a command uses it and a few seconds after, so memory
+  // pressure could compress idle state and the next request would wait to get
+  // it back. A member is wired from its allocation on until the keep-alive
+  // passes without a command, and again from the next command: memory goes
+  // back to macOS when the engine releases it, not when macOS chooses. A
+  // Shared buffer that kernels reach only through its GPU address
+  // (BufferReach::Addressed), as they reach KV extents, also belongs to the
+  // set the command queue holds, which makes it resident for every command
+  // buffer though no command names it (Residency).
   [[nodiscard]] MetalBuffer
   allocateBuffer(uint64_t bytes, BufferStorage storage,
-                 std::string_view label);
+                 std::string_view label,
+                 BufferReach reach = BufferReach::Bound);
   // A Shared buffer over whole pages of memory another agent also reads or
   // writes, such as an IOSurface of the Neural Engine, without a copy. Metal
   // keeps `owner` until it lets the buffer go; the memory is the owner's, so
@@ -354,13 +434,14 @@ public:
   // and reports both GPU and end-to-end wall time.
   [[nodiscard]] CommandTiming submit(const ComputeDispatch &dispatch);
 
-  // Encodes a command into Metal command buffers, one more than it has event
-  // signals (EventStep), and commits them without waiting. The completion
-  // callback only notifies host control flow; command results and errors are
-  // consumed from the returned ticket, which reports the error of the first
-  // of its buffers that failed. A second command is rejected until wait()
-  // consumes the first ticket, preserving the one-in-flight runtime
-  // invariant.
+  // Encodes a command into Metal command buffers, one plus one per buffer its
+  // event steps add (EventStep), and commits each as its encoding ends,
+  // without waiting: the GPU runs the work before an event step while the
+  // work after it is still encoded. The completion callback only notifies
+  // host control flow; command results and errors are consumed from the
+  // returned ticket, which reports the error of the first of its buffers that
+  // failed. A second command is rejected until wait() consumes the first
+  // ticket, preserving the one-in-flight runtime invariant.
   [[nodiscard]] CommandTicket
   submitCommandAsync(const Command &command, CommandCompletion completion = {});
   // A command of these dispatches without event steps: one command buffer.
@@ -378,6 +459,10 @@ public:
   // control-plane status query must use memoryStats() so it can never wait
   // behind an active Metal command.
   [[nodiscard]] MetalMemoryStats refreshMemoryStats() const noexcept;
+  // Starts both peaks again from what is allocated now, sampling the device:
+  // what memory held before, such as a load the caller discarded, no longer
+  // counts. Called where nothing else allocates.
+  void restartPeaks() noexcept;
   // True from a submission until its ticket has been consumed: while memory
   // the command reaches through addresses must stay allocated.
   [[nodiscard]] bool commandInFlight() const noexcept;

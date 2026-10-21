@@ -146,7 +146,7 @@ test-performance-real: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB) \
 ifneq ($(BASELINE),)
 	$(PYTHON) -m dev.benchmarks.backend_regression --baseline "$(BASELINE)" \
 		--model-root "$(MODEL_ROOT)" --output-dir "$(MODEL_RESULTS)" \
-		$(ANE_FFN_SHARE_ARGS)
+		$(ANE_FFN_SHARE_ARGS) $(WEIGHT_DIGESTS_ARGS)
 else
 	@$(TEST_BACKEND_BENCHMARK) $(LIB) "$(MODEL_ROOT)" \
 		--scenario decode,partial,short --samples 3 $(ANE_FFN_SHARE_ARGS) \
@@ -158,11 +158,17 @@ endif
 
 # The installer's restarts without the Hub, a full source hash and the
 # digests of the weight images a load of the installation holds
-# (DEVELOPMENT.md, Release check).
+# (DEVELOPMENT.md, Release check). WEIGHT_DIGESTS_ARGS, weight-digests'
+# --expert-memory SIZE and --ple-memory SIZE as the runtime oracle takes them,
+# streams the routed experts and the PLE table from their files, here and in
+# both builds of the comparison with BASELINE, and leaves their bytes out of
+# the images (dev/tools/weight_digests.mm).
+WEIGHT_DIGESTS_ARGS ?=
 verify-models: preflight $(TARGET) $(WEIGHT_DIGESTS) $(LIB)
 	@$(PYTHON) dev/tools/installer_restarts.py $(MODEL_ARGS)
 	@mkdir -p "$(MODEL_RESULTS)"
-	@$(WEIGHT_DIGESTS) $(LIB) "$(MODEL_ROOT)" > "$(MODEL_RESULTS)/weights.json.tmp"
+	@$(WEIGHT_DIGESTS) $(LIB) "$(MODEL_ROOT)" $(WEIGHT_DIGESTS_ARGS) \
+		> "$(MODEL_RESULTS)/weights.json.tmp"
 	@mv "$(MODEL_RESULTS)/weights.json.tmp" "$(MODEL_RESULTS)/weights.json"
 	@echo "weight images: $(MODEL_RESULTS)/weights.json"
 

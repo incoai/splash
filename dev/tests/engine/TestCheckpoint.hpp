@@ -10,6 +10,7 @@
 #include "metal/abi/QuantFormat.h"
 #include "model/DFlashDraft.hpp"
 #include "model/DraftCheckpoint.hpp"
+#include "model/SafetensorsImage.hpp"
 #include "model/SafetensorsTarget.hpp"
 #include "model/VisionLoader.hpp"
 #include "ops/Vision.hpp"
@@ -101,7 +102,7 @@ inline std::vector<SyntheticTensor> draftTensors(const model::DFlashDraftLayout 
     add(prefix + "mlp.up_proj.weight", {layout.intermediateSize, hidden});
     add(prefix + "mlp.down_proj.weight", {hidden, layout.intermediateSize});
   }
-  add("fc.weight", {hidden, layout.targetHiddenSize});
+  add("fc.weight", {hidden, layout.targetHiddenSize()});
   add("hidden_norm.weight", {hidden});
   add("norm.weight", {hidden});
   add("candidate_selector.hidden_projection.weight", {layout.selectorRank, hidden});
@@ -305,7 +306,7 @@ struct SyntheticAccounting final {
 
 // Writes the target/ and draft/ checkpoints of an installed MLX model of these
 // layouts under root, which weight planning reads before any image loads
-// (modelWeightBytes): the target 4-bit in groups of 64 with a MoE's router and
+// (model::streamableWeights): the target 4-bit in groups of 64 with a MoE's router and
 // shared-expert gate 8-bit, as mlx-community's 4-bit releases keep them, and
 // the DFlash2 draft.
 template <class Layout>
@@ -328,8 +329,11 @@ SyntheticAccounting writeSyntheticModel(const std::filesystem::path &root, const
                                         const ops::VisionLayout &vision) {
   writeSyntheticCheckpoints(root, target, draft);
   writeSyntheticShard(root / "vision" / "model.safetensors", visionTensors(vision));
-  return {model::safetensorsTargetImageBytes(root / "target", target), model::draftImageBytes(root / "draft", draft),
-          model::visionImageBytes(vision)};
+  uint64_t targetBytes = 0;
+  for (const model::gguf::Image &image :
+       model::safetensors::planImages(model::SafetensorsCheckpoint(root / "target"), target))
+    targetBytes += image.bytes;
+  return {targetBytes, model::draftImageBytes(root / "draft", draft), model::visionImageBytes(vision)};
 }
 
 } // namespace splash::test

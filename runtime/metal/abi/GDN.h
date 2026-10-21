@@ -27,12 +27,15 @@ struct GDNPrefillParams {
 static_assert(sizeof(GDNPrefillParams) == 4,
               "GDN prefill parameters are 4 bytes on both sides");
 
-// tiled_heads (0 or 1) selects the value-head order of the GDN output, the
-// out_proj input columns: 0 keeps a key head's value heads adjacent (head h
-// at h); 1 is llama.cpp's tiled GGUF order, head h at
-// (h % heads per key) * key heads + h / heads per key.
+// flags: GDN_TILED_HEADS selects the value-head order of the GDN output, the
+// out_proj input columns: without it a key head's value heads stay adjacent
+// (head h at h); with it, the tiled order of GGUFs puts head h at
+// (h % heads per key) * key heads + h / heads per key. GDN_SIGMOID_GATE gates
+// the normalized output by sigmoid(z) (Qwen3.8-Flash-Next) instead of silu(z).
+#define GDN_TILED_HEADS 1u
+#define GDN_SIGMOID_GATE 2u
 struct GDNGatePrefillParams {
-  uint32_t tiled_heads;
+  uint32_t flags;
 };
 
 static_assert(sizeof(GDNGatePrefillParams) == 4,
@@ -67,7 +70,7 @@ inline constexpr uint64_t gdn_tape_layer_bytes(uint32_t conv_dim,
 }
 
 struct GDNDecodeBatchParams {
-  uint32_t tiled_heads; // As in GDNGatePrefillParams.
+  uint32_t flags; // As in GDNGatePrefillParams.
   uint32_t layer;
   uint64_t conv_layer_bytes;
   uint64_t recurrent_layer_bytes;

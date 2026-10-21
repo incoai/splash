@@ -1,6 +1,9 @@
+#include "AwakeClock.hpp"
 #include "Checked.hpp"
 #include "TestChecks.hpp"
+#include "model/Crc32c.hpp"
 #include "model/SlotFile.hpp"
+#include "model/SsdReaders.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -23,6 +26,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -45,6 +49,7 @@ using splash::kHostPageBytes;
 using splash::model::DiskBudget;
 using splash::model::SlotFile;
 using splash::model::SlotRecord;
+using splash::model::SsdReaders;
 
 // A slot is its payload rounded up to whole host pages, as uncached IO wants.
 static_assert(SlotFile::slotBytesFor(1) == kHostPageBytes &&
@@ -613,6 +618,443 @@ static void testFullVolumeIsReported() {
   }
 }
 
+// Bytes that differ from one place and seed to the next.
+static std::vector<std::byte> patterned(size_t size, uint32_t seed) {
+  std::vector<std::byte> bytes(size);
+  uint32_t state = seed;
+  for (std::byte &value : bytes) {
+    state = state * 1664525u + 1013904223u;
+    value = static_cast<std::byte>(state >> 24);
+  }
+  return bytes;
+}
+
+// Memory aligned for reads beside the worker (SlotFile::readAt).
+class AlignedBytes final {
+public:
+  explicit AlignedBytes(size_t size) : size_(size) {
+    void *memory = nullptr;
+    require(::posix_memalign(&memory, splash::kSlotReadAlignmentBytes, size) == 0,
+            "aligned memory could not be allocated");
+    memory_.reset(static_cast<std::byte *>(memory));
+  }
+  [[nodiscard]] std::span<std::byte> span() const noexcept { return {memory_.get(), size_}; }
+
+private:
+  struct Free {
+    void operator()(std::byte *memory) const noexcept { std::free(memory); }
+  };
+  std::unique_ptr<std::byte, Free> memory_;
+  size_t size_;
+};
+
+// Every byte of a file.
+static std::vector<std::byte> contentsOf(const std::filesystem::path &path) {
+  std::vector<std::byte> bytes(sizeOf(path));
+  const int descriptor = ::open(path.c_str(), O_RDONLY);
+  require(descriptor >= 0 && ::pread(descriptor, bytes.data(), bytes.size(), 0) ==
+                                 static_cast<ssize_t>(bytes.size()),
+          "file could not be read");
+  ::close(descriptor);
+  return bytes;
+}
+
+// `value` at `offset` of `bytes`, as this host lays it out.
+template <class Value> static void put(std::vector<std::byte> &bytes, size_t offset, Value value) {
+  std::memcpy(bytes.data() + offset, &value, sizeof(value));
+}
+
+// A slot reads beside the worker once its write landed: the bytes asked for,
+// from one pread of the aligned units around them into aligned memory that
+// holds those; nothing for an unwritten slot, bytes past the payload, memory
+// that is not aligned or too small, or another file's slot.
+static void testReadAtReadsAlignedUnits() {
+  constexpr size_t size = 4 * kHostPageBytes;
+  constexpr uint64_t unit = splash::kSlotReadAlignmentBytes;
+  auto budget = std::make_shared<DiskBudget>(4 * size);
+  SlotFile file(size, budget), other(size, budget);
+  auto slot = file.acquire(), unwritten = file.acquire(), foreign = other.acquire();
+  const std::vector<std::byte> payload = patterned(size - 1000, 3);
+  require(file.write(slot, {payload}, {})->wait() && other.write(foreign, {payload}, {})->wait(),
+          "slot writes failed");
+  const AlignedBytes buffer(size);
+  const std::vector<std::pair<uint64_t, uint64_t>> ranges{
+      {0, 1}, {unit - 1, 2}, {5000, 20000}, {0, payload.size()}, {payload.size(), 0}};
+  for (const auto [offset, bytes] : ranges) {
+    const uint64_t before = budget->readBytes();
+    const auto read = file.readAt(*slot, offset, bytes, buffer.span());
+    const uint64_t units = bytes ? (offset + bytes + unit - 1) / unit - offset / unit : 0;
+    require(read && read->size() == bytes && std::equal(read->begin(), read->end(), payload.begin() + offset) &&
+                budget->readBytes() - before == units * unit,
+            "a read beside the worker did not return its bytes from the aligned units around them");
+  }
+  require(!file.readAt(*unwritten, 0, 1, buffer.span()), "an unwritten slot read back");
+  require(!file.readAt(*slot, payload.size() - 1, 2, buffer.span()), "bytes past the payload read back");
+  require(!file.readAt(*slot, 0, 1, buffer.span().subspan(1)), "a read landed in unaligned memory");
+  require(!file.readAt(*slot, unit - 100, 200, buffer.span().first(unit)),
+          "a read landed in memory smaller than its aligned units");
+  require(!file.readAt(*foreign, 0, 1, buffer.span()), "another file's slot read back through this one");
+}
+
+// Reads beside the worker run on any thread: a slot whose write is queued
+// reads nothing until the write lands; written slots read back while the
+// worker writes other slots and punches freed ones. Built under TSan too.
+static void testReadAtBesideTheWorker() {
+  constexpr size_t size = 2 * kHostPageBytes;
+  auto budget = std::make_shared<DiskBudget>(16 * size);
+  SlotFile file(size, budget);
+  const AlignedBytes buffer(size);
+  const std::vector<std::byte> first = patterned(size, 1), second = patterned(size, 2);
+  auto written = file.acquire();
+  require(file.write(written, {first}, {})->wait(), "slot write failed");
+  std::promise<void> reached, release;
+  auto released = release.get_future().share();
+  std::vector<std::byte> output(size);
+  auto hold = file.read(written, {output}, [&] {
+    reached.set_value();
+    released.wait();
+  });
+  reached.get_future().wait();
+  auto queued = file.acquire();
+  auto write = file.write(queued, {second}, {});
+  require(!file.readAt(*queued, 0, size, buffer.span()), "a slot read back before its write landed");
+  release.set_value();
+  require(hold->wait() && write->wait(), "queued operations failed");
+  const auto landed = file.readAt(*queued, 0, size, buffer.span());
+  require(landed && std::ranges::equal(*landed, second), "a slot did not read back once its write landed");
+
+  std::atomic<bool> stop = false;
+  std::atomic<int> wrong = 0;
+  std::vector<std::thread> readers;
+  for (const auto &target : {std::pair{written, &first}, std::pair{queued, &second}}) {
+    readers.emplace_back([&, target] {
+      const AlignedBytes mine(size);
+      for (uint64_t round = 0; !stop.load(); ++round) {
+        const uint64_t offset = round * 4099 % (size - 512);
+        const auto read = file.readAt(*target.first, offset, 512, mine.span());
+        if (!read || !std::equal(read->begin(), read->end(), target.second->begin() + offset)) ++wrong;
+      }
+    });
+  }
+  for (uint32_t round = 0; round < 64; ++round) {
+    const std::vector<std::byte> payload = patterned(size, round);
+    auto other = file.acquire();
+    require(other && file.write(other, {payload}, {})->wait(), "a write beside reads failed");
+  }
+  stop = true;
+  for (std::thread &reader : readers) reader.join();
+  require(!wrong.load(), "a read beside the worker's writes and punches returned the wrong bytes");
+}
+
+// A file of one segment keeps version 1 records byte for byte, whatever its
+// options: the header names the tag, label and slot size; a slot's record is
+// its payload's size and CRC-32C, its label and a CRC-32C of those.
+static void testOneSegmentKeepsVersionOneRecords() {
+  constexpr size_t size = kHostPageBytes;
+  const std::vector<std::byte> payload = patterned(size - 100, 5);
+  for (const SlotFile::Options &options : {SlotFile::Options{}, SlotFile::Options{.segments = {size - 100}}}) {
+    Directory directory;
+    {
+      SlotFile file(size, std::make_shared<DiskBudget>(2 * size), directory.persistence("tag"), options);
+      file.finishAdoption();
+      auto slot = file.acquire();
+      require(file.write(slot, {payload}, {})->wait(), "persistent write failed");
+      file.label(slot, labelOf(9));
+      require(file.synchronize({})->wait(), "a persistent file did not synchronize");
+      file.seal();
+    }
+    std::vector<std::byte> expected(4096 + 64);
+    std::memcpy(expected.data(), "SPLASHSF", 8);
+    put(expected, 8, uint32_t{1});
+    put(expected, 12, uint32_t{sizeof(uint64_t)});
+    put(expected, 16, uint64_t{size});
+    put(expected, 24, uint32_t{3});
+    std::memcpy(expected.data() + 32, "tag", 3);
+    put(expected, 28, splash::model::crc32c(std::span(expected).first(35)));
+    put(expected, 4096, uint32_t{0x53524543});
+    put(expected, 4100, splash::model::crc32c(payload));
+    put(expected, 4104, uint64_t{payload.size()});
+    put(expected, 4112, uint64_t{9});
+    put(expected, 4120, splash::model::crc32c(std::span(expected).subspan(4096, 24)));
+    require(contentsOf(directory.records()) == expected, "a file of one segment did not keep version 1 records");
+  }
+}
+
+// A file of several segments keeps a CRC-32C of each in version 2 records,
+// whose header names the segments run by run after the tag, and takes only
+// payloads of exactly their sum. The next process finds each segment's
+// checksum; one opening it for other segments, or for one, starts empty, as
+// one opening a file of one segment for several does.
+static void testSegmentedRecords() {
+  constexpr size_t size = 2 * kHostPageBytes;
+  const std::vector<uint64_t> segments{8192, 4160, 4160, 4160, 4160};
+  const SlotFile::Options options{.segments = segments};
+  const std::vector<std::byte> payload = patterned(24832, 7);
+  Directory directory;
+  const auto fill = [&](const SlotFile::Options &with, size_t bytes) {
+    SlotFile file(size, std::make_shared<DiskBudget>(2 * size), directory.persistence("tag"), with);
+    file.finishAdoption();
+    auto slot = file.acquire();
+    require(file.write(slot, {std::span(payload).first(bytes)}, {})->wait(), "persistent write failed");
+    file.label(slot, labelOf(4));
+    require(file.synchronize({})->wait(), "a persistent file did not synchronize");
+    file.seal();
+  };
+  fill(options, payload.size());
+  std::vector<uint32_t> checksums;
+  for (uint64_t start = 0; const uint64_t bytes : segments) {
+    checksums.push_back(splash::model::crc32c(std::span(payload).subspan(start, bytes)));
+    start += bytes;
+  }
+  std::vector<std::byte> expected(4096 + 64);
+  std::memcpy(expected.data(), "SPLASHSF", 8);
+  put(expected, 8, uint32_t{2});
+  put(expected, 12, uint32_t{sizeof(uint64_t)});
+  put(expected, 16, uint64_t{size});
+  put(expected, 24, uint32_t{3 + 2 * 16});
+  std::memcpy(expected.data() + 32, "tag", 3);
+  for (size_t run = 0; const auto [bytes, count] : {std::pair<uint64_t, uint64_t>{8192, 1}, {4160, 4}}) {
+    put(expected, 35 + 16 * run, bytes);
+    put(expected, 43 + 16 * run++, count);
+  }
+  put(expected, 28, splash::model::crc32c(std::span(expected).first(67)));
+  put(expected, 4096, uint32_t{0x53524543});
+  put(expected, 4100, checksums.front());
+  put(expected, 4104, uint64_t{payload.size()});
+  std::memcpy(expected.data() + 4112, checksums.data() + 1, 16);
+  put(expected, 4128, uint64_t{4});
+  put(expected, 4136, splash::model::crc32c(std::span(expected).subspan(4096, 40)));
+  require(contentsOf(directory.records()) == expected,
+          "a file of several segments did not keep version 2 records naming them");
+  {
+    SlotFile file(size, std::make_shared<DiskBudget>(2 * size), directory.persistence("tag"), options);
+    require(file.records().size() == 1 && file.records()[0].checksums == checksums &&
+                file.records()[0].payloadBytes == payload.size(),
+            "the next process did not find each segment's checksum");
+    rejects([&] { static_cast<void>(file.adopt({0, payload.size(), {checksums.front()}, labelOf(4)})); },
+            "adopted slot is not one of this file's records", "a record of other segments was adopted");
+    file.finishAdoption();
+    auto slot = file.acquire();
+    rejects([&] { static_cast<void>(file.write(slot, {std::span(payload).first(100)}, {})); },
+            "slot write does not match this file's slots", "a payload of other than the segments was written");
+    file.seal();
+  }
+  for (const SlotFile::Options &other :
+       {SlotFile::Options{.segments = {8192, 4160, 4160, 8320}}, SlotFile::Options{}}) {
+    fill(options, payload.size());
+    SlotFile file(size, std::make_shared<DiskBudget>(2 * size), directory.persistence("tag"), other);
+    require(file.records().empty() && sizeOf(directory.slots()) == 0,
+            "a file opened for other segments took slots of these back");
+  }
+  fill({}, payload.size());
+  SlotFile file(size, std::make_shared<DiskBudget>(2 * size), directory.persistence("tag"), options);
+  require(file.records().empty(), "a file opened for several segments took slots of one back");
+  for (const std::vector<uint64_t> &bad : {std::vector<uint64_t>{size, 1}, std::vector<uint64_t>{8192, 0, 4096}})
+    rejects([&] { SlotFile(size, std::make_shared<DiskBudget>(size), {.segments = bad}); },
+            "slot file segments do not fit its slots", "segments past a slot, or empty, were accepted");
+}
+
+// A read of an adopted slot checks every segment it covers, widened to
+// them whole: damage to one segment fails the reads that cover it and no
+// other. The worker's first read checks the whole payload, after which the
+// slot is trusted; a slot this process wrote is too.
+static void testAdoptedReadsCheckTheirSegments() {
+  constexpr size_t size = 2 * kHostPageBytes;
+  constexpr uint64_t unit = splash::kSlotReadAlignmentBytes;
+  const SlotFile::Options options{.segments = {8192, 4160, 4160, 4160, 4160}};
+  const std::vector<std::byte> payload = patterned(24832, 9);
+  Directory directory;
+  {
+    SlotFile file(size, std::make_shared<DiskBudget>(4 * size), directory.persistence(), options);
+    file.finishAdoption();
+    std::vector<std::shared_ptr<SlotFile::Slot>> kept;
+    for (uint64_t label = 0; label < 2; ++label) {
+      kept.push_back(file.acquire());
+      require(file.write(kept.back(), {payload}, {})->wait(), "persistent write failed");
+      file.label(kept.back(), labelOf(label));
+    }
+    require(file.synchronize({})->wait(), "a persistent file did not synchronize");
+    file.seal();
+  }
+  // The second slot's third segment, its second record.
+  flipByte(directory.slots(), static_cast<off_t>(size + 8192 + 4160 + 10));
+  auto budget = std::make_shared<DiskBudget>(4 * size);
+  SlotFile file(size, budget, directory.persistence(), options);
+  require(file.records().size() == 2, "the records of two written slots did not come back");
+  auto intact = file.adopt(file.records()[0]), damaged = file.adopt(file.records()[1]);
+  file.finishAdoption();
+  const AlignedBytes buffer(size);
+  const auto reads = [&](const SlotFile::Slot &slot, uint64_t offset, uint64_t bytes) {
+    const auto read = file.readAt(slot, offset, bytes, buffer.span());
+    return read && std::equal(read->begin(), read->end(), payload.begin() + offset);
+  };
+  uint64_t before = budget->readBytes();
+  require(reads(*intact, 8192 + 100, 50) && budget->readBytes() - before == 2 * unit,
+          "a read of an adopted slot did not cover the segment it lies in");
+  require(reads(*damaged, 0, 8192) && reads(*damaged, 8192, 4160) && reads(*damaged, 8192 + 2 * 4160, 4160) &&
+              !reads(*damaged, 8192 + 4160 + 5, 1) && !reads(*damaged, 8192 + 4000, 300),
+          "damage to one segment failed reads that do not cover it, or passed one that does");
+  std::vector<std::byte> output(payload.size());
+  require(!file.read(damaged, {output}, {})->wait() && file.read(intact, {output}, {})->wait() &&
+              output == payload,
+          "the worker's first read of an adopted slot did not check its whole payload");
+  before = budget->readBytes();
+  require(reads(*intact, 8192 + 100, 50) && budget->readBytes() - before == unit,
+          "an adopted slot the worker checked was not trusted");
+  auto fresh = file.acquire();
+  require(file.write(fresh, {payload}, {})->wait() && reads(*fresh, 8192 + 4160 + 5, 1),
+          "a slot this process wrote was checked against a record");
+}
+
+// Active KV's quota: a commitment locks room within the active limit beside
+// the slots requests hold, without taking a slot; a committed page's slot
+// draws on it within the active limit while a cached copy's takes the
+// limit, each against what the files hold, and no draw takes more than is
+// committed.
+static void testCommitmentsDrawWithinTheActiveLimit() {
+  constexpr size_t size = kHostPageBytes;
+  auto budget = std::make_shared<DiskBudget>(10 * size);
+  require(budget->activeLimitBytes() == 10 * size, "the active limit was not the quota before a measure");
+  budget->setActiveLimitBytes(20 * size);
+  require(budget->activeLimitBytes() == 10 * size, "the active limit passed the quota");
+  budget->setActiveLimitBytes(8 * size);
+  budget->setLimitBytes(2 * size);
+  SlotFile file(size, budget);
+  require(budget->commit(4 * size, 3 * size) && !budget->commit(2 * size, 3 * size) &&
+              budget->commit(size, 3 * size) && budget->committedBytes() == 5 * size,
+          "a commitment passed the active limit beside what is held and committed");
+  budget->uncommit(size);
+  std::vector<std::shared_ptr<SlotFile::Slot>> slots{file.acquire(), file.acquire()};
+  require(slots[0] && slots[1] && !file.acquire(), "cached copies passed the limit");
+  for (int page = 0; page < 4; ++page) {
+    slots.push_back(file.acquire(DiskBudget::Draw::Commitment));
+    require(slots.back() && budget->committedBytes() == (3 - page) * size,
+            "a committed page did not draw its slot from the commitment within the active limit");
+  }
+  require(!file.acquire(DiskBudget::Draw::Commitment) && budget->usedBytes() == 6 * size,
+          "a draw took more than was committed");
+  require(budget->commit(3 * size, 0), "a commitment beside nothing held was refused");
+  for (int page = 0; page < 2; ++page) {
+    slots.push_back(file.acquire(DiskBudget::Draw::Commitment));
+    require(slots.back() != nullptr, "a committed page did not draw its slot within the active limit");
+  }
+  require(!file.acquire(DiskBudget::Draw::Commitment) && budget->committedBytes() == size,
+          "a committed draw passed what the files hold under the active limit");
+  slots.pop_back();
+  require(file.acquire(DiskBudget::Draw::Commitment) && !budget->committedBytes(),
+          "a freed slot's room did not take the committed draw");
+}
+
+// A request may start to spill while the write budget covers what Spill
+// requests committed: always without one, and once it is lifted.
+static void testSpillsWithinTheWriteBudget() {
+  constexpr size_t size = kHostPageBytes;
+  double now = 0.0;
+  auto budget = std::make_shared<DiskBudget>(8 * size, [&now] { return now; });
+  require(budget->admitsSpill(uint64_t{1} << 50), "a budget without a write budget refused a spill");
+  // Four slots a day, one at once.
+  budget->setWriteBudget(4 * size);
+  require(budget->admitsSpill(size) && !budget->admitsSpill(size + 1),
+          "a write budget did not cover exactly its balance of committed writes");
+  SlotFile file(size, budget);
+  auto slot = file.acquire();
+  const std::vector<std::byte> payload(size, std::byte{2});
+  require(file.write(slot, {payload}, {})->wait(), "slot write failed");
+  require(budget->admitsSpill(0) && !budget->admitsSpill(1), "a spent write budget covered a committed write");
+  // It covers half a slot once it refilled an eighth of a day's, a slot
+  // and a half once its refill passes what it holds at once.
+  require(!budget->admitsSpillAt(0) && std::abs(*budget->admitsSpillAt(size / 2) - 86'400'000.0 / 8) < 1.0 &&
+              std::abs(*budget->admitsSpillAt(3 * size / 2) - 3 * 86'400'000.0 / 8) < 1.0,
+          "the write budget did not say when it covers committed writes again");
+  now = 86'400'000.0 / 8;
+  require(budget->admitsSpill(size / 2) && !budget->admitsSpill(size), "the write budget did not refill");
+  budget->lift();
+  require(budget->admitsSpill(uint64_t{1} << 50), "a lifted write budget refused a spill");
+}
+
+// While reads a step waits for run, each chunk of a write waits for them, at
+// most kWriteDeferral, and the wait is counted; without them no chunk
+// waits, nor while a read of the file waits behind the write, until the
+// worker takes it. Either way the write lands.
+static void testWritesDeferToReads() {
+  constexpr size_t size = 3 << 20;
+  constexpr uint64_t bound = std::chrono::microseconds(SlotFile::kWriteDeferral).count();
+  std::atomic<bool> reading = true;
+  std::atomic<int> asked = 0;
+  auto budget = std::make_shared<DiskBudget>(2 * size);
+  SlotFile file(size, budget, {.deferWrites = [&] {
+                                 ++asked;
+                                 return reading.load();
+                               }});
+  auto slot = file.acquire();
+  const std::vector<std::byte> payload = patterned(size, 11);
+  const auto started = splash::AwakeClock::now();
+  require(file.write(slot, {payload}, {})->wait(), "a deferred write failed");
+  const double waited = splash::millisecondsSince(started);
+  const uint64_t deferred = budget->writesDeferredMicroseconds();
+  // Three chunks, each held back its bound and at most a loaded machine's
+  // oversleep more.
+  require(deferred >= 3 * bound && waited * 1000 >= 3 * bound && deferred < 3 * (bound + 20'000),
+          "a write's chunks did not wait their bound for reads, or waited longer");
+  reading = false;
+  asked = 0;
+  require(file.write(slot, {payload}, {})->wait() && budget->writesDeferredMicroseconds() == deferred &&
+              asked.load() == 3,
+          "a write waited without reads to wait for, or did not ask once a chunk");
+  std::vector<std::byte> output(size);
+  require(file.read(slot, {output}, {})->wait() && output == payload, "a deferred write did not land");
+
+  reading = true;
+  std::promise<void> reached, release;
+  auto released = release.get_future().share();
+  auto hold = file.read(slot, {output}, [&] {
+    reached.set_value();
+    released.wait();
+  });
+  reached.get_future().wait();
+  const std::vector<std::byte> later = patterned(size, 12);
+  auto write = file.write(slot, {later}, {});
+  auto behind = file.read(slot, {output}, {});
+  release.set_value();
+  require(hold->wait() && write->wait() && behind->wait() && output == later &&
+              budget->writesDeferredMicroseconds() == deferred,
+          "a write held back for other reads while a read of its file waited behind it");
+  require(file.write(slot, {payload}, {})->wait() && budget->writesDeferredMicroseconds() >= deferred + 3 * bound,
+          "a write did not hold back again once the read behind the last one was taken");
+}
+
+// A file's writes watch the readers without keeping them
+// (SsdReaders::criticalBusyProbe), so the slots a reader's task holds never
+// make it the readers' last owner: a task that holds a file's last slot ends,
+// and lets the slot go, after the file and the readers' owner let go of them,
+// and the readers stop. Built under TSan too.
+static void testSlotsKeepNoReaders() {
+  constexpr size_t size = kHostPageBytes;
+  auto readers = std::make_shared<SsdReaders>(1);
+  const std::weak_ptr<SsdReaders> watched = readers;
+  auto file = std::make_unique<SlotFile>(size, std::make_shared<DiskBudget>(size),
+                                         SlotFile::Options{.deferWrites = readers->criticalBusyProbe()});
+  require(watched.use_count() == 1, "a slot file kept the readers its writes watch");
+  std::promise<void> began, release;
+  auto batch = readers->start(
+      1,
+      [slot = file->acquire(), &began, released = release.get_future().share()](size_t) {
+        began.set_value();
+        released.wait();
+      },
+      1);
+  began.get_future().wait();
+  readers->halt(*batch);
+  batch.reset();
+  file.reset();
+  std::thread owner([&] {
+    while (!watched.expired()) std::this_thread::yield();
+    release.set_value();
+  });
+  readers.reset();
+  owner.join();
+}
+
 int main() {
   try {
     testFailedWriteStopsWriting();
@@ -628,6 +1070,15 @@ int main() {
     testTheLimitBoundsLiveSlots();
     testWritesDrawOnTheWriteBudget();
     testFullVolumeIsReported();
+    testReadAtReadsAlignedUnits();
+    testReadAtBesideTheWorker();
+    testOneSegmentKeepsVersionOneRecords();
+    testSegmentedRecords();
+    testAdoptedReadsCheckTheirSegments();
+    testCommitmentsDrawWithinTheActiveLimit();
+    testSpillsWithinTheWriteBudget();
+    testWritesDeferToReads();
+    testSlotsKeepNoReaders();
     constexpr size_t size = 4 * kHostPageBytes;
     auto budget = std::make_shared<DiskBudget>(size * 2 + 1);
     SlotFile file(size, budget);

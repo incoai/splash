@@ -588,7 +588,7 @@ class ToolCallTests(HarnessTestCase):
         choice = chat(tools=tools, stop=["ris"])
         self.assertEqual(choice["finish_reason"], "stop")
         call = choice["message"]["tool_calls"][0]["function"]
-        self.assertEqual((call["name"], call["arguments"]), ("weather", "{"))
+        self.assertEqual((call["name"], call["arguments"]), ("weather", '{"city":"Pa'))
         choice = chat(tools=tools, stop=["answer"])
         self.assertEqual(choice["finish_reason"], "tool_calls")
         call = choice["message"]["tool_calls"][0]["function"]
@@ -798,36 +798,53 @@ class ToolCallTests(HarnessTestCase):
                 self.assertEqual(json.loads(payload)["error"]["message"], message)
         self.assertEqual(len(runtime.requests), 1)
 
-    def test_unreadable_schema_only_describes_a_tool_that_is_not_strict(self):
-        # Only a strict tool's grammar is built from its schema. Any other
-        # tool is offered as sent, and its values convert as undeclared ones:
-        # each city below says it is a string, which would keep "3" as text.
-        # The parameters' object, properties map and city take three levels.
+    def test_a_tool_that_is_not_strict_reads_its_types_from_any_schema(self):
+        # Only a strict tool's grammar is built from its schema, which must
+        # pass the checks below. Any other tool is offered as sent, and its
+        # values convert by the types its schema declares, valid or not:
+        # city says it is an integer, which reads "3" as 3. A Draft 3
+        # required, a Draft 4 boolean exclusiveMinimum on another parameter,
+        # the null Go writes for a nil slice of required names, the type
+        # "dict" BFCL's function format names an object by, at the root or in
+        # an allOf member, and a remote reference break checks a grammar
+        # needs; only a schema nested too deep to read declares no types, and
+        # "3" stays text. The parameters' object, properties map and city take
+        # three levels.
         deep = {"type": "string"}
         for _ in range(tool_schema.MAX_SCHEMA_DEPTH - 3):
             deep = {"type": "array", "items": deep}
+        city = {"type": "integer"}
+        days = {"type": "integer", "minimum": 0, "exclusiveMinimum": True}
+        invalid = "invalid tool schema for weather: "
+
+        def parameters(**properties):
+            return {"type": "object", "properties": properties}
+
         cases = (
-            ({"type": "string", "required": True}, "invalid tool schema for weather: "),
+            (parameters(city={**city, "required": True}), invalid, 3),
+            (parameters(city=city, days=days), invalid, 3),
+            ({**parameters(city=city), "required": None}, invalid, 3),
+            ({**parameters(city=city), "type": "dict"}, invalid, 3),
+            ({**parameters(city=city), "allOf": [{"type": "dict"}]}, invalid, 3),
             (
-                {"type": "string", "$ref": "https://example.com/city"},
+                parameters(city={**city, "$ref": "https://example.com/city"}),
                 "remote tool schema reference",
+                3,
             ),
             (
-                {"type": "string", "not": deep},
-                "invalid tool schema for weather: nested more than 64 levels",
+                parameters(city={**city, "not": deep}),
+                f"{invalid}nested more than 64 levels",
+                "3",
             ),
         )
         harness = self.harness(FakeRuntime(*(Plan([[28]]) for _ in cases)))
-        for city, message in cases:
+        for schema, message, value in cases:
             for strict in (False, True):
                 tool = {
                     "type": "function",
                     "function": {
                         "name": "weather",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {"city": city},
-                        },
+                        "parameters": schema,
                         "strict": strict,
                     },
                 }
@@ -846,7 +863,7 @@ class ToolCallTests(HarnessTestCase):
                     self.assertEqual(kwargs["tools"], [tool])
                     call = json.loads(payload)["choices"][0]["message"]["tool_calls"][0]
                     self.assertEqual(
-                        json.loads(call["function"]["arguments"]), {"city": 3}
+                        json.loads(call["function"]["arguments"]), {"city": value}
                     )
 
     def test_pydantic_style_schema_reads_values_through_references(self):

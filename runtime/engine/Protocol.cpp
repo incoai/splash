@@ -33,8 +33,8 @@ constexpr uint64_t kStartFixedBytes = 16;
 constexpr uint64_t kPromptProgressFixedBytes = 20;
 constexpr uint64_t kTokensFixedBytes = 16;
 constexpr uint64_t kMaskRequestFixedBytes = 24;
-constexpr uint64_t kDoneFixedBytes = 61;
-constexpr uint64_t kErrorFixedBytes = 18;
+constexpr uint64_t kDoneFixedBytes = 62;
+constexpr uint64_t kErrorFixedBytes = 22;
 constexpr uint64_t kStatusJsonFixedBytes = 8;
 
 struct PayloadBounds {
@@ -502,6 +502,10 @@ std::optional<ProtocolIssue> validateDone(const DoneEvent &event) {
     return invalidEvent(IssueCode::InvalidEnumValue, event.requestId,
                         "done finish reason is invalid");
   }
+  if (event.bounded && event.reason != EngineFinishReason::Length) {
+    return invalidEvent(IssueCode::InvalidEnumValue, event.requestId,
+                        "only a length-finished done event is bounded");
+  }
   const engine::SpeculativeCounts &speculation = event.speculation;
   // Each cycle verified at least one drafted token and accepted at most all.
   if (speculation.acceptedDraftTokens > speculation.draftedTokens ||
@@ -550,6 +554,10 @@ std::optional<ProtocolIssue> validateError(const ErrorEvent &event,
       event.message.size() > limits.maxErrorStringBytes) {
     return invalidEvent(IssueCode::LimitExceeded, event.requestId,
                         "error code or message exceeds its safe limit");
+  }
+  if (event.retryAfterSeconds && !event.retryable) {
+    return invalidEvent(IssueCode::InvalidErrorClassification, event.requestId,
+                        "only a retryable error says when to retry");
   }
   return std::nullopt;
 }
@@ -637,6 +645,7 @@ EncodedEvent encodeDone(const DoneEvent &event) {
                   kDoneFixedBytes + event.optionLogits.size() * sizeof(float));
   writer.u64(event.requestId);
   writer.u8(static_cast<uint8_t>(event.reason));
+  writer.u8(event.bounded);
   writer.u32(event.promptTokens);
   writer.u32(event.completionTokens);
   writer.u64(event.prefillMicros);
@@ -661,6 +670,7 @@ EncodedEvent encodeError(const ErrorEvent &event,
                   kErrorFixedBytes + event.code.size() + event.message.size());
   writer.u8(static_cast<uint8_t>(event.failureClass));
   writer.u8(event.retryable ? 1 : 0);
+  writer.u32(event.retryAfterSeconds);
   writer.u64(event.requestId);
   writer.u32(static_cast<uint32_t>(event.code.size()));
   writer.u32(static_cast<uint32_t>(event.message.size()));

@@ -21,7 +21,8 @@ constexpr size_t kFusedSegments = std::extent_v<decltype(GgufDecodeFusedParams::
 
 // The staged decode tile that holds `rows` rows: MPP computes 16-row
 // fragments, so the tile holds 8, 16 or 32 rows and a three-lane step runs
-// the 32-row tile over four lanes of storage.
+// the 32-row tile over four lanes of storage (a one-lane step may run the
+// 16-row tile over two, LinearConfig::sixteenRows).
 constexpr uint32_t stagedTileRows(uint32_t rows) noexcept { return rows <= 8 ? 8 : rows <= 16 ? 16 : 32; }
 
 std::string decodeKernel(const char *format, uint32_t rows, char epilogue) {
@@ -32,31 +33,43 @@ std::string prefillKernel(const char *format, char epilogue) {
 }
 
 // K splits of a decode tile, one rule for both tiles. A tier asks for more
-// partitions while the grid holds fewer than `threadgroups` threadgroups per
-// core and each partition would still keep `inputs` inputs; the split count
-// doubles, up to the maximum, while some tier asks. Decode K is a multiple of 256,
-// so eight partitions always hold whole 32-input groups. The rule ignores the
-// batch width: bounds that depended on it did not pay on either family.
+// partitions, up to its `splits`, while the grid holds fewer than
+// `threadgroups` threadgroups per core and each partition would still keep
+// `inputs` inputs; the split count doubles, in whole 32-input groups per
+// partition, while some tier asks. The rule ignores the batch width: bounds
+// that depended on it did not pay on either family.
 struct SplitTier {
   uint32_t threadgroups;
   uint32_t inputs;
+  uint32_t splits = 8;
 };
 uint32_t decodeSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const SplitTier> tiers) {
   const uint64_t grid = n / GGUF_TILE_COLUMNS;
   uint32_t splits = 1;
   const auto asks = [&](const SplitTier &t) {
-    return grid * splits < uint64_t{t.threadgroups} * cores && k / (2 * splits) >= t.inputs;
+    return splits < t.splits && grid * splits < uint64_t{t.threadgroups} * cores && k / (2 * splits) >= t.inputs;
   };
-  while (splits < LinearConfig::kMaximumSplits && std::any_of(tiers.begin(), tiers.end(), asks)) splits *= 2;
+  while ((k / 32) % (2 * splits) == 0 && std::any_of(tiers.begin(), tiers.end(), asks)) splits *= 2;
   return splits;
 }
 
 // Apple9 register tile (128 threads). A core holds four of its threadgroups
 // at once, so the tile's time steps with every four threadgroups per core.
-// Below one wave a core must fill it, down to one 256-input coefficient unit
-// per partition; below eight waves more threadgroups shrink the last wave's
-// tail while partitions of 1024 inputs amortize the partial sums.
-constexpr SplitTier kRegisterTiers[] = {{4, 256}, {32, 1024}};
+// Below one wave a core must fill it, down to 256 inputs per partition, whole
+// coefficient units in every format (quant_register_unit); below eight waves
+// more threadgroups shrink the last wave's tail while partitions of 1024
+// inputs amortize the partial sums. Both stop at eight partitions. A grid
+// that eight leave below three threadgroups per core takes sixteen while
+// partitions keep 512 inputs, a tier measured on Apple10 alone (Apple9 takes
+// it unmeasured): Qwen3.8-Flash-Next's hyper-connection down projection,
+// Q8_0 320 x 10240 on five column tiles, then takes 11-17% less time at one
+// to four lanes on the 20-core M5 Pro and 6-20% less on the 32-core M5 Max,
+// and 32 partitions more than 16 on both. On the M5 Max, sixteen take 4%
+// less to 10% more 512 columns wide (two threadgroups per core at eight), up
+// to 18% more 832 wide (3.25), 4-15% more on the same 320 x 10240 in BF16,
+// twice Q8_0's bytes (Flash-Next loads such tensors as Q8_0), and 22-38% more
+// on Q4_K 512 x 5120, whose partitions would keep 320 inputs.
+constexpr SplitTier kRegisterTiers[] = {{4, 256}, {32, 1024}, {3, 512, 16}};
 
 // Staged tile (64 threads): one fitted tier, six threadgroups per core with
 // 512 inputs per partition. Six is not a residency (12-17 of these
@@ -69,13 +82,16 @@ constexpr SplitTier kRegisterTiers[] = {{4, 256}, {32, 1024}};
 constexpr SplitTier kStagedTiers[] = {{6, 512}};
 
 // The staged tile's tiers on a family. Apple9 cores take as many of its
-// threadgroups as of the register tile's, and its tiers: on a 40-core M3 Max
-// over the 27B and 35B dense shapes at one to four lanes they come within
-// 0-9% of each shape's fastest split (20% at one lane on 2048 x 512, a
-// 0.012 ms projection), where the fitted tier above is 13-27% slower on
-// 17408 x 5120 and 12288 x 5120 and 50% on 2048 x 512.
+// threadgroups as of the register tile's, and its tiers of eight partitions
+// (the first two): on a 40-core M3 Max over the 27B and 35B dense shapes at
+// one to four lanes they come within 0-9% of each shape's fastest split (20%
+// at one lane on 2048 x 512, a 0.012 ms projection), where the fitted tier
+// above is 13-27% slower on 17408 x 5120 and 12288 x 5120 and 50% on
+// 2048 x 512. Not sixteen: on the hyper-connection down projection Apple10's
+// staged tile takes 1-7% less time at sixteen than at eight at one lane but
+// 15-34% more at two to four, on the M5 Pro and the M5 Max.
 std::span<const SplitTier> stagedTiers(GpuFamilyClass family) noexcept {
-  if (family == GpuFamilyClass::Apple9) return kRegisterTiers;
+  if (family == GpuFamilyClass::Apple9) return std::span(kRegisterTiers).first(2);
   return kStagedTiers;
 }
 
@@ -85,6 +101,49 @@ LinearConfig registerDecode(uint32_t n, uint32_t k, uint32_t cores) {
 }
 LinearConfig stagedDecode(uint32_t n, uint32_t k, uint32_t cores, GpuFamilyClass family) {
   return {.tile = LinearTile::GgufStaged, .splits = decodeSplits(n, k, cores, stagedTiers(family))};
+}
+
+// Whether every quantized segment of the projections satisfies `holds`.
+template <class Predicate>
+bool everyQuantizedSegment(std::span<const Projection *const> projections, Predicate holds) {
+  for (const Projection *p : projections)
+    if (p)
+      for (const QuantizedSegment &s : p->blocks().segments)
+        if (!s.isFloat() && !holds(s)) return false;
+  return true;
+}
+// Whether the register tile takes a segment (quant_register_tensor).
+bool registerTileTakes(const QuantizedSegment &s) { return quant_register_tensor(s.formatId, s.inputSize); }
+// Whether a segment stores at least four bits per weight (quant_four_bits).
+bool fourBitsPerWeight(const QuantizedSegment &s) { return quant_four_bits(s.formatId); }
+
+// Apple10 runs decode steps on the register tile on narrow grids: where the
+// grid, a threadgroup per 64 columns (a gate/up pair's that runs in one pass
+// staged) and lane, holds fewer than one and a half threadgroups per core,
+// half that in formats of fewer than four bits per weight. There the staged
+// tile's 64 threads per column tile leave its cores' loads too few and the
+// register tile's 128 run more of them; its time grows with each lane, where
+// the staged tile's matmuls take up to 16 rows at the cost of 8, and with its
+// decode, where fewer bits leave the staged tile less to stream. Register
+// against staged time on one lane's 8-row tile, best split of each tile:
+// - 32-core M5 Max: 13-43% less below the bound (BF16 and Q8_0 320 x 10240,
+//   Q4_K and Q5_K 512 x 2560, Q8_0 512 x 2048, Q6_K 1024 x 5120, Q4_K and
+//   Q6_K 2048 x 4096); at 2560 x 6144 (1.25 per core) 6-9% less in Q4_K, Q5_K,
+//   Q6_K, IQ4_XS, IQ4_NL and MXFP4, BF16 2%, Q8_0 the same, and 2-20% more in
+//   Q3_K, IQ3_S, IQ3_XXS, Q2_K, Q2_0, IQ2_XS, IQ2_XXS and IQ1_M, which take
+//   7-41% less below theirs (IQ2_XXS and Q3_K 1024 x 5120, IQ3_XXS, Q3_K and
+//   Q2_K 512 x 2560, Q3_K 320 x 10240) and as much at 1.0 (Q3_K 2048 x 4096);
+// - 20-core M5 Pro: 18-33% less at 320 and 512 columns, 4-9% more past the
+//   bound (Q4_K and Q6_K 2560 x 6144, Q4_K 2048 x 4096); in fewer bits 23-33%
+//   less below theirs (Q3_K, Q2_K, Q2_0 512 x 2560, Q3_K 320 x 10240), 3% and
+//   14% more past (Q3_K and IQ2_XXS 1024 x 5120).
+// A one-pass gate/up pair of 1024 x 5120 takes 3% (Q4_K) and 23% (IQ2_XXS)
+// less time staged than in the register tile's two passes on the M5 Pro, 11%
+// more (Q4_K, 1.0 per core) and 10% less (IQ2_XXS) on the M5 Max; one of
+// 512 x 2560 (Q4_K) takes 17% and 25% less in the two.
+constexpr bool apple10Registers(uint32_t rows, uint32_t columns, uint32_t cores, bool fourBits) noexcept {
+  const uint32_t lanes = rows / SPLASH_TARGET_VERIFY_ROWS;
+  return uint64_t{fourBits ? 2u : 4u} * (columns / GGUF_TILE_COLUMNS) * lanes < uint64_t{3} * cores;
 }
 
 // Whether the staged decode tiles on `cores` cores of `family` spread their
@@ -116,8 +175,8 @@ bool oneFormat(std::span<const Projection *const> projections) {
 // four, and on Q2_K 24-33% less at two and four lanes but 5-8% more at one.
 // Three lanes pad its 24 rows to 32, where it takes 16-47% more for every
 // format; the other formats keep the register tile, 6-44% faster at one lane.
-// A segment in a format the register tile cannot take (quant_register_format)
-// stages the plan whatever its rows.
+// A segment the register tile cannot take (quant_register_tensor) stages the
+// plan whatever its rows.
 bool apple9Stages(LinearWorkload w, std::span<const Projection *const> projections) {
   const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
   bool quantized = false, faster = true;
@@ -125,7 +184,7 @@ bool apple9Stages(LinearWorkload w, std::span<const Projection *const> projectio
     if (!p) continue;
     for (const QuantizedSegment &s : p->blocks().segments) {
       if (s.isFloat()) continue;
-      if (!quant_register_format(s.formatId)) return true;
+      if (!quant_register_tensor(s.formatId, s.inputSize)) return true;
       faster &= apple9StagesFormat(s.formatId) || (s.formatId == GGUF_FMT_Q2K && lanes >= 2);
       quantized = true;
     }
@@ -220,9 +279,12 @@ void LinearPlan::requireConfiguration() const {
     throw std::invalid_argument("only the staged block tile spreads its walks");
   if (c.oneGateUpPass && (c.tile != LinearTile::GgufStaged || !decode || workload_.epilogue != LinearEpilogue::GateUp))
     throw std::invalid_argument("only a staged block gate/up decode runs gate and up in one pass");
+  if (c.sixteenRows && (c.tile != LinearTile::GgufStaged || !decode || workload_.rows != SPLASH_TARGET_VERIFY_ROWS))
+    throw std::invalid_argument("only a staged one-lane block decode runs the 16-row tile");
   if (c.tile == LinearTile::GgufRegister) {
-    // Split boundaries fall on 256-input coefficient units.
-    if (!decode || !c.validSplits() || k / 256 < c.splits)
+    // Split boundaries fall on coefficient units, of 64 inputs at the fewest
+    // (quant_register_unit); addGgufRegister checks each segment's.
+    if (!decode || !c.validSplits() || k / 64 < c.splits)
       throw std::invalid_argument("the register block decode tile takes a K unit per split");
     return;
   }
@@ -242,7 +304,7 @@ uint32_t LinearPlan::storageRows() const noexcept {
   if (config_.tile == LinearTile::GgufRegister) return workload_.rows;
   if (config_.tile == LinearTile::GgufPrefill)
     return (workload_.rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS * GGUF_PREFILL_ROWS;
-  return stagedTileRows(workload_.rows);
+  return config_.sixteenRows ? 16 : stagedTileRows(workload_.rows);
 }
 
 LinearScratchSize LinearPlan::scratchSize() const noexcept {
@@ -269,7 +331,7 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
 }
 
 LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *const> projections,
-                                  bool registerFormats) const {
+                                  ProjectionShape shape) const {
   const auto [n, k] = w.matrix;
   // Prefill: 128-row tiles. A chunk of up to 32 rows runs the staged tile
   // of its rows (8, 16 or 32, two simdgroups) with the decode split rule:
@@ -286,8 +348,15 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
                        .splits = decodeSplits(n, k, gpuCores_, stagedTiers(family_))}
         : LinearConfig{.tile = LinearTile::GgufPrefill};
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
-  // kernel beats staging but for the projections apple9Stages names.
-  if (family_ == GpuFamilyClass::Apple9 && registerFormats && !apple9Stages(w, projections))
+  // kernel beats staging but for the projections apple9Stages names; Apple10
+  // runs it on narrow grids (apple10Registers).
+  const bool spreads = spreadsStagedDecode(family_, gpuCores_),
+             onePass = spreads && w.epilogue == LinearEpilogue::GateUp && oneFormat(projections);
+  if (shape.registerFormats && everyQuantizedSegment(projections, registerTileTakes) &&
+      (family_ == GpuFamilyClass::Apple9
+           ? !apple9Stages(w, projections)
+           : apple10Registers(w.rows, onePass ? 2 * n : n, gpuCores_,
+                              shape.fourBits && everyQuantizedSegment(projections, fourBitsPerWeight))))
     return registerDecode(n, k, gpuCores_);
   // Decode tiles walking K in lockstep all fetch the same slice of the input
   // at each step, just written by the operator before and in no cache yet,
@@ -309,17 +378,50 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // Pro); 8-bit, whose pair streams near DRAM's rate either way, takes 0.1-0.6%
   // more. A 12-core M6 holds 45 chains of the pair per core, saturated, where
   // one pass took 2-11% more.
-  LinearConfig config = stagedDecode(n, k, gpuCores_, family_);
-  config.spread = spreadsStagedDecode(family_, gpuCores_);
-  if (config.spread && w.epilogue == LinearEpilogue::GateUp && oneFormat(projections))
-    return oneGateUpPassDecode(n, k, gpuCores_, family_);
+  //
+  // One lane of a projection whose quantized segments store fewer than four
+  // and a half bits per weight together runs unsplit on Apple10's 16-row
+  // tile, the second lane of its storage padding: the lane's rows are the
+  // bits of the 8-row tile's (gguf-projection checks it), in less time. On
+  // the 27B UD-IQ3_XXS's shapes, DRAM-cold and unsplit, a 12-core M6 takes
+  // 2-10% less (its fused inputs 8-10%, an IQ3_S down projection 1% more)
+  // and a 32-core M5 Max 5-7% less (a one-pass gate/up pair 10%), and the
+  // 27B decodes one lane 3.3-3.6% faster on the M6; Flash-Next's fused
+  // inputs take 7-9% less on a 20-core M5 Pro, its one-lane cycle about 1%.
+  // At 4.5 bits the M6 takes up to 1.6% more (Q4_K, the vocabulary head's),
+  // and split plans up to 18% more. A gate/up pair runs it where both its
+  // tensors' own plans do (sixteenRowLane).
+  LinearConfig config =
+      onePass ? oneGateUpPassDecode(n, k, gpuCores_, family_) : stagedDecode(n, k, gpuCores_, family_);
+  config.spread = spreads;
+  config.sixteenRows = sixteenRowLane(w, config.splits, projections, shape);
   return config;
 }
 
-LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w) const {
+bool Linear::sixteenRowLane(LinearWorkload w, uint32_t splits, std::span<const Projection *const> projections,
+                            ProjectionShape shape) const {
+  // A gate/up pair, whose K split is at most its tensors', where both their
+  // own plans run it: the decode storage of their shapes then holds its rows
+  // (decodeStorageRows).
+  if (w.epilogue == LinearEpilogue::GateUp)
+    return !projections.empty() && std::all_of(projections.begin(), projections.end(), [&](const Projection *p) {
+             return p && ggufBaseline({w.matrix, w.rows}, std::span(&p, 1)).sixteenRows;
+           });
+  if (!projections.empty()) shape = projections.front()->shape();
+  return family_ == GpuFamilyClass::Apple10 && w.rows == SPLASH_TARGET_VERIFY_ROWS && splits == 1 &&
+         shape.underFourAndHalfBits;
+}
+
+LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, bool registerFormats) const {
   const auto [n, k] = w.matrix;
-  LinearScratchSize size = LinearPlan(w, ggufBaseline(w)).scratchSize();
-  if (family_ == GpuFamilyClass::Apple9) size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, family_)).scratchSize());
+  // Every format the register tile takes K inputs in has one register plan,
+  // whose partitions keep whole coefficient units of each (kRegisterTiers);
+  // a projection of segments the tile does not take has none.
+  LinearScratchSize size = LinearPlan(w, ggufBaseline(w, {}, {.registerFormats = registerFormats})).scratchSize();
+  // A projection of segments the register tile does not take, or of fewer
+  // bits, stages where the device registers.
+  if (family_ == GpuFamilyClass::Apple9 || apple10Registers(w.rows, n, gpuCores_, true))
+    size.include(LinearPlan(w, stagedDecode(n, k, gpuCores_, family_)).scratchSize());
   if (w.epilogue == LinearEpilogue::GateUp && spreadsStagedDecode(family_, gpuCores_))
     size.include(LinearPlan(w, oneGateUpPassDecode(n, k, gpuCores_, family_)).scratchSize());
   return size;
@@ -502,9 +604,16 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
   for (const Projection *q : {&p, gate})
     if (q)
-      for (const QuantizedSegment &s : q->blocks().segments)
-        if (!quant_register_format(s.formatId))
-          throw std::invalid_argument(std::string("the register tile does not take ") + s.name() + " weights");
+      for (const QuantizedSegment &s : q->blocks().segments) {
+        if (!quant_register_tensor(s.formatId, s.inputSize))
+          throw std::invalid_argument(std::string("the register tile does not take ") + s.name() + " weights of " +
+                                      std::to_string(s.inputSize) + " inputs");
+        // Each K partition takes whole coefficient units of the segment's format.
+        if (s.inputSize / quant_register_unit(s.formatId) < config.splits)
+          throw std::invalid_argument(std::string("the register tile takes a coefficient unit per split: ") +
+                                      std::to_string(config.splits) + " splits of " + s.name() + " weights of " +
+                                      std::to_string(s.inputSize) + " inputs");
+      }
   if (b.prepared.layout != LinearInput::Table16 || !b.prepared.source.sameView(b.input))
     graph.add("decode_linear_gguf_prepare", {b.input, b.scratch.input, b.scratch.sums}, k,
               {k / 32, lanes, 1}, {128, 1, 1});
@@ -545,9 +654,10 @@ void Linear::addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffer
 // FP32 pipe, where three bf16 matmuls cost three fp32 ones) and a grid of its
 // 64-row by 32-column tiles of at least three threadgroups per two cores. A
 // tile runs K / 32 dependent steps, while the fp32 kernel spreads fewer rows
-// over 8-column tiles with 16 K partitions each and finishes first below that
-// grid: at the 35B's K = 2048 the two take the same time at 1.4-1.6 tiles per
-// core for both of its float projections on the 16- and 20-core M5 Pro.
+// over 8-column tiles with 8 K partitions each and finishes first below that
+// grid: on the 20-core M5 Pro the two take the same time at about 1.5 tiles
+// per core for Flash-Next's BF16 router (K = 2560), and at about 2.2 for the
+// 35B's F32 router (K = 2048), whose weights take three matmuls a step.
 FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexcept {
   const uint64_t tiles = uint64_t{(rows + 63) / 64} * ((outputSize + 31) / 32);
   return family_ == GpuFamilyClass::Apple10 && rows >= 16 && 2 * tiles >= uint64_t{3} * gpuCores_
@@ -555,26 +665,60 @@ FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize) const noexce
              : FloatTile::Simdgroup;
 }
 
-// Simdgroup: 8 columns of 32 rows per threadgroup of 16 simdgroups. Neural
-// accelerator: 32 columns of 64 rows per threadgroup of 4 simdgroups, at least
-// 16 rows and K a multiple of 32 (kernels/shared/gguf_float.metal).
 void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const QuantizedSegment &weights,
                   metal::MetalBuffer output, uint32_t rows, uint32_t outStride, uint32_t outOffset,
                   FloatOutput type, FloatTile tile) {
-  const uint32_t n = weights.outputSize, k = weights.inputSize;
-  const bool accelerator = tile == FloatTile::NeuralAccelerator;
-  if (!weights.isFloat() || !rows || !n || n % 8 || !k || k % 8 || outOffset + uint64_t{n} > outStride ||
-      (accelerator && (rows < 16 || k % 32)))
-    throw std::invalid_argument("invalid float projection");
-  requireBytes(weights.plane0, uint64_t{n} * k * sizeof(float), "float projection weight");
+  const FloatProjection projection{&weights, std::move(output), outStride, outOffset, tile};
+  addGgufFloat(graph, std::move(input), {&projection, 1}, rows, type);
+}
+
+// Simdgroup: 8 columns of 32 rows per threadgroup of 8 simdgroups. Neural
+// accelerator: 32 columns of 64 rows per threadgroup of 4 simdgroups, at least
+// 16 rows and K a multiple of 32 (kernels/shared/gguf_float.metal). Every
+// projection is checked before any dispatch is added; a dispatch's slots past
+// its last projection bind that one's buffers again and take no columns.
+void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, std::span<const FloatProjection> projections,
+                  uint32_t rows, FloatOutput type) {
+  const uint32_t k = projections.empty() ? 0 : projections.front().weights->inputSize;
+  if (!rows || !k || k % 8) throw std::invalid_argument("invalid float projection");
+  for (const FloatProjection &p : projections) {
+    const QuantizedSegment &w = *p.weights;
+    const uint32_t n = w.outputSize;
+    if (!w.isFloat() || w.inputSize != k || !n || n % 8 || p.outOffset + uint64_t{n} > p.outStride ||
+        (p.tile == FloatTile::NeuralAccelerator && (rows < 16 || k % 32)))
+      throw std::invalid_argument("invalid float projection");
+    requireBytes(w.plane0, uint64_t{n} * k * w.floatBytes(), "float projection weight");
+    requireBytes(p.output, rowBytes(rows, p.outStride, uint64_t{p.outOffset} + n, elementBytes(type)),
+                 "float projection output");
+  }
   requireBytes(input, uint64_t{rows} * k * 2, "float projection input");
-  requireBytes(output, rowBytes(rows, outStride, uint64_t{outOffset} + n, elementBytes(type)), "float projection output");
-  const std::string kernel = std::string(accelerator ? "gguf_float_na_" : "gguf_float_") +
-                             (type == FloatOutput::Float32 ? "f32" : "bf16");
-  const metal::DispatchSize grid = accelerator ? metal::DispatchSize{(n + 31) / 32, (rows + 63) / 64, 1}
-                                               : metal::DispatchSize{n / 8, (rows + 31) / 32, 1};
-  graph.add(kernel, {std::move(input), weights.plane0, std::move(output)},
-            GgufFloatParams{rows, k, n, outStride, outOffset}, grid, {accelerator ? 128u : 512u, 1, 1});
+  for (size_t first = 0; first < projections.size();) {
+    const FloatProjection &lead = projections[first];
+    size_t count = 1;
+    while (first + count < projections.size() && count < GGUF_FLOAT_PROJECTIONS &&
+           projections[first + count].weights->formatId == lead.weights->formatId &&
+           projections[first + count].tile == lead.tile)
+      ++count;
+    const bool accelerator = lead.tile == FloatTile::NeuralAccelerator;
+    const uint32_t columns = accelerator ? 32 : 8, tileRows = accelerator ? 64 : 32;
+    GgufFloatParams params{rows, k, {}, {}, {}};
+    std::vector<metal::MetalBuffer> bindings{input};
+    uint32_t tiles = 0;
+    for (uint32_t slot = 0; slot < GGUF_FLOAT_PROJECTIONS; ++slot) {
+      const FloatProjection &p = projections[first + std::min<size_t>(slot, count - 1)];
+      bindings.insert(bindings.end(), {p.weights->plane0, p.output});
+      if (slot >= count) continue;
+      params.output_size[slot] = p.weights->outputSize;
+      params.out_stride[slot] = p.outStride;
+      params.out_offset[slot] = p.outOffset;
+      tiles += (p.weights->outputSize + columns - 1) / columns;
+    }
+    graph.add(std::string(accelerator ? "gguf_float_na_" : "gguf_float_") + lead.weights->name() + "_" +
+                  (type == FloatOutput::Float32 ? "f32" : "bf16"),
+              std::move(bindings), params, {tiles, (rows + tileRows - 1) / tileRows, 1},
+              {accelerator ? 128u : 256u, 1, 1});
+    first += count;
+  }
 }
 
 void requireSegmentPlanes(const QuantizedSegment &segment, std::string_view what, uint32_t planeInputs) {
@@ -610,6 +754,8 @@ QuantizedSegment QuantizedSegment::planes(uint32_t formatId, uint32_t outputSize
   return {std::move(plane0), std::move(plane1), std::move(meta), outputSize, inputSize, 0, formatId};
 }
 const QuantFormat &QuantizedSegment::format() const noexcept { return kQuantFormats[formatId]; }
-const char *QuantizedSegment::name() const noexcept { return isFloat() ? "f32" : format().name; }
+const char *QuantizedSegment::name() const noexcept {
+  return formatId == kFloat32 ? "f32" : formatId == kBFloat16 ? "bf16" : format().name;
+}
 
 } // namespace splash::ops

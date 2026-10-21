@@ -23,10 +23,27 @@ class AneFfn;
 
 namespace splash::model {
 
+class KvBlockCache;
+class KvHistoryStream;
 class QwenStateStorage;
+class SsdReaders;
 class VisionLoader;
 
-using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights>;
+using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights>;
+
+// How a model loads beside its descriptor: with streamedTableBytes, the rows
+// of a table the target's GGUF holds (model/ModelSizing.hpp) stream from its
+// file through a row cache of that many bytes instead of loading into memory
+// (model/SparseRowStore.hpp, --ple-memory). With expertMemoryBytes, a MoE
+// target's routed experts stream from their files through a store of that
+// many bytes (model/ExpertStore.hpp, --expert-memory). Other models load as
+// without them. Streamed weights read on `readers`, the engine's one pool of
+// SSD readers, which KV reads share.
+struct ModelLoadOptions final {
+  uint64_t streamedTableBytes = 0;
+  uint64_t expertMemoryBytes = 0;
+  std::shared_ptr<SsdReaders> readers;
+};
 
 struct LoadedModel final {
   ModelDescriptor descriptor;
@@ -63,6 +80,14 @@ struct LoadedModel final {
       return weights.manifestFingerprintSha256;
     }, target);
   }
+  // The store streamed routed experts are read through, or null.
+  [[nodiscard]] ExpertStore *expertStore() const noexcept {
+    return std::visit([](const auto &weights) -> ExpertStore * { return weights.experts.get(); }, target);
+  }
+  // The store a streamed table is read through, or null.
+  [[nodiscard]] SparseRowStore *streamedTable() const noexcept {
+    return std::visit([](const auto &weights) -> SparseRowStore * { return weights.streamedTable.get(); }, target);
+  }
   [[nodiscard]] std::span<const WeightFileRecord> targetFiles() const noexcept {
     return std::visit([](const auto &weights) ->
                           std::span<const WeightFileRecord> {
@@ -70,6 +95,23 @@ struct LoadedModel final {
     }, target);
   }
 };
+
+// How a decode cycle chooses the rows of the draft's block the target
+// verifies for each lane (--verify-rows), never past the lane's retention
+// limit: the tokens its output budget leaves, at most the block's rows.
+enum class VerifyRows : uint8_t {
+  // The verify budget's rows on a MoE target, every row on a dense one.
+  Auto,
+  // Every row, so that a greedy or seeded request repeats its output.
+  All,
+};
+
+// Whether the decode cycles of `model` verify the rows the verify budget
+// chooses (model::VerifyBudget, ops::DraftSelector::addVerifyRows) under
+// `rows`. Each row a MoE target verifies routes its own experts, which a
+// rejected row reads for nothing; a dense target reads its weights once for
+// all of a cycle's rows.
+[[nodiscard]] bool budgetsVerifyRows(const LoadedModel &model, VerifyRows rows) noexcept;
 
 // Model execution resources, which the engine assembles. What a request's
 // start allocates is admitted through the state storage.
@@ -81,14 +123,22 @@ struct RuntimeContext final {
   const ops::ExecutionPlans &operators;
   // The prefill FFN's Neural Engine split (engine::startAneFfn), if any.
   ops::AneFfn *aneFfn = nullptr;
+  // The readers of a spill-capable target's spilled K/V, both or neither:
+  // the hot block cache its verifies resolve through, and the stream of its
+  // prefills' history (StreamedParts::kv).
+  KvBlockCache *blockCache = nullptr;
+  KvHistoryStream *historyStream = nullptr;
+  VerifyRows verifyRows = VerifyRows::Auto;
 };
 
 // Validates only the interface between independently defined target and draft
 // architectures. Each architecture validates its own tensor and state layout.
 void requireCompatibleModel(const LoadedModel &model);
 
-// The bytes of every image the model's weights load into.
-[[nodiscard]] uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor);
+// The rows of a family's streamed table that a step stages and prefetches,
+// beside Qwen4Exp.hpp's: the Qwen3.5 families have no table to stream.
+[[nodiscard]] SparseRowStoreOptions streamedTableRows(const Qwen3_8Layout &layout);
+[[nodiscard]] SparseRowStoreOptions streamedTableRows(const Qwen3_6MoeLayout &layout);
 
 // The vision role's source, planned; null for a model without vision.
 [[nodiscard]] std::unique_ptr<VisionLoader> planVisionLoader(const std::filesystem::path &root,
@@ -103,7 +153,8 @@ void requireCompatibleModel(const LoadedModel &model);
 [[nodiscard]] LoadedModel
 loadModel(metal::MetalBackend &backend,
                  const std::filesystem::path &root,
-                 const ModelDescriptor &descriptor);
+                 const ModelDescriptor &descriptor,
+                 const ModelLoadOptions &options = {});
 
 // The FFN layers of a dense target, which the prefill FFN's Neural Engine
 // split (ops::AneFfn) may take; none for another target.
@@ -113,10 +164,28 @@ loadModel(metal::MetalBackend &backend,
 void withPrefillArena(
     metal::MetalBackend &backend, const LoadedModel &model, const ops::ExecutionPlans &operators, kv::Format format,
     const std::function<void(const ops::PrefillFfnBuffers &, const std::array<metal::MetalBuffer, 2> &)> &use);
+// What of a model streams from the SSD, which its arenas rest on: a target
+// whose routed experts stream runs its prefill commands as groups
+// (RuntimeGeometry::prefillChunks), the step of one whose table streams
+// stages its rows, of tableRowBytes each (zero: the table loads), and a
+// runtime whose K/V spills (RuntimeContext's readers) runs groups too, which
+// read an attention layer's spilled history once each, and holds where its
+// verifies' listed blocks are. loaded() is what streams of `model` as it
+// loaded, and its K/V when `kv` says it spills.
+struct StreamedParts final {
+  bool experts = false;
+  uint64_t tableRowBytes = 0;
+  bool kv = false;
+
+  [[nodiscard]] static StreamedParts loaded(const LoadedModel &model, bool kv = false) noexcept;
+};
+// The lane state and arenas of `model`'s geometry with `parts` streaming,
+// whatever streams of it as it loaded: one load plans them for every part
+// that may stream (engine::planStreamedMemory).
 [[nodiscard]] ModelMemoryPlan
 plannedRuntimeMemory(const LoadedModel &model,
                      const ops::ExecutionPlans &operators,
-                     kv::Format kvFormat, ops::GdnStateFormat stateFormat);
+                     kv::Format kvFormat, ops::GdnStateFormat stateFormat, StreamedParts parts);
 [[nodiscard]] std::unique_ptr<RuntimeModel>
 createRuntime(RuntimeContext context);
 

@@ -42,7 +42,8 @@ METAL_BUILD := $(BUILD)/metal
 # Production kernels are grouped by execution phase under
 # runtime/metal/kernels/{prefill,decode,shared}; every .metal file there is
 # compiled into the metallib. Templates both phases instantiate live in
-# kernels/common/, the host/shader contract in runtime/metal/abi/.
+# kernels/common/, the host/shader contract in runtime/metal/abi/;
+# kernels/host_step.metal builds into a library of its own (HOST_STEP_LIB).
 PRODUCTION_KERNEL_SOURCES := $(sort $(wildcard \
 	runtime/metal/kernels/prefill/*.metal \
 	runtime/metal/kernels/decode/*.metal \
@@ -64,6 +65,12 @@ ENGINE_CXXFLAGS := -std=c++20 -O3 -Wall -Wextra -Werror -Iruntime \
 	$(MACOS_TARGET_FLAG)
 ENGINE_OBJCXXFLAGS := $(ENGINE_CXXFLAGS) -fobjc-arc
 LIB := $(BUILD)/splash.metallib
+# The spin of awake host steps reaches a memory scope through Metal's internals
+# (#pragma METAL internals), which a later Metal compiler may refuse. It builds
+# beside the metallib, and a compiler that refuses it only warns: the engine
+# then runs awake host steps as plain ones (metal/MetalBackend.hpp, EventStep).
+HOST_STEP_SOURCE := runtime/metal/kernels/host_step.metal
+HOST_STEP_LIB := $(BUILD)/host-step.metallib
 .PHONY: all clean force-build-identity install \
 	install-environment _install-environment \
 	platform-check model-selection preflight
@@ -186,6 +193,10 @@ $(METAL_BUILD)/%.air: runtime/metal/kernels/%.metal $(KERNEL_HEADERS) \
 $(LIB): $(PRODUCTION_AIRS)
 	$(RUN_CONFIGURED) $(METALLIB) $(BUILD_INPUTS) -o $@
 
+$(HOST_STEP_LIB): $(HOST_STEP_SOURCE) | $(BUILD)
+	$(RUN_CONFIGURED) $(METAL) $(PROD_METALFLAGS) $< -o $@ || { rm -f $@; \
+		echo "warning: Metal did not build $@; awake host steps will run as plain ones" >&2; }
+
 ENGINE_BUILD := $(BUILD)/engine
 ENGINE_LIBRARY := $(ENGINE_BUILD)/libsplash.a
 ENGINE_LINKFLAGS := -framework Foundation -framework Metal -framework IOKit \
@@ -228,6 +239,9 @@ ENGINE_INSTRUMENTED_METAL_OBJECT := $(ENGINE_BUILD)/metal/MetalBackendInstrument
 # Program with the fault seam ane/ProgramInstrumentation.hpp declares, linked
 # the same way.
 ENGINE_INSTRUMENTED_ANE_OBJECT := $(ENGINE_BUILD)/ane/ProgramInstrumented.o
+# Runtime with the test seam model/RuntimeInstrumentation.hpp declares, linked
+# the same way.
+ENGINE_INSTRUMENTED_RUNTIME_OBJECT := $(ENGINE_BUILD)/model/RuntimeInstrumented.o
 ENGINE_CPP_SOURCES := \
 	runtime/ops/AneFfn.cpp \
 	runtime/ops/AneFfnCalibration.cpp \
@@ -241,8 +255,12 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/LinearGguf.cpp \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \
+	runtime/ops/HyperConnection.cpp \
+	runtime/ops/NgramEmbedding.cpp \
+	runtime/ops/BlockIndexer.cpp \
 	runtime/ops/PagedAttention.cpp \
 	runtime/ops/PageStorage.cpp \
+	runtime/ops/KvSlotFormat.cpp \
 	runtime/ops/RoPE.cpp \
 	runtime/ops/RowCopy.cpp \
 	runtime/ops/Sampling.cpp \
@@ -277,10 +295,18 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/SafetensorsTarget.cpp \
 	runtime/model/DraftCheckpoint.cpp \
 	runtime/model/WeightSource.cpp \
+	runtime/model/SsdReaders.cpp \
+	runtime/model/SparseRowStore.cpp \
 	runtime/model/WeightImages.cpp \
 	runtime/model/GgufPreparation.cpp \
+	runtime/model/SlotRecycler.cpp \
+	runtime/model/ExpertStore.cpp \
+	runtime/model/VerifyBudget.cpp \
 	runtime/model/Qwen3_6Moe.cpp \
 	runtime/model/Qwen3_8.cpp \
+	runtime/model/Qwen4Exp.cpp \
+	runtime/model/Qwen4Steps.cpp \
+	runtime/model/Qwen4ExpTarget.cpp \
 	runtime/model/QwenVision.cpp \
 	runtime/model/VisionPreparation.cpp \
 	runtime/model/VisionLoader.cpp \
@@ -288,7 +314,12 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/QwenTargetLoader.cpp \
 	runtime/model/DFlashDraft.cpp \
 	runtime/model/ModelFactory.cpp \
+	runtime/model/ModelSizing.cpp \
 	runtime/model/SlotFile.cpp \
+	runtime/model/KvCopyRead.cpp \
+	runtime/model/KvBlockCache.cpp \
+	runtime/model/KvHistoryStream.cpp \
+	runtime/model/SpilledKvReads.cpp \
 	runtime/model/QwenState.cpp \
 	runtime/model/Runtime.cpp \
 	runtime/model/RuntimeArenas.cpp
@@ -306,9 +337,11 @@ ENGINE_OBJECTS := \
 	$(ENGINE_METAL_RUNTIME_OBJECT)
 PRODUCTION_CONFIG_TARGETS := $(ENGINE_OBJECTS) $(ENGINE_MAIN_OBJECT) \
 	$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_INSTRUMENTED_ANE_OBJECT) \
-	$(ENGINE_LIBRARY) $(PRODUCTION_AIRS) $(LIB) $(TARGET)
+	$(ENGINE_INSTRUMENTED_RUNTIME_OBJECT) \
+	$(ENGINE_LIBRARY) $(PRODUCTION_AIRS) $(LIB) $(HOST_STEP_LIB) $(TARGET)
 ENGINE_DEPFILES := $(ENGINE_OBJECTS:.o=.d) $(ENGINE_MAIN_OBJECT:.o=.d) \
-	$(ENGINE_INSTRUMENTED_METAL_OBJECT:.o=.d) $(ENGINE_INSTRUMENTED_ANE_OBJECT:.o=.d)
+	$(ENGINE_INSTRUMENTED_METAL_OBJECT:.o=.d) $(ENGINE_INSTRUMENTED_ANE_OBJECT:.o=.d) \
+	$(ENGINE_INSTRUMENTED_RUNTIME_OBJECT:.o=.d)
 
 -include $(ENGINE_DEPFILES)
 
@@ -347,6 +380,11 @@ $(ENGINE_INSTRUMENTED_ANE_OBJECT): runtime/ane/Program.mm
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_DEPFLAGS) \
 		-DSPLASH_ANE_INSTRUMENTATION=1 -c $< -o $@
 
+$(ENGINE_INSTRUMENTED_RUNTIME_OBJECT): runtime/model/Runtime.cpp
+	@mkdir -p $(dir $@)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_CXXFLAGS) $(ENGINE_DEPFLAGS) \
+		-DSPLASH_RUNTIME_INSTRUMENTATION=1 -c $< -o $@
+
 $(ENGINE_MAIN_OBJECT): runtime/main.mm $(BUILD_ID_HEADER)
 	@mkdir -p $(dir $@)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_DEPFLAGS) \
@@ -358,7 +396,7 @@ $(ENGINE_LIBRARY): $(ENGINE_OBJECTS)
 	$(RUN_CONFIGURED) $(AR) rcs $@ $(BUILD_INPUTS)
 
 $(TARGET): $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) $(LIB) \
-		| $(BUILD)
+		| $(BUILD) $(HOST_STEP_LIB)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) $(ENGINE_MAIN_OBJECT) $(ENGINE_LIBRARY) \
 		$(ENGINE_LINKFLAGS) -o $@
 

@@ -231,11 +231,15 @@ class MakefileTests(unittest.TestCase):
     def test_the_real_model_scripts_take_the_arguments_make_passes(self):
         # Only a release runs these scripts, on a model. Each parses the
         # command lines make -n prints for its target, for a selection with
-        # every source option and its installation in MODEL_ROOT.
+        # every source option and its installation in MODEL_ROOT. Both
+        # verify-models' weight-digests and backend_regression's take
+        # WEIGHT_DIGESTS_ARGS.
+        streamed = ["--expert-memory", "7G", "--ple-memory", "2G"]
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             # backend_regression requires the installation, and builds in
-            # BASELINE and in this checkout, its candidate.
+            # BASELINE and in this checkout, its candidate, whose
+            # weight-digests name the options they take in their usage.
             model_root = directory / "model"
             model_root.mkdir()
             (model_root / "model.json").touch()
@@ -244,7 +248,23 @@ class MakefileTests(unittest.TestCase):
                 (checkout / "build/engine-tests").mkdir(parents=True)
                 (checkout / backend_regression.BENCHMARK).touch()
                 (checkout / backend_regression.METALLIB).touch()
-            (candidate / "build" / weights.WEIGHT_DIGESTS).touch()
+                tool = checkout / "build" / weights.WEIGHT_DIGESTS
+                tool.write_text(
+                    "#!/bin/sh\necho 'usage: weight-digests METALLIB MODEL_DIRECTORY "
+                    "[--expert-memory SIZE] [--ple-memory SIZE]' >&2\nexit 2\n"
+                )
+                tool.chmod(0o755)
+            variables = (
+                "MODEL=owner/repo",
+                "REVISION=main",
+                "DRAFT_MODEL=owner/draft",
+                "LANGUAGE_ONLY=1",
+                f"MODEL_ROOT={model_root}",
+                f"BASELINE={baseline}",
+                "ANE_FFN_SHARE=0",
+                f"WEIGHT_DIGESTS_ARGS={shlex.join(streamed)}",
+                f"VENV={directory / 'venv'}",
+            )
             for target, script, parse_args in (
                 ("test-http-real", "dev/tests/smoke_real.py", smoke_real.parse_args),
                 ("release-check", "dev/tests/smoke_real.py", smoke_real.parse_args),
@@ -260,18 +280,7 @@ class MakefileTests(unittest.TestCase):
                     self.subTest(target=target),
                     mock.patch.object(backend_regression, "ROOT", candidate),
                 ):
-                    result = self.make(
-                        "-n",
-                        target,
-                        "MODEL=owner/repo",
-                        "REVISION=main",
-                        "DRAFT_MODEL=owner/draft",
-                        "LANGUAGE_ONLY=1",
-                        f"MODEL_ROOT={model_root}",
-                        f"BASELINE={baseline}",
-                        "ANE_FFN_SHARE=0",
-                        f"VENV={directory / 'venv'}",
-                    )
+                    result = self.make("-n", target, *variables)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     commands = [
                         shlex.split(line)
@@ -284,6 +293,20 @@ class MakefileTests(unittest.TestCase):
                         self.assertEqual(arguments.model_root, model_root)
                         if script == "dev.benchmarks.backend_regression":
                             self.assertEqual(arguments.ane_ffn_share, 0.0)
+                            self.assertEqual(arguments.weight_digest_options, streamed)
+            result = self.make("-n", "verify-models", *variables)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            tool = str("build" / weights.WEIGHT_DIGESTS)
+            commands = [
+                shlex.split(line)
+                for line in result.stdout.replace("\\\n", "").splitlines()
+                if line.startswith(tool + " ")
+            ]
+            self.assertEqual(len(commands), 1, result.stdout)
+            self.assertEqual(
+                commands[0][: commands[0].index(">")],
+                [tool, "build/splash.metallib", str(model_root), *streamed],
+            )
 
 
 if __name__ == "__main__":

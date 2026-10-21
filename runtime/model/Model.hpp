@@ -15,11 +15,17 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace splash {
+
+namespace model {
+class KvPageSources;
+} // namespace model
 
 enum class WorkKind : uint8_t { Prefill, Decode };
 
@@ -297,11 +303,17 @@ struct BatchItem final {
 
 struct BatchPlan final {
   WorkKind kind = WorkKind::Decode;
-  // A decode's lanes exchange token masks with the host; constrained and
-  // unconstrained lanes never share a command.
-  bool constrained = false;
   std::vector<BatchItem> items;
   DecodeStage decodeStage = DecodeStage::Regular;
+  // A prefill of one lane may run in passes, each over the next of `passes`
+  // even shares of the target's layers (Model::prefillPasses): this command
+  // is pass `pass`. The first pass begins the rows, the last ends them and
+  // commits; the rows' work between lives in the model's prefill memory,
+  // which no other prefill touches meanwhile, while other lanes' decode
+  // commands run between passes. A request that ends between passes leaves
+  // the rest unrun and nothing of the rows committed.
+  uint32_t pass = 0;
+  uint32_t passes = 1;
 
   [[nodiscard]] bool empty() const noexcept { return items.empty(); }
   [[nodiscard]] uint32_t width() const noexcept {
@@ -351,6 +363,11 @@ struct ModelBatchItem final {
   // the one at revision - 1 below pageTableFirstChanged.
   uint64_t pageTableRevision = 0;
   uint32_t pageTableFirstChanged = 0;
+  // Where each page of the list reads its K/V from, cut with the list
+  // (engine::Cache::cutPageTable); null while no page holds only its index.
+  // The command keeps it until it completes, and lets it go before its
+  // ticket's wait() returns.
+  std::shared_ptr<const model::KvPageSources> pageSources{};
   std::span<const uint32_t> inputTokens{};
   // A prefill chunk's states to capture, ascending: page-aligned boundaries in
   // (logicalPosition, logicalPosition + tokenCount], each one where the
@@ -360,6 +377,8 @@ struct ModelBatchItem final {
 
 struct ModelStepResult final {
   uint64_t requestId = 0;
+  // A prefill's rows, which only its last pass consumes (BatchPlan::passes):
+  // an earlier pass's result is the request's id and nothing else.
   uint32_t consumedPromptTokens = 0;
   std::vector<uint32_t> outputTokens;
   // True after a stop token or the final score-only prefill chunk.
@@ -387,6 +406,14 @@ struct ModelStepResult final {
   // state or emits output, and the rest of the batch stands. Broken
   // invariants and GPU faults stay exceptions and remain engine-fatal.
   std::string failure{};
+  // Set when the tier copies of blocks this lane read could not be read
+  // (model::KvPageSource::block), on a host step or anywhere else: a failed
+  // read is the lanes' that needed it, never an exception the engine dies
+  // of. The engine ends that one request as retryable
+  // (engine::LaneOutcome::KvUnreadable) before it publishes cache state or
+  // emits output, keeps the state it restored, which the failure says
+  // nothing of, and gives the copies up (engine::Cache::poisonCopy).
+  std::vector<uint64_t> unreadableKvBlocks{};
   // The request's first output token, which the step that completes its
   // prompt selected and left pending: the first decode cycle writes its KV row
   // and emits it first. Reported so that the engine can send it to the client
@@ -414,6 +441,14 @@ public:
   [[nodiscard]] virtual bool ready() const noexcept = 0;
   [[nodiscard]] virtual std::vector<ModelStepResult> wait() = 0;
   [[nodiscard]] virtual double wallMilliseconds() const noexcept = 0;
+  // Of wallMilliseconds, the time the command's GPU work waited on its host
+  // steps: a streamed target's expert reads, which a prefill command pays
+  // about whole whatever its rows.
+  [[nodiscard]] virtual double hostMilliseconds() const noexcept { return 0.0; }
+  // Of hostMilliseconds, the time it waited on the reads of its history's
+  // spilled K/V (model::KvHistoryStream), which bound a streamed prefill
+  // command's length whatever its rows.
+  [[nodiscard]] virtual double streamMilliseconds() const noexcept { return 0.0; }
   // Fixed auxiliary work remains in wall latency but must not train the
   // text-prefill throughput estimate.
   [[nodiscard]] virtual bool prefillTimingIsRepresentative() const noexcept {
@@ -423,11 +458,115 @@ public:
 
 namespace model {
 
+// The attention of a block-sparse target, which lets its committed K/V leave
+// memory while each page keeps its blocks' index (kv::PageForm::Index): each
+// verify row of a lane attends at most selectedBlocks blocks of blockTokens
+// tokens. Rows that read the whole of a page table instead (a row with at
+// most denseHistoryTokens of history, its first sinkTokens and its last
+// localTokens) read only Full pages, which the cache keeps for them.
+struct SparseKvShape final {
+  uint32_t blockTokens = 0;
+  uint32_t selectedBlocks = 0;
+  uint32_t verifyRows = 0;
+  uint32_t denseHistoryTokens = 0;
+  uint32_t sinkTokens = 0;
+  uint32_t localTokens = 0;
+
+  // The hot block cache of spilled K/V (KvBlockCache) in slots a layer: one
+  // decoding lane's rows select at most laneSlots(), and while `lanes` lanes
+  // decode over Index pages it holds requiredSlots(lanes), one lane's more
+  // than they select, so that two lanes' selections do not thrash it; for
+  // one lane, the size past which more slots save few reads.
+  [[nodiscard]] constexpr uint64_t laneSlots() const noexcept { return uint64_t{verifyRows} * selectedBlocks; }
+  [[nodiscard]] constexpr uint64_t requiredSlots(uint32_t lanes) const noexcept {
+    return lanes ? (uint64_t{lanes} + 1) * laneSlots() : 0;
+  }
+  // The history from its start that a row may read whole through its page
+  // table: its dense history, or its sink tokens if more.
+  [[nodiscard]] constexpr uint32_t denseTokens() const noexcept { return std::max(denseHistoryTokens, sinkTokens); }
+
+  bool operator==(const SparseKvShape &) const = default;
+};
+
 // Startup capabilities used for protocol sizing and admission independently
 // of target-specific headers.
 struct ModelCapabilities final {
   uint32_t vocabularySize = 0;
   uint32_t maximumContextTokens = 0;
+  // Set for a block-sparse target.
+  std::optional<SparseKvShape> sparseKv;
+};
+
+// A tier copy of one block's page, as reads of spilled K/V reach it on any
+// thread: engine::KvPageTier's slots, or a test's bytes.
+class KvCopy {
+public:
+  virtual ~KvCopy() = default;
+  // Unique in the process: the copy's one write (model::SlotFile::Slot::id).
+  [[nodiscard]] virtual uint64_t id() const noexcept = 0;
+  // `bytes` at `offset` of the copy, read into `buffer` (SlotFile::readAt
+  // says what it must hold), or nothing when they cannot be read.
+  [[nodiscard]] virtual std::optional<std::span<const std::byte>>
+  readAt(uint64_t offset, uint64_t bytes, std::span<std::byte> buffer) const noexcept = 0;
+};
+
+// Where a request's page reads its K/V: {} for a page that holds it
+// (kv::PageForm::Full), else the block on a page that holds only its index
+// (kv::PageForm::Index) and the tier copy that holds its K/V.
+struct KvPageSource final {
+  uint64_t block = 0;
+  std::shared_ptr<const KvCopy> copy;
+
+  [[nodiscard]] bool indexed() const noexcept { return block != 0; }
+};
+
+// A request's page sources at one page-table revision, immutable, in chunks
+// of kChunkPages pages that snapshots share: a cut copies only the chunks
+// from its first changed page on. Chunk c holds pages [c kChunkPages,
+// (c + 1) kChunkPages), the last chunk the rest, and counts its Index pages.
+class KvPageSources final {
+public:
+  static constexpr uint32_t kChunkPages = 256;
+  struct Chunk final {
+    std::array<KvPageSource, kChunkPages> pages{};
+    uint32_t indexPages = 0;
+  };
+
+  KvPageSources() = default;
+  // std::invalid_argument unless the chunks, none null, hold `pages` pages.
+  KvPageSources(std::vector<std::shared_ptr<const Chunk>> chunks, uint32_t pages)
+      : chunks_(std::move(chunks)), pages_(pages) {
+    if (chunks_.size() != (uint64_t{pages} + kChunkPages - 1) / kChunkPages)
+      throw std::invalid_argument("KV page sources do not hold their pages");
+    for (const std::shared_ptr<const Chunk> &chunk : chunks_) {
+      if (!chunk) throw std::invalid_argument("KV page sources hold a null chunk");
+      indexPages_ += chunk->indexPages;
+    }
+  }
+
+  [[nodiscard]] uint32_t size() const noexcept { return pages_; }
+  [[nodiscard]] uint32_t indexPages() const noexcept { return indexPages_; }
+  // A page past them reads its own K/V: one the command writes.
+  [[nodiscard]] const KvPageSource &operator[](uint32_t page) const noexcept {
+    static const KvPageSource own{};
+    return page < pages_ ? chunks_[page / kChunkPages]->pages[page % kChunkPages] : own;
+  }
+  [[nodiscard]] std::span<const std::shared_ptr<const Chunk>> chunks() const noexcept { return chunks_; }
+
+private:
+  std::vector<std::shared_ptr<const Chunk>> chunks_;
+  uint32_t pages_ = 0;
+  uint32_t indexPages_ = 0;
+};
+
+// Memory the model takes for a request between commands through the
+// engine's ordinary allocation loop (Engine::allocate): granted, or the
+// cause of the refusal, after which the engine reclaims and retries.
+struct ModelMemoryAdmission final {
+  bool ok = false;
+  metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
+
+  [[nodiscard]] bool granted() const noexcept { return ok; }
 };
 
 // A token mask row holds one bit per vocabulary token in 32-bit words.
@@ -443,6 +582,14 @@ maskWordsPerToken(uint32_t vocabularySize) noexcept {
 // and attention-kernel geometry live with their operators.
 struct ExecutionLimits final {
   static constexpr uint32_t maximumBatchWidth = 4;
+  // The rows of a prefill chunk. A prefill command's lanes fill its chunks
+  // one after another, and the runtime lets at most one lane's rows run past
+  // a chunk: a prefill group has one scratch GDN cell for the state between
+  // a lane's parts. So every lane but a command's last lies within its first
+  // chunk, and a command holds at most each of its lanes' group rows
+  // (Model::prefillGroupRows; a chunk's for a lane that runs no groups). The
+  // rows the engine cuts, or a lane it drops, before the command runs keep
+  // both: the lanes before the last still lie within the first chunk.
   static constexpr uint32_t prefillTokenBudget = 2048;
   // KV pages startup warmup runs on, from page 0: the runway the engine's KV
   // pool allocates when it is built.
@@ -452,6 +599,8 @@ struct ExecutionLimits final {
   static constexpr uint32_t draftProposalTokens = 7;
   static constexpr uint32_t targetVerifyRows = 8;
   static constexpr uint32_t draftContextTokens = 2048;
+  // The most target layers a DFlash2 draft reads (its target_layer_ids).
+  static constexpr uint32_t maximumDraftTargetLayers = 8;
   static constexpr uint32_t speculativeScratchTokens = targetVerifyRows - 1;
   // One step emits at most its retained verify rows plus a terminal anchor
   // (a stop token or the last budgeted token) that never receives a KV row.
@@ -513,6 +662,10 @@ struct ModelTelemetry final {
   uint64_t draftStateResets = 0;
   uint64_t imageEncodes = 0;
   uint64_t imageEmbeddingReuses = 0;
+  // Entries the embedding cache let go of, past its bytes or to a reclaim:
+  // the image of one is encoded again where it is placed next, unless
+  // something else still holds its rows.
+  uint64_t imageEmbeddingEvictions = 0;
   // The vision encoder's scratch while it exists, the encoded rows the
   // embedding cache keeps for reuse, those states in RAM hold to resume
   // inside an image, and every image's rows anything holds, each counted
@@ -526,6 +679,9 @@ struct ModelTelemetry final {
   // Prefill chunks the GPU ran again alone once the Neural Engine split's
   // work for them failed (Runtime::prefillAsync).
   uint64_t aneFfnReruns = 0;
+  // Whether decode cycles verify the rows the verify budget chooses
+  // (budgetsVerifyRows) rather than every row.
+  bool verifyBudget = false;
   double lastConstrainedTargetForwardGpuSeconds = 0.0;
   double totalConstrainedTargetForwardGpuSeconds = 0.0;
   double lastConstrainedMaskWaitSeconds = 0.0;
@@ -560,6 +716,9 @@ struct WarmupStepResult final {
   double wallSeconds = 0.0;
   // Those two warmups return one observation per lane in batch-plan order.
   std::vector<WarmupLaneResult> lanes;
+  // For prefill warmup, of wallSeconds the time its GPU work waited on host
+  // steps (ModelBatchTicket::hostMilliseconds).
+  double hostSeconds = 0.0;
 };
 
 // What a reclaim step may release of the model's idle memory.
@@ -577,7 +736,13 @@ public:
   [[nodiscard]] virtual StateAdmission begin(const ModelRequest &request) = 0;
   // Safe-point preemption returns the request's state buffers, retaining
   // only its host-side sampling/constraint continuation. Resume replays the
-  // supplied committed history through the ordinary prefill path.
+  // supplied committed history through the ordinary prefill path, and takes
+  // the output limit it is given (maxNewTokens), which the engine sets anew
+  // at each start of a request (the SSD cache's quota may bound it). That
+  // limit must leave output past the anchor the request holds once its
+  // first token is selected, which the suspension keeps: the model emits a
+  // last budgeted anchor as it selects it, and decodes no lane left only
+  // that anchor.
   virtual void suspend(uint64_t requestId) = 0;
   [[nodiscard]] virtual StateAdmission resume(const ModelRequest &request) = 0;
   // Restores a cached state into the request's lane at `boundary`. A RAM
@@ -596,10 +761,10 @@ public:
   // Takes the buffers of one cached state for the request's state boundary
   // at `tokens`, which the prefill command reaching it fills
   // (ModelBatchItem::stateCaptures): from the pool, or one admission for
-  // what the pool lacks. Null when the governor refuses; the caller may
-  // release a cached state and retry.
+  // what the pool lacks. Null when the governor refuses, which sets
+  // `refusal` to the cause; the caller may release a cached state and retry.
   [[nodiscard]] virtual std::shared_ptr<StateReservation>
-  reserveState(uint64_t requestId, uint32_t tokens) = 0;
+  reserveState(uint64_t requestId, uint32_t tokens, metal::AllocationFailure &refusal) = 0;
   // Copies the request's committed state at its current page-aligned
   // boundary into the buffers of a cached state, taken as reserveState()
   // takes them: the state of a boundary its prefill command ended at without
@@ -608,6 +773,19 @@ public:
   [[nodiscard]] virtual std::shared_ptr<const CompositeState> snapshot(uint64_t requestId) = 0;
   // The bytes one cached state's buffers take.
   [[nodiscard]] virtual uint64_t snapshotBytes() const noexcept = 0;
+  // Memory for reads of a request's spilled K/V, taken between commands and
+  // held until it ends or is suspended; a model that reads none grants it at
+  // once, taking nothing. The hot block cache's floor for the request's lane,
+  // which decodes over Index pages (model::KvBlockCache::reserveLane), in
+  // place of the staging once no prompt holds it; the staging of a
+  // prefill's history of `pages` pages, which holds Index pages, the
+  // request's while its prompt goes on, also once refused
+  // (model::KvHistoryStream::reserve); and, optionally, one more
+  // extent of the hot block cache toward its planned size
+  // (model::KvBlockCache::growTowardTarget).
+  [[nodiscard]] virtual ModelMemoryAdmission reserveSpilledReads(uint64_t) { return {.ok = true}; }
+  [[nodiscard]] virtual ModelMemoryAdmission reserveHistoryStaging(uint64_t, uint32_t) { return {.ok = true}; }
+  [[nodiscard]] virtual ModelMemoryAdmission growSpilledReads() { return {.ok = true}; }
   // Whether the disk tier takes a state written from a lane now, for a
   // state in use or not, as CompositeState::canOffload. Room in the quota is
   // the write's own concern.
@@ -625,13 +803,28 @@ public:
   // buffers, and the maximum when no number of states does (a buffer no
   // cached state holds, such as Qwen's draft rings).
   [[nodiscard]] virtual uint32_t statesToActivate() const noexcept { return 0; }
+  // The most rows of one lane's prefill command: a prefill group's where
+  // the model runs them (one lane's chunks, layer by layer) to read
+  // something once for all of them, its streamed experts for every lane or a
+  // spilled history for a lane whose K/V spills (`spills`), else a chunk's.
+  [[nodiscard]] virtual uint32_t prefillGroupRows(bool spills) const noexcept {
+    static_cast<void>(spills);
+    return ExecutionLimits::prefillTokenBudget;
+  }
+  // The most passes over its layers one lane's prefill command may run in
+  // (BatchPlan::passes): its layers where a command pays a cost per layer
+  // whatever its rows, which keeps a command long however few they are, as
+  // a streamed target's expert reads; 1 where a command runs whole. A
+  // command that encodes images or streams its history runs whole.
+  [[nodiscard]] virtual uint32_t prefillPasses() const noexcept { return 1; }
   // Releases one unit of idle model memory and returns its bytes; zero when
   // nothing in scope is idle. A unit is one pooled state buffer (keepLane
   // keeps those one lane starts from); with BuffersThenCaches, once no
   // buffer is idle, the vision arena when no image waits for its encode and
-  // nothing holds it, and then one embedding entry nothing else holds,
-  // oldest first. A denied allocation retries between calls, so it frees
-  // only what it needs.
+  // nothing holds it, the staging of spilled history once no prompt streams
+  // into it, an extent of the hot block cache above its lanes' floors, and
+  // then one embedding entry nothing else holds, oldest first. A denied allocation
+  // retries between calls, so it frees only what it needs.
   [[nodiscard]] virtual uint64_t reclaimIdleState(bool keepLane,
                                                   IdleMemory scope) noexcept = 0;
   // Why this request's mask is unusable, or nothing when the model took it.

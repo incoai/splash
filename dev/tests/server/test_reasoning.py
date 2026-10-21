@@ -4,6 +4,7 @@ test_default_reasoning.py."""
 
 import json
 import unittest
+from contextlib import nullcontext
 from unittest import mock
 
 from dev.tests.server_fixtures import (
@@ -247,7 +248,10 @@ class ReasoningTests(HarnessTestCase):
     def test_reasoning_effort_is_preserved_until_the_template_renders(self):
         harness = self.harness(FakeRuntime())
         prompt = harness.app._prepare_prompt(
-            chat_body(reasoning_effort="minimal"), None, deadline=FOREVER
+            chat_body(reasoning_effort="minimal"),
+            None,
+            deadline=FOREVER,
+            without_slot=nullcontext,
         )
         self.assertEqual(prompt.reasoning_effort, "minimal")
         job = harness.app.prepare(

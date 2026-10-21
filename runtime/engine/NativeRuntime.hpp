@@ -40,6 +40,10 @@ struct NativeLoopConfig {
   // when its last request ends; the process keeps the Mac from idle sleep in
   // between (main.mm). It must not throw. Empty where nothing needs to know.
   std::function<void(bool)> holdingRequests;
+  // Told when the engine's own work fails (its failure boundary below caught
+  // an exception), before the failure is reported. It must not throw. Empty
+  // where nothing needs to know.
+  std::function<void()> engineFailed;
   std::function<uint64_t()> unixMicros = systemUnixMicros;
   std::function<double()> monotonicMilliseconds = awakeMilliseconds;
 };
@@ -90,8 +94,8 @@ public:
     core_.setCompletionNotifier(std::move(notifier));
   }
 
-  void observePrefill(uint32_t rows, double wallMilliseconds) {
-    core_.observePrefill(rows, wallMilliseconds);
+  void observePrefill(uint32_t rows, double wallMilliseconds, double hostMilliseconds) {
+    core_.observePrefill(rows, wallMilliseconds, hostMilliseconds);
   }
 
   void announceReady();
@@ -161,7 +165,7 @@ private:
   bool handleMaskIssue(protocol::ProtocolIssue issue);
   bool handleIssue(protocol::ProtocolIssue issue);
   void requestError(uint64_t requestId, std::string code, std::string message,
-                    bool retryable = false);
+                    bool retryable = false, uint32_t retryAfterSeconds = 0);
   void engineError(std::string code, std::string message);
   void executionFailed(std::exception_ptr error);
   bool send(const protocol::EngineEvent &event);
@@ -178,13 +182,13 @@ private:
   void tokens(uint64_t requestId, std::span<const uint32_t> values) override;
   void maskRequested(uint64_t requestId,
                      std::span<const uint32_t> simulationTokens) override;
-  void completed(uint64_t requestId, EngineFinishReason reason,
+  void completed(uint64_t requestId, EngineFinishReason reason, bool bounded,
                  uint32_t promptTokens, uint32_t completionTokens,
                  uint32_t deduplicatedTokens,
                  std::span<const float> optionLogits,
                  const SpeculativeCounts &speculation) override;
   void failed(uint64_t requestId, LaneOutcome outcome,
-              std::string message) override;
+              std::string message, uint32_t retryAfterSeconds) override;
 
   static uint64_t durationMicros(double startMilliseconds,
                                  double endMilliseconds);

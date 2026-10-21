@@ -8,6 +8,7 @@ import socket
 import struct
 import sys
 import unittest
+from contextlib import nullcontext
 from functools import partial
 from unittest import mock
 
@@ -230,6 +231,7 @@ class RequestContractTests(HarnessTestCase):
                 [{"role": "user", "content": "Hi"}, *messages],
                 vision=True,
                 deadline=FOREVER,
+                without_slot=nullcontext,
             )[1]["tool_calls"][0]["id"],
             "call_42",
         )
@@ -265,6 +267,7 @@ class RequestContractTests(HarnessTestCase):
             ],
             vision=True,
             deadline=FOREVER,
+            without_slot=nullcontext,
         )
         self.assertEqual(
             normalized[0]["content"],
@@ -295,6 +298,7 @@ class RequestContractTests(HarnessTestCase):
                         ],
                         vision=True,
                         deadline=FOREVER,
+                        without_slot=nullcontext,
                     )
                 self.assertEqual(caught.exception.status, 400)
 

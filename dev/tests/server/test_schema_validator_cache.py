@@ -176,20 +176,22 @@ class SchemaCheckCacheTests(unittest.TestCase):
         ]
         return tool_schema.normalize_tools(tools, "auto", True)
 
-    def test_tool_schemas_are_checked_once_without_validators(self):
+    def test_strict_tool_schemas_are_checked_once_without_validators(self):
         schemas = [{"type": "object", "properties": {"x": {"type": "integer"}}}] * 2
-        self.tools(*schemas)
+        self.tools(*schemas, strict=True)
         self.assertEqual(len(validation._checked_schemas), 1)
         # Response formats keep the validators' slots to themselves.
         self.assertFalse(validation._validator_cache)
-        # The next turn's tools are not checked again.
+        # The next turn's tools are not checked again, and a tool that is
+        # not strict, whose schema builds no grammar, is not checked at all.
         with mock.patch.object(validation.validators, "validator_for") as check:
-            self.tools(*schemas)
+            self.tools(*schemas, strict=True)
+            self.tools({"type": "object", "properties": {"y": {}}})
         check.assert_not_called()
 
     def test_invalid_tool_schema_is_checked_once(self):
-        # A strict tool's is refused; any other tool's only goes untyped, and
-        # its client sends it again on every turn.
+        # A strict tool's is refused, as its client may send it again; any
+        # other tool keeps its schema unchecked.
         with self.assertRaises(APIError) as first:
             self.tools({"type": "invalid"}, strict=True)
         self.assertEqual(first.exception.status, 400)
@@ -203,7 +205,7 @@ class SchemaCheckCacheTests(unittest.TestCase):
             _, policy = self.tools({"type": "invalid"})
         check.assert_not_called()
         self.assertEqual(again.exception.message, first.exception.message)
-        self.assertEqual(policy.schemas, {"t0": None})
+        self.assertEqual(policy.schemas, {"t0": {"type": "invalid"}})
 
     def test_eviction_obeys_both_count_and_source_byte_limits(self):
         for count, budget in ((2, 10000), (1024, 180)):
@@ -221,12 +223,43 @@ class SchemaCheckCacheTests(unittest.TestCase):
                     self.assertEqual(checked.bytes, sum(len(key) for key in checked))
 
     def test_tools_take_schemas_only_a_validator_could_not_evaluate(self):
-        # Calls are not validated, so a tool's schema need only be valid; a
-        # response format is, and refuses what jsonschema would evaluate
-        # without bounds.
+        # Calls are not validated, so a strict tool's schema need only be
+        # valid; a response format is, and refuses what jsonschema would
+        # evaluate without bounds.
         schema = {"patternProperties": {"^a": {}}, "unevaluatedProperties": False}
-        self.tools(schema)
+        self.tools(schema, strict=True)
         with self.assertRaises(APIError):
             tool_schema.normalize_response_format(
                 {"type": "json_schema", "json_schema": {"schema": schema}}
             )
+
+
+class PatternCheckCacheTests(unittest.TestCase):
+    def test_pattern_checks_are_kept_within_a_byte_budget(self):
+        # A request's patterns may be as large as its body. The checks of
+        # those the grammar compiler takes are kept within a budget of the
+        # patterns' bytes as well as of their count: one larger than the
+        # budget is not kept, and one that would outgrow it drops the least
+        # recently used.
+        validate = tool_schema.LLMatcher.validate_grammar
+        with (
+            mock.patch.object(
+                tool_schema,
+                "_pattern_checks",
+                LRUCache(4096, tool_schema.PATTERN_CHECK_CACHE_SIZE),
+            ),
+            mock.patch.object(tool_schema, "LLMatcher") as matcher,
+        ):
+            matcher.validate_grammar.side_effect = validate
+            for pattern, checks in (
+                ("a" * 1500, 1),
+                ("a" * 1500, 1),
+                ("b" * 5000, 2),
+                ("b" * 5000, 3),
+                ("a" * 1500, 3),
+                ("c" * 1500, 4),
+                ("d" * 1500, 5),
+                ("a" * 1500, 6),
+            ):
+                self.assertTrue(tool_schema._grammar_takes_pattern(pattern))
+                self.assertEqual(matcher.validate_grammar.call_count, checks)

@@ -8,11 +8,13 @@ from dev.benchmarks import weights
 
 MODEL_ROOT = Path("/models/.resolved/assembly")
 A, B, C = ("a" * 64, "b" * 64, "c" * 64)
+# Options of weight-digests that stream the experts and the PLE table.
+STREAMED = ("--expert-memory", "7G", "--ple-memory", "2G")
 
 
 def digest_tool(build: Path, images: dict, status: int = 0):
     """A weight-digests in build that prints images, {component: sha256},
-    and logs the model root it was given."""
+    and logs the model root and options it was given."""
     tool = build / weights.WEIGHT_DIGESTS
     tool.parent.mkdir(parents=True, exist_ok=True)
     document = [
@@ -22,8 +24,8 @@ def digest_tool(build: Path, images: dict, status: int = 0):
     tool.write_text(
         f"#!{sys.executable}\n"
         "import sys\n"
-        f"with open({str(build / 'roots')!r}, 'a') as log:\n"
-        "    log.write(sys.argv[2] + '\\n')\n"
+        f"with open({str(build / 'arguments')!r}, 'a') as log:\n"
+        "    log.write(' '.join(sys.argv[2:]) + '\\n')\n"
         + (
             f"print('error: no model', file=sys.stderr)\nraise SystemExit({status})\n"
             if status
@@ -82,7 +84,13 @@ class WeightBytesTests(unittest.TestCase):
                 weights.digests(build, MODEL_ROOT),
                 {"target/layer-0.bin": A, "vision/model.bin": B},
             )
-            self.assertEqual((build / "roots").read_text(), f"{MODEL_ROOT}\n")
+            self.assertEqual((build / "arguments").read_text(), f"{MODEL_ROOT}\n")
+            # Options load the model as they say.
+            weights.digests(build, MODEL_ROOT, STREAMED)
+            self.assertEqual(
+                (build / "arguments").read_text().splitlines()[-1],
+                " ".join([str(MODEL_ROOT), *STREAMED]),
+            )
             digest_tool(build, {}, status=1)
             with self.assertRaisesRegex(RuntimeError, "exited 1: error: no model"):
                 weights.digests(build, MODEL_ROOT)
@@ -130,7 +138,7 @@ class WeightBytesTests(unittest.TestCase):
                 RuntimeError, "has no engine-tests/weight-digests"
             ):
                 weights.compare_builds(baseline, candidate, MODEL_ROOT, environment)
-            self.assertFalse((candidate / "roots").exists())
+            self.assertFalse((candidate / "arguments").exists())
             (baseline / weights.IDENTITY_HEADER).parent.mkdir(parents=True)
             (baseline / weights.IDENTITY_HEADER).write_text("")
             entry(
@@ -146,11 +154,19 @@ class WeightBytesTests(unittest.TestCase):
                 result["failures"],
                 [f"target/layer-0.bin: the baseline loaded {B}, the candidate {A}"],
             )
-            # A baseline that loads into memory is asked.
+            # A baseline that loads into memory is asked, and each build's
+            # weight-digests takes the options.
             digest_tool(baseline, {"target/layer-0.bin": A})
-            result = weights.compare_builds(baseline, candidate, MODEL_ROOT, None)
+            result = weights.compare_builds(
+                baseline, candidate, MODEL_ROOT, None, STREAMED
+            )
             self.assertTrue(result["pass"], result["failures"])
             self.assertEqual(len(result["images"]), 1)
+            for build in (baseline, candidate):
+                self.assertEqual(
+                    (build / "arguments").read_text().splitlines()[-1],
+                    " ".join([str(MODEL_ROOT), *STREAMED]),
+                )
 
 
 if __name__ == "__main__":

@@ -20,10 +20,13 @@ namespace {
 constexpr char kLock[] = "lock";
 constexpr char kServing[] = "serving";
 constexpr char kProbation[] = "probation";
+// A start failed within its probation: the next one that does empties the
+// cache.
+constexpr char kFailedProbation[] = "failed-probation";
 // What a cache holds, and every file a cache directory may hold: nothing
 // else in one is ever touched.
 constexpr const char *kCacheFiles[] = {"kv.slots", "kv.records", "state.slots", "state.records"};
-constexpr const char *kMarks[] = {kServing, kProbation, kLock};
+constexpr const char *kMarks[] = {kServing, kProbation, kFailedProbation, kLock};
 
 [[noreturn]] void fail(const char *operation) {
   throw std::system_error(errno, std::generic_category(), operation);
@@ -185,13 +188,21 @@ CacheDirectory::open(const std::filesystem::path &root, std::string_view cacheNa
   if (::futimens(result->lock_, nullptr) < 0)
     fail("stamp cache directory lock");
   result->uncleanExit_ = present(result->directory_, kServing);
+  // The last start failed within its probation: the cache goes when the one
+  // before it did too, or when its engine reported the failure.
   if (present(result->directory_, kProbation)) {
-    for (const char *name : kCacheFiles) {
-      if (::unlinkat(result->directory_, name, 0) < 0 && errno != ENOENT)
-        fail("empty cache directory");
+    if (present(result->directory_, kFailedProbation)) {
+      for (const char *name : kCacheFiles) {
+        if (::unlinkat(result->directory_, name, 0) < 0 && errno != ENOENT)
+          fail("empty cache directory");
+      }
+      result->unmark(kFailedProbation);
+      result->coldReason_ =
+          "the last two starts failed within their probation, or the last one's engine did";
+    } else {
+      result->mark(kFailedProbation);
     }
     result->unmark(kProbation);
-    result->coldReason_ = "the last start failed within its probation";
   }
   return result;
 }
@@ -252,16 +263,23 @@ CacheDirectory::~CacheDirectory() {
   ::close(directory_);
 }
 
-void CacheDirectory::beginServing(bool probation) {
+void CacheDirectory::beginServing() {
   mark(kServing);
-  if (probation)
-    mark(kProbation);
+  mark(kProbation);
 }
 
-void CacheDirectory::endProbation() { unmark(kProbation); }
+void CacheDirectory::endProbation() {
+  unmark(kFailedProbation);
+  unmark(kProbation);
+}
+
+void CacheDirectory::engineFailed() {
+  if (present(directory_, kProbation))
+    mark(kFailedProbation);
+}
 
 void CacheDirectory::close() {
-  unmark(kProbation);
+  endProbation();
   unmark(kServing);
 }
 

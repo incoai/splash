@@ -162,8 +162,9 @@ uint32_t grantKvPages(MemoryGovernor &governor,
 // The plan budgets the memory Metal holds outside the backend's buffers
 // (pipelines, driver allocations) inside its reserves and advertises the
 // context the rest of the budget holds. One request must reach that context
-// whatever part of the reserves this memory takes; memory beyond them is
-// still charged, and the device never exceeds the hard budget.
+// through the plan's governor whatever part of the reserves this memory
+// takes; memory beyond them is still charged, and the device never exceeds
+// the hard budget.
 void testAdvertisedContextIsGrantable() {
   struct Machine {
     const char *name;
@@ -200,10 +201,8 @@ void testAdvertisedContextIsGrantable() {
       test::metalStatistics().deviceCurrentAllocatedBytes =
           test::metalStatistics().allocatedBytes + untracked;
       metal::MetalBackend backend("unused");
-      // Configured as RuntimeResources configures it.
-      MemoryGovernor governor(
-          backend, budget.hardBudgetBytes, 2 * kGiB, 2 * kGiB,
-          [] { return hostMemory(200 * kGiB); }, reserves);
+      // The plan's governor, as a start and the runtime oracle build it.
+      MemoryGovernor governor(backend, budget, [] { return hostMemory(200 * kGiB); });
       const uint32_t granted = grantKvPages(governor, budget);
       const std::string context = std::string(machine.name) + ", " +
                                   std::to_string(untracked / kMiB) +
@@ -260,6 +259,21 @@ void testReservationsAndAdmissionClasses() {
       "injected backend defect", "admission swallowed a backend defect");
   require(static_cast<bool>(admit(governor, limit)),
           "a backend defect leaked its reservation");
+}
+
+// Host memory the engine holds outside Metal (a streamed table's row cache)
+// is charged in full beside the backend's buffers.
+void testHostHeldBytesAreCharged() {
+  test::metalStatistics() = {};
+  metal::MetalBackend backend("unused");
+  const uint64_t hostReserve = 64 * 1024;
+  const uint64_t limit = 64 * 1024, held = 16 * 1024;
+  MemoryGovernor governor(backend, limit, hostReserve, hostReserve, [] {
+    return hostMemory(hostReserve + 3 * kGiB);
+  }, 0, held);
+  require(static_cast<bool>(admit(governor, limit - held)) && !admit(governor, limit - held + 1),
+          "memory governor did not charge the host memory the engine holds");
+  require(governor.snapshot().chargedBytes == held, "the host memory the engine holds is not in its charge");
 }
 
 // Critical pressure stops all growth. Host headroom below the warning margin
@@ -422,15 +436,18 @@ void testPressurePolicyDirectives() {
           "a waiting request's shrink stopped short of the recovery margin");
   // The newest publication is what a follow-up resumes from; rebuilding it
   // costs a whole prefill, so a shrink nothing is waiting for leaves it and
-  // takes the rest. A waiting request outranks it, and Critical takes all.
+  // takes the rest short of what is in use, which includes the replay point
+  // a running request publishes for its follow-up. A waiting request
+  // outranks both, and Critical takes all.
   policySnapshot.hostHeadroomBytes = kGiB / 4;
   const auto speculative = policy.update(policySnapshot, 6101.0, false);
   require(speculative && speculative->targetBytes == 3 * kGiB / 4 &&
-              speculative->keepResumePoint,
-          "a speculative shrink discarded the resume point");
+              speculative->keepResumePoint && speculative->upTo == ReclaimClass::Ordinary,
+          "a speculative shrink discarded the resume point or took what is in use");
   const auto demanded = policy.update(policySnapshot, 7101.0, true);
-  require(demanded && demanded->targetBytes == kGiB && !demanded->keepResumePoint,
-          "a waiting request could not reach the resume point");
+  require(demanded && demanded->targetBytes == kGiB && !demanded->keepResumePoint &&
+              demanded->upTo == ReclaimClass::InUse,
+          "a waiting request could not reach the resume point or what is in use");
   policySnapshot.pressure = MemoryPressure::Critical;
   const auto criticalDirective = policy.update(policySnapshot, 7102.0, false);
   require(criticalDirective && criticalDirective->critical &&
@@ -732,7 +749,8 @@ void testOptionalGrowthKeepsTheSpareReserve() {
 // the snapshot says so, while what a request in service needs still grows.
 // Every paced pass returns the warning margin's worth of cache and keeps the
 // resume point, even for a waiting request, which the warning holds back
-// too; once the level is normal again, growth resumes and no pass runs.
+// too; only a pass a request waits for takes what is in use. Once the level
+// is normal again, growth resumes and no pass runs.
 void testSystemWarningGivesCacheBack() {
   test::metalStatistics() = {};
   test::metalStatistics().allocatedBytes = 12 * kGiB;
@@ -758,15 +776,17 @@ void testSystemWarningGivesCacheBack() {
   MemoryPressurePolicy policy;
   const auto first = policy.update(warned, 0.0, false);
   require(first && !first->critical && first->targetBytes == kHostWarningMarginBytes &&
-              first->keepResumePoint,
+              first->keepResumePoint && first->upTo == ReclaimClass::Ordinary,
           "a pass under macOS's warning did not return the warning margin's worth of cache, "
-          "keeping the resume point");
+          "keeping the resume point and what is in use");
   require(policy.update(warned, 500.0, false).value().targetBytes == 0 &&
               policy.update(warned, 1000.0, false).value().targetBytes == kHostWarningMarginBytes,
           "the passes under macOS's warning did not keep the pace");
   const auto waited = policy.update(warned, 2000.0, true);
-  require(waited && waited->targetBytes == kHostWarningMarginBytes && waited->keepResumePoint,
-          "a pass under macOS's warning dropped the resume point for a request it holds back");
+  require(waited && waited->targetBytes == kHostWarningMarginBytes && waited->keepResumePoint &&
+              waited->upTo == ReclaimClass::InUse,
+          "a pass under macOS's warning dropped the resume point for a request it holds back, "
+          "or kept what is in use from it");
 
   governor.setPressure(MemoryPressure::Normal);
   const MemoryGovernorSnapshot normal = governor.evaluate();
@@ -782,6 +802,7 @@ int main() {
     testHostAvailabilityCountsReclaimablePages();
     testAdvertisedContextIsGrantable();
     testReservationsAndAdmissionClasses();
+    testHostHeldBytesAreCharged();
     testHostHeadroomHysteresis();
     testReclaimablePagesReopenGrowth();
     testSnapshotLeavesTheHysteresis();

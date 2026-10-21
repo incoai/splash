@@ -20,6 +20,8 @@ void RoPE::addTables(
       rows.draft_rows > maximumRows) {
     throw std::invalid_argument("invalid RoPE table row count");
   }
+  if (!(rows.target_scale > 0.0F))
+    throw std::invalid_argument("invalid target RoPE scale");
   const uint64_t targetTable = uint64_t{rows.target_rows} * SPLASH_TARGET_ROPE_PAIRS * sizeof(float);
   const uint64_t draftTable = uint64_t{rows.draft_rows} * SPLASH_DRAFT_ROPE_PAIRS * sizeof(float);
   // Target rows carry three positions (t, h, w): Qwen3.5's M-RoPE.

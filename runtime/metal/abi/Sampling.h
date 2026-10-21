@@ -172,6 +172,34 @@ struct SelectorBatchParams {
 static_assert(sizeof(SelectorBatchParams) == 44,
               "Draft selector parameters are 44 bytes on both sides");
 
+// The rows of its block each lane of a decode cycle verifies (its verify
+// rows, draft_verify_rows), chosen for the whole batch by expected accepted
+// tokens per unit of the cycle's cost. The selector writes each lane's
+// confidence at each proposal position: the largest probability among the
+// position's candidates (the softmax at temperature 1 of their scores), which
+// does not depend on the candidate the lane draws there. Once the proposals
+// before it are accepted, a proposal is accepted with probability p, where
+// logit(p) = slope * logit(confidence) + intercept[position]; a lane's
+// survival at a position, the product of p up to it, is the probability that
+// its proposals up to it are all accepted, and verifying one more row adds
+// that much to the lane's expected tokens. Every lane verifies its anchor;
+// the rows past it go to the largest survivals over all lanes, as many as
+// maximize the expected tokens over cost[the rows verified in all], none past
+// a lane's maximum. With every_row, each lane verifies its maximum. The
+// verify's MoE steps route the verify rows alone, and acceptance retains at
+// most that many tokens.
+struct VerifyRowsParams {
+  float slope;
+  float intercept[SPLASH_DRAFT_PROPOSAL_TOKENS];
+  float cost[SPLASH_DRAFT_QUERY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH + 1];
+  uint32_t lanes;
+  uint32_t every_row;
+  uint32_t maximum[SPLASH_MAXIMUM_BATCH_WIDTH];
+};
+
+static_assert(sizeof(VerifyRowsParams) == 188,
+              "Verify rows parameters are 188 bytes on both sides");
+
 struct AcceptBatchParams {
   uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t stop_token_0;

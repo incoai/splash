@@ -562,6 +562,14 @@ void testCommandWatchdogAndPendingHealthWake() {
   generations.complete(1);
   require(!generations.expired(129.999) && generations.expired(130.0),
           "stale completion cleared a newer command deadline");
+  // A command's progress (its host steps) moves its deadline a timeout on,
+  // and another command's moves nothing.
+  metal::CommandWatchdog progressing(120.0);
+  progressing.start(3, 0.0);
+  progressing.progress(3, 100.0);
+  progressing.progress(2, 200.0);
+  require(!progressing.expired(219.999) && progressing.expired(220.0),
+          "a command's progress did not move its deadline, or another's did");
 
   for (bool gpuCompleted : {false, true}) {
     LoopFixture fixture;
@@ -707,13 +715,15 @@ void testControlFailureUsesExecutionBoundary() {
 
 // A frame whose handling throws stops the engine through the same boundary
 // as tick(): one EngineUnhealthy event, whatever was thrown, with a Metal
-// failure named and counted.
+// failure named and counted, and the engine's failure told once.
 void testFrameFailureUsesExecutionBoundary() {
   enum class Thrown { Standard, Metal, Foreign };
   for (const Thrown thrown : {Thrown::Standard, Thrown::Metal, Thrown::Foreign}) {
     RuntimeMetrics metrics;
     engine::NativeLoopConfig config;
     config.metrics = &metrics;
+    uint32_t told = 0;
+    config.engineFailed = [&told] { ++told; };
     LoopFixture fixture(config, {.pages = 8});
     engine::NativeRuntime &loop = fixture.loop;
     fixture.status = [thrown]() -> std::string {
@@ -740,9 +750,9 @@ void testFrameFailureUsesExecutionBoundary() {
         ++errors;
       }
     }
-    require(errors == 1 && metrics.snapshot().metalFailures ==
-                               (thrown == Thrown::Metal ? 1U : 0U),
-            "a frame exception was reported or counted more than once");
+    require(errors == 1 && told == 1 &&
+                metrics.snapshot().metalFailures == (thrown == Thrown::Metal ? 1U : 0U),
+            "a frame exception was reported, told or counted other than once");
   }
 }
 
@@ -1565,7 +1575,7 @@ void testIdleWeightsAreReleasedAndRestored(bool releasable) {
   constexpr double kIdleReleaseSeconds = 2.0;
   constexpr double idleRelease = 1000.0 * kIdleReleaseSeconds;
   Weights weights;
-  ReleasableMemory memory(weights, std::nullopt);
+  ReleasableMemory memory({&weights}, std::nullopt);
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
   config.weights = releasable ? static_cast<model::WeightMemory *>(&memory) : &weights;
@@ -1642,6 +1652,43 @@ void testIdleWeightsAreReleasedAndRestored(bool releasable) {
           "a failed restore did not stop the engine");
 }
 
+// A store of streamed experts (model::ExpertStore), the part after the images,
+// goes back with them and comes back in one restore after their last; a
+// release during a restore gives back what came back.
+void testReleasableMemoryRestoresTheExpertsAfterTheImages() {
+  Weights weights;
+  struct Experts final : model::WeightMemory {
+    bool held = true;
+    uint32_t restores = 0;
+    [[nodiscard]] bool released() const noexcept override { return !held; }
+    void release() override { held = false; }
+    bool restore(const metal::AllocationAdmission &) override {
+      require(!held, "a held arena was restored");
+      held = true;
+      ++restores;
+      return true;
+    }
+  } experts;
+  ReleasableMemory memory({&weights, &experts}, std::nullopt);
+  const metal::AllocationAdmission admit = [](uint64_t, const std::function<void()> &operation) {
+    operation();
+    return metal::AllocationResult{};
+  };
+  memory.release();
+  require(memory.released() && weights.released() && experts.released(),
+          "the release kept the images or the arena");
+  for (uint32_t image = 0; image < Weights::kImages; ++image)
+    require(!memory.restore(admit) && experts.released(), "the arena came back before the last image");
+  require(!weights.released() && memory.released(), "the restore ended without the arena");
+  require(memory.restore(admit) && !memory.released() && experts.restores == 1,
+          "the arena did not come back in one restore after the images");
+  memory.release();
+  require(!memory.restore(admit) && weights.held() == 1, "a restore did not write the first image back");
+  memory.release();
+  require(weights.held() == 0 && experts.released() && experts.restores == 1,
+          "a release during a restore kept what came back");
+}
+
 // With the Neural Engine split, the idle release gives back the images, then
 // the split's program. A request waits while the images are written back, an
 // image per tick, and the program is loaded in one tick more, before the
@@ -1659,7 +1706,7 @@ void testIdleReleaseRestoresTheSplitLast() {
   bool loaded = true, released = false, stopped = false, failLoad = false;
   uint32_t loads = 0;
   ReleasableMemory memory(
-      weights, ReleasableMemory::Split{
+      {&weights}, ReleasableMemory::Split{
                    [&] {
                      require(weights.released(),
                              "the split's program was unloaded before the images were released");
@@ -1770,7 +1817,7 @@ void testRefusedRestoreWaitsForMemory() {
                           [&] { return hostMemory(hostAvailable); }, 0);
   Weights weights;
   uint32_t programReleases = 0, programLoads = 0;
-  ReleasableMemory memory(weights, ReleasableMemory::Split{[&] {
+  ReleasableMemory memory({&weights}, ReleasableMemory::Split{[&] {
                                                              ++programReleases;
                                                              return true;
                                                            },
@@ -1926,7 +1973,7 @@ void testIdleReleaseOffReleasesOnlyOnRequest() {
 // request restores them as after the idle release.
 void testReleaseRequestGivesTheWeightsBackWhenIdle() {
   Weights weights;
-  ReleasableMemory memory(weights, std::nullopt);
+  ReleasableMemory memory({&weights}, std::nullopt);
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
   config.weights = &memory;
@@ -2067,6 +2114,7 @@ int main() {
     testControlPassHoldsGrowthForAWaitingRequest();
     testIdleWeightsAreReleasedAndRestored(false);
     testIdleWeightsAreReleasedAndRestored(true);
+    testReleasableMemoryRestoresTheExpertsAfterTheImages();
     testIdleReleaseRestoresTheSplitLast();
     testRefusedRestoreWaitsForMemory();
     testIdleReleaseOffReleasesOnlyOnRequest();

@@ -6,7 +6,8 @@ import io
 import math
 import threading
 import time
-from contextlib import closing
+from collections.abc import Callable
+from contextlib import closing, nullcontext
 from dataclasses import asdict, dataclass
 
 from .errors import APIError
@@ -31,6 +32,10 @@ class DocumentBudget:
     deadline: float
     remaining_bytes: int = MAX_REQUEST_DOCUMENT_BYTES
     remaining_pages: int = MAX_PAGES
+    # A context manager under which the request holds no preparation slot,
+    # to wait for and use the PDF worker; none to give back outside
+    # preparation.
+    without_slot: Callable = nullcontext
 
     def remaining_time(self):
         remaining = self.deadline - time.monotonic()
@@ -74,7 +79,8 @@ class RenderLimits:
 
 # One bounded PDF worker runs at a time. A request decodes, hashes and looks
 # up its PDF before it waits for the worker, so a cached PDF never waits
-# behind another one's render.
+# behind another one's render, and waits for the worker and renders without
+# its preparation slot, so neither does another request's preparation.
 _render_lock = threading.Lock()
 # Rendered pages by the SHA-256 of their PDF.
 _cache_lock = threading.Lock()
@@ -198,20 +204,21 @@ def _pages(encoded, budget):
     key = hashlib.sha256(payload).digest()
     if (pages := _cached(key, budget)) is not None:
         return pages
-    if not _render_lock.acquire(
-        timeout=min(budget.remaining_time(), threading.TIMEOUT_MAX)
-    ):
-        raise APIError(504, "request timed out", "request_timeout")
-    try:
-        # Another request may have rendered the same PDF meanwhile.
-        if (pages := _cached(key, budget)) is not None:
+    with budget.without_slot():
+        if not _render_lock.acquire(
+            timeout=min(budget.remaining_time(), threading.TIMEOUT_MAX)
+        ):
+            raise APIError(504, "request timed out", "request_timeout")
+        try:
+            # Another request may have rendered the same PDF meanwhile.
+            if (pages := _cached(key, budget)) is not None:
+                return pages
+            pages = _render(payload, budget)
+            budget.charge_pages(len(pages))
+            _cache_pages(key, pages)
             return pages
-        pages = _render(payload, budget)
-        budget.charge_pages(len(pages))
-        _cache_pages(key, pages)
-        return pages
-    finally:
-        _render_lock.release()
+        finally:
+            _render_lock.release()
 
 
 def document_parts(block):

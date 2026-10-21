@@ -8,7 +8,8 @@ class LRUCache:
     """Values by key, each of a size its owner gives, within `budget_bytes`
     and, if given, `capacity` entries: keeping one drops the least recently
     used until both hold, and a value larger than the whole budget is not
-    kept. Its owner holds a lock around every use."""
+    kept. Its owner holds a lock around every use, as memoized holds the one
+    it is given."""
 
     def __init__(self, budget_bytes, capacity=None):
         self.budget_bytes = budget_bytes
@@ -58,3 +59,21 @@ class LRUCache:
             return None
         self.bytes -= entry[1]
         return entry[0]
+
+
+def memoized(cache, lock, key, compute):
+    """The value `cache` keeps for `key`, else the one compute() returns with
+    its size, which `cache` then keeps. `lock` guards `cache`, and compute
+    runs outside it: misses of one key in several threads each compute it,
+    and one that finds a value kept meanwhile returns that value."""
+    with lock:
+        value = cache.get(key)
+    if value is not None:
+        return value
+    value, size = compute()
+    with lock:
+        kept = cache.get(key)
+        if kept is not None:
+            return kept
+        cache.put(key, value, size)
+    return value

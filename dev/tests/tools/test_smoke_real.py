@@ -139,6 +139,9 @@ class SmokeRealTests(unittest.TestCase):
                         max_context=None,
                         max_memory=None,
                         max_cache_disk=None,
+                        ple_memory=None,
+                        expert_memory=None,
+                        verify_rows=None,
                         max_image_pixels=None,
                         kv_format="bf16" if absolute else "int8",
                     )
@@ -164,10 +167,6 @@ class SmokeRealTests(unittest.TestCase):
                                 ["-m", "server.server", str(model_root.resolve())],
                             )
                             self.assertEqual(
-                                command[command.index("--tokenizer") + 1],
-                                str(model_root.resolve() / "tokenizer"),
-                            )
-                            self.assertEqual(
                                 command[command.index("--binary") + 1],
                                 str(binary.resolve()),
                             )
@@ -183,6 +182,9 @@ class SmokeRealTests(unittest.TestCase):
             max_context=None,
             max_memory=None,
             max_cache_disk="4G",
+            ple_memory=None,
+            expert_memory=None,
+            verify_rows=None,
             max_image_pixels=None,
             kv_format="int8",
         )
@@ -214,6 +216,85 @@ class SmokeRealTests(unittest.TestCase):
                     self.assertEqual(
                         command[index + 1 : index + 3], ["--cache-dir", "/tmp/cache"]
                     )
+
+    def test_ssd_streaming_options_reach_the_server(self):
+        model = ["--model", "unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS"]
+        parsed = smoke_real.parse_args(model)
+        self.assertEqual((parsed.ple_memory, parsed.expert_memory), (None, None))
+        parsed = smoke_real.parse_args(
+            [*model, "--ple-memory", "2G", "--expert-memory", "16G"]
+        )
+        self.assertEqual((parsed.ple_memory, parsed.expert_memory), ("2G", "16G"))
+        with self.server():
+            command = smoke_real.subprocess.Popen.call_args.args[0]
+            self.assertNotIn("--ple-memory", command)
+            self.assertNotIn("--expert-memory", command)
+        arguments = self.server_arguments()
+        arguments.ple_memory, arguments.expert_memory = "2G", "16G"
+        with (
+            mock.patch.object(smoke_real, "available_port", return_value=8000),
+            mock.patch.object(smoke_real.subprocess, "Popen") as popen,
+        ):
+            popen.return_value.poll.return_value = 0
+            server = smoke_real.RealServer(arguments)
+            try:
+                command = popen.call_args.args[0]
+                self.assertEqual(command[command.index("--ple-memory") + 1], "2G")
+                self.assertEqual(command[command.index("--expert-memory") + 1], "16G")
+            finally:
+                server.close()
+
+    def test_max_context_reaches_the_server(self):
+        # Past the native window, the context the server serves with YaRN.
+        model = ["--model", "mlx-community/Qwen3.8-27B-4bit"]
+        self.assertIsNone(smoke_real.parse_args(model).max_context)
+        self.assertEqual(
+            smoke_real.parse_args([*model, "--max-context", "1010000"]).max_context,
+            1010000,
+        )
+        with self.server():
+            command = smoke_real.subprocess.Popen.call_args.args[0]
+            self.assertNotIn("--max-context", command)
+        arguments = self.server_arguments()
+        arguments.max_context = 1010000
+        with (
+            mock.patch.object(smoke_real, "available_port", return_value=8000),
+            mock.patch.object(smoke_real.subprocess, "Popen") as popen,
+        ):
+            popen.return_value.poll.return_value = 0
+            server = smoke_real.RealServer(arguments)
+            try:
+                command = popen.call_args.args[0]
+                self.assertEqual(command[command.index("--max-context") + 1], "1010000")
+            finally:
+                server.close()
+
+    def test_verify_rows_reach_the_server(self):
+        model = ["--model", "unsloth/Qwen3.8-Flash-Next-GGUF:UD-IQ4_XS"]
+        self.assertIsNone(smoke_real.parse_args(model).verify_rows)
+        for rows in ("auto", "all"):
+            self.assertEqual(
+                smoke_real.parse_args([*model, "--verify-rows", rows]).verify_rows,
+                rows,
+            )
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            smoke_real.parse_args([*model, "--verify-rows", "budget"])
+        with self.server():
+            command = smoke_real.subprocess.Popen.call_args.args[0]
+            self.assertNotIn("--verify-rows", command)
+        arguments = self.server_arguments()
+        arguments.verify_rows = "all"
+        with (
+            mock.patch.object(smoke_real, "available_port", return_value=8000),
+            mock.patch.object(smoke_real.subprocess, "Popen") as popen,
+        ):
+            popen.return_value.poll.return_value = 0
+            server = smoke_real.RealServer(arguments)
+            try:
+                command = popen.call_args.args[0]
+                self.assertEqual(command[command.index("--verify-rows") + 1], "all")
+            finally:
+                server.close()
 
     def test_persistent_cache_scenario_needs_the_ssd_cache(self):
         model = ["--model", "mlx-community/Qwen3.8-27B-4bit"]
@@ -473,7 +554,10 @@ class SmokeRealTests(unittest.TestCase):
             "content": [{"type": "output_text", "text": text}],
         }
 
-    def run_images(self, output):
+    def run_images(self, output, reused=None):
+        """run_images over canned answers: the red image encoded once, its
+        repeat a prefix hit and, behind another system prompt, its cached rows
+        reused, or the image telemetry `reused` after that request."""
         red = {"choices": [{"message": {"content": "red"}}]}
         repeat = {
             **red,
@@ -483,13 +567,15 @@ class SmokeRealTests(unittest.TestCase):
             "choices": [{"message": {"content": "blue"}}],
             "metrics": {"cache": {"matched_tokens": 0}},
         }
+        encoded = {"encodes": 1, "embedding_reuses": 0, "embedding_evictions": 0}
         documents = [
+            {"images": {**encoded, "encodes": 0}},
             red,
-            {"images": {"encodes": 1, "embedding_reuses": 0}},
+            {"images": encoded},
             repeat,
-            {"images": {"encodes": 1, "embedding_reuses": 0}},
+            {"images": encoded},
             red,
-            {"images": {"encodes": 1, "embedding_reuses": 1}},
+            {"images": reused or {**encoded, "embedding_reuses": 1}},
             blue,
             {"type": "message", "content": [{"type": "text", "text": "red"}]},
             {"object": "response", "output": output},
@@ -504,6 +590,35 @@ class SmokeRealTests(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()),
         ):
             smoke_real.run_images(8000, "test-model", "test-request")
+
+    def test_image_rows_the_cache_let_go_are_encoded_again(self):
+        self.run_images(
+            [self.assistant_message("Blue.")],
+            reused={"encodes": 2, "embedding_reuses": 0, "embedding_evictions": 1},
+        )
+
+    def test_image_rows_the_cache_kept_are_reused(self):
+        cases = {
+            "encoded again": (2, 0, 0),
+            "neither": (1, 0, 0),
+            "evicted, then neither": (1, 0, 1),
+            "evicted, then both": (2, 1, 1),
+        }
+        for name, (encodes, reuses, evictions) in cases.items():
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(
+                    smoke_real.SmokeFailure, "re-ran the vision tower"
+                ),
+            ):
+                self.run_images(
+                    [self.assistant_message("Blue.")],
+                    reused={
+                        "encodes": encodes,
+                        "embedding_reuses": reuses,
+                        "embedding_evictions": evictions,
+                    },
+                )
 
     def test_responses_image_accepts_final_assistant_text(self):
         self.run_images(
@@ -664,10 +779,19 @@ class SmokeRealTests(unittest.TestCase):
                 )
 
     def test_sampling_requires_repeats_the_tool_call_and_the_whole_budget(self):
-        def serve(repeat=True, arguments=None, ignored=32, heaviest="x", failing=None):
+        def serve(
+            repeat=True,
+            arguments=None,
+            ignored=32,
+            heaviest="x",
+            failing=None,
+            verify_rows="all",
+        ):
             answers = iter(("first", "second", "second" if repeat else "third"))
 
             def answer(port, method, path, body=None, **_kwargs):
+                if path == "/status":
+                    return 200, {"verify_rows": verify_rows}
                 if body.get("min_p") == 0.1 and failing == "min_p":
                     raise TimeoutError("timed out")
                 if body.get("tools"):
@@ -697,6 +821,19 @@ class SmokeRealTests(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()),
         ):
             smoke_real.run_sampling(8000, "test-model")
+        # Where the verify budget chooses the rows, greedy answers need not
+        # repeat.
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                smoke_real,
+                "request",
+                serve(repeat=False, heaviest="y", verify_rows="auto"),
+            ),
+            contextlib.redirect_stdout(output),
+        ):
+            smoke_real.run_sampling(8000, "test-model")
+        self.assertIn("greedy answers not compared", output.getvalue())
         for failure, server in (
             ("did not repeat", serve(repeat=False)),
             ("min_p 1 did not answer", serve(heaviest="y")),

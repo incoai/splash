@@ -5,15 +5,17 @@ from __future__ import annotations
 import copy
 import json
 import re
+import threading
 import unicodedata
 from dataclasses import dataclass, field
-from functools import cached_property, lru_cache
+from functools import cached_property
 from urllib.parse import unquote
 
 from jsonschema.exceptions import SchemaError
 from llguidance import LLMatcher
 
 from .errors import APIError
+from .lru import LRUCache, memoized
 from .schema_validation import (
     build_validator,
     check_schema,
@@ -73,10 +75,12 @@ def function_opening(name):
 # interpreter's stack: a schema nests objects and arrays at most this deep.
 MAX_SCHEMA_DEPTH = 64
 
-# Framing projects each tool's fields through schema composition and copies
-# the root schema into every field that refers to it. Pathological schemas
-# make that quadratic or exponential in their size, so framing all tools of
-# a request may produce about this many bytes of schemas.
+# Framing projects each tool's fields through schema composition, and for a
+# strict tool's grammar copies the root schema into every field that refers
+# to it. Pathological schemas make that quadratic or exponential in their
+# size, so framing may produce about this many bytes of schemas: for a
+# request's strict tools, whose grammars are built together, and as much for
+# its other tools, which are framed for their parameters' types alone.
 MAX_FRAMED_SCHEMA_BYTES = 16 * 1024 * 1024
 
 
@@ -99,38 +103,65 @@ class ToolPolicy:
 
     @cached_property
     def argument_schemas(self):
-        """The arguments of each tool, framed: a strict tool's as its grammar
-        generates them, any other's as declared. None for a tool whose schema
-        cannot be read or whose parameters cannot be framed, which only a
-        strict tool refuses."""
+        """The arguments of each strict tool, framed as its grammar generates
+        them. The grammars are built together, so one budget bounds them."""
         budget = [MAX_FRAMED_SCHEMA_BYTES]
-        framed = {}
-        for name, schema in self.schemas.items():
-            if name in self.strict:
-                framed[name] = tool_argument_schema(_strict_schema(schema), budget)
-                continue
-            try:
-                framed[name] = (
-                    None if schema is None else tool_argument_schema(schema, budget)
-                )
-            except APIError:
-                framed[name] = None
-        return framed
+        return {
+            name: tool_argument_schema(_strict_schema(_json_type_names(schema)), budget)
+            for name, schema in self.schemas.items()
+            if name in self.strict
+        }
 
-    def parameter_types(self, name):
-        """The JSON types by which the values of tool `name` convert: those
-        of each parameter it declares, and those of any other; None stands
-        for any type, as for a tool that was not offered."""
-        schema = self.argument_schemas.get(name)
-        if schema is None:
-            return {}, None
-        other = schema["additionalProperties"]
+
+class ParameterTypes:
+    """The JSON types by which the values of a request's tool calls convert,
+    which the projector of its output reads as a call first names a tool of
+    its ToolPolicy and keeps for its later calls: those of each parameter
+    the tool declares, and those of any other; None where its schema
+    constrains no type, as for a tool that was not offered. A strict tool's
+    are those of the arguments its grammar generates. Any other tool's
+    arguments are projected from its schema, within what the budget of the
+    request's tools that are not strict has left, and their types read
+    against that schema; one whose schema cannot be read or whose arguments
+    cannot be projected declares no types."""
+
+    def __init__(self, policy):
+        self._policy = policy
+        # The types of each tool a call has named, and what the budget of the
+        # tools that are not strict has left as calls name them.
+        self._types = {}
+        self._budget = [MAX_FRAMED_SCHEMA_BYTES]
+
+    def of(self, name):
+        """The types of tool `name`'s parameters, and those of any other."""
+        if name not in self._types:
+            self._types[name] = self._read(name)
+        return self._types[name]
+
+    def _read(self, name):
+        policy = self._policy
+        if name in policy.strict:
+            shape = policy.argument_schemas[name]
+
+            def read(value):
+                # A framed value is a schema of its own.
+                return schema_types(value, value)
+
+        else:
+            schema = _json_type_names(policy.schemas.get(name))
+            if schema is None:
+                return {}, None
+            try:
+                shape = _argument_shape(schema, self._budget)
+            except APIError:
+                return {}, None
+            read = _type_reader(schema)
         return (
             {
-                parameter: schema_types(value, value)
-                for parameter, value in schema["properties"].items()
+                parameter: read(value)
+                for parameter, value in shape["properties"].items()
             },
-            frozenset() if other is False else schema_types(other, other),
+            read(shape["additionalProperties"]),
         )
 
 
@@ -189,8 +220,13 @@ GRAMMAR_BOUND_KEYWORDS = ("minItems", "maxItems", "multipleOf")
 MAX_GRAMMAR_BOUND = 64
 
 # Checking a pattern compiles a grammar, and a client sends the same tools and
-# output schema on every turn, so the answers for this many patterns are kept.
+# output schema on every turn, so the answers for this many patterns are kept,
+# within this many bytes of them, as the server's other caches of request text
+# are.
 PATTERN_CHECK_CACHE_SIZE = 1024
+PATTERN_CHECK_CACHE_BYTES = 8 * 1024 * 1024
+_pattern_checks_lock = threading.Lock()
+_pattern_checks = LRUCache(PATTERN_CHECK_CACHE_BYTES, PATTERN_CHECK_CACHE_SIZE)
 
 # The whitespace a model chooses between the tokens of constrained output, in
 # JSON and around tool calls, is bounded: a model that prefers whitespace to
@@ -204,14 +240,20 @@ WHITESPACE = rf"[ \t\n\r]{{0,{MAX_WHITESPACE}}}"
 WHITESPACE_RULE = f"WS: /{WHITESPACE}/"
 
 
-@lru_cache(maxsize=PATTERN_CHECK_CACHE_SIZE)
 def _grammar_takes_pattern(pattern):
     """Whether the grammar compiler takes a JSON Schema ``pattern``. It keeps
     the pattern's search semantics but rejects look-around, word boundaries
     and backreferences, which a response format checks on the complete
     output."""
-    string = json.dumps({"type": "string", "pattern": pattern})
-    return not LLMatcher.validate_grammar(f"%llguidance {{}}\nstart: %json {string}\n")
+
+    def check():
+        string = json.dumps({"type": "string", "pattern": pattern})
+        grammar = f"%llguidance {{}}\nstart: %json {string}\n"
+        # json.dumps uses ASCII escapes, so its length bounds the pattern's
+        # bytes.
+        return not LLMatcher.validate_grammar(grammar), len(string)
+
+    return memoized(_pattern_checks, _pattern_checks_lock, pattern, check)
 
 
 def _grammar_compatible_schema(schema):
@@ -348,8 +390,11 @@ def _referenced(node, root):
 
 def _enumeration(node):
     """The values a schema node lists, as an enum or a const; None if it
-    lists none."""
-    return [node["const"]] if "const" in node else node.get("enum")
+    lists none, as an enum that is not a list does."""
+    if "const" in node:
+        return [node["const"]]
+    values = node.get("enum")
+    return values if isinstance(values, list) else None
 
 
 # The JSON type of each kind of value json_codec reads.
@@ -362,6 +407,56 @@ JSON_TYPES = {
     list: "array",
     dict: "object",
 }
+# The JSON type a schema's type name stands for, whatever its case and the
+# space around it: a JSON type by its own name or by a common alias. Any other
+# name stands for no JSON type. A tool's schema is read with each name that
+# stands for one spelled as that type's name (_json_type_names).
+TYPE_NAMES = {name: name for name in JSON_TYPES.values()} | {
+    "str": "string",
+    "text": "string",
+    "int": "integer",
+    "float": "number",
+    "bool": "boolean",
+    "dict": "object",
+    "list": "array",
+}
+
+
+def _spelled_types(kind):
+    """A schema's type with each name that stands for a JSON type
+    (TYPE_NAMES) spelled as that type's name, and anything else as
+    written."""
+    if isinstance(kind, list):
+        return [
+            _spelled_types(item) if isinstance(item, str) else item for item in kind
+        ]
+    return TYPE_NAMES.get(kind.strip().lower(), kind) if isinstance(kind, str) else kind
+
+
+def _json_type_names(schema):
+    """`schema` with its types spelled as the JSON types they stand for
+    (_spelled_types), as framing, the types it gives a tool's values and a
+    strict tool's grammar read it: a copy where any is spelled otherwise,
+    else `schema` itself. Data a reference reaches, which is not a schema,
+    keeps its type names as written."""
+    if all(
+        _spelled_types(node["type"]) == node["type"]
+        for node in subschemas(schema)
+        if isinstance(node, dict) and "type" in node
+    ):
+        return schema
+    output = copy.deepcopy(schema)
+    for node in subschemas(output):
+        if isinstance(node, dict) and "type" in node:
+            node["type"] = _spelled_types(node["type"])
+    return output
+
+
+def _json_type(name):
+    """The JSON type a type name names in a schema whose types are spelled
+    as JSON types (_json_type_names); None where it names none, as anything
+    but a name does."""
+    return name if name in JSON_TYPES.values() else None
 
 
 def _narrowed(types, other):
@@ -381,11 +476,20 @@ def _narrowed(types, other):
 
 def schema_types(schema, root):
     """The JSON types a value of `schema` may take, by which a parameter's
-    text converts; None for any. Those its type names, else those of its enum
-    or const values, else those its anyOf or oneOf members take together,
-    narrowed by its allOf members and the target of its local reference. A
-    member that constrains no type, such as one met again inside its own
-    reading, neither widens nor narrows the others'."""
+    text converts; None where it constrains no type. Those its type names
+    name (_json_type), unless one of them names none: such a type
+    constrains none, as framing reads it. Else those of its enum or const
+    values, else those its anyOf or oneOf members take together, narrowed by
+    its allOf members and the target of its local reference. A member that
+    constrains no type, such as one met again inside its own reading,
+    neither widens nor narrows the others'."""
+    return _type_reader(root)(schema)
+
+
+def _type_reader(root):
+    """What reads schema_types of schemas within `root`, each node once
+    whatever schema it is read for: the parameters of a tool read the
+    definitions they share once."""
     types = {}
 
     def read(node):
@@ -403,8 +507,9 @@ def schema_types(schema, root):
         members = node.get("anyOf", node.get("oneOf"))
         if isinstance(kind, (str, list)):
             kinds = [kind] if isinstance(kind, str) else kind
-            result = frozenset(item for item in kinds if isinstance(item, str))
-        elif isinstance(values, list):
+            named = frozenset(_json_type(item) for item in kinds)
+            result = None if None in named else named
+        elif values is not None:
             result = frozenset(
                 JSON_TYPES[type(value)] for value in values if type(value) in JSON_TYPES
             )
@@ -421,7 +526,7 @@ def schema_types(schema, root):
             result = _narrowed(result, read(member))
         return result
 
-    return read(schema)
+    return read
 
 
 def _literal_texts(schema, root):
@@ -445,7 +550,7 @@ def _literal_texts(schema, root):
         kind = node.get("type")
         kind = kind[0] if isinstance(kind, list) and len(kind) == 1 else kind
         members = node.get("anyOf", node.get("oneOf"))
-        if isinstance(values, list):
+        if values is not None:
             result = dict.fromkeys(
                 value
                 if isinstance(value, str)
@@ -480,6 +585,12 @@ def _literal_texts(schema, root):
     return None if result is None else list(result)
 
 
+def _definitions(schema):
+    """The $defs of `schema`; none where it holds no object there."""
+    definitions = schema.get("$defs") if isinstance(schema, dict) else None
+    return definitions if isinstance(definitions, dict) else {}
+
+
 def _schema_with_root(schema, root):
     def local_refs(value):
         for node in subschemas(value):
@@ -489,8 +600,7 @@ def _schema_with_root(schema, root):
 
     if next(local_refs(schema), None) is None:
         return schema
-    root_defs = root.get("$defs", {}) if isinstance(root, dict) else {}
-    schema_defs = schema.get("$defs", {}) if isinstance(schema, dict) else {}
+    root_defs, schema_defs = _definitions(root), _definitions(schema)
     name = "__splash_root"
     while name in root_defs or name in schema_defs:
         name += "_"
@@ -504,9 +614,7 @@ def _schema_with_root(schema, root):
         return output
 
     output = rebase(schema)
-    definitions = dict(output.get("$defs", {}))
-    definitions[name] = rebase(root)
-    output["$defs"] = definitions
+    output["$defs"] = {**_definitions(output), name: rebase(root)}
     return output
 
 
@@ -541,26 +649,36 @@ def _json_size(value, limit):
 
 def _keyword(node, key, kind, default):
     """The value of keyword `key` of `node`, which framing reads as a
-    `kind`. An older declared dialect leaves a newer keyword unchecked, so it
-    can hold anything; one of another kind is the client's schema error."""
+    `kind`; `default`, as if it were absent, where it holds another kind."""
     value = node.get(key, default)
-    if not isinstance(value, kind):
-        raise APIError(400, f"unsupported tool parameter schema: {key}")
-    return value
+    return value if isinstance(value, kind) else default
 
 
-def tool_argument_schema(root, budget):
-    """Project a tool's object fields for XML framing.
+def _charge(budget, size):
+    """Take `size` from what a framing budget has left, refusing what it
+    cannot hold."""
+    budget[0] -= size
+    if budget[0] < 0:
+        raise APIError(400, "tool parameter schemas are too complex")
+
+
+def _argument_shape(root, budget):
+    """Project a tool's object fields for XML framing: the properties, the
+    required names and the additionalProperties of its arguments, each value
+    a node of `root` or a combination of its nodes.
 
     The projection keeps every value a field may take rather than choosing a
     branch before the model has written the discriminator or dependent
     properties, so assertions across fields go unenforced.
-    """
 
-    def charge(size):
-        budget[0] -= size
-        if budget[0] < 0:
-            raise APIError(400, "tool parameter schemas are too complex")
+    A keyword can hold anything: an older declared dialect leaves a newer one
+    unchecked, a reference can reach data that is not a schema, and the
+    schema of a tool that is not strict is not checked. A keyword that holds
+    another kind of value than it takes constrains nothing, as one its
+    dialect does not define, and so do a value that is not a schema where
+    one belongs, a type name that stands for no JSON type (TYPE_NAMES), such
+    as Draft 3's "any", and a reference to nothing in the document.
+    """
 
     def combine(shapes, union=False):
         if union:
@@ -572,7 +690,7 @@ def tool_argument_schema(root, budget):
         if not shapes:
             return {"properties": {}, "required": [], "additionalProperties": True}
         names = dict.fromkeys(name for shape in shapes for name in shape["properties"])
-        charge(len(names) * len(shapes))
+        _charge(budget, len(names) * len(shapes))
         required = set(shapes[0]["required"])
         for shape in shapes[1:]:
             if union:
@@ -602,19 +720,25 @@ def tool_argument_schema(root, budget):
     def project(node, visiting):
         if node is False:
             return None
-        if node is True:
-            node = {}
         if not isinstance(node, dict):
-            raise APIError(400, "tool parameters must allow a JSON object")
-        kind = node.get("type", "object")
-        if kind != "object" and not (isinstance(kind, list) and "object" in kind):
+            # True constrains nothing, as does a value that is not a schema.
+            node = {}
+        kind = _keyword(node, "type", (str, list), "object")
+        names = [kind] if isinstance(kind, str) else kind
+        # A type allows no object only where it names JSON types alone, none
+        # of them object.
+        if all(_json_type(name) not in (None, "object") for name in names):
             return None
         properties = dict(_keyword(node, "properties", dict, {}))
         additional = node.get("additionalProperties", True)
         patterns = list(_keyword(node, "patternProperties", dict, {}).values())
         if patterns:
             additional = _schema_combination("anyOf", [additional, *patterns])
-        required = _keyword(node, "required", list, [])
+        required = [
+            name
+            for name in _keyword(node, "required", list, [])
+            if isinstance(name, str)
+        ]
         for name in required:
             properties.setdefault(name, additional)
         shape = {
@@ -623,19 +747,18 @@ def tool_argument_schema(root, budget):
             "additionalProperties": additional,
         }
         shapes = [shape]
-        ref = node.get("$ref")
+        ref = _keyword(node, "$ref", str, None)
         if ref is not None:
             if ref in visiting:
                 raise APIError(400, "cyclic direct tool argument reference")
             if ref not in references:
-                resolved = _lookup_tool_reference(ref, root)
-                references[ref] = project(resolved, visiting | {ref})
+                references[ref] = project(_referenced(node, root), visiting | {ref})
             shapes.append(references[ref])
         for child in _keyword(node, "allOf", list, []):
             shapes.append(project(child, visiting))
         for keyword in ("anyOf", "oneOf"):
-            if keyword in node:
-                children = _keyword(node, keyword, list, [])
+            children = _keyword(node, keyword, list, None)
+            if children is not None:
                 shapes.append(
                     combine([project(child, visiting) for child in children], True)
                 )
@@ -675,17 +798,26 @@ def tool_argument_schema(root, budget):
             )
         return combine(shapes)
 
-    def framed(value):
-        # Shared definitions repeat in the serialized grammar; count them all.
-        charge(_json_size(value, budget[0]))
-        framed_value = _schema_with_root(value, root)
-        if framed_value is not value:
-            charge(_json_size(root, budget[0]))
-        return framed_value
-
     shape = project(root, set())
     if shape is None:
         raise APIError(400, "tool parameters must allow a top-level JSON object")
+    return shape
+
+
+def tool_argument_schema(root, budget):
+    """A strict tool's arguments as its grammar generates them: their
+    projection (_argument_shape), each value made a schema of its own, with
+    a copy of the root schema where it refers to the root."""
+
+    def framed(value):
+        # Shared definitions repeat in the serialized grammar; count them all.
+        _charge(budget, _json_size(value, budget[0]))
+        framed_value = _schema_with_root(value, root)
+        if framed_value is not value:
+            _charge(budget, _json_size(root, budget[0]))
+        return framed_value
+
+    shape = _argument_shape(root, budget)
     shape["type"] = "object"
     shape["properties"] = {
         name: framed(value) for name, value in shape["properties"].items()
@@ -852,8 +984,9 @@ def normalize_response_format(value):
 
 
 def _check_tool_schema(name, schema):
-    """Refuse tool `name`'s schema if it nests too deep, refers to another
-    document or breaks its dialect's meta-schema."""
+    """Refuse strict tool `name`'s schema, from which its grammar is built, if
+    it nests too deep, refers to another document or breaks its dialect's
+    meta-schema."""
     _check_depth(schema, f"invalid tool schema for {name}")
     if ref := _remote_ref(schema):
         raise APIError(400, f"remote tool schema reference is not allowed: {ref}")
@@ -906,15 +1039,18 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
         strict = function.get("strict")
         if strict is not None and not isinstance(strict, bool):
             raise APIError(400, f"strict must be a boolean for tool {name}")
-        try:
+        if strict:
             _check_tool_schema(name, schema)
-        except APIError:
-            if strict:
-                raise
+        else:
             # Only a strict tool's grammar is built from its schema. Any
-            # other's still describes the tool, and its values convert as
-            # those of a parameter it does not declare.
-            schema = None
+            # other's gives the types its values convert by wherever it can
+            # be read, valid or not; one nested too deep to read only
+            # describes the tool, and its values convert as those of a
+            # parameter it does not declare.
+            try:
+                _check_depth(schema, f"invalid tool schema for {name}")
+            except APIError:
+                schema = None
         schemas[name] = schema
         if strict:
             marked.add(name)

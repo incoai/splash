@@ -14,17 +14,17 @@
 namespace splash::ops {
 namespace {
 
-// Matrices of whole 256-row tiles of whole 64-input spans; a decode step's
-// inputs are whole 256-input units.
+// Matrices of whole 64-row tiles (GGUF_TILE_COLUMNS) of whole 64-input spans,
+// whose K is a multiple of a 64-input span (or of its format's superblock).
 void validate(LinearWorkload w) {
-  if (!w.matrix.outputSize || w.matrix.outputSize % 256 || !w.matrix.inputSize || w.matrix.inputSize % 64)
+  if (!w.matrix.outputSize || w.matrix.outputSize % 64 || !w.matrix.inputSize || w.matrix.inputSize % 64)
     throw std::invalid_argument("invalid linear matrix");
   if (w.phase == LinearPhase::Prefill) {
     if (!w.rows || w.rows > SPLASH_PREFILL_TOKEN_BUDGET ||
         w.epilogue == LinearEpilogue::GateUp)
       throw std::invalid_argument("invalid linear prefill workload");
   } else {
-    if (w.matrix.inputSize % 256 || !w.rows || w.rows % SPLASH_TARGET_VERIFY_ROWS ||
+    if (!w.rows || w.rows % SPLASH_TARGET_VERIFY_ROWS ||
         w.rows > SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH ||
         w.epilogue == LinearEpilogue::UpWithGate)
       throw std::invalid_argument("invalid linear decode workload");
@@ -145,7 +145,7 @@ Linear::Linear(const DeviceCapabilities &device) noexcept
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
   const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, LinearPhase::Decode, LinearEpilogue::None};
   validate(w);
-  return LinearPlan(w, ggufBaseline(w, {}, shape.registerFormats)).storageRows();
+  return LinearPlan(w, ggufBaseline(w, {}, shape)).storageRows();
 }
 
 LinearPlan Linear::plan(LinearWorkload workload) const {
@@ -175,7 +175,8 @@ LinearScratchSize Linear::decodeScratchSize(ProjectionShape shape) const {
   LinearScratchSize bound;
   for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
-      bound.include(ggufDecodeScratchSize(decode({shape.outputSize, shape.inputSize}, lanes, epilogue)));
+      bound.include(
+          ggufDecodeScratchSize(decode({shape.outputSize, shape.inputSize}, lanes, epilogue), shape.registerFormats));
   // Decode plans store at most every lane's rows.
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, kMaximumDecodeTileRows);
   return bound;

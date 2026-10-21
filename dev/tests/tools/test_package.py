@@ -81,7 +81,7 @@ class PackageTests(unittest.TestCase):
                 ("install", package.INSTALL_FILES),
                 ("server", package.SERVER_FILES),
                 ("server/chat-assets", package.CHAT_ASSET_FILES),
-                ("build", ("splash", "splash.metallib")),
+                ("build", (*package.ENGINE_FILES, *package.OPTIONAL_ENGINE_FILES)),
             ):
                 (root / folder).mkdir(parents=True)
                 for name in names:
@@ -134,6 +134,10 @@ class PackageTests(unittest.TestCase):
                 {p.name for p in (stage / "server").iterdir()},
                 {*package.SERVER_FILES, "chat-assets"},
             )
+            self.assertEqual(
+                {p.name for p in (stage / "engine").iterdir()},
+                {*package.ENGINE_FILES, *package.OPTIONAL_ENGINE_FILES},
+            )
             assets = stage / "server/chat-assets"
             self.assertEqual(
                 {p.name for p in assets.iterdir()}, set(package.CHAT_ASSET_FILES)
@@ -149,6 +153,37 @@ class PackageTests(unittest.TestCase):
             self.assertFalse((stage / "install/model-catalog.json").exists())
             self.assertNotIn(
                 "catalog_sha256", json.loads((stage / "release.json").read_text())
+            )
+
+    def test_release_without_the_host_step_library_ships_the_engine(self):
+        # A Metal compiler that refuses host_step.metal leaves no
+        # host-step.metallib (Makefile); the release ships without it, and the
+        # engine runs awake host steps without the spin, with a warning
+        # (metal_backend_test.mm, hostStepSpinFallsBack).
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "source"
+            stage = Path(temporary) / "stage"
+            stage.mkdir()
+            for folder, names in (
+                ("install", package.INSTALL_FILES),
+                ("install/completions", package.COMPLETION_FILES),
+                ("server", package.SERVER_FILES),
+                ("server/chat-assets", package.CHAT_ASSET_FILES),
+                ("build", package.ENGINE_FILES),
+            ):
+                (root / folder).mkdir(parents=True, exist_ok=True)
+                for name in names:
+                    (root / folder / name).write_text("fixture")
+            for name in package.LICENSE_FILES:
+                (root / name).write_text("license")
+            with mock.patch.object(package, "ROOT", root):
+                package.stage_runtime(stage, "test")
+            self.assertEqual(
+                {p.name for p in (stage / "engine").iterdir()},
+                set(package.ENGINE_FILES),
+            )
+            self.assertEqual(
+                json.loads((stage / "release.json").read_text())["version"], "test"
             )
 
     def test_every_installer_module_ships(self):

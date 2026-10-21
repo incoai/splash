@@ -35,7 +35,7 @@ template <class F> struct Shape {
     // Linear codes past 127 (MLX affine 8-bit), which enter the MMA as the code itself: no bf16 128 + code holds them
     Wide = QuantWideCodes<F>::value,
     // Linear codes chained from the table's seed of their 16 inputs: s (code - zero) with a zero point (Q6_K, Q3_K,
-    // Q4_0, Q5_0, IQ1, PQ2_0), and Q2_K's min per 16 inputs
+    // Q4_0, Q5_0, IQ1, PQ2_0, Q2_0), and Q2_K's min per 16 inputs
     Seeded = Linear && (!HasMin || F::Group == 16),
     // bf16 bits of the operand of code 0: 128, or 160 - zero when seeded
     Operand = 0x4300 + (Seeded ? kZeroPointOffset - 128 - F::Zero : 0),
@@ -46,9 +46,12 @@ template <class F> struct Shape {
     J = 2 * UnitSpans * CG,                                   // coefficients per column and unit
   };
   // Each coefficient reads its own group's meta unit (coefficient_source), so a unit of two or four groups (MLX
-  // affine's 64 or 128 elements, PQ2_0's 128) splits a coefficient unit of four spans.
+  // affine's 64 or 128 elements, PQ2_0's 128, Q2_0's 64) splits a coefficient unit of four spans: such a format takes
+  // rows of whole 256 inputs here (quant_register_tensor).
   static_assert(F::MetaGroups == 8 || F::MetaGroups == 4 || F::MetaGroups == 2 || F::MetaGroups == 1,
                 "a meta unit is one, two, four or eight groups");
+  static_assert(UnitSpans * GGUF_TABLE16_SPAN_INPUTS == quant_register_unit(F::Id),
+                "the host splits K in the coefficient units of quant_register_unit");
   static_assert(!Wide || (HasMin && !Seeded), "wide codes have a min per 32 inputs");
 };
 template <class F> using Coef = metal::conditional_t<Shape<F>::HasMin != 0, float2, float>;
@@ -395,10 +398,11 @@ template <GgufEpilogue Ep>
 inline void gguf_sg_expert(device const bfloat *table, device const float *sums, device const MoeTileDescriptor *tiles,
                            device const uint *tile_count, device uchar *w0, device uchar *w1, device uchar *meta,
                            device uchar *sw0, device uchar *sw1, device uchar *smeta, device bfloat *out,
-                           device const bfloat *aux, constant MoeGgufExpertParams &p, uint2 tg, uint tid, uint sg,
-                           uint lane, threadgroup bfloat2 *lut, threadgroup float2 *coefs, threadgroup uint *arrival) {
+                           device const bfloat *aux, device const uint *slots, constant MoeGgufExpertParams &p,
+                           uint2 tg, uint tid, uint sg, uint lane, threadgroup bfloat2 *lut, threadgroup float2 *coefs,
+                           threadgroup uint *arrival) {
   if (tg.y >= *tile_count) return;
-  const MoeGgufSegment s = moe_gguf_segment(tiles[tg.y].expert, p, w0, w1, meta, sw0, sw1, smeta);
+  const MoeGgufSegment s = moe_gguf_segment(tiles[tg.y].expert, p, slots, w0, w1, meta, sw0, sw1, smeta);
   const uint K = p.input_size, N = p.output_size;
   const ulong rows = ulong(tg.y) * 8;
   const GgufDecodeParams q{K, 1, N, 0, 0};
@@ -417,14 +421,15 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
                    device uchar *w0 [[buffer(4)]], device uchar *w1 [[buffer(5)]], device uchar *meta [[buffer(6)]], \
                    device uchar *sw0 [[buffer(7)]], device uchar *sw1 [[buffer(8)]], device uchar *smeta [[buffer(9)]], \
                    device bfloat *out [[buffer(10)]], device const bfloat *aux [[buffer(11)]],                      \
-                   constant MoeGgufExpertParams &p [[buffer(12)]], uint2 tg [[threadgroup_position_in_grid]],       \
+                   device const uint *slots [[buffer(12)]], constant MoeGgufExpertParams &p [[buffer(13)]],         \
+                   uint2 tg [[threadgroup_position_in_grid]],                                                       \
                    uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],            \
                    uint lane [[thread_index_in_simdgroup]]) {                                                       \
     threadgroup bfloat2 lut[kQuantPairTableEntries];                                                                \
     threadgroup float2 coefs[gguf_sg::kCoefFloat2s];                                                                \
     threadgroup uint arrival;                                                                                       \
-    gguf_sg_expert<EP>(table, sums, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, out, aux, p, tg, tid, sg, lane, \
-                       lut, coefs, &arrival);                                                                       \
+    gguf_sg_expert<EP>(table, sums, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, out, aux, slots, p, tg, tid, sg, \
+                       lane, lut, coefs, &arrival);                                                                 \
   }
 GGUF_SG_EXPERT(moe_expert_gguf_sg_a, EpNone)
 GGUF_SG_EXPERT(moe_expert_gguf_sg_g, EpUpWithGate)

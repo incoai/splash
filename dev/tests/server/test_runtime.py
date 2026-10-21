@@ -355,6 +355,48 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result.completion_tokens, 3)
         self.assertEqual(result.reason, wire.FinishReason.LENGTH)
 
+    def test_bounded_length_done_ends_short_of_the_logical_max(self):
+        # A bound of the engine's own, the SSD cache's quota or the memory a
+        # lone lane could not grow past, ends a request before its logical
+        # maximum; a bounded end at that maximum breaks the protocol.
+        for completion, valid in ((2, True), (3, False)):
+            with self.subTest(completion=completion):
+                factory = FakeFactory()
+                runtime = engine_runtime.MultiplexedRuntime(
+                    process_factory=factory, eager_start=True
+                )
+                self.addCleanup(runtime.close)
+                process = factory.processes[0]
+                call = runtime.submit(request(15, logical_max_output_tokens=3))
+                process.send(wire.StartEvent(call.request_id, 0, 0))
+                process.send(
+                    wire.TokensEvent(
+                        call.request_id, 0, tuple(range(20, 20 + completion))
+                    )
+                )
+                process.send(
+                    wire.DoneEvent(
+                        call.request_id,
+                        wire.FinishReason.LENGTH,
+                        2,
+                        completion,
+                        10,
+                        20,
+                        30,
+                        (),
+                        bounded=True,
+                    )
+                )
+                if valid:
+                    result = call.result(1.0)
+                    self.assertTrue(result.bounded)
+                    self.assertEqual(result.completion_tokens, completion)
+                else:
+                    with self.assertRaisesRegex(
+                        engine_runtime.ProtocolFatal, "fewer than logical maximum 3"
+                    ):
+                        call.result(1.0)
+
     def test_stop_done_at_logical_max_is_valid(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(

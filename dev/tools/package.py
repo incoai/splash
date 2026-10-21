@@ -29,6 +29,7 @@ INSTALL_FILES = (
     "families.py",
     "assembly.py",
     "upstream.py",
+    "local.py",
     "gguf.py",
     "requirements.txt",
 )
@@ -80,6 +81,12 @@ CHAT_ASSET_FILES = (
 )
 # Splash's license and the notices of the third-party code it ships.
 LICENSE_FILES = ("LICENSE", "THIRD_PARTY_NOTICES")
+# The engine's files in build/, and the host-step spin's library beside them
+# when the build has one: a Metal compiler that refuses its kernel leaves none
+# (Makefile, HOST_STEP_LIB), and the engine then runs awake host steps without
+# the spin.
+ENGINE_FILES = ("splash", "splash.metallib")
+OPTIONAL_ENGINE_FILES = ("host-step.metallib",)
 
 
 def digest(path):
@@ -93,12 +100,15 @@ def stage_runtime(destination, version):
         ("install/completions", COMPLETION_FILES),
         ("server", SERVER_FILES),
         ("server/chat-assets", CHAT_ASSET_FILES),
-        ("engine", ("splash", "splash.metallib")),
+        ("engine", ENGINE_FILES),
     ):
         (destination / folder).mkdir()
         source = ROOT / ("build" if folder == "engine" else folder)
         for name in names:
             shutil.copy2(source / name, destination / folder / name)
+    for name in OPTIONAL_ENGINE_FILES:
+        if (ROOT / "build" / name).exists():
+            shutil.copy2(ROOT / "build" / name, destination / "engine" / name)
     for name in LICENSE_FILES:
         shutil.copy2(ROOT / name, destination / name)
     (destination / "release.json").write_text(

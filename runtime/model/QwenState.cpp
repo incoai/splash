@@ -92,6 +92,25 @@ private:
 
 } // namespace
 
+GdnParityBuffers gdnCellBuffers(metal::MetalBackend &backend, metal::MetalBuffer base, const GdnStateLayout &layout) {
+  if (base.sizeBytes() < layout.cellBytes()) throw std::invalid_argument("a GDN cell is larger than its buffer");
+  GdnParityBuffers cell;
+  cell.stateBase = std::move(base);
+  cell.convolutionLayers.resize(layout.layers);
+  cell.recurrentLayers.resize(layout.layers);
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    cell.convolutionLayers[layer] = backend.view(cell.stateBase, uint64_t{layer} * layout.convolutionLayerBytes(),
+                                                 layout.convolutionLayerBytes());
+    cell.recurrentLayers[layer] =
+        backend.view(cell.stateBase, layout.convolutionBytes() + uint64_t{layer} * layout.recurrentLayerBytes(),
+                     layout.recurrentLayerBytes());
+  }
+  if (layout.auxiliaryBytes)
+    cell.auxiliary = backend.view(cell.stateBase, layout.convolutionBytes() + layout.recurrentBytes(),
+                                  layout.auxiliaryBytes);
+  return cell;
+}
+
 QwenGdnCell::QwenGdnCell(metal::MetalBackend &backend,
                          std::shared_ptr<StateAllocationTracker> tracker,
                          GdnStateLayout layout, std::string_view label)
@@ -101,23 +120,8 @@ QwenGdnCell::QwenGdnCell(metal::MetalBackend &backend,
   if (!layout.valid())
     throw std::invalid_argument("Qwen GDN state layout is invalid");
   const uint64_t before = backend.memoryStats().allocatedBytes;
-  buffers_.stateBase = backend.allocateBuffer(
-      layout.cellBytes(), metal::BufferStorage::Shared, label);
-  // The cell holds every layer's convolution state, then every layer's
-  // recurrent state.
-  buffers_.convolutionLayers.resize(layout.layers);
-  buffers_.recurrentLayers.resize(layout.layers);
-  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    buffers_.convolutionLayers[layer] =
-        backend.view(buffers_.stateBase,
-                     uint64_t{layer} * layout.convolutionLayerBytes(),
-                     layout.convolutionLayerBytes());
-    buffers_.recurrentLayers[layer] = backend.view(
-        buffers_.stateBase,
-        layout.convolutionBytes() +
-            uint64_t{layer} * layout.recurrentLayerBytes(),
-        layout.recurrentLayerBytes());
-  }
+  buffers_ = gdnCellBuffers(backend, backend.allocateBuffer(layout.cellBytes(), metal::BufferStorage::Shared, label),
+                            layout);
   actualAllocatedBytes_ =
       metal::allocationDelta(before, backend.memoryStats().allocatedBytes);
   if (actualAllocatedBytes_ < layout.cellBytes()) {
@@ -420,16 +424,19 @@ QwenStateStorage::snapshot(uint32_t index, QwenLogicalLengths lengths) {
   // Before anything is allocated; copyState() and seal() check again.
   requireCommitted(lane(index));
   validateLengths(lengths, true);
-  const std::shared_ptr<QwenStateReservation> reservation = reserve();
+  metal::AllocationFailure refusal;
+  const std::shared_ptr<QwenStateReservation> reservation = reserve(refusal);
   if (!reservation)
     return nullptr;
   copyState(index, *reservation);
   return seal(*reservation, lengths);
 }
 
-std::shared_ptr<QwenStateReservation> QwenStateStorage::reserve() {
+std::shared_ptr<QwenStateReservation>
+QwenStateStorage::reserve(metal::AllocationFailure &refusal) {
   Buffers buffers;
-  if (!acquire(1, false, "qwen-state-cache", buffers))
+  refusal = acquire(1, false, "qwen-state-cache", buffers).failure;
+  if (refusal != metal::AllocationFailure::None)
     return nullptr;
   return std::shared_ptr<QwenStateReservation>(new QwenStateReservation(
       pool_, {std::move(buffers.gdn[0]), std::move(buffers.window)}));

@@ -4,6 +4,8 @@
 #include "Model.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
+#include "Qwen4Exp.hpp"
+#include "RopeScaling.hpp"
 #include "ops/Vision.hpp"
 
 #include <cstdint>
@@ -15,7 +17,7 @@
 
 namespace splash::model {
 
-using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout>;
+using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout, Qwen4ExpLayout>;
 
 // Where a model's weights come from: a safetensors checkpoint (MLX's, Model
 // Optimizer's or compressed-tensors') or a GGUF, prepared into images when it
@@ -43,6 +45,9 @@ struct ModelDescriptor final {
   // (inspectModelRoot): what every image is written from
   // (WeightFileRecord).
   std::string sourceIdentity;
+  // The target's RoPE scaling (servedFor), which stretches the window
+  // capabilities states beyond the layout's native one.
+  RopeScaling ropeScaling;
 
   // A model installed with --language-only has no vision tower: it loads no
   // vision weights and serves no image requests.
@@ -65,6 +70,13 @@ struct ModelDescriptor final {
                                                   VisionSource visionSource);
 [[nodiscard]] ModelDescriptor
 inspectModelRoot(const std::filesystem::path &root);
+// `model` served for a context of `contextTokens`, zero for auto: as it is
+// within its native window, and past it with YaRN by the context over the
+// native window (RopeScaling), whose window is that context
+// (QwenTargetDimensions::servedContextTokens). std::invalid_argument past
+// the family's YaRN window, or the native one of a family YaRN does not
+// serve, or for a model that is already scaled.
+[[nodiscard]] ModelDescriptor servedFor(ModelDescriptor model, uint32_t contextTokens);
 
 // The family of an upstream model's configuration, checked by the rules
 // inspectModelRoot holds its assembly to: config, the target's config.json

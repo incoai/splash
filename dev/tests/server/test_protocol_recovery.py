@@ -1,6 +1,7 @@
 import copy
 import json
 import unittest
+from contextlib import nullcontext
 from itertools import product
 from unittest import mock
 
@@ -359,7 +360,9 @@ class ProtocolRecoveryTests(unittest.TestCase):
             {"role": "tool", "tool_call_id": "interrupted", "content": "interrupted"},
         ]
         original = copy.deepcopy(source)
-        normalized = normalize_messages(source, vision=True, deadline=FOREVER)
+        normalized = normalize_messages(
+            source, vision=True, deadline=FOREVER, without_slot=nullcontext
+        )
         projected = template_messages(normalized)
         self.assertEqual(source, original)
         self.assertEqual(

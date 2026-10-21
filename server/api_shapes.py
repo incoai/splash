@@ -119,8 +119,11 @@ def _call_arguments(arguments):
     return arguments if isinstance(arguments, dict) else json_codec.dumps(arguments)
 
 
-def normalize_messages(messages, *, vision, deadline):
-    document_budget = DocumentBudget(deadline=deadline)
+def normalize_messages(messages, *, vision, deadline, without_slot):
+    """`messages` checked and in canonical form, each PDF rendered to its
+    pages under `without_slot`, which gives a request in preparation its
+    slot back meanwhile."""
+    document_budget = DocumentBudget(deadline=deadline, without_slot=without_slot)
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "messages must be a non-empty array")
     normalized = []
@@ -1206,8 +1209,9 @@ def anthropic_stop(result, called, output_clamped_to_context):
         return "tool_use"
     if result.reason == "length":
         # Anthropic's reason when the context window, not max_tokens, ends
-        # the response.
-        if output_clamped_to_context:
+        # the response: max_tokens was lowered to what the context leaves, or
+        # the engine ended it at what it holds of the context.
+        if output_clamped_to_context or result.bounded:
             return "model_context_window_exceeded"
         return "max_tokens"
     if result.stop_sequence is not None:

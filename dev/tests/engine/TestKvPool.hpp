@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <thread>
@@ -15,48 +16,55 @@
 namespace splash::test {
 
 // Extents of extentPages pages, none allocated until the pool allocates
-// them (its runway first), as PageStorage. Growth is refused with
-// allocationFailure (EngineBudget, the governor's cause, unless a test
-// names another) past budgetPages allocated pages, while growthBlocked,
-// or when growthAllowed(extent) says no; a budget-limited pool needs more
-// page ids than its budget, as production's has. A release or a copy
-// throws std::logic_error while commandInFlight() says a command is in
-// flight, as PageStorage's does. Every page holds one value, which a test
-// sets, a copy carries and a clear zeroes, so a test can follow the content
-// of pages the pool moves.
+// them (its runway first), as PageStorage, of bytesPerPage bytes a Full page
+// and indexBytesPerPage an Index page; without index bytes, every page is
+// Full. Growth is refused with allocationFailure (EngineBudget, the
+// governor's cause, unless a test names another) past the bytes of
+// budgetPages Full pages, while growthBlocked, or when growthAllowed(extent)
+// says no; a budget-limited pool needs more page ids than its budget, as
+// production's has. A release or a copy throws std::logic_error while
+// commandInFlight() says a command is in flight, as PageStorage's does.
+// Every page holds one value, which a test sets, a copy carries (between
+// forms too, as the page's index) and a clear zeroes, so a test can follow
+// the content of pages the pool moves.
 class TestKvStorage final : public kv::ExtentStorage {
 public:
-    TestKvStorage(uint32_t pages, uint64_t bytesPerPage, uint32_t extentPages)
+    TestKvStorage(uint32_t pages, uint64_t bytesPerPage, uint32_t extentPages,
+                  uint64_t indexBytesPerPage = 0)
         : content(pages), pageCount_(pages), bytesPerPage_(bytesPerPage),
-          extentPages_(extentPages) {
+          indexBytesPerPage_(indexBytesPerPage), extentPages_(extentPages) {
         if (!pages || !bytesPerPage || !extentPages || pages % extentPages) {
             throw std::invalid_argument("invalid test KV extent storage");
         }
-        allocated_.resize(pages / extentPages);
+        forms_.resize(pages / extentPages);
     }
 
     uint32_t pageCount() const noexcept override { return pageCount_; }
-    uint64_t bytesPerPage() const noexcept override { return bytesPerPage_; }
+    uint64_t bytesPerPage(kv::PageForm form) const noexcept override {
+        return form == kv::PageForm::Full ? bytesPerPage_ : indexBytesPerPage_;
+    }
     uint32_t extentPages() const noexcept override { return extentPages_; }
-    metal::AllocationResult allocateExtent(uint32_t extent) override {
+    metal::AllocationResult allocateExtent(uint32_t extent, kv::PageForm form) override {
         ++allocationAttempts;
-        if (allocated_.at(extent))
+        if (forms_.at(extent))
             throw std::logic_error("test KV extent is already allocated");
+        if (form == kv::PageForm::Index && !indexBytesPerPage_)
+            throw std::invalid_argument("test KV pages without an index are all Full");
         if (growthBlocked || (growthAllowed && !growthAllowed(extent)) ||
-            uint64_t{allocatedPages()} + extentPages_ > budgetPages) {
+            allocatedBytes() + extentPages_ * bytesPerPage(form) > budgetPages * bytesPerPage_) {
             return allocationFailure;
         }
-        allocated_[extent] = true;
+        forms_[extent] = form;
         return {};
     }
     void releaseExtent(uint32_t extent) override {
-        if (!allocated_.at(extent))
+        if (!forms_.at(extent))
             throw std::logic_error("test KV extent is not allocated");
         if (commandInFlight && commandInFlight()) {
             throw std::logic_error(
                 "cannot release a KV extent while a command is in flight");
         }
-        allocated_[extent] = false;
+        forms_[extent].reset();
         const auto start = std::chrono::steady_clock::now();
         std::this_thread::sleep_for(releaseTime);
         const double milliseconds = std::chrono::duration<double, std::milli>(
@@ -79,7 +87,7 @@ public:
     }
     void clearPages(std::span<const uint32_t> pages) override {
         for (uint32_t page : pages) {
-            if (!allocated_.at(page / extentPages_)) {
+            if (!forms_.at(page / extentPages_)) {
                 throw std::logic_error(
                     "cannot clear a KV page of an extent that is not allocated");
             }
@@ -91,12 +99,18 @@ public:
     }
 
     [[nodiscard]] bool allocated(uint32_t extent) const {
-        return allocated_.at(extent);
+        return forms_.at(extent).has_value();
     }
     [[nodiscard]] uint32_t allocatedPages() const noexcept {
         uint32_t extents = 0;
-        for (bool allocated : allocated_) extents += allocated;
+        for (const auto &form : forms_) extents += form.has_value();
         return extents * extentPages_;
+    }
+    [[nodiscard]] uint64_t allocatedBytes() const noexcept {
+        uint64_t bytes = 0;
+        for (const auto &form : forms_)
+            if (form) bytes += extentPages_ * bytesPerPage(*form);
+        return bytes;
     }
 
     uint32_t budgetPages = std::numeric_limits<uint32_t>::max();
@@ -121,8 +135,10 @@ public:
 private:
     uint32_t pageCount_ = 0;
     uint64_t bytesPerPage_ = 0;
+    uint64_t indexBytesPerPage_ = 0;
     uint32_t extentPages_ = 0;
-    std::vector<bool> allocated_;
+    // The form of each allocated extent.
+    std::vector<std::optional<kv::PageForm>> forms_;
 };
 
 }  // namespace splash::test

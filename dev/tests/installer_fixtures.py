@@ -1,8 +1,8 @@
-"""What the installer tests share: model and draft repositories, selections,
-Hub errors, FakeHub, the stand-in for the Hugging Face Hub that the upstream
-and GGUF tests install from, and link_assembly, what an installation leaves
-for serve. The installer checks a model's configuration with the engine,
-build/splash, which make test-python builds."""
+"""What the installer tests share: model and draft repositories, GGUF
+headers, selections, Hub errors, and FakeHub, the stand-in for the Hugging
+Face Hub that the upstream and GGUF tests install from. The installer checks
+a model's configuration with the engine, build/splash, which make
+test-python builds."""
 
 import hashlib
 import json
@@ -14,15 +14,21 @@ from unittest import mock
 import httpx
 from huggingface_hub.errors import HfHubHTTPError
 from huggingface_hub.hf_api import RepoSibling
+from tokenizers import pre_tokenizers
 
-from install import families, hub, models
+from dev.tests import fixture_files
+from install import families, gguf, hub, models
 
 DENSE = families.named("Qwen3.8-27B")
 MOE = families.named("Qwen3.6-35B-A3B")
+FLASH_NEXT = families.named("Qwen3.8-Flash-Next")
+# The families whose targets the engine loads from a GGUF only.
+GGUF_ONLY = (FLASH_NEXT,)
 MODEL = "mlx-community/Qwen3.8-27B-4bit"
-# An MLX config.json, a DFlash2 draft config and the scalar metadata of a
-# GGUF (gguf.scalar_metadata) built like each family's, in its lower-case
-# name, which the native configuration test reads too.
+# An MLX config.json (of a GGUF_ONLY family, the one the installer derives
+# from its GGUF), a DFlash2 draft config and the scalar metadata of a GGUF
+# (gguf.scalar_metadata) built like each family's, in its lower-case name,
+# which the native configuration test reads too.
 CONFIGS = Path(__file__).resolve().parent / "fixtures" / "model-configs"
 # The commit the main branch of every family's draft repository names.
 DRAFT_COMMIT = "d" * 40
@@ -70,6 +76,109 @@ def draft_dir(root, family, **changes):
     return root
 
 
+# The GGUF specification's token types (llama_token_type), stated
+# independently of the reader under test.
+NORMAL, UNKNOWN, CONTROL, USER_DEFINED, UNUSED, BYTE = 1, 2, 3, 4, 5, 6
+# GGML tensor types (ggml_type), stated independently of gguf.TENSOR_TYPES.
+GGML = {
+    "F32": 0,
+    "F16": 1,
+    "Q5_0": 6,
+    "Q5_1": 7,
+    "Q8_0": 8,
+    "Q2_K": 10,
+    "Q4_K": 12,
+    "IQ2_XXS": 16,
+    "IQ3_XXS": 18,
+    "IQ4_XS": 23,
+    "IQ1_M": 29,
+    "BF16": 30,
+    "TQ2_0": 35,
+    "MXFP4": 39,
+    "NVFP4": 40,
+    "Q2_0": 42,
+    "PQ2_0": 142,
+}
+# The arrays of a Qwen3.8-Flash-Next header, which its gguf-metadata.json
+# leaves out as scalar_metadata does: each layer's QSA compress ratio, a
+# 4-token block for each full-attention layer (every fourth) and 0 for each
+# GDN one, and the one layer its PLE n-gram embedding feeds.
+FLASH_NEXT_ARRAYS = {
+    "qwen4exp.attention.compress_ratios": [
+        4 if layer % 4 == 3 else 0 for layer in range(48)
+    ],
+    "qwen4exp.ple.layers": [1],
+}
+
+
+def write_gguf(path, values, tensors=()):
+    """A GGUF header of the values and the tensors' (name, GGML type), each
+    tensor 256 values without data: the metadata reader reads no more."""
+    table = [(name, [256], kind, b"") for name, kind in tensors]
+    return fixture_files.write_gguf(path, values, table)
+
+
+def fixture(*, native=False, family=MOE):
+    """A GGUF's metadata of family's (Qwen3.6-35B-A3B's by default): its
+    architecture's, as the native configuration test reads it too, with
+    FLASH_NEXT_ARRAYS for Qwen3.8-Flash-Next, and a tokenizer's, native=True
+    of the family's vocabulary size."""
+    tokens = sorted(pre_tokenizers.ByteLevel.alphabet())
+    tokens += ["ab", "<|endoftext|>", "<|im_end|>", "<think>", "<|im_start|>"]
+    types = [NORMAL] * 257 + [CONTROL, CONTROL, USER_DEFINED, CONTROL]
+    if native:
+        padding = 248320 - len(tokens)
+        tokens += [f"[unused{i}]" for i in range(padding)]
+        types += [UNUSED] * padding
+    typed = family_config(family, "gguf-metadata.json")
+    return (
+        typed["unsigned"]
+        | typed["float"]
+        | typed["string"]
+        | (FLASH_NEXT_ARRAYS if family == FLASH_NEXT else {})
+        | {
+            "tokenizer.ggml.model": "gpt2",
+            "tokenizer.ggml.pre": "qwen35",
+            "tokenizer.ggml.tokens": tokens,
+            "tokenizer.ggml.token_type": types,
+            "tokenizer.ggml.merges": ["a b"],
+            "tokenizer.ggml.eos_token_id": 258,
+            "tokenizer.ggml.bos_token_id": 257,
+            "tokenizer.ggml.padding_token_id": 257,
+            "tokenizer.chat_template": "{% for message in messages %}{{ message.content }}<|im_end|>{% endfor %}",
+        }
+    )
+
+
+def loadable_tensors(values, directory):
+    """A tensor table the native loader accepts for the header values: each
+    tensor it reads, quantized as Q4_K or F32."""
+    header = gguf.Metadata(write_gguf(directory / "header.gguf", values))
+    return {
+        name: GGML[next(t for t in ("Q4_K", "F32") if t in types)]
+        for name, types in gguf.loaded_tensors(header).items()
+    }
+
+
+def vision_fixture():
+    return {
+        "general.architecture": "clip",
+        "clip.projector_type": "qwen3vl_merger",
+        "clip.use_gelu": True,
+        "clip.vision.block_count": 27,
+        "clip.vision.embedding_length": 1152,
+        "clip.vision.attention.head_count": 16,
+        "clip.vision.feed_forward_length": 4304,
+        "clip.vision.projection_dim": 2048,
+        "clip.vision.patch_size": 16,
+        "clip.vision.spatial_merge_size": 2,
+        "clip.vision.image_size": 768,
+        "clip.vision.is_deepstack_layers": [False] * 27,
+        "clip.vision.image_mean": [0.5] * 3,
+        "clip.vision.image_std": [0.5] * 3,
+    }
+
+
 def selection(root, model=MODEL, **options):
     """model's selection under root/models, text only unless options say."""
     return models.Selection.of(
@@ -79,18 +188,6 @@ def selection(root, model=MODEL, **options):
         language_only=options.get("language_only", True),
         draft_model=options.get("draft_model"),
     )
-
-
-def link_assembly(selection):
-    """What an installation leaves for serve to hold, in a test that stubs
-    the installation: the selection's link to an assembly under its models
-    root."""
-    assembly = selection.models_root / ".resolved" / "assembly"
-    assembly.mkdir(parents=True, exist_ok=True)
-    (assembly / "model.json").write_text("{}")
-    if not selection.link.is_symlink():
-        selection.link.parent.mkdir(parents=True, exist_ok=True)
-        selection.link.symlink_to(assembly, target_is_directory=True)
 
 
 def http_error(status):
@@ -194,12 +291,15 @@ class FakeHub:
 
 
 def fake_hub(test, cache, *, target=DENSE, commit="a" * 40):
-    """A FakeHub publishing MODEL at commit on main and every family's
-    draft repository at DRAFT_COMMIT on main."""
+    """A FakeHub publishing MODEL at commit on main and the DFlash2 draft
+    released for each family at DRAFT_COMMIT on main."""
     fake = FakeHub(test, cache)
     fake.publish(MODEL, commit, lambda p: mlx_target(p, target))
     for family in families.FAMILIES:
-        fake.publish(family.draft_repo, DRAFT_COMMIT, lambda p: draft_dir(p, family))
+        if family.draft_repo:
+            fake.publish(
+                family.draft_repo, DRAFT_COMMIT, lambda p: draft_dir(p, family)
+            )
     return fake
 
 

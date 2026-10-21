@@ -1,4 +1,7 @@
 #include "TestChecks.hpp"
+#include "TestDrafts.hpp"
+#include "TestModel.hpp"
+#include "model/ModelDescriptor.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/QwenTargetLoader.hpp"
 #include "model/RuntimeArenas.hpp"
@@ -7,8 +10,10 @@
 
 #include <algorithm>
 #include <array>
+#include <initializer_list>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -20,16 +25,29 @@ using splash::test::rejects;
 using splash::test::require;
 
 template <class Weights>
+model::DFlashDraftLayout draftOf() {
+  if constexpr (std::is_same_v<Weights, model::Qwen3_6MoeWeights>)
+    return test::qwen3_6MoeDraft();
+  else if constexpr (std::is_same_v<Weights, model::Qwen4ExpWeights>)
+    return test::flashNextDraft();
+  else
+    return test::qwen3_8Draft();
+}
+
+template <class Weights>
 model::LoadedModel loadedModel() {
   model::LoadedModel result;
   Weights target;
-  const model::DFlashDraftLayout draft = std::is_same_v<Weights, model::Qwen3_6MoeWeights>
-                                             ? model::kQwen3_6MoeDraftLayout
-                                             : model::kQwen3_8DraftLayout;
+  const model::DFlashDraftLayout draft = draftOf<Weights>();
   const auto projection = [](uint32_t n, uint32_t k) {
     return ops::Projection(n, k, ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_Q4K, n, k, {}, {}, {})}});
   };
   const auto &layout = target.layout;
+  // Qwen3.8-Flash-Next's hyper-connection mixes, QSA indexers and PLE layer.
+  const auto hyper = [&] {
+    return model::Qwen4HyperWeights{.norm = {}, .down = projection(layout.hyperRank, layout.streamWidth()),
+                                    .up = projection(layout.streamWidth(), layout.hyperRank), .inject = {}};
+  };
   target.logitsProjection = projection(layout.vocabularySize, layout.hiddenSize);
   target.layers.resize(layout.layers);
   for (uint32_t i = 0; i < layout.layers; ++i) {
@@ -50,7 +68,22 @@ model::LoadedModel loadedModel() {
       layer.upProjection = layer.gateProjection;
       layer.downProjection = projection(layout.hiddenSize, layout.intermediateSize);
     }
+    if constexpr (std::is_same_v<Weights, model::Qwen4ExpWeights>) {
+      layer.mixerHyper = hyper();
+      layer.ffnHyper = hyper();
+      if (layout.isFullAttentionLayer(i))
+        layer.indexer = model::Qwen4IndexerWeights{
+            .query = projection(layout.indexerHeads * layout.indexerHeadDimension, layout.hiddenSize),
+            .key = projection(layout.indexerHeadDimension, layout.hiddenSize), .queryNorm = {}, .keyNorm = {}};
+      if (i == layout.pleLayer)
+        layer.ple = model::Qwen4PleWeights{.key = projection(layout.hiddenSize, layout.pleWidth()),
+                                           .value = projection(layout.hiddenSize, layout.pleWidth()),
+                                           .keyNorm = {}, .queryNorm = {}, .convolutionNorm = {},
+                                           .convolution = {}};
+    }
   }
+  if constexpr (std::is_same_v<Weights, model::Qwen4ExpWeights>)
+    target.finalHyper = hyper();
   ops::VisionLayout vision;
   vision.outputHiddenSize = target.layout.hiddenSize;
   result.descriptor = model::makeModelDescriptor(
@@ -73,7 +106,7 @@ void checkGateUpLayers() {
   target.layers.front().upProjection = ops::Projection(
       up.outputSize, up.inputSize + 256,
       ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_Q4K, up.outputSize, up.inputSize + 256, {}, {}, {})}});
-  rejects([&] { static_cast<void>(model::qwenTargetGeometry(target)); },
+  rejects([&] { static_cast<void>(model::qwenTargetGeometry(target, dense.draft.layout.targetLayerIds())); },
           "fused gate/up projections must have matching shapes", "mismatched fused gate/up shapes reached execution");
   target.layers.front().upProjection = up;
   // The last layer's gate in F16 and its up in Q8_0.
@@ -144,7 +177,7 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
       {d.dynamicSize, d.hiddenSize}, {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
       {d.hiddenSize, d.attentionSize},
       {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
-      {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize}};
+      {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize()}};
   for (const auto &p : geometry.target.decodeProjections) matrices.push_back({p.outputSize, p.inputSize});
   for (uint32_t family : {9U, 10U, 11U})
     for (uint32_t cores : {12U, 20U, 40U}) {
@@ -166,6 +199,70 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
     }
 }
 
+// A model served with YaRN reaches the runtime's geometry with its scaling
+// and the window it serves, which everything sized by the context follows; a
+// descriptor whose window is not the one its scaling serves is refused.
+void checkYarnGeometry() {
+  auto loaded = loadedModel<model::Qwen3_6MoeWeights>();
+  loaded.descriptor = model::servedFor(std::move(loaded.descriptor), 524'288);
+  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  require(geometry.target.ropeScaling == loaded.descriptor.ropeScaling &&
+              geometry.target.contextTokens() == 524'288 && geometry.target.nativeContextTokens == 262'144,
+          "the runtime's geometry does not serve YaRN's window");
+  loaded.descriptor.capabilities.maximumContextTokens = 262'144;
+  rejects([&] {
+    static_cast<void>(model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32));
+  }, "invalid model runtime geometry", "a geometry serving another window than the model's was accepted");
+}
+
+// A decode tensor's bytes per lane in a runtime of `geometry`, on an M5's
+// plans.
+uint64_t decodeBytes(const model::RuntimeGeometry &geometry, model::DecodeTensor tensor) {
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  return model::decodeTensorBytes(geometry, ops::ExecutionPlans(device))[static_cast<uint32_t>(tensor)];
+}
+
+// A block-sparse target selects its blocks through index tables of their
+// own, a lane's beside its page table (kv::PageStorage::writeIndexEntries);
+// a target without a block index has none, and its arenas are as they were.
+void checkIndexTables() {
+  const auto geometry = [](const model::LoadedModel &loaded) {
+    return model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  };
+  require(decodeBytes(geometry(loadedModel<model::Qwen4ExpWeights>()), model::DecodeTensor::IndexTable) ==
+                  model::kMaximumPageTableEntries * sizeof(SplashKvPage) &&
+              !decodeBytes(geometry(loadedModel<model::Qwen3_8Weights>()), model::DecodeTensor::IndexTable) &&
+              !decodeBytes(geometry(loadedModel<model::Qwen3_6MoeWeights>()), model::DecodeTensor::IndexTable),
+          "a lane's index table is not its block index's alone");
+}
+
+// A runtime whose K/V spills (one given the readers of spilled K/V,
+// model::RuntimeContext) runs its prefill commands as groups, which read an
+// attention layer's spilled history once each, and its decode arena holds
+// where its verify's listed blocks are: a lane's list, 8 rows of 512 blocks
+// and the block of each row's tail. The K/V of a target without a block
+// index cannot spill.
+void checkSpilledKvGeometry() {
+  const auto flash = loadedModel<model::Qwen4ExpWeights>();
+  const auto resident = model::RuntimeGeometry::from(flash, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  const auto spilled = model::RuntimeGeometry::from(flash, kv::Format::Int8, ops::GdnStateFormat::Float32,
+                                                    model::StreamedParts::loaded(flash, true));
+  require(resident.prefillChunks == 1 && !resident.spilledKv &&
+              spilled.prefillChunks == model::kPrefillGroupChunks && spilled.spilledKv == test::sparseKvShape(),
+          "a runtime's prefill groups do not follow whether its K/V spills");
+  require(!decodeBytes(resident, model::DecodeTensor::Locations) &&
+              decodeBytes(spilled, model::DecodeTensor::Locations) == uint64_t{8} * (512 + 1) * sizeof(uint32_t),
+          "a runtime's decode arena does not hold its spilled blocks' locations exactly when its K/V spills");
+  for (const model::LoadedModel &loaded :
+       {loadedModel<model::Qwen3_8Weights>(), loadedModel<model::Qwen3_6MoeWeights>()})
+    rejects([&] {
+      static_cast<void>(model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32,
+                                                     model::StreamedParts::loaded(loaded, true)));
+    }, "invalid model runtime geometry", "the K/V of a target without a block index was let spill");
+}
+
 // Arenas are sized from the projections the weights hold, so each must have
 // sizes; an empty one would drop its workspace from the bound silently.
 void checkUnsizedProjection() {
@@ -174,6 +271,20 @@ void checkUnsizedProjection() {
   rejects([&] {
     static_cast<void>(model::RuntimeGeometry::from(broken, kv::Format::Int8, ops::GdnStateFormat::Float32));
   }, "invalid model runtime geometry", "a target projection without sizes reached arena sizing");
+}
+
+// The target layers the draft reads are the target's, ascending: arena
+// sizing refuses a draft reading past the last one or one twice.
+void checkCaptureLayers() {
+  const auto refuses = [](uint32_t index, uint32_t layer, const std::string &what) {
+    auto model = loadedModel<model::Qwen3_8Weights>();
+    model.draft.layout.targetLayers[index] = layer;
+    rejects([&] {
+      static_cast<void>(model::RuntimeGeometry::from(model, kv::Format::Int8, ops::GdnStateFormat::Float32));
+    }, "invalid model runtime geometry", what + " reached arena sizing");
+  };
+  refuses(4, 64, "a draft reading past the target's last layer");
+  refuses(1, 5, "a draft reading a layer twice");
 }
 
 // The GDN value rows are sized with attentionWidth, so a layout whose value
@@ -200,17 +311,14 @@ void checkGdnWidths() {
   withoutGates.packedGdnWidth = shipped.convolutionDimension + shipped.attentionWidth;
   rejects([&] { sizeArenas(withoutGates); }, "invalid model runtime geometry",
           "packed GDN rows without the gates reached arena sizing");
-  // The dense layout is checked like the sparse one: its capture layers and
-  // its convolution width against its GDN heads.
+  // The dense layout is checked like the sparse one: its convolution width
+  // against its GDN heads.
   const model::Qwen3_8Layout dense;
   model::requireQwenLayout(dense);
-  auto capturePastLastLayer = dense;
-  capturePastLastLayer.hiddenCaptureLayers.back() = dense.layers;
   auto convolutionMismatch = dense;
   convolutionMismatch.convolutionDimension += dense.gdnHeadDimension;
-  for (const model::Qwen3_8Layout &broken : {capturePastLastLayer, convolutionMismatch})
-    rejects([&] { model::requireQwenLayout(broken); }, "Qwen target layout is inconsistent",
-            "an inconsistent dense layout was accepted");
+  rejects([&] { model::requireQwenLayout(convolutionMismatch); }, "Qwen target layout is inconsistent",
+          "an inconsistent dense layout was accepted");
 }
 
 } // namespace
@@ -218,8 +326,12 @@ void checkGdnWidths() {
 int main() {
   try {
     checkUnsizedProjection();
+    checkCaptureLayers();
     checkGdnWidths();
     checkGateUpLayers();
+    checkYarnGeometry();
+    checkIndexTables();
+    checkSpilledKvGeometry();
     const auto dense = loadedModel<model::Qwen3_8Weights>();
     const auto sparse = loadedModel<model::Qwen3_6MoeWeights>();
     checkLaneScratch(dense);

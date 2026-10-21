@@ -2,6 +2,7 @@ import io
 import unittest
 from unittest import mock
 
+from dev.tests.server_fixtures import unprepared_hold
 from server import constraints as generation_constraints
 from server import server
 
@@ -60,14 +61,13 @@ class TokenizerContractTests(unittest.TestCase):
             generation_constraints.validate_tokenizer(tokenizer)
 
     def test_startup_rejects_tokenizer_before_starting_the_native_worker(self):
-        args = server.parse_args(
-            ["model", "--tokenizer", "tokenizer", "--model", "owner/model"]
-        )
+        args = server.parse_args(["model", "--model", "owner/model"])
         tokenizer = self.tokenizer()
         tokenizer.get_vocab()["</think>"] = 0
         http = mock.Mock()
         with (
             mock.patch.object(server, "parse_args", return_value=args),
+            unprepared_hold(),
             mock.patch.object(server.signal, "signal"),
             mock.patch.object(server, "load_thinking_key", return_value=None),
             mock.patch.object(

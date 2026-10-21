@@ -68,6 +68,7 @@ automatically:
 | --- | --- | --- |
 | Qwen3.8-27B | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` | `mlx-community/Qwen3.8-27B-4bit` |
 | Qwen3.6-35B-A3B | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` | `mlx-community/Qwen3.6-35B-A3B-4bit` |
+| Qwen3.8-Flash-Next | `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0` | — |
 
 Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats
 up to `UD-Q8_K_XL`, whose BF16 tensors load too. Whole-BF16 and F16 models are
@@ -80,7 +81,8 @@ including mixed precision, mxfp4 or nvfp4. NVIDIA's and unsloth's NVFP4
 checkpoints and NVFP4 GGUFs also load. Smaller variants run on
 [24 GB Macs](docs/performance.md#smaller-ggufs-on-24-gb-macs).
 [27B variants](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/tree/main) ·
-[35B variants](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/tree/main)
+[35B variants](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/tree/main) ·
+[Flash-Next variants](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main)
 
 Vision and the tokenizer come from the target model's source.
 [Model loading and compatibility](DEVELOPMENT.md#upstream-model-loading) ·
@@ -95,7 +97,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | --- | --- |
 | `--max-memory 28G` | Cap Metal memory use. |
 | `--idle-release off` | Keep the model in memory while idle (default: release after 10m). |
-| `--max-context 100K` | Set the context limit. |
+| `--max-context 100K` | Set the context limit. Up to `1M` tokens. |
 | `--language-only` | Skip vision; serve text only. |
 | `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
 | `--state-format bf16` | Use BF16 recurrent states, half the size. Default: FP32. |
@@ -109,20 +111,24 @@ access, authentication, browser apps on other origins, and other options, see
 [server configuration](DEVELOPMENT.md#server-configuration) or
 `splash serve --help`.
 [KV precision](DEVELOPMENT.md#kv-cache-precision) ·
-[SSD cache](DEVELOPMENT.md#ssd-cache)
+[SSD cache](DEVELOPMENT.md#ssd-cache) ·
+[Advanced memory settings](DEVELOPMENT.md#memory-and-context)
 
 ## Performance
 
 Measured with Splash 1.0 on an M5 Pro (16-core GPU, 48 GB), using its model
 packages and selected SPEED-Bench coding prompts over HTTP. Ratios compare
-with the next-fastest engine measured in that benchmark.
+with the next-fastest engine measured in that benchmark. Qwen3.8-Flash-Next
+(`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0`) was measured the same way
+with this release on an M5 Pro (20-core GPU, 64 GB); its ratios compare with
+Strata serving the same GGUF on that Mac.
 
-| Metric | Qwen3.6-35B-A3B | Qwen3.8-27B |
-| --- | ---: | ---: |
-| Decode · short prompt | 210 tok/s (1.7×) | 74 tok/s (2.0×) |
-| Prefill · 32K prompt | 2,011 tok/s (1.3×) | 363 tok/s (1.2×) |
-| Cached time to first token · 32K replay | 123 ms (6.6×) | 282 ms (7.3×) |
-| Aggregate decode · 4 concurrent short prompts | 357 tok/s (2.0×) | 170 tok/s (3.9×) |
+| Metric | Qwen3.6-35B-A3B | Qwen3.8-27B | Qwen3.8-Flash-Next |
+| --- | ---: | ---: | ---: |
+| Decode · short prompt | 210 tok/s (1.7×) | 74 tok/s (2.0×) | 95 tok/s (1.3×) |
+| Prefill · 32K prompt | 2,011 tok/s (1.3×) | 363 tok/s (1.2×) | 1,312 tok/s (1.3×) |
+| Cached time to first token · 32K replay | 123 ms (6.6×) | 282 ms (7.3×) | 171 ms (212×) |
+| Aggregate decode · 4 concurrent short prompts | 357 tok/s (2.0×) | 170 tok/s (3.9×) | 171 tok/s (2.4×) |
 
 [Launch benchmarks](https://inco.ai/blog/splash/) ·
 [Measurement details](docs/performance.md#splash-10-launch-benchmarks) ·

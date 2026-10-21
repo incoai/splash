@@ -3,12 +3,14 @@
 #include "ops/Vision.hpp"
 #include "engine/Cache.hpp"
 #include "engine/MemoryGovernor.hpp"
+#include "engine/MemoryPlan.hpp"
 #include "engine/Scheduler.hpp"
 #include "engine/Types.hpp"
 #include "engine/WriteBehind.hpp"
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -34,6 +36,11 @@ inline constexpr double kResourceWaitTimeoutMilliseconds = 30000.0;
 // host's does, it finds by retrying this often: at most a tenth of a second
 // later, without spinning the loop on attempts.
 inline constexpr double kResourceRetryBackoffMilliseconds = 100.0;
+// The output a request's KV is projected to hold at admission, at most: the
+// tokens it may still generate, clipped to this many. A request that
+// outgrows it converts to Spill when memory refuses its growth
+// (EngineSpillConfig).
+inline constexpr uint32_t kProjectedOutputTokens = 4096;
 
 // The engine's constructor refuses a config without its context window, its
 // vocabulary or the governor's two hooks, which the bootstrap sets from the
@@ -49,6 +56,12 @@ struct EngineConfig final {
   // its solo rate through a long prefill, which meanwhile takes 1.5x as long;
   // zero alternates one command of each kind.
   double decodeShare = 0.5;
+  // The query-key pairs a prefill command's attention may compute
+  // (Scheduler::attentionPairs): the bootstrap sets those of a full chunk at
+  // the end of the model's native window, so that a command past it, which
+  // only YaRN serves, takes fewer rows and no longer than the deepest native
+  // one, well within the command watchdog.
+  uint64_t maximumPrefillAttentionPairs = std::numeric_limits<uint64_t>::max();
   // The prefill checkpoint interval and the resource wait limit.
   uint32_t prefillCheckpointTokens = kPrefillCheckpointTokens;
   double resourceWaitTimeoutMilliseconds = kResourceWaitTimeoutMilliseconds;
@@ -61,6 +74,9 @@ struct EngineConfig final {
   // which the pause does not hold back, or clears the mark, and returns the
   // mark it replaced (MemoryGovernor::setServing).
   std::function<bool(bool)> serving;
+  // Which requests keep their KV on the SSD cache (KvMode), from the memory
+  // plan; none unless the target can spill.
+  EngineSpillConfig spill;
 };
 
 // While an active one lives, allocations are memory a request in service
@@ -110,9 +126,12 @@ plannedCheckpoints(uint32_t resumeBoundary, uint32_t replayBoundary, uint32_t in
 struct ResourceWaitSnapshot final {
   uint32_t memory = 0;
   uint32_t concurrency = 0;
+  // Starts that wait for the SSD cache's quota of active KV, which other
+  // requests' active KV holds.
+  uint32_t diskQuota = 0;
   // Requests the latest admission pass held back behind the first one
-  // refused memory, whatever they wait for themselves, and a request refused
-  // memory while a pass keeps it out of its memory wait. During recovery
+  // refused memory or that quota, whatever they wait for themselves, and a
+  // request refused them while a pass keeps it out of its wait. During recovery
   // admission tries only suspended requests and those of a strictly higher
   // priority, and holds back only those.
   uint32_t heldBehindRefusal = 0;
@@ -126,8 +145,8 @@ struct ResourceWaitSnapshot final {
 
 // One live request's progress, for /status active_requests: its phase and
 // priority, how many prompt tokens are encoded (cached ones included) and
-// generated, and its age since it arrived, which the native runtime that
-// received it adds (NativeRuntime::statusSnapshot).
+// generated, where its KV lives, and its age since it arrived, which the
+// native runtime that received it adds (NativeRuntime::statusSnapshot).
 struct ActiveRequestSnapshot final {
   uint64_t id = 0;
   Phase phase = Phase::Queued;
@@ -136,7 +155,26 @@ struct ActiveRequestSnapshot final {
   uint32_t promptProcessed = 0;
   uint32_t generatedTokens = 0;
   uint32_t maxNewTokens = 0;
+  KvMode kvMode = KvMode::Resident;
   double ageMilliseconds = 0.0;
+};
+
+// The requests of a target that can spill (EngineConfig::spill): those that
+// started in each KV mode; those that converted to Spill when memory
+// refused their growth; those whose output the SSD cache's quota bounded,
+// and those that ended at that bound or once the cache could hold no more
+// of their KV; and those refused because the quota cannot hold their
+// prompt, the daily write budget is spent or the tier takes no writes. Those
+// waiting for the quota now are ResourceWaitSnapshot::diskQuota.
+struct SpillRequestsSnapshot final {
+  uint64_t spill = 0;
+  uint64_t resident = 0;
+  uint64_t converted = 0;
+  uint64_t bounded = 0;
+  uint64_t lengthEnds = 0;
+  uint64_t refusedQuota = 0;
+  uint64_t refusedWriteBudget = 0;
+  uint64_t refusedClosed = 0;
 };
 
 struct EngineSnapshot final {
@@ -181,6 +219,7 @@ struct EngineSnapshot final {
   uint64_t resourceReplayTokens = 0;
   // A persistent tier's newest restore points (WriteBehind).
   WriteBehindSnapshot writeBehind;
+  SpillRequestsSnapshot spill;
 };
 
 // KV blocks define prefix identity; composite recurrent state is attached
@@ -204,8 +243,8 @@ public:
   // the engine knows: vocabulary, context window, and vision with the
   // server's per-image patch cap.
   void submit(EngineRequest request);
-  void observePrefill(uint32_t rows, double wallMilliseconds) {
-    scheduler_.observePrefill(rows, wallMilliseconds);
+  void observePrefill(uint32_t rows, double wallMilliseconds, double hostMilliseconds) {
+    scheduler_.observePrefill(rows, wallMilliseconds, hostMilliseconds);
   }
   void cancel(uint64_t requestId);
   void failRequest(uint64_t requestId, LaneOutcome outcome, std::string message);
@@ -230,12 +269,13 @@ public:
   // critical directive has no target and takes them all. Under critical
   // pressure it then evicts every unpinned cache entry (Cache::evictAll()).
   // Otherwise it releases empty KV extents and reclaims the cache one
-  // Cache::reclaimOne step at a time, in the order that step's contract
-  // (Cache.hpp) gives, returning the buffers an evicted state handed back to
-  // the model's pool after each step. While the target is still unmet, it
-  // then takes the image rows only evicted states held. A pass counts only
-  // memory that leaves the engine: released KV extents, the caches and idle
-  // buffers the model returns; evicting a state frees nothing by itself.
+  // Cache::reclaimOne step at a time, up to the directive's class, in the
+  // order that step's contract (Cache.hpp) gives, returning the buffers an
+  // evicted state handed back to the model's pool after each step. While
+  // the target is still unmet, it then takes the image rows only evicted
+  // states held. A pass counts only memory that leaves the engine: released
+  // KV extents, the caches and idle buffers the model returns; evicting a
+  // state frees nothing by itself.
   // Pages whose copies are being written count toward the target. A pass
   // short of critical keeps one lane's pooled buffers and one empty extent.
   // Requests waiting for memory retry after any step that freed some, kept
@@ -252,9 +292,12 @@ public:
   [[nodiscard]] bool flushRestorePoints();
 
 private:
+  // A lane's end other than its output's, and for a retryable outcome the
+  // seconds after which a retry may succeed, 0 for at once.
   struct LaneEnd final {
     LaneOutcome outcome;
     std::string message;
+    uint32_t retryAfterSeconds = 0;
   };
 
   struct ResourceWait final {
@@ -275,8 +318,12 @@ private:
     uint64_t epoch = 0;
     // Memory is on its way back; the limit fires only without progress.
     bool pending = false;
+    // It waits for the SSD cache's quota of active KV, which other requests'
+    // active KV holds, rather than for memory.
+    bool diskQuota = false;
   };
 
+  struct Capture;
   struct Request final {
     struct StateBoundary final {
       uint32_t tokens = 0;
@@ -313,16 +360,30 @@ private:
     uint32_t deduplicatedKvTokens = 0;
     // Its speculative decoding so far, which it reports when it completes.
     SpeculativeCounts speculation;
-    // A failed dispatch must fit before replay can consume any model work.
+    // Where its committed KV lives: chosen at each attempt to start it
+    // (kvModeFor), kept from its start on, across suspensions too, and
+    // turned to Spill once by a conversion.
+    KvMode kvMode = KvMode::Resident;
+    // The most tokens it may generate, which the model is given at each
+    // start, a resume's too: maxNewTokens, or fewer when the SSD cache's
+    // quota bounds its output (admitSpill), which each attempt to start it
+    // decides anew.
+    uint32_t outputLimit = 0;
+    // The KV a Resident lane takes when it resumes, before its replay
+    // consumes any model work: what it held, or the work it was refused
+    // room for (suspendLane). A Spill lane takes its replay's pages a
+    // command at a time instead.
     uint64_t resumeKvTargetTokens = 0;
     ResourceWait resourceWait;
-    // The latest attempt to start it was refused memory. Until it starts,
-    // nothing that comes after it in admission order is admitted, in
-    // ordinary admission or among suspended requests during recovery
-    // (admitQueued); a pass that does not schedule it or a prefix wait
-    // leaves it in place.
-    bool refusedMemory = false;
-    // The request refused memory that the latest admission pass held it
+    // The latest attempt to start it was refused memory, or the SSD cache's
+    // quota of active KV. Until it starts, nothing that comes after it in
+    // admission order is admitted, in ordinary admission or among suspended
+    // requests during recovery (admitQueued): what reclaim, finishing lanes
+    // and returned commitments free would otherwise keep going to later
+    // arrivals that need less of it. A pass that does not schedule it or a
+    // prefix wait leaves it in place.
+    bool refusedResources = false;
+    // The request refused resources that the latest admission pass held it
     // back behind, without trying it. It counts as held while that request
     // still waits refused (ResourceWaitSnapshot::heldBehindRefusal).
     std::optional<uint64_t> heldBehind;
@@ -333,6 +394,12 @@ private:
     // (ModelStepResult::firstToken) and until the first decode cycle commits
     // it: that cycle emits it first, and its event leaves it out.
     std::optional<uint32_t> sentFirstToken;
+    // Its model held an anchor when its lane was last suspended: the token
+    // it selected last, which the suspension keeps (Model::suspend). A
+    // decoding lane holds one once its first token is selected, a
+    // constrained lane's under its first mask; a lane in prefill holds what
+    // it held when its replay began.
+    bool suspendedWithAnchor = false;
     // Made from exactTokens and the request's prompt identity, which do not
     // change while the request waits; refreshed each pass and dropped once it starts or
     // skips the cache.
@@ -362,6 +429,14 @@ private:
     // A restore that could not fit alone released its prefix pin:
     // admissions ignore the cache until one succeeds.
     bool skipCache = false;
+    // Between the passes of its prefill command (BatchPlan::passes): the
+    // command's item, with the states it captures, and its captures, which
+    // every pass runs and the last one commits.
+    struct PassCommand final {
+      ModelBatchItem item;
+      std::vector<Capture> captures;
+    };
+    std::optional<PassCommand> passCommand;
     // Admission that waits for its state's read, its KV pages' restores,
     // or both, before the lane runs.
     struct Restore {
@@ -403,6 +478,9 @@ private:
     // Where the engine's time for this command starts: the previous
     // command's retirement when the engine stayed busy, else its plan.
     double startedMilliseconds = 0.0;
+    // A prefill command of one lane that reads its history from the SSD
+    // cache (KvHistoryStream), whose wait on the reads the ticket reports.
+    bool streamed = false;
   };
   enum class Prepared : uint8_t {
     // Some lanes were admitted and the plan runs with them.
@@ -419,6 +497,70 @@ private:
   [[nodiscard]] Request &request(uint64_t requestId);
   [[nodiscard]] bool admitQueued(double nowMilliseconds);
   [[nodiscard]] bool admit(Request &request, double nowMilliseconds);
+  // The tokens the request's KV is projected to hold: those it holds and
+  // the output it may still generate, at most kProjectedOutputTokens.
+  [[nodiscard]] static uint64_t projectedTokens(const Request &request) noexcept;
+  // Where the KV of a request that starts now lives: on a target that can
+  // spill, Spill when its projection does not fit in the memory resident KV
+  // may use beside every other lane's (a Resident lane's projection, a Spill
+  // lane's floor), and for every request under --kv-spill always; Resident
+  // otherwise. Correctness never depends on it.
+  [[nodiscard]] KvMode kvModeFor(const Request &request) const;
+  // The request's projection fits in memory alone, as it would without the
+  // SSD cache (SpillGeometry::residentTokens).
+  [[nodiscard]] bool fitsResidentAlone(const Request &request) const;
+  // The last block of a chain of KV a request holds: the one a lookup
+  // matched, which it restores, or the one it holds published as its lane
+  // runs, its prompt's progress while it prefills (a replay publishes its
+  // own blocks again) and what it published once it decodes; 0 for none.
+  [[nodiscard]] static uint64_t chainEnd(const CacheLookup &lookup) noexcept;
+  [[nodiscard]] uint64_t chainEnd(const Request &request) const;
+  // The full pages of a Spill request's projection that its commitment
+  // covers (Cache::commitSpill): all of them but the blocks of the chain
+  // ending at `chainEnd` that have a copy (Cache::copiedBlocks), whose
+  // pages it writes no more. Each of its other pages is written once.
+  [[nodiscard]] uint32_t spillPages(const Request &request, uint64_t chainEnd) const;
+  // What becomes of a start (or a resume, which keeps its mode) in Spill
+  // mode that restores the chain ending at `chainEnd`. A fresh start needs
+  // a tier that takes writes and a write budget for what Spill requests
+  // committed (Cache::spillGate); refused either, it starts Resident if it
+  // fits in memory alone and is refused otherwise. Then the SSD cache's
+  // quota of active KV (Cache::spillRoom) must hold the pages it publishes
+  // up to its projection. Short of that, a start that fits alone starts
+  // Resident, unless every request spills; otherwise the quota bounds its
+  // output to what it holds, if that leaves a token of it past what the
+  // request holds, the anchor of a resume that holds one included; it
+  // waits while other requests' active KV (the copies of the blocks they
+  // hold, and their commitments) holds what it lacks; and otherwise a start
+  // is refused, and a resume ends at its length.
+  enum class SpillAdmission : uint8_t {
+    // The quota holds what it publishes: commit it once the lane is taken.
+    Commit,
+    // It starts Resident instead.
+    Resident,
+    // It ended: refused, or a resume at its length.
+    Settled,
+    // It waits for the quota other requests' active KV holds.
+    Waiting,
+  };
+  [[nodiscard]] SpillAdmission admitSpill(Request &request, bool resuming, uint64_t chainEnd,
+                                          double nowMilliseconds);
+  // A start the SSD cache's quota of active KV refused while other requests'
+  // active KV holds what it lacks: it waits for them to end, and closes
+  // admission behind it as a start refused memory does
+  // (Request::refusedResources).
+  void waitForDiskQuota(Request &request, double nowMilliseconds);
+  // Whether the lane's next prefill command reads its history from the SSD
+  // cache: its history holds Index pages (Cache::holdsIndexPages), or, in
+  // Spill mode, reaches past its dense history and tail window, where its
+  // pages spill as their copies land.
+  [[nodiscard]] bool streamsHistory(const Request &request) const;
+  // Whether a resident Spill request's prompt goes on: its next commands
+  // take Full pages that spill as their copies land.
+  [[nodiscard]] bool spillingPrompt() const;
+  // Ends a request at its length outside a command: in Spill mode, once
+  // the SSD cache can hold no more of its KV.
+  void endAtLength(Request &request);
   // Where the lane's last state is kept: the last whole page before the
   // replay's final input token and, while the lane replays only its prompt,
   // before the prompt's generation prompt, where a later request resumes.
@@ -516,7 +658,9 @@ private:
   // follows the state before it in the command. A checkpoint whose
   // predecessor a reader pins takes only the pool or the admission too:
   // refused, its command ends at it, and apply publishes it from the lane
-  // only if the pin has gone by then. Null buffers when refused.
+  // only if the pin has gone by then. The prompt's replay point that only
+  // the host refuses once room is made takes its buffers as memory the
+  // request in service needs (Serving). Null buffers when refused.
   [[nodiscard]] Reservation reserveCapture(Request &request, StateClass kind, uint32_t tokens,
                                            bool followsCheckpoint);
   // Makes room for one state's buffers, a step of what its class may take
@@ -527,10 +671,13 @@ private:
   // The reclaim steps for a lane's state and for KV pages the engine's limit
   // refused. Idle memory of the kind refused stays for it to reuse; idle
   // memory of the other kind is released first. Each takes cache up to the
-  // class allocate() is given.
-  [[nodiscard]] CacheReclaimResult reclaimForState(ReclaimClass upTo);
-  [[nodiscard]] CacheReclaimResult reclaimForKv(uint32_t pages, ReclaimClass upTo);
-  [[nodiscard]] bool reclaimIdleState(bool keepLane) noexcept;
+  // class allocate() is given. Memory for later, an optional allocation of
+  // the model's memory, takes no rebuildable cache of the model's and keeps
+  // the next request's empty extent.
+  [[nodiscard]] CacheReclaimResult reclaimForState(ReclaimClass upTo, bool forLater = false);
+  [[nodiscard]] CacheReclaimResult reclaimForKv(const TokenAdmission &admission,
+                                                ReclaimClass upTo);
+  [[nodiscard]] bool reclaimIdleState(bool keepLane, model::IdleMemory scope) noexcept;
   [[nodiscard]] CacheReclaimResult reuseCachedStateWhilePaused(ReclaimClass upTo);
   [[nodiscard]] CacheReclaimResult reuseCachedPagesWhilePaused(
       const TokenAdmission &admission, ReclaimClass upTo);
@@ -538,8 +685,12 @@ private:
   struct Denial {
     metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
     // On its way back: pages whose copies are being written, or a reclaim
-    // that waits for the transfer in flight. The lane waits; nobody yields.
+    // that waits for a transfer in flight that can still cover what was
+    // refused (Cache::reclaimForPages, reclaimForMemory). The lane waits;
+    // nobody yields.
     bool pending = false;
+    // Not memory but the SSD cache's quota of active KV (ResourceWait).
+    bool diskQuota = false;
   };
   // An allocation's last attempt, and what the engine knows about the memory
   // it could not get.
@@ -547,6 +698,15 @@ private:
     Admission admission;
     Denial denial;
   };
+  // The fallback of a Resident lane's KV allocation on a target that can
+  // spill, none otherwise: it converts the lane to Spill (Cache::
+  // convertToSpill), committing its projection's pages without a copy, the
+  // chain it holds or, at admission, the one it restores (`restoring`)
+  // counted, and writing its pages through; that allocates nothing, so the
+  // retry waits for the memory their copies free, and the lane keeps
+  // running.
+  [[nodiscard]] std::function<bool(const Denial &)>
+  spillFallback(Request &request, const CacheLookup *restoring = nullptr);
   // What a lane does about memory it could not get. Pending memory returns
   // by itself: the lane waits. Otherwise a lane fails only when it is alone
   // with nothing left to reclaim; while other lanes hold memory or the host
@@ -571,25 +731,29 @@ private:
   // nullptr without one. prepare() gates that lane's growth and suspends
   // that lane; preemptBelow() suspends it for a higher priority.
   [[nodiscard]] Request *laneToYield();
-  // Runs one allocation of a lane's state or of KV pages, reclaiming cache
-  // up to class upTo between attempts while that makes progress: what is in
-  // use only for running work that would not yield for it, never for a
-  // start a resident lane holds back. A refusal from the host reuses what
-  // the engine holds; when that gives nothing, a request in service retries
-  // as one (EngineConfig::serving), which only the engine's limit and
-  // critical pressure refuse. A refusal from the engine's limit reclaims
-  // cache; when that gives nothing, fallback, given the denial so far, may
-  // let go of what the request itself pins, and the reclaim goes on. An
-  // optional allocation, whose refusal only shortens a command, records no
-  // failure (allocationFailed_).
+  // Runs one allocation of a lane's state, of KV pages or of the model's
+  // memory for reads of spilled KV, reclaiming cache up to class upTo
+  // between attempts while that makes progress: what is in use only for
+  // running work that would not yield for it, never for a start a resident
+  // lane holds back. A refusal from the host reuses what the engine holds;
+  // when that gives nothing, a request in service retries as one
+  // (EngineConfig::serving), which only the engine's limit and critical
+  // pressure refuse. A refusal from the engine's limit reclaims cache. When
+  // neither gives anything, fallback, given the denial so far, may let go of
+  // what the request itself pins or turn its KV to Spill, which allocates
+  // nothing, so the host's refusal offers it too; the allocation is then
+  // attempted again. An optional allocation, whose refusal only shortens a
+  // command or leaves memory for later, records no failure
+  // (allocationFailed_).
   template <class Attempt>
   [[nodiscard]] auto allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
                               const std::function<bool(const Denial &)> &fallback = {},
                               bool optional = false)
       -> Allocation<std::invoke_result_t<Attempt &>>;
   // Takes a resident request's lane: its state and KV pages go back,
-  // and it waits, for `reason`, until admission resumes it with room for
-  // workEnd tokens of KV to replay its history from the cache.
+  // and it waits, for `reason`, until admission resumes it to replay its
+  // history from the cache, a Resident lane with room for workEnd tokens of
+  // KV (Request::resumeKvTargetTokens).
   void suspendLane(Request &request, uint64_t workEnd, metal::AllocationFailure failure,
                    StateFailure reason, double nowMilliseconds);
   // A lane that could not grow yields its memory: it waits for memory, and
@@ -601,8 +765,9 @@ private:
   [[nodiscard]] uint64_t kvCapacity(uint64_t requestId) const;
   // For a request of this priority that cannot start: suspends the lane that
   // yields first (laneToYield) if its priority is strictly lower, without a
-  // drain. The lane waits as for a free one, and resumes from its current KV
-  // capacity once admission reaches it again. True when one was suspended.
+  // drain. The lane waits as for a free one, and resumes once admission
+  // reaches it again, a Resident one with its current KV capacity. True when
+  // one was suspended.
   // Memory on its way back makes no lane yield, as in prepare(): a request
   // refused while it is pending waits for it instead.
   [[nodiscard]] bool preemptBelow(RequestPriority priority, double nowMilliseconds);
@@ -618,7 +783,7 @@ private:
                           StateFailure reason = StateFailure::MemoryPressure) noexcept;
   // Waiting for scheduling or for a prefix does not consume the memory
   // wait limit, so the wait's record is reset. A request that holds
-  // admission closed (Request::refusedMemory) keeps when its wait began and
+  // admission closed (Request::refusedResources) keeps when its wait began and
   // which lanes were admitted before it was refused.
   void deferWait(Request &request) noexcept;
   // The wait limit tick() enforces, or zero while it enforces none: a
@@ -627,10 +792,8 @@ private:
   // ResourceWait::admittedBefore counts, has work in flight.
   [[nodiscard]] double resourceDeadline(const Request &request) const noexcept;
   void signalResourceProgress() noexcept;
-  void apply(const BatchPlan &plan, std::span<const std::vector<Capture>> captures,
-             std::span<const ModelStepResult> results, double wallMilliseconds,
-             double cycleMilliseconds, bool representativePrefillTiming,
-             double nowMilliseconds);
+  void apply(const Pending &command, std::span<const ModelStepResult> results,
+             double cycleMilliseconds, double nowMilliseconds);
   // Whether the command in flight holds the request's lane.
   [[nodiscard]] bool inFlight(uint64_t requestId) const;
   // Ends a request early. While its command or restore runs, the first end

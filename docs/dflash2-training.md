@@ -11,6 +11,24 @@ experimental: unary cross-entropy plus selector cross-entropy over the strict
 unary top-16 candidates. Missing selector targets are skipped and coverage is
 reported. Candidate selection and tie-breaking follow Splash's serving contract.
 
+## Current-main integration
+
+Rechecked against main `1482f6bbc2abf12375332725302019594150b6cb` on
+October 21, 2026. Main's adaptive MoE verify-row policy (#487) controls native
+execution; it does not add training commands or an acceptance-confidence head
+to this trainer. The trainer retains its existing, deliberately restricted
+Qwen3.8-27B adapter and BF16 export schema. Main now derives the draft context
+projection width from its target-layer layout; the supported five target
+layers still imply the same `fc.weight` shape.
+
+The source launcher, CI and Python checks are integrated with the current
+server/options layout. No native runtime or shader change is part of this PR.
+Small-model/metadata checks do not replace production CUDA training,
+real-checkpoint native loading or native acceptance/throughput qualification.
+For deployment comparisons, record the current all/auto verify-row setting and
+the actual target/draft revisions. Historical pre-merge test and timing
+results below or in the PR description keep their original source scope.
+
 ## Setup
 
 Use Python 3.12–3.14 and a separate training environment. CUDA is the default

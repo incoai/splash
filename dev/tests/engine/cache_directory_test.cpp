@@ -93,44 +93,77 @@ void testOneProcessAtATime() {
             "a namespace that is not 32 lowercase hex digits was accepted");
 }
 
-// The marks say how the last process ended: serving without closing is an
-// unclean end, a clean close is not; an end within probation empties the
-// cache, an end after it does not.
+// The marks say how the last processes ended: serving without closing is an
+// unclean end, a clean close is not. Every start serves on probation. The
+// start after one that failed within it keeps the cache, and the start after
+// a second such failure in a row, or after an engine that reported its own
+// failure within probation, empties it. A start that served its probation
+// out ends a run of failures, and neither a failure nor an engine failure
+// after probation counts.
 void testMarksFollowTheLastEnd() {
   Root root;
+  const auto fill = [](const CacheDirectory &directory) {
+    for (const auto &file : {directory.kvSlots(), directory.kvRecords(), directory.stateSlots(),
+                             directory.stateRecords()})
+      touch(file);
+  };
+  const auto kept = [](const CacheDirectory &directory) {
+    return directory.coldReason().empty() && std::filesystem::exists(directory.kvSlots()) &&
+           std::filesystem::exists(directory.stateRecords());
+  };
+  const auto emptied = [](const CacheDirectory &directory) {
+    return !directory.coldReason().empty() && !std::filesystem::exists(directory.kvSlots()) &&
+           !std::filesystem::exists(directory.stateRecords());
+  };
   {
     auto directory = root.open();
-    directory->beginServing(false);
+    fill(*directory);
+    directory->beginServing();
   }
   {
     auto directory = root.open();
-    require(directory->uncleanExit() && directory->coldReason().empty(),
-            "an end without closing did not count as unclean");
-    directory->beginServing(false);
+    require(directory->uncleanExit() && kept(*directory),
+            "one failure within probation emptied the cache");
+    directory->beginServing();
+    directory->endProbation();
+  }
+  {
+    auto directory = root.open();
+    require(directory->uncleanExit() && kept(*directory),
+            "a failure after probation emptied the cache");
+    directory->beginServing();
+  }
+  {
+    auto directory = root.open();
+    require(kept(*directory),
+            "a failure within probation after a probation served out emptied the cache");
+    directory->beginServing();
+  }
+  {
+    auto directory = root.open();
+    require(directory->uncleanExit() && emptied(*directory),
+            "a second failure in a row within probation left the cache to the next start");
+    fill(*directory);
+    directory->beginServing();
     directory->close();
   }
   {
     auto directory = root.open();
-    require(!directory->uncleanExit(), "a clean close counted as unclean");
-    for (const auto &file : {directory->kvSlots(), directory->kvRecords(), directory->stateSlots(),
-                             directory->stateRecords()})
-      touch(file);
-    directory->beginServing(true);
+    require(!directory->uncleanExit() && kept(*directory), "a clean close counted as unclean");
+    directory->beginServing();
+    directory->engineFailed();
   }
   {
     auto directory = root.open();
-    require(directory->uncleanExit() && !directory->coldReason().empty() &&
-                !std::filesystem::exists(directory->kvSlots()) &&
-                !std::filesystem::exists(directory->stateRecords()),
-            "a failure within probation left the cache to the next start");
-    touch(directory->kvSlots());
-    directory->beginServing(true);
+    require(emptied(*directory),
+            "an engine failure within probation left the cache to the next start");
+    fill(*directory);
+    directory->beginServing();
     directory->endProbation();
+    directory->engineFailed();
   }
   auto directory = root.open();
-  require(directory->uncleanExit() && directory->coldReason().empty() &&
-              std::filesystem::exists(directory->kvSlots()),
-          "a failure after probation emptied the cache");
+  require(kept(*directory), "an engine failure after probation emptied the cache");
 }
 
 // Cleanup removes a namespace nobody opened or wrote for the stale period,

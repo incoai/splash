@@ -5,7 +5,9 @@ reference parity, capture, resume, and export tests pass. Production CUDA
 training, real-checkpoint native loading, and speed/acceptance benchmarks are
 still required before declaring the plan complete.
 
-Created: 2026-10-20. Revised after plan review: 2026-10-20.
+Created: 2026-10-20. Current-main integration reviewed: 2026-10-21.
+The October 20 validation record below is historical; the PR description
+records the current-main rerun separately.
 Related: [Splash issue #435](https://github.com/incoai/splash/issues/435).
 
 ## Objective

@@ -126,14 +126,17 @@ struct GgufRotationParams {
 };
 static_assert(sizeof(GgufRotationParams) == 4, "GGUF rotation parameters are 4 bytes on both sides");
 
-// fp32 projection of a GGUF float tensor (kernels/shared/gguf_float.metal):
-// out[r][out_offset + n] = sum_k x[r][k] * W[n][k] for rows r < rows, W the
-// fp32 weights as stored ([output_size][input_size]).
+// fp32 projections of GGUF float tensors (kernels/shared/gguf_float.metal),
+// up to GGUF_FLOAT_PROJECTIONS of one input in one dispatch, their column
+// tiles in projection order: out_p[r][out_offset[p] + n] = sum_k x[r][k] *
+// W_p[n][k] for rows r < rows, W_p the values as stored
+// ([output_size[p]][input_size]).
+#define GGUF_FLOAT_PROJECTIONS 2u
 struct GgufFloatParams {
   uint32_t rows;
-  uint32_t input_size;  // K, a multiple of 8
-  uint32_t output_size; // N, a multiple of 8
-  uint32_t out_stride;  // columns of a destination row
-  uint32_t out_offset;  // first destination column
+  uint32_t input_size;                          // K, a multiple of 8
+  uint32_t output_size[GGUF_FLOAT_PROJECTIONS]; // N, a multiple of 8; 0 past the last projection
+  uint32_t out_stride[GGUF_FLOAT_PROJECTIONS];  // columns of a destination row
+  uint32_t out_offset[GGUF_FLOAT_PROJECTIONS];  // first destination column
 };
-static_assert(sizeof(GgufFloatParams) == 20, "GGUF float parameters are 20 bytes on both sides");
+static_assert(sizeof(GgufFloatParams) == 32, "GGUF float parameters are 32 bytes on both sides");

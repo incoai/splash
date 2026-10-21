@@ -7,11 +7,13 @@ RETRY_STATUSES = (503, 529)
 
 
 class APIError(Exception):
-    def __init__(self, status, message, code="invalid_request_error"):
+    def __init__(self, status, message, code="invalid_request_error", retry_after=1):
         super().__init__(message)
         self.status = status
         self.message = message
         self.code = code
+        # The seconds a retry status invites the client to wait (Retry-After).
+        self.retry_after = retry_after
 
 
 class RequestValidationError(APIError):

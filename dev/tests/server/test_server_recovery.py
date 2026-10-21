@@ -20,6 +20,7 @@ from dev.tests.server_fixtures import (
     Plan,
     main_args,
     make_job,
+    unprepared_hold,
 )
 from server import backend as backend_api
 from server import protocol as wire
@@ -252,7 +253,7 @@ class ServerRecoveryTests(HarnessTestCase):
         # another, as once the Mac's memory budget shrank, still stops the
         # restarts at once.
         args = main_args()
-        first = tuple(api._native_command(args))
+        first = tuple(api._native_command(args, args.model_root))
         relaunch = (*first, "--relaunch-context", str(READY.max_context_tokens))
         for relaunched, serves in (
             (READY, True),
@@ -269,7 +270,7 @@ class ServerRecoveryTests(HarnessTestCase):
                 runtime = engine_runtime.MultiplexedRuntime(
                     first,
                     relaunch_command=lambda ready: api._native_command(
-                        args, ready.max_context_tokens
+                        args, args.model_root, ready.max_context_tokens
                     ),
                 )
                 trace = mock.Mock(last_dump=None)
@@ -776,6 +777,7 @@ class ServerRecoveryTests(HarnessTestCase):
         )
         with (
             mock.patch.object(api, "parse_args", return_value=main_args()),
+            unprepared_hold(),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
                 api.AutoTokenizer, "from_pretrained", return_value=object()

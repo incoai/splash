@@ -22,6 +22,7 @@ namespace {
 
 using namespace splash;
 using engine::NativeArguments;
+using engine::StreamedSetting;
 using splash::test::rejects;
 using splash::test::require;
 
@@ -152,6 +153,9 @@ void testServerCommandLines(const char *path) {
        [](NativeArguments &read) { read.maxImagePatches = 16384; }},
       {"idle_sleep", [](NativeArguments &read) { read.preventIdleSleep = false; }},
       {"disable_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
+      {"verify_rows_all", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::All; }},
+      // Auto is the engine's default, which the server leaves out.
+      {"verify_rows_auto", [](NativeArguments &) {}},
       // A relaunch keeps the first engine's context; with --max-context,
       // which every start holds, its command is the first one's.
       {"relaunch", [](NativeArguments &read) { read.relaunchContext = 61433; }},
@@ -160,10 +164,31 @@ void testServerCommandLines(const char *path) {
          read.maxContext = 102400;
          read.maxMemoryBytes = 32 * kGiB;
        }},
+      // Past the native window, YaRN by the context over it.
+      {"yarn",
+       [](NativeArguments &read) {
+         read.maxContext = 1000000;
+         read.model.ropeScaling = {3.814697265625, 262144};
+       }},
+      {"yarn_double",
+       [](NativeArguments &read) {
+         read.maxContext = 524288;
+         read.model.ropeScaling = {2.0, 262144};
+       }},
+      {"ple_memory", [](NativeArguments &read) { read.pleMemory = {StreamedSetting::Mode::Size, 2 * kGiB}; }},
+      {"ple_memory_off", [](NativeArguments &read) { read.pleMemory = {StreamedSetting::Mode::Off, 0}; }},
+      {"expert_memory",
+       [](NativeArguments &read) { read.expertMemory = {StreamedSetting::Mode::Size, 16 * kGiB}; }},
+      {"expert_memory_off", [](NativeArguments &read) { read.expertMemory = {StreamedSetting::Mode::Off, 0}; }},
+      // Auto is the engine's default, which the server leaves out.
+      {"expert_memory_auto", [](NativeArguments &) {}},
+      {"sparse_kv_memory", [](NativeArguments &read) { read.sparseKvMemory = 1200 * (kGiB >> 10); }},
   };
-  // Every field but the model inspected from the directory.
+  // Every field but the model inspected from the directory, whose RoPE
+  // scaling MAX_CONTEXT sets.
   const auto same = [](const NativeArguments &read, const NativeArguments &meant) {
     return read.modelRoot == meant.modelRoot && read.maxContext == meant.maxContext &&
+           read.model.ropeScaling == meant.model.ropeScaling &&
            read.relaunchContext == meant.relaunchContext &&
            read.maxMemoryBytes == meant.maxMemoryBytes &&
            read.maxCacheDisk.automatic == meant.maxCacheDisk.automatic &&
@@ -175,7 +200,9 @@ void testServerCommandLines(const char *path) {
            read.maxImagePatches == meant.maxImagePatches &&
            read.idleReleaseSeconds == meant.idleReleaseSeconds &&
            read.preventIdleSleep == meant.preventIdleSleep &&
-           read.neuralEngine == meant.neuralEngine;
+           read.neuralEngine == meant.neuralEngine && read.pleMemory == meant.pleMemory &&
+           read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
+           read.kvSpillAlways == meant.kvSpillAlways && read.verifyRows == meant.verifyRows;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -199,6 +226,27 @@ void testNeuralEngine() {
               parse(model, {"auto", "auto", "--ane", "on"}).neuralEngine &&
               !parse(model, {"auto", "auto", "--ane", "off"}).neuralEngine,
           "--ane did not reach the arguments as given");
+}
+
+// --verify-rows auto, which the server never writes, is the engine's rule.
+void testVerifyRows() {
+  const ModelDirectory model;
+  require(parse(model, {"auto", "auto"}).verifyRows == model::VerifyRows::Auto &&
+              parse(model, {"auto", "auto", "--verify-rows", "auto"}).verifyRows == model::VerifyRows::Auto,
+          "--verify-rows auto was not the engine's rule");
+}
+
+// The stores' memory is the planner's unless set, which the server writes
+// only for off or a size; --kv-spill always, which only validation passes,
+// spills every request of a target that can.
+void testStreamedMemoryAndSpill() {
+  const ModelDirectory model;
+  const NativeArguments automatic =
+      parse(model, {"auto", "auto", "--expert-memory", "auto", "--ple-memory", "auto", "--sparse-kv-memory", "auto"});
+  require(automatic.expertMemory == StreamedSetting{} && automatic.pleMemory == StreamedSetting{} &&
+              !automatic.sparseKvMemory && !automatic.kvSpillAlways,
+          "auto did not leave the stores to the planner");
+  require(parse(model, {"auto", "auto", "--kv-spill", "always"}).kvSpillAlways, "--kv-spill always was not read");
 }
 
 // A command line the server never writes is refused with what is wrong.
@@ -229,6 +277,18 @@ void testRefusals() {
   refuses({"auto", "auto", "--idle-sleep", "never"},
           "--idle-sleep requires prevent or allow");
   refuses({"auto", "auto", "--ane", "gpu"}, "--ane requires on or off");
+  for (const char *rows : {"budget", "every", "ALL", ""})
+    refuses({"auto", "auto", "--verify-rows", rows}, "--verify-rows requires auto or all");
+  // The server passes bytes, auto or off.
+  for (const char *size : {"0", "2G", "OFF", ""})
+    refuses({"auto", "auto", "--ple-memory", size}, "--ple-memory requires a positive byte count, auto or off");
+  for (const char *size : {"0", "16G", "Auto", ""})
+    refuses({"auto", "auto", "--expert-memory", size},
+            "--expert-memory requires a positive byte count, auto or off");
+  for (const char *size : {"0", "off", "1200M", ""})
+    refuses({"auto", "auto", "--sparse-kv-memory", size}, "--sparse-kv-memory requires a positive byte count or auto");
+  for (const char *spill : {"never", "auto", ""})
+    refuses({"auto", "auto", "--kv-spill", spill}, "--kv-spill requires always");
   refuses({"auto", "auto", "--persistent-cache", "yes"}, "--persistent-cache requires on or off");
   refuses({"auto", "auto", "0", "--persistent-cache", "on"},
           "--persistent-cache requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
@@ -250,17 +310,27 @@ void testRefusals() {
           "unexpected argument --max-memory");
   for (const char *memory : {"0", "32G", "-1"})
     refuses({"auto", memory}, "MAX_MEMORY_BYTES must be auto or a positive integer");
-  // The model's own context bounds MAX_CONTEXT.
+  // MAX_CONTEXT serves the model as it is up to its native window, and past
+  // it with YaRN by the context over the native window, up to the 1,010,000
+  // tokens Qwen validates.
   const std::string maximum = std::to_string(
       model::inspectModelRoot(model.path()).capabilities.maximumContextTokens);
-  for (const std::string &context : {std::string("0"), std::string("100K"),
-                                     std::to_string(std::stoull(maximum) + 1)})
-    refuses({context, "auto"},
-            "MAX_CONTEXT must be auto or an integer in [1, " + maximum + "]");
-  require(parse(model, {maximum, "auto"}).maxContext == std::stoul(maximum),
-          "the model's whole context was refused");
+  for (const char *context : {"0", "-1", "100K", "1M", ""})
+    refuses({context, "auto"}, "MAX_CONTEXT must be auto or a positive integer");
+  refuses({"1010001", "auto"}, "MAX_CONTEXT: Qwen3.8-27B serves at most 1010000 tokens of context");
+  const NativeArguments native = parse(model, {maximum, "auto"});
+  require(native.maxContext == 262144 && !native.model.ropeScaling.yarn() &&
+              native.model.capabilities.maximumContextTokens == 262144,
+          "the native window was not served as it is");
+  for (const auto [context, factor] : {std::pair{262'145U, 1.000003814697265625}, {524'288U, 2.0},
+                                       {1'000'000U, 3.814697265625}, {1'010'000U, 3.85284423828125}}) {
+    const NativeArguments stretched = parse(model, {std::to_string(context), "auto"});
+    require(stretched.maxContext == context && stretched.model.capabilities.maximumContextTokens == context &&
+                stretched.model.ropeScaling == model::RopeScaling{factor, 262144},
+            "MAX_CONTEXT " + std::to_string(context) + " was not served with YaRN by its ratio to the native window");
+  }
   // A relaunch's context is one the model holds, and only without
-  // MAX_CONTEXT, which every start holds.
+  // MAX_CONTEXT, which every start holds; auto never serves it with YaRN.
   for (const std::string &context : {std::string("0"), std::string("auto"), std::string("100K"),
                                      std::to_string(std::stoull(maximum) + 1), std::string()})
     refuses({"auto", "auto", "--relaunch-context", context},
@@ -300,6 +370,8 @@ int main(int argc, char **argv) {
   try {
     testServerCommandLines(argv[1]);
     testNeuralEngine();
+    testVerifyRows();
+    testStreamedMemoryAndSpill();
     testRefusals();
     std::cout << "native arguments tests passed\n";
     return EXIT_SUCCESS;

@@ -9,6 +9,8 @@ namespace splash::ops {
 
 class RoPE final {
 public:
+  // The cosine and sine tables of the target's and the draft's rows at their
+  // positions; the target's scaled by rows.target_scale.
   static void addTables(
       metal::CommandGraph &graph, metal::MetalBuffer targetPositions,
       metal::MetalBuffer draftPositions,

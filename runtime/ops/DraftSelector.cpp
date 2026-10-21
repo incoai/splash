@@ -4,6 +4,7 @@
 #include "ops/BufferExtent.hpp"
 
 #include <bit>
+#include <cmath>
 #include <stdexcept>
 
 namespace splash::ops {
@@ -67,6 +68,7 @@ void DraftSelector::add(metal::CommandGraph &graph,
   requireBytes(codebooks.predecessor, codebook, "draft predecessor codebook");
   requireBytes(codebooks.successor, codebook, "draft successor codebook");
   requireBytes(buffers.proposedTokens, uint64_t{lanes} * kPositions * sizeof(uint32_t), "proposed token");
+  requireBytes(buffers.confidence, uint64_t{lanes} * kPositions * sizeof(float), "proposal confidence");
   if (const uint64_t sampledLanes = std::bit_width(params.sampling_mask)) {
     requireBytes(buffers.uniforms,
                  ((sampledLanes - 1) * SPLASH_SAMPLING_UNIFORMS + SPLASH_UNIFORM_PROPOSALS + kPositions) * sizeof(float),
@@ -86,8 +88,44 @@ void DraftSelector::add(metal::CommandGraph &graph,
   graph.add("draft_select_dflash",
             {buffers.candidates, buffers.unary, buffers.partialValues,
              buffers.uniforms, buffers.proposedTokens,
-             buffers.proposalProbabilities},
+             buffers.proposalProbabilities, buffers.confidence},
             params, {lanes, 1, 1}, {1, 1, 1});
+}
+
+void DraftSelector::addVerifyRows(metal::CommandGraph &graph, const metal::MetalBuffer &confidence,
+                                  const metal::MetalBuffer &verifyRows, const VerifyRowsModel &model,
+                                  std::span<const uint32_t> maximumRows) {
+  if (maximumRows.empty() || maximumRows.size() > SPLASH_MAXIMUM_BATCH_WIDTH)
+    throw std::invalid_argument("invalid draft verify rows batch");
+  const uint32_t lanes = static_cast<uint32_t>(maximumRows.size());
+  VerifyRowsParams params{};
+  params.lanes = lanes;
+  params.every_row = model.everyRow ? 1 : 0;
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    if (!maximumRows[lane] || maximumRows[lane] > SPLASH_DRAFT_QUERY_ROWS)
+      throw std::invalid_argument("invalid draft verify rows maximum");
+    params.maximum[lane] = maximumRows[lane];
+  }
+  if (!model.everyRow) {
+    if (!std::isfinite(model.slope))
+      throw std::invalid_argument("invalid draft verify rows model");
+    params.slope = model.slope;
+    for (uint32_t position = 0; position < kPositions; ++position) {
+      if (!std::isfinite(model.intercepts[position]))
+        throw std::invalid_argument("invalid draft verify rows model");
+      params.intercept[position] = model.intercepts[position];
+    }
+    // The costs of every total the lanes may verify, from their anchors to
+    // eight rows each.
+    for (uint32_t rows = lanes; rows <= lanes * SPLASH_DRAFT_QUERY_ROWS; ++rows) {
+      if (!(std::isfinite(model.costs[rows]) && model.costs[rows] > 0.0F))
+        throw std::invalid_argument("invalid draft verify rows cost");
+      params.cost[rows] = model.costs[rows];
+    }
+  }
+  requireBytes(confidence, uint64_t{lanes} * kPositions * sizeof(float), "proposal confidence");
+  requireBytes(verifyRows, uint64_t{lanes} * sizeof(uint32_t), "verify rows");
+  graph.add("draft_verify_rows", {confidence, verifyRows}, params, {1, 1, 1}, {1, 1, 1});
 }
 
 } // namespace splash::ops

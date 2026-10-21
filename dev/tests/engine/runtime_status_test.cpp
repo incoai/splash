@@ -26,7 +26,8 @@ namespace {
 using splash::test::capturedStderr;
 using splash::test::require;
 
-EngineMemoryPlan plan() {
+// The 27B's plan, or with another KV layout.
+EngineMemoryPlan plan(const kv::Layout &kvLayout = kv::Layout{16, 4, 256}) {
   DeviceCapabilities device;
   device.deviceName = "test";
   device.appleGpuFamily = 9;
@@ -38,8 +39,9 @@ EngineMemoryPlan plan() {
   device.maxThreadgroupMemoryBytes = 32 * 1024;
   device.maxThreadgroupWidth = 1024;
   device.hasUnifiedMemory = true;
-  return test::requireMemoryPlan(
-      device, test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB));
+  ModelMemoryProfile profile = test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB);
+  profile.targetKvLayout = kvLayout;
+  return test::requireMemoryPlan(device, profile);
 }
 
 MemoryAuditResult audit(const EngineMemoryPlan &memoryPlan) {
@@ -132,6 +134,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   engine.resources.kvTier.usedBytes = 4096;
   engine.resources.kvTier.volumeAvailableBytes = 46170898432;
   engine.resources.kvTier.writesGated = engine::DiskWritesGate::Budget;
+  engine.resources.kvTier.writesDeferredMicroseconds = 2'500;
   engine.resources.persistent = true;
   engine.resources.kvTier.copies = 64;
   engine.resources.adoption = {2, 96, 4096, 1};
@@ -204,11 +207,13 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   executorTelemetry.totalDecodeWallSeconds = 1.5;
   executorTelemetry.imageEncodes = 3;
   executorTelemetry.imageEmbeddingReuses = 4;
+  executorTelemetry.imageEmbeddingEvictions = 9;
   executorTelemetry.visionArenaBytes = 5;
   executorTelemetry.embeddingCacheBytes = 6;
   executorTelemetry.stateHeldImageBytes = 7;
   executorTelemetry.imageRowsBytes = 8;
   executorTelemetry.aneFfnReruns = 1;
+  executorTelemetry.verifyBudget = true;
   const AneFfnSnapshot aneFfn{AneFfnSnapshot::State::Stopped,
                               "an evaluation did not complete within 2 s",
                               0.235,
@@ -256,7 +261,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
           "INT8 status lost its KV identity");
   require(json.find("\"cache\":{\"loaded_model_layout_sha256\":\"" + std::string(64, 'a') +
                     "\",\"build_id\":\"build\",\"dtype\":\"q8s8_f32_scale_per_token_"
-                    "head_k_token_major_v_dimension_major\",\"block_tokens\":32}") !=
+                    "head_k_token_major_v_dimension_major\",\"block_tokens\":32,\"rope_scaling\":null}") !=
                   std::string::npos &&
               json.find("runtime_cache_namespace") == std::string::npos,
           "status lost the cache identity or reported a cache namespace");
@@ -268,6 +273,29 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   require(bf16Status.find("\"format\":\"bf16\"") != std::string::npos &&
               bf16Status.find("\"scale_type\":\"none\"") != std::string::npos,
           "BF16 cache identity advertised INT8 storage");
+  // YaRN's factor, to the digits that read back as it, as a context of a
+  // million tokens takes it, and its original window, which every key went
+  // through; the rest of the document keeps its precision.
+  auto yarnIdentity = identity;
+  yarnIdentity.ropeScaling = {3.814697265625, 262144};
+  std::string yarnExpected = json;
+  const std::string unscaled = "\"rope_scaling\":null";
+  yarnExpected.replace(yarnExpected.find(unscaled), unscaled.size(),
+                       "\"rope_scaling\":{\"type\":\"yarn\",\"factor\":3.814697265625,"
+                       "\"original_context_tokens\":262144}");
+  require(runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan), metrics, executorTelemetry,
+                            yarnIdentity, governor, true, {}, wait, NativeLoopTiming{1843.25},
+                            {600.0, false, false, 2, 1}, aneFfn, ThermalState::Fair) == yarnExpected,
+          "the cache identity did not report YaRN, or the status after it lost its precision");
+  auto tokenMajorIdentity = identity;
+  tokenMajorIdentity.kvLayout.valuesTokenMajor = true;
+  const auto tokenMajorStatus = runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
+                        metrics, executorTelemetry, tokenMajorIdentity, governor, true,
+                        {}, {}, {}, {}, {}, {});
+  require(tokenMajorStatus.find("\"dtype\":\"q8s8_f32_scale_per_token_head_k_token_major_v_token_major\"") !=
+                  std::string::npos &&
+              tokenMajorStatus.find("\"value_layout\":\"token_major\"") != std::string::npos,
+          "token-major values were reported dimension-major");
   require(json.find("\"schema_version\":6") != std::string::npos &&
               json.find("\"ready\":true") != std::string::npos,
           "status readiness/schema is wrong");
@@ -275,8 +303,8 @@ void testCleanRuntimeStatus(const char *goldenPath) {
               std::string::npos,
           "status advertised model capacity instead of the active engine limit");
   require(json.find("\"images\":{\"encodes\":3,\"embedding_reuses\":4,"
-                    "\"arena_bytes\":5,\"cached_bytes\":6,\"state_held_bytes\":7,"
-                    "\"rows_bytes\":8}") !=
+                    "\"embedding_evictions\":9,\"arena_bytes\":5,\"cached_bytes\":6,"
+                    "\"state_held_bytes\":7,\"rows_bytes\":8}") !=
               std::string::npos,
           "image telemetry is missing from status");
   require(json.find("\"decode_wall_ms\":10,\"decode_cycle_ms\":12.5,") !=
@@ -300,6 +328,9 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                           "\"total_gpu_ms\":0,\"total_wall_ms\":0}}") !=
               std::string::npos,
           "status invented model timings from request metrics");
+  require(json.find("\"verify_rows\":\"auto\"") != std::string::npos &&
+              unmeasured.find("\"verify_rows\":\"all\"") != std::string::npos,
+          "status lost the rows decode cycles verify");
   require(json.find("\"kv\":{\"block_tokens\":32,"
                     "\"pages_allocated\":128,\"pages_active\":24,"
                     "\"pages_cache\":32,\"pages_free\":72,") !=
@@ -571,6 +602,188 @@ void testWeightsStatus() {
           "an idle release that is off is not null");
 }
 
+// Streamed routed experts' store (--expert-memory): null without one; with
+// one its arena, staging, slots, residency, loads, hit rate, the
+// latencies of its host steps' round trips and its failure. An added field:
+// the schema version stays.
+void testStreamedExpertsStatus() {
+  const auto memoryPlan = plan();
+  const auto status = [&](const std::optional<model::ExpertStoreStats> &experts) {
+    return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, {}, {}, {}, {}, {}, std::nullopt,
+                             experts);
+  };
+  require(status(std::nullopt).find(",\"streamed_experts\":null,") != std::string::npos,
+          "a model without streamed experts does not report null");
+  model::ExpertStoreStats experts{
+      .arenaBytes = 17179869184, .stagingBytes = 452984832, .slots = 8192, .experts = 25088, .resident = 8000};
+  experts.uses[1] = {.loads = 480,
+                     .routed = 4000,
+                     .read = 1000,
+                     .prefetched = 600,
+                     .readAhead = 900,
+                     .readBytes = 1973000000,
+                     .pickup = {.count = 500, .totalMilliseconds = 11.5, .maximumMilliseconds = 0.09,
+                                .p50Milliseconds = 0.032, .p95Milliseconds = 0.032, .p99Milliseconds = 0.064},
+                     .work = {.count = 500, .totalMilliseconds = 240, .maximumMilliseconds = 9.5,
+                              .p50Milliseconds = 0.512, .p95Milliseconds = 2.048, .p99Milliseconds = 8.192},
+                     .resume = {.count = 500, .totalMilliseconds = 48.5, .maximumMilliseconds = 12.5,
+                                .p50Milliseconds = 0.128, .p95Milliseconds = 0.128, .p99Milliseconds = 16.384}};
+  experts.failure = "injected";
+  const std::string none = "{\"p50\":0,\"p95\":0,\"p99\":0,\"max\":0,\"total\":0,\"samples\":0}";
+  require(status(experts).find(
+              "\"streamed_experts\":{\"arena_bytes\":17179869184,\"staging_bytes\":452984832,\"slots\":8192,"
+              "\"experts\":25088,\"resident\":8000,\"prefill\":{\"loads\":0,\"routed\":0,\"read\":0,\"prefetched\":0,"
+              "\"read_ahead\":0,\"hit_rate\":0,\"read_bytes\":0,\"host_steps\":{\"pickup_ms\":" +
+              none + ",\"work_ms\":" + none + ",\"resume_ms\":" + none +
+              "}},\"decode\":{\"loads\":480,\"routed\":4000,\"read\":1000,\"prefetched\":600,"
+              "\"read_ahead\":900,\"hit_rate\":0.75,\"read_bytes\":1973000000,\"host_steps\":"
+              "{\"pickup_ms\":{\"p50\":0.032,\"p95\":0.032,\"p99\":0.064,\"max\":0.09,\"total\":11.5,"
+              "\"samples\":500},\"work_ms\":{\"p50\":0.512,\"p95\":2.048,\"p99\":8.192,\"max\":9.5,"
+              "\"total\":240,\"samples\":500},\"resume_ms\":{\"p50\":0.128,\"p95\":0.128,\"p99\":16.384,"
+              "\"max\":12.5,\"total\":48.5,\"samples\":500}}},\"failure\":\"injected\"}") != std::string::npos,
+          "streamed experts' status differs");
+}
+
+// A target whose KV can spill reports what spilling does under kv_spill,
+// and each active request's kv_mode; one whose KV stays in memory reports
+// neither, as before (its plan's kv_spill is null). The pages that hold only their
+// index are the pool's pages of that form in use, each a spilled block's,
+// which a request holds as the cache does: counted once. An added section:
+// the schema version stays.
+void testKvSpillStatus() {
+  engine::EngineSnapshot engine;
+  engine.activeRequests = {{.id = 7, .phase = engine::Phase::Decode, .promptTokens = 4096, .maxNewTokens = 256},
+                           {.id = 9,
+                            .phase = engine::Phase::Decode,
+                            .promptTokens = 1'000'000,
+                            .promptProcessed = 1'000'000,
+                            .maxNewTokens = 512,
+                            .kvMode = engine::KvMode::Spill}};
+  // That one spilled, one other did after it converted, and one was refused
+  // for want of quota; another start waits for it. Its prefill streamed once
+  // beside a decoder, which waited 40 ms.
+  engine.spill = {.spill = 1, .resident = 3, .converted = 1, .refusedQuota = 1};
+  engine.scheduler.contendedStreamingPrefillBatches = 1;
+  engine.scheduler.decodeGap = {.count = 1, .totalMilliseconds = 40, .maximumMilliseconds = 40,
+                                .p50Milliseconds = 40, .p95Milliseconds = 40, .p99Milliseconds = 40};
+  // 31,250 of its pages hold only their index, of 24 KiB, and a free extent of
+  // them is the runway.
+  engine.resources.pool.index = {.pagesAllocated = 31'506,
+                                 .pagesFree = 256,
+                                 .pagesActive = 31'250,
+                                 .pagesPrefix = 31'250,
+                                 .allocatedBytes = 31'506 * 24'576ULL};
+  ResourceWaitSnapshot wait;
+  wait.diskQuota = 1;
+  KvSpillStatus spill;
+  spill.cache = {.spilledPages = 31'250,
+                 .spilledBytes = 13'312'000'000,
+                 .writeThroughPages = 31'250,
+                 .writeThroughBytes = 13'312'000'000,
+                 .writeThroughInFlight = 3,
+                 .spillMoves = 31'250,
+                 .indexRestores = 12,
+                 .wholeRestores = 2,
+                 .restore = {.count = 2, .totalMilliseconds = 1.5, .maximumMilliseconds = 1, .p50Milliseconds = 0.5,
+                             .p95Milliseconds = 1, .p99Milliseconds = 1},
+                 .activeLimitBytes = 32 * kGiB,
+                 .heldBytes = 13'312'000'000,
+                 .committedBytes = 55'000'000};
+  spill.blockCache = model::KvBlockCacheStats{.bytes = 408'944'640,
+                                              .targetBytes = 408'944'640,
+                                              .floorBytes = 408'944'640,
+                                              .slotsPerLayer = 8'192,
+                                              .lanes = 1,
+                                              .reads = {.resolves = 24,
+                                                        .entries = 98'304,
+                                                        .paged = 1'024,
+                                                        .hits = 60'000,
+                                                        .misses = 37'280,
+                                                        .ghostHits = 512,
+                                                        .readBytes = 310'000'000}};
+  // Two commands read 24 layers' history in 5 s.
+  spill.historyStream = model::KvHistoryStreamStats{
+      .commands = 2,
+      .layers = 24,
+      .pages = 750'000,
+      .bytes = 24'960'000'000,
+      .stagingBytes = 1'056'440'320,
+      .buffers = 2,
+      .read = {.count = 24, .totalMilliseconds = 5'000, .maximumMilliseconds = 250, .p50Milliseconds = 262.144,
+               .p95Milliseconds = 262.144, .p99Milliseconds = 262.144}};
+  const auto status = [&](const EngineMemoryPlan &memoryPlan, const std::optional<KvSpillStatus> &kvSpill) {
+    return runtimeStatusJson(memoryPlan, engine, {}, {}, {}, {}, {}, {}, {}, true, {}, wait, {}, {}, {}, {},
+                             std::nullopt, std::nullopt, kvSpill);
+  };
+  const std::string resident = status(plan(), std::nullopt);
+  const size_t planned = resident.find("\"kv_spill\":null");
+  require(planned < resident.find("\"memory_actual\"") &&
+              resident.find("\"kv_spill\"", planned + 1) == std::string::npos &&
+              resident.find("\"kv_mode\"") == std::string::npos,
+          "a target whose KV stays in memory reported spilling");
+  const std::string json = status(plan(test::sparseKvLayout()), spill);
+  require(json.find("\"id\":7,") < json.find("\"kv_mode\":\"resident\"") &&
+              json.find("\"id\":9,") < json.find("\"kv_mode\":\"spill\""),
+          "the active requests' KV modes are missing");
+  const std::string none = "{\"p50\":0,\"p95\":0,\"p99\":0,\"max\":0,\"total\":0,\"samples\":0}";
+  const std::string expected =
+      "\"kv_spill\":{\"requests\":{\"spill\":1,\"resident\":3,\"converted\":1,\"bounded\":0,\"length_ends\":0,"
+      "\"refused\":{\"quota\":1,\"write_budget\":0,\"closed\":0},\"waiting_quota\":1},\"pages\":{\"index\":31250,"
+      "\"index_bytes\":768000000,\"spilled\":31250,\"spilled_bytes\":13312000000},\"write_through\":{\"pages\":31250,"
+      "\"bytes\":13312000000,\"in_flight\":3,\"failures\":0,\"paused\":false},\"spill_moves\":31250,\"unspills\":0,"
+      "\"rewrites\":0,\"restores\":{\"index_pages\":12,\"whole_pages\":2,\"ms\":{\"p50\":0.5,\"p95\":1,\"p99\":1,"
+      "\"max\":1,\"total\":1.5,\"samples\":2}},\"quota\":{\"active_limit_bytes\":34359738368,\"held_bytes\":"
+      "13312000000,\"committed_bytes\":55000000,\"revoked\":0},\"index_runway_bytes\":6291456,\"block_cache\":"
+      "{\"bytes\":408944640,\"target_bytes\":408944640,\"floor_bytes\":408944640,\"slots_per_layer\":8192,\"lanes\":1,"
+      "\"resolves\":24,\"entries\":98304,\"paged\":1024,\"hits\":60000,\"read\":37280,\"hit_rate\":0.6167763158,"
+      "\"ghost_hits\":512,\"read_bytes\":310000000,\"read_failures\":0,\"resolve_ms\":" +
+      none + ",\"read_ms\":" + none + ",\"host_steps\":{\"pickup_ms\":" + none + ",\"work_ms\":" + none +
+      ",\"resume_ms\":" + none +
+      "}},\"history_stream\":{\"commands\":2,\"contended_commands\":1,\"layers\":24,\"pages\":750000,"
+      "\"bytes\":24960000000,\"staging_bytes\":1056440320,\"buffers\":2,\"read_ms\":{\"p50\":262.144,"
+      "\"p95\":262.144,\"p99\":262.144,\"max\":250,\"total\":5000,\"samples\":24},\"wait_ms\":" +
+      none + ",\"decode_gap_ms\":{\"p50\":40,\"p95\":40,\"p99\":40,\"max\":40,\"total\":40,\"samples\":1}}}";
+  require(json.find(expected) != std::string::npos, "the spilling target's kv_spill differs:\n" + json);
+}
+
+// A streamed table's store (--ple-memory): null without one; with one its
+// memory, per use its stages, rows, hit rate and stage latencies, its reads,
+// prefetches and failure. An added field: the schema version stays.
+void testStreamedTableStatus() {
+  const auto memoryPlan = plan();
+  const auto status = [&](const std::optional<model::SparseRowStats> &table) {
+    return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, {}, {}, {}, {}, {}, table);
+  };
+  require(status(std::nullopt).find(",\"streamed_table\":null,") != std::string::npos,
+          "a model without a streamed table does not report null");
+  model::SparseRowStats table;
+  table.table = "per_layer_token_embd.weight";
+  table.tableBytes = 28800138240;
+  table.cacheBytes = 2147483648;
+  table.cacheCapacityRows = 18000000;
+  table.cachedRows = 1200;
+  table.uses[1] = {10, 1280, 1000, 750, 250, {10, 12.5, 3.25, 1.024, 2.048, 4.096}};
+  table.readBytes = 22500;
+  table.prefetchRequestedRows = 32768;
+  table.prefetchReadRows = 30000;
+  table.poisoned = true;
+  table.failure = "injected";
+  const std::string json = status(table);
+  require(json.find("\"streamed_table\":{\"table\":\"per_layer_token_embd.weight\",\"table_bytes\":28800138240,"
+                    "\"cache_bytes\":2147483648,\"cache_capacity_rows\":18000000,\"cached_rows\":1200,"
+                    "\"evictions\":0,\"prefill\":{\"stages\":0,") != std::string::npos &&
+              json.find("\"decode\":{\"stages\":10,\"requested_rows\":1280,\"unique_rows\":1000,"
+                        "\"hit_rows\":750,\"read_rows\":250,\"hit_rate\":0.75,\"stage_ms\":{\"p50\":1.024,"
+                        "\"p95\":2.048,\"p99\":4.096,\"max\":3.25,\"total\":12.5,\"samples\":10}}") !=
+                  std::string::npos &&
+              json.find("\"read_errors\":0,\"read_ms\":{\"p50\":0,\"p95\":0,\"p99\":0,\"max\":0,\"total\":0,"
+                        "\"samples\":0},\"prefetch_requested_rows\":32768,") != std::string::npos &&
+              json.find("\"prefetch_read_rows\":30000,\"prefetch_dropped_rows\":0,\"poisoned\":true,"
+                        "\"failure\":\"injected\"}") != std::string::npos &&
+              json.find("\"schema_version\":6,") != std::string::npos,
+          "the streamed table's status is missing or inaccurate");
+}
+
 // The prefill FFN's Neural Engine split: off with the start's reason and no
 // share, serving with the start's, stopped with why, and what it ran beside
 // the chunks the GPU ran again.
@@ -701,6 +914,9 @@ int main(int argc, char **argv) {
     testResourceWaitDiagnostics();
     testWeightsStatus();
     testAneFfnStatus();
+    testStreamedTableStatus();
+    testStreamedExpertsStatus();
+    testKvSpillStatus();
     testThermalStateStatus();
     testThermalStateTransitions();
     testStderrLinesStayWhole();

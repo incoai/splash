@@ -12,6 +12,7 @@ import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 
 from . import images, origins
@@ -19,7 +20,14 @@ from .http_security import validate_api_key
 from .protocol import MAX_THINKING_END_TOKENS
 
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+# The targets' native window, the most context without --max-context, and
+# the most context --max-context takes, which YaRN stretches the native window
+# to and Qwen validates (QwenTargetDimensions::nativeContextTokens,
+# yarnContextTokens).
 MAX_CONTEXT_TOKENS = 262144
+MAX_YARN_CONTEXT_TOKENS = 1010000
+# The suffixes of a --max-context: K, 1024 tokens, and M, a million.
+_CONTEXT_UNITS = {"K": 1024, "M": 1000000}
 DEFAULT_MAX_REQUEST_BYTES = 128 * 1024 * 1024
 DEFAULT_QUEUE_SIZE = 32
 # The port both commands serve on unless --port names another, or for the
@@ -30,6 +38,8 @@ _SIZE_UNITS = {
     for power, unit in enumerate(("K", "M", "G"), 1)
     for suffix in ("", "B", "IB")
 }
+# A size's number: whole, or with a fraction before a unit (2.5G).
+_SIZE_NUMBER = re.compile(r"\d+(\.\d+)?")
 # A model ID, as --model takes it: OWNER/REPO, a Hugging Face repository ID
 # by the Hub's rule, then optionally :VARIANT, which names the GGUF to serve,
 # such as UD-Q4_K_M.
@@ -81,25 +91,31 @@ def parse_model_id(value):
 
 
 def parse_max_context(value):
-    """'auto' (None), or a token count; K is 1024 tokens."""
+    """'auto' (None), or a token count with an optional _CONTEXT_UNITS suffix,
+    up to MAX_YARN_CONTEXT_TOKENS: the engine serves one past the native
+    window with YaRN."""
     normalized = value.strip().upper()
     if normalized == "AUTO":
         return None
+    number, multiplier = normalized, 1
+    if normalized[-1:] in _CONTEXT_UNITS:
+        number, multiplier = normalized[:-1], _CONTEXT_UNITS[normalized[-1]]
     try:
-        tokens = (
-            int(normalized[:-1]) * 1024 if normalized.endswith("K") else int(normalized)
-        )
+        tokens = int(number) * multiplier
     except ValueError:
         tokens = 0
-    if not 1 <= tokens <= MAX_CONTEXT_TOKENS:
+    if not 1 <= tokens <= MAX_YARN_CONTEXT_TOKENS:
         raise argparse.ArgumentTypeError(
-            "must be 'auto' or a token count up to 256K, such as 100K"
+            "must be 'auto' or a token count up to 1010000, such as 100K or 1M "
+            "(K = 1024 tokens, M = 1000000 tokens)"
         )
     return tokens
 
 
 def parse_max_memory(value):
-    """'auto' (None), or a byte count with an optional K, M or G suffix."""
+    """'auto' (None), or a byte count with an optional K, M or G suffix; a
+    count with a suffix may have a fraction (2.5G), rounded down to whole
+    bytes."""
     normalized = value.strip().upper()
     if normalized == "AUTO":
         return None
@@ -108,13 +124,13 @@ def parse_max_memory(value):
         if normalized.endswith(suffix):
             normalized, multiplier = normalized[: -len(suffix)], _SIZE_UNITS[suffix]
             break
-    try:
-        size = int(normalized) * multiplier
-    except ValueError:
-        size = 0
+    number = _SIZE_NUMBER.fullmatch(normalized)
+    size = 0
+    if number and (multiplier > 1 or not number.group(1)):
+        size = int(Decimal(normalized) * multiplier)
     if not 1 <= size <= 2**63 - 1:
         raise argparse.ArgumentTypeError(
-            "must be 'auto' or a positive byte count such as 32G"
+            "must be 'auto' or a positive byte count such as 32G or 2.5G"
         )
     return size
 
@@ -144,6 +160,36 @@ def parse_max_cache_disk_writes(value):
     if size is None:
         raise argparse.ArgumentTypeError("use 0 for no limit, or a size such as 200G")
     return size
+
+
+def _memory_size(value, example, choices):
+    """'auto' (None), one of `choices` as given in lowercase, or a byte count
+    with an optional K, M or G suffix: the memory of a store the engine plans
+    when it is auto. The engine refuses a size below the store's smallest."""
+    normalized = value.strip().lower()
+    if normalized == "auto":
+        return None
+    if normalized in choices:
+        return normalized
+    try:
+        return parse_max_memory(value)
+    except argparse.ArgumentTypeError:
+        options = ", ".join(("auto", *choices))
+        raise argparse.ArgumentTypeError(
+            f"use {options}, or a size such as {example}"
+        ) from None
+
+
+def parse_ple_memory(value):
+    return _memory_size(value, "2G", ("off",))
+
+
+def parse_expert_memory(value):
+    return _memory_size(value, "16G", ("off",))
+
+
+def parse_sparse_kv_memory(value):
+    return _memory_size(value, "1200M", ())
 
 
 def parse_cache_dir(value):
@@ -402,9 +448,49 @@ SERVE_OPTIONS = (
             type=parse_max_context,
             default=None,
             metavar="TOKENS",
-            help="context token limit, e.g. 100K (K = 1024 tokens); it can only "
-            "lower the automatic limit, the model's native window when memory "
-            "holds it (default: auto)",
+            help="context token limit, e.g. 100K or 1M (K = 1024 tokens, M = "
+            "1000000 tokens), up to 1010000; past the model's 256K native window "
+            "it turns on YaRN, which is static and changes answers at every "
+            "length, so pass more than 256K only when a request needs it "
+            "(default: auto, the native window when memory holds it)",
+        ),
+    ),
+    ServeOption(
+        "--ple-memory",
+        "memory",
+        dict(
+            type=parse_ple_memory,
+            default=None,
+            metavar="SIZE",
+            help="RAM row cache of the PLE n-gram table of a Qwen3.8-Flash-Next "
+            "GGUF, e.g. 2G, which streams the rest from the SSD; off loads the "
+            "whole table, tens of GB (default: auto, which streams it where "
+            "memory cannot hold it)",
+        ),
+    ),
+    ServeOption(
+        "--expert-memory",
+        "memory",
+        dict(
+            type=parse_expert_memory,
+            default=None,
+            metavar="SIZE",
+            help="RAM slots of the routed experts of a MoE model, e.g. 16G, which "
+            "reads the others from the SSD when a token routes them; off loads "
+            "every expert (default: auto, which loads them all where memory "
+            "holds them and otherwise gives them what the context leaves)",
+        ),
+    ),
+    ServeOption(
+        "--sparse-kv-memory",
+        "memory",
+        dict(
+            type=parse_sparse_kv_memory,
+            default=None,
+            metavar="SIZE",
+            help="RAM cache of the KV blocks a block-sparse model such as "
+            "Qwen3.8-Flash-Next reads of requests whose KV is on the SSD, e.g. "
+            "1200M; never below its floor (default: auto, its floor)",
         ),
     ),
     ServeOption(
@@ -448,8 +534,9 @@ SERVE_OPTIONS = (
             default=None,
             metavar="SIZE",
             help="SSD quota for cached KV pages and states: auto follows the "
-            "volume's free space up to 32G, 0 disables, or a size such as 16G "
-            "(default: auto)",
+            "volume, a quarter of its free space beyond a floor of 10G (5%% of "
+            "a volume under 200G), at most 32G; a size such as 16G is held as "
+            "given while the volume keeps that floor; 0 disables (default: auto)",
         ),
     ),
     ServeOption(
@@ -608,6 +695,19 @@ SERVE_OPTIONS = (
             default=False,
             help="prefill on the GPU alone (default: a dense model's long "
             "prompts also use the Neural Engine when that is faster)",
+        ),
+    ),
+    ServeOption(
+        "--verify-rows",
+        "requests",
+        dict(
+            choices=("auto", "all"),
+            default="auto",
+            help="rows of each draft block decode verifies: all verifies every "
+            "row, so a MoE model's greedy and seeded outputs repeat as a dense "
+            "model's do (default: auto, where a verify budget learned from "
+            "earlier cycles chooses a MoE model's rows, which is faster but "
+            "lets those outputs differ from run to run)",
         ),
     ),
     ServeOption(

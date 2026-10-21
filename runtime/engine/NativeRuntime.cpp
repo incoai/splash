@@ -202,6 +202,8 @@ bool NativeRuntime::weightsRefused(metal::AllocationFailure failure) {
 }
 
 void NativeRuntime::executionFailed(std::exception_ptr failure) {
+  if (config_.engineFailed)
+    config_.engineFailed();
   try {
     std::rethrow_exception(failure);
   } catch (const metal::MetalBackendError &error) {
@@ -407,9 +409,11 @@ bool NativeRuntime::handleIssue(protocol::ProtocolIssue issue) {
 }
 
 void NativeRuntime::requestError(uint64_t requestId, std::string code,
-                                 std::string message, bool retryable) {
+                                 std::string message, bool retryable,
+                                 uint32_t retryAfterSeconds) {
   send(protocol::ErrorEvent{protocol::FailureClass::RequestError, requestId,
-                            retryable, std::move(code), std::move(message)});
+                            retryable, std::move(code), std::move(message),
+                            retryAfterSeconds});
 }
 
 void NativeRuntime::engineError(std::string code, std::string message) {
@@ -536,7 +540,7 @@ void NativeRuntime::maskRequested(uint64_t requestId,
       std::vector<uint32_t>(simulationTokens.begin(), simulationTokens.end())});
 }
 
-void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
+void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason, bool bounded,
                               uint32_t promptTokens, uint32_t completionTokens,
                               uint32_t deduplicatedTokens,
                               std::span<const float> optionLogits,
@@ -553,17 +557,17 @@ void NativeRuntime::completed(uint64_t requestId, EngineFinishReason reason,
       telemetry.firstTokenMilliseconds ? durationMicros(first, now) : 0,
       durationMicros(telemetry.arrivedMilliseconds, now),
       std::vector<float>(optionLogits.begin(), optionLogits.end()),
-      deduplicatedTokens, speculation});
+      deduplicatedTokens, speculation, bounded});
   ended(requestId, now);
 }
 
 void NativeRuntime::failed(uint64_t requestId, LaneOutcome outcome,
-                           std::string message) {
+                           std::string message, uint32_t retryAfterSeconds) {
   const LaneOutcomeWire wire = laneOutcomeWire(outcome);
   if (outcome == LaneOutcome::CapacityExhausted)
     config_.metrics->capacityFailed();
   requestError(requestId, std::string(wire.code), std::move(message),
-               wire.retryable);
+               wire.retryable, retryAfterSeconds);
   ended(requestId, config_.monotonicMilliseconds());
 }
 

@@ -35,7 +35,8 @@ def benchmark_document(
     ]
     requests = (
         [(scenario, 14096) for scenario in regression.PARTIAL if "partial" in scenarios]
-        + [("short", rows + 1) for rows in regression.SHORT if "short" in scenarios]
+        # A short prompt holds its chunk's rows, as backend-benchmark sends it.
+        + [("short", rows) for rows in regression.SHORT if "short" in scenarios]
         + [(name, 40) for name in regression.TRANSCRIPTS if "transcripts" in scenarios]
     )
     measurements = [
@@ -134,7 +135,7 @@ class BackendRegressionTests(unittest.TestCase):
             "partial_4k_hit_ttft_ms": slower("ttft_ms", 1.05, "partial_4k_hit"),
             # A prompt of a 512-row chunk 2.5% slower: beyond the 2% floor.
             "short_512_rows_prefill_gpu_ms": slower(
-                "prefill_gpu_ms", 1.025, "short", tokens=513
+                "prefill_gpu_ms", 1.025, "short", tokens=512
             ),
         }.items():
             with self.subTest(metric=name):
@@ -320,6 +321,15 @@ class BackendRegressionTests(unittest.TestCase):
                     [benchmark_document(names) for names in documents],
                     scenarios,
                 )
+        # A build before c3dcf53f sent each short prompt a token past its chunk,
+        # which ran as a command of its own: not the prefill this build times.
+        older = benchmark_document(("short",))
+        for measurement in older["measurements"]:
+            measurement["prompt_tokens"] += 1
+        with self.assertRaisesRegex(
+            regression.RegressionError, "a token past their chunk"
+        ):
+            regression.round_record("baseline", [older], ("short",))
 
     def fake_checkout(
         self,
@@ -334,9 +344,12 @@ class BackendRegressionTests(unittest.TestCase):
         context=CONTEXT,
         minimum_rows=832,
         earlier=False,
+        streams=True,
     ):
         """A checkout whose backend-benchmark prints canned output and logs
-        its invocations. Its weight-digests prints one image of digest; a
+        its invocations. Its weight-digests prints one image of digest, logs
+        the arguments after its library in digests.log, and names
+        --expert-memory and --ple-memory in its usage with streams; a
         build of an earlier release (earlier) has none, and its benchmark
         prepares that image into its weight cache instead. Its benchmark takes a list of scenarios with list_support, the short
         and transcripts scenarios among them with short and transcripts too,
@@ -354,7 +367,14 @@ class BackendRegressionTests(unittest.TestCase):
         else:
             tool = checkout / "build" / weights.WEIGHT_DIGESTS
             image = {"component": "target/layer-0.bin", "bytes": 1, "sha256": digest}
-            tool.write_text(f"#!/bin/sh\necho '{json.dumps([image])}'\n")
+            options = " [--expert-memory SIZE] [--ple-memory SIZE]" if streams else ""
+            tool.write_text(
+                "#!/bin/sh\n"
+                "test $# -gt 0 || { echo 'usage: weight-digests METALLIB "
+                f"MODEL_DIRECTORY{options}' >&2; exit 2; }}\n"
+                f"shift; echo {name} \"$@\" >> '{root / 'digests.log'}'\n"
+                f"echo '{json.dumps([image])}'\n"
+            )
             tool.chmod(0o755)
         usage = (
             "[--scenario NAME[,NAME...]]"
@@ -552,12 +572,105 @@ class BackendRegressionTests(unittest.TestCase):
                 [f"target/layer-0.bin: the baseline loaded {a}, the candidate {b}"],
             )
 
+        # A change of the image layout reports the images it changed and
+        # fails nothing.
+        with TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            self.fake_checkout(root, "baseline", a, True)
+            self.fake_checkout(root, "candidate", b, True)
+            self.assertEqual(self.run_main(root, "--expect-image-change"), 0)
+            document = json.loads(
+                (root / "release/backend-regression.json").read_text()
+            )
+            self.assertTrue(document["pass"] and document["expect_image_change"])
+            self.assertFalse(document["weights"]["pass"])
+
         with TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             self.fake_checkout(root, "baseline", a, True)
             self.fake_checkout(root, "candidate", a, True, earlier=True)
             with self.assertRaises(SystemExit):
                 self.run_main(root)
+
+    def test_both_builds_load_the_compared_images_as_the_options_say(self):
+        # The options stream the routed experts and the PLE table in each
+        # build's weight-digests, and only where they are given; the result
+        # records them and its report names them.
+        streamed = ["--expert-memory", "7G", "--ple-memory", "2G"]
+        for options, reported in (
+            ([], "weight bytes: 1 images PASS"),
+            (
+                streamed[2:],
+                "weight bytes: 1 images (loaded with --ple-memory 2G) PASS",
+            ),
+            (
+                streamed,
+                "weight bytes: 1 images "
+                "(loaded with --expert-memory 7G --ple-memory 2G) PASS",
+            ),
+        ):
+            with self.subTest(options=options), TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                self.fake_checkout(root, "baseline", "a" * 64, True)
+                self.fake_checkout(root, "candidate", "a" * 64, True)
+                self.assertEqual(self.run_main(root, *options), 0)
+                calls = [
+                    line.split()
+                    for line in (root / "digests.log").read_text().splitlines()
+                ]
+                self.assertEqual([call[0] for call in calls], ["baseline", "candidate"])
+                for call in calls:
+                    self.assertEqual(call[2:], options)
+                document = json.loads(
+                    (root / "release/backend-regression.json").read_text()
+                )
+                self.assertEqual(document["weight_digest_options"], options)
+                with contextlib.redirect_stdout(io.StringIO()) as printed:
+                    regression.report(document)
+                self.assertIn(reported, printed.getvalue().splitlines())
+
+    def test_options_a_build_cannot_take_are_refused_before_the_rounds(self):
+        # A baseline of an earlier release has no weight-digests, and one
+        # from before the options takes none of them; the candidate's must
+        # take them too. Without the options such builds compare.
+        for baseline, candidate, refused in (
+            ({"earlier": True}, {}, "baseline"),
+            ({"streams": False}, {}, "baseline"),
+            ({}, {"streams": False}, "candidate"),
+        ):
+            with (
+                self.subTest(baseline=baseline, candidate=candidate),
+                TemporaryDirectory() as directory,
+            ):
+                root = Path(directory).resolve()
+                self.fake_checkout(root, "baseline", "a" * 64, True, **baseline)
+                self.fake_checkout(root, "candidate", "a" * 64, True, **candidate)
+                (root / "model").mkdir()
+                (root / "model/model.json").write_text("{}")
+                with (
+                    contextlib.redirect_stderr(io.StringIO()) as errors,
+                    self.assertRaises(SystemExit),
+                ):
+                    regression.parse_args(
+                        [
+                            "--baseline",
+                            str(root / "baseline"),
+                            "--candidate",
+                            str(root / "candidate"),
+                            "--model-root",
+                            str(root / "model"),
+                            "--expert-memory",
+                            "7G",
+                            "--ple-memory",
+                            "2G",
+                        ]
+                    )
+                self.assertIn(
+                    f"the {refused} build has no {weights.WEIGHT_DIGESTS} that "
+                    "takes --expert-memory and --ple-memory",
+                    errors.getvalue(),
+                )
+                self.assertEqual(self.run_main(root), 0)
 
     def test_later_rounds_run_the_first_reported_ane_ffn_split(self):
         calibrated = 1 - 24 / 34

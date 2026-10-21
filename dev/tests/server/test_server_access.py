@@ -20,7 +20,7 @@ PARSERS = (
     (launcher.parse_args, ["serve", "--model", "owner/repo"]),
     (
         server.parse_args,
-        ["model", "--tokenizer", "tokenizer", "--model", "owner/repo"],
+        ["model", "--model", "owner/repo"],
     ),
 )
 

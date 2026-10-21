@@ -1,20 +1,31 @@
-// Loads every weight image of an installed model as the engine does and
+// Loads the weight images of an installed model as the engine does and
 // prints, one per line of a JSON array in load order, the component, size and
 // SHA-256 of each: the release check records them (verify-models) and the
 // regression benchmarks compare them between builds (dev/benchmarks/weights.py).
 //
-//   weight-digests METALLIB MODEL_DIRECTORY
+//   weight-digests METALLIB MODEL_DIRECTORY [--expert-memory SIZE] [--ple-memory SIZE]
+//
+// The options stream a MoE target's routed experts and a Qwen3.8-Flash-Next
+// target's PLE table from their files, as the runtime oracle's do
+// (tools/LoadOptions.hpp), for a Mac whose memory cannot hold every image or
+// whose largest Metal buffer cannot hold one. What streams has no image: the
+// layers' images leave out their routed experts and a table that streams has
+// none (ple.bin), so the digests cover neither; the engine reads their bytes
+// from the source files. Any SIZE the stores take loads the same images.
 #import <Foundation/Foundation.h>
 
 #include "metal/MetalBackend.hpp"
 #include "model/ModelDescriptor.hpp"
 #include "model/ModelFactory.hpp"
+#include "model/SsdReaders.hpp"
 #include "model/WeightImages.hpp"
+#include "tools/LoadOptions.hpp"
 
 #include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -22,15 +33,23 @@ using namespace splash;
 
 int main(int argc, char **argv) {
   @autoreleasepool {
-    if (argc != 3) {
-      std::fprintf(stderr, "usage: weight-digests METALLIB MODEL_DIRECTORY\n");
+    const auto usage = [] {
+      std::fprintf(stderr,
+                   "usage: weight-digests METALLIB MODEL_DIRECTORY [--expert-memory SIZE] [--ple-memory SIZE]\n");
       return 2;
-    }
+    };
+    // Options come as option-value pairs.
+    if (argc < 3 || argc % 2 == 0) return usage();
     try {
+      model::ModelLoadOptions options;
+      for (int index = 3; index < argc; index += 2)
+        if (!tools::takeLoadOption(argv[index], argv[index + 1], options)) return usage();
+      // Streamed weights read on a pool of SSD readers, as the engine's do.
+      options.readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
       metal::MetalBackend backend(argv[1]);
       const std::filesystem::path root = std::filesystem::canonical(argv[2]);
       const model::LoadedModel loaded =
-          model::loadModel(backend, root, model::inspectModelRoot(root));
+          model::loadModel(backend, root, model::inspectModelRoot(root), options);
       const auto images = loaded.images->contents();
       std::vector<std::string> digests(images.size());
       model::parallelFor(images.size(), [&](size_t index, unsigned) {

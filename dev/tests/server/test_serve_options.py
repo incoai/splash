@@ -14,7 +14,7 @@ from server.origins import ANY_ORIGIN
 
 ROOT = Path(__file__).resolve().parents[3]
 # Each parser, with the arguments it requires.
-SERVER_ARGS = ["model", "--tokenizer", "tokenizer", "--model", "owner/repo"]
+SERVER_ARGS = ["model", "--model", "owner/repo"]
 LAUNCHER_ARGS = ["serve", "--model", "owner/repo"]
 PARSERS = ((api.parse_args, SERVER_ARGS), (launcher.parse_args, LAUNCHER_ARGS))
 
@@ -31,6 +31,23 @@ def values(flag, accepted, refused, repeatable=False):
     )
 
 
+# Up to the native window and past it, where the engine serves the context
+# with YaRN, to the 1010000 tokens Qwen validates; K is 1024 tokens and M a
+# million.
+ACCEPTED_CONTEXTS = {
+    "auto": None,
+    "100K": 102400,
+    "256k": 262144,
+    "262144": 262144,
+    "1": 1,
+    "262145": 262145,
+    "512K": 524288,
+    "1m": 1000000,
+    "1000000": 1000000,
+    "1010000": 1010000,
+}
+# Past 1010000 tokens (987K is 1010688), or no count of tokens.
+REFUSED_CONTEXTS = ("0", "-1", "1010001", "987K", "2M", "1.5M", "M", "bad")
 # Every shared option: accepted arguments with the value they parse to, and
 # refused arguments.
 OPTIONS = {
@@ -65,6 +82,39 @@ OPTIONS = {
         "--state-format", {"fp32": "fp32", "bf16": "bf16"}, ("fp16", "int8")
     ),
     "--disable-ane": ([(["--disable-ane"], True)], []),
+    "--verify-rows": values(
+        "--verify-rows",
+        {"auto": "auto", "all": "all"},
+        ("", "budget", "every", "ALL"),
+    ),
+    "--ple-memory": values(
+        "--ple-memory",
+        {
+            "auto": None,
+            "off": "off",
+            "OFF": "off",
+            "1M": 1024**2,
+            "2G": 2 * 1024**3,
+            "0.75G": 768 * 1024**2,
+        },
+        ("0", "bad", "-2G", ".5G"),
+    ),
+    "--expert-memory": values(
+        "--expert-memory",
+        {
+            "auto": None,
+            "off": "off",
+            "OFF": "off",
+            "512M": 512 * 1024**2,
+            "16G": 16 * 1024**3,
+        },
+        ("0", "bad", "-2G"),
+    ),
+    "--sparse-kv-memory": values(
+        "--sparse-kv-memory",
+        {"auto": None, "AUTO": None, "1200M": 1200 * 1024**2},
+        ("0", "off", "bad", "-2G"),
+    ),
     "--max-memory": values(
         "--max-memory",
         {
@@ -73,8 +123,10 @@ OPTIONS = {
             "1GiB": 1024**3,
             "512mb": 512 * 1024**2,
             "1073741824": 1024**3,
+            "10.4G": 11166914969,
+            "2.5g": 5 * 512 * 1024**2,
         },
-        ("0", "-1G", "bad", "G", str(2**64)),
+        ("0", "-1G", "bad", "G", str(2**64), "1.5", "2.G", "1e3G", "0.0000000001K"),
     ),
     "--idle-release": values(
         "--idle-release",
@@ -121,11 +173,7 @@ OPTIONS = {
             ["--cache-dir=", "--persistent-cache", "--max-cache-disk=5G"],
         ],
     ),
-    "--max-context": values(
-        "--max-context",
-        {"auto": None, "100K": 102400, "256k": 262144, "262144": 262144, "1": 1},
-        ("0", "-1", "257K", "262145", "bad"),
-    ),
+    "--max-context": values("--max-context", ACCEPTED_CONTEXTS, REFUSED_CONTEXTS),
     "--decode-share": values(
         "--decode-share",
         {"0": 0.0, "0.25": 0.25, "2": 2.0},
@@ -343,13 +391,7 @@ class ServeOptionsTests(unittest.TestCase):
     def test_server_requires_explicit_model_and_paths(self):
         model = "community/custom-splash"
         package = api.ROOT / "install/models" / model
-        required = [
-            str(package),
-            "--tokenizer",
-            str(package / "tokenizer"),
-            "--model",
-            model,
-        ]
+        required = [str(package), "--model", model]
         for arguments in (
             [],
             required[:-2],
@@ -366,7 +408,6 @@ class ServeOptionsTests(unittest.TestCase):
                 api.parse_args(arguments)
         args = api.parse_args(required)
         self.assertEqual(Path(args.model_root), package)
-        self.assertEqual(Path(args.tokenizer), package / "tokenizer")
         self.assertIsNone(args.request_timeout)
         self.assertEqual(args.model, model)
         self.assertEqual(Path(args.binary).name, "splash")
@@ -378,13 +419,7 @@ class ServeOptionsTests(unittest.TestCase):
     def test_native_command_passes_each_serve_option(self):
         model = "community/custom-splash"
         package = api.ROOT / "install/models" / model
-        required = [
-            str(package),
-            "--tokenizer",
-            str(package / "tokenizer"),
-            "--model",
-            model,
-        ]
+        required = [str(package), "--model", model]
         args = api.parse_args(required)
         # The engine's command line for each option, which the engine reads as
         # the server means it (native_arguments_test.cpp). The engine keeps
@@ -397,6 +432,7 @@ class ServeOptionsTests(unittest.TestCase):
                 self.assertEqual(
                     api._native_command(
                         api.parse_args([*required, *options]),
+                        args.model_root,
                         61433 if name.startswith("relaunch") else None,
                     ),
                     [args.binary, "serve-native", args.model_root, *arguments],

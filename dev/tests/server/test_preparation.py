@@ -1,3 +1,4 @@
+import base64
 import json
 import threading
 import time
@@ -10,12 +11,16 @@ from dev.tests.server_fixtures import (
     FakeRuntime,
     FakeTokenizer,
     HarnessTestCase,
+    ImagePadTokenizer,
     anthropic_body,
     chat_body,
     make_frontend,
+    pdf_bytes,
     responses_body,
 )
+from server import documents
 from server import server as api
+from server.lru import LRUCache
 
 
 class BlockingTokenizer(FakeTokenizer):
@@ -49,7 +54,83 @@ class BlockingTokenizer(FakeTokenizer):
                 self.active -= 1
 
 
+class WatchedLock:
+    """A lock that tells when a thread first waits for it."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.waited = threading.Event()
+
+    def acquire(self, timeout=-1):
+        self.waited.set()
+        return self.lock.acquire(timeout=timeout)
+
+    def release(self):
+        self.lock.release()
+
+
 class PreparationTests(HarnessTestCase):
+    def test_a_request_waits_for_the_pdf_worker_without_a_preparation_slot(self):
+        # One worker renders PDFs. A request that waits for it, while another
+        # PDF renders, gives its preparation slot back, so the only slot
+        # prepares other requests meanwhile, and takes it again to finish; a
+        # request whose PDF fails to render ends without one.
+        app = make_frontend(
+            ImagePadTokenizer(),
+            SimpleNamespace(status=lambda: {}),
+            "test-model",
+            65536,
+            10,
+            1,
+            vision=True,
+        )
+        idle = {"preparation_capacity": 1, "active": 0, "waiting": 0}
+        for payload, failure in (
+            (pdf_bytes("WAITS FOR THE WORKER"), None),
+            (b"not a PDF", "PDF document could not be decoded"),
+        ):
+            encoded = base64.b64encode(payload).decode()
+            part = {"file_data": f"data:application/pdf;base64,{encoded}"}
+            body = chat_body(
+                messages=[{"role": "user", "content": [{"type": "file", "file": part}]}]
+            )
+            worker = WatchedLock()
+            results = []
+
+            def count(body=body, results=results):
+                try:
+                    results.append(app.count_tokens(body, deadline=FOREVER))
+                except api.APIError as error:
+                    results.append(error.message)
+
+            thread = threading.Thread(target=count)
+            with (
+                self.subTest(failure=failure),
+                mock.patch.object(documents, "_render_lock", worker),
+                mock.patch.object(
+                    documents,
+                    "_cache",
+                    LRUCache(documents.CACHE_BYTES, documents.CACHE_ENTRIES),
+                ),
+            ):
+                worker.lock.acquire()
+                thread.start()
+                try:
+                    self.assertTrue(worker.waited.wait(5))
+                    self.assertEqual(app.status()["frontend"], idle)
+                    self.assertEqual(app.count_tokens(chat_body(), deadline=FOREVER), 2)
+                finally:
+                    # Another PDF's render ends.
+                    worker.lock.release()
+                    thread.join(30)
+                # The PDF's count, now that it is cached, or its error.
+                expected = failure or app.count_tokens(body, deadline=FOREVER)
+                self.assertEqual(results, [expected])
+                self.assertEqual(app.status()["frontend"], idle)
+                self.assertTrue(app.preparation_slots.acquire(blocking=False))
+                self.assertFalse(app.preparation_slots.acquire(blocking=False))
+                app.preparation_slots.release()
+
     def test_frontend_limits_generation_and_token_count_preparation_to_two(self):
         tokenizer = BlockingTokenizer()
         app = make_frontend(

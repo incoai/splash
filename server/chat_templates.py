@@ -37,14 +37,16 @@ Tokenizer files and the tokenizer object are never modified.
 
 import json
 import re
+import sys
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import lru_cache
 
 from jinja2 import Environment, TemplateError, TemplateSyntaxError, nodes
 from jinja2.ext import Extension
 from jinja2.lexer import Token
 
+from .lru import LRUCache, memoized
 from .serve_options import REASONING_EFFORTS
 
 # Template arguments request preparation sets itself, and apply_chat_template's
@@ -65,8 +67,13 @@ RESERVED_TEMPLATE_KWARGS = frozenset(
 # Template options that cannot shape the generation prompt: those (the probe
 # renders without tools) and preserve_thinking, which only changes history.
 _HISTORY_OPTIONS = RESERVED_TEMPLATE_KWARGS | {"preserve_thinking"}
-# Combinations of other template variables whose generation prompts are kept.
+# Combinations of other template variables whose generation prompts are kept,
+# at most this many. A request may make its variables as large as its body,
+# and a template may render them into its generation prompt, so the variables
+# and the prompts' text and tokens are kept within this many bytes too, as the
+# server's other caches of request text are.
 _PROBED_OPTIONS = 64
+_PROBED_OPTIONS_BYTES = 8 * 1024 * 1024
 
 # What Splash does with a later system message.
 NATIVE = "native"
@@ -273,10 +280,16 @@ def _prepare(render, encode, source):
         if patched is not None and _verified(render, source, patched):
             source, later_system = patched, PATCHED
 
-    @lru_cache(maxsize=_PROBED_OPTIONS)
+    probed = LRUCache(_PROBED_OPTIONS_BYTES, _PROBED_OPTIONS)
+    lock = threading.Lock()
+
     def probe(key):
-        options = {**json.loads(key), "add_generation_prompt": True}
-        return _generation_prompt(render, encode, source, options) or ("", ())
+        def generation_prompt():
+            options = {**json.loads(key), "add_generation_prompt": True}
+            found = _generation_prompt(render, encode, source, options) or ("", ())
+            return found, _probed_bytes(key, found)
+
+        return memoized(probed, lock, key, generation_prompt)
 
     return ChatTemplate(
         source,
@@ -411,6 +424,18 @@ def _generation_prompt(render, encode, source, options):
     if len(texts) == 1 and (text := texts.pop()):
         return text, tuple(encode(text))
     return None
+
+
+def _probed_bytes(key, found):
+    """The bytes a probed generation prompt keeps: its key, and the text and
+    tokens found for it, a tuple of ints."""
+    text, tokens = found
+    return (
+        sys.getsizeof(key)
+        + sys.getsizeof(text)
+        + sys.getsizeof(tokens)
+        + sum(map(sys.getsizeof, tokens))
+    )
 
 
 def _outcome(render, source, messages, options):

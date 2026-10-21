@@ -41,12 +41,15 @@ inline constexpr uint32_t draft_dynamic_width(uint32_t hidden) {
 // The batched draft kernels' grids cover exactly the dispatch's lanes:
 // per-lane arrays hold those lanes, and entries past them are zero and unread.
 
+// A convolution stage (finish: the second, with the residual) of a draft
+// `hidden` wide, a whole number of convolution groups.
 struct DraftConvBatchParams {
   uint32_t finish;
+  uint32_t hidden;
 };
 
-static_assert(sizeof(DraftConvBatchParams) == 4,
-              "Draft convolution parameters are 4 bytes on both sides");
+static_assert(sizeof(DraftConvBatchParams) == 8,
+              "Draft convolution parameters are 8 bytes on both sides");
 
 // The attention core's split count (SPLASH_DRAFT_ATTENTION_SPLITS) and its
 // rings' slots per KV head (SPLASH_DRAFT_SLIDING_WINDOW) are compiled in.

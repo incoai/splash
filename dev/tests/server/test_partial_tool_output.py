@@ -2,6 +2,7 @@ import json
 import random
 import re
 import unittest
+from contextlib import nullcontext
 from unittest import mock
 
 from dev.tests.server_fixtures import (
@@ -442,6 +443,126 @@ class PartialToolOutputTests(unittest.TestCase):
                         expected,
                     )
 
+    def test_a_think_end_in_the_answer_is_dropped_however_the_text_is_cut(self):
+        # Only the tag goes, the newlines around it stay, and <think> is text.
+        text = "Content here.</think>More content.\n</think>\nEnd <think>kept"
+        expected = "Content here.More content.\n\nEnd <think>kept"
+        for policy in (None, weather_policy()):
+            for size in range(1, len(text) + 1):
+                with self.subTest(tools=policy is not None, size=size):
+                    content, calls, projected = project(text, policy, size=size)
+                    self.assertEqual((content, calls), (expected, []))
+                    self.assertEqual(streamed_text(projected), expected)
+
+    def test_a_think_end_stays_in_tool_arguments_and_in_json(self):
+        text = "Sure.</think>" + weather_call("Par</think>is")
+        for size in range(1, len(text) + 1):
+            with self.subTest(size=size):
+                content, calls, projected = project(text, weather_policy(), size=size)
+                self.assertEqual(content, "Sure.")
+                self.assertEqual(
+                    [json.loads(call["function"]["arguments"]) for call in calls],
+                    [{"city": "Par</think>is"}],
+                )
+        # A structured answer's JSON is data, with tools or without.
+        answer = '{"note": "a</think>b"}'
+        for policy in (None, weather_policy()):
+            projector = model_output.StreamingToolCallProjector(
+                policy, "json", structured=True
+            )
+            events = projector.put(answer)
+            content, calls, owed = projector.finish(False)
+            self.assertEqual((content, calls), (answer, []))
+            self.assertEqual(streamed_text(events + owed), answer)
+
+    def test_a_cut_answer_drops_only_a_trailing_partial_think_end(self):
+        # As with tools: a partial tag the limit cut is dropped, and one an
+        # answer ended with is its text.
+        for incomplete, expected in ((False, "Done.</thi"), (True, "Done.")):
+            content, _, projected = project(
+                "Done.</thi", None, incomplete=incomplete, size=1
+            )
+            self.assertEqual(content, expected)
+            self.assertEqual(streamed_text(projected), expected)
+
+    def test_a_think_end_after_the_reasoning_is_dropped_in_any_protocol(self):
+        # Whether each output thinks, its text, and its reasoning and text
+        # as every protocol returns them, streamed or not, with tools offered
+        # or not.
+        outputs = (
+            (
+                True,
+                "Reasoning here.</think>Content here.</think>More content.",
+                [
+                    ("reasoning", "Reasoning here."),
+                    ("text", "Content here.More content."),
+                ],
+            ),
+            (
+                True,
+                "why\n</think>\n\nA\n</think>\nB",
+                [("reasoning", "why\n"), ("text", "A\n\nB")],
+            ),
+            # With thinking off, the template ended the reasoning in the prompt.
+            (False, "Hi</think> there", [("text", "Hi there")]),
+        )
+        protocols = {
+            "/v1/chat/completions": chat_output,
+            "/v1/responses": responses_output,
+            "/v1/messages": messages_output,
+        }
+        tokenizer, token_ids = character_tokenizer("".join(t for _, t, _ in outputs))
+        for path, parse in protocols.items():
+            for stream in (False, True):
+                for tools in (False, True):
+                    with self.subTest(path=path, stream=stream, tools=tools):
+                        harness = Harness(
+                            FakeRuntime(
+                                *(
+                                    Plan([[token_ids[char]] for char in text])
+                                    for _, text, _ in outputs
+                                )
+                            ),
+                            tokenizer=tokenizer,
+                            max_context=8192,
+                        )
+                        try:
+                            for thinking, _, expected in outputs:
+                                request = weather_request(path, stream, thinking)
+                                if not tools:
+                                    del request["tools"]
+                                status, _, payload = harness.request(
+                                    "POST", path, request
+                                )
+                                self.assertEqual(status, 200, payload)
+                                self.assertEqual(parse(payload, stream)[0], expected)
+                        finally:
+                            harness.close()
+
+    def test_a_think_end_after_a_call_is_dropped_in_any_protocol(self):
+        # A call's tag ends the reasoning where a call may follow; a later
+        # </think> outside the call is dropped, and one inside its arguments
+        # stays.
+        text = "why</think>Sure.</think>" + weather_call("Par</think>is") + "</think>"
+        for path, parse in (
+            ("/v1/chat/completions", chat_output),
+            ("/v1/responses", responses_output),
+            ("/v1/messages", messages_output),
+        ):
+            for stream in (False, True):
+                with self.subTest(path=path, stream=stream):
+                    status, payload = respond(path, text, stream, True)
+                    self.assertEqual(status, 200, payload)
+                    items = parse(payload, stream)[0]
+                    self.assertEqual(
+                        [(kind, value) for kind, value in items if kind != "call"],
+                        [("reasoning", "why"), ("text", "Sure.")],
+                    )
+                    self.assertEqual(
+                        [json.loads(value) for kind, value in items if kind == "call"],
+                        [{"city": "Par</think>is"}],
+                    )
+
     def test_projector_preserves_whitespace_without_a_tool(self):
         for text in (" \n\t", " \nhello \t\n"):
             for incomplete in (False, True):
@@ -484,6 +605,7 @@ class PartialToolOutputTests(unittest.TestCase):
                             ],
                             vision=True,
                             deadline=FOREVER,
+                            without_slot=nullcontext,
                         )
                         actual = normalized[0]["tool_calls"][0]["function"]
                         self.assertEqual(actual["arguments"], arguments)
@@ -913,7 +1035,9 @@ class PartialToolOutputTests(unittest.TestCase):
             if chunk["choices"]
         )
         self.assertEqual(chat_message["content"], expected)
-        self.assertEqual(chat_message["tool_calls"][0]["function"]["arguments"], "{")
+        self.assertEqual(
+            chat_message["tool_calls"][0]["function"]["arguments"], '{"city":"Par'
+        )
         self.assertEqual(chat_streamed, expected)
         self.assertEqual(chat_chunks[-1]["choices"][0]["finish_reason"], "length")
 
@@ -969,6 +1093,7 @@ class PartialToolOutputTests(unittest.TestCase):
                 ],
                 vision=True,
                 deadline=FOREVER,
+                without_slot=nullcontext,
             )
             return messages[1]["tool_calls"][0]["function"]["arguments"]
 

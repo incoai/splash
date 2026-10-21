@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -32,6 +33,14 @@ namespace splash::model {
 // punches them, after the transfer that worker is in, so the files' blocks
 // can briefly exceed the limit by the slots freed but not yet punched.
 //
+// Active KV, the copies of the KV requests hold and the quota Spill requests
+// committed for the pages they will write, is bounded by the active limit
+// instead, which leaves it the volume's whole room where the automatic
+// quota's copies keep a quarter of it (engine::DiskSpace): a commitment
+// locks quota without taking a slot or giving a copy up, and a committed
+// page's slot draws on it (Draw::Commitment). Every draw checks what the
+// files hold against its limit, so none passes a full volume.
+//
 // A write budget that spares the drive is the user's to set
 // (setWriteBudget, --max-cache-disk-writes); without one, the default, every
 // write passes and nothing is held back. With one, every write a file of the
@@ -56,7 +65,7 @@ public:
   // Without a clock the budget refills by the awake clock
   // (awakeMilliseconds), the native loop's.
   explicit DiskBudget(uint64_t capacityBytes, Clock clock = {})
-      : capacity_(capacityBytes), limit_(capacityBytes),
+      : capacity_(capacityBytes), limit_(capacityBytes), activeLimit_(capacityBytes),
         clock_(clock ? std::move(clock) : Clock(awakeMilliseconds)) {}
   // The quota.
   [[nodiscard]] uint64_t capacityBytes() const noexcept { return capacity_; }
@@ -78,14 +87,51 @@ public:
   [[nodiscard]] uint64_t usedBytes() const noexcept {
     return used_.load(std::memory_order_relaxed);
   }
-  [[nodiscard]] bool reserve(uint64_t bytes) noexcept {
-    const uint64_t limit = limitBytes();
+
+  // Active KV, the copies of the KV requests hold and what Spill requests
+  // committed, may use more of the volume than cached copies may: its limit
+  // (engine::DiskSpace sets it), at most the quota, which it is until set.
+  [[nodiscard]] uint64_t activeLimitBytes() const noexcept {
+    return activeLimit_.load(std::memory_order_relaxed);
+  }
+  void setActiveLimitBytes(uint64_t bytes) noexcept {
+    activeLimit_.store(std::min(bytes, capacity_), std::memory_order_relaxed);
+  }
+  // Quota a Spill request's pages will take, locked without taking a slot
+  // or giving any copy up: granted iff heldBytes (the copies of the KV
+  // requests hold, the cache's count) plus what is committed plus `bytes`
+  // stays within the active limit. Engine thread.
+  [[nodiscard]] bool commit(uint64_t bytes, uint64_t heldBytes) noexcept {
+    const uint64_t limit = activeLimitBytes(), committed = committedBytes();
+    if (heldBytes > limit || committed > limit - heldBytes || bytes > limit - heldBytes - committed)
+      return false;
+    committed_.store(committed + bytes, std::memory_order_relaxed);
+    return true;
+  }
+  // Returns what a request committed and will not write. Engine thread.
+  void uncommit(uint64_t bytes) noexcept { committed_.fetch_sub(bytes, std::memory_order_relaxed); }
+  [[nodiscard]] uint64_t committedBytes() const noexcept {
+    return committed_.load(std::memory_order_relaxed);
+  }
+  // What a slot's reservation draws on: a cached copy's room within the
+  // limit, or a committed page's, whose bytes move from what is committed
+  // to what is used within the active limit. Either checks what the files
+  // hold, so no draw passes a full quota; a draw of more than is committed
+  // is refused. A commitment's draw is the engine thread's.
+  enum class Draw : uint8_t { Cache, Commitment };
+  [[nodiscard]] bool reserve(uint64_t bytes, Draw draw = Draw::Cache) noexcept {
+    const bool committed = draw == Draw::Commitment;
+    if (committed && bytes > committedBytes())
+      return false;
+    const uint64_t limit = committed ? activeLimitBytes() : limitBytes();
     uint64_t used = used_.load(std::memory_order_relaxed);
     do {
       // Adopted slots, or a limit that fell, may leave more in use than it.
       if (used > limit || bytes > limit - used)
         return false;
     } while (!used_.compare_exchange_weak(used, used + bytes, std::memory_order_relaxed));
+    if (committed)
+      uncommit(bytes);
     return true;
   }
   void release(uint64_t bytes) noexcept { used_.fetch_sub(bytes, std::memory_order_relaxed); }
@@ -103,6 +149,24 @@ public:
   // while the budget is not overdrawn. Engine thread.
   [[nodiscard]] bool admits(bool inUse) const noexcept {
     return inUse || lifted_ || !refillPerMillisecond_ || balanceAt(clock_()) >= 0.0;
+  }
+  // Whether a request may start to spill, or convert to it, when Spill
+  // requests already committed `outstandingBytes` of writes: without a
+  // write budget, or while its balance covers them. Their writes are in use
+  // and pass whatever the balance. Engine thread.
+  [[nodiscard]] bool admitsSpill(uint64_t outstandingBytes) const noexcept {
+    return lifted_ || !refillPerMillisecond_ || balanceAt(clock_()) >= static_cast<double>(outstandingBytes);
+  }
+  // When admitsSpill(outstandingBytes) holds again as the balance refills,
+  // on the budget's clock; empty while it holds now. The writes of Spill
+  // requests lower their commitments as they charge the balance, so the
+  // balance's shortfall closes only by its refill, and sooner as they end
+  // and return what they did not write.
+  [[nodiscard]] std::optional<double> admitsSpillAt(uint64_t outstandingBytes) const noexcept {
+    if (admitsSpill(outstandingBytes))
+      return std::nullopt;
+    const double now = clock_();
+    return now + (static_cast<double>(outstandingBytes) - balanceAt(now)) / refillPerMillisecond_;
   }
   // When a state's write not in use may start again, on the budget's clock;
   // empty while one may start now.
@@ -153,6 +217,11 @@ public:
   [[nodiscard]] uint64_t fileBytes() const noexcept {
     return file_.load(std::memory_order_relaxed);
   }
+  // Cumulative microseconds the files' writes waited for reads a step waits
+  // for (SlotFile::Options::deferWrites).
+  [[nodiscard]] uint64_t writesDeferredMicroseconds() const noexcept {
+    return deferred_.load(std::memory_order_relaxed);
+  }
 
 private:
   friend class SlotFile;
@@ -173,11 +242,14 @@ private:
 
   uint64_t capacity_;
   std::atomic<uint64_t> limit_;
+  std::atomic<uint64_t> activeLimit_;
   std::atomic<uint64_t> volumeAvailable_{0};
   std::atomic<uint64_t> used_{0};
+  std::atomic<uint64_t> committed_{0};
   std::atomic<uint64_t> read_{0};
   std::atomic<uint64_t> written_{0};
   std::atomic<uint64_t> file_{0};
+  std::atomic<uint64_t> deferred_{0};
   std::atomic<bool> full_{false};
   std::atomic<bool> stopped_{false};
   // The write budget, on the engine thread: its refill per millisecond (zero
@@ -191,12 +263,13 @@ private:
 };
 
 // One slot a persistent file keeps from an earlier process, as its record
-// says: where it is, the size and CRC-32C of the payload its last complete
-// write stored, and the label its writer gave it.
+// says: where it is, the size of the payload its last complete write stored
+// and the CRC-32C of each of its segments (SlotFile::Options::segments), and
+// the label its writer gave it.
 struct SlotRecord final {
   uint32_t index = 0;
   uint64_t payloadBytes = 0;
-  uint32_t checksum = 0;
+  std::vector<uint32_t> checksums;
   std::vector<std::byte> label;
 };
 
@@ -210,27 +283,31 @@ struct SlotRecord final {
 // the file sees only transfers aligned to the host page (kHostPageBytes), as
 // uncached IO wants; a slot is a whole number of host pages. A slot is
 // readable only after one complete write; a failed or cancelled write leaves
-// it unreadable. A write that finds the volume full is reported to the
-// budget (DiskBudget::fullReported) and the file goes on; after one that
-// fails for any other reason, which the worker logs, the file accepts no
-// further writes. A freed slot
-// returns its quota at once; one that was written returns its blocks to the
-// volume (F_PUNCHHOLE) on the worker, after the operation in flight and
-// before any later one (DiskBudget). So that a
+// it unreadable. Beside the worker, any thread may read part of a written
+// slot straight from the file (readAt). While reads a step waits for run
+// (Options::deferWrites), the worker holds each chunk of a write back, at
+// most kWriteDeferral, unless a read of the file waits behind the write. A
+// write that finds the volume full is reported to the budget
+// (DiskBudget::fullReported) and the file goes on; after one that fails for
+// any other reason, which the worker logs, the file accepts no further
+// writes. A freed slot returns its quota at once; one that was written
+// returns its blocks to the volume (F_PUNCHHOLE) on the worker, after the
+// operation in flight and before any later one (DiskBudget). So that a
 // file-size limit fails a write rather than killing the process, a file
 // ignores SIGXFSZ from its construction on.
 //
 // A temporary file is unlinked at once and gone with the process. A
 // persistent file stays, with a record file beside it: one fixed-size record
 // per slot, written by the worker after the slot's write has landed, from
-// the label its writer gives the slot and the CRC-32C of the payload the
-// worker computed while writing it. A freed slot's record is cleared before
-// its blocks return. The next process reads the records, adopts the slots it
-// keeps, and frees the others; the first read of an adopted slot fails
-// unless its payload matches its record, so a slot that changed after its
-// record was written, or whose blocks never reached the drive, is a cache
-// miss and nothing worse. Slots this process wrote are trusted as a
-// temporary file's are.
+// the label its writer gives the slot and the CRC-32C of each segment of the
+// payload, which the worker computed while writing it. A freed slot's record
+// is cleared before its blocks return. The next process reads the records,
+// adopts the slots it keeps, and frees the others. A read of an adopted
+// slot fails unless each segment it covers matches its record, and the
+// worker's first read covers the whole payload, after which the slot is
+// trusted; so a slot that changed after its record was written, or whose
+// blocks never reached the drive, is a cache miss and nothing worse. Slots
+// this process wrote are trusted as a temporary file's are.
 class SlotFile final {
   struct Backing;
 
@@ -250,25 +327,52 @@ public:
     return alignUp(payloadBytes);
   }
 
+  // How a file's slots are written, beside their size and persistence.
+  struct Options final {
+    // The byte lengths of a payload's consecutive segments from its start
+    // (kv::SlotFormat::segments). A persistent file keeps a CRC-32C of each,
+    // which a read of an adopted slot checks for every segment it covers;
+    // empty or one, the whole payload, whatever its size, is one segment.
+    // Several hold every payload of the file: a write stores their sum.
+    std::vector<uint64_t> segments;
+    // While it says so, the worker holds a write's next chunk back, at most
+    // kWriteDeferral each (model::SsdReaders::criticalBusyProbe: reads a
+    // step waits for go first), unless a read of the file waits behind the
+    // write and so would wait as long. It runs on the worker; the file's
+    // slots keep it, and the last may go on any thread, a reader's too, so
+    // it owns nothing that thread may not destroy.
+    std::function<bool()> deferWrites;
+  };
+  // The longest a write's chunk waits for reads (Options::deferWrites).
+  static constexpr std::chrono::milliseconds kWriteDeferral{2};
+
   class Slot final {
   public:
     ~Slot();
     Slot(const Slot &) = delete;
     Slot &operator=(const Slot &) = delete;
+    // Unique in the process, from acquire() or adopt(): a slot is written
+    // once while held, so the id names the bytes of one write.
+    [[nodiscard]] uint64_t id() const noexcept { return id_; }
 
   private:
     friend class SlotFile;
     Slot(std::shared_ptr<Backing> backing, uint32_t index);
     std::shared_ptr<Backing> backing_;
     uint32_t index_;
-    // Owned by the worker: operations on one file run in submission order.
-    bool written_ = false;
-    // In a persistent file, the size and CRC-32C of the payload the last
-    // complete write stored; an adopted slot checks its first read against
-    // them (verify_). Owned by the worker too.
+    uint64_t id_;
+    // Set by the worker, which runs a file's operations in submission
+    // order, once a write landed; read beside it too (readAt), which then
+    // finds the fields below the write's.
+    std::atomic<bool> written_{false};
+    // The size of the payload the last complete write stored and, in a
+    // persistent file, the CRC-32C of each of its segments. Reads of an
+    // adopted slot check the segments they cover against them while verify_
+    // holds, which the worker's first read clears once the whole payload
+    // matched.
     uint64_t payloadBytes_ = 0;
-    uint32_t checksum_ = 0;
-    bool verify_ = false;
+    std::vector<uint32_t> checksums_;
+    std::atomic<bool> verify_{false};
     // Set when a write is submitted: freeing the slot then returns the
     // blocks that write may have taken.
     bool returnsBlocks_ = false;
@@ -299,16 +403,17 @@ public:
   // The budget holds at least one slot: a smaller quota is a configuration
   // error. Files sharing a budget compete for its bytes. A temporary file
   // goes to the temporary directory.
-  SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget);
+  SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget, const Options &options = {});
   // A persistent file: opening it reads the records an earlier process left,
   // and it takes no slot of its own until finishAdoption().
   SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget,
-           const Persistence &persistence);
+           const Persistence &persistence, const Options &options = {});
   ~SlotFile();
   SlotFile(const SlotFile &) = delete;
   SlotFile &operator=(const SlotFile &) = delete;
-  // Null when the live slots are at the budget's limit.
-  [[nodiscard]] std::shared_ptr<Slot> acquire();
+  // Null when the live slots are at the budget's limit for the draw
+  // (DiskBudget::reserve).
+  [[nodiscard]] std::shared_ptr<Slot> acquire(DiskBudget::Draw draw = DiskBudget::Draw::Cache);
   [[nodiscard]] uint64_t slotBytes() const noexcept;
   // False once a write has failed for another reason than a full volume;
   // complete slots stay readable.
@@ -330,8 +435,8 @@ public:
   [[nodiscard]] const std::vector<SlotRecord> &records() const noexcept { return records_; }
   // Takes back the slot a record names, before finishAdoption(). It counts
   // against the budget even past its capacity, so that the caller can give
-  // up what the quota no longer holds; its first read fails unless the
-  // payload matches the record.
+  // up what the quota no longer holds; its reads fail unless what they
+  // cover matches the record.
   [[nodiscard]] std::shared_ptr<Slot> adopt(const SlotRecord &record);
   // Ends adoption: every slot not adopted is freed, its record cleared and
   // its blocks returned. A record that cannot be cleared stays, reported,
@@ -347,18 +452,31 @@ public:
   // The process is ending: a slot dropped from now on keeps its blocks and
   // its record for the next one.
   void seal() noexcept;
-  // The spans total at most one slot and stay valid until the operation is
-  // ready. A write stores them in order from the start of the slot and zeros
-  // the rest, and takes the whole slot from the write budget as it is
-  // submitted; a read fills them from the start of the slot. A write is null
-  // once the file accepts no further writes, as acquire() is null at the
-  // limit; the write budget never makes it null.
+  // The spans total at most one slot, a write's exactly the segments in a
+  // file of several, and stay valid until the operation is ready. A write
+  // stores them in order from the start of the slot and zeros the rest, and
+  // takes the whole slot from the write budget as it is submitted; a read
+  // fills them from the start of the slot, the whole payload while an
+  // adopted slot is not yet trusted. A write is null once the file accepts
+  // no further writes, as acquire() is null at the limit; the write budget
+  // never makes it null.
   [[nodiscard]] std::shared_ptr<Operation> write(
       std::shared_ptr<Slot> slot, std::vector<std::span<const std::byte>> source,
       std::function<void()> completion);
   [[nodiscard]] std::shared_ptr<Operation> read(
       std::shared_ptr<Slot> slot, std::vector<std::span<std::byte>> destination,
       std::function<void()> completion);
+  // Reads `bytes` at `offset` of a slot's payload on the calling thread,
+  // beside the worker, with one uncached pread into `buffer`: 4 KiB-aligned
+  // memory that holds the 4 KiB-aligned range around the bytes, widened to
+  // the whole segments it touches in an adopted slot, whose checksums it
+  // checks; a buffer of slotBytes() always holds it. Returns the bytes within
+  // `buffer`, or nothing for a slot whose write has not landed, bytes past
+  // its payload, a buffer that cannot hold the range, a short or failed read
+  // or a segment that does not match. The caller holds the slot while it
+  // reads, and no write of it runs meanwhile.
+  [[nodiscard]] std::optional<std::span<const std::byte>>
+  readAt(const Slot &slot, uint64_t offset, uint64_t bytes, std::span<std::byte> buffer) const noexcept;
 
 private:
   // Runs on the worker, moving the slot straight or through the worker's
@@ -368,15 +486,17 @@ private:
     std::shared_ptr<Operation> operation;
     Run run;
     std::function<void()> completion;
+    // A read: the writes ahead of it hold back for no other reads.
+    bool read = false;
   };
   struct Free {
     void operator()(std::byte *memory) const noexcept;
   };
-  [[nodiscard]] std::shared_ptr<Operation> submit(Run run,
-                                                  std::function<void()> completion);
+  [[nodiscard]] std::shared_ptr<Operation> submit(Run run, std::function<void()> completion,
+                                                  bool read = false);
   // The checks and the setup both constructors share before the file opens;
   // each starts the worker last.
-  void prepare(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget);
+  void prepare(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget, const Options &options);
   void uncache();
   // Stops the file's writes; true for the call that stopped them.
   static bool stop(Backing &backing) noexcept;

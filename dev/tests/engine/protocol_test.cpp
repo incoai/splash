@@ -245,9 +245,14 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
                          3500, {}, 64, {350, 280, 50}}},
       {"done_scored", DoneEvent{91, EngineFinishReason::Stop, 4096, 0, 1000, 0,
                                 3500, {1.5f, -2.25f, 0.5f}, 32}},
+      {"done_bounded", DoneEvent{91, EngineFinishReason::Length, 4096, 63, 1000,
+                                 2000, 3500, {}, 0, {}, true}},
       {"error_request",
        ErrorEvent{FailureClass::RequestError, 91, true, "deadline_exceeded",
                   "request deadline expired"}},
+      {"error_retry_after",
+       ErrorEvent{FailureClass::RequestError, 91, true, "kv_write_budget",
+                  "the SSD cache's write budget is spent", 21'600}},
       {"error_engine", ErrorEvent{FailureClass::EngineUnhealthy, 0, false,
                                   "gpu_fault", "Metal command buffer failed"}},
       {"error_protocol",
@@ -398,13 +403,20 @@ void testScoreRequestAndDoneLogits() {
   auto encodedDone = serializeEvent(scored, kLimits);
   CHECK(test, encodedDone);
   if (encodedDone) {
-    CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 61 + 12);
-    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 41) == 96);
-    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 57) == 3);
+    CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 62 + 12);
+    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 42) == 96);
+    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 58) == 3);
   }
 
   DoneEvent generation{91, EngineFinishReason::Length, 10, 4, 1, 2, 3, {}};
   CHECK(test, roundTripEvent(generation) == generation);
+  // Only a Length end is bounded.
+  DoneEvent bounded = generation;
+  bounded.bounded = true;
+  CHECK(test, roundTripEvent(bounded) == bounded);
+  DoneEvent boundedStop = bounded;
+  boundedStop.reason = EngineFinishReason::Stop;
+  expectEventIssue(test, boundedStop, IssueCode::InvalidEnumValue);
   for (const auto counts : {splash::engine::SpeculativeCounts{7, 8, 1},
                              splash::engine::SpeculativeCounts{7, 0, 0},
                              splash::engine::SpeculativeCounts{0, 0, 1},
@@ -1014,6 +1026,10 @@ void testFailureTaxonomy() {
                    IssueCode::IntegerOverflow);
   expectEventIssue(test,
                    ErrorEvent{FailureClass::RequestError, 0, false, "bad", ""},
+                   IssueCode::InvalidErrorClassification);
+  // Only a retryable error says when to retry.
+  expectEventIssue(test,
+                   ErrorEvent{FailureClass::RequestError, 5, false, "bad", "", 60},
                    IssueCode::InvalidErrorClassification);
 }
 

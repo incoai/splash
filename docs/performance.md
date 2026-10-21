@@ -8,11 +8,12 @@ Measured for the Splash 1.0 release (September 2026) on an M5 Pro (16-core
 GPU, 48 GB), serving the Qwen3.8-27B and Qwen3.6-35B-A3B Splash packages:
 selected SPEED-Bench coding prompts over HTTP, a 1,024-token output limit,
 reasoning on (medium for the 27B). The ratio in each cell is against the
-next-fastest engine we measured. The MLX 4-bit models prepare to the packages'
-target weights, byte for byte but for the 27B's 48 per-layer GDN decay vectors,
-each within a float ULP, and decode within 0.5% of them on this M5 Pro
-([upstream loading](../dev/benchmarks/upstream-loading.md)). GGUF targets run
-other kernels; [GGUF against llama.cpp](#gguf-against-llamacpp) compares them.
+next-fastest engine we measured. At the time, the MLX 4-bit models prepared to
+the packages' target weights, byte for byte but for the 27B's 48 per-layer GDN
+decay vectors, each within a float ULP, and decoded within 0.5% of them on this
+M5 Pro ([upstream loading](../dev/benchmarks/upstream-loading.md)). MLX targets
+now load into the weight layout of GGUF targets and run on the same kernels,
+which [GGUF against llama.cpp](#gguf-against-llamacpp) measures.
 
 | Metric | Qwen3.6-35B-A3B | Qwen3.8-27B |
 | --- | ---: | ---: |
@@ -93,8 +94,16 @@ memory (2 to 7 GiB) and a 1 GiB margin, 3 GiB on these Macs. It gives cached
 memory back when that memory runs short or macOS warns, but a request in service
 still takes the memory it needs within `--max-memory`, so these models leave
 other applications little room. A request that cannot get memory waits for it,
-then fails with `resource_timeout`: close memory-heavy applications, or serve
-with `--language-only`. Critical memory pressure can suspend a long request; the
+and so does every request that arrived after it, except one of a higher
+priority. While an earlier request is at work, as one prefilling a prompt near
+the context limit can be for many minutes, they wait with no time limit; without
+one, the request refused memory fails after 30 s with `resource_timeout`: close
+memory-heavy applications, or serve with `--language-only`. To bound the wait,
+give requests a `timeout`, or serve with `--request-timeout`, which bounds the
+long request too. A streaming request receives a keepalive every 2 s while it
+waits; a non-streaming one receives nothing until its answer, so a client's
+read timeout may end it first.
+Critical memory pressure can suspend a long request; the
 [SSD cache](../DEVELOPMENT.md#ssd-cache), on by default, keeps its progress and
 cached prefixes, and writes whenever memory runs short: serving
 Ternary-Bonsai-2-27B PQ2_0 to six clients' mixed traffic for 30 minutes, a

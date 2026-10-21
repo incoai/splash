@@ -295,7 +295,7 @@ void encodeAttention(id<MTLComputeCommandEncoder> encoder,
   const PrefillAttentionParams params = overrideParams ? *overrideParams :
       PrefillAttentionParams{data.params.committed_tokens, data.params.chunk_tokens,
                               data.params.chunk_stride, data.params.page_table_entries,
-                              data.params.kv, plan.splits};
+                              data.params.kv, plan.splits, 0, 0};
   [encoder setComputePipelineState:pipelines.split];
   [encoder setBuffer:data.queries offset:0 atIndex:0];
   [encoder setBuffer:data.partials offset:0 atIndex:1];
@@ -698,7 +698,7 @@ void testInvalidAttentionParams(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const PrefillAttentionParams valid{
       data.params.committed_tokens, data.params.chunk_tokens,
       data.params.chunk_stride, data.params.page_table_entries,
-      data.params.kv, plan.splits};
+      data.params.kv, plan.splits, 0, 0};
   for (uint32_t invalidField = 0; invalidField < 3; ++invalidField) {
     auto params = valid;
     if (invalidField == 0) params.split_count = 0;
@@ -862,13 +862,15 @@ void testBatchedVerifyStore(id<MTLDevice> device, id<MTLCommandQueue> queue,
 }
 
 void testContract() {
-  static_assert(sizeof(PrefillAttentionParams) == 28);
+  static_assert(sizeof(PrefillAttentionParams) == 36);
   static_assert(offsetof(PrefillAttentionParams, committed_tokens) == 0);
   static_assert(offsetof(PrefillAttentionParams, rows) == 4);
   static_assert(offsetof(PrefillAttentionParams, chunk_stride) == 8);
   static_assert(offsetof(PrefillAttentionParams, page_table_entries) == 12);
   static_assert(offsetof(PrefillAttentionParams, kv) == 16);
   static_assert(offsetof(PrefillAttentionParams, split_count) == 24);
+  static_assert(offsetof(PrefillAttentionParams, block_stride) == 28);
+  static_assert(offsetof(PrefillAttentionParams, block_list) == 32);
   ChunkedPrefillParams params{129, 8, 32, 5, {}};
   require(chunkedPrefillValidationError(params).empty(),
           "partial committed page must be a valid direct-Q8 input");

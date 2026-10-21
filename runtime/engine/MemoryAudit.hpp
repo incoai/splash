@@ -32,16 +32,24 @@ struct ActualMemoryReport {
     uint64_t sharedPrefillBytes = 0;
     uint64_t sharedDecodeBytes = 0;
     uint64_t kvAllocatedBytes = 0;
+    // A spill-capable target's readers of spilled KV: the hot block cache
+    // and the staging of a prefill's history; zero for another.
+    uint64_t kvBlockCacheBytes = 0;
+    uint64_t kvHistoryStagingBytes = 0;
     // The buffer state writes to the disk tier stage through; zero without
     // the tier.
     uint64_t stateStagingBytes = 0;
     // The prefill FFN's Neural Engine split; zero without one.
     uint64_t aneFfnBytes = 0;
+    // The streamed table's row cache (--ple-memory), host memory outside
+    // Metal's; zero without one.
+    uint64_t streamedTableBytes = 0;
 
     uint64_t backendAllocatedBytes = 0;
     uint64_t deviceCurrentAllocatedBytes = 0;
     uint64_t devicePeakAllocatedBytes = 0;
-    // The backend's own high-water mark since startup.
+    // The backend's own high-water mark, and the device's above, since the
+    // weights that serve began to load (MetalBackend::restartPeaks).
     uint64_t backendPeakAllocatedBytes = 0;
 };
 

@@ -140,12 +140,23 @@ def engine_events():
         "done_scored": p.DoneEvent(
             91, p.FinishReason.STOP, 4096, 0, 1000, 0, 3500, (1.5, -2.25, 0.5), 32
         ),
+        "done_bounded": p.DoneEvent(
+            91, p.FinishReason.LENGTH, 4096, 63, 1000, 2000, 3500, (), bounded=True
+        ),
         "error_request": p.ErrorEvent(
             p.FailureClass.REQUEST_ERROR,
             91,
             True,
             b"deadline_exceeded",
             b"request deadline expired",
+        ),
+        "error_retry_after": p.ErrorEvent(
+            p.FailureClass.REQUEST_ERROR,
+            91,
+            True,
+            b"kv_write_budget",
+            b"the SSD cache's write budget is spent",
+            21_600,
         ),
         "error_engine": p.ErrorEvent(
             p.FailureClass.ENGINE_UNHEALTHY,
@@ -513,7 +524,7 @@ class ProtocolPythonTests(unittest.TestCase):
         wire = native_peer.serialize_event(done)
         self.assertEqual(decode_event(wire), done)
         self.assertEqual(
-            struct.unpack_from("<I", wire, p.FRAME_HEADER_BYTES + 41), (96,)
+            struct.unpack_from("<I", wire, p.FRAME_HEADER_BYTES + 42), (96,)
         )
         # A wrong logit count must fail closed, not truncate.
         self.assert_protocol_error(
@@ -587,6 +598,15 @@ class ProtocolPythonTests(unittest.TestCase):
                     p.IssueCode.INVALID_COUNT,
                     p.DoneEvent(**{**base, field: value}, option_logits=(1.0, 2.0)),
                 )
+        # Only a length end is bounded, by a flag byte.
+        for reason, bounded in ((p.FinishReason.STOP, 1), (p.FinishReason.LENGTH, 2)):
+            with self.subTest(reason=reason, bounded=bounded):
+                self.assert_fatal_event(
+                    p.IssueCode.INVALID_ENUM_VALUE,
+                    p.DoneEvent(
+                        91, reason, 4096, 512, 1000, 2000, 3500, (), bounded=bounded
+                    ),
+                )
         # More logits than score options do not fit a Done frame.
         self.assert_fatal_event(
             p.IssueCode.FRAME_TOO_LARGE,
@@ -597,6 +617,9 @@ class ProtocolPythonTests(unittest.TestCase):
             p.DoneEvent(**base, option_logits=(1.0, 2.0)),
             p.DoneEvent(91, p.FinishReason.STOP, 4096, 512, 1000, 2000, 3500, ()),
             p.DoneEvent(91, p.FinishReason.LENGTH, 4096, 512, 1000, 2000, 3500, ()),
+            p.DoneEvent(
+                91, p.FinishReason.LENGTH, 4096, 63, 1000, 2000, 3500, (), bounded=True
+            ),
             p.DoneEvent(91, p.FinishReason.CANCELLED, 4096, 128, 1000, 500, 1500, ()),
         ):
             with self.subTest(event=event):
@@ -936,7 +959,7 @@ class ProtocolPythonTests(unittest.TestCase):
         error = native_peer.serialize_event(
             p.ErrorEvent(p.FailureClass.REQUEST_ERROR, 7, False, b"bad", b"message")
         )
-        bad_error = mutate_u32(error, p.FRAME_HEADER_BYTES + 10, 0xFFFFFFFF)
+        bad_error = mutate_u32(error, p.FRAME_HEADER_BYTES + 14, 0xFFFFFFFF)
         self.assert_protocol_error(
             p.FailureClass.PROTOCOL_FATAL,
             p.IssueCode.INVALID_PAYLOAD_LENGTH,
@@ -945,6 +968,11 @@ class ProtocolPythonTests(unittest.TestCase):
         self.assert_fatal_event(
             p.IssueCode.INVALID_ERROR_CLASSIFICATION,
             p.ErrorEvent(p.FailureClass.ENGINE_UNHEALTHY, 7, False, b"bad", b""),
+        )
+        # Only a retryable error says when to retry.
+        self.assert_fatal_event(
+            p.IssueCode.INVALID_ERROR_CLASSIFICATION,
+            p.ErrorEvent(p.FailureClass.REQUEST_ERROR, 7, False, b"bad", b"", 60),
         )
 
     def test_status_json_is_opaque_length_delimited_and_bounded(self):

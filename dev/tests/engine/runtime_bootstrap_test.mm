@@ -43,19 +43,19 @@ void testRuntimeCacheIdentityReportsTheLoadedModel() {
   const std::string combined(64, 'A');
   const std::string target(64, 'c');
   const engine::RuntimeCacheIdentity int8 =
-      engine::makeRuntimeCacheIdentity(combined, target, "build", int8Layout);
+      engine::makeRuntimeCacheIdentity(combined, target, "build", int8Layout, {});
   require(int8.modelLayoutSha256 == std::string(64, 'a') &&
               int8.targetModelSha256 == target && int8.buildId == "build" &&
               int8.kvLayout == int8Layout,
           "the cache identity did not report the loaded model");
   const engine::RuntimeCacheIdentity bf16 =
-      engine::makeRuntimeCacheIdentity(combined, target, "build", bf16Layout);
+      engine::makeRuntimeCacheIdentity(combined, target, "build", bf16Layout, {});
   require(bf16.kvLayout == bf16Layout && bf16.kvLayout.format != int8.kvLayout.format,
           "the cache identity did not report the KV format");
   const auto identity = [&](std::string_view combinedDigest, std::string_view targetDigest,
                             std::string_view build) {
     static_cast<void>(
-        engine::makeRuntimeCacheIdentity(combinedDigest, targetDigest, build, int8Layout));
+        engine::makeRuntimeCacheIdentity(combinedDigest, targetDigest, build, int8Layout, {}));
   };
   rejects([&] { identity(std::string(63, 'a'), target, "build"); },
           "manifest SHA-256 must contain exactly 64 hex characters",
@@ -141,7 +141,9 @@ public:
                                  completion);
   }
   uint64_t snapshotBytes() const noexcept override { return 64; }
-  std::shared_ptr<StateReservation> reserveState(uint64_t, uint32_t) override {
+  std::shared_ptr<StateReservation> reserveState(uint64_t, uint32_t,
+                                                 metal::AllocationFailure &refusal) override {
+    refusal = metal::AllocationFailure::EngineBudget;
     return {};
   }
   std::shared_ptr<const CompositeState> snapshot(uint64_t) override { return {}; }

@@ -8,7 +8,6 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import quote
 
-from dev.tests.installer_fixtures import link_assembly
 from dev.tests.server_fixtures import (
     PATHS,
     CharTokenizer,
@@ -26,6 +25,7 @@ from dev.tests.server_fixtures import (
     server_arguments,
     stream_events,
     tool_request,
+    unprepared_hold,
 )
 from install import launcher
 from server import protocol as native_wire
@@ -34,7 +34,7 @@ from server import server as api
 
 ALIASES = ("local", "community/stable:v1", "模型", "-local")
 ANNOUNCED = ALIASES[0]
-SERVER_ARGS = ["model", "--tokenizer", "tokenizer", "--model", "owner/repo"]
+SERVER_ARGS = ["model", "--model", "owner/repo"]
 
 
 def expected(announce):
@@ -341,6 +341,7 @@ class ServedModelNamesTests(unittest.TestCase):
         args = main_args(served_model_name=["local"], announce_served_name=True)
         with (
             mock.patch.object(api, "parse_args", return_value=args),
+            unprepared_hold(),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
                 api.AutoTokenizer, "from_pretrained", return_value=object()
@@ -370,7 +371,7 @@ class ServedModelNamesTests(unittest.TestCase):
             mock.patch.object(launcher, "RUNTIME_DIR", Path(tmp)),
             mock.patch.object(launcher.paths, "MODELS", Path(tmp) / "models"),
             mock.patch.object(launcher.socket, "socket"),
-            mock.patch.object(launcher, "_ensure_installed", side_effect=link_assembly),
+            mock.patch.object(launcher, "_ensure_installed"),
             mock.patch.object(launcher.os, "execve") as execute,
         ):
             launcher.main(
@@ -399,9 +400,7 @@ class ServedModelNamesTests(unittest.TestCase):
                 mock.patch.object(launcher, "RUNTIME_DIR", Path(tmp)),
                 mock.patch.object(launcher.paths, "MODELS", Path(tmp) / "models"),
                 mock.patch.object(launcher.socket, "socket"),
-                mock.patch.object(
-                    launcher, "_ensure_installed", side_effect=link_assembly
-                ),
+                mock.patch.object(launcher, "_ensure_installed"),
                 mock.patch.object(launcher.os, "execve") as execute,
             ):
                 launcher.main(

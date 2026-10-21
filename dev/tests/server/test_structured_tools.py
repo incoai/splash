@@ -1,5 +1,6 @@
 import json
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -544,17 +545,18 @@ class StructuredToolGrammarTest(unittest.TestCase):
                 with self.subTest(strict=strict, name=name):
                     self.assert_not_complete(call.format(name, "1"), **settings)
 
-    def test_a_tool_with_an_unreadable_schema_takes_free_arguments(self):
-        # Its schema, which says n is a string, is not read: a grammar holds
-        # its calls to the tags alone, beside a strict tool or a response
-        # format too, and its values convert untyped.
-        unreadable = {
+    def test_a_tool_with_an_invalid_schema_takes_free_arguments(self):
+        # Its schema, which breaks its dialect's meta-schema, builds no
+        # grammar: a grammar holds its calls to the tags alone, beside a
+        # strict tool or a response format too. Its values still convert by
+        # the types it declares, n as an integer.
+        invalid = {
             "type": "function",
             "function": {
                 "name": "note",
                 "parameters": {
                     "type": "object",
-                    "properties": {"n": {"type": "string", "required": True}},
+                    "properties": {"n": {"type": "integer", "required": True}},
                 },
             },
         }
@@ -563,9 +565,9 @@ class StructuredToolGrammarTest(unittest.TestCase):
             "</function>\n</tool_call>"
         )
         for tools, schema in (
-            ([unreadable], None),
-            ([unreadable, *strict_tools(TOOLS[1])], None),
-            ([unreadable], SCHEMA),
+            ([invalid], None),
+            ([invalid, *strict_tools(TOOLS[1])], None),
+            ([invalid], SCHEMA),
         ):
             with self.subTest(tools=len(tools), schema=schema is not None):
                 self.assert_complete(
@@ -929,7 +931,9 @@ class StructuredToolRequestTest(HarnessTestCase):
                     },
                 )
                 original = json.dumps(body, sort_keys=True)
-                prompt = harness.app._prepare_prompt(body, None, deadline=FOREVER)
+                prompt = harness.app._prepare_prompt(
+                    body, None, deadline=FOREVER, without_slot=nullcontext
+                )
                 self.assertEqual(json.dumps(body, sort_keys=True), original)
                 self.assertEqual(prompt.messages, body["messages"])
                 self.assertEqual(prompt.response_schema, schema)

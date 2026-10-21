@@ -96,6 +96,13 @@ MetalBuffer allocate(MetalBackend &backend, uint64_t bytes) {
   return buffer;
 }
 
+// Each of `lanes` lanes' verify rows: its whole block.
+MetalBuffer wholeBlocks(MetalBackend &backend, uint64_t lanes) {
+  MetalBuffer buffer = allocate(backend, lanes * sizeof(uint32_t));
+  std::fill_n(static_cast<uint32_t *>(buffer.contents()), lanes, kRows);
+  return buffer;
+}
+
 struct Batch final {
   SamplingBuffers buffers;
   uint32_t vocabulary = 0;
@@ -673,7 +680,8 @@ void speculativeExactness(MetalBackend &backend, uint32_t samplingMask) {
       batch.buffers.uniforms,
       batch.buffers.outputTokens,
       allocate(backend, lanes * sizeof(uint32_t)),
-      allocate(backend, lanes * sizeof(uint32_t))};
+      allocate(backend, lanes * sizeof(uint32_t)),
+      wholeBlocks(backend, lanes)};
   auto *proposed = static_cast<uint32_t *>(acceptance.proposedTokens.contents());
   auto *candidates = static_cast<uint32_t *>(acceptance.candidates.contents());
   auto *proposal =
@@ -995,7 +1003,8 @@ void bufferExtents(MetalBackend &backend) {
                                      batch.buffers.uniforms,
                                      batch.buffers.outputTokens,
                                      allocate(backend, lanes * 4),
-                                     allocate(backend, lanes * 4)};
+                                     allocate(backend, lanes * 4),
+                                     wholeBlocks(backend, lanes)};
   const uint64_t candidates = 2 * kPositions * kDraftCandidates * 4;
   for (const uint32_t lastRetained : {5U, kRows}) {
     const std::array<uint32_t, lanes> retained{kRows, kRows, lastRetained};
@@ -1011,7 +1020,8 @@ void bufferExtents(MetalBackend &backend) {
              {&AcceptanceBuffers::outputTokens, (2 * kRows + std::max(kPositions, lastRetained)) * 4, 4,
               "target token"},
              {&AcceptanceBuffers::retainedCounts, lanes * 4, 4, "retained count"},
-             {&AcceptanceBuffers::acceptedCounts, lanes * 4, 4, "accepted count"}})
+             {&AcceptanceBuffers::acceptedCounts, lanes * 4, 4, "accepted count"},
+             {&AcceptanceBuffers::verifyRows, lanes * 4, 4, "verify rows"}})
       splash::test::requireExtent(backend, acceptance.*member, bytes, element, what,
                                   [&](CommandGraph &graph, const MetalBuffer &buffer) {
                                     AcceptanceBuffers changed = acceptance;
@@ -1509,7 +1519,8 @@ void excludedStopTokens(MetalBackend &backend, uint32_t vocabulary) {
       batch.buffers.uniforms,
       batch.buffers.outputTokens,
       allocate(backend, kLanes * sizeof(uint32_t)),
-      allocate(backend, kLanes * sizeof(uint32_t))};
+      allocate(backend, kLanes * sizeof(uint32_t)),
+      wholeBlocks(backend, kLanes)};
   for (uint32_t lane = 0; lane < kLanes; ++lane) {
     static_cast<uint32_t *>(
         acceptance.proposedTokens.contents())[lane * kPositions] = stops[0];
@@ -1677,7 +1688,8 @@ void thinkingCutoffs(MetalBackend &backend, uint32_t vocabulary) {
       batch.buffers.uniforms,
       batch.buffers.outputTokens,
       allocate(backend, kLanes * sizeof(uint32_t)),
-      allocate(backend, kLanes * sizeof(uint32_t))};
+      allocate(backend, kLanes * sizeof(uint32_t)),
+      wholeBlocks(backend, kLanes)};
   auto *proposed = static_cast<uint32_t *>(acceptance.proposedTokens.contents());
   // A draft token with all of the draft's mass, at verify input row
   // position + 1.
@@ -2048,6 +2060,14 @@ void ties(MetalBackend &backend) {
   }
 }
 
+// A policy that keeps only its most likely token selects greedily.
+void onlyTheMostLikelyIsGreedy() {
+  require(SamplingPolicy{0, 0.8F}.samples() && !SamplingPolicy{}.samples() &&
+              !SamplingPolicy{1, 0.8F}.samples() &&
+              !SamplingPolicy{.temperature = 0.8F, .minP = 1.0F}.samples(),
+          "a policy that keeps one token sampled");
+}
+
 // Where min_p cuts, on rows whose weights are known: the heaviest token
 // weighs 1, ten weigh 0.3, twenty 0.1 and a hundred 0.01 at temperature 1.
 // min_p keeps the classes that weigh at least it, each tie whole; top_k then
@@ -2097,8 +2117,7 @@ void minPCuts(MetalBackend &backend) {
         Case{"min_p 0.2 then top_k 5",
              {5, 1.0F, 1.0F, false, false, {}, 0.2F}, 5, 103, 104},
         Case{"min_p 0.05 then top_p 0.5 of what it kept",
-             {0, 1.0F, 0.5F, false, false, {}, 0.05F}, 8, 106, 107},
-        Case{"min_p 1", {0, 1.0F, 1.0F, false, false, {}, 1.0F}, 1, 5, 100}}) {
+             {0, 1.0F, 0.5F, false, false, {}, 0.05F}, 8, 106, 107}}) {
     const Distribution target =
         referenceDistribution(batch.row(0), vocabulary, c.policy);
     require(target.order.size() == c.kept && target.ambiguousMass == 0.0 &&
@@ -2150,7 +2169,8 @@ void speculativeWholeVocabulary(MetalBackend &backend) {
       batch.buffers.uniforms,
       batch.buffers.outputTokens,
       allocate(backend, lanes * sizeof(uint32_t)),
-      allocate(backend, lanes * sizeof(uint32_t))};
+      allocate(backend, lanes * sizeof(uint32_t)),
+      wholeBlocks(backend, lanes)};
   auto *proposed = static_cast<uint32_t *>(acceptance.proposedTokens.contents());
   auto *candidates =
       static_cast<uint32_t *>(batch.buffers.draftCandidates.contents());
@@ -2253,7 +2273,8 @@ void overProposedResidual(MetalBackend &backend) {
       batch.buffers.uniforms,
       batch.buffers.outputTokens,
       allocate(backend, sizeof(uint32_t)),
-      allocate(backend, sizeof(uint32_t))};
+      allocate(backend, sizeof(uint32_t)),
+      wholeBlocks(backend, 1)};
   // Token 5 leads with weight 1 and token 6 weighs less than an ulp of it;
   // token 1000 weighs 0.5 and forty tokens from 1200 a hundredth each. The
   // others weigh nothing.
@@ -2410,7 +2431,8 @@ void nonFiniteRowsSelectTheSentinel(MetalBackend &backend) {
       batch.buffers.uniforms,
       batch.buffers.outputTokens,
       allocate(backend, sizeof(uint32_t)),
-      allocate(backend, sizeof(uint32_t))};
+      allocate(backend, sizeof(uint32_t)),
+      wholeBlocks(backend, 1)};
   Random random(0x6e616e);
   for (uint32_t position = 0; position < kPositions; ++position) {
     const uint32_t draft = 3 + random.next() % (vocabulary - 3);
@@ -2599,6 +2621,8 @@ int main(int argc, char **argv) {
     penaltyWords();
     stage = "penalty lifecycle";
     penaltyLifecycle();
+    stage = "policies that keep one token";
+    onlyTheMostLikelyIsGreedy();
     MetalBackend backend(argv[1]);
     stage = "invalid penalties";
     invalidPenalties(backend);

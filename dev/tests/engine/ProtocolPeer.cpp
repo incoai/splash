@@ -203,6 +203,7 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     DoneEvent event;
     event.requestId = in.u64();
     event.reason = static_cast<engine::EngineFinishReason>(in.u8());
+    event.bounded = in.u8() != 0;
     event.promptTokens = in.u32();
     event.completionTokens = in.u32();
     event.prefillMicros = in.u64();
@@ -219,6 +220,7 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     ErrorEvent event;
     event.failureClass = static_cast<FailureClass>(in.u8());
     event.retryable = in.u8() != 0;
+    event.retryAfterSeconds = in.u32();
     event.requestId = in.u64();
     const uint32_t codeBytes = in.u32();
     const uint32_t messageBytes = in.u32();

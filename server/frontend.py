@@ -498,11 +498,12 @@ class Frontend:
         Output limit errors name output_field, that API's own field.
         thinking_display "omitted" hides Messages reasoning behind a
         signature."""
-        with self._preparation(deadline):
+        with self._preparation(deadline) as without_slot:
             return self._prepare(
                 body,
                 None,
                 deadline,
+                without_slot,
                 output_field=output_field,
                 thinking_display=thinking_display,
             )
@@ -562,8 +563,10 @@ class Frontend:
         return list(tokens)
 
     def count_tokens(self, body, *, deadline):
-        with self._preparation(deadline):
-            prompt = self._prepare_prompt(body, None, deadline=deadline)
+        with self._preparation(deadline) as without_slot:
+            prompt = self._prepare_prompt(
+                body, None, deadline=deadline, without_slot=without_slot
+            )
             rendered = self._render_prompt(prompt, deadline, check_context=False)
             return self._image_token_count(
                 rendered.tokens, rendered.images, rendered.image_positions
@@ -787,8 +790,10 @@ class Frontend:
         add_generation_prompt = body.get("add_generation_prompt", True)
         if not isinstance(add_generation_prompt, bool):
             raise APIError(400, "add_generation_prompt must be a boolean")
-        with self._preparation(deadline):
-            prompt = self._prepare_prompt(body, None, deadline=deadline)
+        with self._preparation(deadline) as without_slot:
+            prompt = self._prepare_prompt(
+                body, None, deadline=deadline, without_slot=without_slot
+            )
             return self._render_prompt(
                 prompt,
                 deadline,
@@ -798,6 +803,31 @@ class Frontend:
 
     @contextmanager
     def _preparation(self, deadline):
+        """Hold a preparation slot while the request prepares. Yields a
+        context manager under which the request holds none: it gives its
+        slot back to wait for and use the PDF worker, which slots do not
+        bound, and takes one again after, unless it failed meanwhile."""
+        self._take_preparation_slot(deadline)
+        held = True
+
+        @contextmanager
+        def without_slot():
+            nonlocal held
+            self._give_preparation_slot()
+            held = False
+            yield
+            self._take_preparation_slot(deadline)
+            held = True
+
+        try:
+            remaining_request_time(deadline)
+            with self.latencies.measure("preparation"):
+                yield without_slot
+        finally:
+            if held:
+                self._give_preparation_slot()
+
+    def _take_preparation_slot(self, deadline):
         remaining = remaining_request_time(deadline)
         with self.preparation_lock:
             self.preparation_waiting += 1
@@ -816,16 +846,13 @@ class Frontend:
                 "frontend preparation capacity is exhausted",
                 "frontend_overloaded",
             )
-        try:
-            remaining_request_time(deadline)
-            with self.latencies.measure("preparation"):
-                yield
-        finally:
-            with self.preparation_lock:
-                self.preparation_active -= 1
-            self.preparation_slots.release()
 
-    def _prepare_prompt(self, body, tool_namespaces, *, deadline):
+    def _give_preparation_slot(self):
+        with self.preparation_lock:
+            self.preparation_active -= 1
+        self.preparation_slots.release()
+
+    def _prepare_prompt(self, body, tool_namespaces, *, deadline, without_slot):
         if not self.accepts_model(body.get("model")):
             raise APIError(404, f"model {body['model']} not found", "model_not_found")
         reasoning_effort = body.get("reasoning_effort")
@@ -854,7 +881,10 @@ class Frontend:
             )
         messages = template_messages(
             normalize_messages(
-                body.get("messages"), vision=self.vision, deadline=deadline
+                body.get("messages"),
+                vision=self.vision,
+                deadline=deadline,
+                without_slot=without_slot,
             )
         )
         tools, tool_policy = normalize_tools(
@@ -960,6 +990,7 @@ class Frontend:
         body,
         tool_namespaces,
         deadline,
+        without_slot,
         *,
         output_field,
         thinking_display,
@@ -976,7 +1007,9 @@ class Frontend:
             or (logprobs is not None and (not isinstance(logprobs, bool) or logprobs))
         ):
             raise APIError(400, "n and logprobs are not currently supported")
-        prompt = self._prepare_prompt(body, tool_namespaces, deadline=deadline)
+        prompt = self._prepare_prompt(
+            body, tool_namespaces, deadline=deadline, without_slot=without_slot
+        )
         tools, tool_policy = prompt.tools, prompt.tool_policy
         response_schema, response_validator = (
             prompt.response_schema,
@@ -1191,7 +1224,7 @@ class Frontend:
             not isinstance(previous_id, str) or not previous_id
         ):
             raise APIError(400, "previous_response_id must be a non-empty string")
-        with self._preparation(deadline):
+        with self._preparation(deadline) as without_slot:
             previous_items = []
             if previous_id is not None:
                 previous = self.response_store.get(previous_id)
@@ -1212,6 +1245,7 @@ class Frontend:
                 chat,
                 namespaces,
                 deadline,
+                without_slot,
                 output_field="max_output_tokens",
                 thinking_display="summarized",
             )

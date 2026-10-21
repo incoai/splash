@@ -381,6 +381,7 @@ void Sampling::addAcceptance(
                "target token");
   requireBytes(buffers.retainedCounts, lanes * sizeof(uint32_t), "retained count");
   requireBytes(buffers.acceptedCounts, lanes * sizeof(uint32_t), "accepted count");
+  requireBytes(buffers.verifyRows, lanes * sizeof(uint32_t), "verify rows");
   if (const uint64_t sampledLanes = std::bit_width(params.sampling_mask)) {
     const uint64_t candidates = sampledLanes * kProposals * SPLASH_DRAFT_CANDIDATES;
     requireBytes(buffers.candidates, candidates * sizeof(uint32_t), "draft candidate");
@@ -397,7 +398,7 @@ void Sampling::addAcceptance(
             {buffers.proposedTokens, buffers.candidates,
              buffers.proposalProbabilities, buffers.targetVocabularyRows,
              buffers.uniforms, buffers.outputTokens, buffers.retainedCounts,
-             buffers.acceptedCounts},
+             buffers.acceptedCounts, buffers.verifyRows},
             params, {lanes, 1, 1}, {1, 1, 1});
 }
 

@@ -1,6 +1,5 @@
 #include "ops/PageStorage.hpp"
 
-#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -39,7 +38,6 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
     for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
         layers_.push_back(splash_kv_layer(extentPages_, data, scale, layer));
     extents_.resize(pageCount_ / extentPages_);
-    extentAddresses_.resize(extents_.size());
 }
 
 size_t PageStorage::extentIndex(uint32_t page) const {
@@ -47,40 +45,54 @@ size_t PageStorage::extentIndex(uint32_t page) const {
     return page / extentPages_;
 }
 
+const PageStorage::Extent &PageStorage::allocatedExtent(uint32_t page) const {
+    const Extent &extent = extents_[extentIndex(page)];
+    if (!extent.address) {
+        throw std::logic_error("KV page " + std::to_string(page) +
+                               " is in an extent that is not allocated");
+    }
+    return extent;
+}
+
 uint64_t PageStorage::actualAllocatedBytes() const noexcept {
-    const auto allocated = std::count_if(
-        extents_.begin(), extents_.end(),
-        [](const metal::MetalBuffer &extent) { return static_cast<bool>(extent); });
-    return static_cast<uint64_t>(allocated) * extentBytes();
+    uint64_t bytes = 0;
+    for (const Extent &extent : extents_)
+        bytes += extent.buffer.sizeBytes();
+    return bytes;
 }
 
 bool PageStorage::isAllocated(uint32_t page) const {
-    return static_cast<bool>(extents_[extentIndex(page)]);
+    return static_cast<bool>(extents_[extentIndex(page)].buffer);
 }
 
-metal::AllocationResult PageStorage::allocateExtent(uint32_t extent) {
-    metal::MetalBuffer &buffer = extents_.at(extent);
-    if (buffer) {
+metal::AllocationResult PageStorage::allocateExtent(uint32_t extent, PageForm form) {
+    Extent &record = extents_.at(extent);
+    if (record.buffer) {
         throw std::logic_error(
             "KV extent " + std::to_string(extent) + " is already allocated");
     }
-    const uint64_t bytes = extentBytes();
+    if (form == PageForm::Index && !layout_.spillable()) {
+        throw std::invalid_argument(
+            "KV pages of a layout that cannot spill are all Full");
+    }
+    const uint64_t bytes = extentBytes(form);
+    const std::string label = form == PageForm::Full ? "kv-extent-" : "kv-index-extent-";
     return admitAllocation_(bytes, [&] {
         metal::MetalBuffer allocated = backend_.allocateBuffer(
             bytes, metal::BufferStorage::Shared,
-            "kv-extent-" + std::to_string(extent * extentPages_));
+            label + std::to_string(extent * extentPages_), metal::BufferReach::Addressed);
         if (allocated.gpuAddress() & SPLASH_KV_PAGE_INDEX_MASK) {
             throw std::logic_error(
                 "KV extent address leaves no room for the page index");
         }
-        extentAddresses_[extent] = allocated.gpuAddress();
-        buffer = std::move(allocated);
+        const uint64_t address = allocated.gpuAddress();
+        record = {std::move(allocated), address, form};
     });
 }
 
 void PageStorage::releaseExtent(uint32_t extent) {
-    metal::MetalBuffer &buffer = extents_.at(extent);
-    if (!buffer) {
+    Extent &record = extents_.at(extent);
+    if (!record.buffer) {
         throw std::logic_error(
             "KV extent " + std::to_string(extent) + " is not allocated");
     }
@@ -88,8 +100,7 @@ void PageStorage::releaseExtent(uint32_t extent) {
         throw std::logic_error(
             "cannot release a KV extent while a command is in flight");
     }
-    buffer = {};
-    extentAddresses_[extent] = 0;
+    record = {};
 }
 
 void PageStorage::copyPages(std::span<const PageCopy> copies) {
@@ -104,8 +115,9 @@ void PageStorage::copyPages(std::span<const PageCopy> copies) {
         }
     }
     for (const PageCopy &copy : copies) {
-        const auto source = spans(copy.from);
-        const auto destination = spans(copy.to);
+        const bool sameForm = form(copy.from) == form(copy.to);
+        const auto source = sameForm ? spans(copy.from) : indexSpans(copy.from);
+        const auto destination = sameForm ? spans(copy.to) : indexSpans(copy.to);
         for (size_t tensor = 0; tensor < source.size(); ++tensor) {
             std::memcpy(destination[tensor].data(), source[tensor].data(),
                         source[tensor].size());
@@ -126,20 +138,17 @@ void PageStorage::clearPages(std::span<const uint32_t> pages) {
     }
 }
 
-SplashKvPage PageStorage::entry(uint32_t page) const {
-    const size_t extent = extentIndex(page);
-    const uint64_t address = extentAddresses_[extent];
-    if (!address) {
-        throw std::logic_error("KV page " + std::to_string(page) +
-                               " is in an extent that is not allocated");
-    }
-    return splash_kv_page_entry(
-        address, page - static_cast<uint32_t>(extent) * extentPages_);
+uint32_t PageStorage::indexOffset(uint32_t layer) const {
+    if (!layout_.indexDimension || layer >= layout_.attentionLayers)
+        throw std::out_of_range("KV layer has no index region");
+    return static_cast<uint32_t>(uint64_t{extentPages_} * layer * layout_.indexBytesPerLayerPage());
 }
 
-void PageStorage::writeEntries(std::span<const uint32_t> pages,
-                               uint32_t first,
-                               const metal::MetalBuffer &table) const {
+PageForm PageStorage::form(uint32_t page) const { return allocatedExtent(page).form; }
+
+template <class Entry>
+void PageStorage::writeTable(std::span<const uint32_t> pages, uint32_t first,
+                             const metal::MetalBuffer &table, Entry entry) const {
     auto *entries = static_cast<SplashKvPage *>(table.contents());
     if (!entries || table.sizeBytes() / sizeof(SplashKvPage) < pages.size()) {
         throw std::logic_error(
@@ -149,33 +158,75 @@ void PageStorage::writeEntries(std::span<const uint32_t> pages,
         throw std::invalid_argument(
             "KV page table entries start past the end of its pages");
     }
-    for (size_t index = first; index < pages.size(); ++index)
-        entries[index] = entry(pages[index]);
+    for (size_t index = first; index < pages.size(); ++index) {
+        const uint32_t page = pages[index];
+        entries[index] = entry(allocatedExtent(page), page % extentPages_);
+    }
+}
+
+void PageStorage::writeEntries(std::span<const uint32_t> pages,
+                               uint32_t first,
+                               const metal::MetalBuffer &table) const {
+    writeTable(pages, first, table, [](const Extent &extent, uint32_t index) {
+        return extent.form == PageForm::Full ? splash_kv_page_entry(extent.address, index)
+                                             : SPLASH_KV_PAGE_ABSENT;
+    });
+}
+
+void PageStorage::writeIndexEntries(std::span<const uint32_t> pages,
+                                    uint32_t first,
+                                    const metal::MetalBuffer &table) const {
+    if (!layout_.indexDimension)
+        throw std::logic_error("KV pages of a layout without an index have no index entries");
+    writeTable(pages, first, table, [this](const Extent &extent, uint32_t index) {
+        return splash_kv_page_entry(extent.address + indexPlaneOffset(extent.form), index);
+    });
 }
 
 std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page) const {
-    auto *extent =
-        static_cast<std::byte *>(extents_[extentIndex(page)].contents());
-    if (!extent) {
-        throw std::logic_error("KV page " + std::to_string(page) +
-                               " is in an extent that is not allocated");
-    }
-    const auto data = static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
-    const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
-    const uint32_t index = page % extentPages_;
     std::vector<std::span<std::byte>> result;
-    result.reserve(size_t{layout_.attentionLayers} * (scale ? 4 : 2));
-    for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
-        for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES;
-             ++tensor) {
-            if (const uint32_t bytes = splash_kv_page_bytes(data, scale, tensor)) {
-                result.emplace_back(extent + splash_kv_offset(extentPages_, data,
-                                                              scale, layer,
-                                                              tensor, index),
-                                    bytes);
+    if (form(page) == PageForm::Full) {
+        result.reserve(size_t{layout_.attentionLayers} *
+                       ((layout_.scaleBytesPerLayerPage() ? 4 : 2) + (layout_.indexDimension ? 1 : 0)));
+        for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
+            for (const std::span<std::byte> tensor : layerSpans(page, layer)) {
+                if (!tensor.empty()) result.push_back(tensor);
             }
         }
     }
+    const std::vector<std::span<std::byte>> index = indexSpans(page);
+    result.insert(result.end(), index.begin(), index.end());
+    return result;
+}
+
+std::array<std::span<std::byte>, 4> PageStorage::layerSpans(uint32_t page, uint32_t layer) const {
+    const Extent &extent = allocatedExtent(page);
+    if (extent.form != PageForm::Full)
+        throw std::logic_error("KV page " + std::to_string(page) + " holds only its index");
+    if (layer >= layout_.attentionLayers)
+        throw std::out_of_range("KV layer is outside the layout");
+    auto *contents = static_cast<std::byte *>(extent.buffer.contents());
+    const auto data = static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
+    const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
+    const uint32_t index = page % extentPages_;
+    std::array<std::span<std::byte>, 4> result;
+    for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES; ++tensor) {
+        result[tensor] = {contents + splash_kv_offset(extentPages_, data, scale, layer, tensor, index),
+                          splash_kv_page_bytes(data, scale, tensor)};
+    }
+    return result;
+}
+
+std::vector<std::span<std::byte>> PageStorage::indexSpans(uint32_t page) const {
+    const Extent &extent = allocatedExtent(page);
+    std::vector<std::span<std::byte>> result;
+    if (!layout_.indexDimension) return result;
+    std::byte *plane = static_cast<std::byte *>(extent.buffer.contents()) + indexPlaneOffset(extent.form);
+    const uint64_t bytes = layout_.indexBytesPerLayerPage();
+    const uint32_t index = page % extentPages_;
+    result.reserve(layout_.attentionLayers);
+    for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
+        result.emplace_back(plane + indexOffset(layer) + index * bytes, bytes);
     return result;
 }
 

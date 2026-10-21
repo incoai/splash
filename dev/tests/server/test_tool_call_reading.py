@@ -24,6 +24,8 @@ from server.output import MAX_ARGUMENTS_DEPTH
 # The deepest a parameter value reads as JSON: one level less than its call's
 # arguments.
 MAX_VALUE_DEPTH = MAX_ARGUMENTS_DEPTH - 1
+# A tool whose value is an array, which reads as the JSON its text spells.
+ARRAY_VALUE = {"f": {"properties": {"value": {"type": "array"}}}}
 
 SCHEMAS = {
     "roll_cut": {
@@ -39,6 +41,11 @@ SCHEMAS = {
         "type": "object",
         "properties": {"time": {"type": ["string", "number"]}},
         "required": ["time"],
+    },
+    "note": {
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "additionalProperties": False,
     },
 }
 
@@ -79,7 +86,15 @@ PARSES = {
     ),
     "a tool not offered": (
         call("search", ("limit", "5"), ("query", "a b")),
-        [("search", {"limit": 5, "query": "a b"})],
+        [("search", {"limit": "5", "query": "a b"})],
+    ),
+    "a parameter the tool does not declare": (
+        call("roll_cut", ("item", "s1"), ("count", "2")),
+        [("roll_cut", {"item": "s1", "count": "2"})],
+    ),
+    "a parameter a closed tool does not declare": (
+        call("note", ("count", "2")),
+        [("note", {"count": "2"})],
     ),
     "no function name": (call("", ("item", "x")), []),
     "a value keeps inner newlines and markup": (
@@ -111,9 +126,12 @@ PARSES = {
     ),
 }
 
-# The value a parameter's text converts to by its declared types: the JSON
-# the text spells, but a string where one may be the value and the JSON is
-# not of another declared type.
+# The value a parameter's text converts to by its declared types: the text
+# where the schema gives none, else the JSON the text spells, but a string
+# where one may be the value and the JSON is not of another declared type. A
+# type name reads in any case and a common alias names a JSON type; a type
+# that holds any other name, or anything but a name, constrains none, as one
+# that gives none.
 CONVERSIONS = (
     ({"type": "string"}, "123", "123"),
     ({"type": "string"}, "true", "true"),
@@ -159,10 +177,29 @@ CONVERSIONS = (
     ({"allOf": [{"type": "integer"}, {"minimum": 0}]}, "5", 5),
     ({"enum": [1, 2, "x"]}, "1", 1),
     ({"enum": [1, 2, "x"]}, "x", "x"),
-    ({}, '{"a": 1}', {"a": 1}),
-    ({}, "7", 7),
+    ({}, '{"a": 1}', '{"a": 1}'),
+    ({}, "7", "7"),
     ({}, "seven", "seven"),
     ({}, "True", "True"),
+    ({"description": "a count"}, "7", "7"),
+    ({"type": "str"}, "42", "42"),
+    ({"type": "text"}, "true", "true"),
+    ({"type": ["string", "int"]}, "12", 12),
+    ({"type": ["string", "float"]}, "4.5", 4.5),
+    ({"type": "bool"}, "True", True),
+    ({"type": ["string", "dict"]}, '{"a": 1}', {"a": 1}),
+    ({"type": ["string", "list"]}, "[1, 2]", [1, 2]),
+    ({"type": "STRING"}, "42", "42"),
+    ({"type": "Integer"}, "7", 7),
+    ({"type": " Boolean "}, "True", True),
+    ({"type": "any"}, "7", "7"),
+    ({"type": "any"}, '"x"', '"x"'),
+    ({"type": "any"}, "seven", "seven"),
+    ({"type": ["string", "any"]}, "7", "7"),
+    ({"type": ["integer", "any"]}, "7", "7"),
+    ({"type": ["null", {"type": "integer"}]}, "7", "7"),
+    ({"type": "integer", "allOf": [{"type": "any"}]}, "7", 7),
+    ({"type": "any", "allOf": [{"type": "integer"}]}, "7", 7),
 )
 
 
@@ -230,7 +267,15 @@ class ToolCallReadingTests(unittest.TestCase):
             f"<parameter=nested>\n{nested}\n</parameter>\n"
             "</function>\n</tool_call>"
         )
-        _, calls, _ = project(text, tool_policy({"f": {}}))
+        schema = {
+            "properties": {
+                "constant": {"type": "number"},
+                "overflow": {"type": "number"},
+                "integer": {"type": "integer"},
+                "nested": {"type": "array"},
+            }
+        }
+        _, calls, _ = project(text, tool_policy({"f": schema}))
         arguments = json.loads(calls[0]["function"]["arguments"])
         self.assertEqual(
             arguments,
@@ -261,7 +306,7 @@ class ToolCallReadingTests(unittest.TestCase):
             "<tool_call>\n<function=f>\n"
             f"<parameter=value>\n{allowed}\n</parameter>\n"
             "</function>\n</tool_call>",
-            tool_policy({"f": {}}),
+            tool_policy(ARRAY_VALUE),
         )
         arguments = json_codec.loads(calls[0]["function"]["arguments"])
         self.assertEqual(arguments, {"value": json.loads(allowed)})
@@ -308,7 +353,7 @@ class ToolCallReadingTests(unittest.TestCase):
                     "<tool_call>\n<function=f>\n"
                     f"<parameter=value>\n{value}\n</parameter>\n"
                     "</function>\n</tool_call>",
-                    tool_policy({"f": {}}),
+                    tool_policy(ARRAY_VALUE),
                 )
                 # The input a complete Messages response holds.
                 arguments = json_codec.loads(calls[0]["function"]["arguments"])
@@ -477,18 +522,30 @@ class ToolCallReadingTests(unittest.TestCase):
         ):
             with self.subTest(closed=closed):
                 self.assertEqual(self.read(closed + "\nDone.")[0].strip(), "Done.")
-        # A call the token limit cuts keeps the arguments it streamed.
-        cut = (
-            "<tool_call>\n<function=roll_cut>\n<parameter=item>\ns1\n"
-            "</parameter>\n<parameter=cut_at>\n12:"
-        )
-        _, calls, events = project(cut, tool_policy(SCHEMAS), incomplete=True)
-        arguments = '{"item":"s1","cut_at":"12:'
-        self.assertEqual(
-            [(c["function"]["name"], c["function"]["arguments"]) for c in calls],
-            [("roll_cut", arguments)],
-        )
-        self.assertEqual(streamed_arguments(events), arguments)
+        # A call the token limit cuts keeps the arguments it streamed. A value
+        # that is its text streams as it is written: one typed a string, and
+        # one its schema gives no type, as a parameter a tool does not
+        # declare, closed or not.
+        for function, name in (
+            ("roll_cut", "cut_at"),
+            ("roll_cut", "count"),
+            ("note", "count"),
+        ):
+            with self.subTest(function=function, name=name):
+                cut = (
+                    f"<tool_call>\n<function={function}>\n<parameter=item>\ns1\n"
+                    f"</parameter>\n<parameter={name}>\n12:"
+                )
+                _, calls, events = project(cut, tool_policy(SCHEMAS), incomplete=True)
+                arguments = f'{{"item":"s1","{name}":"12:'
+                self.assertEqual(
+                    [
+                        (c["function"]["name"], c["function"]["arguments"])
+                        for c in calls
+                    ],
+                    [(function, arguments)],
+                )
+                self.assertEqual(streamed_arguments(events), arguments)
         # Types are read through local references, a parameter's own and the
         # one a model such as pydantic's recursive one puts at the top.
         point = {

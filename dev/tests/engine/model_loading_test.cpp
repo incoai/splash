@@ -4,6 +4,7 @@
 #include "TestCheckpoint.hpp"
 #include "model/GgufImageLayout.hpp"
 #include "model/ModelFactory.hpp"
+#include "model/ModelSizing.hpp"
 #include "model/SafetensorsImage.hpp"
 #include "model/WeightImages.hpp"
 #include "model/WeightLayout.hpp"
@@ -50,7 +51,7 @@ using splash::ops::VisionLayout;
 using splash::model::kWeightFileAlignment;
 using splash::model::loadModel;
 using splash::model::makeModelDescriptor;
-using splash::model::modelWeightBytes;
+using splash::model::streamableWeights;
 using splash::model::weightManifestFingerprint;
 using splash::metal::BufferStorage;
 using splash::metal::MetalBackend;
@@ -431,7 +432,7 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
 }
 
 // The small layouts the synthetic models load: a target and its draft of
-// every projection in whole 256-row tiles of a multiple of 256 inputs, as
+// every projection in whole plane tiles of a multiple of 256 inputs, as
 // block images hold them, and a vision tower. A MoE target keeps its family's
 // 256 experts, 8 per token.
 template <class Layout = Qwen3_8Layout> Layout syntheticTarget() {
@@ -455,24 +456,26 @@ template <class Layout = Qwen3_8Layout> Layout syntheticTarget() {
     else
         target.intermediateSize = 256;
     target.fullAttentionPeriod = 4;
-    target.hiddenCaptureLayers.fill(target.layers - 1);
     return target;
 }
 
+// The draft's hidden size and vocabulary are its target's.
 template <class Layout> DFlashDraftLayout syntheticDraft(const Layout &target) {
     DFlashDraftLayout draft;
     draft.layers = 2;
-    draft.hiddenSize = 256;
-    draft.vocabularySize = 256;
+    draft.hiddenSize = target.hiddenSize;
+    draft.vocabularySize = target.vocabularySize;
     draft.dynamicSize = 256;
     draft.qkvSize = 512;
     draft.attentionSize = 256;
     draft.intermediateSize = 256;
     draft.attentionHeadDimension = 64;
     draft.rotaryTheta = 10'000'000.0F;
-    draft.targetHiddenSize = target.capturedHiddenSize();
     draft.selectorRank = 256;
     draft.kvHeads = 2;
+    // It reads a GDN layer and the attention layer.
+    draft.targetLayers = {1, 3};
+    draft.targetLayerCount = 2;
     return draft;
 }
 
@@ -531,7 +534,7 @@ void testSyntheticModel(MetalBackend &backend,
                     model.vision.files.size() == 1 &&
                     declaredBytes(model.vision.files) == expected.visionBytes,
                 "vision role records are incomplete");
-        require(modelWeightBytes(root, descriptor) ==
+        require(streamableWeights(root, descriptor, {}).loadedBytes ==
                     expected.targetBytes + expected.draftBytes +
                         expected.visionBytes,
                 "the weight budget does not count every image");
@@ -641,7 +644,7 @@ ModelDescriptor writeBlockModel(const std::filesystem::path &root, const Layout 
 
 // An MLX target loads as block images: each quantized module in the format of
 // its tensors, GDN alpha and beta of two formats as F32, bf16 norms and
-// grouped GDN value heads, and modelWeightBytes plans the bytes it loads. A
+// grouped GDN value heads, and streamableWeights plans the bytes it loads. A
 // raw checkpoint, whose convolution mlx-lm has not sanitized, is refused, and
 // so is one whose head mlx-lm left unquantized; a bf16 token table loads as its
 // bf16 rows.
@@ -662,7 +665,7 @@ void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path 
     };
     const ModelDescriptor descriptor =
         writeBlockModel(root, target, splash::test::mlxTargetTensors(target, bitsAndGroup));
-    const uint64_t planned = splash::model::modelWeightBytes(root, descriptor);
+    const uint64_t planned = splash::model::streamableWeights(root, descriptor, {}).loadedBytes;
     auto model = loadModel(backend, root, descriptor);
     const auto &weights = std::get<Qwen3_8Weights>(model.target);
     const auto &gdn = std::get<QwenGdnWeights>(weights.layers[0].mixer);
@@ -685,7 +688,7 @@ void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path 
                 weights.tokenEmbedding.blocks().formatId == format("embed_tokens"),
             "a block FFN, head or token table did not keep its module's format");
     require(declaredBytes(weights.files) + declaredBytes(model.draft.files) == planned,
-            "modelWeightBytes is not what an MLX block target loads");
+            "streamableWeights is not what an MLX block target loads");
 
     std::vector<splash::test::SyntheticTensor> raw = splash::test::mlxTargetTensors(target, bitsAndGroup);
     for (splash::test::SyntheticTensor &tensor : raw)
@@ -733,7 +736,7 @@ std::string checkpointName(splash::test::FloatCheckpoint checkpoint) {
 // compressed-tensors stores them, loads as block images: each module in its
 // format with its convention's tensor scale, GDN alpha and beta of bf16 as
 // F32, the RMSNorms as the F32 1 + w of the w stored but the GDN's gated norm
-// as its w, the bf16 token table as its bf16 rows, and modelWeightBytes plans
+// as its w, the bf16 token table as its bf16 rows, and streamableWeights plans
 // the bytes it loads.
 void testSyntheticFloatModel(MetalBackend &backend, const std::filesystem::path &root,
                              splash::test::FloatCheckpoint checkpoint) {
@@ -747,7 +750,7 @@ void testSyntheticFloatModel(MetalBackend &backend, const std::filesystem::path 
     };
     const ModelDescriptor descriptor =
         writeBlockModel(root, target, splash::test::floatTargetTensors(target, format, checkpoint));
-    const uint64_t planned = splash::model::modelWeightBytes(root, descriptor);
+    const uint64_t planned = splash::model::streamableWeights(root, descriptor, {}).loadedBytes;
     auto model = loadModel(backend, root, descriptor);
     const auto &weights = std::get<Qwen3_8Weights>(model.target);
     const auto &gdn = std::get<QwenGdnWeights>(weights.layers[0].mixer);
@@ -793,14 +796,14 @@ void testSyntheticFloatModel(MetalBackend &backend, const std::filesystem::path 
                 g8.rowsPerValue == (compressed ? 1 : fp8Rows.rows) && g8.bfloat16 == compressed && !g8.reciprocal,
             "a " + name + " target's tensor scales are not read as its convention stores them");
     require(declaredBytes(weights.files) + declaredBytes(model.draft.files) == planned,
-            "modelWeightBytes is not what a " + name + " target loads");
+            "streamableWeights is not what a " + name + " target loads");
 }
 
 // A MoE target in NVFP4 and FP8, as Model Optimizer or compressed-tensors
 // stores it, loads as block images: each layer's routed experts, modules of
 // their own, stacked in index order into the planes of their shared format,
 // the shared expert in its own, the bf16 router and shared-expert gate as
-// F32, and modelWeightBytes plans the bytes it loads.
+// F32, and streamableWeights plans the bytes it loads.
 void testSyntheticFloatMoeModel(MetalBackend &backend, const std::filesystem::path &root,
                                 splash::test::FloatCheckpoint checkpoint) {
     const auto target = syntheticTarget<Qwen3_6MoeLayout>();
@@ -810,7 +813,7 @@ void testSyntheticFloatMoeModel(MetalBackend &backend, const std::filesystem::pa
     };
     const ModelDescriptor descriptor =
         writeBlockModel(root, target, splash::test::floatTargetTensors(target, format, checkpoint));
-    const uint64_t planned = splash::model::modelWeightBytes(root, descriptor);
+    const uint64_t planned = splash::model::streamableWeights(root, descriptor, {}).loadedBytes;
     const auto model = loadModel(backend, root, descriptor);
     const auto &weights = std::get<Qwen3_6MoeWeights>(model.target);
     for (const auto &layer : weights.layers) {
@@ -835,12 +838,12 @@ void testSyntheticFloatMoeModel(MetalBackend &backend, const std::filesystem::pa
         }
     require(stacks == 3 * target.layers, "a " + name + " layer's experts did not stack into three tensors");
     require(declaredBytes(weights.files) + declaredBytes(model.draft.files) == planned,
-            "modelWeightBytes is not what a " + name + " MoE target loads");
+            "streamableWeights is not what a " + name + " MoE target loads");
 }
 
 // An MLX MoE target loads as block images: the experts in mixed formats, the
 // routed down projection mxfp4, and the 8-bit affine router and bf16
-// shared-expert gate as the F32 values the block MoE reads; modelWeightBytes
+// shared-expert gate as the F32 values the block MoE reads; streamableWeights
 // plans the bytes it loads.
 void testSyntheticBlockMoeModel(MetalBackend &backend, const std::filesystem::path &root) {
     const auto target = syntheticTarget<Qwen3_6MoeLayout>();
@@ -874,7 +877,7 @@ void testSyntheticBlockMoeModel(MetalBackend &backend, const std::filesystem::pa
             tensor = {tensor.name, "BF16", {1, target.hiddenSize}};
     }
     const ModelDescriptor descriptor = writeBlockModel(root, target, tensors);
-    const uint64_t planned = splash::model::modelWeightBytes(root, descriptor);
+    const uint64_t planned = splash::model::streamableWeights(root, descriptor, {}).loadedBytes;
     const auto model = loadModel(backend, root, descriptor);
     const auto &weights = std::get<Qwen3_6MoeWeights>(model.target);
     const auto format = [&](std::string_view name) {
@@ -895,7 +898,7 @@ void testSyntheticBlockMoeModel(MetalBackend &backend, const std::filesystem::pa
                 "a block MoE did not read its router and shared-expert gate as F32");
     }
     require(declaredBytes(weights.files) + declaredBytes(model.draft.files) == planned,
-            "modelWeightBytes is not what an MLX block MoE target loads");
+            "streamableWeights is not what an MLX block MoE target loads");
 }
 
 int main(int argc, const char *argv[]) {

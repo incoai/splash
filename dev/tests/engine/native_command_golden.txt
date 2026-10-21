@@ -28,5 +28,15 @@ image_patches_rounded | --max-image-pixels 1000000 | auto auto --max-image-patch
 image_patches_default | --max-image-pixels 4194304 | auto auto
 idle_sleep | --allow-idle-sleep | auto auto --idle-sleep allow
 disable_ane | --disable-ane | auto auto --ane off
+verify_rows_all | --verify-rows all | auto auto --verify-rows all
+verify_rows_auto | --verify-rows auto | auto auto
 relaunch |  | auto auto --relaunch-context 61433
 relaunch_limits | --max-context 100K --max-memory 32G | 102400 34359738368
+yarn | --max-context 1M | 1000000 auto
+yarn_double | --max-context 512K | 524288 auto
+ple_memory | --ple-memory 2G | auto auto --ple-memory 2147483648
+ple_memory_off | --ple-memory off | auto auto --ple-memory off
+expert_memory | --expert-memory 16G | auto auto --expert-memory 17179869184
+expert_memory_off | --expert-memory off | auto auto --expert-memory off
+expert_memory_auto | --expert-memory auto --ple-memory auto | auto auto
+sparse_kv_memory | --sparse-kv-memory 1200M | auto auto --sparse-kv-memory 1258291200

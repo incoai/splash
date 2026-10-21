@@ -15,8 +15,10 @@ import httpx
 from huggingface_hub.errors import IncompleteSnapshotError
 
 from dev.tests.installer_fixtures import (
+    CONFIGS,
     DENSE,
     DRAFT_COMMIT,
+    GGUF_ONLY,
     MODEL,
     MOE,
     PROCESSOR,
@@ -36,7 +38,7 @@ from install import assembly, families, hub, models, paths, upstream
 # tells it apart.
 UNSUPPORTED = (
     "no supported model has this architecture [(]{}[)]; "
-    "supported: Qwen3.8-27B, Qwen3.6-35B-A3B"
+    "supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next"
 )
 
 
@@ -58,7 +60,7 @@ class UpstreamTest(unittest.TestCase):
         return output.getvalue(), warnings.getvalue()
 
     def test_every_family_names_its_own_draft_repository(self):
-        repos = [family.draft_repo for family in families.FAMILIES]
+        repos = [family.draft_repo for family in families.FAMILIES if family.draft_repo]
         for repo in repos:
             with self.subTest(repo=repo):
                 self.assertEqual(models.validate_repo_id(repo), repo)
@@ -66,8 +68,10 @@ class UpstreamTest(unittest.TestCase):
 
     def test_family_is_identified_by_architecture_not_name(self):
         # The engine's check (its model-check command), with and without the
-        # draft.
+        # draft, of each family an MLX checkpoint serves.
         for family in families.FAMILIES:
+            if family in GGUF_ONLY:
+                continue
             config = mlx_target(self.root / family.name, family) / "config.json"
             draft = draft_dir(self.root / family.name / "draft", family)
             for arguments in ({}, {"draft": draft / "config.json"}):
@@ -77,6 +81,29 @@ class UpstreamTest(unittest.TestCase):
                     ),
                     family,
                 )
+        # Qwen3.8-Flash-Next loads from a GGUF: the config and metadata the
+        # installer derives from it name it, with and without its draft, and
+        # another family's draft is refused.
+        flash = families.named("Qwen3.8-Flash-Next")
+        configs = CONFIGS / flash.name.lower()
+        gguf_check = {"gguf_metadata": configs / "gguf-metadata.json"}
+        for arguments in ({}, {"draft": configs / "draft" / "config.json"}):
+            self.assertIs(
+                upstream.check_model(
+                    "gguf", "none", configs / "config.json", **gguf_check, **arguments
+                ),
+                flash,
+            )
+        with self.assertRaisesRegex(
+            models.ModelError, "draft config hidden_size mismatch: checkpoint 5120"
+        ):
+            upstream.check_model(
+                "gguf",
+                "none",
+                configs / "config.json",
+                draft=draft_dir(self.root / "draft", DENSE) / "config.json",
+                **gguf_check,
+            )
         # A differing size or model type is another model, whatever the
         # repository is called; the engine names it. A field a family's
         # fine-tune could change is refused as a mismatch.
@@ -143,7 +170,7 @@ class UpstreamTest(unittest.TestCase):
         ):
             upstream.check_model("mlx-affine", "none", config)
 
-    def test_gguf_selection_is_exact_and_ignores_subfolders(self):
+    def test_gguf_selection_is_exact_and_takes_split_variant_folders(self):
         files = {
             "Qwen3.8-27B-UD-Q4_K_M.gguf",
             "Qwen3.8-27B-Q4_0.gguf",
@@ -155,20 +182,20 @@ class UpstreamTest(unittest.TestCase):
         }
         self.assertEqual(
             upstream.select_gguf(files, "UD-Q4_K_M"),
-            ("Qwen3.8-27B-UD-Q4_K_M.gguf", False),
+            (["Qwen3.8-27B-UD-Q4_K_M.gguf"], False),
         )
         self.assertEqual(
-            upstream.select_gguf(files, "q4_0"), ("Qwen3.8-27B-Q4_0.gguf", False)
+            upstream.select_gguf(files, "q4_0"), (["Qwen3.8-27B-Q4_0.gguf"], False)
         )
         # Q4_K_M names the plain file; without one, the one file ending so,
         # which the caller reports, and never one of several.
         both = files | {"Qwen3.8-27B-Q4_K_M.gguf"}
         self.assertEqual(
-            upstream.select_gguf(both, "Q4_K_M"), ("Qwen3.8-27B-Q4_K_M.gguf", False)
+            upstream.select_gguf(both, "Q4_K_M"), (["Qwen3.8-27B-Q4_K_M.gguf"], False)
         )
         self.assertEqual(
             upstream.select_gguf(files, "Q4_K_M"),
-            ("Qwen3.8-27B-UD-Q4_K_M.gguf", True),
+            (["Qwen3.8-27B-UD-Q4_K_M.gguf"], True),
         )
         with self.assertRaisesRegex(
             models.ModelError,
@@ -179,16 +206,41 @@ class UpstreamTest(unittest.TestCase):
         # A projector is never a target, however its publisher names it.
         self.assertEqual(
             upstream.select_gguf({"Model-PQ2_0.gguf", "Model-mmproj-BF16.gguf"}, None),
-            ("Model-PQ2_0.gguf", False),
+            (["Model-PQ2_0.gguf"], False),
         )
+        # A variant no root file names may be a folder of a split GGUF's
+        # parts, which must all be present.
+        self.assertEqual(
+            upstream.select_gguf(
+                files | {"BF16/Qwen3.8-27B-BF16-00002-of-00002.gguf"}, "BF16"
+            ),
+            (
+                [
+                    "BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf",
+                    "BF16/Qwen3.8-27B-BF16-00002-of-00002.gguf",
+                ],
+                False,
+            ),
+        )
+        with self.assertRaisesRegex(models.ModelError, "incomplete"):
+            upstream.select_gguf(files, "BF16")
+        # Two files of one part number are not one GGUF's parts.
+        parts = {
+            "BF16/Qwen3.8-27B-BF16-00002-of-00002.gguf",
+            "BF16/Qwen3.8-27B-BF16-copy-00001-of-00002.gguf",
+        }
+        with self.assertRaisesRegex(
+            models.ModelError, "are both part 1 of the split GGUF in BF16/"
+        ):
+            upstream.select_gguf(files | parts, "BF16")
         # A repository of one GGUF has no shared name to strip, and needs no
         # variant.
         for variant in ("UD-Q4_K_M", "Q4_K_M", None):
             self.assertEqual(
                 upstream.select_gguf({"Qwen3.8-27B-UD-Q4_K_M.gguf"}, variant),
-                ("Qwen3.8-27B-UD-Q4_K_M.gguf", False),
+                (["Qwen3.8-27B-UD-Q4_K_M.gguf"], False),
             )
-        for variant in (None, "Q4", "BF16", "missing"):
+        for variant in (None, "Q4", "missing"):
             with (
                 self.subTest(variant=variant),
                 self.assertRaisesRegex(models.ModelError, "Qwen3.8-27B-Q8_0.gguf"),
@@ -745,7 +797,7 @@ class UpstreamTest(unittest.TestCase):
             (
                 "someone/other-patches",
                 {"image_processor": PROCESSOR | {"patch_size": 14}},
-                "unsupported vision preprocessing configuration",
+                "unsupported vision preprocessing configuration; use --language-only",
             ),
         ):
             with self.subTest(model=model):
@@ -907,7 +959,7 @@ class UpstreamTest(unittest.TestCase):
         self.prepare(chosen)
         first = chosen.link.resolve()
         # A server holds the assembly it serves.
-        _, server = assembly.hold(chosen.link, chosen.models_root)
+        _, server = assembly.hold(chosen.link)
         self.addCleanup(server.close)
         # Staging an interrupted installation left behind.
         stale = [
@@ -1000,7 +1052,7 @@ class UpstreamTest(unittest.TestCase):
             f"Warning: keeping the installed {MODEL}@{'a' * 12}; cannot install "
             f"{MODEL}@{'b' * 40}: no supported model has this architecture (text "
             "config head_dim: safetensors 128, Qwen3.8-27B 256); supported: Qwen3.8-27B, "
-            "Qwen3.6-35B-A3B",
+            "Qwen3.6-35B-A3B, Qwen3.8-Flash-Next",
             warnings,
         )
         self.assertEqual(chosen.link.resolve(), installed)
@@ -1152,9 +1204,9 @@ class UpstreamTest(unittest.TestCase):
         )
         self.assertIn(
             f"Warning: cannot use the {DENSE.name} draft {DENSE.draft_repo}@"
-            f"{'e' * 12}; keeping the installed one: draft configuration is "
-            f"incompatible with {DENSE.name}: draft config dflash_config block_size "
-            "mismatch: checkpoint 16, runtime 8",
+            f"{'e' * 12}; keeping the installed one: {DENSE.draft_repo}'s draft "
+            f"configuration is incompatible with {DENSE.name}: draft config "
+            "dflash_config block_size mismatch: checkpoint 16, runtime 8",
             warnings,
         )
 
@@ -1259,11 +1311,11 @@ class UpstreamTest(unittest.TestCase):
 
     def test_an_incompatible_draft_is_an_error_not_a_crash(self):
         fake_hub(self, self.cache)
-        local = draft_dir(self.root / "draft", DENSE, num_hidden_layers=6)
+        local = draft_dir(self.root / "draft", DENSE, hidden_size=2048)
         with self.assertRaisesRegex(
             models.ModelError,
             "draft configuration is incompatible with Qwen3.8-27B: draft config "
-            "num_hidden_layers mismatch: checkpoint 6, runtime 5",
+            "hidden_size mismatch: checkpoint 2048, runtime 5120",
         ):
             self.prepare(selection(self.root, draft_model=str(local)))
 
@@ -1410,6 +1462,7 @@ class UpstreamTest(unittest.TestCase):
             lambda r: r.update(metadata="0" * 64),
             lambda r: r.update(target_format="safetensors"),
             lambda r: r.update(version=True),
+            lambda r: r["sources"].pop("draft"),
             lambda r: r["sources"]["draft"].update(revision="main"),
             lambda r: r["files"]["config.json"].pop("mtime_ns"),
             lambda r: r["files"]["config.json"].update(digest="z" * 64),
@@ -1453,9 +1506,17 @@ class UpstreamTest(unittest.TestCase):
         with contextlib.chdir(self.root):
             repo = hub.Repository.resolve(MODEL, "branch")
         self.assertEqual(fake.requests, [(MODEL, "branch")])
-        self.assertEqual((repo.directory, repo.revision), (None, "a" * 40))
+        self.assertEqual((repo.paths, repo.revision), (None, "a" * 40))
+        (self.root / MODEL / "config.json").write_text("{}")
         local = hub.Repository.resolve(str(self.root / MODEL))
-        self.assertEqual((local.directory, local.revision), (self.root / MODEL, None))
+        self.assertEqual(
+            (local.name, local.paths, local.revision),
+            (
+                str(self.root / MODEL),
+                {"config.json": self.root / MODEL / "config.json"},
+                None,
+            ),
+        )
         with self.assertRaisesRegex(models.ModelError, "draft directory not found"):
             hub.Repository.resolve(str(self.root / "deleted-draft"))
 
@@ -1465,8 +1526,7 @@ class UpstreamTest(unittest.TestCase):
         with self.assertRaisesRegex(
             models.ModelError,
             "cannot resolve owner/private: 401 Client Error.*; set HF_TOKEN .*; "
-            "neither this installation nor the Hub cache records a commit "
-            "for the default branch",
+            "the Hub cache records no commit for the default branch",
         ):
             hub.Repository.resolve("owner/private")
         # A branch the cache recorded resolves to its cached snapshot.

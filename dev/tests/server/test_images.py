@@ -7,6 +7,7 @@ import random
 import struct
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
@@ -641,18 +642,25 @@ class ImageRequestTest(HarnessTestCase):
                 self.assertEqual(kinds[-1], "file")
                 with self.assertRaisesRegex(api.APIError, "^image input"):
                     api_shapes.normalize_messages(
-                        messages, vision=False, deadline=FOREVER
+                        messages,
+                        vision=False,
+                        deadline=FOREVER,
+                        without_slot=nullcontext,
                     )
                 with self.assertRaisesRegex(api.APIError, "^PDF input"):
                     api_shapes.normalize_messages(
                         [{"role": "user", "content": messages[0]["content"][1:]}],
                         vision=False,
                         deadline=FOREVER,
+                        without_slot=nullcontext,
                     )
         # Normalization renders the document's PDF after its title and context.
         self.assertEqual(
             api_shapes.normalize_messages(
-                converted["anthropic"], vision=True, deadline=FOREVER
+                converted["anthropic"],
+                vision=True,
+                deadline=FOREVER,
+                without_slot=nullcontext,
             )[0]["content"][1:],
             [
                 {"type": "text", "text": "Report\n"},

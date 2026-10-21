@@ -5,8 +5,13 @@
 #include "engine/DiskLabels.hpp"
 #include "engine/Engine.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/PagedAttention.h"
+#include "model/ExpertStore.hpp"
+#include "model/ModelSizing.hpp"
+#include "model/RuntimeArenas.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/AneFfnMeasurement.hpp"
+#include "ops/KvSlotFormat.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -64,14 +69,15 @@ void requireStartupHeadroom(
   if (!available || *available <= reserveBytes ||
       pressure == MemoryPressure::Critical) {
     std::ostringstream message;
-    message << "not enough free memory to start: ";
+    message << "not enough free memory to start (";
     if (!available)
       message << "reclaimable host memory cannot be measured";
     else
       message << mebibytes(*available) << " MiB reclaimable, "
               << mebibytes(reserveBytes) << " MiB protected for macOS, system "
               << "pressure " << memoryPressureName(pressure);
-    message << "; close memory-heavy applications and retry";
+    message << "): close other applications for the best performance, or pass "
+               "--max-memory to limit Splash's memory";
     throw metal::MetalAllocationError(message.str(),
                                       metal::AllocationFailure::HostPressure);
   }
@@ -89,9 +95,9 @@ constexpr std::chrono::seconds kCacheLockWait{20};
 // A cache nobody opened or wrote for this long is removed at the next start,
 // whether or not that start keeps a cache itself.
 constexpr std::chrono::hours kStaleCache{24 * 14};
-// How long a start that follows an unclean end serves on probation: the
-// server counts a failure within that time toward a crash loop
-// (server/backend.py `CRASH_LOOP_WINDOW_SECONDS`).
+// How long a start serves on probation: the server counts a failure within
+// that time toward a crash loop (server/backend.py
+// `CRASH_LOOP_WINDOW_SECONDS`) and stops restarting after three in a row.
 constexpr std::chrono::seconds kProbation{60};
 
 // A cache root the engine made stays out of Time Machine backups, as
@@ -104,13 +110,14 @@ void excludeFromBackups(const std::filesystem::path &root) {
             error.localizedDescription.UTF8String, ").");
 }
 
-// A persistent tier's directory under root and its files, empty when another
-// process holds the directory or it cannot be used: the tier then keeps
-// temporary files, as without one. A root it makes is excluded from
-// backups.
+// A persistent tier's directory under root and its files, each with its
+// slots' size and options, empty when another process holds the directory or
+// it cannot be used: the tier then keeps temporary files, as without one. A
+// root it makes is excluded from backups.
 PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
                                          const std::string &cacheNamespace,
-                                         uint64_t kvSlotBytes, uint64_t stateSlotBytes,
+                                         uint64_t kvSlotBytes, const model::SlotFile::Options &kvOptions,
+                                         uint64_t stateSlotBytes, const model::SlotFile::Options &stateOptions,
                                          const std::shared_ptr<model::DiskBudget> &budget,
                                          const std::function<bool()> &cancelled) {
   try {
@@ -134,11 +141,13 @@ PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
     files.kv = std::make_shared<model::SlotFile>(
         kvSlotBytes, budget,
         model::SlotFile::Persistence{files.directory->kvSlots(), files.directory->kvRecords(),
-                                     tag, sizeof(KvBlockLabel)});
+                                     tag, sizeof(KvBlockLabel)},
+        kvOptions);
     files.states = std::make_shared<model::SlotFile>(
         stateSlotBytes, budget,
         model::SlotFile::Persistence{files.directory->stateSlots(),
-                                     files.directory->stateRecords(), tag, sizeof(StateLabel)});
+                                     files.directory->stateRecords(), tag, sizeof(StateLabel)},
+        stateOptions);
     return files;
   } catch (const std::exception &error) {
     logLine("Persistent cache disabled (", error.what(), "); this process keeps a temporary cache.");
@@ -149,9 +158,8 @@ PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
 // The disk tier's startup line: where its files are, its limit and why, its
 // write budget and what passes it when one is set, what it holds and stages
 // through, and how to turn it off.
-void reportDiskTier(const DiskSpace &space, const model::DiskBudget &budget, bool automatic,
-                    uint64_t writesPerDay, std::string_view files, uint64_t kvSlotBytes,
-                    uint64_t stateBytes) {
+void reportDiskTier(const DiskSpace &space, const model::DiskBudget &budget, uint64_t writesPerDay,
+                    std::string_view files, uint64_t kvSlotBytes, uint64_t stateBytes) {
   std::ostringstream line;
   line << "SSD cache: up to " << gibibytes(budget.limitBytes()) << " of " << files;
   if (space.othersBytes())
@@ -163,11 +171,11 @@ void reportDiskTier(const DiskSpace &space, const model::DiskBudget &budget, boo
   } else {
     const uint64_t floor = diskFloorBytes(volume->sizeBytes);
     if (budget.limitBytes() < budget.capacityBytes())
-      line << "a quarter of the "
+      line << (space.automatic() ? "a quarter of the " : "the ")
            << gibibytes(diskRoomBytes(volume->availableBytes, space.heldBytes(), floor))
            << " its volume has";
     else
-      line << (automatic ? "its automatic quota" : "its quota") << ", while its volume has room";
+      line << (space.automatic() ? "its automatic quota" : "its quota") << ", while its volume has room";
     line << " beyond the " << gibibytes(floor) << " it keeps free";
   }
   line << ")";
@@ -200,6 +208,244 @@ std::optional<ReleasableMemory::Split> idleSplit(ops::AneFfn *split) {
     return std::nullopt;
   return ReleasableMemory::Split{[split] { return split->release(); },
                                  [split] { split->restore(); }};
+}
+
+// The SSD cache tier as a start opens its files (openDiskTier): its budget,
+// its state and KV files, a persistent tier's directory, and its volume's
+// measure; none of them when it is off, and no KV file when that alone
+// could not be made.
+struct DiskTier final {
+  std::shared_ptr<model::DiskBudget> budget;
+  std::shared_ptr<model::SlotFile> states;
+  std::shared_ptr<model::SlotFile> kv;
+  PersistentCacheFiles persistent;
+  std::unique_ptr<DiskSpace> space;
+};
+
+// Opens the tier's files where the disk takes them, with `quotaBytes` (none
+// leaves it off), each with its slots' size and options: a persistent tier
+// keeps its files in a cache directory of its own; when another process
+// holds it or it cannot be used, the tier keeps temporary files, as without
+// one. The automatic tier opens files only on a volume where its limit would
+// hold two states and 1 GiB of KV: a persistent tier's root, whose caches
+// nobody holds count as the tier's, else the temporary files'. A relaunch
+// whose plan spills (`relaunchSpills`) opens temporary files whatever room
+// their volume has: the first engine's context it keeps may rest on the
+// tier's KV, and the room bounds each request's commitment instead
+// (Engine::admitSpill). Every start removes the root's stale caches.
+DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &cacheNamespace,
+                      uint64_t quotaBytes, uint64_t kvSlotBytes, const model::SlotFile::Options &kvOptions,
+                      uint64_t stateBytes, const model::SlotFile::Options &stateOptions, bool relaunchSpills) {
+  DiskTier tier;
+  // The cache root's caches nobody holds, this start's own included, looked
+  // at once: they are room an automatic persistent tier may take, the stale
+  // ones go once this start holds its own, and the rest share the root's
+  // limit with a persistent tier (DiskSpace).
+  const std::vector<CacheDirectory::Idle> rootCaches =
+      config.cacheRoot.empty() ? std::vector<CacheDirectory::Idle>{} : CacheDirectory::idle(config.cacheRoot);
+  const uint64_t stateSlotBytes = model::SlotFile::slotBytesFor(stateBytes);
+  if (quotaBytes) {
+    // A write budget, when one is set, refills on the awake clock the
+    // engine schedules its wake-ups on (awakeMilliseconds), so a write it
+    // holds back is taken up again when the budget admits it. Without one
+    // every write passes.
+    tier.budget = std::make_shared<model::DiskBudget>(quotaBytes);
+    if (config.cacheDiskWritesPerDay)
+      tier.budget->setWriteBudget(config.cacheDiskWritesPerDay);
+    std::optional<std::string> rootRefusal, temporaryRefusal;
+    if (config.cacheDisk.automatic) {
+      const uint64_t minimumBytes = 2 * stateSlotBytes + (uint64_t{1} << 30);
+      std::error_code ignored;
+      temporaryRefusal = automaticDiskRefusal(
+          config.diskVolume(std::filesystem::temp_directory_path(ignored)), 0, relaunchSpills ? 0 : minimumBytes);
+      if (config.persistentCache && !config.cacheRoot.empty()) {
+        uint64_t heldBytes = 0;
+        for (const CacheDirectory::Idle &cache : rootCaches)
+          heldBytes += cache.bytes;
+        rootRefusal = automaticDiskRefusal(config.diskVolume(config.cacheRoot), heldBytes, minimumBytes);
+      }
+    }
+    if (config.persistentCache && !rootRefusal) {
+      tier.persistent = openPersistentCache(config.cacheRoot, cacheNamespace, kvSlotBytes, kvOptions,
+                                            stateSlotBytes, stateOptions, tier.budget, config.cancelled);
+      tier.states = tier.persistent.states;
+    }
+    std::optional<std::string> off;
+    if (!tier.states && temporaryRefusal) {
+      if (rootRefusal)
+        off = "for its root, " + *rootRefusal + "; for temporary files, " + *temporaryRefusal;
+      else
+        off = config.persistentCache ? "for temporary files, " + *temporaryRefusal : *temporaryRefusal;
+    } else if (!tier.states) {
+      if (rootRefusal)
+        logLine("Persistent cache off: ", *rootRefusal, "; the SSD cache keeps temporary files.");
+      try {
+        tier.states = std::make_shared<model::SlotFile>(stateSlotBytes, tier.budget, stateOptions);
+      } catch (const std::exception &error) {
+        off = error.what();
+      }
+    }
+    if (off) {
+      logLine("SSD cache off: ", *off, "; the state staging the plan set aside stays unused.");
+      tier.budget.reset();
+    }
+  }
+  // After the open, which holds this start's own cache: a held one stays.
+  // The stale ones go, and the others share the root's limit with the
+  // tier.
+  std::vector<CacheDirectory::Idle> otherCaches = CacheDirectory::removeStale(rootCaches, kStaleCache);
+  std::erase_if(otherCaches,
+                [&](const CacheDirectory::Idle &cache) { return cache.path.filename() == cacheNamespace; });
+  if (!tier.budget)
+    return tier;
+  tier.kv = tier.persistent.kv;
+  try {
+    if (!tier.kv)
+      tier.kv = std::make_shared<model::SlotFile>(kvSlotBytes, tier.budget, kvOptions);
+  } catch (const std::exception &error) {
+    // The persistent files are open by now; without the tier nothing would
+    // keep or replace their copies.
+    if (tier.persistent.directory)
+      throw;
+    logLine("SSD cache KV storage disabled; state storage remains enabled (", error.what(), ").");
+  }
+  // The volume sizes the tier before it takes anything back. A persistent
+  // tier's root holds the other caches nobody holds too.
+  std::vector<std::shared_ptr<model::SlotFile>> files{tier.states};
+  if (tier.kv)
+    files.push_back(tier.kv);
+  tier.space = std::make_unique<DiskSpace>(
+      tier.budget, config.cacheDisk.automatic, std::move(files),
+      tier.persistent.directory ? std::move(otherCaches) : std::vector<CacheDirectory::Idle>{});
+  reportDiskTier(*tier.space, *tier.budget, config.cacheDiskWritesPerDay,
+                 tier.persistent.directory
+                     ? "persistent files in " + tier.persistent.directory->path().string()
+                     : "temporary files in " + std::filesystem::temp_directory_path().string(),
+                 tier.kv ? kvSlotBytes : 0, stateBytes);
+  return tier;
+}
+
+// A setting the planner refuses, or a plan the budget cannot hold, refused
+// with what its floors take of those the model has: the stores of parts
+// that stream, and the floors of a block-sparse target's KV on the SSD
+// cache.
+RuntimeResourcesError planRefusal(const StreamedMemoryResult &result, uint64_t hardBudgetBytes,
+                                  const model::StreamableWeights &streamable, const model::ModelDescriptor &model) {
+  if (!result.requiredBytes)
+    return RuntimeResourcesError(RuntimeResourceStage::Configuration, result.error);
+  std::string floors = "model weights with the runtime reserves, one lane's state, the KV runway";
+  if (streamable.expertBytes || streamable.tableBytes)
+    floors += ", the streamed stores at their floors";
+  if (model.capabilities.sparseKv)
+    floors += ", the floors of KV on the SSD cache";
+  return RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
+                               floors + " and any SSD cache state staging require " +
+                                   std::to_string(result.requiredBytes) + " bytes but the Metal memory budget is " +
+                                   std::to_string(hardBudgetBytes) + " bytes",
+                               {}, RuntimeResourceFailure::EngineCapacity);
+}
+
+// An explicit size of `option` that changes nothing: the model has no `what`
+// to stream, or the size holds all of it, which then loads.
+void reportIgnoredSetting(std::string_view option, const StreamedSetting &setting, uint64_t allBytes,
+                          std::string_view modelName, std::string_view what, std::string_view loads) {
+  if (setting.mode != StreamedSetting::Mode::Size)
+    return;
+  if (!allBytes)
+    logLine(option, " ignored: ", modelName, " has no ", what, " to stream");
+  else if (setting.bytes >= allBytes)
+    logLine(option, " ignored: its ", setting.bytes / kMiB, " MiB hold all of the ", what, " (",
+            allBytes / kMiB, " MiB), which ", loads);
+}
+
+// What `plan` streams that `other` loads whole, the routed experts before
+// the PLE table, and that it does; empty for neither.
+std::string_view streamedOnlyIn(const StreamedMemoryPlan &plan, const StreamedMemoryPlan &other) {
+  if (plan.expertBytes && !other.expertBytes)
+    return "routed experts, which load whole without it";
+  if (plan.tableBytes && !other.tableBytes)
+    return "PLE table, which loads whole without it";
+  return {};
+}
+
+// What streams of the loaded model, and how an automatic part's store was
+// sized.
+void reportStreamedStores(const model::LoadedModel &loaded, const model::StreamableWeights &streamable,
+                          const StreamedSetting &experts, const StreamedSetting &table) {
+  const auto automatic = [](const StreamedSetting &setting, std::string_view option) {
+    return setting.mode == StreamedSetting::Mode::Auto
+               ? std::string(", all that ") + std::string(option) +
+                     " auto leaves it beside the floors and the KV kept resident"
+               : std::string();
+  };
+  if (const model::SparseRowStore *store = loaded.streamedTable()) {
+    const model::SparseRowStats stats = store->stats();
+    logLine("Table ", stats.table, " streams from its file: ", stats.tableBytes / kMiB,
+            " MiB stay on the SSD; row cache of ", stats.cacheCapacityRows, " rows in ",
+            store->committedBytes() / kMiB, " MiB", automatic(table, "--ple-memory"), "; ", model::kSsdReaders,
+            " readers.");
+  } else if (streamable.tableBytes && table.mode == StreamedSetting::Mode::Auto) {
+    logLine("The PLE table loads with the weights: memory holds its ", streamable.tableBytes / kMiB,
+            " MiB (--ple-memory auto).");
+  }
+  if (const model::ExpertStore *store = loaded.expertStore()) {
+    const model::ExpertStoreStats stats = store->stats();
+    logLine("Routed experts stream from their files: ", stats.slots, " slots for ", stats.experts, " experts (",
+            stats.slots * 100 / std::max<uint64_t>(stats.experts, 1), "%) in ", stats.arenaBytes / kMiB, " MiB",
+            automatic(experts, "--expert-memory"), ".");
+  } else if (streamable.expertBytes && experts.mode == StreamedSetting::Mode::Auto) {
+    logLine("Routed experts load with their layers: memory holds their ", streamable.expertBytes / kMiB,
+            " MiB (--expert-memory auto).");
+  }
+}
+
+// The rows the target's decode cycles verify (--verify-rows), and why.
+void reportVerifyRows(const model::LoadedModel &loaded, model::VerifyRows rows) {
+  if (model::budgetsVerifyRows(loaded, rows))
+    logLine("Decode cycles verify the rows the verify budget chooses (--verify-rows auto, as ", loaded.name(),
+            " is a MoE target): greedy and seeded outputs can differ from run to run.");
+  else if (rows == model::VerifyRows::All)
+    logLine("Decode cycles verify every row of the draft's block (--verify-rows all).");
+  else
+    logLine("Decode cycles verify every row of the draft's block (--verify-rows auto, as ", loaded.name(),
+            " is dense).");
+}
+
+// Why a target's long requests keep their KV in memory, empty when they
+// spill.
+std::string spillOffReason(const model::ModelDescriptor &model, const kv::Layout &layout,
+                           const KvSpillPlan &spill, bool tierWritable) {
+  if (spill.enabled)
+    return {};
+  if (!model.capabilities.sparseKv)
+    return "its attention is dense";
+  if (model.capabilities.sparseKv->localTokens)
+    return "its rows read a local window, which the SSD cache does not keep in memory";
+  if (!layout.spillable())
+    return "its KV layout cannot keep a page's index alone";
+  if (!tierWritable)
+    return "the SSD cache is off";
+  return "the floors of KV on the SSD cache do not fit beside the model";
+}
+
+// A block-sparse target's startup line: where long requests' KV lives, the
+// context and what bounds it, and the readers' memory.
+void reportSpill(const model::ModelDescriptor &model, const EngineMemoryBreakdown &budget,
+                 std::string_view offReason, uint64_t activeLimitBytes) {
+  if (!model.capabilities.sparseKv)
+    return;
+  const ContextBounds &bounds = budget.contextBounds;
+  const KvSpillPlan &spill = budget.kvSpill;
+  if (!spill.enabled) {
+    logLine("Long requests keep their KV in memory, ", offReason, ": ", bounds.maximum(), " tokens of context.");
+    return;
+  }
+  logLine("Long requests keep their KV on the SSD cache: ", bounds.maximum(), " tokens of context (bound: ",
+          bounds.bound(), "; window ", bounds.window, ", resident ", bounds.resident, ", spilled ", bounds.spilled,
+          ", disk ", bounds.disk, "); a request whose KV fits ", budget.residentKvBytes / kMiB,
+          " MiB stays in memory; hot block cache ", spill.hotTargetBytes / kMiB, " MiB (floor ",
+          spill.hotFloorBytes / kMiB, " MiB); history staging in ", spill.stagingBuffers,
+          " buffers; SSD room for active KV ", gibibytes(activeLimitBytes), ".");
 }
 
 std::array<uint8_t, 32> parseSha256(std::string_view value) {
@@ -250,7 +496,8 @@ RuntimeCacheIdentity
 makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
                          std::string_view targetManifestSha256,
                          std::string_view buildId,
-                         kv::Layout targetKvLayout) {
+                         kv::Layout targetKvLayout,
+                         model::RopeScaling ropeScaling) {
   if (buildId.empty()) {
     throw std::invalid_argument("runtime build id is required");
   }
@@ -263,6 +510,7 @@ makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
   result.modelLayoutSha256 = model::digestHex(parseSha256(combinedManifestSha256));
   result.buildId = buildId;
   result.kvLayout = targetKvLayout;
+  result.ropeScaling = ropeScaling;
   result.targetModelSha256 = model::digestHex(parseSha256(targetManifestSha256));
   return result;
 }
@@ -276,16 +524,37 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
   canonical << "splash-persistent-cache-v" << kPersistentCacheFormat << '\n'
             << identity.modelLayoutSha256 << '\n'
             << "kv " << kv::kPageTokens << ' ' << kv.attentionLayers << ' ' << kv.kvHeads << ' '
-            << kv.headDimension << ' ' << kv::formatName(kv.format) << '\n'
+            << kv.headDimension << ' ' << kv::formatName(kv.format)
+            // Dimension-major values add nothing, so dense layouts keep the
+            // caches they wrote.
+            << (kv.valuesTokenMajor ? " values-token-major" : "");
+  // A block index's pooled keys (kv::Layout::indexDimension), bf16, one a
+  // block of SPLASH_ATTENTION_BLOCK_TOKENS tokens. A change to how a block's
+  // key is pooled, normalized or rotated changes this line.
+  if (kv.indexDimension)
+    canonical << " index " << kv.indexDimension << " bf16 block " << SPLASH_ATTENTION_BLOCK_TOKENS;
+  // How a slot holds a page; nothing for the spans' order, so the caches
+  // written before slots had another order stay valid.
+  canonical << KvPageTier::slotFormatToken(kv) << '\n'
             << "gdn " << gdn.layers << ' ' << gdn.convolutionHistory << ' '
             << gdn.convolutionChannels << ' ' << gdn.recurrentGroups << ' ' << gdn.recurrentRows
             << ' ' << gdn.recurrentColumns
             // fp32 states keep the line they had before states had a format,
             // so the caches they wrote stay valid.
-            << (gdn.format == ops::GdnStateFormat::BFloat16 ? " bf16" : "") << '\n'
+            << (gdn.format == ops::GdnStateFormat::BFloat16 ? " bf16" : "");
+  // A family's state after the GDN layers' (Qwen3.8-Flash-Next's PLE history
+  // and QSA pending keys, model::QwenHybridLayout::gdnStateLayout).
+  if (gdn.auxiliaryBytes) canonical << " auxiliary " << gdn.auxiliaryBytes;
+  canonical << '\n'
             << "draft " << draft.layers << ' ' << draft.kvHeads << ' ' << draft.headDimension << ' '
             << SPLASH_DRAFT_SLIDING_WINDOW << '\n'
             << "context " << draft.contextWidth << " q4 " << SPLASH_DRAFT_CONTEXT_GROUP << '\n';
+  // Without YaRN the line is left out, so the caches written before it
+  // existed stay valid. The factor takes the digits that read back as the
+  // same double, so no two factors share a namespace.
+  if (const model::RopeScaling &rope = identity.ropeScaling; rope.yarn())
+    canonical << "rope yarn " << std::setprecision(std::numeric_limits<double>::max_digits10) << rope.factor
+              << ' ' << rope.originalContextTokens << '\n';
   // 128 bits name it.
   return model::weightDigest(canonical.str()).substr(0, CacheDirectory::kNamespaceDigits);
 }
@@ -299,17 +568,20 @@ RuntimeResourcesError::RuntimeResourcesError(RuntimeResourceStage stage,
 
 RuntimeResources::RuntimeResources(
     PersistentCacheFiles persistentCache,
-    std::unique_ptr<metal::MetalBackend> backend, model::LoadedModel model,
-    ops::ExecutionPlans operators, EngineMemoryPlan memoryPlan,
+    std::unique_ptr<metal::MetalBackend> backend, std::shared_ptr<model::SsdReaders> readers,
+    model::LoadedModel model, ops::ExecutionPlans operators, EngineMemoryPlan memoryPlan,
     RuntimeCacheIdentity cacheIdentity,
     std::unique_ptr<MemoryGovernor> memoryGovernor,
     std::unique_ptr<kv::PageStorage> kvPages,
     std::unique_ptr<model::QwenStateStorage> stateStorage,
     std::unique_ptr<KvPageTier> kvTier, std::unique_ptr<DiskSpace> diskSpace,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
-    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome)
+    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
+    std::unique_ptr<model::KvBlockCache> blockCache,
+    std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
+    model::VerifyRows verifyRows)
     : persistentCache_(std::move(persistentCache)),
-      backend_(std::move(backend)), model_(std::move(model)),
+      backend_(std::move(backend)), readers_(std::move(readers)), model_(std::move(model)),
       operators_(std::move(operators)),
       memoryPlan_(std::move(memoryPlan)),
       cacheIdentity_(std::move(cacheIdentity)),
@@ -317,8 +589,9 @@ RuntimeResources::RuntimeResources(
       stateStorage_(std::move(stateStorage)), kvTier_(std::move(kvTier)),
       diskSpace_(std::move(diskSpace)), kvPool_(std::move(kvPool)),
       cache_(std::move(cache)), aneFfn_(std::move(aneFfn)),
-      releasableMemory_(*model_.images, idleSplit(aneFfn_.get())),
-      aneFfnOutcome_(std::move(aneFfnOutcome)) {}
+      blockCache_(std::move(blockCache)), historyStream_(std::move(historyStream)),
+      releasableMemory_({model_.images.get(), model_.expertStore()}, idleSplit(aneFfn_.get())),
+      aneFfnOutcome_(std::move(aneFfnOutcome)), spillAlways_(spillAlways), verifyRows_(verifyRows) {}
 
 std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config,
@@ -332,8 +605,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     throw RuntimeResourcesError(
         RuntimeResourceStage::Configuration,
         "metallib path, model root, a valid model layout, KV and state format, "
-        "host memory and volume probes, build id, and a merge-aligned image patch "
-        "limit no larger than the protocol's are required");
+        "host memory and volume probes, build id and a merge-aligned image "
+        "patch limit no larger than the protocol's are required");
   }
   std::unique_ptr<metal::MetalBackend> backend;
   try {
@@ -376,14 +649,17 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // One disk quota serves KV pages and states. Without room for a state,
   // disk KV cannot preserve a restorable prefix, so the tier stays off, and
   // no state's write needs the staging buffer the plan would set aside. The
-  // plan never depends on the disk, so that every start of a model serves
-  // the same context: an explicit quota that holds a state sets the staging
-  // aside, and the automatic one where the plan holds the model and the
+  // plan of a target whose KV cannot spill never depends on the disk, so
+  // that every start of the model serves the same context: an explicit quota
+  // that holds a state sets the staging aside, and the automatic one where
+  // the plan holds the model, its parts as they load without it and the
   // requested context beside it and the Neural Engine split does not need
   // its memory (below). The disk decides only whether the tier's files open,
-  // once the plan is made: where they do not, the tier is off and the staging
-  // stays unused. The volume sizes the tier once its files are open
-  // (DiskSpace).
+  // once the weights have loaded: where they do not, the tier is off and the
+  // staging stays unused. The volume sizes the tier once its files are open
+  // (DiskSpace); a target whose KV spills plans its stores and context
+  // (ContextBounds::disk) with the room it leaves active KV, before the
+  // weights load and again once the files open.
   model::CompositeStateLayout stateLayout = config.model.stateLayout;
   stateLayout.target.format = config.stateFormat;
   const uint64_t stateBytes = stateLayout.cachedBytes();
@@ -398,45 +674,149 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   else if (cacheDiskBytes)
     logLine("SSD cache off: its quota holds no state of ", mebibytes(stateBytes),
             " MiB; no state staging is set aside.");
-  // The automatic tier turns off before anything is planned with it.
+  // The automatic tier turns off before the engine's plan is made with it.
   const auto diskOff = [&](std::string_view reason) {
     logLine("SSD cache off: ", reason, "; no state staging is set aside.");
     stateStagingBytes = 0;
   };
+  // The one pool of SSD readers, which the model's streamed weights and the
+  // reads of the KV the tier holds share. It goes after the model and the
+  // tier, which read on it.
+  auto readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
+
+  // One plan (planStreamedMemory) sizes the parts of the weights that may
+  // stream from the SSD, a MoE target's routed experts and a GGUF's PLE
+  // table: a part set to a size or off loads as set, and the plan sizes an
+  // automatic one. It rests on the weights' sizes, which their files give
+  // before they load; on the arenas, which only a loaded model gives, as they
+  // rest on its weights' formats, but which one load gives for whatever
+  // streams of it (model::StreamedParts); and on the SSD cache's room for
+  // active KV and whether its KV file opened.
+  kv::Layout kvLayout = config.model.targetKvLayout;
+  kvLayout.format = config.kvFormat;
+  // How the KV tier lays a page out in its slot, and so the slots' size.
+  const kv::SlotFormat kvFormat(kvLayout);
+  const uint64_t kvSlotBytes = model::SlotFile::slotBytesFor(kvFormat.payloadBytes());
+  const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
+      device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
+  model::StreamableWeights streamable;
+  // The arenas of the loaded model by what streams of it, and those of a
+  // runtime whose K/V spills, which only a block-sparse target with a
+  // spillable layout may have; none before it loads.
+  const bool kvMaySpill = config.model.capabilities.sparseKv && kvLayout.spillable();
+  std::array<std::array<uint64_t, 2>, 2> arenaBytes{};
+  std::array<uint64_t, 2> spillArenaBytes{};
+  // The room for active KV, which only a target whose KV may spill plans
+  // with: until the tier's files open, what the volume they will take
+  // leaves now, a persistent tier's root, whose caches nobody holds count as
+  // the tier's, else the temporary files'; the room the open measures then
+  // bounds it, so that the floors the stores were sized beside only shrink.
+  uint64_t activeLimitBytes = cacheDiskBytes;
+  if (kvMaySpill) {
+    std::error_code ignored;
+    const bool root = config.persistentCache && !config.cacheRoot.empty();
+    uint64_t heldBytes = 0;
+    if (root)
+      for (const CacheDirectory::Idle &cache : CacheDirectory::idle(config.cacheRoot))
+        heldBytes += cache.bytes;
+    activeLimitBytes = volumeActiveLimitBytes(
+        cacheDiskBytes,
+        config.diskVolume(root ? config.cacheRoot : std::filesystem::temp_directory_path(ignored)), heldBytes);
+  }
+  bool kvFileOpen = true;
+  // The context a relaunch keeps, which only an automatic context does.
+  const uint32_t relaunchContext = requestedContextTokens ? 0 : config.relaunchContext;
+  // The plan with the parts set as `experts` and `table`, `stagingBytes` set
+  // aside for the disk tier's state staging and `aneFfnBytes` for the
+  // prefill FFN's Neural Engine split.
+  const auto streamedPlan = [&](const StreamedSetting &experts, const StreamedSetting &table,
+                                uint64_t stagingBytes, uint64_t aneFfnBytes) {
+    return planStreamedMemory(
+        {.hardBudgetBytes = hardBudgetBytes,
+         .fixedBytes = streamable.loadedBytes + model::kPipelineReserveBytes + model::kRuntimeOverheadReserveBytes +
+                       stagingBytes + aneFfnBytes,
+         .arenaBytes = arenaBytes,
+         .spillArenaBytes = spillArenaBytes,
+         .laneStateBytes = stateLayout.laneBytes(),
+         .kvLayout = kvLayout,
+         .windowTokens = config.model.capabilities.maximumContextTokens,
+         .requestedContextTokens = requestedContextTokens,
+         .relaunchContextTokens = relaunchContext,
+         .experts = {streamable.expertBytes, streamable.expertFloorBytes, experts},
+         .table = {streamable.tableBytes, streamable.tableFloorBytes, table},
+         .hotCacheBytes = config.sparseKvMemory,
+         .sparseKv = config.model.capabilities.sparseKv,
+         .tierWritable = stagingBytes && kvFileOpen,
+         .kvSlotBytes = kvSlotBytes,
+         .stateSlotBytes = model::SlotFile::slotBytesFor(stateBytes),
+         .activeLimitBytes = activeLimitBytes,
+         .groupPages = model::kPrefillGroupChunks * model::ExecutionLimits::prefillTokenBudget / kv::kPageTokens});
+  };
+  // The plan of the parts as configured, which sizes their stores.
+  const auto sizingPlan = [&](uint64_t stagingBytes) {
+    return streamedPlan(config.expertMemory, config.pleMemory, stagingBytes, 0);
+  };
+  // The sizing plan with the staging the tier keeps. The automatic tier gives
+  // it up where the plan cannot hold the model beside it, and, once the
+  // model `loaded` gave the arenas, unless the plan spills, which the tier
+  // makes possible, where the staging would stream a part that loads whole
+  // without it: a tier that only caches costs the weights nothing, as it
+  // costs the context nothing (below).
+  const auto storesPlan = [&](bool loaded) {
+    StreamedMemoryResult planned = sizingPlan(stateStagingBytes);
+    if (!stateStagingBytes || !automaticDisk || (planned.plan && planned.plan->spill.enabled))
+      return planned;
+    StreamedMemoryResult without = sizingPlan(0);
+    if (!without.plan)
+      return planned;
+    std::string reason;
+    if (!planned.plan && planned.requiredBytes)
+      reason = "the memory budget has no room for its " + std::to_string(mebibytes(stateBytes)) +
+               " MiB of state staging beside the model";
+    else if (planned.plan && loaded)
+      if (const std::string_view part = streamedOnlyIn(*planned.plan, *without.plan); !part.empty())
+        reason = "its " + std::to_string(mebibytes(stateBytes)) + " MiB of state staging would stream the " +
+                 std::string(part);
+    if (reason.empty())
+      return planned;
+    diskOff(reason);
+    return without;
+  };
+  // The stores the plan gives the parts, except that automatic experts the
+  // plan streams load at their floor while `floors`: until the loaded model
+  // gives the arenas, which take from all that the experts stream through.
+  const auto storesOf = [&](const StreamedMemoryPlan &plan, bool floors) {
+    const bool experts = floors && plan.expertBytes && config.expertMemory.mode == StreamedSetting::Mode::Auto;
+    return model::ModelLoadOptions{.streamedTableBytes = plan.tableBytes,
+                                   .expertMemoryBytes = experts ? streamable.expertFloorBytes : plan.expertBytes,
+                                   .readers = readers};
+  };
+  model::ModelLoadOptions loadOptions;
   try {
-    const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
-        device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
-    // Reject a model that cannot fit before loading its weights. Beside
-    // them the plan needs at least the runtime reserves, one lane's state,
-    // the KV runway and any disk tier state staging; the full plan below adds
-    // the arenas.
-    kv::Layout kvLayout = config.model.targetKvLayout;
-    kvLayout.format = config.kvFormat;
-    const uint64_t weightBytes = model::modelWeightBytes(config.modelRoot, config.model);
-    const auto requiredFor = [&](uint64_t stagingBytes) {
-      uint64_t fixedBytes = 0;
-      for (const uint64_t bytes : {weightBytes, model::kPipelineReserveBytes,
-                                   model::kRuntimeOverheadReserveBytes, stagingBytes}) {
-        if (!checkedAdd(fixedBytes, bytes, fixedBytes))
-          fixedBytes = std::numeric_limits<uint64_t>::max();
-      }
-      return minimumRequiredBytes(fixedBytes, stateLayout.laneBytes(), kvLayout)
-          .value_or(std::numeric_limits<uint64_t>::max());
-    };
-    if (stateStagingBytes && automaticDisk && requiredFor(stateStagingBytes) > hardBudgetBytes)
-      diskOff("the memory budget has no room for its " + std::to_string(mebibytes(stateBytes)) +
-              " MiB of state staging beside the model");
-    const uint64_t requiredBytes = requiredFor(stateStagingBytes);
-    if (requiredBytes > hardBudgetBytes) {
-      throw RuntimeResourcesError(
-          RuntimeResourceStage::MemoryPlanning,
-          "model weights with the runtime reserves, one lane's state, the KV "
-          "runway and any SSD cache state staging require " +
-              std::to_string(requiredBytes) +
-              " bytes but the Metal memory budget is " +
-              std::to_string(hardBudgetBytes) + " bytes",
-          {}, RuntimeResourceFailure::EngineCapacity);
+    // A table set off is among the images that load: its streaming is never
+    // planned.
+    streamable = model::streamableWeights(
+        config.modelRoot, config.model,
+        {.streamExperts = true, .streamTable = config.pleMemory.mode != StreamedSetting::Mode::Off});
+    if (!streamable.tableRefusal.empty()) {
+      if (config.pleMemory.mode == StreamedSetting::Mode::Size)
+        throw RuntimeResourcesError(RuntimeResourceStage::Configuration,
+                                    "--ple-memory cannot stream the PLE table: " + streamable.tableRefusal);
+      logLine("The PLE table loads with the weights: ", streamable.tableRefusal, " (--ple-memory auto).");
     }
+    reportIgnoredSetting("--ple-memory", config.pleMemory, streamable.tableBytes, config.model.name, "PLE table",
+                         "loads with the weights");
+    reportIgnoredSetting("--expert-memory", config.expertMemory, streamable.expertBytes, config.model.name,
+                         "routed experts", "load with their layers");
+    // Refuse a model that cannot fit before loading its weights: beside them
+    // the plan needs at least the runtime reserves, one lane's state, the
+    // KV runway, the streamed stores at their floors, the floors of KV on the
+    // SSD cache and any SSD cache state staging; the plan after the load
+    // adds the arenas.
+    const StreamedMemoryResult planned = storesPlan(false);
+    if (!planned.plan)
+      throw planRefusal(planned, hardBudgetBytes, streamable, config.model);
+    loadOptions = storesOf(*planned.plan, true);
     // Fail before loading the model when the machine has no headroom at
     // all; the guard installed above keeps checking as residency grows.
     admitMetalOperation();
@@ -451,66 +831,139 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                 error.what());
   }
 
-  model::LoadedModel loaded;
-  try {
-    const auto started = AwakeClock::now();
-    loaded = model::loadModel(*backend, config.modelRoot, config.model);
-    requireLoadedModel(loaded);
-    const std::chrono::duration<double> loading = AwakeClock::now() - started;
-    logLine("Weights loaded in ", std::fixed, std::setprecision(2),
-            loading.count(), " s.");
-  } catch (const metal::MetalAllocationError &error) {
-    throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
-                                error.what(), {},
-                                resourceAllocationFailure(error.failure()));
-  } catch (const std::exception &error) {
-    throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
-                                error.what());
-  }
-
   // One plan owner is used both before allocation and during encoding. The
   // engine lends it to model execution without inspecting its plans.
   ops::ExecutionPlans operators(device);
-  model::ModelMemoryPlan modelMemoryPlan;
-  try {
-    modelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat,
-                                                  config.stateFormat);
-  } catch (const std::exception &error) {
-    throw RuntimeResourcesError(
-        RuntimeResourceStage::MemoryPlanning,
-        std::string("model allocated-size plan is invalid: ") + error.what());
-  }
+  model::LoadedModel loaded;
+  // The runtime's lane state and arenas as the model loaded, with its K/V in
+  // memory and where it spills.
+  model::ModelMemoryPlan modelMemoryPlan, spillModelMemoryPlan;
+  // Loads the model as loadOptions says, `again` once it loaded, and plans
+  // its arenas: as it loaded, and for whatever streams of it.
+  const auto load = [&](bool again) {
+    try {
+      const auto started = AwakeClock::now();
+      // The images of the last load go before the next allocates its own,
+      // and the backend's peaks start again: the memory audit holds the load
+      // that serves to its plan, not one the plan with the arenas replaced,
+      // which may have held a PLE table whole that now streams through a
+      // row cache the audit's budget for Metal leaves out.
+      loaded = {};
+      backend->restartPeaks();
+      loaded = model::loadModel(*backend, config.modelRoot, config.model, loadOptions);
+      requireLoadedModel(loaded);
+      const std::chrono::duration<double> loading = AwakeClock::now() - started;
+      logLine("Weights loaded ", again ? "again " : "", "in ", std::fixed, std::setprecision(2), loading.count(),
+              " s.");
+    } catch (const metal::MetalAllocationError &error) {
+      throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
+                                  error.what(), {},
+                                  resourceAllocationFailure(error.failure()));
+    } catch (const std::exception &error) {
+      throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
+                                  error.what());
+    }
+    try {
+      modelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
+                                                    model::StreamedParts::loaded(loaded));
+      if (kvMaySpill)
+        spillModelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
+                                                           model::StreamedParts::loaded(loaded, true));
+      const auto arenas = [&](model::StreamedParts parts) {
+        const model::ModelMemoryPlan streamed =
+            model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat, parts);
+        return streamed.sharedPrefillPlannedAllocatedBytes + streamed.sharedDecodePlannedAllocatedBytes;
+      };
+      for (const bool table : {false, true}) {
+        const uint64_t tableRowBytes = table ? streamable.tableRowBytes : 0;
+        for (const bool experts : {false, true})
+          arenaBytes[experts][table] =
+              arenas({.experts = experts && streamable.expertBytes, .tableRowBytes = tableRowBytes});
+        if (kvMaySpill)
+          spillArenaBytes[table] = arenas({.tableRowBytes = tableRowBytes, .kv = true});
+      }
+    } catch (const std::exception &error) {
+      throw RuntimeResourcesError(
+          RuntimeResourceStage::MemoryPlanning,
+          std::string("model allocated-size plan is invalid: ") + error.what());
+    }
+  };
+  load(false);
+
   // The engine's memory plan, with `stagingBytes` set aside for the disk
   // tier's state staging and `aneFfnBytes` for the prefill FFN's Neural Engine
-  // split.
-  const auto planWith = [&](uint64_t stagingBytes, uint64_t aneFfnBytes) {
+  // split, each part as it loaded, whole or through its store, and the spill
+  // plan beside them, with the arenas of a runtime whose K/V spills where it
+  // spills. Floors that the spill plan refuses refuse it with the engine
+  // plan's breakdown.
+  const auto planWith = [&](uint64_t stagingBytes, uint64_t aneFfnBytes) -> EngineMemoryPlanResult {
+    const auto asLoaded = [](uint64_t storeBytes) {
+      return storeBytes ? StreamedSetting{StreamedSetting::Mode::Size, storeBytes}
+                        : StreamedSetting{StreamedSetting::Mode::Off, 0};
+    };
+    const StreamedMemoryResult streamed = streamedPlan(
+        asLoaded(loadOptions.expertMemoryBytes), asLoaded(loadOptions.streamedTableBytes), stagingBytes, aneFfnBytes);
     ModelMemoryFootprint footprint{
         loaded.targetActualAllocatedBytes(),
         loaded.draft.actualAllocatedBytes,
         loaded.vision.actualAllocatedBytes,
-        modelMemoryPlan,
+        streamed.plan && streamed.plan->spill.enabled ? spillModelMemoryPlan : modelMemoryPlan,
         stagingBytes,
         aneFfnBytes,
+        loaded.streamedTable() ? loaded.streamedTable()->committedBytes() : 0,
     };
     ModelMemoryProfile modelProfile{
-        loaded.name(), loaded.maximumContextTokens(),
-        loaded.targetKvLayout(config.kvFormat), footprint, config.stateFormat};
-    return evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
+        loaded.name(), loaded.maximumContextTokens(), loaded.targetKvLayout(config.kvFormat), footprint,
+        config.stateFormat, streamed.plan ? streamed.plan->spill : KvSpillPlan{}};
+    EngineMemoryPlanResult result = evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
+    if (streamed.plan || !result.plan)
+      return result;
+    BudgetValidationStatus &status = result.status;
+    status.valid = false;
+    status.code = BudgetErrorCode::KvPoolDoesNotFit;
+    status.message = streamed.error;
+    if (streamed.requiredBytes) {
+      status.breakdown.minimumRequiredBytes = streamed.requiredBytes;
+      status.breakdown.deficitBytes = streamed.requiredBytes - status.breakdown.hardBudgetBytes;
+    }
+    return {std::nullopt, std::move(status)};
   };
   // The plan with the staging the tier keeps.
   const auto planMemory = [&](uint64_t aneFfnBytes) { return planWith(stateStagingBytes, aneFfnBytes); };
+
+  // The plan with the loaded model's arenas sizes the stores, and the start
+  // loads again where it gives a part another store: it loads once where the
+  // plan without the arenas already loads each part so, as for a model with
+  // no part to stream, and twice otherwise, as where the routed experts
+  // stream. Floors that the arenas take beyond the budget stop the start
+  // with the engine plan's breakdown (requirePlan, below).
+  const StreamedMemoryResult planned = storesPlan(true);
+  if (!planned.plan && !planned.requiredBytes)
+    throw planRefusal(planned, hardBudgetBytes, streamable, config.model);
+  if (planned.plan) {
+    const model::ModelLoadOptions next = storesOf(*planned.plan, false);
+    if (next.expertMemoryBytes != loadOptions.expertMemoryBytes ||
+        next.streamedTableBytes != loadOptions.streamedTableBytes) {
+      loadOptions = next;
+      load(true);
+    }
+  }
+  reportStreamedStores(loaded, streamable, config.expertMemory, config.pleMemory);
+  reportVerifyRows(loaded, config.verifyRows);
   // The model's side of the split (startAneFfn).
   const AneFfnModel splitModel =
       aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled);
-  EngineMemoryPlanResult planResult = planMemory(0);
+
   // The automatic tier keeps its staging only where the plan holds the model
-  // and the requested context beside it. The split wins over it: where the
-  // plan refuses the split beside the staging but not without it, the tier
-  // turns off before the split is decided. A relaunch decides it as its first
-  // engine, an automatic start, did, so that it keeps the staging that engine
-  // kept; only its split leaves that engine's context (below).
+  // and the requested context beside it, the parts as they load. The split
+  // wins over it: where the plan refuses the split beside the staging but not
+  // without it, the tier turns off before the split is decided. A relaunch
+  // decides it as its first engine, an automatic start, did, so that it keeps
+  // the staging that engine kept; only its split leaves that engine's context
+  // (below).
   if (stateStagingBytes && automaticDisk) {
     const auto withoutStaging = [&](uint64_t aneFfnBytes) { return planWith(0, aneFfnBytes); };
+    const EngineMemoryPlanResult planResult = planMemory(0);
     if (!planResult.plan ||
         planResult.plan->maximumContextTokens() < std::max<uint32_t>(1, requestedContextTokens))
       diskOff(requestedContextTokens
@@ -525,22 +978,28 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                         "-token context beside its state staging"
                   : std::string("the memory plan cannot hold the Neural Engine FFN split and any "
                                 "context beside its state staging"));
-    if (!stateStagingBytes)
-      planResult = planMemory(0);
   }
-  if (!planResult.plan) {
-    throw RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
-                                planResult.status.message,
-                                planResult.status.describe());
-  }
-  EngineMemoryPlan memoryPlan = std::move(*planResult.plan);
+
+  // The engine's plan with the staging the tier keeps; one that cannot hold
+  // the model stops the start with its breakdown, before the tier's files
+  // open.
+  const auto requirePlan = [&] {
+    EngineMemoryPlanResult planResult = planMemory(0);
+    if (!planResult.plan) {
+      throw RuntimeResourcesError(RuntimeResourceStage::MemoryPlanning,
+                                  planResult.status.message,
+                                  planResult.status.describe());
+    }
+    return std::move(*planResult.plan);
+  };
+  EngineMemoryPlan memoryPlan = requirePlan();
 
   RuntimeCacheIdentity cacheIdentity;
   try {
     cacheIdentity = makeRuntimeCacheIdentity(
         loaded.manifestFingerprintSha256,
         loaded.targetManifestFingerprint(), config.buildId,
-        loaded.targetKvLayout(config.kvFormat));
+        loaded.targetKvLayout(config.kvFormat), loaded.descriptor.ropeScaling);
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                 error.what(),
@@ -548,16 +1007,38 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   }
 
   try {
+    // The tier's files open now, where the disk takes them (openDiskTier):
+    // the plan set the staging aside without asking it, and where they do
+    // not open the staging stays unused. A plan that spills takes the room
+    // the tier's volume leaves active KV, and spills only where its KV file
+    // opened: its floors can only shrink. A relaunch whose plan spills opens
+    // them whatever room the volume has, as the first engine's context it
+    // keeps may rest on them.
+    const std::string cacheNamespace =
+        persistentCacheNamespace(cacheIdentity, loaded.stateLayout(config.stateFormat));
+    // The KV file's slots hold a page as the tier lays it out, checksummed by
+    // segment when persistent, and the writes of both files hold back while
+    // a step waits for reads.
+    const model::SlotFile::Options kvFileOptions{.segments = kvFormat.segments(),
+                                                 .deferWrites = readers->criticalBusyProbe()};
+    const model::SlotFile::Options stateFileOptions{.deferWrites = readers->criticalBusyProbe()};
+    DiskTier disk = openDiskTier(config, cacheNamespace, stateStagingBytes ? cacheDiskBytes : 0, kvSlotBytes,
+                                 kvFileOptions, stateBytes, stateFileOptions,
+                                 relaunchContext && memoryPlan.breakdown().kvSpill.enabled);
+    if (memoryPlan.breakdown().kvSpill.enabled) {
+      kvFileOpen = disk.kv != nullptr;
+      if (disk.budget)
+        activeLimitBytes = std::min(activeLimitBytes, disk.budget->activeLimitBytes());
+      memoryPlan = requirePlan();
+    }
+
     // The governor holds the complete Metal footprint to the hard budget. The
     // plan budgets pipelines and driver allocations inside the pipeline and
     // allocator reserves, so memory outside the backend's buffers is charged
     // only beyond them, and elastic state and KV never grow into them. The
     // split only moves bytes from KV to fixed runtime memory, so the governor
     // is the same with it or without.
-    auto memoryGovernor = std::make_unique<MemoryGovernor>(
-        *backend, memoryPlan.breakdown().hardBudgetBytes, hostReserveBytes,
-        EngineMemoryPolicy::hostSpareReserveBytes(device.physicalMemoryBytes), config.hostMemory,
-        memoryPlan.breakdown().pipelineReserveBytes + memoryPlan.breakdown().runtimeOverheadReserveBytes);
+    auto memoryGovernor = std::make_unique<MemoryGovernor>(*backend, memoryPlan.breakdown(), config.hostMemory);
     if (config.memoryPressure)
       memoryGovernor->setPressure(config.memoryPressure());
     // What the start allocates, the KV runway, the arenas and the warmup, is
@@ -568,142 +1049,69 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     memoryGovernor->setServing(true);
     logLine("Kernel policy for GPU family ", device.appleGpuFamily,
             " with ", device.gpuCoreCount, " cores.");
+    if (const model::RopeScaling &rope = config.model.ropeScaling; rope.yarn())
+      logLine("YaRN is on: the target's RoPE is scaled by ", rope.factor, " for ",
+              config.model.capabilities.maximumContextTokens, " tokens of context, past the native window of ",
+              rope.originalContextTokens, ". Static YaRN changes answers at every length, so pass a --max-context "
+              "above ", rope.originalContextTokens, " only when a request needs it.");
     // The split leaves the context asked for, else a relaunch's.
     const RequestedContext splitContext =
         requestedContextTokens ? RequestedContext{.tokens = requestedContextTokens}
                                : RequestedContext{.tokens = config.relaunchContext,
                                                   .relaunch = config.relaunchContext != 0};
-    AneFfnStart aneFfn =
-        startAneFfn(splitModel, config.aneFfn, splitContext, planMemory, config.cancelled);
+    AneFfnStart aneFfn = startAneFfn(splitModel, config.aneFfn, splitContext, planMemory, config.cancelled);
     if (aneFfn.plan)
       memoryPlan = std::move(*aneFfn.plan);
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
+    const KvSpillPlan &spill = budget.kvSpill;
+    const std::string spillOff = spillOffReason(config.model, kvLayout, spill, stateStagingBytes && kvFileOpen);
+    reportSpill(config.model, budget, spillOff, activeLimitBytes);
+    if (!spill.enabled) {
+      if (config.kvSpillAlways)
+        logLine("--kv-spill always ignored: ", config.model.name, " keeps its KV in memory, ", spillOff, ".");
+      if (config.sparseKvMemory)
+        logLine("--sparse-kv-memory ignored: ", config.model.name, " keeps its KV in memory, ", spillOff, ".");
+    }
 
-    // Page ids for every extent the hard budget could hold: the governor,
-    // never the id range, limits the pool.
+    // Page ids for every extent the hard budget could hold, of Index pages
+    // where spilled pages hold only their index: the governor, never the id
+    // range, limits the pool.
+    const uint64_t idExtentBytes =
+        spill.enabled ? uint64_t{budget.kvExtentPages} * budget.kvIndexPageBytes : budget.kvExtentBytes;
     const uint64_t poolExtents = std::min<uint64_t>(
-        (budget.hardBudgetBytes + budget.kvExtentBytes - 1) / budget.kvExtentBytes,
+        (budget.hardBudgetBytes + idExtentBytes - 1) / idExtentBytes,
         std::numeric_limits<uint32_t>::max() / budget.kvExtentPages);
     auto kvPages = std::make_unique<kv::PageStorage>(
-        *backend, memoryGovernor->allocationAdmission(), loaded.targetKvLayout(config.kvFormat),
+        *backend, memoryGovernor->allocationAdmission(), kvLayout,
         static_cast<uint32_t>(poolExtents * budget.kvExtentPages), budget.kvExtentPages);
     auto kvPool = std::make_unique<KvPool>(*kvPages, model::ExecutionLimits::warmupKvPages);
-    // The tier's files open now, where the disk takes them: the plan set the
-    // staging aside without asking it. A persistent tier keeps its files in a
-    // cache directory of its own; when another process holds it or it cannot
-    // be used, the tier keeps temporary files, as without one. The automatic
-    // tier opens files only on a volume where its limit would hold two states
-    // and 1 GiB of KV: a persistent tier's root, whose caches nobody holds
-    // count as the tier's, else the temporary files'. Where it opens none,
-    // the tier is off and the staging stays unused.
-    std::shared_ptr<model::DiskBudget> diskBudget;
-    std::shared_ptr<model::SlotFile> stateFile;
-    PersistentCacheFiles persistentCache;
-    const std::string cacheNamespace =
-        persistentCacheNamespace(cacheIdentity, loaded.stateLayout(config.stateFormat));
-    // The cache root's caches nobody holds, this start's own included, looked
-    // at once: they are room an automatic persistent tier may take, the stale
-    // ones go once this start holds its own, and the rest share the root's
-    // limit with a persistent tier (DiskSpace).
-    const std::vector<CacheDirectory::Idle> rootCaches =
-        config.cacheRoot.empty() ? std::vector<CacheDirectory::Idle>{}
-                                 : CacheDirectory::idle(config.cacheRoot);
-    if (stateStagingBytes) {
-      // A write budget, when one is set, refills on the awake clock the
-      // engine schedules its wake-ups on (awakeMilliseconds), so a write it
-      // holds back is taken up again when the budget admits it. Without one
-      // every write passes.
-      diskBudget = std::make_shared<model::DiskBudget>(cacheDiskBytes);
-      if (config.cacheDiskWritesPerDay)
-        diskBudget->setWriteBudget(config.cacheDiskWritesPerDay);
-      const uint64_t stateSlotBytes = model::SlotFile::slotBytesFor(stateBytes);
-      std::optional<std::string> rootRefusal, temporaryRefusal;
-      if (automaticDisk) {
-        const uint64_t minimumBytes = 2 * stateSlotBytes + (uint64_t{1} << 30);
-        std::error_code ignored;
-        temporaryRefusal = automaticDiskRefusal(
-            config.diskVolume(std::filesystem::temp_directory_path(ignored)), 0, minimumBytes);
-        if (config.persistentCache && !config.cacheRoot.empty()) {
-          uint64_t heldBytes = 0;
-          for (const CacheDirectory::Idle &cache : rootCaches)
-            heldBytes += cache.bytes;
-          rootRefusal =
-              automaticDiskRefusal(config.diskVolume(config.cacheRoot), heldBytes, minimumBytes);
-        }
-      }
-      if (config.persistentCache && !rootRefusal) {
-        persistentCache = openPersistentCache(
-            config.cacheRoot, cacheNamespace, model::SlotFile::slotBytesFor(kvPages->bytesPerPage()),
-            stateSlotBytes, diskBudget, config.cancelled);
-        stateFile = persistentCache.states;
-      }
-      std::optional<std::string> off;
-      if (!stateFile && temporaryRefusal) {
-        if (rootRefusal)
-          off = "for its root, " + *rootRefusal + "; for temporary files, " + *temporaryRefusal;
-        else
-          off = config.persistentCache ? "for temporary files, " + *temporaryRefusal : *temporaryRefusal;
-      } else if (!stateFile) {
-        if (rootRefusal)
-          logLine("Persistent cache off: ", *rootRefusal, "; the SSD cache keeps temporary files.");
-        try {
-          stateFile = std::make_shared<model::SlotFile>(stateSlotBytes, diskBudget);
-        } catch (const std::exception &error) {
-          off = error.what();
-        }
-      }
-      if (off) {
-        logLine("SSD cache off: ", *off, "; the state staging the plan set aside stays unused.");
-        diskBudget.reset();
-      }
-    }
-    // After the open, which holds this start's own cache: a held one stays.
-    // The stale ones go, and the others share the root's limit with the
-    // tier.
-    std::vector<CacheDirectory::Idle> otherCaches =
-        CacheDirectory::removeStale(rootCaches, kStaleCache);
-    std::erase_if(otherCaches, [&](const CacheDirectory::Idle &cache) {
-      return cache.path.filename() == cacheNamespace;
-    });
     auto stateStorage = std::make_unique<model::QwenStateStorage>(
         *backend, memoryGovernor->allocationAdmission(), loaded.stateLayout(config.stateFormat),
-        stateFile);
+        disk.states);
     std::unique_ptr<KvPageTier> kvTier;
-    std::unique_ptr<DiskSpace> diskSpace;
-    if (diskBudget) {
-      const uint64_t slotBytes = model::SlotFile::slotBytesFor(kvPages->bytesPerPage());
-      std::shared_ptr<model::SlotFile> kvFile = persistentCache.kv;
-      try {
-        if (!kvFile)
-          kvFile = std::make_shared<model::SlotFile>(slotBytes, diskBudget);
-        kvTier = std::make_unique<KvPageTier>(*kvPages, kvFile);
-      } catch (const std::exception &error) {
-        // The persistent files are open by now; without the tier nothing
-        // would keep or replace their copies.
-        if (persistentCache.directory)
-          throw;
-        kvFile.reset();
-        logLine("SSD cache KV storage disabled; state storage remains enabled (",
-                error.what(), ").");
-      }
-      // The volume sizes the tier before it takes anything back. A
-      // persistent tier's root holds the other caches nobody holds too.
-      std::vector<std::shared_ptr<model::SlotFile>> files{stateFile};
-      if (kvFile)
-        files.push_back(kvFile);
-      diskSpace = std::make_unique<DiskSpace>(
-          diskBudget, std::move(files),
-          persistentCache.directory ? std::move(otherCaches) : std::vector<CacheDirectory::Idle>{});
-      reportDiskTier(*diskSpace, *diskBudget, automaticDisk, config.cacheDiskWritesPerDay,
-                     persistentCache.directory
-                         ? "persistent files in " + persistentCache.directory->path().string()
-                         : "temporary files in " +
-                               std::filesystem::temp_directory_path().string(),
-                     kvFile ? slotBytes : 0, stateBytes);
+    if (disk.kv)
+      kvTier = std::make_unique<KvPageTier>(*kvPages, kvFormat, disk.kv, readers);
+    std::optional<CacheSpillPolicy> spillPolicy;
+    if (spill.enabled)
+      spillPolicy = CacheSpillPolicy{.densePages = spill.densePages, .windowPages = spill.windowPages};
+    auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), disk.budget, spillPolicy);
+    if (disk.space)
+      cache->setDiskMeasure([space = disk.space.get()] { space->measure(); });
+    // A target whose KV spills reads it back through one hot block cache and
+    // one history stream, which take KV memory from the governor.
+    std::unique_ptr<model::KvBlockCache> blockCache;
+    std::unique_ptr<model::KvHistoryStream> historyStream;
+    if (spill.enabled) {
+      blockCache = std::make_unique<model::KvBlockCache>(
+          *backend, memoryGovernor->allocationAdmission(), kvLayout, budget.kvExtentPages,
+          model::KvBlockCacheOptions{.laneSlots = static_cast<uint32_t>(spill.laneSlots),
+                                     .targetBytes = spill.hotTargetBytes,
+                                     .readers = readers,
+                                     .format = kvFormat});
+      historyStream = std::make_unique<model::KvHistoryStream>(
+          *backend, memoryGovernor->allocationAdmission(), kvLayout, budget.kvExtentPages, readers, kvFormat,
+          spill.stagingBuffers);
     }
-    auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), diskBudget);
-    if (diskSpace)
-      cache->setDiskMeasure([space = diskSpace.get()] { space->measure(); });
 
     if (stateStorage->actualAllocatedBytes() != 0) {
       throw std::runtime_error("lane state was allocated eagerly");
@@ -721,13 +1129,16 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     }
 
     auto result = std::unique_ptr<RuntimeResources>(new RuntimeResources(
-        std::move(persistentCache), std::move(backend), std::move(loaded),
+        std::move(disk.persistent), std::move(backend), std::move(readers), std::move(loaded),
         std::move(operators), std::move(memoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
-        std::move(kvTier), std::move(diskSpace), std::move(kvPool), std::move(cache),
-        std::move(aneFfn.split), std::move(aneFfn.outcome)));
+        std::move(kvTier), std::move(disk.space), std::move(kvPool), std::move(cache),
+        std::move(aneFfn.split), std::move(aneFfn.outcome), std::move(blockCache),
+        std::move(historyStream), config.kvSpillAlways, config.verifyRows));
     result->adoptPersistentCache();
     return result;
+  } catch (const RuntimeResourcesError &) {
+    throw;
   } catch (const metal::MetalAllocationError &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::StorageAllocation,
                                 error.what(),
@@ -768,10 +1179,7 @@ void RuntimeResources::adoptPersistentCache() {
   logLine("Persistent cache ", directory.path().string(), ": took back ", adoption.states,
           " restore points over ", adoption.blocks, " KV blocks (", adoption.bytes / kMiB,
           " MiB); left ", adoption.dropped, " copies behind.",
-          directory.uncleanExit()
-              ? " The last process did not stop cleanly: this one serves on probation for "
-                "its first minute."
-              : "");
+          directory.uncleanExit() ? " The last process did not stop cleanly." : "");
 }
 
 void RuntimeResources::beginServing() {
@@ -779,16 +1187,13 @@ void RuntimeResources::beginServing() {
   CacheDirectory *directory = persistentCache_.directory.get();
   if (!directory)
     return;
-  const bool probation = directory->uncleanExit();
   try {
-    directory->beginServing(probation);
+    directory->beginServing();
   } catch (const std::exception &error) {
     logLine("Persistent cache cannot mark this process serving (", error.what(),
             "); the next start will not know how it ended.");
     return;
   }
-  if (!probation)
-    return;
   probation_ = std::thread([this, directory] {
     std::unique_lock lock(probationMutex_);
     if (probationWake_.wait_until(lock, AwakeClock::now() + kProbation,
@@ -800,6 +1205,19 @@ void RuntimeResources::beginServing() {
       logLine("Persistent cache probation did not end (", error.what(), ").");
     }
   });
+}
+
+void RuntimeResources::engineFailed() noexcept {
+  CacheDirectory *directory = persistentCache_.directory.get();
+  if (!directory)
+    return;
+  // A probation that has not ended yet ends failed.
+  stopProbation();
+  try {
+    directory->engineFailed();
+  } catch (const std::exception &error) {
+    logLine("Persistent cache cannot record the engine's failure (", error.what(), ").");
+  }
 }
 
 void RuntimeResources::stopProbation() noexcept {
@@ -840,7 +1258,39 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       *stateStorage_,
       operators_,
       aneFfn_.get(),
+      blockCache_.get(),
+      historyStream_.get(),
+      verifyRows_,
   };
+}
+
+EngineSpillConfig RuntimeResources::spillConfig() const noexcept {
+  const KvSpillPlan &spill = memoryPlan_.breakdown().kvSpill;
+  return {.capable = spill.enabled,
+          .always = spillAlways_,
+          .denseTokens = spill.densePages * kv::kPageTokens,
+          .geometry = memoryPlan_.spillGeometry()};
+}
+
+std::optional<KvSpillStatus> RuntimeResources::kvSpillStatus() const {
+  if (!memoryPlan_.breakdown().kvSpill.enabled)
+    return std::nullopt;
+  KvSpillStatus result{.cache = cache_->spillSnapshot()};
+  if (blockCache_)
+    result.blockCache = blockCache_->stats();
+  if (historyStream_)
+    result.historyStream = historyStream_->stats();
+  return result;
+}
+
+std::optional<model::SparseRowStats> RuntimeResources::streamedTableStats() const {
+  if (const model::SparseRowStore *table = model_.streamedTable()) return table->stats();
+  return std::nullopt;
+}
+
+std::optional<model::ExpertStoreStats> RuntimeResources::streamedExpertStats() const {
+  if (const model::ExpertStore *experts = model_.expertStore()) return experts->stats();
+  return std::nullopt;
 }
 
 AneFfnSnapshot RuntimeResources::aneFfnSnapshot() const {
@@ -870,8 +1320,13 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
     throw std::logic_error("the KV pool and its storage disagree on allocated extents");
   }
   report.kvAllocatedBytes = kvPool_->allocatedBytes();
+  if (blockCache_)
+    report.kvBlockCacheBytes = blockCache_->stats().bytes;
+  if (historyStream_)
+    report.kvHistoryStagingBytes = historyStream_->stats().stagingBytes;
   report.stateStagingBytes = modelMemory.stateStagingBytes;
   report.aneFfnBytes = aneFfn_ ? aneFfn_->allocatedBytes() : 0;
+  if (const auto table = streamedTableStats()) report.streamedTableBytes = table->cacheBytes;
   // Optional warmup may end with a rolled-back allocation and no subsequent
   // command. Refresh the current counts after that rollback; peaks stay intact.
   metal::MetalMemoryStats memory = backend_->refreshMemoryStats();

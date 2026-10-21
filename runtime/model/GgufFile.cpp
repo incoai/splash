@@ -130,6 +130,15 @@ void skipValue(Reader &reader, uint32_t type, unsigned depth) {
   }
 }
 
+// Opens the files at paths into `sources`, in order: their addresses there,
+// which a deque keeps.
+std::vector<WeightSource *> openSources(std::deque<WeightSource> &sources,
+                                        const std::vector<std::filesystem::path> &paths) {
+  std::vector<WeightSource *> opened;
+  for (const std::filesystem::path &path : paths) opened.push_back(&sources.emplace_back(path));
+  return opened;
+}
+
 } // namespace
 
 std::string ggmlTypeName(uint32_t type) {
@@ -149,7 +158,27 @@ uint64_t GgufTensor::elements() const {
   return elements;
 }
 
-GgufFile::GgufFile(WeightSource &source) : source_(source) {
+GgufFile::GgufFile(WeightSource &source) : GgufFile(std::array<WeightSource *, 1>{&source}) {}
+
+GgufFile::GgufFile(std::span<WeightSource *const> sources) : sources_(sources.begin(), sources.end()) {
+  if (sources_.empty()) throw GgufError("a GGUF needs at least one file");
+  for (uint32_t file = 0; file < sources_.size(); ++file) parse(*sources_[file], file);
+  // The first file's split.count and split.tensors.count, where it states
+  // them, describe the files read, as install/gguf.py merged_split reads
+  // them: a part of a split GGUF read alone is refused here rather than as
+  // the other parts' tensors missing.
+  if (metadata_.unsignedValue("split.count").value_or(1) != sources_.size())
+    throw GgufError("the GGUF's split.count does not match its " + std::to_string(sources_.size()) +
+                    (sources_.size() == 1 ? " file" : " files"));
+  if (metadata_.unsignedValue("split.tensors.count").value_or(tensors_.size()) != tensors_.size())
+    throw GgufError("the GGUF's split files hold another number of tensors than split.tensors.count");
+  rotation_ = readRotation();
+}
+
+void GgufFile::parse(WeightSource &source, uint32_t file) {
+  // Only the first file's metadata is kept: a later split file repeats
+  // split.* alone, whose split.no must be its place.
+  const bool first = file == 0;
   Reader reader(source);
   char magic[4];
   reader.bytes(magic, 4);
@@ -165,6 +194,16 @@ GgufFile::GgufFile(WeightSource &source) : source_(source) {
     const std::string key = reader.string();
     if (!keys.insert(key).second) throw GgufError("duplicate GGUF metadata key: " + key);
     const uint32_t type = reader.scalar<uint32_t>();
+    if (!first) {
+      if (key == "split.no") {
+        if (type != kUint16 && type != kUint32) throw GgufError("invalid split.no");
+        const uint64_t number = type == kUint16 ? reader.scalar<uint16_t>() : reader.scalar<uint32_t>();
+        if (number != file) throw GgufError("GGUF split file " + source.path().string() + " is out of order");
+      } else {
+        skipValue(reader, type, 0);
+      }
+      continue;
+    }
     switch (type) {
     case kUint8: metadata_.unsigneds[key] = reader.scalar<uint8_t>(); break;
     case kUint16: metadata_.unsigneds[key] = reader.scalar<uint16_t>(); break;
@@ -212,9 +251,11 @@ GgufFile::GgufFile(WeightSource &source) : source_(source) {
   const uint64_t alignment = metadata_.unsignedValue("general.alignment").value_or(32);
   if (alignment == 0 || alignment > 65536 || (alignment & (alignment - 1)))
     throw GgufError("invalid GGUF alignment");
-  tensors_.reserve(tensorCount);
+  const size_t firstTensor = tensors_.size();
+  tensors_.reserve(firstTensor + tensorCount);
   for (uint64_t i = 0; i < tensorCount; ++i) {
     GgufTensor tensor;
+    tensor.file = file;
     tensor.name = reader.string();
     const uint32_t dimensions = reader.scalar<uint32_t>();
     if (dimensions == 0 || dimensions > 4) throw GgufError("invalid tensor rank for " + tensor.name);
@@ -242,12 +283,12 @@ GgufFile::GgufFile(WeightSource &source) : source_(source) {
   if (padding > source.bytes() - headerEnd) throw GgufError("GGUF data section is truncated");
   source.setDataOffset(headerEnd + padding);
   const uint64_t dataBytes = source.bytes() - source.dataOffset();
-  for (const GgufTensor &tensor : tensors_) {
+  for (size_t i = firstTensor; i < tensors_.size(); ++i) {
+    const GgufTensor &tensor = tensors_[i];
     if (tensor.offset % alignment) throw GgufError("tensor data is misaligned: " + tensor.name);
     if (tensor.offset > dataBytes || tensor.bytes > dataBytes - tensor.offset)
       throw GgufError("tensor data runs past the end of the file: " + tensor.name);
   }
-  rotation_ = readRotation();
 }
 
 std::optional<GgufRotation> GgufFile::readRotation() const {
@@ -352,6 +393,12 @@ const GgufTensor &GgufFile::require(std::string_view name) const {
   const GgufTensor *tensor = find(name);
   if (!tensor) throw GgufError("GGUF is missing tensor " + std::string(name));
   return *tensor;
+}
+
+OpenGguf::OpenGguf(const std::vector<std::filesystem::path> &paths) : file_(openSources(sources_, paths)) {}
+
+void OpenGguf::checkUnchanged() const {
+  for (const WeightSource &source : sources_) source.checkUnchanged();
 }
 
 } // namespace splash::model

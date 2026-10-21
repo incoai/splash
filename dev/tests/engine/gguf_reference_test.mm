@@ -1,7 +1,8 @@
 // The GGUF CPU reference's fp32 values against golden hashes of upstream
 // GGML's dequantization per GGUF format and of llama.cpp's NVFP4 tensor type,
-// and against MLX's own reading of MLX's quantization per MLX affine format
-// and for mxfp4 and nvfp4.
+// its Q8_0 blocks against one of that library's Q8_0 quantization, and its values
+// against MLX's own reading of MLX's quantization per MLX affine format and
+// for mxfp4 and nvfp4.
 //   gguf-reference GOLDENS MLX_FIXTURE
 // GOLDENS is dev/tests/fixtures/weight-goldens/goldens.json; its README says
 // how to update it. With SPLASH_GGML_ORACLE=<libggml-base.dylib> the reference
@@ -59,6 +60,23 @@ void checkBlockNvfp4(void *ggml, const Goldens &hashes) {
                                      official.size() * sizeof(float)}).c_str());
 }
 
+// The GGUF Q8_0 quantization, which the loader applies to Qwen3.8-Flash-Next's BF16 and F16 hyper-connection
+// projections (model/GgufPreparation.cpp): the reference's block_q8_0 rows of q8_0Values against their golden hash,
+// and against the oracle library's own (quantize_row_q8_0_ref).
+void checkQ8_0Quantization(void *ggml, const Goldens &hashes) {
+  const std::vector<float> values = q8_0Values(uint64_t{kRows} * kColumns, kSeed + GGUF_FMT_Q80);
+  const std::vector<uint8_t> blocks = quantizeQ8_0(values);
+  checkGolden(hashes, "q8_0", blocks, "CPU reference matches the golden hash: Q8_0 quantization");
+  if (!ggml) return;
+  using Quantize = void (*)(const float *, void *, int64_t);
+  const auto quantize = reinterpret_cast<Quantize>(dlsym(ggml, "quantize_row_q8_0_ref"));
+  std::vector<uint8_t> official(blocks.size());
+  if (quantize) quantize(values.data(), official.data(), int64_t(values.size()));
+  check(quantize && official == blocks, std::string("CPU reference matches the oracle: Q8_0 quantization") +
+                                            (quantize ? "" : std::string(" (") + dlerror() + ")"));
+  if (quantize) std::printf("oracle q8_0 quantization %s\n", model::weightDigest(official).c_str());
+}
+
 // Each fixture tensor as the loader's native rows of its format (mlxNative)
 // against MLX's own reading of it: an affine tensor's codes and the fp32
 // values, bit for bit but for mxfp4's and nvfp4's zero code 8, which MLX reads as -0 and
@@ -110,6 +128,7 @@ int main(int argc, char **argv) {
     for (uint32_t f = 0; f < GGUF_FMT_COUNT; ++f)
       if (!quant_loader_format(f)) checkFormat(ggml, hashes, Fmt(f));
     checkBlockNvfp4(ggml, hashes);
+    checkQ8_0Quantization(ggml, goldens(argv[1], @"gguf_quantization"));
     checkMlx(argv[2]);
     std::printf("%s (%d failures)\n", failures ? "GGUF reference tests FAILED" : "GGUF reference tests passed",
                 failures);

@@ -16,6 +16,11 @@ on:
         required: false
         type: boolean
         default: false
+      expect_image_change:
+        description: Report the weight images that differ from the baseline's instead of failing on them (EXPECT_IMAGE_CHANGE=1)
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: runtime-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
@@ -108,6 +113,7 @@ jobs:
     env:
       PYTHON_CANDIDATES: python3
       EXPECT_OUTPUT_CHANGE: ${{ inputs.expect_output_change && '1' || '' }}
+      EXPECT_IMAGE_CHANGE: ${{ inputs.expect_image_change && '1' || '' }}
     # Older Apple GPUs can spend substantially longer in the real context and
     # quality gates. The job must fail on an engine/test result, not an
     # arbitrary job timer.

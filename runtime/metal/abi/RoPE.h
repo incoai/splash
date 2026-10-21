@@ -17,10 +17,13 @@
 struct RopeTableParams {
   uint32_t target_rows;
   uint32_t draft_rows;
+  // What the target table's cosines and sines are scaled by: YaRN's
+  // attention factor, 1 without YaRN (model::RopeScaling).
+  float target_scale;
 };
 
-static_assert(sizeof(RopeTableParams) == 8,
-              "RoPE table parameters are 8 bytes on both sides");
+static_assert(sizeof(RopeTableParams) == 12,
+              "RoPE table parameters are 12 bytes on both sides");
 
 // Draft rows of consecutive positions from start_position, the rows a
 // restore computes its rings from again (ops::RoPE::addDraftRangeTables).

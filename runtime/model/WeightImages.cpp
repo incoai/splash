@@ -20,7 +20,8 @@ WeightFile WeightImages::load(ImagePlan image) {
   if (released_) throw std::logic_error("weights load while their memory is released");
   metal::MetalBuffer buffer = backend_->allocateBuffer(image.bytes, metal::BufferStorage::Shared, image.component);
   image.write(contentsOf(buffer), buffer);
-  WeightFile file(*backend_, buffer, image.component, image.magic, image.layer, image.type, contentIdentity_);
+  WeightFile file(*backend_, buffer, image.component, image.magic, image.layer, image.type,
+                  image.declaredBytes ? image.declaredBytes : buffer.sizeBytes(), contentIdentity_);
   images_.push_back({std::move(image.component), std::move(buffer), std::move(image.write)});
   return file;
 }

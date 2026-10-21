@@ -53,7 +53,7 @@ public:
   WeightFile(metal::MetalBackend &backend, metal::MetalBuffer image,
              std::string relativePath, std::string_view expectedMagic,
              uint32_t expectedLayer, uint32_t expectedType,
-             std::string contentIdentity);
+             uint64_t declaredBytes, std::string contentIdentity);
   ~WeightFile();
 
   WeightFile(const WeightFile &) = delete;

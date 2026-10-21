@@ -20,6 +20,7 @@ from .tool_schema import (
     PARAMETER_OPEN,
     THINK_END,
     TOOL_CALL_CLOSE,
+    ParameterTypes,
 )
 
 TOOL_ARGUMENT_DELTA_CHARS = 16 * 1024
@@ -101,8 +102,9 @@ class ReasoningSplitter:
 _VALUE_ENDS = tuple(
     PARAMETER_CLOSE + tag for tag in (PARAMETER_OPEN, FUNCTION_END, TOOL_CALL_CLOSE)
 )
-# Text outside calls: a call's opening opens one, and a </think>, which a
-# model that called a tool from its reasoning may still write, is dropped.
+# Text outside calls: a call's opening opens one, and a </think> is dropped.
+# A model may write one again after its reasoning has ended, after its own
+# </think>, a call's opening or a budget's forced end, or with thinking off.
 _TEXT_TAGS = (CALL_OPEN, THINK_END)
 _NOT_JSON = object()
 # A template that writes a value through Jinja's string filter, as Nex's and
@@ -135,26 +137,25 @@ def _json_value(text):
 
 
 def convert_value(text, types):
-    """A parameter's text as the JSON types its schema declares read it, any
-    type where `types` is None: a string as the text, and another value as
-    the JSON the text spells when that is of a declared type or when no
-    declared type is a string. A boolean or null declared without a string
-    may also be spelled as Python spells it. Otherwise the text."""
+    """A parameter's text as the JSON types its schema gives for it read it,
+    `types` holding at least one; a value of none is its text, which
+    StreamingToolCallProjector streams as it is written. A string reads as
+    the text, and another value as the JSON the text spells when that is of
+    a declared type or when no declared type is a string. A boolean or null
+    declared without a string may also be spelled as Python spells it.
+    Otherwise the text."""
     value = _json_value(text)
     if value is _NOT_JSON:
         value = _PYTHON_LITERALS.get(text.strip(), _NOT_JSON)
         declared = (
             value is not _NOT_JSON
-            and types is not None
             and "string" not in types
             and JSON_TYPES[type(value)] in types
         )
         return value if declared else text
-    if types is None or "string" in types:
+    if "string" in types:
         kind = JSON_TYPES[type(value)]
-        declared = (
-            types is None or kind in types or (kind == "integer" and "number" in types)
-        )
+        declared = kind in types or (kind == "integer" and "number" in types)
         return value if declared and kind != "string" else text
     return value
 
@@ -171,16 +172,23 @@ class StreamingToolCallProjector:
     other order. </function> closes the call, and the </tool_call> after it
     may be left out. Names lose the space around them; a call that names no
     function is dropped, other text inside a call is dropped, and a repeated
-    parameter keeps its first value, which may have streamed. A value
-    converts by the types its tool declares for it (convert_value), and one
-    that may only be a string streams as it is written. Text outside calls
-    streams as it arrives, after a call as before one, and a </think> there
-    is dropped.
+    parameter keeps its first value, which may have streamed. A value whose
+    schema gives it no type, or the type string alone, is its text and
+    streams as it is written; any other converts at its end by the types its
+    tool declares for it (convert_value). Text outside calls streams as it
+    arrives, after a call as before one, and a </think> there is dropped
+    (_TEXT_TAGS).
+
+    Without a tool policy the output has no calls: a call's opening is text,
+    and the projector only drops the </think>s, so that every answer reads
+    its text the same way. A structured answer's JSON is left as it is.
     """
 
     def __init__(self, policy, request_id, structured=False):
-        self.policy = policy
+        # The types of the tools its calls name, read as they name them.
+        self.tool_types = ParameterTypes(policy) if policy is not None else None
         self.request_id = request_id
+        self.text_tags = _TEXT_TAGS if policy is not None else (THINK_END,)
         self.pending = ""
         self.state = "output" if structured else "content"
         self.call_index = 0
@@ -202,9 +210,10 @@ class StreamingToolCallProjector:
         self.content_fragments = []
         # How many content fragments the stream has published (the rest are
         # whitespace it holds), and whether the text since the start of the
-        # output or the last call has shown a visible character yet.
+        # output or the last call has shown a visible character yet. Without
+        # calls, no whitespace frames them.
         self.streamed_count = 0
-        self.text_visible = False
+        self.text_visible = policy is None
         self.closed_calls = []
 
     def _emit_content(self, value, events):
@@ -255,7 +264,7 @@ class StreamingToolCallProjector:
             self.content_fragments.clear()
         self.function_name = name
         self.call_id = f"call_{self.request_id}_{self.call_index}"
-        self.parameter_types, self.other_types = self.policy.parameter_types(name)
+        self.parameter_types, self.other_types = self.tool_types.of(name)
         events.append(
             (
                 "tool",
@@ -283,9 +292,10 @@ class StreamingToolCallProjector:
         self.parameter_names.add(name)
         self.parameter_name = name if kept else None
         self.value_types = self.parameter_types.get(name, self.other_types)
-        # A value that may only be a string streams as it is written; any
-        # other waits for its end to convert.
-        self.value_streams = self.value_types == {"string"}
+        # A value whose schema gives it no type, or the type string alone, is
+        # its text and streams as it is written; any other waits for its end
+        # to convert.
+        self.value_streams = not self.value_types or self.value_types == {"string"}
         self.value_started = False
         self.value_parts = []
         if self.value_streams and self.parameter_name is not None:
@@ -374,9 +384,9 @@ class StreamingToolCallProjector:
                 self.pending = ""
                 break
             if self.state == "content":
-                start, tag = self._next_tag(*_TEXT_TAGS)
+                start, tag = self._next_tag(*self.text_tags)
                 if tag is None:
-                    ready, self.pending = hold_partial(self.pending, *_TEXT_TAGS)
+                    ready, self.pending = hold_partial(self.pending, *self.text_tags)
                     self._emit_content(ready, events)
                     break
                 self._emit_content(self.pending[:start], events)
@@ -470,7 +480,8 @@ class StreamingToolCallProjector:
             self.state in ("content", "output", "json")
             and self.pending
             and not (
-                incomplete and any(tag.startswith(self.pending) for tag in _TEXT_TAGS)
+                incomplete
+                and any(tag.startswith(self.pending) for tag in self.text_tags)
             )
         ):
             self.content_fragments.append(self.pending)

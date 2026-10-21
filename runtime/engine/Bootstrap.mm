@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <sstream>
 #include <utility>
 
@@ -136,7 +137,8 @@ std::string RuntimeBootstrap::statusJson(const RuntimeMetricsSnapshot &metrics,
       resources_->cacheIdentity(), resources_->memoryGovernor().snapshot(),
       healthy, healthy ? std::string{} : backend.unhealthyReason(),
       nativeLoop_->resourceWaitSnapshot(), loop, nativeLoop_->weightsSnapshot(),
-      resources_->aneFfnSnapshot(), thermalState_.state());
+      resources_->aneFfnSnapshot(), thermalState_.state(), resources_->streamedTableStats(),
+      resources_->streamedExpertStats(), resources_->kvSpillStatus());
 }
 
 void RuntimeBootstrap::sampleThermalState() {
@@ -189,7 +191,7 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
             return modelRuntime.warmupPrefill(model::ExecutionLimits::prefillTokenBudget);
           });
   nativeLoop.observePrefill(model::ExecutionLimits::prefillTokenBudget,
-                           maximumPrefill.wallSeconds * 1000.0);
+                           maximumPrefill.wallSeconds * 1000.0, maximumPrefill.hostSeconds * 1000.0);
   report.warmup.maximumPrefillDetail = maximumPrefill.detail;
   const auto &budget = memoryPlan.breakdown();
   // Startup exercises only widths that fit this budget. This is not a
@@ -283,18 +285,34 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
     // (AneFfnOutcome::context).
     config.nativeLoop.engine.maxContext = resources->aneFfnOutcome().context;
   } else if (config.nativeLoop.engine.maxContext > planContext) {
-    // --max-memory sets the budget only below this Mac's own.
+    // --max-memory sets the budget only below this Mac's own; the SSD cache's
+    // room bounds a context whose KV spills (ContextBounds::bound).
     const auto &budget = resources->memoryPlan().breakdown();
     const bool memoryCapped = budget.configuredMemoryLimitBytes &&
                               budget.hardBudgetBytes == budget.configuredMemoryLimitBytes;
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,
          "--max-context " + std::to_string(config.nativeLoop.engine.maxContext) +
              " exceeds the " + std::to_string(planContext) + " tokens the model and " +
-             (memoryCapped ? "--max-memory" : "this Mac's memory") +
+             (budget.contextBounds.bound() == "disk" ? "the SSD cache's room for its KV"
+              : memoryCapped                         ? "--max-memory"
+                                                     : "this Mac's memory") +
              " allow; omit it or pass at most " + std::to_string(planContext));
   }
   config.nativeLoop.engine.vocabularySize =
       config.resources.model.capabilities.vocabularySize;
+  // A prefill command takes no more attention than a full chunk at the end
+  // of the native window, which every supported Mac runs within the command
+  // watchdog: past it, at depths only YaRN serves, commands take fewer rows.
+  // A row of a target with an indexer attends to its top blocks at any depth,
+  // and only the indexer's scores grow with it, a hundredth of attention's,
+  // so its commands keep their rows.
+  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
+  config.nativeLoop.engine.maximumPrefillAttentionPairs = std::visit(
+      [](const auto &layout) {
+        return layout.hasIndexer() ? std::numeric_limits<uint64_t>::max()
+                                   : Scheduler::attentionPairs(layout.nativeContextTokens - chunk, chunk);
+      },
+      config.resources.model.target);
   // Images are admitted up to the server's pixel cap; a model without vision
   // admits none.
   config.nativeLoop.engine.maxImagePatches =
@@ -339,8 +357,10 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   std::unique_ptr<NativeRuntime> nativeLoop;
   try {
     connectToGovernor(config.nativeLoop.engine, resources->memoryGovernor());
+    config.nativeLoop.engine.spill = resources->spillConfig();
     config.nativeLoop.weights = &resources->releasableMemory();
     config.nativeLoop.weightAdmission = resources->memoryGovernor().allocationAdmission();
+    config.nativeLoop.engineFailed = [owner = resources.get()] { owner->engineFailed(); };
     // The parser and engine consume the same resolved ceiling. In automatic
     // mode it cannot be known until resource planning has measured the device.
     nativeLoop = std::make_unique<NativeRuntime>(

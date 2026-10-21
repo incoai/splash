@@ -7,6 +7,7 @@
 
 #include <functional>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace splash::model {
@@ -49,17 +50,26 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &l
   return loadQwen3_6MoeWeights(backend, layout, files);
 }
 
-uint64_t imageBytes(const std::vector<gguf::Image> &images) {
-  uint64_t total = 0;
-  for (const gguf::Image &image : images) total += image.bytes;
-  return total;
+TargetWeights readTarget(metal::MetalBackend &backend, const Qwen4ExpLayout &layout,
+                         const QwenTargetFiles &files) {
+  return loadQwen4ExpWeights(backend, layout, files);
 }
 
 } // namespace
 
+SparseRowStoreOptions streamedTableRows(const Qwen3_8Layout &) { return {}; }
+
+SparseRowStoreOptions streamedTableRows(const Qwen3_6MoeLayout &) { return {}; }
+
+StreamedParts StreamedParts::loaded(const LoadedModel &model, bool kv) noexcept {
+  const SparseRowStore *table = model.streamedTable();
+  return {.experts = model.expertStore() != nullptr, .tableRowBytes = table ? table->table().rowBytes : 0, .kv = kv};
+}
+
 LoadedModel loadModel(metal::MetalBackend &backend,
                               const std::filesystem::path &root,
-                              const ModelDescriptor &descriptor) {
+                              const ModelDescriptor &descriptor,
+                              const ModelLoadOptions &options) {
   LoadedModel result;
   result.descriptor = descriptor;
   if (!result.descriptor.valid())
@@ -70,16 +80,24 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   // the vision tower's and the draft's here, the target's by its loader.
   const auto vision = planVisionLoader(root, result.descriptor);
   DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
+  // The weights that stream from their files read on the engine's readers.
+  const ExpertStoreOptions experts{.memoryBytes = options.expertMemoryBytes, .readers = options.readers};
   result.target = std::visit(
       [&](const auto &layout) -> TargetWeights {
         const std::filesystem::path directory = root / "target";
         switch (result.descriptor.targetSource) {
         case TargetSource::Safetensors: {
-          SafetensorsTargetLoader loader(backend, images, directory, layout);
+          SafetensorsTargetLoader loader(backend, images, directory, layout, experts);
           return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {
-          GgufTargetLoader loader(backend, images, findTargetGguf(directory), layout);
+          // A streamed table's store: its memory and readers here, the rows
+          // a step stages and prefetches from the family.
+          SparseRowStoreOptions table = streamedTableRows(layout);
+          table.cacheBytes = options.streamedTableBytes;
+          table.readers = options.readers;
+          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout.ggufArchitecture, layout, table,
+                                  experts);
           return readTarget(backend, layout, std::ref(loader));
         }
         }
@@ -98,24 +116,6 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   result.manifestFingerprintSha256 = weightManifestFingerprint(records);
   requireCompatibleModel(result);
   return result;
-}
-
-uint64_t modelWeightBytes(const std::filesystem::path &root, const ModelDescriptor &descriptor) {
-  uint64_t bytes = 0;
-  if (descriptor.targetSource == TargetSource::Gguf) {
-    WeightSource source(findTargetGguf(root / "target"));
-    const GgufFile file(source);
-    bytes = std::visit(
-        [&](const auto &layout) { return imageBytes(gguf::planImages(file, layout)); },
-        descriptor.target);
-  } else {
-    bytes = std::visit([&](const auto &layout) { return safetensorsTargetImageBytes(root / "target", layout); },
-                       descriptor.target);
-  }
-  bytes += draftImageBytes(root / "draft", descriptor.draft);
-  if (descriptor.hasVision())
-    bytes += visionImageBytes(descriptor.vision);
-  return bytes;
 }
 
 } // namespace splash::model

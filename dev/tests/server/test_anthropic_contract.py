@@ -1,6 +1,7 @@
 import copy
 import json
 import unittest
+from contextlib import nullcontext
 from unittest import mock
 
 from dev.tests.server_fixtures import (
@@ -1204,7 +1205,10 @@ class AnthropicHTTPContractTest(HarnessTestCase):
                     ],
                 )
                 parts = normalize_messages(
-                    translated["messages"], vision=True, deadline=FOREVER
+                    translated["messages"],
+                    vision=True,
+                    deadline=FOREVER,
+                    without_slot=nullcontext,
                 )[-1]["content"]
                 self.assertIn("ALPHA 42", parts[0]["text"])
                 self.assertEqual(parts[1]["type"], "image_url")

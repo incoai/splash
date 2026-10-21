@@ -113,8 +113,6 @@ class RealServer:
             str(self.port),
             "--binary",
             str(binary),
-            "--tokenizer",
-            str(model_root / "tokenizer"),
             "--model",
             arguments.model,
         ]
@@ -124,6 +122,12 @@ class RealServer:
             command.extend(("--max-memory", arguments.max_memory))
         if arguments.max_cache_disk is not None:
             command.extend(("--max-cache-disk", arguments.max_cache_disk))
+        if arguments.ple_memory is not None:
+            command.extend(("--ple-memory", arguments.ple_memory))
+        if arguments.expert_memory is not None:
+            command.extend(("--expert-memory", arguments.expert_memory))
+        if arguments.verify_rows is not None:
+            command.extend(("--verify-rows", arguments.verify_rows))
         if cache_dir is not None:
             command.extend(("--persistent-cache", "--cache-dir", str(cache_dir)))
         if arguments.max_image_pixels is not None:
@@ -265,6 +269,8 @@ def run_images(port: int, model: str, nonce: str) -> None:
         "word naming the color, with no punctuation, explanation or other words. "
         f"Request {nonce}."
     )
+    code, start = request(port, "GET", "/status")
+    require(code == 200 and "images" in start, "status lacks image telemetry")
     code, red = request(
         port,
         "POST",
@@ -285,10 +291,15 @@ def run_images(port: int, model: str, nonce: str) -> None:
     # The same image and prompt reuse the image-aware prefix, which covers the
     # image: its rows are neither encoded nor looked up. Behind another system
     # prompt the same image comes from the embedding cache without the vision
-    # tower. A different image behind identical placeholder tokens must not
+    # tower, unless the cache let its rows go since the image was encoded
+    # (images.embedding_evictions), as it does to give memory back, under
+    # macOS's warning for one (DEVELOPMENT.md, Admission and eviction): the
+    # image is then encoded again, once. An eviction that should not have
+    # happened passes here too: the engine tests check which reclaims take the
+    # rows. A different image behind identical placeholder tokens must not
     # reuse KV.
     code, before = request(port, "GET", "/status")
-    require(code == 200 and "images" in before, "status lacks image telemetry")
+    require(code == 200, f"status failed with HTTP {code}")
     code, repeat = request(
         port,
         "POST",
@@ -322,13 +333,19 @@ def run_images(port: int, model: str, nonce: str) -> None:
         f"the image behind another system prompt failed: {other!r}",
     )
     code, reused = request(port, "GET", "/status")
+    require(code == 200, f"status failed with HTTP {code}")
+    rows = (
+        reused["images"]["encodes"] - after["images"]["encodes"],
+        reused["images"]["embedding_reuses"] - after["images"]["embedding_reuses"],
+    )
+    evicted = (
+        reused["images"]["embedding_evictions"] > start["images"]["embedding_evictions"]
+    )
     require(
-        code == 200
-        and reused["images"]["encodes"] == after["images"]["encodes"]
-        and reused["images"]["embedding_reuses"]
-        == after["images"]["embedding_reuses"] + 1,
-        f"a cached image re-ran the vision tower or was not reused: "
-        f"{after['images']} -> {reused['images']}",
+        rows == (0, 1) or (evicted and rows == (1, 0)),
+        "a cached image re-ran the vision tower while the cache kept its rows, "
+        f"or was not reused: {start['images']} -> {after['images']} -> "
+        f"{reused['images']}",
     )
     code, blue = request(
         port,
@@ -348,7 +365,8 @@ def run_images(port: int, model: str, nonce: str) -> None:
     print(
         "image prefix cache: PASS "
         f"(repeat matched={repeat_cache['matched_tokens']}, "
-        f"different image matched={blue_cache.get('matched_tokens')})",
+        f"different image matched={blue_cache.get('matched_tokens')}, "
+        f"cached rows {'reused' if rows == (0, 1) else 'evicted and encoded again'})",
         flush=True,
     )
 
@@ -925,7 +943,11 @@ def run_sampling(port: int, model: str) -> None:
     leaves each row its most likely token answers what a greedy one does, and
     penalized greedy, sampled and constrained requests finish side by side with
     an unpenalized one and with sampled ones whose top_k keeps every token or
-    which min_p cuts."""
+    which min_p cuts. Greedy output repeats only where decode cycles verify
+    every row (/status verify_rows all), so on a MoE target, whose rows the
+    verify budget chooses unless it serves with --verify-rows all, the two
+    greedy comparisons are left out."""
+    repeats = runtime_status(port)["verify_rows"] == "all"
     prompt = "Name the days of the week, three times over, separated by commas."
     penalized = chat_body(
         model,
@@ -940,7 +962,10 @@ def run_sampling(port: int, model: str) -> None:
         code, chat = request(port, "POST", "/v1/chat/completions", penalized)
         require(code == 200, f"penalized greedy Chat failed: {chat!r}")
         answers.append(answer_text(chat))
-    require(answers[1] == answers[2], "a penalized greedy request did not repeat")
+    require(
+        not repeats or answers[1] == answers[2],
+        "a penalized greedy request did not repeat",
+    )
 
     code, greedy = request(
         port,
@@ -965,7 +990,7 @@ def run_sampling(port: int, model: str) -> None:
         ),
     )
     require(
-        code == 200 and answer_text(heaviest) == answer_text(greedy),
+        code == 200 and (not repeats or answer_text(heaviest) == answer_text(greedy)),
         f"min_p 1 did not answer as a greedy request: {heaviest!r}",
     )
 
@@ -1033,7 +1058,11 @@ def run_sampling(port: int, model: str) -> None:
         results["ignore_eos"][1]["usage"]["completion_tokens"] == 32,
         "ignore_eos beside penalized requests stopped early",
     )
-    print("sampling penalties, top_k and min_p: PASS", flush=True)
+    print(
+        "sampling penalties, top_k and min_p: PASS"
+        + ("" if repeats else " (greedy answers not compared: verify_rows auto)"),
+        flush=True,
+    )
 
 
 def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
@@ -1688,6 +1717,22 @@ def add_server_arguments(parser):
     parser.add_argument("--max-context", type=int)
     parser.add_argument("--max-memory")
     parser.add_argument("--max-cache-disk")
+    parser.add_argument(
+        "--ple-memory",
+        help="serve Qwen3.8-Flash-Next's PLE table from its GGUF through a row "
+        "cache of this size (splash serve --ple-memory)",
+    )
+    parser.add_argument(
+        "--expert-memory",
+        help="serve a MoE model's routed experts from RAM slots of this size in "
+        "all, reading the others from the SSD (splash serve --expert-memory)",
+    )
+    parser.add_argument(
+        "--verify-rows",
+        choices=("auto", "all"),
+        help="the rows of each draft block decode verifies (splash serve "
+        "--verify-rows); a MoE model's greedy output repeats only with all",
+    )
     parser.add_argument("--max-image-pixels", type=int)
     parser.add_argument("--kv-format", choices=("int8", "bf16"), default="int8")
     parser.add_argument("--startup-timeout", type=float, default=1800)
@@ -1703,21 +1748,11 @@ def resolve_server_arguments(arguments):
 
 
 def hold_model_root(arguments):
-    """As splash serve does, serve every server this process starts, and its
-    tokenizer, from one assembly, which installations keep while it is held:
-    point arguments.model_root at the assembly it links now, held until the
-    process exits by arguments.held_record. The installation that collects an
-    assembly is the one of the models root it was built in
-    (models/.resolved/<record>), which may be another checkout's."""
-    resolved = arguments.model_root.resolve()
-    models_root = (
-        resolved.parent.parent
-        if resolved.parent.name == ".resolved"
-        else model_artifacts.MODELS
-    )
-    arguments.model_root, arguments.held_record = assembly.hold(
-        arguments.model_root, models_root
-    )
+    """Serve every server this process starts, and its tokenizer, from one
+    assembly, which installations keep while it is held, between servers
+    too: point arguments.model_root at the assembly it links now, held until
+    the process exits by arguments.held_record."""
+    arguments.model_root, arguments.held_record = assembly.hold(arguments.model_root)
 
 
 def parse_args(argv=None):

@@ -36,6 +36,20 @@ enum class FloatTile : uint8_t { Simdgroup, NeuralAccelerator };
 void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, const QuantizedSegment &weights,
                   metal::MetalBuffer output, uint32_t rows, uint32_t outStride, uint32_t outOffset,
                   FloatOutput type, FloatTile tile);
+// One of several float projections of an input, each into its own
+// destination on its own tile, as the QSA indexer projects its query and key.
+struct FloatProjection final {
+  const QuantizedSegment *weights = nullptr;
+  metal::MetalBuffer output;
+  uint32_t outStride = 0;
+  uint32_t outOffset = 0;
+  FloatTile tile = FloatTile::Simdgroup;
+};
+// The projections of `rows` rows of one input, each dispatch running up to
+// GGUF_FLOAT_PROJECTIONS (metal/abi/Gguf.h) consecutive ones of one value
+// type and tile, so that each one's outputs are those of its own dispatch.
+void addGgufFloat(metal::CommandGraph &graph, metal::MetalBuffer input, std::span<const FloatProjection> projections,
+                  uint32_t rows, FloatOutput type);
 
 struct LinearMatrix final {
   uint32_t outputSize = 0;
@@ -85,7 +99,7 @@ struct LinearConfig final {
   // Cross-threadgroup K partitions for GgufStaged and GgufRegister, a power
   // of two up to kMaximumSplits; GgufPrefill uses one.
   uint32_t splits = 1;
-  static constexpr uint32_t kMaximumSplits = 8;
+  static constexpr uint32_t kMaximumSplits = 16;
   // GgufStaged: each column tile starts its walk over its K partition at its
   // own step (kernels/common/gguf_staged_tile.h) instead of every tile at the
   // partition's first; no other tile spreads.
@@ -94,6 +108,10 @@ struct LinearConfig final {
   // each stage both tensors' 32 columns (gguf_decode_<format>_m<rows>_gate_up,
   // gate and up in one format), instead of a gate pass and an up pass.
   bool oneGateUpPass = false;
+  // GgufStaged one-lane decode: the 16-row tile over two lanes of storage
+  // (LinearPlan::storageRows), whose padding lane's rows it computes and
+  // discards, instead of the 8-row tile.
+  bool sixteenRows = false;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
     return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
   }
@@ -278,16 +296,22 @@ public:
 private:
   // The device's configuration of the workload; the tile may follow the
   // formats of the projections it runs (LinearGguf.cpp), or without them
-  // whether those formats are all the register tile's.
+  // those of a projection of `shape`.
   [[nodiscard]] LinearConfig ggufBaseline(LinearWorkload workload,
                                           std::span<const Projection *const> projections = {},
-                                          bool registerFormats = true) const;
+                                          ProjectionShape shape = {}) const;
+  // Whether one decode lane runs its staged plan of `splits` K partitions on
+  // the 16-row tile (LinearConfig::sixteenRows), by the projections' formats
+  // or without them `shape`'s.
+  [[nodiscard]] bool sixteenRowLane(LinearWorkload workload, uint32_t splits,
+                                    std::span<const Projection *const> projections, ProjectionShape shape) const;
   // The partials and counters a dispatch of `splits` K partitions binds: the
   // scratch's, or for one partition, which reads neither, the output.
   [[nodiscard]] static std::array<metal::MetalBuffer, 2> splitScratch(const LinearBuffers &buffers,
                                                                       uint32_t splits);
-  // The scratch of every tile a decode plan of the workload may take.
-  [[nodiscard]] LinearScratchSize ggufDecodeScratchSize(LinearWorkload workload) const;
+  // The scratch of every tile a decode plan of the workload may take, the
+  // register tile's where it takes the projection's formats.
+  [[nodiscard]] LinearScratchSize ggufDecodeScratchSize(LinearWorkload workload, bool registerFormats) const;
   void addGguf(metal::CommandGraph &graph, const LinearBuffers &buffers,
                const Projection &projection, const LinearPlan &plan,
                const Projection *gate) const;

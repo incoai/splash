@@ -17,13 +17,14 @@ The paths an assembly links, and what reads each:
                          which a release check runs on this installation
   target/<shard>         the MLX safetensors shards except those holding only
                          vision_tower.* (SafetensorsCheckpoint.mm)
-  target/<name>.gguf     the GGUF target (GgufTarget.cpp findTargetGguf)
+  target/<name>.gguf     the GGUF target, or the parts of a split one
+                         (GgufTarget.cpp findTargetGgufs)
   tokenizer/config.json  the same configuration again, from which the
                          server's AutoTokenizer.from_pretrained chooses the
                          tokenizer class
   tokenizer/<file>       the MLX tokenizer files, or tokenizer.json,
                          tokenizer_config.json and chat_template.jinja derived
-                         from the GGUF (server.py --tokenizer)
+                         from the GGUF (server.py main)
   draft/config.json, draft/<name>.safetensors
                          the DFlash2 checkpoint (ModelDescriptor.mm,
                          DraftCheckpoint.cpp)
@@ -107,18 +108,23 @@ def _write_durably(path, data):
         os.fsync(stream.fileno())
 
 
-def file_record(path: Path):
+def file_record(path: Path, recorded=None):
     """What model.json records of a linked file: its path, size and times,
     which verify compares on every start, and its content digest, which
-    verify(full=True) recomputes (_digest_of)."""
+    verify(full=True) recomputes (_digest_of). recorded, the record an
+    earlier assembly keeps of the file, gives the digest without reading the
+    file while it keeps the path, size and times recorded, as verify trusts
+    them to."""
     stat = path.stat()
-    return {
+    record = {
         "path": str(path.absolute()),
         "bytes": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
         "ctime_ns": stat.st_ctime_ns,
-        "digest": _digest(path),
     }
+    if recorded and all(recorded[key] == value for key, value in record.items()):
+        return record | {"digest": recorded["digest"]}
+    return record | {"digest": _digest(path)}
 
 
 def _digest(path):
@@ -228,15 +234,15 @@ def pins(record):
     return sorted(snapshots.items())
 
 
-def recorded_pins(link: Path):
-    """pins of the assembly a selection link names, as its record states
-    them whether or not the assembly still verifies; none without a record
-    of the shape build writes."""
+def recorded(link: Path):
+    """The record of the assembly a selection link names, whether or not the
+    assembly still verifies; None without a record of the shape build
+    writes."""
     try:
         record = models.read_json(link / "model.json")
     except models.ModelError:
-        return []
-    return pins(record) if _well_formed(record) else []
+        return None
+    return record if _well_formed(record) else None
 
 
 def _metadata_inputs(files):
@@ -271,17 +277,27 @@ def metadata_key(file_records):
     )
 
 
-def derived_metadata(models_root: Path, files):
+def derived_metadata(models_root: Path, files, records):
     """The key and the files, by assembly path, of the metadata derived from
     the GGUF files among files (assembly path -> source file): derived once,
-    and again when its entry is damaged. Call it under the installation lock."""
-    inputs = [files[name] for name in _metadata_inputs(files)]
-    sources = [file_record(path) for path in inputs]
+    and again when its entry is damaged. records maps each source file to
+    its record (file_record). Call it under the installation lock."""
+    names = _metadata_inputs(files)
+    inputs = [files[name] for name in names]
+    sources = [records[path] for path in inputs]
     key = _metadata_key(sources)
+    # A split target's metadata is its first file's (split order is name
+    # order); the vision projector comes last.
+    derive = [inputs[0]] + ([files[GGUF_VISION]] if GGUF_VISION in files else [])
 
     def write(stage):
-        contents = gguf.derived_files(*inputs)
-        if [file_record(path) for path in inputs] != sources:
+        contents = gguf.derived_files(*derive)
+        # A source written while it was read no longer has its record's times.
+        current = [
+            file_record(path, source)
+            for path, source in zip(inputs, sources, strict=True)
+        ]
+        if current != sources:
             raise models.ModelError("GGUF source changed while reading metadata")
         for name, data in contents.items():
             _write_durably(stage / name, data)
@@ -307,16 +323,34 @@ def _check_metadata(entry):
             raise models.ModelError("prepared GGUF metadata changed: " + name)
 
 
-def hold(link: Path, models_root: Path):
-    """The assembly a selection link serves from, and what holds it: its
-    model.json opened under a shared lock. While that file is open, in this
-    process or one that inherited it, collect_garbage keeps the assembly. The
-    link is read under the installation lock, where collection runs, so there
-    is no moment the assembly is neither linked nor held."""
-    with models.installation_lock(models_root):
-        assembly = link.resolve(strict=True)
-        record = (assembly / "model.json").open("rb")
-        fcntl.flock(record, fcntl.LOCK_SH)
+def hold(path: Path):
+    """The assembly path names, an assembly or a selection link to one, and
+    what holds it: its model.json opened under a shared lock. While that
+    file is open, in this process or one that inherited it, collect_garbage
+    keeps the assembly. path is read under the installation lock of the
+    models root the assembly was built in (MODELS/.resolved/<record>), which
+    may be another checkout's, where collection runs, so there is no moment
+    the assembly is neither linked nor held; the lock needs write access to
+    that root. A ModelError refuses a path that names no assembly, such as
+    one collection removed, and one the file system keeps from being held,
+    such as in a root this process cannot write."""
+    resolved = path.resolve().parent
+    if resolved.name != ".resolved":
+        raise models.ModelError(f"{path} is not a model directory Splash prepared")
+    models_root = resolved.parent
+    try:
+        with models.installation_lock(models_root):
+            assembly = path.resolve(strict=True)
+            record = (assembly / "model.json").open("rb")
+            fcntl.flock(record, fcntl.LOCK_SH)
+    except (FileNotFoundError, NotADirectoryError) as error:
+        raise models.ModelError(
+            f"{path} names no model Splash prepared: prepare the model again"
+        ) from error
+    except OSError as error:
+        raise models.ModelError(
+            f"cannot hold {path} in {models_root}: {error}"
+        ) from error
     return assembly, record
 
 

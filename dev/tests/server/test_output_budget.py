@@ -126,6 +126,26 @@ class OutputBudgetTests(HarnessTestCase):
                     stop_reason = json.loads(payload)["stop_reason"]
                 self.assertEqual(stop_reason, expected)
 
+    def test_anthropic_reports_the_context_window_when_the_engine_bounds_it(self):
+        # The engine ended the response short of max_tokens, at what the SSD
+        # cache or memory holds of the context: within the window, max_tokens
+        # 7 was not lowered.
+        harness = self.harness(
+            FakeRuntime(*(Plan([[4]], reason="bounded") for _ in range(2))),
+            max_context=10,
+        )
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                status, _, payload = harness.request(
+                    "POST", "/v1/messages", anthropic_body(max_tokens=7, stream=stream)
+                )
+                self.assertEqual(status, 200, payload)
+                if stream:
+                    stop_reason = response_events(payload)[-2]["delta"]["stop_reason"]
+                else:
+                    stop_reason = json.loads(payload)["stop_reason"]
+                self.assertEqual(stop_reason, "model_context_window_exceeded")
+
     def test_default_output_budget_uses_remaining_context(self):
         runtime = FakeRuntime()
         harness = self.harness(runtime, max_context=10)

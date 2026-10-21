@@ -2,6 +2,7 @@ import base64
 import json
 import time
 import unittest
+from contextlib import nullcontext
 from unittest import mock
 
 from dev.tests.server_fixtures import (
@@ -37,6 +38,7 @@ class PdfProtocolTests(unittest.TestCase):
             ],
             vision=True,
             deadline=deadline,
+            without_slot=nullcontext,
         )
 
     def test_protocols_share_rendered_pages_and_preserve_order(self):
@@ -57,7 +59,10 @@ class PdfProtocolTests(unittest.TestCase):
             ],
         )
         actual = api_shapes.normalize_messages(
-            response["messages"], vision=True, deadline=FOREVER
+            response["messages"],
+            vision=True,
+            deadline=FOREVER,
+            without_slot=nullcontext,
         )[0]["content"]
         self.assertEqual(
             actual,
@@ -233,7 +238,9 @@ class PdfProtocolTests(unittest.TestCase):
             with mock.patch.object(
                 api_shapes, "DocumentBudget", return_value=request_budget
             ):
-                api_shapes.normalize_messages(messages, vision=True, deadline=FOREVER)
+                api_shapes.normalize_messages(
+                    messages, vision=True, deadline=FOREVER, without_slot=nullcontext
+                )
 
         for dialect in ("chat", "responses"):
             with self.subTest(dialect=dialect):
@@ -297,6 +304,7 @@ class PdfProtocolTests(unittest.TestCase):
                         [{"role": "user", "content": [{"type": "file", "file": file}]}],
                         vision=True,
                         deadline=FOREVER,
+                        without_slot=nullcontext,
                     )
 
     def test_input_bound_checked_before_decode(self):

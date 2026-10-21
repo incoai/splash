@@ -356,8 +356,8 @@ class JsonResponseTests(unittest.TestCase):
             ({"type": "object"}, json.dumps({"pair": "🌍"}), {"pair": "🌍"}),
             ({"type": "string"}, r"\ud800", r"\ud800"),
             ({"type": "object"}, json.dumps({"text": r"\ud800"}), {"text": r"\ud800"}),
-            # A value of any type is the JSON its text spells.
-            ({}, json.dumps(nested), nested),
+            # A value of no type its schema gives is the text as written.
+            ({}, json.dumps(nested), json.dumps(nested)),
             ({"type": "string"}, TEXT * 400, TEXT * 400),
         )
         for schema, raw, expected in cases:

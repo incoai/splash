@@ -162,6 +162,61 @@ class ThinkingTokenBudgetTests(unittest.TestCase):
             [{"reasoning_tokens": 5}] * 4,
         )
 
+    def test_a_think_end_after_the_forced_end_is_dropped_from_the_answer(self):
+        # Under a budget of 3 the engine ends the thinking with "first
+        # second\n" and </think> (the fake vocabulary's 26). A model may write
+        # </think> again in its answer; only that tag is dropped.
+        end = (14, 15, 26)
+        output = [[1, 1, 1], list(end), [27], [26], [27]]
+        runtime = fixtures.FakeRuntime(*(fixtures.Plan(output) for _ in range(4)))
+        harness = fixtures.Harness(runtime, thinking_end=end)
+        self.addCleanup(harness.close)
+        chat = fixtures.chat_body(max_tokens=32, thinking_token_budget=3)
+        responses = fixtures.responses_body(
+            max_output_tokens=32, thinking_token_budget=3
+        )
+        answers = []
+        with mock.patch.object(backend_api, "THINK_END_TOKEN_ID", 26):
+            for path, body, stream in (
+                ("/v1/chat/completions", chat, False),
+                ("/v1/chat/completions", chat, True),
+                ("/v1/responses", responses, False),
+                ("/v1/responses", responses, True),
+            ):
+                if stream:
+                    body = {**body, "stream": True}
+                status, _, payload = harness.request("POST", path, body)
+                self.assertEqual(status, 200, payload)
+                if path == "/v1/chat/completions":
+                    if stream:
+                        answers.append(
+                            "".join(
+                                choice["delta"].get("content") or ""
+                                for chunk in fixtures.stream_events(payload)
+                                for choice in chunk["choices"]
+                            )
+                        )
+                    else:
+                        answers.append(
+                            json.loads(payload)["choices"][0]["message"]["content"]
+                        )
+                else:
+                    response = (
+                        fixtures.response_events(payload)[-1]["response"]
+                        if stream
+                        else json.loads(payload)
+                    )
+                    answers.append(
+                        "".join(
+                            part["text"]
+                            for item in response["output"]
+                            if item["type"] == "message"
+                            for part in item["content"]
+                        )
+                    )
+        self.assertEqual(self.frames(runtime), [budget(3, 26, end)] * 4)
+        self.assertEqual(answers, ["answer\nanswer\n"] * 4)
+
     def test_a_budget_must_be_a_non_negative_integer_or_minus_one(self):
         harness, runtime = self.harness()
         for value in (-2, 1.5, "8", True, [8]):
@@ -308,8 +363,6 @@ class ThinkingEndTextTests(unittest.TestCase):
         args = server.parse_args(
             [
                 "model",
-                "--tokenizer",
-                "tokenizer",
                 "--model",
                 "owner/model",
                 "--thinking-end-text=Time is up.",
@@ -318,6 +371,7 @@ class ThinkingEndTextTests(unittest.TestCase):
         http = mock.Mock()
         with (
             mock.patch.object(server, "parse_args", return_value=args),
+            fixtures.unprepared_hold(),
             mock.patch.object(server.signal, "signal"),
             mock.patch.object(server, "load_thinking_key", return_value=None),
             mock.patch.object(

@@ -35,15 +35,13 @@ bool parseContext(std::string_view value,
          result <= capabilities.maximumContextTokens;
 }
 
-uint32_t parseMaxContext(std::string_view value,
-                         const model::ModelCapabilities &capabilities) {
+// MAX_CONTEXT, zero for auto; the model bounds it (model::servedFor).
+uint32_t parseMaxContext(std::string_view value) {
   if (value == "auto")
     return 0;
   uint32_t result = 0;
-  if (!parseContext(value, capabilities, result)) {
-    throw UsageError("MAX_CONTEXT must be auto or an integer in [1, " +
-                     std::to_string(capabilities.maximumContextTokens) + "]");
-  }
+  if (!parsePositive(value, result))
+    throw UsageError("MAX_CONTEXT must be auto or a positive integer");
   return result;
 }
 
@@ -75,6 +73,19 @@ double parseDecodeShare(std::string_view value) {
   double result = 0.0;
   if (!parseFinite(value, result) || result < 0.0)
     throw UsageError("--decode-share requires a nonnegative number");
+  return result;
+}
+
+// BYTES|auto|off, as the server writes the memory of a store of streamed
+// weights (--expert-memory, --ple-memory).
+StreamedSetting parseStreamedSetting(std::string_view option, std::string_view value) {
+  if (value == "auto")
+    return {};
+  if (value == "off")
+    return {StreamedSetting::Mode::Off, 0};
+  StreamedSetting result{StreamedSetting::Mode::Size, 0};
+  if (!parsePositive(value, result.bytes))
+    throw UsageError(std::string(option) + " requires a positive byte count, auto or off");
   return result;
 }
 
@@ -142,10 +153,27 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "prevent" && value != "allow")
         throw UsageError("--idle-sleep requires prevent or allow");
       result.preventIdleSleep = value == "prevent";
+    } else if (option == "--ple-memory") {
+      result.pleMemory = parseStreamedSetting(option, value);
+    } else if (option == "--expert-memory") {
+      result.expertMemory = parseStreamedSetting(option, value);
+    } else if (option == "--sparse-kv-memory") {
+      uint64_t bytes = 0;
+      if (value != "auto" && !parsePositive(value, bytes))
+        throw UsageError("--sparse-kv-memory requires a positive byte count or auto");
+      result.sparseKvMemory = bytes ? std::optional<uint64_t>(bytes) : std::nullopt;
+    } else if (option == "--kv-spill") {
+      if (value != "always")
+        throw UsageError("--kv-spill requires always");
+      result.kvSpillAlways = true;
     } else if (option == "--ane") {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");
       result.neuralEngine = value == "on";
+    } else if (option == "--verify-rows") {
+      if (value != "auto" && value != "all")
+        throw UsageError("--verify-rows requires auto or all");
+      result.verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
     } else if (option == "--relaunch-context") {
       relaunchContext = value;
     } else {
@@ -159,8 +187,13 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
   if (!result.cacheRoot.empty() && !result.persistentCache)
     throw UsageError("--cache-dir requires --persistent-cache on");
   result.modelRoot = requireModelRoot(argv[2]);
-  result.model = model::inspectModelRoot(result.modelRoot);
-  result.maxContext = parseMaxContext(argv[3], result.model.capabilities);
+  model::ModelDescriptor inspected = model::inspectModelRoot(result.modelRoot);
+  result.maxContext = parseMaxContext(argv[3]);
+  try {
+    result.model = model::servedFor(std::move(inspected), result.maxContext);
+  } catch (const std::invalid_argument &error) {
+    throw UsageError(std::string("MAX_CONTEXT: ") + error.what());
+  }
   if (relaunchContext) {
     if (result.maxContext)
       throw UsageError("--relaunch-context requires MAX_CONTEXT auto");

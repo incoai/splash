@@ -32,6 +32,10 @@ struct SlotFile::Backing {
   uint64_t slotBytes = 0;
   std::shared_ptr<DiskBudget> budget;
   std::atomic<bool> failed{false};
+  // Where each segment of a payload ends (Options::segments); empty when the
+  // whole payload, whatever its size, is one.
+  std::vector<uint64_t> segmentEnds;
+  std::function<bool()> deferWrites;
   // A persistent file's record file, the label each record holds, the size
   // of a record and a cleared one.
   bool persistent = false;
@@ -47,6 +51,9 @@ struct SlotFile::Backing {
   // Freed slots whose blocks go back before the next operation runs.
   std::vector<uint32_t> punches;
   std::deque<Work> work;
+  // The reads in it, which every write ahead of them delays: while any
+  // waits, a write holds back for no other reads (Options::deferWrites).
+  std::atomic<uint32_t> queuedReads{0};
   bool stopping = false;
   // A persistent file between opening and finishAdoption(): the worker
   // waits, and the slots are adoption's alone.
@@ -61,6 +68,24 @@ struct SlotFile::Backing {
     if (records >= 0) ::close(records);
   }
 
+  // A payload's segments, the one that holds its byte `offset`, and where
+  // segment `index` of a payload of payloadBytes starts and ends.
+  [[nodiscard]] size_t segments() const noexcept { return std::max<size_t>(1, segmentEnds.size()); }
+  [[nodiscard]] size_t segmentAt(uint64_t offset) const noexcept {
+    return static_cast<size_t>(std::ranges::upper_bound(segmentEnds, offset) - segmentEnds.begin());
+  }
+  [[nodiscard]] uint64_t segmentStart(size_t index) const noexcept {
+    return index ? segmentEnds[index - 1] : 0;
+  }
+  [[nodiscard]] uint64_t segmentEnd(size_t index, uint64_t payloadBytes) const noexcept {
+    return segmentEnds.empty() ? payloadBytes : segmentEnds[index];
+  }
+
+  // Moves a chunk whole between memory and the slot file at `offset`
+  // (moveChunk), counting what moved in the budget's totals.
+  bool load(std::span<std::byte> chunk, off_t offset) const noexcept;
+  bool store(std::span<const std::byte> chunk, off_t offset) const noexcept;
+
   // Marks a slot's blocks held; true when they were not.
   bool back(uint32_t index) {
     if (backed.size() <= index)
@@ -73,7 +98,10 @@ struct SlotFile::Backing {
 };
 
 SlotFile::Slot::Slot(std::shared_ptr<Backing> backing, uint32_t index)
-    : backing_(std::move(backing)), index_(index) {}
+    : backing_(std::move(backing)), index_(index) {
+  static std::atomic<uint64_t> ids{0};
+  id_ = ids.fetch_add(1, std::memory_order_relaxed) + 1;
+}
 SlotFile::Slot::~Slot() {
   if (!backing_) return;
   bool punch = false;
@@ -252,12 +280,16 @@ bool readAll(int descriptor, std::span<std::byte> bytes, off_t offset) {
 }
 
 // The record file: a header naming what the slots are for, then one record
-// per slot index. A record is the payload's size and CRC-32C, the slot's
-// label, and a CRC-32C of all of that; an all-zero record is a free slot.
-// Fields are stored as this host lays them out: Splash runs on
-// little-endian arm64 only.
+// per slot index. A record is the payload's size and the CRC-32C of each of
+// its segments, the first in the head, the slot's label, and a CRC-32C of
+// all of that; an all-zero record is a free slot. With one segment that is
+// version 1; with several, version 2, whose header also names them after the
+// tag, run by run: a length and how many segments in a row have it. Fields
+// are stored as this host lays them out: Splash runs on little-endian arm64
+// only.
 constexpr char kRecordsMagic[8] = {'S', 'P', 'L', 'A', 'S', 'H', 'S', 'F'};
 constexpr uint32_t kRecordsVersion = 1;
+constexpr uint32_t kSegmentedRecordsVersion = 2;
 constexpr off_t kRecordsHeaderBytes = 4096;
 constexpr uint32_t kRecordMagic = 0x53524543;
 
@@ -272,36 +304,54 @@ struct RecordsHeader final {
 
 struct RecordHead final {
   uint32_t magic;
-  uint32_t payloadChecksum;
+  uint32_t firstChecksum;
   uint64_t payloadBytes;
+};
+
+// A run of segments of one length (version 2's header).
+struct SegmentRun final {
+  uint64_t bytes;
+  uint64_t count;
 };
 
 static_assert(std::endian::native == std::endian::little);
 static_assert(std::is_trivially_copyable_v<RecordsHeader> && sizeof(RecordsHeader) == 32);
 static_assert(std::is_trivially_copyable_v<RecordHead> && sizeof(RecordHead) == 16);
+static_assert(std::is_trivially_copyable_v<SegmentRun> && sizeof(SegmentRun) == 16);
 
-// The header and the tag after it; its checksum covers both.
+// The header and the tag after it, then the segments' runs; its checksum
+// covers all of it.
 std::vector<std::byte> recordsHeader(uint64_t slotBytes, uint32_t labelBytes,
-                                     std::span<const std::byte> tag) {
-  if (sizeof(RecordsHeader) + tag.size() > kRecordsHeaderBytes)
+                                     std::span<const std::byte> tag,
+                                     std::span<const uint64_t> segmentEnds) {
+  std::vector<SegmentRun> runs;
+  for (uint64_t start = 0; const uint64_t end : segmentEnds) {
+    if (!runs.empty() && runs.back().bytes == end - start) ++runs.back().count;
+    else runs.push_back({end - start, 1});
+    start = end;
+  }
+  const auto named = std::as_bytes(std::span(runs));
+  if (sizeof(RecordsHeader) + tag.size() + named.size() > kRecordsHeaderBytes)
     throw std::invalid_argument("slot file tag is too long");
   RecordsHeader header{};
   std::memcpy(header.magic, kRecordsMagic, sizeof(header.magic));
-  header.version = kRecordsVersion;
+  header.version = segmentEnds.empty() ? kRecordsVersion : kSegmentedRecordsVersion;
   header.labelBytes = labelBytes;
   header.slotBytes = slotBytes;
-  header.tagBytes = static_cast<uint32_t>(tag.size());
-  std::vector<std::byte> bytes(sizeof(header) + tag.size());
+  header.tagBytes = static_cast<uint32_t>(tag.size() + named.size());
+  std::vector<std::byte> bytes(sizeof(header));
+  bytes.insert(bytes.end(), tag.begin(), tag.end());
+  bytes.insert(bytes.end(), named.begin(), named.end());
   std::memcpy(bytes.data(), &header, sizeof(header));
-  std::memcpy(bytes.data() + sizeof(header), tag.data(), tag.size());
   header.checksum = crc32c(bytes);
   std::memcpy(bytes.data(), &header, sizeof(header));
   return bytes;
 }
 
-uint64_t recordBytesFor(uint32_t labelBytes) noexcept {
+uint64_t recordBytesFor(uint32_t labelBytes, size_t segments) noexcept {
   constexpr uint64_t alignment = 64;
-  const uint64_t bytes = sizeof(RecordHead) + uint64_t{labelBytes} + sizeof(uint32_t);
+  const uint64_t bytes = sizeof(RecordHead) + (segments - 1) * sizeof(uint32_t) + uint64_t{labelBytes} +
+                         sizeof(uint32_t);
   return (bytes + alignment - 1) / alignment * alignment;
 }
 
@@ -310,33 +360,80 @@ off_t recordOffset(uint64_t index, uint64_t recordBytes) {
 }
 
 std::vector<std::byte> encodeRecord(uint64_t recordBytes, uint64_t payloadBytes,
-                                    uint32_t payloadChecksum,
+                                    std::span<const uint32_t> checksums,
                                     std::span<const std::byte> label) {
   std::vector<std::byte> record(recordBytes);
-  const RecordHead head{kRecordMagic, payloadChecksum, payloadBytes};
+  const RecordHead head{kRecordMagic, checksums.front(), payloadBytes};
+  const auto rest = std::as_bytes(checksums.subspan(1));
   std::memcpy(record.data(), &head, sizeof(head));
-  std::memcpy(record.data() + sizeof(head), label.data(), label.size());
-  const size_t covered = sizeof(head) + label.size();
+  std::memcpy(record.data() + sizeof(head), rest.data(), rest.size());
+  std::memcpy(record.data() + sizeof(head) + rest.size(), label.data(), label.size());
+  const size_t covered = sizeof(head) + rest.size() + label.size();
   const uint32_t checksum = crc32c(std::span(record).first(covered));
   std::memcpy(record.data() + covered, &checksum, sizeof(checksum));
   return record;
 }
 
-// The record's slot, or nothing for a free index or a damaged record.
+// The record's slot, or nothing for a free index or a damaged record. Its
+// payload is `segmentedBytes` in a file of several segments, else at most
+// a slot.
 std::optional<SlotRecord> decodeRecord(std::span<const std::byte> record, uint32_t index,
-                                       uint32_t labelBytes, uint64_t slotBytes) {
+                                       uint32_t labelBytes, size_t segments, uint64_t slotBytes,
+                                       uint64_t segmentedBytes) {
   RecordHead head;
   std::memcpy(&head, record.data(), sizeof(head));
-  if (head.magic != kRecordMagic || !head.payloadBytes || head.payloadBytes > slotBytes)
+  if (head.magic != kRecordMagic || !head.payloadBytes || head.payloadBytes > slotBytes ||
+      (segmentedBytes && head.payloadBytes != segmentedBytes))
     return std::nullopt;
-  const size_t covered = sizeof(head) + labelBytes;
+  const size_t rest = (segments - 1) * sizeof(uint32_t);
+  const size_t covered = sizeof(head) + rest + labelBytes;
   uint32_t checksum;
   std::memcpy(&checksum, record.data() + covered, sizeof(checksum));
   if (checksum != crc32c(record.first(covered)))
     return std::nullopt;
-  const auto label = record.subspan(sizeof(head), labelBytes);
-  return SlotRecord{index, head.payloadBytes, head.payloadChecksum, {label.begin(), label.end()}};
+  std::vector<uint32_t> checksums(segments);
+  checksums.front() = head.firstChecksum;
+  std::memcpy(checksums.data() + 1, record.data() + sizeof(head), rest);
+  const auto label = record.subspan(sizeof(head) + rest, labelBytes);
+  return SlotRecord{index, head.payloadBytes, std::move(checksums), {label.begin(), label.end()}};
 }
+
+// The CRC-32C of each segment of a payload whose bytes come in order: of
+// the whole payload as one without segments (Backing::segmentEnds).
+class SegmentChecksums final {
+public:
+  explicit SegmentChecksums(std::span<const uint64_t> segmentEnds) : ends_(segmentEnds) {
+    checksums_.reserve(std::max<size_t>(1, ends_.size()));
+  }
+  void add(std::span<const std::byte> bytes) {
+    while (!bytes.empty()) {
+      const uint64_t end =
+          checksums_.size() < ends_.size() ? ends_[checksums_.size()] : std::numeric_limits<uint64_t>::max();
+      const auto piece = bytes.first(static_cast<size_t>(std::min<uint64_t>(bytes.size(), end - offset_)));
+      crc_ = crc32c(piece, crc_);
+      offset_ += piece.size();
+      bytes = bytes.subspan(piece.size());
+      if (offset_ == end) {
+        checksums_.push_back(crc_);
+        crc_ = 0;
+      }
+    }
+  }
+  // Once every byte of the payload came.
+  [[nodiscard]] std::vector<uint32_t> take() {
+    if (ends_.empty()) checksums_.push_back(crc_);
+    return std::move(checksums_);
+  }
+
+private:
+  std::span<const uint64_t> ends_;
+  std::vector<uint32_t> checksums_;
+  uint64_t offset_ = 0;
+  uint32_t crc_ = 0;
+};
+
+// How often a write's chunk looks again whether the reads it waits for ended.
+constexpr auto kDeferralPoll = std::chrono::microseconds(100);
 
 int openPersistent(const std::filesystem::path &path, const char *what) {
   const int descriptor = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
@@ -353,9 +450,27 @@ uint64_t fileBytes(int descriptor, const char *what) {
 }
 } // namespace
 
-SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget)
+bool SlotFile::Backing::load(std::span<std::byte> chunk, off_t offset) const noexcept {
+  return moveChunk(chunk, offset, [this](std::byte *data, size_t bytes, off_t at) {
+    const auto count = ::pread(descriptor, data, bytes, at);
+    if (count > 0)
+      budget->read_.fetch_add(count, std::memory_order_relaxed);
+    return count;
+  });
+}
+
+bool SlotFile::Backing::store(std::span<const std::byte> chunk, off_t offset) const noexcept {
+  return moveChunk(chunk, offset, [this](const std::byte *data, size_t bytes, off_t at) {
+    const auto count = ::pwrite(descriptor, data, bytes, at);
+    if (count > 0)
+      budget->written_.fetch_add(count, std::memory_order_relaxed);
+    return count;
+  });
+}
+
+SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget, const Options &options)
     : backing_(std::make_shared<Backing>()) {
-  prepare(slotBytes, std::move(budget));
+  prepare(slotBytes, std::move(budget), options);
   std::string name = (std::filesystem::temp_directory_path() / "splash-cache-XXXXXX").string();
   backing_->descriptor = ::mkstemp(name.data());
   if (backing_->descriptor < 0)
@@ -370,14 +485,14 @@ SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget)
 }
 
 SlotFile::SlotFile(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget,
-                   const Persistence &persistence)
+                   const Persistence &persistence, const Options &options)
     : backing_(std::make_shared<Backing>()) {
-  prepare(slotBytes, std::move(budget));
+  prepare(slotBytes, std::move(budget), options);
   open(persistence);
   worker_ = std::thread([this] { run(); });
 }
 
-void SlotFile::prepare(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget) {
+void SlotFile::prepare(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget, const Options &options) {
   if (!budget)
     throw std::invalid_argument("slot file needs a disk budget");
   const uint64_t capacityBytes = budget->capacityBytes();
@@ -388,6 +503,15 @@ void SlotFile::prepare(uint64_t slotBytes, std::shared_ptr<DiskBudget> budget) {
     throw std::invalid_argument("slot file quota holds no slot");
   if (slotBytes % kHostPageBytes)
     throw std::invalid_argument("slot size is not aligned for uncached IO");
+  if (options.segments.size() > 1) {
+    for (uint64_t end = 0; const uint64_t bytes : options.segments) {
+      if (!bytes || bytes > slotBytes - end)
+        throw std::invalid_argument("slot file segments do not fit its slots");
+      end += bytes;
+      backing_->segmentEnds.push_back(end);
+    }
+  }
+  backing_->deferWrites = options.deferWrites;
   backing_->slotBytes = slotBytes;
   backing_->budget = std::move(budget);
   // A write past the file-size limit (ulimit -f, a launchd FileSize) raises
@@ -417,10 +541,10 @@ void SlotFile::open(const Persistence &persistence) {
     throw std::invalid_argument("a persistent slot file needs a label size");
   backing.persistent = true;
   backing.labelBytes = persistence.labelBytes;
-  backing.recordBytes = recordBytesFor(persistence.labelBytes);
+  backing.recordBytes = recordBytesFor(persistence.labelBytes, backing.segments());
   backing.clearedRecord.assign(backing.recordBytes, std::byte{0});
   const std::vector<std::byte> header =
-      recordsHeader(backing.slotBytes, backing.labelBytes, persistence.tag);
+      recordsHeader(backing.slotBytes, backing.labelBytes, persistence.tag, backing.segmentEnds);
   backing.descriptor = openPersistent(persistence.slots, "open slot file");
   uncache();
   backing.records = openPersistent(persistence.records, "open slot record file");
@@ -447,8 +571,8 @@ void SlotFile::open(const Persistence &persistence) {
     throw std::system_error(errno, std::generic_category(), "read slot records");
   for (uint64_t index = 0; index < records.size() / backing.recordBytes; ++index) {
     const auto record = std::span(records).subspan(index * backing.recordBytes, backing.recordBytes);
-    if (auto slot = decodeRecord(record, static_cast<uint32_t>(index), backing.labelBytes,
-                                 backing.slotBytes))
+    if (auto slot = decodeRecord(record, static_cast<uint32_t>(index), backing.labelBytes, backing.segments(),
+                                 backing.slotBytes, backing.segmentEnds.empty() ? 0 : backing.segmentEnds.back()))
       records_.push_back(std::move(*slot));
   }
 }
@@ -465,7 +589,7 @@ SlotFile::~SlotFile() {
   worker_.join();
 }
 
-std::shared_ptr<SlotFile::Slot> SlotFile::acquire() {
+std::shared_ptr<SlotFile::Slot> SlotFile::acquire(DiskBudget::Draw draw) {
   auto slot = std::shared_ptr<Slot>(new Slot({}, 0));
   std::lock_guard lock(backing_->mutex);
   if (backing_->adopting)
@@ -482,7 +606,7 @@ std::shared_ptr<SlotFile::Slot> SlotFile::acquire() {
         list->reserve(std::max<size_t>(1, 2 * list->capacity()));
     }
   }
-  if (!backing_->budget->reserve(backing_->slotBytes)) return {};
+  if (!backing_->budget->reserve(backing_->slotBytes, draw)) return {};
   uint32_t index;
   if (!backing_->free.empty()) {
     index = backing_->free.back();
@@ -541,7 +665,7 @@ std::shared_ptr<SlotFile::Slot> SlotFile::adopt(const SlotRecord &record) {
   if (!backing.adopting)
     throw std::logic_error("slots are adopted only while a persistent slot file opens");
   if (record.index >= adopted_.size() || adopted_[record.index] || !record.payloadBytes ||
-      record.payloadBytes > backing.slotBytes)
+      record.payloadBytes > backing.slotBytes || record.checksums.size() != backing.segments())
     throw std::invalid_argument("adopted slot is not one of this file's records");
   // Room for every index in the free and punch lists, as acquire() makes
   // it, so that returning a slot never needs to allocate.
@@ -555,10 +679,10 @@ std::shared_ptr<SlotFile::Slot> SlotFile::adopt(const SlotRecord &record) {
     backing.budget->file_.fetch_add(backing.slotBytes, std::memory_order_relaxed);
   slot->backing_ = backing_;
   slot->index_ = record.index;
-  slot->written_ = true;
   slot->payloadBytes_ = record.payloadBytes;
-  slot->checksum_ = record.checksum;
-  slot->verify_ = true;
+  slot->checksums_ = record.checksums;
+  slot->verify_.store(true, std::memory_order_relaxed);
+  slot->written_.store(true, std::memory_order_relaxed);
   slot->returnsBlocks_ = true;
   return slot;
 }
@@ -620,10 +744,10 @@ void SlotFile::label(std::shared_ptr<Slot> slot, std::vector<std::byte> label) {
   static_cast<void>(submit(
       [slot, label = std::move(label)](std::span<std::byte>, const std::atomic<bool> &) {
         const Backing &backing = *slot->backing_;
-        if (!slot->written_) return false;
+        if (!slot->written_.load(std::memory_order_relaxed)) return false;
         return writeAll(backing.records,
                         encodeRecord(backing.recordBytes, slot->payloadBytes_,
-                                     slot->checksum_, label),
+                                     slot->checksums_, label),
                         recordOffset(slot->index_, backing.recordBytes));
       },
       {}));
@@ -645,8 +769,8 @@ void SlotFile::seal() noexcept {
   backing_->sealed = true;
 }
 
-std::shared_ptr<SlotFile::Operation> SlotFile::submit(Run run,
-                                                     std::function<void()> completion) {
+std::shared_ptr<SlotFile::Operation> SlotFile::submit(Run run, std::function<void()> completion,
+                                                     bool read) {
   auto operation = std::make_shared<Operation>();
   {
     std::lock_guard lock(backing_->mutex);
@@ -654,7 +778,9 @@ std::shared_ptr<SlotFile::Operation> SlotFile::submit(Run run,
       throw std::logic_error("slot file is shutting down");
     if (backing_->adopting)
       throw std::logic_error("a persistent slot file takes operations only after adoption");
-    backing_->work.push_back({operation, std::move(run), std::move(completion)});
+    backing_->work.push_back({operation, std::move(run), std::move(completion), read});
+    if (read)
+      backing_->queuedReads.fetch_add(1, std::memory_order_relaxed);
   }
   backing_->wake.notify_one();
   return operation;
@@ -682,6 +808,8 @@ void SlotFile::run() {
       if (backing.work.empty()) return;
       work = std::move(backing.work.front());
       backing.work.pop_front();
+      if (work.read)
+        backing.queuedReads.fetch_sub(1, std::memory_order_relaxed);
     }
     bool success = false;
     try { success = work.run({buffer_.get(), kChunkBytes}, work.operation->cancelled_); }
@@ -731,29 +859,42 @@ void SlotFile::punchHole(uint32_t index) noexcept {
 // scatters each into them, ignoring the slot past them. A chunk of a span
 // the file can move straight skips the buffer. Every pwrite and pread is an
 // aligned range of the slot, and cancellation is noticed before each chunk.
-// In a persistent file a write checksums its spans as they go, and the first
-// read of an adopted slot checks them.
+// In a persistent file a write checksums each segment of its spans as they
+// go, and the first read of an adopted slot checks them.
 std::shared_ptr<SlotFile::Operation> SlotFile::write(
     std::shared_ptr<Slot> slot, std::vector<std::span<const std::byte>> source,
     std::function<void()> completion) {
-  if (!slot || slot->backing_ != backing_ || totalBytes(source) > backing_->slotBytes)
+  const uint64_t payloadBytes = totalBytes(source);
+  if (!slot || slot->backing_ != backing_ || payloadBytes > backing_->slotBytes ||
+      (!backing_->segmentEnds.empty() && payloadBytes != backing_->segmentEnds.back()))
     throw std::invalid_argument("slot write does not match this file's slots");
   if (!writable())
     return nullptr;
   slot->returnsBlocks_ = true;
-  auto operation = submit([slot, source = std::move(source)](std::span<std::byte> buffer,
-                                                            const std::atomic<bool> &cancelled) {
+  auto operation = submit([slot, source = std::move(source), payloadBytes](std::span<std::byte> buffer,
+                                                                          const std::atomic<bool> &cancelled) {
     Backing &backing = *slot->backing_;
     const off_t start = slotOffset(slot->index_, backing.slotBytes);
-    const auto store = [&backing](const std::byte *data, size_t bytes, off_t offset) {
-      const auto count = ::pwrite(backing.descriptor, data, bytes, offset);
-      if (count > 0)
-        backing.budget->written_.fetch_add(count, std::memory_order_relaxed);
-      return count;
+    // Reads a step waits for go first: while they run, a chunk waits for
+    // them, a bounded while, unless a read of this file waits behind it.
+    const auto deferred = [&backing] {
+      return !backing.queuedReads.load(std::memory_order_relaxed) && backing.deferWrites();
     };
-    slot->written_ = false;
-    slot->verify_ = false;
-    uint32_t checksum = 0;
+    const auto defer = [&] {
+      if (!backing.deferWrites || !deferred()) return;
+      const auto began = AwakeClock::now();
+      do {
+        std::this_thread::sleep_for(kDeferralPoll);
+      } while (!cancelled.load(std::memory_order_relaxed) && deferred() &&
+               AwakeClock::now() - began < kWriteDeferral);
+      const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(AwakeClock::now() - began);
+      backing.budget->deferred_.fetch_add(static_cast<uint64_t>(waited.count()), std::memory_order_relaxed);
+    };
+    slot->written_.store(false, std::memory_order_relaxed);
+    slot->verify_.store(false, std::memory_order_relaxed);
+    std::optional<SegmentChecksums> checksums;
+    if (backing.persistent)
+      checksums.emplace(backing.segmentEnds);
     Pieces pieces(source);
     for (uint64_t done = 0; done < backing.slotBytes;) {
       if (cancelled.load(std::memory_order_relaxed)) return false;
@@ -763,8 +904,8 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
       if (!chunk.empty()) {
         chunk = chunk.first(kChunkBytes);
         pieces.skip(kChunkBytes);
-        if (backing.persistent)
-          checksum = crc32c(chunk, checksum);
+        if (checksums)
+          checksums->add(chunk);
       } else {
         const auto gathered = buffer.first(
             pieces.gatherBytes(std::min<uint64_t>(buffer.size(), backing.slotBytes - done)));
@@ -774,12 +915,13 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
           std::memcpy(gathered.data() + filled, piece.data(), piece.size());
           filled += piece.size();
         }
-        if (backing.persistent)
-          checksum = crc32c(gathered.first(filled), checksum);
+        if (checksums)
+          checksums->add(gathered.first(filled));
         std::memset(gathered.data() + filled, 0, gathered.size() - filled);
         chunk = gathered;
       }
-      if (!moveChunk(chunk, start + static_cast<off_t>(done), store)) {
+      defer();
+      if (!backing.store(chunk, start + static_cast<off_t>(done))) {
         // A full volume is the volume's, which the engine measures again
         // (DiskBudget::fullReported), and the file goes on. Any other error
         // stops it.
@@ -791,9 +933,9 @@ std::shared_ptr<SlotFile::Operation> SlotFile::write(
       }
       done += chunk.size();
     }
-    slot->payloadBytes_ = totalBytes(source);
-    slot->checksum_ = checksum;
-    slot->written_ = true;
+    slot->payloadBytes_ = payloadBytes;
+    slot->checksums_ = checksums ? checksums->take() : std::vector<uint32_t>{};
+    slot->written_.store(true, std::memory_order_release);
     return true;
   }, std::move(completion));
   backing_->budget->charge(backing_->slotBytes);
@@ -807,52 +949,84 @@ std::shared_ptr<SlotFile::Operation> SlotFile::read(
     throw std::invalid_argument("slot read does not match this file's slots");
   return submit([slot, destination = std::move(destination)](std::span<std::byte> buffer,
                                                              const std::atomic<bool> &cancelled) {
-    if (!slot->written_) return false;
+    if (!slot->written_.load(std::memory_order_acquire)) return false;
     Backing &backing = *slot->backing_;
     // The first read of an adopted slot reads its whole payload and checks
-    // it against the record.
-    const bool verify = slot->verify_;
+    // each segment against the record.
+    const bool verify = slot->verify_.load(std::memory_order_relaxed);
     if (verify && totalBytes(destination) != slot->payloadBytes_) return false;
-    uint32_t checksum = 0;
+    std::optional<SegmentChecksums> checksums;
+    if (verify)
+      checksums.emplace(backing.segmentEnds);
     const off_t start = slotOffset(slot->index_, backing.slotBytes);
-    const auto load = [&backing](std::byte *data, size_t bytes, off_t offset) {
-      const auto count = ::pread(backing.descriptor, data, bytes, offset);
-      if (count > 0)
-        backing.budget->read_.fetch_add(count, std::memory_order_relaxed);
-      return count;
-    };
     Pieces pieces(destination);
     for (uint64_t done = 0; !pieces.done();) {
       if (cancelled.load(std::memory_order_relaxed)) return false;
       const off_t offset = start + static_cast<off_t>(done);
       if (const auto run = pieces.directRun(); !run.empty()) {
         const auto chunk = run.first(kChunkBytes);
-        if (!moveChunk(chunk, offset, load)) return false;
-        if (verify)
-          checksum = crc32c(chunk, checksum);
+        if (!backing.load(chunk, offset)) return false;
+        if (checksums)
+          checksums->add(chunk);
         pieces.skip(kChunkBytes);
         done += kChunkBytes;
         continue;
       }
       const auto chunk = buffer.first(
           pieces.gatherBytes(std::min<uint64_t>(buffer.size(), backing.slotBytes - done)));
-      if (!moveChunk(chunk, offset, load)) return false;
+      if (!backing.load(chunk, offset)) return false;
       size_t used = 0;
       for (auto piece = pieces.next(chunk.size()); !piece.empty();
            piece = pieces.next(chunk.size() - used)) {
         std::memcpy(piece.data(), chunk.data() + used, piece.size());
         used += piece.size();
       }
-      if (verify)
-        checksum = crc32c(chunk.first(used), checksum);
+      if (checksums)
+        checksums->add(chunk.first(used));
       done += chunk.size();
     }
-    if (verify) {
-      if (checksum != slot->checksum_) return false;
-      slot->verify_ = false;
+    if (checksums) {
+      if (checksums->take() != slot->checksums_) return false;
+      slot->verify_.store(false, std::memory_order_relaxed);
     }
     return true;
-  }, std::move(completion));
+  }, std::move(completion), true);
+}
+
+// A slot read beside the worker, which writes it no more: it reads what the
+// write that landed stored (written_), and the pread is of whole aligned
+// units, which an uncached file moves at the drive's rate.
+std::optional<std::span<const std::byte>> SlotFile::readAt(const Slot &slot, uint64_t offset, uint64_t bytes,
+                                                           std::span<std::byte> buffer) const noexcept {
+  const Backing &backing = *backing_;
+  if (slot.backing_ != backing_ || !slot.written_.load(std::memory_order_acquire))
+    return std::nullopt;
+  const uint64_t payloadBytes = slot.payloadBytes_;
+  if (offset > payloadBytes || bytes > payloadBytes - offset)
+    return std::nullopt;
+  if (!bytes)
+    return buffer.first(0);
+  // An adopted slot's bytes count once every segment they lie in matches.
+  const bool verify = slot.verify_.load(std::memory_order_relaxed);
+  const size_t first = verify ? backing.segmentAt(offset) : 0;
+  const size_t last = verify ? backing.segmentAt(offset + bytes - 1) : 0;
+  const uint64_t begin = verify ? backing.segmentStart(first) : offset;
+  const uint64_t end = verify ? backing.segmentEnd(last, payloadBytes) : offset + bytes;
+  constexpr uint64_t unit = kSlotReadAlignmentBytes;
+  const uint64_t from = begin / unit * unit;
+  const uint64_t to = (end + unit - 1) / unit * unit;
+  if (reinterpret_cast<std::uintptr_t>(buffer.data()) % unit || buffer.size() < to - from)
+    return std::nullopt;
+  const off_t at = slotOffset(slot.index_, backing.slotBytes) + static_cast<off_t>(from);
+  if (!backing.load(buffer.first(to - from), at))
+    return std::nullopt;
+  for (size_t index = first; verify && index <= last; ++index) {
+    const uint64_t start = backing.segmentStart(index);
+    if (crc32c(buffer.subspan(start - from, backing.segmentEnd(index, payloadBytes) - start)) !=
+        slot.checksums_[index])
+      return std::nullopt;
+  }
+  return buffer.subspan(offset - from, bytes);
 }
 
 } // namespace splash::model

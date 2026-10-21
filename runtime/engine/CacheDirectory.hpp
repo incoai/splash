@@ -22,12 +22,16 @@ namespace splash::engine {
 // moment, so one a starting process is about to open can go first: the open
 // then makes it again, and that start begins cold.
 //
-// Two marks say how the last process ended. A serving process is marked
+// Marks say how the last processes ended. A serving process is marked
 // until it closes cleanly, so a start that finds the mark follows an
-// unclean end. A start that takes back a cache after an unclean end serves
-// on probation, marked until it has served long enough; a start that finds
-// that mark empties the cache, so a cached point that breaks the engine
-// cannot break every start after it.
+// unclean end. Every start serves on probation, marked until it has served
+// long enough. A start that finds that mark follows one that failed within
+// its probation and marks the failure; one that finds the failure marked
+// as well empties the cache, as does the start after an engine that
+// reported its own failure within probation (engineFailed). A cached point
+// that breaks the engine breaks every start that takes it back, so the
+// third start in a row begins empty, within the server's limit on failed
+// starts, while one kill or crash of another cause costs nothing.
 class CacheDirectory final {
 public:
   // A namespace is a name of this many lowercase hex digits, 128 bits of a
@@ -77,18 +81,21 @@ public:
   [[nodiscard]] std::filesystem::path kvRecords() const { return path_ / "kv.records"; }
   [[nodiscard]] std::filesystem::path stateSlots() const { return path_ / "state.slots"; }
   [[nodiscard]] std::filesystem::path stateRecords() const { return path_ / "state.records"; }
-  // Why this start found the cache emptied: the last start failed within
-  // its probation. Empty otherwise.
+  // Why this start found the cache emptied: starts failed within their
+  // probation. Empty otherwise.
   [[nodiscard]] const std::string &coldReason() const noexcept { return coldReason_; }
   // The last process served and did not close cleanly.
   [[nodiscard]] bool uncleanExit() const noexcept { return uncleanExit_; }
 
-  // Serving begins, on probation when this start took back a cache after an
-  // unclean end. Until close(), the process counts as ending uncleanly.
-  void beginServing(bool probation);
-  // The process has served long enough: a failure no longer empties the
-  // cache.
+  // Serving begins, on probation. Until close(), the process counts as
+  // ending uncleanly.
+  void beginServing();
+  // The process has served long enough: neither a failure of it nor one of
+  // the start before it counts toward emptying the cache.
   void endProbation();
+  // The engine reported its own failure: within probation, the next start
+  // empties the cache.
+  void engineFailed();
   // A clean end; the tier's files are already on the drive.
   void close();
 

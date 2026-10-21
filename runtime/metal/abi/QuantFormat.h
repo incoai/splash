@@ -27,8 +27,8 @@
 //   Every other field is a little-endian bit string of the 32 slots: IQ4 and
 //     MXFP4 indices (4 bits, so byte p of word c is pair p), BF16 and F16
 //     values (16, so word 4c + p is pair p), Q8_0 values (8), Q6_K high, Q3_K
-//     low, Q2_K and PQ2_0 bits (2), Q5_K, Q5_0 and Q5_1 fifth and Q3_K hmask
-//     bits (1).
+//     low, Q2_K, PQ2_0 and Q2_0 bits (2), Q5_K, Q5_0 and Q5_1 fifth and Q3_K
+//     hmask bits (1).
 //   IQ3_S word c: bits 0..7 and 8..15 the low grid index bits of elements
 //     4c..4c+3 and 16+4c..16+4c+3, 16..23 the sign bits of slots 8c..8c+7,
 //     24 and 25 the two ninth index bits, 26..29 the group's scale.
@@ -120,7 +120,8 @@
 #define GGUF_FMT_Q51 40u
 #define GGUF_FMT_BF16 41u
 #define GGUF_FMT_F16 42u
-#define GGUF_FMT_COUNT 43u
+#define GGUF_FMT_Q20 43u
+#define GGUF_FMT_COUNT 44u
 
 // The tensor type an image descriptor names for an MLX affine format: no GGUF
 // type is of this form.
@@ -193,6 +194,7 @@ QUANT_CONSTANT QuantFormat kQuantFormats[GGUF_FMT_COUNT] = {
     // 16-bit floats in native blocks of 256 GGUF values; meta: g, which the repack writes.
     {30, 256, 512, 64, 0, 4, 8, "bf16"},
     {1, 256, 512, 64, 0, 4, 8, "f16"},
+    {42, 64, 18, 8, 0, 2, 2, "q20"},      // GGUF's block_q2_0, one d per 64 elements; meta: d
 };
 
 // The format that stores a GGUF tensor type (or a loader's);
@@ -226,7 +228,38 @@ inline constexpr uint32_t quant_affine_format_of(uint32_t bits, uint32_t group) 
 // The chunk order slot of element e (0..31) of a group.
 inline constexpr uint32_t quant_slot(uint32_t e) { return 8 * ((e >> 2) & 3) + 4 * (e >> 4) + (e & 3); }
 
-#define QUANT_TILE_ROWS 256u
+// A plane tile holds one GGUF_TILE_COLUMNS column tile of every kernel, so
+// any projection or expert of a multiple of 64 rows starts on a tile.
+#define QUANT_TILE_ROWS 64u
+
+// The columns a [N, K] tensor is a multiple of, from its format's native
+// block of `block_elements` elements: one 64-input span of the activation
+// tables for a block that fits in one (32 or 64 elements: Q2_0's 64 and the
+// MLX affine formats' groups of 64 too), else a whole 256-input superblock
+// (PQ2_0's 128-input blocks and the groups of 128 too).
+inline constexpr uint32_t quant_column_unit(uint32_t block_elements) {
+  return block_elements > 64 ? 256 : 64;
+}
+
+// Whether the Apple9 register tile (kernels/decode/linear_gguf_sgmatrix.metal)
+// takes a tensor of `columns` inputs in `format`: a format it takes in rows
+// of whole coefficient units, which for a format of several groups per meta
+// unit span four 64-input spans (Q2_K's two), so 256 columns.
+inline constexpr bool quant_register_tensor(uint32_t format, uint64_t columns) {
+  return quant_register_format(format) && columns % (kQuantFormats[format].meta_groups > 1 ? 256 : 64) == 0;
+}
+// The inputs of the register tile's coefficient unit in `format`, of which
+// each K partition takes whole ones: one 64-input span for a format of one
+// group per meta unit, else four, and Q2_K's two, whose coefficients per span
+// take twice Q4_K's storage.
+inline constexpr uint32_t quant_register_unit(uint32_t format) {
+  return kQuantFormats[format].meta_groups == 1 ? 64 : format == GGUF_FMT_Q2K ? 128 : 256;
+}
+
+// Whether a format stores at least four bits per weight.
+inline constexpr bool quant_four_bits(uint32_t format) {
+  return 2 * kQuantFormats[format].block_bytes >= kQuantFormats[format].block_elements;
+}
 
 // Index of (row, block) in a [rows / T][blocks][T] plane (blocks = G) or meta
 // plane (blocks = meta units per row).

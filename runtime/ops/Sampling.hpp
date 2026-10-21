@@ -56,8 +56,8 @@ struct ThinkingCutoff final {
 struct SamplingPolicy final {
   // A sampling lane keeps the tokens minP leaves it, then its topK most
   // likely of those, or every one for 0 or a topK past the vocabulary (top-k
-  // disabled), then its top-p nucleus of those. Greedy lanes (temperature 0)
-  // read none of the three.
+  // disabled), then its top-p nucleus of those. Greedy lanes (!samples():
+  // temperature 0, a minP of 1 or a topK of 1) read none of the three.
   uint32_t topK = 0;
   float temperature = 0.0F;
   float topP = 1.0F;
@@ -74,7 +74,10 @@ struct SamplingPolicy final {
   // cutoff's row selects the end of thinking whatever the lane's logits.
   std::optional<ThinkingCutoff> thinkingCutoff{};
 
-  [[nodiscard]] bool samples() const noexcept { return temperature > 0.0F; }
+  // A lane samples unless it keeps only its most likely token, at a
+  // temperature of 0, a minP of 1 or a topK of 1: such a lane selects
+  // greedily, its draft's proposals too (the lowest id among equal logits).
+  [[nodiscard]] bool samples() const noexcept { return temperature > 0.0F && minP < 1.0F && topK != 1; }
 };
 
 // The penalty words of every state lane, one row of vocabulary words each,
@@ -133,6 +136,9 @@ struct AcceptanceBuffers final {
   metal::MetalBuffer outputTokens;
   metal::MetalBuffer retainedCounts;
   metal::MetalBuffer acceptedCounts;
+  // Each lane's verify rows (ops::DraftSelector), which bound what it
+  // retains.
+  metal::MetalBuffer verifyRows;
 };
 
 // Target token policy (penalties, min-p/top-k/top-p, constrained selection,

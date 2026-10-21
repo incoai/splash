@@ -70,11 +70,19 @@ struct QuantCoef {
 constant constexpr uint kQuantPairTableEntries = 256;
 // Fills the threadgroup table of format F's value pairs, as half2 (staged tiles) or bfloat2 (register tiles), entry
 // b = (F::value(b & 15), F::value(b >> 4)) for the index byte b of a pair, when F is a codebook format; called by all
-// threads of the threadgroup.
+// threads of the threadgroup. quant_pair_entries writes the entries alone and returns whether F has a table, for a
+// threadgroup that fills several tables before one barrier.
+template <class F, class T>
+inline bool quant_pair_entries(threadgroup T *table, uint thread_index, uint threads) {
+  if constexpr (F::Kind == QuantCodebook)
+    for (uint i = thread_index; i < kQuantPairTableEntries; i += threads)
+      table[i] = T(float2(F::value(i & 15), F::value(i >> 4)));
+  return F::Kind == QuantCodebook;
+}
 template <class F, class T>
 inline void quant_pair_table(threadgroup T *table, uint thread_index, uint threads) {
   if constexpr (F::Kind == QuantCodebook) {
-    for (uint i = thread_index; i < kQuantPairTableEntries; i += threads) table[i] = T(float2(F::value(i & 15), F::value(i >> 4)));
+    quant_pair_entries<F>(table, thread_index, threads);
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 }
@@ -504,10 +512,10 @@ template <uint F, class V> struct FmtFloat16 {
 };
 typedef FmtFloat16<GGUF_FMT_BF16, bfloat> FmtBF16;
 typedef FmtFloat16<GGUF_FMT_F16, half> FmtF16;
-// PQ2_0 (Prism ML's GGUFs, ggml type 142): plane0 2-bit codes as Q2_K's; meta the half d of the 128-element native
-// block, four groups. value = d * (q - 1).
-struct FmtPQ20 {
-  QUANT_FORMAT(GGUF_FMT_PQ20, QuantLinear, 1, 32, false);
+// PQ2_0 (GGUF tensor type 142) and Q2_0 (type 42): plane0 2-bit codes as Q2_K's; meta the
+// half d of the native block, four groups (PQ2_0's 128 elements) or two (Q2_0's 64). value = d * (q - 1).
+template <uint F> struct FmtTwoBit {
+  QUANT_FORMAT(F, QuantLinear, 1, 32, false);
   struct Payload { uint2 a; }; typedef uint Chunk; typedef ushort Meta;
   static Payload load(device uchar *p0, device uchar *) { return {*((device uint2 *)p0)}; }
   static Meta loadMeta(device uchar *m) { return *((device ushort *)m); }
@@ -516,6 +524,8 @@ struct FmtPQ20 {
   static uint4 codes(Chunk q) { return (uint4(q) >> uint4(0, 4, 8, 12)) & 0x00030003u; }
   static QuantCoef coef(Meta mt, ushort) { return {float2(float(as_type<half>(mt)))}; }
 };
+typedef FmtTwoBit<GGUF_FMT_PQ20> FmtPQ20;
+typedef FmtTwoBit<GGUF_FMT_Q20> FmtQ20;
 
 // The GGUF format whose planes hold Bits-bit linear codes, which an MLX affine format keeps as it does
 // (metal/abi/QuantFormat.h).
@@ -566,7 +576,7 @@ QUANT_AFFINE_GROUPS(8)
   X(FmtAF3G128, af3g128) X(FmtAF4G32, af4g32) X(FmtAF4G64, af4g64) X(FmtAF4G128, af4g128) X(FmtAF5G32, af5g32)    \
   X(FmtAF5G64, af5g64) X(FmtAF5G128, af5g128) X(FmtAF6G32, af6g32) X(FmtAF6G64, af6g64) X(FmtAF6G128, af6g128)    \
   X(FmtAF8G32, af8g32) X(FmtAF8G64, af8g64) X(FmtAF8G128, af8g128) X(FmtNVFP4, nvfp4) X(FmtFP8, fp8)            \
-  X(FmtQ50, q50) X(FmtQ51, q51) X(FmtBF16, bf16)
+  X(FmtQ50, q50) X(FmtQ51, q51) X(FmtBF16, bf16) X(FmtQ20, q20)
 #define QUANT_FORMATS(X) QUANT_REGISTER_FORMATS(X) X(FmtF16, f16)
 
 // Runs body(F()) with the format type of run-time format id `format` (GGUF_FMT_*), for kernels whose tiles pick

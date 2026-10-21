@@ -12,7 +12,7 @@ from jsonschema.exceptions import SchemaError, UndefinedTypeCheck
 from referencing import Registry
 
 from .errors import APIError
-from .lru import LRUCache
+from .lru import LRUCache, memoized
 
 
 class SchemaEvaluationError(Exception):
@@ -185,21 +185,20 @@ _checked_schemas = LRUCache(8 * 1024 * 1024, capacity=1024)
 def check_schema(schema):
     """Raise SchemaError unless `schema` is valid in the dialect it declares.
 
-    A tool's schema needs no other check, as its calls are not validated, and
-    a client sends its tools on every turn, so each outcome is kept: a tool
-    that is not strict keeps an invalid schema to describe itself with."""
+    A strict tool's schema needs no other check, as its calls are not
+    validated, and a client sends its tools on every turn, so each outcome is
+    kept."""
     # json.dumps uses ASCII escapes, so character count equals source bytes.
     key = json.dumps(schema, sort_keys=True)
-    with _checked_schemas_lock:
-        outcome = _checked_schemas.get(key)
-    if outcome is None:
+
+    def check():
         try:
             validators.validator_for(schema).check_schema(schema)
-            outcome = True
         except SchemaError as error:
-            outcome = error.message
-        with _checked_schemas_lock:
-            _checked_schemas.put(key, outcome, len(key))
+            return error.message, len(key)
+        return True, len(key)
+
+    outcome = memoized(_checked_schemas, _checked_schemas_lock, key, check)
     if outcome is not True:
         raise SchemaError(outcome)
 
@@ -210,10 +209,18 @@ def build_validator(schema):
     # validator instead of re-validating and rebuilding it.
     # json.dumps uses ASCII escapes, so character count equals source bytes.
     key = json.dumps(schema, sort_keys=True)
-    with _validator_cache_lock:
-        cached = _validator_cache.get(key)
-    if cached is not None:
-        return cached
+    return memoized(
+        _validator_cache,
+        _validator_cache_lock,
+        key,
+        lambda: (_validator(schema), len(key)),
+    )
+
+
+def _validator(schema):
+    """A validator of `schema` whose regular expressions are bounded, refusing
+    a schema that breaks its dialect (SchemaError) or that it could not
+    evaluate (APIError)."""
     base = validators.validator_for(schema)
     base.check_schema(schema)
     # Draft 3 accepts any type name, and validation fails on one the dialect
@@ -242,11 +249,4 @@ def build_validator(schema):
             if validators.validator_for(node) is not base:
                 raise APIError(400, "mixed schema dialects are not supported")
             node.pop("$schema")
-    validator = _bounded_class(base)(validated, registry=_REGISTRY)
-    with _validator_cache_lock:
-        # Another preparation thread may have filled the same miss.
-        cached = _validator_cache.get(key)
-        if cached is not None:
-            return cached
-        _validator_cache.put(key, validator, len(key))
-    return validator
+    return _bounded_class(base)(validated, registry=_REGISTRY)

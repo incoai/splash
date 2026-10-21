@@ -53,14 +53,14 @@ void checkWeightHeader(const uint8_t *header, uint64_t bytes, std::string_view e
 WeightFile::WeightFile(metal::MetalBackend &backend, metal::MetalBuffer image,
                        std::string relativePath, std::string_view expectedMagic,
                        uint32_t expectedLayer, uint32_t expectedType,
-                       std::string contentIdentity)
+                       uint64_t declaredBytes, std::string contentIdentity)
     : impl_(std::make_unique<Impl>()) {
     const auto *header = static_cast<const uint8_t *>(image.contents());
     if (!header) throw WeightStoreError("weight image is not host visible: " + relativePath);
     checkWeightHeader(header, image.sizeBytes(), expectedMagic, expectedLayer, expectedType, relativePath);
     impl_->backend = &backend;
     impl_->record = {std::move(relativePath), std::string(expectedMagic), expectedLayer, expectedType,
-                     image.sizeBytes(), std::move(contentIdentity)};
+                     declaredBytes, std::move(contentIdentity)};
     impl_->base = std::move(image);
 }
 
@@ -116,20 +116,24 @@ GgufTensorDescriptor readGgufDescriptor(WeightFile &file, std::string_view label
 
 ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view label) {
     const GgufTensorDescriptor d = readGgufDescriptor(file, label);
-    if (d.type == ggml::kF32) {
+    // A float tensor's rows as stored, which no meta unit describes: F32, or
+    // BF16 (a MoE router a GGUF stores so; a repacked BF16 tensor has planes).
+    if (d.type == ggml::kF32 || (d.type == ggml::kBF16 && !d.metaGroups)) {
+        const bool bfloat16 = d.type == ggml::kBF16;
         if (d.p0 || d.p1 || d.metaBytes || d.metaGroups || d.plane1Bytes || d.metaTotalBytes ||
-            d.plane0Bytes != uint64_t{d.outputSize} * d.inputSize * sizeof(float))
+            d.plane0Bytes != uint64_t{d.outputSize} * d.inputSize * (bfloat16 ? sizeof(uint16_t) : sizeof(float)))
             throw WeightStoreError("GGUF float section sizes are inconsistent: " + std::string(label));
-        return ops::QuantizedSegment::floats(d.outputSize, d.inputSize,
-                                             file.section(d.plane0Bytes, std::string(label) + "-floats"));
+        return ops::QuantizedSegment::floats(
+            d.outputSize, d.inputSize, file.section(d.plane0Bytes, std::string(label) + "-floats"),
+            bfloat16 ? ops::QuantizedSegment::kBFloat16 : ops::QuantizedSegment::kFloat32);
     }
     const uint32_t format = gguf_format_of(d.type);
     if (format == GGUF_FMT_COUNT)
         throw WeightStoreError("unsupported GGUF tensor type " + std::to_string(d.type));
-    // Quantized planes fill whole tiles; float tensors are rows as stored.
-    if (d.outputSize % QUANT_TILE_ROWS || d.inputSize % kGgufBlockColumns)
-        throw WeightStoreError("GGUF tensor shape is not tile aligned: " + std::string(label));
     const QuantFormat &layout = kQuantFormats[format];
+    // Quantized planes fill whole tiles; float tensors are rows as stored.
+    if (d.outputSize % QUANT_TILE_ROWS || d.inputSize % ggufColumnUnit(layout))
+        throw WeightStoreError("GGUF tensor shape is not tile aligned: " + std::string(label));
     const GgufPlaneBytes planes = ggufPlaneBytes(layout, d.outputSize, d.inputSize);
     if (d.p0 != layout.plane0_bytes || d.p1 != layout.plane1_bytes ||
         d.metaBytes != layout.meta_bytes || d.metaGroups != layout.meta_groups ||

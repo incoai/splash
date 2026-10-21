@@ -8,12 +8,16 @@
 
 namespace splash::model {
 
+class RuntimeInstrumentation;
+
 class Runtime final : public RuntimeModel {
 public:
   explicit Runtime(RuntimeContext context);
   ~Runtime() override;
   void checkHealth() override;
   [[nodiscard]] uint32_t statesToActivate() const noexcept override;
+  [[nodiscard]] uint32_t prefillGroupRows(bool spills) const noexcept override;
+  [[nodiscard]] uint32_t prefillPasses() const noexcept override;
 
   Runtime(const Runtime &) = delete;
   Runtime &operator=(const Runtime &) = delete;
@@ -21,11 +25,6 @@ public:
   // Direct native-oracle entry point. Production admission uses
   // begin() and installs its cache-aware plan explicitly.
   void beginColdRequest(const ModelRequest &request, uint32_t stateLane);
-  // For the native oracle: the rows a resident request's latest decode step
-  // retained, which its GDN cell holds only once its next step folds them in
-  // (QwenLaneMetadata::pendingRows). They are every GDN layer's tape rows
-  // (metal/abi/GDN.h) up to that count, field by field, layer by layer.
-  [[nodiscard]] std::vector<uint8_t> pendingGdnRows(uint64_t requestId) const;
   [[nodiscard]] StateAdmission
   begin(const ModelRequest &request) override;
   void suspend(uint64_t requestId) override;
@@ -44,13 +43,16 @@ public:
   [[nodiscard]] std::vector<ModelStepResult>
   decode(const BatchPlan &plan, std::span<const ModelBatchItem> items);
   [[nodiscard]] std::shared_ptr<StateReservation>
-  reserveState(uint64_t requestId, uint32_t tokens) override;
+  reserveState(uint64_t requestId, uint32_t tokens, metal::AllocationFailure &refusal) override;
   [[nodiscard]] std::shared_ptr<const CompositeState>
   snapshot(uint64_t requestId) override;
   [[nodiscard]] uint64_t snapshotBytes() const noexcept override;
   [[nodiscard]] bool canSnapshotToDisk(bool inUse) const noexcept override;
   [[nodiscard]] std::unique_ptr<StateOffload>
   snapshotToDisk(uint64_t requestId, std::function<void()> completion) override;
+  [[nodiscard]] ModelMemoryAdmission reserveSpilledReads(uint64_t requestId) override;
+  [[nodiscard]] ModelMemoryAdmission reserveHistoryStaging(uint64_t requestId, uint32_t pages) override;
+  [[nodiscard]] ModelMemoryAdmission growSpilledReads() override;
   [[nodiscard]] uint64_t reclaimIdleState(bool keepLane,
                                           IdleMemory scope) noexcept override;
   [[nodiscard]] std::optional<std::string>
@@ -83,6 +85,7 @@ private:
   decodeAsync(const BatchPlan &plan, std::span<const ModelBatchItem> items,
               std::function<void()> completion);
 
+  friend class RuntimeInstrumentation;
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

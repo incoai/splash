@@ -48,10 +48,13 @@ using splash::test::rejects;
 using splash::test::require;
 using splash::test::requireExtent;
 
+constexpr std::array<uint32_t, kLanes> kAllRows{kRows, kRows, kRows, kRows};
+
 void runWidth(MetalBackend &backend, uint32_t width,
               const std::array<uint32_t, kLanes> &acceptedReference,
               const std::array<uint32_t, kLanes> &remainingReference,
-              uint32_t stopLane = kLanes, uint32_t stopRow = 0) {
+              uint32_t stopLane = kLanes, uint32_t stopRow = 0,
+              const std::array<uint32_t, kLanes> &verifyRowsReference = kAllRows) {
   require(width >= 1 && width <= kLanes, "invalid test width");
   MetalBuffer draft = shared(backend, kLanes * kProposals * sizeof(uint32_t),
                              "accept-draft");
@@ -74,6 +77,10 @@ void runWidth(MetalBackend &backend, uint32_t width,
       shared(backend, kLanes * sizeof(uint32_t), "accept-retained");
   MetalBuffer accepted =
       shared(backend, kLanes * sizeof(uint32_t), "accept-count");
+  MetalBuffer verifyRows =
+      shared(backend, kLanes * sizeof(uint32_t), "accept-verify-rows");
+  std::copy(verifyRowsReference.begin(), verifyRowsReference.end(),
+            contents<uint32_t>(verifyRows));
 
   auto *draftTokens = contents<uint32_t>(draft);
   auto *targetTokens = contents<uint32_t>(output);
@@ -116,8 +123,9 @@ void runWidth(MetalBackend &backend, uint32_t width,
                       {4, uniforms},
                       {5, output},
                       {6, retained},
-                      {7, accepted}};
-  dispatch.bytes = {{8, &params, sizeof(params)}};
+                      {7, accepted},
+                      {8, verifyRows}};
+  dispatch.bytes = {{9, &params, sizeof(params)}};
   dispatch.threadgroups = {width, 1, 1};
   dispatch.threadsPerThreadgroup = {1, 1, 1};
   static_cast<void>(backend.submit(dispatch));
@@ -126,7 +134,8 @@ void runWidth(MetalBackend &backend, uint32_t width,
   const auto *acceptedCounts = contents<uint32_t>(accepted);
   for (uint32_t lane = 0; lane < width; ++lane) {
     uint32_t expectedRetained =
-        std::min(acceptedReference[lane] + 1, remainingReference[lane]);
+        std::min({acceptedReference[lane] + 1, remainingReference[lane],
+                  verifyRowsReference[lane]});
     if (lane == stopLane && stopRow < expectedRetained)
       expectedRetained = stopRow + 1;
     require(acceptedCounts[lane] == acceptedReference[lane],
@@ -245,6 +254,11 @@ int main(int argc, char **argv) {
     constexpr std::array<uint32_t, kLanes> allAccepted{7, 7, 7, 7};
     constexpr std::array<uint32_t, kLanes> shortRemaining{1, 2, 3, 8};
     runWidth(backend, kLanes, allAccepted, shortRemaining, 3, 3);
+    // A lane retains at most the rows its verify verified, below its budget
+    // or above it; acceptance still counts every proposal it checked.
+    constexpr std::array<uint32_t, kLanes> fewRows{2, 3, 5, 1};
+    runWidth(backend, kLanes, allAccepted, fullRemaining, kLanes, 0, fewRows);
+    runWidth(backend, kLanes, lowerAccepted, shortRemaining, kLanes, 0, fewRows);
     testRowCopy(backend);
     verifyInputExtents(backend);
     std::cout << "dflash_batch_control_metal_test: PASS\n";

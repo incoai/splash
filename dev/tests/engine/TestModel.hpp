@@ -21,11 +21,26 @@ modelMemoryFootprint(uint64_t targetWeightsBytes,
 modelMemoryProfile(uint64_t targetWeightsBytes,
                    uint64_t draftWeightsBytes,
                    uint64_t visionWeightsBytes) {
-  return {"Qwen3.8-27B", kv::kMaximumLogicalTokens,
+  // Qwen3.8-27B's native window.
+  return {"Qwen3.8-27B", 262'144,
           kv::Layout{16, 4, 256},
           modelMemoryFootprint(targetWeightsBytes, draftWeightsBytes,
                                visionWeightsBytes)};
 }
+
+// A block-sparse target's KV, Qwen3.8-Flash-Next's: 12 attention layers of 2
+// KV heads of 256 in int8, a 128-wide block index and token-major values, so
+// its pages can spill (kv::Layout::spillable); each verify row attends at
+// most 512 blocks of 4 tokens, and rows with up to 2,048 tokens of history
+// read their page table.
+[[nodiscard]] constexpr kv::Layout sparseKvLayout() noexcept {
+  return {12, 2, 256, kv::Format::Int8, 128, true};
+}
+[[nodiscard]] constexpr model::SparseKvShape sparseKvShape() noexcept {
+  return {.blockTokens = 4, .selectedBlocks = 512, .verifyRows = 8, .denseHistoryTokens = 2048,
+          .sinkTokens = 0, .localTokens = 0};
+}
+static_assert(sparseKvLayout().spillable());
 
 // The plan for a profile the test expects to fit; throws with the planner's
 // verdict otherwise.
