@@ -41,6 +41,10 @@ def jobs(args, models):
                         kv,
                         "--state-format",
                         state,
+                        "--ane-ffn-share",
+                        "0",
+                        "--max-context",
+                        "32768",
                     ]
                     result.append(
                         {

@@ -46,7 +46,11 @@ cells, each with INT8/BF16 KV crossed with FP32/BF16 state oracles, B1 decode
 and mixed workloads at 2k/8k/31,744 contexts, and B2/B3/B4 decode at 2k.
 Serving uses code/math/prose, three trials and 512 output tokens, plus sampled
 and strict-JSON probes. The model oracle runs its own documented numerical
-contract, including its controlled full-row and budgeted cases.
+contract, including its controlled full-row and budgeted cases. Oracle commands
+explicitly select `--max-context 32768 --ane-ffn-share 0`, matching the local
+matrix rather than inheriting the target's automatic context/ANE configuration.
+Serving retains its recorded native ANE configuration; GPU-only oracles do not
+qualify ANE execution.
 
 Review the manifest and repeat with `--execute`; `--suite correctness` and
 `--suite serving` permit separate output directories. `--baseline-env KEY=VALUE`

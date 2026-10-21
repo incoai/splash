@@ -45,6 +45,8 @@ class QualificationMatrixTests(unittest.TestCase):
                 )
             )
             self.assertEqual(job["environment"]["MTL_SHADER_VALIDATION"], "1")
+            self.assertEqual(command[command.index("--ane-ffn-share") + 1], "0")
+            self.assertEqual(command[command.index("--max-context") + 1], "32768")
             self.assertNotIn("--live-gdn", command)
             self.assertNotIn("--live-verify-threshold", command)
         self.assertEqual(

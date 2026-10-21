@@ -44,7 +44,11 @@
         "--kv-format",
         "int8",
         "--state-format",
-        "fp32"
+        "fp32",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
       ],
       "environment": {
         "MTL_SHADER_VALIDATION": "1"
@@ -60,7 +64,11 @@
         "--kv-format",
         "int8",
         "--state-format",
-        "bf16"
+        "bf16",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
       ],
       "environment": {
         "MTL_SHADER_VALIDATION": "1"
@@ -76,7 +84,11 @@
         "--kv-format",
         "bf16",
         "--state-format",
-        "fp32"
+        "fp32",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
       ],
       "environment": {
         "MTL_SHADER_VALIDATION": "1"
@@ -92,7 +104,11 @@
         "--kv-format",
         "bf16",
         "--state-format",
-        "bf16"
+        "bf16",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
       ],
       "environment": {
         "MTL_SHADER_VALIDATION": "1"
@@ -102,7 +118,7 @@
     {
       "id": "moe-gguf-decode-b1",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -151,7 +167,7 @@
     {
       "id": "moe-gguf-mixed-b1",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -200,7 +216,7 @@
     {
       "id": "moe-gguf-decode-b2",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -249,7 +265,7 @@
     {
       "id": "moe-gguf-decode-b3",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -298,7 +314,7 @@
     {
       "id": "moe-gguf-decode-b4",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -353,7 +369,11 @@
         "--kv-format",
         "int8",
         "--state-format",
-        "fp32"
+        "fp32",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
       ],
       "environment": {
         "MTL_SHADER_VALIDATION": "1"
@@ -369,7 +389,11 @@
         "--kv-format",
         "int8",
         "--state-format",
-        "bf16"
+        "bf16",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
       ],
       "environment": {
         "MTL_SHADER_VALIDATION": "1"
@@ -385,7 +409,11 @@
         "--kv-format",
         "bf16",
         "--state-format",
-        "fp32"
+        "fp32",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
       ],
       "environment": {
         "MTL_SHADER_VALIDATION": "1"
@@ -401,7 +429,11 @@
         "--kv-format",
         "bf16",
         "--state-format",
-        "bf16"
+        "bf16",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
       ],
       "environment": {
         "MTL_SHADER_VALIDATION": "1"
@@ -411,7 +443,7 @@
     {
       "id": "moe-mlx-decode-b1",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -460,7 +492,7 @@
     {
       "id": "moe-mlx-mixed-b1",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -509,7 +541,7 @@
     {
       "id": "moe-mlx-decode-b2",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -558,7 +590,7 @@
     {
       "id": "moe-mlx-decode-b3",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -607,7 +639,7 @@
     {
       "id": "moe-mlx-decode-b4",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -662,7 +694,11 @@
         "--kv-format",
         "int8",
         "--state-format",
-        "fp32"
+        "fp32",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
       ],
       "environment": {
         "MTL_SHADER_VALIDATION": "1"
@@ -678,7 +714,11 @@
         "--kv-format",
         "int8",
         "--state-format",
-        "bf16"
+        "bf16",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
       ],
       "environment": {
         "MTL_SHADER_VALIDATION": "1"
@@ -694,7 +734,11 @@
         "--kv-format",
         "bf16",
         "--state-format",
-        "fp32"
+        "fp32",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
       ],
       "environment": {
         "MTL_SHADER_VALIDATION": "1"
@@ -710,7 +754,11 @@
         "--kv-format",
         "bf16",
         "--state-format",
-        "bf16"
+        "bf16",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
       ],
       "environment": {
         "MTL_SHADER_VALIDATION": "1"
@@ -720,7 +768,7 @@
     {
       "id": "dense-mlx-decode-b1",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -769,7 +817,7 @@
     {
       "id": "dense-mlx-mixed-b1",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -818,7 +866,7 @@
     {
       "id": "dense-mlx-decode-b2",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -867,7 +915,7 @@
     {
       "id": "dense-mlx-decode-b3",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -916,7 +964,7 @@
     {
       "id": "dense-mlx-decode-b4",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -971,7 +1019,11 @@
         "--kv-format",
         "int8",
         "--state-format",
-        "fp32"
+        "fp32",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
       ],
       "environment": {
         "MTL_SHADER_VALIDATION": "1"
@@ -987,7 +1039,11 @@
         "--kv-format",
         "int8",
         "--state-format",
-        "bf16"
+        "bf16",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
       ],
       "environment": {
         "MTL_SHADER_VALIDATION": "1"
@@ -1003,7 +1059,11 @@
         "--kv-format",
         "bf16",
         "--state-format",
-        "fp32"
+        "fp32",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
       ],
       "environment": {
         "MTL_SHADER_VALIDATION": "1"
@@ -1019,7 +1079,11 @@
         "--kv-format",
         "bf16",
         "--state-format",
-        "bf16"
+        "bf16",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
       ],
       "environment": {
         "MTL_SHADER_VALIDATION": "1"
@@ -1029,7 +1093,7 @@
     {
       "id": "dense-gguf-decode-b1",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -1078,7 +1142,7 @@
     {
       "id": "dense-gguf-mixed-b1",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -1127,7 +1191,7 @@
     {
       "id": "dense-gguf-decode-b2",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -1176,7 +1240,7 @@
     {
       "id": "dense-gguf-decode-b3",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -1225,7 +1289,7 @@
     {
       "id": "dense-gguf-decode-b4",
       "command": [
-        "/private/tmp/splash-deepinfer-current/.venv/bin/python",
+        "$PYTHON",
         "-m",
         "dev.benchmarks.serving_regression",
         "--model",
@@ -1279,7 +1343,7 @@
     "Serving verdicts and noise bounds remain in each child report.",
     "B2-B4 long-context expansion needs additional memory qualification.",
     "These runs do not change a shared default.",
-    "Illustrative placeholder command arrays; regenerate with qualification_matrix after replacing paths. Shell variables in JSON are not expanded by the runner."
+    "Illustrative placeholders; regenerate after replacing paths. JSON command arrays do not expand shell variables. Oracles pin max-context 32768 and ANE share 0."
   ],
   "runtime_base": "1482f6bbc2abf12375332725302019594150b6cb",
   "hardware_execution": "unexecuted; prepared locally for maintainer Macs, not a passing hardware result"
