@@ -29,7 +29,10 @@ interactive prompt beside an active 2k streaming request. The active request
 generates the selected budget; both peers generate 32 tokens. It records total
 workload seconds/output token, short/long TTFT and p95/max content-chunk gaps.
 Chunk arrival is not one timestamp per token. Native progress every 100 ms must
-prove actual contention; stale status and serialized admission are rejected.
+prove actual contention. The initial snapshot must be fresh. Later stale polls
+are recorded and excluded from overlap evidence; without fresh progress the
+run still fails. Serialized admission is rejected. Per-round stale-poll counts
+remain visible so a transient transport response is not mistaken for progress.
 
 `--cache-mode cached` primes the full long prompt, while `prefix-resume` primes
 its leading half by character count. Fresh cache salts isolate arms. Priming

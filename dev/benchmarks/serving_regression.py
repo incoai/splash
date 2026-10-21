@@ -416,15 +416,17 @@ def prepare_mixed_cache(server, args, long_prompt):
     return salt
 
 
-def native_sample(server, args, before_short=False):
+def native_sample(server, args, before_short=False, *, allow_stale=False):
     value = status(server, args)
+    stale = value.get("transport", {}).get("status_stale", False)
     smoke.require(
-        not value.get("transport", {}).get("status_stale", False),
+        allow_stale or not stale,
         "stale native status cannot prove work overlap",
     )
     return {
         "at": time.monotonic(),
         "before_short": before_short,
+        "status_stale": stale,
         "prefill_rows": value["scheduler"]["prefill_rows"],
         "memory_pressure": value["memory_pressure"],
         "requests": value["active_requests"],
@@ -437,6 +439,8 @@ def native_overlap(
     """Prove native work overlap; concurrent HTTP lifetimes alone are insufficient."""
     long_id = None
     for sample in samples:
+        if sample.get("status_stale", False):
+            continue
         if sample["at"] >= active_response["ended"]:
             continue
         active = any(
@@ -508,10 +512,12 @@ def measure_mixed(server, args, active_prompt, long_prompt, short_prompt, contex
             expect_cached=args.cache_mode != "cold",
         )
         time.sleep(args.arrival_delay)
-        native_samples.append(native_sample(server, args, before_short=True))
+        native_samples.append(
+            native_sample(server, args, before_short=True, allow_stale=True)
+        )
         short = pool.submit(streamed, server, args, short_prompt, 32)
         while not active.done():
-            native_samples.append(native_sample(server, args))
+            native_samples.append(native_sample(server, args, allow_stale=True))
             time.sleep(args.status_interval)
         responses = [
             future.result(timeout=args.request_timeout)
@@ -561,6 +567,9 @@ def measure_mixed(server, args, active_prompt, long_prompt, short_prompt, contex
         "wall_seconds": elapsed,
         "native_overlap": overlap,
         "native_samples": native_samples,
+        "stale_native_status_polls": sum(
+            sample.get("status_stale", False) for sample in native_samples
+        ),
         "decode_batches_by_width": {
             key: value - before["scheduler"]["decode_batches_by_width"][key]
             for key, value in after["scheduler"]["decode_batches_by_width"].items()

@@ -342,6 +342,56 @@ class PairedServingTests(unittest.TestCase):
             serving_regression.native_overlap([sample], 1, 8192, 0, long, active, 2048)
         )
 
+    def test_stale_poll_cannot_supply_overlap_evidence(self):
+        active = {"ended": 10}
+        long = {"ended": 20, "usage": {"prompt_tokens": 8192}}
+        sample = {
+            "at": 4,
+            "before_short": True,
+            "status_stale": True,
+            "prefill_rows": 6144,
+            "requests": [
+                {"id": 1, "phase": "decode"},
+                {
+                    "id": 2,
+                    "phase": "prefill",
+                    "prompt_tokens": 8192,
+                    "max_new_tokens": 32,
+                    "prompt_processed": 4096,
+                },
+            ],
+        }
+        self.assertIsNone(
+            serving_regression.native_overlap([sample], 1, 8192, 0, long, active, 2048)
+        )
+        fresh = {**sample, "status_stale": False}
+        self.assertEqual(
+            serving_regression.native_overlap(
+                [sample, fresh], 1, 8192, 0, long, active, 2048
+            ),
+            "long-prefill",
+        )
+        fresh["requests"] = []
+        self.assertIsNone(
+            serving_regression.native_overlap(
+                [sample, fresh], 1, 8192, 0, long, active, 2048
+            )
+        )
+
+    def test_transient_stale_poll_is_recorded_but_initial_snapshot_must_be_fresh(self):
+        snapshot = {
+            "transport": {"status_stale": True},
+            "scheduler": {"prefill_rows": 12},
+            "memory_pressure": "normal",
+            "active_requests": [],
+        }
+        with patch.object(serving_regression, "status", return_value=snapshot):
+            with self.assertRaises(serving_regression.smoke.SmokeFailure):
+                serving_regression.native_sample(None, None)
+            value = serving_regression.native_sample(None, None, allow_stale=True)
+        self.assertTrue(value["status_stale"])
+        self.assertEqual(value["prefill_rows"], 12)
+
     def test_sequential_residency_closes_each_server_before_starting_the_next(self):
         import argparse
         import io

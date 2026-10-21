@@ -73,7 +73,9 @@ and thermal conditions stable; wake prevention is not a frequency guarantee.
 Measured requests must be cold, produce the full requested output budget and
 release resources. Mixed workloads require native long-prefill/continuation
 progress while another native request decodes; overlapping HTTP lifetimes do
-not suffice. Stale status is rejected. Cached and RAM-prefix continuation are
+not suffice. The initial snapshot must be fresh. Later stale polls are retained
+with an explicit flag and counted, but cannot prove overlap; no fresh progress
+still fails the run. Cached and RAM-prefix continuation are
 available directly in `serving_regression.py`; they do not simulate suspension
 under resource pressure.
 
