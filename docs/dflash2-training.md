@@ -31,8 +31,10 @@ results below or in the PR description keep their original source scope.
 
 ## Setup
 
-Use Python 3.12–3.14 and a separate training environment. CUDA is the default
-for real training. CPU execution supports small reference diagnostics; large
+Use Python 3.12–3.14 and a separate training environment. CUDA is the default.
+Experimental Apple GPU training is available with `--device mps`; see the
+[Mac testing guide](dflash2-mps.md) for setup and qualification steps.
+CPU execution supports small reference diagnostics; large
 BF16 checkpoints still need memory for all their weights. Hardware capacity
 must be measured with preflight; this implementation has not yet completed a
 production Qwen3.8-27B CUDA run or a trained-checkpoint native speed benchmark.
@@ -188,7 +190,7 @@ Transfer the export to a supported Mac and use a compatible deployment target:
   --draft-model /path/to/export
 ```
 
-The CUDA BF16 teacher and Splash's quantized deployment target are distinct
+The BF16 training teacher and Splash's quantized deployment target are distinct
 artifacts. Record the deployment revision and tokenizer compatibility in the
 native benchmark results. Check actual weight preparation/loading and compare
 acceptance, decode throughput, and latency against the released draft using
@@ -208,9 +210,9 @@ checkpoint or reduced loss alone does not establish a speedup.
   same deployment target. Report acceptance, decode throughput, and latency,
   with sampling, cache, memory settings, hardware, and revisions held fixed.
 
-The CPU fixture tests establish implementation behavior at small dimensions.
-They do not satisfy these hardware gates. Fresh initialization, additional
-target families, and a Mac training backend are outside this PR's scope.
+The CPU and MPS fixture tests establish implementation behavior at small
+dimensions. They do not satisfy these real-checkpoint hardware gates. Fresh
+initialization and additional target families remain outside this scope.
 
 ## Development tests
 

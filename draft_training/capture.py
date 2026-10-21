@@ -50,6 +50,8 @@ class TargetAdapter:
         gc.collect()
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
+        elif self.device.type == "mps":
+            torch.mps.empty_cache()
         return self.embedding, self.head
 
     @torch.no_grad()

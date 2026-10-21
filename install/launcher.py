@@ -434,7 +434,8 @@ def parse_args(argv=None):
         from draft_training.__main__ import add_train_arguments
 
         training = commands.add_parser(
-            "train-draft", help="fine-tune a DFlash2 draft (optional CUDA environment)"
+            "train-draft",
+            help="fine-tune a DFlash2 draft (optional CUDA/MPS environment)",
         )
         add_train_arguments(training)
     for name in clients.INSTALL_URLS:

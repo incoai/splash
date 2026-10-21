@@ -104,6 +104,8 @@ def train(
                     kept.append(json.dumps(item, allow_nan=False))
             log.write_text("\n".join(kept) + ("\n" if kept else ""))
     stream = block_stream(training_dir, model, device, progress["cursor"], recipe.seed)
+    if torch.device(device).type == "mps":
+        torch.mps.synchronize()
     start = time.monotonic()
     for step in range(progress["step"] + 1, recipe.max_steps + 1):
         model.train()
@@ -144,6 +146,8 @@ def train(
             optimizer.step()
             progress["updates"] += 1
         progress["step"] = step
+        if torch.device(device).type == "mps":
+            torch.mps.synchronize()
         record = {
             "step": step,
             "seconds": time.monotonic() - start,

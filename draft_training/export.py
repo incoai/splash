@@ -19,6 +19,12 @@ from .config import (
 )
 
 
+def serving_tensor(tensor):
+    """Canonical CPU BF16 values shared by export and MPS validation."""
+    # Transfer first, then convert: keep the rounding operation on the CPU.
+    return tensor.detach().to(device="cpu").to(dtype=torch.bfloat16).contiguous()
+
+
 def export_model(model, destination, provenance, *, family=True, shard_bytes=512 << 20):
     destination = Path(destination)
     if destination.exists():
@@ -28,7 +34,7 @@ def export_model(model, destination, provenance, *, family=True, shard_bytes=512
     try:
         shards, current, size = [], {}, 0
         for name, tensor in model.state_dict().items():
-            value = tensor.detach().to(device="cpu", dtype=torch.bfloat16).contiguous()
+            value = serving_tensor(tensor)
             if not torch.isfinite(value).all():
                 raise TrainingError(f"nonfinite exported tensor: {name}")
             if current and size + value.numel() * value.element_size() > shard_bytes:
@@ -80,7 +86,7 @@ def verify_export(model, directory, provenance, *, family=True):
     for filename in sorted({item["file"] for item in index.values()}):
         with safe_open(directory / filename, framework="pt", device="cpu") as shard:
             for name in shard.keys():
-                expected = state[name].detach().to(device="cpu", dtype=torch.bfloat16)
+                expected = serving_tensor(state[name])
                 if not torch.equal(shard.get_tensor(name), expected):
                     raise TrainingError(
                         f"existing export differs from the selected checkpoint: {name}"
@@ -109,6 +115,9 @@ def save_checkpoint(model, optimizer, directory, state):
                 "cuda_rng": torch.cuda.get_rng_state_all()
                 if torch.cuda.is_available()
                 else [],
+                "mps_rng": torch.mps.get_rng_state()
+                if next(model.parameters()).device.type == "mps"
+                else None,
             },
             stage / "state.pt",
         )
@@ -128,8 +137,14 @@ def restore_checkpoint(model, optimizer, path, run_identity):
         raise TrainingError(
             "resume checkpoint belongs to different data, recipe, target, or draft"
         )
-    model.load_state_dict(load_file(str(path / "model.safetensors")))
     state = torch.load(path / "state.pt", map_location="cpu", weights_only=True)
+    mps_rng = state.get("mps_rng")
+    if next(model.parameters()).device.type == "mps":
+        if mps_rng is None:
+            raise TrainingError("MPS resume requires a checkpoint with MPS RNG state")
+    elif mps_rng is not None:
+        raise TrainingError("resume requires the original MPS device backend")
+    model.load_state_dict(load_file(str(path / "model.safetensors")))
     optimizer.load_state_dict(state["optimizer"])
     torch.set_rng_state(state["cpu_rng"])
     if state["cuda_rng"]:
@@ -139,4 +154,6 @@ def restore_checkpoint(model, optimizer, path, run_identity):
         ):
             raise TrainingError("resume requires the original CUDA device topology")
         torch.cuda.set_rng_state_all(state["cuda_rng"])
+    if mps_rng is not None:
+        torch.mps.set_rng_state(mps_rng)
     return progress

@@ -15,6 +15,7 @@ from .config import (
     write_json,
 )
 from .data import anchors, disjoint
+from .export import serving_tensor
 from .losses import block_loss
 
 
@@ -23,14 +24,34 @@ def evaluate_cached(model, embedding, head, directory, recipe, device):
     # Select the BF16 artifact that serving will load, rather than the FP32
     # master parameters. Restore their original storage even if replay fails;
     # the optimizer must retain every small update for the next training step.
-    masters = [(p, p.data) for p in model.parameters() if p.dtype != torch.bfloat16]
+    masters, replacements = [], []
     try:
-        for parameter, value in masters:
-            parameter.data = value.to(torch.bfloat16)
+        for name, parameter in list(model.named_parameters()):
+            if parameter.dtype == torch.bfloat16:
+                continue
+            if parameter.device.type == "mps":
+                prefix, _, leaf = name.rpartition(".")
+                parent = model.get_submodule(prefix)
+                replacements.append((parent, leaf, parameter))
+                # Score exactly the CPU-rounded export values. Use a temporary
+                # parameter with a fixed dtype, preserving Adam's FP32 object.
+                setattr(
+                    parent,
+                    leaf,
+                    torch.nn.Parameter(
+                        serving_tensor(parameter).to(parameter.device),
+                        requires_grad=False,
+                    ),
+                )
+            else:
+                masters.append((parameter, parameter.data))
+                parameter.data = parameter.data.to(torch.bfloat16)
         return _evaluate_cached(model, embedding, head, directory, recipe, device)
     finally:
         for parameter, value in masters:
             parameter.data = value
+        for parent, leaf, parameter in replacements:
+            setattr(parent, leaf, parameter)
 
 
 def evaluation_plan(directory, manifest, block_size, recipe):
