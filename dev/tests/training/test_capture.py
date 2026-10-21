@@ -178,8 +178,8 @@ class CaptureTests(unittest.TestCase):
         import argparse
         from unittest import mock
 
-        from draft_training.__main__ import run_training
-        from draft_training.config import write_json
+        from draft_training.__main__ import run_evaluation, run_training
+        from draft_training.config import validate_draft
         from draft_training.data import split_manifest
         from draft_training.export import export_model
 
@@ -219,7 +219,29 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(selection["native_validation"], "not run")
         self.assertTrue((output / "baseline-validation.json").exists())
         self.assertTrue(selection["implementation"])
-        write_json(output / "fixture-result.json", {"passed": True})
+        test_data = self.root / "test.jsonl"
+        write_data(test_data, "w9 w10")
+        evaluation = argparse.Namespace(
+            target=self.target,
+            draft=output / "export",
+            baseline_draft=draft,
+            test_data=test_data,
+            selection_manifest=output / "selection.json",
+            output=output / "final-test",
+            device="cpu",
+        )
+        with (
+            mock.patch("draft_training.__main__.validate_target"),
+            mock.patch(
+                "draft_training.__main__.validate_draft",
+                side_effect=lambda directory: validate_draft(directory, family=False),
+            ),
+        ):
+            metrics = run_evaluation(evaluation)
+        self.assertEqual(set(metrics), {"baseline", "trained"})
+        report = read_json(evaluation.output / "test-report.json")
+        self.assertEqual(report["metrics"], metrics)
+        self.assertEqual(report["test_split"], split_manifest(test_data))
 
     def test_changed_execution_context_is_rejected_before_test_data_is_opened(self):
         import argparse

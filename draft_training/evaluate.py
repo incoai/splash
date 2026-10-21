@@ -13,6 +13,20 @@ from .losses import block_loss
 
 @torch.no_grad()
 def evaluate_cached(model, embedding, head, directory, recipe, device):
+    # Select the BF16 artifact that serving will load, rather than the FP32
+    # master parameters. Restore their original storage even if replay fails;
+    # the optimizer must retain every small update for the next training step.
+    masters = [(p, p.data) for p in model.parameters() if p.dtype != torch.bfloat16]
+    try:
+        for parameter, value in masters:
+            parameter.data = value.to(torch.bfloat16)
+        return _evaluate_cached(model, embedding, head, directory, recipe, device)
+    finally:
+        for parameter, value in masters:
+            parameter.data = value
+
+
+def _evaluate_cached(model, embedding, head, directory, recipe, device):
     model.eval()
     manifest = read_json(Path(directory) / "manifest.json")
     totals = {
@@ -77,6 +91,7 @@ def evaluate_cached(model, embedding, head, directory, recipe, device):
     count = totals["tokens"]
     return {
         "scope": "frozen-teacher greedy trace replay; not native throughput or sampled acceptance",
+        "weight_precision": "BF16 serving export",
         "supervision": manifest["binding"]["supervision"],
         "blocks": totals["blocks"],
         "continuations_evaluated": totals["continuations_evaluated"],

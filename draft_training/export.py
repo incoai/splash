@@ -6,11 +6,13 @@ import tempfile
 from pathlib import Path
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 from .config import (
     TrainingError,
     checkpoint_identity,
+    checkpoint_index,
     read_json,
     validate_draft,
     write_json,
@@ -61,6 +63,29 @@ def export_model(model, destination, provenance, *, family=True, shard_bytes=512
         if stage.exists():
             shutil.rmtree(stage)
     return checkpoint_identity(destination)
+
+
+def verify_export(model, directory, provenance, *, family=True):
+    """Recover a published export only when it matches the selected checkpoint."""
+    directory = Path(directory)
+    if (
+        validate_draft(directory, family=family) != model.raw_config
+        or read_json(directory / "training-provenance.json") != provenance
+    ):
+        raise TrainingError(
+            "existing export differs from the selected checkpoint provenance"
+        )
+    index = checkpoint_index(directory)
+    state = model.state_dict()
+    for filename in sorted({item["file"] for item in index.values()}):
+        with safe_open(directory / filename, framework="pt", device="cpu") as shard:
+            for name in shard.keys():
+                expected = state[name].detach().to(device="cpu", dtype=torch.bfloat16)
+                if not torch.equal(shard.get_tensor(name), expected):
+                    raise TrainingError(
+                        f"existing export differs from the selected checkpoint: {name}"
+                    )
+    return checkpoint_identity(directory)
 
 
 def save_checkpoint(model, optimizer, directory, state):
