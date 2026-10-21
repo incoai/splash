@@ -18,6 +18,7 @@ import json
 import math
 import os
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -54,13 +55,50 @@ def fingerprint(path):
 
 
 def environment():
-    return {
+    snapshot = {
         key: subprocess.check_output(command, text=True).strip()
         for key, command in (
             ("power", ["pmset", "-g", "batt"]),
             ("thermal", ["pmset", "-g", "therm"]),
         )
     }
+    return {**snapshot, "unix_seconds": time.time(), "awake_seconds": time.monotonic()}
+
+
+def validate_awake_period(report):
+    before, after = report["environment"], report["final_environment"]
+    difference = (after["unix_seconds"] - before["unix_seconds"]) - (
+        after["awake_seconds"] - before["awake_seconds"]
+    )
+    report["unaccounted_wall_seconds"] = difference
+    smoke.require(
+        abs(difference) < 1,
+        "system suspend or wall-clock adjustment invalidated the benchmark; rerun awake",
+    )
+
+
+@contextlib.contextmanager
+def keep_awake():
+    keeper = None
+    if sys.platform == "darwin":
+        keeper = subprocess.Popen(
+            ["/usr/bin/caffeinate", "-is", "-w", str(os.getpid())],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    try:
+        yield
+    finally:
+        if keeper is not None:
+            try:
+                keeper.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                keeper.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                keeper.kill()
+                keeper.wait(timeout=5)
 
 
 @contextlib.contextmanager
@@ -692,6 +730,7 @@ def run_sequential(args, tokenizer, report, binaries):
                     server.log.seek(0)
                     (args.output / f"round-{arm}.log").write_text(server.log.read())
         report["final_environment"] = environment()
+        validate_awake_period(report)
         report["complete"] = True
     except BaseException as error:
         report["error"] = str(error)
@@ -700,6 +739,7 @@ def run_sequential(args, tokenizer, report, binaries):
         path.write_text(json.dumps(report, indent=2) + "\n")
 
 
+@keep_awake()
 def main():
     args = parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
@@ -715,6 +755,9 @@ def main():
         "scenario": args.scenario,
         "residency": args.residency,
         "tool_sha256": fingerprint(Path(__file__)),
+        "sleep_prevention": "caffeinate -is scoped to benchmark process"
+        if sys.platform == "darwin"
+        else "unavailable on this platform",
         "primary_metric": "native decode cycle seconds/token"
         if args.scenario == "decode"
         else "total workload wall seconds/output token",
@@ -833,6 +876,7 @@ def main():
             report["probes"] = [fallback_probes(server, args) for server in servers]
         report["final_status"] = [status(server, args) for server in servers]
         report["final_environment"] = environment()
+        validate_awake_period(report)
         report["complete"] = True
     except BaseException as error:
         report["error"] = str(error)
