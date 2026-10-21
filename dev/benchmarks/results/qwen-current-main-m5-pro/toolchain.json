@@ -1,0 +1,18 @@
+{
+  "captured_utc": "2026-10-21",
+  "runtime_base": "1482f6bbc2abf12375332725302019594150b6cb",
+  "chip": "Apple M5 Pro",
+  "gpu_cores": 20,
+  "memory_gib": 48,
+  "macos": "26.6.0",
+  "gpu_family": "Apple10",
+  "clang": "Apple clang version 21.0.0 (clang-2100.3.34.2)",
+  "metal": "Apple metal version 32023.921 (metalfe-32023.921.6)",
+  "sdk_version": "27.0",
+  "developer_directory": "/Applications/Xcode.app/Contents/Developer",
+  "deployment_target": "26.4",
+  "cxx_flags": "-std=c++20 -O3 -Wall -Wextra -Werror -Iruntime -mmacosx-version-min=26.4",
+  "objcxx_extra_flags": "-fobjc-arc",
+  "metal_flags": "-std=metal4.0 -O3 -Wall -Wextra -Werror -Iruntime -mmacosx-version-min=26.4",
+  "note": "Tool versions read before the queued current-main native build. Exact build commands, exit results and output hashes accompany the executed ledger; this file alone is not a successful-build claim."
+}

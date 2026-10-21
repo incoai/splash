@@ -11,8 +11,11 @@ selected fixed control. Keep the roadmap's experimental/default-off policy;
 these data do not justify broad adaptive promotion on this device.
 
 The independent full-width MLX reference crossed sleep and is excluded. Its
-awake replacement is pending in `policy-summary.json`. A completed held-out
-negative decision is distinct from that unfinished reference replacement.
+awake replacement is complete in `adaptive-full-reference-mlx-awake.json`; all
+three trials remain inconclusive (8.62–19.91% noise). The apparent 10.53–21.22%
+cost reductions therefore do not qualify a benefit. Its UTC/awake discrepancy
+is below one second. This extra reference does not change the held-out
+negative decision.
 
 ## Source and controls
 
@@ -82,7 +85,12 @@ preservation. This evaluation's primary workloads are greedy only.
 
 The original additional MLX full-eight-row reference has three inconclusive
 trials and crossed sleep. `qualification_validity.usable=false` excludes it
-regardless of any apparent gain. The awake repeat will be attached separately.
+regardless of any apparent gain. The completed awake repeat is attached separately and remains inconclusive.
+Its strict-JSON probe hashes match; the four seeded sampled probes have three
+distinct hashes. Probe execution is not a claim of sampled output equality or
+distribution preservation. The fixed-depth qualification override applies
+only to unconstrained all-greedy batches; sampled probes retain upstream
+adaptive behavior in both arms.
 The four held-out report intervals above are unaffected by the power audit.
 
 ## Evidence and interpretation

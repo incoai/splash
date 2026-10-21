@@ -1,5 +1,5 @@
 {
-  "local_evaluation_complete": false,
+  "local_evaluation_complete": true,
   "upstream_revision": "67bb94069179470125d393da5e5725e3f1501f9d",
   "control_patch_sha256": "efe5ee2ce8a7820d5850b537ba85212aa3eabbd09df909feaf9dd5ac0ca972e5",
   "selections": [
@@ -209,7 +209,5 @@
       "changed_output_hashes": 3
     }
   ],
-  "pending": [
-    "adaptive-full-reference-mlx-awake"
-  ]
+  "pending": []
 }

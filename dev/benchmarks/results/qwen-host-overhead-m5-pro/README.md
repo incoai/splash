@@ -88,14 +88,18 @@ portable copies. All output hashes and sampled/constrained probes match.
 The warmed series gives each server the same number of complete 2k/512-token
 warmup requests until both accumulate at least ten seconds of warmup work.
 Warmups are outside measured deltas. Every stable gain is below the promotion
-rule `max(2%,2*noise)`; noise above 5% is inconclusive, never a pass. Neither
-series supports shipping the change for inference throughput.
+rule `max(2%,2*noise)`; noise above 5% is inconclusive, never a pass. The valid initial and awake replacement series do not support shipping the
+change for inference throughput.
 
 **Power-log audit correction:** the warmed series crossed a sleep/wake
 transition and is excluded from performance qualification in its entirety,
 including the two low-spread trials. Its raw numbers above are retained as
-historical diagnostics, not usable evidence. An awake repeat is queued with
-process-scoped sleep prevention and an elapsed UTC/awake-clock validity check.
+historical diagnostics, not usable evidence. The awake replacement `serving-warmed-awake.json` uses process-scoped sleep
+prevention and an elapsed UTC/awake-clock validity check. All three trials are
+valid: throughput changes **-0.154%, -0.065%, -0.371%**, with noise
+**0.184%, 0.208%, 0.865%**. Every output hash and fallback probe matches.
+The UTC/awake discrepancy is 0.000272 seconds. No gain clears the 2% floor;
+there is no detected throughput regression beyond that floor either.
 The initial series is unaffected. See the [audit](../qwen-serving-qualification-m5-pro/power-audit.json).
 
 The patch stays an experiment. Device-side propagation, double-buffered arenas

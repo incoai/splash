@@ -1,0 +1,624 @@
+{
+  "legacy_serving_matrix_complete": false,
+  "reports": [
+    {
+      "model": "moe",
+      "mode": "prefix-resume",
+      "artifact": "moe-prefix-resume.json",
+      "full_budgets_verified": true,
+      "ane_configuration_consistent": true,
+      "initial_ane_configurations": [
+        [
+          "off",
+          0,
+          0
+        ],
+        [
+          "off",
+          0,
+          0
+        ],
+        [
+          "off",
+          0,
+          0
+        ],
+        [
+          "off",
+          0,
+          0
+        ]
+      ],
+      "unaccounted_wall_seconds": null,
+      "contexts": [
+        {
+          "context": 8192,
+          "trials": 3,
+          "qualified_throughput_gains": 0,
+          "throughput_inconclusive": 3,
+          "throughput_regressions": 0,
+          "latency": {
+            "short_ttft_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 3
+            },
+            "long_ttft_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 3
+            },
+            "active_gap_p95_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 3
+            },
+            "active_gap_max_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 3
+            }
+          },
+          "descriptive_distributions": {
+            "short_ttft_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 562.4831459863344,
+                "p95_ms_descriptive": 605.6188022339484
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 567.311229504412,
+                "p95_ms_descriptive": 574.7112077588099
+              }
+            },
+            "long_ttft_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 2716.773665990331,
+                "p95_ms_descriptive": 2865.7528434996493
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 2676.464395990479,
+                "p95_ms_descriptive": 2792.0392294909107
+              }
+            },
+            "active_gap_p95_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 33.606937416334404,
+                "p95_ms_descriptive": 37.07995262338953
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 34.527024706767406,
+                "p95_ms_descriptive": 35.752263970061904
+              }
+            },
+            "active_gap_max_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 398.11177049705293,
+                "p95_ms_descriptive": 425.00608299451414
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 400.3372705046786,
+                "p95_ms_descriptive": 435.4424267585273
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "model": "dense",
+      "mode": "cold",
+      "artifact": "dense-cold.json",
+      "full_budgets_verified": true,
+      "ane_configuration_consistent": true,
+      "initial_ane_configurations": [
+        [
+          "split",
+          0.4117647059,
+          1801
+        ],
+        [
+          "split",
+          0.4117647059,
+          1801
+        ],
+        [
+          "split",
+          0.4117647059,
+          1801
+        ],
+        [
+          "split",
+          0.4117647059,
+          1801
+        ]
+      ],
+      "unaccounted_wall_seconds": 0.015384350495878607,
+      "contexts": [
+        {
+          "context": 2048,
+          "trials": 3,
+          "qualified_throughput_gains": 0,
+          "throughput_inconclusive": 1,
+          "throughput_regressions": 0,
+          "latency": {
+            "short_ttft_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 3
+            },
+            "long_ttft_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 3
+            },
+            "active_gap_p95_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 0
+            },
+            "active_gap_max_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 3
+            }
+          },
+          "descriptive_distributions": {
+            "short_ttft_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 3806.240041492856,
+                "p95_ms_descriptive": 4081.7717602476478
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 3966.02522948524,
+                "p95_ms_descriptive": 4161.708916748466
+              }
+            },
+            "long_ttft_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 10706.20589601458,
+                "p95_ms_descriptive": 11153.818655999203
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 11021.544021001318,
+                "p95_ms_descriptive": 11847.535656510445
+              }
+            },
+            "active_gap_p95_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 357.53468983384664,
+                "p95_ms_descriptive": 369.9908177695761
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 366.7791010615474,
+                "p95_ms_descriptive": 381.69482210541895
+              }
+            },
+            "active_gap_max_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 418.8068329822272,
+                "p95_ms_descriptive": 706.0260210128035
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 442.87635399086867,
+                "p95_ms_descriptive": 711.8820317555219
+              }
+            }
+          }
+        },
+        {
+          "context": 8192,
+          "trials": 3,
+          "qualified_throughput_gains": 0,
+          "throughput_inconclusive": 0,
+          "throughput_regressions": 0,
+          "latency": {
+            "short_ttft_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 3
+            },
+            "long_ttft_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 0
+            },
+            "active_gap_p95_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 0
+            },
+            "active_gap_max_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 2
+            }
+          },
+          "descriptive_distributions": {
+            "short_ttft_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 4038.70268749597,
+                "p95_ms_descriptive": 4101.818385512161
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 4110.886666996521,
+                "p95_ms_descriptive": 4330.085613990377
+              }
+            },
+            "long_ttft_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 27927.639541507233,
+                "p95_ms_descriptive": 30913.015812737285
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 27583.173374994658,
+                "p95_ms_descriptive": 30139.974666992202
+              }
+            },
+            "active_gap_p95_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 373.97658299596515,
+                "p95_ms_descriptive": 390.14167687491863
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 370.67359351203777,
+                "p95_ms_descriptive": 377.95486511458876
+              }
+            },
+            "active_gap_max_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 426.43916652014013,
+                "p95_ms_descriptive": 467.4027292494429
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 424.2648124927655,
+                "p95_ms_descriptive": 474.6161145012593
+              }
+            }
+          }
+        },
+        {
+          "context": 31744,
+          "trials": 3,
+          "qualified_throughput_gains": 0,
+          "throughput_inconclusive": 0,
+          "throughput_regressions": 0,
+          "latency": {
+            "short_ttft_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 1
+            },
+            "long_ttft_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 0
+            },
+            "active_gap_p95_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 0
+            },
+            "active_gap_max_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 1
+            }
+          },
+          "descriptive_distributions": {
+            "short_ttft_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 4100.69920848764,
+                "p95_ms_descriptive": 4213.423875014996
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 4063.489167005173,
+                "p95_ms_descriptive": 4174.630239751423
+              }
+            },
+            "long_ttft_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 77031.74277101061,
+                "p95_ms_descriptive": 79111.07538597571
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 76041.7868749937,
+                "p95_ms_descriptive": 78743.20667672873
+              }
+            },
+            "active_gap_p95_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 374.47566673654364,
+                "p95_ms_descriptive": 384.1498592446442
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 370.8268542541191,
+                "p95_ms_descriptive": 374.10666662617587
+              }
+            },
+            "active_gap_max_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 430.19222949806135,
+                "p95_ms_descriptive": 435.33190574817127
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 430.1394164940575,
+                "p95_ms_descriptive": 475.4305624956032
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "model": "dense",
+      "mode": "cached",
+      "artifact": "dense-cached.json",
+      "full_budgets_verified": true,
+      "ane_configuration_consistent": true,
+      "initial_ane_configurations": [
+        [
+          "split",
+          0.4117647059,
+          1801
+        ],
+        [
+          "split",
+          0.4117647059,
+          1801
+        ],
+        [
+          "split",
+          0.4117647059,
+          1801
+        ],
+        [
+          "split",
+          0.4117647059,
+          1801
+        ]
+      ],
+      "unaccounted_wall_seconds": -0.0009475239203311503,
+      "contexts": [
+        {
+          "context": 8192,
+          "trials": 3,
+          "qualified_throughput_gains": 0,
+          "throughput_inconclusive": 0,
+          "throughput_regressions": 0,
+          "latency": {
+            "short_ttft_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 0
+            },
+            "long_ttft_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 0
+            },
+            "active_gap_p95_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 1
+            },
+            "active_gap_max_ms": {
+              "qualified_reductions": 0,
+              "regressions": 1,
+              "inconclusive": 2
+            }
+          },
+          "descriptive_distributions": {
+            "short_ttft_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 3665.572790996521,
+                "p95_ms_descriptive": 3754.817083266971
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 3719.6261454955675,
+                "p95_ms_descriptive": 3760.976375247992
+              }
+            },
+            "long_ttft_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 2341.3001664885087,
+                "p95_ms_descriptive": 2366.590177247417
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 2344.566854502773,
+                "p95_ms_descriptive": 2363.723520997155
+              }
+            },
+            "active_gap_p95_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 80.17196782020619,
+                "p95_ms_descriptive": 82.97161802074697
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 79.42562855168944,
+                "p95_ms_descriptive": 80.35656668507727
+              }
+            },
+            "active_gap_max_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 716.8902090197662,
+                "p95_ms_descriptive": 751.124447248003
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 750.9430210047867,
+                "p95_ms_descriptive": 758.6888962541707
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "model": "dense",
+      "mode": "prefix-resume",
+      "artifact": "dense-prefix-resume.json",
+      "full_budgets_verified": true,
+      "ane_configuration_consistent": true,
+      "initial_ane_configurations": [
+        [
+          "split",
+          0.4117647059,
+          1801
+        ],
+        [
+          "split",
+          0.4117647059,
+          1801
+        ],
+        [
+          "split",
+          0.4117647059,
+          1801
+        ],
+        [
+          "split",
+          0.4117647059,
+          1801
+        ]
+      ],
+      "unaccounted_wall_seconds": 0.013086813472909853,
+      "contexts": [
+        {
+          "context": 8192,
+          "trials": 3,
+          "qualified_throughput_gains": 0,
+          "throughput_inconclusive": 0,
+          "throughput_regressions": 0,
+          "latency": {
+            "short_ttft_ms": {
+              "qualified_reductions": 1,
+              "regressions": 0,
+              "inconclusive": 0
+            },
+            "long_ttft_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 0
+            },
+            "active_gap_p95_ms": {
+              "qualified_reductions": 0,
+              "regressions": 0,
+              "inconclusive": 0
+            },
+            "active_gap_max_ms": {
+              "qualified_reductions": 1,
+              "regressions": 0,
+              "inconclusive": 1
+            }
+          },
+          "descriptive_distributions": {
+            "short_ttft_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 4202.852854010416,
+                "p95_ms_descriptive": 4258.449708489934
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 4055.380416510161,
+                "p95_ms_descriptive": 4165.78231274616
+              }
+            },
+            "long_ttft_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 20127.568812516984,
+                "p95_ms_descriptive": 20903.900489240186
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 20082.98910400481,
+                "p95_ms_descriptive": 20760.859229252674
+              }
+            },
+            "active_gap_p95_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 385.2013228679425,
+                "p95_ms_descriptive": 392.76260298465786
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 379.47385400912026,
+                "p95_ms_descriptive": 391.4180962401588
+              }
+            },
+            "active_gap_max_ms": {
+              "ema": {
+                "samples": 6,
+                "p50_ms": 437.1550415089587,
+                "p95_ms_descriptive": 769.7834684950067
+              },
+              "bucketed": {
+                "samples": 6,
+                "p50_ms": 432.77285448857583,
+                "p95_ms_descriptive": 714.7724375026883
+              }
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "pending": [
+    "prefill-cost-moe-cold",
+    "prefill-cost-moe-cached"
+  ],
+  "excluded": [
+    {
+      "model": "moe",
+      "mode": "cold",
+      "reason": "sleep/dark-wake; original raw trace kept locally"
+    },
+    {
+      "model": "moe",
+      "mode": "cached",
+      "reason": "sleep/dark-wake; original raw trace kept locally"
+    }
+  ],
+  "note": "Historical implementation 02a1162e on bc09da81; not current-main qualification. Six arm samples per context are descriptive, not independent high-confidence tail estimates. Latency promotion uses relative cost reduction > max(2%,2*noise); throughput promotion uses output-rate gain above that bound."
+}

@@ -1,5 +1,5 @@
 {
-  "local_matrix_complete": false,
+  "local_matrix_complete": true,
   "reports": [
     {
       "model": "gguf",
@@ -48,17 +48,146 @@
           "median_throughput_gain_descriptive_only": 0.032163407872228156
         }
       ]
+    },
+    {
+      "model": "gguf",
+      "width": 2,
+      "artifact": "prefix-gguf-b2.json",
+      "residency": "sequential",
+      "contexts": [
+        {
+          "context": 2048,
+          "trials": 3,
+          "qualified_speed_gains": 1,
+          "inconclusive": 0,
+          "regressions": 0,
+          "changed_output_hashes": [],
+          "median_throughput_gain_descriptive_only": 0.01063953068440493
+        }
+      ]
+    },
+    {
+      "model": "gguf",
+      "width": 3,
+      "artifact": "prefix-gguf-b3.json",
+      "residency": "sequential",
+      "contexts": [
+        {
+          "context": 2048,
+          "trials": 3,
+          "qualified_speed_gains": 1,
+          "inconclusive": 0,
+          "regressions": 0,
+          "changed_output_hashes": [],
+          "median_throughput_gain_descriptive_only": 0.013312850297190204
+        }
+      ]
+    },
+    {
+      "model": "gguf",
+      "width": 4,
+      "artifact": "prefix-gguf-b4.json",
+      "residency": "sequential",
+      "contexts": [
+        {
+          "context": 2048,
+          "trials": 3,
+          "qualified_speed_gains": 0,
+          "inconclusive": 0,
+          "regressions": 0,
+          "changed_output_hashes": [],
+          "median_throughput_gain_descriptive_only": 0.013275246837037624
+        }
+      ]
+    },
+    {
+      "model": "mlx",
+      "width": 1,
+      "artifact": "prefix-mlx-b1.json",
+      "residency": "sequential",
+      "contexts": [
+        {
+          "context": 2048,
+          "trials": 9,
+          "qualified_speed_gains": 6,
+          "inconclusive": 0,
+          "regressions": 0,
+          "changed_output_hashes": [],
+          "median_throughput_gain_descriptive_only": 0.03182050573054096
+        },
+        {
+          "context": 8192,
+          "trials": 9,
+          "qualified_speed_gains": 0,
+          "inconclusive": 0,
+          "regressions": 0,
+          "changed_output_hashes": [],
+          "median_throughput_gain_descriptive_only": 0.025141797781017772
+        },
+        {
+          "context": 31744,
+          "trials": 9,
+          "qualified_speed_gains": 2,
+          "inconclusive": 3,
+          "regressions": 0,
+          "changed_output_hashes": [],
+          "median_throughput_gain_descriptive_only": 0.02355986613064287
+        }
+      ]
+    },
+    {
+      "model": "mlx",
+      "width": 2,
+      "artifact": "prefix-mlx-b2.json",
+      "residency": "sequential",
+      "contexts": [
+        {
+          "context": 2048,
+          "trials": 3,
+          "qualified_speed_gains": 3,
+          "inconclusive": 0,
+          "regressions": 0,
+          "changed_output_hashes": [],
+          "median_throughput_gain_descriptive_only": 0.03911466063263691
+        }
+      ]
+    },
+    {
+      "model": "mlx",
+      "width": 3,
+      "artifact": "prefix-mlx-b3.json",
+      "residency": "sequential",
+      "contexts": [
+        {
+          "context": 2048,
+          "trials": 3,
+          "qualified_speed_gains": 2,
+          "inconclusive": 0,
+          "regressions": 0,
+          "changed_output_hashes": [],
+          "median_throughput_gain_descriptive_only": 0.036696466815682616
+        }
+      ]
+    },
+    {
+      "model": "mlx",
+      "width": 4,
+      "artifact": "prefix-mlx-b4.json",
+      "residency": "sequential",
+      "contexts": [
+        {
+          "context": 2048,
+          "trials": 3,
+          "qualified_speed_gains": 2,
+          "inconclusive": 0,
+          "regressions": 0,
+          "changed_output_hashes": [],
+          "median_throughput_gain_descriptive_only": 0.031030056247517868
+        }
+      ]
     }
   ],
-  "pending": [
-    "prefix-gguf-b2",
-    "prefix-gguf-b3",
-    "prefix-gguf-b4",
-    "prefix-mlx-b1",
-    "prefix-mlx-b2",
-    "prefix-mlx-b3",
-    "prefix-mlx-b4"
-  ],
+  "pending": [],
   "excluded": [
     {
       "source": "final/prefix-mlx-b1-single",

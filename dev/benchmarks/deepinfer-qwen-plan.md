@@ -1,6 +1,12 @@
 # DeepInfer lessons and Qwen optimization plan
 
-**Versioned historical experiment:** runtime instructions and results below apply to their pinned legacy revisions. The runtime flags/build targets are not current-main settings. See [the October 21 current-main audit](current-main-audit.md) and [current qualification recipe](qwen-maintainer-runs.md). Replacement runs and final validation are still being completed.
+**Current integration: [PR #523](https://github.com/incoai/splash/pull/523).**
+Upstream advanced substantially during this investigation. The contribution now
+contains current-main benchmark tools and source-pinned experimental evidence;
+it changes no production runtime or default. See [the completion/review ledger](deepinfer-qwen-completion.md), [current-main
+source audit](current-main-audit.md) and [qualification recipe](qwen-maintainer-runs.md).
+Runtime instructions in the original design below describe the frozen legacy
+sources, rather than settings supported by today's main.
 
 
 Splash should first measure its current execution gaps and evaluate the existing
@@ -11,20 +17,21 @@ model architecture and trained confidence head differ from Splash's.
 
 ## Execution status
 
-The remaining roadmap is actively tracked in
-[#508](https://github.com/incoai/splash/issues/508). The initial MoE experiment
-is [PR #507](https://github.com/incoai/splash/pull/507); it does not complete
-all six steps. Work proceeds in independently reviewable changes, with measured
-decisions for the conditional optimizations.
+The roadmap is tracked in [#508](https://github.com/incoai/splash/issues/508).
+Completing a conditional optimization means implementing and testing its
+experiment, measuring its gate, and recording the resulting decision. A failed
+speed or latency gate leaves that experiment out of the product. Historical
+runtime PRs #507/#509/#510/#511/#522 are preserved separately; #523 is the
+reviewable contribution based on current main.
 
 | Step | Current status | Remaining gate |
 | --- | --- | --- |
-| 1. Runtime measurement | Native profiling complete; serving trace/HTTP tools in #509 | Full engine/mask/ANE timeline and repeatable workload results |
-| 2. Greedy MoE prefixes | Implemented and locally tested in #507 | Expanded formats/contexts and repeatable HTTP qualification |
-| 3. Pending-tape GDN pruning | Experiment complete in draft #511; correctness passes, speed gate not met | Keep off; other hardware remains unexecuted |
-| 4. Cost-aware policy | Fixed sweeps complete; adaptive evaluation pending | Held-out comparison with the best fixed policy; coordinate with #487 |
-| 5. Host overhead | Allocation experiment and serving repeats complete; no qualified gain | Retain baseline; larger reuse/overlap deferred by measured gate |
-| 6. Mixed prefill/decode | Measurement and estimator experiment pending | Contended latency/throughput and fairness checks |
+| 1. Runtime measurement | Per-width operator tables, full-engine/mask traces and overlap-validating HTTP tools complete | Finish final single-resident ANE trace; current-main model checks |
+| 2. Greedy MoE prefixes | Both formats B1 context/workload and B2–B4 matrices complete: 72 ABBA trials | Exact-prompt hash replay; upstream #487 supersedes the prototype |
+| 3. Pending-tape GDN pruning | Complete: 128 shader combinations, real-model oracles, native/HTTP controls; promotion gate not met | Keep historical prototype off; no current runtime change |
+| 4. Cost-aware policy | Complete: 14 training reports, 18 held-out trials and awake full-width reference against #487 revision `67bb9406`; held-out promotion fails | Later merged #487 has different code; no current-main regression claim |
+| 5. Host overhead | Complete: one allocation saved per dispatch, ownership/GPU checks and awake serving repeats; no qualified gain | Retain runtime baseline; no larger reuse pipeline justified |
+| 6. Mixed prefill/decode | Prototype, causal prediction analysis and dense cold/cache/continuation comparisons complete | Awake MoE replacements, actual policy trace and dedicated scheduler sanitizer runs |
 
 Only this M5 Pro is available for local runs. Other GPU families will receive
 [a repeatable maintainer-run package](qwen-maintainer-runs.md); those tests remain unexecuted until their
