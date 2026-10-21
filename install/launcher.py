@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Serve in the foreground, or connect an installed agent to the local server."""
+"""Serve in the foreground, generate one video, or connect an installed agent
+to the local server."""
 
 import argparse
 import errno
@@ -30,11 +31,12 @@ from . import models as model_artifacts
 
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
-# Either stops `splash serve` wherever it is. The programs with handlers of
-# their own, the installer it runs and the server it executes, start with
-# them blocked, not ignored, until those handlers are in place, so one sent
-# meanwhile waits for its handler instead of being lost or ending the
-# program in a traceback. make and the device check run with them unblocked.
+# Either stops `splash serve` or `splash generate` wherever it is. The
+# programs with handlers of their own, the installer it runs and the server
+# or clip it executes, start with them blocked, not ignored, until those
+# handlers are in place, so one sent meanwhile waits for its handler instead
+# of being lost or ending the program in a traceback. make and the device
+# check run with them unblocked.
 STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 
@@ -186,6 +188,54 @@ def _check_port(host, port):
             raise OSError(errno.EADDRINUSE, os.strerror(errno.EADDRINUSE))
 
 
+def _share_installation(installation):
+    """Hold the installation lock shared, as every server does; an upgrade
+    holds it exclusively."""
+    try:
+        fcntl.flock(installation, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise LauncherError(
+            "Splash is being upgraded; wait for the upgrade to finish"
+        ) from None
+
+
+def _exec_server(module, selection, model, arguments, environment, held):
+    """Execute the server package's module on selection's assembly, keeping
+    the held files open across the exec.
+
+    The server package of this installation, from any working directory: -P
+    keeps the directory, which may hold a package of the same name, off
+    sys.path, and PYTHONPATH names the root. The program holds the assembly
+    the selection link names when it starts, and runs from it until it exits,
+    however an installation advances the link meanwhile."""
+    command = [
+        str(paths.PYTHON),
+        "-u",
+        "-P",
+        "-m",
+        module,
+        str(selection.link),
+        "--model",
+        model,
+        "--binary",
+        str(paths.BINARY),
+        *arguments,
+    ]
+    environment = dict(
+        os.environ,
+        PYTHONUNBUFFERED="1",
+        TRANSFORMERS_VERBOSITY="error",
+        PYTHONPATH=str(ROOT),
+        **environment,
+    )
+    for file in held:
+        os.set_inheritable(file.fileno(), True)
+    # The exec resets the handlers; the program unblocks the signals once its
+    # own are in place, past its imports.
+    signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    os.execve(command[0], command, environment)
+
+
 def serve(args):
     # Started in the background from a non-interactive shell, the launcher
     # inherits SIGINT as ignored; take both stop signals from the start.
@@ -200,13 +250,7 @@ def serve(args):
         (RUNTIME_DIR / "serve.lock").open("a+") as installation,
         (RUNTIME_DIR / f"serve-{args.port}.lock").open("a+") as lock,
     ):
-        # Servers share the installation; upgrades require exclusive access.
-        try:
-            fcntl.flock(installation, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise LauncherError(
-                "Splash is being upgraded; wait for the upgrade to finish"
-            ) from None
+        _share_installation(installation)
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -234,40 +278,46 @@ def serve(args):
             draft_model=args.draft_model,
         )
         _ensure_installed(selection)
-        # The server package of this installation, from any working
-        # directory: -P keeps the directory, which may hold a package of the
-        # same name, off sys.path, and PYTHONPATH names the root. The server
-        # holds the assembly the selection link names when it starts, and
-        # serves from it until it exits, however an installation advances the
-        # link meanwhile.
-        command = [
-            str(paths.PYTHON),
-            "-u",
-            "-P",
-            "-m",
+        _exec_server(
             "server.server",
-            str(selection.link),
-            "--model",
+            selection,
             args.model,
-            "--binary",
-            str(paths.BINARY),
-            "--port",
-            str(args.port),
-            *serve_options.serve_argv(args),
-        ]
-        environment = dict(
-            os.environ,
-            PYTHONUNBUFFERED="1",
-            TRANSFORMERS_VERBOSITY="error",
-            PYTHONPATH=str(ROOT),
-            **serve_options.serve_environment(args),
+            ["--port", str(args.port), *serve_options.serve_argv(args)],
+            serve_options.serve_environment(args),
+            (installation, lock),
         )
-        os.set_inheritable(installation.fileno(), True)
-        os.set_inheritable(lock.fileno(), True)
-        # The exec resets the handlers; the server unblocks the signals once
-        # its own are in place, past its imports.
-        signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
-        os.execve(command[0], command, environment)
+
+
+def generate(args):
+    """Install the model as serve does, then execute one clip of it on its
+    engine (server/videos.py), which refuses a language model; no HTTP
+    server starts. The clip's program exits with the engine's outcome."""
+    for number in STOP_SIGNALS:
+        signal.signal(number, _interrupt)
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with (RUNTIME_DIR / "serve.lock").open("a+") as installation:
+        _share_installation(installation)
+        selection = model_artifacts.Selection.of(paths.MODELS, args.model)
+        _ensure_installed(selection)
+        # The flags as a POST /v1/videos body, which the program checks as
+        # the server checks one; an absent flag takes the route's default.
+        fields = {
+            "prompt": args.prompt,
+            "seconds": args.seconds,
+            "seed": args.seed,
+            "variant": args.variant,
+            "preview": args.preview,
+            "audio": not args.no_audio,
+        }
+        request = {name: value for name, value in fields.items() if value is not None}
+        _exec_server(
+            "server.videos",
+            selection,
+            args.model,
+            ["--out", str(args.out), "--request", json.dumps(request)],
+            {},
+            (installation,),
+        )
 
 
 def coding_client(args):
@@ -428,6 +478,45 @@ def parse_args(argv=None):
         help=f"HTTP port (default: SPLASH_PORT or {serve_options.DEFAULT_PORT})",
     )
     serve_options.add_serve_arguments(server, groups)
+    generator = commands.add_parser(
+        "generate",
+        help="generate one video clip with a video model",
+        description="Install a video model as serve does and write one clip "
+        "of a prompt as an mp4; no server starts. Ctrl+C cancels it at the next "
+        "step.",
+        epilog="Example:\n  splash generate --model MiniMaxAI/MiniMax-H3 "
+        "--prompt 'A golden retriever runs along a beach at sunset.' --out clip.mp4",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    generator.add_argument(
+        "--model",
+        type=serve_options.parse_model_id,
+        required=True,
+        metavar="OWNER/REPO",
+        help="upstream Hugging Face video model, such as MiniMaxAI/MiniMax-H3",
+    )
+    generator.add_argument("--prompt", required=True, help="what the clip shows")
+    generator.add_argument(
+        "--out", type=Path, required=True, metavar="PATH", help="the mp4 to write"
+    )
+    generator.add_argument(
+        "--seconds", metavar="SECONDS", help="clip length: 3, 10 or 15 (default 3)"
+    )
+    generator.add_argument("--seed", metavar="SEED", help="noise seed (default 0)")
+    generator.add_argument(
+        "--variant",
+        metavar="VARIANT",
+        help="turbo (8 steps, the default) or default (50 steps)",
+    )
+    generator.add_argument(
+        "--preview",
+        action="store_true",
+        help="also write the fast preview, to PATH's stem with .preview.mp4, "
+        "as soon as it is decoded",
+    )
+    generator.add_argument(
+        "--no-audio", action="store_true", help="a clip without its audio track"
+    )
     for name in clients.INSTALL_URLS:
         client = commands.add_parser(
             name,
@@ -448,6 +537,11 @@ def parse_args(argv=None):
             client_args = client_args[1:]
     else:
         args = parser.parse_args(argv)
+        if client_args:
+            parser.error("arguments after -- are only supported for coding clients")
+    args.client_args = client_args
+    if args.command == "generate":
+        return args
     # An explicit --port wins; SPLASH_PORT is read only without one.
     args.explicit_port = args.port is not None
     if not args.explicit_port:
@@ -459,16 +553,16 @@ def parse_args(argv=None):
             parser.error(f"SPLASH_PORT: {error}")
     if args.command == "serve":
         serve_options.check_serve_arguments(parser, args)
-    if client_args and args.command == "serve":
-        parser.error("arguments after -- are only supported for coding clients")
-    args.client_args = client_args
     return args
 
 
 def main(argv=None):
     args = parse_args(argv)
     try:
-        return serve(args) if args.command == "serve" else coding_client(args)
+        command = {"serve": serve, "generate": generate}.get(
+            args.command, coding_client
+        )
+        return command(args)
     except (LauncherError, clients.ClientError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

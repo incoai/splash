@@ -10,17 +10,23 @@ on the GPU, the others wait in a short queue in their order of arrival. A
 job's progress follows the engine's phases, its denoising step by step; its
 preview and mp4 stay in a store of bounded bytes, which evicts the oldest
 finished job first; DELETE cancels a job, a running one at its next step.
+
+`python -m server.videos`, which `splash generate` starts, runs one clip on
+the engine instead and writes its mp4 (main, generate).
 """
 
 from __future__ import annotations
 
+import argparse
 import email.parser
 import email.policy
 import itertools
+import json
 import os
 import re
 import secrets
 import select
+import signal
 import subprocess
 import threading
 import time
@@ -29,7 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs
 
-from install import assembly, video
+from install import assembly, models, video
 
 from . import protocol as wire
 from .diagnostics import print_status
@@ -67,8 +73,10 @@ PHASE_PROGRESS = {
     wire.VideoPhase.AUDIO: 98,
     wire.VideoPhase.MUX: 100,
 }
-# How long a stopping engine may take to end its request.
+# How long a stopping engine may take to end its request, and a starting one
+# to announce Ready, as the server waits for a language model's.
 CLOSE_SECONDS = 30.0
+START_SECONDS = 600.0
 JOB_ID = re.compile(r"/v1/videos/(video_[0-9a-f]{32})(/content)?")
 
 
@@ -146,6 +154,46 @@ def parse_request(fields, names):
         _boolean(fields, "preview", False),
         _boolean(fields, "audio", True),
     )
+
+
+def prompt_tokens(tokenizer, prompt, ready):
+    """The prompt's token ids, as the text encoder of the engine that
+    announced ready takes them."""
+    tokens = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    if not 2 <= len(tokens) <= ready.max_context_tokens:
+        raise APIError(
+            400,
+            f"the prompt is {len(tokens)} tokens; the text encoder takes 2 to "
+            f"{ready.max_context_tokens}",
+        )
+    return tuple(tokens)
+
+
+def clip(request, tokens):
+    """A VideoRequestFrame's fields but its id: the clip of request."""
+    outputs = wire.VideoOutputFlag(0)
+    if request.preview:
+        outputs |= wire.VideoOutputFlag.PREVIEW
+    if request.audio:
+        outputs |= wire.VideoOutputFlag.AUDIO
+    width, height = (int(n) for n in SIZE.split("x"))
+    return (VARIANTS[request.variant], outputs, CLIP_FRAMES[request.seconds], width,
+            height, request.steps, request.seed, tokens)  # fmt: skip
+
+
+def load(model_root, binary, startup_timeout):
+    """The engine of the assembly at model_root, started and ready, and the
+    tokenizer its prompts are encoded with."""
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_root / "tokenizer", local_files_only=True, trust_remote_code=False
+    )
+    engine = VideoEngine(
+        [str(binary), "serve-native", str(model_root)], startup_timeout
+    )
+    engine.start()
+    return engine, tokenizer
 
 
 def form_fields(content_type, payload):
@@ -362,13 +410,7 @@ class VideoService:
 
     def submit(self, fields):
         request = parse_request(fields, self.names)
-        tokens = self.tokenizer(request.prompt, add_special_tokens=False)["input_ids"]
-        if not 2 <= len(tokens) <= self.engine.ready.max_context_tokens:
-            raise APIError(
-                400,
-                f"the prompt is {len(tokens)} tokens; the text encoder takes 2 to "
-                f"{self.engine.ready.max_context_tokens}",
-            )
+        tokens = prompt_tokens(self.tokenizer, request.prompt, self.engine.ready)
         with self.lock:
             if self.closing:
                 raise APIError(503, "the server is shutting down", "server_shutdown")
@@ -378,9 +420,7 @@ class VideoService:
                     f"{MAX_QUEUED_JOBS} video jobs are already queued",
                     "video_queue_full",
                 )
-            job = Job(
-                "video_" + secrets.token_hex(16), self.names[0], request, tuple(tokens)
-            )
+            job = Job("video_" + secrets.token_hex(16), self.names[0], request, tokens)
             self.jobs[job.id] = job
             self.queue.append(job)
             self.lock.notify_all()
@@ -491,17 +531,10 @@ class VideoService:
                 self._evict()
 
     def _run(self, job):
-        request = job.request
-        outputs = wire.VideoOutputFlag(0)
-        if request.preview:
-            outputs |= wire.VideoOutputFlag.PREVIEW
-        if request.audio:
-            outputs |= wire.VideoOutputFlag.AUDIO
-        width, height = (int(n) for n in SIZE.split("x"))
-        clip = (VARIANTS[request.variant], outputs, CLIP_FRAMES[request.seconds], width,
-                height, request.steps, request.seed, job.tokens)  # fmt: skip
         try:
-            output = self.engine.run(clip, lambda event: self._report(job, event))
+            output = self.engine.run(
+                clip(job.request, job.tokens), lambda event: self._report(job, event)
+            )
         except VideoFailed as error:
             self._finish(job, None, {"code": error.code, "message": str(error)})
         else:
@@ -568,16 +601,7 @@ class VideoApp:
     def start(cls, model, names, model_root, binary, startup_timeout):
         """The app of the assembly at model_root, its engine started and
         ready, and its tokenizer loaded."""
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_root / "tokenizer", local_files_only=True, trust_remote_code=False
-        )
-        engine = VideoEngine(
-            [str(binary), "serve-native", str(model_root)], startup_timeout
-        )
-        engine.start()
-        return cls(model, names, engine, tokenizer)
+        return cls(model, names, *load(model_root, binary, startup_timeout))
 
     def status(self):
         return {"videos": self.videos.status()}
@@ -706,3 +730,106 @@ def handler(base):
                 self._safe_error(APIError(404, "model not found", "model_not_found"))
 
     return VideoHandler
+
+
+def generate(engine, tokenizer, request, out: Path):
+    """Run request on the ready engine as a job runs, its progress on
+    stderr, and write its mp4 to out; its preview, when asked, to
+    <out stem>.preview.mp4 as soon as it is decoded. Raises VideoFailed with
+    the engine's error, APIError for a prompt the encoder refuses."""
+    tokens = prompt_tokens(tokenizer, request.prompt, engine.ready)
+    preview = out.with_suffix(".preview.mp4")
+
+    def report(event):
+        if isinstance(event, wire.VideoOutputEvent):
+            preview.write_bytes(event.mp4)
+            print_status(f"Video · preview · {preview}", error=True)
+        else:
+            print_status(
+                f"Video · {event.phase.name.lower()} · step {event.step}/"
+                f"{event.steps} · {event.elapsed_micros / 1e6:.1f} s",
+                error=True,
+            )
+
+    output = engine.run(clip(request, tokens), report)
+    out.write_bytes(output.mp4)
+    print_status(
+        f"Video · {out} · {output.frames} frames · {output.wall_micros / 1e6:.1f} s",
+        error=True,
+    )
+
+
+def _stop(number, _frame):
+    raise KeyboardInterrupt(number)
+
+
+def main(argv=None):
+    """One clip of the video model at MODEL_ROOT: what `splash generate`
+    starts, with the POST /v1/videos fields its flags give. Exits 0 once the
+    mp4 is written, 1 on a refusal or the engine's error, and 128 + the
+    signal's number on SIGINT or SIGTERM, which cancel the clip at its next
+    step."""
+    parser = argparse.ArgumentParser(prog="python -m server.videos")
+    parser.add_argument("model_root", type=Path)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--binary", type=Path, required=True)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--request", type=json.loads, required=True)
+    args = parser.parse_args(argv)
+    for number in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(number, _stop)
+    engine = None
+    try:
+        # The launcher blocks both across its exec.
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
+        request = parse_request(args.request, (args.model,))
+        if not args.out.parent.is_dir():
+            raise APIError(400, f"{args.out.parent} is not a directory")
+        # Nothing reads `held`: it keeps the assembly from collection until
+        # this process exits, as the server's does.
+        model_root, held = assembly.hold(args.model_root)
+        if not serves(model_root):
+            raise APIError(
+                400,
+                f"{args.model} is a language model: splash generate takes a video "
+                "model, such as MiniMaxAI/MiniMax-H3; splash serve serves this one",
+            )
+        print_status(f"Loading · {args.model}", error=True)
+        engine, tokenizer = load(model_root, args.binary, START_SECONDS)
+        failure = []
+
+        def run():
+            try:
+                generate(engine, tokenizer, request, args.out)
+            except Exception as error:
+                failure.append(error)
+
+        # The clip runs beside this thread, which takes the stop signals and
+        # cancels it.
+        worker = threading.Thread(target=run, name="splash-generate", daemon=True)
+        worker.start()
+        try:
+            worker.join()
+        except KeyboardInterrupt:
+            print_status("Video · cancelling at the next step", error=True)
+            engine.cancel()
+            worker.join()
+            raise
+        if failure:
+            raise failure[0]
+        return 0
+    except (APIError, VideoFailed, models.ModelError, OSError) as error:
+        print_status(f"Error · {error}", error=True)
+        return 1
+    except KeyboardInterrupt as stop:
+        return 128 + (stop.args[0] if stop.args else signal.SIGINT)
+    finally:
+        # A stop during cleanup leaves it to end the engine.
+        for number in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(number, signal.SIG_IGN)
+        if engine is not None:
+            engine.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

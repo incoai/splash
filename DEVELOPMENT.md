@@ -2124,6 +2124,8 @@ OpenAI shape: `video_queue_full` (503) past four queued jobs,
 the mp4s and previews of finished jobs stay in a 4 GB store, the oldest
 evicted first.
 
+`splash generate --model MiniMaxAI/MiniMax-H3 --prompt ... --out clip.mp4` installs the model as `serve` does and runs one clip on its engine without a server (`python -m server.videos`): its flags are the `POST` fields, checked by the same `parse_request`; progress goes to stderr, `--preview` writes `clip.preview.mp4` once decoded, and Ctrl+C cancels at the next step.
+
 ### Video installation
 
 The model's assembly is of target format `h3-video` (`install/video.py`).

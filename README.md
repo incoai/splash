@@ -103,6 +103,8 @@ curl http://127.0.0.1:8000/v1/videos -H 'Content-Type: application/json' \
 curl http://127.0.0.1:8000/v1/videos/VIDEO_ID/content -o clip.mp4
 ```
 
+Without a server, `splash generate --model MiniMaxAI/MiniMax-H3 --prompt "..." --out clip.mp4 [--seconds 3|10|15] [--seed N] [--variant turbo|default] [--preview] [--no-audio]` writes one clip.
+
 | Turbo clip, M5 Pro 48 GB | Wall | Denoising | Video VAE | Engine peak |
 | --- | ---: | ---: | ---: | ---: |
 | 3 s | 5.8 min | 313 s | 27 s | 14.4 GB |

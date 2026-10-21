@@ -1,16 +1,21 @@
 """A video model's server (server/videos.py) over a stand-in engine
 (dev/tests/fake_video_engine.py): OpenAI's video API, through its own SDK
 too, the jobs' queue, cancellation and store, and a language model's routes
-absent."""
+absent; and the one clip `splash generate` runs."""
 
+import contextlib
 import http.client
+import io
 import json
+import os
+import signal
 import sys
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from openai import OpenAI
 
@@ -29,20 +34,25 @@ class FakeTokenizer:
         return {"input_ids": [ord(character) for character in text]}
 
 
+def fake_engine(log, step_seconds, *options):
+    return videos.VideoEngine(
+        [
+            sys.executable,
+            str(ROOT / "dev/tests/fake_video_engine.py"),
+            str(log),
+            str(step_seconds),
+            *options,
+        ],  # fmt: skip
+        30.0,
+    )
+
+
 class VideoServerTest(unittest.TestCase):
     def serve(self, step_seconds=0.02, budget_bytes=videos.STORE_BUDGET_BYTES):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.log = Path(temporary.name) / "engine.log"
-        engine = videos.VideoEngine(
-            [
-                sys.executable,
-                str(ROOT / "dev/tests/fake_video_engine.py"),
-                str(self.log),
-                str(step_seconds),
-            ],  # fmt: skip
-            30.0,
-        )
+        engine = fake_engine(self.log, step_seconds)
         engine.start()
         app = videos.VideoApp(MODEL, ("h3",), engine, FakeTokenizer())
         app.videos.budget_bytes = budget_bytes
@@ -185,6 +195,101 @@ class VideoServerTest(unittest.TestCase):
         listed = self.request("GET", "/v1/videos?order=asc&limit=100")[1]
         self.assertEqual([video["id"] for video in listed["data"]], [jobs[-1]["id"]])
         self.assertEqual(app.videos.status()["evictions"], videos.MAX_QUEUED_JOBS)
+
+
+class GenerateTest(unittest.TestCase):
+    """`python -m server.videos`, which `splash generate` executes: one clip
+    of a held assembly's engine, written to --out."""
+
+    def setUp(self):
+        for number in (signal.SIGINT, signal.SIGTERM):
+            self.addCleanup(signal.signal, number, signal.getsignal(number))
+        self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.log = self.directory / "engine.log"
+        self.log.touch()
+
+    def generate(self, request, *, video=True, step_seconds=0.0, options=()):
+        """main's status and stderr, its engine the stand-in."""
+
+        def load(model_root, binary, startup_timeout):
+            engine = fake_engine(self.log, step_seconds, *options)
+            engine.start()
+            return engine, FakeTokenizer()
+
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(videos.assembly, "hold", lambda path: (path, None)),
+            mock.patch.object(videos, "serves", return_value=video),
+            mock.patch.object(videos, "load", side_effect=load),
+            contextlib.redirect_stderr(stderr),
+        ):
+            status = videos.main([
+                str(self.directory), "--model", MODEL, "--binary", "splash",
+                "--out", str(self.directory / "clip.mp4"),
+                "--request", json.dumps(request),
+            ])  # fmt: skip
+        return status, stderr.getvalue()
+
+    def test_the_clip_and_its_preview_are_written(self):
+        status, stderr = self.generate(
+            {"prompt": "a cat", "seed": "7", "preview": True, "audio": False}
+        )
+        self.assertEqual(status, 0)
+        mp4 = (self.directory / "clip.mp4").read_bytes()
+        self.assertEqual(mp4[-8:], (7).to_bytes(8, "little"))
+        self.assertEqual(
+            (self.directory / "clip.preview.mp4").read_bytes(), b"preview" + mp4
+        )
+        (taken,) = [json.loads(line) for line in self.log.read_text().splitlines()]
+        self.assertEqual(
+            taken,
+            {"request": 1, "tokens": [ord(c) for c in "a cat"], "frames": 73, "variant": 0,
+             "outputs": 1, "seed": 7},
+        )  # fmt: skip
+        self.assertIn("Video · denoise · step 4/4", stderr)
+        self.assertIn("· 73 frames ·", stderr)
+
+    def test_without_preview_only_the_clip_is_written(self):
+        self.assertEqual(self.generate({"prompt": "a cat", "seconds": "10"})[0], 0)
+        self.assertEqual(
+            sorted(path.name for path in self.directory.glob("*.mp4")), ["clip.mp4"]
+        )
+
+    def test_a_language_model_and_an_invalid_request_are_refused(self):
+        status, stderr = self.generate({"prompt": "a cat"}, video=False)
+        self.assertEqual(status, 1)
+        self.assertIn("is a language model", stderr)
+        status, stderr = self.generate({"prompt": "a cat", "seconds": "4"})
+        self.assertEqual(status, 1)
+        self.assertIn("seconds must be one of 3, 10, 15", stderr)
+        self.assertEqual(self.log.read_text(), "")
+        self.assertFalse((self.directory / "clip.mp4").exists())
+
+    def test_an_engine_error_fails_the_clip(self):
+        status, stderr = self.generate({"prompt": "a cat"}, options=["fail"])
+        self.assertEqual(status, 1)
+        self.assertIn("Error · the video VAE failed", stderr)
+        self.assertFalse((self.directory / "clip.mp4").exists())
+
+    def test_a_stop_cancels_the_clip_at_its_next_step(self):
+        def interrupt():
+            deadline = time.monotonic() + 10
+            while not self.log.read_text() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            os.kill(os.getpid(), signal.SIGINT)
+
+        threading.Thread(target=interrupt, daemon=True).start()
+        status, stderr = self.generate({"prompt": "a cat"}, step_seconds=0.5)
+        self.assertEqual(status, 130)
+        self.assertIn("cancelling at the next step", stderr)
+        self.assertEqual(
+            [
+                next(iter(record))
+                for record in map(json.loads, self.log.read_text().splitlines())
+            ],
+            ["request", "cancel"],
+        )
+        self.assertFalse((self.directory / "clip.mp4").exists())
 
 
 if __name__ == "__main__":

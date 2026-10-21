@@ -1,12 +1,13 @@
 """A stand-in for a video model's engine process (runtime/video/
 VideoRuntime.hpp) on the native protocol, for the server's tests.
 
-  fake_video_engine.py LOG STEP_SECONDS
+  fake_video_engine.py LOG STEP_SECONDS [fail]
 
 It announces FeatureVideo, then runs each VideoRequest's phases, its
 denoising in four steps of STEP_SECONDS, then its preview when asked and its
-clip: mp4s of the request's seed. A Cancel ends a request at its next step
-or phase. LOG gets one JSON line per request taken and per cancel."""
+clip: mp4s of the request's seed; with `fail`, each request fails with the
+engine's error once denoised. A Cancel ends a request at its next step or
+phase. LOG gets one JSON line per request taken and per cancel."""
 
 import json
 import os
@@ -23,9 +24,10 @@ DENOISE_STEPS = 4
 
 
 class Engine:
-    def __init__(self, log, step_seconds):
+    def __init__(self, log, step_seconds, fail):
         self.log = log
         self.step_seconds = step_seconds
+        self.fail = fail
         self.reader = native_peer.ClientFrameReader()
         self.requests, self.cancelled = [], set()
 
@@ -72,6 +74,10 @@ class Engine:
         for phase, steps in phases:
             if not self.phase(request, phase, steps):
                 return self.cancel(request)
+        if self.fail:
+            return self.send(wire.ErrorEvent(wire.FailureClass.REQUEST_ERROR, request.request_id,
+                                             False, b"video_engine_failed",
+                                             b"the video VAE failed"))  # fmt: skip
         mp4 = b"\0\0\0\x18ftypmp42" + request.seed.to_bytes(8, "little")
         if request.outputs & wire.VideoOutputFlag.PREVIEW:
             self.phase(request, wire.VideoPhase.PREVIEW)
@@ -107,4 +113,4 @@ class Engine:
 
 if __name__ == "__main__":
     with open(sys.argv[1], "a") as log:
-        Engine(log, float(sys.argv[2])).serve()
+        Engine(log, float(sys.argv[2]), sys.argv[3:] == ["fail"]).serve()
