@@ -158,7 +158,8 @@ void printUsage(std::string_view executable) {
       " [--max-cache-disk-writes BYTES]"
       " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]"
       " [--relaunch-context TOKENS] [--ple-memory BYTES] [--expert-memory BYTES]"
-      " [--verify-rows auto|all]");
+      " [--verify-rows auto|all] [--control-vector FILE] [--control-vector-scale SCALE]"
+      " [--control-vector-layer-range FIRST-LAST] [--control-vector-mode add|project]");
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_METADATA [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " device-check");
@@ -216,6 +217,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.sparseKvMemory = arguments.sparseKvMemory;
   config.resources.kvSpillAlways = arguments.kvSpillAlways;
   config.resources.verifyRows = arguments.verifyRows;
+  config.resources.controlVector = arguments.controlVector;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   return config;

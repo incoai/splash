@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/Vision.hpp"
+#include "ControlVector.hpp"
 #include "DFlashDraft.hpp"
 #include "ModelDescriptor.hpp"
 #include "Qwen3_6Moe.hpp"
@@ -38,11 +39,14 @@ using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWe
 // target's routed experts stream from their files through a store of that
 // many bytes (model/ExpertStore.hpp, --expert-memory). Other models load as
 // without them. Streamed weights read on `readers`, the engine's one pool of
-// SSD readers, which KV reads share.
+// SSD readers, which KV reads share. With controlVector, a target that
+// steers its residual by one (model/ControlVector.hpp, --control-vector:
+// Qwen3.8-Flash-Next) loads it with its weights; another refuses it.
 struct ModelLoadOptions final {
   uint64_t streamedTableBytes = 0;
   uint64_t expertMemoryBytes = 0;
   std::shared_ptr<SsdReaders> readers;
+  ControlVectorOptions controlVector;
 };
 
 struct LoadedModel final {
@@ -87,6 +91,17 @@ struct LoadedModel final {
   // The store a streamed table is read through, or null.
   [[nodiscard]] SparseRowStore *streamedTable() const noexcept {
     return std::visit([](const auto &weights) -> SparseRowStore * { return weights.streamedTable.get(); }, target);
+  }
+  // The control vector the target runs, or null.
+  [[nodiscard]] const ControlVector *controlVector() const noexcept {
+    return std::visit(
+        [](const auto &weights) -> const ControlVector * {
+          if constexpr (requires { weights.controlVector; })
+            return weights.controlVector ? &*weights.controlVector : nullptr;
+          else
+            return nullptr;
+        },
+        target);
   }
   [[nodiscard]] std::span<const WeightFileRecord> targetFiles() const noexcept {
     return std::visit([](const auto &weights) ->

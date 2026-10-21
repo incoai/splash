@@ -10,6 +10,7 @@
 #include "ops/NgramEmbedding.hpp"
 #include "ops/PageStorage.hpp"
 
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -62,6 +63,18 @@ void addStreamCapture(metal::CommandGraph &graph, const QwenTargetGeometry &geom
     throw std::logic_error("Qwen target capture slot past the captured hidden rows");
   ops::HyperConnection::addStreamMean(graph, std::move(streams), std::move(captured),
                                       {destinationRow, capturedWidth, slot * width}, hyperShape(geometry), rows);
+}
+
+// The control vector after layer `index`, where it steers it: on every
+// stream of `rows` rows of `streams`, after the FFN's combine and before the
+// draft's capture, so the DFlash2 draft reads the outputs the target runs on.
+void addControlVector(metal::CommandGraph &graph, const Qwen4ExpWeights &weights, const QwenTargetGeometry &geometry,
+                      metal::MetalBuffer streams, uint32_t index, uint32_t rows) {
+  const std::optional<ControlVector> &vector = weights.controlVector;
+  if (!vector || !vector->steers(index)) return;
+  ops::HyperConnection::addSteer(graph, std::move(streams), vector->directions,
+                                 {index, vector->mode == ControlVectorMode::Project, vector->scale},
+                                 hyperShape(geometry), rows);
 }
 
 } // namespace
@@ -173,6 +186,7 @@ void Qwen4ExpTarget::addPrefillExperts(PrefillStep &step, uint32_t index) const 
   const Qwen4Scratch &h = step.scratch;
   ops::MoE::addRouted(step.graph, step.ffn, weights_.layers[index].ffn, *step.moe);
   ops::HyperConnection::addCombine(step.graph, h.streams, h.branch, h.weights, hyperShape(geometry_), step.rows);
+  addControlVector(step.graph, weights_, geometry_, h.streams, index, step.rows);
   forEachPrefillCapture(step, index, [&](uint32_t slot, uint32_t source, uint32_t destination, uint32_t rows) {
     addStreamCapture(step.graph, geometry_, slot, rowsOf<float>(h.streams, source, rows, geometry_.streamWidth()),
                      step.buffers.captured, destination, rows);
@@ -371,6 +385,7 @@ void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffe
     addVerifyMix(step, layer.ffnHyper, b.normalized);
     ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe, b.verifyRows}, layer.ffn, *step.moe);
     ops::HyperConnection::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
+    addControlVector(step.graph, weights_, geometry_, h.streams, index, rows);
     if (const auto slot = geometry_.captureSlot(index))
       addStreamCapture(step.graph, geometry_, *slot, h.streams, b.capturedTargetHidden, 0, rows);
   }
