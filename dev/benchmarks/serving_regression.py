@@ -751,7 +751,9 @@ def main():
     )
     binaries = [args.baseline_binary, args.binary]
     report = {
-        "method": "two resident servers, serial cold requests with unique cache salts, paired ABBA",
+        "method": "one resident server per ABBA round, matched workload histories"
+        if args.residency == "sequential"
+        else "two resident servers, serial requests with unique cache salts, paired ABBA",
         "scenario": args.scenario,
         "residency": args.residency,
         "tool_sha256": fingerprint(Path(__file__)),
