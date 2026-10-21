@@ -20,8 +20,9 @@ void *writableContents(const MetalBuffer &buffer, const char *name) {
   return contents;
 }
 
-// The buffer of a cell of no bytes is empty (QwenGdnCell): nothing to copy
-// or clear.
+// The buffer of a cell of no bytes is empty (QwenGdnCell), as is the context
+// window of a model without a draft (DFlashContextWindow): nothing to copy or
+// clear.
 void copyExact(const MetalBuffer &destination, const MetalBuffer &source,
                const char *name) {
   if (destination.sizeBytes() != source.sizeBytes()) {
@@ -38,7 +39,7 @@ void clear(const MetalBuffer &buffer, const char *name) {
 }
 
 // What a state file slot holds of a state: its GDN cell, unless it has no
-// bytes, then its context window.
+// bytes, then its context window, which a model without a draft has none of.
 std::vector<std::span<std::byte>> stateSpans(const GdnParityBuffers &gdn,
                                              const MetalBuffer &window) {
   std::vector<std::span<std::byte>> spans;
