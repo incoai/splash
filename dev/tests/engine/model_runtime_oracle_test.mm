@@ -1,4 +1,5 @@
 #include "LinearNumerics.hpp"
+#include "PenaltyOracle.hpp"
 #include "TestChecks.hpp"
 #include "TestKvTier.hpp"
 #include "ane/ProgramInstrumentation.hpp"
@@ -39,6 +40,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <span>
@@ -64,6 +66,103 @@ namespace {
 
 using splash::test::rejects;
 using splash::test::require;
+
+// A scoped observer sees this command's actual forward values before target
+// policy rewrites them. Full-context scoring is a different numerical graph
+// and cannot supply an exact reference for an incremental decode decision.
+class PenaltyProbe final {
+public:
+  PenaltyProbe(model::Runtime &runtime, uint32_t vocabulary,
+               std::span<const uint32_t> prompt, ops::SamplingPenalties penalties,
+               bool enabled)
+      : runtime_(runtime), vocabulary_(vocabulary), penalties_(penalties), enabled_(enabled) {
+    if (!enabled_) return;
+    prompt_.resize(vocabulary_);
+    counts_.resize(vocabulary_);
+    for (const uint32_t token : prompt) prompt_.at(token) = 1;
+    model::RuntimeInstrumentation::observeTargetLogits(runtime_,
+        [this](uint32_t lane, std::span<const float> logits) {
+          require(lane == 0, "penalty probe expects a B1 command");
+          std::lock_guard lock(mutex_);
+          raw_.assign(logits.begin(), logits.end());
+          ++generation_;
+        });
+  }
+  ~PenaltyProbe() {
+    if (enabled_) model::RuntimeInstrumentation::observeTargetLogits(runtime_, {});
+  }
+  PenaltyProbe(const PenaltyProbe &) = delete;
+  PenaltyProbe &operator=(const PenaltyProbe &) = delete;
+
+  [[nodiscard]] uint64_t generation() const {
+    std::lock_guard lock(mutex_);
+    return generation_;
+  }
+
+  void initial(const ModelStepResult &result) {
+    if (!enabled_ || !result.firstToken) return;
+    std::fill(counts_.begin(), counts_.end(), 0);
+    row(0, *result.firstToken);
+    ++initials_;
+  }
+
+  void decoded(uint64_t before, std::span<const uint32_t> emitted,
+               uint32_t anchor, const ModelStepResult &result) {
+    if (!enabled_) return;
+    require(!result.outputTokens.empty() && result.outputTokens.front() == anchor,
+            "penalty probe lost the already-selected anchor");
+    if (generation() == before) {
+      require(result.outputTokens.size() == 1 && result.outputTokensWithoutKv == 1,
+              "penalty probe missed a target forward");
+      return; // A previously selected terminal anchor needs no new forward.
+    }
+    std::fill(counts_.begin(), counts_.end(), 0);
+    for (const uint32_t token : emitted) ++counts_.at(token);
+    ++counts_.at(anchor); // Selected before this command, not yet emitted.
+    const auto next = model::RuntimeInstrumentation::pendingToken(runtime_, result.requestId);
+    require(next.has_value(), "penalty probe has no selected continuation");
+    const size_t retained = result.outputTokens.size() - result.outputTokensWithoutKv;
+    require(retained > 0 && retained <= model::ExecutionLimits::targetVerifyRows,
+            "penalty probe retention is outside the verified rows");
+    for (size_t index = 0; index < retained; ++index) {
+      const uint32_t selected = index + 1 < retained ? result.outputTokens[index + 1] : *next;
+      row(index, selected);
+      ++counts_.at(selected); // Accepted proposal prefix for the next row.
+    }
+    if (result.outputTokensWithoutKv)
+      require(result.outputTokens.back() == *next, "terminal penalty anchor changed");
+  }
+
+  void report() const {
+    if (!enabled_) return;
+    require(initials_ == 1 && rows_ > 1, "penalty probe did not cover initial and verify policies");
+    std::cout << "penalty_same_forward=PASS rows=" << rows_
+              << " maximum_relative_error=" << maximumRelativeError_ << '\n';
+  }
+
+private:
+  void row(size_t index, uint32_t selected) {
+    std::lock_guard lock(mutex_);
+    const size_t offset = index * vocabulary_;
+    require(offset + vocabulary_ <= raw_.size(), "penalty probe has no raw logit row");
+    const auto actual = model::RuntimeInstrumentation::lastLogits(runtime_, 0);
+    const double error = test::requirePenaltyLogits(
+        std::span(raw_).subspan(offset, vocabulary_), actual.subspan(offset, vocabulary_),
+        prompt_, counts_, penalties_, selected);
+    maximumRelativeError_ = std::max(maximumRelativeError_, error);
+    ++rows_;
+  }
+  model::Runtime &runtime_;
+  uint32_t vocabulary_;
+  ops::SamplingPenalties penalties_;
+  bool enabled_;
+  std::vector<float> raw_;
+  std::vector<uint8_t> prompt_;
+  std::vector<uint32_t> counts_;
+  mutable std::mutex mutex_;
+  uint64_t generation_ = 0, rows_ = 0, initials_ = 0;
+  double maximumRelativeError_ = 0.0;
+};
 
 std::string mebibytes(uint64_t bytes) {
   return std::to_string(bytes >> 20) + " MiB";
@@ -5596,6 +5695,9 @@ int main(int argc, char **argv) {
       sequence.sampling.presencePenalty = penalties.presence;
       sequence.sampling.frequencyPenalty = penalties.frequency;
       sequence.sampling.repetitionPenalty = penalties.repetition;
+      PenaltyProbe penaltyProbe(executor, model.descriptor.capabilities.vocabularySize,
+                                 prompt129, penalties,
+                                 kind == RequestKind::Greedy && penalties.active());
       beginCold(executor, sequence, 0);
       uint32_t stateLane = 0;
       // A penalized request resumes in a state lane other than 0 and decodes
@@ -5639,6 +5741,7 @@ int main(int argc, char **argv) {
         }
         ModelStepResult replay = prefillChunk(
             executor, sequence.id, 0, sequence.prompt, pageTable);
+        penaltyProbe.initial(replay);
         requireOpen(replay, "regeneration replay emitted historical tokens");
         if (repeatDuringReplay) {
           const StateSamples rebuilt = sampleCommittedState(backend, states, stateLane);
@@ -5670,6 +5773,7 @@ int main(int argc, char **argv) {
       } else {
         const ModelStepResult promptEnd = prefillChunk(
             executor, sequence.id, 0, sequence.prompt, pageTable);
+        penaltyProbe.initial(promptEnd);
         requireOpen(promptEnd, "preemption prompt");
         stage = promptEnd.nextDecodeStage;
       }
@@ -5697,6 +5801,11 @@ int main(int argc, char **argv) {
       auto &transcript = run.transcript;
       bool generationPreempted = false;
       for (uint32_t cycle = 0; cycle < 24 && transcript.size() < 24; ++cycle) {
+        const uint64_t probeGeneration = penaltyProbe.generation();
+        const auto probeAnchor = kind == RequestKind::Greedy && penalties.active()
+            ? model::RuntimeInstrumentation::pendingToken(executor, sequence.id) : std::nullopt;
+        require(!(kind == RequestKind::Greedy && penalties.active()) || probeAnchor.has_value(),
+                "penalized decode has no pending anchor to check");
         ModelStepResult result;
         if (constrained) {
           auto pending = beginMaskedDecodeOne(
@@ -5714,6 +5823,8 @@ int main(int argc, char **argv) {
                              pageTable, stage);
         }
         require(!result.outputTokens.empty(), "preempted decode made no progress");
+        if (probeAnchor)
+          penaltyProbe.decoded(probeGeneration, transcript, *probeAnchor, result);
         require(result.outputTokens.size() <= sequence.maxNewTokens - transcript.size() &&
                     result.acceptedDraftTokens <= result.draftedTokens &&
                     result.outputTokensWithoutKv <= result.outputTokens.size(),
@@ -5741,6 +5852,7 @@ int main(int argc, char **argv) {
       require(preemptionMode != 2 || generationPreempted,
               "preemption fixture stopped before its generation replay");
       executor.end(sequence.id);
+      penaltyProbe.report();
       return run;
     };
     for (RequestKind kind : {RequestKind::Greedy, RequestKind::Sampling,
@@ -5837,10 +5949,10 @@ int main(int argc, char **argv) {
       return worst;
     };
 
-    // Penalized requests keep every preemption guarantee above, and the
-    // score probe checks their decisions within the drift between score
-    // (prefill) and verify logits, and any further drift the unpenalized
-    // transcript shows.
+    // Penalized requests keep every preemption guarantee above. PenaltyProbe
+    // checks actual forward/policy rows against an independent fp64 policy
+    // reference. Cold scoring below remains a cross-graph diagnostic: drift
+    // on the unpenalized trajectory does not bound another trajectory.
     // Negative presence and frequency favour the output's tokens by their
     // counts, so the decisions they change follow the counts, a verify row's
     // draft prefix included; presence 1.5 is Qwen's recommendation, and
@@ -5853,7 +5965,7 @@ int main(int argc, char **argv) {
     const float drift = probeLoss(control.transcript, {});
     const float tolerance = std::max(2.0F * drift, 0.1F);
     std::cout << "penalty_probe control_drift=" << drift
-              << " tolerance=" << tolerance << '\n';
+              << " diagnostic_allowance=" << tolerance << '\n';
     bool penaltiesDecided = false;
     for (const ops::SamplingPenalties penalties :
          {ops::SamplingPenalties{1.0F, -2.0F, -2.0F},
@@ -5882,8 +5994,9 @@ int main(int argc, char **argv) {
                 << " changed=" << (reference.transcript != control.transcript)
                 << " reference_loss=" << referenceLoss
                 << " resumed_loss=" << resumedLoss << '\n';
-      require(referenceLoss <= tolerance && resumedLoss <= tolerance,
-              "a penalized token is not the best of its penalized logits");
+      // Cold scoring rebuilds the context through prefill; its disagreement
+      // with incremental verification is diagnostic. PenaltyProbe above
+      // independently checks every actual policy logit and selected token.
     }
     require(penaltiesDecided, "no penalty changed a decision to probe");
     // Sampled lanes with presence and frequency repeat under a fixed seed;

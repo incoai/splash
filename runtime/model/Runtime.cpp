@@ -416,6 +416,32 @@ struct Runtime::Impl {
   // The request the history's staging was last reserved for
   // (reserveHistoryStaging), whose next prefill command streams into it.
   uint64_t stagingRequest = 0;
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+  RuntimeInstrumentation::LogitsObserver logitsObserver;
+
+  void observeTargetLogits(CommandGraph &graph, uint32_t lanes, uint32_t rows) {
+    if (!logitsObserver)
+      return;
+    std::array<MetalBuffer, kLaneCount> buffers;
+    std::array<MetalBuffer, kLaneCount> verifyRows;
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      buffers[lane] = decodeArena->get(lane, DecodeTensor::Logits);
+      if (rows > 1)
+        verifyRows[lane] = decodeArena->get(lane, DecodeTensor::VerifyRows);
+    }
+    const uint32_t vocabulary = geometry.target.vocabularySize;
+    graph.host([observer = logitsObserver, buffers = std::move(buffers),
+                verifyRows = std::move(verifyRows), lanes, rows, vocabulary] {
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        const uint32_t validRows = rows == 1 ? 1 : *contents<uint32_t>(verifyRows[lane], "observed verify rows");
+        if (!validRows || validRows > rows)
+          throw std::logic_error("observed target policy has invalid rows");
+        observer(lane, {contents<float>(buffers[lane], "observed target logits"),
+                        uint64_t{validRows} * vocabulary});
+      }
+    });
+  }
+#endif
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         model(value.model),
@@ -1233,6 +1259,9 @@ struct Runtime::Impl {
       policies[lane.lane] = samplingPolicy(*lane.entry);
       stateLanes[lane.lane] = lane.entry->stateLane;
     }
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+    observeTargetLogits(graph, width, 1);
+#endif
     sampling.addInitial(graph, std::span(policies).first(width),
                         samplingBuffers(width), 0,
                         geometry.target.stopTokens[0],
@@ -2027,6 +2056,9 @@ struct Runtime::Impl {
       policies[lane] = samplingPolicy(*entries[lane]);
       stateLanes[lane] = entries[lane]->stateLane;
     }
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+    observeTargetLogits(graph, lanes, kDecodeRows);
+#endif
     sampling.addVerify(graph, std::span(policies).first(lanes),
                        samplingBuffers(lanes), geometry.target.stopTokens[0],
                        geometry.target.stopTokens[1],
@@ -3461,6 +3493,14 @@ std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {
 }
 
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
+void RuntimeInstrumentation::observeTargetLogits(Runtime &runtime, LogitsObserver observer) {
+  runtime.impl_->logitsObserver = std::move(observer);
+}
+
+std::optional<uint32_t> RuntimeInstrumentation::pendingToken(const Runtime &runtime, uint64_t requestId) {
+  return runtime.impl_->requests.at(requestId).pendingToken;
+}
+
 std::vector<uint32_t> RuntimeInstrumentation::lastTableRows(const Runtime &runtime, uint32_t lane) {
   return runtime.impl_->targetModel->verifyTableRows(lane);
 }

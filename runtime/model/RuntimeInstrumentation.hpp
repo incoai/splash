@@ -5,6 +5,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -15,6 +17,12 @@ namespace splash::model {
 // these; production binaries never link it.
 class RuntimeInstrumentation final {
 public:
+  // Observe the actual forward logits before target penalties/selection.
+  // Only an explicitly installed test observer adds a host step. The
+  // callback's owner must outlive the commands that copied it.
+  using LogitsObserver = std::function<void(uint32_t, std::span<const float>)>;
+  static void observeTargetLogits(Runtime &runtime, LogitsObserver observer);
+  [[nodiscard]] static std::optional<uint32_t> pendingToken(const Runtime &runtime, uint64_t requestId);
   // The PLE rows the last decode step gathered for batch lane `lane`'s
   // verify rows, each row's heads' in order (Qwen3.8-Flash-Next), until the
   // next decode step; none for a target without them.
