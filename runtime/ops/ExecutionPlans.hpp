@@ -47,6 +47,8 @@ public:
 
 private:
   Linear linear_;
+  // Apple8's attention reads half queries and probabilities (PagedAttention).
+  bool halfAttention_ = false;
 };
 
 } // namespace splash::ops

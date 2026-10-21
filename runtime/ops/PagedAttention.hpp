@@ -147,17 +147,21 @@ struct PrefillAttentionPlan final {
   // Whether the reduce adds the layer's learned sinks, which addPrefill then
   // takes: its geometry's (kCompiledAttention).
   const bool sinks;
+  // The split kernel reads half queries, converted in place before it (Apple8).
+  const bool halfQueries;
 
 private:
   friend class PagedAttention;
   PrefillAttentionPlan(uint32_t rows, uint32_t splits, AttentionWorkspace workspace,
                        std::string splitPipeline, std::string reducePipeline,
                        metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
-                       bool sparse, bool sinks, kv::Layout layout, uint32_t queryHeads)
+                       bool sparse, bool sinks, kv::Layout layout, uint32_t queryHeads,
+                       bool halfQueries)
       : layout(layout), queryHeads(queryHeads), rows(rows), tiles(kv::prefillAttentionTiles(rows)),
         splits(splits), workspace(workspace),
         splitPipeline(std::move(splitPipeline)), reducePipeline(std::move(reducePipeline)),
-        splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse), sinks(sinks) {}
+        splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse), sinks(sinks),
+        halfQueries(halfQueries) {}
 };
 
 struct VerifyAttentionPlan final {
@@ -180,6 +184,8 @@ struct VerifyAttentionPlan final {
   // Whether the reduce adds the layer's learned sinks, which addVerify then
   // takes (PagedVerifyBuffers::sinks): its geometry's (kCompiledAttention).
   const bool sinks;
+  // The split kernel reads half queries, converted in place before it (Apple8).
+  const bool halfQueries;
 
 private:
   friend class PagedAttention;
@@ -195,11 +201,12 @@ private:
                       metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
                       bool sparse, bool sinks, std::string locatedSplitPipeline, std::string storePipeline,
                       metal::DispatchSize storeGroups, metal::DispatchSize storeThreads, kv::Layout layout,
-                      uint32_t queryHeads)
+                      uint32_t queryHeads, bool halfQueries)
       : layout(layout), queryHeads(queryHeads), lanes(lanes), laneSplits(laneSplits),
         splits(splits), workspace(workspace),
         splitPipeline(std::move(splitPipeline)), reducePipeline(std::move(reducePipeline)),
         splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse), sinks(sinks),
+        halfQueries(halfQueries),
         locatedSplitPipeline_(std::move(locatedSplitPipeline)), storePipeline_(std::move(storePipeline)),
         storeGroups_(storeGroups), storeThreads_(storeThreads) {}
 };
@@ -260,12 +267,13 @@ public:
   // `pagesPerSplit` (AttentionCalibration).
   [[nodiscard]] static PrefillAttentionPlan
   prefillPlan(uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,
-              uint32_t pagesPerSplit, AttentionVariant variant = {});
+              uint32_t pagesPerSplit, AttentionVariant variant = {}, bool halfQueries = false);
   // historyTokens holds each lane's committed tokens before its verify rows,
   // one entry per lane.
   [[nodiscard]] static VerifyAttentionPlan
   verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-             std::span<const uint32_t> historyTokens, AttentionVariant variant = {});
+             std::span<const uint32_t> historyTokens, AttentionVariant variant = {},
+             bool halfQueries = false);
 
   // The runtime owns allocation, not the selected kernel's workspace layout.
   // Prefill storage covers every sequence length up to maximumRows; sequences

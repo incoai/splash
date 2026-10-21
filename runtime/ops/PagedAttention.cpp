@@ -221,6 +221,13 @@ void requirePageTable(const metal::MetalBuffer &table, const kv::ChunkedPrefillP
   requireBytes(table, uint64_t{kv::chunkedPrefillRequiredPages(chunk)} * sizeof(SplashKvPage), "page table");
 }
 
+// The bytes the Apple8 split kernels read as half: count / 8 threads of four
+// values each.
+void addHalfQueries(metal::CommandGraph &graph, const metal::MetalBuffer &queries, uint64_t bytes) {
+  const uint32_t count = static_cast<uint32_t>(bytes / 8);
+  graph.add("gguf_prefill_input_half", {queries, queries}, count, {(count + 255) / 256, 1, 1}, {256, 1, 1});
+}
+
 // A dispatch's tiles read lists `blocks.list` to `blocks.list` + `tiles`, and
 // only a sparse plan takes lists.
 void requireBlocks(const AttentionBlocks &blocks, bool sparse, uint64_t tiles) {
@@ -270,7 +277,7 @@ uint32_t prefillSplits(uint32_t tiles, uint64_t visibleTokens, uint32_t windowTo
 
 PrefillAttentionPlan PagedAttention::prefillPlan(uint32_t rows, uint32_t historyTokens, uint32_t queryHeads,
                                                  kv::Layout layout, uint32_t pagesPerSplit,
-                                                 AttentionVariant variant) {
+                                                 AttentionVariant variant, bool halfQueries) {
   const CompiledAttention &kernel = compiledAttention(queryHeads, layout, variant);
   if (!rows || rows > kv::kChunkedPrefillMaximumRows)
     throw std::invalid_argument("invalid attention workspace rows");
@@ -283,20 +290,26 @@ PrefillAttentionPlan PagedAttention::prefillPlan(uint32_t rows, uint32_t history
                     pagesPerSplit);
   const uint32_t fusedRows =
       kv::kPrefillAttentionTileRows * (queryHeads / layout.kvHeads);
+  const bool half = halfQueries && !selectsBlocks(layout) && layout.format != kv::Format::BFloat16;
   return {rows, splits,
           attentionWorkspace(uint64_t{tiles} * splits * layout.kvHeads * fusedRows,
                              layout.headDimension),
-          kernelName("prefill", kernelFormat(layout) + (selectsBlocks(layout) ? "_sparse" : "_split"),
+          // Apple8 reads half queries and probabilities: its _split_h
+          // kernels, never a sparse one, whose values are another layout.
+          kernelName("prefill", kernelFormat(layout) +
+                                    (selectsBlocks(layout)
+                                         ? "_sparse"
+                                         : half ? "_split_h" : "_split"),
                      splitSuffix(kernel, variant)),
           reduceKernel("prefill", kernel, variant),
           {layout.kvHeads * tileParts(queryHeads, layout), tiles, splits},
           {layout.kvHeads, fusedRows, tiles}, selectsBlocks(layout), kernel.sinks,
-          layout, queryHeads};
+          layout, queryHeads, half};
 }
 
 VerifyAttentionPlan PagedAttention::verifyPlan(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-    std::span<const uint32_t> historyTokens, AttentionVariant variant) {
+    std::span<const uint32_t> historyTokens, AttentionVariant variant, bool halfQueries) {
   const CompiledAttention &kernel = compiledAttention(queryHeads, layout, variant);
   if (!lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid attention workspace batch width");
@@ -312,9 +325,13 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
     laneSplits[lane] = kv::verifyAttentionSplits(historyTokens[lane], variant.windowTokens);
     splits = std::max(splits, laneSplits[lane]);
   }
+  const bool half = halfQueries && !selectsBlocks(layout) && layout.format != kv::Format::BFloat16;
   return {lanes, laneSplits, splits,
           verifyWorkspaceBound(lanes, queryHeads, layout),
-          kernelName("verify", kernelFormat(layout) + (selectsBlocks(layout) ? "_sparse" : "_split"),
+          kernelName("verify", kernelFormat(layout) +
+                                   (selectsBlocks(layout)
+                                       ? "_sparse"
+                                       : half ? "_split_h" : "_split"),
                      splitSuffix(kernel, variant)),
           reduceKernel("verify", kernel, variant),
           // A sparse lane's list fills only the first of the plan's splits.
@@ -330,7 +347,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
           selectsBlocks(layout) ? kernelName("verify", kernelFormat(layout) + "_sparse_located", kernel.suffix) : "",
           kernelName("verify", kernelFormat(layout) + "_store", storeSuffix(layout)),
           {uint64_t{lanes} * 2 * kv::kVerifyRows * layout.kvHeads, 1, 1},
-          {layout.headDimension, 1, 1}, layout, queryHeads};
+          {layout.headDimension, 1, 1}, layout, queryHeads, half};
 }
 
 AttentionWorkspace PagedAttention::prefillWorkspace(
@@ -522,6 +539,11 @@ void PagedAttention::addPrefill(
   requireBlocks(blocks, plan.sparse, plan.tiles);
   if (blocks.locations) throw std::invalid_argument("prefill attention takes no block locations");
   requireSinks(sinks, plan.sinks, plan.queryHeads);
+  // Apple8's split kernel reads the queries as half: convert the bytes the
+  // tiles read in place, each thread its own four values (the kernel of
+  // kernels/shared/gguf_linear.metal, which saturates finite values past
+  // half's range and passes NaN and infinities). Nothing reads them back.
+  if (plan.halfQueries) addHalfQueries(graph, queries, rows);
   const kv::PrefillAttentionParams params{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
       chunk.page_table_entries, layer, plan.splits, blocks.stride, blocks.list};
@@ -586,6 +608,7 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
                        blocks.list + lane};
   }
   const auto tables = laneBindings(buffers.pageTables.first(plan.lanes));
+  if (plan.halfQueries) addHalfQueries(graph, buffers.queries, rows);
   std::vector<metal::MetalBuffer> store{buffers.chunkKeys, buffers.chunkValues};
   store.insert(store.end(), tables.begin(), tables.end());
   graph.add(std::string(plan.storePipeline_), std::move(store), stores, plan.storeGroups_, plan.storeThreads_);
