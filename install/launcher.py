@@ -410,7 +410,7 @@ def parse_args(argv=None):
         type=model_artifacts.parse_draft_model,
         metavar="DRAFT",
         help="DFlash2 draft repository or local directory to use instead of the "
-        "automatically selected one",
+        "automatically selected one, or none to decode without a draft",
     )
     model.add_argument(
         "--language-only",
