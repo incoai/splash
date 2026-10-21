@@ -1,25 +1,59 @@
-MiniMax-H3 video engine (h3), vendored
+MiniMax-H3 video engine (h3): Splash's copy
 
-Source: the h3 engine repository, branch main, commit 5b55ab7 (ABI v2:
-h3_prep, h3_denoise, h3_decode, h3_decode_audio, h3_preview, h3_write_mp4).
-A plain copy without its history, by dev/tools/vendor_video.sh:
+Imported from h3 commit 5b55ab7 (branch main, ABI v2: h3_prep, h3_denoise,
+h3_decode, h3_decode_audio, h3_preview, h3_write_mp4), once, without its
+history:
 
   h3 runtime/{engine,media,model,ops}/   -> runtime/video/h3/{engine,media,model,ops}/
-  h3 runtime/metal/MetalBackend.*        -> runtime/video/h3/metal/
   h3 include/h3/h3.h (C ABI)             -> runtime/video/h3/h3.h
   h3 runtime/metal/abi/                  -> runtime/metal/abi/video/
   h3 runtime/metal/kernels/GROUP/        -> runtime/metal/kernels/video/GROUP/
   h3 tools/convert_*.py, h3/{__init__,common,config,safetensors}.py
                                          -> install/video/
 
-Include paths are rewritten for these places ("engine/" -> "video/h3/engine/"
-and likewise for media, metal, model and ops; "metal/abi/" ->
-"metal/abi/video/"; "metal/kernels/common/" -> "metal/kernels/video/common/";
-"h3/h3.h" -> "video/h3/h3.h"). Code and kernel arithmetic are otherwise
-unchanged.
+Since then the copy has two parts.
 
-Splash's own files beside the copy: VideoRuntime.* (the engine process of a
-video model, which drives the engine through its C ABI), TextEncoder.* and
+As h3 has them: the kernels, their host/shader ABI headers and the weight
+converters, with include paths rewritten for their places ("metal/abi/" ->
+"metal/abi/video/", "metal/kernels/common/" -> "metal/kernels/video/common/").
+Their arithmetic is h3's: the golden clip of make test-video-real is byte for
+byte h3's.
+
+Splash's own: the host code in runtime/video/h3 is the engine's (the C ABI,
+request preparation, the DiT scheduler and its memory plan, weight stream and
+key-range table, the operators, the decoders, the mp4 writer), but it runs on
+Splash's base layer instead of the one it came with:
+
+  h3 metal/MetalBackend: device, queue, metallib, pipeline cache, buffers and
+    command buffers -> metal/MetalBackend. engine/Encoder.hpp records a
+    command's dispatches as the engine's kernels bind them; a kernel that runs
+    an exact grid takes ComputeDispatch::gridThreads. One command runs a DiT
+    block, a VAE clip or a preview chunk, the next encoded while it runs.
+  h3 model/Safetensors, model/Json and its pread loops -> model/
+    SafetensorsCheckpoint (a converted directory read as one index, so the
+    DiT and FL2VA manifests' file maps are not read), model/WeightSource and
+    parallelFor (model/WeightImages.hpp); the decoders' manifests through
+    NSJSONSerialization (model/WeightFiles.hpp).
+  h3 engine/Status (codes, H3_TRY, Logger, H3_LOG) -> exceptions, as Splash
+    fails (engine/Errors.hpp; CApi.mm returns each as its h3_status), and
+    logLine on stderr.
+  std::chrono::steady_clock -> AwakeClock.
+
+Gone with the h3 tools that used them: the VAE stage profile, the prep's
+intermediate dump and the numpy readers no caller uses. h3_forward_stats keeps
+its fields; those one command per block cannot measure (GPU time by step
+class, gaps between command buffers) are 0.
+
+h3 itself keeps its own base layer for its CLI, benchmarks and tests, so the
+copy no longer follows it file by file. To bring an upstream change,
+dev/tools/vendor_video.sh H3_CHECKOUT copies the kernels, ABI headers and
+converters again and prints the upstream changes to h3's host code since the
+commit above, which are ported into runtime/video/h3 by hand; then record the
+new commit here, rebuild, and run make test-engine-metal and make
+test-video-real.
+
+Splash's files beside the copy: VideoRuntime.* (the engine process of a video
+model, which drives the engine through its C ABI), TextEncoder.* and
 TextEncoderABI.h with kernels/video/text_encoder.metal (the prompt's text
 encoder), and this note.
 
@@ -27,11 +61,8 @@ Build (Makefile): the kernels compile into splash.metallib as its video
 group with Splash's production Metal flags, the prep kernels also without
 fast math, as h3 builds them, since they reproduce MLX's arithmetic bit for
 bit. The host code compiles with Splash's flags plus -ffp-contract=off, as h3
-builds it, into build/engine/libsplash-video.a; the mp4 writer links
-AVFoundation, CoreMedia and CoreVideo.
+builds it, into build/engine/libsplash-video.a, which links before the
+engine's library; the mp4 writer links AVFoundation, CoreMedia and CoreVideo.
 
 Licenses: THIRD_PARTY_NOTICES. No model weights are vendored; the installer
 downloads them under the MiniMax H3 Community License Agreement.
-
-To update: dev/tools/vendor_video.sh H3_CHECKOUT, record its commit here,
-rebuild, and run make test-engine-metal and make test-video-real.

@@ -2157,8 +2157,9 @@ speaks the native protocol and announces `FeatureVideo`. A `VideoRequest`
 (the clip's variant, frames, size, steps, seed, outputs and the prompt's
 token ids) runs every phase in this process, one request at a time:
 the text encoder, Qwen3-VL-32B through decoder layer 50, loaded for the
-request (`runtime/video/TextEncoder.hpp`); then, through the vendored h3
-engine's C ABI (`runtime/video/h3`, `runtime/video/VENDORED`), request
+request (`runtime/video/TextEncoder.hpp`); then, through the C ABI of
+Splash's copy of the h3 engine, on Splash's Metal backend and weight readers
+(`runtime/video/h3`, `runtime/video/VENDORED`), request
 preparation, the DiT streamed from SSD in 8 slots, the TAEH3 preview, the
 video VAE, the audio VAE and the mp4. `VideoProgress` reports each phase's
 start and end and each denoising step, `VideoOutput` delivers the preview
