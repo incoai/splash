@@ -1,0 +1,42 @@
+{
+  "production_runtime_preprocessed_identical": true,
+  "base": "1482f6bbc2abf12375332725302019594150b6cb",
+  "macro": "SPLASH_RUNTIME_INSTRUMENTATION unset",
+  "normalization": "remove blank lines only; clang -E -P strips line markers",
+  "outputs": [
+    {
+      "label": "base",
+      "command": [
+        "xcrun",
+        "-sdk",
+        "macosx",
+        "clang++",
+        "-std=c++20",
+        "-E",
+        "-P",
+        "-Iruntime",
+        "-mmacosx-version-min=26.4",
+        "$ORACLE_WORKTREE/build/penalty-oracle-validation/Runtime-base.cpp"
+      ],
+      "normalized_sha256": "931abfa5be9f190a387fe30460a4e498f5ac73dedd18b000e78f00a4d63e8ec6",
+      "bytes": 4279706
+    },
+    {
+      "label": "patch",
+      "command": [
+        "xcrun",
+        "-sdk",
+        "macosx",
+        "clang++",
+        "-std=c++20",
+        "-E",
+        "-P",
+        "-Iruntime",
+        "-mmacosx-version-min=26.4",
+        "$ORACLE_WORKTREE/runtime/model/Runtime.cpp"
+      ],
+      "normalized_sha256": "931abfa5be9f190a387fe30460a4e498f5ac73dedd18b000e78f00a4d63e8ec6",
+      "bytes": 4279706
+    }
+  ]
+}

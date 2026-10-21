@@ -1,0 +1,21 @@
+{
+  "command": [
+    "xcrun",
+    "-sdk",
+    "macosx",
+    "clang++",
+    "-std=c++20",
+    "-O1",
+    "-g",
+    "-Iruntime",
+    "-Idev",
+    "-mmacosx-version-min=26.4",
+    "-fsanitize=address,undefined",
+    "-fno-omit-frame-pointer",
+    "dev/tests/engine/penalty_oracle_test.cpp",
+    "-o",
+    "build/penalty-oracle-validation/penalty-oracle-asan"
+  ],
+  "exit_status": 0,
+  "stdout": "penalty oracle tests passed\n"
+}

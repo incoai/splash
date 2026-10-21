@@ -1,0 +1,76 @@
+{
+  "family": "Qwen3.6-35B-A3B",
+  "files": {
+    "config.json": {
+      "bytes": 296,
+      "ctime_ns": 1791582827285246285,
+      "digest": "98a92a176f9daf4ad495a2aa789feac57942417bf2071e2280db3d2c0ffb24b9",
+      "mtime_ns": 1791582827285246285,
+      "path": "/Users/linson/Documents/ai/splash/install/models/.metadata/51336b8956f8c54b25c6d119a2e12c0b203535f69f1120eb0cff5a4dd5924154/config.json"
+    },
+    "draft/config.json": {
+      "bytes": 1291,
+      "ctime_ns": 1791575078841854832,
+      "digest": "8608b21225ca5368677b627f61eb2441c572e875",
+      "mtime_ns": 1791575078841111583,
+      "path": "/Users/linson/.cache/huggingface/hub/models--incoai--Qwen3.6-35B-A3B-DFlash2/snapshots/51ef7b6923ad6c14cb1bb41c37a9041446496ab6/config.json"
+    },
+    "draft/model.safetensors": {
+      "bytes": 1052513456,
+      "ctime_ns": 1791576404315752290,
+      "digest": "d1f16c0ff85afbe6166fabfae998af3ec16fa11da87da4391b5e0e0a7c796a4d",
+      "mtime_ns": 1791576404314178291,
+      "path": "/Users/linson/.cache/huggingface/hub/models--incoai--Qwen3.6-35B-A3B-DFlash2/snapshots/51ef7b6923ad6c14cb1bb41c37a9041446496ab6/model.safetensors"
+    },
+    "target/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf": {
+      "bytes": 13211155424,
+      "ctime_ns": 1791582826858580884,
+      "digest": "9c964e657212fea1f24905dd7b0a89b82fd807d19fab0b41da14251b07b88fbe",
+      "mtime_ns": 1791582826857443398,
+      "path": "/Users/linson/.cache/huggingface/hub/models--unsloth--Qwen3.6-35B-A3B-GGUF/snapshots/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf"
+    },
+    "tokenizer/chat_template.jinja": {
+      "bytes": 8057,
+      "ctime_ns": 1791582827287257593,
+      "digest": "55d4931433fe502b794226ee7f4d206a6bdd436ac9f80eb7d8ebb4c639f9ea0c",
+      "mtime_ns": 1791582827287257593,
+      "path": "/Users/linson/Documents/ai/splash/install/models/.metadata/51336b8956f8c54b25c6d119a2e12c0b203535f69f1120eb0cff5a4dd5924154/tokenizer/chat_template.jinja"
+    },
+    "tokenizer/config.json": {
+      "bytes": 296,
+      "ctime_ns": 1791582827285246285,
+      "digest": "98a92a176f9daf4ad495a2aa789feac57942417bf2071e2280db3d2c0ffb24b9",
+      "mtime_ns": 1791582827285246285,
+      "path": "/Users/linson/Documents/ai/splash/install/models/.metadata/51336b8956f8c54b25c6d119a2e12c0b203535f69f1120eb0cff5a4dd5924154/config.json"
+    },
+    "tokenizer/tokenizer.json": {
+      "bytes": 10085571,
+      "ctime_ns": 1791582827286480853,
+      "digest": "8e852142d8ab38bb7678f650bd504ba28c29d9c6357e6ed762bebdbd474689eb",
+      "mtime_ns": 1791582827286480853,
+      "path": "/Users/linson/Documents/ai/splash/install/models/.metadata/51336b8956f8c54b25c6d119a2e12c0b203535f69f1120eb0cff5a4dd5924154/tokenizer/tokenizer.json"
+    },
+    "tokenizer/tokenizer_config.json": {
+      "bytes": 6198,
+      "ctime_ns": 1791582827287137386,
+      "digest": "c0435ea80b819a4fb16914a820960ff7c38f9d48cb94e7e8a28780fe01e8dea0",
+      "mtime_ns": 1791582827287137386,
+      "path": "/Users/linson/Documents/ai/splash/install/models/.metadata/51336b8956f8c54b25c6d119a2e12c0b203535f69f1120eb0cff5a4dd5924154/tokenizer/tokenizer_config.json"
+    }
+  },
+  "metadata": "51336b8956f8c54b25c6d119a2e12c0b203535f69f1120eb0cff5a4dd5924154",
+  "model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-IQ3_XXS",
+  "sources": {
+    "draft": {
+      "repo": "incoai/Qwen3.6-35B-A3B-DFlash2",
+      "revision": "51ef7b6923ad6c14cb1bb41c37a9041446496ab6"
+    },
+    "target": {
+      "repo": "unsloth/Qwen3.6-35B-A3B-GGUF",
+      "revision": "a483e9e6cbd595906af30beda3187c2663a1118c"
+    }
+  },
+  "target_format": "gguf",
+  "version": 1,
+  "vision_format": "none"
+}

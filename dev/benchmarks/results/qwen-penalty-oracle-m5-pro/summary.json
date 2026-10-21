@@ -1,0 +1,69 @@
+{
+  "base": "1482f6bbc2abf12375332725302019594150b6cb",
+  "initial_model_patch": "17966d05",
+  "final_reference_patch": "c20ea1e1f942c54555738321e813d847eb4c6190",
+  "initial_failure": {
+    "exit_status": 1,
+    "cold_score_loss": 0.205502,
+    "cold_score_allowance": 0.1
+  },
+  "initial_fix": {
+    "exit_status": 0,
+    "pass_marker": true,
+    "policy_runs": 12,
+    "initial_and_retained_rows": 248,
+    "maximum_relative_error": 5.90884e-08,
+    "original_cold_score_disagreement_reproduced": true
+  },
+  "final_patch_model_matrix_status": "queued; four representative model/storage/KV/state cells after current-main functional checks",
+  "sources": [
+    {
+      "file": "upstream-moe-gguf-bf16-fp32.log",
+      "source_sha256": "80e3be183c9f6badd451618dd2b62e37de41be40d88d35dee6211ab0edcb39e3",
+      "exported_sha256": "80e3be183c9f6badd451618dd2b62e37de41be40d88d35dee6211ab0edcb39e3",
+      "normalization": "replace absolute workspace roots only"
+    },
+    {
+      "file": "same-forward-moe-gguf-bf16-fp32.log",
+      "source_sha256": "0c1c66f491dfd8580d6af363f42a34e1cc138102e76badc3b9a8785866173657",
+      "exported_sha256": "0c1c66f491dfd8580d6af363f42a34e1cc138102e76badc3b9a8785866173657",
+      "normalization": "replace absolute workspace roots only"
+    },
+    {
+      "file": "target-sampling.log",
+      "source_sha256": "d3c44524f7b029dfd35713dc6cb05e03dde570cd0f1e4e24047048dc713355b8",
+      "exported_sha256": "d3c44524f7b029dfd35713dc6cb05e03dde570cd0f1e4e24047048dc713355b8",
+      "normalization": "replace absolute workspace roots only"
+    },
+    {
+      "file": "cpu-suite.log",
+      "source_sha256": "1e1e171e6df92e408ab498debee18524d42c6254bc48b084985d6c932b71cdb3",
+      "exported_sha256": "1e1e171e6df92e408ab498debee18524d42c6254bc48b084985d6c932b71cdb3",
+      "normalization": "replace absolute workspace roots only"
+    },
+    {
+      "file": "penalty-oracle-asan.log",
+      "source_sha256": "c7f56fcb763da2a0805cac773408c825ae8fb7aa302a3a498eb4d932facdc8d9",
+      "exported_sha256": "c7f56fcb763da2a0805cac773408c825ae8fb7aa302a3a498eb4d932facdc8d9",
+      "normalization": "replace absolute workspace roots only"
+    },
+    {
+      "file": "penalty-oracle-asan.json",
+      "source_sha256": "0c9d6362f1ebb174006d4ec678478b544f26fff866428e0581bba6804f096883",
+      "exported_sha256": "0c9d6362f1ebb174006d4ec678478b544f26fff866428e0581bba6804f096883",
+      "normalization": "replace absolute workspace roots only"
+    },
+    {
+      "file": "production-parity.json",
+      "source_sha256": "094188dfb2e93bfe3c138c0d02b727d1fdad369d40ebb8253712dd8fbc47c349",
+      "exported_sha256": "796e2614d65523327bf5199806d286621bc411c79a91becda55a6d69f7edcddb",
+      "normalization": "replace absolute workspace roots only"
+    },
+    {
+      "file": "initial-fix-jobs.json",
+      "source_sha256": "8a953736b1a4f7e7518af15570bfb6fefe6ef1174495d3563b69331972d86078",
+      "exported_sha256": "97fbe510f33ea4a7d874937147565382714386ee7fcc363b2331bdee0b2d7bdd",
+      "normalization": "replace absolute workspace roots only"
+    }
+  ]
+}

@@ -1,0 +1,66 @@
+{
+  "complete": true,
+  "runtime_base": "1482f6bbc2abf12375332725302019594150b6cb",
+  "patch_head": "17966d05f9fed066f7e5c432d52d09a9749e5339",
+  "jobs": [
+    {
+      "name": "penalty-unit",
+      "command": [
+        "/tmp/splash-deepinfer-oracle/build/engine-tests/penalty-oracle"
+      ],
+      "cwd": "/tmp/splash-deepinfer-oracle",
+      "started": 1792568746.6319091,
+      "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t93%; charging; 0:25 remaining present: true\n",
+      "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "exit_status": 0,
+      "finished": 1792568747.172575,
+      "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t93%; charging; 0:25 remaining present: true\n",
+      "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+    },
+    {
+      "name": "target-sampling",
+      "command": [
+        "env",
+        "MTL_SHADER_VALIDATION=1",
+        "/tmp/splash-deepinfer-oracle/build/engine-tests/target-sampling",
+        "/tmp/splash-deepinfer-oracle/build/splash.metallib"
+      ],
+      "cwd": "/tmp/splash-deepinfer-oracle",
+      "started": 1792568747.1962152,
+      "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t93%; charging; 0:25 remaining present: true\n",
+      "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "exit_status": 0,
+      "finished": 1792568769.932601,
+      "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t94%; charging; 0:23 remaining present: true\n",
+      "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+    },
+    {
+      "name": "moe-gguf-oracle-bf16-fp32",
+      "command": [
+        "env",
+        "MTL_SHADER_VALIDATION=1",
+        "/tmp/splash-deepinfer-oracle/build/engine-tests/model-runtime-oracle",
+        "/tmp/splash-deepinfer-oracle/build/splash.metallib",
+        "$SPLASH/install/models/.resolved/fbd33ebb12696638784e67f8d0b6c7f9add5de557c39732d95de90a8194967d5",
+        "--kv-format",
+        "bf16",
+        "--state-format",
+        "fp32",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
+      ],
+      "cwd": "/tmp/splash-deepinfer-oracle",
+      "started": 1792568769.94714,
+      "power_before": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t94%; charging; 0:23 remaining present: true\n",
+      "thermal_before": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "exit_status": 0,
+      "finished": 1792568975.023412,
+      "power_after": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t96%; charging; 0:18 remaining present: true\n",
+      "thermal_after": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+    }
+  ],
+  "build/engine-tests/model-runtime-oracle_sha256": "a8eda3f8f86dac43e03c851e60e3b688d9e8e0342546798daa1b59079747a21f",
+  "build/splash.metallib_sha256": "12539edddd82bd28b9fb8e4d9b61f3603a41fa46190b2c0e05cc92ec0623f1ec"
+}

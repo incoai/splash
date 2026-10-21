@@ -1,0 +1,8 @@
+2026-10-21 13:15:47.655 target-sampling[56789:7664369] Metal GPU Validation Enabled
+sampling search top_k 20 temperature 1 top_p 0.95: 0.511375 ms, ordinary 0.907 ms
+sampling search top_k 20 temperature 0.7 top_p 0.8: 0.502083 ms, ordinary 0.907 ms
+extreme search top_k 1000 at temperature 1e-6: 1.10408 ms, ordinary 0.907 ms
+extreme search top_k in a tail saturated by repetition 1e38: 3.207 ms, ordinary 0.907 ms
+extreme search top_k in a tail spread by repetition 1e6: 1.4545 ms, ordinary 0.907 ms
+extreme search top_k in a saturated tail at temperature 1e-5: 3.10125 ms, ordinary 0.907 ms
+target_sampling_metal_test: PASS
