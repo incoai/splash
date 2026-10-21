@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
-"""fp32 reference for the packed Qwen3.5 vision tower.
+"""fp32 reference for the Qwen3.5 vision tower of an installed model.
 
 This is the executable specification the native Metal encoder is graded
-against. It reads a runtime package's ``vision/model.bin`` (the padded engine
-layout that ``runtime/model/QwenVision.cpp`` maps directly) and encodes
-resized uint8 RGB pixels into language-space embeddings entirely in numpy
-fp32: patchify and normalize, patch embedding plus the bilinear
-(align-corners) resample of the learned 48x48 position table, 27 pre-norm
-blocks with 2D rotary attention, and the 2x2 spatial merger. Token order is
-spatial-merge-block-major throughout.
+against. It reads the vision weights of an installed model from the source the
+engine loads (``config.json`` gives the language width): the
+``vision_tower.*`` tensors of an MLX checkpoint's ``vision/`` shards,
+a checkpoint's ``model.visual.*`` in the same place, or the ``v.*`` and
+``mm.*`` tensors of a GGUF projector, ``vision/mmproj.gguf``, bound as
+``VisionLoader`` binds them. It encodes resized uint8 RGB pixels into
+language-space embeddings entirely in numpy fp32: patchify and normalize,
+patch embedding plus the bilinear (align-corners) resample of the learned
+48x48 position table, 27 pre-norm blocks with 2D rotary attention, and the
+2x2 spatial merger. Token order is spatial-merge-block-major throughout.
 
-    python dev/tools/vision_reference.py PACKAGE_ROOT OUT_DIR
+    python dev/tools/vision_reference.py MODEL_ROOT OUT_DIR
 
 writes a small deterministic parity fixture (pixels, grid, fp32 embeddings)
-consumed by ``dev/tests/engine/vision_encoder_test.mm``.
+consumed by ``dev/tests/engine/vision_encoder_test.mm``. The fixtures in
+``dev/tests/fixtures/vision-parity/`` are the default 96x128 image, but the
+35B's, which is ``--height 192 --width 192``.
 """
 
 import argparse
 import json
-import math
 import struct
 import sys
 from dataclasses import dataclass
@@ -29,9 +33,8 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from install import legacy  # noqa: E402
+from install import gguf  # noqa: E402
 
-MAGIC = b"MDFV0001"
 PATCH = 16
 MERGE = 2
 NORM_EPS = 1e-6
@@ -40,68 +43,188 @@ ROPE_THETA = 10000.0
 
 @dataclass(frozen=True)
 class VisionLayout:
-    """The packed tower's geometry, mirroring ``ops::VisionLayout``."""
+    """The tower's geometry, mirroring ``ops::VisionLayout``."""
 
     depth: int = 27
     hidden: int = 1152
     patch_dim: int = 1536
     intermediate: int = 4304
-    padded_intermediate: int = 4352
     merged_hidden: int = 4608
     out_hidden: int = 5120
     heads: int = 16
     position_grid_side: int = 48
 
 
-def sections(layout: VisionLayout):
-    """(section name, shape) in the order the engine reads the pack."""
+def tensor_names(layout: VisionLayout, namespace: str = "vision_tower."):
+    """(reference name, checkpoint tensor name) of every weight the tower
+    reads: MLX's ``vision_tower.*`` or the original ``model.visual.*``."""
 
-    def affine(name, out_size, in_size):
-        yield name + ".weight", (out_size, in_size)
-        yield name + ".bias", (out_size,)
+    def pair(reference, mlx):
+        yield reference + ".weight", namespace + mlx + ".weight"
+        yield reference + ".bias", namespace + mlx + ".bias"
 
-    def norm(name):
-        yield name + ".weight", (layout.hidden,)
-        yield name + ".bias", (layout.hidden,)
-
-    yield from affine("patch_embed", layout.hidden, layout.patch_dim)
-    yield "pos_embed", (layout.position_grid_side**2, layout.hidden)
+    yield from pair("patch_embed", "patch_embed.proj")
+    yield "pos_embed", namespace + "pos_embed.weight"
     for block in range(layout.depth):
         prefix = f"blocks.{block}."
-        yield from norm(prefix + "norm1")
-        yield from affine(prefix + "qkv", 3 * layout.hidden, layout.hidden)
-        yield from affine(prefix + "proj", layout.hidden, layout.hidden)
-        yield from norm(prefix + "norm2")
-        yield from affine(prefix + "fc1", layout.padded_intermediate, layout.hidden)
-        yield from affine(prefix + "fc2", layout.hidden, layout.padded_intermediate)
-    yield from norm("merger.norm")
-    yield from affine("merger.fc1", layout.merged_hidden, layout.merged_hidden)
-    yield from affine("merger.fc2", layout.out_hidden, layout.merged_hidden)
+        yield from pair(prefix + "norm1", prefix + "norm1")
+        yield from pair(prefix + "qkv", prefix + "attn.qkv")
+        yield from pair(prefix + "proj", prefix + "attn.proj")
+        yield from pair(prefix + "norm2", prefix + "norm2")
+        yield from pair(prefix + "fc1", prefix + "mlp.linear_fc1")
+        yield from pair(prefix + "fc2", prefix + "mlp.linear_fc2")
+    yield from pair("merger.norm", "merger.norm")
+    yield from pair("merger.fc1", "merger.linear_fc1")
+    yield from pair("merger.fc2", "merger.linear_fc2")
+
+
+def gguf_names(layout: VisionLayout):
+    """(reference name, mmproj tensor name) of every weight the tower reads,
+    as VisionLoader binds a clip qwen3vl_merger projector. The patch embedding
+    is one [hidden, channel, patch-row, patch-col] weight per temporal frame,
+    ``v.patch_embd.weight`` and ``v.patch_embd.weight.1``."""
+
+    def pair(reference, gguf):
+        yield reference + ".weight", gguf + ".weight"
+        yield reference + ".bias", gguf + ".bias"
+
+    yield "patch_embed.weight", "v.patch_embd.weight"
+    yield "patch_embed.weight.1", "v.patch_embd.weight.1"
+    yield "patch_embed.bias", "v.patch_embd.bias"
+    yield "pos_embed", "v.position_embd.weight"
+    for block in range(layout.depth):
+        prefix, gguf = f"blocks.{block}.", f"v.blk.{block}."
+        yield from pair(prefix + "norm1", gguf + "ln1")
+        yield from pair(prefix + "qkv", gguf + "attn_qkv")
+        yield from pair(prefix + "proj", gguf + "attn_out")
+        yield from pair(prefix + "norm2", gguf + "ln2")
+        yield from pair(prefix + "fc1", gguf + "ffn_up")
+        yield from pair(prefix + "fc2", gguf + "ffn_down")
+    yield from pair("merger.norm", "v.post_ln")
+    yield from pair("merger.fc1", "mm.0")
+    yield from pair("merger.fc2", "mm.2")
 
 
 def bf16_to_f32(words: np.ndarray) -> np.ndarray:
     return (words.astype(np.uint32) << 16).view(np.float32)
 
 
-def load_pack(root: Path) -> tuple[VisionLayout, dict]:
-    """The package's vision layout and its fp32 weights by section name."""
-    config = json.loads((root / "tokenizer" / "config.json").read_text())
+def safetensors_names(directory: Path) -> set:
+    """The tensor names of directory's safetensors shards."""
+    names = set()
+    for shard in sorted(directory.glob("*.safetensors")):
+        with shard.open("rb") as file:
+            length = struct.unpack("<Q", file.read(8))[0]
+            names.update(json.loads(file.read(length)))
+    names.discard("__metadata__")
+    return names
+
+
+# ggml type -> (name, element dtype); the ones a projector's tensors may be.
+GGUF_TYPES = {0: ("F32", np.float32), 1: ("F16", np.float16), 30: ("BF16", np.uint16)}
+
+
+def read_gguf_tensors(path: Path, names) -> dict:
+    """The fp32 values of the named tensors of a GGUF file, F32, F16 or BF16.
+    GGUF lists a tensor's dimensions innermost first; each value is returned
+    row-major, in the reversed shape."""
+    header = gguf.Metadata(path, tensors=True)
+    if header.values.get("general.architecture") != "clip" or (
+        header.values.get("clip.projector_type") != "qwen3vl_merger"
+    ):
+        raise ValueError(f"{path} is not a clip qwen3vl_merger projector")
+    # The data section starts at the first multiple of the alignment past
+    # the header.
+    alignment = header.values.get("general.alignment", 32)
+    data = (header.consumed + alignment - 1) // alignment * alignment
+    found = {}
+    for name in names:
+        if name not in header.tensors:
+            continue
+        dims, kind = header.extents[name], header.tensors[name]
+        if kind not in GGUF_TYPES:
+            raise ValueError(f"unsupported vision tensor type {kind}: {name}")
+        label, dtype = GGUF_TYPES[kind]
+        count = int(np.prod(dims))
+        offset = data + header.offsets[name]
+        raw = np.fromfile(path, dtype=dtype, count=count, offset=offset)
+        values = bf16_to_f32(raw) if label == "BF16" else raw.astype(np.float32)
+        found[name] = values.reshape(dims[::-1])
+    missing = sorted(set(names) - set(found))
+    if missing:
+        raise ValueError(f"{path} lacks vision tensors: {', '.join(missing[:3])}")
+    return found
+
+
+def read_tensors(directory: Path, names) -> dict:
+    """The fp32 values of the named tensors among directory's safetensors
+    shards, BF16, F16 or F32."""
+    found = {}
+    for shard in sorted(directory.glob("*.safetensors")):
+        with shard.open("rb") as file:
+            length = struct.unpack("<Q", file.read(8))[0]
+            header = json.loads(file.read(length))
+        data = np.memmap(shard, dtype=np.uint8, mode="r", offset=8 + length)
+        for name in names:
+            if name in found or name not in header:
+                continue
+            record = header[name]
+            begin, end = record["data_offsets"]
+            raw = np.asarray(data[begin:end])
+            if record["dtype"] == "BF16":
+                values = bf16_to_f32(raw.view(np.uint16))
+            elif record["dtype"] == "F16":
+                values = raw.view(np.float16).astype(np.float32)
+            elif record["dtype"] == "F32":
+                values = raw.view(np.float32).copy()
+            else:
+                raise ValueError(
+                    f"unsupported vision tensor dtype {record['dtype']}: {name}"
+                )
+            found[name] = values.reshape(record["shape"])
+    missing = sorted(set(names) - set(found))
+    if missing:
+        raise ValueError(f"{directory} lacks vision tensors: {', '.join(missing[:3])}")
+    return found
+
+
+def load_model(root: Path) -> tuple[VisionLayout, dict]:
+    """The installed model's vision layout and its fp32 weights by reference
+    name, from ``vision/mmproj.gguf`` when the installation links one, else
+    the ``vision/`` safetensors shards. Patchify orders a patch [channel,
+    frame, patch-row, patch-col]: MLX stores the patch embedding [frame,
+    patch-row, patch-col, channel], the original layout [channel, frame,
+    patch-row, patch-col], and a GGUF projector one [channel, patch-row,
+    patch-col] weight per frame."""
+    config = json.loads((root / "config.json").read_text())
     layout = VisionLayout(out_hidden=config["text_config"]["hidden_size"])
-    path = root / "vision" / "model.bin"
-    data = np.memmap(path, dtype=np.uint8, mode="r")
-    magic, depth, kind = struct.unpack("<8sII", data[:16].tobytes())
-    if magic != MAGIC or depth != layout.depth or kind != 0:
-        raise ValueError(f"invalid vision pack header: {path}")
-    weights = {}
-    offset = 16
-    for name, shape in sections(layout):
-        count = math.prod(shape)
-        offset = -(-offset // legacy.ALIGNMENT) * legacy.ALIGNMENT
-        words = np.asarray(data[offset : offset + count * 2]).view(np.uint16)
-        weights[name] = bf16_to_f32(words).reshape(shape)
-        offset += count * 2
-    if -(-offset // legacy.ALIGNMENT) * legacy.ALIGNMENT != data.size:
-        raise ValueError(f"unexpected vision pack size: {path}")
+    mmproj = root / "vision" / "mmproj.gguf"
+    if mmproj.exists():
+        names = dict(gguf_names(layout))
+        values = read_gguf_tensors(mmproj, list(names.values()))
+        weights = {reference: values[name] for reference, name in names.items()}
+        patch = np.stack(
+            [weights.pop("patch_embed.weight"), weights.pop("patch_embed.weight.1")],
+            axis=2,
+        )
+    else:
+        shards = root / "vision"
+        visual_names = "model.visual.patch_embed.proj.weight" in safetensors_names(
+            shards
+        )
+        names = dict(
+            tensor_names(layout, "model.visual." if visual_names else "vision_tower.")
+        )
+        values = read_tensors(shards, list(names.values()))
+        weights = {reference: values[name] for reference, name in names.items()}
+        patch = weights["patch_embed.weight"]
+        if not visual_names:
+            patch = patch.transpose(0, 4, 1, 2, 3)
+    if patch.shape != (layout.hidden, 3, 2, PATCH, PATCH):
+        raise ValueError(f"unexpected patch embedding shape {patch.shape}")
+    weights["patch_embed.weight"] = np.ascontiguousarray(patch).reshape(
+        layout.hidden, layout.patch_dim
+    )
     return layout, weights
 
 
@@ -200,7 +323,6 @@ def encode(layout: VisionLayout, weights: dict, pixels: np.ndarray) -> np.ndarra
     )
     cos, sin = rope_tables(grid_h, grid_w, head_dim)
     scale = head_dim**-0.5
-    intermediate = layout.intermediate
     for block in range(layout.depth):
         p = f"blocks.{block}."
         normalized = layer_norm(
@@ -221,19 +343,10 @@ def encode(layout: VisionLayout, weights: dict, pixels: np.ndarray) -> np.ndarra
         normalized = layer_norm(
             x, weights[p + "norm2.weight"], weights[p + "norm2.bias"]
         )
-        # The pack pads the MLP width to 4352 with zero rows/columns; the
-        # padded activations are exactly zero and contribute nothing.
-        hidden = linear(
-            normalized,
-            weights[p + "fc1.weight"][:intermediate],
-            weights[p + "fc1.bias"][:intermediate],
+        hidden = gelu_tanh(
+            linear(normalized, weights[p + "fc1.weight"], weights[p + "fc1.bias"])
         )
-        hidden = gelu_tanh(hidden)
-        x = x + linear(
-            hidden,
-            weights[p + "fc2.weight"][:, :intermediate],
-            weights[p + "fc2.bias"],
-        )
+        x = x + linear(hidden, weights[p + "fc2.weight"], weights[p + "fc2.bias"])
     merged = layer_norm(x, weights["merger.norm.weight"], weights["merger.norm.bias"])
     merged = merged.reshape(tokens // (MERGE * MERGE), layout.merged_hidden)
     merged = linear(merged, weights["merger.fc1.weight"], weights["merger.fc1.bias"])
@@ -252,7 +365,7 @@ def fixture_image(height: int = 96, width: int = 128) -> np.ndarray:
 
 
 def write_fixture(root: Path, out: Path, height: int = 96, width: int = 128) -> None:
-    layout, weights = load_pack(root)
+    layout, weights = load_model(root)
     pixels = fixture_image(height, width)
     expected = encode(layout, weights, pixels).astype(np.float32)
     out.mkdir(parents=True, exist_ok=True)
@@ -269,9 +382,9 @@ def write_fixture(root: Path, out: Path, height: int = 96, width: int = 128) -> 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("package", type=Path)
+    parser.add_argument("model", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--height", type=int, default=96)
     parser.add_argument("--width", type=int, default=128)
     args = parser.parse_args()
-    write_fixture(args.package, args.output, args.height, args.width)
+    write_fixture(args.model, args.output, args.height, args.width)

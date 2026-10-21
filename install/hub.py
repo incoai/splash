@@ -1,8 +1,8 @@
 """The Hugging Face Hub and its cache, as the installers read them.
 
 A source is one repository at one commit (Repository): listed by the Hub,
-read from that commit's snapshot in the Hub cache, or a local draft
-directory. An installation pins every snapshot it links with a ref of its
+read from that commit's snapshot in the Hub cache, or local files. An
+installation pins every snapshot it links with a ref of its
 own, refs/splash/<installation>/<commit>, so neither pruning the cache nor
 another installation can remove its files.
 
@@ -34,14 +34,13 @@ def token():
     return os.environ.get("HF_TOKEN") or get_token()
 
 
-def reason(error, used_token=None) -> str:
-    """The Hub's reason for error on one line, with the token redacted (the
-    one the request used, or the configured one) and, for denied access, how
-    to authenticate."""
+def reason(error) -> str:
+    """The Hub's reason for error on one line, with the configured token
+    redacted and, for denied access, how to authenticate."""
     from huggingface_hub.errors import HfHubHTTPError
 
     message = " ".join(str(error).split()) or type(error).__name__
-    if secret := used_token or token():
+    if secret := token():
         message = message.replace(secret, "[redacted]")
     if (
         isinstance(error, HfHubHTTPError)
@@ -90,9 +89,7 @@ def snapshot_commit(path: Path, repo_id: str) -> str:
         or path.parent.parent.name != folder_name(repo_id)
         or not models.is_hex_digest(path.name, 40)
     ):
-        raise models.ModelError(
-            "installed package is not a snapshot of the requested Hub repository"
-        )
+        raise models.ModelError(f"{path} is not a snapshot of {repo_id} in a Hub cache")
     return path.name
 
 
@@ -133,16 +130,17 @@ def pin(path: Path, repo_id: str, installation: Path) -> Path:
             raise models.ModelError(f"invalid installed snapshot reference: {ref}")
         return ref
     ref.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=ref.parent) as temporary:
-        temporary.write(commit.encode())
-        temporary.flush()
+    # A pin's content is its own name, so writers never disagree: publish it by
+    # rename, which file systems without hard links (exFAT) support too.
+    with tempfile.NamedTemporaryFile(dir=ref.parent, delete=False) as temporary:
+        pending = Path(temporary.name)
         try:
-            os.link(temporary.name, ref)
-        except FileExistsError:
-            if ref.read_text() != commit:
-                raise models.ModelError(
-                    f"invalid installed snapshot reference: {ref}"
-                ) from None
+            temporary.write(commit.encode())
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            os.replace(pending, ref)
+        finally:
+            pending.unlink(missing_ok=True)
     return ref
 
 
@@ -182,23 +180,25 @@ def repair_pins(installation: Path, snapshots):
 
 class Repository:
     """One source at one commit: a Hub repository at the commit its revision
-    resolved to, listed by the Hub (directory None) or read from that
-    commit's cached snapshot, or a local draft directory (revision None).
-    The commit of a verified installation that starts without the Hub is
-    not listed at all: that installation's links name its files."""
+    resolved to, listed by the Hub (paths None) or read from that commit's
+    cached snapshot, or local files (revision None): a draft directory, or
+    the files a model is prepared from (local.py). The commit of a verified
+    installation that starts without the Hub is not listed at all: that
+    installation's links name its files."""
 
     def __init__(
         self,
         name,
         revision,
         files,
-        directory=None,
+        paths=None,
         *,
         sizes=None,
         unreachable_reason=None,
     ):
         self.name, self.revision, self.files = name, revision, files
-        self.directory = directory
+        # Each file's local path, for a cached snapshot or local files.
+        self.paths = paths
         # Hub filename -> (bytes, blob ID), to report what a download fetches.
         self.sizes = sizes or {}
         # Why the Hub did not resolve this source, when its cached snapshot
@@ -210,7 +210,13 @@ class Repository:
         path = Path(path)
         if not path.is_dir():
             raise models.ModelError(f"local draft directory not found: {path}")
-        return cls(str(path), None, _listing(path), path)
+        return cls.local_files(str(path), _paths(path))
+
+    @classmethod
+    def local_files(cls, name, paths):
+        """name, the local files paths maps each file name to, wherever each
+        lies."""
+        return cls(name, None, set(paths), dict(paths))
 
     @classmethod
     def cached(cls, name, commit, *, unreachable_reason=None):
@@ -219,8 +225,9 @@ class Repository:
         path = snapshot(name, commit)
         if not path.is_dir():
             raise models.ModelError(f"the Hub cache has no snapshot {commit} of {name}")
+        paths = _paths(path)
         return cls(
-            name, commit, _listing(path), path, unreachable_reason=unreachable_reason
+            name, commit, set(paths), paths, unreachable_reason=unreachable_reason
         )
 
     @classmethod
@@ -296,12 +303,16 @@ class Repository:
         for commit in commits:
             if snapshot(name, commit).is_dir():
                 return cls.cached(name, commit, unreachable_reason=why)
-        cache = (
-            "the Hub cache has no snapshot of " + ", ".join(commits)
-            if commits
-            else "neither this installation nor the Hub cache records a commit "
-            f"for {revision or 'the default branch'}"
-        )
+        branch = revision or "the default branch"
+        if commits:
+            cache = "the Hub cache has no snapshot of " + ", ".join(commits)
+        elif installation is not None:
+            cache = (
+                "neither this installation nor the Hub cache records a commit "
+                f"for {branch}"
+            )
+        else:
+            cache = f"the Hub cache records no commit for {branch}"
         raise models.ModelError(f"cannot resolve {name}: {why}; {cache}")
 
     def _require(self, name):
@@ -312,8 +323,8 @@ class Repository:
 
     def file(self, name):
         self._require(name)
-        if self.directory is not None:
-            return self.directory / name
+        if self.paths is not None:
+            return self.paths[name]
         from huggingface_hub import hf_hub_download
 
         return Path(hf_hub_download(self.name, name, revision=self.revision))
@@ -322,8 +333,8 @@ class Repository:
         """A binary stream of one file read on demand: reading a GGUF header
         costs a few range requests, not a download."""
         self._require(name)
-        if self.directory is not None:
-            return (self.directory / name).open("rb")
+        if self.paths is not None:
+            return self.paths[name].open("rb")
         from huggingface_hub import HfFileSystem, try_to_load_from_cache
 
         cached = try_to_load_from_cache(self.name, name, revision=self.revision)
@@ -337,8 +348,8 @@ class Repository:
         """Each of names -> its local path, downloading what the cache lacks."""
         for name in names:
             self._require(name)
-        if self.directory is not None:
-            return {name: self.directory / name for name in names}
+        if self.paths is not None:
+            return {name: self.paths[name] for name in names}
         from huggingface_hub import snapshot_download
 
         blobs = folder(self.name) / "blobs"
@@ -367,9 +378,12 @@ class Repository:
         return {"repo": self.name, "revision": self.revision}
 
 
-def _listing(directory):
+def _paths(directory):
+    """Each file under directory, by its name relative to it, -> its path."""
     return {
-        p.relative_to(directory).as_posix() for p in directory.rglob("*") if p.is_file()
+        p.relative_to(directory).as_posix(): p
+        for p in directory.rglob("*")
+        if p.is_file()
     }
 
 

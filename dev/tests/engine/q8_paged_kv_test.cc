@@ -1,9 +1,10 @@
 #include "Q8PageFormatReference.hpp"
+#include "TestChecks.hpp"
 
 #include <algorithm>
-#include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -11,6 +12,8 @@
 #include <vector>
 
 using namespace splash::kv;
+using splash::test::rejects;
+using splash::test::require;
 
 namespace {
 
@@ -61,32 +64,41 @@ void testByteAccounting() {
 }
 
 void testLayouts() {
-  assert(splash_kv_key_element(0, 0, 1) == splash_kv_key_element(0, 0, 0) + 1);
-  assert(splash_kv_key_element(0, 1, 0) ==
-         splash_kv_key_element(0, 0, 0) + kHeadDimension);
-  assert(splash_kv_value_element(0, 1, 0) ==
-         splash_kv_value_element(0, 0, 0) + 1);
-  assert(splash_kv_value_element(0, 0, 1) ==
-         splash_kv_value_element(0, 0, 0) + kPageTokens);
-  assert(splash_kv_key_element(kKvHeads - 1, kPageTokens - 1,
-                               kHeadDimension - 1) == kElementsPerLayerPage - 1);
-  assert(splash_kv_value_element(kKvHeads - 1, kPageTokens - 1,
-                                 kHeadDimension - 1) == kElementsPerLayerPage - 1);
+  require(splash_kv_key_element(0, 0, 1) == splash_kv_key_element(0, 0, 0) + 1,
+          "a key's next dimension is not its next element");
+  require(splash_kv_key_element(0, 1, 0) ==
+              splash_kv_key_element(0, 0, 0) + kHeadDimension,
+          "a key's next token does not follow its head dimension");
+  require(splash_kv_value_element(0, 1, 0) ==
+              splash_kv_value_element(0, 0, 0) + 1,
+          "a value's next token is not its next element");
+  require(splash_kv_value_element(0, 0, 1) ==
+              splash_kv_value_element(0, 0, 0) + kPageTokens,
+          "a value's next dimension does not follow the page's tokens");
+  require(splash_kv_key_element(kKvHeads - 1, kPageTokens - 1,
+                                kHeadDimension - 1) == kElementsPerLayerPage - 1,
+          "the last key element is not the layer page's last");
+  require(splash_kv_value_element(kKvHeads - 1, kPageTokens - 1,
+                                  kHeadDimension - 1) == kElementsPerLayerPage - 1,
+          "the last value element is not the layer page's last");
 }
 
 void testBFloat16() {
   for (float value : {0.0f, -0.0f, 1.0f, -3.5f, 1.0e-20f, 65504.0f}) {
     float roundTrip = bfloat16ToFloat(floatToBFloat16(value));
     if (value == 0.0f) {
-      assert(roundTrip == value);
+      require(roundTrip == value, "a zero did not survive BF16");
     } else {
-      assert(std::abs(roundTrip - value) <= std::abs(value) / 128.0f);
+      require(std::abs(roundTrip - value) <= std::abs(value) / 128.0f,
+              "a BF16 round trip moved a value by more than 1/128 of it");
     }
   }
-  assert(std::isinf(bfloat16ToFloat(
-      floatToBFloat16(std::numeric_limits<float>::infinity()))));
-  assert(std::isnan(bfloat16ToFloat(
-      floatToBFloat16(std::numeric_limits<float>::quiet_NaN()))));
+  require(std::isinf(bfloat16ToFloat(
+              floatToBFloat16(std::numeric_limits<float>::infinity()))),
+          "an infinity did not survive BF16");
+  require(std::isnan(bfloat16ToFloat(
+              floatToBFloat16(std::numeric_limits<float>::quiet_NaN()))),
+          "a NaN did not survive BF16");
 }
 
 void testQuantization(uint32_t validTokens) {
@@ -117,21 +129,25 @@ void testQuantization(uint32_t validTokens) {
         uint64_t logical = logicalIndex(token, head, dimension);
         float keyScale = page->keyScales[splash_kv_scale_element(head, token)];
         float valueScale = page->valueScales[splash_kv_scale_element(head, token)];
-        assert(std::abs(decodedKeys[logical] - keys[logical]) <=
-               keyScale * 0.51f + 1.0e-7f);
-        assert(std::abs(decodedValues[logical] - values[logical]) <=
-               valueScale * 0.51f + 1.0e-7f);
-        assert(decodedKeys[logical] ==
-               dequantizeKey(*page, head, token, dimension));
-        assert(decodedValues[logical] ==
-               dequantizeValue(*page, head, token, dimension));
+        require(std::abs(decodedKeys[logical] - keys[logical]) <=
+                    keyScale * 0.51f + 1.0e-7f,
+                "a key is off by more than half its scale");
+        require(std::abs(decodedValues[logical] - values[logical]) <=
+                    valueScale * 0.51f + 1.0e-7f,
+                "a value is off by more than half its scale");
+        require(decodedKeys[logical] ==
+                    dequantizeKey(*page, head, token, dimension),
+                "the page's keys and one key's dequantization differ");
+        require(decodedValues[logical] ==
+                    dequantizeValue(*page, head, token, dimension),
+                "the page's values and one value's dequantization differ");
       }
     }
   }
   for (uint32_t token = validTokens; token < kPageTokens; ++token) {
     uint64_t logical = logicalIndex(token, 0, 0);
-    assert(decodedKeys[logical] == 0.0f);
-    assert(decodedValues[logical] == 0.0f);
+    require(decodedKeys[logical] == 0.0f && decodedValues[logical] == 0.0f,
+            "a row past the valid tokens is not zero");
   }
 }
 
@@ -140,28 +156,31 @@ void testZeroAndInvalidInputs() {
   std::vector<float> values(uint64_t{tokens} * kKvHeads * kHeadDimension);
   auto page = std::make_unique<Q8LayerPage>();
   quantizeLayerPage(values, values, tokens, *page);
-  assert(std::all_of(page->keys.begin(), page->keys.end(),
-                     [](int8_t value) { return value == 0; }));
-  assert(std::all_of(page->values.begin(), page->values.end(),
-                     [](int8_t value) { return value == 0; }));
+  require(std::all_of(page->keys.begin(), page->keys.end(),
+                      [](int8_t value) { return value == 0; }) &&
+              std::all_of(page->values.begin(), page->values.end(),
+                          [](int8_t value) { return value == 0; }),
+          "a zero page did not quantize to zeros");
   values[0] = std::numeric_limits<float>::quiet_NaN();
-  bool rejected = false;
-  try {
-    quantizeLayerPage(values, values, tokens, *page);
-  } catch (const std::invalid_argument &) {
-    rejected = true;
-  }
-  assert(rejected);
+  rejects([&] { quantizeLayerPage(values, values, tokens, *page); },
+          "logical keys contains a non-finite value",
+          "a page with a non-finite value was quantized");
 }
 
 } // namespace
 
 int main() {
-  testByteAccounting();
-  testLayouts();
-  testBFloat16();
-  testQuantization(kPageTokens);
-  testQuantization(17);
-  testZeroAndInvalidInputs();
-  std::cout << "q8_paged_kv_test: ok\n";
+  try {
+    testByteAccounting();
+    testLayouts();
+    testBFloat16();
+    testQuantization(kPageTokens);
+    testQuantization(17);
+    testZeroAndInvalidInputs();
+    std::cout << "q8_paged_kv_test: ok\n";
+    return EXIT_SUCCESS;
+  } catch (const std::exception &error) {
+    std::cerr << "q8_paged_kv_test failed: " << error.what() << '\n';
+    return EXIT_FAILURE;
+  }
 }

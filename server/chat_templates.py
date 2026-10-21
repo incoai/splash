@@ -37,14 +37,16 @@ Tokenizer files and the tokenizer object are never modified.
 
 import json
 import re
+import sys
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
-from functools import lru_cache
 
 from jinja2 import Environment, TemplateError, TemplateSyntaxError, nodes
 from jinja2.ext import Extension
 from jinja2.lexer import Token
 
+from .lru import LRUCache, memoized
 from .serve_options import REASONING_EFFORTS
 
 # Template arguments request preparation sets itself, and apply_chat_template's
@@ -65,8 +67,13 @@ RESERVED_TEMPLATE_KWARGS = frozenset(
 # Template options that cannot shape the generation prompt: those (the probe
 # renders without tools) and preserve_thinking, which only changes history.
 _HISTORY_OPTIONS = RESERVED_TEMPLATE_KWARGS | {"preserve_thinking"}
-# Combinations of other template variables whose generation prompts are kept.
+# Combinations of other template variables whose generation prompts are kept,
+# at most this many. A request may make its variables as large as its body,
+# and a template may render them into its generation prompt, so the variables
+# and the prompts' text and tokens are kept within this many bytes too, as the
+# server's other caches of request text are.
 _PROBED_OPTIONS = 64
+_PROBED_OPTIONS_BYTES = 8 * 1024 * 1024
 
 # What Splash does with a later system message.
 NATIVE = "native"
@@ -87,18 +94,33 @@ class ChatTemplateError(ValueError):
     """The tokenizer has no chat template Splash can serve."""
 
 
-# What a template that rejects one of the REASONING_EFFORTS renders instead.
+# What a template that rejects one of the REASONING_EFFORTS renders instead;
+# one that rejects none renders by enable_thinking alone (render_chat_template).
 REASONING_EFFORT_ALIASES = {"high": "xhigh", "max": "xhigh", "minimal": "low"}
 
 
 def template_options(
-    *, reasoning_effort, preserve_thinking, tools, add_generation_prompt
+    *,
+    reasoning_effort,
+    preserve_thinking,
+    tools,
+    add_generation_prompt,
+    enable_thinking=None,
 ):
-    """Template variables exactly as request preparation passes them."""
+    """Template variables exactly as request preparation passes them, before
+    the request's other chat_template_kwargs. Whether the model thinks
+    follows the request's own enable_thinking, else its effort, and both
+    switches templates read say so: enable_thinking, and reasoning_effort,
+    which some templates read alone: "none" without thinking, the effort with
+    it, and absent for the template's default effort."""
     options = {"add_generation_prompt": add_generation_prompt}
-    if reasoning_effort is not None:
-        options["enable_thinking"] = reasoning_effort != "none"
-        if reasoning_effort != "none":
+    if enable_thinking is None and reasoning_effort is not None:
+        enable_thinking = reasoning_effort != "none"
+    if enable_thinking is not None:
+        options["enable_thinking"] = enable_thinking
+        if not enable_thinking:
+            options["reasoning_effort"] = "none"
+        elif reasoning_effort not in (None, "none"):
             options["reasoning_effort"] = reasoning_effort
     if preserve_thinking is not None:
         options["preserve_thinking"] = preserve_thinking
@@ -109,16 +131,25 @@ def template_options(
 
 def render_chat_template(tokenizer, messages, options):
     """Render as requests and the startup probe do: a template that rejects
-    the reasoning effort renders its alias instead."""
+    the reasoning effort renders its alias instead, and one that rejects
+    "none" while thinking is off renders by enable_thinking alone."""
     try:
         return tokenizer.apply_chat_template(messages, **options)
-    except TemplateError:
-        alias = REASONING_EFFORT_ALIASES.get(options.get("reasoning_effort"))
-        if alias is None:
+    except TemplateError as error:
+        effort = options.get("reasoning_effort")
+        retry = dict(options)
+        if effort in REASONING_EFFORT_ALIASES:
+            retry["reasoning_effort"] = REASONING_EFFORT_ALIASES[effort]
+        elif effort == "none" and options.get("enable_thinking") is False:
+            del retry["reasoning_effort"]
+        else:
             raise
-        return tokenizer.apply_chat_template(
-            messages, **{**options, "reasoning_effort": alias}
-        )
+        try:
+            return tokenizer.apply_chat_template(messages, **retry)
+        except TemplateError:
+            # The alias is Splash's own fallback: the request reads what its
+            # own effort met.
+            raise error from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,10 +280,16 @@ def _prepare(render, encode, source):
         if patched is not None and _verified(render, source, patched):
             source, later_system = patched, PATCHED
 
-    @lru_cache(maxsize=_PROBED_OPTIONS)
+    probed = LRUCache(_PROBED_OPTIONS_BYTES, _PROBED_OPTIONS)
+    lock = threading.Lock()
+
     def probe(key):
-        options = {**json.loads(key), "add_generation_prompt": True}
-        return _generation_prompt(render, encode, source, options) or ("", ())
+        def generation_prompt():
+            options = {**json.loads(key), "add_generation_prompt": True}
+            found = _generation_prompt(render, encode, source, options) or ("", ())
+            return found, _probed_bytes(key, found)
+
+        return memoized(probed, lock, key, generation_prompt)
 
     return ChatTemplate(
         source,
@@ -389,6 +426,18 @@ def _generation_prompt(render, encode, source, options):
     return None
 
 
+def _probed_bytes(key, found):
+    """The bytes a probed generation prompt keeps: its key, and the text and
+    tokens found for it, a tuple of ints."""
+    text, tokens = found
+    return (
+        sys.getsizeof(key)
+        + sys.getsizeof(text)
+        + sys.getsizeof(tokens)
+        + sum(map(sys.getsizeof, tokens))
+    )
+
+
 def _outcome(render, source, messages, options):
     try:
         return render(source, messages, options)
@@ -450,7 +499,12 @@ def _system_block(render, source):
     patched.
     """
     ask = [_ASK]
-    options = {"add_generation_prompt": False, "enable_thinking": False}
+    options = template_options(
+        reasoning_effort="none",
+        preserve_thinking=None,
+        tools=None,
+        add_generation_prompt=False,
+    )
     try:
         with_system = render(
             source, [{"role": "system", "content": _MARKER}, *ask], options

@@ -14,7 +14,8 @@ namespace splash::test::gguf {
 using Bytes = std::vector<uint8_t>;
 
 // Metadata value types.
-inline constexpr uint32_t kUint32 = 4, kInt32 = 5, kFloat32 = 6, kBool = 7, kString = 8, kArray = 9, kUint64 = 10;
+inline constexpr uint32_t kUint16 = 2, kUint32 = 4, kInt32 = 5, kFloat32 = 6, kBool = 7, kString = 8, kArray = 9,
+                          kUint64 = 10;
 // The alignment of the tensor data and of each tensor in it when the file
 // has no general.alignment key.
 inline constexpr uint64_t kAlignment = 32;
@@ -74,6 +75,17 @@ inline Key stringArrayKey(std::string name, const std::vector<std::string> &valu
   append<uint64_t>(key.value, values.size());
   for (const std::string &value : values) appendString(key.value, value);
   return key;
+}
+
+// The keys a split GGUF's writer puts into every part of it,
+// in its types: the part's number from 0, the number of parts and the
+// number of tensors in them all.
+inline std::vector<Key> splitKeys(uint16_t number, uint16_t count, int32_t tensors) {
+  std::vector<Key> keys{{"split.no", kUint16, {}}, {"split.count", kUint16, {}}, {"split.tensors.count", kInt32, {}}};
+  append(keys[0].value, number);
+  append(keys[1].value, count);
+  append(keys[2].value, tensors);
+  return keys;
 }
 
 struct Tensor {

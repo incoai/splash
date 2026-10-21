@@ -5,7 +5,7 @@ import functools
 import queue
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from tokenizers.decoders import DecodeStream
 
@@ -18,7 +18,13 @@ from .errors import APIError, ConstraintError
 from .latency import RequestLatency
 from .metrics import metrics_dict
 from .output import hold_partial
-from .tool_schema import THINK_END_TOKEN_ID, ToolPolicy
+from .tool_schema import (
+    CALL_OPEN,
+    THINK_END,
+    THINK_END_TOKEN_ID,
+    TOOL_CALL_OPEN_TOKEN_ID,
+    ToolPolicy,
+)
 
 # A failure counts toward a crash loop unless its engine served this long.
 CRASH_LOOP_WINDOW_SECONDS = 60.0
@@ -31,7 +37,41 @@ RESTART_BACKOFF_SECONDS = 5.0
 
 # Control requests use a short live probe and explicitly label stale snapshots.
 STATUS_REFRESH_TIMEOUT_SECONDS = 0.05
-STATUS_BACKGROUND_TIMEOUT_SECONDS = 30.0
+
+
+# What the engine selects where a thinking budget runs out without
+# --thinking-end-text: the close of thinking alone.
+DEFAULT_THINKING_END = (THINK_END_TOKEN_ID,)
+
+
+class ThinkingEndError(ValueError):
+    """A --thinking-end-text the model's tokenizer cannot end thinking with."""
+
+
+def thinking_end_tokens(tokenizer, text):
+    """The tokens the engine selects where a thinking budget runs out:
+    DEFAULT_THINKING_END, or --thinking-end-text, which must encode as text
+    then the close of thinking as its own token, at most
+    wire.MAX_THINKING_END_TOKENS tokens. The text holds none of the
+    tokenizer's added tokens, the template's special tokens."""
+    if text is None:
+        return DEFAULT_THINKING_END
+    tokens = tuple(tokenizer.encode(text, add_special_tokens=False))
+    if (
+        not tokens
+        or tokens[-1] != THINK_END_TOKEN_ID
+        or not tokenizer.added_tokens_decoder.keys().isdisjoint(tokens[:-1])
+    ):
+        raise ThinkingEndError(
+            f"--thinking-end-text must end with {THINK_END} and hold no other "
+            "special token"
+        )
+    if len(tokens) > wire.MAX_THINKING_END_TOKENS:
+        raise ThinkingEndError(
+            f"--thinking-end-text takes {len(tokens)} tokens; the most is "
+            f"{wire.MAX_THINKING_END_TOKENS}"
+        )
+    return tokens
 
 
 def remaining_request_time(deadline):
@@ -48,6 +88,21 @@ class CacheInfo:
     status: str = "unknown"
     matched_tokens: int = 0
     lane: int = -1
+    # Tokens whose KV the request read from cached blocks another request
+    # computed, past its cached prefix; known once it is done.
+    deduplicated_tokens: int = 0
+
+
+@dataclass(frozen=True)
+class ReasoningRequest:
+    """How a chat request asked to reason: the reasoning effort it sent, None
+    when absent; the effort its template rendered with, the server's default
+    for an absent one and None for the template's own; and its
+    chat_template_kwargs enable_thinking, None when unset."""
+
+    sent: str | None
+    effort: str | None
+    enable_thinking: bool | None
 
 
 @dataclass
@@ -64,6 +119,12 @@ class NativeResult:
     first_token_batch_tokens: int = 0
     # Raw option logits for score-only jobs, in requested token order.
     option_logits: tuple = ()
+    drafted_tokens: int = 0
+    accepted_draft_tokens: int = 0
+    draft_cycles: int = 0
+    # The engine ended the response at a bound of its own, short of
+    # max_new_tokens: what the SSD cache or memory holds of its context.
+    bounded: bool = False
 
     @functools.cached_property
     def metrics(self):
@@ -82,6 +143,12 @@ class Job:
     priority: wire.RequestPriority = wire.RequestPriority.NORMAL
     stop_sequences: tuple[str, ...] = ()
     thinking: bool = False
+    # A chat request's reasoning options, which its Started line shows; None
+    # for a request without a chat template.
+    reasoning: ReasoningRequest | None = None
+    # The thinking tokens the job may select before its thinking closes, set
+    # only where that comes before the output limit; None for no cap.
+    thinking_token_budget: int | None = None
     thinking_display: str = "summarized"
     reasoning_tokens: int = 0
     events: queue.Queue = field(default_factory=queue.Queue)
@@ -104,7 +171,6 @@ class Job:
     tools_signature: tuple | None = None
     response_previous_id: str | None = None
     response_history_items: list | None = None
-    return_progress: bool = False
     # Option token ids for score-only jobs; empty means ordinary generation.
     score_tokens: tuple = ()
     # Trailing prompt tokens of the chat template's generation prompt; zero
@@ -116,7 +182,15 @@ class Job:
     output_clamped_to_context: bool = False
     # The digest of a judgment's rendered prompt, which its response reports.
     prompt_sha256: str | None = None
+    # The request's cache_salt hashed to 128 bits; zero without one.
+    cache_salt: int = 0
     latency: RequestLatency | None = None
+
+    @property
+    def may_call_tools(self):
+        """Whether the output may call a tool: tools are offered under a
+        choice other than none."""
+        return self.tool_policy is not None and bool(self.tool_policy.schemas)
 
 
 class CallbackStreamer:
@@ -207,13 +281,29 @@ class CallbackStreamer:
             self._send(self.pending_text)
             self.pending_text = ""
 
-    def count_reasoning_tokens(self, enabled):
+    def count_reasoning_tokens(self, enabled, tool_calls=False):
+        """The tokens before the reasoning's end, as ReasoningSplitter reads
+        the text: its close, or where a call may follow, a call's opening."""
         if not enabled:
             return 0
-        try:
-            return self.token_ids.index(THINK_END_TOKEN_ID)
-        except ValueError:
-            return len(self.token_ids)
+        for index, token in enumerate(self.token_ids):
+            if token == THINK_END_TOKEN_ID or (
+                tool_calls
+                and token == TOOL_CALL_OPEN_TOKEN_ID
+                and self._opens_call(index)
+            ):
+                return index
+        return len(self.token_ids)
+
+    def _opens_call(self, index):
+        """Whether the text from the call-open token at `index` on begins
+        CALL_OPEN, decoded from as few tokens as decide it."""
+        text = ""
+        for end in range(index + 1, len(self.token_ids) + 1):
+            text = self.tokenizer.decode(self.token_ids[index:end])
+            if len(text) >= len(CALL_OPEN) or not CALL_OPEN.startswith(text):
+                break
+        return text.startswith(CALL_OPEN)
 
 
 @dataclass
@@ -245,10 +335,15 @@ class NativeBackend:
         wire.FinishReason.CANCELLED: "cancelled",
     }
 
-    def __init__(self, runtime, tokenizer, request_logger):
+    def __init__(
+        self, runtime, tokenizer, request_logger, thinking_end=DEFAULT_THINKING_END
+    ):
         self.runtime = runtime
         self.tokenizer = tokenizer
         self.request_logger = request_logger
+        # What the engine selects where a thinking budget runs out
+        # (thinking_end_tokens).
+        self.thinking_end = thinking_end
         self.active = {}
         self.closing = False
         self.lock = threading.RLock()
@@ -270,7 +365,9 @@ class NativeBackend:
         # Why the engine cannot serve: its failure, the last failed restart or
         # why restarts stopped.
         self.engine_error = None
-        self.terminals = queue.Queue()
+        # What the finalizer runs, in order: requests' Started lines and
+        # terminals, which must not hold up the runtime's reader thread.
+        self.finalizer_queue = queue.Queue()
         self.finalizer = threading.Thread(
             target=self._finalize_loop,
             name="splash-http-finalizer",
@@ -384,7 +481,8 @@ class NativeBackend:
             try:
                 restarts = self.runtime.restart_count
                 event = self.runtime.status(
-                    timeout=STATUS_BACKGROUND_TIMEOUT_SECONDS, fail_unanswered=True
+                    timeout=engine_runtime.STATUS_ANSWER_LIMIT_SECONDS,
+                    fail_unanswered=True,
                 )
                 self._cache_status(self._decode_status_event(event), restarts)
             except Exception as error:
@@ -515,7 +613,7 @@ class NativeBackend:
                     and snapshot.get("ready") is True
                     and (
                         unanswered is None
-                        or now - unanswered < STATUS_BACKGROUND_TIMEOUT_SECONDS
+                        or now - unanswered < engine_runtime.STATUS_ANSWER_LIMIT_SECONDS
                     )
                 )
         else:
@@ -576,14 +674,62 @@ class NativeBackend:
             constraint=constraint,
             image_spans=job.image_spans,
             image_pixels=job.image_pixels,
-            return_progress=job.return_progress,
             score_tokens=job.score_tokens,
             generation_prompt_tokens=job.generation_prompt_tokens,
             flags=job.flags,
+            cache_salt=job.cache_salt,
+            thinking_budget=self._thinking_budget(job),
         )
         return engine_runtime.GenerationRequest(
             frame, job.deadline, self._mask_provider(job), job.image_owner
         )
+
+    def _thinking_budget(self, job):
+        """The engine's cutoff of the thinking a job generates in, which it
+        ends with the server's thinking end. The engine's thinking ends at its
+        close or, where a call may follow, at any call-open token, while
+        count_reasoning_tokens ends the reasoning at a call-open token only
+        where it begins CALL_OPEN: a stray call-open token in the thinking ends
+        the engine's count, and the reasoning can then run past the budget."""
+        if job.thinking_token_budget is None:
+            return None
+        return wire.ThinkingBudget(
+            job.thinking_token_budget,
+            self.thinking_end,
+            TOOL_CALL_OPEN_TOKEN_ID if job.may_call_tools else THINK_END_TOKEN_ID,
+        )
+
+    def release_weights(self, timeout=5.0):
+        """Asks the engine to give its weights back now; returns its status.
+
+        It releases them only while no request is in service and no restore is
+        under way, with `--idle-release off` too; the returned snapshot's
+        `weights` says whether they are released: `released` and not
+        `restoring`. The next request restores the weights as after the idle
+        release.
+        """
+        with self.lock:
+            if self.closing:
+                raise APIError(503, "server is shutting down", "server_shutdown")
+        restarts = self.runtime.restart_count
+        try:
+            event = self.runtime.release_weights(timeout=timeout)
+        except TimeoutError:
+            # The engine answers between commands: it is running a long one.
+            raise APIError(
+                503,
+                f"the engine did not answer within {timeout:g} s; retry shortly",
+                "engine_busy",
+            ) from None
+        except (
+            engine_runtime.EngineUnhealthy,
+            engine_runtime.ProtocolFatal,
+            engine_runtime.RuntimeClosed,
+        ) as error:
+            raise self.refusal() or self._api_error(error) from None
+        snapshot = self._decode_status_event(event)
+        self._cache_status(snapshot, restarts)
+        return snapshot
 
     def submit(self, job):
         state = None
@@ -626,7 +772,7 @@ class NativeBackend:
                 if state.call is None:
                     state.call = call
                 state.terminal_enqueued = True
-                self.terminals.put((state, call))
+                self.finalizer_queue.put(functools.partial(self._finalize, state, call))
 
         with self.lock:
             if self.closing:
@@ -662,7 +808,11 @@ class NativeBackend:
                 refusal = None
                 if isinstance(
                     error,
-                    (engine_runtime.EngineUnhealthy, engine_runtime.RuntimeClosed),
+                    (
+                        engine_runtime.EngineUnhealthy,
+                        engine_runtime.ProtocolFatal,
+                        engine_runtime.RuntimeClosed,
+                    ),
                 ):
                     # Not admitted: refused as a request arriving now would be.
                     refusal = self.refusal()
@@ -683,6 +833,22 @@ class NativeBackend:
             )
             with self.lock:
                 job.cache = cache
+            record = {
+                "outcome": "started",
+                "prompt_tokens": len(job.prompt_tokens),
+                "cached_tokens": cache.matched_tokens,
+            }
+            if job.reasoning is not None:
+                record["reasoning"] = {
+                    "sent_effort": job.reasoning.sent,
+                    "effort": job.reasoning.effort,
+                    "enable_thinking": job.reasoning.enable_thinking,
+                    "thinking": job.thinking,
+                }
+            # The finalizer prints it, as it prints the Done line: a console
+            # that stops draining must not hold up the reader thread, which
+            # delivers every request's tokens and masks.
+            self.finalizer_queue.put(functools.partial(self._log, record))
             job.events.put(("start", None))
         elif isinstance(event, wire.PromptProgressEvent):
             job.events.put(
@@ -716,16 +882,12 @@ class NativeBackend:
             call.cancel()
 
     def _finalize_loop(self):
-        while True:
-            item = self.terminals.get()
-            if item is None:
-                return
-            state, call = item
-            self._finalize(state, call)
-            # Do not keep the finished request alive while waiting for the
-            # next terminal: its image batch returns the request budget only
-            # once nothing references it.
-            del item, state, call
+        while (work := self.finalizer_queue.get()) is not None:
+            work()
+            # Do not keep a finished request alive while waiting: its image
+            # batch returns the request budget only once nothing references
+            # it.
+            del work
 
     def _finalize(self, state, call):
         job = state.job
@@ -744,7 +906,9 @@ class NativeBackend:
                 # still be computing.
                 job.constraint.finish()
             state.streamer.end()
-            job.reasoning_tokens = state.streamer.count_reasoning_tokens(job.thinking)
+            job.reasoning_tokens = state.streamer.count_reasoning_tokens(
+                job.thinking, job.may_call_tools
+            )
             stop_sequence = state.streamer.stop_sequence
             result = NativeResult(
                 reason=(
@@ -763,19 +927,24 @@ class NativeBackend:
                 first_token_to_done_ms=done.decode_micros / 1000.0,
                 request_wall_ms=done.wall_micros / 1000.0,
                 prefill_tokens=max(0, done.prompt_tokens - job.cache.matched_tokens),
-                cache=job.cache,
+                cache=replace(job.cache, deduplicated_tokens=done.deduplicated_tokens),
                 stop_sequence=stop_sequence,
                 first_token_batch_tokens=state.first_token_batch_tokens,
+                drafted_tokens=done.drafted_tokens,
+                accepted_draft_tokens=done.accepted_draft_tokens,
+                draft_cycles=done.draft_cycles,
+                bounded=done.bounded,
             )
             if job.latency is not None:
                 latency = result.metrics["request_latency"]
                 queued = latency.get("queue_to_start_ms")
                 if queued is not None:
                     job.latency.metrics.observe("native_queue", queued / 1000.0)
-        except engine_runtime.EngineUnhealthy:
-            # An admitted request ends with EngineUnhealthy only when the
-            # engine running it fails. The listener has already decided
-            # whether that engine restarts; the console names the failure.
+        except (engine_runtime.EngineUnhealthy, engine_runtime.ProtocolFatal):
+            # An admitted request ends with EngineUnhealthy or ProtocolFatal
+            # only when the engine running it fails: it stopped or broke the
+            # protocol. The listener has already decided whether that engine
+            # restarts; the console names the failure.
             with self.lock:
                 fatal_error = self.fatal_error
             if fatal_error is not None:
@@ -822,19 +991,23 @@ class NativeBackend:
                     f"larger --max-memory or a smaller --max-context ({message})",
                     code,
                 )
+            # The SSD cache cannot hold even the prompt's KV of a request that
+            # does not fit in memory; the message names its quota.
+            if code == "kv_disk_quota":
+                return APIError(400, message, code)
             request_codes = {
-                "integer_overflow",
                 "invalid_constraint",
                 "invalid_count",
                 "invalid_deadline",
                 "invalid_enum_value",
                 "invalid_request",
-                "invalid_request_id",
                 "invalid_sampling",
                 "limit_exceeded",
             }
             status = 503 if error.retryable else 400 if code in request_codes else 500
-            return APIError(status, message, code)
+            # The engine says when a retry may succeed where that is not at
+            # once, as when the SSD cache's write budget refills.
+            return APIError(status, message, code, error.retry_after_seconds or 1)
         if isinstance(error, engine_runtime.MaskComputationFailed):
             if error.retryable:
                 return APIError(503, str(error), "runtime_busy")
@@ -846,11 +1019,14 @@ class NativeBackend:
             # overload like the gate's own, retried the same way.
             return APIError(503, "request queue is full", "frontend_overloaded")
         if isinstance(
-            error, (engine_runtime.EngineUnhealthy, engine_runtime.RuntimeClosed)
+            error,
+            (
+                engine_runtime.EngineUnhealthy,
+                engine_runtime.ProtocolFatal,
+                engine_runtime.RuntimeClosed,
+            ),
         ):
             return APIError(503, str(error), "runtime_unavailable")
-        if isinstance(error, engine_runtime.ProtocolFatal):
-            return APIError(500, str(error), "protocol_error")
         if isinstance(error, TimeoutError):
             return APIError(504, "request timed out", "request_timeout")
         return APIError(500, str(error), "runtime_error")
@@ -870,6 +1046,10 @@ class NativeBackend:
             }
         if error:
             record["error_code"] = error.code
+        self._log(record)
+
+    def _log(self, record):
+        # A request's start, when the engine admits it, and its end.
         try:
             self.request_logger(record)
         except Exception:
@@ -907,5 +1087,5 @@ class NativeBackend:
                 error = APIError(503, "server is shutting down", "server_shutdown")
                 self._record(state.job, error=error)
                 state.job.events.put(("error", error))
-            self.terminals.put(None)
+            self.finalizer_queue.put(None)
             self.finalizer.join()

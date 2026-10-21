@@ -18,8 +18,10 @@
 // pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 7;
-inline constexpr size_t kFrameHeaderBytes = 24;
+inline constexpr uint16_t kProtocolVersion = 11;
+// A frame is its header, the magic "SPLH", the u16 protocol version, the
+// u16 FrameType and the u64 payload length, then the payload.
+inline constexpr size_t kFrameHeaderBytes = 16;
 inline constexpr uint32_t kStatusSchemaVersion = 6;
 // Image pixels travel inside the request frame; a multi-image agent turn can
 // carry well over 64 MiB of resized RGB bytes.
@@ -27,12 +29,13 @@ inline constexpr uint64_t kAbsoluteMaxFramePayloadBytes =
     256ULL * 1024 * 1024;
 
 // Every integer, including binary prompt/token words, is little-endian on the
-// wire.  Header flags and reserved bytes must be zero in native protocol.
+// wire.
 enum class FrameType : uint16_t {
   Request = 0x0001,
   Cancel = 0x0002,
   MaskResponse = 0x0003,
   StatusRequest = 0x0004,
+  ReleaseRequest = 0x0005,
 
   Ready = 0x0100,
   Start = 0x0101,
@@ -46,8 +49,8 @@ enum class FrameType : uint16_t {
 
 // Request errors reject one request while preserving the stream.  An
 // engine-unhealthy error asks the supervisor to replace the engine.  A
-// protocol-fatal error means framing is no longer trusted, so the stream must
-// close without attempting another framing mode.
+// protocol-fatal error means framing is no longer trusted, or a client frame
+// failed without naming its request, so the stream must close.
 enum class FailureClass : uint8_t {
   RequestError = 1,
   EngineUnhealthy = 2,
@@ -60,10 +63,7 @@ enum class IssueCode : uint16_t {
   None = 0,
   BadMagic,
   UnsupportedVersion,
-  InvalidHeaderSize,
   UnknownFrameType,
-  NonZeroHeaderFlags,
-  NonZeroReservedField,
   FrameTooLarge,
   InvalidPayloadLength,
   TruncatedFrame,
@@ -128,13 +128,24 @@ validateLimits(const ProtocolLimits &limits);
 //   34 u32 image span count
 //   38 sampling: f32 temperature, f32 topP, u32 topK, f32 presencePenalty,
 //      f32 frequencyPenalty, f32 repetitionPenalty, f32 minP, u64 seed
-//   74 u8  returnProgress
-//   75 u32 score token count
-//   79 u32 generationPromptTokens
-//   83 u32 flags
-// then the prompt tokens, the 32-byte image spans, the image pixels and the
-// score tokens.
-inline constexpr uint64_t kRequestFixedBytes = 87;
+//   74 u32 score token count
+//   78 u32 generationPromptTokens
+//   82 u32 flags
+//   86 u64 cacheSalt.lo, u64 cacheSalt.hi
+//  102 u32 thinkingBudget.tokens, kNoThinkingBudget for none
+//  106 u32 thinking end token count, u32 thinkingBudget.alsoEnds, zero
+//      without a budget
+// then the prompt tokens, the 32-byte image spans, the image pixels, the
+// score tokens and the thinking end tokens.
+inline constexpr uint64_t kRequestFixedBytes = 114;
+inline constexpr uint32_t kNoThinkingBudget = 0xFFFFFFFFU;
+// A thinking budget's end holds 1 to this many tokens.
+inline constexpr uint32_t kMaximumThinkingEndTokens = 64;
+
+// The request flags word holds the RequestFlag bits and this one, which asks
+// for PromptProgressEvents while the prompt prefills.
+inline constexpr uint32_t kReturnProgressFlag = 1U << 1;
+static_assert(!(kReturnProgressFlag & kRequestFlagBits));
 
 struct RequestFrame {
   uint64_t requestId = 0;
@@ -157,7 +168,6 @@ struct RequestFrame {
   // which score requests require (seed aside).
   SamplingParameters sampling;
   ConstraintMode constraint = ConstraintMode::None;
-  bool returnProgress = false;
   // Empty selects ordinary generation. Nonempty selects score-only mode:
   // 2..255 distinct token ids, logicalMaxOutputTokens must be zero, and the
   // request must be text-only, unconstrained, and greedy.
@@ -165,8 +175,13 @@ struct RequestFrame {
   // Trailing prompt tokens of the chat template's generation prompt; zero
   // when unknown. It must leave at least one prompt token.
   uint32_t generationPromptTokens = 0;
-  // RequestFlag bits.
+  // RequestFlag bits and kReturnProgressFlag.
   uint32_t flags = 0;
+  // The request's cache_salt as the server hashed it; zero without one.
+  engine::CacheSalt cacheSalt;
+  // Only a request that generates inside a thinking block has one; a score
+  // request never does.
+  std::optional<ThinkingBudget> thinkingBudget;
 
   bool operator==(const RequestFrame &) const = default;
 };
@@ -176,6 +191,7 @@ struct RequestFrame {
 //   Cancel         u64 requestId
 //   MaskResponse   u64 requestId, u64 maskRequestId, u32 count, u32 words
 //   StatusRequest  u64 correlationId
+//   ReleaseRequest u64 correlationId
 //   Ready          u32 maxConcurrentRequests, u32 maxContextTokens, u8 vision
 //   Start          u64 requestId, u32 lane, u32 matchedPromptTokens
 //   PromptProgress u64 requestId, u32 processedTokens, u64 elapsedMicros
@@ -184,7 +200,9 @@ struct RequestFrame {
 //                  u32 count, u32 simulation tokens
 //   Done           u64 requestId, u8 reason, u32 promptTokens,
 //                  u32 completionTokens, u64 prefillMicros, u64 decodeMicros,
-//                  u64 wallMicros, u32 count, f32 option logits
+//                  u64 wallMicros, u32 deduplicatedTokens, u32 draftedTokens,
+//                  u32 acceptedDraftTokens, u32 speculative cycles, u32 count,
+//                  f32 option logits
 //   Error          u8 failureClass, u8 retryable, u64 requestId, u32 code
 //                  bytes, u32 message bytes, the code, the message
 //   StatusJson     u64 correlationId, the JSON
@@ -206,6 +224,16 @@ struct StatusRequestFrame {
   uint64_t correlationId = 0;
 
   bool operator==(const StatusRequestFrame &) const = default;
+};
+
+// Asks the engine to give its weights back now, as the idle release does, when
+// it holds no request and restores none, with the idle release on or off. The
+// answer is a StatusJson with the same correlationId, whose `weights` section
+// says whether the weights are released: `released` and not `restoring`.
+struct ReleaseRequestFrame {
+  uint64_t correlationId = 0;
+
+  bool operator==(const ReleaseRequestFrame &) const = default;
 };
 
 struct ReadyEvent {
@@ -266,6 +294,16 @@ struct DoneEvent {
   // Raw final-prompt-position logits at the request's scoreTokens, in
   // requested order. Empty for generation and for cancelled/failed scoring.
   std::vector<float> optionLogits{};
+  // Tokens whose KV the request read from cached blocks another request
+  // computed, past the cached prefix it started from
+  // (engine::EngineEventSink::completed).
+  uint32_t deduplicatedTokens = 0;
+  // Its speculative decoding; zero without a draft and for scoring.
+  engine::SpeculativeCounts speculation{};
+  // A Length end short of the request's logical maximum, at a bound of the
+  // engine's own: the SSD cache's quota, or memory a lone lane could not
+  // grow past (engine::EngineEventSink::completed).
+  bool bounded = false;
 
   bool operator==(const DoneEvent &) const = default;
 };
@@ -276,6 +314,9 @@ struct ErrorEvent {
   bool retryable = false;
   std::string code;
   std::string message;
+  // For a retryable request error, the seconds after which a retry may
+  // succeed, as when the SSD cache's write budget refills; 0 for at once.
+  uint32_t retryAfterSeconds = 0;
 
   bool operator==(const ErrorEvent &) const = default;
 };
@@ -291,7 +332,7 @@ struct StatusJsonEvent {
 };
 
 using ClientMessage = std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
-                                   StatusRequestFrame>;
+                                   StatusRequestFrame, ReleaseRequestFrame>;
 using EngineEvent =
     std::variant<ReadyEvent, StartEvent, PromptProgressEvent, TokensEvent,
                  MaskRequestEvent, DoneEvent, ErrorEvent, StatusJsonEvent>;

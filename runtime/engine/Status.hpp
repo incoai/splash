@@ -5,7 +5,10 @@
 #include "metal/MetalBackend.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryAudit.hpp"
-#include "TestConfig.hpp"
+#include "engine/ThermalState.hpp"
+#include "model/ExpertStoreStats.hpp"
+#include "model/KvReadStats.hpp"
+#include "model/SparseRowStore.hpp"
 
 #include <algorithm>
 #include <array>
@@ -84,11 +87,10 @@ struct RuntimeMetricsSnapshot {
 // emits the snapshot consumed by runtimeStatusJson().
 class RuntimeMetrics final {
 public:
-  // TTFT and ITL samples the percentiles cover. Tests set a smaller window
-  // through TestConfig.
+  // TTFT and ITL samples the percentiles cover, by default.
   static constexpr uint32_t kLatencyWindow = 4096;
 
-  RuntimeMetrics();
+  explicit RuntimeMetrics(uint32_t latencyWindow = kLatencyWindow);
 
   void tokens(double submittedMilliseconds,
               std::optional<double> previousTokenMilliseconds,
@@ -122,8 +124,11 @@ private:
   RuntimeBatchMetricsSnapshot currentDecodeBatch_;
 };
 
-inline RuntimeMetrics::RuntimeMetrics()
-    : latencyWindow_(testConfig().metricsLatencyWindow.value_or(kLatencyWindow)) {}
+inline RuntimeMetrics::RuntimeMetrics(uint32_t latencyWindow)
+    : latencyWindow_(latencyWindow) {
+  if (!latencyWindow_)
+    throw std::invalid_argument("the latency window must hold a sample");
+}
 
 inline void RuntimeMetrics::tokens(
     double submittedMilliseconds,
@@ -245,6 +250,47 @@ struct NativeLoopTiming {
   double maxTickMilliseconds = 0.0;
 };
 
+// The model's weights as the native loop releases and restores them
+// (NativeRuntime::releaseWeights).
+struct WeightsSnapshot {
+  // --idle-release: infinite with `off`, when only a release request frees them.
+  double idleReleaseSeconds = 0.0;
+  // From a release until the restore has written the last image back.
+  bool released = false;
+  // From the request that found them released until the restore ends.
+  bool restoring = false;
+  // The times they were written back, each for a request.
+  uint64_t restores = 0;
+  // The restores that gave up for want of memory: their requests failed
+  // retryably and the weights were released again.
+  uint64_t restoreFailures = 0;
+};
+
+// The prefill FFN's Neural Engine split (RuntimeResources::aneFfnSnapshot).
+struct AneFfnSnapshot {
+  // Off: the start left the GPU alone; Split: the split serves; Stopped: it
+  // stopped while serving, and the GPU runs alone until the engine restarts.
+  enum class State : uint8_t { Off, Split, Stopped };
+  State state = State::Off;
+  // The start's outcome (AneFfnOutcome), or why the split stopped.
+  std::string reason;
+  // The split's share and least chunk rows; 0 when off.
+  double share = 0.0;
+  uint32_t minimumRows = 0;
+  // What it ran (ops::AneFfn::Served).
+  uint64_t commands = 0, evaluations = 0;
+  double aneMilliseconds = 0.0;
+};
+
+// A spill-capable target's KV on the SSD cache as /status reports it
+// (kv_spill): what the cache holds and did (Cache::spillSnapshot), and its
+// readers' memory and reads.
+struct KvSpillStatus final {
+  KvSpillSnapshot cache;
+  std::optional<model::KvBlockCacheStats> blockCache;
+  std::optional<model::KvHistoryStreamStats> historyStream;
+};
+
 // Single source for /status and native protocol status events.
 [[nodiscard]] std::string runtimeStatusJson(
     const EngineMemoryPlan &plan, const EngineSnapshot &core,
@@ -254,6 +300,10 @@ struct NativeLoopTiming {
     const RuntimeCacheIdentity &cacheIdentity,
     const MemoryGovernorSnapshot &memoryGovernor, bool metalHealthy,
     std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait,
-    const NativeLoopTiming &loop);
+    const NativeLoopTiming &loop, const WeightsSnapshot &weights,
+    const AneFfnSnapshot &aneFfn, ThermalState thermalState,
+    const std::optional<model::SparseRowStats> &streamedTable = std::nullopt,
+    const std::optional<model::ExpertStoreStats> &streamedExperts = std::nullopt,
+    const std::optional<KvSpillStatus> &kvSpill = std::nullopt);
 
 } // namespace splash::engine

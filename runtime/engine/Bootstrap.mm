@@ -1,8 +1,9 @@
 #include "engine/Bootstrap.hpp"
-#include "engine/StartupLog.hpp"
+#include "StderrLine.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <sstream>
 #include <utility>
 
@@ -11,7 +12,6 @@ namespace {
 
 RuntimeBootstrapReport reportForPlan(const EngineMemoryPlan &plan) {
   RuntimeBootstrapReport report;
-  report.memoryPlanJson = plan.toStatusJson();
   report.budgetDescription = plan.breakdown().describe();
   return report;
 }
@@ -19,9 +19,9 @@ RuntimeBootstrapReport reportForPlan(const EngineMemoryPlan &plan) {
 RuntimeBootstrapReport
 reportForResourceFailure(const RuntimeResourcesError &error) {
   RuntimeBootstrapReport report;
+  report.resourceStage = error.stage();
   report.resourceFailure = error.failure();
-  report.message = error.message();
-  report.memoryPlanJson = error.statusJson();
+  report.message = error.what();
   report.budgetDescription = error.budgetDescription();
   return report;
 }
@@ -61,7 +61,10 @@ std::string RuntimeBootstrapReport::describe() const {
   std::ostringstream out;
   out << (stage == RuntimeBootstrapStage::Ready ? "runtime bootstrap ready"
                                                 : "runtime bootstrap failed")
-      << " [" << runtimeBootstrapStageName(stage) << "]: " << message;
+      << " [" << runtimeBootstrapStageName(stage);
+  if (resourceStage)
+    out << '/' << runtimeResourceStageName(*resourceStage);
+  out << "]: " << message;
   if (!memoryAudit.message.empty()) {
     out << '\n' << memoryAudit.describe();
   }
@@ -82,23 +85,14 @@ StartupRetryWindow::retryUntil(const RuntimeBootstrapReport &failure,
   if (failure.resourceFailure != RuntimeResourceFailure::HostCapacity &&
       failure.resourceFailure != RuntimeResourceFailure::DriverAllocation)
     return std::nullopt;
-  if (!deadline_ || failure.stage > stage_) {
+  const std::pair reached{failure.stage, failure.resourceStage};
+  if (!deadline_ || reached > reached_) {
     deadline_ = now + length_;
-    stage_ = failure.stage;
+    reached_ = reached;
   }
   if (now >= *deadline_)
     return std::nullopt;
   return deadline_;
-}
-
-bool memoryMayNotHold(const EngineMemoryPlan &plan,
-                      uint64_t hostAvailableBytes, uint32_t contextTokens) {
-  const uint64_t held = EngineMemoryPolicy::hostAvailableReserveBytes(
-                            plan.breakdown().physicalMemoryBytes) +
-                        kHostWarningMarginBytes;
-  return plan.contextTokensWithin(
-             hostAvailableBytes > held ? hostAvailableBytes - held : 0) <
-         contextTokens;
 }
 
 protocol::ProtocolLimits protocolLimitsFor(
@@ -121,7 +115,9 @@ RuntimeBootstrap::RuntimeBootstrap(std::unique_ptr<RuntimeResources> resources,
       nativeLoop_(std::move(nativeLoop)),
       memoryControl_(resources_->memoryGovernor(), resources_->backend(),
                      *nativeLoop_),
-      report_(std::move(report)) {}
+      report_(std::move(report)) {
+  sampleThermalState();
+}
 
 RuntimeBootstrap::~RuntimeBootstrap() {
   // Refuse new commands before the loop, the model and the resources they
@@ -136,11 +132,19 @@ std::string RuntimeBootstrap::statusJson(const RuntimeMetricsSnapshot &metrics,
   metal::MetalBackend &backend = resources_->backend();
   const bool healthy = backend.healthy();
   return runtimeStatusJson(
-      resources_->memoryPlan(), nativeLoop_->snapshot(), backend.memoryStats(),
+      resources_->memoryPlan(), nativeLoop_->statusSnapshot(), backend.memoryStats(),
       report_.warmup, report_.memoryAudit, metrics, model_->telemetry(),
       resources_->cacheIdentity(), resources_->memoryGovernor().snapshot(),
       healthy, healthy ? std::string{} : backend.unhealthyReason(),
-      nativeLoop_->resourceWaitSnapshot(), loop);
+      nativeLoop_->resourceWaitSnapshot(), loop, nativeLoop_->weightsSnapshot(),
+      resources_->aneFfnSnapshot(), thermalState_.state(), resources_->streamedTableStats(),
+      resources_->streamedExpertStats(), resources_->kvSpillStatus());
+}
+
+void RuntimeBootstrap::sampleThermalState() {
+  const std::string transition = thermalState_.update(queryThermalState());
+  if (!transition.empty())
+    logLine(transition);
 }
 
 RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
@@ -187,7 +191,7 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
             return modelRuntime.warmupPrefill(model::ExecutionLimits::prefillTokenBudget);
           });
   nativeLoop.observePrefill(model::ExecutionLimits::prefillTokenBudget,
-                           maximumPrefill.wallSeconds * 1000.0);
+                           maximumPrefill.wallSeconds * 1000.0, maximumPrefill.hostSeconds * 1000.0);
   report.warmup.maximumPrefillDetail = maximumPrefill.detail;
   const auto &budget = memoryPlan.breakdown();
   // Startup exercises only widths that fit this budget. This is not a
@@ -237,10 +241,10 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
     nativeLoop.announceReady();
   } catch (const std::exception &error) {
     fail(report, RuntimeBootstrapStage::AnnounceReady,
-         std::string("binary ReadyEvent announcement failed: ") + error.what());
+         std::string("ReadyEvent announcement failed: ") + error.what());
   } catch (...) {
     fail(report, RuntimeBootstrapStage::AnnounceReady,
-         "binary ReadyEvent announcement failed with an unknown exception");
+         "ReadyEvent announcement failed with an unknown exception");
   }
   report.stage = RuntimeBootstrapStage::Ready;
   report.message = "required warmup paths and memory audit passed";
@@ -253,47 +257,62 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
     NativeRuntime::StatusProvider statusProvider) {
   std::unique_ptr<RuntimeResources> resources;
   try {
-    resources = RuntimeResources::create(config.resources);
+    resources = RuntimeResources::create(config.resources, config.nativeLoop.engine.maxContext);
   } catch (const RuntimeResourcesError &error) {
     throw RuntimeBootstrapError(error);
   }
 
   RuntimeBootstrapReport base = reportForPlan(resources->memoryPlan());
-  const uint32_t automaticContext =
+  const uint32_t planContext =
       resources->memoryPlan().maximumContextTokens();
-  if (!automaticContext) {
+  if (!planContext) {
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,
          "memory plan cannot hold one model token");
   }
-  if (!config.nativeLoop.engine.maxContext) {
-    config.nativeLoop.engine.maxContext = automaticContext;
-  } else if (config.nativeLoop.engine.maxContext > automaticContext) {
-    // --max-memory sets the budget only below this Mac's own.
+  const uint32_t relaunchContext = config.resources.relaunchContext;
+  if (!config.nativeLoop.engine.maxContext && relaunchContext) {
+    // A relaunch serves the context of the server's first engine, which its
+    // split left. A plan that holds less, as once this Mac's memory budget
+    // shrank, has the relaunch serve that, and the server, which serves the
+    // first engine's context, stops relaunching (server/runtime.py).
+    if (relaunchContext > planContext)
+      logLine("The memory plan holds ", planContext, " tokens of context, less than the ",
+              relaunchContext, " the server's first engine served.");
+    config.nativeLoop.engine.maxContext = std::min(relaunchContext, planContext);
+  } else if (!config.nativeLoop.engine.maxContext) {
+    // The automatic context, which the plan holds and every start of the
+    // model on this Mac that takes its calibration serves alike
+    // (AneFfnOutcome::context).
+    config.nativeLoop.engine.maxContext = resources->aneFfnOutcome().context;
+  } else if (config.nativeLoop.engine.maxContext > planContext) {
+    // --max-memory sets the budget only below this Mac's own; the SSD cache's
+    // room bounds a context whose KV spills (ContextBounds::bound).
     const auto &budget = resources->memoryPlan().breakdown();
     const bool memoryCapped = budget.configuredMemoryLimitBytes &&
                               budget.hardBudgetBytes == budget.configuredMemoryLimitBytes;
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,
          "--max-context " + std::to_string(config.nativeLoop.engine.maxContext) +
-             " exceeds the " + std::to_string(automaticContext) + " tokens the model and " +
-             (memoryCapped ? "--max-memory" : "this Mac's memory") +
-             " allow; omit it or pass at most " + std::to_string(automaticContext));
-  }
-  // Without the disk tier a request that runs out of memory cannot publish
-  // its progress checkpoints and replays its prompt.
-  const std::optional<uint64_t> hostAvailable =
-      resources->hostAvailableAtStart();
-  if (!config.resources.maximumCacheDiskBytes && hostAvailable &&
-      memoryMayNotHold(resources->memoryPlan(), *hostAvailable,
-                       config.nativeLoop.engine.maxContext)) {
-    logStartup("The ", *hostAvailable / kMiB,
-               " MiB this Mac had available at startup may not hold a ",
-               config.nativeLoop.engine.maxContext,
-               "-token request; one that runs out of memory is suspended"
-               " and replays its prompt. --max-cache-disk SIZE keeps its"
-               " progress and cached prefixes on SSD.");
+             " exceeds the " + std::to_string(planContext) + " tokens the model and " +
+             (budget.contextBounds.bound() == "disk" ? "the SSD cache's room for its KV"
+              : memoryCapped                         ? "--max-memory"
+                                                     : "this Mac's memory") +
+             " allow; omit it or pass at most " + std::to_string(planContext));
   }
   config.nativeLoop.engine.vocabularySize =
       config.resources.model.capabilities.vocabularySize;
+  // A prefill command takes no more attention than a full chunk at the end
+  // of the native window, which every supported Mac runs within the command
+  // watchdog: past it, at depths only YaRN serves, commands take fewer rows.
+  // A row of a target with an indexer attends to its top blocks at any depth,
+  // and only the indexer's scores grow with it, a hundredth of attention's,
+  // so its commands keep their rows.
+  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
+  config.nativeLoop.engine.maximumPrefillAttentionPairs = std::visit(
+      [](const auto &layout) {
+        return layout.hasIndexer() ? std::numeric_limits<uint64_t>::max()
+                                   : Scheduler::attentionPairs(layout.nativeContextTokens - chunk, chunk);
+      },
+      config.resources.model.target);
   // Images are admitted up to the server's pixel cap; a model without vision
   // admits none.
   config.nativeLoop.engine.maxImagePatches =
@@ -338,12 +357,15 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   std::unique_ptr<NativeRuntime> nativeLoop;
   try {
     connectToGovernor(config.nativeLoop.engine, resources->memoryGovernor());
-    config.nativeLoop.weights = &resources->weightImages();
+    config.nativeLoop.engine.spill = resources->spillConfig();
+    config.nativeLoop.weights = &resources->releasableMemory();
+    config.nativeLoop.weightAdmission = resources->memoryGovernor().allocationAdmission();
+    config.nativeLoop.engineFailed = [owner = resources.get()] { owner->engineFailed(); };
     // The parser and engine consume the same resolved ceiling. In automatic
     // mode it cannot be known until resource planning has measured the device.
     nativeLoop = std::make_unique<NativeRuntime>(
-        config.nativeLoop, resources->cache(), *modelRuntime,
-        std::move(output), std::move(statusProvider),
+        config.nativeLoop, config.resources.idleReleaseSeconds, resources->cache(),
+        *modelRuntime, std::move(output), std::move(statusProvider),
         protocolLimitsFor(config.resources.model.capabilities,
                           config.nativeLoop.engine.maxContext));
   } catch (const metal::MetalAllocationError &error) {

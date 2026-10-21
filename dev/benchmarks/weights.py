@@ -3,17 +3,18 @@
 A build's engine-tests/weight-digests loads a model as its engine does and
 prints the component, size and SHA-256 of every image it holds
 (dev/tools/weight_digests.mm). Both builds must load the same images with the
-same bytes.
+same bytes. Given --expert-memory SIZE or --ple-memory SIZE, it streams the
+routed experts or the PLE table from their files, as the engine does where
+memory cannot hold them, and their bytes are not among the images.
 
-Builds of earlier releases have no weight-digests and loaded a package's
-files as they are, so a package's are not compared with theirs. Those that
-prepared an assembly's images into a cache, <cache>/<key>/{weights, sha256,
+Builds of earlier releases that have no weight-digests and prepared an
+assembly's images into a cache, <cache>/<key>/{weights, sha256,
 source}, have build/engine/WeightPreparationIdentity.hpp: such a baseline
 prepares into a cache of its own, whose images are compared after its rounds.
 Once the release baselines of assemblies have weight-digests, delete
 IDENTITY_HEADER, PROVENANCE, DIGEST, baseline_environment and prepared, and
-compare_builds' environment with the baseline environments that the
-regression benchmarks pass it.
+compare_builds' environment with the baseline environment that
+backend_regression passes it.
 """
 
 from __future__ import annotations
@@ -35,12 +36,12 @@ def loads_in_memory(build: Path) -> bool:
     return (Path(build) / WEIGHT_DIGESTS).is_file()
 
 
-def digests(build: Path, package: Path) -> dict:
+def digests(build: Path, model_root: Path, options=()) -> dict:
     """The SHA-256 of each image, by component, that the build directory's
-    engine loads from package."""
+    engine loads from model_root, its weight-digests given options."""
     tool = Path(build) / WEIGHT_DIGESTS
     result = subprocess.run(
-        [str(tool), str(Path(build) / "splash.metallib"), str(package)],
+        [str(tool), str(Path(build) / "splash.metallib"), str(model_root), *options],
         capture_output=True,
         text=True,
     )
@@ -59,11 +60,11 @@ def baseline_environment(directory: Path) -> dict:
     return {"SPLASH_WEIGHT_CACHE": str(cache)}
 
 
-def prepared(environment: dict, package: Path) -> dict:
+def prepared(environment: dict, model_root: Path) -> dict:
     """The SHA-256 of each image, by component, that a baseline of an earlier
-    release, started with environment, prepared from package: its cache's
-    complete entries whose source is under package."""
-    root = str(package)
+    release, started with environment, prepared from model_root: its cache's
+    complete entries whose source is under model_root."""
+    root = str(model_root)
     images = {}
     for entry in sorted(Path(environment["SPLASH_WEIGHT_CACHE"]).iterdir()):
         if not DIGEST.fullmatch(entry.name):
@@ -103,17 +104,15 @@ def compare(baseline: dict, candidate: dict) -> dict:
 
 
 def compare_builds(
-    baseline: Path, candidate: Path, package: Path, environment: dict, assembly: bool
+    baseline: Path, candidate: Path, model_root: Path, environment: dict, options=()
 ) -> dict:
-    """Compares the images the build directories load from package, the
-    model root both were given; environment started the baseline, and
-    assembly says whether package is one."""
+    """Compares the images the build directories load from model_root, which
+    both were given, each build's weight-digests given options; environment
+    started the baseline."""
     if loads_in_memory(baseline):
-        images = digests(baseline, package)
-    elif not assembly:
-        return {"images": [], "failures": [], "pass": True}
+        images = digests(baseline, model_root, options)
     elif (Path(baseline) / IDENTITY_HEADER).is_file():
-        images = prepared(environment, package)
+        images = prepared(environment, model_root)
     else:
         raise RuntimeError(f"the baseline build has no {WEIGHT_DIGESTS}")
-    return compare(images, digests(candidate, package))
+    return compare(images, digests(candidate, model_root, options))

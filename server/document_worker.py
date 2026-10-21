@@ -143,7 +143,9 @@ def render(payload, limits, remaining):
                 result = json.loads(encoded)
             except (ValueError, UnicodeError):
                 raise APIError(
-                    500, "document worker returned an invalid result"
+                    500,
+                    "document worker returned an invalid result",
+                    "document_worker_failed",
                 ) from None
             if "error" in result:
                 error = result["error"]

@@ -1,4 +1,5 @@
 #include "model/VisionLoader.hpp"
+#include "metal/abi/Vision.h"
 #include "model/GgufFile.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
 #include "model/VisionPreparation.hpp"
@@ -64,30 +65,40 @@ vision::Input input(std::string name, SourceTensor tensor) {
   return {std::move(name), std::move(tensor)};
 }
 
-// MLX: an unquantized vision_tower.*, whose patch embedding is one Conv3d
-// weight [output, frame, patch-row, patch-col, channel].
+// A safetensors checkpoint's unquantized tower: MLX's vision_tower.*, whose
+// patch embedding is one Conv3d weight [output, frame, patch-row, patch-col,
+// channel], or transformers' model.visual.* (as Model Optimizer keeps it),
+// whose Conv3d weight [output, channel, frame, patch-row, patch-col] is in the
+// image's order already, so the writer copies it as stored.
 void bindCheckpoint(const SafetensorsCheckpoint &checkpoint, const ops::VisionLayout &layout, Plan &plan) {
   const uint64_t p = layout.patchSize;
+  const std::string mlxPrefix = "vision_tower.", transformersPrefix = "model.visual.";
+  const bool transformers = checkpoint.find(transformersPrefix + "patch_embed.proj.weight") != nullptr;
   for (auto &s : plan.sections) {
+    const std::string name = transformers ? transformersPrefix + s.mlx.substr(mlxPrefix.size()) : s.mlx;
     // A quantized module keeps its scales beside the packed weight.
-    const auto scales = s.mlx.substr(0, s.mlx.rfind('.')) + ".scales";
-    if (const SourceTensor *quantized = checkpoint.find(scales))
-      throw WeightStoreError("the MLX vision tower is quantized (" + scales + " in " +
-                             quantized->file->path().string() +
-                             "); preparation needs BF16, F16 or F32 vision weights");
-    const auto &tensor = checkpoint.require(s.mlx);
-    const std::vector<uint64_t> shape = s.patch          ? std::vector<uint64_t>{s.rows, 2, p, p, 3}
+    const auto stem = name.substr(0, name.rfind('.'));
+    for (const auto &scales : {stem + ".scales", stem + ".weight_scale"})
+      if (const SourceTensor *quantized = checkpoint.find(scales))
+        throw WeightStoreError("the vision tower is quantized (" + scales + " in " + quantized->file->path().string() +
+                               "); preparation needs BF16, F16 or F32 vision weights");
+    const auto &tensor = checkpoint.require(name);
+    const std::vector<uint64_t> shape = s.patch          ? transformers ? std::vector<uint64_t>{s.rows, 3, 2, p, p}
+                                                                        : std::vector<uint64_t>{s.rows, 2, p, p, 3}
                                         : s.columns == 1 ? std::vector<uint64_t>{s.rows}
                                                          : std::vector<uint64_t>{s.rows, s.columns};
-    if (tensor.shape != shape) throw WeightStoreError("vision tensor shape mismatch: " + s.mlx);
-    s.inputs.push_back(input(s.mlx, tensor));
+    if (tensor.shape != shape) throw WeightStoreError("vision tensor shape mismatch: " + name);
+    // Transformers' patch embedding needs no reordering.
+    if (transformers) s.patch = false;
+    s.inputs.push_back(input(name, tensor));
   }
 }
 
 // The metadata of a clip qwen3vl_merger mmproj of this layout, with no
 // deepstack block.
 void requireMmprojMetadata(const GgufFile &gguf, const ops::VisionLayout &layout) {
-  if (gguf.architecture() != "clip" || gguf.stringValue("clip.projector_type") != "qwen3vl_merger")
+  const GgufMetadata &metadata = gguf.metadata();
+  if (metadata.architecture() != "clip" || metadata.stringValue("clip.projector_type") != "qwen3vl_merger")
     throw WeightStoreError("unsupported vision GGUF architecture");
   for (const auto &[key, expected] : std::initializer_list<std::pair<const char *, uint64_t>>{
            {"clip.vision.projection_dim", layout.outputHiddenSize},
@@ -98,9 +109,9 @@ void requireMmprojMetadata(const GgufFile &gguf, const ops::VisionLayout &layout
            {"clip.vision.attention.head_count", layout.heads},
            {"clip.vision.spatial_merge_size", layout.spatialMerge},
            {"clip.use_gelu", 1}})
-    if (gguf.unsignedValue(key) != expected) throw WeightStoreError(std::string("vision metadata mismatch: ") + key);
-  const auto epsilon = gguf.floatValue("clip.vision.attention.layer_norm_epsilon");
-  if (!epsilon || !std::isfinite(*epsilon) || std::abs(*epsilon - 1e-6) > 1e-12)
+    if (metadata.unsignedValue(key) != expected) throw WeightStoreError(std::string("vision metadata mismatch: ") + key);
+  const auto epsilon = metadata.floatValue("clip.vision.attention.layer_norm_epsilon");
+  if (!epsilon || !std::isfinite(*epsilon) || std::abs(*epsilon - SPLASH_VISION_NORM_EPSILON) > 1e-12)
     throw WeightStoreError("vision LayerNorm epsilon mismatch");
   for (const char *key : {"clip.vision.image_mean", "clip.vision.image_std"}) {
     const auto values = gguf.numericArray(key);
@@ -165,14 +176,14 @@ VisionLoader::VisionLoader(const std::filesystem::path &directory, VisionSource 
   auto planned = std::make_shared<Planned>();
   planned->layout = layout;
   planned->plan = plan(layout);
-  if (source == VisionSource::Mlx) {
+  if (source == VisionSource::Safetensors) {
     planned->checkpoint = std::make_unique<SafetensorsCheckpoint>(directory);
     bindCheckpoint(*planned->checkpoint, layout, planned->plan);
   } else if (source == VisionSource::Gguf) {
     planned->mmproj = std::make_unique<WeightSource>(directory / "mmproj.gguf");
     bindMmproj(GgufFile(*planned->mmproj), layout, planned->plan);
   } else {
-    throw WeightStoreError("only MLX and GGUF vision sources are written into the packed layout");
+    throw WeightStoreError("only MLX and GGUF vision sources are written into images");
   }
   planned_ = std::move(planned);
 }
@@ -191,8 +202,8 @@ ImagePlan VisionLoader::image() const {
 
 uint64_t visionImageBytes(const ops::VisionLayout &layout) { return plan(layout).bytes; }
 
-// The writer relies on the packed patch width and on padding that only adds
-// rows or columns.
+// The writer relies on the patch embedding's width, two frames of RGB
+// patches, and on padding that only adds rows or columns.
 void requireVisionLayout(const ops::VisionLayout &layout) {
   if (!layout.depth || !layout.hiddenSize || !layout.patchDimension || !layout.intermediateSize ||
       !layout.paddedIntermediateSize || !layout.mergedHiddenSize || !layout.outputHiddenSize || !layout.heads ||

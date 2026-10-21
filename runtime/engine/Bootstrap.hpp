@@ -1,9 +1,11 @@
 #pragma once
 
+#include "AwakeClock.hpp"
 #include "engine/MemoryControl.hpp"
 #include "engine/NativeRuntime.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "engine/Status.hpp"
+#include "engine/ThermalState.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -13,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace splash::engine {
 
@@ -33,13 +36,12 @@ enum class RuntimeBootstrapStage {
 // A report of a successful bootstrap is at stage Ready.
 struct RuntimeBootstrapReport {
     RuntimeBootstrapStage stage = RuntimeBootstrapStage::ResourceAssembly;
+    // The step of resource assembly that failed; empty past resource assembly.
+    std::optional<RuntimeResourceStage> resourceStage;
     RuntimeResourceFailure resourceFailure = RuntimeResourceFailure::Other;
     std::string message;
     WarmupReport warmup;
     MemoryAuditResult memoryAudit;
-    // Always present once an immutable plan exists. On planning failure this
-    // is the full BudgetValidationStatus JSON instead.
-    std::string memoryPlanJson;
     std::string budgetDescription;
 
     [[nodiscard]] std::string describe() const;
@@ -61,11 +63,12 @@ private:
 // Startup retries a temporary host or driver allocation failure for a
 // bounded time. The window opens at the first such failure, not at process
 // start, since a start loads the weights and warms up for a while before
-// one; a failure at a later stage than the last one follows progress and
-// opens a new window.
+// one; a failure at a later stage, or a later step of resource assembly,
+// than the failure that opened the window follows progress and opens a new
+// one.
 class StartupRetryWindow final {
 public:
-    using Clock = std::chrono::steady_clock;
+    using Clock = AwakeClock;
 
     explicit StartupRetryWindow(Clock::duration length) noexcept
         : length_(length) {}
@@ -78,16 +81,10 @@ public:
 private:
     Clock::duration length_;
     std::optional<Clock::time_point> deadline_;
-    RuntimeBootstrapStage stage_ = RuntimeBootstrapStage::ResourceAssembly;
+    // How far the failure that opened the window got.
+    std::pair<RuntimeBootstrapStage, std::optional<RuntimeResourceStage>>
+        reached_;
 };
-
-// Whether memory may not hold a request of contextTokens: the plan within
-// what the host had available at startup, beyond its reserve and the warning
-// margin, holds less. The estimate is conservative, since macOS compresses
-// other applications further once the engine loads.
-[[nodiscard]] bool memoryMayNotHold(const EngineMemoryPlan &plan,
-                                    uint64_t hostAvailableBytes,
-                                    uint32_t contextTokens);
 
 // The wire limits of a model served with maxContext tokens: prompts and
 // outputs up to the context, the engine's step and draft query rows, and a
@@ -98,14 +95,16 @@ protocolLimitsFor(const model::ModelCapabilities &capabilities,
 
 struct RuntimeBootstrapConfig {
     RuntimeResourcesConfig resources;
-    // A zero engine maxContext is what the memory plan holds, as serve's
-    // default; a larger one than that fails the bootstrap.
-    NativeLoopConfig nativeLoop{.engine = {.maxContext = 0}};
+    // A zero engine maxContext is a relaunch's context
+    // (RuntimeResourcesConfig::relaunchContext), or else what the memory
+    // plan holds, as serve's default; another one larger than the plan
+    // holds fails the bootstrap.
+    NativeLoopConfig nativeLoop;
 };
 
 using ActualMemoryReporter = std::function<ActualMemoryReport()>;
 
-// Complete owner returned only after the real loop has emitted its binary
+// Complete owner returned only after the native loop has sent its
 // ReadyEvent. No partially warmed instance escapes start().
 class RuntimeBootstrap final {
 public:
@@ -132,13 +131,14 @@ public:
     [[nodiscard]] NativeRuntime &nativeLoop() noexcept {
         return *nativeLoop_;
     }
-    [[nodiscard]] const RuntimeBootstrapReport &report() const noexcept {
-        return report_;
-    }
 
-    // The memory control pass the transport runs at a command-free point
+    // The control pass the transport runs at a command-free point: it
+    // samples the thermal state, keeps the disk tier within what its volume
+    // leaves it (Cache::keepDiskLimit), and runs the memory control pass
     // (MemoryControl::run).
     [[nodiscard]] bool controlPass(MemoryPressure pressure) {
+        sampleThermalState();
+        resources_->cache().keepDiskLimit();
         return memoryControl_.run(pressure);
     }
     // The status document, with the metrics and the loop timing the
@@ -152,12 +152,19 @@ private:
                      std::unique_ptr<NativeRuntime> nativeLoop,
                      RuntimeBootstrapReport report);
 
+    // Records the thermal state macOS reports for the status document, and
+    // logs a change: nothing else tells why serving slowed down. The control
+    // pass is the loop's regular tick, so a polled state needs no observer
+    // of its own.
+    void sampleThermalState();
+
     // Reverse destruction order is loop -> modelRuntime -> resources.
     std::unique_ptr<RuntimeResources> resources_;
     std::unique_ptr<model::RuntimeModel> model_;
     std::unique_ptr<NativeRuntime> nativeLoop_;
     MemoryControl memoryControl_;
     RuntimeBootstrapReport report_;
+    ThermalStateReporter thermalState_;
 };
 
 }  // namespace splash::engine

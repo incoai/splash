@@ -15,7 +15,8 @@ namespace {
 using splash::test::require;
 
 EngineMemoryPlan plan(uint64_t visionBytes = kGiB,
-                      uint64_t stateStagingBytes = 0) {
+                      uint64_t stateStagingBytes = 0, uint64_t aneFfnBytes = 0,
+                      uint64_t streamedTableBytes = 0) {
   DeviceCapabilities device;
   device.deviceName = "test";
   device.appleGpuFamily = 9;
@@ -30,6 +31,8 @@ EngineMemoryPlan plan(uint64_t visionBytes = kGiB,
   ModelMemoryProfile model =
       test::modelMemoryProfile(2 * kGiB, 1 * kGiB, visionBytes);
   model.footprint.stateStagingBytes = stateStagingBytes;
+  model.footprint.aneFfnBytes = aneFfnBytes;
+  model.footprint.streamedTableBytes = streamedTableBytes;
   return test::requireMemoryPlan(device, model);
 }
 
@@ -109,7 +112,7 @@ void testUnreportedAllocationsCountAgainstReserves() {
 // audit bounds it by that plan: it is neither charged to the reserves nor
 // counted a second time beside the backend's peak that includes it.
 void testStateStagingHasItsOwnBound() {
-  // One Qwen3.8-27B state (DEVELOPMENT.md, Disk cache).
+  // One Qwen3.8-27B state (DEVELOPMENT.md, SSD cache).
   const uint64_t staging = 187 * kMiB;
   const auto memoryPlan = plan(kGiB, staging);
   const auto &budget = memoryPlan.breakdown();
@@ -132,6 +135,104 @@ void testStateStagingHasItsOwnBound() {
           "state staging beyond its plan was accepted");
   require(audit(0, 0).valid,
           "a plan with state staging failed without a started disk tier");
+}
+
+// The prefill FFN's Neural Engine split is planned as a category of its own:
+// the audit bounds it by that plan, apart from the reserves, and passes a
+// start that ran without it.
+void testNeuralEngineSplitHasItsOwnBound() {
+  // Qwen3.8-27B's split at the M6's share (DEVELOPMENT.md, Neural Engine prefill).
+  const uint64_t surfaces = 508 * kMiB;
+  const auto memoryPlan = plan(kGiB, 0, surfaces);
+  const auto &budget = memoryPlan.breakdown();
+  const uint64_t reserves =
+      budget.pipelineReserveBytes + budget.runtimeOverheadReserveBytes;
+  const auto audit = [&](uint64_t splitBytes, uint64_t unclassifiedBytes) {
+    ActualMemoryReport actual = report(memoryPlan, unclassifiedBytes);
+    actual.aneFfnBytes = splitBytes;
+    actual.backendAllocatedBytes += splitBytes;
+    actual.deviceCurrentAllocatedBytes += splitBytes;
+    actual.devicePeakAllocatedBytes += splitBytes;
+    actual.backendPeakAllocatedBytes += splitBytes;
+    return auditActualMemory(memoryPlan, actual);
+  };
+  const auto split = audit(surfaces, reserves);
+  require(split.valid && split.backendUnclassifiedBytes == reserves,
+          "the split was charged to the reserves or counted twice");
+  require(audit(surfaces + 1, 0).error == MemoryAuditError::CategoryExceedsPlan,
+          "a split beyond its plan was accepted");
+  require(audit(0, 0).valid, "a start without the split failed its audit");
+}
+
+// The streamed table's row cache is host memory the plan sets aside: the
+// audit bounds it by that plan and counts it toward the hard budget beside
+// Metal's footprint, not toward Metal's categories.
+void testStreamedTableHasItsOwnBound() {
+  // Flash-Next's PLE table cached in 2 GiB (DEVELOPMENT.md, PLE table streaming).
+  const uint64_t table = 2 * kGiB;
+  const auto memoryPlan = plan(kGiB, 0, 0, table);
+  const auto &budget = memoryPlan.breakdown();
+  ActualMemoryReport actual = report(memoryPlan);
+  actual.streamedTableBytes = table;
+  const auto held = auditActualMemory(memoryPlan, actual);
+  require(held.valid && held.backendUnclassifiedBytes == 0 &&
+              held.actualHeadroomBytes ==
+                  budget.hardBudgetBytes - table - actual.devicePeakAllocatedBytes,
+          "the streamed table was counted in Metal's categories or left out "
+          "of the hard budget");
+  actual.streamedTableBytes = table + 1;
+  require(auditActualMemory(memoryPlan, actual).error ==
+              MemoryAuditError::CategoryExceedsPlan,
+          "a streamed table beyond its plan was accepted");
+  actual = report(memoryPlan);
+  actual.streamedTableBytes = table;
+  actual.devicePeakAllocatedBytes = budget.hardBudgetBytes - table + 1;
+  actual.backendPeakAllocatedBytes = actual.devicePeakAllocatedBytes;
+  require(auditActualMemory(memoryPlan, actual).error ==
+              MemoryAuditError::HardBudgetExceeded,
+          "a Metal peak that leaves the streamed table no room was accepted");
+}
+
+// A spill-capable target's readers of spilled KV, the hot block cache and a
+// prefill's history staging, are KV memory the plan bounds: each by its own
+// plan, together within the dynamic budget.
+void testSpilledKvReadersHaveTheirBounds() {
+  DeviceCapabilities device;
+  device.deviceName = "test";
+  device.appleGpuFamily = 9;
+  device.macosMajor = 26;
+  device.macosMinor = 4;
+  device.physicalMemoryBytes = 32 * kGiB;
+  device.recommendedMaxWorkingSetBytes = 24 * kGiB;
+  device.maxBufferLengthBytes = 16 * kGiB;
+  device.maxThreadgroupMemoryBytes = 32 * 1024;
+  device.maxThreadgroupWidth = 1024;
+  device.hasUnifiedMemory = true;
+  ModelMemoryProfile model = test::modelMemoryProfile(2 * kGiB, 1 * kGiB, kGiB);
+  model.targetKvLayout = test::sparseKvLayout();
+  // Flash-Next's hot cache for four decoding lanes (20,480 slots a layer)
+  // and a 256K history staged twice.
+  model.spill = {.enabled = true, .hotFloorBytes = 408'944'640, .hotTargetBytes = 408'944'640,
+                 .hotLimitBytes = 1'022'361'600, .stagingBuffers = 2, .stagingBytes = 545'259'520};
+  const EngineMemoryPlan memoryPlan = test::requireMemoryPlan(device, model);
+  ActualMemoryReport actual = report(memoryPlan);
+  const auto withReaders = [&](uint64_t hot, uint64_t staging) {
+    ActualMemoryReport result = actual;
+    result.kvBlockCacheBytes = hot;
+    result.kvHistoryStagingBytes = staging;
+    for (uint64_t *bytes : {&result.backendAllocatedBytes, &result.deviceCurrentAllocatedBytes,
+                            &result.devicePeakAllocatedBytes, &result.backendPeakAllocatedBytes})
+      *bytes += hot + staging;
+    return auditActualMemory(memoryPlan, result);
+  };
+  const MemoryAuditResult held = withReaders(1'022'361'600, 545'259'520);
+  require(held.valid && held.backendUnclassifiedBytes == 0 &&
+              held.categorizedBytes == auditActualMemory(memoryPlan, actual).categorizedBytes +
+                                           1'022'361'600 + 545'259'520,
+          "the readers of spilled KV were not counted as their own categories");
+  require(withReaders(1'022'361'601, 0).error == MemoryAuditError::CategoryExceedsPlan &&
+              withReaders(0, 545'259'521).error == MemoryAuditError::CategoryExceedsPlan,
+          "a reader of spilled KV beyond its plan was accepted");
 }
 
 void testFixedCategoryAndPeakFailures() {
@@ -214,6 +315,9 @@ int main() {
     testOptionalVisionAudit();
     testUnreportedAllocationsCountAgainstReserves();
     testStateStagingHasItsOwnBound();
+    testNeuralEngineSplitHasItsOwnBound();
+    testStreamedTableHasItsOwnBound();
+    testSpilledKvReadersHaveTheirBounds();
     testFixedCategoryAndPeakFailures();
     testDevicePeakDeviationExcludesReserves();
     std::cout << "elastic memory audit tests passed\n";

@@ -4,9 +4,15 @@ from server import output, tool_schema
 
 
 def argument_grammar(schema):
-    """The argument grammar of a tool whose parameters are `schema`, framed
-    within a request's budget as ToolPolicy frames it."""
-    policy = tool_schema.ToolPolicy({}, {"tool": schema}, False, True)
+    """The argument grammar of a strict tool whose parameters are `schema`,
+    framed within a request's budget as ToolPolicy frames it."""
+    policy = tool_schema.ToolPolicy(
+        schemas={"tool": schema},
+        required=False,
+        parallel=True,
+        strict=frozenset({"tool"}),
+        constrained=True,
+    )
     return tool_schema._argument_grammar(policy.argument_schemas["tool"])
 
 
@@ -33,13 +39,11 @@ def put(projector, text, size=None):
 def project(text, policy, request_id="test", incomplete=False, size=None):
     """Project `text` as a request does, whole or in chunks of `size`
     characters, and finish it. Returns the content, the calls and the
-    events, the last of them the content the finish still owed."""
+    events, those the finish still owed last."""
     projector = output.StreamingToolCallProjector(policy, request_id)
     events = put(projector, text, size)
-    content, calls, unsent = projector.finish(incomplete)
-    if unsent:
-        events.append(("content", unsent))
-    return content, calls, events
+    content, calls, owed = projector.finish(incomplete)
+    return content, calls, events + owed
 
 
 def streamed_text(events):

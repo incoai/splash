@@ -4,35 +4,41 @@
 #include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/rms_inverse.h"
 
-// Four-tap causal convolution of one channel at one token of the command,
-// reading the three preceding tokens from the carried state, rounded to bf16
-// and gated by SiLU.
-inline bfloat gdn_conv_silu(device const bfloat *packed,
-                            device const bfloat *conv_state_in,
+// The convolution inputs before a command's first row: the rows a state
+// cell carries, or after `consumed` rows (in `rows`) the last of those rows
+// and the carried ones: at(r, c) is row r of the carried state the rows
+// leave.
+struct GdnConvHistory {
+  device const bfloat *carried;
+  device const bfloat *rows;
+  uint conv_dim;
+  uint rows_width;
+  uint consumed;
+
+  bfloat at(uint row, uint channel) const {
+    constexpr uint Carried = SPLASH_GDN_CONVOLUTION_TAPS - 1;
+    const uint source = consumed + row;
+    return source < Carried ? carried[source * conv_dim + channel]
+                            : rows[(source - Carried) * rows_width + channel];
+  }
+};
+
+// Causal convolution of one channel at one token of the command, reading the
+// preceding tokens from the history, rounded to bf16 and gated by SiLU.
+inline bfloat gdn_conv_silu(device const bfloat *packed, GdnConvHistory history,
                             device const bfloat *conv_weights,
-                            uint packed_width, uint conv_dim, uint token,
-                            uint channel) {
+                            uint packed_width, uint token, uint channel) {
+  constexpr uint Taps = SPLASH_GDN_CONVOLUTION_TAPS, Carried = Taps - 1;
   float value = 0.0f;
-  for (uint tap = 0; tap < 4; ++tap) {
+  for (uint tap = 0; tap < Taps; ++tap) {
     uint position = token + tap;
-    bfloat input = position < 3
-                       ? conv_state_in[position * conv_dim + channel]
-                       : packed[(position - 3) * packed_width + channel];
-    value += float(input) * float(conv_weights[channel * 4 + tap]);
+    bfloat input = position < Carried
+                       ? history.at(position, channel)
+                       : packed[(position - Carried) * packed_width + channel];
+    value += float(input) * float(conv_weights[channel * Taps + tap]);
   }
   value = float(bfloat(value));
   return bfloat(splash_silu(value));
-}
-
-// Row `row` of the carried state after consumed_tokens: the last three inputs
-// seen, still taken from the incoming state when fewer were consumed.
-inline bfloat gdn_conv_carry(device const bfloat *packed,
-                             device const bfloat *conv_state_in,
-                             uint packed_width, uint conv_dim,
-                             uint consumed_tokens, uint row, uint channel) {
-  uint source = consumed_tokens + row;
-  return source < 3 ? conv_state_in[source * conv_dim + channel]
-                    : packed[(source - 3) * packed_width + channel];
 }
 
 // The gates of one (token, value head): beta = sigmoid(b) and
@@ -73,14 +79,14 @@ inline uint gdn_output_head(uint head, bool tiled) {
 // thread per dimension, stored at the head's output position. Prefill
 // dispatches one task per threadgroup; decode runs gdn_decode_gate, which
 // reproduces these rows bitwise. The norm weights are read in their stored
-// type W: bfloat in the packed formats, float for a GGUF's F32 norms.
+// type W: bfloat for an MLX target's, float for a GGUF's F32 norms.
 template <uint KeyHeads, uint ValueHeads, uint HeadDim, uint ConvDim,
           uint PackedWidth, class W>
 inline void
 gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
                device const W *norm_weight, device bfloat *hidden, uint task,
                bool tiled, threadgroup float *scratch, uint thread_index,
-               uint lane, uint simd_group) {
+               uint lane, uint simd_group, bool sigmoid_gate = false) {
   constexpr uint Simdgroups = 4, ZOffset = ConvDim;
   static_assert(HeadDim == Simdgroups * 32, "one thread per dimension");
   uint token = task / ValueHeads;
@@ -97,6 +103,7 @@ gdn_gate_phase(device const bfloat *recurrent, device const bfloat *packed,
       bfloat(value * inverse * float(norm_weight[thread_index]));
   float gate = float(packed[token * PackedWidth + ZOffset + head * HeadDim +
                             thread_index]);
-  float silu = splash_silu(gate);
-  hidden[hidden_base + thread_index] = bfloat(float(normalized) * silu);
+  // Qwen3.5 gates by silu(z), Qwen3.8-Flash-Next by sigmoid(z).
+  float gated = sigmoid_gate ? splash_sigmoid(gate) : splash_silu(gate);
+  hidden[hidden_base + thread_index] = bfloat(float(normalized) * gated);
 }

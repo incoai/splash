@@ -2,8 +2,10 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/Sampling.h"
 #include "metal/MetalBackend.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -24,13 +26,38 @@ struct SamplingPenalties final {
   }
 };
 
+// Where a lane's thinking budget runs out in a selection: its selected rows
+// from `row` on take the `end` tokens in order, as many as the selection
+// holds, unless a draft token before that row is the last of `end`, which
+// closes thinking, or `alsoEnds`, either of which ended thinking first. A row
+// past the selection's rows cuts nothing in it. At row 0 no draft token comes
+// before the cut, so the end replaces the draft's proposals there too
+// (Sampling::addThinkingDrafts). An end that waits for the mask of a
+// constrained lane starts instead at the first of those rows whose mask
+// admits its first token, the rows before it keeping their own selections;
+// as that is known only at the verify, it replaces no proposals.
+struct ThinkingCutoff final {
+  uint32_t row = 0;
+  std::span<const uint32_t> end{};
+  uint32_t alsoEnds = 0;
+  bool waitsForMask = false;
+
+  // How many of the draft's proposals, from the first, the end replaces:
+  // tokens the draft did not propose.
+  [[nodiscard]] uint32_t replacedProposals() const noexcept {
+    return row || waitsForMask
+               ? 0
+               : static_cast<uint32_t>(std::min<size_t>(end.size(), SPLASH_DRAFT_PROPOSAL_TOKENS));
+  }
+};
+
 // One lane's target policy. The defaults are a request's: greedy, and a
 // sampling lane keeps every token.
 struct SamplingPolicy final {
   // A sampling lane keeps the tokens minP leaves it, then its topK most
   // likely of those, or every one for 0 or a topK past the vocabulary (top-k
-  // disabled), then its top-p nucleus of those. Greedy lanes (temperature 0)
-  // read none of the three.
+  // disabled), then its top-p nucleus of those. Greedy lanes (!samples():
+  // temperature 0, a minP of 1 or a topK of 1) read none of the three.
   uint32_t topK = 0;
   float temperature = 0.0F;
   float topP = 1.0F;
@@ -43,8 +70,14 @@ struct SamplingPolicy final {
   // A sampling lane first drops the tokens less likely than minP times its
   // most likely one; 0 drops none.
   float minP = 0.0F;
+  // While the lane thinks under a budget, where that budget runs out; the
+  // cutoff's row selects the end of thinking whatever the lane's logits.
+  std::optional<ThinkingCutoff> thinkingCutoff{};
 
-  [[nodiscard]] bool samples() const noexcept { return temperature > 0.0F; }
+  // A lane samples unless it keeps only its most likely token, at a
+  // temperature of 0, a minP of 1 or a topK of 1: such a lane selects
+  // greedily, its draft's proposals too (the lowest id among equal logits).
+  [[nodiscard]] bool samples() const noexcept { return temperature > 0.0F && minP < 1.0F && topK != 1; }
 };
 
 // The penalty words of every state lane, one row of vocabulary words each,
@@ -103,6 +136,9 @@ struct AcceptanceBuffers final {
   metal::MetalBuffer outputTokens;
   metal::MetalBuffer retainedCounts;
   metal::MetalBuffer acceptedCounts;
+  // Each lane's verify rows (ops::DraftSelector), which bound what it
+  // retains.
+  metal::MetalBuffer verifyRows;
 };
 
 // Target token policy (penalties, min-p/top-k/top-p, constrained selection,
@@ -114,7 +150,7 @@ public:
   explicit Sampling(uint32_t vocabulary);
 
   // Exact scratch/output bytes for the fixed precompiled sampling ABI.
-  // Counts may cover one lane or a packed batch; the operator owns sharding.
+  // Counts may cover one lane or a batch of lanes; the operator owns sharding.
   [[nodiscard]] static SamplingWorkspace workspace(uint32_t rows);
 
   // A penalized request's penalty words (metal/abi/Sampling.h), rebuilt
@@ -142,8 +178,9 @@ public:
   // rowOffset, and every verify row of a batch. Each selected row's token
   // goes to the output tokens in order, one per lane for the first token
   // and eight for verify; acceptance reads a sampled verify row's draft
-  // token probability from the vocabulary rows. Both run the same kernels
-  // (addSelection).
+  // token probability from the vocabulary rows. A lane's rows from its
+  // thinking cutoff on then take the end of thinking. Both run the same
+  // kernels (addSelection).
   void addInitial(metal::CommandGraph &graph,
                   std::span<const SamplingPolicy> policies,
                   SamplingBuffers buffers, uint32_t rowOffset,
@@ -158,6 +195,14 @@ public:
       std::span<const uint32_t> maximumRetained,
       std::span<const SamplingPolicy> policies, uint32_t stopToken0,
       uint32_t stopToken1) const;
+  // After the draft's selection and before the verify reads its proposals,
+  // the proposals of each lane whose thinking cutoff is at row 0, and whose
+  // end does not wait for its mask, take the end tokens its verify rows will
+  // select, so acceptance keeps them all. A batch without such a lane
+  // dispatches nothing.
+  void addThinkingDrafts(metal::CommandGraph &graph,
+                         std::span<const SamplingPolicy> policies,
+                         metal::MetalBuffer proposedTokens) const;
 
 private:
   // The rows a selection takes from each lane (metal/abi/Sampling.h
@@ -173,16 +218,22 @@ private:
   // Penalizes the row at rowOffset of each penalized lane or, for verify,
   // all its rows, each also counting the draft tokens its context adds.
   // Policies come from validated requests (Model.hpp
-  // SamplingParameters::validationError).
+  // SamplingParameters::validationError). It follows selection(), whose
+  // check of every lane's logits covers those it rewrites.
   void addPenalties(metal::CommandGraph &graph,
                     std::span<const SamplingPolicy> policies,
                     const SamplingBuffers &buffers, const PenaltyTable &table,
                     uint32_t rowOffset, bool verify) const;
-  // Selects the rows that rows names of every lane.
-  void addSelection(metal::CommandGraph &graph,
-                    std::span<const SamplingPolicy> policies,
-                    const SamplingBuffers &buffers, const TargetRows &rows,
-                    uint32_t stopToken0, uint32_t stopToken1) const;
+  // The parameters that select the rows `rows` names of every lane; throws
+  // unless the buffers hold what the selection's kernels reach, before
+  // addInitial or addVerify encodes anything.
+  [[nodiscard]] TargetSamplingParams selection(std::span<const SamplingPolicy> policies,
+                                               const SamplingBuffers &buffers, const TargetRows &rows,
+                                               uint32_t stopToken0, uint32_t stopToken1) const;
+  // Selects the rows `selection` names of its `lanes` lanes, then the end of
+  // thinking at each lane's thinking cutoff among them.
+  void addSelection(metal::CommandGraph &graph, const TargetSamplingParams &selection,
+                    std::span<const SamplingPolicy> policies, const SamplingBuffers &buffers) const;
 
   uint32_t vocabulary_ = 0;
   uint32_t maskWords_ = 0;

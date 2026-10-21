@@ -2,7 +2,8 @@
 
 // Decode-only value tables of the GGUF formats (metal/abi/QuantFormat.h),
 // shared by the GEMM kernels, the token gathers and the host reference decoder
-// of the tests. No prepared byte depends on them.
+// of the tests. Of the prepared bytes, only the F32 values the loader writes
+// of an MLX mxfp4 tensor depend on one (kFP4Values, model/GgufPreparation.cpp).
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>
 #define QUANT_CONSTANT constant constexpr

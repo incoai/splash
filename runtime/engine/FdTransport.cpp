@@ -1,5 +1,5 @@
 #include "engine/FdTransport.hpp"
-#include "TestConfig.hpp"
+#include "AwakeClock.hpp"
 
 #include <algorithm>
 #include <array>
@@ -263,13 +263,12 @@ private:
   std::thread thread_;
 };
 
-FdTransport::FdTransport(int inputFd, int outputFd)
-    : inputFd_(inputFd), outputFd_(outputFd),
-      inputQueueBytes_(
-          testConfig().transportInputQueueBytes.value_or(kInputQueueBytes)),
+FdTransport::FdTransport(int inputFd, int outputFd, size_t inputQueueBytes)
+    : inputFd_(inputFd), outputFd_(outputFd), inputQueueBytes_(inputQueueBytes),
       wake_(std::make_shared<LoopWake>()) {
-  if (inputFd_ < 0 || outputFd_ < 0) {
-    throw std::invalid_argument("native transport requires valid fds");
+  if (inputFd_ < 0 || outputFd_ < 0 || !inputQueueBytes_) {
+    throw std::invalid_argument(
+        "native transport requires valid fds and room for input");
   }
 }
 
@@ -326,15 +325,14 @@ NativeProcessExit FdTransport::run(NativeRuntime &loop) {
       }
     } // What was taken is freed before control, tick and poll.
 
-    const auto stepStarted = std::chrono::steady_clock::now();
+    const auto stepStarted = AwakeClock::now();
     deferredControl = wake->takeControl() || deferredControl;
     if (deferredControl && !loop.commandInFlight()) {
       deferredControl = loop.runControl(controlHandler_);
     }
 
     const bool progressed = loop.tick();
-    const double tickMilliseconds = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - stepStarted).count();
+    const double tickMilliseconds = millisecondsSince(stepStarted);
     if (tickMilliseconds > maxTickMilliseconds_)
       maxTickMilliseconds_ = tickMilliseconds;
     if (progressed)
@@ -362,10 +360,10 @@ NativeProcessExit FdTransport::run(NativeRuntime &loop) {
 }
 
 bool FdTransport::runFlush(NativeRuntime &loop, std::chrono::milliseconds budget) {
-  const auto deadline = std::chrono::steady_clock::now() + budget;
+  const auto deadline = AwakeClock::now() + budget;
   while (!loop.flushRestorePoints()) {
     const auto left = std::chrono::ceil<std::chrono::milliseconds>(
-        deadline - std::chrono::steady_clock::now());
+        deadline - AwakeClock::now());
     if (!loop.engineHealthy() || left.count() <= 0)
       return false;
     pollfd descriptor{wake_->readFd, POLLIN, 0};

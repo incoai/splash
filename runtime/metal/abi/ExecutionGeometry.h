@@ -5,7 +5,10 @@
 #define SPLASH_DRAFT_QUERY_ROWS 8u
 #define SPLASH_DRAFT_PROPOSAL_TOKENS 7u
 #define SPLASH_TARGET_VERIFY_ROWS 8u
-#define SPLASH_MAXIMUM_CONTEXT_TOKENS 262144u
+// The KV ceiling: four times the targets' native window of 262,144 tokens,
+// which holds the most context YaRN serves them
+// (QwenTargetDimensions::yarnContextTokens).
+#define SPLASH_MAXIMUM_CONTEXT_TOKENS 1048576u
 #define SPLASH_SPECULATIVE_SCRATCH_TOKENS                                  \
   (SPLASH_TARGET_VERIFY_ROWS - 1u)
 #define SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS                                  \
@@ -50,6 +53,10 @@
 // prefill/gdn.metal ties the two literals together.
 #define SPLASH_GDN_SCAN_STATE_ROWS 16u
 #define SPLASH_GDN_SCAN_THREADS 128u
+// The epsilon of every RMS norm the kernels compute, which a target's and a
+// draft's configurations must state. Unsuffixed, so the host compares a
+// configuration's double with it exactly and the kernels take it as a float.
+#define SPLASH_RMS_EPSILON 1e-6
 // Plain norms of at most SPLASH_STAGED_NORM_ROWS rows of at most
 // SPLASH_STAGED_NORM_WIDTH columns run norm_rms_staged, whose 1024-thread
 // groups hold a row in threadgroup memory: the region where it measured

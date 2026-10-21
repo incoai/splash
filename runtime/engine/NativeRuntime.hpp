@@ -1,5 +1,6 @@
 #pragma once
 
+#include "AwakeClock.hpp"
 #include "engine/Engine.hpp"
 #include "engine/Protocol.hpp"
 #include "engine/Status.hpp"
@@ -16,14 +17,35 @@
 
 namespace splash::engine {
 
+// The clocks a native loop reads unless told others: the system clock in
+// Unix microseconds, which a request's absolute deadline is on, and the awake
+// clock in milliseconds (awakeMilliseconds), which it measures every duration
+// on.
+[[nodiscard]] uint64_t systemUnixMicros() noexcept;
+
+// The loop's constructor refuses a config without its metrics, its weights,
+// their admission or its clocks.
 struct NativeLoopConfig {
   engine::EngineConfig engine;
   RuntimeMetrics *metrics = nullptr;
-  // The model's weights: released once the engine has held no request for
-  // the residency keep-alive (metal::kResidencyKeepAliveSeconds), and written
-  // back, an image per tick, before the engine runs the next request. Null
-  // where they stay, as in tests of other behavior.
+  // What the engine gives back while idle (ReleasableMemory): released once
+  // the engine has held no request for the idle release, and taken back, a
+  // part per tick, before the engine runs the next request.
   model::WeightMemory *weights = nullptr;
+  // Admits the memory the weights take back
+  // (MemoryGovernor::allocationAdmission), as memory the requests waiting for
+  // them need (EngineConfig::serving).
+  metal::AllocationAdmission weightAdmission;
+  // Told true when the engine takes a request while it holds none, and false
+  // when its last request ends; the process keeps the Mac from idle sleep in
+  // between (main.mm). It must not throw. Empty where nothing needs to know.
+  std::function<void(bool)> holdingRequests;
+  // Told when the engine's own work fails (its failure boundary below caught
+  // an exception), before the failure is reported. It must not throw. Empty
+  // where nothing needs to know.
+  std::function<void()> engineFailed;
+  std::function<uint64_t()> unixMicros = systemUnixMicros;
+  std::function<double()> monotonicMilliseconds = awakeMilliseconds;
 };
 
 // Translates native protocol messages and events at the Engine boundary.
@@ -39,8 +61,11 @@ public:
   using ByteSink = std::function<void(std::span<const uint8_t>)>;
   using StatusProvider = std::function<std::string()>;
 
-  NativeRuntime(NativeLoopConfig config, engine::Cache &cache,
-                model::Model &model, ByteSink output,
+  // idleReleaseSeconds is the engine's idle release
+  // (RuntimeResourcesConfig::idleReleaseSeconds): positive, and infinite
+  // where the weights stay.
+  NativeRuntime(NativeLoopConfig config, double idleReleaseSeconds,
+                engine::Cache &cache, model::Model &model, ByteSink output,
                 StatusProvider statusProvider, protocol::ProtocolLimits limits);
 
   // Processes every complete frame in bytes. False means the connection
@@ -48,28 +73,33 @@ public:
   bool receive(std::span<const uint8_t> bytes);
   bool finishInput();
 
-  // Executes at most one explicit GPU BatchPlan, or writes back one image of
-  // released weights.
+  // Executes at most one explicit GPU BatchPlan, or takes back one part of
+  // the released weights (model::WeightMemory::restore). While admission
+  // refuses that part, the tick makes no progress and the requests wait for
+  // memory, retrying after kResourceRetryBackoffMilliseconds, until
+  // EngineConfig::resourceWaitTimeoutMilliseconds has passed since the first
+  // refusal after the last part that came back. Then, or at once when no
+  // request waits, the weights give back the parts that came back and the
+  // requests fail with LaneOutcome::ResourceTimeout.
   bool tick();
   // Command-free control work uses the same failure boundary as execution.
   bool runControl(const std::function<bool()> &control);
   // At a clean stop (Engine::flushRestorePoints). False until no restore
   // point is left, and once the engine has failed.
   bool flushRestorePoints();
-  // Releases the weights once the engine has held no request for the
-  // residency keep-alive. Runs between commands, in the control pass.
+  // Releases the weights once the engine has held no request for the idle
+  // release since it became ready. Runs between commands, in the control pass.
   void releaseIdleWeights();
   void setCompletionNotifier(std::function<void()> notifier) {
     core_.setCompletionNotifier(std::move(notifier));
   }
 
-  void observePrefill(uint32_t rows, double wallMilliseconds) {
-    core_.observePrefill(rows, wallMilliseconds);
+  void observePrefill(uint32_t rows, double wallMilliseconds, double hostMilliseconds) {
+    core_.observePrefill(rows, wallMilliseconds, hostMilliseconds);
   }
 
   void announceReady();
 
-  [[nodiscard]] bool ready() const noexcept { return ready_; }
   [[nodiscard]] bool connectionMustClose() const noexcept {
     return closeConnection_;
   }
@@ -81,17 +111,25 @@ public:
   [[nodiscard]] bool commandInFlight() const noexcept {
     return core_.commandInFlight();
   }
-  // Used by the fd event host to block in poll(2) without periodic sleeps,
-  // waking for either a request deadline or a deferred resource retry.
+  // How long FdTransport may block in poll(2): until a refused restore tries
+  // again, or the engine's next timed event (Engine::nextWakeupMilliseconds),
+  // without a limit when it has none.
   [[nodiscard]] std::optional<double> millisecondsUntilNextWakeup() const;
   [[nodiscard]] engine::EngineSnapshot snapshot() const {
     return core_.snapshot();
   }
-  [[nodiscard]] engine::ResourceWaitSnapshot resourceWaitSnapshot() const {
-    return core_.resourceWaitSnapshot(clocks_.monotonicMilliseconds());
+  // The snapshot /status reports: each live request's age counted from its
+  // arrival, on the runtime's clock.
+  [[nodiscard]] engine::EngineSnapshot statusSnapshot() const;
+  [[nodiscard]] WeightsSnapshot weightsSnapshot() const {
+    return {idleReleaseSeconds_, config_.weights->released(),
+            restoreStarted_.has_value(), weightRestores_, weightRestoreFailures_};
   }
+  // The engine's (Engine::resourceWaitSnapshot), with the requests a refused
+  // restore holds waiting for memory.
+  [[nodiscard]] engine::ResourceWaitSnapshot resourceWaitSnapshot() const;
   [[nodiscard]] double monotonicMilliseconds() const {
-    return clocks_.monotonicMilliseconds();
+    return config_.monotonicMilliseconds();
   }
   [[nodiscard]] MemoryReclaimResult
   reclaimMemory(const MemoryReclaimDirective &directive) {
@@ -101,7 +139,8 @@ public:
 private:
   struct RequestTelemetry {
     double arrivedMilliseconds = 0.0;
-    double startedMilliseconds = 0.0;
+    // Empty until the engine starts the request (EngineEventSink::started).
+    std::optional<double> startedMilliseconds;
     std::optional<double> firstTokenMilliseconds;
     std::optional<double> lastTokenMilliseconds;
     uint32_t emittedTokens = 0;
@@ -114,17 +153,24 @@ private:
 
   bool handle(protocol::ClientMessage &message);
   bool handleRequest(protocol::RequestFrame &request);
-  void restoreWeights();
+  // Gives the weights back when the engine holds no request and no restore is
+  // under way; true when it did.
+  bool releaseWeights();
+  bool restoreWeights();
+  bool weightsRefused(metal::AllocationFailure failure);
   bool handleCancel(const protocol::CancelFrame &cancel);
   bool handleMask(const protocol::MaskResponseFrame &mask);
   bool handleStatus(const protocol::StatusRequestFrame &status);
+  bool handleRelease(const protocol::ReleaseRequestFrame &release);
   bool handleMaskIssue(protocol::ProtocolIssue issue);
   bool handleIssue(protocol::ProtocolIssue issue);
   void requestError(uint64_t requestId, std::string code, std::string message,
-                    bool retryable = false);
+                    bool retryable = false, uint32_t retryAfterSeconds = 0);
   void engineError(std::string code, std::string message);
   void executionFailed(std::exception_ptr error);
   bool send(const protocol::EngineEvent &event);
+  // After a request's terminal event: the engine no longer holds it.
+  void ended(uint64_t requestId, double now);
 
   void started(uint64_t requestId, uint32_t matchedTokens,
                uint32_t lane) override;
@@ -136,39 +182,40 @@ private:
   void tokens(uint64_t requestId, std::span<const uint32_t> values) override;
   void maskRequested(uint64_t requestId,
                      std::span<const uint32_t> simulationTokens) override;
-  void completed(uint64_t requestId, EngineFinishReason reason,
+  void completed(uint64_t requestId, EngineFinishReason reason, bool bounded,
                  uint32_t promptTokens, uint32_t completionTokens,
-                 std::span<const float> optionLogits) override;
+                 uint32_t deduplicatedTokens,
+                 std::span<const float> optionLogits,
+                 const SpeculativeCounts &speculation) override;
   void failed(uint64_t requestId, LaneOutcome outcome,
-              std::string message) override;
+              std::string message, uint32_t retryAfterSeconds) override;
 
-  // The system clock in microseconds and the steady clock in milliseconds,
-  // or the test seam's (TestConfig).
-  struct Clocks {
-    std::function<uint64_t()> unixMicros;
-    std::function<double()> monotonicMilliseconds;
-  };
-  static Clocks clocks();
   static uint64_t durationMicros(double startMilliseconds,
                                  double endMilliseconds);
 
   NativeLoopConfig config_;
+  double idleReleaseSeconds_;
   ByteSink output_;
   StatusProvider statusProvider_;
-  Clocks clocks_;
   protocol::ProtocolLimits limits_;
   protocol::FrameParser parser_;
   engine::Engine core_;
   std::unordered_map<uint64_t, RequestTelemetry> telemetry_;
   std::unordered_map<uint64_t, PendingMask> pendingMasks_;
   uint64_t nextMaskRequestId_ = 1;
-  // metal::kResidencyKeepAliveSeconds, or the test seam's (TestConfig), and
-  // when the engine last held a request: when one ended, or when weights were
-  // restored for one.
-  double weightKeepAliveMilliseconds_;
-  double lastRequestMilliseconds_;
+  // When the engine's idle period began: at Ready, when a request ended, or
+  // when the weights were restored for one.
+  double idleSinceMilliseconds_;
   // When the weights began to be written back for a request, until they are.
   std::optional<double> restoreStarted_;
+  // Since when admission refuses the next part of the weights to the
+  // requests waiting: from the first refusal after the last part that came
+  // back.
+  std::optional<double> restoreRefusedSince_;
+  // The times the weights were written back, each for a request.
+  uint64_t weightRestores_ = 0;
+  // The restores that gave up for want of memory.
+  uint64_t weightRestoreFailures_ = 0;
   bool ready_ = false;
   bool closeConnection_ = false;
   bool engineHealthy_ = true;

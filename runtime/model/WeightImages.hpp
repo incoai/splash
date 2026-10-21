@@ -6,7 +6,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <functional>
 #include <span>
 #include <string>
@@ -32,7 +31,8 @@ using ImageWriter = std::function<void(std::span<uint8_t> bytes, const metal::Me
 
 // An image of a model's weights as its loader plans it: the component it is
 // (such as target/layer-0.bin), the header its file starts with, its size and
-// its writer.
+// its writer, and the size its record declares when not that one
+// (gguf::Image::residentBytes: a layer whose routed experts stream).
 struct ImagePlan final {
   std::string component;
   std::string magic;
@@ -40,6 +40,7 @@ struct ImagePlan final {
   uint32_t type = 0;
   uint64_t bytes = 0;
   ImageWriter write;
+  uint64_t declaredBytes = 0;
 };
 
 // A model's weights in memory: each image in a buffer of its own, written
@@ -50,16 +51,18 @@ struct ImagePlan final {
 // contentIdentity, what the sources hold (ModelDescriptor::sourceIdentity).
 class WeightImages final : public WeightMemory {
 public:
-  explicit WeightImages(metal::MetalBackend &backend, std::string contentIdentity = {}) noexcept
+  WeightImages(metal::MetalBackend &backend, std::string contentIdentity) noexcept
       : backend_(&backend), contentIdentity_(std::move(contentIdentity)) {}
   WeightImages(const WeightImages &) = delete;
   WeightImages &operator=(const WeightImages &) = delete;
 
   // Allocates the image's buffer, writes it and returns its file.
   [[nodiscard]] WeightFile load(ImagePlan image);
+  // What every image's file records the sources hold.
+  [[nodiscard]] const std::string &contentIdentity() const noexcept { return contentIdentity_; }
   [[nodiscard]] bool released() const noexcept override { return released_; }
   void release() override;
-  [[nodiscard]] bool restore() override;
+  [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override;
 
   struct Contents final {
     std::string_view component;
@@ -83,10 +86,6 @@ private:
   size_t restored_ = 0;
 };
 
-// The image of a Splash package's packed file at path, read as it is.
-[[nodiscard]] ImagePlan packedImage(const std::filesystem::path &path, std::string component,
-                                    std::string_view magic, uint32_t layer, uint32_t type);
-
 // The threads that read and convert weights while images are written: one
 // per core.
 [[nodiscard]] unsigned loadThreads() noexcept;
@@ -96,6 +95,10 @@ private:
 // through its worker's buffers. Rethrows the first exception once every
 // worker has stopped.
 void parallelFor(size_t count, const std::function<void(size_t index, unsigned thread)> &task);
+
+// Writes the F32 GDN decay of `count` BF16 or F32 values A_log at values,
+// each float(-exp(double(A_log))), to `to`; throws on a non-finite decay.
+void writeGdnDecay(const uint8_t *values, uint64_t count, bool bfloat16, uint8_t *to);
 
 // Zeroes the bytes of image outside the extents, [offset, offset + bytes),
 // that its writer writes: the alignment between sections and any padding.

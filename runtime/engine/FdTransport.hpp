@@ -3,6 +3,8 @@
 #include "engine/NativeRuntime.hpp"
 #include "engine/Protocol.hpp"
 
+#include <sysexits.h>
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -12,11 +14,12 @@
 
 namespace splash::engine {
 
+// The process's exit status for how its transport ended, from sysexits(3).
 enum class NativeProcessExit : int {
-  CleanEof = 0,
-  ProtocolFailure = 64,
-  EngineFailure = 70,
-  IoFailure = 74,
+  CleanEof = EX_OK,
+  ProtocolFailure = EX_PROTOCOL,
+  EngineFailure = EX_SOFTWARE,
+  IoFailure = EX_IOERR,
 };
 
 // POSIX pipe transport for the native runtime child process. While run() is
@@ -29,14 +32,15 @@ enum class NativeProcessExit : int {
 // after that command drains.
 class FdTransport final {
 public:
-  // The reader stops reading once this much input waits for the loop: one
-  // frame of the largest size the protocol accepts, so the reader can take a
-  // whole request of any size while the loop runs. Until the loop takes it,
-  // the pipe stops the writer. Tests set a smaller bound through TestConfig.
+  // The reader stops reading once inputQueueBytes of input wait for the
+  // loop. By default that is one frame of the largest size the protocol
+  // accepts, so the reader can take a whole request of any size while the
+  // loop runs. Until the loop takes it, the pipe stops the writer.
   static constexpr size_t kInputQueueBytes =
       protocol::kFrameHeaderBytes + protocol::kAbsoluteMaxFramePayloadBytes;
 
-  explicit FdTransport(int inputFd, int outputFd);
+  explicit FdTransport(int inputFd, int outputFd,
+                       size_t inputQueueBytes = kInputQueueBytes);
   FdTransport(const FdTransport &) = delete;
   FdTransport &operator=(const FdTransport &) = delete;
 

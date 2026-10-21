@@ -36,11 +36,11 @@ Loading changes layout, never values:
   GDN layers differs by at most one float ULP from the package's MLX
   exponential; the adapter computes `float(-exp(double(A_log)))`, and the
   source oracle allows at most two ULP in that section.
-- GGUF: the bounded repack of all eight supported formats, with multiple row
-  tiles, wide rows, head permutations and offsets above 4 GiB, matches the CPU
-  reference bytewise on the M3 Max and the M5 Pro.
-- Vision: every source is written into the packed `vision/model.bin`, padding
-  included.
+- GGUF: the bounded repack of all eight formats supported then, with multiple
+  row tiles, wide rows, head permutations and offsets above 4 GiB, matches the
+  CPU reference bytewise on the M3 Max and the M5 Pro.
+- Vision: every source is written into an image laid out as a package's
+  `vision/model.bin`, padding included.
 
 | Vision source | Bytes | SHA-256 |
 | --- | ---: | --- |
@@ -52,14 +52,10 @@ Each Unsloth mmproj holds 334 tensors: 110 BF16 matrices and 224 F32 tensors
 F32 values has non-zero low 16 bits (0 of 4,833,008 for 27B, 0 of 4,829,936 for
 35B), so they convert to BF16 exactly.
 
-The affine comparison is `affine-source-oracle` (DEVELOPMENT.md, Validate),
-which prints `packed_exact=true` and the decay's `decay_max_ulp` per file. The
-GGUF repack check is `gguf-preparation` in `make test-engine-metal`.
-
-```sh
-build/engine-tests/affine-source-oracle build/splash.metallib \
-  install/models/mlx-community/Qwen3.6-35B-A3B-4bit/target install/models/incoai/Qwen3.6-35B-A3B-Splash
-```
+The affine comparison was `affine-source-oracle`, which printed
+`package_exact=true` and the decay's `decay_max_ulp` per file; it was removed
+with Splash packages, which later releases do not load. The GGUF repack check is
+`gguf-preparation` in `make test-engine-metal`.
 
 `weight-digests` prints the size and SHA-256 of every image a model loads,
 `vision/model.bin` among them:
@@ -68,7 +64,7 @@ build/engine-tests/affine-source-oracle build/splash.metallib \
 The vision fixture embedding is unchanged, with Metal shader validation:
 `7946f077435ef45d0a596461a9d9a234ff458c805c007bb3ea1af7296bd230f9` for 35B on
 both M5 Pro devices, `011d9121bf52f85a26e7eff28e9c9459a48eb0bb36d585ff8e7ef7621cd3a37b`
-for 27B on the M3 Max. The 35B mmproj and MLX sources give the packed embedding.
+for 27B on the M3 Max. The 35B mmproj and MLX sources give the package's embedding.
 `make test-real MODEL=...` prints it (`embedding SHA-256`) with the vision
 parity check.
 
@@ -94,8 +90,8 @@ which shares vocabulary, merges and pre-tokenizer (used only as a test reference
   thinking on and off) match the original template and the reference token IDs.
 
 That comparison script is not in the repository. The committed checks are
-`python -m unittest dev.tests.test_gguf_metadata` (synthetic metadata) and the
-chat-template probe tests over the embedded templates in
+`python -m unittest dev.tests.install.test_gguf_metadata` (synthetic metadata)
+and the chat-template probe tests over the embedded templates in
 `dev/tests/fixtures/chat_templates/`.
 
 ## Loading time
@@ -128,7 +124,7 @@ reopened the prepared files in 0.641 s and 0.533–0.539 s.
 
 Baseline: PR 114 (`d25020e`), serving the Splash packages. Candidate: its child
 `f72b411`, which introduced source preparation, serving the packages
-("packed"), the MLX checkpoints with the packages' drafts ("prepared"), and the
+("package"), the MLX checkpoints with the packages' drafts ("prepared"), and the
 Unsloth GGUFs through the GGUF packages of that time ("GGUF"). 64 tokens per lane at B1–B4, run
 baseline/candidate/candidate/baseline; ratios are baseline median GPU time over
 candidate median GPU time, so 1.000 is unchanged.
@@ -140,11 +136,11 @@ build/engine-tests/backend-benchmark build/splash.metallib MODEL_ROOT \
 
 | Device | Target | B1 | B2 | B3 | B4 |
 | --- | --- | ---: | ---: | ---: | ---: |
-| M3 Max | packed affine 27B | 0.999 | 1.000 | 0.999 | 0.999 |
-| M3 Max | packed affine 35B | 1.004 | 0.997 | 0.998 | 0.996 |
+| M3 Max | package affine 27B | 0.999 | 1.000 | 0.999 | 0.999 |
+| M3 Max | package affine 35B | 1.004 | 0.997 | 0.998 | 0.996 |
 | M3 Max | GGUF 27B | 1.003 | 1.001 | 1.000 | 1.000 |
 | M3 Max | GGUF 35B | 0.999 | 1.000 | 1.000 | 0.998 |
-| M5 Pro 16 | packed affine 27B | 0.995 | 1.000 | 1.003 | 0.997 |
+| M5 Pro 16 | package affine 27B | 0.995 | 1.000 | 1.003 | 0.997 |
 | M5 Pro 16 | prepared affine 27B | 1.000 | 0.997 | 1.000 | 0.998 |
 | M5 Pro 16 | prepared affine 35B | 0.999 | 1.004 | 1.000 | 0.998 |
 | M5 Pro 16 | GGUF 35B | 1.005 | 1.008 | 1.001 | 1.000 |

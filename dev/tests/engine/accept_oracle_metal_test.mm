@@ -148,6 +148,7 @@ public:
                    buffers_.uniforms,
                    buffers_.outputTokens,
                    allocate(uint64_t{kLanes} * sizeof(uint32_t)),
+                   allocate(uint64_t{kLanes} * sizeof(uint32_t)),
                    allocate(uint64_t{kLanes} * sizeof(uint32_t))};
   }
 
@@ -185,7 +186,9 @@ public:
     auto *proposed =
         static_cast<uint32_t *>(acceptance_.proposedTokens.contents());
     auto *uniforms = static_cast<float *>(buffers_.uniforms.contents());
+    auto *verifyRows = static_cast<uint32_t *>(acceptance_.verifyRows.contents());
     for (uint32_t lane = 0; lane < lanes; ++lane) {
+      verifyRows[lane] = kRows;
       input[lane * kRows] = 0;
       for (uint32_t position = 0; position < kProposals; ++position) {
         input[lane * kRows + position + 1] = trials[lane].proposal;
@@ -207,7 +210,7 @@ public:
     const std::vector<uint32_t> maximumRetained(lanes, kRows);
     CommandGraph verify;
     sampling_.addVerify(verify, policies, buffers_, 1, 2, {});
-    static_cast<void>(backend.submitCommand(verify.dispatches()));
+    static_cast<void>(backend.submitCommandAsync(verify.command()).wait());
     const auto *tokens =
         static_cast<const uint32_t *>(buffers_.outputTokens.contents());
     const auto *records = static_cast<const TargetVocabularyRow *>(
@@ -225,7 +228,7 @@ public:
     CommandGraph accept;
     sampling_.addAcceptance(accept, acceptance_, maximumRetained, policies, 1,
                             2);
-    static_cast<void>(backend.submitCommand(accept.dispatches()));
+    static_cast<void>(backend.submitCommandAsync(accept.command()).wait());
     const auto *counts =
         static_cast<const uint32_t *>(acceptance_.retainedCounts.contents());
     std::vector<uint32_t> outputs;

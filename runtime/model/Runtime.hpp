@@ -4,8 +4,11 @@
 
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace splash::model {
+
+class RuntimeInstrumentation;
 
 class Runtime final : public RuntimeModel {
 public:
@@ -13,6 +16,8 @@ public:
   ~Runtime() override;
   void checkHealth() override;
   [[nodiscard]] uint32_t statesToActivate() const noexcept override;
+  [[nodiscard]] uint32_t prefillGroupRows(bool spills) const noexcept override;
+  [[nodiscard]] uint32_t prefillPasses() const noexcept override;
 
   Runtime(const Runtime &) = delete;
   Runtime &operator=(const Runtime &) = delete;
@@ -37,12 +42,17 @@ public:
               std::function<void()> completion) override;
   [[nodiscard]] std::vector<ModelStepResult>
   decode(const BatchPlan &plan, std::span<const ModelBatchItem> items);
+  [[nodiscard]] std::shared_ptr<StateReservation>
+  reserveState(uint64_t requestId, uint32_t tokens, metal::AllocationFailure &refusal) override;
   [[nodiscard]] std::shared_ptr<const CompositeState>
   snapshot(uint64_t requestId) override;
   [[nodiscard]] uint64_t snapshotBytes() const noexcept override;
-  [[nodiscard]] bool canSnapshotToDisk() const noexcept override;
+  [[nodiscard]] bool canSnapshotToDisk(bool inUse) const noexcept override;
   [[nodiscard]] std::unique_ptr<StateOffload>
   snapshotToDisk(uint64_t requestId, std::function<void()> completion) override;
+  [[nodiscard]] ModelMemoryAdmission reserveSpilledReads(uint64_t requestId) override;
+  [[nodiscard]] ModelMemoryAdmission reserveHistoryStaging(uint64_t requestId, uint32_t pages) override;
+  [[nodiscard]] ModelMemoryAdmission growSpilledReads() override;
   [[nodiscard]] uint64_t reclaimIdleState(bool keepLane,
                                           IdleMemory scope) noexcept override;
   [[nodiscard]] std::optional<std::string>
@@ -75,6 +85,7 @@ private:
   decodeAsync(const BatchPlan &plan, std::span<const ModelBatchItem> items,
               std::function<void()> completion);
 
+  friend class RuntimeInstrumentation;
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };

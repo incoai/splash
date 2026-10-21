@@ -14,17 +14,8 @@ using namespace splash::engine;
 
 namespace {
 
+using splash::test::rejects;
 using splash::test::require;
-
-template <typename Exception, typename Function>
-void requireThrows(Function &&function, const char *message) {
-  try {
-    function();
-  } catch (const Exception &) {
-    return;
-  }
-  throw std::runtime_error(message);
-}
 
 std::array<uint32_t, KvCache::pageTokens> page(uint32_t token) {
   std::array<uint32_t, KvCache::pageTokens> result{};
@@ -47,13 +38,13 @@ void testImageIdentityKeysBlocks() {
   const ImageSpan blue{8, 16, 8, 8, 0x3333, 0x4444};
   const std::array<ImageSpan, 1> redSpans{red};
   const std::array<ImageSpan, 1> blueSpans{blue};
-  require(blockImageIdentity(0, 32, {}) == ImageIdentity{},
+  require(blockImageIdentity(0, 32, {}) == BlockIdentity{},
           "text-only block identity must be zero");
-  require(blockImageIdentity(32, 32, redSpans) == ImageIdentity{},
+  require(blockImageIdentity(32, 32, redSpans) == BlockIdentity{},
           "a block after the image must not carry image identity");
-  const ImageIdentity redIdentity = blockImageIdentity(0, 32, redSpans);
-  const ImageIdentity blueIdentity = blockImageIdentity(0, 32, blueSpans);
-  require(redIdentity != ImageIdentity{} && redIdentity != blueIdentity,
+  const BlockIdentity redIdentity = blockImageIdentity(0, 32, redSpans);
+  const BlockIdentity blueIdentity = blockImageIdentity(0, 32, blueSpans);
+  require(redIdentity != BlockIdentity{} && redIdentity != blueIdentity,
           "image identity does not depend on the content digest");
   const ImageSpan redLater{40, 16, 8, 8, 0x1111, 0x2222};
   const std::array<ImageSpan, 1> laterSpans{redLater};
@@ -81,6 +72,33 @@ void testImageIdentityKeysBlocks() {
           "token-identical blocks with different images were merged");
   for (uint32_t physical : acquired.pages) pool.releasePage(physical, false);
   std::cout << "KV image identity ok\n";
+}
+
+// A persistent tier records each block's identity (KvBlockLabel), and a later
+// process's lookups compute it again: a change to blockIdentity's mixing or
+// seeds would leave the salted and image chains it holds matching nothing.
+// Such a change bumps kPersistentCacheFormat (engine/RuntimeResources.mm) and
+// pins the new values here.
+void testBlockIdentitiesArePinned() {
+  const CacheSalt salt{0x0123456789abcdefULL, 0xfedcba9876543210ULL};
+  // Two images in the first block, the second through the third.
+  const std::array<ImageSpan, 2> images{
+      ImageSpan{8, 16, 8, 8, 0x1111222233334444ULL, 0x5555666677778888ULL},
+      ImageSpan{24, 72, 12, 24, 0x99990000aaaabbbbULL, 0xccccddddeeeeffffULL}};
+  require(blockIdentity(0, 32, {}, salt) ==
+                  BlockIdentity{0x7ebd72de8d5302c4ULL, 0xfc6aad21c68d9802ULL} &&
+              blockIdentity(0, 32, images, {}) ==
+                  BlockIdentity{0x9979f264297f2e0dULL, 0x2a53365bb9c20351ULL} &&
+              blockIdentity(32, 32, images, {}) ==
+                  BlockIdentity{0xbb5b6de52eeab8baULL, 0xfa8765be1d4ad307ULL} &&
+              blockIdentity(64, 32, images, {}) ==
+                  BlockIdentity{0xbb5b6de52eeab89aULL, 0xfa8765be1d4ad327ULL} &&
+              blockIdentity(0, 32, images, salt) ==
+                  BlockIdentity{0xa23cc0b0f9bab89dULL, 0x386a63737598e476ULL} &&
+              blockIdentity(32, 32, images, salt) == blockIdentity(32, 32, images, {}),
+          "block identities changed: persisted salted and image chains would match "
+          "nothing; bump kPersistentCacheFormat and pin the new values");
+  std::cout << "KV block identities pinned ok\n";
 }
 
 void testExactChainedBlocksAndPhysicalOwnership() {
@@ -128,8 +146,8 @@ void testExactChainedBlocksAndPhysicalOwnership() {
               pool.snapshot().pagesPrefix == 4,
           "exact duplicate created a second KV block");
 
-  requireThrows<std::logic_error>([&] { cache.erase(root.id); },
-                                  "parent block was evicted before children");
+  rejects([&] { cache.erase(root.id); }, "cannot evict a referenced KV cache block",
+          "parent block was evicted before children");
   cache.retainActive(left.id);
   require(cache.evictionCandidate(0).value().id == right.id &&
               cache.evictionCandidate(right.id).value().id == other.id &&
@@ -204,17 +222,19 @@ void testInputValidation() {
   auto acquired = pool.acquirePages(1);
   require(acquired.granted(), "validation page was not acquired");
   const std::array<uint32_t, 1> shortTokens{1};
-  requireThrows<std::invalid_argument>(
+  rejects(
       [&] {
         static_cast<void>(
             cache.insert(0, shortTokens, acquired.pages[0], {}));
       },
+      "KV cache block must contain one full page",
       "partial token page was accepted");
-  requireThrows<std::invalid_argument>(
+  rejects(
       [&] {
         static_cast<void>(
             cache.insert(999, page(2), acquired.pages[0], {}));
       },
+      "KV cache parent block is unknown",
       "nonresident parent was accepted");
   pool.releasePage(acquired.pages[0], false);
 }
@@ -406,8 +426,8 @@ void testDiskTierTransitions() {
   require(cache.evictionCandidate(0).value().id == leaf.id &&
               !cache.diskCandidate(true) && !cache.diskCandidate(false),
           "fresh blocks hold disk copies");
-  requireThrows<std::logic_error>([&] { cache.dropPage(leaf.id); },
-                                  "a block without a disk copy dropped its page");
+  rejects([&] { cache.dropPage(leaf.id); }, "KV cache block has no page to drop or no disk copy",
+          "a block without a disk copy dropped its page");
 
   // A copy of a resident block is redundant; the block stays a RAM leaf.
   cache.setSlot(leaf.id, std::make_shared<FakeSlot>());
@@ -441,22 +461,24 @@ void testDiskTierTransitions() {
               cache.chain(leaf.id).pages ==
                   std::vector<uint32_t>{acquired.pages[0], KvCache::noPage},
           "disk-only block did not match through the chain");
-  requireThrows<std::logic_error>([&] { cache.setSlot(leaf.id, nullptr); },
-                                  "a disk-only block was stripped instead of erased");
-  requireThrows<std::logic_error>([&] { cache.erase(root.id); },
-                                  "a parent with a disk child was erased");
+  rejects([&] { cache.setSlot(leaf.id, nullptr); },
+          "a disk-only KV cache block is erased, not stripped",
+          "a disk-only block was stripped instead of erased");
+  rejects([&] { cache.erase(root.id); }, "cannot evict a referenced KV cache block",
+          "a parent with a disk child was erased");
 
   // A user protects a disk copy; a transfer hides the block from every order.
   cache.retainActive(leaf.id);
   require(!cache.diskCandidate(false), "a used disk block stayed replaceable");
   cache.releaseActive(leaf.id);
   require(cache.diskCandidate(false).value().id == leaf.id, "released disk block left the order");
-  cache.setTransferring(leaf.id, true);
+  cache.setTransfer(leaf.id, KvCache::Transfer::Filling);
   require(!cache.diskCandidate(false), "a block in transfer stayed replaceable");
-  requireThrows<std::logic_error>([&] { cache.setTransferring(leaf.id, true); },
-                                  "a block in transfer was not marked as such");
-  requireThrows<std::logic_error>([&] { cache.erase(leaf.id); },
-                                  "a block in transfer was erased");
+  rejects([&] { cache.setTransfer(leaf.id, KvCache::Transfer::Draining); },
+          "KV cache block transfer state did not change",
+          "a block in transfer started another");
+  rejects([&] { cache.erase(leaf.id); }, "cannot evict a referenced KV cache block",
+          "a block in transfer was erased");
 
   // Adopting a page makes the block resident again while its content is on
   // the way; a writer that recomputes it meanwhile keeps its own page.
@@ -470,12 +492,12 @@ void testDiskTierTransitions() {
   require(writer.id == leaf.id && writer.physicalPage == acquired.pages[3],
           "a writer was switched to a page still being filled");
   pool.releasePage(acquired.pages[3], false);
-  cache.setTransferring(leaf.id, false);
+  cache.setTransfer(leaf.id, KvCache::Transfer::None);
   require(cache.evictionCandidate(0).value().id == leaf.id &&
               cache.diskCandidate(true).value().id == leaf.id,
           "restored block did not rejoin the orders");
-  requireThrows<std::logic_error>([&] { cache.adoptPage(leaf.id, acquired.pages[3]); },
-                                  "a resident block adopted a second page");
+  rejects([&] { cache.adoptPage(leaf.id, acquired.pages[3]); }, "KV cache block already has a page",
+          "a resident block adopted a second page");
 
   cache.erase(leaf.id);
   cache.erase(root.id);
@@ -518,8 +540,8 @@ void testDiskOnlyAdoptionAndPoison() {
   cache.dropPage(leaf.id);
   cache.adoptPage(leaf.id, acquired.pages[2]);
   cache.retainActive(leaf.id);
-  cache.setTransferring(leaf.id, true);
-  cache.setTransferring(leaf.id, false);
+  cache.setTransfer(leaf.id, KvCache::Transfer::Filling);
+  cache.setTransfer(leaf.id, KvCache::Transfer::None);
   cache.poison(leaf.id);
   require(!cache.find(root.id, leafTokens, {}) && cache.contains(leaf.id) &&
               cache.diskBlocks() == 0 && !cache.evictionCandidate(0) &&
@@ -569,12 +591,191 @@ void testMatchableExcludesPoisonedBlocks() {
           "an erased block stayed matchable");
 }
 
+
+// A cache whose requests may spill: a request's reference to a page marks
+// the block on it held, from its insertion on, until the last one goes; a
+// held block is in no order, so neither RAM reclaim nor quota takes it or
+// its copy. Without a spill policy nothing is held and quota strips a copy
+// requests still read through their pages, as it always has.
+void testRequestsHoldTheirBlocks() {
+  for (const bool spill : {true, false}) {
+    test::TestKvStorage storage(8, 100, 1, 10);
+    KvPool pool(storage, 8);
+    CacheRecency recency;
+    KvCache cache(pool, recency, spill);
+    auto acquired = pool.acquirePages(2);
+    require(acquired.granted(), "test pages were not acquired");
+    auto root = cache.insert(0, page(51), acquired.pages[0], {});
+    auto leaf = cache.insert(root.id, page(52), acquired.pages[1], {});
+    cache.setSlot(root.id, std::make_shared<FakeSlot>());
+    cache.setSlot(leaf.id, std::make_shared<FakeSlot>());
+    require(cache.held(root.id) == spill && cache.held(leaf.id) == spill &&
+                cache.heldCopies() == (spill ? 2u : 0u) && cache.diskCandidate(true).has_value() == !spill &&
+                cache.evictionCandidate(0).has_value() == !spill,
+            "a block a request holds was not held, or held without a spill policy");
+    // A second reference keeps the mark when the first goes.
+    cache.holdPage(acquired.pages[1]);
+    cache.unholdPage(acquired.pages[1]);
+    require(cache.held(leaf.id) == spill, "a block lost its mark while a request still held its page");
+    cache.unholdPage(acquired.pages[0]);
+    cache.unholdPage(acquired.pages[1]);
+    require(!cache.held(root.id) && !cache.held(leaf.id) && cache.heldCopies() == 0 &&
+                cache.diskCandidate(true).has_value() && cache.evictionCandidate(0).value().id == leaf.id,
+            "a block nothing holds did not rejoin the orders");
+    cache.holdPage(acquired.pages[1]);
+    require(cache.held(leaf.id) == spill && cache.heldCopies() == (spill ? 1u : 0u),
+            "a request's new reference did not hold the block");
+    if (spill)
+      rejects([&] { cache.erase(leaf.id); }, "cannot evict a referenced KV cache block",
+              "a held block was erased");
+    cache.unholdPage(acquired.pages[1]);
+    cache.checkInvariants();
+  }
+}
+
+// A block's page moves to the other form with its holders' references: a
+// spilled block keeps its index in RAM and its K/V in its copy alone, which
+// it cannot give up and quota takes only with the block, from a leaf; it is
+// a RAM leaf like any other, whose page frees at once. Back on a Full page
+// its copy is redundant again.
+void testSpilledBlocksTakeTheirPagesForm() {
+  test::TestKvStorage storage(16, 100, 4, 10);
+  KvPool pool(storage, 4);
+  CacheRecency recency;
+  KvCache cache(pool, recency, true);
+  auto acquired = pool.acquirePages(2);
+  require(acquired.granted(), "test pages were not acquired");
+  auto root = cache.insert(0, page(61), acquired.pages[0], {});
+  auto leaf = cache.insert(root.id, page(62), acquired.pages[1], {});
+  cache.setSlot(leaf.id, std::make_shared<FakeSlot>());
+  const KvPageMoveResult spilled = pool.movePages(std::array{acquired.pages[1]}, kv::PageForm::Index);
+  require(spilled.granted(), "the leaf's page did not move to the index form");
+  cache.followPages(spilled.moves);
+  const uint32_t indexPage = cache.page(leaf.id);
+  require(pool.form(indexPage) == kv::PageForm::Index && cache.indexBlocks() == 1 && cache.held(leaf.id) &&
+              cache.blockOn(indexPage) == leaf.id && cache.blockOn(acquired.pages[1]) == 0,
+          "the spilled block did not follow its page to the index form");
+  rejects([&] { cache.setSlot(leaf.id, nullptr); }, "copy holds its only K/V",
+          "a spilled block gave up its only K/V");
+  cache.unholdPage(acquired.pages[0]);
+  cache.unholdPage(indexPage);
+  require(!cache.diskCandidate(true) && cache.diskCandidate(false).value().id == leaf.id &&
+              cache.evictionCandidate(0).value().id == leaf.id,
+          "an idle spilled leaf was a redundant copy, or not the only copy or a RAM leaf");
+  cache.holdPage(indexPage);
+  const KvPageMoveResult restored = pool.movePages(std::array{indexPage}, kv::PageForm::Full);
+  require(restored.granted(), "the page did not move back to the Full form");
+  cache.followPages(restored.moves);
+  cache.unholdPage(cache.page(leaf.id));
+  require(cache.indexBlocks() == 0 && cache.diskCandidate(true).value().id == leaf.id &&
+              !cache.diskCandidate(false),
+          "a block back on a Full page did not hold a redundant copy");
+  cache.checkInvariants();
+}
+
+// A writer moves onto its block's page while a write reads it, whose bytes
+// are final, and keeps its own while a restore fills it. A disk-only block
+// that adopts the writer's page keeps its copy, which holds what another
+// command computed: the block's K/V has no copy until one of the page
+// replaces it, or the page goes and the copy holds the block's only K/V.
+// No request reads that copy, so it is no active KV, and quota may take it
+// beside the page the writer holds.
+void testWritersAndTheContentOfABlock() {
+  for (const bool spill : {true, false}) {
+    test::TestKvStorage storage(8, 100, 1, 10);
+    KvPool pool(storage, 8);
+    CacheRecency recency;
+    KvCache cache(pool, recency, spill);
+    auto acquired = pool.acquirePages(4);
+    require(acquired.granted(), "test pages were not acquired");
+    auto root = cache.insert(0, page(71), acquired.pages[0], {});
+    cache.setSlot(root.id, std::make_shared<FakeSlot>());
+    cache.setTransfer(root.id, KvCache::Transfer::Draining);
+    require(cache.insert(0, page(71), acquired.pages[1], {}).physicalPage == acquired.pages[0],
+            "a writer kept its own page beside a page being written");
+    cache.setTransfer(root.id, KvCache::Transfer::None);
+    cache.setTransfer(root.id, KvCache::Transfer::Filling);
+    require(cache.insert(0, page(71), acquired.pages[1], {}).physicalPage == acquired.pages[1],
+            "a writer moved onto a page being filled");
+    cache.setTransfer(root.id, KvCache::Transfer::None);
+
+    auto leaf = cache.insert(root.id, page(72), acquired.pages[2], {});
+    cache.setSlot(leaf.id, std::make_shared<FakeSlot>());
+    cache.unholdPage(acquired.pages[2]);
+    cache.dropPage(leaf.id);
+    const auto adopted = cache.insert(root.id, page(72), acquired.pages[3], {});
+    require(adopted.id == leaf.id && adopted.physicalPage == acquired.pages[3] && cache.slot(leaf.id) &&
+                !cache.kvCopied(leaf.id) && cache.diskBlocks() == 2,
+            "a disk-only block a writer filled gave its copy up, or took it for a copy of the page");
+    const auto redundant = cache.diskCandidate(true);
+    require(cache.held(leaf.id) == spill && cache.heldCopies() == (spill ? 1u : 0u) && redundant &&
+                redundant->id == (spill ? leaf.id : root.id),
+            "a copy of another command's K/V beside a held page was active KV, or quota could not take it");
+    cache.checkInvariants();
+    cache.unholdPage(acquired.pages[3]);
+    cache.dropPage(leaf.id);
+    require(cache.kvCopied(leaf.id), "the copy of a block without its page did not hold its K/V");
+    const auto writer = pool.acquirePages(1);
+    require(writer.granted() && cache.insert(root.id, page(72), writer.pages[0], {}).id == leaf.id &&
+                !cache.kvCopied(leaf.id),
+            "a disk-only block a writer filled again took its copy for one of the page");
+    cache.setSlot(leaf.id, std::make_shared<FakeSlot>());
+    require(cache.kvCopied(leaf.id) && cache.rewrites() == 1 && cache.heldCopies() == (spill ? 2u : 0u),
+            "a copy of the page did not replace the copy of another command's K/V as active KV");
+    for (const uint32_t held : {acquired.pages[0], acquired.pages[1], writer.pages[0]})
+      cache.unholdPage(held);
+    cache.checkInvariants();
+  }
+}
+
+// A poisoned block that requests hold keeps its copy, which they may still
+// read; it leaves with the block once the last of them lets go. A block
+// written once more after its copy went counts as written again. A reader
+// holds a copy while a request holds its block; one that outlives the
+// holders, as a command's cut does while the engine applies its results,
+// keeps the slot of a block that left until it lets go, and the invariants
+// find it while the block stays.
+void testCopiesLeaveWithTheirBlocks() {
+  test::TestKvStorage storage(8, 100, 1, 10);
+  KvPool pool(storage, 8);
+  CacheRecency recency;
+  KvCache cache(pool, recency, true);
+  auto acquired = pool.acquirePages(2);
+  require(acquired.granted(), "test pages were not acquired");
+  auto root = cache.insert(0, page(81), acquired.pages[0], {});
+  auto leaf = cache.insert(root.id, page(82), acquired.pages[1], {});
+  cache.setSlot(leaf.id, std::make_shared<FakeSlot>());
+  cache.poison(leaf.id);
+  require(cache.contains(leaf.id) && cache.slot(leaf.id) && cache.diskBlocks() == 1,
+          "a held poisoned block lost its copy");
+  cache.unholdPage(acquired.pages[1]);
+  require(!cache.contains(leaf.id) && cache.diskBlocks() == 0,
+          "a poisoned block outlived the last request that held it");
+
+  cache.setSlot(root.id, std::make_shared<FakeSlot>());
+  cache.setSlot(root.id, nullptr);
+  cache.setSlot(root.id, std::make_shared<FakeSlot>());
+  require(cache.rewrites() == 1, "a block written again after its copy went was not counted");
+  std::shared_ptr<engine::KvDiskSlot> reader = cache.slot(root.id);
+  const std::weak_ptr<engine::KvDiskSlot> slot = reader;
+  cache.checkInvariants();
+  cache.unholdPage(acquired.pages[0]);
+  rejects([&] { cache.checkInvariants(); }, "has no reader",
+          "a copy whose block nothing holds kept a reader unnoticed");
+  cache.erase(root.id);
+  require(!cache.contains(root.id) && cache.diskBlocks() == 0 && !slot.expired(),
+          "a block whose copy a reader holds did not leave, or took the copy from the reader");
+  reader.reset();
+  require(slot.expired(), "the copy outlived its last reader");
+  cache.checkInvariants();
+}
 } // namespace
 
 int main() {
   try {
     testExactChainedBlocksAndPhysicalOwnership();
     testImageIdentityKeysBlocks();
+    testBlockIdentitiesArePinned();
     testErasedLeafParentInheritsRecency();
     testInputValidation();
     testCandidateOrderThroughChurn();
@@ -582,6 +783,10 @@ int main() {
     testDiskTierTransitions();
     testDiskOnlyAdoptionAndPoison();
     testMatchableExcludesPoisonedBlocks();
+    testRequestsHoldTheirBlocks();
+    testSpilledBlocksTakeTheirPagesForm();
+    testWritersAndTheContentOfABlock();
+    testCopiesLeaveWithTheirBlocks();
     std::cout << "KV page cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {

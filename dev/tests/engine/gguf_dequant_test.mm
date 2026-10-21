@@ -50,9 +50,9 @@ int main(int argc, char **argv) {
         const MetalBuffer w1 = kQuantFormats[f].plane1_bytes ? upload(backend, planes.w1) : meta;
         const MetalBuffer output = sharedBuffer(backend, uint64_t{N} * K * 2);
         CommandGraph graph;
-        graph.add(std::string("gguf_test_dequant_") + fmtName(f), {w0, w1, meta, output}, GgufDecodeParams{K, 1, N, 0},
+        graph.add(std::string("gguf_test_dequant_") + fmtName(f), {w0, w1, meta, output}, GgufDecodeParams{K, 1, N, 0, 0},
                   {N * (K / kGroup) / kThreads, 1, 1}, {kThreads, 1, 1});
-        static_cast<void>(backend.submitCommand(graph.dispatches()));
+        static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
         const auto *got = static_cast<const uint16_t *>(output.contents());
         size_t differ = 0;
         for (size_t i = 0; i < values.size(); ++i) differ += got[i] != f2h(values[i]);

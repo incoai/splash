@@ -1,6 +1,7 @@
 #include "ops/RowCopy.hpp"
 
 #include "metal/abi/RowCopy.h"
+#include "ops/BufferExtent.hpp"
 
 #include <stdexcept>
 #include <utility>
@@ -10,13 +11,10 @@ namespace {
 
 constexpr uint32_t kThreads = metal::CommandGraph::kDefaultThreads;
 
-// Whether `buffer` holds `rows` rows of `width` values of `region`.
-bool holds(const metal::MetalBuffer &buffer, RowRegion region, uint32_t rows,
-           uint32_t width) {
-  return region.column + uint64_t{width} <= region.stride &&
-         buffer.sizeBytes() >=
-             ((uint64_t{region.row} + rows - 1) * region.stride +
-              region.column + width) * 2;
+// The bytes from a buffer's start to the end of `rows` rows of `width`
+// values of `region`, which the copy reads or writes.
+uint64_t regionBytes(RowRegion region, uint32_t rows, uint32_t width) {
+  return rowBytes(uint64_t{region.row} + rows, region.stride, uint64_t{region.column} + width, 2);
 }
 
 } // namespace
@@ -24,9 +22,11 @@ bool holds(const metal::MetalBuffer &buffer, RowRegion region, uint32_t rows,
 void RowCopy::add(metal::CommandGraph &graph, metal::MetalBuffer source,
                   RowRegion from, metal::MetalBuffer destination, RowRegion to,
                   uint32_t rows, uint32_t width) {
-  if (!rows || !width || !holds(source, from, rows, width) ||
-      !holds(destination, to, rows, width))
+  if (!rows || !width || from.column + uint64_t{width} > from.stride ||
+      to.column + uint64_t{width} > to.stride)
     throw std::invalid_argument("invalid row copy");
+  requireBytes(source, regionBytes(from, rows, width), "row copy source");
+  requireBytes(destination, regionBytes(to, rows, width), "row copy destination");
   const RowCopyParams params{rows,        width,     from.row,
                              from.stride, from.column, to.row,
                              to.stride,   to.column};

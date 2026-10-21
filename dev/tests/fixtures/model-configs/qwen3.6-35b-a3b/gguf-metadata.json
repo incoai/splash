@@ -1,0 +1,29 @@
+{
+  "float": {
+    "qwen35moe.attention.layer_norm_rms_epsilon": 9.999999974752427e-07,
+    "qwen35moe.rope.freq_base": 10000000.0
+  },
+  "string": {
+    "general.architecture": "qwen35moe"
+  },
+  "unsigned": {
+    "qwen35moe.attention.head_count": 16,
+    "qwen35moe.attention.head_count_kv": 2,
+    "qwen35moe.attention.key_length": 256,
+    "qwen35moe.attention.value_length": 256,
+    "qwen35moe.block_count": 40,
+    "qwen35moe.context_length": 262144,
+    "qwen35moe.embedding_length": 2048,
+    "qwen35moe.expert_count": 256,
+    "qwen35moe.expert_feed_forward_length": 512,
+    "qwen35moe.expert_shared_feed_forward_length": 512,
+    "qwen35moe.expert_used_count": 8,
+    "qwen35moe.full_attention_interval": 4,
+    "qwen35moe.rope.dimension_count": 64,
+    "qwen35moe.ssm.conv_kernel": 4,
+    "qwen35moe.ssm.group_count": 16,
+    "qwen35moe.ssm.inner_size": 4096,
+    "qwen35moe.ssm.state_size": 128,
+    "qwen35moe.ssm.time_step_rank": 32
+  }
+}

@@ -15,8 +15,9 @@ struct RowRegion final {
 };
 
 // Copies rows of bf16 values between two row regions: a finished prompt's
-// last prefill row into the head's input, and a capture layer's output into
-// its slot of the draft's captured target hidden rows.
+// last prefill row into the head's input, a capture layer's output into its
+// slot of the draft's captured target hidden rows, and an image's embedding
+// rows over its placeholder rows of a prefill chunk's hidden rows.
 class RowCopy final {
 public:
   // Copies `rows` rows of `width` values from `source` at `from` to

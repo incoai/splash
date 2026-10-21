@@ -65,11 +65,14 @@ class RequestFailed(EngineRuntimeError):
         message: bytes,
         *,
         retryable: bool = False,
+        retry_after_seconds: int = 0,
     ):
         self.request_id = request_id
         self.code = code
         self.message_bytes = message
         self.retryable = retryable
+        # When a retry may succeed, in seconds; 0 for at once.
+        self.retry_after_seconds = retry_after_seconds
         text = message.decode("utf-8", errors="replace")
         machine_code = code.decode("ascii", errors="replace")
         super().__init__(f"request {request_id} failed [{machine_code}]: {text}")
@@ -80,6 +83,7 @@ class RequestFailed(EngineRuntimeError):
             self.code,
             self.message_bytes,
             retryable=self.retryable,
+            retry_after_seconds=self.retry_after_seconds,
         )
 
 
@@ -113,6 +117,11 @@ FailureListener: TypeAlias = Callable[[EngineRuntimeError, float], None]
 
 _READ_CHUNK_BYTES = 64 * 1024
 _MAX_U64 = (1 << 64) - 1
+
+# How long the engine's loop may leave a status request unanswered before its
+# engine counts as stuck and fails: far above any legitimate tick (release
+# passes take <= 0.5 s, pipeline compiles < 1 s).
+STATUS_ANSWER_LIMIT_SECONDS = 30.0
 
 
 def _remaining(deadline: float) -> float:
@@ -176,7 +185,7 @@ class RuntimeCall:
         self._prompt_tokens = len(frame.prompt_tokens)
         self._logical_max = frame.logical_max_output_tokens
         self._score_tokens = len(frame.score_tokens)
-        self._return_progress = frame.return_progress
+        self._return_progress = bool(frame.flags & wire.RequestFlag.RETURN_PROGRESS)
         self.mask_provider = request.mask_provider
         self.image_owner = request.image_owner
         self._on_event = on_event
@@ -332,13 +341,17 @@ class RuntimeCall:
                 and not completion_tokens
             ):
                 raise ProtocolFatal("DoneEvent arrived before StartEvent")
-            if (
-                done.reason is wire.FinishReason.LENGTH
-                and completion_tokens != logical_max
+            # Only a bound of the engine's own ends a request with LENGTH short of
+            # its logical maximum.
+            if done.reason is wire.FinishReason.LENGTH and (
+                completion_tokens >= logical_max
+                if done.bounded
+                else completion_tokens != logical_max
             ):
                 raise ProtocolFatal(
                     f"length-finished DoneEvent has {completion_tokens} tokens; "
-                    f"expected logical maximum {logical_max}"
+                    f"expected {'fewer than ' if done.bounded else ''}logical "
+                    f"maximum {logical_max}"
                 )
             expected_scores = self._score_tokens
             if expected_scores:
@@ -417,24 +430,25 @@ class MultiplexedRuntime:
     _shutdown_grace_seconds = 15.0
     # How long a started frame write may make no progress.
     _io_timeout_seconds = 5.0
-    # CPU token-mask workers; None lets the executor choose.
-    _mask_workers = None
     # Allow the native 120-second command watchdog to finish before fencing it.
     _cancel_grace_seconds = 150.0
     # While calls are pending, how often the loop must answer a status request.
     _liveness_interval_seconds = 10.0
-    # Far above any legitimate tick: release passes take <= 0.5 s, pipeline
-    # compiles < 1 s.
-    _liveness_timeout_seconds = 30.0
 
     def __init__(
         self,
         command: Sequence[str] | None = None,
         *,
+        # The command of every engine started once one was Ready, from that
+        # first engine's ReadyEvent: the server's keeps its context. None
+        # starts `command` again.
+        relaunch_command: Callable[[wire.ReadyEvent], Sequence[str]] | None = None,
         process_factory: Callable[[], ProcessLike] | None = None,
         startup_timeout: float = 30.0,
         pending_limit: int = 64,
-        eager_start: bool = True,
+        eager_start: bool = False,
+        # CPU token-mask workers; None lets the executor choose.
+        mask_workers: int | None = None,
     ):
         if process_factory is None and not command:
             raise ValueError("command or process_factory is required")
@@ -444,7 +458,8 @@ class MultiplexedRuntime:
             raise ValueError("pending_limit must be positive")
 
         self._command = tuple(command) if command else None
-        self._process_factory = process_factory or self._default_process_factory
+        self._relaunch_command = relaunch_command
+        self._process_factory = process_factory
         self._startup_timeout = startup_timeout
         self._pending_limit = pending_limit
         self._admission_slots = threading.BoundedSemaphore(pending_limit)
@@ -452,7 +467,7 @@ class MultiplexedRuntime:
         # necessarily finishes. Bound queued + running jobs independently.
         self._mask_slots = threading.BoundedSemaphore(pending_limit)
         self._mask_executor = ThreadPoolExecutor(
-            max_workers=self._mask_workers,
+            max_workers=mask_workers,
             thread_name_prefix="splash-mask",
         )
 
@@ -489,10 +504,20 @@ class MultiplexedRuntime:
         if eager_start:
             self._ensure_process()
 
-    def _default_process_factory(self) -> ProcessLike:
-        assert self._command is not None
+    def _launch_command(self) -> tuple[str, ...] | None:
+        """The command of the engine to start, a relaunch's once an engine
+        was Ready; None without a command, which a process factory stands
+        in for."""
+        with self._state_lock:
+            first = self._first_ready
+        if self._command is None or first is None or self._relaunch_command is None:
+            return self._command
+        return tuple(self._relaunch_command(first))
+
+    @staticmethod
+    def _spawn(command: Sequence[str]) -> ProcessLike:
         return subprocess.Popen(
-            self._command,
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=None,
@@ -623,8 +648,20 @@ class MultiplexedRuntime:
         the request unanswered for `timeout` fails the engine it ran."""
         return self._status(timeout, None, fail_unanswered)
 
+    def release_weights(self, timeout: float = 5.0) -> wire.StatusJsonEvent:
+        """Asks the engine to give its weights back now. It does so only while
+        it holds no request and no restore is under way, with
+        `--idle-release off` too; the status JSON that answers shows which
+        (`weights`: `released` and not `restoring`). The next request restores
+        them, as after the idle release."""
+        return self._status(timeout, None, False, release=True)
+
     def _status(
-        self, timeout: float, generation: int | None, fail_unanswered: bool
+        self,
+        timeout: float,
+        generation: int | None,
+        fail_unanswered: bool,
+        release: bool = False,
     ) -> wire.StatusJsonEvent:
         """Asks the engine of ``generation``, or the current one when None, so
         that a probe never measures a newer engine."""
@@ -642,7 +679,11 @@ class MultiplexedRuntime:
             waiter = _StatusWaiter()
             self._status_waiters[correlation_id] = waiter
         try:
-            encoded = wire.serialize_message(wire.StatusRequestFrame(correlation_id))
+            encoded = wire.serialize_message(
+                wire.ReleaseRequestFrame(correlation_id)
+                if release
+                else wire.StatusRequestFrame(correlation_id)
+            )
             self._write_bytes(encoded, generation, deadline=deadline)
         except BaseException:
             with self._state_lock:
@@ -824,7 +865,12 @@ class MultiplexedRuntime:
 
         process = None
         try:
-            process = self._process_factory()
+            command = self._launch_command()
+            process = (
+                self._spawn(command)
+                if self._process_factory is None
+                else self._process_factory()
+            )
             if process.stdin is None or process.stdout is None:
                 raise EngineUnhealthy(
                     "native process did not expose binary stdin/stdout"
@@ -861,7 +907,7 @@ class MultiplexedRuntime:
                 self._ready_message = None
                 self._last_status = None
                 attempt.generation = generation
-                self._crash_trace.start_generation(generation, process.pid)
+                self._crash_trace.start_generation(generation, process.pid, command)
                 reader = threading.Thread(
                     target=self._reader_loop,
                     args=(process, generation),
@@ -1032,7 +1078,7 @@ class MultiplexedRuntime:
                     return
             try:
                 self._status(
-                    self._liveness_timeout_seconds, generation, fail_unanswered=True
+                    STATUS_ANSWER_LIMIT_SECONDS, generation, fail_unanswered=True
                 )
             except (EngineRuntimeError, TimeoutError):
                 # Left unanswered, the generation has failed. Otherwise it
@@ -1082,10 +1128,10 @@ class MultiplexedRuntime:
             self._fail_generation(generation, error)
 
     def _issue_error(self, issue: wire.ProtocolIssue) -> EngineRuntimeError:
+        # The parser and the decoder fail the stream, or the engine when an
+        # allocation fails; a request's own failure arrives as an ErrorEvent.
         if issue.failure_class is wire.FailureClass.ENGINE_UNHEALTHY:
             return EngineUnhealthy(issue.describe())
-        # Request-scoped decode issues cannot be trusted on the engine->client
-        # stream unless they arrive as a valid ErrorEvent.
         return ProtocolFatal(issue.describe())
 
     def _dispatch_message(self, generation: int, message: wire.EngineEvent) -> None:
@@ -1117,8 +1163,11 @@ class MultiplexedRuntime:
                     first.max_concurrent_requests,
                     first.vision,
                 ):
-                    # The frontend serves the first engine's limits. Every
-                    # relaunch would load the model to announce them again.
+                    # The frontend serves the first engine's limits, and the
+                    # server's relaunch command keeps its context. A relaunch
+                    # that still announces others, as once the Mac's memory
+                    # budget shrank, would at every relaunch, each loading
+                    # the model to announce them again.
                     self._fatal_error = EngineUnhealthy(
                         "native context window, concurrency or vision "
                         "changed; restart the Splash server"
@@ -1195,6 +1244,7 @@ class MultiplexedRuntime:
                     event.code,
                     event.message,
                     retryable=event.retryable,
+                    retry_after_seconds=event.retry_after_seconds,
                 ),
             )
             return

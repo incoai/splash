@@ -96,10 +96,16 @@ FrameType write(Writer &out, const RequestFrame &request) {
   out.f32(request.sampling.repetitionPenalty);
   out.f32(request.sampling.minP);
   out.u64(request.sampling.seed);
-  out.u8(request.returnProgress);
   out.u32(static_cast<uint32_t>(request.scoreTokens.size()));
   out.u32(request.generationPromptTokens);
   out.u32(request.flags);
+  out.u64(request.cacheSalt.lo);
+  out.u64(request.cacheSalt.hi);
+  const ThinkingBudget thinking =
+      request.thinkingBudget.value_or(ThinkingBudget{.tokens = kNoThinkingBudget});
+  out.u32(thinking.tokens);
+  out.u32(static_cast<uint32_t>(thinking.end.size()));
+  out.u32(thinking.alsoEnds);
   out.words(request.promptTokens);
   for (const ImageSpan &span : request.imageSpans) {
     out.u32(span.offset);
@@ -111,6 +117,7 @@ FrameType write(Writer &out, const RequestFrame &request) {
   }
   out.raw(request.imagePixels);
   out.words(request.scoreTokens);
+  out.words(thinking.end);
   return FrameType::Request;
 }
 
@@ -132,6 +139,11 @@ FrameType write(Writer &out, const StatusRequestFrame &request) {
   return FrameType::StatusRequest;
 }
 
+FrameType write(Writer &out, const ReleaseRequestFrame &request) {
+  out.u64(request.correlationId);
+  return FrameType::ReleaseRequest;
+}
+
 struct Header {
   FrameType type;
   uint64_t payloadBytes;
@@ -142,11 +154,10 @@ Header readHeader(std::span<const uint8_t> bytes) {
   Reader in(bytes);
   const auto magic = in.bytes(kMagic.size());
   if (!std::equal(magic.begin(), magic.end(), kMagic.begin()) ||
-      in.u16() != kProtocolVersion || in.u16() != kFrameHeaderBytes) {
+      in.u16() != kProtocolVersion) {
     throw std::runtime_error("native frame header is invalid");
   }
   const auto type = static_cast<FrameType>(in.u16());
-  static_cast<void>(in.u16()); // flags
   return {type, in.u64()};
 }
 
@@ -192,11 +203,14 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     DoneEvent event;
     event.requestId = in.u64();
     event.reason = static_cast<engine::EngineFinishReason>(in.u8());
+    event.bounded = in.u8() != 0;
     event.promptTokens = in.u32();
     event.completionTokens = in.u32();
     event.prefillMicros = in.u64();
     event.decodeMicros = in.u64();
     event.wallMicros = in.u64();
+    event.deduplicatedTokens = in.u32();
+    event.speculation = {in.u32(), in.u32(), in.u32()};
     event.optionLogits.resize(in.u32());
     for (float &logit : event.optionLogits)
       logit = in.f32();
@@ -206,6 +220,7 @@ EngineEvent decodeEvent(FrameType type, Reader &in) {
     ErrorEvent event;
     event.failureClass = static_cast<FailureClass>(in.u8());
     event.retryable = in.u8() != 0;
+    event.retryAfterSeconds = in.u32();
     event.requestId = in.u64();
     const uint32_t codeBytes = in.u32();
     const uint32_t messageBytes = in.u32();
@@ -235,11 +250,8 @@ std::vector<uint8_t> serialize(const ClientMessage &message) {
   frame.raw(std::span(reinterpret_cast<const uint8_t *>(kMagic.data()),
                       kMagic.size()));
   frame.u16(kProtocolVersion);
-  frame.u16(static_cast<uint16_t>(kFrameHeaderBytes));
   frame.u16(static_cast<uint16_t>(type));
-  frame.u16(0);
   frame.u64(bytes.size());
-  frame.u32(0);
   frame.raw(bytes);
   return frame.take();
 }

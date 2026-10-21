@@ -1,6 +1,7 @@
 #include "ProtocolPeer.hpp"
 #include "Q8PageFormatReference.hpp"
 #include "TestChecks.hpp"
+#include "TestEngine.hpp"
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
 #include "TestStatus.hpp"
@@ -11,17 +12,16 @@
 #import <Foundation/Foundation.h>
 
 #include <cstdlib>
-#include <filesystem>
-#include <fstream>
 #include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -31,122 +31,8 @@ using namespace splash;
 using namespace splash::engine;
 namespace runtime = splash::engine;
 
+using splash::test::rejects;
 using splash::test::require;
-
-class TemporaryModelRoot final {
-public:
-  TemporaryModelRoot() {
-    path_ = std::filesystem::temp_directory_path() /
-            ("splash-geometry-" +
-             std::string([NSUUID UUID].UUIDString.UTF8String));
-    if (!std::filesystem::create_directory(path_))
-      throw std::runtime_error("unable to create temporary model root");
-    std::filesystem::create_directories(path_ / "tokenizer");
-    std::ofstream config(path_ / "tokenizer" / "config.json");
-    config << R"({"text_config":{"model_type":"qwen3_5_text","max_position_embeddings":262144,"hidden_size":5120,"vocab_size":248320}})";
-    if (!config)
-      throw std::runtime_error("unable to write tokenizer config");
-  }
-  ~TemporaryModelRoot() { std::filesystem::remove_all(path_); }
-
-  const std::filesystem::path &path() const noexcept { return path_; }
-  void write(std::string_view document) const {
-    std::ofstream output(path_ / "manifest.json");
-    output << document;
-    if (!output)
-      throw std::runtime_error("unable to write temporary model manifest");
-  }
-
-private:
-  std::filesystem::path path_;
-};
-
-std::string executionManifest(uint32_t draftRows = 8,
-                              std::string_view extraGeometry = {}) {
-  std::ostringstream out;
-  out << R"({"schema_version":3,"model":"Qwen3.8-27B-DFlash2","format":{"name":"splash-packed-q4","q4_bits":4,"q4_group_size":64,"q4_storage_n":256,"section_alignment_bytes":16384,"target_layer_magic":"MDFL0006","draft_layer_magic":"MDFD0004","vision_magic":"MDFV0001"},"execution_geometry":{)"
-      << R"("draft_proposal_tokens":7,)"
-      << "\"draft_query_rows\":" << draftRows << ','
-      << R"("draft_sliding_window":2048,)"
-      << R"("maximum_batch_width":4,)"
-      << R"("prefill_token_budget":2048,)"
-      << R"("target_kv_block_tokens":32,)"
-      << R"("target_verify_rows":8)" << extraGeometry << "}}";
-  return out.str();
-}
-
-void testInstalledManifestBindsExecutionGeometry() {
-  TemporaryModelRoot root;
-  root.write(executionManifest());
-  // The sources' identity is the digest of the record naming them.
-  const std::string sourceIdentity = model::inspectModelPackage(root.path()).sourceIdentity;
-  require(sourceIdentity == model::weightDigest(executionManifest()),
-          "the sources' identity is not the manifest's digest");
-
-  root.write(executionManifest(7));
-  try {
-    static_cast<void>(model::inspectModelPackage(root.path()));
-    throw std::runtime_error("geometry mismatch was accepted");
-  } catch (const std::invalid_argument &error) {
-    require(std::string_view(error.what()).find("draft_query_rows") !=
-                std::string_view::npos,
-            "geometry mismatch did not identify its field");
-  }
-
-  root.write(executionManifest(8, R"(,"description":"package metadata")"));
-  require(model::inspectModelPackage(root.path()).sourceIdentity != sourceIdentity,
-          "another manifest named the same sources");
-
-  // A whole number written as a float, as Python writes 1e7, is that
-  // integer; a fraction is not one.
-  std::string floatRows = executionManifest();
-  const std::string rows = "\"draft_query_rows\":8,";
-  const size_t rowsAt = floatRows.find(rows);
-  require(rowsAt != std::string::npos, "test manifest lost draft rows");
-  root.write(std::string(floatRows).replace(rowsAt, rows.size(),
-                                            "\"draft_query_rows\":8.0,"));
-  static_cast<void>(model::inspectModelPackage(root.path()));
-  root.write(floatRows.replace(rowsAt, rows.size(),
-                               "\"draft_query_rows\":8.5,"));
-  try {
-    static_cast<void>(model::inspectModelPackage(root.path()));
-    throw std::runtime_error("fractional geometry was accepted");
-  } catch (const std::invalid_argument &error) {
-    require(std::string_view(error.what()).find("draft_query_rows") !=
-                std::string_view::npos,
-            "fractional geometry did not identify its field");
-  }
-
-  std::string missingGeometry = executionManifest();
-  const std::string requiredField = "\"draft_sliding_window\":2048,";
-  const size_t field = missingGeometry.find(requiredField);
-  require(field != std::string::npos, "test manifest lost required geometry");
-  missingGeometry.erase(field, requiredField.size());
-  root.write(missingGeometry);
-  try {
-    static_cast<void>(model::inspectModelPackage(root.path()));
-    throw std::runtime_error("missing geometry field was accepted");
-  } catch (const std::invalid_argument &error) {
-    require(std::string_view(error.what()).find("draft_sliding_window") !=
-                std::string_view::npos,
-            "missing geometry field did not identify its name");
-  }
-
-  std::string wrongStorage = executionManifest();
-  const size_t storage = wrongStorage.find("\"q4_storage_n\":256");
-  require(storage != std::string::npos, "test manifest lost Q4 storage");
-  wrongStorage.replace(storage, std::string("\"q4_storage_n\":256").size(),
-                       "\"q4_storage_n\":128");
-  root.write(wrongStorage);
-  try {
-    static_cast<void>(model::inspectModelPackage(root.path()));
-    throw std::runtime_error("wrong Q4 storage was accepted");
-  } catch (const std::invalid_argument &error) {
-    require(std::string_view(error.what()).find("q4_storage_n") !=
-                std::string_view::npos,
-            "Q4 storage mismatch did not identify the weight format");
-  }
-}
 
 // The identity reports the loaded model's digests in lowercase hex and the
 // KV layout as loaded; a malformed digest or a missing build id fails before
@@ -157,29 +43,27 @@ void testRuntimeCacheIdentityReportsTheLoadedModel() {
   const std::string combined(64, 'A');
   const std::string target(64, 'c');
   const engine::RuntimeCacheIdentity int8 =
-      engine::makeRuntimeCacheIdentity(combined, target, "build", int8Layout);
+      engine::makeRuntimeCacheIdentity(combined, target, "build", int8Layout, {});
   require(int8.modelLayoutSha256 == std::string(64, 'a') &&
               int8.targetModelSha256 == target && int8.buildId == "build" &&
               int8.kvLayout == int8Layout,
           "the cache identity did not report the loaded model");
   const engine::RuntimeCacheIdentity bf16 =
-      engine::makeRuntimeCacheIdentity(combined, target, "build", bf16Layout);
+      engine::makeRuntimeCacheIdentity(combined, target, "build", bf16Layout, {});
   require(bf16.kvLayout == bf16Layout && bf16.kvLayout.format != int8.kvLayout.format,
           "the cache identity did not report the KV format");
-  const auto rejected = [&](std::string_view combinedDigest,
-                            std::string_view targetDigest, std::string_view build) {
-    try {
-      static_cast<void>(engine::makeRuntimeCacheIdentity(combinedDigest, targetDigest,
-                                                         build, int8Layout));
-    } catch (const std::invalid_argument &) {
-      return true;
-    }
-    return false;
+  const auto identity = [&](std::string_view combinedDigest, std::string_view targetDigest,
+                            std::string_view build) {
+    static_cast<void>(
+        engine::makeRuntimeCacheIdentity(combinedDigest, targetDigest, build, int8Layout, {}));
   };
-  require(rejected(std::string(63, 'a'), target, "build") &&
-              rejected(combined, std::string(63, 'c') + 'g', "build") &&
-              rejected(combined, target, ""),
-          "a malformed digest or an empty build id was accepted");
+  rejects([&] { identity(std::string(63, 'a'), target, "build"); },
+          "manifest SHA-256 must contain exactly 64 hex characters",
+          "a digest of 63 characters was accepted");
+  rejects([&] { identity(combined, std::string(63, 'c') + 'g', "build"); },
+          "manifest SHA-256 is not hexadecimal", "a digest that is not hexadecimal was accepted");
+  rejects([&] { identity(combined, target, ""); }, "runtime build id is required",
+          "an empty build id was accepted");
 }
 
 DeviceCapabilities device() {
@@ -223,11 +107,6 @@ ActualMemoryReport validActual(const EngineMemoryPlan &plan) {
   return actual;
 }
 
-class State final : public CompositeState {
-public:
-  uint64_t bytes() const noexcept override { return 64; }
-};
-
 class Executor final : public model::RuntimeModel {
 public:
   explicit Executor(int throwingStep = -1) : throwingStep_(throwingStep) {}
@@ -262,9 +141,12 @@ public:
                                  completion);
   }
   uint64_t snapshotBytes() const noexcept override { return 64; }
-  std::shared_ptr<const CompositeState> snapshot(uint64_t) override {
-    return std::make_shared<State>();
+  std::shared_ptr<StateReservation> reserveState(uint64_t, uint32_t,
+                                                 metal::AllocationFailure &refusal) override {
+    refusal = metal::AllocationFailure::EngineBudget;
+    return {};
   }
+  std::shared_ptr<const CompositeState> snapshot(uint64_t) override { return {}; }
   uint64_t reclaimIdleState(bool, model::IdleMemory) noexcept override { return 0; }
   std::optional<std::string> provideMask(uint64_t,
                                          std::span<const uint32_t>) override {
@@ -320,7 +202,7 @@ public:
         resources_(pool_, nullptr, nullptr),
         executor_(throwingStep),
         loop_(
-            loopConfig(), resources_, executor_,
+            loopConfig(), metal::kResidencyKeepAliveSeconds, resources_, executor_,
             [this, failReadyWrite](std::span<const uint8_t> bytes) {
               if (failReadyWrite) {
                 throw std::runtime_error("injected output failure");
@@ -336,10 +218,11 @@ public:
   const std::vector<uint8_t> &output() const noexcept { return output_; }
 
 private:
-  static engine::NativeLoopConfig loopConfig() {
-    engine::NativeLoopConfig config;
-    config.engine.maxContext = 1024;
-    return config;
+  engine::NativeLoopConfig loopConfig() {
+    return {.engine = test::engineConfig({.maxContext = 1024}),
+            .metrics = &metrics_,
+            .weights = &weights_,
+            .weightAdmission = test::admitAll};
   }
 
   test::TestKvStorage backing_;
@@ -347,19 +230,22 @@ private:
   engine::Cache resources_;
   Executor executor_;
   std::vector<uint8_t> output_;
+  RuntimeMetrics metrics_;
+  test::Weights weights_;
   engine::NativeRuntime loop_;
 };
 
 void testAllNativeWarmupsPrecedeReady() {
   const EngineMemoryPlan plan = memoryPlan();
   Harness harness;
-  require(!harness.loop().ready() && harness.output().empty(),
+  require(harness.output().empty(),
           "runtime became visible before warmup");
   auto report = engine::RuntimeBootstrap::requireWarmupAndAnnounce(
       plan, harness.executor(), [&] { return validActual(plan); },
       harness.loop());
+  const auto events = protocol::peer::decodeEvents(harness.output());
   require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid &&
-              harness.loop().ready() && !harness.output().empty(),
+              events.size() == 1 && std::holds_alternative<protocol::ReadyEvent>(events.front()),
           "successful native bootstrap was incomplete");
   require(harness.executor().calls == std::vector<int>({0, 1, 2, 3, 4, 5}),
           "bootstrap did not warm fixed prefill and B1/B2/B3/B4 in order");
@@ -377,8 +263,7 @@ RuntimeBootstrapReport warmup(Harness &harness, const EngineMemoryPlan &plan) {
 
 void requireReadyWithoutReducingConcurrency(
     Harness &harness, const RuntimeBootstrapReport &report) {
-  require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid &&
-              harness.loop().ready(),
+  require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid,
           "memory-limited warmup did not become ready");
   const auto events = protocol::peer::decodeEvents(harness.output());
   require(events.size() == 1, "bootstrap did not emit one complete Ready frame");
@@ -462,16 +347,20 @@ void testResourceFailureClassificationSurvivesBootstrap() {
       for (const char *message : {
                "currently available; close memory-heavy applications and retry",
                "different diagnostic wording"}) {
-        RuntimeResourcesError resourceError(stage, message, "{\"budget\":1}",
-                                             "budget details", failure);
+        RuntimeResourcesError resourceError(stage, message, "budget details",
+                                             failure);
         RuntimeBootstrapError error(resourceError);
         const auto &report = error.report();
         require(report.stage == RuntimeBootstrapStage::ResourceAssembly &&
+                    report.resourceStage == stage &&
                     report.resourceFailure == failure &&
                     report.message == message &&
-                    report.memoryPlanJson == "{\"budget\":1}" &&
                     report.budgetDescription == "budget details",
                 "bootstrap lost resource failure classification or diagnostics");
+        require(report.describe().starts_with(
+                    "runtime bootstrap failed [resource_assembly/" +
+                    std::string(runtimeResourceStageName(stage)) + "]: "),
+                "the failure did not name its step of resource assembly");
       }
     }
   }
@@ -498,7 +387,7 @@ void testRequiredWarmupPreservesAllocationFailure() {
       throw std::runtime_error("required allocation refusal announced ready");
     } catch (const RuntimeBootstrapError &error) {
       require(error.report().resourceFailure == resourceAllocationFailure(failure) &&
-                  !harness.loop().ready() && harness.output().empty(),
+                  harness.output().empty(),
               "required warmup erased allocation refusal classification");
     }
   }
@@ -517,7 +406,7 @@ void testFinalHostPressurePreventsReady() {
     throw std::runtime_error("final pressure check announced ready");
   } catch (const RuntimeBootstrapError &error) {
     require(error.report().resourceFailure == RuntimeResourceFailure::HostCapacity &&
-                !harness.loop().ready() && harness.output().empty(),
+                harness.output().empty(),
             "final host pressure lost retryability or announced ready");
   }
 }
@@ -572,7 +461,6 @@ void testWarmupErrorsCannotMasqueradeAsMemoryLimits() {
         require(error.report().stage == stages[step] &&
                     (failure == Failure::Allocation ||
                      error.report().resourceFailure == RuntimeResourceFailure::Other) &&
-                    !harness.loop().ready() &&
                     harness.output().empty() &&
                     harness.executor().calls.back() == step,
                 "warmup failure was swallowed as a memory-limited success");
@@ -593,7 +481,7 @@ void testExceptionsMemoryAndReadyWriteAreFailClosed() {
     } catch (const engine::RuntimeBootstrapError &error) {
       require(error.report().stage ==
                       engine::RuntimeBootstrapStage::DecodeWarmup &&
-                  !harness.loop().ready(),
+                  harness.output().empty(),
               "warmup exception was not contained");
     }
   }
@@ -607,7 +495,7 @@ void testExceptionsMemoryAndReadyWriteAreFailClosed() {
     } catch (const engine::RuntimeBootstrapError &error) {
       require(error.report().stage ==
                       engine::RuntimeBootstrapStage::MemoryAudit &&
-                  !harness.loop().ready(),
+                  harness.output().empty(),
               "invalid memory report escaped the audit");
     }
   }
@@ -621,7 +509,7 @@ void testExceptionsMemoryAndReadyWriteAreFailClosed() {
     } catch (const engine::RuntimeBootstrapError &error) {
       require(error.report().stage ==
                       engine::RuntimeBootstrapStage::AnnounceReady &&
-                  !harness.loop().ready() && harness.output().empty(),
+                  harness.output().empty(),
               "Ready write failure left a visible runtime");
     }
   }
@@ -629,7 +517,9 @@ void testExceptionsMemoryAndReadyWriteAreFailClosed() {
 
 void testStartupRetryWindowOpensAtFirstFailure() {
   using namespace std::chrono_literals;
+  // A refusal of host memory before the weights load.
   RuntimeBootstrapReport failure;
+  failure.resourceStage = RuntimeResourceStage::ModelLoading;
   failure.resourceFailure = RuntimeResourceFailure::HostCapacity;
   StartupRetryWindow window(30s);
   // A slow start fails for the first time minutes in.
@@ -638,15 +528,26 @@ void testStartupRetryWindowOpensAtFirstFailure() {
               window.retryUntil(failure, first + 29s) == first + 30s &&
               !window.retryUntil(failure, first + 30s),
           "the startup retry window did not open at the first failure");
-  // A retry that fails later in startup made progress: a new window opens.
-  // Failing again at that stage or before does not extend it.
-  failure.stage = RuntimeBootstrapStage::MaximumPrefill;
+  // A retry that fails later in startup made progress: a new window opens,
+  // at a later step of resource assembly, as after the weights loaded, and at
+  // a later stage. Failing again there or before does not extend it.
+  failure.resourceStage = RuntimeResourceStage::StorageAllocation;
   require(window.retryUntil(failure, first + 40s) == first + 70s,
+          "progress through resource assembly did not open a new window");
+  failure.stage = RuntimeBootstrapStage::MaximumPrefill;
+  failure.resourceStage.reset();
+  require(window.retryUntil(failure, first + 80s) == first + 110s,
           "progress to a later startup stage did not open a new window");
-  for (auto stage : {RuntimeBootstrapStage::MaximumPrefill,
-                     RuntimeBootstrapStage::ResourceAssembly}) {
+  for (const auto &[stage, resourceStage] :
+       {std::pair{RuntimeBootstrapStage::MaximumPrefill,
+                  std::optional<RuntimeResourceStage>()},
+        std::pair{RuntimeBootstrapStage::ResourceAssembly,
+                  std::optional(RuntimeResourceStage::StorageAllocation)},
+        std::pair{RuntimeBootstrapStage::ResourceAssembly,
+                  std::optional(RuntimeResourceStage::ModelLoading)}}) {
     failure.stage = stage;
-    require(window.retryUntil(failure, first + 50s) == first + 70s,
+    failure.resourceStage = resourceStage;
+    require(window.retryUntil(failure, first + 90s) == first + 110s,
             "a failure without progress extended the retry window");
   }
   failure.resourceFailure = RuntimeResourceFailure::DriverAllocation;
@@ -658,25 +559,6 @@ void testStartupRetryWindowOpensAtFirstFailure() {
     require(!StartupRetryWindow(30s).retryUntil(failure, first),
             "a failure that cannot recover was retried");
   }
-}
-
-// The disk tier suggestion follows the plan within the host's headroom
-// beyond its reserve and the warning margin; a host with no more than those
-// holds nothing.
-void testMemoryMayNotHoldBeyondHostHeadroom() {
-  const EngineMemoryPlan plan = memoryPlan();
-  const auto &budget = plan.breakdown();
-  const uint64_t held = EngineMemoryPolicy::hostAvailableReserveBytes(
-                            budget.physicalMemoryBytes) +
-                        kHostWarningMarginBytes;
-  const uint64_t available = held + budget.minimumRequiredBytes + 64 * kMiB;
-  const uint32_t fits = plan.contextTokensWithin(available - held);
-  require(fits && fits < plan.maximumContextTokens() &&
-              !memoryMayNotHold(plan, available, fits) &&
-              memoryMayNotHold(plan, available, fits + 1) &&
-              !memoryMayNotHold(plan, 64 * kGiB, plan.maximumContextTokens()) &&
-              memoryMayNotHold(plan, held, 1),
-          "the disk tier suggestion does not follow the host's headroom");
 }
 
 // The parser's limits follow the model: prompts and outputs up to the served
@@ -696,7 +578,6 @@ void testProtocolLimitsFollowTheModel() {
 
 int main() {
   try {
-    testInstalledManifestBindsExecutionGeometry();
     testRuntimeCacheIdentityReportsTheLoadedModel();
     testAllNativeWarmupsPrecedeReady();
     testBudgetLimitedWarmupKeepsRuntimeConcurrency();
@@ -707,7 +588,6 @@ int main() {
     testWarmupErrorsCannotMasqueradeAsMemoryLimits();
     testExceptionsMemoryAndReadyWriteAreFailClosed();
     testStartupRetryWindowOpensAtFirstFailure();
-    testMemoryMayNotHoldBeyondHostHeadroom();
     testProtocolLimitsFollowTheModel();
     std::cout << "native bootstrap tests passed\n";
     return EXIT_SUCCESS;

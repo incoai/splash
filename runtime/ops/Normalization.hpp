@@ -9,9 +9,9 @@
 
 namespace splash::ops {
 
-// The per-channel multipliers of an RMS norm as stored: bf16 in the packed
-// formats, F32 in a GGUF, which keeps its norms unquantized as llama.cpp
-// does. Every kernel that reads them widens them to fp32, so the type only
+// The per-channel multipliers of an RMS norm as stored: bf16 in an MLX
+// target and the draft, F32 in a GGUF, which keeps its norms unquantized as
+// llama.cpp does. Every kernel that reads them widens them to fp32, so the type only
 // selects the kernel variant that loads them (normKernel).
 struct NormWeights final {
   metal::MetalBuffer buffer;
@@ -37,15 +37,6 @@ public:
                               uint32_t width, uint32_t rows,
                               LinearScratch scratch = {},
                               LinearInput layout = LinearInput::Plain);
-
-  // Fused RMS normalization plus Q4 input-group sums for an affine prefill
-  // projection; its norm weights are bf16.
-  static void addRmsWithQ4Sums(metal::CommandGraph &graph,
-                               metal::MetalBuffer input,
-                               const NormWeights &weight,
-                               metal::MetalBuffer output,
-                               metal::MetalBuffer sums, uint32_t width,
-                               uint32_t rows);
 };
 
 } // namespace splash::ops

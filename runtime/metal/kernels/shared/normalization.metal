@@ -2,17 +2,16 @@
 #include "metal/kernels/common/gguf_sgmatrix.h"
 #include "metal/kernels/common/rms_inverse.h"
 
-// Every norm reads its weights in their stored type W: bfloat in the packed
-// formats, float for a GGUF's F32 norms (the _f32 entry points). Both widen to
-// fp32 exactly, so W changes only the loads.
+// Every norm reads its weights in their stored type W: bfloat for an MLX
+// target's and the draft's, float for a GGUF's F32 norms (the _f32 entry
+// points). Both widen to fp32 exactly, so W changes only the loads.
 //
 // Wide decode norms hold their row in registers, kNormChunk columns at a time:
 // 256 threads of kNormColumns columns each, one chunk for every hidden size
 // in use. The first chunk's input and weight loads are all issued before the
 // reduction instead of per output iteration, so the (cold) weights arrive in
-// one round trip: a chain of 130 eight-row norms of 5120 went from 14.8 to
-// 8.2 us per norm on a 40-core M3 Max (Table16) and from 8.6 to 2.6 us on a
-// 16-core M5 Pro (plain rows), bitwise unchanged.
+// one round trip, which makes a chain of eight-row norms of 5120 1.8x (40-core
+// M3 Max) to 3.3x (16-core M5 Pro) faster with the same bits.
 constant constexpr uint kNormColumns = 32;
 constant constexpr uint kNormThreads = 256;
 constant constexpr uint kNormChunk = kNormThreads * kNormColumns;
@@ -108,17 +107,13 @@ NORM_RMS(norm_rms_f32, float)
 // load each row once into threadgroup memory, a vector per thread of a
 // 1024-thread group, and scale it from there instead of reading it from
 // device memory twice as norm_rms does. The reduction is rms_inverse's over
-// the first 256 threads, so the bits match every other norm. In chains of
-// dependent norms with DRAM-cold weights, 2048-column norms of 1 to 64 rows
-// ran x1.3-2.6 faster on a 40-core M3 Max and a 20-core M5 Pro, bf16 and F32
-// weights alike. At 128 rows the M5 Pro's margin is within noise (x1.02), and
-// from 256 rows on norm_rms is faster, by up to 1.3x at 2048 rows, its
-// 256-thread groups overlapping once the rows fill the GPU. Against the
-// register path of 5120-column rows it measured x0.94-1.15 up to 64 rows,
-// within the spread of norm_rms against itself (x0.91-1.04), and lost from
-// 128 rows on, so wider rows keep norm_rms. WV is the weights' vector type:
-// bfloat4, or packed_float4 for a GGUF's F32 norms, which assume no more than
-// scalar alignment.
+// the first 256 threads, so the bits match every other norm. On 2048-column
+// rows, up to 64 rows (SPLASH_STAGED_NORM_ROWS), that is 1.3-2.6x faster than
+// norm_rms in chains of dependent norms with DRAM-cold weights (40-core M3
+// Max, 20-core M5 Pro); from 128 rows on, norm_rms's 256-thread groups overlap
+// and match or beat it, and on 5120-column rows it does not beat the register
+// path. WV is the weights' vector type: bfloat4, or packed_float4 for a GGUF's
+// F32 norms, which assume no more than scalar alignment.
 static_assert(SPLASH_STAGED_NORM_WIDTH % 4 == 0, "the staged row is a whole number of vectors");
 static_assert(SPLASH_STAGED_NORM_THREADS % 256 == 0, "rms_inverse's 256 threads are whole simdgroups");
 template <class WV>
@@ -153,10 +148,10 @@ NORM_RMS_STAGED(norm_rms_staged_f32, packed_float4)
 #undef NORM_RMS_STAGED
 
 // Keep the ordinary output for non-matrix consumers, and emit the consumer's
-// matrix operand table (Table: q4sg::Table64 affine, gguf_sg::Table16 GGUF) from
-// the same rounded bfloat values. No additional dispatch is needed. The table
-// takes a simdgroup per 64-column span, so the first chunk's span pairs are
-// loaded (L2-hot input, weights) alongside the reduction's columns.
+// matrix operand table (Table: gguf_sg::Table16) from the same rounded bfloat
+// values. No additional dispatch is needed. The table takes a simdgroup per
+// 64-column span, so the first chunk's span pairs are loaded (L2-hot input,
+// weights) alongside the reduction's columns.
 template <class Table, class W>
 inline void norm_rms_table(device const bfloat *input, device const W *weight,
                            device bfloat *output, device bfloat *table, device float *sums,
@@ -220,10 +215,8 @@ inline void norm_rms_table(device const bfloat *input, device const W *weight,
     threadgroup float reductions[8]; \
     norm_rms_table<Table>(input, weight, output, table, sums, width, row, tid, lane, sg, reductions); \
   }
-// The reachable pairs: Table64 feeds affine projections, from the affine targets' and the draft's bf16 norms.
-// Table16 feeds a GGUF target's register-tile projections, from its F32 norms, and also the target's vocabulary
-// head from the draft's bf16 final norm (DFlashDraft::addDecode). No F32 norm feeds an affine projection.
-NORM_RMS_TABLE(norm_rms_table64_decode, q4sg::Table64, bfloat)
+// Table16 feeds the register-tile projections, from a GGUF target's F32 norms and from an MLX target's and the
+// draft's bf16 norms.
 NORM_RMS_TABLE(norm_rms_table16_decode, gguf_sg::Table16, bfloat)
 NORM_RMS_TABLE(norm_rms_table16_decode_f32, gguf_sg::Table16, float)
 #undef NORM_RMS_TABLE

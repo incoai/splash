@@ -45,8 +45,74 @@ struct SplashChunkedPrefillParams {
 static_assert(sizeof(SplashChunkedPrefillParams) == 24,
               "Chunked store parameters are 24 bytes on both sides");
 
-// Prefill divides each query tile's visible Page32 history into balanced
-// splits. The same count and partition rule are used by split and reduce.
+// Sparse attention (kernels/shared/sparse_attention.metal,
+// ops::AttentionBlocks): a query row attends only to the blocks of
+// SPLASH_ATTENTION_BLOCK_TOKENS tokens its block mask names, within its causal
+// history; the mask is per row a bitmap over the history's blocks, block b at
+// bit b % 32 of word b / 32. A tile's rows' masks become its block list: in
+// ascending order each block of the tile's history that some row attends, as
+// block << SPLASH_ATTENTION_BLOCK_ROW_BITS | a bit per row of the tile that
+// attends it, in lists of block_stride entries with their counts apart. A
+// sparse split reads list block_list (verify: its lane's), or a prefill tile
+// list block_list + tile; without a stride a tile attends to every block of
+// its history.
+#define SPLASH_ATTENTION_BLOCK_TOKENS 4u
+#define SPLASH_ATTENTION_BLOCK_ROW_BITS 8u
+// A sparse split takes at least SPLASH_SPARSE_SPLIT_BLOCKS entries of its
+// tile's list, and a list spreads over at least SPLASH_SPARSE_MINIMUM_SPLITS
+// splits while it gives each a partition unit, so that a lane's split count
+// follows its own list, not its history.
+#define SPLASH_SPARSE_SPLIT_BLOCKS 48u
+#define SPLASH_SPARSE_MINIMUM_SPLITS 32u
+
+static_assert(SPLASH_MAXIMUM_PHYSICAL_KV_TOKENS / SPLASH_ATTENTION_BLOCK_TOKENS <
+                  1u << (32 - SPLASH_ATTENTION_BLOCK_ROW_BITS),
+              "A list entry's bits above its rows' hold any block");
+
+// A list's blocks may sit outside the tile's page table (ops::AttentionBlocks
+// locations, the blocks a spilled request's hot block cache holds), which the
+// located verify split reads: a location per entry, in an array of the lists'
+// shape, names a page of the locations' own page table (location >>
+// SPLASH_ATTENTION_LOCATION_BLOCK_BITS) and the block's place in it (the low
+// bits), or is SPLASH_ATTENTION_PAGED for a block whose page the page table
+// holds, at its own place. The locations' pages hold the layer where the
+// tile's `kv` places it, as the pool's do.
+#define SPLASH_ATTENTION_PAGED 0xffffffffu
+#define SPLASH_ATTENTION_LOCATION_BLOCK_BITS 3u
+
+static_assert(SPLASH_TARGET_KV_BLOCK_TOKENS / SPLASH_ATTENTION_BLOCK_TOKENS ==
+                  1u << SPLASH_ATTENTION_LOCATION_BLOCK_BITS,
+              "A location's low bits hold a block's place in its page");
+
+// The block lists of up to SPLASH_MAXIMUM_BATCH_WIDTH sequences of rows (a
+// verify step's lanes, or a prefill chunk's sequences), in tiles of
+// `tile_rows` rows: sequence s's `rows` rows, whose block masks are rows
+// `mask_row` on of the masks, `mask_words` words each, the first at position
+// `first_position`, its last tile holding the rest; its tile t's entries go
+// to list `list` + t, `stride` entries each. A threadgroup of
+// SPLASH_ATTENTION_BLOCK_LIST_THREADS threads lists one tile.
+#define SPLASH_ATTENTION_BLOCK_LIST_THREADS 256u
+struct SplashAttentionBlockListSequence {
+  uint32_t mask_row;
+  uint32_t rows;
+  uint32_t first_position;
+  uint32_t list;
+};
+
+struct SplashAttentionBlockListParams {
+  uint32_t tile_rows;
+  uint32_t mask_words;
+  uint32_t stride;
+  uint32_t sequences;
+  SplashAttentionBlockListSequence sequence[SPLASH_MAXIMUM_BATCH_WIDTH];
+};
+
+static_assert(sizeof(SplashAttentionBlockListParams) == 16 + 16 * SPLASH_MAXIMUM_BATCH_WIDTH,
+              "Block list parameters are the same size on both sides");
+
+// Prefill divides each query tile's history into balanced splits: the page
+// loop its visible Page32 pages, a sparse split its block list in whole
+// partition units. Split and reduce use the same count and partition rule.
 struct SplashPrefillAttentionParams {
   uint32_t committed_tokens;
   uint32_t rows;
@@ -54,10 +120,12 @@ struct SplashPrefillAttentionParams {
   uint32_t page_table_entries;
   SplashKvLayer kv;
   uint32_t split_count;
+  uint32_t block_stride;
+  uint32_t block_list;
 };
 
-static_assert(sizeof(SplashPrefillAttentionParams) == 28,
-              "Prefill attention parameters are 28 bytes on both sides");
+static_assert(sizeof(SplashPrefillAttentionParams) == 36,
+              "Prefill attention parameters are 36 bytes on both sides");
 
 // A verify lane attends all its SPLASH_TARGET_VERIFY_ROWS rows, which its
 // queries and output hold in SPLASH_VERIFY_CHUNK_STRIDE rows per KV head.
@@ -69,7 +137,29 @@ struct SplashVerifyAttentionParams {
   // plan-wide slot stride that every lane's partials use.
   uint32_t split_count;
   uint32_t slot_splits;
+  // The lane's block list, which its sparse split and reduce read.
+  uint32_t block_stride;
+  uint32_t block_list;
 };
 
-static_assert(sizeof(SplashVerifyAttentionParams) == 24,
-              "Verify attention parameters are 24 bytes on both sides");
+static_assert(sizeof(SplashVerifyAttentionParams) == 32,
+              "Verify attention parameters are 32 bytes on both sides");
+
+// A prefill whose history has pages that hold only their index reads one
+// layer's history staged (kernels/shared/kv_stage.metal, ops::PagedAttention::
+// addStageLayer): pages of the pool's layer from first_page on, a threadgroup
+// each, reached through a page table, copied to the same pages of a staging
+// table, whose storage holds that one layer; a pool entry that is
+// SPLASH_KV_PAGE_ABSENT is left to the reads that fill it. data_bytes and
+// scale_bytes are a page's bytes of one tensor of the layer (zero scale bytes
+// for BF16).
+struct SplashKvStageParams {
+  SplashKvLayer pool;
+  SplashKvLayer staged;
+  uint32_t first_page;
+  uint32_t data_bytes;
+  uint32_t scale_bytes;
+};
+
+static_assert(sizeof(SplashKvStageParams) == 28,
+              "KV stage parameters are 28 bytes on both sides");

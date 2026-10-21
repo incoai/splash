@@ -7,11 +7,16 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+import contextlib
+import fcntl
 import http.client
 import io
 import json
 import os
+import re
+import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,6 +30,7 @@ sys.path.insert(0, str(ROOT))
 
 from install import assembly  # noqa: E402
 from install import models as model_artifacts  # noqa: E402
+from server import serve_options  # noqa: E402
 
 
 class SmokeFailure(RuntimeError):
@@ -82,10 +88,15 @@ def stream_request(port: int, path: str, body: dict) -> tuple[int, str, bytes]:
 
 
 class RealServer:
-    def __init__(self, arguments, environment: dict | None = None):
-        """A server of arguments.package, its process started with these
-        variables added to this process's environment."""
-        package = arguments.package.resolve()
+    def __init__(
+        self,
+        arguments,
+        *,
+        cache_dir: Path | None = None,
+    ):
+        """A server of arguments.model_root, with a persistent cache in
+        cache_dir when one is given."""
+        model_root = arguments.model_root.resolve()
         binary = arguments.binary.resolve()
         self.port = available_port()
         self.log = tempfile.NamedTemporaryFile(
@@ -95,15 +106,13 @@ class RealServer:
             sys.executable,
             "-m",
             "server.server",
-            str(package),
+            str(model_root),
             "--host",
             "127.0.0.1",
             "--port",
             str(self.port),
             "--binary",
             str(binary),
-            "--tokenizer",
-            str(package / "tokenizer"),
             "--model",
             arguments.model,
         ]
@@ -113,13 +122,20 @@ class RealServer:
             command.extend(("--max-memory", arguments.max_memory))
         if arguments.max_cache_disk is not None:
             command.extend(("--max-cache-disk", arguments.max_cache_disk))
+        if arguments.ple_memory is not None:
+            command.extend(("--ple-memory", arguments.ple_memory))
+        if arguments.expert_memory is not None:
+            command.extend(("--expert-memory", arguments.expert_memory))
+        if arguments.verify_rows is not None:
+            command.extend(("--verify-rows", arguments.verify_rows))
+        if cache_dir is not None:
+            command.extend(("--persistent-cache", "--cache-dir", str(cache_dir)))
         if arguments.max_image_pixels is not None:
             command.extend(("--max-image-pixels", str(arguments.max_image_pixels)))
         command.extend(("--kv-format", arguments.kv_format))
         self.process = subprocess.Popen(
             command,
             cwd=ROOT,
-            env=None if environment is None else {**os.environ, **environment},
             stdout=self.log,
             stderr=subprocess.STDOUT,
             text=True,
@@ -143,6 +159,18 @@ class RealServer:
                 pass
             time.sleep(0.25)
         raise SmokeFailure(f"server did not become ready\n{self.tail()}")
+
+    def stop(self, timeout: float = 60) -> None:
+        """Stops the server with SIGINT, as Ctrl+C stops splash serve, and
+        requires a clean exit within timeout."""
+        self.process.send_signal(signal.SIGINT)
+        try:
+            code = self.process.wait(timeout)
+        except subprocess.TimeoutExpired:
+            raise SmokeFailure(
+                f"server did not stop within {timeout:.0f} s\n{self.tail()}"
+            ) from None
+        require(code == 0, f"server stopped with status {code}\n{self.tail()}")
 
     def close(self) -> None:
         if self.process.poll() is None:
@@ -241,6 +269,8 @@ def run_images(port: int, model: str, nonce: str) -> None:
         "word naming the color, with no punctuation, explanation or other words. "
         f"Request {nonce}."
     )
+    code, start = request(port, "GET", "/status")
+    require(code == 200 and "images" in start, "status lacks image telemetry")
     code, red = request(
         port,
         "POST",
@@ -261,10 +291,15 @@ def run_images(port: int, model: str, nonce: str) -> None:
     # The same image and prompt reuse the image-aware prefix, which covers the
     # image: its rows are neither encoded nor looked up. Behind another system
     # prompt the same image comes from the embedding cache without the vision
-    # tower. A different image behind identical placeholder tokens must not
+    # tower, unless the cache let its rows go since the image was encoded
+    # (images.embedding_evictions), as it does to give memory back, under
+    # macOS's warning for one (DEVELOPMENT.md, Admission and eviction): the
+    # image is then encoded again, once. An eviction that should not have
+    # happened passes here too: the engine tests check which reclaims take the
+    # rows. A different image behind identical placeholder tokens must not
     # reuse KV.
     code, before = request(port, "GET", "/status")
-    require(code == 200 and "images" in before, "status lacks image telemetry")
+    require(code == 200, f"status failed with HTTP {code}")
     code, repeat = request(
         port,
         "POST",
@@ -298,13 +333,19 @@ def run_images(port: int, model: str, nonce: str) -> None:
         f"the image behind another system prompt failed: {other!r}",
     )
     code, reused = request(port, "GET", "/status")
+    require(code == 200, f"status failed with HTTP {code}")
+    rows = (
+        reused["images"]["encodes"] - after["images"]["encodes"],
+        reused["images"]["embedding_reuses"] - after["images"]["embedding_reuses"],
+    )
+    evicted = (
+        reused["images"]["embedding_evictions"] > start["images"]["embedding_evictions"]
+    )
     require(
-        code == 200
-        and reused["images"]["encodes"] == after["images"]["encodes"]
-        and reused["images"]["embedding_reuses"]
-        == after["images"]["embedding_reuses"] + 1,
-        f"a cached image re-ran the vision tower or was not reused: "
-        f"{after['images']} -> {reused['images']}",
+        rows == (0, 1) or (evicted and rows == (1, 0)),
+        "a cached image re-ran the vision tower while the cache kept its rows, "
+        f"or was not reused: {start['images']} -> {after['images']} -> "
+        f"{reused['images']}",
     )
     code, blue = request(
         port,
@@ -324,7 +365,8 @@ def run_images(port: int, model: str, nonce: str) -> None:
     print(
         "image prefix cache: PASS "
         f"(repeat matched={repeat_cache['matched_tokens']}, "
-        f"different image matched={blue_cache.get('matched_tokens')})",
+        f"different image matched={blue_cache.get('matched_tokens')}, "
+        f"cached rows {'reused' if rows == (0, 1) else 'evicted and encoded again'})",
         flush=True,
     )
 
@@ -764,6 +806,7 @@ def run(port: int, model: str) -> None:
     content = structured.get("choices", [{}])[0].get("message", {}).get("content")
     require(code == 200 and json.loads(content) == {"result": "ok"}, "JSON failed")
     print("structured output: PASS", flush=True)
+    run_thinking_budget_under_grammar(port, model, schema)
 
     code, responses = request(
         port,
@@ -829,6 +872,70 @@ def run(port: int, model: str) -> None:
     run_judgments(port, model, nonce)
 
 
+# Words whose characters the Qwen tokenizer splits across two tokens each.
+SPLIT_WORDS = ("饕餮", "魍魉", "耄耋", "龘", "彧")
+
+
+def run_thinking_budget_under_grammar(port: int, model: str, schema: dict) -> None:
+    """Structured output with thinking on and a small thinking budget. The
+    grammar admits the end of thinking only between whole characters, so a
+    budget whose last token is part of one thinks on until it is complete.
+    Greedy requests that think in Chinese about characters the tokenizer
+    splits, at budgets of 1 to 48, must each succeed with reasoning that
+    breaks no character, those that finish with the schema's JSON. Where
+    their reasoning holds such a character, a budget ended inside it, and
+    that request must have thought past its budget; a model that thinks in
+    English may reach none within these budgets."""
+    words = "、".join(SPLIT_WORDS)
+    prompt = f"请用中文思考：{words}这些字分别怎么读？然后按要求返回 JSON。"
+    budgets = range(1, 49)
+    past = 0
+    split = False
+    for budget in budgets:
+        code, chat = request(
+            port,
+            "POST",
+            "/v1/chat/completions",
+            chat_body(
+                model,
+                prompt,
+                reasoning_effort="high",
+                thinking_token_budget=budget,
+                max_completion_tokens=budget + 16,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": "probe", "strict": True, "schema": schema},
+                },
+            ),
+        )
+        require(
+            code == 200, f"thinking budget {budget} under a grammar failed: {chat!r}"
+        )
+        choice = chat["choices"][0]
+        message = choice["message"]
+        reasoning = message.get("reasoning_content") or ""
+        require(
+            "\ufffd" not in reasoning
+            and (
+                choice["finish_reason"] != "stop"
+                or json.loads(message["content"]) == {"result": "ok"}
+            ),
+            f"thinking budget {budget} under a grammar broke its output: {message!r}",
+        )
+        split |= any(character in reasoning for character in "".join(SPLIT_WORDS))
+        past += chat["usage"]["completion_tokens_details"]["reasoning_tokens"] > budget
+    require(
+        past or not split,
+        "the reasoning holds a split character, yet no thinking budget under a "
+        "grammar ended inside one",
+    )
+    print(
+        f"thinking budget under a grammar: PASS ({past} of {len(budgets)} "
+        "thought past their budget)",
+        flush=True,
+    )
+
+
 def run_sampling(port: int, model: str) -> None:
     """The sampling penalties, top_k and min_p on the real model: a penalized
     greedy request repeats itself exactly once its prompt is cached (the first
@@ -836,7 +943,11 @@ def run_sampling(port: int, model: str) -> None:
     leaves each row its most likely token answers what a greedy one does, and
     penalized greedy, sampled and constrained requests finish side by side with
     an unpenalized one and with sampled ones whose top_k keeps every token or
-    which min_p cuts."""
+    which min_p cuts. Greedy output repeats only where decode cycles verify
+    every row (/status verify_rows all), so on a MoE target, whose rows the
+    verify budget chooses unless it serves with --verify-rows all, the two
+    greedy comparisons are left out."""
+    repeats = runtime_status(port)["verify_rows"] == "all"
     prompt = "Name the days of the week, three times over, separated by commas."
     penalized = chat_body(
         model,
@@ -851,7 +962,10 @@ def run_sampling(port: int, model: str) -> None:
         code, chat = request(port, "POST", "/v1/chat/completions", penalized)
         require(code == 200, f"penalized greedy Chat failed: {chat!r}")
         answers.append(answer_text(chat))
-    require(answers[1] == answers[2], "a penalized greedy request did not repeat")
+    require(
+        not repeats or answers[1] == answers[2],
+        "a penalized greedy request did not repeat",
+    )
 
     code, greedy = request(
         port,
@@ -876,7 +990,7 @@ def run_sampling(port: int, model: str) -> None:
         ),
     )
     require(
-        code == 200 and answer_text(heaviest) == answer_text(greedy),
+        code == 200 and (not repeats or answer_text(heaviest) == answer_text(greedy)),
         f"min_p 1 did not answer as a greedy request: {heaviest!r}",
     )
 
@@ -944,7 +1058,11 @@ def run_sampling(port: int, model: str) -> None:
         results["ignore_eos"][1]["usage"]["completion_tokens"] == 32,
         "ignore_eos beside penalized requests stopped early",
     )
-    print("sampling penalties, top_k and min_p: PASS", flush=True)
+    print(
+        "sampling penalties, top_k and min_p: PASS"
+        + ("" if repeats else " (greedy answers not compared: verify_rows auto)"),
+        flush=True,
+    )
 
 
 def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
@@ -968,7 +1086,7 @@ def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
             "model": model,
             "messages": messages,
             "max_tokens": 256,
-            "thinking": {"type": "enabled", "display": "omitted"},
+            "thinking": {"type": "adaptive", "display": "omitted"},
             "output_config": {"effort": "low"},
         },
     )
@@ -1073,6 +1191,7 @@ def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
                     "type": "function",
                     "function": {
                         "name": "lookup",
+                        "strict": True,
                         "parameters": {
                             "type": "object",
                             "properties": {},
@@ -1095,7 +1214,7 @@ def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
     )
     require(
         json.loads(calls[0]["function"]["arguments"]) == {},
-        "combined tools/schema changed tool arguments",
+        f"combined tools/schema changed strict tool arguments: {calls!r}",
     )
 
     code, high = request(
@@ -1467,73 +1586,203 @@ def run_judgments(port: int, model: str, nonce: str) -> None:
     print(f"judgments timeout recovery: PASS (504 after {elapsed:.2f}s)", flush=True)
 
 
+# What a persistent cache keeps under its --cache-dir, one directory per
+# namespace (runtime/engine/CacheDirectory.cpp): the tier's files, the lock,
+# and while a process serves or a start is on probation, a mark of that.
+CACHE_NAMESPACE = re.compile(r"[0-9a-f]{1,64}")
+CACHE_FILES = {"kv.slots", "kv.records", "state.slots", "state.records"}
+
+
+@contextlib.contextmanager
+def serving(arguments, **options):
+    """A ready RealServer of arguments with these options, whose log's tail
+    is printed when anything fails while it serves; closed afterwards."""
+    server = RealServer(arguments, **options)
+    try:
+        validate_status(
+            server.wait_ready(arguments.startup_timeout), arguments.kv_format
+        )
+        yield server
+    except Exception:
+        print(server.tail(), file=sys.stderr)
+        raise
+    finally:
+        server.close()
+
+
+def require_closed_cache(root: Path) -> None:
+    """The one cache under root is as a clean close leaves it: a 0700
+    namespace directory of the tier's files and a lock nobody holds, without
+    a mark of serving or probation."""
+    entries = sorted(root.iterdir())
+    require(
+        len(entries) == 1
+        and CACHE_NAMESPACE.fullmatch(entries[0].name) is not None
+        and entries[0].is_dir(),
+        f"the cache directory holds {[entry.name for entry in entries]}",
+    )
+    directory = entries[0]
+    mode = stat.S_IMODE(directory.stat().st_mode)
+    require(mode == 0o700, f"the cache namespace has mode {mode:o}")
+    names = {path.name for path in directory.iterdir()}
+    require(names == CACHE_FILES | {"lock"}, f"the closed cache holds {sorted(names)}")
+    with (directory / "lock").open("rb") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SmokeFailure("a stopped server still holds the cache lock") from None
+
+
+def run_persistent_cache(arguments) -> None:
+    """A conversation's prefix across a clean restart, in a fresh cache
+    directory: the first server answers a prompt deep enough for its restore
+    point to be written, and stops; the second takes the point back, and the
+    conversation's next turn restores the prompt from disk. Each stop must
+    close the cache cleanly."""
+    nonce = uuid.uuid4().hex
+    conversation = chat_body(
+        arguments.model,
+        f"{filler(nonce, 'persistent', 100)} Reply with one short word.",
+    )
+    with tempfile.TemporaryDirectory(prefix="splash-persistent-cache-") as directory:
+        root = Path(directory)
+        with serving(arguments, cache_dir=root) as server:
+            disk = runtime_status(server.port)["disk"]
+            require(
+                disk["persistent"] and disk["taken_back"]["states"] == 0,
+                f"a fresh persistent cache started with {disk!r}",
+            )
+            code, answer = request(
+                server.port, "POST", "/v1/chat/completions", conversation, timeout=300
+            )
+            require(code == 200, f"the first turn failed with HTTP {code}: {answer!r}")
+            prompt_tokens = answer["usage"]["prompt_tokens"]
+            points = runtime_status(server.port)["disk"]["write_behind"]
+            require(
+                points["waiting"] + points["durable"] >= 1,
+                f"the first turn left no restore point to write: {points!r}",
+            )
+            server.stop()
+        require_closed_cache(root)
+        conversation["messages"] += [
+            {
+                "role": "assistant",
+                "content": answer["choices"][0]["message"]["content"],
+            },
+            {"role": "user", "content": "Reply with one more short word."},
+        ]
+        with serving(arguments, cache_dir=root) as server:
+            before = runtime_status(server.port)
+            taken = before["disk"]["taken_back"]
+            require(
+                taken["states"] >= 1
+                and taken["kv_blocks"] >= 1
+                and taken["left_behind"] == 0,
+                f"the restart took back {taken!r}",
+            )
+            code, reply = request(
+                server.port, "POST", "/v1/chat/completions", conversation, timeout=300
+            )
+            require(code == 200, f"the next turn failed with HTTP {code}: {reply!r}")
+            after = runtime_status(server.port)
+            states = after["state"]["disk_hits"] - before["state"]["disk_hits"]
+            restored = (
+                after["cache"]["kv_disk_hit_tokens"]
+                - before["cache"]["kv_disk_hit_tokens"]
+            )
+            reused = after["cache"]["reused_tokens"] - before["cache"]["reused_tokens"]
+            require(states >= 1, "the next turn restored no state from disk")
+            # The tail past the restore point's block boundary is recomputed.
+            require(
+                min(restored, reused) * 10 >= prompt_tokens * 9,
+                f"the next turn restored {restored} and reused {reused} of the "
+                f"first turn's {prompt_tokens} prompt tokens",
+            )
+            server.stop()
+        require_closed_cache(root)
+    print(
+        f"persistent cache restart: PASS ({restored}/{prompt_tokens} from disk)",
+        flush=True,
+    )
+
+
 def add_server_arguments(parser):
     parser.add_argument("--binary", type=Path, default=ROOT / "build/splash")
     parser.add_argument(
-        "--package",
+        "--model-root",
         type=Path,
-        help="installed model package root (target, draft and tokenizer)",
+        help="installed model root (target, draft and tokenizer)",
     )
-    parser.add_argument("--model", type=model_artifacts.parse_model_id, required=True)
+    parser.add_argument("--model", type=serve_options.parse_model_id, required=True)
     parser.add_argument("--max-context", type=int)
     parser.add_argument("--max-memory")
     parser.add_argument("--max-cache-disk")
+    parser.add_argument(
+        "--ple-memory",
+        help="serve Qwen3.8-Flash-Next's PLE table from its GGUF through a row "
+        "cache of this size (splash serve --ple-memory)",
+    )
+    parser.add_argument(
+        "--expert-memory",
+        help="serve a MoE model's routed experts from RAM slots of this size in "
+        "all, reading the others from the SSD (splash serve --expert-memory)",
+    )
+    parser.add_argument(
+        "--verify-rows",
+        choices=("auto", "all"),
+        help="the rows of each draft block decode verifies (splash serve "
+        "--verify-rows); a MoE model's greedy output repeats only with all",
+    )
     parser.add_argument("--max-image-pixels", type=int)
     parser.add_argument("--kv-format", choices=("int8", "bf16"), default="int8")
     parser.add_argument("--startup-timeout", type=float, default=1800)
 
 
 def resolve_server_arguments(arguments):
-    """Serve --package, or else the selection link of --model."""
-    if arguments.package is None:
-        arguments.package = model_artifacts.selection_link(
+    """Serve --model-root, or else the selection link of --model."""
+    if arguments.model_root is None:
+        arguments.model_root = model_artifacts.selection_link(
             model_artifacts.MODELS, arguments.model
         )
     return arguments
 
 
-def hold_package(arguments):
-    """As splash serve does, serve every server this process starts, and its
-    tokenizer, from one assembly, which installations keep while it is held:
-    point arguments.package at the assembly it links now, held until the
-    process exits by arguments.held_record (None for a legacy package). The
-    installation that collects an assembly is the one of the models root it
-    was built in (models/.resolved/<record>), which may be another
-    checkout's."""
-    resolved = arguments.package.resolve()
-    models_root = (
-        resolved.parent.parent
-        if resolved.parent.name == ".resolved"
-        else model_artifacts.MODELS
-    )
-    arguments.package, arguments.held_record = assembly.hold(
-        arguments.package, models_root
-    )
+def hold_model_root(arguments):
+    """Serve every server this process starts, and its tokenizer, from one
+    assembly, which installations keep while it is held, between servers
+    too: point arguments.model_root at the assembly it links now, held until
+    the process exits by arguments.held_record."""
+    arguments.model_root, arguments.held_record = assembly.hold(arguments.model_root)
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     add_server_arguments(parser)
-    return resolve_server_arguments(parser.parse_args(argv))
+    parser.add_argument(
+        "--persistent-cache",
+        action="store_true",
+        help="instead of the smoke, check a conversation's prefix across a clean "
+        "restart of a server with --persistent-cache in a fresh cache directory",
+    )
+    arguments = parser.parse_args(argv)
+    if arguments.persistent_cache and arguments.max_cache_disk == "0":
+        parser.error(
+            "--persistent-cache needs the SSD cache --max-cache-disk 0 turns off"
+        )
+    return resolve_server_arguments(arguments)
 
 
 def main(argv=None) -> int:
     arguments = parse_args(argv)
-    hold_package(arguments)
-    server = RealServer(arguments)
-    try:
-        validate_status(
-            server.wait_ready(arguments.startup_timeout), arguments.kv_format
-        )
+    hold_model_root(arguments)
+    if arguments.persistent_cache:
+        run_persistent_cache(arguments)
+        return 0
+    with serving(arguments) as server:
         run(server.port, arguments.model)
         validate_status(request(server.port, "GET", "/status")[1], arguments.kv_format)
-        print("http smoke: PASS", flush=True)
-        return 0
-    except Exception:
-        print(server.tail(), file=sys.stderr)
-        raise
-    finally:
-        server.close()
+    print("http smoke: PASS", flush=True)
+    return 0
 
 
 if __name__ == "__main__":

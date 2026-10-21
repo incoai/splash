@@ -1,19 +1,17 @@
 #pragma once
 
-#include "model/AffineTarget.hpp"
+#include "model/ExpertStore.hpp"
 #include "model/GgufTarget.hpp"
 #include "model/QwenHybridLayout.hpp"
 #include "model/QwenTarget.hpp"
 #include "model/QwenTargetFiles.hpp"
-#include "model/WeightImages.hpp"
+#include "model/SafetensorsTarget.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/GDN.hpp"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
 
-#include <algorithm>
 #include <cstdint>
-#include <filesystem>
 #include <functional>
 #include <initializer_list>
 #include <string>
@@ -22,51 +20,32 @@
 
 namespace splash::model {
 
-// How a target's files store its tensors; loadQwenTarget pairs each source's
-// files with their format. Affine files, packed or written from MLX, hold
-// every projection, a fused one too, as one affine Q4 tensor, and bf16 norms.
-struct AffineTargetFormat final {
-  static constexpr ops::GdnHeadOrder gdnOutputOrder = ops::GdnHeadOrder::Grouped;
+// The bytes of an F32 value in a target's images.
+inline constexpr uint64_t kFloat32Bytes = 4;
 
-  [[nodiscard]] ops::NormWeights norm(WeightFile &file, uint32_t width, std::string_view label) const {
-    return readNorm(file, width, false, label);
-  }
-  [[nodiscard]] ops::Projection projection(WeightFile &file, uint32_t outputSize,
-                                           uint32_t inputSize, std::string_view label) const {
-    return readAffineProjection(file, outputSize, inputSize, label);
-  }
-  // The tensor `label`; block images keep the projection as `tensors`.
-  [[nodiscard]] ops::Projection fused(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
-                                      std::string_view label,
-                                      std::initializer_list<std::string_view>) const {
-    return projection(file, outputSize, inputSize, label);
-  }
-  [[nodiscard]] ops::EmbeddingWeights embedding(WeightFile &file, uint32_t outputSize,
-                                                uint32_t inputSize) const {
-    return readAffineEmbedding(file, outputSize, inputSize, "embedding");
-  }
-};
-
-// GGUF images hold each GGUF tensor as one block-quantized segment,
-// a fused projection as its tensors in output column order, and the GGUF's
-// F32 norms. The GGUF keeps the GDN output projection's input columns in
-// llama.cpp's tiled value-head order, so the GDN writes its output in it; a
-// rotated Prism ML GGUF keeps them grouped, and rotateInputs (Qwen3_8.cpp)
-// switches its GDN to that order.
+// How a target's block images store its tensors; loadQwenTarget pairs each
+// source's images with their format. Block images hold each tensor as one
+// block-quantized segment, a fused projection as its tensors in output column
+// order. A GGUF's keep its F32 norms and the GDN output projection's input
+// columns in llama.cpp's tiled value-head order, so the GDN writes its output
+// in it (a rotated Prism ML GGUF keeps them grouped, and rotateInputs,
+// Qwen3_8.cpp, switches its GDN to that order); a safetensors target's
+// (model/SafetensorsImage.hpp) keep its grouped value heads and MLX's bf16
+// norms, or the F32 norms of a checkpoint of transformers names.
 struct BlockTargetFormat final {
-  static constexpr ops::GdnHeadOrder gdnOutputOrder = ops::GdnHeadOrder::Tiled;
+  bool float32Norms = true;
+  ops::GdnHeadOrder gdnOutputOrder = ops::GdnHeadOrder::Tiled;
 
   [[nodiscard]] ops::NormWeights norm(WeightFile &file, uint32_t width, std::string_view label) const {
-    return readNorm(file, width, true, label);
+    return readNorm(file, width, float32Norms, label);
   }
   [[nodiscard]] ops::Projection projection(WeightFile &file, uint32_t outputSize,
                                            uint32_t inputSize, std::string_view label) const {
     return readBlockProjection(file, outputSize, inputSize, label);
   }
   // The tensors, which may leave padding columns past the last one
-  // (LinearGguf.cpp requireSegments); affine files keep one tensor.
+  // (LinearGguf.cpp requireSegments).
   [[nodiscard]] ops::Projection fused(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
-                                      std::string_view,
                                       std::initializer_list<std::string_view> tensors) const;
   [[nodiscard]] ops::EmbeddingWeights embedding(WeightFile &file, uint32_t outputSize,
                                                 uint32_t inputSize) const {
@@ -74,42 +53,38 @@ struct BlockTargetFormat final {
   }
 };
 
-// Reads the mixer sections that follow a layer's input norm, in file order
-// (instantiated for both formats).
-template <class Format>
-[[nodiscard]] QwenMixerWeights readQwenMixer(WeightFile &file, const Format &format,
-                                             const QwenMixerGeometry &geometry,
+// Reads the mixer sections that follow a layer's input norm, in file order.
+[[nodiscard]] QwenMixerWeights readQwenMixer(WeightFile &file, const BlockTargetFormat &format,
+                                             const QwenTargetDimensions &target,
                                              bool fullAttention);
 
-// Loads the packed files of a target directory: one per hybrid layer,
-// head.bin and embedding.bin.
-template <class Layout> struct PackedTargetFiles final {
-  WeightImages &images;
-  std::filesystem::path directory;
-  const Layout &layout;
-  [[nodiscard]] WeightFile layer(uint32_t index) const {
-    const std::string filename = "layer-" + std::to_string(index) + ".bin";
-    return images.load(packedImage(directory / filename, "target/" + filename, Layout::layerMagic, index,
-                                   layout.isFullAttentionLayer(index) ? 1U : 0U));
-  }
-  [[nodiscard]] WeightFile head() const {
-    return images.load(packedImage(directory / "head.bin", "target/head.bin", Layout::headMagic, layout.layers, 2));
-  }
-  [[nodiscard]] WeightFile embedding() const {
-    return images.load(packedImage(directory / "embedding.bin", "target/embedding.bin", kEmbeddingMagic,
-                                   layout.vocabularySize, layout.hiddenSize));
-  }
+// How a MoE target's blocks reach their routed experts: through a store when
+// they stream (its files' loader streamsExperts()), the target's layers its
+// blocks; else from their images through `resident`, the identity table of
+// `experts` slots.
+struct MoeExperts final {
+  std::shared_ptr<ExpertStore> store;
+  metal::MetalBuffer resident;
+  uint32_t experts = 0;
 };
+[[nodiscard]] MoeExperts openMoeExperts(metal::MetalBackend &backend, const QwenTargetFiles &files,
+                                        const QwenTargetDimensions &target);
 
-// Reads a target through the files of its images, packaged or written from
-// an upstream source, in their format: per layer the input norm, mixer,
-// post-attention norm and the architecture's FFN through readFfn, then the
-// head and the token embedding. Weights is the architecture's weight struct.
-template <class Weights, class Layout, class Files, class Format, class ReadFfn>
+// A MoE block's sections in image order: its router, its routed experts'
+// gate, up and down (none when they stream), its shared expert's gate, up
+// and down and its scalar gate. Block `block` of the store when its experts
+// stream.
+[[nodiscard]] ops::BlockMoeWeights readMoeBlock(WeightFile &file, const MoeExperts &experts, uint32_t block);
+
+// Reads a target through the files of its images, written from an upstream
+// source, in their format: per layer the input norm, mixer,
+// post-attention norm and the architecture's FFN through readFfn (called
+// with the file, the layer's weights, the format and the layer's index),
+// then the head and the token embedding. Weights is the architecture's
+// weight struct.
+template <class Weights, class Layout, class Files, class ReadFfn>
 [[nodiscard]] Weights
-readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files &&files,
-                      const Format &format, ReadFfn readFfn) {
-  const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
+readQwenTargetWeights(const Layout &layout, Files &&files, const BlockTargetFormat &format, ReadFfn readFfn) {
   Weights result;
   result.layout = layout;
   result.layers.reserve(layout.layers);
@@ -119,9 +94,9 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
     WeightFile file = files.layer(layerIndex);
     auto &layer = result.layers.emplace_back();
     layer.inputNorm = format.norm(file, layout.hiddenSize, "input-norm");
-    layer.mixer = readQwenMixer(file, format, layout.mixerGeometry(), fullAttention);
+    layer.mixer = readQwenMixer(file, format, layout, fullAttention);
     layer.postAttentionNorm = format.norm(file, layout.hiddenSize, "post-attention-norm");
-    readFfn(file, layer, format);
+    readFfn(file, layer, format, layerIndex);
     file.finish();
     result.files.push_back(file.record());
   }
@@ -143,30 +118,20 @@ readQwenTargetWeights(metal::MetalBackend &backend, const Layout &layout, Files 
     file.finish();
     result.files.push_back(file.record());
   }
-
-  result.manifestFingerprintSha256 = weightManifestFingerprint(result.files);
-  result.actualAllocatedBytes = metal::allocationDelta(
-      allocationBaseline, backend.memoryStats().allocatedBytes);
   return result;
 }
 
-// Throws unless every dimension of a family's layout is set, the dimensions
-// agree with each other and every projection fits the Q4 storage tiles.
+// Throws unless every dimension of a family's layout is set and the
+// dimensions agree with each other. The image planners hold each tensor to
+// whole plane tiles.
 template <class Layout> void requireQwenLayout(const Layout &layout) {
   const auto zero = [](auto... dimensions) { return ((dimensions == 0) || ...); };
-  uint32_t ffnWidth = 0;
-  bool ffnZero = false;
-  bool routingInconsistent = false;
-  if constexpr (Layout::ffnKind == QwenFfnKind::Dense) {
-    ffnWidth = layout.intermediateSize;
-    ffnZero = zero(ffnWidth);
-  } else {
-    ffnWidth = layout.expertIntermediateSize;
-    ffnZero = zero(layout.experts, layout.expertsPerToken, ffnWidth);
-    routingInconsistent = layout.expertsPerToken > layout.experts;
-  }
+  const bool dense = layout.ffnKind == QwenFfnKind::Dense;
+  const uint32_t ffnWidth = dense ? layout.intermediateSize : layout.expertIntermediateSize;
+  const bool ffnZero = dense ? zero(ffnWidth) : zero(layout.experts, layout.expertsPerToken, ffnWidth);
+  const bool routingInconsistent = !dense && layout.expertsPerToken > layout.experts;
   if (ffnZero || !(layout.rotaryTheta > 0.0F) ||
-      zero(layout.maximumContextTokens, layout.layers, layout.hiddenSize, layout.vocabularySize,
+      zero(layout.nativeContextTokens, layout.layers, layout.hiddenSize, layout.vocabularySize,
            layout.packedGdnWidth, layout.packedFullWidth, layout.convolutionDimension, layout.gdnKeyHeads,
            layout.gdnValueHeads, layout.gdnHeadDimension, layout.attentionWidth, layout.attentionQueryHeads,
            layout.attentionKvHeads, layout.attentionHeadDimension, layout.rotaryPairs,
@@ -179,32 +144,38 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
       layout.gdnValueHeads * layout.gdnHeadDimension != layout.attentionWidth ||
       layout.packedFullWidth !=
           2 * layout.attentionWidth + 2 * layout.attentionKvHeads * layout.attentionHeadDimension ||
-      std::ranges::any_of(layout.hiddenCaptureLayers, [&](uint32_t layer) { return layer >= layout.layers; }) ||
       !layout.kvLayout().valid() || !layout.gdnStateLayout().valid())
     throw WeightStoreError("Qwen target layout is inconsistent");
-  validateQ4Layout(layout.packedGdnWidth, layout.hiddenSize);
-  validateQ4Layout(layout.packedFullWidth, layout.hiddenSize);
-  validateQ4Layout(layout.hiddenSize, layout.attentionWidth);
-  validateQ4Layout(ffnWidth, layout.hiddenSize);
-  validateQ4Layout(layout.hiddenSize, ffnWidth);
-  validateQ4Layout(layout.vocabularySize, layout.hiddenSize);
 }
 
-// Checks the layout and loads a target from its files. The architecture
-// reads its FFN through readFfn, called with the file, the layer and the
-// format.
-template <class Weights, class Layout, class ReadFfn>
+// Checks the layout and loads a target from its files: a MoE target's routed
+// experts open first (openMoeExperts), then `read` reads the weights, called
+// with the files' loader, their format and the experts (readQwenTargetWeights,
+// or a family's own order). The target's allocations are all that loading it
+// allocates, its expert store's among them, and its fingerprint is its
+// files'. A family whose weights load from a GGUF only (loadsSafetensors
+// false) reads a GGUF's loader alone.
+template <class Weights, class Layout, class Read>
 [[nodiscard]] Weights
-loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTargetFiles<Layout> &files,
-               ReadFfn readFfn) {
+loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTargetFiles &files, Read read) {
   requireQwenLayout(layout);
-  if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
-    return readQwenTargetWeights<Weights>(backend, layout, gguf->get(), BlockTargetFormat{}, readFfn);
-  const AffineTargetFormat affine{};
-  if (const auto *mlx = std::get_if<std::reference_wrapper<AffineTargetLoader>>(&files))
-    return readQwenTargetWeights<Weights>(backend, layout, mlx->get(), affine, readFfn);
-  return readQwenTargetWeights<Weights>(backend, layout, std::get<PackedTargetFiles<Layout>>(files), affine,
-                                        readFfn);
+  const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
+  const MoeExperts experts =
+      layout.ffnKind == QwenFfnKind::SparseMoe ? openMoeExperts(backend, files, layout) : MoeExperts{};
+  Weights weights = [&] {
+    if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
+      return read(gguf->get(), BlockTargetFormat{}, experts);
+    if constexpr (Layout::loadsSafetensors) {
+      SafetensorsTargetLoader &safetensors = std::get<std::reference_wrapper<SafetensorsTargetLoader>>(files).get();
+      return read(safetensors, BlockTargetFormat{safetensors.float32Norms(), ops::GdnHeadOrder::Grouped}, experts);
+    } else {
+      throw WeightStoreError(std::string(Layout::family) + " loads from a GGUF only");
+    }
+  }();
+  weights.experts = experts.store;
+  weights.manifestFingerprintSha256 = weightManifestFingerprint(weights.files);
+  weights.actualAllocatedBytes = metal::allocationDelta(allocationBaseline, backend.memoryStats().allocatedBytes);
+  return weights;
 }
 
 } // namespace splash::model

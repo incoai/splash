@@ -1,4 +1,5 @@
 #include "ProtocolPeer.hpp"
+#include "TestChecks.hpp"
 #include "engine/Protocol.hpp"
 
 #include <algorithm>
@@ -26,9 +27,11 @@ using splash::ConstraintMode;
 using splash::ImageSpan;
 using splash::RequestIgnoreEndOfSequence;
 using splash::SamplingParameters;
+using splash::ThinkingBudget;
 using splash::engine::EngineFinishReason;
 using splash::engine::RequestPriority;
 using splash::model::ExecutionLimits;
+using splash::test::rejects;
 
 int failures = 0;
 
@@ -63,11 +66,12 @@ constexpr size_t frequencyPenalty = presencePenalty + 4;
 constexpr size_t repetitionPenalty = frequencyPenalty + 4;
 constexpr size_t minP = repetitionPenalty + 4;
 constexpr size_t seed = minP + 4;
-constexpr size_t returnProgress = seed + 8;
-constexpr size_t scoreCount = returnProgress + 1;
+constexpr size_t scoreCount = seed + 8;
 constexpr size_t generationPrompt = scoreCount + 4;
 constexpr size_t flags = generationPrompt + 4;
-static_assert(flags + 4 == kRequestFixedBytes);
+constexpr size_t cacheSalt = flags + 4;
+constexpr size_t thinkingBudget = cacheSalt + 16;
+static_assert(thinkingBudget + 12 == kRequestFixedBytes);
 } // namespace request_offset
 
 uint32_t loadU32(const std::vector<uint8_t> &bytes, size_t offset) {
@@ -171,6 +175,8 @@ RequestFrame exampleRequest() {
   request.sampling.seed = 0xfedcba9876543210ULL;
   request.constraint = ConstraintMode::TokenMask;
   request.generationPromptTokens = 2;
+  request.cacheSalt = {0x8899aabbccddeeffULL, 0x0011223344556677ULL};
+  request.thinkingBudget = ThinkingBudget{4096, {198, 248069}, 248058};
   return request;
 }
 
@@ -193,6 +199,7 @@ RequestFrame exampleScoreRequest() {
   request.sampling = {.seed = request.sampling.seed};
   request.constraint = ConstraintMode::None;
   request.scoreTokens = {101, 202, 303};
+  request.thinkingBudget.reset();
   return request;
 }
 
@@ -203,16 +210,24 @@ RequestFrame exampleIgnoreEosRequest() {
   return request;
 }
 
+RequestFrame exampleProgressRequest() {
+  RequestFrame request = exampleRequest();
+  request.flags = kReturnProgressFlag;
+  return request;
+}
+
 const std::vector<std::pair<std::string, ClientMessage>> &clientMessages() {
   static const std::vector<std::pair<std::string, ClientMessage>> messages{
       {"request", exampleRequest()},
       {"request_image", exampleImageRequest()},
       {"request_score", exampleScoreRequest()},
       {"request_ignore_eos", exampleIgnoreEosRequest()},
+      {"request_progress", exampleProgressRequest()},
       {"cancel", CancelFrame{91}},
       {"mask_response",
        MaskResponseFrame{91, 7, {0xffffffffU, 0, 0xa5a5a5a5U}}},
       {"status_request", StatusRequestFrame{808}},
+      {"release_request", ReleaseRequestFrame{808}},
   };
   return messages;
 }
@@ -227,12 +242,17 @@ const std::vector<std::pair<std::string, EngineEvent>> &engineEvents() {
       {"mask_request_initial", MaskRequestEvent{91, 6, 4, {}}},
       {"mask_request_verify", MaskRequestEvent{91, 7, 4, {101, 102, 103}}},
       {"done", DoneEvent{91, EngineFinishReason::Stop, 4096, 512, 1000, 2000,
-                         3500, {}}},
+                         3500, {}, 64, {350, 280, 50}}},
       {"done_scored", DoneEvent{91, EngineFinishReason::Stop, 4096, 0, 1000, 0,
-                                3500, {1.5f, -2.25f, 0.5f}}},
+                                3500, {1.5f, -2.25f, 0.5f}, 32}},
+      {"done_bounded", DoneEvent{91, EngineFinishReason::Length, 4096, 63, 1000,
+                                 2000, 3500, {}, 0, {}, true}},
       {"error_request",
        ErrorEvent{FailureClass::RequestError, 91, true, "deadline_exceeded",
                   "request deadline expired"}},
+      {"error_retry_after",
+       ErrorEvent{FailureClass::RequestError, 91, true, "kv_write_budget",
+                  "the SSD cache's write budget is spent", 21'600}},
       {"error_engine", ErrorEvent{FailureClass::EngineUnhealthy, 0, false,
                                   "gpu_fault", "Metal command buffer failed"}},
       {"error_protocol",
@@ -294,8 +314,7 @@ void testRequestRoundTrip() {
   CHECK(test, roundTrip(request) == request);
   RequestFrame withImage = exampleImageRequest();
   CHECK(test, roundTrip(withImage) == withImage);
-  RequestFrame progress = request;
-  progress.returnProgress = true;
+  RequestFrame progress = exampleProgressRequest();
   CHECK(test, roundTrip(progress) == progress);
 }
 
@@ -379,17 +398,33 @@ void testScoreRequestAndDoneLogits() {
   expectRequestIssue(test, topP, IssueCode::InvalidSampling);
 
   DoneEvent scored{91, EngineFinishReason::Stop, 4096, 0, 1000, 0, 3500,
-                   {1.5f, -2.0f, 0.25f}};
+                   {1.5f, -2.0f, 0.25f}, 96};
   CHECK(test, roundTripEvent(scored) == scored);
   auto encodedDone = serializeEvent(scored, kLimits);
   CHECK(test, encodedDone);
   if (encodedDone) {
-    CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 45 + 12);
-    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 41) == 3);
+    CHECK(test, encodedDone.value->size() == kFrameHeaderBytes + 62 + 12);
+    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 42) == 96);
+    CHECK(test, loadU32(*encodedDone.value, kFrameHeaderBytes + 58) == 3);
   }
 
   DoneEvent generation{91, EngineFinishReason::Length, 10, 4, 1, 2, 3, {}};
   CHECK(test, roundTripEvent(generation) == generation);
+  // Only a Length end is bounded.
+  DoneEvent bounded = generation;
+  bounded.bounded = true;
+  CHECK(test, roundTripEvent(bounded) == bounded);
+  DoneEvent boundedStop = bounded;
+  boundedStop.reason = EngineFinishReason::Stop;
+  expectEventIssue(test, boundedStop, IssueCode::InvalidEnumValue);
+  for (const auto counts : {splash::engine::SpeculativeCounts{7, 8, 1},
+                             splash::engine::SpeculativeCounts{7, 0, 0},
+                             splash::engine::SpeculativeCounts{0, 0, 1},
+                             splash::engine::SpeculativeCounts{7, 0, 8}}) {
+    DoneEvent invalid = generation;
+    invalid.speculation = counts;
+    expectEventIssue(test, invalid, IssueCode::InvalidCount);
+  }
 
   DoneEvent cancelled{91, EngineFinishReason::Cancelled, 10, 0, 1, 0, 3, {}};
   CHECK(test, roundTripEvent(cancelled) == cancelled);
@@ -574,12 +609,8 @@ void testHeaderFailures() {
   storeU16(version, 4, 1);
   expect(std::move(version), IssueCode::UnsupportedVersion);
 
-  auto headerSize = valid;
-  storeU16(headerSize, 6, 23);
-  expect(std::move(headerSize), IssueCode::InvalidHeaderSize);
-
   auto unknownType = valid;
-  storeU16(unknownType, 8, 0x7777);
+  storeU16(unknownType, 6, 0x7777);
   expect(std::move(unknownType), IssueCode::UnknownFrameType);
 
   // The engine never receives the frames it sends.
@@ -590,23 +621,15 @@ void testHeaderFailures() {
       expect(std::move(*wire.value), IssueCode::UnknownFrameType);
   }
 
-  auto flags = valid;
-  storeU16(flags, 10, 1);
-  expect(std::move(flags), IssueCode::NonZeroHeaderFlags);
-
-  auto reserved = valid;
-  storeU32(reserved, 20, 1);
-  expect(std::move(reserved), IssueCode::NonZeroReservedField);
-
   auto enormous = valid;
-  storeU64(enormous, 12, std::numeric_limits<uint64_t>::max());
+  storeU64(enormous, 8, std::numeric_limits<uint64_t>::max());
   expect(std::move(enormous), IssueCode::FrameTooLarge);
 
   auto tooShort = valid;
-  storeU64(tooShort, 12, 54);
+  storeU64(tooShort, 8, 54);
   expect(std::move(tooShort), IssueCode::InvalidPayloadLength);
 
-  std::vector<uint8_t> invalidMagic(24, 'r');
+  std::vector<uint8_t> invalidMagic(kFrameHeaderBytes, 'r');
   expect(std::move(invalidMagic), IssueCode::BadMagic);
 
   // A caller that keeps feeding a failed parser is a bug.
@@ -615,13 +638,8 @@ void testHeaderFailures() {
   corrupted[0] = 0;
   ParseStep first = sticky.consume(corrupted);
   CHECK(test, first.issue);
-  bool refused = false;
-  try {
-    static_cast<void>(sticky.consume(valid));
-  } catch (const std::logic_error &) {
-    refused = true;
-  }
-  CHECK(test, refused);
+  rejects([&] { static_cast<void>(sticky.consume(valid)); },
+          "native frame parser used after it failed", "a failed parser consumed more bytes");
 }
 
 void testTruncationAtEveryBoundary() {
@@ -692,10 +710,6 @@ void testMalformedPayloadClassification() {
   storeU64(zeroDeadline, kFrameHeaderBytes + request_offset::absoluteDeadline,
            0);
   expect(zeroDeadline, IssueCode::InvalidDeadline);
-
-  auto returnProgress = valid;
-  returnProgress[kFrameHeaderBytes + request_offset::returnProgress] = 2;
-  expect(returnProgress, IssueCode::InvalidEnumValue);
 
   auto nanSampling = valid;
   storeU32(nanSampling, kFrameHeaderBytes + request_offset::temperature,
@@ -859,14 +873,18 @@ void testSamplingBlock() {
   }
 }
 
-// The flags word follows the generation prompt count. Unconstrained
-// generation can ignore end-of-sequence; an undefined bit, or that flag on a
-// constrained or score request, is the request's own error.
+// The flags word follows the generation prompt count. Any request can ask
+// for its prompt's progress, unconstrained generation can ignore
+// end-of-sequence; an undefined bit, or that flag on a constrained or score
+// request, is the request's own error.
 void testRequestFlags() {
   constexpr std::string_view test = "request flags";
   RequestFrame request = exampleIgnoreEosRequest();
   CHECK(test, roundTrip(request) == request);
-  for (const uint32_t flags : {1U << 1, 1U << 31, 0xffffffffU}) {
+  RequestFrame progress = request;
+  progress.flags |= kReturnProgressFlag;
+  CHECK(test, roundTrip(progress) == progress);
+  for (const uint32_t flags : {1U << 2, 1U << 31, 0xffffffffU}) {
     RequestFrame undefined = request;
     undefined.flags = flags;
     expectRequestIssue(test, undefined, IssueCode::InvalidEnumValue);
@@ -877,6 +895,70 @@ void testRequestFlags() {
   RequestFrame score = exampleScoreRequest();
   score.flags = RequestIgnoreEndOfSequence;
   expectRequestIssue(test, score, IssueCode::InvalidConstraint);
+}
+
+// A thinking budget's tokens, end token count and alsoEnds follow the cache
+// salt and its end tokens end the frame; without one, the tokens word is
+// kNoThinkingBudget, the others are zero and no end token follows. Its end
+// holds 1 to kMaximumThinkingEndTokens tokens, and only the last may end
+// thinking.
+void testThinkingBudget() {
+  constexpr std::string_view test = "thinking budget";
+  const size_t at = kFrameHeaderBytes + request_offset::thinkingBudget;
+  const std::vector<uint8_t> wire = peer::serialize(exampleRequest());
+  CHECK(test, loadU32(wire, at) == 4096 && loadU32(wire, at + 4) == 2 &&
+                  loadU32(wire, at + 8) == 248058);
+  CHECK(test, loadU32(wire, wire.size() - 8) == 198 &&
+                  loadU32(wire, wire.size() - 4) == 248069);
+
+  RequestFrame none = exampleRequest();
+  none.thinkingBudget.reset();
+  const std::vector<uint8_t> noneWire = peer::serialize(none);
+  CHECK(test, loadU32(noneWire, at) == kNoThinkingBudget &&
+                  loadU32(noneWire, at + 4) == 0 && loadU32(noneWire, at + 8) == 0);
+  CHECK(test, noneWire.size() + 8 == wire.size());
+  CHECK(test, roundTrip(none) == none);
+  RequestFrame zero = exampleRequest();
+  zero.thinkingBudget->tokens = 0;
+  CHECK(test, roundTrip(zero) == zero);
+  RequestFrame longest = exampleRequest();
+  longest.thinkingBudget->end.assign(kMaximumThinkingEndTokens, 198);
+  longest.thinkingBudget->end.back() = 248069;
+  CHECK(test, roundTrip(longest) == longest);
+
+  const auto expectInvalidCount = [&](const std::vector<uint8_t> &bytes) {
+    const auto decoded = decodeClient(bytes, kLimits);
+    CHECK(test, !decoded && decoded.issue &&
+                    decoded.issue->failureClass == FailureClass::RequestError &&
+                    decoded.issue->code == IssueCode::InvalidCount);
+  };
+  for (const size_t word : {at + 4, at + 8}) {
+    std::vector<uint8_t> stray = noneWire;
+    storeU32(stray, word, 1);
+    expectInvalidCount(stray);
+  }
+  // The count is checked before the tokens are read.
+  std::vector<uint8_t> overlong = wire;
+  storeU32(overlong, at + 4, kMaximumThinkingEndTokens + 1);
+  expectInvalidCount(overlong);
+  std::vector<uint8_t> uncounted = wire;
+  storeU32(uncounted, at + 4, 3);
+  const auto decoded = decodeClient(uncounted, kLimits);
+  CHECK(test, !decoded && decoded.issue &&
+                  decoded.issue->code == IssueCode::InvalidPayloadLength);
+
+  for (const std::vector<uint32_t> &end :
+       {std::vector<uint32_t>{}, std::vector<uint32_t>(kMaximumThinkingEndTokens + 1, 198),
+        std::vector<uint32_t>{248069, 248069}, std::vector<uint32_t>{248058, 248069}}) {
+    RequestFrame invalid = exampleRequest();
+    invalid.thinkingBudget->end = end;
+    if (!end.empty())
+      invalid.thinkingBudget->end.back() = 248069;
+    expectRequestIssue(test, invalid, IssueCode::InvalidCount);
+  }
+  RequestFrame score = exampleScoreRequest();
+  score.thinkingBudget = ThinkingBudget{0, {248069}, 248069};
+  expectRequestIssue(test, score, IssueCode::InvalidCount);
 }
 
 std::string jsonOfExactSize(size_t bytes) {
@@ -945,6 +1027,40 @@ void testFailureTaxonomy() {
   expectEventIssue(test,
                    ErrorEvent{FailureClass::RequestError, 0, false, "bad", ""},
                    IssueCode::InvalidErrorClassification);
+  // Only a retryable error says when to retry.
+  expectEventIssue(test,
+                   ErrorEvent{FailureClass::RequestError, 5, false, "bad", "", 60},
+                   IssueCode::InvalidErrorClassification);
+}
+
+// A client frame's failure is its request's error only when the frame names
+// the request; with request id 0 it closes the stream, however else the
+// frame is malformed.
+void testUnnamedRequestFailuresAreFatal() {
+  constexpr std::string_view test = "unnamed request failures";
+  auto expect = [&](const ClientMessage &message, IssueCode code,
+                    FailureClass failureClass,
+                    const ProtocolLimits &limits = kLimits) {
+    auto decoded = decodeClient(peer::serialize(message), limits);
+    CHECK(test, !decoded && decoded.issue);
+    if (decoded.issue) {
+      CHECK(test, decoded.issue->failureClass == failureClass);
+      CHECK(test, decoded.issue->code == code);
+    }
+  };
+  RequestFrame unnamed = exampleRequest();
+  unnamed.requestId = 0;
+  expect(unnamed, IssueCode::InvalidRequestId, FailureClass::ProtocolFatal);
+  ProtocolLimits fourTokens;
+  fourTokens.maxPromptTokens = 4;
+  expect(unnamed, IssueCode::LimitExceeded, FailureClass::ProtocolFatal,
+         fourTokens);
+  expect(CancelFrame{0}, IssueCode::InvalidRequestId,
+         FailureClass::ProtocolFatal);
+  expect(MaskResponseFrame{0, 7, {1}}, IssueCode::InvalidRequestId,
+         FailureClass::ProtocolFatal);
+  expect(MaskResponseFrame{91, 0, {1}}, IssueCode::InvalidRequestId,
+         FailureClass::RequestError);
 }
 
 void testInvalidLimitsAndOuterTruncation() {
@@ -959,7 +1075,7 @@ void testInvalidLimitsAndOuterTruncation() {
   }
 
   auto claimsOneMore = peer::serialize(exampleRequest());
-  storeU64(claimsOneMore, 12, loadU64(claimsOneMore, 12) + 1);
+  storeU64(claimsOneMore, 8, loadU64(claimsOneMore, 8) + 1);
   ProtocolIssue issue = parserIssue(claimsOneMore, kLimits);
   CHECK(test, issue.code == IssueCode::TruncatedFrame);
   CHECK(test, issue.failureClass == FailureClass::ProtocolFatal);
@@ -1051,8 +1167,10 @@ int main(int argc, char **argv) {
     testPromptAndImageSpanRejections();
     testSamplingBlock();
     testRequestFlags();
+    testThinkingBudget();
     testBoundedArbitraryStatusJsonAndFrames();
     testFailureTaxonomy();
+    testUnnamedRequestFailuresAreFatal();
     testInvalidLimitsAndOuterTruncation();
     testFuzzLikeInputsAndMutations();
   } catch (const std::exception &error) {
@@ -1064,6 +1182,6 @@ int main(int argc, char **argv) {
     std::cerr << failures << " failure(s)\n";
     return 1;
   }
-  std::cout << "native current protocol tests passed\n";
+  std::cout << "native protocol tests passed\n";
   return 0;
 }

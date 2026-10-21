@@ -919,13 +919,24 @@ kernel void decode_sample_vocabulary_draw(
   }
 }
 
+// Whether no token can be selected for a logit: NaN has no order and -inf
+// no probability. A bit test, which Metal's fast math keeps.
+inline bool unselectable_logit(float value) {
+  const uint bits = as_type<uint>(value);
+  return (bits & 0x7fffffffu) > 0x7f800000u || bits == 0xff800000u;
+}
+
 // The sampling penalties of one logit: repetition divides a positive
 // logit and multiplies a negative one when the prompt or the output holds
 // the token, and presence and frequency lower it by the output's count of
-// the token. The result saturates, so no rewritten logit is infinite.
+// the token. The result saturates, so no rewritten logit is infinite; an
+// unselectable logit stays as it is, since saturating would make it
+// selectable.
 inline float penalize_logit(float value, uint count, float repetition,
                             float repetition_inverse, float presence,
                             float frequency) {
+  if (unselectable_logit(value))
+    return value;
   value *= value > 0.0f ? repetition_inverse : repetition;
   if (count)
     value -= frequency * float(count) + presence;
@@ -1293,14 +1304,17 @@ kernel void draft_select_edges(
 
 // One thread per lane walks the seven positions: the score of a candidate is
 // its unary score plus the edge from the previously chosen candidate, read
-// from the table draft_select_edges left in the partial-values scratch.
+// from the table draft_select_edges left in the partial-values scratch. It
+// writes the lane's confidence at each position (VerifyRowsParams) as it
+// walks.
 kernel void draft_select_dflash(
     device const uint *candidates [[buffer(0)]],
     device const float *unary [[buffer(1)]],
     device const float *partial_values [[buffer(2)]],
     device const float *uniforms [[buffer(3)]],
     device uint *tokens [[buffer(4)]], device float *q_probs [[buffer(5)]],
-    constant SelectorBatchParams &params [[buffer(6)]],
+    device float *confidence [[buffer(6)]],
+    constant SelectorBatchParams &params [[buffer(7)]],
     uint batch [[thread_position_in_grid]]) {
   constexpr ulong Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
   constexpr ulong Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
@@ -1313,6 +1327,7 @@ kernel void draft_select_dflash(
   uniforms += batch * SPLASH_SAMPLING_UNIFORMS;
   tokens += batch * Positions;
   q_probs += batch * Positions * Candidates;
+  confidence += batch * Positions;
 
   const bool sampling = (params.sampling_mask & (1u << batch)) != 0;
   uint predecessor_index = 0;
@@ -1322,6 +1337,15 @@ kernel void draft_select_dflash(
     float scores[Candidates];
     for (uint i = 0; i < Candidates; ++i)
       scores[i] = unary[position * Candidates + i] + edges[i];
+    // The largest of the position's candidate probabilities at temperature
+    // 1, before the lane chooses among them.
+    float best = scores[0];
+    for (uint i = 1; i < Candidates; ++i)
+      best = max(best, scores[i]);
+    float mass = 0.0f;
+    for (uint i = 0; i < Candidates; ++i)
+      mass += exp(scores[i] - best);
+    confidence[position] = 1.0f / mass;
     uint selected = 0;
     if (sampling) {
       float maximum = scores[0];
@@ -1354,6 +1378,65 @@ kernel void draft_select_dflash(
     predecessor_index = selected;
     tokens[position] = candidates[position * Candidates + selected];
   }
+}
+
+// One thread chooses every lane's verify rows (VerifyRowsParams): it ranks
+// the survivals of the lanes' proposal positions, largest first, the earlier
+// position first among equal ones, so that a lane's chosen rows are always the
+// first of its block, and takes as many as maximize the expected tokens over
+// the cost of the rows verified in all.
+kernel void draft_verify_rows(device const float *confidence [[buffer(0)]],
+                              device uint *verify_rows [[buffer(1)]],
+                              constant VerifyRowsParams &params [[buffer(2)]],
+                              uint index [[thread_position_in_grid]]) {
+  constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  constexpr uint Lanes = SPLASH_MAXIMUM_BATCH_WIDTH;
+  if (index != 0)
+    return;
+  uint rows[Lanes];
+  uint total = 0;
+  for (uint lane = 0; lane < params.lanes; ++lane) {
+    rows[lane] = params.every_row != 0 ? params.maximum[lane] : 1;
+    total += rows[lane];
+  }
+  if (params.every_row == 0) {
+    float survivals[Lanes * Positions];
+    uint owners[Lanes * Positions];
+    uint count = 0;
+    for (uint lane = 0; lane < params.lanes; ++lane) {
+      float survival = 1.0f;
+      // Row position + 2 verifies the proposal at `position`.
+      for (uint position = 0; position + 1 < params.maximum[lane]; ++position) {
+        const float q = clamp(confidence[lane * Positions + position], 1.0e-6f,
+                              1.0f - 1.0e-6f);
+        const float z = params.slope * log(q / (1.0f - q)) +
+                        params.intercept[position];
+        survival *= 1.0f / (1.0f + exp(-z));
+        uint at = count++;
+        for (; at > 0 && survivals[at - 1] < survival; --at) {
+          survivals[at] = survivals[at - 1];
+          owners[at] = owners[at - 1];
+        }
+        survivals[at] = survival;
+        owners[at] = lane;
+      }
+    }
+    float expected = float(params.lanes);
+    float best = expected / params.cost[total];
+    uint taken = 0;
+    for (uint i = 0; i < count; ++i) {
+      expected += survivals[i];
+      const float value = expected / params.cost[total + i + 1];
+      if (value > best) {
+        best = value;
+        taken = i + 1;
+      }
+    }
+    for (uint i = 0; i < taken; ++i)
+      ++rows[owners[i]];
+  }
+  for (uint lane = 0; lane < params.lanes; ++lane)
+    verify_rows[lane] = rows[lane];
 }
 
 inline float sparse_lookup(device const uint *ids,
@@ -1419,8 +1502,9 @@ inline void accept_sampled_lane(device const uint *draft_tokens,
                     accepted_count);
 }
 
-// One shard of a greedy row: its admitted token with the largest logit, the
-// lowest id among ties, per thread in token order and then over the group.
+// One shard of a greedy row: its admitted token with the largest selectable
+// logit, the lowest id among ties, per thread in token order and then over
+// the group. A row with no selectable logit keeps the sentinel id.
 inline void argmax_shard(TargetRow row, uint shard, device float &partial_value,
                          device uint &partial_index,
                          threadgroup float *group_values,
@@ -1433,6 +1517,8 @@ inline void argmax_shard(TargetRow row, uint shard, device float &partial_value,
     if (!row.admits(token))
       continue;
     float value = row.logits[token];
+    if (unselectable_logit(value))
+      continue;
     if (value > best || (value == best && token < best_index)) {
       best = value;
       best_index = token;
@@ -1508,6 +1594,65 @@ kernel void decode_sample_argmax_reduce(
     tokens[s] = token;
 }
 
+// After the selection, the thinking cutoff of each lane that has one
+// (ThinkingCutoffParams): its rows from its row on select its end tokens, or
+// where its end waits for its mask, its rows from the first of those whose
+// mask admits the end's first token. Draft token r is verify input row r + 1.
+kernel void decode_sample_thinking_cutoff(
+    device const uint *input_tokens [[buffer(0)]],
+    device const uint *token_mask [[buffer(1)]],
+    device uint *tokens [[buffer(2)]],
+    device TargetVocabularyRow *vocabulary_rows [[buffer(3)]],
+    constant ThinkingCutoffParams &params [[buffer(4)]],
+    uint lane [[threadgroup_position_in_grid]]) {
+  uint row = params.row[lane];
+  if (params.waiting_mask & (1u << lane)) {
+    // The lane's mask rows, as selected_row reads them.
+    device const uint *masks =
+        token_mask + (ulong(lane) * (SPLASH_TARGET_VERIFY_ROWS + 1) +
+                      params.mask_row) *
+                         params.mask_words;
+    const uint start = params.tokens[lane][0];
+    for (; row < params.rows; ++row) {
+      if (masks[row * params.mask_words + start / 32] & (1u << (start % 32)))
+        break;
+    }
+  }
+  if (row >= params.rows)
+    return;
+  const uint first = lane * params.rows;
+  for (uint r = 0; r < min(row, params.drafted_rows); ++r) {
+    const uint draft = input_tokens[first + r + 1];
+    if (draft == params.close[lane] || draft == params.also_ends[lane])
+      return;
+  }
+  for (uint i = 0; i < min(params.count[lane], params.rows - row); ++i) {
+    // A row with no selectable logit keeps its sentinel, so the lane fails.
+    if (tokens[first + row + i] >= params.vocabulary)
+      continue;
+    const uint end = params.tokens[lane][i];
+    tokens[first + row + i] = end;
+    if ((params.sampling_mask & (1u << lane)) && row + i < params.drafted_rows)
+      vocabulary_rows[first + row + i].draft_probability =
+          input_tokens[first + row + i + 1] == end ? 1.0f : 0.0f;
+  }
+}
+
+// Before the verify, each lane whose thinking cutoff is at row 0
+// (ThinkingCutoffParams) and whose end does not wait for its mask, which
+// only the verify reads, drafts the end tokens its verify rows will select:
+// its draft token r is its row r's.
+kernel void decode_draft_thinking_cutoff(
+    device uint *proposed_tokens [[buffer(0)]],
+    constant ThinkingCutoffParams &params [[buffer(1)]],
+    uint lane [[threadgroup_position_in_grid]]) {
+  if (params.row[lane] != 0 || (params.waiting_mask & (1u << lane)))
+    return;
+  for (uint r = 0; r < min(params.count[lane], params.drafted_rows); ++r)
+    proposed_tokens[lane * SPLASH_DRAFT_PROPOSAL_TOKENS + r] =
+        params.tokens[lane][r];
+}
+
 inline void accept_greedy_lane(device const uint *draft_tokens,
                                device uint *target_tokens,
                                device uint &retained,
@@ -1531,9 +1676,12 @@ kernel void decode_accept_dflash(
     device uint *target_tokens [[buffer(5)]],
     device uint *retained [[buffer(6)]],
     device uint *accepted_count [[buffer(7)]],
-    constant AcceptBatchParams &params [[buffer(8)]],
+    device const uint *verify_rows [[buffer(8)]],
+    constant AcceptBatchParams &params [[buffer(9)]],
     uint batch [[threadgroup_position_in_grid]]) {
-  uint remaining = params.remaining[batch];
+  // A lane retains at most the rows its verify verified (the selector's
+  // verify rows, SelectorBatchParams).
+  uint remaining = min(params.remaining[batch], verify_rows[batch]);
   AcceptParams lane_params{remaining, params.stop_token_0,
                            params.stop_token_1};
   device const uint *lane_draft =

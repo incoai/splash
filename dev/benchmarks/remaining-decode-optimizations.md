@@ -25,8 +25,9 @@ Apple10 M24 plain and residual projections use the existing eight-SIMD-group
 N128 kernel when there is at most one output tile per GPU core and K >= 4096.
 Other M24 workloads keep four SIMD groups. The conservative boundary excludes
 short dot products and grids that can benefit more from occupancy. This adds
-no kernel, scratch buffer or weight format. Apple9 policy is unchanged. (Those
-narrow grids now split K at every batch width, [device-policy.md](device-policy.md).)
+no kernel, scratch buffer or weight format. Apple9 policy is unchanged. (The
+affine Q4 kernels measured here have since been removed: every target runs the
+block kernels.)
 
 `attention-sweep` can compare two libraries with alternating order, GPU warmup
 and medians, and can select verify or prefill. Its figures describe one layer's
@@ -163,7 +164,3 @@ comparison against MLX Serve or Ollama was performed.
 
 Long-context attention remains a substantial optimization opportunity. The
 experiments above rule out these implementations, not every possible redesign.
-
-The subsequent [device-policy convergence pass](device-policy.md) preserves
-these defaults, removes superseded policy code and expands bounded offline
-calibration across core counts.

@@ -15,9 +15,9 @@
 namespace splash::test {
 
 // Prepares `lanes` verify blocks of the plain bf16 rows in `input`, `width`
-// wide, as the `layout` table and sums, with the dispatch the projections
-// issue when no producer wrote the table (the simdgroup branch of Linear::add
-// in ops/Linear.cpp and Linear::addGgufRegister in ops/LinearGguf.cpp).
+// wide, as the `layout` table and sums, with the dispatch the register tile
+// issues when no producer wrote the table (Linear::addGgufRegister in
+// ops/LinearGguf.cpp).
 inline void addReferencePreparation(metal::CommandGraph &graph, ops::LinearInput layout,
                                     const metal::MetalBuffer &input,
                                     const metal::MetalBuffer &table,
@@ -25,9 +25,7 @@ inline void addReferencePreparation(metal::CommandGraph &graph, ops::LinearInput
                                     uint32_t lanes) {
   if (layout == ops::LinearInput::Plain)
     throw std::invalid_argument("a plain input has no table to prepare");
-  graph.add(layout == ops::LinearInput::Table16 ? "decode_linear_gguf_prepare"
-                                                : "decode_linear_q4_prepare",
-            {input, table, sums}, width, {width / 32, lanes, 1}, {128, 1, 1});
+  graph.add("decode_linear_gguf_prepare", {input, table, sums}, width, {width / 32, lanes, 1}, {128, 1, 1});
 }
 
 } // namespace splash::test

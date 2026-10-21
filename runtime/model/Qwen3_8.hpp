@@ -3,41 +3,48 @@
 #include "QwenHybridLayout.hpp"
 #include "QwenTarget.hpp"
 #include "QwenTargetFiles.hpp"
+#include "metal/abi/RoPE.h"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
+#include "ops/Vision.hpp"
 
 #include <cstdint>
 #include <string_view>
 
 namespace splash::model {
 
-struct Qwen3_8Layout final : QwenHybridLayout<5> {
-  static constexpr std::string_view layerMagic = "MDFL0006";
-  static constexpr std::string_view headMagic = "MDFL0002";
-  static constexpr QwenFfnKind ffnKind = QwenFfnKind::Dense;
-
-  uint32_t intermediateSize = 17408;
+struct Qwen3_8Layout final : QwenHybridLayout {
+  // The family's name, as the installer pairs its draft (install/families.py).
+  static constexpr std::string_view family = "Qwen3.8-27B";
+  // Its config's text model type and its GGUFs' architecture; a safetensors
+  // checkpoint of it loads too.
+  static constexpr std::string_view modelType = "qwen3_5_text";
+  static constexpr std::string_view ggufArchitecture = "qwen35";
+  static constexpr bool loadsSafetensors = true;
 
   constexpr Qwen3_8Layout()
-      : QwenHybridLayout{.layers = 64,
-                         .hiddenSize = 5120,
-                         .vocabularySize = 248320,
-                         .packedGdnWidth = 16640,
-                         .packedFullWidth = 14336,
-                         .convolutionDimension = 10240,
-                         .gdnKeyHeads = 16,
-                         .gdnValueHeads = 48,
-                         .gdnHeadDimension = 128,
-                         .attentionWidth = 6144,
-                         .attentionQueryHeads = 24,
-                         .attentionKvHeads = 4,
-                         .attentionHeadDimension = 256,
-                         .rotaryPairs = 32,
-                         .rotaryTheta = 10'000'000.0F,
-                         .fullAttentionPeriod = 4,
-                         .maskToken = 248070,
-                         .stopTokens = {248044, 248046},
-                         .hiddenCaptureLayers = {5, 19, 33, 47, 61}} {}
+      : QwenHybridLayout{{.nativeContextTokens = 262'144,
+                          .yarnContextTokens = 1'010'000,
+                          .layers = 64,
+                          .hiddenSize = 5120,
+                          .vocabularySize = 248320,
+                          .packedGdnWidth = 16640,
+                          .packedFullWidth = 14336,
+                          .convolutionDimension = 10240,
+                          .gdnKeyHeads = 16,
+                          .gdnValueHeads = 48,
+                          .gdnHeadDimension = 128,
+                          .attentionWidth = 6144,
+                          .attentionQueryHeads = 24,
+                          .attentionKvHeads = 4,
+                          .attentionHeadDimension = 256,
+                          .rotaryPairs = SPLASH_TARGET_ROPE_PAIRS,
+                          .rotaryTheta = 10'000'000.0F,
+                          .fullAttentionPeriod = 4,
+                          .maskToken = 248070,
+                          .stopTokens = {248044, 248046},
+                          .ffnKind = QwenFfnKind::Dense,
+                          .intermediateSize = 17408}} {}
   bool operator==(const Qwen3_8Layout &) const = default;
 };
 
@@ -54,6 +61,6 @@ using Qwen3_8Weights = QwenTargetWeights<Qwen3_8Layout, Qwen3_8LayerWeights>;
 
 [[nodiscard]] Qwen3_8Weights
 loadQwen3_8Weights(metal::MetalBackend &backend, Qwen3_8Layout layout,
-                   const QwenTargetFiles<Qwen3_8Layout> &files);
+                   const QwenTargetFiles &files);
 
 } // namespace splash::model

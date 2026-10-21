@@ -1,7 +1,7 @@
 // Writes the tiny vision source run_vision_preparation.py writes (depth 2,
 // width 8, 2x2 patches) and prints its image's SHA-256.
 //
-//   vision-preparation mlx|gguf DIRECTORY EXPECTED
+//   vision-preparation safetensors|gguf DIRECTORY EXPECTED
 //   vision-preparation padding DIRECTORY
 //
 // EXPECTED is an independently serialized file the image and the size
@@ -61,10 +61,10 @@ int main(int argc, char **argv) {
       return 0;
     }
     if (argc != 4)
-      throw std::runtime_error("usage: vision-preparation mlx|gguf DIRECTORY EXPECTED | padding DIRECTORY");
+      throw std::runtime_error("usage: vision-preparation safetensors|gguf DIRECTORY EXPECTED | padding DIRECTORY");
     const std::string format = argv[1];
-    if (format != "mlx" && format != "gguf") throw std::runtime_error("invalid vision-preparation arguments");
-    const auto source = format == "mlx" ? model::VisionSource::Mlx
+    if (format != "safetensors" && format != "gguf") throw std::runtime_error("invalid vision-preparation arguments");
+    const auto source = format == "safetensors" ? model::VisionSource::Safetensors
                                         : model::VisionSource::Gguf;
     ops::VisionLayout layout;
     layout.depth = 2;

@@ -2,8 +2,8 @@
 
 // What the GGUF reference, planner and preparation tests share: their
 // reporting, the golden hashes (dev/tests/fixtures/weight-goldens), random
-// native blocks and F32 values, and small qwen35 and qwen35moe GGUF targets
-// in the shapes llama.cpp writes.
+// native blocks and F32 values, and small qwen35, qwen35moe and qwen4exp GGUF
+// targets in the shapes GGUF converters write.
 
 #import <Foundation/Foundation.h>
 
@@ -18,10 +18,12 @@
 #include "model/StateLayout.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <random>
 #include <span>
 #include <stdexcept>
@@ -48,6 +50,54 @@ inline constexpr uint32_t kQ8_0 = ggmlType("Q8_0"), kQ3_K = ggmlType("Q3_K"), kQ
                           kIQ3_S = ggmlType("IQ3_S"), kIQ4_XS = ggmlType("IQ4_XS");
 
 inline int failures = 0;
+
+// One tensor of the MLX quantization fixture (dev/tests/fixtures/mlx-quantization), which
+// dev/tools/mlx_quantization_fixture.py writes with MLX: its mode (affine, mxfp4 or nvfp4), bits, group size and
+// shape, MLX's packed codes, scales (bf16, or mxfp4's E8M0 and nvfp4's E4M3 bytes) and an affine tensor's bf16
+// biases, and MLX's reading of it, an affine tensor's codes and the fp32 values.
+struct MlxTensor {
+  std::string mode;
+  uint32_t bits = 0, group = 0, rows = 0, columns = 0;
+  std::vector<uint8_t> weight, scales, biases, codes, values;
+  [[nodiscard]] bool affine() const { return mode == "affine"; }
+  // Its format (metal/abi/QuantFormat.h).
+  [[nodiscard]] Fmt format() const {
+    return affine() ? Fmt(quant_affine_format_of(bits, group))
+                    : mode == "nvfp4" ? gguf_reference::NVFP4 : gguf_reference::MXFP4;
+  }
+  [[nodiscard]] std::vector<uint8_t> native() const {
+    return gguf_reference::mlxNative(format(), rows, columns, weight, scales, biases);
+  }
+};
+inline std::vector<MlxTensor> mlxFixture(const char *path) {
+  NSData *data = [NSData dataWithContentsOfFile:@(path)];
+  NSDictionary *fixture = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+  if (![fixture isKindOfClass:NSDictionary.class]) throw std::runtime_error(std::string("unreadable ") + path);
+  const auto bytes = [](NSString *hex) {
+    std::vector<uint8_t> result(hex.length / 2);
+    const char *text = hex.UTF8String;
+    for (size_t i = 0; i < result.size(); ++i)
+      result[i] = uint8_t(std::stoul(std::string(text + 2 * i, 2), nullptr, 16));
+    return result;
+  };
+  std::vector<MlxTensor> tensors;
+  for (NSDictionary *entry in fixture[@"formats"]) {
+    MlxTensor &t = tensors.emplace_back();
+    t.mode = [entry[@"mode"] UTF8String];
+    t.bits = [entry[@"bits"] unsignedIntValue];
+    t.group = [entry[@"group"] unsignedIntValue];
+    t.rows = [entry[@"rows"] unsignedIntValue];
+    t.columns = [entry[@"columns"] unsignedIntValue];
+    t.weight = bytes(entry[@"weight"]);
+    t.scales = bytes(entry[@"scales"]);
+    t.values = bytes(entry[@"values"]);
+    if (t.affine()) {
+      t.biases = bytes(entry[@"biases"]);
+      t.codes = bytes(entry[@"codes"]);
+    }
+  }
+  return tensors;
+}
 
 inline void check(bool ok, const std::string &what) {
   std::printf("%-64s %s\n", what.c_str(), ok ? "ok" : "FAIL");
@@ -93,15 +143,44 @@ inline void checkGolden(const Goldens &hashes, const std::string &name, std::spa
 }
 
 // Every byte random and every half scale a random finite half: either sign,
-// zero and subnormal included.
+// zero and subnormal included; an MLX affine format's bf16 scales and biases
+// random finite bf16s; NVFP4's and FP8's blocks as makeNative draws them.
 inline std::vector<uint8_t> fixture(Fmt f, uint32_t rows, uint32_t K, uint32_t seed) {
   std::mt19937 rng(seed);
+  if (f == gguf_reference::NVFP4 || f == gguf_reference::FP8) return gguf_reference::makeNative(f, rows, K, rng);
+  if (gguf_reference::affine(f)) {
+    std::vector<uint8_t> native((size_t)rows * gguf_reference::rowBytes(f, K));
+    for (auto &b : native) b = (uint8_t)rng();
+    for (size_t at = 0; at < native.size(); at += kQuantFormats[f].block_bytes)
+      for (size_t field = 0; field < 4; field += 2)
+        if ((native[at + field + 1] & 0x7F) == 0x7F && (native[at + field] & 0x80)) native[at + field + 1] ^= 1;
+    return native;
+  }
   return gguf_reference::makeNative(f, rows, K, rng, [&] {
     uint16_t h;
     do h = static_cast<uint16_t>(rng());
     while ((h & 0x7C00) == 0x7C00);
     return h;
   });
+}
+
+// The GGUF tensor type of a format's tensors: its table type, or llama.cpp's
+// NVFP4 for NVFP4, whose native rows the loader builds from it; none for the
+// loader's other formats (MLX affine, FP8).
+inline std::optional<uint32_t> ggufType(uint32_t format) {
+  if (format == GGUF_FMT_NVFP4) return model::ggml::kNVFP4;
+  if (quant_loader_format(format)) return std::nullopt;
+  return kQuantFormats[format].ggml_type;
+}
+
+// block_nvfp4 rows of llama.cpp's NVFP4 (ggml type 40), every byte random,
+// so their scales take every byte: 0x7F, which UE4M3 reads as 0, and those
+// of bit 7, which it ignores, included.
+inline std::vector<uint8_t> blockNvfp4Fixture(uint32_t rows, uint32_t K, uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::vector<uint8_t> blocks(size_t(rows) * K / 64 * gguf_reference::kBlockNvfp4Bytes);
+  for (auto &b : blocks) b = uint8_t(rng());
+  return blocks;
 }
 
 // F32 values in [-1, -0.5] and [0.5, 1], optionally exact bf16 values (the
@@ -117,6 +196,26 @@ inline std::vector<uint8_t> floatValues(uint64_t count, uint32_t seed, bool bflo
   return bytes;
 }
 
+// Values for Q8_0 quantization (gguf_reference::quantizeQ8_0), per 32: block
+// 0 zeros (d 0); block 1 of largest magnitude 127, so that d is 1 and the
+// others, halves exact in BF16 and F16, are ties, which roundf takes away
+// from zero; block 2 of a negative largest magnitude; the others uniform
+// draws of scale 2^e, e cycling from -28 to 4, which take d through fp16's
+// normal and subnormal range and below it, to 0.
+inline std::vector<float> q8_0Values(uint64_t count, uint32_t seed) {
+  std::mt19937 rng(seed);
+  std::vector<float> values(count);
+  for (uint64_t i = 0; i < count; ++i) {
+    const uint64_t block = i / 32, j = i % 32;
+    const float draw = float(int32_t(rng())) * 0x1p-31F;
+    if (block == 0) values[i] = 0.0F;
+    else if (block == 1) values[i] = j == 0 ? 127.0F : (j % 2 ? 1.0F : -1.0F) * (float(j * 4 % 127) + 0.5F);
+    else if (block == 2) values[i] = j == 5 ? -3.0F : 2.9F * draw;
+    else values[i] = std::ldexp(draw, int(block * 7 % 33) - 28);
+  }
+  return values;
+}
+
 // The ggml type of each quantized tensor, by name or by its name without the
 // "blk.N." prefix; every other tensor is F32.
 using TensorTypes = std::map<std::string, uint32_t>;
@@ -128,8 +227,22 @@ inline uint32_t typeOf(const TensorTypes &types, const std::string &name) {
   return found == types.end() ? model::ggml::kF32 : found->second;
 }
 
-// Every tensor of the geometry, zero, in the order llama.cpp writes them.
-inline std::vector<Tensor> targetTensors(const model::gguf::TargetGeometry &g, const TensorTypes &types) {
+// The architecture of a GGUF of a fixture geometry, each layout's
+// ggufArchitecture: qwen4exp for hyper-connected streams, else qwen35moe or
+// qwen35 by its FFN.
+inline std::string architecture(const model::QwenTargetDimensions &g) {
+  return g.hyperConnected() ? "qwen4exp" : g.ffnKind == model::QwenFfnKind::SparseMoe ? "qwen35moe" : "qwen35";
+}
+
+// The rows of a fixture's PLE table.
+inline constexpr uint64_t kPleTableRows = 96;
+
+// Every tensor of the geometry, zero, in the order GGUF converters write them:
+// with hyper-connected streams, mixes in place of the norms around each mixer
+// and the output norm; with a QSA indexer, its tensors in each
+// full-attention layer; and with a PLE embedding, its tensors in the layer it
+// feeds and its table of kPleTableRows rows.
+inline std::vector<Tensor> targetTensors(const model::QwenTargetDimensions &g, const TensorTypes &types) {
   std::vector<Tensor> tensors;
   const auto add = [&](std::string name, std::vector<uint64_t> dims) {
     const uint32_t type = typeOf(types, name);
@@ -141,9 +254,21 @@ inline std::vector<Tensor> targetTensors(const model::gguf::TargetGeometry &g, c
   };
   const uint64_t hidden = g.hiddenSize, valueRows = uint64_t{g.gdnValueHeads} * g.gdnHeadDimension;
   const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
+  const uint64_t streams = g.streamWidth();
+  // A hyper-connection mix in place of the norm `norm`.
+  const auto mix = [&](const std::string &stem, bool inject, const std::string &norm) {
+    if (!g.hyperConnected()) {
+      add(norm, {hidden});
+      return;
+    }
+    add(stem + "_norm.weight", {streams});
+    add(stem + "_down.weight", {streams, g.hyperRank});
+    add(stem + "_up.weight", {g.hyperRank, streams});
+    if (inject) add(stem + "_inject.weight", {streams, g.hyperConnections});
+  };
   for (uint32_t layer = 0; layer < g.layers; ++layer) {
     const std::string p = "blk." + std::to_string(layer) + ".";
-    add(p + "attn_norm.weight", {hidden});
+    mix(p + "hc_attn", true, p + "attn_norm.weight");
     if (g.isFullAttentionLayer(layer)) {
       add(p + "attn_q.weight", {hidden, 2ull * g.attentionWidth}); // queries and their gate
       add(p + "attn_k.weight", {hidden, kvRows});
@@ -151,6 +276,12 @@ inline std::vector<Tensor> targetTensors(const model::gguf::TargetGeometry &g, c
       add(p + "attn_q_norm.weight", {g.attentionHeadDimension});
       add(p + "attn_k_norm.weight", {g.attentionHeadDimension});
       add(p + "attn_output.weight", {g.attentionWidth, hidden});
+      if (g.hasIndexer()) {
+        add(p + "indexer.q_proj.weight", {hidden, uint64_t{g.indexerHeads} * g.indexerHeadDimension});
+        add(p + "indexer.k_proj.weight", {hidden, g.indexerHeadDimension});
+        add(p + "indexer.q_norm.weight", {g.indexerHeadDimension});
+        add(p + "indexer.k_norm.weight", {g.indexerHeadDimension});
+      }
     } else {
       add(p + "attn_qkv.weight", {hidden, g.convolutionDimension});
       add(p + "attn_gate.weight", {hidden, valueRows});
@@ -162,8 +293,8 @@ inline std::vector<Tensor> targetTensors(const model::gguf::TargetGeometry &g, c
       add(p + "ssm_norm.weight", {g.gdnHeadDimension});
       add(p + "ssm_out.weight", {valueRows, hidden});
     }
-    add(p + "post_attention_norm.weight", {hidden});
-    if (g.sparseMoe()) {
+    mix(p + "hc_ffn", true, p + "post_attention_norm.weight");
+    if (g.ffnKind == model::QwenFfnKind::SparseMoe) {
       const uint64_t experts = g.experts, width = g.expertIntermediateSize;
       add(p + "ffn_gate_inp.weight", {hidden, experts});
       add(p + "ffn_gate_exps.weight", {hidden, width, experts});
@@ -178,10 +309,19 @@ inline std::vector<Tensor> targetTensors(const model::gguf::TargetGeometry &g, c
       add(p + "ffn_up.weight", {hidden, g.intermediateSize});
       add(p + "ffn_down.weight", {g.intermediateSize, hidden});
     }
+    if (g.hasPle() && layer == g.pleLayer) {
+      add(p + "ple_key.weight", {g.pleWidth(), streams});
+      add(p + "ple_value.weight", {g.pleWidth(), hidden});
+      add(p + "ple_norm_key.weight", {streams});
+      add(p + "ple_norm_query.weight", {streams});
+      add(p + "ple_norm_conv.weight", {streams});
+      add(p + "ple_conv1d.weight", {streams, g.pleConvolutionTaps});
+    }
   }
-  add("output_norm.weight", {hidden});
+  mix("output_hc", false, "output_norm.weight");
   add("output.weight", {hidden, g.vocabularySize});
   add("token_embd.weight", {hidden, g.vocabularySize});
+  if (g.hasPle()) add("per_layer_token_embd.weight", {g.pleHeadDimension, kPleTableRows});
   return tensors;
 }
 
@@ -200,7 +340,7 @@ inline Tensor &tensorNamed(std::vector<Tensor> &tensors, const std::string &name
 
 // A small target: its geometry and its tensors.
 struct SmallTarget {
-  model::gguf::TargetGeometry geometry;
+  model::QwenTargetDimensions geometry;
   std::vector<Tensor> tensors;
   [[nodiscard]] test_gguf::Bytes &data(const std::string &name) { return tensorNamed(tensors, name).data; }
 };
@@ -227,7 +367,7 @@ inline void randomize(std::vector<Tensor> &tensors, uint32_t seed) {
 // first in its file.
 inline SmallTarget smallTarget(bool moe) {
   SmallTarget target;
-  model::gguf::TargetGeometry &g = target.geometry;
+  model::QwenTargetDimensions &g = target.geometry;
   g.hiddenSize = 512;
   g.vocabularySize = 256;
   g.gdnKeyHeads = 4;
@@ -242,6 +382,7 @@ inline SmallTarget smallTarget(bool moe) {
     g.layers = 1;
     g.gdnValueHeads = 8;
     g.convolutionDimension = 1024; // q and k of 4 heads, v of 8
+    g.ffnKind = model::QwenFfnKind::SparseMoe;
     g.experts = 4;
     g.expertsPerToken = 2;
     g.expertIntermediateSize = 256;
@@ -285,14 +426,97 @@ inline SmallTarget smallTarget(bool moe) {
   return target;
 }
 
-// The architecture metadata a GGUF of the geometry declares.
-inline std::vector<test_gguf::Key> metadata(const model::gguf::TargetGeometry &g) {
-  const std::string arch = g.architecture();
+// A small qwen4exp target: a GDN and a full-attention layer of a dense FFN,
+// four hyper-connected streams, a QSA indexer and a PLE embedding that feeds
+// the GDN layer.
+inline model::QwenTargetDimensions qwen4ExpGeometry() {
+  model::QwenTargetDimensions g;
+  g.layers = 2;
+  g.hiddenSize = 256;
+  g.vocabularySize = 256;
+  g.gdnKeyHeads = 2;
+  g.gdnValueHeads = 2;
+  g.gdnHeadDimension = 128;
+  g.convolutionDimension = 768; // q and k of 2 heads, v of 2
+  g.attentionWidth = 256;       // two query heads of 128
+  g.attentionKvHeads = 1;
+  g.attentionHeadDimension = 128;
+  g.rotaryPairs = 32;
+  g.rotaryTheta = 1e7F;
+  g.fullAttentionPeriod = 2; // layer 1
+  g.intermediateSize = 256;
+  g.hyperConnections = 4;
+  g.hyperRank = 64;
+  g.indexerHeads = 2;
+  g.indexerHeadDimension = 64;
+  g.indexerTopBlocks = 2;
+  g.indexerBlockTokens = 4;
+  g.pleLayer = 0;
+  g.pleNgram = 3;
+  g.pleHeadsPerNgram = 2;
+  g.pleHeadDimension = 64;
+  g.pleConvolutionTaps = 4;
+  return g;
+}
+
+// Its quantized tensors, Q8_0 but for the hyper-connection projections,
+// which each test sets.
+inline TensorTypes qwen4ExpTypes() {
+  return {{"attn_qkv.weight", kQ8_0},    {"attn_gate.weight", kQ8_0}, {"ssm_out.weight", kQ8_0},
+          {"attn_q.weight", kQ8_0},      {"attn_k.weight", kQ8_0},    {"attn_v.weight", kQ8_0},
+          {"attn_output.weight", kQ8_0}, {"ffn_gate.weight", kQ8_0},  {"ffn_up.weight", kQ8_0},
+          {"ffn_down.weight", kQ8_0},    {"ple_key.weight", kQ8_0},   {"ple_value.weight", kQ8_0},
+          {"output.weight", kQ8_0},      {"token_embd.weight", kQ8_0}, {"per_layer_token_embd.weight", kQ8_0}};
+}
+
+// The tensors with a MoE layer's gate and up experts tensors held as llama.cpp's fused ffn_gate_up_exps
+// (create_tensor_gate_up_exps) in the gate tensor's place: each expert's gate rows, then its up rows.
+inline std::vector<Tensor> withFusedGateUp(std::vector<Tensor> tensors, uint32_t layer, uint64_t experts) {
+  const std::string prefix = "blk." + std::to_string(layer) + ".";
+  Tensor up = tensorNamed(tensors, prefix + "ffn_up_exps.weight");
+  Tensor &gate = tensorNamed(tensors, prefix + "ffn_gate_exps.weight");
+  const size_t expertBytes = gate.data.size() / experts;
+  test_gguf::Bytes rows;
+  for (uint64_t expert = 0; expert < experts; ++expert)
+    for (const Tensor *tensor : {&gate, &up})
+      rows.insert(rows.end(), tensor->data.begin() + expert * expertBytes,
+                  tensor->data.begin() + (expert + 1) * expertBytes);
+  gate = {prefix + "ffn_gate_up_exps.weight", {gate.dims[0], 2 * gate.dims[1], gate.dims[2]}, gate.type,
+          std::move(rows)};
+  std::erase_if(tensors, [&](const Tensor &tensor) { return tensor.name == up.name; });
+  return tensors;
+}
+
+// The architecture metadata a GGUF of the geometry declares: with
+// hyper-connected streams their keys, with a QSA indexer its keys and each
+// layer's compress ratio, and with a PLE embedding its keys and layer.
+inline std::vector<test_gguf::Key> metadata(const model::QwenTargetDimensions &g) {
+  const std::string arch = architecture(g);
   std::vector<test_gguf::Key> keys{test_gguf::stringKey("general.architecture", arch)};
   const auto key = [&](const char *name, uint32_t value) {
     keys.push_back(test_gguf::uint32Key(arch + "." + name, value));
   };
   key("block_count", g.layers);
+  if (g.hyperConnected()) {
+    key("hyper_connection.count", g.hyperConnections);
+    key("hyper_connection.low_rank", g.hyperRank);
+  }
+  if (g.hasIndexer()) {
+    key("attention.indexer.head_count", g.indexerHeads);
+    key("attention.indexer.key_length", g.indexerHeadDimension);
+    key("attention.indexer.top_k", g.indexerTokens());
+    std::vector<int32_t> ratios;
+    for (uint32_t layer = 0; layer < g.layers; ++layer)
+      ratios.push_back(g.isFullAttentionLayer(layer) ? int32_t(g.indexerBlockTokens) : 0);
+    keys.push_back(test_gguf::int32ArrayKey(arch + ".attention.compress_ratios", ratios));
+  }
+  if (g.hasPle()) {
+    key("ple.ngram_size", g.pleNgram);
+    key("ple.heads_per_ngram", g.pleHeadsPerNgram);
+    key("ple.conv_kernel", g.pleConvolutionTaps);
+    key("embedding_length_per_layer_input", g.pleHeadDimension);
+    keys.push_back(test_gguf::int32ArrayKey(arch + ".ple.layers", {int32_t(g.pleLayer)}));
+  }
   key("embedding_length", g.hiddenSize);
   key("attention.head_count", g.attentionWidth / g.attentionHeadDimension);
   key("attention.head_count_kv", g.attentionKvHeads);
@@ -307,7 +531,7 @@ inline std::vector<test_gguf::Key> metadata(const model::gguf::TargetGeometry &g
   key("ssm.time_step_rank", g.gdnValueHeads);
   key("ssm.state_size", g.gdnHeadDimension);
   key("ssm.inner_size", g.gdnValueHeads * g.gdnHeadDimension);
-  if (g.sparseMoe()) {
+  if (g.ffnKind == model::QwenFfnKind::SparseMoe) {
     key("expert_count", g.experts);
     key("expert_used_count", g.expertsPerToken);
     key("expert_feed_forward_length", g.expertIntermediateSize);
@@ -320,7 +544,7 @@ inline std::vector<test_gguf::Key> metadata(const model::gguf::TargetGeometry &g
 
 // Writes a GGUF of the tensors declaring the geometry.
 inline void writeGguf(const std::filesystem::path &path, const std::vector<Tensor> &tensors,
-                      const model::gguf::TargetGeometry &geometry) {
+                      const model::QwenTargetDimensions &geometry) {
   splash::test::writeFile(path, test_gguf::file(metadata(geometry), tensors));
 }
 
