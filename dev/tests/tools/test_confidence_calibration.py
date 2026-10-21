@@ -4,6 +4,71 @@ from dev.benchmarks import confidence_calibration as calibration
 
 
 class ConfidenceCalibrationTests(unittest.TestCase):
+    def test_sequential_rounds_map_by_arm_and_pool_both_reference_rounds(self):
+        import json
+        import sys
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        binary_indices = [0, 1, 1, 0]
+        rounds = [
+            {"arm": i + 1, "server": side} for i, side in enumerate(binary_indices)
+        ]
+        report = {
+            "complete": True,
+            "scenario": "decode",
+            "residency": "sequential",
+            "settings": {"batch": 1},
+            "model": "test/model",
+            "model_manifest_sha256": "model",
+            "binaries": [],
+            "environments": [{}, {}],
+            "environment": {},
+            "tool_sha256": "tool",
+            "server_runs": [{**row, "warmup": {"rounds_per_arm": 1}} for row in rounds],
+            "cases": [{"context": 2048, "workload": "code", "rounds": rounds}],
+        }
+
+        def event(name, ident, rows, context=0):
+            return {
+                "name": name,
+                "ph": "X",
+                "ts": ident,
+                "dur": 0,
+                "args": {
+                    "id": ident,
+                    "rows": rows,
+                    "context": context,
+                    "flags": 1,
+                    "value": 0.5,
+                    "width": 1,
+                },
+            }
+
+        document = {
+            "traceEvents": [
+                event("request.active", 1, 512),
+                event("request.active", 2, 2048),
+                event("draft.confidence", 2, 1, 8),
+            ]
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "report.json").write_text(json.dumps(report))
+            for number in range(1, 5):
+                (root / f"round-{number}-trace.json").write_text(json.dumps(document))
+            output = root / "result.json"
+            with patch.object(
+                sys, "argv", ["calibrate", str(root), "--output", str(output)]
+            ):
+                calibration.main()
+            result = json.loads(output.read_text())
+        self.assertEqual(set(result["arms"]), {"1", "2"})
+        self.assertEqual([row["arm"] for row in result["inputs"]], [1, 2, 2, 1])
+        self.assertEqual(result["arms"]["1"][0]["total"], 2)
+        self.assertEqual(result["arms"]["2"][0]["total"], 2)
+
     def test_censored_suffix_is_excluded_from_calibration(self):
         common = {"context": 2048, "workload": "code", "position": 3}
         rows = [

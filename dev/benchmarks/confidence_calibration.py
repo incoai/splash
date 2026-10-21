@@ -32,7 +32,11 @@ def observations(report, document, server):
         case
         for case in report["cases"]
         for row in case["rounds"]
-        if row["server"] == server
+        if (
+            row["arm"] == server + 1
+            if report["residency"] == "sequential"
+            else row["server"] == server
+        )
     ]
     active = sorted(
         (e for e in document["traceEvents"] if e.get("name") == "request.active"),
@@ -133,7 +137,7 @@ def main():
         data = (args.directory / name).read_bytes()
         rows = observations(report, json.loads(data), server)
         arm = (
-            report["server_runs"][server]["arm"]
+            report["server_runs"][server]["server"] + 1
             if report["residency"] == "sequential"
             else server + 1
         )
