@@ -1,8 +1,8 @@
 """A video model's engine (runtime/video/VideoRuntime.hpp) for the server's
-tests: fake_video_engine.py LOG STEP_SECONDS. Each request denoises in four
-steps of STEP_SECONDS, unless a Cancel ends it, then sends its preview when
-asked and its clip, each the request's seed. LOG gets a JSON line per request
-and per cancel."""
+tests: fake_video_engine.py LOG STEP_SECONDS [fail]. Each request denoises in
+four steps of STEP_SECONDS, unless a Cancel ends it, then sends its preview
+when asked and its clip, each the request's seed; with `fail`, the engine's
+error instead. LOG gets a JSON line per request and per cancel."""
 
 import json
 import os
@@ -16,7 +16,7 @@ from dev.tests import native_peer  # noqa: E402
 from server import protocol as wire  # noqa: E402
 
 
-def main(log, step_seconds):
+def main(log, step_seconds, fail):
     reader, pending, cancelled = native_peer.ClientFrameReader(), [], set()
 
     def send(event):
@@ -57,6 +57,10 @@ def main(log, step_seconds):
             )
             poll(step_seconds)
         else:
+            if fail:
+                send(wire.ErrorEvent(wire.FailureClass.REQUEST_ERROR, number, False,
+                                     b"video_engine_failed", b"the video VAE failed"))  # fmt: skip
+                continue
             if request.outputs & wire.VideoOutputFlag.PREVIEW:
                 kind = wire.VideoOutputKind.PREVIEW
                 send(wire.VideoOutputEvent(number, kind, 25, 0, b"preview" + seed))
@@ -66,4 +70,4 @@ def main(log, step_seconds):
 
 if __name__ == "__main__":
     with open(sys.argv[1], "a") as log:
-        main(log, float(sys.argv[2]))
+        main(log, float(sys.argv[2]), sys.argv[3:] == ["fail"])

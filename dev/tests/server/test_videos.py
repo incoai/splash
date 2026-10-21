@@ -1,6 +1,6 @@
 """A video model's server (server/videos.py) over a stand-in engine
-(dev/tests/fake_video_engine.py): a job through OpenAI's SDK, and the one clip
-`splash generate` runs."""
+(dev/tests/fake_video_engine.py): a job through OpenAI's SDK and the bounds of
+the jobs' queue and store, and the one clip `splash generate` runs."""
 
 import contextlib
 import io
@@ -29,8 +29,9 @@ def tokenize(text, add_special_tokens):
     return {"input_ids": [ord(character) for character in text]}
 
 
-def engine(log, step_seconds=0.0):
-    started = videos.VideoEngine([sys.executable, ENGINE, log, str(step_seconds)], 30)
+def engine(log, step_seconds=0.0, fail=False):
+    command = [sys.executable, ENGINE, log, str(step_seconds)] + ["fail"] * fail
+    started = videos.VideoEngine(command, 30)
     started.start()
     return started
 
@@ -41,9 +42,9 @@ def taken(log):
 
 
 class VideoServerTest(unittest.TestCase):
-    def setUp(self):
+    def serve(self, step_seconds=0.0):
         self.log = Path(self.enterContext(tempfile.TemporaryDirectory())) / "log"
-        app = videos.VideoApp(MODEL, ("h3",), engine(self.log), tokenize)
+        app = videos.VideoApp(MODEL, ("h3",), engine(self.log, step_seconds), tokenize)
         self.addCleanup(app.close)
         server = api.FrontendServer(("127.0.0.1", 0), app)
         server.RequestHandlerClass = videos.handler(api.FrontendHandler)
@@ -51,10 +52,14 @@ class VideoServerTest(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         self.client = openai.OpenAI(
-            base_url=f"http://127.0.0.1:{server.server_port}/v1", api_key="unused"
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="unused",
+            max_retries=0,
         )
+        return app
 
     def test_a_job_runs_and_its_clip_and_preview_download_until_deleted(self):
+        self.serve()
         videos_api = self.client.videos
         created = videos_api.create(
             prompt="a cat", model=MODEL, extra_body={"seed": 7, "preview": "true"}
@@ -73,10 +78,29 @@ class VideoServerTest(unittest.TestCase):
             videos_api.retrieve(video.id)
 
     def test_an_invalid_request_is_refused_in_openais_shape(self):
+        self.serve()
         with self.assertRaises(openai.BadRequestError) as refused:
             self.client.videos.create(prompt="a cat", seconds="4")
         self.assertEqual(refused.exception.code, "invalid_request_error")
         self.assertEqual(taken(self.log), [])
+
+    def test_the_queue_and_the_store_are_bounded(self):
+        app = self.serve(step_seconds=0.2)
+        app.videos.budget_bytes = 12  # one 8-byte clip
+        videos_api = self.client.videos
+        jobs = [videos_api.create(prompt="job 0")]
+        while videos_api.retrieve(jobs[0].id).status != "in_progress":
+            time.sleep(0.02)
+        jobs += [videos_api.create(prompt=f"job {n}", extra_body={"seed": n})
+                 for n in range(1, videos.MAX_QUEUED_JOBS + 1)]  # fmt: skip
+        with self.assertRaises(openai.APIStatusError) as refused:
+            videos_api.create(prompt="one too many")
+        self.assertEqual((refused.exception.status_code, refused.exception.code),
+                         (503, "video_queue_full"))  # fmt: skip
+        videos_api.poll(jobs[-1].id, poll_interval_ms=20)
+        listed = videos_api.list(order="asc", limit=100)
+        self.assertEqual([video.id for video in listed.data], [jobs[-1].id])
+        self.assertEqual(app.videos.status()["evictions"], videos.MAX_QUEUED_JOBS)
 
 
 class GenerateTest(unittest.TestCase):
@@ -90,9 +114,9 @@ class GenerateTest(unittest.TestCase):
         self.log = self.directory / "log"
         self.log.touch()
 
-    def generate(self, video=True, step_seconds=0.0):
+    def generate(self, video=True, step_seconds=0.0, fail=False):
         def load(*_):
-            return engine(self.log, step_seconds), tokenize
+            return engine(self.log, step_seconds, fail), tokenize
 
         with (
             mock.patch.object(videos.assembly, "hold", lambda path: (path, None)),
@@ -120,6 +144,12 @@ class GenerateTest(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn("is a language model", stderr)
         self.assertEqual(taken(self.log), [])
+
+    def test_an_engine_error_fails_the_clip(self):
+        status, stderr = self.generate(fail=True)
+        self.assertEqual(status, 1)
+        self.assertIn("Error · the video VAE failed", stderr)
+        self.assertFalse((self.directory / "clip.mp4").exists())
 
     def test_a_stop_cancels_the_clip_at_its_next_step(self):
         def interrupt():
