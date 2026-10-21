@@ -3,6 +3,7 @@
 #include "metal/abi/HyperConnection.h"
 #include "ops/BufferExtent.hpp"
 
+#include <cmath>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -88,6 +89,18 @@ void HyperConnection::addCombine(metal::CommandGraph &graph, metal::MetalBuffer 
   requireShape(shape);
   graph.add("hyper_connection_combine", {std::move(streams), std::move(branch), std::move(weights)},
             hyperParams(shape, rows), {rows, groups(shape.hidden), 1}, {kThreads, 1, 1});
+}
+
+void HyperConnection::addSteer(metal::CommandGraph &graph, metal::MetalBuffer streams,
+                               metal::MetalBuffer directions, HyperSteer steer, HyperShape shape, uint32_t rows) {
+  requireShape(shape);
+  if (!rows || !std::isfinite(steer.scale)) throw std::invalid_argument("invalid control vector step");
+  requireBytes(streams, uint64_t{rows} * shape.width() * sizeof(float), "steered streams");
+  requireBytes(directions, (uint64_t{steer.layer} + 1) * shape.hidden * sizeof(float), "control vector directions");
+  const uint32_t mode = steer.project ? HYPER_CONNECTION_STEER_PROJECT : HYPER_CONNECTION_STEER_ADD;
+  const HyperSteerParams params{rows, shape.hidden, shape.streams, steer.layer, mode, steer.scale};
+  graph.add("hyper_connection_steer", {std::move(streams), std::move(directions)}, params,
+            {rows, shape.streams, 1}, {kThreads, 1, 1});
 }
 
 void HyperConnection::addStreamMean(metal::CommandGraph &graph, metal::MetalBuffer streams,
