@@ -67,7 +67,7 @@ The profiler now saves per-cycle timing, committed output counts, proposal and
 acceptance counts, prefix survival and eligible expert rows. Optional ordinary
 command traces separate graph construction, backend preparation, Metal encoding,
 GPU execution, completion notification and finalization. Production builds do
-not include backend tracing. The new [sweep](verification_sweep.py) reuses the
+not include backend tracing. The new [sweep](https://github.com/linson007/splash/blob/b8e7c98df0e52289c39e8001e38b22fc762a9f06/dev/benchmarks/verification_sweep.py) reuses the
 existing ABBA comparison rule.
 
 ## Performance
