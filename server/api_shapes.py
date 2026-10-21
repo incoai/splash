@@ -2,26 +2,38 @@
 
 from __future__ import annotations
 
-import copy
-import hashlib
 import json
-import re
 
-if __package__:
-    from . import json_codec
-    from .documents import DocumentBudget, document_parts, file_content
-    from .errors import APIError
-    from .metrics import metrics_dict, timings_dict, usage_dict
-else:  # ``python server/server.py`` from the repo root.
-    import json_codec
-    from documents import DocumentBudget, document_parts, file_content
-    from errors import APIError
-    from metrics import metrics_dict, timings_dict, usage_dict
+from . import json_codec
+from . import protocol as wire
+from .documents import DocumentBudget, document_parts, file_content
+from .errors import APIError
+from .metrics import timings_dict, usage_dict
+from .tool_schema import TAG_NAME_RULE, is_tag_name
 
 IMAGE_PAD_TOKEN = "<|image_pad|>"
 VISION_UNAVAILABLE = (
     "this model is serving without vision (started with --language-only)"
 )
+
+
+def _field(value, key, default):
+    """`value`'s field `key`, or `default` where it is absent or null, as a
+    null field is one left out."""
+    field = value.get(key)
+    return default if field is None else field
+
+
+# Chat's and Responses' kinds of text part. An assistant's refusal is text it
+# wrote, in a field of its own.
+TEXT_PARTS = ("text", "input_text", "output_text", "refusal")
+
+
+def _part_text(part):
+    text = _field(part, "refusal" if part["type"] == "refusal" else "text", "")
+    if not isinstance(text, str):
+        raise APIError(400, "text message content must be a string")
+    return text
 
 
 def _text_content(content):
@@ -32,15 +44,10 @@ def _text_content(content):
     if isinstance(content, list):
         parts = []
         for part in content:
-            if not isinstance(part, dict) or part.get("type") not in (
-                "text",
-                "input_text",
-            ):
+            kind = part.get("type") if isinstance(part, dict) else None
+            if kind not in TEXT_PARTS:
                 raise APIError(400, "only text message content is supported")
-            text = part.get("text", "")
-            if not isinstance(text, str):
-                raise APIError(400, "text message content must be a string")
-            parts.append(text)
+            parts.append(_part_text(part))
         return "".join(parts)
     raise APIError(400, "message content must be text")
 
@@ -78,16 +85,13 @@ def _user_content(content, document_budget, vision):
         if not isinstance(part, dict):
             raise APIError(400, "message content parts must be objects")
         kind = part.get("type")
-        if kind == "image_url":
+        if kind in ("image_url", "input_image"):
             _require_vision("image", vision)
             image_url = part.get("image_url")
             url = image_url.get("url") if isinstance(image_url, dict) else image_url
             parts.append(_image_part(url))
-        elif kind in ("text", "input_text"):
-            text = part.get("text", "")
-            if not isinstance(text, str):
-                raise APIError(400, "text message content must be a string")
-            parts.append({"type": "text", "text": text})
+        elif kind in TEXT_PARTS:
+            parts.append({"type": "text", "text": _part_text(part)})
         elif kind == "file":
             _require_vision("PDF", vision)
             parts.extend(file_content(part.get("file"), budget=document_budget))
@@ -98,115 +102,28 @@ def _user_content(content, document_budget, vision):
     return _media_content(parts)
 
 
-_JSON_NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
-_JSON_STRING_SPECIAL = re.compile(r'["\\\x00-\x1f]')
+def _call_arguments(arguments):
+    """A history call's arguments: an object, as sent or as JSON text of one;
+    otherwise their text, the string as sent or another value's JSON, which
+    template_messages keeps as text, so that a conversation continues past a
+    call the output limit cut or the model wrote wrong."""
+    if arguments is None:
+        return {}
+    if isinstance(arguments, str):
+        try:
+            # Some providers send a call without arguments as "".
+            parsed = json_codec.loads(arguments.strip() or "{}")
+        except ValueError:
+            return arguments
+        return parsed if isinstance(parsed, dict) else arguments
+    return arguments if isinstance(arguments, dict) else json_codec.dumps(arguments)
 
 
-def _unfinished_json(text):
-    """Recognize unfinished JSON in linear space/time, without building values.
-
-    The stack holds one expectation per container, so flat arrays and long
-    strings use constant auxiliary memory. Only a valid prefix is accepted.
-    """
-    stack = ["value"]
-    pos, size = 0, len(text)
-    while pos < size:
-        char = text[pos]
-        if char in " \t\r\n":
-            pos += 1
-            continue
-        expected = stack[-1]
-        if expected in ("array_end", "object_end"):
-            if char == ("]" if expected == "array_end" else "}"):
-                stack.pop()
-            elif char == ",":
-                stack[-1] = "array_value" if expected == "array_end" else "key"
-            else:
-                return False
-            pos += 1
-            continue
-        if expected == "colon":
-            if char != ":":
-                return False
-            stack[-1] = "object_value"
-            pos += 1
-            continue
-        if expected in ("array_first", "object_first") and char == (
-            "]" if expected == "array_first" else "}"
-        ):
-            stack.pop()
-            pos += 1
-            continue
-        if expected == "done":
-            return False
-        key = expected in ("key", "object_first")
-        if key and char != '"':
-            return False
-        # Record the continuation before consuming a scalar or entering a
-        # nested container. Root completion stays on the stack as a sentinel.
-        if key:
-            stack[-1] = "colon"
-        elif expected == "value":
-            stack[-1] = "done"
-        elif expected == "object_value":
-            stack[-1] = "object_end"
-        else:
-            stack[-1] = "array_end"
-        if char in "[{":
-            stack.append("array_first" if char == "[" else "object_first")
-            pos += 1
-        elif char == '"':
-            pos += 1
-            while True:
-                special = _JSON_STRING_SPECIAL.search(text, pos)
-                if special is None:
-                    return True
-                pos = special.start() + 1
-                char = special.group()
-                if char == '"':
-                    break
-                if char != "\\":
-                    return False
-                if pos == size:
-                    return True
-                escape = text[pos]
-                pos += 1
-                if escape == "u":
-                    end = min(pos + 4, size)
-                    if any(c not in "0123456789abcdefABCDEF" for c in text[pos:end]):
-                        return False
-                    if end - pos < 4:
-                        return True
-                    pos = end
-                elif escape not in '"\\/bfnrt':
-                    return False
-        elif char in "tfn":
-            literal = {"t": "true", "f": "false", "n": "null"}[char]
-            available = text[pos : pos + len(literal)]
-            if not literal.startswith(available):
-                return False
-            pos += len(available)
-            if len(available) < len(literal):
-                return True
-        else:
-            number = _JSON_NUMBER.match(text, pos)
-            if number is None:
-                return char == "-" and pos + 1 == size
-            start, pos = pos, number.end()
-            if size - pos <= 2:
-                suffix = text[pos:]
-                exponent = (
-                    text.find("e", start, pos) >= 0 or text.find("E", start, pos) >= 0
-                )
-                if suffix in ("e", "E", "e+", "e-", "E+", "E-"):
-                    return not exponent
-                if suffix == ".":
-                    return not exponent and text.find(".", start, pos) < 0
-    return stack != ["done"]
-
-
-def normalize_messages(messages, *, vision, deadline=None):
-    document_budget = DocumentBudget(deadline=deadline)
+def normalize_messages(messages, *, vision, deadline, without_slot):
+    """`messages` checked and in canonical form, each PDF rendered to its
+    pages under `without_slot`, which gives a request in preparation its
+    slot back meanwhile."""
+    document_budget = DocumentBudget(deadline=deadline, without_slot=without_slot)
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "messages must be a non-empty array")
     normalized = []
@@ -236,47 +153,39 @@ def normalize_messages(messages, *, vision, deadline=None):
             if role in ("user", "tool")
             else _text_content(content),
         }
-        if role == "assistant" and message.get("reasoning_content") is not None:
-            item["reasoning_content"] = _text_content(message["reasoning_content"])
+        if role == "assistant":
+            # Clients send an assistant's reasoning back as Splash's
+            # reasoning_content or as reasoning text.
+            reasoning = message.get("reasoning_content")
+            if reasoning is None and isinstance(message.get("reasoning"), str):
+                reasoning = message["reasoning"]
+            if reasoning is not None:
+                item["reasoning_content"] = _text_content(reasoning)
         if role == "assistant" and message.get("tool_calls") is not None:
             if not isinstance(message["tool_calls"], list):
                 raise APIError(400, "assistant tool_calls must be an array")
             calls = []
             for call in message["tool_calls"]:
                 function = call.get("function") if isinstance(call, dict) else None
-                if not isinstance(function, dict):
-                    raise APIError(400, "invalid assistant tool call")
-                arguments = function.get("arguments", {})
-                unfinished = False
-                if isinstance(arguments, str):
-                    try:
-                        # Some providers send a call without arguments as "".
-                        arguments = json_codec.loads(arguments.strip() or "{}")
-                    except ValueError as error:
-                        # Preserve calls truncated by the output limit in history
-                        # so the conversation can continue. Invalid complete JSON
-                        # is still rejected.
-                        if not _unfinished_json(arguments):
-                            raise APIError(
-                                400, "tool call arguments must be valid JSON"
-                            ) from error
-                        unfinished = True
-                if not (isinstance(arguments, dict) or unfinished) or not isinstance(
+                if not isinstance(function, dict) or not isinstance(
                     function.get("name"), str
                 ):
                     raise APIError(400, "invalid assistant tool call")
                 calls.append(
                     {
                         "type": "function",
-                        "function": {"name": function["name"], "arguments": arguments},
+                        "function": {
+                            "name": function["name"],
+                            "arguments": _call_arguments(function.get("arguments")),
+                        },
                     }
                 )
-                if "id" in call:
+                if call.get("id") is not None:
                     if not isinstance(call["id"], str):
                         raise APIError(400, "tool call id must be a string")
                     calls[-1]["id"] = call["id"]
             item["tool_calls"] = calls
-        if role == "tool" and "tool_call_id" in message:
+        if role == "tool" and message.get("tool_call_id") is not None:
             tool_call_id = message["tool_call_id"]
             if not isinstance(tool_call_id, str):
                 raise APIError(400, "tool_call_id must be a string")
@@ -288,7 +197,8 @@ def normalize_messages(messages, *, vision, deadline=None):
 
 
 def template_messages(messages):
-    """Keep unfinished call text without presenting it as complete arguments."""
+    """Keep a call whose arguments are text, not an object, as text, without
+    presenting it as a complete call."""
     result = []
     for message in messages:
         calls = message.get("tool_calls", [])
@@ -463,26 +373,22 @@ def normalize_responses_input(instructions, items):
 
 
 def canonical_responses_input(items):
+    """A Responses input as its list of items, a string as one user message."""
     if isinstance(items, str):
         return [{"type": "message", "role": "user", "content": items}]
     if not isinstance(items, list):
         raise APIError(400, "input must be a non-empty string or array")
-    return copy.deepcopy(items)
+    return items
 
 
 def _namespace_alias(namespace, name):
-    if (
-        not isinstance(namespace, str)
-        or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", namespace) is None
-        or not isinstance(name, str)
-        or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name) is None
+    """The name a namespace's function goes by in the prompt and its calls,
+    which the tools' own name rule then applies to."""
+    if not (
+        isinstance(namespace, str) and namespace and isinstance(name, str) and name
     ):
         raise APIError(400, "invalid namespace tool name")
-    alias = f"{namespace}__{name}"
-    if len(alias) <= 64:
-        return alias
-    digest = hashlib.sha256(f"{namespace}\0{name}".encode()).hexdigest()[:16]
-    return f"{namespace[:20]}__{name[:24]}__{digest}"
+    return f"{namespace}__{name}"
 
 
 def _response_function(tool, name=None):
@@ -497,8 +403,6 @@ def _response_function(tool, name=None):
 
 
 def normalize_responses_tools(tools):
-    if tools is None:
-        return None
     if not isinstance(tools, list):
         raise APIError(400, "tools must be an array")
     output, namespaces = [], {}
@@ -548,22 +452,20 @@ def _responses_format(text):
     }
 
 
-def responses_to_chat_body(body, previous_items=()):
+def responses_to_chat_body(body, items):
+    """A Responses request as a Chat body, and the namespace and name of
+    each namespaced tool by its alias. `items` are the request's canonical
+    input items after those of the response it continues."""
     if body.get("conversation") is not None:
         raise APIError(400, "conversation is not supported")
     if body.get("background") not in (None, False):
         raise APIError(400, "background responses are not supported")
     if body.get("truncation") not in (None, "disabled"):
         raise APIError(400, "only disabled truncation is supported")
-    if body.get("context_management") not in (None, []):
-        raise APIError(400, "Responses context_management edits are not supported")
     if body.get("stream") is not None and not isinstance(body["stream"], bool):
         raise APIError(400, "stream must be a boolean")
-    current_items = canonical_responses_input(body.get("input"))
     chat = {
-        "messages": normalize_responses_input(
-            body.get("instructions"), [*previous_items, *current_items]
-        ),
+        "messages": normalize_responses_input(body.get("instructions"), items),
         "parallel_tool_calls": body.get("parallel_tool_calls"),
     }
     namespaces = {}
@@ -591,21 +493,26 @@ def responses_to_chat_body(body, previous_items=()):
     if response_format is not None:
         chat["response_format"] = response_format
     aliases = {"max_output_tokens": "max_completion_tokens"}
+    # Chat validates what it receives, so a field Splash cannot honor, such
+    # as logit_bias, is refused rather than dropped.
     for field_name in (
         "model",
-        "temperature",
-        "top_p",
-        "top_k",
+        *wire.SAMPLING_FIELDS,
+        "logit_bias",
         "seed",
         "timeout",
         "priority",
+        "cache_salt",
         "stop",
         "max_output_tokens",
+        "ignore_eos",
+        "chat_template_kwargs",
+        "preserve_thinking",
+        "thinking_token_budget",
     ):
         if field_name in body and body[field_name] is not None:
             chat[aliases.get(field_name, field_name)] = body[field_name]
-    chat["_tool_namespaces"] = namespaces
-    return chat
+    return chat, namespaces
 
 
 def _anthropic_system_text(value, label):
@@ -661,6 +568,9 @@ def _anthropic_content(value, label):
 
 
 def anthropic_to_chat_body(body, *, thinking_resolver):
+    """A Messages generation request as a Chat body, and how its response
+    shows reasoning. count_tokens converts only the prompt, so it still
+    counts a final assistant message."""
     max_tokens = body.get("max_tokens")
     if (
         not isinstance(max_tokens, int)
@@ -670,7 +580,15 @@ def anthropic_to_chat_body(body, *, thinking_resolver):
         raise APIError(400, "max_tokens must be a positive integer")
     if not isinstance(body.get("stream", False), bool):
         raise APIError(400, "stream must be a boolean")
-    chat = anthropic_to_chat_prompt(body, thinking_resolver=thinking_resolver)
+    chat, thinking_display = _anthropic_chat(body, thinking_resolver)
+    # Anthropic continues a final assistant message (a prefill); Splash would
+    # close that turn and start another, so it refuses it.
+    if chat["messages"] and chat["messages"][-1]["role"] == "assistant":
+        raise APIError(
+            400,
+            "a final assistant message (prefill) is not supported; "
+            "end messages with a user turn",
+        )
     chat.update(
         max_completion_tokens=max_tokens,
         stop=body.get("stop_sequences"),
@@ -680,40 +598,92 @@ def anthropic_to_chat_body(body, *, thinking_resolver):
         seed=body.get("seed"),
         timeout=body.get("timeout"),
         priority=body.get("priority"),
+        cache_salt=body.get("cache_salt"),
     )
-    return {key: value for key, value in chat.items() if value is not None}
+    chat = {key: value for key, value in chat.items() if value is not None}
+    return chat, thinking_display
 
 
 def _anthropic_preserve_thinking(context_management):
-    if context_management is None:
-        return None
-    if not isinstance(context_management, dict):
-        raise APIError(400, "context_management must be an object")
-    edits = context_management.get("edits", [])
-    if not isinstance(edits, list):
-        raise APIError(400, "context_management.edits must be an array")
-    for edit in edits:
-        if (
-            not isinstance(edit, dict)
-            or edit.get("type") != "clear_thinking_20251015"
-            or edit.get("keep") != "all"
-        ):
+    """True when a Messages request keeps every turn's thinking: its
+    context_management clears none (clear_thinking_20251015 with keep: all).
+    Splash makes no other edit, so the model reads the conversation as
+    sent."""
+    edits = (
+        context_management.get("edits")
+        if isinstance(context_management, dict)
+        else None
+    )
+    if isinstance(edits, list) and any(
+        isinstance(edit, dict)
+        and edit.get("type") == "clear_thinking_20251015"
+        and edit.get("keep") == "all"
+        for edit in edits
+    ):
+        return True
+    return None
+
+
+def _anthropic_thinking(thinking, effort):
+    """The reasoning effort and the reasoning display of a Messages
+    request's thinking, which is off when omitted."""
+    if thinking is None:
+        return "none", "summarized"
+    if not isinstance(thinking, dict) or thinking.get("type") not in (
+        "enabled",
+        "disabled",
+        "adaptive",
+    ):
+        raise APIError(400, "thinking.type must be enabled, disabled, or adaptive")
+    thinking_type = thinking["type"]
+    display = thinking.get("display")
+    if display is not None:
+        if thinking_type == "disabled":
+            raise APIError(
+                400, "thinking.display requires enabled or adaptive thinking"
+            )
+        if display not in ("summarized", "omitted", "updates"):
             raise APIError(
                 400,
-                "only clear_thinking_20251015 with keep: all is supported "
-                "in context_management.edits",
+                "thinking.display must be summarized, omitted, updates, or null",
             )
-    return True if edits else None
+    return (
+        "none" if thinking_type == "disabled" else effort,
+        # Models expose reasoning and text, not separate progress-update blocks.
+        "omitted" if display in ("omitted", "updates") else "summarized",
+    )
+
+
+def _anthropic_thinking_budget(thinking):
+    """The budget_tokens of enabled thinking, which caps it: at least 1024,
+    as Messages requires. One at or above max_tokens, which Messages allows
+    with interleaved thinking, caps nothing. Adaptive thinking sets none."""
+    if not isinstance(thinking, dict) or thinking.get("type") != "enabled":
+        return None
+    budget = thinking.get("budget_tokens")
+    if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1024:
+        raise APIError(
+            400, "thinking.budget_tokens must be an integer of at least 1024"
+        )
+    return budget
 
 
 def anthropic_to_chat_prompt(body, *, thinking_resolver):
+    """The prompt of a Messages request as a Chat body, as count_tokens
+    counts it."""
+    return _anthropic_chat(body, thinking_resolver)[0]
+
+
+def _anthropic_chat(body, thinking_resolver):
+    """A Messages request's prompt as a Chat body, and how its response
+    shows reasoning."""
     if not isinstance(body.get("model"), str) or not body["model"]:
         raise APIError(400, "model must be a non-empty string")
     preserve_thinking = _anthropic_preserve_thinking(body.get("context_management"))
     output_config = body.get("output_config", {})
     if not isinstance(output_config, dict):
         raise APIError(400, "output_config must be an object")
-    effort = output_config.get("effort", "high")
+    effort = _field(output_config, "effort", "high")
     if not isinstance(effort, str) or effort not in (
         "low",
         "medium",
@@ -722,243 +692,309 @@ def anthropic_to_chat_prompt(body, *, thinking_resolver):
         "max",
     ):
         raise APIError(400, "output_config.effort is invalid")
-    if "format" in output_config and "output_format" in body:
-        raise APIError(400, "output_config.format and output_format cannot be combined")
-    response_format = None
-    if "format" in output_config or "output_format" in body:
-        output_format = output_config.get("format", body.get("output_format"))
-        if (
-            not isinstance(output_format, dict)
-            or output_format.get("type") != "json_schema"
-            or not isinstance(output_format.get("schema"), (dict, bool))
-        ):
-            raise APIError(
-                400, "output format must be a json_schema object with a schema"
-            )
-        response_format = {
-            "type": "json_schema",
-            "json_schema": {"schema": output_format["schema"]},
-        }
+    response_format = _anthropic_response_format(body, output_config)
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "messages must be a non-empty array")
-
-    translated = []
-    system_text = None
     system = body.get("system")
-    if system is not None:
-        system_text = _anthropic_system_text(system, "system")
-    for message in messages:
-        if not isinstance(message, dict):
-            raise APIError(400, "Anthropic messages must be objects")
-        role = message.get("role")
-        content = message.get("content")
-        if role not in ("user", "assistant", "system"):
-            raise APIError(
-                400, "Anthropic messages require user/assistant/system roles"
-            )
-        if role == "system":
-            text = _anthropic_system_text(content, "system message")
-            if text:
-                translated.append({"role": "system", "content": text})
-            continue
-        if isinstance(content, str):
-            translated.append({"role": role, "content": content})
-            continue
-        if not isinstance(content, list):
-            raise APIError(400, "Anthropic message content must be text or blocks")
-        text_parts = []
-        user_blocks = []
-        reasoning_parts = []
-        tool_calls = []
-        tool_results = []
-        for block in content:
-            if not isinstance(block, dict):
-                raise APIError(400, "Anthropic content blocks must be objects")
-            kind = block.get("type")
-            if kind == "text" and isinstance(block.get("text"), str):
-                text_parts.append(block["text"])
-                user_blocks.append(block)
-            elif role == "user" and kind in ("image", "document"):
-                user_blocks.append(block)
-            elif (
-                role == "assistant"
-                and kind == "thinking"
-                and isinstance(block.get("thinking"), str)
-            ):
-                signature = block.get("signature", "")
-                if not isinstance(signature, str):
-                    raise APIError(400, "invalid thinking signature")
-                if signature:
-                    try:
-                        reasoning = thinking_resolver(signature)
-                    except APIError as error:
-                        # Other providers' signatures are opaque, as are ours
-                        # under another key. Preserve their visible history;
-                        # hidden content is dropped, as redacted_thinking is.
-                        if error.code != "invalid_thinking_signature":
-                            raise
-                        reasoning = block["thinking"]
-                    if reasoning:
-                        reasoning_parts.append(reasoning)
-                else:
-                    reasoning_parts.append(block["thinking"])
-            elif role == "assistant" and kind == "redacted_thinking":
-                if not isinstance(block.get("data"), str) or not block["data"]:
-                    raise APIError(400, "invalid redacted_thinking data")
-                # Provider-encrypted reasoning cannot be rendered in this
-                # model's prompt. Keep the surrounding visible history.
-            elif role == "assistant" and kind == "tool_use":
-                if (
-                    not isinstance(block.get("id"), str)
-                    or not isinstance(block.get("name"), str)
-                    or not isinstance(block.get("input"), dict)
-                ):
-                    raise APIError(400, "invalid Anthropic tool_use block")
-                tool_calls.append(
-                    {
-                        "id": block["id"],
-                        "type": "function",
-                        "function": {
-                            "name": block["name"],
-                            "arguments": block["input"],
-                        },
-                    }
-                )
-            elif role == "user" and kind == "tool_result":
-                if not isinstance(block.get("tool_use_id"), str):
-                    raise APIError(400, "invalid Anthropic tool_result block")
-                if not isinstance(block.get("is_error", False), bool):
-                    raise APIError(400, "tool_result.is_error must be a boolean")
-                tool_results.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": block["tool_use_id"],
-                        "content": _anthropic_content(
-                            block.get("content", ""), "tool_result"
-                        ),
-                    }
-                )
-                if block.get("is_error"):
-                    result = tool_results[-1]
-                    content = result["content"]
-                    result["content"] = (
-                        "Tool execution failed:\n" + content
-                        if isinstance(content, str)
-                        else [
-                            {"type": "text", "text": "Tool execution failed:\n"},
-                            *content,
-                        ]
-                    )
-            else:
-                raise APIError(400, f"unsupported Anthropic content block: {kind}")
-        if role == "assistant":
-            item = {"role": role, "content": "".join(text_parts)}
-            if reasoning_parts:
-                item["reasoning_content"] = "".join(reasoning_parts)
-            if tool_calls:
-                item["tool_calls"] = tool_calls
-            translated.append(item)
-        else:
-            translated.extend(tool_results)
-            if user_blocks or not tool_results:
-                translated.append(
-                    {
-                        "role": role,
-                        "content": _anthropic_content(user_blocks, "user message"),
-                    }
-                )
-
+    system_text = None if system is None else _anthropic_system_text(system, "system")
+    translated = [
+        translation
+        for message in messages
+        for translation in _anthropic_message(message, thinking_resolver)
+    ]
     if system_text:
         translated.insert(0, {"role": "system", "content": system_text})
-
+    reasoning_effort, thinking_display = _anthropic_thinking(
+        body.get("thinking"), effort
+    )
     chat = {
         "model": body["model"],
         "messages": translated,
+        "tools": _anthropic_offered_tools(body.get("tools"), messages),
         "response_format": response_format,
         "preserve_thinking": preserve_thinking,
+        "reasoning_effort": reasoning_effort,
+        "chat_template_kwargs": body.get("chat_template_kwargs"),
+        "thinking_token_budget": _anthropic_thinking_budget(body.get("thinking")),
     }
-    thinking = body.get("thinking")
-    if thinking is None:
-        chat["reasoning_effort"] = "none"
-    elif not isinstance(thinking, dict) or thinking.get("type") not in (
-        "enabled",
-        "disabled",
-        "adaptive",
-    ):
-        raise APIError(400, "thinking.type must be enabled, disabled, or adaptive")
-    else:
-        thinking_type = thinking["type"]
-        if "display" in thinking:
-            if thinking_type == "disabled":
-                raise APIError(
-                    400, "thinking.display requires enabled or adaptive thinking"
-                )
-            display = thinking["display"]
-            if display not in (None, "summarized", "omitted", "updates"):
-                raise APIError(
-                    400,
-                    "thinking.display must be summarized, omitted, updates, or null",
-                )
-            # Models expose reasoning and text, not separate progress-update blocks.
-            chat["thinking_display"] = (
-                "omitted" if display in ("omitted", "updates") else "summarized"
-            )
-        if thinking_type == "disabled":
-            chat["reasoning_effort"] = "none"
-        elif thinking_type == "adaptive":
-            chat["reasoning_effort"] = effort
-        else:
-            chat["reasoning_effort"] = effort
+    if body.get("tool_choice") is not None:
+        chat.update(_anthropic_tool_choice(body["tool_choice"]))
+    chat = {key: value for key, value in chat.items() if value is not None}
+    return chat, thinking_display
 
-    tools = body.get("tools")
-    if tools is not None:
-        if not isinstance(tools, list):
-            raise APIError(400, "tools must be an array")
-        chat["tools"] = []
-        for tool in tools:
-            if isinstance(tool, dict) and tool.get("type", "custom") != "custom":
-                raise APIError(
-                    400,
-                    "only custom function tools are supported; "
-                    f"received type {tool['type']!r}",
-                )
+
+def _anthropic_response_format(body, output_config):
+    """The format of a Messages request's output, in output_config.format or
+    output_format, as a Chat response_format; None without one."""
+    output_format, legacy = output_config.get("format"), body.get("output_format")
+    if output_format is not None and legacy is not None:
+        raise APIError(400, "output_config.format and output_format cannot be combined")
+    output_format = legacy if output_format is None else output_format
+    if output_format is None:
+        return None
+    if (
+        not isinstance(output_format, dict)
+        or output_format.get("type") != "json_schema"
+        or not isinstance(output_format.get("schema"), (dict, bool))
+    ):
+        raise APIError(400, "output format must be a json_schema object with a schema")
+    return {"type": "json_schema", "json_schema": {"schema": output_format["schema"]}}
+
+
+def _anthropic_message(message, thinking_resolver):
+    """The Chat messages a Messages message stands for: a system message's
+    text; an assistant's text, reasoning and calls as one message; a user's
+    tool results, then the rest of its content."""
+    if not isinstance(message, dict):
+        raise APIError(400, "Anthropic messages must be objects")
+    role = message.get("role")
+    content = message.get("content")
+    if role not in ("user", "assistant", "system"):
+        raise APIError(400, "Anthropic messages require user/assistant/system roles")
+    if role == "system":
+        if isinstance(content, list):
+            # Its tool changes apply to the request's tools.
+            content = [block for block in content if not _is_tool_change(block)]
+        text = _anthropic_system_text(content, "system message")
+        return [{"role": "system", "content": text}] if text else []
+    if isinstance(content, str):
+        return [{"role": role, "content": content}]
+    if not isinstance(content, list):
+        raise APIError(400, "Anthropic message content must be text or blocks")
+    text_parts = []
+    user_blocks = []
+    reasoning_parts = []
+    tool_calls = []
+    tool_results = []
+    for block in content:
+        if not isinstance(block, dict):
+            raise APIError(400, "Anthropic content blocks must be objects")
+        kind = block.get("type")
+        if kind == "text" and isinstance(block.get("text"), str):
+            text_parts.append(block["text"])
+            user_blocks.append(block)
+        elif role == "user" and kind in ("image", "document"):
+            user_blocks.append(block)
+        elif (
+            role == "assistant"
+            and kind == "thinking"
+            and isinstance(block.get("thinking"), str)
+        ):
+            signature = _field(block, "signature", "")
+            if not isinstance(signature, str):
+                raise APIError(400, "invalid thinking signature")
+            if signature:
+                try:
+                    reasoning = thinking_resolver(signature)
+                except APIError as error:
+                    # Other providers' signatures are opaque, as are ours
+                    # under another key. Preserve their visible history;
+                    # hidden content is dropped, as redacted_thinking is.
+                    if error.code != "invalid_thinking_signature":
+                        raise
+                    reasoning = block["thinking"]
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+            else:
+                reasoning_parts.append(block["thinking"])
+        elif role == "assistant" and kind == "redacted_thinking":
+            if not isinstance(block.get("data"), str) or not block["data"]:
+                raise APIError(400, "invalid redacted_thinking data")
+            # Provider-encrypted reasoning cannot be rendered in this
+            # model's prompt. Keep the surrounding visible history.
+        elif role == "assistant" and kind == "tool_use":
             if (
-                not isinstance(tool, dict)
-                or not isinstance(tool.get("name"), str)
-                or not isinstance(tool.get("input_schema", {}), (dict, bool))
+                not isinstance(block.get("id"), str)
+                or not isinstance(block.get("name"), str)
+                or not isinstance(block.get("input"), dict)
             ):
-                raise APIError(400, "invalid Anthropic tool")
-            function = {
-                "name": tool["name"],
-                "parameters": tool.get("input_schema", {}),
-            }
-            if isinstance(tool.get("description"), str):
-                function["description"] = tool["description"]
-            chat["tools"].append({"type": "function", "function": function})
-    choice = body.get("tool_choice")
-    if choice is not None:
-        if not isinstance(choice, dict):
-            raise APIError(400, "tool_choice must be an object")
-        disable_parallel = choice.get("disable_parallel_tool_use", False)
-        if not isinstance(disable_parallel, bool):
-            raise APIError(400, "disable_parallel_tool_use must be a boolean")
-        chat["parallel_tool_calls"] = not disable_parallel
-        kind = choice.get("type")
-        if kind == "auto":
-            chat["tool_choice"] = "auto"
-        elif kind == "any":
-            chat["tool_choice"] = "required"
-        elif kind == "none":
-            chat["tool_choice"] = "none"
-        elif kind == "tool" and isinstance(choice.get("name"), str):
-            chat["tool_choice"] = {
-                "type": "function",
-                "function": {"name": choice["name"]},
-            }
+                raise APIError(400, "invalid Anthropic tool_use block")
+            tool_calls.append(
+                {
+                    "id": block["id"],
+                    "type": "function",
+                    "function": {"name": block["name"], "arguments": block["input"]},
+                }
+            )
+        elif role == "user" and kind == "tool_result":
+            tool_results.append(_anthropic_tool_result(block))
         else:
-            raise APIError(400, "invalid Anthropic tool_choice")
-    return {key: value for key, value in chat.items() if value is not None}
+            raise APIError(400, f"unsupported Anthropic content block: {kind}")
+    if role == "assistant":
+        item = {"role": role, "content": "".join(text_parts)}
+        if reasoning_parts:
+            item["reasoning_content"] = "".join(reasoning_parts)
+        if tool_calls:
+            item["tool_calls"] = tool_calls
+        return [item]
+    if user_blocks or not tool_results:
+        user = {
+            "role": role,
+            "content": _anthropic_content(user_blocks, "user message"),
+        }
+        return [*tool_results, user]
+    return tool_results
+
+
+def _anthropic_tool_result(block):
+    """A user's tool_result block as a Chat tool message, whose content
+    says first that the tool failed where it did."""
+    if not isinstance(block.get("tool_use_id"), str):
+        raise APIError(400, "invalid Anthropic tool_result block")
+    is_error = _field(block, "is_error", False)
+    if not isinstance(is_error, bool):
+        raise APIError(400, "tool_result.is_error must be a boolean")
+    content = _anthropic_content(
+        _tool_references_as_text(_field(block, "content", "")), "tool_result"
+    )
+    if is_error:
+        failed = "Tool execution failed:\n"
+        content = (
+            failed + content
+            if isinstance(content, str)
+            else [{"type": "text", "text": failed}, *content]
+        )
+    return {"role": "tool", "tool_call_id": block["tool_use_id"], "content": content}
+
+
+def _tool_references_as_text(content):
+    """tool_result content with each tool_reference block, a tool search's
+    result, as text naming the tool. The prompt already declares every tool of
+    the request, deferred ones too, so the name is what the model needs to call
+    the tool it found."""
+    if not isinstance(content, list):
+        return content
+    return [
+        _tool_reference_text(part)
+        if isinstance(part, dict) and part.get("type") == "tool_reference"
+        else part
+        for part in content
+    ]
+
+
+def _tool_reference_text(block):
+    name = block.get("tool_name")
+    if not is_tag_name(name):
+        raise APIError(400, f"tool_reference.tool_name must be {TAG_NAME_RULE}")
+    return {"type": "text", "text": f"\nAvailable tool: {name}\n"}
+
+
+def _anthropic_tools(tools):
+    """Messages tools, custom ones only, as Chat function tools."""
+    if not isinstance(tools, list):
+        raise APIError(400, "tools must be an array")
+    functions = []
+    for tool in tools:
+        if isinstance(tool, dict) and _field(tool, "type", "custom") != "custom":
+            raise APIError(
+                400,
+                "only custom function tools are supported; "
+                f"received type {tool['type']!r}",
+            )
+        if (
+            not isinstance(tool, dict)
+            or not isinstance(tool.get("name"), str)
+            or not isinstance(_field(tool, "input_schema", {}), (dict, bool))
+        ):
+            raise APIError(400, "invalid Anthropic tool")
+        function = {
+            "name": tool["name"],
+            "parameters": _field(tool, "input_schema", {}),
+        }
+        if isinstance(tool.get("description"), str):
+            function["description"] = tool["description"]
+        if "strict" in tool:
+            function["strict"] = tool["strict"]
+        functions.append({"type": "function", "function": function})
+    return functions
+
+
+_TOOL_CHANGES = ("tool_addition", "tool_removal")
+
+
+def _is_tool_change(block):
+    return isinstance(block, dict) and block.get("type") in _TOOL_CHANGES
+
+
+def _anthropic_offered_tools(tools, messages):
+    """A Messages request's tools as Chat function tools, changed in order by
+    the tool_addition and tool_removal blocks of its system messages. A chat
+    template declares one tool list, so a tool a message defines joins it,
+    replacing a tool of its name, and a removed tool leaves it until added
+    again. None without tools."""
+    declared = None if tools is None else _anthropic_tools(tools)
+    changes = [
+        block
+        for message in messages
+        if message["role"] == "system" and isinstance(message["content"], list)
+        for block in message["content"]
+        if _is_tool_change(block)
+    ]
+    if not changes:
+        return declared
+    offered = {}
+    for tool in declared or []:
+        name = tool["function"]["name"]
+        # Keyed by name, the tools would hide a repeated one from
+        # normalize_tools.
+        if name in offered:
+            raise APIError(400, f"duplicate tool name: {name}")
+        offered[name] = tool
+    removed = set()
+    for block in changes:
+        name, definition = _tool_change(block)
+        if definition is not None:
+            offered[name] = definition
+        elif name not in offered:
+            raise APIError(
+                400, f"{block['type']} names tool {name!r}, which is not declared"
+            )
+        if block["type"] == "tool_removal":
+            removed.add(name)
+        else:
+            removed.discard(name)
+    return [tool for name, tool in offered.items() if name not in removed]
+
+
+def _tool_change(block):
+    """The name of the tool a tool_addition or tool_removal block changes, and
+    the Chat tool it defines; None when it names the tool."""
+    tool = block.get("tool")
+    form = tool.get("type") if isinstance(tool, dict) else None
+    if block["type"] == "tool_addition" and form == "tool_definition":
+        (definition,) = _anthropic_tools([tool.get("definition")])
+        return definition["function"]["name"], definition
+    if form != "tool_reference" or not isinstance(tool.get("name"), str):
+        forms = (
+            "a named tool_reference or a tool_definition"
+            if block["type"] == "tool_addition"
+            else "a named tool_reference"
+        )
+        raise APIError(400, f"{block['type']}.tool must be {forms}")
+    return tool["name"], None
+
+
+def _anthropic_tool_choice(choice):
+    """A Messages tool_choice as Chat's parallel_tool_calls and
+    tool_choice."""
+    if not isinstance(choice, dict):
+        raise APIError(400, "tool_choice must be an object")
+    disable_parallel = _field(choice, "disable_parallel_tool_use", False)
+    if not isinstance(disable_parallel, bool):
+        raise APIError(400, "disable_parallel_tool_use must be a boolean")
+    kind = choice.get("type")
+    if kind == "auto":
+        tool_choice = "auto"
+    elif kind == "any":
+        tool_choice = "required"
+    elif kind == "none":
+        tool_choice = "none"
+    elif kind == "tool" and isinstance(choice.get("name"), str):
+        tool_choice = {"type": "function", "function": {"name": choice["name"]}}
+    else:
+        raise APIError(400, "invalid Anthropic tool_choice")
+    return {"parallel_tool_calls": not disable_parallel, "tool_choice": tool_choice}
 
 
 def responses_response(model, job, status, output, result=None, error=None):
@@ -1004,14 +1040,15 @@ def responses_response(model, job, status, output, result=None, error=None):
     }
 
 
-def finish_reason(result, tool_calls):
-    """OpenAI finish_reason: tool calls count only when the output was not cut."""
-    if tool_calls and result.reason != "length":
+def finish_reason(result, called):
+    """OpenAI finish_reason: the output's whole tool calls count only when
+    the token limit did not end it."""
+    if called and result.reason != "length":
         return "tool_calls"
     return result.reason
 
 
-def completion_response(model, job, result, message, tool_calls):
+def completion_response(model, job, result, message, called):
     return {
         "id": f"chatcmpl-{job.public_id}",
         "object": "chat.completion",
@@ -1021,13 +1058,51 @@ def completion_response(model, job, result, message, tool_calls):
             {
                 "index": 0,
                 "message": message,
-                "finish_reason": finish_reason(result, tool_calls),
+                "finish_reason": finish_reason(result, called),
             }
         ],
         "usage": usage_dict(result, job),
-        "metrics": metrics_dict(result),
+        "metrics": result.metrics,
         "timings": timings_dict(result),
     }
+
+
+def text_completion_response(model, job, result, text):
+    return {
+        "id": f"cmpl-{job.public_id}",
+        "object": "text_completion",
+        "created": job.created_at,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "text": text,
+                "logprobs": None,
+                "finish_reason": result.reason,
+            }
+        ],
+        "usage": usage_dict(result, job),
+        "metrics": result.metrics,
+        "timings": timings_dict(result),
+    }
+
+
+def _chunk(object_type, chunk_id, created, model, choice, usage, metrics, timings):
+    chunk = {
+        "id": chunk_id,
+        "object": object_type,
+        "created": created,
+        "model": model,
+        "choices": [choice],
+    }
+    if usage is not None:
+        chunk["choices"] = []
+        chunk["usage"] = usage
+    if metrics is not None:
+        chunk["metrics"] = metrics
+    if timings is not None:
+        chunk["timings"] = timings
+    return chunk
 
 
 def stream_chunk(
@@ -1040,80 +1115,104 @@ def stream_chunk(
     metrics=None,
     timings=None,
 ):
-    chunk = {
-        "id": f"chatcmpl-{request_id}",
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
-    }
-    if usage is not None:
-        chunk["choices"] = []
-        chunk["usage"] = usage
-    if metrics is not None:
-        chunk["metrics"] = metrics
-    if timings is not None:
-        chunk["timings"] = timings
-    return chunk
+    return _chunk(
+        "chat.completion.chunk",
+        f"chatcmpl-{request_id}",
+        created,
+        model,
+        {"index": 0, "delta": delta, "finish_reason": finish_reason},
+        usage,
+        metrics,
+        timings,
+    )
 
 
-def responses_item(job, kind, value, index=0, status="completed"):
-    public_id = job.public_id
-    if kind == "reasoning":
+def text_completion_chunk(
+    model,
+    request_id,
+    created,
+    text,
+    finish_reason=None,
+    usage=None,
+    metrics=None,
+    timings=None,
+):
+    return _chunk(
+        "text_completion",
+        f"cmpl-{request_id}",
+        created,
+        model,
+        {"index": 0, "text": text, "logprobs": None, "finish_reason": finish_reason},
+        usage,
+        metrics,
+        timings,
+    )
+
+
+_RESPONSES_ITEM_PREFIXES = {"reasoning": "rs", "text": "msg", "tool": "fc"}
+
+
+def responses_item_id(job, kind, index):
+    """The id of the Responses item of a block of `kind` at `index`."""
+    return f"{_RESPONSES_ITEM_PREFIXES[kind]}_{job.public_id}_{index}"
+
+
+def responses_item(job, block, index):
+    """The Responses output item of `block` at `index`. An item in progress
+    carries no text or arguments yet."""
+    item_id = responses_item_id(job, block.kind, index)
+    status = block.status
+    text = "" if status == "in_progress" else block.text
+    if block.kind == "reasoning":
         return {
-            "id": f"rs_{public_id}_{index}",
-            "type": kind,
+            "id": item_id,
+            "type": "reasoning",
             "status": status,
-            "summary": ([{"type": "summary_text", "text": value}] if value else []),
-            "content": ([{"type": "reasoning_text", "text": value}] if value else []),
+            "summary": ([{"type": "summary_text", "text": text}] if text else []),
+            "content": ([{"type": "reasoning_text", "text": text}] if text else []),
             "encrypted_content": None,
         }
-    if kind == "message":
+    if block.kind == "text":
         return {
-            "id": f"msg_{public_id}_{index}",
-            "type": kind,
+            "id": item_id,
+            "type": "message",
             "status": status,
             "role": "assistant",
-            "content": [{"type": "output_text", "text": value, "annotations": []}],
+            "content": (
+                []
+                if status == "in_progress"
+                else [{"type": "output_text", "text": text, "annotations": []}]
+            ),
         }
-    name = value["function"]["name"]
-    wire = job.tool_policy.namespaces.get(name) if job.tool_policy else None
+    namespaced = job.tool_policy.namespaces.get(block.name) if job.tool_policy else None
     item = {
-        "id": f"fc_{public_id}_{index}",
+        "id": item_id,
         "type": "function_call",
         "status": status,
-        "call_id": value["id"],
-        "name": wire[1] if wire else name,
-        "arguments": "" if status == "in_progress" else value["function"]["arguments"],
+        "call_id": block.call_id,
+        "name": namespaced[1] if namespaced else block.name,
+        "arguments": text,
     }
-    if wire:
-        item["namespace"] = wire[0]
+    if namespaced:
+        item["namespace"] = namespaced[0]
     return item
 
 
-def responses_output(
-    job, reasoning, content, calls, status="completed", reasoning_status="completed"
-):
-    output = []
-    if reasoning:
-        output.append(
-            responses_item(job, "reasoning", reasoning, status=reasoning_status)
-        )
-    if content or not calls:
-        output.append(
-            responses_item(job, "message", content, len(output), status=status)
-        )
-    for call in calls:
-        output.append(
-            responses_item(job, "function_call", call, len(output), status=status)
-        )
-    return output
+def responses_output(job, blocks):
+    return [responses_item(job, block, index) for index, block in enumerate(blocks)]
 
 
-def anthropic_stop(result, tool_calls):
-    if tool_calls and result.reason != "length":
+def anthropic_stop(result, called, output_clamped_to_context):
+    """Anthropic's stop_reason: the output's whole tool calls count only when
+    the token limit did not end it."""
+    if called and result.reason != "length":
         return "tool_use"
     if result.reason == "length":
+        # Anthropic's reason when the context window, not max_tokens, ends
+        # the response: max_tokens was lowered to what the context leaves, or
+        # the engine ended it at what it holds of the context.
+        if output_clamped_to_context or result.bounded:
+            return "model_context_window_exceeded"
         return "max_tokens"
     if result.stop_sequence is not None:
         return "stop_sequence"
@@ -1128,45 +1227,37 @@ def anthropic_usage(prompt_tokens, output_tokens, cache):
     }
 
 
-def anthropic_response(
-    model, job, reasoning, content, tool_calls, result, thinking_signature=""
-):
-    parsed_calls = []
-    for call in tool_calls:
-        try:
-            arguments = json_codec.loads(call["function"]["arguments"])
-        except ValueError:
-            if result.reason != "length":
-                raise
-            continue
-        parsed_calls.append((call, arguments))
-    blocks = []
-    if reasoning:
-        blocks.append(
-            {
-                "type": "thinking",
-                "thinking": "" if job.thinking_display == "omitted" else reasoning,
-                "signature": thinking_signature,
-            }
-        )
-    if content or not parsed_calls:
-        blocks.append({"type": "text", "text": content})
-    for call, arguments in parsed_calls:
-        blocks.append(
-            {
-                "type": "tool_use",
-                "id": call["id"],
-                "name": call["function"]["name"],
-                "input": arguments,
-            }
-        )
+def anthropic_block(job, block, signature=""):
+    """The Messages content block of `block` as a complete response shows it
+    or, while it is in progress, as a stream starts it, before its text or
+    input. Reasoning whose display is omitted shows only `signature`. A call
+    no longer in progress has complete arguments: the projector writes each
+    call it closes as JSON, and a complete response leaves out a call the
+    token limit or a stop sequence cut."""
+    if block.kind == "reasoning":
+        thinking = "" if job.thinking_display == "omitted" else block.text
+        return {"type": "thinking", "thinking": thinking, "signature": signature}
+    if block.kind == "text":
+        return {"type": "text", "text": block.text}
+    return {
+        "type": "tool_use",
+        "id": block.call_id,
+        "name": block.name,
+        "input": {} if block.status == "in_progress" else json_codec.loads(block.text),
+    }
+
+
+def anthropic_response(model, job, blocks, result, called, thinking_signature):
+    content = [anthropic_block(job, block, thinking_signature) for block in blocks]
+    if all(item["type"] == "thinking" for item in content):
+        content.append({"type": "text", "text": ""})
     return {
         "id": f"msg_{job.public_id}",
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": blocks,
-        "stop_reason": anthropic_stop(result, tool_calls),
+        "content": content,
+        "stop_reason": anthropic_stop(result, called, job.output_clamped_to_context),
         "stop_sequence": result.stop_sequence,
         "usage": anthropic_usage(
             result.prompt_tokens, result.completion_tokens, result.cache

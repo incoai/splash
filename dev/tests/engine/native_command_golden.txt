@@ -1,0 +1,42 @@
+# serve-native command lines both sides must agree on, as
+# "<name> | <splash serve options> | <arguments after MODEL_DIRECTORY>" lines.
+# A line whose name starts with relaunch is a relaunch's, after a first engine
+# that served 61433 tokens of context.
+#
+# server/server.py's _native_command writes the arguments for the options
+# (dev/tests/server/test_serve_options.py checks it), and
+# runtime/engine/NativeArguments.cpp must read them as the server means them
+# (dev/tests/engine/native_arguments_test.cpp checks each line).
+
+defaults |  | auto auto
+limits | --max-context 100K --max-memory 32G | 102400 34359738368
+disk_auto | --max-cache-disk auto | auto auto
+disk_off | --max-cache-disk 0 | auto auto 0
+disk | --max-cache-disk 5G | auto auto 5368709120
+disk_writes | --max-cache-disk-writes 200G | auto auto --max-cache-disk-writes 214748364800
+persistent_auto | --persistent-cache | auto auto --persistent-cache on
+persistent | --max-cache-disk 5G --persistent-cache | auto auto 5368709120 --persistent-cache on
+persistent_dir | --max-cache-disk 5G --persistent-cache --cache-dir /srv/cache | auto auto 5368709120 --persistent-cache on --cache-dir /srv/cache
+bf16 | --kv-format bf16 | auto auto --kv-format bf16
+disk_bf16 | --max-cache-disk 5G --kv-format bf16 | auto auto 5368709120 --kv-format bf16
+state_bf16 | --state-format bf16 | auto auto --state-format bf16
+idle_release | --idle-release 30m | auto auto --idle-release 1800.0
+idle_release_off | --idle-release off | auto auto --idle-release off
+decode_share | --max-cache-disk 5G --decode-share 0 | auto auto 5368709120 --decode-share 0.0
+image_patches | --max-image-pixels 1048576 | auto auto --max-image-patches 4096
+image_patches_rounded | --max-image-pixels 1000000 | auto auto --max-image-patches 3904
+image_patches_default | --max-image-pixels 4194304 | auto auto
+idle_sleep | --allow-idle-sleep | auto auto --idle-sleep allow
+disable_ane | --disable-ane | auto auto --ane off
+verify_rows_all | --verify-rows all | auto auto --verify-rows all
+verify_rows_auto | --verify-rows auto | auto auto
+relaunch |  | auto auto --relaunch-context 61433
+relaunch_limits | --max-context 100K --max-memory 32G | 102400 34359738368
+yarn | --max-context 1M | 1000000 auto
+yarn_double | --max-context 512K | 524288 auto
+ple_memory | --ple-memory 2G | auto auto --ple-memory 2147483648
+ple_memory_off | --ple-memory off | auto auto --ple-memory off
+expert_memory | --expert-memory 16G | auto auto --expert-memory 17179869184
+expert_memory_off | --expert-memory off | auto auto --expert-memory off
+expert_memory_auto | --expert-memory auto --ple-memory auto | auto auto
+sparse_kv_memory | --sparse-kv-memory 1200M | auto auto --sparse-kv-memory 1258291200

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -14,9 +15,11 @@
 
 namespace splash::metal {
 
-// An ordered dispatch list for one command buffer. Buffers bind at indices
-// 0..n-1; an optional parameter struct binds at index n and is copied into
-// graph-owned storage until submission.
+// An ordered dispatch list for one command, with the event steps that order
+// it against another agent or the CPU (EventStep); MetalBackend splits a
+// command into Metal command buffers at its event signals and host steps.
+// Buffers bind at indices 0..n-1; an optional parameter struct binds at
+// index n and is copied into graph-owned storage until submission.
 class CommandGraph final {
 public:
   static constexpr uint32_t kDefaultThreads = 256;
@@ -47,9 +50,43 @@ public:
                               payloads_.back().data(), sizeof(Params)});
   }
 
+  // A dispatch of the grid in `grid`, which an earlier dispatch writes
+  // within `groups` (ComputeDispatch::indirectThreadgroups).
+  template <class Params>
+  void add(std::string pipeline, std::vector<MetalBuffer> buffers,
+           const Params &params, DispatchSize groups, IndirectGrid grid,
+           DispatchSize threads) {
+    add(std::move(pipeline), std::move(buffers), params, groups, threads);
+    dispatches_.back().indirectThreadgroups = std::move(grid);
+  }
+
+  // Event steps after the dispatches added so far (EventStep): signal once
+  // all earlier work has completed, or hold all later work until the event
+  // reaches value.
+  void signal(SharedEvent event, uint64_t value) {
+    step(std::move(event), value, EventStep::Kind::Signal);
+  }
+  void wait(SharedEvent event, uint64_t value) {
+    step(std::move(event), value, EventStep::Kind::Wait);
+  }
+  // A host step after the dispatches added so far (EventStep::Kind::Host):
+  // `work` runs on the CPU between the work before and the work after it,
+  // `timed` gets its round trip once the command completed, `gpu` says
+  // whether the GPU spins through it, and `then` runs once the work after it
+  // may go.
+  void host(std::function<void()> work, std::function<void(const HostStepTiming &)> timed = {},
+            HostStepGpu gpu = HostStepGpu::Idle, std::function<void()> then = {}) {
+    events_.push_back({dispatches_.size(), {}, 0, EventStep::Kind::Host, std::move(work), std::move(timed), gpu,
+                       std::move(then)});
+  }
+
   [[nodiscard]] bool empty() const noexcept { return dispatches_.empty(); }
+  // The dispatches alone; command() has the event steps too.
   [[nodiscard]] std::span<const ComputeDispatch> dispatches() const noexcept {
     return dispatches_;
+  }
+  [[nodiscard]] Command command() const noexcept {
+    return {dispatches_, events_};
   }
 
 private:
@@ -67,8 +104,13 @@ private:
     return dispatches_.back();
   }
 
+  void step(SharedEvent event, uint64_t value, EventStep::Kind kind) {
+    events_.push_back({dispatches_.size(), std::move(event), value, kind});
+  }
+
   std::deque<std::vector<std::byte>> payloads_;
   std::vector<ComputeDispatch> dispatches_;
+  std::vector<EventStep> events_;
 };
 
 } // namespace splash::metal

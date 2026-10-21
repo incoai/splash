@@ -36,7 +36,7 @@ STAGES = (
     "grammar",
     "images",
     "native_queue",
-    "ttft",
+    "http_ttft",
     "output_interval",
 )
 
@@ -89,7 +89,7 @@ class RequestLatency:
         # Token callbacks for a request are serialized by the native transport.
         now = time.monotonic()
         if self.last_output is None:
-            self.metrics.observe("ttft", now - self.received_at)
+            self.metrics.observe("http_ttft", now - self.received_at)
         else:
             self.metrics.observe("output_interval", now - self.last_output)
         self.last_output = now

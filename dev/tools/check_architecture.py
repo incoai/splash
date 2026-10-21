@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Enforce production dependency boundaries."""
+"""Enforce production dependency boundaries, and keep Hugging Face tokens out
+of CI."""
 
 from __future__ import annotations
 
@@ -12,17 +13,32 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".h", ".hpp", ".m", ".mm", ".metal"}
 INCLUDE = re.compile(r'^\s*#\s*(?:include|import)\s*(["<])([^">]+)[">]', re.MULTILINE)
+# Tile, split and kernel-configuration names runtime/ops owns: model/ and
+# engine/ size workspaces through the operators, never through these.
+OPERATOR_WORKSPACE_POLICY_NAMES: tuple[str, ...] = (
+    "prefillAttentionTiles",
+    "kVerifySplits",
+    "kPrefillAttentionTileRows",
+    "moeMaximumTiles",
+    "LinearTile",
+    "LinearConfig",
+    "MoeExpertTile",
+    "MoeConfig",
+)
 OPERATOR_WORKSPACE_POLICY = re.compile(
-    r"\b(?:PrefillAttentionWave|prefillAttentionTiles|"
-    r"kQ8VerifySplits|kQ8PrefillAttentionTileRows|"
-    r"moeMaximumTiles|kMoePrefillTileRows|kMoeDecodeTileRows|"
-    r"Q4DecodeKind|Q4DecodeShape|Q4PrefillShape|kQ4PrefillTileRows|"
-    r"narrowAffineKind|narrowResidualKind|headKind|gdnInputGroups|"
-    r"attentionGroups|addPrefill128|LinearTile|LinearConfig|LinearSimdgroups|"
-    r"PrefillSplitMultiplier|PrefillAttentionConfig|VerifySplitCount|"
-    r"VerifyAttentionConfig|AttentionScalePlacement|MoeExpertTile|"
-    r"MoeExpertSimdgroups|MoeConfig|"
-    r"DraftAttentionConfiguration|selectorShards)\b"
+    r"\b(?:" + "|".join(OPERATOR_WORKSPACE_POLICY_NAMES) + r")\b"
+)
+# The standard library's steady clocks, which count sleep on macOS, and the
+# timed waits that measure on them; production measures durations on
+# AwakeClock and wall-clock instants on system_clock.
+SLEEP_COUNTING_CLOCK = re.compile(
+    r"\b(?:steady_clock|high_resolution_clock|wait_for|try_lock_for"
+    r"|try_acquire_for)\b"
+)
+# The variables huggingface_hub reads a token from, and the repository
+# secrets a workflow would pass one in.
+HUGGING_FACE_TOKEN = re.compile(
+    r"\b(?:HF_TOKEN|HUGGING_FACE_HUB_TOKEN)\b|\bsecrets\s*(?:\.\s*|\[\s*['\"])HF_"
 )
 
 
@@ -96,16 +112,64 @@ def check_server_dependencies() -> list[str]:
     return errors
 
 
-def check() -> list[str]:
-    errors = check_server_dependencies()
-    obsolete_roots = (
-        ROOT / "runtime" / "kernels",
-        ROOT / "runtime" / "src" / "metal",
+def check_package_imports() -> list[str]:
+    # The server and the installer each import their own modules one way,
+    # relatively, never by their package's name. The installer's script
+    # entry points name their package in a PEP 366 header, their one use of
+    # __package__.
+    header = ast.dump(
+        ast.parse('__name__ == "__main__" and not __package__', mode="eval").body
     )
-    for path in obsolete_roots:
-        if path.exists():
-            errors.append(f"obsolete production directory exists: {relative(path)}")
+    entry_points = {"install/launcher.py", "install/models.py"}
+    errors = []
+    for package in ("server", "install"):
+        paths = sorted((ROOT / package).glob("*.py"))
+        own_names = {package, *(path.stem for path in paths)}
+        for path in paths:
+            name = relative(path)
+            tree = ast.parse(path.read_text())
+            allowed = set()
+            if name in entry_points:
+                allowed = {
+                    id(node)
+                    for statement in tree.body
+                    if isinstance(statement, ast.If)
+                    and ast.dump(statement.test) == header
+                    for node in ast.walk(statement)
+                }
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and not node.level:
+                    modules = [node.module]
+                elif isinstance(node, ast.Import):
+                    modules = [alias.name for alias in node.names]
+                else:
+                    modules = []
+                for module in modules:
+                    if module.split(".")[0] in own_names:
+                        errors.append(
+                            f"{name}: imports {module} without a relative import"
+                        )
+                if (
+                    isinstance(node, ast.Name)
+                    and node.id == "__package__"
+                    and id(node) not in allowed
+                ):
+                    errors.append(f"{name}: reads __package__")
+    return errors
 
+
+def check_workflows() -> list[str]:
+    # CI installs public models alone, which need no token, and a token a
+    # workflow passes reaches every program its job runs.
+    return [
+        f"{relative(path)}: passes a Hugging Face token ({match.group()})"
+        for path in sorted((ROOT / ".github/workflows").glob("*.y*ml"))
+        if (match := HUGGING_FACE_TOKEN.search(path.read_text()))
+    ]
+
+
+def check() -> list[str]:
+    errors = check_server_dependencies() + check_package_imports() + check_workflows()
     forbidden_metal_dependencies = ("engine/", "model/", "ops/")
     forbidden_model_dependencies = ("engine/",)
     forbidden_operator_dependencies = ("engine/", "model/")
@@ -120,6 +184,9 @@ def check() -> list[str]:
         "model/ModelFactory.hpp",
         "model/Qwen3_6Moe.hpp",
         "model/Qwen3_8.hpp",
+        "model/Qwen4Exp.hpp",
+        "model/Qwen4ExpTarget.hpp",
+        "model/Qwen4Steps.hpp",
         "model/QwenHybridLayout.hpp",
         "model/QwenState.hpp",
         "model/QwenTarget.hpp",
@@ -136,8 +203,8 @@ def check() -> list[str]:
         text = path.read_text(errors="replace")
         includes = include_paths(path, text)
         for include in includes:
-            if include.startswith("tuning/"):
-                errors.append(f"{name}: production depends on offline tuning {include}")
+            if include.startswith("tests/"):
+                errors.append(f"{name}: production depends on test code {include}")
         if name.startswith("runtime/metal/"):
             for include in includes:
                 if include.startswith(forbidden_metal_dependencies):
@@ -174,21 +241,41 @@ def check() -> list[str]:
                     )
             if concrete_model_symbols.search(text):
                 errors.append(f"{name}: startup names a concrete model type")
-        if (
-            name.startswith("runtime/engine/")
-            and name != "runtime/engine/Checked.hpp"
-            and re.search(r"^namespace splash\s*\{", text, re.MULTILINE)
+        if name.startswith("runtime/engine/") and re.search(
+            r"^namespace splash\s*\{", text, re.MULTILINE
         ):
             errors.append(f"{name}: engine declarations leak into root namespace")
         if client_names.search(text):
             errors.append(
                 f"{name}: production backend contains client-specific behavior"
             )
+        # Every timeout and duration counts time the Mac is awake, as the
+        # server's time.monotonic() does.
+        if SLEEP_COUNTING_CLOCK.search(text):
+            errors.append(f"{name}: measures time on a clock that counts sleep")
     return errors
 
 
+def stale_policy_names() -> list[str]:
+    """The guarded operator policy names no source under runtime/ops uses,
+    which the rule would keep guarding for nothing."""
+    operators = [
+        path.read_text(errors="replace")
+        for path in production_sources()
+        if relative(path).startswith("runtime/ops/")
+    ]
+    return [
+        name
+        for name in OPERATOR_WORKSPACE_POLICY_NAMES
+        if not any(re.search(rf"\b{name}\b", text) for text in operators)
+    ]
+
+
 def main() -> int:
-    errors = check()
+    errors = check() + [
+        f"rule guards vanished operator policy symbol {name}"
+        for name in stale_policy_names()
+    ]
     if errors:
         for error in errors:
             print(f"architecture error: {error}", file=sys.stderr)

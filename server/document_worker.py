@@ -4,7 +4,6 @@ import atexit
 import ctypes
 import json
 import math
-import os
 import resource
 import subprocess
 import sys
@@ -14,10 +13,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-if __package__:
-    from .errors import APIError
-else:
-    from errors import APIError
+from .errors import APIError
 
 MAX_SECONDS = 30.0
 MAX_MEMORY_BYTES = 1024 * 1024 * 1024
@@ -54,20 +50,16 @@ class _RusageInfo(ctypes.Structure):
     ]
 
 
-if sys.platform == "darwin":
-    _libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-    _libproc.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
-    _libproc.proc_pid_rusage.restype = ctypes.c_int
+_libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+_libproc.proc_pid_rusage.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+_libproc.proc_pid_rusage.restype = ctypes.c_int
 
 
 def _memory_bytes(pid):
-    if sys.platform == "darwin":
-        usage = _RusageInfo()
-        if _libproc.proc_pid_rusage(pid, 2, ctypes.byref(usage)):
-            raise OSError(ctypes.get_errno(), "cannot inspect document worker")
-        return max(usage.resident_size, usage.phys_footprint)
-    pages = int(Path(f"/proc/{pid}/statm").read_text().split()[1])
-    return pages * os.sysconf("SC_PAGE_SIZE")
+    usage = _RusageInfo()
+    if _libproc.proc_pid_rusage(pid, 2, ctypes.byref(usage)):
+        raise OSError(ctypes.get_errno(), "cannot inspect document worker")
+    return max(usage.resident_size, usage.phys_footprint)
 
 
 def _stop(process):
@@ -85,11 +77,14 @@ def _close_workers():
 
 
 def render(payload, limits, remaining):
-    duration = MAX_SECONDS if remaining < 0 else min(MAX_SECONDS, remaining)
+    """Render a PDF in a worker within the `remaining` seconds of its request,
+    infinite when it has no deadline, and the worker's own time limit."""
+    duration = min(MAX_SECONDS, remaining)
     deadline = time.monotonic() + duration
     command = [
         sys.executable,
-        str(Path(__file__).resolve()),
+        "-m",
+        "server.document_worker",
         json.dumps(limits),
         str(duration),
     ]
@@ -99,8 +94,14 @@ def render(payload, limits, remaining):
         source.write(payload)
         source.seek(0)
         try:
+            # From the directory that holds the server package, so the worker
+            # imports it however the server was started.
             process = subprocess.Popen(
-                command, stdin=source, stdout=output, stderr=subprocess.DEVNULL
+                command,
+                stdin=source,
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                cwd=Path(__file__).resolve().parents[1],
             )
         except OSError:
             raise APIError(
@@ -111,7 +112,7 @@ def render(payload, limits, remaining):
         try:
             while process.poll() is None:
                 if time.monotonic() >= deadline:
-                    if 0 <= remaining <= MAX_SECONDS:
+                    if remaining <= MAX_SECONDS:
                         raise APIError(504, "request timed out", "request_timeout")
                     raise APIError(400, "PDF processing exceeded the time limit")
                 try:
@@ -142,7 +143,9 @@ def render(payload, limits, remaining):
                 result = json.loads(encoded)
             except (ValueError, UnicodeError):
                 raise APIError(
-                    500, "document worker returned an invalid result"
+                    500,
+                    "document worker returned an invalid result",
+                    "document_worker_failed",
                 ) from None
             if "error" in result:
                 error = result["error"]
@@ -155,7 +158,7 @@ def render(payload, limits, remaining):
 
 
 def main():
-    from documents import MAX_PDF_BYTES, DocumentBudget, RenderLimits, render_pages
+    from .documents import MAX_PDF_BYTES, DocumentBudget, RenderLimits, render_pages
 
     limits = RenderLimits(**json.loads(sys.argv[1]))
     duration = float(sys.argv[2])
@@ -163,8 +166,6 @@ def main():
     resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_OUTPUT_BYTES, MAX_OUTPUT_BYTES))
     cpu_seconds = max(1, math.ceil(duration))
     resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
-    if sys.platform != "darwin":
-        resource.setrlimit(resource.RLIMIT_AS, (MAX_MEMORY_BYTES, MAX_MEMORY_BYTES))
     # On macOS RLIMIT_AS aliases the advisory RSS limit. The parent instead
     # measures resident/physical footprint and terminates an over-budget child.
     budget = DocumentBudget(

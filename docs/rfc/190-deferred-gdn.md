@@ -1,42 +1,53 @@
-# RFC 190 — Deferred GDN recurrent replay
+# RFC 190: current deferred GDN replay
 
-Upstream issue: https://github.com/incoai/splash/issues/190
+Related issue: [#190](https://github.com/incoai/splash/issues/190).
+Rechecked against main `1482f6bbc2abf12375332725302019594150b6cb`.
 
-Source: bonsai `CBv2DeferredRecurrentReplay` (`keep/inputs/build/resolve`,
-`RecurrentStateV2.swift`), `Qwen35A3BTargetVerify GDNReplayFused`.
+## Current implementation
 
-## Problem
+Main already folds a decode step's retained GDN rows into the lane's next
+step. Commit [48a94aaa](https://github.com/incoai/splash/commit/48a94aaae6deda31bfbaec08e8a896c2d670e37a)
+replaced the earlier standalone commit path. The original September RFC
+scaffolding predates this implementation; it is not a second runtime feature
+or an environment-controlled optimization.
 
-27B has 48 GDN layers vs 16 full-attention; GDN scans dominate 32K
-prefill and add per-verify traffic. On partial accept Splash rebuilds
-the strict-prefix SSM eagerly; bonsai fuses it into the next verify scan
-(or lazy `replay(keep)`).
+- [`GdnTapeLane`](../../runtime/ops/GDN.hpp) identifies the previous step's
+  pending tape, current step's tape and retained pending row count.
+- [`GDN::addDecode`](../../runtime/ops/GDN.cpp) passes those tapes and counts
+  to the fused decode kernels, with bounds, alignment and overlap checks.
+- The [decode shader](../../runtime/metal/kernels/decode/gdn.metal) folds
+  the pending rows into its incoming recurrent state before processing the
+  current rows; convolution history also reads the pending input tape.
+- [`QwenStateStorage::swapDecodeParity`](../../runtime/model/QwenState.cpp)
+  records the retained rows for the next step. Snapshot/copy/materialization
+  paths must resolve pending state before publishing a committed snapshot.
 
-## Proposal
+The original placeholder tracked `proposed - accepted`, which counts discarded
+suffix rows. The runtime needs the retained prefix, including its anchor.
+Zero accepted draft proposals therefore does not imply zero retained target
+rows, and a full-width retained step still leaves rows pending. The stale
+placeholder and its string/Python-mirror tests are removed from this proposal.
+`SPLASH_DEFERRED_GDN_REPLAY` is not a supported product option.
 
-1. `runtime/ops/Rfc190DeferredGdn.hpp` declares the flag + env var
-   (`SPLASH_DEFERRED_GDN_REPLAY`).
-2. Follow-up adds deferred-replay state to `QwenGdnCell` / GDN plan
-   (`ops/GDN.*`, `model/QwenState.hpp`): keep unbuilt prefix inputs,
-   resolve in next verify; `finalSSM:nil + fullAcceptance` fast path.
-3. Scratch sized at startup via memory plan.
+## Contracts for further work
 
-## Code change (landed)
+Any subsequent replay optimization must consume every previously retained row,
+preserve convolution carry and tape ownership, and materialize a complete
+state for capture, restore, preemption and cache publication. Previous pending
+length and the next step's selected verify length are independent. Cover FP32
+and BF16 state, supported packed layouts, lane permutations, zero accepted
+draft proposals and partial/full retention.
 
-`runtime/ops/Rfc190DeferredGdn.hpp` now carries the transition contract
-(`ReplayState`, `DeferredReplay{state, pendingTokens}`, `onVerify()`)
-as `constexpr` with `static_assert` cases. No new `.metal`: the resolve
-target is the existing `verify_gdn_fused*` family in
-`kernels/decode/gdn.metal`, which already fuses the scan — the follow-up
-only teaches `QwenGdnCell` / GDN plan to defer into it.
-`clang++ -fsyntax-only` clean.
+Changing the floating-point graph requires an explicit numerical contract;
+bitwise equality between different graphs is not assumed. Measure a complete
+fused cycle and serving behavior, not the removed standalone pass in isolation.
 
-## Contracts
+## Review and validation scope
 
-- Bit-identical recurrent state after resolve; `StateCache` / SSD-tier
-  semantics preserved; ABBA gate.
-
-## Validation
-
-- 32K prefill + 32K replay TTFT + B1–B4 profile; `test-engine-metal` GDN
-  bounds; ABBA.
+This PR now documents main's implemented mechanism. It changes no runtime,
+shader, build registration or product default. Existing
+[GDN decode tests](../../dev/tests/engine/gdn_decode_metal_test.mm) and
+[model runtime oracle](../../dev/tests/engine/model_runtime_oracle_test.mm)
+are the relevant executable checks. Rechecking this documentation is not a
+new hardware, throughput or quality result. Issue #190 remains available for
+maintainer discussion of any additional optimization beyond the current code.

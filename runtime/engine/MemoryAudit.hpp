@@ -15,7 +15,7 @@ enum class MemoryAuditError {
     BackendAccountingMismatch,
     RuntimeReserveExceeded,
     HardBudgetExceeded,
-    WarmupEstimateDeviation,
+    DevicePeakDeviation,
     ArithmeticOverflow,
 };
 
@@ -28,17 +28,29 @@ struct ActualMemoryReport {
     uint64_t visionWeightsBytes = 0;
     // Unique physical GDN/draft allocations across active lanes, cached
     // states and idle pooled buffers.
-    uint64_t stateResidentBytes = 0;
+    uint64_t stateAllocatedBytes = 0;
     uint64_t sharedPrefillBytes = 0;
     uint64_t sharedDecodeBytes = 0;
-    uint64_t kvResidentBytes = 0;
-    // The disk tier's KV staging ring and copy table; zero without the tier.
-    uint64_t kvStagingBytes = 0;
+    uint64_t kvAllocatedBytes = 0;
+    // A spill-capable target's readers of spilled KV: the hot block cache
+    // and the staging of a prefill's history; zero for another.
+    uint64_t kvBlockCacheBytes = 0;
+    uint64_t kvHistoryStagingBytes = 0;
+    // The buffer state writes to the disk tier stage through; zero without
+    // the tier.
+    uint64_t stateStagingBytes = 0;
+    // The prefill FFN's Neural Engine split; zero without one.
+    uint64_t aneFfnBytes = 0;
+    // The streamed table's row cache (--ple-memory), host memory outside
+    // Metal's; zero without one.
+    uint64_t streamedTableBytes = 0;
 
     uint64_t backendAllocatedBytes = 0;
     uint64_t deviceCurrentAllocatedBytes = 0;
     uint64_t devicePeakAllocatedBytes = 0;
-    uint64_t estimatedWarmupPeakBytes = 0;
+    // The backend's own high-water mark, and the device's above, since the
+    // weights that serve began to load (MetalBackend::restartPeaks).
+    uint64_t backendPeakAllocatedBytes = 0;
 };
 
 struct MemoryAuditResult {
@@ -49,14 +61,14 @@ struct MemoryAuditResult {
     uint64_t categorizedBytes = 0;
     uint64_t backendUnclassifiedBytes = 0;
     uint64_t deviceUntrackedBytes = 0;
-    uint32_t warmupPeakDeviationBasisPoints = 0;
+    uint32_t devicePeakDeviationBasisPoints = 0;
     uint64_t actualHeadroomBytes = 0;
 
     [[nodiscard]] std::string toStatusJson() const;
     [[nodiscard]] std::string describe() const;
 };
 
-inline constexpr uint32_t kMaximumWarmupDeviationBasisPoints = 500;
+inline constexpr uint32_t kMaximumDevicePeakDeviationBasisPoints = 500;
 
 // Validates actual MTLResource.allocatedSize category totals and Metal's
 // process-wide peak against the immutable plan.

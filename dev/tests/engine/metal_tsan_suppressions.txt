@@ -1,0 +1,10 @@
+# What ThreadSanitizer cannot see in the Metal tests it runs (make
+# test-sanitizers-metal).
+#
+# Metal calls a command buffer's completed handlers on threads of its own once
+# the GPU ended the command, which metal::MetalBackend's commit committed after
+# it added them and wrote what they read (the ticket state their blocks
+# capture, its leading buffers, its start time). That order lies inside Metal,
+# so ThreadSanitizer reports the handlers' reads against those writes. Nothing
+# of the spilled-KV readers runs in a completed handler.
+race:invocation*for*block*in*splash::metal::MetalBackend::Impl::commit

@@ -2,19 +2,38 @@
 
 #include "metal/MetalBackend.hpp"
 #include "model/GgufImage.hpp"
-#include "model/PreparedWeights.hpp"
+#include "model/WeightSource.hpp"
+
+#include <cstdint>
+#include <optional>
 
 namespace splash::model {
 
-// The identity of a planned image of source: the preparation identity, the
-// whole plan and the bytes and type of every tensor it reads.
-[[nodiscard]] PreparedWeight ggufImageWeight(const WeightSource &source, const gguf::Image &image);
+// The Metal staging of the rows of one repack step, whatever the tensor,
+// layer or expert count.
+inline constexpr uint64_t kGgufRepackStagingBytes = 32 << 20;
 
-// Writes a planned image into its preallocated, zeroed destination file: the
-// header and descriptors, the copied rows and the planes the GPU repacks.
-// Staging stays within kWeightPreparationStagingBytes whatever the tensor,
-// layer or expert count; admit runs before each chunk.
-void writeGgufImage(metal::MetalBackend &backend, const WeightSource &source, int destination,
-                    const gguf::Image &image, const PreparationCheck &admit);
+// Writes every byte of a planned image into its buffer: the header and
+// descriptors, the copied rows and the planes the GPU repacks into it, each
+// read from the source its rows name (a GGUF's, or an MLX checkpoint's
+// tensors).
+void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &image, const gguf::Image &plan);
+
+// Rows [first, first + count) of a repack (its sources' rows in order), whole
+// and back to back into `to`, count * ggufRowBytes(format, columns) bytes:
+// the native rows the GPU repacks into those rows' planes. A streamed
+// expert's rows are read with it (model/ExpertStore.hpp), from any thread.
+void readRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count, uint8_t *to);
+
+// Where rows [first, first + count) of a repack are in a file, when one of
+// its sources stores them as they are and in order, so that they are read
+// with the file's bytes alone: the file and the offset of the first row from
+// its start. None when they are built (a quantized safetensors tensor's,
+// NVFP4 rows, a quantized float tensor) or permuted, or span two sources.
+struct StoredRows final {
+  const WeightSource *file = nullptr;
+  uint64_t offset = 0;
+};
+[[nodiscard]] std::optional<StoredRows> storedRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count);
 
 } // namespace splash::model

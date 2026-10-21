@@ -1,5 +1,6 @@
 #include "model/GgufFile.hpp"
 
+#include "Checked.hpp"
 #include "metal/abi/Gguf.h"
 
 #include <algorithm>
@@ -9,12 +10,6 @@
 
 namespace splash::model {
 namespace {
-
-uint64_t checkedMultiply(uint64_t a, uint64_t b) {
-  if (b && a > std::numeric_limits<uint64_t>::max() / b)
-    throw GgufError("GGUF size overflows uint64");
-  return a * b;
-}
 
 enum ValueType : uint32_t {
   kUint8 = 0, kInt8 = 1, kUint16 = 2, kInt16 = 3, kUint32 = 4, kInt32 = 5,
@@ -119,7 +114,7 @@ void skipArray(Reader &reader, uint32_t element, uint64_t count, unsigned depth)
   if (element == kString || element == kArray) {
     for (uint64_t i = 0; i < count; ++i) skipValue(reader, element, depth + 1);
   } else {
-    reader.skip(checkedMultiply(count, scalarBytes(element)));
+    reader.skip(checkedMultiply<GgufError>(count, scalarBytes(element), "GGUF size"));
   }
 }
 
@@ -135,6 +130,15 @@ void skipValue(Reader &reader, uint32_t type, unsigned depth) {
   }
 }
 
+// Opens the files at paths into `sources`, in order: their addresses there,
+// which a deque keeps.
+std::vector<WeightSource *> openSources(std::deque<WeightSource> &sources,
+                                        const std::vector<std::filesystem::path> &paths) {
+  std::vector<WeightSource *> opened;
+  for (const std::filesystem::path &path : paths) opened.push_back(&sources.emplace_back(path));
+  return opened;
+}
+
 } // namespace
 
 std::string ggmlTypeName(uint32_t type) {
@@ -144,17 +148,37 @@ std::string ggmlTypeName(uint32_t type) {
 
 uint64_t GgufTensor::rows() const {
   uint64_t rows = 1;
-  for (size_t i = 1; i < dims.size(); ++i) rows = checkedMultiply(rows, dims[i]);
+  for (size_t i = 1; i < dims.size(); ++i) rows = checkedMultiply<GgufError>(rows, dims[i], "GGUF size");
   return rows;
 }
 
 uint64_t GgufTensor::elements() const {
   uint64_t elements = 1;
-  for (uint64_t dim : dims) elements = checkedMultiply(elements, dim);
+  for (uint64_t dim : dims) elements = checkedMultiply<GgufError>(elements, dim, "GGUF size");
   return elements;
 }
 
-GgufFile::GgufFile(WeightSource &source) : source_(source) {
+GgufFile::GgufFile(WeightSource &source) : GgufFile(std::array<WeightSource *, 1>{&source}) {}
+
+GgufFile::GgufFile(std::span<WeightSource *const> sources) : sources_(sources.begin(), sources.end()) {
+  if (sources_.empty()) throw GgufError("a GGUF needs at least one file");
+  for (uint32_t file = 0; file < sources_.size(); ++file) parse(*sources_[file], file);
+  // The first file's split.count and split.tensors.count, where it states
+  // them, describe the files read, as install/gguf.py merged_split reads
+  // them: a part of a split GGUF read alone is refused here rather than as
+  // the other parts' tensors missing.
+  if (metadata_.unsignedValue("split.count").value_or(1) != sources_.size())
+    throw GgufError("the GGUF's split.count does not match its " + std::to_string(sources_.size()) +
+                    (sources_.size() == 1 ? " file" : " files"));
+  if (metadata_.unsignedValue("split.tensors.count").value_or(tensors_.size()) != tensors_.size())
+    throw GgufError("the GGUF's split files hold another number of tensors than split.tensors.count");
+  rotation_ = readRotation();
+}
+
+void GgufFile::parse(WeightSource &source, uint32_t file) {
+  // Only the first file's metadata is kept: a later split file repeats
+  // split.* alone, whose split.no must be its place.
+  const bool first = file == 0;
   Reader reader(source);
   char magic[4];
   reader.bytes(magic, 4);
@@ -164,22 +188,35 @@ GgufFile::GgufFile(WeightSource &source) : source_(source) {
   const uint64_t tensorCount = reader.scalar<uint64_t>();
   const uint64_t keyCount = reader.scalar<uint64_t>();
   if (tensorCount > 16384 || keyCount > 16384) throw GgufError("implausible GGUF header counts");
+  // A key holds one value, as llama.cpp's reader and install/gguf.py require.
+  std::set<std::string, std::less<>> keys;
   for (uint64_t i = 0; i < keyCount; ++i) {
     const std::string key = reader.string();
+    if (!keys.insert(key).second) throw GgufError("duplicate GGUF metadata key: " + key);
     const uint32_t type = reader.scalar<uint32_t>();
+    if (!first) {
+      if (key == "split.no") {
+        if (type != kUint16 && type != kUint32) throw GgufError("invalid split.no");
+        const uint64_t number = type == kUint16 ? reader.scalar<uint16_t>() : reader.scalar<uint32_t>();
+        if (number != file) throw GgufError("GGUF split file " + source.path().string() + " is out of order");
+      } else {
+        skipValue(reader, type, 0);
+      }
+      continue;
+    }
     switch (type) {
-    case kUint8: unsigned_[key] = reader.scalar<uint8_t>(); break;
-    case kUint16: unsigned_[key] = reader.scalar<uint16_t>(); break;
-    case kUint32: unsigned_[key] = reader.scalar<uint32_t>(); break;
-    case kUint64: unsigned_[key] = reader.scalar<uint64_t>(); break;
-    case kInt8: unsigned_[key] = static_cast<uint64_t>(reader.scalar<int8_t>()); break;
-    case kInt16: unsigned_[key] = static_cast<uint64_t>(reader.scalar<int16_t>()); break;
-    case kInt32: unsigned_[key] = static_cast<uint64_t>(reader.scalar<int32_t>()); break;
-    case kInt64: unsigned_[key] = static_cast<uint64_t>(reader.scalar<int64_t>()); break;
-    case kBool: unsigned_[key] = reader.scalar<uint8_t>() != 0; break;
-    case kString: strings_[key] = reader.string(); break;
-    case kFloat32: floats_[key] = reader.scalar<float>(); break;
-    case kFloat64: floats_[key] = reader.scalar<double>(); break;
+    case kUint8: metadata_.unsigneds[key] = reader.scalar<uint8_t>(); break;
+    case kUint16: metadata_.unsigneds[key] = reader.scalar<uint16_t>(); break;
+    case kUint32: metadata_.unsigneds[key] = reader.scalar<uint32_t>(); break;
+    case kUint64: metadata_.unsigneds[key] = reader.scalar<uint64_t>(); break;
+    case kInt8: metadata_.unsigneds[key] = static_cast<uint64_t>(reader.scalar<int8_t>()); break;
+    case kInt16: metadata_.unsigneds[key] = static_cast<uint64_t>(reader.scalar<int16_t>()); break;
+    case kInt32: metadata_.unsigneds[key] = static_cast<uint64_t>(reader.scalar<int32_t>()); break;
+    case kInt64: metadata_.unsigneds[key] = static_cast<uint64_t>(reader.scalar<int64_t>()); break;
+    case kBool: metadata_.unsigneds[key] = reader.scalar<uint8_t>() != 0; break;
+    case kString: metadata_.strings[key] = reader.string(); break;
+    case kFloat32: metadata_.floats[key] = reader.scalar<float>(); break;
+    case kFloat64: metadata_.floats[key] = reader.scalar<double>(); break;
     case kArray: {
       // Small numeric arrays of any key are kept; strings and long arrays
       // (vocabularies, merges, token types) are skipped without reading them,
@@ -211,13 +248,14 @@ GgufFile::GgufFile(WeightSource &source) : source_(source) {
     default: skipValue(reader, type, 0); break;
     }
   }
-  const uint64_t alignment = unsignedValue("general.alignment").value_or(32);
+  const uint64_t alignment = metadata_.unsignedValue("general.alignment").value_or(32);
   if (alignment == 0 || alignment > 65536 || (alignment & (alignment - 1)))
     throw GgufError("invalid GGUF alignment");
-  architecture_ = stringValue("general.architecture").value_or("");
-  tensors_.reserve(tensorCount);
+  const size_t firstTensor = tensors_.size();
+  tensors_.reserve(firstTensor + tensorCount);
   for (uint64_t i = 0; i < tensorCount; ++i) {
     GgufTensor tensor;
+    tensor.file = file;
     tensor.name = reader.string();
     const uint32_t dimensions = reader.scalar<uint32_t>();
     if (dimensions == 0 || dimensions > 4) throw GgufError("invalid tensor rank for " + tensor.name);
@@ -233,8 +271,9 @@ GgufFile::GgufFile(WeightSource &source) : source_(source) {
     if (!traits) throw GgufError("unknown ggml type " + std::to_string(tensor.type) + " for " + tensor.name);
     if (tensor.columns() % traits->blockElements)
       throw GgufError("tensor row is not block aligned: " + tensor.name);
-    tensor.bytes = checkedMultiply(checkedMultiply(tensor.rows(), tensor.columns() / traits->blockElements),
-                                   traits->blockBytes);
+    tensor.bytes = checkedMultiply<GgufError>(
+        checkedMultiply<GgufError>(tensor.rows(), tensor.columns() / traits->blockElements, "GGUF size"),
+        traits->blockBytes, "GGUF size");
     if (!index_.emplace(tensor.name, tensors_.size()).second)
       throw GgufError("duplicate GGUF tensor: " + tensor.name);
     tensors_.push_back(std::move(tensor));
@@ -244,12 +283,12 @@ GgufFile::GgufFile(WeightSource &source) : source_(source) {
   if (padding > source.bytes() - headerEnd) throw GgufError("GGUF data section is truncated");
   source.setDataOffset(headerEnd + padding);
   const uint64_t dataBytes = source.bytes() - source.dataOffset();
-  for (const GgufTensor &tensor : tensors_) {
+  for (size_t i = firstTensor; i < tensors_.size(); ++i) {
+    const GgufTensor &tensor = tensors_[i];
     if (tensor.offset % alignment) throw GgufError("tensor data is misaligned: " + tensor.name);
     if (tensor.offset > dataBytes || tensor.bytes > dataBytes - tensor.offset)
       throw GgufError("tensor data runs past the end of the file: " + tensor.name);
   }
-  rotation_ = readRotation();
 }
 
 std::optional<GgufRotation> GgufFile::readRotation() const {
@@ -260,9 +299,9 @@ std::optional<GgufRotation> GgufFile::readRotation() const {
     for (const auto &entry : values)
       if (std::string_view(entry.first).starts_with(kRotationPrefix)) keys.insert(entry.first);
   };
-  collect(unsigned_);
-  collect(strings_);
-  collect(floats_);
+  collect(metadata_.unsigneds);
+  collect(metadata_.strings);
+  collect(metadata_.floats);
   collect(arrays_);
   collect(names_);
   if (keys.empty()) return std::nullopt;
@@ -277,14 +316,15 @@ std::optional<GgufRotation> GgufFile::readRotation() const {
         std::end(kKnown))
       throw GgufError("unsupported rotation metadata: " + key);
   const auto key = [](std::string_view name) { return std::string(kRotationPrefix) + std::string(name); };
-  if (unsignedValue(key("version")) != 1) throw GgufError("unsupported prism.hadamard.version");
-  if (unsignedValue(key("block_size")) != GGUF_ROTATION_BLOCK ||
-      stringValue(key("transform")) != "normalized-sylvester-walsh-hadamard" ||
-      stringValue(key("axis")) != "input-last-dimension" || stringValue(key("sign_mode")) != "explicit")
+  if (metadata_.unsignedValue(key("version")) != 1) throw GgufError("unsupported prism.hadamard.version");
+  if (metadata_.unsignedValue(key("block_size")) != GGUF_ROTATION_BLOCK ||
+      metadata_.stringValue(key("transform")) != "normalized-sylvester-walsh-hadamard" ||
+      metadata_.stringValue(key("axis")) != "input-last-dimension" ||
+      metadata_.stringValue(key("sign_mode")) != "explicit")
     throw GgufError("unsupported rotation: the kernels run explicit signs and normalized Sylvester "
                     "Walsh-Hadamard blocks of " + std::to_string(GGUF_ROTATION_BLOCK) + " inputs");
   GgufRotation rotation;
-  rotation.valueHeadsGrouped = unsignedValue(key("gdn_v_grouped")).value_or(0) != 0;
+  rotation.valueHeadsGrouped = metadata_.unsignedValue(key("gdn_v_grouped")).value_or(0) != 0;
   const auto widths = numericArray(key("sign_widths")), values = numericArray(key("sign_values"));
   if (!widths || !values || widths->empty()) throw GgufError("rotation signs are missing");
   size_t at = 0;
@@ -321,22 +361,23 @@ std::optional<GgufRotation> GgufFile::readRotation() const {
   return rotation;
 }
 
-std::optional<uint64_t> GgufFile::unsignedValue(std::string_view key) const {
-  auto it = unsigned_.find(key);
-  if (it == unsigned_.end()) return std::nullopt;
-  return it->second;
+std::optional<uint64_t> GgufMetadata::unsignedValue(std::string_view key) const {
+  const auto it = unsigneds.find(key);
+  return it == unsigneds.end() ? std::nullopt : std::optional<uint64_t>(it->second);
 }
 
-std::optional<std::string> GgufFile::stringValue(std::string_view key) const {
-  auto it = strings_.find(key);
-  if (it == strings_.end()) return std::nullopt;
-  return it->second;
+std::optional<double> GgufMetadata::floatValue(std::string_view key) const {
+  const auto it = floats.find(key);
+  return it == floats.end() ? std::nullopt : std::optional<double>(it->second);
 }
 
-std::optional<double> GgufFile::floatValue(std::string_view key) const {
-  const auto it = floats_.find(key);
-  return it == floats_.end() ? std::nullopt : std::optional<double>(it->second);
+std::optional<std::string> GgufMetadata::stringValue(std::string_view key) const {
+  const auto it = strings.find(key);
+  return it == strings.end() ? std::nullopt : std::optional<std::string>(it->second);
 }
+
+std::string GgufMetadata::architecture() const { return stringValue("general.architecture").value_or(""); }
+
 std::optional<std::span<const double>> GgufFile::numericArray(std::string_view key) const {
   const auto it = arrays_.find(key);
   if (it == arrays_.end()) return std::nullopt;
@@ -352,6 +393,12 @@ const GgufTensor &GgufFile::require(std::string_view name) const {
   const GgufTensor *tensor = find(name);
   if (!tensor) throw GgufError("GGUF is missing tensor " + std::string(name));
   return *tensor;
+}
+
+OpenGguf::OpenGguf(const std::vector<std::filesystem::path> &paths) : file_(openSources(sources_, paths)) {}
+
+void OpenGguf::checkUnchanged() const {
+  for (const WeightSource &source : sources_) source.checkUnchanged();
 }
 
 } // namespace splash::model

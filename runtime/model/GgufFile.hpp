@@ -4,10 +4,12 @@
 // strings and small numeric arrays, the tensor table and where the tensor
 // data starts. Tensor data is never read here.
 
-#include "model/PreparedWeights.hpp"
+#include "model/WeightSource.hpp"
 
 #include <array>
 #include <cstdint>
+#include <deque>
+#include <filesystem>
 #include <map>
 #include <optional>
 #include <set>
@@ -25,11 +27,11 @@ public:
   using std::runtime_error::runtime_error;
 };
 
-// ggml type ids as stored in GGUF tensor infos.
+// The ggml type ids production names, as stored in GGUF tensor infos; the
+// rest are looked up in kGgmlTypes. llama.cpp's NVFP4 (kNVFP4) loads into
+// the NVFP4 format's native rows (model/GgufImage.cpp, imageFormat).
 namespace ggml {
-inline constexpr uint32_t kF32 = 0, kF16 = 1, kQ8_0 = 8, kQ3_K = 11, kQ4_K = 12,
-                          kQ5_K = 13, kQ6_K = 14, kIQ4_NL = 20, kIQ3_S = 21,
-                          kIQ4_XS = 23, kBF16 = 30, kPQ2_0 = 142;
+inline constexpr uint32_t kF32 = 0, kF16 = 1, kQ8_0 = 8, kBF16 = 30, kNVFP4 = 40, kPQ2_0 = 142;
 }
 
 struct GgmlTypeTraits {
@@ -41,7 +43,7 @@ struct GgmlTypeTraits {
 // (id, name, block elements, block bytes) of the ggml types this parser can
 // size, as ggml-common.h defines them and, for 142, PrismML-Eng/llama.cpp's
 // block_pq2_0; a tensor of another type is rejected.
-inline constexpr std::array<std::pair<uint32_t, GgmlTypeTraits>, 31> kGgmlTypes{{
+inline constexpr std::array<std::pair<uint32_t, GgmlTypeTraits>, 33> kGgmlTypes{{
     {0, {"F32", 1, 4}},         {1, {"F16", 1, 2}},         {2, {"Q4_0", 32, 18}},
     {3, {"Q4_1", 32, 20}},      {6, {"Q5_0", 32, 22}},      {7, {"Q5_1", 32, 24}},
     {8, {"Q8_0", 32, 34}},      {9, {"Q8_1", 32, 36}},      {10, {"Q2_K", 256, 84}},
@@ -52,7 +54,7 @@ inline constexpr std::array<std::pair<uint32_t, GgmlTypeTraits>, 31> kGgmlTypes{
     {23, {"IQ4_XS", 256, 136}}, {24, {"I8", 1, 1}},         {25, {"I16", 1, 2}},
     {26, {"I32", 1, 4}},        {27, {"I64", 1, 8}},        {28, {"F64", 1, 8}},
     {29, {"IQ1_M", 256, 56}},   {30, {"BF16", 1, 2}},       {39, {"MXFP4", 32, 17}},
-    {142, {"PQ2_0", 128, 34}},
+    {40, {"NVFP4", 64, 36}},    {42, {"Q2_0", 64, 18}},     {142, {"PQ2_0", 128, 34}},
 }};
 
 // nullptr for type ids this parser does not know.
@@ -69,6 +71,7 @@ struct GgufTensor {
   std::vector<uint64_t> dims; // dims[0] is the fastest (row length)
   uint64_t offset = 0;        // in the file's tensor data
   uint64_t bytes = 0;
+  uint32_t file = 0;          // which file of a split GGUF holds it
   [[nodiscard]] uint64_t columns() const noexcept { return dims.empty() ? 0 : dims[0]; }
   [[nodiscard]] uint64_t rows() const;
   [[nodiscard]] uint64_t elements() const;
@@ -88,17 +91,37 @@ struct GgufRotation {
   std::map<uint32_t, std::vector<int8_t>> signs;
 };
 
+// A GGUF's scalar metadata by key: every integer and boolean as unsigned, a
+// negative integer as its two's complement, every float as a double, and the
+// strings. GgufFile reads it from a header, and model-check from the
+// installer's copy of the header's (install/gguf.py scalar_metadata), so that
+// gguf::requireMetadata holds either to the same rules.
+struct GgufMetadata {
+  std::map<std::string, uint64_t, std::less<>> unsigneds;
+  std::map<std::string, double, std::less<>> floats;
+  std::map<std::string, std::string, std::less<>> strings;
+
+  [[nodiscard]] std::optional<uint64_t> unsignedValue(std::string_view key) const;
+  [[nodiscard]] std::optional<double> floatValue(std::string_view key) const;
+  [[nodiscard]] std::optional<std::string> stringValue(std::string_view key) const;
+  // general.architecture, empty when the metadata names none.
+  [[nodiscard]] std::string architecture() const;
+};
+
 class GgufFile final {
 public:
   // Parses the header of source and sets where its tensor data starts.
   explicit GgufFile(WeightSource &source);
+  // The files of a GGUF: its one file, or every part of a split one
+  // (GGUF's split format) in split order. The first file's metadata,
+  // whose split.* keys must describe these files (a part read alone is
+  // refused), and every file's tensors, each tagged with its file.
+  explicit GgufFile(std::span<WeightSource *const> sources);
 
-  [[nodiscard]] const WeightSource &source() const noexcept { return source_; }
-  [[nodiscard]] const std::string &architecture() const noexcept { return architecture_; }
-
-  [[nodiscard]] std::optional<uint64_t> unsignedValue(std::string_view key) const;
-  [[nodiscard]] std::optional<std::string> stringValue(std::string_view key) const;
-  [[nodiscard]] std::optional<double> floatValue(std::string_view key) const;
+  [[nodiscard]] const WeightSource &source() const noexcept { return *sources_.front(); }
+  [[nodiscard]] const WeightSource &source(uint32_t file) const { return *sources_.at(file); }
+  [[nodiscard]] uint32_t files() const noexcept { return static_cast<uint32_t>(sources_.size()); }
+  [[nodiscard]] const GgufMetadata &metadata() const noexcept { return metadata_; }
   [[nodiscard]] std::optional<std::span<const double>> numericArray(std::string_view key) const;
   // The rotation the metadata declares, if any.
   [[nodiscard]] const std::optional<GgufRotation> &rotation() const noexcept { return rotation_; }
@@ -108,11 +131,9 @@ public:
   [[nodiscard]] const GgufTensor &require(std::string_view name) const;
 
 private:
-  const WeightSource &source_;
-  std::string architecture_;
-  std::map<std::string, uint64_t, std::less<>> unsigned_;
-  std::map<std::string, std::string, std::less<>> strings_;
-  std::map<std::string, double, std::less<>> floats_;
+  void parse(WeightSource &source, uint32_t file);
+  std::vector<WeightSource *> sources_;
+  GgufMetadata metadata_;
   std::map<std::string, std::vector<double>, std::less<>> arrays_;
   // The string arrays of the rotation keys, the only ones kept.
   std::map<std::string, std::vector<std::string>, std::less<>> names_;
@@ -121,6 +142,25 @@ private:
   [[nodiscard]] std::optional<GgufRotation> readRotation() const;
   std::vector<GgufTensor> tensors_;
   std::map<std::string, size_t, std::less<>> index_;
+};
+
+// A GGUF's files, open, and the header parsed from them (GgufFile): one file
+// or every part of a split one, in split order. The header and the plans
+// made from it read the files in place, so it neither copies nor moves.
+class OpenGguf final {
+public:
+  explicit OpenGguf(const std::vector<std::filesystem::path> &paths);
+  OpenGguf(const OpenGguf &) = delete;
+  OpenGguf &operator=(const OpenGguf &) = delete;
+
+  [[nodiscard]] const GgufFile &file() const noexcept { return file_; }
+  // Throws once a file was written since it was opened
+  // (WeightSource::checkUnchanged).
+  void checkUnchanged() const;
+
+private:
+  std::deque<WeightSource> sources_;
+  GgufFile file_;
 };
 
 } // namespace splash::model

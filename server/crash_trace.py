@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Bounded native-protocol crash traces and deterministic local replay.
 
 The ring keeps the newest MAX_TRACE_ENTRIES frames within MAX_TRACE_BYTES of a
@@ -30,11 +29,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Sequence
 
-if __package__:
-    from . import protocol as wire
-else:  # Direct execution from the server directory.
-    import protocol as wire
-
+from . import protocol as wire
 
 TRACE_SCHEMA_VERSION = 1
 MAX_TRACE_ENTRIES = 512
@@ -98,24 +93,35 @@ class CrashTraceRing:
         with self._lock:
             return self._last_dump
 
-    def start_generation(self, generation: int, pid: int) -> None:
+    def start_generation(
+        self, generation: int, pid: int, command: Sequence[str] | None = None
+    ) -> None:
+        """Record `generation`, process `pid`, which `command` started when
+        given: a relaunch's keeps the first engine's context, so that its
+        replay runs as the relaunch did."""
         if not self.active:
             return
         with self._lock:
+            if command:
+                self._command = tuple(command)
             self._generation = generation
             self._pid = pid
             self._started_ns = time.monotonic_ns()
             self._entries.clear()
             self._bytes = 0
 
-    def record_bytes(self, generation: int, direction: str, frame: bytes) -> None:
+    def record_bytes(
+        self, generation: int, direction: str, frame: bytes | bytearray
+    ) -> None:
         if not self.active:
             return
-        encoded = bytes(frame)
         omitted, digest = 0, ""
-        if len(encoded) > MAX_TRACE_BYTES:
-            omitted, digest = len(encoded), hashlib.sha256(encoded).hexdigest()
-            encoded = encoded[: wire.FRAME_HEADER_BYTES]
+        if len(frame) > MAX_TRACE_BYTES:
+            # Only the header is kept, so only the header is copied.
+            omitted, digest = len(frame), hashlib.sha256(frame).hexdigest()
+            encoded = bytes(memoryview(frame)[: wire.FRAME_HEADER_BYTES])
+        else:
+            encoded = bytes(frame)
         with self._lock:
             if generation != self._generation:
                 return
@@ -148,6 +154,7 @@ class CrashTraceRing:
             self._dumped_generation = generation
             started_ns = self._started_ns
             pid = self._pid
+            command = self._command
             entries = tuple(self._entries)
         document = {
             "schema_version": TRACE_SCHEMA_VERSION,
@@ -155,7 +162,7 @@ class CrashTraceRing:
             "generation": generation,
             "pid": pid,
             "process_returncode": process_returncode,
-            "command": list(self._command),
+            "command": list(command),
             "error": {
                 "type": type(error).__name__,
                 "message": str(error),

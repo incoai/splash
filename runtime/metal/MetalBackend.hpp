@@ -17,18 +17,16 @@ namespace splash::metal {
 
 enum class AllocationFailure : uint8_t {
   None,
-  Capacity, // Unclassified capacity refusal from an alternate backing.
   EngineBudget,
   HostPressure,
   DriverRejected,
 };
 
 struct AllocationResult final {
-  AllocationFailure failure;
-  AllocationResult(bool granted)
-      : failure(granted ? AllocationFailure::None
-                        : AllocationFailure::Capacity) {}
-  AllocationResult(AllocationFailure reason) : failure(reason) {}
+  AllocationFailure failure = AllocationFailure::None;
+  // Granted.
+  AllocationResult() noexcept = default;
+  AllocationResult(AllocationFailure reason) noexcept : failure(reason) {}
   [[nodiscard]] explicit operator bool() const noexcept {
     return failure == AllocationFailure::None;
   }
@@ -38,7 +36,6 @@ struct AllocationResult final {
     AllocationFailure failure) noexcept {
   switch (failure) {
   case AllocationFailure::None: return "none";
-  case AllocationFailure::Capacity: return "allocation capacity unavailable";
   case AllocationFailure::EngineBudget: return "engine memory budget exceeded";
   case AllocationFailure::HostPressure: return "host memory reserve protected";
   case AllocationFailure::DriverRejected:
@@ -47,10 +44,10 @@ struct AllocationResult final {
   return "unknown allocation failure";
 }
 
-// Physical allocators use this callback to obtain engine-governed headroom
+// Allocators use this callback to obtain engine-governed headroom
 // without depending on the engine policy type. The operation runs while the
-// caller's reservation is held and returns false without side effects when
-// admission is denied.
+// caller's reservation is held; the callback returns the refusal's cause,
+// with no side effects, when admission is denied.
 using AllocationAdmission =
     std::function<AllocationResult(uint64_t, const std::function<void()> &)>;
 
@@ -59,9 +56,15 @@ enum class BufferStorage {
   Private,
 };
 
+// How kernels reach a buffer: bound to the dispatches that use it, or only
+// through its GPU address held in another buffer, as they reach KV extents.
+enum class BufferReach {
+  Bound,
+  Addressed,
+};
+
 class MetalBackend;
 class CommandTicket;
-class SparseHeap;
 
 // A cheap, copyable reference to a backend-owned Metal allocation. Views keep
 // the base allocation alive and do not increase the tracked allocation count.
@@ -76,9 +79,18 @@ public:
 
   [[nodiscard]] explicit operator bool() const noexcept;
   [[nodiscard]] uint64_t sizeBytes() const noexcept;
+  // The base allocation's MTLResource.allocatedSize, as memoryStats() counts
+  // it; views of one allocation all report it.
+  [[nodiscard]] uint64_t allocatedBytes() const noexcept;
   [[nodiscard]] BufferStorage storage() const noexcept;
-  // Returns nullptr for private buffers. The pointer covers this view only.
+  // Returns nullptr for private buffers and released memory
+  // (MetalBackend::releaseMemory). The pointer covers this view only.
   [[nodiscard]] void *contents() const noexcept;
+  // GPU address of the view's first byte, for kernels that reach a buffer
+  // through an address another buffer holds; zero for released memory. Only
+  // a buffer allocated BufferReach::Addressed has one: no command names the
+  // buffers kernels reach that way, so only that keeps them resident.
+  [[nodiscard]] uint64_t gpuAddress() const;
   // Allocation identity and exact view range, including Private storage.
   // This compares metadata only; it never maps or reads device contents.
   [[nodiscard]] bool sameView(const MetalBuffer &other) const noexcept;
@@ -92,37 +104,36 @@ private:
   friend class MetalBackend;
 };
 
-// Move-only ownership of one private placement heap. Destroying an empty heap
-// is the operation that actually returns sparse KV backing to the OS; merely
-// unmapping tiles is not sufficient on Apple Silicon.
-class SparseHeap final {
+// A shared event another agent, such as the Neural Engine, waits on or
+// signals. Copies name the same event. nativeHandle() is its
+// id<MTLSharedEvent> for Objective-C++ callers. Its value never decreases:
+// Metal ignores a signal below it, from the CPU as from the GPU.
+class SharedEvent final {
 public:
-  SparseHeap();
-  ~SparseHeap();
-  SparseHeap(const SparseHeap &) = delete;
-  SparseHeap &operator=(const SparseHeap &) = delete;
-  SparseHeap(SparseHeap &&) noexcept;
-  SparseHeap &operator=(SparseHeap &&) noexcept;
+  SharedEvent();
+  ~SharedEvent();
+  SharedEvent(const SharedEvent &);
+  SharedEvent &operator=(const SharedEvent &);
+  SharedEvent(SharedEvent &&) noexcept;
+  SharedEvent &operator=(SharedEvent &&) noexcept;
 
   [[nodiscard]] explicit operator bool() const noexcept;
-  [[nodiscard]] uint64_t sizeBytes() const noexcept;
+  [[nodiscard]] void *nativeHandle() const noexcept;
+  // Raises the event to `value` from the CPU.
+  void signal(uint64_t value) const noexcept;
+  // Calls `callback` once, when the event reaches `value`, promptly if it
+  // already has. Callbacks run on a serial dispatch queue of the backend
+  // that created the event, one at a time and never within notify(); they
+  // must not throw.
+  void notify(uint64_t value, std::function<void()> callback) const;
+
 private:
   struct Impl;
-  explicit SparseHeap(std::shared_ptr<Impl> impl);
+  explicit SharedEvent(std::shared_ptr<Impl> impl);
 
   std::shared_ptr<Impl> impl_;
 
   friend class MetalBackend;
-};
-
-// Tiles [bufferOffsetBytes, bufferOffsetBytes + sizeBytes) of a
-// placement-sparse buffer, never a view with an offset, backed from
-// heapOffsetBytes of a placement heap.
-struct SparseMapping {
-  MetalBuffer buffer;
-  uint64_t bufferOffsetBytes = 0;
-  uint64_t sizeBytes = 0;
-  uint64_t heapOffsetBytes = 0;
 };
 
 struct DispatchSize {
@@ -143,31 +154,129 @@ struct BytesBinding {
   uint64_t sizeBytes = 0;
 };
 
+// A grid the GPU reads as the dispatch starts, so an earlier dispatch of the
+// same command may write it: three uint32 threadgroup counts, x, y and z
+// (MTLDispatchThreadgroupsIndirectArguments), at offsetBytes into buffer and
+// at a multiple of 4 bytes into its allocation.
+struct IndirectGrid {
+  MetalBuffer buffer;
+  uint64_t offsetBytes = 0;
+};
+
 struct ComputeDispatch {
   std::string pipelineName;
   std::vector<BufferBinding> buffers;
   std::vector<BytesBinding> bytes;
+  // With a buffer in indirectThreadgroups the dispatch runs the grid it
+  // holds, which its writer keeps within threadgroups.
   DispatchSize threadgroups;
   DispatchSize threadsPerThreadgroup;
+  IndirectGrid indirectThreadgroups = {};
+};
+
+// A host step's round trip on the host clock (AwakeClock, the time base of
+// the GPU's command buffer times): from the GPU end of the work before the
+// step to the runner taking it up, its work, and from its return to the GPU
+// start of the work after it.
+struct HostStepTiming {
+  double pickupSeconds = 0.0;
+  double workSeconds = 0.0;
+  double resumeSeconds = 0.0;
+};
+
+// What the GPU does through a host step (EventStep::Kind::Host): it idles,
+// or one GPU thread spins through the step and keeps it awake.
+enum class HostStepGpu : uint8_t {
+  Idle,
+  Awake,
+};
+
+// Orders a command against another agent, such as the Neural Engine, after
+// the first `before` of its dispatches. A Signal raises the event to `value`
+// once all earlier work has completed; a Wait holds all later work until the
+// event reaches `value`. A command is split into Metal command buffers at its
+// signals, so a signal is never held back behind the dispatches that follow
+// it, and a signal is delivered even when the work before it fails.
+//
+// A Host step runs `work` on the CPU once all earlier work has completed and
+// holds all later work until it returned, through two shared events the
+// backend creates for the command's host steps, one the GPU raises and one the
+// backend's runner raises, so that no write of one side puts back a value of
+// the other (the step's event and value are unused): the work reads what the
+// GPU wrote before it and writes Shared buffers the GPU reads after it. With
+// HostStepGpu::Awake, one GPU
+// thread spins through the step so the GPU stays awake and starts the work
+// after it at once and at full clocks: for steps about as short as the GPU's
+// wake-up (a streamed decode load), not for long ones, where the spin saves
+// little. The spin, host_step_wait of host-step.metallib beside the
+// backend's metallib, sees the CPU end it through a memory scope Metal's
+// public headers leave out, so the backend checks, before the first command
+// with an awake step, that it does; without that library, or if it does not,
+// awake steps run as plain ones, with a warning. The steps of the committed
+// commands run in order on one thread of the backend's while the submitting
+// thread goes on, so `work` must not call the backend: it touches buffer
+// contents and its own state only. It may also run after submitCommandAsync
+// or wait() threw (its encoding failed after its first buffers were committed,
+// or the watchdog or a shutdown gave the command up), so it owns what it
+// touches. A step is skipped when the command buffer before it failed, and
+// so is every later step of its command, as are those after a step whose
+// work threw: a later step may build on what an earlier one did (an expert
+// load's later rounds on its first), and a command that failed is given up.
+// The GPU work after a skipped step still runs, on what its buffers held, as
+// all work after a failed buffer runs on what it left, and the command fails
+// with the first failure; a step whose work threw names it (its ticket's
+// wait() throws its message). The failure also names, of the steps that ran,
+// the longest work and the longest pickup (from the end of the GPU work
+// before a step to its start), so that a buffer Metal timed out tells which
+// step held its wait. Once a command completed without a failure, `timed`
+// gets the round trip of each of its host steps (HostStepTiming) on Metal's
+// completion thread; one that throws marks the backend unhealthy, as a
+// completion callback that throws does. A command run under dispatch
+// profiling reports no round trip. Once the work returned, `then` runs on the
+// runner right after the step let the work after it go: short CPU work the
+// GPU need not wait for and that would slow its start, such as reads begun in
+// the background; the runner takes the next step once it returned. The
+// command may have completed by then, so `then` must not throw: one that does
+// marks the backend unhealthy.
+struct EventStep {
+  enum class Kind : uint8_t { Signal, Wait, Host };
+
+  size_t before = 0;
+  SharedEvent event;
+  uint64_t value = 0;
+  Kind kind = Kind::Signal;
+  std::function<void()> work{};
+  std::function<void(const HostStepTiming &)> timed{};
+  HostStepGpu gpu = HostStepGpu::Idle;
+  std::function<void()> then{};
+};
+
+// What one submission encodes: its dispatches in order, and the event steps
+// between them in the order of their `before`.
+struct Command {
+  std::span<const ComputeDispatch> dispatches;
+  std::span<const EventStep> events;
 };
 
 struct CommandTiming {
+  // From the GPU start of a command's first Metal command buffer to the end
+  // of its last: a command split at event signals (EventStep) also counts the
+  // time its later buffers wait for the other agent or its host steps.
   double gpuSeconds = 0.0;
   double wallSeconds = 0.0;
+  // Of gpuSeconds, the time its work waited on its host steps: from the GPU
+  // end of the work before each step to the GPU start of the work after it.
+  double hostSeconds = 0.0;
 };
 
-// GPU time of one dispatch replayed as its own command while profiling.
-struct DispatchTiming {
-  std::string pipelineName;
-  double gpuSeconds = 0.0;
-};
-
-// Move-only ownership of one submitted Metal command, including any resource
-// dependency wait before GPU commitment. Completion is signalled
+// Move-only ownership of one submitted Metal command. Completion is signalled
 // without blocking the submitting thread; wait() is normally called only
 // after the host event loop receives the completion notification.
 // Destroying or replacing an unfinished ticket waits for GPU completion and
-// retains its allocations throughout that wait.
+// retains its allocations throughout that wait. Each of these waits runs the
+// command watchdog every second: once the watchdog gives up on the command,
+// wait() throws MetalBackendError and destruction or replacement returns,
+// leaving the allocations to the command's completion handler.
 class CommandTicket final {
 public:
   CommandTicket();
@@ -177,8 +286,6 @@ public:
   CommandTicket(CommandTicket &&) noexcept;
   CommandTicket &operator=(CommandTicket &&) noexcept;
 
-  [[nodiscard]] explicit operator bool() const noexcept;
-  [[nodiscard]] uint64_t sequence() const noexcept;
   [[nodiscard]] bool ready() const noexcept;
   [[nodiscard]] CommandTiming wait();
 
@@ -191,7 +298,7 @@ private:
   friend class MetalBackend;
 };
 
-using CommandCompletion = std::function<void(uint64_t sequence)>;
+using CommandCompletion = std::function<void()>;
 
 // Bytes one allocation added between two memoryStats() readings.
 [[nodiscard]] inline uint64_t allocationDelta(uint64_t before, uint64_t after) {
@@ -204,42 +311,18 @@ struct MetalMemoryStats {
   // Sum of MTLResource.allocatedSize for live base buffers created through
   // this backend. Views share their base allocation and add no bytes.
   uint64_t allocatedBytes = 0;
+  // Its highest value since the backend was made or its peaks restarted
+  // (MetalBackend::restartPeaks).
   uint64_t peakAllocatedBytes = 0;
 
   // Most recently sampled Metal device-wide process counter. Allocation and
   // command lifecycle boundaries refresh it; status reads never synchronize
   // with an in-flight GPU command.
   uint64_t deviceCurrentAllocatedBytes = 0;
-  // Highest sampled device.currentAllocatedSize. Sampled after allocations
-  // and pipeline creation, before submission, and on host-side retirement.
+  // Highest sampled device.currentAllocatedSize since then. Sampled after
+  // allocations and pipeline creation, on host-side retirement and whenever
+  // admission refreshes the stats.
   uint64_t devicePeakAllocatedBytes = 0;
-
-  // Placement-sparse buffers reserve virtual GPU address space without
-  // committing it. Resident bytes count live placement heaps, which are the
-  // reclaimable physical unit.
-  uint64_t sparseVirtualBytes = 0;
-  uint64_t sparseResidentBytes = 0;
-  uint64_t peakSparseResidentBytes = 0;
-
-  // Peak of the simultaneous dense + sparse physical allocations. The two
-  // component peaks above can occur at different times and must not be added.
-  uint64_t peakResidentBytes = 0;
-
-  // Placement-sparse unmapping is asynchronous. The heap of an unmapped
-  // extent stays retained, and counted resident, until the sparse queue
-  // reports that unmap complete; at most one unmap is outstanding. Durations
-  // are observed at the next backend safe point, not measured by the kernel.
-  uint64_t sparseTileBytes = 0;
-  uint64_t pendingSparseUnmaps = 0;
-  uint64_t completedSparseUnmaps = 0;
-  double lastSparseUnmapSeconds = 0.0;
-  double maxSparseUnmapSeconds = 0.0;
-  double pendingSparseUnmapSeconds = 0.0;
-  // Host-side dependency wait before committing a compute command.
-  uint64_t sparseMapWaitEvent = 0;
-  double pendingSparseMapWaitSeconds = 0.0;
-  double lastSparseMapWaitSeconds = 0.0;
-  double maxSparseMapWaitSeconds = 0.0;
 };
 
 class MetalBackendError : public std::runtime_error {
@@ -248,7 +331,8 @@ public:
 };
 
 // A normal capacity failure. Callers may evict cache or return a retryable
-// admission error; the Metal backend remains healthy.
+// admission error; the Metal backend remains healthy. MemoryGovernor's
+// allocationAdmission is the one place it becomes a value (AllocationResult).
 class MetalAllocationError final : public MetalBackendError {
 public:
   explicit MetalAllocationError(
@@ -261,136 +345,140 @@ private:
 };
 
 // The capabilities a backend reads, without loading kernels or allocating:
-// enough to refuse an unsupported Mac before a model is downloaded. Only a
-// backend also exercises placement-sparse mapping.
+// enough to refuse an unsupported Mac before a model is downloaded.
 [[nodiscard]] DeviceCapabilities probeDeviceCapabilities();
 
+// How long a command may go without progress before the backend gives up on
+// it by default, in time the Mac is awake (AwakeClock): from its commit, and
+// then from each of its host steps as the GPU work before it ends and as it
+// returns (CommandWatchdog).
+inline constexpr double kCommandTimeoutSeconds = 120.0;
+// How long every buffer stays wired after the last command by default (see
+// allocateBuffer), also the default of the engine's idle release
+// (RuntimeResourcesConfig::idleReleaseSeconds).
+inline constexpr double kResidencyKeepAliveSeconds = 600.0;
+static_assert(kCommandTimeoutSeconds > 0.0 && kResidencyKeepAliveSeconds > 0.0);
+
 // Permits exactly one submitted-but-not-applied command on its command queue.
+// One thread submits, allocates and looks up pipelines; checkHealth(),
+// healthy(), unhealthyReason(), memoryStats() and commandInFlight() may be
+// called from any thread.
 class MetalBackend final {
 public:
-  // A sparse map a command waits for, or an unmap, still pending after
-  // sparseTimeoutMilliseconds fails the command or the backend. Buffers kept
-  // resident stay wired until residencyKeepAliveSeconds pass without a
-  // command.
+  // Buffers stay wired for residencyKeepAliveSeconds after the last command;
+  // an infinite keep-alive holds them while the backend lives. The watchdog
+  // gives up on a command that goes longer than commandTimeoutSeconds without
+  // progress (kCommandTimeoutSeconds).
   explicit MetalBackend(std::string metallibPath,
-                        double commandTimeoutSeconds = 120.0,
-                        uint32_t sparseTimeoutMilliseconds = 30000,
-                        double residencyKeepAliveSeconds = 600.0);
+                        double residencyKeepAliveSeconds = kResidencyKeepAliveSeconds,
+                        double commandTimeoutSeconds = kCommandTimeoutSeconds);
   ~MetalBackend();
   // Invoked before allocations and submissions; may throw to stop bootstrap.
   void setOperationGuard(std::function<void()> guard);
+  // Asked between the slices of a ticket's wait(); true gives up the wait as
+  // the watchdog does and marks the backend unhealthy: the process is
+  // shutting down. Destroying or replacing a ticket still waits for its
+  // command.
+  void setWaitInterrupt(std::function<bool()> shuttingDown);
   void checkOperation() const;
-  // Stop new submissions and cancel dependency waits before teardown.
-  // Commands already committed to the GPU retain their normal lifetime.
+  // Stop new submissions before teardown. Commands already committed to the
+  // GPU retain their normal lifetime.
   void stop() noexcept;
 
   MetalBackend(const MetalBackend &) = delete;
   MetalBackend &operator=(const MetalBackend &) = delete;
-  MetalBackend(MetalBackend &&) noexcept;
-  MetalBackend &operator=(MetalBackend &&) noexcept;
+  MetalBackend(MetalBackend &&) = delete;
+  MetalBackend &operator=(MetalBackend &&) = delete;
 
   [[nodiscard]] const DeviceCapabilities &capabilities() const noexcept;
 
+  // Every buffer the backend allocates belongs to one residency set until its
+  // memory is released or its last view is gone. Metal by itself wires a
+  // buffer only while a command uses it and a few seconds after, so memory
+  // pressure could compress idle state and the next request would wait to get
+  // it back. A member is wired from its allocation on until the keep-alive
+  // passes without a command, and again from the next command: memory goes
+  // back to macOS when the engine releases it, not when macOS chooses. A
+  // Shared buffer that kernels reach only through its GPU address
+  // (BufferReach::Addressed), as they reach KV extents, also belongs to the
+  // set the command queue holds, which makes it resident for every command
+  // buffer though no command names it (Residency).
   [[nodiscard]] MetalBuffer
-  allocateBuffer(uint64_t bytes, BufferStorage storage = BufferStorage::Shared,
-                 std::string_view label = {});
-
-  // Private sparse buffers use the shared 64 KiB tile ABI. Per-layer scale
-  // ranges must stay tile-aligned; fewer dirty tiles reduce unmap cost.
-  [[nodiscard]] MetalBuffer
-  allocatePlacementSparseBuffer(uint64_t virtualBytes, uint64_t sparsePageBytes,
-                                std::string_view label = {});
-  [[nodiscard]] SparseHeap allocatePlacementHeap(uint64_t physicalBytes,
-                                                 uint64_t sparsePageBytes,
-                                                 std::string_view label = {});
-
-  // Mapping is ordered before the next compute command by an internal
-  // Metal event. Unmapping is only legal with no submitted command. It is
-  // asynchronous: the backend takes ownership of the mapped heap and keeps it
-  // resident until the sparse queue reports the unmap complete, which is
-  // observed at later safe points. Only one unmap may be outstanding; a
-  // second call first waits for the previous unmap. Unmapping GPU-written
-  // tiles is kernel work that can stall the whole GPU stack when issued in
-  // bursts, so callers pace releases with sparseUnmapPending().
-  void mapSparse(const SparseHeap &heap,
-                 std::span<const SparseMapping> mappings);
-  void unmapSparse(std::span<const SparseMapping> mappings, SparseHeap &&heap);
-  // Reports whether an unmap is still outstanding, reaping a completed one
-  // (releasing its heap) when no command is being encoded.
-  // Never blocks. Marks the backend unhealthy once the outstanding unmap has
-  // been pending longer than the drain's bounded wait.
-  [[nodiscard]] bool sparseUnmapPending() noexcept;
-  // Placement-sparse page (tile) size shared with the KV page layout.
-  static constexpr uint64_t kPlacementSparsePageBytes = 64 * 1024;
-  // Blocks until the outstanding unmap, if any, has completed. A bounded
-  // timeout marks the backend unhealthy; use only at startup and shutdown.
-  void drainSparseUnmaps();
-
-  // Wraps page-aligned shared memory without copying it. The lifetime token
-  // is retained by Metal's deallocator, including any internal buffer owners
-  // that outlive our C++ views and completed tickets.
+  allocateBuffer(uint64_t bytes, BufferStorage storage,
+                 std::string_view label,
+                 BufferReach reach = BufferReach::Bound);
+  // A Shared buffer over whole pages of memory another agent also reads or
+  // writes, such as an IOSurface of the Neural Engine, without a copy. Metal
+  // keeps `owner` until it lets the buffer go; the memory is the owner's, so
+  // releaseMemory refuses it.
   [[nodiscard]] MetalBuffer wrapSharedMemory(void *address, uint64_t bytes,
-                                             std::shared_ptr<void> lifetime,
-                                             std::string_view label = {});
+                                             std::shared_ptr<void> owner,
+                                             std::string_view label);
+
   [[nodiscard]] MetalBuffer view(const MetalBuffer &base, uint64_t offsetBytes,
                                  uint64_t lengthBytes) const;
+  // An event at value 0, whose notify() callbacks run on this backend's
+  // event queue.
+  [[nodiscard]] SharedEvent newSharedEvent();
 
-  // Metal wires a buffer only while a command uses it and a few seconds
-  // after, so memory pressure can drop idle weights and the next request
-  // reads them from disk again. A kept buffer (the base allocation of a view)
-  // is wired from here on until the keep-alive passes without a command, and
-  // again from the next command, until the allocation's last view is gone.
-  // Keeping a buffer twice throws.
-  void keepResident(const MetalBuffer &buffer);
-  // The kept bytes whose residency the keep-alive has ended, until the next
-  // command holds them again; Metal unwires them shortly after the end.
-  [[nodiscard]] uint64_t lapsedResidentBytes() const noexcept;
+  // Frees the memory of a buffer from allocateBuffer while no command is in
+  // flight: it leaves the residency set and the accounting. Its views stay
+  // valid handles of no memory: a command that binds one fails, and their
+  // contents are null and GPU addresses 0, until restoreMemory allocates the
+  // buffer's memory again, at another GPU address, its contents undefined
+  // until written.
+  void releaseMemory(const MetalBuffer &buffer);
+  void restoreMemory(const MetalBuffer &buffer);
 
   // Encodes exactly one compute dispatch, commits it, waits for completion,
   // and reports both GPU and end-to-end wall time.
   [[nodiscard]] CommandTiming submit(const ComputeDispatch &dispatch);
 
-  // Encodes an ordered dispatch list into one command buffer and waits for it.
-  [[nodiscard]] CommandTiming
-  submitCommand(std::span<const ComputeDispatch> dispatches);
-
-  // Encodes and commits without waiting. The completion callback only
-  // notifies host control flow; command results and errors are consumed from
-  // the returned ticket. A second command is rejected until wait() consumes
-  // the first ticket, preserving the one-in-flight runtime invariant.
+  // Encodes a command into Metal command buffers, one plus one per buffer its
+  // event steps add (EventStep), and commits each as its encoding ends,
+  // without waiting: the GPU runs the work before an event step while the
+  // work after it is still encoded. The completion callback only notifies
+  // host control flow; command results and errors are consumed from the
+  // returned ticket, which reports the error of the first of its buffers that
+  // failed. A second command is rejected until wait() consumes the first
+  // ticket, preserving the one-in-flight runtime invariant.
   [[nodiscard]] CommandTicket
-  submitAsync(const ComputeDispatch &dispatch,
-              CommandCompletion completion = {});
+  submitCommandAsync(const Command &command, CommandCompletion completion = {});
+  // A command of these dispatches without event steps: one command buffer.
   [[nodiscard]] CommandTicket
   submitCommandAsync(std::span<const ComputeDispatch> dispatches,
                      CommandCompletion completion = {});
 
-  // Development profiling replays a multi-dispatch command synchronously,
-  // one dispatch per command buffer. Even submitCommandAsync() then blocks,
-  // invokes completion inline and returns an already-completed ticket.
-  // Production serving leaves this disabled. Benchmarks read and clear the
-  // per-dispatch timings with takeDispatchProfile().
-  void setDispatchProfiling(bool enabled) noexcept;
-  [[nodiscard]] std::vector<DispatchTiming> takeDispatchProfile();
+  // Startup: compiles now the pipelines a later submission of these
+  // dispatches would compile. Validates them as submission does and throws
+  // as it would, but encodes and commits nothing.
+  void preparePipelines(std::span<const ComputeDispatch> dispatches);
 
   [[nodiscard]] MetalMemoryStats memoryStats() const noexcept;
   // Explicit safe-point refresh for memory admission/reclamation code. A
   // control-plane status query must use memoryStats() so it can never wait
   // behind an active Metal command.
   [[nodiscard]] MetalMemoryStats refreshMemoryStats() const noexcept;
-  [[nodiscard]] uint64_t submissionCount() const noexcept;
-  [[nodiscard]] size_t pipelineCount() const noexcept;
+  // Starts both peaks again from what is allocated now, sampling the device:
+  // what memory held before, such as a load the caller discarded, no longer
+  // counts. Called where nothing else allocates.
+  void restartPeaks() noexcept;
+  // True from a submission until its ticket has been consumed: while memory
+  // the command reaches through addresses must stay allocated.
+  [[nodiscard]] bool commandInFlight() const noexcept;
   [[nodiscard]] bool healthy() const noexcept;
-  // Serving-loop check of actual GPU commands and pending unmaps. Terminal
-  // results may invoke completion here if the driver callback is delayed.
+  // Serving-loop check of the command in flight. Terminal results may invoke
+  // completion here if the driver callback is delayed.
   // Timeout marks the backend unhealthy without releasing in-flight resources.
+  // A synchronous ticket wait runs the same command watchdog.
   void checkHealth();
-  [[nodiscard]] bool needsHealthCheck() const noexcept;
   [[nodiscard]] std::string unhealthyReason() const;
 
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+
+  friend class BackendInstrumentation;
 };
 
 } // namespace splash::metal

@@ -1,7 +1,5 @@
 #pragma once
 
-// Editing this file re-prepares every GGUF and vision model.
-
 #include <bit>
 #include <cstdint>
 #include <optional>
@@ -15,5 +13,8 @@ namespace splash::model {
   if (bits & 0xFFFFu) return std::nullopt;
   return static_cast<uint16_t>(bits >> 16);
 }
+
+// The float a bf16's bits hold.
+[[nodiscard]] inline float widenBfloat16(uint16_t bits) { return std::bit_cast<float>(uint32_t{bits} << 16); }
 
 } // namespace splash::model
