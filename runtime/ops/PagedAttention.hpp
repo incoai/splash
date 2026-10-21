@@ -217,6 +217,9 @@ public:
     return located ? locatedSplitPipeline_ : splitPipeline_;
   }
   [[nodiscard]] const std::string &reducePipeline() const noexcept { return reducePipeline_; }
+  // The split reads half queries and probabilities (the _split_h entries),
+  // its queries converted in place before it (Apple8).
+  [[nodiscard]] bool halfQueries() const noexcept { return halfQueries_; }
   [[nodiscard]] metal::DispatchSize splitGroups(const Dispatch &dispatch) const noexcept;
   [[nodiscard]] metal::DispatchSize reduceGroups(const Dispatch &dispatch) const noexcept;
 
@@ -231,6 +234,7 @@ private:
   std::string splitPipeline_;
   std::string locatedSplitPipeline_;
   std::string reducePipeline_;
+  bool halfQueries_ = false;
 };
 
 // A sequence whose rows' block masks become block lists
@@ -266,11 +270,13 @@ public:
   // on, the plan's queries score as INT8 against INT8 pages (the dense
   // kernels' q8q entries) where some tile's splits read at least the
   // device's `int8QueriesFromPages` pages each: a command's sequences share
-  // the choice, as a decode step's lanes do.
+  // the choice, as a decode step's lanes do. With `halfOperands` (Apple8),
+  // a dense plan over INT8 pages that does not score INT8 queries reads half
+  // queries and probabilities (AttentionPlan::halfQueries).
   [[nodiscard]] static AttentionPlan plan(std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
                                           kv::Layout layout, const AttentionCalibration &calibration,
                                           Int8Activations int8Activations, AttentionWorkspace capacity,
-                                          AttentionVariant variant = {});
+                                          AttentionVariant variant = {}, bool halfOperands = false);
   // `plan`'s sequences from the tile that holds each one's last row: their
   // kernels and splits, so each tile computes what it does in `plan`.
   [[nodiscard]] static AttentionPlan lastTiles(const AttentionPlan &plan);

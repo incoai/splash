@@ -42,12 +42,14 @@ static_assert(kRows == splash::ops::kNarrowLaneRows, "a lane of the narrow cap's
 // token-major values; a group of more than eight runs each tile in parts,
 // each a threadgroup of the split with partial slots of its own
 // (splash_attention_tile_part). A dense geometry also runs its INT8-query
-// entries (q8q).
+// entries (q8q), and Apple8's entries of half queries and probabilities
+// (_h), whose queries it converts to half.
 struct Shape {
   uint32_t kvHeads;
   uint32_t queryHeadsPerKvHead;
   splash::kv::Reads reads;
   bool int8Queries = false;
+  bool halfQueries = false;
   uint32_t queryHeads() const { return kvHeads * queryHeadsPerKvHead; }
   uint32_t fusedRows() const { return kRows * queryHeadsPerKvHead; }
   bool sparse() const { return reads == splash::kv::Reads::SelectedBlocks; }
@@ -73,15 +75,17 @@ private:
     return splash::ops::PagedAttention::plan(
         lane, queryHeads(), layout(), splash::test::attentionRow(int8Queries ? 1U : splash::ops::kNever),
         splash::ops::Int8Activations::On,
-        splash::ops::PagedAttention::workspace(kAttentionMaximumSplits, queryHeads(), layout()));
+        splash::ops::PagedAttention::workspace(kAttentionMaximumSplits, queryHeads(), layout()), {}, halfQueries);
   }
 };
 const std::vector<Shape> kShapes = [] {
   std::vector<Shape> shapes;
   for (const splash::test::AttentionGeometry &geometry : splash::test::familyAttentionGeometries()) {
     shapes.push_back({geometry.kvHeads, geometry.queryHeads / geometry.kvHeads, geometry.reads});
-    if (geometry.reads == splash::kv::Reads::EveryPage)
+    if (geometry.reads == splash::kv::Reads::EveryPage) {
       shapes.push_back({geometry.kvHeads, geometry.queryHeads / geometry.kvHeads, geometry.reads, true});
+      shapes.push_back({geometry.kvHeads, geometry.queryHeads / geometry.kvHeads, geometry.reads, false, true});
+    }
   }
   return shapes;
 }();
@@ -614,6 +618,15 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   for (uint32_t lane = 0; lane < width; ++lane) {
     std::memcpy(static_cast<uint8_t *>(queries.contents) + lane * laneBytes,
                 data.queries.contents, laneBytes);
+  }
+  // The _h entries read half queries: the case's bf16 values, each exact in
+  // half's range, against the same references.
+  if (shape.halfQueries) {
+    auto *values = static_cast<BFloat16Bits *>(queries.contents);
+    for (uint64_t i = 0; i < queries.length / sizeof(BFloat16Bits); ++i) {
+      const _Float16 value = static_cast<_Float16>(bfloat16ToFloat(values[i]));
+      std::memcpy(values + i, &value, sizeof(value));
+    }
   }
   // With QSA masks every lane attends through a copy of the case's list,
   // lane l's list kQsaJunkLists + l.
@@ -1172,8 +1185,8 @@ void run(const char *libraryPath) {
     throw std::runtime_error(error.localizedDescription.UTF8String);
   id<MTLCommandQueue> queue = [device newCommandQueue];
   for (const Shape shape : kShapes) {
-    // The INT8-query entries share their geometry's reduce.
-    if (!shape.int8Queries)
+    // The INT8-query and half-query entries share their geometry's reduce.
+    if (!shape.int8Queries && !shape.halfQueries)
       for (uint32_t splits : {1U, 3U, 7U, 32U, 65U, 128U}) {
         checkReduce(device, queue, library, shape, splits, kRows);
         checkReduce(device, queue, library, shape, splits, 1);
