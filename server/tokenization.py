@@ -20,6 +20,21 @@ def tokenizable(text):
     return _SURROGATE.sub("\ufffd", text)
 
 
+def plain_tokens(tokenizer, text):
+    """`text` encoded as ordinary text: by the tokenizer's normalizer,
+    pre-tokenizer and model alone, so that an added token it spells reads as
+    the tokens of its characters."""
+    backend = tokenizer.backend_tokenizer
+    if backend.normalizer is not None:
+        text = backend.normalizer.normalize_str(text)
+    pieces = (
+        backend.pre_tokenizer.pre_tokenize_str(text)
+        if backend.pre_tokenizer is not None
+        else [(text, None)]
+    )
+    return [token.id for piece, _ in pieces for token in backend.model.tokenize(piece)]
+
+
 class PromptTokenizer:
     """Encodes prompts reusing a cached prompt's tokens up to its last
     `marker`, the chat template's special token at a message boundary
