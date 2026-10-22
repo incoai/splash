@@ -26,7 +26,7 @@ selected BF16 export with the real loader and run held-out native rollouts.
 No real checkpoint acceptance or throughput improvement has been measured.
 
 Local verification (Apple M5 Pro, macOS 26.6, Python 3.12.14, PyTorch 2.13.0,
-Transformers 5.15.1): `55` training tests passed, including the pinned upstream
+Transformers 5.15.1): `56` training tests passed, including the pinned upstream
 reference comparison; none skipped. Actual MPS was required and CPU fallback disabled:
 
 ```sh

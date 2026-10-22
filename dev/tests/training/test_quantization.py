@@ -170,3 +170,11 @@ class QuantizationTests(unittest.TestCase):
                 rtol=0,
                 atol=0,
             )
+
+    def test_half_away_preserves_large_integral_float32_values(self):
+        from draft_training.quantization import half_away
+
+        t = self.torch
+        values = t.tensor([-0.5, 0.5, -2.5, 2.5, 8388609.0, -8388609.0])
+        expected = t.tensor([-1.0, 1.0, -3.0, 3.0, 8388609.0, -8388609.0])
+        t.testing.assert_close(half_away(values), expected, rtol=0, atol=0)

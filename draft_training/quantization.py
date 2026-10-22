@@ -12,7 +12,13 @@ from .config import TrainingError
 
 
 def half_away(value):
-    return value.sign() * (value.abs() + 0.5).floor()
+    # Adding 0.5 first can round a large, already-integral FP32 value to
+    # its neighboring even integer. Inspect the fractional part instead.
+    integral = value.trunc()
+    fraction = value - integral
+    return integral + torch.where(
+        fraction >= 0.5, 1.0, torch.where(fraction <= -0.5, -1.0, 0.0)
+    )
 
 
 @torch.no_grad()
