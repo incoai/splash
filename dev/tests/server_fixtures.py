@@ -813,6 +813,8 @@ def main_args(**overrides):
             "sparse_kv_memory": None,
             "kv_format": "int8",
             "state_format": "fp32",
+            "anthropic_upstream": None,
+            "openai_upstream": None,
             **overrides,
         }
     )
@@ -893,6 +895,7 @@ class Harness:
         allowed_origins=(),
         vision=True,
         thinking_end=backend_api.DEFAULT_THINKING_END,
+        upstreams=None,
         **frontend_options,
     ):
         self.tokenizer = tokenizer or FakeTokenizer()
@@ -928,6 +931,7 @@ class Harness:
             max_request_bytes=max_request_bytes,
             allowed_hosts=allowed_hosts,
             allowed_origins=map(parse_allowed_origin, allowed_origins),
+            upstreams=upstreams,
         )
         # The server reads HTTP_IO_TIMEOUT per connection. A harness given its
         # own holds it until close(); patching only once setup has succeeded

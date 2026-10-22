@@ -26,7 +26,7 @@ from install import assembly
 from install.models import ModelError
 
 from . import images as image_input
-from . import json_codec, judgments, serve_options
+from . import json_codec, judgments, serve_options, upstream
 from . import protocol as wire
 from . import runtime as engine_runtime
 from .api_shapes import (
@@ -200,15 +200,20 @@ class PostRoute:
     # Whether it takes no fields: a request carries no body or an empty JSON
     # object.
     fieldless: bool = False
+    # Whether it is a cloud API's endpoint, which an upstream serves for the
+    # models this server does not (upstream.py); Splash's own are not.
+    relayed: bool = False
 
 
 POST_ROUTES = {
-    "/v1/chat/completions": PostRoute("_post_chat_completions", OPENAI_ERRORS),
-    "/v1/completions": PostRoute("_post_completions", OPENAI_ERRORS),
-    "/v1/responses": PostRoute("_post_responses", OPENAI_ERRORS),
-    "/v1/messages": PostRoute("_post_messages", ANTHROPIC_ERRORS),
+    "/v1/chat/completions": PostRoute(
+        "_post_chat_completions", OPENAI_ERRORS, relayed=True
+    ),
+    "/v1/completions": PostRoute("_post_completions", OPENAI_ERRORS, relayed=True),
+    "/v1/responses": PostRoute("_post_responses", OPENAI_ERRORS, relayed=True),
+    "/v1/messages": PostRoute("_post_messages", ANTHROPIC_ERRORS, relayed=True),
     "/v1/messages/count_tokens": PostRoute(
-        "_post_count_tokens", ANTHROPIC_ERRORS, prompt_only=True
+        "_post_count_tokens", ANTHROPIC_ERRORS, prompt_only=True, relayed=True
     ),
     "/tokenize": PostRoute("_post_tokenize", OPENAI_ERRORS, prompt_only=True),
     "/apply-template": PostRoute(
@@ -220,6 +225,10 @@ POST_ROUTES = {
         "_post_memory_release", OPENAI_ERRORS, fieldless=True
     ),
 }
+
+
+# How the startup summary names each API an upstream takes.
+API_NAMES = {upstream.ANTHROPIC: "Messages", upstream.OPENAI: "OpenAI API"}
 
 
 def path_errors(path):
@@ -448,8 +457,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
         # Inactivity allowed at any point, plus the body at the upload rate.
         return HTTP_IO_TIMEOUT + length / HTTP_UPLOAD_BYTES_PER_SECOND
 
-    def _read_json_body(self, deadline):
-        """The request's body, a JSON object, read by `deadline`."""
+    def _read_json_body(self, deadline, *, keep_bytes=False):
+        """The request's body, a JSON object, read by `deadline`; with
+        keep_bytes, also the bytes it was read from."""
         if self.headers.get_all("Transfer-Encoding"):
             raise APIError(400, "transfer encoding is not supported")
         encodings = self.headers.get_all("Content-Encoding", [])
@@ -503,7 +513,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.connection.settimeout(HTTP_IO_TIMEOUT)
         try:
             text = payload.decode(json.detect_encoding(payload), "surrogatepass")
-            payload.clear()
+            if not keep_bytes:
+                payload.clear()
             body = json_codec.loads(text)
         except ValueError:
             # Text that is not JSON, or JSON nested past json_codec.MAX_DEPTH.
@@ -514,7 +525,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             raise RequestValidationError(
                 [field_error([], "request body must be an object")]
             )
-        return body
+        return (body, bytes(payload)) if keep_bytes else body
 
     def do_HEAD(self):
         self.do_GET()
@@ -640,10 +651,21 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         started_at = time.monotonic()
         route = POST_ROUTES.get(self.route)
-        if route is None:
+        # The API whose upstream takes this path's requests for other models:
+        # a cloud API's endpoint, served here or not, but none of Splash's own.
+        api = (
+            self.server.upstreams.api(self.route)
+            if route is None or route.relayed
+            else None
+        )
+        if route is None and api is None:
             self._safe_error(APIError(404, "not found", "not_found"))
             return
-        refusal = None if route.prompt_only else self.app.backend.refusal()
+        # With an upstream, the engine's state refuses only a request served
+        # here, which only its body says.
+        refusal = (
+            None if api is not None or route.prompt_only else self.app.backend.refusal()
+        )
         if refusal is not None:
             self._safe_error(refusal, log=False)
             return
@@ -651,7 +673,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
         # complete response. Slow uploads/readers cannot accumulate outside
         # the native pending limit, and control endpoints need no such slot.
         admission = (
-            self.server.token_counts if route.prompt_only else self.server.requests
+            self.server.token_counts
+            if route is not None and route.prompt_only
+            else self.server.requests
         )
         if not admission.acquire():
             self._safe_error(
@@ -666,7 +690,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         # The native job submitted last, which a failure cancels.
         self._submitted = None
         try:
-            generation = self._serve(route, started_at)
+            generation = self._serve(route, api, started_at)
             if generation is not None:
                 self._generate(*generation, started_at)
         except (BrokenPipeError, ConnectionResetError):
@@ -696,22 +720,71 @@ class FrontendHandler(BaseHTTPRequestHandler):
             admission.release()
             self.app.latencies.observe("http_request", time.monotonic() - started_at)
 
-    def _serve(self, route, started_at):
-        """Read the request and serve it: answer it, or prepare the
+    def _serve(self, route, api, started_at):
+        """Read the request and serve it: relay it to `api`'s upstream when
+        it names a model served elsewhere, answer it, or prepare the
         generation it asks for and return its job and the method that answers
         with the job's output."""
-        if route.fieldless and not self._unread_body:
+        if route is not None and route.fieldless and not self._unread_body:
             body = {}
         else:
+            deadline = started_at + self.app.request_timeout
             with self.app.latencies.measure("upload"):
-                body = self._read_json_body(started_at + self.app.request_timeout)
+                if api is None:
+                    body = self._read_json_body(deadline)
+                else:
+                    body, data = self._read_json_body(deadline, keep_bytes=True)
+            if api is not None:
+                model = body.get("model")
+                if isinstance(model, str) and not self.app.accepts_model(model):
+                    self._relay(api, data, model, started_at)
+                    return None
             # A field set to null is one left out, as clients that write every
             # field they do not set as null mean it.
             body = {key: value for key, value in body.items() if value is not None}
-            if route.fieldless and body:
+            if route is not None and route.fieldless and body:
                 raise APIError(400, "this endpoint takes no fields")
+        if api is not None:
+            if route is None:
+                raise APIError(404, "not found", "not_found")
+            refusal = None if route.prompt_only else self.app.backend.refusal()
+            if refusal is not None:
+                self._safe_error(refusal, log=False)
+                return None
         serve = getattr(self, route.method)
         return serve(body, self.app.request_deadline(body, started_at))
+
+    def _relay(self, api, data, model, started_at):
+        """Send the request to `api`'s upstream and its response back as it
+        arrives: the upstream's status, headers and body, and Via."""
+        upstreams = self.server.upstreams
+        query = self.path.partition("?")[2].partition("#")[0]
+        status = None
+        try:
+            with upstreams.relay(
+                api, self.route, query, self.headers, data
+            ) as response:
+                status = response.status_code
+                self.send_response(status)
+                for name, value in upstream.response_headers(response):
+                    self.send_header(name, value)
+                self.send_header("Via", "1.1 splash")
+                self.send_header("Connection", "close")
+                self._response_started = True
+                self.end_headers()
+                for chunk in response.iter_raw():
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+        finally:
+            # The model and the status, never a header or the body; a failure
+            # to reach the upstream is logged as the error it answers with.
+            if status is not None:
+                shown = "".join(c if c.isprintable() else "?" for c in model[:128])
+                print_status(
+                    f"Relayed · {shown} · {upstreams.host(api)} · {status} · "
+                    f"{time.monotonic() - started_at:.1f}s",
+                    error=status >= 500,
+                )
 
     def _generate(self, job, respond, started_at):
         """Submit a prepared generation and answer with its output. The
@@ -1516,6 +1589,7 @@ class FrontendServer(HTTPServer):
         webui=True,
         max_request_bytes=serve_options.DEFAULT_MAX_REQUEST_BYTES,
         allowed_origins=(),
+        upstreams=None,
     ):
         if (
             isinstance(max_request_bytes, bool)
@@ -1528,6 +1602,8 @@ class FrontendServer(HTTPServer):
             max(DEFAULT_REQUEST_BODY_BUDGET, 2 * max_request_bytes)
         )
         self.api_key = api_key
+        # Where requests for the models served elsewhere go; none by default.
+        self.upstreams = upstream.Upstreams() if upstreams is None else upstreams
         self.webui = webui
         self.allowed_hosts = {
             host.lower().rstrip(".")
@@ -1567,6 +1643,8 @@ class FrontendServer(HTTPServer):
             "token_counts": self.token_counts.stats(),
             "connections": self.connections.stats(),
         }
+        if self.upstreams:
+            status["upstreams"] = self.upstreams.status()
         return status
 
     def server_activate(self):
@@ -1623,6 +1701,7 @@ class FrontendServer(HTTPServer):
         super().server_close()
         self.connections.stop()
         self.connections.idle.wait(min(2.0, HTTP_IO_TIMEOUT))
+        self.upstreams.close()
 
     def handle_error(self, request, client_address):
         error = sys.exc_info()[1]
@@ -1740,6 +1819,7 @@ def main():
         # Bind before loading the tokenizer or model so duplicates fail early.
         # Activate only after the runtime is ready, keeping a partially started
         # service from receiving requests.
+        upstreams = upstream.Upstreams(args.anthropic_upstream, args.openai_upstream)
         server = FrontendServer(
             (args.host, args.port),
             None,
@@ -1750,6 +1830,7 @@ def main():
             webui=not args.no_webui,
             max_request_bytes=args.max_request_size,
             allowed_origins=args.allowed_origin,
+            upstreams=upstreams,
         )
         server.server_bind()
         if ANY_ORIGIN in args.allowed_origin and args.api_key is None:
@@ -1828,6 +1909,10 @@ def main():
             else f"{effective_context:,}"
         )
         mode = "" if readiness.vision else " · language only"
+        for api, url in upstreams.urls.items():
+            print_status(
+                f"Upstream · {API_NAMES[api]} requests for other models go to {url}"
+            )
         print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
         server.serve_forever()
     except (

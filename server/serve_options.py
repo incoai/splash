@@ -7,9 +7,11 @@ parses these options before .venv exists.
 
 import argparse
 import copy
+import ipaddress
 import math
 import os
 import re
+import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -319,6 +321,44 @@ def parse_api_key(value):
         raise argparse.ArgumentTypeError(str(error)) from None
 
 
+def parse_upstream_url(value):
+    """An upstream API's base URL, without a trailing slash: https, or http
+    to a loopback address such as a local proxy's, and no credentials, query
+    or fragment, which the relay would carry to wherever it named."""
+    invalid = argparse.ArgumentTypeError(
+        "must be an API base URL such as https://api.anthropic.com, without "
+        "credentials, query or fragment"
+    )
+    try:
+        parts = urllib.parse.urlsplit(value)
+        parts.port
+    except ValueError:
+        raise invalid from None
+    if (
+        parts.scheme not in ("https", "http")
+        or not parts.hostname
+        or "@" in parts.netloc
+        or parts.query
+        or parts.fragment
+        or "?" in value
+        or "#" in value
+        or not value.isprintable()
+        or any(char.isspace() for char in value)
+    ):
+        raise invalid
+    if parts.scheme == "http":
+        try:
+            loopback = ipaddress.ip_address(parts.hostname).is_loopback
+        except ValueError:
+            loopback = parts.hostname == "localhost"
+        if not loopback:
+            raise argparse.ArgumentTypeError(
+                "must use https; plain http is accepted only for a loopback "
+                "address, such as a local proxy's"
+            )
+    return value.rstrip("/")
+
+
 def parse_reasoning_effort(value):
     if value not in REASONING_EFFORTS:
         raise argparse.ArgumentTypeError(
@@ -595,6 +635,30 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--anthropic-upstream",
+        "api",
+        dict(
+            type=parse_upstream_url,
+            metavar="URL",
+            help="relay Messages requests for models this server does not "
+            "serve to this Anthropic API base URL, with the client's own "
+            "credentials, e.g. https://api.anthropic.com; not with --api-key",
+        ),
+    ),
+    ServeOption(
+        "--openai-upstream",
+        "api",
+        dict(
+            type=parse_upstream_url,
+            metavar="URL",
+            help="relay Responses and Chat requests for models this server does "
+            "not serve to this OpenAI API base URL, with the client's own "
+            "credentials, e.g. https://api.openai.com/v1, or "
+            "https://chatgpt.com/backend-api/codex for Codex with a ChatGPT "
+            "login; not with --api-key",
+        ),
+    ),
+    ServeOption(
         "--default-reasoning-effort",
         "api",
         dict(
@@ -757,6 +821,14 @@ def check_serve_arguments(parser, args):
         )
     if args.cache_dir is not None and not args.persistent_cache:
         parser.error("--cache-dir needs --persistent-cache")
+    if args.api_key is not None and (args.anthropic_upstream or args.openai_upstream):
+        # A relayed client sends one credential, its cloud key, in the
+        # headers that would carry the server's key.
+        parser.error(
+            "--api-key (or SPLASH_API_KEY) cannot be combined with "
+            "--anthropic-upstream or --openai-upstream: clients send their "
+            "cloud credentials in the headers that would carry the key"
+        )
 
 
 def serve_argv(args):

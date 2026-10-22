@@ -107,6 +107,8 @@ access.
 | `--cache-dir` | `~/Library/Caches/Splash/prefix-cache` | Where `--persistent-cache` keeps its files; needs `--persistent-cache`. |
 | `--served-model-name` | None | Additional model name the API accepts; repeatable. See [API model aliases](#api-model-aliases). |
 | `--announce-served-name` | Off | Report the first `--served-model-name` in responses; needs `--served-model-name`. |
+| `--anthropic-upstream` | None | Relay Messages requests for models this server does not serve to this Anthropic API base URL, e.g. `https://api.anthropic.com`; not with `--api-key`. See [upstream relay](#upstream-relay). |
+| `--openai-upstream` | None | Relay Responses and Chat requests for models this server does not serve to this OpenAI API base URL, e.g. `https://api.openai.com/v1`; not with `--api-key`. See [upstream relay](#upstream-relay). |
 | `--default-reasoning-effort` | `SPLASH_DEFAULT_REASONING_EFFORT` or the template's | Effort of Chat and Responses requests that set none. See [default reasoning effort](#default-reasoning-effort). |
 | `--thinking-token-budget` | `SPLASH_THINKING_TOKEN_BUDGET` or none | Thinking tokens of a request that sets no budget. See [thinking token budget](#thinking-token-budget). |
 | `--thinking-end-text` | `SPLASH_THINKING_END_TEXT` or `</think>` | Text that ends thinking where a budget runs out, `</think>` its last token. See [thinking token budget](#thinking-token-budget). |
@@ -856,6 +858,46 @@ With `SPLASH_API_KEY` set, Pi's `models.json` and the Hermes profile name the
 variable instead of holding the key: Pi and Hermes read the key from their
 environment, so one started without `splash` needs the variable in its shell.
 A file these launchers rewrite keeps its mode; one they create is private.
+
+### Upstream relay
+
+With an upstream, one Splash URL serves an agent's cloud model and the
+subagents it runs on Splash: Claude Code and Codex send the main agent's and
+the subagents' requests to one base URL, so the server routes them by model.
+
+```sh
+splash serve --model unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M \
+  --anthropic-upstream https://api.anthropic.com \
+  --openai-upstream https://api.openai.com/v1
+```
+
+A POST under `/v1/` naming a model the server does not serve (the model ID or
+an alias) goes to its API's upstream: Messages and count_tokens to
+`--anthropic-upstream`, every other path under `/v1/` but Splash's own
+endpoints (such as `/v1/judgments`) to `--openai-upstream`, with the path as
+that API's SDKs append it to their base URL (an OpenAI base URL includes its
+version, as `https://api.openai.com/v1` or, for Codex with a ChatGPT login,
+`https://chatgpt.com/backend-api/codex` does) and the query string. The body
+and every end-to-end header, the client's own credentials included, go as the
+client sent them; the upstream's status, headers and body come back as they
+arrive, with `Via: 1.1 splash`. Splash keeps no credential, follows no
+redirect and logs no header or body: a relayed request prints its model,
+upstream host, status and time, and `/status` lists each upstream with its
+counts. An upstream is `https`, or `http` on a loopback address such as a local
+proxy's, without credentials, query or fragment. Relayed requests count toward
+`--queue-size` but never reach the engine, which refuses none of them while it
+restarts. Without an upstream nothing changes: a request for another model is
+refused as before.
+
+`--api-key` cannot be combined with an upstream: these clients send their cloud
+credential in the headers that would carry it. A server on another interface
+relays any client's requests with that client's own credentials.
+
+To try it, point Claude Code at the server and run its subagents on the served
+model (`ANTHROPIC_BASE_URL=http://127.0.0.1:8000
+CLAUDE_CODE_SUBAGENT_MODEL=<served model> claude`), or give Codex a provider
+whose `base_url` is the server's `/v1` with `requires_openai_auth = true`,
+so its OpenAI models relay with its own login.
 
 ## Upgrading from earlier versions
 
@@ -2103,8 +2145,8 @@ recognized by its `manifest.json`, which names the package format.
 - `dev/`: maintained tests, benchmarks and build/release tools.
 
 Within `server/`, `server.py` owns HTTP routing and startup,
-`connections.py` the HTTP ingress bounds and `errors.py` each API's error
-shape; `frontend.py` prepares
+`connections.py` the HTTP ingress bounds, `upstream.py` the relay of other
+models' requests and `errors.py` each API's error shape; `frontend.py` prepares
 requests and history; `backend.py` owns native request lifecycles. `judgments.py`
 owns finite-choice prompts, validation and typed answer math. `output.py` parses
 generated text as it arrives, one parser serving streamed and complete

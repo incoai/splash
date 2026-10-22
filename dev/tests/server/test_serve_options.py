@@ -215,9 +215,36 @@ OPTIONS = {
         {"secret-key": "secret-key"},
         ("", "two words", "key\n", "非ASCII"),
     ),
+    "--anthropic-upstream": values(
+        "--anthropic-upstream",
+        {
+            "http://127.0.0.1:4000/": "http://127.0.0.1:4000",
+            "https://api.anthropic.com": "https://api.anthropic.com",
+        },
+        (
+            "http://api.anthropic.com",
+            "https://user:key@api.anthropic.com",
+            "https://api.anthropic.com?key=1",
+            "api.anthropic.com",
+        ),
+    ),
+    "--openai-upstream": values(
+        "--openai-upstream",
+        {
+            "https://api.openai.com/v1/": "https://api.openai.com/v1",
+            "https://chatgpt.com/backend-api/codex": (
+                "https://chatgpt.com/backend-api/codex"
+            ),
+        },
+        ("ftp://api.openai.com/v1", "https://api.openai.com/v1#models"),
+    ),
     "--allow-idle-sleep": ([(["--allow-idle-sleep"], True)], []),
     "--no-webui": ([(["--no-webui"], True)], []),
 }
+
+
+# The options of the upstream relay, which --api-key cannot be combined with.
+RELAY_FLAGS = ("--anthropic-upstream", "--openai-upstream")
 
 
 def dest(flag):
@@ -330,10 +357,18 @@ class ServeOptionsTests(unittest.TestCase):
                     self.assertEqual(getattr(parse(required), option.dest), [])
 
     def test_launcher_forwards_exactly_what_the_server_parses(self):
+        # --api-key cannot guard a server that relays to an upstream, so the
+        # upstreams travel in a launch of their own.
+        for left_out in (RELAY_FLAGS, ("--api-key",)):
+            with self.subTest(left_out=left_out):
+                self.forwards_exactly_what_the_server_parses(left_out)
+
+    def forwards_exactly_what_the_server_parses(self, left_out):
         launched = [
             *(
                 argument
-                for accepted, _ in OPTIONS.values()
+                for flag, (accepted, _) in OPTIONS.items()
+                if flag not in left_out
                 for arguments, _ in accepted[-1:]
                 for argument in arguments
             ),
@@ -352,11 +387,14 @@ class ServeOptionsTests(unittest.TestCase):
             {
                 option.flag
                 for option in serve_options.SERVE_OPTIONS
-                if not option.secret
+                if not option.secret and option.flag not in left_out
             },
         )
         self.assertFalse(any("secret-key" in argument for argument in argv))
-        self.assertEqual(environment, {"SPLASH_API_KEY": "secret-key"})
+        self.assertEqual(
+            environment,
+            {} if "--api-key" in left_out else {"SPLASH_API_KEY": "secret-key"},
+        )
         with mock.patch.dict(os.environ, environment):
             served = api.parse_args([*SERVER_ARGS, *argv])
         for option in serve_options.SERVE_OPTIONS:
