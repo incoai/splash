@@ -70,6 +70,9 @@ def train(
     stop_after=None,
 ):
     output = Path(output)
+    from .quantization import enable_affine4
+
+    enable_affine4(model, recipe.affine4_scope)
     configure_trainable(model, recipe.trainable)
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -163,7 +166,7 @@ def train(
             )
             record["validation"] = metrics
             # Selection uses only validation replay. Native speed remains an
-            # independent gate before any performance claim or ready PR.
+            # independent gate before recommending a trained checkpoint.
             score = metrics["mean_matching_proposals"]
             if progress["best_score"] is None or score > progress["best_score"]:
                 progress["best_score"] = score

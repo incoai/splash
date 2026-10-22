@@ -247,6 +247,9 @@ def run_training(args, *, family=True):
             raise TrainingError(
                 "preflight continuation has no full assistant query block"
             )
+        from .quantization import enable_affine4
+
+        enable_affine4(model, recipe.affine4_scope)
         configure_trainable(model, recipe.trainable)
         with torch.autocast(
             device_type=torch.device(args.device).type, dtype=torch.bfloat16
