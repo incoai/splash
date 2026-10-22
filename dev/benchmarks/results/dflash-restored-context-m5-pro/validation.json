@@ -1,0 +1,37 @@
+{
+  "tests": {
+    "capture_analysis": {
+      "tests_run": 26,
+      "status": "passed"
+    },
+    "native_cli_guards": {
+      "cases": 9,
+      "status": "passed"
+    },
+    "native_matrix": {
+      "captures": 12,
+      "cycles": 48,
+      "matched_contexts": 24,
+      "status": "passed"
+    },
+    "production_runtime_preprocess": {
+      "matches_origin_main": true,
+      "sha256": "11c4aac9285dae98a7f4db0f053072bfe83ac57beb99d77b3ed31c1130a77f38"
+    },
+    "shader_validation_b3": {
+      "status": "passed",
+      "mode": "MTL_SHADER_VALIDATION=1",
+      "cycles": 2,
+      "lanes": 3
+    },
+    "combined_api_shader_validation": {
+      "status": "failed",
+      "mode": "MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1",
+      "message": "prefill_gdn_scan_vh32: threadgroupMemoryLength 35072 exceeds 32768",
+      "scope": "existing target GDN prefill kernel; no production/kernel changes in this PR",
+      "baseline_reproduction": "same assertion reproduced on unchanged #550 baseline binary",
+      "baseline_revision": "ef0e95d4fa09f265f1cb071d43591ff32367b372"
+    }
+  },
+  "scope": "code and probe mechanics; not real-checkpoint training, model quality or throughput improvement"
+}

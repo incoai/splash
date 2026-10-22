@@ -27,6 +27,21 @@ public:
   // The rows of its block batch lane `lane` of the last decode step verified
   // (ops::DraftSelector::addVerifyRows), until the next decode step.
   [[nodiscard]] static uint32_t lastVerifyRows(const Runtime &runtime, uint32_t lane);
+  // Shared scratch of a completed, unconstrained decode, until the next
+  // command. `width` is the dispatch width, not its projection storage width:
+  // edge tables follow ALL lanes' shard partials in one packed allocation.
+  // Position zero has only predecessor row zero; its other rows are unwritten.
+  struct DraftSelection final {
+    std::span<const uint32_t> candidates, proposed, targetTokens;
+    std::span<const float> unary, edges, confidence;
+    uint32_t accepted = 0, retained = 0, verifyRows = 0;
+  };
+  [[nodiscard]] static DraftSelection lastDraftSelection(const Runtime &runtime,
+                                                        uint32_t lane, uint32_t width);
+  // Restore the prior/seed for controlled capture; no online timing history.
+  static void resetVerifyBudget(Runtime &runtime);
+  // BF16 bit patterns of all final draft hidden rows, anchor included.
+  [[nodiscard]] static std::span<const uint16_t> lastDraftHidden(const Runtime &runtime, uint32_t lane);
   // The GPU tables of resident request `requestId`'s lane as its last
   // command left them, every entry the lane holds: its page table and, for
   // a layout with a block index, its index table (none without).

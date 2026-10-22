@@ -1,0 +1,462 @@
+{
+  "dense-code-b2": {
+    "complete_reference_cycles": 14,
+    "scales": [
+      {
+        "edge_scale": 0,
+        "mean_tokens_at_original_starts": 3.7142857142857144,
+        "changed_path_cycles": 12
+      },
+      {
+        "edge_scale": 0.25,
+        "mean_tokens_at_original_starts": 4.0,
+        "changed_path_cycles": 8
+      },
+      {
+        "edge_scale": 0.5,
+        "mean_tokens_at_original_starts": 4.0,
+        "changed_path_cycles": 8
+      },
+      {
+        "edge_scale": 0.75,
+        "mean_tokens_at_original_starts": 3.857142857142857,
+        "changed_path_cycles": 0
+      },
+      {
+        "edge_scale": 1,
+        "mean_tokens_at_original_starts": 3.857142857142857,
+        "changed_path_cycles": 0
+      },
+      {
+        "edge_scale": 1.25,
+        "mean_tokens_at_original_starts": 3.857142857142857,
+        "changed_path_cycles": 2
+      },
+      {
+        "edge_scale": 1.5,
+        "mean_tokens_at_original_starts": 3.857142857142857,
+        "changed_path_cycles": 2
+      },
+      {
+        "edge_scale": 2,
+        "mean_tokens_at_original_starts": 3.5714285714285716,
+        "changed_path_cycles": 4
+      }
+    ],
+    "limitation": "Exploratory score scaling on fixed candidates and continuations; not held-out calibration, a quantized checkpoint export, or a rollout."
+  },
+  "dense-code-b3-validated": {
+    "complete_reference_cycles": 24,
+    "scales": [
+      {
+        "edge_scale": 0,
+        "mean_tokens_at_original_starts": 4.0,
+        "changed_path_cycles": 18
+      },
+      {
+        "edge_scale": 0.25,
+        "mean_tokens_at_original_starts": 4.0,
+        "changed_path_cycles": 15
+      },
+      {
+        "edge_scale": 0.5,
+        "mean_tokens_at_original_starts": 4.5,
+        "changed_path_cycles": 12
+      },
+      {
+        "edge_scale": 0.75,
+        "mean_tokens_at_original_starts": 4.375,
+        "changed_path_cycles": 0
+      },
+      {
+        "edge_scale": 1,
+        "mean_tokens_at_original_starts": 4.375,
+        "changed_path_cycles": 0
+      },
+      {
+        "edge_scale": 1.25,
+        "mean_tokens_at_original_starts": 4.375,
+        "changed_path_cycles": 3
+      },
+      {
+        "edge_scale": 1.5,
+        "mean_tokens_at_original_starts": 4.375,
+        "changed_path_cycles": 3
+      },
+      {
+        "edge_scale": 2,
+        "mean_tokens_at_original_starts": 4.125,
+        "changed_path_cycles": 6
+      }
+    ],
+    "limitation": "Exploratory score scaling on fixed candidates and continuations; not held-out calibration, a quantized checkpoint export, or a rollout."
+  },
+  "dense-code-b4": {
+    "complete_reference_cycles": 56,
+    "scales": [
+      {
+        "edge_scale": 0,
+        "mean_tokens_at_original_starts": 3.7857142857142856,
+        "changed_path_cycles": 48
+      },
+      {
+        "edge_scale": 0.25,
+        "mean_tokens_at_original_starts": 4.0,
+        "changed_path_cycles": 36
+      },
+      {
+        "edge_scale": 0.5,
+        "mean_tokens_at_original_starts": 3.857142857142857,
+        "changed_path_cycles": 32
+      },
+      {
+        "edge_scale": 0.75,
+        "mean_tokens_at_original_starts": 4.0,
+        "changed_path_cycles": 4
+      },
+      {
+        "edge_scale": 1,
+        "mean_tokens_at_original_starts": 4.0,
+        "changed_path_cycles": 0
+      },
+      {
+        "edge_scale": 1.25,
+        "mean_tokens_at_original_starts": 3.857142857142857,
+        "changed_path_cycles": 20
+      },
+      {
+        "edge_scale": 1.5,
+        "mean_tokens_at_original_starts": 3.857142857142857,
+        "changed_path_cycles": 20
+      },
+      {
+        "edge_scale": 2,
+        "mean_tokens_at_original_starts": 3.7142857142857144,
+        "changed_path_cycles": 28
+      }
+    ],
+    "limitation": "Exploratory score scaling on fixed candidates and continuations; not held-out calibration, a quantized checkpoint export, or a rollout."
+  },
+  "dense-code-penalty": {
+    "complete_reference_cycles": 61,
+    "scales": [
+      {
+        "edge_scale": 0,
+        "mean_tokens_at_original_starts": 4.491803278688525,
+        "changed_path_cycles": 38
+      },
+      {
+        "edge_scale": 0.25,
+        "mean_tokens_at_original_starts": 4.836065573770492,
+        "changed_path_cycles": 30
+      },
+      {
+        "edge_scale": 0.5,
+        "mean_tokens_at_original_starts": 4.901639344262295,
+        "changed_path_cycles": 18
+      },
+      {
+        "edge_scale": 0.75,
+        "mean_tokens_at_original_starts": 4.885245901639344,
+        "changed_path_cycles": 6
+      },
+      {
+        "edge_scale": 1,
+        "mean_tokens_at_original_starts": 4.819672131147541,
+        "changed_path_cycles": 0
+      },
+      {
+        "edge_scale": 1.25,
+        "mean_tokens_at_original_starts": 4.672131147540983,
+        "changed_path_cycles": 7
+      },
+      {
+        "edge_scale": 1.5,
+        "mean_tokens_at_original_starts": 4.639344262295082,
+        "changed_path_cycles": 10
+      },
+      {
+        "edge_scale": 2,
+        "mean_tokens_at_original_starts": 4.524590163934426,
+        "changed_path_cycles": 18
+      }
+    ],
+    "limitation": "Exploratory score scaling on fixed candidates and continuations; not held-out calibration, a quantized checkpoint export, or a rollout."
+  },
+  "dense-code": {
+    "complete_reference_cycles": 64,
+    "scales": [
+      {
+        "edge_scale": 0,
+        "mean_tokens_at_original_starts": 4.125,
+        "changed_path_cycles": 50
+      },
+      {
+        "edge_scale": 0.25,
+        "mean_tokens_at_original_starts": 4.3125,
+        "changed_path_cycles": 39
+      },
+      {
+        "edge_scale": 0.5,
+        "mean_tokens_at_original_starts": 4.390625,
+        "changed_path_cycles": 29
+      },
+      {
+        "edge_scale": 0.75,
+        "mean_tokens_at_original_starts": 4.234375,
+        "changed_path_cycles": 15
+      },
+      {
+        "edge_scale": 1,
+        "mean_tokens_at_original_starts": 4.34375,
+        "changed_path_cycles": 0
+      },
+      {
+        "edge_scale": 1.25,
+        "mean_tokens_at_original_starts": 4.15625,
+        "changed_path_cycles": 15
+      },
+      {
+        "edge_scale": 1.5,
+        "mean_tokens_at_original_starts": 4.140625,
+        "changed_path_cycles": 21
+      },
+      {
+        "edge_scale": 2,
+        "mean_tokens_at_original_starts": 4.046875,
+        "changed_path_cycles": 28
+      }
+    ],
+    "limitation": "Exploratory score scaling on fixed candidates and continuations; not held-out calibration, a quantized checkpoint export, or a rollout."
+  },
+  "dense-json": {
+    "complete_reference_cycles": 64,
+    "scales": [
+      {
+        "edge_scale": 0,
+        "mean_tokens_at_original_starts": 5.078125,
+        "changed_path_cycles": 33
+      },
+      {
+        "edge_scale": 0.25,
+        "mean_tokens_at_original_starts": 5.171875,
+        "changed_path_cycles": 25
+      },
+      {
+        "edge_scale": 0.5,
+        "mean_tokens_at_original_starts": 5.296875,
+        "changed_path_cycles": 13
+      },
+      {
+        "edge_scale": 0.75,
+        "mean_tokens_at_original_starts": 5.328125,
+        "changed_path_cycles": 7
+      },
+      {
+        "edge_scale": 1,
+        "mean_tokens_at_original_starts": 5.375,
+        "changed_path_cycles": 0
+      },
+      {
+        "edge_scale": 1.25,
+        "mean_tokens_at_original_starts": 5.375,
+        "changed_path_cycles": 4
+      },
+      {
+        "edge_scale": 1.5,
+        "mean_tokens_at_original_starts": 5.15625,
+        "changed_path_cycles": 11
+      },
+      {
+        "edge_scale": 2,
+        "mean_tokens_at_original_starts": 5.03125,
+        "changed_path_cycles": 21
+      }
+    ],
+    "limitation": "Exploratory score scaling on fixed candidates and continuations; not held-out calibration, a quantized checkpoint export, or a rollout."
+  },
+  "dense-math": {
+    "complete_reference_cycles": 64,
+    "scales": [
+      {
+        "edge_scale": 0,
+        "mean_tokens_at_original_starts": 4.53125,
+        "changed_path_cycles": 33
+      },
+      {
+        "edge_scale": 0.25,
+        "mean_tokens_at_original_starts": 4.765625,
+        "changed_path_cycles": 20
+      },
+      {
+        "edge_scale": 0.5,
+        "mean_tokens_at_original_starts": 4.84375,
+        "changed_path_cycles": 10
+      },
+      {
+        "edge_scale": 0.75,
+        "mean_tokens_at_original_starts": 4.78125,
+        "changed_path_cycles": 8
+      },
+      {
+        "edge_scale": 1,
+        "mean_tokens_at_original_starts": 4.78125,
+        "changed_path_cycles": 0
+      },
+      {
+        "edge_scale": 1.25,
+        "mean_tokens_at_original_starts": 4.890625,
+        "changed_path_cycles": 6
+      },
+      {
+        "edge_scale": 1.5,
+        "mean_tokens_at_original_starts": 4.96875,
+        "changed_path_cycles": 10
+      },
+      {
+        "edge_scale": 2,
+        "mean_tokens_at_original_starts": 4.921875,
+        "changed_path_cycles": 17
+      }
+    ],
+    "limitation": "Exploratory score scaling on fixed candidates and continuations; not held-out calibration, a quantized checkpoint export, or a rollout."
+  },
+  "dense-prose": {
+    "complete_reference_cycles": 62,
+    "scales": [
+      {
+        "edge_scale": 0,
+        "mean_tokens_at_original_starts": 2.806451612903226,
+        "changed_path_cycles": 54
+      },
+      {
+        "edge_scale": 0.25,
+        "mean_tokens_at_original_starts": 3.0,
+        "changed_path_cycles": 45
+      },
+      {
+        "edge_scale": 0.5,
+        "mean_tokens_at_original_starts": 3.129032258064516,
+        "changed_path_cycles": 34
+      },
+      {
+        "edge_scale": 0.75,
+        "mean_tokens_at_original_starts": 3.129032258064516,
+        "changed_path_cycles": 13
+      },
+      {
+        "edge_scale": 1,
+        "mean_tokens_at_original_starts": 3.129032258064516,
+        "changed_path_cycles": 0
+      },
+      {
+        "edge_scale": 1.25,
+        "mean_tokens_at_original_starts": 3.1774193548387095,
+        "changed_path_cycles": 16
+      },
+      {
+        "edge_scale": 1.5,
+        "mean_tokens_at_original_starts": 3.1774193548387095,
+        "changed_path_cycles": 25
+      },
+      {
+        "edge_scale": 2,
+        "mean_tokens_at_original_starts": 3.225806451612903,
+        "changed_path_cycles": 36
+      }
+    ],
+    "limitation": "Exploratory score scaling on fixed candidates and continuations; not held-out calibration, a quantized checkpoint export, or a rollout."
+  },
+  "moe-code": {
+    "complete_reference_cycles": 63,
+    "scales": [
+      {
+        "edge_scale": 0,
+        "mean_tokens_at_original_starts": 3.5714285714285716,
+        "changed_path_cycles": 52
+      },
+      {
+        "edge_scale": 0.25,
+        "mean_tokens_at_original_starts": 3.761904761904762,
+        "changed_path_cycles": 42
+      },
+      {
+        "edge_scale": 0.5,
+        "mean_tokens_at_original_starts": 3.9365079365079363,
+        "changed_path_cycles": 30
+      },
+      {
+        "edge_scale": 0.75,
+        "mean_tokens_at_original_starts": 3.9682539682539684,
+        "changed_path_cycles": 15
+      },
+      {
+        "edge_scale": 1,
+        "mean_tokens_at_original_starts": 3.9206349206349205,
+        "changed_path_cycles": 0
+      },
+      {
+        "edge_scale": 1.25,
+        "mean_tokens_at_original_starts": 3.9206349206349205,
+        "changed_path_cycles": 13
+      },
+      {
+        "edge_scale": 1.5,
+        "mean_tokens_at_original_starts": 3.857142857142857,
+        "changed_path_cycles": 21
+      },
+      {
+        "edge_scale": 2,
+        "mean_tokens_at_original_starts": 3.619047619047619,
+        "changed_path_cycles": 29
+      }
+    ],
+    "limitation": "Exploratory score scaling on fixed candidates and continuations; not held-out calibration, a quantized checkpoint export, or a rollout."
+  },
+  "moe-prose": {
+    "complete_reference_cycles": 62,
+    "scales": [
+      {
+        "edge_scale": 0,
+        "mean_tokens_at_original_starts": 3.3225806451612905,
+        "changed_path_cycles": 55
+      },
+      {
+        "edge_scale": 0.25,
+        "mean_tokens_at_original_starts": 3.4193548387096775,
+        "changed_path_cycles": 47
+      },
+      {
+        "edge_scale": 0.5,
+        "mean_tokens_at_original_starts": 3.403225806451613,
+        "changed_path_cycles": 36
+      },
+      {
+        "edge_scale": 0.75,
+        "mean_tokens_at_original_starts": 3.435483870967742,
+        "changed_path_cycles": 18
+      },
+      {
+        "edge_scale": 1,
+        "mean_tokens_at_original_starts": 3.467741935483871,
+        "changed_path_cycles": 0
+      },
+      {
+        "edge_scale": 1.25,
+        "mean_tokens_at_original_starts": 3.467741935483871,
+        "changed_path_cycles": 16
+      },
+      {
+        "edge_scale": 1.5,
+        "mean_tokens_at_original_starts": 3.3548387096774195,
+        "changed_path_cycles": 24
+      },
+      {
+        "edge_scale": 2,
+        "mean_tokens_at_original_starts": 3.193548387096774,
+        "changed_path_cycles": 41
+      }
+    ],
+    "limitation": "Exploratory score scaling on fixed candidates and continuations; not held-out calibration, a quantized checkpoint export, or a rollout."
+  }
+}

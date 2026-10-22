@@ -1,0 +1,226 @@
+{
+  "baseline_commit": "6e8849b65bf757030dabea5c6c47fb90a0990334",
+  "device": "Apple M5 Pro",
+  "unified_memory_bytes": 51539607552,
+  "macos": "26.6 (25G72)",
+  "target_kv": "int8",
+  "recurrent_state": "fp32",
+  "thinking": false,
+  "verify_rows": "all",
+  "ane_ffn": false,
+  "training_performed": false,
+  "throughput_measurement": false,
+  "captures": [
+    {
+      "name": "dense-code-b2",
+      "raw_path": "build/dflash-acceptance-m5-pro/dense-code-b2.jsonl",
+      "raw_sha256": "30a39d22c12db1e97935d81ba11b3f9e34f297f5cea1ab490a7bc9f32dc18430",
+      "report_sha256": "6615a4f0b9c1e3f9eeb996fe73d93aaa061723b346dab46c3b4fe6e747a15c7b",
+      "shader_validation": false,
+      "checkpoints": {
+        "draft": {
+          "repo": "incoai/Qwen3.8-27B-DFlash2",
+          "revision": "015e795645c74b1a0eeef3b570031fb62e769bc5"
+        },
+        "target": {
+          "repo": "mlx-community/Qwen3.8-27B-4bit",
+          "revision": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818"
+        }
+      },
+      "capture_path": "dev/benchmarks/results/dflash-acceptance-m5-pro/dense-code-b2.jsonl.gz",
+      "capture_sha256": "202f01e7b2e8cbdc008dd8803af7934c88d11939842392f6ebc40bc1a390d51f"
+    },
+    {
+      "name": "dense-code-b3-validated",
+      "raw_path": "build/dflash-acceptance-m5-pro/dense-code-b3-validated.jsonl",
+      "raw_sha256": "f31e97d917b727704175b85c0e7ff6504957482e047873203ad4694fd94db6f0",
+      "report_sha256": "8737b883cfd996499e2f032d70eabe6bec6b1ce8a8ed03373fb5f2ac9a17fc3e",
+      "shader_validation": true,
+      "checkpoints": {
+        "draft": {
+          "repo": "incoai/Qwen3.8-27B-DFlash2",
+          "revision": "015e795645c74b1a0eeef3b570031fb62e769bc5"
+        },
+        "target": {
+          "repo": "mlx-community/Qwen3.8-27B-4bit",
+          "revision": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818"
+        }
+      },
+      "capture_path": "dev/benchmarks/results/dflash-acceptance-m5-pro/dense-code-b3-validated.jsonl.gz",
+      "capture_sha256": "779557e4acb7de3b0ac4ddb9fa598434f66b0d3886b34d657781107cf668e9e0"
+    },
+    {
+      "name": "dense-code-b4",
+      "raw_path": "build/dflash-acceptance-m5-pro/dense-code-b4.jsonl",
+      "raw_sha256": "f4baa6ec584e2bf90d4d5d24918cabbaa481279128eb3fb918a73239a509a845",
+      "report_sha256": "1993ff970f36cdf8e71976d3764b740df5a99afa09706027f7c9cbe10c052ea7",
+      "shader_validation": false,
+      "checkpoints": {
+        "draft": {
+          "repo": "incoai/Qwen3.8-27B-DFlash2",
+          "revision": "015e795645c74b1a0eeef3b570031fb62e769bc5"
+        },
+        "target": {
+          "repo": "mlx-community/Qwen3.8-27B-4bit",
+          "revision": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818"
+        }
+      },
+      "capture_path": "dev/benchmarks/results/dflash-acceptance-m5-pro/dense-code-b4.jsonl.gz",
+      "capture_sha256": "eb4e0a036f11e6e69c24192e416b50e724fee0d030724b7cb2fb5773499b20e9"
+    },
+    {
+      "name": "dense-code-penalty",
+      "raw_path": "build/dflash-acceptance-m5-pro/dense-code-penalty.jsonl",
+      "raw_sha256": "66af6a077b2b5a95ee7f42a15a90286ab75fbe8bc5917a264ffa04ecdca42ca6",
+      "report_sha256": "f1e730db08a3347ffef3e0e5cd3d49253f64b6517759bccd7cea95c959479f82",
+      "shader_validation": false,
+      "checkpoints": {
+        "draft": {
+          "repo": "incoai/Qwen3.8-27B-DFlash2",
+          "revision": "015e795645c74b1a0eeef3b570031fb62e769bc5"
+        },
+        "target": {
+          "repo": "mlx-community/Qwen3.8-27B-4bit",
+          "revision": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818"
+        }
+      },
+      "capture_path": "dev/benchmarks/results/dflash-acceptance-m5-pro/dense-code-penalty.jsonl.gz",
+      "capture_sha256": "a6d97c38fef1769bcb23592c9c2dae5d9fea00641f3579e3439ce013231de4ed"
+    },
+    {
+      "name": "dense-code",
+      "raw_path": "build/dflash-acceptance-m5-pro/dense-code.jsonl",
+      "raw_sha256": "7816a2185a3e512e7eb4c8949f8ebace06e8cb7f4320e4a394a3a791e3544b4d",
+      "report_sha256": "02cb209c6fe052df48f2ee9c44bb648fd27e70f1c5d5882e35e9aa02f34acab1",
+      "shader_validation": false,
+      "checkpoints": {
+        "draft": {
+          "repo": "incoai/Qwen3.8-27B-DFlash2",
+          "revision": "015e795645c74b1a0eeef3b570031fb62e769bc5"
+        },
+        "target": {
+          "repo": "mlx-community/Qwen3.8-27B-4bit",
+          "revision": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818"
+        }
+      },
+      "capture_path": "dev/benchmarks/results/dflash-acceptance-m5-pro/dense-code.jsonl.gz",
+      "capture_sha256": "f5c3d58f0aaad4996099b27130e22f42d399305c6500f64501c12ae18e3f60a2"
+    },
+    {
+      "name": "dense-json",
+      "raw_path": "build/dflash-acceptance-m5-pro/dense-json.jsonl",
+      "raw_sha256": "81f6d22f4cae8ec6edb7de841b519624e8a0332d19052a861c8308320a1d6e98",
+      "report_sha256": "3e05ce2c014903f2159180c3e47fa26f1ed9137a03ab3ca90cea1b2d996ede7e",
+      "shader_validation": false,
+      "checkpoints": {
+        "draft": {
+          "repo": "incoai/Qwen3.8-27B-DFlash2",
+          "revision": "015e795645c74b1a0eeef3b570031fb62e769bc5"
+        },
+        "target": {
+          "repo": "mlx-community/Qwen3.8-27B-4bit",
+          "revision": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818"
+        }
+      },
+      "capture_path": "dev/benchmarks/results/dflash-acceptance-m5-pro/dense-json.jsonl.gz",
+      "capture_sha256": "8b64fb88b872faeda3e44b16225aec12248cf607663b5f4d05faaa385b2d7465"
+    },
+    {
+      "name": "dense-math",
+      "raw_path": "build/dflash-acceptance-m5-pro/dense-math.jsonl",
+      "raw_sha256": "1e6e0990c40edb58ff2a898ef20f9fd8153c3db237cc541f9ab66a052c0dacd7",
+      "report_sha256": "b5cb9226518694de57e11d699c712ae3e751e0b38290486c4408315327144c27",
+      "shader_validation": false,
+      "checkpoints": {
+        "draft": {
+          "repo": "incoai/Qwen3.8-27B-DFlash2",
+          "revision": "015e795645c74b1a0eeef3b570031fb62e769bc5"
+        },
+        "target": {
+          "repo": "mlx-community/Qwen3.8-27B-4bit",
+          "revision": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818"
+        }
+      },
+      "capture_path": "dev/benchmarks/results/dflash-acceptance-m5-pro/dense-math.jsonl.gz",
+      "capture_sha256": "37e96333b45cc82da0138103f354b418d91ad8f2ac727da183dc63610d8351a8"
+    },
+    {
+      "name": "dense-prose",
+      "raw_path": "build/dflash-acceptance-m5-pro/dense-prose.jsonl",
+      "raw_sha256": "3c3b914469772533b30667354e9948c04215daf6c6a3a8c21055380aee136a52",
+      "report_sha256": "48b322299eaf9f74ad7925f24e70cded0eefb5710af0f752e10d88232aadf260",
+      "shader_validation": false,
+      "checkpoints": {
+        "draft": {
+          "repo": "incoai/Qwen3.8-27B-DFlash2",
+          "revision": "015e795645c74b1a0eeef3b570031fb62e769bc5"
+        },
+        "target": {
+          "repo": "mlx-community/Qwen3.8-27B-4bit",
+          "revision": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818"
+        }
+      },
+      "capture_path": "dev/benchmarks/results/dflash-acceptance-m5-pro/dense-prose.jsonl.gz",
+      "capture_sha256": "564f63a16742b50fda5ee1437932e15241956d06b97c407763aee50b23845512"
+    },
+    {
+      "name": "moe-code",
+      "raw_path": "build/dflash-acceptance-m5-pro/moe-code.jsonl",
+      "raw_sha256": "a483d57d1d58e983b5ab8e7148a8f9016acbbbf3723d3c3d98cca4d11c0b12b0",
+      "report_sha256": "933c51eca71684f14219b0a252a8e7e2338bbb0b06644e129e3f9ea8a9ad7ebe",
+      "shader_validation": false,
+      "checkpoints": {
+        "draft": {
+          "repo": "incoai/Qwen3.6-35B-A3B-DFlash2",
+          "revision": "51ef7b6923ad6c14cb1bb41c37a9041446496ab6"
+        },
+        "target": {
+          "repo": "mlx-community/Qwen3.6-35B-A3B-4bit",
+          "revision": "38740b847e4cb78f352aba30aa41c76e08e6eb46"
+        }
+      },
+      "capture_path": "dev/benchmarks/results/dflash-acceptance-m5-pro/moe-code.jsonl.gz",
+      "capture_sha256": "82020ae9f8b44fff3266afb990f76f1fa62000bdbe9bb40c54436a0367d7d2d8"
+    },
+    {
+      "name": "moe-prose",
+      "raw_path": "build/dflash-acceptance-m5-pro/moe-prose.jsonl",
+      "raw_sha256": "7b95ad39a29af0f7abb6fc8800ee981b0400946c9dff60bd335cf957da529360",
+      "report_sha256": "75f0f723d4d8ac13a0a4de565f7d965492c4fa770762f0f2d35a6e61898828f0",
+      "shader_validation": false,
+      "checkpoints": {
+        "draft": {
+          "repo": "incoai/Qwen3.6-35B-A3B-DFlash2",
+          "revision": "51ef7b6923ad6c14cb1bb41c37a9041446496ab6"
+        },
+        "target": {
+          "repo": "mlx-community/Qwen3.6-35B-A3B-4bit",
+          "revision": "38740b847e4cb78f352aba30aa41c76e08e6eb46"
+        }
+      },
+      "capture_path": "dev/benchmarks/results/dflash-acceptance-m5-pro/moe-prose.jsonl.gz",
+      "capture_sha256": "f7f4fc884a63045fd33644e0bfc38ad7efc2ae6a48c0b3a9060d07a975d04ab2"
+    }
+  ],
+  "capture_binary_note": "Early B1 captures precede the terminal-step guard; B2/B3/B4 and MoE captures use the final native code. No captured case reached an early terminal step.",
+  "capture_source_sha256": {
+    "runtime/model/Runtime.cpp": "36acf3edb4e229afcd7ea0b755700eeeb413fed047a3e647de549226b2f616c6",
+    "runtime/model/RuntimeInstrumentation.hpp": "c19f26aa6bbb3630b073baf04cafb861b13da07dfe081294c30e64b11faa8fc4",
+    "dev/benchmarks/decode_profile.mm": "83a5f509a96881766e8fc7dded2bdf1d520491d714327ad948d33b4bd11c07bb",
+    "dev/native.mk": "ad55fa38cfc8c8cbd8f4b9d274fd8f5fcd74987d294a2ab0e6849d19a5e29920",
+    "dev/benchmarks/draft_replay.py": "4d022400787399837d8ae88524f58e27e7bf1e59da62bf5e71da72312c404cef",
+    "dev/tests/tools/test_draft_replay.py": "6dd7d067178fa5353407a8b9ae410a5ec8b518ffc7d6ee539c288b2d7a1e1b9f"
+  },
+  "last_capture_binary_sha256": "806b862eb96cb80b3ec44954a06191e294bfa5f34b13542d8e45479cba5fad50",
+  "pr_base_commit": "1482f6bbc2abf12375332725302019594150b6cb",
+  "analysis_source_sha256": {
+    "dev/benchmarks/draft_replay.py": "43b3fe7cca6f7ac0a5efdfa0d8e1e10387863472fcd680ab66693b501d9e2237",
+    "dev/tests/tools/test_draft_replay.py": "cef7cd05fb910f2911e04bff1ec07baf42f3f1dd5286bdf228f190244406df85",
+    "dev/benchmarks/decode_profile.mm": "cb54f644438e251c7036f3bd60778c2ec6ab3a608e5e79f2dd7acb6876822030",
+    "runtime/model/Runtime.cpp": "36acf3edb4e229afcd7ea0b755700eeeb413fed047a3e647de549226b2f616c6",
+    "runtime/model/RuntimeInstrumentation.hpp": "c19f26aa6bbb3630b073baf04cafb861b13da07dfe081294c30e64b11faa8fc4",
+    "dev/native.mk": "ad55fa38cfc8c8cbd8f4b9d274fd8f5fcd74987d294a2ab0e6849d19a5e29920"
+  },
+  "edge_scale_report_sha256": "a98cc893d8de4de5de31a11a7b1516416402ab7473fcfd2fbcc0207f85b29988",
+  "capture_source_patch_sha256": "29984b2186a6ae06325d56fb3a7d00c668c0f2333d65bb83c1eaa320a8a3f8ba"
+}
