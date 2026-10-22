@@ -3,7 +3,9 @@
 """Real video-model tests (make test-video-real, test-video-http-real,
 test-video-first-frame-real) on the h3 engine's references (--references,
 its H3_REFS), named and compared as its dev/tests/references.sh and
-smoke_golden.sh do.
+smoke_golden.sh do. The engine is the golden-clip tests' (--engine,
+dev/tools/video_golden.mm): the model's runtime, which takes the golden
+prompt's hidden states and keeps a request's latents and frames.
 
 engine: the engine, on GOLDEN_PROMPT_NPZ's hidden states, makes the 3 s
 golden clip, GOLDEN_FINAL and GOLDEN_FRAMES byte for byte; a clip cancelled
@@ -67,8 +69,8 @@ def require_golden(kept: Path, references: Path):
 def run_engine(arguments, scratch):
     hidden = arguments.references / GOLDEN_PROMPT_NPZ
     engine = videos.VideoEngine(
-        [arguments.binary, "serve-native", arguments.model_root,
-         "--hidden-states", hidden, "--keep", scratch],
+        [arguments.engine, "serve-native", arguments.model_root, "--metallib",
+         arguments.metallib, "--hidden-states", hidden, "--keep", scratch],
         videos.START_SECONDS,
     )  # fmt: skip
     engine.start()
@@ -112,9 +114,10 @@ def serving(arguments, scratch, *engine_options):
     """An OpenAI client of `python -m server.server` on the model, as
     `splash serve` starts it, and its port; its engine takes engine_options."""
     engine = scratch / "engine"
-    command = shlex.join(map(str, engine_options))
+    options = ("--metallib", arguments.metallib.resolve(), *engine_options)
+    command = shlex.join(map(str, options))
     engine.write_text(
-        f'#!/bin/sh\nexec "{arguments.binary.resolve()}" "$@" {command}\n'
+        f'#!/bin/sh\nexec "{arguments.engine.resolve()}" "$@" {command}\n'
     )
     engine.chmod(0o755)
     port = available_port()
@@ -216,7 +219,11 @@ def main(argv=None):
     source.add_argument("--model-root", type=Path, help="a prepared MiniMax-H3")
     source.add_argument("--converted", type=Path, help="images converted before")
     parser.add_argument("--model", default="MiniMaxAI/MiniMax-H3")
-    parser.add_argument("--binary", type=Path, default=ROOT / "build" / "splash")
+    parser.add_argument("--engine", type=Path,
+                        default=ROOT / "build" / "engine-tests" / "video-golden")  # fmt: skip
+    parser.add_argument(
+        "--metallib", type=Path, default=ROOT / "build" / "splash.metallib"
+    )
     parser.add_argument("--references", type=Path, required=True)
     parser.add_argument("--seconds", type=int, choices=(3, 10, 15), default=3)
     parser.add_argument("--first-frame-final", type=Path,

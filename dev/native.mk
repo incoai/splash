@@ -144,6 +144,12 @@ TEST_VISION_METAL_TEST := $(ENGINE_TEST_BUILD)/vision-metal
 TEST_VISION_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/vision-attention
 TEST_TEXT_ENCODER_TEST := $(ENGINE_TEST_BUILD)/text-encoder
 TEST_VIDEO_SYNTHETIC_TEST := $(ENGINE_TEST_BUILD)/video-synthetic
+# The production kernels and the synthetic weights' fill (video_synthetic.metal)
+# in one library, which the synthetic forward runs on.
+TEST_VIDEO_SYNTHETIC_AIR := $(ENGINE_TEST_BUILD)/video-synthetic.air
+TEST_VIDEO_SYNTHETIC_LIB := $(ENGINE_TEST_BUILD)/video-synthetic.metallib
+# The video engine of the golden-clip tests (dev/tools/video_golden.mm).
+VIDEO_GOLDEN := $(ENGINE_TEST_BUILD)/video-golden
 TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
 TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
 TEST_TEACHER_LOGITS := $(ENGINE_TEST_BUILD)/teacher-logits
@@ -253,7 +259,7 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_VISION_METAL_TEST) \
 	$(TEST_VISION_ATTENTION_TEST) \
 	$(TEST_TEXT_ENCODER_TEST) \
-	$(TEST_VIDEO_SYNTHETIC_TEST) \
+	$(TEST_VIDEO_SYNTHETIC_TEST) $(TEST_VIDEO_SYNTHETIC_LIB) \
 	$(TEST_METAL_BACKEND_TEST) \
 	$(TEST_HANDOFF_TEST) \
 	$(LIB) $(HOST_STEP_LIB) $(TEST_METAL_BACKEND_LIB) $(TEST_PRODUCTION_LIB) $(TEST_HOST_STEP_LIB) \
@@ -266,7 +272,7 @@ TEST_CONFIG_TARGETS := $(filter-out $(LIB) $(HOST_STEP_LIB),$(sort $(TEST_CPU_TA
 	$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) \
 	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) $(TEST_HOST_STEP_AIR) $(TEST_METAL_BACKEND_AIR) \
-	$(TEST_GGUF_DEQUANT_AIR)
+	$(TEST_GGUF_DEQUANT_AIR) $(TEST_VIDEO_SYNTHETIC_AIR) $(VIDEO_GOLDEN)
 # Benchmarks and tools that build with the production flags.
 PRODUCTION_FLAG_TOOLS := $(TEST_BACKEND_BENCHMARK) $(WEIGHT_DIGESTS)
 PRODUCTION_CONFIG_TARGETS += $(PRODUCTION_FLAG_TOOLS)
@@ -469,12 +475,16 @@ $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(TEST_ANE_FFN) \
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
 
-# The video engine's synthetic forward compiles as the engine's host code
-# does (VIDEO_OBJCXXFLAGS) and links the engine library under it, whose Metal
-# backend and weight readers it runs on, and its mp4 writer's frameworks.
+# The video engine's synthetic forward and the golden-clip tests' engine
+# compile as the engine's host code does (VIDEO_OBJCXXFLAGS) and link the video
+# library and the engine library under it, whose Metal backend and weight
+# readers it runs on, and its mp4 writer's frameworks.
 $(TEST_VIDEO_SYNTHETIC_TEST): dev/tests/engine/video_synthetic_metal_test.mm \
-		$(VIDEO_LIBRARY) $(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
-	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -ffp-contract=off -fobjc-arc $< \
+		dev/tests/engine/VideoSynthetic.mm dev/tests/engine/VideoSynthetic.hpp \
+		dev/tests/engine/VideoSyntheticABI.h
+$(VIDEO_GOLDEN): dev/tools/video_golden.mm dev/tools/Numpy.cpp dev/tools/Numpy.hpp
+$(TEST_VIDEO_SYNTHETIC_TEST) $(VIDEO_GOLDEN): $(VIDEO_LIBRARY) $(ENGINE_LIBRARY) | $(ENGINE_TEST_BUILD)
+	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -ffp-contract=off -fobjc-arc $(filter %.mm %.cpp,$^) \
 		$(VIDEO_LIBRARY) $(ENGINE_LIBRARY) $(ENGINE_LINKFLAGS) $(VIDEO_LINKFLAGS) -o $@
 
 # Tools built with the production flags.
@@ -498,7 +508,10 @@ $(TEST_BACKEND_BENCHMARK): dev/benchmarks/backend_benchmark.mm \
 $(TEST_Q8_AIR): dev/tests/engine/q8_page_format_oracle.metal runtime/metal/abi/ExecutionGeometry.h
 $(TEST_METAL_BACKEND_AIR): dev/tests/engine/metal_backend_test.metal
 
-$(TEST_Q8_AIR) $(TEST_METAL_BACKEND_AIR): | $(ENGINE_TEST_BUILD)
+$(TEST_VIDEO_SYNTHETIC_AIR): dev/tests/engine/video_synthetic.metal dev/tests/engine/VideoSyntheticABI.h \
+	runtime/metal/abi/video/Layout.h
+
+$(TEST_Q8_AIR) $(TEST_METAL_BACKEND_AIR) $(TEST_VIDEO_SYNTHETIC_AIR): | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(METAL) $(TEST_METALFLAGS) -c $(filter %.metal,$^) -o $@
 
 $(ENGINE_TEST_BUILD)/kernels/%.air: runtime/metal/kernels/%.metal \
@@ -524,9 +537,10 @@ $(TEST_HOST_STEP_LIB): $(TEST_HOST_STEP_AIR)
 # one library, for the kernel tests that order a test copy between production
 # dispatches. It relinks whenever the production library does.
 $(TEST_PRODUCTION_LIB): $(PRODUCTION_AIRS) $(TEST_METAL_BACKEND_AIR) $(LIB)
+$(TEST_VIDEO_SYNTHETIC_LIB): $(PRODUCTION_AIRS) $(TEST_VIDEO_SYNTHETIC_AIR) $(LIB)
 
 $(TEST_GGUF_DEQUANT_LIB) $(TEST_Q8_LIB) $(TEST_Q8_ATTENTION_LIB) $(TEST_METAL_BACKEND_LIB) \
-		$(TEST_PRODUCTION_LIB) $(TEST_HOST_STEP_LIB):
+		$(TEST_PRODUCTION_LIB) $(TEST_HOST_STEP_LIB) $(TEST_VIDEO_SYNTHETIC_LIB):
 	$(RUN_CONFIGURED) $(METALLIB) $(filter %.air,$^) -o $@
 
 .PHONY: verify-build-identity
@@ -626,7 +640,7 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_VISION_METAL_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_VISION_ATTENTION_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_TEXT_ENCODER_TEST) $(LIB)
-	$(TEST_VIDEO_SYNTHETIC_TEST) $(LIB)
+	$(TEST_VIDEO_SYNTHETIC_TEST) $(TEST_VIDEO_SYNTHETIC_LIB)
 	$(METAL_TEST_ENV) $(TEST_METAL_BACKEND_TEST) $(TEST_METAL_BACKEND_LIB)
 	$(METAL_TEST_ENV) $(TEST_HANDOFF_TEST) $(TEST_METAL_BACKEND_LIB)
 

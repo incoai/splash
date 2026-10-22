@@ -252,7 +252,7 @@ OpenVDN vdn-minimax-h3 (https://huggingface.co/OpenVDN/vdn-minimax-h3)
 
 The video DiT's window-softmax attention and linear branch
 (runtime/metal/kernels/video/dit/window_attention.metal and
-linear_branch.metal, runtime/video/h3/engine/WindowTable.mm) and its converter
+linear_branch.metal, runtime/video/ops/WindowTable.mm) and its converter
 (install/video/convert_dit.py) implement VDN-H3's hybrid attention from
 OpenVDN's code, licensed under the Apache License, Version 2.0
 (http://www.apache.org/licenses/LICENSE-2.0). Its NOTICE:

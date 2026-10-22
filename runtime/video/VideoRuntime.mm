@@ -4,10 +4,15 @@
 #include "StderrLine.hpp"
 #include "engine/NativeArguments.hpp"
 #include "engine/Protocol.hpp"
-#include "metal/MetalBackend.hpp"
-#include "video/TextEncoder.hpp"
-#include "video/h3/h3.h"
-#include "video/h3/model/Numpy.hpp"
+#include "video/model/TextEncoder.hpp"
+#include "video/ops/WindowAttention.hpp"
+#include "video/stages/AudioDecodingStage.hpp"
+#include "video/stages/DecodingStage.hpp"
+#include "video/stages/DenoisingStage.hpp"
+#include "video/stages/MuxStage.hpp"
+#include "video/stages/PrepStage.hpp"
+#include "video/stages/PreviewStage.hpp"
+#include "video/stages/TextEncodingStage.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -21,12 +26,8 @@
 #include <cerrno>
 #include <condition_variable>
 #include <csignal>
-#include <fstream>
-#include <iterator>
-#include <map>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -40,21 +41,6 @@ namespace splash::video {
 namespace {
 
 using protocol::VideoPhase;
-
-// The DiT reads its block weights from SSD into a ring of this many slots:
-// a 15 s clip fits in about 15 GB instead of 32 GB, at the same speed
-// (runtime/video/VENDORED).
-constexpr int32_t kStreamSlots = 8;
-
-// A request stopped by its Cancel.
-struct Cancelled final {};
-
-// A failure of the vendored engine: its status and message.
-class EngineFailure final : public std::runtime_error {
-public:
-  EngineFailure(h3_status status, const std::string &message) : std::runtime_error(message), status(status) {}
-  h3_status status;
-};
 
 std::atomic<bool> gStopping{false};
 
@@ -102,143 +88,81 @@ private:
   protocol::ProtocolLimits limits_;
 };
 
-struct Options {
-  std::filesystem::path root;
-  std::filesystem::path metallib;
-  std::optional<std::vector<float>> hiddenStates;
-  std::filesystem::path keep;
-};
-
-std::vector<float> readHiddenStates(const std::filesystem::path &path) {
-  std::map<std::string, h3::model::NpyArray> npz;
-  try {
-    npz = h3::model::readNpz(path.string());
-  } catch (const std::runtime_error &) {
-  }
-  const auto found = npz.find("hidden");
-  if (found == npz.end() || found->second.dtype != "<f4" || found->second.shape.size() != 2 ||
-      found->second.shape[1] != TextEncoder::kHiddenSize)
-    throw std::invalid_argument(path.string() + " holds no f32 [L][5120] hidden");
-  const auto *values = found->second.as<float>();
-  return {values, values + found->second.count()};
-}
-
-Options parse(const std::filesystem::path &metallib, int argc, char **argv) {
-  Options options{argv[2], metallib, std::nullopt, {}};
-  for (int index = 3; index < argc; index += 2) {
-    const std::string_view option(argv[index]);
-    if (index + 1 == argc || (option != "--hidden-states" && option != "--keep"))
-      throw engine::UsageError("a video model's engine takes --hidden-states NPZ and --keep DIRECTORY");
-    if (option == "--hidden-states")
-      options.hiddenStates = readHiddenStates(argv[index + 1]);
-    else
-      options.keep = argv[index + 1];
-  }
-  return options;
-}
-
-// The vendored engine for one request, destroyed on every path.
-class H3Engine final {
-public:
-  H3Engine(const Options &options, const h3_request &request) {
-    const std::string metallib = options.metallib.string(), weights = (options.root / "weights").string();
-    const h3_config config{metallib.c_str(), weights.c_str()};
-    check(h3_create(&config, &request, &engine_), "start the video engine");
-  }
-  ~H3Engine() { h3_destroy(engine_); }
-  H3Engine(const H3Engine &) = delete;
-  H3Engine &operator=(const H3Engine &) = delete;
-
-  [[nodiscard]] h3_engine *get() const noexcept { return engine_; }
-  void check(h3_status status, std::string_view what) const {
-    if (status != H3_OK)
-      throw EngineFailure(status, std::string(what) + ": " + (engine_ ? h3_error(engine_) : "invalid request or files"));
-  }
-
-private:
-  h3_engine *engine_ = nullptr;
-};
-
-// One request's phases, each announced as it starts and as it completes.
-class Request final {
+// One request: its frame, and the events of its stages, each announced as it starts and as it completes.
+class Request final : public PipelineEvents {
 public:
   Request(protocol::VideoRequestFrame frame, EventWriter &events)
       : frame(std::move(frame)), arrived(AwakeClock::now()), events_(events) {}
 
-  void start(VideoPhase phase, uint32_t steps = 1) {
-    if (cancelled.load(std::memory_order_relaxed)) throw Cancelled{};
+  void start(VideoPhase phase, uint32_t steps) override {
     phase_ = phase;
     steps_ = steps;
     phaseStarted_ = AwakeClock::now();
     progress(0);
   }
-  void progress(uint32_t step) {
+  void progress(uint32_t step) override {
+    step_ = step;
     events_.send(protocol::VideoProgressEvent{frame.requestId, phase_, step, steps_, microsSince(phaseStarted_),
                                               peakFootprint()});
   }
-  void complete() { progress(steps_); }
-  void output(protocol::VideoOutputKind kind, uint32_t frames, std::vector<uint8_t> mp4) {
+  // The phase's last step, unless the stage reported it.
+  void complete() override {
+    if (step_ != steps_) progress(steps_);
+  }
+  void output(protocol::VideoOutputKind kind, uint32_t frames, std::vector<uint8_t> mp4) override {
     events_.send(protocol::VideoOutputEvent{frame.requestId, kind, frames, microsSince(arrived), std::move(mp4)});
   }
+  [[nodiscard]] bool cancelled() const override { return cancel.load(std::memory_order_relaxed); }
 
   const protocol::VideoRequestFrame frame;
   const AwakeClock::time_point arrived;
-  std::atomic<bool> cancelled{false};
+  std::atomic<bool> cancel{false};
 
 private:
   EventWriter &events_;
   VideoPhase phase_ = VideoPhase::Encode;
-  uint32_t steps_ = 1;
+  uint32_t steps_ = 1, step_ = 0;
   AwakeClock::time_point phaseStarted_;
 };
 
-// An npz of named arrays (--keep).
-void write(const std::filesystem::path &path, const std::vector<std::pair<std::string, h3::model::NpyArray>> &arrays) {
-  std::vector<std::pair<std::string, const h3::model::NpyArray *>> members;
-  for (const auto &[name, array] : arrays) members.emplace_back(name, &array);
-  h3::model::writeNpz(path.string(), members);
-}
-
-void writeFile(const std::filesystem::path &path, const void *data, size_t bytes) {
-  std::ofstream file(path, std::ios::binary);
-  file.write(static_cast<const char *>(data), static_cast<std::streamsize>(bytes));
-  if (!file.flush()) throw std::runtime_error("cannot write " + path.string());
-}
-
-// The mp4 of frames and, when given, the waveform, through a file of its own.
-std::vector<uint8_t> mp4(const std::vector<uint8_t> &frames, int32_t count, const h3_geometry &geometry,
-                         const std::vector<float> &wav, uint64_t requestId) {
-  const std::filesystem::path path = std::filesystem::temp_directory_path() /
-                                     ("splash-video-" + std::to_string(getpid()) + "-" +
-                                      std::to_string(requestId) + ".mp4");
-  h3_mp4_stats stats{};
-  const h3_status status =
-      h3_write_mp4(path.c_str(), frames.data(), count, geometry.width, geometry.height,
-                   wav.empty() ? nullptr : wav.data(), wav.empty() ? 0 : geometry.audio_samples, &stats);
-  std::ifstream file(path, std::ios::binary);
-  std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-  std::error_code ignored;
-  std::filesystem::remove(path, ignored);
-  if (status != H3_OK || bytes.empty()) throw EngineFailure(status, "cannot write the mp4");
-  return bytes;
+// The batch of a request, its clip's geometry checked.
+VideoBatch batchOf(const protocol::VideoRequestFrame &frame) {
+  VideoBatch batch;
+  batch.requestId = frame.requestId;
+  ClipOptions &options = batch.options;
+  options.variant = frame.variant == protocol::VideoVariant::Turbo ? model::Variant::Turbo : model::Variant::Default;
+  options.frames = static_cast<int32_t>(frame.frames);
+  options.width = static_cast<int32_t>(frame.width);
+  options.height = static_cast<int32_t>(frame.height);
+  try {
+    batch.geometry = ops::VideoGeometry::of(options.frames, options.width, options.height);
+  } catch (const std::invalid_argument &) {
+    throw std::invalid_argument("MiniMax-H3 renders 17 n + 5 frames of 1344 x 768");
+  }
+  batch.promptTokens = frame.promptTokens;
+  batch.steps = static_cast<int32_t>(frame.steps);
+  batch.seed = frame.seed;
+  batch.firstFrame = frame.firstFrame;
+  batch.lastFrame = frame.lastFrame;
+  batch.preview = (frame.outputs & protocol::VideoOutputPreview) != 0;
+  batch.audio = (frame.outputs & protocol::VideoOutputAudio) != 0;
+  return batch;
 }
 
 class VideoServer final {
 public:
-  VideoServer(Options options, EventWriter &events)
-      : options_(std::move(options)), events_(events), backend_(options_.metallib.string()),
-        encoder_(backend_, options_.root / "encoder") {}
+  VideoServer(const VideoRuntime &runtime, EventWriter &events) : runtime_(runtime), events_(events) {}
 
   // Reads client frames from `input` until it ends or a stop signal; a
   // request runs on the worker meanwhile.
   int run(int input) {
-    events_.send(protocol::ReadyEvent{1, TextEncoder::kMaximumTokens, false, true});
+    events_.send(protocol::ReadyEvent{1, model::TextEncoder::kMaximumTokens, false, true});
     std::thread worker([this] { work(); });
     const int status = read(input);
     {
       std::lock_guard lock(mutex_);
       stopping_ = true;
-      if (running_) running_->cancelled.store(true, std::memory_order_relaxed);
+      if (running_) running_->cancel.store(true, std::memory_order_relaxed);
     }
     wake_.notify_all();
     worker.join();
@@ -298,7 +222,7 @@ private:
   void cancel(uint64_t requestId) {
     std::lock_guard lock(mutex_);
     for (Request *request : {pending_.get(), running_.get()})
-      if (request && request->frame.requestId == requestId) request->cancelled.store(true, std::memory_order_relaxed);
+      if (request && request->frame.requestId == requestId) request->cancel.store(true, std::memory_order_relaxed);
   }
 
   void work() {
@@ -315,8 +239,7 @@ private:
     }
   }
 
-  // Runs the request and answers it; a failure the engine cannot serve on
-  // after ends the process.
+  // Runs the request and answers it; a failure the engine cannot serve on after ends the process.
   void generate(Request &request) {
     const uint64_t id = request.frame.requestId;
     try {
@@ -326,13 +249,15 @@ private:
         }
       } catch (const Cancelled &) {
         events_.requestError(id, "cancelled", "the video request was cancelled");
-      } catch (const EngineFailure &error) {
+      } catch (const metal::MetalBackendError &error) {
         // A command buffer or device failure leaves the GPU in doubt.
-        if (error.status == H3_ERROR_GPU || error.status == H3_ERROR_METAL) fail(error.what());
-        events_.requestError(id, error.status == H3_ERROR_ARGUMENT ? "invalid_video_request" : "video_engine_failed",
-                             error.what());
+        fail(error.what());
       } catch (const std::invalid_argument &error) {
+        logLine("video request failed: ", error.what());
         events_.requestError(id, "invalid_video_request", error.what());
+      } catch (const std::exception &error) {
+        logLine("video request failed: ", error.what());
+        events_.requestError(id, "video_engine_failed", error.what());
       }
     } catch (const std::exception &error) {
       fail(error.what());
@@ -352,116 +277,15 @@ private:
   }
 
   void run(Request &request) {
-    const protocol::VideoRequestFrame &frame = request.frame;
-    h3_request clip = h3_default_request();
-    clip.variant = frame.variant == protocol::VideoVariant::Turbo ? H3_VARIANT_TURBO : H3_VARIANT_DEFAULT;
-    clip.frames = static_cast<int32_t>(frame.frames);
-    clip.width = static_cast<int32_t>(frame.width);
-    clip.height = static_cast<int32_t>(frame.height);
-    clip.stream = 1;
-    clip.stream_slots = kStreamSlots;
-    h3_geometry geometry{};
-    if (h3_geometry_of(&clip, &geometry) != H3_OK)
-      throw std::invalid_argument("MiniMax-H3 renders 17 n + 5 frames of 1344 x 768");
-    const std::filesystem::path keep =
-        options_.keep.empty() ? std::filesystem::path() : options_.keep / std::to_string(frame.requestId);
-    if (!keep.empty()) std::filesystem::create_directories(keep);
-
-    request.start(VideoPhase::Encode);
-    const std::vector<float> hidden =
-        options_.hiddenStates ? *options_.hiddenStates : encoder_.encode(frame.promptTokens);
-    const auto rows = static_cast<int64_t>(hidden.size() / TextEncoder::kHiddenSize);
-    if (!keep.empty())
-      write(keep / "hidden.npz", {{"hidden", h3::model::NpyArray::of("<f4", {rows, TextEncoder::kHiddenSize},
-                                                                      hidden.data(), hidden.size() * 4)}});
-    request.complete();
-
-    H3Engine engine(options_, clip);
-    std::vector<float> video(size_t(geometry.video_rows) * 96), audio(size_t(geometry.audio_rows) * 32);
-    @autoreleasepool {
-      request.start(VideoPhase::Prepare);
-      // The keyframes arrive on the canvas (protocol::VideoRequestFrame): the video VAE encoder's input as is.
-      auto keyframe = [](const std::vector<uint8_t> &rgb) { return rgb.empty() ? nullptr : rgb.data(); };
-      const h3_prep_inputs inputs{hidden.data(),
-                                  static_cast<int32_t>(rows),
-                                  static_cast<int32_t>(frame.steps),
-                                  frame.seed,
-                                  nullptr,
-                                  keyframe(frame.firstFrame),
-                                  keyframe(frame.lastFrame)};
-      h3_prepared prepared{};
-      engine.check(h3_prep(engine.get(), &inputs, &prepared), "prepare the request");
-      request.complete();
-
-      request.start(VideoPhase::Denoise, static_cast<uint32_t>(prepared.steps));
-      const h3_dit_inputs dit{prepared.text_rows, prepared.tags,      prepared.rope,
-                              prepared.text,      prepared.cond_rows, prepared.cond};
-      engine.check(h3_dit_load(engine.get(), &dit), "load the DiT");
-      const h3_schedule schedule{prepared.steps,         prepared.ada_blocks,   prepared.ada_final,
-                                 prepared.video_t,       prepared.audio_t,      prepared.video_sigmas,
-                                 prepared.audio_sigmas};
-      // A Cancel stops the loop at the next step: the step callback throws
-      // through h3_denoise, which is C++ (CApi.mm), once the step's commands
-      // have completed.
-      const h3_step_callback onStep = [](void *user, int32_t step, const h3_forward_stats *, const float *,
-                                         const float *) {
-        auto &stepping = *static_cast<Request *>(user);
-        stepping.progress(static_cast<uint32_t>(step + 1));
-        if (stepping.cancelled.load(std::memory_order_relaxed)) throw Cancelled{};
-      };
-      engine.check(h3_denoise(engine.get(), &schedule, prepared.video_noise, prepared.audio_noise, video.data(),
-                              audio.data(), onStep, &request),
-                   "denoise");
-      h3_dit_release(engine.get());
-      h3_prep_release(engine.get());
-    }
-    if (!keep.empty())
-      write(keep / "final.npz",
-            {{"video", h3::model::NpyArray::of("<f4", {geometry.video_rows, 96}, video.data(), video.size() * 4)},
-             {"audio", h3::model::NpyArray::of("<f4", {geometry.audio_rows, 32}, audio.data(), audio.size() * 4)}});
-
-    if (frame.outputs & protocol::VideoOutputPreview) {
-      @autoreleasepool {
-        request.start(VideoPhase::Preview);
-        std::vector<uint8_t> frames(size_t(geometry.width) * geometry.height * 3 * geometry.preview_frames);
-        h3_preview_stats stats{};
-        engine.check(h3_preview(engine.get(), video.data(), frames.data(), nullptr, &stats), "decode the preview");
-        request.output(protocol::VideoOutputKind::Preview, static_cast<uint32_t>(geometry.preview_frames),
-                       mp4(frames, geometry.preview_frames, geometry, {}, frame.requestId));
-        request.complete();
-      }
-    }
-
-    std::vector<uint8_t> frames(size_t(geometry.width) * geometry.height * 3 * geometry.decode_frames);
-    @autoreleasepool {
-      request.start(VideoPhase::Decode);
-      h3_decode_stats stats{};
-      engine.check(h3_decode(engine.get(), video.data(), frames.data(), &stats), "decode the video");
-      if (!keep.empty()) writeFile(keep / "frames.rgb", frames.data(), frames.size());
-      request.complete();
-    }
-    std::vector<float> wav;
-    if (frame.outputs & protocol::VideoOutputAudio) {
-      @autoreleasepool {
-        request.start(VideoPhase::Audio);
-        wav.resize(size_t(2) * geometry.audio_samples);
-        h3_audio_stats stats{};
-        engine.check(h3_decode_audio(engine.get(), audio.data(), wav.data(), &stats), "decode the audio");
-        request.complete();
-      }
-    }
-    request.start(VideoPhase::Mux);
-    std::vector<uint8_t> clipMp4 = mp4(frames, geometry.decode_frames, geometry, wav, frame.requestId);
-    request.complete();
-    request.output(protocol::VideoOutputKind::Video, static_cast<uint32_t>(geometry.decode_frames),
-                   std::move(clipMp4));
+    VideoBatch batch = batchOf(request.frame);
+    runtime_.forward(batch, request);
+    request.output(protocol::VideoOutputKind::Video,
+                   static_cast<uint32_t>(ops::planVaeDecode(batch.geometry).outputFrames()), std::move(batch.mp4));
   }
 
-  Options options_;
+  const VideoRuntime &runtime_;
   EventWriter &events_;
   protocol::ProtocolLimits limits_;
-  metal::MetalBackend backend_;
-  TextEncoder encoder_;
   std::mutex mutex_;
   std::condition_variable wake_;
   std::unique_ptr<Request> pending_, running_;
@@ -469,6 +293,31 @@ private:
 };
 
 } // namespace
+
+Stages VideoRuntime::stages(metal::MetalBackend &backend, const std::filesystem::path &modelRoot) {
+  const std::filesystem::path weights = modelRoot / "weights";
+  Stages stages;
+  stages.push_back(std::make_unique<TextEncodingStage>(backend, modelRoot / "encoder"));
+  stages.push_back(std::make_unique<PrepStage>(backend, weights));
+  stages.push_back(std::make_unique<DenoisingStage>(backend, weights));
+  stages.push_back(std::make_unique<PreviewStage>(backend, weights));
+  stages.push_back(std::make_unique<DecodingStage>(backend, weights));
+  stages.push_back(std::make_unique<AudioDecodingStage>(backend, weights));
+  stages.push_back(std::make_unique<MuxStage>());
+  return stages;
+}
+
+void VideoRuntime::forward(VideoBatch &batch, PipelineEvents &events) const {
+  for (const std::unique_ptr<PipelineStage> &stage : stages_) {
+    if (!stage->runs(batch)) continue;
+    if (events.cancelled()) throw Cancelled{};
+    @autoreleasepool {
+      events.start(stage->phase(), stage->steps(batch));
+      stage->forward(batch, events);
+      events.complete();
+    }
+  }
+}
 
 bool servesVideo(const std::filesystem::path &modelRoot) {
   @autoreleasepool {
@@ -482,13 +331,19 @@ int tabulateAdaLn(const std::filesystem::path &metallib, int argc, char **argv) 
   const std::string_view variant = argc == 5 ? argv[3] : "";
   if (variant != "turbo" && variant != "default")
     throw engine::UsageError("video-adaln takes WEIGHTS VARIANT (turbo or default) TRANSFORMER");
-  const h3_config config{metallib.c_str(), argv[2]};
-  const h3_status status =
-      h3_tabulate_adaln(&config, variant == "turbo" ? H3_VARIANT_TURBO : H3_VARIANT_DEFAULT, argv[4]);
-  return status == H3_OK ? EX_OK : EX_SOFTWARE;
+  try {
+    metal::MetalBackend backend(metallib.string());
+    const bool turbo = variant == "turbo";
+    model::Prep::tabulateAdaLn(backend, std::string(argv[2]) + (turbo ? "/dit-turbo" : "/dit-default"), argv[4],
+                               turbo ? model::Variant::Turbo : model::Variant::Default);
+    return EX_OK;
+  } catch (const std::exception &error) {
+    writeStderrLine(std::string("error: ") + error.what());
+    return EX_SOFTWARE;
+  }
 }
 
-int serve(const std::filesystem::path &metallib, int argc, char **argv) {
+int serve(const std::filesystem::path &metallib, const std::function<Stages(metal::MetalBackend &)> &compose) {
   struct sigaction action {};
   action.sa_handler = requestStop;
   sigemptyset(&action.sa_mask);
@@ -499,8 +354,17 @@ int serve(const std::filesystem::path &metallib, int argc, char **argv) {
     return EX_SOFTWARE;
   }
   EventWriter writer(STDOUT_FILENO);
-  VideoServer server(parse(metallib, argc, argv), writer);
+  metal::MetalBackend backend(metallib.string());
+  ops::checkRegisterLayout(backend);
+  const VideoRuntime runtime(compose(backend));
+  VideoServer server(runtime, writer);
   return server.run(STDIN_FILENO);
+}
+
+int serve(const std::filesystem::path &metallib, int argc, char **argv) {
+  if (argc != 3) throw engine::UsageError("a video model's engine takes its model directory alone");
+  const std::filesystem::path modelRoot = argv[2];
+  return serve(metallib, [&](metal::MetalBackend &backend) { return VideoRuntime::stages(backend, modelRoot); });
 }
 
 } // namespace splash::video

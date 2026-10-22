@@ -2186,17 +2186,25 @@ The engine process of an h3-video assembly (`runtime/video/VideoRuntime.hpp`)
 speaks the native protocol and announces `FeatureVideo`. A `VideoRequest`
 (the clip's variant, frames, size, steps, seed, outputs, the prompt's token
 ids and, for a clip from its first and last frames, their pixels on the
-canvas) runs every phase in this process, one request at a time:
+canvas) runs every phase in this process, one request at a time, on
+Splash's Metal backend and weight readers. The `VideoRuntime` composes the
+phases as SGLang Diffusion composes a pipeline, one stage each
+(`runtime/video/stages`), which pass the request's batch from one to the next:
 the text encoder, Qwen3-VL-32B through decoder layer 50, loaded for the
-request (`runtime/video/TextEncoder.hpp`); then, through the C ABI of
-Splash's copy of the h3 engine, on Splash's Metal backend and weight readers
-(`runtime/video/h3`, `runtime/video/VENDORED`), request
-preparation (with the video VAE's encoder for the keyframes), the DiT
-streamed from its block files on the SSD in 8 slots, the TAEH3 preview, the
-video VAE, the audio VAE and the mp4. `VideoProgress` reports each phase's
-start and end and each denoising step, `VideoOutput` delivers the preview
-and then the clip, which ends the request; a `Cancel` stops it at the next
-step or phase. A language model's engine refuses a `VideoRequest`.
+request (`TextEncodingStage`); request preparation, with the video VAE's
+encoder for the keyframes (`PrepStage`); the DiT, streamed from its block
+files on the SSD in 8 slots (`DenoisingStage`); the TAEH3 preview
+(`PreviewStage`); the video VAE (`DecodingStage`); the audio VAE
+(`AudioDecodingStage`); and the mp4 (`MuxStage`). Under the stages, the
+subtree keeps Splash's layering: `model/` (weights, request preparation, the
+DiT's activation plan and weight stream), `ops/` (the operators) and
+`metal/` (the dispatch recorder and the device's tuning), checked by
+`dev/tools/check_architecture.py`; its kernels are under
+`runtime/metal/kernels/video` (`runtime/video/VENDORED`). `VideoProgress`
+reports each phase's start and end and each denoising step, `VideoOutput`
+delivers the preview and then the clip, which ends the request; a `Cancel`
+stops it at the next step or phase. A language model's engine refuses a
+`VideoRequest`.
 
 On an M5 Pro (48 GB), through `/v1/videos`:
 
@@ -2242,10 +2250,13 @@ make test-video-http-real VIDEO_REFERENCES=... VIDEO_CONVERTED=... VIDEO_SECONDS
 make test-video-first-frame-real VIDEO_REFERENCES=... VIDEO_CONVERTED=... VIDEO_FIRST_FRAME_FINAL=...
 ```
 
-`test-video-real` drives the engine with the golden prompt's saved hidden
-states (the engine's `--hidden-states`) and requires the 3 s golden clip's
-latents and frames (`--keep`) byte-identical to h3's references, as h3's
-own suite compares them, then cancels a clip. `test-video-http-real` does the
+The tests run the golden-clip engine (`dev/tools/video_golden.mm`,
+`build/engine-tests/video-golden`): the model's runtime with two of its stages
+changed, the text encoding by the golden prompt's saved hidden states
+(`--hidden-states`) and the denoising and decoding followed by writing their
+latents and frames (`--keep`). `test-video-real` requires the 3 s golden
+clip's latents and frames byte-identical to h3's references, as h3's own suite
+compares them, then cancels a clip. `test-video-http-real` does the
 same through `/v1/videos`, deletes a running job, then runs a clip of
 `VIDEO_SECONDS` from the server's tokenizer and the engine's encoder.
 `test-video-first-frame-real` sends the golden frames' first frame as a PNG

@@ -35,7 +35,7 @@
   <text x="900" y="252" font-size="12" fill="#4b5563">VideoRequest · VideoProgress · VideoOutput</text>
   <rect x="644" y="264" width="492" height="74" rx="10" fill="#ffffff" stroke="#86efac"/>
   <text x="660" y="288" font-size="14" font-weight="600" fill="#111827">engine (build/splash serve-native)</text>
-  <text x="660" y="310" font-size="13" fill="#374151">runtime/video: text encoder + vendored h3 engine (C ABI)</text>
+  <text x="660" y="310" font-size="13" fill="#374151">runtime/video: VideoRuntime, a pipeline of stages (encode → mux)</text>
   <text x="660" y="329" font-size="13" fill="#6b7280">Ready: FeatureVideo</text>
 
   <!-- Shared model layer -->

@@ -141,6 +141,7 @@ VIDEO_REFERENCES ?= $(H3_REFS)
 VIDEO_SECONDS ?= 3
 VIDEO_FIRST_FRAME_FINAL ?= $(VIDEO_REFERENCES)/golden_i2v_3s/final.npz
 VIDEO_ARGS = --model "$(VIDEO_MODEL)" --references "$(VIDEO_REFERENCES)" \
+	--engine "$(VIDEO_GOLDEN)" --metallib "$(LIB)" \
 	$(if $(VIDEO_CONVERTED),--converted "$(VIDEO_CONVERTED)",--model-root "$(VIDEO_ROOT)")
 
 .PHONY: video-references test-video-real test-video-http-real test-video-first-frame-real
@@ -150,15 +151,15 @@ video-references:
 		exit 1; \
 	}
 
-test-video-real: install-development $(TARGET) video-references
+test-video-real: install-development $(TARGET) $(VIDEO_GOLDEN) video-references
 	$(PYTHON) dev/tests/video_real.py engine $(VIDEO_ARGS) \
 		--output build/release/video-engine.json
 
-test-video-http-real: install-development $(TARGET) video-references
+test-video-http-real: install-development $(TARGET) $(VIDEO_GOLDEN) video-references
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/video_real.py http $(VIDEO_ARGS) \
 		--seconds "$(VIDEO_SECONDS)" --output build/release/video-http.json
 
-test-video-first-frame-real: install-development $(TARGET) video-references
+test-video-first-frame-real: install-development $(TARGET) $(VIDEO_GOLDEN) video-references
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/video_real.py first-frame $(VIDEO_ARGS) \
 		--first-frame-final "$(VIDEO_FIRST_FRAME_FINAL)" --output build/release/video-first-frame.json
 

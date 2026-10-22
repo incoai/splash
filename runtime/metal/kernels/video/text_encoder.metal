@@ -1,4 +1,4 @@
-#include "video/TextEncoderABI.h"
+#include "metal/abi/video/TextEncoderABI.h"
 
 using namespace metal;
 

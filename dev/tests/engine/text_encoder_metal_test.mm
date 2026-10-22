@@ -8,7 +8,7 @@
 #include "TestChecks.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
-#include "video/TextEncoderABI.h"
+#include "metal/abi/video/TextEncoderABI.h"
 
 #import <Foundation/Foundation.h>
 

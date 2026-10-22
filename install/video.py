@@ -26,9 +26,9 @@ preview/ and fl2va/, as h3 converts them) prepares without converting.
 
 The paths an assembly links (assembly.py lists a language model's):
   weights/dit-<variant>/, weights/vae/, weights/audio/, weights/preview/
-                         the engine's images (runtime/video/h3/h3.h)
+                         the engine's images (runtime/video/model)
   encoder/               the text encoder's config.json and shards
-                         (runtime/video/TextEncoder.hpp)
+                         (runtime/video/model/TextEncoder.hpp)
   tokenizer/             FL2VA's tokenizer, which the server encodes prompts
                          with (server/videos.py)
   LICENSE                the MiniMax H3 Community License Agreement

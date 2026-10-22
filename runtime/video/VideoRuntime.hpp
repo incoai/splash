@@ -1,45 +1,65 @@
 #pragma once
 
-// The engine process of a video model: `serve-native MODEL_DIRECTORY` of an
-// assembly whose record names an h3-video model. It speaks the native
-// protocol on stdin and stdout as a language model's engine does, announcing
-// FeatureVideo, and takes VideoRequests one at a time, and Cancels; every
-// other client frame ends the stream. A request runs every phase on the GPU
-// in this process, in order: the text encoder (TextEncoder.hpp, loaded for
-// the request), then the vendored MiniMax-H3 engine through its C ABI
-// (h3/h3.h): request preparation, with the video VAE encoder for the request's
-// first and last frames when it carries them, the DiT, streamed from SSD, the
-// TAEH3 preview when asked, the video VAE, the audio VAE when asked and the
-// mp4 writer.
-// Each phase reports VideoProgress, the denoising each step; the preview and
-// the clip arrive as VideoOutputs. A Cancel stops the request at the next
-// step or phase boundary. The engine's own log lines go to stderr.
+// The engine process of a video model: `serve-native MODEL_DIRECTORY` of an assembly whose record names an h3-video
+// model. It speaks the native protocol on stdin and stdout as a language model's engine does, announcing
+// FeatureVideo, and takes VideoRequests one at a time, and Cancels; every other client frame ends the stream.
 //
-// Two options serve the identity tests (DEVELOPMENT.md, Video):
-//   --hidden-states NPZ  every request is conditioned on the f32 [L][5120]
-//                        `hidden` of NPZ instead of its encoded prompt;
-//   --keep DIRECTORY     each request writes its prompt's hidden states
-//                        (hidden.npz), final latents (final.npz) and video
-//                        frames (frames.rgb, uint8 RGB) into
-//                        DIRECTORY/REQUEST_ID.
+// A request runs through the VideoRuntime, a composed pipeline (SGLang Diffusion's ComposedPipeline) of stages
+// (stages/), every one on the GPU of this process, in order: the text encoder (TextEncodingStage), request
+// preparation, with the video VAE encoder for the request's first and last frames when it carries them (PrepStage),
+// the DiT, streamed from SSD (DenoisingStage), the TAEH3 preview when asked (PreviewStage), the video VAE
+// (DecodingStage), the audio VAE when asked (AudioDecodingStage) and the mp4 writer (MuxStage). Each stage reports
+// VideoProgress, the denoising each step; the preview and the clip arrive as VideoOutputs. A Cancel stops the request
+// at the next step or stage boundary. The stages' log lines go to stderr.
+
+#include "metal/MetalBackend.hpp"
+#include "video/pipeline/PipelineStage.hpp"
 
 #include <filesystem>
+#include <functional>
+#include <memory>
+#include <vector>
 
 namespace splash::video {
 
-// Whether the assembly at modelRoot holds a video model: its model.json's
-// target_format.
+// What a request's client hears from the runtime: each stage's phase as it starts and as it completes, besides what
+// the stage reports.
+class PipelineEvents : public StageEvents {
+public:
+  virtual void start(protocol::VideoPhase phase, uint32_t steps) = 0;
+  virtual void complete() = 0;
+};
+
+using Stages = std::vector<std::unique_ptr<PipelineStage>>;
+
+class VideoRuntime final {
+public:
+  explicit VideoRuntime(Stages stages) : stages_(std::move(stages)) {}
+
+  // The model's stages, of the assembly at modelRoot: encoder/ and weights/.
+  [[nodiscard]] static Stages stages(metal::MetalBackend &backend, const std::filesystem::path &modelRoot);
+
+  // Runs the request's stages in order, each that runs for it; throws Cancelled at the first stage boundary or
+  // denoising step after its Cancel.
+  void forward(VideoBatch &batch, PipelineEvents &events) const;
+
+private:
+  Stages stages_;
+};
+
+// Whether the assembly at modelRoot holds a video model: its model.json's target_format.
 [[nodiscard]] bool servesVideo(const std::filesystem::path &modelRoot);
 
-// argv: serve-native MODEL_DIRECTORY [--hidden-states NPZ] [--keep DIRECTORY].
-// The process's exit status (engine::NativeProcessExit).
+// The engine process on an Apple10 GPU (M5) or later, of the stages `compose` makes on its backend: serves until the
+// client ends the stream or a stop signal. The process's exit status (engine::NativeProcessExit).
+[[nodiscard]] int serve(const std::filesystem::path &metallib,
+                        const std::function<Stages(metal::MetalBackend &)> &compose);
+// argv: serve-native MODEL_DIRECTORY, served with the model's stages.
 [[nodiscard]] int serve(const std::filesystem::path &metallib, int argc, char **argv);
 
-// argv: video-adaln WEIGHTS VARIANT TRANSFORMER, a conversion step of the
-// installer (install/video.py): WEIGHTS/dit-VARIANT/adaln.safetensors, the
-// adaLN tables of the variant (turbo or default), from FL2VA's transformer
-// shards in TRANSFORMER (h3_tabulate_adaln). EX_OK, or EX_SOFTWARE after the
-// engine's error on stderr.
+// argv: video-adaln WEIGHTS VARIANT TRANSFORMER, a conversion step of the installer (install/video.py):
+// WEIGHTS/dit-VARIANT/adaln.safetensors, the adaLN tables of the variant (turbo or default), from FL2VA's transformer
+// shards in TRANSFORMER (model::Prep::tabulateAdaLn). EX_OK, or EX_SOFTWARE after the error on stderr.
 [[nodiscard]] int tabulateAdaLn(const std::filesystem::path &metallib, int argc, char **argv);
 
 } // namespace splash::video

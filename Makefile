@@ -58,7 +58,7 @@ PRODUCTION_AIRS := $(addprefix $(METAL_BUILD)/, \
 	$(addsuffix .air,$(PRODUCTION_KERNEL_NAMES)))
 KERNEL_HEADERS := $(sort $(wildcard runtime/metal/abi/*.h \
 	runtime/metal/kernels/common/*.h runtime/metal/abi/video/*.h \
-	runtime/metal/kernels/video/common/*.h runtime/video/*.h))
+	runtime/metal/kernels/video/common/*.h))
 # The video engine's request preparation reproduces MLX's arithmetic bit for
 # bit, and compiles as MLX's metallib does, without fast math.
 VIDEO_PREP_AIRS := $(filter $(METAL_BUILD)/video/prep/%,$(PRODUCTION_AIRS))
@@ -357,12 +357,12 @@ ENGINE_OBJECTS := \
 	$(patsubst runtime/%.mm,$(ENGINE_BUILD)/%.o,$(ENGINE_MM_SOURCES)) \
 	$(ENGINE_METAL_RUNTIME_OBJECT)
 # The video engine is an archive of its own: its objects share basenames with
-# the engine's (Engine.o, MemoryPlan.o, Scheduler.o), which one archive cannot
+# the engine's (MemoryPlan.o, Linear.o), which one archive cannot
 # hold. It links before the engine's archive, whose Metal backend and weight
 # readers it runs on.
 VIDEO_LIBRARY := $(ENGINE_BUILD)/libsplash-video.a
-VIDEO_SOURCES := $(sort $(wildcard runtime/video/*.mm runtime/video/h3/*/*.cpp \
-	runtime/video/h3/*/*.mm))
+VIDEO_SOURCES := $(sort $(wildcard runtime/video/*.mm runtime/video/*/*.cpp \
+	runtime/video/*/*.mm))
 VIDEO_CPP_OBJECTS := $(patsubst runtime/%.cpp,$(ENGINE_BUILD)/%.o, \
 	$(filter %.cpp,$(VIDEO_SOURCES)))
 VIDEO_MM_OBJECTS := $(patsubst runtime/%.mm,$(ENGINE_BUILD)/%.o, \
