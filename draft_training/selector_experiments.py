@@ -1,6 +1,9 @@
 """Training-only selector candidates. Artifacts are NOT native checkpoints."""
 
 import json
+import os
+import shutil
+import tempfile
 from pathlib import Path
 
 import torch
@@ -121,26 +124,36 @@ class ExperimentalSelector(nn.Module):
         if not isinstance(baseline_identity, str) or not baseline_identity:
             raise TrainingError("record the baseline checkpoint identity")
         directory = Path(directory)
-        # mkdir refuses replacement. No config.json/model.safetensors pair is
-        # emitted, so the serving loader cannot silently accept this artifact.
-        directory.mkdir(parents=True, exist_ok=False)
+        if directory.exists():
+            raise TrainingError("research selector destination already exists")
         state = {k: v.detach().cpu().contiguous() for k, v in self.state_dict().items()}
         if any(not torch.isfinite(v).all() for v in state.values()):
             raise TrainingError("nonfinite research selector")
-        save_file(state, str(directory / "research-selector.safetensors"))
-        (directory / "experiment.json").write_text(
-            json.dumps(
-                {
-                    "capability": "splash-research-selector-v1",
-                    "variant": self.variant,
-                    "geometry": self.geometry,
-                    "baseline_identity": baseline_identity,
-                    "native_compatible": False,
-                },
-                indent=2,
-            )
-            + "\n"
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        stage = Path(
+            tempfile.mkdtemp(prefix=".research-selector-", dir=directory.parent)
         )
+        try:
+            # Publish weights and capability metadata together. No serving
+            # config.json/model.safetensors pair is ever emitted.
+            save_file(state, str(stage / "research-selector.safetensors"))
+            (stage / "experiment.json").write_text(
+                json.dumps(
+                    {
+                        "capability": "splash-research-selector-v1",
+                        "variant": self.variant,
+                        "geometry": self.geometry,
+                        "baseline_identity": baseline_identity,
+                        "native_compatible": False,
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            os.rename(stage, directory)
+        finally:
+            if stage.exists():
+                shutil.rmtree(stage)
 
     def load_research(self, directory, baseline_identity):
         from safetensors.torch import load_file
@@ -160,4 +173,13 @@ class ExperimentalSelector(nn.Module):
         state = load_file(str(directory / "research-selector.safetensors"))
         if any(not torch.isfinite(v).all() for v in state.values()):
             raise TrainingError("nonfinite research selector")
+        expected = self.state_dict()
+        if state.keys() != expected.keys() or any(
+            value.shape != expected[name].shape
+            or value.dtype not in (torch.float32, torch.bfloat16)
+            for name, value in state.items()
+        ):
+            raise TrainingError(
+                "research selector tensor names, shapes or precision differ"
+            )
         self.load_state_dict(state, strict=True)

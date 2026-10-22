@@ -136,3 +136,45 @@ class SelectorExperimentTests(unittest.TestCase):
         loss.backward()
         self.assertEqual(float(loss.detach()), 0)
         self.assertEqual(metrics["covered"], 0)
+
+    def test_failed_save_is_atomic_and_can_be_retried(self):
+        from unittest import mock
+
+        from draft_training.config import TrainingError
+        from draft_training.selector_experiments import ExperimentalSelector
+
+        exp = ExperimentalSelector(self.baseline, variant="pair_context")
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "candidate"
+            with mock.patch(
+                "safetensors.torch.save_file", side_effect=OSError("disk full")
+            ):
+                with self.assertRaises(OSError):
+                    exp.save_research(output, "baseline")
+            self.assertFalse(output.exists())
+            self.assertFalse(list(Path(directory).glob(".research-selector-*")))
+            exp.save_research(output, "baseline")
+            with self.assertRaises(TrainingError):
+                exp.save_research(output, "baseline")
+
+    def test_shape_failure_does_not_partially_replace_weights(self):
+        from safetensors.torch import load_file, save_file
+
+        from draft_training.config import TrainingError
+        from draft_training.selector_experiments import ExperimentalSelector
+
+        t = self.t
+        exp = ExperimentalSelector(self.baseline, variant="pair_context")
+        before = {k: v.clone() for k, v in exp.state_dict().items()}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "candidate"
+            exp.save_research(output, "baseline")
+            state = load_file(str(output / "research-selector.safetensors"))
+            names = list(state)
+            state[names[0]] = state[names[0]] + 1
+            state[names[-1]] = state[names[-1]].flatten()[:1]
+            save_file(state, str(output / "research-selector.safetensors"))
+            with self.assertRaises(TrainingError):
+                exp.load_research(output, "baseline")
+        for name, value in exp.state_dict().items():
+            t.testing.assert_close(value, before[name], rtol=0, atol=0)
