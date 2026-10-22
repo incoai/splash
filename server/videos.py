@@ -5,6 +5,10 @@ serves these routes alone, beside /health, /ready, /status and /v1/models:
 POST /v1/videos, GET /v1/videos, GET /v1/videos/{id},
 GET /v1/videos/{id}/content and DELETE /v1/videos/{id}. A language model's
 routes answer 404: a language model is served by an instance of its own.
+A job may start from an image: OpenAI's `input_reference`, a PNG or JPEG
+file of the multipart body, is the clip's first frame, and Splash's
+`last_frame`, another, its last; each is put on the canvas here
+(images.keyframe) and travels with the job's request to the engine.
 The engine process (runtime/video/VideoRuntime.hpp) runs one job at a time
 on the GPU, the others wait in a short queue in their order of arrival. A
 job's progress follows the engine's phases, its denoising step by step; its
@@ -31,12 +35,13 @@ import subprocess
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import parse_qs
 
 from install import assembly, models, video
 
+from . import images
 from . import protocol as wire
 from .diagnostics import print_status
 from .errors import APIError
@@ -56,7 +61,11 @@ FIELDS = {
     "steps",
     "preview",
     "audio",
+    "input_reference",
+    "last_frame",
 }
+# The image fields of a multipart body: the clip's first and last frames.
+KEYFRAMES = ("input_reference", "last_frame")
 # The jobs that may wait for the engine, and the bytes of finished jobs' mp4s
 # kept for download: the oldest finished job goes first.
 MAX_QUEUED_JOBS = 4
@@ -101,6 +110,9 @@ class VideoRequest:
     steps: int
     preview: bool
     audio: bool
+    # Its keyframes on the canvas, uint8 RGB, or empty.
+    first_frame: bytes = field(default=b"", repr=False)
+    last_frame: bytes = field(default=b"", repr=False)
 
 
 def _integer(fields, name, default, maximum):
@@ -121,11 +133,35 @@ def _boolean(fields, name, default):
     return value
 
 
+def _keyframes(fields):
+    """The request's first and last frames on the canvas, or empty: the
+    image bytes of input_reference and last_frame, the first stretched onto
+    the canvas and the last cropped to it, as MiniMax-H3's port does."""
+    width, height = (int(n) for n in SIZE.split("x"))
+    if "last_frame" in fields and "input_reference" not in fields:
+        raise APIError(400, "last_frame needs input_reference, the clip's first frame")
+    keyframes = []
+    for name in KEYFRAMES:
+        payload = fields.get(name)
+        if payload is None:
+            keyframes.append(b"")
+            continue
+        if not isinstance(payload, bytes):
+            raise APIError(
+                400, f"{name} must be an image file of a multipart/form-data body"
+            )
+        try:
+            stretch = name == "input_reference"
+            keyframes.append(images.keyframe(payload, width, height, stretch))
+        except images.ImageError as error:
+            raise APIError(400, f"{name}: {error}") from error
+    return keyframes
+
+
 def parse_request(fields, names):
-    """A POST /v1/videos body's fields (JSON, or form fields, all strings)
-    as a VideoRequest; `names` are the names the model answers to."""
-    if "input_reference" in fields:
-        raise APIError(400, "input_reference is not supported", "unsupported_parameter")
+    """A POST /v1/videos body's fields (JSON, or form fields, all strings but
+    the keyframes' image bytes) as a VideoRequest; `names` are the names the
+    model answers to."""
     if unknown := sorted(set(fields) - FIELDS):
         raise APIError(
             400, f"unsupported parameter: {unknown[0]}", "unsupported_parameter"
@@ -153,6 +189,7 @@ def parse_request(fields, names):
         _integer(fields, "steps", 0, 1000),
         _boolean(fields, "preview", False),
         _boolean(fields, "audio", True),
+        *_keyframes(fields),
     )
 
 
@@ -178,7 +215,8 @@ def clip(request, tokens):
         outputs |= wire.VideoOutputFlag.AUDIO
     width, height = (int(n) for n in SIZE.split("x"))
     return (VARIANTS[request.variant], outputs, CLIP_FRAMES[request.seconds], width,
-            height, request.steps, request.seed, tokens)  # fmt: skip
+            height, request.steps, request.seed, tokens, request.first_frame,
+            request.last_frame)  # fmt: skip
 
 
 def load(model_root, binary, startup_timeout):
@@ -197,8 +235,9 @@ def load(model_root, binary, startup_timeout):
 
 
 def form_fields(content_type, payload):
-    """The text fields of a multipart/form-data body, as OpenAI's SDK sends
-    a video's; a file field is refused."""
+    """The fields of a multipart/form-data body, as OpenAI's SDK sends a
+    video's: its text fields, and the keyframes' files as their bytes; any
+    other file field is refused."""
     message = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
         f"Content-Type: {content_type}\r\n\r\n".encode() + bytes(payload)
     )
@@ -207,11 +246,14 @@ def form_fields(content_type, payload):
     fields = {}
     for part in message.iter_parts():
         name = part.get_param("name", header="content-disposition")
-        if name is None or part.get_filename() is not None:
+        if name is None or (part.get_filename() is not None and name not in KEYFRAMES):
             raise APIError(
                 400, f"{name or 'a field'} is not supported", "unsupported_parameter"
             )
-        fields[name] = part.get_content().strip()
+        if name in KEYFRAMES:
+            fields[name] = part.get_payload(decode=True)
+        else:
+            fields[name] = part.get_content().strip()
     return fields
 
 
@@ -564,6 +606,8 @@ class VideoService:
             job.status = "failed" if error else "completed"
             job.error, job.phase = error, None
             job.completed_at = int(time.time())
+            # A finished job keeps its mp4s, not its keyframes.
+            job.request = replace(job.request, first_frame=b"", last_frame=b"")
             if output is not None:
                 job.video, job.progress = output.mp4, 100
                 job.phases["total"] = {"seconds": round(output.wall_micros / 1e6, 3)}
@@ -715,7 +759,7 @@ def handler(base):
                     "object": "model",
                     "created": 0,
                     "owned_by": "splash",
-                    "input_modalities": ["text"],
+                    "input_modalities": ["text", "image"],
                     "output_modalities": ["video", "audio"],
                 }
                 for name in self.app.names
@@ -765,16 +809,18 @@ def _stop(number, _frame):
 
 def main(argv=None):
     """One clip of the video model at MODEL_ROOT: what `splash generate`
-    starts, with the POST /v1/videos fields its flags give. Exits 0 once the
-    mp4 is written, 1 on a refusal or the engine's error, and 128 + the
-    signal's number on SIGINT or SIGTERM, which cancel the clip at its next
-    step."""
+    starts, with the POST /v1/videos fields its flags give, its first and
+    last frames read from image files. Exits 0 once the mp4 is written, 1 on
+    a refusal or the engine's error, and 128 + the signal's number on SIGINT
+    or SIGTERM, which cancel the clip at its next step."""
     parser = argparse.ArgumentParser(prog="python -m server.videos")
     parser.add_argument("model_root", type=Path)
     parser.add_argument("--model", required=True)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--request", type=json.loads, required=True)
+    parser.add_argument("--first-frame", type=Path)
+    parser.add_argument("--last-frame", type=Path)
     args = parser.parse_args(argv)
     for number in (signal.SIGINT, signal.SIGTERM):
         signal.signal(number, _stop)
@@ -782,7 +828,11 @@ def main(argv=None):
     try:
         # The launcher blocks both across its exec.
         signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
-        request = parse_request(args.request, (args.model,))
+        fields = dict(args.request)
+        for name, path in zip(KEYFRAMES, (args.first_frame, args.last_frame)):
+            if path is not None:
+                fields[name] = path.read_bytes()
+        request = parse_request(fields, (args.model,))
         if not args.out.parent.is_dir():
             raise APIError(400, f"{args.out.parent} is not a directory")
         # Nothing reads `held`: it keeps the assembly from collection until

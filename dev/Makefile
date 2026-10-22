@@ -131,16 +131,19 @@ test-release-real: preflight $(TARGET) agent-preflight verify-build-identity
 # VIDEO_CONVERTED, images converted before, which the tests prepare first;
 # and VIDEO_REFERENCES, the h3 engine's references (its H3_REFS: the golden
 # prompt's hidden states, latents and frames). VIDEO_SECONDS is the length of
-# the clip of the server's own text encoder.
+# the clip of the server's own text encoder. VIDEO_FIRST_FRAME_FINAL is the h3
+# engine's final.npz of the 3 s golden clip from golden frame 0 (DEVELOPMENT.md,
+# Video tests).
 VIDEO_MODEL ?= MiniMaxAI/MiniMax-H3
 VIDEO_ROOT ?= $(shell $(PYTHON) install/models.py --model "$(VIDEO_MODEL)" link)
 VIDEO_CONVERTED ?=
 VIDEO_REFERENCES ?= $(H3_REFS)
 VIDEO_SECONDS ?= 3
+VIDEO_FIRST_FRAME_FINAL ?= $(VIDEO_REFERENCES)/golden_i2v_3s/final.npz
 VIDEO_ARGS = --model "$(VIDEO_MODEL)" --references "$(VIDEO_REFERENCES)" \
 	$(if $(VIDEO_CONVERTED),--converted "$(VIDEO_CONVERTED)",--model-root "$(VIDEO_ROOT)")
 
-.PHONY: video-references test-video-real test-video-http-real
+.PHONY: video-references test-video-real test-video-http-real test-video-first-frame-real
 video-references:
 	@test -d "$(VIDEO_REFERENCES)" || { \
 		echo "error: set VIDEO_REFERENCES to the h3 engine's reference directory" >&2; \
@@ -154,6 +157,10 @@ test-video-real: install-development $(TARGET) video-references
 test-video-http-real: install-development $(TARGET) video-references
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/video_real.py http $(VIDEO_ARGS) \
 		--seconds "$(VIDEO_SECONDS)" --output build/release/video-http.json
+
+test-video-first-frame-real: install-development $(TARGET) video-references
+	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/video_real.py first-frame $(VIDEO_ARGS) \
+		--first-frame-final "$(VIDEO_FIRST_FRAME_FINAL)" --output build/release/video-first-frame.json
 
 # BASELINE is a checkout whose build/ holds another build's splash.metallib,
 # engine-tests/backend-benchmark and, for a build that loads the weights into

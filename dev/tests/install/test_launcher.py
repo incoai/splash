@@ -1084,7 +1084,8 @@ class LauncherTests(unittest.TestCase):
         ):
             launcher.main([
                 "generate", "--model", model, "--prompt", "a cat", "--out", "clip.mp4",
-                "--seconds", "15", "--preview", "--no-audio",
+                "--seconds", "15", "--preview", "--no-audio", "--first-frame", "first.png",
+                "--last-frame", "last.jpg",
             ])  # fmt: skip
         probe.assert_not_called()
         selection = install.call_args.args[0]
@@ -1092,6 +1093,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(execute.call_args.args[1][4:], [
             "server.videos", str(selection.link), "--model", model, "--binary",
             str(launcher.paths.BINARY), "--out", "clip.mp4", "--request", json.dumps(request),
+            "--first-frame", "first.png", "--last-frame", "last.jpg",
         ])  # fmt: skip
         with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
             launcher.parse_args(["generate", "--model", model])

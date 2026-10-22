@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 
-"""Real video-model tests (make test-video-real, test-video-http-real) on the
-h3 engine's references (--references, its H3_REFS), named and compared as
-its dev/tests/references.sh and smoke_golden.sh do.
+"""Real video-model tests (make test-video-real, test-video-http-real,
+test-video-first-frame-real) on the h3 engine's references (--references,
+its H3_REFS), named and compared as its dev/tests/references.sh and
+smoke_golden.sh do.
 
 engine: the engine, on GOLDEN_PROMPT_NPZ's hidden states, makes the 3 s
 golden clip, GOLDEN_FINAL and GOLDEN_FRAMES byte for byte; a clip cancelled
 at denoising step 2 ends there. http: the same clip through POST /v1/videos,
 a job deleted while it denoises, and a clip of --seconds from the server's
-own tokenizer and text encoder.
+own tokenizer and text encoder. first-frame: the 3 s golden clip from
+GOLDEN_FRAMES' first frame, a PNG sent as input_reference, makes the h3
+engine's latents of the same inputs (--first-frame-final) byte for byte.
 """
 
 import argparse
@@ -26,6 +29,7 @@ from pathlib import Path
 import httpx
 import numpy as np
 import openai
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -184,9 +188,30 @@ def run_http(arguments, scratch):
     return report
 
 
+def run_first_frame(arguments, scratch):
+    """The 3 s golden clip from the golden frames' first frame: its latents
+    are the h3 engine's of the same prompt, seed and first frame."""
+    first = scratch / "first.png"
+    frames = np.load(arguments.references / GOLDEN_FRAMES, mmap_mode="r")
+    Image.fromarray(frames[0]).save(first)
+    hidden, kept = arguments.references / GOLDEN_PROMPT_NPZ, scratch / "first-frame"
+    golden = ("--hidden-states", hidden, "--keep", kept)
+    with serving(arguments, scratch, *golden) as (client, _):
+        with first.open("rb") as image:
+            job = client.videos.create(
+                prompt=GOLDEN_PROMPT, seconds="3", input_reference=image
+            )
+        video = client.videos.poll(job.id, poll_interval_ms=2000)
+        require(video.status == "completed", f"the job failed: {video.error}")
+    final = arguments.first_frame_final
+    require(filecmp.cmp(kept / "1" / "final.npz", final, shallow=False),
+            f"the latents differ from {final}")  # fmt: skip
+    return {"first_frame_3s": {"identical": True, "phases": video.phases}}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("mode", choices=("engine", "http"))
+    parser.add_argument("mode", choices=("engine", "http", "first-frame"))
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--model-root", type=Path, help="a prepared MiniMax-H3")
     source.add_argument("--converted", type=Path, help="images converted before")
@@ -194,6 +219,8 @@ def main(argv=None):
     parser.add_argument("--binary", type=Path, default=ROOT / "build" / "splash")
     parser.add_argument("--references", type=Path, required=True)
     parser.add_argument("--seconds", type=int, choices=(3, 10, 15), default=3)
+    parser.add_argument("--first-frame-final", type=Path,
+                        help="the h3 engine's final.npz of the 3 s golden clip from golden frame 0")  # fmt: skip
     parser.add_argument("--output", type=Path)
     arguments = parser.parse_args(argv)
     try:
@@ -201,7 +228,11 @@ def main(argv=None):
             arguments.model_root = local.prepare_local_model(arguments.converted)
         record = assembly.verify(arguments.model_root)
         require(record["target_format"] == "h3-video", "the model is not MiniMax-H3")
-        run = run_engine if arguments.mode == "engine" else run_http
+        if arguments.mode == "first-frame":
+            require(arguments.first_frame_final and arguments.first_frame_final.is_file(),
+                    "first-frame takes --first-frame-final, the h3 engine's latents")  # fmt: skip
+        modes = {"engine": run_engine, "http": run_http, "first-frame": run_first_frame}
+        run = modes[arguments.mode]
         with tempfile.TemporaryDirectory(prefix="splash-video-") as scratch:
             report = run(arguments, Path(scratch))
     except (SmokeFailure, videos.VideoFailed) as error:

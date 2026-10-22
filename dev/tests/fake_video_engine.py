@@ -2,8 +2,10 @@
 tests: fake_video_engine.py LOG STEP_SECONDS [fail]. Each request denoises in
 four steps of STEP_SECONDS, unless a Cancel ends it, then sends its preview
 when asked and its clip, each the request's seed; with `fail`, the engine's
-error instead. LOG gets a JSON line per request and per cancel."""
+error instead. LOG gets a JSON line per request, with the SHA-256 of each
+keyframe it carries, and per cancel."""
 
+import hashlib
 import json
 import os
 import select
@@ -45,8 +47,11 @@ def main(log, step_seconds, fail):
             poll(None)
         request = pending.pop(0)
         number, seed = request.request_id, request.seed.to_bytes(8, "little")
+        keyframes = {name: hashlib.sha256(pixels).hexdigest()
+                     for name, pixels in (("first_frame", request.first_frame),
+                                          ("last_frame", request.last_frame)) if pixels}  # fmt: skip
         note(request=number, tokens=list(request.prompt_tokens), frames=request.frames,
-             outputs=int(request.outputs), seed=request.seed)  # fmt: skip
+             outputs=int(request.outputs), seed=request.seed, **keyframes)  # fmt: skip
         for step in range(5):
             if number in cancelled:
                 send(wire.ErrorEvent(wire.FailureClass.REQUEST_ERROR, number, False,

@@ -300,7 +300,8 @@ def generate(args):
         selection = model_artifacts.Selection.of(paths.MODELS, args.model)
         _ensure_installed(selection)
         # The flags as a POST /v1/videos body, which the program checks as
-        # the server checks one; an absent flag takes the route's default.
+        # the server checks one; an absent flag takes the route's default. It
+        # reads the keyframes' image files itself.
         fields = {
             "prompt": args.prompt,
             "seconds": args.seconds,
@@ -310,11 +311,16 @@ def generate(args):
             "audio": not args.no_audio,
         }
         request = {name: value for name, value in fields.items() if value is not None}
+        arguments = ["--out", str(args.out), "--request", json.dumps(request)]
+        for flag, path in (("--first-frame", args.first_frame),
+                           ("--last-frame", args.last_frame)):  # fmt: skip
+            if path is not None:
+                arguments += [flag, str(path)]
         _exec_server(
             "server.videos",
             selection,
             args.model,
-            ["--out", str(args.out), "--request", json.dumps(request)],
+            arguments,
             {},
             (installation,),
         )
@@ -516,6 +522,19 @@ def parse_args(argv=None):
     )
     generator.add_argument(
         "--no-audio", action="store_true", help="a clip without its audio track"
+    )
+    generator.add_argument(
+        "--first-frame",
+        type=Path,
+        metavar="IMAGE",
+        help="start the clip from this PNG or JPEG, stretched onto 1344x768",
+    )
+    generator.add_argument(
+        "--last-frame",
+        type=Path,
+        metavar="IMAGE",
+        help="end the clip on this PNG or JPEG, cropped to 1344x768 "
+        "(with --first-frame)",
     )
     for name in clients.INSTALL_URLS:
         client = commands.add_parser(

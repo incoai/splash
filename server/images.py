@@ -27,6 +27,8 @@ MAX_PIXELS = 4_194_304
 MAX_SOURCE_PIXELS = 32 * 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 IMAGE_FORMATS = ("JPEG", "PNG", "WEBP", "GIF")
+# A video model's keyframes.
+KEYFRAME_FORMATS = ("PNG", "JPEG")
 
 
 class ImageError(ValueError):
@@ -140,6 +142,40 @@ def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
     digest = hashlib.sha256(struct.pack("<II", grid_height, grid_width) + pixels)
     digest_lo, digest_hi = struct.unpack_from("<QQ", digest.digest())
     return PreparedImage(grid_height, grid_width, pixels, digest_lo, digest_hi)
+
+
+def keyframe(payload: bytes, width: int, height: int, stretch: bool) -> bytes:
+    """A video clip's keyframe on its canvas, uint8 RGB [height][width][3],
+    as MiniMax-H3's MLX port puts it there (prepare_keyframe_image): an image
+    of the canvas's size as it is; otherwise stretched onto the canvas (the
+    request's first keyframe), or scaled to cover it and centre-cropped (a
+    second one), LANCZOS. Its pixels are its stored RGB, alpha dropped and
+    EXIF orientation not applied, as the port reads an image."""
+    from PIL import Image
+
+    if len(payload) > MAX_IMAGE_BYTES:
+        raise ImageError("image exceeds the size limit")
+    try:
+        with Image.open(io.BytesIO(payload), formats=KEYFRAME_FORMATS) as decoded:
+            if decoded.height * decoded.width > MAX_SOURCE_PIXELS:
+                raise ImageError("source image exceeds the pixel limit")
+            image = decoded.convert("RGB")
+    except ImageError:
+        raise
+    except Exception as error:
+        raise ImageError("image could not be decoded as PNG or JPEG") from error
+    if image.size == (width, height):
+        return image.tobytes()
+    if stretch:
+        return image.resize((width, height), Image.Resampling.LANCZOS).tobytes()
+    scale = max(width / image.width, height / image.height)
+    size = (
+        max(width, round(image.width * scale)),
+        max(height, round(image.height * scale)),
+    )
+    left, top = max(0, (size[0] - width) // 2), max(0, (size[1] - height) // 2)
+    resized = image.resize(size, Image.Resampling.LANCZOS)
+    return resized.crop((left, top, left + width, top + height)).tobytes()
 
 
 class PreparedImages(list):

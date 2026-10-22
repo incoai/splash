@@ -2115,8 +2115,18 @@ handling; the video model has an engine process of its own
 `model`, `seconds` (`3`, `10` or `15`; 73, 243 or 362 frames at 24 fps) and
 `size` (`1344x768`), and Splash's `variant` (`turbo`, 8 steps, or `default`,
 50), `seed`, `steps` (0 for the variant's), `preview` (false) and `audio`
-(true); `input_reference` is refused. The video object has OpenAI's fields,
-and `phase`, `variant`, `seed`, `preview` (ready) and `phases`, each
+(true). A clip may start from an image: OpenAI's `input_reference`, a PNG or
+JPEG file field of the multipart form, is its first frame, and Splash's
+`last_frame`, another file field (with `input_reference`), its last
+(MiniMax-H3's FL2VA first-frame and first-and-last-frame conditioning). The
+server decodes each with Pillow and puts it on the 1344×768 canvas as the
+model's MLX port does (`images.keyframe`: an image of that size as it is,
+otherwise the first frame stretched and the last scaled to cover and
+centre-cropped, LANCZOS; stored RGB, alpha dropped, no EXIF rotation). A PNG
+decodes to the same pixels as in h3's native CLI (ImageIO); a JPEG may differ
+by the two decoders' rounding, Pillow's being the MLX port's. JSON bodies and
+`input_reference` objects (`image_url`, `file_id`) carry no image. The video
+object has OpenAI's fields, and `phase`, `variant`, `seed`, `preview` (ready) and `phases`, each
 completed phase's seconds and the engine's peak footprint. Errors have the
 OpenAI shape: `video_queue_full` (503) past four queued jobs,
 `video_not_ready` (409) for content not yet decoded, `not_found` and
@@ -2124,7 +2134,7 @@ OpenAI shape: `video_queue_full` (503) past four queued jobs,
 the mp4s and previews of finished jobs stay in a 4 GB store, the oldest
 evicted first.
 
-`splash generate --model MiniMaxAI/MiniMax-H3 --prompt ... --out clip.mp4` installs the model as `serve` does and runs one clip on its engine without a server (`python -m server.videos`): its flags are the `POST` fields, checked by the same `parse_request`; progress goes to stderr, `--preview` writes `clip.preview.mp4` once decoded, and Ctrl+C cancels at the next step.
+`splash generate --model MiniMaxAI/MiniMax-H3 --prompt ... --out clip.mp4` installs the model as `serve` does and runs one clip on its engine without a server (`python -m server.videos`): its flags are the `POST` fields, checked by the same `parse_request`, `--first-frame` and `--last-frame` the image files of `input_reference` and `last_frame`; progress goes to stderr, `--preview` writes `clip.preview.mp4` once decoded, and Ctrl+C cancels at the next step.
 
 ### Video installation
 
@@ -2140,13 +2150,19 @@ license text in the models directory's `.licenses.json`. The vendored
 converters then write the engine's images, about 100 GB, once into
 `.converted/<key>` of the models directory; the video VAE's needs MLX in
 Splash's environment and `H3_MLX_PORT` naming a checkout of
-[minimax-h3-mlx](https://github.com/PipeNetwork/minimax-h3-mlx). The
+[minimax-h3-mlx](https://github.com/PipeNetwork/minimax-h3-mlx). The video
+VAE's encoder, of a clip's first and last frames (`vae/vae_enc_f16.bin`,
+0.36 GB, `convert_vae.py --encoder`), joined the images after the others: an
+entry the converters converted before it, of the same commits, is cloned
+into the new entry and completed with the encoder's images alone, not
+converted again. The
 assembly links the images, FL2VA's transformer shards (whose adaLN bases
 each request reads), the tokenizer, the encoder's checkpoint and the license.
 
 `prepare_local_model` takes a directory of images converted before (as h3
-lays them out: `dit-turbo/`, `dit-default/`, `vae/`, `audio/`, `preview/`
-and `fl2va/`, a link to FL2VA), which prepares without converting, or the
+lays them out: `dit-turbo/`, `dit-default/`, `vae/` with the encoder's
+images, `audio/`, `preview/` and `fl2va/`, a link to FL2VA), which prepares
+without converting, or the
 `MiniMaxAI/MiniMax-H3` repository's layout, converted with the companions
 the Hugging Face cache holds; the encoder comes from the cache too.
 
@@ -2154,13 +2170,15 @@ the Hugging Face cache holds; the encoder comes from the cache too.
 
 The engine process of an h3-video assembly (`runtime/video/VideoRuntime.hpp`)
 speaks the native protocol and announces `FeatureVideo`. A `VideoRequest`
-(the clip's variant, frames, size, steps, seed, outputs and the prompt's
-token ids) runs every phase in this process, one request at a time:
+(the clip's variant, frames, size, steps, seed, outputs, the prompt's token
+ids and, for a clip from its first and last frames, their pixels on the
+canvas) runs every phase in this process, one request at a time:
 the text encoder, Qwen3-VL-32B through decoder layer 50, loaded for the
 request (`runtime/video/TextEncoder.hpp`); then, through the C ABI of
 Splash's copy of the h3 engine, on Splash's Metal backend and weight readers
 (`runtime/video/h3`, `runtime/video/VENDORED`), request
-preparation, the DiT streamed from SSD in 8 slots, the TAEH3 preview, the
+preparation (with the video VAE's encoder for the keyframes), the DiT
+streamed from SSD in 8 slots, the TAEH3 preview, the
 video VAE, the audio VAE and the mp4. `VideoProgress` reports each phase's
 start and end and each denoising step, `VideoOutput` delivers the preview
 and then the clip, which ends the request; a `Cancel` stops it at the next
@@ -2180,6 +2198,21 @@ golden one along the denoising (latents 27% relative RMS, frames 22.9 dB
 PSNR), as any change of its conditioning does, while the golden hidden states
 reproduce the golden clip byte for byte.
 
+A first frame, and a last frame, condition the clip as the model's FL2VA
+checkpoint does (h3's README, Keyframe conditioning): the video VAE's encoder
+turns each into 1,008 latent rows, noised to t = 0.999, which join the DiT's
+sequence after the text, stay fixed through the denoising (only the clip's
+rows step) and take a fourth adaLN slot per block. The text encoder sees the
+prompt alone: the reference presents each keyframe to Qwen3-VL as image
+tokens too, which this encoder, a language model without its vision tower,
+does not; on the 3 s golden clip h3 measured the image tokens moving the
+first frame from 38.2 to 38.3 dB PSNR against its keyframe, and the later
+frames' mean PSNR against the first from 15.4 to 15.9 dB: the latents carry
+the conditioning. Ref2VA (reference audio) is not served. A first frame adds
+the encoder's pass to the request preparation (2.0 s instead of 0.9 s) and
+its 1,008 rows to the DiT's: the 3 s golden clip denoised in 335 s instead of
+310 s.
+
 ### Video tests
 
 `make test-engine-metal` runs the encoder's attention kernels against a CPU
@@ -2192,6 +2225,7 @@ first:
 ```sh
 make test-video-real VIDEO_REFERENCES=... VIDEO_CONVERTED=...
 make test-video-http-real VIDEO_REFERENCES=... VIDEO_CONVERTED=... VIDEO_SECONDS=15
+make test-video-first-frame-real VIDEO_REFERENCES=... VIDEO_CONVERTED=... VIDEO_FIRST_FRAME_FINAL=...
 ```
 
 `test-video-real` drives the engine with the golden prompt's saved hidden
@@ -2199,7 +2233,13 @@ states (the engine's `--hidden-states`) and requires the 3 s golden clip's
 latents and frames (`--keep`) byte-identical to h3's references, as h3's
 own suite compares them, then cancels a clip. `test-video-http-real` does the
 same through `/v1/videos`, deletes a running job, then runs a clip of
-`VIDEO_SECONDS` from the server's tokenizer and the engine's encoder; the
+`VIDEO_SECONDS` from the server's tokenizer and the engine's encoder.
+`test-video-first-frame-real` sends the golden frames' first frame as a PNG
+`input_reference` with the golden prompt's hidden states and requires the 3 s
+clip's latents byte-identical to `VIDEO_FIRST_FRAME_FINAL` (default
+`VIDEO_REFERENCES/golden_i2v_3s/final.npz`), h3's of the same inputs:
+`build/h3 prep --hidden GOLDEN_PROMPT_NPZ --seconds 3 --first-frame frame0.png
+--out D/prep` then `build/h3 denoise --prep D/prep --out D --stream`. The
 reports, each clip's phases, go to `build/release/video-*.json`.
 
 ## Internals

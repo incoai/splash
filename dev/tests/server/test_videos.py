@@ -1,8 +1,10 @@
 """A video model's server (server/videos.py) over a stand-in engine
-(dev/tests/fake_video_engine.py): a job through OpenAI's SDK and the bounds of
-the jobs' queue and store, and the one clip `splash generate` runs."""
+(dev/tests/fake_video_engine.py): a job through OpenAI's SDK, one from its
+first and last frames, the bounds of the jobs' queue and store, and the one
+clip `splash generate` runs."""
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -15,7 +17,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import httpx
 import openai
+from PIL import Image
 
 from server import server as api
 from server import videos
@@ -23,6 +27,18 @@ from server import videos
 ENGINE = Path(__file__).resolve().parents[1] / "fake_video_engine.py"
 MODEL = "MiniMaxAI/MiniMax-H3"
 SEVEN = (7).to_bytes(8, "little")
+# A first frame of the canvas's size, which goes to the engine as it is.
+CANVAS = bytes(range(256)) * (1344 * 768 * 3 // 256)
+
+
+def png(width, height, pixels):
+    image = io.BytesIO()
+    Image.frombytes("RGB", (width, height), pixels).save(image, "PNG")
+    return image.getvalue()
+
+
+def digest(pixels):
+    return hashlib.sha256(pixels).hexdigest()
 
 
 def tokenize(text, add_special_tokens):
@@ -51,8 +67,9 @@ class VideoServerTest(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
+        self.url = f"http://127.0.0.1:{server.server_port}/v1"
         self.client = openai.OpenAI(
-            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            base_url=self.url,
             api_key="unused",
             max_retries=0,
         )
@@ -76,6 +93,42 @@ class VideoServerTest(unittest.TestCase):
         self.assertTrue(videos_api.delete(video.id).deleted)
         with self.assertRaises(openai.NotFoundError):
             videos_api.retrieve(video.id)
+
+    def test_a_job_starts_from_its_input_reference_and_ends_on_its_last_frame(self):
+        self.serve()
+        first = ("first.png", png(1344, 768, CANVAS), "image/png")
+        video = self.client.videos.create(prompt="a cat", input_reference=first)
+        self.assertEqual(
+            self.client.videos.poll(video.id, poll_interval_ms=20).status, "completed"
+        )
+        # A last frame of another shape is scaled to cover the canvas and cropped.
+        last = ("last.png", png(300, 100, bytes([10, 200, 30]) * 30000), "image/png")
+        both = httpx.post(f"{self.url}/videos", data={"prompt": "a cat"},
+                          files={"input_reference": first, "last_frame": last})  # fmt: skip
+        self.assertEqual(both.status_code, 200)
+        self.client.videos.poll(both.json()["id"], poll_interval_ms=20)
+        (one, two) = taken(self.log)
+        self.assertEqual(
+            (one["first_frame"], "last_frame" in one), (digest(CANVAS), False)
+        )
+        self.assertEqual((two["first_frame"], two["last_frame"]),
+                         (digest(CANVAS), digest(bytes([10, 200, 30]) * 1344 * 768)))  # fmt: skip
+
+    def test_keyframes_are_refused_unless_image_files_of_a_first_frame(self):
+        self.serve()
+        prompt = {"prompt": "a cat"}
+        image = ("frame.png", png(4, 2, bytes(24)), "image/png")
+        for body, refused in (
+            ({"data": prompt, "files": {"last_frame": image}}, "last_frame needs input_reference"),
+            ({"data": prompt, "files": {"input_reference": ("frame.png", b"no image", "image/png")}},
+             "input_reference: image could not be decoded"),
+            ({"json": prompt | {"input_reference": "frame.png"}}, "input_reference must be an image file"),
+        ):  # fmt: skip
+            with self.subTest(refused=refused):
+                answer = httpx.post(f"{self.url}/videos", **body)
+                self.assertEqual(answer.status_code, 400)
+                self.assertIn(refused, answer.json()["error"]["message"])
+        self.assertEqual(taken(self.log), [])
 
     def test_an_invalid_request_is_refused_in_openais_shape(self):
         self.serve()
@@ -114,7 +167,7 @@ class GenerateTest(unittest.TestCase):
         self.log = self.directory / "log"
         self.log.touch()
 
-    def generate(self, video=True, step_seconds=0.0, fail=False):
+    def generate(self, video=True, step_seconds=0.0, fail=False, keyframes=()):
         def load(*_):
             return engine(self.log, step_seconds, fail), tokenize
 
@@ -127,7 +180,7 @@ class GenerateTest(unittest.TestCase):
             status = videos.main([
                 str(self.directory), "--model", MODEL, "--binary", "splash",
                 "--out", str(self.directory / "clip.mp4"),
-                "--request", '{"prompt": "a cat", "seed": 7, "preview": true}',
+                "--request", '{"prompt": "a cat", "seed": 7, "preview": true}', *keyframes,
             ])  # fmt: skip
         return status, stderr.getvalue()
 
@@ -138,6 +191,13 @@ class GenerateTest(unittest.TestCase):
         preview = (self.directory / "clip.preview.mp4").read_bytes()
         self.assertEqual(preview, b"preview" + SEVEN)
         self.assertIn("Video · denoise · step 4/4", stderr)
+
+    def test_the_first_frame_is_read_from_its_file(self):
+        first = self.directory / "first.png"
+        first.write_bytes(png(1344, 768, CANVAS))
+        status, _ = self.generate(keyframes=("--first-frame", str(first)))
+        self.assertEqual(status, 0)
+        self.assertEqual(taken(self.log)[0]["first_frame"], digest(CANVAS))
 
     def test_a_language_model_is_refused(self):
         status, stderr = self.generate(video=False)
