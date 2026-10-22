@@ -1,0 +1,135 @@
+{
+  "scope": "real-checkpoint CUDA and native compatibility smoke; no consistent acceptance gain",
+  "training_source_commit": "d066629ff370d94e645bbdd6d32f73a4c8194838",
+  "native_diagnostics_commit": "b4006b12cdd7e0eff0b759b2f5f1aa9d53e93610",
+  "teacher": {
+    "repo": "Qwen/Qwen3.8-27B",
+    "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+  },
+  "initial_draft": {
+    "repo": "incoai/Qwen3.8-27B-DFlash2",
+    "revision": "015e795645c74b1a0eeef3b570031fb62e769bc5"
+  },
+  "native_target": {
+    "repo": "mlx-community/Qwen3.8-27B-4bit",
+    "revision": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818"
+  },
+  "hardware": {
+    "training": "NVIDIA A100-SXM4-80GB",
+    "native": "Apple M5 Pro"
+  },
+  "experiments": {
+    "baseline": {
+      "steps": 20,
+      "selected_checkpoint": "step-00000010",
+      "initial_validation_matching_proposals": 3.875,
+      "final_validation_matching_proposals": 3.875,
+      "training_peak_cuda_bytes": 11369331200,
+      "capture_peak_cuda_bytes": 55651344896,
+      "exact_native_export_hashes": true
+    },
+    "qat": {
+      "steps": 20,
+      "selected_checkpoint": "step-00000010",
+      "initial_validation_matching_proposals": 3.875,
+      "final_validation_matching_proposals": 3.875,
+      "training_peak_cuda_bytes": 12831249920,
+      "capture_peak_cuda_bytes": 55651344896,
+      "exact_native_export_hashes": true
+    },
+    "prefix": {
+      "steps": 20,
+      "selected_checkpoint": "step-00000010",
+      "initial_validation_matching_proposals": 3.875,
+      "final_validation_matching_proposals": 3.875,
+      "training_peak_cuda_bytes": 11369331200,
+      "capture_peak_cuda_bytes": 55651344896,
+      "exact_native_export_hashes": true
+    },
+    "recall": {
+      "steps": 20,
+      "selected_checkpoint": "step-00000010",
+      "initial_validation_matching_proposals": 3.875,
+      "final_validation_matching_proposals": 3.875,
+      "training_peak_cuda_bytes": 17411893760,
+      "capture_peak_cuda_bytes": 55651344896,
+      "exact_native_export_hashes": true
+    }
+  },
+  "full_draft_preflight": {
+    "mode": "device-preflight",
+    "recipe": {
+      "seed": 42,
+      "max_steps": 20,
+      "sequence_length": 2048,
+      "batch_size": 1,
+      "gradient_accumulation": 4,
+      "learning_rate": 1e-05,
+      "weight_decay": 0.01,
+      "max_grad_norm": 1.0,
+      "selector_loss_weight": 1.0,
+      "selector_warmup_steps": 10,
+      "prefix_loss_weight": 0.0,
+      "position_decay": 1.0,
+      "checkpoint_interval": 10,
+      "validation_interval": 10,
+      "max_new_tokens": 128,
+      "max_validation_blocks": 8,
+      "vocabulary_chunk_rows": 1,
+      "trainable": "all",
+      "recall_last_layers": 1,
+      "affine4_scope": "off"
+    },
+    "capture_peak_cuda_bytes": 55651344896,
+    "metrics": {
+      "unary_ce": 3.5363281794956754,
+      "selector_ce": 2.0711601802280972,
+      "prefix_survival_surrogate": 0.9757372140884399,
+      "tokens": 7,
+      "covered": 7,
+      "selector_correct": 5
+    },
+    "training_peak_cuda_bytes": 43708742144,
+    "capture_memory": null,
+    "training_memory": null
+  },
+  "native_probe_cycles": 540,
+  "native_mean_retained_tokens": {
+    "code": {
+      "released": 7.15625,
+      "baseline": 7.03125,
+      "qat": 7.03125,
+      "prefix": 7.03125,
+      "recall": 7.03125
+    },
+    "math": {
+      "released": 4.84375,
+      "baseline": 4.84375,
+      "qat": 4.84375,
+      "prefix": 4.84375,
+      "recall": 4.84375
+    },
+    "prose": {
+      "released": 2.5,
+      "baseline": 2.53125,
+      "qat": 2.53125,
+      "prefix": 2.53125,
+      "recall": 2.5
+    },
+    "json": {
+      "released": 7.166666666666667,
+      "baseline": 7.166666666666667,
+      "qat": 7.166666666666667,
+      "prefix": 7.166666666666667,
+      "recall": 7.166666666666667
+    }
+  },
+  "limitations": [
+    "tiny authored data, one seed, 20 steps",
+    "combined stack, not isolated PR heads",
+    "recall recipe combines QAT and objective changes",
+    "BF16 teacher differs from quantized native target",
+    "one prompt per native domain; cycles are correlated",
+    "no sampled decoding, long-context quality or serving throughput study"
+  ]
+}

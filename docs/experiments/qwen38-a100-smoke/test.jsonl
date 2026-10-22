@@ -1,0 +1,4 @@
+{"source_id": "runpod-dflash-smoke-test-0", "messages": [{"role": "user", "content": "Implement binary search in Python and show how it handles an absent key."}]}
+{"source_id": "runpod-dflash-smoke-test-1", "messages": [{"role": "user", "content": "Explain why the sum of two consecutive integers is odd."}]}
+{"source_id": "runpod-dflash-smoke-test-2", "messages": [{"role": "user", "content": "Give a practical five-step plan for making a shared office quieter."}]}
+{"source_id": "runpod-dflash-smoke-test-3", "messages": [{"role": "user", "content": "Return a JSON object containing a three-item shopping list with item names and integer quantities."}]}

@@ -1,0 +1,17 @@
+seed: 42
+max_steps: 20
+sequence_length: 2048
+batch_size: 1
+gradient_accumulation: 4
+learning_rate: 0.00001
+weight_decay: 0.01
+max_grad_norm: 1.0
+selector_loss_weight: 1.0
+selector_warmup_steps: 10
+checkpoint_interval: 10
+validation_interval: 10
+max_new_tokens: 128
+max_validation_blocks: 8
+vocabulary_chunk_rows: 1
+trainable: selector
+affine4_scope: selector_context

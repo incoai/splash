@@ -1,0 +1,4 @@
+{"source_id": "runpod-dflash-smoke-validation-0", "messages": [{"role": "user", "content": "Write a Python function to merge two sorted integer lists, with an example and complexity analysis."}]}
+{"source_id": "runpod-dflash-smoke-validation-1", "messages": [{"role": "user", "content": "Prove that the product of two odd integers is odd, showing the algebra."}]}
+{"source_id": "runpod-dflash-smoke-validation-2", "messages": [{"role": "user", "content": "Describe a weekly maintenance plan for a small public garden."}]}
+{"source_id": "runpod-dflash-smoke-validation-3", "messages": [{"role": "user", "content": "Return JSON describing two meeting rooms with their names, integer capacities and boolean availability."}]}

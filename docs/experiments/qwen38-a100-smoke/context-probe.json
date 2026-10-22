@@ -1,0 +1,6 @@
+{
+  "prompt_tokens": 1895,
+  "max_new_tokens": 128,
+  "maximum_combined_tokens": 2023,
+  "purpose": "near-2K real-teacher capture and draft optimizer memory probe; no quality benchmark"
+}

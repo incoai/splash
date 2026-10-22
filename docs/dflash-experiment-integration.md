@@ -42,3 +42,9 @@ The native context probe's combined Metal API+shader validation assertion was
 also reproduced on its unchanged baseline; shader-validation-only capture and
 the ordinary native matrix passed. That pre-existing validation-mode limitation
 is recorded in #556's artifacts, not described as a passing check.
+
+Real-checkpoint CUDA qualification on one A100 80GB is recorded in the
+[Qwen3.8 smoke results](experiments/qwen38-a100-smoke/README.md). Four recipes
+completed 20 steps each, and a separate full-draft optimizer preflight passed.
+Validation acceptance stayed unchanged on the tiny smoke split; implementation
+success does not establish a trained-model or serving improvement.
