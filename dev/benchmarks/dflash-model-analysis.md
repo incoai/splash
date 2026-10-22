@@ -206,6 +206,13 @@ Use three explicit stages:
    behavior matched to the selected target quantization. Keep a separate
    BF16-draft control in the trainer to measure how much rounding costs.
 
+For frozen-selector adaptation, [#543](https://github.com/incoai/splash/issues/543)
+also proposes exporting native draft final hidden rows, natural candidates
+and correct-prefix labels. Training on that frozen cache can avoid loading
+the BF16 teacher and draft backbone on the training device. It needs a new
+feature-export schema beyond the score-only captures here, and does not
+replace joint backbone training or native evaluation of the trained export.
+
 Try scalar unary/edge scale calibration before adding capacity; the current
 score is `unary + edge` with no configurable learned scale at inference. A
 checkpoint-compatible edge scale can be folded into one trained codebook.

@@ -14,15 +14,95 @@
   },
   "aggregate_check": {
     "command": "make -j6 check",
-    "status": "running",
-    "log": "/tmp/splash-dflash-pr-check.log"
+    "status": "passed",
+    "exit_code": 0,
+    "local_log": "/tmp/splash-dflash-pr-check.log",
+    "log_sha256": "c3b3c0a23a6ea00c5b3d57fb71f6e6906c2469ad0857847054c0af617650ff0c",
+    "scope": "Full CPU, shader-validated Metal and native-build suites, Python suite, compileall, Ruff and architecture/source checks. Final capture CLI guards and final 20 replay tests were qualified separately after their additions."
   },
   "final_tool_smokes": {
     "dense_width4_cycles": 8,
     "moe_width1_cycles": 8,
     "normal_dispatch_profile": "pass",
-    "capture_replay": "pass"
+    "capture_replay": "pass",
+    "terminal_capture": "one cycle; terminal correction and unavailable suffix censored"
   },
   "speedup_claim": false,
-  "training_performed": false
+  "training_performed": false,
+  "cli_validation": [
+    {
+      "arguments": [
+        "--draft-dump",
+        "build/invalid.jsonl",
+        "--width",
+        "5"
+      ],
+      "expected_error": "--width takes 1..4",
+      "passed": true
+    },
+    {
+      "arguments": [
+        "--draft-dump",
+        "build/invalid.jsonl",
+        "--presence-penalty",
+        "nan"
+      ],
+      "expected_error": "--presence-penalty takes a finite number",
+      "passed": true
+    },
+    {
+      "arguments": [
+        "--width",
+        "2"
+      ],
+      "expected_error": "capture options require --draft-dump",
+      "passed": true
+    },
+    {
+      "arguments": [
+        "--draft-dump",
+        "build/invalid.jsonl",
+        "--prompt-file",
+        "/tmp/splash-dflash-invalid.u32"
+      ],
+      "expected_error": "--prompt-file must contain uint32 token ids",
+      "passed": true
+    },
+    {
+      "arguments": [
+        "--draft-dump",
+        "build/invalid.jsonl",
+        "--cycles",
+        "1000001"
+      ],
+      "expected_error": "--cycles exceeds 1000000",
+      "passed": true
+    },
+    {
+      "arguments": [
+        "--draft-dump",
+        "build/invalid.jsonl",
+        "--cycles",
+        "40000"
+      ],
+      "expected_error": "capture prompt and output budget exceed the model context",
+      "passed": true
+    }
+  ],
+  "production_runtime_preprocessing": {
+    "base_commit": "1482f6bbc2abf12375332725302019594150b6cb",
+    "command": "xcrun -sdk macosx clang++ -std=c++20 -Iruntime -E -P Runtime.cpp",
+    "matches": true,
+    "sha256": "11c4aac9285dae98a7f4db0f053072bfe83ac57beb99d77b3ed31c1130a77f38"
+  },
+  "related_issues": {
+    "542": "https://github.com/incoai/splash/issues/542",
+    "543": "https://github.com/incoai/splash/issues/543",
+    "544": "https://github.com/incoai/splash/issues/544",
+    "545": "https://github.com/incoai/splash/issues/545",
+    "546": "https://github.com/incoai/splash/issues/546",
+    "547": "https://github.com/incoai/splash/issues/547",
+    "548": "https://github.com/incoai/splash/issues/548"
+  },
+  "pull_request": "https://github.com/incoai/splash/pull/550"
 }
