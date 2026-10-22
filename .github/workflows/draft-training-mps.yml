@@ -45,4 +45,4 @@ jobs:
           }, indent=2))
           PY
       - name: Run actual MPS capture, training, resume, export, and evaluation
-        run: python -m unittest dev.tests.training.test_mps -v
+        run: python -m unittest discover -s dev/tests/training -t . -v
