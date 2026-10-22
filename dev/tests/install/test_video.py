@@ -23,6 +23,7 @@ SOURCES = {
     video.TARGET: {"LICENSE": LICENSE, "FL2VA/model_index.json": "{}",
                    "FL2VA/transformer/model.safetensors.index.json": '{"weight_map": {"a": "t"}}',
                    "FL2VA/transformer/t": "", "FL2VA/video_vae/source/model.safetensors": "",
+                   "FL2VA/video_vae/source/config.json": "{}",
                    "FL2VA/video_vae/minimax_h3_video_vae.py": "",
                    "FL2VA/audio_vae/config.json": "{}", "FL2VA/audio_vae/model.safetensors": "",
                    "FL2VA/tokenizer/tokenizer.json": "{}"},
@@ -111,6 +112,32 @@ class VideoModelTest(unittest.TestCase):
         served = link.resolve()
         self.install()
         self.assertEqual((link.resolve(), len(self.conversions)), (served, 1))
+
+    def test_images_converted_before_the_encoder_are_completed_with_its_alone(self):
+        self.hub()
+        commits = {
+            name: COMMITS[name] for name in (video.TARGET, video.VDN, video.PREVIEW)
+        }
+        identity = {"converters": video.ENCODERLESS_CONVERTERS, "commits": commits}
+        before = images(video._entry(self.models, identity))
+        for name in ("manifest_enc.json", "vae_enc_f16.bin"):
+            (before / "vae" / name).unlink()
+        (before / "model.json").write_bytes(models.json_bytes(identity))
+        encoders = []
+
+        def convert_encoder(staging, fl2va):
+            encoders.append(fl2va)
+            for name in ("manifest_enc.json", "vae_enc_f16.bin"):
+                (staging / "vae" / name).write_text("")
+
+        with mock.patch("install.video._convert_encoder", convert_encoder):
+            link, _ = self.install()
+        record = assembly.verify(link, full=True)
+        self.assertEqual((len(self.conversions), len(encoders)), (0, 1))
+        linked = Path(record["files"]["weights/vae/vae_enc_f16.bin"]["path"])
+        self.assertEqual(Path(record["files"]["weights/dit-turbo/x"]["path"]).parents[1],
+                         linked.parents[1])  # fmt: skip
+        self.assertNotEqual(linked.parents[1], before)
 
     def test_the_license_is_refused_unacknowledged_and_recorded_once_acknowledged(self):
         fake = self.hub()

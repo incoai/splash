@@ -10,7 +10,8 @@ the VAEs and TAEH3 into the engine's images once, into .converted/<key>
 under the models root, keyed by the converters and the commits converted
 (written into .converting/<key> first, outside the installation lock, and
 published by one rename); assemblies link them as they link a GGUF's
-derived metadata. A local
+derived metadata. Images the converters converted before the video VAE's
+encoder joined them are completed with the encoder's alone. A local
 directory of images converted before (dit-turbo/, dit-default/, vae/,
 audio/, preview/ and fl2va/, as h3 converts them) prepares without
 converting.
@@ -60,15 +61,27 @@ VARIANTS = {
     "default": ("stage-b-step-2000", False),
 }
 # The image directories the engine reads, and the files of each it reads
-# (None: all of them); the video VAE's are the W8 ones the engine runs.
+# (None: all of them); the video VAE's are the W8 decoder the engine runs and
+# the encoder of a clip's first and last frames.
 IMAGES = {
     "dit-turbo": None,
     "dit-default": None,
-    "vae": ("manifest_w8.json", "vae_dec_w8.bin"),
+    "vae": (
+        "manifest_w8.json",
+        "vae_dec_w8.bin",
+        "manifest_enc.json",
+        "vae_enc_f16.bin",
+    ),
     "audio": None,
     "preview": None,
 }
 CONVERTERS = paths.ROOT / "install" / "video"
+# converters_identity() before the video VAE's encoder joined the converters
+# (h3 5b55ab7): an entry they converted holds every image but the encoder's,
+# and the same commits' entry starts from it (_complete).
+ENCODERLESS_CONVERTERS = (
+    "cab145e7ae06aa29dc0f4a6619cfbb643cca48529a487cf0ff37b55d2c29f6c5"
+)
 LICENSE_NAME = "MiniMax H3 Community License Agreement"
 # The value of SPLASH_ACCEPT_LICENSE that acknowledges the license without a
 # prompt, for an installation with no terminal to ask on.
@@ -187,6 +200,7 @@ def _target_files(repo):
         "LICENSE",
         "FL2VA/transformer/model.safetensors.index.json",
         "FL2VA/video_vae/source/model.safetensors",
+        "FL2VA/video_vae/source/config.json",
         "FL2VA/audio_vae/config.json",
         "FL2VA/audio_vae/model.safetensors",
         *shards,
@@ -288,13 +302,17 @@ def converted(models_root: Path, fl2va: Path, vdn: Path, taeh3: Path, commits):
     links it. A conversion writes about 100 GB, holding no installation
     lock."""
     identity = {"converters": converters_identity(), "commits": commits}
-    entry = (
+    entry = _entry(models_root, identity)
+    with _held(entry) or _convert(entry, identity, fl2va, vdn, taeh3):
+        yield entry, identity
+
+
+def _entry(models_root: Path, identity):
+    return (
         models_root
         / ".converted"
         / hashlib.sha256(models.json_bytes(identity)).hexdigest()
     )
-    with _held(entry) or _convert(entry, identity, fl2va, vdn, taeh3):
-        yield entry, identity
 
 
 def _held(entry: Path):
@@ -315,8 +333,11 @@ def _convert(entry: Path, identity, fl2va: Path, vdn: Path, taeh3: Path):
     """Converts the images into .converting/<key>, one conversion of an
     entry at a time, and publishes them as entry by one rename with their
     record held, which it returns; a conversion that was interrupted left
-    its staging, which is removed."""
-    _require_converter_environment()
+    its staging, which is removed. The same commits' images without the
+    encoder's, when there, are completed instead (_complete)."""
+    encoderless = _entry(
+        entry.parents[1], identity | {"converters": ENCODERLESS_CONVERTERS}
+    )
     converting = entry.parents[1] / ".converting"
     converting.mkdir(parents=True, exist_ok=True)
     entry.parent.mkdir(exist_ok=True)
@@ -328,7 +349,12 @@ def _convert(entry: Path, identity, fl2va: Path, vdn: Path, taeh3: Path):
         shutil.rmtree(staging, ignore_errors=True)
         staging.mkdir()
         try:
-            _convert_into(staging, fl2va, vdn, taeh3)
+            if held := _held(encoderless):
+                with held:
+                    _complete(staging, encoderless, fl2va)
+            else:
+                _require_converter_environment()
+                _convert_into(staging, fl2va, vdn, taeh3)
             _write(staging / "model.json", models.json_bytes(identity))
             record = _held(staging)
             os.rename(staging, entry)
@@ -366,6 +392,7 @@ def _convert_into(staging: Path, fl2va: Path, vdn: Path, taeh3: Path):
         )
     _run(["convert_vae.py", "--src", str(fl2va / "video_vae"), "--out",
           str(staging / "vae"), "--tag", "w8", "--i8", "qkv,o,1,2"], environment)  # fmt: skip
+    _convert_encoder(staging, fl2va)
     _run(
         ["convert_audio.py", str(fl2va / "audio_vae"), str(staging / "audio")],
         environment,
@@ -374,6 +401,29 @@ def _convert_into(staging: Path, fl2va: Path, vdn: Path, taeh3: Path):
     for link in ("vdn", "fl2va"):
         (staging / link).unlink()
     shutil.rmtree(cache)
+
+
+def _convert_encoder(staging: Path, fl2va: Path):
+    """The video VAE encoder's images, of a clip's first and last frames."""
+    _run(["convert_vae.py", "--src", str(fl2va / "video_vae"), "--out", str(staging / "vae"),
+          "--encoder"], dict(os.environ, PYTHONPATH=str(CONVERTERS)))  # fmt: skip
+
+
+def _complete(staging: Path, encoderless: Path, fl2va: Path):
+    """The images of an entry the converters converted before the video
+    VAE's encoder joined them, cloned into staging (APFS copies on write: no
+    bytes are copied, and the clones outlive that entry's collection), and
+    the encoder's."""
+
+    def clone(source, destination):
+        subprocess.run(["/bin/cp", "-c", source, destination], check=True)
+
+    def record(directory, _names):
+        return ["model.json"] if Path(directory) == encoderless else []
+
+    shutil.copytree(encoderless, staging, copy_function=clone, dirs_exist_ok=True,
+                    ignore=record)  # fmt: skip
+    _convert_encoder(staging, fl2va)
 
 
 def _files_of(directory: Path):

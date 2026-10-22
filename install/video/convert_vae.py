@@ -1,7 +1,14 @@
-"""MiniMax-H3 video VAE decoder (FL2VA/video_vae/source/model.safetensors, fp32) -> the engine's weights (<weights>/vae).
+"""MiniMax-H3 video VAE (FL2VA/video_vae/source/model.safetensors, fp32) -> the engine's weights (<weights>/vae).
 
   convert_vae.py --src <FL2VA/video_vae dir> --out weights/vae --tag w8 --i8 qkv,o,1,2     (shipping, W8A8)
   convert_vae.py --src <FL2VA/video_vae dir> --out weights/vae --tag f16                   (all linears fp16)
+  convert_vae.py --src <FL2VA/video_vae dir> --out weights/vae --encoder                   (encoder, FL2VA keyframes)
+
+Encoder (--encoder): vae_enc_f16.bin + manifest_enc.json. The causal 3D CNN encoder (conv_in, 6 down levels of
+2 ResnetBlock3d + Downsample3d, norm_out, conv_out) and quant_conv. Every 3D convolution: fp16 weight
+[kd][kh][kw][cout_pad][cin_pad] (torch [cout][cin][kd][kh][kw] transposed; conv_in's 3 input channels zero-padded to
+32, conv_out's 48 output channels zero-padded to 64) + fp32 bias [cout_pad]; TIsolatedGroupNorm weight / bias fp32;
+quant_conv fp32 [48][48] + bias. manifest: per tensor name its byte offset and shape fields.
 
 One flat little-endian binary per variant (vae_dec_<tag>.bin) + manifest_<tag>.json (byte offsets; every
 tensor 256-byte aligned). Decoder tensors only (post_quant_conv is folded into x_embedder in fp64).
@@ -97,14 +104,74 @@ def rope_tables():
     return np.array(c[0, :, 0]).astype(np.float32), np.array(s[0, :, 0]).astype(np.float32)
 
 
+ENC_CH = (128, 256, 256, 512, 512, 1024)
+ENC_SPACE_DOWN = (2, 2, 2, 2, 1, 1)
+ENC_TIME_DOWN = (1, 2, 2, 1, 1, 1)
+
+
+def convert_encoder(src: Path, out: Path):
+    """Encoder + quant_conv -> vae_enc_f16.bin / manifest_enc.json (layout in the module docstring)."""
+    st = ST(src / "source" / "model.safetensors")
+    cfg = json.load(open(src / "source" / "config.json"))
+    assert tuple(cfg["ch"] * m for m in cfg["ch_mult"]) == ENC_CH and cfg["num_res_blocks"] == 2, cfg
+    assert tuple(cfg["space_down"]) == ENC_SPACE_DOWN and tuple(cfg["time_down"]) == ENC_TIME_DOWN, cfg
+    blob = Blob(out / "vae_enc_f16.bin")
+    man = {"convs": {}, "norms": {}, "src": str((src / "source" / "model.safetensors").resolve())}
+    t0 = time.time()
+
+    def conv(name, cin_pad=None, cout_pad=None):
+        w, b = st.get(f"encoder.{name}.weight" if name != "quant_conv" else "quant_conv.weight"), \
+            st.get(f"encoder.{name}.bias" if name != "quant_conv" else "quant_conv.bias")
+        cout, cin, kd, kh, kw = w.shape
+        cp, op = cin_pad or cin, cout_pad or cout
+        wt = np.zeros((kd, kh, kw, op, cp), np.float32)
+        wt[:, :, :, :cout, :cin] = w.transpose(2, 3, 4, 0, 1)
+        bt = np.zeros(op, np.float32)
+        bt[:cout] = b
+        man["convs"][name] = {"w": blob.put(f16(wt, name)), "b": blob.put(bt), "cin": cin, "cin_pad": cp,
+                              "cout": cout, "cout_pad": op, "kd": kd, "k": kh}
+
+    def norm(name):
+        man["norms"][name] = {"w": blob.put(st.get(f"encoder.{name}.weight")),
+                              "b": blob.put(st.get(f"encoder.{name}.bias")), "c": int(st.get(f"encoder.{name}.weight").shape[0])}
+
+    conv("conv_in", cin_pad=32)
+    for i in range(len(ENC_CH)):
+        for j in range(2):
+            p = f"down.{i}.block.{j}"
+            norm(p + ".norm1")
+            conv(p + ".conv1")
+            norm(p + ".norm2")
+            conv(p + ".conv2")
+            if f"encoder.{p}.nin_shortcut.weight" in st.h:
+                conv(p + ".nin_shortcut")
+        if ENC_SPACE_DOWN[i] * ENC_TIME_DOWN[i] > 1:
+            conv(f"down.{i}.downsample.conv")
+    norm("norm_out")
+    conv("conv_out", cout_pad=64)
+    qw = st.get("quant_conv.weight").reshape(48, 48)
+    man["quant_conv"] = {"w": blob.put(qw.astype(np.float32)), "b": blob.put(st.get("quant_conv.bias"))}
+    man["bytes"] = blob.off
+    blob.f.close()
+    json.dump(man, open(out / "manifest_enc.json", "w"), indent=1)
+    print("CONVERT_OK encoder", len(man["convs"]), "convs", len(man["norms"]), "norms", blob.off / 1e9, "GB",
+          f"{time.time() - t0:.0f}s")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--tag", required=True, help="output name: vae_dec_<tag>.bin / manifest_<tag>.json")
+    ap.add_argument("--tag", help="output name: vae_dec_<tag>.bin / manifest_<tag>.json")
     ap.add_argument("--i8", default="", help="comma list of linears stored W8 (Hadamard + int8): qkv,o,1,2; "
                     "empty = all fp16")
+    ap.add_argument("--encoder", action="store_true", help="convert the encoder (vae_enc_f16.bin) instead")
     a = ap.parse_args()
+    if a.encoder:
+        Path(a.out).mkdir(parents=True, exist_ok=True)
+        return convert_encoder(Path(a.src), Path(a.out))
+    if not a.tag:
+        ap.error("--tag is required for the decoder")
     st = ST(Path(a.src) / "source" / "model.safetensors")
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
