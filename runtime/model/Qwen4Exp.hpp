@@ -18,7 +18,6 @@
 //    which gate a value added to every stream through a dilated convolution.
 // Its weights load from a GGUF only.
 
-#include "ControlVector.hpp"
 #include "QwenHybridLayout.hpp"
 #include "QwenTarget.hpp"
 #include "QwenTargetFiles.hpp"
@@ -176,9 +175,6 @@ struct Qwen4ExpWeights final : QwenTargetWeightsBase {
   ops::EmbeddingWeights pleTable;
   uint32_t pleFormat = 0;
   Qwen4PleHash pleHash;
-  // The control vector on its hyper-connection streams (--control-vector), if
-  // any.
-  std::optional<ControlVector> controlVector;
 };
 
 [[nodiscard]] Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend, Qwen4ExpLayout layout,

@@ -10,6 +10,8 @@
 #include <string>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace splash::model {
@@ -76,16 +78,25 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   result.descriptor = descriptor;
   if (!result.descriptor.valid())
     throw std::invalid_argument("model descriptor is invalid");
-  // A control vector's file is read before any weight: Qwen3.8-Flash-Next's
-  // forward pass applies one, no other family's does.
+  // A control vector's file is read before any weight: the forward pass of
+  // Qwen3.8-Flash-Next (its hyper-connection streams) and of both Qwen3.5
+  // families (the residual) applies one, no other family's does.
   std::optional<ControlVectorTable> steering;
   if (options.controlVector) {
-    const auto *layout = std::get_if<Qwen4ExpLayout>(&result.descriptor.target);
-    if (!layout)
-      throw std::invalid_argument("--control-vector steers " + std::string(Qwen4ExpLayout::family) +
-                                  " only, not " + result.descriptor.name);
-    steering = readControlVector(options.controlVector, Qwen4ExpLayout::ggufArchitecture, layout->layers,
-                                 layout->hiddenSize);
+    const auto architecture = std::visit(
+        [&](const auto &layout) -> std::pair<std::string_view, std::pair<uint32_t, uint32_t>> {
+          using Layout = std::decay_t<decltype(layout)>;
+          if constexpr (std::is_same_v<Layout, Qwen4ExpLayout> || std::is_same_v<Layout, Qwen3_8Layout> ||
+                        std::is_same_v<Layout, Qwen3_6MoeLayout>)
+            return {Layout::ggufArchitecture, std::pair{layout.layers, layout.hiddenSize}};
+          throw std::invalid_argument("--control-vector steers " + std::string(Qwen4ExpLayout::family) + ", " +
+                                      std::string(Qwen3_8Layout::family) + " and " +
+                                      std::string(Qwen3_6MoeLayout::family) + " only, not " +
+                                      result.descriptor.name);
+        },
+        result.descriptor.target);
+    steering = readControlVector(options.controlVector, architecture.first, architecture.second.first,
+                                 architecture.second.second);
   }
   result.images = std::make_shared<WeightImages>(backend, result.descriptor.sourceIdentity);
   WeightImages &images = *result.images;
@@ -118,11 +129,18 @@ LoadedModel loadModel(metal::MetalBackend &backend,
       },
       result.descriptor.target);
   if (steering) {
-    // Its directions are the target's: its allocation counts with theirs.
-    Qwen4ExpWeights &target = std::get<Qwen4ExpWeights>(result.target);
-    const uint64_t before = backend.memoryStats().allocatedBytes;
-    target.controlVector = loadControlVector(backend, *steering);
-    target.actualAllocatedBytes += metal::allocationDelta(before, backend.memoryStats().allocatedBytes);
+    // Its directions are the target's: its allocation counts with theirs. A
+    // Prism-rotated target's residual is not the vector's space.
+    std::visit(
+        [&](auto &target) {
+          if (target.inputsRotated)
+            throw std::invalid_argument("--control-vector cannot steer " + result.descriptor.name +
+                                        ": its GGUF's inputs are Prism-rotated");
+          const uint64_t before = backend.memoryStats().allocatedBytes;
+          target.controlVector = loadControlVector(backend, *steering);
+          target.actualAllocatedBytes += metal::allocationDelta(before, backend.memoryStats().allocatedBytes);
+        },
+        result.target);
   }
   result.draft = loadDFlashDraftWeights(backend, draft, result.descriptor.draft);
   result.vision = loadVisionWeights(backend, images, vision.get());
