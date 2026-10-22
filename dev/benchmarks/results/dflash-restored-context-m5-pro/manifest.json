@@ -1,0 +1,384 @@
+{
+  "schema": 1,
+  "scope": "native matched-prefix state/ring restore mechanics; four cycles per case, not a serving benchmark",
+  "capture_base_commit": "ef0e95d4fa09f265f1cb071d43591ff32367b372",
+  "device": "Apple M5 Pro",
+  "memory_gib": 48,
+  "macos": "26.6",
+  "python": "3.14.8",
+  "production_runtime_preprocessed_sha256": "11c4aac9285dae98a7f4db0f053072bfe83ac57beb99d77b3ed31c1130a77f38",
+  "source_identity": "base commit plus capture-native-source.patch.gz; analyzer is this PR",
+  "files": {
+    "capture-native-source.patch.gz": "abb583709ef2672d40666772dac71c1a14f37a8754c1a279f14377700fc52540",
+    "dense-2112-int8-fresh.jsonl.gz": "557ae7bcc5f770a63ba17cabf646c4401e1fb15e384d03f51aef4dfe849d97b8",
+    "dense-2112-int8-restored.jsonl.gz": "113c51e436eece2a5c1ebda51855d73c86c0e10829a8efa719f3e1c881a6092d",
+    "dense-2112-int8.prompt.json": "c598559ff061f6a33b6144d1a2ed119cbd91c09d2581711bdb01e063eb030866",
+    "dense-2112-int8.report.json": "2ab554ec883aa4c9b9fe923da50db66922c1a4b95a235df99dd6739fdea600f0",
+    "dense-2112-int8.u32": "7a567a4f0fbfbe12e503a9d555b9d7bbf94fc7fe5040fe6171c05a808bb0c537",
+    "dense-8256-bf16-fresh.jsonl.gz": "5526f32c4aa76ebaa78f6ebbe6d7f8103a3b9be9312cbe14ead05fd950a01196",
+    "dense-8256-bf16-restored.jsonl.gz": "31ba28086606da434462bd661d6927da16ea88490fd6d52b17ae86c593f031d8",
+    "dense-8256-bf16.prompt.json": "63d59bfb0ca8ecdd7f518edbc902f44512e9bc499362f7a93cae800276522736",
+    "dense-8256-bf16.report.json": "092ab75623154b1f2f86a576e2d0d47bdcb8fdcb0613befd3c7cbdf9ad790c69",
+    "dense-8256-bf16.u32": "0d83313212e62ba589bd1709e4008f4ff0cb8a420049718113c57acd19b0b87b",
+    "moe-2112-bf16-auto-frozen-fresh.jsonl.gz": "db33c4adffa28e72af64d305e38b093dff614bf5a92545742704c0d3e71b29fe",
+    "moe-2112-bf16-auto-frozen-restored.jsonl.gz": "134547eea1fa9a6d50c909b1b57e603c914d41fc0f151dcdcd691b0ead657b34",
+    "moe-2112-bf16-auto-frozen.prompt.json": "c598559ff061f6a33b6144d1a2ed119cbd91c09d2581711bdb01e063eb030866",
+    "moe-2112-bf16-auto-frozen.report.json": "bc8f2d974b3413941cb383060ccba1b1c8a7bbc601a8f1b8e0fbddca781d82f9",
+    "moe-2112-bf16-auto-frozen.u32": "7a567a4f0fbfbe12e503a9d555b9d7bbf94fc7fe5040fe6171c05a808bb0c537",
+    "moe-2112-bf16-fresh.jsonl.gz": "d64afa58cfc430768bb5279c139adf58a4e1a4d7cc8c35920907d262d92217bf",
+    "moe-2112-bf16-restored.jsonl.gz": "fa2b11beb6f1bcccea3ccba0c215ea6bae2b812e198fc937bf8545e247f0a673",
+    "moe-2112-bf16.prompt.json": "c598559ff061f6a33b6144d1a2ed119cbd91c09d2581711bdb01e063eb030866",
+    "moe-2112-bf16.report.json": "77ff323821d594701234e42ad41263dfec71e3696fb3a1c7ef483f1248628c18",
+    "moe-2112-bf16.u32": "7a567a4f0fbfbe12e503a9d555b9d7bbf94fc7fe5040fe6171c05a808bb0c537",
+    "moe-8256-int8-auto-frozen-fresh.jsonl.gz": "0ee8462f222fd4f97d2edccbbe350a4ea98b53820258ad761d13d807d6bc62ae",
+    "moe-8256-int8-auto-frozen-restored.jsonl.gz": "1d6b828e83d5c26ea5e5f28c9fe432f7ce9583a4b05ae37c698c09d68f7c1be6",
+    "moe-8256-int8-auto-frozen.prompt.json": "63d59bfb0ca8ecdd7f518edbc902f44512e9bc499362f7a93cae800276522736",
+    "moe-8256-int8-auto-frozen.report.json": "7ffc49653289eab814f35751128fc3a14f50b4f814896a5a867806a86d190478",
+    "moe-8256-int8-auto-frozen.u32": "0d83313212e62ba589bd1709e4008f4ff0cb8a420049718113c57acd19b0b87b",
+    "moe-8256-int8-fresh.jsonl.gz": "363a3e6b6bd94f06ab4d0888bbdb74323521a0498e1fb79b5bc3f80aa92bc339",
+    "moe-8256-int8-restored.jsonl.gz": "837a511917ab7a6cc76d620f2f44ca9051309fc347f1430d63dfe30a1f52d9e0",
+    "moe-8256-int8.prompt.json": "63d59bfb0ca8ecdd7f518edbc902f44512e9bc499362f7a93cae800276522736",
+    "moe-8256-int8.report.json": "f68961803bb7249919857422bf3b8383a0547b374d1f0b1c2657c50260c59e04",
+    "moe-8256-int8.u32": "0d83313212e62ba589bd1709e4008f4ff0cb8a420049718113c57acd19b0b87b",
+    "cli-guards.json": "4213ee14b52fd0926abd446b8a2789cc17e42bc97b9b00bdc41c915a8759a412",
+    "validation.json": "0ab4939bb2f24f2d9a16ea505f0198b526c97a05610b5f4089988614cdd6a8c5"
+  },
+  "cases": [
+    {
+      "name": "dense-2112-int8",
+      "captures": [
+        "dense-2112-int8-fresh.jsonl.gz",
+        "dense-2112-int8-restored.jsonl.gz"
+      ],
+      "report": "dense-2112-int8.report.json",
+      "prompt": "dense-2112-int8.u32",
+      "prompt_description": "dense-2112-int8.prompt.json",
+      "model_root": "/Users/linson/Documents/ai/splash/install/models/mlx-community/Qwen3.8-27B-4bit",
+      "model_fingerprint": "73ca2049777aee00d1c77cd21449b25380035a389d826cdc0492ab7959972a9e",
+      "prompt_tokens": 2112,
+      "restore_prefix": 2048,
+      "verify_budget": "all",
+      "budget_learning": "live",
+      "matched_contexts": 4,
+      "max_hidden_relative_l2": 0.04373089594686257,
+      "max_confidence_abs": 0.040746630000000006,
+      "proposal_changes": 0,
+      "retained_pairs": [
+        [
+          3,
+          3
+        ],
+        [
+          2,
+          2
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          8,
+          8
+        ]
+      ],
+      "verify_row_pairs": [
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ]
+      ]
+    },
+    {
+      "name": "dense-8256-bf16",
+      "captures": [
+        "dense-8256-bf16-fresh.jsonl.gz",
+        "dense-8256-bf16-restored.jsonl.gz"
+      ],
+      "report": "dense-8256-bf16.report.json",
+      "prompt": "dense-8256-bf16.u32",
+      "prompt_description": "dense-8256-bf16.prompt.json",
+      "model_root": "/Users/linson/Documents/ai/splash/install/models/mlx-community/Qwen3.8-27B-4bit",
+      "model_fingerprint": "73ca2049777aee00d1c77cd21449b25380035a389d826cdc0492ab7959972a9e",
+      "prompt_tokens": 8256,
+      "restore_prefix": 8192,
+      "verify_budget": "all",
+      "budget_learning": "live",
+      "matched_contexts": 4,
+      "max_hidden_relative_l2": 0.04762724858199303,
+      "max_confidence_abs": 0.09202992900000007,
+      "proposal_changes": 0,
+      "retained_pairs": [
+        [
+          3,
+          3
+        ],
+        [
+          3,
+          3
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "verify_row_pairs": [
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ]
+      ]
+    },
+    {
+      "name": "moe-2112-bf16",
+      "captures": [
+        "moe-2112-bf16-fresh.jsonl.gz",
+        "moe-2112-bf16-restored.jsonl.gz"
+      ],
+      "report": "moe-2112-bf16.report.json",
+      "prompt": "moe-2112-bf16.u32",
+      "prompt_description": "moe-2112-bf16.prompt.json",
+      "model_root": "/Users/linson/Documents/ai/splash/install/models/.resolved/3a1b291dc8b9e540488f002c99df9b34e29ad3b707b5f2501106609068cb7251",
+      "model_fingerprint": "c2c93ba76d0de1cc9be28b9fa6f9e168614c5ee1e1e1b8615c7963a5123e9edd",
+      "prompt_tokens": 2112,
+      "restore_prefix": 2048,
+      "verify_budget": "all",
+      "budget_learning": "live",
+      "matched_contexts": 4,
+      "max_hidden_relative_l2": 0.056575256775186704,
+      "max_confidence_abs": 0.087288916,
+      "proposal_changes": 0,
+      "retained_pairs": [
+        [
+          4,
+          4
+        ],
+        [
+          3,
+          3
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          8,
+          8
+        ]
+      ],
+      "verify_row_pairs": [
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ]
+      ]
+    },
+    {
+      "name": "moe-8256-int8",
+      "captures": [
+        "moe-8256-int8-fresh.jsonl.gz",
+        "moe-8256-int8-restored.jsonl.gz"
+      ],
+      "report": "moe-8256-int8.report.json",
+      "prompt": "moe-8256-int8.u32",
+      "prompt_description": "moe-8256-int8.prompt.json",
+      "model_root": "/Users/linson/Documents/ai/splash/install/models/.resolved/3a1b291dc8b9e540488f002c99df9b34e29ad3b707b5f2501106609068cb7251",
+      "model_fingerprint": "c2c93ba76d0de1cc9be28b9fa6f9e168614c5ee1e1e1b8615c7963a5123e9edd",
+      "prompt_tokens": 8256,
+      "restore_prefix": 8192,
+      "verify_budget": "all",
+      "budget_learning": "live",
+      "matched_contexts": 4,
+      "max_hidden_relative_l2": 0.04590095332969964,
+      "max_confidence_abs": 0.059229940000000036,
+      "proposal_changes": 0,
+      "retained_pairs": [
+        [
+          5,
+          5
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "verify_row_pairs": [
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ],
+        [
+          8,
+          8
+        ]
+      ]
+    },
+    {
+      "name": "moe-2112-bf16-auto-frozen",
+      "captures": [
+        "moe-2112-bf16-auto-frozen-fresh.jsonl.gz",
+        "moe-2112-bf16-auto-frozen-restored.jsonl.gz"
+      ],
+      "report": "moe-2112-bf16-auto-frozen.report.json",
+      "prompt": "moe-2112-bf16-auto-frozen.u32",
+      "prompt_description": "moe-2112-bf16-auto-frozen.prompt.json",
+      "model_root": "/Users/linson/Documents/ai/splash/install/models/.resolved/3a1b291dc8b9e540488f002c99df9b34e29ad3b707b5f2501106609068cb7251",
+      "model_fingerprint": "c2c93ba76d0de1cc9be28b9fa6f9e168614c5ee1e1e1b8615c7963a5123e9edd",
+      "prompt_tokens": 2112,
+      "restore_prefix": 2048,
+      "verify_budget": "auto",
+      "budget_learning": "frozen",
+      "matched_contexts": 4,
+      "max_hidden_relative_l2": 0.05588315109672577,
+      "max_confidence_abs": 0.17531746599999998,
+      "proposal_changes": 0,
+      "retained_pairs": [
+        [
+          4,
+          4
+        ],
+        [
+          3,
+          3
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          8,
+          8
+        ]
+      ],
+      "verify_row_pairs": [
+        [
+          5,
+          5
+        ],
+        [
+          6,
+          5
+        ],
+        [
+          3,
+          3
+        ],
+        [
+          8,
+          8
+        ]
+      ]
+    },
+    {
+      "name": "moe-8256-int8-auto-frozen",
+      "captures": [
+        "moe-8256-int8-auto-frozen-fresh.jsonl.gz",
+        "moe-8256-int8-auto-frozen-restored.jsonl.gz"
+      ],
+      "report": "moe-8256-int8-auto-frozen.report.json",
+      "prompt": "moe-8256-int8-auto-frozen.u32",
+      "prompt_description": "moe-8256-int8-auto-frozen.prompt.json",
+      "model_root": "/Users/linson/Documents/ai/splash/install/models/.resolved/3a1b291dc8b9e540488f002c99df9b34e29ad3b707b5f2501106609068cb7251",
+      "model_fingerprint": "c2c93ba76d0de1cc9be28b9fa6f9e168614c5ee1e1e1b8615c7963a5123e9edd",
+      "prompt_tokens": 8256,
+      "restore_prefix": 8192,
+      "verify_budget": "auto",
+      "budget_learning": "frozen",
+      "matched_contexts": 4,
+      "max_hidden_relative_l2": 0.04607801460456738,
+      "max_confidence_abs": 0.07058757599999993,
+      "proposal_changes": 0,
+      "retained_pairs": [
+        [
+          5,
+          5
+        ],
+        [
+          1,
+          1
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          1,
+          1
+        ]
+      ],
+      "verify_row_pairs": [
+        [
+          6,
+          6
+        ],
+        [
+          5,
+          5
+        ],
+        [
+          4,
+          4
+        ],
+        [
+          8,
+          8
+        ]
+      ]
+    }
+  ]
+}

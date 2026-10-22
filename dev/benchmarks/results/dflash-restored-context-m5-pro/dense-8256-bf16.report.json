@@ -1,0 +1,402 @@
+{
+  "scope": "matched-context native capture comparison; no global-memory or speedup claim",
+  "model_fingerprint": "73ca2049777aee00d1c77cd21449b25380035a389d826cdc0492ab7959972a9e",
+  "prompt_sha256": "0d83313212e62ba589bd1709e4008f4ff0cb8a420049718113c57acd19b0b87b",
+  "restore_prefix_left": 0,
+  "restore_prefix_right": 8192,
+  "matched_contexts": 4,
+  "unmatched_left": 0,
+  "unmatched_right": 0,
+  "comparisons": [
+    {
+      "lane": 0,
+      "position": 8256,
+      "accepted_left": 2,
+      "accepted_right": 2,
+      "accepted_scratch_left": 2,
+      "accepted_scratch_right": 2,
+      "verify_rows_left": 8,
+      "verify_rows_right": 8,
+      "retained_left": 3,
+      "retained_right": 3,
+      "confidence_max_abs": 0.010505348999999997,
+      "candidate_slot_changes": 21,
+      "proposed_token_changes": 0,
+      "target_token_prefix_equal": true,
+      "hidden_max_abs": 0.75,
+      "hidden_rms": 0.034320662430802854,
+      "hidden_relative_l2": 0.016095447606434374
+    },
+    {
+      "lane": 0,
+      "position": 8259,
+      "accepted_left": 2,
+      "accepted_right": 2,
+      "accepted_scratch_left": 2,
+      "accepted_scratch_right": 2,
+      "verify_rows_left": 8,
+      "verify_rows_right": 8,
+      "retained_left": 3,
+      "retained_right": 3,
+      "confidence_max_abs": 0.005352318999999994,
+      "candidate_slot_changes": 27,
+      "proposed_token_changes": 0,
+      "target_token_prefix_equal": true,
+      "hidden_max_abs": 1.0,
+      "hidden_rms": 0.08597721822307906,
+      "hidden_relative_l2": 0.0385861960668018
+    },
+    {
+      "lane": 0,
+      "position": 8262,
+      "accepted_left": 0,
+      "accepted_right": 0,
+      "accepted_scratch_left": 0,
+      "accepted_scratch_right": 0,
+      "verify_rows_left": 8,
+      "verify_rows_right": 8,
+      "retained_left": 1,
+      "retained_right": 1,
+      "confidence_max_abs": 0.09202992900000007,
+      "candidate_slot_changes": 43,
+      "proposed_token_changes": 0,
+      "target_token_prefix_equal": true,
+      "hidden_max_abs": 1.25,
+      "hidden_rms": 0.11302058977571876,
+      "hidden_relative_l2": 0.04762724858199303
+    },
+    {
+      "lane": 0,
+      "position": 8263,
+      "accepted_left": 0,
+      "accepted_right": 0,
+      "accepted_scratch_left": 0,
+      "accepted_scratch_right": 0,
+      "verify_rows_left": 8,
+      "verify_rows_right": 8,
+      "retained_left": 1,
+      "retained_right": 1,
+      "confidence_max_abs": 0.049623697999999994,
+      "candidate_slot_changes": 43,
+      "proposed_token_changes": 0,
+      "target_token_prefix_equal": true,
+      "hidden_max_abs": 1.0,
+      "hidden_rms": 0.08891772443993183,
+      "hidden_relative_l2": 0.039616017432427465
+    }
+  ],
+  "left_acceptance": {
+    "metadata": {
+      "kind": "metadata",
+      "schema": 1,
+      "model_root": "/Users/linson/Documents/ai/splash/install/models/mlx-community/Qwen3.8-27B-4bit",
+      "device": "Apple M5 Pro",
+      "width": 1,
+      "positions": 7,
+      "candidates": 16,
+      "sampling": false,
+      "verify_rows": "all",
+      "presence_penalty": 0,
+      "model_fingerprint": "73ca2049777aee00d1c77cd21449b25380035a389d826cdc0492ab7959972a9e",
+      "kv_format": "bf16",
+      "state_format": "fp32",
+      "budget_learning": "live",
+      "materialize_prefix": 8192,
+      "restore_prefix": 0,
+      "capture_hidden": true,
+      "prompt_sha256": "0d83313212e62ba589bd1709e4008f4ff0cb8a420049718113c57acd19b0b87b",
+      "prompt_tokens": 8256
+    },
+    "cycles": 4,
+    "mean_retained_tokens": 2.0,
+    "verified_proposals": 28,
+    "accepted_proposals": 4,
+    "first_rejections": {
+      "selection": 4,
+      "candidate_recall": 0,
+      "censored": 0
+    },
+    "selection_miss_unary_rank_counts": [
+      0,
+      1,
+      1,
+      1,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "conditional_acceptance": [
+      {
+        "position": 1,
+        "reached": 4,
+        "accepted": 2,
+        "rate": 0.5
+      },
+      {
+        "position": 2,
+        "reached": 2,
+        "accepted": 2,
+        "rate": 1.0
+      },
+      {
+        "position": 3,
+        "reached": 2,
+        "accepted": 0,
+        "rate": 0.0
+      },
+      {
+        "position": 4,
+        "reached": 0,
+        "accepted": 0,
+        "rate": null
+      },
+      {
+        "position": 5,
+        "reached": 0,
+        "accepted": 0,
+        "rate": null
+      },
+      {
+        "position": 6,
+        "reached": 0,
+        "accepted": 0,
+        "rate": null
+      },
+      {
+        "position": 7,
+        "reached": 0,
+        "accepted": 0,
+        "rate": null
+      }
+    ],
+    "confidence_bins": [
+      {
+        "count": 0,
+        "mean_confidence": null,
+        "acceptance_rate": null
+      },
+      {
+        "count": 0,
+        "mean_confidence": null,
+        "acceptance_rate": null
+      },
+      {
+        "count": 0,
+        "mean_confidence": null,
+        "acceptance_rate": null
+      },
+      {
+        "count": 1,
+        "mean_confidence": 0.325599909,
+        "acceptance_rate": 0.0
+      },
+      {
+        "count": 0,
+        "mean_confidence": null,
+        "acceptance_rate": null
+      },
+      {
+        "count": 0,
+        "mean_confidence": null,
+        "acceptance_rate": null
+      },
+      {
+        "count": 1,
+        "mean_confidence": 0.633432508,
+        "acceptance_rate": 0.0
+      },
+      {
+        "count": 1,
+        "mean_confidence": 0.732286394,
+        "acceptance_rate": 0.0
+      },
+      {
+        "count": 1,
+        "mean_confidence": 0.875928521,
+        "acceptance_rate": 0.0
+      },
+      {
+        "count": 4,
+        "mean_confidence": 0.9897186010000001,
+        "acceptance_rate": 1.0
+      }
+    ],
+    "counterfactual": {
+      "complete_reference_cycles": 1,
+      "censored_reference_cycles": 3,
+      "mean_tokens_at_original_starts": {
+        "greedy": 3.0,
+        "expected_length": 3.0,
+        "viterbi": 4.0,
+        "candidate_oracle": 7.0
+      },
+      "limitation": "Fixed greedy continuation at original cycle starts; not a rollout or throughput estimate."
+    }
+  },
+  "right_acceptance": {
+    "metadata": {
+      "kind": "metadata",
+      "schema": 1,
+      "model_root": "/Users/linson/Documents/ai/splash/install/models/mlx-community/Qwen3.8-27B-4bit",
+      "device": "Apple M5 Pro",
+      "width": 1,
+      "positions": 7,
+      "candidates": 16,
+      "sampling": false,
+      "verify_rows": "all",
+      "presence_penalty": 0,
+      "model_fingerprint": "73ca2049777aee00d1c77cd21449b25380035a389d826cdc0492ab7959972a9e",
+      "kv_format": "bf16",
+      "state_format": "fp32",
+      "budget_learning": "live",
+      "materialize_prefix": 8192,
+      "restore_prefix": 8192,
+      "capture_hidden": true,
+      "prompt_sha256": "0d83313212e62ba589bd1709e4008f4ff0cb8a420049718113c57acd19b0b87b",
+      "prompt_tokens": 8256
+    },
+    "cycles": 4,
+    "mean_retained_tokens": 2.0,
+    "verified_proposals": 28,
+    "accepted_proposals": 4,
+    "first_rejections": {
+      "selection": 4,
+      "candidate_recall": 0,
+      "censored": 0
+    },
+    "selection_miss_unary_rank_counts": [
+      0,
+      1,
+      1,
+      1,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "conditional_acceptance": [
+      {
+        "position": 1,
+        "reached": 4,
+        "accepted": 2,
+        "rate": 0.5
+      },
+      {
+        "position": 2,
+        "reached": 2,
+        "accepted": 2,
+        "rate": 1.0
+      },
+      {
+        "position": 3,
+        "reached": 2,
+        "accepted": 0,
+        "rate": 0.0
+      },
+      {
+        "position": 4,
+        "reached": 0,
+        "accepted": 0,
+        "rate": null
+      },
+      {
+        "position": 5,
+        "reached": 0,
+        "accepted": 0,
+        "rate": null
+      },
+      {
+        "position": 6,
+        "reached": 0,
+        "accepted": 0,
+        "rate": null
+      },
+      {
+        "position": 7,
+        "reached": 0,
+        "accepted": 0,
+        "rate": null
+      }
+    ],
+    "confidence_bins": [
+      {
+        "count": 0,
+        "mean_confidence": null,
+        "acceptance_rate": null
+      },
+      {
+        "count": 0,
+        "mean_confidence": null,
+        "acceptance_rate": null
+      },
+      {
+        "count": 0,
+        "mean_confidence": null,
+        "acceptance_rate": null
+      },
+      {
+        "count": 1,
+        "mean_confidence": 0.375223607,
+        "acceptance_rate": 0.0
+      },
+      {
+        "count": 0,
+        "mean_confidence": null,
+        "acceptance_rate": null
+      },
+      {
+        "count": 0,
+        "mean_confidence": null,
+        "acceptance_rate": null
+      },
+      {
+        "count": 1,
+        "mean_confidence": 0.635569632,
+        "acceptance_rate": 0.0
+      },
+      {
+        "count": 1,
+        "mean_confidence": 0.765271842,
+        "acceptance_rate": 0.0
+      },
+      {
+        "count": 1,
+        "mean_confidence": 0.87963295,
+        "acceptance_rate": 0.0
+      },
+      {
+        "count": 4,
+        "mean_confidence": 0.98926550125,
+        "acceptance_rate": 1.0
+      }
+    ],
+    "counterfactual": {
+      "complete_reference_cycles": 1,
+      "censored_reference_cycles": 3,
+      "mean_tokens_at_original_starts": {
+        "greedy": 3.0,
+        "expected_length": 3.0,
+        "viterbi": 4.0,
+        "candidate_oracle": 7.0
+      },
+      "limitation": "Fixed greedy continuation at original cycle starts; not a rollout or throughput estimate."
+    }
+  }
+}

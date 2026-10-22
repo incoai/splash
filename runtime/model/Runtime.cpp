@@ -3501,6 +3501,17 @@ RuntimeInstrumentation::DraftSelection RuntimeInstrumentation::lastDraftSelectio
           ids(DecodeTensor::VerifyRows, 1)[0]};
 }
 
+void RuntimeInstrumentation::resetVerifyBudget(Runtime &runtime) {
+  if (runtime.impl_->verifyBudget) runtime.impl_->verifyBudget.emplace();
+}
+
+std::span<const uint16_t> RuntimeInstrumentation::lastDraftHidden(const Runtime &runtime, uint32_t lane) {
+  if (lane >= kLaneCount) throw std::invalid_argument("invalid draft hidden lane");
+  const auto &impl = *runtime.impl_;
+  return {contents<uint16_t>(impl.decodeArena->get(lane, DecodeTensor::DraftFinalHidden), "draft hidden"),
+          uint64_t{SPLASH_DRAFT_QUERY_ROWS} * impl.geometry.draft.hiddenSize};
+}
+
 RuntimeInstrumentation::LaneTables RuntimeInstrumentation::laneTables(const Runtime &runtime, uint64_t requestId) {
   const Runtime::Impl &impl = *runtime.impl_;
   const Runtime::Impl::LaneTables tables = impl.laneTables(impl.requests.at(requestId).stateLane);

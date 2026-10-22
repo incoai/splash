@@ -1,0 +1,86 @@
+[
+  {
+    "args": [
+      "--restore-prefix",
+      "31",
+      "--draft-dump",
+      "/tmp/unused-dflash"
+    ],
+    "status": 1,
+    "message": "decode-profile: --restore-prefix requires B1 and a page-aligned boundary before the prompt end"
+  },
+  {
+    "args": [
+      "--restore-prefix",
+      "512",
+      "--draft-dump",
+      "/tmp/unused-dflash"
+    ],
+    "status": 1,
+    "message": "decode-profile: --restore-prefix requires B1 and a page-aligned boundary before the prompt end"
+  },
+  {
+    "args": [
+      "--restore-prefix",
+      "256",
+      "--draft-dump",
+      "/tmp/unused-dflash",
+      "--width",
+      "2"
+    ],
+    "status": 1,
+    "message": "decode-profile: --restore-prefix requires B1 and a page-aligned boundary before the prompt end"
+  },
+  {
+    "args": [
+      "--restore-prefix",
+      "256",
+      "--materialize-prefix",
+      "128",
+      "--draft-dump",
+      "/tmp/unused-dflash"
+    ],
+    "status": 1,
+    "message": "decode-profile: restore and materialize boundaries must match"
+  },
+  {
+    "args": [
+      "--restore-prefix",
+      "256"
+    ],
+    "status": 1,
+    "message": "decode-profile: capture options require --draft-dump"
+  },
+  {
+    "args": [
+      "--capture-hidden",
+      "maybe"
+    ],
+    "status": 1,
+    "message": "decode-profile: --capture-hidden takes yes or no"
+  },
+  {
+    "args": [
+      "--verify-budget",
+      "maybe"
+    ],
+    "status": 1,
+    "message": "decode-profile: --verify-budget takes all or auto"
+  },
+  {
+    "args": [
+      "--budget-learning",
+      "maybe"
+    ],
+    "status": 1,
+    "message": "decode-profile: --budget-learning takes live or frozen"
+  },
+  {
+    "args": [
+      "--materialize-prefix",
+      "0"
+    ],
+    "status": 1,
+    "message": "decode-profile: --materialize-prefix must be positive"
+  }
+]

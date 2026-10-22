@@ -38,6 +38,10 @@ public:
   };
   [[nodiscard]] static DraftSelection lastDraftSelection(const Runtime &runtime,
                                                         uint32_t lane, uint32_t width);
+  // Restore the prior/seed for controlled capture; no online timing history.
+  static void resetVerifyBudget(Runtime &runtime);
+  // BF16 bit patterns of all final draft hidden rows, anchor included.
+  [[nodiscard]] static std::span<const uint16_t> lastDraftHidden(const Runtime &runtime, uint32_t lane);
   // The GPU tables of resident request `requestId`'s lane as its last
   // command left them, every entry the lane holds: its page table and, for
   // a layout with a block index, its index table (none without).

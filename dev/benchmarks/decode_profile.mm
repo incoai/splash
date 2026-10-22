@@ -4,7 +4,7 @@
 //                  [--state-format fp32|bf16] [--expert-memory SIZE] [--ple-memory SIZE]
 //                  [--dispatch-list FILE]
 //                  [--draft-dump FILE --prompt-file TOKENS --width 1..4]
-//                  [--presence-penalty P]
+//                  [--presence-penalty P] [--restore-prefix N | --materialize-prefix N] [--capture-hidden yes|no] [--verify-budget all|auto] [--budget-learning live|frozen]
 // --draft-dump captures only ordinary greedy cycles, without profiling replay.
 // TOKENS is a nonempty file of little-endian uint32 ids, already chat formatted.
 //   decode-profile METALLIB MODEL_ROOT --images HxW[,HxW...] [--cycles K]
@@ -36,6 +36,7 @@
 #include "model/WeightImages.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "model/QwenState.hpp"
+#include "model/WeightStore.hpp"
 #include "tools/LoadOptions.hpp"
 
 #import <Foundation/Foundation.h>
@@ -240,18 +241,22 @@ struct Lane final {
 
 void prefill(model::Runtime &executor, Lane &lane,
              std::span<const uint32_t> prompt, uint32_t maxNewTokens = 256,
-             float presencePenalty = 0.0F) {
+             float presencePenalty = 0.0F, uint32_t restorePrefix = 0, uint32_t materializePrefix = 0) {
   EngineRequest request;
   request.id = lane.id;
   request.prompt.assign(prompt.begin(), prompt.end());
   request.maxNewTokens = maxNewTokens;
   request.sampling.presencePenalty = presencePenalty;
   executor.beginColdRequest(request.modelView(), lane.stateLane);
+  const uint32_t boundary = restorePrefix ? restorePrefix : materializePrefix;
+  if (boundary) {
+    const std::array<uint32_t, 1> boundaries{boundary};
+    executor.setDraftContextPlan(lane.id, planDraftContext(0, prompt.size(), boundaries));
+  }
   uint32_t offset = 0;
   while (offset < prompt.size()) {
-    const uint32_t count = std::min<uint32_t>(
-        model::ExecutionLimits::prefillTokenBudget,
-        static_cast<uint32_t>(prompt.size()) - offset);
+    const uint32_t end = boundary && offset < boundary ? boundary : static_cast<uint32_t>(prompt.size());
+    const uint32_t count = std::min<uint32_t>(model::ExecutionLimits::prefillTokenBudget, end - offset);
     BatchPlan plan{.kind = WorkKind::Prefill,
                    .items = {{lane.id, count, offset}},
                    .decodeStage = DecodeStage::Regular};
@@ -265,6 +270,17 @@ void prefill(model::Runtime &executor, Lane &lane,
     if (!results[0].failure.empty())
       throw std::runtime_error(results[0].failure);
     offset += count;
+    if (restorePrefix && offset == restorePrefix) {
+      auto snapshot = executor.snapshot(lane.id);
+      if (!snapshot) throw std::runtime_error("could not allocate context snapshot");
+      executor.end(lane.id);
+      // Move to another state lane to exercise ownership and ring rebuilding.
+      const uint32_t movedLane = (lane.stateLane + 1) % 4;
+      executor.beginColdRequest(request.modelView(), movedLane);
+      if (executor.beginRestore(lane.id, restorePrefix, snapshot, true, {}))
+        throw std::logic_error("resident snapshot unexpectedly requires disk I/O");
+      executor.setDraftContextPlan(lane.id, planDraftContext(restorePrefix, prompt.size(), {}));
+    }
   }
   lane.position = prompt.size();
 }
@@ -301,7 +317,8 @@ template <class T> void jsonArray(std::ostream &file, std::span<const T> values)
 // Read only after decode() has waited. Edges of position zero have just one
 // valid predecessor row; never serialize the other, unwritten scratch rows.
 void captureDraft(model::Runtime &executor, std::span<Lane> lanes,
-                  uint32_t cycles, std::ostream &file) {
+                  uint32_t cycles, std::ostream &file, std::span<const uint32_t> prompt, bool hiddenCapture, bool frozenBudget) {
+  std::vector<std::vector<uint32_t>> histories(lanes.size(), std::vector<uint32_t>(prompt.begin(), prompt.end()));
   uint64_t records = 0;
   for (uint32_t cycle = 0; cycle < cycles; ++cycle) {
     BatchPlan plan;
@@ -311,6 +328,7 @@ void captureDraft(model::Runtime &executor, std::span<Lane> lanes,
       plan.items.push_back({lane.id, 0, 0});
       items.push_back({lane.id, lane.position, 0, lane.pages, lane.pageTableRevision});
     }
+    if (frozenBudget) model::RuntimeInstrumentation::resetVerifyBudget(executor);
     const auto results = executor.decode(plan, items);
     if (results.size() != lanes.size()) throw std::runtime_error("capture width changed");
     for (const auto &result : results)
@@ -343,7 +361,16 @@ void captureDraft(model::Runtime &executor, std::span<Lane> lanes,
       jsonArray(file, draft.targetTokens.first(draft.retained));
       file << ",\"output_tokens\":";
       jsonArray(file, std::span<const uint32_t>(result.outputTokens));
+      auto context = histories[lane];
+      if (!result.outputTokens.empty()) context.push_back(result.outputTokens.front());
+      file << ",\"context_sha256\":" << json::quote(model::weightDigest(std::span<const uint8_t>(
+          reinterpret_cast<const uint8_t *>(context.data()), context.size() * sizeof(uint32_t))));
+      if (hiddenCapture) {
+        file << ",\"draft_hidden_bf16\":";
+        jsonArray(file, model::RuntimeInstrumentation::lastDraftHidden(executor, lane));
+      }
       file << "}\n";
+      histories[lane].insert(histories[lane].end(), result.outputTokens.begin(), result.outputTokens.end());
       ++records;
       lanes[lane].position += result.outputTokens.size() - result.outputTokensWithoutKv;
     }
@@ -395,7 +422,7 @@ int main(int argc, char **argv) {
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
                      "[--state-format fp32|bf16] [--expert-memory SIZE] [--ple-memory SIZE] "
                      "[--dispatch-list FILE]\n"
-                     "       --draft-dump FILE [--prompt-file TOKENS] [--width 1..4] [--presence-penalty P]\n"
+                     "       --draft-dump FILE [--prompt-file TOKENS] [--width 1..4] [--presence-penalty P] [--restore-prefix N | --materialize-prefix N] [--capture-hidden yes|no] [--verify-budget all|auto] [--budget-learning live|frozen]\n"
                      "       decode-profile METALLIB MODEL_ROOT "
                      "--images HxW[,HxW...] [--cycles K]\n";
         return 2;
@@ -410,7 +437,9 @@ int main(int argc, char **argv) {
       bool textOptions = false;
       std::string dispatchList;
       std::string draftDump, promptFile;
-      uint32_t captureWidth = 1;
+      uint32_t captureWidth = 1, restorePrefix = 0, materializePrefix = 0;
+      bool hiddenCapture = false, frozenBudget = false;
+      model::VerifyRows captureVerifyRows = model::VerifyRows::All;
       float presencePenalty = 0.0F;
       bool captureOptions = false;
       for (int index = 3; index < argc; index += 2) {
@@ -449,6 +478,27 @@ int main(int argc, char **argv) {
           captureWidth = parseCount(argv[index + 1], "--width");
           if (captureWidth > 4) throw std::invalid_argument("--width takes 1..4");
           captureOptions = textOptions = true;
+        } else if (option == "--budget-learning") {
+          const std::string_view value(argv[index + 1]);
+          if (value != "live" && value != "frozen") throw std::invalid_argument("--budget-learning takes live or frozen");
+          frozenBudget = value == "frozen";
+          captureOptions = textOptions = true;
+        } else if (option == "--verify-budget") {
+          const std::string_view value(argv[index + 1]);
+          if (value != "all" && value != "auto") throw std::invalid_argument("--verify-budget takes all or auto");
+          captureVerifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
+          captureOptions = textOptions = true;
+        } else if (option == "--materialize-prefix") {
+          materializePrefix = parseCount(argv[index + 1], "--materialize-prefix");
+          captureOptions = textOptions = true;
+        } else if (option == "--restore-prefix") {
+          restorePrefix = parseCount(argv[index + 1], "--restore-prefix");
+          captureOptions = textOptions = true;
+        } else if (option == "--capture-hidden") {
+          const std::string_view value(argv[index + 1]);
+          if (value != "yes" && value != "no") throw std::invalid_argument("--capture-hidden takes yes or no");
+          hiddenCapture = value == "yes";
+          captureOptions = textOptions = true;
         } else if (option == "--presence-penalty") {
           const std::string_view value(argv[index + 1]);
           const auto parsed = std::from_chars(value.data(), value.data() + value.size(), presencePenalty);
@@ -471,6 +521,11 @@ int main(int argc, char **argv) {
         throw std::invalid_argument("--cycles exceeds 1000000");
       const std::vector<uint32_t> prompt = promptFile.empty() ? chatPrompt(promptTokens) : readPrompt(promptFile);
       promptTokens = static_cast<uint32_t>(prompt.size());
+      if (restorePrefix && materializePrefix && restorePrefix != materializePrefix)
+        throw std::invalid_argument("restore and materialize boundaries must match");
+      materializePrefix = restorePrefix ? restorePrefix : materializePrefix;
+      if (materializePrefix && (materializePrefix >= promptTokens || materializePrefix % kv::kPageTokens || captureWidth != 1))
+        throw std::invalid_argument("--restore-prefix requires B1 and a page-aligned boundary before the prompt end");
       const uint32_t outputBudget = draftDump.empty() ? 256 : cycles * model::ExecutionLimits::targetVerifyRows + 2;
       if (uint64_t{promptTokens} + outputBudget + 16 > std::numeric_limits<uint32_t>::max())
         throw std::invalid_argument("prompt and output budget are too large");
@@ -515,7 +570,7 @@ int main(int argc, char **argv) {
                                       governor.allocationAdmission(),
                                       model.stateLayout(stateFormat), nullptr);
       model::RuntimeContext context{backend, model, pages, states, operators};
-      if (!draftDump.empty()) context.verifyRows = model::VerifyRows::All;
+      if (!draftDump.empty()) context.verifyRows = captureVerifyRows;
       model::Runtime executor(context);
 
       std::printf("device %s, %u prompt tokens, %u cycles per width, %s state\n",
@@ -537,15 +592,22 @@ int main(int argc, char **argv) {
         file << "{\"kind\":\"metadata\",\"schema\":1,\"model_root\":" << json::quote(root.string())
              << ",\"device\":" << json::quote(backend.capabilities().deviceName)
              << ",\"width\":" << captureWidth << ",\"positions\":" << SPLASH_DRAFT_PROPOSAL_TOKENS
-             << ",\"candidates\":" << SPLASH_DRAFT_CANDIDATES << ",\"sampling\":false,\"verify_rows\":\"all\""
+             << ",\"candidates\":" << SPLASH_DRAFT_CANDIDATES << ",\"sampling\":false,\"verify_rows\":"
+             << json::quote(captureVerifyRows == model::VerifyRows::All ? "all" : "auto")
              << ",\"presence_penalty\":" << presencePenalty
              << ",\"model_fingerprint\":" << json::quote(model.manifestFingerprintSha256)
              << ",\"kv_format\":" << json::quote(format == kv::Format::Int8 ? "int8" : "bf16")
              << ",\"state_format\":" << json::quote(std::string(ops::formatName(stateFormat)))
+             << ",\"budget_learning\":" << json::quote(frozenBudget ? "frozen" : "live")
+             << ",\"materialize_prefix\":" << materializePrefix
+             << ",\"restore_prefix\":" << restorePrefix
+             << ",\"capture_hidden\":" << (hiddenCapture ? "true" : "false")
+             << ",\"prompt_sha256\":" << json::quote(model::weightDigest(std::span<const uint8_t>(
+                  reinterpret_cast<const uint8_t *>(prompt.data()), prompt.size() * sizeof(uint32_t))))
              << ",\"prompt_tokens\":" << promptTokens << "}\n";
         for (uint32_t lane = 0; lane < captureWidth; ++lane)
-          prefill(executor, lanes[lane], prompt, outputBudget, presencePenalty);
-        captureDraft(executor, std::span<Lane>(lanes.data(), captureWidth), cycles, file);
+          prefill(executor, lanes[lane], prompt, outputBudget, presencePenalty, restorePrefix, materializePrefix);
+        captureDraft(executor, std::span<Lane>(lanes.data(), captureWidth), cycles, file, prompt, hiddenCapture, frozenBudget);
         for (uint32_t lane = 0; lane < captureWidth; ++lane) executor.end(lanes[lane].id);
         return 0;
       }
