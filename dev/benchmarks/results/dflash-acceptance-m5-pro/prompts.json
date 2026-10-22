@@ -1,0 +1,6 @@
+{
+  "code": "Write a complete Python implementation of an LRU cache with a dictionary and doubly linked list. Include type hints, a careful explanation of every operation, and several usage examples. Do not use collections.OrderedDict.",
+  "math": "Explain and prove why the sum of the first n odd positive integers equals n squared. Give an induction proof, a geometric proof, and a proof using arithmetic series, with detailed steps and examples for n from 1 to 10.",
+  "prose": "Explain how a city can reduce summer heat through trees, building design, and public transport. Discuss the tradeoffs and practical implementation steps in detail, with concrete examples.",
+  "json": "Write a JSON object describing a software release plan. Include ten milestones, each with a name, owner role, prerequisites, acceptance criteria, and rollback procedure. Return only JSON."
+}
