@@ -13,7 +13,6 @@ namespace h3 {
 namespace {
 
 constexpr int32_t D = H3_DIT_HIDDEN, F = H3_DIT_FFN, C = H3_DIT_INNER;
-constexpr size_t kAdaBlockBytes = size_t(H3_MODALITIES) * H3_ADA_ROWS * D * 2;
 
 using ops::AdaRow;
 
@@ -111,7 +110,8 @@ void Scheduler::encodeBlock(int block, const BlockBinding &bind, Encoder &e) con
   const int32_t M = layout_.rows(), Nin = layout_.innerRows();
   const BufferView x = plan_.view(Tensor::Residual), tags = plan_.view(Tensor::Tags);
   const BufferView rope = plan_.view(Tensor::Rope);
-  const BufferView ada = plan_.view(Tensor::AdaBlocks) + size_t(block) * kAdaBlockBytes;
+  const size_t adaBlockBytes = size_t(layout_.adaModalities()) * H3_ADA_ROWS * D * 2;
+  const BufferView ada = plan_.view(Tensor::AdaBlocks) + size_t(block) * adaBlockBytes;
   const BufferView signsHidden = plan_.view(Tensor::SignsHidden), signsFfn = plan_.view(Tensor::SignsFfn);
   const ops::ProducerOut linearIn{plan_.view(Tensor::LinearIn), plan_.view(Tensor::RowScale)};
   const ops::ProducerOut outProjIn{plan_.view(qkfix ? Tensor::OutProjInQkFix : Tensor::OutProjIn),
@@ -171,9 +171,13 @@ void Scheduler::forward(const uint16_t *adaBlocks, const uint16_t *adaFinal, con
   stats = ForwardStats{};
   const size_t videoBytes = static_cast<size_t>(layout_.frames) * layout_.tokensPerFrame * H3_DIT_VIDEO_CHANNELS * 4;
   const size_t audioBytes = static_cast<size_t>(layout_.audio) * H3_DIT_AUDIO_CHANNELS * 4;
-  std::memcpy(plan_.view(Tensor::AdaBlocks).contents(), adaBlocks, size_t(H3_DIT_BLOCKS) * kAdaBlockBytes);
+  std::memcpy(plan_.view(Tensor::AdaBlocks).contents(), adaBlocks,
+              size_t(H3_DIT_BLOCKS) * layout_.adaModalities() * H3_ADA_ROWS * D * 2);
   std::memcpy(plan_.view(Tensor::AdaFinal).contents(), adaFinal, size_t(H3_MODALITIES) * 2 * D * 2);
-  std::memcpy(plan_.view(Tensor::VideoIn).contents(), videoIn, videoBytes);
+  // conditioning rows first (VideoIn shares its slab with raw q, so they are copied every forward), then the target
+  const size_t condBytes = cond_.size() * 4;
+  if (condBytes) std::memcpy(plan_.view(Tensor::VideoIn).contents(), cond_.data(), condBytes);
+  std::memcpy(static_cast<uint8_t *>(plan_.view(Tensor::VideoIn).contents()) + condBytes, videoIn, videoBytes);
   if (audioBytes) std::memcpy(plan_.view(Tensor::AudioIn).contents(), audioIn, audioBytes);
   const ops::IoBuffers io{plan_.view(Tensor::Residual), plan_.view(Tensor::Tags),     plan_.view(Tensor::Text),
                           plan_.view(Tensor::AdaFinal), plan_.view(Tensor::VideoIn),  plan_.view(Tensor::AudioIn),

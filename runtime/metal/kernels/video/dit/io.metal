@@ -1,10 +1,11 @@
 // DiT pieces outside the 50-block loop that run every step (fp32 math, bf16 storage where the reference stores bf16).
-//   dit_io_embed  packed residual X [M, 5376] bf16, rows [text L | audio Na | video Nv]:
+//   dit_io_embed  packed residual X [M, 5376] bf16, rows [text L | conditioning C | audio Na | video Nv]:
 //                 text rows: the refined text stream (computed once per request by prep);
-//                 audio / video rows: audio_patch_proj / video_patch_proj (fp32 weights [K][5376] transposed + bias),
-//                 input rounded to bf16 first, output rounded to bf16
+//                 conditioning / audio / video rows: video_patch_proj / audio_patch_proj / video_patch_proj (fp32
+//                 weights [K][5376] transposed + bias), input rounded to bf16 first, output rounded to bf16; the video
+//                 input holds the C conditioning rows, then the Nv target rows
 //   dit_io_final  final_layer: RMSNorm -> x * (1 + scale[t]) + shift[t] with the bf16 rounding of the MLX reference op
-//                 by op -> fp32 heads (video_out [96, 5376] / audio_out [32, 5376] + bias); audio and video rows only
+//                 by op -> fp32 heads (video_out [96, 5376] / audio_out [32, 5376] + bias); target audio and video rows only
 #include <metal_stdlib>
 #include "metal/abi/video/DitIoABI.h"
 
@@ -23,9 +24,11 @@ kernel void dit_io_embed(device bfloat *X [[buffer(0)]], device const bfloat *te
     if (n < p.D) X[ulong(row) * p.D + n] = text[ulong(row) * p.D + n];
     return;
   }
-  const bool aud = row < p.L + p.Na;
+  const bool cond = row < p.L + p.C;
+  const bool aud = !cond && row < p.L + p.C + p.Na;
   const int K = aud ? p.Ka : p.Kv;
-  device const float *src = aud ? ain + ulong(row - p.L) * p.Ka : vin + ulong(row - p.L - p.Na) * p.Kv;
+  device const float *src = cond ? vin + ulong(row - p.L) * p.Kv
+                                 : (aud ? ain + ulong(row - p.L - p.C) * p.Ka : vin + ulong(row - p.L - p.Na) * p.Kv);
   if (tid < K) xin[tid] = float(bfloat(src[tid]));
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (n >= p.D) return;
@@ -46,7 +49,7 @@ kernel void dit_io_final(device const bfloat *X [[buffer(0)]], device const ucha
                          ushort lane [[thread_index_in_simdgroup]]) {
   threadgroup float y[H3_DIT_HIDDEN];
   threadgroup float red[8];
-  const int row = p.L + int(tg);
+  const int row = p.L + p.C + int(tg);
   device const bfloat *x = X + ulong(row) * p.D;
   float ss = 0.0f;
   for (int k = tid; k < p.D; k += 256) {
@@ -67,11 +70,11 @@ kernel void dit_io_final(device const bfloat *X [[buffer(0)]], device const ucha
     y[k] = float(bfloat(t + float(sh[k])));                             // + shift, bf16
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const bool aud = row < p.L + p.Na;
+  const bool aud = row < p.L + p.C + p.Na;
   const int N = aud ? p.Ka : p.Kv;
   device const float *W = aud ? Wa : Wv;
   device const float *b = aud ? ba : bv;
-  device float *o = aud ? aout + ulong(row - p.L) * p.Ka : vout + ulong(row - p.L - p.Na) * p.Kv;
+  device float *o = aud ? aout + ulong(row - p.L - p.C) * p.Ka : vout + ulong(row - p.L - p.C - p.Na) * p.Kv;
   for (int j = sg; j < N; j += 8) {
     device const float *w = W + ulong(j) * p.D;
     float acc = 0.0f;

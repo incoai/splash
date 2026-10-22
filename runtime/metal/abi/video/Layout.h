@@ -22,6 +22,14 @@
 #define H3_DIT_AUDIO_CHANNELS 32
 #define H3_ADA_ROWS 6           // shift / scale / gate of attention and MLP, per modality
 #define H3_MODALITIES 3
+// Modality tags of the packed rows (adaLN table slot): 0 video, 1 text, 2 audio; FL2VA keyframe conditioning rows are
+// video rows held at the conditioning timestep, slot 3 (their tables are [4][6][5376] per block).
+#define H3_TAG_VIDEO 0
+#define H3_TAG_TEXT 1
+#define H3_TAG_AUDIO 2
+#define H3_TAG_COND 3
+#define H3_MODALITIES_COND 4
+#define H3_COND_ROWS_PER_FRAME 1008  // one keyframe: 1 x 24 x 42 patches of the 1344 x 768 canvas
 
 // Linear-branch state (per head: 128 x 128 fp32 matrices)
 #define H3_BRANCH_STATE (H3_DIT_HEAD_DIM * H3_DIT_HEAD_DIM)

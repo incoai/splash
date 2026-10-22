@@ -57,6 +57,13 @@ inline constexpr int32_t kVaeAttentionSimdgroups = H3_VAE_ATTENTION_NSG;
 inline constexpr int32_t kVaeProducerGroups = 2;
 inline constexpr int32_t kVaeFfnProducerGroups = 4;
 
+// ---- Video VAE encoder (FL2VA keyframes) ---------------------------------------------------------------------
+inline constexpr int32_t kVaeEncodeBatch = 7;           // 256 px tiles per command buffer
+inline constexpr Tile kVaeEncodeTileWide{64, 128, 4};   // convolutions with >= kVaeEncodeWideRows GEMM rows
+inline constexpr Tile kVaeEncodeTileNarrow{32, 128, 4};
+inline constexpr Tile kVaeEncodeTileOut{32, 64, 2};     // conv_out (48 channels padded to 64)
+inline constexpr int32_t kVaeEncodeWideRows = 8192;
+
 // ---- TAEH3 preview ----------------------------------------------------------------------------------------------
 inline constexpr int32_t kPreviewChunk = 5;  // latent frames per command (TAEH3_CHUNK)
 inline constexpr Tile kPreviewTile256{32, 128, 4};  // conv tiles per channel level (TAE_T256 / T128 / T64 / TFIN)

@@ -18,12 +18,17 @@ struct VideoGeometry {
   static VideoGeometry of(int32_t frames, int32_t width, int32_t height);
 };
 
-// Packed DiT rows [text L | audio Na | video F x T], no pad rows. The linear branch covers the inner frames
-// 1 .. F - 2 (anchor frames 0 and F - 1 excluded).
+// Packed DiT rows [text L | keyframe conditioning C | audio Na | video F x T], no pad rows (C = 0 for text-to-video).
+// Conditioning rows are global rows of the window softmax (dense in both directions, as OpenVDN's layout, whose
+// target video is the trailing contiguous run of video rows) and are not part of the linear branch. The linear branch
+// covers the inner frames 1 .. F - 2 (anchor frames 0 and F - 1 excluded).
 struct SequenceLayout {
-  int32_t text = 0, audio = 0, frames = 0, tokensPerFrame = 0, gridH = 0, gridW = 0;
+  int32_t text = 0, audio = 0, frames = 0, tokensPerFrame = 0, gridH = 0, gridW = 0, cond = 0;
 
-  [[nodiscard]] int32_t videoStart() const { return text + audio; }
+  [[nodiscard]] int32_t videoStart() const { return text + cond + audio; }
+  [[nodiscard]] int32_t audioStart() const { return text + cond; }
+  // adaLN table slots per block: video, text, audio (+ conditioning video)
+  [[nodiscard]] int32_t adaModalities() const { return cond > 0 ? 4 : 3; }
   [[nodiscard]] int32_t rows() const { return videoStart() + frames * tokensPerFrame; }
   [[nodiscard]] int32_t paddedRows() const { return (rows() + 127) / 128 * 128; }
   [[nodiscard]] int32_t innerFrames() const { return frames - 2; }

@@ -516,3 +516,40 @@ kernel void prep_normal(device const uint32_t *bits [[buffer(0)]], device float 
   const float sqrt2 = 1.41421356237309504880f;
   y[i] = sqrt2 * e;
 }
+
+// ---- FL2VA keyframe conditioning rows -----------------------------------------------------------------------------
+
+// pipeline._encode_keyframes after VideoVAE._encode_clip, op by op: logvar = clip(logvar, -30, 20) (maximum then
+// minimum), std = exp(0.5 logvar), latent = mean + std eps, float16 round trip, (latent - mean_c) / std_c, then
+// patchify_video_latents (1 x 2 x 2 patches, column c * 4 + py * 2 + px). One thread per (k, y, x, c).
+kernel void prep_keyframe_latents(device const float *mom [[buffer(0)]], device const float *eps [[buffer(1)]],
+                                  device const float *stats [[buffer(2)]], device float *rows [[buffer(3)]],
+                                  constant PrepKeyframeParams &p [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+  const int n = p.keyframes * p.LH * p.LW * 24;
+  if (int(gid) >= n) return;
+  const int c = int(gid) % 24, px = int(gid) / 24;
+  const int x = px % p.LW, y = (px / p.LW) % p.LH, k = px / (p.LW * p.LH);
+  device const float *m = mom + long(px) * 48;
+  float lv = m[24 + c];
+  lv = metal::max(lv, -30.0f);
+  lv = metal::min(lv, 20.0f);
+  float h = 0.5f * lv;
+  const float sd = metal::precise::exp(h);
+  const float z = sd * eps[gid];
+  const float lat = m[c] + z;
+  const float r = static_cast<float>(static_cast<half>(lat));
+  const float d = r - stats[c];
+  const float v = d / stats[24 + c];
+  const int gw = p.LW / 2, rowsPerFrame = (p.LH / 2) * gw;
+  const long row = long(k) * rowsPerFrame + (y / 2) * gw + x / 2;
+  rows[row * 96 + c * 4 + (y % 2) * 2 + (x % 2)] = v;
+}
+
+kernel void prep_cond_noise(device const float *x [[buffer(0)]], device const float *noise [[buffer(1)]],
+                            device float *y [[buffer(2)]], constant PrepCondNoiseParams &p [[buffer(3)]],
+                            uint i [[thread_position_in_grid]]) {
+  if (int(i) >= p.n) return;
+  const float a = p.t * x[i];
+  const float b = p.omt * noise[i];
+  y[i] = a + b;
+}

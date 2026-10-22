@@ -33,6 +33,9 @@ public:
   void ropeTrig(Encoder &e, View pos, View inv, View cos, View sin, int rows);
   void tembSinusoid(Encoder &e, View t, View y, int T);
   void normal(Encoder &e, View bits, View y, int n);
+  // FL2VA keyframes: posterior sample -> normalised patchified rows; noise augmentation t x + (1 - t) noise
+  void keyframeLatents(Encoder &e, View moments, View eps, View stats, View rows, int keyframes, int LH, int LW);
+  void condNoise(Encoder &e, View x, View noise, View y, int n, float t, float omt);
 };
 
 } // namespace h3::ops

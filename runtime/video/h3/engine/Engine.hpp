@@ -28,12 +28,15 @@ struct EngineConfig {
   std::string weights;  // root: dit-turbo/, dit-default/, vae/, preview/
 };
 
-// Prepared layout of the packed sequence (borrowed until releaseDit).
+// Prepared layout of the packed sequence [text | conditioning | audio | video] (borrowed until releaseDit; the
+// conditioning rows are copied).
 struct DitInputs {
   int32_t textRows = 0;
   const uint8_t *tags = nullptr;
   const uint16_t *rope = nullptr;
   const uint16_t *text = nullptr;
+  int32_t condRows = 0;        // keyframe conditioning rows (multiple of 1008; 0 for text-to-video)
+  const float *cond = nullptr;  // [condRows][96]: the noised keyframe latents, fixed for every step
 };
 
 struct Schedule {
@@ -60,7 +63,7 @@ public:
   [[nodiscard]] const Request &request() const { return request_; }
   [[nodiscard]] metal::MetalBackend &backend() { return *backend_; }
 
-  // ---- prep: request-constant DiT inputs from the text hidden states (model/Prep.hpp)
+  // ---- prep: request-constant DiT inputs from the text hidden states and the keyframes (model/Prep.hpp)
   void prep(const model::PrepInputs &inputs, model::Prepared &out);
 
   // ---- DiT
@@ -88,7 +91,7 @@ public:
   [[nodiscard]] int32_t previewFrames() const { return model::previewFrames(geometry_.latentFrames); }
 
   // Key-range table of a request (no device needed).
-  [[nodiscard]] static WindowTable windowTable(const Request &request, int32_t textRows);
+  [[nodiscard]] static WindowTable windowTable(const Request &request, int32_t textRows, int32_t condRows);
 
 private:
   struct DitState {

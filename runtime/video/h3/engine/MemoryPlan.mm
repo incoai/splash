@@ -28,13 +28,14 @@ MemoryPlan::MemoryPlan(metal::MetalBackend &backend, const model::SequenceLayout
   set(Tensor::Tags, "modality tags u8 [M]", Slab::Tags, 0, M, "request");
   set(Tensor::Rope, "rope bf16 [M][96]", Slab::Rope, 0, M * H3_DIT_ROPE * 2, "request");
   set(Tensor::Text, "refined text bf16 [L][5376]", Slab::Text, 0, L * D * 2, "request");
-  set(Tensor::AdaBlocks, "adaLN tables bf16 [50][3][6][5376]", Slab::AdaBlocks, 0,
-      size_t(H3_DIT_BLOCKS) * H3_MODALITIES * H3_ADA_ROWS * D * 2, "step");
+  set(Tensor::AdaBlocks, "adaLN tables bf16 [50][3 | 4][6][5376]", Slab::AdaBlocks, 0,
+      size_t(H3_DIT_BLOCKS) * lay.adaModalities() * H3_ADA_ROWS * D * 2, "step");
   set(Tensor::AdaFinal, "final adaLN table bf16 [3][2][5376]", Slab::AdaFinal, 0, size_t(H3_MODALITIES) * 2 * D * 2,
       "step");
   set(Tensor::SignsHidden, "Hadamard signs [5376]", Slab::SignsHidden, 0, D, "request");
   set(Tensor::SignsFfn, "Hadamard signs [14336]", Slab::SignsFfn, 0, F, "request");
-  set(Tensor::VideoIn, "video latent in fp32 [Nv][96]", Slab::RawQ, 0, Nv * H3_DIT_VIDEO_CHANNELS * 4,
+  set(Tensor::VideoIn, "video latent in fp32 [C + Nv][96]", Slab::RawQ, 0,
+      (size_t(lay.cond) + Nv) * H3_DIT_VIDEO_CHANNELS * 4,
       "embed (before block 0 writes raw q)");
   set(Tensor::VideoOut, "video velocity fp32 [Nv][96]", Slab::RawQ, 0, Nv * H3_DIT_VIDEO_CHANNELS * 4,
       "final layer (after block 49 read raw q)");

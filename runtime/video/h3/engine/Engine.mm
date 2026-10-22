@@ -21,7 +21,6 @@
 namespace h3 {
 namespace {
 
-constexpr size_t kAdaStepBlocks = size_t(H3_DIT_BLOCKS) * H3_MODALITIES * H3_ADA_ROWS * H3_DIT_HIDDEN;
 constexpr size_t kAdaStepFinal = size_t(H3_MODALITIES) * 2 * H3_DIT_HIDDEN;
 
 // The request's geometry, once its options are consistent.
@@ -35,9 +34,10 @@ model::VideoGeometry geometryOf(const Request &r) {
   return model::VideoGeometry::of(r.frames, r.width, r.height);
 }
 
-model::SequenceLayout layoutOf(const model::VideoGeometry &g, int32_t textRows) {
+model::SequenceLayout layoutOf(const model::VideoGeometry &g, int32_t textRows, int32_t condRows) {
   model::SequenceLayout lay;
   lay.text = textRows;
+  lay.cond = condRows;
   lay.audio = g.audioRows;
   lay.frames = g.latentFrames;
   lay.tokensPerFrame = g.tokensPerFrame;
@@ -78,17 +78,18 @@ std::string Engine::ditDirectory() const {
   return config_.weights + (request_.variant == Variant::Turbo ? "/dit-turbo" : "/dit-default");
 }
 
-WindowTable Engine::windowTable(const Request &request, int32_t textRows) {
+WindowTable Engine::windowTable(const Request &request, int32_t textRows, int32_t condRows) {
   const model::VideoGeometry g = model::VideoGeometry::of(request.frames, request.width, request.height);
-  return WindowTable(layoutOf(g, textRows), request.windowChunk, request.windowRadius);
+  if (condRows < 0 || condRows % g.tokensPerFrame) throw std::invalid_argument("conditioning rows: whole frames");
+  return WindowTable(layoutOf(g, textRows, condRows), request.windowChunk, request.windowRadius);
 }
 
 void Engine::prep(const model::PrepInputs &inputs, model::Prepared &out) {
   model::Prep::run(*backend_, config_.weights, request_.variant, geometry_, inputs, out);
-  splash::logLine(std::format("H3 prep M={} L={} steps={} distinct_t={} total {:.1f}s (layout {:.2f}s, text+temb+noise "
-                              "{:.2f}s, adaLN {:.1f}s reading {:.1f} GB) device_MB={:.0f}",
-                              out.rows, out.textRows, out.steps, out.table.size(), out.totalS, out.layoutS, out.textS,
-                              out.adalnS, out.adalnReadGb, deviceMb(*backend_)));
+  splash::logLine(std::format("H3 prep M={} L={} C={} steps={} distinct_t={} total {:.1f}s (layout {:.2f}s, keyframe "
+                              "encode {:.2f}s, text+temb+noise {:.2f}s, adaLN {:.1f}s reading {:.1f} GB) device_MB={:.0f}",
+                              out.rows, out.textRows, out.condRows, out.steps, out.table.size(), out.totalS,
+                              out.layoutS, out.encodeS, out.textS, out.adalnS, out.adalnReadGb, deviceMb(*backend_)));
 }
 
 void Engine::loadDit(const DitInputs &inputs) { loadDitWith(inputs, nullptr); }
@@ -115,18 +116,25 @@ void Engine::loadDitWith(const DitInputs &inputs, std::unique_ptr<model::DitWeig
   if (dit_) throw StateError("DiT already loaded");
   if (inputs.textRows < 1 || !inputs.tags || !inputs.rope || !inputs.text)
     throw std::invalid_argument("DiT inputs incomplete");
+  if (inputs.condRows < 0 || inputs.condRows % geometry_.tokensPerFrame || (inputs.condRows && !inputs.cond))
+    throw std::invalid_argument(std::format("conditioning rows: whole keyframes of {} rows and their latents",
+                                            geometry_.tokensPerFrame));
   metal::MetalBackend &b = *backend_;
   auto dit = std::make_unique<DitState>();
-  dit->layout = layoutOf(geometry_, inputs.textRows);
+  dit->layout = layoutOf(geometry_, inputs.textRows, inputs.condRows);
   const model::SequenceLayout &lay = dit->layout;
   const int32_t M = lay.rows();
   std::set<int> qkfix;
   if (request_.qkfix) qkfix.insert(request_.qkfixBlocks.begin(), request_.qkfixBlocks.end());
-  // modality tags must match the packed layout [text | audio | video]
+  // modality tags must match the packed layout [text | conditioning | audio | video]; text rows are text (1), or video
+  // (0) for the rows of a keyframe's vision block
   for (int32_t r = 0; r < M; ++r) {
-    const uint8_t want = r < lay.text ? 1 : (r < lay.videoStart() ? 2 : 0);
-    if (inputs.tags[r] != want)
-      throw std::invalid_argument(std::format("layout tags differ from [text | audio | video] at row {}", r));
+    const uint8_t want = r < lay.text ? H3_TAG_TEXT
+                                      : (r < lay.audioStart() ? H3_TAG_COND
+                                                              : (r < lay.videoStart() ? H3_TAG_AUDIO : H3_TAG_VIDEO));
+    if (inputs.tags[r] != want && !(r < lay.text && inputs.tags[r] == H3_TAG_VIDEO))
+      throw std::invalid_argument(
+          std::format("layout tags differ from [text | conditioning | audio | video] at row {}", r));
   }
   WindowTable &table = dit->table.emplace(lay, request_.windowChunk, request_.windowRadius);
   table.upload(b);
@@ -158,12 +166,13 @@ void Engine::loadDitWith(const DitInputs &inputs, std::unique_ptr<model::DitWeig
   const auto bounds = table.branchBounds();
   std::memcpy(plan.view(Tensor::Bounds).contents(), bounds.data(), bounds.size() * sizeof(bounds[0]));
   dit->scheduler = std::make_unique<Scheduler>(b, lay, plan, table, dit->weights.get(), dit->stream.get(), qkfix);
+  if (lay.cond) dit->scheduler->setConditioning(inputs.cond);
   dit_ = std::move(dit);
   const DitInfo info = ditInfo();
-  splash::logLine(std::format("H3 DiT M={} L={} Na={} F={} Spad={} window chunk={} radius={} density={:.4f} items={} "
-                              "chunked_groups={} qkfix={} stream_slots={} weights_MB={:.0f} activations_MB={:.0f} "
+  splash::logLine(std::format("H3 DiT M={} L={} C={} Na={} F={} Spad={} window chunk={} radius={} density={:.4f} "
+                              "items={} chunked_groups={} qkfix={} stream_slots={} weights_MB={:.0f} activations_MB={:.0f} "
                               "device_MB={:.0f}",
-                              M, lay.text, lay.audio, lay.frames, lay.paddedRows(), request_.windowChunk,
+                              M, lay.text, lay.cond, lay.audio, lay.frames, lay.paddedRows(), request_.windowChunk,
                               request_.windowRadius, info.density, info.windowItems, info.chunkedGroups, qkfix.size(),
                               info.streamSlots, info.weightsMb, info.activationsMb, info.deviceMb));
 }
@@ -199,9 +208,11 @@ void Engine::denoise(const Schedule &s, const float *videoNoise, const float *au
   const size_t audioCount = size_t(geometry_.audioRows) * H3_DIT_AUDIO_CHANNELS;
   std::vector<float> video(videoNoise, videoNoise + videoCount), audio(audioNoise, audioNoise + audioCount);
   std::vector<float> videoV(videoCount), audioV(audioCount);
+  // only the target rows are stepped: the conditioning rows stay at their noised keyframe latents (pipeline.py)
+  const size_t adaStepBlocks = size_t(H3_DIT_BLOCKS) * dit_->layout.adaModalities() * H3_ADA_ROWS * H3_DIT_HIDDEN;
   for (int32_t step = 0; step < s.steps; ++step) {
     ForwardStats stats;
-    forward(s.adaBlocks + size_t(step) * kAdaStepBlocks, s.adaFinal + size_t(step) * kAdaStepFinal, video.data(),
+    forward(s.adaBlocks + size_t(step) * adaStepBlocks, s.adaFinal + size_t(step) * kAdaStepFinal, video.data(),
             audio.data(), videoV.data(), audioV.data(), stats);
     if (!allFinite(videoV) || !allFinite(audioV)) splash::logWarning("H3 non-finite velocity at step ", step);
     euler(video, videoV, s.videoT[step], s.videoSigmas[step], s.videoSigmas[step + 1]);

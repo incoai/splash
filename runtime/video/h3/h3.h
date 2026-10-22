@@ -2,12 +2,14 @@
  * h3: MiniMax-H3 on-device engine (M5 Pro, macOS 27) -- its C ABI, which Splash's video engine process
  * (runtime/video/VideoRuntime.mm) drives; the engine runs on Splash's Metal backend and weight readers.
  *
- * One engine per request. The host supplies the request options and the text-encoder hidden states (Qwen3-VL-32B,
- * layer 50); the engine owns the device, the weights, the activations and every kernel choice, and returns latents,
- * frames, the waveform and the mp4. Phases:
+ * One engine per request. The host supplies the request options, the text-encoder hidden states (Qwen3-VL-32B,
+ * layer 50) and, for first-frame / last-frame conditioning (FL2VA, I2VA), the keyframe images; the engine owns the
+ * device, the weights, the activations and every kernel choice, and returns latents, frames, the waveform and the mp4.
+ * Phases:
  *
  *   h3_create            device, kernel library, request geometry
- *   h3_prep              text hidden states -> layout, RoPE, adaLN tables, refined text, schedule, noise
+ *   h3_prep              text hidden states (+ keyframes: video VAE encoder) -> layout, RoPE, adaLN tables, refined
+ *                        text, schedule, noise, keyframe conditioning rows
  *   h3_dit_load          DiT weights (resident or SSD-streamed), key-range table, activations; prepared layout
  *   h3_denoise           all steps: forward + Euler update, per-step callback      (or h3_dit_forward: one forward)
  *   h3_dit_release       frees the DiT memory (weights, slots, activations)
@@ -30,7 +32,7 @@
 extern "C" {
 #endif
 
-#define H3_ABI_VERSION 2
+#define H3_ABI_VERSION 3
 #define H3_MAX_QKFIX_BLOCKS 8
 
 typedef enum h3_status {
@@ -78,14 +80,23 @@ typedef struct h3_geometry {
   int32_t audio_samples;          /* samples per channel of h3_decode_audio (800 per audio latent) */
 } h3_geometry;
 
-/* Text conditioning of h3_prep: the hidden states of Qwen3-VL-32B-Instruct after decoder layer 50 of 64
- * (hidden_states[50], unnormalized), fp32 [text_rows][5120], all rows text (the prompt tokenized without special
- * tokens or chat template). */
+/* Inputs of h3_prep.
+ * Text conditioning: the hidden states of Qwen3-VL-32B-Instruct after decoder layer 50 of 64 (hidden_states[50],
+ * unnormalized), fp32 [text_rows][5120]: the prompt tokenized without special tokens or chat template, preceded for
+ * FL2VA by the text encoder's keyframe presentation ("<Picture i>: " + vision block per keyframe) when the host has
+ * a vision tower; text_tags marks the vision-block rows (tag 0, video adaLN) among the text rows (tag 1).
+ * Keyframes (FL2VA / I2VA, optional): uint8 RGB [height][width][3] of the request canvas (1344 x 768), already
+ * resized / cropped as the MLX port's prepare_keyframe_image (first keyframe stretched, a second cover-cropped,
+ * LANCZOS); first_frame anchors latent frame 0, last_frame the last latent frame. Each becomes 1008 conditioning rows
+ * (video VAE encoder, seeded posterior sample, noised to t = 0.999) that stay fixed through the denoising loop. */
 typedef struct h3_prep_inputs {
   const float *hidden;
-  int32_t text_rows; /* >= 2 */
-  int32_t steps;     /* 0: the variant's (turbo 8, default 50) */
-  uint64_t seed;     /* noise: MLX random.normal under mx.random.seed(seed) */
+  int32_t text_rows;          /* >= 2 */
+  int32_t steps;              /* 0: the variant's (turbo 8, default 50) */
+  uint64_t seed;              /* noise: MLX random.normal under mx.random.seed(seed) */
+  const uint8_t *text_tags;   /* nullable: [text_rows] 1 text, 0 vision-block row; NULL = all text */
+  const uint8_t *first_frame; /* nullable: RGB [height][width][3] */
+  const uint8_t *last_frame;  /* nullable: RGB [height][width][3] */
 } h3_prep_inputs;
 
 /* Outputs of h3_prep, owned by the engine (valid until the next h3_prep, h3_prep_release or h3_destroy). They are
@@ -93,11 +104,11 @@ typedef struct h3_prep_inputs {
  * (ada_blocks, ada_final, video_t, audio_t, video_sigmas, audio_sigmas, video_noise, audio_noise) directly. */
 typedef struct h3_prepared {
   int32_t text_rows, rows, steps, distinct_t;
-  const uint8_t *tags;                      /* [rows] 1 text, 2 audio, 0 video */
+  const uint8_t *tags;                      /* [rows] 1 text, 2 audio, 0 video, 3 keyframe conditioning (video) */
   const uint16_t *rope;                     /* bf16 [rows][96]: cos 48 | sin 48 */
   const float *pos;                         /* [rows][3] (t, h, w) */
   const uint16_t *text;                     /* bf16 [text_rows][5376] refined text */
-  const uint16_t *ada_blocks;               /* bf16 [steps][50][3][6][5376] */
+  const uint16_t *ada_blocks;               /* bf16 [steps][50][ada_modalities][6][5376] */
   const uint16_t *ada_final;                /* bf16 [steps][3][2][5376] */
   const float *video_t, *audio_t;           /* [steps] */
   const float *video_sigmas, *audio_sigmas; /* [steps + 1] */
@@ -106,20 +117,29 @@ typedef struct h3_prepared {
   const float *video_noise;                 /* [video_rows][96] */
   const float *audio_noise;                 /* [audio_rows][32] */
   double seconds;
+  /* keyframe conditioning (FL2VA); cond_rows = 0, ada_modalities = 3 and NULL arrays without keyframes */
+  int32_t cond_rows;                        /* 1008 per keyframe, packed after the text rows */
+  int32_t ada_modalities;                   /* adaLN slots per block: 3 (video, text, audio), 4 (+ conditioning) */
+  const float *cond;                        /* [cond_rows][96] noised keyframe latents, fixed for every step */
+  const float *cond_t;                      /* [steps] conditioning timestep max(video t, 0.999) */
+  const int64_t *cond_index;                /* [steps] into table */
 } h3_prepared;
 
-/* Prepared layout of the packed DiT sequence [text L | audio | video] (h3_prep). */
+/* Prepared layout of the packed DiT sequence [text L | keyframes C | audio | video] (h3_prep). */
 typedef struct h3_dit_inputs {
   int32_t text_rows;     /* L */
-  const uint8_t *tags;   /* [M] modality: 0 video, 1 text, 2 audio */
+  const uint8_t *tags;   /* [M] modality: 0 video, 1 text (0 for vision-block rows), 2 audio, 3 conditioning */
   const uint16_t *rope;  /* bf16 [M][96]: cos 48 | sin 48 */
   const uint16_t *text;  /* bf16 [L][5376] refined text */
+  int32_t cond_rows;     /* C: keyframe conditioning rows (0 or 1008 per keyframe) */
+  const float *cond;     /* [C][96] (h3_prepared.cond), copied; NULL when C = 0 */
 } h3_dit_inputs;
 
-/* Denoising schedule (rectified-flow Euler, eta 0, one forward per step). */
+/* Denoising schedule (rectified-flow Euler, eta 0, one forward per step). With keyframe conditioning the adaLN tables
+ * have 4 slots per block (h3_prepared.ada_modalities) and only the target rows are stepped. */
 typedef struct h3_schedule {
   int32_t steps;
-  const uint16_t *ada_blocks;               /* bf16 [steps][50][3][6][5376] */
+  const uint16_t *ada_blocks;               /* bf16 [steps][50][3 | 4][6][5376] */
   const uint16_t *ada_final;                /* bf16 [steps][3][2][5376] */
   const float *video_t, *audio_t;           /* [steps] */
   const float *video_sigmas, *audio_sigmas; /* [steps + 1] */
@@ -136,7 +156,7 @@ typedef struct h3_forward_stats {
 } h3_forward_stats;
 
 typedef struct h3_dit_info {
-  int32_t rows, padded_rows, text_rows, audio_rows, video_rows;
+  int32_t rows, padded_rows, text_rows, audio_rows, video_rows, cond_rows;
   int32_t window_items, chunked_groups, partial_slots;
   double density;           /* allowed (q, k) pairs / rows^2 */
   int32_t stream_slots;     /* 0: weights resident */
@@ -179,19 +199,21 @@ typedef void (*h3_step_callback)(void *user, int32_t step, const h3_forward_stat
 
 h3_request h3_default_request(void);
 h3_status h3_geometry_of(const h3_request *request, h3_geometry *out);
-/* Key-range table of the window softmax for this request and text length: int32 words; returns the word count
- * (call with capacity 0 to size the buffer), or -1 on a bad request. */
-int64_t h3_window_table(const h3_request *request, int32_t text_rows, int32_t *words, int64_t capacity);
+/* Key-range table of the window softmax for this request, text length and conditioning rows: int32 words; returns
+ * the word count (call with capacity 0 to size the buffer), or -1 on a bad request. */
+int64_t h3_window_table(const h3_request *request, int32_t text_rows, int32_t cond_rows, int32_t *words,
+                        int64_t capacity);
 
 h3_status h3_create(const h3_config *config, const h3_request *request, h3_engine **out);
 void h3_destroy(h3_engine *engine);
 const char *h3_error(const h3_engine *engine);
 
 /* Request-constant DiT inputs (weights: <weights>/dit-<variant>/prep.safetensors, vdn-w8-blockNN / vdn-globals LoRA
- * factors, <weights>/fl2va/transformer adaLN bases). */
+ * factors, <weights>/fl2va/transformer adaLN bases; keyframes: <weights>/vae/vae_enc_f16.bin). */
 h3_status h3_prep(h3_engine *engine, const h3_prep_inputs *inputs, h3_prepared *out);
 /* The last h3_prep's arrays as a prep directory (layout.npz, sched.npz, ada_blocks.npy, ada_final.npy, text_ref.npy,
- * noise.npz, prep.json; the files of the former Python prep). */
+ * noise.npz, prep.json; the files of the former Python prep; with keyframes also layout C / keyframes, sched c_t / tc,
+ * noise cond and keyframes.npz). */
 h3_status h3_prep_write(h3_engine *engine, const char *dir);
 void h3_prep_release(h3_engine *engine);
 

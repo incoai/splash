@@ -158,4 +158,26 @@ void PrepOps::normal(Encoder &e, View bits, View y, int n) {
   e.dispatch(grid1(n), size3(256, 1, 1));
 }
 
+void PrepOps::keyframeLatents(Encoder &e, View moments, View eps, View stats, View rows, int keyframes, int LH,
+                              int LW) {
+  const PrepKeyframeParams p{keyframes, LH, LW, 0};
+  e.pipeline("prep_keyframe_latents");
+  e.bind(moments, 0);
+  e.bind(eps, 1);
+  e.bind(stats, 2);
+  e.bind(rows, 3);
+  e.bytes(p, 4);
+  e.dispatch(grid1(keyframes * LH * LW * 24), size3(256, 1, 1));
+}
+
+void PrepOps::condNoise(Encoder &e, View x, View noise, View y, int n, float t, float omt) {
+  const PrepCondNoiseParams p{n, 0, t, omt};
+  e.pipeline("prep_cond_noise");
+  e.bind(x, 0);
+  e.bind(noise, 1);
+  e.bind(y, 2);
+  e.bytes(p, 3);
+  e.dispatch(grid1(n), size3(256, 1, 1));
+}
+
 } // namespace h3::ops

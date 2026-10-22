@@ -35,13 +35,18 @@ public:
   void encodeBlock(int block, const BlockBinding &weights, Encoder &e) const;
   [[nodiscard]] BlockBinding residentBinding(int block) const;
 
-  // ada: bf16 [50][3][6][5376] and [3][2][5376] of one step; latents fp32 [Nv][96] / [Na][32].
+  // ada: bf16 [50][3 | 4][6][5376] (4 slots with conditioning rows) and [3][2][5376] of one step; latents fp32
+  // [Nv][96] / [Na][32] (target rows; the conditioning rows are setConditioning's).
   void forward(const uint16_t *adaBlocks, const uint16_t *adaFinal, const float *videoIn, const float *audioIn,
                float *videoOut, float *audioOut, ForwardStats &stats);
 
   [[nodiscard]] const MemoryPlan &plan() const { return plan_; }
   // Blocks per forward (default all 50; the quick synthetic check runs 1).
   void setBlocks(int blocks) { blocks_ = blocks; }
+  // Keyframe conditioning rows fp32 [C][96] (layout.cond rows), fixed for the request.
+  void setConditioning(const float *rows) {
+    cond_.assign(rows, rows + size_t(layout_.cond) * H3_DIT_VIDEO_CHANNELS);
+  }
 
 private:
   [[nodiscard]] ops::AttentionBuffers attentionBuffers() const;
@@ -57,6 +62,7 @@ private:
   std::set<int> qkfixBlocks_;
   ops::LinearBranch branch_;
   int blocks_ = H3_DIT_BLOCKS;
+  std::vector<float> cond_;
 };
 
 } // namespace h3

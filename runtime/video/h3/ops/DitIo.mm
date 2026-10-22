@@ -7,7 +7,7 @@ namespace h3::ops {
 namespace {
 
 DitIoParams params(const model::SequenceLayout &lay) {
-  return {lay.text, lay.audio, H3_DIT_VIDEO_CHANNELS, H3_DIT_AUDIO_CHANNELS, H3_DIT_HIDDEN, device::kNormEps};
+  return {lay.text, lay.audio, H3_DIT_VIDEO_CHANNELS, H3_DIT_AUDIO_CHANNELS, H3_DIT_HIDDEN, device::kNormEps, lay.cond};
 }
 
 } // namespace

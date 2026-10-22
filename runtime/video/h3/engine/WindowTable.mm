@@ -77,7 +77,7 @@ WindowTable::WindowTable(const model::SequenceLayout &lay, int32_t chunk, int32_
   t.frames_ = lay.frames;
   t.words_.assign(static_cast<size_t>(nqb + 1) * H3_TABLE_RECORD, 0);
   const int32_t header[15] = {H3_TABLE_MAGIC, 1,         S,         nqb,        chunk,
-                              radius,         kAnchorsBoth, lay.text, 0,          lay.audio,
+                              radius,         kAnchorsBoth, lay.text, lay.cond,   lay.audio,
                               lay.frames,     lay.tokensPerFrame,     0, lay.videoStart(), window.videoEnd()};
   std::copy(header, header + 15, t.words_.begin());
   std::map<int32_t, Ranges> cache;

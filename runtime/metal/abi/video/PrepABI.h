@@ -52,3 +52,16 @@ struct PrepNormalParams {
   int32_t n, pad0;
   float lo, range;
 };
+
+// prep_keyframe_latents: FL2VA keyframe posterior sample -> normalised, patchified conditioning rows
+// (pipeline._encode_keyframes after the encoder). moments [k][LH][LW][48], eps [k][LH][LW][24] (MLX normal, seed 42),
+// stats [48] = latents_mean 24 | latents_std 24, rows [k][LH / 2][LW / 2][96].
+struct PrepKeyframeParams {
+  int32_t keyframes, LH, LW, pad0;
+};
+
+// prep_cond_noise: scale_noise(rows, t, noise) = t rows + (1 - t) noise (t = 0.999, noise from the request seed).
+struct PrepCondNoiseParams {
+  int32_t n, pad0;
+  float t, omt;
+};

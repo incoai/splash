@@ -16,9 +16,10 @@ struct IoBuffers {
   BufferView videoIn, audioIn, videoOut, audioOut;
 };
 
-// X = [refined text | audio_patch_proj(audio) | video_patch_proj(video)], bf16.
+// X = [refined text | video_patch_proj(conditioning) | audio_patch_proj(audio) | video_patch_proj(video)], bf16;
+// videoIn holds the conditioning rows, then the target rows.
 void embed(Encoder &e, const model::SequenceLayout &layout, const model::DitIoWeights &w, const IoBuffers &x);
-// final_layer on the audio and video rows -> fp32 velocities.
+// final_layer on the target audio and video rows -> fp32 velocities.
 void finalLayer(Encoder &e, const model::SequenceLayout &layout, const model::DitIoWeights &w, const IoBuffers &x);
 
 } // namespace h3::ops

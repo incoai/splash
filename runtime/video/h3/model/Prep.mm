@@ -2,9 +2,12 @@
 
 #include "AwakeClock.hpp"
 #include "metal/abi/video/Layout.h"
+#include "video/h3/engine/Errors.hpp"
 #include "video/h3/model/Numpy.hpp"
+#include "video/h3/model/VaeLatents.hpp"
 #include "video/h3/model/WeightFiles.hpp"
 #include "video/h3/ops/PrepOps.hpp"
+#include "video/h3/ops/VaeEncoder.hpp"
 
 #include <dispatch/dispatch.h>
 
@@ -59,6 +62,28 @@ std::vector<double> spatialGrid(int dim, int patch, double sqrtArea) {
   std::vector<double> g = linspaceNoEnd(left, left + ratio, dim / patch);
   for (double &v : g) v = v * 32;
   return g;
+}
+
+// numpy add.reduce of float64 (pairwise summation, 8 accumulators, blocks of 128) from the identity 0
+double pairwiseSum(const double *a, int64_t n) {
+  if (n < 8) {
+    double r = 0.0;
+    for (int64_t i = 0; i < n; ++i) r += a[i];
+    return r;
+  }
+  if (n <= 128) {
+    double r[8];
+    for (int j = 0; j < 8; ++j) r[j] = a[j];
+    int64_t i = 8;
+    for (; i < n - (n % 8); i += 8)
+      for (int j = 0; j < 8; ++j) r[j] += a[i + j];
+    double res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
+    for (; i < n; ++i) res += a[i];
+    return res;
+  }
+  int64_t n2 = n / 2;
+  n2 -= n2 % 8;
+  return pairwiseSum(a, n2) + pairwiseSum(a + n2, n - n2);
 }
 
 // MLX threefry2x32 (random.metal)
@@ -157,7 +182,8 @@ void applyLora(const uint16_t *h, const std::vector<double> &st, const float *A,
 
 } // namespace
 
-void Prep::layout(const VideoGeometry &g, int32_t L, Prepared &p) {
+void Prep::layout(const VideoGeometry &g, int32_t L, const uint8_t *textTags, const std::vector<int32_t> &anchors,
+                  Prepared &p) {
   p.frames = g.frames;
   p.textRows = L;
   p.latT = g.latentFrames;
@@ -166,13 +192,35 @@ void Prep::layout(const VideoGeometry &g, int32_t L, Prepared &p) {
   p.nAud = g.audioRows / 2;
   p.audioRows = g.audioRows;
   p.videoRows = g.videoRows();
-  p.rows = L + p.audioRows + p.videoRows;
+  p.anchors = anchors;
+  p.condRows = static_cast<int32_t>(anchors.size()) * g.tokensPerFrame;
+  p.rows = L + p.condRows + p.audioRows + p.videoRows;
   const int32_t M = p.rows, n = p.nAud, gh = g.gridH, gw = g.gridW, rowsPerFrame = gh * gw;
   std::vector<double> pos(size_t(M) * 3, 0.0);
   for (int32_t i = 0; i < L; ++i) pos[size_t(i) * 3] = static_cast<double>(i);
   const double sqrtArea = std::sqrt(static_cast<double>(p.latH * p.latW));
   const std::vector<double> hg = spatialGrid(p.latH, 2, sqrtArea), wg = spatialGrid(p.latW, 2, sqrtArea);
-  const int32_t audioStart = L, videoStart = L + p.audioRows;
+  const int32_t condStart = L, audioStart = L + p.condRows, videoStart = audioStart + p.audioRows;
+  for (size_t k = 0; k < anchors.size(); ++k) {
+    // anchor time: the first latent frame (L), or the last one: L + _temporal_position_span(F) - 5/3, the span summed
+    // pairwise by numpy
+    double t = static_cast<double>(L);
+    if (anchors[k] == 1) {
+      static constexpr int kPat[5] = {1, 4, 4, 4, 4};
+      std::vector<double> spans(p.latT, 5.0 / 3.0);
+      for (int32_t f = 0; f < p.latT; ++f) spans[f] = spans[f] * kPat[f % 5];
+      const double span = 0.0 + pairwiseSum(spans.data(), p.latT);
+      t = static_cast<double>(L) + span;
+      t = t - 5.0 / 3.0;
+    }
+    for (int32_t y = 0; y < gh; ++y)
+      for (int32_t x = 0; x < gw; ++x) {
+        double *r = &pos[size_t(condStart + int32_t(k) * rowsPerFrame + y * gw + x) * 3];
+        r[0] = t;
+        r[1] = hg[y];
+        r[2] = wg[x];
+      }
+  }
   for (int32_t c = 0; c < 2; ++c)
     for (int32_t t = 0; t < n; ++t) {
       double *r = &pos[size_t(audioStart + c * n + t) * 3];
@@ -198,12 +246,13 @@ void Prep::layout(const VideoGeometry &g, int32_t L, Prepared &p) {
       }
   p.pos.resize(pos.size());
   for (size_t i = 0; i < pos.size(); ++i) p.pos[i] = static_cast<float>(pos[i]);
-  p.tags.assign(M, 0);
-  std::fill(p.tags.begin(), p.tags.begin() + L, uint8_t(1));
-  std::fill(p.tags.begin() + audioStart, p.tags.begin() + videoStart, uint8_t(2));
+  p.tags.assign(M, H3_TAG_VIDEO);
+  for (int32_t i = 0; i < L; ++i) p.tags[i] = textTags ? textTags[i] : uint8_t(H3_TAG_TEXT);
+  std::fill(p.tags.begin() + condStart, p.tags.begin() + audioStart, uint8_t(H3_TAG_COND));
+  std::fill(p.tags.begin() + audioStart, p.tags.begin() + videoStart, uint8_t(H3_TAG_AUDIO));
 }
 
-void Prep::schedule(int32_t steps, Prepared &p) {
+void Prep::schedule(int32_t steps, bool conditioned, Prepared &p) {
   if (steps < 1) throw std::invalid_argument("prep: steps must be >= 1");
   // scheduler._linspace_1_to_0(steps + 1) and the exponential shift, float32 element ops as numpy
   auto sigmas = [&](float shift) {
@@ -247,6 +296,11 @@ void Prep::schedule(int32_t steps, Prepared &p) {
   p.aT = timesteps(p.aSigmas);
   std::set<float> distinct(p.vT.begin(), p.vT.end());
   distinct.insert(p.aT.begin(), p.aT.end());
+  p.cT.clear();
+  if (conditioned) {  // _row_timestep_plan: conditioning rows at max(t, KEYFRAME_NOISE_AUG) in Python floats, as fp32
+    for (float t : p.vT) p.cT.push_back(static_cast<float>(std::max(static_cast<double>(t), 0.999)));
+    distinct.insert(p.cT.begin(), p.cT.end());
+  }
   p.table.assign(distinct.begin(), distinct.end());
   auto index = [&](const std::vector<float> &t) {
     std::vector<int64_t> idx(t.size());
@@ -256,28 +310,30 @@ void Prep::schedule(int32_t steps, Prepared &p) {
   };
   p.tv = index(p.vT);
   p.ta = index(p.aT);
+  p.tc = index(p.cT);
+}
+
+void Prep::drawBits(uint64_t seed, const std::vector<size_t> &counts, std::vector<std::vector<uint32_t>> &out) {
+  // mx.random.seed(seed): key (seed >> 32, seed); every draw takes KeySequence::next(): split(key) -> key = [0],
+  // subkey = [1]
+  uint32_t k0 = static_cast<uint32_t>(seed >> 32), k1 = static_cast<uint32_t>(seed);
+  out.assign(counts.size(), {});
+  for (size_t d = 0; d < counts.size(); ++d) {
+    uint32_t key[4];
+    randomBits(k0, k1, 4, key);
+    k0 = key[0];
+    k1 = key[1];
+    out[d].resize(counts[d]);
+    randomBits(key[2], key[3], counts[d], out[d].data());
+  }
 }
 
 void Prep::noiseBits(uint64_t seed, size_t videoCount, size_t audioCount, std::vector<uint32_t> &video,
                      std::vector<uint32_t> &audio) {
-  // mx.random.seed(seed): key (seed >> 32, seed); every draw takes KeySequence::next(): split(key) -> key = [0],
-  // subkey = [1]
-  uint32_t k0 = static_cast<uint32_t>(seed >> 32), k1 = static_cast<uint32_t>(seed);
-  auto next = [&](uint32_t &s0, uint32_t &s1) {
-    uint32_t out[4];
-    randomBits(k0, k1, 4, out);
-    k0 = out[0];
-    k1 = out[1];
-    s0 = out[2];
-    s1 = out[3];
-  };
-  uint32_t s0, s1;
-  next(s0, s1);
-  video.resize(videoCount);
-  randomBits(s0, s1, videoCount, video.data());
-  next(s0, s1);
-  audio.resize(audioCount);
-  randomBits(s0, s1, audioCount, audio.data());
+  std::vector<std::vector<uint32_t>> bits;
+  drawBits(seed, {videoCount, audioCount}, bits);
+  video = std::move(bits[0]);
+  audio = std::move(bits[1]);
 }
 
 void Prep::run(metal::MetalBackend &b, const std::string &weights, Variant variant, const VideoGeometry &g,
@@ -285,10 +341,30 @@ void Prep::run(metal::MetalBackend &b, const std::string &weights, Variant varia
   const auto t0 = AwakeClock::now();
   if (!in.hidden || in.textRows < 2) throw std::invalid_argument("prep: text hidden states need >= 2 rows");
   const int32_t L = in.textRows;
+  if (in.textTags)
+    for (int32_t i = 0; i < L; ++i)
+      if (in.textTags[i] != H3_TAG_TEXT && in.textTags[i] != H3_TAG_VIDEO)
+        throw std::invalid_argument("prep: text row " + std::to_string(i) + " has tag " +
+                                    std::to_string(in.textTags[i]) + " (1 text, 0 vision block)");
   const int32_t steps = in.steps > 0 ? in.steps : (variant == Variant::Turbo ? 8 : 50);
-  layout(g, L, p);
-  schedule(steps, p);
+  std::vector<int32_t> anchors;
+  if (in.firstFrame) anchors.push_back(0);
+  if (in.lastFrame) anchors.push_back(1);
+  const int32_t K = static_cast<int32_t>(anchors.size());
+  layout(g, L, in.textTags, anchors, p);
+  schedule(steps, K > 0, p);
   p.layoutS = since(t0);
+  if (K) {  // keyframe moments: the video VAE encoder (released before the text path allocates)
+    const auto te = AwakeClock::now();
+    const size_t frameBytes = size_t(g.height) * g.width * 3;
+    std::vector<uint8_t> rgb;
+    for (const uint8_t *f : {in.firstFrame, in.lastFrame})
+      if (f) rgb.insert(rgb.end(), f, f + frameBytes);
+    ops::VaeEncodeStats es;
+    ops::VaeEncoder(b, weights + "/vae").encodeRgb(rgb.data(), K, g.height, g.width, p.moments, es);
+    if (es.nonfinite) throw GpuError("prep: " + std::to_string(es.nonfinite) + " non-finite keyframe moments");
+    p.encodeS = since(te);
+  }
   const std::string ditDir = weights + (variant == Variant::Turbo ? "/dit-turbo" : "/dit-default");
   const SafetensorsCheckpoint dit(ditDir);
   ops::PrepOps op;
@@ -332,13 +408,40 @@ void Prep::run(metal::MetalBackend &b, const std::string &weights, Variant varia
   buf.make("final", {L, kD}, 2);
   const size_t videoCount = size_t(H3_VAE_LATENT) * p.latT * p.latH * p.latW, audioCount = size_t(p.audioRows) * 32;
   std::vector<uint32_t> vbits, abits;
-  noiseBits(in.seed, videoCount, audioCount, vbits, abits);
+  buf.make("noise_v", {1, H3_VAE_LATENT, p.latT, p.latH, p.latW}, 4);
+  buf.make("noise_a", {p.audioRows, 32}, 4);
+  const size_t condCount = size_t(p.condRows) * 96, epsCount = size_t(p.latH) * p.latW * H3_VAE_LATENT;
+  if (K) {
+    // keyframe posterior noise: mx.random.seed(42), one draw per keyframe ([1][1][H][W][24], channels last); then the
+    // request's draws in pipeline order: keyframe noise, video latents, audio rows
+    std::vector<std::vector<uint32_t>> kbits, rbits;
+    drawBits(42, std::vector<size_t>(K, epsCount), kbits);
+    drawBits(in.seed, {condCount, videoCount, audioCount}, rbits);
+    buf.make("moments", {K, p.latH, p.latW, 48}, 4);
+    std::memcpy(buf.contents("moments"), p.moments.data(), p.moments.size() * 4);
+    buf.make("bits_k", {int64_t(K * epsCount)}, 4);
+    for (int32_t k = 0; k < K; ++k)
+      std::memcpy(static_cast<uint32_t *>(buf.contents("bits_k")) + k * epsCount, kbits[k].data(), epsCount * 4);
+    buf.make("eps", {K, p.latH, p.latW, H3_VAE_LATENT}, 4);
+    buf.make("latent_stats", {48}, 4);
+    for (int c = 0; c < 24; ++c) {
+      static_cast<float *>(buf.contents("latent_stats"))[c] = static_cast<float>(kVaeLatentMean[c]);
+      static_cast<float *>(buf.contents("latent_stats"))[24 + c] = static_cast<float>(kVaeLatentStd[c]);
+    }
+    buf.make("cond_clean", {p.condRows, 96}, 4);
+    buf.make("bits_c", {int64_t(condCount)}, 4);
+    std::memcpy(buf.contents("bits_c"), rbits[0].data(), condCount * 4);
+    buf.make("noise_c", {p.condRows, 96}, 4);
+    buf.make("cond", {p.condRows, 96}, 4);
+    vbits = std::move(rbits[1]);
+    abits = std::move(rbits[2]);
+  } else {
+    noiseBits(in.seed, videoCount, audioCount, vbits, abits);
+  }
   buf.make("bits_v", {int64_t(videoCount)}, 4);
   buf.make("bits_a", {int64_t(audioCount)}, 4);
   std::memcpy(buf.contents("bits_v"), vbits.data(), videoCount * 4);
   std::memcpy(buf.contents("bits_a"), abits.data(), audioCount * 4);
-  buf.make("noise_v", {1, H3_VAE_LATENT, p.latT, p.latH, p.latW}, 4);
-  buf.make("noise_a", {p.audioRows, 32}, 4);
 
   auto weight = [&](const std::string &name, const char *dtype, const std::vector<int64_t> &shape) {
     return BufferView{resident(b, dit, name, dtype, shape)};
@@ -405,7 +508,19 @@ void Prep::run(metal::MetalBackend &b, const std::string &weights, Variant varia
     op.rms(e, buf[x], finalNorm, buf["final"], L, kD, kD, kD, kEps);
     op.normal(e, buf["bits_v"], buf["noise_v"], int(videoCount));
     op.normal(e, buf["bits_a"], buf["noise_a"], int(audioCount));
+    if (K) {
+      op.normal(e, buf["bits_k"], buf["eps"], int(K * epsCount));
+      op.keyframeLatents(e, buf["moments"], buf["eps"], buf["latent_stats"], buf["cond_clean"], K, p.latH, p.latW);
+      op.normal(e, buf["bits_c"], buf["noise_c"], int(condCount));
+      // scale_noise(rows, KEYFRAME_NOISE_AUG, noise): float(t32) and float(1 - t32) in fp32
+      const float t32 = 0.999f, omt = 1.0f - t32;
+      op.condNoise(e, buf["cond_clean"], buf["noise_c"], buf["cond"], int(condCount), t32, omt);
+    }
     h3::run(b, e);
+  }
+  if (K) {
+    p.condClean.assign(buf.host<float>("cond_clean"), buf.host<float>("cond_clean") + condCount);
+    p.cond.assign(buf.host<float>("cond"), buf.host<float>("cond") + condCount);
   }
   p.textS = since(t1);
   // RoPE bf16 [M][96] = cos 48 | sin 48
@@ -437,7 +552,9 @@ void Prep::run(metal::MetalBackend &b, const std::string &weights, Variant varia
   const auto t2 = AwakeClock::now();
   std::vector<double> st(size_t(T) * kTembDim);
   for (size_t i = 0; i < st.size(); ++i) st[i] = double(buf.host<float>("st")[i]);
-  p.adaBlocks.assign(size_t(steps) * H3_DIT_BLOCKS * kAdaOut, 0);
+  const int32_t slots = p.adaModalities();  // video, text, audio (+ conditioning video at max(t, 0.999))
+  constexpr size_t kTag = size_t(H3_ADA_ROWS) * kD;
+  p.adaBlocks.assign(size_t(steps) * H3_DIT_BLOCKS * slots * kTag, 0);
   p.adaFinal.assign(size_t(steps) * H3_MODALITIES * kFinalOut, 0);
   {  // final layer (vdn-globals LoRA)
     std::vector<float> A, B;
@@ -490,12 +607,12 @@ void Prep::run(metal::MetalBackend &b, const std::string &weights, Variant varia
     wait(ticket);
     applyLora(static_cast<const uint16_t *>(hslot[s].contents()), st, lora ? A.data() : nullptr,
               lora ? B.data() : nullptr, T, kTembDim, kAdaOut, tab);
-    constexpr size_t kTag = size_t(H3_ADA_ROWS) * kD;
     for (int32_t sp = 0; sp < steps; ++sp)
-      for (int m = 0; m < H3_MODALITIES; ++m) {
-        const int64_t t = m < 2 ? p.tv[sp] : p.ta[sp];
-        std::memcpy(&p.adaBlocks[((size_t(sp) * H3_DIT_BLOCKS + i) * H3_MODALITIES + m) * kTag],
-                    &tab[size_t(t) * kAdaOut + m * kTag], kTag * 2);
+      for (int m = 0; m < slots; ++m) {
+        const int64_t t = m == H3_TAG_COND ? p.tc[sp] : (m < 2 ? p.tv[sp] : p.ta[sp]);
+        const int src = m == H3_TAG_COND ? H3_TAG_VIDEO : m;  // modality slice of the adaLN output
+        std::memcpy(&p.adaBlocks[((size_t(sp) * H3_DIT_BLOCKS + i) * slots + m) * kTag],
+                    &tab[size_t(t) * kAdaOut + src * kTag], kTag * 2);
       }
   }
   p.adalnS = since(t2);
@@ -533,25 +650,50 @@ void Prep::write(const std::string &dir, const Prepared &p, Variant variant, uin
   const NpyArray pos = NpyArray::of("<f4", {M, 3}, p.pos.data(), p.pos.size() * 4);
   const NpyArray L = i64(p.textRows), Na = i64(p.audioRows), Nv = i64(p.videoRows), latT = i64(p.latT),
                  latH = i64(p.latH), latW = i64(p.latW), nAud = i64(p.nAud), frames = i64(p.frames);
-  writeNpz(dir + "/layout.npz", {{"tags", &tags}, {"rope", &rope}, {"pos", &pos}, {"L", &L}, {"Na", &Na}, {"Nv", &Nv},
-                                 {"lat_t", &latT}, {"lat_h", &latH}, {"lat_w", &latW}, {"n_aud", &nAud},
-                                 {"frames", &frames}});
+  const NpyArray C = i64(p.condRows);
+  std::vector<int64_t> anchors(p.anchors.begin(), p.anchors.end());
+  const NpyArray keyframes = NpyArray::of("<i8", {int64_t(anchors.size())}, anchors.data(), anchors.size() * 8);
+  std::vector<std::pair<std::string, const NpyArray *>> lay{
+      {"tags", &tags}, {"rope", &rope}, {"pos", &pos}, {"L", &L}, {"Na", &Na}, {"Nv", &Nv}, {"lat_t", &latT},
+      {"lat_h", &latH}, {"lat_w", &latW}, {"n_aud", &nAud}, {"frames", &frames}};
+  if (p.condRows) {  // FL2VA only, so text-to-video prep files stay byte-identical
+    lay.push_back({"C", &C});
+    lay.push_back({"keyframes", &keyframes});
+  }
+  writeNpz(dir + "/layout.npz", lay);
   const int64_t S = p.steps, T = static_cast<int64_t>(p.table.size());
   const NpyArray vs = NpyArray::of("<f4", {S + 1}, p.vSigmas.data(), (S + 1) * 4);
   const NpyArray as = NpyArray::of("<f4", {S + 1}, p.aSigmas.data(), (S + 1) * 4);
   const NpyArray vt = NpyArray::of("<f4", {S}, p.vT.data(), S * 4), at = NpyArray::of("<f4", {S}, p.aT.data(), S * 4);
   const NpyArray table = NpyArray::of("<f4", {T}, p.table.data(), T * 4);
   const NpyArray tv = NpyArray::of("<i8", {S}, p.tv.data(), S * 8), ta = NpyArray::of("<i8", {S}, p.ta.data(), S * 8);
-  writeNpz(dir + "/sched.npz", {{"v_sigmas", &vs}, {"a_sigmas", &as}, {"v_t", &vt}, {"a_t", &at}, {"table", &table},
-                                {"tv", &tv}, {"ta", &ta}});
-  writeNpy(dir + "/ada_blocks.npy", NpyArray::of("<u2", {S, H3_DIT_BLOCKS, H3_MODALITIES, H3_ADA_ROWS, kD},
+  const NpyArray ct = NpyArray::of("<f4", {int64_t(p.cT.size())}, p.cT.data(), p.cT.size() * 4);
+  const NpyArray tc = NpyArray::of("<i8", {int64_t(p.tc.size())}, p.tc.data(), p.tc.size() * 8);
+  std::vector<std::pair<std::string, const NpyArray *>> sched{{"v_sigmas", &vs}, {"a_sigmas", &as}, {"v_t", &vt},
+                                                              {"a_t", &at},      {"table", &table}, {"tv", &tv},
+                                                              {"ta", &ta}};
+  if (p.condRows) {
+    sched.push_back({"c_t", &ct});
+    sched.push_back({"tc", &tc});
+  }
+  writeNpz(dir + "/sched.npz", sched);
+  writeNpy(dir + "/ada_blocks.npy", NpyArray::of("<u2", {S, H3_DIT_BLOCKS, p.adaModalities(), H3_ADA_ROWS, kD},
                                                  p.adaBlocks.data(), p.adaBlocks.size() * 2));
   writeNpy(dir + "/ada_final.npy",
            NpyArray::of("<u2", {S, H3_MODALITIES, 2, kD}, p.adaFinal.data(), p.adaFinal.size() * 2));
   writeNpy(dir + "/text_ref.npy", NpyArray::of("<u2", {p.textRows, kD}, p.text.data(), p.text.size() * 2));
   const NpyArray video = NpyArray::of("<f4", {p.videoRows, 96}, p.videoNoise.data(), p.videoNoise.size() * 4);
   const NpyArray audio = NpyArray::of("<f4", {p.audioRows, 32}, p.audioNoise.data(), p.audioNoise.size() * 4);
-  writeNpz(dir + "/noise.npz", {{"video", &video}, {"audio", &audio}});
+  const NpyArray cond = NpyArray::of("<f4", {p.condRows, 96}, p.cond.data(), p.cond.size() * 4);
+  if (p.condRows) {
+    writeNpz(dir + "/noise.npz", {{"video", &video}, {"audio", &audio}, {"cond", &cond}});
+    const int64_t K = static_cast<int64_t>(p.anchors.size());
+    const NpyArray moments = NpyArray::of("<f4", {K, p.latH, p.latW, 48}, p.moments.data(), p.moments.size() * 4);
+    const NpyArray clean = NpyArray::of("<f4", {p.condRows, 96}, p.condClean.data(), p.condClean.size() * 4);
+    writeNpz(dir + "/keyframes.npz", {{"moments", &moments}, {"clean", &clean}});
+  } else {
+    writeNpz(dir + "/noise.npz", {{"video", &video}, {"audio", &audio}});
+  }
   auto list = [](const std::vector<float> &v) {
     std::string s = "[";
     char x[32];
@@ -571,9 +713,18 @@ void Prep::write(const std::string &dir, const Prepared &p, Variant variant, uin
            static_cast<unsigned long long>(seed), variant == Variant::Turbo ? "turbo" : "default", p.adalnLoraBlocks,
            p.finalLora ? "true" : "false", source.c_str(), list(p.vSigmas).c_str(), list(p.aSigmas).c_str(), p.layoutS,
            p.textS, p.adalnS, p.adalnReadGb, p.totalS);
+  std::string text = json;
+  if (p.condRows) {
+    std::string kf;
+    for (int32_t a : p.anchors) kf += std::string(kf.empty() ? "" : ",") + (a == 0 ? "first" : "last");
+    char extra[256];
+    snprintf(extra, sizeof extra, ",\n \"cond_rows\": %d,\n \"keyframes\": \"%s\",\n \"encode_s\": %.3f\n}", p.condRows,
+             kf.c_str(), p.encodeS);
+    text = text.substr(0, text.size() - 2) + extra;
+  }
   FILE *f = fopen((dir + "/prep.json").c_str(), "w");
   if (!f) throw std::runtime_error("cannot write " + dir + "/prep.json");
-  fputs(json, f);
+  fputs(text.c_str(), f);
   fclose(f);
 }
 

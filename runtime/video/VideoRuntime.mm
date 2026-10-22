@@ -380,14 +380,22 @@ private:
     std::vector<float> video(size_t(geometry.video_rows) * 96), audio(size_t(geometry.audio_rows) * 32);
     @autoreleasepool {
       request.start(VideoPhase::Prepare);
-      const h3_prep_inputs inputs{hidden.data(), static_cast<int32_t>(rows), static_cast<int32_t>(frame.steps),
-                                  frame.seed};
+      // The keyframes arrive on the canvas (protocol::VideoRequestFrame): the video VAE encoder's input as is.
+      auto keyframe = [](const std::vector<uint8_t> &rgb) { return rgb.empty() ? nullptr : rgb.data(); };
+      const h3_prep_inputs inputs{hidden.data(),
+                                  static_cast<int32_t>(rows),
+                                  static_cast<int32_t>(frame.steps),
+                                  frame.seed,
+                                  nullptr,
+                                  keyframe(frame.firstFrame),
+                                  keyframe(frame.lastFrame)};
       h3_prepared prepared{};
       engine.check(h3_prep(engine.get(), &inputs, &prepared), "prepare the request");
       request.complete();
 
       request.start(VideoPhase::Denoise, static_cast<uint32_t>(prepared.steps));
-      const h3_dit_inputs dit{prepared.text_rows, prepared.tags, prepared.rope, prepared.text};
+      const h3_dit_inputs dit{prepared.text_rows, prepared.tags,      prepared.rope,
+                              prepared.text,      prepared.cond_rows, prepared.cond};
       engine.check(h3_dit_load(engine.get(), &dit), "load the DiT");
       const h3_schedule schedule{prepared.steps,         prepared.ada_blocks,   prepared.ada_final,
                                  prepared.video_t,       prepared.audio_t,      prepared.video_sigmas,

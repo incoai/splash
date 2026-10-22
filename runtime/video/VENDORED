@@ -1,8 +1,10 @@
 MiniMax-H3 video engine (h3): Splash's copy
 
-Imported from h3 commit 5b55ab7 (branch main, ABI v2: h3_prep, h3_denoise,
-h3_decode, h3_decode_audio, h3_preview, h3_write_mp4), once, without its
-history:
+Imported from h3 commit e6deb5e (branch main, ABI v3: h3_prep, with
+first-frame and first-and-last-frame conditioning (FL2VA keyframes),
+h3_denoise, h3_decode, h3_decode_audio, h3_preview, h3_write_mp4), without
+its history: first at 5b55ab7 (ABI v2), then with its keyframe
+conditioning (5b55ab7..e6deb5e):
 
   h3 runtime/{engine,media,model,ops}/   -> runtime/video/h3/{engine,media,model,ops}/
   h3 include/h3/h3.h (C ABI)             -> runtime/video/h3/h3.h
@@ -40,7 +42,11 @@ Splash's base layer instead of the one it came with:
   std::chrono::steady_clock -> AwakeClock.
 
 Gone with the h3 tools that used them: the VAE stage profile, the prep's
-intermediate dump and the numpy readers no caller uses. h3_forward_stats keeps
+intermediate dump and the numpy readers no caller uses; of the keyframe
+conditioning, the encoder's debug stop and the prep's moments input (h3
+encode-frame, prep --moments), and model/Keyframe: Splash's server puts a
+keyframe on the canvas with Pillow (server/images.py keyframe), the
+resampling h3's Keyframe reproduces. h3_forward_stats keeps
 its fields; those one command per block cannot measure (GPU time by step
 class, gaps between command buffers) are 0.
 

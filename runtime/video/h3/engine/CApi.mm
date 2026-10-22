@@ -114,11 +114,12 @@ h3_status h3_geometry_of(const h3_request *request, h3_geometry *out) {
   });
 }
 
-int64_t h3_window_table(const h3_request *request, int32_t text_rows, int32_t *words, int64_t capacity) {
+int64_t h3_window_table(const h3_request *request, int32_t text_rows, int32_t cond_rows, int32_t *words,
+                        int64_t capacity) {
   if (!request) return -1;
   int64_t n = -1;
   guarded(nullptr, [&] {
-    const h3::WindowTable table = h3::Engine::windowTable(toRequest(*request), text_rows);
+    const h3::WindowTable table = h3::Engine::windowTable(toRequest(*request), text_rows, cond_rows);
     n = static_cast<int64_t>(table.words().size());
     if (words && capacity >= n) std::memcpy(words, table.words().data(), static_cast<size_t>(n) * 4);
   });
@@ -145,7 +146,15 @@ h3_status h3_prep(h3_engine *e, const h3_prep_inputs *in, h3_prepared *out) {
   if (!e || !in || !out) return H3_ERROR_ARGUMENT;
   return guarded(e, [&] {
     auto p = std::make_unique<h3::model::Prepared>();
-    e->engine->prep({in->hidden, in->text_rows, in->steps, in->seed}, *p);
+    h3::model::PrepInputs inputs;
+    inputs.hidden = in->hidden;
+    inputs.textRows = in->text_rows;
+    inputs.steps = in->steps;
+    inputs.seed = in->seed;
+    inputs.textTags = in->text_tags;
+    inputs.firstFrame = in->first_frame;
+    inputs.lastFrame = in->last_frame;
+    e->engine->prep(inputs, *p);
     e->prepared = std::move(p);
     e->seed = in->seed;
     const h3::model::Prepared &q = *e->prepared;
@@ -153,7 +162,11 @@ h3_status h3_prep(h3_engine *e, const h3_prep_inputs *in, h3_prepared *out) {
                        q.tags.data(),     q.rope.data(),    q.pos.data(),     q.text.data(),
                        q.adaBlocks.data(), q.adaFinal.data(), q.vT.data(),      q.aT.data(),
                        q.vSigmas.data(),  q.aSigmas.data(), q.table.data(),   q.tv.data(),
-                       q.ta.data(),       q.videoNoise.data(), q.audioNoise.data(), q.totalS};
+                       q.ta.data(),       q.videoNoise.data(), q.audioNoise.data(), q.totalS,
+                       q.condRows,        q.adaModalities(),
+                       q.condRows ? q.cond.data() : nullptr,
+                       q.condRows ? q.cT.data() : nullptr,
+                       q.condRows ? q.tc.data() : nullptr};
   });
 }
 
@@ -171,7 +184,9 @@ void h3_prep_release(h3_engine *e) {
 
 h3_status h3_dit_load(h3_engine *e, const h3_dit_inputs *in) {
   if (!e || !in) return H3_ERROR_ARGUMENT;
-  return guarded(e, [&] { e->engine->loadDit({in->text_rows, in->tags, in->rope, in->text}); });
+  return guarded(e, [&] {
+    e->engine->loadDit({in->text_rows, in->tags, in->rope, in->text, in->cond_rows, in->cond});
+  });
 }
 
 h3_status h3_dit_info_of(const h3_engine *e, h3_dit_info *out) {
@@ -180,7 +195,8 @@ h3_status h3_dit_info_of(const h3_engine *e, h3_dit_info *out) {
     const h3::DitInfo info = e->engine->ditInfo();
     const h3::model::SequenceLayout &lay = *e->engine->layout();
     *out = h3_dit_info{info.rows,          info.paddedRows,  lay.text,          lay.audio,
-                       lay.frames * lay.tokensPerFrame,     info.windowItems, info.chunkedGroups, info.partialSlots,
+                       lay.frames * lay.tokensPerFrame,     lay.cond,         info.windowItems,   info.chunkedGroups,
+                       info.partialSlots,
                        info.density,       info.streamSlots, info.weightsMb,   info.activationsMb, info.deviceMb};
   });
 }
