@@ -17,7 +17,10 @@ The small tests exercise the actual Apple GPU, including teacher generation,
 feature capture, selector and full-draft optimization, optimizer/RNG resume,
 BF16 export, and final evaluation. Production Qwen3.8-27B memory, throughput,
 training quality, and trained-export native qualification still need testing.
-Keep this change draft until that evidence is available.
+Merge readiness covers this optional backend integration and its reproducible
+small-model CPU/MPS tests. Ready-for-review status does not qualify a trained
+Qwen3.8-27B checkpoint or establish production training capacity. Those
+checkpoint/deployment claims still require the real-model evidence below.
 
 ## Run the smoke tests
 

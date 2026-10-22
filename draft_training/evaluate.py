@@ -24,6 +24,11 @@ def evaluate_cached(model, embedding, head, directory, recipe, device):
     # Select the BF16 artifact that serving will load, rather than the FP32
     # master parameters. Restore their original storage even if replay fails;
     # the optimizer must retain every small update for the next training step.
+    from .quantization import enable_affine4
+
+    # Switching a module class must precede temporary parameter replacement.
+    # Otherwise MPS restoration would write masters back to an orphan module.
+    enable_affine4(model, recipe.affine4_scope)
     masters, replacements = [], []
     try:
         for name, parameter in list(model.named_parameters()):
@@ -153,6 +158,7 @@ def _evaluate_cached(model, embedding, head, directory, recipe, device):
     return {
         "scope": "frozen-teacher greedy trace replay; not native throughput or sampled acceptance",
         "weight_precision": "BF16 serving export",
+        "projection_forward": recipe.affine4_scope,
         "supervision": manifest["binding"]["supervision"],
         "blocks": totals["blocks"],
         "continuations_evaluated": totals["continuations_evaluated"],
