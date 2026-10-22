@@ -131,6 +131,8 @@ def train(
                     head,
                     alpha,
                     recipe.vocabulary_chunk_rows,
+                    prefix_weight=recipe.prefix_loss_weight,
+                    position_decay=recipe.position_decay,
                 )
             if not torch.isfinite(loss):
                 raise TrainingError(

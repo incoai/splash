@@ -51,6 +51,8 @@ class Recipe:
     max_grad_norm: float = 1.0
     selector_loss_weight: float = 1.0
     selector_warmup_steps: int = 10
+    prefix_loss_weight: float = 0.0
+    position_decay: float = 1.0
     checkpoint_interval: int = 10
     validation_interval: int = 10
     max_new_tokens: int = 128
@@ -95,6 +97,8 @@ class Recipe:
             "max_grad_norm",
             "weight_decay",
             "selector_loss_weight",
+            "prefix_loss_weight",
+            "position_decay",
         ):
             value = getattr(recipe, name)
             if (
@@ -105,15 +109,21 @@ class Recipe:
                 raise TrainingError(f"{name} must be finite")
             if value < 0 or (name in ("learning_rate", "max_grad_norm") and value == 0):
                 raise TrainingError(f"invalid {name}")
+        if not 0 < recipe.position_decay <= 1:
+            raise TrainingError("position_decay must be in (0, 1]")
         if recipe.trainable not in ("selector", "all"):
             raise TrainingError("trainable must be selector or all")
         if recipe.sequence_length < 16:
             raise TrainingError("sequence_length must be at least 16")
         if recipe.max_new_tokens >= recipe.sequence_length - 1:
             raise TrainingError("max_new_tokens must leave room for the prompt")
-        if recipe.trainable == "selector" and recipe.selector_loss_weight == 0:
+        if (
+            recipe.trainable == "selector"
+            and recipe.selector_loss_weight == 0
+            and recipe.prefix_loss_weight == 0
+        ):
             raise TrainingError(
-                "selector-only training needs a positive selector loss weight"
+                "selector-only training needs a positive selector or prefix loss weight"
             )
         return recipe
 

@@ -263,8 +263,10 @@ def run_training(args, *, family=True):
                 sample["tokens"],
                 anchor,
                 head,
-                1,
+                recipe.selector_loss_weight,
                 recipe.vocabulary_chunk_rows,
+                prefix_weight=recipe.prefix_loss_weight,
+                position_decay=recipe.position_decay,
             )
         if not loss.requires_grad:
             raise TrainingError(
@@ -286,6 +288,7 @@ def run_training(args, *, family=True):
         optimizer.step()
         return {
             "mode": "device-preflight",
+            "recipe": recipe.to_dict(),
             "capture_peak_cuda_bytes": capture_peak,
             "metrics": metrics,
             "training_peak_cuda_bytes": torch.cuda.max_memory_allocated()
