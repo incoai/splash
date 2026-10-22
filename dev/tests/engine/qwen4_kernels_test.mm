@@ -27,6 +27,7 @@
 #include "../../../runtime/ops/BlockIndexer.hpp"
 #include "../../../runtime/ops/HyperConnection.hpp"
 #include "../../../runtime/ops/NgramEmbedding.hpp"
+#include "../../../runtime/ops/ResidualSteer.hpp"
 #include "../../../runtime/ops/RoPE.hpp"
 #include "../../../runtime/ops/Sampling.hpp"
 #include "../../../runtime/model/ControlVector.hpp"
@@ -954,6 +955,59 @@ void pleHashTest(MetalBackend &backend) {
   check(ok, "PLE hash: GPU rows equal the CPU's");
 }
 
+// The control vector on a Qwen3.5-family target's bf16 residual
+// (ops::addResidualSteer): each steered row loses scale times its component
+// along the unit direction (project) or gains the scaled direction (add),
+// against an fp64 reference of the decoded bf16 inputs within their bf16
+// step; a projection of scale 1 leaves no component along the direction
+// beyond every value's bf16 rounding; the rows past the dispatch's, and the
+// other layers' directions, are not read or written. Both Qwen3.5 families'
+// hidden sizes and the decode dispatch's 1 to 32 rows.
+void residualSteerTest(MetalBackend &backend) {
+  std::mt19937 rng(31);
+  const uint32_t layers = 3, layer = 2, extra = 2;
+  for (const uint32_t hidden : {2048u, 5120u})
+    for (const uint32_t rows : {1u, 8u, 32u})
+      for (const bool project : {false, true})
+        for (const float scale : {1.0f, -0.5f, 2.0f}) {
+          std::vector<float> directions = randoms(rng, layers * hidden, 0.05f);
+          double squares = 0.0;
+          for (uint32_t d = 0; d < hidden; ++d)
+            squares += double(directions[layer * hidden + d]) * directions[layer * hidden + d];
+          if (project)
+            for (uint32_t d = 0; d < hidden; ++d)
+              directions[layer * hidden + d] = float(directions[layer * hidden + d] / std::sqrt(squares));
+          const auto values = bf16s(randoms(rng, (rows + extra) * hidden, 3.0f));
+          MetalBuffer residual = upload(backend, values);
+          CommandGraph graph;
+          ops::addResidualSteer(graph, residual, upload(backend, directions), {layer, project, scale}, hidden, rows);
+          run(backend, graph);
+          const auto got = download<uint16_t>(residual, values.size());
+          const float *v = directions.data() + layer * hidden;
+          bool ok = true, orthogonal = true;
+          for (uint32_t r = 0; r < rows + extra; ++r) {
+            const uint16_t *x = values.data() + r * hidden;
+            const uint16_t *y = got.data() + r * hidden;
+            if (r >= rows) {
+              ok &= std::memcmp(x, y, hidden * sizeof(uint16_t)) == 0;
+              continue;
+            }
+            double dot = 0.0, after = 0.0, rowSquares = 0.0;
+            for (uint32_t d = 0; d < hidden; ++d) dot += double(f32(x[d])) * v[d];
+            for (uint32_t d = 0; d < hidden; ++d) {
+              const double in = f32(x[d]);
+              const double want = project ? in - scale * dot * v[d] : in + double(scale) * v[d];
+              ok &= closeBf16(f32(y[d]), want, 1e-2);
+              after += double(f32(y[d])) * v[d];
+              rowSquares += in * in;
+            }
+            if (project && scale == 1.0f) orthogonal &= std::fabs(after) <= 0.02 * std::sqrt(rowSquares);
+          }
+          check(ok && orthogonal, std::string("residual steer ") + (project ? "project" : "add") + ", " +
+                                      std::to_string(hidden) + " values x " + std::to_string(rows) + " rows");
+        }
+}
+
 // The control vector after a steered layer: each stream of each of the
 // dispatch's rows loses scale times its component along the unit direction
 // (project) or gains the scaled direction (add), against an fp64 reference,
@@ -1153,6 +1207,7 @@ int main(int argc, const char *argv[]) {
         streamMeanTest(backend);
         pleHashTest(backend);
         steerTest(backend);
+        residualSteerTest(backend);
         controlVectorFileTest(backend);
       }
     } catch (const std::exception &error) {

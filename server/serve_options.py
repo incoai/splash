@@ -417,7 +417,8 @@ SERVE_OPTIONS = (
             help="GGUF control vector, as llama.cpp's --control-vector reads it "
             "(a direction.L tensor per steered layer L), applied to the "
             "residual after each layer it steers in every request; "
-            "Qwen3.8-Flash-Next only (default: none)",
+            "Qwen3.8-Flash-Next, Qwen3.8-27B and Qwen3.6-35B-A3B only "
+            "(default: none)",
         ),
     ),
     ServeOption(

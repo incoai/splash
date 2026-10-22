@@ -256,6 +256,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \
 	runtime/ops/HyperConnection.cpp \
+	runtime/ops/ResidualSteer.cpp \
 	runtime/ops/NgramEmbedding.cpp \
 	runtime/ops/BlockIndexer.cpp \
 	runtime/ops/PagedAttention.cpp \
