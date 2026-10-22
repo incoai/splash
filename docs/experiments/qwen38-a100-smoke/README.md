@@ -67,6 +67,15 @@ budget learning. The BF16 training teacher and low-bit native target are
 distinct artifacts. Quantizing draft projections during training does not
 make their target features and output heads identical.
 
+Teacher capture also left `enable_thinking` unspecified. The exact pinned
+teacher template therefore enables thinking with its default `xhigh` reasoning
+effort; the native probes explicitly disable thinking. With only 128 generated
+training tokens, these captures can primarily exercise reasoning prefixes.
+This mode mismatch is an additional limitation: these runs qualify mechanics,
+not an effectiveness comparison at a matched deployment distribution. Future
+capture configuration should make thinking mode explicit and bind it into
+feature-cache and run provenance before comparing matched modes.
+
 The JSON evidence records native acceptance separately from frozen BF16 trace
 replay. Native mean retained tokens includes the anchor; validation matching
 proposals excludes it. Do not compare these two numbers directly.
@@ -91,7 +100,7 @@ must not be interpreted as a statistical comparison or used to tune on the
 held-out test prompts.
 
 The next effectiveness study needs more independent prompts, a frozen final
-test, matched target features/quantization, equal training-token budgets and
+test, matched thinking modes and target features/quantization, equal training-token budgets and
 paired native timing. A wider support, larger selector, wider convolutions or
 deeper backbone is not justified by this smoke. Issues #542–#548 retain their
 research and deployment gates.

@@ -126,6 +126,7 @@
   },
   "limitations": [
     "tiny authored data, one seed, 20 steps",
+    "teacher capture uses template-default thinking/xhigh; native probes disable thinking",
     "combined stack, not isolated PR heads",
     "recall recipe combines QAT and objective changes",
     "BF16 teacher differs from quantized native target",
