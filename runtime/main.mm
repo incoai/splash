@@ -154,7 +154,8 @@ void printUsage(std::string_view executable) {
       " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]"
       " [--activations auto|bf16] [--relaunch-context TOKENS] [--ple-memory BYTES|auto|off]"
       " [--expert-memory BYTES|auto|off] [--sparse-kv-memory BYTES|auto]"
-      " [--kv-spill always] [--kv-window-trim on|off] [--verify-rows auto|all] [--control-vector FILE] [--control-vector-scale SCALE]"
+      " [--kv-spill always] [--kv-window-trim on|off] [--verify-rows auto|all]"
+      " [--control-vector FILE] [--control-vector-scale SCALE]"
       " [--control-vector-layer-range FIRST-LAST] [--control-vector-mode add|project]");
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_HEADERS [DRAFT_CONFIG]");
