@@ -6,7 +6,8 @@
 //   (converted) for 8-bit linear codes, or the codebook, int8 or grid value;
 // - one MMA chain per coefficient group, closed by the fp32 epilogue
 //   s * chain + b * sum (b = m - 128 s, formats with a min per 32 inputs, or
-//   b = m for 8-bit codes) or
+//   b = m for 8-bit codes; Apple9 takes Q4_0's and Q5_0's zero point as such
+//   a min, Apple9View) or
 //   s * chain with the chain seeded by -160 * sum from the table (formats
 //   with a zero point, and Q2_K, whose min per 16 inputs adds b * seed with
 //   b = m / -160);
@@ -54,6 +55,37 @@ template <class F> struct Shape {
                 "the host splits K in the coefficient units of quant_register_unit");
   static_assert(!Wide || (HasMin && !Seeded), "wide codes have a min per 32 inputs");
 };
+// Q4_0 and Q5_0 with the zero point taken as a min, m = -zero d: a 32-input group enters the MMA as 128 + code in one
+// chain, closed against the table's sum of its inputs with b = -(128 + zero) d, instead of as two 16-input chains
+// seeded from the table, with half the coefficients. On a 10-core M4 this takes 3-8% off Q4_0's and Q5_0's 27B
+// gate/up and down projections at one to four lanes. Metal has no struct inheritance, so the view forwards what the
+// register tile reads of F.
+template <class F> struct ZeroAsMin {
+  enum : uint { Id = F::Id, P0 = F::P0, P1 = F::P1, MetaBytes = F::MetaBytes };
+  enum : ushort { MetaGroups = F::MetaGroups, Zero = 0, Group = F::Group };
+  static constexpr constant QuantKind Kind = F::Kind;
+  static constexpr constant bool ScaleInChunk = F::ScaleInChunk;
+  typedef typename F::Chunk Chunk; typedef typename F::Meta Meta;
+  static Meta loadMeta(device uchar *m) { return F::loadMeta(m); }
+  static Chunk loadChunk(device uchar *p0, device uchar *p1, ushort c) { return F::loadChunk(p0, p1, c); }
+  static uint4 codes(Chunk q) { return F::codes(q); }
+  static QuantCoef coef(Meta mt, ushort j) {
+    QuantCoef k = F::coef(mt, j);
+    k.m = -float(F::Zero) * k.s;   // exact: the zero point is a power of two
+    return k;
+  }
+};
+// The format Apple9 decodes F as (gguf_apple9_view): its gguf_decode_sg9_ instances, and fused segments with
+// GGUF_DECODE_APPLE9_VIEW. Apple10 decodes F itself.
+template <class F> struct Apple9View { typedef F type; };
+template <> struct Apple9View<FmtQ40> { typedef ZeroAsMin<FmtQ40> type; };
+template <> struct Apple9View<FmtQ50> { typedef ZeroAsMin<FmtQ50> type; };
+#define GGUF_SG_APPLE9_VIEW(F, f)                                                                     \
+  static_assert(is_same_v<typename Apple9View<F>::type, F> != gguf_apple9_view(F::Id),               \
+                #f ": Apple9View holds the views of gguf_apple9_view");
+QUANT_REGISTER_FORMATS(GGUF_SG_APPLE9_VIEW)
+#undef GGUF_SG_APPLE9_VIEW
+
 template <class F> using Coef = metal::conditional_t<Shape<F>::HasMin != 0, float2, float>;
 // The coefficients of a threadgroup's simdgroups for one unit; the run-time-format kernels hold every format's in
 // storage of the largest size.
@@ -329,22 +361,28 @@ kernel void decode_linear_gguf_prepare(device const bfloat *input [[buffer(0)]],
                               lut, coefs, &arrival);                                                        \
   }
 // Each epilogue into bf16, and the plain one also into fp32 (_a_f32: the logits, ops::Projection::destination).
-#define GGUF_SG_EPILOGUES(F, f, L)                                                                            \
-  GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_a, F, L, EpNone, bfloat)                                \
-  GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_a_f32, F, L, EpNone, float)                             \
-  GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_r, F, L, EpResidual, bfloat)                            \
-  GGUF_SG_KERNEL(gguf_decode_sg_##f##_l##L##_g, F, L, EpUpWithGate, bfloat)
-#define GGUF_SG_FORMAT(F, f) \
-  GGUF_SG_EPILOGUES(F, f, 1) GGUF_SG_EPILOGUES(F, f, 2) GGUF_SG_EPILOGUES(F, f, 3) GGUF_SG_EPILOGUES(F, f, 4)
+#define GGUF_SG_EPILOGUES(F, n, L)                                                                            \
+  GGUF_SG_KERNEL(gguf_decode_##n##_l##L##_a, F, L, EpNone, bfloat)                                \
+  GGUF_SG_KERNEL(gguf_decode_##n##_l##L##_a_f32, F, L, EpNone, float)                             \
+  GGUF_SG_KERNEL(gguf_decode_##n##_l##L##_r, F, L, EpResidual, bfloat)                            \
+  GGUF_SG_KERNEL(gguf_decode_##n##_l##L##_g, F, L, EpUpWithGate, bfloat)
+#define GGUF_SG_LANES(F, n) \
+  GGUF_SG_EPILOGUES(F, n, 1) GGUF_SG_EPILOGUES(F, n, 2) GGUF_SG_EPILOGUES(F, n, 3) GGUF_SG_EPILOGUES(F, n, 4)
+#define GGUF_SG_FORMAT(F, f) GGUF_SG_LANES(F, sg_##f)
 QUANT_REGISTER_FORMATS(GGUF_SG_FORMAT)
+// Apple9's views (gguf_apple9_view).
+GGUF_SG_LANES(gguf_sg::Apple9View<FmtQ40>::type, sg9_q40)
+GGUF_SG_LANES(gguf_sg::Apple9View<FmtQ50>::type, sg9_q50)
 #undef GGUF_SG_FORMAT
+#undef GGUF_SG_LANES
 #undef GGUF_SG_EPILOGUES
 #undef GGUF_SG_KERNEL
 
 // Fused projections (qkv|z|ab, q|k|v): up to three column segments of any
 // formats in one dispatch, so the small segments do not run as dispatches of
 // their own. The threadgroup's tile picks its segment, and the segment's
-// format picks the decode; every segment takes the same K splits.
+// format picks the decode (in Apple9's view of the format with
+// GGUF_DECODE_APPLE9_VIEW); every segment takes the same K splits.
 #define GGUF_SG_SEGMENT(i, w0, w1, m) \
   device uchar *w0 [[buffer(i)]], device uchar *w1 [[buffer(i + 1)]], device uchar *m [[buffer(i + 2)]]
 template <uint L>
@@ -360,12 +398,19 @@ inline void gguf_sg_fused(device const bfloat *table, device const float *sums, 
   device uchar *meta = s == 0 ? ma : s == 1 ? mb : mc;
   const GgufDecodeParams q{p.input_size, p.splits, p.out_stride, p.offset[s], 0};
   const uint2 local(tg.x - (s == 0 ? 0 : s == 1 ? t0 : t1), tg.y);
-  quant_register_format_switch(p.fmt[s], [&](auto format) {
+  const uint fmt = p.fmt[s];
+  quant_register_format_switch(fmt & ~GGUF_DECODE_APPLE9_VIEW, [&](auto format) {
     typedef decltype(format) F;
     quant_pair_table<F>(lut, tid, GGUF_REGISTER_THREADS);
-    gguf_sg::decode<F, L, EpNone>(table, sums, w0, w1, meta, out, partials, counters, out, q, local,
-                                              tid, sg, lane, lut,
-                                              reinterpret_cast<threadgroup gguf_sg::Coef<F> *>(coefs), &arrival);
+    const auto run = [&](auto view) __attribute__((always_inline)) {
+      typedef decltype(view) V;
+      gguf_sg::decode<V, L, EpNone>(table, sums, w0, w1, meta, out, partials, counters, out, q, local, tid, sg, lane,
+                                    lut, reinterpret_cast<threadgroup gguf_sg::Coef<V> *>(coefs), &arrival);
+    };
+    typedef typename gguf_sg::Apple9View<F>::type V;
+    if constexpr (!is_same_v<V, F>)
+      if (fmt & GGUF_DECODE_APPLE9_VIEW) return run(V());
+    run(F());
   });
 }
 #define GGUF_SG_FUSED(L)                                                                                          \

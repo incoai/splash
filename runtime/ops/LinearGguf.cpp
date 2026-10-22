@@ -620,18 +620,27 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
   const metal::DispatchSize grid{segmentColumns(p) / GGUF_TILE_COLUMNS, config.splits, 1};
   const std::string suffix = "_l" + std::to_string(lanes);
   const auto [partials, counters] = splitScratch(b, config.splits);
+  // Apple9 decodes Q4_0 and Q5_0 with their zero point as a min, 3-8% faster
+  // at one to four lanes on a 10-core M4 (gguf_apple9_view); Apple10 keeps
+  // them seeded.
+  const auto apple9View = [&](const QuantizedSegment &s) {
+    return family_ == GpuFamilyClass::Apple9 && gguf_apple9_view(s.formatId);
+  };
   if (segments.size() > 1) {
     std::vector<const QuantizedSegment *> order;
     for (const QuantizedSegment &s : segments) order.push_back(&s);
     std::vector<metal::MetalBuffer> bindings{b.scratch.input, b.scratch.sums};
-    const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
+    GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
+    for (size_t i = 0; i < order.size(); ++i)
+      if (apple9View(*order[i])) params.fmt[i] |= GGUF_DECODE_APPLE9_VIEW;
     bindings.insert(bindings.end(), {b.output, partials, counters});
     graph.add("gguf_decode_sg_fused" + suffix, std::move(bindings), params, grid, {GGUF_REGISTER_THREADS, 1, 1});
     return;
   }
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
-    graph.add(kernelInstance(std::string("gguf_decode_sg_") + s.name() + suffix + "_" + epilogue, plan.destination()),
+    const std::string prefix = apple9View(s) ? "gguf_decode_sg9_" : "gguf_decode_sg_";
+    graph.add(kernelInstance(prefix + s.name() + suffix + "_" + epilogue, plan.destination()),
               {b.scratch.input, b.scratch.sums, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
               GgufDecodeParams{k, config.splits, n, s.columnOffset, 0}, grid, {GGUF_REGISTER_THREADS, 1, 1});
   };

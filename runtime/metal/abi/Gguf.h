@@ -100,6 +100,8 @@ struct GgufDecodeFusedParams {
   uint32_t offset[3];   // first destination column per segment
   uint32_t spread;      // as GgufDecodeParams', each segment's tiles from their index in it
 };
+// A fmt bit of the register tile's fused decode: the segment decodes in Apple9's view of its format.
+#define GGUF_DECODE_APPLE9_VIEW 0x80000000u
 static_assert(sizeof(GgufDecodeFusedParams) == 52, "GGUF fused decode parameters are 52 bytes on both sides");
 
 struct GgufEmbedParams {
@@ -113,6 +115,12 @@ static_assert(sizeof(GgufEmbedParams) == 12, "GGUF embedding parameters are 12 b
 // (kernels/shared/embedding.metal, gguf_embed_<kQuantFormats name> and
 // gguf_embed_f32_<name>): every format.
 inline constexpr bool gguf_embedding_format(uint32_t format) { return format < GGUF_FMT_COUNT; }
+
+// The formats that Apple9's register tile decodes in a view of their own
+// (kernels/decode/linear_gguf_sgmatrix.metal, Apple9View; the
+// gguf_decode_sg9_<kQuantFormats name> instances): Q4_0 and Q5_0 with their
+// zero point as a min. Apple10 decodes them as they are.
+inline constexpr bool gguf_apple9_view(uint32_t format) { return format == GGUF_FMT_Q40 || format == GGUF_FMT_Q50; }
 
 // Prism ML's input rotation (kernels/shared/gguf_rotation.metal): weights
 // stored for rotated inputs multiply H (D x), H the normalized Walsh-Hadamard

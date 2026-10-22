@@ -1068,6 +1068,15 @@ int main(int argc, char **argv) {
         fusedDecode(backend, linear, tile, false);
         gateUpPairs(backend, linear, tile);
       }
+      // The register tile in the other family's view of the formats Apple9 decodes in views of their own
+      // (gguf_apple9_view): on Apple9, the seeded chains Apple10 runs.
+      DeviceCapabilities other = backend.capabilities();
+      other.appleGpuFamily = other.appleGpuFamily == 9 ? 10 : 9;
+      const Linear otherFamily(other);
+      std::vector<Fmt> apple9Views;
+      for (const Fmt f : tileFormats(LinearTile::GgufRegister))
+        if (gguf_apple9_view(f)) apple9Views.push_back(f);
+      decodeTile(backend, otherFamily, LinearTile::GgufRegister, false, decodeInputs(false), apple9Views);
       decodeTile(backend, linear, LinearTile::GgufStaged, true, decodeInputs(true), tileFormats(LinearTile::GgufStaged));
       fusedDecode(backend, linear, LinearTile::GgufStaged, true);
       for (const bool spread : {false, true}) oneGateUpPass(backend, linear, spread);
