@@ -7,8 +7,10 @@
 // steered layer the residual takes scale times the direction (add, llama.cpp's
 // own), or loses scale times its component along the direction (project).
 // Qwen3.8-Flash-Next applies it to every hyper-connection stream after the
-// layer's FFN (model/Qwen4ExpTarget.cpp, ops::HyperConnection::addSteer). It
-// is fixed for the process: every request runs on it.
+// layer's FFN (model/Qwen4ExpTarget.cpp, ops::HyperConnection::addSteer); the
+// Qwen3.5 families to the bf16 residual itself
+// (model/QwenTarget.cpp, ops::addResidualSteer). It is fixed for the process:
+// every request runs on it.
 
 #include "metal/MetalBackend.hpp"
 

@@ -9,6 +9,7 @@
 #include "ops/LogitFinish.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PageStorage.hpp"
+#include "ops/ResidualSteer.hpp"
 #include "ops/RowCopy.hpp"
 
 #include <algorithm>
@@ -472,6 +473,15 @@ void QwenTarget::addDraftCapture(const PrefillStep &step, uint32_t id, metal::Me
   });
 }
 
+void QwenTarget::addResidualSteer(metal::CommandGraph &graph, metal::MetalBuffer residual, uint32_t index,
+                                  uint32_t rows) const {
+  const std::optional<ControlVector> &vector = weightsBase_.controlVector;
+  if (!vector || !vector->steers(index)) return;
+  ops::addResidualSteer(graph, std::move(residual), vector->directions,
+                        {index, vector->mode == ControlVectorMode::Project, vector->scale}, geometry_.hiddenSize,
+                        rows);
+}
+
 namespace {
 
 // The rows a mixer's output projection adds to the layer's input rows into.
@@ -550,6 +560,7 @@ private:
     const QwenTargetPrefillBuffers &b = step.buffers;
     if (const ops::BlockMoeWeights *ffn = moe(index)) ops::MoE::addRouted(step.graph, step.ffn, *ffn, *step.moe);
     addReadRows(step, b.hidden[index & 1], b.hidden[(index & 1) ^ 1]);
+    addResidualSteer(step.graph, b.hidden[(index & 1) ^ 1], index, step.rows);
     // The draft reads its layers' output rows.
     addDraftCapture(step, index, b.hidden[(index & 1) ^ 1]);
   }
