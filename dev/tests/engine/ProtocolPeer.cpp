@@ -153,8 +153,12 @@ FrameType write(Writer &out, const VideoRequestFrame &request) {
   out.u32(request.height);
   out.u32(request.steps);
   out.u64(request.seed);
+  out.u8(static_cast<uint8_t>((request.firstFrame.empty() ? 0 : VideoKeyframeFirst) |
+                              (request.lastFrame.empty() ? 0 : VideoKeyframeLast)));
   out.u32(static_cast<uint32_t>(request.promptTokens.size()));
   out.words(request.promptTokens);
+  out.raw(request.firstFrame);
+  out.raw(request.lastFrame);
   return FrameType::VideoRequest;
 }
 

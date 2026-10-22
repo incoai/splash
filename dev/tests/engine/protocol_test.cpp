@@ -212,7 +212,16 @@ RequestFrame exampleIgnoreEosRequest() {
 
 const VideoRequestFrame kVideoRequest{92, VideoVariant::Turbo,
                                       VideoOutputPreview | VideoOutputAudio,
-                                      73, 1344, 768, 0, 42, {5, 6, 7}};
+                                      73, 1344, 768, 0, 42, {5, 6, 7}, {}, {}};
+
+VideoRequestFrame exampleKeyframeRequest() {
+  VideoRequestFrame request{92, VideoVariant::Turbo, VideoOutputAudio, 73, 4, 2, 0, 42, {5}, {}, {}};
+  for (uint8_t index = 0; index < 24; ++index) {
+    request.firstFrame.push_back(index);
+    request.lastFrame.push_back(static_cast<uint8_t>(255 - index));
+  }
+  return request;
+}
 
 RequestFrame exampleProgressRequest() {
   RequestFrame request = exampleRequest();
@@ -236,7 +245,9 @@ const std::vector<std::pair<std::string, ClientMessage>> &clientMessages() {
       // The default variant's clip without audio or preview.
       {"video_request_default",
        VideoRequestFrame{92, VideoVariant::Default, 0, 73, 1344, 768, 50, 42,
-                         {0xffffffffU}}},
+                         {0xffffffffU}, {}, {}}},
+      // A clip of a 4 x 2 canvas from its first and last frames.
+      {"video_request_keyframes", exampleKeyframeRequest()},
   };
   return messages;
 }
@@ -370,6 +381,10 @@ void testVideoFrameRejections() {
   expectRequestIssue(test, empty, IssueCode::LimitExceeded);
   expectRequestIssue(test, noFrames, IssueCode::InvalidCount);
   expectRequestIssue(test, variant, IssueCode::InvalidEnumValue);
+  // A keyframe holds the canvas's height x width x 3 bytes.
+  VideoRequestFrame keyframe = exampleKeyframeRequest();
+  keyframe.lastFrame.pop_back();
+  expectRequestIssue(test, keyframe, IssueCode::InvalidPayloadLength);
   expectEventIssue(test, VideoProgressEvent{92, VideoPhase::Denoise, 9, 8},
                    IssueCode::InvalidCount);
   expectEventIssue(test, VideoOutputEvent{92, VideoOutputKind::Video, 73, 0, {}},

@@ -18,7 +18,7 @@
 // pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 12;
+inline constexpr uint16_t kProtocolVersion = 13;
 // A frame is its header, the magic "SPLH", the u16 protocol version, the
 // u16 FrameType and the u64 payload length, then the payload.
 inline constexpr size_t kFrameHeaderBytes = 16;
@@ -212,7 +212,9 @@ struct RequestFrame {
 //   StatusJson     u64 correlationId, the JSON
 //   VideoRequest   u64 requestId, u8 variant, u8 outputs (VideoOutputFlag),
 //                  u32 frames, u32 width, u32 height, u32 steps, u64 seed,
-//                  u32 prompt token count, the prompt tokens
+//                  u8 keyframes (VideoKeyframeFlag), u32 prompt token
+//                  count, the prompt tokens, then the first frame's and the
+//                  last frame's pixels, each height x width x 3 bytes
 //   VideoProgress  u64 requestId, u8 phase, u32 step, u32 steps,
 //                  u64 elapsedMicros, u64 peakFootprintBytes
 //   VideoOutput    u64 requestId, u8 output, u32 frames, u64 wallMicros,
@@ -349,6 +351,11 @@ enum VideoOutputFlag : uint8_t {
   VideoOutputPreview = 1U << 0,
   VideoOutputAudio = 1U << 1,
 };
+// The keyframes a video request carries.
+enum VideoKeyframeFlag : uint8_t {
+  VideoKeyframeFirst = 1U << 0,
+  VideoKeyframeLast = 1U << 1,
+};
 
 struct VideoRequestFrame {
   uint64_t requestId = 0;
@@ -362,6 +369,12 @@ struct VideoRequestFrame {
   uint32_t steps = 0;
   uint64_t seed = 0;
   std::vector<uint32_t> promptTokens;
+  // Keyframes (first-frame and first-and-last-frame conditioning), each
+  // empty or uint8 RGB [height][width][3], already on the clip's canvas
+  // (server/images.py keyframe): the first frame anchors the clip's first
+  // latent frame, the last frame its last.
+  std::vector<uint8_t> firstFrame;
+  std::vector<uint8_t> lastFrame;
 
   bool operator==(const VideoRequestFrame &) const = default;
 };

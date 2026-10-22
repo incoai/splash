@@ -12,7 +12,7 @@ _REQUEST = struct.Struct("<QBBQQIIIffIffffQIIIQQIII")
 _IMAGE_SPAN = struct.Struct("<IIIIQQ")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _ID = struct.Struct("<Q")
-_VIDEO_REQUEST = struct.Struct("<QBBIIIIQI")
+_VIDEO_REQUEST = struct.Struct("<QBBIIIIQBI")
 
 
 def request_frame(**overrides) -> wire.RequestFrame:
@@ -224,10 +224,18 @@ def decode_client_frame(frame_type: int, payload: bytes) -> wire.ClientMessage:
         case wire.FrameType.RELEASE_REQUEST:
             return wire.ReleaseRequestFrame(*_ID.unpack(payload))
         case wire.FrameType.VIDEO_REQUEST:
-            number, variant, outputs, *clip, count = _VIDEO_REQUEST.unpack_from(payload)
+            fields = _VIDEO_REQUEST.unpack_from(payload)
+            number, variant, outputs, *clip, keyframes, count = fields
             tokens = _words(payload, _VIDEO_REQUEST.size, count)
+            # The keyframes after the tokens, each height x width x 3 bytes.
+            canvas = clip[1] * clip[2] * 3
+            at, frames = _VIDEO_REQUEST.size + 4 * count, []
+            for flag in wire.VideoKeyframeFlag:
+                size = canvas if keyframes & flag else 0
+                frames.append(bytes(payload[at : at + size]))
+                at += size
             return wire.VideoRequestFrame(number, wire.VideoVariant(variant),
-                                          wire.VideoOutputFlag(outputs), *clip, tokens)  # fmt: skip
+                                          wire.VideoOutputFlag(outputs), *clip, tokens, *frames)  # fmt: skip
     raise ValueError(f"frame type {frame_type:#06x} is not a client frame")
 
 

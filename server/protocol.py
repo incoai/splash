@@ -15,7 +15,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 12
+PROTOCOL_VERSION = 13
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -60,7 +60,7 @@ _MASK_REQUEST = struct.Struct("<QQII")
 _DONE = struct.Struct("<QBBIIQQQIIIII")
 _ERROR = struct.Struct("<BBIQII")
 _STATUS_JSON = struct.Struct("<Q")
-_VIDEO_REQUEST = struct.Struct("<QBBIIIIQI")
+_VIDEO_REQUEST = struct.Struct("<QBBIIIIQBI")
 _VIDEO_PROGRESS = struct.Struct("<QBIIQQ")
 _VIDEO_OUTPUT = struct.Struct("<QBIQ")
 
@@ -77,7 +77,7 @@ assert _START.size == 16
 assert _DONE.size == 62
 assert _ERROR.size == 22
 assert _STATUS_JSON.size == 8
-assert _VIDEO_REQUEST.size == 38
+assert _VIDEO_REQUEST.size == 39
 assert _VIDEO_PROGRESS.size == 33
 assert _VIDEO_OUTPUT.size == 21
 
@@ -355,6 +355,11 @@ class VideoOutputFlag(IntFlag):
 _VIDEO_OUTPUT_BITS = int(VideoOutputFlag.PREVIEW | VideoOutputFlag.AUDIO)
 
 
+class VideoKeyframeFlag(IntFlag):
+    FIRST = 1 << 0
+    LAST = 1 << 1
+
+
 @dataclass(slots=True, frozen=True)
 class VideoRequestFrame:
     """One clip of a video model, of a prompt of the text encoder's token
@@ -371,6 +376,11 @@ class VideoRequestFrame:
     steps: int
     seed: int
     prompt_tokens: tuple[int, ...]
+    # Keyframes, each empty or uint8 RGB [height][width][3] already on the
+    # canvas (images.keyframe): the first frame anchors the clip's first
+    # latent frame, the last frame its last.
+    first_frame: bytes = b""
+    last_frame: bytes = b""
 
 
 class VideoPhase(IntEnum):
@@ -682,7 +692,7 @@ def _payload_bounds(frame_type: FrameType) -> tuple[int, int]:
         case FrameType.STATUS_JSON:
             bounds = (_STATUS_JSON.size, _STATUS_JSON.size + MAX_STATUS_JSON_BYTES)
         case FrameType.VIDEO_REQUEST:
-            bounds = (_VIDEO_REQUEST.size, _VIDEO_REQUEST.size + MAX_PROMPT_TOKENS * 4)
+            bounds = (_VIDEO_REQUEST.size, MAX_FRAME_PAYLOAD_BYTES)
         case FrameType.VIDEO_PROGRESS:
             bounds = (_VIDEO_PROGRESS.size, _VIDEO_PROGRESS.size)
         case FrameType.VIDEO_OUTPUT:
@@ -1042,7 +1052,18 @@ def _video_request_frame(request: VideoRequestFrame) -> bytearray:
             "a video prompt holds 1 token or more, within the prompt limit",
             request_id,
         )
-    payload_bytes = _VIDEO_REQUEST.size + 4 * len(tokens)
+    keyframes = (request.first_frame, request.last_frame)
+    if any(len(pixels) not in (0, width * height * 3) for pixels in keyframes):
+        _fail_request(
+            IssueCode.INVALID_COUNT,
+            "a keyframe holds height x width x 3 bytes",
+            request_id,
+        )
+    flags = VideoKeyframeFlag(0)
+    for flag, pixels in zip(VideoKeyframeFlag, keyframes):
+        if pixels:
+            flags |= flag
+    payload_bytes = _VIDEO_REQUEST.size + 4 * len(tokens) + sum(map(len, keyframes))
     if issue := _payload_length_issue(FrameType.VIDEO_REQUEST, payload_bytes):
         _fail_request(issue.code, issue.message, request_id)
     frame = _frame(FrameType.VIDEO_REQUEST, payload_bytes)
@@ -1057,9 +1078,13 @@ def _video_request_frame(request: VideoRequestFrame) -> bytearray:
         height,
         steps,
         seed,
+        int(flags),
         len(tokens),
     )
-    frame[FRAME_HEADER_BYTES + _VIDEO_REQUEST.size :] = memoryview(tokens).cast("B")
+    words = FRAME_HEADER_BYTES + _VIDEO_REQUEST.size
+    pixels = words + 4 * len(tokens)
+    frame[words:pixels] = memoryview(tokens).cast("B")
+    frame[pixels:] = b"".join(keyframes)
     return frame
 
 

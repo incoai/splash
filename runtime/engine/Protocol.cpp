@@ -36,7 +36,7 @@ constexpr uint64_t kMaskRequestFixedBytes = 24;
 constexpr uint64_t kDoneFixedBytes = 62;
 constexpr uint64_t kErrorFixedBytes = 22;
 constexpr uint64_t kStatusJsonFixedBytes = 8;
-constexpr uint64_t kVideoRequestFixedBytes = 38;
+constexpr uint64_t kVideoRequestFixedBytes = 39;
 constexpr uint64_t kVideoProgressFixedBytes = 33;
 constexpr uint64_t kVideoOutputFixedBytes = 21;
 
@@ -419,6 +419,16 @@ validateMaskResponse(const MaskResponseFrame &response,
   return std::nullopt;
 }
 
+// The bytes of a keyframe of the request's canvas, height x width x 3; zero
+// when they overflow.
+uint64_t keyframeBytes(const VideoRequestFrame &request) {
+  uint64_t pixels = 0, bytes = 0;
+  if (!checkedMultiply(request.width, request.height, pixels) ||
+      !checkedMultiply(pixels, 3, bytes))
+    return 0;
+  return bytes;
+}
+
 std::optional<ProtocolIssue> validateVideoRequest(const VideoRequestFrame &request,
                                                   const ProtocolLimits &limits) {
   if (!request.requestId)
@@ -436,6 +446,10 @@ std::optional<ProtocolIssue> validateVideoRequest(const VideoRequestFrame &reque
       request.promptTokens.size() > limits.maxPromptTokens)
     return requestIssue(IssueCode::LimitExceeded, request.requestId,
                         "a video prompt holds 1 token or more, within the prompt limit");
+  for (const std::vector<uint8_t> *keyframe : {&request.firstFrame, &request.lastFrame})
+    if (!keyframe->empty() && keyframe->size() != keyframeBytes(request))
+      return requestIssue(IssueCode::InvalidCount, request.requestId,
+                          "a keyframe holds height x width x 3 bytes");
   return std::nullopt;
 }
 
@@ -886,23 +900,40 @@ ProtocolResult<ClientMessage> decodeVideoRequest(const Frame &frame,
                                                  const ProtocolLimits &limits) {
   Reader reader(frame.payload);
   VideoRequestFrame request;
-  uint8_t variant = 0;
+  uint8_t variant = 0, keyframes = 0;
   uint32_t promptCount = 0;
   if (!reader.u64(request.requestId) || !reader.u8(variant) ||
       !reader.u8(request.outputs) || !reader.u32(request.frames) ||
       !reader.u32(request.width) || !reader.u32(request.height) ||
       !reader.u32(request.steps) || !reader.u64(request.seed) ||
-      !reader.u32(promptCount)) {
+      !reader.u8(keyframes) || !reader.u32(promptCount)) {
     return failure<ClientMessage>(
         makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
                   0, "video request fixed payload is truncated"));
   }
   request.variant = static_cast<VideoVariant>(variant);
-  if (!reader.words(promptCount, request.promptTokens) || reader.remaining()) {
+  if (keyframes & ~(VideoKeyframeFirst | VideoKeyframeLast)) {
+    return failure<ClientMessage>(
+        requestIssue(IssueCode::InvalidEnumValue, request.requestId,
+                     "video keyframes are not defined"));
+  }
+  const uint64_t canvas = keyframeBytes(request);
+  const uint64_t pixels = canvas * (((keyframes & VideoKeyframeFirst) != 0) +
+                                    ((keyframes & VideoKeyframeLast) != 0));
+  if (!reader.words(promptCount, request.promptTokens) ||
+      (keyframes && (!canvas || canvas > limits.maxFramePayloadBytes)) ||
+      reader.remaining() != pixels) {
     return failure<ClientMessage>(
         requestIssue(IssueCode::InvalidPayloadLength, request.requestId,
-                     "video prompt count does not match the binary token payload"));
+                     "video prompt count or keyframes do not match the payload"));
   }
+  const uint8_t *keyframe = frame.payload.data() + (frame.payload.size() - pixels);
+  if (keyframes & VideoKeyframeFirst) {
+    request.firstFrame.assign(keyframe, keyframe + canvas);
+    keyframe += canvas;
+  }
+  if (keyframes & VideoKeyframeLast)
+    request.lastFrame.assign(keyframe, keyframe + canvas);
   if (auto issue = validateVideoRequest(request, limits)) {
     return failure<ClientMessage>(std::move(*issue));
   }

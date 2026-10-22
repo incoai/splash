@@ -118,6 +118,11 @@ VIDEO_DEFAULT_REQUEST = replace(
     VIDEO_REQUEST, variant=p.VideoVariant.DEFAULT, outputs=p.VideoOutputFlag(0),
     steps=50, prompt_tokens=(0xFFFFFFFF,),
 )  # fmt: skip
+# A clip of a 4 x 2 canvas from its first and last frames.
+VIDEO_KEYFRAME_REQUEST = p.VideoRequestFrame(
+    92, p.VideoVariant.TURBO, p.VideoOutputFlag.AUDIO, 73, 4, 2, 0, 42, (5,),
+    bytes(range(24)), bytes(255 - n for n in range(24)),
+)  # fmt: skip
 
 
 def client_messages():
@@ -135,6 +140,7 @@ def client_messages():
         "release_request": p.ReleaseRequestFrame(808),
         "video_request": VIDEO_REQUEST,
         "video_request_default": VIDEO_DEFAULT_REQUEST,
+        "video_request_keyframes": VIDEO_KEYFRAME_REQUEST,
     }
 
 
@@ -310,6 +316,7 @@ class ProtocolPythonTests(unittest.TestCase):
             (p.IssueCode.LIMIT_EXCEEDED, {"prompt_tokens": ()}),
             (p.IssueCode.INVALID_COUNT, {"frames": 0}),
             (p.IssueCode.INVALID_ENUM_VALUE, {"outputs": p.VideoOutputFlag(4)}),
+            (p.IssueCode.INVALID_COUNT, {"first_frame": bytes(23)}),
         ):
             with self.subTest(change=change):
                 invalid = replace(VIDEO_REQUEST, **change)
