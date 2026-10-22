@@ -29,7 +29,8 @@
       "mode": "MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1",
       "message": "prefill_gdn_scan_vh32: threadgroupMemoryLength 35072 exceeds 32768",
       "scope": "existing target GDN prefill kernel; no production/kernel changes in this PR",
-      "baseline_reproduction": "in progress"
+      "baseline_reproduction": "same assertion reproduced on unchanged #550 baseline binary",
+      "baseline_revision": "ef0e95d4fa09f265f1cb071d43591ff32367b372"
     }
   },
   "scope": "code and probe mechanics; not real-checkpoint training, model quality or throughput improvement"

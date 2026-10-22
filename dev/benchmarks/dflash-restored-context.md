@@ -92,5 +92,6 @@ reports. Production `Runtime.cpp` preprocesses identically to upstream main
 Extra validation: a B3/two-cycle capture passed with
 `MTL_SHADER_VALIDATION=1`. Enabling Metal API validation as well on this host
 hit a `prefill_gdn_scan_vh32` threadgroup-memory assertion (35072 > 32768)
-in the unchanged target kernel. This combined-validation run did not pass;
+in the unchanged target kernel. The same assertion reproduced on the unchanged
+#550 baseline binary. This combined-validation run did not pass;
 it is not included in the successful matrix. See `validation.json`.
