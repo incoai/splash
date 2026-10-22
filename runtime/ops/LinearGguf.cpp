@@ -621,7 +621,8 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
   const std::string suffix = "_l" + std::to_string(lanes);
   const auto [partials, counters] = splitScratch(b, config.splits);
   // Apple9 decodes Q4_0 and Q5_0 with their zero point as a min, 3-8% faster
-  // at one to four lanes on a 10-core M4 (gguf_apple9_view); Apple10 keeps
+  // at one to four lanes on a 10-core M4, and Q6_K and Q3_K with it in their
+  // operands, 2-5% faster at three and four (gguf_apple9_view); Apple10 keeps
   // them seeded.
   const auto apple9View = [&](const QuantizedSegment &s) {
     return family_ == GpuFamilyClass::Apple9 && gguf_apple9_view(s.formatId);

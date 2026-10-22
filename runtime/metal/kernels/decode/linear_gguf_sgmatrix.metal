@@ -2,7 +2,8 @@
 // on the FP32 pipe there, so the kernel keeps every other FP32 operation to
 // the minimum a group scale needs, and does the rest on the integer pipe:
 // - weights enter the MMA as exact bf16: 128 + code for linear codes with a
-//   min, 160 + code - zero for seeded linear codes (one add), the code itself
+//   min, 160 + code - zero for seeded linear codes (one add), code - zero for
+//   Apple9's Q6_K and Q3_K (an add and a bf16 subtraction), the code itself
 //   (converted) for 8-bit linear codes, or the codebook, int8 or grid value;
 // - one MMA chain per coefficient group, closed by the fp32 epilogue
 //   s * chain + b * sum (b = m - 128 s, formats with a min per 32 inputs, or
@@ -29,6 +30,9 @@
 
 namespace gguf_sg {
 
+template <class F> struct Centered;
+template <class F> struct IsCentered { static constexpr constant bool value = false; };
+template <class F> struct IsCentered<Centered<F>> { static constexpr constant bool value = true; };
 template <class F> struct Shape {
   enum : uint {
     Linear = F::Kind == QuantLinear,
@@ -38,6 +42,8 @@ template <class F> struct Shape {
     // Linear codes chained from the table's seed of their 16 inputs: s (code - zero) with a zero point (Q6_K, Q3_K,
     // Q4_0, Q5_0, IQ1, PQ2_0, Q2_0), and Q2_K's min per 16 inputs
     Seeded = Linear && (!HasMin || F::Group == 16),
+    // Seeded codes whose operand is code - zero (Centered): their chains start from zero
+    Centered = IsCentered<F>::value,
     // bf16 bits of the operand of code 0: 128, or 160 - zero when seeded
     Operand = 0x4300 + (Seeded ? kZeroPointOffset - 128 - F::Zero : 0),
     CG = Seeded || F::Group == 16 ? 2 : 1,                    // coefficient groups per 32 inputs
@@ -54,6 +60,7 @@ template <class F> struct Shape {
   static_assert(UnitSpans * GGUF_TABLE16_SPAN_INPUTS == quant_register_unit(F::Id),
                 "the host splits K in the coefficient units of quant_register_unit");
   static_assert(!Wide || (HasMin && !Seeded), "wide codes have a min per 32 inputs");
+  static_assert(!Centered || (Seeded && !HasMin), "centered codes have a zero point");
 };
 // Q4_0 and Q5_0 with the zero point taken as a min, m = -zero d: a 32-input group enters the MMA as 128 + code in one
 // chain, closed against the table's sum of its inputs with b = -(128 + zero) d, instead of as two 16-input chains
@@ -75,11 +82,28 @@ template <class F> struct ZeroAsMin {
     return k;
   }
 };
+// Q6_K and Q3_K with the zero point in the operand, code - zero (-32..31, -4..3): each 16-input chain starts from
+// zero instead of the table's seed, so a lane reads no seeds. On a 10-core M4 this takes 2-5% off Q6_K's and Q3_K's
+// 27B projections at three and four lanes, the same time at one and two. The view is F itself under another type.
+template <class F> struct Centered {
+  enum : uint { Id = F::Id, P0 = F::P0, P1 = F::P1, MetaBytes = F::MetaBytes };
+  enum : ushort { MetaGroups = F::MetaGroups, Zero = F::Zero, Group = F::Group };
+  static constexpr constant QuantKind Kind = F::Kind;
+  static constexpr constant bool ScaleInChunk = F::ScaleInChunk;
+  typedef typename F::Chunk Chunk; typedef typename F::Meta Meta;
+  static Meta loadMeta(device uchar *m) { return F::loadMeta(m); }
+  static Chunk loadChunk(device uchar *p0, device uchar *p1, ushort c) { return F::loadChunk(p0, p1, c); }
+  static uint4 codes(Chunk q) { return F::codes(q); }
+  static QuantCoef coef(Meta mt, ushort j) { return F::coef(mt, j); }
+};
+
 // The format Apple9 decodes F as (gguf_apple9_view): its gguf_decode_sg9_ instances, and fused segments with
 // GGUF_DECODE_APPLE9_VIEW. Apple10 decodes F itself.
 template <class F> struct Apple9View { typedef F type; };
 template <> struct Apple9View<FmtQ40> { typedef ZeroAsMin<FmtQ40> type; };
 template <> struct Apple9View<FmtQ50> { typedef ZeroAsMin<FmtQ50> type; };
+template <> struct Apple9View<FmtQ6K> { typedef Centered<FmtQ6K> type; };
+template <> struct Apple9View<FmtQ3K> { typedef Centered<FmtQ3K> type; };
 #define GGUF_SG_APPLE9_VIEW(F, f)                                                                     \
   static_assert(is_same_v<typename Apple9View<F>::type, F> != gguf_apple9_view(F::Id),               \
                 #f ": Apple9View holds the views of gguf_apple9_view");
@@ -103,6 +127,8 @@ inline bfloat2 operand(typename F::Chunk ch, uint f, threadgroup const bfloat2 *
   if constexpr (F::Kind == QuantLinear && S::Wide) {
     const uint pair = F::codes(ch)[f];
     return bfloat2(float2(pair & 0xFFFFu, pair >> 16));   // exact: bf16 holds every integer to 256
+  } else if constexpr (F::Kind == QuantLinear && S::Centered) {   // exact: the difference of integers to 256
+    return as_type<bfloat2>(F::codes(ch)[f] + 0x43004300u) - bfloat2(bfloat(128 + F::Zero));
   } else if constexpr (F::Kind == QuantLinear) {
     return as_type<bfloat2>(F::codes(ch)[f] + S::Operand * 0x00010001u);   // Operand in both halves
   } else if constexpr (F::Kind == QuantCodebook) {
@@ -260,7 +286,7 @@ inline void decode(device const bfloat *table, device const float *sums, device 
           if (S::HasMin && !S::Seeded) sum = *(device const float2 *)(s32 + ulong(r) * tileSums + q * 8 + fn);
 #pragma unroll
           for (uint h = 0; h < S::CG; ++h)
-            seed[h] = S::Seeded ? *(device const float2 *)(seeds + ulong(r) * tileSums + (2 * q + h) * 8 + fn)
+            seed[h] = S::Seeded && !S::Centered ? *(device const float2 *)(seeds + ulong(r) * tileSums + (2 * q + h) * 8 + fn)
                                 : float2(0);
 #pragma unroll
           for (uint h = 0; h < S::CG; ++h) {
@@ -373,6 +399,8 @@ QUANT_REGISTER_FORMATS(GGUF_SG_FORMAT)
 // Apple9's views (gguf_apple9_view).
 GGUF_SG_LANES(gguf_sg::Apple9View<FmtQ40>::type, sg9_q40)
 GGUF_SG_LANES(gguf_sg::Apple9View<FmtQ50>::type, sg9_q50)
+GGUF_SG_LANES(gguf_sg::Apple9View<FmtQ6K>::type, sg9_q6k)
+GGUF_SG_LANES(gguf_sg::Apple9View<FmtQ3K>::type, sg9_q3k)
 #undef GGUF_SG_FORMAT
 #undef GGUF_SG_LANES
 #undef GGUF_SG_EPILOGUES

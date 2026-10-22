@@ -119,8 +119,11 @@ inline constexpr bool gguf_embedding_format(uint32_t format) { return format < G
 // The formats that Apple9's register tile decodes in a view of their own
 // (kernels/decode/linear_gguf_sgmatrix.metal, Apple9View; the
 // gguf_decode_sg9_<kQuantFormats name> instances): Q4_0 and Q5_0 with their
-// zero point as a min. Apple10 decodes them as they are.
-inline constexpr bool gguf_apple9_view(uint32_t format) { return format == GGUF_FMT_Q40 || format == GGUF_FMT_Q50; }
+// zero point as a min, Q6_K and Q3_K with it in their operands. Apple10
+// decodes them as they are.
+inline constexpr bool gguf_apple9_view(uint32_t format) {
+  return format == GGUF_FMT_Q40 || format == GGUF_FMT_Q50 || format == GGUF_FMT_Q6K || format == GGUF_FMT_Q3K;
+}
 
 // Prism ML's input rotation (kernels/shared/gguf_rotation.metal): weights
 // stored for rotated inputs multiply H (D x), H the normalized Walsh-Hadamard
