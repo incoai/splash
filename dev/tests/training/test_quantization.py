@@ -178,3 +178,62 @@ class QuantizationTests(unittest.TestCase):
         values = t.tensor([-0.5, 0.5, -2.5, 2.5, 8388609.0, -8388609.0])
         expected = t.tensor([-1.0, 1.0, -3.0, 3.0, 8388609.0, -8388609.0])
         t.testing.assert_close(half_away(values), expected, rtol=0, atol=0)
+
+    def test_evaluation_scope_switch_restores_optimizer_parameters_after_failure(self):
+        import tempfile
+        from dataclasses import replace
+        from pathlib import Path
+
+        from draft_training.config import Recipe
+        from draft_training.evaluate import evaluate_cached
+        from draft_training.quantization import Affine4Linear
+
+        t = self.torch
+        devices = ["cpu"] + (["mps"] if t.backends.mps.is_available() else [])
+        with tempfile.TemporaryDirectory() as directory:
+            for device in devices:
+                with self.subTest(device=device):
+                    model = t.nn.Module()
+                    model.fc = t.nn.Linear(64, 64, bias=False).to(device)
+                    model.candidate_selector = t.nn.Module()
+                    model.candidate_selector.hidden_projection = t.nn.Linear(
+                        64, 4, bias=False
+                    ).to(device)
+                    parameters = dict(model.named_parameters())
+                    optimizer = t.optim.AdamW(model.parameters(), lr=0.001)
+                    for scope in ("selector_context", "off", "all", "off"):
+                        values = {
+                            k: p.detach().cpu().clone()
+                            for k, p in model.named_parameters()
+                        }
+                        with self.assertRaises(FileNotFoundError):
+                            evaluate_cached(
+                                model,
+                                None,
+                                None,
+                                Path(directory) / "absent",
+                                replace(Recipe(), affine4_scope=scope),
+                                device,
+                            )
+                        self.assertEqual(
+                            isinstance(model.fc, Affine4Linear), scope != "off"
+                        )
+                        for name, parameter in model.named_parameters():
+                            self.assertIs(parameter, parameters[name])
+                            self.assertEqual(parameter.dtype, t.float32)
+                            t.testing.assert_close(
+                                parameter.cpu(), values[name], rtol=0, atol=0
+                            )
+                        optimizer.zero_grad()
+                        with t.autocast(device, dtype=t.bfloat16):
+                            loss = (
+                                model.fc(t.ones(1, 64, device=device))
+                                .float()
+                                .square()
+                                .sum()
+                            )
+                        loss.backward()
+                        optimizer.step()
+                        self.assertFalse(
+                            t.equal(model.fc.weight.detach().cpu(), values["fc.weight"])
+                        )
