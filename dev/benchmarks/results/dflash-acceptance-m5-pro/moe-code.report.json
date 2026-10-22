@@ -1,0 +1,152 @@
+{
+  "metadata": {
+    "kind": "metadata",
+    "schema": 1,
+    "model_root": "install/models/.resolved/3a1b291dc8b9e540488f002c99df9b34e29ad3b707b5f2501106609068cb7251",
+    "device": "Apple M5 Pro",
+    "width": 1,
+    "positions": 7,
+    "candidates": 16,
+    "sampling": false,
+    "verify_rows": "all",
+    "presence_penalty": 0,
+    "model_fingerprint": "c2c93ba76d0de1cc9be28b9fa6f9e168614c5ee1e1e1b8615c7963a5123e9edd",
+    "kv_format": "int8",
+    "state_format": "fp32",
+    "prompt_tokens": 54
+  },
+  "cycles": 64,
+  "mean_retained_tokens": 3.90625,
+  "verified_proposals": 448,
+  "accepted_proposals": 186,
+  "first_rejections": {
+    "selection": 45,
+    "candidate_recall": 10,
+    "censored": 0
+  },
+  "selection_miss_unary_rank_counts": [
+    2,
+    19,
+    5,
+    5,
+    6,
+    2,
+    1,
+    1,
+    1,
+    0,
+    0,
+    0,
+    0,
+    2,
+    0,
+    1
+  ],
+  "conditional_acceptance": [
+    {
+      "position": 1,
+      "reached": 64,
+      "accepted": 50,
+      "rate": 0.78125
+    },
+    {
+      "position": 2,
+      "reached": 50,
+      "accepted": 42,
+      "rate": 0.84
+    },
+    {
+      "position": 3,
+      "reached": 42,
+      "accepted": 30,
+      "rate": 0.7142857142857143
+    },
+    {
+      "position": 4,
+      "reached": 30,
+      "accepted": 26,
+      "rate": 0.8666666666666667
+    },
+    {
+      "position": 5,
+      "reached": 26,
+      "accepted": 17,
+      "rate": 0.6538461538461539
+    },
+    {
+      "position": 6,
+      "reached": 17,
+      "accepted": 12,
+      "rate": 0.7058823529411765
+    },
+    {
+      "position": 7,
+      "reached": 12,
+      "accepted": 9,
+      "rate": 0.75
+    }
+  ],
+  "confidence_bins": [
+    {
+      "count": 0,
+      "mean_confidence": null,
+      "acceptance_rate": null
+    },
+    {
+      "count": 0,
+      "mean_confidence": null,
+      "acceptance_rate": null
+    },
+    {
+      "count": 1,
+      "mean_confidence": 0.275593549,
+      "acceptance_rate": 0.0
+    },
+    {
+      "count": 5,
+      "mean_confidence": 0.37235483540000003,
+      "acceptance_rate": 0.4
+    },
+    {
+      "count": 9,
+      "mean_confidence": 0.4577082858888888,
+      "acceptance_rate": 0.5555555555555556
+    },
+    {
+      "count": 21,
+      "mean_confidence": 0.5477058632380953,
+      "acceptance_rate": 0.47619047619047616
+    },
+    {
+      "count": 16,
+      "mean_confidence": 0.6427639498125,
+      "acceptance_rate": 0.6875
+    },
+    {
+      "count": 16,
+      "mean_confidence": 0.7486776001875001,
+      "acceptance_rate": 0.375
+    },
+    {
+      "count": 24,
+      "mean_confidence": 0.8546298840833333,
+      "acceptance_rate": 0.625
+    },
+    {
+      "count": 149,
+      "mean_confidence": 0.9823641684966437,
+      "acceptance_rate": 0.9194630872483222
+    }
+  ],
+  "counterfactual": {
+    "complete_reference_cycles": 63,
+    "censored_reference_cycles": 1,
+    "mean_tokens_at_original_starts": {
+      "greedy": 3.9206349206349205,
+      "expected_length": 3.9206349206349205,
+      "viterbi": 3.9682539682539684,
+      "candidate_oracle": 6.031746031746032
+    },
+    "limitation": "Fixed greedy continuation at original cycle starts; not a rollout or throughput estimate."
+  }
+}

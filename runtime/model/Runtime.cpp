@@ -3475,6 +3475,32 @@ uint32_t RuntimeInstrumentation::lastVerifyRows(const Runtime &runtime, uint32_t
   return *contents<uint32_t>(runtime.impl_->decodeArena->get(lane, DecodeTensor::VerifyRows), "verify rows");
 }
 
+RuntimeInstrumentation::DraftSelection RuntimeInstrumentation::lastDraftSelection(
+    const Runtime &runtime, uint32_t lane, uint32_t width) {
+  if (!width || width > kLaneCount || lane >= width)
+    throw std::invalid_argument("invalid draft selection batch");
+  const auto &arena = *runtime.impl_->decodeArena;
+  constexpr uint32_t positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
+  constexpr uint32_t candidates = SPLASH_DRAFT_CANDIDATES;
+  const auto ids = [&](DecodeTensor tensor, uint32_t count) {
+    return std::span<const uint32_t>(contents<uint32_t>(arena.get(lane, tensor), "draft selection ids"), count);
+  };
+  const auto values = [&](DecodeTensor tensor, uint32_t count) {
+    return std::span<const float>(contents<float>(arena.get(lane, tensor), "draft selection values"), count);
+  };
+  const float *partials = contents<float>(arena.get(0, DecodeTensor::TopPartialValues), "draft edge tables");
+  const uint64_t edgeOffset = uint64_t{width} * positions * SPLASH_DRAFT_SAMPLING_SHARDS * candidates +
+                              uint64_t{lane} * positions * candidates * candidates;
+  return {ids(DecodeTensor::Candidates, positions * candidates),
+          ids(DecodeTensor::ProposedTokens, positions),
+          ids(DecodeTensor::OutputTokens, SPLASH_DRAFT_QUERY_ROWS),
+          values(DecodeTensor::Unary, positions * candidates),
+          {partials + edgeOffset, positions * candidates * candidates},
+          values(DecodeTensor::VerifyConfidence, positions),
+          ids(DecodeTensor::AcceptedCount, 1)[0], ids(DecodeTensor::RetainedCount, 1)[0],
+          ids(DecodeTensor::VerifyRows, 1)[0]};
+}
+
 RuntimeInstrumentation::LaneTables RuntimeInstrumentation::laneTables(const Runtime &runtime, uint64_t requestId) {
   const Runtime::Impl &impl = *runtime.impl_;
   const Runtime::Impl::LaneTables tables = impl.laneTables(impl.requests.at(requestId).stateLane);

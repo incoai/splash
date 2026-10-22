@@ -1,0 +1,28 @@
+{
+  "base_commit": "1482f6bbc2abf12375332725302019594150b6cb",
+  "replay_tests": {
+    "command": ".venv/bin/python -m unittest dev.tests.tools.test_draft_replay",
+    "passed": 20,
+    "archived_lane_cycles": 552
+  },
+  "python_suite": {
+    "command": "make -j6 check (Python component)",
+    "passed": true,
+    "tests": 1335,
+    "skipped": 27,
+    "note": "Full-suite discovery preceded the final archived-capture/terminal/metadata tests; final replay suite separately passes all 20."
+  },
+  "aggregate_check": {
+    "command": "make -j6 check",
+    "status": "running",
+    "log": "/tmp/splash-dflash-pr-check.log"
+  },
+  "final_tool_smokes": {
+    "dense_width4_cycles": 8,
+    "moe_width1_cycles": 8,
+    "normal_dispatch_profile": "pass",
+    "capture_replay": "pass"
+  },
+  "speedup_claim": false,
+  "training_performed": false
+}

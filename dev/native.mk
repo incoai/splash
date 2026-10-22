@@ -431,7 +431,7 @@ $(TEST_MODEL_RUNTIME_ORACLE): dev/tests/engine/model_runtime_oracle_test.mm \
 $(TEST_MODEL_RUNTIME_ORACLE): ENGINE_TEST_CXXFLAGS += -include $(BUILD_ID_HEADER)
 $(TEST_DECODE_PROFILE): dev/benchmarks/decode_profile.mm \
 		dev/tools/LoadOptions.hpp \
-		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY) $(LIB)
+		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_INSTRUMENTED_RUNTIME_OBJECT) $(ENGINE_LIBRARY) $(LIB)
 $(TEST_TEACHER_LOGITS): dev/benchmarks/teacher_logits.mm \
 		dev/tools/LoadOptions.hpp \
 		$(ENGINE_INSTRUMENTED_RUNTIME_OBJECT) $(ENGINE_LIBRARY) $(LIB)
