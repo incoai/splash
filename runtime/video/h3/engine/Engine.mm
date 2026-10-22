@@ -87,7 +87,7 @@ WindowTable Engine::windowTable(const Request &request, int32_t textRows, int32_
 void Engine::prep(const model::PrepInputs &inputs, model::Prepared &out) {
   model::Prep::run(*backend_, config_.weights, request_.variant, geometry_, inputs, out);
   splash::logLine(std::format("H3 prep M={} L={} C={} steps={} distinct_t={} total {:.1f}s (layout {:.2f}s, keyframe "
-                              "encode {:.2f}s, text+temb+noise {:.2f}s, adaLN {:.1f}s reading {:.1f} GB) device_MB={:.0f}",
+                              "encode {:.2f}s, text+noise {:.2f}s, adaLN tables {:.1f}s reading {:.1f} GB) device_MB={:.0f}",
                               out.rows, out.textRows, out.condRows, out.steps, out.table.size(), out.totalS,
                               out.layoutS, out.encodeS, out.textS, out.adalnS, out.adalnReadGb, deviceMb(*backend_)));
 }

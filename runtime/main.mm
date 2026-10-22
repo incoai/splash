@@ -418,6 +418,8 @@ int main(int argc, char **argv) {
         return splash::checkDevice();
       if (argc > 1 && std::string_view(argv[1]) == "model-check")
         return splash::checkModel(argc, argv);
+      if (argc > 1 && std::string_view(argv[1]) == "video-adaln")
+        return splash::video::tabulateAdaLn(splash::executablePath().parent_path() / "splash.metallib", argc, argv);
       if (argc > 2 && std::string_view(argv[1]) == "serve-native" && splash::video::servesVideo(argv[2]))
         return splash::video::serve(splash::executablePath().parent_path() / "splash.metallib", argc, argv);
       const splash::engine::NativeArguments arguments =

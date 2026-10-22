@@ -7,6 +7,7 @@
  * device, the weights, the activations and every kernel choice, and returns latents, frames, the waveform and the mp4.
  * Phases:
  *
+ *   h3_tabulate_adaln    (conversion, no engine) the adaLN tables of a variant's schedule, which h3_prep reads
  *   h3_create            device, kernel library, request geometry
  *   h3_prep              text hidden states (+ keyframes: video VAE encoder) -> layout, RoPE, adaLN tables, refined
  *                        text, schedule, noise, keyframe conditioning rows
@@ -204,11 +205,17 @@ int64_t h3_window_table(const h3_request *request, int32_t text_rows, int32_t co
                         int64_t capacity);
 
 h3_status h3_create(const h3_config *config, const h3_request *request, h3_engine **out);
+/* Conversion, without an engine: the adaLN tables of the variant's schedule, with and without keyframes, from its
+ * converted DiT (<weights>/dit-<variant>: prep.safetensors, the blocks' and vdn-globals' LoRA factors) and the adaLN
+ * bases in FL2VA's transformer shards (transformer: their directory, 26 GB read, which no request reads), into
+ * <weights>/dit-<variant>/adaln.safetensors (0.3 GB turbo, 1.9 GB default). The error goes to stderr. */
+h3_status h3_tabulate_adaln(const h3_config *config, h3_variant variant, const char *transformer);
 void h3_destroy(h3_engine *engine);
 const char *h3_error(const h3_engine *engine);
 
-/* Request-constant DiT inputs (weights: <weights>/dit-<variant>/prep.safetensors, vdn-w8-blockNN / vdn-globals LoRA
- * factors, <weights>/fl2va/transformer adaLN bases; keyframes: <weights>/vae/vae_enc_f16.bin). */
+/* Request-constant DiT inputs (weights: <weights>/dit-<variant>/prep.safetensors and adaln.safetensors, the adaLN
+ * tables of the variant's schedule, which h3_tabulate_adaln writes; keyframes: <weights>/vae/vae_enc_f16.bin). The
+ * request takes the variant's steps (0, 8 for turbo, 50 for default): others are refused (H3_ERROR_ARGUMENT). */
 h3_status h3_prep(h3_engine *engine, const h3_prep_inputs *inputs, h3_prepared *out);
 /* The last h3_prep's arrays as a prep directory (layout.npz, sched.npz, ada_blocks.npy, ada_final.npy, text_ref.npy,
  * noise.npz, prep.json; the files of the former Python prep; with keyframes also layout C / keyframes, sched c_t / tc,

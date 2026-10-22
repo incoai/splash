@@ -478,6 +478,16 @@ bool servesVideo(const std::filesystem::path &modelRoot) {
   }
 }
 
+int tabulateAdaLn(const std::filesystem::path &metallib, int argc, char **argv) {
+  const std::string_view variant = argc == 5 ? argv[3] : "";
+  if (variant != "turbo" && variant != "default")
+    throw engine::UsageError("video-adaln takes WEIGHTS VARIANT (turbo or default) TRANSFORMER");
+  const h3_config config{metallib.c_str(), argv[2]};
+  const h3_status status =
+      h3_tabulate_adaln(&config, variant == "turbo" ? H3_VARIANT_TURBO : H3_VARIANT_DEFAULT, argv[4]);
+  return status == H3_OK ? EX_OK : EX_SOFTWARE;
+}
+
 int serve(const std::filesystem::path &metallib, int argc, char **argv) {
   struct sigaction action {};
   action.sa_handler = requestStop;

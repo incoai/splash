@@ -10,7 +10,9 @@
 //            timesteps 1 - sigma, the sorted distinct timesteps (table) and per-step indices into it
 //   adaLN    per block: bf16(fp32(fp64(bf16 W silu(temb) + b) + B (A silu(temb)))) for every distinct timestep (base
 //            W, b from the FL2VA shards, rank-16 A / B from dit-<variant>/vdn-w8-blockNN), gathered per step and
-//            modality; final layer likewise (vdn-globals LoRA); temb = time_embedder(sinusoid(table)) in fp32
+//            modality; final layer likewise (vdn-globals LoRA); temb = time_embedder(sinusoid(table)) in fp32. The
+//            tables depend only on the variant's schedule: tabulateAdaLn computes them once, at conversion, into
+//            dit-<variant>/adaln.safetensors, which run() gathers from
 //   text     condition_proj + 2-block token refiner (LoRAs merged by tools/convert_prep.py) + final RMSNorm, bf16
 //   noise    MLX random.normal: threefry2x32 key sequence of mx.random.seed(seed) (one split per draw), uniform
 //            on (nextafter(-1, 0), 1), erfinv, x sqrt 2; keyframe noise [C][96] (FL2VA), video latents
@@ -19,8 +21,9 @@
 //            (ops/VaeEncoder), sampled under mx.random.seed(42), float16 round trip, normalised, patchified, then
 //            noised to t = 0.999 with the request's keyframe noise: rows that stay fixed through the denoising loop
 //            and run at timestep max(t, 0.999) (adaLN slot 3 = the video modulation at that timestep)
-// GPU work runs on kernels/prep (MLX-identical arithmetic, see prep.metal); the 26 GB of adaLN bases are streamed
-// from <weights>/fl2va/transformer while the GPU evaluates the previous block.
+// GPU work runs on kernels/prep (MLX-identical arithmetic, see prep.metal). A request reads 0.15 GB (turbo) / 1 GB
+// (default) of adaLN tables; their conversion streams the 26 GB of adaLN bases from FL2VA's transformer shards while
+// the GPU evaluates the previous block.
 #include "video/h3/engine/Encoder.hpp"
 #include "video/h3/engine/Types.hpp"
 #include "video/h3/model/Geometry.hpp"
@@ -34,7 +37,7 @@ namespace h3::model {
 struct PrepInputs {
   const float *hidden = nullptr;  // [textRows][5120] fp32: Qwen3-VL-32B hidden_states[50], unnormalized
   int32_t textRows = 0;           // >= 2
-  int32_t steps = 0;              // 0: the variant's (turbo 8, default 50)
+  int32_t steps = 0;              // 0 or the variant's (turbo 8, default 50): the schedule of its adaLN tables
   uint64_t seed = 0;
   const uint8_t *textTags = nullptr;  // [textRows] 1 text, 0 video (rows of a keyframe's vision block); null: all 1
   // FL2VA keyframes: uint8 RGB [height][width][3] of the request canvas (resized / cropped by the host as the port's
@@ -75,6 +78,11 @@ class Prep {
 public:
   static void run(metal::MetalBackend &backend, const std::string &weights, Variant variant,
                   const VideoGeometry &geometry, const PrepInputs &inputs, Prepared &out);
+  // Conversion: the adaLN tables of the variant's schedule, without keyframes and with them (adaln.text.* and
+  // adaln.keyframes.*: table F32 [T], final BF16 [T][2][5376], blocks BF16 [50][T][6 x 3 x 5376]), from the converted
+  // DiT in ditDir and the adaLN bases of FL2VA's transformer shards in transformerDir, into ditDir/adaln.safetensors.
+  static void tabulateAdaLn(metal::MetalBackend &backend, const std::string &ditDir, const std::string &transformerDir,
+                            Variant variant);
   // The prep directory of the former Python prep: layout.npz, sched.npz, ada_blocks.npy, ada_final.npy,
   // text_ref.npy, noise.npz, prep.json (same members, dtypes and bytes); with keyframes also layout C / keyframes,
   // sched c_t / tc, noise cond and keyframes.npz.

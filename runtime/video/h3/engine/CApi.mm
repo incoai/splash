@@ -140,6 +140,16 @@ void h3_destroy(h3_engine *engine) { delete engine; }
 
 const char *h3_error(const h3_engine *engine) { return engine ? engine->error.c_str() : ""; }
 
+h3_status h3_tabulate_adaln(const h3_config *config, h3_variant variant, const char *transformer) {
+  if (!config || !config->metallib || !config->weights || !transformer) return H3_ERROR_ARGUMENT;
+  return guarded(nullptr, [&] {
+    splash::metal::MetalBackend backend(config->metallib);
+    const bool turbo = variant == H3_VARIANT_TURBO;
+    h3::model::Prep::tabulateAdaLn(backend, std::string(config->weights) + (turbo ? "/dit-turbo" : "/dit-default"),
+                                   transformer, turbo ? h3::Variant::Turbo : h3::Variant::Default);
+  });
+}
+
 h3_status h3_prep(h3_engine *e, const h3_prep_inputs *in, h3_prepared *out) {
   if (!e || !in || !out) return H3_ERROR_ARGUMENT;
   return guarded(e, [&] {

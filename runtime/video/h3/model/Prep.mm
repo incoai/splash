@@ -10,11 +10,14 @@
 #include "video/h3/ops/VaeEncoder.hpp"
 
 #include <dispatch/dispatch.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -180,7 +183,188 @@ void applyLora(const uint16_t *h, const std::vector<double> &st, const float *A,
   });
 }
 
+int32_t variantSteps(Variant variant) { return variant == Variant::Turbo ? 8 : 50; }
+
+// The tensors of adaln.safetensors, by schedule: without keyframes (text) or with them (keyframes).
+std::string adalnName(bool keyframes, const char *what) {
+  return std::string("adaln.") + (keyframes ? "keyframes." : "text.") + what;
+}
+
+// A safetensors file written in place: its header first, then each tensor's bytes at its offset, published by rename.
+class SafetensorsWriter {
+public:
+  struct Entry {
+    std::string name, dtype;
+    std::vector<int64_t> shape;
+    uint64_t bytes = 0, offset = 0;
+  };
+
+  SafetensorsWriter(std::string path, std::vector<Entry> entries) : path_(std::move(path)), entries_(std::move(entries)) {
+    std::string header = "{";
+    uint64_t offset = 0;
+    for (Entry &e : entries_) {
+      e.offset = offset;
+      offset += e.bytes;
+      std::string shape;
+      for (int64_t d : e.shape) shape += (shape.empty() ? "" : ",") + std::to_string(d);
+      header += std::format("{}\"{}\":{{\"dtype\":\"{}\",\"shape\":[{}],\"data_offsets\":[{},{}]}}",
+                            header.size() > 1 ? "," : "", e.name, e.dtype, shape, e.offset, offset);
+    }
+    header += "}";
+    header.append((8 - header.size() % 8) % 8, ' ');
+    data_ = 8 + header.size();
+    file_ = std::fopen((path_ + ".partial").c_str(), "wb");
+    if (!file_) throw std::runtime_error("cannot write " + path_ + ".partial");
+    const uint64_t length = header.size();
+    write(0, &length, 8);
+    write(8, header.data(), header.size());
+  }
+  ~SafetensorsWriter() {
+    if (file_) std::fclose(file_);
+  }
+  SafetensorsWriter(const SafetensorsWriter &) = delete;
+  SafetensorsWriter &operator=(const SafetensorsWriter &) = delete;
+
+  // Bytes at `at` of tensor `index`.
+  void put(size_t index, uint64_t at, const void *bytes, uint64_t size) {
+    const Entry &e = entries_.at(index);
+    if (at + size > e.bytes) throw std::logic_error(e.name + ": write past its end");
+    write(data_ + e.offset + at, bytes, size);
+  }
+  void publish() {
+    const bool closed = std::fflush(file_) == 0 && fsync(fileno(file_)) == 0;
+    std::fclose(file_);
+    file_ = nullptr;
+    if (!closed || std::rename((path_ + ".partial").c_str(), path_.c_str()) != 0)
+      throw std::runtime_error("cannot write " + path_);
+  }
+
+private:
+  void write(uint64_t at, const void *bytes, uint64_t size) {
+    if (fseeko(file_, static_cast<off_t>(at), SEEK_SET) != 0 || std::fwrite(bytes, 1, size, file_) != size)
+      throw std::runtime_error("cannot write " + path_ + ".partial");
+  }
+
+  std::string path_;
+  std::vector<Entry> entries_;
+  uint64_t data_ = 0;
+  std::FILE *file_ = nullptr;
+};
+
 } // namespace
+
+void Prep::tabulateAdaLn(metal::MetalBackend &b, const std::string &ditDir, const std::string &transformerDir,
+                         Variant variant) {
+  const SafetensorsCheckpoint dit(ditDir), transformer(transformerDir);
+  const int32_t steps = variantSteps(variant);
+  // the schedule without keyframes and with them, whose distinct timesteps index the tables
+  struct Schedule {
+    Prepared p;
+    int32_t T = 0;
+    Buffers buf;
+    std::vector<double> st;
+    metal::MetalBuffer out[2];
+  };
+  Schedule sched[2] = {{{}, 0, {b, {}}, {}, {}}, {{}, 0, {b, {}}, {}, {}}};
+  std::vector<SafetensorsWriter::Entry> entries;
+  for (int k = 0; k < 2; ++k) {
+    Schedule &s = sched[k];
+    schedule(steps, k == 1, s.p);
+    s.T = static_cast<int32_t>(s.p.table.size());
+    const uint64_t T = uint64_t(s.T);
+    entries.push_back({adalnName(k == 1, "table"), "F32", {s.T}, T * 4});
+    entries.push_back({adalnName(k == 1, "final"), "BF16", {s.T, kFinalOut}, T * kFinalOut * 2});
+    entries.push_back({adalnName(k == 1, "blocks"), "BF16", {H3_DIT_BLOCKS, s.T, kAdaOut}, H3_DIT_BLOCKS * T * kAdaOut * 2});
+  }
+  SafetensorsWriter file(ditDir + "/adaln.safetensors", entries);
+  auto weight = [&](const std::string &name, const char *dtype, const std::vector<int64_t> &shape) {
+    return BufferView{resident(b, dit, name, dtype, shape)};
+  };
+  const BufferView teInW = weight("time_embedder.proj_in.weight", "F32", {kTembHidden, kTembIn});
+  const BufferView teInB = weight("time_embedder.proj_in.bias", "F32", {kTembHidden});
+  const BufferView teOutW = weight("time_embedder.proj_out.weight", "F32", {kTembDim, kTembHidden});
+  const BufferView teOutB = weight("time_embedder.proj_out.bias", "F32", {kTembDim});
+  const BufferView finW = weight("final_layer.adaln_proj.linear.weight", "BF16", {kFinalOut, kTembDim});
+  const BufferView finB = weight("final_layer.adaln_proj.linear.bias", "BF16", {kFinalOut});
+  ops::PrepOps op;
+  {  // timestep MLP and the final layer's adaLN base, of each schedule's distinct timesteps
+    Encoder e(b);
+    for (Schedule &s : sched) {
+      const int32_t T = s.T;
+      Buffers &buf = s.buf;
+      buf.make("table", {T}, 4);
+      std::memcpy(buf.contents("table"), s.p.table.data(), size_t(T) * 4);
+      buf.make("te_sin", {T, kTembIn}, 4);
+      buf.make("te_h", {T, kTembHidden}, 4);
+      buf.make("te_s", {T, kTembHidden}, 4);
+      buf.make("temb", {T, kTembDim}, 4);
+      buf.make("st", {T, kTembDim}, 4);
+      buf.make("st_bf", {T, kTembDim}, 2);
+      buf.make("fin", {T, kFinalOut}, 2);
+      for (metal::MetalBuffer &out : s.out) out = allocate(b, size_t(T) * kAdaOut * 2, "adaLN output slot");
+      op.tembSinusoid(e, buf["table"], buf["te_sin"], T);
+      op.linear(e, true, buf["te_sin"], teInW, teInB, buf["te_h"], T, kTembHidden, kTembIn);
+      op.siluF32(e, buf["te_h"], buf["te_s"], T * kTembHidden);
+      op.linear(e, true, buf["te_s"], teOutW, teOutB, buf["temb"], T, kTembDim, kTembHidden);
+      op.siluF32(e, buf["temb"], buf["st"], T * kTembDim);
+      op.castBf16(e, buf["st"], buf["st_bf"], T * kTembDim);
+      op.linear(e, false, buf["st_bf"], finW, finB, buf["fin"], T, kFinalOut, kTembDim);
+    }
+    h3::run(b, e);
+  }
+  // final layer (vdn-globals LoRA)
+  const bool finalLora = dit.find("norm_out.linear.lora_A") != nullptr;
+  std::vector<float> finalA, finalB;
+  if (finalLora) {
+    finalA = readF32(dit, "norm_out.linear.lora_A", {16, kTembDim});
+    finalB = readF32(dit, "norm_out.linear.lora_B", {kFinalOut, 16});
+  }
+  std::vector<uint16_t> tab;
+  for (int k = 0; k < 2; ++k) {
+    Schedule &s = sched[k];
+    s.st.resize(size_t(s.T) * kTembDim);
+    for (size_t i = 0; i < s.st.size(); ++i) s.st[i] = double(s.buf.host<float>("st")[i]);
+    applyLora(s.buf.host<uint16_t>("fin"), s.st, finalLora ? finalA.data() : nullptr,
+              finalLora ? finalB.data() : nullptr, s.T, kTembDim, kFinalOut, tab);
+    file.put(3 * k, 0, s.p.table.data(), uint64_t(s.T) * 4);
+    file.put(3 * k + 1, 0, tab.data(), tab.size() * 2);
+  }
+  // block bases from the FL2VA shards, two slots: block i + 1 is read while the GPU evaluates block i
+  metal::MetalBuffer wslot[2], bslot[2];
+  for (int s = 0; s < 2; ++s) {
+    wslot[s] = allocate(b, size_t(kAdaOut) * kTembDim * 2, "adaLN base slot");
+    bslot[s] = allocate(b, size_t(kAdaOut) * 2, "adaLN bias slot");
+  }
+  auto readBlock = [&](int i, int s) {
+    const std::string k = "blocks." + std::to_string(i) + ".adaln_proj.linear.";
+    read(tensor(transformer, k + "bias", "BF16", {kAdaOut}), bslot[s].contents());
+    read(tensor(transformer, k + "weight", "BF16", {kAdaOut, kTembDim}), wslot[s].contents());
+  };
+  readBlock(0, 0);
+  for (int i = 0; i < H3_DIT_BLOCKS; ++i) {
+    const int slot = i & 1;
+    Encoder e(b);
+    for (Schedule &s : sched)
+      op.linear(e, false, s.buf["st_bf"], wslot[slot], bslot[slot], s.out[slot], s.T, kAdaOut, kTembDim);
+    metal::CommandTicket ticket = submit(b, e);
+    if (i + 1 < H3_DIT_BLOCKS) readBlock(i + 1, slot ^ 1);
+    const std::string ka = "blocks." + std::to_string(i) + ".adaln_proj.lora_A";
+    std::vector<float> A, B;
+    const bool lora = dit.find(ka) != nullptr;
+    if (lora) {
+      A = readF32(dit, ka, {16, kTembDim});
+      B = readF32(dit, "blocks." + std::to_string(i) + ".adaln_proj.lora_B", {kAdaOut, 16});
+    }
+    wait(ticket);
+    for (int k = 0; k < 2; ++k) {
+      Schedule &s = sched[k];
+      applyLora(static_cast<const uint16_t *>(s.out[slot].contents()), s.st, lora ? A.data() : nullptr,
+                lora ? B.data() : nullptr, s.T, kTembDim, kAdaOut, tab);
+      file.put(3 * k + 2, uint64_t(i) * tab.size() * 2, tab.data(), tab.size() * 2);
+    }
+  }
+  file.publish();
+}
 
 void Prep::layout(const VideoGeometry &g, int32_t L, const uint8_t *textTags, const std::vector<int32_t> &anchors,
                   Prepared &p) {
@@ -346,7 +530,7 @@ void Prep::run(metal::MetalBackend &b, const std::string &weights, Variant varia
       if (in.textTags[i] != H3_TAG_TEXT && in.textTags[i] != H3_TAG_VIDEO)
         throw std::invalid_argument("prep: text row " + std::to_string(i) + " has tag " +
                                     std::to_string(in.textTags[i]) + " (1 text, 0 vision block)");
-  const int32_t steps = in.steps > 0 ? in.steps : (variant == Variant::Turbo ? 8 : 50);
+  const int32_t steps = in.steps > 0 ? in.steps : variantSteps(variant);
   std::vector<int32_t> anchors;
   if (in.firstFrame) anchors.push_back(0);
   if (in.lastFrame) anchors.push_back(1);
@@ -370,22 +554,13 @@ void Prep::run(metal::MetalBackend &b, const std::string &weights, Variant varia
   ops::PrepOps op;
   const int32_t T = static_cast<int32_t>(p.table.size()), M = p.rows;
   Buffers buf{b, {}};
-  // ---- one command: RoPE, timestep MLP, final adaLN base, text path, noise
+  // ---- one command: RoPE, text path, noise
   const auto t1 = AwakeClock::now();
   buf.make("inv_freq", {16}, 4);
   buf.make("pos", {M, 3}, 4);
   buf.make("cos", {M, 48}, 4);
   buf.make("sin", {M, 48}, 4);
   std::memcpy(buf.contents("pos"), p.pos.data(), p.pos.size() * 4);
-  buf.make("table", {T}, 4);
-  std::memcpy(buf.contents("table"), p.table.data(), size_t(T) * 4);
-  buf.make("te_sin", {T, kTembIn}, 4);
-  buf.make("te_h", {T, kTembHidden}, 4);
-  buf.make("te_s", {T, kTembHidden}, 4);
-  buf.make("temb", {T, kTembDim}, 4);
-  buf.make("st", {T, kTembDim}, 4);
-  buf.make("st_bf", {T, kTembDim}, 2);
-  buf.make("fin", {T, kFinalOut}, 2);
   buf.make("hidden", {L, kTextDim}, 4);
   std::memcpy(buf.contents("hidden"), in.hidden, size_t(L) * kTextDim * 4);
   buf.make("x0", {L, kTextDim}, 2);
@@ -446,12 +621,6 @@ void Prep::run(metal::MetalBackend &b, const std::string &weights, Variant varia
   auto weight = [&](const std::string &name, const char *dtype, const std::vector<int64_t> &shape) {
     return BufferView{resident(b, dit, name, dtype, shape)};
   };
-  const BufferView teInW = weight("time_embedder.proj_in.weight", "F32", {kTembHidden, kTembIn});
-  const BufferView teInB = weight("time_embedder.proj_in.bias", "F32", {kTembHidden});
-  const BufferView teOutW = weight("time_embedder.proj_out.weight", "F32", {kTembDim, kTembHidden});
-  const BufferView teOutB = weight("time_embedder.proj_out.bias", "F32", {kTembDim});
-  const BufferView finW = weight("final_layer.adaln_proj.linear.weight", "BF16", {kFinalOut, kTembDim});
-  const BufferView finB = weight("final_layer.adaln_proj.linear.bias", "BF16", {kFinalOut});
   const BufferView cpW = weight("condition_proj.weight", "BF16", {kD, kTextDim});
   const BufferView cpB = weight("condition_proj.bias", "BF16", {kD});
   const BufferView finalNorm = weight("token_refiner.final_norm.weight", "BF16", {kD});
@@ -474,13 +643,6 @@ void Prep::run(metal::MetalBackend &b, const std::string &weights, Variant varia
     Encoder e(b);
     op.ropeInvFreq(e, buf["inv_freq"]);
     op.ropeTrig(e, buf["pos"], buf["inv_freq"], buf["cos"], buf["sin"], M);
-    op.tembSinusoid(e, buf["table"], buf["te_sin"], T);
-    op.linear(e, true, buf["te_sin"], teInW, teInB, buf["te_h"], T, kTembHidden, kTembIn);
-    op.siluF32(e, buf["te_h"], buf["te_s"], T * kTembHidden);
-    op.linear(e, true, buf["te_s"], teOutW, teOutB, buf["temb"], T, kTembDim, kTembHidden);
-    op.siluF32(e, buf["temb"], buf["st"], T * kTembDim);
-    op.castBf16(e, buf["st"], buf["st_bf"], T * kTembDim);
-    op.linear(e, false, buf["st_bf"], finW, finB, buf["fin"], T, kFinalOut, kTembDim);
     // text path
     op.castBf16(e, buf["hidden"], buf["x0"], L * kTextDim);
     op.linear(e, false, buf["x0"], cpW, cpB, buf["cp"], L, kD, kTextDim);
@@ -548,65 +710,38 @@ void Prep::run(metal::MetalBackend &b, const std::string &weights, Variant varia
                     v[((size_t(c) * F + f) * Hh + 2 * y + py) * Ww + 2 * x + px];
     p.audioNoise.assign(buf.host<float>("noise_a"), buf.host<float>("noise_a") + audioCount);
   }
-  // ---- adaLN tables
+  // ---- adaLN tables: the converted ones of this schedule (tabulateAdaLn), gathered per step and modality
   const auto t2 = AwakeClock::now();
-  std::vector<double> st(size_t(T) * kTembDim);
-  for (size_t i = 0; i < st.size(); ++i) st[i] = double(buf.host<float>("st")[i]);
+  const bool keyframes = K > 0;
+  const SourceTensor &stored = tensor(dit, adalnName(keyframes, "table"), "F32");
+  std::vector<float> table(stored.bytes / 4);
+  read(stored, table.data());
+  if (table.size() != p.table.size() || std::memcmp(table.data(), p.table.data(), size_t(T) * 4) != 0)
+    throw std::invalid_argument("prep: " + ditDir + " holds the adaLN tables of the " +
+                                std::to_string(variantSteps(variant)) + "-step schedule, not of " +
+                                std::to_string(steps) + " steps");
   const int32_t slots = p.adaModalities();  // video, text, audio (+ conditioning video at max(t, 0.999))
   constexpr size_t kTag = size_t(H3_ADA_ROWS) * kD;
   p.adaBlocks.assign(size_t(steps) * H3_DIT_BLOCKS * slots * kTag, 0);
   p.adaFinal.assign(size_t(steps) * H3_MODALITIES * kFinalOut, 0);
-  {  // final layer (vdn-globals LoRA)
-    std::vector<float> A, B;
-    p.finalLora = dit.find("norm_out.linear.lora_A") != nullptr;
-    if (p.finalLora) {
-      A = readF32(dit, "norm_out.linear.lora_A", {16, kTembDim});
-      B = readF32(dit, "norm_out.linear.lora_B", {kFinalOut, 16});
-    }
-    std::vector<uint16_t> tab;
-    applyLora(buf.host<uint16_t>("fin"), st, p.finalLora ? A.data() : nullptr, p.finalLora ? B.data() : nullptr, T,
-              kTembDim, kFinalOut, tab);
+  p.finalLora = dit.find("norm_out.linear.lora_A") != nullptr;
+  std::vector<uint16_t> tab(size_t(T) * kAdaOut);
+  {  // final layer
+    const SourceTensor &final = tensor(dit, adalnName(keyframes, "final"), "BF16", {T, kFinalOut});
+    read(final, tab.data());
+    p.adalnReadGb += final.bytes / 1e9;
     for (int32_t s = 0; s < steps; ++s)
       for (int m = 0; m < H3_MODALITIES; ++m) {
         const int64_t t = m < 2 ? p.tv[s] : p.ta[s];
         std::memcpy(&p.adaFinal[(size_t(s) * H3_MODALITIES + m) * kFinalOut], &tab[size_t(t) * kFinalOut], kFinalOut * 2);
       }
   }
-  // block bases from the FL2VA shards, two slots: block i + 1 is read while the GPU evaluates block i
-  const SafetensorsCheckpoint transformer(weights + "/fl2va/transformer");
-  metal::MetalBuffer wslot[2], bslot[2], hslot[2];
-  for (int s = 0; s < 2; ++s) {
-    wslot[s] = allocate(b, size_t(kAdaOut) * kTembDim * 2, "adaLN base slot");
-    bslot[s] = allocate(b, size_t(kAdaOut) * 2, "adaLN bias slot");
-    hslot[s] = allocate(b, size_t(T) * kAdaOut * 2, "adaLN output slot");
-  }
-  auto readBlock = [&](int i, int s) {
-    const std::string k = "blocks." + std::to_string(i) + ".adaln_proj.linear.";
-    const SourceTensor &wt = tensor(transformer, k + "weight", "BF16", {kAdaOut, kTembDim});
-    const SourceTensor &bt = tensor(transformer, k + "bias", "BF16", {kAdaOut});
-    read(bt, bslot[s].contents());
-    read(wt, wslot[s].contents());
-    p.adalnReadGb += (wt.bytes + bt.bytes) / 1e9;
-  };
-  readBlock(0, 0);
-  std::vector<uint16_t> tab;
+  const SourceTensor &blocks = tensor(dit, adalnName(keyframes, "blocks"), "BF16", {H3_DIT_BLOCKS, T, kAdaOut});
+  const uint64_t blockBytes = uint64_t(T) * kAdaOut * 2;
   for (int i = 0; i < H3_DIT_BLOCKS; ++i) {
-    const int s = i & 1;
-    Encoder e(b);
-    op.linear(e, false, buf["st_bf"], wslot[s], bslot[s], hslot[s], T, kAdaOut, kTembDim);
-    metal::CommandTicket ticket = submit(b, e);
-    if (i + 1 < H3_DIT_BLOCKS) readBlock(i + 1, s ^ 1);
-    const std::string ka = "blocks." + std::to_string(i) + ".adaln_proj.lora_A";
-    std::vector<float> A, B;
-    const bool lora = dit.find(ka) != nullptr;
-    if (lora) {
-      A = readF32(dit, ka, {16, kTembDim});
-      B = readF32(dit, "blocks." + std::to_string(i) + ".adaln_proj.lora_B", {kAdaOut, 16});
-      ++p.adalnLoraBlocks;
-    }
-    wait(ticket);
-    applyLora(static_cast<const uint16_t *>(hslot[s].contents()), st, lora ? A.data() : nullptr,
-              lora ? B.data() : nullptr, T, kTembDim, kAdaOut, tab);
+    if (dit.find("blocks." + std::to_string(i) + ".adaln_proj.lora_A")) ++p.adalnLoraBlocks;
+    blocks.read(uint64_t(i) * blockBytes, {reinterpret_cast<uint8_t *>(tab.data()), blockBytes});
+    p.adalnReadGb += blockBytes / 1e9;
     for (int32_t sp = 0; sp < steps; ++sp)
       for (int m = 0; m < slots; ++m) {
         const int64_t t = m == H3_TAG_COND ? p.tc[sp] : (m < 2 ? p.tv[sp] : p.ta[sp]);

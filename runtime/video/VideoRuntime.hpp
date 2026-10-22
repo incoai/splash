@@ -35,4 +35,11 @@ namespace splash::video {
 // The process's exit status (engine::NativeProcessExit).
 [[nodiscard]] int serve(const std::filesystem::path &metallib, int argc, char **argv);
 
+// argv: video-adaln WEIGHTS VARIANT TRANSFORMER, a conversion step of the
+// installer (install/video.py): WEIGHTS/dit-VARIANT/adaln.safetensors, the
+// adaLN tables of the variant (turbo or default), from FL2VA's transformer
+// shards in TRANSFORMER (h3_tabulate_adaln). EX_OK, or EX_SOFTWARE after the
+// engine's error on stderr.
+[[nodiscard]] int tabulateAdaLn(const std::filesystem::path &metallib, int argc, char **argv);
+
 } // namespace splash::video

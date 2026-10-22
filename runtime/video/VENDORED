@@ -41,6 +41,14 @@ Splash's base layer instead of the one it came with:
     logLine on stderr.
   std::chrono::steady_clock -> AwakeClock.
 
+Its data are Splash's too (ABI 4): the weight stream reads the int8
+matrices from the DiT's block files, which h3 copies into a stream image
+(stream.bin, 22 GB per variant), and request preparation gathers the adaLN
+tables of the variant's schedule from dit-<variant>/adaln.safetensors, which
+h3_tabulate_adaln (splash video-adaln) computes once at conversion with h3's
+own arithmetic, where h3 computes them from FL2VA's transformer shards
+(26 GB read) at every request: a request takes the variant's steps.
+
 Gone with the h3 tools that used them: the VAE stage profile, the prep's
 intermediate dump and the numpy readers no caller uses; of the keyframe
 conditioning, the encoder's debug stop and the prep's moments input (h3
