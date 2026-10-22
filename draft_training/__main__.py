@@ -252,6 +252,9 @@ def run_training(args, *, family=True):
             raise TrainingError(
                 "preflight continuation has no full assistant query block"
             )
+        from .quantization import enable_affine4
+
+        enable_affine4(model, recipe.affine4_scope)
         configure_trainable(model, recipe.trainable, recipe.recall_last_layers)
         with torch.autocast(
             device_type=torch.device(args.device).type, dtype=torch.bfloat16
@@ -270,6 +273,8 @@ def run_training(args, *, family=True):
                 head,
                 recipe.selector_loss_weight,
                 recipe.vocabulary_chunk_rows,
+                prefix_weight=recipe.prefix_loss_weight,
+                position_decay=recipe.position_decay,
             )
         if not loss.requires_grad:
             raise TrainingError(

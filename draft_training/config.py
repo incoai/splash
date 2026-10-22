@@ -51,6 +51,8 @@ class Recipe:
     max_grad_norm: float = 1.0
     selector_loss_weight: float = 1.0
     selector_warmup_steps: int = 10
+    prefix_loss_weight: float = 0.0
+    position_decay: float = 1.0
     checkpoint_interval: int = 10
     validation_interval: int = 10
     max_new_tokens: int = 128
@@ -58,6 +60,7 @@ class Recipe:
     vocabulary_chunk_rows: int = 1
     trainable: str = "selector"
     recall_last_layers: int = 1
+    affine4_scope: str = "off"
 
     @classmethod
     def load(cls, path=None):
@@ -96,6 +99,8 @@ class Recipe:
             "max_grad_norm",
             "weight_decay",
             "selector_loss_weight",
+            "prefix_loss_weight",
+            "position_decay",
         ):
             value = getattr(recipe, name)
             if (
@@ -119,13 +124,21 @@ class Recipe:
             and not recipe.recall_last_layers
         ):
             raise TrainingError("late-backbone adaptation needs recall_last_layers > 0")
+        if not 0 < recipe.position_decay <= 1:
+            raise TrainingError("position_decay must be in (0, 1]")
+        if recipe.affine4_scope not in ("off", "selector_context", "all"):
+            raise TrainingError("affine4_scope must be off, selector_context, or all")
         if recipe.sequence_length < 16:
             raise TrainingError("sequence_length must be at least 16")
         if recipe.max_new_tokens >= recipe.sequence_length - 1:
             raise TrainingError("max_new_tokens must leave room for the prompt")
-        if recipe.trainable == "selector" and recipe.selector_loss_weight == 0:
+        if (
+            recipe.trainable == "selector"
+            and recipe.selector_loss_weight == 0
+            and recipe.prefix_loss_weight == 0
+        ):
             raise TrainingError(
-                "selector-only training needs a positive selector loss weight"
+                "selector-only training needs a positive selector or prefix loss weight"
             )
         return recipe
 
