@@ -196,7 +196,17 @@ identical target, sampling, cache, and memory settings with alternating runs.
 Exports remain experimental until these real-model gates pass. A compatible
 checkpoint or reduced loss alone does not establish a speedup.
 
-## Evidence required before leaving draft
+## Merge scope and trained-checkpoint qualification
+
+This is an opt-in experimental training command. Code review covers the
+metadata/launcher contracts, isolated-block reference behavior, optimizer
+resume and finite BF16 exports; CPU/reference and ordinary runtime/Python CI
+exercise those contracts without model downloads. Serving defaults do not
+select weights produced by this command automatically.
+
+Ready-for-review status applies to that implementation scope. A trained
+checkpoint needs the following independent evidence before deployment or a
+performance recommendation:
 
 - Complete a CUDA preflight and short training run with the real BF16 target
   and released initial draft. Record GPU, peak memory, step time, exact input
