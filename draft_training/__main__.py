@@ -170,6 +170,11 @@ def inspect_training(args):
     validate_target(args.target)
     config = validate_draft(args.init_draft)
     recipe = Recipe.load(args.config)
+    if (
+        recipe.trainable in ("late_backbone", "recall")
+        and recipe.recall_last_layers > config["num_hidden_layers"]
+    ):
+        raise TrainingError("recall_last_layers exceeds draft depth")
     if recipe.sequence_length > config["max_position_embeddings"]:
         raise TrainingError("sequence_length exceeds model position limit")
     training, validation = (
@@ -247,7 +252,7 @@ def run_training(args, *, family=True):
             raise TrainingError(
                 "preflight continuation has no full assistant query block"
             )
-        configure_trainable(model, recipe.trainable)
+        configure_trainable(model, recipe.trainable, recipe.recall_last_layers)
         with torch.autocast(
             device_type=torch.device(args.device).type, dtype=torch.bfloat16
         ):
@@ -263,7 +268,7 @@ def run_training(args, *, family=True):
                 sample["tokens"],
                 anchor,
                 head,
-                1,
+                recipe.selector_loss_weight,
                 recipe.vocabulary_chunk_rows,
             )
         if not loss.requires_grad:
@@ -286,6 +291,7 @@ def run_training(args, *, family=True):
         optimizer.step()
         return {
             "mode": "device-preflight",
+            "recipe": recipe.to_dict(),
             "capture_peak_cuda_bytes": capture_peak,
             "metrics": metrics,
             "training_peak_cuda_bytes": torch.cuda.max_memory_allocated()

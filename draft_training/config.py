@@ -57,6 +57,7 @@ class Recipe:
     max_validation_blocks: int = 64
     vocabulary_chunk_rows: int = 1
     trainable: str = "selector"
+    recall_last_layers: int = 1
 
     @classmethod
     def load(cls, path=None):
@@ -86,7 +87,7 @@ class Recipe:
             value = getattr(recipe, name)
             if type(value) is not int or value <= 0:
                 raise TrainingError(f"{name} must be a positive integer")
-        for name in ("seed", "selector_warmup_steps"):
+        for name in ("seed", "selector_warmup_steps", "recall_last_layers"):
             value = getattr(recipe, name)
             if type(value) is not int or value < 0:
                 raise TrainingError(f"{name} must be a nonnegative integer")
@@ -105,8 +106,19 @@ class Recipe:
                 raise TrainingError(f"{name} must be finite")
             if value < 0 or (name in ("learning_rate", "max_grad_norm") and value == 0):
                 raise TrainingError(f"invalid {name}")
-        if recipe.trainable not in ("selector", "all"):
-            raise TrainingError("trainable must be selector or all")
+        if recipe.trainable not in (
+            "selector",
+            "all",
+            "context",
+            "late_backbone",
+            "recall",
+        ):
+            raise TrainingError("unsupported trainable scope")
+        if (
+            recipe.trainable in ("late_backbone", "recall")
+            and not recipe.recall_last_layers
+        ):
+            raise TrainingError("late-backbone adaptation needs recall_last_layers > 0")
         if recipe.sequence_length < 16:
             raise TrainingError("sequence_length must be at least 16")
         if recipe.max_new_tokens >= recipe.sequence_length - 1:

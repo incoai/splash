@@ -42,14 +42,34 @@ def block_stream(directory, model, device, cursor=0, seed=42):
         epoch += 1
 
 
-def configure_trainable(model, mode):
-    for name, parameter in model.named_parameters():
-        parameter.requires_grad_(
-            mode == "all" or name.startswith("candidate_selector.")
+def configure_trainable(model, mode, recall_last_layers=1):
+    if mode not in ("selector", "all", "context", "late_backbone", "recall"):
+        raise TrainingError("unsupported trainable scope")
+    if mode in ("late_backbone", "recall") and (
+        type(recall_last_layers) is not int
+        or not 1 <= recall_last_layers <= len(model.layers)
+    ):
+        raise TrainingError("recall_last_layers must fit the draft's layer count")
+    late = (
+        tuple(
+            f"layers.{i}."
+            for i in range(len(model.layers) - recall_last_layers, len(model.layers))
         )
+        if mode in ("late_backbone", "recall")
+        else ()
+    )
+    for name, parameter in model.named_parameters():
+        context = name.startswith(("fc.", "hidden_norm."))
+        backbone = name.startswith(late) or name.startswith("norm.")
+        trainable = (
+            mode == "all"
+            or (mode == "selector" and name.startswith("candidate_selector."))
+            or (mode in ("context", "recall") and context)
+            or (mode in ("late_backbone", "recall") and backbone)
+        )
+        parameter.requires_grad_(trainable)
         if parameter.requires_grad:
-            # Preserve small optimizer updates with FP32 master parameters.
-            # Forward matmuls use BF16 autocast; Adam moments remain FP32.
+            # FP32 masters keep updates smaller than BF16's spacing.
             parameter.data = parameter.data.float()
 
 
@@ -70,7 +90,7 @@ def train(
     stop_after=None,
 ):
     output = Path(output)
-    configure_trainable(model, recipe.trainable)
+    configure_trainable(model, recipe.trainable, recipe.recall_last_layers)
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=recipe.learning_rate,

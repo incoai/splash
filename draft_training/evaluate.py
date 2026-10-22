@@ -17,6 +17,21 @@ from .config import (
 from .data import anchors, disjoint
 from .export import serving_tensor
 from .losses import block_loss
+from .model import top_candidates
+
+
+def conditional_recall(path, labels, candidates):
+    """Counts only rows whose complete preceding proposal prefix matched."""
+    matches = path == labels
+    reached = torch.cat(
+        (torch.ones_like(matches[:, :1]), matches[:, :-1].long().cumprod(-1).bool()), -1
+    )
+    covered = (candidates == labels.unsqueeze(-1)).any(-1)
+    return {
+        "reached": reached.sum(0).tolist(),
+        "covered": (reached & covered).sum(0).tolist(),
+        "selected": (reached & covered & matches).sum(0).tolist(),
+    }
 
 
 @torch.no_grad()
@@ -108,6 +123,10 @@ def _evaluate_cached(model, embedding, head, directory, recipe, device):
         "selector_ce": 0.0,
     }
     histogram = [0] * model.flash["block_size"]
+    conditional = {
+        key: [0] * (model.flash["block_size"] - 1)
+        for key in ("reached", "covered", "selected")
+    }
     # Spend the frozen block budget across conversations, rather than letting
     # the first long continuation consume the entire validation/test set.
     selected = evaluation_plan(directory, manifest, model.flash["block_size"], recipe)
@@ -136,6 +155,14 @@ def _evaluate_cached(model, embedding, head, directory, recipe, device):
                     hidden, logits, sample["tokens"][anchor : anchor + 1]
                 )
             labels = sample["tokens"][anchor + 1 : anchor + 1 + hidden.shape[1]]
+            _, natural_candidates = top_candidates(
+                logits, model.flash["selector_top_k"]
+            )
+            counts = conditional_recall(path, labels[None], natural_candidates)
+            for key in conditional:
+                conditional[key] = [
+                    a + b for a, b in zip(conditional[key], counts[key], strict=True)
+                ]
             accepted = int((path[0] == labels).long().cumprod(0).sum())
             histogram[accepted] += 1
             totals["blocks"] += 1
@@ -167,6 +194,21 @@ def _evaluate_cached(model, embedding, head, directory, recipe, device):
         "mean_matching_proposals": sum(i * n for i, n in enumerate(histogram))
         / totals["blocks"],
         "matching_proposal_histogram": histogram,
+        "conditional_by_position": {
+            **conditional,
+            "recall": [
+                c / r if r else None
+                for c, r in zip(
+                    conditional["covered"], conditional["reached"], strict=True
+                )
+            ],
+            "selection_when_covered": [
+                s / c if c else None
+                for s, c in zip(
+                    conditional["selected"], conditional["covered"], strict=True
+                )
+            ],
+        },
     }
 
 
