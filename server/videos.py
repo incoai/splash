@@ -51,6 +51,9 @@ from .errors import APIError
 CLIP_FRAMES = {"3": 73, "10": 243, "15": 362}
 SIZE = "1344x768"
 VARIANTS = {"turbo": wire.VideoVariant.TURBO, "default": wire.VideoVariant.DEFAULT}
+# Each variant's denoising steps, the schedule its adaLN tables were
+# converted for (install/video.py): a request takes them, or 0.
+STEPS = {"turbo": 8, "default": 50}
 FIELDS = {
     "prompt",
     "model",
@@ -181,16 +184,38 @@ def parse_request(fields, names):
     variant = fields.get("variant", "turbo")
     if variant not in VARIANTS:
         raise APIError(400, "variant must be turbo or default")
+    steps = _integer(fields, "steps", 0, 1000)
+    if steps not in (0, STEPS[variant]):
+        raise APIError(
+            400, f"steps must be 0 or {STEPS[variant]}, the {variant} variant's"
+        )
     return VideoRequest(
         prompt,
         seconds,
         variant,
         _integer(fields, "seed", 0, 2**31 - 1),
-        _integer(fields, "steps", 0, 1000),
+        steps,
         _boolean(fields, "preview", False),
         _boolean(fields, "audio", True),
         *_keyframes(fields),
     )
+
+
+def installed_variants(model_root: Path):
+    """The variants whose DiT the assembly at model_root holds."""
+    return tuple(v for v in VARIANTS if (model_root / "weights" / f"dit-{v}").is_dir())
+
+
+def require_variant(request, model, variants):
+    """Refuses a request of a variant not installed, which its first clip of
+    `splash generate` converts."""
+    if request.variant not in variants:
+        raise APIError(
+            400,
+            f"the {request.variant} variant of {model} is not installed: "
+            f"`splash generate --model {model} --variant {request.variant}` "
+            "converts it",
+        )
 
 
 def prompt_tokens(tokenizer, prompt, ready):
@@ -434,10 +459,19 @@ class VideoService:
     """Admits jobs, runs them one at a time on the engine, and keeps their
     results within the store's budget."""
 
-    def __init__(self, engine, tokenizer, names, *, budget_bytes=STORE_BUDGET_BYTES):
+    def __init__(
+        self,
+        engine,
+        tokenizer,
+        names,
+        *,
+        variants=tuple(VARIANTS),
+        budget_bytes=STORE_BUDGET_BYTES,
+    ):
         self.engine = engine
         self.tokenizer = tokenizer
         self.names = names
+        self.variants = variants
         self.budget_bytes = budget_bytes
         self.jobs = OrderedDict()
         self.queue = []
@@ -452,6 +486,7 @@ class VideoService:
 
     def submit(self, fields):
         request = parse_request(fields, self.names)
+        require_variant(request, self.names[0], self.variants)
         tokens = prompt_tokens(self.tokenizer, request.prompt, self.engine.ready)
         with self.lock:
             if self.closing:
@@ -636,16 +671,17 @@ class VideoApp:
     """What a video model's server serves (FrontendServer.app): the model
     under its names, and its jobs on the engine."""
 
-    def __init__(self, model, names, engine, tokenizer):
+    def __init__(self, model, names, engine, tokenizer, variants=tuple(VARIANTS)):
         self.model = model
         self.names = tuple(dict.fromkeys((model, *names)))
-        self.videos = VideoService(engine, tokenizer, self.names)
+        self.videos = VideoService(engine, tokenizer, self.names, variants=variants)
 
     @classmethod
     def start(cls, model, names, model_root, binary, startup_timeout):
         """The app of the assembly at model_root, its engine started and
         ready, and its tokenizer loaded."""
-        return cls(model, names, *load(model_root, binary, startup_timeout))
+        engine, tokenizer = load(model_root, binary, startup_timeout)
+        return cls(model, names, engine, tokenizer, installed_variants(model_root))
 
     def status(self):
         return {"videos": self.videos.status()}
@@ -844,6 +880,7 @@ def main(argv=None):
                 f"{args.model} is a language model: splash generate takes a video "
                 "model, such as MiniMaxAI/MiniMax-H3; splash serve serves this one",
             )
+        require_variant(request, args.model, installed_variants(model_root))
         print_status(f"Loading · {args.model}", error=True)
         engine, tokenizer = load(model_root, args.binary, START_SECONDS)
         failure = []

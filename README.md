@@ -96,7 +96,9 @@ and a last frame, through OpenAI's video API, as
 an instance of its own: run a language model beside it on another `--port`.
 It needs an M5 with 48 GB. The first start quotes the MiniMax H3 Community
 License Agreement, which limits use to its Applicable Territory, asks you to
-acknowledge it, then downloads and converts the model once (about 100 GB).
+acknowledge it, then downloads the model and converts its 8-step turbo
+variant once (26 GB); `splash generate --variant default` converts the
+50-step one on its first clip (24 GB more).
 
 ```bash
 curl http://127.0.0.1:8000/v1/videos -H 'Content-Type: application/json' \

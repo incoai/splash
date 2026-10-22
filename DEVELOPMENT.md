@@ -2114,8 +2114,8 @@ handling; the video model has an engine process of its own
 `POST` takes JSON, or the multipart form OpenAI's SDK sends: `prompt`,
 `model`, `seconds` (`3`, `10` or `15`; 73, 243 or 362 frames at 24 fps) and
 `size` (`1344x768`), and Splash's `variant` (`turbo`, 8 steps, or `default`,
-50), `seed`, `steps` (0 for the variant's), `preview` (false) and `audio`
-(true). A clip may start from an image: OpenAI's `input_reference`, a PNG or
+50), `seed`, `steps` (0 or the variant's: its adaLN tables are those of
+its schedule), `preview` (false) and `audio` (true). A clip may start from an image: OpenAI's `input_reference`, a PNG or
 JPEG file field of the multipart form, is its first frame, and Splash's
 `last_frame`, another file field (with `input_reference`), its last
 (MiniMax-H3's FL2VA first-frame and first-and-last-frame conditioning). The
@@ -2147,24 +2147,38 @@ Before any weight download the installer quotes the MiniMax H3 Community
 License Agreement's territory clauses and asks for its acknowledgement on the
 terminal, or takes `SPLASH_ACCEPT_LICENSE=minimax-h3`; it records it once per
 license text in the models directory's `.licenses.json`. The vendored
-converters then write the engine's images, about 100 GB, once into
-`.converted/<key>` of the models directory; the video VAE's needs MLX in
-Splash's environment and `H3_MLX_PORT` naming a checkout of
-[minimax-h3-mlx](https://github.com/PipeNetwork/minimax-h3-mlx). The video
-VAE's encoder, of a clip's first and last frames (`vae/vae_enc_f16.bin`,
-0.36 GB, `convert_vae.py --encoder`), joined the images after the others: an
-entry the converters converted before it, of the same commits, is cloned
-into the new entry and completed with the encoder's images alone, not
-converted again. The
-assembly links the images, FL2VA's transformer shards (whose adaLN bases
-each request reads), the tokenizer, the encoder's checkpoint and the license.
+converters then write the engine's images once into `.converted/<key>` of
+the models directory: the turbo variant's DiT, the VAEs and TAEH3, 26 GB;
+the video VAE's needs MLX in Splash's environment and `H3_MLX_PORT` naming a
+checkout of [minimax-h3-mlx](https://github.com/PipeNetwork/minimax-h3-mlx).
+The 50-step `default` variant (24 GB more) converts once asked for: by
+`--variants default` of `install/models.py`, or by the first `splash
+generate --variant default`; a server refuses a variant its installation
+does not hold. Each DiT's adaLN tables (`dit-<variant>/adaln.safetensors`,
+0.3 GB turbo, 1.8 GB default) are tabulated at conversion by the engine
+(`splash video-adaln`) from FL2VA's transformer shards, which no request
+reads. An entry starts from a clone of the same commits' entry converted
+before (APFS copies on write) and converts only what it lacks: the other
+variant, or what entries from before lack, the adaLN tables or the video
+VAE's encoder (`vae/vae_enc_f16.bin`, 0.36 GB, `convert_vae.py --encoder`).
+The assembly links the images of its variants, the tokenizer, the encoder's
+checkpoint and the license.
+
+Once converted, FL2VA's transformer shards (62 GB) are neither linked nor
+downloaded again: they can be deleted from the Hugging Face cache
+(`models--MiniMaxAI--MiniMax-H3/snapshots/COMMIT/FL2VA/transformer/` and the
+blobs it links), and are downloaded again to convert another variant or
+commit. The installer removes no downloaded source and leaves that to the
+user, as it does for a package's snapshot.
 
 `prepare_local_model` takes a directory of images converted before (as h3
-lays them out: `dit-turbo/`, `dit-default/`, `vae/` with the encoder's
-images, `audio/`, `preview/` and `fl2va/`, a link to FL2VA), which prepares
-without converting, or the
-`MiniMaxAI/MiniMax-H3` repository's layout, converted with the companions
-the Hugging Face cache holds; the encoder comes from the cache too.
+lays them out: `dit-turbo/` and or `dit-default/`, each with the
+`adaln.safetensors` that `build/splash video-adaln DIRECTORY VARIANT
+FL2VA/transformer` tabulates, `vae/` with the encoder's images, `audio/`,
+`preview/` and `fl2va/`, a link to FL2VA), which prepares without
+converting, or the `MiniMaxAI/MiniMax-H3` repository's layout, whose turbo
+variant converts with the companions the Hugging Face cache holds; the
+encoder comes from the cache too.
 
 ### Video engine
 

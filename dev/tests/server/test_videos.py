@@ -166,8 +166,12 @@ class GenerateTest(unittest.TestCase):
         self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.log = self.directory / "log"
         self.log.touch()
+        # The assembly holds the turbo variant alone.
+        (self.directory / "weights" / "dit-turbo").mkdir(parents=True)
 
-    def generate(self, video=True, step_seconds=0.0, fail=False, keyframes=()):
+    def generate(
+        self, video=True, step_seconds=0.0, fail=False, keyframes=(), request=None
+    ):
         def load(*_):
             return engine(self.log, step_seconds, fail), tokenize
 
@@ -180,7 +184,8 @@ class GenerateTest(unittest.TestCase):
             status = videos.main([
                 str(self.directory), "--model", MODEL, "--binary", "splash",
                 "--out", str(self.directory / "clip.mp4"),
-                "--request", '{"prompt": "a cat", "seed": 7, "preview": true}', *keyframes,
+                "--request", request or '{"prompt": "a cat", "seed": 7, "preview": true}',
+                *keyframes,
             ])  # fmt: skip
         return status, stderr.getvalue()
 
@@ -198,6 +203,19 @@ class GenerateTest(unittest.TestCase):
         status, _ = self.generate(keyframes=("--first-frame", str(first)))
         self.assertEqual(status, 0)
         self.assertEqual(taken(self.log)[0]["first_frame"], digest(CANVAS))
+
+    def test_a_variant_not_installed_and_other_steps_are_refused(self):
+        status, stderr = self.generate(
+            request='{"prompt": "a cat", "variant": "default"}'
+        )
+        self.assertEqual(status, 1)
+        self.assertIn(
+            "the default variant of MiniMaxAI/MiniMax-H3 is not installed", stderr
+        )
+        status, stderr = self.generate(request='{"prompt": "a cat", "steps": 4}')
+        self.assertEqual(status, 1)
+        self.assertIn("steps must be 0 or 8, the turbo variant's", stderr)
+        self.assertEqual(taken(self.log), [])
 
     def test_a_language_model_is_refused(self):
         status, stderr = self.generate(video=False)

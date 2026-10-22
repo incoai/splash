@@ -2,6 +2,7 @@
 The converters do not run: a stand-in writes the images they would."""
 
 import contextlib
+import dataclasses
 import functools
 import io
 import os
@@ -43,24 +44,42 @@ def tree(root: Path, files):
     return root
 
 
-def images(root: Path):
-    """The engine's images as the converters write them."""
-    files = video.IMAGES.items()
-    return tree(root, {f"{d}/{n}": "" for d, names in files for n in names or ["x"]})
+def images(root: Path, variants=("turbo",)):
+    """The engine's images as the converters write them, with the DiT of
+    each of variants."""
+    files = {
+        f"{d}/{n}": "" for d, names in video.IMAGES.items() for n in names or ["x"]
+    }
+    for variant in variants:
+        files |= {f"dit-{variant}/x": "", f"dit-{variant}/{video.ADALN}": ""}
+    return tree(root, files)
 
 
 class VideoModelTest(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
         self.cache, self.models = self.root / "hub", self.root / "models"
+        # The conversion steps that ran: decoders, encoder, (dit, variant)
+        # and (adaln, variant).
         self.conversions = []
 
-        def convert_into(staging, fl2va, vdn, taeh3):
-            self.conversions.append((fl2va, vdn, taeh3))
-            images(staging)
+        def step(name, files):
+            def run(staging, *arguments):
+                variant = arguments[0] if name in ("dit", "adaln") else None
+                self.conversions.append((name, variant) if variant else name)
+                tree(staging, {f.format(variant=variant): "" for f in files})
 
+            return run
+
+        steps = {
+            "_convert_decoders": step("decoders", ["vae/manifest_w8.json", "vae/vae_dec_w8.bin",
+                                                   "audio/x", "preview/x"]),
+            "_convert_encoder": step("encoder", ["vae/manifest_enc.json", "vae/vae_enc_f16.bin"]),
+            "_convert_dit": step("dit", ["dit-{variant}/x"]),
+            "_tabulate_adaln": step("adaln", [f"dit-{{variant}}/{video.ADALN}"]),
+        }  # fmt: skip
         for patch in (
-            mock.patch("install.video._convert_into", convert_into),
+            *(mock.patch(f"install.video.{name}", run) for name, run in steps.items()),
             mock.patch("install.video._require_converter_environment", lambda: None),
             mock.patch("huggingface_hub.constants.HF_HUB_CACHE", str(self.cache)),
             mock.patch.dict(os.environ, {"SPLASH_ACCEPT_LICENSE": video.ACCEPT}),
@@ -73,8 +92,9 @@ class VideoModelTest(unittest.TestCase):
             fake.publish(repo, COMMITS[repo], functools.partial(tree, files=files))
         return fake
 
-    def install(self):
+    def install(self, variants=()):
         chosen = selection(self.root, video.TARGET, language_only=False)
+        chosen = dataclasses.replace(chosen, variants=variants)
         with contextlib.redirect_stdout(io.StringIO()) as output:
             upstream.prepare(chosen)
         return chosen.link, output.getvalue()
@@ -96,22 +116,62 @@ class VideoModelTest(unittest.TestCase):
             record["video"]["images"]["commits"],
             {name: COMMITS[name] for name in (video.TARGET, video.VDN, video.PREVIEW)},
         )
+        self.assertEqual(record["video"]["images"]["variants"], ["turbo"])
         self.assertEqual(
             Path(record["files"]["weights/dit-turbo/x"]["path"]).parents[2],
             self.models / ".converted",
         )
+        self.assertIn(f"weights/dit-turbo/{video.ADALN}", record["files"])
+        self.assertFalse(any(name.startswith(("weights/dit-default/", "weights/fl2va/"))
+                             for name in record["files"]))  # fmt: skip
+        self.assertEqual(self.conversions,
+                         ["decoders", "encoder", ("dit", "turbo"), ("adaln", "turbo")])  # fmt: skip
         self.assertIn("“Excluded Territories” means the European Union", output)
+        self.assertIn("FL2VA's transformer shards", output)
         self.assertEqual(
             sorted(pins(self.cache)), [COMMITS[video.TARGET], COMMITS[video.ENCODER]]
         )
-        # Only what the converters and the engine read is downloaded.
+        # Only what the converters and the engine read is downloaded: not the
+        # default variant's stage.
         unread = (".py", "README.md", "taehv.safetensors",
                   f"{video.ENCODER}/model.safetensors.index.json")  # fmt: skip
         self.assertEqual([d for d in fake.downloads if d.endswith(unread)], [])
-        # A restart on the same commits converts nothing.
+        self.assertEqual([d for d in fake.downloads if "stage-b-step-2000" in d], [])
+        # A restart on the same commits converts nothing, and downloads
+        # nothing only the conversion read, the transformer's deleted shard
+        # included.
         served = link.resolve()
+        (shard,) = self.cache.glob(
+            "models--MiniMaxAI--MiniMax-H3/snapshots/*/FL2VA/transformer/t"
+        )
+        shard.unlink()
+        downloaded = len(fake.downloads)
         self.install()
-        self.assertEqual((link.resolve(), len(self.conversions)), (served, 1))
+        self.assertEqual((link.resolve(), len(self.conversions)), (served, 4))
+        self.assertEqual(fake.downloads[downloaded:], [])
+
+    def test_the_default_variant_converts_once_asked_for(self):
+        self.hub()
+        link, _ = self.install()
+        turbo = Path(assembly.verify(link)["files"]["weights/dit-turbo/x"]["path"])
+        self.install(variants=("default",))
+        record = assembly.verify(link, full=True)
+        self.assertEqual(record["video"]["images"]["variants"], ["turbo", "default"])
+        self.assertEqual(
+            self.conversions[4:], [("dit", "default"), ("adaln", "default")]
+        )
+        # The turbo images are the earlier entry's, cloned.
+        both = Path(record["files"]["weights/dit-turbo/x"]["path"])
+        self.assertNotEqual(both.parents[1], turbo.parents[1])
+        self.assertIn(f"weights/dit-default/{video.ADALN}", record["files"])
+        # The installation keeps both variants from then on.
+        self.install()
+        self.assertEqual(len(self.conversions), 6)
+        self.assertEqual(
+            Path(assembly.verify(link)["files"]["weights/dit-turbo/x"]["path"]), both
+        )
+        with self.assertRaisesRegex(models.ModelError, "no variant fast"):
+            self.install(variants=("fast",))
 
     def test_images_converted_before_the_encoder_are_completed_with_its_alone(self):
         self.hub()
@@ -119,21 +179,18 @@ class VideoModelTest(unittest.TestCase):
             name: COMMITS[name] for name in (video.TARGET, video.VDN, video.PREVIEW)
         }
         identity = {"converters": video.ENCODERLESS_CONVERTERS, "commits": commits}
-        before = images(video._entry(self.models, identity))
-        for name in ("manifest_enc.json", "vae_enc_f16.bin"):
-            (before / "vae" / name).unlink()
+        # Both variants, their stream images and no adaLN tables.
+        before = images(video._entry(self.models, identity), ("turbo", "default"))
+        for name in ("vae/manifest_enc.json", "vae/vae_enc_f16.bin",
+                     f"dit-turbo/{video.ADALN}", f"dit-default/{video.ADALN}"):  # fmt: skip
+            (before / name).unlink()
+        tree(before, {"dit-turbo/stream.bin": "", "dit-default/stream.bin": ""})
         (before / "model.json").write_bytes(models.json_bytes(identity))
-        encoders = []
-
-        def convert_encoder(staging, fl2va):
-            encoders.append(fl2va)
-            for name in ("manifest_enc.json", "vae_enc_f16.bin"):
-                (staging / "vae" / name).write_text("")
-
-        with mock.patch("install.video._convert_encoder", convert_encoder):
-            link, _ = self.install()
+        link, _ = self.install()
         record = assembly.verify(link, full=True)
-        self.assertEqual((len(self.conversions), len(encoders)), (0, 1))
+        self.assertEqual(self.conversions, ["encoder", ("adaln", "turbo")])
+        self.assertFalse(any("stream.bin" in name or "dit-default" in name
+                             for name in record["files"]))  # fmt: skip
         linked = Path(record["files"]["weights/vae/vae_enc_f16.bin"]["path"])
         self.assertEqual(Path(record["files"]["weights/dit-turbo/x"]["path"]).parents[1],
                          linked.parents[1])  # fmt: skip
@@ -175,11 +232,16 @@ class VideoModelTest(unittest.TestCase):
         self.assertEqual(
             record["video"]["images"]["commits"][video.TARGET], str(target)
         )
-        self.assertEqual(len(self.conversions), 1)
+        self.assertEqual(len(self.conversions), 4)
 
     def test_collection_keeps_the_images_an_installation_holds(self):
         fl2va = tree(self.root / "h3", SOURCES[video.TARGET]) / "FL2VA"
-        with video.converted(self.models, fl2va, self.root, self.root, {}) as (held, _):
+        with video.converted(
+            self.models, fl2va, self.root, self.root, {}, ("turbo",)
+        ) as (
+            held,
+            _,
+        ):
             with models.installation_lock(self.models):
                 assembly.collect_garbage(self.models)
             self.assertTrue(held.is_dir())

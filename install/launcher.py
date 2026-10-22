@@ -139,6 +139,8 @@ def _ensure_installed(selection):
             command[-1:-1] = [flag, value]
     if selection.language_only:
         command.insert(-1, "--language-only")
+    if selection.variants:
+        command[-1:-1] = ["--variants", ",".join(selection.variants)]
     if _run_held(command, cwd=ROOT):
         raise LauncherError("model download or verification failed")
 
@@ -297,7 +299,10 @@ def generate(args):
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     with (RUNTIME_DIR / "serve.lock").open("a+") as installation:
         _share_installation(installation)
-        selection = model_artifacts.Selection.of(paths.MODELS, args.model)
+        # A variant converts on its first clip.
+        selection = model_artifacts.Selection.of(
+            paths.MODELS, args.model, variants=(args.variant,) if args.variant else ()
+        )
         _ensure_installed(selection)
         # The flags as a POST /v1/videos body, which the program checks as
         # the server checks one; an absent flag takes the route's default. It

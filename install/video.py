@@ -5,23 +5,28 @@ transformer, the video and audio VAEs and the tokenizer; the VDN-H3 stage
 checkpoints its DiT is converted from (OpenVDN/vdn-minimax-h3); the TAEH3
 preview decoder (madebyollin/taehv); and its text encoder, Qwen3-VL-32B's
 MLX checkpoint (mlx-community/Qwen3-VL-32B-Instruct-4bit). The vendored
-engine's converters (install/video, runtime/video/VENDORED) turn the DiT,
-the VAEs and TAEH3 into the engine's images once, into .converted/<key>
-under the models root, keyed by the converters and the commits converted
+engine's converters (install/video, runtime/video/VENDORED) turn the DiT
+of each variant installed, the VAEs and TAEH3 into the engine's images
+once, and the engine (splash video-adaln) tabulates each DiT's adaLN tables
+from FL2VA's transformer shards, into .converted/<key> under the models
+root, keyed by the converters, the commits converted and the variants
 (written into .converting/<key> first, outside the installation lock, and
 published by one rename); assemblies link them as they link a GGUF's
-derived metadata. Images the converters converted before the video VAE's
-encoder joined them are completed with the encoder's alone. A local
-directory of images converted before (dit-turbo/, dit-default/, vae/,
-audio/, preview/ and fl2va/, as h3 converts them) prepares without
-converting.
+derived metadata. An installation converts the turbo variant, and the
+default one once asked for (`--variants`, `splash generate --variant
+default`); its entry starts from a clone of the same commits' entry
+converted before, with fewer variants, or before the variants were
+converted apart, or before the video VAE's encoder joined the images, and
+converts only what that one lacks. Once converted, nothing reads FL2VA's
+transformer shards (62 GB): the installation neither links nor downloads
+them again, and they can be deleted from the Hugging Face cache, until
+another variant or commit is converted. A local directory of images
+converted before (dit-<variant>/ with its adaln.safetensors, vae/, audio/,
+preview/ and fl2va/, as h3 converts them) prepares without converting.
 
 The paths an assembly links (assembly.py lists a language model's):
-  weights/dit-turbo/, weights/dit-default/, weights/vae/, weights/audio/,
-  weights/preview/       the engine's images (runtime/video/h3/h3.h)
-  weights/fl2va/transformer/
-                         FL2VA's transformer shards and index, whose adaLN
-                         bases the engine's request preparation reads
+  weights/dit-<variant>/, weights/vae/, weights/audio/, weights/preview/
+                         the engine's images (runtime/video/h3/h3.h)
   encoder/               the text encoder's config.json and shards
                          (runtime/video/TextEncoder.hpp)
   tokenizer/             FL2VA's tokenizer, which the server encodes prompts
@@ -30,7 +35,8 @@ The paths an assembly links (assembly.py lists a language model's):
 
 Its record's sources are the target and the encoder; `video` adds the
 license the user acknowledged and the images' origin: the converters'
-identity and the commits they converted, or the local directory.
+identity, the commits they converted and the variants, or the local
+directory.
 """
 
 from __future__ import annotations
@@ -60,12 +66,18 @@ VARIANTS = {
     "turbo": ("stage-dmd-step-250", True),
     "default": ("stage-b-step-2000", False),
 }
-# The image directories the engine reads, and the files of each it reads
-# (None: all of them); the video VAE's are the W8 decoder the engine runs and
-# the encoder of a clip's first and last frames.
+# The variants an installation converts unless asked for others.
+DEFAULT_VARIANTS = ("turbo",)
+# The adaLN tables of a variant's schedule in its DiT's directory, which the
+# engine tabulates at conversion (h3_tabulate_adaln).
+ADALN = "adaln.safetensors"
+# What h3 converts that the engine does not read: the DiT's stream image.
+UNREAD = ("stream.bin",)
+# The image directories the engine reads beside the variants' dit-<variant>,
+# and the files of each it reads (None: all of them); the video VAE's are
+# the W8 decoder the engine runs and the encoder of a clip's first and last
+# frames.
 IMAGES = {
-    "dit-turbo": None,
-    "dit-default": None,
     "vae": (
         "manifest_w8.json",
         "vae_dec_w8.bin",
@@ -78,7 +90,7 @@ IMAGES = {
 CONVERTERS = paths.ROOT / "install" / "video"
 # converters_identity() before the video VAE's encoder joined the converters
 # (h3 5b55ab7): an entry they converted holds every image but the encoder's,
-# and the same commits' entry starts from it (_complete).
+# and the same commits' entry starts from it (_earlier).
 ENCODERLESS_CONVERTERS = (
     "cab145e7ae06aa29dc0f4a6619cfbb643cca48529a487cf0ff37b55d2c29f6c5"
 )
@@ -109,7 +121,31 @@ def is_local(path: Path):
 
 
 def _is_converted(path: Path):
-    return all((path / name).is_dir() for name in IMAGES) and (path / "fl2va").is_dir()
+    return (
+        all((path / name).is_dir() for name in IMAGES)
+        and (path / "fl2va").is_dir()
+        and bool(_converted_variants(path))
+    )
+
+
+def _converted_variants(images: Path):
+    """The variants whose DiT images holds."""
+    return [v for v in VARIANTS if (images / f"dit-{v}").is_dir()]
+
+
+def _variants(selection, installed):
+    """The variants an installation converts: those selection asks for (the
+    defaults without), and those it installed before."""
+    asked = selection.variants or DEFAULT_VARIANTS
+    if unknown := sorted(set(asked) - set(VARIANTS)):
+        raise models.ModelError(
+            f"{selection.model} has no variant {unknown[0]}: its variants are "
+            + ", ".join(VARIANTS)
+        )
+    images = (installed or {}).get("video", {}).get("images", {})
+    # An installation before the variants were converted apart held both.
+    before = images.get("variants", list(VARIANTS) if "commits" in images else [])
+    return sorted({*asked, *before}, key=list(VARIANTS).index)
 
 
 def _refuse_options(model, *options):
@@ -187,31 +223,33 @@ def _write(path: Path, data: bytes):
     os.replace(staging, path)
 
 
-def _target_files(repo):
-    """The target's files the model needs, by repository name: its license,
-    FL2VA's transformer, VAEs and tokenizer, read from FL2VA's index."""
-    index = models.read_json(
-        repo.file("FL2VA/transformer/model.safetensors.index.json")
-    )
-    shards = {
-        f"FL2VA/transformer/{name}" for name in index.get("weight_map", {}).values()
-    }
-    names = {
-        "LICENSE",
-        "FL2VA/transformer/model.safetensors.index.json",
-        "FL2VA/video_vae/source/model.safetensors",
-        "FL2VA/video_vae/source/config.json",
-        "FL2VA/audio_vae/config.json",
-        "FL2VA/audio_vae/model.safetensors",
-        *shards,
-        *(n for n in repo.files if n.startswith("FL2VA/tokenizer/")),
-    }
+def _target_files(repo, converting):
+    """The target's files the model needs, by repository name: its license
+    and tokenizer, which the assembly links, and for a conversion FL2VA's
+    transformer, read from FL2VA's index, and VAEs."""
+    names = {"LICENSE", *(n for n in repo.files if n.startswith("FL2VA/tokenizer/"))}
+    if converting:
+        index = models.read_json(
+            repo.file("FL2VA/transformer/model.safetensors.index.json")
+        )
+        names |= {
+            "FL2VA/transformer/model.safetensors.index.json",
+            "FL2VA/video_vae/source/model.safetensors",
+            "FL2VA/video_vae/source/config.json",
+            "FL2VA/audio_vae/config.json",
+            "FL2VA/audio_vae/model.safetensors",
+            *(
+                f"FL2VA/transformer/{name}"
+                for name in index.get("weight_map", {}).values()
+            ),
+        }
     _require(repo, names)
     return names
 
 
-def _vdn_files(repo):
-    stages = tuple(f"{stage}/" for stage, _ in VARIANTS.values())
+def _vdn_files(repo, variants):
+    """The OpenVDN stages of the variants converted."""
+    stages = tuple(f"{VARIANTS[variant][0]}/" for variant in variants)
     names = {
         n
         for n in repo.files
@@ -293,18 +331,30 @@ def _run(arguments, environment):
 
 
 @contextmanager
-def converted(models_root: Path, fl2va: Path, vdn: Path, taeh3: Path, commits):
+def converted(
+    models_root: Path, fl2va: Path, vdn: Path, taeh3: Path, commits, variants
+):
     """The engine's images of these sources, FL2VA (fl2va), the OpenVDN
-    stages (vdn) and TAEH3's safetensors (taeh3), and their identity: the
-    entry .converted/<key>, converted once and reused for the same
-    converters and commits, held by its model.json (assembly.is_held) while
-    the block runs, so that no collection removes it before an assembly
-    links it. A conversion writes about 100 GB, holding no installation
-    lock."""
-    identity = {"converters": converters_identity(), "commits": commits}
+    stages (vdn) and TAEH3's safetensors (taeh3), with the DiT of each of
+    variants, and their identity: the entry .converted/<key>, converted once
+    and reused for the same converters, commits and variants, held by its
+    model.json (assembly.is_held) while the block runs, so that no
+    collection removes it before an assembly links it. A conversion of the
+    turbo variant writes about 26 GB (the default one 25 GB more), holding
+    no installation lock. The sources are read only to convert: of an entry
+    that is there, they may be None."""
+    identity = _identity(commits, variants)
     entry = _entry(models_root, identity)
     with _held(entry) or _convert(entry, identity, fl2va, vdn, taeh3):
         yield entry, identity
+
+
+def _identity(commits, variants):
+    return {
+        "converters": converters_identity(),
+        "commits": commits,
+        "variants": list(variants),
+    }
 
 
 def _entry(models_root: Path, identity):
@@ -333,11 +383,9 @@ def _convert(entry: Path, identity, fl2va: Path, vdn: Path, taeh3: Path):
     """Converts the images into .converting/<key>, one conversion of an
     entry at a time, and publishes them as entry by one rename with their
     record held, which it returns; a conversion that was interrupted left
-    its staging, which is removed. The same commits' images without the
-    encoder's, when there, are completed instead (_complete)."""
-    encoderless = _entry(
-        entry.parents[1], identity | {"converters": ENCODERLESS_CONVERTERS}
-    )
+    its staging, which is removed. It starts from the images of an entry the
+    same commits converted before (_earlier), cloned, and converts what
+    they lack."""
     converting = entry.parents[1] / ".converting"
     converting.mkdir(parents=True, exist_ok=True)
     entry.parent.mkdir(exist_ok=True)
@@ -349,24 +397,77 @@ def _convert(entry: Path, identity, fl2va: Path, vdn: Path, taeh3: Path):
         shutil.rmtree(staging, ignore_errors=True)
         staging.mkdir()
         try:
-            if held := _held(encoderless):
-                with held:
-                    _complete(staging, encoderless, fl2va)
-            else:
-                _require_converter_environment()
-                _convert_into(staging, fl2va, vdn, taeh3)
+            if earlier := _earlier(entry, identity):
+                with earlier[1]:
+                    _clone(earlier[0], staging, identity["variants"])
+            _convert_into(staging, fl2va, vdn, taeh3, identity["variants"])
             _write(staging / "model.json", models.json_bytes(identity))
             record = _held(staging)
             os.rename(staging, entry)
+            print(
+                f"FL2VA's transformer shards in {fl2va / 'transformer'} are read only "
+                "to convert MiniMax-H3: they can be deleted now, and are downloaded "
+                "again to convert another variant or commit.",
+                flush=True,
+            )
             return record
         finally:
             shutil.rmtree(staging, ignore_errors=True)
 
 
-def _convert_into(staging: Path, fl2va: Path, vdn: Path, taeh3: Path):
-    """The converters' steps (h3's README, Weights) into staging, which they
-    see as their weights root (H3_WEIGHTS_DIR) with the stages in vdn/; they
-    find FL2VA as the only snapshot of the Hub cache they are given."""
+def _earlier(entry: Path, identity):
+    """An entry of the same commits converted before, held, and its path:
+    of fewer of the variants, or from before the variants were converted
+    apart (both of them) or before the video VAE's encoder joined the
+    images; None without one."""
+    variants = identity["variants"]
+    before = {"commits": identity["commits"]}
+    candidates = [
+        identity | {"variants": [v for v in variants if v != dropped]}
+        for dropped in variants
+        if len(variants) > 1
+    ]
+    candidates += [
+        before | {"converters": identity["converters"]},
+        before | {"converters": ENCODERLESS_CONVERTERS},
+    ]
+    for candidate in candidates:
+        path = _entry(entry.parents[1], candidate)
+        if record := _held(path):
+            return path, record
+    return None
+
+
+def _clone(earlier: Path, staging: Path, variants):
+    """The images of earlier that staging keeps, cloned into it (APFS copies
+    on write: no bytes are copied, and the clones outlive earlier's
+    collection): all but its record, the DiT of other variants and the
+    stream images the engine no longer reads."""
+
+    def clone(source, destination):
+        subprocess.run(["/bin/cp", "-c", source, destination], check=True)
+
+    def unkept(directory, names):
+        if Path(directory) == earlier:
+            kept = {f"dit-{v}" for v in variants}
+            return [
+                n
+                for n in names
+                if n == "model.json" or (n.startswith("dit-") and n not in kept)
+            ]
+        return [n for n in names if n in UNREAD]
+
+    shutil.copytree(
+        earlier, staging, copy_function=clone, dirs_exist_ok=True, ignore=unkept
+    )
+
+
+def _convert_into(staging: Path, fl2va: Path, vdn: Path, taeh3: Path, variants):
+    """What staging lacks of the images (h3's README, Weights): the
+    decoders', the video VAE encoder's, and each variant's DiT and its adaLN
+    tables. The converters see staging as their weights root
+    (H3_WEIGHTS_DIR) with the stages in vdn/, and find FL2VA as the only
+    snapshot of the Hub cache they are given."""
     cache = staging / ".cache"
     snapshot = cache / f"models--{TARGET.replace('/', '--')}" / "snapshots" / "source"
     snapshot.mkdir(parents=True)
@@ -378,28 +479,35 @@ def _convert_into(staging: Path, fl2va: Path, vdn: Path, taeh3: Path):
         HF_HUB_CACHE=str(cache),
         PYTHONPATH=str(CONVERTERS),
     )
-    for variant, (stage, turbo) in VARIANTS.items():
-        out, source = staging / f"dit-{variant}", staging / "vdn" / stage
-        adapter = ["--turbo", str(source / "adapters" / "turbo")] if turbo else []
-        for step in ("blocks", "qkfix"):
-            _run(["convert_dit.py", step, "--stage", str(source), *adapter, "--out", str(out)],
-                 environment)  # fmt: skip
-        _run(["convert_dit.py", "io", "--out", str(out)], environment)
-        _run(
-            ["convert_prep.py", "--variant", variant, "--weights", str(staging)],
-            environment,
-        )
+    try:
+        if (
+            not all((staging / name).is_dir() for name in IMAGES)
+            or not (staging / "vae" / "vae_dec_w8.bin").is_file()
+        ):
+            _require_converter_environment()
+            _convert_decoders(staging, fl2va, taeh3, environment)
+        if not (staging / "vae" / "vae_enc_f16.bin").is_file():
+            _convert_encoder(staging, fl2va)
+        for variant in variants:
+            if not (staging / f"dit-{variant}").is_dir():
+                _convert_dit(staging, variant, environment)
+            if not (staging / f"dit-{variant}" / ADALN).is_file():
+                _tabulate_adaln(staging, variant, fl2va)
+    finally:
+        for link in ("vdn", "fl2va"):
+            (staging / link).unlink(missing_ok=True)
+        shutil.rmtree(cache)
+
+
+def _convert_decoders(staging: Path, fl2va: Path, taeh3: Path, environment):
+    """The video VAE's W8 decoder, the audio VAE's and TAEH3's images."""
     _run(["convert_vae.py", "--src", str(fl2va / "video_vae"), "--out",
           str(staging / "vae"), "--tag", "w8", "--i8", "qkv,o,1,2"], environment)  # fmt: skip
-    _convert_encoder(staging, fl2va)
     _run(
         ["convert_audio.py", str(fl2va / "audio_vae"), str(staging / "audio")],
         environment,
     )
     _run(["convert_preview.py", str(taeh3), str(staging / "preview")], environment)
-    for link in ("vdn", "fl2va"):
-        (staging / link).unlink()
-    shutil.rmtree(cache)
 
 
 def _convert_encoder(staging: Path, fl2va: Path):
@@ -408,21 +516,30 @@ def _convert_encoder(staging: Path, fl2va: Path):
           "--encoder"], dict(os.environ, PYTHONPATH=str(CONVERTERS)))  # fmt: skip
 
 
-def _complete(staging: Path, encoderless: Path, fl2va: Path):
-    """The images of an entry the converters converted before the video
-    VAE's encoder joined them, cloned into staging (APFS copies on write: no
-    bytes are copied, and the clones outlive that entry's collection), and
-    the encoder's."""
+def _convert_dit(staging: Path, variant, environment):
+    """The variant's DiT, dit-<variant>: its blocks, QKFIX blocks, patch
+    projections and request-independent prep inputs."""
+    stage, turbo = VARIANTS[variant]
+    out, source = staging / f"dit-{variant}", staging / "vdn" / stage
+    adapter = ["--turbo", str(source / "adapters" / "turbo")] if turbo else []
+    for step in ("blocks", "qkfix"):
+        _run(["convert_dit.py", step, "--stage", str(source), *adapter, "--out", str(out)],
+             environment)  # fmt: skip
+    _run(["convert_dit.py", "io", "--out", str(out)], environment)
+    _run(
+        ["convert_prep.py", "--variant", variant, "--weights", str(staging)],
+        environment,
+    )
 
-    def clone(source, destination):
-        subprocess.run(["/bin/cp", "-c", source, destination], check=True)
 
-    def record(directory, _names):
-        return ["model.json"] if Path(directory) == encoderless else []
-
-    shutil.copytree(encoderless, staging, copy_function=clone, dirs_exist_ok=True,
-                    ignore=record)  # fmt: skip
-    _convert_encoder(staging, fl2va)
+def _tabulate_adaln(staging: Path, variant, fl2va: Path):
+    """The adaLN tables of the variant's schedule (dit-<variant>/ADALN), from
+    FL2VA's transformer shards, on the engine."""
+    print(f"Converting · adaLN tables of dit-{variant}", flush=True)
+    models.run_engine(
+        ["video-adaln", str(staging), variant, str(fl2va / "transformer")],
+        "conversion of the adaLN tables",
+    )
 
 
 def _files_of(directory: Path):
@@ -432,7 +549,8 @@ def _files_of(directory: Path):
 
 def _links(images: Path, fl2va: Path, encoder):
     """The assembly's files (assembly path -> source file) of the images in
-    images, FL2VA's directory and the encoder's files."""
+    images, with the DiT of each variant they hold, FL2VA's tokenizer and
+    license, and the encoder's files."""
     files = {}
     for name, wanted in IMAGES.items():
         found = _files_of(images / name)
@@ -440,13 +558,15 @@ def _links(images: Path, fl2va: Path, encoder):
             if file not in found:
                 raise models.ModelError(f"{images / name} holds no {file}")
             files[f"weights/{name}/{file}"] = found[file]
-    transformer = fl2va / "transformer"
-    index = models.read_json(transformer / "model.safetensors.index.json")
-    for shard in {
-        "model.safetensors.index.json",
-        *index.get("weight_map", {}).values(),
-    }:
-        files[f"weights/fl2va/transformer/{shard}"] = transformer / shard
+    for variant in _converted_variants(images):
+        found = _files_of(images / f"dit-{variant}")
+        if ADALN not in found:
+            raise models.ModelError(
+                f"{images / f'dit-{variant}'} holds no {ADALN}: tabulate it with "
+                f"`build/splash video-adaln {images} {variant} FL2VA/transformer`"
+            )
+        for file in found.keys() - set(UNREAD):
+            files[f"weights/dit-{variant}/{file}"] = found[file]
     files |= {f"tokenizer/{n}": p for n, p in _files_of(fl2va / "tokenizer").items()}
     files["LICENSE"] = fl2va.parent / "LICENSE"
     files |= {f"encoder/{n}": p for n, p in encoder.items()}
@@ -481,34 +601,53 @@ def prepare(selection, target, installed):
         selection.draft_model,
         selection.language_only,
     )
-    with hub.as_model_errors(f"cannot install {selection.model}"):
-        repos = {
-            name: _companion(name, selection.link, installed, target.unreachable_reason)
-            for name in (VDN, PREVIEW, ENCODER)
-        }
-        repos[TARGET] = target
-        wanted = {
-            TARGET: _target_files(target),
-            VDN: _vdn_files(repos[VDN]),
-            PREVIEW: {"safetensors/taeh3.safetensors"},
-            ENCODER: _encoder_files(repos[ENCODER]),
-        }
-        _require(repos[PREVIEW], wanted[PREVIEW])
-        license = acknowledge(
-            selection.models_root, selection.model, target.file("LICENSE")
+    variants = _variants(selection, installed)
+    with ExitStack() as held:
+        with hub.as_model_errors(f"cannot install {selection.model}"):
+            repos = {
+                name: _companion(
+                    name, selection.link, installed, target.unreachable_reason
+                )
+                for name in (VDN, PREVIEW, ENCODER)
+            }
+            repos[TARGET] = target
+            commits = {
+                name: repo.revision for name, repo in repos.items() if name != ENCODER
+            }
+            # Images converted before are held from here: what only their
+            # conversion reads is not downloaded again.
+            entry = _held(_entry(selection.models_root, _identity(commits, variants)))
+            converting = entry is None
+            if entry:
+                held.enter_context(entry)
+            wanted = {
+                TARGET: _target_files(target, converting),
+                ENCODER: _encoder_files(repos[ENCODER]),
+            }
+            if converting:
+                wanted[VDN] = _vdn_files(repos[VDN], variants)
+                wanted[PREVIEW] = {"safetensors/taeh3.safetensors"}
+                _require(repos[PREVIEW], wanted[PREVIEW])
+            license = acknowledge(
+                selection.models_root, selection.model, target.file("LICENSE")
+            )
+            print(f"Installing {selection.model} as {FAMILY} ({FORMAT}).", flush=True)
+            downloaded = {
+                name: repos[name].download(names) for name, names in wanted.items()
+            }
+        fl2va = _root(downloaded[TARGET]) / "FL2VA"
+        images, identity = held.enter_context(
+            converted(
+                selection.models_root,
+                fl2va,
+                _root(downloaded[VDN]) if converting else None,
+                downloaded[PREVIEW]["safetensors/taeh3.safetensors"]
+                if converting
+                else None,
+                commits,
+                variants,
+            )
         )
-        print(f"Installing {selection.model} as {FAMILY} ({FORMAT}).", flush=True)
-        downloaded = {
-            name: repos[name].download(names) for name, names in wanted.items()
-        }
-    fl2va = _root(downloaded[TARGET]) / "FL2VA"
-    with converted(
-        selection.models_root,
-        fl2va,
-        _root(downloaded[VDN]),
-        downloaded[PREVIEW]["safetensors/taeh3.safetensors"],
-        {name: repo.revision for name, repo in repos.items() if name != ENCODER},
-    ) as (images, identity):
         record = _record(
             selection.model, target.identity(), repos[ENCODER], license, identity
         )
@@ -544,11 +683,12 @@ def prepare_local(
                 converted(
                     models_root,
                     fl2va,
-                    _root(vdn.download(_vdn_files(vdn))),
+                    _root(vdn.download(_vdn_files(vdn, DEFAULT_VARIANTS))),
                     preview.download({"safetensors/taeh3.safetensors"})[
                         "safetensors/taeh3.safetensors"
                     ],
                     {TARGET: str(target), VDN: vdn.revision, PREVIEW: preview.revision},
+                    DEFAULT_VARIANTS,
                 )
             )
         record = _record(
