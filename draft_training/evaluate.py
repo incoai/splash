@@ -97,6 +97,9 @@ def evaluation_plan(directory, manifest, block_size, recipe):
 
 
 def _evaluate_cached(model, embedding, head, directory, recipe, device):
+    from .quantization import enable_affine4
+
+    enable_affine4(model, recipe.affine4_scope)
     model.eval()
     manifest = read_json(Path(directory) / "manifest.json")
     totals = {
@@ -153,6 +156,7 @@ def _evaluate_cached(model, embedding, head, directory, recipe, device):
     return {
         "scope": "frozen-teacher greedy trace replay; not native throughput or sampled acceptance",
         "weight_precision": "BF16 serving export",
+        "projection_forward": recipe.affine4_scope,
         "supervision": manifest["binding"]["supervision"],
         "blocks": totals["blocks"],
         "continuations_evaluated": totals["continuations_evaluated"],

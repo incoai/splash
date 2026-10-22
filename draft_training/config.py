@@ -57,6 +57,7 @@ class Recipe:
     max_validation_blocks: int = 64
     vocabulary_chunk_rows: int = 1
     trainable: str = "selector"
+    affine4_scope: str = "off"
 
     @classmethod
     def load(cls, path=None):
@@ -105,6 +106,8 @@ class Recipe:
                 raise TrainingError(f"{name} must be finite")
             if value < 0 or (name in ("learning_rate", "max_grad_norm") and value == 0):
                 raise TrainingError(f"invalid {name}")
+        if recipe.affine4_scope not in ("off", "selector_context", "all"):
+            raise TrainingError("affine4_scope must be off, selector_context, or all")
         if recipe.trainable not in ("selector", "all"):
             raise TrainingError("trainable must be selector or all")
         if recipe.sequence_length < 16:

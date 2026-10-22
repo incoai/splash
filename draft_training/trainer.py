@@ -70,6 +70,9 @@ def train(
     stop_after=None,
 ):
     output = Path(output)
+    from .quantization import enable_affine4
+
+    enable_affine4(model, recipe.affine4_scope)
     configure_trainable(model, recipe.trainable)
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
