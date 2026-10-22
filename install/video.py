@@ -384,8 +384,7 @@ def _convert_into(staging: Path, fl2va: Path, vdn: Path, taeh3: Path):
         for step in ("blocks", "qkfix"):
             _run(["convert_dit.py", step, "--stage", str(source), *adapter, "--out", str(out)],
                  environment)  # fmt: skip
-        for step in ("io", "stream"):
-            _run(["convert_dit.py", step, "--out", str(out)], environment)
+        _run(["convert_dit.py", "io", "--out", str(out)], environment)
         _run(
             ["convert_prep.py", "--variant", variant, "--weights", str(staging)],
             environment,

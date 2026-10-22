@@ -2178,7 +2178,7 @@ request (`runtime/video/TextEncoder.hpp`); then, through the C ABI of
 Splash's copy of the h3 engine, on Splash's Metal backend and weight readers
 (`runtime/video/h3`, `runtime/video/VENDORED`), request
 preparation (with the video VAE's encoder for the keyframes), the DiT
-streamed from SSD in 8 slots, the TAEH3 preview, the
+streamed from its block files on the SSD in 8 slots, the TAEH3 preview, the
 video VAE, the audio VAE and the mp4. `VideoProgress` reports each phase's
 start and end and each denoising step, `VideoOutput` delivers the preview
 and then the clip, which ends the request; a `Cancel` stops it at the next

@@ -20,7 +20,6 @@ struct Request {
   std::vector<int32_t> qkfixBlocks{45, 48, 49};
   bool stream = false;
   int32_t streamSlots = 8;
-  std::string streamImage;  // empty: <weights>/dit-<variant>/stream.bin
   VaePrecision vaePrecision = VaePrecision::W8;
 };
 

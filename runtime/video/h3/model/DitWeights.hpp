@@ -40,7 +40,7 @@ struct DitIoWeights {
   metal::MetalBuffer audioOut, audioOutBias;    // fp32 [32][5376] + [32]
 };
 
-// A tensor left on disk for the stream image, and where it goes in its slot.
+// A tensor left on disk for the weight stream (engine/WeightStream.hpp), and where it goes in its slot.
 struct StreamedTensor {
   int block = 0;
   int slotTensor = 0;       // WeightStream::Tensor, -1 for the QKFIX weights
@@ -51,7 +51,8 @@ struct StreamedTensor {
 
 class DitWeights {
 public:
-  // streamed: the five int8 matrices per block and the QKFIX fp16 weights stay on disk.
+  // streamed: the five int8 matrices per block and the QKFIX fp16 weights stay on disk, read by the weight stream
+  // from the files this object keeps open.
   static std::unique_ptr<DitWeights> load(metal::MetalBackend &backend, const std::string &dir,
                                           const std::set<int> &qkfixBlocks, bool streamed);
   // Deterministic synthetic weights (model/Synthetic.hpp) with the converted shapes, resident, no files: the listed
@@ -75,7 +76,7 @@ private:
                               const std::vector<int64_t> &shape);
   metal::MetalBuffer resident(metal::MetalBackend &backend, const std::vector<float> &values, const char *what);
 
-  std::unique_ptr<SafetensorsCheckpoint> checkpoint_;  // kept open for the stream-image check
+  std::unique_ptr<SafetensorsCheckpoint> checkpoint_;  // kept open for the streamed tensors
   std::vector<DitBlockWeights> blocks_;
   std::map<int, QkFixWeights> qkfix_;
   DitIoWeights io_;

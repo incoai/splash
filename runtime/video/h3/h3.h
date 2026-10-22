@@ -32,13 +32,13 @@
 extern "C" {
 #endif
 
-#define H3_ABI_VERSION 3
+#define H3_ABI_VERSION 4
 #define H3_MAX_QKFIX_BLOCKS 8
 
 typedef enum h3_status {
   H3_OK = 0,
   H3_ERROR_ARGUMENT = 1, /* request or inputs inconsistent */
-  H3_ERROR_IO = 2,       /* file missing, unreadable or malformed (weights, stream image) */
+  H3_ERROR_IO = 2,       /* file missing, unreadable or malformed (weights) */
   H3_ERROR_METAL = 3,    /* device, kernel library, pipeline or allocation failure */
   H3_ERROR_GPU = 4,      /* a command buffer failed */
   H3_ERROR_STATE = 5,    /* phase called out of order */
@@ -65,8 +65,7 @@ typedef struct h3_request {
   int32_t qkfix_blocks[H3_MAX_QKFIX_BLOCKS];  /* 45, 48, 49 */
   int32_t n_qkfix_blocks;
   int32_t stream;                             /* SSD weight streaming */
-  int32_t stream_slots;                       /* block slots in the ring (8) */
-  const char *stream_image;                   /* NULL: <weights>/dit-<variant>/stream.bin */
+  int32_t stream_slots;                       /* block slots in the ring (8), read from the block files */
   h3_vae_precision vae_precision;
 } h3_request;
 

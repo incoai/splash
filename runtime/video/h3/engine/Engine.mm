@@ -140,21 +140,8 @@ void Engine::loadDitWith(const DitInputs &inputs, std::unique_ptr<model::DitWeig
   table.upload(b);
   dit->weights = synthetic ? std::move(synthetic) : model::DitWeights::load(b, ditDirectory(), qkfix, request_.stream);
   if (request_.stream) {
-    const std::string image = request_.streamImage.empty() ? ditDirectory() + "/stream.bin" : request_.streamImage;
-    dit->stream = std::make_unique<WeightStream>(b, image, request_.streamSlots);
-    WeightStream &s = *dit->stream;
-    const uint64_t D = H3_DIT_HIDDEN, F = H3_DIT_FFN, C = H3_DIT_INNER;
-    const uint64_t expected[WeightStream::kTensors] = {(H3_DIT_QKV + H3_DIT_GATES) * D, D * C, 2 * F * D, D * F, D * C};
-    for (int t = 0; t < WeightStream::kTensors; ++t)
-      if (s.tensorBytes(static_cast<WeightStream::Tensor>(t)) != expected[t])
-        throw std::runtime_error(std::format("stream image {}: tensor {} has an unexpected size", image, t));
-    for (const model::StreamedTensor &t : dit->weights->streamed()) {
-      const uint64_t offset = t.slotTensor >= 0
-                                  ? s.tensorOffset(t.block, static_cast<WeightStream::Tensor>(t.slotTensor)) + t.slotOffset
-                                  : s.qkfixOffset(t.block);
-      s.verify(*t.tensor, offset, t.name.c_str(), t.block);
-    }
-    s.start(b, H3_DIT_BLOCKS, qkfix);
+    dit->stream = std::make_unique<WeightStream>(b, dit->weights->streamed(), request_.streamSlots);
+    dit->stream->start(b, H3_DIT_BLOCKS, qkfix);
   }
   const MemoryPlan &plan = dit->plan.emplace(b, lay, table.partialSlots(), !qkfix.empty());
   std::memcpy(plan.view(Tensor::Tags).contents(), inputs.tags, M);

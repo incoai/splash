@@ -43,9 +43,7 @@ inline constexpr bool kDenseItemsLast = true;
 inline constexpr int32_t kQkFixSplitDims = H3_QKFIX_SPLIT;
 
 // ---- SSD weight streaming ---------------------------------------------------------------------------------------
-inline constexpr int32_t kStreamQkFixSlots = 2;     // fp16 QKFIX weights ring (H3_STREAM_QKF_SLOTS)
-inline constexpr size_t kStreamVerifyBytes = 16384;  // image vs block files: first / last bytes of every streamed
-                                                     // tensor compared at load (H3_STREAM_VERIFY=1)
+inline constexpr int32_t kStreamQkFixSlots = 2;  // fp16 QKFIX weights ring (H3_STREAM_QKF_SLOTS)
 
 // ---- Video VAE --------------------------------------------------------------------------------------------------
 inline constexpr int32_t kVaeBatch = 7;  // tile-clips per layer dispatch (H3VAE_BATCH)

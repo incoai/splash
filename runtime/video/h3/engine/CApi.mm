@@ -38,7 +38,6 @@ h3::Request toRequest(const h3_request &r) {
   q.qkfixBlocks.assign(r.qkfix_blocks, r.qkfix_blocks + std::max(0, std::min(r.n_qkfix_blocks, H3_MAX_QKFIX_BLOCKS)));
   q.stream = r.stream != 0;
   q.streamSlots = r.stream_slots;
-  q.streamImage = r.stream_image ? r.stream_image : "";
   q.vaePrecision = r.vae_precision == H3_VAE_F16 ? h3::VaePrecision::F16 : h3::VaePrecision::W8;
   return q;
 }
@@ -97,7 +96,6 @@ h3_request h3_default_request(void) {
   r.n_qkfix_blocks = 3;
   r.stream = 0;
   r.stream_slots = 8;
-  r.stream_image = nullptr;
   r.vae_precision = H3_VAE_W8;
   return r;
 }

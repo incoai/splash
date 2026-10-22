@@ -1,26 +1,22 @@
 #pragma once
 
 // SSD weight streaming: the five int8 matrices of a block (qkv + gates, out, fc1, fc2, to_out_linear; 425 MB) are not
-// resident. They live in one contiguous per-block image (tools/convert_dit.py stream) and a reader thread reads them
-// into a ring of K block-sized slots ahead of the GPU, in an endless block sequence n = 0, 1, 2, ... (block n % 50 into
-// slot n % K; forwards run back to back, so the next forward's first blocks are read while the current one finishes).
-// QKFIX blocks' fp16 q / k / v weights (231 MB each) use a second ring.
+// resident. A reader thread reads them from the block's own file (dit-<variant>/vdn-w8-blockNN.safetensors, opened
+// without the buffer cache like every weight source) into a ring of K block-sized slots ahead of the GPU, in an
+// endless block sequence n = 0, 1, 2, ... (block n % 50 into slot n % K; forwards run back to back, so the next
+// forward's first blocks are read while the current one finishes). QKFIX blocks' fp16 q / k / v weights (231 MB each,
+// qkfix-blockNN.safetensors) use a second ring.
 // Per slot: `ready` (reader -> encoder, after the read) and `free` (encoder -> reader, once the command of the block
 // that used the slot has completed).
-//
-// Image (little endian): magic "H3WSTRM1", u32 version 1, u32 blocks, u64 block bytes, u32 tensors (5), u32 QKFIX
-// blocks, u64 blocks offset, u64 QKFIX offset, u64 QKFIX stride, u64 tensor offsets[5], u64 tensor bytes[5], then
-// QKFIX entries (i32 block, i32 0, u64 offset); tensors 16 KiB aligned.
 #include <dispatch/dispatch.h>
 
 #include "video/h3/engine/Encoder.hpp"
-#include "video/h3/model/WeightFiles.hpp"
+#include "video/h3/model/DitWeights.hpp"
 
 #include <atomic>
 #include <cstdint>
 #include <exception>
 #include <set>
-#include <string>
 #include <thread>
 #include <vector>
 
@@ -42,18 +38,11 @@ public:
     dispatch_semaphore_t ready = nullptr, free = nullptr;
   };
 
-  WeightStream(metal::MetalBackend &backend, const std::string &image, int slots);
+  // The tensors DitWeights left on disk (DitWeights::streamed), which must stay open while the stream runs.
+  WeightStream(metal::MetalBackend &backend, const std::vector<model::StreamedTensor> &tensors, int slots);
   ~WeightStream();
   WeightStream(const WeightStream &) = delete;
   WeightStream &operator=(const WeightStream &) = delete;
-
-  // Image offsets of a block's tensor and of a QKFIX block's fp16 weights.
-  [[nodiscard]] uint64_t tensorOffset(int block, Tensor t) const;
-  [[nodiscard]] uint64_t tensorBytes(Tensor t) const { return header_.tensorBytes[t]; }
-  [[nodiscard]] int blocks() const { return static_cast<int>(header_.blocks); }
-  [[nodiscard]] uint64_t qkfixOffset(int block) const;
-  // First / last kStreamVerifyBytes of the tensor vs the same bytes at `imageOffset`.
-  void verify(const model::SourceTensor &tensor, uint64_t imageOffset, const char *what, int block) const;
 
   // Starts the reader for `blocks` per forward and the QKFIX blocks among them.
   void start(metal::MetalBackend &backend, int blocks, const std::set<int> &qkfixBlocks);
@@ -68,26 +57,11 @@ public:
   [[nodiscard]] size_t slotBytes() const;
 
 private:
-  struct Header {
-    char magic[8];
-    uint32_t version, blocks;
-    uint64_t blockBytes;
-    uint32_t tensors, qkfixBlocks;
-    uint64_t blocksOffset, qkfixOffset, qkfixStride;
-    uint64_t tensorOffset[kTensors], tensorBytes[kTensors];
-  };
-  struct QkFixEntry {
-    int32_t block, pad;
-    uint64_t offset;
-  };
-
   bool waitFree(dispatch_semaphore_t semaphore);
   Slot *qkfixSlotOf(int64_t n);
   void reader();
 
-  model::WeightSource image_;
-  Header header_{};
-  std::vector<QkFixEntry> qkfixEntries_;
+  std::vector<std::vector<model::StreamedTensor>> blockTensors_;  // block -> its streamed tensors
   std::vector<Slot> slots_, qkfixSlots_;
   std::vector<int> qkfixRank_;  // block -> rank among the streamed QKFIX blocks, -1 = none
   int blocksPerForward_ = 0, qkfixPerForward_ = 0;
