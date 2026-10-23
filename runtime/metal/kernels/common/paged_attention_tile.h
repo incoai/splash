@@ -20,6 +20,12 @@ using namespace mpp::tensor_ops;
 // each, the head dimension a kernel is compiled for. Each split writes fp32
 // partials and statistics for a fixed-order reduce.
 //
+// A kernel compiled with a Window attends, for a row at position p, only the
+// keys p - Window to p (Window + 1 with its own; a sliding-window layer's),
+// and a reduce given a layer's learned sinks adds one per query head
+// (splash_attention_combine_splits). Window 0 and no sinks is plain causal
+// attention over the whole history.
+//
 // Prefill and verify share this device-operand page loop.
 constant uint SplashVerifyMaximumSplits =
     SPLASH_VERIFY_ATTENTION_MAXIMUM_SPLITS;
@@ -120,7 +126,8 @@ inline SplashAttentionTile splash_attention_tile_part(SplashAttentionTile tile, 
 }
 
 // Split and reduce derive the same balanced partition of each query tile's
-// visible pages. Causal masking remains per query row inside each split.
+// visible pages (splash_attention_first_page on). Causal and window masking
+// remain per query row inside each split.
 inline uint splash_attention_pages(uint visible_tokens) {
   return (visible_tokens + SplashKvPageTokens - 1) / SplashKvPageTokens;
 }
@@ -129,11 +136,25 @@ inline uint splash_attention_pages_per_split(uint pages, uint splits) {
   return (pages + splits - 1) / splits;
 }
 
+// The first key a row at `position` attends: Window keys before it, or with
+// no window (0) the history's first.
+template <uint Window> inline uint splash_attention_window_start(uint position) {
+  return Window && position > Window ? position - Window : 0;
+}
+
+// The first page a tile whose first row is at first_position reads: its
+// first row's window start's, the tile's others starting their windows on it
+// or after it and masking the keys before them. Its pages end with its last
+// row's (splash_attention_pages), and with no window begin at page 0.
+template <uint Window> inline uint splash_attention_first_page(uint first_position) {
+  return splash_attention_window_start<Window>(first_position) / SplashKvPageTokens;
+}
+
 // The scale of a head's scores, 1/sqrt(HeadDim), as the literal of each head
 // dimension the kernels are compiled for.
 template <uint HeadDim> constexpr float splash_attention_scale() {
-  static_assert(HeadDim == 256, "a score scale for each compiled head dimension");
-  return 0.0625f;
+  static_assert(HeadDim == 128 || HeadDim == 256, "a score scale for each compiled head dimension");
+  return HeadDim == 256 ? 0.0625f : 0.08838834764831845f;
 }
 
 // One Page32 block of one tile: key-scaled scores become value-scaled bf16
@@ -150,7 +171,7 @@ template <uint HeadDim> constexpr float splash_attention_scale() {
 // flag. Existing threadgroup barriers separate reset, concurrent set, and
 // read; relaxed atomics make the same-value writes safe without changing
 // arithmetic.
-template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim, bool Quantized>
+template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim, uint Window, bool Quantized>
 inline void splash_attention_page_softmax(
     threadgroup const float *scores, threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
@@ -174,8 +195,13 @@ inline void splash_attention_page_softmax(
   const uint query_row = fused_row / QueryHeadsPerKVHead;
   const uint causal_end =
       committed_tokens + min(query_row, active_rows - 1) + 1;
-  const uint limit = min(visible_tokens, causal_end);
-  const uint token = token_start + column;
+  // The row sees the tokens of [start, its causal end): its window's, or
+  // with no window its whole history's. Tokens and limit count from start,
+  // so one unsigned comparison tests both ends: a token before start wraps
+  // past every limit.
+  const uint start = splash_attention_window_start<Window>(causal_end - 1);
+  const uint limit = min(visible_tokens, causal_end) - start;
+  const uint token = token_start + column - start;
   threadgroup const float4 *scores4 =
       reinterpret_cast<threadgroup const float4 *>(scores + fused_row * N +
                                                    column);
@@ -251,7 +277,7 @@ inline void splash_attention_page_softmax(
 // Three barriers per page order the score store, the softmax and the
 // probability reads of PV.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim,
-          typename CacheElement>
+          uint Window, typename CacheElement>
 inline void splash_paged_attention_tile(
     device bfloat *tile_queries, device const SplashKvPage *page_table,
     SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows, uint splits,
@@ -266,8 +292,11 @@ inline void splash_paged_attention_tile(
   constexpr ushort D = HeadDim;
   uint visible_tokens = committed_tokens + active_rows;
   uint pages = splash_attention_pages(visible_tokens);
-  uint per_split = splash_attention_pages_per_split(pages, splits);
-  uint page_begin = split * per_split;
+  uint first_page = 0;
+  if constexpr (Window != 0)
+    first_page = splash_attention_first_page<Window>(committed_tokens);
+  uint per_split = splash_attention_pages_per_split(pages - first_page, splits);
+  uint page_begin = first_page + split * per_split;
   if (page_begin >= pages)
     return;
   uint page_end = min(pages, page_begin + per_split);
@@ -329,7 +358,7 @@ inline void splash_paged_attention_tile(
     if (thread_index == 0)
       atomic_store_explicit(rescale, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    splash_attention_page_softmax<QueryHeadsPerKVHead, RowsPerTile, HeadDim, Quantized>(
+    splash_attention_page_softmax<QueryHeadsPerKVHead, RowsPerTile, HeadDim, Window, Quantized>(
         scores, probabilities, row_max, row_sum, previous_scale, rescale,
         reinterpret_cast<device const float4 *>(key_scales),
         reinterpret_cast<device const float4 *>(value_scales), token_start,
@@ -357,6 +386,15 @@ inline void splash_paged_attention_tile(
   }
 }
 
+// The sink of a fused row's query head among its group's, or with none a
+// logit below every score.
+template <uint QueryHeadsPerKVHead> inline float splash_row_sink(uint) { return -INFINITY; }
+
+template <uint QueryHeadsPerKVHead>
+inline float splash_row_sink(uint fused_row, device const float *group_sinks) {
+  return group_sinks[fused_row % QueryHeadsPerKVHead];
+}
+
 // Partials are [slot][fused row][dimension]; statistics are
 // [slot][fused row]{max, sum}. The callers lay slots out as
 // [tile][KV head][part][split] (prefill) and [lane][KV head][part][split]
@@ -368,12 +406,19 @@ inline void splash_paged_attention_tile(
 // never exceeds HeadDim), then each lane streams one dimension of the
 // partials. A row past the tile's active rows is written as zeros; a
 // threadgroup owns one fused row, so it returns uniformly.
-template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim>
+// A layer's learned sinks come as group_sinks, a logit per query head of the
+// tile's KV head (its GQA group), and none without: the row's query head's
+// sink is one more key, with no value, of the softmax (the scores' scale
+// already applied), so it enters the maximum and, after the splits in their
+// order, the denominator.
+template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim, class... GroupSinks>
 inline void splash_attention_combine_splits(
     device const float *partials, device const float *statistics,
     device bfloat *tile_output, uint active_rows, uint written,
     ulong head_slot, uint fused_row, uint thread_index,
-    threadgroup float *weights, threadgroup float *group_values) {
+    threadgroup float *weights, threadgroup float *group_values,
+    GroupSinks... group_sinks) {
+  constexpr bool Sinks = sizeof...(GroupSinks) != 0;
   constexpr uint M = RowsPerTile * QueryHeadsPerKVHead;
   constexpr uint D = HeadDim;
   static_assert(D >= SPLASH_VERIFY_ATTENTION_MAXIMUM_SPLITS &&
@@ -389,7 +434,9 @@ inline void splash_attention_combine_splits(
   const float group_maximum = simd_max(maximum);
   if (lane == 0) group_values[sg] = group_maximum;
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  const float row_maximum = simd_max(lane < D / 32 ? group_values[lane] : -INFINITY);
+  const float split_maximum = simd_max(lane < D / 32 ? group_values[lane] : -INFINITY);
+  const float sink = splash_row_sink<QueryHeadsPerKVHead>(fused_row, group_sinks...);
+  const float row_maximum = Sinks ? max(split_maximum, sink) : split_maximum;
   if (thread_index < written)
     weights[thread_index] = fast::exp(maximum - row_maximum);
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -403,21 +450,31 @@ inline void splash_attention_combine_splits(
         partials[((head_slot + split) * M + fused_row) * D + thread_index];
     denominator += weight * statistics[stat + 1];
   }
+  if constexpr (Sinks)
+    denominator += fast::exp(sink - row_maximum);
   tile_output[fused_row * D + thread_index] =
       bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
+}
+
+// The sinks of KV head kv_head's query heads (its GQA group) among a
+// layer's, one per query head.
+template <uint QueryHeadsPerKVHead>
+inline device const float *splash_group_sinks(uint kv_head, device const float *sinks) {
+  return sinks + kv_head * QueryHeadsPerKVHead;
 }
 
 // Fused row `fused_row` of a tile run as Parts parts
 // (splash_attention_tile_part) combines the splits of its part's page loop:
 // those that own at least one page wrote their partials, and the partition
-// is recomputed here. A part past the tile's active rows ran no split; its
-// rows are written as zeros.
-template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint Parts, uint HeadDim>
+// is recomputed here, of the same Window. A part past the tile's active rows
+// ran no split; its rows are written as zeros.
+template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint Parts, uint HeadDim,
+          uint Window, class... GroupSinks>
 inline void splash_attention_reduce_row(
     device const float *partials, device const float *statistics,
     device bfloat *output, SplashAttentionTile whole, uint slot_stride,
     uint fused_row, uint thread_index, threadgroup float *weights,
-    threadgroup float *group_values) {
+    threadgroup float *group_values, GroupSinks... group_sinks) {
   constexpr uint PartRows = RowsPerTile / Parts;
   constexpr uint PartM = PartRows * QueryHeadsPerKVHead;
   const SplashAttentionTile tile =
@@ -428,11 +485,13 @@ inline void splash_attention_reduce_row(
            thread_index] = bfloat(0.0f);
     return;
   }
-  const uint pages =
-      splash_attention_pages(tile.first_position + tile.active_rows);
+  uint pages = splash_attention_pages(tile.first_position + tile.active_rows);
+  if constexpr (Window != 0)
+    pages -= splash_attention_first_page<Window>(tile.first_position);
   const uint per_split = splash_attention_pages_per_split(pages, tile.splits);
   const uint written = (pages + per_split - 1) / per_split;
   splash_attention_combine_splits<QueryHeadsPerKVHead, PartRows, HeadDim>(
       partials, statistics, output + tile.offset, tile.active_rows, written,
-      tile.first_slot, fused_row % PartM, thread_index, weights, group_values);
+      tile.first_slot, fused_row % PartM, thread_index, weights, group_values,
+      group_sinks...);
 }

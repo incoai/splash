@@ -185,8 +185,8 @@ public:
   // Where one value of a KV head sits in a page's slab of values, in the
   // layout's value order (kv::Layout::valuesTokenMajor).
   [[nodiscard]] uint64_t valueElement(uint32_t head, uint32_t token, uint32_t dimension) const noexcept {
-    return layout_.valuesTokenMajor ? splash_kv_key_element(head, token, dimension)
-                                    : splash_kv_value_element(head, token, dimension);
+    return layout_.valuesTokenMajor ? splash_kv_key_element(head, token, dimension, layout_.headDimension)
+                                    : splash_kv_value_element(head, token, dimension, layout_.headDimension);
   }
   // The host address of one tensor of one Full page in one layer.
   template <typename T>

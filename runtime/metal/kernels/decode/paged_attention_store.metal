@@ -59,6 +59,9 @@ PAGED_VERIFY_STORE(verify_attention_q8_store, 4, 256, int8_t, false)
 PAGED_VERIFY_STORE(verify_attention_q8_store_kv2_g8, 2, 256, int8_t, false)
 PAGED_VERIFY_STORE(verify_attention_bf16_store, 4, 256, bfloat, false)
 PAGED_VERIFY_STORE(verify_attention_bf16_store_kv2_g8, 2, 256, bfloat, false)
+// Four KV heads of 128 dimensions.
+PAGED_VERIFY_STORE(verify_attention_q8_store_kv4_d128, 4, 128, int8_t, false)
+PAGED_VERIFY_STORE(verify_attention_bf16_store_kv4_d128, 4, 128, bfloat, false)
 // Two KV heads whose values are token-major (sparse attention).
 PAGED_VERIFY_STORE(verify_attention_q8_store_kv2_vt, 2, 256, int8_t, true)
 PAGED_VERIFY_STORE(verify_attention_bf16_store_kv2_vt, 2, 256, bfloat, true)

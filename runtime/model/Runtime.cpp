@@ -973,7 +973,7 @@ struct Runtime::Impl {
         {.target_rows = targetRows,
          .draft_rows = draftRows,
          .target_scale = geometry.target.ropeScaling.attentionFactor()},
-        kPrefillRows);
+        kPrefillRows, geometry.target.rotaryPairs);
   }
 
   // A constrained lane keeps its final prompt row, which prefill leaves at

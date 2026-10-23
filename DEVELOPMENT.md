@@ -2486,11 +2486,12 @@ leading inputs of wider rows), the register ones `gguf_decode_sg_<format>_l<lane
 experts `moe_expert_gguf_m<rows>_<e>` and `moe_expert_gguf_sg_<e>`, with gate and up in one pass
 `moe_expert_gguf_m<rows>_gate_up`; the fused projections run
 `gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode, and in prefill one
-`gguf_prefill_<format>_a` per format over that format's segments. The norm, GDN and
-attention-gate variants that also write the register kernels' input table carry `table16` in
-their names. The epilogue kinds of both GGUF families are in `kernels/common/gguf_tile.h`, the
-SiLU and sigmoid every kernel shares in `kernels/common/activation.h`, and the MMA helpers every
-register kernel uses, GGUF or fp32, in `kernels/common/sgmatrix.h`.
+`gguf_prefill_<format>_a` per format over that format's segments. The norm, GDN,
+attention-gate and attention-gather variants that also write the register kernels' input
+table carry `table16` in their names. The epilogue kinds of both GGUF families are in
+`kernels/common/gguf_tile.h`, the SiLU and sigmoid every kernel shares in
+`kernels/common/activation.h`, and the MMA helpers every register kernel uses, GGUF or fp32, in
+`kernels/common/sgmatrix.h`.
 
 The ABIs are in `runtime/metal/abi/Gguf.h`, which also defines the tile geometry the kernels
 and `LinearGguf.cpp` share, and `MoE.h`; the image formats in
@@ -2533,6 +2534,22 @@ rows (more than 32); the formats `float-bf16` and `float-f32` time the float pro
 (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles instead, marking
 `Linear::ggufFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape
 on the device's plans and the other GGUF tile.
+
+Target attention runs the geometries of `kCompiledAttention` (`runtime/ops/PagedAttention.cpp`):
+query heads over KV heads of a head dimension (`_d128` in the names of 128-wide heads' kernels;
+256 is unnamed) in a value order, each compiled with the variants its layers take, which a layer
+selects with an `ops::AttentionVariant`. Its queries and keys are rotated by the geometry's
+RoPE, or not (NoPE: `qkv…_nope`, which binds no tables); and each row attends its whole history,
+or a window of the keys before it (`…_w512`: a row at position p attends p − 512 to p). A
+windowed split and reduce start at the page of their tile's first row's window start
+(`splash_attention_first_page`), each row masking the keys before its own, and a windowed verify
+lane's or prefill tile's splits stop at the 18 pages such a window reads
+(`kv::windowAttentionPages`). A geometry with learned sinks (`reduce…_sinks`) binds the layer's,
+an F32 per query head, to the reduce, which adds each to its row's softmax after the splits, in
+their order, as a key with no value; one without an output gate (`gather`) gives the
+out-projection its attention rows as they are. The RoPE tables are of the target geometry's pairs
+(`rope_build_tables`, or `rope_build_tables_p64` for 64). `make test-engine-metal` runs
+`attention-variants`, every variant through the production encoders against fp64.
 
 ### Sparse attention
 
