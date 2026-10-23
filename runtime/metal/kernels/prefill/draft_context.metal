@@ -1,25 +1,32 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/draft_context_kv.h"
 
-kernel void
-prefill_draft_context_kv(device const bfloat *context_kv [[buffer(0)]],
-                         device const bfloat *k_norm [[buffer(1)]],
-                         device const float *rope_cos [[buffer(2)]],
-                         device const float *rope_sin [[buffer(3)]],
-                         device bfloat *keys [[buffer(4)]],
-                         device bfloat *values [[buffer(5)]],
-                         constant DraftContextParams &params [[buffer(6)]],
-                         uint task [[threadgroup_position_in_grid]],
-                         uint thread_index [[thread_index_in_threadgroup]],
-                         uint lane [[thread_index_in_simdgroup]],
-                         uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float reductions[8];
-  threadgroup bfloat normalized[SPLASH_DRAFT_HEAD_DIMENSION];
-  draft_context_kv_phase(context_kv, k_norm, rope_cos, rope_sin, keys, values,
-                         params.start_position, params.tokens, task,
-                         thread_index, lane, simd_group, reductions,
-                         normalized);
-}
+#define PREFILL_DRAFT_CONTEXT_KV(Name, KVHeads, HeadDim)                         \
+  kernel void Name(device const bfloat *context_kv [[buffer(0)]],                \
+                   device const bfloat *k_norm [[buffer(1)]],                    \
+                   device const float *rope_cos [[buffer(2)]],                   \
+                   device const float *rope_sin [[buffer(3)]],                   \
+                   device bfloat *keys [[buffer(4)]],                            \
+                   device bfloat *values [[buffer(5)]],                          \
+                   constant DraftContextParams &params [[buffer(6)]],             \
+                   uint task [[threadgroup_position_in_grid]],                   \
+                   uint thread_index [[thread_index_in_threadgroup]],            \
+                   uint lane [[thread_index_in_simdgroup]],                      \
+                   uint simd_group [[simdgroup_index_in_threadgroup]]) {         \
+    threadgroup float reductions[8];                                             \
+    threadgroup bfloat normalized[HeadDim];                                      \
+    draft_context_kv_phase<KVHeads, HeadDim>(                                    \
+        context_kv, k_norm, rope_cos, rope_sin, keys, values,                    \
+        params.start_position, params.tokens, task, thread_index, lane,          \
+        simd_group, reductions, normalized);                                     \
+  }
+
+PREFILL_DRAFT_CONTEXT_KV(prefill_draft_context_kv, SPLASH_DRAFT_KV_HEADS,
+                         SPLASH_DRAFT_HEAD_DIMENSION)
+PREFILL_DRAFT_CONTEXT_KV(prefill_draft_context_kv_kv4_h256,
+                         SPLASH_DRAFT4_KV_HEADS,
+                         SPLASH_DRAFT4_HEAD_DIMENSION)
+#undef PREFILL_DRAFT_CONTEXT_KV
 
 // One simdgroup per row and group of the context window: lane l holds the
 // group's values 2l and 2l + 1, which share one byte of codes. The code of x

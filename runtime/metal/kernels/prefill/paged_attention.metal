@@ -72,9 +72,11 @@ inline void splash_prefill_attention_reduce_phase(
 
 PAGED_PREFILL_SPLIT(prefill_attention_q8_split, 4, 6, int8_t)
 PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv2_g8, 2, 8, int8_t)
+PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv4_g4, 4, 4, int8_t)
 // BF16 shares the page loop and reduction, without quantization scales.
 PAGED_PREFILL_SPLIT(prefill_attention_bf16_split, 4, 6, bfloat)
 PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8, 2, 8, bfloat)
+PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv4_g4, 4, 4, bfloat)
 #undef PAGED_PREFILL_SPLIT
 
 #define PAGED_PREFILL_REDUCE(Name, Heads, Group)                               \
@@ -93,4 +95,5 @@ PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8, 2, 8, bfloat)
   }
 PAGED_PREFILL_REDUCE(prefill_attention_reduce, 4, 6)
 PAGED_PREFILL_REDUCE(prefill_attention_reduce_kv2_g8, 2, 8)
+PAGED_PREFILL_REDUCE(prefill_attention_reduce_kv4_g4, 4, 4)
 #undef PAGED_PREFILL_REDUCE

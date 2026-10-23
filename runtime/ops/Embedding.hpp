@@ -20,7 +20,8 @@ public:
                              metal::MetalBuffer draftInputTokens,
                              metal::MetalBuffer proposedTokens,
                              metal::MetalBuffer verifyInputTokens,
-                             uint32_t vocabulary, uint32_t lanes);
+                             uint32_t vocabulary, uint32_t lanes,
+                             uint32_t draftRows = SPLASH_TARGET_VERIFY_ROWS);
 };
 
 } // namespace splash::ops

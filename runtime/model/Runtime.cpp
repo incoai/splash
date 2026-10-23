@@ -965,7 +965,8 @@ struct Runtime::Impl {
         std::move(draftSin),
         {.target_rows = targetRows,
          .draft_rows = draftRows,
-         .target_scale = geometry.target.ropeScaling.attentionFactor()},
+         .target_scale = geometry.target.ropeScaling.attentionFactor(),
+         .draft_pairs = geometry.draftRotaryPairs()},
         kPrefillRows);
   }
 
@@ -1559,7 +1560,8 @@ struct Runtime::Impl {
     auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor, 0); };
     ops::RoPE::addDraftRangeTables(graph, p(PrefillTensor::DraftInverseFrequencies),
                                    p(PrefillTensor::DraftRopeCos), p(PrefillTensor::DraftRopeSin),
-                                   rebuild.rows, rebuild.begin, kPrefillRows);
+                                   rebuild.rows, rebuild.begin, kPrefillRows,
+                                   geometry.draftRotaryPairs());
     draftModel.addContextRebuild(graph, draftPrefillBuffers(*prefillArena, 0), states.window(lane),
                                  states.draft(lane), rebuild.rows, rebuild.begin);
   }
@@ -1812,7 +1814,8 @@ struct Runtime::Impl {
         decodeArena->get(lane, DecodeTensor::DraftInputTokens),
         "draft input tokens");
     draftInput[0] = *entry.pendingToken;
-    std::fill(draftInput + 1, draftInput + kDecodeRows,
+    const uint32_t draftRows = geometry.draft.queryRows;
+    std::fill(draftInput + 1, draftInput + draftRows,
               geometry.target.maskToken);
     targetModel->prepareVerifyLane(lane, item.logicalPosition, targetRequest(entry));
 
@@ -1826,9 +1829,11 @@ struct Runtime::Impl {
       const std::array<uint32_t, 3> rotary =
           ropePosition(entry, item.logicalPosition + row);
       std::copy(rotary.begin(), rotary.end(), positions + row * 3);
-      // The draft is a text model over logical positions.
-      draftPositions[row] = static_cast<uint32_t>(item.logicalPosition + row);
     }
+    // A 4B draft reads a whole 16-row block together; the target still
+    // verifies the first eight rows.
+    for (uint32_t row = 0; row < draftRows; ++row)
+      draftPositions[row] = static_cast<uint32_t>(item.logicalPosition + row);
   }
 
   // Batch lanes beyond the active width replay the last active request so
@@ -2125,10 +2130,11 @@ struct Runtime::Impl {
   }
 
   void encodeBatchEmbedding(CommandGraph &graph, DecodeTensor tokens,
-                            DecodeTensor output, uint32_t lanes) {
+                            DecodeTensor output, uint32_t lanes,
+                            uint32_t rowsPerLane = kDecodeRows) {
     if (!lanes || lanes > kLaneCount)
       throw std::invalid_argument("invalid embedding batch width");
-    const uint32_t rows = lanes * kDecodeRows;
+    const uint32_t rows = lanes * rowsPerLane;
     targetModel->addEmbedding(graph, decodeArena->batchSlice(tokens, lanes),
                              decodeArena->batchSlice(output, lanes), rows);
   }
@@ -2139,7 +2145,8 @@ struct Runtime::Impl {
     targetModel->addVerifyInput(
         graph, decodeArena->batchSlice(DecodeTensor::DraftInputTokens, lanes),
         decodeArena->batchSlice(DecodeTensor::ProposedTokens, lanes),
-        decodeArena->batchSlice(DecodeTensor::InputTokens, lanes), lanes);
+        decodeArena->batchSlice(DecodeTensor::InputTokens, lanes), lanes,
+        geometry.draft.queryRows);
   }
 
   // A stop token or the last budgeted token needs no target work of its own:
@@ -2979,17 +2986,20 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
   const std::span<Impl::Request *const> entries(requests.data(), width);
   const uint32_t ropeRows = width * kDecodeRows;
+  const uint32_t draftRopeRows = width * impl_->geometry.draft.queryRows;
   CommandGraph commandGraph;
   impl_->addRopeTables(
       commandGraph,
       impl_->decodeArena->batchSlice(DecodeTensor::Positions, width), ropeRows,
       impl_->decodeArena->batchSlice(DecodeTensor::DraftPositions, width),
-      ropeRows, impl_->decodeArena->batchSlice(DecodeTensor::RopeCos, width),
+      draftRopeRows,
+      impl_->decodeArena->batchSlice(DecodeTensor::RopeCos, width),
       impl_->decodeArena->batchSlice(DecodeTensor::RopeSin, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
   impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
-                              DecodeTensor::DraftHidden0, width);
+                              DecodeTensor::DraftHidden0, width,
+                              impl_->geometry.draft.queryRows);
   impl_->encodeDraftBatchGraph(commandGraph, entries,
                                {logicalPositions.data(), width},
                                {maximumRetained.data(), width}, constrained);

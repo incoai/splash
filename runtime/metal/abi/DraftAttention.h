@@ -8,14 +8,21 @@
 #include <stdint.h>
 #endif
 
-// The draft attention the kernels are compiled for, the only one
-// ops::DraftAttention accepts: 32 query heads over 8 KV heads of 128
-// dimensions, so a q|k|v row holds 6144 values and an attention row 4096.
-// The attention core runs a KV head's four query heads over the eight query
-// rows together, as 32 attention rows.
+// The original draft attention kernels: 32 query heads over 8 KV heads of
+// 128 dimensions, so a q|k|v row holds 6144 values and an attention row
+// 4096. Qwen3.5-4B's release below keeps the same row width with 16 query
+// heads over 4 KV heads of 256 dimensions.
 #define SPLASH_DRAFT_QUERY_HEADS 32u
 #define SPLASH_DRAFT_KV_HEADS 8u
 #define SPLASH_DRAFT_HEAD_DIMENSION 128u
+#define SPLASH_DRAFT_MAXIMUM_QUERY_ROWS 16u
+// Qwen3.5-4B's DFlash2 release uses a 16-token block over 16 query heads,
+// four KV heads and 256 dimensions. Its q|k|v width is unchanged because
+// 16 * 256 + 2 * 4 * 256 == 32 * 128 + 2 * 8 * 128.
+#define SPLASH_DRAFT4_QUERY_ROWS 16u
+#define SPLASH_DRAFT4_QUERY_HEADS 16u
+#define SPLASH_DRAFT4_KV_HEADS 4u
+#define SPLASH_DRAFT4_HEAD_DIMENSION 256u
 #define SPLASH_DRAFT_ATTENTION_WIDTH                                           \
   (SPLASH_DRAFT_QUERY_HEADS * SPLASH_DRAFT_HEAD_DIMENSION)
 #define SPLASH_DRAFT_QKV_WIDTH                                                 \

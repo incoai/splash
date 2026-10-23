@@ -13,7 +13,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class ModelFamily:
     # The family's name, as the engine names it (each target layout's family,
-    # runtime/model/Qwen3_8.hpp, Qwen3_6Moe.hpp and Qwen4Exp.hpp).
+    # Qwen3_5_4B.hpp, Qwen3_8.hpp, Qwen3_6Moe.hpp and Qwen4Exp.hpp).
     name: str
     # The repository of the DFlash2 draft released for the family, as its
     # release publishes it (config.json and BF16 safetensors). Installations
@@ -24,6 +24,7 @@ class ModelFamily:
 
 
 FAMILIES = (
+    ModelFamily("Qwen3.5-4B", "nchapman/Qwen3.5-4B-DFlash2"),
     ModelFamily("Qwen3.8-27B", "incoai/Qwen3.8-27B-DFlash2"),
     ModelFamily("Qwen3.6-35B-A3B", "incoai/Qwen3.6-35B-A3B-DFlash2"),
     ModelFamily("Qwen3.8-Flash-Next", "incoai/Qwen3.8-Flash-Next-DFlash2"),

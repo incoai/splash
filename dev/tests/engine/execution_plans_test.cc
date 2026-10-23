@@ -20,10 +20,12 @@ struct AttentionShape final {
   kv::Layout layout;
 };
 constexpr std::array attentionShapes{
-    AttentionShape{24, {1, 4, 256}}, AttentionShape{16, {1, 2, 256}}};
+    AttentionShape{24, {1, 4, 256}}, AttentionShape{16, {1, 4, 256}},
+    AttentionShape{16, {1, 2, 256}}};
 constexpr std::array draftShapes{
     DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128},
-    DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128}};
+    DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128},
+    DraftAttentionShape{2560, 640, 6144, 4096, 16, 4, 256, 16}};
 constexpr MoeShape routedShape{2048, 256, 8, 512};
 constexpr std::array moeShapes{
     routedShape, MoeShape{768, 7, 3, 256}, MoeShape{256, 1, 1, 256}};

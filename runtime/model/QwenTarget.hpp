@@ -35,6 +35,7 @@ class PageStorage;
 namespace splash::model {
 
 struct Qwen3_8Layout;
+struct Qwen3_5_4BLayout;
 struct Qwen3_8LayerWeights;
 struct Qwen3_6MoeLayout;
 struct Qwen3_6MoeLayerWeights;
@@ -369,6 +370,8 @@ template <class Layer> [[nodiscard]] const ops::BlockMoeWeights *qwenMoeBlock(co
 void includeFamilyProjections(QwenTargetGeometry &geometry,
                               const QwenTargetWeights<Qwen3_8Layout, Qwen3_8LayerWeights> &weights);
 void includeFamilyProjections(QwenTargetGeometry &geometry,
+                              const QwenTargetWeights<Qwen3_5_4BLayout, Qwen3_8LayerWeights> &weights);
+void includeFamilyProjections(QwenTargetGeometry &geometry,
                               const QwenTargetWeights<Qwen3_6MoeLayout, Qwen3_6MoeLayerWeights> &weights);
 
 // The geometry of a target of `weights` whose DFlash2 draft reads the output
@@ -469,7 +472,8 @@ public:
   // target makes of them itself.
   virtual void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                               metal::MetalBuffer proposals,
-                              metal::MetalBuffer verifyInput, uint32_t lanes) const;
+                              metal::MetalBuffer verifyInput, uint32_t lanes,
+                              uint32_t draftRows = SPLASH_TARGET_VERIFY_ROWS) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
   // The commit after acceptance of a verify of `lanes` lanes: in the

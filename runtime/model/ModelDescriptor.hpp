@@ -4,6 +4,7 @@
 #include "Model.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
+#include "Qwen3_5_4B.hpp"
 #include "Qwen4Exp.hpp"
 #include "RopeScaling.hpp"
 #include "ops/Vision.hpp"
@@ -17,7 +18,7 @@
 
 namespace splash::model {
 
-using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout, Qwen4ExpLayout>;
+using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout, Qwen4ExpLayout, Qwen3_5_4BLayout>;
 
 // Where a model's weights come from: a safetensors checkpoint (MLX's, Model
 // Optimizer's or compressed-tensors') or a GGUF, prepared into images when it

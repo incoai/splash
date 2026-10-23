@@ -183,6 +183,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
     size = std::max(size, bytes);
   };
   const uint64_t r = kDecodeRows;
+  const uint64_t draftRows = geometry.draft.queryRows;
   put(DecodeTensor::Hidden0,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::Hidden1,
@@ -216,7 +217,7 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::AttentionOutput,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::Positions, bytesFor<uint32_t>(r * 3));
-  put(DecodeTensor::DraftPositions, bytesFor<uint32_t>(r));
+  put(DecodeTensor::DraftPositions, bytesFor<uint32_t>(draftRows));
   put(DecodeTensor::RopeCos,
       bytesFor<float>(r * geometry.target.rotaryPairs));
   put(DecodeTensor::RopeSin,
@@ -234,13 +235,14 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   // Proposal attention and accepted target-hidden injection use the same
   // eight absolute positions, so one RoPE table per lane is sufficient.
   put(DecodeTensor::DraftRopeCos,
-      bytesFor<float>(r * geometry.draftRotaryPairs()));
+      bytesFor<float>(draftRows * geometry.draftRotaryPairs()));
   put(DecodeTensor::DraftRopeSin,
-      bytesFor<float>(r * geometry.draftRotaryPairs()));
+      bytesFor<float>(draftRows * geometry.draftRotaryPairs()));
   put(DecodeTensor::FinalHidden,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::Logits,
-      bytesFor<float>(r * geometry.target.vocabularySize));
+      bytesFor<float>(std::max(r, draftRows) *
+                      geometry.target.vocabularySize));
   put(DecodeTensor::ArgmaxValues, samplingWorkspace.argmaxValuesBytes);
   put(DecodeTensor::ArgmaxIndices, samplingWorkspace.argmaxIndicesBytes);
   put(DecodeTensor::TargetPartialMasses, samplingWorkspace.partialMassesBytes);
@@ -258,29 +260,29 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::AcceptedCount, sizeof(uint32_t));
   put(DecodeTensor::VerifyRows, sizeof(uint32_t));
   put(DecodeTensor::VerifyConfidence, bytesFor<float>(kDraftProposalTokens));
-  put(DecodeTensor::DraftInputTokens, bytesFor<uint32_t>(r));
+  put(DecodeTensor::DraftInputTokens, bytesFor<uint32_t>(draftRows));
   for (uint32_t index = 0; index < 2; ++index) {
     put(static_cast<DecodeTensor>(
             static_cast<uint32_t>(DecodeTensor::DraftHidden0) + index),
-        bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
+        bytesFor<uint16_t>(draftRows * geometry.draft.hiddenSize));
   }
   put(DecodeTensor::DraftNormalized,
-      bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(draftRows * geometry.draft.hiddenSize));
   put(DecodeTensor::DraftDynamic,
-      bytesFor<uint16_t>(r * geometry.draft.dynamicSize));
+      bytesFor<uint16_t>(draftRows * geometry.draft.dynamicSize));
   put(DecodeTensor::DraftConvolved, draftWorkspace.convolutionBytes);
   put(DecodeTensor::DraftProposalQkv, draftWorkspace.qkvBytes);
   put(DecodeTensor::DraftAttention, draftWorkspace.groupedQueriesBytes);
   put(DecodeTensor::DraftProjected,
-      bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(draftRows * geometry.draft.hiddenSize));
   put(DecodeTensor::DraftResidual,
-      bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(draftRows * geometry.draft.hiddenSize));
   put(DecodeTensor::DraftIntermediate,
-      bytesFor<uint16_t>(r * geometry.draft.intermediateSize));
+      bytesFor<uint16_t>(draftRows * geometry.draft.intermediateSize));
   put(DecodeTensor::DraftFinalHidden,
-      bytesFor<uint16_t>(r * geometry.draft.hiddenSize));
+      bytesFor<uint16_t>(draftRows * geometry.draft.hiddenSize));
   put(DecodeTensor::SelectorHidden,
-      bytesFor<uint16_t>(r * geometry.draft.selectorRank));
+      bytesFor<uint16_t>(draftRows * geometry.draft.selectorRank));
   put(DecodeTensor::Candidates, selectorWorkspace.candidatesBytes);
   put(DecodeTensor::Unary, selectorWorkspace.unaryBytes);
   put(DecodeTensor::TopPartialIds, selectorWorkspace.partialIdsBytes);

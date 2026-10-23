@@ -57,9 +57,11 @@
 
 PAGED_VERIFY_SPLIT(verify_attention_q8_split, 4, 6, int8_t)
 PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv2_g8, 2, 8, int8_t)
+PAGED_VERIFY_SPLIT(verify_attention_q8_split_kv4_g4, 4, 4, int8_t)
 // BF16 shares the page loop and reduction, without quantization scales.
 PAGED_VERIFY_SPLIT(verify_attention_bf16_split, 4, 6, bfloat)
 PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv2_g8, 2, 8, bfloat)
+PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv4_g4, 4, 4, bfloat)
 #undef PAGED_VERIFY_SPLIT
 #undef PAGED_VERIFY_TILE_AT
 #undef PAGED_VERIFY_SCRATCH
@@ -101,4 +103,5 @@ inline void splash_verify_attention_reduce_phase(
   }
 PAGED_VERIFY_REDUCE(verify_attention_reduce, 4, 6)
 PAGED_VERIFY_REDUCE(verify_attention_reduce_kv2_g8, 2, 8)
+PAGED_VERIFY_REDUCE(verify_attention_reduce_kv4_g4, 4, 4)
 #undef PAGED_VERIFY_REDUCE

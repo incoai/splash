@@ -167,10 +167,11 @@ struct SelectorBatchParams {
   uint32_t lanes;
   uint32_t sampling_mask;
   uint32_t vocabulary;
+  uint32_t query_rows;
 };
 
-static_assert(sizeof(SelectorBatchParams) == 44,
-              "Draft selector parameters are 44 bytes on both sides");
+static_assert(sizeof(SelectorBatchParams) == 48,
+              "Draft selector parameters are 48 bytes on both sides");
 
 // The rows of its block each lane of a decode cycle verifies (its verify
 // rows, draft_verify_rows), chosen for the whole batch by expected accepted

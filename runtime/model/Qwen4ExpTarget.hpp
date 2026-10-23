@@ -44,7 +44,8 @@ public:
   // host step of the command stages them, between the hash and the verify
   // that gathers them.
   void addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput, metal::MetalBuffer proposals,
-                      metal::MetalBuffer verifyInput, uint32_t lanes) const override;
+                      metal::MetalBuffer verifyInput, uint32_t lanes,
+                      uint32_t draftRows = SPLASH_TARGET_VERIFY_ROWS) const override;
   // Each lane's PLE history and QSA pending keys after its retained rows,
   // from the convolution inputs and keys its verify wrote.
   void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers, uint32_t lanes) const override;

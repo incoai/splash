@@ -90,6 +90,13 @@ void refuses(const SourceModel &model, std::string_view error, const std::string
 // vision tower when the record names one.
 void testFamilies(const std::filesystem::path &fixtures) {
   const SourceModel dense = mlxModel(fixtures, "qwen3.8-27b");
+  const SourceModel qwen4 = mlxModel(fixtures, "qwen3.5-4b");
+  const model::ModelDescriptor qwen4Descriptor = inspect(qwen4);
+  require(std::holds_alternative<model::Qwen3_5_4BLayout>(
+              qwen4Descriptor.target) &&
+              qwen4Descriptor.draft == test::qwen3_5_4bDraft(),
+          "a Qwen3.5-4B target and its 16-row DFlash2 draft made another "
+          "descriptor");
   const model::ModelDescriptor denseDescriptor = inspect(dense);
   require(denseDescriptor.name == "community/fine-tune" &&
               std::holds_alternative<model::Qwen3_8Layout>(denseDescriptor.target) &&
@@ -157,11 +164,11 @@ void testFamilies(const std::filesystem::path &fixtures) {
                       .with(&SourceModel::draft, "61\n", "61,\n      63\n"))
                   .draft == model::draftLayout(5120, 248320, 3, 8192, 1e6F, ownLayers),
           "a draft's own sizes were not its descriptor's");
-  // The model type names the family; the sizes every source's config states
-  // tell its target from other models of the architecture, which Splash does
-  // not serve, such as Qwen3.5-4B.
+  // The model type and sizes select one of the families sharing an
+  // architecture.
   constexpr std::string_view supported =
-      "; supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next";
+      "; supported: Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next, "
+      "Qwen3.5-4B";
   struct Refused final {
     std::string_view from, to, difference;
   };

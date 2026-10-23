@@ -1,0 +1,57 @@
+{
+  "architectures": [
+    "DFlash2DraftModel"
+  ],
+  "aux_hidden_state_layer_ids": [
+    2,
+    10,
+    17,
+    24,
+    29
+  ],
+  "block_size": 16,
+  "conv_group_size": 16,
+  "conv_kernel_size": 2,
+  "draft_vocab_size": 248320,
+  "dtype": "bfloat16",
+  "mask_token_id": 248077,
+  "sample_from_anchor": false,
+  "selector_rank": 256,
+  "selector_top_k": 16,
+  "sliding_window_non_causal": true,
+  "speculators_model_type": "dflash2",
+  "tie_word_embeddings": false,
+  "transformer_layer_config": {
+    "architectures": [
+      "Qwen3ForCausalLM"
+    ],
+    "attention_bias": false,
+    "attention_dropout": 0.0,
+    "head_dim": 256,
+    "hidden_act": "silu",
+    "hidden_size": 2560,
+    "initializer_range": 0.02,
+    "intermediate_size": 9216,
+    "layer_types": [
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention",
+      "full_attention"
+    ],
+    "max_position_embeddings": 262144,
+    "model_type": "qwen3",
+    "num_attention_heads": 16,
+    "num_hidden_layers": 5,
+    "num_key_value_heads": 4,
+    "rms_norm_eps": 0.000001,
+    "rope_parameters": {
+      "rope_theta": 10000.0,
+      "rope_type": "default"
+    },
+    "sliding_window": null,
+    "tie_word_embeddings": true,
+    "use_cache": true,
+    "vocab_size": 248320
+  }
+}

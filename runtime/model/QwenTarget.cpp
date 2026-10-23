@@ -2,6 +2,7 @@
 
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"
+#include "model/Qwen3_5_4B.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/AneFfn.hpp"
 #include "ops/Embedding.hpp"
@@ -73,7 +74,9 @@ const ops::BlockMoeWeights *qwenMoeBlock(const Qwen3_8LayerWeights &) noexcept {
 
 // A dense layer's FFN runs its gate and up as one gate/up plan, which takes
 // them of one size and rotation in any formats.
-void includeFamilyProjections(QwenTargetGeometry &geometry, const Qwen3_8Weights &weights) {
+template <class Layout>
+void includeDenseProjections(QwenTargetGeometry &geometry,
+                             const QwenTargetWeights<Layout, Qwen3_8LayerWeights> &weights) {
   for (const Qwen3_8LayerWeights &layer : weights.layers) {
     const ops::ProjectionShape gate = layer.gateProjection.shape(), up = layer.upProjection.shape();
     if (gate.outputSize != up.outputSize || gate.inputSize != up.inputSize || gate.rotated != up.rotated)
@@ -83,6 +86,12 @@ void includeFamilyProjections(QwenTargetGeometry &geometry, const Qwen3_8Weights
     geometry.include(layer.downProjection);
     geometry.gateUpProjections.push_back(up);
   }
+}
+void includeFamilyProjections(QwenTargetGeometry &geometry, const Qwen3_8Weights &weights) {
+  includeDenseProjections(geometry, weights);
+}
+void includeFamilyProjections(QwenTargetGeometry &geometry, const Qwen3_5_4BWeights &weights) {
+  includeDenseProjections(geometry, weights);
 }
 void includeFamilyProjections(QwenTargetGeometry &, const Qwen3_6MoeWeights &) {}
 
@@ -114,9 +123,9 @@ std::vector<uint32_t> QwenTarget::verifyTableRows(uint32_t) const { return {}; }
 
 void QwenTarget::addVerifyInput(metal::CommandGraph &graph, metal::MetalBuffer draftInput,
                                 metal::MetalBuffer proposals, metal::MetalBuffer verifyInput,
-                                uint32_t lanes) const {
+                                uint32_t lanes, uint32_t draftRows) const {
   ops::Embedding::addVerifyInput(graph, std::move(draftInput), std::move(proposals), std::move(verifyInput),
-                                 geometry_.vocabularySize, lanes);
+                                 geometry_.vocabularySize, lanes, draftRows);
 }
 
 void QwenTarget::addEmbedding(metal::CommandGraph &graph,
@@ -542,6 +551,8 @@ std::unique_ptr<QwenTarget> makeQwenTarget(const QwenTargetWeights<Layout, Layer
 }
 
 template std::unique_ptr<QwenTarget> makeQwenTarget(const Qwen3_8Weights &, const QwenTargetGeometry &,
+                                                    metal::MetalBackend &, const ops::ExecutionPlans &, uint32_t);
+template std::unique_ptr<QwenTarget> makeQwenTarget(const Qwen3_5_4BWeights &, const QwenTargetGeometry &,
                                                     metal::MetalBackend &, const ops::ExecutionPlans &, uint32_t);
 template std::unique_ptr<QwenTarget> makeQwenTarget(const Qwen3_6MoeWeights &, const QwenTargetGeometry &,
                                                     metal::MetalBackend &, const ops::ExecutionPlans &, uint32_t);

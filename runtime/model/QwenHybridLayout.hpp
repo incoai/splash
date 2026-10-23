@@ -55,6 +55,8 @@ struct QwenTargetDimensions {
   uint32_t experts = 0;
   uint32_t expertsPerToken = 0;
   uint32_t expertIntermediateSize = 0;
+  // The vocabulary projection reads the token table when the model ties it.
+  bool tiedEmbeddings = false;
   // Qwen3.8-Flash-Next's additions (model/Qwen4Exp.hpp), which its family
   // takes together and the Qwen3.5 families leave zero: hyper-connected
   // streams (hyperConnected), the residual's streams and the mixes' low rank;

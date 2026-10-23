@@ -29,7 +29,7 @@ class QwenStateStorage;
 class SsdReaders;
 class VisionLoader;
 
-using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights>;
+using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights, Qwen3_5_4BWeights>;
 
 // How a model loads beside its descriptor: with streamedTableBytes, the rows
 // of a table the target's GGUF holds (model/ModelSizing.hpp) stream from its
@@ -138,6 +138,7 @@ void requireCompatibleModel(const LoadedModel &model);
 // The rows of a family's streamed table that a step stages and prefetches,
 // beside Qwen4Exp.hpp's: the Qwen3.5 families have no table to stream.
 [[nodiscard]] SparseRowStoreOptions streamedTableRows(const Qwen3_8Layout &layout);
+[[nodiscard]] SparseRowStoreOptions streamedTableRows(const Qwen3_5_4BLayout &layout);
 [[nodiscard]] SparseRowStoreOptions streamedTableRows(const Qwen3_6MoeLayout &layout);
 
 // The vision role's source, planned; null for a model without vision.

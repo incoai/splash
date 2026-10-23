@@ -2,6 +2,7 @@
 
 #include "metal/abi/Embedding.h"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/DraftAttention.h"
 #include "metal/abi/Gguf.h"
 #include "ops/BufferExtent.hpp"
 
@@ -49,14 +50,17 @@ void Embedding::addVerifyInput(metal::CommandGraph &graph,
                                metal::MetalBuffer draftInputTokens,
                                metal::MetalBuffer proposedTokens,
                                metal::MetalBuffer verifyInputTokens,
-                               uint32_t vocabulary, uint32_t lanes) {
+                               uint32_t vocabulary, uint32_t lanes,
+                               uint32_t draftRows) {
   if (!vocabulary || !lanes || lanes > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid verify input batch");
   // A lane's anchor is row 0 of its draft input rows.
-  requireBytes(draftInputTokens, rowBytes(lanes, SPLASH_TARGET_VERIFY_ROWS, 1, sizeof(uint32_t)), "draft input token");
+  if (!draftRows || draftRows > SPLASH_DRAFT_MAXIMUM_QUERY_ROWS)
+    throw std::invalid_argument("invalid draft input rows");
+  requireBytes(draftInputTokens, rowBytes(lanes, draftRows, 1, sizeof(uint32_t)), "draft input token");
   requireBytes(proposedTokens, uint64_t{lanes} * SPLASH_DRAFT_PROPOSAL_TOKENS * sizeof(uint32_t), "proposed token");
   requireBytes(verifyInputTokens, uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS * sizeof(uint32_t), "verify input token");
-  const VerifyInputBatchParams params{vocabulary};
+  const VerifyInputBatchParams params{vocabulary, draftRows};
   graph.add("verify_input_tokens",
             {std::move(draftInputTokens), std::move(proposedTokens),
              std::move(verifyInputTokens)},

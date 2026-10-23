@@ -1,6 +1,7 @@
 #pragma once
 
 #include "model/DFlashDraft.hpp"
+#include "model/Qwen3_5_4B.hpp"
 #include "model/Qwen3_6Moe.hpp"
 #include "model/Qwen3_8.hpp"
 #include "model/Qwen4Exp.hpp"
@@ -19,6 +20,17 @@ namespace splash::test {
   constexpr model::Qwen3_8Layout target;
   constexpr std::array<uint32_t, 5> targetLayers{5, 19, 33, 47, 61};
   return model::draftLayout(target.hiddenSize, target.vocabularySize, 5, 17408, 10'000'000.0F, targetLayers);
+}
+[[nodiscard]] inline model::DFlashDraftLayout qwen3_5_4bDraft() {
+  constexpr model::Qwen3_5_4BLayout target;
+  constexpr std::array<uint32_t, 5> targetLayers{2, 10, 17, 24, 29};
+  return model::draftLayout(
+      target.hiddenSize, target.vocabularySize, 5, 9216, 10'000.0F,
+      targetLayers,
+      {.queryRows = SPLASH_DRAFT4_QUERY_ROWS,
+       .queryHeads = SPLASH_DRAFT4_QUERY_HEADS,
+       .kvHeads = SPLASH_DRAFT4_KV_HEADS,
+       .headDimension = SPLASH_DRAFT4_HEAD_DIMENSION});
 }
 [[nodiscard]] inline model::DFlashDraftLayout qwen3_6MoeDraft() {
   constexpr model::Qwen3_6MoeLayout target;

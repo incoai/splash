@@ -45,6 +45,11 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_8Layout &layo
   return loadQwen3_8Weights(backend, layout, files);
 }
 
+TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_5_4BLayout &layout,
+                         const QwenTargetFiles &files) {
+  return loadQwen3_5_4BWeights(backend, layout, files);
+}
+
 TargetWeights readTarget(metal::MetalBackend &backend, const Qwen3_6MoeLayout &layout,
                          const QwenTargetFiles &files) {
   return loadQwen3_6MoeWeights(backend, layout, files);
@@ -58,6 +63,8 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen4ExpLayout &lay
 } // namespace
 
 SparseRowStoreOptions streamedTableRows(const Qwen3_8Layout &) { return {}; }
+
+SparseRowStoreOptions streamedTableRows(const Qwen3_5_4BLayout &) { return {}; }
 
 SparseRowStoreOptions streamedTableRows(const Qwen3_6MoeLayout &) { return {}; }
 

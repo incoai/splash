@@ -6,6 +6,7 @@
 // One KV head of one context row: a row of context_kv holds the row's keys,
 // then its values (KWidth each). The keys are normalized and rotated into
 // the ring slot of the row's position; the values are copied there.
+template <uint KVHeads, uint HeadDim>
 inline void draft_context_kv_phase(
     device const bfloat *context_kv, device const bfloat *k_norm,
     device const float *rope_cos, device const float *rope_sin,
@@ -13,9 +14,9 @@ inline void draft_context_kv_phase(
     uint active_tokens, uint task,
     uint thread_index, uint lane, uint simd_group,
     threadgroup float *reductions, threadgroup bfloat *normalized) {
-  constexpr uint KVHeads = SPLASH_DRAFT_KV_HEADS, HeadDim = SPLASH_DRAFT_HEAD_DIMENSION,
-                 Window = SPLASH_DRAFT_SLIDING_WINDOW;
-  constexpr uint KWidth = KVHeads * HeadDim, RowWidth = 2 * KWidth;
+  constexpr uint Window = SPLASH_DRAFT_SLIDING_WINDOW;
+  constexpr uint KWidth = KVHeads * HeadDim, RowWidth = 2 * KWidth,
+                 RopePairs = HeadDim / 2;
   uint row = task / KVHeads;
   if (row >= active_tokens)
     return;
@@ -40,8 +41,8 @@ inline void draft_context_kv_phase(
   if (thread_index < HeadDim / 2) {
     float first = float(normalized[thread_index]);
     float second = float(normalized[thread_index + HeadDim / 2]);
-    float cosine = rope_cos[ulong(row) * SPLASH_DRAFT_ROPE_PAIRS + thread_index];
-    float sine = rope_sin[ulong(row) * SPLASH_DRAFT_ROPE_PAIRS + thread_index];
+    float cosine = rope_cos[ulong(row) * RopePairs + thread_index];
+    float sine = rope_sin[ulong(row) * RopePairs + thread_index];
     key[thread_index] = bfloat(first * cosine - second * sine);
     key[thread_index + HeadDim / 2] = bfloat(second * cosine + first * sine);
   }

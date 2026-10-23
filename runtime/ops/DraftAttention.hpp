@@ -16,6 +16,7 @@ struct DraftAttentionShape final {
   uint32_t queryHeads = 0;
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
+  uint32_t queryRows = SPLASH_DRAFT_QUERY_ROWS;
 
   bool operator==(const DraftAttentionShape &) const = default;
 };

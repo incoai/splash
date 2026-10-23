@@ -1052,12 +1052,11 @@ kernel void draft_select_top16_sharded(
     device const float *logits [[buffer(0)]],
     device uint *partial_ids [[buffer(1)]],
     device float *partial_values [[buffer(2)]],
-    constant uint &vocabulary [[buffer(3)]],
+    constant SelectorBatchParams &params [[buffer(3)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
   constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
   constexpr uint K = SPLASH_DRAFT_CANDIDATES;
@@ -1066,10 +1065,11 @@ kernel void draft_select_top16_sharded(
   uint local = group % (Positions * Shards);
   uint position = local / Shards;
   uint shard = local % Shards;
-  ulong row_start = (ulong(batch) * Rows + position + 1) * vocabulary;
-  uint shard_tokens = (vocabulary + Shards - 1) / Shards;
-  uint begin = min(shard * shard_tokens, vocabulary);
-  uint end = min(begin + shard_tokens, vocabulary);
+  ulong row_start =
+      (ulong(batch) * params.query_rows + position + 1) * params.vocabulary;
+  uint shard_tokens = (params.vocabulary + Shards - 1) / Shards;
+  uint begin = min(shard * shard_tokens, params.vocabulary);
+  uint end = min(begin + shard_tokens, params.vocabulary);
   // Vector loads require 16-byte alignment. Handle the shard's unaligned head
   // and tail with scalar inserts; the logits binding must also be aligned.
   uint head = uint((VectorTokens - (row_start + begin) % VectorTokens) %
@@ -1229,7 +1229,6 @@ kernel void draft_select_edges(
     uint threads [[threads_per_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]) {
-  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr uint Positions = SPLASH_DRAFT_PROPOSAL_TOKENS;
   constexpr uint Shards = SPLASH_DRAFT_SAMPLING_SHARDS;
   constexpr uint Candidates = SPLASH_DRAFT_CANDIDATES;
@@ -1268,7 +1267,7 @@ kernel void draft_select_edges(
                         ulong(params.lanes) * Positions * Shards * Candidates +
                         ulong(row) * Candidates * Candidates;
   device const bfloat *row_hidden =
-      hidden + (ulong(batch) * Rows + position + 1) * Rank;
+      hidden + (ulong(batch) * params.query_rows + position + 1) * Rank;
   for (uint task = simd_group; task < tasks; task += threads / 32) {
     uint predecessor_index = task / (Candidates / TaskCandidates);
     uint first_candidate =

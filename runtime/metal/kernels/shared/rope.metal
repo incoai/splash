@@ -25,10 +25,10 @@ kernel void rope_build_tables(
     target_cosine[element] = rope.x;
     target_sine[element] = rope.y;
   }
-  const uint draft_elements = params.draft_rows * SPLASH_DRAFT_ROPE_PAIRS;
+  const uint draft_elements = params.draft_rows * params.draft_pairs;
   for (uint element = index; element < draft_elements; element += grid_size) {
-    const uint row = element / SPLASH_DRAFT_ROPE_PAIRS;
-    const uint dim = element % SPLASH_DRAFT_ROPE_PAIRS;
+    const uint row = element / params.draft_pairs;
+    const uint dim = element % params.draft_pairs;
     const float angle =
         float(draft_positions[row]) * draft_inverse_frequencies[dim];
     draft_cosine[element] = cos(angle);
@@ -44,10 +44,10 @@ kernel void rope_build_draft_range_tables(
     constant RopeRangeParams &params [[buffer(3)]],
     uint index [[thread_position_in_grid]],
     uint grid_size [[threads_per_grid]]) {
-  const uint draft_elements = params.rows * SPLASH_DRAFT_ROPE_PAIRS;
+  const uint draft_elements = params.rows * params.draft_pairs;
   for (uint element = index; element < draft_elements; element += grid_size) {
-    const uint row = element / SPLASH_DRAFT_ROPE_PAIRS;
-    const uint dim = element % SPLASH_DRAFT_ROPE_PAIRS;
+    const uint row = element / params.draft_pairs;
+    const uint dim = element % params.draft_pairs;
     const float angle = float(params.start_position + row) *
                         draft_inverse_frequencies[dim];
     draft_cosine[element] = cos(angle);

@@ -275,7 +275,7 @@ void validateTextConfig(NSDictionary *text, const QwenTargetDimensions &target, 
   requireBooleans(text, "text config",
                   {{"attention_bias", false},
                    {"attn_output_gate", true},
-                   {"tie_word_embeddings", false}});
+                   {"tie_word_embeddings", target.tiedEmbeddings}});
   requireEqual(requireString(text, @"hidden_act", "text config hidden_act"),
                "silu", name, "text config hidden_act");
   requireLayerTypes(requireArray(text, @"layer_types", "text config layer_types"),
@@ -540,17 +540,65 @@ void requireQuantization(NSDictionary *config, const QwenTargetDimensions &geome
 // and the target layers it reads (target_layer_ids) some of the target's,
 // ascending. Its layers, intermediate size and rotary base are its own.
 DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimensions &target) {
+  // Speculators releases store the draft transformer under
+  // transformer_layer_config and its DFlash fields at the top level. Splash's
+  // published drafts use the flattened config the runtime validates below.
+  // Normalize the former in memory so both installations load one shape.
+  if (NSDictionary *transformer = draft[@"transformer_layer_config"];
+      [transformer isKindOfClass:[NSDictionary class]] && !draft[@"dflash_config"]) {
+    NSMutableDictionary *checkpoint = [transformer mutableCopy];
+    checkpoint[@"architectures"] = draft[@"architectures"];
+    checkpoint[@"num_hidden_layers"] = transformer[@"num_hidden_layers"];
+    checkpoint[@"intermediate_size"] = transformer[@"intermediate_size"];
+    checkpoint[@"hidden_size"] = transformer[@"hidden_size"];
+    checkpoint[@"vocab_size"] = draft[@"draft_vocab_size"] ?: transformer[@"vocab_size"];
+    checkpoint[@"num_attention_heads"] = transformer[@"num_attention_heads"];
+    checkpoint[@"num_key_value_heads"] = transformer[@"num_key_value_heads"];
+    checkpoint[@"head_dim"] = transformer[@"head_dim"];
+    checkpoint[@"rms_norm_eps"] = transformer[@"rms_norm_eps"];
+    checkpoint[@"hidden_act"] = transformer[@"hidden_act"];
+    checkpoint[@"attention_bias"] = transformer[@"attention_bias"];
+    checkpoint[@"is_causal"] = @NO;
+    checkpoint[@"tie_word_embeddings"] = draft[@"tie_word_embeddings"] ?: @NO;
+    checkpoint[@"rope_parameters"] = transformer[@"rope_parameters"];
+    // A full-attention draft has no sliding_window field. Splash's DFlash
+    // ring serves its first 2,048 positions; an explicitly different window
+    // remains a configuration error rather than being silently resized.
+    id window = transformer[@"sliding_window"];
+    checkpoint[@"sliding_window"] =
+        !window || window == [NSNull null]
+            ? @(ExecutionLimits::draftContextTokens)
+            : window;
+    NSMutableDictionary *flash = [NSMutableDictionary dictionary];
+    flash[@"block_size"] = draft[@"block_size"];
+    flash[@"conv_group_size"] = draft[@"conv_group_size"];
+    flash[@"conv_kernel_size"] = draft[@"conv_kernel_size"];
+    flash[@"selector_rank"] = draft[@"selector_rank"];
+    flash[@"selector_top_k"] = draft[@"selector_top_k"];
+    flash[@"mask_token_id"] = draft[@"mask_token_id"];
+    flash[@"target_layer_ids"] = draft[@"aux_hidden_state_layer_ids"];
+    checkpoint[@"dflash_config"] = flash;
+    draft = checkpoint;
+  }
   NSArray *architectures =
       requireArray(draft, @"architectures", "draft architectures");
   if (architectures.count != 1 ||
       ![architectures[0] isEqual:@"DFlash2DraftModel"])
     throw std::invalid_argument("draft is not a DFlash2 model");
+  const DFlashDraftAttention attention =
+      target.attentionQueryHeads == 16 && target.attentionKvHeads == 4 &&
+              target.attentionHeadDimension == 256
+          ? DFlashDraftAttention{SPLASH_DRAFT4_QUERY_ROWS,
+                                 SPLASH_DRAFT4_QUERY_HEADS,
+                                 SPLASH_DRAFT4_KV_HEADS,
+                                 SPLASH_DRAFT4_HEAD_DIMENSION}
+          : DFlashDraftAttention{};
   requireNumbers(draft, "checkpoint", "draft config",
                  {{"hidden_size", target.hiddenSize},
                   {"vocab_size", target.vocabularySize},
-                  {"num_attention_heads", SPLASH_DRAFT_QUERY_HEADS},
-                  {"num_key_value_heads", SPLASH_DRAFT_KV_HEADS},
-                  {"head_dim", SPLASH_DRAFT_HEAD_DIMENSION},
+                  {"num_attention_heads", attention.queryHeads},
+                  {"num_key_value_heads", attention.kvHeads},
+                  {"head_dim", attention.headDimension},
                   {"sliding_window", ExecutionLimits::draftContextTokens},
                   {"rms_norm_eps", SPLASH_RMS_EPSILON}});
   requireBooleans(draft, "draft config",
@@ -567,7 +615,7 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   NSDictionary *flash =
       requireObject(draft, @"dflash_config", "draft config dflash_config");
   requireNumbers(flash, "checkpoint", "draft config dflash_config",
-                 {{"block_size", ExecutionLimits::draftQueryRows},
+                 {{"block_size", attention.queryRows},
                   {"conv_group_size", SPLASH_DRAFT_CONVOLUTION_GROUP},
                   {"conv_kernel_size", SPLASH_DRAFT_CONVOLUTION_TAPS},
                   {"selector_rank", SPLASH_DRAFT_SELECTOR_RANK},
@@ -595,7 +643,7 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
                   requireWhole(draft[@"num_hidden_layers"], "draft config num_hidden_layers"),
                   requireWhole(draft[@"intermediate_size"], "draft config intermediate_size"),
                   requireNumber(rope[@"rope_theta"], "draft config rope_parameters rope_theta").floatValue,
-                  targetLayers);
+                  targetLayers, attention);
   return layout;
 }
 
@@ -634,7 +682,13 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   const auto type = requireString(text, @"model_type", "text model type");
   std::optional<TargetLayout> target;
   forEachFamily([&](const auto &layout) {
-    if (layout.modelType == type) target = layout;
+    if (layout.modelType != type) return;
+    // Several sizes share a model_type. Keep the first for useful mismatch
+    // diagnostics, then select the size whose width and depth both match.
+    if (!target) target = layout;
+    if (requireNumber(text[@"hidden_size"], "text config hidden_size").doubleValue == layout.hiddenSize &&
+        requireNumber(text[@"num_hidden_layers"], "text config num_hidden_layers").doubleValue == layout.layers)
+      target = layout;
   });
   if (!target) throw unsupportedModel("text model type " + type);
   TargetSource targetSource;

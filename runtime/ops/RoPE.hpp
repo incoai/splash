@@ -25,7 +25,8 @@ public:
                                   metal::MetalBuffer draftInverseFrequencies,
                                   metal::MetalBuffer draftCosine,
                                   metal::MetalBuffer draftSine, uint32_t rows,
-                                  uint32_t startPosition, uint32_t maximumRows);
+                                  uint32_t startPosition, uint32_t maximumRows,
+                                  uint32_t draftPairs = SPLASH_DRAFT_ROPE_PAIRS);
 };
 
 } // namespace splash::ops

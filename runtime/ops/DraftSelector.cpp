@@ -1,5 +1,6 @@
 #include "ops/DraftSelector.hpp"
 
+#include "metal/abi/DraftAttention.h"
 #include "metal/abi/Sampling.h"
 #include "ops/BufferExtent.hpp"
 
@@ -39,14 +40,18 @@ void DraftSelector::add(metal::CommandGraph &graph,
                         const DraftSelectorBuffers &buffers,
                         const DraftCodebooks &codebooks,
                         std::span<const uint32_t> anchors,
-                        std::span<const SamplingPolicy> policies) const {
+                        std::span<const SamplingPolicy> policies,
+                        uint32_t queryRows) const {
   if (anchors.empty() || anchors.size() != policies.size() ||
       anchors.size() > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
+  if (queryRows < kPositions + 1 || queryRows > SPLASH_DRAFT_MAXIMUM_QUERY_ROWS)
+    throw std::invalid_argument("invalid draft selector query rows");
   const uint32_t lanes = static_cast<uint32_t>(anchors.size());
   SelectorBatchParams params{};
   params.lanes = lanes;
   params.vocabulary = vocabulary_;
+  params.query_rows = queryRows;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     params.anchor[lane] = anchors[lane];
     params.temperature[lane] = policies[lane].temperature;
@@ -57,7 +62,7 @@ void DraftSelector::add(metal::CommandGraph &graph,
   // logits and the selector hidden rows; a sampling lane draws its proposals
   // with its proposal uniforms and writes their candidates' probabilities.
   const DraftSelectorWorkspace workspace = DraftSelector::workspace(lanes * kPositions);
-  const uint64_t rows = uint64_t{lanes} * SPLASH_DRAFT_QUERY_ROWS;
+  const uint64_t rows = uint64_t{lanes} * queryRows;
   const uint64_t codebook = uint64_t{vocabulary_} * SPLASH_DRAFT_SELECTOR_RANK * 2;
   requireBytes(buffers.logits, rows * vocabulary_ * sizeof(float), "draft logits");
   requireBytes(buffers.partialIds, workspace.partialIdsBytes, "draft selector partial id");
@@ -78,7 +83,7 @@ void DraftSelector::add(metal::CommandGraph &graph,
   }
   graph.add("draft_select_top16_sharded",
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            vocabulary_, {uint64_t{lanes} * kPositions * kShards, 1, 1});
+            params, {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add("draft_select_edges",
             {buffers.partialIds, buffers.partialValues, buffers.candidates,
              buffers.unary, buffers.selectorHidden, codebooks.predecessor,

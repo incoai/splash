@@ -1,4 +1,5 @@
 #include "model/Qwen3_8.hpp"
+#include "model/Qwen3_5_4B.hpp"
 #include "model/QwenTargetLoader.hpp"
 
 #include <cstring>
@@ -13,7 +14,8 @@ namespace {
 // D (H r), and the GDN writes its value heads grouped, the order of the
 // rotated output projection's inputs. One signs buffer per input width; the
 // manifest fingerprint covers the signs.
-void rotateInputs(metal::MetalBackend &backend, Qwen3_8Weights &weights, const GgufRotation &rotation) {
+template <class Weights>
+void rotateInputs(metal::MetalBackend &backend, Weights &weights, const GgufRotation &rotation) {
   const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
   std::map<uint32_t, metal::MetalBuffer> signs;
   std::string identity = weights.manifestFingerprintSha256 + " input rotation";
@@ -46,10 +48,8 @@ void rotateInputs(metal::MetalBackend &backend, Qwen3_8Weights &weights, const G
   weights.actualAllocatedBytes += metal::allocationDelta(allocationBaseline, backend.memoryStats().allocatedBytes);
 }
 
-} // namespace
-
-Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend, Qwen3_8Layout layout,
-                                  const QwenTargetFiles &files) {
+template <class Weights, class Layout>
+Weights loadDenseWeights(metal::MetalBackend &backend, Layout layout, const QwenTargetFiles &files) {
   const auto readFfn = [&](WeightFile &file, Qwen3_8LayerWeights &layer, const BlockTargetFormat &format, uint32_t) {
     layer.gateProjection =
         format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
@@ -58,13 +58,25 @@ Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend, Qwen3_8Layout la
     layer.downProjection =
         format.projection(file, layout.hiddenSize, layout.intermediateSize, "mlp-down");
   };
-  Qwen3_8Weights weights = loadQwenTarget<Qwen3_8Weights>(
+  Weights weights = loadQwenTarget<Weights>(
       backend, layout, files, [&](auto &loader, const BlockTargetFormat &format, const MoeExperts &) {
-        return readQwenTargetWeights<Qwen3_8Weights>(layout, loader, format, readFfn);
+        return readQwenTargetWeights<Weights>(layout, loader, format, readFfn);
       });
   if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
     if (const std::optional<GgufRotation> &rotation = gguf->get().rotation()) rotateInputs(backend, weights, *rotation);
   return weights;
+}
+
+} // namespace
+
+Qwen3_8Weights loadQwen3_8Weights(metal::MetalBackend &backend, Qwen3_8Layout layout,
+                                 const QwenTargetFiles &files) {
+  return loadDenseWeights<Qwen3_8Weights>(backend, layout, files);
+}
+
+Qwen3_5_4BWeights loadQwen3_5_4BWeights(metal::MetalBackend &backend, Qwen3_5_4BLayout layout,
+                                       const QwenTargetFiles &files) {
+  return loadDenseWeights<Qwen3_5_4BWeights>(backend, layout, files);
 }
 
 } // namespace splash::model

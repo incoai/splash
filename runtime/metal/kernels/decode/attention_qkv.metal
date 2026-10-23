@@ -54,6 +54,8 @@ VERIFY_ATTENTION_QKV(verify_attention_qkv_f32, 24, 4, float)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g8_f32, 16, 2, float)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g12, 24, 2, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g12_f32, 24, 2, float)
+VERIFY_ATTENTION_QKV(verify_attention_qkv_kv4_g4, 16, 4, bfloat)
+VERIFY_ATTENTION_QKV(verify_attention_qkv_kv4_g4_f32, 16, 4, float)
 #undef VERIFY_ATTENTION_QKV
 
 // Element `element` of every verify lane's rows, lane by lane.
@@ -93,6 +95,7 @@ inline void full_attention_gate_decode_phase(
 VERIFY_ATTENTION_GATE(verify_attention_gate, 24, 4)
 VERIFY_ATTENTION_GATE(verify_attention_gate_kv2_g8, 16, 2)
 VERIFY_ATTENTION_GATE(verify_attention_gate_kv2_g12, 24, 2)
+VERIFY_ATTENTION_GATE(verify_attention_gate_kv4_g4, 16, 4)
 #undef VERIFY_ATTENTION_GATE
 
 #define ATTENTION_GATE_TABLE(Name, QHeads, KHeads, Layout) \
@@ -115,4 +118,5 @@ VERIFY_ATTENTION_GATE(verify_attention_gate_kv2_g12, 24, 2)
 ATTENTION_GATE_TABLE(verify_attention_gate_table16, 24, 4, gguf_sg::Table16)
 ATTENTION_GATE_TABLE(verify_attention_gate_table16_kv2_g8, 16, 2, gguf_sg::Table16)
 ATTENTION_GATE_TABLE(verify_attention_gate_table16_kv2_g12, 24, 2, gguf_sg::Table16)
+ATTENTION_GATE_TABLE(verify_attention_gate_table16_kv4_g4, 16, 4, gguf_sg::Table16)
 #undef ATTENTION_GATE_TABLE

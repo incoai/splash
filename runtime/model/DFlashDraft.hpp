@@ -85,6 +85,10 @@ struct DFlashDraftLayout final {
   float rotaryTheta = 0.0F;
   uint32_t selectorRank = 0;
   uint32_t kvHeads = 0;
+  // The rows one draft forward evaluates together. A 16-row Qwen3.5 block
+  // still verifies the first eight rows in this runtime version.
+  uint32_t queryRows = 0;
+  uint32_t queryHeads = 0;
   // The target layers whose output rows the draft reads, ascending: the
   // first targetLayerCount of targetLayers, targetHiddenSize() values a row.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> targetLayers{};
@@ -101,7 +105,7 @@ struct DFlashDraftLayout final {
   [[nodiscard]] constexpr ops::DraftAttentionShape attentionShape() const noexcept {
     return {hiddenSize, dynamicSize, qkvSize, attentionSize,
             attentionSize / attentionHeadDimension, kvHeads,
-            attentionHeadDimension};
+            attentionHeadDimension, queryRows};
   }
   // The key and value columns of the fused QKV projection, all the context
   // writers read.
@@ -115,12 +119,25 @@ struct DFlashDraftLayout final {
 // The layout of a DFlash2 draft of a target of `hiddenSize` and
 // `vocabularySize` with `layers` (at least one) layers of `intermediateSize`
 // (a positive multiple of 64), rotary base `rotaryTheta` (positive), reading
+// A DFlash2 attention shape the draft kernels are compiled for.
+struct DFlashDraftAttention final {
+  uint32_t queryRows = SPLASH_DRAFT_QUERY_ROWS;
+  uint32_t queryHeads = SPLASH_DRAFT_QUERY_HEADS;
+  uint32_t kvHeads = SPLASH_DRAFT_KV_HEADS;
+  uint32_t headDimension = SPLASH_DRAFT_HEAD_DIMENSION;
+  bool operator==(const DFlashDraftAttention &) const = default;
+};
+
 // the target's layers `targetLayers` (ascending, 1 to
 // ExecutionLimits::maximumDraftTargetLayers): its attention widths and
 // selector are those the kernels are built for.
 [[nodiscard]] DFlashDraftLayout draftLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint32_t layers,
                                             uint32_t intermediateSize, float rotaryTheta,
                                             std::span<const uint32_t> targetLayers);
+[[nodiscard]] DFlashDraftLayout draftLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint32_t layers,
+                                            uint32_t intermediateSize, float rotaryTheta,
+                                            std::span<const uint32_t> targetLayers,
+                                            DFlashDraftAttention attention);
 
 struct DFlashDecodeBuffers final {
   ops::LinearScratch linearScratch{};

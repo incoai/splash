@@ -73,7 +73,7 @@ kernel void verify_input_tokens(
   uint batch = index / SPLASH_TARGET_VERIFY_ROWS;
   uint row = index % SPLASH_TARGET_VERIFY_ROWS;
   uint token = row == 0
-                   ? draft_input[batch * SPLASH_TARGET_VERIFY_ROWS]
+                   ? draft_input[batch * params.draft_rows]
                    : draft_tokens[batch * SPLASH_DRAFT_PROPOSAL_TOKENS +
                                   row - 1];
   verify_input[index] = min(token, params.vocabulary - 1u);

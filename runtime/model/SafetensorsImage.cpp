@@ -372,7 +372,8 @@ void walkLayer(Walk &b, const QwenTargetDimensions &g, ModuleNames names, uint32
 
 template <class Walk> void walkHead(Walk &b, const QwenTargetDimensions &g, ModuleNames names) {
   b.norm(modelPrefix(names) + "norm", g.hiddenSize);
-  b.projection(headName(names), g.vocabularySize, g.hiddenSize);
+  b.projection(g.tiedEmbeddings ? modelPrefix(names) + "embed_tokens" : headName(names),
+                g.vocabularySize, g.hiddenSize);
 }
 
 template <class Walk> void walkEmbedding(Walk &b, ModuleNames names) {
@@ -382,8 +383,7 @@ template <class Walk> void walkEmbedding(Walk &b, ModuleNames names) {
 } // namespace
 
 ModuleNames moduleNames(const SafetensorsCheckpoint &checkpoint) {
-  return checkpoint.find("lm_head.weight") || checkpoint.find("lm_head.weight_packed") ? ModuleNames::Transformers
-                                                                                         : ModuleNames::Mlx;
+  return checkpoint.find("model.language_model.norm.weight") ? ModuleNames::Transformers : ModuleNames::Mlx;
 }
 
 std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry,

@@ -72,7 +72,8 @@ public:
 
   void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
            const DraftCodebooks &codebooks, std::span<const uint32_t> anchors,
-           std::span<const SamplingPolicy> policies) const;
+           std::span<const SamplingPolicy> policies,
+           uint32_t queryRows = SPLASH_DRAFT_QUERY_ROWS) const;
   // After add: each lane's verify rows (a uint32 per lane in `verifyRows`) by
   // `model` from its confidences, at most maximumRows[lane] of them.
   static void addVerifyRows(metal::CommandGraph &graph, const metal::MetalBuffer &confidence,
