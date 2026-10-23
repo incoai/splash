@@ -510,6 +510,21 @@ Every request, including image placeholder, token-count and judgment
 startup; tokenizer files and the tokenizer object are unchanged. The probe's
 upstream fixtures are in `dev/tests/fixtures/chat_templates/`.
 
+## Custom chat templates
+
+`--chat-template-file FILE`, of `splash serve` or the server, names a UTF-8
+Jinja file that every request renders with, in place of every template the
+tokenizer defines, `tool_use` included; without it, the tokenizer's templates
+serve as before. The server reads the file once at startup, probes it as it
+probes the tokenizer's, and logs its path and SHA-256 (`Chat template file ·
+...`); a later change to the file takes effect at the next start. A file that
+cannot be read, is not UTF-8, is blank or is not a Jinja template stops
+startup, as does a template that cannot render a question, before any weights
+load; Splash never falls back to the model's templates. The template supplies
+formatting alone: the vocabulary, special tokens and the [chat
+format](#chat-formats) the output is read in remain the model's. Preparation
+is unchanged: a GGUF still needs a chat template of its own.
+
 ## Chat formats
 
 Each family's model frames its reasoning and lays out its tool calls in a

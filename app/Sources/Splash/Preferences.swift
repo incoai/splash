@@ -159,7 +159,7 @@ struct ServeSettings: Equatable {
 /// A `splash serve` option the Server screen offers: its flag, its words, its part of the screen,
 /// and how its value is chosen. `all` holds every option `splash serve` takes but those the app
 /// sets itself (`--model`, `--model-dir`, `--offline`) and those of one model rather than every
-/// start (`--revision`, `--draft-model`, `--mmproj`).
+/// start (`--revision`, `--draft-model`, `--mmproj`, `--chat-template-file`).
 struct LaunchOption: Identifiable, Sendable {
     enum Section: String, CaseIterable {
         case main = "Launch Options", memory = "Memory", cache = "SSD Cache"
