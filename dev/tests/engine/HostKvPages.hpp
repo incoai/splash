@@ -14,8 +14,9 @@ namespace splash::test {
 // Pages in host memory, reached as kv::PageStorage reaches its pages: each
 // layer's keys, key scales, values and value scales, in the order of the
 // layers' regions (kv::Layout::region), then each layer's index. Every page
-// is Full until a test gives it the index form, which a tier reads its index
-// alone into (engine::BasicKvPageTier).
+// is Full until a test gives it another form: the index form, which a tier
+// reads its index alone into (engine::BasicKvPageTier), or the Slim form,
+// whose spans are the regions it holds (kv::Layout::regions) and the index.
 class HostKvPages final {
 public:
   HostKvPages(kv::Layout layout, uint32_t pages)
@@ -48,6 +49,7 @@ public:
     std::vector<uint32_t> regionLayers(layout_.attentionLayers);
     for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
       regionLayers[layout_.region(layer)] = layer;
+    regionLayers.resize(layout_.regions(form(page)));
     std::vector<std::span<std::byte>> result;
     for (const uint32_t layer : regionLayers)
       for (const std::span<std::byte> tensor : layerSpans(page, layer))

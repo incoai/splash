@@ -45,10 +45,13 @@ blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
 // chained full-page hashes from the root. A block holds a pool page, a disk
 // slot, or both; resident blocks form a subtree at the root, so a matched
 // chain is a resident prefix followed by disk-only blocks. A resident block's
-// page holds its K/V (kv::PageForm::Full) or, once the block spilled, only
-// its index, its K/V living in its copy alone (kv::PageForm::Index).
-// Composite recurrent states are a separate sparse layer. This class owns
-// exactly one prefix reference for every resident block.
+// page holds its K/V (kv::PageForm::Full); once the block spilled, only its
+// index, its K/V living in its copy alone (kv::PageForm::Index); or, of a
+// layout with a sliding window, the K/V of the layers no window bounds
+// (kv::PageForm::Slim). A copy holds what the page held when it was written
+// (copyForm), which a restore gives the page back. Composite recurrent
+// states are a separate sparse layer. This class owns exactly one prefix
+// reference for every resident block.
 class KvCache final {
 public:
   static constexpr uint32_t pageTokens = kv::kPageTokens;
@@ -97,12 +100,14 @@ public:
                                   uint32_t physicalPage,
                                   BlockIdentity identity);
   // Takes back a disk-only block an earlier process left in a persistent
-  // tier, under its id, key and recency; a parent comes back before its
-  // children. New ids continue after it. False, taking nothing, when
-  // another block holds the key.
+  // tier, under its id, key and recency, and the form of the page its copy
+  // was written from; a parent comes back before its children. New ids
+  // continue after it. False, taking nothing, when another block holds the
+  // key.
   [[nodiscard]] bool adoptDiskBlock(uint64_t blockId, uint64_t parentBlock,
                                     std::span<const uint32_t> tokens, BlockIdentity identity,
-                                    std::shared_ptr<KvDiskSlot> slot, uint64_t lastUsed);
+                                    std::shared_ptr<KvDiskSlot> slot, uint64_t lastUsed,
+                                    kv::PageForm copyForm = kv::PageForm::Full);
   // New ids continue after this one, which an earlier process recorded.
   void continueIdsAfter(uint64_t blockId) noexcept;
   // A block's key and recency, which a persistent tier records with its copy.
@@ -154,6 +159,10 @@ public:
   // filled it with (insert) is none: a restore point's chain keeps it, until
   // a copy of the page replaces it or the page goes.
   [[nodiscard]] bool kvCopied(uint64_t blockId) const;
+  // What the block's copy holds: the form of the page it was written from,
+  // Full or Slim, which a restore gives a page of; Full for a spilled
+  // block's, whose page held its K/V when it was written.
+  [[nodiscard]] kv::PageForm copyForm(uint64_t blockId) const;
   [[nodiscard]] bool hasDiskChildren(uint64_t blockId) const;
   // StateCache counts each of its entries in and out, and each entry while
   // an unfinished request uses it: a state restores through the KV of its
@@ -184,9 +193,9 @@ public:
   // Starts a transfer of the block's page, or ends it with None; one at a
   // time.
   void setTransfer(uint64_t blockId, Transfer transfer);
-  // Publishes the block's disk copy. A block whose page holds its K/V may
-  // drop it with null; one whose page holds only its index cannot, and a
-  // disk-only block is erased instead.
+  // Publishes the block's disk copy, of what its page holds now. A block
+  // whose page holds its K/V may drop it with null; one whose page holds
+  // only its index cannot, and a disk-only block is erased instead.
   void setSlot(uint64_t blockId, std::shared_ptr<KvDiskSlot> slot);
   // Returns the page of a resident leaf that has a disk copy to the pool.
   void dropPage(uint64_t blockId);
@@ -194,7 +203,7 @@ public:
   // the request that recomputed it. The parent must be resident.
   void adoptPage(uint64_t blockId, uint32_t page);
   // The pool moved pages, within their form (KvPool::compactExtent) or to
-  // the other one (KvPool::movePages): the block on each of them, if any,
+  // another one (KvPool::movePages): the block on each of them, if any,
   // names the page it moved to and takes its form. It visits only the moved
   // pages.
   void followPages(const KvPageMoves &moves) noexcept;
@@ -276,8 +285,10 @@ private:
     uint32_t depth = 0;
     uint64_t lastUsed = 0;
     Transfer transfer = Transfer::None;
-    // Its page's form, kept here so that reindex reads no pool state.
+    // Its page's form, kept here so that reindex reads no pool state, and
+    // what its copy holds (copyForm).
     kv::PageForm form = kv::PageForm::Full;
+    kv::PageForm copyForm = kv::PageForm::Full;
     bool held = false;
     // It had a disk copy once (rewrites).
     bool copied = false;
@@ -304,7 +315,9 @@ private:
   [[nodiscard]] Orders orders(const Block &entry) const noexcept;
   // Places the block in its orders.
   void reindex(Block &entry) noexcept;
-  void giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot);
+  // Gives the block a copy, written from a page of the form, or none.
+  void giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot,
+                    kv::PageForm copyForm = kv::PageForm::Full);
   // Marks the block's copy as one of another command's K/V, or of its own;
   // the caller reindexes it.
   void setForeignCopy(Block &entry, bool foreign) noexcept;

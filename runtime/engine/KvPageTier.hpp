@@ -29,11 +29,13 @@ namespace splash::engine {
 // beyond what reads land in. The file's IO worker writes a page straight from
 // its extent (SlotFormat::transferSpans), a bounded number at once: reclaim
 // may use all of them, persistent copies a quarter and write-through half, so
-// that one kind never starves another and reclaim always keeps a quarter.
+// that one kind never starves another and reclaim always keeps a quarter. A
+// page's slot holds what the page holds as it is written: a Full page whole,
+// a Slim page its first regions and its index (kv::SlotFormat::payloadBytes).
 // Reads go to the SSD readers beside the worker (model::readKvCopy): a
 // restore is a task of a background batch that reads what its page's form
-// holds, the index alone or all of it, into memory of its own and scatters
-// it into the page. The restores asked for since the last
+// holds, the index alone, a Slim page's payload or all of it, into memory of
+// its own and scatters it into the page. The restores asked for since the last
 // submitRestores() go out together, the index restores as one batch on
 // every reader and the whole restores as another on at most
 // kWholeRestoreReaders, whose reads are a slot each. Copies of slots are
@@ -122,12 +124,13 @@ private:
     std::shared_ptr<model::SlotFile::Operation> io;
     std::shared_ptr<Outcome> outcome;
   };
-  // A restore: its slot, its page and whether it reads the page's index
-  // alone (an Index page) or all of it.
+  // A restore: its slot, its page and the page's form, which says what it
+  // reads: the page's index alone (an Index page) or the payload of what
+  // the page holds.
   struct Restore final {
     std::shared_ptr<const DiskSlot> copy;
     uint32_t page = 0;
-    bool index = false;
+    kv::PageForm form = kv::PageForm::Full;
     std::function<void()> completion;
     std::shared_ptr<Outcome> outcome;
   };
@@ -240,7 +243,7 @@ std::unique_ptr<KvTransfer> BasicKvPageTier<Pages>::demote(uint32_t page, std::s
                                                            WriteClass write, std::function<void()> completion) {
   if (!canDemote(write))
     return {};
-  if (pages_.form(page) != kv::PageForm::Full)
+  if (pages_.form(page) == kv::PageForm::Index)
     throw std::logic_error("only a page that holds its K/V is written to the KV tier");
   auto disk = diskSlot(slot);
   auto outcome = std::make_shared<Outcome>();
@@ -260,8 +263,7 @@ std::unique_ptr<KvTransfer> BasicKvPageTier<Pages>::restore(std::shared_ptr<KvDi
                                                             std::function<void()> completion) {
   if (!canRestore())
     return {};
-  Restore restore{diskSlot(slot), page, pages_.form(page) == kv::PageForm::Index, std::move(completion),
-                  std::make_shared<Outcome>()};
+  Restore restore{diskSlot(slot), page, pages_.form(page), std::move(completion), std::make_shared<Outcome>()};
   auto ticket = std::make_unique<Ticket>(restore.outcome);
   queued_.push_back(std::move(restore));
   ++restores_;
@@ -273,8 +275,9 @@ template <class Pages> void BasicKvPageTier<Pages>::submitRestores() {
   // reads a slot, so fewer of them run at once and their memory stays
   // within kWholeRestoreReaders slots.
   for (const bool index : {true, false}) {
-    const auto first = std::stable_partition(queued_.begin(), queued_.end(),
-                                             [&](const Restore &restore) { return restore.index != index; });
+    const auto first = std::stable_partition(queued_.begin(), queued_.end(), [&](const Restore &restore) {
+      return (restore.form == kv::PageForm::Index) != index;
+    });
     const auto count = static_cast<size_t>(queued_.end() - first);
     if (!count)
       continue;
@@ -306,12 +309,13 @@ template <class Pages> void BasicKvPageTier<Pages>::submitRestores() {
 template <class Pages> void BasicKvPageTier<Pages>::read(const Restore &restore) const {
   // The page's extent stays while its restore is in flight, and its memory
   // is found beside the engine thread's changes to other extents.
-  const kv::SlotRange range = restore.index ? format_.indexRange() : kv::SlotRange{0, format_.payloadBytes()};
+  const bool index = restore.form == kv::PageForm::Index;
+  const kv::SlotRange range = index ? format_.indexRange() : kv::SlotRange{0, format_.payloadBytes(restore.form)};
   model::KvReadBuffer buffer;
   const std::optional<std::span<const std::byte>> bytes = model::readKvCopy(*restore.copy, range, buffer);
   if (!bytes)
     throw std::runtime_error("a KV tier slot could not be read");
-  if (restore.index)
+  if (index)
     format_.scatterIndex(*bytes, pages_.indexSpans(restore.page));
   else
     format_.scatterPage(*bytes, pages_, restore.page);

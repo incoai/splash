@@ -903,7 +903,7 @@ private:
   // empties; progress with zero bytes when the extent emptied is the runway
   // kept. No progress when the free pages fill none.
   [[nodiscard]] CacheReclaimResult releaseExtent(bool keepRunway);
-  // Empties one extent that still holds pages, of the form or of either
+  // Empties one extent that still holds pages, of the form or of any
   // (KvPool::compactExtent); the blocks and requests on its pages follow
   // them. A page a transfer reads or writes stays where it is until the
   // transfer has landed. False when the free pages cover no extent.

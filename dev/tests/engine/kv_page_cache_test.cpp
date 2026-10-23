@@ -673,6 +673,59 @@ void testSpilledBlocksTakeTheirPagesForm() {
   cache.checkInvariants();
 }
 
+// A block's page moves to the Slim form of a windowed layout with its
+// holders' references, and the block keeps its K/V there: its copy is
+// redundant as a Full page's is. A copy holds what the page held when it
+// was written (copyForm): one of the Full page it had before holds more and
+// stays its copy, one written from the Slim page holds that, a disk-only
+// block keeps it, and so does one an earlier process left.
+void testSlimBlocksKeepWhatTheirCopiesHold() {
+  test::TestKvStorage storage(16, 100, 4, 0, 30);
+  KvPool pool(storage, 4);
+  CacheRecency recency;
+  KvCache cache(pool, recency);
+  auto acquired = pool.acquirePages(3);
+  require(acquired.granted(), "test pages were not acquired");
+  auto root = cache.insert(0, page(91), acquired.pages[0], {});
+  auto middle = cache.insert(root.id, page(92), acquired.pages[1], {});
+  auto leaf = cache.insert(middle.id, page(93), acquired.pages[2], {});
+  cache.setSlot(middle.id, std::make_shared<FakeSlot>());
+  const KvPageMoveResult trimmed =
+      pool.movePages(std::array{acquired.pages[1], acquired.pages[2]}, kv::PageForm::Slim);
+  require(trimmed.granted(), "the pages did not move to the Slim form");
+  cache.followPages(trimmed.moves);
+  require(pool.form(cache.page(middle.id)) == kv::PageForm::Slim &&
+              pool.form(cache.page(leaf.id)) == kv::PageForm::Slim && cache.indexBlocks() == 0 &&
+              cache.blockOn(cache.page(leaf.id)) == leaf.id && cache.kvCopied(middle.id) &&
+              cache.copyForm(middle.id) == kv::PageForm::Full,
+          "a block did not follow its page to the Slim form, or its Full copy stopped holding its K/V");
+  cache.setSlot(leaf.id, std::make_shared<FakeSlot>());
+  require(cache.kvCopied(leaf.id) && cache.copyForm(leaf.id) == kv::PageForm::Slim,
+          "a copy of a Slim page did not hold what the page holds");
+  cache.unholdPage(acquired.pages[0]);
+  cache.unholdPage(cache.page(middle.id));
+  cache.unholdPage(cache.page(leaf.id));
+  require(cache.diskCandidate(true).value().id == middle.id && !cache.diskCandidate(false) &&
+              cache.evictionCandidate(0).value().id == leaf.id,
+          "the copy of a Slim page was not redundant, or a Slim leaf not a RAM leaf");
+  cache.dropPage(leaf.id);
+  require(cache.page(leaf.id) == KvCache::noPage && cache.copyForm(leaf.id) == kv::PageForm::Slim &&
+              cache.kvCopied(leaf.id),
+          "a disk-only block lost the form its copy holds");
+  cache.checkInvariants();
+
+  CacheRecency later;
+  KvCache next(pool, later);
+  require(next.adoptDiskBlock(40, 0, page(94), {}, std::make_shared<FakeSlot>(), 1, kv::PageForm::Slim) &&
+              next.copyForm(40) == kv::PageForm::Slim,
+          "a block taken back lost the form its copy holds");
+  rejects([&] {
+    static_cast<void>(next.adoptDiskBlock(41, 0, page(95), {}, std::make_shared<FakeSlot>(), 1,
+                                          kv::PageForm::Index));
+  }, "invalid adopted KV cache block", "a copy of an index alone was taken back");
+  next.checkInvariants();
+}
+
 // A writer moves onto its block's page while a write reads it, whose bytes
 // are final, and keeps its own while a restore fills it. A disk-only block
 // that adopts the writer's page keeps its copy, which holds what another
@@ -785,6 +838,7 @@ int main() {
     testMatchableExcludesPoisonedBlocks();
     testRequestsHoldTheirBlocks();
     testSpilledBlocksTakeTheirPagesForm();
+    testSlimBlocksKeepWhatTheirCopiesHold();
     testWritersAndTheContentOfABlock();
     testCopiesLeaveWithTheirBlocks();
     std::cout << "KV page cache tests passed\n";

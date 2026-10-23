@@ -73,9 +73,11 @@ std::vector<std::byte> indexOf(const test::HostKvPages &pages, uint32_t page) {
 }
 
 // Pages leave for their slots and come back byte for byte, all at once: a
-// whole restore brings a page back, and, of a spillable layout, an index
-// restore every other page's index alone. Each kind's batch wakes the engine
-// once. A restore of a slot never written fails, the others beside it land.
+// whole restore brings a page back, of a windowed layout every third one
+// Slim, which its slot holds and a restore into a Slim page brings back,
+// and, of a spillable layout, an index restore every other page's index
+// alone. Each kind's batch wakes the engine once. A restore of a slot never
+// written fails, the others beside it land.
 void roundTrips(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout layout) {
   constexpr uint32_t kPages = 48;
   test::HostKvPages pages(layout, 2 * kPages + 1);
@@ -84,8 +86,13 @@ void roundTrips(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout la
   Tier tier(pages, format, slotFile(format, kPages + 1, budget), readers);
   std::vector<std::shared_ptr<engine::KvDiskSlot>> slots;
   std::vector<std::unique_ptr<KvTransfer>> writes;
+  const auto slim = [&](uint32_t page) { return layout.slimmable() && page % 3 == 0; };
   for (uint32_t page = 0; page < kPages; ++page) {
     pages.fill(page, page + 1);
+    if (slim(page)) {
+      pages.setForm(page, kv::PageForm::Slim);
+      pages.setForm(kPages + page, kv::PageForm::Slim);
+    }
     slots.push_back(tier.acquireSlot(cached));
     writes.push_back(tier.demote(page, slots.back(), WriteClass::Reclaim, {}));
     require(writes.back() != nullptr, "a write within the tier's bound was refused");
@@ -106,9 +113,10 @@ void roundTrips(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout la
   for (uint32_t page = 0; page < kPages; ++page) {
     const uint32_t into = kPages + page;
     const bool index = pages.form(into) == kv::PageForm::Index;
+    const uint64_t bytes = layout.bytesPerModelPage(pages.form(into));
     require(restores[page]->finish() &&
                 (index ? indexOf(pages, into) == indexOf(pages, page)
-                       : std::ranges::equal(pages.page(into), pages.page(page))),
+                       : std::ranges::equal(pages.page(into).first(bytes), pages.page(page).first(bytes))),
             "a page did not come back from its slot byte for byte");
   }
   require(!restores.back()->finish(), "a slot never written was restored");
@@ -165,9 +173,12 @@ int main() {
   try {
     const auto readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
     for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
-      // Qwen3.6-35B's layout, which keeps its spans' order, and
-      // Qwen3.8-Flash-Next's, whose slots hold block records.
-      for (const kv::Layout layout : {kv::Layout{10, 2, 256, format}, kv::Layout{12, 2, 256, format, 128, true}}) {
+      // Qwen3.6-35B's layout, which keeps its spans' order, a windowed one
+      // with Slim pages, and Qwen3.8-Flash-Next's, whose slots hold block
+      // records.
+      for (const kv::Layout layout : {kv::Layout{10, 2, 256, format},
+                                      kv::Layout{6, 2, 256, format, 0, false, 512, 0b010110},
+                                      kv::Layout{12, 2, 256, format, 128, true}}) {
         roundTrips(readers, layout);
         teardown(readers, layout);
       }

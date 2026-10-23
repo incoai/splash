@@ -2912,13 +2912,20 @@ over the layers `windowedLayers` names) places the regions of the layers no
 window bounds first and then the windowed layers', each in layer order
 (`Layout::region`): what a row reads of a page every window has passed lies in
 its first regions, and a page's SSD slot holds them first too. Each extent has
-a form (`kv::PageForm`): a Full extent holds its pages' K/V and then, for a
-layout with a block index, their index plane; an Index extent only the plane,
-for pages whose K/V is on the SSD, and only a pool that spills allocates one. A
-page moves to the other form, its references with it, when its K/V leaves
-memory or comes back (`KvPool::movePages`). The pool allocates an extent
-when it needs one of its pages. When it is built it allocates the runway, the
-extents of the first 64 pages, which startup warmup runs on; nothing but the
+a form (`kv::PageForm`), which holds the first of a Full extent's regions
+(`Layout::regions`) and then, for a layout with a block index, their index
+plane: a Full extent every layer's; an Index extent none, only the plane, for
+pages whose K/V is on the SSD, and only a pool that spills allocates one; and a
+Slim extent, only of a layout with a sliding window whose slots hold a page's
+spans in order (`Layout::slimmable`), those of the layers no window bounds, for
+a page every row's window has passed. A layer's region sits at one offset in
+every extent that holds it, so the kernels reach a Slim page as they reach a
+Full one, through a real page table entry; only an Index page's is absent. A
+page moves to another form, its references with it, when its K/V leaves memory
+or comes back, or when it gives up its windowed layers' K/V
+(`KvPool::movePages`), and the copy takes what both forms hold. The pool
+allocates an extent when it needs one of its pages. When it is built it
+allocates the runway, the extents of the first 64 pages, which startup warmup runs on; nothing but the
 pool allocates or releases an extent. An extent whose last page is free stays
 allocated until a reclaim releases it, at once and only between commands: memory
 pressure, an admission the budget denies, the publication of a replay point in
@@ -2929,9 +2936,9 @@ queue's residency set makes extents resident for every command buffer. The host 
 returns free pages before it evicts anything: an empty extent as it is, and the
 free pages scattered over the others of its form as soon as they cover the
 extent of that form that holds the fewest pages, whose pages the pool copies to
-them (`KvPool::compactExtent`): a Full extent before an Index one, unless the
-reclaim needs the memory of one form, as a shortfall of Index pages needs Full
-memory.
+them (`KvPool::compactExtent`): a Full extent before a Slim one and a Slim one
+before an Index one, unless the reclaim needs the memory of one form, as a
+shortfall of Index pages needs Full memory.
 The blocks and requests on those pages follow them, a page a disk transfer reads
 or writes stays where it is, and a pass that evicts everything copies only what
 is left afterwards. Every extent a pass empties is released, except that a
@@ -3282,10 +3289,14 @@ chain whose newest blocks have no copy, as a finished request's prompt past the
 chain it restored, so leaves RAM one write at a time, and an allocation refused
 meanwhile waits for each write. Unneeded
 tails are dropped without writing, before any state, together with any disk
-copies below them. Writes run on their file's IO worker. A KV page is restored
-by the engine's SSD readers (`SsdReaders`), which
-read what the page's form holds, its index alone or the whole page, with one
-aligned read into memory of their own, and scatter it into the page; the
+copies below them. Writes run on their file's IO worker. A KV page's slot
+holds what the page holds as it is written: a Slim page's is the first part
+of a Full page's payload, its regions in their order, and the block keeps the
+form of its copy (`KvCache::copyForm`), which a restore of the block allocates
+its page in. A KV page is restored by the engine's SSD readers (`SsdReaders`),
+which read what the page's form holds, its index alone, a Slim page's payload
+or the whole page, with one aligned read into memory of their own, and scatter
+it into the page; the
 restores asked for between two submissions (`KvTier::submitRestores`) go out
 together, index restores on every reader and whole ones on at most
 `KvPageTier::kWholeRestoreReaders`. A state is restored on its file's worker.

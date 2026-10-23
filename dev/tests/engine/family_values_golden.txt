@@ -5,7 +5,8 @@
 #
 #   kv: the target's KV layout (kv::Layout) and its sliding window, if it
 #     has one;
-#   kv <format>: a page's bytes, Full and Index (kv::PageForm), the extent
+#   kv <format>: a page's bytes, Full and Index (kv::PageForm), and Slim for
+#     a layout whose pages can be Slim (kv::Layout::slimmable), the extent
 #     alignment and the smallest and largest extent, in pages;
 #   kv <format> extent-pages: the extent of a pool of so many pages
 #     (kv::Layout::extentPagesFor);

@@ -182,9 +182,9 @@ KvCache::BlockMatch KvCache::insert(uint64_t parentBlock,
 
 bool KvCache::adoptDiskBlock(uint64_t blockId, uint64_t parentBlock,
                              std::span<const uint32_t> tokens, BlockIdentity identity,
-                             std::shared_ptr<KvDiskSlot> slot, uint64_t lastUsed) {
+                             std::shared_ptr<KvDiskSlot> slot, uint64_t lastUsed, kv::PageForm copyForm) {
   if (!blockId || blockId == std::numeric_limits<uint64_t>::max() || blocks_.contains(blockId) ||
-      tokens.size() != pageTokens || !slot)
+      tokens.size() != pageTokens || !slot || copyForm == kv::PageForm::Index)
     throw std::invalid_argument("invalid adopted KV cache block");
   if (parentBlock && !blocks_.contains(parentBlock))
     throw std::invalid_argument("adopted KV cache block's parent is unknown");
@@ -205,7 +205,7 @@ bool KvCache::adoptDiskBlock(uint64_t blockId, uint64_t parentBlock,
   entry.unneededNode = RecencyOrder::allocate();
   Block &placed = blocks_.emplace(blockId, std::move(entry)).first->second;
   index_.emplace(placed.indexHash, blockId);
-  giveDiskCopy(placed, std::move(slot));
+  giveDiskCopy(placed, std::move(slot), copyForm);
   if (parentBlock) {
     Block &parent = block(parentBlock);
     ++parent.children;
@@ -313,6 +313,8 @@ bool KvCache::kvCopied(uint64_t blockId) const {
   const Block &entry = block(blockId);
   return entry.slot && !entry.foreignCopy;
 }
+
+kv::PageForm KvCache::copyForm(uint64_t blockId) const { return block(blockId).copyForm; }
 
 bool KvCache::hasDiskChildren(uint64_t blockId) const {
   const Block &entry = block(blockId);
@@ -445,11 +447,13 @@ void KvCache::setSlot(uint64_t blockId, std::shared_ptr<KvDiskSlot> slot) {
     throw std::logic_error("a disk-only KV cache block is erased, not stripped");
   if (!slot && entry.form == kv::PageForm::Index)
     throw std::logic_error("a spilled KV cache block's copy holds its only K/V");
-  giveDiskCopy(entry, std::move(slot));
+  // A copy holds what the page holds; a spilled block's was written while
+  // its page held all of it.
+  giveDiskCopy(entry, std::move(slot), entry.form == kv::PageForm::Index ? kv::PageForm::Full : entry.form);
   reindex(entry);
 }
 
-void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot) {
+void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot, kv::PageForm copyForm) {
   setForeignCopy(entry, false);
   if (static_cast<bool>(entry.slot) != static_cast<bool>(slot)) {
     slot ? ++diskBlocks_ : --diskBlocks_;
@@ -459,6 +463,7 @@ void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot) {
   if (slot)
     rewrites_ += std::exchange(entry.copied, true);
   entry.slot = std::move(slot);
+  entry.copyForm = entry.slot ? copyForm : kv::PageForm::Full;
 }
 
 void KvCache::setForeignCopy(Block &entry, bool foreign) noexcept {
@@ -504,7 +509,8 @@ void KvCache::followPages(const KvPageMoves &moves) noexcept {
     const kv::PageForm form = pool_.form(move.to);
     if (form == entry.form)
       continue;
-    form == kv::PageForm::Index ? ++indexBlocks_ : --indexBlocks_;
+    indexBlocks_ += form == kv::PageForm::Index;
+    indexBlocks_ -= entry.form == kv::PageForm::Index;
     entry.form = form;
     reindex(entry);
   }
@@ -576,7 +582,7 @@ void KvCache::poison(uint64_t blockId) {
   // read the copy, and a spilled block's copy holds its only K/V: either
   // copy leaves with the block.
   ++generation_;
-  if (!entry.held && (entry.page == noPage || entry.form == kv::PageForm::Full))
+  if (!entry.held && (entry.page == noPage || entry.form != kv::PageForm::Index))
     giveDiskCopy(entry, nullptr);
   reindex(entry);
   erasePoisonedLeaf(blockId);
@@ -681,27 +687,28 @@ const KvCache::Block &KvCache::block(uint64_t blockId) const {
 }
 
 // Resident leaves wait in one order, disk copies in another: redundant
-// copies of blocks whose page holds their K/V, or the only copies, of a
-// spilled or disk-only block without children. In a persistent cache the
-// disk copies no state needs wait in a third as well: a redundant one that
-// no state on disk restores through, and the only one of a leaf without a
-// state. A block a request uses or holds, one in transfer, or a poisoned one
-// is in no order: quota never takes a copy active KV reads, nor RAM reclaim
-// a page a request holds. Active KV reads no copy of another command's K/V,
-// which waits as a redundant copy beside a page requests use or hold.
+// copies of blocks whose page holds their K/V, Full or Slim, or the only
+// copies, of a spilled or disk-only block without children. In a persistent
+// cache the disk copies no state needs wait in a third as well: a redundant
+// one that no state on disk restores through, and the only one of a leaf
+// without a state. A block a request uses or holds, one in transfer, or a
+// poisoned one is in no order: quota never takes a copy active KV reads, nor
+// RAM reclaim a page a request holds. Active KV reads no copy of another
+// command's K/V, which waits as a redundant copy beside a page requests use
+// or hold.
 KvCache::Orders KvCache::orders(const Block &entry) const noexcept {
   if (entry.transfer != Transfer::None || entry.poisoned)
     return {};
   const bool used = entry.activeUsers || entry.held;
   const bool paged = entry.page != noPage;
-  const bool full = paged && entry.form == kv::PageForm::Full;
+  const bool holdsKv = paged && entry.form != kv::PageForm::Index;
   Orders result;
   result.ramLeaf = paged && !entry.residentChildren && !used;
   if (!entry.slot || (used && !entry.foreignCopy))
     return result;
-  result.duplicate = full;
-  result.diskLeaf = !full && !entry.children;
-  result.unneeded = persistent_ && (full ? !entry.diskStates : !entry.statesHere && !entry.children);
+  result.duplicate = holdsKv;
+  result.diskLeaf = !holdsKv && !entry.children;
+  result.unneeded = persistent_ && (holdsKv ? !entry.diskStates : !entry.statesHere && !entry.children);
   return result;
 }
 
@@ -750,6 +757,12 @@ void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &state
     }
     check(!entry.foreignCopy || (entry.slot && entry.page != noPage && entry.form == kv::PageForm::Full),
           "a copy of another command's K/V sits beside a Full page");
+    // A copy holds what its page held when it was written, which a Slim
+    // page holds no more of and a Full or spilled page all of.
+    check(entry.copyForm != kv::PageForm::Index &&
+              (!entry.slot || entry.foreignCopy || entry.page == noPage ||
+               entry.copyForm == kv::PageForm::Full || entry.form == kv::PageForm::Slim),
+          "a block's copy holds what its page held");
     if (entry.page == noPage) {
       check(entry.slot != nullptr || entry.poisoned, "a disk-only block has a copy");
       check(!entry.held && entry.transfer == Transfer::None,

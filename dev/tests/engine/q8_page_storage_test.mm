@@ -47,20 +47,23 @@ constexpr kv::Layout windowedBf16Layout{49, 4, 128, kv::Format::BFloat16, 0, fal
 
 // The host reaches a Full page through spans of its tensors, region by
 // region (kv::Layout::region) as keys, key scales, values and value scales,
-// BF16 without scales, then each layer's QSA pooled keys, and an Index page
-// through its pooled keys alone. Kernels find a page's keys at the page's
-// slab in the layer's region and its pooled keys at its slab of the layer's
-// index region in the extent's index plane, after every layer's region where
-// there are K/V, so that is where those spans start, and the spans of an
-// extent's pages cover the extent once, without gaps or overlaps.
+// BF16 without scales, then each layer's QSA pooled keys, a Slim page
+// through those of the regions it holds (kv::Layout::regions) and its pooled
+// keys, and an Index page through its pooled keys alone. Kernels find a
+// page's keys at the page's slab in the layer's region and its pooled keys
+// at its slab of the layer's index region in the extent's index plane, after
+// the regions the extent holds, so that is where those spans start, and the
+// spans of an extent's pages cover the extent once, without gaps or
+// overlaps.
 void requireSpansTileExtent(const kv::PageStorage &storage, uint32_t firstPage) {
     const kv::Layout layout = storage.layout();
     const kv::PageForm form = storage.form(firstPage);
     const bool scaled = layout.format == kv::Format::Int8;
     const uint32_t tensors = scaled ? 4 : 2;
-    const uint32_t kvSpans = form == kv::PageForm::Full ? layout.attentionLayers * tensors : 0;
+    const uint32_t kvSpans = layout.regions(form) * tensors;
     std::byte *const extent = storage.spans(firstPage).front().data();
-    std::byte *const plane = extent + (kvSpans ? uint64_t{storage.extentPages()} * layout.kvBytesPerModelPage() : 0);
+    std::byte *const plane =
+        extent + uint64_t{storage.extentPages()} * layout.regions(form) * layout.bytesPerLayerPage();
     std::vector<std::span<std::byte>> all;
     for (uint32_t index = 0; index < storage.extentPages(); ++index) {
         const auto spans = storage.spans(firstPage + index);
@@ -73,7 +76,7 @@ void requireSpansTileExtent(const kv::PageStorage &storage, uint32_t firstPage) 
             require(spans[span].size() == bytes, "a page's span holds another tensor's bytes");
         }
         for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer) {
-            if (kvSpans)
+            if (layout.region(layer) < layout.regions(form))
                 require(spans[layout.region(layer) * tensors].data() ==
                             extent + storage.layers()[layer].offset +
                                 uint64_t{index} * layout.dataBytesPerLayerPage(),
@@ -289,6 +292,95 @@ void windowedLayersComeLast(metal::MetalBackend &backend, MemoryGovernor &govern
                              "HostKvExtents misplaces a windowed layout's page");
         }
     }
+}
+
+// A windowed layout's Slim extent holds the regions of the layers no window
+// bounds where a Full extent holds them, then its index plane, which this
+// layout has none of (kv::Layout::regions): every such layer's placement
+// reaches a Slim page as it reaches a Full one, and a page's spans are the
+// first ones of a Full page's. Its entry reaches its extent, as a kernel
+// writing through it shows, a copy between the forms moves those regions
+// alone, and HostKvExtents places a Slim extent where the storage does. A
+// layout without a window has no Slim pages.
+void slimPagesHoldTheirFirstRegions(metal::MetalBackend &backend, MemoryGovernor &governor) {
+    for (const auto layout : {windowedLayout, windowedBf16Layout}) {
+        const uint32_t extent = layout.minimumExtentPages();
+        const uint32_t tensors = layout.format == kv::Format::Int8 ? 4 : 2;
+        kv::PageStorage storage(backend, governor.allocationAdmission(), layout, 2 * extent, extent);
+        require(storage.allocateExtent(0) && storage.allocateExtent(1, kv::PageForm::Slim) &&
+                    storage.extentBytes(kv::PageForm::Slim) == uint64_t{extent} * 14 * layout.bytesPerLayerPage() &&
+                    storage.actualAllocatedBytes() ==
+                        storage.extentBytes() + storage.extentBytes(kv::PageForm::Slim) &&
+                    storage.form(extent) == kv::PageForm::Slim,
+                "an extent of Slim pages was not allocated at the bytes of their regions");
+        requireSpansTileExtent(storage, extent);
+        std::byte *const fullBase = storage.spans(0).front().data();
+        std::byte *const slimBase = storage.spans(extent).front().data();
+        const std::vector<std::span<std::byte>> fullSpans = storage.spans(3), slimSpans = storage.spans(extent + 3);
+        require(slimSpans.size() == 14 * tensors &&
+                    std::ranges::equal(slimSpans, std::span(fullSpans).first(slimSpans.size()),
+                                       [&](auto slim, auto full) {
+                                           return slim.data() - slimBase == full.data() - fullBase &&
+                                                  slim.size() == full.size();
+                                       }),
+                "a Slim page's spans are not the first ones of a Full page's");
+        rejects([&] { (void)storage.layerSpans(extent + 3, 2); }, "holds no windowed layer's K/V",
+                "a Slim page had a windowed layer's K/V spans");
+
+        // A kernel writing through the Slim page's entry reaches its keys.
+        const metal::MetalBuffer table = test::sharedBuffer(backend, 2 * sizeof(SplashKvPage));
+        const SplashKvPage fullEntry = entryOf(storage, 0, table), slimEntry = entryOf(storage, extent, table);
+        require(slimEntry != SPLASH_KV_PAGE_ABSENT && !(slimEntry & SPLASH_KV_PAGE_INDEX_MASK),
+                "a Slim page's entry does not reach its extent");
+        const uint32_t words = 1024, seed = 0x51f;
+        (void)backend.submit({"addressed_write_u32", {{0, table}},
+                              {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
+                              {words / 256, 1, 1}, {256, 1, 1}});
+        const auto *written = reinterpret_cast<const uint32_t *>(slimBase);
+        for (uint32_t word = 0; word < words; ++word)
+            require(written[word] == (seed ^ word), "a kernel did not reach a Slim page through its entry");
+
+        // Full to Slim takes the regions every row reads, and back leaves a
+        // Full page's windowed regions as they were.
+        const auto fill = [&](std::span<const std::span<std::byte>> spans, std::byte value) {
+            for (const auto span : spans) std::fill(span.begin(), span.end(), value);
+        };
+        const auto holds = [&](std::span<const std::span<std::byte>> spans, std::byte value) {
+            return std::ranges::all_of(spans, [&](auto span) {
+                return std::ranges::all_of(span, [&](std::byte byte) { return byte == value; });
+            });
+        };
+        fill(storage.spans(3), std::byte{0x22});
+        fill(storage.spans(extent + 3), std::byte{0x55});
+        fill(storage.spans(4), std::byte{0x66});
+        storage.copyPages(std::array{kv::PageCopy{3, extent + 3}});
+        storage.copyPages(std::array{kv::PageCopy{extent + 3, 4}});
+        const std::vector<std::span<std::byte>> back = storage.spans(4);
+        require(holds(storage.spans(extent + 3), std::byte{0x22}) &&
+                    holds(std::span(back).first(slimSpans.size()), std::byte{0x22}) &&
+                    holds(std::span(back).subspan(slimSpans.size()), std::byte{0x66}),
+                "a copy between the forms did not move exactly the regions both pages hold");
+        storage.clearPages(std::array<uint32_t, 1>{extent + 3});
+        require(holds(storage.spans(extent + 3), std::byte{0}) && holds(storage.spans(3), std::byte{0x22}),
+                "a cleared Slim page kept its K/V, or a Full page changed");
+
+        const test::HostKvExtents host(layout, extent,
+                                       {{fullBase, fullEntry, kv::PageForm::Full},
+                                        {slimBase, slimEntry, kv::PageForm::Slim}});
+        for (const uint32_t layer : {0u, 1u, 5u, 48u})
+            requireSameSpans(host.layerSpans(extent + 3, layer), storage.layerSpans(extent + 3, layer),
+                             "HostKvExtents misplaces a Slim page's K/V");
+        const std::array<uint32_t, 2> pages{3, extent + 3};
+        std::array<SplashKvPage, 2> hostEntries{};
+        host.writeTable(pages, hostEntries.data());
+        storage.writeEntries(pages, 0, table);
+        require(std::ranges::equal(hostEntries, std::span(static_cast<const SplashKvPage *>(table.contents()), 2)),
+                "HostKvExtents writes other entries of Slim pages");
+    }
+    kv::PageStorage dense(backend, governor.allocationAdmission(), kvLayout, 256, 128);
+    rejects([&] { (void)dense.allocateExtent(0, kv::PageForm::Slim); },
+            "KV pages of a layout without a window keep every layer",
+            "a layout without a window allocated Slim pages");
 }
 
 void run(const std::string &metallib) {
@@ -533,6 +625,7 @@ void run(const std::string &metallib) {
             "KV layer has no index region", "a layout without an index had an index region");
     indexPagesHoldOnlyTheirIndex(backend, governor);
     windowedLayersComeLast(backend, governor);
+    slimPagesHoldTheirFirstRegions(backend, governor);
     std::cout << "KV page storage tests passed\n";
 }
 

@@ -67,8 +67,9 @@ std::string familyValues() {
       kv::Layout layout = kv;
       layout.format = format;
       out << "kv " << kv::formatName(format) << " page " << layout.bytesPerModelPage(kv::PageForm::Full)
-          << " index-page " << layout.bytesPerModelPage(kv::PageForm::Index) << " alignment "
-          << layout.extentAlignmentPages() << " extents " << layout.minimumExtentPages() << ".."
+          << " index-page " << layout.bytesPerModelPage(kv::PageForm::Index)
+          << (layout.slimmable() ? " slim-page " + std::to_string(layout.bytesPerModelPage(kv::PageForm::Slim)) : "")
+          << " alignment " << layout.extentAlignmentPages() << " extents " << layout.minimumExtentPages() << ".."
           << layout.maximumExtentPages() << '\n'
           << "kv " << kv::formatName(format) << " extent-pages";
       for (const uint64_t pages : kPoolPages)

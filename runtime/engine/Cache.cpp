@@ -4,6 +4,7 @@
 #include "engine/DiskLabels.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <limits>
 #include <stdexcept>
@@ -347,7 +348,7 @@ std::shared_ptr<const model::KvPageSources> Cache::cutSources(const Request &act
 }
 
 model::KvPageSource Cache::sourceOf(uint32_t page) const {
-  if (pool_.form(page) == kv::PageForm::Full)
+  if (pool_.form(page) != kv::PageForm::Index)
     return {};
   // A request reaches an Index page only through the spilled block on it,
   // whose copy holds its K/V.
@@ -873,8 +874,8 @@ void Cache::followMoves(const KvPageMoves &moves) {
       const uint32_t destination = moves.follow(page);
       if (destination == page)
         continue;
-      if (pool_.form(destination) != pool_.form(page))
-        pool_.form(destination) == kv::PageForm::Index ? ++active.indexPages : --active.indexPages;
+      active.indexPages += pool_.form(destination) == kv::PageForm::Index;
+      active.indexPages -= pool_.form(page) == kv::PageForm::Index;
       page = destination;
       first = std::min(first, index);
     }
@@ -1266,38 +1267,41 @@ TokenAdmission Cache::restoreRequest(uint64_t requestId, const CacheLookup &look
   KvCache::Chain chain = kv_.chain(lookup.state->kvBlock());
   const bool spills = active.mode == KvMode::Spill;
   const uint32_t densePages = spill_ ? spill_->densePages : 0;
-  // Resident blocks are a rooted prefix of the chain. Past a Spill request's
-  // dense history a disk-only block comes back as its index alone. A
-  // spilled block comes back whole for a Resident request that would be
-  // its only holder, once no transfer moves it: no other request can read
-  // its page while its bytes land.
-  uint32_t full = 0, index = 0;
+  // Resident blocks are a rooted prefix of the chain. A disk-only block
+  // comes back as what its copy holds (KvCache::copyForm), and past a Spill
+  // request's dense history as its index alone. A spilled block comes back
+  // whole for a Resident request that would be its only holder, once no
+  // transfer moves it: no other request can read its page while its bytes
+  // land.
+  const auto restoredForm = [&](uint32_t position) {
+    return spills && position >= densePages ? kv::PageForm::Index : kv_.copyForm(chain.blocks[position]);
+  };
+  // The disk-only blocks' pages by form (kv::PageForm), and those taken.
+  std::array<uint32_t, 3> restored{};
+  std::array<std::vector<uint32_t>, 3> taken;
   std::vector<uint32_t> unspilled;
   for (uint32_t position = 0; position < chain.blocks.size(); ++position) {
     const uint32_t page = chain.pages[position];
     const uint64_t block = chain.blocks[position];
     if (page == KvCache::noPage)
-      ++(spills && position >= densePages ? index : full);
+      ++restored[static_cast<size_t>(restoredForm(position))];
     else if (!spills && pool_.form(page) == kv::PageForm::Index && !kv_.held(block) &&
              kv_.transfer(block) == KvCache::Transfer::None)
       unspilled.push_back(page);
   }
-  if ((full || index) && !tier_)
+  if (std::ranges::any_of(restored, [](uint32_t pages) { return pages != 0; }) && !tier_)
     throw std::logic_error("disk-only KV block without a disk tier");
   // All or nothing: pages one admission took go back when the next fails.
-  std::vector<uint32_t> fullPages, indexPages;
   const auto giveBack = [&] {
-    for (const std::vector<uint32_t> *pages : {&fullPages, &indexPages})
-      for (uint32_t page : *pages)
+    for (const std::vector<uint32_t> &pages : taken)
+      for (uint32_t page : pages)
         pool_.releasePage(page, false);
   };
-  if (full) {
-    if (const TokenAdmission admission = admitPages(full, fullPages); !admission.granted())
-      return admission;
-  }
-  if (index) {
-    if (const TokenAdmission admission = admitPages(index, indexPages, kv::PageForm::Index);
-        !admission.granted()) {
+  for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index}) {
+    const auto each = static_cast<size_t>(form);
+    if (!restored[each])
+      continue;
+    if (const TokenAdmission admission = admitPages(restored[each], taken[each], form); !admission.granted()) {
       giveBack();
       return admission;
     }
@@ -1313,14 +1317,15 @@ TokenAdmission Cache::restoreRequest(uint64_t requestId, const CacheLookup &look
     spilled_.unspills += unspilled.size();
   }
   kv_.retainActive(chain.blocks.back());
-  size_t nextFull = 0, nextIndex = 0;
+  std::array<size_t, 3> next{};
   for (uint32_t position = 0; position < chain.blocks.size(); ++position) {
     const uint64_t block = chain.blocks[position];
     uint32_t &page = chain.pages[position];
     if (page == KvCache::noPage) {
       // Root first, so every restored block finds its parent resident. The
       // admission's reference is the request's.
-      page = spills && position >= densePages ? indexPages[nextIndex++] : fullPages[nextFull++];
+      const auto form = static_cast<size_t>(restoredForm(position));
+      page = taken[form][next[form]++];
       kv_.adoptPage(block, page);
       startRestore(block);
     } else {
@@ -1550,10 +1555,10 @@ bool Cache::dropUnneededCopy() {
   const auto unneeded = kv_.unneededCopy();
   if (!unneeded)
     return false;
-  // A Full block's copy is redundant; a spilled or disk-only leaf's is its
-  // only K/V, and it goes with the block.
+  // The copy of a block whose page holds its K/V is redundant; a spilled or
+  // disk-only leaf's is its only K/V, and it goes with the block.
   if (const uint32_t page = kv_.page(unneeded->id);
-      page != KvCache::noPage && pool_.form(page) == kv::PageForm::Full)
+      page != KvCache::noPage && pool_.form(page) != kv::PageForm::Index)
     kv_.setSlot(unneeded->id, nullptr);
   else
     kv_.erase(unneeded->id);

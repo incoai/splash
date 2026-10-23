@@ -43,11 +43,17 @@ enum class Format : uint32_t { Int8 = 1, BFloat16 = 2 };
 // What a pool page holds. A Full page holds its K/V and, with a block index
 // (Layout::indexDimension), its blocks' index; an Index page holds only the
 // index, its K/V living in the page's tier copy, which the request's reads
-// of spilled KV serve (model::SpilledKvReads). A page's form is its extent's:
-// a Full extent holds every layer's K/V region and then the index plane, an
-// Index extent only the index plane. A layout that cannot spill
-// (Layout::spillable) has only Full pages.
-enum class PageForm : uint8_t { Full, Index };
+// of spilled KV serve (model::SpilledKvReads); a Slim page, of a layout with
+// a sliding window, holds the K/V of the layers no window bounds and the
+// index, for a page no row's window reaches any more. A page's form is its
+// extent's: an extent holds the first Layout::regions(form) of a Full
+// extent's K/V regions, in their order (Layout::region), and then the index
+// plane, so that a layer's region sits at one offset in every extent that
+// holds it. A layout that cannot spill (Layout::spillable) has no Index
+// pages, and one whose pages cannot give up a window's layers
+// (Layout::slimmable) no Slim pages. The values are a persistent cache's
+// (KvSlotLabel).
+enum class PageForm : uint8_t { Full, Index, Slim };
 
 // A page whose content goes to another page.
 struct PageCopy final {
@@ -180,6 +186,22 @@ struct Layout final {
     const auto unwindowed = attentionLayers - static_cast<uint32_t>(std::popcount(windowedLayers));
     return windowed(layer) ? unwindowed + windowedBelow : layer - windowedBelow;
   }
+  // The K/V regions a page of the form holds, the first ones of a Full
+  // page's: every layer's, those of the layers no window bounds (Slim), or
+  // none (Index).
+  [[nodiscard]] constexpr uint32_t regions(PageForm form) const noexcept {
+    switch (form) {
+    case PageForm::Full: return attentionLayers;
+    case PageForm::Slim: return attentionLayers - static_cast<uint32_t>(std::popcount(windowedLayers));
+    case PageForm::Index: return 0;
+    }
+    return 0;
+  }
+  // The pages before a row's own that hold keys a windowed layer's row
+  // reads: a row at or past a page boundary reads none before them.
+  [[nodiscard]] constexpr uint32_t windowPages() const noexcept {
+    return (windowTokens + kPageTokens - 1) / kPageTokens;
+  }
   [[nodiscard]] constexpr uint32_t elementsPerScale() const noexcept {
     return format == Format::Int8 ? headDimension : 0;
   }
@@ -212,7 +234,7 @@ struct Layout final {
   }
   // What a page of the form holds (PageForm).
   [[nodiscard]] constexpr uint64_t bytesPerModelPage(PageForm form = PageForm::Full) const noexcept {
-    return (form == PageForm::Full ? kvBytesPerModelPage() : 0) + indexBytesPerModelPage();
+    return uint64_t{regions(form)} * bytesPerLayerPage() + indexBytesPerModelPage();
   }
   // Whether a page's K/V can leave memory while its index stays (PageForm::
   // Index): the layout has a block index, which selects the blocks a row
@@ -224,6 +246,12 @@ struct Layout final {
     return indexDimension && valuesTokenMajor &&
            kPageTokens == SPLASH_ATTENTION_BLOCK_TOKENS << SPLASH_ATTENTION_LOCATION_BLOCK_BITS;
   }
+  // Whether a page can give up its windowed layers' K/V (PageForm::Slim)
+  // once no row's window reaches it: the layout has a window, and its tier
+  // slots hold a page's spans in order (kv::SlotFormat version 0), of which
+  // a Slim page's are the first; the block records of a spillable layout's
+  // slots hold every layer's.
+  [[nodiscard]] constexpr bool slimmable() const noexcept { return windowedLayers && !spillable(); }
 
   // An extent holds a whole number of these pages, so that every tensor
   // region starts 64 KiB-aligned. The INT8 scales are the tightest
