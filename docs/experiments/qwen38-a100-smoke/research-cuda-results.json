@@ -1,0 +1,57 @@
+{
+  "scope": "real-checkpoint CUDA component tests; new selector capacity is not native serving support or a trained-model improvement",
+  "source_commit": "d066629ff370d94e645bbdd6d32f73a4c8194838",
+  "anchor": 69,
+  "input_shape": [
+    1,
+    8,
+    5120
+  ],
+  "teacher_tables_loaded_without_decoder": true,
+  "component_peak_cuda_bytes": 1603638272,
+  "results": [
+    {
+      "variant": "pair_context",
+      "zero_init_matches_baseline": true,
+      "finite_gradient_update": true,
+      "frozen_baseline_preserved": true,
+      "artifact_roundtrip_exact": true,
+      "native_compatible": false,
+      "loss": 2.1415398120880127,
+      "metrics": {
+        "tokens": 7,
+        "covered": 7,
+        "correct_when_covered": 4
+      },
+      "geometry": {
+        "hidden": 5120,
+        "rank": 256,
+        "top_k": 16,
+        "vocabulary": 248320,
+        "bottleneck": 8
+      }
+    },
+    {
+      "variant": "nonlinear",
+      "zero_init_matches_baseline": true,
+      "finite_gradient_update": true,
+      "frozen_baseline_preserved": true,
+      "artifact_roundtrip_exact": true,
+      "native_compatible": false,
+      "loss": 2.1415398120880127,
+      "metrics": {
+        "tokens": 7,
+        "covered": 7,
+        "correct_when_covered": 4
+      },
+      "geometry": {
+        "hidden": 5120,
+        "rank": 256,
+        "top_k": 16,
+        "vocabulary": 248320,
+        "bottleneck": 8
+      }
+    }
+  ],
+  "status": "passed"
+}

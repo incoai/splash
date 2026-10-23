@@ -1,0 +1,134 @@
+{
+  "non_draft_inputs_identical": true,
+  "comparisons": [
+    {
+      "domain": "code",
+      "trained": "baseline",
+      "matched_contexts": 19,
+      "common_output_tokens": 225,
+      "target_output_common_prefix_equal": true,
+      "matched_retained_length_changes": 1
+    },
+    {
+      "domain": "code",
+      "trained": "qat",
+      "matched_contexts": 19,
+      "common_output_tokens": 225,
+      "target_output_common_prefix_equal": true,
+      "matched_retained_length_changes": 1
+    },
+    {
+      "domain": "code",
+      "trained": "prefix",
+      "matched_contexts": 19,
+      "common_output_tokens": 225,
+      "target_output_common_prefix_equal": true,
+      "matched_retained_length_changes": 1
+    },
+    {
+      "domain": "code",
+      "trained": "recall",
+      "matched_contexts": 19,
+      "common_output_tokens": 225,
+      "target_output_common_prefix_equal": true,
+      "matched_retained_length_changes": 1
+    },
+    {
+      "domain": "math",
+      "trained": "baseline",
+      "matched_contexts": 32,
+      "common_output_tokens": 155,
+      "target_output_common_prefix_equal": true,
+      "matched_retained_length_changes": 0
+    },
+    {
+      "domain": "math",
+      "trained": "qat",
+      "matched_contexts": 32,
+      "common_output_tokens": 155,
+      "target_output_common_prefix_equal": true,
+      "matched_retained_length_changes": 0
+    },
+    {
+      "domain": "math",
+      "trained": "prefix",
+      "matched_contexts": 32,
+      "common_output_tokens": 155,
+      "target_output_common_prefix_equal": true,
+      "matched_retained_length_changes": 0
+    },
+    {
+      "domain": "math",
+      "trained": "recall",
+      "matched_contexts": 30,
+      "common_output_tokens": 155,
+      "target_output_common_prefix_equal": true,
+      "matched_retained_length_changes": 1
+    },
+    {
+      "domain": "prose",
+      "trained": "baseline",
+      "matched_contexts": 31,
+      "common_output_tokens": 80,
+      "target_output_common_prefix_equal": true,
+      "matched_retained_length_changes": 1
+    },
+    {
+      "domain": "prose",
+      "trained": "qat",
+      "matched_contexts": 31,
+      "common_output_tokens": 80,
+      "target_output_common_prefix_equal": true,
+      "matched_retained_length_changes": 1
+    },
+    {
+      "domain": "prose",
+      "trained": "prefix",
+      "matched_contexts": 31,
+      "common_output_tokens": 80,
+      "target_output_common_prefix_equal": true,
+      "matched_retained_length_changes": 1
+    },
+    {
+      "domain": "prose",
+      "trained": "recall",
+      "matched_contexts": 32,
+      "common_output_tokens": 80,
+      "target_output_common_prefix_equal": true,
+      "matched_retained_length_changes": 0
+    },
+    {
+      "domain": "json",
+      "trained": "baseline",
+      "matched_contexts": 12,
+      "common_output_tokens": 87,
+      "target_output_common_prefix_equal": true,
+      "matched_retained_length_changes": 0
+    },
+    {
+      "domain": "json",
+      "trained": "qat",
+      "matched_contexts": 12,
+      "common_output_tokens": 87,
+      "target_output_common_prefix_equal": true,
+      "matched_retained_length_changes": 0
+    },
+    {
+      "domain": "json",
+      "trained": "prefix",
+      "matched_contexts": 12,
+      "common_output_tokens": 87,
+      "target_output_common_prefix_equal": true,
+      "matched_retained_length_changes": 0
+    },
+    {
+      "domain": "json",
+      "trained": "recall",
+      "matched_contexts": 12,
+      "common_output_tokens": 87,
+      "target_output_common_prefix_equal": true,
+      "matched_retained_length_changes": 0
+    }
+  ],
+  "scope": "four authored prompts; correlated cycles, changed block boundaries; no statistical or throughput conclusion"
+}

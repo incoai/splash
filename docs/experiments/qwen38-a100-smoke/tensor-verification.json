@@ -1,0 +1,359 @@
+{
+  "scope": "Exact payload comparison of captures and frozen BF16 export tensors",
+  "modes": {
+    "baseline": {
+      "steps": 20,
+      "finite_metrics": true,
+      "all_export_tensors_bf16": true,
+      "changed_tensors": [
+        "candidate_selector.hidden_projection.weight",
+        "candidate_selector.predecessor_codebook",
+        "candidate_selector.successor_codebook"
+      ],
+      "frozen_tensors_exact": true,
+      "frozen_selector_exact": false
+    },
+    "qat": {
+      "steps": 20,
+      "finite_metrics": true,
+      "all_export_tensors_bf16": true,
+      "changed_tensors": [
+        "candidate_selector.hidden_projection.weight",
+        "candidate_selector.predecessor_codebook",
+        "candidate_selector.successor_codebook"
+      ],
+      "frozen_tensors_exact": true,
+      "frozen_selector_exact": false
+    },
+    "prefix": {
+      "steps": 20,
+      "finite_metrics": true,
+      "all_export_tensors_bf16": true,
+      "changed_tensors": [
+        "candidate_selector.hidden_projection.weight",
+        "candidate_selector.predecessor_codebook",
+        "candidate_selector.successor_codebook"
+      ],
+      "frozen_tensors_exact": true,
+      "frozen_selector_exact": false
+    },
+    "recall": {
+      "steps": 20,
+      "finite_metrics": true,
+      "all_export_tensors_bf16": true,
+      "changed_tensors": [
+        "fc.weight",
+        "layers.4.attention_conv.base_kernel",
+        "layers.4.attention_conv.kernel_projection.weight",
+        "layers.4.mlp.down_proj.weight",
+        "layers.4.mlp.gate_proj.weight",
+        "layers.4.mlp.up_proj.weight",
+        "layers.4.mlp_conv.base_kernel",
+        "layers.4.mlp_conv.kernel_projection.weight",
+        "layers.4.self_attn.k_proj.weight",
+        "layers.4.self_attn.o_proj.weight",
+        "layers.4.self_attn.q_norm.weight",
+        "layers.4.self_attn.q_proj.weight",
+        "layers.4.self_attn.v_proj.weight",
+        "norm.weight"
+      ],
+      "frozen_tensors_exact": true,
+      "frozen_selector_exact": true
+    }
+  },
+  "all_capture_tensor_payloads_equal": true,
+  "capture_payload_hashes": {
+    "train": {
+      "000000.safetensors": {
+        "tokens": {
+          "dtype": "I64",
+          "shape": [
+            198
+          ],
+          "sha256": "6ce2dc8cbddcbb7a622b1340b57f044f6abae749f97fa617cb395edb21d70ceb"
+        },
+        "features": {
+          "dtype": "BF16",
+          "shape": [
+            198,
+            25600
+          ],
+          "sha256": "947077f3ee51eb621fc4626ec4d2828c0ee1a8f8cedc7300dc8a0125f3ca92bf"
+        },
+        "assistant_mask": {
+          "dtype": "BOOL",
+          "shape": [
+            198
+          ],
+          "sha256": "fb07f3f65b73df159d73a027f77191fc088e500885272743a98c0a2d25be9f7a"
+        }
+      },
+      "000001.safetensors": {
+        "tokens": {
+          "dtype": "I64",
+          "shape": [
+            194
+          ],
+          "sha256": "99b18e0c687eeb547a9331038513cc4cf79c6c43346b639db37c2c0945de3ef1"
+        },
+        "features": {
+          "dtype": "BF16",
+          "shape": [
+            194,
+            25600
+          ],
+          "sha256": "73c29046846b12f4f2fbbc58d28175a36b432ed7f967b80b9487099c691b10e1"
+        },
+        "assistant_mask": {
+          "dtype": "BOOL",
+          "shape": [
+            194
+          ],
+          "sha256": "d0a2375a1b122e04ecb7b6d19637e33e15ae2246f3d22691cb17bc365c666679"
+        }
+      },
+      "000002.safetensors": {
+        "tokens": {
+          "dtype": "I64",
+          "shape": [
+            198
+          ],
+          "sha256": "3613be6b08602db13a132812ca8d89e16cf1c9dd8fee0a287b7975be9725d06d"
+        },
+        "features": {
+          "dtype": "BF16",
+          "shape": [
+            198,
+            25600
+          ],
+          "sha256": "e3f81e7b9c47ce71bb501a747aa54c2416723a3a7f516e0680b39e22c03e665f"
+        },
+        "assistant_mask": {
+          "dtype": "BOOL",
+          "shape": [
+            198
+          ],
+          "sha256": "fb07f3f65b73df159d73a027f77191fc088e500885272743a98c0a2d25be9f7a"
+        }
+      },
+      "000003.safetensors": {
+        "tokens": {
+          "dtype": "I64",
+          "shape": [
+            202
+          ],
+          "sha256": "999ab7b3b570b26d6d2382112a7ed328035eb9cb6967b6f1262de572bd4d0885"
+        },
+        "features": {
+          "dtype": "BF16",
+          "shape": [
+            202,
+            25600
+          ],
+          "sha256": "410528211087930eb044319e3c7fd076909b763fd5bf38ceaa5e1695c9738a73"
+        },
+        "assistant_mask": {
+          "dtype": "BOOL",
+          "shape": [
+            202
+          ],
+          "sha256": "041bfcd5bfeb1336aa0f6051319680637b5f207ae6ed2246e6b3080872960d1c"
+        }
+      },
+      "000004.safetensors": {
+        "tokens": {
+          "dtype": "I64",
+          "shape": [
+            194
+          ],
+          "sha256": "16479782f29a8e5864f54d41c782baf7ebb4d6f2e569f9abcc232a7e9d15c5f0"
+        },
+        "features": {
+          "dtype": "BF16",
+          "shape": [
+            194,
+            25600
+          ],
+          "sha256": "02927f49e6ea876a3de2f4dd803a813f337e681c3af29b1de610d8e16b5eab7f"
+        },
+        "assistant_mask": {
+          "dtype": "BOOL",
+          "shape": [
+            194
+          ],
+          "sha256": "d0a2375a1b122e04ecb7b6d19637e33e15ae2246f3d22691cb17bc365c666679"
+        }
+      },
+      "000005.safetensors": {
+        "tokens": {
+          "dtype": "I64",
+          "shape": [
+            191
+          ],
+          "sha256": "54947e33c1cb2aad8245ee66148105b0d870f1d95b00e56108777ab1988851b4"
+        },
+        "features": {
+          "dtype": "BF16",
+          "shape": [
+            191,
+            25600
+          ],
+          "sha256": "434eb9a345158e357d5fef4c8ddd00a9ebc28892d0f081a030e2d6d3e8636642"
+        },
+        "assistant_mask": {
+          "dtype": "BOOL",
+          "shape": [
+            191
+          ],
+          "sha256": "a120c724dbddb538bf04231b76ec50bb86e4bd74d1e88fca124e9181acf99db7"
+        }
+      },
+      "000006.safetensors": {
+        "tokens": {
+          "dtype": "I64",
+          "shape": [
+            200
+          ],
+          "sha256": "2a64958417838adb7d5d37afbfa31038379882a32cbc730da7907bc637778b24"
+        },
+        "features": {
+          "dtype": "BF16",
+          "shape": [
+            200,
+            25600
+          ],
+          "sha256": "44645af0fe963fb33551e5bf783bfdc823de96192b5b9b723901d93e7ad96e47"
+        },
+        "assistant_mask": {
+          "dtype": "BOOL",
+          "shape": [
+            200
+          ],
+          "sha256": "c53e5b4eeb783e5b2a79f937bb5d6de9f33e400f845942e58d669c881baf45b4"
+        }
+      },
+      "000007.safetensors": {
+        "tokens": {
+          "dtype": "I64",
+          "shape": [
+            200
+          ],
+          "sha256": "3185b8dfbc833bf60570d048b81c0b47d7e775d61d6fadd5102de50c63cbcdd6"
+        },
+        "features": {
+          "dtype": "BF16",
+          "shape": [
+            200,
+            25600
+          ],
+          "sha256": "01a1ee29ff6a080ac6c0a763bf425cbceacf942f3c43d2a32eea4155392cd14b"
+        },
+        "assistant_mask": {
+          "dtype": "BOOL",
+          "shape": [
+            200
+          ],
+          "sha256": "c53e5b4eeb783e5b2a79f937bb5d6de9f33e400f845942e58d669c881baf45b4"
+        }
+      }
+    },
+    "validation": {
+      "000000.safetensors": {
+        "tokens": {
+          "dtype": "I64",
+          "shape": [
+            198
+          ],
+          "sha256": "f02254493751204533507604bc4e3877c6f1633859a280c701573f1151f8c9d4"
+        },
+        "features": {
+          "dtype": "BF16",
+          "shape": [
+            198,
+            25600
+          ],
+          "sha256": "41b4eec241f148aeac7046290371c4c65f5d3856d510f9ae03227c51026ce105"
+        },
+        "assistant_mask": {
+          "dtype": "BOOL",
+          "shape": [
+            198
+          ],
+          "sha256": "fb07f3f65b73df159d73a027f77191fc088e500885272743a98c0a2d25be9f7a"
+        }
+      },
+      "000001.safetensors": {
+        "tokens": {
+          "dtype": "I64",
+          "shape": [
+            196
+          ],
+          "sha256": "6840d89d705b4ad8182d7072028d58eb5b61654c7f8c6400e30ddff9d0076c4d"
+        },
+        "features": {
+          "dtype": "BF16",
+          "shape": [
+            196,
+            25600
+          ],
+          "sha256": "a5e09b127238e49324127a2fbfe0e62f1ff0292bd0736102a3baab0ff5dcbd54"
+        },
+        "assistant_mask": {
+          "dtype": "BOOL",
+          "shape": [
+            196
+          ],
+          "sha256": "8143a255211838279f5e30524d50bb79ee691000d6ca64865077271cd13ba9c7"
+        }
+      },
+      "000002.safetensors": {
+        "tokens": {
+          "dtype": "I64",
+          "shape": [
+            191
+          ],
+          "sha256": "829e11a302416dab8be5b9fa78ce219073941209dc0d953b49409c41d57a126a"
+        },
+        "features": {
+          "dtype": "BF16",
+          "shape": [
+            191,
+            25600
+          ],
+          "sha256": "be544a7d80a0b894ef730d8bfcfb748d1ad62df45d6c39bb6ad8e00827d6dd40"
+        },
+        "assistant_mask": {
+          "dtype": "BOOL",
+          "shape": [
+            191
+          ],
+          "sha256": "a120c724dbddb538bf04231b76ec50bb86e4bd74d1e88fca124e9181acf99db7"
+        }
+      },
+      "000003.safetensors": {
+        "tokens": {
+          "dtype": "I64",
+          "shape": [
+            188
+          ],
+          "sha256": "b2abc6596688e52621be196d16172e2b32398eb3af337d5c4f3caf99d5c96dea"
+        },
+        "features": {
+          "dtype": "BF16",
+          "shape": [
+            188,
+            25600
+          ],
+          "sha256": "30da99ec3b3e1cd699fa788898f6bd87fdb10680200c4e5ffd241712788db335"
+        },
+        "assistant_mask": {
+          "dtype": "BOOL",
+          "shape": [
+            188
+          ],
+          "sha256": "fad4a3fcc434f93e2498527cae4c2ca89cc7ab4ac5997f9f3649ba241b87f6a4"
+        }
+      }
+    }
+  }
+}

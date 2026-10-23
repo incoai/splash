@@ -12,6 +12,19 @@ while [ -L "$script" ]; do
 done
 ROOT=$(CDPATH= cd -P -- "$(dirname -- "$script")" && pwd -P)
 
+# Training has its own optional dependencies; prefer its explicitly selected
+# interpreter or activated environment without changing normal serving setup.
+if [ "${1:-}" = train-draft ]; then
+    training_python=${SPLASH_TRAINING_PYTHON:-${VIRTUAL_ENV:+$VIRTUAL_ENV/bin/python}}
+    if [ -n "$training_python" ]; then
+        if [ -x "$training_python" ] && "$training_python" -c 'import sys; raise SystemExit(not ((3, 12) <= sys.version_info[:2] < (3, 15)))'; then
+            exec "$training_python" -u "$ROOT/install/launcher.py" "$@"
+        fi
+        echo "Training needs an executable Python 3.12, 3.13, or 3.14: $training_python" >&2
+        exit 1
+    fi
+fi
+
 for python in "$ROOT/.venv/bin/python" python3.13 python3 python3.12 python3.14; do
     if (test -x "$python" 2>/dev/null || command -v "$python" >/dev/null 2>&1) \
         && "$python" -c 'import sys; raise SystemExit(not ((3, 12) <= sys.version_info[:2] < (3, 15)))' \
