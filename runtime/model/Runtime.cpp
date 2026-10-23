@@ -115,8 +115,7 @@ private:
 using kv::ChunkedPrefillParams;
 
 bool isStopToken(const RuntimeGeometry &geometry, uint32_t token) noexcept {
-  return token == geometry.target.stopTokens[0] ||
-         token == geometry.target.stopTokens[1];
+  return geometry.target.stopTokens.contains(token);
 }
 
 void requireShared(const MetalBuffer &buffer, std::string_view label) {
@@ -476,14 +475,12 @@ struct Runtime::Impl {
     const ops::PenaltyTable penalties{penaltyTable, stateLanes};
     CommandGraph graph;
     sampling.addInitial(graph, policies, samplingBuffers(2), 0,
-                        geometry.target.stopTokens[0],
-                        geometry.target.stopTokens[1], penalties);
+                        geometry.target.stopTokens, penalties);
     sampling.addThinkingDrafts(
         graph, policies,
         decodeArena->batchSlice(DecodeTensor::ProposedTokens, 2));
     sampling.addVerify(graph, policies, samplingBuffers(2),
-                       geometry.target.stopTokens[0],
-                       geometry.target.stopTokens[1], penalties);
+                       geometry.target.stopTokens, penalties);
     backend.preparePipelines(graph.dispatches());
   }
 
@@ -1267,8 +1264,7 @@ struct Runtime::Impl {
 #endif
     sampling.addInitial(graph, std::span(policies).first(width),
                         samplingBuffers(width), 0,
-                        geometry.target.stopTokens[0],
-                        geometry.target.stopTokens[1],
+                        geometry.target.stopTokens,
                         {penaltyTable, std::span(stateLanes).first(width)});
   }
 
@@ -2063,8 +2059,7 @@ struct Runtime::Impl {
     encodeTargetLogitsCapture(graph, lanes, kDecodeRows);
 #endif
     sampling.addVerify(graph, std::span(policies).first(lanes),
-                       samplingBuffers(lanes), geometry.target.stopTokens[0],
-                       geometry.target.stopTokens[1],
+                       samplingBuffers(lanes), geometry.target.stopTokens,
                        {penaltyTable, std::span(stateLanes).first(lanes)});
   }
 
@@ -2126,7 +2121,7 @@ struct Runtime::Impl {
          decodeArena->batchSlice(DecodeTensor::AcceptedCount, width),
          decodeArena->batchSlice(DecodeTensor::VerifyRows, width)},
         maximumRetained, std::span(policies).first(width),
-        geometry.target.stopTokens[0], geometry.target.stopTokens[1]);
+        geometry.target.stopTokens);
   }
 
   // The target's commit after acceptance (QwenTarget::addStateCommit): each

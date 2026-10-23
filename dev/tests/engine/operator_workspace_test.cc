@@ -7,6 +7,7 @@
 #include "ops/Sampling.hpp"
 
 #include <algorithm>
+#include <array>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -171,6 +172,19 @@ void sampling() {
   rejects([] { (void)DraftSelector::workspace(0); },
           "invalid draft selector workspace position count",
           "a draft selector workspace of no positions was sized");
+  // A family's stop tokens fill the places the kernels compare, those past
+  // its list with SPLASH_NO_TOKEN, which is no stop token.
+  using splash::ops::StopTokens;
+  constexpr StopTokens two{248044, 248046};
+  static_assert(std::ranges::equal(two.ids, std::array{248044U, 248046U, SPLASH_NO_TOKEN, SPLASH_NO_TOKEN}) &&
+                std::ranges::equal(two.tokens(), std::array{248044U, 248046U}) && two.contains(248046) &&
+                !two.contains(SPLASH_NO_TOKEN) && StopTokens{}.tokens().empty());
+  constexpr StopTokens four{150001, 150003, 150005, 150018};
+  static_assert(four.tokens().size() == SPLASH_STOP_TOKENS && four.contains(150018) && !four.contains(150002));
+  rejects([] { (void)StopTokens{1, 2, 3, 4, 5}; }, "more stop tokens than the sampling kernels compare",
+          "five stop tokens were taken");
+  rejects([] { (void)StopTokens{1, SPLASH_NO_TOKEN}; }, "SPLASH_NO_TOKEN",
+          "SPLASH_NO_TOKEN was taken as a stop token");
 }
 
 } // namespace
