@@ -1463,7 +1463,12 @@ class AnthropicHTTPContractTest(HarnessTestCase):
         self.assertEqual(message["stop_reason"], "end_turn")
         self.assertEqual(
             message["usage"],
-            {"input_tokens": 1, "cache_read_input_tokens": 1, "output_tokens": 1},
+            {
+                "input_tokens": 1,
+                "cache_read_input_tokens": 1,
+                "output_tokens": 1,
+                "output_tokens_details": {"thinking_tokens": 0},
+            },
         )
 
         # Standard Anthropic query parameters do not change endpoint routing.
@@ -1784,12 +1789,46 @@ class AnthropicHTTPContractTest(HarnessTestCase):
                             "input_tokens": 2 - matched_tokens,
                             "cache_read_input_tokens": matched_tokens,
                             "output_tokens": 2,
+                            "output_tokens_details": {"thinking_tokens": 0},
                         },
                     )
                     self.assertEqual(finish["stop_reason"], "stop_sequence")
                     self.assertEqual(finish["stop_sequence"], "second")
                     self.assertEqual(content, "first ")
                     self.assertEqual(runtime.cancel_count, 1)
+
+    def test_usage_reports_the_tokens_spent_thinking(self):
+        # The same output as Chat, whose reasoning_tokens count them too.
+        runtime = FakeRuntime(*(Plan([[1, 2, 3]]) for _ in range(3)))
+        harness = self.harness(runtime)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/chat/completions",
+            {"model": "test-model", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        self.assertEqual(status, 200, payload)
+        expected = json.loads(payload)["usage"]["completion_tokens_details"][
+            "reasoning_tokens"
+        ]
+        self.assertGreater(expected, 0)
+        thinking = {"thinking": {"type": "adaptive"}}
+        status, _, payload = harness.request(
+            "POST", "/v1/messages", anthropic_body(**thinking)
+        )
+        self.assertEqual(status, 200, payload)
+        usage = json.loads(payload)["usage"]
+        self.assertEqual(usage["output_tokens_details"], {"thinking_tokens": expected})
+        status, _, payload = harness.request(
+            "POST", "/v1/messages", anthropic_body(stream=True, **thinking)
+        )
+        self.assertEqual(status, 200, payload)
+        events = response_events(payload)
+        delta = next(event for event in events if event["type"] == "message_delta")
+        self.assertEqual(
+            delta["usage"]["output_tokens_details"], {"thinking_tokens": expected}
+        )
+        # message_start reports no output yet, and no breakdown of it.
+        self.assertNotIn("output_tokens_details", events[0]["message"]["usage"])
 
 
 if __name__ == "__main__":
