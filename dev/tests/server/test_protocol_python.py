@@ -143,6 +143,20 @@ def engine_events():
         "done_bounded": p.DoneEvent(
             91, p.FinishReason.LENGTH, 4096, 63, 1000, 2000, 3500, (), bounded=True
         ),
+        "done_scored_readout": p.DoneEvent(
+            91,
+            p.FinishReason.STOP,
+            4096,
+            0,
+            1000,
+            0,
+            3500,
+            (1.5, -2.25),
+            16,
+            log_normalizer=12.75,
+            top_token_ids=(7, 3, 11),
+            top_logits=(9.5, 9.25, -1.0),
+        ),
         "error_request": p.ErrorEvent(
             p.FailureClass.REQUEST_ERROR,
             91,

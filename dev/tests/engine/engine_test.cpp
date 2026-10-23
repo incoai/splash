@@ -61,7 +61,8 @@ public:
   }
   void completed(uint64_t id, EngineFinishReason, bool bounded, uint32_t prompt,
                  uint32_t completion, uint32_t deduplicated,
-                 std::span<const float>, const SpeculativeCounts &speculation) override {
+                 std::span<const float>, const SpeculativeCounts &speculation,
+                 const ScoreReadout &) override {
     ++completedCount;
     if (bounded)
       boundedIds.push_back(id);
