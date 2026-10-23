@@ -81,19 +81,28 @@ class UpstreamTest(unittest.TestCase):
                     ),
                     family,
                 )
-        # Qwen3.8-Flash-Next loads from a GGUF: the config and metadata the
-        # installer derives from it name it, with and without its draft, and
+        # Qwen3.8-Flash-Next and Flint load from a GGUF: the config and
+        # metadata the installer derives from it name the family, with and
+        # without its draft (Flint's flat config, its release's keys, and a
+        # test draft naming one of its reserved tokens as its mask), and
         # another family's draft is refused.
+        for family in GGUF_ONLY:
+            configs = CONFIGS / family.name.lower()
+            gguf_check = {"gguf_metadata": configs / "gguf-metadata.json"}
+            for arguments in ({}, {"draft": configs / "draft" / "config.json"}):
+                self.assertIs(
+                    upstream.check_model(
+                        "gguf",
+                        "none",
+                        configs / "config.json",
+                        **gguf_check,
+                        **arguments,
+                    ),
+                    family,
+                )
         flash = families.named("Qwen3.8-Flash-Next")
         configs = CONFIGS / flash.name.lower()
         gguf_check = {"gguf_metadata": configs / "gguf-metadata.json"}
-        for arguments in ({}, {"draft": configs / "draft" / "config.json"}):
-            self.assertIs(
-                upstream.check_model(
-                    "gguf", "none", configs / "config.json", **gguf_check, **arguments
-                ),
-                flash,
-            )
         with self.assertRaisesRegex(
             models.ModelError, "draft config hidden_size mismatch: checkpoint 5120"
         ):
