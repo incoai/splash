@@ -61,10 +61,17 @@ class FakeServer:
     """Answers smoke_real.request like a text-only or vision server; records
     each request."""
 
-    def __init__(self, modalities=VISION, later_system="native", prompt=IN_PLACE):
+    def __init__(
+        self,
+        modalities=VISION,
+        later_system="native",
+        prompt=IN_PLACE,
+        reasoning_switch=True,
+    ):
         self.modalities = modalities
         self.later_system = later_system
         self.prompt = prompt
+        self.reasoning_switch = reasoning_switch
         self.requests = {"submitted": 3, "cancelled": 0, "failed": 0}
         self.calls = []
         self.refuse = True
@@ -73,6 +80,7 @@ class FakeServer:
         return {
             "vision": "image" in self.modalities,
             "input_modalities": self.modalities,
+            "reasoning_switch": self.reasoning_switch,
             "chat_template": {"later_system": self.later_system},
             "requests": dict(self.requests),
             "cache": {"reused_tokens": 0},
@@ -361,13 +369,17 @@ class SmokeRealTests(unittest.TestCase):
                 with self.assertRaisesRegex(smoke_real.SmokeFailure, "lock"):
                     smoke_real.require_closed_cache(Path(temporary))
 
-    def run_persistent_cache(self, changes=()):
-        """Runs the scenario against scripted servers, each change (read,
+    def run_persistent_cache(self, changes=(), switch=True):
+        """Runs the scenario against scripted servers of a model whose
+        reasoning a request's effort switches or not, each change (read,
         section, key, value) setting a key of one status read. Returns the
         bodies both turns sent, the directory each start was given and the
         closed-cache check."""
         statuses = [
-            {"disk": {"persistent": True, "taken_back": {"states": 0}}},
+            {
+                "disk": {"persistent": True, "taken_back": {"states": 0}},
+                "reasoning_switch": switch,
+            },
             {"disk": {"write_behind": {"waiting": 1, "durable": 0}}},
             {
                 "disk": {
@@ -417,6 +429,13 @@ class SmokeRealTests(unittest.TestCase):
         turns, starts, closed = self.run_persistent_cache()
         self.assertEqual(starts, [starts[0]] * 2)
         self.assertEqual(closed.call_args_list, [mock.call(starts[0])] * 2)
+        self.assertEqual([turn["max_completion_tokens"] for turn in turns], [32] * 2)
+        # A model that reasons whatever a request asks has room to answer.
+        turns, _, _ = self.run_persistent_cache(switch=False)
+        self.assertEqual(
+            [turn["max_completion_tokens"] for turn in turns],
+            [32 + smoke_real.REASONING_ROOM] * 2,
+        )
         first, second = (turn["messages"] for turn in turns)
         self.assertEqual(second[:1], first)
         self.assertEqual(
@@ -777,6 +796,170 @@ class SmokeRealTests(unittest.TestCase):
                     any(path == "/apply-template" for _, path, _ in server.calls),
                     later_system != "unsupported",
                 )
+
+    def test_a_model_that_reasons_by_itself_has_room_to_answer(self):
+        # Where a request's effort leaves the model reasoning, each request
+        # whose answer is checked has room for its reasoning, the JSON asked
+        # for is named, the inline instruction may show in the reasoning and
+        # no thinking budget is checked, which caps nothing for such a model;
+        # where the effort turns reasoning off, the requests and checks are
+        # the ones a model without reasoning takes.
+        stream = (
+            200,
+            "text/event-stream",
+            b'data: {"choices":[{"delta":{"content":"hi"}}]}\n'
+            b'data: {"choices":[],"usage":{"completion_tokens":1}}\n'
+            b"data: [DONE]\n",
+        )
+        answered = [{"type": "text", "text": "PONG"}]
+        weighed = [
+            {"type": "thinking", "thinking": "Reply with only PONG?", "signature": "s"},
+            {"type": "text", "text": "Ready."},
+        ]
+        for switch, blocks, passes in (
+            (True, answered, True),
+            (True, weighed, False),
+            (False, answered, True),
+            (False, weighed, True),
+        ):
+            with self.subTest(switch=switch, blocks=blocks):
+                server = FakeServer(["text"], reasoning_switch=switch)
+                limits, prompts = {}, {}
+
+                def answer(
+                    port, method, path, body=None, server=server, blocks=blocks, **_
+                ):
+                    if body and body.get("tools"):
+                        limits["tool"] = body["max_completion_tokens"]
+                        arguments = json.dumps({"value": "ok"})
+                        call = {
+                            "function": {"name": "record_probe", "arguments": arguments}
+                        }
+                        return 200, {"choices": [{"message": {"tool_calls": [call]}}]}
+                    if body and body.get("response_format"):
+                        limits["json"] = body["max_completion_tokens"]
+                        prompts["json"] = body["messages"][0]["content"]
+                        content = '{"result": "ok"}'
+                        return 200, {"choices": [{"message": {"content": content}}]}
+                    if path == "/v1/responses":
+                        return 200, {"object": "response"}
+                    if path == "/v1/messages":
+                        limits["messages"] = body["max_tokens"]
+                        return 200, {"type": "message", "content": blocks}
+                    return server(port, method, path, body)
+
+                def stream_request(port, path, body):
+                    limits["stream"] = body["max_completion_tokens"]
+                    return stream
+
+                with (
+                    mock.patch.object(smoke_real, "request", answer),
+                    mock.patch.object(smoke_real, "stream_request", stream_request),
+                    mock.patch.object(smoke_real, "run_text_only"),
+                    mock.patch.object(
+                        smoke_real, "run_protocol_extensions"
+                    ) as extensions,
+                    mock.patch.object(smoke_real, "run_judgments"),
+                    mock.patch.object(smoke_real, "run_sampling") as sampling,
+                    mock.patch.object(
+                        smoke_real, "run_thinking_budget_under_grammar"
+                    ) as thinking_budget,
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    if not passes:
+                        with self.assertRaisesRegex(
+                            smoke_real.SmokeFailure, "instruction was not followed"
+                        ):
+                            smoke_real.run(8000, "test-model")
+                        continue
+                    smoke_real.run(8000, "test-model")
+                room = 0 if switch else smoke_real.REASONING_ROOM
+                self.assertEqual(
+                    limits,
+                    {
+                        "stream": 32 + room,
+                        "tool": 96 + room,
+                        "json": 64 + room,
+                        "messages": 32 + room,
+                    },
+                )
+                self.assertEqual(
+                    prompts["json"].startswith("Return the required JSON for request"),
+                    switch,
+                )
+                if not switch:
+                    self.assertTrue(
+                        prompts["json"].startswith('Return {"result": "ok"}')
+                    )
+                self.assertEqual(thinking_budget.called, switch)
+                self.assertEqual(sampling.call_args.args[2], switch)
+                self.assertEqual(extensions.call_args.args[3], switch)
+
+    def test_hidden_thinking_may_be_absent_only_where_the_model_decides(self):
+        def serve(blocks, limits):
+            def answer(port, method, path, body=None, **_kwargs):
+                if path.startswith("/v1/messages/count_tokens"):
+                    return 200, {"input_tokens": 9}
+                if path == "/v1/responses":
+                    return 200, {"object": "response"}
+                if body.get("tools"):
+                    limits["call"] = body["max_tokens"]
+                    call = {"function": {"name": "lookup", "arguments": "{}"}}
+                    return 200, {"choices": [{"message": {"tool_calls": [call]}}]}
+                if path == "/v1/chat/completions":
+                    return 200, {"choices": [{"message": {"content": "4"}}]}
+                if body["thinking"]["type"] == "adaptive":
+                    return 200, {"content": blocks}
+                if "format" in body.get("output_config", {}):
+                    limits["json"] = body["max_tokens"]
+                    text = '{"answer": "yes"}'
+                    return 200, {"content": [{"type": "text", "text": text}]}
+                if "context_management" in body:
+                    limits["continuation"] = body["max_tokens"]
+                return 200, {
+                    "content": [{"type": "text", "text": "4"}],
+                    "usage": {"input_tokens": 9},
+                }
+
+            return answer
+
+        hidden = {"type": "thinking", "thinking": "", "signature": "s"}
+        leaked = {"type": "thinking", "thinking": "Four.", "signature": "s"}
+        for blocks, switch, passes in (
+            ([hidden], True, True),
+            ([], True, False),
+            ([leaked], True, False),
+            ([hidden], False, True),
+            ([], False, True),
+            ([leaked], False, False),
+        ):
+            with self.subTest(blocks=blocks, switch=switch):
+                limits = {}
+                with (
+                    mock.patch.object(smoke_real, "request", serve(blocks, limits)),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    if passes:
+                        smoke_real.run_protocol_extensions(
+                            8000, "test-model", False, switch
+                        )
+                    else:
+                        with self.assertRaisesRegex(
+                            smoke_real.SmokeFailure, "hidden thinking"
+                        ):
+                            smoke_real.run_protocol_extensions(
+                                8000, "test-model", False, switch
+                            )
+                if passes:
+                    room = 0 if switch else smoke_real.REASONING_ROOM
+                    self.assertEqual(
+                        limits,
+                        {
+                            "json": 64 + room,
+                            "call": 64 + room,
+                            "continuation": 32 + room,
+                        },
+                    )
 
     def test_sampling_requires_repeats_the_tool_call_and_the_whole_budget(self):
         def serve(

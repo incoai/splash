@@ -323,6 +323,7 @@ class Frontend:
         status = self.backend.status()
         status["vision"] = self.vision
         status["input_modalities"] = self.input_modalities
+        status["reasoning_switch"] = self.chat_format.reasoning_switch
         status["chat_template"] = self.chat_templates.status()
         with self.preparation_lock:
             status["frontend"] = {

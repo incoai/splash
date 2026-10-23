@@ -223,6 +223,27 @@ def chat_body(model: str, prompt: str, **extra) -> dict:
     return body
 
 
+# The tokens a model that decides itself whether to reason (/status
+# reasoning_switch false) may think before it answers, which no reasoning
+# effort or disabled thinking spares a request.
+REASONING_ROOM = 2048
+
+
+def reasoning_switch(status: dict) -> bool:
+    """Whether a request's effort turns the served model's reasoning on and
+    off, as its /status reports it."""
+    switch = status.get("reasoning_switch")
+    require(isinstance(switch, bool), f"/status lacks reasoning_switch: {switch!r}")
+    return switch
+
+
+def output_limit(tokens: int, switch: bool) -> int:
+    """The output limit of a request whose answer of up to tokens is checked:
+    those alone where the request turns reasoning off (switch), and room for
+    the reasoning before them where the model reasons whatever it asks."""
+    return tokens if switch else tokens + REASONING_ROOM
+
+
 def image_data_url(kind: str) -> str:
     """Synthetic 256x256 PNGs: solid red, solid blue, or red-left/blue-right."""
     from PIL import Image
@@ -717,6 +738,7 @@ PROBE_TOOL = {
 def run(port: int, model: str) -> None:
     nonce = uuid.uuid4().hex
     modalities = input_modalities(port, model)
+    switch = reasoning_switch(runtime_status(port))
 
     code, chat = request(
         port,
@@ -736,6 +758,7 @@ def run(port: int, model: str) -> None:
             f"Reply with one short word. Streaming request {nonce}.",
             stream=True,
             stream_options={"include_usage": True},
+            max_completion_tokens=output_limit(32, switch),
         ),
     )
     require(code == 200, f"streaming Chat failed with HTTP {code}")
@@ -769,7 +792,7 @@ def run(port: int, model: str) -> None:
             f"Call record_probe for request {nonce}.",
             tools=[PROBE_TOOL],
             tool_choice={"type": "function", "function": {"name": "record_probe"}},
-            max_completion_tokens=96,
+            max_completion_tokens=output_limit(96, switch),
         ),
     )
     calls = (
@@ -789,14 +812,22 @@ def run(port: int, model: str) -> None:
         "required": ["result"],
         "additionalProperties": False,
     }
+    # The grammar alone writes the JSON a model that does not reason is asked
+    # for; one that reasons first is told what it is, or it reasons on about
+    # what the request may require.
+    prompt = (
+        f"Return the required JSON for request {nonce}."
+        if switch
+        else f'Return {{"result": "ok"}} as JSON for request {nonce}.'
+    )
     code, structured = request(
         port,
         "POST",
         "/v1/chat/completions",
         chat_body(
             model,
-            f"Return the required JSON for request {nonce}.",
-            max_completion_tokens=64,
+            prompt,
+            max_completion_tokens=output_limit(64, switch),
             response_format={
                 "type": "json_schema",
                 "json_schema": {"name": "probe", "strict": True, "schema": schema},
@@ -806,7 +837,15 @@ def run(port: int, model: str) -> None:
     content = structured.get("choices", [{}])[0].get("message", {}).get("content")
     require(code == 200 and json.loads(content) == {"result": "ok"}, "JSON failed")
     print("structured output: PASS", flush=True)
-    run_thinking_budget_under_grammar(port, model, schema)
+    if switch:
+        run_thinking_budget_under_grammar(port, model, schema)
+    else:
+        # A budget caps only thinking the generation prompt opened.
+        print(
+            "thinking budget under a grammar: skipped, the model opens its "
+            "reasoning itself",
+            flush=True,
+        )
 
     code, responses = request(
         port,
@@ -843,7 +882,7 @@ def run(port: int, model: str) -> None:
                 {"role": "system", "content": "Reply with only PONG."},
                 {"role": "user", "content": "Go."},
             ],
-            "max_tokens": 32,
+            "max_tokens": output_limit(32, switch),
             "temperature": 0,
             "thinking": {"type": "disabled"},
         },
@@ -851,10 +890,14 @@ def run(port: int, model: str) -> None:
     if later_system in LATER_SYSTEM_IN_PLACE:
         require(code == 200 and anthropic.get("type") == "message", "Messages failed")
         require(isinstance(anthropic.get("content"), list), "Messages content missing")
-        require(
-            "PONG" in "".join(block.get("text", "") for block in anthropic["content"]),
-            "Messages inline system instruction was not followed",
+        # A model that reasons whatever a request asks shows that the
+        # instruction reached it in its reasoning too, where it may weigh it
+        # instead of following it.
+        read = "".join(
+            block.get("text", "") + ("" if switch else block.get("thinking", ""))
+            for block in anthropic["content"]
         )
+        require("PONG" in read, "Messages inline system instruction was not followed")
     else:
         require(
             code == 400 and LATER_SYSTEM_UNSUPPORTED in error_message(anthropic),
@@ -862,13 +905,13 @@ def run(port: int, model: str) -> None:
         )
     print("anthropic messages: PASS", flush=True)
 
-    run_sampling(port, model)
+    run_sampling(port, model, switch)
     vision = "image" in modalities
     if vision:
         run_images(port, model, nonce)
     else:
         run_text_only(port, model, nonce)
-    run_protocol_extensions(port, model, vision)
+    run_protocol_extensions(port, model, vision, switch)
     run_judgments(port, model, nonce)
 
 
@@ -936,7 +979,7 @@ def run_thinking_budget_under_grammar(port: int, model: str, schema: dict) -> No
     )
 
 
-def run_sampling(port: int, model: str) -> None:
+def run_sampling(port: int, model: str, switch: bool = True) -> None:
     """The sampling penalties, top_k and min_p on the real model: a penalized
     greedy request repeats itself exactly once its prompt is cached (the first
     run chunks the prompt differently), a sampled request whose min_p of 1
@@ -1029,7 +1072,7 @@ def run_sampling(port: int, model: str) -> None:
             tool_choice={"type": "function", "function": {"name": "record_probe"}},
             repetition_penalty=1.1,
             presence_penalty=0.5,
-            max_completion_tokens=96,
+            max_completion_tokens=output_limit(96, switch),
         ),
         "ignore_eos": chat_body(model, prompt, ignore_eos=True),
     }
@@ -1065,7 +1108,9 @@ def run_sampling(port: int, model: str) -> None:
     )
 
 
-def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
+def run_protocol_extensions(
+    port: int, model: str, vision: bool = True, switch: bool = True
+) -> None:
     messages = [{"role": "user", "content": "What is 2 + 2? Answer briefly."}]
     for suffix in ("", "?beta=true"):
         code, count = request(
@@ -1092,8 +1137,10 @@ def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
     )
     require(code == 200, f"hidden thinking failed: {hidden!r}")
     blocks = [b for b in hidden["content"] if b["type"] == "thinking"]
+    # A model that decides itself whether to reason may answer at once.
     require(
-        blocks and all(b["thinking"] == "" and b.get("signature") for b in blocks),
+        (blocks or not switch)
+        and all(b["thinking"] == "" and b.get("signature") for b in blocks),
         "hidden thinking leaked text or omitted its continuation signature",
     )
     code, count = request(
@@ -1126,7 +1173,7 @@ def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
         {
             "model": model,
             "messages": [{"role": "user", "content": "Answer yes in JSON."}],
-            "max_tokens": 64,
+            "max_tokens": output_limit(64, switch),
             "thinking": {"type": "disabled"},
             "output_config": {"format": {"type": "json_schema", "schema": schema}},
         },
@@ -1181,7 +1228,7 @@ def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
         "/v1/chat/completions",
         {
             "model": model,
-            "max_tokens": 64,
+            "max_tokens": output_limit(64, switch),
             "reasoning_effort": "none",
             "messages": [{"role": "user", "content": "Call lookup."}],
             "tool_choice": "required",
@@ -1236,7 +1283,7 @@ def run_protocol_extensions(port: int, model: str, vision: bool = True) -> None:
         "/v1/messages",
         {
             "model": model,
-            "max_tokens": 32,
+            "max_tokens": output_limit(32, switch),
             "thinking": {"type": "disabled"},
             "context_management": {
                 "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]
@@ -1647,10 +1694,14 @@ def run_persistent_cache(arguments) -> None:
     with tempfile.TemporaryDirectory(prefix="splash-persistent-cache-") as directory:
         root = Path(directory)
         with serving(arguments, cache_dir=root) as server:
-            disk = runtime_status(server.port)["disk"]
+            status = runtime_status(server.port)
+            disk = status["disk"]
             require(
                 disk["persistent"] and disk["taken_back"]["states"] == 0,
                 f"a fresh persistent cache started with {disk!r}",
+            )
+            conversation["max_completion_tokens"] = output_limit(
+                32, reasoning_switch(status)
             )
             code, answer = request(
                 server.port, "POST", "/v1/chat/completions", conversation, timeout=300

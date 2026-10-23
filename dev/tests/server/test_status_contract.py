@@ -10,6 +10,7 @@ from pathlib import Path
 from dev.tests import native_peer
 from dev.tests.server_fixtures import FakeRuntime, HarnessTestCase
 from server import protocol as wire
+from server.chat_format import FLINT, QWEN
 from server.metrics import PROMETHEUS_SERIES, prometheus_metrics
 
 # A representative status document, every section of it set, which
@@ -298,6 +299,16 @@ class StatusRouteTests(HarnessTestCase):
                         "GET", f"/v1/models/{model['id']}"
                     )
                     self.assertEqual((status, json.loads(detail)), (200, model))
+
+    def test_status_reports_whether_requests_switch_the_reasoning(self):
+        # A Qwen request's effort opens the think block or leaves it out;
+        # Flint's model decides each turn.
+        for chat_format, switch in ((QWEN, True), (FLINT, False)):
+            with self.subTest(switch=switch):
+                harness = self.harness(FakeRuntime(), chat_format=chat_format)
+                status, _, payload = harness.request("GET", "/status")
+                self.assertEqual(status, 200)
+                self.assertIs(json.loads(payload)["reasoning_switch"], switch)
 
 
 if __name__ == "__main__":

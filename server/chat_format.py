@@ -133,6 +133,15 @@ class ChatFormat:
         return tuple(token for _text, token in self.stop_tokens)
 
     @property
+    def reasoning_switch(self):
+        """Whether a request turns the model's reasoning on and off: its
+        reasoning effort or enable_thinking opens the think block in the
+        generation prompt, or leaves it out. A model that opens its reasoning
+        itself decides each turn whether to reason, whatever the request
+        says."""
+        return self.think_start_id is None
+
+    @property
     def calls_end_reasoning(self):
         """Whether a call's opening also ends the reasoning where a call may
         follow. A Qwen model may call a tool in the think block its
