@@ -7,6 +7,7 @@
 #include "ops/Embedding.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/PageStorage.hpp"
+#include "ops/ResidualSteer.hpp"
 #include "ops/RowCopy.hpp"
 
 #include <algorithm>
@@ -368,6 +369,16 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mi
 
 namespace {
 
+// The control vector after layer `index`, where it steers it: on the
+// residual rows the layer's FFN has just written, before the draft's
+// capture, so the DFlash2 draft reads the outputs the target runs on.
+void addResidualSteer(metal::CommandGraph &graph, const std::optional<ControlVector> &vector,
+                      metal::MetalBuffer residual, uint32_t index, uint32_t hiddenSize, uint32_t rows) {
+  if (!vector || !vector->steers(index)) return;
+  ops::addResidualSteer(graph, std::move(residual), vector->directions,
+                        {index, vector->mode == ControlVectorMode::Project, vector->scale}, hiddenSize, rows);
+}
+
 // Copies `rows` rows of a capture layer's output, from row `sourceRow`, into
 // capture slot `slot` of the captured hidden rows from row `destinationRow`.
 void addCapture(metal::CommandGraph &graph, const QwenTargetGeometry &geometry, uint32_t slot,
@@ -428,6 +439,7 @@ public:
           },
           layer.mixer);
       addVerifyFfn(step, layer, residual, output);
+      addResidualSteer(step.graph, weights_.controlVector, output, index, geometry_.hiddenSize, step.rows);
       if (const auto slot = geometry_.captureSlot(index))
         addCapture(step.graph, geometry_, *slot, output, 0, buffers.capturedTargetHidden, 0, step.rows);
     }
@@ -471,6 +483,8 @@ private:
   void addPrefillExperts(PrefillStep &step, uint32_t index) const {
     const QwenTargetPrefillBuffers &b = step.buffers;
     if (const ops::BlockMoeWeights *ffn = moe(index)) ops::MoE::addRouted(step.graph, step.ffn, *ffn, *step.moe);
+    addResidualSteer(step.graph, weights_.controlVector, b.hidden[(index & 1) ^ 1], index, geometry_.hiddenSize,
+                     step.rows);
     forEachPrefillCapture(step, index, [&](uint32_t slot, uint32_t source, uint32_t destination, uint32_t rows) {
       addCapture(step.graph, geometry_, slot, b.hidden[(index & 1) ^ 1], source, b.captured, destination, rows);
     });

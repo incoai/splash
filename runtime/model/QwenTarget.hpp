@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ControlVector.hpp"
 #include "Model.hpp"
 #include "QwenHybridLayout.hpp"
 #include "RopeScaling.hpp"
@@ -78,6 +79,12 @@ struct QwenTargetWeightsBase {
   std::string manifestFingerprintSha256;
   std::shared_ptr<ExpertStore> experts;
   std::shared_ptr<SparseRowStore> streamedTable;
+  // The control vector on the target's residual after each steered layer's
+  // FFN (--control-vector, model/ControlVector.hpp), if any; a target whose
+  // GGUF inputs a Prism rotation rotated cannot run one, its residual not
+  // the vector's space.
+  std::optional<ControlVector> controlVector;
+  bool inputsRotated = false;
 };
 
 // The weights of a Qwen3.5-architecture target of Layout, whose layers the

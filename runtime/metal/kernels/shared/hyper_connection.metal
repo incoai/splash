@@ -287,3 +287,34 @@ kernel void hyper_connection_stream_mean(device const float *streams [[buffer(0)
   for (uint s = 0; s < p.streams; ++s) sum += x[s * p.hidden];
   destination[ulong(p.row + row) * p.stride + p.column + d] = bfloat(sum / float(p.streams));
 }
+
+// A control vector after a steered layer (HyperSteerParams): a threadgroup per
+// stream of a row. A projection sums the stream's dot with the direction in
+// fp32 over the threadgroup, then takes scale times it along the direction
+// off every value; an addition adds the scaled direction.
+kernel void hyper_connection_steer(device float *streams [[buffer(0)]],
+                                   device const float *directions [[buffer(1)]],
+                                   constant HyperSteerParams &p [[buffer(2)]],
+                                   uint2 group [[threadgroup_position_in_grid]],
+                                   uint tid [[thread_index_in_threadgroup]],
+                                   uint lane [[thread_index_in_simdgroup]],
+                                   uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float partial[kSimdgroups];
+  const uint row = group.x, stream = group.y;
+  if (row >= p.rows || stream >= p.streams) return;
+  device float *x = streams + (ulong(row) * p.streams + stream) * p.hidden;
+  device const float *v = directions + ulong(p.layer) * p.hidden;
+  if (p.mode == HYPER_CONNECTION_STEER_ADD) {
+    for (uint d = tid; d < p.hidden; d += kRowThreads) x[d] = fma(p.scale, v[d], x[d]);
+    return;
+  }
+  float dot = 0.0f;
+  for (uint d = tid; d < p.hidden; d += kRowThreads) dot = fma(x[d], v[d], dot);
+  dot = simd_sum(dot);
+  if (lane == 0) partial[sg] = dot;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float total = 0.0f;
+  for (uint g = 0; g < kSimdgroups; ++g) total += partial[g];
+  const float along = p.scale * total;
+  for (uint d = tid; d < p.hidden; d += kRowThreads) x[d] = fma(-along, v[d], x[d]);
+}

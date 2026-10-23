@@ -1695,6 +1695,21 @@ def _native_command(args, model_root, relaunch_context=None):
         )
     if args.allow_idle_sleep:
         command.extend(("--idle-sleep", "allow"))
+    if args.control_vector is not None:
+        command.extend(("--control-vector", str(args.control_vector)))
+        if args.control_vector_scale != 1.0:
+            command.extend(("--control-vector-scale", str(args.control_vector_scale)))
+        if args.control_vector_layer_range is not None:
+            command.extend(
+                (
+                    "--control-vector-layer-range",
+                    serve_options.control_vector_layer_range_text(
+                        args.control_vector_layer_range
+                    ),
+                )
+            )
+        if args.control_vector_mode != "add":
+            command.extend(("--control-vector-mode", args.control_vector_mode))
     if relaunch_context is not None and args.max_context is None:
         command.extend(("--relaunch-context", str(relaunch_context)))
     for flag, value in (

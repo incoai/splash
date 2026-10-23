@@ -501,6 +501,16 @@ void testPersistentCacheNamespace() {
   // Factors that print alike to six digits still rotate keys differently.
   require(scaled(3.9999999) != scaled(4.0) && scaled(1.0000001) != scaled(1.0000004),
           "factors alike to six digits shared a cache namespace");
+  // A control vector changes every state and page after the first layer it
+  // steers: each vector names its own namespace, none the stock model's.
+  RuntimeCacheIdentity steered = identity('a', "build", kv::Format::Int8), otherwise = steered;
+  steered.controlVectorSha256 = std::string(64, 'd');
+  otherwise.controlVectorSha256 = std::string(64, 'e');
+  require(persistentCacheNamespace(steered, model.stateLayout) != name &&
+              persistentCacheNamespace(otherwise, model.stateLayout) != name &&
+              persistentCacheNamespace(steered, model.stateLayout) !=
+                  persistentCacheNamespace(otherwise, model.stateLayout),
+          "a control vector's caches shared a namespace with the stock model's or another vector's");
 }
 
 void testWeightBudgetBeforeLoading(const char *metallibPath) {

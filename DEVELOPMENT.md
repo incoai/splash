@@ -87,6 +87,10 @@ access.
 | `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place; required for a family without a released draft. See [drafts](#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](#vision). |
 | `--offline` | Off | Start the installed model without asking the Hub, as `HF_HUB_OFFLINE=1` does. See [revisions](#revisions). |
+| `--control-vector` | None | Qwen3.8-Flash-Next, Qwen3.8-27B and Qwen3.6-35B-A3B: a GGUF control vector, as llama.cpp's `--control-vector` reads it, applied to the residual (Flash-Next: every stream) after each layer it steers in every request. See [control vectors](#control-vectors). |
+| `--control-vector-scale` | `1.0` | The scale of its directions. |
+| `--control-vector-layer-range` | Every layer it holds | The layers it steers, both included, e.g. `4-44`. |
+| `--control-vector-mode` | `add` | `add` adds the scaled direction to the residual, as llama.cpp does; `project` removes the residual's scaled component along it. |
 | `--port` | `SPLASH_PORT` or `8000` | HTTP port. |
 | `--host` | `127.0.0.1` | HTTP bind address. See [network and authentication](#network-and-authentication). |
 | `--allowed-host` | No extra names | Additional HTTP Host name, e.g. `mymac.local`; repeatable. |
@@ -132,6 +136,31 @@ and `--max-cache-disk-writes 0`, its default, sets no write budget. Durations
 (`--idle-release`, `--request-timeout`) are seconds, or a number with an `s`,
 `m` or `h` suffix, such as `90s`, `30m` or `1.5h`; `--idle-release off` turns
 the timer off, and only `POST /v1/memory/release` then frees the weights.
+
+### Control vectors
+
+`--control-vector FILE` steers a Qwen3.8-Flash-Next, Qwen3.8-27B or
+Qwen3.6-35B-A3B target with a control vector in llama.cpp's GGUF format:
+`general.architecture` `controlvector`, an optional `controlvector.model_hint`
+that must then name the target's family (`qwen4exp`, `qwen35` or `qwen35moe`),
+and one F32 tensor `direction.L` of the hidden size (2560, 5120 or 2048) for
+each layer `L` it steers, from 1. After a steered layer's FFN, every
+hyper-connection stream `h` (Flash-Next) or residual value `h` of every row
+(Qwen3.5 families, in decode, verify, batched rows and chunked prefill)
+becomes `h + s v` (`--control-vector-mode add`, llama.cpp's operation) or
+`h - s (h . v) v` with `v` normalized to unit length (`project`), `s` the
+`--control-vector-scale`. `--control-vector-layer-range
+FIRST-LAST` limits it to those layers; a layer without a direction, or with a
+zero one, is left alone. The engine logs what it runs, e.g. `Control vector:
+project, layers 4..44 (41 steered), scale 1`.
+
+The vector is fixed for the process: every request, prefill and decode, runs
+on it. The DFlash2 draft reads the steered layer outputs it captures, and the
+target verifies its proposals, so outputs are the steered target's. The
+vector's mode, scale, layers and directions name the persistent cache's
+directory: caches computed with one vector are never read without it, or with
+another. Other families refuse `--control-vector`, as does a target whose
+GGUF inputs a Prism rotation turned.
 
 ### Network and authentication
 

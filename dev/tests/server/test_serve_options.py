@@ -48,6 +48,8 @@ ACCEPTED_CONTEXTS = {
 }
 # Past 1010000 tokens (987K is 1010688), or no count of tokens.
 REFUSED_CONTEXTS = ("0", "-1", "1010001", "987K", "2M", "1.5M", "M", "bad")
+# The control vector the options that need one take.
+CONTROL_VECTOR = "--control-vector=/srv/steer.gguf"
 # Every shared option: accepted arguments with the value they parse to, and
 # refused arguments.
 OPTIONS = {
@@ -76,6 +78,52 @@ OPTIONS = {
         "--thinking-end-text",
         {"</think>": "</think>", "Time is up.\n</think>": "Time is up.\n</think>"},
         (),
+    ),
+    "--control-vector": values(
+        "--control-vector",
+        {
+            "/srv/steer.gguf": Path("/srv/steer.gguf"),
+            "steer.gguf": Path("steer.gguf").absolute(),
+        },
+        ("", " "),
+    ),
+    # A vector's settings take the vector; its defaults alone pass.
+    "--control-vector-scale": (
+        [
+            (["--control-vector-scale=1"], 1.0),
+            (["--control-vector-scale=-0.5", CONTROL_VECTOR], -0.5),
+            (["--control-vector-scale=2", CONTROL_VECTOR], 2.0),
+        ],
+        [
+            *(
+                [f"--control-vector-scale={scale}", CONTROL_VECTOR]
+                for scale in ("nan", "inf", "-inf", "half", "")
+            ),
+            ["--control-vector-scale=0.5"],
+        ],
+    ),
+    "--control-vector-layer-range": (
+        [
+            (["--control-vector-layer-range=0-0", CONTROL_VECTOR], (0, 0)),
+            (["--control-vector-layer-range=4-44", CONTROL_VECTOR], (4, 44)),
+        ],
+        [
+            *(
+                [f"--control-vector-layer-range={layers}", CONTROL_VECTOR]
+                for layers in ("44-4", "4", "4-", "-1-4", "a-b", "4-44-48", "")
+            ),
+            ["--control-vector-layer-range=4-44"],
+        ],
+    ),
+    "--control-vector-mode": (
+        [
+            (["--control-vector-mode=add"], "add"),
+            (["--control-vector-mode=project", CONTROL_VECTOR], "project"),
+        ],
+        [
+            ["--control-vector-mode=subtract", CONTROL_VECTOR],
+            ["--control-vector-mode=project"],
+        ],
     ),
     "--kv-format": values("--kv-format", {"int8": "int8", "bf16": "bf16"}, ("fp16",)),
     "--state-format": values(
