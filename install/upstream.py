@@ -279,7 +279,8 @@ def gguf_target(repo, names, scratch, *, projector=None):
     parts in split order, its configuration and metadata written into
     scratch. projector, for a model that serves images, gives the name and
     header of its vision projector in repo (select_vision): called once the
-    text configuration passed."""
+    text configuration passed, for a family whose models have a vision
+    tower; the others serve text only."""
     headers = []
     for part in names:
         with repo.open(part) as stream:
@@ -295,7 +296,7 @@ def gguf_target(repo, names, scratch, *, projector=None):
     family = check_model("gguf", "none", config, gguf_metadata=metadata)
     gguf.require_loadable(header)
     vision_format = "none"
-    if projector is not None:
+    if projector is not None and family.vision:
         name, vision_header = projector(repo)
         try:
             _validate_processor(gguf.processor_config(vision_header))
@@ -593,10 +594,10 @@ def _install(selection, repo, installed, draft=None):
         if draft is None:
             draft = _resolve_draft(target.family, selection, installed, repo)
         draft, files = _draft(target, installed, draft)
+        vision = "disabled" if target.vision_format == "none" else "enabled"
         print(
             f"Installing {selection.model} as {target.family.name} ({target.format}); "
-            f"draft {draft.name}; "
-            f"vision {'disabled' if selection.language_only else 'enabled'}.",
+            f"draft {draft.name}; vision {vision}.",
             flush=True,
         )
         downloaded = repo.download(set(target.files.values()))

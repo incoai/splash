@@ -27,6 +27,10 @@ class ModelFamily:
     # How the family's model reasons and calls tools, and the tokens it
     # shares with the engine (server/chat_format.py).
     chat_format: ChatFormat
+    # Whether the family's models have a vision tower, which an installation
+    # loads from the target repository unless --language-only. The models of
+    # a family without one serve text only, whatever their repository holds.
+    vision: bool = True
 
 
 FAMILIES = (
@@ -36,8 +40,8 @@ FAMILIES = (
     # released for it the family's.
     ModelFamily("Qwen3.5-122B-A10B", "incoai/Ornith-1.5-122B-DFlash2", QWEN),
     ModelFamily("Qwen3.8-Flash-Next", "incoai/Qwen3.8-Flash-Next-DFlash2", QWEN),
-    # No DFlash2 draft is released for it yet.
-    ModelFamily("Flint", None, FLINT),
+    # No DFlash2 draft is released for it yet, and it has no vision tower.
+    ModelFamily("Flint", None, FLINT, vision=False),
 )
 
 

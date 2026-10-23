@@ -1,11 +1,14 @@
 """Flint's GGUFs (general.architecture flint): the configuration, tokenizer
 and tensor screen the installer derives from a header like
 unsloth/flint-GGUF's flint-UD-Q4_K_XL.gguf (revision
-20468edfc38ab43d6914cc88b08cbecb05d0fc62). Its scalar metadata and its
-tensor table, read by HTTP range requests, are fixtures
-(dev/tests/fixtures/model-configs/flint), and so are the config.json and
-the chat template of the release it was made from, RecursiveSI/flint."""
+20468edfc38ab43d6914cc88b08cbecb05d0fc62), and its installation of one. Its
+scalar metadata and its tensor table, read by HTTP range requests, are
+fixtures (dev/tests/fixtures/model-configs/flint), and so are the
+config.json and the chat template of the release it was made from,
+RecursiveSI/flint."""
 
+import contextlib
+import io
 import json
 import re
 import tempfile
@@ -16,8 +19,19 @@ from tokenizers import pre_tokenizers
 from transformers import AutoTokenizer
 
 from dev.tests import fixture_files
-from dev.tests.installer_fixtures import CONFIGS, CONTROL, GGML, NORMAL, USER_DEFINED
-from install import gguf, models
+from dev.tests.installer_fixtures import (
+    CONFIGS,
+    CONTROL,
+    GGML,
+    NORMAL,
+    USER_DEFINED,
+    FakeHub,
+    draft_dir,
+    selection,
+    vision_fixture,
+    write_gguf,
+)
+from install import assembly, families, gguf, local, models, upstream
 from server import constraints
 from server.chat_format import FLINT
 from server.chat_templates import NATIVE, ChatTemplates
@@ -365,6 +379,77 @@ class FlintGgufTests(unittest.TestCase):
         metadata = self.metadata(tensors=tensors)
         gguf.require_loadable(metadata)
         self.assertIn("blk.2.ffn_gate_up_exps.weight", gguf.loaded_tensors(metadata))
+
+    @staticmethod
+    def flint_gguf(path):
+        """A GGUF target of Flint's header and tensor table at path, and a
+        vision projector beside it."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fixture_files.write_gguf(
+            path,
+            header_values(),
+            [(name, extents, kind, b"") for name, extents, kind in tensor_table()],
+        )
+        write_gguf(
+            path.parent / "mmproj-F32.gguf",
+            vision_fixture(),
+            [("v.patch_embd.weight", GGML["F32"])],
+        )
+        return path
+
+    def test_a_repository_installs_text_only_without_language_only(self):
+        # Flint's models have no vision tower: an installation that serves
+        # images where it can serves Flint's text only, reads no projector its
+        # repository holds and needs no --language-only.
+        family = families.named("Flint")
+        repo, variant = "unsloth/flint-GGUF", "UD-Q4_K_XL"
+        target = f"flint-{variant}.gguf"
+        fake = FakeHub(self, self.root / "hub")
+        fake.publish(repo, "a" * 40, lambda root: self.flint_gguf(root / target))
+        draft = draft_dir(self.root / "draft", family)
+        chosen = selection(
+            self.root,
+            f"{repo}:{variant}",
+            language_only=False,
+            draft_model=str(draft),
+        )
+        with (
+            contextlib.redirect_stdout(io.StringIO()) as output,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            upstream.prepare(chosen)
+        self.assertIn(
+            f"as Flint (gguf); draft {draft}; vision disabled.",
+            output.getvalue(),
+        )
+        record = assembly.verify(chosen.link, full=True)
+        self.assertEqual((record["family"], record["vision_format"]), ("Flint", "none"))
+        self.assertFalse((chosen.link / "vision").exists())
+        self.assertEqual(fake.range_reads, [f"{repo}/{target}"])
+        self.assertEqual(fake.downloads, [f"{repo}/{target}"])
+
+    def test_local_files_serve_text_only_and_take_no_projector(self):
+        # Resolved, as prepare_local_model names the files it prepares.
+        root = self.root.resolve()
+        target = self.flint_gguf(root / "model" / "flint.gguf")
+        mmproj = target.parent / "mmproj-F32.gguf"
+        draft = draft_dir(root / "draft", families.named("Flint"))
+
+        def prepare(**options):
+            with contextlib.redirect_stdout(io.StringIO()):
+                return local.prepare_local_model(
+                    target, draft, models_dir=root / "models", **options
+                )
+
+        self.assertEqual(assembly.verify(prepare())["vision_format"], "none")
+        with self.assertRaisesRegex(
+            models.ModelError,
+            re.escape(
+                f"{mmproj} is a vision projector, which a Flint model, without a "
+                "vision tower, does not load"
+            ),
+        ):
+            prepare(mmproj=mmproj)
 
     def test_the_fixture_metadata_is_the_header_s_scalars(self):
         # What the engine's model check takes besides the config: the

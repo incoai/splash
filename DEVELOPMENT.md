@@ -2013,7 +2013,9 @@ BF16. The processor configuration (MLX `preprocessor_config.json`, or the
 `image_processor` object of `processor_config.json`, where newer Transformers
 releases save it; the GGUF's `clip.vision` metadata) must describe the one
 preprocessing Splash implements (`server/images.py`); it is checked before any
-weight download and not installed.
+weight download and not installed. The models of a family without a vision
+tower (Flint; `vision` in `install/families.py`) serve text only: their
+installation reads no projector, with or without `--language-only`.
 
 Both sources are written into one image, which the one BF16 vision operator
 reads: BF16 tensors are
@@ -2170,8 +2172,9 @@ model's source options (`--revision`, `--draft-model`, `--language-only`,
   `hf download incoai/Qwen3.8-27B-DFlash2` does; `splash serve` downloads by
   commit, which records none.
 - `mmproj`: a GGUF target's vision projector ([Vision](#vision)); without
-  one, a GGUF target serves text only. An MLX target serves images with the
-  tower in its checkpoint unless `language_only=True`.
+  one, a GGUF target serves text only, and a target of a family without a
+  vision tower refuses one. An MLX target serves images with the tower in
+  its checkpoint unless `language_only=True`.
 - `models_dir`: where prepared models are kept, Splash's own models
   directory by default ([files Splash writes](#files-splash-writes)).
 
