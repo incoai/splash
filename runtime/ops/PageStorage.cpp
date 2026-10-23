@@ -33,10 +33,15 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
         throw std::invalid_argument(
             "KV page pool is not a whole number of extents");
     }
+    // splash_kv_offset places an extent's regions one after another; a
+    // layer's is the one Layout::region orders it at.
     const auto data = static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
     const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
-    for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
-        layers_.push_back(splash_kv_layer(extentPages_, data, scale, layer));
+    regionLayers_.resize(layout_.attentionLayers);
+    for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
+        layers_.push_back(splash_kv_layer(extentPages_, data, scale, layout_.region(layer)));
+        regionLayers_[layout_.region(layer)] = layer;
+    }
     extents_.resize(pageCount_ / extentPages_);
 }
 
@@ -188,7 +193,7 @@ std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page) const {
     if (form(page) == PageForm::Full) {
         result.reserve(size_t{layout_.attentionLayers} *
                        ((layout_.scaleBytesPerLayerPage() ? 4 : 2) + (layout_.indexDimension ? 1 : 0)));
-        for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
+        for (const uint32_t layer : regionLayers_) {
             for (const std::span<std::byte> tensor : layerSpans(page, layer)) {
                 if (!tensor.empty()) result.push_back(tensor);
             }
@@ -211,8 +216,9 @@ std::array<std::span<std::byte>, 4> PageStorage::layerSpans(uint32_t page, uint3
     const uint32_t index = page % extentPages_;
     std::array<std::span<std::byte>, 4> result;
     for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES; ++tensor) {
-        result[tensor] = {contents + splash_kv_offset(extentPages_, data, scale, layer, tensor, index),
-                          splash_kv_page_bytes(data, scale, tensor)};
+        result[tensor] = {
+            contents + splash_kv_offset(extentPages_, data, scale, layout_.region(layer), tensor, index),
+            splash_kv_page_bytes(data, scale, tensor)};
     }
     return result;
 }

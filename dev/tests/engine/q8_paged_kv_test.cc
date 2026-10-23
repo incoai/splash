@@ -2,6 +2,7 @@
 #include "TestChecks.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -61,6 +62,50 @@ void testByteAccounting() {
   static_assert(kOracleLayout.attentionLayers * kKeyScaleBytesPerLayerPage == 8 * 1024);
   static_assert(kBytesPerModelPage == 2 * (512 + 8) * 1024);
   static_assert(4608 * kBytesPerModelPage == 4'907'335'680ULL); // 147456 tokens.
+}
+
+// A sliding window: windowedLayers names the layers whose rows read only the
+// windowTokens keys before their own, and either is zero without the other.
+// A page's regions hold the layers no window bounds first, then the windowed
+// ones, each in layer order; without a window a layer's region is the layer,
+// and a window changes no byte count.
+void testWindows() {
+  // Flint's 49 layers: all but 0, 1, 48 and every fourth from 5 windowed.
+  constexpr uint64_t windowed = [] {
+    uint64_t layers = (uint64_t{1} << 48) - 4;
+    for (uint32_t layer = 5; layer < 48; layer += 4)
+      layers &= ~(uint64_t{1} << layer);
+    return layers;
+  }();
+  constexpr Layout flint{49, 4, 128, Format::Int8, 0, false, 512, windowed};
+  static_assert(flint.valid() && std::popcount(windowed) == 35);
+  static_assert(flint.bytesPerModelPage() == 1'655'808 &&
+                flint.bytesPerModelPage() == Layout{49, 4, 128}.bytesPerModelPage());
+  static_assert(flint.region(0) == 0 && flint.region(1) == 1 && flint.region(5) == 2 &&
+                flint.region(45) == 12 && flint.region(48) == 13);
+  static_assert(flint.region(2) == 14 && flint.region(3) == 15 && flint.region(6) == 17 &&
+                flint.region(47) == 48);
+  std::vector<bool> taken(flint.attentionLayers);
+  for (uint32_t layer = 0; layer < flint.attentionLayers; ++layer) {
+    const uint32_t region = flint.region(layer);
+    require(region < flint.attentionLayers && !taken[region], "two layers share a region");
+    taken[region] = true;
+    for (uint32_t later = layer + 1; later < flint.attentionLayers; ++later)
+      if (flint.windowed(later) == flint.windowed(layer))
+        require(flint.region(later) > region, "a class of layers is out of layer order");
+  }
+  for (const Layout layout : {Layout{16, 4, 256}, Layout{12, 2, 256, Format::Int8, 128, true}})
+    for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer)
+      require(layout.region(layer) == layer && !layout.windowed(layer),
+              "a layout without a window moved a layer");
+  // Layers past the mask's 64 are never windowed and come before the
+  // windowed ones.
+  constexpr Layout wide{80, 2, 256, Format::Int8, 0, false, 64, 1};
+  static_assert(wide.valid() && wide.region(0) == 79 && wide.region(1) == 0 &&
+                wide.region(79) == 78);
+  static_assert(!Layout{49, 4, 128, Format::Int8, 0, false, 512, 0}.valid() &&
+                !Layout{49, 4, 128, Format::Int8, 0, false, 0, windowed}.valid() &&
+                !Layout{48, 4, 128, Format::Int8, 0, false, 512, uint64_t{1} << 48}.valid());
 }
 
 void testLayouts() {
@@ -172,6 +217,7 @@ void testZeroAndInvalidInputs() {
 int main() {
   try {
     testByteAccounting();
+    testWindows();
     testLayouts();
     testBFloat16();
     testQuantization(kPageTokens);

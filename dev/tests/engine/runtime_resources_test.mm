@@ -508,6 +508,18 @@ void testPersistentCacheNamespace() {
   require(persistentCacheNamespace(dense, attentionOnly) != name &&
               persistentCacheNamespace(dense, attentionOnly) == persistentCacheNamespace(dense, bfloatAttentionOnly),
           "a target without GDN layers shared a hybrid's namespace, or took another for its state format");
+  // A sliding window orders a page's regions and labels its slots with their
+  // page's form: each window and each set of windowed layers names a cache of
+  // its own.
+  RuntimeCacheIdentity windowed = dense, otherWindow = dense, otherLayers = dense;
+  windowed.kvLayout.windowTokens = otherLayers.kvLayout.windowTokens = 512;
+  otherWindow.kvLayout.windowTokens = 1024;
+  windowed.kvLayout.windowedLayers = otherWindow.kvLayout.windowedLayers = 0b1100;
+  otherLayers.kvLayout.windowedLayers = 0b0110;
+  const std::string windowName = persistentCacheNamespace(windowed, model.stateLayout);
+  require(windowName != name && persistentCacheNamespace(otherWindow, model.stateLayout) != windowName &&
+              persistentCacheNamespace(otherLayers, model.stateLayout) != windowName,
+          "a window, or another window or windowed layers, shared a cache namespace");
 }
 
 void testWeightBudgetBeforeLoading(const char *metallibPath) {

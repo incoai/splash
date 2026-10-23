@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/KvCache.hpp"
+#include "ops/PagedKv.hpp"
 
 #include <array>
 #include <bit>
@@ -53,6 +54,38 @@ template <typename Label>
     return std::nullopt;
   Label label;
   std::memcpy(&label, bytes.data(), sizeof(Label));
+  return label;
+}
+
+// A KV slot's label: its block's, then for a windowed layout (kv::Layout::
+// windowedLayers) the form of the page the slot holds, one byte: a build
+// whose windowed pages take another form keeps the namespace, and a build
+// that cannot restore that form drops those copies. Other layouts' slots
+// hold Full pages alone and keep the label they always had.
+struct KvSlotLabel final {
+  KvBlockLabel block;
+  kv::PageForm form = kv::PageForm::Full;
+};
+
+[[nodiscard]] constexpr uint32_t kvSlotLabelBytes(bool windowed) noexcept {
+  return sizeof(KvBlockLabel) + (windowed ? sizeof(kv::PageForm) : 0);
+}
+
+[[nodiscard]] inline std::vector<std::byte> encodeKvSlotLabel(const KvSlotLabel &label,
+                                                             bool windowed) {
+  std::vector<std::byte> bytes = encodeLabel(label.block);
+  if (windowed)
+    bytes.push_back(static_cast<std::byte>(label.form));
+  return bytes;
+}
+
+[[nodiscard]] inline std::optional<KvSlotLabel>
+decodeKvSlotLabel(std::span<const std::byte> bytes, bool windowed) noexcept {
+  if (bytes.size() != kvSlotLabelBytes(windowed))
+    return std::nullopt;
+  KvSlotLabel label{*decodeLabel<KvBlockLabel>(bytes.first(sizeof(KvBlockLabel)))};
+  if (windowed)
+    label.form = static_cast<kv::PageForm>(bytes.back());
   return label;
 }
 

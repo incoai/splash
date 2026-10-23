@@ -5,6 +5,7 @@
 #include "metal/MetalBackend.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -154,9 +155,30 @@ struct Layout final {
   // (ops::AttentionBlocks) gathers blocks of tokens, whose values are
   // contiguous only token-major.
   bool valuesTokenMajor = false;
+  // A sliding window: a row at position p of a windowed layer reads the keys
+  // of positions p - windowTokens to p alone, the other layers' every key up
+  // to p. windowedLayers holds a bit for each windowed attention layer, bit l
+  // for the l-th; both are zero for a layout without a window.
+  uint32_t windowTokens = 0;
+  uint64_t windowedLayers = 0;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return attentionLayers && kvHeads && headDimension && validFormat(format);
+    return attentionLayers && kvHeads && headDimension && validFormat(format) &&
+           !windowTokens == !windowedLayers &&
+           (attentionLayers >= 64 || !(windowedLayers >> attentionLayers));
+  }
+  [[nodiscard]] constexpr bool windowed(uint32_t layer) const noexcept {
+    return layer < 64 && (windowedLayers >> layer & 1);
+  }
+  // Where a layer's K/V region sits among a page's: the layers no window
+  // bounds first, then the windowed ones, each in layer order, so that what
+  // a row reads of a page every window has passed lies in its first
+  // regions. Without a window a layer's region is the layer itself.
+  [[nodiscard]] constexpr uint32_t region(uint32_t layer) const noexcept {
+    const uint64_t below = layer < 64 ? windowedLayers & ((uint64_t{1} << layer) - 1) : windowedLayers;
+    const auto windowedBelow = static_cast<uint32_t>(std::popcount(below));
+    const auto unwindowed = attentionLayers - static_cast<uint32_t>(std::popcount(windowedLayers));
+    return windowed(layer) ? unwindowed + windowedBelow : layer - windowedBelow;
   }
   [[nodiscard]] constexpr uint32_t elementsPerScale() const noexcept {
     return format == Format::Int8 ? headDimension : 0;

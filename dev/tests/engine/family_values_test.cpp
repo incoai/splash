@@ -59,7 +59,10 @@ std::string familyValues() {
     const kv::Layout &kv = model.targetKvLayout;
     out << "family " << family.family << '\n'
         << "kv layers " << kv.attentionLayers << " heads " << kv.kvHeads << " dimension " << kv.headDimension
-        << " index " << kv.indexDimension << (kv.valuesTokenMajor ? " values-token-major" : "") << '\n';
+        << " index " << kv.indexDimension << (kv.valuesTokenMajor ? " values-token-major" : "");
+    if (kv.windowedLayers)
+      out << " window " << kv.windowTokens << " layers 0x" << std::hex << kv.windowedLayers << std::dec;
+    out << '\n';
     for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
       kv::Layout layout = kv;
       layout.format = format;

@@ -111,7 +111,8 @@ TokenAdmission admitTokens(engine::Cache &cache, uint64_t requestId, uint64_t to
 
 // One process's cache over eight pages, with a KV tier and a shelf for
 // state copies, persistent or not, and requests that may spill with a spill
-// policy (their Index pages beside the eight).
+// policy (their Index pages beside the eight), of a windowed KV layout or
+// not.
 struct Process final {
   test::TestKvStorage storage{16, 100, 1, 10};
   KvPool pool{storage, 8};
@@ -120,8 +121,8 @@ struct Process final {
   engine::Cache cache;
 
   explicit Process(bool persistent, std::shared_ptr<model::DiskBudget> budget = nullptr,
-                   std::optional<CacheSpillPolicy> spill = std::nullopt)
-      : tier(persistent), cache(pool, &tier, std::move(budget), spill) {
+                   std::optional<CacheSpillPolicy> spill = std::nullopt, bool windowedKv = false)
+      : tier(persistent), cache(pool, &tier, std::move(budget), spill, windowedKv) {
     storage.budgetPages = 8;
     tier.capacity = 16;
     tier.transferLimit = 8;
@@ -219,6 +220,41 @@ void testCopiesAreLabelled() {
                 state->lastUsed,
             "the state label did not name its block, boundary and class");
   }
+}
+
+// A windowed layout's KV labels name the form of the page their slot holds
+// after the block's label (KvSlotLabel): Full, as the tier takes pages. The
+// next process takes back such copies, and drops one of a form it does not
+// know, a later build's, with the restore point whose chain it breaks.
+void testWindowedCopiesNameTheirForm() {
+  const std::vector<uint32_t> prompt = promptOf(1000, 4);
+  Process earlier(true, nullptr, std::nullopt, true);
+  const std::vector<uint64_t> blocks = earlier.cachePrompt(1, prompt);
+  earlier.publish(blocks[1]);
+  earlier.publish(blocks[3]);
+  earlier.writeEverything();
+  std::vector<std::vector<std::byte>> copies = earlier.kvLabels();
+  require(copies.size() == 4, "a windowed layout's persistent tier left a copy unlabelled");
+  for (const auto &bytes : copies) {
+    const auto label = decodeKvSlotLabel(bytes, true);
+    require(bytes.size() == kvSlotLabelBytes(true) && kvSlotLabelBytes(true) == sizeof(KvBlockLabel) + 1 &&
+                label && label->form == kv::PageForm::Full &&
+                std::ranges::find(blocks, label->block.id) != blocks.end(),
+            "a windowed layout's KV label does not name its block and its page's form");
+  }
+  {
+    Process next(true, nullptr, std::nullopt, true);
+    const CacheAdoption adoption = next.adopt(copies, earlier.stateLabels());
+    require(adoption.blocks == 4 && adoption.states == 2 && adoption.dropped == 0,
+            "the next process did not take back a windowed layout's restore points");
+  }
+  for (auto &bytes : copies)
+    if (decodeKvSlotLabel(bytes, true)->block.id == blocks[2])
+      bytes.back() = std::byte{0xff};
+  Process next(true, nullptr, std::nullopt, true);
+  const CacheAdoption adoption = next.adopt(copies, earlier.stateLabels());
+  require(adoption.blocks == 2 && adoption.states == 1 && adoption.dropped == 3,
+          "a copy of a form the process does not know was taken back");
 }
 
 // The next process takes back each restore point whole, under the ids and
@@ -1043,6 +1079,7 @@ void testCommittedPagesTakeTheSpilledChainOfAStateInRam() {
 int main() {
   try {
     testCopiesAreLabelled();
+    testWindowedCopiesNameTheirForm();
     testRestorePointsComeBack();
     testSaltedPointsComeBackUnderTheirSalt();
     testBrokenChainsStayBehind();

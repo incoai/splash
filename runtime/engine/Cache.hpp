@@ -285,7 +285,7 @@ struct StateRoom final {
 enum class KvRestoreStatus : uint8_t { None, Pending, Failed };
 
 // A slot an earlier process left in a persistent tier's file: its label
-// (KvBlockLabel or StateLabel), and how to take it back, which only what
+// (KvSlotLabel or StateLabel), and how to take it back, which only what
 // the cache keeps is.
 struct PersistedKv final {
   std::vector<std::byte> label;
@@ -309,13 +309,15 @@ public:
   // the states' file can run on it without the tier. A persistent KV tier
   // makes the cache persistent: its copies are labelled for the next
   // process, and the quota keeps whole restore points by the recency of
-  // their states (dropOldestPoint).
+  // their states (dropOldestPoint). The labels of a windowed layout's
+  // copies (windowedKv, kv::Layout::windowedLayers) name their page's form
+  // too (KvSlotLabel).
   // With a spill policy, on a layout that can spill (kv::Layout::spillable)
   // and with a tier, requests may spill (KvMode::Spill), and the blocks
   // requests hold keep their copies (KvCache::holdPage); without one, quota
   // treats copies as it always has.
   Cache(KvPool &pool, KvTier *kvTier, std::shared_ptr<model::DiskBudget> diskBudget,
-        std::optional<CacheSpillPolicy> spill = std::nullopt);
+        std::optional<CacheSpillPolicy> spill = std::nullopt, bool windowedKv = false);
   Cache(const Cache &) = delete;
   Cache &operator=(const Cache &) = delete;
 
@@ -960,6 +962,7 @@ private:
   KvTier *tier_;
   std::optional<CacheSpillPolicy> spill_;
   bool persistent_;
+  bool windowedKv_;
   CacheAdoption adoption_;
   std::shared_ptr<model::DiskBudget> diskBudget_;
   std::function<void()> diskMeasure_;

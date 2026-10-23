@@ -2906,10 +2906,15 @@ pressure and swap.
 KV pages live in extents: ordinary shared Metal buffers of one size per pool,
 between half and one and a half times 128 MiB, in which every tensor region of
 each attention layer starts 64 KiB-aligned, sized to leave the fewest of the
-budget's pages unused (`Layout::extentPagesFor`). Each extent has a form
-(`kv::PageForm`): a Full extent holds its pages' K/V and then, for a layout
-with a block index, their index plane; an Index extent only the plane, for
-pages whose K/V is on the SSD, and only a pool that spills allocates one. A
+budget's pages unused (`Layout::extentPagesFor`). The regions follow the
+layers, except that a layout with a sliding window (`Layout::windowTokens`,
+over the layers `windowedLayers` names) places the regions of the layers no
+window bounds first and then the windowed layers', each in layer order
+(`Layout::region`): what a row reads of a page every window has passed lies in
+its first regions, and a page's SSD slot holds them first too. Each extent has
+a form (`kv::PageForm`): a Full extent holds its pages' K/V and then, for a
+layout with a block index, their index plane; an Index extent only the plane,
+for pages whose K/V is on the SSD, and only a pool that spills allocates one. A
 page moves to the other form, its references with it, when its K/V leaves
 memory or comes back (`KvPool::movePages`). The pool allocates an extent
 when it needs one of its pages. When it is built it allocates the runway, the
@@ -3361,7 +3366,9 @@ one of each segment: the page's index, then each block's record. A state that
 fails it on its first read is a miss. Every read of a KV copy a restart took
 back checks the segments it covers: a whole or index restore that fails is a
 miss, and a block or history read that fails is `kv_unreadable` for the
-requests that read it.
+requests that read it. A KV record of a layout with a sliding window also names
+the form of the page its slot holds (`KvSlotLabel`), and a start takes back
+only the forms it restores.
 
 `/status` reports the shared quota, its limit, the write budget and KV
 transfers under `disk`. Its cumulative `read_bytes` and `written_bytes` count

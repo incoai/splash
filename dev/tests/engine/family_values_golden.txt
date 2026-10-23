@@ -3,7 +3,8 @@
 # family by family in kFamilies' order, each with the draft
 # dev/tests/fixtures/model-configs describes for it:
 #
-#   kv: the target's KV layout (kv::Layout);
+#   kv: the target's KV layout (kv::Layout) and its sliding window, if it
+#     has one;
 #   kv <format>: a page's bytes, Full and Index (kv::PageForm), the extent
 #     alignment and the smallest and largest extent, in pages;
 #   kv <format> extent-pages: the extent of a pool of so many pages

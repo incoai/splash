@@ -113,10 +113,12 @@ void excludeFromBackups(const std::filesystem::path &root) {
 // A persistent tier's directory under root and its files, each with its
 // slots' size and options, empty when another process holds the directory or
 // it cannot be used: the tier then keeps temporary files, as without one. A
-// root it makes is excluded from backups.
+// root it makes is excluded from backups. The KV file's records keep labels
+// of kvLabelBytes.
 PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
                                          const std::string &cacheNamespace,
-                                         uint64_t kvSlotBytes, const model::SlotFile::Options &kvOptions,
+                                         uint64_t kvSlotBytes, uint32_t kvLabelBytes,
+                                         const model::SlotFile::Options &kvOptions,
                                          uint64_t stateSlotBytes, const model::SlotFile::Options &stateOptions,
                                          const std::shared_ptr<model::DiskBudget> &budget,
                                          const std::function<bool()> &cancelled) {
@@ -141,7 +143,7 @@ PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
     files.kv = std::make_shared<model::SlotFile>(
         kvSlotBytes, budget,
         model::SlotFile::Persistence{files.directory->kvSlots(), files.directory->kvRecords(),
-                                     tag, sizeof(KvBlockLabel)},
+                                     tag, kvLabelBytes},
         kvOptions);
     files.states = std::make_shared<model::SlotFile>(
         stateSlotBytes, budget,
@@ -234,7 +236,8 @@ struct DiskTier final {
 // tier's KV, and the room bounds each request's commitment instead
 // (Engine::admitSpill). Every start removes the root's stale caches.
 DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &cacheNamespace,
-                      uint64_t quotaBytes, uint64_t kvSlotBytes, const model::SlotFile::Options &kvOptions,
+                      uint64_t quotaBytes, uint64_t kvSlotBytes, uint32_t kvLabelBytes,
+                      const model::SlotFile::Options &kvOptions,
                       uint64_t stateBytes, const model::SlotFile::Options &stateOptions, bool relaunchSpills) {
   DiskTier tier;
   // The cache root's caches nobody holds, this start's own included, looked
@@ -266,8 +269,9 @@ DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &c
       }
     }
     if (config.persistentCache && !rootRefusal) {
-      tier.persistent = openPersistentCache(config.cacheRoot, cacheNamespace, kvSlotBytes, kvOptions,
-                                            stateSlotBytes, stateOptions, tier.budget, config.cancelled);
+      tier.persistent = openPersistentCache(config.cacheRoot, cacheNamespace, kvSlotBytes, kvLabelBytes,
+                                            kvOptions, stateSlotBytes, stateOptions, tier.budget,
+                                            config.cancelled);
       tier.states = tier.persistent.states;
     }
     std::optional<std::string> off;
@@ -533,6 +537,11 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
   // key is pooled, normalized or rotated changes this line.
   if (kv.indexDimension)
     canonical << " index " << kv.indexDimension << " bf16 block " << SPLASH_ATTENTION_BLOCK_TOKENS;
+  // A sliding window (kv::Layout::windowTokens), which also orders a page's
+  // regions in its slot (kv::Layout::region) and labels a slot with its
+  // page's form (KvSlotLabel). A layout without one keeps the line it had.
+  if (kv.windowedLayers)
+    canonical << " window " << kv.windowTokens << " layers 0x" << std::hex << kv.windowedLayers << std::dec;
   // How a slot holds a page; nothing for the spans' order, so the caches
   // written before slots had another order stay valid.
   canonical << KvPageTier::slotFormatToken(kv) << '\n'
@@ -1024,8 +1033,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                                  .deferWrites = readers->criticalBusyProbe()};
     const model::SlotFile::Options stateFileOptions{.deferWrites = readers->criticalBusyProbe()};
     DiskTier disk = openDiskTier(config, cacheNamespace, stateStagingBytes ? cacheDiskBytes : 0, kvSlotBytes,
-                                 kvFileOptions, stateBytes, stateFileOptions,
-                                 relaunchContext && memoryPlan.breakdown().kvSpill.enabled);
+                                 kvSlotLabelBytes(kvLayout.windowedLayers != 0), kvFileOptions, stateBytes,
+                                 stateFileOptions, relaunchContext && memoryPlan.breakdown().kvSpill.enabled);
     if (memoryPlan.breakdown().kvSpill.enabled) {
       kvFileOpen = disk.kv != nullptr;
       if (disk.budget)
@@ -1095,7 +1104,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     std::optional<CacheSpillPolicy> spillPolicy;
     if (spill.enabled)
       spillPolicy = CacheSpillPolicy{.densePages = spill.densePages, .windowPages = spill.windowPages};
-    auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), disk.budget, spillPolicy);
+    auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), disk.budget, spillPolicy,
+                                                 kvLayout.windowedLayers != 0);
     if (disk.space)
       cache->setDiskMeasure([space = disk.space.get()] { space->measure(); });
     // A target whose KV spills reads it back through one hot block cache and

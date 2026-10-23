@@ -30,9 +30,10 @@ bool older(const std::optional<CacheEvictionCandidate> &left,
 } // namespace
 
 Cache::Cache(KvPool &pool, KvTier *kvTier, std::shared_ptr<model::DiskBudget> diskBudget,
-             std::optional<CacheSpillPolicy> spill)
+             std::optional<CacheSpillPolicy> spill, bool windowedKv)
     : pool_(pool), tier_(kvTier), spill_(spill), persistent_(kvTier && kvTier->persistent()),
-      diskBudget_(std::move(diskBudget)), kv_(pool, recency_, spill.has_value(), persistent_),
+      windowedKv_(windowedKv), diskBudget_(std::move(diskBudget)),
+      kv_(pool, recency_, spill.has_value(), persistent_),
       states_(kv_, recency_, [this](bool inUse) { return freeDiskSpace(inUse); }, persistent_) {
   // Spilled K/V lives in the tier's copies, within its quota.
   if (spill_ && (!tier_ || !diskBudget_))
@@ -60,11 +61,14 @@ CacheAdoption Cache::adopt(std::vector<PersistedKv> blocks, std::vector<Persiste
   // process.
   uint64_t highestId = 0;
   for (size_t index = 0; index < blocks.size(); ++index) {
-    const auto label = decodeLabel<KvBlockLabel>(blocks[index].label);
+    const auto label = decodeKvSlotLabel(blocks[index].label, windowedKv_);
     if (label)
-      highestId = std::max(highestId, label->id);
-    if (!label || !label->id || label->parent >= label->id ||
-        !recorded.emplace(label->id, Recorded{*label, index}).second)
+      highestId = std::max(highestId, label->block.id);
+    // A copy of a page of another form than Full is a later build's, which
+    // this one does not restore.
+    if (!label || !label->block.id || label->block.parent >= label->block.id ||
+        label->form != kv::PageForm::Full ||
+        !recorded.emplace(label->block.id, Recorded{label->block, index}).second)
       ++result.dropped;
   }
   for (auto &[id, block] : recorded) {
@@ -1417,9 +1421,10 @@ void Cache::labelKv(uint64_t block, const std::shared_ptr<KvDiskSlot> &slot) {
   if (!persistent_)
     return;
   const KvCache::Key key = kv_.key(block);
-  KvBlockLabel label{block, key.parent, kv_.lastUsed(block), key.identity.lo, key.identity.hi, {}};
-  std::copy(key.tokens.begin(), key.tokens.end(), label.tokens.begin());
-  tier_->label(slot, encodeLabel(label));
+  KvSlotLabel label{{block, key.parent, kv_.lastUsed(block), key.identity.lo, key.identity.hi, {}},
+                    pool_.form(kv_.page(block))};
+  std::copy(key.tokens.begin(), key.tokens.end(), label.block.tokens.begin());
+  tier_->label(slot, encodeKvSlotLabel(label, windowedKv_));
 }
 
 std::shared_ptr<KvDiskSlot> Cache::acquireDiskSlot(model::DiskBudget::Draw draw, bool inUse) {

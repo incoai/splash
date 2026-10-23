@@ -33,15 +33,26 @@ constexpr kv::Layout compactBf16Layout{10, 2, 256, kv::Format::BFloat16};
 // keys.
 constexpr kv::Layout indexedLayout{12, 2, 256, kv::Format::Int8, 128, true};
 constexpr kv::Layout indexedBf16Layout{12, 2, 256, kv::Format::BFloat16, 128, true};
+// A sliding window over 35 of 49 layers of 4 KV heads of 128, Flint's: every
+// layer but 0, 1, 48 and every fourth from 5 reads the 512 keys before its
+// row's alone.
+constexpr uint64_t kWindowedLayers = [] {
+    uint64_t layers = (uint64_t{1} << 48) - 4;
+    for (uint32_t layer = 5; layer < 48; layer += 4)
+        layers &= ~(uint64_t{1} << layer);
+    return layers;
+}();
+constexpr kv::Layout windowedLayout{49, 4, 128, kv::Format::Int8, 0, false, 512, kWindowedLayers};
+constexpr kv::Layout windowedBf16Layout{49, 4, 128, kv::Format::BFloat16, 0, false, 512, kWindowedLayers};
 
-// The host reaches a Full page through spans of its tensors, layer by layer
-// as keys, key scales, values and value scales, BF16 without scales, then
-// each layer's QSA pooled keys, and an Index page through its pooled keys
-// alone. Kernels find a page's keys at the page's slab in the layer's region
-// and its pooled keys at its slab of the layer's index region in the
-// extent's index plane, after every layer's region where there are K/V, so
-// that is where those spans start, and the spans of an extent's pages cover
-// the extent once, without gaps or overlaps.
+// The host reaches a Full page through spans of its tensors, region by
+// region (kv::Layout::region) as keys, key scales, values and value scales,
+// BF16 without scales, then each layer's QSA pooled keys, and an Index page
+// through its pooled keys alone. Kernels find a page's keys at the page's
+// slab in the layer's region and its pooled keys at its slab of the layer's
+// index region in the extent's index plane, after every layer's region where
+// there are K/V, so that is where those spans start, and the spans of an
+// extent's pages cover the extent once, without gaps or overlaps.
 void requireSpansTileExtent(const kv::PageStorage &storage, uint32_t firstPage) {
     const kv::Layout layout = storage.layout();
     const kv::PageForm form = storage.form(firstPage);
@@ -63,7 +74,7 @@ void requireSpansTileExtent(const kv::PageStorage &storage, uint32_t firstPage) 
         }
         for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer) {
             if (kvSpans)
-                require(spans[layer * tensors].data() ==
+                require(spans[layout.region(layer) * tensors].data() ==
                             extent + storage.layers()[layer].offset +
                                 uint64_t{index} * layout.dataBytesPerLayerPage(),
                         "a layer's spans do not start at the page's keys in its region");
@@ -233,6 +244,51 @@ void indexPagesHoldOnlyTheirIndex(metal::MetalBackend &backend, MemoryGovernor &
     rejects([&] { dense.writeIndexEntries(std::array<uint32_t, 1>{0}, 0, table); },
             "KV pages of a layout without an index have no index entries",
             "a layout without an index wrote index entries");
+}
+
+// A windowed layout's regions are those of the layers no window bounds, then
+// the windowed layers', each in layer order (kv::Layout::region): a layer
+// sits where splash_kv_offset places its region, the layers every row reads
+// end where the windowed ones begin, and a page's spans of them come first.
+// HostKvExtents places the regions where the storage does.
+void windowedLayersComeLast(metal::MetalBackend &backend, MemoryGovernor &governor) {
+    for (const auto layout : {windowedLayout, windowedBf16Layout}) {
+        const uint32_t extent = layout.minimumExtentPages();
+        kv::PageStorage storage(backend, governor.allocationAdmission(), layout, extent, extent);
+        require(static_cast<bool>(storage.allocateExtent(0)), "a windowed layout's extent was not allocated");
+        std::vector<uint32_t> unwindowed;
+        for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer)
+            if (!layout.windowed(layer))
+                unwindowed.push_back(layer);
+        require(unwindowed.size() == 14, "the window's layers are not Flint's");
+        const auto data = static_cast<uint32_t>(layout.dataBytesPerLayerPage());
+        const auto scale = static_cast<uint32_t>(layout.scaleBytesPerLayerPage());
+        const uint64_t unwindowedBytes = unwindowed.size() * extent * layout.bytesPerLayerPage();
+        for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer)
+            require(storage.layers()[layer].offset ==
+                            splash_kv_layer(extent, data, scale, layout.region(layer)).offset &&
+                        (storage.layers()[layer].offset < unwindowedBytes) == !layout.windowed(layer),
+                    "a windowed layout's region is not where its order places it");
+        requireSpansTileExtent(storage, 0);
+        const std::vector<std::span<std::byte>> spans = storage.spans(3);
+        std::vector<std::span<std::byte>> first;
+        for (const uint32_t layer : unwindowed)
+            for (const std::span<std::byte> tensor : storage.layerSpans(3, layer))
+                if (!tensor.empty())
+                    first.push_back(tensor);
+        requireSameSpans(std::span(spans).first(first.size()), first,
+                         "a page's spans do not start with the layers every row reads");
+        const metal::MetalBuffer probe = test::sharedBuffer(backend, sizeof(SplashKvPage));
+        const test::HostKvExtents host(
+            layout, extent,
+            {{storage.spans(0).front().data(), entryOf(storage, 0, probe), kv::PageForm::Full}});
+        for (const uint32_t layer : {0u, 2u, 5u, 47u, 48u}) {
+            require(host.layer(layer).offset == storage.layers()[layer].offset,
+                    "HostKvExtents places a windowed layout's layer elsewhere");
+            requireSameSpans(host.layerSpans(3, layer), storage.layerSpans(3, layer),
+                             "HostKvExtents misplaces a windowed layout's page");
+        }
+    }
 }
 
 void run(const std::string &metallib) {
@@ -476,6 +532,7 @@ void run(const std::string &metallib) {
     rejects([&] { (void)kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 256, 128).indexOffset(0); },
             "KV layer has no index region", "a layout without an index had an index region");
     indexPagesHoldOnlyTheirIndex(backend, governor);
+    windowedLayersComeLast(backend, governor);
     std::cout << "KV page storage tests passed\n";
 }
 

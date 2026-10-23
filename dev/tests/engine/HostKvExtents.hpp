@@ -20,12 +20,13 @@ namespace splash::test {
 // The extents of a KV pool in CPU-visible memory, for the kernel tests and
 // benchmarks that fill and read pages on the host. Page p sits in extent
 // p / extentPages at index p % extentPages, every layer's region where
-// splash_kv_offset places it and the index plane after them, as in
-// production extents (kv::PageStorage); an extent of Index pages holds only
-// the index plane. Kernels reach a page only through its entries. The
-// constructors size each extent exactly, so an access past one fails under
-// shader validation; contiguous() extents lie extentStride() apart in one
-// region, and an access past one runs into its neighbour unchecked.
+// splash_kv_offset places the layer's kv::Layout::region and the index plane
+// after them, as in production extents (kv::PageStorage); an extent of Index
+// pages holds only the index plane. Kernels reach a page only through its
+// entries. The constructors size each extent exactly, so an access past one
+// fails under shader validation; contiguous() extents lie extentStride()
+// apart in one region, and an access past one runs into its neighbour
+// unchecked.
 class HostKvExtents final {
 public:
   struct Extent final {
@@ -124,7 +125,7 @@ public:
   [[nodiscard]] SplashKvLayer layer(uint32_t index) const {
     if (index >= layout_.attentionLayers)
       throw std::out_of_range("host KV layer is outside the layout");
-    return splash_kv_layer(extentPages_, dataBytes(), scaleBytes(), index);
+    return splash_kv_layer(extentPages_, dataBytes(), scaleBytes(), layout_.region(index));
   }
   // Writes the entries of `pages` to the start of a CPU-visible table, as
   // kv::PageStorage::writeEntries: SPLASH_KV_PAGE_ABSENT for an Index page.
@@ -245,7 +246,7 @@ private:
     return static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
   }
   [[nodiscard]] uint64_t offset(uint32_t layer, uint32_t tensor, uint32_t index) const {
-    return splash_kv_offset(extentPages_, dataBytes(), scaleBytes(), layer, tensor, index);
+    return splash_kv_offset(extentPages_, dataBytes(), scaleBytes(), layout_.region(layer), tensor, index);
   }
 
   kv::Layout layout_;

@@ -158,12 +158,14 @@ void testPitchRule() {
 }
 
 // A layout without block records, an index or token-major values, keeps its
-// spans' order as one segment, has no records, and a whole restore puts the
-// payload back in that order.
+// spans' order as one segment, a windowed layout's region by region
+// (kv::Layout::region), has no records, and a whole restore puts the payload
+// back in that order.
 void testUnspillableLayouts() {
   for (const kv::Layout &layout : {kv::Layout{16, 4, 256}, kv::Layout{10, 2, 256, kv::Format::BFloat16},
                                    kv::Layout{12, 2, 256, kv::Format::Int8, 128, false},
-                                   kv::Layout{12, 2, 256, kv::Format::Int8, 0, true}}) {
+                                   kv::Layout{12, 2, 256, kv::Format::Int8, 0, true},
+                                   kv::Layout{6, 4, 128, kv::Format::Int8, 0, false, 512, 0b011010}}) {
     const SlotFormat format(layout);
     require(format.version() == 0 && format.payloadBytes() == layout.bytesPerModelPage() &&
                 format.segments() == std::vector<uint64_t>{layout.bytesPerModelPage()},

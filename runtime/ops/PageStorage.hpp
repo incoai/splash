@@ -19,7 +19,8 @@ namespace splash::kv {
 // between commands releases it (Engine::reclaimMemory); the cleanup after
 // startup warmup keeps one. Inside an extent every attention layer has a
 // region that holds the keys of all its pages, then their key scales, values
-// and value scales (abi/KvExtent.h). With a block index, the index plane
+// and value scales (abi/KvExtent.h), in the order Layout::region gives them:
+// a window's layers after the others. With a block index, the index plane
 // follows them: per layer a region of every page's pooled keys
 // (indexOffset). An extent holds pages of one form: a Full extent all of
 // that, an Index extent only the index plane. Kernels reach a page through
@@ -106,8 +107,8 @@ public:
   void writeIndexEntries(std::span<const uint32_t> pages, uint32_t first,
                          const metal::MetalBuffer &table) const;
   // The page's memory as the host reaches it, and the only code that names
-  // it: a Full page's bytes of each tensor in every layer's region, layer by
-  // layer as keys, key scales, values and value scales, where
+  // it: a Full page's bytes of each tensor in every layer's region, region
+  // by region as keys, key scales, values and value scales, where
   // splash_kv_offset places them for the kernels, then each layer's pooled
   // keys (indexOffset); an Index page's pooled keys alone. BF16 pages have no
   // scale bytes. Throws std::logic_error for a page whose extent is not
@@ -147,6 +148,8 @@ private:
   uint32_t pageCount_ = 0;
   uint32_t extentPages_ = 0;
   std::vector<SplashKvLayer> layers_;
+  // The layer of each region, in region order (Layout::region).
+  std::vector<uint32_t> regionLayers_;
   std::vector<Extent> extents_;
 };
 
