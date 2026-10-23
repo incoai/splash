@@ -107,6 +107,10 @@ class MetadataTests(unittest.TestCase):
             {"learning_rate": float("nan")},
             {"trainable": "magic"},
             {"selector_loss_weight": 0},
+            {"enable_thinking": "false"},
+            {"enable_thinking": 0},
+            {"reasoning_effort": "high"},
+            {"reasoning_effort": None},
         ):
             with self.subTest(values=values):
                 # JSON is valid YAML, including NaN for this parser check.

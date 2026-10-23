@@ -91,6 +91,72 @@ class TrainingTests(unittest.TestCase):
             read_json(uninterrupted / "checkpoints/step-00000008/progress.json"),
             read_json(resumed / "checkpoints/step-00000008/progress.json"),
         )
+        self.assertEqual(
+            read_json(uninterrupted / "selection.json")["validation_comparison"],
+            read_json(resumed / "selection.json")["validation_comparison"],
+        )
+
+    def test_step_metrics_cover_every_accumulated_block(self):
+        import json
+        from unittest import mock
+
+        from draft_training.losses import block_loss
+
+        self.recipe = replace(self.recipe, max_steps=1, batch_size=2)
+        block_metrics = []
+
+        def record_block(*args, **kwargs):
+            loss, metrics = block_loss(*args, **kwargs)
+            block_metrics.append(metrics)
+            return loss, metrics
+
+        output = self.root / "accumulated"
+        with mock.patch("draft_training.trainer.block_loss", side_effect=record_block):
+            self.run_train(self.model, output)
+        record = json.loads((output / "metrics.jsonl").read_text())
+        self.assertEqual(len(block_metrics), 6)
+        self.assertEqual(record["blocks"], 6)
+        for name in ("tokens", "covered", "selector_correct"):
+            self.assertEqual(record[name], sum(m[name] for m in block_metrics))
+        for name in ("unary_ce", "selector_ce"):
+            expected = (
+                sum(m[name] * m["tokens"] for m in block_metrics) / record["tokens"]
+            )
+            self.assertAlmostEqual(record[name], expected)
+        self.assertNotEqual(record["unary_ce"], block_metrics[-1]["unary_ce"])
+
+    def test_selection_reports_improvement_ties_and_regressions_against_baseline(self):
+        from unittest import mock
+
+        self.recipe = replace(self.recipe, max_steps=1)
+        for baseline, selected, outcome in (
+            (1.0, 2.0, "improved"),
+            (2.0, 2.0, "tied"),
+            (3.0, 2.0, "regressed"),
+        ):
+            with self.subTest(outcome=outcome):
+                output = self.root / outcome
+                model, _, _ = tiny_components()
+                with mock.patch(
+                    "draft_training.trainer.evaluate_cached",
+                    side_effect=[
+                        {"mean_matching_proposals": baseline},
+                        {"mean_matching_proposals": selected},
+                    ],
+                ):
+                    self.run_train(model, output)
+                comparison = read_json(output / "selection.json")[
+                    "validation_comparison"
+                ]
+                self.assertEqual(
+                    comparison,
+                    {
+                        "baseline_mean_matching_proposals": baseline,
+                        "selected_mean_matching_proposals": selected,
+                        "delta_mean_matching_proposals": selected - baseline,
+                        "outcome": outcome,
+                    },
+                )
 
     def test_export_roundtrip_and_finite_guard(self):
         from draft_training.config import checkpoint_identity, validate_draft

@@ -186,7 +186,6 @@ def run_training(args, *, family=True):
         }
     torch = require_torch(args.device)
     from .capture import TargetAdapter, capture_dataset
-    from .evaluate import evaluate_cached
     from .model import load_draft
     from .trainer import train
 
@@ -338,13 +337,6 @@ def run_training(args, *, family=True):
     # training optimizer state do not have to coexist on the accelerator.
     embedding, head = adapter.release_teacher()
     model = load_draft(args.init_draft, config, args.device)
-    if not (args.output / "baseline-validation.json").exists():
-        write_json(
-            args.output / "baseline-validation.json",
-            evaluate_cached(
-                model, embedding, head, validation_dir, recipe, args.device
-            ),
-        )
     return train(
         model,
         embedding,

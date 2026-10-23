@@ -77,15 +77,19 @@ class TargetAdapter:
     @torch.no_grad()
     def make_sample(self, messages, answer, recipe):
         prefix = self.tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            **recipe.chat_template_kwargs(),
         ).to(self.device)
         if not isinstance(prefix, torch.Tensor):
             prefix = prefix["input_ids"]
-        if prefix.shape[1] + recipe.max_new_tokens > recipe.sequence_length:
-            raise TrainingError(
-                "prompt plus max_new_tokens exceeds sequence_length; shorten the example or increase the recipe limit"
-            )
         if answer is None:
+            if prefix.shape[1] + recipe.max_new_tokens > recipe.sequence_length:
+                raise TrainingError(
+                    "prompt plus max_new_tokens exceeds sequence_length; shorten the example or increase the recipe limit"
+                )
             sequence = self.model.generate(
                 input_ids=prefix,
                 max_new_tokens=recipe.max_new_tokens,
@@ -98,6 +102,7 @@ class TargetAdapter:
                 tokenize=True,
                 add_generation_prompt=False,
                 return_tensors="pt",
+                **recipe.chat_template_kwargs(),
             ).to(self.device)
             if not isinstance(complete, torch.Tensor):
                 complete = complete["input_ids"]
@@ -131,6 +136,7 @@ def capture_dataset(adapter, data_path, output, recipe, identity, supervision):
         "data": file_digest(data_path),
         "sequence_length": recipe.sequence_length,
         "max_new_tokens": recipe.max_new_tokens,
+        "chat_template": recipe.chat_template_kwargs(),
         "generation": {"do_sample": False},
     }
     manifest = (

@@ -54,6 +54,8 @@ class Recipe:
     checkpoint_interval: int = 10
     validation_interval: int = 10
     max_new_tokens: int = 128
+    enable_thinking: bool = True
+    reasoning_effort: str = "xhigh"
     max_validation_blocks: int = 64
     vocabulary_chunk_rows: int = 1
     trainable: str = "selector"
@@ -71,6 +73,10 @@ class Recipe:
         if unknown:
             raise TrainingError(f"unknown recipe settings: {sorted(unknown)}")
         recipe = cls(**values)
+        if type(recipe.enable_thinking) is not bool:
+            raise TrainingError("enable_thinking must be a boolean")
+        if recipe.reasoning_effort not in ("low", "medium", "xhigh"):
+            raise TrainingError("reasoning_effort must be low, medium, or xhigh")
         positive = (
             "max_steps",
             "sequence_length",
@@ -119,6 +125,12 @@ class Recipe:
 
     def to_dict(self):
         return asdict(self)
+
+    def chat_template_kwargs(self):
+        return {
+            "enable_thinking": self.enable_thinking,
+            "reasoning_effort": self.reasoning_effort,
+        }
 
 
 def checkpoint_index(directory):

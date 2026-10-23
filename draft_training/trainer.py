@@ -76,6 +76,13 @@ def train(
         lr=recipe.learning_rate,
         weight_decay=recipe.weight_decay,
     )
+    baseline_path = output / "baseline-validation.json"
+    if not baseline_path.exists():
+        write_json(
+            baseline_path,
+            evaluate_cached(model, embedding, head, validation_dir, recipe, device),
+        )
+    baseline_score = read_json(baseline_path)["mean_matching_proposals"]
     progress = {
         "step": 0,
         "cursor": 0,
@@ -111,7 +118,8 @@ def train(
         alpha = recipe.selector_loss_weight * min(
             1.0, step / max(1, recipe.selector_warmup_steps)
         )
-        latest_metrics = None
+        step_totals = {}
+        counts = ("tokens", "covered", "selector_correct")
         micro_count = recipe.batch_size * recipe.gradient_accumulation
         for _ in range(micro_count):
             cursor, sample, anchor = next(stream)
@@ -121,7 +129,7 @@ def train(
                 hidden = model.block_hidden(
                     sample["tokens"], sample["features"], anchor, embedding
                 )
-                loss, latest_metrics = block_loss(
+                loss, metrics = block_loss(
                     model,
                     hidden,
                     sample["tokens"],
@@ -136,7 +144,14 @@ def train(
                 )
             if loss.requires_grad:
                 (loss / micro_count).backward()
+            for key, value in metrics.items():
+                contribution = value if key in counts else value * metrics["tokens"]
+                step_totals[key] = step_totals.get(key, 0) + contribution
             progress["cursor"] = cursor + 1
+        step_metrics = {
+            key: value if key in counts else value / step_totals["tokens"]
+            for key, value in step_totals.items()
+        }
         norm = torch.nn.utils.clip_grad_norm_(
             model.parameters(), recipe.max_grad_norm, error_if_nonfinite=True
         )
@@ -148,7 +163,8 @@ def train(
             "step": step,
             "seconds": time.monotonic() - start,
             "gradient_norm": float(norm),
-            **latest_metrics,
+            "blocks": micro_count,
+            **step_metrics,
         }
         due = step % recipe.validation_interval == 0 or step == recipe.max_steps
         if due:
@@ -167,7 +183,7 @@ def train(
 
             stream_log.write(json.dumps(record, allow_nan=False) + "\n")
         print(
-            f"step {step}/{recipe.max_steps}: unary CE {latest_metrics['unary_ce']:.4f}",
+            f"step {step}/{recipe.max_steps}: unary CE {step_metrics['unary_ce']:.4f}",
             flush=True,
         )
         if due or step % recipe.checkpoint_interval == 0 or step == stop_after:
@@ -208,7 +224,17 @@ def train(
         "export_identity": export_identity,
         "recipe": recipe.to_dict(),
         "selected_checkpoint": progress["best_checkpoint"],
-        "criterion": "maximum validation mean_matching_proposals; earliest step wins ties",
+        "criterion": "maximum validation mean_matching_proposals among trained checkpoints; earliest step wins ties; released baseline reported separately",
+        "validation_comparison": {
+            "baseline_mean_matching_proposals": baseline_score,
+            "selected_mean_matching_proposals": progress["best_score"],
+            "delta_mean_matching_proposals": progress["best_score"] - baseline_score,
+            "outcome": "improved"
+            if progress["best_score"] > baseline_score
+            else "regressed"
+            if progress["best_score"] < baseline_score
+            else "tied",
+        },
         "native_validation": "not run",
         "status": "experimental",
     }

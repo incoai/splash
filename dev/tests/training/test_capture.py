@@ -93,6 +93,110 @@ class CaptureTests(unittest.TestCase):
                 "target-generated",
             )
 
+    def test_supplied_answer_uses_actual_length_instead_of_generation_budget(self):
+        from unittest import mock
+
+        from draft_training.data import anchors
+
+        messages = [{"role": "user", "content": " ".join(["w5"] * 54)}]
+        with mock.patch.object(self.adapter.model, "generate") as generate:
+            sample = self.adapter.make_sample(
+                messages, " ".join(["w6"] * 8), self.recipe
+            )
+            self.assertEqual(len(sample["tokens"]), self.recipe.sequence_length)
+            self.assertTrue(list(anchors(sample, 8)))
+            with self.assertRaisesRegex(TrainingError, "supplied answer exceeds"):
+                self.adapter.make_sample(messages, " ".join(["w6"] * 9), self.recipe)
+            with self.assertRaisesRegex(TrainingError, "prompt plus max_new_tokens"):
+                self.adapter.make_sample(messages, None, self.recipe)
+            generate.assert_not_called()
+
+    def test_thinking_settings_apply_to_prompt_and_supplied_answer(self):
+        from unittest import mock
+
+        for enabled in (False, True):
+            with self.subTest(enable_thinking=enabled):
+                recipe = replace(
+                    self.recipe, enable_thinking=enabled, reasoning_effort="low"
+                )
+                with mock.patch.object(
+                    self.adapter.tokenizer,
+                    "apply_chat_template",
+                    wraps=self.adapter.tokenizer.apply_chat_template,
+                ) as apply_template:
+                    self.adapter.make_sample(
+                        [{"role": "user", "content": "w5 w6"}],
+                        " ".join(["w7"] * 8),
+                        recipe,
+                    )
+                self.assertEqual(apply_template.call_count, 2)
+                for call in apply_template.call_args_list:
+                    self.assertIs(call.kwargs["enable_thinking"], enabled)
+                    self.assertEqual(call.kwargs["reasoning_effort"], "low")
+
+    def test_family_template_thinking_modes_preserve_supplied_answer_prefix(self):
+        template = (
+            Path(__file__).resolve().parents[1] / "fixtures/chat_templates/qwen38.jinja"
+        ).read_text()
+        messages = [{"role": "user", "content": "w5 w6"}]
+        for enabled in (False, True):
+            for effort in ("low", "medium", "xhigh"):
+                with self.subTest(enable_thinking=enabled, reasoning_effort=effort):
+                    recipe = replace(
+                        self.recipe, enable_thinking=enabled, reasoning_effort=effort
+                    )
+                    kwargs = {
+                        "chat_template": template,
+                        **recipe.chat_template_kwargs(),
+                    }
+                    prefix = self.tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        **kwargs,
+                    )
+                    complete = self.tokenizer.apply_chat_template(
+                        [*messages, {"role": "assistant", "content": "w7"}],
+                        tokenize=False,
+                        add_generation_prompt=False,
+                        **kwargs,
+                    )
+                    self.assertTrue(complete.startswith(prefix))
+                    self.assertTrue(
+                        prefix.endswith("<think>\n" if enabled else "</think>\n\n")
+                    )
+                    if enabled and effort != "medium":
+                        self.assertIn(f"Reasoning effort is set to {effort}.", prefix)
+                    else:
+                        self.assertNotIn("Reasoning effort is set to", prefix)
+
+    def test_capture_rejects_changed_thinking_settings_before_reuse(self):
+        from unittest import mock
+
+        from draft_training.capture import capture_dataset
+
+        data, output = self.root / "data.jsonl", self.root / "features"
+        write_data(data, "w5 w6")
+        manifest = capture_dataset(
+            self.adapter, data, output, self.recipe, {}, "target-generated"
+        )
+        self.assertEqual(
+            manifest["binding"]["chat_template"], self.recipe.chat_template_kwargs()
+        )
+        for changes in ({"enable_thinking": False}, {"reasoning_effort": "low"}):
+            with self.subTest(changes=changes):
+                with mock.patch.object(self.adapter, "make_sample") as make_sample:
+                    with self.assertRaisesRegex(TrainingError, "provenance"):
+                        capture_dataset(
+                            self.adapter,
+                            data,
+                            output,
+                            replace(self.recipe, **changes),
+                            {},
+                            "target-generated",
+                        )
+                    make_sample.assert_not_called()
+
     def test_capture_train_export_and_final_test_replay(self):
         from draft_training.capture import capture_dataset
         from draft_training.config import checkpoint_identity, write_json
@@ -183,6 +287,9 @@ class CaptureTests(unittest.TestCase):
         from draft_training.data import split_manifest
         from draft_training.export import export_model
 
+        self.recipe = replace(
+            self.recipe, enable_thinking=False, reasoning_effort="low"
+        )
         initial, _, _ = tiny_components()
         draft = self.root / "draft"
         export_model(initial, draft, {}, family=False)
@@ -219,6 +326,31 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(selection["native_validation"], "not run")
         self.assertTrue((output / "baseline-validation.json").exists())
         self.assertTrue(selection["implementation"])
+        self.assertEqual(selection["recipe"], self.recipe.to_dict())
+        for split in ("train", "validation"):
+            self.assertEqual(
+                read_json(output / "features" / split / "manifest.json")["binding"][
+                    "chat_template"
+                ],
+                self.recipe.chat_template_kwargs(),
+            )
+        args.resume = True
+        for changes in ({"enable_thinking": True}, {"reasoning_effort": "medium"}):
+            with self.subTest(resume_changes=changes):
+                with (
+                    mock.patch(
+                        "draft_training.__main__.inspect_training",
+                        return_value=(
+                            inspected[0],
+                            replace(self.recipe, **changes),
+                            *inspected[2:],
+                        ),
+                    ),
+                    mock.patch("draft_training.capture.TargetAdapter.load") as load,
+                ):
+                    with self.assertRaisesRegex(TrainingError, "resume configuration"):
+                        run_training(args, family=False)
+                    load.assert_not_called()
         test_data = self.root / "test.jsonl"
         write_data(test_data, "w9 w10")
         evaluation = argparse.Namespace(
@@ -242,6 +374,12 @@ class CaptureTests(unittest.TestCase):
         report = read_json(evaluation.output / "test-report.json")
         self.assertEqual(report["metrics"], metrics)
         self.assertEqual(report["test_split"], split_manifest(test_data))
+        self.assertEqual(
+            read_json(evaluation.output / "features/manifest.json")["binding"][
+                "chat_template"
+            ],
+            self.recipe.chat_template_kwargs(),
+        )
 
     def test_changed_execution_context_is_rejected_before_test_data_is_opened(self):
         import argparse

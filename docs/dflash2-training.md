@@ -34,8 +34,10 @@ results below or in the PR description keep their original source scope.
 Use Python 3.12–3.14 and a separate training environment. CUDA is the default
 for real training. CPU execution supports small reference diagnostics; large
 BF16 checkpoints still need memory for all their weights. Hardware capacity
-must be measured with preflight; this implementation has not yet completed a
-production Qwen3.8-27B CUDA run or a trained-checkpoint native speed benchmark.
+must be measured with preflight. A previously published combined training stack
+completed a real-checkpoint CUDA smoke and native loading/replay; see
+[qualification evidence](#published-integration-evidence). That evidence does
+not establish serving speed or qualify subsequent code changes.
 
 ```bash
 python3.12 -m venv /path/to/training-env
@@ -74,6 +76,25 @@ replaces its continuation with the frozen teacher's greedy generation and
 never includes later source turns in that continuation. `supplied-answers`
 uses the assistant turn immediately following each user turn; it is a
 separate experiment and may reduce agreement with the teacher.
+Supplied answers are checked against the actual tokenized sequence length;
+`max_new_tokens` reserves continuation space only for generated supervision.
+
+The recipe explicitly controls chat-template conditioning:
+
+```yaml
+enable_thinking: true
+reasoning_effort: xhigh  # low, medium, or xhigh
+```
+
+These defaults preserve the released teacher template's previous behavior.
+Set `enable_thinking: false` for an experiment targeting non-thinking serving;
+the template ignores reasoning effort in that mode. Both settings apply to
+prompt and supplied-answer rendering, are stored in feature-cache bindings,
+and are frozen in run/export/selection provenance through the recipe.
+Changing either setting requires a new run and new captures. Final evaluation
+uses the selected run's settings. Short thinking-enabled continuations may
+contain mostly reasoning tokens, so match this mode to deployment before
+comparing effectiveness.
 
 Keep every source conversation and derived prompt in one split. Duplicate
 normalized prompt prefixes or an explicit shared `source_id` across splits are
@@ -115,6 +136,8 @@ master parameters and moments with BF16 autocast for forward matmuls. The
 learning rate is constant; selector loss weight ramps over the configured
 optimizer steps. The effective streamed batch is `batch_size` times
 `gradient_accumulation`, processed one isolated block at a time.
+Each optimizer-step log aggregates token, coverage and correct-selector counts
+across all of those blocks, with token-weighted mean losses.
 
 The target is frozen throughout. After capture, its decoder and vision weights
 are released; training retains only the frozen embedding and output head.
@@ -150,7 +173,12 @@ finishing the manifest. It never replaces a published export. An independent
 ## Evaluation and native serving
 
 Checkpoint selection uses validation trace replay only. It maximizes mean
-consecutive matching proposals; the earlier checkpoint wins ties. Validation
+consecutive matching proposals among trained checkpoints; the earlier
+checkpoint wins ties. The released draft is reported separately.
+`selection.json` includes a `validation_comparison` with the baseline and
+selected scores, their delta, and an `improved`, `tied`, or `regressed` outcome.
+The best trained checkpoint can still underperform the released draft; selection
+alone is not a recommendation to deploy it. Validation
 uses the BF16 weights that will be exported and then restores the FP32 masters
 before training continues. The export,
 recipe, input identities, implementation, library versions, device context,
@@ -221,6 +249,24 @@ performance recommendation:
 The CPU fixture tests establish implementation behavior at small dimensions.
 They do not satisfy these hardware gates. Fresh initialization, additional
 target families, and a Mac training backend are outside this PR's scope.
+
+## Published integration evidence
+
+The [2026-10-22 CUDA/native smoke report](https://github.com/linson007/splash/blob/310e75d7f22e7a86f2141c5cf93e82aba62a9342/docs/experiments/qwen38-a100-smoke/README.md)
+records the combined training stack at `d066629ff370`, containing the previous
+#499 head plus #537, #551, #552, #553 and #554. It ran 20 selector-continuation
+steps on an A100-SXM4-80GB and loaded the finite BF16 export in native Splash
+on Apple M5 Pro. Full-draft training received one backward/optimizer preflight
+update. This was integration evidence, rather than an isolated #499 CUDA run.
+
+Validation mean matching proposals stayed 3.875 before and after training, and
+the short native probes showed no consistent acceptance improvement. The tiny
+authored splits, one seed, template-default thinking/xhigh during capture,
+non-thinking native probes and distinct quantized deployment target limit
+effectiveness conclusions. Sustained full-draft training, matched-distribution
+comparisons, sampled decoding, longer contexts and paired serving throughput
+and latency measurements remain separate qualification work. The recorded
+runs precede the explicit thinking controls and metric fixes described above.
 
 ## Development tests
 
