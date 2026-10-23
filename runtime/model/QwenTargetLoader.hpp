@@ -53,10 +53,15 @@ struct BlockTargetFormat final {
   }
 };
 
-// Reads the mixer sections that follow a layer's input norm, in file order.
+// Reads the mixer sections that follow a layer's input norm, in file order:
+// an attention layer's (readQwenAttention) or a GDN layer's.
 [[nodiscard]] QwenMixerWeights readQwenMixer(WeightFile &file, const BlockTargetFormat &format,
                                              const QwenTargetDimensions &target,
                                              bool fullAttention);
+// An attention layer's: its fused q, k and v projection, the q and k norms
+// and its output projection.
+[[nodiscard]] QwenAttentionWeights readQwenAttention(WeightFile &file, const BlockTargetFormat &format,
+                                                     const QwenTargetDimensions &target);
 
 // How a MoE target's blocks reach their routed experts: through a store when
 // they stream (its files' loader streamsExperts()), the target's layers its
@@ -75,6 +80,29 @@ struct MoeExperts final {
 // and down and its scalar gate. Block `block` of the store when its experts
 // stream.
 [[nodiscard]] ops::BlockMoeWeights readMoeBlock(WeightFile &file, const MoeExperts &experts, uint32_t block);
+
+// Reads, into `result`, the head of a target whose last layer's rows read a
+// final norm, then its token embedding: the images after its layers'.
+template <class Weights, class Layout, class Files>
+void readQwenTargetHead(Weights &result, const Layout &layout, Files &&files, const BlockTargetFormat &format) {
+  {
+    WeightFile file = files.head();
+    result.finalNorm = format.norm(file, layout.hiddenSize, "final-norm");
+    result.logitsProjection =
+        format.projection(file, layout.vocabularySize, layout.hiddenSize, "logits");
+    // bf16 logits would round near-ties together: their spacing is 0.125 at
+    // logits of 16 to 32.
+    result.logitsProjection.destination = ops::FloatOutput::Float32;
+    file.finish();
+    result.files.push_back(file.record());
+  }
+  {
+    WeightFile file = files.embedding();
+    result.tokenEmbedding = format.embedding(file, layout.vocabularySize, layout.hiddenSize);
+    file.finish();
+    result.files.push_back(file.record());
+  }
+}
 
 // Reads a target through the files of its images, written from an upstream
 // source, in their format: per layer the input norm, mixer,
@@ -100,24 +128,7 @@ readQwenTargetWeights(const Layout &layout, Files &&files, const BlockTargetForm
     file.finish();
     result.files.push_back(file.record());
   }
-
-  {
-    WeightFile file = files.head();
-    result.finalNorm = format.norm(file, layout.hiddenSize, "final-norm");
-    result.logitsProjection =
-        format.projection(file, layout.vocabularySize, layout.hiddenSize, "logits");
-    // bf16 logits would round near-ties together: their spacing is 0.125 at
-    // logits of 16 to 32.
-    result.logitsProjection.destination = ops::FloatOutput::Float32;
-    file.finish();
-    result.files.push_back(file.record());
-  }
-  {
-    WeightFile file = files.embedding();
-    result.tokenEmbedding = format.embedding(file, layout.vocabularySize, layout.hiddenSize);
-    file.finish();
-    result.files.push_back(file.record());
-  }
+  readQwenTargetHead(result, layout, files, format);
   return result;
 }
 

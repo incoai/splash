@@ -2460,8 +2460,15 @@ through `BlockTargetFormat`, which reads each tensor as one block-quantized
 `QuantizedSegment` (a fused projection's tensors in output column order), the
 norms as F32 (bf16 for an MLX checkpoint), and keeps the GDN output projection's
 input in the source's value-head order, llama.cpp's tiled or MLX's grouped.
-Both Qwen families share one layout
-(`QwenHybridLayout`) and its validator.
+Every family's layout derives `QwenHybridLayout`, whose validator
+(`requireQwenLayout`) it shares.
+
+A family's target is a `QwenTarget` (`QwenTarget.hpp`) composed of the blocks
+every Qwen target shares: a step's checks and plans, the GDN and attention
+mixers, the FFNs of a residual of one row (a dense SwiGLU and a MoE block's
+routing and experts), the draft's captures and the normed head. The Qwen3.5
+architecture's target (`Qwen3_5Target`, `QwenTarget.cpp`) and Flash-Next's
+(`Qwen4ExpTarget`) each compose them into their own layer loop.
 
 Every source loads into block planes: `Projection`, `BlockMoeWeights` and
 `EmbeddingWeights` (`runtime/ops/Weights.hpp`, `MoE.hpp`) hold them whatever

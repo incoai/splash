@@ -18,18 +18,20 @@ ops::Projection BlockTargetFormat::fused(WeightFile &file, uint32_t outputSize, 
   return {outputSize, inputSize, std::move(weights)};
 }
 
+QwenAttentionWeights readQwenAttention(WeightFile &file, const BlockTargetFormat &format,
+                                       const QwenTargetDimensions &target) {
+  QwenAttentionWeights attention;
+  attention.inputProjection =
+      format.fused(file, target.packedFullWidth, target.hiddenSize, {"attn-q", "attn-k", "attn-v"});
+  attention.queryNorm = format.norm(file, target.attentionHeadDimension, "query-norm");
+  attention.keyNorm = format.norm(file, target.attentionHeadDimension, "key-norm");
+  attention.outputProjection = format.projection(file, target.hiddenSize, target.attentionWidth, "attention-output");
+  return attention;
+}
+
 QwenMixerWeights readQwenMixer(WeightFile &file, const BlockTargetFormat &format,
                                const QwenTargetDimensions &target, bool fullAttention) {
-  if (fullAttention) {
-    QwenAttentionWeights attention;
-    attention.inputProjection =
-        format.fused(file, target.packedFullWidth, target.hiddenSize, {"attn-q", "attn-k", "attn-v"});
-    attention.queryNorm = format.norm(file, target.attentionHeadDimension, "query-norm");
-    attention.keyNorm = format.norm(file, target.attentionHeadDimension, "key-norm");
-    attention.outputProjection =
-        format.projection(file, target.hiddenSize, target.attentionWidth, "attention-output");
-    return attention;
-  }
+  if (fullAttention) return readQwenAttention(file, format, target);
   QwenGdnWeights gdn;
   gdn.inputProjection = format.fused(file, target.packedGdnWidth, target.hiddenSize, {"gdn-qkv", "gdn-z", "gdn-ab"});
   gdn.convolutionWeights = file.section(

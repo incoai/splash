@@ -71,18 +71,19 @@ void QwenTargetGeometry::finish(std::span<const ops::BlockMoeWeights *const> moe
 
 const ops::BlockMoeWeights *qwenMoeBlock(const Qwen3_8LayerWeights &) noexcept { return nullptr; }
 
-// A dense layer's FFN runs its gate and up as one gate/up plan, which takes
-// them of one size and rotation in any formats.
+void includeDenseFfn(QwenTargetGeometry &geometry, ops::SwiGluProjections ffn) {
+  const ops::ProjectionShape gate = ffn.gate->shape(), up = ffn.up->shape();
+  if (gate.outputSize != up.outputSize || gate.inputSize != up.inputSize || gate.rotated != up.rotated)
+    throw WeightStoreError("fused gate/up projections must have matching shapes");
+  geometry.include(*ffn.gate);
+  geometry.include(*ffn.up);
+  geometry.include(*ffn.down);
+  geometry.gateUpProjections.push_back(up);
+}
+
 void includeFamilyProjections(QwenTargetGeometry &geometry, const Qwen3_8Weights &weights) {
-  for (const Qwen3_8LayerWeights &layer : weights.layers) {
-    const ops::ProjectionShape gate = layer.gateProjection.shape(), up = layer.upProjection.shape();
-    if (gate.outputSize != up.outputSize || gate.inputSize != up.inputSize || gate.rotated != up.rotated)
-      throw WeightStoreError("fused gate/up projections must have matching shapes");
-    geometry.include(layer.gateProjection);
-    geometry.include(layer.upProjection);
-    geometry.include(layer.downProjection);
-    geometry.gateUpProjections.push_back(up);
-  }
+  for (const Qwen3_8LayerWeights &layer : weights.layers)
+    includeDenseFfn(geometry, {&layer.gateProjection, &layer.upProjection, &layer.downProjection});
 }
 void includeFamilyProjections(QwenTargetGeometry &, const Qwen3_6MoeWeights &) {}
 
@@ -366,19 +367,75 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mi
              mixer.outputProjection, outputPlan);
 }
 
-namespace {
+void QwenTarget::addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops::NormWeights &norm,
+                                    ops::SwiGluProjections ffn, metal::MetalBuffer residual,
+                                    metal::MetalBuffer output) const {
+  ops::Normalization::addRms(step.graph, residual, norm, step.buffers.normalized, geometry_.hiddenSize, step.rows);
+  const ops::PrefillFfnBuffers buffers = step.buffers.ffn();
+  if (step.aneFfn)
+    step.aneFfn->add(step.graph, index, buffers, std::move(residual), std::move(output), step.rows);
+  else
+    operators_.linear().addPrefillSwiGlu(step.graph, ffn, buffers, std::move(residual), std::move(output),
+                                         step.rows);
+}
 
-// Copies `rows` rows of a capture layer's output, from row `sourceRow`, into
-// capture slot `slot` of the captured hidden rows from row `destinationRow`.
-void addCapture(metal::CommandGraph &graph, const QwenTargetGeometry &geometry, uint32_t slot,
-                metal::MetalBuffer output, uint32_t sourceRow, metal::MetalBuffer captured,
-                uint32_t destinationRow, uint32_t rows) {
-  const uint32_t width = geometry.hiddenSize, capturedWidth = geometry.capturedHiddenSize();
+void QwenTarget::addPrefillMoeRouting(PrefillStep &step, const ops::NormWeights &norm,
+                                      const ops::BlockMoeWeights &ffn, metal::MetalBuffer residual,
+                                      metal::MetalBuffer output) const {
+  const QwenTargetPrefillBuffers &b = step.buffers;
+  ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, step.rows);
+  step.ffn = {b.normalized, std::move(residual), std::move(output), b.moe, {}};
+  ops::MoE::addRouting(step.graph, step.ffn, ffn, *step.moe);
+}
+
+void QwenTarget::addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &norm, ops::SwiGluProjections ffn,
+                                   metal::MetalBuffer residual, metal::MetalBuffer output) const {
+  const QwenTargetVerifyBuffers &b = step.buffers;
+  const ops::Linear &linear = operators_.linear();
+  const ops::LinearPlan gateUpPlan =
+      linear.decodePlan(*ffn.up, step.lanes, ops::LinearEpilogue::GateUp, ffn.gate);
+  const ops::PreparedInput normalized =
+      ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, step.rows,
+                                 b.linearScratch, gateUpPlan.input());
+  linear.add(step.graph,
+             {.input = b.normalized, .output = b.denseIntermediate, .gateScratch = b.denseGateScratch,
+              .scratch = b.linearScratch, .prepared = normalized},
+             *ffn.up, gateUpPlan, ffn.gate);
+  linear.add(step.graph,
+             {.input = b.denseIntermediate, .output = std::move(output), .residual = std::move(residual),
+              .scratch = b.linearScratch},
+             *ffn.down, linear.decodePlan(*ffn.down, step.lanes, ops::LinearEpilogue::Residual));
+}
+
+void QwenTarget::addVerifyMoe(VerifyStep &step, const ops::NormWeights &norm, const ops::BlockMoeWeights &ffn,
+                              metal::MetalBuffer residual, metal::MetalBuffer output) const {
+  const QwenTargetVerifyBuffers &b = step.buffers;
+  ops::Normalization::addRms(step.graph, residual, norm, b.normalized, geometry_.hiddenSize, step.rows);
+  ops::MoE::add(step.graph, {b.normalized, std::move(residual), std::move(output), b.moe, b.verifyRows}, ffn,
+                *step.moe);
+}
+
+void QwenTarget::addNormalizedHead(metal::CommandGraph &graph, const ops::NormWeights &finalNorm,
+                                   metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
+                                   metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const {
+  const ops::PreparedInput normalized =
+      ops::Normalization::addRms(graph, std::move(hidden), finalNorm, finalHidden, geometry_.hiddenSize,
+                                 lanes * kVerifyRows, scratch, decodeInput(vocabularyProjection(), lanes));
+  addDecodeProjection(graph, std::move(finalHidden), vocabularyProjection(), std::move(logits), lanes, scratch,
+                      normalized);
+}
+
+void QwenTarget::addCapture(metal::CommandGraph &graph, uint32_t slot, metal::MetalBuffer output,
+                            uint32_t sourceRow, metal::MetalBuffer captured, uint32_t destinationRow,
+                            uint32_t rows) const {
+  const uint32_t width = geometry_.hiddenSize, capturedWidth = geometry_.capturedHiddenSize();
   if (slot >= capturedWidth / width)
     throw std::logic_error("Qwen target capture slot past the captured hidden rows");
   ops::RowCopy::add(graph, std::move(output), {sourceRow, width, 0}, std::move(captured),
                     {destinationRow, capturedWidth, slot * width}, rows, width);
 }
+
+namespace {
 
 // The rows a mixer's output projection adds to the layer's input rows into.
 template <class Buffers> metal::MetalBuffer mixerOutput(const Buffers &b, const QwenGdnWeights &) {
@@ -429,7 +486,7 @@ public:
           layer.mixer);
       addVerifyFfn(step, layer, residual, output);
       if (const auto slot = geometry_.captureSlot(index))
-        addCapture(step.graph, geometry_, *slot, output, 0, buffers.capturedTargetHidden, 0, step.rows);
+        addCapture(step.graph, *slot, output, 0, buffers.capturedTargetHidden, 0, step.rows);
     }
     requireLayerPartition(step.gdnLayer, step.attentionLayer);
     addHeadBatch(step.graph, buffers.hidden[geometry_.layers & 1], buffers.finalHidden, buffers.logits, step.lanes,
@@ -438,11 +495,8 @@ public:
 
   void addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden, metal::MetalBuffer finalHidden,
                     metal::MetalBuffer logits, uint32_t lanes, ops::LinearScratch scratch) const override {
-    const ops::PreparedInput normalized = ops::Normalization::addRms(
-        graph, std::move(hidden), weights_.finalNorm, finalHidden, geometry_.hiddenSize, lanes * kVerifyRows,
-        scratch, decodeInput(vocabularyProjection(), lanes));
-    addDecodeProjection(graph, std::move(finalHidden), vocabularyProjection(), std::move(logits), lanes, scratch,
-                        normalized);
+    addNormalizedHead(graph, weights_.finalNorm, std::move(hidden), std::move(finalHidden), std::move(logits), lanes,
+                      scratch);
   }
 
 private:
@@ -472,61 +526,34 @@ private:
     const QwenTargetPrefillBuffers &b = step.buffers;
     if (const ops::BlockMoeWeights *ffn = moe(index)) ops::MoE::addRouted(step.graph, step.ffn, *ffn, *step.moe);
     forEachPrefillCapture(step, index, [&](uint32_t slot, uint32_t source, uint32_t destination, uint32_t rows) {
-      addCapture(step.graph, geometry_, slot, b.hidden[(index & 1) ^ 1], source, b.captured, destination, rows);
+      addCapture(step.graph, slot, b.hidden[(index & 1) ^ 1], source, b.captured, destination, rows);
     });
   }
   [[nodiscard]] metal::MetalBuffer addPrefillEnd(PrefillStep &step) const {
     return step.buffers.hidden[geometry_.layers & 1];
   }
 
-  // The FFN of layer `index`, of the RMS norm of the mixer's `residual` rows,
-  // adding to them into `output`: a dense FFN, or a MoE's routing, whose
-  // routed work addPrefillExperts adds.
+  // The FFN of layer `index` (QwenTarget::addPrefillDenseFfn and its kin): a
+  // dense FFN, or a MoE's routing, whose routed work addPrefillExperts adds.
   void addPrefillFfn(PrefillStep &step, uint32_t index, const Qwen3_8LayerWeights &layer,
                      metal::MetalBuffer residual, metal::MetalBuffer output) const {
-    ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, step.buffers.normalized,
-                               geometry_.hiddenSize, step.rows);
-    const ops::PrefillFfnBuffers ffn = step.buffers.ffn();
-    if (step.aneFfn)
-      step.aneFfn->add(step.graph, index, ffn, residual, output, step.rows);
-    else
-      operators_.linear().addPrefillSwiGlu(step.graph, {&layer.gateProjection, &layer.upProjection,
-                                                        &layer.downProjection},
-                                           ffn, residual, output, step.rows);
+    addPrefillDenseFfn(step, index, layer.postAttentionNorm, swiGlu(layer), std::move(residual), std::move(output));
   }
   void addPrefillFfn(PrefillStep &step, uint32_t, const Qwen3_6MoeLayerWeights &layer,
                      metal::MetalBuffer residual, metal::MetalBuffer output) const {
-    const QwenTargetPrefillBuffers &b = step.buffers;
-    ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize,
-                               step.rows);
-    step.ffn = {b.normalized, residual, output, b.moe, {}};
-    ops::MoE::addRouting(step.graph, step.ffn, layer.ffn, *step.moe);
+    addPrefillMoeRouting(step, layer.postAttentionNorm, layer.ffn, std::move(residual), std::move(output));
   }
 
   void addVerifyFfn(VerifyStep &step, const Qwen3_8LayerWeights &layer, metal::MetalBuffer residual,
                     metal::MetalBuffer output) const {
-    const QwenTargetVerifyBuffers &b = step.buffers;
-    const ops::Linear &linear = operators_.linear();
-    const ops::LinearPlan gateUpPlan =
-        linear.decodePlan(layer.upProjection, step.lanes, ops::LinearEpilogue::GateUp, &layer.gateProjection);
-    const ops::PreparedInput normalized = ops::Normalization::addRms(
-        step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize, step.rows,
-        b.linearScratch, gateUpPlan.input());
-    linear.add(step.graph,
-               {.input = b.normalized, .output = b.denseIntermediate, .gateScratch = b.denseGateScratch,
-                .scratch = b.linearScratch, .prepared = normalized},
-               layer.upProjection, gateUpPlan, &layer.gateProjection);
-    linear.add(step.graph,
-               {.input = b.denseIntermediate, .output = output, .residual = residual, .scratch = b.linearScratch},
-               layer.downProjection,
-               linear.decodePlan(layer.downProjection, step.lanes, ops::LinearEpilogue::Residual));
+    addVerifyDenseFfn(step, layer.postAttentionNorm, swiGlu(layer), std::move(residual), std::move(output));
   }
   void addVerifyFfn(VerifyStep &step, const Qwen3_6MoeLayerWeights &layer, metal::MetalBuffer residual,
                     metal::MetalBuffer output) const {
-    const QwenTargetVerifyBuffers &b = step.buffers;
-    ops::Normalization::addRms(step.graph, residual, layer.postAttentionNorm, b.normalized, geometry_.hiddenSize,
-                               step.rows);
-    ops::MoE::add(step.graph, {b.normalized, residual, output, b.moe, b.verifyRows}, layer.ffn, *step.moe);
+    addVerifyMoe(step, layer.postAttentionNorm, layer.ffn, std::move(residual), std::move(output));
+  }
+  static ops::SwiGluProjections swiGlu(const Qwen3_8LayerWeights &layer) {
+    return {&layer.gateProjection, &layer.upProjection, &layer.downProjection};
   }
 
   const QwenTargetWeights<Layout, Layer> &weights_;

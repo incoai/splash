@@ -364,6 +364,19 @@ template <class Layer> [[nodiscard]] const ops::BlockMoeWeights *qwenMoeBlock(co
   return &layer.ffn;
 }
 
+// The projections of a layer's mixer, of either kind (QwenMixerWeights) or
+// of one.
+template <class Mixer> void includeMixer(QwenTargetGeometry &geometry, const Mixer &mixer) {
+  geometry.include(mixer.inputProjection);
+  geometry.include(mixer.outputProjection);
+}
+inline void includeMixer(QwenTargetGeometry &geometry, const QwenMixerWeights &mixer) {
+  std::visit([&](const auto &kind) { includeMixer(geometry, kind); }, mixer);
+}
+// A dense FFN's projections, whose gate and up run as one gate/up plan,
+// which takes them of one size and rotation in any formats.
+void includeDenseFfn(QwenTargetGeometry &geometry, ops::SwiGluProjections ffn);
+
 // The projections a family's layers and head dispatch beyond their mixers'
 // and MoE blocks' (qwenTargetGeometry): Qwen3.8-27B's dense FFN; the
 // Qwen3.6-35B-A3B's none (Qwen3.8-Flash-Next's: model/Qwen4Exp.hpp).
@@ -383,10 +396,7 @@ template <class Weights>
   geometry.stateLayout = weights.layout.gdnStateLayout();
   std::vector<const ops::BlockMoeWeights *> moeBlocks;
   for (const auto &layer : weights.layers) {
-    std::visit([&](const auto &mixer) {
-      geometry.include(mixer.inputProjection);
-      geometry.include(mixer.outputProjection);
-    }, layer.mixer);
+    includeMixer(geometry, layer.mixer);
     if (const ops::BlockMoeWeights *block = qwenMoeBlock(layer)) moeBlocks.push_back(block);
   }
   includeFamilyProjections(geometry, weights);
@@ -395,12 +405,14 @@ template <class Weights>
 }
 
 // The target the runtime drives: a family's layers over the blocks every
-// Qwen hybrid family shares, made for its weights by makeQwenTarget. The
-// shared blocks are a step's checks and plans, the GDN and full-attention
-// mixers (one wiring each for prefill and for verify), the draft's captures
-// and the head's projection; each family composes them into its layers and
-// residual: the Qwen3.5 architecture's (Qwen3.8-27B and Qwen3.6-35B-A3B,
-// model/QwenTarget.cpp) and Qwen3.8-Flash-Next's (model/Qwen4ExpTarget.cpp).
+// Qwen target shares, made for its weights by makeQwenTarget. The shared
+// blocks are a step's checks and plans, the GDN and attention mixers (one
+// wiring each for prefill and for verify), the FFNs of a residual of one
+// row (a dense SwiGLU and a MoE block's routing and experts), the draft's
+// captures and the normed head; each family composes them into its layers
+// and residual: the Qwen3.5 architecture's (Qwen3.8-27B and
+// Qwen3.6-35B-A3B, model/QwenTarget.cpp) and Qwen3.8-Flash-Next's
+// (model/Qwen4ExpTarget.cpp).
 // A family that needs more of a step than the buffers the runtime binds
 // keeps that scratch itself (qwenTargetScratchBytes) and makes its own
 // inputs of the step's tokens; the runtime calls the same functions for
@@ -621,6 +633,32 @@ protected:
   void addDecodeProjection(metal::CommandGraph &graph, metal::MetalBuffer input, const ops::Projection &projection,
                            metal::MetalBuffer output, uint32_t lanes, ops::LinearScratch scratch,
                            ops::PreparedInput prepared = {}) const;
+  // The FFNs of a layer whose residual is one row of hiddenSize values: each
+  // reads the RMS norm `norm` of the mixer's `residual` rows and adds its
+  // output to them into `output`. A dense SwiGLU, in a prefill on the
+  // Neural Engine with the step's split of it (layer `index`'s, AneFfn); a
+  // MoE block's routing, whose routed work a prefill adds after the layer's
+  // load (addPrefillLayers, ops::MoE::addRouted with step.ffn), and a verify's
+  // whole block.
+  void addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops::NormWeights &norm,
+                          ops::SwiGluProjections ffn, metal::MetalBuffer residual, metal::MetalBuffer output) const;
+  void addPrefillMoeRouting(PrefillStep &step, const ops::NormWeights &norm, const ops::BlockMoeWeights &ffn,
+                            metal::MetalBuffer residual, metal::MetalBuffer output) const;
+  void addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &norm, ops::SwiGluProjections ffn,
+                         metal::MetalBuffer residual, metal::MetalBuffer output) const;
+  void addVerifyMoe(VerifyStep &step, const ops::NormWeights &norm, const ops::BlockMoeWeights &ffn,
+                    metal::MetalBuffer residual, metal::MetalBuffer output) const;
+  // The head of a target whose last layer's rows read a final RMS norm,
+  // `finalNorm`, into `finalHidden`, as addHeadBatch takes them.
+  void addNormalizedHead(metal::CommandGraph &graph, const ops::NormWeights &finalNorm, metal::MetalBuffer hidden,
+                         metal::MetalBuffer finalHidden, metal::MetalBuffer logits, uint32_t lanes,
+                         ops::LinearScratch scratch) const;
+  // Copies `rows` rows of a layer's output rows, from row `sourceRow` of
+  // `output`, into capture slot `slot` of the captured hidden rows from row
+  // `destinationRow`: the draft's capture of a layer whose output is one row
+  // of hiddenSize values.
+  void addCapture(metal::CommandGraph &graph, uint32_t slot, metal::MetalBuffer output, uint32_t sourceRow,
+                  metal::MetalBuffer captured, uint32_t destinationRow, uint32_t rows) const;
   // Each of a prefill step's captures of layer `index`'s output rows, when
   // the draft reads the layer: capture(slot, source row, destination row,
   // rows) of the captured hidden rows' slot `slot`.
