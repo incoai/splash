@@ -63,6 +63,44 @@ class KernelIdentityTests(unittest.TestCase):
         )
         self.assertTrue(lines[-1].startswith("kernel identity: 4 of 4 identical"))
 
+    def test_the_symbols_a_module_defines_are_compared_in_order(self):
+        # A helper and its threadgroup variable, which C++ names for the
+        # helper's template values, and an external declaration.
+        module = (
+            'source_filename = "verify_split"\n\n'
+            "@{1} = internal addrspace(3) global [8 x float] undef\n\n"
+            "define void @verify_split() {{\n"
+            "  tail call fastcc void @{0}(float addrspace(3)* @{1})\n"
+            "  tail call void @{2}()\n"
+            "  ret void\n}}\n\n"
+            "define internal fastcc void @{0}(float addrspace(3)* %0) {{\n"
+            "  ret void\n}}\n\n"
+            "declare void @{2}()\n"
+        )
+        baseline = {
+            "verify_split": module.format(
+                "_Z5splitILj4EEvv", "_ZZ5splitILj4EEvvE6maxima", "air.wg.barrier"
+            )
+        }
+        # A template value added with its old value renames both.
+        renamed = {
+            "verify_split": module.format(
+                "_Z5splitILj4ELj256EEvv",
+                "_ZZ5splitILj4ELj256EEvvE6maxima",
+                "air.wg.barrier",
+            )
+        }
+        status, lines = self.run_main(baseline, renamed)
+        self.assertEqual((status, lines[0]), (0, "identical: verify_split"))
+        # Another external is another function.
+        external = {
+            "verify_split": module.format(
+                "_Z5splitILj4EEvv", "_ZZ5splitILj4EEvvE6maxima", "air.simdgroup.barrier"
+            )
+        }
+        status, lines = self.run_main(baseline, external)
+        self.assertEqual((status, lines[0]), (1, "different: verify_split"))
+
     def test_by_default_kernels_named_for_other_paths_are_left_out(self):
         baseline = {
             name: MODULE.format(name)

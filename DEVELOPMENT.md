@@ -3613,7 +3613,10 @@ that model alone once the Mac has cooled.
 
 `.venv/bin/python dev/tools/kernel_identity.py BASELINE/build build` compares
 the AIR of each kernel the decode path may run in the two builds'
-`splash.metallib` (`--match` for others) and fails if any differs.
+`splash.metallib` (`--match` for others) and fails if any differs. The helpers
+a kernel's module defines are compared in the order they appear there, not by
+name: C++ names them for their template values, which a kernel template that
+gains a value renames without changing their code.
 
 Two pairs of constants in `runtime/engine/Protocol.hpp` and `server/protocol.py`
 version what the server and the engine exchange. When the native wire layout

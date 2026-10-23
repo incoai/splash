@@ -6,7 +6,11 @@ PATTERN ...]``, each a metallib or a directory whose splash.metallib or
 build/splash.metallib it compares. metal-objdump disassembles each function of
 a library as an LLVM module of its own, which holds no source path or build
 id. Two functions are identical when their modules' text is, but for the
-module's offset in its library, which the disassembly prints before it.
+module's offset in its library, which the disassembly prints before it, and
+the names of the other symbols a module defines, its internal functions and
+their threadgroup and constant variables: C++ names them for their
+signatures, which a template value added with its old value changes without
+changing any code, so they are compared in the order they first appear.
 
 By default it compares the kernels the decode path may run: every function
 but those named for prefill (prefill_*, gguf_prefill_*), the vision encoder
@@ -31,6 +35,12 @@ from pathlib import Path
 OTHER_PATHS = ("*prefill*", "vision_*", "ane_ffn_*")
 # A function's header in the disassembly: its module's offset, then its name.
 HEADER = re.compile(r"^0x[0-9a-f]+ -- (.+):$", re.MULTILINE)
+# A symbol a module defines: a function, or an internal or private variable.
+DEFINITION = re.compile(
+    r"^(?:define\b[^@\n]*@([-\w$.]+)\(|@([-\w$.]+) = (?:internal|private)\b)",
+    re.MULTILINE,
+)
+SYMBOL = re.compile(r"@([-\w$.]+)")
 
 
 def library(path: Path) -> Path:
@@ -42,6 +52,23 @@ def library(path: Path) -> Path:
         if metallib.is_file():
             return metallib
     raise FileNotFoundError(f"no splash.metallib in {path}")
+
+
+def normalized(name: str, module: str) -> str:
+    """Function `name`'s module with every other symbol it defines renamed
+    for the order in which it first appears."""
+    defined = {
+        function or variable for function, variable in DEFINITION.findall(module)
+    } - {name}
+    order: dict[str, int] = {}
+
+    def rename(match: re.Match) -> str:
+        symbol = match.group(1)
+        if symbol not in defined:
+            return match.group(0)
+        return f"@defined.{order.setdefault(symbol, len(order))}"
+
+    return SYMBOL.sub(rename, module)
 
 
 def functions(metallib: Path) -> dict[str, str]:
@@ -62,7 +89,7 @@ def functions(metallib: Path) -> dict[str, str]:
         raise RuntimeError(f"{metallib} names a function twice")
     # Blank lines separate the modules.
     return {
-        name: hashlib.sha256(module.strip().encode()).hexdigest()
+        name: hashlib.sha256(normalized(name, module.strip()).encode()).hexdigest()
         for name, module in zip(names, modules)
     }
 

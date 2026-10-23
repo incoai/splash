@@ -6,7 +6,7 @@
 // Prefill split: KV heads (and each one's tile parts,
 // splash_attention_tile_part) vary first, then query tiles, then history
 // splits.
-template <uint KVHeads, uint QueryHeadsPerKVHead, typename CacheElement>
+template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim, typename CacheElement>
 inline void splash_prefill_attention_split_phase(
     device bfloat *queries, device float *partials,
     device float *statistics, device const SplashKvPage *page_table,
@@ -19,20 +19,21 @@ inline void splash_prefill_attention_split_phase(
   const uint split = group.z;
   const uint kv_head = group.x / Parts;
   const SplashAttentionTile tile =
-      splash_attention_tile_part<QueryHeadsPerKVHead, SPLASH_PREFILL_ATTENTION_TILE_ROWS, Parts>(
-          splash_prefill_attention_tile<KVHeads, QueryHeadsPerKVHead>(params, kv_head, group.y),
+      splash_attention_tile_part<QueryHeadsPerKVHead, SPLASH_PREFILL_ATTENTION_TILE_ROWS, Parts, HeadDim>(
+          splash_prefill_attention_tile<KVHeads, QueryHeadsPerKVHead, HeadDim>(params, kv_head, group.y),
           group.x % Parts, params.split_count);
   if (!tile.active || split >= tile.splits)
     return;
   splash_paged_attention_tile<KVHeads, QueryHeadsPerKVHead,
-                              SPLASH_PREFILL_ATTENTION_TILE_ROWS / Parts, CacheElement>(
+                              SPLASH_PREFILL_ATTENTION_TILE_ROWS / Parts, HeadDim, CacheElement>(
       queries + tile.offset, page_table, params.kv, kv_head, tile.first_position,
       tile.active_rows, tile.splits, split, partials, statistics,
       tile.first_slot + split, scores, probabilities, row_max, row_sum,
       previous_scale, rescale, thread_index);
 }
 
-template <uint KVHeads, uint QueryHeadsPerKVHead>
+// Prefill reduce: a threadgroup of HeadDim threads per fused row.
+template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim>
 inline void splash_prefill_attention_reduce_phase(
     device const float *partials, device const float *statistics,
     device bfloat *output,
@@ -40,20 +41,20 @@ inline void splash_prefill_attention_reduce_phase(
     uint thread_index, threadgroup float *weights,
     threadgroup float *group_values) {
   constexpr ushort M = SPLASH_PREFILL_ATTENTION_TILE_ROWS * QueryHeadsPerKVHead;
-  constexpr ushort D = SplashKvHeadDimension;
+  constexpr ushort D = HeadDim;
   const uint fused_row = group.y;
   const SplashAttentionTile tile =
-      splash_prefill_attention_tile<KVHeads, QueryHeadsPerKVHead>(params, group.x, group.z);
+      splash_prefill_attention_tile<KVHeads, QueryHeadsPerKVHead, HeadDim>(params, group.x, group.z);
   if (!tile.active || fused_row >= M || thread_index >= D)
     return;
   splash_attention_reduce_row<QueryHeadsPerKVHead,
                               SPLASH_PREFILL_ATTENTION_TILE_ROWS,
-                              SPLASH_ATTENTION_TILE_PARTS(QueryHeadsPerKVHead)>(
+                              SPLASH_ATTENTION_TILE_PARTS(QueryHeadsPerKVHead), HeadDim>(
       partials, statistics, output, tile, params.split_count, fused_row,
       thread_index, weights, group_values);
 }
 
-#define PAGED_PREFILL_SPLIT(Name, Heads, Group, CacheElement)                  \
+#define PAGED_PREFILL_SPLIT(Name, Heads, Group, HeadDim, CacheElement)         \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
       device float *partials [[buffer(1)]],                                    \
@@ -71,22 +72,22 @@ inline void splash_prefill_attention_reduce_phase(
     threadgroup float row_sum[M];                                              \
     threadgroup float previous_scale[M];                                       \
     threadgroup atomic_uint rescale;                                           \
-    splash_prefill_attention_split_phase<Heads, Group, CacheElement>(          \
+    splash_prefill_attention_split_phase<Heads, Group, HeadDim, CacheElement>( \
         queries, partials, statistics, page_table, params, scores,             \
         probabilities, row_max, row_sum, previous_scale, &rescale, group,      \
         thread_index);                                                         \
   }
 
-PAGED_PREFILL_SPLIT(prefill_attention_q8_split, 4, 6, int8_t)
-PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv2_g8, 2, 8, int8_t)
-PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv2_g16, 2, 16, int8_t)
+PAGED_PREFILL_SPLIT(prefill_attention_q8_split, 4, 6, 256, int8_t)
+PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv2_g8, 2, 8, 256, int8_t)
+PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv2_g16, 2, 16, 256, int8_t)
 // BF16 shares the page loop and reduction, without quantization scales.
-PAGED_PREFILL_SPLIT(prefill_attention_bf16_split, 4, 6, bfloat)
-PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8, 2, 8, bfloat)
-PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g16, 2, 16, bfloat)
+PAGED_PREFILL_SPLIT(prefill_attention_bf16_split, 4, 6, 256, bfloat)
+PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8, 2, 8, 256, bfloat)
+PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g16, 2, 16, 256, bfloat)
 #undef PAGED_PREFILL_SPLIT
 
-#define PAGED_PREFILL_REDUCE(Name, Heads, Group)                               \
+#define PAGED_PREFILL_REDUCE(Name, Heads, Group, HeadDim)                      \
   kernel void Name(                                                            \
       device const float *partials [[buffer(0)]],                              \
       device const float *statistics [[buffer(1)]],                            \
@@ -95,12 +96,12 @@ PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g16, 2, 16, bfloat)
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     threadgroup float weights[SplashPrefillMaximumSplits];                     \
-    threadgroup float group_values[8];                                         \
-    splash_prefill_attention_reduce_phase<Heads, Group>(                       \
+    threadgroup float group_values[HeadDim / 32];                              \
+    splash_prefill_attention_reduce_phase<Heads, Group, HeadDim>(              \
         partials, statistics, output, params, group, thread_index, weights,    \
         group_values);                                                         \
   }
-PAGED_PREFILL_REDUCE(prefill_attention_reduce, 4, 6)
-PAGED_PREFILL_REDUCE(prefill_attention_reduce_kv2_g8, 2, 8)
-PAGED_PREFILL_REDUCE(prefill_attention_reduce_kv2_g16, 2, 16)
+PAGED_PREFILL_REDUCE(prefill_attention_reduce, 4, 6, 256)
+PAGED_PREFILL_REDUCE(prefill_attention_reduce_kv2_g8, 2, 8, 256)
+PAGED_PREFILL_REDUCE(prefill_attention_reduce_kv2_g16, 2, 16, 256)
 #undef PAGED_PREFILL_REDUCE

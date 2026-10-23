@@ -30,30 +30,39 @@ uint64_t gateGroups(uint64_t rows, uint32_t queryHeads, uint32_t headDimension) 
 
 // The compiled attention geometries (kernels/{prefill,decode}/attention_qkv.metal,
 // paged_attention.metal and paged_attention_store.metal, and
-// shared/sparse_attention.metal): query heads over KV heads of 256 dimensions
-// in a value order, and their kernels' name suffix, the stores' by KV heads and
-// value order. The sparse kernels gather blocks of token-major values
-// (Qwen3.8-Flash-Next's); the dense page loop reads dimension-major ones.
+// shared/sparse_attention.metal): query heads over KV heads of a head
+// dimension in a value order, and their kernels' name suffix, the stores' by
+// KV heads, head dimension and value order. The sparse kernels gather blocks
+// of token-major values (Qwen3.8-Flash-Next's); the dense page loop reads
+// dimension-major ones.
 struct CompiledAttention final {
   uint32_t queryHeads;
   uint32_t kvHeads;
+  uint32_t headDimension;
   bool valuesTokenMajor;
   std::string_view suffix;
   std::string_view storeSuffix;
 };
 constexpr std::array kCompiledAttention{
-    CompiledAttention{24, 4, false, "", ""},
-    CompiledAttention{16, 2, false, "_kv2_g8", "_kv2_g8"},
-    CompiledAttention{32, 2, false, "_kv2_g16", "_kv2_g8"},
-    CompiledAttention{24, 2, true, "_kv2_g12", "_kv2_vt"},
+    CompiledAttention{24, 4, 256, false, "", ""},
+    CompiledAttention{16, 2, 256, false, "_kv2_g8", "_kv2_g8"},
+    CompiledAttention{32, 2, 256, false, "_kv2_g16", "_kv2_g8"},
+    CompiledAttention{24, 2, 256, true, "_kv2_g12", "_kv2_vt"},
 };
 
-// The KV store kernels' suffix of a layout's KV heads and value order.
+// Whether a compiled geometry's pages are a layout's: its KV heads, head
+// dimension and value order.
+bool storesLayout(const CompiledAttention &compiled, kv::Layout layout) {
+  return compiled.kvHeads == layout.kvHeads && compiled.headDimension == layout.headDimension &&
+         compiled.valuesTokenMajor == layout.valuesTokenMajor;
+}
+
+// The KV store kernels' suffix of a layout's KV heads, head dimension and
+// value order.
 std::string_view storeSuffix(kv::Layout layout) {
-  if (layout.valid() && layout.headDimension == 256)
+  if (layout.valid())
     for (const CompiledAttention &compiled : kCompiledAttention)
-      if (compiled.kvHeads == layout.kvHeads && compiled.valuesTokenMajor == layout.valuesTokenMajor)
-        return compiled.storeSuffix;
+      if (storesLayout(compiled, layout)) return compiled.storeSuffix;
   throw std::invalid_argument("no KV store kernel for layout");
 }
 
@@ -62,8 +71,7 @@ std::string_view storeSuffix(kv::Layout layout) {
 const CompiledAttention &compiledAttention(uint32_t queryHeads, kv::Layout layout) {
   static_cast<void>(storeSuffix(layout));
   for (const CompiledAttention &compiled : kCompiledAttention)
-    if (compiled.queryHeads == queryHeads && compiled.kvHeads == layout.kvHeads &&
-        compiled.valuesTokenMajor == layout.valuesTokenMajor)
+    if (compiled.queryHeads == queryHeads && storesLayout(compiled, layout))
       return compiled;
   throw std::invalid_argument(layout.valuesTokenMajor ? "no sparse attention kernel for layout"
                                                        : "no paged-attention kernel for layout");
@@ -157,6 +165,10 @@ void requireBlocks(const AttentionBlocks &blocks, bool sparse, uint64_t tiles) {
 std::array<metal::MetalBuffer, 2> blockBindings(const AttentionBlocks &blocks, const metal::MetalBuffer &other) {
   return blocks.stride ? std::array{blocks.lists, blocks.counts} : std::array{other, other};
 }
+
+// A reduce threadgroup combines one fused row's splits, a thread per
+// dimension.
+metal::DispatchSize reduceThreads(kv::Layout layout) { return {layout.headDimension, 1, 1}; }
 
 // Each query tile's history splits: the maximum shared out over the chunk's
 // tiles, at least one.
@@ -412,7 +424,8 @@ void PagedAttention::addPrefill(
     reduce.push_back(counts);
   }
   graph.add(std::string(plan.splitPipeline), std::move(split), params, plan.splitGroups);
-  graph.add(std::string(plan.reducePipeline), std::move(reduce), params, plan.reduceGroups);
+  graph.add(std::string(plan.reducePipeline), std::move(reduce), params, plan.reduceGroups,
+            reduceThreads(plan.layout));
 }
 
 void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
@@ -471,7 +484,8 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
   }
   graph.add(std::string(blocks.locations ? plan.locatedSplitPipeline_ : plan.splitPipeline), std::move(split),
             attention, plan.splitGroups);
-  graph.add(std::string(plan.reducePipeline), std::move(reduce), attention, plan.reduceGroups);
+  graph.add(std::string(plan.reducePipeline), std::move(reduce), attention, plan.reduceGroups,
+            reduceThreads(plan.layout));
 }
 
 void PagedAttention::addBlockLists(metal::CommandGraph &graph, const metal::MetalBuffer &mask, uint32_t maskWords,
