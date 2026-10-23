@@ -20,32 +20,46 @@ def conversations(path):
                 record = json.loads(raw)
             except ValueError as error:
                 raise TrainingError(f"{path}:{line}: invalid JSON") from error
-            messages = record.get("messages") if isinstance(record, dict) else None
-            if not isinstance(messages, list) or not messages:
-                raise TrainingError(f"{path}:{line}: expected nonempty messages")
-            for message in messages:
-                if (
-                    not isinstance(message, dict)
-                    or message.get("role") not in ("system", "user", "assistant")
-                    or not isinstance(message.get("content"), str)
-                    or not message["content"].strip()
-                ):
-                    raise TrainingError(
-                        f"{path}:{line}: only nonempty text system/user/assistant messages are supported"
-                    )
-            if not any(m["role"] == "user" for m in messages):
-                raise TrainingError(f"{path}:{line}: conversation needs a user message")
-            records.append(
-                {
-                    "messages": [
-                        {"role": m["role"], "content": m["content"]} for m in messages
-                    ],
-                    "source_id": record.get("source_id"),
-                }
-            )
+            records.append(validate_record(record, f"{path}:{line}"))
     if not records:
         raise TrainingError(f"empty dataset: {path}")
     return records
+
+
+def validate_record(record, location):
+    messages = record.get("messages") if isinstance(record, dict) else None
+    if not isinstance(messages, list) or not messages:
+        raise TrainingError(f"{location}: expected nonempty messages")
+    for message in messages:
+        if (
+            not isinstance(message, dict)
+            or message.get("role") not in ("system", "user", "assistant")
+            or not isinstance(message.get("content"), str)
+            or not message["content"].strip()
+        ):
+            raise TrainingError(
+                f"{location}: only nonempty text system/user/assistant messages are supported"
+            )
+    if not any(m["role"] == "user" for m in messages):
+        raise TrainingError(f"{location}: conversation needs a user message")
+    return {
+        "messages": [{"role": m["role"], "content": m["content"]} for m in messages],
+        "source_id": record.get("source_id"),
+    }
+
+
+def conversation_identities(record):
+    identities = set()
+    if record["source_id"] is not None:
+        identities.add(digest(["source", record["source_id"]]))
+    for i, message in enumerate(record["messages"]):
+        if message["role"] == "user":
+            prefix = [
+                {"role": m["role"], "content": normalized(m["content"])}
+                for m in record["messages"][: i + 1]
+            ]
+            identities.add(digest(["prompt", prefix]))
+    return identities
 
 
 def split_manifest(path):
@@ -53,15 +67,7 @@ def split_manifest(path):
     identities = set()
     prompts = []
     for record in records:
-        if record["source_id"] is not None:
-            identities.add(digest(["source", record["source_id"]]))
-        for i, message in enumerate(record["messages"]):
-            if message["role"] == "user":
-                prefix = [
-                    {"role": m["role"], "content": normalized(m["content"])}
-                    for m in record["messages"][: i + 1]
-                ]
-                identities.add(digest(["prompt", prefix]))
+        identities.update(conversation_identities(record))
         prompts.append(digest(record["messages"]))
     return {
         "sha256": file_digest(path),

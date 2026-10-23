@@ -197,6 +197,165 @@ class CaptureTests(unittest.TestCase):
                         )
                     make_sample.assert_not_called()
 
+    def test_tokenizer_check_rejects_bad_data_before_teacher_allocation(self):
+        from unittest import mock
+
+        from draft_training.__main__ import parse_args, run_training
+        from draft_training.data import split_manifest
+
+        training, validation = self.root / "train.jsonl", self.root / "validation.jsonl"
+        write_data(training, " ".join(["w5"] * 54), "w6")
+        write_data(validation, "w7 w8", "w9")
+        args = parse_args(
+            [
+                "train",
+                "--target",
+                str(self.target),
+                "--init-draft",
+                str(self.root / "draft"),
+                "--data",
+                str(training),
+                "--validation-data",
+                str(validation),
+                "--output",
+                str(self.root / "run"),
+                "--device",
+                "cpu",
+            ]
+        )
+        with (
+            mock.patch(
+                "draft_training.__main__.inspect_training",
+                return_value=(
+                    tiny_components()[0].raw_config,
+                    self.recipe,
+                    split_manifest(training),
+                    split_manifest(validation),
+                ),
+            ),
+            mock.patch("draft_training.capture.TargetAdapter.load") as load,
+        ):
+            with self.assertRaisesRegex(TrainingError, "example 1.*needs 68 tokens"):
+                run_training(args, family=False)
+            load.assert_not_called()
+        self.assertFalse(args.output.exists())
+
+    def test_tokenizer_check_handles_supplied_lengths_and_missing_answers(self):
+        from draft_training.check_data import check_dataset
+        from draft_training.data import anchors
+
+        data = self.root / "answers.jsonl"
+        messages = [{"role": "user", "content": " ".join(["w5"] * 54)}]
+        answer = " ".join(["w6"] * 8)
+        write_data(data, messages[0]["content"], answer)
+        report = check_dataset(self.tokenizer, data, self.recipe, "supplied-answers")
+        sample = self.adapter.make_sample(messages, answer, self.recipe)
+        self.assertEqual(report["max_sequence_tokens"], 64)
+        self.assertEqual(report["full_assistant_blocks"], len(list(anchors(sample, 8))))
+        data.write_text('{"messages":[{"role":"user","content":"w5"}]}\n')
+        with self.assertRaisesRegex(TrainingError, "no usable examples"):
+            check_dataset(self.tokenizer, data, self.recipe, "supplied-answers")
+        write_data(data, "w5", "w6")
+        with self.assertRaisesRegex(TrainingError, "no full assistant query blocks"):
+            check_dataset(self.tokenizer, data, self.recipe, "supplied-answers")
+
+    def test_check_data_cli_needs_tokenizer_files_only(self):
+        import json
+
+        import yaml
+
+        from draft_training.__main__ import main
+
+        target = self.root / "tokenizer-only"
+        self.tokenizer.save_pretrained(target)
+        self.assertFalse(list(target.glob("*.safetensors")))
+        training, validation = self.root / "train.jsonl", self.root / "validation.jsonl"
+        write_data(training, "w5 w6")
+        write_data(validation, "w7 w8")
+        recipe = self.root / "recipe.yaml"
+        recipe.write_text(yaml.safe_dump(self.recipe.to_dict()))
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            result = main(
+                [
+                    "check-data",
+                    "--target",
+                    str(target),
+                    "--data",
+                    str(training),
+                    "--validation-data",
+                    str(validation),
+                    "--config",
+                    str(recipe),
+                ]
+            )
+        self.assertEqual(result, 0)
+        report = json.loads(output.getvalue())
+        self.assertFalse(report["teacher_weights_loaded"])
+        self.assertEqual(report["training"]["examples"], 1)
+        self.assertEqual(report["validation"]["examples"], 1)
+
+    def test_preflight_skips_short_supplied_answers_without_writing_run(self):
+        import json
+        from unittest import mock
+
+        from draft_training.__main__ import parse_args, run_training
+        from draft_training.data import split_manifest
+        from draft_training.export import export_model
+
+        model, _, _ = tiny_components()
+        draft = self.root / "draft"
+        export_model(model, draft, {}, family=False)
+        training, validation = self.root / "train.jsonl", self.root / "validation.jsonl"
+
+        def record(prompt, answer):
+            return (
+                json.dumps(
+                    {
+                        "messages": [
+                            {"role": "user", "content": prompt},
+                            {"role": "assistant", "content": answer},
+                        ]
+                    }
+                )
+                + "\n"
+            )
+
+        training.write_text(record("w5", "w6") + record("w7", " ".join(["w8"] * 8)))
+        validation.write_text(record("w9", " ".join(["w10"] * 8)))
+        args = parse_args(
+            [
+                "train",
+                "--target",
+                str(self.target),
+                "--init-draft",
+                str(draft),
+                "--data",
+                str(training),
+                "--validation-data",
+                str(validation),
+                "--output",
+                str(self.root / "unwritten"),
+                "--supervision",
+                "supplied-answers",
+                "--device",
+                "cpu",
+                "--preflight",
+            ]
+        )
+        recipe = replace(self.recipe, trainable="all")
+        with mock.patch(
+            "draft_training.__main__.inspect_training",
+            return_value=(
+                model.raw_config,
+                recipe,
+                split_manifest(training),
+                split_manifest(validation),
+            ),
+        ):
+            result = run_training(args, family=False)
+        self.assertEqual(result["examples_checked"], 2)
+        self.assertFalse(args.output.exists())
+
     def test_capture_train_export_and_final_test_replay(self):
         from draft_training.capture import capture_dataset
         from draft_training.config import checkpoint_identity, write_json
@@ -280,12 +439,14 @@ class CaptureTests(unittest.TestCase):
 
     def test_cli_orchestration_uses_real_target_capture_and_training(self):
         import argparse
+        import json
         from unittest import mock
 
         from draft_training.__main__ import run_evaluation, run_training
         from draft_training.config import validate_draft
         from draft_training.data import split_manifest
         from draft_training.export import export_model
+        from draft_training.prepare import prepare_data
 
         self.recipe = replace(
             self.recipe, enable_thinking=False, reasoning_effort="low"
@@ -293,9 +454,14 @@ class CaptureTests(unittest.TestCase):
         initial, _, _ = tiny_components()
         draft = self.root / "draft"
         export_model(initial, draft, {}, family=False)
-        training, validation = self.root / "train.jsonl", self.root / "validation.jsonl"
-        write_data(training, "w5 w6")
-        write_data(validation, "w7 w8")
+        corpus, prepared = self.root / "corpus.jsonl", self.root / "prepared"
+        corpus.write_text(
+            "".join(
+                json.dumps({"prompt": f"w{i + 5} w{i + 15}"}) + "\n" for i in range(8)
+            )
+        )
+        prepare_data(corpus, prepared, 0.25, 0.25)
+        training, validation = prepared / "train.jsonl", prepared / "validation.jsonl"
         output = self.root / "cli-run"
         args = argparse.Namespace(
             target=self.target,
@@ -351,8 +517,7 @@ class CaptureTests(unittest.TestCase):
                     with self.assertRaisesRegex(TrainingError, "resume configuration"):
                         run_training(args, family=False)
                     load.assert_not_called()
-        test_data = self.root / "test.jsonl"
-        write_data(test_data, "w9 w10")
+        test_data = prepared / "test.jsonl"
         evaluation = argparse.Namespace(
             target=self.target,
             draft=output / "export",

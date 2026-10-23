@@ -90,7 +90,7 @@ def add_train_arguments(parser):
     group.add_argument(
         "--preflight",
         action="store_true",
-        help="capture one continuation and probe gradients without starting a run",
+        help="probe gradients on a scorable continuation without starting a run",
     )
     group.add_argument(
         "--resume",
@@ -104,6 +104,26 @@ def parse_args(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("train", "capture"):
         add_train_arguments(commands.add_parser(name))
+    prepare = commands.add_parser(
+        "prepare-data",
+        help="normalize JSONL and create isolated train/validation/test splits",
+    )
+    prepare.add_argument("--data", type=Path, required=True)
+    prepare.add_argument("--output", type=Path, required=True)
+    prepare.add_argument("--validation-fraction", type=float, default=0.1)
+    prepare.add_argument("--test-fraction", type=float, default=0.1)
+    prepare.add_argument("--seed", type=int, default=42)
+    check = commands.add_parser(
+        "check-data", help="validate tokenized examples without loading model weights"
+    )
+    for name in ("target", "data", "validation-data"):
+        check.add_argument("--" + name, type=Path, required=True)
+    check.add_argument("--config", type=Path)
+    check.add_argument(
+        "--supervision",
+        choices=("target-generated", "supplied-answers"),
+        default="target-generated",
+    )
     validate = commands.add_parser(
         "validate", help="check draft/target metadata without allocating model tensors"
     )
@@ -189,23 +209,49 @@ def run_training(args, *, family=True):
     from .model import load_draft
     from .trainer import train
 
+    data_check = None
+    if not args.resume:
+        from .check_data import check_datasets
+
+        data_check = check_datasets(
+            args.target,
+            args.data,
+            args.validation_data,
+            recipe,
+            args.supervision,
+            config["dflash_config"]["block_size"],
+        )
     torch.manual_seed(recipe.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(recipe.seed)
     if args.preflight:
-        from .data import conversations, examples
+        from itertools import islice
+
+        from .data import anchors, conversations, examples
         from .losses import block_loss
         from .trainer import configure_trainable
 
         adapter = TargetAdapter.load(
             args.target, config["dflash_config"]["target_layer_ids"], args.device
         )
-        messages, answer = next(examples(conversations(args.data), args.supervision))
-        sample = {
-            name: value.to(args.device)
-            for name, value in adapter.make_sample(messages, answer, recipe).items()
-        }
-        from .data import anchors
+        checked = 0
+        for messages, answer in islice(
+            examples(conversations(args.data), args.supervision), 8
+        ):
+            checked += 1
+            sample = {
+                name: value.to(args.device)
+                for name, value in adapter.make_sample(messages, answer, recipe).items()
+            }
+            if (
+                next(anchors(sample, config["dflash_config"]["block_size"]), None)
+                is not None
+            ):
+                break
+        else:
+            raise TrainingError(
+                "preflight found no full assistant query block in the first eight examples; provide longer answers or increase max_new_tokens"
+            )
 
         capture_peak = (
             torch.cuda.max_memory_allocated() if args.device == "cuda" else None
@@ -260,6 +306,7 @@ def run_training(args, *, family=True):
             "mode": "device-preflight",
             "capture_peak_cuda_bytes": capture_peak,
             "metrics": metrics,
+            "examples_checked": checked,
             "training_peak_cuda_bytes": torch.cuda.max_memory_allocated()
             if args.device == "cuda"
             else None,
@@ -307,6 +354,8 @@ def run_training(args, *, family=True):
         args.output / "run.json",
         {**provenance, "run_identity": run_identity, "draft_config": config},
     )
+    if data_check is not None:
+        write_json(args.output / "data-check.json", data_check)
     capture_identity = {
         "teacher": teacher_identity,
         "tokenizer": {
@@ -389,6 +438,15 @@ def run_evaluation(args):
     test = split_manifest(args.test_data)
     for split in ("training_split", "validation_split"):
         disjoint(selection[split], test)
+    from .check_data import check_dataset, load_tokenizer
+
+    check_dataset(
+        load_tokenizer(args.target),
+        args.test_data,
+        recipe,
+        selection["supervision"],
+        config["dflash_config"]["block_size"],
+    )
     from .capture import TargetAdapter, capture_dataset
     from .evaluate import evaluate_cached, write_test_report
     from .model import load_draft
@@ -423,6 +481,39 @@ def main(argv=None):
     try:
         if args.command in ("train", "capture"):
             result = run_training(args)
+        elif args.command == "prepare-data":
+            from .prepare import prepare_data
+
+            prepared = prepare_data(
+                args.data,
+                args.output,
+                args.validation_fraction,
+                args.test_fraction,
+                args.seed,
+            )
+            result = {
+                "mode": "prepared-data",
+                "output": str(args.output),
+                "groups": prepared["groups"],
+                "splits": {
+                    name: {
+                        "path": str(args.output / f"{name}.jsonl"),
+                        "conversations": manifest["conversations"],
+                        "sha256": manifest["sha256"],
+                    }
+                    for name, manifest in prepared["splits"].items()
+                },
+            }
+        elif args.command == "check-data":
+            from .check_data import check_datasets
+
+            result = check_datasets(
+                args.target,
+                args.data,
+                args.validation_data,
+                Recipe.load(args.config),
+                args.supervision,
+            )
         elif args.command == "validate":
             validate_target(args.target)
             validate_draft(args.draft)

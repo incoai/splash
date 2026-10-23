@@ -1,5 +1,8 @@
 # Experimental DFlash2 fine-tuning
 
+For the complete dataset-to-export workflow, start with the
+[own-data training quickstart](dflash2-training-quickstart.md).
+
 The optional source-checkout command fine-tunes an existing Qwen3.8-27B
 DFlash2 draft. It exports the BF16 safetensors format Splash already accepts
 through `--draft-model`. It does not add support for other target families or
@@ -117,7 +120,7 @@ without loading tensor data or creating output. It does not establish tensor
 finiteness or native loading. Replace `--dry-run` with `--preflight` to generate
 one continuation, capture selected decoder outputs, and execute a gradient
 and optimizer probe. It reports separate CUDA capture and training peaks and
-writes no run. The first probe must contain a full assistant block.
+writes no run. It checks up to eight continuations to find a full assistant block.
 
 A query block contains one known anchor and seven masked proposals. Its
 captured target context ends strictly before the anchor and respects each
@@ -149,6 +152,7 @@ A run contains:
 
 ```text
 run.json                    # inputs, recipe, implementation hashes, versions
+data-check.json             # tokenizer-only checks made before teacher loading
 features/train/             # safetensors shards and capture manifest
 features/validation/
 baseline-validation.json    # released draft on validation traces
