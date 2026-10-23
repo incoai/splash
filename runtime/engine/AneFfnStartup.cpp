@@ -33,7 +33,7 @@ uint32_t contextOf(const EngineMemoryPlanResult &result) {
 // memory plan holds: off as given, or not taken by the model or this Mac; none
 // when it may run.
 std::optional<std::pair<Kind, std::string>> notRunning(const AneFfnModel &model, const AneFfnSetting &setting) {
-  if (!model.dense) return std::pair{Kind::Unsupported, std::string("the target has no dense FFN layers")};
+  if (!model.dense) return std::pair{Kind::Unsupported, std::string("the target's FFN layers are not all dense")};
   if (!setting.enabled) return std::pair{Kind::Off, std::string("as given")};
   if (!model.unsupported.empty()) return std::pair{Kind::Unsupported, model.unsupported};
   if (std::optional<std::string> reason = model.unavailable()) return std::pair{Kind::Unsupported, std::move(*reason)};
@@ -46,13 +46,13 @@ uint32_t leastUnits(const AneFfnModel &model, const AneFfnSetting &setting) {
   return setting.given ? ane_ffn::nearestUnits(setting.given->share, model.units) : 1;
 }
 
-// Logs `outcome` of a start of `model` as `setting` allows: a model without
-// dense FFN layers and one --disable-ane leaves alone without its layers said, and
-// a refusal of a context the GPU alone does not hold either, which the start
-// reports on its own (RuntimeBootstrap::start), log nothing. A refusal of a
-// relaunch's context is a plain line, without the way out the warning of a
-// refused --max-context gives. An automatic context below the GPU alone's
-// is named beside it.
+// Logs `outcome` of a start of `model` as `setting` allows: a model whose FFN
+// layers are not all dense and one --disable-ane leaves alone without its
+// layers said, and a refusal of a context the GPU alone does not hold either,
+// which the start reports on its own (RuntimeBootstrap::start), log nothing. A
+// refusal of a relaunch's context is a plain line, without the way out the
+// warning of a refused --max-context gives. An automatic context below the GPU
+// alone's is named beside it.
 void logOutcome(const AneFfnOutcome &outcome, const AneFfnModel &model, const AneFfnSetting &setting,
                 RequestedContext requested) {
   const std::string context = !requested.tokens && outcome.context != outcome.contextWithout

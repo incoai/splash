@@ -39,6 +39,8 @@ model::DFlashDraftLayout draftOf(std::string_view family) {
     return test::qwen3_5_122BDraft();
   if (family == model::Qwen4ExpLayout{}.family)
     return test::flashNextDraft();
+  if (family == model::FlintLayout{}.family)
+    return test::flintDraft();
   throw std::logic_error(std::string(family) + " has no draft to take its values with");
 }
 
@@ -51,8 +53,12 @@ std::string familyValues() {
   std::ostringstream out;
   model::forEachFamily([&](const auto &family) {
     const model::DFlashDraftLayout draft = draftOf(family.family);
+    // A family whose drafts choose their mask token holds its draft's, the
+    // fixture's first reserved token.
+    auto target = family;
+    if (target.draftChoosesMaskToken()) target.maskToken = target.firstDraftMaskToken;
     const model::ModelDescriptor model =
-        model::makeModelDescriptor(std::string(family.family), family, draft,
+        model::makeModelDescriptor(std::string(family.family), target, draft,
                                    {.outputHiddenSize = draft.hiddenSize}, model::TargetSource::Gguf,
                                    model::VisionSource::None);
     require(model.valid(), std::string(family.family) + "'s descriptor is not valid");

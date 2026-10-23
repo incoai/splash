@@ -1658,13 +1658,20 @@ and model-card `base_model` fields play no part. Families of one model type,
 Qwen3.6-35B-A3B and Qwen3.5-122B-A10B (`qwen3_5_moe_text`, GGUF `qwen35moe`),
 are told apart by their sizes, and a fine-tune of either, such as
 Ornith-1.5-35B-A3B or Ornith-1.5-122B, is its family. A layout type
-(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp` in `runtime/model/`) is an
-architecture, whose code its families share, and each family is a value of it in
-one list, `model::kFamilies` (`ModelDescriptor.hpp`): another size of an
-architecture is one more value there, its draft in `families.FAMILIES`, and, for
-a GDN or attention shape no family had, its kernel instances and a row of the
-compiled shapes in `ops/GDN.cpp` or `ops/PagedAttention.cpp`. The kernel tests
-take every family's shapes from that list (`dev/tests/engine/TestFamilies.hpp`).
+(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp` in
+`runtime/model/`) is an architecture, whose code its families share, and each
+family is a value of it in one list, `model::kFamilies` (`ModelDescriptor.hpp`):
+another size of an architecture is one more value there, its draft in
+`families.FAMILIES`, and, for a GDN or attention shape no family had, its kernel
+instances and a row of the compiled shapes in `ops/GDN.cpp` or
+`ops/PagedAttention.cpp`. The kernel tests take every family's shapes from that
+list (`dev/tests/engine/TestFamilies.hpp`). A Qwen config holds its text model
+under `text_config`; Flint's is flat, its keys at the top level, which the check
+reads only for a model type whose configs are flat (a layout type's
+`flatConfig`). Flint loads from a GGUF only, and its configuration is held to
+Flint's values key by key (its widths, router, window, `layer_types`,
+`no_rope_layer_indices`, `mlp_only_layers` and `eos_token_id`; `softmax_type`,
+`rope_theta` and the rest where it states them).
 An MLX target must declare `quantization` in `config.json` in formats it loads
 ([MLX targets](#mlx-targets)). Every start checks the configuration again.
 Remote Python code is not loaded.
@@ -1906,7 +1913,11 @@ architecture never replaces one that loads.
 A draft's `config.json` states its layers, intermediate size, rotary base and
 the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
 ascending, at most eight); its hidden size, vocabulary and mask token are its
-target's, and its attention (32 query and 8 KV heads of 128), selector (rank
+target's (Flint's vocabulary keeps no mask token: a Flint draft chooses one of
+its reserved special tokens, 150019 to 150143, as its
+`dflash_config.mask_token_id`, which the target's layout then holds,
+`QwenTargetDimensions::firstDraftMaskToken`), and its attention (32 query and
+8 KV heads of 128), selector (rank
 256, 16 candidates) and 2048-token window are those the kernels are built for,
 and its block at least their 8 rows, of which a cycle drafts the first (the
 Qwen3.5-122B-A10B draft was trained to fill 16; `readDraftLayout` in
@@ -2473,21 +2484,29 @@ A family's target is a `QwenTarget` (`QwenTarget.hpp`) composed of the blocks
 every Qwen target shares: a step's checks and plans, the GDN and attention
 mixers, the FFNs of a residual of one row (a dense SwiGLU and a MoE block's
 routing and experts), the draft's captures and the normed head. The Qwen3.5
-architecture's target (`Qwen3_5Target`, `QwenTarget.cpp`) and Flash-Next's
-(`Qwen4ExpTarget`) each compose them into their own layer loop. What a family
-changes in a block is a value of its layout (`QwenTargetDimensions`), read by
-the shared block rather than branched on: an attention layer's variant
-(`QwenTargetGeometry::attentionVariant`: rotated by the target's RoPE unless
-`unrotatedLayers` names it, over a sliding window of `slidingWindow` keys where
-`slidingLayers` does), for which a step plans the windowed layers apart; the
-learned sinks, which a layer's `QwenAttentionWeights` carry where its geometry
-adds them; the MoE router and the shared expert's slices and gate
-(`QwenTargetDimensions::moeBlockShape`); and the leading layers of a MoE target
-whose FFN is dense (`leadingDenseLayers`), whose blocks, and streamed experts,
-are the MoE layers' alone. The output gate (`attentionGate`) and the RoPE pairs
-(`rotaryPairs`) are values the attention kernels compile with their geometry
-(`kCompiledAttention`), to which a target holds its layout's
-(`PagedAttention::compiles`).
+architecture's target (`Qwen3_5Target`, `QwenTarget.cpp`), Flash-Next's
+(`Qwen4ExpTarget`) and Flint's (`FlintTarget`) each compose them into their own
+layer loop. What a family changes in a block is a value of its layout
+(`QwenTargetDimensions`), read by the shared block rather than branched on: an
+attention layer's variant (`QwenTargetGeometry::attentionVariant`: rotated by
+the target's RoPE unless `unrotatedLayers` names it, over a sliding window of
+`slidingWindow` keys where `slidingLayers` does), for which a step plans the
+windowed layers apart; the learned sinks, which a layer's
+`QwenAttentionWeights` carry where its geometry adds them; the MoE router and
+the shared expert's slices and gate (`QwenTargetDimensions::moeBlockShape`);
+and the leading layers of a MoE target whose FFN is dense
+(`leadingDenseLayers`), whose blocks, and streamed experts, are the MoE layers'
+alone. The output gate (`attentionGate`) and the RoPE pairs (`rotaryPairs`) are
+values the attention kernels compile with their geometry (`kCompiledAttention`),
+to which a target holds its layout's (`PagedAttention::compiles`). Flint
+(`Flint.hpp`) has no GDN layers (`fullAttentionPeriod` 1): its 49 layers
+attend, 35 over a window of the 512 keys before a row's with RoPE over whole
+heads and 14 over every key without RoPE, each with its sinks; its first two
+layers' FFN is dense and the others' a MoE of a sigmoid router and an ungated
+shared expert of two slices; its norms are plain, as its GGUFs store them. Its
+layer images (`GgufImage.cpp`, `FlintGguf`) hold its input norm, attention,
+sinks, the norm before its FFN and its FFN, which `loadFlintWeights` reads with
+the Qwen readers.
 
 Every source loads into block planes: `Projection`, `BlockMoeWeights` and
 `EmbeddingWeights` (`runtime/ops/Weights.hpp`, `MoE.hpp`) hold them whatever

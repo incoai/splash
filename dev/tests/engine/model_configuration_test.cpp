@@ -18,6 +18,7 @@
 #include "model/WeightStore.hpp"
 
 #include <array>
+#include <bit>
 #include <cmath>
 #include <filesystem>
 #include <initializer_list>
@@ -866,6 +867,66 @@ void testYarn(const std::filesystem::path &fixtures) {
           "YaRN's attention factor is not 0.1 ln(factor) + 1");
 }
 
+// Flint's configs are flat, its GGUF config the release's config.json or
+// one the installer derives with the release's keys of it: the layout's
+// values hold each key to it by name, and its draft names the mask token,
+// one of Flint's reserved tokens, which the descriptor's layout then holds.
+void testFlint(const std::filesystem::path &fixtures) {
+  const SourceModel flint =
+      mlxModel(fixtures, "flint").with(&SourceModel::record, R"("mlx-affine")", R"("gguf")");
+  const model::ModelDescriptor descriptor = inspect(flint);
+  const auto *layout = std::get_if<model::FlintLayout>(&descriptor.target);
+  require(layout && descriptor.targetSource == model::TargetSource::Gguf && descriptor.family() == "Flint" &&
+              layout->maskToken == 150019 && descriptor.draft == test::flintDraft() && descriptor.valid(),
+          "a GGUF Flint made another descriptor");
+  // Its 35 sliding layers read a window of the 512 keys before a row's, its
+  // 14 others every key, the 49 attention layers' K/V in one page.
+  require(descriptor.targetKvLayout.attentionLayers == 49 && descriptor.targetKvLayout.windowTokens == 512 &&
+              std::popcount(descriptor.targetKvLayout.windowedLayers) == 35 && !descriptor.stateLayout.target.layers,
+          "Flint's KV and state layouts are not its layers'");
+  const auto masked = [&](uint32_t token) {
+    return flint.with(&SourceModel::draft, R"("mask_token_id": 150019)",
+                      R"("mask_token_id": )" + std::to_string(token));
+  };
+  require(std::get<model::FlintLayout>(inspect(masked(150143)).target).maskToken == 150143,
+          "a Flint draft's last reserved mask token was not its layout's");
+  for (const uint32_t token : {150018u, 150144u, 248077u})
+    refuses(masked(token), "is not one of the target's reserved tokens 150019 to 150143",
+            "a Flint draft's mask token outside the reserved tokens was accepted");
+  refuses(flint.with(&SourceModel::record, R"("gguf")", R"("mlx-affine")"), "Flint loads from a GGUF only",
+          "an MLX Flint was accepted");
+  // Each key Flint's values make is held to them by name.
+  struct Refused final {
+    std::string_view from, to, error;
+  };
+  for (const Refused &refused : std::initializer_list<Refused>{
+           {R"("sliding_window": 513)", R"("sliding_window": 512)", "text config sliding_window mismatch"},
+           {R"("sliding_attention")", R"("full_attention")", "text config layer_types 2 must be sliding_attention"},
+           {"\n    48\n  ]", "\n    47\n  ]", "text config no_rope_layer_indices mismatch"},
+           {R"("softmax_type": "learnable")", R"("softmax_type": "vanilla")", "text config softmax_type mismatch"},
+           {R"("router_score_function": "sigmoid")", R"("router_score_function": "softmax")",
+            "text config router_score_function mismatch"},
+           {R"("norm_topk_prob": true)", R"("norm_topk_prob": false)", "text config norm_topk_prob must be true"},
+           {R"("shared_expert_intermediate_size": 1024)", R"("shared_expert_intermediate_size": 512)",
+            "text config shared_expert_intermediate_size mismatch"},
+           {R"("intermediate_size": 6144)", R"("intermediate_size": 4096)", "text config intermediate_size mismatch"},
+           {"\n    0,\n    1\n  ],", "\n    0\n  ],", "text config mlp_only_layers mismatch"},
+           {"150018\n  ]", "150017\n  ]", "text config eos_token_id mismatch"},
+           {R"("rope_theta": 10000.0)", R"("rope_theta": 1000000.0)", "text config rope_theta mismatch"},
+           {R"("tie_word_embeddings": false)", R"("tie_word_embeddings": true)",
+            "text config tie_word_embeddings must be false"}})
+    refuses(flint.with(&SourceModel::config, refused.from, refused.to), refused.error,
+            "a Flint config with " + std::string(refused.to) + " was accepted");
+  // A flat config is read only for a family whose configs are flat, and
+  // Flint's only flat.
+  refuses(flint.with(&SourceModel::config, R"("model_type": "flint")", R"("model_type": "qwen3_5_moe_text")"),
+          "its config has no text_config", "a flat Qwen config was accepted");
+  SourceModel nested = flint;
+  nested.config = R"({"model_type":"flint_vl","text_config":)" + flint.config + "}";
+  refuses(nested, "no supported model has this architecture (text model type flint)",
+          "a Flint config under text_config was accepted");
+}
+
 int main(int argc, char **argv) {
   try {
     if (argc != 2) throw std::invalid_argument("usage: model-configuration FIXTURES");
@@ -877,8 +938,9 @@ int main(int argc, char **argv) {
     testPrunedExperts(argv[1]);
     testConfigurationCheck(argv[1]);
     testYarn(argv[1]);
+    testFlint(argv[1]);
     std::cout << "model configuration: every family, sources, one rule per value, quantization, vision, pruned "
-                 "experts, the installer's check, YaRN PASS\n";
+                 "experts, the installer's check, YaRN, Flint PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

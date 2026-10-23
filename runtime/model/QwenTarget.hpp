@@ -394,7 +394,8 @@ void includeDenseFfn(QwenTargetGeometry &geometry, ops::SwiGluProjections ffn);
 
 // The projections a family's layers and head dispatch beyond their mixers'
 // and MoE blocks' (qwenTargetGeometry): Qwen3.8-27B's dense FFN; the
-// Qwen3.6-35B-A3B's none (Qwen3.8-Flash-Next's: model/Qwen4Exp.hpp).
+// Qwen3.6-35B-A3B's none (Qwen3.8-Flash-Next's: model/Qwen4Exp.hpp; Flint's
+// leading dense layers: model/Flint.hpp).
 void includeFamilyProjections(QwenTargetGeometry &geometry,
                               const QwenTargetWeights<Qwen3_8Layout, Qwen3_8LayerWeights> &weights);
 void includeFamilyProjections(QwenTargetGeometry &geometry,
@@ -426,8 +427,8 @@ template <class Weights>
 // row (a dense SwiGLU and a MoE block's routing and experts), the draft's
 // captures and the normed head; each family composes them into its layers
 // and residual: the Qwen3.5 architecture's (Qwen3.8-27B and
-// Qwen3.6-35B-A3B, model/QwenTarget.cpp) and Qwen3.8-Flash-Next's
-// (model/Qwen4ExpTarget.cpp).
+// Qwen3.6-35B-A3B, model/QwenTarget.cpp), Qwen3.8-Flash-Next's
+// (model/Qwen4ExpTarget.cpp) and Flint's (model/FlintTarget.cpp).
 // A family that needs more of a step than the buffers the runtime binds
 // keeps that scratch itself (qwenTargetScratchBytes) and makes its own
 // inputs of the step's tokens; the runtime calls the same functions for

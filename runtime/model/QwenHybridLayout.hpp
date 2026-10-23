@@ -62,7 +62,15 @@ struct QwenTargetDimensions {
   uint64_t slidingLayers = 0;
   uint64_t unrotatedLayers = 0;
   uint32_t fullAttentionPeriod = 0;
+  // The token whose row a DFlash2 draft's mask rows read
+  // (dflash_config.mask_token_id). A family whose vocabulary keeps none for
+  // it (Flint's) names instead the tokens its drafts choose theirs among,
+  // its reserved special tokens firstDraftMaskToken to lastDraftMaskToken:
+  // maskToken is then its draft's (ModelDescriptor.mm describeSourceModel),
+  // zero before a draft names one.
   uint32_t maskToken = 0;
+  uint32_t firstDraftMaskToken = 0;
+  uint32_t lastDraftMaskToken = 0;
   ops::StopTokens stopTokens{};
   QwenFfnKind ffnKind = QwenFfnKind::Dense;
   // The dense FFN's width.
@@ -111,6 +119,8 @@ struct QwenTargetDimensions {
     return fullAttentionPeriod ? layers / fullAttentionPeriod : 0;
   }
   [[nodiscard]] constexpr uint32_t gdnLayerCount() const noexcept { return layers - attentionLayerCount(); }
+  // Whether its drafts choose their mask token (firstDraftMaskToken).
+  [[nodiscard]] constexpr bool draftChoosesMaskToken() const noexcept { return lastDraftMaskToken != 0; }
   // Whether layer `layer`'s FFN is a MoE block, and the block's index among
   // the target's (its ExpertStore block).
   [[nodiscard]] constexpr bool isMoeLayer(uint32_t layer) const noexcept {
@@ -181,8 +191,12 @@ struct QwenTargetDimensions {
 // family is a value of it (model::kFamilies) that sets every value its FFN
 // uses. The type states its config's model type, the architecture of its GGUFs
 // and whether a safetensors checkpoint of it loads (modelType,
-// ggufArchitecture, loadsSafetensors).
+// ggufArchitecture, loadsSafetensors), and, where its config.json holds the
+// text model's keys at its top level instead of in a text_config (a
+// multimodal Qwen checkpoint's), flatConfig.
 struct QwenHybridLayout : QwenTargetDimensions {
+  static constexpr bool flatConfig = false;
+
   // The family's name, as the installer pairs its draft (install/families.py).
   std::string_view family;
 

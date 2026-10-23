@@ -15,6 +15,7 @@
 #include <fnmatch.h>
 #include <initializer_list>
 #include <iterator>
+#include <numeric>
 #include <optional>
 #include <regex>
 #include <span>
@@ -177,17 +178,19 @@ void requireBooleans(NSDictionary *object, std::string_view where,
   }
 }
 
-// Each layer's type in a layer_types array: full_attention for a
-// full-attention layer, linear_attention for a GDN layer.
-void requireLayerTypes(NSArray *types, const QwenTargetDimensions &target,
+// Each layer's type in a layer_types array: linear_attention for a GDN
+// layer; for an attention layer, sliding_attention where a window bounds it
+// (kv::Layout::windowed), else full_attention.
+void requireLayerTypes(NSArray *types, const QwenHybridLayout &target,
                        std::string_view source, std::string_view label) {
   if (types.count != target.layers)
     throw std::invalid_argument(std::string(label) + " count mismatch: " + std::string(source) +
                                 " " + std::to_string(types.count) + ", runtime " +
                                 std::to_string(target.layers));
-  for (uint32_t layer = 0; layer < target.layers; ++layer) {
-    NSString *expected =
-        target.isFullAttentionLayer(layer) ? @"full_attention" : @"linear_attention";
+  for (uint32_t layer = 0, attention = 0; layer < target.layers; ++layer) {
+    NSString *expected = !target.isFullAttentionLayer(layer)       ? @"linear_attention"
+                         : target.kvLayout().windowed(attention++) ? @"sliding_attention"
+                                                                   : @"full_attention";
     if (![types[layer] isEqual:expected])
       throw std::invalid_argument(std::string(label) + " " +
                                   std::to_string(layer) + " must be " +
@@ -301,6 +304,87 @@ void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, Targ
   const std::string typeLabel =
       std::string("text config rope_parameters ") + typeKey.UTF8String;
   requireEqual(requireString(rope, typeKey, typeLabel), "default", name, typeLabel);
+}
+
+// The whole numbers of a JSON array, which must be `expected`, in order.
+void requireWholes(NSArray *values, std::span<const uint32_t> expected, std::string_view source,
+                   const std::string &label) {
+  std::vector<uint32_t> found;
+  for (id value in values) found.push_back(requireWhole(value, label + " " + std::to_string(found.size())));
+  if (std::ranges::equal(found, expected)) return;
+  const auto text = [](std::span<const uint32_t> numbers) {
+    std::string list = "[";
+    for (const uint32_t number : numbers) list += (list.size() > 1 ? ", " : "") + std::to_string(number);
+    return list + "]";
+  };
+  throw std::invalid_argument(label + " mismatch: " + std::string(source) + " " + text(found) + ", runtime " +
+                              text(expected));
+}
+
+// The layers of `mask` among `layers`, a bit each, in order.
+std::vector<uint32_t> layersOf(uint64_t mask, uint32_t layers) {
+  std::vector<uint32_t> result;
+  for (uint32_t layer = 0; layer < layers && layer < 64; ++layer)
+    if (mask >> layer & 1) result.push_back(layer);
+  return result;
+}
+
+// Flint's text configuration, its config.json at the top level: the sizes
+// every family's holds (sizeDifference), then the rest as the layout's
+// values make them: its dense, routed and shared FFN widths, the experts a
+// token takes and how its router weighs them, its leading dense layers
+// (mlp_only_layers), its window, the layers that slide (layer_types) and
+// those without RoPE (no_rope_layer_indices), and its stop tokens. A
+// config the installer derives from a GGUF states those, as the header
+// holds them; where a config states them too (the release's config.json
+// does), its learned sinks, RoPE base, RMS epsilon, activation, bias-free
+// attention and untied head.
+void validateTextConfig(NSDictionary *text, const FlintLayout &target, TargetSource source) {
+  const std::string_view name = sourceName(source);
+  if (const auto difference = sizeDifference(text, target, source)) throw unsupportedModel(difference->difference);
+  requireNumbers(text, name, "text config",
+                 {{"intermediate_size", target.intermediateSize},
+                  {"moe_intermediate_size", target.expertIntermediateSize},
+                  {"shared_expert_intermediate_size", target.sharedExpertSlices * target.expertIntermediateSize},
+                  {"num_experts_per_tok", target.expertsPerToken},
+                  {"sliding_window", target.slidingWindow}});
+  const bool sigmoid = target.moeRouter == ops::MoeRouter::SigmoidNormalized;
+  requireEqual(requireString(text, @"router_score_function", "text config router_score_function"),
+               sigmoid ? "sigmoid" : "softmax", name, "text config router_score_function");
+  requireBooleans(text, "text config", {{"norm_topk_prob", true}});
+  requireLayerTypes(requireArray(text, @"layer_types", "text config layer_types"), target, name,
+                    "text config layer_types");
+  std::vector<uint32_t> dense(target.leadingDenseLayers);
+  std::iota(dense.begin(), dense.end(), 0u);
+  requireWholes(requireArray(text, @"mlp_only_layers", "text config mlp_only_layers"), dense, name,
+                "text config mlp_only_layers");
+  requireWholes(requireArray(text, @"no_rope_layer_indices", "text config no_rope_layer_indices"),
+                layersOf(target.unrotatedLayers, target.layers), name, "text config no_rope_layer_indices");
+  requireWholes(requireArray(text, @"eos_token_id", "text config eos_token_id"), target.stopTokens.tokens(), name,
+                "text config eos_token_id");
+  if (text[@"softmax_type"])
+    requireEqual(requireString(text, @"softmax_type", "text config softmax_type"), "learnable", name,
+                 "text config softmax_type");
+  if (text[@"rope_theta"]) requireNumbers(text, name, "text config", {{"rope_theta", target.rotaryTheta}});
+  if (text[@"rms_norm_eps"]) requireNumbers(text, name, "text config", {{"rms_norm_eps", SPLASH_RMS_EPSILON}});
+  if (text[@"hidden_act"])
+    requireEqual(requireString(text, @"hidden_act", "text config hidden_act"), "silu", name, "text config hidden_act");
+  for (const char *key : {"attention_bias", "tie_word_embeddings"})
+    if (text[@(key)]) requireBooleans(text, "text config", {{key, false}});
+}
+
+// The mask token a DFlash2 draft of a family whose drafts choose theirs
+// names (dflash_config.mask_token_id), which must be one of the target's
+// reserved tokens; readDraftLayout then holds the draft to it.
+uint32_t draftMaskToken(NSDictionary *draft, const QwenTargetDimensions &target) {
+  NSDictionary *flash = requireObject(draft, @"dflash_config", "draft config dflash_config");
+  const uint32_t token = requireWhole(flash[@"mask_token_id"], "draft config dflash_config mask_token_id");
+  if (token < target.firstDraftMaskToken || token > target.lastDraftMaskToken)
+    throw std::invalid_argument("draft config dflash_config mask_token_id " + std::to_string(token) +
+                                " is not one of the target's reserved tokens " +
+                                std::to_string(target.firstDraftMaskToken) + " to " +
+                                std::to_string(target.lastDraftMaskToken));
+  return token;
 }
 
 // The routed experts of a GGUF target of `target`'s family: its header's
@@ -673,7 +757,13 @@ void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
 ModelDescriptor describeSourceModel(std::string name, std::string_view targetFormat,
                                     std::string_view visionFormat, NSDictionary *config,
                                     NSDictionary *draft) {
-  NSDictionary *text = config[@"text_config"];
+  // A family whose config is flat (flatConfig) holds its text model's keys
+  // in the config itself, which then names its model type.
+  bool flat = false;
+  forEachFamily([&](const auto &layout) {
+    flat = flat || (layout.flatConfig && [config[@"model_type"] isEqual:@(std::string(layout.modelType).c_str())]);
+  });
+  NSDictionary *text = flat ? config : config[@"text_config"];
   if (![text isKindOfClass:[NSDictionary class]]) throw unsupportedModel("its config has no text_config");
   const auto type = requireString(text, @"model_type", "text model type");
   TargetSource targetSource;
@@ -687,7 +777,7 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   std::optional<TargetLayout> target;
   std::optional<SizeDifference> nearest;
   forEachFamily([&](const auto &layout) {
-    if (layout.modelType != type || target) return;
+    if (layout.modelType != type || layout.flatConfig != flat || target) return;
     auto difference = sizeDifference(text, layout, targetSource);
     if (!difference) target = layout;
     else if (!nearest || difference->matched > nearest->matched) nearest = std::move(difference);
@@ -709,6 +799,7 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
     if (targetSource == TargetSource::Safetensors) requireQuantization(config, layout);
     if (targetSource == TargetSource::Gguf && layout.ffnKind == QwenFfnKind::SparseMoe)
       layout.experts = ggufRoutedExperts(text, layout);
+    if (draft && layout.draftChoosesMaskToken()) layout.maskToken = draftMaskToken(draft, layout);
     if (draft) dflashLayout = readDraftLayout(draft, layout);
   }, *target);
   ModelDescriptor result = makeModelDescriptor(std::move(name), *target, dflashLayout,
@@ -814,6 +905,9 @@ bool ModelDescriptor::valid() const noexcept {
                layout.hiddenSize == draft.hiddenSize &&
                draft.targetLayerCount && draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
                draft.targetLayers[draft.targetLayerCount - 1] < layout.layers &&
+               // A family whose drafts choose the mask token holds its draft's.
+               (!layout.draftChoosesMaskToken() ||
+                (layout.maskToken >= layout.firstDraftMaskToken && layout.maskToken <= layout.lastDraftMaskToken)) &&
                layout.kvLayout() == targetKvLayout &&
                layout.gdnStateLayout() == stateLayout.target;
       },

@@ -44,8 +44,8 @@ struct AneFfnPrepared final {
 // The model's side of the split, as functions, so that a test can stand in
 // for it (engine::aneFfnModel() in RuntimeResources.hpp).
 struct AneFfnModel final {
-  // Whether the target has dense FFN layers, which the split could take; a
-  // MoE target has none.
+  // Whether the target's FFN layers are all dense, which the split could
+  // take; a MoE target's are not.
   bool dense = false;
   // Why the split does not take them; empty when it does.
   std::string unsupported;
