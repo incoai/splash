@@ -1,5 +1,6 @@
 import array
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 
 from llguidance import LLExecutor, LLMatcher
@@ -8,6 +9,7 @@ from dev.tests.server_fixtures import grammar_tokenizers
 from server import backend as backend_api
 from server import constraints
 from server import protocol as wire
+from server.chat_format import QWEN
 from server.errors import ConstraintError
 
 
@@ -18,21 +20,25 @@ class TokenConstraintTest(unittest.TestCase):
     def setUpClass(cls):
         tokenizer, guidance = grammar_tokenizers()
 
-        class Constraint(constraints.TokenConstraint):
-            VOCABULARY = guidance.vocab_size
-            EOS_TOKENS = (tokenizer.token_to_id("<eos>"),)
-
-        cls.Constraint = Constraint
-        cls.width = (Constraint.VOCABULARY + 31) // 32
+        # The format of a model whose vocabulary is the tokenizer's, which
+        # stops at <eos>.
+        cls.chat_format = replace(
+            QWEN,
+            vocabulary=guidance.vocab_size,
+            stop_tokens=(("<eos>", tokenizer.token_to_id("<eos>")),),
+        )
+        cls.width = (cls.chat_format.vocabulary + 31) // 32
         cls.matcher = LLMatcher(
             guidance, '%llguidance {}\nstart: "ab" | "ac"\n', log_level=0
         )
         cls.executor = LLExecutor()
         cls.a, cls.b, cls.c, cls.z = map(tokenizer.token_to_id, "abcz")
-        cls.eos = Constraint.EOS_TOKENS[0]
+        cls.eos = cls.chat_format.stop_ids[0]
 
     def constraint(self):
-        return self.Constraint(self.matcher.deep_copy(), self.executor)
+        return constraints.TokenConstraint(
+            self.matcher.deep_copy(), self.executor, self.chat_format
+        )
 
     def rows(self, payload):
         """The allowed token IDs of each mask row."""
@@ -52,7 +58,7 @@ class TokenConstraintTest(unittest.TestCase):
         constraint = self.constraint()
         self.assertEqual(self.rows(constraint.masks(())), [[a]])
         self.assertEqual(self.rows(constraint.masks((a, b))), [[a], [b, c], [eos]])
-        for draft in ((a, z, b), (a, self.Constraint.VOCABULARY, b), (a, -1, b)):
+        for draft in ((a, z, b), (a, self.chat_format.vocabulary, b), (a, -1, b)):
             with self.subTest(draft=draft):
                 self.assertEqual(
                     self.rows(constraint.masks(draft)), [[a], [b, c], [b, c], [b, c]]
@@ -93,8 +99,10 @@ class TokenConstraintTest(unittest.TestCase):
                 )
 
         a, z = self.a, self.z
-        constraint = self.Constraint(
-            Uncopyable(self.matcher.deep_copy()), Executor(self.executor)
+        constraint = constraints.TokenConstraint(
+            Uncopyable(self.matcher.deep_copy()),
+            Executor(self.executor),
+            self.chat_format,
         )
         rows = self.rows(constraint.masks((a, z)))
         constraint.commit([a])
@@ -113,7 +121,7 @@ class TokenConstraintTest(unittest.TestCase):
         constraint.commit([eos])
         constraint.finish()
         self.assertFalse(constraint.matcher.is_error())
-        for tokens in ([self.z], [self.Constraint.VOCABULARY], [-1]):
+        for tokens in ([self.z], [self.chat_format.vocabulary], [-1]):
             with (
                 self.subTest(tokens=tokens),
                 self.assertRaises(ConstraintError) as caught,

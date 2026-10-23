@@ -22,6 +22,7 @@ from .api_shapes import (
     template_messages,
 )
 from .backend import Job, ReasoningRequest, remaining_request_time
+from .chat_format import THINK_END, THINK_START, TOOL_CALL_OPEN
 from .chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
     RESERVED_TEMPLATE_KWARGS,
@@ -41,11 +42,7 @@ from .metrics import is_finite_number
 from .serve_options import REASONING_EFFORTS, parse_served_model_name
 from .tokenization import PromptTokenizer, tokenizable
 from .tool_schema import (
-    THINK_END,
-    THINK_END_TOKEN_ID,
-    TOOL_CALL_OPEN,
     ToolPolicy,
-    function_opening,
     json_grammar,
     normalize_response_format,
     normalize_tools,
@@ -129,7 +126,7 @@ def _generation_prompt(probed, rendered, tokens):
         )
     count = len(ids)
     return (
-        text.rfind("<think>") > text.rfind(THINK_END),
+        text.rfind(THINK_START) > text.rfind(THINK_END),
         count if count < len(tokens) and tuple(tokens[-count:]) == ids else 0,
     )
 
@@ -248,6 +245,7 @@ class Frontend:
         *,
         constraint_factory,
         chat_templates,
+        chat_format,
         thinking_codec,
         vision,
         max_image_pixels=image_input.MAX_PIXELS,
@@ -266,7 +264,9 @@ class Frontend:
         # Probed at startup; requests choose among these, never the
         # tokenizer's own.
         self.chat_templates = chat_templates
-        self.prompt_tokenizer = PromptTokenizer(tokenizer)
+        # The served family's: how its output reasons and calls tools.
+        self.chat_format = chat_format
+        self.prompt_tokenizer = PromptTokenizer(tokenizer, chat_format.message_boundary)
         self.backend = backend
         # The model id the engine loaded. /status reports it, so an alias
         # can never hide what served a request (#81).
@@ -1037,13 +1037,20 @@ class Frontend:
             with self.latencies.measure("grammar"):
                 if tool_constrained:
                     constraint = self.constraint_factory.create(
-                        tool_grammar(tool_policy, thinking, response_schema),
+                        tool_grammar(
+                            tool_policy,
+                            thinking,
+                            response_schema,
+                            chat_format=self.chat_format,
+                        ),
                         timeout=remaining_request_time(deadline),
                         prefixes=lambda: self._call_openings(tool_policy, thinking),
                     )
                 else:
                     constraint = self.constraint_factory.create(
-                        json_grammar(response_schema, thinking),
+                        json_grammar(
+                            response_schema, thinking, chat_format=self.chat_format
+                        ),
                         timeout=remaining_request_time(deadline),
                     )
         remaining_request_time(deadline)
@@ -1079,6 +1086,7 @@ class Frontend:
             reasoning=ReasoningRequest(
                 prompt.sent_effort, prompt.reasoning_effort, prompt.enable_thinking
             ),
+            chat_format=self.chat_format,
             thinking_token_budget=(
                 budget if thinking and budget is not None and budget < max_new else None
             ),
@@ -1096,15 +1104,18 @@ class Frontend:
         )
 
     def _call_openings(self, policy, thinking):
-        """The tokens that begin each strict tool's call. Its parameter names
-        may come next, so a tool with more of them than the parser admits
-        fails there."""
-        reasoning = [THINK_END_TOKEN_ID] if thinking else []
+        """The tokens that begin each strict tool's call, after the close of
+        the reasoning the generation prompt opened. Its parameter names may
+        come next, so a tool with more of them than the parser admits fails
+        there."""
+        chat_format = self.chat_format
+        reasoning = [chat_format.think_end_id] if thinking else []
         return [
             (
                 reasoning
                 + self._tokenize(
-                    TOOL_CALL_OPEN + function_opening(name), add_special_tokens=False
+                    TOOL_CALL_OPEN + chat_format.tool_calls.function_opening(name),
+                    add_special_tokens=False,
                 )["input_ids"],
                 f"tool {name} has too many parameters to constrain",
             )

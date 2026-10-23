@@ -8,18 +8,13 @@ from jsonschema.exceptions import ValidationError
 from referencing.exceptions import Unresolvable
 
 from . import json_codec
+from .chat_format import THINK_END, THINK_START, TOOL_CALL_CLOSE
 from .errors import APIError
 from .schema_validation import SchemaEvaluationError
 from .tool_schema import (
-    CALL_OPEN,
-    FUNCTION_END,
     JSON_TYPES,
     MAX_NAME_LENGTH,
     NAME_SPACE,
-    PARAMETER_CLOSE,
-    PARAMETER_OPEN,
-    THINK_END,
-    TOOL_CALL_CLOSE,
     ParameterTypes,
 )
 
@@ -47,17 +42,47 @@ def hold_partial(text, *markers):
 
 
 class ReasoningSplitter:
-    def __init__(self, thinking, tool_calls=False):
+    """The output's reasoning and its answer, as the output arrives. The
+    reasoning starts the output where the generation prompt opened a think
+    block (thinking), and where the model opens its reasoning itself
+    (chat_format.think_start_id), it follows a THINK_START that starts the
+    output, which is dropped. It ends at THINK_END, which is dropped too,
+    and where a call may follow (tool_calls) and a call's opening ends it
+    (chat_format.calls_end_reasoning), at a call's opening, which begins the
+    answer. A text completion, which has no chat format, reasons only where
+    thinking says so, and calls no tool."""
+
+    def __init__(self, thinking, tool_calls=False, chat_format=None):
         self.reasoning = thinking
+        # Whether the output may yet open its reasoning: until it shows
+        # whether it starts with THINK_START.
+        self.opening = (
+            not thinking
+            and chat_format is not None
+            and chat_format.think_start_id is not None
+        )
         self.pending = ""
         # Whether the newlines after </think>, which set the answer apart in
         # the chat template's layout of a turn, are still to be dropped.
         self.separator = False
-        # Where a call may follow, a call's opening also ends the reasoning
-        # and begins the answer.
-        self.ends = (THINK_END, CALL_OPEN) if tool_calls else (THINK_END,)
+        self.ends = (
+            (THINK_END, chat_format.tool_calls.call_open)
+            if tool_calls and chat_format.calls_end_reasoning
+            else (THINK_END,)
+        )
 
     def put(self, text):
+        if self.opening:
+            self.pending += text
+            if len(self.pending) < len(THINK_START) and THINK_START.startswith(
+                self.pending
+            ):
+                return []
+            self.opening = False
+            text, self.pending = self.pending, ""
+            if text.startswith(THINK_START):
+                self.reasoning = True
+                text = text[len(THINK_START) :]
         if not self.reasoning:
             return self._content(text)
         self.pending += text
@@ -96,16 +121,6 @@ class ReasoningSplitter:
         return [(kind, text)]
 
 
-# Where a value ends: the close the template writes after it, then the next
-# parameter, the function's close, or the call's close a model may write
-# without the function's. A value may hold the tags in any other order.
-_VALUE_ENDS = tuple(
-    PARAMETER_CLOSE + tag for tag in (PARAMETER_OPEN, FUNCTION_END, TOOL_CALL_CLOSE)
-)
-# Text outside calls: a call's opening opens one, and a </think> is dropped.
-# A model may write one again after its reasoning has ended, after its own
-# </think>, a call's opening or a budget's forced end, or with thinking off.
-_TEXT_TAGS = (CALL_OPEN, THINK_END)
 _NOT_JSON = object()
 # A template that writes a value through Jinja's string filter, as Nex's and
 # some of Qwen's do, spells a boolean or null as Python does.
@@ -161,34 +176,42 @@ def convert_value(text, types):
 
 
 class StreamingToolCallProjector:
-    """Parse Qwen's XML tool calls out of the output as it arrives into
-    OpenAI JSON argument deltas, for streamed and complete responses alike.
+    """Parse the tool calls a model writes in its chat template's layout
+    (syntax, a ToolCallSyntax) out of the output as it arrives into OpenAI
+    JSON argument deltas, for streamed and complete responses alike.
 
-    Calls read as the chat template lays them out. One opens at CALL_OPEN
-    and names its function up to ">". Each parameter is a <parameter=NAME>
-    tag and a value, without the newline the template sets after the tag,
-    that ends at PARAMETER_CLOSE where the next parameter, the function's
-    close or the call's close follows, so a value may hold the tags in any
-    other order. </function> closes the call, and the </tool_call> after it
-    may be left out. Names lose the space around them; a call that names no
+    A call opens at the syntax's call_open and names its function up to its
+    name_end. Each parameter is key_open, a name up to key_close, and a
+    value, without the value_open the template sets before it, that ends at
+    value_close where the next parameter's opening, the arguments' close or
+    the call's close follows (value_ends), so a value may hold the tags in
+    any other order. The arguments' close or the call's close ends the call,
+    and the </tool_call> after an arguments' close (Qwen's </function>) may
+    be left out. Names lose the space around them; a call that names no
     function is dropped, other text inside a call is dropped, and a repeated
     parameter keeps its first value, which may have streamed. A value whose
     schema gives it no type, or the type string alone, is its text and
     streams as it is written; any other converts at its end by the types its
     tool declares for it (convert_value). Text outside calls streams as it
-    arrives, after a call as before one, and a </think> there is dropped
-    (_TEXT_TAGS).
+    arrives, after a call as before one, and a </think> there is dropped: a
+    model may write one again after its reasoning has ended, after its own
+    </think>, a call's opening or a budget's forced end, or with thinking
+    off.
 
     Without a tool policy the output has no calls: a call's opening is text,
     and the projector only drops the </think>s, so that every answer reads
     its text the same way. A structured answer's JSON is left as it is.
     """
 
-    def __init__(self, policy, request_id, structured=False):
+    def __init__(self, policy, request_id, structured=False, syntax=None):
         # The types of the tools its calls name, read as they name them.
         self.tool_types = ParameterTypes(policy) if policy is not None else None
         self.request_id = request_id
-        self.text_tags = _TEXT_TAGS if policy is not None else (THINK_END,)
+        # The layout its calls are read in, which a tool policy needs.
+        self.syntax = syntax
+        self.text_tags = (
+            (syntax.call_open, THINK_END) if policy is not None else (THINK_END,)
+        )
         self.pending = ""
         self.state = "output" if structured else "content"
         self.call_index = 0
@@ -309,7 +332,7 @@ class StreamingToolCallProjector:
             if not text:
                 return
             self.value_started = True
-            text = text.removeprefix("\n")
+            text = text.removeprefix(self.syntax.value_open)
         if not text:
             return
         if self.value_streams:
@@ -321,7 +344,7 @@ class StreamingToolCallProjector:
         if self.parameter_name is not None:
             if not self.value_started:
                 self.value_started = True
-                text = text.removeprefix("\n")
+                text = text.removeprefix(self.syntax.value_open)
             self._put_value(text, events)
             if self.value_streams:
                 self._emit_argument('"', events)
@@ -359,18 +382,21 @@ class StreamingToolCallProjector:
         found = [(index, tag) for tag in tags if (index := self.pending.find(tag)) >= 0]
         return min(found) if found else (-1, None)
 
-    def _name(self):
-        """The name the pending text spells up to ">", taken off the text; ""
-        for a longer one, and None while it may yet end."""
-        end = self.pending.find(">", 0, MAX_NAME_LENGTH + 1)
-        if end < 0:
-            return None if len(self.pending) <= MAX_NAME_LENGTH else ""
-        name, self.pending = self.pending[:end], self.pending[end + 1 :]
+    def _name(self, end, keep=False):
+        """The name the pending text spells up to `end`, taken off the text
+        with `end` unless `end` is kept; "" for a longer one, and None while
+        it may yet end."""
+        index = self.pending.find(end, 0, MAX_NAME_LENGTH + len(end))
+        if index < 0:
+            return None if len(self.pending) < MAX_NAME_LENGTH + len(end) else ""
+        name = self.pending[:index]
+        self.pending = self.pending[index if keep else index + len(end) :]
         return name
 
     def put(self, text):
         self.pending += text
         events = []
+        syntax = self.syntax
         while self.pending:
             if self.state == "output":
                 first = self.pending.lstrip()
@@ -391,24 +417,27 @@ class StreamingToolCallProjector:
                     break
                 self._emit_content(self.pending[:start], events)
                 self.pending = self.pending[start + len(tag) :]
-                if tag == CALL_OPEN:
+                if tag != THINK_END:
+                    # A call's opening, the other tag.
                     self.state = "name"
                 continue
             if self.state == "name":
-                if (name := self._name()) is None:
+                # The character that ends the name stays: the arguments drop
+                # it, or read the tag it begins.
+                if (name := self._name(syntax.name_end, keep=True)) is None:
                     break
                 self._begin_call(name, events)
                 continue
             if self.state == "arguments":
                 # Text between parameters is dropped, but for a tag it may
                 # begin.
-                tags = (PARAMETER_OPEN, FUNCTION_END, TOOL_CALL_CLOSE)
+                tags = syntax.argument_tags
                 start, tag = self._next_tag(*tags)
                 if tag is None:
                     self.pending = hold_partial(self.pending, *tags)[1]
                     break
                 self.pending = self.pending[start + len(tag) :]
-                if tag == PARAMETER_OPEN:
+                if tag == syntax.key_open:
                     self.state = "parameter"
                 else:
                     self._finish_call(events)
@@ -416,14 +445,22 @@ class StreamingToolCallProjector:
                         self.state = "content"
                 continue
             if self.state == "parameter":
-                if (name := self._name()) is None:
+                if (name := self._name(syntax.key_close)) is None:
                     break
                 self._begin_parameter(name, events)
                 continue
             if self.state == "value":
-                start, tag = self._next_tag(*_VALUE_ENDS)
+                # Before the value starts, the start of the value_open the
+                # template sets before it waits for the rest.
+                if (
+                    not self.value_started
+                    and len(self.pending) < len(syntax.value_open)
+                    and syntax.value_open.startswith(self.pending)
+                ):
+                    break
+                start, tag = self._next_tag(*syntax.value_ends)
                 if tag is None:
-                    held = hold_partial(self.pending, *_VALUE_ENDS)[1]
+                    held = hold_partial(self.pending, *syntax.value_ends)[1]
                     self._put_value(
                         self.pending[: len(self.pending) - len(held)], events
                     )
@@ -431,7 +468,7 @@ class StreamingToolCallProjector:
                     break
                 self._end_parameter(self.pending[:start], events)
                 # The tag after the close stays for the arguments to read.
-                self.pending = self.pending[start + len(PARAMETER_CLOSE) :]
+                self.pending = self.pending[start + len(syntax.value_close) :]
                 continue
             if self.state == "closing":
                 # After </function>, the template closes the call's block.

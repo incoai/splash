@@ -1,11 +1,13 @@
 """Tool-call grammars and output as a request produces them, for tests."""
 
 from server import output, tool_schema
+from server.chat_format import QWEN_XML
 
 
-def argument_grammar(schema):
+def argument_grammar(schema, syntax=QWEN_XML):
     """The argument grammar of a strict tool whose parameters are `schema`,
-    framed within a request's budget as ToolPolicy frames it."""
+    framed within a request's budget as ToolPolicy frames it, in `syntax`'s
+    tags (Qwen's unless a test passes another)."""
     policy = tool_schema.ToolPolicy(
         schemas={"tool": schema},
         required=False,
@@ -13,7 +15,7 @@ def argument_grammar(schema):
         strict=frozenset({"tool"}),
         constrained=True,
     )
-    return tool_schema._argument_grammar(policy.argument_schemas["tool"])
+    return tool_schema._argument_grammar(policy.argument_schemas["tool"], syntax)
 
 
 def tool_policy(schemas):
@@ -36,11 +38,14 @@ def put(projector, text, size=None):
     return events
 
 
-def project(text, policy, request_id="test", incomplete=False, size=None):
+def project(
+    text, policy, request_id="test", incomplete=False, size=None, syntax=QWEN_XML
+):
     """Project `text` as a request does, whole or in chunks of `size`
-    characters, and finish it. Returns the content, the calls and the
+    characters, with its calls in `syntax`'s layout (Qwen's unless a test
+    passes another), and finish it. Returns the content, the calls and the
     events, those the finish still owed last."""
-    projector = output.StreamingToolCallProjector(policy, request_id)
+    projector = output.StreamingToolCallProjector(policy, request_id, syntax=syntax)
     events = put(projector, text, size)
     content, calls, owed = projector.finish(incomplete)
     return content, calls, events + owed

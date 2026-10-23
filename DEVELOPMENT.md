@@ -752,6 +752,13 @@ template that cannot give the thinking a request asks for, one that always or
 never thinks, renders as it can, and the request reasons as its prompt does. A
 template that refuses a request's messages returns 400 with its reason.
 
+Flint's template has no thinking switch: its generation prompt is
+`<|assistant|>` alone, whatever the effort or `enable_thinking`, and the model
+decides each turn whether to reason. Both reach its template and change
+nothing; a reply whose output opens with `<think>` returns that block as its
+reasoning, and any other reply is all answer
+([chat formats](#chat-formats)).
+
 ```sh
 splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort none
 ```
@@ -819,14 +826,15 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --thinking-token-budget 1200
 
 A budget applies only where generation starts in a thinking block, and one the
 output limit reaches first changes nothing; the output limit can also cut the
-end short. Where the output may call a tool, a call's opening ends thinking
-too, so the end never lands inside a call. The engine takes any `<tool_call>`
-token for that opening, while the reply's reasoning ends only where
-`<tool_call>` is followed by `\n<function=`: a stray `<tool_call>` in the
-thinking ends the budget's count while the reasoning goes on, and the
-request's `reasoning_tokens` can then exceed the budget. Only the end is
-forced, and a close the model selects itself before the budget ends the count.
-Text completions have no reasoning split and refuse a budget with 400.
+end short. A model that opens its thinking itself, as Flint does, never starts
+in one, and a budget caps nothing for it. Where the output may call a tool, a
+call's opening ends thinking too, so the end never lands inside a call. The
+engine takes any `<tool_call>` token for that opening, while the reply's
+reasoning ends only where `<tool_call>` is followed by `\n<function=`: a stray
+`<tool_call>` in the thinking ends the budget's count while the reasoning goes
+on, and the request's `reasoning_tokens` can then exceed the budget. Only the
+end is forced, and a close the model selects itself before the budget ends the
+count. Text completions have no reasoning split and refuse a budget with 400.
 
 ## Agent launchers
 
@@ -1274,11 +1282,15 @@ not give: `["integer", "any"]` constrains no type, and
 Calls are not validated against their schemas; a client reports what its tool
 rejects. A `stop` string may cut a call ([request fields](#request-fields)).
 
-The output is read as the chat template lays calls out: a call opens at
+The output is read as the chat template lays calls out, in the family's
+syntax ([chat formats](#chat-formats)). In Qwen's XML a call opens at
 `<tool_call>` and the newline before `<function=`, and a value ends at
 `\n</parameter>\n` where the next parameter, `</function>` or `</tool_call>`
-follows, so a value may hold the tags in any other order, as a file an agent
-writes may. Tags written otherwise are text. Besides:
+follows; in Flint's GLM tags a call opens at `<tool_call>`, the function's name
+follows it up to the first tag, and a value ends at `</arg_value>` where the
+next `<arg_key>` or `</tool_call>` follows. A value may hold the tags in any
+other order, as a file an agent writes may. Tags written otherwise are text.
+Besides:
 
 - names lose the space around them, and a call that names no function is
   dropped, as is a `</think>` in text;
@@ -1293,20 +1305,22 @@ writes may. Tags written otherwise are text. Besides:
   within the 128 levels the server reads where a request carries them deepest,
   as a `tool_use` block's `input` in a Messages history, five levels into the
   body;
-- a call's opening also ends the reasoning where a call may follow.
+- a call's opening also ends the reasoning where a call may follow, but for a
+  model that opens its reasoning itself, as Flint does, which closes it before
+  a call.
 
 `dev/tests/server/test_tool_call_reading.py` holds model outputs with the calls
-and content they read as.
+and content they read as, and `dev/tests/server/test_chat_formats.py` Flint's.
 
 A strict tool's schema is checked against its JSON Schema dialect on arrival,
 and every tool's arguments are framed through schema composition and local
 references, which give each parameter its types. A strict tool's framed
 arguments are closed, so that an object or an array takes nothing it does not
-declare. Its values are written in Qwen XML: raw text where any string may be
-the value, whose pattern, format and length go unenforced; otherwise one of the
-values each member of the value's union lists, as its text, or JSON of a member
-that lists none, leaving out array item bounds and `multipleOf` above 64 and
-patterns the grammar cannot compile (look-around, word boundaries,
+declare. Its values are written in the family's tags: raw text where any string
+may be the value, whose pattern, format and length go unenforced; otherwise one
+of the values each member of the value's union lists, as its text, or JSON of a
+member that lists none, leaving out array item bounds and `multipleOf` above 64
+and patterns the grammar cannot compile (look-around, word boundaries,
 backreferences). The framed schemas of a request's strict tools, whose grammars
 are built together, are limited to 16 MiB in all. Any other tool is framed when
 a call first names it, for its parameters' types alone, which take no copy of
@@ -1462,10 +1476,10 @@ share the scheduler. Disconnects and timeouts cancel the current question.
 
 Preparation renders each prompt once, then enforces the context limit and the
 batch token budget before the per-slot boundary checks. A label can change only
-the tokens after the prompt's last `<|im_end|>`, which the tokenizer encodes on
-its own, so each check encodes that end with the option appended rather than
-the whole prompt. The checks observe the request deadline and stop when the
-client disconnects.
+the tokens after the prompt's last message boundary (`<|im_end|>`, or Flint's
+`<|assistant|>`), which the tokenizer encodes on its own, so each check encodes
+that end with the option appended rather than the whole prompt. The checks
+observe the request deadline and stop when the client disconnects.
 Prompts that exceed the context limit are rejected, not truncated.
 
 System One validation uses 422 `detail` arrays; successful responses contain
@@ -2047,6 +2061,41 @@ Every request, including image placeholder, token-count and judgment
 startup; tokenizer files and the tokenizer object are unchanged. The probe's
 upstream fixtures are in `dev/tests/fixtures/chat_templates/`.
 
+### Chat formats
+
+Each family's model frames its reasoning and lays out its tool calls in a
+format of its own, a value of `server/chat_format.py` that `families.FAMILIES`
+names for the family. The server reads and constrains a model's output in the
+format of the family its installation found, which the assembly records:
+
+- Qwen's (`QWEN`): the generation prompt opens a think block where the request
+  thinks, calls are Qwen3-Coder's XML (`QWEN_XML`), and `<|endoftext|>` and
+  `<|im_end|>` stop.
+- Flint's (`FLINT`): the generation prompt is `<|assistant|>` alone, and the
+  model opens a think block itself, as its first token, when it reasons; calls
+  are GLM-4.7's argument tags (`GLM_ARGS`),
+  `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`,
+  each tag a token; `<|end_of_text|>`, `<|user|>`, `<|observation|>` and
+  `<|developer|>` stop.
+
+A format holds the model's vocabulary and the engine's stop tokens, which are
+its target layout's; the tokens of `</think>`, of `<think>` where the model
+opens its reasoning itself, and of `<tool_call>`; the call syntax; and the
+special token after which prompt tokenization reuses a cached prompt's tokens,
+`<|im_end|>` or `<|assistant|>`. Startup checks that the tokenizer encodes each
+as the format has it. Grammars write reasoning and calls as the format lays
+them out: Flint's optional think block may come before any constrained output,
+and its tags, which the grammar compiler takes as tokens rather than text, are
+written as their tokens. A model that opens its reasoning itself closes it
+before a call, so a `<tool_call>` inside its think block is reasoning, as
+Flint's own parser reads it.
+
+Flint's template renders as shipped: its roles, the tools block it adds before
+the first message that is not a system message, each assistant turn's
+reasoning and calls, and tool results as `<|observation|>` turns. Request
+preparation merges leading system and developer messages into one system
+message for every family, so a developer message renders as `<|system|>`.
+
 ### Local model files
 
 An application that downloads models itself prepares them for the server
@@ -2147,7 +2196,8 @@ shape; `frontend.py` prepares
 requests and history; `backend.py` owns native request lifecycles. `judgments.py`
 owns finite-choice prompts, validation and typed answer math. `output.py` parses
 generated text as it arrives, one parser serving streamed and complete
-responses alike, and `constraints.py` compiles token constraints. Messages and
+responses alike, in the family's chat format (`chat_format.py`), and
+`constraints.py` compiles token constraints. Messages and
 Responses build streamed and complete responses from the same block sequence;
 the one difference is a call cut by the token limit or a stop sequence, which a
 complete Messages response leaves out. `make architecture-check` prevents lower

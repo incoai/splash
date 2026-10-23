@@ -14,6 +14,7 @@ from urllib.parse import unquote
 from jsonschema.exceptions import SchemaError
 from llguidance import LLMatcher
 
+from .chat_format import TOOL_CALL_CLOSE, TOOL_CALL_OPEN
 from .errors import APIError
 from .lru import LRUCache, memoized
 from .schema_validation import (
@@ -23,21 +24,6 @@ from .schema_validation import (
     subschemas,
 )
 
-# The chat template's tool-call tags, as it lays a call out: grammars write
-# calls that way, and the projector reads them that way (output.py). A call
-# opens at CALL_OPEN, and a value ends at PARAMETER_CLOSE where the next
-# parameter or the function's close follows, so a value may hold any of the
-# tags but that sequence.
-TOOL_CALL_OPEN = "<tool_call>"
-TOOL_CALL_CLOSE = "</tool_call>"
-FUNCTION_START = "<function="
-FUNCTION_END = "</function>"
-PARAMETER_OPEN = "<parameter="
-PARAMETER_CLOSE = "\n</parameter>\n"
-CALL_OPEN = f"{TOOL_CALL_OPEN}\n{FUNCTION_START}"
-THINK_END = "</think>"
-THINK_END_TOKEN_ID = 248069  # the chat template's think-close token
-TOOL_CALL_OPEN_TOKEN_ID = 248058  # and its call-open token
 # A function's or parameter's name is at most this long, and reading strips
 # this space around it, so a name the grammars write neither starts nor ends
 # with it.
@@ -62,12 +48,6 @@ def is_tag_name(name):
         and not any("\ud800" <= character <= "\udfff" for character in name)
         and unicodedata.is_normalized("NFC", name)
     )
-
-
-def function_opening(name):
-    """What follows TOOL_CALL_OPEN in a call of tool `name`, up to its
-    arguments."""
-    return f"\n{FUNCTION_START}{name}>\n"
 
 
 # Schemas are read recursively, by jsonschema and by this module, several
@@ -531,11 +511,11 @@ def _type_reader(root):
 
 def _literal_texts(schema, root):
     """The values a parameter of `schema` takes when the schema lists them
-    all, as the grammar writes each in Qwen XML: a string as its text, any
-    other value as JSON. An enum or const lists its values, a schema whose
-    only type is null or boolean lists that type's, a union lists its
-    members' and a local reference its target's, narrowed by allOf members
-    that list theirs. None when the schema does not list them."""
+    all, as the grammar writes each in a call's value tags: a string as its
+    text, any other value as JSON. An enum or const lists its values, a
+    schema whose only type is null or boolean lists that type's, a union
+    lists its members' and a local reference its target's, narrowed by allOf
+    members that list theirs. None when the schema does not list them."""
     texts = {}
 
     def read(node):
@@ -830,24 +810,76 @@ def _lark_regex(pattern):
     return "/" + pattern.replace("/", r"\/") + "/"
 
 
-# A parameter's name is a lexeme of its own: one spanning "<parameter=url>"
-# would win over another name that starts like it, and lexing cannot back off.
-_NAME_OPEN, _NAME_CLOSE = json.dumps(PARAMETER_OPEN), json.dumps(">\n")
 # What the grammars write reads back as written: a name neither starts nor
 # ends with the space reading strips and is no longer than reading takes, and
-# raw text ends at the first PARAMETER_CLOSE, its suffix.
+# raw text does not run past its value's close.
 _NAME = _lark_regex(rf"[^<> \t\n\r]([^<>\n\r]{{0,{MAX_NAME_LENGTH - 2}}}[^<> \t\n\r])?")
 _RAW_VALUE = "/(?s:.*)/"
 
-# The arguments of a tool that is not strict: parameters in the chat
-# template's tags, each with any name and raw text.
-FREE_ARGUMENTS = (
-    "%llguidance {}\n"
-    "start: parameter*\n"
-    f"parameter: {_NAME_OPEN} NAME {_NAME_CLOSE} value\n"
-    f"value[suffix={json.dumps(PARAMETER_CLOSE)}]: {_RAW_VALUE}\n"
-    f"NAME: {_NAME}\n"
-)
+
+def _tags(syntax, *tags):
+    """Tags of `syntax` in a row, as a grammar writes them: each as its token
+    where the tags are tokens of the family's tokenizer (Flint's), which the
+    grammar compiler takes apart from text, so text cannot spell them; else
+    their text as one string."""
+    if syntax.tags_are_tokens:
+        return " ".join(tag for tag in tags if tag)
+    return json.dumps("".join(tags))
+
+
+def _function_opening(syntax, name):
+    """What follows TOOL_CALL_OPEN in a grammar's call of tool `name`, up to
+    its arguments: the tags around the name, and the name as text."""
+    if syntax.tags_are_tokens:
+        return " ".join(
+            part
+            for part in (syntax.name_open, json.dumps(name), syntax.name_close)
+            if part
+        )
+    return json.dumps(syntax.function_opening(name))
+
+
+def _key_tags(syntax):
+    """The tags around a parameter's name in a grammar, up to its value. The
+    name is a lexeme of its own: one spanning "<parameter=url>" would win
+    over another name that starts like it, and lexing cannot back off."""
+    return _tags(syntax, syntax.key_open), _tags(
+        syntax, syntax.key_close, syntax.value_open
+    )
+
+
+def _raw_value(syntax, rule):
+    """The rules of a raw value, rule `rule`, with its close: where the tags
+    are text, any text up to the close's first spelling, its suffix; where
+    they are tokens, any text but a spelling of the close, then its token
+    (_value_terminals)."""
+    if syntax.tags_are_tokens:
+        return [f"{rule}: RAW_VALUE {syntax.value_close}"]
+    return [f"{rule}[suffix={json.dumps(syntax.value_close)}]: {_RAW_VALUE}"]
+
+
+def _value_terminals(syntax):
+    """The terminal the raw values of `syntax` read where its tags are
+    tokens."""
+    if not syntax.tags_are_tokens:
+        return []
+    spelled = _lark_regex(f"(?s:.*){re.escape(syntax.value_close)}(?s:.*)")
+    return [f"RAW_VALUE: {_RAW_VALUE} & ~{spelled}"]
+
+
+def _free_arguments(syntax):
+    """The arguments of a tool that is not strict: parameters in the chat
+    template's tags, each with any name and raw text."""
+    key_open, key_close = _key_tags(syntax)
+    rules = [
+        "%llguidance {}",
+        "start: parameter*",
+        f"parameter: {key_open} NAME {key_close} value",
+        *_raw_value(syntax, "value"),
+        f"NAME: {_NAME}",
+        *_value_terminals(syntax),
+    ]
+    return "\n".join(rules) + "\n"
 
 
 def _union_members(schema):
@@ -861,14 +893,15 @@ def _union_members(schema):
     return [schema]
 
 
-def _parameter_rules(rule, prefix, value_schema):
-    """The rules of a parameter of a strict tool, its value written in Qwen
-    XML as the template writes values, a string as its text and any other
-    value as JSON: raw text when it may be any string, else one of the
-    values each member of its union lists, or JSON of a member that lists
-    none. None when no value is possible. Framing makes each parameter
-    schema self-contained, so it is its own reference root."""
-    closing = json.dumps(PARAMETER_CLOSE)
+def _parameter_rules(rule, prefix, value_schema, syntax):
+    """The rules of a parameter of a strict tool, its value written as the
+    template writes values, a string as its text and any other value as
+    JSON, then the syntax's value close: raw text when it may be any string,
+    else one of the values each member of its union lists, or JSON of a
+    member that lists none. None when no value is possible. Framing makes
+    each parameter schema self-contained, so it is its own reference
+    root."""
+    closing = _tags(syntax, syntax.value_close)
     if value_schema is False:
         return None
     rules, choices = [], []
@@ -880,7 +913,7 @@ def _parameter_rules(rule, prefix, value_schema):
                 # Any text may be the value; the listed ones are among it.
                 return [
                     f"{rule}: {prefix} {rule}_value",
-                    f"{rule}_value[suffix={closing}]: {_RAW_VALUE}",
+                    *_raw_value(syntax, f"{rule}_value"),
                 ]
             if member is not value_schema:
                 # A member refers to the parameter schema's definitions.
@@ -889,7 +922,7 @@ def _parameter_rules(rule, prefix, value_schema):
             choices.append(f"%json {json.dumps(member, separators=(',', ':'))}")
             continue
         for text in texts:
-            if PARAMETER_CLOSE in text:
+            if syntax.value_close in text:
                 raise APIError(400, "tool parameter enum contains XML framing")
             if text:
                 choices.append(json.dumps(text))
@@ -904,19 +937,20 @@ def _parameter_rules(rule, prefix, value_schema):
     ]
 
 
-def _argument_grammar(schema):
+def _argument_grammar(schema, syntax):
     """The arguments of a strict tool: the declared parameters in schema
     order, each required one present, then any others the schema allows."""
+    key_open, key_close = _key_tags(syntax)
     properties = schema["properties"]
     required = schema["required"]
     rules = []
     sequence = []
     for index, (name, value_schema) in enumerate(properties.items()):
         rule = f"parameter_{index}"
-        prefix = f"{_NAME_OPEN} {json.dumps(name)} {_NAME_CLOSE}"
+        prefix = f"{key_open} {json.dumps(name)} {key_close}"
         if value_schema is not False and not is_tag_name(name):
             raise APIError(400, "invalid tool parameter name")
-        parameter_rules = _parameter_rules(rule, prefix, value_schema)
+        parameter_rules = _parameter_rules(rule, prefix, value_schema, syntax)
         if parameter_rules is None:
             if name in required:
                 raise APIError(
@@ -927,8 +961,9 @@ def _argument_grammar(schema):
         sequence.append(rule + ("" if name in required else "?"))
     extra_rules = _parameter_rules(
         "extra",
-        f"{_NAME_OPEN} EXTRA_NAME {_NAME_CLOSE}",
+        f"{key_open} EXTRA_NAME {key_close}",
         schema["additionalProperties"],
+        syntax,
     )
     if extra_rules is not None:
         # Other names are those the tool does not declare.
@@ -936,6 +971,7 @@ def _argument_grammar(schema):
         rules.append(f"EXTRA_NAME: {_NAME}" + (f" & ~({declared})" if declared else ""))
         rules.extend(extra_rules)
         sequence.append("extra*")
+    rules.extend(_value_terminals(syntax))
     return (
         "%llguidance {}\nstart:"
         + "".join(f" {item}" for item in sequence)
@@ -945,14 +981,32 @@ def _argument_grammar(schema):
     )
 
 
-def json_grammar(schema, thinking):
-    start = "start: " + ("think " if thinking else "") + "WS %json "
+def _reasoning(thinking, chat_format):
+    """The reasoning a grammar lets come before its answer, as the first item
+    of its start and the rule that item names: where the generation prompt
+    opened a think block (thinking), its text up to the block's close; where
+    the model opens one itself, an optional block from its opening to its
+    close; otherwise none. Each tag is its token, as the template writes it,
+    and the text between is TEXT, which cannot spell the close."""
+    close = f"<[{chat_format.think_end_id}]>"
+    if thinking:
+        return "think ", f"think: TEXT {close}"
+    if chat_format.think_start_id is not None:
+        return "think? ", f"think: <[{chat_format.think_start_id}]> TEXT {close}"
+    return "", None
+
+
+def json_grammar(schema, thinking, *, chat_format):
+    """The output grammar of a request with a response schema and no tools:
+    the reasoning chat_format lets come first (_reasoning), then the JSON."""
+    think, think_rule = _reasoning(thinking, chat_format)
     grammar = [
         "%llguidance {}",
-        start + json.dumps(_grammar_compatible_schema(schema), separators=(",", ":")),
+        f"start: {think}WS %json "
+        + json.dumps(_grammar_compatible_schema(schema), separators=(",", ":")),
     ]
-    if thinking:
-        grammar.append(f"think: TEXT <[{THINK_END_TOKEN_ID}]>")
+    if think_rule is not None:
+        grammar.append(think_rule)
         grammar.append(r"TEXT: /(?s:.*)/ & ~/(?s:.*)<\/think>(?s:.*)/")
     grammar.append(WHITESPACE_RULE)
     return "\n".join(grammar) + "\n"
@@ -1105,22 +1159,30 @@ def normalize_tools(tools, tool_choice, parallel, namespaces=None):
     return offered, policy
 
 
-def tool_grammar(policy, thinking, response_schema=None):
+def tool_grammar(policy, thinking, response_schema=None, *, chat_format):
     """The output grammar of a request whose tool calls are constrained, or
-    whose tools stand beside a response schema: each call names an offered
-    tool in the chat template's layout, with a strict tool's arguments
-    generated to its schema and any other's free. A required choice starts
-    with a call and a named one is that call; under an auto choice text may
-    come first. Parallel calls may be followed by text and further calls,
-    and a single call by whitespace only. Beside an auto choice, a response
-    schema admits its JSON answer instead of the calls."""
+    whose tools stand beside a response schema: after the reasoning
+    chat_format lets come first (_reasoning), each call names an offered tool
+    in the chat template's layout (chat_format.tool_calls), with a strict
+    tool's arguments generated to its schema and any other's free. A
+    required choice starts with a call and a named one is that call; under
+    an auto choice text may come first. Parallel calls may be followed by
+    text and further calls, and a single call by whitespace only. Beside an
+    auto choice, a response schema admits its JSON answer instead of the
+    calls."""
+    syntax = chat_format.tool_calls
     strict_arguments = {
-        name: _argument_grammar(policy.argument_schemas[name]) for name in policy.strict
+        name: _argument_grammar(policy.argument_schemas[name], syntax)
+        for name in policy.strict
     }
     side_grammars = []
     if len(strict_arguments) < len(policy.schemas):
-        side_grammars.append({"name": "free_arguments", "lark_grammar": FREE_ARGUMENTS})
-    closing = json.dumps(f"{FUNCTION_END}\n")
+        side_grammars.append(
+            {"name": "free_arguments", "lark_grammar": _free_arguments(syntax)}
+        )
+    closing = (
+        f" {_tags(syntax, syntax.arguments_close)}" if syntax.arguments_close else ""
+    )
     calls = []
     for index, name in enumerate(policy.schemas):
         arguments = "free_arguments"
@@ -1130,8 +1192,8 @@ def tool_grammar(policy, thinking, response_schema=None):
                 {"name": arguments, "lark_grammar": strict_arguments[name]}
             )
         calls.append(
-            f"call_{index}: {TOOL_CALL_OPEN} {json.dumps(function_opening(name))} "
-            f"@{arguments} {closing} {TOOL_CALL_CLOSE}"
+            f"call_{index}: {TOOL_CALL_OPEN} {_function_opening(syntax, name)} "
+            f"@{arguments}{closing} {TOOL_CALL_CLOSE}"
         )
     call = "(" + " | ".join(f"call_{index}" for index in range(len(calls))) + ")"
     if not calls:
@@ -1144,7 +1206,8 @@ def tool_grammar(policy, thinking, response_schema=None):
             body = f"(({body}) | answer)"
     else:
         body = f"(TEXT {call})* TEXT" if policy.parallel else f"TEXT ({call} WS)?"
-    main = ["%llguidance {}", "start: " + ("think " if thinking else "") + body]
+    think, think_rule = _reasoning(thinking, chat_format)
+    main = ["%llguidance {}", f"start: {think}{body}"]
     if response_schema is not None and not policy.required:
         main.append(
             "answer: WS %json "
@@ -1153,8 +1216,8 @@ def tool_grammar(policy, thinking, response_schema=None):
             )
             + " WS"
         )
-    if thinking:
-        main.append(f"think: TEXT <[{THINK_END_TOKEN_ID}]>")
+    if think_rule is not None:
+        main.append(think_rule)
     main.extend(
         [
             *calls,
