@@ -611,6 +611,7 @@ class LauncherTests(unittest.TestCase):
             "--revision",
             "--draft-model",
             "--mmproj",
+            "--chat-template-file",
         }
         self.assertIn("--max-memory", flags)
         table = Path(launcher.__file__).resolve().parents[1] / (

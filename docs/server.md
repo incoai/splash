@@ -154,6 +154,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--default-reasoning-effort` | `SPLASH_DEFAULT_REASONING_EFFORT` or the template's | Effort of Chat and Responses requests that set none. See [default reasoning effort](#default-reasoning-effort). |
 | `--thinking-token-budget` | `SPLASH_THINKING_TOKEN_BUDGET` or none | Thinking tokens of a request that sets no budget. See [thinking token budget](#thinking-token-budget). |
 | `--thinking-end-text` | `SPLASH_THINKING_END_TEXT` or the template's close | Text that ends thinking where a budget runs out, `</think>` its last token; unset, the close the chat template writes after a reasoning. See [thinking token budget](#thinking-token-budget). |
+| `--chat-template-file` | The model's own | A Jinja chat template to render every request with, in place of the model's. See [custom chat templates](models.md#custom-chat-templates). |
 | `--max-request-size` | `128M` | Largest HTTP request body. See [request limits](api.md#request-limits-and-timeouts). |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
 | `--request-timeout` | None | Time a request may take from its arrival; a request's own `timeout` can only shorten it. |
