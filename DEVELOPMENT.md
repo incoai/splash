@@ -1778,7 +1778,24 @@ and lists every unsupported tensor in one error:
   gather (`gguf_embed_f32_<format>`), GGML's own F32 values. A BF16 or F16
   pair stays such a float segment: it reads the input unrotated, as Prism's
   BF16 alpha and beta need, and leaves the GDN input projection on Apple9's
-  register tile, which takes no F16.
+  register tile, which takes no F16;
+- Flint's attention sinks: F32, as llama.cpp writes them.
+
+Flint's GGUFs (`flint`, as llama.cpp writes them from release b11803) differ
+from Qwen's beyond their tensor types: every layer attends, its norm before the
+FFN is `ffn_norm`, `leading_dense_block_count` leading layers have a dense FFN
+and the others a MoE whose shared expert has no gate, and each layer carries
+its attention sinks, `attn_sinks.weight`. Its derived configuration is flat,
+as Flint's config.json is, and holds the keys of that file the header states
+(`gguf.flint_text_config`): every size, the experts each token takes, the
+router (`router_score_function` from `expert_gating_func`, `norm_topk_prob`),
+`mlp_only_layers`, `sliding_window`, `layer_types` from
+`attention.sliding_window_pattern`, `no_rope_layer_indices` from
+`attention.rope_pattern`, and `eos_token_id` from
+`tokenizer.ggml.eog_token_ids`; the engine's check holds each to the family's,
+the two layer patterns included, which the scalar metadata leaves out. The
+token table must be of a format: RecursiveSI's int4 GGUF, whose table is F32,
+is refused before its download.
 
 A variant no root file names may be a folder of a split GGUF's parts, as
 repositories publish files too large for one
@@ -2011,8 +2028,11 @@ An MLX target's configuration, tokenizer files and chat template come from its
 resolved snapshot. For GGUF, `install/gguf.py` reads the selected file's
 metadata without mapping or decoding weight tensors. Vocabulary IDs, BPE merge
 ranks, control/user-defined token types, BOS/EOS/padding IDs and template text
-come from that file; the supported `gpt2/qwen35` profile supplies the NFC and
-byte-level pre-tokenization algorithms. Unknown profiles, malformed metadata
+come from that file; the supported profiles supply the pre-tokenization
+algorithms: `gpt2/qwen35` NFC and Qwen's split, `gpt2/flint` Flint's three
+splits (digits in runs of up to three, runs of Han and kana, then o200k's
+pattern) without a normalizer, each before byte-level BPE, as the release's
+own tokenizer.json has them. Unknown profiles, malformed metadata
 and automatic BOS/EOS insertion are rejected, with no cross-repository
 fallback; GGUF sidecar tokenizer/config files do not override embedded metadata.
 Model geometry is translated from the same metadata, subtracting any declared
