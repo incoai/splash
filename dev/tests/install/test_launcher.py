@@ -1073,6 +1073,31 @@ class LauncherTests(unittest.TestCase):
             served = api.parse_args(server_arguments(execute.call_args.args[1]))
             self.assertEqual(served.model_root, str(selection))
 
+    def test_generate_installs_as_serve_does_and_executes_one_clip(self):
+        model = "MiniMaxAI/MiniMax-H3"
+        with (
+            tempfile.TemporaryDirectory() as runtime,
+            mock.patch.object(launcher, "RUNTIME_DIR", Path(runtime)),
+            mock.patch.object(launcher, "_check_port") as probe,
+            mock.patch.object(launcher, "_ensure_installed") as install,
+            mock.patch.object(launcher.os, "execve") as execute,
+        ):
+            launcher.main([
+                "generate", "--model", model, "--prompt", "a cat", "--out", "clip.mp4",
+                "--seconds", "15", "--preview", "--no-audio", "--first-frame", "first.png",
+                "--last-frame", "last.jpg",
+            ])  # fmt: skip
+        probe.assert_not_called()
+        selection = install.call_args.args[0]
+        request = {"prompt": "a cat", "seconds": "15", "preview": True, "audio": False}
+        self.assertEqual(execute.call_args.args[1][4:], [
+            "server.videos", str(selection.link), "--model", model, "--binary",
+            str(launcher.paths.BINARY), "--out", "clip.mp4", "--request", json.dumps(request),
+            "--first-frame", "first.png", "--last-frame", "last.jpg",
+        ])  # fmt: skip
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            launcher.parse_args(["generate", "--model", model])
+
     def test_serve_takes_the_stop_signals_and_holds_them_across_the_exec(self):
         # A non-interactive shell starts background jobs with SIGINT ignored.
         signal.signal(signal.SIGINT, signal.SIG_IGN)

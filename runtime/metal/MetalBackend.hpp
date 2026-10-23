@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -172,6 +173,10 @@ struct ComputeDispatch {
   DispatchSize threadgroups;
   DispatchSize threadsPerThreadgroup;
   IndirectGrid indirectThreadgroups = {};
+  // With gridThreads the dispatch runs exactly that many threads in each
+  // dimension, Metal trimming the threadgroups at the grid's far edges
+  // (dispatchThreads), and threadgroups is unused.
+  std::optional<DispatchSize> gridThreads = {};
 };
 
 // A host step's round trip on the host clock (AwakeClock, the time base of

@@ -109,6 +109,22 @@ def example_progress_request():
     return replace(example_request(), flags=p.RequestFlag.RETURN_PROGRESS)
 
 
+VIDEO_REQUEST = p.VideoRequestFrame(
+    92, p.VideoVariant.TURBO, p.VideoOutputFlag.PREVIEW | p.VideoOutputFlag.AUDIO,
+    73, 1344, 768, 0, 42, (5, 6, 7),
+)  # fmt: skip
+# The default variant's clip without audio or preview.
+VIDEO_DEFAULT_REQUEST = replace(
+    VIDEO_REQUEST, variant=p.VideoVariant.DEFAULT, outputs=p.VideoOutputFlag(0),
+    steps=50, prompt_tokens=(0xFFFFFFFF,),
+)  # fmt: skip
+# A clip of a 4 x 2 canvas from its first and last frames.
+VIDEO_KEYFRAME_REQUEST = p.VideoRequestFrame(
+    92, p.VideoVariant.TURBO, p.VideoOutputFlag.AUDIO, 73, 4, 2, 0, 42, (5,),
+    bytes(range(24)), bytes(255 - n for n in range(24)),
+)  # fmt: skip
+
+
 def client_messages():
     return {
         "request": example_request(),
@@ -122,6 +138,9 @@ def client_messages():
         ),
         "status_request": p.StatusRequestFrame(808),
         "release_request": p.ReleaseRequestFrame(808),
+        "video_request": VIDEO_REQUEST,
+        "video_request_default": VIDEO_DEFAULT_REQUEST,
+        "video_request_keyframes": VIDEO_KEYFRAME_REQUEST,
     }
 
 
@@ -129,6 +148,7 @@ def engine_events():
     return {
         "ready": p.ReadyEvent(4, 524_288, False),
         "ready_vision": p.ReadyEvent(4, 524_288, True),
+        "ready_video": p.ReadyEvent(1, 2048, False, True),
         "start": p.StartEvent(91, 2, 4096),
         "prompt_progress": p.PromptProgressEvent(91, 2048, 123456),
         "tokens": p.TokensEvent(91, 17, (10, 11, 12)),
@@ -174,6 +194,12 @@ def engine_events():
         ),
         "status_json": p.StatusJsonEvent(
             808, b'{\n  "schema_version": 6, "ready": true\n}'
+        ),
+        "video_progress": p.VideoProgressEvent(
+            92, p.VideoPhase.DENOISE, 3, 8, 312_000_000, 15_200_000_000
+        ),
+        "video_output": p.VideoOutputEvent(
+            92, p.VideoOutputKind.VIDEO, 73, 345_000_000, b"\x00\x00\x00\x18ftyp"
         ),
     }
 
@@ -284,6 +310,22 @@ class ProtocolPythonTests(unittest.TestCase):
         for name, event in engine_events().items():
             with self.subTest(name=name):
                 self.assertEqual(decode_event(golden[name]), event)
+
+    def test_video_frames_are_validated(self):
+        for code, change in (
+            (p.IssueCode.LIMIT_EXCEEDED, {"prompt_tokens": ()}),
+            (p.IssueCode.INVALID_COUNT, {"frames": 0}),
+            (p.IssueCode.INVALID_ENUM_VALUE, {"outputs": p.VideoOutputFlag(4)}),
+            (p.IssueCode.INVALID_COUNT, {"first_frame": bytes(23)}),
+        ):
+            with self.subTest(change=change):
+                invalid = replace(VIDEO_REQUEST, **change)
+                self.assert_protocol_error(p.FailureClass.REQUEST_ERROR, code,
+                                           lambda: p.serialize_message(invalid))  # fmt: skip
+        self.assert_fatal_event(p.IssueCode.INVALID_COUNT,
+                                p.VideoProgressEvent(92, p.VideoPhase.DENOISE, 9, 8, 0, 0))  # fmt: skip
+        self.assert_fatal_event(p.IssueCode.LIMIT_EXCEEDED,
+                                p.VideoOutputEvent(92, p.VideoOutputKind.VIDEO, 73, 0, b""))  # fmt: skip
 
     def test_progress_wire_validation(self):
         # A request asks for its prompt's progress with a flag bit.
@@ -1028,7 +1070,7 @@ class ProtocolPythonTests(unittest.TestCase):
         )
         self.assert_fatal_event(p.IssueCode.INVALID_COUNT, p.ReadyEvent(0, 4096, False))
         self.assert_fatal_event(
-            p.IssueCode.INVALID_ENUM_VALUE, p.ReadyEvent(4, 4096, 2)
+            p.IssueCode.INVALID_ENUM_VALUE, p.ReadyEvent(4, 4096, 4)
         )
 
     def test_unnamed_request_failures_are_fatal(self):

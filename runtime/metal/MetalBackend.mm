@@ -910,7 +910,9 @@ struct MetalBackend::Impl {
     // One dispatch of a command, validated and resolved to its pipeline.
     struct PreparedDispatch {
         const ComputeDispatch *source = nullptr;
+        // Threadgroups, or with exactGrid threads (ComputeDispatch::gridThreads).
         MTLSize groups{};
+        bool exactGrid = false;
         MTLSize threads{};
         uint64_t threadCount = 0;
         // The argument table entries its buffers take, one bit each.
@@ -1029,7 +1031,10 @@ struct MetalBackend::Impl {
         for (const ComputeDispatch &dispatch : dispatches) {
             PreparedDispatch item;
             item.source = &dispatch;
-            item.groups = metalSize(dispatch.threadgroups, "threadgroups");
+            item.exactGrid = dispatch.gridThreads.has_value();
+            item.groups = item.exactGrid
+                ? metalSize(*dispatch.gridThreads, "gridThreads")
+                : metalSize(dispatch.threadgroups, "threadgroups");
             item.threads = metalSize(
                 dispatch.threadsPerThreadgroup, "threadsPerThreadgroup");
             if (multiplyOverflows(dispatch.threadsPerThreadgroup.x,
@@ -1087,6 +1092,11 @@ struct MetalBackend::Impl {
             // Metal reads an indirect grid's three counts at a multiple of 4
             // bytes, counted from the allocation's start, not the view's.
             const IndirectGrid &grid = dispatch.indirectThreadgroups;
+            if (grid.buffer && item.exactGrid) {
+                throw MetalBackendError(
+                    "compute dispatch '" + dispatch.pipelineName +
+                    "' takes an indirect grid and an exact one");
+            }
             if (grid.buffer) {
                 const MetalBuffer::Impl &arguments = *grid.buffer.impl_;
                 if (arguments.allocation->accounting.get() != accounting.get() ||
@@ -1427,6 +1437,9 @@ struct MetalBackend::Impl {
                                               indirectBufferOffset:
                                 arguments.offsetBytes + grid.offsetBytes
                                              threadsPerThreadgroup:item.threads];
+                    } else if (item.exactGrid) {
+                        [encoder dispatchThreads:item.groups
+                           threadsPerThreadgroup:item.threads];
                     } else {
                         [encoder dispatchThreadgroups:item.groups
                                  threadsPerThreadgroup:item.threads];

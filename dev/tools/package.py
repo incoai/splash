@@ -31,6 +31,7 @@ INSTALL_FILES = (
     "upstream.py",
     "local.py",
     "gguf.py",
+    "video.py",
     "requirements.txt",
 )
 COMPLETION_FILES = (
@@ -70,6 +71,7 @@ SERVER_FILES = (
     "thinking.py",
     "schema_validation.py",
     "crash_trace.py",
+    "videos.py",
     "chat.html",
     "favicon.svg",
 )

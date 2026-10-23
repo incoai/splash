@@ -249,10 +249,20 @@ class Selection:
     draft_model: str | None
     models_root: Path
     link: Path
+    # A video model's DiT variants to install beside those it has (its
+    # defaults without any); a language model takes none.
+    variants: tuple[str, ...] = ()
 
     @classmethod
     def of(
-        cls, models_root, model, *, revision=None, language_only=False, draft_model=None
+        cls,
+        models_root,
+        model,
+        *,
+        revision=None,
+        language_only=False,
+        draft_model=None,
+        variants=(),
     ):
         repo_id, variant = split_model_id(model)
         models_root = Path(models_root).resolve()
@@ -272,6 +282,7 @@ class Selection:
             draft_model,
             models_root,
             link,
+            tuple(variants),
         )
 
 
@@ -366,6 +377,13 @@ def parse_args(argv=None):
         action="store_true",
         help="skip vision preparation and loading",
     )
+    parser.add_argument(
+        "--variants",
+        type=lambda value: tuple(v for v in value.split(",") if v),
+        default=(),
+        help="a video model's DiT variants to install beside those installed "
+        "(MiniMax-H3: turbo, default; turbo alone without)",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("prepare")
     commands.add_parser("verify").add_argument("--full", action="store_true")
@@ -381,6 +399,7 @@ def main(argv=None):
         revision=args.revision,
         language_only=args.language_only,
         draft_model=args.draft_model,
+        variants=args.variants,
     )
     if args.command == "link":
         print(selection.link)

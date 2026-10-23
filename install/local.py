@@ -34,7 +34,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from . import hub, models, paths, upstream
+from . import hub, models, paths, upstream, video
 from .models import ModelError
 
 __all__ = ["ModelError", "prepare_local_model"]
@@ -49,7 +49,9 @@ def prepare_local_model(
     target: a GGUF file, any part of a split GGUF naming all of them, which
     lie beside it; or a directory whose root holds an MLX model (config.json,
     tokenizer files and a safetensors checkpoint) or else a single GGUF
-    target, whole or split, beside any vision projector named mmproj.
+    target, whole or split, beside any vision projector named mmproj; or a
+    directory of the video model MiniMax-H3 (install/video.py), which takes
+    none of the options below.
     draft: the directory of a DFlash2 draft (config.json and safetensors
     weights) trained for the target's family. Without one, the draft
     released for the family is taken from the Hugging Face cache
@@ -93,6 +95,13 @@ def prepare_local_model(
 
 def _prepare(target, draft, mmproj, language_only, models_root):
     """prepare_local_model, of its paths made absolute."""
+    if video.is_local(target):
+        link = models.local_selection_link(
+            models_root, target, draft, mmproj, language_only
+        )
+        return video.prepare_local(
+            target, models_root, link, draft, mmproj, language_only
+        )
     if mmproj and language_only:
         raise ModelError(
             f"{mmproj} is a vision projector, which a model that serves text "

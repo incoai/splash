@@ -1,0 +1,94 @@
+MiniMax-H3 video engine: Splash's own, and what it still copies from h3
+
+Copied from h3 commit e6deb5e (branch main), as of its keyframe conditioning
+(FL2VA first-frame and first-and-last-frame), without its history.
+
+Splash's own: runtime/video. It began as h3's host code (its engine, model,
+ops and media), which now runs on Splash's base layer and is laid out as
+Splash and SGLang Diffusion lay out theirs:
+
+  runtime/video/VideoRuntime.*   the engine process of a video model and the
+                                 VideoRuntime, a pipeline of stages run in
+                                 order on a request's batch (SGLang's
+                                 ComposedPipeline)
+  runtime/video/pipeline/        the stage interface and the batch
+  runtime/video/stages/          TextEncodingStage, PrepStage,
+                                 DenoisingStage (h3's scheduler and denoising
+                                 loop), PreviewStage, DecodingStage,
+                                 AudioDecodingStage, MuxStage (h3's mp4 writer)
+  runtime/video/model/           the weights' readers, request preparation,
+                                 the DiT's activation plan and weight stream,
+                                 the text encoder
+  runtime/video/ops/             the operators, which take their weights as
+                                 buffers, and the shapes they take
+  runtime/video/metal/           the dispatch recorder and the M5 Pro tuning
+
+h3's C ABI is gone: the runtime calls the stages, and they the model and the
+operators, directly; failures are exceptions, as Splash fails. On Splash's
+base layer:
+
+  h3 metal/MetalBackend: device, queue, metallib, pipeline cache, buffers and
+    command buffers -> metal/MetalBackend, one per engine process.
+    video/metal/Encoder.hpp records a command's dispatches as the operators
+    bind them; a kernel that runs an exact grid takes
+    ComputeDispatch::gridThreads. One command runs a DiT block, a VAE clip or
+    a preview chunk, the next encoded while it runs.
+  h3 model/Safetensors, model/Json and its pread loops -> model/
+    SafetensorsCheckpoint (a converted directory read as one index),
+    model/WeightSource and parallelFor (model/WeightImages.hpp); the
+    decoders' manifests through NSJSONSerialization
+    (video/model/WeightFiles.hpp).
+  h3 engine/Status, Logger -> exceptions, and logLine on stderr.
+  std::chrono::steady_clock -> AwakeClock.
+  metal/Residency of Splash is a Metal residency set: it cannot express the
+    DiT's SSD read-ahead ring, so video/model/WeightStream keeps its own.
+
+Its data are Splash's too: the weight stream reads the int8 matrices from the
+DiT's block files, which h3 copies into a stream image (stream.bin, 22 GB per
+variant), and request preparation gathers the adaLN tables of the variant's
+schedule from dit-<variant>/adaln.safetensors, which `splash video-adaln`
+computes once at conversion with h3's own arithmetic, where h3 computes them
+from FL2VA's transformer shards (26 GB read) at every request. The int8
+weights' format is QUANT_VIDEO_W8 of runtime/metal/abi/QuantFormat.h, which
+the readers check the manifests against; the images are served from a
+repository of the engine's format (install/video.py), which
+dev/tools/publish_video_repo.py makes with the converters.
+
+Its development tools are under dev/: the synthetic DiT weights and their
+fill kernel (dev/tests/engine/VideoSynthetic.*, video_synthetic.metal), and
+the golden-clip tests' engine (dev/tools/video_golden.mm), which reads and
+writes .npz files (dev/tools/Numpy.*); the engine process takes none of
+their options.
+
+Still copied from h3, with include paths rewritten for their places
+("metal/abi/" -> "metal/abi/video/", "metal/kernels/common/" ->
+"metal/kernels/video/common/"):
+
+  h3 runtime/metal/kernels/GROUP/        -> runtime/metal/kernels/video/GROUP/
+     (but shared/synthetic.metal; common/quant.h, whose format constants are
+     metal/abi/QuantFormat.h's, is Splash's)
+  h3 runtime/metal/abi/                  -> runtime/metal/abi/video/
+     (but SyntheticABI.h; TextEncoderABI.h there is Splash's)
+  h3 tools/convert_*.py, h3/{__init__,common,config,safetensors}.py
+                                         -> dev/tools/video/
+
+Their arithmetic is h3's: the golden clip of make test-video-real is byte for
+byte h3's. To bring an upstream change, dev/tools/vendor_video.sh H3_CHECKOUT
+copies these again and prints the upstream changes to h3's host code and
+common/quant.h since the commit above, which are ported into runtime/video and
+quant.h by hand; then record the
+new commit here, rebuild, and run make test-engine-metal and make
+test-video-real.
+
+Beside them, Splash's kernels/video/text_encoder.metal (the prompt's text
+encoder) and this note.
+
+Build (Makefile): the kernels compile into splash.metallib as its video
+group with Splash's production Metal flags, the prep kernels also without
+fast math, as h3 builds them, since they reproduce MLX's arithmetic bit for
+bit. The host code compiles with Splash's flags plus -ffp-contract=off, as h3
+builds it, into build/engine/libsplash-video.a, which links before the
+engine's library; the mp4 writer links AVFoundation, CoreMedia and CoreVideo.
+
+Licenses: THIRD_PARTY_NOTICES. No model weights are vendored; the installer
+downloads them, converted, under the MiniMax H3 Community License Agreement.

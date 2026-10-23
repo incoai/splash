@@ -126,6 +126,45 @@ test-release-real: preflight $(TARGET) agent-preflight verify-build-identity
 	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/agent_real.py $(AGENT_ARGS) \
 		--http-smoke
 
+# The video model (DEVELOPMENT.md, Video): VIDEO_ROOT, the MiniMax-H3 a
+# selection prepared (by default `splash serve --model VIDEO_MODEL`'s, the
+# repository install/video.py REPOSITORY names), or VIDEO_CONVERTED, a
+# directory of its repository's layout or of h3's converted images, which
+# the tests prepare first;
+# and VIDEO_REFERENCES, the h3 engine's references (its H3_REFS: the golden
+# prompt's hidden states, latents and frames). VIDEO_SECONDS is the length of
+# the clip of the server's own text encoder. VIDEO_FIRST_FRAME_FINAL is the h3
+# engine's final.npz of the 3 s golden clip from golden frame 0 (DEVELOPMENT.md,
+# Video tests).
+VIDEO_MODEL ?= $(shell $(PYTHON) -c 'from install import video; print(video.REPOSITORY)')
+VIDEO_ROOT ?= $(shell $(PYTHON) install/models.py --model "$(VIDEO_MODEL)" link)
+VIDEO_CONVERTED ?=
+VIDEO_REFERENCES ?= $(H3_REFS)
+VIDEO_SECONDS ?= 3
+VIDEO_FIRST_FRAME_FINAL ?= $(VIDEO_REFERENCES)/golden_i2v_3s/final.npz
+VIDEO_ARGS = --model "$(VIDEO_MODEL)" --references "$(VIDEO_REFERENCES)" \
+	--engine "$(VIDEO_GOLDEN)" --metallib "$(LIB)" \
+	$(if $(VIDEO_CONVERTED),--converted "$(VIDEO_CONVERTED)",--model-root "$(VIDEO_ROOT)")
+
+.PHONY: video-references test-video-real test-video-http-real test-video-first-frame-real
+video-references:
+	@test -d "$(VIDEO_REFERENCES)" || { \
+		echo "error: set VIDEO_REFERENCES to the h3 engine's reference directory" >&2; \
+		exit 1; \
+	}
+
+test-video-real: install-development $(TARGET) $(VIDEO_GOLDEN) video-references
+	$(PYTHON) dev/tests/video_real.py engine $(VIDEO_ARGS) \
+		--output build/release/video-engine.json
+
+test-video-http-real: install-development $(TARGET) $(VIDEO_GOLDEN) video-references
+	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/video_real.py http $(VIDEO_ARGS) \
+		--seconds "$(VIDEO_SECONDS)" --output build/release/video-http.json
+
+test-video-first-frame-real: install-development $(TARGET) $(VIDEO_GOLDEN) video-references
+	TRANSFORMERS_VERBOSITY=error $(PYTHON) dev/tests/video_real.py first-frame $(VIDEO_ARGS) \
+		--first-frame-final "$(VIDEO_FIRST_FRAME_FINAL)" --output build/release/video-first-frame.json
+
 # BASELINE is a checkout whose build/ holds another build's splash.metallib,
 # engine-tests/backend-benchmark and, for a build that loads the weights into
 # memory, engine-tests/weight-digests: this build is compared with it on this

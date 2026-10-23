@@ -173,6 +173,14 @@ def check() -> list[str]:
     forbidden_metal_dependencies = ("engine/", "model/", "ops/")
     forbidden_model_dependencies = ("engine/",)
     forbidden_operator_dependencies = ("engine/", "model/")
+    # The video subtree's layers, lowest first: each depends on Splash's layers
+    # as runtime/'s layer of its name does, and on its own lower layers only.
+    video_layers = ("metal", "ops", "model", "pipeline", "stages")
+    video_forbidden = {
+        "metal": forbidden_metal_dependencies,
+        "ops": forbidden_operator_dependencies,
+        "model": forbidden_model_dependencies,
+    }
     engine_assembly_sources = {
         "runtime/engine/Bootstrap.hpp",
         "runtime/engine/Bootstrap.mm",
@@ -221,6 +229,16 @@ def check() -> list[str]:
             if OPERATOR_WORKSPACE_POLICY.search(text):
                 layer = name.split("/")[1]
                 errors.append(f"{name}: {layer} owns an operator workspace policy")
+        video_layer = name.split("/")[2] if name.startswith("runtime/video/") else None
+        if video_layer in video_layers:
+            above = video_layers[video_layers.index(video_layer) + 1 :]
+            upper = (*video_forbidden.get(video_layer, ()), "video/VideoRuntime.")
+            upper += tuple(f"video/{layer}/" for layer in above)
+            for include in includes:
+                if include.startswith(upper):
+                    errors.append(
+                        f"{name}: video {video_layer} depends on upper layer {include}"
+                    )
         if name.startswith("runtime/ops/"):
             for include in includes:
                 if include.startswith(forbidden_operator_dependencies):

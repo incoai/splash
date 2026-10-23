@@ -1,9 +1,9 @@
 # Development
 
 This document runs from using Splash to working on it: running and
-configuring the server, the [API](#api), the [models](#models) it loads, its
-[internals](#internals), then [validation](#validate) and
-[packaging](#package).
+configuring the server, the [API](#api), the [models](#models) it loads, the
+[video model](#video), its [internals](#internals), then
+[validation](#validate) and [packaging](#package).
 
 Building from source needs Apple Silicon with macOS 26.4+, Xcode 26 or newer,
 Python 3.12–3.14, and a Metal 4 compiler with `uint4b_format` tensor support.
@@ -2040,7 +2040,9 @@ model's source options (`--revision`, `--draft-model`, `--language-only`,
 
 - `target`: a GGUF file, any part of a split GGUF naming all its parts,
   which lie beside it; or a directory whose root holds an MLX model or else
-  a single GGUF target, whole or split, beside any projectors named `mmproj`.
+  a single GGUF target, whole or split, beside any projectors named `mmproj`;
+  or a directory of the video model ([Video](#video)), which takes no other
+  argument.
 - `draft`: the directory of a DFlash2 draft ([Drafts](#drafts)). Without
   one, the family's released draft is taken from the Hugging Face cache, at
   the commit a download of its default branch last recorded there, as
@@ -2086,6 +2088,199 @@ byte but for the 27B's GDN decay vectors, each within a float ULP. For an
 installed package it also names the Hub cache folder holding the package's
 files, which nothing reads any more and can be deleted. A package is
 recognized by its `manifest.json`, which names the package format.
+
+## Video
+
+`splash serve --model bzzzy1234/MiniMax-H3-Splash` serves MiniMax-H3, a text to
+video and audio model, as its own instance: its server answers
+[OpenAI's video API](https://platform.openai.com/docs/api-reference/videos)
+and no language model's routes, which answer 404; chat and video together
+are two instances on two ports. The two share the model layer, the
+installer's inspection, publication and assemblies, and the server's HTTP
+handling; the video model has an engine process of its own
+([figure](runtime/video/docs/video-serving.svg)). It runs on an M5 (Apple10 GPU) with
+48 GB.
+
+### Video API
+
+| Route | Answer |
+| --- | --- |
+| `POST /v1/videos` | a queued video object |
+| `GET /v1/videos/{id}` | the video object |
+| `GET /v1/videos/{id}/content` | the mp4; `?variant=preview` the TAEH3 preview once decoded |
+| `GET /v1/videos` | a list (`limit` up to 100, `order`, `after`) |
+| `DELETE /v1/videos/{id}` | forgets the job, cancelling it at its next step |
+
+`POST` takes JSON, or the multipart form OpenAI's SDK sends: `prompt`,
+`model`, `seconds` (`3`, `10` or `15`; 73, 243 or 362 frames at 24 fps) and
+`size` (`1344x768`), and Splash's `variant` (`turbo`, 8 steps, or `default`,
+50), `seed`, `steps` (0 or the variant's: its adaLN tables are those of
+its schedule), `preview` (false) and `audio` (true). A clip may start from an image: OpenAI's `input_reference`, a PNG or
+JPEG file field of the multipart form, is its first frame, and Splash's
+`last_frame`, another file field (with `input_reference`), its last
+(MiniMax-H3's FL2VA first-frame and first-and-last-frame conditioning). The
+server decodes each with Pillow and puts it on the 1344×768 canvas as the
+model's MLX port does (`images.keyframe`: an image of that size as it is,
+otherwise the first frame stretched and the last scaled to cover and
+centre-cropped, LANCZOS; stored RGB, alpha dropped, no EXIF rotation). A PNG
+decodes to the same pixels as in h3's native CLI (ImageIO); a JPEG may differ
+by the two decoders' rounding, Pillow's being the MLX port's. JSON bodies and
+`input_reference` objects (`image_url`, `file_id`) carry no image. The video
+object has OpenAI's fields, and `phase`, `variant`, `seed`, `preview` (ready) and `phases`, each
+completed phase's seconds and the engine's peak footprint. Errors have the
+OpenAI shape: `video_queue_full` (503) past four queued jobs,
+`video_not_ready` (409) for content not yet decoded, `not_found` and
+`model_not_found` (404). Jobs run one at a time in their order of arrival;
+the mp4s and previews of finished jobs stay in a 4 GB store, the oldest
+evicted first.
+
+`splash generate --model bzzzy1234/MiniMax-H3-Splash --prompt ... --out clip.mp4` installs the model as `serve` does and runs one clip on its engine without a server (`python -m server.videos`): its flags are the `POST` fields, checked by the same `parse_request`, `--first-frame` and `--last-frame` the image files of `input_reference` and `last_frame`; progress goes to stderr, `--preview` writes `clip.preview.mp4` once decoded, and Ctrl+C cancels at the next step.
+
+### Video installation
+
+The model's assembly is of target format `h3-video` (`install/video.py`).
+Splash serves MiniMax-H3 from a Hugging Face repository in its engine's own
+format, as it serves a GGUF or MLX repository: the installer downloads its
+files and links them as they are, converting nothing. `bzzzy1234/MiniMax-H3-Splash` is the
+one this documentation names (`install/video.py` `REPOSITORY`); any
+repository its marker describes serves the same way. Its layout:
+
+| Path | Holds |
+| --- | --- |
+| `splash-video.json` | the marker: `format` `h3-video`, `version` 1, `weights` `h3-w8a8-vdn-v1` (the int8 format, [Kernels](#kernels)), `variants` and the `sources`' commits |
+| `dit-turbo/`, `dit-default/` | each variant's DiT: 50 int8 blocks, 3 QKFIX blocks, globals, patch projections (`io`), request-independent prep inputs, adaLN tables and `manifest.json`; 24.8 and 26.1 GB |
+| `vae/` | the video VAE's int8 decoder and its encoder of a clip's keyframes, 2.8 GB |
+| `audio/`, `preview/` | the audio VAE's decoder and TAEH3's, 0.3 GB |
+| `tokenizer/` | FL2VA's tokenizer, which the server encodes prompts with |
+| `LICENSE`, `NOTICE`, `README.md` | the MiniMax H3 Community License Agreement, the notice it requires, the model card |
+
+The installer recognizes the repository by its marker, and refuses one whose
+format, version, weights or variants it does not serve. Before any weight
+download it quotes the license agreement's territory clauses and asks for its
+acknowledgement on the terminal, or takes `SPLASH_ACCEPT_LICENSE=minimax-h3`;
+it records it once per license text in the models directory's
+`.licenses.json`. It then downloads the turbo variant's DiT, the decoders and
+encoders, the tokenizer and the license, and the text encoder,
+`mlx-community/Qwen3-VL-32B-Instruct-4bit`, at its default branch's commit,
+as a draft is. The 50-step `default` variant downloads once asked for: by
+`--variants default` of `install/models.py`, or by the first `splash
+generate --variant default`; a server refuses a variant its installation
+does not hold. A start without the Hub starts the installation from the
+snapshots it pins.
+
+`--model MiniMaxAI/MiniMax-H3`, MiniMax's bf16 release, is refused with the
+way to the engine's format: Splash does not convert at installation.
+`dev/tools/publish_video_repo.py` makes a repository of the layout above, to
+upload with `hf upload`: from images converted before (`--images`, h3's
+layout below; `--commit REPO=COMMIT` names each source's commit the
+release's link does not), or converted from the release, `OpenVDN/vdn-minimax-h3`
+(the VDN-H3 DiT stages) and `madebyollin/taehv` (TAEH3) at their default
+branches (`--convert`, 26 GB for the turbo variant, 25 GB more for the
+default one, and FL2VA's transformer shards, 62 GB, in the Hugging Face
+cache). Its converters are h3's (`dev/tools/video`, `runtime/video/VENDORED`);
+the video VAE's needs MLX in Splash's environment and `H3_MLX_PORT` naming a
+checkout of [minimax-h3-mlx](https://github.com/PipeNetwork/minimax-h3-mlx),
+and the engine tabulates each DiT's adaLN tables from FL2VA's transformer
+shards (`splash video-adaln`). The repository's files are APFS clones of the
+images, but for their manifests, written again without the converting
+machine's paths.
+
+`prepare_local_model` takes a directory of the repository's layout, or of
+images converted before as h3 lays them out (`dit-turbo/` and or
+`dit-default/`, each with the `adaln.safetensors` that `build/splash
+video-adaln DIRECTORY VARIANT FL2VA/transformer` tabulates, `vae/` with the
+encoder's images, `audio/`, `preview/` and `fl2va/`, a link to FL2VA, whose
+tokenizer and license it takes), and links its files as they are; the
+encoder comes from the Hugging Face cache. Images an earlier release
+converted into the models directory (`.converted/`) are removed once no
+installation links them.
+
+### Video engine
+
+The engine process of an h3-video assembly (`runtime/video/VideoRuntime.hpp`)
+speaks the native protocol and announces `FeatureVideo`. A `VideoRequest`
+(the clip's variant, frames, size, steps, seed, outputs, the prompt's token
+ids and, for a clip from its first and last frames, their pixels on the
+canvas) runs every phase in this process, one request at a time, on
+Splash's Metal backend and weight readers. The `VideoRuntime` composes the
+phases as SGLang Diffusion composes a pipeline, one stage each
+(`runtime/video/stages`), which pass the request's batch from one to the next:
+the text encoder, Qwen3-VL-32B through decoder layer 50, loaded for the
+request (`TextEncodingStage`); request preparation, with the video VAE's
+encoder for the keyframes (`PrepStage`); the DiT, streamed from its block
+files on the SSD in 8 slots (`DenoisingStage`); the TAEH3 preview
+(`PreviewStage`); the video VAE (`DecodingStage`); the audio VAE
+(`AudioDecodingStage`); and the mp4 (`MuxStage`). Under the stages, the
+subtree keeps Splash's layering: `model/` (weights, request preparation, the
+DiT's activation plan and weight stream), `ops/` (the operators) and
+`metal/` (the dispatch recorder and the device's tuning), checked by
+`dev/tools/check_architecture.py`; its kernels are under
+`runtime/metal/kernels/video` (`runtime/video/VENDORED`). `VideoProgress`
+reports each phase's start and end and each denoising step, `VideoOutput`
+delivers the preview and then the clip, which ends the request; a `Cancel`
+stops it at the next step or phase. A language model's engine refuses a
+`VideoRequest`.
+
+On an M5 Pro (48 GB), through `/v1/videos`:
+
+| Turbo clip | Encoder | Prep | Denoising | Preview | Video VAE | Audio | mp4 | Wall | Engine peak |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3 s | 3.0 s | 2.2 s | 313 s | 0.7 s | 27.1 s | 0.1 s | 0.2 s | 347 s | 14.4 GB |
+| 15 s | 2.4 s | 2.3 s | 1,764 s | 2.4 s | 141.5 s | 0.4 s | 0.9 s | 1,914 s | 18.0 GB |
+
+The engine's peak is in the encoder, whose 14 GB of weights load for the
+request, for 3 s, and in the DiT for 15 s. On the golden prompt the encoder's
+hidden states are 0.44% relative RMS from MLX's; the clip diverges from the
+golden one along the denoising (latents 27% relative RMS, frames 22.9 dB
+PSNR), as any change of its conditioning does, while the golden hidden states
+reproduce the golden clip byte for byte.
+
+A first frame, and a last frame, condition the clip as the model's FL2VA
+checkpoint does (h3's README, Keyframe conditioning): the video VAE's encoder
+turns each into 1,008 latent rows, noised to t = 0.999, which join the DiT's
+sequence after the text, stay fixed through the denoising (only the clip's
+rows step) and take a fourth adaLN slot per block. The text encoder sees the
+prompt alone: the reference presents each keyframe to Qwen3-VL as image
+tokens too, which this encoder, a language model without its vision tower,
+does not; on the 3 s golden clip h3 measured the image tokens moving the
+first frame from 38.2 to 38.3 dB PSNR against its keyframe, and the later
+frames' mean PSNR against the first from 15.4 to 15.9 dB: the latents carry
+the conditioning. Ref2VA (reference audio) is not served. A first frame adds
+the encoder's pass to the request preparation (2.0 s instead of 0.9 s) and
+its 1,008 rows to the DiT's: the 3 s golden clip denoised in 335 s instead of
+310 s.
+
+### Video tests
+
+`make test-engine-metal` runs the encoder's attention kernels against a CPU
+reference and one DiT block on synthetic weights against h3's references.
+With the weights, `VIDEO_REFERENCES` naming h3's reference directory, and
+`VIDEO_ROOT` a prepared model (by default `splash serve`'s) or
+`VIDEO_CONVERTED` a directory of the repository's layout or of converted
+images, which the tests prepare first:
+
+```sh
+make test-video-real VIDEO_REFERENCES=... VIDEO_CONVERTED=...
+make test-video-http-real VIDEO_REFERENCES=... VIDEO_CONVERTED=... VIDEO_SECONDS=15
+make test-video-first-frame-real VIDEO_REFERENCES=... VIDEO_CONVERTED=... VIDEO_FIRST_FRAME_FINAL=...
+```
+
+The tests run the golden-clip engine (`dev/tools/video_golden.mm`,
+`build/engine-tests/video-golden`): the model's runtime with two of its stages
+changed, the text encoding by the golden prompt's saved hidden states
+(`--hidden-states`) and the denoising and decoding followed by writing their
+latents and frames (`--keep`). `test-video-real` requires the 3 s golden
+clip's latents and frames byte-identical to h3's references, as h3's own suite
+compares them, then cancels a clip. `test-video-http-real` does the
+same through `/v1/videos`, deletes a running job, then runs a clip of
+`VIDEO_SECONDS` from the server's tokenizer and the engine's encoder.
+`test-video-first-frame-real` sends the golden frames' first frame as a PNG
+`input_reference` with the golden prompt's hidden states and requires the 3 s
+clip's latents byte-identical to `VIDEO_FIRST_FRAME_FINAL` (default
+`VIDEO_REFERENCES/golden_i2v_3s/final.npz`), h3's of the same inputs:
+`build/h3 prep --hidden GOLDEN_PROMPT_NPZ --seconds 3 --first-frame frame0.png
+--out D/prep` then `build/h3 denoise --prep D/prep --out D --stream`. The
+reports, each clip's phases, go to `build/release/video-*.json`.
 
 ## Internals
 
@@ -2465,6 +2660,18 @@ and the decode-only value tables in `runtime/metal/abi/QuantTables.h`, which no 
 depends on; weight loading's repack ABI is `runtime/metal/abi/GgufRepack.h`. The tables are
 llama.cpp's and the decoding follows its Metal kernels: both keep llama.cpp's MIT notice in
 `THIRD_PARTY_NOTICES`, which the release archive ships.
+
+`QuantFormat.h` also defines the video model's int8 format, `QUANT_VIDEO_W8`
+(`h3-w8a8-vdn-v1`), which its repository's marker and DiT manifests name
+([Video installation](#video-installation)). It is no `kQuantFormats` row: no
+MDGG0001 tiles and no decoder in the LLM GEMMs. A [N, K] weight is dense
+row-major int8 with one fp32 scale per output row (absmax / 127, rounded half
+to even) after a Hadamard rotation of its inputs in groups of 128 with
+splitmix64 signs (seed `0x48335138`), as the video GEMMs read it, and the
+producers quantize the activations so per token
+(`runtime/metal/kernels/video/common/quant.h`). The DiT and VAE readers
+refuse manifests that name another format or seed, and a test holds the
+converters' constants to the header.
 
 The tests' CPU reference (`dev/tests/engine/GgufFormatReference.hpp`) must reproduce the golden
 hashes of upstream GGML's dequantization (llama.cpp 7ab4ee7; for PQ2_0, which upstream lacks,
@@ -3305,6 +3512,11 @@ counters include:
   past what the cache changed.
 
 ### Native protocol
+
+A video model's engine takes `VideoRequest` and `Cancel` frames and answers
+with `VideoProgress`, `VideoOutput` and `Error` events ([Video
+engine](#video-engine)); its Ready sets `FeatureVideo` in the features byte,
+beside `FeatureVision`.
 
 The engine receives `ignore_eos` as bit 0 of the request frame's flags word and
 `return_progress` as bit 1; the word rejects undefined bits.

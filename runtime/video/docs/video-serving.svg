@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760" font-family="-apple-system, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#4b5563"/>
+    </marker>
+  </defs>
+  <rect width="1200" height="760" fill="#ffffff"/>
+  <text x="600" y="38" text-anchor="middle" font-size="22" font-weight="600" fill="#111827">Splash: a video model is a sibling serve mode</text>
+  <text x="600" y="62" text-anchor="middle" font-size="14" fill="#4b5563">Two instances, one model layer. Chat and video together are two processes on two ports; neither hands the GPU to the other.</text>
+
+  <!-- LLM instance -->
+  <rect x="40" y="86" width="540" height="270" rx="14" fill="#eff6ff" stroke="#3b82f6" stroke-width="2"/>
+  <text x="60" y="114" font-size="17" font-weight="600" fill="#1e3a8a">Language model instance</text>
+  <text x="60" y="136" font-size="13" fill="#1e40af" font-family="Menlo, monospace">splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M</text>
+  <rect x="64" y="152" width="492" height="78" rx="10" fill="#ffffff" stroke="#93c5fd"/>
+  <text x="80" y="176" font-size="14" font-weight="600" fill="#111827">server (python -m server.server)</text>
+  <text x="80" y="198" font-size="13" fill="#374151">/v1/chat/completions · /v1/responses · /v1/messages · /v1/completions</text>
+  <text x="80" y="218" font-size="13" fill="#6b7280">/v1/videos → 404</text>
+  <line x1="310" y1="230" x2="310" y2="262" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="320" y="252" font-size="12" fill="#4b5563">Request · Tokens · Done</text>
+  <rect x="64" y="264" width="492" height="74" rx="10" fill="#ffffff" stroke="#93c5fd"/>
+  <text x="80" y="288" font-size="14" font-weight="600" fill="#111827">engine (build/splash serve-native)</text>
+  <text x="80" y="310" font-size="13" fill="#374151">target + DFlash2 draft · scheduler · KV cache · memory governor</text>
+  <text x="80" y="329" font-size="13" fill="#6b7280">Ready: FeatureVision</text>
+
+  <!-- Video instance -->
+  <rect x="620" y="86" width="540" height="270" rx="14" fill="#f0fdf4" stroke="#22c55e" stroke-width="2"/>
+  <text x="640" y="114" font-size="17" font-weight="600" fill="#14532d">Video model instance</text>
+  <text x="640" y="136" font-size="13" fill="#166534" font-family="Menlo, monospace">splash serve --model bzzzy1234/MiniMax-H3-Splash</text>
+  <rect x="644" y="152" width="492" height="78" rx="10" fill="#ffffff" stroke="#86efac"/>
+  <text x="660" y="176" font-size="14" font-weight="600" fill="#111827">server (server/videos.py)</text>
+  <text x="660" y="198" font-size="13" fill="#374151">POST · GET /v1/videos[/{id}[/content]] · DELETE /v1/videos/{id}</text>
+  <text x="660" y="218" font-size="13" fill="#6b7280">one job at a time · queue of 4 · 4 GB store · chat → 404</text>
+  <line x1="890" y1="230" x2="890" y2="262" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="900" y="252" font-size="12" fill="#4b5563">VideoRequest · VideoProgress · VideoOutput</text>
+  <rect x="644" y="264" width="492" height="74" rx="10" fill="#ffffff" stroke="#86efac"/>
+  <text x="660" y="288" font-size="14" font-weight="600" fill="#111827">engine (build/splash serve-native)</text>
+  <text x="660" y="310" font-size="13" fill="#374151">runtime/video: VideoRuntime, a pipeline of stages (encode → mux)</text>
+  <text x="660" y="329" font-size="13" fill="#6b7280">Ready: FeatureVideo</text>
+
+  <!-- Shared model layer -->
+  <rect x="40" y="390" width="1120" height="150" rx="14" fill="#f9fafb" stroke="#9ca3af" stroke-width="2"/>
+  <text x="60" y="418" font-size="17" font-weight="600" fill="#111827">Shared model layer (install/)</text>
+  <text x="60" y="440" font-size="13" fill="#4b5563">The Hub (splash serve) and local files (prepare_local_model) take one path; the server holds the assembly it serves.</text>
+  <rect x="70" y="456" width="300" height="66" rx="10" fill="#ffffff" stroke="#6b7280"/>
+  <text x="220" y="481" text-anchor="middle" font-size="15" font-weight="600" fill="#111827">inspect</text>
+  <text x="220" y="503" text-anchor="middle" font-size="13" fill="#374151">GGUF | MLX | h3-video</text>
+  <line x1="370" y1="489" x2="448" y2="489" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <rect x="450" y="456" width="300" height="66" rx="10" fill="#ffffff" stroke="#6b7280"/>
+  <text x="600" y="481" text-anchor="middle" font-size="15" font-weight="600" fill="#111827">publish</text>
+  <text x="600" y="503" text-anchor="middle" font-size="12" fill="#374151">license acknowledged · images downloaded as they are</text>
+  <line x1="750" y1="489" x2="828" y2="489" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <rect x="830" y="456" width="300" height="66" rx="10" fill="#ffffff" stroke="#6b7280"/>
+  <text x="980" y="481" text-anchor="middle" font-size="15" font-weight="600" fill="#111827">assembly</text>
+  <text x="980" y="503" text-anchor="middle" font-size="12" fill="#374151">immutable · .resolved/&lt;record&gt; · held</text>
+  <line x1="310" y1="356" x2="310" y2="388" stroke="#4b5563" stroke-width="1.5" stroke-dasharray="5 4" marker-start="url(#arrow)"/>
+  <line x1="890" y1="356" x2="890" y2="388" stroke="#4b5563" stroke-width="1.5" stroke-dasharray="5 4" marker-start="url(#arrow)"/>
+  <text x="320" y="378" font-size="12" fill="#4b5563">holds and loads</text>
+  <text x="900" y="378" font-size="12" fill="#4b5563">holds and loads</text>
+
+  <!-- Video pipeline -->
+  <rect x="40" y="572" width="1120" height="160" rx="14" fill="#fefce8" stroke="#eab308" stroke-width="2"/>
+  <text x="60" y="600" font-size="17" font-weight="600" fill="#713f12">Video pipeline, one GPU, one request at a time (runtime/video/VideoRuntime.hpp)</text>
+  <g font-size="13" text-anchor="middle">
+    <rect x="60" y="618" width="150" height="70" rx="10" fill="#ffffff" stroke="#ca8a04"/>
+    <text x="135" y="642" font-weight="600" fill="#111827">text encoder</text>
+    <text x="135" y="660" fill="#374151">Qwen3-VL-32B 4-bit</text>
+    <text x="135" y="677" fill="#374151">layers 0-49, prefill</text>
+    <line x1="210" y1="653" x2="226" y2="653" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <rect x="228" y="618" width="120" height="70" rx="10" fill="#ffffff" stroke="#ca8a04"/>
+    <text x="288" y="642" font-weight="600" fill="#111827">prep</text>
+    <text x="288" y="660" fill="#374151">layout · RoPE</text>
+    <text x="288" y="677" fill="#374151">adaLN · noise</text>
+    <line x1="348" y1="653" x2="364" y2="653" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <rect x="366" y="618" width="170" height="70" rx="10" fill="#ffffff" stroke="#ca8a04"/>
+    <text x="451" y="642" font-weight="600" fill="#111827">DiT (VDN-H3)</text>
+    <text x="451" y="660" fill="#374151">SSD-streamed, 8 slots</text>
+    <text x="451" y="677" fill="#374151">8 or 50 steps</text>
+    <line x1="536" y1="653" x2="552" y2="653" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <rect x="554" y="618" width="150" height="70" rx="10" fill="#ffffff" stroke="#ca8a04" stroke-dasharray="5 4"/>
+    <text x="629" y="642" font-weight="600" fill="#111827">TAEH3 preview</text>
+    <text x="629" y="660" fill="#374151">optional</text>
+    <text x="629" y="677" fill="#374151">early mp4</text>
+    <line x1="704" y1="653" x2="720" y2="653" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <rect x="722" y="618" width="130" height="70" rx="10" fill="#ffffff" stroke="#ca8a04"/>
+    <text x="787" y="642" font-weight="600" fill="#111827">video VAE</text>
+    <text x="787" y="660" fill="#374151">W8A8</text>
+    <text x="787" y="677" fill="#374151">1344 x 768</text>
+    <line x1="852" y1="653" x2="868" y2="653" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <rect x="870" y="618" width="130" height="70" rx="10" fill="#ffffff" stroke="#ca8a04"/>
+    <text x="935" y="642" font-weight="600" fill="#111827">audio VAE</text>
+    <text x="935" y="660" fill="#374151">BigVGAN</text>
+    <text x="935" y="677" fill="#374151">32 kHz stereo</text>
+    <line x1="1000" y1="653" x2="1016" y2="653" stroke="#4b5563" stroke-width="1.5" marker-end="url(#arrow)"/>
+    <rect x="1018" y="618" width="122" height="70" rx="10" fill="#ffffff" stroke="#ca8a04"/>
+    <text x="1079" y="642" font-weight="600" fill="#111827">mp4</text>
+    <text x="1079" y="660" fill="#374151">H.264 + AAC</text>
+    <text x="1079" y="677" fill="#374151">AVFoundation</text>
+  </g>
+  <text x="60" y="715" font-size="12" fill="#6b7280">VideoProgress per phase and per denoising step · Cancel stops the request at the next step · the encoder's weights load for the request and are freed after it</text>
+</svg>

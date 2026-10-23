@@ -26,7 +26,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import assembly, families, gguf, hub, models
+from . import assembly, families, gguf, hub, models, video
 
 # The tokenizer files an MLX target may supply, linked when present.
 TOKENIZER_FILES = (
@@ -472,7 +472,12 @@ def prepare(selection):
         with hub.as_model_errors(f"cannot install {selection.model}"):
             manifest = models.read_json(target.file("manifest.json"))
         models.refuse_package(selection.model, manifest)
-    if installed is not None and target.revision == installed_commit:
+    if (
+        video.is_source(target.files)
+        or (installed or {}).get("target_format") == video.FORMAT
+    ):
+        video.prepare(selection, target, installed)
+    elif installed is not None and target.revision == installed_commit:
         _start_installed(selection, target, installed)
     else:
         _install_commit(selection, target, installed)
