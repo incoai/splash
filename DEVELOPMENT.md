@@ -2091,7 +2091,7 @@ recognized by its `manifest.json`, which names the package format.
 
 ## Video
 
-`splash serve --model MiniMaxAI/MiniMax-H3` serves MiniMax-H3, a text to
+`splash serve --model bzzzy1234/MiniMax-H3-Splash` serves MiniMax-H3, a text to
 video and audio model, as its own instance: its server answers
 [OpenAI's video API](https://platform.openai.com/docs/api-reference/videos)
 and no language model's routes, which answer 404; chat and video together
@@ -2134,51 +2134,66 @@ OpenAI shape: `video_queue_full` (503) past four queued jobs,
 the mp4s and previews of finished jobs stay in a 4 GB store, the oldest
 evicted first.
 
-`splash generate --model MiniMaxAI/MiniMax-H3 --prompt ... --out clip.mp4` installs the model as `serve` does and runs one clip on its engine without a server (`python -m server.videos`): its flags are the `POST` fields, checked by the same `parse_request`, `--first-frame` and `--last-frame` the image files of `input_reference` and `last_frame`; progress goes to stderr, `--preview` writes `clip.preview.mp4` once decoded, and Ctrl+C cancels at the next step.
+`splash generate --model bzzzy1234/MiniMax-H3-Splash --prompt ... --out clip.mp4` installs the model as `serve` does and runs one clip on its engine without a server (`python -m server.videos`): its flags are the `POST` fields, checked by the same `parse_request`, `--first-frame` and `--last-frame` the image files of `input_reference` and `last_frame`; progress goes to stderr, `--preview` writes `clip.preview.mp4` once decoded, and Ctrl+C cancels at the next step.
 
 ### Video installation
 
 The model's assembly is of target format `h3-video` (`install/video.py`).
-Its sources are `MiniMaxAI/MiniMax-H3` (FL2VA's transformer, VAEs and
-tokenizer), `OpenVDN/vdn-minimax-h3` (the VDN-H3 DiT stages),
-`madebyollin/taehv` (TAEH3) and `mlx-community/Qwen3-VL-32B-Instruct-4bit`
-(the text encoder), each at its default branch's commit, as a draft is.
-Before any weight download the installer quotes the MiniMax H3 Community
-License Agreement's territory clauses and asks for its acknowledgement on the
-terminal, or takes `SPLASH_ACCEPT_LICENSE=minimax-h3`; it records it once per
-license text in the models directory's `.licenses.json`. The vendored
-converters then write the engine's images once into `.converted/<key>` of
-the models directory: the turbo variant's DiT, the VAEs and TAEH3, 26 GB;
-the video VAE's needs MLX in Splash's environment and `H3_MLX_PORT` naming a
-checkout of [minimax-h3-mlx](https://github.com/PipeNetwork/minimax-h3-mlx).
-The 50-step `default` variant (24 GB more) converts once asked for: by
+Splash serves MiniMax-H3 from a Hugging Face repository in its engine's own
+format, as it serves a GGUF or MLX repository: the installer downloads its
+files and links them as they are, converting nothing. `bzzzy1234/MiniMax-H3-Splash` is the
+one this documentation names (`install/video.py` `REPOSITORY`); any
+repository its marker describes serves the same way. Its layout:
+
+| Path | Holds |
+| --- | --- |
+| `splash-video.json` | the marker: `format` `h3-video`, `version` 1, `weights` `h3-w8a8-vdn-v1` (the int8 format, [Kernels](#kernels)), `variants` and the `sources`' commits |
+| `dit-turbo/`, `dit-default/` | each variant's DiT: 50 int8 blocks, 3 QKFIX blocks, globals, patch projections (`io`), request-independent prep inputs, adaLN tables and `manifest.json`; 24.8 and 26.1 GB |
+| `vae/` | the video VAE's int8 decoder and its encoder of a clip's keyframes, 2.8 GB |
+| `audio/`, `preview/` | the audio VAE's decoder and TAEH3's, 0.3 GB |
+| `tokenizer/` | FL2VA's tokenizer, which the server encodes prompts with |
+| `LICENSE`, `NOTICE`, `README.md` | the MiniMax H3 Community License Agreement, the notice it requires, the model card |
+
+The installer recognizes the repository by its marker, and refuses one whose
+format, version, weights or variants it does not serve. Before any weight
+download it quotes the license agreement's territory clauses and asks for its
+acknowledgement on the terminal, or takes `SPLASH_ACCEPT_LICENSE=minimax-h3`;
+it records it once per license text in the models directory's
+`.licenses.json`. It then downloads the turbo variant's DiT, the decoders and
+encoders, the tokenizer and the license, and the text encoder,
+`mlx-community/Qwen3-VL-32B-Instruct-4bit`, at its default branch's commit,
+as a draft is. The 50-step `default` variant downloads once asked for: by
 `--variants default` of `install/models.py`, or by the first `splash
 generate --variant default`; a server refuses a variant its installation
-does not hold. Each DiT's adaLN tables (`dit-<variant>/adaln.safetensors`,
-0.3 GB turbo, 1.8 GB default) are tabulated at conversion by the engine
-(`splash video-adaln`) from FL2VA's transformer shards, which no request
-reads. An entry starts from a clone of the same commits' entry converted
-before (APFS copies on write) and converts only what it lacks: the other
-variant, or what entries from before lack, the adaLN tables or the video
-VAE's encoder (`vae/vae_enc_f16.bin`, 0.36 GB, `convert_vae.py --encoder`).
-The assembly links the images of its variants, the tokenizer, the encoder's
-checkpoint and the license.
+does not hold. A start without the Hub starts the installation from the
+snapshots it pins.
 
-Once converted, FL2VA's transformer shards (62 GB) are neither linked nor
-downloaded again: they can be deleted from the Hugging Face cache
-(`models--MiniMaxAI--MiniMax-H3/snapshots/COMMIT/FL2VA/transformer/` and the
-blobs it links), and are downloaded again to convert another variant or
-commit. The installer removes no downloaded source and leaves that to the
-user, as it does for a package's snapshot.
+`--model MiniMaxAI/MiniMax-H3`, MiniMax's bf16 release, is refused with the
+way to the engine's format: Splash does not convert at installation.
+`dev/tools/publish_video_repo.py` makes a repository of the layout above, to
+upload with `hf upload`: from images converted before (`--images`, h3's
+layout below; `--commit REPO=COMMIT` names each source's commit the
+release's link does not), or converted from the release, `OpenVDN/vdn-minimax-h3`
+(the VDN-H3 DiT stages) and `madebyollin/taehv` (TAEH3) at their default
+branches (`--convert`, 26 GB for the turbo variant, 25 GB more for the
+default one, and FL2VA's transformer shards, 62 GB, in the Hugging Face
+cache). Its converters are h3's (`dev/tools/video`, `runtime/video/VENDORED`);
+the video VAE's needs MLX in Splash's environment and `H3_MLX_PORT` naming a
+checkout of [minimax-h3-mlx](https://github.com/PipeNetwork/minimax-h3-mlx),
+and the engine tabulates each DiT's adaLN tables from FL2VA's transformer
+shards (`splash video-adaln`). The repository's files are APFS clones of the
+images, but for their manifests, written again without the converting
+machine's paths.
 
-`prepare_local_model` takes a directory of images converted before (as h3
-lays them out: `dit-turbo/` and or `dit-default/`, each with the
-`adaln.safetensors` that `build/splash video-adaln DIRECTORY VARIANT
-FL2VA/transformer` tabulates, `vae/` with the encoder's images, `audio/`,
-`preview/` and `fl2va/`, a link to FL2VA), which prepares without
-converting, or the `MiniMaxAI/MiniMax-H3` repository's layout, whose turbo
-variant converts with the companions the Hugging Face cache holds; the
-encoder comes from the cache too.
+`prepare_local_model` takes a directory of the repository's layout, or of
+images converted before as h3 lays them out (`dit-turbo/` and or
+`dit-default/`, each with the `adaln.safetensors` that `build/splash
+video-adaln DIRECTORY VARIANT FL2VA/transformer` tabulates, `vae/` with the
+encoder's images, `audio/`, `preview/` and `fl2va/`, a link to FL2VA, whose
+tokenizer and license it takes), and links its files as they are; the
+encoder comes from the Hugging Face cache. Images an earlier release
+converted into the models directory (`.converted/`) are removed once no
+installation links them.
 
 ### Video engine
 
@@ -2241,8 +2256,8 @@ its 1,008 rows to the DiT's: the 3 s golden clip denoised in 335 s instead of
 reference and one DiT block on synthetic weights against h3's references.
 With the weights, `VIDEO_REFERENCES` naming h3's reference directory, and
 `VIDEO_ROOT` a prepared model (by default `splash serve`'s) or
-`VIDEO_CONVERTED` a directory of converted images, which the tests prepare
-first:
+`VIDEO_CONVERTED` a directory of the repository's layout or of converted
+images, which the tests prepare first:
 
 ```sh
 make test-video-real VIDEO_REFERENCES=... VIDEO_CONVERTED=...

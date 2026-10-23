@@ -52,7 +52,7 @@ CLIP_FRAMES = {"3": 73, "10": 243, "15": 362}
 SIZE = "1344x768"
 VARIANTS = {"turbo": wire.VideoVariant.TURBO, "default": wire.VideoVariant.DEFAULT}
 # Each variant's denoising steps, the schedule its adaLN tables were
-# converted for (install/video.py): a request takes them, or 0.
+# tabulated for (install/video.py): a request takes them, or 0.
 STEPS = {"turbo": 8, "default": 50}
 FIELDS = {
     "prompt",
@@ -208,13 +208,13 @@ def installed_variants(model_root: Path):
 
 def require_variant(request, model, variants):
     """Refuses a request of a variant not installed, which its first clip of
-    `splash generate` converts."""
+    `splash generate` installs."""
     if request.variant not in variants:
         raise APIError(
             400,
             f"the {request.variant} variant of {model} is not installed: "
             f"`splash generate --model {model} --variant {request.variant}` "
-            "converts it",
+            "installs it",
         )
 
 
@@ -878,7 +878,7 @@ def main(argv=None):
             raise APIError(
                 400,
                 f"{args.model} is a language model: splash generate takes a video "
-                "model, such as MiniMaxAI/MiniMax-H3; splash serve serves this one",
+                f"model, such as {video.REPOSITORY}; splash serve serves this one",
             )
         require_variant(request, args.model, installed_variants(model_root))
         print_status(f"Loading · {args.model}", error=True)

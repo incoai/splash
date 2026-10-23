@@ -381,7 +381,7 @@ def parse_args(argv=None):
         "--variants",
         type=lambda value: tuple(v for v in value.split(",") if v),
         default=(),
-        help="a video model's DiT variants to convert beside those installed "
+        help="a video model's DiT variants to install beside those installed "
         "(MiniMax-H3: turbo, default; turbo alone without)",
     )
     commands = parser.add_subparsers(dest="command", required=True)

@@ -48,7 +48,11 @@ DiT's block files, which h3 copies into a stream image (stream.bin, 22 GB per
 variant), and request preparation gathers the adaLN tables of the variant's
 schedule from dit-<variant>/adaln.safetensors, which `splash video-adaln`
 computes once at conversion with h3's own arithmetic, where h3 computes them
-from FL2VA's transformer shards (26 GB read) at every request.
+from FL2VA's transformer shards (26 GB read) at every request. The int8
+weights' format is QUANT_VIDEO_W8 of runtime/metal/abi/QuantFormat.h, which
+the readers check the manifests against; the images are served from a
+repository of the engine's format (install/video.py), which
+dev/tools/publish_video_repo.py makes with the converters.
 
 Its development tools are under dev/: the synthetic DiT weights and their
 fill kernel (dev/tests/engine/VideoSynthetic.*, video_synthetic.metal), and
@@ -61,16 +65,18 @@ Still copied from h3, with include paths rewritten for their places
 "metal/kernels/video/common/"):
 
   h3 runtime/metal/kernels/GROUP/        -> runtime/metal/kernels/video/GROUP/
-     (but shared/synthetic.metal)
+     (but shared/synthetic.metal; common/quant.h, whose format constants are
+     metal/abi/QuantFormat.h's, is Splash's)
   h3 runtime/metal/abi/                  -> runtime/metal/abi/video/
      (but SyntheticABI.h; TextEncoderABI.h there is Splash's)
   h3 tools/convert_*.py, h3/{__init__,common,config,safetensors}.py
-                                         -> install/video/
+                                         -> dev/tools/video/
 
 Their arithmetic is h3's: the golden clip of make test-video-real is byte for
 byte h3's. To bring an upstream change, dev/tools/vendor_video.sh H3_CHECKOUT
-copies these again and prints the upstream changes to h3's host code since
-the commit above, which are ported into runtime/video by hand; then record the
+copies these again and prints the upstream changes to h3's host code and
+common/quant.h since the commit above, which are ported into runtime/video and
+quant.h by hand; then record the
 new commit here, rebuild, and run make test-engine-metal and make
 test-video-real.
 
@@ -85,4 +91,4 @@ builds it, into build/engine/libsplash-video.a, which links before the
 engine's library; the mp4 writer links AVFoundation, CoreMedia and CoreVideo.
 
 Licenses: THIRD_PARTY_NOTICES. No model weights are vendored; the installer
-downloads them under the MiniMax H3 Community License Agreement.
+downloads them, converted, under the MiniMax H3 Community License Agreement.

@@ -2,8 +2,7 @@
 
 An assembly is models/.resolved/<SHA-256 of its record>: links to its source
 snapshots' files (hub.py) and to what is derived from them, metadata derived
-from a GGUF (models/.metadata/<key>) or a video model's converted images
-(models/.converted/<key>, video.py), and model.json, the record naming its
+from a GGUF (models/.metadata/<key>), and model.json, the record naming its
 sources and the identity of every linked file. It never changes once
 published. Selection links point to assemblies; one that no selection links
 and no server holds is collected, and so is a derived entry no assembly
@@ -57,7 +56,9 @@ TARGET_FORMATS = {
     "h3-video": ({"video"}, {"target", "encoder"}),
 }
 VISION_FORMATS = ("none", "safetensors", "gguf")
-# The entries derived from sources, under the models root.
+# The entries derived from sources, under the models root: a GGUF's metadata,
+# and the video model's images earlier releases converted at installation,
+# which no assembly links any more.
 DERIVED = (".metadata", ".converted")
 RECORD_KEYS = {
     "version",
@@ -370,8 +371,7 @@ def hold(path: Path):
 
 def is_held(assembly: Path) -> bool:
     """Whether a process holds the entry by its model.json: a server the
-    assembly it serves (hold), or an installation the images it converted
-    until an assembly links them (video.py)."""
+    assembly it serves (hold)."""
     try:
         with (assembly / "model.json").open("rb") as record:
             fcntl.flock(record, fcntl.LOCK_EX | fcntl.LOCK_NB)

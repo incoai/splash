@@ -127,14 +127,16 @@ test-release-real: preflight $(TARGET) agent-preflight verify-build-identity
 		--http-smoke
 
 # The video model (DEVELOPMENT.md, Video): VIDEO_ROOT, the MiniMax-H3 a
-# selection prepared (by default `splash serve --model VIDEO_MODEL`'s), or
-# VIDEO_CONVERTED, images converted before, which the tests prepare first;
+# selection prepared (by default `splash serve --model VIDEO_MODEL`'s, the
+# repository install/video.py REPOSITORY names), or VIDEO_CONVERTED, a
+# directory of its repository's layout or of h3's converted images, which
+# the tests prepare first;
 # and VIDEO_REFERENCES, the h3 engine's references (its H3_REFS: the golden
 # prompt's hidden states, latents and frames). VIDEO_SECONDS is the length of
 # the clip of the server's own text encoder. VIDEO_FIRST_FRAME_FINAL is the h3
 # engine's final.npz of the 3 s golden clip from golden frame 0 (DEVELOPMENT.md,
 # Video tests).
-VIDEO_MODEL ?= MiniMaxAI/MiniMax-H3
+VIDEO_MODEL ?= $(shell $(PYTHON) -c 'from install import video; print(video.REPOSITORY)')
 VIDEO_ROOT ?= $(shell $(PYTHON) install/models.py --model "$(VIDEO_MODEL)" link)
 VIDEO_CONVERTED ?=
 VIDEO_REFERENCES ?= $(H3_REFS)

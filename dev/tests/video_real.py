@@ -42,7 +42,7 @@ from dev.tests.smoke_real import (  # noqa: E402
     request_headers,
     require,
 )
-from install import assembly, local  # noqa: E402
+from install import assembly, local, video  # noqa: E402
 from server import protocol as wire  # noqa: E402
 from server import videos  # noqa: E402
 
@@ -217,8 +217,10 @@ def main(argv=None):
     parser.add_argument("mode", choices=("engine", "http", "first-frame"))
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--model-root", type=Path, help="a prepared MiniMax-H3")
-    source.add_argument("--converted", type=Path, help="images converted before")
-    parser.add_argument("--model", default="MiniMaxAI/MiniMax-H3")
+    source.add_argument(
+        "--converted", type=Path, help="a directory of MiniMax-H3 to prepare first"
+    )
+    parser.add_argument("--model", default=video.REPOSITORY)
     parser.add_argument("--engine", type=Path,
                         default=ROOT / "build" / "engine-tests" / "video-golden")  # fmt: skip
     parser.add_argument(

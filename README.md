@@ -90,15 +90,15 @@ Vision and the tokenizer come from the target model's source.
 
 ## Video
 
-`splash serve --model MiniMaxAI/MiniMax-H3` serves MiniMax-H3, text to video
+`splash serve --model bzzzy1234/MiniMax-H3-Splash` serves MiniMax-H3, text to video
 with audio (1344×768, 24 fps, 3, 10 or 15 s), optionally from a first frame
 and a last frame, through OpenAI's video API, as
 an instance of its own: run a language model beside it on another `--port`.
 It needs an M5 with 48 GB. The first start quotes the MiniMax H3 Community
 License Agreement, which limits use to its Applicable Territory, asks you to
-acknowledge it, then downloads the model and converts its 8-step turbo
-variant once (26 GB); `splash generate --variant default` converts the
-50-step one on its first clip (24 GB more).
+acknowledge it, then downloads the model in the engine's int8 format, with
+its 8-step turbo variant (28 GB); `splash generate --variant default`
+downloads the 50-step one on its first clip (26 GB more).
 
 ```bash
 curl http://127.0.0.1:8000/v1/videos -H 'Content-Type: application/json' \
@@ -108,7 +108,7 @@ curl http://127.0.0.1:8000/v1/videos -F prompt='The dog turns to the camera.' \
 curl http://127.0.0.1:8000/v1/videos/VIDEO_ID/content -o clip.mp4
 ```
 
-Without a server, `splash generate --model MiniMaxAI/MiniMax-H3 --prompt "..." --out clip.mp4 [--seconds 3|10|15] [--seed N] [--variant turbo|default] [--preview] [--no-audio] [--first-frame IMAGE [--last-frame IMAGE]]` writes one clip.
+Without a server, `splash generate --model bzzzy1234/MiniMax-H3-Splash --prompt "..." --out clip.mp4 [--seconds 3|10|15] [--seed N] [--variant turbo|default] [--preview] [--no-audio] [--first-frame IMAGE [--last-frame IMAGE]]` writes one clip.
 
 | Turbo clip, M5 Pro 48 GB | Wall | Denoising | Video VAE | Engine peak |
 | --- | ---: | ---: | ---: | ---: |

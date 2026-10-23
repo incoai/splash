@@ -57,7 +57,7 @@ private:
 // argv: serve-native MODEL_DIRECTORY, served with the model's stages.
 [[nodiscard]] int serve(const std::filesystem::path &metallib, int argc, char **argv);
 
-// argv: video-adaln WEIGHTS VARIANT TRANSFORMER, a conversion step of the installer (install/video.py):
+// argv: video-adaln WEIGHTS VARIANT TRANSFORMER, a conversion step of dev/tools/publish_video_repo.py:
 // WEIGHTS/dit-VARIANT/adaln.safetensors, the adaLN tables of the variant (turbo or default), from FL2VA's transformer
 // shards in TRANSFORMER (model::Prep::tabulateAdaLn). EX_OK, or EX_SOFTWARE after the error on stderr.
 [[nodiscard]] int tabulateAdaLn(const std::filesystem::path &metallib, int argc, char **argv);

@@ -26,7 +26,7 @@ if __name__ == "__main__" and not __package__:
 # library alone: the launcher runs before .venv exists.
 from server import serve_options
 
-from . import clients, paths
+from . import clients, paths, video
 from . import models as model_artifacts
 
 ROOT = paths.ROOT
@@ -299,7 +299,7 @@ def generate(args):
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     with (RUNTIME_DIR / "serve.lock").open("a+") as installation:
         _share_installation(installation)
-        # A variant converts on its first clip.
+        # A variant installs on its first clip.
         selection = model_artifacts.Selection.of(
             paths.MODELS, args.model, variants=(args.variant,) if args.variant else ()
         )
@@ -495,7 +495,7 @@ def parse_args(argv=None):
         description="Install a video model as serve does and write one clip "
         "of a prompt as an mp4; no server starts. Ctrl+C cancels it at the next "
         "step.",
-        epilog="Example:\n  splash generate --model MiniMaxAI/MiniMax-H3 "
+        epilog=f"Example:\n  splash generate --model {video.REPOSITORY} "
         "--prompt 'A golden retriever runs along a beach at sunset.' --out clip.mp4",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -504,7 +504,7 @@ def parse_args(argv=None):
         type=serve_options.parse_model_id,
         required=True,
         metavar="OWNER/REPO",
-        help="upstream Hugging Face video model, such as MiniMaxAI/MiniMax-H3",
+        help=f"upstream Hugging Face video model, such as {video.REPOSITORY}",
     )
     generator.add_argument("--prompt", required=True, help="what the clip shows")
     generator.add_argument(
