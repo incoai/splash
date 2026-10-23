@@ -1,5 +1,6 @@
 #include "video/model/DitWeights.hpp"
 
+#include "metal/abi/QuantFormat.h"
 #include "metal/abi/video/Layout.h"
 
 #include <cmath>
@@ -32,10 +33,25 @@ std::vector<float> readFloat(const SafetensorsCheckpoint &checkpoint, const std:
   return out;
 }
 
+// The weights' format and rotation, as the directory's manifest.json names them, must be the ones the kernels read
+// (QUANT_VIDEO_W8).
+void requireFormat(const std::string &dir) {
+  const std::string path = dir + "/manifest.json";
+  NSDictionary *manifest = readManifest(path);
+  NSDictionary *hadamard = manifest[@"hadamard"];
+  if (![manifest[@"format"] isEqual:@QUANT_VIDEO_W8] || ![hadamard isKindOfClass:[NSDictionary class]] ||
+      integer(hadamard[@"group"]) != int64_t(QUANT_VIDEO_W8_GROUP) ||
+      integer(hadamard[@"seed"]) != int64_t(QUANT_VIDEO_W8_SEED))
+    throw std::invalid_argument(path + ": the DiT's weights are not of format " QUANT_VIDEO_W8 " (Hadamard group " +
+                                std::to_string(QUANT_VIDEO_W8_GROUP) + ", seed " +
+                                std::to_string(QUANT_VIDEO_W8_SEED) + ")");
+}
+
 } // namespace
 
 std::unique_ptr<DitWeights> DitWeights::load(metal::MetalBackend &backend, const std::string &dir,
                                              const std::set<int> &qkfixBlocks, bool streamed) {
+  requireFormat(dir);
   auto w = std::unique_ptr<DitWeights>(new DitWeights());
   w->checkpoint_ = std::make_unique<SafetensorsCheckpoint>(dir);
   w->blocks_.resize(H3_DIT_BLOCKS);

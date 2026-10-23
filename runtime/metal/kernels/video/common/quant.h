@@ -1,15 +1,18 @@
 #pragma once
 
-// Per-token int8 quantizer, Hadamard(128) transforms and activation functions shared by the W8A8 producers.
+// Per-token int8 quantizer, Hadamard(128) transforms and activation functions shared by the W8A8 producers: the
+// activations of the weights' format, QUANT_VIDEO_W8 (metal/abi/QuantFormat.h).
 //
 // Hadamard convention (tools/convert_dit.py, tools/convert_vae.py): for every group g of 128 input channels
 //   x'_g = (1/sqrt(128)) * H128 * (s_g (.) x_g),  H128[i][j] = (-1)^popcount(i & j),  s = +-1 (splitmix64 signs).
 // Weights are stored rotated the same way, so x'.w' = x.w. Kernels compute the unnormalized u = H128 (s (.) x) and
 // fold 1/sqrt(128) into the per-token scale (absmax quantization is invariant to it).
+#include "metal/abi/QuantFormat.h"
 #include "metal/kernels/video/common/tensor.h"
 
 namespace h3 {
-constant constexpr float kQMax = 127.0f;
+static_assert(QUANT_VIDEO_W8_GROUP == 128, "wht128 rotates groups of 128");
+constant constexpr float kQMax = QUANT_VIDEO_W8_QMAX;
 constant constexpr float kRs128 = 0.08838834764831845f;  // 1/sqrt(128)
 
 // s = amax / 127, q = rint(clamp(x * (127 / amax), -127, 127))

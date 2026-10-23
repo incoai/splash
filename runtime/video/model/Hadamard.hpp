@@ -1,13 +1,16 @@
 #pragma once
 
-// Sign vector of the Hadamard(128) rotation applied to every int8 linear (same definition in tools/convert_dit.py and
-// tools/convert_vae.py had_signs): s[k] = -1 if splitmix64((0x48335138 << 32) + k) >> 63 else +1.
+// Sign vector of the Hadamard(128) rotation applied to every int8 linear, of the weights' format QUANT_VIDEO_W8
+// (metal/abi/QuantFormat.h; tools/convert_dit.py and tools/convert_vae.py had_signs): s[k] = -1 if
+// splitmix64((QUANT_VIDEO_W8_SEED << 32) + k) >> 63 else +1.
+#include "metal/abi/QuantFormat.h"
+
 #include <cstdint>
 #include <vector>
 
 namespace splash::video::model {
 
-inline constexpr uint64_t kHadamardSeed = 0x48335138ull;  // "H3Q8"
+inline constexpr uint64_t kHadamardSeed = QUANT_VIDEO_W8_SEED;  // "H3Q8"
 
 inline uint64_t splitmix64(uint64_t x) {
   uint64_t z = x + 0x9E3779B97F4A7C15ull;

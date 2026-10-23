@@ -2646,6 +2646,18 @@ depends on; weight loading's repack ABI is `runtime/metal/abi/GgufRepack.h`. The
 llama.cpp's and the decoding follows its Metal kernels: both keep llama.cpp's MIT notice in
 `THIRD_PARTY_NOTICES`, which the release archive ships.
 
+`QuantFormat.h` also defines the video model's int8 format, `QUANT_VIDEO_W8`
+(`h3-w8a8-vdn-v1`), which its repository's marker and DiT manifests name
+([Video installation](#video-installation)). It is no `kQuantFormats` row: no
+MDGG0001 tiles and no decoder in the LLM GEMMs. A [N, K] weight is dense
+row-major int8 with one fp32 scale per output row (absmax / 127, rounded half
+to even) after a Hadamard rotation of its inputs in groups of 128 with
+splitmix64 signs (seed `0x48335138`), as the video GEMMs read it, and the
+producers quantize the activations so per token
+(`runtime/metal/kernels/video/common/quant.h`). The DiT and VAE readers
+refuse manifests that name another format or seed, and a test holds the
+converters' constants to the header.
+
 The tests' CPU reference (`dev/tests/engine/GgufFormatReference.hpp`) must reproduce the golden
 hashes of upstream GGML's dequantization (llama.cpp 7ab4ee7; for PQ2_0, which upstream lacks,
 PrismML-Eng/llama.cpp 01ae597) in `gguf-reference`, and `gguf-planner` checks the planner's

@@ -267,4 +267,25 @@ inline constexpr uint64_t quant_tile_index(uint32_t row, uint32_t block, uint32_
   return (uint64_t(row / QUANT_TILE_ROWS) * blocks + block) * QUANT_TILE_ROWS + row % QUANT_TILE_ROWS;
 }
 
+// QUANT_VIDEO_W8, the int8 format of the video model's weights: the linears
+// of MiniMax-H3's DiT and video VAE, as its published repository holds them
+// (install/video.py WEIGHTS; the DiT's manifest.json names it). It is no
+// kQuantFormats row, whose tiled image every LLM GEMM decodes: the video
+// GEMMs (kernels/video/dit/linear.metal, vae/linear.metal) read a [N, K]
+// tensor as it is stored, dense row-major int8 [N][K], with one fp32 scale
+// per output row,
+//   s[n] = max_k |W'[n, k]| / QUANT_VIDEO_W8_QMAX,
+//   q[n, k] = rint(clamp(W'[n, k] / s[n], -QMAX, QMAX)) (half to even),
+// of the weights rotated in groups g of QUANT_VIDEO_W8_GROUP inputs,
+//   W'[n, g] = H (S_g W[n, g]) / sqrt(GROUP),
+// H the Walsh-Hadamard matrix of the group and S_g its inputs' signs: input
+// k's is -1 when splitmix64((QUANT_VIDEO_W8_SEED << 32) + k) >> 63, else +1;
+// the DiT's to_out_linear takes inputs H3_DIT_INNER.. of its FFN's sequence.
+// The kernels rotate and quantize the activations so, per token
+// (kernels/video/common/quant.h): x' . w' = x . w.
+#define QUANT_VIDEO_W8 "h3-w8a8-vdn-v1"
+#define QUANT_VIDEO_W8_GROUP 128u
+#define QUANT_VIDEO_W8_SEED 0x48335138u
+#define QUANT_VIDEO_W8_QMAX 127.0f
+
 #undef QUANT_CONSTANT

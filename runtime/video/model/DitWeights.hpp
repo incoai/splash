@@ -1,9 +1,9 @@
 #pragma once
 
 // Converted VDN-H3 DiT weights (tools/convert_dit.py), the safetensors files of dit-<variant>/ read as one checkpoint:
-// one file per block (rotated int8 linears + per-row fp32 scales, norms, linear-branch tensors in kernel layouts),
-// qkfix-blockNN.safetensors (fp16 q / k / v of the QKFIX blocks + split dims) and io.safetensors (patch projections and
-// final layer).
+// one file per block (rotated int8 linears + per-row fp32 scales, of the format QUANT_VIDEO_W8 of metal/abi/QuantFormat.h
+// that manifest.json names, norms, linear-branch tensors in kernel layouts), qkfix-blockNN.safetensors (fp16 q / k / v
+// of the QKFIX blocks + split dims) and io.safetensors (patch projections and final layer).
 #include "video/metal/Encoder.hpp"
 #include "video/model/WeightFiles.hpp"
 
@@ -53,7 +53,7 @@ struct StreamedTensor {
 class DitWeights {
 public:
   // streamed: the five int8 matrices per block and the QKFIX fp16 weights stay on disk, read by the weight stream
-  // from the files this object keeps open.
+  // from the files this object keeps open. Refuses a directory whose manifest.json names another format.
   static std::unique_ptr<DitWeights> load(metal::MetalBackend &backend, const std::string &dir,
                                           const std::set<int> &qkfixBlocks, bool streamed);
   // Resident weights made in memory, of `bytes` in all (the synthetic weights of dev/tests/engine/VideoSynthetic.hpp).

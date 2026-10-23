@@ -1,5 +1,6 @@
 #include "video/model/VaeWeights.hpp"
 
+#include "metal/abi/QuantFormat.h"
 #include "model/WeightStore.hpp"
 #include "video/model/WeightFiles.hpp"
 
@@ -25,6 +26,12 @@ ops::VaeDecoderWeights loadVaeDecoder(metal::MetalBackend &backend, const std::s
     throw WeightStoreError(manifestPath + ": expected globals and " + std::to_string(H3_VAE_LAYERS) + " layers");
   for (NSDictionary *layer in layers)
     if (![layer isKindOfClass:[NSDictionary class]]) throw WeightStoreError(manifestPath + ": a layer is no object");
+  // int8 layers are of the weights' format, QUANT_VIDEO_W8: rotated by the Hadamard signs of its seed.
+  NSArray *int8Layers = manifest[@"i8"];
+  if ([int8Layers isKindOfClass:[NSArray class]] && int8Layers.count &&
+      integer(manifest[@"had_seed"]) != int64_t(QUANT_VIDEO_W8_SEED))
+    throw WeightStoreError(manifestPath + ": its int8 layers are not of format " QUANT_VIDEO_W8 " (Hadamard seed " +
+                           std::to_string(QUANT_VIDEO_W8_SEED) + ")");
   const std::string blob = dir + "/vae_dec_" + tag + ".bin";
   const WeightSource source(blob);
   // regions: globals, then one per layer (from its smallest offset to the next layer's)
