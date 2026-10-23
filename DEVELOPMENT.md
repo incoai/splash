@@ -2381,8 +2381,14 @@ reads the sources at about the speed of the disk that holds them
 
 At load time the engine validates the GGUF metadata, including the rotary
 embedding and norm epsilon the kernels assume (`rope.freq_base`,
-`rope.dimension_count`, `attention.layer_norm_rms_epsilon`, and no
-`rope.scaling.type` but `none`), and plans the `MDGG0001` layout.
+`rope.dimension_count`, which a Flint GGUF, whose RoPE rotates whole heads,
+need not state, `attention.layer_norm_rms_epsilon`, and no
+`rope.scaling.type` but `none`), and plans the `MDGG0001` layout. A Flint
+GGUF's family keys hold its window, leading dense layers, shared expert's
+slices, sigmoid router and normalized, unscaled routing weights
+(`expert_weights_scale` 1) and its two layer patterns to the family's, and
+a router bias (`ffn_exp_probs_b`), which its blocks would not add, is
+refused.
 `GgufPreparation` stages rows in image order on the CPU within the
 staging bound, splitting rows wider than it into column chunks, and runs the
 `gguf_repack` kernel, which writes their planes into the image. Embeddings and

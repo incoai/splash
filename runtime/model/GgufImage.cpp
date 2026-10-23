@@ -303,6 +303,12 @@ public:
     return {from, headRows, geometry_.gdnKeyHeads, geometry_.gdnValueHeads / geometry_.gdnKeyHeads};
   }
 
+  // A tensor the target's blocks would not apply, which changes what the
+  // model computes where a GGUF holds it: `what` names it in the error.
+  void absent(const std::string &name, std::string_view what) {
+    if (file_.find(name)) problems_.push_back(name + " (" + std::string(what) + ")");
+  }
+
   Image finish() { return image_.finish(); }
 
 private:
@@ -381,11 +387,12 @@ private:
 
 std::string prefix(uint32_t layer) { return "blk." + std::to_string(layer) + "."; }
 
-// A layer's GDN or full-attention mixer, which every family's layers hold.
+// A layer's GDN or attention mixer, which every family's layers hold. The
+// queries' projection holds every query head's queries and, gated
+// (attentionGate), its gate.
 void mixerImage(Builder &b, const QwenTargetDimensions &g, const std::string &p, bool full) {
   if (full) {
-    b.quantized(p + "attn_q.weight", 2ull * g.attentionHeadDimension * (g.attentionWidth / g.attentionHeadDimension),
-                g.hiddenSize);
+    b.quantized(p + "attn_q.weight", (g.attentionGate ? 2ull : 1ull) * g.attentionWidth, g.hiddenSize);
     const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
     b.quantized(p + "attn_k.weight", kvRows, g.hiddenSize);
     b.quantized(p + "attn_v.weight", kvRows, g.hiddenSize);
@@ -406,15 +413,17 @@ void mixerImage(Builder &b, const QwenTargetDimensions &g, const std::string &p,
   }
 }
 
-// A layer's dense FFN or sparse MoE, which every family's layers hold.
-void ffnImage(Builder &b, const QwenTargetDimensions &g, const std::string &p) {
-  if (g.ffnKind == QwenFfnKind::SparseMoe) {
+// Layer `index`'s dense FFN or sparse MoE, which every family's layers hold:
+// a MoE layer's router, routed experts and shared expert of its slices
+// (QwenTargetDimensions::sharedExpertSlices) and, where its blocks have one,
+// the shared expert's scalar gate; a dense layer's SwiGLU.
+void ffnImage(Builder &b, const QwenTargetDimensions &g, const std::string &p, uint32_t index) {
+  if (g.isMoeLayer(index)) {
     const uint64_t routed = g.experts, width = g.expertIntermediateSize;
     b.floatTensor(p + "ffn_gate_inp.weight", routed, g.hiddenSize);
     b.routedExperts(p, routed, width, g.hiddenSize);
-    // A Qwen shared expert is one slice of the routed experts' width.
-    b.sharedExpert(p, 1, width, g.hiddenSize);
-    b.floatRows(p + "ffn_gate_inp_shexp.weight", 1, g.hiddenSize, true);
+    b.sharedExpert(p, g.sharedExpertSlices, width, g.hiddenSize);
+    if (g.sharedExpertGate) b.floatRows(p + "ffn_gate_inp_shexp.weight", 1, g.hiddenSize, true);
   } else {
     b.quantized(p + "ffn_gate.weight", g.intermediateSize, g.hiddenSize);
     b.quantized(p + "ffn_up.weight", g.intermediateSize, g.hiddenSize);
@@ -446,14 +455,15 @@ void hyperImage(Builder &b, const QwenTargetDimensions &g, const std::string &st
 // The Qwen3.5 hybrid's GGUFs (qwen35, qwen35moe): a norm before each layer's
 // mixer and FFN and before the logits.
 struct HybridGguf final {
-  template <class Expect> static void metadata(const Expect &, const QwenTargetDimensions &) {}
+  template <class Expect, class ExpectFloat>
+  static void metadata(const Expect &, const ExpectFloat &, const QwenTargetDimensions &) {}
   static void arrays(const GgufFile &, const QwenTargetDimensions &) {}
   static void layer(Builder &b, const QwenTargetDimensions &g, uint32_t index) {
     const std::string p = prefix(index);
     b.floatNorm(p + "attn_norm.weight", g.hiddenSize);
     mixerImage(b, g, p, g.isFullAttentionLayer(index));
     b.floatNorm(p + "post_attention_norm.weight", g.hiddenSize);
-    ffnImage(b, g, p);
+    ffnImage(b, g, p, index);
   }
   static void head(Builder &b, const QwenTargetDimensions &g) { b.floatNorm("output_norm.weight", g.hiddenSize); }
   static void tables(const GgufFile &, const QwenTargetDimensions &, PlanOptions, std::vector<std::string> &,
@@ -467,7 +477,8 @@ struct HybridGguf final {
 struct Qwen4ExpGguf final {
   static constexpr std::string_view architecture = "qwen4exp";
 
-  template <class Expect> static void metadata(const Expect &expect, const QwenTargetDimensions &g) {
+  template <class Expect, class ExpectFloat>
+  static void metadata(const Expect &expect, const ExpectFloat &, const QwenTargetDimensions &g) {
     expect("hyper_connection.count", g.hyperConnections);
     expect("hyper_connection.low_rank", g.hyperRank);
     expect("attention.indexer.head_count", g.indexerHeads);
@@ -508,7 +519,7 @@ struct Qwen4ExpGguf final {
       b.floatNorm(p + "indexer.k_norm.weight", g.indexerHeadDimension);
     }
     hyperImage(b, g, p + "hc_ffn", true);
-    ffnImage(b, g, p);
+    ffnImage(b, g, p, index);
     if (index != g.pleLayer) return;
     const uint64_t streams = g.streamWidth();
     b.quantized(p + "ple_key.weight", streams, g.pleWidth());
@@ -535,10 +546,75 @@ struct Qwen4ExpGguf final {
   }
 };
 
+// Flint's GGUFs (flint): every layer attends, those sliding_window_pattern
+// names over a sliding window and those rope_pattern names with RoPE, each
+// with its learned sinks after its mixer (attn_sinks, an F32 per query head,
+// as llama.cpp writes them); a norm before each layer's mixer and FFN
+// (ffn_norm) and before the logits; and the FFN of the
+// leading_dense_block_count first layers dense, of the others a MoE with a
+// sigmoid router and an ungated shared expert of expert_shared_count routed
+// experts' width. It has no GDN, and its scalars hold no rope.dimension_count:
+// its RoPE rotates whole heads.
+struct FlintGguf final {
+  static constexpr std::string_view architecture = "flint";
+  // llama.cpp's expert_gating_func of each router
+  // (LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID).
+  static constexpr uint64_t kSoftmaxGating = 1, kSigmoidGating = 2;
+
+  // Its routing weights are the selected experts' normalized scores, which
+  // nothing scales (expert_weights_scale 1).
+  template <class Expect, class ExpectFloat>
+  static void metadata(const Expect &expect, const ExpectFloat &expectFloat, const QwenTargetDimensions &g) {
+    expect("attention.sliding_window", g.slidingWindow);
+    expect("leading_dense_block_count", g.leadingDenseLayers);
+    expect("feed_forward_length", g.intermediateSize);
+    expect("expert_shared_count", g.sharedExpertSlices);
+    expect("expert_gating_func", g.moeRouter == ops::MoeRouter::SigmoidNormalized ? kSigmoidGating : kSoftmaxGating);
+    expect("expert_weights_norm", 1);
+    expectFloat("expert_weights_scale", 1.0);
+  }
+
+  // The layer patterns the installer's copy of the scalar metadata leaves
+  // out: each layer's sliding window and RoPE. One error names every
+  // mismatch.
+  static void arrays(const GgufFile &file, const QwenTargetDimensions &g) {
+    const std::string arch(architecture);
+    std::string mismatched;
+    const auto pattern = [&](const char *key, uint64_t mask) {
+      const auto values = file.numericArray(arch + "." + key);
+      bool matches = values && values->size() == g.layers;
+      for (uint32_t layer = 0; matches && layer < g.layers; ++layer)
+        matches = (*values)[layer] == double(layer < 64 && (mask >> layer & 1));
+      if (!matches) mismatched += (mismatched.empty() ? "" : ", ") + std::string(key);
+    };
+    // Every layer attends: a layer's bit is its attention layer's.
+    pattern("attention.sliding_window_pattern", g.slidingLayers);
+    pattern("attention.rope_pattern", ~g.unrotatedLayers & (g.layers < 64 ? (uint64_t{1} << g.layers) - 1 : ~0ull));
+    if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
+  }
+
+  static void layer(Builder &b, const QwenTargetDimensions &g, uint32_t index) {
+    const std::string p = prefix(index);
+    b.floatNorm(p + "attn_norm.weight", g.hiddenSize);
+    mixerImage(b, g, p, true);
+    b.floatNorm(p + "attn_sinks.weight", g.attentionQueryHeads);
+    b.floatNorm(p + "ffn_norm.weight", g.hiddenSize);
+    ffnImage(b, g, p, index);
+    // llama.cpp writes a router's expert bias (Flint's optional expert_bias)
+    // as ffn_exp_probs_b, which the router's selection would add.
+    b.absent(p + "ffn_exp_probs_b.bias", "a router bias");
+  }
+  static void head(Builder &b, const QwenTargetDimensions &g) { b.floatNorm("output_norm.weight", g.hiddenSize); }
+  static void tables(const GgufFile &, const QwenTargetDimensions &, PlanOptions, std::vector<std::string> &,
+                     std::vector<Image> &) {}
+};
+
 // Calls `use` with what the GGUFs of `architecture` hold: Qwen3.8-Flash-Next's
-// (Qwen4ExpGguf), or else the Qwen3.5 hybrid's (HybridGguf).
+// (Qwen4ExpGguf), Flint's (FlintGguf), or else the Qwen3.5 hybrid's
+// (HybridGguf).
 template <class Use> decltype(auto) withFamily(std::string_view architecture, Use &&use) {
   if (architecture == Qwen4ExpGguf::architecture) return use(Qwen4ExpGguf{});
+  if (architecture == FlintGguf::architecture) return use(FlintGguf{});
   return use(HybridGguf{});
 }
 
@@ -738,23 +814,30 @@ void requireMetadata(const GgufMetadata &metadata, std::string_view architecture
   expect("attention.head_count_kv", geometry.attentionKvHeads);
   expect("attention.key_length", geometry.attentionHeadDimension);
   expect("attention.value_length", geometry.attentionHeadDimension);
-  expect("rope.dimension_count", 2ull * geometry.rotaryPairs);
+  // A GGUF whose RoPE rotates whole heads (Flint's) need not state the
+  // rotated dimensions, but one that does states the target's.
+  if (2 * geometry.rotaryPairs != geometry.attentionHeadDimension ||
+      metadata.unsignedValue(arch + ".rope.dimension_count"))
+    expect("rope.dimension_count", 2ull * geometry.rotaryPairs);
   expectFloat("rope.freq_base", geometry.rotaryTheta);
   expectFloat("attention.layer_norm_rms_epsilon", SPLASH_RMS_EPSILON);
   if (const auto scaling = metadata.stringValue(arch + ".rope.scaling.type"); scaling && *scaling != "none")
     mismatched += (mismatched.empty() ? "" : ", ") + std::string("rope.scaling.type ") + *scaling + " (expected none)";
-  expect("full_attention_interval", geometry.fullAttentionPeriod);
-  expect("ssm.conv_kernel", kGdnConvolutionTaps);
-  expect("ssm.group_count", geometry.gdnKeyHeads);
-  expect("ssm.time_step_rank", geometry.gdnValueHeads);
-  expect("ssm.state_size", geometry.gdnHeadDimension);
-  expect("ssm.inner_size", uint64_t{geometry.gdnValueHeads} * geometry.gdnHeadDimension);
-  withFamily(architecture, [&](auto family) { family.metadata(expect, geometry); });
+  if (geometry.gdnLayerCount()) {
+    expect("full_attention_interval", geometry.fullAttentionPeriod);
+    expect("ssm.conv_kernel", kGdnConvolutionTaps);
+    expect("ssm.group_count", geometry.gdnKeyHeads);
+    expect("ssm.time_step_rank", geometry.gdnValueHeads);
+    expect("ssm.state_size", geometry.gdnHeadDimension);
+    expect("ssm.inner_size", uint64_t{geometry.gdnValueHeads} * geometry.gdnHeadDimension);
+  }
+  withFamily(architecture, [&](auto family) { family.metadata(expect, expectFloat, geometry); });
   if (geometry.ffnKind == QwenFfnKind::SparseMoe) {
     expect("expert_count", geometry.experts);
     expect("expert_used_count", geometry.expertsPerToken);
     expect("expert_feed_forward_length", geometry.expertIntermediateSize);
-    expect("expert_shared_feed_forward_length", geometry.expertIntermediateSize);
+    expect("expert_shared_feed_forward_length",
+           uint64_t{geometry.sharedExpertSlices} * geometry.expertIntermediateSize);
   } else {
     expect("feed_forward_length", geometry.intermediateSize);
   }
