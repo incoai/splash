@@ -7,6 +7,8 @@ import struct
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
+from .families import TRAINING_FAMILIES
+
 
 class TrainingError(ValueError):
     pass
@@ -258,43 +260,28 @@ def expected_tensors(config):
 def validate_draft(directory, *, family=True):
     config = read_json(Path(directory) / "config.json")
     if family:
-        required = {
-            "architectures": ["DFlash2DraftModel"],
-            "model_type": "qwen3",
-            "num_hidden_layers": 5,
-            "hidden_size": 5120,
-            "vocab_size": 248320,
-            "intermediate_size": 17408,
-            "num_attention_heads": 32,
-            "num_key_value_heads": 8,
-            "head_dim": 128,
-            "sliding_window": 2048,
-            "rms_norm_eps": 1e-6,
-            "is_causal": False,
-            "attention_bias": False,
-            "tie_word_embeddings": False,
-            "hidden_act": "silu",
-            "layer_types": ["sliding_attention"] * 5,
-            "rope_parameters": {"rope_theta": 10000000, "rope_type": "default"},
-        }
-        for key, value in required.items():
-            if config.get(key) != value or isinstance(
-                config.get(key), bool
-            ) != isinstance(value, bool):
-                raise TrainingError(f"Qwen3.8-27B draft config mismatch: {key}")
-        flash = {
-            "block_size": 8,
-            "conv_group_size": 16,
-            "conv_kernel_size": 2,
-            "mask_token_id": 248070,
-            "selector_rank": 256,
-            "selector_top_k": 16,
-            "target_layer_ids": [5, 19, 33, 47, 61],
-        }
-        if config.get("dflash_config") != flash or any(
-            isinstance(v, bool) for v in config.get("dflash_config", {}).values()
+        spec = draft_family(config)
+        for key, value in spec["draft"].items():
+            if (
+                config.get(key) != value
+                or isinstance(config.get(key), bool) != isinstance(value, bool)
+                or (type(value) is int and type(config.get(key)) is not int)
+            ):
+                raise TrainingError(f"{spec['name']} draft config mismatch: {key}")
+        flash = spec["flash"]
+        if (
+            config.get("dflash_config") != flash
+            or any(
+                type(config["dflash_config"].get(key)) is not int
+                for key in flash
+                if key != "target_layer_ids"
+            )
+            or any(
+                type(layer) is not int
+                for layer in config.get("dflash_config", {}).get("target_layer_ids", [])
+            )
         ):
-            raise TrainingError("Qwen3.8-27B draft dflash_config mismatch")
+            raise TrainingError(f"{spec['name']} draft dflash_config mismatch")
         for name, default in [
             ("output_multiplier", 1),
             ("input_embedding_scale", 1),
@@ -318,12 +305,7 @@ def validate_target(directory):
     directory = Path(directory)
     config = read_json(directory / "config.json")
     text = config.get("text_config", {})
-    if config.get("model_type") != "qwen3_5" or config.get("architectures") != [
-        "Qwen3_5ForConditionalGeneration"
-    ]:
-        raise TrainingError(
-            "target must be a Qwen3.8-27B Transformers Qwen3_5ForConditionalGeneration checkpoint"
-        )
+    spec = target_family(config)
     for section in (config, text):
         if any(
             key in section
@@ -332,38 +314,34 @@ def validate_target(directory):
             raise TrainingError(
                 "training requires unquantized BF16 Transformers weights; GGUF/MLX/FP8/NVFP4 are unsupported"
             )
-    for name, value in {
-        "hidden_size": 5120,
-        "num_hidden_layers": 64,
-        "vocab_size": 248320,
-        "num_attention_heads": 24,
-        "num_key_value_heads": 4,
-        "head_dim": 256,
-        "intermediate_size": 17408,
-        "linear_conv_kernel_dim": 4,
-        "linear_key_head_dim": 128,
-        "linear_value_head_dim": 128,
-        "linear_num_key_heads": 16,
-        "linear_num_value_heads": 48,
-        "rms_norm_eps": 1e-6,
-    }.items():
-        if text.get(name) != value:
-            raise TrainingError(f"Qwen3.8-27B target config mismatch: {name}")
+    for name, value in spec["target"].items():
+        if text.get(name) != value or (
+            type(value) is int and type(text.get(name)) is not int
+        ):
+            raise TrainingError(f"{spec['name']} target config mismatch: {name}")
+    layers, hidden, vocab = (
+        text["num_hidden_layers"],
+        text["hidden_size"],
+        text["vocab_size"],
+    )
     expected_layers = [
-        "full_attention" if (i + 1) % 4 == 0 else "linear_attention" for i in range(64)
+        "full_attention" if (i + 1) % 4 == 0 else "linear_attention"
+        for i in range(layers)
     ]
     if (
         text.get("layer_types") != expected_layers
         or text.get("full_attention_interval", 4) != 4
     ):
-        raise TrainingError("Qwen3.8-27B target layer_types mismatch")
+        raise TrainingError(f"{spec['name']} target layer_types mismatch")
+    if text.get("mlp_only_layers", []) != []:
+        raise TrainingError("unsupported target mlp_only_layers")
     rope = text.get("rope_parameters", {})
     if (
         rope.get("rope_type") != "default"
         or rope.get("rope_theta") != 10000000
         or rope.get("partial_rotary_factor") != 0.25
     ):
-        raise TrainingError("Qwen3.8-27B target RoPE mismatch")
+        raise TrainingError(f"{spec['name']} target RoPE mismatch")
     for name in ("tokenizer.json", "tokenizer_config.json"):
         if not (directory / name).is_file():
             raise TrainingError(f"target needs {name}")
@@ -377,25 +355,103 @@ def validate_target(directory):
     if any(t["dtype"] != "BF16" for t in tensors.values()):
         raise TrainingError("training target weights must all be BF16 safetensors")
     for name, shape in {
-        "model.language_model.embed_tokens.weight": [248320, 5120],
-        "lm_head.weight": [248320, 5120],
+        "model.language_model.embed_tokens.weight": [vocab, hidden],
+        "lm_head.weight": [vocab, hidden],
     }.items():
         if name not in tensors or tensors[name]["shape"] != shape:
             raise TrainingError(f"target missing required tensor: {name}")
-    for layer in range(64):
+    for layer in range(layers):
         prefix = f"model.language_model.layers.{layer}."
         required = {
-            "input_layernorm.weight": [5120],
-            "post_attention_layernorm.weight": [5120],
-            "mlp.gate_proj.weight": [17408, 5120],
-            "mlp.up_proj.weight": [17408, 5120],
-            "mlp.down_proj.weight": [5120, 17408],
+            "input_layernorm.weight": [hidden],
+            "post_attention_layernorm.weight": [hidden],
         }
+        if spec["model_type"] == "qwen3_5_moe":
+            experts, intermediate = text["num_experts"], text["moe_intermediate_size"]
+            shared = text["shared_expert_intermediate_size"]
+            required.update(
+                {
+                    "mlp.gate.weight": [experts, hidden],
+                    "mlp.shared_expert_gate.weight": [1, hidden],
+                    "mlp.shared_expert.gate_proj.weight": [shared, hidden],
+                    "mlp.shared_expert.up_proj.weight": [shared, hidden],
+                    "mlp.shared_expert.down_proj.weight": [hidden, shared],
+                }
+            )
+            if prefix + "mlp.experts.gate_up_proj" in tensors:
+                required.update(
+                    {
+                        "mlp.experts.gate_up_proj": [experts, 2 * intermediate, hidden],
+                        "mlp.experts.down_proj": [experts, hidden, intermediate],
+                    }
+                )
+            else:
+                for expert in range(experts):
+                    required.update(
+                        {
+                            f"mlp.experts.{expert}.gate_proj.weight": [
+                                intermediate,
+                                hidden,
+                            ],
+                            f"mlp.experts.{expert}.up_proj.weight": [
+                                intermediate,
+                                hidden,
+                            ],
+                            f"mlp.experts.{expert}.down_proj.weight": [
+                                hidden,
+                                intermediate,
+                            ],
+                        }
+                    )
+        else:
+            intermediate = text["intermediate_size"]
+            required.update(
+                {
+                    "mlp.gate_proj.weight": [intermediate, hidden],
+                    "mlp.up_proj.weight": [intermediate, hidden],
+                    "mlp.down_proj.weight": [hidden, intermediate],
+                }
+            )
         for suffix, shape in required.items():
             name = prefix + suffix
             if name not in tensors or tensors[name]["shape"] != shape:
                 raise TrainingError(f"target missing required decoder tensor: {name}")
     return config
+
+
+def target_family(config):
+    for spec in TRAINING_FAMILIES:
+        if config.get("model_type") == spec["model_type"] and config.get(
+            "architectures"
+        ) == [spec["architecture"]]:
+            return spec
+    raise TrainingError(
+        "target must be a supported Transformers checkpoint: Qwen3.8-27B or Qwen3.6-35B-A3B"
+    )
+
+
+def draft_family(config):
+    for spec in TRAINING_FAMILIES:
+        if config.get("hidden_size") == spec["draft"]["hidden_size"]:
+            return spec
+    raise TrainingError(
+        "draft must match a supported training family: Qwen3.8-27B or Qwen3.6-35B-A3B"
+    )
+
+
+def validate_pair(target, config):
+    text = read_json(Path(target) / "config.json")["text_config"]
+    if (
+        config["hidden_size"] != text["hidden_size"]
+        or config["vocab_size"] != text["vocab_size"]
+        or config.get("num_target_layers", text["num_hidden_layers"])
+        != text["num_hidden_layers"]
+        or any(
+            layer < 0 or layer >= text["num_hidden_layers"]
+            for layer in config["dflash_config"]["target_layer_ids"]
+        )
+    ):
+        raise TrainingError("target and draft belong to incompatible model families")
 
 
 def checkpoint_identity(directory):

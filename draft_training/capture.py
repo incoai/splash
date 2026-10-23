@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 from safetensors.torch import load_file, save_file
 
-from .config import TrainingError, file_digest, read_json, write_json
+from .config import TrainingError, file_digest, read_json, target_family, write_json
 from .data import conversations, examples
 
 
@@ -22,12 +22,14 @@ class TargetAdapter:
 
     @classmethod
     def load(cls, directory, layer_ids, device):
-        from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
+        import transformers
+        from transformers import AutoTokenizer
 
+        spec = target_family(read_json(Path(directory) / "config.json"))
         tokenizer = AutoTokenizer.from_pretrained(
             str(directory), local_files_only=True, trust_remote_code=False
         )
-        model, loading = Qwen3_5ForConditionalGeneration.from_pretrained(
+        model, loading = getattr(transformers, spec["architecture"]).from_pretrained(
             str(directory),
             dtype=torch.bfloat16,
             local_files_only=True,

@@ -12,9 +12,12 @@ from .config import (
     TrainingError,
     checkpoint_identity,
     digest,
+    draft_family,
     file_digest,
     read_json,
+    target_family,
     validate_draft,
+    validate_pair,
     validate_target,
     write_json,
 )
@@ -46,7 +49,7 @@ def add_train_arguments(parser):
         "--target",
         type=Path,
         required=True,
-        help="local BF16 Transformers Qwen3.8-27B checkpoint",
+        help="local BF16 Transformers Qwen3.8-27B or Qwen3.6-35B-A3B checkpoint",
     )
     parser.add_argument(
         "--init-draft",
@@ -171,6 +174,7 @@ def inspect_training(args):
         split_manifest(args.validation_data),
     )
     disjoint(training, validation)
+    validate_pair(args.target, config)
     if any(
         source.resolve() == args.output.resolve()
         or source.resolve() in args.output.resolve().parents
@@ -195,7 +199,7 @@ def run_training(args, *, family=True):
     if args.dry_run:
         return {
             "mode": "metadata-only",
-            "family": "Qwen3.8-27B",
+            "family": draft_family(config)["name"],
             "recipe": recipe.to_dict(),
             "training": training,
             "validation": validation,
@@ -311,9 +315,11 @@ def run_training(args, *, family=True):
             if args.device == "cuda"
             else None,
         }
+    target_spec = target_family(read_json(args.target / "config.json"))
     teacher_identity = checkpoint_identity(args.target)
     initial_identity = checkpoint_identity(args.init_draft)
     provenance = {
+        "family": target_spec["name"],
         "teacher_identity": teacher_identity,
         "initial_draft_identity": initial_identity,
         "training_split": training,
@@ -324,7 +330,7 @@ def run_training(args, *, family=True):
         "splash_contract": {
             name: file_digest(Path(__file__).parent.parent / name)
             for name in (
-                "runtime/model/Qwen3_8.hpp",
+                target_spec["layout"],
                 "runtime/model/DraftCheckpoint.cpp",
                 "runtime/model/ModelDescriptor.mm",
                 "runtime/metal/abi/ExecutionGeometry.h",
@@ -405,6 +411,7 @@ def run_training(args, *, family=True):
 def run_evaluation(args):
     validate_target(args.target)
     config = validate_draft(args.draft)
+    validate_pair(args.target, config)
     validate_draft(args.baseline_draft)
     selection = read_json(args.selection_manifest)
     recipe = Recipe.load()
@@ -516,7 +523,8 @@ def main(argv=None):
             )
         elif args.command == "validate":
             validate_target(args.target)
-            validate_draft(args.draft)
+            config = validate_draft(args.draft)
+            validate_pair(args.target, config)
             result = {
                 "metadata": "valid",
                 "native_loading": "not run",

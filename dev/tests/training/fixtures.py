@@ -93,7 +93,7 @@ def write_data(path, prompt="hello", answer="response", **extra):
     )
 
 
-def tiny_target(directory):
+def tiny_target(directory, *, moe=False):
     import torch
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
@@ -102,13 +102,29 @@ def tiny_target(directory):
         PreTrainedTokenizerFast,
         Qwen3_5Config,
         Qwen3_5ForConditionalGeneration,
+        Qwen3_5MoeConfig,
+        Qwen3_5MoeForConditionalGeneration,
     )
 
-    config = Qwen3_5Config(
+    config_type = Qwen3_5MoeConfig if moe else Qwen3_5Config
+    model_type = (
+        Qwen3_5MoeForConditionalGeneration if moe else Qwen3_5ForConditionalGeneration
+    )
+    expert_config = (
+        dict(
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=8,
+            shared_expert_intermediate_size=8,
+        )
+        if moe
+        else dict(intermediate_size=32)
+    )
+    config = config_type(
         text_config=dict(
             vocab_size=32,
             hidden_size=16,
-            intermediate_size=32,
+            **expert_config,
             num_hidden_layers=4,
             num_attention_heads=2,
             num_key_value_heads=1,
@@ -144,7 +160,7 @@ def tiny_target(directory):
         video_token_id=29,
     )
     torch.manual_seed(19)
-    model = Qwen3_5ForConditionalGeneration(config).to(torch.bfloat16).eval()
+    model = model_type(config).to(torch.bfloat16).eval()
     tokenizer = Tokenizer(
         WordLevel(
             {

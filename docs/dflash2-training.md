@@ -3,10 +3,12 @@
 For the complete dataset-to-export workflow, start with the
 [own-data training quickstart](dflash2-training-quickstart.md).
 
-The optional source-checkout command fine-tunes an existing Qwen3.8-27B
-DFlash2 draft. It exports the BF16 safetensors format Splash already accepts
-through `--draft-model`. It does not add support for other target families or
-reproduce Inco's undisclosed original training recipe. Related: [issue #435](https://github.com/incoai/splash/issues/435).
+The optional source-checkout command fine-tunes existing DFlash2 drafts for
+Qwen3.8-27B and Qwen3.6-35B-A3B. The latter uses a frozen MoE teacher; its
+routers and experts are not trained. Both export the BF16 safetensors format
+Splash already accepts through `--draft-model`. Other target families and
+reproducing Inco's undisclosed original training recipe remain outside scope.
+Related: [issue #435](https://github.com/incoai/splash/issues/435).
 
 The tensor implementation is checked against Z Lab's public DFlash code at
 `07ebd93db9f472af339b644bb70221ad8428328a`. The training objective is
@@ -19,10 +21,10 @@ reported. Candidate selection and tie-breaking follow Splash's serving contract.
 Rechecked against main `1482f6bbc2abf12375332725302019594150b6cb` on
 October 21, 2026. Main's adaptive MoE verify-row policy (#487) controls native
 execution; it does not add training commands or an acceptance-confidence head
-to this trainer. The trainer retains its existing, deliberately restricted
-Qwen3.8-27B adapter and BF16 export schema. Main now derives the draft context
-projection width from its target-layer layout; the supported five target
-layers still imply the same `fc.weight` shape.
+to this trainer. The explicit training-family registry preserves each released
+pair's BF16 export schema. Main derives the draft context projection width
+from the target-layer layout: five selected layers for Qwen3.8-27B and eight
+for Qwen3.6-35B-A3B. Checkpoint validation rejects mixed-family target/draft pairs.
 
 The source launcher, CI and Python checks are integrated with the current
 server/options layout. No native runtime or shader change is part of this PR.
@@ -58,10 +60,17 @@ do not advertise or include this optional training command.
 
 `--target` requires a local, unquantized BF16 Transformers checkpoint with
 `config.json`, tokenizer files, a chat template, and `model.safetensors` or
-indexed safetensors shards. The first adapter uses the `qwen3_5` configuration
-and `Qwen3_5ForConditionalGeneration` architecture for the supported
-Qwen3.8-27B family. GGUF, MLX, FP8, and NVFP4 training targets are rejected.
+indexed safetensors shards. The adapters use `Qwen3_5ForConditionalGeneration`
+for Qwen3.8-27B and `Qwen3_5MoeForConditionalGeneration` for Qwen3.6-35B-A3B.
+Family-specific validation checks target geometry, draft geometry and capture
+layers. MoE validation checks routers, shared experts and every routed expert,
+including packed or individual expert storage. GGUF, MLX, FP8, and NVFP4
+training targets are rejected.
 `--init-draft` requires the matching released BF16 DFlash2 checkpoint.
+
+The MoE adapter has real small-model pipeline tests and released-checkpoint
+metadata/tokenizer validation. A full-size MoE CUDA run and native
+exported-checkpoint qualification remain pending.
 
 Both inputs stay local; commands never download checkpoints, provision a
 machine, upload weights, or start a paid job. Input files are fingerprinted
@@ -90,6 +99,8 @@ reasoning_effort: xhigh  # low, medium, or xhigh
 ```
 
 These defaults preserve the released teacher template's previous behavior.
+Qwen3.8-27B implements the effort setting; the pinned Qwen3.6 template uses
+`enable_thinking` and ignores `reasoning_effort`.
 Set `enable_thinking: false` for an experiment targeting non-thinking serving;
 the template ignores reasoning effort in that mode. Both settings apply to
 prompt and supplied-answer rendering, are stored in feature-cache bindings,
@@ -146,7 +157,7 @@ The target is frozen throughout. After capture, its decoder and vision weights
 are released; training retains only the frozen embedding and output head.
 Gradients through the output head still reach the draft. Capture uses bounded
 continuation shards; BF16 selected features alone occupy about 51.2 GB per
-million tokens for this family.
+million tokens for Qwen3.8-27B and about 32.8 GB for Qwen3.6-35B-A3B.
 
 A run contains:
 
@@ -285,3 +296,12 @@ make check
 Tensor tests skip when optional dependencies are absent. Metadata and launcher
 checks still run in the ordinary suite. The separate Linux CI job installs
 CPU training dependencies and tests the pinned reference without model downloads.
+
+## Adding another model family
+
+`draft_training/families.py` lists explicit supported target architectures and
+the matching released draft geometries. Adding a family requires its teacher
+loader, selected-layer feature contract, tokenizer/special-token compatibility,
+strict checkpoint validation, end-to-end tests and native export qualification.
+The shared optimizer and dataset pipeline can be reused. Registering a model
+name or allowing arbitrary `AutoModel` loading does not establish these contracts.

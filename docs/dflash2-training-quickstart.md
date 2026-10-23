@@ -1,9 +1,10 @@
-# Train a Qwen3.8-27B DFlash2 draft on your own data
+# Train a DFlash2 draft on your own data
 
-This workflow continues the released Qwen3.8-27B DFlash2 draft using your
+This workflow continues released Qwen3.8-27B or Qwen3.6-35B-A3B DFlash2 drafts using your
 text dataset. It includes data preparation, validation, teacher capture,
 optimization, interruption recovery, BF16 export and held-out comparison.
-It supports selector-only or full-draft training. Other model families and
+It supports selector-only or full-draft training against a frozen dense or MoE
+teacher. Other model families and
 training a new architecture from scratch are outside this first workflow.
 
 Training produces a candidate; whether it improves acceptance depends on your
@@ -19,12 +20,16 @@ does not require building the Apple Metal runtime. Native deployment testing
 later requires a supported Mac. #499 itself supports CUDA and CPU diagnostics;
 experimental MPS training is introduced separately in #537.
 
-One A100-SXM4-80GB completed the published combined-stack smoke. Teacher
+For Qwen3.8-27B, one A100-SXM4-80GB completed the published combined-stack smoke. Teacher
 capture peaked at 51.8 GiB allocated, selector optimization at 10.6 GiB and
 one full-draft preflight update at 40.7 GiB, measured separately near 2K context.
 Those are measured allocated bytes, rather than total hardware requirements.
 Use preflight on your host and recipe. Feature caches alone use about 51.2 GB
-per million captured tokens, plus model weights and optimizer checkpoints.
+per million captured tokens for that family, plus model weights and optimizer
+checkpoints. Qwen3.6-35B-A3B caches use about 32.8 GB per million tokens. Its
+teacher still holds all experts in memory even though only a subset is active
+per token. Do not infer its full memory requirement from the 3B active count.
+The published 27B GPU measurements do not qualify the full-size MoE workflow.
 
 ```bash
 python3.12 -m venv /path/to/training-env
@@ -49,6 +54,25 @@ The teacher must be the unquantized BF16 Transformers checkpoint, including
 its tokenizer and chat template. A GGUF or 4-bit serving package cannot be
 used as the training teacher. Commands below use only local checkpoints;
 they do not rent a GPU, download models or upload data automatically.
+
+For **Qwen3.6-35B-A3B MoE**, use the matching local teacher and released draft:
+
+```bash
+hf download Qwen/Qwen3.6-35B-A3B \
+  --revision 995ad96eacd98c81ed38be0c5b274b04031597b0 \
+  --local-dir /models/qwen36-teacher
+hf download incoai/Qwen3.6-35B-A3B-DFlash2 \
+  --revision 51ef7b6923ad6c14cb1bb41c37a9041446496ab6 \
+  --local-dir /models/qwen36-draft
+```
+
+Use these two paths in place of the `qwen38` paths in every command below,
+and copy `training/qwen3_6_35b_a3b.yaml` or
+`training/qwen3_6_35b_a3b_full.yaml` as your recipe. Family detection is automatic
+from checkpoint metadata; mixing the dense and MoE checkpoints is rejected.
+The full-size MoE path has metadata/tokenizer validation and real small-MoE
+pipeline tests, while real-checkpoint CUDA and native qualification are still
+required. There is no MoE acceptance or serving speed claim.
 
 ## 2. Prepare your JSONL dataset
 
@@ -93,6 +117,7 @@ own already isolated `messages` JSONL splits directly to training.
 cp training/qwen3_8_27b.yaml my-domain.yaml
 # For full-draft continuation instead:
 # cp training/qwen3_8_27b_full.yaml my-domain.yaml
+# For the MoE teacher, use qwen3_6_35b_a3b.yaml or qwen3_6_35b_a3b_full.yaml.
 ```
 
 Edit `my-domain.yaml` before starting. Choose the training budget, learning
@@ -108,6 +133,7 @@ N scorable blocks and B blocks per step, an epoch takes about N/B steps;
 teacher-generated block counts become known only after capture.
 
 Match `enable_thinking` and `reasoning_effort` to the intended deployment.
+The pinned Qwen3.6 template ignores effort; its thinking flag still applies.
 Set `enable_thinking: false` for non-thinking serving. With thinking enabled,
 short generated continuations may mostly contain reasoning tokens.
 
