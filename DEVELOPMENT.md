@@ -1455,7 +1455,11 @@ system prompt and A–P option order. It returns the exact rendered prompt's SHA
 (each lone surrogate read as U+FFFD, as every prompt is tokenized),
 answer token IDs, raw option logits, normalized probabilities and zero completion
 tokens. Every answer label must round-trip as one token, including at the actual
-assistant prompt boundary. Besides the row it takes `model`, `timeout`,
+assistant prompt boundary. Prompts render without thinking, as effort `none`
+renders them. A model that opens its reasoning itself (Flint), which no effort
+turns off, would open it where the generation prompt ends: its prompt ends with
+an empty think block, `<think></think>`, and the answer slots are read after it,
+where its answer starts. Besides the row it takes `model`, `timeout`,
 `priority` and `cache_salt` as the generation APIs do ([request
 fields](#request-fields)); other generation controls return errors rather than
 silently changing the scoring protocol. SemIf-derived code retains its MIT

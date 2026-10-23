@@ -648,6 +648,29 @@ class FlintPromptTests(unittest.TestCase):
                 prompts.add(frontend.apply_template(body, deadline=fixtures.FOREVER))
         self.assertEqual(prompts, {"<|user|>hello<|assistant|>"})
 
+    def test_scores_are_read_where_the_model_answers_without_reasoning(self):
+        # Its effort leaves Flint's model reasoning, which it would open where
+        # the generation prompt ends: judgment and System One slots are read
+        # after an empty think block, where its answer starts.
+        frontend = self.frontend()
+        judgment, _ = frontend.prepare_judgment(
+            fixtures.judgment_body(),
+            deadline=fixtures.FOREVER,
+            disconnected=fixtures.stays_connected,
+        )
+        systemone = frontend.prepare_systemone(
+            {"model": "test-model", "state": {}, "questions": {"q": {"type": "noul"}}},
+            deadline=fixtures.FOREVER,
+            disconnected=fixtures.stays_connected,
+        )
+        ids = frontend.tokenizer.convert_tokens_to_ids
+        for job in (judgment, systemone[0][2]):
+            self.assertEqual(
+                list(job.prompt_tokens[-3:]),
+                [ids("<|assistant|>"), ids("<think>"), ids("</think>")],
+            )
+            self.assertEqual(len(job.score_tokens), 2)
+
     def test_prompt_tokens_are_reused_after_the_last_assistant_turn(self):
         # Splits before the byte-level BPE, as Flint's tokenizer has three,
         # and the GGUF tokenizer's byte-level post-processor.

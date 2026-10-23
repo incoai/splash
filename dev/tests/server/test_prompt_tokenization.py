@@ -168,6 +168,7 @@ class PromptTokenizationTests(unittest.TestCase):
                 template,
                 messages,
                 labels,
+                chat_format=QWEN,
                 admit=lambda tokens: None,
                 checkpoint=lambda: None,
             )

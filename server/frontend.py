@@ -647,6 +647,7 @@ class Frontend:
                 self.chat_templates.select(None).source,
                 messages,
                 labels,
+                chat_format=self.chat_format,
                 admit=admit,
                 checkpoint=checkpoint,
             )
