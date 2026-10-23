@@ -115,3 +115,40 @@ conversations resume from are dropped instead of written.
 See [the low-bit GGUF measurements](https://github.com/incoai/splash/pull/160)
 for the workloads, memory pressure, SSD settings and limitations, and
 [the Bonsai measurements](https://github.com/incoai/splash/pull/166) for PQ2_0.
+
+## On a 128 GB M5 Max
+
+The `backend-benchmark`'s scenarios on an M5 Max (40-core GPU, 128 GB) with
+the MLX 4-bit models: a 39-token prompt and 64 output tokens for the decode,
+a 14,096-token prompt for the cache scenarios, each family's DFlash2 draft,
+the default INT8 KV, and the ANE split where it serves. The 27B calibrates
+8 of its 34 prefill-FFN units to the ANE, the value documented in its
+[Neural Engine prefill](../DEVELOPMENT.md#neural-engine-prefill) section; the 35B's MoE FFN runs on
+the GPU alone, as the split does not serve MoE targets.
+
+| | Qwen3.6-35B-A3B | Qwen3.8-27B |
+| --- | ---: | ---: |
+| Decode · one lane | 476 tok/s (2.3×) | 190 tok/s (2.6×) |
+| Decode · 4 lanes, aggregate | 1,297 tok/s (3.6×) | 594 tok/s (3.5×) |
+| Prefill · 14K, cold | 6,069 tok/s (3.0×) | 909 tok/s (2.5×) |
+| Prefill · 14K, cached prefix | 18,028 tok/s | 2,633 tok/s |
+| First token · 928 tokens | 0.15 s | 1.28 s |
+| Draft acceptance | 74.6% | 88.7% |
+| Advertised context | 262,144 tokens | 262,144 tokens |
+
+The ratios are against the M5 Pro's [launch
+figures](#splash-10-launch-benchmarks), which used longer coding prompts,
+reasoning on, and a 32K prefill; the decode lanes are of similar, not
+identical, work. As on the M5 Pro the lead grows with lanes, and each model
+advertises a 256K context on the 128 GB pool.
+
+On the 40 cores the measured kernel plans hold their expected winners: the
+decode projection runs the staged tile at four K splits at every lane count,
+1.1× the register tile at one lane and 3.1× at four; a 5120×8192 Q4_K
+projection takes 0.050–0.067 ms staged against 0.057–0.207 ms register. The 35B's experts run 14–19% faster pooled and staged
+than in registers at 16–32 rows. The Flash-Next sparse attention is equal
+across its four selection schemes on one decode row, the independent pages
+costing 45% more in prefill. The model runtime oracle verified both
+installations with their drafts: the restored draft rings run at 0.992–0.999
+cosine, and the 35B's budgeted verify serves 6.14 rows over 209 lanes a
+cycle.
