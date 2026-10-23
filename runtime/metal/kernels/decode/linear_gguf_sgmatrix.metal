@@ -7,8 +7,8 @@
 //   (converted) for 8-bit linear codes, or the codebook, int8 or grid value;
 // - one MMA chain per coefficient group, closed by the fp32 epilogue
 //   s * chain + b * sum (b = m - 128 s, formats with a min per 32 inputs, or
-//   b = m for 8-bit codes; Apple9 takes Q4_0's and Q5_0's zero point as such
-//   a min, Apple9View) or
+//   b = m for 8-bit codes; Apple9 takes Q4_0's, Q5_0's and PQ2_0's zero point
+//   as such a min, Apple9View) or
 //   s * chain with the chain seeded by -160 * sum from the table (formats
 //   with a zero point, and Q2_K, whose min per 16 inputs adds b * seed with
 //   b = m / -160);
@@ -62,11 +62,11 @@ template <class F> struct Shape {
   static_assert(!Wide || (HasMin && !Seeded), "wide codes have a min per 32 inputs");
   static_assert(!Centered || (Seeded && !HasMin), "centered codes have a zero point");
 };
-// Q4_0 and Q5_0 with the zero point taken as a min, m = -zero d: a 32-input group enters the MMA as 128 + code in one
-// chain, closed against the table's sum of its inputs with b = -(128 + zero) d, instead of as two 16-input chains
-// seeded from the table, with half the coefficients. On a 10-core M4 this takes 3-8% off Q4_0's and Q5_0's 27B
-// gate/up and down projections at one to four lanes. Metal has no struct inheritance, so the view forwards what the
-// register tile reads of F.
+// Q4_0, Q5_0 and PQ2_0 with the zero point taken as a min, m = -zero d: a 32-input group enters the MMA as 128 + code
+// in one chain, closed against the table's sum of its inputs with b = -(128 + zero) d, instead of as two 16-input
+// chains seeded from the table, with half the coefficients. On a 10-core M4 this takes 3-8% off Q4_0's, Q5_0's and
+// PQ2_0's 27B gate/up and down projections at one to four lanes. Metal has no struct inheritance, so the view forwards
+// what the register tile reads of F.
 template <class F> struct ZeroAsMin {
   enum : uint { Id = F::Id, P0 = F::P0, P1 = F::P1, MetaBytes = F::MetaBytes };
   enum : ushort { MetaGroups = F::MetaGroups, Zero = 0, Group = F::Group };
@@ -102,6 +102,7 @@ template <class F> struct Centered {
 template <class F> struct Apple9View { typedef F type; };
 template <> struct Apple9View<FmtQ40> { typedef ZeroAsMin<FmtQ40> type; };
 template <> struct Apple9View<FmtQ50> { typedef ZeroAsMin<FmtQ50> type; };
+template <> struct Apple9View<FmtPQ20> { typedef ZeroAsMin<FmtPQ20> type; };
 template <> struct Apple9View<FmtQ6K> { typedef Centered<FmtQ6K> type; };
 template <> struct Apple9View<FmtQ3K> { typedef Centered<FmtQ3K> type; };
 #define GGUF_SG_APPLE9_VIEW(F, f)                                                                     \
@@ -399,6 +400,7 @@ QUANT_REGISTER_FORMATS(GGUF_SG_FORMAT)
 // Apple9's views (gguf_apple9_view).
 GGUF_SG_LANES(gguf_sg::Apple9View<FmtQ40>::type, sg9_q40)
 GGUF_SG_LANES(gguf_sg::Apple9View<FmtQ50>::type, sg9_q50)
+GGUF_SG_LANES(gguf_sg::Apple9View<FmtPQ20>::type, sg9_pq20)
 GGUF_SG_LANES(gguf_sg::Apple9View<FmtQ6K>::type, sg9_q6k)
 GGUF_SG_LANES(gguf_sg::Apple9View<FmtQ3K>::type, sg9_q3k)
 #undef GGUF_SG_FORMAT
