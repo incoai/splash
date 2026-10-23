@@ -8,9 +8,13 @@ a library as an LLVM module of its own, which holds no source path or build
 id. Two functions are identical when their modules' text is, but for the
 module's offset in its library, which the disassembly prints before it, and
 the names of the other symbols a module defines, its internal functions and
-their threadgroup and constant variables: C++ names them for their
-signatures, which a template value added with its old value changes without
-changing any code, so they are compared in the order they first appear.
+their threadgroup and constant variables, and two kinds of names the C++
+frontend gives a module's types: the numbers of its lambdas' anonymous
+classes (%class.anon.N), and the mangled names of its classes in the
+type-based alias metadata (!"_ZTS..."). C++ names the symbols for their
+signatures and numbers the lambdas across the source file, so a template
+value added with its old value renames all three without changing any code;
+each is compared in the order it first appears.
 
 By default it compares the kernels the decode path may run: every function
 but those named for prefill (prefill_*, gguf_prefill_*), the vision encoder
@@ -41,6 +45,13 @@ DEFINITION = re.compile(
     re.MULTILINE,
 )
 SYMBOL = re.compile(r"@([-\w$.]+)")
+# The names the frontend gives a module's types, which the module's own
+# definitions and metadata spell out: a lambda's anonymous class, and a
+# class's mangled name in the type-based alias metadata.
+TYPE_NAMES = (
+    (re.compile(r"%class\.anon(?:\.\d+)*"), "%class.anon.defined.{}"),
+    (re.compile(r'!"_ZTS[^"]*"'), '!"_ZTS.defined.{}"'),
+)
 
 
 def library(path: Path) -> Path:
@@ -55,8 +66,9 @@ def library(path: Path) -> Path:
 
 
 def normalized(name: str, module: str) -> str:
-    """Function `name`'s module with every other symbol it defines renamed
-    for the order in which it first appears."""
+    """Function `name`'s module with every other symbol it defines, and the
+    names of its anonymous classes and of its classes' alias metadata
+    (TYPE_NAMES), renamed for the order in which each first appears."""
     defined = {
         function or variable for function, variable in DEFINITION.findall(module)
     } - {name}
@@ -68,7 +80,14 @@ def normalized(name: str, module: str) -> str:
             return match.group(0)
         return f"@defined.{order.setdefault(symbol, len(order))}"
 
-    return SYMBOL.sub(rename, module)
+    module = SYMBOL.sub(rename, module)
+    for pattern, spelling in TYPE_NAMES:
+        names: dict[str, int] = {}
+        module = pattern.sub(
+            lambda match: spelling.format(names.setdefault(match.group(0), len(names))),
+            module,
+        )
+    return module
 
 
 def functions(metallib: Path) -> dict[str, str]:

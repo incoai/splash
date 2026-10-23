@@ -101,6 +101,28 @@ class KernelIdentityTests(unittest.TestCase):
         status, lines = self.run_main(baseline, external)
         self.assertEqual((status, lines[0]), (1, "different: verify_split"))
 
+    def test_anonymous_classes_and_alias_names_are_compared_in_order(self):
+        # A lambda's class, which the frontend numbers across the source file
+        # and the linker again where two modules take one name, and a class's
+        # mangled name in the alias metadata, which a template value renames.
+        module = (
+            'source_filename = "moe_expert"\n\n'
+            "%class.anon{0} = type {{ float, i32 }}\n\n"
+            "define void @moe_expert(%class.anon{0}* %0) {{\n"
+            "  %2 = load float, float* null, !tbaa !1\n"
+            "  ret void\n}}\n\n"
+            '!1 = !{{!2, !3, i64 0}}\n!2 = !{{!"{1}", !3, i64 0}}\n'
+            '!3 = !{{!"{2}"}}\n'
+        )
+        baseline = {"moe_expert": module.format(".3.42", "_ZTS4TileILj8EE", "float")}
+        renamed = {"moe_expert": module.format(".7.43", "_ZTS4TileILj8ELj1EE", "float")}
+        status, lines = self.run_main(baseline, renamed)
+        self.assertEqual((status, lines[0]), (0, "identical: moe_expert"))
+        # Another scalar type in the alias metadata is another function.
+        retyped = {"moe_expert": module.format(".3.42", "_ZTS4TileILj8EE", "int")}
+        status, lines = self.run_main(baseline, retyped)
+        self.assertEqual((status, lines[0]), (1, "different: moe_expert"))
+
     def test_by_default_kernels_named_for_other_paths_are_left_out(self):
         baseline = {
             name: MODULE.format(name)
