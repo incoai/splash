@@ -277,7 +277,7 @@ void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, Targ
                     {"num_experts_per_tok", target.expertsPerToken},
                     {"moe_intermediate_size", target.expertIntermediateSize},
                     {"shared_expert_intermediate_size",
-                     target.expertIntermediateSize}});
+                     target.sharedExpertSlices * target.expertIntermediateSize}});
   else
     requireNumbers(text, name, "text config",
                    {{"intermediate_size", target.intermediateSize}});
@@ -316,8 +316,9 @@ uint32_t ggufRoutedExperts(NSDictionary *text, const QwenHybridLayout &target) {
   if (!text[@"num_experts"]) return target.experts;
   constexpr uint32_t routerTile = 8;
   const auto served = [&](uint32_t experts) {
-    return experts <= target.experts && experts % routerTile == 0 &&
-           ops::MoeShape{target.hiddenSize, experts, target.expertsPerToken, target.expertIntermediateSize}.valid();
+    ops::MoeShape shape = target.moeBlockShape();
+    shape.experts = experts;
+    return experts <= target.experts && experts % routerTile == 0 && shape.valid();
   };
   const uint32_t experts = requireWhole(text[@"num_experts"], "text config num_experts");
   if (served(experts)) return experts;

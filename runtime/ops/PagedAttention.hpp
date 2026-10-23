@@ -271,6 +271,12 @@ public:
                    kv::Layout layout);
   [[nodiscard]] static AttentionWorkspace
   verifyWorkspace(uint32_t lanes, uint32_t queryHeads, kv::Layout layout);
+  // Whether the compiled geometry of `queryHeads` over a layout's KV heads
+  // (kCompiledAttention) computes attention as a target's layout states it:
+  // gated or not, rotating `rotaryPairs` pairs. Throws for a geometry with
+  // no kernels.
+  [[nodiscard]] static bool compiles(uint32_t queryHeads, kv::Layout layout, bool gated,
+                                     uint32_t rotaryPairs);
 
   // The q/k norms and, for a rotated variant, the RoPE of the packed
   // projection rows (every query head's queries, and a gated geometry's

@@ -91,6 +91,9 @@ QwenTarget::QwenTarget(const QwenTargetWeightsBase &weights, const QwenTargetGeo
                        metal::MetalBackend &backend, const ops::ExecutionPlans &operators)
     : weightsBase_(weights), geometry_(geometry), backend_(backend), operators_(operators) {
   if (!geometry_.valid()) throw std::invalid_argument("Qwen target weights do not match execution geometry");
+  if (!ops::PagedAttention::compiles(geometry_.attentionQueryHeads, geometry_.kvLayout, geometry_.attentionGate,
+                                     geometry_.rotaryPairs))
+    throw std::invalid_argument("no attention kernel for the target's output gate and RoPE");
 }
 
 QwenTarget::~QwenTarget() = default;
@@ -164,10 +167,14 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
       chunk.rows > ExecutionLimits::prefillTokenBudget)
     throw std::invalid_argument("invalid Qwen prefill chunk");
   PrefillStep step{graph, chunk.buffers, chunk.sequences, chunk.rows, kv.layers(), spilled};
+  const uint32_t window = geometry_.kvLayout.windowTokens;
   for (const QwenTargetPrefillSequence &sequence : chunk.sequences) {
     requirePrefillStates(geometry_, sequence);
     step.attention.push_back(
         operators_.prefillAttention(sequence.rows, geometry_.attentionQueryHeads, geometry_.kvLayout));
+    if (window)
+      step.windowedAttention.push_back(operators_.prefillAttention(
+          sequence.rows, geometry_.attentionQueryHeads, geometry_.kvLayout, {.windowTokens = window}));
   }
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moePrefill(geometry_.moeShape(), chunk.rows);
   if (aneFfn && aneFfn->splits(chunk.rows)) step.aneFfn = aneFfn;
@@ -194,6 +201,10 @@ QwenTarget::VerifyStep QwenTarget::verifyStep(metal::CommandGraph &graph, const 
   VerifyStep step{graph, buffers, kvLayers, spilled, chunks, lanes, lanes * kVerifyRows,
                   operators_.verifyAttention(lanes, geometry_.attentionQueryHeads, geometry_.kvLayout,
                                              std::span(histories).first(lanes))};
+  if (const uint32_t window = geometry_.kvLayout.windowTokens)
+    step.windowedAttention.emplace(operators_.verifyAttention(lanes, geometry_.attentionQueryHeads,
+                                                              geometry_.kvLayout, std::span(histories).first(lanes),
+                                                              {.windowTokens = window}));
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moeDecode(geometry_.moeShape(), lanes);
   return step;
 }
@@ -251,6 +262,9 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
                                  std::span<const ops::AttentionBlocks> blocks) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   const uint32_t layer = step.attentionLayer++;
+  const ops::AttentionVariant variant = geometry_.attentionVariant(layer);
+  const std::vector<ops::PrefillAttentionPlan> &plans =
+      variant.windowTokens ? step.windowedAttention : step.attention;
   if (!blocks.empty() && blocks.size() != step.sequences.size())
     throw std::invalid_argument("Qwen prefill attention blocks do not match its sequences");
   const auto u16Rows = [&](const metal::MetalBuffer &buffer, const QwenTargetPrefillSequence &sequence,
@@ -276,7 +290,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
         step.graph, u16Rows(b.fullPacked, sequence, geometry_.packedFullWidth), mixer.queryNorm, mixer.keyNorm,
         f32Rows(b.ropeCos, sequence, geometry_.rotaryPairs), f32Rows(b.ropeSin, sequence, geometry_.rotaryPairs),
         queries, keys, values, sequence.rows, sequence.attentionStride, geometry_.attentionQueryHeads,
-        geometry_.kvLayout);
+        geometry_.kvLayout, variant);
     ops::PagedAttention::addPrefillStore(step.graph, step.kvLayers[layer], keys, values, sequence.pageTable,
                                          sequence.chunk, geometry_.kvLayout);
     const uint32_t firstPage = sequence.chunk.committed_tokens / kv::kPageTokens;
@@ -285,8 +299,8 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
                              kv::chunkedPrefillRequiredPages(sequence.chunk) - firstPage,
                              {sequence.pageTable, step.kvLayers[layer]});
     ops::PagedAttention::addPrefill(step.graph, attended.kv, queries, attentionRows, b.attentionPartials,
-                                    b.attentionStatistics, attended.table, sequence.chunk, step.attention[index],
-                                    blocks.empty() ? ops::AttentionBlocks{} : blocks[index]);
+                                    b.attentionStatistics, attended.table, sequence.chunk, plans[index],
+                                    blocks.empty() ? ops::AttentionBlocks{} : blocks[index], mixer.sinks);
     ops::PagedAttention::addPrefillGate(
         step.graph, u16Rows(b.fullPacked, sequence, geometry_.packedFullWidth), attentionRows,
         u16Rows(b.attentionHidden, sequence, geometry_.attentionWidth), sequence.rows, sequence.attentionStride,
@@ -342,11 +356,12 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mi
   const QwenTargetVerifyBuffers &b = step.buffers;
   const ops::Linear &linear = operators_.linear();
   const uint32_t layer = step.attentionLayer++;
+  const ops::AttentionVariant variant = geometry_.attentionVariant(layer);
   addDecodeProjection(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.lanes, b.linearScratch,
                       std::move(normalized));
   ops::PagedAttention::addVerifyProjection(step.graph, b.fullPacked, mixer.queryNorm, mixer.keyNorm, b.ropeCos,
                                            b.ropeSin, b.fullQueries, b.chunkKeys[layer], b.chunkValues[layer],
-                                           geometry_.attentionQueryHeads, geometry_.kvLayout, step.lanes);
+                                           geometry_.attentionQueryHeads, geometry_.kvLayout, step.lanes, variant);
   ops::AttentionBlocks attended = blocks;
   if (step.spilled.active()) {
     if (!blocks.stride) throw std::logic_error("a verify over spilled K/V attends without block lists");
@@ -354,8 +369,9 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mi
   }
   ops::PagedAttention::addVerify(step.graph, step.kvLayers[layer],
                                  {b.chunkKeys[layer], b.chunkValues[layer], b.fullQueries, b.attentionPartials,
-                                  b.attentionStatistics, b.fullAttention, b.pageTables},
-                                 step.chunks, step.attention, attended);
+                                  b.attentionStatistics, b.fullAttention, b.pageTables, mixer.sinks},
+                                 step.chunks, variant.windowTokens ? *step.windowedAttention : step.attention,
+                                 attended);
   const ops::LinearPlan outputPlan = linear.decodePlan(
       mixer.outputProjection, step.lanes, output.residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
   const ops::PreparedInput hidden = ops::PagedAttention::addVerifyGate(

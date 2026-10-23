@@ -2468,7 +2468,20 @@ every Qwen target shares: a step's checks and plans, the GDN and attention
 mixers, the FFNs of a residual of one row (a dense SwiGLU and a MoE block's
 routing and experts), the draft's captures and the normed head. The Qwen3.5
 architecture's target (`Qwen3_5Target`, `QwenTarget.cpp`) and Flash-Next's
-(`Qwen4ExpTarget`) each compose them into their own layer loop.
+(`Qwen4ExpTarget`) each compose them into their own layer loop. What a family
+changes in a block is a value of its layout (`QwenTargetDimensions`), read by
+the shared block rather than branched on: an attention layer's variant
+(`QwenTargetGeometry::attentionVariant`: rotated by the target's RoPE unless
+`unrotatedLayers` names it, over a sliding window of `slidingWindow` keys where
+`slidingLayers` does), for which a step plans the windowed layers apart; the
+learned sinks, which a layer's `QwenAttentionWeights` carry where its geometry
+adds them; the MoE router and the shared expert's slices and gate
+(`QwenTargetDimensions::moeBlockShape`); and the leading layers of a MoE target
+whose FFN is dense (`leadingDenseLayers`), whose blocks, and streamed experts,
+are the MoE layers' alone. The output gate (`attentionGate`) and the RoPE pairs
+(`rotaryPairs`) are values the attention kernels compile with their geometry
+(`kCompiledAttention`), to which a target holds its layout's
+(`PagedAttention::compiles`).
 
 Every source loads into block planes: `Projection`, `BlockMoeWeights` and
 `EmbeddingWeights` (`runtime/ops/Weights.hpp`, `MoE.hpp`) hold them whatever

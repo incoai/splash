@@ -58,6 +58,9 @@ struct QwenAttentionWeights final {
   ops::NormWeights queryNorm;
   ops::NormWeights keyNorm;
   ops::Projection outputProjection;
+  // The layer's learned sinks, an F32 per query head, of a geometry whose
+  // attention adds them (ops::PrefillAttentionPlan::sinks); none otherwise.
+  metal::MetalBuffer sinks{};
 };
 
 using QwenMixerWeights = std::variant<QwenGdnWeights, QwenAttentionWeights>;
@@ -140,7 +143,17 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
     return hiddenSize * captureLayerCount;
   }
   [[nodiscard]] constexpr ops::MoeShape moeShape() const noexcept {
-    return {hiddenSize, experts, expertsPerToken, expertIntermediateSize, moeExpertFormat, moeRegisterFormats};
+    ops::MoeShape shape = moeBlockShape();
+    shape.expertFormat = moeExpertFormat;
+    shape.registerFormats = moeRegisterFormats;
+    return shape;
+  }
+  // How attention layer `attention` (the a-th attention layer) attends: with
+  // the RoPE of the target's pairs unless unrotatedLayers names it, and over
+  // the window of kvLayout where that names it.
+  [[nodiscard]] constexpr ops::AttentionVariant attentionVariant(uint32_t attention) const noexcept {
+    return {.rotated = attention >= 64 || !(unrotatedLayers >> attention & 1),
+            .windowTokens = kvLayout.windowed(attention) ? kvLayout.windowTokens : 0};
   }
   [[nodiscard]] constexpr std::span<const uint32_t>
   captureLayers() const noexcept {
@@ -166,7 +179,8 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   // loaded. The draft reads 1 to ExecutionLimits::maximumDraftTargetLayers
   // of its layers, ascending. A target without GDN layers has no GDN shape.
   // The projection lists hold every projection the weights dispatch, which
-  // each have sizes.
+  // each have sizes; a target with dense FFNs, a MoE target's leading layers
+  // too, holds their gate and up projections.
   [[nodiscard]] bool valid() const noexcept {
     const auto sized = [](const std::vector<ops::ProjectionShape> &shapes) {
       return !shapes.empty() && std::all_of(shapes.begin(), shapes.end(), [](const auto &shape) {
@@ -178,13 +192,14 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
       const auto ids = captureLayers();
       return std::ranges::adjacent_find(ids, std::ranges::greater_equal{}) == ids.end() && ids.back() < layers;
     };
+    const bool dense = intermediateSize && sized(gateUpProjections);
     return captured() && stateLayout.layers + kvLayout.attentionLayers == layers &&
            (!stateLayout.layers || gdnShape().valid()) &&
            kvLayout.kvHeads == attentionKvHeads &&
            kvLayout.headDimension == attentionHeadDimension &&
            sized(prefillProjections) && sized(decodeProjections) &&
-           ((ffnKind == QwenFfnKind::Dense && intermediateSize && sized(gateUpProjections)) ||
-            (ffnKind == QwenFfnKind::SparseMoe && moeShape().valid()));
+           ((ffnKind == QwenFfnKind::Dense && dense) ||
+            (ffnKind == QwenFfnKind::SparseMoe && moeShape().valid() && (!leadingDenseLayers || dense)));
   }
 };
 
@@ -513,8 +528,11 @@ protected:
     uint32_t rows;
     std::span<const SplashKvLayer> kvLayers;
     SpilledKvReads &spilled;
-    // Each sequence's attention plan, which every attention layer runs.
+    // Each sequence's attention plan, which every attention layer runs, and
+    // with a sliding window (kv::Layout::windowTokens) its windowed plan,
+    // which the sliding layers run instead.
     std::vector<ops::PrefillAttentionPlan> attention{};
+    std::vector<ops::PrefillAttentionPlan> windowedAttention{};
     std::optional<ops::MoePlan> moe{};
     // The layer's MoE buffers, which its routing (addPrefillLayer), the
     // layer's load and its routed work (addPrefillExperts) share.
@@ -533,6 +551,8 @@ protected:
     uint32_t lanes;
     uint32_t rows;
     ops::VerifyAttentionPlan attention;
+    // With a sliding window, the plan of the sliding layers.
+    std::optional<ops::VerifyAttentionPlan> windowedAttention{};
     std::optional<ops::MoePlan> moe{};
     uint32_t gdnLayer = 0;
     uint32_t attentionLayer = 0;
@@ -612,10 +632,11 @@ protected:
   void requireLayerPartition(uint32_t gdnLayers, uint32_t attentionLayers) const;
 
   // The mixers, of a step's normalized rows (buffers.normalized) into their
-  // output projection's `output`: a GDN, and a full attention whose rows
-  // attend, when given, only the blocks of their lists (`blocks`, a prefill's
-  // per sequence, a verify's for the step), through the step's reads of
-  // spilled K/V.
+  // output projection's `output`: a GDN, and an attention whose rows attend
+  // as the layer's variant does (QwenTargetGeometry::attentionVariant), with
+  // the layer's sinks where its geometry adds them, and, when given, only the
+  // blocks of their lists (`blocks`, a prefill's per sequence, a verify's for
+  // the step), through the step's reads of spilled K/V.
   void addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, BlockOutput output) const;
   void addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer, BlockOutput output,
                        std::span<const ops::AttentionBlocks> blocks = {}) const;

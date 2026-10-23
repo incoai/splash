@@ -38,12 +38,14 @@ GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &i
       gguf::planImages(planned_->source.file(), architecture, geometry,
                        {.streamExperts = experts.memoryBytes != 0, .streamTable = table.cacheBytes != 0});
   planned_->layers = geometry.layers;
+  planned_->firstMoeLayer = geometry.leadingDenseLayers;
   planned_->table = table;
   planned_->experts = experts;
 }
 
 StreamedBlocks GgufTargetLoader::streamedExperts() const {
-  return {gguf::streamedExperts(std::span(planned_->images).first(planned_->layers)), planned_,
+  const std::span layers = std::span(planned_->images).first(planned_->layers);
+  return {gguf::streamedExperts(layers.subspan(planned_->firstMoeLayer)), planned_,
           {[planned = planned_] { planned->source.checkUnchanged(); }}};
 }
 

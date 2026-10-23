@@ -325,6 +325,11 @@ AttentionWorkspace PagedAttention::verifyWorkspace(
   return verifyWorkspaceBound(lanes, queryHeads, layout);
 }
 
+bool PagedAttention::compiles(uint32_t queryHeads, kv::Layout layout, bool gated, uint32_t rotaryPairs) {
+  const CompiledAttention &compiled = compiledAttention(queryHeads, layout);
+  return compiled.gated == gated && compiled.rotaryPairs == rotaryPairs;
+}
+
 void PagedAttention::addPrefillProjection(
     metal::CommandGraph &graph, metal::MetalBuffer packed,
     const NormWeights &queryNorm, const NormWeights &keyNorm,
