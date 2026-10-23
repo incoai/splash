@@ -390,11 +390,12 @@ GGUF_SG_FUSED(4)
 #undef GGUF_SG_SEGMENT
 
 // MoE experts (ops/MoE.cpp): threadgroup (x, y) computes 64 columns of grouped 8-row tile y from its Table16 tile
-// (kernels/shared/moe.metal) with the weights of the tile's expert (moe_gguf_segment), in the format the tile picks
+// (kernels/shared/moe.metal) with the weights of the tile's expert (moe_gguf_segment) of a block whose shared expert
+// is Shared slices (each instance's slices suffix, ops::kCompiledMoeRoutings), in the format the tile picks
 // at run time: on the 40-core M3 Max one run-time-format kernel is within +1.6% of the per-format kernels
 // (23040x2048 Q4_K and 92160x512 Q5_K, one to four lanes). No K splits, so no partials or counters.
 // aux is the gate of the up pass. Grid (column tiles, expert tiles), GGUF_REGISTER_THREADS threads.
-template <GgufEpilogue Ep>
+template <GgufEpilogue Ep, uint Shared>
 inline void gguf_sg_expert(device const bfloat *table, device const float *sums, device const MoeTileDescriptor *tiles,
                            device const uint *tile_count, device uchar *w0, device uchar *w1, device uchar *meta,
                            device uchar *sw0, device uchar *sw1, device uchar *smeta, device bfloat *out,
@@ -402,7 +403,7 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
                            uint2 tg, uint tid, uint sg, uint lane, threadgroup bfloat2 *lut, threadgroup float2 *coefs,
                            threadgroup uint *arrival) {
   if (tg.y >= *tile_count) return;
-  const MoeGgufSegment s = moe_gguf_segment(tiles[tg.y].expert, p, slots, w0, w1, meta, sw0, sw1, smeta);
+  const MoeGgufSegment s = moe_gguf_segment<Shared>(tiles[tg.y].expert, p, slots, w0, w1, meta, sw0, sw1, smeta);
   const uint K = p.input_size, N = p.output_size;
   const ulong rows = ulong(tg.y) * 8;
   const GgufDecodeParams q{K, 1, N, 0, 0};
@@ -415,7 +416,7 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
         arrival);
   });
 }
-#define GGUF_SG_EXPERT(Name, EP)                                                                                    \
+#define GGUF_SG_EXPERT(Name, EP, Shared)                                                                            \
   kernel void Name(device const bfloat *table [[buffer(0)]], device const float *sums [[buffer(1)]],              \
                    device const MoeTileDescriptor *tiles [[buffer(2)]], device const uint *tile_count [[buffer(3)]], \
                    device uchar *w0 [[buffer(4)]], device uchar *w1 [[buffer(5)]], device uchar *meta [[buffer(6)]], \
@@ -428,9 +429,11 @@ inline void gguf_sg_expert(device const bfloat *table, device const float *sums,
     threadgroup bfloat2 lut[kQuantPairTableEntries];                                                                \
     threadgroup float2 coefs[gguf_sg::kCoefFloat2s];                                                                \
     threadgroup uint arrival;                                                                                       \
-    gguf_sg_expert<EP>(table, sums, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, out, aux, slots, p, tg, tid, sg, \
-                       lane, lut, coefs, &arrival);                                                                 \
+    gguf_sg_expert<EP, Shared>(table, sums, tiles, tile_count, w0, w1, meta, sw0, sw1, smeta, out, aux, slots, p, tg, \
+                               tid, sg, lane, lut, coefs, &arrival);                                                \
   }
-GGUF_SG_EXPERT(moe_expert_gguf_sg_a, EpNone)
-GGUF_SG_EXPERT(moe_expert_gguf_sg_g, EpUpWithGate)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_a, EpNone, 1)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_g, EpUpWithGate, 1)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_a_s2, EpNone, 2)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_g_s2, EpUpWithGate, 2)
 #undef GGUF_SG_EXPERT

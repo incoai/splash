@@ -97,14 +97,23 @@ public:
                 floatType(tensor->type) ? Conversion::None : Conversion::WidenToFloat32);
   }
 
-  // Quantized rows [N, K] repacked into planes, rows in `order`.
-  void quantized(const std::string &name, uint64_t rows, uint64_t columns, RowOrder order = {}) {
+  // Quantized rows [N, windows * K] repacked into planes, rows in `order`, as
+  // `windows` column windows of K inputs, window w's N rows after window
+  // w - 1's (TensorRows::windows).
+  void quantized(const std::string &name, uint64_t rows, uint64_t columns, RowOrder order = {},
+                 uint32_t windows = 1) {
     const GgufTensor *tensor = find(name, quantizedType);
     if (!tensor) return;
-    if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
+    if (tensor->rows() != rows || tensor->columns() != windows * columns)
+      throw GgufError("unexpected shape for " + name);
     const uint32_t format = imageFormat(tensor->type);
-    Repack repack = image_.planes(format, rows, columns, name);
-    repack.sources.push_back(tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], columns), order));
+    Repack repack = image_.planes(format, windows * rows, columns, name);
+    for (uint32_t window = 0; window < windows; ++window) {
+      TensorRows source = tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], windows * columns), order);
+      source.windows = windows;
+      source.window = window;
+      repack.sources.push_back(std::move(source));
+    }
     image_.repack(std::move(repack));
   }
 
@@ -164,6 +173,17 @@ public:
       }
     }
     expertTensor(prefix + "ffn_down_exps.weight", experts * hidden, width);
+  }
+
+  // A layer's shared expert of `slices` slices of `width`, which the grouped
+  // expert passes run as experts of their own (ops::MoeShape::sharedSlices,
+  // ops::BlockExpertProjection): gate and up of slices * width rows, slice s
+  // rows s * width on, and down's column windows of width inputs, window s's
+  // rows from image row s * hidden on.
+  void sharedExpert(const std::string &prefix, uint32_t slices, uint64_t width, uint64_t hidden) {
+    quantized(prefix + "ffn_gate_shexp.weight", slices * width, hidden);
+    quantized(prefix + "ffn_up_shexp.weight", slices * width, hidden);
+    quantized(prefix + "ffn_down_shexp.weight", hidden, width, {}, slices);
   }
 
   // beta (value heads rows) | alpha (value heads rows), rows in grouped head
@@ -392,9 +412,8 @@ void ffnImage(Builder &b, const QwenTargetDimensions &g, const std::string &p) {
     const uint64_t routed = g.experts, width = g.expertIntermediateSize;
     b.floatTensor(p + "ffn_gate_inp.weight", routed, g.hiddenSize);
     b.routedExperts(p, routed, width, g.hiddenSize);
-    b.quantized(p + "ffn_gate_shexp.weight", width, g.hiddenSize);
-    b.quantized(p + "ffn_up_shexp.weight", width, g.hiddenSize);
-    b.quantized(p + "ffn_down_shexp.weight", g.hiddenSize, width);
+    // A Qwen shared expert is one slice of the routed experts' width.
+    b.sharedExpert(p, 1, width, g.hiddenSize);
     b.floatRows(p + "ffn_gate_inp_shexp.weight", 1, g.hiddenSize, true);
   } else {
     b.quantized(p + "ffn_gate.weight", g.intermediateSize, g.hiddenSize);

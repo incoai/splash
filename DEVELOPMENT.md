@@ -2451,7 +2451,18 @@ form in `linear_gguf_sgmatrix.metal`, the staged one in `kernels/shared/moe_gguf
 Apple9 takes for experts mostly in the formats it stages (`MoeShape::expertFormat`) and for
 experts with an F16 weight (`MoeShape::registerFormats`). One `MoeShape` serves all of a model's
 MoE layers, so one F16 routed or shared expert tensor in any layer stages every layer's experts
-there. Their
+there. A block routes as one of the routings the kernels compile (`ops::kCompiledMoeRoutings`):
+its router weights a row's top k experts by the softmax of their scores (`MoeRouter::Softmax`,
+the Qwen families) or by each one's sigmoid over the sum of theirs (`SigmoidNormalized`, Flint),
+and every row also visits the `MoeShape::sharedSlices` slices of the shared expert, ids `experts`
+on, of the routed experts' width, each weighted by the sigmoid of the block's scalar gate
+(`sharedGate`) or by 1. A shared expert wider than the routed ones runs as such slices in the
+grouped passes: the planner keeps its gate and up rows and lays its down projection out as column
+windows (`gguf::TensorRows::windows`), so slice s's rows of each projection follow slice s - 1's
+(`moe_gguf_segment`). The select kernel names the routing's select suffix
+(`moe_route_select_f32_sigmoid_s2`), the grouping and expert passes its slices suffix
+(`moe_group_routes_s2`, `moe_expert_gguf_m8_a_s2`); the softmax router's one gated slice is the
+unsuffixed instances. Their
 passes launch the live tiles alone: the grouping kernel writes each pass's grid with the tile
 count, and the pass reads it as an indirect dispatch (`ComputeDispatch::indirectThreadgroups`).
 The staged tile runs gate and up in one pass, a gate and an up simdgroup on the same columns,
@@ -2507,7 +2518,8 @@ PrismML-Eng/llama.cpp 01ae597) in `gguf-reference`, and `gguf-planner` checks th
 plans; both run in `make test-engine-cpu`.
 `make test-engine-metal` runs `gguf-preparation`, which checks every format's planes, as the
 production executor and its `gguf_repack` kernel write them, bitwise against the reference,
-the alpha/beta, norm, convolution and router bytes they write and the golden images; then
+also as column windows, the alpha/beta, norm, convolution and router bytes they write and the
+golden images; then
 `gguf-dequant`, the staged tile's dequantizer, built with the production Metal flags, against
 the half rounding of every reference weight; `gguf-rotation`, `gguf_rotate` and the rotated
 PQ2_0 token gather bitwise against the fp32 butterflies and within one bf16 step of fp64;
@@ -2520,7 +2532,9 @@ split, and one lane on the staged 16-row tile bitwise against the 8-row tile; an
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
 plan, the staged 8- and 32-row tiles and the Apple9 register tile whatever GPU runs it, each in
 every format it takes as each routed and shared expert tensor, against fp64, and bitwise against
-the full grids and two gate/up passes. The goldens and how to regenerate them are
+the full grids and two gate/up passes; `gguf-moe-e512` runs it at Qwen3.8-Flash-Next's 512
+experts and `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated
+shared slices. The goldens and how to regenerate them are
 in `dev/tests/fixtures/weight-goldens/`; with `SPLASH_GGML_ORACLE=<libggml-base.dylib>`,
 `gguf-reference` also compares the reference with GGML directly and prints GGML's hashes.
 

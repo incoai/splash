@@ -65,17 +65,21 @@ void attention() {
 }
 
 // Expert ids, route rows and grouped routes are uint32, routing weights fp32
-// and activations bf16. The grouped input first holds the router's fp32
-// scores, one row of 256 per token. Every plan parks its gate in
-// expertOutput, so that field spans the wider of the hidden and intermediate
-// widths. Plans of the staged tiles hold no sums.
+// and activations bf16; a row routes its top k and each shared slice, which
+// fills one tile per tileRows rows. The grouped input first holds the
+// router's fp32 scores, one row of 256 per token. Every plan parks its gate
+// in expertOutput, so that field spans the wider of the hidden and
+// intermediate widths. Plans of the staged tiles hold no sums.
 void checkMoe(splash::ops::MoeWorkspace workspace,
               splash::ops::MoeShape shape, uint32_t rows, uint32_t tileRows) {
   using splash::model::kBFloat16Bytes;
   constexpr uint64_t kRouterScores = 256;
   const uint64_t outputWidth = std::max(shape.hiddenSize, shape.expertIntermediateSize);
-  const uint64_t routes = uint64_t{rows} * shape.routesPerToken();
-  const uint64_t tiles = splash::ops::moeMaximumTiles(rows, shape, tileRows);
+  const uint64_t routes = uint64_t{rows} * (shape.expertsPerToken + shape.sharedSlices);
+  const uint64_t routed = uint64_t{rows} * shape.expertsPerToken;
+  const uint64_t tiles = std::min(routed / tileRows + shape.experts, routed) +
+                         uint64_t{shape.sharedSlices} * ((rows + tileRows - 1) / tileRows);
+  require(tiles == splash::ops::moeMaximumTiles(rows, shape, tileRows), "MoE maximum tiles changed from baseline");
   const uint64_t grouped = tiles * tileRows;
   require(workspace.selectedExpertsBytes == routes * sizeof(uint32_t) &&
               workspace.routingWeightsBytes == routes * sizeof(float) &&
@@ -94,8 +98,15 @@ void checkMoe(splash::ops::MoeWorkspace workspace,
 
 void moe() {
   using namespace splash::ops;
-  for (const MoeShape shape : {MoeShape{256, 8, 2, 512},
-                               MoeShape{2048, 256, 8, 512}}) {
+  // Flint's: two ungated shared slices behind a sigmoid router.
+  constexpr MoeShape kSlices{.hiddenSize = 2048,
+                             .experts = 256,
+                             .expertsPerToken = 6,
+                             .expertIntermediateSize = 512,
+                             .router = MoeRouter::SigmoidNormalized,
+                             .sharedSlices = 2,
+                             .sharedGate = false};
+  for (const MoeShape shape : {MoeShape{256, 8, 2, 512}, MoeShape{2048, 256, 8, 512}, kSlices}) {
     for (uint32_t rows = 1; rows <= 2048; ++rows)
       checkMoe(MoE::prefillPlan(shape, rows, {MoeExpertTile::M32}).workspace(), shape, rows, 32);
     const auto single = MoE::decodePlan(shape, 1, {MoeExpertTile::M8}).workspace();
@@ -118,6 +129,11 @@ void moe() {
   }
   rejects([] { (void)MoE::prefillPlan({}, 1, {MoeExpertTile::M32}); },
           "invalid MoE workspace shape", "a MoE plan of an empty shape was sized");
+  // No kernel routes a softmax router's two shared slices.
+  MoeShape uncompiled = kSlices;
+  uncompiled.router = MoeRouter::Softmax;
+  rejects([&] { (void)MoE::prefillPlan(uncompiled, 1, {MoeExpertTile::M32}); }, "invalid MoE workspace shape",
+          "a MoE plan of a routing no kernel compiles was sized");
 }
 
 void sampling() {

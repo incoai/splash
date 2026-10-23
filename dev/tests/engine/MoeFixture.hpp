@@ -102,14 +102,16 @@ inline splash::metal::MetalBuffer bfloatBuffer(splash::metal::MetalBackend &back
   return upload(backend, bits.data(), bits.size() * 2, label);
 }
 
-// A block of `shape`: its router, shared expert scalar gate, routed experts'
-// and shared expert's gate, up and down, their weights with expert e in slot
-// e, and the formats of the six projections.
+// A block of `shape`: its router, shared expert scalar gate (none without
+// shape.sharedGate), routed experts' and shared expert's gate, up and down,
+// the shared expert's shape.sharedSlices slices in the order the kernels read
+// them (ops::BlockExpertProjection), their weights with expert e in slot e,
+// and the formats of the six projections.
 struct Model {
   splash::ops::MoeShape shape;
   Tensor router, sharedGate;
   std::array<Tensor, 3> routed;   // gate, up, down: experts * N rows
-  std::array<Tensor, 3> shared;
+  std::array<Tensor, 3> shared;   // sharedSlices * N rows
   splash::ops::BlockMoeWeights weights;
   std::array<gguf_reference::Fmt, 6> formats{};
 };
@@ -160,10 +162,10 @@ inline Model makeModel(splash::metal::MetalBackend &backend, const splash::ops::
     m.formats[4] = m.formats[3];
   }
   m.router = floating(backend, shape.experts, hidden, 0.05f);
-  m.sharedGate = floating(backend, 1, hidden, 0.05f);
+  if (shape.sharedGate) m.sharedGate = floating(backend, 1, hidden, 0.05f);
   for (int p = 0; p < 3; ++p) {
     m.routed[p] = quantized(backend, m.formats[p], shape.experts * n[p], k[p]);
-    m.shared[p] = quantized(backend, m.formats[3 + p], n[p], k[p]);
+    m.shared[p] = quantized(backend, m.formats[3 + p], shape.sharedSlices * n[p], k[p]);
   }
   splash::ops::BlockMoeWeights gguf;
   gguf.router = m.router.segment;
