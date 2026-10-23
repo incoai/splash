@@ -608,6 +608,102 @@ void testReservations(metal::MetalBackend &backend) {
           "a reservation that outlived its storage kept its buffers");
 }
 
+// A target without GDN layers (attention alone) keeps no GDN state: its
+// layout has no GDN dimensions, its cells no bytes, and a lane and a state
+// hold the draft's buffers alone. Every lane and state shares one empty cell,
+// which Metal allocates nothing for and the pool never holds, so no idle
+// cell is counted, a start lacks no cell a state could give and a reclaim
+// releases rings and windows. A state copies, writes, reads and restores
+// its window alone.
+void testAttentionOnlyTarget(metal::MetalBackend &backend) {
+  constexpr model::CompositeStateLayout layout{{}, kDraftState};
+  static_assert(layout.valid() && layout.target.cellBytes() == 0 &&
+                layout.laneBytes() == kDraftState.ringBytes() + kDraftState.windowBytes() &&
+                layout.cachedBytes() == kDraftState.windowBytes());
+  static_assert(model::GdnStateLayout{.format = ops::GdnStateFormat::BFloat16}.valid() &&
+                !model::GdnStateLayout{.convolutionHistory = 3}.valid() &&
+                !model::GdnStateLayout{48, 3, 10'240, 48, 128, 0}.valid());
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
+  uint32_t admissions = 0;
+  const metal::AllocationAdmission admit = [admit = governor.allocationAdmission(), &admissions](
+                                               uint64_t bytes, const std::function<void()> &allocate) {
+    ++admissions;
+    return admit(bytes, allocate);
+  };
+  const uint64_t slotBytes = model::SlotFile::slotBytesFor(layout.cachedBytes());
+  const uint64_t beforeStorage = backend.memoryStats().allocatedBytes;
+  {
+    model::QwenStateStorage storage(
+        backend, admit, layout,
+        std::make_shared<model::SlotFile>(slotBytes, std::make_shared<model::DiskBudget>(slotBytes)));
+    require(storage.actualAllocatedBytes() == 0 && storage.stagingBytes() == layout.cachedBytes(),
+            "an attention-only storage allocated a cell or stages more than a window");
+    require(static_cast<bool>(storage.tryActivateLane(0, 1)) && admissions == 1 &&
+                storage.actualAllocatedBytes() >= layout.laneBytes(),
+            "an attention-only lane did not take its rings and window in one admission");
+    const model::GdnParityBuffers &current = storage.current(0);
+    require(&current == &storage.next(0) && !current.stateBase && current.convolutionLayers.empty() &&
+                current.recurrentLayers.empty() && !current.auxiliary,
+            "an attention-only lane's cells are not the one empty cell");
+    storage.clearForColdStart(0);
+    fill(storage.window(0), 31);
+    const std::vector<uint8_t> window = bytesOf(storage.window(0));
+    storage.updateLengths(0, published(4096));
+    storage.swapParity(0);
+
+    // A state takes a window alone, and gives it back alone.
+    auto state = storage.snapshot(0);
+    require(state && state->bytes() == layout.cachedBytes() && admissions == 2,
+            "an attention-only state did not take a window alone");
+    require(static_cast<bool>(storage.tryActivateLane(1, 2)), "a second attention-only lane did not start");
+    fill(storage.window(1), 32);
+    bool committed = false;
+    require(!storage.beginRestore(1, *state, true, {}, [&] { committed = true; }) && committed &&
+                sameBytes(storage.window(1), window) && storage.metadata(1).lengths == published(4096),
+            "an attention-only state did not restore its window and lengths");
+    state.reset();
+    require(storage.idleCells() == 0 && storage.idleWindows() == 1 && storage.idleRings() == 0,
+            "a dropped attention-only state did not return its window alone");
+    const uint64_t pooled = storage.actualAllocatedBytes();
+    const uint32_t admitted = admissions;
+    metal::AllocationFailure refusal;
+    auto reservation = storage.reserve(refusal);
+    require(reservation && admissions == admitted && storage.idleWindows() == 0 &&
+                storage.actualAllocatedBytes() == pooled,
+            "an attention-only reservation did not take the pooled window alone");
+    storage.copyState(1, *reservation);
+    require(sameBytes(reservation->buffers().window->buffer(), window),
+            "an attention-only state's copy did not take the lane's window");
+    state = storage.seal(*reservation, published(4096));
+    reservation.reset();
+
+    // On disk a state is its window.
+    auto write = state->offload({});
+    require(write && finishWhenReady(*write) && write->state()->bytes() == layout.cachedBytes(),
+            "an attention-only state's disk write failed");
+    fill(storage.window(0), 33);
+    auto read = storage.beginRestore(0, *write->state(), true, {}, [] {});
+    require(read && finishWhenReady(*read) && sameBytes(storage.window(0), window),
+            "an attention-only state's disk copy did not restore its window");
+    read.reset();
+    write.reset();
+    state.reset();
+
+    // Released lanes leave rings and windows, and no cell, to reclaim.
+    storage.releaseLane(0, 1);
+    storage.releaseLane(1, 2);
+    require(storage.idleCells() == 0 && storage.idleRings() == 2 && storage.idleWindows() == 3 &&
+                storage.statesToActivate() == 0,
+            "released attention-only lanes pooled a cell or lost a buffer");
+    require(releaseAllIdle(storage, false) > 0 && storage.actualAllocatedBytes() == 0 &&
+                storage.idleRings() == 0 && storage.idleWindows() == 0,
+            "an attention-only pool kept buffers past reclaim");
+  }
+  require(backend.memoryStats().allocatedBytes == beforeStorage,
+          "an attention-only storage's buffers outlived it");
+}
+
 void run(const std::string &metallib) {
   using model::QwenCompositeState;
   using model::QwenLogicalLengths;
@@ -623,6 +719,7 @@ void run(const std::string &metallib) {
   testPersistentStateComesBack(backend);
   testPersistKeepsTheRamCopy(backend);
   testReservations(backend);
+  testAttentionOnlyTarget(backend);
   MemoryGovernor governor(
       backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
       queryHostMemory, 0);

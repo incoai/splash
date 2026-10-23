@@ -501,6 +501,13 @@ void testPersistentCacheNamespace() {
   // Factors that print alike to six digits still rotate keys differently.
   require(scaled(3.9999999) != scaled(4.0) && scaled(1.0000001) != scaled(1.0000004),
           "factors alike to six digits shared a cache namespace");
+  // A target without GDN layers stores nothing in the state format.
+  const RuntimeCacheIdentity dense = identity('a', "build", kv::Format::Int8);
+  model::CompositeStateLayout attentionOnly{{}, model.stateLayout.draft}, bfloatAttentionOnly = attentionOnly;
+  bfloatAttentionOnly.target.format = ops::GdnStateFormat::BFloat16;
+  require(persistentCacheNamespace(dense, attentionOnly) != name &&
+              persistentCacheNamespace(dense, attentionOnly) == persistentCacheNamespace(dense, bfloatAttentionOnly),
+          "a target without GDN layers shared a hybrid's namespace, or took another for its state format");
 }
 
 void testWeightBudgetBeforeLoading(const char *metallibPath) {

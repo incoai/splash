@@ -3534,6 +3534,9 @@ std::vector<uint8_t> RuntimeInstrumentation::pendingGdnRows(const Runtime &runti
   const Runtime::Impl::Request &entry = impl.requests.at(requestId);
   if (!entry.resident)
     throw std::logic_error("request is not resident");
+  // A target without GDN layers keeps no tape.
+  if (!impl.geometry.target.stateLayout.layers)
+    return {};
   const QwenLaneMetadata &metadata = impl.states.metadata(entry.stateLane);
   const ops::GdnShape shape = impl.geometry.target.gdnShape();
   const uint32_t kvWidth = (shape.keyHeads + shape.valueHeads) * shape.headDimension;

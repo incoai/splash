@@ -30,6 +30,9 @@ struct GdnParityBuffers final {
 [[nodiscard]] GdnParityBuffers gdnCellBuffers(metal::MetalBackend &backend, metal::MetalBuffer base,
                                               const GdnStateLayout &layout);
 
+// One GDN cell: one buffer of layout.cellBytes() and its views. A cell of no
+// bytes (a target without GDN layers or other state) has no buffer, views
+// or memory.
 class QwenGdnCell final {
 public:
   ~QwenGdnCell();
@@ -99,7 +102,8 @@ struct QwenCachedBuffers final {
 
 // Free buffers available for reuse: a lane takes two cells, the draft rings
 // and a context window, a cached state a cell and a window. Both return them
-// here; idle buffers are released only by reclaim.
+// here; idle buffers are released only by reclaim. The empty cell of cells
+// of no bytes (QwenStateStorage) is never pooled.
 struct QwenBufferPool final {
   std::vector<std::shared_ptr<QwenGdnCell>> cells;
   std::vector<std::shared_ptr<DFlashDraftRing>> rings;
@@ -107,11 +111,16 @@ struct QwenBufferPool final {
   // Cleared when the storage goes away; late returns then just free.
   bool open = true;
 
+  // Takes back a cell, unless it is the empty cell.
+  void giveCell(std::shared_ptr<QwenGdnCell> cell) {
+    if (cell->buffers().stateBase)
+      cells.push_back(std::move(cell));
+  }
   // Takes back the buffers of a cached state.
   void give(QwenCachedBuffers buffers) {
     if (!open)
       return;
-    cells.push_back(std::move(buffers.gdn));
+    giveCell(std::move(buffers.gdn));
     windows.push_back(std::move(buffers.window));
   }
 };
@@ -206,7 +215,9 @@ private:
   friend class QwenStateStorage;
 };
 
-// Live cells keep their buffers; only idle buffers may be reclaimed.
+// Live cells keep their buffers; only idle buffers may be reclaimed. Cells of
+// no bytes are all one empty cell (QwenGdnCell), which every lane and state
+// shares: it holds nothing to read or write, and nothing to pool or reclaim.
 class QwenStateStorage final {
 public:
   // The file, when given, holds one state per slot and shares the cache's
@@ -264,9 +275,10 @@ public:
   [[nodiscard]] uint32_t idleRings() const noexcept;
   [[nodiscard]] uint32_t idleWindows() const noexcept;
   // What activating a lane lacks in the idle pool, in cached states: each
-  // holds one GDN cell and one context window, a lane two cells, a window
-  // and the draft rings, which no cached state holds: without idle rings no
-  // number of states makes up the lack.
+  // holds one GDN cell and one context window, a lane two cells (none of the
+  // pool's when cells have no bytes), a window and the draft rings, which no
+  // cached state holds: without idle rings no number of states makes up the
+  // lack.
   [[nodiscard]] uint32_t statesToActivate() const noexcept;
 
   // Hot-path metadata operations; none performs a buffer copy. A step makes
@@ -375,6 +387,8 @@ private:
   std::array<Lane, ExecutionLimits::maximumBatchWidth> lanes_;
   std::shared_ptr<SlotFile> file_;
   std::shared_ptr<StateStaging> staging_;
+  // Every lane's and state's cell when cells have no bytes; null otherwise.
+  std::shared_ptr<QwenGdnCell> emptyCell_;
 };
 
 } // namespace splash::model

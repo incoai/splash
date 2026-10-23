@@ -3169,7 +3169,10 @@ GDN layer's dispatches stop there to store the state and go on from it, and
 the state's window is a copy of the lane's as the chunk finds it plus the
 chunk's rows before the boundary, since the chunk's later rows take the slots
 of the state's oldest rows in the lane's window. A state at the chunk's end is
-copied from the lane after it.
+copied from the lane after it. A target without GDN layers keeps no GDN state:
+its cells have no bytes, every lane and state shares one empty cell that holds
+no memory, so a lane holds the draft's rings and window and a cached state the
+window alone, and `state.idle_gdn_cells` stays 0.
 
 ### Disk tier
 
