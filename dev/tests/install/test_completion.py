@@ -314,6 +314,63 @@ class CompletionTests(unittest.TestCase):
                         [],
                     )
 
+    def test_bash_completes_local_model_paths_with_spaces(self):
+        _, directory = self.layout()
+        target = self.root / "local target.gguf"
+        target.touch()
+        for shell in bash_paths():
+            for flag in ("--model-dir", "--draft-model", "--mmproj"):
+                with self.subTest(shell=shell, flag=flag):
+                    self.assertEqual(
+                        self.bash_complete(
+                            shell,
+                            directory / "splash.bash",
+                            ["splash", "serve", flag, str(self.root / "local t")],
+                        ),
+                        [str(target)],
+                    )
+                    self.assertEqual(
+                        self.bash_complete(
+                            shell,
+                            directory / "splash.bash",
+                            [
+                                "splash",
+                                "serve",
+                                flag + "=" + str(self.root / "local t"),
+                            ],
+                            unbroken="=",
+                        ),
+                        [flag + "=" + str(target)],
+                    )
+
+    def test_zsh_completes_local_model_paths_with_spaces(self):
+        _, directory = self.layout()
+        (self.root / "local target.gguf").touch()
+        for flag in ("--model-dir", "--draft-model", "--mmproj"):
+            with self.subTest(flag=flag):
+                result = self.shell_tab(
+                    directory / "_splash", f"splash serve {flag} local\\ t"
+                )
+                self.assertEqual(
+                    shlex.split(result), ["splash", "serve", flag, "local target.gguf"]
+                )
+
+    @unittest.skipUnless(FISH, "fish is not installed")
+    def test_fish_completes_local_model_paths_with_spaces(self):
+        _, directory = self.layout()
+        target = self.root / "local target.gguf"
+        target.touch()
+        for flag in ("--model-dir", "--draft-model", "--mmproj"):
+            with self.subTest(flag=flag):
+                self.assertEqual(
+                    self.fish_complete(
+                        "source $argv[2]; complete -C $argv[1]",
+                        f"splash serve {flag} {shlex.quote(str(self.root / 'local t'))}",
+                        directory / "splash.fish",
+                    ),
+                    [str(target)],
+                )
+
     def test_bash_loaded_completion_survives_release_upgrade(self):
         for index, shell in enumerate(bash_paths()):
             with self.subTest(shell=shell):

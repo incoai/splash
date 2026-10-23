@@ -31,7 +31,10 @@ from __future__ import annotations
 
 import functools
 import os
+import signal
+import sys
 import tempfile
+from contextlib import redirect_stdout
 from pathlib import Path
 
 from . import hub, models, paths, upstream
@@ -252,3 +255,38 @@ def _draft(family, draft):
             f"{error}; download {family.draft_repo}, or pass the directory of a "
             f"{family.name} DFlash2 draft as draft"
         ) from None
+
+
+def _main(argv=None):
+    """The launcher's helper, run by Splash's Python after setup. Its stdout
+    is only prepare_local_model's result; preparation messages use stderr."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Prepare local Splash model files")
+    parser.add_argument("target")
+    parser.add_argument("--models", type=Path, default=paths.MODELS)
+    parser.add_argument("--draft-model")
+    parser.add_argument("--mmproj")
+    parser.add_argument("--language-only", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
+        with redirect_stdout(sys.stderr):
+            prepared = prepare_local_model(
+                args.target,
+                args.draft_model,
+                mmproj=args.mmproj,
+                language_only=args.language_only,
+                models_dir=args.models,
+            )
+        print(prepared)
+    except (ModelError, OSError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

@@ -14,6 +14,14 @@ _splash() {
     for word in "${words[@]:2:$(( CURRENT - 3 ))}"; do
         [[ $word == -- ]] && return 0
     done
+    if [[ $words[CURRENT-1] == (--model-dir|--draft-model|--mmproj) ]]; then
+        _files
+        return
+    elif [[ $words[CURRENT] == (--model-dir|--draft-model|--mmproj)=* ]]; then
+        compset -P '*='
+        _files
+        return
+    fi
     if [[ $words[CURRENT-1] == --model ]]; then
         :
     elif [[ $words[CURRENT] == --model=* ]]; then

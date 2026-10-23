@@ -90,6 +90,20 @@ Vision and the tokenizer come from the target model's source.
 [Model loading and compatibility](DEVELOPMENT.md#upstream-model-loading) ·
 [Supported formats](DEVELOPMENT.md#gguf-targets)
 
+To serve files already on this Mac, pass the target's GGUF file or GGUF/MLX
+directory directly, and a compatible local DFlash2 draft:
+
+```bash
+splash serve --model local/qwen \
+  --model-dir /models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
+  --draft-model /models/Qwen3.8-27B-DFlash2
+```
+
+This prepares local files without contacting the Hub; `--model` is the name
+reported by the API. Omit `--draft-model` to use the family's draft from the
+Hub cache, or add `--mmproj /models/mmproj-BF16.gguf` for a GGUF's vision.
+See [local model files](DEVELOPMENT.md#local-model-files) for details.
+
 ## Settings
 
 Memory and context are sized automatically, up to the model's native context

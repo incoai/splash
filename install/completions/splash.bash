@@ -6,7 +6,7 @@ esac
 
 _splash() {
     local cur prev prefix value_prefix= trim= repository variant source directory
-    local target model i
+    local target model i path_value=0
     COMPREPLY=()
     cur=${COMP_WORDS[COMP_CWORD]}
     prev=${COMP_WORDS[COMP_CWORD-1]}
@@ -18,6 +18,32 @@ _splash() {
     for ((i=2; i<COMP_CWORD; i++)); do
         [[ ${COMP_WORDS[i]} == -- ]] && return 0
     done
+    case $cur in
+        --model-dir=*|--draft-model=*|--mmproj=*)
+            path_value=1
+            prefix=${cur#*=}
+            [[ ${COMP_WORDBREAKS-} == *=* ]] || value_prefix=${cur%%=*}=
+            ;;
+        *)
+            case $prev in
+                --model-dir|--draft-model|--mmproj) prefix=$cur path_value=1 ;;
+                =)
+                    case ${COMP_WORDS[COMP_CWORD-2]} in
+                        --model-dir|--draft-model|--mmproj) prefix=$cur path_value=1 ;;
+                    esac
+                    ;;
+                *) prefix= ;;
+            esac
+            ;;
+    esac
+    if [[ $path_value == 1 ]]; then
+        while IFS= read -r target; do
+            COMPREPLY[${#COMPREPLY[@]}]=$value_prefix$target
+        done < <(compgen -f -- "$prefix")
+        # Readline quotes spaces; Bash 3.2 has no compopt, so ask for the
+        # same treatment with complete's filenames option below.
+        return 0
+    fi
     if [[ $cur == --model=* ]]; then
         prefix=${cur#--model=}
         [[ ${COMP_WORDBREAKS-} == *=* ]] || value_prefix=--model=
@@ -72,4 +98,4 @@ _splash() {
     done < <("$directory/models" "$prefix")
 }
 
-complete -F _splash splash
+complete -o filenames -F _splash splash

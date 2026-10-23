@@ -11,6 +11,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -97,7 +98,7 @@ def _request_json(path, timeout=2, *, port=serve_options.DEFAULT_PORT):
         return None
 
 
-def _ensure_installed(selection):
+def _ensure_runtime():
     if not paths.PACKAGED:
         # Serialize builds across ports; make keeps the lock if the launcher exits.
         with (RUNTIME_DIR / "build.lock").open("a+") as lock:
@@ -120,6 +121,10 @@ def _ensure_installed(selection):
         model_artifacts.run_engine(["device-check"], "device check")
     except model_artifacts.ModelError as error:
         raise LauncherError(str(error)) from None
+
+
+def _ensure_installed(selection):
+    _ensure_runtime()
     command = [
         str(paths.PYTHON),
         str(ROOT / "install/models.py"),
@@ -139,6 +144,40 @@ def _ensure_installed(selection):
         command.insert(-1, "--language-only")
     if _run_held(command, cwd=ROOT):
         raise LauncherError("model download or verification failed")
+
+
+def _prepare_local_model(args):
+    _ensure_runtime()
+    # Preparation needs Splash's dependencies, which the launcher's Python
+    # need not have. The helper prints only the public interface's result;
+    # progress and refusals go to the terminal on stderr.
+    command = [
+        str(paths.PYTHON),
+        "-P",
+        "-m",
+        "install.local",
+        "--models",
+        str(paths.MODELS),
+    ]
+    for flag, value in (("--draft-model", args.draft_model), ("--mmproj", args.mmproj)):
+        if value is not None:
+            command = [*command, flag, value]
+    if args.language_only:
+        command = [*command, "--language-only"]
+    command = [*command, "--", args.model_dir]
+    with tempfile.TemporaryFile(mode="w+") as result:
+        if _run_held(
+            command,
+            cwd=ROOT,
+            stdout=result,
+            env=dict(os.environ, PYTHONPATH=str(ROOT)),
+        ):
+            raise LauncherError("local model preparation failed; see the output above")
+        result.seek(0)
+        prepared = Path(result.read().strip())
+    if not prepared.is_absolute():
+        raise LauncherError("local model preparation returned no absolute directory")
+    return prepared
 
 
 def _serve_lock_owner(lock):
@@ -226,14 +265,18 @@ def serve(args):
             raise LauncherError(
                 f"cannot bind {args.host}:{args.port}: {error}"
             ) from None
-        selection = model_artifacts.Selection.of(
-            paths.MODELS,
-            args.model,
-            revision=args.revision,
-            language_only=args.language_only,
-            draft_model=args.draft_model,
-        )
-        _ensure_installed(selection)
+        if args.model_dir is not None:
+            model_dir = _prepare_local_model(args)
+        else:
+            selection = model_artifacts.Selection.of(
+                paths.MODELS,
+                args.model,
+                revision=args.revision,
+                language_only=args.language_only,
+                draft_model=args.draft_model,
+            )
+            _ensure_installed(selection)
+            model_dir = selection.link
         # The server package of this installation, from any working
         # directory: -P keeps the directory, which may hold a package of the
         # same name, off sys.path, and PYTHONPATH names the root. The server
@@ -246,7 +289,7 @@ def serve(args):
             "-P",
             "-m",
             "server.server",
-            str(selection.link),
+            str(model_dir),
             "--model",
             args.model,
             "--binary",
@@ -347,6 +390,12 @@ def _version():
     )
 
 
+def _local_path(value):
+    # Preserve a GGUF's filename symlink in a Hub snapshot: resolving the
+    # file itself would replace its .gguf name with a cache blob's digest.
+    return str(Path(value).expanduser().absolute())
+
+
 def parse_args(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     client_args = []
@@ -374,7 +423,7 @@ def parse_args(argv=None):
     server = commands.add_parser(
         "serve",
         help="run the local server; Ctrl+C stops it",
-        description="Load an upstream model, automatically select its DFlash2 draft, and serve in the foreground.",
+        description="Load an upstream or local model with its DFlash2 draft, and serve in the foreground.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
@@ -398,7 +447,20 @@ def parse_args(argv=None):
         type=serve_options.parse_model_id,
         required=True,
         metavar="OWNER/REPO[:VARIANT]",
-        help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. :UD-Q4_K_M)",
+        help="upstream Hugging Face model, with a GGUF variant after ':' (e.g. :UD-Q4_K_M); "
+        "with --model-dir, the ID reported by the API",
+    )
+    model.add_argument(
+        "--model-dir",
+        type=_local_path,
+        metavar="PATH",
+        help="prepare a local GGUF file or GGUF/MLX model directory without Hub access",
+    )
+    model.add_argument(
+        "--mmproj",
+        type=_local_path,
+        metavar="FILE",
+        help="local GGUF vision projector (requires --model-dir)",
     )
     model.add_argument(
         "--revision",
@@ -410,7 +472,7 @@ def parse_args(argv=None):
         type=model_artifacts.parse_draft_model,
         metavar="DRAFT",
         help="DFlash2 draft repository or local directory to use instead of the "
-        "automatically selected one",
+        "automatically selected one (a local directory with --model-dir)",
     )
     model.add_argument(
         "--language-only",
@@ -458,6 +520,17 @@ def parse_args(argv=None):
         except argparse.ArgumentTypeError as error:
             parser.error(f"SPLASH_PORT: {error}")
     if args.command == "serve":
+        if args.model_dir is not None:
+            if args.revision is not None:
+                parser.error("--revision cannot be used with --model-dir")
+            if args.draft_model is not None and not Path(args.draft_model).is_dir():
+                parser.error(
+                    "--draft-model must be a local DFlash2 draft directory with --model-dir"
+                )
+        elif args.mmproj is not None:
+            parser.error("--mmproj requires --model-dir")
+        if args.mmproj is not None and args.language_only:
+            parser.error("--mmproj cannot be used with --language-only")
         serve_options.check_serve_arguments(parser, args)
     if client_args and args.command == "serve":
         parser.error("arguments after -- are only supported for coding clients")

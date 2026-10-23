@@ -72,7 +72,8 @@ Zsh after `compinit`, or `install/completions/splash.fish` for fish.
 
 Completion suggests commands, the upstream models the README starts with and
 installed models, a GGUF's `OWNER/REPO:VARIANT` included, without network
-access.
+access. It also completes local paths for `--model-dir`, `--draft-model` and
+`--mmproj`.
 
 ## Server configuration
 
@@ -82,7 +83,9 @@ access.
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `--model` | Required | The upstream model, `OWNER/REPO`, or a GGUF's `OWNER/REPO:VARIANT`. See [upstream model loading](#upstream-model-loading). |
+| `--model` | Required | The upstream model, `OWNER/REPO`, or a GGUF's `OWNER/REPO:VARIANT`; with `--model-dir`, the name the API reports. See [upstream model loading](#upstream-model-loading). |
+| `--model-dir` | None | Prepare a local GGUF file or GGUF/MLX model directory without the Hub. See [local model files](#local-model-files). |
+| `--mmproj` | None | A local GGUF target's vision projector; requires `--model-dir`. |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
 | `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place; required for a family without a released draft. See [drafts](#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](#vision). |
@@ -2043,6 +2046,34 @@ startup; tokenizer files and the tokenizer object are unchanged. The probe's
 upstream fixtures are in `dev/tests/fixtures/chat_templates/`.
 
 ### Local model files
+
+`splash serve --model-dir PATH` prepares the target at `PATH` with
+`install.local.prepare_local_model` and starts the server on the directory it
+returns. `PATH` names a GGUF file, any part of a split GGUF, a directory
+holding one GGUF target, or an MLX model directory. It names the target
+directly, rather than a library to search by repository ID:
+
+```sh
+splash serve --model local/qwen \
+  --model-dir /models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_M.gguf \
+  --draft-model /models/Qwen3.8-27B-DFlash2 \
+  --mmproj /models/Qwen3.8-27B-GGUF/mmproj-BF16.gguf
+```
+
+`--model` remains required in `OWNER/REPO[:VARIANT]` form as the API's model
+name; it selects no files and makes no Hub request in this mode. Preparation
+never contacts the Hub, whether or not `--offline` is set. `--draft-model`
+must name a local compatible DFlash2 draft directory; without one, the
+family's released draft must already be in the Hub cache at the commit its
+default branch records, as `hf download REPO` leaves it. A missing draft is
+refused with its download instruction; it is never downloaded implicitly.
+
+`--mmproj` supplies a local BF16, F32 or F16 GGUF vision projector. Without
+one, a GGUF serves text only. An MLX target uses its own vision tower unless
+`--language-only` is set. `--revision` cannot be combined with `--model-dir`,
+and `--mmproj` requires `--model-dir` and cannot be combined with
+`--language-only`. Files are linked, and each start prepares them again under
+the same validation, publication and lifetime rules described below.
 
 An application that downloads models itself prepares them for the server
 with `install.local.prepare_local_model`, the installer's one public
