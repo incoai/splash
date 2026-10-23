@@ -1,0 +1,86 @@
+{
+  "fraction_scope": "independent groups; conversation counts may differ",
+  "groups": {
+    "test": 4,
+    "train": 8,
+    "validation": 4
+  },
+  "input_sha256": "8b08ef947cb2f6733b7b473fb707239807b85058fcd90e9f908edb6d46653eb4",
+  "seed": 42,
+  "splits": {
+    "test": {
+      "conversations": 4,
+      "identities": [
+        "13072739cbdf42f93aa0c9783c69d5387f2d41f1de799de479b623a3d5342735",
+        "51e66936e5ad540e61b6a685a9e2e3723951984dcf55ddfc8906dabe94b99fde",
+        "84aab756a3e36e4a449a1401ea91800e0609b1ede7e448ba887a0a815e596052",
+        "c1bb6b65f2215d5e0cd0a1cff665752588a8f912d9e6883a45e4f9f0c80df27a",
+        "cc53e394db0b27fc1ca0e0743a809bcdcfb75992c039e5b80f53ca9436b7bfea",
+        "cf0a040fec5e67b7b4bac9c35f22f7bdd103c1b39c7cbcbb02824f809e32dea3",
+        "d2e2d0c5e3880a770d17766f8ce02ea824b340393f8b0d8fa1b4fea34bdb9528",
+        "d9827e1928dec7159bd96faa59d13089a28db7bd592cb768e41c1117d9e6530e"
+      ],
+      "records": [
+        "e1726ee57fe855157231417ba58f91ddf0b65ebda6fff5514139b67e79f7be60",
+        "9f9f53ca86c702ab7bfd0090547a3b693e282d8b114f425c29696352c1d77466",
+        "f595da360d7bf5afedb1a23914b2989451758fbf94985c1655b78d195a8a62c0",
+        "c5344bff9c62b6cd326fdbcc8bac1935b2b3d6b3ecd55ded39aadccdcfc9b618"
+      ],
+      "sha256": "e423e058ac176fa851048b6a627b421ccbaaa14e7fcc01389dcada334fff3692"
+    },
+    "train": {
+      "conversations": 8,
+      "identities": [
+        "014b90662e7a1ce2837c98f4133bf67ba0aeb51a97075b82e65c58583c2dc150",
+        "245446b048ba159c981086c1964326aab1b9e1c1c2361759baa61a489a4e6cd3",
+        "2c92d9cfe301ddf34657185467a95157cc93e796e3056aa84cba9d9aee3fe026",
+        "4ae570eade3809c4ce4d03ffdfb02c7018ae9e2e7f45f6cd4cd0b5b5cc9e739b",
+        "68af3315cf204da780f9ba66fcb8567bfcdf7073411730adae40e2da5a8e8577",
+        "7228fab6d0e29102896f48b62336ea93206649496c1c7c26dd96b766676d2b06",
+        "9ff0e9ab6a1028d3e0119e21c92016fb070310b9db18deb892545cfd609e2764",
+        "a7541bb6c82e5e6cb25f6a3db77f64bbee4c8435257295a7567c30c764802940",
+        "ac87f03169dea0fcc322a20e2642dd05c8770dc9906ee6ad93c34929b5664c4b",
+        "ae708695fb809e105c89e45a47224d07a76bb9a9a8a00f8d88318212e9b68e82",
+        "c86da3ba6960b61aec40a1b72b263d2ce78e9859f032d63638155aa2c1c03dbb",
+        "d16cfcd17e92143e5c1d278267e6ae623187e3efa21db456e91bc6c080f86376",
+        "d8808799e6dc3547479f7c8c0df006ff629c551bb8e3731dd13173fdeb0067e3",
+        "e4df5e4c17962fc2d2b68d597936f0349966ee7edc0f3bb212b998d065ab3703",
+        "e5d0896246fe4df668b7b4423ddebac8daac3dfb45a7303eea1d3b01da2da075",
+        "ef35974cc83daba8c12fcd61f868dafdc9c7708d2c200605059a9b4ec2f02c40"
+      ],
+      "records": [
+        "55e8e145059c23e5f567af7433545f274f4d6d5ed40cecdbf7bab6e23a6f241d",
+        "36f342cac469c9930b10c1ccd5cff4ae38ebac80dd0f5e935db8ba6ca33a44fc",
+        "a8f9c2fe104051880a7b064bff6786c17296da9f4b66d8f11d329f582c465792",
+        "c59b6ccd1645915bef4dbee3647fcbf7dd4f6b9122785c9f577b38ed9f618b17",
+        "5da3de2e50eb9be91bf8468d08d553dd79f022bb45924897797f81695d224fee",
+        "feeb5a72164d5326af4f116ac0521c5c50eb65f3142e9b65745cdf613e6e884c",
+        "395e151a84876d959a4e427992bc743b8a97c0b5766eb6eb39e51c80c2d1a69b",
+        "23dcf4f20b8b42d4e3c4c26acdcf353a66b50034cc737a5eef92bab4cc9a2e6d"
+      ],
+      "sha256": "1fe70c5286d7ae4bd541e8e74d2cd8c23ba9f0503b9301c845d31001ebbfe690"
+    },
+    "validation": {
+      "conversations": 4,
+      "identities": [
+        "1ba7b79d74c95fda284a8e6fd8dc5b7dbdd1c8ed0f8a6253f8a8f08fc1bcd417",
+        "347e9b0cc1b636d143dccafb3094a8afc5e75272070773cec3c1f1ce6350783d",
+        "6ff53c1f3fe5e06c4047799d06fd36b80981859bd69bc72d23144a93ce238ae7",
+        "87a4fe5596016bb466a21666cffabf87c8aba9465558846e81df9c354a94474f",
+        "8c1d08c33d76389cb16a3801476f843250ed350c52bbf8dc3223dfffc1d54e6c",
+        "9d44464a6c20f9e0bf4680f23879c02b91cc06bd95878d14f47a1c742eab904a",
+        "b212da8752b27f8c38bf4ff7fb0a5fdf48d092642ddc792141f0e1b200288878",
+        "fdc7f5245659eb135f2727ef5de708632ee30df1e21e1ff4f1b12713f45fc07d"
+      ],
+      "records": [
+        "8fbc27c00198d03acc7e9c45a363f6ea905abe11538dd197ddf19b7e318a277e",
+        "5cd1bcb731270ef468e1df69fffea554a5e73c804f6ad3fe21133b48e7885fd5",
+        "247ed98643dcc2cfb419d535caa396441e5f088d35dbd3e4acb24c4f34293062",
+        "4a40a4959e5cca5f1a4d7982728759e868d25c642a7567a430beff0251a44884"
+      ],
+      "sha256": "07b1054f6b647d46add9db28bc7f51d66177f7476bb5a9ca96406bad60d52f23"
+    }
+  },
+  "test_fraction": 0.25,
+  "validation_fraction": 0.25
+}

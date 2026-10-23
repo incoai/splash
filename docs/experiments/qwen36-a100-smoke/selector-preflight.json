@@ -1,0 +1,13 @@
+{
+  "mode": "device-preflight",
+  "capture_peak_cuda_bytes": 70716582912,
+  "metrics": {
+    "unary_ce": 2.789533887590681,
+    "selector_ce": 1.5359093802315849,
+    "tokens": 7,
+    "covered": 6,
+    "selector_correct": 4
+  },
+  "examples_checked": 1,
+  "training_peak_cuda_bytes": 5464703488
+}

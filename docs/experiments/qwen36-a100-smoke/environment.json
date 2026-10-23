@@ -1,0 +1,6 @@
+{
+  "python": "3.12.3",
+  "gpu": "NVIDIA A100-SXM4-80GB, 81920 MiB, 595.91.07",
+  "source_commit": "1aae5d5dcb45805aad63915de54e845dd6be7c37",
+  "source_working_tree": ""
+}

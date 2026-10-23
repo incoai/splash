@@ -1,0 +1,173 @@
+{
+  "criterion": "maximum validation mean_matching_proposals among trained checkpoints; earliest step wins ties; released baseline reported separately",
+  "deployment_validation": "pending: BF16 teacher and native quantized target are distinct artifacts",
+  "execution": {
+    "attention": "sdpa",
+    "cuda_version": "13.0",
+    "device": "cuda",
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "forward_precision": "BF16 autocast; FP32 rotary frequencies",
+    "optimizer_precision": "FP32 trainable masters and Adam moments",
+    "torch_threads": 8
+  },
+  "export_identity": {
+    "config.json": "016202877100d168a93f12f8c043cf1a161cb793b20ceee50a32f0931644cc89",
+    "model-00001.safetensors": "392424afc8b058f7c9b0fb3720c6fe26144064751e7ebb920c4253a748ac3927",
+    "model-00002.safetensors": "ae28062d0e9fd99060edd2f2b5ad5a36e7cffbaad7eb1cd468539c2c9f262c0f",
+    "model.safetensors.index.json": "a93eaa8256fbcecd195c541bd5d8f6b2ce480a98c81043769e68b1cae866a1f1",
+    "training-provenance.json": "52d8f959510a343bd99bdd29bd43e2b71a4cb77fca693a41b417eb16d447073f"
+  },
+  "family": "Qwen3.6-35B-A3B",
+  "implementation": {
+    "__init__.py": "866dd15abc8a72daeb132ee1de2d121f44e6c5adfdc8ef463a8630e3ec2ff456",
+    "__main__.py": "6519b0f1e58441e6c0925b222be15cab2f308cf05a1a6a562015ac7accf8dfb5",
+    "capture.py": "ea4180f9f2441ff48ac95fa0a36d4916265de0b9f4ed9cfc8f4136cc8019b390",
+    "check_data.py": "916aa470ddb0cb6d439f493424f9d62dc8d244612957880192720131fb5b6983",
+    "config.py": "ee2ae47001f1127f215f6879eb1a0cb0492bf5de75834c2aa3a26eeec21b45af",
+    "data.py": "2e43b57878fa6f9807662954e750305d222f28b5f0420b1b13dacc035bf7e581",
+    "evaluate.py": "5514126963dd029378d164c46b8c6bc070147b4a15811c23a737746348fe7b11",
+    "export.py": "e31e71b95f91739e66257731b91596ebab591eb7544a0364f10e2c866e0a379b",
+    "families.py": "2e5b5eb9fc936822cc680761ca989843c931f44066604c17f0e2500de269e8d2",
+    "losses.py": "328fd3a73ffafd2cad09b54ca630358b18dc6745c18e0cd17d1dc567d595d84f",
+    "model.py": "7239cebc74d8bdc8aeebebbdb7abf3dfd5af68f97862c415ab6475150ee85372",
+    "prepare.py": "233bb4ae6738c191eee241a48f95b81c10ab44e615d7a97a98a28f9c04f2345e",
+    "trainer.py": "628644aa8895026ca0fa1b24ecc20281d686850418c8413841e1963b101394c2"
+  },
+  "initial_draft_identity": {
+    "config.json": "86d2e8e57e7c70bb867240708d00c0535ae9ed3c828dbdcb21584471c7bbce59",
+    "model.safetensors": "d1f16c0ff85afbe6166fabfae998af3ec16fa11da87da4391b5e0e0a7c796a4d"
+  },
+  "native_validation": "not run",
+  "recipe": {
+    "batch_size": 1,
+    "checkpoint_interval": 10,
+    "enable_thinking": false,
+    "gradient_accumulation": 4,
+    "learning_rate": 1e-05,
+    "max_grad_norm": 1.0,
+    "max_new_tokens": 128,
+    "max_steps": 20,
+    "max_validation_blocks": 8,
+    "reasoning_effort": "medium",
+    "seed": 42,
+    "selector_loss_weight": 1.0,
+    "selector_warmup_steps": 10,
+    "sequence_length": 2048,
+    "trainable": "all",
+    "validation_interval": 10,
+    "vocabulary_chunk_rows": 1,
+    "weight_decay": 0.01
+  },
+  "reference_revision": "07ebd93db9f472af339b644bb70221ad8428328a",
+  "selected_checkpoint": "step-00000010",
+  "splash_contract": {
+    "runtime/metal/abi/DraftAttention.h": "d92fcbab6aad962803a043a134ae7ee7c817692c60cce991e37a6c33ae820c6c",
+    "runtime/metal/abi/ExecutionGeometry.h": "545fe4c85c0989b5e087cb6c5a96e12aaace9447afe04c7662a496cd7fad12c0",
+    "runtime/model/DraftCheckpoint.cpp": "2e8f8b8ac0272fcd3ca6a0ee8b9db3d5b8024f571bdebf761e2e29caf0c9ea50",
+    "runtime/model/ModelDescriptor.mm": "5f40726d6e84cdbe303a09b78d96a30df5ba28b76e6079d8dd07726332c19850",
+    "runtime/model/Qwen3_6Moe.hpp": "fc670e0b91de72eb711135ffe717fcd381084861e4d4b1bcbbc659c1e3b50eb8"
+  },
+  "status": "experimental",
+  "supervision": "target-generated",
+  "teacher_identity": {
+    "chat_template.jinja": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
+    "config.json": "93a4693fa9d8392fbfccd4b3c9873f4bfdcb14fdede978b123d07d19675efe99",
+    "configuration.json": "c1b09db419119513247e9b8b912c4b9897106c9b20c6cada7e107d993c5435eb",
+    "generation_config.json": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e",
+    "model-00001-of-00026.safetensors": "adee7bcb930aed22e0677e58d4873b48dadb1ed8001cb5c6a0487286eadb3478",
+    "model-00002-of-00026.safetensors": "88f2dfd2b9e73e4b70be533dbf61bcfa3c9a0003758900fcbc9d9b96f5751d4b",
+    "model-00003-of-00026.safetensors": "8f7d72178d3f4431864978e5bcfa4c6cb1c204bc00590644d90bb19d6d522eeb",
+    "model-00004-of-00026.safetensors": "12d7db38689ba3c8af74b23ef8523eca41e0cd95db870583d0663a3ee8a6bd60",
+    "model-00005-of-00026.safetensors": "a836047305d0f7a7b50f0815d09d5c03ec03d59ec2c763fcdc4bf7e9936bf902",
+    "model-00006-of-00026.safetensors": "c9080d718e9c5f9e337443225aa417d4c24d00ae7995d76ee3f1cc296b557d15",
+    "model-00007-of-00026.safetensors": "e8c05e23131b1dd45a455ec38cfac7db14667358268623c3938d00cf3e959a68",
+    "model-00008-of-00026.safetensors": "4b6a6d495053089f4a80e7cbc82e848fba44e2c0c60122233d8fdff79fa7b296",
+    "model-00009-of-00026.safetensors": "a31a954bb72d1c714e751bf0aabf2ff533f5a509693ebf7dd22ad6e90be46f67",
+    "model-00010-of-00026.safetensors": "246560e66570fe746653b8443e245dc334c9b8b831ea43d2d9f1b7d98623994e",
+    "model-00011-of-00026.safetensors": "7180392817fe3ecb3a27a1da43b7ff22c1a94806bac49975f9f122c3126df675",
+    "model-00012-of-00026.safetensors": "043fb525f6625c2f2acb75e65a9959ee3fa7b6e3fdd2034b5cfe1859b01d3cfb",
+    "model-00013-of-00026.safetensors": "33a20fb20a21379bf43c84a43105f9c0cc35bd50d740b1c302dcbe4b700f5425",
+    "model-00014-of-00026.safetensors": "be823e33c5cb6120ad3769d081f34a2449dc2358041fca7c29d636c1ba19130d",
+    "model-00015-of-00026.safetensors": "a89d547c6f9d0b535ee5ea2f2478f163089539f3f0dd330cb23d278a19d76123",
+    "model-00016-of-00026.safetensors": "69fc3ae0316482288afdcdd0b9eb7d626703ae26f7567e89aa3fc8d1ffd4ff5b",
+    "model-00017-of-00026.safetensors": "e356e3943cf3852b76bb8992e674f3256013e27d54b78e8250514151cdc29637",
+    "model-00018-of-00026.safetensors": "9e5e63fd1cc7d6848330c1fa363dfcb661bbc2ac87e672d0e28b71c9cb7f3c7f",
+    "model-00019-of-00026.safetensors": "708644ad34f1de727bf484f396944d8ec628645d52c183e9a992e65671685e21",
+    "model-00020-of-00026.safetensors": "ca083a1d1aa64f8e8a785998f543a43374f13436dc85d396eee4e72c7a84e1ae",
+    "model-00021-of-00026.safetensors": "ada4ae48f3d48fe01b4c53f2f82bce25e798a9631fd33959c881156fef2ccbce",
+    "model-00022-of-00026.safetensors": "def207fb42d7db31efb512755557763c23233c6e4d4c433027cb5102a7bce2f7",
+    "model-00023-of-00026.safetensors": "864d52ca7768a36f514069222e8de8626264ae124097ba8fcce5b5da2c6e2ed7",
+    "model-00024-of-00026.safetensors": "391acd27420cdce5935ff18152423c70620d19dac3c39a5ef1a81d369f82d737",
+    "model-00025-of-00026.safetensors": "778e7f76602f05042b69ba7f3ec91f1fdffef390540b16074041c258fb81d154",
+    "model-00026-of-00026.safetensors": "1a97404220077ed3d4182e10385b152004cab608377f50cec9f54a6b8d28b613",
+    "model.safetensors.index.json": "41b9356101ebf8e7519e150dc811f80c4226e727301fbb032b890f006ed0be83",
+    "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+    "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+    "tokenizer_config.json": "5186f0defcd7f232382c7f0aebcd2252d073bb921ab240e407b7ae8745d2b29b",
+    "video_preprocessor_config.json": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+    "vocab.json": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+  },
+  "training_split": {
+    "conversations": 8,
+    "identities": [
+      "014b90662e7a1ce2837c98f4133bf67ba0aeb51a97075b82e65c58583c2dc150",
+      "245446b048ba159c981086c1964326aab1b9e1c1c2361759baa61a489a4e6cd3",
+      "2c92d9cfe301ddf34657185467a95157cc93e796e3056aa84cba9d9aee3fe026",
+      "4ae570eade3809c4ce4d03ffdfb02c7018ae9e2e7f45f6cd4cd0b5b5cc9e739b",
+      "68af3315cf204da780f9ba66fcb8567bfcdf7073411730adae40e2da5a8e8577",
+      "7228fab6d0e29102896f48b62336ea93206649496c1c7c26dd96b766676d2b06",
+      "9ff0e9ab6a1028d3e0119e21c92016fb070310b9db18deb892545cfd609e2764",
+      "a7541bb6c82e5e6cb25f6a3db77f64bbee4c8435257295a7567c30c764802940",
+      "ac87f03169dea0fcc322a20e2642dd05c8770dc9906ee6ad93c34929b5664c4b",
+      "ae708695fb809e105c89e45a47224d07a76bb9a9a8a00f8d88318212e9b68e82",
+      "c86da3ba6960b61aec40a1b72b263d2ce78e9859f032d63638155aa2c1c03dbb",
+      "d16cfcd17e92143e5c1d278267e6ae623187e3efa21db456e91bc6c080f86376",
+      "d8808799e6dc3547479f7c8c0df006ff629c551bb8e3731dd13173fdeb0067e3",
+      "e4df5e4c17962fc2d2b68d597936f0349966ee7edc0f3bb212b998d065ab3703",
+      "e5d0896246fe4df668b7b4423ddebac8daac3dfb45a7303eea1d3b01da2da075",
+      "ef35974cc83daba8c12fcd61f868dafdc9c7708d2c200605059a9b4ec2f02c40"
+    ],
+    "records": [
+      "55e8e145059c23e5f567af7433545f274f4d6d5ed40cecdbf7bab6e23a6f241d",
+      "36f342cac469c9930b10c1ccd5cff4ae38ebac80dd0f5e935db8ba6ca33a44fc",
+      "a8f9c2fe104051880a7b064bff6786c17296da9f4b66d8f11d329f582c465792",
+      "c59b6ccd1645915bef4dbee3647fcbf7dd4f6b9122785c9f577b38ed9f618b17",
+      "5da3de2e50eb9be91bf8468d08d553dd79f022bb45924897797f81695d224fee",
+      "feeb5a72164d5326af4f116ac0521c5c50eb65f3142e9b65745cdf613e6e884c",
+      "395e151a84876d959a4e427992bc743b8a97c0b5766eb6eb39e51c80c2d1a69b",
+      "23dcf4f20b8b42d4e3c4c26acdcf353a66b50034cc737a5eef92bab4cc9a2e6d"
+    ],
+    "sha256": "1fe70c5286d7ae4bd541e8e74d2cd8c23ba9f0503b9301c845d31001ebbfe690"
+  },
+  "validation_comparison": {
+    "baseline_mean_matching_proposals": 3.5,
+    "delta_mean_matching_proposals": 0.25,
+    "outcome": "improved",
+    "selected_mean_matching_proposals": 3.75
+  },
+  "validation_split": {
+    "conversations": 4,
+    "identities": [
+      "1ba7b79d74c95fda284a8e6fd8dc5b7dbdd1c8ed0f8a6253f8a8f08fc1bcd417",
+      "347e9b0cc1b636d143dccafb3094a8afc5e75272070773cec3c1f1ce6350783d",
+      "6ff53c1f3fe5e06c4047799d06fd36b80981859bd69bc72d23144a93ce238ae7",
+      "87a4fe5596016bb466a21666cffabf87c8aba9465558846e81df9c354a94474f",
+      "8c1d08c33d76389cb16a3801476f843250ed350c52bbf8dc3223dfffc1d54e6c",
+      "9d44464a6c20f9e0bf4680f23879c02b91cc06bd95878d14f47a1c742eab904a",
+      "b212da8752b27f8c38bf4ff7fb0a5fdf48d092642ddc792141f0e1b200288878",
+      "fdc7f5245659eb135f2727ef5de708632ee30df1e21e1ff4f1b12713f45fc07d"
+    ],
+    "records": [
+      "8fbc27c00198d03acc7e9c45a363f6ea905abe11538dd197ddf19b7e318a277e",
+      "5cd1bcb731270ef468e1df69fffea554a5e73c804f6ad3fe21133b48e7885fd5",
+      "247ed98643dcc2cfb419d535caa396441e5f088d35dbd3e4acb24c4f34293062",
+      "4a40a4959e5cca5f1a4d7982728759e868d25c642a7567a430beff0251a44884"
+    ],
+    "sha256": "07b1054f6b647d46add9db28bc7f51d66177f7476bb5a9ca96406bad60d52f23"
+  },
+  "versions": {
+    "safetensors": "0.8.0",
+    "torch": "2.13.0",
+    "transformers": "5.15.1"
+  }
+}

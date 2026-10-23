@@ -1,0 +1,7 @@
+{
+  "config.json": "016202877100d168a93f12f8c043cf1a161cb793b20ceee50a32f0931644cc89",
+  "model-00001.safetensors": "392424afc8b058f7c9b0fb3720c6fe26144064751e7ebb920c4253a748ac3927",
+  "model-00002.safetensors": "ae28062d0e9fd99060edd2f2b5ad5a36e7cffbaad7eb1cd468539c2c9f262c0f",
+  "model.safetensors.index.json": "a93eaa8256fbcecd195c541bd5d8f6b2ce480a98c81043769e68b1cae866a1f1",
+  "training-provenance.json": "04d1aaba5b86276f6739b8bb9d4cf6a659b0a8e0932667a71b32d1f0e22426a5"
+}
