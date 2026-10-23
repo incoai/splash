@@ -209,6 +209,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.expertMemory = arguments.expertMemory;
   config.resources.sparseKvMemory = arguments.sparseKvMemory;
   config.resources.kvSpillAlways = arguments.kvSpillAlways;
+  config.resources.kvWindowTrim = arguments.kvWindowTrim;
   config.resources.verifyRows = arguments.verifyRows;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;

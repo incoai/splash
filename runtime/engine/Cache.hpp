@@ -155,6 +155,22 @@ struct KvSpillSnapshot final {
   uint64_t revokedCommitments = 0;
 };
 
+// What a cache of a windowed layout holds and did (/status kv.window): the
+// pages each request's window and each state's tail keep Full, whether
+// pages below every window give up their windowed layers' K/V
+// (CacheWindowPolicy::trim), the blocks a state's tail pins, and the pages
+// trimmed, the blocks that took the page of a writer that computed them
+// again (KvCache::upgrades) and the states refused a tail that was not
+// Full.
+struct KvWindowSnapshot final {
+  uint32_t windowPages = 0;
+  bool trim = false;
+  uint32_t pinnedBlocks = 0;
+  uint64_t trimmedPages = 0;
+  uint64_t upgrades = 0;
+  uint64_t refusedStates = 0;
+};
+
 struct CacheSnapshot final {
   KvPoolSnapshot pool;
   StateCacheSnapshot stateCache;
@@ -167,6 +183,8 @@ struct CacheSnapshot final {
   // A persistent tier, and what the start took back from it.
   bool persistent = false;
   CacheAdoption adoption;
+  // A windowed layout's; none for another.
+  std::optional<KvWindowSnapshot> window;
 };
 
 enum class TokenAdmissionFailure : uint8_t {
@@ -217,6 +235,19 @@ struct PageTableState final {
 struct CacheSpillPolicy final {
   uint32_t densePages = 0;
   uint32_t windowPages = 0;
+};
+
+// What the cache of a layout with a sliding window (kv::Layout::windowTokens)
+// keeps Full: the windowPages pages (kv::Layout::windowPages) before each
+// request's next row, which its windowed layers read, and the tail of each
+// state, the windowPages blocks that end at its block, which a request that
+// resumes there reads. Every other page gives up its windowed layers' K/V
+// (Cache::trimWindows) unless trim is off, which changes no byte a kernel
+// reads and only takes more memory: a run with it off computes what one
+// with it on does, to the bit.
+struct CacheWindowPolicy final {
+  uint32_t windowPages = 0;
+  bool trim = true;
 };
 
 // Whether a request may start to spill now, or what holds it back: the KV
@@ -309,15 +340,16 @@ public:
   // the states' file can run on it without the tier. A persistent KV tier
   // makes the cache persistent: its copies are labelled for the next
   // process, and the quota keeps whole restore points by the recency of
-  // their states (dropOldestPoint). The labels of a windowed layout's
-  // copies (windowedKv, kv::Layout::windowedLayers) name their page's form
-  // too (KvSlotLabel).
+  // their states (dropOldestPoint). A windowed layout's cache keeps what its
+  // window policy says Full (CacheWindowPolicy), and the labels of its
+  // copies name their page's form too (KvSlotLabel).
   // With a spill policy, on a layout that can spill (kv::Layout::spillable)
   // and with a tier, requests may spill (KvMode::Spill), and the blocks
   // requests hold keep their copies (KvCache::holdPage); without one, quota
   // treats copies as it always has.
   Cache(KvPool &pool, KvTier *kvTier, std::shared_ptr<model::DiskBudget> diskBudget,
-        std::optional<CacheSpillPolicy> spill = std::nullopt, bool windowedKv = false);
+        std::optional<CacheSpillPolicy> spill = std::nullopt,
+        std::optional<CacheWindowPolicy> window = std::nullopt);
   Cache(const Cache &) = delete;
   Cache &operator=(const Cache &) = delete;
 
@@ -325,9 +357,11 @@ public:
   // Before the first request, takes back the restore points an earlier
   // process left in a persistent tier: each state whose block's chain is
   // whole, and that chain. Everything else stays behind, and once the files
-  // finish adoption its slots are free. Then copies go while the disk limit
-  // is exceeded, as keepDiskLimit() gives them up. Ids and recency continue
-  // after those taken back.
+  // finish adoption its slots are free. A windowed layout's copies come
+  // back as the form their labels name, a Full or a Slim page's, and a
+  // state only with a tail of Full copies (stateTailFull). Then copies go
+  // while the disk limit is exceeded, as keepDiskLimit() gives them up. Ids
+  // and recency continue after those taken back.
   [[nodiscard]] CacheAdoption adopt(std::vector<PersistedKv> blocks,
                                     std::vector<PersistedState> states);
   // One step of making the restore point at this block durable in a
@@ -440,6 +474,18 @@ public:
   // Pages of the form that transfers in flight will free: demotions, and
   // for Full the eligible write-throughs that an Index page will take.
   [[nodiscard]] uint32_t pendingPages(kv::PageForm form) const noexcept;
+  // Between commands, with a window: moves to the Slim form every Full page
+  // no row will read whole again: every request that holds it has
+  // published windowPages blocks past it (its next command's rows, at or
+  // past its published blocks, reach no key on it), no state's tail holds
+  // it and no transfer moves it; cached pages no request holds go too, and
+  // the pages requests keep beside their blocks, a writer's own or one a
+  // block left for a writer's (KvCache::insert). Free Slim pages take them
+  // first, the runway's among them, then with `allocate` the extents of the
+  // form it allocates, and the runway refills; a refusal leaves the rest
+  // Full, which costs only memory, for the next pass. Returns the pages
+  // moved; none with trim off.
+  uint32_t trimWindows(bool allocate = true);
   [[nodiscard]] bool holdsIndexPages(uint64_t requestId) const;
   // The block's copy could not be read (ModelStepResult::unreadableKvBlocks):
   // it matches nothing any more, and its copy goes with the block.
@@ -493,7 +539,9 @@ public:
   // command: every change since the last cut makes one new revision, which
   // differs from the last from the first page any of them changed, with its
   // sources cut from there. A command reads only a cut list: another change
-  // before the next cut stays in the same revision.
+  // before the next cut stays in the same revision. With a window, every
+  // page from the window before the request's published blocks on is Full,
+  // or std::logic_error: what its rows' windows read holds every layer.
   [[nodiscard]] PageTableView cutPageTable(uint64_t requestId);
 
   // Canonicalizes every newly complete Page32 block. A block whose parent,
@@ -512,6 +560,8 @@ public:
   // Reuses the state at this block in either tier, as reuseCompositeState()
   // does a RAM copy.
   [[nodiscard]] bool reuseStoredState(uint64_t kvBlock, bool checkpoint = false);
+  // A windowed layout's state needs its tail Full (stateTailFull), or the
+  // publication is a std::logic_error.
   void publishCompositeState(uint64_t kvBlock,
                              std::shared_ptr<const CompositeState> state,
                              bool checkpoint);
@@ -522,6 +572,12 @@ public:
   // over one is a logic error.
   [[nodiscard]] bool publishStateToDisk(uint64_t kvBlock, const StateWriter &write,
                                         bool checkpoint);
+  // Whether a state may be published at this block: with a window, the
+  // windowPages blocks that end at it, which a request resuming there reads
+  // whole, are Full in RAM or in their copies (KvCache::tailFull), as a
+  // command that computed or held them in its window leaves them. A refused
+  // tail counts in the window snapshot.
+  [[nodiscard]] bool stateTailFull(uint64_t kvBlock);
   // The request holding the handle is unfinished and its conversation
   // resumes from the state at this block: see StateCache::useState.
   [[nodiscard]] StateUse useState(uint64_t kvBlock) { return states_.useState(kvBlock); }
@@ -601,9 +657,14 @@ public:
   // until, with KeepExtents, an evicted state has returned memory (the retry
   // may then grow the pool), or until nothing more of the class can go; one
   // step instead of a retry per page. The pages are of the form, whose free
-  // and pending pages count, and empty extents of the other form go first.
-  // What is in use waits, and the step reports pending, only while a
-  // transfer in flight can still cover the pages (returnsInFlight).
+  // and pending pages count, and empty extents of the other forms go first.
+  // A windowed cache's Full pages come next from trims (trimWindows), then
+  // from states, as reclaimStateForLane takes them, each followed by a trim
+  // that frees what only its tail kept Full (none when the state stays on
+  // the SSD, which still pins its tail), while those trims free pages; with
+  // KeepExtents one state at most, as above. What is in use waits, and
+  // the step reports pending, only while a transfer in flight can still
+  // cover the pages (returnsInFlight).
   [[nodiscard]] CacheReclaimResult reclaimForPages(uint32_t pages, CacheReclaimMode mode,
                                                    ReclaimClass upTo,
                                                    kv::PageForm form = kv::PageForm::Full);
@@ -701,6 +762,11 @@ private:
     uint32_t spillScan = 0;
     uint32_t pendingRestores = 0;
     bool restoreFailed = false;
+    // With a window, the indices of the pages it keeps beside the blocks
+    // there while they are Full: its own, which it wrote while a transfer
+    // moved the block's, and one the block left for the page of a writer
+    // that computed it again (publishCommittedBlocks).
+    std::vector<uint32_t> privatePages;
   };
   // Records a change of the request's page list from index first on.
   static void pagesChanged(Request &active, uint32_t first) noexcept;
@@ -957,12 +1023,15 @@ private:
   [[nodiscard]] TokenAdmission moveLandedPages(bool allocate, SpilledExtents extents = SpilledExtents::Kept);
   // The copy of the K/V on an Index page.
   [[nodiscard]] model::KvPageSource sourceOf(uint32_t page) const;
+  // Every request that holds the page, at chain index `index`, has
+  // published the window's pages past it.
+  [[nodiscard]] bool windowsPassed(uint32_t page, uint32_t index) const;
 
   KvPool &pool_;
   KvTier *tier_;
   std::optional<CacheSpillPolicy> spill_;
   bool persistent_;
-  bool windowedKv_;
+  std::optional<CacheWindowPolicy> window_;
   CacheAdoption adoption_;
   std::shared_ptr<model::DiskBudget> diskBudget_;
   std::function<void()> diskMeasure_;
@@ -990,6 +1059,9 @@ private:
   KvSpillSnapshot spilled_;
   model::LatencyHistogram restoreLatency_;
   CacheLookupSnapshot lookup_;
+  // The window snapshot's counts.
+  uint64_t trimmedPages_ = 0;
+  uint64_t refusedStates_ = 0;
   double extentCompactMaxMilliseconds_ = 0.0;
   std::function<void()> completionNotifier_;
 };

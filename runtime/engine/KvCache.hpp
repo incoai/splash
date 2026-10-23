@@ -49,9 +49,9 @@ blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
 // index, its K/V living in its copy alone (kv::PageForm::Index); or, of a
 // layout with a sliding window, the K/V of the layers no window bounds
 // (kv::PageForm::Slim). A copy holds what the page held when it was written
-// (copyForm), which a restore gives the page back. Composite recurrent
-// states are a separate sparse layer. This class owns exactly one prefix
-// reference for every resident block.
+// (copyForm), which a restore gives the page back, and at least what the
+// page holds now. Composite recurrent states are a separate sparse layer.
+// This class owns exactly one prefix reference for every resident block.
 class KvCache final {
 public:
   static constexpr uint32_t pageTokens = kv::kPageTokens;
@@ -60,6 +60,9 @@ public:
   struct BlockMatch {
     uint64_t id = 0;
     uint32_t physicalPage = noPage;
+    // From insert(): the page the block left for the writer's (upgrades),
+    // which whoever held it keeps; noPage otherwise.
+    uint32_t previousPage = noPage;
   };
 
   // What moves a block's page from or to the tier: a restore, whose bytes
@@ -77,9 +80,14 @@ public:
   // block on a page a request holds is held (holdPage), and a block spills
   // only to a copy of what its page holds (kvCopied), so that it has one
   // content, whichever form its page has. A persistent cache keeps the
-  // copies no state needs in an order of their own (unneededCopy).
-  KvCache(KvPool &pool, CacheRecency &recency, bool spill = false, bool persistent = false)
-      : pool_(pool), recency_(recency), spill_(spill), persistent_(persistent),
+  // copies no state needs in an order of their own (unneededCopy). With a
+  // window of windowPages pages (kv::Layout::windowPages), a state pins the
+  // windowPages blocks that end at its block, its tail, which a restore
+  // reads whole (windowPinned), and the Full blocks no tail holds wait in an
+  // order of their own (trimCandidate).
+  KvCache(KvPool &pool, CacheRecency &recency, bool spill = false, bool persistent = false,
+          uint32_t windowPages = 0)
+      : pool_(pool), recency_(recency), spill_(spill), persistent_(persistent), windowPages_(windowPages),
         blockOnPage_(pool.pageCount()) {}
   KvCache(const KvCache &) = delete;
   KvCache &operator=(const KvCache &) = delete;
@@ -92,9 +100,16 @@ public:
                                                std::span<const uint32_t> tokens,
                                                BlockIdentity identity) const;
   // Existing content is returned as is: the writer moves onto its page,
-  // either form, unless a restore is filling it, and then keeps its own. A
+  // Full or Index, unless a restore is filling it, and then keeps its own. A
   // disk-only block adopts the writer's page instead and keeps its copy,
-  // which holds what another command computed (kvCopied).
+  // which holds what another command computed (kvCopied). With a window the
+  // writer keeps its page in any case, as its window reads it whole, whether
+  // trimming left the block's page Full or made it Slim, and a block on a
+  // page takes the writer's, once no transfer moves its own (upgrades): the
+  // old page stays with whoever holds it (previousPage). A copy of a Slim
+  // page, which holds less than the block's new page, goes, so that a copy
+  // holds what its page does when the page leaves; one of a Full page stays
+  // as one of another command's K/V.
   [[nodiscard]] BlockMatch insert(uint64_t parentBlock,
                                   std::span<const uint32_t> tokens,
                                   uint32_t physicalPage,
@@ -166,7 +181,9 @@ public:
   [[nodiscard]] bool hasDiskChildren(uint64_t blockId) const;
   // StateCache counts each of its entries in and out, and each entry while
   // an unfinished request uses it: a state restores through the KV of its
-  // own block and every block above.
+  // own block and every block above, and with a window pins its tail, the
+  // windowPages blocks that end at its block, which a row past the state's
+  // boundary reads whole.
   void countState(uint64_t blockId, bool added, bool inUse) noexcept;
   void countStateInUse(uint64_t blockId, bool added) noexcept;
   // In a persistent cache, StateCache counts each state's disk copy in from
@@ -183,6 +200,19 @@ public:
   // block; lookups that find the block without one report a lost state.
   void noteState(uint64_t blockId);
   [[nodiscard]] bool hadState(uint64_t blockId) const;
+  // With a window: the tail of a state, its own or one below it, holds the
+  // block (countState), whose page stays Full.
+  [[nodiscard]] bool windowPinned(uint64_t blockId) const;
+  // Whether the windowPages blocks that end at this one, its tail, hold
+  // every layer's K/V, in RAM (a Full page) or, without a page, in their
+  // copy (copyForm): what a state at the block needs to restore.
+  [[nodiscard]] bool tailFull(uint64_t blockId) const;
+  // With a window, the oldest block after `after` (0 for the first) whose
+  // page may give up its windowed layers' K/V once every request that holds
+  // it has passed it: a Full page no state's tail holds and no transfer
+  // moves, of a block that is not poisoned. Pass the previous candidate to
+  // continue the scan.
+  [[nodiscard]] std::optional<CacheEvictionCandidate> trimCandidate(uint64_t after) const;
   // The resident pages of the form, on the chains of these blocks (each
   // block and every block above it), that no request holds and no transfer
   // moves; each counts once. A request holds every page of its chain, so a
@@ -251,10 +281,17 @@ public:
   // Copies given to a block that had one before: writes of content that
   // was on the disk once already.
   [[nodiscard]] uint64_t rewrites() const noexcept { return rewrites_; }
+  // Blocks that left their page for that of a writer that computed them
+  // again (insert).
+  [[nodiscard]] uint64_t upgrades() const noexcept { return upgrades_; }
+  // Blocks a state's tail holds (windowPinned).
+  [[nodiscard]] uint32_t pinnedBlocks() const noexcept { return pinnedBlocks_; }
   // Tests: std::logic_error unless every block's links, counts, form and
   // held mark agree with the graph and the pool, every order holds exactly
   // the blocks reindex places in it, and, between commands, no copy of a
-  // block that nothing holds or moves has a reader. A persistent cache's
+  // block that nothing holds or moves has a reader; with a window, the pins
+  // are those of the states' tails, and every tail holds its K/V Full in
+  // RAM or in its copies (tailFull). A persistent cache's
   // caller names the blocks where a state with a disk copy sits
   // (StateCache::onDisk), which the blocks' counts of them must match.
   void checkInvariants(const std::function<bool(uint64_t blockId)> &stateOnDisk = {}) const;
@@ -297,9 +334,14 @@ private:
     bool foreignCopy = false;
     bool poisoned = false;
     bool hadState = false;
+    // The tails of states, each counted once, that hold the block
+    // (countState).
+    uint32_t windowPins = 0;
     RecencyOrder::Node ramNode;
     RecencyOrder::Node diskNode;
     RecencyOrder::Node unneededNode;
+    // With a window alone.
+    RecencyOrder::Node trimNode;
   };
 
   // The orders a block waits in, as its fields stand.
@@ -308,6 +350,7 @@ private:
     bool duplicate = false;
     bool diskLeaf = false;
     bool unneeded = false;
+    bool trimmable = false;
   };
 
   [[nodiscard]] Block &block(uint64_t blockId);
@@ -324,6 +367,9 @@ private:
   // The block takes the page, whose form it keeps and whose holders, if
   // any, hold it; or leaves its page with noPage.
   void placeOnPage(Block &entry, uint32_t page);
+  // A block takes the Full page of a writer that computed it again
+  // (insert).
+  void upgrade(Block &entry, uint32_t page);
   void setHeld(Block &entry, bool held) noexcept;
   void inherit(Block &parent, uint64_t lastUsed) noexcept;
   // Applies count to every block above this one.
@@ -336,6 +382,7 @@ private:
   CacheRecency &recency_;
   const bool spill_;
   const bool persistent_;
+  const uint32_t windowPages_;
   std::unordered_map<uint64_t, Block> blocks_;
   // The resident block on each page, 0 for none. A resident block owns its
   // page: a writer whose block already exists moves onto that block's page,
@@ -353,10 +400,13 @@ private:
   RecencyOrder duplicates_;
   RecencyOrder diskLeaves_;
   RecencyOrder unneeded_;
+  RecencyOrder trimmable_;
   uint32_t diskBlocks_ = 0;
   uint32_t indexBlocks_ = 0;
   uint32_t heldCopies_ = 0;
   uint64_t rewrites_ = 0;
+  uint64_t upgrades_ = 0;
+  uint32_t pinnedBlocks_ = 0;
 };
 
 } // namespace splash::engine

@@ -736,6 +736,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   bool kvFileOpen = true;
   // The context a relaunch keeps, which only an automatic context does.
   const uint32_t relaunchContext = requestedContextTokens ? 0 : config.relaunchContext;
+  // The pages of a prefill group's rows (model::kPrefillGroupChunks chunks).
+  constexpr uint32_t groupPages =
+      model::kPrefillGroupChunks * model::ExecutionLimits::prefillTokenBudget / kv::kPageTokens;
   // The plan with the parts set as `experts` and `table`, `stagingBytes` set
   // aside for the disk tier's state staging and `aneFfnBytes` for the
   // prefill FFN's Neural Engine split.
@@ -760,7 +763,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
          .kvSlotBytes = kvSlotBytes,
          .stateSlotBytes = model::SlotFile::slotBytesFor(stateBytes),
          .activeLimitBytes = activeLimitBytes,
-         .groupPages = model::kPrefillGroupChunks * model::ExecutionLimits::prefillTokenBudget / kv::kPageTokens});
+         .groupPages = groupPages});
   };
   // The plan of the parts as configured, which sizes their stores.
   const auto sizingPlan = [&](uint64_t stagingBytes) {
@@ -922,9 +925,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         aneFfnBytes,
         loaded.streamedTable() ? loaded.streamedTable()->committedBytes() : 0,
     };
+    // A lane's prefill command writes a group of chunks where the routed
+    // experts stream (model::RuntimeGeometry::prefillChunks).
+    const uint32_t commandPages = loadOptions.expertMemoryBytes ? groupPages : 0;
     ModelMemoryProfile modelProfile{
         loaded.name(), loaded.maximumContextTokens(), loaded.targetKvLayout(config.kvFormat), footprint,
-        config.stateFormat, streamed.plan ? streamed.plan->spill : KvSpillPlan{}};
+        config.stateFormat, streamed.plan ? streamed.plan->spill : KvSpillPlan{}, commandPages};
     EngineMemoryPlanResult result = evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
     if (streamed.plan || !result.plan)
       return result;
@@ -1083,11 +1089,14 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         logLine("--sparse-kv-memory ignored: ", config.model.name, " keeps its KV in memory, ", spillOff, ".");
     }
 
-    // Page ids for every extent the hard budget could hold, of Index pages
-    // where spilled pages hold only their index: the governor, never the id
-    // range, limits the pool.
+    // Page ids for every extent the hard budget could hold, of the smallest
+    // pages the pool takes: Index pages where spilled pages hold only their
+    // index, Slim ones where pages every window has passed hold the layers
+    // no window bounds. The governor, never the id range, limits the pool.
     const uint64_t idExtentBytes =
-        spill.enabled ? uint64_t{budget.kvExtentPages} * budget.kvIndexPageBytes : budget.kvExtentBytes;
+        spill.enabled          ? uint64_t{budget.kvExtentPages} * budget.kvIndexPageBytes
+        : kvLayout.slimmable() ? uint64_t{budget.kvExtentPages} * kvLayout.bytesPerModelPage(kv::PageForm::Slim)
+                               : budget.kvExtentBytes;
     const uint64_t poolExtents = std::min<uint64_t>(
         (budget.hardBudgetBytes + idExtentBytes - 1) / idExtentBytes,
         std::numeric_limits<uint32_t>::max() / budget.kvExtentPages);
@@ -1104,8 +1113,13 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     std::optional<CacheSpillPolicy> spillPolicy;
     if (spill.enabled)
       spillPolicy = CacheSpillPolicy{.densePages = spill.densePages, .windowPages = spill.windowPages};
-    auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), disk.budget, spillPolicy,
-                                                 kvLayout.windowedLayers != 0);
+    // A windowed layout's pages give up their windowed layers' K/V where
+    // they can (kv::Layout::slimmable), unless --kv-window-trim off.
+    std::optional<CacheWindowPolicy> windowPolicy;
+    if (kvLayout.windowedLayers)
+      windowPolicy = CacheWindowPolicy{.windowPages = kvLayout.windowPages(),
+                                       .trim = kvLayout.slimmable() && config.kvWindowTrim};
+    auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), disk.budget, spillPolicy, windowPolicy);
     if (disk.space)
       cache->setDiskMeasure([space = disk.space.get()] { space->measure(); });
     // A target whose KV spills reads it back through one hot block cache and

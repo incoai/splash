@@ -112,19 +112,37 @@ KvCache::BlockMatch KvCache::insert(uint64_t parentBlock,
   }
   if (auto existing = find(parentBlock, tokens, identity)) {
     BlockMatch result{existing->id, existing->physicalPage};
+    Block &found = block(existing->id);
     if (existing->physicalPage == noPage) {
       adoptPage(existing->id, physicalPage);
       // The copy, which holds what another command computed, stays: a
       // restore point's chain on disk may need it. The block spills only
-      // once a copy of the writer's page replaced it.
+      // once a copy of the writer's page replaced it. A copy of a Slim page
+      // holds less than the writer's page and goes, as in upgrade(): the
+      // page could otherwise leave for it under a state's tail, which a
+      // restore reads whole.
       Block &adopted = block(existing->id);
-      setForeignCopy(adopted, true);
+      if (adopted.copyForm == kv::PageForm::Slim && adopted.form == kv::PageForm::Full)
+        giveDiskCopy(adopted, nullptr);
+      else
+        setForeignCopy(adopted, true);
       reindex(adopted);
       result.physicalPage = physicalPage;
-    } else if (block(existing->id).transfer == Transfer::Filling) {
+    } else if (found.transfer == Transfer::Filling) {
       // Its page is still being filled; the writer keeps its own copy. A
       // page being written holds its final bytes, and the writer moves
       // onto it.
+      result.physicalPage = physicalPage;
+    } else if (windowPages_ && pool_.form(physicalPage) == kv::PageForm::Full) {
+      // With a window the writer keeps its page, which its window reads
+      // whole: a Slim page no longer holds all of it, and moving onto a
+      // Full one would make what the writer reads depend on whether
+      // trimming took the block's windowed layers. The block takes the
+      // writer's page, once no write reads its own.
+      if (found.transfer == Transfer::None) {
+        result.previousPage = found.page;
+        upgrade(found, physicalPage);
+      }
       result.physicalPage = physicalPage;
     }
     return result;
@@ -155,6 +173,8 @@ KvCache::BlockMatch KvCache::insert(uint64_t parentBlock,
   entry.ramNode = RecencyOrder::allocate();
   entry.diskNode = RecencyOrder::allocate();
   entry.unneededNode = RecencyOrder::allocate();
+  if (windowPages_)
+    entry.trimNode = RecencyOrder::allocate();
 
   pool_.retainPage(physicalPage, true);
   auto [position, unique] = blocks_.emplace(entry.id, std::move(entry));
@@ -203,6 +223,8 @@ bool KvCache::adoptDiskBlock(uint64_t blockId, uint64_t parentBlock,
   entry.ramNode = RecencyOrder::allocate();
   entry.diskNode = RecencyOrder::allocate();
   entry.unneededNode = RecencyOrder::allocate();
+  if (windowPages_)
+    entry.trimNode = RecencyOrder::allocate();
   Block &placed = blocks_.emplace(blockId, std::move(entry)).first->second;
   index_.emplace(placed.indexHash, blockId);
   giveDiskCopy(placed, std::move(slot), copyForm);
@@ -346,6 +368,21 @@ void KvCache::countState(uint64_t blockId, bool added, bool inUse) noexcept {
     if (inUse)
       added ? ++entry.statesInUseBelow : --entry.statesInUseBelow;
   });
+  // The state's tail, a bounded walk beside the counts above.
+  uint64_t id = blockId;
+  for (uint32_t pinned = 0; id && pinned < windowPages_; ++pinned) {
+    const auto tail = blocks_.find(id);
+    if (tail == blocks_.end())
+      std::terminate();
+    Block &entry = tail->second;
+    added ? ++entry.windowPins : --entry.windowPins;
+    // Pinned, or no longer.
+    if (entry.windowPins == (added ? 1u : 0u)) {
+      added ? ++pinnedBlocks_ : --pinnedBlocks_;
+      reindex(entry);
+    }
+    id = entry.parent;
+  }
 }
 
 void KvCache::countStateInUse(uint64_t blockId, bool added) noexcept {
@@ -379,6 +416,25 @@ bool KvCache::stateInUseBelow(uint64_t blockId) const {
 void KvCache::noteState(uint64_t blockId) { block(blockId).hadState = true; }
 
 bool KvCache::hadState(uint64_t blockId) const { return block(blockId).hadState; }
+
+bool KvCache::windowPinned(uint64_t blockId) const { return block(blockId).windowPins != 0; }
+
+bool KvCache::tailFull(uint64_t blockId) const {
+  for (uint32_t index = 0; blockId && index < windowPages_; ++index) {
+    const Block &entry = block(blockId);
+    if (entry.page != noPage ? entry.form != kv::PageForm::Full
+                             : !entry.slot || entry.copyForm != kv::PageForm::Full)
+      return false;
+    blockId = entry.parent;
+  }
+  return true;
+}
+
+std::optional<CacheEvictionCandidate> KvCache::trimCandidate(uint64_t after) const {
+  if (!after)
+    return trimmable_.oldest();
+  return trimmable_.next({after, block(after).lastUsed});
+}
 
 uint32_t KvCache::idlePagesOnChains(std::span<const uint64_t> blocks, kv::PageForm form) const {
   std::unordered_set<uint64_t> visited;
@@ -491,6 +547,21 @@ void KvCache::placeOnPage(Block &entry, uint32_t page) {
   if (entry.form == kv::PageForm::Index)
     ++indexBlocks_;
   setHeld(entry, spill_ && pool_.pageActive(page));
+}
+
+void KvCache::upgrade(Block &entry, uint32_t page) {
+  if (blockOnPage_[page])
+    throw std::logic_error("KV cache page already holds a block");
+  const uint32_t previous = entry.page;
+  pool_.retainPage(page, true);
+  // A copy of a Slim page holds less than the block's page now; one of a
+  // Full page holds what another command computed.
+  if (entry.slot)
+    entry.copyForm == kv::PageForm::Slim ? giveDiskCopy(entry, nullptr) : setForeignCopy(entry, true);
+  placeOnPage(entry, page);
+  reindex(entry);
+  pool_.releasePage(previous, true);
+  ++upgrades_;
 }
 
 void KvCache::followPages(const KvPageMoves &moves) noexcept {
@@ -646,6 +717,7 @@ void KvCache::erase(uint64_t blockId) {
   RecencyOrder::unlink(candidate.ramNode);
   RecencyOrder::unlink(candidate.diskNode);
   RecencyOrder::unlink(candidate.unneededNode);
+  RecencyOrder::unlink(candidate.trimNode);
   index_.erase(indexed);
   blocks_.erase(blockId);
   ++generation_;
@@ -704,6 +776,7 @@ KvCache::Orders KvCache::orders(const Block &entry) const noexcept {
   const bool holdsKv = paged && entry.form != kv::PageForm::Index;
   Orders result;
   result.ramLeaf = paged && !entry.residentChildren && !used;
+  result.trimmable = windowPages_ && paged && entry.form == kv::PageForm::Full && !entry.windowPins;
   if (!entry.slot || (used && !entry.foreignCopy))
     return result;
   result.duplicate = holdsKv;
@@ -716,9 +789,12 @@ void KvCache::reindex(Block &entry) noexcept {
   RecencyOrder::unlink(entry.ramNode);
   RecencyOrder::unlink(entry.diskNode);
   RecencyOrder::unlink(entry.unneededNode);
+  RecencyOrder::unlink(entry.trimNode);
   const Orders placed = orders(entry);
   if (placed.ramLeaf)
     ramLeaves_.link(entry.ramNode, entry.lastUsed, entry.id);
+  if (placed.trimmable)
+    trimmable_.link(entry.trimNode, entry.lastUsed, entry.id);
   if (placed.duplicate)
     duplicates_.link(entry.diskNode, entry.lastUsed, entry.id);
   else if (placed.diskLeaf)
@@ -755,13 +831,15 @@ void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &state
       ++all;
       resident += entry.page != noPage;
     }
-    check(!entry.foreignCopy || (entry.slot && entry.page != noPage && entry.form == kv::PageForm::Full),
-          "a copy of another command's K/V sits beside a Full page");
+    check(!entry.foreignCopy || (entry.slot && entry.page != noPage && entry.form != kv::PageForm::Index),
+          "a copy of another command's K/V sits beside a page that holds its K/V");
     // A copy holds what its page held when it was written, which a Slim
-    // page holds no more of and a Full or spilled page all of.
+    // page holds no more of and a Full or spilled page all of; one of
+    // another command's K/V too, so that the copy holds whatever the page
+    // does when the page leaves.
     check(entry.copyForm != kv::PageForm::Index &&
-              (!entry.slot || entry.foreignCopy || entry.page == noPage ||
-               entry.copyForm == kv::PageForm::Full || entry.form == kv::PageForm::Slim),
+              (!entry.slot || entry.page == noPage || entry.copyForm == kv::PageForm::Full ||
+               entry.form == kv::PageForm::Slim),
           "a block's copy holds what its page held");
     if (entry.page == noPage) {
       check(entry.slot != nullptr || entry.poisoned, "a disk-only block has a copy");
@@ -809,6 +887,27 @@ void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &state
     check(entry.diskStates == (counted == diskStates.end() ? 0 : counted->second),
           "a block counts the states on disk at it and below it");
   }
+  // With a window each block counts the tails of the states that hold it,
+  // and every tail holds its K/V whole, in RAM or in its copies, but one
+  // that runs through a poisoned block, which no lookup reaches.
+  std::unordered_map<uint64_t, uint32_t> windowPins;
+  for (const auto &[id, entry] : blocks_) {
+    if (!entry.statesHere || !windowPages_)
+      continue;
+    bool reachable = true;
+    uint64_t above = id;
+    for (uint32_t index = 0; above && index < windowPages_; ++index, above = blocks_.at(above).parent) {
+      ++windowPins[above];
+      reachable = reachable && !blocks_.at(above).poisoned;
+    }
+    check(!reachable || tailFull(id), "a state's tail holds every layer's K/V");
+  }
+  for (const auto &[id, entry] : blocks_) {
+    const auto counted = windowPins.find(id);
+    check(entry.windowPins == (counted == windowPins.end() ? 0 : counted->second),
+          "a block counts the state tails that hold it");
+  }
+  check(windowPins.size() == pinnedBlocks_, "the count of blocks a state's tail holds");
   // Each order holds the blocks reindex places in it, under their recency.
   const auto checkOrder = [&](const RecencyOrder &order, const auto &placed, const char *what) {
     size_t members = 0;
@@ -826,6 +925,7 @@ void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &state
   checkOrder(duplicates_, [](const Orders &in) { return in.duplicate; }, "the order of redundant copies");
   checkOrder(diskLeaves_, [](const Orders &in) { return in.diskLeaf; }, "the order of only copies");
   checkOrder(unneeded_, [](const Orders &in) { return in.unneeded; }, "the order of copies no state needs");
+  checkOrder(trimmable_, [](const Orders &in) { return in.trimmable; }, "the order of Full pages no tail holds");
 }
 
 void KvCache::erasePoisonedLeaf(uint64_t blockId) noexcept {

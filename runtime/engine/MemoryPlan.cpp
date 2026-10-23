@@ -224,7 +224,9 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
     const uint64_t pages = pagesOf(kvTokens(tokens));
     uint64_t budget = pages;
     while (kvCapacityPagesFor(layout, budget) < pages) ++budget;
-    return static_cast<int64_t>(remaining(budget * layout.bytesPerModelPage(), runwayBytes));
+    // A windowed layout's KV beyond its lane's Full pages is Slim.
+    const uint32_t floorPages = kvWindowFloorPages(layout, streaming ? in.groupPages : 0);
+    return static_cast<int64_t>(remaining(kvPagesBytes(layout, budget, floorPages), runwayBytes));
   };
   const int64_t tableShare =
       table.automatic ? static_cast<int64_t>(remaining(std::min(table.all, kTableShareBytes), table.floor)) : 0;
@@ -367,6 +369,24 @@ uint64_t kvCapacityPagesFor(const kv::Layout &layout, uint64_t pages) noexcept {
   return extentPages ? pages - pages % extentPages : 0;
 }
 
+uint32_t kvWindowFloorPages(const kv::Layout &layout, uint32_t commandPages) noexcept {
+  if (!layout.slimmable()) return 0;
+  const uint32_t command =
+      commandPages ? commandPages : model::ExecutionLimits::prefillTokenBudget / kv::kPageTokens;
+  return layout.windowPages() + command + 1;
+}
+
+uint64_t kvPagesBytes(const kv::Layout &layout, uint64_t pages, uint32_t floorPages) noexcept {
+  const uint64_t full = layout.slimmable() ? std::min<uint64_t>(pages, floorPages) : pages;
+  return full * layout.bytesPerModelPage() + (pages - full) * layout.bytesPerModelPage(kv::PageForm::Slim);
+}
+
+uint64_t kvPagesWithin(const kv::Layout &layout, uint64_t bytes, uint32_t floorPages) noexcept {
+  const uint64_t floorBytes = uint64_t{floorPages} * layout.bytesPerModelPage();
+  if (!layout.slimmable() || bytes <= floorBytes) return bytes / layout.bytesPerModelPage();
+  return floorPages + (bytes - floorBytes) / layout.bytesPerModelPage(kv::PageForm::Slim);
+}
+
 uint32_t ContextBounds::maximum() const noexcept {
   return std::min(window, std::max(resident, std::min(spilled, disk)));
 }
@@ -473,8 +493,12 @@ std::string EngineMemoryBreakdown::toStatusJson() const {
       << "\"kv_capacity_pages\":" << kvCapacityPages << ','
       << "\"kv_capacity_bytes\":" << kvCapacityBytes << ','
       << "\"kv_capacity_tokens\":" << kvCapacityTokens << ','
-      << "\"kv_index_page_bytes\":" << kvIndexPageBytes << ','
-      << "\"kv_spill\":" << spillStatusJson(kvSpill) << ','
+      << "\"kv_index_page_bytes\":" << kvIndexPageBytes << ',';
+  // A windowed layout's Slim pages; nothing for another layout.
+  if (kvSlimPageBytes)
+    out << "\"kv_window\":{\"slim_page_bytes\":" << kvSlimPageBytes << ",\"floor_pages\":" << kvWindowFloorPages
+        << "},";
+  out << "\"kv_spill\":" << spillStatusJson(kvSpill) << ','
       << "\"resident_kv_bytes\":" << residentKvBytes << ','
       << "\"context_bounds\":{\"window\":" << contextBounds.window
       << ",\"resident\":" << contextBounds.resident << ",\"spilled\":" << contextBounds.spilled
@@ -518,6 +542,9 @@ std::string EngineMemoryBreakdown::describe() const {
       << bytesAndMiB(kvExtentBytes) << '\n'
       << "KV capacity of one request: " << kvCapacityPages << " pages / "
       << kvCapacityTokens << " tokens\n";
+  if (kvSlimPageBytes)
+    out << "KV past the windows: Slim pages of " << bytesAndMiB(kvSlimPageBytes) << ", a lane keeping "
+        << kvWindowFloorPages << " pages Full\n";
   if (kvSpill.enabled)
     out << "KV on the SSD cache: Index pages of " << bytesAndMiB(kvIndexPageBytes) << "; a Spill request keeps "
         << kvSpill.densePages << " dense, " << kvSpill.windowPages << " window and 2 x " << kvSpill.groupPages
@@ -639,6 +666,12 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   breakdown.minimumDynamicBytes = *required - breakdown.fixedRuntimeBytes;
   breakdown.kvIndexPageBytes = model.targetKvLayout.indexBytesPerModelPage();
   breakdown.kvSpill = model.spill;
+  // A windowed layout's request keeps Full only its lane's window and the
+  // pages its command writes; the rest of its KV is Slim.
+  const kv::Layout &kvLayout = model.targetKvLayout;
+  breakdown.kvWindowFloorPages = kvWindowFloorPages(kvLayout, model.commandPages);
+  if (kvLayout.slimmable())
+    breakdown.kvSlimPageBytes = kvLayout.bytesPerModelPage(kv::PageForm::Slim);
   // Page ids stay 32-bit. One request's KV capacity is the whole extents of
   // the size that leaves the fewest of the budget's pages unused.
   const uint64_t availableForOneRequestKv =
@@ -646,15 +679,14 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
           ? breakdown.dynamicBudgetBytes - breakdown.laneStateBytes
           : 0;
   const uint64_t budgetPages =
-      std::min<uint64_t>(availableForOneRequestKv / breakdown.kvPageBytes,
+      std::min<uint64_t>(kvPagesWithin(kvLayout, availableForOneRequestKv, breakdown.kvWindowFloorPages),
                          std::numeric_limits<uint32_t>::max());
   breakdown.kvExtentPages = model.targetKvLayout.extentPagesFor(budgetPages);
   breakdown.kvCapacityPages = static_cast<uint32_t>(kvCapacityPagesFor(model.targetKvLayout, budgetPages));
+  breakdown.kvCapacityBytes = kvPagesBytes(kvLayout, breakdown.kvCapacityPages, breakdown.kvWindowFloorPages);
 
   if (!checkedMultiply(breakdown.kvPageBytes, breakdown.kvExtentPages,
                        breakdown.kvExtentBytes) ||
-      !checkedMultiply(breakdown.kvPageBytes, breakdown.kvCapacityPages,
-                       breakdown.kvCapacityBytes) ||
       !checkedMultiply(breakdown.kvPageTokens, breakdown.kvCapacityPages,
                        breakdown.kvCapacityTokens)) {
     return {std::nullopt, failure(BudgetErrorCode::ArithmeticOverflow,
