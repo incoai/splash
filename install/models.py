@@ -49,6 +49,9 @@ MODELS = paths.MODELS
 # 14 MB for a checkpoint that stores each routed expert's tensors of its own
 # (Model Optimizer's). The engine bounds the files it reads by its own rule.
 MAX_JSON_BYTES = 64 * 1024 * 1024
+# --draft-model's value for an installation that downloads and loads no
+# draft: its every decode cycle selects one token (DEVELOPMENT.md, Drafts).
+NO_DRAFT = "none"
 # What installation_kind finds at a selection link: an assembly, or a Splash
 # package an earlier release installed.
 ASSEMBLY, PACKAGE = "assembly", "package"
@@ -153,16 +156,20 @@ def split_model_id(value: str) -> tuple[str, str | None]:
 
 
 def parse_draft_model(value: str) -> str:
-    # A local draft directory is recorded as an absolute path, so the
-    # installation it selects does not depend on the working directory.
+    # NO_DRAFT selects an installation without a draft, even beside a
+    # directory of that name, which ./none names. A local draft directory is
+    # recorded as an absolute path, so the installation it selects does not
+    # depend on the working directory.
+    if value == NO_DRAFT:
+        return NO_DRAFT
     if value and (local := Path(value).expanduser()).is_dir():
         return str(local.resolve())
     try:
         return validate_repo_id(value)
     except ModelError:
         raise argparse.ArgumentTypeError(
-            "must be a local DFlash2 draft directory or a Hugging Face "
-            "repository ID (owner/repo)"
+            "must be a local DFlash2 draft directory, a Hugging Face "
+            f"repository ID (owner/repo) or {NO_DRAFT}"
         ) from None
 
 
@@ -359,7 +366,8 @@ def parse_args(argv=None):
         "--draft-model",
         type=parse_draft_model,
         help="the DFlash2 draft's repository or local directory, in place of the "
-        "family's released one (required for a family without one)",
+        "family's released one (required for a family without one), or none "
+        "for no draft",
     )
     parser.add_argument(
         "--language-only",

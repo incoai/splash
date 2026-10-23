@@ -1204,6 +1204,15 @@ class LauncherTests(unittest.TestCase):
                 ["serve", "--model", MODEL_ID, "--draft-model", repository]
             )
             self.assertEqual(args.draft_model, repository)
+            # none selects no draft, even beside a directory of that name,
+            # which ./none names.
+            (base / "none").mkdir()
+            for value, draft in (("none", "none"), ("./none", str(base / "none"))):
+                with self.subTest(value=value):
+                    args = launcher.parse_args(
+                        ["serve", "--model", MODEL_ID, "--draft-model", value]
+                    )
+                    self.assertEqual(args.draft_model, draft)
             for value in ("./missing", "missing", "", "drafts/local/../../missing/"):
                 with (
                     self.subTest(value=value),
@@ -1217,7 +1226,7 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(failed.exception.code, 2)
                 self.assertIn(
                     "argument --draft-model: must be a local DFlash2 draft "
-                    "directory or a Hugging Face repository ID",
+                    "directory, a Hugging Face repository ID (owner/repo) or none",
                     error.getvalue(),
                 )
                 install.assert_not_called()

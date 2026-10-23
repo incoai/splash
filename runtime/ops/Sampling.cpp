@@ -199,15 +199,16 @@ void Sampling::addVerify(metal::CommandGraph &graph,
                          std::span<const SamplingPolicy> policies,
                          SamplingBuffers buffers, uint32_t stopToken0,
                          uint32_t stopToken1,
-                         const PenaltyTable &penalties) const {
+                         const PenaltyTable &penalties, bool drafted) const {
   if (policies.empty() || policies.size() > kMaximumLanes)
     throw std::invalid_argument("invalid sampling batch width");
   // Verify row r of a lane reads mask row r + 1 and, below the last row,
-  // follows draft token r; every row draws with the lane's correction
-  // uniform.
+  // follows draft token r when there is a draft; every row draws with the
+  // lane's correction uniform.
   const TargetSamplingParams params =
       selection(policies, buffers,
-                {SPLASH_TARGET_VERIFY_ROWS, 0, 1, SPLASH_UNIFORM_CORRECTION, SPLASH_DRAFT_PROPOSAL_TOKENS},
+                {SPLASH_TARGET_VERIFY_ROWS, 0, 1, SPLASH_UNIFORM_CORRECTION,
+                 drafted ? SPLASH_DRAFT_PROPOSAL_TOKENS : 0U},
                 stopToken0, stopToken1);
   addPenalties(graph, policies, buffers, penalties, 0, true);
   addSelection(graph, params, policies, buffers);

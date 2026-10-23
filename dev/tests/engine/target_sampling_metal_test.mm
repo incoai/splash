@@ -769,6 +769,84 @@ void speculativeExactness(MetalBackend &backend, uint32_t samplingMask) {
   }
 }
 
+// Without a draft (--draft-model none), a lane's proposals are mask tokens
+// and it verifies its anchor alone, a row that follows no draft token: the
+// search clears the draft probability an earlier cycle left in its record,
+// so whatever its proposals' candidates say, acceptance keeps none of them,
+// and the anchor's token is what a decode without speculation selects, a
+// sampled lane's a draw from the whole distribution with its correction
+// uniform.
+void withoutDraft(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 1003;
+  constexpr uint32_t lanes = 2;
+  constexpr uint32_t kMask = 4;
+  Random random(0x6e6f6472);
+  Sampling sampling(vocabulary);
+  const Batch batch = makeBatch(backend, vocabulary, lanes);
+  MetalBuffer anchors = allocate(backend, lanes * sizeof(uint32_t));
+  std::fill_n(static_cast<uint32_t *>(anchors.contents()), lanes, 1U);
+  AcceptanceBuffers acceptance{
+      allocate(backend, uint64_t{lanes} * kPositions * sizeof(uint32_t)),
+      batch.buffers.draftCandidates,
+      batch.buffers.draftProbabilities,
+      batch.buffers.vocabularyRows,
+      batch.buffers.uniforms,
+      batch.buffers.outputTokens,
+      allocate(backend, lanes * sizeof(uint32_t)),
+      allocate(backend, lanes * sizeof(uint32_t)),
+      anchors};
+  auto *proposed = static_cast<uint32_t *>(acceptance.proposedTokens.contents());
+  auto *candidates = static_cast<uint32_t *>(acceptance.candidates.contents());
+  auto *proposal = static_cast<float *>(acceptance.proposalProbabilities.contents());
+  // Candidates that would accept the mask token surely: what the draft
+  // buffers of another cycle could hold.
+  std::fill(candidates, candidates + lanes * kPositions * kDraftCandidates, kMask);
+  std::fill(proposal, proposal + lanes * kPositions * kDraftCandidates, 1.0F);
+  const std::vector<SamplingPolicy> policies{{32, 0.9F, 0.95F, false}, {1, 0.0F, 1.0F, false}};
+  std::vector<Distribution> targets(lanes);
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    uint32_t *inputs = batch.inputTokens() + lane * kRows;
+    inputs[0] = 5 + lane;
+    for (uint32_t row = 0; row < kRows; ++row)
+      fillRow(batch.row(lane * kRows + row), vocabulary, random);
+    // The mask token is likely enough that a stale probability accepts it.
+    batch.row(lane * kRows)[kMask] = 4.0F;
+    for (uint32_t position = 0; position < kPositions; ++position)
+      inputs[position + 1] = proposed[lane * kPositions + position] = kMask;
+    float *uniforms = batch.uniforms() + lane * kUniforms;
+    for (uint32_t uniform = 0; uniform < kUniforms; ++uniform)
+      uniforms[uniform] = 0.5F * (random.unit() + 1.0F);
+    uniforms[SPLASH_UNIFORM_ACCEPTANCE] = 0.0F;
+    if (policies[lane].samples())
+      targets[lane] = referenceDistribution(batch.row(lane * kRows), vocabulary, policies[lane]);
+  }
+
+  batch.poison();
+  auto *records = static_cast<TargetVocabularyRow *>(batch.buffers.vocabularyRows.contents());
+  for (uint32_t row = 0; row < batch.rows; ++row) records[row].draft_probability = 1.0F;
+  CommandGraph graph;
+  sampling.addVerify(graph, policies, batch.buffers, kStopTokens[0], kStopTokens[1], {}, false);
+  const std::array<uint32_t, lanes> maximumRetained{kRows, kRows};
+  sampling.addAcceptance(graph, acceptance, maximumRetained, policies, kStopTokens[0], kStopTokens[1]);
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+  const auto *retained = static_cast<const uint32_t *>(acceptance.retainedCounts.contents());
+  const auto *accepted = static_cast<const uint32_t *>(acceptance.acceptedCounts.contents());
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
+    const std::string label = "lane " + std::to_string(lane) + " without a draft";
+    const uint32_t token = batch.outputTokens()[lane * kRows];
+    require(accepted[lane] == 0 && retained[lane] == 1, label + ": accepted a proposal");
+    if (policies[lane].samples()) {
+      require(batch.record(lane * kRows).draft_probability == 0.0F,
+              label + ": the anchor kept a draft probability");
+      requireDraw(token, targets[lane].probabilities,
+                  batch.uniforms()[lane * kUniforms + SPLASH_UNIFORM_CORRECTION], targets[lane].ambiguousMass,
+                  label + " draw");
+    } else {
+      require(token == referenceArgmax(batch.row(lane * kRows), vocabulary, {}), label + ": lost its argmax");
+    }
+  }
+}
+
 // Extreme repetition penalties saturate instead of overflowing: every
 // candidate the penalty drives to the same float limit ties, greedy takes the
 // lowest id among them, and sampling draws evenly among the lowest ids top-k
@@ -2612,6 +2690,8 @@ int main(int argc, char **argv) {
               std::to_string(samplingMask);
       speculativeExactness(backend, samplingMask);
     }
+    stage = "without a draft";
+    withoutDraft(backend);
     stage = "non-finite rows";
     nonFiniteRowsSelectTheSentinel(backend);
     stage = "ties";

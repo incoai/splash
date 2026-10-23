@@ -25,6 +25,9 @@ void copyExact(const MetalBuffer &destination, const MetalBuffer &source,
   if (destination.sizeBytes() != source.sizeBytes()) {
     throw std::logic_error(std::string(name) + " shape mismatch");
   }
+  // The context window of a model without a draft holds nothing.
+  if (!destination.sizeBytes())
+    return;
   std::memcpy(writableContents(destination, name),
               writableContents(source, name), destination.sizeBytes());
 }
@@ -34,13 +37,14 @@ void clear(const MetalBuffer &buffer, const char *name) {
 }
 
 // What a state file slot holds of a state: its GDN cell, then its context
-// window.
+// window, which a model without a draft has none of.
 std::vector<std::span<std::byte>> stateSpans(const GdnParityBuffers &gdn,
                                              const MetalBuffer &window) {
   std::vector<std::span<std::byte>> spans;
   for (const MetalBuffer *buffer : {&gdn.stateBase, &window})
-    spans.emplace_back(static_cast<std::byte *>(writableContents(*buffer, "state IO")),
-                       buffer->sizeBytes());
+    if (buffer->sizeBytes())
+      spans.emplace_back(static_cast<std::byte *>(writableContents(*buffer, "state IO")),
+                         buffer->sizeBytes());
   return spans;
 }
 

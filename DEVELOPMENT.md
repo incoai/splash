@@ -84,7 +84,7 @@ access.
 | --- | --- | --- |
 | `--model` | Required | The upstream model, `OWNER/REPO`, or a GGUF's `OWNER/REPO:VARIANT`. See [upstream model loading](#upstream-model-loading). |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
-| `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place; required for a family without a released draft. See [drafts](#drafts). |
+| `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place, required for a family without a released draft; `none` serves the model without a draft, one token a decode cycle. See [drafts](#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](#vision). |
 | `--offline` | Off | Start the installed model without asking the Hub, as `HF_HUB_OFFLINE=1` does. See [revisions](#revisions). |
 | `--port` | `SPLASH_PORT` or `8000` | HTTP port. |
@@ -1495,7 +1495,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `memory_plan.budget.context_bounds` | What bounds `maximum_context_tokens` ([memory and context](#memory-and-context)): the model's `window`, one request's KV in memory (`resident`), the longest context a block-sparse target's floors hold (`spilled`) and its SSD cache's room holds (`disk`), and the `bound` that sets the limit: `model`, `memory` or `disk` |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
-| `verify_rows` | The rows of a draft block decode cycles verify ([drafts](#drafts), `--verify-rows`): `auto` where the verify budget chooses them (a MoE target under the default), `all` where they verify every row the output limit leaves (a dense target, or `--verify-rows all`) |
+| `verify_rows` | The rows of a draft block decode cycles verify ([drafts](#drafts), `--verify-rows`): `auto` where the verify budget chooses them (a MoE target under the default), `all` where they verify every row the output limit leaves (a dense target, or `--verify-rows all`), `anchor` where a model installed without a draft (`--draft-model none`) selects one token a cycle |
 | `model_timing.prefill.last_gpu_ms`, `total_gpu_ms` | GPU time of the last prefill command, and of all since engine start, warmup included: each from its first Metal command buffer's start to its last one's end, so with the Neural Engine split it spans the GPU's waits on the Neural Engine; a chunk run again adds the rerun's |
 | `metrics.decode_tokens_per_second` | Aggregate native decode throughput, not a request's end-to-end rate |
 | `metrics.decode_wall_ms` | Total wall time of the decode commands on the GPU, from submission to completion |
@@ -1850,7 +1850,8 @@ the parameters, `GgufFile` and the planner check the rest).
 
 ### Drafts
 
-Every model decodes with a DFlash2 draft. Each family names the repository
+A model decodes with a DFlash2 draft unless it is installed without one
+(below). Each family names the repository
 of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
 it as the release publishes it: `config.json` and BF16 `model.safetensors`
 (or the shards its index names), and `mask_embedding.safetensors` when the
@@ -1946,6 +1947,22 @@ one for the rest, and `GgufPreparation` quantizes each projection into af4g64
 planes, 4 bits in groups of 64 as MLX's affine quantization rounds them, and
 copies every other tensor as stored. The draft runs on the block kernels its
 target's projections run on.
+
+`--draft-model none` installs the target alone: the installer asks the Hub for
+no draft, downloads none and links no `draft/`, and the installation's
+`model.json` records its draft source as `null`, so it is an installation of
+its own beside the drafted one ([Model cache](#model-cache)). The engine then
+loads no draft weights and allocates neither the draft's rings, its context
+windows nor its decode rows (`DFlashDraftLayout{}`, whose `present()` is
+false), and every decode cycle selects one token: its proposals are mask tokens
+and the target verifies its anchor alone, sampled from the target's
+distribution as a request without a draft samples it. The target still runs
+the block's eight rows, since its kernels take eight rows a lane, but a MoE
+target routes experts for the anchor only. `--verify-rows` has no use there;
+the startup log says the cycles select one token each and `/status` reports
+`verify_rows` as `anchor`. Greedy and seeded outputs then repeat from run to
+run, on a MoE target too, and the memory the draft and its state took goes to
+the KV cache.
 
 ### Vision
 
