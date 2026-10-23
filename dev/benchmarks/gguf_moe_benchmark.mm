@@ -6,7 +6,9 @@
 // - decode steps of one to four lanes of 8 rows on the device's plan and on the other GGUF tile, each row routed to
 //   top-k experts drawn at random from all of them (random) or, per lane of 8 rows, from a pool of three times top-k
 //   (pooled: the rows of a verify sharing their experts), with the share of the plan's expert tiles that run the
-//   column tile (an expert's only tile of MOE_GGUF_COLUMN_ROWS live rows or fewer);
+//   column tile (an expert's only tile of MOE_GGUF_COLUMN_ROWS live rows or fewer); where decode runs the live-row
+//   passes (Apple9's register tile, MoePlan::liveRows), also against the register tile's 8-row MMA on the same rows
+//   (the prefill plan of a step's rows), alternating;
 // - prefill chunks of 64 to 2048 rows routed at random, on both tiles;
 // - every dispatch of the 2048-row chunk and of the 8- and 32-row steps replayed as its own command.
 // Each command runs layers of their own routes and buffers over one set of weights larger than the system cache, so a
@@ -112,9 +114,9 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
     std::vector<MoeBuffers> buffers;
     CommandGraph graph;
   };
-  const auto layers = [&](const MoePlan &plan, Routing routing) {
+  const auto layers = [&](const MoePlan &plan, Routing routing, uint32_t count = 0) {
     Layers l;
-    l.buffers.resize(plan.phase() == splash::ops::MoePhase::Decode ? kDecodeLayers : kPrefillLayers);
+    l.buffers.resize(count ? count : plan.phase() == splash::ops::MoePhase::Decode ? kDecodeLayers : kPrefillLayers);
     for (MoeBuffers &b : l.buffers) {
       b.input = bfloatBuffer(backend, input(plan.rows(), routing), "input");
       b.residual = zeros(backend, uint64_t{plan.rows()} * H * 2, "residual");
@@ -180,6 +182,19 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
       const double ms = time(mine);
       printf(" | %s %s %.4f (%2.0f%% column)", routing == Routing::Random ? "random" : "pooled", tileName(device), ms,
              columnShare(mine, plan));
+      if (plan.liveRows()) {
+        // The live-row passes against the register tile's MMA on as many layers of the same rows, alternating five
+        // times: the medians of both.
+        const Layers mma = layers(plans.moePrefill(shape, plan.rows()), routing, kDecodeLayers);
+        std::vector<double> liveMs, mmaMs;
+        for (int i = 0; i < 5; ++i) {
+          liveMs.push_back(time(mine));
+          mmaMs.push_back(time(mma));
+        }
+        std::sort(liveMs.begin(), liveMs.end());
+        std::sort(mmaMs.begin(), mmaMs.end());
+        printf(" (live rows %.4f vs MMA %.4f, %+.1f%%)", liveMs[2], mmaMs[2], 100.0 * (liveMs[2] / mmaMs[2] - 1.0));
+      }
       // The register tile takes the weights of quant_register_tensor only.
       if (other == MoeGgufTile::Register && !shape.registerFormats) continue;
       const MoePlan otherPlan = MoE::decodePlan(shape, lanes, config);
