@@ -110,6 +110,7 @@ access.
 | `--default-reasoning-effort` | `SPLASH_DEFAULT_REASONING_EFFORT` or the template's | Effort of Chat and Responses requests that set none. See [default reasoning effort](#default-reasoning-effort). |
 | `--thinking-token-budget` | `SPLASH_THINKING_TOKEN_BUDGET` or none | Thinking tokens of a request that sets no budget. See [thinking token budget](#thinking-token-budget). |
 | `--thinking-end-text` | `SPLASH_THINKING_END_TEXT` or `</think>` | Text that ends thinking where a budget runs out, `</think>` its last token. See [thinking token budget](#thinking-token-budget). |
+| `--chat-template-file` | The model's own | A Jinja chat template to render every request with, in place of the model's. See [custom chat templates](#custom-chat-templates). |
 | `--max-request-size` | `128M` | Largest HTTP request body. See [request limits](#request-limits-and-timeouts). |
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
 | `--request-timeout` | None | Time a request may take from its arrival; a request's own `timeout` can only shorten it. |
@@ -2007,6 +2008,21 @@ Every request, including image placeholder, token-count and judgment
 (`/v1/judgments`, `/v1/systemone`) rendering, uses the template chosen at
 startup; tokenizer files and the tokenizer object are unchanged. The probe's
 upstream fixtures are in `dev/tests/fixtures/chat_templates/`.
+
+### Custom chat templates
+
+`--chat-template-file FILE`, of `splash serve` or the server, names a UTF-8
+Jinja file that every request renders with, in place of every template the
+tokenizer defines, `tool_use` included; without it, the tokenizer's templates
+serve as before. The server reads the file once at startup, probes it as it
+probes the tokenizer's, and logs its path and SHA-256 (`Chat template file ·
+...`); a later change to the file takes effect at the next start. A file that
+cannot be read, is not UTF-8, is blank or is not a Jinja template stops
+startup, as does a template that cannot render a question, before any weights
+load; Splash never falls back to the model's templates. The template supplies
+formatting alone: the vocabulary, special tokens and the parsing of reasoning
+and tool calls remain the model's. Preparation is unchanged: a GGUF still
+needs a chat template of its own.
 
 ### Local model files
 
