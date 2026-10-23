@@ -786,6 +786,7 @@ def main_args(**overrides):
             "default_reasoning_effort": None,
             "thinking_token_budget": None,
             "thinking_end_text": None,
+            "chat_template_file": None,
             "max_context": None,
             "max_memory": None,
             "idle_release": None,
@@ -827,20 +828,28 @@ def unprepared_hold():
 
 
 def make_frontend(
-    tokenizer, *args, constraint_factory=None, thinking_codec=None, **options
+    tokenizer,
+    *args,
+    constraint_factory=None,
+    thinking_codec=None,
+    chat_templates=None,
+    **options,
 ):
     """A frontend over the tokenizer, with its chat templates probed as
     startup probes them. Unless a test passes its own, generation is
-    unconstrained and thinking is signed with a fresh key."""
+    unconstrained, thinking is signed with a fresh key and the templates are
+    the tokenizer's."""
     if constraint_factory is None:
         constraint_factory = PassThroughConstraintFactory()
     if thinking_codec is None:
         thinking_codec = ThinkingCodec()
+    if chat_templates is None:
+        chat_templates = ChatTemplates(tokenizer)
     return request_frontend.Frontend(
         tokenizer,
         *args,
         constraint_factory=constraint_factory,
-        chat_templates=ChatTemplates(tokenizer),
+        chat_templates=chat_templates,
         thinking_codec=thinking_codec,
         **options,
     )

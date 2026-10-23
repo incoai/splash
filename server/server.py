@@ -53,7 +53,7 @@ from .backend import (
     remaining_request_time,
     thinking_end_tokens,
 )
-from .chat_templates import ChatTemplateError, ChatTemplates
+from .chat_templates import ChatTemplateError, ChatTemplates, read_template_file
 from .connections import ConnectionSlots, HttpAdmission, RequestBodyReservation
 from .constraints import ConstraintFactory, validate_tokenizer
 from .diagnostics import log_unexpected, print_request, print_status
@@ -1707,6 +1707,16 @@ def _native_command(args, model_root, relaunch_context=None):
     return command
 
 
+def _custom_template(path):
+    """The source of the chat template file --chat-template-file names
+    (path), which startup logs with its digest, or None."""
+    if path is None:
+        return None
+    custom = read_template_file(path)
+    print_status(f"Chat template file · {custom.path} · sha256 {custom.sha256}")
+    return custom.source
+
+
 def _raise_descriptor_limit():
     """Raise the soft descriptor limit to DESCRIPTOR_LIMIT, or to the hard
     limit when that is lower; a higher soft limit stays."""
@@ -1764,12 +1774,13 @@ def main():
         # exits, so that no installation collects the assembly its tokenizer
         # and engines, a relaunched one too, serve.
         model_root, held = assembly.hold(Path(args.model_root))
+        custom = _custom_template(args.chat_template_file)
         tokenizer = AutoTokenizer.from_pretrained(
             model_root / "tokenizer", local_files_only=True, trust_remote_code=False
         )
         validate_tokenizer(tokenizer)
         thinking_end = thinking_end_tokens(tokenizer, args.thinking_end_text)
-        chat_templates = ChatTemplates(tokenizer)
+        chat_templates = ChatTemplates(tokenizer, override=custom)
         print_status(f"Chat template · {chat_templates.describe()}")
         runtime = engine_runtime.MultiplexedRuntime(
             _native_command(args, model_root),

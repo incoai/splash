@@ -1,5 +1,7 @@
 import copy
+import hashlib
 import json
+import tempfile
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -20,6 +22,7 @@ from server.chat_templates import (
     UNSUPPORTED,
     ChatTemplateError,
     ChatTemplates,
+    read_template_file,
     template_options,
 )
 from server.errors import APIError
@@ -992,6 +995,147 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             {"messages": [{"role": "system", "content": "First"}, later[0]]},
         )["prompt"]
         self.assertTrue(prompt.startswith("<|im_start|>system\nFirst<|im_end|>"))
+
+
+class CustomChatTemplateTests(unittest.TestCase):
+    """A custom template, from the file --chat-template-file names, in place
+    of every template the tokenizer defines."""
+
+    # Renders each message in order: later system messages in place.
+    CUSTOM = (
+        "{%- for message in messages %}"
+        "{{- '[' + message.role + '] ' + message.content + '\\n' }}"
+        "{%- endfor %}{%- if add_generation_prompt %}[assistant] {%- endif %}"
+    )
+    NATIVE = (
+        "{%- for message in messages %}{{- message.role + ': ' + message.content"
+        " + '\\n' }}{%- endfor %}"
+    )
+
+    def test_a_custom_template_replaces_every_template_the_tokenizer_defines(self):
+        defined = {"default": self.NATIVE, "tool_use": source("qwen36")}
+        upstream = tokenizer(copy.deepcopy(defined))
+        templates = ChatTemplates(upstream, override=self.CUSTOM)
+        for tools in (None, TOOLS):
+            with self.subTest(tools=bool(tools)):
+                chosen = templates.select(tools)
+                self.assertEqual(chosen.source, self.CUSTOM)
+                self.assertEqual(chosen.later_system, NATIVE)
+        self.assertEqual(templates.status(), {"later_system": NATIVE})
+        self.assertEqual(
+            render(upstream, AGENT_TURNS, templates.select(TOOLS).source),
+            "[system] You are a coding agent.\n\nWork in /repo.\n"
+            "[user] Fix the failing test\n[assistant] \n[tool] def test(): ...\n"
+            "[system] Approval mode changed: never ask.\n[user] Continue\n"
+            "[assistant]",
+        )
+        # The tokenizer keeps its own templates, and one without any is
+        # served by a custom template.
+        self.assertEqual(upstream.chat_template, defined)
+        bare = ChatTemplates(tokenizer(None), override=self.CUSTOM)
+        self.assertEqual(bare.select(None).source, self.CUSTOM)
+
+    def test_a_custom_template_is_probed_as_the_tokenizers_are(self):
+        templates = ChatTemplates(tokenizer(self.NATIVE), override=source("qwen36"))
+        chosen = templates.select(None)
+        self.assertEqual(
+            (chosen.original, chosen.later_system), (chat_templates.REJECTS, PATCHED)
+        )
+        self.assertNotEqual(chosen.source, source("qwen36"))
+        self.assertTrue(templates.describe().startswith("patched to render"))
+
+    def test_a_custom_template_that_cannot_render_stops_startup(self):
+        # Splash never falls back from a custom template to the tokenizer's.
+        for override, refusal in (
+            ("", "the custom chat template is empty"),
+            (" \n", "the custom chat template is empty"),
+            (
+                "{{ raise_exception('not this model') }}",
+                "cannot render a conversation: not this model",
+            ),
+            ("{{ messages[0].content.missing() }}", "cannot render a conversation"),
+            ("{% for message in messages %}", "cannot render a conversation"),
+        ):
+            with (
+                self.subTest(override=override),
+                self.assertRaisesRegex(ChatTemplateError, refusal),
+            ):
+                ChatTemplates(tokenizer(self.NATIVE), override=override)
+
+    def test_a_template_file_is_read_once_as_written(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            # Its bytes as written: a byte order mark, CRLF and surrounding
+            # whitespace stay, as transformers reads a chat_template.jinja.
+            data = b"\xef\xbb\xbf  " + self.CUSTOM.encode() + b"\r\n\r\n"
+            path = root / "custom template.jinja"
+            path.write_bytes(data)
+            read = read_template_file(path)
+            self.assertEqual(
+                (read.path, read.source, read.sha256),
+                (path, data.decode(), hashlib.sha256(data).hexdigest()),
+            )
+            # transformers' own tags compile.
+            path.write_text(
+                "{% for m in messages %}{% if loop.first %}{% continue %}"
+                "{% endif %}{% generation %}{{ m.content | tojson }}"
+                "{% endgeneration %}{% endfor %}"
+            )
+            read_template_file(path)
+            (root / "folder").mkdir()
+            for name, data, refusal in (
+                ("absent.jinja", None, "absent.jinja: No such file or directory"),
+                ("folder", None, "folder: Is a directory"),
+                ("latin.jinja", "é".encode("latin-1"), "latin.jinja is not UTF-8"),
+                ("blank.jinja", b" \n\t", "blank.jinja is empty"),
+                (
+                    "open.jinja",
+                    b"{% for message in messages %}",
+                    "open.jinja is not a Jinja template Splash renders: line 1:",
+                ),
+                (
+                    "filter.jinja",
+                    b"\n{{ messages | no_such_filter }}",
+                    "line 2: No filter named 'no_such_filter'",
+                ),
+            ):
+                path = root / name
+                if data is not None:
+                    path.write_bytes(data)
+                with (
+                    self.subTest(name),
+                    self.assertRaisesRegex(ChatTemplateError, refusal),
+                ):
+                    read_template_file(path)
+
+    def test_every_request_path_uses_the_custom_template(self):
+        recording = ChatTemplateFrontendTests.OffsetTokenizer(
+            {"default": source("qwen38"), "tool_use": source("qwen36")}
+        )
+        templates = ChatTemplates(recording, override=source("qwen38_gguf"))
+        harness = fixtures.Harness(
+            fixtures.FakeRuntime(fixtures.Plan([[1]])),
+            tokenizer=recording,
+            chat_templates=templates,
+        )
+        self.addCleanup(harness.close)
+        chosen = templates.select(TOOLS).source
+        self.assertIs(templates.select(None).source, chosen)
+        messages = [{"role": "user", "content": "Hi"}]
+        for path, body in (
+            ("/apply-template", {"messages": messages}),
+            ("/apply-template", {"messages": messages, "tools": TOOLS}),
+            ("/v1/chat/completions", {"messages": messages, "max_tokens": 1}),
+            ("/v1/messages/count_tokens", {"messages": messages}),
+        ):
+            with self.subTest(path=path, tools="tools" in body):
+                recording.templates.clear()
+                code, _, payload = harness.request(
+                    "POST", path, {"model": "test-model", **body}
+                )
+                self.assertEqual(code, 200, payload)
+                used = {kwargs["chat_template"] for _, kwargs in recording.templates}
+                self.assertEqual(used, {chosen})
 
 
 class LeadingSystemMergeTests(unittest.TestCase):
