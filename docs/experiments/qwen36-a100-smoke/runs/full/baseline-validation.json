@@ -1,0 +1,24 @@
+{
+  "block_budget": 8,
+  "blocks": 8,
+  "continuations_evaluated": 4,
+  "matching_proposal_histogram": [
+    1,
+    2,
+    0,
+    0,
+    2,
+    1,
+    1,
+    1
+  ],
+  "mean_matching_proposals": 3.5,
+  "scope": "frozen-teacher greedy trace replay; not native throughput or sampled acceptance",
+  "selector_accuracy_when_covered": 0.7692307692307693,
+  "selector_ce": 0.7091482397372602,
+  "supervision": "target-generated",
+  "top_k_coverage": 0.9285714285714286,
+  "total_continuations": 4,
+  "unary_ce": 1.6650410278567247,
+  "weight_precision": "BF16 serving export"
+}

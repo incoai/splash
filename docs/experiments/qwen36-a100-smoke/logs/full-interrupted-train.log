@@ -1,0 +1,24 @@
+Loading weights:   0%|          | 0/1026 [00:00<?, ?it/s]Loading weights:  34%|███▎      | 344/1026 [00:00<00:00, 3423.00it/s]Loading weights:  67%|██████▋   | 687/1026 [00:00<00:00, 3148.60it/s]Loading weights:  98%|█████████▊| 1004/1026 [00:00<00:00, 3122.04it/s]Loading weights: 100%|██████████| 1026/1026 [00:00<00:00, 3158.52it/s]
+captured 1 continuations (13.5s)
+captured 2 continuations (25.1s)
+captured 3 continuations (36.5s)
+captured 4 continuations (43.7s)
+captured 5 continuations (55.1s)
+captured 6 continuations (61.6s)
+captured 7 continuations (73.0s)
+captured 8 continuations (84.4s)
+captured 1 continuations (11.7s)
+captured 2 continuations (23.1s)
+captured 3 continuations (34.7s)
+captured 4 continuations (45.2s)
+step 1/20: unary CE 0.4292
+step 2/20: unary CE 0.4480
+step 3/20: unary CE 0.0526
+step 4/20: unary CE 0.4851
+step 5/20: unary CE 0.1745
+step 6/20: unary CE 2.0238
+step 7/20: unary CE 0.0040
+step 8/20: unary CE 0.1792
+step 9/20: unary CE 0.2680
+step 10/20: unary CE 0.3121
+training interrupted; resume from the latest complete checkpoint with --resume

@@ -1,0 +1,93 @@
+{
+  "source_commit": "1aae5d5dcb45805aad63915de54e845dd6be7c37",
+  "recipes": {
+    "selector": {
+      "trainer_module_hashes_match": true,
+      "trainer_modules_checked": 13,
+      "native_contract_hashes_match": true,
+      "native_contract_files_checked": 5,
+      "metric_steps": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20
+      ],
+      "checkpoint_progress": {
+        "best_checkpoint": "step-00000010",
+        "best_score": 3.5,
+        "cursor": 80,
+        "run_identity": "cf72ffc124cb8e96cc311857f5364140c903802252175443630b25e3589c42ff",
+        "step": 20,
+        "updates": 20
+      },
+      "downloaded_export_file_hashes_match": true,
+      "export_identity": {
+        "config.json": "016202877100d168a93f12f8c043cf1a161cb793b20ceee50a32f0931644cc89",
+        "model-00001.safetensors": "751c9d20ecbd95a2c2e3b23344e114a9411d99667d6cb5e75c97277382a96c77",
+        "model-00002.safetensors": "5a5e07e9f745a1e278663b830466c9ccedbde918bcfbc326899a21394d32b844",
+        "model.safetensors.index.json": "a93eaa8256fbcecd195c541bd5d8f6b2ce480a98c81043769e68b1cae866a1f1",
+        "training-provenance.json": "b947b43635720537a9a41ba676e90e82bff307771d5fb03d9adf986ae9f88ae7"
+      }
+    },
+    "full": {
+      "trainer_module_hashes_match": true,
+      "trainer_modules_checked": 13,
+      "native_contract_hashes_match": true,
+      "native_contract_files_checked": 5,
+      "metric_steps": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20
+      ],
+      "checkpoint_progress": {
+        "best_checkpoint": "step-00000010",
+        "best_score": 3.75,
+        "cursor": 80,
+        "run_identity": "34dfa5c26f2e04a10f7484a684072200327445d43c3bb498dd5f9ea3b3095846",
+        "step": 20,
+        "updates": 20
+      },
+      "downloaded_export_file_hashes_match": true,
+      "export_identity": {
+        "config.json": "016202877100d168a93f12f8c043cf1a161cb793b20ceee50a32f0931644cc89",
+        "model-00001.safetensors": "392424afc8b058f7c9b0fb3720c6fe26144064751e7ebb920c4253a748ac3927",
+        "model-00002.safetensors": "ae28062d0e9fd99060edd2f2b5ad5a36e7cffbaad7eb1cd468539c2c9f262c0f",
+        "model.safetensors.index.json": "a93eaa8256fbcecd195c541bd5d8f6b2ce480a98c81043769e68b1cae866a1f1",
+        "training-provenance.json": "52d8f959510a343bd99bdd29bd43e2b71a4cb77fca693a41b417eb16d447073f"
+      }
+    }
+  }
+}

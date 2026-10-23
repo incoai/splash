@@ -29,7 +29,11 @@ per million captured tokens for that family, plus model weights and optimizer
 checkpoints. Qwen3.6-35B-A3B caches use about 32.8 GB per million tokens. Its
 teacher still holds all experts in memory even though only a subset is active
 per token. Do not infer its full memory requirement from the 3B active count.
-The published 27B GPU measurements do not qualify the full-size MoE workflow.
+The separate [full-size MoE smoke](experiments/qwen36-a100-smoke/README.md)
+completed 20 selector and 20 full-draft steps on the same GPU class. Its
+long-context preflight peaked at 65.9 GiB during teacher capture, 5.1 GiB during
+selector optimization and 11.8 GiB during full-draft optimization. These are
+separate allocated peaks from one probe, not total device-memory requirements.
 
 ```bash
 python3.12 -m venv /path/to/training-env
@@ -70,9 +74,12 @@ Use these two paths in place of the `qwen38` paths in every command below,
 and copy `training/qwen3_6_35b_a3b.yaml` or
 `training/qwen3_6_35b_a3b_full.yaml` as your recipe. Family detection is automatic
 from checkpoint metadata; mixing the dense and MoE checkpoints is rejected.
-The full-size MoE path has metadata/tokenizer validation and real small-MoE
-pipeline tests, while real-checkpoint CUDA and native qualification are still
-required. There is no MoE acceptance or serving speed claim.
+The full-size MoE CUDA smoke covers preparation, training, BF16 export and
+held-out comparison in both modes, plus interrupted resume in full-draft mode.
+Its tiny test set showed
+no matching-proposal gain. Native qualification of the trained exports and
+representative effectiveness testing remain required; there is no MoE serving
+speed claim.
 
 ## 2. Prepare your JSONL dataset
 

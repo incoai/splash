@@ -68,9 +68,14 @@ including packed or individual expert storage. GGUF, MLX, FP8, and NVFP4
 training targets are rejected.
 `--init-draft` requires the matching released BF16 DFlash2 checkpoint.
 
-The MoE adapter has real small-model pipeline tests and released-checkpoint
-metadata/tokenizer validation. A full-size MoE CUDA run and native
-exported-checkpoint qualification remain pending.
+The MoE adapter has real small-model pipeline tests, released-checkpoint
+metadata/tokenizer validation and a [full-size A100 CUDA smoke](experiments/qwen36-a100-smoke/README.md)
+at the isolated #499 source `1aae5d5dcb45805aad63915de54e845dd6be7c37`.
+That smoke completed 20 selector and 20 full-draft steps, interrupted resume,
+finite BF16 export and held-out comparison. Full-draft validation matching
+proposals rose from 3.5 to 3.75; both candidates tied the released baseline at
+4.5 on the tiny held-out test. Native qualification of these trained MoE exports
+and representative effectiveness testing remain pending.
 
 Both inputs stay local; commands never download checkpoints, provision a
 machine, upload weights, or start a paid job. Input files are fingerprinted
@@ -282,6 +287,16 @@ effectiveness conclusions. Sustained full-draft training, matched-distribution
 comparisons, sampled decoding, longer contexts and paired serving throughput
 and latency measurements remain separate qualification work. The recorded
 runs precede the explicit thinking controls and metric fixes described above.
+
+The separate [2026-10-23 MoE CUDA smoke](experiments/qwen36-a100-smoke/README.md)
+ran the isolated #499 source `1aae5d5dcb45` with the full BF16 Qwen3.6-35B-A3B
+pair, explicit non-thinking capture and independent selector/full-draft recipes.
+Both completed 20 optimizer updates, export and final comparison; full-draft
+training also recovered from a committed step-10 interruption. Long-context
+preflight capture peaked at 65.9 GiB allocated, selector optimization at 5.1 GiB
+and full-draft optimization at 11.8 GiB, measured separately. Both trained
+candidates tied the baseline at 4.5 matching proposals on the tiny held-out set.
+These MoE exports have not yet received the older dense run's native qualification.
 
 ## Development tests
 

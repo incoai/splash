@@ -1,0 +1,16 @@
+{"source_id": "runpod-moe-smoke-0", "messages": [{"role": "user", "content": "Write Python code for a stable deduplication function for strings and explain its time complexity."}]}
+{"source_id": "runpod-moe-smoke-1", "messages": [{"role": "user", "content": "Implement a Python function that validates balanced parentheses, including two worked examples."}]}
+{"source_id": "runpod-moe-smoke-2", "messages": [{"role": "user", "content": "Prove by induction that the sum of the first n positive odd integers equals n squared."}]}
+{"source_id": "runpod-moe-smoke-3", "messages": [{"role": "user", "content": "Explain how to solve 3*x + 7 = 28 and check the answer by substitution."}]}
+{"source_id": "runpod-moe-smoke-4", "messages": [{"role": "user", "content": "Explain three practical ways a small library can reduce its electricity consumption."}]}
+{"source_id": "runpod-moe-smoke-5", "messages": [{"role": "user", "content": "Write a concise checklist for organizing a community book exchange."}]}
+{"source_id": "runpod-moe-smoke-6", "messages": [{"role": "user", "content": "Return a JSON object describing three project milestones, each with a name, owner and integer duration_days."}]}
+{"source_id": "runpod-moe-smoke-7", "messages": [{"role": "user", "content": "Explain how a server should handle an invalid JSON request body and give a small error response example."}]}
+{"source_id": "runpod-moe-smoke-8", "messages": [{"role": "user", "content": "Write a Python function to merge two sorted integer lists, with an example and complexity analysis."}]}
+{"source_id": "runpod-moe-smoke-9", "messages": [{"role": "user", "content": "Prove that the product of two odd integers is odd, showing the algebra."}]}
+{"source_id": "runpod-moe-smoke-10", "messages": [{"role": "user", "content": "Describe a weekly maintenance plan for a small public garden."}]}
+{"source_id": "runpod-moe-smoke-11", "messages": [{"role": "user", "content": "Return JSON describing two meeting rooms with their names, integer capacities and boolean availability."}]}
+{"source_id": "runpod-moe-smoke-12", "messages": [{"role": "user", "content": "Implement binary search in Python and show how it handles an absent key."}]}
+{"source_id": "runpod-moe-smoke-13", "messages": [{"role": "user", "content": "Explain why the sum of two consecutive integers is odd."}]}
+{"source_id": "runpod-moe-smoke-14", "messages": [{"role": "user", "content": "Give a practical five-step plan for making a shared office quieter."}]}
+{"source_id": "runpod-moe-smoke-15", "messages": [{"role": "user", "content": "Return a JSON object containing a three-item shopping list with item names and integer quantities."}]}
