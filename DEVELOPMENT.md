@@ -3931,7 +3931,13 @@ window, the fp32 logits of the prefill's final position and of ROWS decode
 positions after it, each computed by a verify row forced to the true next
 token, in `OUTPUT-END.f32`, and prints how well they predict the true ids. It
 also takes `--kv-format`, `--state-format`, `--expert-memory` and
-`--ple-memory`.
+`--ple-memory`, and, with `--captures yes`, writes the output rows of the
+target layers the model's draft reads (its `target_layer_ids`) at the
+positions a window's prefill computed, in one command, to
+`OUTPUT-END.captures.f32` (fp32, a row per position of each layer's hidden
+values in the draft's layer order), which a reference's residuals after those
+layers compare with: a draft of the layers to compare, such as a test draft
+whose `fc` reads them, makes them its captures.
 
 `benchmark-backend` lists the contexts the memory plan cannot hold in its
 report. Its cache checks reuse each context's cached prefix, so they need that

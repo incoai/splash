@@ -3503,6 +3503,11 @@ std::span<const float> RuntimeInstrumentation::lastLogits(const Runtime &runtime
           uint64_t{ExecutionLimits::targetVerifyRows} * impl.geometry.target.vocabularySize};
 }
 
+std::span<const uint16_t> RuntimeInstrumentation::lastCapturedRows(const Runtime &runtime, uint32_t chunk) {
+  const MetalBuffer captured = runtime.impl_->prefillArena->get(PrefillTensor::Captured, chunk);
+  return {contents<uint16_t>(captured, "captured target rows"), captured.sizeBytes() / sizeof(uint16_t)};
+}
+
 uint32_t RuntimeInstrumentation::lastVerifyRows(const Runtime &runtime, uint32_t lane) {
   return *contents<uint32_t>(runtime.impl_->decodeArena->get(lane, DecodeTensor::VerifyRows), "verify rows");
 }
