@@ -165,7 +165,7 @@ void DFlashDraft::addContextPrefill(
   }
   operators_.linear().addPrefill(graph, buffers.capturedTargetHidden, weights_.contextProjection,
                                  buffers.projected, rows, buffers.linearScratch);
-  ops::Normalization::addRms(graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize,
+  ops::Normalization::addRms(backend_, graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize,
                              rows);
   const uint64_t rowBytes = uint64_t{layout.hiddenSize} * sizeof(uint16_t);
   const auto store = [&](uint32_t compactRow, uint32_t count, uint32_t startPosition,
@@ -266,7 +266,7 @@ void DFlashDraft::addDecode(
     const uint32_t next = current ^ 1;
     const DFlashDraftLayerWeights &weights = weights_.layers[layer];
     const ops::LinearPlan attentionDynamicPlan = linear.decodePlan(weights.attentionDynamic, lanes);
-    const ops::PreparedInput attentionNormalized = ops::Normalization::addRms(
+    const ops::PreparedInput attentionNormalized = ops::Normalization::addRms(backend_,
         graph, buffers.hidden[current], weights.inputNorm, buffers.normalized,
         layout.hiddenSize, rows, scratch, attentionDynamicPlan.input());
     linear.add(graph,
@@ -302,7 +302,7 @@ void DFlashDraft::addDecode(
          buffers.hidden[current], buffers.residual},
         attentionPlan, ops::DraftConvolutionStage::Residual);
     const ops::LinearPlan mlpDynamicPlan = linear.decodePlan(weights.mlpDynamic, lanes);
-    const ops::PreparedInput mlpNormalized = ops::Normalization::addRms(
+    const ops::PreparedInput mlpNormalized = ops::Normalization::addRms(backend_,
         graph, buffers.residual, weights.postAttentionNorm, buffers.normalized,
         layout.hiddenSize, rows, scratch, mlpDynamicPlan.input());
     linear.add(graph,
@@ -332,7 +332,7 @@ void DFlashDraft::addDecode(
   // The final norm feeds the shared vocabulary head and then the selector;
   // the selector reuses whatever table the head leaves when the layouts match.
   const ops::LinearPlan headPlan = linear.decodePlan(vocabularyProjection, lanes);
-  const ops::PreparedInput finalHidden = ops::Normalization::addRms(
+  const ops::PreparedInput finalHidden = ops::Normalization::addRms(backend_,
       graph, buffers.hidden[weights_.layout.layers & 1], weights_.finalNorm,
       buffers.finalHidden, layout.hiddenSize, rows, scratch, headPlan.input());
   const ops::PreparedInput afterHead = linear.add(
@@ -368,7 +368,7 @@ void DFlashDraft::addContextCommit(
   // Every layer's key and value projection reads the same normalized rows,
   // prepared for the first layer's plan.
   ops::LinearPlan kvPlan = linear.decodePlan(contextKvProjections_[0], lanes);
-  ops::PreparedInput hidden = ops::Normalization::addRms(
+  ops::PreparedInput hidden = ops::Normalization::addRms(backend_,
       graph, buffers.projected, weights_.hiddenNorm, buffers.hidden, layout.hiddenSize, rows,
       scratch, kvPlan.input());
 

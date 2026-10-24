@@ -432,7 +432,7 @@ struct Runtime::Impl {
         operators(value.operators),
         kvPages(value.kvPages),
         states(value.stateStorage),
-        sampling(geometry.target.vocabularySize),
+        sampling(backend, geometry.target.vocabularySize),
         targetModel(std::visit(
                         [&](const auto &weights) {
                           return makeQwenTarget(weights, geometry.target, value.backend, operators,

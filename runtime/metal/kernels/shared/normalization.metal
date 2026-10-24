@@ -119,29 +119,30 @@ static_assert(SPLASH_STAGED_NORM_THREADS % 256 == 0, "rms_inverse's 256 threads 
 template <class WV>
 inline void norm_rms_staged_row(device const bfloat4 *input, device const WV *weight,
                                 device bfloat4 *output, uint width, uint row, uint tid,
-                                uint lane, uint sg, threadgroup bfloat4 *stage,
+                                uint lane, uint sg, uint threads, threadgroup bfloat4 *stage,
                                 threadgroup float *reductions) {
 #pragma clang fp reassociate(off)
   const uint vectors = width / 4;
-  for (uint column = tid; column < vectors; column += SPLASH_STAGED_NORM_THREADS)
+  for (uint column = tid; column < vectors; column += threads)
     stage[column] = input[row * vectors + column];
   threadgroup_barrier(mem_flags::mem_threadgroup);
   // The first 256 threads reduce the row as rms_inverse does; the other
   // simdgroups' partials are zero and unread.
   const float sum = tid < 256 ? row_squares((threadgroup const bfloat *)stage, width, tid) : 0.0f;
   const float inverse = rms_inverse_of_sums(sum, width, reductions, tid, lane, sg);
-  for (uint column = tid; column < vectors; column += SPLASH_STAGED_NORM_THREADS)
+  for (uint column = tid; column < vectors; column += threads)
     output[row * vectors + column] = bfloat4((float4(stage[column]) * inverse) * float4(weight[column]));
 }
 #define NORM_RMS_STAGED(Name, WV) \
   kernel void Name(device const bfloat4 *input [[buffer(0)]], \
       device const WV *weight [[buffer(1)]], device bfloat4 *output [[buffer(2)]], \
-      constant uint &width [[buffer(3)]], uint row [[threadgroup_position_in_grid]], \
+      constant NormParams &params [[buffer(3)]], uint row [[threadgroup_position_in_grid]], \
       uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]], \
       uint sg [[simdgroup_index_in_threadgroup]]) { \
     threadgroup bfloat4 stage[SPLASH_STAGED_NORM_WIDTH / 4]; \
     threadgroup float reductions[SPLASH_STAGED_NORM_THREADS / 32]; \
-    norm_rms_staged_row(input, weight, output, width, row, tid, lane, sg, stage, reductions); \
+    norm_rms_staged_row(input, weight, output, params.width, row, tid, lane, sg, params.threads, \
+                        stage, reductions); \
   }
 NORM_RMS_STAGED(norm_rms_staged, bfloat4)
 NORM_RMS_STAGED(norm_rms_staged_f32, packed_float4)

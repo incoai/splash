@@ -15,7 +15,7 @@ namespace {
 constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kTargetShards = SPLASH_TARGET_SAMPLING_SHARDS;
 constexpr uint32_t kVocabularyThreads = SPLASH_TARGET_VOCABULARY_THREADS;
-constexpr uint32_t kVocabularyGroups = SPLASH_TARGET_VOCABULARY_GROUPS;
+constexpr uint32_t kVocabularyRanges = SPLASH_TARGET_VOCABULARY_RANGES;
 
 // A sampled lane keeps its topK most likely tokens, and every token for 0 or
 // a topK past the vocabulary (top-k disabled).
@@ -128,8 +128,8 @@ void Sampling::countPenaltyTokens(std::span<uint32_t> words,
     ++words[token];
 }
 
-Sampling::Sampling(uint32_t vocabulary)
-    : vocabulary_(vocabulary), maskWords_((vocabulary + 31) / 32) {
+Sampling::Sampling(metal::MetalBackend &backend, uint32_t vocabulary)
+    : backend_(backend), vocabulary_(vocabulary), maskWords_((vocabulary + 31) / 32) {
   if (!vocabulary)
     throw std::invalid_argument("invalid sampling geometry");
 }
@@ -226,6 +226,17 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
   params.drafted_rows = rows.draftedRows;
   params.stop_token_0 = stopToken0;
   params.stop_token_1 = stopToken1;
+  // The driver caps the search pipeline's total threads below the design
+  // width on some families (Apple7); the kernel strides its token loops by
+  // the dispatch's thread count, which stays the design width elsewhere.
+  params.search_threads =
+      std::min<uint32_t>(kVocabularyThreads,
+                         backend_.pipelineMaxThreads("decode_sample_vocabulary_search"));
+  // The draw's threadgroups cover the row's ranges with their simdgroups;
+  // the row's slices (and arrivals) follow the thread count the driver allows.
+  params.draw_threads =
+      std::min<uint32_t>(kVocabularyThreads,
+                         backend_.pipelineMaxThreads("decode_sample_vocabulary_draw"));
   for (uint32_t lane = 0; lane < policies.size(); ++lane) {
     const SamplingPolicy &policy = policies[lane];
     if (policy.samples()) {
@@ -306,15 +317,16 @@ void Sampling::addSelection(metal::CommandGraph &graph, const TargetSamplingPara
     graph.add("decode_sample_vocabulary_search",
               {buffers.logits, buffers.constraintMasks, buffers.partialMasses,
                buffers.vocabularyRows},
-              params, {selected, 1, 1}, {kVocabularyThreads, 1, 1});
+              params, {selected, 1, 1}, {params.search_threads, 1, 1});
+    const uint32_t drawGroups = params.draw_threads / 32;
+    const uint32_t drawSlices = (kVocabularyRanges + drawGroups - 1) / drawGroups;
     graph.add("decode_sample_vocabulary_draw",
               {buffers.logits, buffers.constraintMasks, buffers.vocabularyRows,
                buffers.inputTokens, buffers.draftCandidates,
                buffers.draftProbabilities, buffers.uniforms,
                buffers.outputTokens, buffers.vocabularyRanges,
                buffers.vocabularyArrivals},
-              params, {selected * kVocabularyGroups, 1, 1},
-              {kVocabularyThreads, 1, 1});
+              params, {selected * drawSlices, 1, 1}, {params.draw_threads, 1, 1});
   }
   // Only a selection that reaches a lane's thinking cutoff dispatches it.
   const ThinkingCutoffs cutoffs =

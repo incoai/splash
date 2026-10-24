@@ -88,6 +88,8 @@ ChunkTimings timedChunks(double most) {
 struct Fake {
   bool dense = true;
   std::string unsupported;
+  // The Mac's Apple GPU family as the model takes it; the default is the family the programs were tuned on.
+  uint32_t appleGpuFamily = 9;
   std::optional<std::string> unavailable;
   uint64_t unitBytes = 256 * kMiB;
   std::function<Timings()> time = measured;
@@ -119,6 +121,7 @@ struct Fake {
     AneFfnModel result;
     result.dense = dense;
     result.unsupported = unsupported;
+    result.appleGpuFamily = appleGpuFamily;
     result.unavailable = [this] {
       ++asked;
       return unavailable;
@@ -186,8 +189,9 @@ void testOff() {
           "--disable-ane was logged for a model the split does not take");
 }
 
-// A model of no dense FFN layers logs nothing; one whose layers the split does not take, or on a Mac without the
-// private Neural Engine interface, says why. Each serves the context the plan holds without the split.
+// A model of no dense FFN layers logs nothing; one whose layers the split does not take, on a Mac without the
+// private Neural Engine interface, or on one of Apple GPU family 7 or 8, says why. Each serves the context the
+// plan holds without the split.
 void testUnsupported() {
   Fake fake;
   fake.dense = false;
@@ -209,6 +213,15 @@ void testUnsupported() {
               started.start.outcome.context == contextWith(0) &&
               line(started.log, "The GPU runs the prefill FFN alone: AppleNeuralEngine lacks _ANEClient."),
           "a Mac without the Neural Engine's interface did not say so: " + started.log);
+  for (const uint32_t family : {7U, 8U}) {
+    fake = {};
+    fake.appleGpuFamily = family;
+    started = start(fake);
+    require(started.start.outcome.kind == Kind::Unsupported && nothingStarted(fake, started) && !fake.asked &&
+                started.start.outcome.context == contextWith(0) &&
+                line(started.log, "The GPU runs the prefill FFN alone: this Mac's Apple GPU family is below 9."),
+            "a Mac of Apple GPU family " + std::to_string(family) + " ran the Neural Engine FFN split");
+  }
 }
 
 // A --max-context no split leaves: the GPU runs alone, nothing is timed or prepared, and a warning names the most
@@ -283,15 +296,17 @@ void testRefusalIsArithmetic() {
           "a split that leaves no context beside other memory was not refused, or one that leaves some was");
   require(!fake.timings && !fake.prepared && !fake.recalled && !fake.remembered,
           "weighing the refusal set something up");
-  // --disable-ane, a MoE target, layers the split does not take, and a Mac without the interface.
-  Fake moe, unsupported, unavailable;
+  // --disable-ane, a MoE target, layers the split does not take, a Mac without the interface, and one of a Legacy GPU family.
+  Fake moe, unsupported, unavailable, legacy;
   moe.dense = false;
   unsupported.unsupported = "ANE FFN split needs unrotated quantized projections";
   unavailable.unavailable = "AppleNeuralEngine lacks _ANEClient";
+  legacy.appleGpuFamily = 7;
   require(!aneFfnRefused(fake.model(), {.enabled = false}, 0, beside(16 * kGiB)) &&
               !aneFfnRefused(moe.model(), {}, 0, beside(16 * kGiB)) &&
               !aneFfnRefused(unsupported.model(), {}, 0, beside(16 * kGiB)) &&
-              !aneFfnRefused(unavailable.model(), {}, 0, beside(16 * kGiB)),
+              !aneFfnRefused(unavailable.model(), {}, 0, beside(16 * kGiB)) &&
+              !aneFfnRefused(legacy.model(), {}, 0, beside(16 * kGiB)),
           "a split that does not run was refused");
 }
 

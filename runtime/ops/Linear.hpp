@@ -229,13 +229,15 @@ inline constexpr uint32_t kAssumedGpuCores = 32;
 [[nodiscard]] constexpr uint32_t plannedGpuCores(const DeviceCapabilities &device) noexcept {
   return device.gpuCoreCount ? device.gpuCoreCount : kAssumedGpuCores;
 }
-// The GPU family classes kernel policy tells apart: Apple9 (family 9: M3,
-// M4), whose matrix operations share the FP32 pipe, and Apple10 (family 10
-// and later: M5, M6), whose cores each hold a neural accelerator. Startup
-// refuses families below 9.
-enum class GpuFamilyClass : uint8_t { Apple9, Apple10 };
+// The GPU family classes kernel policy tells apart: Legacy (families 7 and
+// 8: M1, M2), which decodes and prefills entirely on the staged tiles,
+// never the register tile and never the neural accelerator; Apple9 (family
+// 9: M3, M4), whose matrix operations share the FP32 pipe; and Apple10
+// (family 10 and later: M5, M6), whose cores each hold a neural accelerator.
+enum class GpuFamilyClass : uint8_t { Legacy, Apple9, Apple10 };
 [[nodiscard]] constexpr GpuFamilyClass gpuFamilyClass(uint32_t appleGpuFamily) noexcept {
-  return appleGpuFamily >= 10 ? GpuFamilyClass::Apple10 : GpuFamilyClass::Apple9;
+  return appleGpuFamily >= 10 ? GpuFamilyClass::Apple10
+                               : appleGpuFamily == 9 ? GpuFamilyClass::Apple9 : GpuFamilyClass::Legacy;
 }
 
 // Owns projection pipeline selection and dispatch. Device policy uses the GPU

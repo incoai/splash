@@ -32,9 +32,9 @@ public:
   // Also writes the consumer's `layout` table into `scratch` when it is not
   // Plain, and throws when `scratch` cannot hold it; returns what the
   // scratch then describes.
-  static PreparedInput addRms(metal::CommandGraph &graph, metal::MetalBuffer input,
-                              const NormWeights &weight, metal::MetalBuffer output,
-                              uint32_t width, uint32_t rows,
+  static PreparedInput addRms(metal::MetalBackend &backend, metal::CommandGraph &graph,
+                              metal::MetalBuffer input, const NormWeights &weight,
+                              metal::MetalBuffer output, uint32_t width, uint32_t rows,
                               LinearScratch scratch = {},
                               LinearInput layout = LinearInput::Plain);
 };
