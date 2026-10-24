@@ -2433,7 +2433,30 @@
       "tooling": "perf/qwen38-m5-measurements",
       "decode": "perf/qwen38-m5-decode-m16",
       "prefill": "perf/qwen38-m5-short-prefill"
-    }
+    },
+    "pull_requests": [
+      {
+        "key": "tools",
+        "url": "https://github.com/incoai/splash/pull/583",
+        "number": 583,
+        "branch": "perf/qwen38-m5-measurements",
+        "draft": false
+      },
+      {
+        "key": "decode",
+        "url": "https://github.com/incoai/splash/pull/584",
+        "number": 584,
+        "branch": "perf/qwen38-m5-decode-m16",
+        "draft": true
+      },
+      {
+        "key": "prefill",
+        "url": "https://github.com/incoai/splash/pull/585",
+        "number": 585,
+        "branch": "perf/qwen38-m5-short-prefill",
+        "draft": false
+      }
+    ]
   },
   "issue_state_scope": "The issues array preserves original fork states at the end of measurement; upstream tracking is recorded separately."
 }

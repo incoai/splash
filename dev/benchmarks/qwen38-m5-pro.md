@@ -27,6 +27,10 @@ The measurements below belong to the pinned combined experimental patch;
 branch-specific validation is listed in each PR. The source archive retains
 the exact measured patch rather than relabeling it as a publication commit.
 
+Upstream PRs: [#583 evidence/tooling](https://github.com/incoai/splash/pull/583),
+[#584 M16 decode (draft)](https://github.com/incoai/splash/pull/584), and
+[#585 short prefill](https://github.com/incoai/splash/pull/585).
+
 ## What the implementation actually does
 
 The reference is the installed `mlx-community/Qwen3.8-27B-4bit`, target

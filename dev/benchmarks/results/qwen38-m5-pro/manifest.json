@@ -1722,8 +1722,8 @@
   ],
   "packaged_files": {
     "summary.json": {
-      "sha256": "479704e222b6a46cc611bf0da2e7835fa3d2d7582ad0cd7fb62d25c00956b6a0",
-      "bytes": 72980
+      "sha256": "a16f09de3620a6fc25d18d90a5f18491fde440e875969413c06bc4b5639c7ec1",
+      "bytes": 73598
     },
     "publication-validation.json": {
       "sha256": "78046448837d4b56974c319111bed6b8ba35a6b036f49ee378d0aecb857e7faa",
@@ -1738,8 +1738,8 @@
       "bytes": 4532
     },
     "publication.json": {
-      "sha256": "e2b3a44df283bf6bd8b7cfb0b4aee39d15802c842e89a8954c27de8387850fe8",
-      "bytes": 1271
+      "sha256": "b4aaee58b665181b775c88cbd2d014727ebba8395068080f3d70a7346e5b0d19",
+      "bytes": 1843
     },
     "exploration-sources.tar.gz": {
       "sha256": "3ec3e09fd7b69bd5e6aa1ecb0059712d6cc4542eb300f0002e946d02a92979d7",
