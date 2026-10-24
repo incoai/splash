@@ -1,0 +1,50 @@
+{
+  "upstream_repository": "incoai/splash",
+  "tracking_issues": [
+    {
+      "key": "evidence",
+      "title": "Qwen3.8-27B on a 48 GiB M5 Pro: reproducible inference measurements and tuning results",
+      "url": "https://github.com/incoai/splash/issues/580",
+      "number": 580
+    },
+    {
+      "key": "decode",
+      "title": "Qualify one-lane AF4G64 M16 decode on the 20-core M5 Pro",
+      "url": "https://github.com/incoai/splash/issues/581",
+      "number": 581
+    },
+    {
+      "key": "prefill",
+      "title": "Use smaller SIMD-group rows for short Qwen3.8-27B prefill on the 20-core M5 Pro",
+      "url": "https://github.com/incoai/splash/issues/582",
+      "number": 582
+    }
+  ],
+  "original_fork_to_upstream": {
+    "10": 580,
+    "11": 581,
+    "12": 580,
+    "13": 580,
+    "14": 582,
+    "15": 580,
+    "16": 580,
+    "17": 580,
+    "18": 580,
+    "19": 542
+  },
+  "existing_research_issues": [
+    542,
+    543,
+    544,
+    545,
+    546,
+    547,
+    548
+  ],
+  "measurement_scope": "Original combined patch at3135ab45 base; historical hashes and raw measurements retained.",
+  "publication_branches": {
+    "tooling": "perf/qwen38-m5-measurements",
+    "decode": "perf/qwen38-m5-decode-m16",
+    "prefill": "perf/qwen38-m5-short-prefill"
+  }
+}

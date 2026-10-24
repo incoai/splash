@@ -122,6 +122,10 @@ class RealServer:
             command.extend(("--max-memory", arguments.max_memory))
         if arguments.max_cache_disk is not None:
             command.extend(("--max-cache-disk", arguments.max_cache_disk))
+        if getattr(arguments, "disable_ane", False):
+            command.append("--disable-ane")
+        if getattr(arguments, "state_format", None) is not None:
+            command.extend(("--state-format", arguments.state_format))
         if arguments.ple_memory is not None:
             command.extend(("--ple-memory", arguments.ple_memory))
         if arguments.expert_memory is not None:
@@ -1717,6 +1721,8 @@ def add_server_arguments(parser):
     parser.add_argument("--max-context", type=int)
     parser.add_argument("--max-memory")
     parser.add_argument("--max-cache-disk")
+    parser.add_argument("--disable-ane", action="store_true")
+    parser.add_argument("--state-format", choices=("fp32", "bf16"))
     parser.add_argument(
         "--ple-memory",
         help="serve Qwen3.8-Flash-Next's PLE table from its GGUF through a row "
