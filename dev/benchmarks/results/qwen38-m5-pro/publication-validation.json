@@ -1,0 +1,319 @@
+{
+  "schema_version": 1,
+  "builds": [
+    {
+      "key": "tools",
+      "branch": "perf/qwen38-m5-measurements",
+      "head": "472f3290418c336c4d09e31fd4b5d6fe105cc9ef",
+      "files": [
+        "dev/benchmarks/backend_benchmark.mm",
+        "dev/benchmarks/gguf_projection_benchmark.mm",
+        "dev/benchmarks/qwen38-m5-pro.md",
+        "dev/benchmarks/results/qwen38-m5-pro/README.md",
+        "dev/benchmarks/results/qwen38-m5-pro/exploration-sources.tar.gz",
+        "dev/benchmarks/results/qwen38-m5-pro/manifest.json",
+        "dev/benchmarks/results/qwen38-m5-pro/measurements.jsonl.gz",
+        "dev/benchmarks/results/qwen38-m5-pro/publication.json",
+        "dev/benchmarks/results/qwen38-m5-pro/summary.json",
+        "dev/native.mk",
+        "dev/tests/gguf_projection_benchmark_cli.sh",
+        "dev/tests/smoke_real.py"
+      ],
+      "exit_code": 0,
+      "command": [
+        "make",
+        "-j4",
+        "all",
+        "build/engine-tests/backend-benchmark",
+        "build/engine-tests/gguf-projection-benchmark"
+      ]
+    },
+    {
+      "key": "decode",
+      "branch": "perf/qwen38-m5-decode-m16",
+      "head": "26e080b06e340433b4a7786cb8c8af2e54fed3ac",
+      "files": [
+        "dev/tests/engine/linear_plan_test.mm",
+        "runtime/ops/Linear.cpp",
+        "runtime/ops/Linear.hpp",
+        "runtime/ops/LinearGguf.cpp",
+        "runtime/ops/Weights.hpp"
+      ],
+      "exit_code": 0,
+      "command": [
+        "make",
+        "-j4",
+        "all",
+        "build/engine-tests/linear-plan",
+        "build/engine-tests/gguf-projection",
+        "build/engine-tests/production-and-test.metallib",
+        "build/engine-tests/model-runtime-oracle"
+      ]
+    },
+    {
+      "key": "prefill",
+      "branch": "perf/qwen38-m5-short-prefill",
+      "head": "34272c6811f0a13c1fe9a18570d789a9fc9d4688",
+      "files": [
+        "dev/benchmarks/gguf_projection_benchmark.mm",
+        "dev/tests/engine/gguf_projection_test.mm",
+        "dev/tests/engine/linear_plan_test.mm",
+        "runtime/metal/kernels/shared/gguf_linear.metal",
+        "runtime/model/Runtime.cpp",
+        "runtime/ops/Linear.cpp",
+        "runtime/ops/Linear.hpp",
+        "runtime/ops/LinearGguf.cpp",
+        "runtime/ops/Weights.hpp"
+      ],
+      "exit_code": 0,
+      "command": [
+        "make",
+        "-j4",
+        "all",
+        "build/engine-tests/linear-plan",
+        "build/engine-tests/gguf-projection",
+        "build/engine-tests/production-and-test.metallib",
+        "build/engine-tests/model-runtime-oracle"
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "branch": "tools",
+      "name": "tool-cli",
+      "command": [
+        "sh",
+        "dev/tests/gguf_projection_benchmark_cli.sh",
+        "build/engine-tests/gguf-projection-benchmark"
+      ],
+      "cwd": "$TOOLS_CHECKOUT",
+      "exit_code": 0,
+      "seconds": 0.5102648735046387
+    },
+    {
+      "branch": "tools",
+      "name": "tool-python",
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "unittest",
+        "dev.tests.tools.test_http_regression",
+        "dev.tests.tools.test_smoke_real",
+        "dev.tests.tools.test_backend_regression"
+      ],
+      "cwd": "$TOOLS_CHECKOUT",
+      "exit_code": 0,
+      "seconds": 36.92473292350769
+    },
+    {
+      "branch": "tools",
+      "name": "tool-ruff",
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "ruff",
+        "check",
+        "--config",
+        "dev/ruff.toml",
+        "dev/tests/smoke_real.py"
+      ],
+      "cwd": "$TOOLS_CHECKOUT",
+      "exit_code": 0,
+      "seconds": 0.055841922760009766
+    },
+    {
+      "branch": "tools",
+      "name": "tool-format",
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "ruff",
+        "format",
+        "--check",
+        "--config",
+        "dev/ruff.toml",
+        "dev/tests/smoke_real.py"
+      ],
+      "cwd": "$TOOLS_CHECKOUT",
+      "exit_code": 0,
+      "seconds": 0.02378082275390625
+    },
+    {
+      "branch": "tools",
+      "name": "tool-f32",
+      "command": [
+        "build/engine-tests/gguf-projection-benchmark",
+        "build/splash.metallib",
+        "af4g64",
+        "248320",
+        "5120",
+        "none",
+        "3",
+        "output=f32"
+      ],
+      "cwd": "$TOOLS_CHECKOUT",
+      "exit_code": 0,
+      "seconds": 10.509747982025146
+    },
+    {
+      "branch": "tools",
+      "name": "tool-counters",
+      "command": [
+        "build/engine-tests/backend-benchmark",
+        "build/splash.metallib",
+        "$REPO/install/models/mlx-community/Qwen3.8-27B-4bit",
+        "--scenario",
+        "decode",
+        "--samples",
+        "1",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
+      ],
+      "cwd": "$TOOLS_CHECKOUT",
+      "exit_code": 0,
+      "seconds": 17.55016279220581
+    },
+    {
+      "branch": "decode",
+      "name": "decode-cpu",
+      "command": [
+        "build/engine-tests/linear-plan",
+        "--cpu"
+      ],
+      "cwd": "$DECODE_CHECKOUT",
+      "exit_code": 0,
+      "seconds": 0.9232649803161621
+    },
+    {
+      "branch": "decode",
+      "name": "retained-runtime-binary-equivalence",
+      "exit_code": 0,
+      "evidence": "splash and splash.metallib SHA256 exactly match frozen m16-wide artifacts; its prior full real-model oracle and shader-validated tests apply without a new runtime change."
+    },
+    {
+      "branch": "prefill",
+      "name": "prefill-cpu",
+      "command": [
+        "build/engine-tests/linear-plan",
+        "--cpu"
+      ],
+      "cwd": "$PREFILL_CHECKOUT",
+      "exit_code": 0,
+      "seconds": 0.8752028942108154
+    },
+    {
+      "branch": "prefill",
+      "name": "prefill-shader",
+      "command": [
+        "build/engine-tests/gguf-projection",
+        "build/engine-tests/production-and-test.metallib"
+      ],
+      "cwd": "$PREFILL_CHECKOUT",
+      "exit_code": 0,
+      "seconds": 44.17465615272522
+    },
+    {
+      "branch": "prefill",
+      "name": "prefill-oracle",
+      "command": [
+        "build/engine-tests/model-runtime-oracle",
+        "build/splash.metallib",
+        "$REPO/install/models/mlx-community/Qwen3.8-27B-4bit",
+        "--ane-ffn-share",
+        "0",
+        "--max-context",
+        "32768"
+      ],
+      "cwd": "$PREFILL_CHECKOUT",
+      "exit_code": 0,
+      "seconds": 184.72623896598816
+    }
+  ],
+  "decode_binary_equivalence": {
+    "splash_sha256": "95e72e1cc94bf364167e530a8df0b43de8c47dbd746eeabb0b1198438136f7a1",
+    "metallib_sha256": "bf5b262ede9283ba38b93da31e069324fd996d54f05ee15cfee596bd7eea334c",
+    "reference": "Frozen m16-wide runtime; prior full runtime oracle and projection shader validation captured in measurements archive."
+  },
+  "integration": {
+    "merge": "all three branches merge automatically against3135ab45",
+    "runtime_and_other_modified_code_byte_identical_to_measured_combined_patch": true,
+    "only_code_difference": "CPU fused-format assertion moved into a separate decode-only test; rebuilt integrated CPU test PASS",
+    "cpu_exit_code": 0
+  },
+  "original_combined_validation": {
+    "make_check": {
+      "command": [
+        "caffeinate",
+        "-is",
+        "make",
+        "-j6",
+        "check"
+      ],
+      "exit_code": 0,
+      "log": "final-make-check.log",
+      "approximate_seconds_from_log_timestamps": 1763.365311384201,
+      "python_tests": 1321,
+      "python_skipped": 27,
+      "ruff_check": "pass",
+      "ruff_format": "pass",
+      "architecture": "pass"
+    },
+    "shader_validated_projection": {
+      "command": [
+        "env",
+        "MTL_SHADER_VALIDATION=1",
+        "build/engine-tests/gguf-projection",
+        "build/engine-tests/production-and-test.metallib"
+      ],
+      "pass_marker": true
+    },
+    "model_oracles": [
+      {
+        "name": "final-model-oracle-int8-fp32",
+        "command": [
+          "$REPO/build/engine-tests/model-runtime-oracle",
+          "$REPO/build/splash.metallib",
+          "$REPO/install/models/mlx-community/Qwen3.8-27B-4bit",
+          "--ane-ffn-share",
+          "0",
+          "--max-context",
+          "32768",
+          "--kv-format",
+          "int8",
+          "--state-format",
+          "fp32"
+        ],
+        "exit_code": 0,
+        "utc_start": 1792874305.679699,
+        "seconds": 177.7655050754547,
+        "pass_marker": true
+      },
+      {
+        "name": "final-model-oracle-bf16-bf16",
+        "command": [
+          "$REPO/build/engine-tests/model-runtime-oracle",
+          "$REPO/build/splash.metallib",
+          "$REPO/install/models/mlx-community/Qwen3.8-27B-4bit",
+          "--ane-ffn-share",
+          "0",
+          "--max-context",
+          "32768",
+          "--kv-format",
+          "bf16",
+          "--state-format",
+          "bf16"
+        ],
+        "exit_code": 0,
+        "utc_start": 1792874483.445666,
+        "seconds": 184.32151079177856,
+        "pass_marker": true
+      }
+    ]
+  },
+  "notes": [
+    "Timing claims refer to the original retained experimental artifacts; publication checks are correctness/build checks, not fresh performance qualification.",
+    "The decode PR remains draft because the aggregate cold2K timing gate is inconclusive."
+  ]
+}

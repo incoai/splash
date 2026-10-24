@@ -1725,6 +1725,10 @@
       "sha256": "479704e222b6a46cc611bf0da2e7835fa3d2d7582ad0cd7fb62d25c00956b6a0",
       "bytes": 72980
     },
+    "publication-validation.json": {
+      "sha256": "78046448837d4b56974c319111bed6b8ba35a6b036f49ee378d0aecb857e7faa",
+      "bytes": 9164
+    },
     "measurements.jsonl.gz": {
       "sha256": "79df2e7d7d966ba7d35ab73a28ad9805a13da55f9edfb6cd70b89d33d1f2edc9",
       "bytes": 256144
