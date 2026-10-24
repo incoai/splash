@@ -6,6 +6,7 @@
 #include "model/Model.hpp"
 #include "ops/Embedding.hpp"
 #include "ops/RowCopy.hpp"
+#include "ops/StopTokens.hpp"
 
 #import <Foundation/Foundation.h>
 
@@ -29,6 +30,7 @@ using splash::metal::MetalBuffer;
 using splash::ops::Embedding;
 using splash::ops::RowCopy;
 using splash::ops::RowRegion;
+using splash::ops::StopTokens;
 
 constexpr uint32_t kRows = splash::model::ExecutionLimits::targetVerifyRows;
 constexpr uint32_t kProposals =
@@ -49,12 +51,19 @@ using splash::test::require;
 using splash::test::requireExtent;
 
 constexpr std::array<uint32_t, kLanes> kAllRows{kRows, kRows, kRows, kRows};
+// The stop token runWidth places, in the last place the kernel compares.
+constexpr uint32_t kStopToken = 248044;
+constexpr StopTokens kFourStops{248046, 150001, 150003, kStopToken};
 
+// Lane stopLane's target selects `stopToken` at row stopRow, also its draft
+// below its accepted rows; acceptance cuts the lane's tokens after it when it
+// is one of `stops`.
 void runWidth(MetalBackend &backend, uint32_t width,
               const std::array<uint32_t, kLanes> &acceptedReference,
               const std::array<uint32_t, kLanes> &remainingReference,
               uint32_t stopLane = kLanes, uint32_t stopRow = 0,
-              const std::array<uint32_t, kLanes> &verifyRowsReference = kAllRows) {
+              const std::array<uint32_t, kLanes> &verifyRowsReference = kAllRows,
+              uint32_t stopToken = kStopToken, const StopTokens &stops = kFourStops) {
   require(width >= 1 && width <= kLanes, "invalid test width");
   MetalBuffer draft = shared(backend, kLanes * kProposals * sizeof(uint32_t),
                              "accept-draft");
@@ -101,19 +110,17 @@ void runWidth(MetalBackend &backend, uint32_t width,
     targetTokens[lane * kRows + kRows - 1] = 9000 + lane;
   }
 
-  constexpr uint32_t kStopToken = 248044;
   if (stopLane < width) {
     require(stopRow < kRows, "invalid stop row");
-    targetTokens[stopLane * kRows + stopRow] = kStopToken;
+    targetTokens[stopLane * kRows + stopRow] = stopToken;
     if (stopRow < acceptedReference[stopLane])
-      draftTokens[stopLane * kProposals + stopRow] = kStopToken;
+      draftTokens[stopLane * kProposals + stopRow] = stopToken;
   }
 
   AcceptBatchParams params{};
   std::copy(remainingReference.begin(), remainingReference.end(),
             std::begin(params.remaining));
-  params.stop_token_0 = kStopToken;
-  params.stop_token_1 = 248046;
+  std::ranges::copy(stops.ids, params.stop_tokens);
   ComputeDispatch dispatch;
   dispatch.pipelineName = "decode_accept_dflash";
   dispatch.buffers = {{0, draft},
@@ -136,7 +143,7 @@ void runWidth(MetalBackend &backend, uint32_t width,
     uint32_t expectedRetained =
         std::min({acceptedReference[lane] + 1, remainingReference[lane],
                   verifyRowsReference[lane]});
-    if (lane == stopLane && stopRow < expectedRetained)
+    if (lane == stopLane && stopRow < expectedRetained && stops.contains(stopToken))
       expectedRetained = stopRow + 1;
     require(acceptedCounts[lane] == acceptedReference[lane],
             "accepted proposal count mismatch");
@@ -254,6 +261,12 @@ int main(int argc, char **argv) {
     constexpr std::array<uint32_t, kLanes> allAccepted{7, 7, 7, 7};
     constexpr std::array<uint32_t, kLanes> shortRemaining{1, 2, 3, 8};
     runWidth(backend, kLanes, allAccepted, shortRemaining, 3, 3);
+    // SPLASH_NO_TOKEN, which pads a list of two stop tokens, is no stop token
+    // where acceptance retains it: a row with no selectable logit selects it,
+    // and a draft that proposed it there is accepted, so the lane keeps its
+    // later tokens and the runtime fails it on the sentinel.
+    runWidth(backend, kLanes, allAccepted, fullRemaining, 1, 2, kAllRows, SPLASH_NO_TOKEN,
+             StopTokens{248044, 248046});
     // A lane retains at most the rows its verify verified, below its budget
     // or above it; acceptance still counts every proposal it checked.
     constexpr std::array<uint32_t, kLanes> fewRows{2, 3, 5, 1};

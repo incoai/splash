@@ -49,7 +49,7 @@ struct Qwen4ExpLayout final : QwenHybridLayout {
   // cuts an n-gram short; and the token it reads at every position of an
   // image, which a prompt holds there (<|image_pad|>, server/frontend.py). A
   // GGUF states both (ple.eos_token_id, ple.image_token_id).
-  uint32_t pleEosToken = stopTokens[0];
+  uint32_t pleEosToken = stopTokens.ids[0];
   uint32_t pleImageToken = 248056;
 
   // Qwen3.8-Flash-Next's, its first family (kFamilies).

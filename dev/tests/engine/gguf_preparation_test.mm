@@ -506,9 +506,12 @@ constexpr uint64_t kSourceOffset = 96;
 
 // Row tiles are whole (the planner requires whole plane tiles of rows);
 // the shapes cover several tiles, super-blocks and groups, and a permuted row range.
+// A tensor of `windows` column windows is [rows, windows * K], repacked as the
+// windows' rows in turn (model::gguf::TensorRows::windows).
 struct Shape {
   uint32_t rows, K;
   model::gguf::RowOrder order;
+  uint32_t windows = 1;
 };
 
 // The narrowest K whose tile of source rows exceeds the repack staging, so
@@ -519,22 +522,38 @@ uint32_t widerThanStaging(Fmt f) {
 }
 
 // One quantized tensor through the production executor, from a file whose
-// data section starts at kSourceOffset, against the CPU reference's planes.
+// data section starts at kSourceOffset, against the CPU reference's planes of
+// its rows in image order, window after window. With blockNvfp4 the file
+// holds an NVFP4 tensor as llama.cpp's NVFP4 rows (blockNvfp4Rows), which the
+// reader converts window by window (TensorRows::ggufNvfp4RowBytes).
 void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, Fmt f, const Shape &shape,
-                 uint32_t seed) {
+                 uint32_t seed, bool blockNvfp4 = false) {
   const QuantFormat &layout = kQuantFormats[f];
-  const uint32_t rows = shape.rows, K = shape.K, stride = rowBytes(f, K);
-  const std::vector<uint8_t> native = fixture(f, rows, K, seed);
-  const Packed expected = repack(f, orderedRows(native, stride, shape.order), rows, K, nullptr);
+  const uint32_t windows = shape.windows, rows = shape.rows * windows, K = shape.K;
+  const uint32_t stride = rowBytes(f, windows * K), windowBytes = rowBytes(f, K);
+  std::vector<uint8_t> native = fixture(f, shape.rows, windows * K, seed);
+  // llama.cpp's NVFP4 without a .scale tensor: g is 1.
+  if (blockNvfp4) setTensorScales(native, NVFP4, windows * K, [](uint32_t) { return 1.0f; });
+  const std::vector<uint8_t> ordered = orderedRows(native, stride, shape.order);
+  std::vector<uint8_t> windowRows;
+  for (uint32_t window = 0; window < windows; ++window)
+    for (uint32_t row = 0; row < shape.rows; ++row) {
+      const auto at = ordered.begin() + uint64_t{row} * stride + uint64_t{window} * windowBytes;
+      windowRows.insert(windowRows.end(), at, at + windowBytes);
+    }
+  const Packed expected = repack(f, windowRows, rows, K, nullptr);
   const uint64_t plane0 = model::kWeightFileAlignment, plane1 = model::alignWeightOffset(plane0 + expected.w0.size());
   const uint64_t meta = layout.plane1_bytes ? model::alignWeightOffset(plane1 + expected.w1.size()) : plane1;
   const uint64_t bytes = model::alignWeightOffset(meta + expected.meta.size()) + model::kWeightFileAlignment;
   const std::string what = std::string("prepared ") + fmtName(f) + " rows=" + std::to_string(rows) +
-                           " K=" + std::to_string(K) + (shape.order.from == UINT64_MAX ? "" : " permuted");
+                           " K=" + std::to_string(K) + (shape.order.from == UINT64_MAX ? "" : " permuted") +
+                           (windows == 1 ? "" : " windows=" + std::to_string(windows)) +
+                           (blockNvfp4 ? " from llama.cpp NVFP4" : "");
   const auto inputPath = directory / "repack-source";
   try {
     std::vector<uint8_t> input(kSourceOffset, 0);
-    input.insert(input.end(), native.begin(), native.end());
+    const std::vector<uint8_t> stored = blockNvfp4 ? blockNvfp4Rows(native) : native;
+    input.insert(input.end(), stored.begin(), stored.end());
     splash::test::writeFile(inputPath, input);
     model::WeightSource source(inputPath);
     source.setDataOffset(kSourceOffset);
@@ -545,7 +564,13 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
     step.plane0 = plane0;
     step.plane1 = layout.plane1_bytes ? plane1 : 0;
     step.meta = meta;
-    step.sources = {{"fixture", layout.ggml_type, 0, rows, stride, shape.order, &source}};
+    for (uint32_t window = 0; window < windows; ++window) {
+      model::gguf::TensorRows sources{"fixture", layout.ggml_type, 0, shape.rows, stride, shape.order, &source};
+      sources.windows = windows;
+      sources.window = window;
+      if (blockNvfp4) sources.ggufNvfp4RowBytes = uint64_t{windows} * K / 64 * kBlockNvfp4Bytes;
+      step.sources.push_back(sources);
+    }
     model::gguf::Image plan;
     plan.bytes = bytes;
     plan.repacks.push_back(step);
@@ -586,6 +611,18 @@ void checkExecutor(MetalBackend &backend, const std::filesystem::path &directory
     checkRepack(backend, directory, format, {8704, 2048, {}}, 741);
     checkRepack(backend, directory, format, {256, widerThanStaging(format), {}}, 742);
   }
+  // Column windows, a shared expert's down projection split into its slices
+  // (Flint's 2048 rows of two 512-input windows) in every format whose blocks
+  // a window holds whole, permuted rows too, windows wider than one staging
+  // step, and windows of llama.cpp's NVFP4 rows.
+  for (int f = 0; f < FMT_COUNT; ++f)
+    if (512 % model::ggufColumnUnit(kQuantFormats[f]) == 0) {
+      checkRepack(backend, directory, Fmt(f), {2048, 512, {}, 2}, 500 + f);
+      checkRepack(backend, directory, Fmt(f), {768, 512, {256, 16, 8, 4}, 3}, 600 + f);
+    }
+  checkRepack(backend, directory, Q80, {256, widerThanStaging(Q80), {}, 2}, 743);
+  checkRepack(backend, directory, NVFP4, {2048, 512, {}, 2}, 744, true);
+  checkRepack(backend, directory, NVFP4, {768, 512, {256, 16, 8, 4}, 3}, 745, true);
 }
 
 // Each MLX fixture tensor through the production writer, read from a

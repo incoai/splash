@@ -4,6 +4,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Sampling.h"
 #include "metal/MetalBackend.hpp"
+#include "ops/StopTokens.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -184,17 +185,17 @@ public:
   void addInitial(metal::CommandGraph &graph,
                   std::span<const SamplingPolicy> policies,
                   SamplingBuffers buffers, uint32_t rowOffset,
-                  uint32_t stopToken0, uint32_t stopToken1,
+                  const StopTokens &stopTokens,
                   const PenaltyTable &penalties) const;
   void addVerify(metal::CommandGraph &graph,
                  std::span<const SamplingPolicy> policies,
-                 SamplingBuffers buffers, uint32_t stopToken0,
-                 uint32_t stopToken1, const PenaltyTable &penalties) const;
+                 SamplingBuffers buffers, const StopTokens &stopTokens,
+                 const PenaltyTable &penalties) const;
   void addAcceptance(
       metal::CommandGraph &graph, AcceptanceBuffers buffers,
       std::span<const uint32_t> maximumRetained,
-      std::span<const SamplingPolicy> policies, uint32_t stopToken0,
-      uint32_t stopToken1) const;
+      std::span<const SamplingPolicy> policies,
+      const StopTokens &stopTokens) const;
   // After the draft's selection and before the verify reads its proposals,
   // the proposals of each lane whose thinking cutoff is at row 0, and whose
   // end does not wait for its mask, take the end tokens its verify rows will
@@ -229,7 +230,7 @@ private:
   // addInitial or addVerify encodes anything.
   [[nodiscard]] TargetSamplingParams selection(std::span<const SamplingPolicy> policies,
                                                const SamplingBuffers &buffers, const TargetRows &rows,
-                                               uint32_t stopToken0, uint32_t stopToken1) const;
+                                               const StopTokens &stopTokens) const;
   // Selects the rows `selection` names of its `lanes` lanes, then the end of
   // thinking at each lane's thinking cutoff among them.
   void addSelection(metal::CommandGraph &graph, const TargetSamplingParams &selection,

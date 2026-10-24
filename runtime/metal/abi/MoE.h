@@ -26,10 +26,11 @@ struct MoeRouteParams {
 static_assert(sizeof(MoeRouteParams) == 16,
               "MoE routing parameters are 16 bytes on both sides");
 
-// Every row carries top_k routed experts followed by the shared expert, whose
-// id is `experts` and whose routing weight is the sigmoid of its scalar gate.
-// Routes are sorted by expert: tile t covers grouped rows [t * tile_rows,
-// (t + 1) * tile_rows) of one expert; padding rows carry the route ~0u.
+// Every row carries top_k routed experts followed by the slices of the shared
+// expert, ids `experts` on, whose routing weight is the sigmoid of the
+// block's scalar gate or 1 (ops::MoeShape). Routes are sorted by expert: tile
+// t covers grouped rows [t * tile_rows, (t + 1) * tile_rows) of one expert;
+// padding rows carry the route ~0u.
 //
 // Written by grouping kernels; the host uses this layout to size storage.
 struct MoeTileDescriptor {
@@ -102,8 +103,10 @@ static_assert(sizeof(MoeGatherParams) == 12,
 // A GGUF expert pass (ops/MoE.cpp): the routed experts of the projection are
 // one segment of slots * output_size rows, routed expert e's planes starting
 // at tile slots[e] * output_size / QUANT_TILE_ROWS of it, where slots is the
-// block's slot table (ops::BlockMoeWeights); the shared expert (id `experts`)
-// has a segment of its own. Formats are GGUF_FMT_* (metal/abi/QuantFormat.h).
+// block's slot table (ops::BlockMoeWeights); the shared expert's slices (ids
+// `experts` on) have a segment of their own, slice s's planes from tile
+// s * output_size / QUANT_TILE_ROWS on. Formats are GGUF_FMT_*
+// (metal/abi/QuantFormat.h).
 struct MoeGgufExpertParams {
   uint32_t input_size;
   uint32_t output_size; // per expert

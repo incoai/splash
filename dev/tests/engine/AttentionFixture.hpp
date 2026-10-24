@@ -27,14 +27,16 @@
 // through its locations.
 namespace splash::test {
 
-// The target attention layer a fixture holds: its query and KV heads, its
-// cache format and its value order (kv::Layout::valuesTokenMajor).
+// The target attention layer a fixture holds: its query and KV heads and
+// their width, its cache format, its value order (kv::Layout::
+// valuesTokenMajor) and its variant of the geometry (a window, RoPE).
 struct AttentionShape final {
   uint32_t queryHeads = 0;
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
   kv::Format format = kv::Format::Int8;
   bool valuesTokenMajor = false;
+  ops::AttentionVariant variant{};
 };
 
 // Where a fixture's attention layer sits: layer `layer` of a pool of
@@ -51,11 +53,11 @@ struct AttentionFixtureGeometry final {
 // tensors.
 struct AttentionFixturePlan final {
   static constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-  static constexpr uint32_t kHeadDimension = SPLASH_KV_HEAD_DIMENSION;
   static constexpr uint64_t kAlignment = 16 * 1024;
+  // Sinks: an F32 per query head, which a geometry with learned sinks adds.
   // Table0 is lane 0's page table; every other lane's follows it.
   enum class Tensor : uint32_t {
-    ChunkKeys, ChunkValues, Queries, Output, Partials, Statistics,
+    ChunkKeys, ChunkValues, Queries, Output, Partials, Statistics, Sinks,
     Table0, Count = Table0 + kMaximumLanes
   };
   using Histories = std::array<uint32_t, kMaximumLanes>;
@@ -120,7 +122,7 @@ struct AttentionFixturePlan final {
     plan.pages = pagesOf(lanes, rows, histories);
     plan.poolPages = poolPagesFor(plan.pages);
     const kv::Layout pool = plan.poolLayout();
-    if (shape.headDimension != kHeadDimension || !pool.valid() ||
+    if (!pool.valid() ||
         geometry.layer >= geometry.poolLayers || !geometry.extentPages ||
         geometry.extentPages % pool.extentAlignmentPages() ||
         geometry.extentPages > SPLASH_KV_PAGE_INDEX_MASK)
@@ -132,15 +134,16 @@ struct AttentionFixturePlan final {
     plan.poolBytes =
         uint64_t{plan.extents} * HostKvExtents::extentStride(pool, geometry.extentPages);
     const uint64_t chunks =
-        uint64_t{lanes} * shape.kvHeads * plan.stride * kHeadDimension * sizeof(uint16_t);
+        uint64_t{lanes} * shape.kvHeads * plan.stride * shape.headDimension * sizeof(uint16_t);
     const uint64_t queries =
-        uint64_t{lanes} * shape.queryHeads * plan.stride * kHeadDimension * sizeof(uint16_t);
+        uint64_t{lanes} * shape.queryHeads * plan.stride * shape.headDimension * sizeof(uint16_t);
     plan.size(Tensor::ChunkKeys, chunks);
     plan.size(Tensor::ChunkValues, chunks);
     plan.size(Tensor::Queries, queries);
     plan.size(Tensor::Output, queries);
     plan.size(Tensor::Partials, scratch.partialsBytes);
     plan.size(Tensor::Statistics, scratch.statisticsBytes);
+    plan.size(Tensor::Sinks, uint64_t{shape.queryHeads} * sizeof(float));
     plan.bytes = aligned(plan.poolBytes);
     for (uint64_t size : plan.sizes) {
       const uint64_t allocation = aligned(size);
@@ -167,7 +170,7 @@ struct AttentionFixturePlan final {
                                     uint32_t dimension) const noexcept {
     const uint32_t group = shape.queryHeads / shape.kvHeads;
     return (((uint64_t{lane} * shape.kvHeads + head / group) * stride + row) * group +
-            head % group) * kHeadDimension + dimension;
+            head % group) * shape.headDimension + dimension;
   }
 
 private:
@@ -227,7 +230,7 @@ public:
     auto *chunkKeys = data<uint16_t>(Tensor::ChunkKeys);
     auto *chunkValues = data<uint16_t>(Tensor::ChunkValues);
     auto *queries = data<uint16_t>(Tensor::Queries);
-    constexpr uint32_t dimensions = AttentionFixturePlan::kHeadDimension;
+    const uint32_t dimensions = plan_.shape.headDimension;
     for (uint32_t lane = 0; lane < plan_.lanes; ++lane) {
       pages_.writeTable(pageIds_[lane], tables_[lane].contents());
       for (uint32_t token = 0; token < plan_.histories[lane]; ++token) {
@@ -277,6 +280,8 @@ public:
                 1018.0f);
       }
     }
+    for (uint32_t head = 0; head < plan_.shape.queryHeads; ++head)
+      data<float>(Tensor::Sinks)[head] = 0.5f * float(head % 7) - 1.0f;
     return true;
   }
 
@@ -292,7 +297,7 @@ public:
     ops::PagedAttention::addPrefill(graph, layer_, buffer(Tensor::Queries),
                                     buffer(Tensor::Output), buffer(Tensor::Partials),
                                     buffer(Tensor::Statistics), tables_[0], chunk, attention,
-                                    blocks);
+                                    blocks, sinks(attention.sinks));
   }
   // Each lane's rows are its verify rows, in the verify chunk stride.
   void addGraph(metal::CommandGraph &graph, const ops::VerifyAttentionPlan &attention,
@@ -307,7 +312,8 @@ public:
     ops::PagedAttention::addVerify(
         graph, layer_,
         {buffer(Tensor::ChunkKeys), buffer(Tensor::ChunkValues), buffer(Tensor::Queries),
-         buffer(Tensor::Partials), buffer(Tensor::Statistics), buffer(Tensor::Output), tables_},
+         buffer(Tensor::Partials), buffer(Tensor::Statistics), buffer(Tensor::Output), tables_,
+         sinks(attention.sinks)},
         std::span(chunks).first(attention.lanes), attention, blocks);
   }
 
@@ -322,7 +328,7 @@ public:
   template <typename T>
   [[nodiscard]] T *keyRow(uint32_t lane, uint32_t head, uint32_t token) const {
     return slab<T>(lane, SPLASH_KV_KEYS, token) +
-           splash_kv_key_element(head, token % kv::kPageTokens, 0);
+           splash_kv_key_element(head, token % kv::kPageTokens, 0, plan_.shape.headDimension);
   }
   template <typename T>
   [[nodiscard]] T *valueOf(uint32_t lane, uint32_t head, uint32_t token, uint32_t dimension) const {
@@ -343,6 +349,10 @@ public:
 private:
   template <typename T> T *data(Tensor tensor) const {
     return static_cast<T *>(buffer(tensor).contents());
+  }
+  // The layer's sinks for a plan whose reduce adds them, none otherwise.
+  [[nodiscard]] metal::MetalBuffer sinks(bool added) const {
+    return added ? buffer(Tensor::Sinks) : metal::MetalBuffer{};
   }
   template <typename T> T *slab(uint32_t lane, uint32_t tensor, uint32_t token) const {
     return pages_.slab<T>(plan_.geometry.layer, tensor, page(lane, token));

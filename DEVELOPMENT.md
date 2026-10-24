@@ -1176,6 +1176,9 @@ finishes with `length` unless a `stop` string ends it first. Benchmarks use it
 to generate a fixed number of tokens. Constrained tool calls, output under
 `tool_choice: "none"` and structured output generate under a grammar, which
 decides where the output ends, so combining them with `ignore_eos` returns 400.
+A family states up to four stop tokens: a request finishes at the first it
+emits, acceptance keeps no token after one, and a lane that ignores
+end-of-sequence admits none.
 
 Streaming requests accept `"return_progress":true` (default false). Before output,
 `prompt_progress` reports `{total, cache, processed, time_ms}`: prompt tokens,
@@ -2451,7 +2454,18 @@ form in `linear_gguf_sgmatrix.metal`, the staged one in `kernels/shared/moe_gguf
 Apple9 takes for experts mostly in the formats it stages (`MoeShape::expertFormat`) and for
 experts with an F16 weight (`MoeShape::registerFormats`). One `MoeShape` serves all of a model's
 MoE layers, so one F16 routed or shared expert tensor in any layer stages every layer's experts
-there. Their
+there. A block routes as one of the routings the kernels compile (`ops::kCompiledMoeRoutings`):
+its router weights a row's top k experts by the softmax of their scores (`MoeRouter::Softmax`,
+the Qwen families) or by each one's sigmoid over the sum of theirs (`SigmoidNormalized`, Flint),
+and every row also visits the `MoeShape::sharedSlices` slices of the shared expert, ids `experts`
+on, of the routed experts' width, each weighted by the sigmoid of the block's scalar gate
+(`sharedGate`) or by 1. A shared expert wider than the routed ones runs as such slices in the
+grouped passes: the planner keeps its gate and up rows and lays its down projection out as column
+windows (`gguf::TensorRows::windows`), so slice s's rows of each projection follow slice s - 1's
+(`moe_gguf_segment`). The select kernel names the routing's select suffix
+(`moe_route_select_f32_sigmoid_s2`), the grouping and expert passes its slices suffix
+(`moe_group_routes_s2`, `moe_expert_gguf_m8_a_s2`); the softmax router's one gated slice is the
+unsuffixed instances. Their
 passes launch the live tiles alone: the grouping kernel writes each pass's grid with the tile
 count, and the pass reads it as an indirect dispatch (`ComputeDispatch::indirectThreadgroups`).
 The staged tile runs gate and up in one pass, a gate and an up simdgroup on the same columns,
@@ -2486,11 +2500,12 @@ leading inputs of wider rows), the register ones `gguf_decode_sg_<format>_l<lane
 experts `moe_expert_gguf_m<rows>_<e>` and `moe_expert_gguf_sg_<e>`, with gate and up in one pass
 `moe_expert_gguf_m<rows>_gate_up`; the fused projections run
 `gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode, and in prefill one
-`gguf_prefill_<format>_a` per format over that format's segments. The norm, GDN and
-attention-gate variants that also write the register kernels' input table carry `table16` in
-their names. The epilogue kinds of both GGUF families are in `kernels/common/gguf_tile.h`, the
-SiLU and sigmoid every kernel shares in `kernels/common/activation.h`, and the MMA helpers every
-register kernel uses, GGUF or fp32, in `kernels/common/sgmatrix.h`.
+`gguf_prefill_<format>_a` per format over that format's segments. The norm, GDN,
+attention-gate and attention-gather variants that also write the register kernels' input
+table carry `table16` in their names. The epilogue kinds of both GGUF families are in
+`kernels/common/gguf_tile.h`, the SiLU and sigmoid every kernel shares in
+`kernels/common/activation.h`, and the MMA helpers every register kernel uses, GGUF or fp32, in
+`kernels/common/sgmatrix.h`.
 
 The ABIs are in `runtime/metal/abi/Gguf.h`, which also defines the tile geometry the kernels
 and `LinearGguf.cpp` share, and `MoE.h`; the image formats in
@@ -2506,7 +2521,8 @@ PrismML-Eng/llama.cpp 01ae597) in `gguf-reference`, and `gguf-planner` checks th
 plans; both run in `make test-engine-cpu`.
 `make test-engine-metal` runs `gguf-preparation`, which checks every format's planes, as the
 production executor and its `gguf_repack` kernel write them, bitwise against the reference,
-the alpha/beta, norm, convolution and router bytes they write and the golden images; then
+also as column windows, the alpha/beta, norm, convolution and router bytes they write and the
+golden images; then
 `gguf-dequant`, the staged tile's dequantizer, built with the production Metal flags, against
 the half rounding of every reference weight; `gguf-rotation`, `gguf_rotate` and the rotated
 PQ2_0 token gather bitwise against the fp32 butterflies and within one bf16 step of fp64;
@@ -2519,7 +2535,9 @@ split, and one lane on the staged 16-row tile bitwise against the 8-row tile; an
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
 plan, the staged 8- and 32-row tiles and the Apple9 register tile whatever GPU runs it, each in
 every format it takes as each routed and shared expert tensor, against fp64, and bitwise against
-the full grids and two gate/up passes. The goldens and how to regenerate them are
+the full grids and two gate/up passes; `gguf-moe-e512` runs it at Qwen3.8-Flash-Next's 512
+experts and `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated
+shared slices. The goldens and how to regenerate them are
 in `dev/tests/fixtures/weight-goldens/`; with `SPLASH_GGML_ORACLE=<libggml-base.dylib>`,
 `gguf-reference` also compares the reference with GGML directly and prints GGML's hashes.
 
@@ -2531,8 +2549,28 @@ every K split, and marks the device policy's pick, or, with a trailing `prefill=
 after the epilogue and the round count, one format's 128-row prefill tile at each chunk of `R`
 rows (more than 32); the formats `float-bf16` and `float-f32` time the float projection
 (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles instead, marking
-`Linear::ggufFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape
-on the device's plans and the other GGUF tile.
+`Linear::ggufFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape,
+or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the
+device's plans and the other GGUF tile.
+
+Target attention runs the geometries of `kCompiledAttention` (`runtime/ops/PagedAttention.cpp`):
+query heads over KV heads of a head dimension (`_d128` in the names of 128-wide heads' kernels;
+256 is unnamed) in a value order, each compiled with the variants its layers take, which a layer
+selects with an `ops::AttentionVariant`. Its queries and keys are rotated by the geometry's
+RoPE, or not (NoPE: `qkv…_nope`, which binds no tables); and each row attends its whole history,
+or a window of the keys before it (`…_w512`: a row at position p attends p − 512 to p). A
+windowed split and reduce start at the page of their tile's first row's window start
+(`splash_attention_first_page`), each row masking the keys before its own, and a windowed verify
+lane's or prefill tile's splits stop at the 18 pages such a window reads
+(`kv::windowAttentionPages`). A geometry with learned sinks (`reduce…_sinks`) binds the layer's,
+an F32 per query head, to the reduce, which adds each to its row's softmax after the splits, in
+their order, as a key with no value; one without an output gate (`gather`) gives the
+out-projection its attention rows as they are. The RoPE tables are of the target geometry's pairs
+(`rope_build_tables`, or `rope_build_tables_p64` for 64). `make test-engine-metal` runs
+`attention-variants`, every variant through the production encoders against fp64, and
+`make benchmark-attention-sweep ATTENTION_SWEEP_ARGS='--shapes flint-window,flint-full'` times
+Flint's two kinds of layers with their sinks: a window of 512 keys with RoPE, and the whole
+history without.
 
 ### Sparse attention
 
@@ -3613,7 +3651,12 @@ that model alone once the Mac has cooled.
 
 `.venv/bin/python dev/tools/kernel_identity.py BASELINE/build build` compares
 the AIR of each kernel the decode path may run in the two builds'
-`splash.metallib` (`--match` for others) and fails if any differs.
+`splash.metallib` (`--match` for others) and fails if any differs. The helpers
+a kernel's module defines are compared in the order they appear there, not by
+name: C++ names them for their template values, which a kernel template that
+gains a value renames without changing their code. So are the numbers of its
+lambdas' anonymous classes and its classes' names in the alias metadata, which
+the same change renames.
 
 Two pairs of constants in `runtime/engine/Protocol.hpp` and `server/protocol.py`
 version what the server and the engine exchange. When the native wire layout

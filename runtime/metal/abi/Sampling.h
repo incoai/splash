@@ -23,6 +23,14 @@
   (SPLASH_UNIFORM_ACCEPTANCE + SPLASH_DRAFT_PROPOSAL_TOKENS)
 #define SPLASH_SAMPLING_UNIFORMS (SPLASH_UNIFORM_CORRECTION + 1u)
 
+// The stop tokens a target's selections and acceptance compare
+// (ops::StopTokens): up to SPLASH_STOP_TOKENS ids, every place past them
+// SPLASH_NO_TOKEN, which no vocabulary holds. It is no stop token: a row with
+// no selectable logit selects it, and the runtime fails that lane
+// (Runtime.cpp, invalidSelection) whatever its family's list.
+#define SPLASH_STOP_TOKENS 4u
+#define SPLASH_NO_TOKEN 0xFFFFFFFFu
+
 // One target-policy dispatch over lanes of SPLASH_TARGET_VERIFY_ROWS logits
 // rows, SPLASH_TARGET_VERIFY_ROWS + 1 constraint-mask rows and
 // SPLASH_SAMPLING_UNIFORMS uniforms each. Selected row s is row s % rows of
@@ -49,12 +57,11 @@ struct TargetSamplingParams {
   uint32_t constrained_mask;
   // Lanes that ignore end-of-sequence: they never select a stop token.
   uint32_t exclude_stop_mask;
-  uint32_t stop_token_0;
-  uint32_t stop_token_1;
+  uint32_t stop_tokens[SPLASH_STOP_TOKENS];
 };
 
-static_assert(sizeof(TargetSamplingParams) == 112,
-              "Target sampling parameters are 112 bytes on both sides");
+static_assert(sizeof(TargetSamplingParams) == 120,
+              "Target sampling parameters are 120 bytes on both sides");
 
 // One shard's share of a sampled row's softmax denominator: the largest
 // logit it admits, the sum of exp((logit - maximum) / temperature) over its
@@ -202,10 +209,9 @@ static_assert(sizeof(VerifyRowsParams) == 188,
 
 struct AcceptBatchParams {
   uint32_t remaining[SPLASH_MAXIMUM_BATCH_WIDTH];
-  uint32_t stop_token_0;
-  uint32_t stop_token_1;
+  uint32_t stop_tokens[SPLASH_STOP_TOKENS];
   uint32_t sampling_mask;
 };
 
-static_assert(sizeof(AcceptBatchParams) == 28,
-              "Batched acceptance parameters are 28 bytes on both sides");
+static_assert(sizeof(AcceptBatchParams) == 36,
+              "Batched acceptance parameters are 36 bytes on both sides");
