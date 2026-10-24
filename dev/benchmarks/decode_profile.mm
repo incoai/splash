@@ -46,6 +46,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 using namespace splash;
@@ -104,21 +105,38 @@ std::vector<uint32_t> pageRange(uint32_t first, uint32_t count) {
 
 // A chat-formatted request that asks for a long answer, so decode cycles keep
 // producing tokens instead of a stop token right after prefill. The user text
-// repeats one sentence until the prompt reaches the requested length.
-std::vector<uint32_t> chatPrompt(uint32_t tokens) {
-  static constexpr std::array<uint32_t, 3> kUserHeader{248045, 846, 198};
-  static constexpr std::array<uint32_t, 17> kSentence{
-      7734, 264, 11346, 11,    7072,  12, 26829, 8627, 883,
-      279,  3712, 314,   279,   12386, 19825, 13,    220};
-  static constexpr std::array<uint32_t, 9> kAssistantHeader{
-      248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271};
-  if (tokens < kUserHeader.size() + kAssistantHeader.size() + 1)
+// repeats one sentence, "Write a detailed, multi-paragraph essay about the
+// history of the Roman Empire. ", until the prompt reaches the requested
+// length, and the answer follows an empty think block. Its tokens are the
+// target's tokenizer's: the Qwen families' (one tokenizer) or Flint's.
+struct ChatTokens final {
+  std::vector<uint32_t> userHeader;
+  std::vector<uint32_t> sentence;
+  std::vector<uint32_t> assistantHeader;
+};
+const ChatTokens kQwenChat{
+    // <|im_start|>user\n
+    .userHeader = {248045, 846, 198},
+    .sentence = {7734, 264, 11346, 11, 7072, 12, 26829, 8627, 883, 279, 3712, 314, 279, 12386, 19825, 13, 220},
+    // <|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n
+    .assistantHeader = {248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271}};
+const ChatTokens kFlintChat{
+    // <|user|>
+    .userHeader = {150003},
+    .sentence = {7421, 260, 7426, 11, 4519, 12, 41088, 6369, 762, 269, 3476, 297, 269, 10831, 18381, 13, 220},
+    // <|assistant|><think></think>
+    .assistantHeader = {150004, 150006, 150007}};
+
+std::vector<uint32_t> chatPrompt(const model::ModelDescriptor &descriptor, uint32_t tokens) {
+  const ChatTokens &chat =
+      std::holds_alternative<model::FlintLayout>(descriptor.target) ? kFlintChat : kQwenChat;
+  if (tokens < chat.userHeader.size() + chat.assistantHeader.size() + 1)
     throw std::invalid_argument("prompt is too short for a chat request");
-  std::vector<uint32_t> prompt(kUserHeader.begin(), kUserHeader.end());
-  const uint32_t body = tokens - kUserHeader.size() - kAssistantHeader.size();
+  std::vector<uint32_t> prompt = chat.userHeader;
+  const uint32_t body = tokens - chat.userHeader.size() - chat.assistantHeader.size();
   for (uint32_t index = 0; index < body; ++index)
-    prompt.push_back(kSentence[index % kSentence.size()]);
-  prompt.insert(prompt.end(), kAssistantHeader.begin(), kAssistantHeader.end());
+    prompt.push_back(chat.sentence[index % chat.sentence.size()]);
+  prompt.insert(prompt.end(), chat.assistantHeader.begin(), chat.assistantHeader.end());
   return prompt;
 }
 
@@ -398,7 +416,7 @@ int main(int argc, char **argv) {
         lanes[index] = {index + 1, index, 0,
                         pageRange(index * pagesPerLane, pagesPerLane)};
       }
-      const std::vector<uint32_t> prompt = chatPrompt(promptTokens);
+      const std::vector<uint32_t> prompt = chatPrompt(model.descriptor, promptTokens);
 
       // Warm prefill and B1 decode with real work before measuring.
       prefill(executor, lanes[0], prompt);
