@@ -68,6 +68,29 @@ Projection blockProjection(uint32_t n, uint32_t k, uint32_t segments, uint32_t f
   return blockProjection(n, k, std::vector<uint32_t>(segments, format));
 }
 
+void affineFusedDecodePlans() {
+  // The real GDN fusion has three affine segments and trailing padding.
+  // A float segment in the same geometry must not classify as all-affine.
+  for (const bool lastFloat : {false, true}) {
+    BlockWeights weights;
+    uint32_t offset = 0;
+    for (const uint32_t n : {10240U, 6144U, 128U}) {
+      QuantizedSegment part = lastFloat && n == 128
+          ? QuantizedSegment::floats(n, 5120, {})
+          : QuantizedSegment::planes(GGUF_FMT_AF4G64, n, 5120, {}, {}, {});
+      part.columnOffset = offset;
+      offset += n;
+      weights.segments.push_back(part);
+    }
+    const Projection p(16640, 5120, std::move(weights));
+    const Linear device = gpu(10, 20);
+    const LinearPlan plan = device.plan({{16640, 5120}, 8, LinearPhase::Decode, LinearEpilogue::None}, p);
+    require(p.shape().affine4Group64 == !lastFloat && plan.configuration().sixteenRows == !lastFloat &&
+                plan.storageRows() == device.decodeStorageRows(8, p.shape()),
+            "affine fused input format and allocation classification");
+  }
+}
+
 // fp32 destinations (the logits): the plan of a projection with an fp32
 // destination keeps the configuration, input table and scratch of its bf16
 // plan on every family and core count, and only plain decode workloads take
@@ -536,7 +559,8 @@ void ggufPlans() {
     for (const uint32_t family : {9U, 10U, 11U})
       for (uint32_t cores = 0; cores <= 128; ++cores) {
         const Linear device = gpu(family, cores);
-        for (const auto [n, k] : {std::pair{17408U, 5120U}, {5120U, 17408U}, {16384U, 5120U}, {248320U, 5120U},
+        for (const auto [n, k] : {std::pair{17408U, 5120U}, {14336U, 5120U}, {16640U, 5120U},
+                                  {5120U, 17408U}, {16384U, 5120U}, {248320U, 5120U},
                                   {1024U, 5120U}})
           for (const Formats &formats : kFormats) {
             const Projection plain = blockProjection(n, k, formats), mixed = withFloat(n, k, formats),
@@ -552,9 +576,12 @@ void ggufPlans() {
               const LinearPlan one = device.plan({{n, k}, 8, LinearPhase::Decode, epilogue}, *p, gate),
                                two = device.plan({{n, k}, 16, LinearPhase::Decode, epilogue}, *p, gate);
               LinearConfig config = one.configuration();
+              const bool affineWide = family == 10 && cores == 20 &&
+                                      (n == 14336 || n == 16640 || n == 17408) && k == 5120 &&
+                                      p == &plain && formats == Formats{GGUF_FMT_AF4G64};
               const bool sixteen = gate ? alone(*p) && alone(*gate)
                                         : family >= 10 && config.tile == LinearTile::GgufStaged &&
-                                              config.splits == 1 && p->shape().underFourAndHalfBits;
+                                              config.splits == 1 && (p->shape().underFourAndHalfBits || affineWide);
               uint32_t storage = device.decodeStorageRows(8, p->shape());
               if (gate) storage = std::max(storage, device.decodeStorageRows(8, gate->shape()));
               require(config.sixteenRows == sixteen && one.storageRows() == (sixteen ? 16U : 8U) &&
@@ -1263,6 +1290,7 @@ int main(int argc, char **argv) {
     ggufPlans();
     scratchBoundsRotated();
     ggufCoreLaws();
+    affineFusedDecodePlans();
     floatOutputPlans();
     if (std::string_view(argv[1]) == "--cpu") {
       std::cout << "Linear CPU plans: PASS\n";

@@ -326,6 +326,7 @@ private:
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
   GpuFamilyClass family_;
+  uint32_t appleGpuFamily_ = 0;
   uint32_t gpuCores_ = 0;
 };
 
