@@ -13,6 +13,7 @@
 #include "model/SsdReaders.hpp"
 
 #import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
 
 #include <sys/time.h>
 
@@ -26,6 +27,7 @@
 #include <functional>
 #include <iostream>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -840,6 +842,52 @@ void testStartGrowsThroughHostPressure(const char *metallibPath) {
   }
 }
 
+// A start checks the host's reserve one last time before Ready, with what
+// the engine serves with. Its decode warmups past one lane leave their
+// lanes' state idle, which goes back to macOS before Ready, and macOS counts
+// it as available only a moment later: a check that still counted it, or
+// that did not wait for that moment, would refuse a start the host has room
+// for (#572).
+void testStartChecksTheReserveWithWhatItServes(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-start-reserve");
+  RuntimeBootstrapConfig config;
+  config.resources = loadableConfig(metallibPath, root.path(), "start-reserve-test");
+  RuntimeMetrics metrics;
+  config.nativeLoop.metrics = &metrics;
+  // The process's Metal memory at the last check of the host. Once the start
+  // has given back a lane's state, the host refuses its next two checks, as
+  // macOS would before it counts what Metal freed.
+  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+  const uint64_t lane = config.resources.model.stateLayout.laneBytes();
+  uint64_t checked = 0;
+  uint64_t peak = 0;
+  int refused = 0;
+  config.resources.hostMemory = [&, host = config.resources.hostMemory] {
+    checked = device.currentAllocatedSize;
+    peak = std::max(peak, checked);
+    if (checked + lane <= peak && refused < 2) {
+      ++refused;
+      return std::optional<HostMemory>(HostMemory{0, 0});
+    }
+    return host();
+  };
+  std::unique_ptr<RuntimeBootstrap> bootstrap;
+  static_cast<void>(test::capturedStderr([&] {
+    bootstrap = RuntimeBootstrap::start(config, [](std::span<const uint8_t>) {},
+                                        [] { return std::string(); });
+  }));
+  require(refused == 2, "the start checked the host before it gave back its warmups' idle state");
+  // The warmups leave three lanes' state idle beside the lane the engine
+  // keeps. Under shader validation (MTL_SHADER_VALIDATION), less than a lane
+  // of it leaves Metal's count only a moment later, which the last check may
+  // still see.
+  require(checked < device.currentAllocatedSize + 2 * lane,
+          "the start's last check of the host counted the lanes' state its warmups left idle");
+  require(bootstrap->statusJson(metrics.snapshot(), {}).find("\"memory_limited_steps\":[]") !=
+              std::string::npos,
+          "the start did not warm every decode width");
+}
+
 // A model served with YaRN starts and runs as any other, with YaRN all the
 // way into its runtime: the start names its factor and the context it
 // serves, the runtime's geometry serves that window, its arenas hold YaRN's
@@ -1139,6 +1187,7 @@ int main(int argc, char **argv) {
       testStartupAdmissionIgnoresModelSize(argv[1]);
       testFailedStepIsNamed(argv[1]);
       testStartGrowsThroughHostPressure(argv[1]);
+      testStartChecksTheReserveWithWhatItServes(argv[1]);
       testYarnRuntime(argv[1]);
       testWriteBudgetOnlyWhenSet(argv[1]);
       testStaleCachesGoAtEveryStart(argv[1]);

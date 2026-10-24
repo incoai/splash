@@ -5,10 +5,19 @@
 #include <cmath>
 #include <limits>
 #include <sstream>
+#include <thread>
 #include <utility>
 
 namespace splash::engine {
 namespace {
+
+// macOS counts the memory Metal frees as available only a moment later, 0.5
+// to 1 s after Metal's own count drops on a 24 GB Mac mini. A start's last
+// check of the host's reserve waits up to this long, checking again at this
+// interval, for what the start gave back: the lanes its warmups left idle
+// and the state of a warmup the host refused.
+constexpr auto kMemoryReleaseWait = std::chrono::seconds(2);
+constexpr auto kMemoryReleasePoll = std::chrono::milliseconds(100);
 
 RuntimeBootstrapReport reportForPlan(const EngineMemoryPlan &plan) {
   RuntimeBootstrapReport report;
@@ -382,7 +391,6 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   RuntimeBootstrapReport report = requireWarmupAndAnnounce(
       resources->memoryPlan(), *modelRuntime,
       [resourcesPointer, modelPointer] {
-        resourcesPointer->backend().checkOperation();
         // Audit every attempted warmup before reclaiming idle buffers.
         // Wider batches and cache memory grow on demand after Ready.
         ActualMemoryReport report = resourcesPointer->actualMemoryReport(
@@ -392,7 +400,19 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
         while (modelPointer->reclaimIdleState(true, model::IdleMemory::Buffers)) {
         }
         static_cast<void>(resourcesPointer->cache().releaseEmptyExtents(true));
-        return report;
+        // The last check of the host's reserve before Ready weighs what the
+        // engine serves with, not the lanes the optional warmups left idle.
+        const auto deadline = AwakeClock::now() + kMemoryReleaseWait;
+        for (;;) {
+          try {
+            resourcesPointer->backend().checkOperation();
+            return report;
+          } catch (const metal::MetalAllocationError &) {
+            if (AwakeClock::now() >= deadline)
+              throw;
+          }
+          std::this_thread::sleep_for(kMemoryReleasePoll);
+        }
       },
       *nativeLoop);
 
