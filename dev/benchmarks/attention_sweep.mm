@@ -12,11 +12,17 @@
 // case prints a digest of its output: two builds that fill the same pages must
 // print the same digests, whatever their storage.
 //
-// usage: attention-sweep METALLIB [--histories 0,2048,...] [--shapes 27b,35b,122b,fn]
+// usage: attention-sweep METALLIB [--histories 0,2048,...]
+//                        [--shapes 27b,35b,122b,fn,flint-window,flint-full]
 //                        [--lanes 1,4] [--repeat N] [--phases both|verify|prefill]
 //                        [--compare-metallib PATH] [--kv-format int8|bf16]
 //                        [--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer]
 //                        [--located]
+//
+// flint-window and flint-full are Flint's two kinds of layers: 32 query heads
+// over 4 KV heads of 128 dimensions with a learned sink per query head, 35
+// that attend a window of the 512 keys before each row and 14 that attend
+// the whole history (ops::AttentionVariant).
 //
 // fn is Qwen3.8-Flash-Next's GQA-12 attention, whose rows attend past 512
 // complete blocks of four tokens only to the 512 blocks their QSA bitmap
@@ -92,9 +98,10 @@ constexpr uint32_t kPrefillRows = SPLASH_PREFILL_TOKEN_BUDGET;
 
 // The swept attention layer is the second of the extents' two.
 constexpr uint32_t kLayer = 1;
-// The memory plan's extents of the full models: 16, 10, 12 and 12 attention
-// layers.
-constexpr uint32_t kModelLayers27b = 16, kModelLayers35b = 10, kModelLayers122b = 12, kModelLayersFn = 12;
+// The memory plan's extents of the full models: 16, 10, 12, 12 and 49
+// attention layers.
+constexpr uint32_t kModelLayers27b = 16, kModelLayers35b = 10, kModelLayers122b = 12, kModelLayersFn = 12,
+                   kModelLayersFlint = 49;
 // Qwen3.8-Flash-Next's QSA: the indexer's top_k of 2048 tokens in blocks of 4.
 constexpr uint32_t kQsaTopBlocks = 512, kQsaBlockTokens = SPLASH_ATTENTION_BLOCK_TOKENS;
 // --qsa overlapping: the blocks a tile's rows choose theirs from, three times
@@ -102,7 +109,11 @@ constexpr uint32_t kQsaTopBlocks = 512, kQsaBlockTokens = SPLASH_ATTENTION_BLOCK
 // verify steps make at 126K-252K tokens of real text and code.
 constexpr uint32_t kQsaOverlapBlocks = 3 * kQsaTopBlocks;
 
+bool isFlint(const std::string &shape) { return shape == "flint-window" || shape == "flint-full"; }
+
 AttentionShape shapeOf(const std::string &shape, kv::Format format) {
+  if (shape == "flint-window") return AttentionShape{32, 4, 128, format, false, {.rotated = true, .windowTokens = 512}};
+  if (shape == "flint-full") return AttentionShape{32, 4, 128, format, false, {.rotated = false, .windowTokens = 0}};
   if (shape == "fn") return AttentionShape{24, 2, 256, format, true};
   if (shape == "122b") return AttentionShape{32, 2, 256, format};
   return shape == "27b" ? AttentionShape{24, 4, 256, format}
@@ -113,6 +124,7 @@ uint32_t modelLayers(const std::string &shape) {
   return shape == "27b"    ? kModelLayers27b
          : shape == "35b"  ? kModelLayers35b
          : shape == "122b" ? kModelLayers122b
+         : isFlint(shape)  ? kModelLayersFlint
                            : kModelLayersFn;
 }
 
@@ -120,6 +132,7 @@ std::string modelName(const std::string &shape) {
   return shape == "27b"    ? "qwen3.8-27b"
          : shape == "35b"  ? "qwen3.6-35b-a3b"
          : shape == "122b" ? "qwen3.5-122b-a10b"
+         : isFlint(shape)  ? shape
                            : "qwen3.8-flash-next";
 }
 
@@ -189,10 +202,10 @@ AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes
   AttentionFixturePlan::Histories histories{};
   std::fill_n(histories.begin(), caseLanes, history);
   const AttentionWorkspace scratch =
-      prefill ? PagedAttention::prefillPlan(kPrefillRows, shape.queryHeads, layout)
+      prefill ? PagedAttention::prefillPlan(kPrefillRows, shape.queryHeads, layout, shape.variant)
                     .workspace
               : PagedAttention::verifyPlan(caseLanes, shape.queryHeads, layout,
-                                           std::span(histories).first(caseLanes))
+                                           std::span(histories).first(caseLanes), shape.variant)
                     .workspace;
   return AttentionFixturePlan::make(shape, caseLanes, prefill ? kPrefillRows : kVerifyRows,
                                     histories, scratch, {kLayer + 1, kLayer, extentPages});
@@ -397,12 +410,14 @@ metal::CommandGraph caseGraph(const AttentionFixture &fixture, bool prefill, con
   }
   if (prefill)
     fixture.addGraph(graph,
-                     PagedAttention::prefillPlan(plan.rows, plan.shape.queryHeads, plan.layout()),
+                     PagedAttention::prefillPlan(plan.rows, plan.shape.queryHeads, plan.layout(),
+                                                 plan.shape.variant),
                      qsa.blocks);
   else
     fixture.addGraph(graph,
                      PagedAttention::verifyPlan(plan.lanes, plan.shape.queryHeads, plan.layout(),
-                                                std::span(plan.histories).first(plan.lanes)),
+                                                std::span(plan.histories).first(plan.lanes),
+                                                plan.shape.variant),
                      qsa.blocks);
   return graph;
 }
@@ -567,7 +582,8 @@ std::string json(const Case &item, const std::string &shape, uint32_t history,
 int main(int argc, const char *argv[]) {
   try {
     if (argc < 2) {
-      std::cerr << "usage: attention-sweep METALLIB [--histories LIST] [--shapes 27b,35b,122b,fn] "
+      std::cerr << "usage: attention-sweep METALLIB [--histories LIST] "
+                   "[--shapes 27b,35b,122b,fn,flint-window,flint-full] "
                    "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] "
                    "[--compare-metallib PATH] [--kv-format int8|bf16] "
                    "[--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer] "
@@ -624,8 +640,8 @@ int main(int argc, const char *argv[]) {
           const size_t comma = value.find(',', start);
           const std::string shape =
               value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-          if (shape != "27b" && shape != "35b" && shape != "122b" && shape != "fn")
-            throw std::invalid_argument("--shapes takes 27b, 35b, 122b or fn");
+          if (shape != "27b" && shape != "35b" && shape != "122b" && shape != "fn" && !isFlint(shape))
+            throw std::invalid_argument("--shapes takes 27b, 35b, 122b, fn, flint-window or flint-full");
           shapes.push_back(shape);
           if (comma == std::string::npos) break;
           start = comma + 1;

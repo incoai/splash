@@ -2890,11 +2890,11 @@ void requireConstrainedLaneSharesDecode(model::Runtime &executor, const model::Q
   // Cycles whose masks admit every token, then the forced cycle and the one
   // after it.
   constexpr uint32_t kAdmitting = 3, kCycles = kAdmitting + 2;
-  const std::array<uint32_t, 2> stops =
+  const ops::StopTokens stops =
       std::visit([](const auto &layout) { return layout.stopTokens; }, descriptor.target);
   std::vector<uint32_t> admitting(uint64_t{kRows + 1} * kMaskWords, ~0U);
   for (uint32_t row = 0; row <= kRows; ++row)
-    for (const uint32_t stop : stops)
+    for (const uint32_t stop : stops.tokens())
       admitting[uint64_t{row} * kMaskWords + stop / 32] &= ~(1U << (stop % 32));
   const std::array pages{pageRange(40, 8), pageRange(48, 8)};
   // Request `id` in batch and state lane `slot`: slot 0 decodes greedily,
@@ -3788,7 +3788,7 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
   const auto originalTarget = model.descriptor.target;
   const auto setStops = [&](uint32_t stop) {
     std::visit([&](auto &weights) {
-      weights.layout.stopTokens = {stop, stop};
+      weights.layout.stopTokens = {stop};
       model.descriptor.target = weights.layout;
     }, model.target);
   };

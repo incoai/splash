@@ -12,7 +12,8 @@ namespace splash::engine {
 
 namespace {
 
-constexpr std::array kForms{kv::PageForm::Full, kv::PageForm::Index};
+// The order extents of each form are compacted and released in.
+constexpr std::array kForms{kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index};
 
 } // namespace
 
@@ -184,8 +185,10 @@ bool KvPool::pageFree(uint32_t page) const {
 }
 
 uint64_t KvPool::allocatedBytes() const noexcept {
-  return formSnapshot(kv::PageForm::Full).allocatedBytes +
-         formSnapshot(kv::PageForm::Index).allocatedBytes;
+  uint64_t bytes = 0;
+  for (const kv::PageForm form : kForms)
+    bytes += formSnapshot(form).allocatedBytes;
+  return bytes;
 }
 
 uint64_t KvPool::reclaimEmptyExtents(bool keepRunway, uint32_t limit, std::optional<kv::PageForm> form) {
@@ -307,15 +310,18 @@ KvPageMoves KvPool::compactExtent(std::span<const uint32_t> fixed, std::optional
 }
 
 KvPoolSnapshot KvPool::snapshot() const {
-  const KvPoolFormSnapshot full = formSnapshot(kv::PageForm::Full);
   KvPoolSnapshot result;
   result.index = formSnapshot(kv::PageForm::Index);
-  result.pagesAllocated = full.pagesAllocated + result.index.pagesAllocated;
-  result.pagesActive = full.pagesActive + result.index.pagesActive;
-  result.pagesPrefix = full.pagesPrefix + result.index.pagesPrefix;
-  result.pagesFree = full.pagesFree + result.index.pagesFree;
-  result.allocatedBytes = full.allocatedBytes + result.index.allocatedBytes;
-  result.reclaimableBytes = full.reclaimableBytes + result.index.reclaimableBytes;
+  result.slim = formSnapshot(kv::PageForm::Slim);
+  for (const kv::PageForm form : kForms) {
+    const KvPoolFormSnapshot each = formSnapshot(form);
+    result.pagesAllocated += each.pagesAllocated;
+    result.pagesActive += each.pagesActive;
+    result.pagesPrefix += each.pagesPrefix;
+    result.pagesFree += each.pagesFree;
+    result.allocatedBytes += each.allocatedBytes;
+    result.reclaimableBytes += each.reclaimableBytes;
+  }
   result.extentAllocations = extentAllocations_;
   result.extentReleases = extentReleases_;
   result.extentAllocateMaxMilliseconds = extentAllocateMaxMilliseconds_;

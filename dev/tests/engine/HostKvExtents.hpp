@@ -20,12 +20,14 @@ namespace splash::test {
 // The extents of a KV pool in CPU-visible memory, for the kernel tests and
 // benchmarks that fill and read pages on the host. Page p sits in extent
 // p / extentPages at index p % extentPages, every layer's region where
-// splash_kv_offset places it and the index plane after them, as in
-// production extents (kv::PageStorage); an extent of Index pages holds only
-// the index plane. Kernels reach a page only through its entries. The
-// constructors size each extent exactly, so an access past one fails under
-// shader validation; contiguous() extents lie extentStride() apart in one
-// region, and an access past one runs into its neighbour unchecked.
+// splash_kv_offset places the layer's kv::Layout::region and the index plane
+// after them, as in production extents (kv::PageStorage); an extent of Slim
+// pages holds the regions of the layers no window bounds and the index
+// plane, and one of Index pages only the index plane. Kernels reach a page
+// only through its entries. The constructors size each extent exactly, so
+// an access past one fails under shader validation; contiguous() extents
+// lie extentStride() apart in one region, and an access past one runs into
+// its neighbour unchecked.
 class HostKvExtents final {
 public:
   struct Extent final {
@@ -124,7 +126,7 @@ public:
   [[nodiscard]] SplashKvLayer layer(uint32_t index) const {
     if (index >= layout_.attentionLayers)
       throw std::out_of_range("host KV layer is outside the layout");
-    return splash_kv_layer(extentPages_, dataBytes(), scaleBytes(), index);
+    return splash_kv_layer(extentPages_, dataBytes(), scaleBytes(), layout_.region(index));
   }
   // Writes the entries of `pages` to the start of a CPU-visible table, as
   // kv::PageStorage::writeEntries: SPLASH_KV_PAGE_ABSENT for an Index page.
@@ -132,9 +134,9 @@ public:
     auto *entries = static_cast<SplashKvPage *>(table);
     for (size_t index = 0; index < pages.size(); ++index) {
       const Extent &placed = extent(pages[index]);
-      entries[index] = placed.form == kv::PageForm::Full
-                           ? splash_kv_page_entry(placed.gpuAddress, pages[index] % extentPages_)
-                           : SPLASH_KV_PAGE_ABSENT;
+      entries[index] = placed.form == kv::PageForm::Index
+                           ? SPLASH_KV_PAGE_ABSENT
+                           : splash_kv_page_entry(placed.gpuAddress, pages[index] % extentPages_);
     }
   }
   // The same for an index table (kv::PageStorage::writeIndexEntries): the
@@ -185,15 +187,18 @@ public:
   // Where one value of a KV head sits in a page's slab of values, in the
   // layout's value order (kv::Layout::valuesTokenMajor).
   [[nodiscard]] uint64_t valueElement(uint32_t head, uint32_t token, uint32_t dimension) const noexcept {
-    return layout_.valuesTokenMajor ? splash_kv_key_element(head, token, dimension)
-                                    : splash_kv_value_element(head, token, dimension);
+    return layout_.valuesTokenMajor ? splash_kv_key_element(head, token, dimension, layout_.headDimension)
+                                    : splash_kv_value_element(head, token, dimension, layout_.headDimension);
   }
-  // The host address of one tensor of one Full page in one layer.
+  // The host address of one tensor of one page in one layer whose region
+  // the page's form holds (kv::Layout::regions).
   template <typename T>
   [[nodiscard]] T *slab(uint32_t layer, uint32_t tensor, uint32_t page) const {
     const Extent &placed = extent(page);
-    if (placed.form != kv::PageForm::Full)
+    if (placed.form == kv::PageForm::Index)
       throw std::logic_error("host KV page holds only its index");
+    if (layout_.region(layer) >= layout_.regions(placed.form))
+      throw std::logic_error("host KV page holds no windowed layer's K/V");
     return reinterpret_cast<T *>(placed.contents + offset(layer, tensor, page % extentPages_));
   }
   // `count` distinct pages of a pool for a request's table: the first and
@@ -227,6 +232,8 @@ private:
         throw std::invalid_argument("host KV extent is not visible or not 16 KiB-aligned");
       if (extent.form == kv::PageForm::Index && !layout_.spillable())
         throw std::invalid_argument("host KV pages of a layout that cannot spill are all Full");
+      if (extent.form == kv::PageForm::Slim && !layout_.slimmable())
+        throw std::invalid_argument("host KV pages of a layout without a window keep every layer");
     }
   }
   [[nodiscard]] const Extent &extent(uint32_t page) const {
@@ -234,9 +241,9 @@ private:
       throw std::out_of_range("host KV page is outside the extents");
     return extents_[page / extentPages_];
   }
-  // Where an extent's index plane starts.
+  // Where an extent's index plane starts: after the regions its form holds.
   [[nodiscard]] uint64_t indexPlaneOffset(kv::PageForm form) const noexcept {
-    return form == kv::PageForm::Full ? uint64_t{extentPages_} * layout_.kvBytesPerModelPage() : 0;
+    return uint64_t{extentPages_} * layout_.regions(form) * layout_.bytesPerLayerPage();
   }
   [[nodiscard]] uint32_t dataBytes() const noexcept {
     return static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
@@ -245,7 +252,7 @@ private:
     return static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
   }
   [[nodiscard]] uint64_t offset(uint32_t layer, uint32_t tensor, uint32_t index) const {
-    return splash_kv_offset(extentPages_, dataBytes(), scaleBytes(), layer, tensor, index);
+    return splash_kv_offset(extentPages_, dataBytes(), scaleBytes(), layout_.region(layer), tensor, index);
   }
 
   kv::Layout layout_;

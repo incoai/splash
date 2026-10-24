@@ -1,5 +1,5 @@
-// Streamed experts (model::ExpertStore) at three MoE shapes in turn, a small
-// one, the 35B's routing and Qwen3.8-Flash-Next's: routed experts read from a
+// Streamed experts (model::ExpertStore) at four MoE shapes in turn, a small
+// one, the 35B's routing, Qwen3.8-Flash-Next's and Flint's: routed experts read from a
 // file into an arena of one block's experts and three more, which two blocks
 // share, run decode steps and prefill chunks bitwise as the resident experts
 // do, their slots holding the reference repack's planes, in as many rounds as
@@ -73,9 +73,20 @@ using namespace gguf_reference;
 using namespace moe_fixture;
 
 // The shapes the store runs at: 16 experts, top 4, hidden 1024, 512 wide; the
-// 35B's 256 experts, top 8, at hidden 256 and 512 wide; and
-// Qwen3.8-Flash-Next's 512 experts, top 10, hidden 256, 640 wide.
-constexpr MoeShape kShapes[] = {{1024, 16, 4, 512}, {256, 256, 8, 512}, {256, 512, 10, 640}};
+// 35B's 256 experts, top 8, at hidden 256 and 512 wide; Qwen3.8-Flash-Next's
+// 512 experts, top 10, hidden 256, 640 wide; and Flint's 256 experts, top 6
+// by a sigmoid router, 512 wide, with a shared expert of two ungated slices,
+// at hidden 256.
+constexpr MoeShape kShapes[] = {{1024, 16, 4, 512},
+                                {256, 256, 8, 512},
+                                {256, 512, 10, 640},
+                                {.hiddenSize = 256,
+                                 .experts = 256,
+                                 .expertsPerToken = 6,
+                                 .expertIntermediateSize = 512,
+                                 .router = splash::ops::MoeRouter::SigmoidNormalized,
+                                 .sharedSlices = 2,
+                                 .sharedGate = false}};
 
 // Memory a store gets past the slots a test asks for, less than any slot
 // takes: the store, which takes the most slots its memory holds, takes

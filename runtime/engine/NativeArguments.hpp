@@ -70,6 +70,11 @@ struct NativeArguments final {
   // KV on the SSD cache, for validation; without it, the requests memory
   // cannot hold (EngineSpillConfig::always).
   bool kvSpillAlways = false;
+  // --kv-window-trim on|off: whether a windowed target's pages give up their
+  // windowed layers' K/V once every window has passed them; off, for
+  // validation, keeps them Full, which changes no output
+  // (RuntimeResourcesConfig::kvWindowTrim).
+  bool kvWindowTrim = true;
   // --verify-rows auto|all: the rows of the draft's block a decode
   // cycle verifies (RuntimeResourcesConfig::verifyRows).
   model::VerifyRows verifyRows = model::VerifyRows::Auto;

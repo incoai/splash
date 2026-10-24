@@ -3,6 +3,7 @@
 #include "model/RopeScaling.hpp"
 #include "model/StateLayout.hpp"
 #include "ops/PagedKv.hpp"
+#include "ops/StopTokens.hpp"
 
 #include <array>
 #include <cmath>
@@ -46,7 +47,7 @@ struct QwenTargetDimensions {
   float rotaryTheta = 0.0F;
   uint32_t fullAttentionPeriod = 0;
   uint32_t maskToken = 0;
-  std::array<uint32_t, 2> stopTokens{};
+  ops::StopTokens stopTokens{};
   QwenFfnKind ffnKind = QwenFfnKind::Dense;
   // The dense FFN's width.
   uint32_t intermediateSize = 0;

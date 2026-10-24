@@ -18,6 +18,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -5435,6 +5436,260 @@ void testCutsShareUnchangedChunks() {
   spill.cache.endRequest(1);
 }
 
+// A windowed layout's cache, of a window of two pages, over pages of 100
+// bytes, Slim ones of 30, in extents of four: requests run the prompt's
+// pages as commands do, publishing the blocks they commit, and states land
+// at the blocks they name.
+struct Windowed final {
+  static constexpr uint32_t kWindowPages = 2;
+  test::TestKvStorage storage{64, 100, 4, 0, 30};
+  KvPool pool{storage, 4};
+  engine::Cache cache;
+
+  explicit Windowed(engine::KvTier *tier = nullptr, bool trim = true)
+      : cache(pool, tier, nullptr, std::nullopt, CacheWindowPolicy{kWindowPages, trim}) {}
+
+  // `pages` pages of distinct tokens from `first`, and one token past them.
+  static std::vector<uint32_t> prompt(uint32_t first, uint32_t pages) {
+    std::vector<uint32_t> tokens(pages * KvCache::pageTokens + 1);
+    std::iota(tokens.begin(), tokens.end(), first);
+    return tokens;
+  }
+  // The request's command commits its pages up to `pages`.
+  void run(uint64_t id, const std::vector<uint32_t> &tokens, uint32_t pages) {
+    require(admitTokens(cache, id, pages * KvCache::pageTokens + 1).granted(), "windowed KV was refused");
+    cache.publishCommittedBlocks(id, tokens, pages * KvCache::pageTokens, {});
+  }
+  void publish(uint64_t id, uint32_t pages, bool checkpoint = false) {
+    cache.publishCompositeState(cache.blockAt(id, pages * KvCache::pageTokens), std::make_shared<TestState>(100),
+                                checkpoint);
+  }
+  // The forms of the request's pages, F for Full and S for Slim.
+  std::string forms(uint64_t id) const {
+    std::string result;
+    for (const uint32_t page : cache.pageTable(id).pages)
+      result += pool.form(page) == kv::PageForm::Slim ? 'S' : 'F';
+    return result;
+  }
+  [[nodiscard]] uint32_t slimPages() const {
+    const KvPoolSnapshot snapshot = pool.snapshot();
+    return snapshot.slim.pagesAllocated - snapshot.slim.pagesFree;
+  }
+};
+
+// A page gives up its windowed layers' K/V once every request that holds it
+// has published two blocks past it: its next command's rows, at or past
+// them, read no key on it. Another holder behind keeps it Full, and a writer
+// that computes a block again whose page is Slim gives the block its own
+// Full page back (upgrades), keeping the Slim one for the requests that hold
+// it. Trimming off keeps every page Full.
+void testWindowsTrimWhatEveryHolderPassed() {
+  Windowed windowed;
+  engine::Cache &cache = windowed.cache;
+  const std::vector<uint32_t> prompt = Windowed::prompt(5000, 8);
+  cache.beginRequest(1);
+  windowed.run(1, prompt, 3);
+  require(cache.trimWindows() == 1 && windowed.forms(1) == "SFFF", "three published pages did not trim the first");
+  windowed.run(1, prompt, 8);
+  require(cache.trimWindows() == 5 && windowed.forms(1) == "SSSSSSFFF" &&
+              cache.snapshot().window->trimmedPages == 6 && cache.trimWindows() == 0,
+          "the pages the window passed were not trimmed, or trimmed twice");
+  static_cast<void>(cache.cutPageTable(1));
+
+  // A second request computes the first three blocks again: it takes them
+  // back Full, while the first keeps the Slim pages, and only what it has
+  // passed itself trims.
+  cache.beginRequest(2);
+  windowed.run(2, prompt, 3);
+  const PageTableState first = cache.pageTable(1), second = cache.pageTable(2);
+  require(cache.snapshot().window->upgrades == 3 && windowed.forms(2) == "FFFF" &&
+              windowed.forms(1) == "SSSSSSFFF" && cache.blockAt(2, 32) == cache.blockAt(1, 32) &&
+              first.pages[0] != second.pages[0],
+          "a writer did not give the Slim blocks it computed again its own Full pages");
+  require(cache.trimWindows() == 1 && windowed.forms(2) == "SFFF", "the writer's pages did not trim on its window");
+  cache.checkInvariants();
+  cache.endRequest(2);
+  cache.endRequest(1);
+  require(cache.trimWindows() == 4 && windowed.slimPages() == 8 && cache.snapshot().pool.pagesActive == 0,
+          "the pages no request holds kept their windowed layers");
+  cache.checkInvariants();
+
+  Windowed full(nullptr, false);
+  full.cache.beginRequest(1);
+  full.run(1, prompt, 8);
+  require(full.cache.trimWindows() == 0 && full.forms(1) == "FFFFFFFFF" && !full.cache.snapshot().window->trim,
+          "a cache with trimming off trimmed");
+  full.cache.endRequest(1);
+}
+
+// A writer that computes blocks again keeps its own pages, which the blocks
+// take, whether trimming made the blocks' pages Slim or left them Full: what
+// it reads, and what a later restore of the blocks reads, is the same with
+// trimming on or off. A request that holds a page a block left keeps it as
+// a page of its own, which a pass trims once it has passed the page.
+void testWritersKeepTheirPagesTrimmedOrNot() {
+  for (const bool trim : {true, false}) {
+    Windowed windowed(nullptr, trim);
+    engine::Cache &cache = windowed.cache;
+    const std::vector<uint32_t> prompt = Windowed::prompt(9000, 12);
+    cache.beginRequest(1);
+    windowed.run(1, prompt, 8);
+    require(cache.trimWindows() == (trim ? 6u : 0u), "the first request's passed pages did not trim");
+    const std::vector<uint32_t> first(cache.pageTable(1).pages.begin(), cache.pageTable(1).pages.end());
+
+    // The second request computes the eight blocks again beside the first,
+    // whose window holds the last two.
+    cache.beginRequest(2);
+    require(admitTokens(cache, 2, 8 * KvCache::pageTokens + 1).granted(), "the second request was refused");
+    const std::vector<uint32_t> own(cache.pageTable(2).pages.begin(), cache.pageTable(2).pages.end());
+    require(cache.publishCommittedBlocks(2, prompt, 8 * KvCache::pageTokens, {}) == 0 &&
+                std::ranges::equal(cache.pageTable(2).pages, own) &&
+                std::ranges::equal(cache.pageTable(1).pages, first) &&
+                cache.blockAt(2, 8 * KvCache::pageTokens) == cache.blockAt(1, 8 * KvCache::pageTokens) &&
+                cache.snapshot().window->upgrades == 8,
+            "a writer moved onto the pages of the blocks it computed again, or they kept theirs");
+    cache.checkInvariants();
+
+    // Once the first has passed the two pages it kept, they trim, beside
+    // the second's six and the two the first passed of its own.
+    windowed.run(1, prompt, 12);
+    require(cache.trimWindows() == (trim ? 10u : 0u) &&
+                windowed.forms(1) == (trim ? "SSSSSSSSSSFFF" : "FFFFFFFFFFFFF") &&
+                windowed.forms(2) == (trim ? "SSSSSSFFF" : "FFFFFFFFF"),
+            "the pages a request kept beside its blocks did not trim once it passed them");
+    cache.checkInvariants();
+    cache.endRequest(1);
+    cache.endRequest(2);
+    cache.checkInvariants();
+  }
+}
+
+// A state pins its tail, the two blocks that end at its block, which a
+// request resuming there reads whole: states a block apart share one of
+// them, three blocks in all. Their pages stay Full while either state does,
+// an evicted state unpins its tail, which the next pass trims, and a
+// restore from the other finds its tail Full and its history Slim.
+void testStateTailsPinTheirWindows() {
+  Windowed windowed;
+  engine::Cache &cache = windowed.cache;
+  const std::vector<uint32_t> prompt = Windowed::prompt(6000, 8);
+  cache.beginRequest(1);
+  windowed.run(1, prompt, 8);
+  windowed.publish(1, 4);
+  windowed.publish(1, 5);
+  require(cache.snapshot().window->pinnedBlocks == 3, "adjacent states did not share their tails");
+  cache.endRequest(1);
+  require(cache.trimWindows() == 5, "the pages no tail holds were not trimmed");
+  cache.checkInvariants();
+
+  CacheLookup lookup = cache.lookup(std::span<const uint32_t>(prompt).first(4 * KvCache::pageTokens + 1), {});
+  require(lookup.state && lookup.resumeBoundary() == 4 * KvCache::pageTokens, "the earlier state was not found");
+  const uint64_t earlier = lookup.state->kvBlock();
+  lookup = {};
+  cache.invalidateState(earlier);
+  require(cache.snapshot().window->pinnedBlocks == 2 && cache.trimWindows() == 1,
+          "an evicted state's tail was not trimmed once unpinned");
+
+  cache.beginRequest(2);
+  CacheLookup resume = cache.lookup(prompt, {});
+  require(resume.state && resume.resumeBoundary() == 5 * KvCache::pageTokens &&
+              admitRestore(cache, 2, resume).granted() && windowed.forms(2) == "SSSFF",
+          "a restore did not find its tail Full and its history Slim");
+  static_cast<void>(cache.cutPageTable(2));
+  cache.checkInvariants();
+  cache.endRequest(2);
+}
+
+// A state's tail holds every layer's K/V, or the state is refused: a
+// command leaves its tail so, and a block past every window does not, so
+// that the engine publishes no state it could not restore, and a
+// publication that would is a logic error. A refusal counts.
+void testStatesNeedTheirTailFull() {
+  Windowed windowed;
+  engine::Cache &cache = windowed.cache;
+  const std::vector<uint32_t> prompt = Windowed::prompt(7000, 6);
+  cache.beginRequest(1);
+  windowed.run(1, prompt, 6);
+  require(cache.trimWindows() == 4, "the window's past was not trimmed");
+  const uint64_t passed = cache.blockAt(1, 3 * KvCache::pageTokens);
+  require(!cache.stateTailFull(passed) && cache.stateTailFull(cache.blockAt(1, 6 * KvCache::pageTokens)) &&
+              cache.snapshot().window->refusedStates == 1,
+          "a tail past the window was taken for Full, or the window's for less");
+  rejects([&] { cache.publishCompositeState(passed, std::make_shared<TestState>(100), false); },
+          "tail holds only the layers no window bounds", "a state was published on a Slim tail");
+  windowed.publish(1, 6);
+  cache.checkInvariants();
+  cache.endRequest(1);
+}
+
+// A Full shortfall in a windowed cache is met by trims first, then by
+// states, a checkpoint first, each unpinning a tail the trim after it
+// frees, and with KeepExtents one state at a time; the KV of every block
+// stays cached, Slim.
+void testFullShortfallsTrimBeforeAnyLeafGoes() {
+  Windowed windowed;
+  windowed.storage.budgetPages = 16;
+  engine::Cache &cache = windowed.cache;
+  const std::vector<uint32_t> cached = Windowed::prompt(8000, 8);
+  cache.beginRequest(1);
+  windowed.run(1, cached, 8);
+  windowed.publish(1, 4, true);
+  windowed.publish(1, 8);
+  cache.endRequest(1);
+  require(cache.trimWindows() == 4 && windowed.slimPages() == 4, "the unpinned pages were not trimmed");
+
+  // Twelve Full pages are three Full extents, which leave the Slim ones no
+  // room in the budget: the eight free pages need four more.
+  cache.beginRequest(2);
+  const TokenAdmission refused = cache.ensureTokens(2, 12 * KvCache::pageTokens);
+  require(!refused.granted() && refused.form == kv::PageForm::Full, "the shortfall setup was granted");
+  const CacheReclaimResult checkpoint =
+      cache.reclaimForPages(refused.additionalPages, CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
+  require(checkpoint.madeProgress && checkpoint.evictedState && windowed.slimPages() == 6 &&
+              cache.snapshot().stateCache.entries == 1 && cache.snapshot().stateCache.checkpointEntries == 0,
+          "the checkpoint did not go first, or its tail was not trimmed");
+  require(admitTokens(cache, 2, 12 * KvCache::pageTokens).granted() && windowed.slimPages() == 8 &&
+              cache.snapshot().stateCache.entries == 0,
+          "the shortfall was not met by the states' tails");
+  const CacheLookup kept = cache.lookup(cached, {});
+  require(kept.kvBoundary == 8 * KvCache::pageTokens && !kept.state, "a KV leaf went for Full pages");
+  cache.checkInvariants();
+  cache.endRequest(2);
+}
+
+// A state the SSD keeps still pins its tail, which a resume at it reads
+// whole: the Full shortfall above, with a checkpoint the SSD takes, writes it
+// there and trims none of its tail, and the checkpoint keeps its entry.
+void testFullShortfallsKeepTheTailsOfStatesTheSsdKeeps() {
+  Windowed windowed;
+  windowed.storage.budgetPages = 16;
+  engine::Cache &cache = windowed.cache;
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  const std::vector<uint32_t> cached = Windowed::prompt(8000, 8);
+  cache.beginRequest(1);
+  windowed.run(1, cached, 8);
+  cache.publishCompositeState(cache.blockAt(1, 4 * KvCache::pageTokens), std::make_shared<TieredState>(control),
+                              true);
+  windowed.publish(1, 8);
+  cache.endRequest(1);
+  require(cache.trimWindows() == 4 && windowed.slimPages() == 4, "the unpinned pages were not trimmed");
+
+  cache.beginRequest(2);
+  const TokenAdmission refused = cache.ensureTokens(2, 12 * KvCache::pageTokens);
+  require(!refused.granted() && refused.form == kv::PageForm::Full, "the shortfall setup was granted");
+  const CacheReclaimResult checkpoint =
+      cache.reclaimForPages(refused.additionalPages, CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
+  require(checkpoint.madeProgress && checkpoint.evictedState && cache.pollTransfers(),
+          "the checkpoint was not written to the SSD");
+  const auto states = cache.snapshot().stateCache;
+  require(states.entries == 2 && states.checkpointEntries == 1 && states.diskBytes == 100 && control->slots == 1 &&
+              windowed.slimPages() == 4,
+          "the checkpoint the SSD keeps lost its entry, or its tail was trimmed");
+  cache.checkInvariants();
+  cache.endRequest(2);
+}
+
 int main() {
   try {
     testStateInUseGoesLast();
@@ -5583,6 +5838,12 @@ int main() {
     testRecomputedBlocksSpillToCopiesOfTheirPages();
     testUnreadableCopyLeavesWithItsHolders();
     testCutsShareUnchangedChunks();
+    testWindowsTrimWhatEveryHolderPassed();
+    testWritersKeepTheirPagesTrimmedOrNot();
+    testStateTailsPinTheirWindows();
+    testStatesNeedTheirTailFull();
+    testFullShortfallsTrimBeforeAnyLeafGoes();
+    testFullShortfallsKeepTheTailsOfStatesTheSsdKeeps();
     std::cout << "engine cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {

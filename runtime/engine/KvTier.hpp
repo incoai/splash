@@ -66,15 +66,17 @@ public:
   // Null when the tier is at its limit for the draw (model::DiskBudget::
   // reserve).
   [[nodiscard]] virtual std::shared_ptr<KvDiskSlot> acquireSlot(model::DiskBudget::Draw draw) = 0;
-  // Starts writing the page, which holds its K/V (kv::PageForm::Full). Null
-  // when the tier takes no more writes of the class for now; the caller
-  // waits while transfers are in flight.
+  // Starts writing what the page holds, its K/V (kv::PageForm::Full) or
+  // that of the layers no window bounds (Slim), which its slot then holds.
+  // Null when the tier takes no more writes of the class for now; the
+  // caller waits while transfers are in flight.
   [[nodiscard]] virtual std::unique_ptr<KvTransfer>
   demote(uint32_t page, std::shared_ptr<KvDiskSlot> slot, WriteClass write,
          std::function<void()> completion) = 0;
   // Reads the page back from its slot, what the page's form holds: its
-  // index alone, or all of it. Null when the tier takes no more restores for
-  // now (canRestore); the caller retries later.
+  // index alone, or the K/V and index of a page of the form the slot was
+  // written from. Null when the tier takes no more restores for now
+  // (canRestore); the caller retries later.
   [[nodiscard]] virtual std::unique_ptr<KvTransfer>
   restore(std::shared_ptr<KvDiskSlot> slot, uint32_t page,
           std::function<void()> completion) = 0;

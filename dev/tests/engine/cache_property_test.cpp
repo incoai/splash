@@ -72,12 +72,19 @@ private:
 // tier's writes of every class fail now and then, and the tier's transfers
 // land at random. The cache checks every invariant spilling relies on after
 // each step (Cache::checkInvariants), and active KV never stays past its
-// limit after the quota was kept.
+// limit after the quota was kept. A windowed run's requests do not spill,
+// and between commands the pages every window has passed give up their
+// windowed layers' K/V: each page a request's next command reads from its
+// window on stays Full (its cuts check it), and each state's tail too, in
+// RAM and on disk, which it is published only with (Cache::stateTailFull).
 class Run final {
 public:
-  explicit Run(uint32_t seed)
-      : random_(seed), tier_(chance(50)), budget_(std::make_shared<model::DiskBudget>(kSlots * 100)),
-        cache_(pool_, &tier_, budget_, CacheSpillPolicy{pick(0, 2), pick(1, 2)}) {
+  Run(uint32_t seed, bool windowed)
+      : random_(seed), windowed_(windowed), tier_(chance(50)),
+        budget_(std::make_shared<model::DiskBudget>(kSlots * 100)),
+        cache_(pool_, &tier_, budget_,
+               windowed ? std::nullopt : std::optional(CacheSpillPolicy{pick(0, 2), pick(1, 2)}),
+               windowed ? std::optional(CacheWindowPolicy{pick(1, 3)}) : std::nullopt) {
     tier_.budget = budget_;
     tier_.transferLimit = 64;
     tier_.writeLimits = {8, 4, 8};
@@ -95,7 +102,9 @@ public:
     case 1: case 2: grow(); break;
     case 3: static_cast<void>(cache_.writeThrough()); break;
     case 4: land(); break;
-    case 5: static_cast<void>(cache_.spillWritten()); break;
+    case 5:
+      static_cast<void>(windowed_ ? cache_.trimWindows(chance(80)) : cache_.spillWritten().additionalPages);
+      break;
     case 6: reclaim(); break;
     case 7: keepQuota(); break;
     case 8: convert(); break;
@@ -172,7 +181,7 @@ private:
     if (requests_.size() >= 6) return;
     const uint64_t id = ++nextId_;
     Request request{pick(0, static_cast<uint32_t>(bases_.size()) - 1), pick(1, kMaximumPages - 2),
-                    chance(60) ? KvMode::Spill : KvMode::Resident};
+                    !windowed_ && chance(60) ? KvMode::Spill : KvMode::Resident};
     CacheLookup lookup = cache_.lookup(prompt(request), {});
     cache_.beginRequest(id, request.mode);
     const uint32_t copied = lookup.state ? cache_.copiedBlocks(lookup.state->kvBlock()) : 0;
@@ -200,9 +209,9 @@ private:
     request->pages = pages;
     cache_.publishCommittedBlocks(id, prompt(*request), pages * KvCache::pageTokens, {});
     // As the engine does, a state at a block another request published one
-    // at is reused.
+    // at is reused, and one is published only with a tail it restores from.
     if (const uint64_t block = cache_.blockAt(id, pages * KvCache::pageTokens);
-        chance(30) && !cache_.reuseStoredState(block))
+        chance(30) && !cache_.reuseStoredState(block) && cache_.stateTailFull(block))
       cache_.publishCompositeState(block, std::make_shared<ShelvedState>(shelf_, false), false);
   }
 
@@ -255,7 +264,7 @@ private:
 
   void convert() {
     Request *request = anyRequest();
-    if (!request || request->mode == KvMode::Spill) return;
+    if (windowed_ || !request || request->mode == KvMode::Spill) return;
     if (cache_.convertToSpill(idOf(*request), kMaximumPages)) request->mode = KvMode::Spill;
   }
 
@@ -309,7 +318,10 @@ private:
   }
 
   std::mt19937 random_;
-  test::TestKvStorage storage_{1024, 100, 4, 10};
+  bool windowed_;
+  // Index pages of 10 bytes for a run that spills, Slim ones of 30 for a
+  // windowed one.
+  test::TestKvStorage storage_{1024, 100, 4, 10, 30};
   KvPool pool_{storage_, 4};
   test::TestKvTier tier_;
   std::shared_ptr<model::DiskBudget> budget_;
@@ -322,15 +334,20 @@ private:
   uint64_t nextId_ = 0;
 };
 
+// A windowed run takes more seeds: the paths that leave a state's tail
+// Slim, unless the cache keeps it Full, take a run of steps few seeds make.
 void testRandomRuns() {
-  for (uint32_t seed = 1; seed <= 40; ++seed) {
-    Run run(seed);
-    try {
-      for (int step = 0; step < 600; ++step)
-        run.step();
-      run.drain();
-    } catch (const std::exception &error) {
-      throw std::runtime_error("seed " + std::to_string(seed) + ": " + error.what());
+  for (const bool windowed : {false, true}) {
+    for (uint32_t seed = 1; seed <= (windowed ? 400u : 40u); ++seed) {
+      Run run(seed, windowed);
+      try {
+        for (int step = 0; step < 600; ++step)
+          run.step();
+        run.drain();
+      } catch (const std::exception &error) {
+        throw std::runtime_error(std::string(windowed ? "windowed " : "") + "seed " + std::to_string(seed) + ": " +
+                                 error.what());
+      }
     }
   }
   std::cout << "cache property runs ok\n";

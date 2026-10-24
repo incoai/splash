@@ -113,10 +113,12 @@ void excludeFromBackups(const std::filesystem::path &root) {
 // A persistent tier's directory under root and its files, each with its
 // slots' size and options, empty when another process holds the directory or
 // it cannot be used: the tier then keeps temporary files, as without one. A
-// root it makes is excluded from backups.
+// root it makes is excluded from backups. The KV file's records keep labels
+// of kvLabelBytes.
 PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
                                          const std::string &cacheNamespace,
-                                         uint64_t kvSlotBytes, const model::SlotFile::Options &kvOptions,
+                                         uint64_t kvSlotBytes, uint32_t kvLabelBytes,
+                                         const model::SlotFile::Options &kvOptions,
                                          uint64_t stateSlotBytes, const model::SlotFile::Options &stateOptions,
                                          const std::shared_ptr<model::DiskBudget> &budget,
                                          const std::function<bool()> &cancelled) {
@@ -141,7 +143,7 @@ PersistentCacheFiles openPersistentCache(const std::filesystem::path &root,
     files.kv = std::make_shared<model::SlotFile>(
         kvSlotBytes, budget,
         model::SlotFile::Persistence{files.directory->kvSlots(), files.directory->kvRecords(),
-                                     tag, sizeof(KvBlockLabel)},
+                                     tag, kvLabelBytes},
         kvOptions);
     files.states = std::make_shared<model::SlotFile>(
         stateSlotBytes, budget,
@@ -234,7 +236,8 @@ struct DiskTier final {
 // tier's KV, and the room bounds each request's commitment instead
 // (Engine::admitSpill). Every start removes the root's stale caches.
 DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &cacheNamespace,
-                      uint64_t quotaBytes, uint64_t kvSlotBytes, const model::SlotFile::Options &kvOptions,
+                      uint64_t quotaBytes, uint64_t kvSlotBytes, uint32_t kvLabelBytes,
+                      const model::SlotFile::Options &kvOptions,
                       uint64_t stateBytes, const model::SlotFile::Options &stateOptions, bool relaunchSpills) {
   DiskTier tier;
   // The cache root's caches nobody holds, this start's own included, looked
@@ -266,8 +269,9 @@ DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &c
       }
     }
     if (config.persistentCache && !rootRefusal) {
-      tier.persistent = openPersistentCache(config.cacheRoot, cacheNamespace, kvSlotBytes, kvOptions,
-                                            stateSlotBytes, stateOptions, tier.budget, config.cancelled);
+      tier.persistent = openPersistentCache(config.cacheRoot, cacheNamespace, kvSlotBytes, kvLabelBytes,
+                                            kvOptions, stateSlotBytes, stateOptions, tier.budget,
+                                            config.cancelled);
       tier.states = tier.persistent.states;
     }
     std::optional<std::string> off;
@@ -533,6 +537,11 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
   // key is pooled, normalized or rotated changes this line.
   if (kv.indexDimension)
     canonical << " index " << kv.indexDimension << " bf16 block " << SPLASH_ATTENTION_BLOCK_TOKENS;
+  // A sliding window (kv::Layout::windowTokens), which also orders a page's
+  // regions in its slot (kv::Layout::region) and labels a slot with its
+  // page's form (KvSlotLabel). A layout without one keeps the line it had.
+  if (kv.windowedLayers)
+    canonical << " window " << kv.windowTokens << " layers 0x" << std::hex << kv.windowedLayers << std::dec;
   // How a slot holds a page; nothing for the spans' order, so the caches
   // written before slots had another order stay valid.
   canonical << KvPageTier::slotFormatToken(kv) << '\n'
@@ -540,8 +549,9 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
             << gdn.convolutionChannels << ' ' << gdn.recurrentGroups << ' ' << gdn.recurrentRows
             << ' ' << gdn.recurrentColumns
             // fp32 states keep the line they had before states had a format,
-            // so the caches they wrote stay valid.
-            << (gdn.format == ops::GdnStateFormat::BFloat16 ? " bf16" : "");
+            // so the caches they wrote stay valid; without GDN layers the
+            // format stores nothing.
+            << (gdn.layers && gdn.format == ops::GdnStateFormat::BFloat16 ? " bf16" : "");
   // A family's state after the GDN layers' (Qwen3.8-Flash-Next's PLE history
   // and QSA pending keys, model::QwenHybridLayout::gdnStateLayout).
   if (gdn.auxiliaryBytes) canonical << " auxiliary " << gdn.auxiliaryBytes;
@@ -726,6 +736,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   bool kvFileOpen = true;
   // The context a relaunch keeps, which only an automatic context does.
   const uint32_t relaunchContext = requestedContextTokens ? 0 : config.relaunchContext;
+  // The pages of a prefill group's rows (model::kPrefillGroupChunks chunks).
+  constexpr uint32_t groupPages =
+      model::kPrefillGroupChunks * model::ExecutionLimits::prefillTokenBudget / kv::kPageTokens;
   // The plan with the parts set as `experts` and `table`, `stagingBytes` set
   // aside for the disk tier's state staging and `aneFfnBytes` for the
   // prefill FFN's Neural Engine split.
@@ -750,7 +763,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
          .kvSlotBytes = kvSlotBytes,
          .stateSlotBytes = model::SlotFile::slotBytesFor(stateBytes),
          .activeLimitBytes = activeLimitBytes,
-         .groupPages = model::kPrefillGroupChunks * model::ExecutionLimits::prefillTokenBudget / kv::kPageTokens});
+         .groupPages = groupPages});
   };
   // The plan of the parts as configured, which sizes their stores.
   const auto sizingPlan = [&](uint64_t stagingBytes) {
@@ -912,9 +925,12 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         aneFfnBytes,
         loaded.streamedTable() ? loaded.streamedTable()->committedBytes() : 0,
     };
+    // A lane's prefill command writes a group of chunks where the routed
+    // experts stream (model::RuntimeGeometry::prefillChunks).
+    const uint32_t commandPages = loadOptions.expertMemoryBytes ? groupPages : 0;
     ModelMemoryProfile modelProfile{
         loaded.name(), loaded.maximumContextTokens(), loaded.targetKvLayout(config.kvFormat), footprint,
-        config.stateFormat, streamed.plan ? streamed.plan->spill : KvSpillPlan{}};
+        config.stateFormat, streamed.plan ? streamed.plan->spill : KvSpillPlan{}, commandPages};
     EngineMemoryPlanResult result = evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
     if (streamed.plan || !result.plan)
       return result;
@@ -1023,8 +1039,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                                  .deferWrites = readers->criticalBusyProbe()};
     const model::SlotFile::Options stateFileOptions{.deferWrites = readers->criticalBusyProbe()};
     DiskTier disk = openDiskTier(config, cacheNamespace, stateStagingBytes ? cacheDiskBytes : 0, kvSlotBytes,
-                                 kvFileOptions, stateBytes, stateFileOptions,
-                                 relaunchContext && memoryPlan.breakdown().kvSpill.enabled);
+                                 kvSlotLabelBytes(kvLayout.windowedLayers != 0), kvFileOptions, stateBytes,
+                                 stateFileOptions, relaunchContext && memoryPlan.breakdown().kvSpill.enabled);
     if (memoryPlan.breakdown().kvSpill.enabled) {
       kvFileOpen = disk.kv != nullptr;
       if (disk.budget)
@@ -1073,11 +1089,14 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         logLine("--sparse-kv-memory ignored: ", config.model.name, " keeps its KV in memory, ", spillOff, ".");
     }
 
-    // Page ids for every extent the hard budget could hold, of Index pages
-    // where spilled pages hold only their index: the governor, never the id
-    // range, limits the pool.
+    // Page ids for every extent the hard budget could hold, of the smallest
+    // pages the pool takes: Index pages where spilled pages hold only their
+    // index, Slim ones where pages every window has passed hold the layers
+    // no window bounds. The governor, never the id range, limits the pool.
     const uint64_t idExtentBytes =
-        spill.enabled ? uint64_t{budget.kvExtentPages} * budget.kvIndexPageBytes : budget.kvExtentBytes;
+        spill.enabled          ? uint64_t{budget.kvExtentPages} * budget.kvIndexPageBytes
+        : kvLayout.slimmable() ? uint64_t{budget.kvExtentPages} * kvLayout.bytesPerModelPage(kv::PageForm::Slim)
+                               : budget.kvExtentBytes;
     const uint64_t poolExtents = std::min<uint64_t>(
         (budget.hardBudgetBytes + idExtentBytes - 1) / idExtentBytes,
         std::numeric_limits<uint32_t>::max() / budget.kvExtentPages);
@@ -1094,7 +1113,13 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     std::optional<CacheSpillPolicy> spillPolicy;
     if (spill.enabled)
       spillPolicy = CacheSpillPolicy{.densePages = spill.densePages, .windowPages = spill.windowPages};
-    auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), disk.budget, spillPolicy);
+    // A windowed layout's pages give up their windowed layers' K/V where
+    // they can (kv::Layout::slimmable), unless --kv-window-trim off.
+    std::optional<CacheWindowPolicy> windowPolicy;
+    if (kvLayout.windowedLayers)
+      windowPolicy = CacheWindowPolicy{.windowPages = kvLayout.windowPages(),
+                                       .trim = kvLayout.slimmable() && config.kvWindowTrim};
+    auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), disk.budget, spillPolicy, windowPolicy);
     if (disk.space)
       cache->setDiskMeasure([space = disk.space.get()] { space->measure(); });
     // A target whose KV spills reads it back through one hot block cache and

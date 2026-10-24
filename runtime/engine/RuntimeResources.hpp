@@ -154,6 +154,9 @@ struct RuntimeResourcesConfig {
   // --kv-spill always: every request of a spill-capable target spills, for
   // validation (EngineSpillConfig::always).
   bool kvSpillAlways = false;
+  // --kv-window-trim off: a windowed target's pages keep every layer's K/V,
+  // for validation that trimming changes no output (CacheWindowPolicy::trim).
+  bool kvWindowTrim = true;
   // --verify-rows: the rows of the draft's block a decode cycle verifies
   // (model::budgetsVerifyRows); a benchmark round verifies every row so that
   // rounds repeat one another.
