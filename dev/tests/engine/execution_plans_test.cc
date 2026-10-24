@@ -126,15 +126,26 @@ void baselinePlans() {
   }
 }
 
-// MoE plans run the three expert passes: the exact register tile on Apple9,
-// with its Table16 row sums in the workspace bounds, staged tiles everywhere
-// else (32-row tiles for prefill chunks past one route per expert).
+// MoE plans run the three expert passes: the exact register tile on Apple9
+// GPUs of more than 10 cores, with its Table16 row sums in the workspace
+// bounds, staged tiles everywhere else (32-row tiles for prefill chunks past
+// one route per expert).
 void ggufMoePlans() {
   const MoeShape shape = routedShape;
-  for (uint32_t family : {9U, 10U, 11U}) {
-    ExecutionPlans plans(device(family));
-    const MoeGgufTile expected = family == 9 ? MoeGgufTile::Register : MoeGgufTile::Staged;
-    require(moeGgufTile(gpuFamilyClass(family), shape) == expected, "GGUF expert tile is not gated on GPU family 9");
+  // A GPU family, the cores its device reports (none: kAssumedGpuCores) and its tile.
+  struct Device final {
+    uint32_t family, reportedCores;
+    MoeGgufTile expected;
+  };
+  for (const auto [family, reportedCores, expected] :
+       {Device{9, 0, MoeGgufTile::Register}, Device{9, 11, MoeGgufTile::Register}, Device{9, 10, MoeGgufTile::Staged},
+        Device{10, 0, MoeGgufTile::Staged}, Device{11, 0, MoeGgufTile::Staged}}) {
+    DeviceCapabilities capabilities = device(family);
+    capabilities.gpuCoreCount = reportedCores;
+    ExecutionPlans plans(capabilities);
+    const uint32_t cores = plannedGpuCores(capabilities);
+    require(moeGgufTile(gpuFamilyClass(family), cores, shape) == expected,
+            "GGUF expert tile is not gated on GPU family 9 of more than 10 cores");
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const MoePlan plan = plans.moeDecode(shape, lanes);
       require(plan.configuration().ggufTile == expected && plan.tileRows() == 8 &&
@@ -146,18 +157,18 @@ void ggufMoePlans() {
               "GGUF register plan sums its Table16 tiles");
       covers(plans.moeDecodeWorkspacePerLane(shape), plan.workspace(), lanes, kMoeWorkspaceFields);
     }
-    // Apple9 stages experts mostly in a format it stages (IQ2_XS: UD-Q2_K_XL)
-    // and keeps the register tile for the others (Q4_K: UD-Q4_K_M).
+    // Apple9 stages experts mostly in a format it stages (IQ2_XS: UD-Q2_K_XL),
+    // and the others (Q4_K: UD-Q4_K_M) take the device's tile.
     MoeShape staged = shape, q4k = shape;
     staged.expertFormat = GGUF_FMT_IQ2XS;
     q4k.expertFormat = GGUF_FMT_Q4K;
-    require(moeGgufTile(gpuFamilyClass(family), staged) == MoeGgufTile::Staged &&
-                moeGgufTile(gpuFamilyClass(family), q4k) == expected,
+    require(moeGgufTile(gpuFamilyClass(family), cores, staged) == MoeGgufTile::Staged &&
+                moeGgufTile(gpuFamilyClass(family), cores, q4k) == expected,
             "GGUF expert tile does not follow the experts' format on GPU family 9");
     // An expert weight in a format the register tile does not take (F16) stages the experts.
     MoeShape f16 = q4k;
     f16.registerFormats = false;
-    require(moeGgufTile(gpuFamilyClass(family), f16) == MoeGgufTile::Staged,
+    require(moeGgufTile(gpuFamilyClass(family), cores, f16) == MoeGgufTile::Staged,
             "GGUF experts with an F16 weight took the register tile");
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
       const MoePlan plan = plans.moeDecode(staged, lanes);
@@ -179,8 +190,8 @@ void ggufMoePlans() {
               "GGUF MoE prefill plan left the device's tile");
       covers(plans.moePrefillWorkspace(shape, 2048), plan.workspace(), 1, kMoeWorkspaceFields);
     }
-    // The prefill bound holds the device's plans and nothing else: on Apple9
-    // the register tile's 8-row tiles (20480 grouped rows at 2048 rows), not
+    // The prefill bound holds the device's plans and nothing else: on the
+    // register tile its 8-row tiles (20480 grouped rows at 2048 rows), not
     // the staged 32-row tiles it never runs (26624).
     MoeWorkspace devicePlans;
     for (uint32_t rows = 1; rows <= 2048; ++rows) {

@@ -47,6 +47,7 @@ private:
 
   Linear linear_;
   GpuFamilyClass family_;
+  uint32_t gpuCores_;
 };
 
 } // namespace splash::ops

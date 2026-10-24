@@ -187,19 +187,31 @@ enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
 // GGUF image: the half-staged tiles of
 // kernels/shared/moe_gguf.metal, or Register, the exact register tile of
 // kernels/decode/linear_gguf_sgmatrix.metal over Table16 tiles of the
-// grouped rows (8-row tiles only). Apple9 runs Register in both phases but
-// for experts mostly in a format it stages. In decode, as its dense GGUF
-// projections do (LinearGguf.cpp): its matrix operations share the FP32 pipe,
-// where the register tile beats staging. In prefill it keeps the decode
-// numerics at a cost: the staged 32-row tiles run long chunks faster.
+// grouped rows (8-row tiles only). Apple9 GPUs of more than 10 cores run
+// Register in both phases but for experts mostly in a format they stage. In
+// decode, as Apple9's dense GGUF projections do (LinearGguf.cpp): its matrix
+// operations share the FP32 pipe, where the register tile beats staging. In
+// prefill it keeps the decode numerics at a cost: the staged 32-row tiles run
+// long chunks faster.
 enum class MoeGgufTile : uint8_t { Staged, Register };
 
 // Apple9 stages experts mostly in a format apple9StagesFormat names: one
 // 35B-shaped layer on a 40-core M3 Max decodes UD-Q2_K_XL's IQ2_XS and
 // IQ3_XXS experts, and the IQ2, IQ3_XXS and IQ1 formats alone, 4-21% faster
 // staged at B1-B4, where Q4_K/Q5_K, Q2_K and IQ4_XS experts take 3-34% longer.
-[[nodiscard]] inline MoeGgufTile moeGgufTile(GpuFamilyClass family, MoeShape shape) noexcept {
-  return family == GpuFamilyClass::Apple9 && shape.registerFormats && !apple9StagesFormat(shape.expertFormat)
+// Apple9 GPUs of 10 cores or fewer (the base M3 and M4) stage experts in every
+// format, in both phases: on a 10-core M4 such a layer in each of the 25
+// formats the register tile takes, and one of Flash-Next's shape in 4-bit
+// formats, take 12-45% less time staged at B1-B4 with rows routed at random,
+// up to 17% less with each lane's rows routed among few experts (IQ4_NL at B1:
+// 1% more) and 7-28% less on a 2048-row chunk (at most 4% more on 128- to
+// 512-row chunks). The M3 Max's numbers predate the staged tile's one gate/up
+// pass and its column tile for an expert's lone tile of one or two rows: at
+// their code the M4 too ran Q4_K/Q5_K, Q2_K and IQ4_XS experts 2-15% faster on
+// the register tile, so larger GPUs, unmeasured since, keep it.
+[[nodiscard]] inline MoeGgufTile moeGgufTile(GpuFamilyClass family, uint32_t cores, MoeShape shape) noexcept {
+  return family == GpuFamilyClass::Apple9 && cores > 10 && shape.registerFormats &&
+                 !apple9StagesFormat(shape.expertFormat)
              ? MoeGgufTile::Register
              : MoeGgufTile::Staged;
 }
