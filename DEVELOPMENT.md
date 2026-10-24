@@ -2448,8 +2448,9 @@ into sixteen while partitions keep 512 inputs (Qwen3.8-Flash-Next's hyper-connec
 projection, 320 columns over 10240 inputs; measured on Apple10). The MoE experts
 (`runtime/ops/MoE.cpp`) run the same numerics per family over the grouped rows: the register
 form in `linear_gguf_sgmatrix.metal`, the staged one in `kernels/shared/moe_gguf.metal`, which
-Apple9 takes for experts mostly in the formats it stages (`MoeShape::expertFormat`) and for
-experts with an F16 weight (`MoeShape::registerFormats`). One `MoeShape` serves all of a model's
+Apple9 takes on GPUs of 10 cores or fewer (the base M3 and M4), and on larger ones for experts
+mostly in the formats it stages (`MoeShape::expertFormat`) and for experts with an F16 weight
+(`MoeShape::registerFormats`). One `MoeShape` serves all of a model's
 MoE layers, so one F16 routed or shared expert tensor in any layer stages every layer's experts
 there. Their
 passes launch the live tiles alone: the grouping kernel writes each pass's grid with the tile
