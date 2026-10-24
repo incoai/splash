@@ -252,9 +252,13 @@ int main(int argc, char **argv) {
       std::vector<Case> cases;
       for (const uint32_t rows : prefillRows) {
         const LinearWorkload w{{N, K}, rows, LinearPhase::Prefill, epilogue};
-        const LinearConfig config{.tile = LinearTile::GgufPrefill};
-        cases.push_back({"R" + std::to_string(rows), "prefill128", Linear::plan(w, config, FloatOutput::BFloat16),
-                         config == linear.plan(w, ring.front()).configuration(), {}});
+        for (const uint32_t sgRows : {32u, 16u}) {
+          if (sgRows == 16 && (formats.size() != 1 || formats.front() != "af4g64")) continue;
+          const LinearConfig config{.tile = LinearTile::GgufPrefill, .prefillSimdgroupRows = sgRows};
+          cases.push_back({"R" + std::to_string(rows), sgRows == 32 ? "prefill128" : "prefill128-sg16",
+                           Linear::plan(w, config, FloatOutput::BFloat16),
+                           config == linear.plan(w, ring.front()).configuration(), {}});
+        }
       }
       for (uint32_t lanes = 1; lanes <= kMaximumLanes && !prefill; ++lanes) {
         const LinearWorkload w{{N, K}, lanes * kLaneRows, LinearPhase::Decode, epilogue};

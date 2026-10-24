@@ -269,6 +269,18 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32)
 #define GGUF_PREFILL_FORMAT(F, f) \
   GGUF_PREFILL(F, f) GGUF_PREFILL_EPILOGUE(F, f, r, EpResidual) GGUF_PREFILL_EPILOGUE(F, f, g, EpUpWithGate)
 QUANT_FORMATS(GGUF_PREFILL_FORMAT)
+// The short affine FFN tile: the same 128 rows and K order, eight
+// independent 16-row simdgroups. The host chooses it only for measured
+// short chunks; all ordinary instances above retain four 32-row groups.
+#undef GGUF_PREFILL_SIMDGROUP_ROWS
+#undef GGUF_PREFILL_SIMDGROUPS
+#define GGUF_PREFILL_SIMDGROUP_ROWS 16u
+#define GGUF_PREFILL_SIMDGROUPS 8u
+GGUF_PREFILL_FORMAT(FmtAF4G64, af4g64_sg16)
+#undef GGUF_PREFILL_SIMDGROUP_ROWS
+#undef GGUF_PREFILL_SIMDGROUPS
+#define GGUF_PREFILL_SIMDGROUP_ROWS 32u
+#define GGUF_PREFILL_SIMDGROUPS 4u
 #undef GGUF_PREFILL_FORMAT
 
 // The residual kernels over a view of the leading inputs of wider weight rows, for the Neural Engine FFN split's down

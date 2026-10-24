@@ -190,7 +190,30 @@ uint64_t gateBytes(const LinearPlan &plan) {
 // GGUF projections plan with their segments: the staged split policy for
 // every projection kind, exact split scratch over the tile's rows, and
 // prefill tiles of 8, 16, 32 or 128 rows.
+void shortAffinePrefillPlans() {
+  for (const uint32_t family : {9U, 10U, 11U})
+    for (const uint32_t cores : {16U, 20U, 40U})
+      for (const auto [n, k] : {std::pair{17408U, 5120U}, {5120U, 17408U}, {14336U, 5120U}})
+        for (const uint32_t rows : {32U, 33U, 64U, 128U, 160U, 192U, 193U, 256U})
+          for (const uint32_t format : {GGUF_FMT_AF4G64, GGUF_FMT_Q4K}) {
+            const LinearWorkload w{{n, k}, rows, LinearPhase::Prefill, LinearEpilogue::None};
+            const LinearPlan plan = gpu(family, cores).plan(w, blockProjection(n, k, 1, format));
+            const bool small = family == 10 && cores == 20 && n != 14336 && rows > 32 && rows <= 192 &&
+                               format == GGUF_FMT_AF4G64;
+            if (plan.configuration().prefillSimdgroupRows != (small ? 16U : 32U))
+              broke("short affine prefill selection", family, cores, w);
+            require(plan.storageRows() >= rows, "short prefill storage does not cover its active rows");
+          }
+  const LinearWorkload w{{17408, 5120}, 64, LinearPhase::Prefill, LinearEpilogue::None};
+  for (const LinearConfig config : {
+           LinearConfig{.tile = LinearTile::GgufStaged, .prefillSimdgroupRows = 16},
+           LinearConfig{.tile = LinearTile::GgufPrefill, .prefillSimdgroupRows = 64}})
+    rejects([&] { (void)Linear::plan(w, config, FloatOutput::BFloat16); },
+            "only the block prefill tile takes 16 rows per simdgroup", "an invalid prefill row tile was accepted");
+}
+
 void ggufPlans() {
+  shortAffinePrefillPlans();
   const Linear linear = gpu(10, 16);
   // A block projection without segments would reach the dispatch paths with
   // nothing to index or encode.

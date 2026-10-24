@@ -112,6 +112,9 @@ struct LinearConfig final {
   // (LinearPlan::storageRows), whose padding lane's rows it computes and
   // discards, instead of the 8-row tile.
   bool sixteenRows = false;
+  // GgufPrefill: rows per simdgroup in the 128-row tile. The small affine
+  // instance uses eight groups of 16 instead of four groups of 32.
+  uint32_t prefillSimdgroupRows = 32;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
     return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
   }
@@ -326,6 +329,7 @@ private:
   void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
                             const Projection &projection, const LinearPlan &plan) const;
   GpuFamilyClass family_;
+  uint32_t appleGpuFamily_ = 0;
   uint32_t gpuCores_ = 0;
 };
 
