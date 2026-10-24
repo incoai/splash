@@ -28,8 +28,8 @@ constexpr uint32_t stagedTileRows(uint32_t rows) noexcept { return rows <= 8 ? 8
 std::string decodeKernel(const char *format, uint32_t rows, char epilogue) {
   return std::string("gguf_decode_") + format + "_m" + std::to_string(rows) + "_" + epilogue;
 }
-std::string prefillKernel(const char *format, char epilogue) {
-  return std::string("gguf_prefill_") + format + "_" + epilogue;
+std::string prefillKernel(const char *format, char epilogue, uint32_t simdgroupRows = 32) {
+  return std::string("gguf_prefill_") + format + (simdgroupRows == 16 ? "_sg16_" : "_") + epilogue;
 }
 
 // K splits of a decode tile, one rule for both tiles. A tier asks for more
@@ -275,6 +275,8 @@ void LinearPlan::requireConfiguration() const {
   const uint32_t k = workload_.matrix.inputSize;
   const LinearConfig &c = config_;
   const bool decode = workload_.phase == LinearPhase::Decode;
+  if (c.prefillSimdgroupRows != 32 && (c.tile != LinearTile::GgufPrefill || c.prefillSimdgroupRows != 16))
+    throw std::invalid_argument("only the block prefill tile takes 16 rows per simdgroup");
   if (c.spread && c.tile != LinearTile::GgufStaged)
     throw std::invalid_argument("only the staged block tile spreads its walks");
   if (c.oneGateUpPass && (c.tile != LinearTile::GgufStaged || !decode || workload_.epilogue != LinearEpilogue::GateUp))
@@ -342,11 +344,21 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // that is 1.8-2.9x faster on a 16-core M5 Pro (its neural accelerator pads
   // 8 rows to 16) and 1.1-2.8x on a 40-core M3 Max; the 27B down and output
   // projections split in two gain 24-37% more on the 16-core M5 Pro.
-  if (w.phase == LinearPhase::Prefill)
-    return w.rows <= kMaximumDecodeTileRows
+  if (w.phase == LinearPhase::Prefill) {
+    LinearConfig config = w.rows <= kMaximumDecodeTileRows
         ? LinearConfig{.tile = LinearTile::GgufStaged,
                        .splits = decodeSplits(n, k, gpuCores_, stagedTiers(family_))}
         : LinearConfig{.tile = LinearTile::GgufPrefill};
+    // Short 27B affine FFNs have too few row tiles to amortize staging:
+    // eight independent 16-row matmuls shorten their chains and round a
+    // partial tile to 16 rows. Larger chunks keep the measured 32-row tile.
+    if (appleGpuFamily_ == 10 && gpuCores_ == 20 && w.rows > 32 && w.rows <= 192 &&
+        ((n == 17408 && k == 5120) || (n == 5120 && k == 17408)) &&
+        !projections.empty() && projections.front() && !projections.front()->planeInputs() &&
+        !projections.front()->rotation && projections.front()->shape().affine4Group64)
+      config.prefillSimdgroupRows = 16;
+    return config;
+  }
   // Apple9 runs matrix operations on the FP32 pipe, so the exact register
   // kernel beats staging but for the projections apple9Stages names; Apple10
   // runs it on narrow grids (apple10Registers).
@@ -550,6 +562,10 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
   const auto [n, k] = w.matrix;
   const char epilogue = epilogueSuffix(w.epilogue);
   const uint32_t rowTiles = plan.storageRows() / GGUF_PREFILL_ROWS;
+  const uint32_t simdgroupRows = plan.configuration().prefillSimdgroupRows;
+  const uint32_t threads = GGUF_PREFILL_ROWS / simdgroupRows * 32;
+  if (simdgroupRows == 16 && (!p.shape().affine4Group64 || p.planeInputs() || p.rotation))
+    throw std::invalid_argument("the small block prefill instance takes unrotated affine-4/group-64 tensors");
   if (w.epilogue == LinearEpilogue::None && !p.planeInputs()) {
     const std::vector<QuantizedSegment> &segments = p.blocks().segments;
     std::vector<uint32_t> formats;
@@ -574,8 +590,8 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
         bindings.insert(bindings.end(), {s.plane0, s.plane1Slot(), s.meta});
       }
       bindings.push_back(b.output);
-      graph.add(prefillKernel(group.front()->name(), epilogue), std::move(bindings), params,
-                {rowTiles, columns / GGUF_TILE_COLUMNS, 1}, {GGUF_PREFILL_THREADS, 1, 1});
+      graph.add(prefillKernel(group.front()->name(), epilogue, simdgroupRows), std::move(bindings), params,
+                {rowTiles, columns / GGUF_TILE_COLUMNS, 1}, {threads, 1, 1});
     }
     return;
   }
@@ -588,7 +604,7 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
       graph.add(leadingInputsInstance(prefillKernel(s.name(), epilogue)), std::move(bindings),
                 GgufPrefillLeadingParams{params, p.planeInputs()}, groups, {GGUF_PREFILL_THREADS, 1, 1});
     else
-      graph.add(prefillKernel(s.name(), epilogue), std::move(bindings), params, groups, {GGUF_PREFILL_THREADS, 1, 1});
+      graph.add(prefillKernel(s.name(), epilogue, simdgroupRows), std::move(bindings), params, groups, {threads, 1, 1});
   }
 }
 

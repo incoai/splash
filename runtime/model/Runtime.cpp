@@ -484,6 +484,18 @@ struct Runtime::Impl {
     sampling.addVerify(graph, policies, samplingBuffers(2),
                        geometry.target.stopTokens[0],
                        geometry.target.stopTokens[1], penalties);
+    // Maximum-row warmup does not reach the short affine FFN instances.
+    // Prepare them before readiness so the first short prompt does not
+    // compile their pipelines inside TTFT. This graph is never submitted.
+    if (const auto *weights = std::get_if<Qwen3_8Weights>(&model.target); weights && !weights->layers.empty()) {
+      const auto &layer = weights->layers.front();
+      if (operators.linear().prefillPlan(layer.gateProjection, 64, ops::LinearEpilogue::None)
+              .configuration().prefillSimdgroupRows == 16) {
+        const auto buffers = prefillBuffers(*prefillArena, 0);
+        operators.linear().addPrefillSwiGlu(graph, {&layer.gateProjection, &layer.upProjection, &layer.downProjection},
+                                           buffers.ffn(), buffers.hidden[0], buffers.hidden[1], 64);
+      }
+    }
     backend.preparePipelines(graph.dispatches());
   }
 

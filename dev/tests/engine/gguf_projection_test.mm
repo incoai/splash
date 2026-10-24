@@ -704,6 +704,19 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
                        [](uint16_t v) { return v == kUnwritten; }))
         fail(name + ": simdgroups past the chunk write their rows");
       if (tileOutput.empty()) tileOutput = whole.output;
+      if (std::all_of(parts.begin(), parts.end(), [](const Tensor *t) { return t->format == GGUF_FMT_AF4G64; })) {
+        LinearConfig small = kTiles;
+        small.prefillSimdgroupRows = 16;
+        const Outcome out = run(backend, linear, Linear::plan(w, small, FloatOutput::BFloat16), p, nullptr,
+                                storageRows(x, K, chunk, storage), aux, kPoisonNaN, covered, name + " sg16");
+        checkValues(out, dots, {}, aux, w, chunk, covered, true, name + " sg16");
+        if (!sameRows(out.output, 0, whole.output, 0, chunk, columns))
+          fail(name + ": the 16-row simdgroups differ from the 32-row ones");
+        const uint32_t smallWritten = (chunk + 15) / 16 * 16;
+        if (!std::all_of(out.output.begin() + uint64_t{smallWritten} * columns, out.output.end(),
+                         [](uint16_t v) { return v == kUnwritten; }))
+          fail(name + ": 16-row simdgroups past the chunk write their rows");
+      }
     }
     for (const uint32_t rows : {8u, 16u, 24u, 32u})
       for (const uint32_t splits : {1u, splitChunk}) {
@@ -729,6 +742,12 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
     const std::vector<const Tensor *> parts{&w, &b, &c};
     chunks(projection(parts, segmentColumns(parts) + kPadding), parts, LinearEpilogue::None,
            std::string(fmtName(w.format)) + "|" + fmtName(b.format) + "|" + fmtName(c.format));
+    if (w.format == GGUF_FMT_AF4G64) {
+      const Tensor x = tensor(backend, Fmt(GGUF_FMT_AF4G64), 256, K), y = tensor(backend, Fmt(GGUF_FMT_AF4G64), 256, K);
+      const std::vector<const Tensor *> affineParts{&w, &x, &y};
+      chunks(projection(affineParts, segmentColumns(affineParts) + kPadding), affineParts, LinearEpilogue::None,
+             "affine-4 fused short tile");
+    }
   }
   section("prefill: " + std::to_string(formats.size()) + " formats, K " + std::to_string(K) +
           ", plain/residual/up-with-gate and fused segments, 128-row tiles over 168- and 136-row chunks and chunks of "
