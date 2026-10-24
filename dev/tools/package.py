@@ -51,6 +51,7 @@ SERVER_FILES = (
     "judgments.py",
     "diagnostics.py",
     "api_shapes.py",
+    "chat_format.py",
     "tool_schema.py",
     "tokenization.py",
     "json_codec.py",

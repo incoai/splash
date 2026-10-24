@@ -3,7 +3,7 @@
 //
 //   teacher-logits METALLIB MODEL_ROOT TOKENS OUTPUT --window END:ROWS [--window END:ROWS...]
 //                  [--kv-format int8|bf16] [--state-format fp32|bf16]
-//                  [--expert-memory SIZE] [--ple-memory SIZE]
+//                  [--expert-memory SIZE] [--ple-memory SIZE] [--captures yes]
 //
 // TOKENS holds little-endian uint32 token ids, read as they are: no BOS, no
 // chat template. For each window a cold request prefills ids [0, END - ROWS)
@@ -15,11 +15,18 @@
 // OUTPUT-END.f32 receives ROWS + 1 rows of the target's vocabulary of fp32
 // logits for positions END - ROWS - 1 .. END - 1, position p's predicting
 // id p + 1: the row of the prefill's final position, then the verify rows,
-// which RuntimeInstrumentation::lastLogits reads after each command.
+// which RuntimeInstrumentation::lastLogits reads after each command. With
+// --captures yes, OUTPUT-END.captures.f32 receives, of a window whose prefill
+// is one command, the output rows of the target layers the model's draft
+// reads (its target_layer_ids) at positions 0 .. END - ROWS - 1, as the draft
+// captures them (RuntimeInstrumentation::lastCapturedRows), in fp32: a row
+// per position of each layer's hidden values in the draft's layer order,
+// which a reference's residuals after those layers compare with.
 
 #include "engine/MemoryGovernor.hpp"
 #include "engine/Types.hpp"
 #include "metal/MetalBackend.hpp"
+#include "model/Bfloat16.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/QwenState.hpp"
 #include "model/Runtime.hpp"
@@ -133,7 +140,7 @@ void require(bool condition, const std::string &message) {
 
 // One window on state lane 0, which the request leaves free.
 void runWindow(model::Runtime &executor, std::span<const uint32_t> tokens, Window window, uint64_t id,
-               std::span<const uint32_t> pages, uint32_t vocabulary, const std::string &output) {
+               std::span<const uint32_t> pages, uint32_t vocabulary, const std::string &output, uint32_t captureWidth) {
   const uint32_t start = window.end - window.rows;
   const std::span<const uint32_t> prompt = tokens.first(start);
   const std::span<const uint32_t> forced = tokens.subspan(start, window.rows + 1);
@@ -164,6 +171,17 @@ void runWindow(model::Runtime &executor, std::span<const uint32_t> tokens, Windo
     offset += count;
     if (offset == start)
       require(results[0].firstToken == forced[0], "the prefill did not select the first forced id");
+  }
+  if (captureWidth) {
+    require(start <= chunk, "--captures takes a window whose prefill is one command");
+    const std::span<const uint16_t> captured = model::RuntimeInstrumentation::lastCapturedRows(executor, 0);
+    require(captured.size() >= uint64_t{start} * captureWidth, "the prefill captured fewer rows than its prompt");
+    std::vector<float> rows(uint64_t{start} * captureWidth);
+    std::ranges::transform(captured.first(rows.size()), rows.begin(), model::widenBfloat16);
+    const std::string path = output + "-" + std::to_string(window.end) + ".captures.f32";
+    std::ofstream file(path, std::ios::binary);
+    file.write(reinterpret_cast<const char *>(rows.data()), static_cast<std::streamsize>(rows.size() * sizeof(float)));
+    require(static_cast<bool>(file), "cannot write " + path);
   }
   logits.put(0, model::RuntimeInstrumentation::lastLogits(executor, 0).first(vocabulary), forced[0]);
   const double prefillSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
@@ -206,10 +224,11 @@ int main(int argc, char **argv) {
       if (argc < 5) {
         std::cerr << "usage: teacher-logits METALLIB MODEL_ROOT TOKENS OUTPUT --window END:ROWS "
                      "[--window END:ROWS...] [--kv-format int8|bf16] [--state-format fp32|bf16] "
-                     "[--expert-memory SIZE] [--ple-memory SIZE]\n";
+                     "[--expert-memory SIZE] [--ple-memory SIZE] [--captures yes]\n";
         return 2;
       }
       std::vector<Window> windows;
+      bool captures = false;
       kv::Format format = kv::Format::Int8;
       ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
       model::ModelLoadOptions loadOptions;
@@ -220,6 +239,11 @@ int main(int argc, char **argv) {
         const std::string_view value(argv[index + 1]);
         if (option == "--window")
           windows.push_back(parseWindow(value));
+        else if (option == "--captures") {
+          if (value != "yes")
+            throw std::invalid_argument("--captures takes yes");
+          captures = true;
+        }
         else if (option == "--kv-format") {
           if (value != "int8" && value != "bf16")
             throw std::invalid_argument("--kv-format takes int8 or bf16");
@@ -275,7 +299,8 @@ int main(int argc, char **argv) {
                   format == kv::Format::Int8 ? "int8" : "bf16", std::string(ops::formatName(stateFormat)).c_str(),
                   tokens.size());
       for (size_t index = 0; index < windows.size(); ++index)
-        runWindow(executor, tokens, windows[index], index + 1, pageTable, vocabulary, argv[4]);
+        runWindow(executor, tokens, windows[index], index + 1, pageTable, vocabulary, argv[4],
+                  captures ? model.draft.layout.targetHiddenSize() : 0);
       return 0;
     } catch (const std::exception &error) {
       std::cerr << "teacher-logits: " << error.what() << '\n';

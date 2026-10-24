@@ -798,6 +798,140 @@ void checkSplit(const std::filesystem::path &directory) {
 
 } // namespace
 
+// A small flint target, its GGUF as llama.cpp writes Flint's: four layers
+// that attend, 1 and 2 over a sliding window with RoPE and 0 and 3 over every
+// key without, as its two layer patterns state, each with its sinks after its
+// attention and its norm before the FFN named ffn_norm; layers 0 and 1 a
+// dense FFN, 2 and 3 a MoE of four experts, routed by sigmoid, whose shared
+// expert is two routed experts wide and has no gate.
+model::QwenTargetDimensions flintGeometry() {
+  model::QwenTargetDimensions g;
+  g.layers = 4;
+  g.hiddenSize = 256;
+  g.vocabularySize = 256;
+  g.attentionWidth = 512; // four query heads of 128
+  g.attentionQueryHeads = 4;
+  g.attentionKvHeads = 1;
+  g.attentionHeadDimension = 128;
+  g.attentionGate = false;
+  g.rotaryPairs = 64;
+  g.rotaryTheta = 1e4F;
+  g.slidingWindow = 33;
+  g.slidingLayers = 0b0110;
+  g.unrotatedLayers = 0b1001;
+  g.fullAttentionPeriod = 1;
+  g.ffnKind = model::QwenFfnKind::SparseMoe;
+  g.intermediateSize = 256;
+  g.experts = 4;
+  g.expertsPerToken = 2;
+  g.expertIntermediateSize = 256;
+  g.moeRouter = splash::ops::MoeRouter::SigmoidNormalized;
+  g.sharedExpertSlices = 2;
+  g.sharedExpertGate = false;
+  g.leadingDenseLayers = 2;
+  return g;
+}
+
+// Flint's GGUF plans its layers as llama.cpp writes them: every layer's
+// attention (ungated queries) and sinks, the norm before the FFN, the
+// leading layers' dense FFN and the others' MoE, whose shared expert runs as
+// two slices of the routed width and has no gate; its streamed experts are
+// the MoE layers' alone. Its metadata names each mismatch, its layer
+// patterns' among them, scaled routing weights and a RoPE over part of a
+// head, and its tensors a missing sink and a router bias the blocks would
+// not add.
+void checkFlint(const std::filesystem::path &directory) {
+  const model::QwenTargetDimensions g = flintGeometry();
+  std::vector<Tensor> tensors = targetTensors(
+      g, {{"attn_q.weight", kQ8_0},         {"attn_k.weight", kQ8_0},         {"attn_v.weight", kQ8_0},
+          {"attn_output.weight", kQ8_0},    {"ffn_gate.weight", kQ8_0},       {"ffn_up.weight", kQ8_0},
+          {"ffn_down.weight", kQ8_0},       {"ffn_gate_exps.weight", kQ4_K},  {"ffn_up_exps.weight", kQ4_K},
+          {"ffn_down_exps.weight", kQ5_K},  {"ffn_gate_shexp.weight", kQ8_0}, {"ffn_up_shexp.weight", kQ8_0},
+          {"ffn_down_shexp.weight", kQ8_0}, {"output.weight", kQ8_0},         {"token_embd.weight", kQ8_0}});
+  randomize(tensors, 1100);
+  const auto path = directory / "flint.gguf";
+  const auto planned = [&](const std::vector<test_gguf::Key> &keys, const std::vector<Tensor> &written,
+                           model::gguf::PlanOptions options = {}) {
+    splash::test::writeFile(path, test_gguf::file(keys, written));
+    return plan(path, g, options);
+  };
+  const Plan flint = planned(metadata(g), tensors);
+  check(!flint.error && flint.images.size() == g.layers + 2,
+        "planner plans the Flint target" + (flint.error ? ": " + *flint.error : ""));
+  if (flint.error) return;
+  for (uint32_t layer = 0; layer < g.layers; ++layer) {
+    const model::gguf::Image &image = flint.images[layer];
+    const std::string p = "blk." + std::to_string(layer) + ".";
+    const auto *query = repackOf(image, p + "attn_q.weight");
+    check(query && query->rows == g.attentionWidth && image.type == 1,
+          "planner plans layer " + std::to_string(layer) + "'s queries without a gate");
+    for (const std::string name : {"attn_norm.weight", "attn_sinks.weight", "ffn_norm.weight"})
+      check(asStored(copyOf(image, p + name), tensorNamed(tensors, p + name).data),
+            "planner copies the F32 tensor as stored: " + p + name);
+    const bool moe = layer >= g.leadingDenseLayers;
+    check(bool(repackOf(image, p + "ffn_gate.weight")) != moe && bool(copyOf(image, p + "ffn_gate_inp.weight")) == moe,
+          "planner plans layer " + std::to_string(layer) + "'s " + (moe ? "MoE" : "dense FFN"));
+    if (!moe) continue;
+    const auto *gate = repackOf(image, p + "ffn_gate_shexp.weight");
+    const auto *down = repackOf(image, p + "ffn_down_shexp.weight");
+    check(gate && gate->rows == 2 * g.expertIntermediateSize && down && down->rows == 2 * g.hiddenSize &&
+              down->columns == g.expertIntermediateSize && down->sources.size() == 2 &&
+              down->sources[0].windows == 2 && down->sources[0].window == 0 && down->sources[1].window == 1,
+          "planner plans layer " + std::to_string(layer) + "'s shared expert as two slices of the routed width");
+  }
+  const auto expertsOf = [](const Plan &result) {
+    std::vector<bool> streams;
+    for (uint32_t layer = 0; layer < 4; ++layer) streams.push_back(result.images[layer].experts.has_value());
+    return streams;
+  };
+  const Plan streamed = planned(metadata(g), tensors, {.streamExperts = true});
+  check(!streamed.error && streamsExperts(flint, streamed) &&
+            expertsOf(streamed) == std::vector<bool>{false, false, true, true} &&
+            model::gguf::streamedExperts(std::span(streamed.images).subspan(2, 2)).size() == 2,
+        "planner streams the experts of the MoE layers alone");
+
+  const auto withKey = [&](const test_gguf::Key &replacement) {
+    std::vector<test_gguf::Key> keys = metadata(g);
+    for (test_gguf::Key &key : keys)
+      if (key.name == replacement.name) key = replacement;
+    return keys;
+  };
+  check(names(planned(withKey(test_gguf::boolArrayKey("flint.attention.rope_pattern", {true, true, true, false})),
+                      tensors),
+              {"does not match the target: attention.rope_pattern"}),
+        "planner names a RoPE pattern of other layers");
+  std::vector<test_gguf::Key> unpatterned = metadata(g);
+  std::erase_if(unpatterned, [](const test_gguf::Key &key) { return key.name.ends_with("_pattern"); });
+  check(names(planned(unpatterned, tensors),
+              {"attention.sliding_window_pattern, attention.rope_pattern"}),
+        "planner names each missing layer pattern");
+  check(names(planned(withKey(test_gguf::uint32Key("flint.expert_gating_func", 1)), tensors),
+              {"expert_gating_func 1 (expected 2)"}),
+        "planner refuses a softmax router");
+  check(names(planned(withKey(test_gguf::uint32Key("flint.leading_dense_block_count", 1)), tensors),
+              {"leading_dense_block_count 1 (expected 2)"}),
+        "planner names other leading dense layers");
+  check(names(planned(withKey(test_gguf::float32Key("flint.expert_weights_scale", 2.5F)), tensors),
+              {"expert_weights_scale 2.5 (expected 1)"}),
+        "planner refuses scaled routing weights");
+  // Its GGUFs state no rotated dimensions; one that does states the whole
+  // head's.
+  std::vector<test_gguf::Key> rotary = metadata(g);
+  rotary.push_back(test_gguf::uint32Key("flint.rope.dimension_count", 2 * g.rotaryPairs));
+  check(!planned(rotary, tensors).error, "planner plans a Flint GGUF that states its rotated dimensions");
+  rotary.back() = test_gguf::uint32Key("flint.rope.dimension_count", g.rotaryPairs);
+  check(names(planned(rotary, tensors), {"rope.dimension_count 64 (expected 128)"}),
+        "planner names a RoPE over part of the head");
+  std::vector<Tensor> sinkless = tensors;
+  std::erase_if(sinkless, [](const Tensor &tensor) { return tensor.name == "blk.3.attn_sinks.weight"; });
+  check(names(planned(metadata(g), sinkless), {"blk.3.attn_sinks.weight (missing)"}),
+        "planner names a missing sink");
+  std::vector<Tensor> biased = tensors;
+  biased.push_back({"blk.2.ffn_exp_probs_b.bias", {g.experts}, model::ggml::kF32, test_gguf::Bytes(4 * g.experts)});
+  check(names(planned(metadata(g), biased), {"blk.2.ffn_exp_probs_b.bias (a router bias)"}),
+        "planner refuses a router bias");
+}
+
 int main() {
   @autoreleasepool {
     const splash::test::TemporaryDirectory directory("splash-gguf-planner");
@@ -810,6 +944,7 @@ int main() {
     guarded("planner on Flash-Next hyper-connections", [&] { checkHyperConnections(directory.path()); });
     guarded("planner on Flash-Next's PLE table", [&] { checkPleTable(directory.path()); });
     guarded("planner on a split GGUF", [&] { checkSplit(directory.path()); });
+    guarded("planner on Flint", [&] { checkFlint(directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF planner tests FAILED" : "GGUF planner tests passed", failures);
     return failures ? 1 : 0;
   }

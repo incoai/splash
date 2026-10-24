@@ -119,7 +119,7 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend, Qwen4ExpLayout
           layer.mixer = readQwenMixer(file, format, layout, fullAttention);
           if (fullAttention) layer.indexer = readIndexer(file, layout);
           layer.ffnHyper = readHyper(file, layout, true, "ffn-hyper");
-          layer.ffn = readMoeBlock(file, experts, index);
+          layer.ffn = readMoeBlock(file, layout, experts, index);
           if (index == layout.pleLayer) {
             Qwen4PleWeights ple;
             ple.key = format.projection(file, streams, layout.pleWidth(), "ple-key");

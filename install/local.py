@@ -57,8 +57,9 @@ def prepare_local_model(
     `hf download REPO`, last recorded there; `splash serve` downloads by
     commit, which records none.
     mmproj: a GGUF target's vision projector, a GGUF file, with which it
-    serves images; a GGUF target serves text only without one. An MLX
-    target's vision tower is in its checkpoint, and it serves images unless
+    serves images; a GGUF target serves text only without one, as one of a
+    family without a vision tower (Flint) always does. An MLX target's
+    vision tower is in its checkpoint, and it serves images unless
     language_only.
     language_only: serve text only.
     models_dir: where prepared models are kept, Splash's own models
@@ -163,9 +164,15 @@ def _inspect(target, mmproj, language_only, scratch):
         projector = functools.partial(_projector, mmproj)
     repo = hub.Repository.local_files(str(target), files)
     try:
-        return repo, upstream.gguf_target(repo, names, scratch, projector=projector)
+        inspected = upstream.gguf_target(repo, names, scratch, projector=projector)
     except models.VisionError as error:
         raise models.VisionError(f"{error}; omit mmproj to serve text only") from None
+    if mmproj and not inspected.family.vision:
+        raise ModelError(
+            f"{mmproj} is a vision projector, which a {inspected.family.name} "
+            "model, without a vision tower, does not load"
+        )
+    return repo, inspected
 
 
 def _model_of(name):

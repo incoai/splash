@@ -17,6 +17,7 @@ from server import backend as backend_api
 from server import protocol as native_wire
 from server import server as api
 from server import tool_schema
+from server.chat_format import QWEN
 
 
 class StreamKeepaliveTests(HarnessTestCase):
@@ -256,6 +257,7 @@ class StreamKeepaliveTests(HarnessTestCase):
             thinking=False,
             tool_policy=policy,
             may_call_tools=True,
+            chat_format=QWEN,
             response_validator=None,
             deadline=100,
             events=SimpleNamespace(get=next_event),

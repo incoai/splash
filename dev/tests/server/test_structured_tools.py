@@ -1,8 +1,8 @@
 import json
 import unittest
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
-from unittest import mock
 
 from llguidance import LLMatcher
 
@@ -29,6 +29,7 @@ from server import backend as backend_api
 from server import output as model_output
 from server import server as api
 from server import tool_schema
+from server.chat_format import QWEN, QWEN_XML, TOOL_CALL_OPEN
 
 TOOLS = [
     {
@@ -76,10 +77,10 @@ class StructuredToolGrammarTest(unittest.TestCase):
         cls.tokenizer, cls.guidance = grammar_tokenizers()
 
     def matcher(self, thinking=False, schema=SCHEMA, **settings):
-        with mock.patch.object(
-            tool_schema, "THINK_END_TOKEN_ID", self.tokenizer.token_to_id("</think>")
-        ):
-            grammar = tool_schema.tool_grammar(policy(**settings), thinking, schema)
+        chat_format = replace(QWEN, think_end_id=self.tokenizer.token_to_id("</think>"))
+        grammar = tool_schema.tool_grammar(
+            policy(**settings), thinking, schema, chat_format=chat_format
+        )
         self.assertFalse(LLMatcher.validate_grammar(grammar, self.guidance))
         return LLMatcher(self.guidance, grammar)
 
@@ -189,10 +190,10 @@ class StructuredToolGrammarTest(unittest.TestCase):
         tools = strict_tools(
             {"function": {"name": "wide", "parameters": {"properties": properties}}}
         )
-        grammar = tool_schema.tool_grammar(policy(tools=tools), False)
+        grammar = tool_schema.tool_grammar(policy(tools=tools), False, chat_format=QWEN)
         self.assertFalse(LLMatcher.validate_grammar(grammar, self.guidance))
         opening = self.tokenizer.encode(
-            tool_schema.TOOL_CALL_OPEN + tool_schema.function_opening("wide")
+            TOOL_CALL_OPEN + QWEN_XML.function_opening("wide")
         ).ids
         matcher = LLMatcher(self.guidance, grammar, log_level=0)
         self.assertFalse(matcher.consume_tokens(opening))
@@ -234,7 +235,9 @@ class StructuredToolGrammarTest(unittest.TestCase):
         for strict in (False, True):
             tool = {"name": "search", "parameters": parameters, "strict": strict}
             tools = [{"type": "function", "function": tool}]
-            grammar = tool_schema.tool_grammar(policy("required", tools=tools), False)
+            grammar = tool_schema.tool_grammar(
+                policy("required", tools=tools), False, chat_format=QWEN
+            )
             for text in (declared, *undeclared):
                 with self.subTest(strict=strict, text=text):
                     matcher = LLMatcher(self.guidance, grammar)
@@ -363,7 +366,7 @@ class StructuredToolGrammarTest(unittest.TestCase):
                 pad = " " * spaces
                 for text in ("{" + pad + '"answer":42}', pad + ANSWER):
                     self.assertEqual(self.accepts(text), complete, text)
-                grammar = tool_schema.json_grammar(SCHEMA, False)
+                grammar = tool_schema.json_grammar(SCHEMA, False, chat_format=QWEN)
                 matcher = LLMatcher(self.guidance, grammar)
                 tokens = self.tokenizer.encode("{" + pad + '"answer":42}').ids
                 self.assertEqual(
@@ -378,7 +381,7 @@ class StructuredToolGrammarTest(unittest.TestCase):
         tools = strict_tools(
             {"function": {"name": "note", "parameters": {"properties": {"body": body}}}}
         )
-        grammar = tool_schema.tool_grammar(policy(tools=tools), False)
+        grammar = tool_schema.tool_grammar(policy(tools=tools), False, chat_format=QWEN)
         for spaces, complete in ((bound, True), (bound + 1, False)):
             text = (
                 "<tool_call>\n<function=note>\n<parameter=body>\n{"
@@ -629,11 +632,13 @@ class StructuredToolGrammarTest(unittest.TestCase):
         # The reasoning splitter ends thinking at the first decoded
         # "</think>", so an ordinary-token spelling must not stay in thinking.
         close = self.tokenizer.token_to_id("</think>")
-        with mock.patch.object(tool_schema, "THINK_END_TOKEN_ID", close):
-            grammars = {
-                "json": tool_schema.json_grammar(SCHEMA, True),
-                "tools": tool_schema.tool_grammar(policy(), True, SCHEMA),
-            }
+        chat_format = replace(QWEN, think_end_id=close)
+        grammars = {
+            "json": tool_schema.json_grammar(SCHEMA, True, chat_format=chat_format),
+            "tools": tool_schema.tool_grammar(
+                policy(), True, SCHEMA, chat_format=chat_format
+            ),
+        }
         tokens = [*b"Reason. </think> More.", close, *ANSWER.encode()]
         for name, grammar in grammars.items():
             with self.subTest(grammar=name):
@@ -695,7 +700,7 @@ class StructuredToolGrammarTest(unittest.TestCase):
             strict=frozenset(),
             constrained=True,
         )
-        grammar = json.loads(tool_schema.tool_grammar(policy, True))
+        grammar = json.loads(tool_schema.tool_grammar(policy, True, chat_format=QWEN))
         main = grammar["grammars"][0]["lark_grammar"]
         self.assertIn(
             r"TEXT: /(?s:.*)/ & ~/(?s:.*)(<tool_call>|<\/think>)(?s:.*)/",
@@ -737,7 +742,9 @@ class StructuredToolGrammarTest(unittest.TestCase):
                     # the output free.
                     self.assertFalse(policy.constrained)
                     continue
-                main = json.loads(tool_schema.tool_grammar(policy, True))["grammars"][0]
+                main = json.loads(
+                    tool_schema.tool_grammar(policy, True, chat_format=QWEN)
+                )["grammars"][0]
                 self.assertIn(f"start: think {start}\n", main["lark_grammar"])
                 self.assertEqual(
                     [
@@ -764,7 +771,7 @@ class StructuredToolProjectionTest(unittest.TestCase):
         ended it. Returns the content, the calls and the text the stream
         sends, the finish's owed text included."""
         projector = model_output.StreamingToolCallProjector(
-            job.tool_policy, job.public_id, True
+            job.tool_policy, job.public_id, True, syntax=QWEN_XML
         )
         events = put(projector, text, size)
         result = SimpleNamespace(
@@ -783,7 +790,7 @@ class StructuredToolProjectionTest(unittest.TestCase):
         for split in range(len(text) + 1):
             with self.subTest(split=split):
                 projector = model_output.StreamingToolCallProjector(
-                    job.tool_policy, job.public_id, True
+                    job.tool_policy, job.public_id, True, syntax=QWEN_XML
                 )
                 events = projector.put(text[:split]) + projector.put(text[split:])
                 content, calls, owed = projector.finish(False)
@@ -840,7 +847,7 @@ class StructuredToolProjectionTest(unittest.TestCase):
         for width in (1, 2, 7, len(payload)):
             with self.subTest(width=width):
                 projector = model_output.StreamingToolCallProjector(
-                    policy, "test", structured=True
+                    policy, "test", structured=True, syntax=QWEN_XML
                 )
                 events = []
                 for start in range(0, len(payload), width):

@@ -228,9 +228,10 @@ inline uint32_t typeOf(const TensorTypes &types, const std::string &name) {
 }
 
 // The architecture of a GGUF of a fixture geometry, each layout's
-// ggufArchitecture: qwen4exp for hyper-connected streams, else qwen35moe or
-// qwen35 by its FFN.
+// ggufArchitecture: flint for one without GDN layers, qwen4exp for
+// hyper-connected streams, else qwen35moe or qwen35 by its FFN.
 inline std::string architecture(const model::QwenTargetDimensions &g) {
+  if (g.layers && !g.gdnLayerCount()) return "flint";
   return g.hyperConnected() ? "qwen4exp" : g.ffnKind == model::QwenFfnKind::SparseMoe ? "qwen35moe" : "qwen35";
 }
 
@@ -240,8 +241,13 @@ inline constexpr uint64_t kPleTableRows = 96;
 // Every tensor of the geometry, zero, in the order GGUF converters write them:
 // with hyper-connected streams, mixes in place of the norms around each mixer
 // and the output norm; with a QSA indexer, its tensors in each
-// full-attention layer; and with a PLE embedding, its tensors in the layer it
-// feeds and its table of kPleTableRows rows.
+// full-attention layer; with a PLE embedding, its tensors in the layer it
+// feeds and its table of kPleTableRows rows; and in a flint GGUF, each
+// layer's sinks after its attention and its norm before the FFN named
+// ffn_norm. The queries hold their gate where the attention has one
+// (attentionGate), a MoE geometry's leading layers are dense (isMoeLayer),
+// and its shared expert is sharedExpertSlices routed experts wide, with a
+// scalar gate where its blocks have one (sharedExpertGate).
 inline std::vector<Tensor> targetTensors(const model::QwenTargetDimensions &g, const TensorTypes &types) {
   std::vector<Tensor> tensors;
   const auto add = [&](std::string name, std::vector<uint64_t> dims) {
@@ -255,6 +261,7 @@ inline std::vector<Tensor> targetTensors(const model::QwenTargetDimensions &g, c
   const uint64_t hidden = g.hiddenSize, valueRows = uint64_t{g.gdnValueHeads} * g.gdnHeadDimension;
   const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
   const uint64_t streams = g.streamWidth();
+  const bool flint = architecture(g) == "flint";
   // A hyper-connection mix in place of the norm `norm`.
   const auto mix = [&](const std::string &stem, bool inject, const std::string &norm) {
     if (!g.hyperConnected()) {
@@ -270,12 +277,14 @@ inline std::vector<Tensor> targetTensors(const model::QwenTargetDimensions &g, c
     const std::string p = "blk." + std::to_string(layer) + ".";
     mix(p + "hc_attn", true, p + "attn_norm.weight");
     if (g.isFullAttentionLayer(layer)) {
-      add(p + "attn_q.weight", {hidden, 2ull * g.attentionWidth}); // queries and their gate
+      // The queries and, with attentionGate, their gate.
+      add(p + "attn_q.weight", {hidden, (g.attentionGate ? 2ull : 1ull) * g.attentionWidth});
       add(p + "attn_k.weight", {hidden, kvRows});
       add(p + "attn_v.weight", {hidden, kvRows});
       add(p + "attn_q_norm.weight", {g.attentionHeadDimension});
       add(p + "attn_k_norm.weight", {g.attentionHeadDimension});
       add(p + "attn_output.weight", {g.attentionWidth, hidden});
+      if (flint) add(p + "attn_sinks.weight", {g.attentionQueryHeads});
       if (g.hasIndexer()) {
         add(p + "indexer.q_proj.weight", {hidden, uint64_t{g.indexerHeads} * g.indexerHeadDimension});
         add(p + "indexer.k_proj.weight", {hidden, g.indexerHeadDimension});
@@ -293,17 +302,18 @@ inline std::vector<Tensor> targetTensors(const model::QwenTargetDimensions &g, c
       add(p + "ssm_norm.weight", {g.gdnHeadDimension});
       add(p + "ssm_out.weight", {valueRows, hidden});
     }
-    mix(p + "hc_ffn", true, p + "post_attention_norm.weight");
-    if (g.ffnKind == model::QwenFfnKind::SparseMoe) {
+    mix(p + "hc_ffn", true, p + (flint ? "ffn_norm.weight" : "post_attention_norm.weight"));
+    if (g.isMoeLayer(layer)) {
       const uint64_t experts = g.experts, width = g.expertIntermediateSize;
+      const uint64_t shared = uint64_t{g.sharedExpertSlices} * width;
       add(p + "ffn_gate_inp.weight", {hidden, experts});
       add(p + "ffn_gate_exps.weight", {hidden, width, experts});
       add(p + "ffn_up_exps.weight", {hidden, width, experts});
       add(p + "ffn_down_exps.weight", {width, hidden, experts});
-      add(p + "ffn_gate_shexp.weight", {hidden, width});
-      add(p + "ffn_up_shexp.weight", {hidden, width});
-      add(p + "ffn_down_shexp.weight", {width, hidden});
-      add(p + "ffn_gate_inp_shexp.weight", {hidden});
+      add(p + "ffn_gate_shexp.weight", {hidden, shared});
+      add(p + "ffn_up_shexp.weight", {hidden, shared});
+      add(p + "ffn_down_shexp.weight", {shared, hidden});
+      if (g.sharedExpertGate) add(p + "ffn_gate_inp_shexp.weight", {hidden});
     } else {
       add(p + "ffn_gate.weight", {hidden, g.intermediateSize});
       add(p + "ffn_up.weight", {hidden, g.intermediateSize});
@@ -489,9 +499,13 @@ inline std::vector<Tensor> withFusedGateUp(std::vector<Tensor> tensors, uint32_t
 
 // The architecture metadata a GGUF of the geometry declares: with
 // hyper-connected streams their keys, with a QSA indexer its keys and each
-// layer's compress ratio, and with a PLE embedding its keys and layer.
+// layer's compress ratio, with a PLE embedding its keys and layer, with GDN
+// layers their keys and the rotated dimensions, and in a flint GGUF its
+// window, dense layers, shared slices and routing and its two layer
+// patterns.
 inline std::vector<test_gguf::Key> metadata(const model::QwenTargetDimensions &g) {
   const std::string arch = architecture(g);
+  const bool hybrid = g.gdnLayerCount() != 0;
   std::vector<test_gguf::Key> keys{test_gguf::stringKey("general.architecture", arch)};
   const auto key = [&](const char *name, uint32_t value) {
     keys.push_back(test_gguf::uint32Key(arch + "." + name, value));
@@ -522,22 +536,40 @@ inline std::vector<test_gguf::Key> metadata(const model::QwenTargetDimensions &g
   key("attention.head_count_kv", g.attentionKvHeads);
   key("attention.key_length", g.attentionHeadDimension);
   key("attention.value_length", g.attentionHeadDimension);
-  key("rope.dimension_count", 2 * g.rotaryPairs);
+  if (hybrid) key("rope.dimension_count", 2 * g.rotaryPairs);
   keys.push_back(test_gguf::float32Key(arch + ".rope.freq_base", g.rotaryTheta));
   keys.push_back(test_gguf::float32Key(arch + ".attention.layer_norm_rms_epsilon", 1e-6F));
-  key("full_attention_interval", g.fullAttentionPeriod);
-  key("ssm.conv_kernel", model::kGdnConvolutionTaps);
-  key("ssm.group_count", g.gdnKeyHeads);
-  key("ssm.time_step_rank", g.gdnValueHeads);
-  key("ssm.state_size", g.gdnHeadDimension);
-  key("ssm.inner_size", g.gdnValueHeads * g.gdnHeadDimension);
+  if (hybrid) {
+    key("full_attention_interval", g.fullAttentionPeriod);
+    key("ssm.conv_kernel", model::kGdnConvolutionTaps);
+    key("ssm.group_count", g.gdnKeyHeads);
+    key("ssm.time_step_rank", g.gdnValueHeads);
+    key("ssm.state_size", g.gdnHeadDimension);
+    key("ssm.inner_size", g.gdnValueHeads * g.gdnHeadDimension);
+  }
   if (g.ffnKind == model::QwenFfnKind::SparseMoe) {
     key("expert_count", g.experts);
     key("expert_used_count", g.expertsPerToken);
     key("expert_feed_forward_length", g.expertIntermediateSize);
-    key("expert_shared_feed_forward_length", g.expertIntermediateSize);
+    key("expert_shared_feed_forward_length", g.sharedExpertSlices * g.expertIntermediateSize);
   } else {
     key("feed_forward_length", g.intermediateSize);
+  }
+  if (arch == "flint") {
+    key("attention.sliding_window", g.slidingWindow);
+    key("leading_dense_block_count", g.leadingDenseLayers);
+    key("feed_forward_length", g.intermediateSize);
+    key("expert_shared_count", g.sharedExpertSlices);
+    key("expert_gating_func", 2); // sigmoid
+    keys.push_back(test_gguf::boolKey(arch + ".expert_weights_norm", true));
+    keys.push_back(test_gguf::float32Key(arch + ".expert_weights_scale", 1.0F));
+    std::vector<bool> sliding, rotated;
+    for (uint32_t layer = 0; layer < g.layers; ++layer) {
+      sliding.push_back(g.slidingLayers >> layer & 1);
+      rotated.push_back(!(g.unrotatedLayers >> layer & 1));
+    }
+    keys.push_back(test_gguf::boolArrayKey(arch + ".attention.sliding_window_pattern", sliding));
+    keys.push_back(test_gguf::boolArrayKey(arch + ".attention.rope_pattern", rotated));
   }
   return keys;
 }

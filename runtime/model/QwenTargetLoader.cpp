@@ -18,18 +18,20 @@ ops::Projection BlockTargetFormat::fused(WeightFile &file, uint32_t outputSize, 
   return {outputSize, inputSize, std::move(weights)};
 }
 
+QwenAttentionWeights readQwenAttention(WeightFile &file, const BlockTargetFormat &format,
+                                       const QwenTargetDimensions &target) {
+  QwenAttentionWeights attention;
+  attention.inputProjection =
+      format.fused(file, target.packedFullWidth, target.hiddenSize, {"attn-q", "attn-k", "attn-v"});
+  attention.queryNorm = format.norm(file, target.attentionHeadDimension, "query-norm");
+  attention.keyNorm = format.norm(file, target.attentionHeadDimension, "key-norm");
+  attention.outputProjection = format.projection(file, target.hiddenSize, target.attentionWidth, "attention-output");
+  return attention;
+}
+
 QwenMixerWeights readQwenMixer(WeightFile &file, const BlockTargetFormat &format,
                                const QwenTargetDimensions &target, bool fullAttention) {
-  if (fullAttention) {
-    QwenAttentionWeights attention;
-    attention.inputProjection =
-        format.fused(file, target.packedFullWidth, target.hiddenSize, {"attn-q", "attn-k", "attn-v"});
-    attention.queryNorm = format.norm(file, target.attentionHeadDimension, "query-norm");
-    attention.keyNorm = format.norm(file, target.attentionHeadDimension, "key-norm");
-    attention.outputProjection =
-        format.projection(file, target.hiddenSize, target.attentionWidth, "attention-output");
-    return attention;
-  }
+  if (fullAttention) return readQwenAttention(file, format, target);
   QwenGdnWeights gdn;
   gdn.inputProjection = format.fused(file, target.packedGdnWidth, target.hiddenSize, {"gdn-qkv", "gdn-z", "gdn-ab"});
   gdn.convolutionWeights = file.section(
@@ -64,16 +66,15 @@ MoeExperts openMoeExperts(metal::MetalBackend &backend, const QwenTargetFiles &f
           result.resident = residentExpertSlots(backend, target.experts);
           return result;
         }
-        result.store = std::make_shared<ExpertStore>(
-            backend, loader.streamedExperts(),
-            ops::MoeShape{target.hiddenSize, target.experts, target.expertsPerToken, target.expertIntermediateSize},
-            loader.expertStoreOptions());
+        result.store = std::make_shared<ExpertStore>(backend, loader.streamedExperts(), target.moeBlockShape(),
+                                                     loader.expertStoreOptions());
         return result;
       },
       files);
 }
 
-ops::BlockMoeWeights readMoeBlock(WeightFile &file, const MoeExperts &experts, uint32_t block) {
+ops::BlockMoeWeights readMoeBlock(WeightFile &file, const QwenTargetDimensions &target, const MoeExperts &experts,
+                                  uint32_t block) {
   ops::BlockMoeWeights ffn;
   ffn.router = readQuantizedSegment(file, "router");
   if (!experts.store) {
@@ -86,7 +87,7 @@ ops::BlockMoeWeights readMoeBlock(WeightFile &file, const MoeExperts &experts, u
   ffn.gate.shared = readQuantizedSegment(file, "shared-expert-gate");
   ffn.up.shared = readQuantizedSegment(file, "shared-expert-up");
   ffn.down.shared = readQuantizedSegment(file, "shared-expert-down");
-  ffn.sharedScalarGate = readQuantizedSegment(file, "shared-expert-scalar-gate");
+  if (target.sharedExpertGate) ffn.sharedScalarGate = readQuantizedSegment(file, "shared-expert-scalar-gate");
   // The store keeps the block's router and scalar gate, which predict its
   // routes.
   if (experts.store) experts.store->bind(block, ffn);

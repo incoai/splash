@@ -46,12 +46,13 @@ struct KvPoolSnapshot {
   // Extents emptied by moving their pages, and the pages moved.
   uint64_t extentCompactions = 0;
   uint64_t pagesMoved = 0;
-  // The same pages and bytes of the extents of Index pages alone, which the
-  // counts above include.
+  // The same pages and bytes of the extents of Index pages alone and of Slim
+  // pages alone, which the counts above include.
   KvPoolFormSnapshot index{};
+  KvPoolFormSnapshot slim{};
 };
 
-// Where moved pages went: an emptied extent's, or pages moved to the other
+// Where moved pages went: an emptied extent's, or pages moved to another
 // form. Whoever names one of them follows it.
 struct KvPageMoves final {
   // Each moved page and the page that took its content, by moved page.
@@ -75,7 +76,7 @@ struct KvPageAcquisition {
   }
 };
 
-// Pages moved to the other form (KvPool::movePages): where each went, or,
+// Pages moved to another form (KvPool::movePages): where each went, or,
 // with nothing moved, why the pool could not grow by an extent of the form.
 struct KvPageMoveResult final {
   KvPageMoves moves;
@@ -93,8 +94,9 @@ struct KvPageMoveResult final {
 // Resource policy may ask for pages or release references, but cannot
 // directly allocate or release Metal memory. Every extent holds pages of one
 // form (kv::PageForm) from its allocation to its release, and the forms
-// share one id space: a page's content goes to a page of the other form when
-// its K/V leaves memory or comes back (movePages). Free pages of a form are
+// share one id space: a page's content goes to a page of another form when
+// its K/V leaves memory or comes back, or when it gives up a window's layers
+// (movePages). Free pages of a form are
 // handed out from the allocated extent of the form with the most live pages
 // first, so partially used extents fill up, empty extents are touched last,
 // and cold extents drain to empty, the only state in which an extent can be
@@ -130,8 +132,8 @@ public:
   // A request holds the page, as one of its own or as a page of a cached
   // chain it uses.
   [[nodiscard]] bool pageActive(uint32_t page) const;
-  // Between commands: gives each page, of the other form, a page of form
-  // `to` that takes its index (ExtentStorage::copyPages) and its references,
+  // Between commands: gives each page, of another form, a page of form `to`
+  // that takes what both hold (ExtentStorage::copyPages) and its references,
   // as compactExtent() moves them, and frees it; all of them or none. The
   // pages of form `to` come as acquirePages() hands them out, from the free
   // pages (the form's runway among them) and then from extents it allocates;
@@ -147,28 +149,29 @@ public:
     return record.allocatedExtents * extentPages_ - record.activePages;
   }
 
-  // Releases completely unreferenced extents, of the form or of either, at
+  // Releases completely unreferenced extents, of the form or of any, at
   // most `limit` of them, and returns the bytes released. keepRunway keeps
-  // one empty extent of each form warm, so the next request, or the next
-  // spill, does not wait for an allocation; unlike the runway the
-  // constructor allocates, it is always a single extent.
+  // one empty extent of each form warm, so the next request, spill or trim
+  // does not wait for an allocation; unlike the runway the constructor
+  // allocates, it is always a single extent.
   [[nodiscard]] uint64_t reclaimEmptyExtents(bool keepRunway, uint32_t limit,
                                              std::optional<kv::PageForm> form = std::nullopt);
   // Allocates an empty extent of the form unless one is allocated already:
   // the runway the next pages of the form come from without an allocation,
   // as a spill at the memory wall needs its Index pages to free its Full
-  // ones. Granted, or the budget's refusal with nothing allocated.
+  // ones, and a trim its Slim pages. Granted, or the budget's refusal with
+  // nothing allocated.
   [[nodiscard]] metal::AllocationResult fillRunway(kv::PageForm form);
-  // Empties the allocated extent, of the form or of either, that holds the
+  // Empties the allocated extent, of the form or of any, that holds the
   // fewest pages, by moving each of them to a free page of the other extents
   // of its form that hold pages, fullest first: free pages scattered over the
-  // pool become an empty extent, which a reclaim releases. Of either form, a
-  // Full extent goes before an Index one, as reclaimEmptyExtents() releases
-  // them; a caller that needs the memory of one form names it. References
-  // move with their pages, and the result says where each went, for the
-  // caller to re-point whoever names them. Nothing moves, and the result is
-  // empty, unless those free pages cover the extent. An extent that holds a
-  // page of `fixed` is not emptied.
+  // pool become an empty extent, which a reclaim releases. Of any form, a
+  // Full extent goes before a Slim one and a Slim one before an Index one, as
+  // reclaimEmptyExtents() releases them; a caller that needs the memory of
+  // one form names it. References move with their pages, and the result
+  // says where each went, for the caller to re-point whoever names them.
+  // Nothing moves, and the result is empty, unless those free pages cover
+  // the extent. An extent that holds a page of `fixed` is not emptied.
   [[nodiscard]] KvPageMoves compactExtent(std::span<const uint32_t> fixed,
                                           std::optional<kv::PageForm> form = std::nullopt);
   [[nodiscard]] KvPoolSnapshot snapshot() const;
@@ -269,7 +272,7 @@ private:
   std::vector<PageRecord> pages_;
   std::vector<ExtentRecord> extents_;
   // By kv::PageForm.
-  std::array<FormRecord, 2> forms_;
+  std::array<FormRecord, 3> forms_;
 };
 
 } // namespace splash::engine

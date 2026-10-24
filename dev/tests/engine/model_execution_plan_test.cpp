@@ -266,6 +266,51 @@ void checkSpilledKvGeometry() {
     }, "invalid model runtime geometry", "the K/V of a target without a block index was let spill");
 }
 
+// A target without GDN layers (model::GdnStateLayout without layers) has no
+// GDN scratch: its arenas leave out exactly the GDN layers' tensors, the
+// decode tape among them, and a prefill group's scratch cell, whose cell
+// holds nothing, and size every other tensor as a hybrid target's.
+void checkArenasWithoutGdnLayers() {
+  const auto sparse = loadedModel<model::Qwen3_6MoeWeights>();
+  // Streamed experts make a prefill command a group, which a hybrid target's
+  // scratch cell serves.
+  model::StreamedParts parts = model::StreamedParts::loaded(sparse);
+  parts.experts = true;
+  const auto hybrid = model::RuntimeGeometry::from(sparse, kv::Format::Int8, ops::GdnStateFormat::Float32, parts);
+  auto attentionOnly = hybrid;
+  attentionOnly.target.stateLayout = {};
+  require(hybrid.prefillChunks > 1 && attentionOnly.target.stateLayout.valid() &&
+              !attentionOnly.target.stateLayout.cellBytes(),
+          "the arenas' geometries are not a prefill group's with and without GDN layers");
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  const ops::ExecutionPlans plans(device);
+  // Whether `bytes` are the hybrid's but for the GDN tensors, which only the
+  // hybrid's arena holds.
+  const auto withoutGdn = [](const auto &hybridBytes, const auto &bytes, const auto &gdnTensors) {
+    using Tensor = typename std::decay_t<decltype(gdnTensors)>::value_type;
+    for (uint32_t index = 0; index < hybridBytes.size(); ++index) {
+      const bool gdn = std::ranges::find(gdnTensors, static_cast<Tensor>(index)) != gdnTensors.end();
+      if (gdn ? !hybridBytes[index] || bytes[index] : bytes[index] != hybridBytes[index]) return false;
+    }
+    return true;
+  };
+  using model::DecodeTensor;
+  using model::PrefillTensor;
+  constexpr std::array gdnPrefill{PrefillTensor::GdnPacked, PrefillTensor::GdnQueries, PrefillTensor::GdnKeys,
+                                  PrefillTensor::GdnValues, PrefillTensor::GdnDecay, PrefillTensor::GdnBeta,
+                                  PrefillTensor::Recurrent, PrefillTensor::GdnHidden, PrefillTensor::GdnOutput,
+                                  PrefillTensor::GroupCell};
+  constexpr std::array gdnDecode{DecodeTensor::GdnHidden, DecodeTensor::GdnOutput, DecodeTensor::GdnTape};
+  require(withoutGdn(model::prefillTensorBytes(hybrid, plans), model::prefillTensorBytes(attentionOnly, plans),
+                     gdnPrefill),
+          "the prefill arena without GDN layers is not a hybrid's without its GDN scratch");
+  require(withoutGdn(model::decodeTensorBytes(hybrid, plans), model::decodeTensorBytes(attentionOnly, plans),
+                     gdnDecode),
+          "the decode arena without GDN layers is not a hybrid's without its GDN scratch");
+}
+
 // Arenas are sized from the projections the weights hold, so each must have
 // sizes; an empty one would drop its workspace from the bound silently.
 void checkUnsizedProjection() {
@@ -337,6 +382,7 @@ int main() {
     checkYarnGeometry();
     checkIndexTables();
     checkSpilledKvGeometry();
+    checkArenasWithoutGdnLayers();
     checkLaneScratch(loadedModel<model::Qwen3_8Weights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));

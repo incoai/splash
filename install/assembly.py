@@ -44,7 +44,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from . import gguf, hub, models
+from . import families, gguf, hub, models
 
 GGUF_VISION = "vision/mmproj.gguf"
 TARGET_FORMATS = ("mlx-affine", "gguf")
@@ -245,6 +245,14 @@ def recorded(link: Path):
     except models.ModelError:
         return None
     return record if _well_formed(record) else None
+
+
+def family(path: Path):
+    """The family the assembly path names was installed as, its record's
+    (families.FAMILIES); None without a record of the shape build writes, or
+    for a family this release does not serve."""
+    record = recorded(path)
+    return record and families.named(record["family"])
 
 
 def _metadata_inputs(files):

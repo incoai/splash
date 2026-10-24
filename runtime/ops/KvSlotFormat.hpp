@@ -24,7 +24,9 @@ struct SlotRange final {
 // How a page sits in its tier slot, and the only definition of it.
 //
 // Version 0, for a layout that cannot spill (Layout::spillable): the page's
-// spans in PageStorage::spans order, one segment.
+// spans in PageStorage::spans order, one segment. A Slim page's are the
+// spans of the regions it holds and its index: without an index, the
+// first bytes of a Full page's payload.
 //
 // Version 1, for a spillable layout: the page's index, layer by layer
 // (indexBytesPerLayerPage each), then, from base = the index rounded up to
@@ -58,8 +60,12 @@ public:
 
   [[nodiscard]] uint32_t version() const noexcept { return recordBytes_ ? 1 : 0; }
   [[nodiscard]] const Layout &layout() const noexcept { return layout_; }
-  // The bytes a slot stores (model::SlotFile::slotBytesFor rounds them up).
-  [[nodiscard]] uint64_t payloadBytes() const noexcept;
+  // The bytes a slot stores of a page of the form, a Full one's by default
+  // (model::SlotFile::slotBytesFor rounds them up), which every slot has
+  // room for. std::logic_error for a form version 1 does not store whole: a
+  // spillable layout's slots hold Full pages, and an Index page's restore
+  // reads indexRange().
+  [[nodiscard]] uint64_t payloadBytes(PageForm form = PageForm::Full) const;
   // The byte lengths of the payload's consecutive segments from its start
   // (model::SlotFile::Options::segments): one for version 0.
   [[nodiscard]] std::vector<uint64_t> segments() const;
@@ -78,8 +84,9 @@ public:
   // record pieces for version 1.
   template <class Pages>
   [[nodiscard]] std::vector<std::span<const std::byte>> transferSpans(const Pages &pages, uint32_t page) const;
-  // What a read of the whole payload holds, into the page: a whole restore.
-  // std::invalid_argument for another payload size.
+  // What a read of the whole payload holds, into the page: a whole restore,
+  // of what the page's form holds. std::invalid_argument for another
+  // payload size.
   template <class Pages>
   void scatterPage(std::span<const std::byte> payload, const Pages &pages, uint32_t page) const;
   // Version 1 only, and std::invalid_argument for bytes or spans of other
@@ -125,7 +132,8 @@ std::vector<std::span<const std::byte>> SlotFormat::transferSpans(const Pages &p
 
 template <class Pages>
 void SlotFormat::scatterPage(std::span<const std::byte> payload, const Pages &pages, uint32_t page) const {
-  if (payload.size() != payloadBytes()) throw std::invalid_argument("a KV slot's payload has another size");
+  if (payload.size() != payloadBytes(pages.form(page)))
+    throw std::invalid_argument("a KV slot's payload has another size");
   if (!version()) {
     scatterInOrder(payload, pages.spans(page));
     return;

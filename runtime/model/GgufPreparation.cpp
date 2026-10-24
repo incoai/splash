@@ -38,6 +38,12 @@ uint64_t sourceRow(const gguf::TensorRows &rows, uint64_t row) {
   return rows.first + source;
 }
 
+// Whether a source row of `rows` splits into its `windows` equal windows and
+// it names one of them (gguf::TensorRows::windows), as imageRowBytes() needs.
+bool validWindow(const gguf::TensorRows &rows) {
+  return rows.windows && rows.window < rows.windows && rows.rowBytes % rows.windows == 0;
+}
+
 void requireRange(uint64_t offset, uint64_t bytes, uint64_t available) {
   if (offset > available || bytes > available - offset)
     throw GgufError("prepared weight section is out of bounds");
@@ -308,11 +314,14 @@ void readGgufNvfp4Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t co
 }
 
 // Image rows [first, first + count) of `rows`, bytes [column, column + span)
-// of each, back to back. Consecutive source rows are read together.
+// of each, back to back, from their column window on. Consecutive whole
+// source rows are read together.
 void readRows(const gguf::TensorRows &rows, uint64_t first, uint64_t count, uint64_t column, uint64_t span,
               uint8_t *to) {
-  if (first > rows.rows || count > rows.rows - first || column > rows.rowBytes || span > rows.rowBytes - column)
+  if (!validWindow(rows) || first > rows.rows || count > rows.rows - first || column > rows.imageRowBytes() ||
+      span > rows.imageRowBytes() - column)
     throw GgufError("prepared weight rows are out of bounds");
+  column += rows.window * rows.imageRowBytes();
   for (uint64_t row = 0; row < count;) {
     const uint64_t start = sourceRow(rows, first + row);
     uint64_t run = 1;
@@ -457,7 +466,8 @@ void requireRepack(const gguf::Repack &repack, uint64_t imageBytes) {
   const uint64_t rowBytes = ggufRowBytes(format, repack.columns);
   uint64_t sourceRows = 0;
   for (const gguf::TensorRows &rows : repack.sources) {
-    if (rows.rowBytes != rowBytes) throw GgufError("invalid prepared weight source size");
+    if (!validWindow(rows) || rows.imageRowBytes() != rowBytes)
+      throw GgufError("invalid prepared weight source size");
     sourceRows += rows.rows;
   }
   if (sourceRows > repack.rows) throw GgufError("invalid prepared weight source size");
@@ -612,7 +622,7 @@ void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &imag
   uint64_t staging = 0, ids = 0;
   for (const gguf::Copy &copy : plan.copies) {
     const bool decodes = copy.conversion == gguf::Conversion::DequantizeToFloat32;
-    if (!copy.source.rows || !copy.source.rowBytes ||
+    if (!copy.source.rows || !copy.source.rowBytes || copy.source.windows != 1 ||
         (copy.conversion != gguf::Conversion::None && !decodes && copy.source.rowBytes % 4))
       throw GgufError("invalid prepared weight copy");
     extents.emplace_back(copy.destination, copyBytes(copy));

@@ -1,0 +1,29 @@
+{
+  "float": {
+    "flint.attention.layer_norm_rms_epsilon": 9.999999974752427e-07,
+    "flint.expert_weights_scale": 1.0,
+    "flint.rope.freq_base": 10000.0
+  },
+  "string": {
+    "general.architecture": "flint"
+  },
+  "unsigned": {
+    "flint.attention.head_count": 32,
+    "flint.attention.head_count_kv": 4,
+    "flint.attention.key_length": 128,
+    "flint.attention.sliding_window": 513,
+    "flint.attention.value_length": 128,
+    "flint.block_count": 49,
+    "flint.context_length": 262144,
+    "flint.embedding_length": 2048,
+    "flint.expert_count": 256,
+    "flint.expert_feed_forward_length": 512,
+    "flint.expert_gating_func": 2,
+    "flint.expert_shared_count": 2,
+    "flint.expert_shared_feed_forward_length": 1024,
+    "flint.expert_used_count": 6,
+    "flint.expert_weights_norm": 1,
+    "flint.feed_forward_length": 6144,
+    "flint.leading_dense_block_count": 2
+  }
+}

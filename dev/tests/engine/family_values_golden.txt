@@ -1,0 +1,80 @@
+# What the engine's memory and caches take from each family Splash serves
+# (model::kFamilies), as dev/tests/engine/family_values_test.cpp writes it,
+# family by family in kFamilies' order, each with the draft
+# dev/tests/fixtures/model-configs describes for it:
+#
+#   kv: the target's KV layout (kv::Layout) and its sliding window, if it
+#     has one;
+#   kv <format>: a page's bytes, Full and Index (kv::PageForm), and Slim for
+#     a layout whose pages can be Slim (kv::Layout::slimmable), the extent
+#     alignment and the smallest and largest extent, in pages;
+#   kv <format> extent-pages: the extent of a pool of so many pages
+#     (kv::Layout::extentPagesFor);
+#   state <format>: a GDN cell's, a lane's and a cached state's bytes
+#     (model::CompositeStateLayout);
+#   namespace <kv format> <state format>: the persistent cache's directory
+#     (engine::persistentCacheNamespace) for manifests of 'a' and 'b' digits.
+#
+# A line that changes for an existing family moves its memory plan, or
+# empties its users' persistent caches: such a change must be one on
+# purpose. A new family adds its lines.
+family Qwen3.8-27B
+kv layers 16 heads 4 dimension 256 index 0
+kv int8 page 1064960 index-page 0 alignment 128 extents 128..128
+kv int8 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:128 129:128 255:128 256:128 257:128 511:128 512:128 1000:128 4095:128 4096:128 10000:128 65535:128 65536:128 100000:128 262144:128 1000000:128
+kv bf16 page 2097152 index-page 0 alignment 1 extents 32..96
+kv bf16 extent-pages 1:0 31:0 32:32 63:63 64:64 127:63 128:64 129:43 255:51 256:64 257:64 511:73 512:64 1000:50 4095:63 4096:64 10000:50 65535:51 65536:64 100000:50 262144:64 1000000:64
+state fp32 cell 154140672 lane 356122624 cached 160038912
+namespace int8 fp32 6365d687c8be103a3bbcc6d2a83b1543
+namespace bf16 fp32 4b73b38234ba34253dc2b6b75dc340a8
+state bf16 cell 78643200 lane 205127680 cached 84541440
+namespace int8 bf16 172879058b5e2bcc713e129a2b62393a
+namespace bf16 bf16 42a4e915c0e06b5a19ac419dbfca5147
+family Qwen3.6-35B-A3B
+kv layers 10 heads 2 dimension 256 index 0
+kv int8 page 332800 index-page 0 alignment 256 extents 256..512
+kv int8 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:0 129:0 255:0 256:256 257:256 511:256 512:512 1000:256 4095:256 4096:512 10000:256 65535:256 65536:512 100000:512 262144:512 1000000:512
+kv bf16 page 655360 index-page 0 alignment 2 extents 104..306
+kv bf16 extent-pages 1:0 31:0 32:0 63:0 64:0 127:126 128:128 129:128 255:254 256:256 257:256 511:170 512:256 1000:200 4095:178 4096:256 10000:200 65535:302 65536:256 100000:200 262144:256 1000000:200
+state fp32 cell 64389120 lane 181469184 cached 66748416
+namespace int8 fp32 b36bf13380eec6ae2e0317015e93004c
+namespace bf16 fp32 b49827616c5256cab339aa7d85dedb54
+state bf16 cell 32931840 lane 118554624 cached 35291136
+namespace int8 bf16 4debebc6a78787f3367f847b6362e45b
+namespace bf16 bf16 f0dcb3f1543f228fb6ad140ffa8d39a9
+family Qwen3.5-122B-A10B
+kv layers 12 heads 2 dimension 256 index 0
+kv int8 page 399360 index-page 0 alignment 256 extents 256..256
+kv int8 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:0 129:0 255:0 256:256 257:256 511:256 512:256 1000:256 4095:256 4096:256 10000:256 65535:256 65536:256 100000:256 262144:256 1000000:256
+kv bf16 page 786432 index-page 0 alignment 2 extents 86..256
+kv bf16 extent-pages 1:0 31:0 32:0 63:0 64:0 127:126 128:128 129:128 255:254 256:128 257:128 511:170 512:128 1000:200 4095:178 4096:128 10000:200 65535:172 65536:128 100000:160 262144:128 1000000:160
+state fp32 cell 153944064 lane 361758720 cached 157483008
+namespace int8 fp32 efde11f16ba1eadd2ce3e4f8300c8df4
+namespace bf16 fp32 7899ddaa4af8523babde297df11906dc
+state bf16 cell 78446592 lane 210763776 cached 81985536
+namespace int8 bf16 734718fde5d9ae8498a8b81e6740167b
+namespace bf16 bf16 4cf67c8254e966ac407c08e9b46eec1b
+family Qwen3.8-Flash-Next
+kv layers 12 heads 2 dimension 256 index 128 values-token-major
+kv int8 page 423936 index-page 24576 alignment 256 extents 256..256
+kv int8 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:0 129:0 255:0 256:256 257:256 511:256 512:256 1000:256 4095:256 4096:256 10000:256 65535:256 65536:256 100000:256 262144:256 1000000:256
+kv bf16 page 811008 index-page 24576 alignment 32 extents 96..224
+kv bf16 extent-pages 1:0 31:0 32:0 63:0 64:0 127:96 128:128 129:128 255:224 256:128 257:128 511:160 512:128 1000:160 4095:192 4096:128 10000:192 65535:192 65536:128 100000:160 262144:128 1000000:160
+state fp32 cell 115802112 lane 259719168 cached 118751232
+namespace int8 fp32 85a41456bb80e9131a06a66d6fb0ed45
+namespace bf16 fp32 2b257d5e7d0245cdb4cdd83d5137ac4e
+state bf16 cell 59179008 lane 146472960 cached 62128128
+namespace int8 bf16 3fcac1d60caabbc9d1133acd36ef3b05
+namespace bf16 bf16 f6e38910bc0e3f19d0341068bb3c6848
+family Flint
+kv layers 49 heads 4 dimension 128 index 0 window 512 layers 0xdddddddddddc
+kv int8 page 1655808 index-page 0 slim-page 473088 alignment 128 extents 128..128
+kv int8 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:128 129:128 255:128 256:128 257:128 511:128 512:128 1000:128 4095:128 4096:128 10000:128 65535:128 65536:128 100000:128 262144:128 1000000:128
+kv bf16 page 3211264 index-page 0 slim-page 917504 alignment 2 extents 22..62
+kv bf16 extent-pages 1:0 31:30 32:32 63:62 64:32 127:42 128:32 129:32 255:42 256:32 257:32 511:34 512:32 1000:40 4095:46 4096:32 10000:40 65535:62 65536:32 100000:40 262144:32 1000000:40
+state fp32 cell 0 lane 10747904 cached 2359296
+namespace int8 fp32 b0dbac8e4f941ecd3e28c87cc3d2c58a
+namespace bf16 fp32 b06e435b51f8c94636cf3a72acdcfc26
+state bf16 cell 0 lane 10747904 cached 2359296
+namespace int8 bf16 b0dbac8e4f941ecd3e28c87cc3d2c58a
+namespace bf16 bf16 b06e435b51f8c94636cf3a72acdcfc26

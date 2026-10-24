@@ -27,14 +27,14 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
     : linear_(device), family_(gpuFamilyClass(device.appleGpuFamily)) {}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
-    uint32_t rows, uint32_t queryHeads, kv::Layout layout) const {
-  return PagedAttention::prefillPlan(rows, queryHeads, layout);
+    uint32_t rows, uint32_t queryHeads, kv::Layout layout, AttentionVariant variant) const {
+  return PagedAttention::prefillPlan(rows, queryHeads, layout, variant);
 }
 
 VerifyAttentionPlan ExecutionPlans::verifyAttention(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-    std::span<const uint32_t> historyTokens) const {
-  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens);
+    std::span<const uint32_t> historyTokens, AttentionVariant variant) const {
+  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, variant);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,

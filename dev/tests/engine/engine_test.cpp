@@ -5385,6 +5385,100 @@ void testCompactionWaitsForTheCommandInFlight() {
           "a request did not complete after the held decode");
 }
 
+// A windowed target's engine gives up the windowed layers' K/V of the pages
+// every window has passed between commands (Cache::trimWindows), and runs
+// as it does with every page Full: no step reads a page of its window that
+// is not Full (Executor::windowPages), the steps read the same marks there,
+// and the requests start and emit alike, a second turn that resumes at the
+// first one's replay point among them, which finds its history Slim and
+// its tail Full; only the memory of the pages differs.
+void testWindowTrimChangesNoOutput() {
+  struct Outcome {
+    std::unordered_map<uint64_t, std::vector<uint32_t>> outputs;
+    std::vector<uint32_t> starts;
+    uint64_t digest = 0;
+    uint64_t trimmed = 0;
+    uint32_t slimPages = 0;
+  };
+  const auto run = [](bool trim) {
+    test::TestKvStorage storage(512, 4096, 4, 0, 1024);
+    KvPool pool(storage, 0);
+    engine::Cache cache(pool, nullptr, nullptr, std::nullopt, CacheWindowPolicy{2, trim});
+    Executor model;
+    model.kv = &storage;
+    model.windowPages = 2;
+    model.decodeFinishes = false;
+    model.decodeTokens = 4;
+    Events events;
+    engine::Engine engine(test::engineConfig(), cache, model, events);
+    guardReleases(storage, engine);
+    double now = 1;
+    std::vector<uint32_t> prompt = ScatteredPages::prompt(1000, 3000);
+    EngineRequest first = request(1, prompt);
+    first.maxNewTokens = 40;
+    engine.submit(first);
+    tickUntil(engine, now, [&] { return idle(engine); }, "the first request did not end");
+    // The fake marks no decoded rows, so the next turn shares the prompt
+    // alone.
+    for (uint32_t token = 0; token < 300; ++token)
+      prompt.push_back(90000 + token);
+    EngineRequest second = request(2, prompt);
+    second.maxNewTokens = 20;
+    engine.submit(second);
+    tickUntil(engine, now, [&] { return idle(engine); }, "the continuation did not end");
+    const CacheSnapshot cached = cache.snapshot();
+    return Outcome{events.outputs, events.starts, model.windowDigest, cached.window->trimmedPages,
+                   cached.pool.slim.pagesAllocated - cached.pool.slim.pagesFree};
+  };
+  const Outcome trimmed = run(true), full = run(false);
+  require(trimmed.outputs == full.outputs && trimmed.starts == full.starts && trimmed.digest == full.digest &&
+              trimmed.starts.size() == 2 && trimmed.starts[1] > 0 && trimmed.outputs.at(2).size() == 20,
+          "trimming changed what the steps read or emitted");
+  require(trimmed.trimmed > 90 && trimmed.slimPages > 90 && full.trimmed == 0 && full.slimPages == 0,
+          "the pages the windows passed did not give up their windowed layers, or did with trimming off");
+}
+
+// While the host pauses growth (macOS warns), a windowed target's trims are
+// memory the request in service needs, as its pages are: a prompt longer
+// than the budget holds Full pages completes, the pages its windows passed
+// Slim, where trims the pause refused would leave every page Full and the
+// request at the engine's limit.
+void testWindowTrimServesThroughTheHostPause() {
+  test::TestKvStorage storage(512, 4096, 4, 0, 1024);
+  // 128 Full pages, 4096 tokens; the prompt is 8000.
+  storage.budgetPages = 128;
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr, std::nullopt, CacheWindowPolicy{2, true});
+  Executor model;
+  model.kv = &storage;
+  model.windowPages = 2;
+  model.decodeFinishes = false;
+  Events events;
+  bool serving = false;
+  EngineConfig config = test::engineConfig();
+  config.growthPaused = [] { return true; };
+  config.serving = [&](bool value) { return std::exchange(serving, value); };
+  // As the governor does: the host refuses growth unless a request in
+  // service needs it, then the engine's limit binds.
+  storage.growthAllowed = [&](uint32_t) {
+    storage.allocationFailure =
+        serving ? metal::AllocationFailure::EngineBudget : metal::AllocationFailure::HostPressure;
+    return serving;
+  };
+  engine::Engine engine(config, cache, model, events);
+  guardReleases(storage, engine);
+  EngineRequest prompt = request(1, ScatteredPages::prompt(1000, 8000));
+  prompt.maxNewTokens = 8;
+  engine.submit(prompt);
+  double now = 1;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the long prompt did not end");
+  const CacheSnapshot cached = cache.snapshot();
+  require(events.completedCount == 1 && events.failures.empty() && events.outputs.at(1).size() == 8,
+          "a prompt the trims fit failed under the host's pause");
+  require(cached.window->trimmedPages > 128 && cached.pool.slim.pagesAllocated > 128,
+          "the pages the prompt's windows passed stayed Full under the host's pause");
+}
+
 void testAllocationCausesRemainDistinct() {
   for (bool stateAllocation : {false, true}) {
     for (auto reason : {metal::AllocationFailure::HostPressure,
@@ -12232,6 +12326,8 @@ int main() {
     testStateStartGathersFreePagesBeforeEvicting();
     testCommandReadsItsPageTableAfterRoomForItsStates();
     testCompactionWaitsForTheCommandInFlight();
+    testWindowTrimChangesNoOutput();
+    testWindowTrimServesThroughTheHostPause();
     testAllocationCausesRemainDistinct();
     testAdmissionRespectsPriorityBeforeHashOrder();
     testConstraintMaskOverlapsInsideOneSchedulerBatch();

@@ -937,14 +937,17 @@ class FrontendHandler(BaseHTTPRequestHandler):
         start, each piece of output, the idle waits and prompt progress:
         streams send them, and complete Messages and Responses gather the
         output into blocks."""
-        splitter = ReasoningSplitter(job.thinking, job.may_call_tools)
+        splitter = ReasoningSplitter(job.thinking, job.may_call_tools, job.chat_format)
         # A chat answer is parsed as it arrives whether it streams or not:
         # its calls where tools may be called, and in any answer, a </think>
         # the model writes after its reasoning ended is dropped. A text
         # completion, without a chat template, is its text as written.
         projector = (
             StreamingToolCallProjector(
-                job.tool_policy, job.public_id, job.response_validator is not None
+                job.tool_policy,
+                job.public_id,
+                job.response_validator is not None,
+                job.chat_format.tool_calls,
             )
             if job.tool_policy is not None or job.reasoning is not None
             else None
@@ -1764,11 +1767,21 @@ def main():
         # exits, so that no installation collects the assembly its tokenizer
         # and engines, a relaunched one too, serve.
         model_root, held = assembly.hold(Path(args.model_root))
+        # The family the installation found the model to be, whose chat
+        # format its output is read in.
+        family = assembly.family(model_root)
+        if family is None:
+            raise ModelError(
+                f"{args.model} is not prepared as a model of a family this "
+                "release serves: prepare it again"
+            )
         tokenizer = AutoTokenizer.from_pretrained(
             model_root / "tokenizer", local_files_only=True, trust_remote_code=False
         )
-        validate_tokenizer(tokenizer)
-        thinking_end = thinking_end_tokens(tokenizer, args.thinking_end_text)
+        validate_tokenizer(tokenizer, family.chat_format)
+        thinking_end = thinking_end_tokens(
+            tokenizer, args.thinking_end_text, family.chat_format
+        )
         chat_templates = ChatTemplates(tokenizer)
         print_status(f"Chat template · {chat_templates.describe()}")
         runtime = engine_runtime.MultiplexedRuntime(
@@ -1799,7 +1812,7 @@ def main():
                 "native runtime reported an invalid context window"
             )
         effective_context = readiness.max_context_tokens
-        constraint_factory = ConstraintFactory(tokenizer)
+        constraint_factory = ConstraintFactory(tokenizer, family.chat_format)
         app = Frontend(
             tokenizer,
             backend,
@@ -1811,6 +1824,7 @@ def main():
             readiness.max_concurrent_requests,
             constraint_factory=constraint_factory,
             chat_templates=chat_templates,
+            chat_format=family.chat_format,
             max_image_pixels=args.max_image_pixels,
             thinking_codec=thinking_codec,
             served_model_names=args.served_model_name,

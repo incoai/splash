@@ -25,6 +25,12 @@ public:
   // verify rows, or in row 0 the final position of the prefill chunk that
   // ended a prompt.
   [[nodiscard]] static std::span<const float> lastLogits(const Runtime &runtime, uint32_t lane);
+  // The target rows the last prefill command captured for the draft in its
+  // chunk `chunk`'s buffer, until the next prefill: bf16 rows of the output
+  // of each target layer the draft reads (its target_layer_ids, hiddenSize
+  // values each, in their order), the captured rows in the order the draft's
+  // context plan captured them (a cold prompt's first command: its rows).
+  [[nodiscard]] static std::span<const uint16_t> lastCapturedRows(const Runtime &runtime, uint32_t chunk);
   // The rows of its block batch lane `lane` of the last decode step verified
   // (ops::DraftSelector::addVerifyRows), until the next decode step.
   [[nodiscard]] static uint32_t lastVerifyRows(const Runtime &runtime, uint32_t lane);

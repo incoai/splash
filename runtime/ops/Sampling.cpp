@@ -183,22 +183,21 @@ void Sampling::addPenalties(metal::CommandGraph &graph,
 void Sampling::addInitial(metal::CommandGraph &graph,
                           std::span<const SamplingPolicy> policies,
                           SamplingBuffers buffers, uint32_t rowOffset,
-                          uint32_t stopToken0, uint32_t stopToken1,
+                          const StopTokens &stopTokens,
                           const PenaltyTable &penalties) const {
   if (policies.empty() || policies.size() > kMaximumLanes)
     throw std::invalid_argument("invalid sampling batch width");
   if (rowOffset >= SPLASH_TARGET_VERIFY_ROWS)
     throw std::invalid_argument("invalid initial sampling row");
   const TargetSamplingParams params =
-      selection(policies, buffers, {1, rowOffset, 0, SPLASH_UNIFORM_INITIAL, 0}, stopToken0, stopToken1);
+      selection(policies, buffers, {1, rowOffset, 0, SPLASH_UNIFORM_INITIAL, 0}, stopTokens);
   addPenalties(graph, policies, buffers, penalties, rowOffset, false);
   addSelection(graph, params, policies, buffers);
 }
 
 void Sampling::addVerify(metal::CommandGraph &graph,
                          std::span<const SamplingPolicy> policies,
-                         SamplingBuffers buffers, uint32_t stopToken0,
-                         uint32_t stopToken1,
+                         SamplingBuffers buffers, const StopTokens &stopTokens,
                          const PenaltyTable &penalties) const {
   if (policies.empty() || policies.size() > kMaximumLanes)
     throw std::invalid_argument("invalid sampling batch width");
@@ -208,14 +207,14 @@ void Sampling::addVerify(metal::CommandGraph &graph,
   const TargetSamplingParams params =
       selection(policies, buffers,
                 {SPLASH_TARGET_VERIFY_ROWS, 0, 1, SPLASH_UNIFORM_CORRECTION, SPLASH_DRAFT_PROPOSAL_TOKENS},
-                stopToken0, stopToken1);
+                stopTokens);
   addPenalties(graph, policies, buffers, penalties, 0, true);
   addSelection(graph, params, policies, buffers);
 }
 
 TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policies,
                                          const SamplingBuffers &buffers, const TargetRows &rows,
-                                         uint32_t stopToken0, uint32_t stopToken1) const {
+                                         const StopTokens &stopTokens) const {
   TargetSamplingParams params{};
   params.vocabulary = vocabulary_;
   params.mask_words = maskWords_;
@@ -224,8 +223,7 @@ TargetSamplingParams Sampling::selection(std::span<const SamplingPolicy> policie
   params.mask_row = rows.maskRow;
   params.uniform = rows.uniform;
   params.drafted_rows = rows.draftedRows;
-  params.stop_token_0 = stopToken0;
-  params.stop_token_1 = stopToken1;
+  std::ranges::copy(stopTokens.ids, params.stop_tokens);
   for (uint32_t lane = 0; lane < policies.size(); ++lane) {
     const SamplingPolicy &policy = policies[lane];
     if (policy.samples()) {
@@ -352,15 +350,14 @@ void Sampling::addThinkingDrafts(metal::CommandGraph &graph, std::span<const Sam
 void Sampling::addAcceptance(
     metal::CommandGraph &graph, AcceptanceBuffers buffers,
     std::span<const uint32_t> maximumRetained,
-    std::span<const SamplingPolicy> policies, uint32_t stopToken0,
-    uint32_t stopToken1) const {
+    std::span<const SamplingPolicy> policies,
+    const StopTokens &stopTokens) const {
   if (maximumRetained.empty() || maximumRetained.size() != policies.size() ||
       maximumRetained.size() > kMaximumLanes)
     throw std::invalid_argument("invalid DFlash acceptance batch");
   const uint32_t lanes = static_cast<uint32_t>(maximumRetained.size());
   AcceptBatchParams params{};
-  params.stop_token_0 = stopToken0;
-  params.stop_token_1 = stopToken1;
+  std::ranges::copy(stopTokens.ids, params.stop_tokens);
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     if (!maximumRetained[lane] ||
         maximumRetained[lane] > SPLASH_TARGET_VERIFY_ROWS)

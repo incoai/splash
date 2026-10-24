@@ -2,7 +2,9 @@
 
 #include "model/RopeScaling.hpp"
 #include "model/StateLayout.hpp"
+#include "ops/MoE.hpp"
 #include "ops/PagedKv.hpp"
+#include "ops/StopTokens.hpp"
 
 #include <array>
 #include <cmath>
@@ -14,10 +16,11 @@ namespace splash::model {
 enum class QwenFfnKind : uint8_t { Dense, SparseMoe };
 
 // The dimensions and tokens of a Qwen hybrid target: GDN layers, every
-// fullAttentionPeriod-th layer full attention instead, each followed by a
-// dense FFN or a sparse MoE. A family's layout (QwenHybridLayout) sets them,
-// and every view of a target reads them from there: the target loaders, the
-// GGUF planner and the runtime's QwenTargetGeometry.
+// fullAttentionPeriod-th layer an attention layer instead (every layer with
+// a period of 1, a target without GDN), each followed by a dense FFN or a
+// sparse MoE. A family's layout (QwenHybridLayout) sets them, and every view
+// of a target reads them from there: the target loaders, the GGUF planner
+// and the runtime's QwenTargetGeometry.
 struct QwenTargetDimensions {
   // The native window, the context max_position_embeddings states, and the
   // most context YaRN stretches it to (servedFor), as the family's model
@@ -41,20 +44,51 @@ struct QwenTargetDimensions {
   uint32_t attentionQueryHeads = 0;
   uint32_t attentionKvHeads = 0;
   uint32_t attentionHeadDimension = 0;
+  // Whether the attention's q projection holds each query head's output gate
+  // after its queries, by whose sigmoid the attention's output rows multiply
+  // (Qwen3.5's attn_output_gate); else it holds the queries alone.
+  bool attentionGate = true;
   // The rotated dimension pairs of each attention head and their RoPE base.
   uint32_t rotaryPairs = 0;
   float rotaryTheta = 0.0F;
+  // How the attention layers attend beyond reading every key up to their row
+  // through the RoPE above, each a bit per attention layer, bit a for the
+  // a-th (kv::Layout::windowedLayers), zero for none: those of slidingLayers
+  // read the slidingWindow keys that end at their row, its own included (a
+  // config's sliding_window), and those of unrotatedLayers take no RoPE
+  // (NoPE). The attention kernels compile each such variant
+  // (ops::AttentionVariant, QwenTargetGeometry::attentionVariant).
+  uint32_t slidingWindow = 0;
+  uint64_t slidingLayers = 0;
+  uint64_t unrotatedLayers = 0;
   uint32_t fullAttentionPeriod = 0;
+  // The token whose row a DFlash2 draft's mask rows read
+  // (dflash_config.mask_token_id). A family whose vocabulary keeps none for
+  // it (Flint's) names instead the tokens its drafts choose theirs among,
+  // its reserved special tokens firstDraftMaskToken to lastDraftMaskToken:
+  // maskToken is then its draft's (ModelDescriptor.mm describeSourceModel),
+  // zero before a draft names one.
   uint32_t maskToken = 0;
-  std::array<uint32_t, 2> stopTokens{};
+  uint32_t firstDraftMaskToken = 0;
+  uint32_t lastDraftMaskToken = 0;
+  ops::StopTokens stopTokens{};
   QwenFfnKind ffnKind = QwenFfnKind::Dense;
   // The dense FFN's width.
   uint32_t intermediateSize = 0;
   // The sparse MoE's routed experts, those each token takes, and the width of
-  // each and of its shared expert.
+  // each; how its router weights them, and its shared expert: as wide as
+  // sharedExpertSlices routed experts and weighted by the sigmoid of the
+  // block's scalar gate or, without sharedExpertGate, by 1 (ops::MoeShape).
   uint32_t experts = 0;
   uint32_t expertsPerToken = 0;
   uint32_t expertIntermediateSize = 0;
+  ops::MoeRouter moeRouter = ops::MoeRouter::Softmax;
+  uint32_t sharedExpertSlices = 1;
+  bool sharedExpertGate = true;
+  // The first layers of a sparse MoE target, which run a dense FFN of
+  // intermediateSize instead (a config's mlp_only_layers); its MoE blocks
+  // are those of the layers after them, in layer order.
+  uint32_t leadingDenseLayers = 0;
   // Qwen3.8-Flash-Next's additions (model/Qwen4Exp.hpp), which its family
   // takes together and the Qwen3.5 families leave zero: hyper-connected
   // streams (hyperConnected), the residual's streams and the mixes' low rank;
@@ -83,6 +117,26 @@ struct QwenTargetDimensions {
   }
   [[nodiscard]] constexpr uint32_t attentionLayerCount() const noexcept {
     return fullAttentionPeriod ? layers / fullAttentionPeriod : 0;
+  }
+  [[nodiscard]] constexpr uint32_t gdnLayerCount() const noexcept { return layers - attentionLayerCount(); }
+  // Whether its drafts choose their mask token (firstDraftMaskToken).
+  [[nodiscard]] constexpr bool draftChoosesMaskToken() const noexcept { return lastDraftMaskToken != 0; }
+  // Whether layer `layer`'s FFN is a MoE block, and the block's index among
+  // the target's (its ExpertStore block).
+  [[nodiscard]] constexpr bool isMoeLayer(uint32_t layer) const noexcept {
+    return ffnKind == QwenFfnKind::SparseMoe && layer >= leadingDenseLayers;
+  }
+  [[nodiscard]] constexpr uint32_t moeBlock(uint32_t layer) const noexcept { return layer - leadingDenseLayers; }
+  // The shape of the MoE blocks but for the formats of their expert weights,
+  // which the loaded weights give (QwenTargetGeometry::moeShape).
+  [[nodiscard]] constexpr ops::MoeShape moeBlockShape() const noexcept {
+    return {.hiddenSize = hiddenSize,
+            .experts = experts,
+            .expertsPerToken = expertsPerToken,
+            .expertIntermediateSize = expertIntermediateSize,
+            .router = moeRouter,
+            .sharedSlices = sharedExpertSlices,
+            .sharedGate = sharedExpertGate};
   }
   [[nodiscard]] constexpr uint32_t actualGdnWidth() const noexcept {
     return convolutionDimension + attentionWidth + 2 * gdnValueHeads;
@@ -137,25 +191,32 @@ struct QwenTargetDimensions {
 // family is a value of it (model::kFamilies) that sets every value its FFN
 // uses. The type states its config's model type, the architecture of its GGUFs
 // and whether a safetensors checkpoint of it loads (modelType,
-// ggufArchitecture, loadsSafetensors).
+// ggufArchitecture, loadsSafetensors), and, where its config.json holds the
+// text model's keys at its top level instead of in a text_config (a
+// multimodal Qwen checkpoint's), flatConfig.
 struct QwenHybridLayout : QwenTargetDimensions {
+  static constexpr bool flatConfig = false;
+
   // The family's name, as the installer pairs its draft (install/families.py).
   std::string_view family;
 
   // The KV pages, which also hold a QSA indexer's pooled keys; a QSA target's
   // sparse attention gathers blocks of tokens, so its values are token-major.
+  // A sliding layer reads the slidingWindow - 1 keys before its row's.
   [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
     return {.attentionLayers = attentionLayerCount(),
             .kvHeads = attentionKvHeads,
             .headDimension = attentionHeadDimension,
             .indexDimension = indexerHeadDimension,
-            .valuesTokenMajor = hasIndexer()};
+            .valuesTokenMajor = hasIndexer(),
+            .windowTokens = slidingWindow ? slidingWindow - 1 : 0,
+            .windowedLayers = slidingLayers};
   }
   // The GDN layers' state and, after it in a cell, a PLE convolution's
   // history and the QSA indexer's pending keys.
   [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {
-    return {.layers = layers - attentionLayerCount(),
-            .convolutionHistory = kGdnConvolutionTaps - 1,
+    return {.layers = gdnLayerCount(),
+            .convolutionHistory = gdnLayerCount() ? kGdnConvolutionTaps - 1 : 0,
             .convolutionChannels = convolutionDimension,
             .recurrentGroups = gdnValueHeads,
             .recurrentRows = gdnHeadDimension,

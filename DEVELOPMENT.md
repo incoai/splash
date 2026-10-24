@@ -752,6 +752,13 @@ template that cannot give the thinking a request asks for, one that always or
 never thinks, renders as it can, and the request reasons as its prompt does. A
 template that refuses a request's messages returns 400 with its reason.
 
+Flint's template has no thinking switch: its generation prompt is
+`<|assistant|>` alone, whatever the effort or `enable_thinking`, and the model
+decides each turn whether to reason. Both reach its template and change
+nothing; a reply whose output opens with `<think>` returns that block as its
+reasoning, and any other reply is all answer
+([chat formats](#chat-formats)).
+
 ```sh
 splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort none
 ```
@@ -819,14 +826,15 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --thinking-token-budget 1200
 
 A budget applies only where generation starts in a thinking block, and one the
 output limit reaches first changes nothing; the output limit can also cut the
-end short. Where the output may call a tool, a call's opening ends thinking
-too, so the end never lands inside a call. The engine takes any `<tool_call>`
-token for that opening, while the reply's reasoning ends only where
-`<tool_call>` is followed by `\n<function=`: a stray `<tool_call>` in the
-thinking ends the budget's count while the reasoning goes on, and the
-request's `reasoning_tokens` can then exceed the budget. Only the end is
-forced, and a close the model selects itself before the budget ends the count.
-Text completions have no reasoning split and refuse a budget with 400.
+end short. A model that opens its thinking itself, as Flint does, never starts
+in one, and a budget caps nothing for it. Where the output may call a tool, a
+call's opening ends thinking too, so the end never lands inside a call. The
+engine takes any `<tool_call>` token for that opening, while the reply's
+reasoning ends only where `<tool_call>` is followed by `\n<function=`: a stray
+`<tool_call>` in the thinking ends the budget's count while the reasoning goes
+on, and the request's `reasoning_tokens` can then exceed the budget. Only the
+end is forced, and a close the model selects itself before the budget ends the
+count. Text completions have no reasoning split and refuse a budget with 400.
 
 ## Agent launchers
 
@@ -1176,6 +1184,9 @@ finishes with `length` unless a `stop` string ends it first. Benchmarks use it
 to generate a fixed number of tokens. Constrained tool calls, output under
 `tool_choice: "none"` and structured output generate under a grammar, which
 decides where the output ends, so combining them with `ignore_eos` returns 400.
+A family states up to four stop tokens: a request finishes at the first it
+emits, acceptance keeps no token after one, and a lane that ignores
+end-of-sequence admits none.
 
 Streaming requests accept `"return_progress":true` (default false). Before output,
 `prompt_progress` reports `{total, cache, processed, time_ms}`: prompt tokens,
@@ -1271,11 +1282,15 @@ not give: `["integer", "any"]` constrains no type, and
 Calls are not validated against their schemas; a client reports what its tool
 rejects. A `stop` string may cut a call ([request fields](#request-fields)).
 
-The output is read as the chat template lays calls out: a call opens at
+The output is read as the chat template lays calls out, in the family's
+syntax ([chat formats](#chat-formats)). In Qwen's XML a call opens at
 `<tool_call>` and the newline before `<function=`, and a value ends at
 `\n</parameter>\n` where the next parameter, `</function>` or `</tool_call>`
-follows, so a value may hold the tags in any other order, as a file an agent
-writes may. Tags written otherwise are text. Besides:
+follows; in Flint's GLM tags a call opens at `<tool_call>`, the function's name
+follows it up to the first tag, and a value ends at `</arg_value>` where the
+next `<arg_key>` or `</tool_call>` follows. A value may hold the tags in any
+other order, as a file an agent writes may. Tags written otherwise are text.
+Besides:
 
 - names lose the space around them, and a call that names no function is
   dropped, as is a `</think>` in text;
@@ -1290,20 +1305,22 @@ writes may. Tags written otherwise are text. Besides:
   within the 128 levels the server reads where a request carries them deepest,
   as a `tool_use` block's `input` in a Messages history, five levels into the
   body;
-- a call's opening also ends the reasoning where a call may follow.
+- a call's opening also ends the reasoning where a call may follow, but for a
+  model that opens its reasoning itself, as Flint does, which closes it before
+  a call.
 
 `dev/tests/server/test_tool_call_reading.py` holds model outputs with the calls
-and content they read as.
+and content they read as, and `dev/tests/server/test_chat_formats.py` Flint's.
 
 A strict tool's schema is checked against its JSON Schema dialect on arrival,
 and every tool's arguments are framed through schema composition and local
 references, which give each parameter its types. A strict tool's framed
 arguments are closed, so that an object or an array takes nothing it does not
-declare. Its values are written in Qwen XML: raw text where any string may be
-the value, whose pattern, format and length go unenforced; otherwise one of the
-values each member of the value's union lists, as its text, or JSON of a member
-that lists none, leaving out array item bounds and `multipleOf` above 64 and
-patterns the grammar cannot compile (look-around, word boundaries,
+declare. Its values are written in the family's tags: raw text where any string
+may be the value, whose pattern, format and length go unenforced; otherwise one
+of the values each member of the value's union lists, as its text, or JSON of a
+member that lists none, leaving out array item bounds and `multipleOf` above 64
+and patterns the grammar cannot compile (look-around, word boundaries,
 backreferences). The framed schemas of a request's strict tools, whose grammars
 are built together, are limited to 16 MiB in all. Any other tool is framed when
 a call first names it, for its parameters' types alone, which take no copy of
@@ -1438,7 +1455,11 @@ system prompt and A–P option order. It returns the exact rendered prompt's SHA
 (each lone surrogate read as U+FFFD, as every prompt is tokenized),
 answer token IDs, raw option logits, normalized probabilities and zero completion
 tokens. Every answer label must round-trip as one token, including at the actual
-assistant prompt boundary. Besides the row it takes `model`, `timeout`,
+assistant prompt boundary. Prompts render without thinking, as effort `none`
+renders them. A model that opens its reasoning itself (Flint), which no effort
+turns off, would open it where the generation prompt ends: its prompt ends with
+an empty think block, `<think></think>`, and the answer slots are read after it,
+where its answer starts. Besides the row it takes `model`, `timeout`,
 `priority` and `cache_salt` as the generation APIs do ([request
 fields](#request-fields)); other generation controls return errors rather than
 silently changing the scoring protocol. SemIf-derived code retains its MIT
@@ -1459,10 +1480,10 @@ share the scheduler. Disconnects and timeouts cancel the current question.
 
 Preparation renders each prompt once, then enforces the context limit and the
 batch token budget before the per-slot boundary checks. A label can change only
-the tokens after the prompt's last `<|im_end|>`, which the tokenizer encodes on
-its own, so each check encodes that end with the option appended rather than
-the whole prompt. The checks observe the request deadline and stop when the
-client disconnects.
+the tokens after the prompt's last message boundary (`<|im_end|>`, or Flint's
+`<|assistant|>`), which the tokenizer encodes on its own, so each check encodes
+that end with the option appended rather than the whole prompt. The checks
+observe the request deadline and stop when the client disconnects.
 Prompts that exceed the context limit are rejected, not truncated.
 
 System One validation uses 422 `detail` arrays; successful responses contain
@@ -1492,6 +1513,8 @@ Proxy consumers can use these fields; additional fields may be added:
 | `streamed_table` | While the PLE table streams, the [streamed PLE table](#ple-table-streaming)'s cache, stages, reads and prefetches; `null` otherwise |
 | `streamed_experts` | While routed experts stream, the [streamed experts](#streamed-experts)' store: its slots and resident experts, per use its loads, reads, read-ahead and host-step round trips, and its failure; `null` otherwise |
 | `kv_spill` | While a block-sparse target's KV can go to the SSD, its [KV on the SSD](#kv-on-the-ssd): the requests that started in each mode, converted to `spill`, had their output bounded or ended at that bound, and were refused for the quota, the write budget or a closed tier, and the starts waiting for the quota (`requests`); the pages that hold only their index and those whose KV is on the SSD; the write-through of spilling requests' pages; page moves, rewrites and restores; the quota of KV in service; the hot block cache's memory, hits, reads and host steps (`block_cache`; `read` over `resolves` is the blocks a layer's step missed on average) and the history streams' reads, how long each layer's took (`read_ms`, whose total gives with `bytes` the streams' bandwidth) and staging, the streamed commands that ran beside decoders, and the decoders' gaps across them (`history_stream`); absent for a target whose KV stays in memory, whose plan's `memory_plan.budget.kv_spill` is `null` |
+| `kv.window` | For a target with sliding-window layers, its [windows](#sliding-windows): the `window_pages` a row's window and a state's tail keep Full, whether pages past every window give up their windowed layers' K/V (`trim`, off with the native `--kv-window-trim off`), the pool's `full_pages` and `slim_pages` in use and the Slim extents' `slim_bytes`, the `pinned_blocks` states' tails hold, the `trimmed_pages` since engine start, the `upgrades` of blocks that took the page of a writer that computed them again, and the `refused_states` whose tail was not Full; absent for other targets |
+| `memory_plan.budget.kv_window` | For a target whose pages give up a window's layers, a Slim page's `slim_page_bytes` and the `floor_pages` a lane keeps Full, by which one request's KV capacity is counted; absent for other targets |
 | `memory_plan.budget.context_bounds` | What bounds `maximum_context_tokens` ([memory and context](#memory-and-context)): the model's `window`, one request's KV in memory (`resident`), the longest context a block-sparse target's floors hold (`spilled`) and its SSD cache's room holds (`disk`), and the `bound` that sets the limit: `model`, `memory` or `disk` |
 | `ane_ffn.state`, `share`, `minimum_rows`, `reason` | The prefill FFN's [Neural Engine split](#neural-engine-prefill): `split` while it serves, at `share` of the FFN's channels over chunks of `minimum_rows` rows or more; `off` when the start left the GPU alone (`share` and `minimum_rows` 0); `stopped` once it stopped while serving, until the engine restarts. `reason` is the start's outcome, or why the split stopped |
 | `ane_ffn.split_commands`, `evaluations`, `ane_ms`, `reruns` | Prefill commands the split ran since engine start, the Neural Engine's evaluations in them and its milliseconds over them (each evaluation's from the GPU's signal to start it to its report); and the chunks the GPU ran again alone after the split's work for them failed |
@@ -1504,6 +1527,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `thermal_state` | The Mac's thermal state as macOS reports it: `nominal`, `fair`, `serious` or `critical`. As the Mac heats, its CPU and GPU clocks drop and prefill and decode slow down, on some Macs already at `fair`; readiness ignores it. The engine samples it twice a second and logs each change (`Thermal state: fair → serious`) |
 | `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` after `--language-only` |
+| `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
 | `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after repeated failures; `error` names its failure, the last failed restart, or why restarts stopped |
 
@@ -1635,13 +1659,20 @@ and model-card `base_model` fields play no part. Families of one model type,
 Qwen3.6-35B-A3B and Qwen3.5-122B-A10B (`qwen3_5_moe_text`, GGUF `qwen35moe`),
 are told apart by their sizes, and a fine-tune of either, such as
 Ornith-1.5-35B-A3B or Ornith-1.5-122B, is its family. A layout type
-(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp` in `runtime/model/`) is an
-architecture, whose code its families share, and each family is a value of it in
-one list, `model::kFamilies` (`ModelDescriptor.hpp`): another size of an
-architecture is one more value there, its draft in `families.FAMILIES`, and, for
-a GDN or attention shape no family had, its kernel instances and a row of the
-compiled shapes in `ops/GDN.cpp` or `ops/PagedAttention.cpp`. The kernel tests
-take every family's shapes from that list (`dev/tests/engine/TestFamilies.hpp`).
+(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp` in
+`runtime/model/`) is an architecture, whose code its families share, and each
+family is a value of it in one list, `model::kFamilies` (`ModelDescriptor.hpp`):
+another size of an architecture is one more value there, its draft in
+`families.FAMILIES`, and, for a GDN or attention shape no family had, its kernel
+instances and a row of the compiled shapes in `ops/GDN.cpp` or
+`ops/PagedAttention.cpp`. The kernel tests take every family's shapes from that
+list (`dev/tests/engine/TestFamilies.hpp`). A Qwen config holds its text model
+under `text_config`; Flint's is flat, its keys at the top level, which the check
+reads only for a model type whose configs are flat (a layout type's
+`flatConfig`). Flint loads from a GGUF only, and its configuration is held to
+Flint's values key by key (its widths, router, window, `layer_types`,
+`no_rope_layer_indices`, `mlp_only_layers` and `eos_token_id`; `softmax_type`,
+`rope_theta` and the rest where it states them).
 An MLX target must declare `quantization` in `config.json` in formats it loads
 ([MLX targets](#mlx-targets)). Every start checks the configuration again.
 Remote Python code is not loaded.
@@ -1759,7 +1790,24 @@ and lists every unsupported tensor in one error:
   gather (`gguf_embed_f32_<format>`), GGML's own F32 values. A BF16 or F16
   pair stays such a float segment: it reads the input unrotated, as Prism's
   BF16 alpha and beta need, and leaves the GDN input projection on Apple9's
-  register tile, which takes no F16.
+  register tile, which takes no F16;
+- Flint's attention sinks: F32, as llama.cpp writes them.
+
+Flint's GGUFs (`flint`, as llama.cpp writes them from release b11803) differ
+from Qwen's beyond their tensor types: every layer attends, its norm before the
+FFN is `ffn_norm`, `leading_dense_block_count` leading layers have a dense FFN
+and the others a MoE whose shared expert has no gate, and each layer carries
+its attention sinks, `attn_sinks.weight`. Its derived configuration is flat,
+as Flint's config.json is, and holds the keys of that file the header states
+(`gguf.flint_text_config`): every size, the experts each token takes, the
+router (`router_score_function` from `expert_gating_func`, `norm_topk_prob`),
+`mlp_only_layers`, `sliding_window`, `layer_types` from
+`attention.sliding_window_pattern`, `no_rope_layer_indices` from
+`attention.rope_pattern`, and `eos_token_id` from
+`tokenizer.ggml.eog_token_ids`; the engine's check holds each to the family's,
+the two layer patterns included, which the scalar metadata leaves out. The
+token table must be of a format: RecursiveSI's int4 GGUF, whose table is F32,
+is refused before its download.
 
 A variant no root file names may be a folder of a split GGUF's parts, as
 repositories publish files too large for one
@@ -1866,7 +1914,11 @@ architecture never replaces one that loads.
 A draft's `config.json` states its layers, intermediate size, rotary base and
 the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
 ascending, at most eight); its hidden size, vocabulary and mask token are its
-target's, and its attention (32 query and 8 KV heads of 128), selector (rank
+target's (Flint's vocabulary keeps no mask token: a Flint draft chooses one of
+its reserved special tokens, 150019 to 150143, as its
+`dflash_config.mask_token_id`, which the target's layout then holds,
+`QwenTargetDimensions::firstDraftMaskToken`), and its attention (32 query and
+8 KV heads of 128), selector (rank
 256, 16 candidates) and 2048-token window are those the kernels are built for,
 and its block at least their 8 rows, of which a cycle drafts the first (the
 Qwen3.5-122B-A10B draft was trained to fill 16; `readDraftLayout` in
@@ -1962,7 +2014,9 @@ BF16. The processor configuration (MLX `preprocessor_config.json`, or the
 `image_processor` object of `processor_config.json`, where newer Transformers
 releases save it; the GGUF's `clip.vision` metadata) must describe the one
 preprocessing Splash implements (`server/images.py`); it is checked before any
-weight download and not installed.
+weight download and not installed. The models of a family without a vision
+tower (Flint; `vision` in `install/families.py`) serve text only: their
+installation reads no projector, with or without `--language-only`.
 
 Both sources are written into one image, which the one BF16 vision operator
 reads: BF16 tensors are
@@ -1992,8 +2046,11 @@ An MLX target's configuration, tokenizer files and chat template come from its
 resolved snapshot. For GGUF, `install/gguf.py` reads the selected file's
 metadata without mapping or decoding weight tensors. Vocabulary IDs, BPE merge
 ranks, control/user-defined token types, BOS/EOS/padding IDs and template text
-come from that file; the supported `gpt2/qwen35` profile supplies the NFC and
-byte-level pre-tokenization algorithms. Unknown profiles, malformed metadata
+come from that file; the supported profiles supply the pre-tokenization
+algorithms: `gpt2/qwen35` NFC and Qwen's split, `gpt2/flint` Flint's three
+splits (digits in runs of up to three, runs of Han and kana, then o200k's
+pattern) without a normalizer, each before byte-level BPE, as the release's
+own tokenizer.json has them. Unknown profiles, malformed metadata
 and automatic BOS/EOS insertion are rejected, with no cross-repository
 fallback; GGUF sidecar tokenizer/config files do not override embedded metadata.
 Model geometry is translated from the same metadata, subtracting any declared
@@ -2042,6 +2099,41 @@ Every request, including image placeholder, token-count and judgment
 startup; tokenizer files and the tokenizer object are unchanged. The probe's
 upstream fixtures are in `dev/tests/fixtures/chat_templates/`.
 
+### Chat formats
+
+Each family's model frames its reasoning and lays out its tool calls in a
+format of its own, a value of `server/chat_format.py` that `families.FAMILIES`
+names for the family. The server reads and constrains a model's output in the
+format of the family its installation found, which the assembly records:
+
+- Qwen's (`QWEN`): the generation prompt opens a think block where the request
+  thinks, calls are Qwen3-Coder's XML (`QWEN_XML`), and `<|endoftext|>` and
+  `<|im_end|>` stop.
+- Flint's (`FLINT`): the generation prompt is `<|assistant|>` alone, and the
+  model opens a think block itself, as its first token, when it reasons; calls
+  are GLM-4.7's argument tags (`GLM_ARGS`),
+  `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`,
+  each tag a token; `<|end_of_text|>`, `<|user|>`, `<|observation|>` and
+  `<|developer|>` stop.
+
+A format holds the model's vocabulary and the engine's stop tokens, which are
+its target layout's; the tokens of `</think>`, of `<think>` where the model
+opens its reasoning itself, and of `<tool_call>`; the call syntax; and the
+special token after which prompt tokenization reuses a cached prompt's tokens,
+`<|im_end|>` or `<|assistant|>`. Startup checks that the tokenizer encodes each
+as the format has it. Grammars write reasoning and calls as the format lays
+them out: Flint's optional think block may come before any constrained output,
+and its tags, which the grammar compiler takes as tokens rather than text, are
+written as their tokens. A model that opens its reasoning itself closes it
+before a call, so a `<tool_call>` inside its think block is reasoning, as
+Flint's own parser reads it.
+
+Flint's template renders as shipped: its roles, the tools block it adds before
+the first message that is not a system message, each assistant turn's
+reasoning and calls, and tool results as `<|observation|>` turns. Request
+preparation merges leading system and developer messages into one system
+message for every family, so a developer message renders as `<|system|>`.
+
 ### Local model files
 
 An application that downloads models itself prepares them for the server
@@ -2081,8 +2173,9 @@ model's source options (`--revision`, `--draft-model`, `--language-only`,
   `hf download incoai/Qwen3.8-27B-DFlash2` does; `splash serve` downloads by
   commit, which records none.
 - `mmproj`: a GGUF target's vision projector ([Vision](#vision)); without
-  one, a GGUF target serves text only. An MLX target serves images with the
-  tower in its checkpoint unless `language_only=True`.
+  one, a GGUF target serves text only, and a target of a family without a
+  vision tower refuses one. An MLX target serves images with the tower in
+  its checkpoint unless `language_only=True`.
 - `models_dir`: where prepared models are kept, Splash's own models
   directory by default ([files Splash writes](#files-splash-writes)).
 
@@ -2142,7 +2235,8 @@ shape; `frontend.py` prepares
 requests and history; `backend.py` owns native request lifecycles. `judgments.py`
 owns finite-choice prompts, validation and typed answer math. `output.py` parses
 generated text as it arrives, one parser serving streamed and complete
-responses alike, and `constraints.py` compiles token constraints. Messages and
+responses alike, in the family's chat format (`chat_format.py`), and
+`constraints.py` compiles token constraints. Messages and
 Responses build streamed and complete responses from the same block sequence;
 the one difference is a call cut by the token limit or a stop sequence, which a
 complete Messages response leaves out. `make architecture-check` prevents lower
@@ -2302,8 +2396,14 @@ reads the sources at about the speed of the disk that holds them
 
 At load time the engine validates the GGUF metadata, including the rotary
 embedding and norm epsilon the kernels assume (`rope.freq_base`,
-`rope.dimension_count`, `attention.layer_norm_rms_epsilon`, and no
-`rope.scaling.type` but `none`), and plans the `MDGG0001` layout.
+`rope.dimension_count`, which a Flint GGUF, whose RoPE rotates whole heads,
+need not state, `attention.layer_norm_rms_epsilon`, and no
+`rope.scaling.type` but `none`), and plans the `MDGG0001` layout. A Flint
+GGUF's family keys hold its window, leading dense layers, shared expert's
+slices, sigmoid router and normalized, unscaled routing weights
+(`expert_weights_scale` 1) and its two layer patterns to the family's, and
+a router bias (`ffn_exp_probs_b`), which its blocks would not add, is
+refused.
 `GgufPreparation` stages rows in image order on the CPU within the
 staging bound, splitting rows wider than it into column chunks, and runs the
 `gguf_repack` kernel, which writes their planes into the image. Embeddings and
@@ -2381,8 +2481,36 @@ through `BlockTargetFormat`, which reads each tensor as one block-quantized
 `QuantizedSegment` (a fused projection's tensors in output column order), the
 norms as F32 (bf16 for an MLX checkpoint), and keeps the GDN output projection's
 input in the source's value-head order, llama.cpp's tiled or MLX's grouped.
-Both Qwen families share one layout
-(`QwenHybridLayout`) and its validator.
+Every family's layout derives `QwenHybridLayout`, whose validator
+(`requireQwenLayout`) it shares.
+
+A family's target is a `QwenTarget` (`QwenTarget.hpp`) composed of the blocks
+every Qwen target shares: a step's checks and plans, the GDN and attention
+mixers, the FFNs of a residual of one row (a dense SwiGLU and a MoE block's
+routing and experts), the draft's captures and the normed head. The Qwen3.5
+architecture's target (`Qwen3_5Target`, `QwenTarget.cpp`), Flash-Next's
+(`Qwen4ExpTarget`) and Flint's (`FlintTarget`) each compose them into their own
+layer loop. What a family changes in a block is a value of its layout
+(`QwenTargetDimensions`), read by the shared block rather than branched on: an
+attention layer's variant (`QwenTargetGeometry::attentionVariant`: rotated by
+the target's RoPE unless `unrotatedLayers` names it, over a sliding window of
+`slidingWindow` keys where `slidingLayers` does), for which a step plans the
+windowed layers apart; the learned sinks, which a layer's
+`QwenAttentionWeights` carry where its geometry adds them; the MoE router and
+the shared expert's slices and gate (`QwenTargetDimensions::moeBlockShape`);
+and the leading layers of a MoE target whose FFN is dense
+(`leadingDenseLayers`), whose blocks, and streamed experts, are the MoE layers'
+alone. The output gate (`attentionGate`) and the RoPE pairs (`rotaryPairs`) are
+values the attention kernels compile with their geometry (`kCompiledAttention`),
+to which a target holds its layout's (`PagedAttention::compiles`). Flint
+(`Flint.hpp`) has no GDN layers (`fullAttentionPeriod` 1): its 49 layers
+attend, 35 over a window of the 512 keys before a row's with RoPE over whole
+heads and 14 over every key without RoPE, each with its sinks; its first two
+layers' FFN is dense and the others' a MoE of a sigmoid router and an ungated
+shared expert of two slices; its norms are plain, as its GGUFs store them. Its
+layer images (`GgufImage.cpp`, `FlintGguf`) hold its input norm, attention,
+sinks, the norm before its FFN and its FFN, which `loadFlintWeights` reads with
+the Qwen readers.
 
 Every source loads into block planes: `Projection`, `BlockMoeWeights` and
 `EmbeddingWeights` (`runtime/ops/Weights.hpp`, `MoE.hpp`) hold them whatever
@@ -2451,7 +2579,18 @@ form in `linear_gguf_sgmatrix.metal`, the staged one in `kernels/shared/moe_gguf
 Apple9 takes for experts mostly in the formats it stages (`MoeShape::expertFormat`) and for
 experts with an F16 weight (`MoeShape::registerFormats`). One `MoeShape` serves all of a model's
 MoE layers, so one F16 routed or shared expert tensor in any layer stages every layer's experts
-there. Their
+there. A block routes as one of the routings the kernels compile (`ops::kCompiledMoeRoutings`):
+its router weights a row's top k experts by the softmax of their scores (`MoeRouter::Softmax`,
+the Qwen families) or by each one's sigmoid over the sum of theirs (`SigmoidNormalized`, Flint),
+and every row also visits the `MoeShape::sharedSlices` slices of the shared expert, ids `experts`
+on, of the routed experts' width, each weighted by the sigmoid of the block's scalar gate
+(`sharedGate`) or by 1. A shared expert wider than the routed ones runs as such slices in the
+grouped passes: the planner keeps its gate and up rows and lays its down projection out as column
+windows (`gguf::TensorRows::windows`), so slice s's rows of each projection follow slice s - 1's
+(`moe_gguf_segment`). The select kernel names the routing's select suffix
+(`moe_route_select_f32_sigmoid_s2`), the grouping and expert passes its slices suffix
+(`moe_group_routes_s2`, `moe_expert_gguf_m8_a_s2`); the softmax router's one gated slice is the
+unsuffixed instances. Their
 passes launch the live tiles alone: the grouping kernel writes each pass's grid with the tile
 count, and the pass reads it as an indirect dispatch (`ComputeDispatch::indirectThreadgroups`).
 The staged tile runs gate and up in one pass, a gate and an up simdgroup on the same columns,
@@ -2486,11 +2625,12 @@ leading inputs of wider rows), the register ones `gguf_decode_sg_<format>_l<lane
 experts `moe_expert_gguf_m<rows>_<e>` and `moe_expert_gguf_sg_<e>`, with gate and up in one pass
 `moe_expert_gguf_m<rows>_gate_up`; the fused projections run
 `gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode, and in prefill one
-`gguf_prefill_<format>_a` per format over that format's segments. The norm, GDN and
-attention-gate variants that also write the register kernels' input table carry `table16` in
-their names. The epilogue kinds of both GGUF families are in `kernels/common/gguf_tile.h`, the
-SiLU and sigmoid every kernel shares in `kernels/common/activation.h`, and the MMA helpers every
-register kernel uses, GGUF or fp32, in `kernels/common/sgmatrix.h`.
+`gguf_prefill_<format>_a` per format over that format's segments. The norm, GDN,
+attention-gate and attention-gather variants that also write the register kernels' input
+table carry `table16` in their names. The epilogue kinds of both GGUF families are in
+`kernels/common/gguf_tile.h`, the SiLU and sigmoid every kernel shares in
+`kernels/common/activation.h`, and the MMA helpers every register kernel uses, GGUF or fp32, in
+`kernels/common/sgmatrix.h`.
 
 The ABIs are in `runtime/metal/abi/Gguf.h`, which also defines the tile geometry the kernels
 and `LinearGguf.cpp` share, and `MoE.h`; the image formats in
@@ -2506,7 +2646,8 @@ PrismML-Eng/llama.cpp 01ae597) in `gguf-reference`, and `gguf-planner` checks th
 plans; both run in `make test-engine-cpu`.
 `make test-engine-metal` runs `gguf-preparation`, which checks every format's planes, as the
 production executor and its `gguf_repack` kernel write them, bitwise against the reference,
-the alpha/beta, norm, convolution and router bytes they write and the golden images; then
+also as column windows, the alpha/beta, norm, convolution and router bytes they write and the
+golden images; then
 `gguf-dequant`, the staged tile's dequantizer, built with the production Metal flags, against
 the half rounding of every reference weight; `gguf-rotation`, `gguf_rotate` and the rotated
 PQ2_0 token gather bitwise against the fp32 butterflies and within one bf16 step of fp64;
@@ -2519,7 +2660,9 @@ split, and one lane on the staged 16-row tile bitwise against the 8-row tile; an
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
 plan, the staged 8- and 32-row tiles and the Apple9 register tile whatever GPU runs it, each in
 every format it takes as each routed and shared expert tensor, against fp64, and bitwise against
-the full grids and two gate/up passes. The goldens and how to regenerate them are
+the full grids and two gate/up passes; `gguf-moe-e512` runs it at Qwen3.8-Flash-Next's 512
+experts and `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated
+shared slices. The goldens and how to regenerate them are
 in `dev/tests/fixtures/weight-goldens/`; with `SPLASH_GGML_ORACLE=<libggml-base.dylib>`,
 `gguf-reference` also compares the reference with GGML directly and prints GGML's hashes.
 
@@ -2531,8 +2674,28 @@ every K split, and marks the device policy's pick, or, with a trailing `prefill=
 after the epilogue and the round count, one format's 128-row prefill tile at each chunk of `R`
 rows (more than 32); the formats `float-bf16` and `float-f32` time the float projection
 (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles instead, marking
-`Linear::ggufFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape
-on the device's plans and the other GGUF tile.
+`Linear::ggufFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape,
+or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the
+device's plans and the other GGUF tile.
+
+Target attention runs the geometries of `kCompiledAttention` (`runtime/ops/PagedAttention.cpp`):
+query heads over KV heads of a head dimension (`_d128` in the names of 128-wide heads' kernels;
+256 is unnamed) in a value order, each compiled with the variants its layers take, which a layer
+selects with an `ops::AttentionVariant`. Its queries and keys are rotated by the geometry's
+RoPE, or not (NoPE: `qkv…_nope`, which binds no tables); and each row attends its whole history,
+or a window of the keys before it (`…_w512`: a row at position p attends p − 512 to p). A
+windowed split and reduce start at the page of their tile's first row's window start
+(`splash_attention_first_page`), each row masking the keys before its own, and a windowed verify
+lane's or prefill tile's splits stop at the 18 pages such a window reads
+(`kv::windowAttentionPages`). A geometry with learned sinks (`reduce…_sinks`) binds the layer's,
+an F32 per query head, to the reduce, which adds each to its row's softmax after the splits, in
+their order, as a key with no value; one without an output gate (`gather`) gives the
+out-projection its attention rows as they are. The RoPE tables are of the target geometry's pairs
+(`rope_build_tables`, or `rope_build_tables_p64` for 64). `make test-engine-metal` runs
+`attention-variants`, every variant through the production encoders against fp64, and
+`make benchmark-attention-sweep ATTENTION_SWEEP_ARGS='--shapes flint-window,flint-full'` times
+Flint's two kinds of layers with their sinks: a window of 512 keys with RoPE, and the whole
+history without.
 
 ### Sparse attention
 
@@ -2868,14 +3031,26 @@ pressure and swap.
 KV pages live in extents: ordinary shared Metal buffers of one size per pool,
 between half and one and a half times 128 MiB, in which every tensor region of
 each attention layer starts 64 KiB-aligned, sized to leave the fewest of the
-budget's pages unused (`Layout::extentPagesFor`). Each extent has a form
-(`kv::PageForm`): a Full extent holds its pages' K/V and then, for a layout
-with a block index, their index plane; an Index extent only the plane, for
-pages whose K/V is on the SSD, and only a pool that spills allocates one. A
-page moves to the other form, its references with it, when its K/V leaves
-memory or comes back (`KvPool::movePages`). The pool allocates an extent
-when it needs one of its pages. When it is built it allocates the runway, the
-extents of the first 64 pages, which startup warmup runs on; nothing but the
+budget's pages unused (`Layout::extentPagesFor`). The regions follow the
+layers, except that a layout with a sliding window (`Layout::windowTokens`,
+over the layers `windowedLayers` names) places the regions of the layers no
+window bounds first and then the windowed layers', each in layer order
+(`Layout::region`): what a row reads of a page every window has passed lies in
+its first regions, and a page's SSD slot holds them first too. Each extent has
+a form (`kv::PageForm`), which holds the first of a Full extent's regions
+(`Layout::regions`) and then, for a layout with a block index, their index
+plane: a Full extent every layer's; an Index extent none, only the plane, for
+pages whose K/V is on the SSD, and only a pool that spills allocates one; and a
+Slim extent, only of a layout with a sliding window whose slots hold a page's
+spans in order (`Layout::slimmable`), those of the layers no window bounds, for
+a page every row's window has passed. A layer's region sits at one offset in
+every extent that holds it, so the kernels reach a Slim page as they reach a
+Full one, through a real page table entry; only an Index page's is absent. A
+page moves to another form, its references with it, when its K/V leaves memory
+or comes back, or when it gives up its windowed layers' K/V
+(`KvPool::movePages`), and the copy takes what both forms hold. The pool
+allocates an extent when it needs one of its pages. When it is built it
+allocates the runway, the extents of the first 64 pages, which startup warmup runs on; nothing but the
 pool allocates or releases an extent. An extent whose last page is free stays
 allocated until a reclaim releases it, at once and only between commands: memory
 pressure, an admission the budget denies, the publication of a replay point in
@@ -2886,9 +3061,9 @@ queue's residency set makes extents resident for every command buffer. The host 
 returns free pages before it evicts anything: an empty extent as it is, and the
 free pages scattered over the others of its form as soon as they cover the
 extent of that form that holds the fewest pages, whose pages the pool copies to
-them (`KvPool::compactExtent`): a Full extent before an Index one, unless the
-reclaim needs the memory of one form, as a shortfall of Index pages needs Full
-memory.
+them (`KvPool::compactExtent`): a Full extent before a Slim one and a Slim one
+before an Index one, unless the reclaim needs the memory of one form, as a
+shortfall of Index pages needs Full memory.
 The blocks and requests on those pages follow them, a page a disk transfer reads
 or writes stays where it is, and a pass that evicts everything copies only what
 is left afterwards. Every extent a pass empties is released, except that a
@@ -3131,7 +3306,77 @@ GDN layer's dispatches stop there to store the state and go on from it, and
 the state's window is a copy of the lane's as the chunk finds it plus the
 chunk's rows before the boundary, since the chunk's later rows take the slots
 of the state's oldest rows in the lane's window. A state at the chunk's end is
-copied from the lane after it.
+copied from the lane after it. A target without GDN layers keeps no GDN state:
+its cells have no bytes, every lane and state shares one empty cell that holds
+no memory, so a lane holds the draft's rings and window and a cached state the
+window alone, and `state.idle_gdn_cells` stays 0.
+
+### Sliding windows
+
+A target whose layers include sliding-window ones (`kv::Layout::windowTokens`,
+over the layers `windowedLayers` names) pages every layer, and a row of a
+windowed layer reads only the `windowTokens` keys before its own. Once every
+row that will run has passed a page by a window, its windowed layers' K/V is
+read no more, and the page gives it up for the Slim form, which keeps the
+layers no window bounds (`kv::PageForm::Slim`): for Flint 14 of 49 layers, 462
+KiB of a page's 1.58 MiB in int8. A cached state needs its tail, the
+`windowPages` blocks that end at its block (`Layout::windowPages`, 16 for a
+512-token window), Full, since a request resuming there reads them whole: so a
+cached prefix restores at a state as ever (`Cache::restoreRequest`), and states
+closer than a window share the pages of their tails. The cache keeps it so
+(`CacheWindowPolicy`):
+
+- Between commands, before any lane grows, `Cache::trimWindows` moves to the
+  Slim form every Full page that every request holding it has published
+  `windowPages` blocks past (its next command's rows, at or past its published
+  blocks, read no key on it), that no state's tail holds and that no transfer
+  moves, the cached pages no request holds and the pages requests keep beside
+  their blocks among them. The Slim runway's free pages take them first,
+  then extents memory allows: while a request is in service, memory it
+  needs, as its KV is, so the host's pause does not hold them back and a long
+  prompt's passed pages trim as it prefills. A refusal leaves pages Full for
+  the next pass: memory, never correctness. A multi-pass prefill publishes
+  only once its last pass ends, so its rows' windows stay Full between
+  passes.
+- Every state, in RAM or on the SSD, pins its tail (`KvCache::countState`, a
+  bounded walk beside the counts of the states below); only its removal
+  unpins the tail, which the next pass trims: a state written to the SSD
+  keeps its entry and its tail Full, on a request's own chain too, where the
+  plan's floor (`kvWindowFloorPages`) does not count it.
+- A writer that computes a block again keeps its own page, which the block
+  takes once no transfer moves the block's (`KvCache::insert`,
+  `kv.window.upgrades`), rather than moving onto the block's page as a
+  writer of another layout does: its window reads the page whole, which a
+  Slim page no longer is, and were it to move onto a Full one, what it reads
+  would depend on whether trimming had taken the block's windowed layers.
+  Requests that hold the old page keep it, as a page of their own the next
+  passes trim once their windows have passed it. A copy of a Slim page goes,
+  there and where a disk-only block takes a writer's page: a block's copy
+  holds at least what its page holds, should the page leave.
+- A state is published only on a Full tail (`Cache::stateTailFull`), which a
+  command leaves where it computed or held the tail in its window; the engine
+  counts one it refuses as a failed publication. A start takes back a
+  persistent restore point only with Full copies of its tail.
+- Each cut of a request's page table checks that every page from the window
+  before its published blocks on is Full, always (`Cache::cutPageTable`).
+- A KV slot holds what its page holds when it is written, and its record
+  names the form (`KvSlotLabel`); a restore allocates that form. A restore
+  point persists its tail Full, as RAM holds it.
+
+So no byte a kernel reads changes: a run with trimming off
+(`--kv-window-trim off`, the native argument validation passes) emits the
+same tokens and logits wherever memory lets it cache what a run with
+trimming on caches, only taking the memory of Full pages. The memory plan
+counts on trimming, with it off too, so a validation run keeps within what
+Full pages hold: one request's KV capacity is the Full pages its lane keeps,
+its window's, the pages a command writes (a chunk, or a group of four where
+the routed experts stream) and one more, and Slim pages past them
+(`kvWindowFloorPages`), and the pool's page ids cover the Slim pages the hard
+budget could hold. A Full shortfall takes trims first, then states, a
+checkpoint first, each followed by a trim of the tail it unpinned, while those
+trims free pages (a state the SSD cache keeps unpins none, which ends the
+step), before any KV leaf goes (`Cache::reclaimForPages`); empty Slim extents
+beyond the runway go for the retry to grow by.
 
 ### Disk tier
 
@@ -3236,10 +3481,14 @@ chain whose newest blocks have no copy, as a finished request's prompt past the
 chain it restored, so leaves RAM one write at a time, and an allocation refused
 meanwhile waits for each write. Unneeded
 tails are dropped without writing, before any state, together with any disk
-copies below them. Writes run on their file's IO worker. A KV page is restored
-by the engine's SSD readers (`SsdReaders`), which
-read what the page's form holds, its index alone or the whole page, with one
-aligned read into memory of their own, and scatter it into the page; the
+copies below them. Writes run on their file's IO worker. A KV page's slot
+holds what the page holds as it is written: a Slim page's is the first part
+of a Full page's payload, its regions in their order, and the block keeps the
+form of its copy (`KvCache::copyForm`), which a restore of the block allocates
+its page in. A KV page is restored by the engine's SSD readers (`SsdReaders`),
+which read what the page's form holds, its index alone, a Slim page's payload
+or the whole page, with one aligned read into memory of their own, and scatter
+it into the page; the
 restores asked for between two submissions (`KvTier::submitRestores`) go out
 together, index restores on every reader and whole ones on at most
 `KvPageTier::kWholeRestoreReaders`. A state is restored on its file's worker.
@@ -3320,7 +3569,9 @@ one of each segment: the page's index, then each block's record. A state that
 fails it on its first read is a miss. Every read of a KV copy a restart took
 back checks the segments it covers: a whole or index restore that fails is a
 miss, and a block or history read that fails is `kv_unreadable` for the
-requests that read it.
+requests that read it. A KV record of a layout with a sliding window also names
+the form of the page its slot holds (`KvSlotLabel`), and a start takes back
+only the forms it restores.
 
 `/status` reports the shared quota, its limit, the write budget and KV
 transfers under `disk`. Its cumulative `read_bytes` and `written_bytes` count
@@ -3454,7 +3705,7 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | --- | --- |
 | `verify-models` | the installer's restarts without the Hub, `verify --full`, and the record of the weight images (`dev/tools/installer_restarts.py`, `weight-digests` with `WEIGHT_DIGESTS_ARGS` added, such as `WEIGHT_DIGESTS_ARGS="--expert-memory 7G --ple-memory 2G"` to stream the routed experts and the PLE table, [Release check](#release-check)) |
 | `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle, each of its three runs with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"`, `"--expert-memory 16G"` or `"--max-context 1010000"`); for a block-sparse target their spill checks take the default prompts, two staging buffers, and 32K tokens with the default window |
-| `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`), whose greedy comparisons (a penalized greedy request repeats once its prompt is cached, `min_p` 1 answers as greedy) run where `/status` reports `verify_rows` `all`, which on any MoE target takes `HTTP_SMOKE_ARGS="--verify-rows all"`; with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
+| `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`), whose greedy comparisons (a penalized greedy request repeats once its prompt is cached, `min_p` 1 answers as greedy) run where `/status` reports `verify_rows` `all`, which on any MoE target takes `HTTP_SMOKE_ARGS="--verify-rows all"`; where `/status` reports `reasoning_switch` `false` (Flint), it gives each request whose answer it checks room for the model's reasoning and leaves out the thinking budget's check; with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
 | `test-performance-real` | the native decode, partial-prefix and short-prompt benchmark, or with `BASELINE` its ABBA comparison with that build, in which both builds' `weight-digests` take `WEIGHT_DIGESTS_ARGS` (`dev/benchmarks/backend_regression.py`) |
@@ -3613,7 +3864,12 @@ that model alone once the Mac has cooled.
 
 `.venv/bin/python dev/tools/kernel_identity.py BASELINE/build build` compares
 the AIR of each kernel the decode path may run in the two builds'
-`splash.metallib` (`--match` for others) and fails if any differs.
+`splash.metallib` (`--match` for others) and fails if any differs. The helpers
+a kernel's module defines are compared in the order they appear there, not by
+name: C++ names them for their template values, which a kernel template that
+gains a value renames without changing their code. So are the numbers of its
+lambdas' anonymous classes and its classes' names in the alias metadata, which
+the same change renames.
 
 Two pairs of constants in `runtime/engine/Protocol.hpp` and `server/protocol.py`
 version what the server and the engine exchange. When the native wire layout
@@ -3679,7 +3935,13 @@ window, the fp32 logits of the prefill's final position and of ROWS decode
 positions after it, each computed by a verify row forced to the true next
 token, in `OUTPUT-END.f32`, and prints how well they predict the true ids. It
 also takes `--kv-format`, `--state-format`, `--expert-memory` and
-`--ple-memory`.
+`--ple-memory`, and, with `--captures yes`, writes the output rows of the
+target layers the model's draft reads (its `target_layer_ids`) at the
+positions a window's prefill computed, in one command, to
+`OUTPUT-END.captures.f32` (fp32, a row per position of each layer's hidden
+values in the draft's layer order), which a reference's residuals after those
+layers compare with: a draft of the layers to compare, such as a test draft
+whose `fc` reads them, makes them its captures.
 
 `benchmark-backend` lists the contexts the memory plan cannot hold in its
 report. Its cache checks reuse each context's cached prefix, so they need that

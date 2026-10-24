@@ -158,12 +158,14 @@ void testPitchRule() {
 }
 
 // A layout without block records, an index or token-major values, keeps its
-// spans' order as one segment, has no records, and a whole restore puts the
-// payload back in that order.
+// spans' order as one segment, a windowed layout's region by region
+// (kv::Layout::region), has no records, and a whole restore puts the payload
+// back in that order.
 void testUnspillableLayouts() {
   for (const kv::Layout &layout : {kv::Layout{16, 4, 256}, kv::Layout{10, 2, 256, kv::Format::BFloat16},
                                    kv::Layout{12, 2, 256, kv::Format::Int8, 128, false},
-                                   kv::Layout{12, 2, 256, kv::Format::Int8, 0, true}}) {
+                                   kv::Layout{12, 2, 256, kv::Format::Int8, 0, true},
+                                   kv::Layout{6, 4, 128, kv::Format::Int8, 0, false, 512, 0b011010}}) {
     const SlotFormat format(layout);
     require(format.version() == 0 && format.payloadBytes() == layout.bytesPerModelPage() &&
                 format.segments() == std::vector<uint64_t>{layout.bytesPerModelPage()},
@@ -188,6 +190,38 @@ void testUnspillableLayouts() {
   }
   rejects([] { static_cast<void>(SlotFormat(kv::Layout{})); }, "layout is invalid",
           "an invalid layout has a slot format");
+}
+
+// A Slim page of a windowed layout, which holds the regions of the layers
+// no window bounds (kv::Layout::regions), stores those spans in order: the
+// first bytes of a Full page's payload, which a Slim page restores into as
+// a Full page restores, leaving the rest of its memory alone. A spillable
+// layout's records hold Full pages alone.
+void testSlimPayloads() {
+  for (const kv::Layout &layout : {kv::Layout{6, 4, 128, kv::Format::Int8, 0, false, 512, 0b011010},
+                                   kv::Layout{6, 4, 128, kv::Format::BFloat16, 0, false, 512, 0b111000}}) {
+    const SlotFormat format(layout);
+    const uint64_t slim = layout.bytesPerModelPage(kv::PageForm::Slim);
+    require(layout.slimmable() && format.payloadBytes(kv::PageForm::Slim) == slim &&
+                slim == 3 * layout.bytesPerLayerPage() && format.payloadBytes() == layout.bytesPerModelPage(),
+            "a Slim page's payload is not the regions of its layers no window bounds");
+    test::HostKvPages pages(layout, 2);
+    pages.fill(0, 11);
+    const std::vector<std::byte> full = gather(format, pages, 0);
+    pages.setForm(0, kv::PageForm::Slim);
+    const std::vector<std::byte> payload = gather(format, pages, 0);
+    require(payload.size() == slim && std::ranges::equal(payload, std::span(full).first(slim)),
+            "a Slim page's payload is not the first bytes of its Full payload");
+    pages.setForm(1, kv::PageForm::Slim);
+    format.scatterPage(payload, pages, 1);
+    require(std::ranges::equal(pages.page(1).first(slim), pages.page(0).first(slim)) &&
+                zero(pages.page(1).subspan(slim)),
+            "a Slim restore did not put its regions back, or wrote past them");
+    rejects([&] { format.scatterPage(full, pages, 1); }, "another size", "a Full payload was restored as Slim");
+  }
+  const SlotFormat records(kFlashNext);
+  rejects([&] { static_cast<void>(records.payloadBytes(kv::PageForm::Slim)); }, "holds a Full page",
+          "a slot of block records held a Slim page");
 }
 
 // A write stores the page's bytes as the format says, zeros in between: its
@@ -296,6 +330,7 @@ int main() {
     testFlashNextSlots();
     testPitchRule();
     testUnspillableLayouts();
+    testSlimPayloads();
     testTransfersAndScatters();
     testRejections();
   } catch (const std::exception &error) {

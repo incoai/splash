@@ -23,29 +23,31 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   put(PrefillTensor::Captured,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
                          geometry.target.capturedHiddenSize()));
+  // The GDN layers' scratch, which a target without them has none of.
+  const uint64_t gdnRows = geometry.target.stateLayout.layers ? kPrefillRows : 0;
   put(PrefillTensor::GdnPacked,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} *
+      bytesFor<uint16_t>(gdnRows *
                          geometry.target.packedGdnWidth));
   put(PrefillTensor::GdnQueries,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} *
+      bytesFor<uint16_t>(gdnRows *
                          geometry.target.gdnKeyWidth()));
   put(PrefillTensor::GdnKeys,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} *
+      bytesFor<uint16_t>(gdnRows *
                          geometry.target.gdnKeyWidth()));
   put(PrefillTensor::GdnValues,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} *
+      bytesFor<uint16_t>(gdnRows *
                          geometry.target.attentionWidth));
   put(PrefillTensor::GdnDecay,
-      bytesFor<float>(uint64_t{kPrefillRows} *
+      bytesFor<float>(gdnRows *
                       geometry.target.gdnValueHeads));
   put(PrefillTensor::GdnBeta,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} *
+      bytesFor<uint16_t>(gdnRows *
                          geometry.target.gdnValueHeads));
   put(PrefillTensor::Recurrent,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} *
+      bytesFor<uint16_t>(gdnRows *
                          geometry.target.attentionWidth));
   put(PrefillTensor::GdnHidden,
-      bytesFor<uint16_t>(uint64_t{kPrefillRows} *
+      bytesFor<uint16_t>(gdnRows *
                          geometry.target.attentionWidth));
   put(PrefillTensor::GateIntermediate,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
@@ -74,9 +76,11 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{kPrefillRows} *
                          geometry.target.attentionWidth));
   // The rows a mixer adds its output to, which the FFN adds to.
-  if (geometry.target.mixersAddToHidden())
-    for (const PrefillTensor tensor : {PrefillTensor::GdnOutput, PrefillTensor::AttentionOutput})
-      put(tensor, bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
+  if (geometry.target.mixersAddToHidden()) {
+    put(PrefillTensor::GdnOutput, bytesFor<uint16_t>(gdnRows * geometry.target.hiddenSize));
+    put(PrefillTensor::AttentionOutput,
+        bytesFor<uint16_t>(uint64_t{kPrefillRows} * geometry.target.hiddenSize));
+  }
   // Three rotary axes per row (Qwen3.5 M-RoPE); text rows repeat one value.
   put(PrefillTensor::TargetPositions,
       bytesFor<uint32_t>(uint64_t{kPrefillRows} * 3));
@@ -183,6 +187,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
     size = std::max(size, bytes);
   };
   const uint64_t r = kDecodeRows;
+  // As in prefill, no GDN scratch without GDN layers.
+  const uint64_t gdnRows = geometry.target.stateLayout.layers ? r : 0;
   put(DecodeTensor::Hidden0,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::Hidden1,
@@ -191,9 +197,9 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::Normalized,
       bytesFor<uint16_t>(r * geometry.target.hiddenSize));
   put(DecodeTensor::GdnHidden,
-      bytesFor<uint16_t>(r * geometry.target.attentionWidth));
+      bytesFor<uint16_t>(gdnRows * geometry.target.attentionWidth));
   put(DecodeTensor::GdnOutput,
-      bytesFor<uint16_t>(r * geometry.target.hiddenSize));
+      bytesFor<uint16_t>(gdnRows * geometry.target.hiddenSize));
   put(DecodeTensor::Intermediate,
       bytesFor<uint16_t>(r * geometry.target.intermediateSize));
   put(DecodeTensor::FullPacked,

@@ -35,6 +35,19 @@ minimumRequiredBytes(uint64_t fixedBytes, uint64_t laneStateBytes,
 // whole extents of the size a pool of them takes (kv::Layout::extentPagesFor).
 [[nodiscard]] uint64_t kvCapacityPagesFor(const kv::Layout &layout, uint64_t pages) noexcept;
 
+// The pages a lane of a layout whose pages give up a window's layers
+// (kv::Layout::slimmable) keeps Full at the most: its window's, the pages
+// its command's rows write (`commandPages`, zero for a prefill chunk's) and
+// one more, where its window starts inside a page. Zero for another layout,
+// whose pages are all Full.
+[[nodiscard]] uint32_t kvWindowFloorPages(const kv::Layout &layout, uint32_t commandPages) noexcept;
+// The bytes of one request's `pages` KV pages: Full ones, but for a layout
+// whose pages give up a window's layers, Slim ones beyond the `floorPages`
+// its lane keeps Full (kvWindowFloorPages). kvPagesWithin is the inverse:
+// the pages `bytes` hold.
+[[nodiscard]] uint64_t kvPagesBytes(const kv::Layout &layout, uint64_t pages, uint32_t floorPages) noexcept;
+[[nodiscard]] uint64_t kvPagesWithin(const kv::Layout &layout, uint64_t bytes, uint32_t floorPages) noexcept;
+
 // How a part of the weights that can stream from the SSD is held
 // (--expert-memory, --ple-memory): as the planner decides (Auto), loaded
 // whole (Off), or streamed through a store of `bytes` (Size), which loads
@@ -127,6 +140,10 @@ struct ModelMemoryProfile final {
   ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
   // A spill-capable target's (planStreamedMemory); disabled for others.
   KvSpillPlan spill{};
+  // The pages one lane's prefill command writes at most: a group's where
+  // its routed experts stream (model::kPrefillGroupChunks chunks), zero for
+  // a chunk's. A windowed layout's lane keeps them Full (kvWindowFloorPages).
+  uint32_t commandPages = 0;
 
   [[nodiscard]] std::optional<std::string> validationError() const;
   [[nodiscard]] uint64_t fixedRuntimeBytes() const;
@@ -324,6 +341,14 @@ struct EngineMemoryBreakdown {
   uint64_t kvCapacityTokens = 0;
   // An Index page's bytes (kv::PageForm::Index): its blocks' index alone.
   uint64_t kvIndexPageBytes = 0;
+  // A Slim page's bytes and the Full pages a lane keeps beside them
+  // (kvWindowFloorPages), of a layout whose pages give up a window's layers
+  // past every window; zero for another layout. One request's capacity is
+  // then those Full pages and as many Slim ones as the rest holds. The tails
+  // of states the SSD keeps on a request's chain stay Full beside these and
+  // are not counted.
+  uint64_t kvSlimPageBytes = 0;
+  uint32_t kvWindowFloorPages = 0;
   // A spill-capable target's plan, and what the dynamic budget leaves the
   // requests' pages beside one lane's state, its readers and its runway
   // (SpillGeometry::residentKvBytes).

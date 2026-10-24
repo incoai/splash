@@ -651,6 +651,48 @@ void testCompactionEmptiesAnExtentOfTheFormAskedFor() {
             "a compaction for either form did not empty a Full extent before an Index one");
 }
 
+// A windowed layout's pool has a third form, Slim pages of 30 bytes: a page
+// moves to it with its content and references, the cache's too, and back;
+// its extents keep their own runway, compact among themselves after the
+// Full ones and count apart in the snapshot.
+void testSlimPagesAreAThirdForm() {
+    constexpr uint64_t slimExtentBytes = 4 * 30;
+    TestKvStorage storage(24, 100, 4, 0, 30);
+    for (uint32_t page = 0; page < storage.pageCount(); ++page)
+        storage.content[page] = 100 + page;
+    KvPool pool(storage, 4);
+    auto held = pool.acquirePages(3);
+    require(held.granted() && pool.fillRunway(PageForm::Slim) && pool.freePageCount(PageForm::Slim) == 4,
+            "Slim setup failed");
+    // Page 1 belongs to the cache alone, page 2 to its requester.
+    pool.retainPage(1, true);
+    pool.releasePage(1, false);
+    const auto trimmed = pool.movePages(std::vector<uint32_t>{2, 1}, PageForm::Slim);
+    require(trimmed.granted() && trimmed.moves.moved == std::vector<PageCopy>{{1, 4}, {2, 5}} &&
+                pool.form(4) == PageForm::Slim && storage.content[4] == 101 && storage.content[5] == 102,
+            "pages did not move to the Slim runway with their content");
+    const auto status = pool.snapshot();
+    require(status.slim.pagesActive == 1 && status.slim.pagesPrefix == 1 && status.slim.pagesFree == 2 &&
+                status.pagesAllocated == 8 && status.allocatedBytes == extentBytes + slimExtentBytes &&
+                status.index.pagesAllocated == 0 && pool.freePageCount() == 3 && !pool.pageActive(2),
+            "the snapshot did not count the Slim pages apart, or the pages they left were not freed");
+    // Slim extent 1 keeps pages 4, 5 and 7, Slim extent 2 page 8, which a
+    // compaction of any form moves to extent 1 once no Full extent can go.
+    auto more = pool.acquirePages(3, PageForm::Slim);
+    require(more.granted() && more.pages == std::vector<uint32_t>{6, 7, 8}, "Slim pages did not fill their extents");
+    pool.releasePage(6, false);
+    const auto compacted = pool.compactExtent({});
+    require(compacted.moved == std::vector<PageCopy>{{8, 6}} && storage.content[6] == 108 &&
+                pool.form(6) == PageForm::Slim && pool.reclaimEmptyExtents(true, 8) == 0 &&
+                reclaimEvery(pool, false) == slimExtentBytes,
+            "a Slim extent was not compacted into another, or not kept as the Slim runway");
+    const auto restored = pool.movePages(std::vector<uint32_t>{4}, PageForm::Full);
+    const uint32_t back = restored.moves.follow(4);
+    require(restored.granted() && pool.form(back) == PageForm::Full && storage.content[back] == 101 &&
+                pool.snapshot().slim.pagesPrefix == 0 && pool.snapshot().pagesPrefix == 1,
+            "a Slim page did not move back to a Full page with the cache's reference");
+}
+
 }  // namespace
 
 int main() {
@@ -679,6 +721,7 @@ int main() {
         testSpillAtTheWallGoesThroughTheIndexRunway();
         testCompactionStaysWithinAForm();
         testCompactionEmptiesAnExtentOfTheFormAskedFor();
+        testSlimPagesAreAThirdForm();
         std::cout << "elastic KV pool tests passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception &error) {
