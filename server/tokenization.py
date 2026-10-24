@@ -21,25 +21,27 @@ def tokenizable(text):
 
 
 class PromptTokenizer:
-    MARKER = "<|im_end|>"
+    """Encodes prompts reusing a cached prompt's tokens up to its last
+    `marker`, the chat template's special token at a message boundary
+    (ChatFormat.message_boundary), where the tokenizer splits its input."""
+
     MIN_PREFIX_CHARS = 4096
     BUDGET_BYTES = 8 * 1024 * 1024
     CAPACITY = 4
 
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, marker):
         self.tokenizer = tokenizer
-        self.enabled = self._supports_boundaries(tokenizer)
+        self.marker = marker
+        self.enabled = self._supports_boundaries(tokenizer, marker)
         self.marker_id = (
-            tokenizer.backend_tokenizer.token_to_id(self.MARKER)
-            if self.enabled
-            else None
+            tokenizer.backend_tokenizer.token_to_id(marker) if self.enabled else None
         )
         self.entries = LRUCache(self.BUDGET_BYTES, self.CAPACITY)
         self.hits = self.reused_tokens = 0
         self.lock = threading.Lock()
 
-    @classmethod
-    def _supports_boundaries(cls, tokenizer):
+    @staticmethod
+    def _supports_boundaries(tokenizer, marker):
         backend = getattr(tokenizer, "backend_tokenizer", None)
         if not getattr(tokenizer, "is_fast", False) or backend is None:
             return False
@@ -51,12 +53,13 @@ class PromptTokenizer:
             return False
         pre = json.loads(backend.pre_tokenizer.__getstate__())
         parts = pre["pretokenizers"] if pre.get("type") == "Sequence" else [pre]
-        if [part.get("type") for part in parts] not in (
-            ["ByteLevel"],
-            ["Split", "ByteLevel"],
-        ) or parts[-1].get("add_prefix_space"):
-            # For example, Metaspace's prepend_scheme="first" depends on
-            # whether a segment starts the complete input, not just a split.
+        # Regex splits, Qwen's one or Flint's three, then byte-level BPE: each
+        # split reads a segment on its own. Another pre-tokenizer may not:
+        # for example, Metaspace's prepend_scheme="first" depends on whether
+        # a segment starts the complete input, not just a split.
+        if [part.get("type") for part in parts] != ["Split"] * (len(parts) - 1) + [
+            "ByteLevel"
+        ] or parts[-1].get("add_prefix_space"):
             return False
         for component, allowed in (
             (backend.normalizer, {"NFC"}),
@@ -69,9 +72,9 @@ class PromptTokenizer:
                 return False
         markers = []
         for token in backend.get_added_tokens_decoder().values():
-            if cls.MARKER not in token.content:
+            if marker not in token.content:
                 continue
-            if token.content != cls.MARKER:
+            if token.content != marker:
                 return False
             markers.append(token)
         return len(markers) == 1 and not any(
@@ -87,10 +90,10 @@ class PromptTokenizer:
         return self.tokenizer(tokenizable(text), add_special_tokens=False)["input_ids"]
 
     def encode(self, text):
-        boundary = text.rfind(self.MARKER)
+        boundary = text.rfind(self.marker)
         if not self.enabled or boundary < 0:
             return self._encode(text)
-        boundary += len(self.MARKER)
+        boundary += len(self.marker)
         if boundary < self.MIN_PREFIX_CHARS:
             return self._encode(text)
         prefix = text[:boundary]
@@ -122,12 +125,12 @@ class PromptTokenizer:
         return tokens + self._encode(text[boundary:])
 
     def split(self, text):
-        """`text` cut just past its last MARKER where the tokenizer splits it
+        """`text` cut just past its last marker where the tokenizer splits it
         there: the tokens before the cut, and the text after it, which
         encodes on its own. No tokens and all of `text` where it does not."""
-        boundary = text.rfind(self.MARKER)
+        boundary = text.rfind(self.marker)
         if self.enabled and boundary >= 0:
-            boundary += len(self.MARKER)
+            boundary += len(self.marker)
             head = self._encode(text[:boundary])
             # As in encode, another added token may consume part of the
             # marker, which is then no boundary.

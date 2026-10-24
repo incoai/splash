@@ -8,6 +8,7 @@ from unittest import mock
 from dev.tests.server_fixtures import grammar_tokenizers
 from server import constraints
 from server import server as api
+from server.chat_format import QWEN
 
 
 class ConstraintCacheTests(unittest.TestCase):
@@ -26,9 +27,7 @@ class ConstraintCacheTests(unittest.TestCase):
             def deep_copy(self):
                 return self.grammar
 
-        constraint = mock.Mock(side_effect=lambda matcher, executor: matcher)
-        constraint.VOCABULARY = constraints.TokenConstraint.VOCABULARY
-        constraint.EOS_TOKENS = constraints.TokenConstraint.EOS_TOKENS
+        constraint = mock.Mock(side_effect=lambda matcher, _executor, _format: matcher)
         for target, replacement in (
             ("guidance_tokenizer", lambda *args, **kwargs: None),
             ("LLMatcher", Matcher),
@@ -41,7 +40,7 @@ class ConstraintCacheTests(unittest.TestCase):
                 constraints.ConstraintFactory, "CACHE_SOURCE_BYTES", budget
             )
         )
-        return constraints.ConstraintFactory(object())
+        return constraints.ConstraintFactory(object(), QWEN)
 
     def test_byte_budget_evicts_lru_and_counts_utf8(self):
         factory = self.factory()
@@ -172,7 +171,7 @@ class ConstraintCacheTests(unittest.TestCase):
             "guidance_tokenizer",
             return_value=guidance,
         ):
-            factory = constraints.ConstraintFactory(object())
+            factory = constraints.ConstraintFactory(object(), QWEN)
         unsatisfiable = {"type": "array", "minItems": 5, "maxItems": 2}
         # More grammar symbols than the compiler can index make it panic.
         array = {"type": "array", "maxItems": tool_schema.MAX_GRAMMAR_BOUND}
@@ -185,7 +184,9 @@ class ConstraintCacheTests(unittest.TestCase):
                 self.subTest(reason=reason),
                 self.assertRaises(constraints.APIError) as caught,
             ):
-                factory.create(tool_schema.json_grammar(schema, False))
+                factory.create(
+                    tool_schema.json_grammar(schema, False, chat_format=QWEN)
+                )
             self.assertEqual(caught.exception.status, 400)
             self.assertIn(reason, caught.exception.message)
             self.assertNotIn("\n", caught.exception.message)
@@ -198,7 +199,7 @@ class ConstraintCacheTests(unittest.TestCase):
             "guidance_tokenizer",
             return_value=guidance,
         ):
-            factory = constraints.ConstraintFactory(object())
+            factory = constraints.ConstraintFactory(object(), QWEN)
         barrier = threading.Barrier(8)
 
         def generate(index):
@@ -253,10 +254,10 @@ class ConstraintCacheTests(unittest.TestCase):
             mock.patch("server.constraints.LLExecutor", return_value="executor"),
             mock.patch(
                 "server.constraints.TokenConstraint",
-                side_effect=lambda matcher, executor: (matcher, executor),
+                side_effect=lambda matcher, executor, _format: (matcher, executor),
             ),
         ):
-            factory = constraints.ConstraintFactory(object())
+            factory = constraints.ConstraintFactory(object(), QWEN)
             first = factory.create("one")
             second = factory.create("one")
             factory.create("two")
@@ -303,10 +304,10 @@ class ConstraintCacheTests(unittest.TestCase):
             mock.patch("server.constraints.LLExecutor", return_value=object()),
             mock.patch(
                 "server.constraints.TokenConstraint",
-                side_effect=lambda matcher, _: matcher,
+                side_effect=lambda matcher, _executor, _format: matcher,
             ),
         ):
-            factory = constraints.ConstraintFactory(object())
+            factory = constraints.ConstraintFactory(object(), QWEN)
             with ThreadPoolExecutor(max_workers=4) as executor:
                 results = list(executor.map(factory.create, ["shared"] * 4))
 
@@ -344,10 +345,10 @@ class ConstraintCacheTests(unittest.TestCase):
             mock.patch("server.constraints.LLExecutor", return_value=object()),
             mock.patch(
                 "server.constraints.TokenConstraint",
-                side_effect=lambda matcher, _: matcher,
+                side_effect=lambda matcher, _executor, _format: matcher,
             ),
         ):
-            factory = constraints.ConstraintFactory(object())
+            factory = constraints.ConstraintFactory(object(), QWEN)
             for _ in range(2):
                 with self.assertRaisesRegex(api.APIError, "^too wide$") as caught:
                     factory.create("wide", prefixes=lambda: prefixes(([9], "too wide")))

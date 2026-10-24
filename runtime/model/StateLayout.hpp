@@ -6,6 +6,8 @@
 #include "metal/abi/GDN.h"
 #include "ops/GDN.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 
 namespace splash::model {
@@ -16,7 +18,9 @@ inline constexpr uint32_t kGdnConvolutionTaps = SPLASH_GDN_CONVOLUTION_TAPS;
 
 // Physical state geometry is supplied by the paired target and draft models,
 // and the recurrent state's format by the runtime (--state-format). The
-// engine sees only opaque CompositeState handles and byte accounting.
+// engine sees only opaque CompositeState handles and byte accounting. A
+// target without GDN layers keeps only its auxiliary state in a cell, if it
+// has one: its cells may hold nothing.
 struct GdnStateLayout final {
   static constexpr uint32_t bfloat16Bytes = 2;
 
@@ -31,10 +35,13 @@ struct GdnStateLayout final {
   // convolution history), after them in the cell.
   uint64_t auxiliaryBytes = 0;
 
+  // Every GDN dimension is set with GDN layers and zero without.
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return layers && convolutionHistory && convolutionChannels &&
-           recurrentGroups && recurrentRows && recurrentColumns &&
-           ops::validFormat(format);
+    const std::array dimensions{convolutionHistory, convolutionChannels,
+                                recurrentGroups, recurrentRows,
+                                recurrentColumns};
+    const auto set = [&](uint32_t dimension) { return !dimension == !layers; };
+    return std::ranges::all_of(dimensions, set) && ops::validFormat(format);
   }
   [[nodiscard]] constexpr uint64_t convolutionLayerBytes() const noexcept {
     return alignUp(uint64_t{convolutionHistory} * convolutionChannels *
@@ -95,7 +102,8 @@ struct DraftStateLayout final {
 
 // A lane holds two GDN cells, its draft rings and their context window; a
 // cached state one GDN cell and the window, from which a restore that needs
-// the rings computes them again.
+// the rings computes them again. A cell of no bytes takes no memory
+// (QwenGdnCell).
 struct CompositeStateLayout final {
   static constexpr uint32_t kLaneGdnCells = 2;
 

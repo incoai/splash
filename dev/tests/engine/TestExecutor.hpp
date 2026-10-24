@@ -690,8 +690,12 @@ public:
   }
   // With `kv`, a step names pages of allocated extents only and finds every
   // prompt block before `position` through the page table the engine handed
-  // it.
-  void requireRows(const ModelBatchItem &item, uint64_t position) const {
+  // it. With a window of windowPages pages too, every page from the window
+  // before `position` on holds every layer's K/V (kv::PageForm::Full), as
+  // the step's windowed layers read them whole, and windowDigest folds in
+  // the step and the marks of those pages that prefill wrote, which
+  // trimming must leave as they are.
+  void requireRows(const ModelBatchItem &item, uint64_t position) {
     if (!kv)
       return;
     for (uint32_t page : item.pageTable)
@@ -704,6 +708,21 @@ public:
       if (kv->content.at(item.pageTable[block]) !=
           rows(block, prompt[block * engine::KvCache::pageTokens]))
         throw std::logic_error("a page does not hold its block's rows");
+    }
+    if (!windowPages)
+      return;
+    const auto fold = [&](uint64_t value) { windowDigest = (windowDigest ^ value) * 0x100000001b3ULL; };
+    fold(item.requestId);
+    fold(position);
+    fold(item.tokenCount);
+    const uint64_t first = position / engine::KvCache::pageTokens;
+    const uint64_t marked = (std::min<uint64_t>(position, prompt.size()) + engine::KvCache::pageTokens - 1) /
+                            engine::KvCache::pageTokens;
+    for (uint64_t page = first - std::min<uint64_t>(first, windowPages); page < item.pageTable.size(); ++page) {
+      if (kv->form(item.pageTable[page]) != kv::PageForm::Full)
+        throw std::logic_error("a page a step's window reads does not hold every layer");
+      if (page < marked)
+        fold(kv->content.at(item.pageTable[page]));
     }
   }
 
@@ -733,6 +752,10 @@ public:
   // page of every block it starts, as the production model writes its rows
   // there, and each later step requires the marks of the blocks before it.
   TestKvStorage *kv = nullptr;
+  // A windowed target's window, in pages, and the digest of what each step
+  // read in its windows (requireRows).
+  uint32_t windowPages = 0;
+  uint64_t windowDigest = 0xcbf29ce484222325ULL;
   std::unordered_map<uint64_t, std::vector<uint32_t>> prompts;
   std::unordered_map<uint64_t, DraftContextPlan> plans;
   std::shared_ptr<RestoreControl> restoreControl = std::make_shared<RestoreControl>();

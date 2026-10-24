@@ -111,17 +111,19 @@ TokenAdmission admitTokens(engine::Cache &cache, uint64_t requestId, uint64_t to
 
 // One process's cache over eight pages, with a KV tier and a shelf for
 // state copies, persistent or not, and requests that may spill with a spill
-// policy (their Index pages beside the eight).
+// policy (their Index pages beside the eight), or of a windowed KV layout
+// with a window policy (its Slim pages of 30 bytes).
 struct Process final {
-  test::TestKvStorage storage{16, 100, 1, 10};
+  test::TestKvStorage storage{16, 100, 1, 10, 30};
   KvPool pool{storage, 8};
   test::TestKvTier tier;
   std::shared_ptr<Shelf> shelf = std::make_shared<Shelf>();
   engine::Cache cache;
 
   explicit Process(bool persistent, std::shared_ptr<model::DiskBudget> budget = nullptr,
-                   std::optional<CacheSpillPolicy> spill = std::nullopt)
-      : tier(persistent), cache(pool, &tier, std::move(budget), spill) {
+                   std::optional<CacheSpillPolicy> spill = std::nullopt,
+                   std::optional<CacheWindowPolicy> window = std::nullopt)
+      : tier(persistent), cache(pool, &tier, std::move(budget), spill, window) {
     storage.budgetPages = 8;
     tier.capacity = 16;
     tier.transferLimit = 8;
@@ -218,6 +220,159 @@ void testCopiesAreLabelled() {
     require(state && state->block == blocks[3] && state->tokens == 128 && !state->checkpoint &&
                 state->lastUsed,
             "the state label did not name its block, boundary and class");
+  }
+}
+
+// A windowed layout's KV labels name the form of the page their slot holds
+// after the block's label (KvSlotLabel): Full, as the tier takes pages. The
+// next process takes back such copies, and drops one of a form it does not
+// know, a later build's, with the restore point whose chain it breaks.
+void testWindowedCopiesNameTheirForm() {
+  const std::vector<uint32_t> prompt = promptOf(1000, 4);
+  constexpr CacheWindowPolicy window{2};
+  Process earlier(true, nullptr, std::nullopt, window);
+  const std::vector<uint64_t> blocks = earlier.cachePrompt(1, prompt);
+  earlier.publish(blocks[1]);
+  earlier.publish(blocks[3]);
+  earlier.writeEverything();
+  std::vector<std::vector<std::byte>> copies = earlier.kvLabels();
+  require(copies.size() == 4, "a windowed layout's persistent tier left a copy unlabelled");
+  for (const auto &bytes : copies) {
+    const auto label = decodeKvSlotLabel(bytes, true);
+    require(bytes.size() == kvSlotLabelBytes(true) && kvSlotLabelBytes(true) == sizeof(KvBlockLabel) + 1 &&
+                label && label->form == kv::PageForm::Full &&
+                std::ranges::find(blocks, label->block.id) != blocks.end(),
+            "a windowed layout's KV label does not name its block and its page's form");
+  }
+  {
+    Process next(true, nullptr, std::nullopt, window);
+    const CacheAdoption adoption = next.adopt(copies, earlier.stateLabels());
+    require(adoption.blocks == 4 && adoption.states == 2 && adoption.dropped == 0,
+            "the next process did not take back a windowed layout's restore points");
+  }
+  for (auto &bytes : copies)
+    if (decodeKvSlotLabel(bytes, true)->block.id == blocks[2])
+      bytes.back() = std::byte{0xff};
+  Process next(true, nullptr, std::nullopt, window);
+  const CacheAdoption adoption = next.adopt(copies, earlier.stateLabels());
+  require(adoption.blocks == 2 && adoption.states == 1 && adoption.dropped == 3,
+          "a copy of a form the process does not know was taken back");
+}
+
+// A windowed cache's restore point keeps its tail Full and the rest of its
+// chain as RAM holds it: the copies of trimmed pages hold the layers no
+// window bounds alone and name the Slim form, which the next process
+// restores them into, and its tail Full. It takes back no state a Slim copy
+// of whose tail would leave unrestorable.
+void testWindowedPointsKeepTheirTailsFull() {
+  const std::vector<uint32_t> prompt = promptOf(3000, 6);
+  constexpr CacheWindowPolicy window{2};
+  // Room beside the eight Full pages for the Slim ones.
+  Process earlier(true, nullptr, std::nullopt, window);
+  earlier.storage.budgetPages = 16;
+  const std::vector<uint64_t> blocks = earlier.cachePrompt(1, prompt);
+  earlier.publish(blocks[5]);
+  require(earlier.cache.trimWindows() == 4, "the blocks past the tail were not trimmed");
+  PersistStatus status = PersistStatus::Started;
+  for (int step = 0; step < 16 && status != PersistStatus::Durable; ++step) {
+    status = earlier.cache.persist(blocks[5]);
+    earlier.tier.complete();
+    static_cast<void>(earlier.cache.pollTransfers());
+  }
+  std::vector<std::vector<std::byte>> copies = earlier.kvLabels();
+  require(status == PersistStatus::Durable && copies.size() == 6, "the restore point did not become durable");
+  for (const auto &bytes : copies) {
+    const auto label = decodeKvSlotLabel(bytes, true);
+    const auto index = std::ranges::find(blocks, label->block.id) - blocks.begin();
+    require(label->form == (index < 4 ? kv::PageForm::Slim : kv::PageForm::Full),
+            "a copy did not name the form of the page it was written from");
+  }
+  {
+    Process next(true, nullptr, std::nullopt, window);
+    next.storage.budgetPages = 16;
+    const CacheAdoption adoption = next.adopt(copies, earlier.stateLabels());
+    require(adoption.blocks == 6 && adoption.states == 1 && adoption.dropped == 0,
+            "the next process did not take back the restore point");
+    std::vector<uint32_t> resumed = prompt;
+    resumed.push_back(1);
+    next.cache.beginRequest(1);
+    const CacheLookup lookup = next.cache.lookup(resumed, {});
+    require(lookup.resumeBoundary() == 6 * KvCache::pageTokens &&
+                next.cache.restoreRequest(1, lookup).granted(),
+            "the restore point did not restore");
+    std::string forms;
+    for (const uint32_t page : next.cache.pageTable(1).pages)
+      forms += next.pool.form(page) == kv::PageForm::Slim ? 'S' : 'F';
+    require(forms == "SSSSFF" && next.tier.restores == 6, "the chain did not come back in its copies' forms");
+    next.tier.complete();
+    static_cast<void>(next.cache.pollTransfers());
+    static_cast<void>(next.cache.cutPageTable(1));
+    next.cache.checkInvariants();
+    next.cache.endRequest(1);
+  }
+  for (auto &bytes : copies)
+    if (decodeKvSlotLabel(bytes, true)->block.id == blocks[4])
+      bytes.back() = static_cast<std::byte>(kv::PageForm::Slim);
+  Process next(true, nullptr, std::nullopt, window);
+  const CacheAdoption adoption = next.adopt(copies, earlier.stateLabels());
+  require(adoption.blocks == 0 && adoption.states == 0 && adoption.dropped == 7,
+          "a state whose tail a Slim copy holds was taken back");
+}
+
+// A writer that computes blocks again which only copies of Slim pages hold
+// gives them its Full pages, beside which those copies go: a state it
+// publishes there, whose tail they are, restores whole once they leave RAM
+// again, from Full copies, in this process and the next.
+void testRecomputedTailsKeepFullCopies() {
+  for (const bool persistent : {false, true}) {
+    const std::vector<uint32_t> earlier = promptOf(5000, 6);
+    constexpr CacheWindowPolicy window{2};
+    Process process(persistent, nullptr, std::nullopt, window);
+    process.storage.budgetPages = 16;
+    const std::vector<uint64_t> blocks = process.cachePrompt(1, earlier);
+    process.publish(blocks[5]);
+    require(process.cache.trimWindows() == 4, "the blocks past the tail were not trimmed");
+    process.writeEverything();
+
+    // A later prompt shares the first four blocks, which copies of Slim
+    // pages hold, and no state there: its request computes them again.
+    std::vector<uint32_t> later(earlier.begin(), earlier.begin() + 4 * KvCache::pageTokens);
+    for (uint32_t row = 0; row < 2 * KvCache::pageTokens; ++row)
+      later.push_back(90000 + row);
+    const CacheLookup none = process.cache.lookup(later, {});
+    require(!none.state && none.kvBoundary == 4 * KvCache::pageTokens, "the shared blocks were not cached alone");
+    process.cache.beginRequest(2);
+    require(admitTokens(process.cache, 2, later.size()).granted(), "the later prompt's KV was not admitted");
+    process.cache.publishCommittedBlocks(2, later, static_cast<uint32_t>(later.size()), {});
+    require(process.cache.blockAt(2, 4 * KvCache::pageTokens) == blocks[3] && process.cache.stateTailFull(blocks[3]),
+            "the writer's blocks were not the cached ones, or their tail not Full");
+    process.publish(blocks[3]);
+    process.cache.endRequest(2);
+    process.writeEverything();
+    process.cache.checkInvariants();
+
+    std::vector<uint32_t> resumed(later.begin(), later.begin() + 4 * KvCache::pageTokens + 1);
+    process.cache.beginRequest(3);
+    const CacheLookup lookup = process.cache.lookup(resumed, {});
+    require(lookup.state && lookup.resumeBoundary() == 4 * KvCache::pageTokens &&
+                process.cache.restoreRequest(3, lookup).granted(),
+            "the state on the blocks computed again did not restore");
+    process.tier.complete();
+    static_cast<void>(process.cache.pollTransfers());
+    const PageTableState table = process.cache.pageTable(3);
+    require(table.pages.size() == 4 && process.pool.form(table.pages[2]) == kv::PageForm::Full &&
+                process.pool.form(table.pages[3]) == kv::PageForm::Full,
+            "a restore found its tail Slim");
+    static_cast<void>(process.cache.cutPageTable(3));
+    process.cache.checkInvariants();
+    process.cache.endRequest(3);
+    if (!persistent)
+      continue;
+    Process next(true, nullptr, std::nullopt, window);
+    next.storage.budgetPages = 16;
+    const CacheAdoption adoption = next.adopt(process.kvLabels(), process.stateLabels());
+    require(adoption.states == 2 && adoption.dropped == 0,
+            "the next process did not take back both restore points");
   }
 }
 
@@ -1043,6 +1198,9 @@ void testCommittedPagesTakeTheSpilledChainOfAStateInRam() {
 int main() {
   try {
     testCopiesAreLabelled();
+    testWindowedCopiesNameTheirForm();
+    testWindowedPointsKeepTheirTailsFull();
+    testRecomputedTailsKeepFullCopies();
     testRestorePointsComeBack();
     testSaltedPointsComeBackUnderTheirSalt();
     testBrokenChainsStayBehind();

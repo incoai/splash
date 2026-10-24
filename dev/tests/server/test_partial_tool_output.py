@@ -21,12 +21,15 @@ from dev.tests.tool_output import project, streamed_arguments, streamed_text
 from server import api_shapes
 from server import backend as backend_api
 from server import output as model_output
-from server.tool_schema import (
-    MAX_NAME_LENGTH,
-    PARAMETER_CLOSE,
+from server.chat_format import (
+    QWEN,
+    QWEN_XML,
     THINK_END,
     TOOL_CALL_CLOSE,
     TOOL_CALL_OPEN,
+)
+from server.tool_schema import (
+    MAX_NAME_LENGTH,
     ToolPolicy,
     normalize_tools,
 )
@@ -428,7 +431,7 @@ class PartialToolOutputTests(unittest.TestCase):
         for tool_calls, expected in ((True, ["why", text[3:]]), (False, [text, ""])):
             for size in range(1, len(text) + 1):
                 with self.subTest(tool_calls=tool_calls, size=size):
-                    splitter = model_output.ReasoningSplitter(True, tool_calls)
+                    splitter = model_output.ReasoningSplitter(True, tool_calls, QWEN)
                     parts = [
                         part
                         for offset in range(0, len(text), size)
@@ -468,7 +471,7 @@ class PartialToolOutputTests(unittest.TestCase):
         answer = '{"note": "a</think>b"}'
         for policy in (None, weather_policy()):
             projector = model_output.StreamingToolCallProjector(
-                policy, "json", structured=True
+                policy, "json", structured=True, syntax=QWEN_XML
             )
             events = projector.put(answer)
             content, calls, owed = projector.finish(False)
@@ -750,14 +753,17 @@ class PartialToolOutputTests(unittest.TestCase):
             + json.dumps(items)
             + "\n</parameter>\n</function>\n</tool_call>"
         )
-        projector = model_output.StreamingToolCallProjector(policy, "typed")
+        projector = model_output.StreamingToolCallProjector(
+            policy, "typed", syntax=QWEN_XML
+        )
         projected = []
         for offset in range(0, len(text), 4):
             projected += projector.put(text[offset : offset + 4])
             if projector.state == "value":
                 # No longer than the longest end of a value.
                 self.assertLess(
-                    len(projector.pending), len(PARAMETER_CLOSE + TOOL_CALL_CLOSE)
+                    len(projector.pending),
+                    len(QWEN_XML.value_close + TOOL_CALL_CLOSE),
                 )
         self.assertEqual(
             streamed_arguments(projected),
@@ -790,7 +796,7 @@ class PartialToolOutputTests(unittest.TestCase):
         for head, filler, calls in cases:
             with self.subTest(head=head):
                 projector = model_output.StreamingToolCallProjector(
-                    weather_policy(), "held"
+                    weather_policy(), "held", syntax=QWEN_XML
                 )
                 projector.put(head)
                 for _ in range(4096):
@@ -822,7 +828,9 @@ class PartialToolOutputTests(unittest.TestCase):
             strict=frozenset(),
             constrained=False,
         )
-        projector = model_output.StreamingToolCallProjector(policy, "owned")
+        projector = model_output.StreamingToolCallProjector(
+            policy, "owned", syntax=QWEN_XML
+        )
         projector.put(FakeTokenizer().fragments[5])
         _, calls, _ = projector.finish(False)
         self.assertEqual(calls[0]["function"]["arguments"], '{"city":"Paris"}')
@@ -1224,7 +1232,7 @@ class TextAfterToolCallTests(unittest.TestCase):
             "auto",
             True,
         )[1]
-        projector = model_output.StreamingToolCallProjector(policy, 1)
+        projector = model_output.StreamingToolCallProjector(policy, 1, syntax=QWEN_XML)
         call = "<tool_call>\n<function=read>\n</function>\n</tool_call>"
         first = projector.put("First message. " + call)
         second = projector.put("POST-CALL TEXT THAT SHOULD BE VISIBLE")

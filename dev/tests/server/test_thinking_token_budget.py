@@ -1,14 +1,16 @@
 import io
 import json
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 from dev.tests import server_fixtures as fixtures
-from server import backend as backend_api
 from server import protocol as wire
 from server import server
 from server.backend import ThinkingEndError, thinking_end_tokens
-from server.tool_schema import THINK_END_TOKEN_ID, TOOL_CALL_OPEN_TOKEN_ID
+from server.chat_format import QWEN
+
+THINK_END_TOKEN_ID, TOOL_CALL_OPEN_TOKEN_ID = QWEN.think_end_id, QWEN.call_open_id
 
 TOOLS = [{"type": "function", "function": {"name": "weather"}}]
 
@@ -128,33 +130,34 @@ class ThinkingTokenBudgetTests(unittest.TestCase):
         end = (14, 15, 26)
         output = [[1, 1, 1], list(end), [27]]
         runtime = fixtures.FakeRuntime(*(fixtures.Plan(output) for _ in range(4)))
-        harness = fixtures.Harness(runtime, thinking_end=end)
+        harness = fixtures.Harness(
+            runtime, thinking_end=end, chat_format=replace(QWEN, think_end_id=26)
+        )
         self.addCleanup(harness.close)
         chat = fixtures.chat_body(max_tokens=32, thinking_token_budget=3)
         responses = fixtures.responses_body(
             max_output_tokens=32, thinking_token_budget=3
         )
         usages = []
-        with mock.patch.object(backend_api, "THINK_END_TOKEN_ID", 26):
-            for path, body, stream in (
-                ("/v1/chat/completions", chat, False),
-                ("/v1/chat/completions", chat, True),
-                ("/v1/responses", responses, False),
-                ("/v1/responses", responses, True),
-            ):
-                if stream:
-                    body = {**body, "stream": True}
-                    if path == "/v1/chat/completions":
-                        body["stream_options"] = {"include_usage": True}
-                status, _, payload = harness.request("POST", path, body)
-                self.assertEqual(status, 200, payload)
-                if not stream:
-                    usages.append(json.loads(payload)["usage"])
-                elif path == "/v1/chat/completions":
-                    usages.append(fixtures.stream_events(payload)[-1]["usage"])
-                else:
-                    events = fixtures.response_events(payload)
-                    usages.append(events[-1]["response"]["usage"])
+        for path, body, stream in (
+            ("/v1/chat/completions", chat, False),
+            ("/v1/chat/completions", chat, True),
+            ("/v1/responses", responses, False),
+            ("/v1/responses", responses, True),
+        ):
+            if stream:
+                body = {**body, "stream": True}
+                if path == "/v1/chat/completions":
+                    body["stream_options"] = {"include_usage": True}
+            status, _, payload = harness.request("POST", path, body)
+            self.assertEqual(status, 200, payload)
+            if not stream:
+                usages.append(json.loads(payload)["usage"])
+            elif path == "/v1/chat/completions":
+                usages.append(fixtures.stream_events(payload)[-1]["usage"])
+            else:
+                events = fixtures.response_events(payload)
+                usages.append(events[-1]["response"]["usage"])
         self.assertEqual(self.frames(runtime), [budget(3, 26, end)] * 4)
         self.assertEqual(
             [usage["completion_tokens_details"] for usage in usages[:2]]
@@ -169,51 +172,52 @@ class ThinkingTokenBudgetTests(unittest.TestCase):
         end = (14, 15, 26)
         output = [[1, 1, 1], list(end), [27], [26], [27]]
         runtime = fixtures.FakeRuntime(*(fixtures.Plan(output) for _ in range(4)))
-        harness = fixtures.Harness(runtime, thinking_end=end)
+        harness = fixtures.Harness(
+            runtime, thinking_end=end, chat_format=replace(QWEN, think_end_id=26)
+        )
         self.addCleanup(harness.close)
         chat = fixtures.chat_body(max_tokens=32, thinking_token_budget=3)
         responses = fixtures.responses_body(
             max_output_tokens=32, thinking_token_budget=3
         )
         answers = []
-        with mock.patch.object(backend_api, "THINK_END_TOKEN_ID", 26):
-            for path, body, stream in (
-                ("/v1/chat/completions", chat, False),
-                ("/v1/chat/completions", chat, True),
-                ("/v1/responses", responses, False),
-                ("/v1/responses", responses, True),
-            ):
+        for path, body, stream in (
+            ("/v1/chat/completions", chat, False),
+            ("/v1/chat/completions", chat, True),
+            ("/v1/responses", responses, False),
+            ("/v1/responses", responses, True),
+        ):
+            if stream:
+                body = {**body, "stream": True}
+            status, _, payload = harness.request("POST", path, body)
+            self.assertEqual(status, 200, payload)
+            if path == "/v1/chat/completions":
                 if stream:
-                    body = {**body, "stream": True}
-                status, _, payload = harness.request("POST", path, body)
-                self.assertEqual(status, 200, payload)
-                if path == "/v1/chat/completions":
-                    if stream:
-                        answers.append(
-                            "".join(
-                                choice["delta"].get("content") or ""
-                                for chunk in fixtures.stream_events(payload)
-                                for choice in chunk["choices"]
-                            )
-                        )
-                    else:
-                        answers.append(
-                            json.loads(payload)["choices"][0]["message"]["content"]
-                        )
-                else:
-                    response = (
-                        fixtures.response_events(payload)[-1]["response"]
-                        if stream
-                        else json.loads(payload)
-                    )
                     answers.append(
                         "".join(
-                            part["text"]
-                            for item in response["output"]
-                            if item["type"] == "message"
-                            for part in item["content"]
+                            choice["delta"].get("content") or ""
+                            for chunk in fixtures.stream_events(payload)
+                            for choice in chunk["choices"]
                         )
                     )
+                else:
+                    answers.append(
+                        json.loads(payload)["choices"][0]["message"]["content"]
+                    )
+            else:
+                response = (
+                    fixtures.response_events(payload)[-1]["response"]
+                    if stream
+                    else json.loads(payload)
+                )
+                answers.append(
+                    "".join(
+                        part["text"]
+                        for item in response["output"]
+                        if item["type"] == "message"
+                        for part in item["content"]
+                    )
+                )
         self.assertEqual(self.frames(runtime), [budget(3, 26, end)] * 4)
         self.assertEqual(answers, ["answer\nanswer\n"] * 4)
 
@@ -329,7 +333,8 @@ class ThinkingEndTextTests(unittest.TestCase):
 
     def test_without_a_text_thinking_ends_at_its_close(self):
         tokenizer = self.tokenizer()
-        self.assertEqual(thinking_end_tokens(tokenizer, None), (THINK_END_TOKEN_ID,))
+        # The engine then selects the close alone, the job's chat format's.
+        self.assertIsNone(thinking_end_tokens(tokenizer, None, QWEN))
         tokenizer.encode.assert_not_called()
 
     def test_a_text_ends_with_the_close_and_holds_no_other_special_token(self):
@@ -337,7 +342,8 @@ class ThinkingEndTextTests(unittest.TestCase):
             with self.subTest(text=text):
                 tokenizer = self.tokenizer()
                 self.assertEqual(
-                    thinking_end_tokens(tokenizer, text), tuple(self.ENCODINGS[text])
+                    thinking_end_tokens(tokenizer, text, QWEN),
+                    tuple(self.ENCODINGS[text]),
                 )
                 tokenizer.encode.assert_called_once_with(text, add_special_tokens=False)
         for text in (
@@ -353,11 +359,11 @@ class ThinkingEndTextTests(unittest.TestCase):
                     "^--thinking-end-text must end with </think> and hold no other "
                     "special token$",
                 ):
-                    thinking_end_tokens(self.tokenizer(), text)
+                    thinking_end_tokens(self.tokenizer(), text, QWEN)
         with self.assertRaisesRegex(
             ThinkingEndError, "^--thinking-end-text takes 65 tokens; the most is 64$"
         ):
-            thinking_end_tokens(self.tokenizer(), "too long")
+            thinking_end_tokens(self.tokenizer(), "too long", QWEN)
 
     def test_startup_refuses_a_text_before_starting_the_native_worker(self):
         args = server.parse_args(

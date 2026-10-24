@@ -39,6 +39,7 @@ import string
 import weakref
 from dataclasses import dataclass
 
+from .chat_format import THINK_END, THINK_START
 from .chat_templates import render_chat_template, template_options
 from .errors import field_error
 from .protocol import MAX_SCORE_TOKENS
@@ -178,13 +179,23 @@ def slot_labels(tokenizer):
 
 
 def encode_prompt(
-    prompt_tokenizer, chat_template, messages, labels, *, admit, checkpoint
+    prompt_tokenizer,
+    chat_template,
+    messages,
+    labels,
+    *,
+    chat_format,
+    admit,
+    checkpoint,
 ):
     """Render messages with chat_template, without thinking as a request
-    with effort none renders, and verify single-token answer slots. The
-    prompt is the rendered text as every prompt is tokenized, with each
-    surrogate code point as U+FFFD (tokenizable): the one text its tokens,
-    the slot checks and its digest read.
+    with effort none renders, and verify single-token answer slots. A model
+    that opens its reasoning itself (chat_format.think_start_id), which the
+    effort leaves reasoning, would start it where the generation prompt
+    ends: its prompt ends with an empty think block, after which it
+    answers. The prompt is the rendered text as every prompt is tokenized,
+    with each surrogate code point as U+FFFD (tokenizable): the one text its
+    tokens, the slot checks and its digest read.
 
     Mirrors SemIf semif_phase1.direct.encode_prompt: each slot label must be
     one exact round-trip token, and appending the label to the rendered
@@ -211,6 +222,8 @@ def encode_prompt(
             ),
         },
     )
+    if chat_format.think_start_id is not None:
+        rendered += THINK_START + THINK_END
     prompt = tokenizable(rendered)
     head, tail = prompt_tokenizer.split(prompt)
     tail_ids = list(tokenizer.encode(tail, add_special_tokens=False))

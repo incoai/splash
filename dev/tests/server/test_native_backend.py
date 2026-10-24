@@ -26,9 +26,10 @@ from dev.tests.server_fixtures import (
 )
 from server import backend as backend_api
 from server import constraints as generation_constraints
-from server import diagnostics, images, runtime, tool_schema
+from server import diagnostics, images, runtime
 from server import errors as api_errors
 from server import protocol as wire
+from server.chat_format import QWEN
 from server.runtime import STATUS_ANSWER_LIMIT_SECONDS
 
 
@@ -227,7 +228,9 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(constraint.mask_calls, [(), tuple(range(8))])
 
         with self.assertRaises(api_errors.ConstraintError):
-            generation_constraints.TokenConstraint(None, None).masks(tuple(range(9)))
+            generation_constraints.TokenConstraint(None, None, QWEN).masks(
+                tuple(range(9))
+            )
 
     def test_release_weights_asks_the_engine_and_returns_its_status(self):
         transport, runtime = self.make_transport()
@@ -648,7 +651,7 @@ class NativeBackendContractTests(unittest.TestCase):
 
     def test_token_constraint_consumes_committed_batches_only_at_mask_or_finish(self):
         matcher = FakeMatcher()
-        constraint = generation_constraints.TokenConstraint(matcher, None)
+        constraint = generation_constraints.TokenConstraint(matcher, None, QWEN)
         constraint.commit((7, 8))
         constraint.commit((9,))
         self.assertEqual(matcher.consumed, [])
@@ -1167,8 +1170,8 @@ class CallbackStreamerTests(unittest.TestCase):
     def test_reasoning_tokens_end_where_the_splitter_ends_reasoning(self):
         # A call-open token ends the reasoning where a call may follow and its
         # text opens one; a </think> ends it always.
-        think_end = tool_schema.THINK_END_TOKEN_ID
-        call = tool_schema.TOOL_CALL_OPEN_TOKEN_ID
+        think_end = QWEN.think_end_id
+        call = QWEN.call_open_id
         texts = {
             1: "a",
             2: " b",
@@ -1191,9 +1194,9 @@ class CallbackStreamerTests(unittest.TestCase):
                 streamer = backend_api.CallbackStreamer(tokenizer, lambda *_: None)
                 streamer.token_ids = token_ids
                 self.assertEqual(
-                    streamer.count_reasoning_tokens(True, tool_calls), expected
+                    streamer.count_reasoning_tokens(QWEN, True, tool_calls), expected
                 )
-                self.assertEqual(streamer.count_reasoning_tokens(False, True), 0)
+                self.assertEqual(streamer.count_reasoning_tokens(QWEN, False, True), 0)
 
     def test_callback_streamer_matches_one_shot_for_random_token_batches(self):
         family = "👨‍👩‍👧‍👦".encode()

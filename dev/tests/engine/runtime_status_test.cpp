@@ -746,6 +746,29 @@ void testKvSpillStatus() {
   require(json.find(expected) != std::string::npos, "the spilling target's kv_spill differs:\n" + json);
 }
 
+// A windowed target's KV reports its window under kv.window: the pages a
+// window keeps Full, whether the pages past every window give up their
+// windowed layers' K/V, the pool's Full and Slim pages in use and the Slim
+// pages' bytes, the blocks states' tails pin, and the pages trimmed, the
+// blocks that took the page of a writer that computed them again and the
+// states refused a tail that was not Full. Another target reports none. An added field: the
+// schema version stays.
+void testKvWindowStatus() {
+  engine::EngineSnapshot engine;
+  engine.resources.pool = {.pagesAllocated = 1024, .pagesFree = 124, .pagesActive = 300, .pagesPrefix = 700};
+  engine.resources.pool.slim = {.pagesAllocated = 768, .pagesFree = 68, .allocatedBytes = 768 * 473'088ULL};
+  const auto status = [&] {
+    return runtimeStatusJson(plan(), engine, {}, {}, {}, {}, {}, {}, {}, true, {}, {}, {}, {}, {}, {});
+  };
+  require(status().find("\"window_pages\"") == std::string::npos, "a target without a window reported one");
+  engine.resources.window = engine::KvWindowSnapshot{
+      .windowPages = 16, .trim = true, .pinnedBlocks = 48, .trimmedPages = 9000, .upgrades = 3, .refusedStates = 1};
+  require(status().find("\"window\":{\"window_pages\":16,\"trim\":true,\"full_pages\":200,\"slim_pages\":700,"
+                        "\"slim_bytes\":363331584,\"pinned_blocks\":48,\"trimmed_pages\":9000,\"upgrades\":3,"
+                        "\"refused_states\":1}") != std::string::npos,
+          "a windowed target's kv.window differs:\n" + status());
+}
+
 // A streamed table's store (--ple-memory): null without one; with one its
 // memory, per use its stages, rows, hit rate and stage latencies, its reads,
 // prefetches and failure. An added field: the schema version stays.
@@ -917,6 +940,7 @@ int main(int argc, char **argv) {
     testStreamedTableStatus();
     testStreamedExpertsStatus();
     testKvSpillStatus();
+    testKvWindowStatus();
     testThermalStateStatus();
     testThermalStateTransitions();
     testStderrLinesStayWhole();

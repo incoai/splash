@@ -27,8 +27,8 @@ done
 for value in -1 1048576 4294967296 10x '' '0,'; do
     reject '--histories requires integers' --histories "$value"
 done
-for value in typo '' '27b,' '27b,typo' ',35b'; do
-    reject '--shapes takes 27b, 35b, 122b or fn' --shapes "$value"
+for value in typo '' '27b,' '27b,typo' ',35b' flint 'flint-window,'; do
+    reject '--shapes takes 27b, 35b, 122b, fn, flint-window or flint-full' --shapes "$value"
 done
 for value in 0 16384 -1 1x ''; do
     reject '--extent-pages requires integers' --extent-pages "$value"
@@ -46,5 +46,5 @@ reject 'does not hold whole alignment units' --shapes 27b --extent-pages 448
 # Valid values must reach the final sentinel, still without opening Metal.
 reject 'unknown option --sentinel' \
     --lanes 1,2,3,4 --histories 0,2048,131072 --repeat 1 \
-    --shapes 27b,35b,fn --qsa pages --located --extent-pages 512 --sentinel 1
+    --shapes 27b,35b,fn,flint-window,flint-full --qsa pages --located --extent-pages 512 --sentinel 1
 echo 'attention-sweep CLI validation: PASS'

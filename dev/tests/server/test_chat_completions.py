@@ -1,6 +1,6 @@
 import json
 import unittest
-from unittest import mock
+from dataclasses import replace
 
 from dev.tests.server_fixtures import (
     FakeRuntime,
@@ -10,7 +10,7 @@ from dev.tests.server_fixtures import (
     openai_client,
     responses_body,
 )
-from server import backend as backend_api
+from server.chat_format import QWEN
 
 
 class ChatCompletionTests(HarnessTestCase):
@@ -146,12 +146,12 @@ class ChatCompletionTests(HarnessTestCase):
         self.assertEqual(runtime.cancel_count, 1)
 
     def test_usage_counts_only_tokens_before_the_thinking_delimiter(self):
-        harness = self.harness(FakeRuntime(Plan([[1], [26], [27]])))
-        with (
-            # The fake vocabulary's </think> is token 26.
-            mock.patch.object(backend_api, "THINK_END_TOKEN_ID", 26),
-            openai_client(harness) as client,
-        ):
+        # The fake vocabulary's </think> is token 26.
+        harness = self.harness(
+            FakeRuntime(Plan([[1], [26], [27]])),
+            chat_format=replace(QWEN, think_end_id=26),
+        )
+        with openai_client(harness) as client:
             response = client.chat.completions.create(
                 model="test-model",
                 messages=[{"role": "user", "content": "hello"}],
@@ -167,14 +167,13 @@ class ChatCompletionTests(HarnessTestCase):
     def test_usage_counts_reasoning_tokens_before_a_call_from_the_reasoning(self):
         # Where a call may follow, its tag ends the reasoning, and a later
         # </think> is dropped from the text.
-        harness = self.harness(FakeRuntime(Plan([[1], [5], [26], [27]])))
-        with (
-            # The fake vocabulary's </think> is token 26, and token 5 is a
-            # call, which begins with <tool_call>.
-            mock.patch.object(backend_api, "THINK_END_TOKEN_ID", 26),
-            mock.patch.object(backend_api, "TOOL_CALL_OPEN_TOKEN_ID", 5),
-            openai_client(harness) as client,
-        ):
+        # The fake vocabulary's </think> is token 26, and token 5 is a call,
+        # which begins with <tool_call>.
+        harness = self.harness(
+            FakeRuntime(Plan([[1], [5], [26], [27]])),
+            chat_format=replace(QWEN, think_end_id=26, call_open_id=5),
+        )
+        with openai_client(harness) as client:
             response = client.chat.completions.create(
                 model="test-model",
                 messages=[{"role": "user", "content": "hello"}],

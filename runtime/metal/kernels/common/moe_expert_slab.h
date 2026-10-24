@@ -45,13 +45,21 @@ inline void moe_live_rows(uint rows, Run run) {
   run(integral_constant<ushort, Max>{});
 }
 
+// The shared slice that `id` names when the shared expert's slices take the
+// ids from `first` on: a route slot of a row, whose top_k routed routes the
+// slices follow (first = top_k), or an expert, the slices following the
+// routed experts (first = experts). An id below `first` names a routed one
+// and wraps past every slice.
+inline uint moe_shared_slice(uint id, uint first) { return id - first; }
+
 // A GGUF expert pass's weights for one tile (ops/MoE.cpp, metal/abi/MoE.h):
 // the routed experts of the projection are one segment of slots *
 // output_size rows, so routed expert e's planes start at tile slots[e] *
 // output_size / QUANT_TILE_ROWS (metal/abi/QuantFormat.h), slots being the
-// block's slot table; the shared expert (id `experts`) has a segment of its
-// own, possibly in another format. w1 is the meta plane for formats without
-// a second plane, as the host binds it.
+// block's slot table; the Shared slices of the shared expert (ids `experts`
+// on) have a segment of their own, possibly in another format, slice s's
+// planes from tile s * output_size / QUANT_TILE_ROWS on. w1 is the meta
+// plane for formats without a second plane, as the host binds it.
 struct MoeGgufSegment {
   device uchar *w0;
   device uchar *w1;
@@ -59,22 +67,33 @@ struct MoeGgufSegment {
   uint format;
 };
 
+// The planes of a segment in format f (id `format`) from row `row` on, of
+// `groups` groups of 32 inputs a row.
+inline MoeGgufSegment moe_gguf_planes(constant QuantFormat &f, uint format, device uchar *w0, device uchar *w1,
+                                      device uchar *meta, ulong row, ulong groups) {
+  return {w0 + row * groups * f.plane0_bytes, w1 + row * groups * f.plane1_bytes,
+          meta + row * (groups / f.meta_groups) * f.meta_bytes, format};
+}
+template <uint Shared>
 inline MoeGgufSegment moe_gguf_segment(uint expert, uint experts, uint input_size, uint output_size,
                                        uint routed_format, uint shared_format, device const uint *slots,
                                        device uchar *w0, device uchar *w1, device uchar *meta,
                                        device uchar *shared_w0, device uchar *shared_w1,
                                        device uchar *shared_meta) {
-  if (expert == experts)
-    return {shared_w0, shared_w1, shared_meta, shared_format};
+  const uint slice = moe_shared_slice(expert, experts);
+  if (slice < Shared) {
+    constant QuantFormat &f = kQuantFormats[shared_format];
+    return moe_gguf_planes(f, shared_format, shared_w0, shared_w1, shared_meta, ulong(slice) * output_size,
+                           input_size / 32);
+  }
   constant QuantFormat &f = kQuantFormats[routed_format];
-  const ulong rows = ulong(slots[expert]) * output_size, groups = input_size / 32;
-  return {w0 + rows * groups * f.plane0_bytes, w1 + rows * groups * f.plane1_bytes,
-          meta + rows * (groups / f.meta_groups) * f.meta_bytes, routed_format};
+  return moe_gguf_planes(f, routed_format, w0, w1, meta, ulong(slots[expert]) * output_size, input_size / 32);
 }
+template <uint Shared>
 inline MoeGgufSegment moe_gguf_segment(uint expert, constant MoeGgufExpertParams &p, device const uint *slots,
                                        device uchar *w0, device uchar *w1, device uchar *meta,
                                        device uchar *shared_w0, device uchar *shared_w1,
                                        device uchar *shared_meta) {
-  return moe_gguf_segment(expert, p.experts, p.input_size, p.output_size, p.routed_format, p.shared_format, slots,
-                          w0, w1, meta, shared_w0, shared_w1, shared_meta);
+  return moe_gguf_segment<Shared>(expert, p.experts, p.input_size, p.output_size, p.routed_format, p.shared_format,
+                                  slots, w0, w1, meta, shared_w0, shared_w1, shared_meta);
 }

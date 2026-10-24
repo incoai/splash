@@ -1,5 +1,6 @@
 #include "ops/PageStorage.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -33,10 +34,15 @@ PageStorage::PageStorage(metal::MetalBackend &backend,
         throw std::invalid_argument(
             "KV page pool is not a whole number of extents");
     }
+    // splash_kv_offset places an extent's regions one after another; a
+    // layer's is the one Layout::region orders it at.
     const auto data = static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
     const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
-    for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
-        layers_.push_back(splash_kv_layer(extentPages_, data, scale, layer));
+    regionLayers_.resize(layout_.attentionLayers);
+    for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
+        layers_.push_back(splash_kv_layer(extentPages_, data, scale, layout_.region(layer)));
+        regionLayers_[layout_.region(layer)] = layer;
+    }
     extents_.resize(pageCount_ / extentPages_);
 }
 
@@ -75,8 +81,14 @@ metal::AllocationResult PageStorage::allocateExtent(uint32_t extent, PageForm fo
         throw std::invalid_argument(
             "KV pages of a layout that cannot spill are all Full");
     }
+    if (form == PageForm::Slim && !layout_.slimmable()) {
+        throw std::invalid_argument(
+            "KV pages of a layout without a window keep every layer");
+    }
     const uint64_t bytes = extentBytes(form);
-    const std::string label = form == PageForm::Full ? "kv-extent-" : "kv-index-extent-";
+    const std::string label = form == PageForm::Full   ? "kv-extent-"
+                              : form == PageForm::Slim ? "kv-slim-extent-"
+                                                       : "kv-index-extent-";
     return admitAllocation_(bytes, [&] {
         metal::MetalBuffer allocated = backend_.allocateBuffer(
             bytes, metal::BufferStorage::Shared,
@@ -115,9 +127,10 @@ void PageStorage::copyPages(std::span<const PageCopy> copies) {
         }
     }
     for (const PageCopy &copy : copies) {
-        const bool sameForm = form(copy.from) == form(copy.to);
-        const auto source = sameForm ? spans(copy.from) : indexSpans(copy.from);
-        const auto destination = sameForm ? spans(copy.to) : indexSpans(copy.to);
+        const uint32_t regions = std::min(layout_.regions(form(copy.from)),
+                                          layout_.regions(form(copy.to)));
+        const auto source = spans(copy.from, regions);
+        const auto destination = spans(copy.to, regions);
         for (size_t tensor = 0; tensor < source.size(); ++tensor) {
             std::memcpy(destination[tensor].data(), source[tensor].data(),
                         source[tensor].size());
@@ -168,8 +181,8 @@ void PageStorage::writeEntries(std::span<const uint32_t> pages,
                                uint32_t first,
                                const metal::MetalBuffer &table) const {
     writeTable(pages, first, table, [](const Extent &extent, uint32_t index) {
-        return extent.form == PageForm::Full ? splash_kv_page_entry(extent.address, index)
-                                             : SPLASH_KV_PAGE_ABSENT;
+        return extent.form == PageForm::Index ? SPLASH_KV_PAGE_ABSENT
+                                              : splash_kv_page_entry(extent.address, index);
     });
 }
 
@@ -184,14 +197,16 @@ void PageStorage::writeIndexEntries(std::span<const uint32_t> pages,
 }
 
 std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page) const {
+    return spans(page, layout_.regions(form(page)));
+}
+
+std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page, uint32_t regions) const {
     std::vector<std::span<std::byte>> result;
-    if (form(page) == PageForm::Full) {
-        result.reserve(size_t{layout_.attentionLayers} *
-                       ((layout_.scaleBytesPerLayerPage() ? 4 : 2) + (layout_.indexDimension ? 1 : 0)));
-        for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer) {
-            for (const std::span<std::byte> tensor : layerSpans(page, layer)) {
-                if (!tensor.empty()) result.push_back(tensor);
-            }
+    result.reserve(size_t{regions} * (layout_.scaleBytesPerLayerPage() ? 4 : 2) +
+                   (layout_.indexDimension ? layout_.attentionLayers : 0));
+    for (uint32_t region = 0; region < regions; ++region) {
+        for (const std::span<std::byte> tensor : layerSpans(page, regionLayers_[region])) {
+            if (!tensor.empty()) result.push_back(tensor);
         }
     }
     const std::vector<std::span<std::byte>> index = indexSpans(page);
@@ -201,18 +216,21 @@ std::vector<std::span<std::byte>> PageStorage::spans(uint32_t page) const {
 
 std::array<std::span<std::byte>, 4> PageStorage::layerSpans(uint32_t page, uint32_t layer) const {
     const Extent &extent = allocatedExtent(page);
-    if (extent.form != PageForm::Full)
+    if (extent.form == PageForm::Index)
         throw std::logic_error("KV page " + std::to_string(page) + " holds only its index");
     if (layer >= layout_.attentionLayers)
         throw std::out_of_range("KV layer is outside the layout");
+    if (layout_.region(layer) >= layout_.regions(extent.form))
+        throw std::logic_error("KV page " + std::to_string(page) + " holds no windowed layer's K/V");
     auto *contents = static_cast<std::byte *>(extent.buffer.contents());
     const auto data = static_cast<uint32_t>(layout_.dataBytesPerLayerPage());
     const auto scale = static_cast<uint32_t>(layout_.scaleBytesPerLayerPage());
     const uint32_t index = page % extentPages_;
     std::array<std::span<std::byte>, 4> result;
     for (uint32_t tensor = SPLASH_KV_KEYS; tensor <= SPLASH_KV_VALUE_SCALES; ++tensor) {
-        result[tensor] = {contents + splash_kv_offset(extentPages_, data, scale, layer, tensor, index),
-                          splash_kv_page_bytes(data, scale, tensor)};
+        result[tensor] = {
+            contents + splash_kv_offset(extentPages_, data, scale, layout_.region(layer), tensor, index),
+            splash_kv_page_bytes(data, scale, tensor)};
     }
     return result;
 }

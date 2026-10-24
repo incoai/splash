@@ -166,6 +166,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "always")
         throw UsageError("--kv-spill requires always");
       result.kvSpillAlways = true;
+    } else if (option == "--kv-window-trim") {
+      if (value != "on" && value != "off")
+        throw UsageError("--kv-window-trim requires on or off");
+      result.kvWindowTrim = value == "on";
     } else if (option == "--ane") {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");

@@ -1,7 +1,8 @@
 """Read GGUF metadata without mapping or decoding any weight tensors.
 
-The supported tokenizer profile describes algorithms; vocabulary, merge ranks,
-special-token IDs and the chat template always come from the selected GGUF.
+The supported tokenizer profiles describe algorithms; vocabulary, merge
+ranks, special-token IDs and the chat template always come from the selected
+GGUF.
 
 This file is the metadata adapter, identified by the SHA-256 of its bytes:
 assembly._metadata_key keys each derived metadata entry by that hash, the
@@ -16,6 +17,7 @@ import collections
 import contextlib
 import math
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -156,6 +158,25 @@ QWEN35_PATTERN = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}"
     r"| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 )
+# The flint profile, as Flint's own tokenizer.json splits text before its
+# byte-level BPE, without a normalizer: digits in runs of up to three, runs
+# of Han, hiragana and katakana, then o200k's pattern.
+FLINT_PATTERNS = (
+    r"\p{N}{1,3}",
+    "[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+",
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+)
+# Each GGUF tokenizer profile (tokenizer.ggml.pre) Splash derives a tokenizer
+# for: the patterns that split text, each isolating its matches, in order,
+# and whether text is NFC-normalized before them.
+TOKENIZER_PROFILES = {
+    "qwen35": ((QWEN35_PATTERN,), True),
+    "flint": (FLINT_PATTERNS, False),
+}
 # The GGUF token types (llama_token_type) a byte-level BPE vocabulary uses:
 # control tokens are special added tokens, user-defined ones added tokens
 # that are not special, and unused ones fill the vocabulary to its size.
@@ -187,9 +208,18 @@ def tokenizer_files(metadata):
 
     if (
         metadata.require("tokenizer.ggml.model", str) != "gpt2"
-        or metadata.require("tokenizer.ggml.pre", str) != "qwen35"
+        or (
+            profile := TOKENIZER_PROFILES.get(
+                metadata.require("tokenizer.ggml.pre", str)
+            )
+        )
+        is None
     ):
-        raise ModelError("unsupported GGUF tokenizer profile; expected gpt2/qwen35")
+        raise ModelError(
+            "unsupported GGUF tokenizer profile; expected gpt2/"
+            + " or gpt2/".join(TOKENIZER_PROFILES)
+        )
+    patterns, nfc = profile
     tokens = metadata.require("tokenizer.ggml.tokens", list)
     types = metadata.require("tokenizer.ggml.token_type", list)
     merges = metadata.require("tokenizer.ggml.merges", list)
@@ -221,10 +251,14 @@ def tokenizer_files(metadata):
         )
     except Exception as error:
         raise ModelError("invalid GGUF BPE vocabulary or merges") from error
-    backend.normalizer = normalizers.NFC()
+    if nfc:
+        backend.normalizer = normalizers.NFC()
     backend.pre_tokenizer = pre_tokenizers.Sequence(
         [
-            pre_tokenizers.Split(Regex(QWEN35_PATTERN), behavior="isolated"),
+            *(
+                pre_tokenizers.Split(Regex(pattern), behavior="isolated")
+                for pattern in patterns
+            ),
             pre_tokenizers.ByteLevel(
                 add_prefix_space=False, use_regex=False, trim_offsets=False
             ),
@@ -295,7 +329,11 @@ def text_architecture(metadata):
 
 
 def model_config(metadata, vision=None):
+    """The configuration of the target metadata describes, in the keys and
+    the shape of its family's own config.json: Qwen's text model under
+    text_config, with its vision tower's beside it, or Flint's flat."""
     arch = text_architecture(metadata)
+    architecture = ARCHITECTURES[arch]
     fields = {
         "hidden_size": "embedding_length",
         "max_position_embeddings": "context_length",
@@ -303,18 +341,24 @@ def model_config(metadata, vision=None):
         "num_key_value_heads": "attention.head_count_kv",
         "head_dim": "attention.key_length",
     }
-    if ARCHITECTURES[arch].moe:
+    if architecture.moe:
         # The routed experts, which a pruned release keeps fewer of than its
         # family; the engine plans, sizes and loads them by this count.
         fields["num_experts"] = "expert_count"
     text = {name: metadata.positive(arch + "." + key) for name, key in fields.items()}
     text.update(
         num_hidden_layers=loaded_layers(metadata, arch),
-        model_type=ARCHITECTURES[arch].model_type,
+        model_type=architecture.model_type,
         vocab_size=len(metadata.require("tokenizer.ggml.tokens", list)),
     )
+    if architecture.text_config is not None:
+        text.update(architecture.text_config(metadata, arch))
+    if architecture.flat:
+        if vision is not None:
+            raise ModelError(f"GGUF {arch} targets take no vision projector")
+        return text
     config = {
-        "model_type": ARCHITECTURES[arch].model_type.removesuffix("_text"),
+        "model_type": architecture.model_type.removesuffix("_text"),
         "text_config": text,
     }
     if vision is not None:
@@ -349,6 +393,77 @@ def loaded_layers(metadata, arch):
     if type(mtp) is not int or not 0 <= mtp < layers:
         raise ModelError("invalid GGUF MTP layer count")
     return layers - mtp
+
+
+def dense_layers(metadata, arch):
+    """The leading layers whose FFN is dense in a MoE target whose
+    architecture has such layers (leading_dense_block_count), fewer than its
+    layers; none in any other."""
+    if not ARCHITECTURES[arch].leading_dense:
+        return 0
+    key = arch + ".leading_dense_block_count"
+    dense = metadata.require(key, int)
+    if not 0 <= dense < loaded_layers(metadata, arch):
+        raise ModelError("invalid GGUF metadata: " + key)
+    return dense
+
+
+def layer_pattern(metadata, arch, name):
+    """A boolean per loaded layer, the header's array `name`."""
+    key = f"{arch}.{name}"
+    values = metadata.values.get(key)
+    if (
+        type(values) is not list
+        or len(values) != loaded_layers(metadata, arch)
+        or any(type(value) is not bool for value in values)
+    ):
+        raise ModelError("missing or invalid GGUF metadata: " + key)
+    return values
+
+
+# The router functions of llama_expert_gating_func_type, by its value, as a
+# configuration's router_score_function names them.
+EXPERT_GATING_FUNCTIONS = {1: "softmax", 2: "sigmoid"}
+
+
+def flint_text_config(metadata, arch):
+    """What Flint's config.json states beyond the sizes every architecture's
+    does, from its header: the dense, routed and shared experts' FFN widths,
+    the experts each token takes and how the router weighs them, the leading
+    dense layers, the sliding window, the layers that slide
+    (attention.sliding_window_pattern) and those without RoPE
+    (attention.rope_pattern), and the tokens that end a turn. The engine's
+    check holds each to the family's by its key (its layer patterns
+    included, which scalar_metadata leaves out)."""
+    gating = metadata.require(arch + ".expert_gating_func", int)
+    if gating not in EXPERT_GATING_FUNCTIONS:
+        raise ModelError(f"unsupported GGUF expert gating function: {gating}")
+    stops = metadata.require("tokenizer.ggml.eog_token_ids", list)
+    if not stops or any(type(token) is not int for token in stops):
+        raise ModelError("invalid GGUF metadata: tokenizer.ggml.eog_token_ids")
+    sliding = layer_pattern(metadata, arch, "attention.sliding_window_pattern")
+    rotated = layer_pattern(metadata, arch, "attention.rope_pattern")
+    return {
+        "intermediate_size": metadata.positive(arch + ".feed_forward_length"),
+        "moe_intermediate_size": metadata.positive(
+            arch + ".expert_feed_forward_length"
+        ),
+        "shared_expert_intermediate_size": metadata.positive(
+            arch + ".expert_shared_feed_forward_length"
+        ),
+        "num_experts_per_tok": metadata.positive(arch + ".expert_used_count"),
+        "norm_topk_prob": metadata.require(arch + ".expert_weights_norm", bool),
+        "router_score_function": EXPERT_GATING_FUNCTIONS[gating],
+        "mlp_only_layers": list(range(dense_layers(metadata, arch))),
+        "sliding_window": metadata.positive(arch + ".attention.sliding_window"),
+        "layer_types": [
+            "sliding_attention" if slides else "full_attention" for slides in sliding
+        ],
+        "no_rope_layer_indices": [
+            layer for layer, rotates in enumerate(rotated) if not rotates
+        ],
+        "eos_token_id": stops,
+    }
 
 
 def vision_config(vision):
@@ -471,7 +586,8 @@ EMBEDDING_TYPES = FORMAT_TYPES
 # shared-expert scalar gates of F32, BF16 or Q8_0, which preparation turns
 # into the F32 values they hold (floatRows); GDN alpha and beta, each of a
 # format or F32, which preparation widens to the F32 values they hold unless
-# both are of one quantized type or both BF16.
+# both are of one quantized type or both BF16; and Flint's attention sinks,
+# as llama.cpp writes them, of F32.
 F32 = {"F32"}
 NORM_TYPES = {"F32", "BF16", "F16"}
 FLOAT_PROJECTION_TYPES = {"F32", "BF16"}
@@ -519,13 +635,17 @@ MOE_TENSORS = {
     "ffn_up_shexp.weight": FORMAT_TYPES,
     "ffn_down_shexp.weight": FORMAT_TYPES,
 }
-# A MoE layer whose gate and up experts are llama.cpp's fused tensor
-# (create_tensor_gate_up_exps): each expert's gate rows, then its up rows.
-FUSED_MOE_TENSORS = {
-    name: types
-    for name, types in MOE_TENSORS.items()
-    if name not in ("ffn_gate_exps.weight", "ffn_up_exps.weight")
-} | {"ffn_gate_up_exps.weight": FORMAT_TYPES}
+
+
+def fused_experts(moe_tensors):
+    """A MoE layer's tensors where its gate and up experts are llama.cpp's
+    fused tensor (create_tensor_gate_up_exps): each expert's gate rows, then
+    its up rows."""
+    return {
+        name: types
+        for name, types in moe_tensors.items()
+        if name not in ("ffn_gate_exps.weight", "ffn_up_exps.weight")
+    } | {"ffn_gate_up_exps.weight": FORMAT_TYPES}
 
 
 # Qwen3.8-Flash-Next (qwen4exp): hyper-connections replace every norm, so a
@@ -566,6 +686,20 @@ QWEN4_PLE_TENSORS = {
     "ple_conv1d.weight": NORM_TYPES,
 }
 
+# Flint (flint): every layer attention, its norm before the FFN named
+# ffn_norm, each attention head's learned sink logit an F32 value, and a
+# shared expert without a gate in its MoE layers.
+FLINT_LAYER_TENSORS = {
+    "attn_norm.weight": NORM_TYPES,
+    "ffn_norm.weight": NORM_TYPES,
+}
+FLINT_ATTENTION_TENSORS = {"attn_sinks.weight": F32}
+FLINT_MOE_TENSORS = {
+    name: types
+    for name, types in MOE_TENSORS.items()
+    if name != "ffn_gate_inp_shexp.weight"
+}
+
 
 @dataclass(frozen=True)
 class Architecture:
@@ -587,6 +721,21 @@ class Architecture:
     # The one layer its PLE n-gram embedding feeds, which ple.layers names
     # alone; it reads QWEN4_PLE_TENSORS. None without one.
     ple_layer: int | None = None
+    # A MoE layer's tensors beside the layer's own.
+    moe_tensors: dict = field(default_factory=lambda: MOE_TENSORS)
+    # Whether its layers are Qwen3.5's hybrid of GDN and full attention, each
+    # full_attention_interval-th layer full attention; otherwise each layer
+    # is attention.
+    hybrid: bool = True
+    # Whether a MoE target's leading_dense_block_count leading layers have a
+    # dense FFN (dense_layers).
+    leading_dense: bool = False
+    # What its configuration states beyond the sizes model_config derives,
+    # given the metadata and the architecture's name; None for nothing more.
+    text_config: Callable | None = None
+    # Whether its configuration is flat, the text model's at its top, as
+    # Flint's is; otherwise under text_config, as Qwen's is.
+    flat: bool = False
 
 
 # The GGUF text architectures Splash serves, by general.architecture; the
@@ -606,30 +755,46 @@ ARCHITECTURES = {
         qsa_block=4,
         ple_layer=1,
     ),
+    "flint": Architecture(
+        "flint",
+        MODEL_TENSORS,
+        FLINT_LAYER_TENSORS,
+        moe=True,
+        attention_tensors=FLINT_ATTENTION_TENSORS,
+        moe_tensors=FLINT_MOE_TENSORS,
+        hybrid=False,
+        leading_dense=True,
+        text_config=flint_text_config,
+        flat=True,
+    ),
 }
 
 
 def loaded_tensors(metadata):
     """Each tensor the native loader reads from the target that metadata
-    describes, with the types it accepts. MTP layers are not loaded; every
-    full_attention_interval-th layer is full attention, the others GDN. A MoE
-    layer whose header lists the fused gate/up experts tensor reads it in place
-    of the two. A PLE layer reads the n-gram embedding's tensors too."""
+    describes, with the types it accepts. MTP layers are not loaded; in a
+    hybrid every full_attention_interval-th layer is full attention, the
+    others GDN, and otherwise every layer is attention. A MoE target's
+    leading dense layers (dense_layers) read a dense FFN, and a MoE layer
+    whose header lists the fused gate/up experts tensor reads it in place of
+    the two. A PLE layer reads the n-gram embedding's tensors too."""
     arch = text_architecture(metadata)
     architecture = ARCHITECTURES[arch]
-    period = metadata.positive(arch + ".full_attention_interval")
+    if architecture.hybrid:
+        period = metadata.positive(arch + ".full_attention_interval")
+    dense = dense_layers(metadata, arch)
     tensors = dict(architecture.model_tensors)
     for layer in range(loaded_layers(metadata, arch)):
-        if (layer + 1) % period == 0:
+        if not architecture.hybrid or (layer + 1) % period == 0:
             mixer = ATTENTION_TENSORS | architecture.attention_tensors
         else:
             mixer = GDN_TENSORS
-        if not architecture.moe:
+        if not architecture.moe or layer < dense:
             ffn = DENSE_TENSORS
         elif f"blk.{layer}.ffn_gate_up_exps.weight" in metadata.tensors:
-            ffn = FUSED_MOE_TENSORS
+            ffn = fused_experts(architecture.moe_tensors)
         else:
-            ffn = MOE_TENSORS
+            ffn = architecture.moe_tensors
         parts = architecture.layer_tensors | mixer | ffn
         if layer == architecture.ple_layer:
             parts |= QWEN4_PLE_TENSORS

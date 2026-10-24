@@ -236,8 +236,8 @@ public:
       }
       cursor += alignUp(sizes[index]);
     }
-    if (const metal::MetalBuffer cell = get(PrefillTensor::GroupCell))
-      groupCell_ = gdnCellBuffers(backend, cell, geometry.target.stateLayout);
+    if (chunks_ > 1)
+      groupCell_ = gdnCellBuffers(backend, get(PrefillTensor::GroupCell), geometry.target.stateLayout);
     if (cursor != bytes_)
       throw std::logic_error("prefill arena mismatch");
     auto *target = static_cast<float *>(
@@ -272,7 +272,8 @@ public:
     return tensors_[index];
   }
   [[nodiscard]] uint32_t chunks() const noexcept { return chunks_; }
-  // A group's scratch cell (PrefillTensor::GroupCell); null without groups.
+  // A group's scratch cell (PrefillTensor::GroupCell), whose views are empty
+  // when cells have no bytes; null without groups.
   [[nodiscard]] const GdnParityBuffers *groupCell() const noexcept {
     return groupCell_ ? &*groupCell_ : nullptr;
   }

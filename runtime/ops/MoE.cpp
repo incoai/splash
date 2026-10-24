@@ -7,6 +7,7 @@
 
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
@@ -28,18 +29,20 @@ void requireSegment(const QuantizedSegment &segment, uint32_t output, uint32_t i
 void validate(const BlockMoeWeights &weights, MoeShape shape) {
   const uint32_t hidden = shape.hiddenSize, intermediate = shape.expertIntermediateSize;
   requireSegment(weights.router, shape.experts, hidden, true, "MoE router");
-  requireSegment(weights.sharedScalarGate, 1, hidden, true, "MoE shared scalar gate");
-  // The select kernel reads the scalar gate's fp32 weights.
-  if (weights.sharedScalarGate.formatId != QuantizedSegment::kFloat32)
-    throw std::invalid_argument("the MoE shared scalar gate is not F32");
-  requireBytes(weights.sharedScalarGate.plane0, uint64_t{hidden} * sizeof(float), "MoE shared scalar gate weight");
+  if (shape.sharedGate) {
+    requireSegment(weights.sharedScalarGate, 1, hidden, true, "MoE shared scalar gate");
+    // The select kernel reads the scalar gate's fp32 weights.
+    if (weights.sharedScalarGate.formatId != QuantizedSegment::kFloat32)
+      throw std::invalid_argument("the MoE shared scalar gate is not F32");
+    requireBytes(weights.sharedScalarGate.plane0, uint64_t{hidden} * sizeof(float), "MoE shared scalar gate weight");
+  }
   if (!weights.slots) throw std::invalid_argument("MoE routed experts have no slots");
   requireBytes(weights.slotTable, uint64_t{shape.experts} * sizeof(uint32_t), "MoE slot table");
   for (const auto &[projection, name, output, input] :
        {std::tuple{&weights.gate, "gate", intermediate, hidden}, std::tuple{&weights.up, "up", intermediate, hidden},
         std::tuple{&weights.down, "down", hidden, intermediate}}) {
     requireSegment(projection->routed, weights.slots * output, input, false, std::string("MoE expert ") + name);
-    requireSegment(projection->shared, output, input, false, std::string("MoE shared ") + name);
+    requireSegment(projection->shared, shape.sharedSlices * output, input, false, std::string("MoE shared ") + name);
   }
 }
 
@@ -64,11 +67,19 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows, MoeG
           groupedRows * widest * sizeof(uint16_t), sumsBytes};
 }
 
-// A routing kernel's instance for the shape's router width: past
-// SPLASH_MOE_EXPERT_SLOTS experts, its wide one.
-std::string routingKernel(std::string name, MoeShape shape) {
+// The shape's compiled routing (MoeShape::compiledRouting).
+const CompiledMoeRouting &compiledRouting(MoeShape shape) {
+  if (const CompiledMoeRouting *compiled = shape.compiledRouting()) return *compiled;
+  throw std::invalid_argument("no MoE kernel routes the shape's router and shared slices");
+}
+
+// A routing kernel's instance for the shape's router width (past
+// SPLASH_MOE_EXPERT_SLOTS experts, its wide one) and its compiled routing's
+// `suffix`.
+std::string routingKernel(std::string name, MoeShape shape, std::string_view CompiledMoeRouting::*suffix) {
   static_assert(SPLASH_MOE_WIDE_EXPERT_SLOTS == 512, "the wide routing kernels are the _e512 instances");
   if (shape.routerWidth() == SPLASH_MOE_WIDE_EXPERT_SLOTS) name += "_e512";
+  name += compiledRouting(shape).*suffix;
   return name;
 }
 
@@ -99,6 +110,8 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
                                       " weights of " + std::to_string(s->inputSize) + " inputs");
   const uint32_t threads = table16 ? GGUF_REGISTER_THREADS : GGUF_STAGED_THREADS;
   const std::string kernel = table16 ? "moe_expert_gguf_sg" : "moe_expert_gguf_m" + std::to_string(plan.tileRows());
+  // The passes' instances for the shape's shared slices.
+  const std::string slices(compiledRouting(shape).slicesSuffix);
   const metal::IndirectGrid gateUpGrid{scratch.tileCount, offsetof(MoeTileCount, gate_up_grid)};
   const metal::IndirectGrid downGrid{scratch.tileCount, offsetof(MoeTileCount, down_grid)};
   const auto params = [&](const BlockExpertProjection &projection, uint32_t n, uint32_t k) {
@@ -116,8 +129,8 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
                      projection.routed.meta, projection.shared.plane0,
                      projection.shared.plane1Slot(), projection.shared.meta, output,
                      scratch.expertOutput, weights.slotTable});
-    graph.add(kernel + (up ? "_g" : "_a"), std::move(bindings), params(projection, n, k), {columns, tiles, 1}, grid,
-              {threads, 1, 1});
+    graph.add(kernel + (up ? "_g" : "_a") + slices, std::move(bindings), params(projection, n, k), {columns, tiles, 1},
+              grid, {threads, 1, 1});
   };
   const uint32_t hidden = shape.hiddenSize;
   const uint32_t intermediate = shape.expertIntermediateSize;
@@ -125,7 +138,7 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
     const BlockExpertProjection &gate = weights.gate, &up = weights.up;
     // One pair table where gate and up share their formats, one each otherwise.
     const bool mixed = gate.routed.formatId != up.routed.formatId || gate.shared.formatId != up.shared.formatId;
-    graph.add(kernel + (mixed ? "_gate_up_mixed" : "_gate_up"),
+    graph.add(kernel + (mixed ? "_gate_up_mixed" : "_gate_up") + slices,
               {scratch.groupedInput, scratch.tileDescriptors, scratch.tileCount,
                gate.routed.plane0, gate.routed.plane1Slot(), gate.routed.meta,
                gate.shared.plane0, gate.shared.plane1Slot(), gate.shared.meta,
@@ -221,7 +234,8 @@ void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
                  "MoE verify rows");
     grouping.push_back(buffers.verifyRows);
   }
-  graph.add(routingKernel(buffers.verifyRows ? "moe_group_routes_verified" : "moe_group_routes", shape),
+  graph.add(routingKernel(buffers.verifyRows ? "moe_group_routes_verified" : "moe_group_routes", shape,
+                          &CompiledMoeRouting::slicesSuffix),
             std::move(grouping), groupParams(plan), {1, 1, 1}, {shape.routerWidth(), 1, 1});
 }
 
@@ -256,11 +270,14 @@ void MoE::addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input,
                     const metal::MetalBuffer &selected, const metal::MetalBuffer &routingWeights, uint32_t rows,
                     MoeShape shape, FloatTile routerTile) {
   // fp32 scores of the F32 router in rows of routerWidth() expert slots, as
-  // the select kernel of that width reads.
+  // the select kernel of that width reads, which weights gated shared slices
+  // by the sigmoid of the input's product with the scalar gate.
   const uint32_t width = shape.routerWidth();
   addGgufFloat(graph, input, router, scores, rows, width, 0, FloatOutput::Float32, routerTile);
-  graph.add(routingKernel("moe_route_select_f32", shape),
-            {scores, input, sharedScalarGate.plane0, selected, routingWeights},
+  std::vector<metal::MetalBuffer> bindings{scores};
+  if (shape.sharedGate) bindings.insert(bindings.end(), {input, sharedScalarGate.plane0});
+  bindings.insert(bindings.end(), {selected, routingWeights});
+  graph.add(routingKernel("moe_route_select_f32", shape, &CompiledMoeRouting::selectSuffix), std::move(bindings),
             MoeRouteParams{rows, shape.hiddenSize, shape.experts, shape.expertsPerToken}, {rows, 1, 1},
             {width, 1, 1});
 }

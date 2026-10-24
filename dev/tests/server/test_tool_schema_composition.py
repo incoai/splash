@@ -20,6 +20,7 @@ from dev.tests.tool_output import (
     tool_policy,
 )
 from server import api_shapes, tool_schema
+from server.chat_format import QWEN
 from server.errors import APIError
 from server.tool_schema import _grammar_compatible_schema
 
@@ -44,7 +45,9 @@ class ToolSchemaCompositionTests(HarnessTestCase):
         cls.tokenizer, cls.guidance = grammar_tokenizers()
 
     def accepts(self, policy, xml):
-        matcher = LLMatcher(self.guidance, tool_schema.tool_grammar(policy, False))
+        matcher = LLMatcher(
+            self.guidance, tool_schema.tool_grammar(policy, False, chat_format=QWEN)
+        )
         tokens = self.tokenizer.encode(xml).ids
         return (
             matcher.validate_tokens(tokens) == len(tokens)
@@ -60,7 +63,7 @@ class ToolSchemaCompositionTests(HarnessTestCase):
         policy = strict_policy(schema)
         self.assertFalse(
             LLMatcher.validate_grammar(
-                tool_schema.tool_grammar(policy, False), self.guidance
+                tool_schema.tool_grammar(policy, False, chat_format=QWEN), self.guidance
             )
         )
         shape = policy.argument_schemas["t0"]
@@ -176,7 +179,7 @@ class ToolSchemaCompositionTests(HarnessTestCase):
                     tool_schema, "_lookup_tool_reference", side_effect=lookup
                 ) as counted,
             ):
-                tool_schema.tool_grammar(policy, False)
+                tool_schema.tool_grammar(policy, False, chat_format=QWEN)
             # A few lookups per reference, rather than one per path.
             self.assertLess(counted.call_count, 4 * (depth + 1))
             self.check_arguments(schema, arguments)
@@ -193,7 +196,9 @@ class ToolSchemaCompositionTests(HarnessTestCase):
         }
         definitions[f"d{depth}"] = {"enum": ["a", "b"]}
         schema = {"$defs": definitions, "properties": {"value": {"$ref": "#/$defs/d0"}}}
-        grammar = tool_schema.tool_grammar(strict_policy(schema), False)
+        grammar = tool_schema.tool_grammar(
+            strict_policy(schema), False, chat_format=QWEN
+        )
         arguments = json.loads(grammar)["grammars"][1]["lark_grammar"]
         self.assertIn('("a" | "b")', arguments)
         self.check_arguments(schema, {"value": "b"})
@@ -223,7 +228,7 @@ class ToolSchemaCompositionTests(HarnessTestCase):
         nested["$ref"] = "#/$defs/d0"
         half = {"properties": {"x": {"description": "d" * 12_000}}}
         with mock.patch.object(tool_schema, "MAX_FRAMED_SCHEMA_BYTES", 20_000):
-            tool_schema.tool_grammar(strict_policy(half), False)
+            tool_schema.tool_grammar(strict_policy(half), False, chat_format=QWEN)
             for name, schemas in (
                 ("wide union", [wide]),
                 ("root copies", [copies]),
@@ -234,7 +239,9 @@ class ToolSchemaCompositionTests(HarnessTestCase):
                     self.subTest(name),
                     self.assertRaisesRegex(APIError, "too complex") as caught,
                 ):
-                    tool_schema.tool_grammar(strict_policy(*schemas), False)
+                    tool_schema.tool_grammar(
+                        strict_policy(*schemas), False, chat_format=QWEN
+                    )
                 self.assertEqual(caught.exception.status, 400)
 
     def test_tools_that_are_not_strict_are_framed_for_their_types_alone(self):
@@ -270,7 +277,9 @@ class ToolSchemaCompositionTests(HarnessTestCase):
         )
         with mock.patch.object(tool_schema, "MAX_FRAMED_SCHEMA_BYTES", 20_000):
             with self.assertRaisesRegex(APIError, "too complex"):
-                tool_schema.tool_grammar(strict_policy(referring), False)
+                tool_schema.tool_grammar(
+                    strict_policy(referring), False, chat_format=QWEN
+                )
             tools = [
                 {"function": {"name": "referring", "parameters": referring}},
                 {"function": {"name": "composed", "parameters": composed}},
@@ -278,7 +287,7 @@ class ToolSchemaCompositionTests(HarnessTestCase):
                 {"function": {"name": "strict", "parameters": plain, "strict": True}},
             ]
             policy = tool_schema.normalize_tools(tools, "auto", True)[1]
-            tool_schema.tool_grammar(policy, False)
+            tool_schema.tool_grammar(policy, False, chat_format=QWEN)
             names = ("referring", "composed", "plain", "strict")
             _, calls, _ = project("".join(map(call.format, names)), policy)
             self.assertEqual(

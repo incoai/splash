@@ -164,8 +164,9 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   }
   // The layout itself was checked by requireQwenLayout when the target
   // loaded. The draft reads 1 to ExecutionLimits::maximumDraftTargetLayers
-  // of its layers, ascending. The projection lists hold every projection the
-  // weights dispatch, which each have sizes.
+  // of its layers, ascending. A target without GDN layers has no GDN shape.
+  // The projection lists hold every projection the weights dispatch, which
+  // each have sizes.
   [[nodiscard]] bool valid() const noexcept {
     const auto sized = [](const std::vector<ops::ProjectionShape> &shapes) {
       return !shapes.empty() && std::all_of(shapes.begin(), shapes.end(), [](const auto &shape) {
@@ -178,7 +179,7 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
       return std::ranges::adjacent_find(ids, std::ranges::greater_equal{}) == ids.end() && ids.back() < layers;
     };
     return captured() && stateLayout.layers + kvLayout.attentionLayers == layers &&
-           gdnShape().valid() &&
+           (!stateLayout.layers || gdnShape().valid()) &&
            kvLayout.kvHeads == attentionKvHeads &&
            kvLayout.headDimension == attentionHeadDimension &&
            sized(prefillProjections) && sized(decodeProjections) &&

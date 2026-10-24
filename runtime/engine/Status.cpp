@@ -187,6 +187,22 @@ void appendKvReads(std::ostringstream &out, const model::KvReadStats &reads) {
       << ",\"read_failures\":" << reads.readFailures;
 }
 
+// A windowed layout's KV (kv.window): the pages a window and a state's tail
+// keep Full, whether pages past every window give up their windowed layers'
+// K/V, the pool's pages of each form in use, the blocks states' tails pin,
+// and the pages trimmed, the blocks that took the page of a writer that
+// computed them again and the states refused a tail that was not Full
+// (Cache::snapshot).
+void appendKvWindow(std::ostringstream &out, const KvWindowSnapshot &window, const KvPoolSnapshot &pool) {
+  const uint32_t slim = pool.slim.pagesAllocated - pool.slim.pagesFree;
+  const uint32_t used = pool.pagesAllocated - pool.pagesFree;
+  out << ",\"window\":{\"window_pages\":" << window.windowPages << ",\"trim\":" << boolean(window.trim)
+      << ",\"full_pages\":" << used - slim - (pool.index.pagesAllocated - pool.index.pagesFree)
+      << ",\"slim_pages\":" << slim << ",\"slim_bytes\":" << pool.slim.allocatedBytes
+      << ",\"pinned_blocks\":" << window.pinnedBlocks << ",\"trimmed_pages\":" << window.trimmedPages
+      << ",\"upgrades\":" << window.upgrades << ",\"refused_states\":" << window.refusedStates << '}';
+}
+
 // A spill-capable target's KV on the SSD cache (kv_spill): the engine's
 // requests by KV mode, conversions, bounds, ends and refusals, and the starts
 // waiting for the quota; the pages that hold only their index, the pool's
@@ -374,8 +390,10 @@ std::string runtimeStatusJson(
       << ",\"extent_release_max_ms\":" << pool.extentReleaseMaxMilliseconds
       << ",\"extent_compactions\":" << pool.extentCompactions
       << ",\"pages_moved\":" << pool.pagesMoved
-      << ",\"extent_compact_max_ms\":" << resources.extentCompactMaxMilliseconds
-      << "}"
+      << ",\"extent_compact_max_ms\":" << resources.extentCompactMaxMilliseconds;
+  if (resources.window)
+    appendKvWindow(out, *resources.window, pool);
+  out << "}"
       << ",\"state\":{\"entries\":" << state.entries
       << ",\"pinned\":" << state.pinned << ",\"in_use\":" << state.inUse
       << ",\"in_use_evictions\":" << state.inUseEvictions << ",\"bytes\":" << state.bytes

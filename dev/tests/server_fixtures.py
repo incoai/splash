@@ -4,6 +4,7 @@ them; request bodies and response readers for each API; and the PDFs and
 launcher arguments several tests build."""
 
 import base64
+import contextlib
 import http.client
 import inspect
 import io
@@ -24,7 +25,7 @@ from openai._streaming import SSEDecoder
 from tokenizers import Regex, Tokenizer, decoders, models, pre_tokenizers
 
 from dev.tests import native_peer
-from install import launcher
+from install import families, launcher
 from server import api_shapes, documents, images, serve_options
 from server import backend as backend_api
 from server import errors as api_errors
@@ -32,6 +33,7 @@ from server import frontend as request_frontend
 from server import protocol as wire
 from server import runtime as engine_runtime
 from server import server as api
+from server.chat_format import QWEN
 from server.chat_templates import ChatTemplates
 from server.lru import LRUCache
 from server.origins import parse_allowed_origin
@@ -285,7 +287,7 @@ class PassthroughStreamer:
         pass
 
     @staticmethod
-    def count_reasoning_tokens(_enabled, _tool_calls=False):
+    def count_reasoning_tokens(_chat_format, _thinking, _tool_calls=False):
         return 0
 
 
@@ -818,20 +820,30 @@ def main_args(**overrides):
     )
 
 
-def unprepared_hold():
+@contextlib.contextmanager
+def unprepared_hold(family="Qwen3.8-27B"):
     """main()'s hold of its model directory, for a test of a directory Splash
-    did not prepare: the directory as it is, held by nothing."""
-    return mock.patch.object(
-        api.assembly, "hold", side_effect=lambda path: (path, None)
-    )
+    did not prepare: the directory as it is, held by nothing, and a model of
+    `family` by its family's name."""
+    with (
+        mock.patch.object(api.assembly, "hold", side_effect=lambda path: (path, None)),
+        mock.patch.object(api.assembly, "family", return_value=families.named(family)),
+    ):
+        yield
 
 
 def make_frontend(
-    tokenizer, *args, constraint_factory=None, thinking_codec=None, **options
+    tokenizer,
+    *args,
+    constraint_factory=None,
+    thinking_codec=None,
+    chat_format=QWEN,
+    **options,
 ):
     """A frontend over the tokenizer, with its chat templates probed as
     startup probes them. Unless a test passes its own, generation is
-    unconstrained and thinking is signed with a fresh key."""
+    unconstrained, thinking is signed with a fresh key and the output is
+    read in the Qwen families' chat format."""
     if constraint_factory is None:
         constraint_factory = PassThroughConstraintFactory()
     if thinking_codec is None:
@@ -841,6 +853,7 @@ def make_frontend(
         *args,
         constraint_factory=constraint_factory,
         chat_templates=ChatTemplates(tokenizer),
+        chat_format=chat_format,
         thinking_codec=thinking_codec,
         **options,
     )
@@ -892,7 +905,7 @@ class Harness:
         allowed_hosts=(),
         allowed_origins=(),
         vision=True,
-        thinking_end=backend_api.DEFAULT_THINKING_END,
+        thinking_end=None,
         **frontend_options,
     ):
         self.tokenizer = tokenizer or FakeTokenizer()

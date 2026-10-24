@@ -77,7 +77,11 @@ struct TensorScale {
 // llama.cpp's NVFP4 rows (ggufNvfp4RowBytes set: rows of block_nvfp4 that long
 // from `offset` on) or by quantizing a GGUF tensor of BF16 or F16 values into
 // Q8_0 (ggufFloatRowBytes set: rows of ggufFloatType values that long from
-// `offset` on).
+// `offset` on). An image row is column window `window` of `windows` equal
+// windows of such a row, whole native blocks: its imageRowBytes() bytes from
+// window * imageRowBytes() on (a shared expert's down projection split into
+// slices of the routed experts' width, ops::MoeShape::sharedSlices). One
+// window is the whole row.
 struct TensorRows {
   std::string name;
   uint32_t type = 0;   // ggml type, or a loader's (metal/abi/QuantFormat.h)
@@ -92,6 +96,10 @@ struct TensorRows {
   uint32_t ggufFloatType = 0;
   uint64_t ggufFloatRowBytes = 0;
   uint64_t first = 0; // the source row of image row 0
+  uint32_t windows = 1;
+  uint32_t window = 0;
+
+  [[nodiscard]] uint64_t imageRowBytes() const noexcept { return rowBytes / windows; }
 };
 
 // Header and descriptor bytes.

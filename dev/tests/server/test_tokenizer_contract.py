@@ -5,6 +5,7 @@ from unittest import mock
 from dev.tests.server_fixtures import unprepared_hold
 from server import constraints as generation_constraints
 from server import server
+from server.chat_format import QWEN
 
 
 class TokenizerContractTests(unittest.TestCase):
@@ -23,7 +24,7 @@ class TokenizerContractTests(unittest.TestCase):
         )
 
     def test_padded_model_vocabulary_need_not_have_a_token_at_every_index(self):
-        generation_constraints.validate_tokenizer(self.tokenizer())
+        generation_constraints.validate_tokenizer(self.tokenizer(), QWEN)
 
     def test_mismatched_stop_or_thinking_tokens_are_rejected(self):
         for token in ("<|endoftext|>", "<|im_end|>", "</think>", "<tool_call>"):
@@ -33,7 +34,7 @@ class TokenizerContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     server.engine_runtime.EngineUnhealthy, "native token"
                 ):
-                    generation_constraints.validate_tokenizer(tokenizer)
+                    generation_constraints.validate_tokenizer(tokenizer, QWEN)
 
     def test_normalizer_cannot_split_a_native_special_token(self):
         tokenizer = self.tokenizer()
@@ -42,7 +43,7 @@ class TokenizerContractTests(unittest.TestCase):
         with self.assertRaisesRegex(
             server.engine_runtime.EngineUnhealthy, "native token"
         ):
-            generation_constraints.validate_tokenizer(tokenizer)
+            generation_constraints.validate_tokenizer(tokenizer, QWEN)
 
     def test_out_of_range_token_is_rejected(self):
         for token_id in (-1, 248320, True):
@@ -52,13 +53,13 @@ class TokenizerContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     server.engine_runtime.EngineUnhealthy, "vocabulary"
                 ):
-                    generation_constraints.validate_tokenizer(tokenizer)
+                    generation_constraints.validate_tokenizer(tokenizer, QWEN)
 
     def test_eos_configuration_must_match_a_native_stop_token(self):
         tokenizer = self.tokenizer()
         tokenizer.eos_token_id = 0
         with self.assertRaisesRegex(server.engine_runtime.EngineUnhealthy, "EOS token"):
-            generation_constraints.validate_tokenizer(tokenizer)
+            generation_constraints.validate_tokenizer(tokenizer, QWEN)
 
     def test_startup_rejects_tokenizer_before_starting_the_native_worker(self):
         args = server.parse_args(["model", "--model", "owner/model"])

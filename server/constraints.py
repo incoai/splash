@@ -12,28 +12,25 @@ from llguidance.numpy import (
 )
 
 from . import runtime as engine_runtime
+from .chat_format import THINK_END, THINK_START, TOOL_CALL_OPEN
 from .errors import APIError, ConstraintError
 from .lru import LRUCache
-from .tool_schema import (
-    THINK_END,
-    THINK_END_TOKEN_ID,
-    TOOL_CALL_OPEN,
-    TOOL_CALL_OPEN_TOKEN_ID,
-)
 
 
 class TokenConstraint:
-    VOCABULARY = 248320
     # A mask request simulates at most the engine's target verify rows
     # (ExecutionLimits::targetVerifyRows, 8: the pending anchor and seven
     # draft proposals) and takes a mask before and after each.
     MAX_ROWS = 9
-    EOS_TOKENS = (248044, 248046)
 
-    def __init__(self, matcher, executor):
+    def __init__(self, matcher, executor, chat_format):
         self.matcher = matcher
         self.executor = executor
-        self.bitmask = allocate_token_bitmask(self.MAX_ROWS, self.VOCABULARY)
+        # The model's vocabulary, which each mask covers, and the engine's
+        # stop tokens, which end a grammar's output.
+        self.vocabulary = chat_format.vocabulary
+        self.eos_tokens = chat_format.stop_ids
+        self.bitmask = allocate_token_bitmask(self.MAX_ROWS, self.vocabulary)
         # Generated batches the grammar has not consumed yet. The reader
         # thread commits them; the mask thread consumes them before the next
         # mask, so reading the native stream never waits for the grammar.
@@ -41,7 +38,7 @@ class TokenConstraint:
         self._committed: list[tuple[int, ...]] = []
 
     def commit(self, token_ids):
-        if any(not 0 <= token < self.VOCABULARY for token in token_ids):
+        if any(not 0 <= token < self.vocabulary for token in token_ids):
             raise ConstraintError("generated token is out of range")
         with self._lock:
             self._committed.append(tuple(token_ids))
@@ -58,7 +55,7 @@ class TokenConstraint:
             (
                 index
                 for index, token in enumerate(simulation_tokens)
-                if not 0 <= token < self.VOCABULARY
+                if not 0 <= token < self.vocabulary
             ),
             len(simulation_tokens),
         )
@@ -89,7 +86,7 @@ class TokenConstraint:
             # LLGuidance's bulk API rejects EOS after a NoExtension stop.
             stopped_eos = (
                 len(token_ids) == 1
-                and token_ids[0] in self.EOS_TOKENS
+                and token_ids[0] in self.eos_tokens
                 and not self.matcher.is_error()
                 and self.matcher.is_stopped()
                 and self.matcher.is_accepting()
@@ -108,21 +105,28 @@ class TokenConstraint:
                 )
 
 
-def validate_tokenizer(tokenizer):
+def validate_tokenizer(tokenizer, chat_format):
+    """Refuse a tokenizer that does not encode chat_format's tokens, which
+    the engine and the server read the model's output by, as that format
+    has them: its vocabulary must fit the model's, the engine's stop tokens,
+    the close of thinking, the model's own opening of it where the model
+    opens it, and a call's opening must each be one token, and its EOS one
+    of the stop tokens."""
     vocabulary = tokenizer.get_vocab()
     if not vocabulary or any(
-        type(token_id) is not int or not 0 <= token_id < TokenConstraint.VOCABULARY
+        type(token_id) is not int or not 0 <= token_id < chat_format.vocabulary
         for token_id in vocabulary.values()
     ):
         raise engine_runtime.EngineUnhealthy(
             "tokenizer vocabulary does not fit the native model"
         )
     expected = {
-        "<|endoftext|>": TokenConstraint.EOS_TOKENS[0],
-        "<|im_end|>": TokenConstraint.EOS_TOKENS[1],
-        THINK_END: THINK_END_TOKEN_ID,
-        TOOL_CALL_OPEN: TOOL_CALL_OPEN_TOKEN_ID,
+        **dict(chat_format.stop_tokens),
+        THINK_END: chat_format.think_end_id,
+        TOOL_CALL_OPEN: chat_format.call_open_id,
     }
+    if chat_format.think_start_id is not None:
+        expected[THINK_START] = chat_format.think_start_id
     for token, token_id in expected.items():
         if vocabulary.get(token) != token_id or tokenizer.encode(
             token, add_special_tokens=False
@@ -130,7 +134,7 @@ def validate_tokenizer(tokenizer):
             raise engine_runtime.EngineUnhealthy(
                 f"tokenizer must encode {token!r} as native token {token_id}"
             )
-    if tokenizer.eos_token_id not in TokenConstraint.EOS_TOKENS:
+    if tokenizer.eos_token_id not in chat_format.stop_ids:
         raise engine_runtime.EngineUnhealthy(
             "tokenizer EOS token does not match the native model"
         )
@@ -148,11 +152,12 @@ class ConstraintFactory:
     CACHE_SIZE = 32
     CACHE_SOURCE_BYTES = 8 * 1024 * 1024
 
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, chat_format):
+        self.chat_format = chat_format
         self.tokenizer = guidance_tokenizer(
             tokenizer,
-            n_vocab=TokenConstraint.VOCABULARY,
-            eos_token=list(TokenConstraint.EOS_TOKENS),
+            n_vocab=chat_format.vocabulary,
+            eos_token=list(chat_format.stop_ids),
             slices=LLTokenizer.json_slices(),
         )
         self.executor = LLExecutor()
@@ -170,7 +175,7 @@ class ConstraintFactory:
         parser's limits where generation reaches a construct, after the whole
         prompt has been processed."""
         matcher = self._matcher(grammar, timeout, prefixes)
-        return TokenConstraint(matcher.deep_copy(), self.executor)
+        return TokenConstraint(matcher.deep_copy(), self.executor, self.chat_format)
 
     def _matcher(self, grammar, timeout, prefixes):
         # Compilation uses the frontend's bounded preparation slots. Share
