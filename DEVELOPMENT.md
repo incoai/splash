@@ -2549,8 +2549,9 @@ every K split, and marks the device policy's pick, or, with a trailing `prefill=
 after the epilogue and the round count, one format's 128-row prefill tile at each chunk of `R`
 rows (more than 32); the formats `float-bf16` and `float-f32` time the float projection
 (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles instead, marking
-`Linear::ggufFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape
-on the device's plans and the other GGUF tile.
+`Linear::ggufFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape,
+or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the
+device's plans and the other GGUF tile.
 
 Target attention runs the geometries of `kCompiledAttention` (`runtime/ops/PagedAttention.cpp`):
 query heads over KV heads of a head dimension (`_d128` in the names of 128-wide heads' kernels;
@@ -2566,7 +2567,10 @@ an F32 per query head, to the reduce, which adds each to its row's softmax after
 their order, as a key with no value; one without an output gate (`gather`) gives the
 out-projection its attention rows as they are. The RoPE tables are of the target geometry's pairs
 (`rope_build_tables`, or `rope_build_tables_p64` for 64). `make test-engine-metal` runs
-`attention-variants`, every variant through the production encoders against fp64.
+`attention-variants`, every variant through the production encoders against fp64, and
+`make benchmark-attention-sweep ATTENTION_SWEEP_ARGS='--shapes flint-window,flint-full'` times
+Flint's two kinds of layers with their sinks: a window of 512 keys with RoPE, and the whole
+history without.
 
 ### Sparse attention
 
