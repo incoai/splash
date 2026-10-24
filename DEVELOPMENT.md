@@ -974,14 +974,23 @@ below, `seed`, `stop`, `priority`, `timeout` and `stream` with
 `echo`, `logprobs`, `best_of` and `n` other than 1 are rejected.
 
 Responses takes `input` and `instructions`, function `tools` and `namespace`
-groups of them, `tool_choice`, `parallel_tool_calls`, `reasoning.effort`,
-`thinking_token_budget`, `text.format` for structured output,
-`max_output_tokens`, the sampling fields, Chat's `ignore_eos`,
-`chat_template_kwargs` and `preserve_thinking`, and `store` and
-`previous_response_id` ([Responses state](#responses-state)). Reasoning comes
-back as `reasoning` output items. `conversation`, `background: true` and
+groups of them, custom (freeform) `tools`, `tool_choice`,
+`parallel_tool_calls`, `reasoning.effort`, `thinking_token_budget`,
+`text.format` for structured output, `max_output_tokens`, the sampling fields,
+Chat's `ignore_eos`, `chat_template_kwargs` and `preserve_thinking`, and `store`
+and `previous_response_id` ([Responses state](#responses-state)). Reasoning
+comes back as `reasoning` output items. `conversation`, `background: true` and
 `truncation` other than `disabled` return 400; Splash compacts nothing, so
 `context_management` leaves the input as sent.
+
+A custom tool, such as Codex's `apply_patch`, reaches the model as a function
+of one string parameter, `input`, whose description carries the tool's
+`format` (its grammar, or plain text); the grammar describes the input and
+does not constrain it. A call comes back as a `custom_tool_call` item with the
+input as the model wrote it, streamed as one
+`response.custom_tool_call_input.delta` and `.done` when the call closes;
+`custom_tool_call` and `custom_tool_call_output` items are taken as input, and
+`tool_choice` `{"type": "custom", "name": ...}` names one.
 
 Messages takes `max_tokens`, `system`, `messages`, custom `tools` (every one
 declared in the prompt, `defer_loading` ones too, so a `tool_result`'s

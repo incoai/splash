@@ -38,6 +38,7 @@ from .api_shapes import (
     anthropic_usage,
     completion_response,
     finish_reason,
+    is_custom_call,
     responses_item,
     responses_item_id,
     responses_output,
@@ -1299,6 +1300,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 )
 
         def item_delta(index, block, text):
+            if is_custom_call(job, block):
+                # A custom tool's input is the string inside the arguments;
+                # it streams whole when the call closes.
+                return
             if block.kind == "tool":
                 event, extra = "response.function_call_arguments.delta", {}
             elif block.kind == "reasoning":
@@ -1321,7 +1326,15 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
         def close_item(index, block):
             item = responses_item(job, block, index)
-            if block.kind == "tool":
+            if item["type"] == "custom_tool_call":
+                for event, field in (("delta", "delta"), ("done", "input")):
+                    send(
+                        f"response.custom_tool_call_input.{event}",
+                        item_id=item["id"],
+                        output_index=index,
+                        **{field: item["input"]},
+                    )
+            elif block.kind == "tool":
                 send(
                     "response.function_call_arguments.done",
                     item_id=item["id"],

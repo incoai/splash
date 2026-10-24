@@ -1169,7 +1169,7 @@ class ResponsesTests(HarnessTestCase):
                 {"text": {"format": {"type": "json_schema"}}},
                 "response_format.json_schema.schema is required",
             ),
-            ({"tools": [{"type": "custom", "name": "shell"}]}, "only function"),
+            ({"tools": [{"type": "web_search"}]}, "only function and custom tools"),
             (
                 {
                     "input": [
