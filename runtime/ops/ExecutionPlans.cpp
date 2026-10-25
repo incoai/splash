@@ -1,7 +1,9 @@
 #include "ops/ExecutionPlans.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
+#include <string_view>
 
 namespace splash::ops {
 namespace {
@@ -46,6 +48,11 @@ DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
 MoeConfig ExecutionPlans::moeConfig(MoeShape shape, uint32_t rows, MoePhase phase) const {
   MoeConfig config;
   config.ggufTile = moeGgufTile(family_, shape);
+  // Opt-in diagnostic fallback for a device whose staged GGUF kernels
+  // cannot complete compilation. The register tile does not support F16.
+  const char *registerExperts = std::getenv("SPLASH_GGUF_REGISTER_EXPERTS");
+  if (shape.registerFormats && registerExperts && std::string_view(registerExperts) == "1")
+    config.ggufTile = MoeGgufTile::Register;
   config.expertTile =
       phase == MoePhase::Prefill ? moeGgufPrefillTile(shape, rows, config.ggufTile) : MoeExpertTile::M8;
   config.ggufRouterTile = linear_.ggufFloatTile(rows, shape.experts);
