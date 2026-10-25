@@ -210,7 +210,8 @@ def validate_review(body):
 
 
 def messages_request(body):
-    """The classifier_context and user intent of a Messages request whose
+    """The classifier_context, user intent and scheduling (the priority and
+    cache_salt its reviews share with it) of a Messages request whose
     `safeguards` field asks for dangerous_tool_use results; None when it
     asks for none."""
     requested = body.get("safeguards")
@@ -224,6 +225,7 @@ def messages_request(body):
             return (
                 context if isinstance(context, dict) else {},
                 _intent(body.get("messages")),
+                {key: body[key] for key in ("priority", "cache_salt") if key in body},
             )
     return None
 

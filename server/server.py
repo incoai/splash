@@ -882,29 +882,30 @@ class FrontendHandler(BaseHTTPRequestHandler):
         """The safeguard_results of a Messages response that asked for them:
         each tool call in `blocks` reviewed in turn, within the request's
         deadline. A call the output cut has no verdict."""
-        context, intent = review
+        context, intent, scheduling = review
         tool_uses = {}
         for block in blocks:
             if block.kind != "tool":
                 continue
             tool_uses[block.call_id] = (
-                self._review_call(job, block, context, intent, on_idle)
+                self._review_call(job, block, context, intent, scheduling, on_idle)
                 if block.status == "completed"
                 else safeguards.unavailable("truncated")
             )
         return safeguards.messages_results(tool_uses)
 
-    def _review_call(self, job, block, context, intent, on_idle):
-        """One tool call's safeguard result. A review that fails leaves the
-        call without a verdict, which its client denies; only the client's
-        leaving ends the response."""
+    def _review_call(self, job, block, context, intent, scheduling, on_idle):
+        """One tool call's safeguard result, reviewed under the request's
+        priority and cache_salt. A review that fails leaves the call without
+        a verdict, which its client denies; only the client's leaving ends the
+        response."""
         action = {"name": block.name, "input": json_codec.loads(block.text)}
         try:
             review = self.app.prepare_review(
                 action,
                 intent,
                 context,
-                {},
+                scheduling,
                 deadline=job.deadline,
                 disconnected=self._client_disconnected,
             )

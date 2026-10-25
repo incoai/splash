@@ -202,6 +202,17 @@ class MessagesSafeguardTests(HarnessTestCase):
                 review = runtime.requests[1].frame
                 self.assertEqual(len(review.score_tokens), len(safeguards.OPTIONS))
 
+    def test_reviews_share_the_requests_cache_salt(self):
+        _, _, runtime, _ = self.messages(
+            Plan([[CALL]]),
+            Plan(logits=logits(safeguards.ALLOWED)),
+            stream=True,
+            cache_salt="tenant-a",
+        )
+        generation, review = (request.frame.cache_salt for request in runtime.requests)
+        self.assertNotEqual(generation, 0)
+        self.assertEqual(review, generation)
+
     def test_an_allowed_call_is_not_flagged(self):
         call, results, _, _ = self.messages(
             Plan([[CALL]]), Plan(logits=logits(safeguards.ALLOWED)), stream=True
@@ -269,7 +280,7 @@ class MessagesSafeguardTests(HarnessTestCase):
 
 class SafeguardPolicyTests(unittest.TestCase):
     def test_intent_is_the_latest_user_text_without_reminders(self):
-        _, intent = safeguards.messages_request(messages_body())
+        _, intent, _ = safeguards.messages_request(messages_body())
         self.assertEqual(intent, "Check the weather in Paris")
         body = messages_body()
         body["messages"] += [
