@@ -905,6 +905,7 @@ Messages requires it.
 | `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit |
 | `POST /tokenize`, `/apply-template` | A text's tokens, or a conversation's rendered prompt, without inference |
 | `POST /v1/judgments`, `/v1/systemone` | Scores over fixed answers ([judgment contracts](#judgment-contracts)) |
+| `POST /v1/safeguards` | Whether to block an agent's tool call ([action review](#action-review)) |
 | `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](#explicit-weights-release)). It takes no body (or `{}`); `200` with `{"released": true, "weights": …}`, `409 engine_busy` while the engine serves a request or restores its weights, `503 engine_busy` when the engine does not answer within 5 s, and `503 engine_recovering` or `server_shutdown` while the engine restarts or the server stops |
 | `GET /status`, `/metrics` | JSON status and Prometheus metrics ([status](#status-readiness-and-metrics)) |
 | `GET /health` | 200 while the server answers; public |
@@ -1476,6 +1477,38 @@ softmax over the declared answer slots. Choice/score `confidence` is normalized
 entropy concentration, `1 - H(p) / log(K)`, not an estimate of correctness.
 Score answers are probability-weighted level indices. Measure accuracy and
 calibrate on representative held-out data before using decision thresholds.
+
+### Action review
+
+`POST /v1/safeguards` reviews one tool call an agent wants to run without
+asking its user, and answers whether to block it:
+
+```bash
+curl http://127.0.0.1:8000/v1/safeguards \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "action": {"name": "Bash", "input": {"command": "git push --force"}},
+    "intent": "Fix the typo in the README"
+  }'
+```
+
+`action` takes the tool's `name` and its JSON `input`; `intent`, optional, is
+what the user asked for. `context`, optional, takes the shape of Claude Code's
+auto-mode `classifier_context` (the `safeguards` request field): the review
+reads its permission rules, auto-mode `allow`/`soft_deny`/`hard_deny` rules and
+`environment` notes as policy, and its working directory, trusted directories
+and git state as evidence, and ignores its other fields. It also takes `model`,
+`timeout`, `priority` and `cache_salt` as the generation APIs do.
+
+A review is one [judgment](#judgment-contracts) with thinking off and no
+generation: Splash's policy (`server/safeguards.py`) as fixed options, allowed
+first and then each category it blocks, such as running downloaded code,
+discarding uncommitted work or rewriting shared git history, and sending
+secrets elsewhere. The most likely option decides. The response carries
+`outcome` (`flagged` or `not_flagged`), the blocked `category` and its
+description as `explanation` (both null when not flagged), the per-option
+`probabilities`, `prompt_version` and `usage`. Like other judgments these are
+uncalibrated local model scores, not a guarantee.
 
 ### Status, readiness and metrics
 

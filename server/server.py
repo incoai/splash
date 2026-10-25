@@ -26,7 +26,7 @@ from install import assembly
 from install.models import ModelError
 
 from . import images as image_input
-from . import json_codec, judgments, serve_options
+from . import json_codec, judgments, safeguards, serve_options
 from . import protocol as wire
 from . import runtime as engine_runtime
 from .api_shapes import (
@@ -216,6 +216,7 @@ POST_ROUTES = {
     ),
     "/v1/judgments": PostRoute("_post_judgments", OPENAI_ERRORS),
     "/v1/systemone": PostRoute("_post_systemone", SYSTEMONE_ERRORS),
+    "/v1/safeguards": PostRoute("_post_safeguards", OPENAI_ERRORS),
     "/v1/memory/release": PostRoute(
         "_post_memory_release", OPENAI_ERRORS, fieldless=True
     ),
@@ -805,6 +806,21 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._json(
             200,
             judgments.judgment_response(self.app.response_model, row, job, result),
+        )
+
+    def _post_safeguards(self, body, deadline):
+        job = self.app.prepare_safeguard(
+            body, deadline=deadline, disconnected=self._client_disconnected
+        )
+        self._submit(job)
+        result = self._await_done(job)
+        self._json(
+            200,
+            safeguards.review_response(
+                self.app.response_model,
+                result,
+                judgments.softmax(list(result.option_logits)),
+            ),
         )
 
     def _post_memory_release(self, body, deadline):
