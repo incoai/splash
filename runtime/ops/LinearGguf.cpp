@@ -7,9 +7,11 @@
 #include "ops/BufferExtent.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -515,8 +517,15 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
               {u.outputSize / GGUF_STAGED_COLUMNS, splits, 1}, {GGUF_GATE_UP_THREADS, 1, 1});
     return;
   }
-  if (segments.size() == 1) {
-    addDecodeTensor(b, w.epilogue, segments.front(), gate, tensor);
+  // The 12-core Apple10-class GPU can spend minutes compiling the
+  // run-time-format fused kernel. Each segment writes disjoint columns,
+  // so dispatch the existing format-specific kernels on this device.
+  const char *separate = std::getenv("SPLASH_GGUF_SEPARATE_SEGMENTS");
+  const bool separateSegments = separate && std::string_view(separate) == "1" &&
+                                family_ == GpuFamilyClass::Apple10 && gpuCores_ == 12;
+  if (segments.size() == 1 || separateSegments) {
+    for (const QuantizedSegment &segment : segments)
+      addDecodeTensor(b, w.epilogue, segment, gate, tensor);
     return;
   }
   // Dispatch order is tile order: segments with the most bytes per tile
