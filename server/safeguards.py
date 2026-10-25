@@ -12,7 +12,7 @@ auto-mode classifier_context (the `safeguards` request field) carries the
 user's permission rules, auto-mode allow and deny rules and environment
 notes, which the review reads as part of its evidence.
 
-With --safeguards, a Messages request whose `safeguards` field asks for
+Unless serve --no-safeguards, a Messages request whose `safeguards` field asks for
 dangerous_tool_use gets each tool call of its response reviewed the same
 way, and the results as `safeguard_results`, which Claude Code reads in
 place of making classifier requests of its own. A call without a verdict

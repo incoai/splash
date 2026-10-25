@@ -217,7 +217,7 @@ OPTIONS = {
     ),
     "--allow-idle-sleep": ([(["--allow-idle-sleep"], True)], []),
     "--no-webui": ([(["--no-webui"], True)], []),
-    "--safeguards": ([(["--safeguards"], True)], []),
+    "--no-safeguards": ([(["--no-safeguards"], True)], []),
 }
 
 

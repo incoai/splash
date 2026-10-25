@@ -188,9 +188,9 @@ def _claude(path, server, environment, arguments):
         CLAUDE_CODE_USE_VERTEX="0",
         CLAUDE_CODE_USE_FOUNDRY="0",
     )
-    # Start in auto mode: Splash reviews each tool call itself with serve
-    # --safeguards, and otherwise Claude Code's own classifier requests reach
-    # Splash as Messages requests. A --permission-mode argument overrides it.
+    # Start in auto mode: Splash reviews each tool call itself, or with serve
+    # --no-safeguards Claude Code's own classifier requests reach Splash as
+    # Messages requests. A --permission-mode argument overrides it.
     return [
         path,
         "--disallowedTools",

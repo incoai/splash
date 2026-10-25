@@ -774,7 +774,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         chat, thinking_display = anthropic_to_chat_body(
             body, thinking_resolver=self.app.thinking_codec.decode
         )
-        # Without --safeguards the field is ignored, as an unknown field is,
+        # With --no-safeguards the field is ignored, as an unknown field is,
         # and Claude Code makes its own classifier requests.
         review = safeguards.messages_request(body) if self.server.safeguards else None
         job = self.app.prepare(
@@ -1828,7 +1828,7 @@ def main():
             webui=not args.no_webui,
             max_request_bytes=args.max_request_size,
             allowed_origins=args.allowed_origin,
-            safeguards=args.safeguards,
+            safeguards=not args.no_safeguards,
         )
         server.server_bind()
         if ANY_ORIGIN in args.allowed_origin and args.api_key is None:
