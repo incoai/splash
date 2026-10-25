@@ -687,6 +687,14 @@ class Frontend:
         action, intent, context = safeguards.validate_review(body)
         if not self.accepts_model(body.get("model")):
             raise APIError(404, f"model {body['model']} not found", "model_not_found")
+        return self.prepare_review(
+            action, intent, context, body, deadline=deadline, disconnected=disconnected
+        )
+
+    def prepare_review(self, action, intent, context, body, *, deadline, disconnected):
+        """The score job reviewing `action` for a user who asked for
+        `intent` under a caller `context`; `body` carries the priority and
+        cache_salt."""
         row = safeguards.review_row(action, intent, context)
         try:
             judgments.validate_row(row)

@@ -107,6 +107,7 @@ access.
 | `--cache-dir` | `~/Library/Caches/Splash/prefix-cache` | Where `--persistent-cache` keeps its files; needs `--persistent-cache`. |
 | `--served-model-name` | None | Additional model name the API accepts; repeatable. See [API model aliases](#api-model-aliases). |
 | `--announce-served-name` | Off | Report the first `--served-model-name` in responses; needs `--served-model-name`. |
+| `--safeguards` | Off | Review each tool call of a Messages response that asks for it and return `safeguard_results`, Claude Code auto mode's server-side classifier. See [action review](#action-review). |
 | `--default-reasoning-effort` | `SPLASH_DEFAULT_REASONING_EFFORT` or the template's | Effort of Chat and Responses requests that set none. See [default reasoning effort](#default-reasoning-effort). |
 | `--thinking-token-budget` | `SPLASH_THINKING_TOKEN_BUDGET` or none | Thinking tokens of a request that sets no budget. See [thinking token budget](#thinking-token-budget). |
 | `--thinking-end-text` | `SPLASH_THINKING_END_TEXT` or `</think>` | Text that ends thinking where a budget runs out, `</think>` its last token. See [thinking token budget](#thinking-token-budget). |
@@ -1509,6 +1510,30 @@ secrets elsewhere. The most likely option decides. The response carries
 description as `explanation` (both null when not flagged), the per-option
 `probabilities`, `prompt_version` and `usage`. Like other judgments these are
 uncalibrated local model scores, not a guarantee.
+
+With `splash serve --safeguards`, Splash also answers Claude Code's auto mode
+on `/v1/messages`. In auto mode Claude Code sends a `safeguards` field
+(`[{"type": "dangerous_tool_use", "classifier_context": {…}}]`) and reads
+verdicts back from the response, in place of making classifier requests of its
+own. Splash reviews each tool call of the response as above, the user's
+intent being the text of their latest turn without `<system-reminder>` blocks,
+and returns the results, on the final `message_delta` of a stream or at the
+top level of a complete response:
+
+```json
+"safeguard_results": [{"type": "dangerous_tool_use", "status": {
+  "type": "available",
+  "tool_uses": {"<tool_use id>": {"type": "evaluated", "outcome": "flagged",
+                                  "explanation": "…"}}}}]
+```
+
+The reviews run once the output ends, keeping the stream alive with `ping`
+events, one judgment per call under the request's deadline. A call the output
+cut, or whose review fails, times out or exceeds the context, has no verdict
+(`{"type": "unavailable", "reason": "truncated" | "error" | "timeout" |
+"input_too_long"}`), which Claude Code denies rather than run unreviewed.
+Without `--safeguards` the field is ignored, and Claude Code falls back to its
+own classifier requests, which reach Splash as ordinary Messages requests.
 
 ### Status, readiness and metrics
 

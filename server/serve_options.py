@@ -595,6 +595,18 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--safeguards",
+        "api",
+        dict(
+            action="store_true",
+            default=False,
+            help="answer the Messages safeguards field Claude Code's auto mode "
+            "sends: review each tool call the model makes and return "
+            "safeguard_results, so auto mode needs no classifier requests of "
+            "its own",
+        ),
+    ),
+    ServeOption(
         "--default-reasoning-effort",
         "api",
         dict(

@@ -11,6 +11,12 @@ The policy is Splash's own. A caller's context adds to it: Claude Code's
 auto-mode classifier_context (the `safeguards` request field) carries the
 user's permission rules, auto-mode allow and deny rules and environment
 notes, which the review reads as part of its evidence.
+
+With --safeguards, a Messages request whose `safeguards` field asks for
+dangerous_tool_use gets each tool call of its response reviewed the same
+way, and the results as `safeguard_results`, which Claude Code reads in
+place of making classifier requests of its own. A call without a verdict
+is `unavailable`, which Claude Code denies rather than run unreviewed.
 """
 
 from __future__ import annotations
@@ -20,6 +26,10 @@ import json
 from .errors import APIError
 
 PROMPT_VERSION = "splash-safeguards-v1"
+# The Messages safeguard this review answers.
+SAFEGUARD_TYPE = "dangerous_tool_use"
+# The most of the user's latest request a review reads.
+MAX_INTENT_CHARS = 4000
 QUESTION = (
     "An autonomous coding agent wants to run the action below without asking "
     "its user. Decide whether it is safe to run. The action is blocked when "
@@ -197,6 +207,78 @@ def validate_review(body):
     if context is not None and not isinstance(context, dict):
         raise APIError(400, "context must be an object")
     return action, intent, context
+
+
+def messages_request(body):
+    """The classifier_context and user intent of a Messages request whose
+    `safeguards` field asks for dangerous_tool_use results; None when it
+    asks for none."""
+    requested = body.get("safeguards")
+    if requested is None:
+        return None
+    if not isinstance(requested, list):
+        raise APIError(400, "safeguards must be an array")
+    for safeguard in requested:
+        if isinstance(safeguard, dict) and safeguard.get("type") == SAFEGUARD_TYPE:
+            context = safeguard.get("classifier_context")
+            return (
+                context if isinstance(context, dict) else {},
+                _intent(body.get("messages")),
+            )
+    return None
+
+
+def _intent(messages):
+    """What the user last asked for: the text of the latest user turn that
+    has any, without the reminders an agent attaches to it, at most
+    MAX_INTENT_CHARS of its end."""
+    for message in reversed(messages if isinstance(messages, list) else []):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            blocks = [{"type": "text", "text": content}]
+        elif isinstance(content, list):
+            blocks = content
+        else:
+            continue
+        texts = [
+            block["text"].strip()
+            for block in blocks
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+            and not block["text"].lstrip().startswith("<system-reminder>")
+        ]
+        text = "\n\n".join(text for text in texts if text)
+        if text:
+            return text[-MAX_INTENT_CHARS:]
+    return None
+
+
+def unavailable(reason):
+    """A tool call's result when it got no verdict: Claude Code denies it."""
+    return {"type": "unavailable", "reason": reason}
+
+
+def evaluated(probabilities):
+    """A tool call's result from its review's option probabilities."""
+    decided = verdict(probabilities)
+    result = {"type": "evaluated", "outcome": decided["outcome"]}
+    if decided["explanation"] is not None:
+        result["explanation"] = decided["explanation"]
+    return result
+
+
+def messages_results(tool_uses):
+    """The safeguard_results of a Messages response from each tool call's
+    result, by tool_use id."""
+    return [
+        {
+            "type": SAFEGUARD_TYPE,
+            "status": {"type": "available", "tool_uses": tool_uses},
+        }
+    ]
 
 
 def review_response(model, result, probabilities):

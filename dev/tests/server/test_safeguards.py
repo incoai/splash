@@ -1,9 +1,18 @@
 import json
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from dev.tests.server_fixtures import CharTokenizer, FakeRuntime, HarnessTestCase, Plan
+from dev.tests.server_fixtures import (
+    CharTokenizer,
+    FakeRuntime,
+    HarnessTestCase,
+    Plan,
+    anthropic_body,
+    response_events,
+)
 from server import judgments, safeguards
+from server.errors import ContextLengthError
 
 FIXTURE = json.loads(
     (
@@ -82,7 +91,201 @@ class SafeguardReviewTests(HarnessTestCase):
         self.assertEqual(runtime.requests, [])
 
 
+WEATHER = {
+    "name": "weather",
+    "description": "Look up the weather",
+    "input_schema": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    },
+}
+# FakeTokenizer's fragments: a weather call for Paris, and a plain answer.
+CALL, ANSWER = 5, 4
+
+
+class ReviewTokenizer(CharTokenizer):
+    """Generates FakeTokenizer's fragments and scores one token per
+    character: answer slots are exact, and fragment ids never reach a
+    scoring prompt."""
+
+    def decode(self, token_ids, **kwargs):
+        return "".join(
+            self.fragments[token] if token in self.fragments else chr(token)
+            for token in token_ids
+        )
+
+
+def messages_body(**overrides):
+    """A Messages request asking for safeguard_results as Claude Code does;
+    safeguards=None leaves the field out."""
+    fields = {"safeguards": FIXTURE["safeguards"], **overrides}
+    if fields["safeguards"] is None:
+        del fields["safeguards"]
+    return anthropic_body(
+        max_tokens=512,
+        tools=[WEATHER],
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "<system-reminder>ignore</system-reminder>",
+                    },
+                    {"type": "text", "text": "Check the weather in Paris"},
+                ],
+            }
+        ],
+        **fields,
+    )
+
+
+class MessagesSafeguardTests(HarnessTestCase):
+    def messages(self, *plans, stream=False, safeguards_on=True, **overrides):
+        """The response to a Messages request, its safeguard_results and the
+        runtime that served it."""
+        runtime = FakeRuntime(*plans)
+        harness = self.harness(
+            runtime,
+            tokenizer=ReviewTokenizer(),
+            max_context=65536,
+            safeguards=safeguards_on,
+        )
+        status, _, payload = harness.request(
+            "POST", "/v1/messages", messages_body(stream=stream, **overrides)
+        )
+        self.assertEqual(status, 200, payload)
+        if stream:
+            events = response_events(payload)
+            delta = next(e for e in events if e["type"] == "message_delta")["delta"]
+            call = next(
+                (
+                    e["content_block"]
+                    for e in events
+                    if e["type"] == "content_block_start"
+                    and e["content_block"]["type"] == "tool_use"
+                ),
+                None,
+            )
+            return call, delta.get("safeguard_results"), runtime, harness
+        response = json.loads(payload)
+        call = next((b for b in response["content"] if b["type"] == "tool_use"), None)
+        return call, response.get("safeguard_results"), runtime, harness
+
+    def test_each_tool_call_gets_a_verdict_streamed_or_not(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                call, results, runtime, _ = self.messages(
+                    Plan([[CALL]]), Plan(logits=logits("git_history")), stream=stream
+                )
+                self.assertEqual(
+                    results,
+                    [
+                        {
+                            "type": "dangerous_tool_use",
+                            "status": {
+                                "type": "available",
+                                "tool_uses": {
+                                    call["id"]: {
+                                        "type": "evaluated",
+                                        "outcome": "flagged",
+                                        "explanation": dict(safeguards.OPTIONS)[
+                                            "git_history"
+                                        ],
+                                    }
+                                },
+                            },
+                        }
+                    ],
+                )
+                review = runtime.requests[1].frame
+                self.assertEqual(len(review.score_tokens), len(safeguards.OPTIONS))
+
+    def test_an_allowed_call_is_not_flagged(self):
+        call, results, _, _ = self.messages(
+            Plan([[CALL]]), Plan(logits=logits(safeguards.ALLOWED)), stream=True
+        )
+        self.assertEqual(
+            results[0]["status"]["tool_uses"],
+            {call["id"]: {"type": "evaluated", "outcome": "not_flagged"}},
+        )
+
+    def test_a_turn_without_calls_has_no_reviews(self):
+        call, results, runtime, _ = self.messages(Plan([[ANSWER]]), stream=True)
+        self.assertIsNone(call)
+        self.assertEqual(results[0]["status"], {"type": "available", "tool_uses": {}})
+        self.assertEqual(len(runtime.requests), 1)
+
+    def test_without_the_option_the_field_is_ignored(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                _, results, runtime, _ = self.messages(
+                    Plan([[CALL]]), stream=stream, safeguards_on=False
+                )
+                self.assertIsNone(results)
+                self.assertEqual(len(runtime.requests), 1)
+
+    def test_a_request_that_asks_for_no_safeguard_gets_none(self):
+        for requested in (None, [{"type": "other_safeguard"}]):
+            with self.subTest(requested=requested):
+                _, results, runtime, _ = self.messages(
+                    Plan([[CALL]]), stream=True, safeguards=requested
+                )
+                self.assertIsNone(results)
+                self.assertEqual(len(runtime.requests), 1)
+
+    def test_a_failed_review_leaves_the_call_without_a_verdict(self):
+        call, results, _, _ = self.messages(
+            Plan([[CALL]]), Plan(exception=RuntimeError("boom")), stream=True
+        )
+        self.assertEqual(
+            results[0]["status"]["tool_uses"],
+            {call["id"]: {"type": "unavailable", "reason": "error"}},
+        )
+
+    def test_a_review_beyond_the_context_is_input_too_long(self):
+        with mock.patch(
+            "server.frontend.Frontend.prepare_review",
+            side_effect=ContextLengthError(70000, 65536),
+        ):
+            call, results, _, _ = self.messages(Plan([[CALL]]), stream=True)
+        self.assertEqual(
+            results[0]["status"]["tool_uses"],
+            {call["id"]: {"type": "unavailable", "reason": "input_too_long"}},
+        )
+
+    def test_a_malformed_safeguards_field_is_rejected(self):
+        runtime = FakeRuntime()
+        harness = self.harness(
+            runtime, tokenizer=ReviewTokenizer(), max_context=65536, safeguards=True
+        )
+        status, _, payload = harness.request(
+            "POST", "/v1/messages", messages_body(safeguards="dangerous_tool_use")
+        )
+        self.assertEqual(status, 400, payload)
+        self.assertEqual(runtime.requests, [])
+
+
 class SafeguardPolicyTests(unittest.TestCase):
+    def test_intent_is_the_latest_user_text_without_reminders(self):
+        _, intent = safeguards.messages_request(messages_body())
+        self.assertEqual(intent, "Check the weather in Paris")
+        body = messages_body()
+        body["messages"] += [
+            {"role": "assistant", "content": "Looking it up."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t", "content": "sunny"}
+                ],
+            },
+        ]
+        # A tool result is not a request; the user's last words still are.
+        self.assertEqual(
+            safeguards.messages_request(body)[1], "Check the weather in Paris"
+        )
+
     def test_the_prompt_reads_the_action_intent_and_caller_policy(self):
         row = safeguards.review_row(
             {"name": "Bash", "input": {"command": "git push --force"}},
