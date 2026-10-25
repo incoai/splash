@@ -1,0 +1,964 @@
+{
+  "command": [
+    "${SPLASH_ROOT}/build/qwen38-rejection-audit/native/rejection-audit",
+    "${SPLASH_ROOT}/build/qwen38-rejection-audit/native/splash.metallib",
+    "${SPLASH_ROOT}/install/models/mlx-community/Qwen3.8-27B-4bit",
+    "${SPLASH_ROOT}/build/qwen38-rejection-audit/protocol.json"
+  ],
+  "before": {
+    "utc": 1792951316.816459,
+    "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+    "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+    "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+    "swap": "vm.swapusage: total = 2048.00M  used = 1116.00M  free = 932.00M  (encrypted)\n"
+  },
+  "completed": [
+    {
+      "line": "AUDIT 1/192 code-5-token-bucket-2k-think 5.868s",
+      "utc": 1792951325.890367
+    },
+    {
+      "line": "AUDIT 2/192 chinese-4-library-reuse-8k-direct 17.251s",
+      "utc": 1792951343.14197
+    },
+    {
+      "line": "AUDIT 3/192 math-5-pigeonhole-2k-direct 5.812s",
+      "utc": 1792951348.959429
+    },
+    {
+      "line": "AUDIT 4/192 math-5-pigeonhole-short-think 2.333s",
+      "utc": 1792951351.293507
+    },
+    {
+      "line": "AUDIT 5/192 math-2-convex-jensen-short-direct 2.341s",
+      "utc": 1792951353.636568
+    },
+    {
+      "line": "AUDIT 6/192 json-0-deployment-calendar-2k-think 5.905s",
+      "utc": 1792951359.5470889
+    },
+    {
+      "line": "AUDIT 7/192 json-4-support-triage-2k-think 6.055s",
+      "utc": 1792951365.605589
+    },
+    {
+      "line": "AUDIT 8/192 chinese-5-waste-collection-short-think 2.337s",
+      "utc": 1792951367.947032
+    },
+    {
+      "line": "AUDIT 9/192 math-0-divisibility-induction-8k-direct 18.414s",
+      "utc": 1792951386.3675678
+    },
+    {
+      "line": "AUDIT 10/192 json-5-research-catalog-short-think 2.345s",
+      "utc": 1792951388.714551
+    },
+    {
+      "line": "AUDIT 11/192 chinese-6-bus-information-2k-think 6.188s",
+      "utc": 1792951394.905878
+    },
+    {
+      "line": "AUDIT 12/192 json-7-backup-manifest-2k-direct 6.197s",
+      "utc": 1792951401.107871
+    },
+    {
+      "line": "AUDIT 13/192 math-4-geometric-series-short-think 2.356s",
+      "utc": 1792951403.46695
+    },
+    {
+      "line": "AUDIT 14/192 chinese-6-bus-information-8k-think 18.462s",
+      "utc": 1792951421.935128
+    },
+    {
+      "line": "AUDIT 15/192 code-5-token-bucket-8k-think 18.315s",
+      "utc": 1792951440.25438
+    },
+    {
+      "line": "AUDIT 16/192 json-7-backup-manifest-short-think 2.343s",
+      "utc": 1792951442.59986
+    },
+    {
+      "line": "AUDIT 17/192 code-0-rollback-dsu-8k-direct 18.324s",
+      "utc": 1792951460.930478
+    },
+    {
+      "line": "AUDIT 18/192 code-6-topological-order-8k-think 18.337s",
+      "utc": 1792951479.2693272
+    },
+    {
+      "line": "AUDIT 19/192 json-6-conference-rooms-2k-think 6.106s",
+      "utc": 1792951485.3794172
+    },
+    {
+      "line": "AUDIT 20/192 math-1-inclusion-exclusion-2k-direct 6.194s",
+      "utc": 1792951491.578856
+    },
+    {
+      "line": "AUDIT 21/192 math-2-convex-jensen-2k-think 6.261s",
+      "utc": 1792951497.8426292
+    },
+    {
+      "line": "AUDIT 22/192 chinese-5-waste-collection-8k-direct 18.711s",
+      "utc": 1792951516.557014
+    },
+    {
+      "line": "AUDIT 23/192 code-4-cursor-pages-short-direct 2.634s",
+      "utc": 1792951519.1916249
+    },
+    {
+      "line": "AUDIT 24/192 chinese-4-library-reuse-8k-think 18.898s",
+      "utc": 1792951538.092169
+    },
+    {
+      "line": "AUDIT 25/192 code-4-cursor-pages-8k-think 18.859s",
+      "utc": 1792951556.954367
+    },
+    {
+      "line": "AUDIT 26/192 code-6-topological-order-short-think 2.522s",
+      "utc": 1792951559.4767401
+    },
+    {
+      "line": "AUDIT 27/192 code-0-rollback-dsu-2k-direct 6.273s",
+      "utc": 1792951565.7507799
+    },
+    {
+      "line": "AUDIT 28/192 chinese-1-school-meals-short-think 2.493s",
+      "utc": 1792951568.244729
+    },
+    {
+      "line": "AUDIT 29/192 code-1-stream-csv-short-direct 2.494s",
+      "utc": 1792951570.741127
+    },
+    {
+      "line": "AUDIT 30/192 math-1-inclusion-exclusion-short-direct 2.498s",
+      "utc": 1792951573.24425
+    },
+    {
+      "line": "AUDIT 31/192 chinese-1-school-meals-2k-think 6.311s",
+      "utc": 1792951579.5566201
+    },
+    {
+      "line": "AUDIT 32/192 code-2-fair-scheduler-8k-think 18.676s",
+      "utc": 1792951598.239315
+    },
+    {
+      "line": "AUDIT 33/192 math-2-convex-jensen-2k-direct 6.326s",
+      "utc": 1792951604.567491
+    },
+    {
+      "line": "AUDIT 34/192 code-6-topological-order-2k-think 6.413s",
+      "utc": 1792951610.983228
+    },
+    {
+      "line": "AUDIT 35/192 code-2-fair-scheduler-8k-direct 18.998s",
+      "utc": 1792951629.987028
+    },
+    {
+      "line": "AUDIT 36/192 chinese-2-storm-drains-short-think 2.555s",
+      "utc": 1792951632.5449128
+    },
+    {
+      "line": "AUDIT 37/192 code-7-rolling-median-2k-direct 6.580s",
+      "utc": 1792951639.128903
+    },
+    {
+      "line": "AUDIT 38/192 math-2-convex-jensen-8k-direct 19.371s",
+      "utc": 1792951658.504554
+    },
+    {
+      "line": "AUDIT 39/192 json-6-conference-rooms-short-think 2.608s",
+      "utc": 1792951661.113902
+    },
+    {
+      "line": "AUDIT 40/192 math-3-binary-gcd-short-direct 2.629s",
+      "utc": 1792951663.745209
+    },
+    {
+      "line": "AUDIT 41/192 json-3-device-maintenance-2k-think 6.695s",
+      "utc": 1792951670.44492
+    },
+    {
+      "line": "AUDIT 42/192 json-2-museum-program-short-think 2.635s",
+      "utc": 1792951673.083943
+    },
+    {
+      "line": "AUDIT 43/192 json-4-support-triage-short-direct 2.642s",
+      "utc": 1792951675.729156
+    },
+    {
+      "line": "AUDIT 44/192 chinese-3-bicycle-parking-short-direct 2.642s",
+      "utc": 1792951678.37601
+    },
+    {
+      "line": "AUDIT 45/192 math-0-divisibility-induction-2k-think 6.731s",
+      "utc": 1792951685.109487
+    },
+    {
+      "line": "AUDIT 46/192 code-1-stream-csv-2k-think 6.910s",
+      "utc": 1792951692.021139
+    },
+    {
+      "line": "AUDIT 47/192 chinese-7-shared-laundry-8k-think 20.149s",
+      "utc": 1792951712.1739762
+    },
+    {
+      "line": "AUDIT 48/192 math-7-counting-paths-8k-think 20.335s",
+      "utc": 1792951732.5155048
+    },
+    {
+      "line": "AUDIT 49/192 json-2-museum-program-2k-direct 7.055s",
+      "utc": 1792951739.572801
+    },
+    {
+      "line": "AUDIT 50/192 json-4-support-triage-2k-direct 7.067s",
+      "utc": 1792951746.642533
+    },
+    {
+      "line": "AUDIT 51/192 code-6-topological-order-8k-direct 20.604s",
+      "utc": 1792951767.2497559
+    },
+    {
+      "line": "AUDIT 52/192 code-5-token-bucket-2k-direct 7.065s",
+      "utc": 1792951774.317516
+    },
+    {
+      "line": "AUDIT 53/192 math-4-geometric-series-short-direct 2.812s",
+      "utc": 1792951777.132653
+    },
+    {
+      "line": "AUDIT 54/192 code-2-fair-scheduler-short-direct 2.724s",
+      "utc": 1792951779.858965
+    },
+    {
+      "line": "AUDIT 55/192 chinese-7-shared-laundry-2k-think 6.964s",
+      "utc": 1792951786.8268921
+    },
+    {
+      "line": "AUDIT 56/192 json-0-deployment-calendar-short-think 2.770s",
+      "utc": 1792951789.599724
+    },
+    {
+      "line": "AUDIT 57/192 math-1-inclusion-exclusion-8k-think 20.567s",
+      "utc": 1792951810.168204
+    },
+    {
+      "line": "AUDIT 58/192 json-7-backup-manifest-8k-think 20.527s",
+      "utc": 1792951830.6981819
+    },
+    {
+      "line": "AUDIT 59/192 code-0-rollback-dsu-2k-think 7.107s",
+      "utc": 1792951837.807251
+    },
+    {
+      "line": "AUDIT 60/192 math-3-binary-gcd-8k-direct 20.417s",
+      "utc": 1792951858.2293491
+    },
+    {
+      "line": "AUDIT 61/192 json-6-conference-rooms-8k-think 20.446s",
+      "utc": 1792951878.677057
+    },
+    {
+      "line": "AUDIT 62/192 chinese-5-waste-collection-2k-think 7.023s",
+      "utc": 1792951885.702498
+    },
+    {
+      "line": "AUDIT 63/192 code-4-cursor-pages-2k-think 6.973s",
+      "utc": 1792951892.678163
+    },
+    {
+      "line": "AUDIT 64/192 math-4-geometric-series-2k-think 7.027s",
+      "utc": 1792951899.710439
+    },
+    {
+      "line": "AUDIT 65/192 json-1-warehouse-transfers-short-direct 2.771s",
+      "utc": 1792951902.4846148
+    },
+    {
+      "line": "AUDIT 66/192 json-3-device-maintenance-8k-think 20.550s",
+      "utc": 1792951923.042562
+    },
+    {
+      "line": "AUDIT 67/192 chinese-3-bicycle-parking-short-think 2.779s",
+      "utc": 1792951925.82443
+    },
+    {
+      "line": "AUDIT 68/192 code-3-autocomplete-2k-direct 6.993s",
+      "utc": 1792951932.820142
+    },
+    {
+      "line": "AUDIT 69/192 chinese-3-bicycle-parking-2k-think 7.042s",
+      "utc": 1792951939.86461
+    },
+    {
+      "line": "AUDIT 70/192 math-4-geometric-series-8k-direct 20.612s",
+      "utc": 1792951960.4805
+    },
+    {
+      "line": "AUDIT 71/192 math-6-bezout-inverse-short-think 2.794s",
+      "utc": 1792951963.2781062
+    },
+    {
+      "line": "AUDIT 72/192 math-7-counting-paths-short-direct 2.779s",
+      "utc": 1792951966.059525
+    },
+    {
+      "line": "AUDIT 73/192 code-0-rollback-dsu-short-think 2.762s",
+      "utc": 1792951968.8235369
+    },
+    {
+      "line": "AUDIT 74/192 chinese-0-clinic-access-2k-direct 7.032s",
+      "utc": 1792951975.858016
+    },
+    {
+      "line": "AUDIT 75/192 code-7-rolling-median-short-think 2.815s",
+      "utc": 1792951978.6749818
+    },
+    {
+      "line": "AUDIT 76/192 chinese-5-waste-collection-2k-direct 7.076s",
+      "utc": 1792951985.753479
+    },
+    {
+      "line": "AUDIT 77/192 code-5-token-bucket-short-think 2.834s",
+      "utc": 1792951988.58948
+    },
+    {
+      "line": "AUDIT 78/192 json-2-museum-program-8k-think 20.807s",
+      "utc": 1792952009.399741
+    },
+    {
+      "line": "AUDIT 79/192 json-7-backup-manifest-short-direct 2.835s",
+      "utc": 1792952012.2370791
+    },
+    {
+      "line": "AUDIT 80/192 json-6-conference-rooms-2k-direct 7.062s",
+      "utc": 1792952019.3015249
+    },
+    {
+      "line": "AUDIT 81/192 math-3-binary-gcd-2k-direct 7.157s",
+      "utc": 1792952026.461111
+    },
+    {
+      "line": "AUDIT 82/192 json-1-warehouse-transfers-8k-think 20.970s",
+      "utc": 1792952047.434241
+    },
+    {
+      "line": "AUDIT 83/192 code-7-rolling-median-8k-direct 21.004s",
+      "utc": 1792952068.444329
+    },
+    {
+      "line": "AUDIT 84/192 chinese-7-shared-laundry-short-direct 2.792s",
+      "utc": 1792952071.236639
+    },
+    {
+      "line": "AUDIT 85/192 chinese-4-library-reuse-2k-direct 7.146s",
+      "utc": 1792952078.385619
+    },
+    {
+      "line": "AUDIT 86/192 json-3-device-maintenance-8k-direct 20.859s",
+      "utc": 1792952099.248412
+    },
+    {
+      "line": "AUDIT 87/192 chinese-0-clinic-access-8k-direct 21.005s",
+      "utc": 1792952120.257461
+    },
+    {
+      "line": "AUDIT 88/192 chinese-2-storm-drains-2k-direct 7.222s",
+      "utc": 1792952127.482174
+    },
+    {
+      "line": "AUDIT 89/192 json-3-device-maintenance-2k-direct 7.118s",
+      "utc": 1792952134.6020758
+    },
+    {
+      "line": "AUDIT 90/192 math-2-convex-jensen-short-think 2.952s",
+      "utc": 1792952137.556299
+    },
+    {
+      "line": "AUDIT 91/192 chinese-6-bus-information-2k-direct 7.260s",
+      "utc": 1792952144.818515
+    },
+    {
+      "line": "AUDIT 92/192 json-6-conference-rooms-short-direct 2.856s",
+      "utc": 1792952147.676665
+    },
+    {
+      "line": "AUDIT 93/192 code-7-rolling-median-8k-think 21.056s",
+      "utc": 1792952168.735679
+    },
+    {
+      "line": "AUDIT 94/192 math-0-divisibility-induction-8k-think 20.991s",
+      "utc": 1792952189.7302809
+    },
+    {
+      "line": "AUDIT 95/192 json-5-research-catalog-8k-think 21.087s",
+      "utc": 1792952210.82062
+    },
+    {
+      "line": "AUDIT 96/192 json-2-museum-program-short-direct 2.865s",
+      "utc": 1792952213.687553
+    },
+    {
+      "line": "AUDIT 97/192 chinese-7-shared-laundry-2k-direct 7.189s",
+      "utc": 1792952220.879097
+    },
+    {
+      "line": "AUDIT 98/192 code-4-cursor-pages-2k-direct 7.190s",
+      "utc": 1792952228.071439
+    },
+    {
+      "line": "AUDIT 99/192 chinese-6-bus-information-short-direct 2.849s",
+      "utc": 1792952230.922954
+    },
+    {
+      "line": "AUDIT 100/192 chinese-0-clinic-access-short-direct 2.795s",
+      "utc": 1792952233.7201972
+    },
+    {
+      "line": "AUDIT 101/192 code-0-rollback-dsu-short-direct 2.846s",
+      "utc": 1792952236.571288
+    },
+    {
+      "line": "AUDIT 102/192 json-7-backup-manifest-8k-direct 21.000s",
+      "utc": 1792952257.575138
+    },
+    {
+      "line": "AUDIT 103/192 code-3-autocomplete-8k-direct 21.137s",
+      "utc": 1792952278.7158349
+    },
+    {
+      "line": "AUDIT 104/192 chinese-4-library-reuse-short-think 2.850s",
+      "utc": 1792952281.56798
+    },
+    {
+      "line": "AUDIT 105/192 chinese-1-school-meals-8k-direct 21.112s",
+      "utc": 1792952302.6852648
+    },
+    {
+      "line": "AUDIT 106/192 chinese-2-storm-drains-2k-think 7.304s",
+      "utc": 1792952309.991093
+    },
+    {
+      "line": "AUDIT 107/192 math-6-bezout-inverse-8k-direct 20.991s",
+      "utc": 1792952330.985576
+    },
+    {
+      "line": "AUDIT 108/192 json-0-deployment-calendar-short-direct 2.946s",
+      "utc": 1792952333.933692
+    },
+    {
+      "line": "AUDIT 109/192 math-6-bezout-inverse-short-direct 2.750s",
+      "utc": 1792952336.687006
+    },
+    {
+      "line": "AUDIT 110/192 code-3-autocomplete-8k-think 21.144s",
+      "utc": 1792952357.837609
+    },
+    {
+      "line": "AUDIT 111/192 code-4-cursor-pages-8k-direct 21.085s",
+      "utc": 1792952378.927286
+    },
+    {
+      "line": "AUDIT 112/192 math-0-divisibility-induction-short-think 2.875s",
+      "utc": 1792952381.802538
+    },
+    {
+      "line": "AUDIT 113/192 code-7-rolling-median-2k-think 7.146s",
+      "utc": 1792952388.951296
+    },
+    {
+      "line": "AUDIT 114/192 json-4-support-triage-short-think 2.865s",
+      "utc": 1792952391.819032
+    },
+    {
+      "line": "AUDIT 115/192 code-6-topological-order-2k-direct 7.202s",
+      "utc": 1792952399.024058
+    },
+    {
+      "line": "AUDIT 116/192 math-3-binary-gcd-short-think 2.862s",
+      "utc": 1792952401.8882601
+    },
+    {
+      "line": "AUDIT 117/192 chinese-6-bus-information-short-think 2.822s",
+      "utc": 1792952404.712973
+    },
+    {
+      "line": "AUDIT 118/192 code-1-stream-csv-short-think 2.823s",
+      "utc": 1792952407.541018
+    },
+    {
+      "line": "AUDIT 119/192 math-5-pigeonhole-short-direct 2.863s",
+      "utc": 1792952410.4061599
+    },
+    {
+      "line": "AUDIT 120/192 math-0-divisibility-induction-short-direct 2.803s",
+      "utc": 1792952413.2116969
+    },
+    {
+      "line": "AUDIT 121/192 json-4-support-triage-8k-direct 21.103s",
+      "utc": 1792952434.319062
+    },
+    {
+      "line": "AUDIT 122/192 json-1-warehouse-transfers-8k-direct 21.132s",
+      "utc": 1792952455.454425
+    },
+    {
+      "line": "AUDIT 123/192 json-3-device-maintenance-short-think 2.873s",
+      "utc": 1792952458.3301818
+    },
+    {
+      "line": "AUDIT 124/192 math-6-bezout-inverse-8k-think 20.928s",
+      "utc": 1792952479.261387
+    },
+    {
+      "line": "AUDIT 125/192 json-1-warehouse-transfers-2k-think 7.221s",
+      "utc": 1792952486.48502
+    },
+    {
+      "line": "AUDIT 126/192 chinese-7-shared-laundry-8k-direct 21.166s",
+      "utc": 1792952507.654807
+    },
+    {
+      "line": "AUDIT 127/192 math-6-bezout-inverse-2k-think 7.251s",
+      "utc": 1792952514.908514
+    },
+    {
+      "line": "AUDIT 128/192 code-2-fair-scheduler-2k-direct 7.237s",
+      "utc": 1792952522.147718
+    },
+    {
+      "line": "AUDIT 129/192 chinese-0-clinic-access-8k-think 21.337s",
+      "utc": 1792952543.490101
+    },
+    {
+      "line": "AUDIT 130/192 math-3-binary-gcd-8k-think 21.031s",
+      "utc": 1792952564.525409
+    },
+    {
+      "line": "AUDIT 131/192 math-7-counting-paths-8k-direct 21.182s",
+      "utc": 1792952585.711076
+    },
+    {
+      "line": "AUDIT 132/192 chinese-1-school-meals-short-direct 2.814s",
+      "utc": 1792952588.5275872
+    },
+    {
+      "line": "AUDIT 133/192 math-4-geometric-series-8k-think 20.998s",
+      "utc": 1792952609.529023
+    },
+    {
+      "line": "AUDIT 134/192 chinese-5-waste-collection-8k-think 21.267s",
+      "utc": 1792952630.8017302
+    },
+    {
+      "line": "AUDIT 135/192 chinese-6-bus-information-8k-direct 21.029s",
+      "utc": 1792952651.8335428
+    },
+    {
+      "line": "AUDIT 136/192 code-7-rolling-median-short-direct 2.819s",
+      "utc": 1792952654.654335
+    },
+    {
+      "line": "AUDIT 137/192 math-5-pigeonhole-2k-think 7.120s",
+      "utc": 1792952661.777029
+    },
+    {
+      "line": "AUDIT 138/192 code-5-token-bucket-short-direct 2.808s",
+      "utc": 1792952664.587198
+    },
+    {
+      "line": "AUDIT 139/192 json-1-warehouse-transfers-short-think 2.840s",
+      "utc": 1792952667.4296918
+    },
+    {
+      "line": "AUDIT 140/192 math-4-geometric-series-2k-direct 7.104s",
+      "utc": 1792952674.536396
+    },
+    {
+      "line": "AUDIT 141/192 math-7-counting-paths-2k-direct 7.147s",
+      "utc": 1792952681.685744
+    },
+    {
+      "line": "AUDIT 142/192 json-5-research-catalog-2k-think 7.167s",
+      "utc": 1792952688.8565052
+    },
+    {
+      "line": "AUDIT 143/192 chinese-3-bicycle-parking-2k-direct 7.133s",
+      "utc": 1792952695.993849
+    },
+    {
+      "line": "AUDIT 144/192 chinese-3-bicycle-parking-8k-think 21.019s",
+      "utc": 1792952717.015779
+    },
+    {
+      "line": "AUDIT 145/192 json-5-research-catalog-8k-direct 21.021s",
+      "utc": 1792952738.040948
+    },
+    {
+      "line": "AUDIT 146/192 json-7-backup-manifest-2k-think 7.116s",
+      "utc": 1792952745.159532
+    },
+    {
+      "line": "AUDIT 147/192 math-5-pigeonhole-8k-direct 21.044s",
+      "utc": 1792952766.22491
+    },
+    {
+      "line": "AUDIT 148/192 math-3-binary-gcd-2k-think 7.167s",
+      "utc": 1792952773.400291
+    },
+    {
+      "line": "AUDIT 149/192 chinese-3-bicycle-parking-8k-direct 21.070s",
+      "utc": 1792952794.4819992
+    },
+    {
+      "line": "AUDIT 150/192 chinese-7-shared-laundry-short-think 2.840s",
+      "utc": 1792952797.326546
+    },
+    {
+      "line": "AUDIT 151/192 json-5-research-catalog-short-direct 2.856s",
+      "utc": 1792952800.1831172
+    },
+    {
+      "line": "AUDIT 152/192 math-1-inclusion-exclusion-8k-direct 21.160s",
+      "utc": 1792952821.348874
+    },
+    {
+      "line": "AUDIT 153/192 math-5-pigeonhole-8k-think 21.126s",
+      "utc": 1792952842.478882
+    },
+    {
+      "line": "AUDIT 154/192 code-0-rollback-dsu-8k-think 21.153s",
+      "utc": 1792952863.6354802
+    },
+    {
+      "line": "AUDIT 155/192 code-1-stream-csv-8k-direct 21.118s",
+      "utc": 1792952884.7572632
+    },
+    {
+      "line": "AUDIT 156/192 chinese-5-waste-collection-short-direct 2.836s",
+      "utc": 1792952887.595555
+    },
+    {
+      "line": "AUDIT 157/192 math-1-inclusion-exclusion-short-think 2.815s",
+      "utc": 1792952890.412717
+    },
+    {
+      "line": "AUDIT 158/192 chinese-4-library-reuse-short-direct 2.838s",
+      "utc": 1792952893.253215
+    },
+    {
+      "line": "AUDIT 159/192 chinese-1-school-meals-8k-think 21.052s",
+      "utc": 1792952914.309011
+    },
+    {
+      "line": "AUDIT 160/192 math-2-convex-jensen-8k-think 21.105s",
+      "utc": 1792952935.4173079
+    },
+    {
+      "line": "AUDIT 161/192 code-1-stream-csv-2k-direct 7.173s",
+      "utc": 1792952942.5903392
+    },
+    {
+      "line": "AUDIT 162/192 code-4-cursor-pages-short-think 2.834s",
+      "utc": 1792952945.4265249
+    },
+    {
+      "line": "AUDIT 163/192 code-2-fair-scheduler-2k-think 7.199s",
+      "utc": 1792952952.627504
+    },
+    {
+      "line": "AUDIT 164/192 json-3-device-maintenance-short-direct 2.831s",
+      "utc": 1792952955.461083
+    },
+    {
+      "line": "AUDIT 165/192 json-1-warehouse-transfers-2k-direct 7.206s",
+      "utc": 1792952962.669133
+    },
+    {
+      "line": "AUDIT 166/192 code-1-stream-csv-8k-think 21.139s",
+      "utc": 1792952983.815752
+    },
+    {
+      "line": "AUDIT 167/192 json-0-deployment-calendar-8k-direct 21.320s",
+      "utc": 1792953005.139717
+    },
+    {
+      "line": "AUDIT 168/192 chinese-4-library-reuse-2k-think 7.198s",
+      "utc": 1792953012.338264
+    },
+    {
+      "line": "AUDIT 169/192 code-3-autocomplete-2k-think 7.197s",
+      "utc": 1792953019.537581
+    },
+    {
+      "line": "AUDIT 170/192 json-2-museum-program-2k-think 7.176s",
+      "utc": 1792953026.716016
+    },
+    {
+      "line": "AUDIT 171/192 json-0-deployment-calendar-8k-think 21.145s",
+      "utc": 1792953047.864498
+    },
+    {
+      "line": "AUDIT 172/192 math-7-counting-paths-short-think 2.837s",
+      "utc": 1792953050.704781
+    },
+    {
+      "line": "AUDIT 173/192 code-3-autocomplete-short-think 2.851s",
+      "utc": 1792953053.558538
+    },
+    {
+      "line": "AUDIT 174/192 json-2-museum-program-8k-direct 21.182s",
+      "utc": 1792953074.7442281
+    },
+    {
+      "line": "AUDIT 175/192 chinese-0-clinic-access-2k-think 7.145s",
+      "utc": 1792953081.891155
+    },
+    {
+      "line": "AUDIT 176/192 chinese-2-storm-drains-8k-direct 21.141s",
+      "utc": 1792953103.035554
+    },
+    {
+      "line": "AUDIT 177/192 math-6-bezout-inverse-2k-direct 7.180s",
+      "utc": 1792953110.218339
+    },
+    {
+      "line": "AUDIT 178/192 code-2-fair-scheduler-short-think 2.826s",
+      "utc": 1792953113.046456
+    },
+    {
+      "line": "AUDIT 179/192 code-5-token-bucket-8k-direct 21.180s",
+      "utc": 1792953134.228693
+    },
+    {
+      "line": "AUDIT 180/192 json-5-research-catalog-2k-direct 7.186s",
+      "utc": 1792953141.417561
+    },
+    {
+      "line": "AUDIT 181/192 code-6-topological-order-short-direct 2.828s",
+      "utc": 1792953144.248149
+    },
+    {
+      "line": "AUDIT 182/192 math-7-counting-paths-2k-think 7.202s",
+      "utc": 1792953151.4524648
+    },
+    {
+      "line": "AUDIT 183/192 chinese-1-school-meals-2k-direct 7.207s",
+      "utc": 1792953158.6636002
+    },
+    {
+      "line": "AUDIT 184/192 code-3-autocomplete-short-direct 2.742s",
+      "utc": 1792953161.4054441
+    },
+    {
+      "line": "AUDIT 185/192 chinese-2-storm-drains-8k-think 21.533s",
+      "utc": 1792953182.944063
+    },
+    {
+      "line": "AUDIT 186/192 json-0-deployment-calendar-2k-direct 7.174s",
+      "utc": 1792953190.118338
+    },
+    {
+      "line": "AUDIT 187/192 json-6-conference-rooms-8k-direct 21.030s",
+      "utc": 1792953211.15352
+    },
+    {
+      "line": "AUDIT 188/192 json-4-support-triage-8k-think 21.133s",
+      "utc": 1792953232.290499
+    },
+    {
+      "line": "AUDIT 189/192 math-0-divisibility-induction-2k-direct 7.207s",
+      "utc": 1792953239.4995031
+    },
+    {
+      "line": "AUDIT 190/192 math-1-inclusion-exclusion-2k-think 7.251s",
+      "utc": 1792953246.754098
+    },
+    {
+      "line": "AUDIT 191/192 chinese-0-clinic-access-short-think 2.855s",
+      "utc": 1792953249.611425
+    },
+    {
+      "line": "AUDIT 192/192 chinese-2-storm-drains-short-direct 2.859s",
+      "utc": 1792953252.4725912
+    }
+  ],
+  "status": "complete",
+  "snapshots": [
+    {
+      "utc": 1792951367.9470441,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1116.00M  free = 932.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792951442.599864,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1116.00M  free = 932.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792951538.092173,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1116.00M  free = 932.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792951598.239319,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1116.00M  free = 932.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792951663.745211,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1116.00M  free = 932.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792951732.515512,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1116.00M  free = 932.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792951789.5997272,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1116.00M  free = 932.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792951899.7104409,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1116.00M  free = 932.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792951966.059529,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1116.00M  free = 932.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792952019.301528,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1116.00M  free = 932.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792952127.482177,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1108.00M  free = 940.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792952213.687556,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1108.00M  free = 940.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792952281.5679832,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1108.00M  free = 940.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792952381.802541,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1108.00M  free = 940.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792952413.2117,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1108.00M  free = 940.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792952522.147721,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1108.00M  free = 940.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792952654.654337,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1108.00M  free = 940.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792952717.0157819,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1108.00M  free = 940.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792952821.348877,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1108.00M  free = 940.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792952935.4173162,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1108.00M  free = 940.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792953012.3382668,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1108.00M  free = 940.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792953103.035557,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1108.00M  free = 940.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792953161.405447,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1108.00M  free = 940.00M  (encrypted)\n"
+    },
+    {
+      "utc": 1792953252.472594,
+      "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+      "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+      "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+      "swap": "vm.swapusage: total = 2048.00M  used = 1108.00M  free = 940.00M  (encrypted)\n"
+    }
+  ],
+  "after": {
+    "utc": 1792953252.522901,
+    "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22478947)\t100%; charged; 0:00 remaining present: true\n",
+    "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n",
+    "pressure": "kern.memorystatus_vm_pressure_level: 1\n",
+    "swap": "vm.swapusage: total = 2048.00M  used = 1108.00M  free = 940.00M  (encrypted)\n"
+  },
+  "exit_code": 0
+}

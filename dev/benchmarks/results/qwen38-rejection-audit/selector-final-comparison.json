@@ -1,0 +1,1258 @@
+{
+  "scope": "native natural greedy rollout acceptance;32 cycles maximum; identical target/backbone/codebooks, merged selector-H update; bootstrap clusters task families and does not treat cycles as independent; not timed serving throughput",
+  "cases": [
+    {
+      "id": "chinese-6-bus-information-2k-think",
+      "family": "bus-information",
+      "domain": "chinese",
+      "context": "2k",
+      "thinking": true,
+      "baseline_tau": 5.875,
+      "candidate_tau": 5.65625,
+      "tau_ratio": 0.9627659574468085,
+      "common_prefix_tokens": 181,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 12,
+        "candidate_recall": 1,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 14,
+        "candidate_recall": 0,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "json-7-backup-manifest-2k-direct",
+      "family": "backup-manifest",
+      "domain": "json",
+      "context": "2k",
+      "thinking": false,
+      "baseline_tau": 5.1875,
+      "candidate_tau": 5.1875,
+      "tau_ratio": 1.0,
+      "common_prefix_tokens": 166,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 19,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 19,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "chinese-6-bus-information-8k-think",
+      "family": "bus-information",
+      "domain": "chinese",
+      "context": "8k",
+      "thinking": true,
+      "baseline_tau": 5.15625,
+      "candidate_tau": 4.75,
+      "tau_ratio": 0.9212121212121213,
+      "common_prefix_tokens": 152,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 16,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 17,
+        "candidate_recall": 3,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "json-7-backup-manifest-short-think",
+      "family": "backup-manifest",
+      "domain": "json",
+      "context": "short",
+      "thinking": true,
+      "baseline_tau": 3.9375,
+      "candidate_tau": 3.9375,
+      "tau_ratio": 1.0,
+      "common_prefix_tokens": 126,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 18,
+        "candidate_recall": 10,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 18,
+        "candidate_recall": 10,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "code-6-topological-order-8k-think",
+      "family": "topological-order",
+      "domain": "code",
+      "context": "8k",
+      "thinking": true,
+      "baseline_tau": 3.9375,
+      "candidate_tau": 4.15625,
+      "tau_ratio": 1.0555555555555556,
+      "common_prefix_tokens": 126,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 24,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 21,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "json-6-conference-rooms-2k-think",
+      "family": "conference-rooms",
+      "domain": "json",
+      "context": "2k",
+      "thinking": true,
+      "baseline_tau": 4.40625,
+      "candidate_tau": 4.34375,
+      "tau_ratio": 0.9858156028368794,
+      "common_prefix_tokens": 139,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 22,
+        "candidate_recall": 1,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 22,
+        "candidate_recall": 1,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "code-6-topological-order-short-think",
+      "family": "topological-order",
+      "domain": "code",
+      "context": "short",
+      "thinking": true,
+      "baseline_tau": 3.84375,
+      "candidate_tau": 3.6875,
+      "tau_ratio": 0.959349593495935,
+      "common_prefix_tokens": 118,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 22,
+        "candidate_recall": 5,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 23,
+        "candidate_recall": 5,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "code-6-topological-order-2k-think",
+      "family": "topological-order",
+      "domain": "code",
+      "context": "2k",
+      "thinking": true,
+      "baseline_tau": 4.125,
+      "candidate_tau": 3.78125,
+      "tau_ratio": 0.9166666666666666,
+      "common_prefix_tokens": 121,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 21,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 22,
+        "candidate_recall": 1,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "code-7-rolling-median-2k-direct",
+      "family": "rolling-median",
+      "domain": "code",
+      "context": "2k",
+      "thinking": false,
+      "baseline_tau": 5.4375,
+      "candidate_tau": 5.3125,
+      "tau_ratio": 0.9770114942528736,
+      "common_prefix_tokens": 170,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 15,
+        "candidate_recall": 3,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 15,
+        "candidate_recall": 5,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "json-6-conference-rooms-short-think",
+      "family": "conference-rooms",
+      "domain": "json",
+      "context": "short",
+      "thinking": true,
+      "baseline_tau": 4.84375,
+      "candidate_tau": 4.71875,
+      "tau_ratio": 0.9741935483870968,
+      "common_prefix_tokens": 151,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 19,
+        "candidate_recall": 5,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 20,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "chinese-7-shared-laundry-8k-think",
+      "family": "shared-laundry",
+      "domain": "chinese",
+      "context": "8k",
+      "thinking": true,
+      "baseline_tau": 5.0625,
+      "candidate_tau": 4.875,
+      "tau_ratio": 0.9629629629629629,
+      "common_prefix_tokens": 156,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 18,
+        "candidate_recall": 5,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 17,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "math-7-counting-paths-8k-think",
+      "family": "counting-paths",
+      "domain": "math",
+      "context": "8k",
+      "thinking": true,
+      "baseline_tau": 5.9375,
+      "candidate_tau": 6.34375,
+      "tau_ratio": 1.068421052631579,
+      "common_prefix_tokens": 190,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 17,
+        "candidate_recall": 1,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 12,
+        "candidate_recall": 1,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "code-6-topological-order-8k-direct",
+      "family": "topological-order",
+      "domain": "code",
+      "context": "8k",
+      "thinking": false,
+      "baseline_tau": 3.75,
+      "candidate_tau": 3.75,
+      "tau_ratio": 1.0,
+      "common_prefix_tokens": 120,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 23,
+        "candidate_recall": 6,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 26,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "chinese-7-shared-laundry-2k-think",
+      "family": "shared-laundry",
+      "domain": "chinese",
+      "context": "2k",
+      "thinking": true,
+      "baseline_tau": 4.65625,
+      "candidate_tau": 4.65625,
+      "tau_ratio": 1.0,
+      "common_prefix_tokens": 149,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 21,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 21,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "json-7-backup-manifest-8k-think",
+      "family": "backup-manifest",
+      "domain": "json",
+      "context": "8k",
+      "thinking": true,
+      "baseline_tau": 4.09375,
+      "candidate_tau": 4.09375,
+      "tau_ratio": 1.0,
+      "common_prefix_tokens": 131,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 22,
+        "candidate_recall": 5,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 21,
+        "candidate_recall": 5,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "json-6-conference-rooms-8k-think",
+      "family": "conference-rooms",
+      "domain": "json",
+      "context": "8k",
+      "thinking": true,
+      "baseline_tau": 4.03125,
+      "candidate_tau": 4.03125,
+      "tau_ratio": 1.0,
+      "common_prefix_tokens": 129,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 20,
+        "candidate_recall": 7,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 20,
+        "candidate_recall": 7,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "math-6-bezout-inverse-short-think",
+      "family": "bezout-inverse",
+      "domain": "math",
+      "context": "short",
+      "thinking": true,
+      "baseline_tau": 5.53125,
+      "candidate_tau": 5.53125,
+      "tau_ratio": 1.0,
+      "common_prefix_tokens": 177,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 16,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 16,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "math-7-counting-paths-short-direct",
+      "family": "counting-paths",
+      "domain": "math",
+      "context": "short",
+      "thinking": false,
+      "baseline_tau": 4.9375,
+      "candidate_tau": 4.6875,
+      "tau_ratio": 0.9493670886075949,
+      "common_prefix_tokens": 150,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 20,
+        "candidate_recall": 1,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 22,
+        "candidate_recall": 0,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "code-7-rolling-median-short-think",
+      "family": "rolling-median",
+      "domain": "code",
+      "context": "short",
+      "thinking": true,
+      "baseline_tau": 4.0625,
+      "candidate_tau": 3.40625,
+      "tau_ratio": 0.8384615384615385,
+      "common_prefix_tokens": 109,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 24,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 26,
+        "candidate_recall": 1,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "json-7-backup-manifest-short-direct",
+      "family": "backup-manifest",
+      "domain": "json",
+      "context": "short",
+      "thinking": false,
+      "baseline_tau": 4.90625,
+      "candidate_tau": 4.90625,
+      "tau_ratio": 1.0,
+      "common_prefix_tokens": 157,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 17,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 18,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "json-6-conference-rooms-2k-direct",
+      "family": "conference-rooms",
+      "domain": "json",
+      "context": "2k",
+      "thinking": false,
+      "baseline_tau": 4.03125,
+      "candidate_tau": 4.03125,
+      "tau_ratio": 1.0,
+      "common_prefix_tokens": 129,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 20,
+        "candidate_recall": 6,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 19,
+        "candidate_recall": 6,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "code-7-rolling-median-8k-direct",
+      "family": "rolling-median",
+      "domain": "code",
+      "context": "8k",
+      "thinking": false,
+      "baseline_tau": 4.4375,
+      "candidate_tau": 4.34375,
+      "tau_ratio": 0.9788732394366197,
+      "common_prefix_tokens": 139,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 19,
+        "candidate_recall": 5,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 21,
+        "candidate_recall": 3,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "chinese-7-shared-laundry-short-direct",
+      "family": "shared-laundry",
+      "domain": "chinese",
+      "context": "short",
+      "thinking": false,
+      "baseline_tau": 2.53125,
+      "candidate_tau": 2.5,
+      "tau_ratio": 0.9876543209876543,
+      "common_prefix_tokens": 80,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 24,
+        "candidate_recall": 6,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 25,
+        "candidate_recall": 5,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "chinese-6-bus-information-2k-direct",
+      "family": "bus-information",
+      "domain": "chinese",
+      "context": "2k",
+      "thinking": false,
+      "baseline_tau": 3.03125,
+      "candidate_tau": 3.3125,
+      "tau_ratio": 1.092783505154639,
+      "common_prefix_tokens": 97,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 26,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 23,
+        "candidate_recall": 6,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "json-6-conference-rooms-short-direct",
+      "family": "conference-rooms",
+      "domain": "json",
+      "context": "short",
+      "thinking": false,
+      "baseline_tau": 4.25,
+      "candidate_tau": 4.28125,
+      "tau_ratio": 1.0073529411764706,
+      "common_prefix_tokens": 136,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 21,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 20,
+        "candidate_recall": 6,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "code-7-rolling-median-8k-think",
+      "family": "rolling-median",
+      "domain": "code",
+      "context": "8k",
+      "thinking": true,
+      "baseline_tau": 4.21875,
+      "candidate_tau": 4.46875,
+      "tau_ratio": 1.0592592592592593,
+      "common_prefix_tokens": 135,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 21,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 21,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "chinese-7-shared-laundry-2k-direct",
+      "family": "shared-laundry",
+      "domain": "chinese",
+      "context": "2k",
+      "thinking": false,
+      "baseline_tau": 3.03125,
+      "candidate_tau": 2.9375,
+      "tau_ratio": 0.9690721649484536,
+      "common_prefix_tokens": 94,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 27,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 27,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "chinese-6-bus-information-short-direct",
+      "family": "bus-information",
+      "domain": "chinese",
+      "context": "short",
+      "thinking": false,
+      "baseline_tau": 2.03125,
+      "candidate_tau": 1.78125,
+      "tau_ratio": 0.8769230769230769,
+      "common_prefix_tokens": 57,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 20,
+        "candidate_recall": 11,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 22,
+        "candidate_recall": 10,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "json-7-backup-manifest-8k-direct",
+      "family": "backup-manifest",
+      "domain": "json",
+      "context": "8k",
+      "thinking": false,
+      "baseline_tau": 5.15625,
+      "candidate_tau": 4.90625,
+      "tau_ratio": 0.9515151515151515,
+      "common_prefix_tokens": 157,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 18,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 21,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "math-6-bezout-inverse-8k-direct",
+      "family": "bezout-inverse",
+      "domain": "math",
+      "context": "8k",
+      "thinking": false,
+      "baseline_tau": 4.75,
+      "candidate_tau": 4.75,
+      "tau_ratio": 1.0,
+      "common_prefix_tokens": 152,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 23,
+        "candidate_recall": 3,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 26,
+        "candidate_recall": 1,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "math-6-bezout-inverse-short-direct",
+      "family": "bezout-inverse",
+      "domain": "math",
+      "context": "short",
+      "thinking": false,
+      "baseline_tau": 5.4375,
+      "candidate_tau": 5.4375,
+      "tau_ratio": 1.0,
+      "common_prefix_tokens": 174,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 18,
+        "candidate_recall": 1,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 18,
+        "candidate_recall": 1,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "code-7-rolling-median-2k-think",
+      "family": "rolling-median",
+      "domain": "code",
+      "context": "2k",
+      "thinking": true,
+      "baseline_tau": 4.21875,
+      "candidate_tau": 4.375,
+      "tau_ratio": 1.037037037037037,
+      "common_prefix_tokens": 135,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 23,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 21,
+        "candidate_recall": 3,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "code-6-topological-order-2k-direct",
+      "family": "topological-order",
+      "domain": "code",
+      "context": "2k",
+      "thinking": false,
+      "baseline_tau": 4.15625,
+      "candidate_tau": 3.8125,
+      "tau_ratio": 0.9172932330827067,
+      "common_prefix_tokens": 122,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 25,
+        "candidate_recall": 3,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 28,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "chinese-6-bus-information-short-think",
+      "family": "bus-information",
+      "domain": "chinese",
+      "context": "short",
+      "thinking": true,
+      "baseline_tau": 3.21875,
+      "candidate_tau": 3.375,
+      "tau_ratio": 1.0485436893203883,
+      "common_prefix_tokens": 103,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 23,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 22,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "math-6-bezout-inverse-8k-think",
+      "family": "bezout-inverse",
+      "domain": "math",
+      "context": "8k",
+      "thinking": true,
+      "baseline_tau": 5.65625,
+      "candidate_tau": 5.40625,
+      "tau_ratio": 0.9558011049723757,
+      "common_prefix_tokens": 173,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 18,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 21,
+        "candidate_recall": 1,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "chinese-7-shared-laundry-8k-direct",
+      "family": "shared-laundry",
+      "domain": "chinese",
+      "context": "8k",
+      "thinking": false,
+      "baseline_tau": 2.5625,
+      "candidate_tau": 2.90625,
+      "tau_ratio": 1.1341463414634145,
+      "common_prefix_tokens": 82,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 27,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 25,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "math-6-bezout-inverse-2k-think",
+      "family": "bezout-inverse",
+      "domain": "math",
+      "context": "2k",
+      "thinking": true,
+      "baseline_tau": 5.0,
+      "candidate_tau": 5.25,
+      "tau_ratio": 1.05,
+      "common_prefix_tokens": 160,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 18,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 16,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "math-7-counting-paths-8k-direct",
+      "family": "counting-paths",
+      "domain": "math",
+      "context": "8k",
+      "thinking": false,
+      "baseline_tau": 5.6875,
+      "candidate_tau": 5.625,
+      "tau_ratio": 0.989010989010989,
+      "common_prefix_tokens": 180,
+      "first_output_difference": 138,
+      "common_output_prefix_equal": false,
+      "baseline_first_rejections": {
+        "selection": 20,
+        "candidate_recall": 1,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 21,
+        "candidate_recall": 0,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "chinese-6-bus-information-8k-direct",
+      "family": "bus-information",
+      "domain": "chinese",
+      "context": "8k",
+      "thinking": false,
+      "baseline_tau": 3.0625,
+      "candidate_tau": 3.0625,
+      "tau_ratio": 1.0,
+      "common_prefix_tokens": 98,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 26,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 26,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "code-7-rolling-median-short-direct",
+      "family": "rolling-median",
+      "domain": "code",
+      "context": "short",
+      "thinking": false,
+      "baseline_tau": 4.8125,
+      "candidate_tau": 4.875,
+      "tau_ratio": 1.0129870129870129,
+      "common_prefix_tokens": 154,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 17,
+        "candidate_recall": 5,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 17,
+        "candidate_recall": 5,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "math-7-counting-paths-2k-direct",
+      "family": "counting-paths",
+      "domain": "math",
+      "context": "2k",
+      "thinking": false,
+      "baseline_tau": 6.0625,
+      "candidate_tau": 5.625,
+      "tau_ratio": 0.9278350515463918,
+      "common_prefix_tokens": 180,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 18,
+        "candidate_recall": 1,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 21,
+        "candidate_recall": 1,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "json-7-backup-manifest-2k-think",
+      "family": "backup-manifest",
+      "domain": "json",
+      "context": "2k",
+      "thinking": true,
+      "baseline_tau": 3.9375,
+      "candidate_tau": 3.9375,
+      "tau_ratio": 1.0,
+      "common_prefix_tokens": 126,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 23,
+        "candidate_recall": 3,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 23,
+        "candidate_recall": 3,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "chinese-7-shared-laundry-short-think",
+      "family": "shared-laundry",
+      "domain": "chinese",
+      "context": "short",
+      "thinking": true,
+      "baseline_tau": 3.625,
+      "candidate_tau": 3.71875,
+      "tau_ratio": 1.0258620689655173,
+      "common_prefix_tokens": 116,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 19,
+        "candidate_recall": 8,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 18,
+        "candidate_recall": 9,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "math-7-counting-paths-short-think",
+      "family": "counting-paths",
+      "domain": "math",
+      "context": "short",
+      "thinking": true,
+      "baseline_tau": 5.03125,
+      "candidate_tau": 4.6875,
+      "tau_ratio": 0.9316770186335404,
+      "common_prefix_tokens": 150,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 19,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 21,
+        "candidate_recall": 1,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "math-6-bezout-inverse-2k-direct",
+      "family": "bezout-inverse",
+      "domain": "math",
+      "context": "2k",
+      "thinking": false,
+      "baseline_tau": 6.09375,
+      "candidate_tau": 6.09375,
+      "tau_ratio": 1.0,
+      "common_prefix_tokens": 195,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 18,
+        "candidate_recall": 0,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 19,
+        "candidate_recall": 0,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "code-6-topological-order-short-direct",
+      "family": "topological-order",
+      "domain": "code",
+      "context": "short",
+      "thinking": false,
+      "baseline_tau": 3.84375,
+      "candidate_tau": 3.75,
+      "tau_ratio": 0.975609756097561,
+      "common_prefix_tokens": 120,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 23,
+        "candidate_recall": 5,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 25,
+        "candidate_recall": 3,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "math-7-counting-paths-2k-think",
+      "family": "counting-paths",
+      "domain": "math",
+      "context": "2k",
+      "thinking": true,
+      "baseline_tau": 3.65625,
+      "candidate_tau": 3.65625,
+      "tau_ratio": 1.0,
+      "common_prefix_tokens": 117,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 23,
+        "candidate_recall": 3,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 23,
+        "candidate_recall": 3,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "json-6-conference-rooms-8k-direct",
+      "family": "conference-rooms",
+      "domain": "json",
+      "context": "8k",
+      "thinking": false,
+      "baseline_tau": 4.15625,
+      "candidate_tau": 4.15625,
+      "tau_ratio": 1.0,
+      "common_prefix_tokens": 133,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 18,
+        "candidate_recall": 6,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 18,
+        "candidate_recall": 6,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    }
+  ],
+  "geometric_mean_tau_gain_pct": -1.173311239854391,
+  "family_cluster_bootstrap_95pct_gain_interval": [
+    -2.0308978262084,
+    -0.2624775955954803
+  ],
+  "independent_task_families": 8,
+  "all_initial_non_selector_forwards_bitwise_equal": true,
+  "all_common_output_prefixes_equal": false,
+  "domains": {
+    "chinese": {
+      "cases": 12,
+      "tau_gain_pct": -0.3774610554927782
+    },
+    "code": {
+      "cases": 12,
+      "tau_gain_pct": -2.464296609535699
+    },
+    "json": {
+      "cases": 12,
+      "tau_gain_pct": -0.6876652353223878
+    },
+    "math": {
+      "cases": 12,
+      "tau_gain_pct": -1.150936462887553
+    }
+  },
+  "strata": {
+    "2k/direct": {
+      "cases": 8,
+      "tau_gain_pct": -1.5771104700054273
+    },
+    "2k/think": {
+      "cases": 8,
+      "tau_gain_pct": -0.6737756027677899
+    },
+    "8k/direct": {
+      "cases": 8,
+      "tau_gain_pct": 0.5487201931024366
+    },
+    "8k/think": {
+      "cases": 8,
+      "tau_gain_pct": 0.16023151082122933
+    },
+    "short/direct": {
+      "cases": 8,
+      "tau_gain_pct": -2.4712206366278133
+    },
+    "short/think": {
+      "cases": 8,
+      "tau_gain_pct": -2.9756432658677445
+    }
+  },
+  "acceptance_promotion_gate": false
+}

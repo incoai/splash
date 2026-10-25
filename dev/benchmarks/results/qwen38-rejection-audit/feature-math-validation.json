@@ -1,0 +1,9 @@
+{
+  "rows_checked": 8,
+  "native_edges": 12416,
+  "edge_RMSE": 4.2263692878530746e-05,
+  "edge_max_abs": 0.001222697894169622,
+  "conditional_argmax_match": 776,
+  "conditional_argmax_count": 776,
+  "method": "original BF16 H weight -> loader-equivalent group64 AF4 -> captured normalized BF16 h -> BF16 gate; F64 CPU edge sums vs F32 Metal reductions; candidate position uses hidden row position+1"
+}

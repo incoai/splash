@@ -1,0 +1,31 @@
+{
+  "scope": "Conditional pilot only if fresh development captures show selection headroom; existing five-layer backbone and codebooks frozen; adapt only selector hidden projection through a merged rank8 update.",
+  "split": "Task-family development/validation/test assignment in protocol.json is frozen before capture. Final test metrics remain uninspected until checkpoint selection is frozen.",
+  "arms": [
+    "released",
+    "BF16-forward rank8 adaptation",
+    "loader-matched AF4G64-forward rank8 adaptation"
+  ],
+  "learning_rates": [
+    0.0003,
+    0.001
+  ],
+  "steps_per_fit": 200,
+  "batch_size": 256,
+  "rank": 8,
+  "seed": 20261025,
+  "validation_steps": [
+    0,
+    50,
+    100,
+    150,
+    200
+  ],
+  "loss": "Reached-prefix candidate CE plus0.25 KL(baseline candidate distribution || current), position decay exp(-position/8). Train and candidate evaluation keep natural top16 support; unsupported labels are counted and excluded from candidate CE.",
+  "sampling": "Case-balanced replacement sampling within development only, shared sampled-example sequence across arms.",
+  "selection": "Validation fixed-continuation prefix yield on complete-reference cycles; this is an off-policy proxy, never a rollout throughput claim. Re-evaluate selected export with native loader and real rollouts before final-test conclusions.",
+  "controls": "Frozen zero-update export must retain original BF16 tensor bytes; existing PR551 quantizer must match independent native-loader reference; native target/codebooks/backbone files must match original.",
+  "native_gate": "Improvement must survive natural native rollouts, full cycle cost and uncertainty, unchanged greedy target outputs, sampling/state tests, TTFT and memory review. No automatic default change from offline metrics.",
+  "numerical_control": "Training and proxy scores anchor to captured native edges plus the change in computed context gate. This subtracts the same forward baseline to remove CPU/Metal accumulation mismatch. All exports are subsequently evaluated through native AF4 preparation.",
+  "frozen_before_training_utc": 1792952311.899441
+}

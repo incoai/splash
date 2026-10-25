@@ -1,0 +1,40 @@
+{
+  "source_sha256": "7363d4b7b9a6ad32aa6716773451a5101d9eaf71d1062646ec094bdbb7ec26a0",
+  "files": {
+    "runtime/model/Runtime.cpp": "eaf70fa47cb263d83731c75752724787d3d714a6dd7d99a3a21e3e80aafc1002",
+    "runtime/model/RuntimeInstrumentation.hpp": "329081240c18765755c377796768d005486d0cc25ee3cd9b182e604593ebecb7",
+    "dev/benchmarks/decode_profile.mm": "0a6aa148cfebcdd9580792121aab76befd0d3883dd3b7f3d87f88f26939c8433",
+    "dev/benchmarks/rejection_audit.mm": "40961557d711a49cf681bfcf3e31b72ebd6cdd569696cf410e10aa33c7c8761d"
+  },
+  "command": [
+    "xcrun",
+    "-sdk",
+    "macosx",
+    "clang++",
+    "-std=c++20",
+    "-O3",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-fobjc-arc",
+    "-I${AUDIT_WORKTREE}/runtime",
+    "-I${AUDIT_WORKTREE}/dev",
+    "-mmacosx-version-min=26.4",
+    "-DSPLASH_AUDIT_SOURCE_ID=\"7363d4b7b9a6ad32aa6716773451a5101d9eaf71d1062646ec094bdbb7ec26a0\"",
+    "${AUDIT_WORKTREE}/dev/benchmarks/rejection_audit.mm",
+    "${SPLASH_ROOT}/build/qwen38-rejection-audit/native/RuntimeInstrumented.o",
+    "${SPLASH_ROOT}/build/engine/metal/MetalBackendInstrumented.o",
+    "${SPLASH_ROOT}/build/engine/libsplash.a",
+    "-framework",
+    "Foundation",
+    "-framework",
+    "Metal",
+    "-framework",
+    "IOKit",
+    "-framework",
+    "IOSurface",
+    "-o",
+    "${SPLASH_ROOT}/build/qwen38-rejection-audit/native/rejection-audit"
+  ],
+  "binary_sha256": "3f2b497f81fdf144138abc78547de357ebcd0b4933a731886ac889879160941d"
+}

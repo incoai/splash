@@ -1,0 +1,10 @@
+{
+  "model_root": "${SPLASH_ROOT}/build/qwen38-rejection-audit/model-assemblies/released-control",
+  "source_draft_sha256": "67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c",
+  "export_draft_sha256": "67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c",
+  "tensor_sha256": "458127a477af64ce695ea4519bb7040d0776740eecc2a74dd63106d2960fe89e",
+  "all_non_selector_draft_bytes_equal": true,
+  "original_source_unchanged": true,
+  "target_tokenizer_vision": "original read-only source symlinks",
+  "same_geometry": true
+}

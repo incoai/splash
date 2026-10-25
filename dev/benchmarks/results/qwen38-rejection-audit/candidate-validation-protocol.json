@@ -1,0 +1,522 @@
+{
+  "schema": "qwen38-rejection-audit-v1",
+  "seed": 20261025,
+  "method": "native short validation rollouts of frozen selected selector export; same prompts/policies, source-only selector H update",
+  "context_scope": "Long contexts contain unique deterministic synthetic supporting records; this is an acceptance study, not a real-world retrieval/task-accuracy benchmark. Record templates are shared across families.",
+  "families": [
+    {
+      "domain": "code",
+      "index": 0,
+      "family": "rollback-dsu",
+      "split": "development",
+      "task": "Implement a Python disjoint-set union structure supporting snapshot and rollback. State which optimizations are safe, provide the implementation and focused tests, and explain time and space bounds."
+    },
+    {
+      "domain": "code",
+      "index": 1,
+      "family": "stream-csv",
+      "split": "development",
+      "task": "Implement an incremental CSV parser in Python that accepts arbitrary string chunks, quoted fields, escaped quotes, CRLF and embedded newlines. Explain how state persists across chunks and give tests."
+    },
+    {
+      "domain": "code",
+      "index": 2,
+      "family": "fair-scheduler",
+      "split": "development",
+      "task": "Design and implement a small Python job scheduler that respects per-tenant concurrency limits and rotates fairly among ready tenants. Explain cancellation and completion races and give tests."
+    },
+    {
+      "domain": "code",
+      "index": 3,
+      "family": "autocomplete",
+      "split": "development",
+      "task": "Implement a trie-based autocomplete index in Python supporting insert, removal, prefix search and deterministic top suggestions. Explain invariants and complexity, including shared prefixes."
+    },
+    {
+      "domain": "code",
+      "index": 4,
+      "family": "cursor-pages",
+      "split": "validation",
+      "task": "Implement cursor-based pagination over records sorted by timestamp and unique ID. Explain duplicate timestamps, concurrent inserts and deletes, and give a Python implementation with tests."
+    },
+    {
+      "domain": "code",
+      "index": 5,
+      "family": "token-bucket",
+      "split": "validation",
+      "task": "Implement a thread-safe token-bucket rate limiter in Python using a monotonic clock. Inject the clock for deterministic tests and explain bursts, clock advancement and nonblocking rejection."
+    },
+    {
+      "domain": "code",
+      "index": 6,
+      "family": "topological-order",
+      "split": "test",
+      "task": "Implement a Python dependency planner that returns a deterministic topological order or a concrete cycle. Handle disconnected nodes and duplicate edges. Give code, tests, invariants and complexity."
+    },
+    {
+      "domain": "code",
+      "index": 7,
+      "family": "rolling-median",
+      "split": "test",
+      "task": "Implement an exact sliding-window median in Python using two heaps and lazy deletion. Explain balancing and duplicate values, and include tests that repeatedly expire the current median."
+    },
+    {
+      "domain": "math",
+      "index": 0,
+      "family": "divisibility-induction",
+      "split": "development",
+      "task": "Prove that n cubed minus n is divisible by six for every integer n, using two independent arguments. Explain the role of consecutive integers and address negative n."
+    },
+    {
+      "domain": "math",
+      "index": 1,
+      "family": "inclusion-exclusion",
+      "split": "development",
+      "task": "Explain inclusion-exclusion for three finite sets, prove the formula using element multiplicities, and give a worked numerical example with consistent intersections."
+    },
+    {
+      "domain": "math",
+      "index": 2,
+      "family": "convex-jensen",
+      "split": "development",
+      "task": "Prove the midpoint inequality for the square function, extend it to weighted averages, and explain its equality cases and its relation to variance."
+    },
+    {
+      "domain": "math",
+      "index": 3,
+      "family": "binary-gcd",
+      "split": "development",
+      "task": "Explain the binary greatest-common-divisor algorithm. Prove the transformations, work through gcd(462,1071), and give pseudocode with a termination argument."
+    },
+    {
+      "domain": "math",
+      "index": 4,
+      "family": "geometric-series",
+      "split": "validation",
+      "task": "Derive the finite geometric-series formula and use it to establish convergence when the absolute ratio is below one. Explain exceptional cases and provide numerical examples."
+    },
+    {
+      "domain": "math",
+      "index": 5,
+      "family": "pigeonhole",
+      "split": "validation",
+      "task": "Give a rigorous proof that any n+1 integers contain two whose difference is divisible by n. Then discuss why replacing n+1 by n fails, with examples."
+    },
+    {
+      "domain": "math",
+      "index": 6,
+      "family": "bezout-inverse",
+      "split": "test",
+      "task": "Derive the extended Euclidean algorithm and use it to find the multiplicative inverse of 37 modulo 101. Verify the result and explain when such an inverse exists."
+    },
+    {
+      "domain": "math",
+      "index": 7,
+      "family": "counting-paths",
+      "split": "test",
+      "task": "Count shortest lattice paths from (0,0) to (7,5) that avoid (3,2). Derive the counting method, show the arithmetic, and explain how to generalize to two forbidden points."
+    },
+    {
+      "domain": "chinese",
+      "index": 0,
+      "family": "clinic-access",
+      "split": "development",
+      "task": "请为社区诊所制定改善预约和现场排队的方案。解释老人、临时急需就诊者和上班族的不同需求，分析预约爽约、人员安排和执行成本，提出可检验的改进指标。"
+    },
+    {
+      "domain": "chinese",
+      "index": 1,
+      "family": "school-meals",
+      "split": "development",
+      "task": "请分析学校食堂减少食物浪费的可行方案。结合学生选择、菜单反馈、份量和食品安全，说明如何试行和评估，避免用简单的处罚替代管理。"
+    },
+    {
+      "domain": "chinese",
+      "index": 2,
+      "family": "storm-drains",
+      "split": "development",
+      "task": "请为住宅区雨水排水沟制定雨季前后的维护方案。说明检查顺序、居民反馈、垃圾堵塞、积水记录和施工协作，区分可以自行处理与需要专业人员处理的问题。"
+    },
+    {
+      "domain": "chinese",
+      "index": 3,
+      "family": "bicycle-parking",
+      "split": "development",
+      "task": "请讨论老城区自行车和电动车停车空间的安排。平衡行人通行、消防通道、商户装卸和居民便利，提出可逐步试行的设计和反馈机制。"
+    },
+    {
+      "domain": "chinese",
+      "index": 4,
+      "family": "library-reuse",
+      "split": "validation",
+      "task": "请提出社区旧图书馆改造的方案。考虑安静阅读、儿童活动、无障碍通行、设备维护与志愿者安排，解释空间和预算取舍，并说明如何评价使用效果。"
+    },
+    {
+      "domain": "chinese",
+      "index": 5,
+      "family": "waste-collection",
+      "split": "validation",
+      "task": "请分析社区分类垃圾收集的运行问题。讨论收集时段、标识、异味、清洁人员工作量和居民参与，提出务实的试点方案及评估方法。"
+    },
+    {
+      "domain": "chinese",
+      "index": 6,
+      "family": "bus-information",
+      "split": "test",
+      "task": "请为社区公交站的信息展示提出改进建议。考虑临时改道、老年乘客、夜间辨识、手机使用困难和维护责任，说明信息如何更新、验证和纠错。"
+    },
+    {
+      "domain": "chinese",
+      "index": 7,
+      "family": "shared-laundry",
+      "split": "test",
+      "task": "请为公寓共享洗衣房制定公平可行的使用安排。讨论预约、超时占用、设备故障、清洁责任和邻里纠纷，给出试行步骤及可衡量的效果指标。"
+    },
+    {
+      "domain": "json",
+      "index": 0,
+      "family": "deployment-calendar",
+      "split": "development",
+      "task": "Return only a JSON object describing a fictional deployment calendar. Include at least20 milestones with unique IDs, dependency IDs, owners, status, and rollback actions. Keep references consistent."
+    },
+    {
+      "domain": "json",
+      "index": 1,
+      "family": "warehouse-transfers",
+      "split": "development",
+      "task": "Return only a JSON document describing at least24 fictional warehouse transfers. Include product IDs, origin, destination, quantity, checks and approval records, with consistent references and varied values."
+    },
+    {
+      "domain": "json",
+      "index": 2,
+      "family": "museum-program",
+      "split": "development",
+      "task": "Return only JSON for a fictional museum program with at least20 events, rooms, guides, accessibility details and dependencies. Use consistent IDs and sensible schedules."
+    },
+    {
+      "domain": "json",
+      "index": 3,
+      "family": "device-maintenance",
+      "split": "development",
+      "task": "Return only JSON describing a fictional maintenance plan for at least24 devices. Include device IDs, locations, owners, inspection steps and follow-up actions with consistent references."
+    },
+    {
+      "domain": "json",
+      "index": 4,
+      "family": "support-triage",
+      "split": "validation",
+      "task": "Return only JSON representing a fictional support triage queue of at least24 tickets. Include severity, evidence, routing, owner, dependencies and resolution checks. Use unique IDs and coherent references."
+    },
+    {
+      "domain": "json",
+      "index": 5,
+      "family": "research-catalog",
+      "split": "validation",
+      "task": "Return only JSON for a fictional research artifact catalog with at least24 artifacts. Include provenance, authors, versions, linked datasets and validation steps, keeping identifiers consistent."
+    },
+    {
+      "domain": "json",
+      "index": 6,
+      "family": "conference-rooms",
+      "split": "test",
+      "task": "Return only JSON describing a fictional conference schedule with at least24 sessions. Include rooms, speakers, setup dependencies, accessibility notes and contingency actions. Keep references internally consistent."
+    },
+    {
+      "domain": "json",
+      "index": 7,
+      "family": "backup-manifest",
+      "split": "test",
+      "task": "Return only JSON for a fictional backup manifest with at least24 resources. Include resource IDs, retention, dependencies, recovery order, owners and verification steps, with consistent references."
+    }
+  ],
+  "cases": [
+    {
+      "id": "math-5-pigeonhole-short-think",
+      "family": "pigeonhole",
+      "domain": "math",
+      "split": "validation",
+      "context": "short",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "cycles": 32,
+      "capture_hidden": true,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/math-5-pigeonhole-short-think.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/candidate-validation/math-5-pigeonhole-short-think.jsonl",
+      "prompt_tokens": 69,
+      "prompt_sha256": "2e1387e8ebed17551153f5868909eb0a5d720fd03a250673e5ec598b9972a88a",
+      "content_sha256": "b85c5f90207ae433a0cf7566b456d17262f3ad6e1597b52be4831471818561a1",
+      "restore_prefix": 0,
+      "materialize_prefix": 0
+    },
+    {
+      "id": "chinese-5-waste-collection-short-think",
+      "family": "waste-collection",
+      "domain": "chinese",
+      "split": "validation",
+      "context": "short",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "cycles": 32,
+      "capture_hidden": true,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/chinese-5-waste-collection-short-think.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/candidate-validation/chinese-5-waste-collection-short-think.jsonl",
+      "prompt_tokens": 69,
+      "prompt_sha256": "19e95a403c31ffad701dda089508c6463146bb48a53f11a1ed2c0c4ad52e1a1f",
+      "content_sha256": "b778d73745c6b5feb34e81c9db55c56dbdc262acdcddc0cea2c06a757beda800",
+      "restore_prefix": 0,
+      "materialize_prefix": 0
+    },
+    {
+      "id": "json-5-research-catalog-short-think",
+      "family": "research-catalog",
+      "domain": "json",
+      "split": "validation",
+      "context": "short",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "cycles": 32,
+      "capture_hidden": true,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/json-5-research-catalog-short-think.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/candidate-validation/json-5-research-catalog-short-think.jsonl",
+      "prompt_tokens": 70,
+      "prompt_sha256": "b9ad9b7683bef6c26051c5b80fbd7df2a0a5a50993aca926af9762ec73a21302",
+      "content_sha256": "2c3c9197acf3207a34822cce042fa814a1565889118f98a9c906e75ebb053335",
+      "restore_prefix": 0,
+      "materialize_prefix": 0
+    },
+    {
+      "id": "math-4-geometric-series-short-think",
+      "family": "geometric-series",
+      "domain": "math",
+      "split": "validation",
+      "context": "short",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "cycles": 32,
+      "capture_hidden": true,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/math-4-geometric-series-short-think.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/candidate-validation/math-4-geometric-series-short-think.jsonl",
+      "prompt_tokens": 65,
+      "prompt_sha256": "7b20270502e085f8c9648b353a3d77c541f44c3dceac41c67422035d5dde8f1f",
+      "content_sha256": "11148db1033393fe531fd0c5b5295d2f47985a29c5c1927cf869b5715550d54f",
+      "restore_prefix": 0,
+      "materialize_prefix": 0
+    },
+    {
+      "id": "code-4-cursor-pages-short-direct",
+      "family": "cursor-pages",
+      "domain": "code",
+      "split": "validation",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "cycles": 32,
+      "capture_hidden": true,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/code-4-cursor-pages-short-direct.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/candidate-validation/code-4-cursor-pages-short-direct.jsonl",
+      "prompt_tokens": 68,
+      "prompt_sha256": "fe6ee75d9765d23e8d1b5faf0b6231f942128d44fb5221e4edef516067cd2ae1",
+      "content_sha256": "80dd1ad1079c2459bc84352f311442d464c5ce8c4c03713baa1dd8a36353b57d",
+      "restore_prefix": 0,
+      "materialize_prefix": 0
+    },
+    {
+      "id": "json-4-support-triage-short-direct",
+      "family": "support-triage",
+      "domain": "json",
+      "split": "validation",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "cycles": 32,
+      "capture_hidden": true,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/json-4-support-triage-short-direct.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/candidate-validation/json-4-support-triage-short-direct.jsonl",
+      "prompt_tokens": 76,
+      "prompt_sha256": "30150a11f3f6274428bec08c23812a3abe88d46e5b5774fd65963f1d9d34241c",
+      "content_sha256": "5d946b77143500ad0947908f76c57bf24a8e47386e5725131194c1e275214c05",
+      "restore_prefix": 0,
+      "materialize_prefix": 0
+    },
+    {
+      "id": "math-4-geometric-series-short-direct",
+      "family": "geometric-series",
+      "domain": "math",
+      "split": "validation",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "cycles": 32,
+      "capture_hidden": true,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/math-4-geometric-series-short-direct.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/candidate-validation/math-4-geometric-series-short-direct.jsonl",
+      "prompt_tokens": 67,
+      "prompt_sha256": "b817e6fb3d5a3bca81321e14c12c1892514e59384f9196444cf2a9fa1f8454ee",
+      "content_sha256": "11148db1033393fe531fd0c5b5295d2f47985a29c5c1927cf869b5715550d54f",
+      "restore_prefix": 0,
+      "materialize_prefix": 0
+    },
+    {
+      "id": "code-5-token-bucket-short-think",
+      "family": "token-bucket",
+      "domain": "code",
+      "split": "validation",
+      "context": "short",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "cycles": 32,
+      "capture_hidden": true,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/code-5-token-bucket-short-think.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/candidate-validation/code-5-token-bucket-short-think.jsonl",
+      "prompt_tokens": 70,
+      "prompt_sha256": "5c21d26d30c8eebf9c32808602e33240c423cbb3e23970e858ba48c1ab484429",
+      "content_sha256": "a3eaadfcbda7cab0797ab3b77dd8b0e86c85e10fc1ef355462d9bea9436c8706",
+      "restore_prefix": 0,
+      "materialize_prefix": 0
+    },
+    {
+      "id": "chinese-4-library-reuse-short-think",
+      "family": "library-reuse",
+      "domain": "chinese",
+      "split": "validation",
+      "context": "short",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "cycles": 32,
+      "capture_hidden": true,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/chinese-4-library-reuse-short-think.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/candidate-validation/chinese-4-library-reuse-short-think.jsonl",
+      "prompt_tokens": 72,
+      "prompt_sha256": "aa37899d915e15bab0f7e3f3d544094c7fc84ef08a36bf9a707a75b16ce8220d",
+      "content_sha256": "38575891c6447bf17fbdf313faea61b70340391bf40ccb8be4314cefb86e9e18",
+      "restore_prefix": 0,
+      "materialize_prefix": 0
+    },
+    {
+      "id": "json-4-support-triage-short-think",
+      "family": "support-triage",
+      "domain": "json",
+      "split": "validation",
+      "context": "short",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "cycles": 32,
+      "capture_hidden": true,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/json-4-support-triage-short-think.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/candidate-validation/json-4-support-triage-short-think.jsonl",
+      "prompt_tokens": 74,
+      "prompt_sha256": "dfc94cf8a7d2c8ff5278f0dc1826025b7a2ba9b7a9ecf648b1b0a8c43bb014a7",
+      "content_sha256": "5d946b77143500ad0947908f76c57bf24a8e47386e5725131194c1e275214c05",
+      "restore_prefix": 0,
+      "materialize_prefix": 0
+    },
+    {
+      "id": "math-5-pigeonhole-short-direct",
+      "family": "pigeonhole",
+      "domain": "math",
+      "split": "validation",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "cycles": 32,
+      "capture_hidden": true,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/math-5-pigeonhole-short-direct.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/candidate-validation/math-5-pigeonhole-short-direct.jsonl",
+      "prompt_tokens": 71,
+      "prompt_sha256": "27e6e434ea28263766828388e0c82829c00bc199e38282216affb15d115fa09b",
+      "content_sha256": "b85c5f90207ae433a0cf7566b456d17262f3ad6e1597b52be4831471818561a1",
+      "restore_prefix": 0,
+      "materialize_prefix": 0
+    },
+    {
+      "id": "code-5-token-bucket-short-direct",
+      "family": "token-bucket",
+      "domain": "code",
+      "split": "validation",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "cycles": 32,
+      "capture_hidden": true,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/code-5-token-bucket-short-direct.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/candidate-validation/code-5-token-bucket-short-direct.jsonl",
+      "prompt_tokens": 72,
+      "prompt_sha256": "52c234b4751ab02efb7a5a9208f3566f15a8d3a09227a3e468bfa4ad44c04df2",
+      "content_sha256": "a3eaadfcbda7cab0797ab3b77dd8b0e86c85e10fc1ef355462d9bea9436c8706",
+      "restore_prefix": 0,
+      "materialize_prefix": 0
+    },
+    {
+      "id": "json-5-research-catalog-short-direct",
+      "family": "research-catalog",
+      "domain": "json",
+      "split": "validation",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "cycles": 32,
+      "capture_hidden": true,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/json-5-research-catalog-short-direct.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/candidate-validation/json-5-research-catalog-short-direct.jsonl",
+      "prompt_tokens": 72,
+      "prompt_sha256": "b09131a1d477456f3d7929b35fc65f346518fd470a1ee2362bf83570e6c5eb6b",
+      "content_sha256": "2c3c9197acf3207a34822cce042fa814a1565889118f98a9c906e75ebb053335",
+      "restore_prefix": 0,
+      "materialize_prefix": 0
+    },
+    {
+      "id": "chinese-5-waste-collection-short-direct",
+      "family": "waste-collection",
+      "domain": "chinese",
+      "split": "validation",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "cycles": 32,
+      "capture_hidden": true,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/chinese-5-waste-collection-short-direct.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/candidate-validation/chinese-5-waste-collection-short-direct.jsonl",
+      "prompt_tokens": 71,
+      "prompt_sha256": "7a3365f58341fad358d4f63c701bb5c6f11e253a49370f900f8aab658327fca2",
+      "content_sha256": "b778d73745c6b5feb34e81c9db55c56dbdc262acdcddc0cea2c06a757beda800",
+      "restore_prefix": 0,
+      "materialize_prefix": 0
+    },
+    {
+      "id": "chinese-4-library-reuse-short-direct",
+      "family": "library-reuse",
+      "domain": "chinese",
+      "split": "validation",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "cycles": 32,
+      "capture_hidden": true,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/chinese-4-library-reuse-short-direct.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/candidate-validation/chinese-4-library-reuse-short-direct.jsonl",
+      "prompt_tokens": 74,
+      "prompt_sha256": "0bb3f85ca2aa70fad63ed7a94a70e176b32524270b97991de2811583ec6f6d48",
+      "content_sha256": "38575891c6447bf17fbdf313faea61b70340391bf40ccb8be4314cefb86e9e18",
+      "restore_prefix": 0,
+      "materialize_prefix": 0
+    },
+    {
+      "id": "code-4-cursor-pages-short-think",
+      "family": "cursor-pages",
+      "domain": "code",
+      "split": "validation",
+      "context": "short",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "cycles": 32,
+      "capture_hidden": true,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/code-4-cursor-pages-short-think.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/candidate-validation/code-4-cursor-pages-short-think.jsonl",
+      "prompt_tokens": 66,
+      "prompt_sha256": "9fd7cd0bc4e04a65385ba2d4ef2d7828f27cfb2080a2e65623a2e71262d3c274",
+      "content_sha256": "80dd1ad1079c2459bc84352f311442d464c5ce8c4c03713baa1dd8a36353b57d",
+      "restore_prefix": 0,
+      "materialize_prefix": 0
+    }
+  ]
+}

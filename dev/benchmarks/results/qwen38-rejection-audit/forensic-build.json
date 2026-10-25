@@ -1,0 +1,11 @@
+{
+  "source_sha256": "d81a73501f566a8085cb9d6066e41a5cdb438ae4aa135b7eba4bb81eb42c879d",
+  "files": {
+    "runtime/model/Runtime.cpp": "eaf70fa47cb263d83731c75752724787d3d714a6dd7d99a3a21e3e80aafc1002",
+    "runtime/model/RuntimeInstrumentation.hpp": "329081240c18765755c377796768d005486d0cc25ee3cd9b182e604593ebecb7",
+    "dev/benchmarks/decode_profile.mm": "0a6aa148cfebcdd9580792121aab76befd0d3883dd3b7f3d87f88f26939c8433",
+    "dev/benchmarks/rejection_forensic.mm": "98dd4050551c9dc1661ce716ee0abc31696c0d1a83e02b3c5886ff2997ae36af"
+  },
+  "binary_sha256": "e7e3db5f7dcff62bd37fe9c9d86a71a0cbec7943cbfd2dff9701640c4db1b6f1",
+  "raw_sidecar": "8x248320 F32 logits per policy_record; rows past retained are not a correct-prefix oracle"
+}

@@ -1,0 +1,689 @@
+{
+  "scope": "representative original-checkpoint M16-only vs baseline;one ABBA block;not selector adaptation",
+  "strata": {
+    "short/direct": {
+      "decode": {
+        "rounds": [
+          16.904764687499977,
+          17.380133320312495,
+          17.282113320312533,
+          18.884418320312534
+        ],
+        "baseline": 17.894591503906256,
+        "candidate": 17.331123320312514,
+        "noise": 0.11062860151797337,
+        "regression": -0.03148818364871531,
+        "bound": 0.22125720303594673,
+        "verdict": "inconclusive",
+        "pass": false,
+        "tps_gain": 0.03251192511759138,
+        "promotion_gain_pass": false
+      },
+      "ttft": {
+        "rounds": [
+          260.21899999999994,
+          297.4285,
+          307.45700000000056,
+          302.5635000000002
+        ],
+        "baseline": 281.39125000000007,
+        "candidate": 302.4427500000003,
+        "noise": 0.15048264649309548,
+        "regression": 0.07481220542572031,
+        "bound": 0.30096529298619096,
+        "verdict": "inconclusive",
+        "pass": false
+      }
+    },
+    "short/think": {
+      "decode": {
+        "rounds": [
+          17.352974109374998,
+          18.740242999999996,
+          19.71575994921875,
+          20.95937923828125
+        ],
+        "baseline": 19.156176673828124,
+        "candidate": 19.22800147460937,
+        "noise": 0.18826330485004647,
+        "regression": 0.0037494329899021572,
+        "bound": 0.37652660970009294,
+        "verdict": "inconclusive",
+        "pass": false,
+        "tps_gain": -0.0037354272557182933,
+        "promotion_gain_pass": false
+      },
+      "ttft": {
+        "rounds": [
+          256.7755000000001,
+          290.283,
+          303.83899999999994,
+          306.7404999999999
+        ],
+        "baseline": 281.758,
+        "candidate": 297.061,
+        "noise": 0.17733303047295837,
+        "regression": 0.054312566102825865,
+        "bound": 0.35466606094591674,
+        "verdict": "inconclusive",
+        "pass": false
+      }
+    },
+    "2k/direct": {
+      "decode": {
+        "rounds": [
+          17.760759101562492,
+          17.982583320312493,
+          18.349764804687503,
+          18.401802265624994
+        ],
+        "baseline": 18.081280683593743,
+        "candidate": 18.166174062499998,
+        "noise": 0.03545341589902755,
+        "regression": 0.004695097675425419,
+        "bound": 0.0709068317980551,
+        "verdict": "pass",
+        "pass": true,
+        "tps_gain": -0.004673156748040808,
+        "promotion_gain_pass": false
+      },
+      "ttft": {
+        "rounds": [
+          4216.1175,
+          4718.701000000001,
+          4804.870499999999,
+          4833.539000000001
+        ],
+        "baseline": 4524.8282500000005,
+        "candidate": 4761.78575,
+        "noise": 0.1364519194734077,
+        "regression": 0.05236828602278987,
+        "bound": 0.2729038389468154,
+        "verdict": "inconclusive",
+        "pass": false
+      }
+    },
+    "2k/think": {
+      "decode": {
+        "rounds": [
+          15.902684101562514,
+          16.351459921875005,
+          16.402660468749986,
+          16.64086933593748
+        ],
+        "baseline": 16.271776718749997,
+        "candidate": 16.377060195312495,
+        "noise": 0.04536598843102087,
+        "regression": 0.006470312270274725,
+        "bound": 0.09073197686204174,
+        "verdict": "pass",
+        "pass": true,
+        "tps_gain": -0.006428716467234641,
+        "promotion_gain_pass": false
+      },
+      "ttft": {
+        "rounds": [
+          4241.289,
+          4651.5005,
+          4811.5235,
+          4835.137
+        ],
+        "baseline": 4538.213,
+        "candidate": 4731.512000000001,
+        "noise": 0.13085503038310453,
+        "regression": 0.04259363762785062,
+        "bound": 0.26171006076620906,
+        "verdict": "inconclusive",
+        "pass": false
+      }
+    }
+  },
+  "per_case": {
+    "chinese-6-bus-information-2k-think": {
+      "rounds": [
+        12.575892250000003,
+        13.13600390625,
+        13.487473304687501,
+        13.586475257812499
+      ],
+      "baseline": 13.08118375390625,
+      "candidate": 13.31173860546875,
+      "noise": 0.07725470621194507,
+      "regression": 0.017624922629318807,
+      "bound": 0.15450941242389013,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": -0.017319664875915075,
+      "outputs_equal": true
+    },
+    "json-7-backup-manifest-2k-direct": {
+      "rounds": [
+        11.509856117187496,
+        12.04596875,
+        12.34648275,
+        12.42208203125
+      ],
+      "baseline": 11.965969074218748,
+      "candidate": 12.19622575,
+      "noise": 0.07623502186947295,
+      "regression": 0.019242626681807984,
+      "bound": 0.1524700437389459,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": -0.018879338616805463,
+      "outputs_equal": true
+    },
+    "json-7-backup-manifest-short-think": {
+      "rounds": [
+        17.272877281250004,
+        18.584310218749998,
+        19.603042320312497,
+        20.7066689453125
+      ],
+      "baseline": 18.989773113281252,
+      "candidate": 19.093676269531247,
+      "noise": 0.1808232064479453,
+      "regression": 0.005471532262664391,
+      "bound": 0.3616464128958906,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": -0.005441757510878054,
+      "outputs_equal": true
+    },
+    "json-6-conference-rooms-2k-think": {
+      "rounds": [
+        17.641105148437504,
+        18.401458335937505,
+        18.969313125,
+        19.091943648437507
+      ],
+      "baseline": 18.366524398437505,
+      "candidate": 18.685385730468752,
+      "noise": 0.07899363366339635,
+      "regression": 0.017361005550858177,
+      "bound": 0.1579872673267927,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": -0.017064744428117673,
+      "outputs_equal": true
+    },
+    "code-6-topological-order-short-think": {
+      "rounds": [
+        17.43307093749999,
+        18.896175781249994,
+        19.828477578125003,
+        21.21208953125
+      ],
+      "baseline": 19.322580234374996,
+      "candidate": 19.3623266796875,
+      "noise": 0.19557525692283637,
+      "regression": 0.002056994709318971,
+      "bound": 0.39115051384567273,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": -0.0020527721678303967,
+      "outputs_equal": true
+    },
+    "code-6-topological-order-2k-think": {
+      "rounds": [
+        17.138441093750004,
+        17.896133828125002,
+        18.369676406249994,
+        18.572458359375005
+      ],
+      "baseline": 17.855449726562505,
+      "candidate": 18.132905117187498,
+      "noise": 0.08031258173753521,
+      "regression": 0.015538975207789907,
+      "bound": 0.16062516347507041,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": -0.015301210083650818,
+      "outputs_equal": true
+    },
+    "code-7-rolling-median-2k-direct": {
+      "rounds": [
+        17.574830390624996,
+        17.337790937500003,
+        17.726044609374995,
+        17.829797499999984
+      ],
+      "baseline": 17.70231394531249,
+      "candidate": 17.5319177734375,
+      "noise": 0.022145533471713663,
+      "regression": -0.009625643992157928,
+      "bound": 0.044291066943427326,
+      "verdict": "pass",
+      "pass": true,
+      "tps_gain": 0.009719197527446655,
+      "outputs_equal": true
+    },
+    "json-6-conference-rooms-short-think": {
+      "rounds": [
+        15.412093749999997,
+        15.977358124999995,
+        16.582447578125,
+        17.758148750000004
+      ],
+      "baseline": 16.58512125,
+      "candidate": 16.279902851562497,
+      "noise": 0.14145540238362786,
+      "regression": -0.01840314543600352,
+      "bound": 0.2829108047672557,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": 0.018748170748955628,
+      "outputs_equal": true
+    },
+    "chinese-7-shared-laundry-2k-think": {
+      "rounds": [
+        15.951817734374998,
+        16.77405335937499,
+        17.113055312500023,
+        17.363628281249987
+      ],
+      "baseline": 16.657723007812493,
+      "candidate": 16.943554335937506,
+      "noise": 0.08475411352517076,
+      "regression": 0.0171590875890395,
+      "bound": 0.16950822705034152,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": -0.016869620296773302,
+      "outputs_equal": true
+    },
+    "math-6-bezout-inverse-short-think": {
+      "rounds": [
+        11.401591484375018,
+        12.452483437500007,
+        12.832394921874993,
+        13.382804375000006
+      ],
+      "baseline": 12.392197929687512,
+      "candidate": 12.6424391796875,
+      "noise": 0.15987582686027574,
+      "regression": 0.020193451671756568,
+      "bound": 0.3197516537205515,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": -0.01979374758646646,
+      "outputs_equal": true
+    },
+    "math-7-counting-paths-short-direct": {
+      "rounds": [
+        14.152794921875,
+        15.46911976562501,
+        16.04993781249999,
+        16.71091015625001
+      ],
+      "baseline": 15.431852539062504,
+      "candidate": 15.7595287890625,
+      "noise": 0.16576851210181512,
+      "regression": 0.021233759794590634,
+      "bound": 0.33153702420363024,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": -0.020792261899823528,
+      "outputs_equal": true
+    },
+    "code-7-rolling-median-short-think": {
+      "rounds": [
+        18.579291640625,
+        19.692435546875004,
+        20.345122343750006,
+        21.697707656250003
+      ],
+      "baseline": 20.138499648437502,
+      "candidate": 20.018778945312505,
+      "noise": 0.15484847779446925,
+      "regression": -0.005944867056383973,
+      "bound": 0.3096969555889385,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": 0.005980419857377406,
+      "outputs_equal": true
+    },
+    "json-7-backup-manifest-short-direct": {
+      "rounds": [
+        15.185365859374997,
+        15.515725234374997,
+        15.992161484375004,
+        16.47644367187499
+      ],
+      "baseline": 15.830904765624993,
+      "candidate": 15.753943359375,
+      "noise": 0.08155426563511523,
+      "regression": -0.004861466062072828,
+      "bound": 0.16310853127023045,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": 0.004885215370803886,
+      "outputs_equal": true
+    },
+    "json-6-conference-rooms-2k-direct": {
+      "rounds": [
+        17.946687812499988,
+        18.627375703124983,
+        18.97348500000001,
+        18.973807031250004
+      ],
+      "baseline": 18.460247421874996,
+      "candidate": 18.800430351562497,
+      "noise": 0.05563951529343545,
+      "regression": 0.018427864042840136,
+      "bound": 0.1112790305868709,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": -0.018094422485346318,
+      "outputs_equal": true
+    },
+    "chinese-7-shared-laundry-short-direct": {
+      "rounds": [
+        29.888125703124985,
+        30.80627046875003,
+        32.138416328125004,
+        33.81373562499999
+      ],
+      "baseline": 31.85093066406249,
+      "candidate": 31.472343398437516,
+      "noise": 0.12324945739511112,
+      "regression": -0.01188622303122,
+      "bound": 0.24649891479022223,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": 0.012029204842870733,
+      "outputs_equal": true
+    },
+    "chinese-6-bus-information-2k-direct": {
+      "rounds": [
+        26.89843812500004,
+        27.297168593749973,
+        27.659885781249955,
+        28.788952812499986
+      ],
+      "baseline": 27.843695468750013,
+      "candidate": 27.478527187499964,
+      "noise": 0.06789740570254899,
+      "regression": -0.013114935898501323,
+      "bound": 0.13579481140509797,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": 0.0132892232090287,
+      "outputs_equal": true
+    },
+    "json-6-conference-rooms-short-direct": {
+      "rounds": [
+        17.618385468749977,
+        18.168771171874994,
+        18.16951109375003,
+        19.49953000000005
+      ],
+      "baseline": 18.558957734375014,
+      "candidate": 18.169141132812513,
+      "noise": 0.1013604620568646,
+      "regression": -0.0210042291782625,
+      "bound": 0.2027209241137292,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": 0.02145487223160547,
+      "outputs_equal": true
+    },
+    "chinese-7-shared-laundry-2k-direct": {
+      "rounds": [
+        25.753995078125,
+        26.185214843750032,
+        26.131435546874968,
+        27.34685445312499
+      ],
+      "baseline": 26.550424765624996,
+      "candidate": 26.1583251953125,
+      "noise": 0.05999374356760854,
+      "regression": -0.014768109127208717,
+      "bound": 0.11998748713521708,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": 0.014989475334711289,
+      "outputs_equal": true
+    },
+    "chinese-6-bus-information-short-direct": {
+      "rounds": [
+        31.462551093749994,
+        32.53675328124996,
+        32.65256343750002,
+        34.768357734375
+      ],
+      "baseline": 33.1154544140625,
+      "candidate": 32.59465835937499,
+      "noise": 0.09982670324527375,
+      "regression": -0.015726676982163124,
+      "bound": 0.1996534064905475,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": 0.01597795715314554,
+      "outputs_equal": true
+    },
+    "math-6-bezout-inverse-short-direct": {
+      "rounds": [
+        13.598378281250007,
+        13.954423828125016,
+        13.974464218750029,
+        14.788042656249957
+      ],
+      "baseline": 14.193210468749982,
+      "candidate": 13.964444023437522,
+      "noise": 0.08381925834322708,
+      "regression": -0.016118019655676052,
+      "bound": 0.16763851668645416,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": 0.01638206611938897,
+      "outputs_equal": true
+    },
+    "code-7-rolling-median-2k-think": {
+      "rounds": [
+        15.757091796874988,
+        15.83079132812503,
+        15.692265624999948,
+        15.883685234375037
+      ],
+      "baseline": 15.820388515625012,
+      "candidate": 15.76152847656249,
+      "noise": 0.008788849592288706,
+      "regression": -0.003720517925611677,
+      "bound": 0.02,
+      "verdict": "pass",
+      "pass": true,
+      "tps_gain": 0.0037344118719226937,
+      "outputs_equal": true
+    },
+    "code-6-topological-order-2k-direct": {
+      "rounds": [
+        24.81154328125001,
+        25.113997109374964,
+        24.712163750000002,
+        26.52880601562498
+      ],
+      "baseline": 25.670174648437495,
+      "candidate": 24.913080429687483,
+      "noise": 0.06689719715169513,
+      "regression": -0.02949314638948497,
+      "bound": 0.13379439430339027,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": 0.03038942618464091,
+      "outputs_equal": true
+    },
+    "chinese-6-bus-information-short-think": {
+      "rounds": [
+        23.402462890624975,
+        24.121925781250013,
+        23.98794171875005,
+        25.54022359375
+      ],
+      "baseline": 24.471343242187487,
+      "candidate": 24.054933750000032,
+      "noise": 0.08735771804465652,
+      "regression": -0.01701620904362877,
+      "bound": 0.17471543608931303,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": 0.017310772771820915,
+      "outputs_equal": true
+    },
+    "math-6-bezout-inverse-2k-think": {
+      "rounds": [
+        15.85355046875003,
+        15.928866484375021,
+        15.46152859374996,
+        15.918110390624975
+      ],
+      "baseline": 15.885830429687502,
+      "candidate": 15.695197539062491,
+      "noise": 0.029775852738517086,
+      "regression": -0.012000184155859794,
+      "bound": 0.05955170547703417,
+      "verdict": "pass",
+      "pass": true,
+      "tps_gain": 0.012145937644337357,
+      "outputs_equal": true
+    },
+    "code-7-rolling-median-short-direct": {
+      "rounds": [
+        16.191143906249977,
+        16.591495468749997,
+        16.394715546875034,
+        18.269306640625018
+      ],
+      "baseline": 17.230225273437497,
+      "candidate": 16.493105507812515,
+      "noise": 0.1206114662690327,
+      "regression": -0.04278062265159943,
+      "bound": 0.2412229325380654,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": 0.044692599903385144,
+      "outputs_equal": true
+    },
+    "math-7-counting-paths-2k-direct": {
+      "rounds": [
+        12.887536406250035,
+        12.919329453124988,
+        12.552373671874932,
+        13.016541953125056
+      ],
+      "baseline": 12.952039179687546,
+      "candidate": 12.73585156249996,
+      "noise": 0.028812818636371168,
+      "regression": -0.01669139617232085,
+      "bound": 0.057625637272742336,
+      "verdict": "pass",
+      "pass": true,
+      "tps_gain": 0.016974728083682944,
+      "outputs_equal": true
+    },
+    "json-7-backup-manifest-2k-think": {
+      "rounds": [
+        19.507965859374963,
+        19.70773695312505,
+        19.25908531250002,
+        19.842226874999938
+      ],
+      "baseline": 19.67509636718745,
+      "candidate": 19.483411132812535,
+      "noise": 0.02302736607910737,
+      "regression": -0.00974253090290289,
+      "bound": 0.04605473215821474,
+      "verdict": "pass",
+      "pass": true,
+      "tps_gain": 0.009838381640065785,
+      "outputs_equal": true
+    },
+    "chinese-7-shared-laundry-short-think": {
+      "rounds": [
+        24.256149375000064,
+        24.876586562499938,
+        24.364733046875017,
+        26.317583671875013
+      ],
+      "baseline": 25.28686652343754,
+      "candidate": 24.620659804687477,
+      "noise": 0.08152193530836556,
+      "regression": -0.026345957816978904,
+      "bound": 0.16304387061673112,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": 0.027058849114320882,
+      "outputs_equal": true
+    },
+    "math-7-counting-paths-short-think": {
+      "rounds": [
+        14.604738281249979,
+        14.830874062500015,
+        14.693742499999985,
+        15.47647234375006
+      ],
+      "baseline": 15.04060531250002,
+      "candidate": 14.76230828125,
+      "noise": 0.05795870873465422,
+      "regression": -0.018503047282194873,
+      "bound": 0.11591741746930843,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": 0.018851864217162673,
+      "outputs_equal": true
+    },
+    "math-6-bezout-inverse-2k-direct": {
+      "rounds": [
+        14.78388187500002,
+        14.754814765625042,
+        14.005049140625033,
+        14.709298515624937
+      ],
+      "baseline": 14.746590195312478,
+      "candidate": 14.379931953125038,
+      "noise": 0.05213971995445156,
+      "regression": -0.024863933786129833,
+      "bound": 0.10427943990890312,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": 0.025497912186417393,
+      "outputs_equal": true
+    },
+    "code-6-topological-order-short-direct": {
+      "rounds": [
+        19.972114921875004,
+        20.381867187500006,
+        20.472110078124956,
+        21.587259453125057
+      ],
+      "baseline": 20.77968718750003,
+      "candidate": 20.42698863281248,
+      "noise": 0.07772708591213245,
+      "regression": -0.016973236964785254,
+      "bound": 0.1554541718242649,
+      "verdict": "inconclusive",
+      "pass": false,
+      "tps_gain": 0.017266302000139122,
+      "outputs_equal": true
+    },
+    "math-7-counting-paths-2k-think": {
+      "rounds": [
+        12.417133124999964,
+        12.34737398437494,
+        11.835795546875033,
+        12.39049085937495
+      ],
+      "baseline": 12.403811992187457,
+      "candidate": 12.091584765624987,
+      "noise": 0.04230863426225704,
+      "regression": -0.025171876739112697,
+      "bound": 0.08461726852451408,
+      "verdict": "pass",
+      "pass": true,
+      "tps_gain": 0.025821861452776318,
+      "outputs_equal": true
+    }
+  },
+  "all_messages_usage_speculation_equal": true,
+  "performance_pass": false
+}

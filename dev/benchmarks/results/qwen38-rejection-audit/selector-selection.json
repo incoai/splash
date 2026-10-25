@@ -1,0 +1,11 @@
+{
+  "initial_proxy": 4.285805663976287,
+  "candidate_proxy": 4.312250073659887,
+  "improves_proxy": true,
+  "trial": "bf16-lr0.001",
+  "step": 100,
+  "tensor_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/selector-fits/bf16-lr0.001-step100.bf16",
+  "tensor_sha256": "21b9cc1b35b2ea73cafe4a8dec1f75eccbf7dd2bf804babe7b35f5039e1c3c0d",
+  "test_used": false,
+  "scope": "candidate selection only; native rollout qualification still required"
+}
