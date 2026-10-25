@@ -183,7 +183,7 @@ class ClientTests(unittest.TestCase):
                 "--model",
                 MODEL,
                 "--permission-mode",
-                "default",
+                "auto",
             ],
         )
         self.assertEqual(

@@ -545,7 +545,7 @@ class ClientRun:
         if self.name == "claude":
             # Normal edit authorization and one explicit project test command;
             # --allowedTools grants permission, unlike --tools it does not filter
-            # the registered tool inventory. Production still defaults to default.
+            # the registered tool inventory. Production defaults to auto.
             arguments = [
                 "--print",
                 "--output-format",

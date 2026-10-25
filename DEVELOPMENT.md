@@ -835,6 +835,12 @@ Agents must already be installed; `splash claude|opencode|codex|hermes|pi`
 connects to the running server. Arguments pass through, for example
 `splash codex resume --last` or `splash hermes chat -q "Hello"`.
 
+`splash claude` starts Claude Code in auto mode (`--permission-mode auto`,
+which a `--permission-mode` argument overrides). With `splash serve
+--safeguards` Splash reviews each tool call itself ([action
+review](#action-review)); without it, Claude Code's own classifier requests
+reach Splash as ordinary Messages requests.
+
 `splash pi` adds a `splash` provider to Pi's `models.json` (`splash-<port>` for
 a server on another port), preserving other providers, settings and sessions.
 The chat page names no model, and the launchers configure each client with the
