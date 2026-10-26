@@ -71,10 +71,12 @@ public:
   void batchCompleted(WorkKind kind, uint32_t width, uint32_t inputTokens,
                       uint32_t outputTokens,
                       uint32_t draftedTokens, uint32_t acceptedDraftTokens,
-                      double, double) override {
+                      double wallMilliseconds, double cycleMilliseconds) override {
     lastBatch_ = {kind, width, inputTokens, outputTokens, draftedTokens,
                   acceptedDraftTokens};
     ++batchSequence_;
+    metrics_.batchCompleted(kind, width, inputTokens, outputTokens, draftedTokens, acceptedDraftTokens,
+                            wallMilliseconds, cycleMilliseconds);
   }
 
   void started(uint64_t requestId, uint32_t matchedTokens,
@@ -134,11 +136,13 @@ public:
   [[nodiscard]] const BatchObservation &lastBatch() const noexcept {
     return lastBatch_;
   }
+  [[nodiscard]] RuntimeMetricsSnapshot metrics() const { return metrics_.snapshot(); }
 
 private:
   std::unordered_map<uint64_t, Observation> observations_;
   BatchObservation lastBatch_;
   uint64_t batchSequence_ = 0;
+  RuntimeMetrics metrics_;
 };
 
 struct Measurement final {
@@ -151,6 +155,10 @@ struct Measurement final {
   double ttftMilliseconds = 0.0;
   double prefillGpuMilliseconds = 0.0;
   double decodeGpuMilliseconds = 0.0;
+  double decodeCycleMilliseconds = 0.0;
+  uint64_t decodeOutputTokens = 0;
+  uint64_t draftedTokens = 0;
+  uint64_t acceptedDraftTokens = 0;
   uint64_t targetPrefillRows = 0;
   uint64_t draftContextRows = 0;
   uint64_t draftContextRowsAvoided = 0;
@@ -172,9 +180,11 @@ struct DecodeThroughputMeasurement final {
   double prefillWallMilliseconds = 0.0;
   double prefillGpuMilliseconds = 0.0;
   double decodeWallMilliseconds = 0.0;
+  double decodeCycleMilliseconds = 0.0;
   double decodeGpuMilliseconds = 0.0;
   double aggregateRequestWallTokensPerSecond = 0.0;
   double aggregateDecodeWallTokensPerSecond = 0.0;
+  double aggregateDecodeCycleTokensPerSecond = 0.0;
   double aggregateGpuTokensPerSecond = 0.0;
   double outputTokensPerLaneBatch = 0.0;
   double draftAcceptanceRate = 0.0;
@@ -422,6 +432,7 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
       milliseconds(Clock::now() + std::chrono::hours(2));
 
   const model::ModelTelemetry before = executor.telemetry();
+  const RuntimeMetricsSnapshot metricsBefore = events.metrics();
   const engine::EngineSnapshot engineBefore = engine.snapshot();
   std::vector<uint32_t> prefillBatchRows;
   prefillBatchRows.reserve(
@@ -435,6 +446,7 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
   const auto ended = Clock::now();
   const model::ModelTelemetry after = executor.telemetry();
   const engine::EngineSnapshot engineAfter = engine.snapshot();
+  const RuntimeMetricsSnapshot metricsAfter = events.metrics();
   const Observation &observed = events.get(requestId);
   if (!observed.completed || !observed.failure.empty()) {
     throw std::runtime_error("request failed: " + observed.failure);
@@ -455,6 +467,10 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
       (after.totalPrefillGpuSeconds - before.totalPrefillGpuSeconds) * 1000.0;
   result.decodeGpuMilliseconds =
       (after.totalDecodeGpuSeconds - before.totalDecodeGpuSeconds) * 1000.0;
+  result.decodeCycleMilliseconds = metricsAfter.decodeCycleMilliseconds - metricsBefore.decodeCycleMilliseconds;
+  result.decodeOutputTokens = metricsAfter.decodeOutputTokens - metricsBefore.decodeOutputTokens;
+  result.draftedTokens = metricsAfter.draftedTokens - metricsBefore.draftedTokens;
+  result.acceptedDraftTokens = metricsAfter.acceptedDraftTokens - metricsBefore.acceptedDraftTokens;
   result.targetPrefillRows = after.targetPrefillRows - before.targetPrefillRows;
   result.draftContextRows =
       after.draftContextRowsActive + after.draftContextRowsMaterialization -
@@ -534,6 +550,7 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
   const model::ModelTelemetry telemetryBefore =
       executor.telemetry();
   const engine::SchedulerSnapshot schedulerBefore = engine.snapshot().scheduler;
+  const RuntimeMetricsSnapshot metricsBefore = events.metrics();
   std::vector<uint64_t> requestIds;
   requestIds.reserve(width);
   uint64_t decodeBatches = 0;
@@ -568,6 +585,7 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
   const auto ended = Clock::now();
   const model::ModelTelemetry telemetryAfter = executor.telemetry();
   const engine::SchedulerSnapshot schedulerAfter = engine.snapshot().scheduler;
+  const RuntimeMetricsSnapshot metricsAfter = events.metrics();
 
   uint32_t completedTokens = 0;
   const Observation *reference = nullptr;
@@ -617,6 +635,11 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
       (telemetryAfter.totalDecodeWallSeconds -
        telemetryBefore.totalDecodeWallSeconds) *
       1000.0;
+  result.decodeCycleMilliseconds = metricsAfter.decodeCycleMilliseconds - metricsBefore.decodeCycleMilliseconds;
+  if (metricsAfter.decodeOutputTokens - metricsBefore.decodeOutputTokens != decodeOutputTokens ||
+      metricsAfter.draftedTokens - metricsBefore.draftedTokens != draftedTokens ||
+      metricsAfter.acceptedDraftTokens - metricsBefore.acceptedDraftTokens != acceptedDraftTokens)
+    throw std::runtime_error("decode throughput event counters disagree with observed batches");
   result.decodeGpuMilliseconds =
       (telemetryAfter.totalDecodeGpuSeconds -
        telemetryBefore.totalDecodeGpuSeconds) *
@@ -625,6 +648,7 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
       !(result.prefillWallMilliseconds > 0.0) ||
       !(result.prefillGpuMilliseconds > 0.0) ||
       !(result.decodeWallMilliseconds > 0.0) ||
+      !(result.decodeCycleMilliseconds > 0.0) ||
       !(result.decodeGpuMilliseconds > 0.0)) {
     throw std::runtime_error("decode throughput timing is not positive");
   }
@@ -634,6 +658,7 @@ runDecodeThroughput(engine::Engine &engine, Driver &driver,
   result.aggregateDecodeWallTokensPerSecond =
       static_cast<double>(decodeOutputTokens) * 1000.0 /
       result.decodeWallMilliseconds;
+  result.aggregateDecodeCycleTokensPerSecond = 1000.0 * result.decodeOutputTokens / result.decodeCycleMilliseconds;
   result.aggregateGpuTokensPerSecond =
       static_cast<double>(decodeOutputTokens) * 1000.0 /
       result.decodeGpuMilliseconds;
@@ -683,6 +708,10 @@ void emitMeasurement(const Measurement &value, bool first) {
             << ",\"ttft_ms\":" << value.ttftMilliseconds
             << ",\"prefill_gpu_ms\":" << value.prefillGpuMilliseconds
             << ",\"decode_gpu_ms\":" << value.decodeGpuMilliseconds
+            << ",\"decode_cycle_ms\":" << value.decodeCycleMilliseconds
+            << ",\"decode_output_tokens\":" << value.decodeOutputTokens
+            << ",\"drafted_tokens\":" << value.draftedTokens
+            << ",\"accepted_draft_tokens\":" << value.acceptedDraftTokens
             << ",\"draft_context_rows\":" << value.draftContextRows
             << ",\"draft_context_rows_avoided\":"
             << value.draftContextRowsAvoided
@@ -1541,12 +1570,15 @@ int main(int argc, char **argv) {
                 << ",\"prefill_gpu_ms\":"
                 << value.prefillGpuMilliseconds
                 << ",\"decode_wall_ms\":" << value.decodeWallMilliseconds
+                << ",\"decode_cycle_ms\":" << value.decodeCycleMilliseconds
                 << ",\"decode_gpu_ms\":"
                 << value.decodeGpuMilliseconds
                 << ",\"aggregate_request_wall_tokens_per_second\":"
                 << value.aggregateRequestWallTokensPerSecond
                 << ",\"aggregate_decode_wall_tokens_per_second\":"
                 << value.aggregateDecodeWallTokensPerSecond
+                << ",\"aggregate_decode_cycle_tokens_per_second\":"
+                << value.aggregateDecodeCycleTokensPerSecond
                 << ",\"aggregate_gpu_tokens_per_second\":"
                 << value.aggregateGpuTokensPerSecond << '}';
     }

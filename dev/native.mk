@@ -543,7 +543,7 @@ verify-build-identity: $(TARGET) $(BUILD_ID_HEADER) $(BUILD_ID_STAMP)
 METAL_TEST_ENV := MTL_SHADER_VALIDATION=1
 test-engine: test-engine-cpu test-engine-metal
 
-test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENCHMARK)
+test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENCHMARK) $(TEST_GGUF_PROJECTION_BENCHMARK)
 	$(TEST_SLOT_FILE)
 	$(TEST_KV_SLOT_FORMAT)
 	$(TEST_KV_PAGE_TIER_HOST)
@@ -565,6 +565,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(TEST_LINEAR_PLAN) --cpu
 	/bin/sh dev/tests/attention_sweep_cli.sh $(TEST_ATTENTION_SWEEP)
 	/bin/sh dev/tests/backend_benchmark_cli.sh $(TEST_BACKEND_BENCHMARK) $(MODEL_CONFIGS)
+	/bin/sh dev/tests/gguf_projection_benchmark_cli.sh $(TEST_GGUF_PROJECTION_BENCHMARK)
 	$(TEST_OPERATOR_WORKSPACE)
 	$(TEST_ANE_FFN_CALIBRATION)
 	$(TEST_ANE_FFN_STARTUP)

@@ -2,7 +2,7 @@
 // tile, on the device policy's walk, one lane on its 8- and 16-row tiles) at one to four lanes and every K split, the
 // measurements behind the tile rule and split tiers of runtime/ops/LinearGguf.cpp:
 //   gguf-projection-benchmark <metallib> <fmt[+fmt+fmt]> <N[+N+N]> <K> [none|residual|gateup] [rounds]
-//                             [prefill=R[,R...]]
+//                             [prefill=R[,R...]] [output=bf16|f32] [gateup=both]
 // The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 64
 // columns. With prefill=, it times the 128-row prefill tile instead, one case per chunk of R rows (more than 32: the
 // decode tiles run the smaller chunks) of a single segment; gateup is then the up projection's gated epilogue. The
@@ -15,6 +15,8 @@
 // indexer's, F32 alpha/beta) instead, one tensor per width of any multiple of 8 columns, two in one dispatch as the
 // indexer's query and key run, on both float tiles at one to four lanes or each prefill chunk of R rows (the
 // accelerator tile from 16 rows), the tile the device takes for every width marked with *.
+// output=f32 measures a quantized plain decode projection's actual FP32 destination, including its stores.
+// gateup=both compares the staged one- and two-pass gate/up at equal splits within the alternating measurement order.
 #include "../tests/engine/GgufFormatReference.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
@@ -96,12 +98,13 @@ void measure(std::vector<C> &cases, uint32_t rounds, uint32_t copies, Time time,
 }
 
 std::string heading(const MetalBackend &backend, const char *formats, const char *widths, uint32_t K,
-                    const std::string &epilogue, uint32_t copies, uint64_t bytes, uint32_t rounds) {
+                    const std::string &epilogue, uint32_t copies, uint64_t bytes, uint32_t rounds,
+                    const char *output = "bf16") {
   const DeviceCapabilities &device = backend.capabilities();
   char line[512];
-  std::snprintf(line, sizeof line, "%s (GPU family %u, %u cores): %s %sx%u %s, %u weight copies of %.1f MB, median ms "
+  std::snprintf(line, sizeof line, "%s (GPU family %u, %u cores): %s %sx%u %s output=%s, %u weight copies of %.1f MB, median ms "
                 "of %u rounds:\n", device.deviceName.c_str(), device.appleGpuFamily, device.gpuCoreCount, formats,
-                widths, K, epilogue.c_str(), copies, bytes / 1e6, rounds);
+                widths, K, epilogue.c_str(), output, copies, bytes / 1e6, rounds);
   return line;
 }
 
@@ -176,7 +179,7 @@ void floatProjections(MetalBackend &backend, const char *formatList, const char 
     }
     return backend.submitCommandAsync(graph.dispatches()).wait().gpuSeconds * 1e3 / copies;
   };
-  measure(cases, rounds, copies, time, heading(backend, formatList, widthList, K, "none", copies, bytes, rounds));
+  measure(cases, rounds, copies, time, heading(backend, formatList, widthList, K, "none", copies, bytes, rounds, "f32"));
 }
 
 } // namespace
@@ -184,30 +187,50 @@ void floatProjections(MetalBackend &backend, const char *formatList, const char 
 int main(int argc, char **argv) {
   @autoreleasepool {
     const std::string prefillOption = "prefill=";
-    const bool prefill = argc == 8;
-    if (argc < 5 || argc > 8 || (prefill && std::string(argv[7]).rfind(prefillOption, 0))) {
+    if (argc < 5 || argc > 10) {
       std::cerr << "usage: gguf-projection-benchmark <metallib> <fmt[+fmt+fmt]> <N[+N+N]> <K> "
-                   "[none|residual|gateup] [rounds] [prefill=R[,R...]]\n";
+                   "[none|residual|gateup] [rounds] [prefill=R[,R...]] [output=bf16|f32] [gateup=both]\n";
       return 2;
     }
     const std::vector<std::string> formats = split(argv[2], '+'), widths = split(argv[3], '+');
     const uint32_t K = uint32_t(std::stoul(argv[4])), rounds = argc > 6 ? uint32_t(std::stoul(argv[6])) : 20;
     const std::string epilogueName = argc > 5 ? argv[5] : "none";
     std::vector<uint32_t> prefillRows;
-    if (prefill)
-      for (const std::string &rows : split(argv[7] + prefillOption.size(), ','))
-        prefillRows.push_back(uint32_t(std::stoul(rows)));
+    bool prefill = false, outputGiven = false, bothGatePasses = false;
+    FloatOutput destination = FloatOutput::BFloat16;
+    for (int i = 7; i < argc; ++i) {
+      const std::string option(argv[i]);
+      if (option.rfind(prefillOption, 0) == 0 && !prefill) {
+        prefill = true;
+        for (const std::string &rows : split(option.substr(prefillOption.size()), ','))
+          prefillRows.push_back(uint32_t(std::stoul(rows)));
+      } else if ((option == "output=bf16" || option == "output=f32") && !outputGiven) {
+        outputGiven = true;
+        destination = option == "output=f32" ? FloatOutput::Float32 : FloatOutput::BFloat16;
+      } else if (option == "gateup=both" && !bothGatePasses) {
+        bothGatePasses = true;
+      } else {
+        std::cerr << "unknown or repeated benchmark option: " << option << '\n';
+        return 2;
+      }
+    }
     const LinearEpilogue epilogue = epilogueName == "residual" ? LinearEpilogue::Residual
                                   : epilogueName != "gateup"   ? LinearEpilogue::None
                                   : prefill                    ? LinearEpilogue::UpWithGate
                                                                : LinearEpilogue::GateUp;
-    if (formats.size() != widths.size() || formats.size() > 3 ||
+    if (formats.empty() || formats.size() != widths.size() || formats.size() > 3 ||
         (formats.size() > 1 && (epilogue != LinearEpilogue::None || prefill)) ||
         (epilogue == LinearEpilogue::None && epilogueName != "none") || !rounds ||
         (prefill && (prefillRows.empty() ||
                      std::any_of(prefillRows.begin(), prefillRows.end(), [](uint32_t r) { return r <= 32; })))) {
       std::cerr << "one format per width, at most three, fused projections take no epilogue; prefill takes one "
                    "format and chunks of more than 32 rows\n";
+      return 2;
+    }
+    if ((outputGiven && formats.front().rfind("float-", 0) == 0) ||
+        (destination == FloatOutput::Float32 && (prefill || formats.size() != 1 || epilogue != LinearEpilogue::None)) ||
+        (bothGatePasses && (prefill || epilogue != LinearEpilogue::GateUp || formats.front().rfind("float-", 0) == 0))) {
+      std::cerr << "output=f32 takes one quantized plain decode projection; gateup=both takes quantized decode gateup\n";
       return 2;
     }
     try {
@@ -247,6 +270,7 @@ int main(int argc, char **argv) {
           weights.segments.back().columnOffset = image.offset;
         }
         ring.emplace_back(N, K, std::move(weights));
+        ring.back().destination = destination;
       }
       const Linear linear(backend.capabilities());
       std::vector<Case> cases;
@@ -278,13 +302,17 @@ int main(int argc, char **argv) {
             // One lane stages on the 8-row tile and on the 16-row tile (staged16).
             for (const bool sixteenRows : {false, true}) {
               if (sixteenRows && (registerTile || lanes > 1)) continue;
-              const LinearConfig config{.tile = tile, .splits = splits, .spread = !registerTile && wide.spread,
-                                        .oneGateUpPass = !registerTile && wide.oneGateUpPass,
-                                        .sixteenRows = sixteenRows};
-              cases.push_back({"L" + std::to_string(lanes),
-                               std::string(registerTile ? "register" : sixteenRows ? "staged16" : "staged") + " S" +
-                                   std::to_string(splits),
-                               Linear::plan(w, config, FloatOutput::BFloat16), config == policy, {}});
+              for (const bool onePass : {false, true}) {
+                if (onePass && (registerTile || (!wide.oneGateUpPass && !bothGatePasses))) continue;
+                if (!registerTile && !bothGatePasses && onePass != wide.oneGateUpPass) continue;
+                const LinearConfig config{.tile = tile, .splits = splits, .spread = !registerTile && wide.spread,
+                                          .oneGateUpPass = onePass, .sixteenRows = sixteenRows};
+                cases.push_back({"L" + std::to_string(lanes),
+                                 std::string(registerTile ? "register" : sixteenRows ? "staged16" : "staged") +
+                                     (bothGatePasses && !registerTile ? onePass ? " one-pass" : " two-pass" : "") +
+                                     " S" + std::to_string(splits),
+                                 Linear::plan(w, config, destination), config == policy, {}});
+              }
             }
           }
       }
@@ -301,7 +329,7 @@ int main(int argc, char **argv) {
         std::memset(b.contents(), 0, n);
         return b;
       };
-      MetalBuffer input = zeros(rows * K * 2), output = zeros(rows * N * 2), residual = zeros(rows * N * 2),
+      MetalBuffer input = zeros(rows * K * 2), output = zeros(rows * N * elementBytes(destination)), residual = zeros(rows * N * 2),
                   gate = zeros(rows * N * 2);
       {
         std::uniform_real_distribution<float> unit(-1.f, 1.f);
@@ -335,7 +363,8 @@ int main(int argc, char **argv) {
                                        step > 1 ? &ring[(next + 1) % copies] : nullptr));
         return backend.submitCommandAsync(graph.dispatches()).wait().gpuSeconds * 1e3 / (copies / step);
       };
-      measure(cases, rounds, copies, time, heading(backend, argv[2], argv[3], K, epilogueName, copies, bytes, rounds));
+      measure(cases, rounds, copies, time, heading(backend, argv[2], argv[3], K, epilogueName, copies, bytes, rounds,
+                                                  destination == FloatOutput::Float32 ? "f32" : "bf16"));
     } catch (const std::exception &e) {
       std::cerr << "gguf-projection-benchmark: " << e.what() << '\n';
       return 1;
