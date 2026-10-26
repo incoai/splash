@@ -677,6 +677,41 @@ class FlintPromptTests(unittest.TestCase):
             )
             self.assertEqual(len(job.score_tokens), 2)
 
+    def test_score_labels_are_read_after_an_empty_think_block(self):
+        # /v1/score reads its labels where Flint answers, as the judgments
+        # do: after an empty think block, then the assistant prefix. A prefix
+        # that opens the think block itself takes its place.
+        frontend = self.frontend()
+        ids = frontend.tokenizer.convert_tokens_to_ids
+        body = {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Paris weather?"}],
+            "labels": ["A", "B"],
+        }
+        job = frontend.prepare_score(body, deadline=fixtures.FOREVER)
+        self.assertEqual(
+            list(job.prompt_tokens[-3:]),
+            [ids("<|assistant|>"), ids("<think>"), ids("</think>")],
+        )
+        self.assertEqual(job.score_tokens, tuple(ids(label) for label in "AB"))
+        prefixed = frontend.prepare_score(
+            body | {"assistant_prefix": "in"}, deadline=fixtures.FOREVER
+        )
+        self.assertEqual(
+            list(prefixed.prompt_tokens[: len(job.prompt_tokens)]),
+            list(job.prompt_tokens),
+        )
+        self.assertGreater(len(prefixed.prompt_tokens), len(job.prompt_tokens))
+        own = frontend.prepare_score(
+            body | {"assistant_prefix": "<think>in</think>"},
+            deadline=fixtures.FOREVER,
+        )
+        opening = len(job.prompt_tokens) - 2
+        self.assertEqual(
+            own.prompt_tokens[opening - 1 : opening + 1], job.prompt_tokens[-3:-1]
+        )
+        self.assertEqual(own.prompt_tokens.count(ids("<think>")), 1)
+
     def test_prompt_tokens_are_reused_after_the_last_assistant_turn(self):
         # Splits before the byte-level BPE, as Flint's tokenizer has three,
         # and the GGUF tokenizer's byte-level post-processor.

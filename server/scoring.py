@@ -2,7 +2,8 @@
 
 A score request renders its messages exactly as /v1/chat/completions does
 (same chat template, reasoning effort, images and tokenization), appends
-`assistant_prefix` after the assistant turn's opening, and reads the final
+`assistant_prefix` after the assistant turn's opening (after an empty think
+block for a model that opens its reasoning itself), and reads the final
 position's logits at its labels' single tokens in one native prefill, with
 no decoding. The native result also carries the position's log-sum-exp over
 the whole vocabulary and its highest logits, from which full-vocabulary log

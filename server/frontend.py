@@ -695,7 +695,11 @@ class Frontend:
     def prepare_score(self, body, *, deadline, index=None):
         """A /v1/score request: its messages rendered exactly as Chat renders
         them, the assistant prefix after the generation prompt, and its
-        labels' single tokens in that position (scoring.py)."""
+        labels' single tokens in that position (scoring.py). A model that
+        opens its reasoning itself (chat_format.think_start_id), which a
+        request's effort leaves reasoning, would open it where the generation
+        prompt ends: there an empty think block comes first, after which it
+        answers, unless the prefix opens the think block itself."""
         try:
             options = scoring.validate_options(body, index=index)
         except scoring.ScoreRequestError as error:
@@ -714,9 +718,14 @@ class Frontend:
                     "rendered prompt opens a think block, so set "
                     '"reasoning_effort": "none"',
                 )
-            text = rendered.text + options.assistant_prefix
+            prefix = options.assistant_prefix
+            if self.chat_format.think_start_id is not None and not prefix.startswith(
+                THINK_START
+            ):
+                prefix = THINK_START + THINK_END + prefix
+            text = rendered.text + prefix
             ids = list(rendered.tokens)
-            if options.assistant_prefix:
+            if prefix:
                 with self.latencies.measure("tokenization"):
                     extended = list(self.prompt_tokenizer.encode(text))
                 if extended[: len(ids)] != ids or len(extended) == len(ids):

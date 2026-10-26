@@ -46,8 +46,13 @@ readout.
 2. **Rendering.** `prepare_score` calls `_prepare_prompt` and `_render_prompt`,
    the same calls Chat uses, so the template, reasoning default, images and
    tokens are identical. A prompt that opens a think block is refused, because
-   the answer would sit inside it. The assistant prefix is appended to the
-   rendered text, and the result must extend Chat's tokens unchanged.
+   the answer would sit inside it. A model that opens its reasoning itself
+   (Flint: its template has no thinking switch, `/status` `reasoning_switch`
+   false) would open it right after the generation prompt, so an empty think
+   block, `<think></think>`, comes first, as `/v1/judgments` and
+   `/v1/systemone` read their slots after it; a prefix that starts with
+   `<think>` replaces it. The assistant prefix is appended to the rendered
+   text, and the result must extend Chat's tokens unchanged.
 3. **Labels.** Each label must be exactly one token in its position: the
    prompt text plus prefix plus label must tokenize as the prompt tokens plus
    one token. The same check is used for `/v1/judgments` answer slots. A
@@ -138,7 +143,8 @@ Fields:
   agent's requests do.
 - `reasoning_effort` and `chat_template_kwargs`: as in Chat. The server's
   `--default-reasoning-effort` applies, and thinking must end up disabled.
-- `assistant_prefix`: optional text after the assistant turn's opening.
+- `assistant_prefix`: optional text after the assistant turn's opening (after
+  the empty think block for a model that opens its reasoning itself).
 - `labels`: two or more labels, each one token in that position, or
   `label_token_ids`, which overrides the text labels.
 - `temperature`: optional, default 1. It divides only the label logits used
