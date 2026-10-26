@@ -29,6 +29,9 @@ struct ProjectionShape final {
   // per weight, its float ones aside; Apple10 may decode a lane of it on the
   // staged 16-row tile (Linear::decodeStorageRows).
   bool underFourAndHalfBits = false;
+  // Every segment is affine 4-bit with 64-input groups. Kept in the shape
+  // so allocation-time storage planning sees the same format as dispatch.
+  bool affine4Group64 = false;
   auto operator<=>(const ProjectionShape &) const = default;
 };
 
@@ -114,19 +117,20 @@ public:
 
   [[nodiscard]] const BlockWeights &blocks() const noexcept { return weights_; }
   [[nodiscard]] ProjectionShape shape() const noexcept {
-    bool registerFormats = true, fourBits = true;
+    bool registerFormats = true, fourBits = true, affine4Group64 = !weights_.segments.empty();
     // The quantized segments' weights and the bytes of their native blocks.
     uint64_t weights = 0, bytes = 0;
     for (const QuantizedSegment &s : weights_.segments) {
       registerFormats &= s.isFloat() || quant_register_tensor(s.formatId, s.inputSize);
       fourBits &= s.isFloat() || quant_four_bits(s.formatId);
+      affine4Group64 &= s.formatId == GGUF_FMT_AF4G64;
       if (s.isFloat()) continue;
       const uint64_t n = uint64_t{s.outputSize} * s.inputSize;
       weights += n;
       bytes += n * s.format().block_bytes / s.format().block_elements;
     }
     return {outputSize, inputSize, static_cast<bool>(rotation), registerFormats, fourBits,
-            weights && 16 * bytes < 9 * weights};
+            weights && 16 * bytes < 9 * weights, affine4Group64};
   }
 
   // Views of a projection of one unrotated quantized tensor (Linear.cpp):

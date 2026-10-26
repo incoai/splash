@@ -408,8 +408,17 @@ bool Linear::sixteenRowLane(LinearWorkload w, uint32_t splits, std::span<const P
              return p && ggufBaseline({w.matrix, w.rows}, std::span(&p, 1)).sixteenRows;
            });
   if (!projections.empty()) shape = projections.front()->shape();
+  // The 27B's affine-4 FFN and fused inputs on the 20-core M5 Pro: the unsplit 16-row
+  // tile hides staging latency better than the 8-row tile, although only
+  // its first eight rows are consumed. Other shapes/formats keep the
+  // bandwidth-based rule below; in particular, split down projections do
+  // not benefit. The same shape predicate sizes the padding storage.
+  const uint32_t columns = w.matrix.outputSize;
+  const bool affineWide = appleGpuFamily_ == 10 && gpuCores_ == 20 &&
+                          (columns == 14336 || columns == 16640 || columns == 17408) &&
+                          w.matrix.inputSize == 5120 && shape.affine4Group64 && !shape.rotated;
   return family_ == GpuFamilyClass::Apple10 && w.rows == SPLASH_TARGET_VERIFY_ROWS && splits == 1 &&
-         shape.underFourAndHalfBits;
+         (shape.underFourAndHalfBits || affineWide);
 }
 
 LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, bool registerFormats) const {
