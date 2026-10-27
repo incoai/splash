@@ -293,7 +293,8 @@ is read by a handful of rows per token: 16 per position, eight heads each of
 the 2- and 3-gram hashes of the token and the tokens before it. Where memory
 cannot hold it beside everything else (`--ple-memory auto`, the default,
 [memory and context](#memory-and-context)), or with `--ple-memory SIZE`, such
-as `--ple-memory 2G`, the table stays in its GGUF on the SSD: no `ple.bin`
+as `--ple-memory 2G`, the table stays in its source on the SSD (GGUF, MLX
+safetensors shards or an MLX pack's `ngram_table.bin`): no `ple.bin`
 image is written, and the weights shrink by the stored table size. Startup
 memory requirements also include the cache and Metal staging buffers. The
 rows each command gathers are read through a host cache with a SIZE-byte
@@ -1738,8 +1739,35 @@ The MoE router keeps its format too, a quantized one as native rows, an
 unquantized one as its bf16 or F32 rows, which the float projection runs
 ([Kernels](#kernels)). The MoE selection reads the shared-expert gate in F32,
 so it loads as the F32 values of its quantization, and so do GDN alpha and
-beta unless both are in one format. Norms stay bf16 and the GDN value heads in
-MLX's grouped order.
+beta unless both are in one format. Norms stay bf16 (Flash-Next's norms load
+as F32) and the GDN value heads in MLX's grouped order.
+
+Qwen3.8-Flash-Next (`qwen4_exp` / `qwen4_exp_text`) loads from MLX too, for
+example `mlx-community/Qwen3.8-Flash-Next-4bit`. Its hyper-connection mixes,
+QSA indexer and PLE layer load into the same runtime as its GGUFs. The fused
+`self_attn.indexer.index_qk_proj` is split into F32 query and key projections;
+it and the injection weights may be quantized or BF16. Standard MLX exports
+preserve Flash-Next's centered norm weights, which load as F32 `1 + weight`;
+the GDN's gated norm is widened without that offset.
+
+The PLE table can be either numbered
+`language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.N`
+modules in the safetensors checkpoint, or an mlx-serve `ngram_table.bin`
+sidecar. The sidecar uses safetensors encoding, `__metadata__.format` set
+to `mlx-serve-ngram`, and short tensor names
+`weight`, `scales`, `biases` (or just a BF16 `weight`), and is included in
+Hub and local installations. The mlx-serve sidecar packs have already folded
+their norm offsets, so those gains are widened without adding 1 again.
+Older embedded-table exports that folded norm offsets should be re-exported
+with a converter that preserves upstream centered weights.
+
+All PLE row shards must share a format: BF16, affine quantization compatible
+with the 160-wide rows (group size 32), or MXFP4. The saved integer
+`layer_multipliers`, `ngram_heads_offsets` and `ngram_heads_vocab_sizes`
+buffers define the hash and are required. With `--ple-memory`, the existing
+row cache reads only the requested rows, assembling their native bytes from
+codes, scales and biases without another table copy on disk.
+`--expert-memory` streams the routed experts from their MLX shards too.
 
 ### Model Optimizer targets
 

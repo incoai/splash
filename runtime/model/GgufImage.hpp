@@ -142,9 +142,9 @@ struct Repack {
 struct StreamedExperts {
   std::array<Repack, 3> projections; // gate, up, down
 };
-// Where a table's rows are in its GGUF (tableRows), for reading them from the
-// file (model/SparseRowStore.hpp) instead of loading the table's image: the
-// rows exactly as the image would hold them.
+// Where a table's native rows come from: stored in a GGUF (tableRows), or
+// assembled from safetensors sources. The row store reads exactly the bytes
+// the table's resident image would hold.
 struct StreamedRows final {
   std::string tensor;
   uint32_t file = 0;   // the part of a split GGUF that holds it
@@ -152,6 +152,10 @@ struct StreamedRows final {
   uint64_t rows = 0;
   uint32_t rowBytes = 0;
   uint32_t format = 0; // its gguf_embedding_format (GGUF_FMT_*)
+  // A safetensors table's concatenated row shards. Its native rows are
+  // assembled on demand from the codes, scales and biases, without an
+  // additional table file. Empty for rows stored directly in a GGUF.
+  std::vector<TensorRows> sources;
 };
 struct Image {
   std::string name; // layer-N.bin, head.bin, embedding.bin, a family's table's (ple.bin)
@@ -177,7 +181,7 @@ struct Image {
 
 // How a target's images are planned: with streamExperts, every MoE layer's
 // routed experts stream (Image::experts) instead of loading with it; with
-// streamTable, the rows of a table the family's GGUF holds after the
+// streamTable, the rows of a table the family holds after the
 // embedding (Qwen3.8-Flash-Next's PLE n-gram table) stream
 // (Image::streamedRows) instead of loading as its image.
 struct PlanOptions {

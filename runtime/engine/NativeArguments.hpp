@@ -57,7 +57,7 @@ struct NativeArguments final {
   // off).
   bool neuralEngine = true;
   // --ple-memory BYTES|auto|off and --expert-memory BYTES|auto|off: a
-  // Qwen3.8-Flash-Next GGUF's PLE table and a MoE target's routed experts,
+  // Qwen3.8-Flash-Next target's PLE table and a MoE target's routed experts,
   // through a store of BYTES that streams the rest from the SSD, as the
   // memory planner decides (auto, without the option) or loaded whole (off)
   // (RuntimeResourcesConfig::pleMemory, expertMemory).

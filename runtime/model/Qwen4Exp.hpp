@@ -40,11 +40,10 @@ namespace splash::model {
 struct SparseRowStoreOptions;
 
 struct Qwen4ExpLayout final : QwenHybridLayout {
-  // Its config's text model type and its GGUFs' architecture; no safetensors
-  // checkpoint of it loads.
+  // Its config's text model type and its GGUFs' architecture.
   static constexpr std::string_view modelType = "qwen4_exp_text";
   static constexpr std::string_view ggufArchitecture = "qwen4exp";
-  static constexpr bool loadsSafetensors = false;
+  static constexpr bool loadsSafetensors = true;
   // The PLE n-gram hash's end-of-sequence token, the first stop token, which
   // cuts an n-gram short; and the token it reads at every position of an
   // image, which a prompt holds there (<|image_pad|>, server/frontend.py). A
@@ -114,7 +113,7 @@ static_assert(Qwen4ExpLayout{}.indexerHeads == BLOCK_INDEXER_HEADS &&
 // The longest n-gram the PLE hash mixes (metal/abi/NgramEmbedding.h).
 inline constexpr uint32_t kPleMaximumNgram = NGRAM_EMBEDDING_MAXIMUM_NGRAM;
 
-// The hash of the PLE n-gram embedding, from the GGUF's metadata: the multiplier of each n-gram position (0 past
+// The hash of the PLE n-gram embedding, from source metadata: the multiplier of each n-gram position (0 past
 // pleNgram), each head's table rows and the table's rows.
 struct Qwen4PleHash final {
   std::array<uint64_t, kPleMaximumNgram> multipliers{};

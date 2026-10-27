@@ -689,7 +689,7 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
     require(at != std::string::npos, "the config or metadata has no " + std::string(from));
     return json.replace(at, from.size(), to);
   };
-  // Qwen3.8-Flash-Next loads from a GGUF only; its metadata also states the
+  // Qwen3.8-Flash-Next loads from GGUF or MLX; GGUF metadata also states the
   // hyper-connections, the QSA indexer and the PLE n-gram embedding.
   const std::string flashConfig = text(fixtures / "qwen3.8-flash-next" / "config.json");
   const std::string flashMetadata = text(fixtures / "qwen3.8-flash-next" / "gguf-metadata.json");
@@ -712,8 +712,32 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
   rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, flashMetadata, otherReduction)); },
           "draft config dflash_config target_hidden_reduction mismatch: checkpoint none, runtime stream_mean",
           "a draft of another reduction was accepted");
-  rejects([&] { static_cast<void>(check("mlx-affine", "none", flashConfig, std::nullopt, std::nullopt)); },
-          "Qwen3.8-Flash-Next loads from a GGUF only", "Qwen3.8-Flash-Next was accepted from MLX");
+  require(check("mlx-affine", "none", flashConfig, std::nullopt, std::nullopt) == "Qwen3.8-Flash-Next" &&
+              check("mlx-affine", "none", flashConfig, std::nullopt, flashDraft) == "Qwen3.8-Flash-Next",
+          "Qwen3.8-Flash-Next's MLX config and draft were not accepted");
+  for (const auto &[from, to, error] : std::initializer_list<std::array<std::string_view, 3>>{
+           {R"("hc_count": 4)", R"("hc_count": 2)", "text config hc_count mismatch"},
+           {R"("hc_lowrank": 320)", R"("hc_lowrank": 160)", "text config hc_lowrank mismatch"},
+           {R"("indexer_n_heads": 4)", R"("indexer_n_heads": 2)", "text config indexer_n_heads mismatch"},
+           {R"("indexer_kv_heads": 1)", R"("indexer_kv_heads": 2)", "text config indexer_kv_heads mismatch"},
+           {R"("indexer_head_dim": 128)", R"("indexer_head_dim": 64)", "text config indexer_head_dim mismatch"},
+           {R"("indexer_budget": 2048)", R"("indexer_budget": 1024)", "text config indexer_budget mismatch"},
+           {R"("indexer_compress_ratio": 4)", R"("indexer_compress_ratio": 2)", "text config indexer_compress_ratio mismatch"},
+           {R"("ngram_size": 3)", R"("ngram_size": 2)", "text config ngram_size mismatch"},
+           {R"("heads_per_ngram": 8)", R"("heads_per_ngram": 4)", "text config heads_per_ngram mismatch"},
+           {R"("output_gate_type": "sigmoid")", R"("output_gate_type": "silu")", "text config output_gate_type mismatch"},
+           {R"("ple_embed_dim": 2560)", R"("ple_embed_dim": 1280)", "text config ple_embed_dim mismatch"},
+           {R"("ple_conv_kernel_size": 4)", R"("ple_conv_kernel_size": 2)", "text config ple_conv_kernel_size mismatch"},
+           {R"("ple_layer_ids": [)", R"("ple_layer_ids": [1,)", "text config ple_layer_ids mismatch"},
+           {R"("eos_token_id": 248044)", R"("eos_token_id": 0)", "text config eos_token_id mismatch"},
+           {R"("image_token_id": 248056)", R"("image_token_id": 0)", "config image_token_id mismatch"}}) {
+    rejects([&] { static_cast<void>(check("mlx-affine", "none", replaced(flashConfig, from, to),
+                                          std::nullopt, std::nullopt)); },
+            error, "Flash-Next accepted an incompatible MLX configuration");
+  }
+  require(check("mlx-affine", "none", replaced(flashConfig, R"("full_attention")", R"("qwen_sparse_attention")"),
+                  std::nullopt, std::nullopt) == "Qwen3.8-Flash-Next",
+          "Flash-Next's qwen_sparse_attention layer spelling was refused");
   for (const auto &[from, to, error] : std::initializer_list<std::array<std::string_view, 3>>{
            {R"("qwen4exp.hyper_connection.count": 4)", R"("qwen4exp.hyper_connection.count": 2)",
             "GGUF metadata does not match the target: hyper_connection.count 2 (expected 4)"},

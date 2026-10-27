@@ -191,7 +191,9 @@ void requireLayerTypes(NSArray *types, const QwenHybridLayout &target,
     NSString *expected = !target.isFullAttentionLayer(layer)       ? @"linear_attention"
                          : target.kvLayout().windowed(attention++) ? @"sliding_attention"
                                                                    : @"full_attention";
-    if (![types[layer] isEqual:expected])
+    const bool sparseAlias = target.hasIndexer() && target.isFullAttentionLayer(layer) &&
+                               [types[layer] isEqual:@"qwen_sparse_attention"];
+    if (![types[layer] isEqual:expected] && !sparseAlias)
       throw std::invalid_argument(std::string(label) + " " +
                                   std::to_string(layer) + " must be " +
                                   expected.UTF8String);
@@ -286,8 +288,10 @@ void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, Targ
                    {{"intermediate_size", target.intermediateSize}});
   requireBooleans(text, "text config",
                   {{"attention_bias", false},
-                   {"attn_output_gate", true},
                    {"tie_word_embeddings", false}});
+  // Flash-Next always gates attention and states the GDN gate separately.
+  if (!target.hyperConnected() || text[@"attn_output_gate"])
+    requireBooleans(text, "text config", {{"attn_output_gate", true}});
   requireEqual(requireString(text, @"hidden_act", "text config hidden_act"),
                "silu", name, "text config hidden_act");
   requireLayerTypes(requireArray(text, @"layer_types", "text config layer_types"),
@@ -319,6 +323,24 @@ void requireWholes(NSArray *values, std::span<const uint32_t> expected, std::str
   };
   throw std::invalid_argument(label + " mismatch: " + std::string(source) + " " + text(found) + ", runtime " +
                               text(expected));
+}
+
+void validateTextConfig(NSDictionary *text, const Qwen4ExpLayout &target, TargetSource source) {
+  validateTextConfig(text, static_cast<const QwenHybridLayout &>(target), source);
+  if (source != TargetSource::Safetensors) return;
+  const auto name = sourceName(source);
+  requireNumbers(text, name, "text config",
+                 {{"hc_count", target.hyperConnections}, {"hc_lowrank", target.hyperRank},
+                  {"indexer_n_heads", target.indexerHeads}, {"indexer_kv_heads", 1},
+                  {"indexer_head_dim", target.indexerHeadDimension}, {"indexer_budget", target.indexerTokens()},
+                  {"indexer_compress_ratio", target.indexerBlockTokens}, {"ngram_size", target.pleNgram},
+                  {"heads_per_ngram", target.pleHeadsPerNgram}, {"ple_embed_dim", target.pleWidth()},
+                  {"ple_conv_kernel_size", target.pleConvolutionTaps}, {"eos_token_id", target.pleEosToken}});
+  requireWholes(requireArray(text, @"ple_layer_ids", "text config ple_layer_ids"),
+                 std::array<uint32_t, 1>{target.pleLayer + 1}, name, "text config ple_layer_ids");
+  requireEqual(requireString(text, @"output_gate_type", "text config output_gate_type"),
+                 "sigmoid", name, "text config output_gate_type");
+  if (text[@"norm_topk_prob"]) requireBooleans(text, "text config", {{"norm_topk_prob", true}});
 }
 
 // The layers of `mask` among `layers`, a bit each, in order.
@@ -802,6 +824,10 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
     if (draft && layout.draftChoosesMaskToken()) layout.maskToken = draftMaskToken(draft, layout);
     if (draft) dflashLayout = readDraftLayout(draft, layout);
   }, *target);
+  if (targetSource == TargetSource::Safetensors && std::holds_alternative<Qwen4ExpLayout>(*target) &&
+      config[@"image_token_id"])
+    requireNumbers(config, sourceName(targetSource), "config",
+                    {{"image_token_id", std::get<Qwen4ExpLayout>(*target).pleImageToken}});
   ModelDescriptor result = makeModelDescriptor(std::move(name), *target, dflashLayout,
                                                {.outputHiddenSize = std::visit(
                                                     [](const auto &layout) { return layout.hiddenSize; }, *target)},

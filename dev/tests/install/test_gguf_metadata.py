@@ -681,11 +681,17 @@ class GgufMetadataTests(unittest.TestCase):
                 "num_experts",
             },
         )
-        # Qwen3.8-Flash-Next's fixture config, which the native configuration
-        # test reads, is the one derived from its fixture header.
+        # Flash-Next's GGUF derives the same sizes as its MLX fixture; the
+        # rest of that fixture describes MLX tensors rather than GGUF metadata.
+        flash = family_config(FLASH_NEXT)
         self.assertEqual(
             gguf.model_config(self.metadata(fixture(native=True, family=FLASH_NEXT))),
-            family_config(FLASH_NEXT),
+            {
+                "model_type": flash["model_type"],
+                "text_config": {
+                    key: flash["text_config"][key] for key in config["text_config"]
+                },
+            },
         )
         path, metadata = self.root / "config.json", self.root / "gguf-metadata.json"
         mismatch = "GGUF metadata does not match the target: "

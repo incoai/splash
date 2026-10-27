@@ -463,7 +463,7 @@ SERVE_OPTIONS = (
             default=None,
             metavar="SIZE",
             help="RAM row cache of the PLE n-gram table of a Qwen3.8-Flash-Next "
-            "GGUF, e.g. 2G, which streams the rest from the SSD; off loads the "
+            "target, e.g. 2G, which streams the rest from the SSD; off loads the "
             "whole table, tens of GB (default: auto, which streams it where "
             "memory cannot hold it)",
         ),

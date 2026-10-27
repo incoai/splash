@@ -931,6 +931,172 @@ void testSyntheticBlockMoeModel(MetalBackend &backend, const std::filesystem::pa
             "streamableWeights is not what an MLX block MoE target loads");
 }
 
+// Flash-Next's centered norms, split QSA projection, integer PLE hash and
+// native table rows must be identical with the table resident or streamed.
+void testSyntheticFlashNext(MetalBackend &backend, const std::filesystem::path &root, uint32_t headWidth) {
+    auto target = syntheticTarget<splash::model::Qwen4ExpLayout>();
+    target.experts = 16;
+    target.expertsPerToken = 4;
+    target.hyperRank = 256;
+    target.indexerHeads = 2;
+    target.indexerHeadDimension = 64;
+    target.pleHeadsPerNgram = 4;
+    target.pleHeadDimension = headWidth;
+    const uint64_t groups = headWidth / 32, rowBytes = groups * 20, floatRowBytes = uint64_t{headWidth} * 2;
+    auto tensors = splash::test::mlxTargetTensors(target, [](const std::string &) {
+        return std::pair<uint32_t, uint32_t>{4, 32};
+    });
+    const std::string ple = "language_model.model.layers.1.ple.ple_embedding.";
+    const auto integers = [&](const std::string &name, std::vector<uint64_t> values) {
+        std::vector<uint8_t> data(values.size() * sizeof(uint64_t));
+        std::memcpy(data.data(), values.data(), data.size());
+        tensors.push_back({ple + name, "I64", {values.size()}, std::move(data)});
+    };
+    integers("layer_multipliers", {3, 5, 7});
+    integers("ngram_heads_offsets", {0, 2, 4, 6, 8, 10, 12, 14});
+    integers("ngram_heads_vocab_sizes", std::vector<uint64_t>(target.pleHeads(), 2));
+    for (uint32_t shard = 0; shard < 2; ++shard) {
+        const std::string module = ple + "ngram_embedding.shards." + std::to_string(shard);
+        tensors.push_back({module + ".weight", "U32", {8, groups * 4}});
+        tensors.push_back({module + ".scales", "BF16", {8, groups}});
+        std::vector<uint16_t> values(8 * groups, uint16_t(shard ? 0x4000 : 0x3f80)); // biases 1 and 2
+        std::vector<uint8_t> data(values.size() * 2);
+        std::memcpy(data.data(), values.data(), data.size());
+        tensors.push_back({module + ".biases", "BF16", {8, groups}, std::move(data)});
+    }
+    for (auto &tensor : tensors) {
+        if (!tensor.name.ends_with("index_qk_proj.biases")) continue;
+        std::vector<uint16_t> values(tensor.shape[0] * tensor.shape[1]);
+        for (size_t row = 0; row < tensor.shape[0]; ++row)
+            std::fill_n(values.begin() + row * tensor.shape[1], tensor.shape[1],
+                          row < target.indexerHeads * target.indexerHeadDimension ? 0x3fc0 : 0x4020);
+        tensor.data.resize(values.size() * 2);
+        std::memcpy(tensor.data.data(), values.data(), tensor.data.size());
+    }
+    const auto descriptor = writeBlockModel(root, target, tensors);
+    std::vector<uint8_t> residentRows;
+    std::string fingerprint;
+    {
+        const auto planned = streamableWeights(root, descriptor, {});
+        auto model = loadModel(backend, root, descriptor);
+        const auto &weights = std::get<splash::model::Qwen4ExpWeights>(model.target);
+        require(declaredBytes(weights.files) + declaredBytes(model.draft.files) == planned.loadedBytes,
+                  "Flash-Next's resident safetensors size differs from its plan");
+        require(weights.layers[0].mixerHyper.norm.float32 &&
+                    static_cast<const float *>(weights.layers[0].mixerHyper.norm.buffer.contents())[0] == 1.0F &&
+                    static_cast<const float *>(std::get<QwenGdnWeights>(weights.layers[0].mixer).mixerNorm.buffer.contents())[0] == 0.0F,
+                  "Flash-Next's centered norms or uncentered gated norm were changed incorrectly");
+        const auto &indexer = *weights.layers[3].indexer;
+        require(static_cast<const float *>(indexer.query.blocks().segments[0].plane0.contents())[0] == 1.5F &&
+                    static_cast<const float *>(indexer.key.blocks().segments[0].plane0.contents())[0] == 2.5F,
+                  "Flash-Next's fused QSA projection was not split at its key rows");
+        require(weights.pleHash.tableRows == 16 && weights.pleHash.multipliers[2] == 7 &&
+                    weights.pleHash.headOffsets.back() == 14, "Flash-Next's PLE hash was changed");
+        const auto &table = weights.pleTable.blocks();
+        residentRows.resize(16 * rowBytes);
+        std::memcpy(residentRows.data(), table.rows.contents(), residentRows.size());
+        fingerprint = weights.manifestFingerprintSha256;
+    }
+    const auto planned = streamableWeights(root, descriptor, {.streamExperts = true, .streamTable = true});
+    auto readers = std::make_shared<splash::model::SsdReaders>(2);
+    splash::model::ModelLoadOptions options{.streamedTableBytes = planned.tableFloorBytes + 4096,
+                                             .expertMemoryBytes = planned.expertFloorBytes, .readers = readers};
+    auto model = loadModel(backend, root, descriptor, options);
+    const auto &weights = std::get<splash::model::Qwen4ExpWeights>(model.target);
+    require(weights.streamedTable && weights.experts && weights.manifestFingerprintSha256 == fingerprint,
+              "Flash-Next's streaming changed the weight identity or failed to open its stores");
+    std::vector<uint8_t> rows(3 * rowBytes);
+    std::array<uint32_t, 3> slots{};
+    const std::array<uint32_t, 3> ids{15, 0, 8};
+    weights.streamedTable->stage(ids, rows, slots, splash::model::SparseRowUse::Decode);
+    for (size_t index = 0; index < ids.size(); ++index)
+        require(std::memcmp(rows.data() + slots[index] * rowBytes,
+                              residentRows.data() + ids[index] * rowBytes, rowBytes) == 0,
+                  "a streamed PLE row differs from the resident row across shards");
+
+    // mlx-serve puts the concatenated codes/scales/biases in a safetensors
+    // sidecar and has already folded the norm offsets into its BF16 gains.
+    auto external = tensors;
+    std::erase_if(external, [](const auto &tensor) { return tensor.name.find("ngram_embedding.shards.") != std::string::npos; });
+    for (auto &tensor : external) {
+        if (!tensor.name.ends_with("norm.weight") && tensor.name.find(".ple.norm_") == std::string::npos) continue;
+        if (tensor.name.ends_with("linear_attn.norm.weight")) continue;
+        uint64_t count = 1;
+        for (const auto dimension : tensor.shape) count *= dimension;
+        std::vector<uint16_t> gains(count, 0x3f80);
+        tensor.data.resize(count * 2);
+        std::memcpy(tensor.data.data(), gains.data(), tensor.data.size());
+    }
+    const auto sidecar = root / "sidecar";
+    const auto sidecarDescriptor = writeBlockModel(sidecar, target, external);
+    std::vector<uint16_t> biases(16 * groups, 0x3f80);
+    std::fill(biases.begin() + 8 * groups, biases.end(), 0x4000);
+    std::vector<uint8_t> biasBytes(biases.size() * 2);
+    std::memcpy(biasBytes.data(), biases.data(), biasBytes.size());
+    splash::test::writeSyntheticShard(sidecar / "target" / "ngram_table.bin",
+        {{"weight", "U32", {16, groups * 4}}, {"scales", "BF16", {16, groups}},
+          {"biases", "BF16", {16, groups}, biasBytes}}, "mlx-serve-ngram");
+    auto externalModel = loadModel(backend, sidecar, sidecarDescriptor, options);
+    const auto &externalWeights = std::get<splash::model::Qwen4ExpWeights>(externalModel.target);
+    require(static_cast<const float *>(externalWeights.layers[0].mixerHyper.norm.buffer.contents())[0] == 1.0F,
+              "an mlx-serve pack's already-folded norm was shifted a second time");
+    externalWeights.streamedTable->stage(ids, rows, slots, splash::model::SparseRowUse::Decode);
+    for (size_t index = 0; index < ids.size(); ++index)
+        require(std::memcmp(rows.data() + slots[index] * rowBytes,
+                              residentRows.data() + ids[index] * rowBytes, rowBytes) == 0,
+                  "an external PLE row differs from its embedded row");
+    {
+        std::ofstream changed(sidecar / "target" / "ngram_table.bin", std::ios::binary | std::ios::app);
+        changed.put(0);
+    }
+    rejects([&] { externalWeights.streamedTable->stage(ids, rows, slots, splash::model::SparseRowUse::Decode); },
+              "was written", "a changed PLE sidecar was accepted");
+    require(externalWeights.streamedTable->stats().poisoned, "a changed PLE sidecar did not poison its store");
+
+    const auto bf16 = root / "bf16-sidecar";
+    const auto bf16Descriptor = writeBlockModel(bf16, target, external);
+    std::vector<uint16_t> bf16Values(16 * headWidth, 0x3f80);
+    std::fill(bf16Values.begin() + 8 * headWidth, bf16Values.end(), 0x4000);
+    std::vector<uint8_t> bf16Bytes(bf16Values.size() * 2);
+    std::memcpy(bf16Bytes.data(), bf16Values.data(), bf16Bytes.size());
+    splash::test::writeSyntheticShard(bf16 / "target" / "ngram_table.bin",
+        {{"weight", "BF16", {16, headWidth}, bf16Bytes}}, "mlx-serve-ngram");
+    const auto bf16Plan = streamableWeights(bf16, bf16Descriptor, {.streamTable = true});
+    auto bf16Options = options;
+    bf16Options.streamedTableBytes = bf16Plan.tableFloorBytes + 4096;
+    auto bf16Model = loadModel(backend, bf16, bf16Descriptor, bf16Options);
+    const auto &bf16Weights = std::get<splash::model::Qwen4ExpWeights>(bf16Model.target);
+    require(bf16Weights.streamedTable->table().rowBytes == floatRowBytes && bf16Weights.pleFormat == GGUF_FMT_BF16,
+              "an unquantized PLE sidecar did not preserve its BF16 rows");
+    std::vector<uint8_t> bf16Rows(3 * floatRowBytes);
+    bf16Weights.streamedTable->stage(ids, bf16Rows, slots, splash::model::SparseRowUse::Decode);
+    for (size_t index = 0; index < ids.size(); ++index)
+        require(std::memcmp(bf16Rows.data() + slots[index] * floatRowBytes,
+                              bf16Bytes.data() + ids[index] * floatRowBytes, floatRowBytes) == 0,
+                  "a BF16 PLE row was changed while streaming");
+    auto bf16Resident = loadModel(backend, bf16, bf16Descriptor);
+    const auto &residentTable = std::get<splash::model::Qwen4ExpWeights>(bf16Resident.target).pleTable;
+    const auto gatherIds = sharedBuffer(backend, ids.size() * sizeof(uint32_t));
+    const auto gathered = sharedBuffer(backend, bf16Rows.size());
+    std::memcpy(gatherIds.contents(), ids.data(), ids.size() * sizeof(uint32_t));
+    splash::metal::CommandGraph gather;
+    splash::ops::Embedding::add(gather, gatherIds, residentTable, gathered, ids.size());
+    static_cast<void>(backend.submitCommandAsync(gather.command()).wait());
+    for (size_t index = 0; index < ids.size(); ++index)
+        require(std::memcmp(static_cast<const uint8_t *>(gathered.contents()) + index * floatRowBytes,
+                              bf16Bytes.data() + ids[index] * floatRowBytes, floatRowBytes) == 0,
+                  "a short resident BF16 PLE row was changed by its Metal gather");
+
+    auto invalid = tensors;
+    std::erase_if(invalid, [&](const auto &tensor) { return tensor.name == ple + "ngram_heads_vocab_sizes"; });
+    // Separate directory: changing a source while its model is live must not
+    // invalidate the buffers above merely to exercise a parser refusal.
+    const auto bad = root / "bad";
+    const auto badDescriptor = writeBlockModel(bad, target, invalid);
+    rejects([&] { static_cast<void>(loadModel(backend, bad, badDescriptor, options)); },
+              "missing source tensor", "a PLE table without its hash metadata was accepted");
+}
+
 int main(int argc, const char *argv[]) {
     if (argc != 3) {
         std::cerr << "usage: model_loading_test <test.metallib> <splash.metallib>\n";
@@ -948,6 +1114,8 @@ int main(int argc, const char *argv[]) {
         testSyntheticModel(production, temporary.path() / "model");
         testSyntheticBlockModel(production, temporary.path() / "block-model");
         testSyntheticBlockMoeModel(production, temporary.path() / "block-moe-model");
+        for (const uint32_t width : {32u, 160u})
+            testSyntheticFlashNext(production, temporary.path() / ("flash-next-model-" + std::to_string(width)), width);
         for (const auto checkpoint : {splash::test::FloatCheckpoint::ModelOptimizer,
                                       splash::test::FloatCheckpoint::CompressedTensors}) {
             const std::string at = checkpoint == splash::test::FloatCheckpoint::ModelOptimizer ? "model-optimizer"

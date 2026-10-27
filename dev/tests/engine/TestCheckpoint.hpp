@@ -34,12 +34,14 @@ struct SyntheticTensor final {
 // A safetensors shard of tensors whose values are all zero but those given
 // data: the zeros are a hole in the file, so a large model costs no disk.
 inline void writeSyntheticShard(const std::filesystem::path &path,
-                                const std::vector<SyntheticTensor> &tensors) {
-  std::string header = "{";
+                                const std::vector<SyntheticTensor> &tensors,
+                                std::string_view format = {}) {
+  std::string header = format.empty() ? "{" : "{\"__metadata__\":{\"format\":\"" + std::string(format) + "\"}";
   uint64_t offset = 0;
   std::vector<uint64_t> offsets;
   for (const SyntheticTensor &tensor : tensors) {
-    uint64_t bytes = tensor.dtype == "U32" || tensor.dtype == "F32"     ? 4
+    uint64_t bytes = tensor.dtype == "I64" || tensor.dtype == "U64"     ? 8
+                     : tensor.dtype == "U32" || tensor.dtype == "F32" ? 4
                      : tensor.dtype == "U8" || tensor.dtype == "F8_E4M3" ? 1
                                                                          : 2;
     std::string shape;
@@ -131,9 +133,16 @@ std::vector<SyntheticTensor> mlxTargetTensors(const Layout &layout, Quantization
     bfloat16(module + ".biases", shape(columns / group));
   };
   const uint64_t hidden = layout.hiddenSize;
+  const auto hyper = [&](const std::string &prefix, bool inject) {
+    bfloat16(prefix + "hc_norm.weight", {layout.streamWidth()});
+    quantized(prefix + "input_mix_weight_down", layout.hyperRank, layout.streamWidth());
+    quantized(prefix + "input_mix_weight_up", layout.streamWidth(), layout.hyperRank);
+    if (inject) quantized(prefix + "block_inject_weight", layout.hyperConnections, layout.streamWidth());
+  };
   for (uint32_t layer = 0; layer < layout.layers; ++layer) {
     const std::string prefix = "language_model.model.layers." + std::to_string(layer) + ".";
-    bfloat16(prefix + "input_layernorm.weight", {hidden});
+    if (layout.hyperConnected()) hyper(prefix + "attn_hyper_connection.", true);
+    else bfloat16(prefix + "input_layernorm.weight", {hidden});
     if (layout.isFullAttentionLayer(layer)) {
       const std::string attention = prefix + "self_attn.";
       const uint64_t kv = uint64_t{layout.attentionKvHeads} * layout.attentionHeadDimension;
@@ -143,6 +152,12 @@ std::vector<SyntheticTensor> mlxTargetTensors(const Layout &layout, Quantization
       bfloat16(attention + "q_norm.weight", {layout.attentionHeadDimension});
       bfloat16(attention + "k_norm.weight", {layout.attentionHeadDimension});
       quantized(attention + "o_proj", hidden, layout.attentionWidth);
+      if (layout.hasIndexer()) {
+        quantized(attention + "indexer.index_qk_proj",
+                    uint64_t{layout.indexerHeads + 1} * layout.indexerHeadDimension, hidden);
+        bfloat16(attention + "indexer.q_layernorm.weight", {layout.indexerHeadDimension});
+        bfloat16(attention + "indexer.k_layernorm.weight", {layout.indexerHeadDimension});
+      }
     } else {
       const std::string gdn = prefix + "linear_attn.";
       quantized(gdn + "in_proj_qkv", layout.convolutionDimension, hidden);
@@ -155,7 +170,8 @@ std::vector<SyntheticTensor> mlxTargetTensors(const Layout &layout, Quantization
       bfloat16(gdn + "norm.weight", {layout.gdnHeadDimension});
       quantized(gdn + "out_proj", hidden, layout.attentionWidth);
     }
-    bfloat16(prefix + "post_attention_layernorm.weight", {hidden});
+    if (layout.hyperConnected()) hyper(prefix + "mlp_hyper_connection.", true);
+    else bfloat16(prefix + "post_attention_layernorm.weight", {hidden});
     const std::string mlp = prefix + "mlp.";
     const auto ffn = [&](const std::string &projections, uint64_t width, uint64_t experts) {
       quantized(projections + "gate_proj", width, hidden, experts);
@@ -170,8 +186,17 @@ std::vector<SyntheticTensor> mlxTargetTensors(const Layout &layout, Quantization
     } else {
       ffn(mlp, layout.intermediateSize, 1);
     }
+    if (layout.hasPle() && layer == layout.pleLayer) {
+      const std::string ple = prefix + "ple.";
+      quantized(ple + "key_proj", layout.streamWidth(), layout.pleWidth());
+      quantized(ple + "value_proj", hidden, layout.pleWidth());
+      for (const std::string norm : {"norm_key", "norm_query", "norm_conv"})
+        bfloat16(ple + norm + ".weight", {layout.streamWidth()});
+      bfloat16(ple + "conv1d.weight", {layout.streamWidth(), layout.pleConvolutionTaps, 1});
+    }
   }
-  bfloat16("language_model.model.norm.weight", {hidden});
+  if (layout.hyperConnected()) hyper("language_model.model.hyper_connection_mixer.", false);
+  else bfloat16("language_model.model.norm.weight", {hidden});
   quantized("language_model.lm_head", layout.vocabularySize, hidden);
   quantized("language_model.model.embed_tokens", layout.vocabularySize, hidden);
   return result;
