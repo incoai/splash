@@ -1,0 +1,72 @@
+{
+  "block_budget": 8,
+  "blocks": 8,
+  "conditional_by_position": {
+    "covered": [
+      8,
+      7,
+      6,
+      4,
+      4,
+      4,
+      3
+    ],
+    "reached": [
+      8,
+      7,
+      6,
+      4,
+      4,
+      4,
+      3
+    ],
+    "recall": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "selected": [
+      7,
+      6,
+      4,
+      4,
+      4,
+      3,
+      3
+    ],
+    "selection_when_covered": [
+      0.875,
+      0.8571428571428571,
+      0.6666666666666666,
+      1.0,
+      1.0,
+      0.75,
+      1.0
+    ]
+  },
+  "continuations_evaluated": 4,
+  "matching_proposal_histogram": [
+    1,
+    1,
+    2,
+    0,
+    0,
+    1,
+    0,
+    3
+  ],
+  "mean_matching_proposals": 3.875,
+  "projection_forward": "off",
+  "scope": "frozen-teacher greedy trace replay; not native throughput or sampled acceptance",
+  "selector_accuracy_when_covered": 0.6730769230769231,
+  "selector_ce": 0.9974486687233366,
+  "supervision": "target-generated",
+  "top_k_coverage": 0.9285714285714286,
+  "total_continuations": 4,
+  "unary_ce": 1.9561333163276555,
+  "weight_precision": "BF16 serving export"
+}

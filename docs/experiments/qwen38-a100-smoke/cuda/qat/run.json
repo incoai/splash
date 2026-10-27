@@ -1,0 +1,205 @@
+{
+  "deployment_validation": "pending: BF16 teacher and native quantized target are distinct artifacts",
+  "draft_config": {
+    "architectures": [
+      "DFlash2DraftModel"
+    ],
+    "attention_bias": false,
+    "attention_dropout": 0.0,
+    "bos_token_id": null,
+    "dflash_config": {
+      "block_size": 8,
+      "conv_group_size": 16,
+      "conv_kernel_size": 2,
+      "mask_token_id": 248070,
+      "selector_rank": 256,
+      "selector_top_k": 16,
+      "target_layer_ids": [
+        5,
+        19,
+        33,
+        47,
+        61
+      ]
+    },
+    "dtype": "bfloat16",
+    "eos_token_id": 248044,
+    "head_dim": 128,
+    "hidden_act": "silu",
+    "hidden_size": 5120,
+    "initializer_range": 0.02,
+    "intermediate_size": 17408,
+    "is_causal": false,
+    "layer_types": [
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention",
+      "sliding_attention"
+    ],
+    "max_position_embeddings": 262144,
+    "max_window_layers": 5,
+    "model_type": "qwen3",
+    "num_attention_heads": 32,
+    "num_hidden_layers": 5,
+    "num_key_value_heads": 8,
+    "num_target_layers": 64,
+    "pad_token_id": 248044,
+    "rms_norm_eps": 1e-06,
+    "rope_parameters": {
+      "rope_theta": 10000000,
+      "rope_type": "default"
+    },
+    "sliding_window": 2048,
+    "tie_word_embeddings": false,
+    "transformers_version": "5.15.0",
+    "use_cache": true,
+    "use_sliding_window": true,
+    "vocab_size": 248320
+  },
+  "execution": {
+    "attention": "sdpa",
+    "cuda_version": "13.0",
+    "device": "cuda",
+    "device_name": "NVIDIA A100-SXM4-80GB",
+    "forward_precision": "BF16 autocast; FP32 rotary frequencies",
+    "optimizer_precision": "FP32 trainable masters and Adam moments",
+    "torch_threads": 64
+  },
+  "implementation": {
+    "__init__.py": "866dd15abc8a72daeb132ee1de2d121f44e6c5adfdc8ef463a8630e3ec2ff456",
+    "__main__.py": "e50f4613f66ecd42e015d374ba3dda105032b8aee9c0f725d2e34ea3326bc1d7",
+    "capture.py": "ef6642bc3dffd790681bc9e7ef90d07e33334e24e1f74ea81a0aa57a61ae3dd9",
+    "config.py": "efeeeb64b9509e6cca1e53c7663d381224c839a599e5c24f16e571811b7e99ff",
+    "data.py": "a0f6f000274ca715415a4b49166efaff9b0e8cbfa3b872573eb0c24844fea2d9",
+    "evaluate.py": "40d385d69bca9aecf9c08e97bcd049c3a34c3b319aee4faa806d6c971050214a",
+    "export.py": "742d062762dfb7ba87dc36302b22cd8363e6f27a2ca89e2b3c27f5ed5f5accca",
+    "losses.py": "0a46bb24bfe064922be09a644d0756a1e6656552cf65a437add1d3c3c9ba2687",
+    "model.py": "de9e6a7472954b27ac249ee233b40dfe6a37745dc8dd6af63d1e67521a4a9ff8",
+    "quantization.py": "8e71d791858bc7d2461b42b22e4d095d7eaa666f889d07a8f2e2153077318953",
+    "selector_experiments.py": "de1c44edfe442698af5d0addd59e712b89e66dd9d1776fd5ce33d07a693d18ce",
+    "trainer.py": "0ad5df291ef0ffa24e3e2214d84b93f480bae138364b378b8393fda78b8d54ad"
+  },
+  "initial_draft_identity": {
+    "config.json": "873e3556509b0da06e29654ba00d4944888d4b5e8a33afde25f7eb27d321e980",
+    "model.safetensors": "67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c"
+  },
+  "recipe": {
+    "affine4_scope": "selector_context",
+    "batch_size": 1,
+    "checkpoint_interval": 10,
+    "gradient_accumulation": 4,
+    "learning_rate": 1e-05,
+    "max_grad_norm": 1.0,
+    "max_new_tokens": 128,
+    "max_steps": 20,
+    "max_validation_blocks": 8,
+    "position_decay": 1.0,
+    "prefix_loss_weight": 0.0,
+    "recall_last_layers": 1,
+    "seed": 42,
+    "selector_loss_weight": 1.0,
+    "selector_warmup_steps": 10,
+    "sequence_length": 2048,
+    "trainable": "selector",
+    "validation_interval": 10,
+    "vocabulary_chunk_rows": 1,
+    "weight_decay": 0.01
+  },
+  "reference_revision": "07ebd93db9f472af339b644bb70221ad8428328a",
+  "run_identity": "a33ffedc6ed9ccde8a636c2ec07e07e295da1c6a979d82a6301d297f773c638b",
+  "splash_contract": {
+    "runtime/metal/abi/DraftAttention.h": "d92fcbab6aad962803a043a134ae7ee7c817692c60cce991e37a6c33ae820c6c",
+    "runtime/metal/abi/ExecutionGeometry.h": "545fe4c85c0989b5e087cb6c5a96e12aaace9447afe04c7662a496cd7fad12c0",
+    "runtime/model/DraftCheckpoint.cpp": "2e8f8b8ac0272fcd3ca6a0ee8b9db3d5b8024f571bdebf761e2e29caf0c9ea50",
+    "runtime/model/ModelDescriptor.mm": "5f40726d6e84cdbe303a09b78d96a30df5ba28b76e6079d8dd07726332c19850",
+    "runtime/model/Qwen3_8.hpp": "22b7d97404cbab55626139519843ef917142a065112d21bfbe5cd802c6151312"
+  },
+  "supervision": "target-generated",
+  "teacher_identity": {
+    "chat_template.jinja": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+    "config.json": "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab",
+    "generation_config.json": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e",
+    "model-00001-of-00018.safetensors": "ba0ce20aae489ad196733da5064bcdf159a1fe84f53336648196e1ebb7751b1c",
+    "model-00002-of-00018.safetensors": "06a148c01bfbe3faa14a5f184a7ff29a706f7ae1c8b2705d2058e26d17a001fb",
+    "model-00003-of-00018.safetensors": "2e1bf62cbcd406eaa64b60d10353e1f0ef4039d0976e56f05cabe953454f9968",
+    "model-00004-of-00018.safetensors": "511e34063187882659753c4d93f3859f93c019fd438d8813071921c81d9a3f1a",
+    "model-00005-of-00018.safetensors": "635cb53446dc74f219740fc59e18b774f877b803b9722e289ca62575a6efa701",
+    "model-00006-of-00018.safetensors": "0bc5214fac607f0e6cc92eec3789d4b8559410ef9fce66621ba8158e8410dae0",
+    "model-00007-of-00018.safetensors": "80b0c49033e9a0d5762562aa12f4acdb7f54da586f3d0110f28c48d91cf07892",
+    "model-00008-of-00018.safetensors": "7192c5b66185d3592927daabee1cc19e6f6e0ce75988ee20e824b624765fda79",
+    "model-00009-of-00018.safetensors": "af3c48cc37af44f3db6ae0579baf019180d48d9c527caa0a1f03ff85813a56d8",
+    "model-00010-of-00018.safetensors": "163490a76f3bea3a40855b7efc04ce6d27afaf1a34f0bbde495b9491f76457c9",
+    "model-00011-of-00018.safetensors": "5f3ae1b948aeee39da77aec558e8236cd65fe4d7cb7686a76bb007acc563c6d8",
+    "model-00012-of-00018.safetensors": "a3de1c7114677a8f5ac5c4892c90e8238ea5c1e2038c80e757dfc87c3902ca55",
+    "model-00013-of-00018.safetensors": "06ab79a41f74c9c5cb734816feb0c7fc364104b227165ee7391231e1155aa02a",
+    "model-00014-of-00018.safetensors": "4138ed94603065ba884bbcadedb04d7718bb40117e85e6f5c6fc5b9c05b7a85b",
+    "model-00015-of-00018.safetensors": "69224e27b9de4e7dbf6fc936c6eaae08447bda3b80a6c31a871ab451173afd22",
+    "model-00016-of-00018.safetensors": "73cb9a1089fb6155cb648609478d6633be8a5c7d9ca5a05bc8925ce8a553cefe",
+    "model-00017-of-00018.safetensors": "beb51f01056142ac4984bd800507b0dd0fd18de57f8e9ef6ea41d1a3598983a8",
+    "model-00018-of-00018.safetensors": "1d3479509e21494658f9b64d317f5ea8e55c4025d28c702d6c4d0b356ce8ea06",
+    "model.safetensors.index.json": "77042094076611b69791a610065f28b7013b8c621795fa86ddccc8bac7d1b9df",
+    "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+    "tokenizer.json": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+    "tokenizer_config.json": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
+    "video_preprocessor_config.json": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+    "vocab.json": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+  },
+  "training_split": {
+    "conversations": 8,
+    "identities": [
+      "014b90662e7a1ce2837c98f4133bf67ba0aeb51a97075b82e65c58583c2dc150",
+      "13446fb1cceebbf34a44d356cfe73e24e7ef43daf53d74261822566f04a3a760",
+      "1ba7b79d74c95fda284a8e6fd8dc5b7dbdd1c8ed0f8a6253f8a8f08fc1bcd417",
+      "347e9b0cc1b636d143dccafb3094a8afc5e75272070773cec3c1f1ce6350783d",
+      "3b31c2e37a9ebc83b29b1ab1c90deac080c22bbb5b15309f6a2bd937376e5ec4",
+      "4ae570eade3809c4ce4d03ffdfb02c7018ae9e2e7f45f6cd4cd0b5b5cc9e739b",
+      "7026aed5a708d9da61b65650657e9f37b5bc74899765c967e9d0cab3b5d5c69b",
+      "8c1d08c33d76389cb16a3801476f843250ed350c52bbf8dc3223dfffc1d54e6c",
+      "ae708695fb809e105c89e45a47224d07a76bb9a9a8a00f8d88318212e9b68e82",
+      "c185d702d00f153ad729fb9b333d6fbd3d20c27f0669875a1e5fa9a6f65a8be0",
+      "d8808799e6dc3547479f7c8c0df006ff629c551bb8e3731dd13173fdeb0067e3",
+      "dffd6ffcb2b3ebc6d3ce3062a0674429c2ec625cafd35ac81514270c1d5862fd",
+      "e4df5e4c17962fc2d2b68d597936f0349966ee7edc0f3bb212b998d065ab3703",
+      "e7058c3bb062bf2f6d7b8c9e371377d20f23766fd9750c2568b29cc5bddf60de",
+      "f2ea4f94e59b117bcbb190ef1ffe3cb3d986eb321f8db60ec395184130e493bd",
+      "ffd0fca5d77be52390e63501307564bbc4d1a2c90de5d5823b393ff09faefcb1"
+    ],
+    "records": [
+      "395e151a84876d959a4e427992bc743b8a97c0b5766eb6eb39e51c80c2d1a69b",
+      "55e8e145059c23e5f567af7433545f274f4d6d5ed40cecdbf7bab6e23a6f241d",
+      "36f342cac469c9930b10c1ccd5cff4ae38ebac80dd0f5e935db8ba6ca33a44fc",
+      "23dcf4f20b8b42d4e3c4c26acdcf353a66b50034cc737a5eef92bab4cc9a2e6d",
+      "5da3de2e50eb9be91bf8468d08d553dd79f022bb45924897797f81695d224fee",
+      "247ed98643dcc2cfb419d535caa396441e5f088d35dbd3e4acb24c4f34293062",
+      "4a40a4959e5cca5f1a4d7982728759e868d25c642a7567a430beff0251a44884",
+      "8fbc27c00198d03acc7e9c45a363f6ea905abe11538dd197ddf19b7e318a277e"
+    ],
+    "sha256": "79d9c64422a214c8adf8be7a05cfd0592c989a526222ba96f70363051f901c02"
+  },
+  "validation_split": {
+    "conversations": 4,
+    "identities": [
+      "13072739cbdf42f93aa0c9783c69d5387f2d41f1de799de479b623a3d5342735",
+      "80209e8f9e3012a6b76147d9bcd4293d031c99af8d72281aa678e585520ea40d",
+      "b24bce821fd6ff544cbadf25572c830d5a442c98cf7617c09ef0627b07221975",
+      "b8bfc8f990a9bf621e6631917ab32cc1102efaa5530c52ca4165ca5dffe84940",
+      "d9827e1928dec7159bd96faa59d13089a28db7bd592cb768e41c1117d9e6530e",
+      "e5d0896246fe4df668b7b4423ddebac8daac3dfb45a7303eea1d3b01da2da075",
+      "fdc7f5245659eb135f2727ef5de708632ee30df1e21e1ff4f1b12713f45fc07d",
+      "fff2efc811f171dbf237c81d74797a2ff66d117c5dfaf48310129a2b4ad3e733"
+    ],
+    "records": [
+      "c5344bff9c62b6cd326fdbcc8bac1935b2b3d6b3ecd55ded39aadccdcfc9b618",
+      "5cd1bcb731270ef468e1df69fffea554a5e73c804f6ad3fe21133b48e7885fd5",
+      "9f9f53ca86c702ab7bfd0090547a3b693e282d8b114f425c29696352c1d77466",
+      "feeb5a72164d5326af4f116ac0521c5c50eb65f3142e9b65745cdf613e6e884c"
+    ],
+    "sha256": "b90647de69c1c1e6afeaa34e832ae01dfe048ba95c20a7cad70278d01f7e0bc1"
+  },
+  "versions": {
+    "safetensors": "0.8.0",
+    "torch": "2.13.0",
+    "transformers": "5.15.1"
+  }
+}

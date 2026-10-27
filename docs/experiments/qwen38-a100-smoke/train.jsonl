@@ -1,0 +1,8 @@
+{"source_id": "runpod-dflash-smoke-train-0", "messages": [{"role": "user", "content": "Write Python code for a stable deduplication function for strings and explain its time complexity."}]}
+{"source_id": "runpod-dflash-smoke-train-1", "messages": [{"role": "user", "content": "Implement a Python function that validates balanced parentheses, including two worked examples."}]}
+{"source_id": "runpod-dflash-smoke-train-2", "messages": [{"role": "user", "content": "Prove by induction that the sum of the first n positive odd integers equals n squared."}]}
+{"source_id": "runpod-dflash-smoke-train-3", "messages": [{"role": "user", "content": "Explain how to solve 3*x + 7 = 28 and check the answer by substitution."}]}
+{"source_id": "runpod-dflash-smoke-train-4", "messages": [{"role": "user", "content": "Explain three practical ways a small library can reduce its electricity consumption."}]}
+{"source_id": "runpod-dflash-smoke-train-5", "messages": [{"role": "user", "content": "Write a concise checklist for organizing a community book exchange."}]}
+{"source_id": "runpod-dflash-smoke-train-6", "messages": [{"role": "user", "content": "Return a JSON object describing three project milestones, each with a name, owner and integer duration_days."}]}
+{"source_id": "runpod-dflash-smoke-train-7", "messages": [{"role": "user", "content": "Explain how a server should handle an invalid JSON request body and give a small error response example."}]}
