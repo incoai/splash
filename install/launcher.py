@@ -428,6 +428,15 @@ def parse_args(argv=None):
         help=f"HTTP port (default: SPLASH_PORT or {serve_options.DEFAULT_PORT})",
     )
     serve_options.add_serve_arguments(server, groups)
+    if not paths.PACKAGED:
+        # Parsing/help use only standard-library metadata code. Training tensor
+        # dependencies are imported only when this source-only command runs.
+        from draft_training.__main__ import add_train_arguments
+
+        training = commands.add_parser(
+            "train-draft", help="fine-tune a DFlash2 draft (optional CUDA environment)"
+        )
+        add_train_arguments(training)
     for name in clients.INSTALL_URLS:
         client = commands.add_parser(
             name,
@@ -448,6 +457,10 @@ def parse_args(argv=None):
             client_args = client_args[1:]
     else:
         args = parser.parse_args(argv)
+    if args.command == "train-draft":
+        if client_args:
+            parser.error("arguments after -- are only supported for coding clients")
+        return args
     # An explicit --port wins; SPLASH_PORT is read only without one.
     args.explicit_port = args.port is not None
     if not args.explicit_port:
@@ -468,6 +481,11 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     try:
+        if args.command == "train-draft":
+            from draft_training.__main__ import main as train_main
+
+            arguments = list(sys.argv[1:] if argv is None else argv)
+            return train_main(["train", *arguments[1:]])
         return serve(args) if args.command == "serve" else coding_client(args)
     except (LauncherError, clients.ClientError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)

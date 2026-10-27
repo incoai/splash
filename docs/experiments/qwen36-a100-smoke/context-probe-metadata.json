@@ -1,0 +1,6 @@
+{
+  "prompt_tokens": 1773,
+  "max_new_tokens": 128,
+  "sequence_limit": 2048,
+  "enable_thinking": false
+}

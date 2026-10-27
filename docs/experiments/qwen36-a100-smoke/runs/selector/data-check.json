@@ -1,0 +1,24 @@
+{
+  "chat_template": {
+    "enable_thinking": false,
+    "reasoning_effort": "medium"
+  },
+  "generated_lengths_include_max_new_tokens": true,
+  "mode": "tokenizer-only",
+  "supervision": "target-generated",
+  "teacher_weights_loaded": false,
+  "training": {
+    "examples": 8,
+    "full_assistant_blocks": null,
+    "max_prompt_tokens": 34,
+    "max_sequence_tokens": 162,
+    "short_answers": null
+  },
+  "validation": {
+    "examples": 4,
+    "full_assistant_blocks": null,
+    "max_prompt_tokens": 32,
+    "max_sequence_tokens": 160,
+    "short_answers": null
+  }
+}

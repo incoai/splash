@@ -1,0 +1,98 @@
+{
+  "status": "completed",
+  "stage": "completed",
+  "source_commit": "1aae5d5dcb45805aad63915de54e845dd6be7c37",
+  "history": [
+    {
+      "stage": "prepare-data",
+      "exit_code": 0,
+      "seconds": 0.5131420909892768,
+      "interrupted": false
+    },
+    {
+      "stage": "validate-models",
+      "exit_code": 0,
+      "seconds": 3.0111546480329707,
+      "interrupted": false
+    },
+    {
+      "stage": "selector-check-data",
+      "exit_code": 0,
+      "seconds": 78.16114500700496,
+      "interrupted": false
+    },
+    {
+      "stage": "selector-dry-run",
+      "exit_code": 0,
+      "seconds": 1.0151001299964264,
+      "interrupted": false
+    },
+    {
+      "stage": "selector-preflight",
+      "exit_code": 0,
+      "seconds": 230.0677108420059,
+      "interrupted": false
+    },
+    {
+      "stage": "selector-train",
+      "exit_code": 0,
+      "seconds": 344.1082593789324,
+      "interrupted": false
+    },
+    {
+      "stage": "selector-final-evaluation",
+      "exit_code": 0,
+      "seconds": 399.22115167905577,
+      "interrupted": false
+    },
+    {
+      "stage": "full-check-data",
+      "exit_code": 0,
+      "seconds": 45.02121073601302,
+      "interrupted": false
+    },
+    {
+      "stage": "full-dry-run",
+      "exit_code": 0,
+      "seconds": 1.0291236550547183,
+      "interrupted": false
+    },
+    {
+      "stage": "full-preflight",
+      "exit_code": 0,
+      "seconds": 92.53270977502689,
+      "interrupted": false
+    },
+    {
+      "stage": "full-interrupted-train",
+      "exit_code": 130,
+      "seconds": 328.41568103595637,
+      "interrupted": true
+    },
+    {
+      "stage": "full-resume",
+      "exit_code": 0,
+      "seconds": 251.59153151197825,
+      "interrupted": false
+    },
+    {
+      "stage": "full-standalone-export",
+      "exit_code": 0,
+      "seconds": 66.52673852303997,
+      "interrupted": false
+    },
+    {
+      "stage": "full-final-evaluation",
+      "exit_code": 0,
+      "seconds": 191.5712682750309,
+      "interrupted": false
+    },
+    {
+      "stage": "full-completed-resume",
+      "exit_code": 0,
+      "seconds": 316.1317799440585,
+      "interrupted": false
+    }
+  ],
+  "updated_at_epoch": 1792781239.891193
+}

@@ -1,0 +1,9 @@
+Loading weights:   0%|          | 0/1026 [00:00<?, ?it/s]Loading weights:  40%|████      | 414/1026 [00:00<00:00, 4071.61it/s]Loading weights:  80%|████████  | 822/1026 [00:00<00:00, 3455.68it/s]Loading weights: 100%|██████████| 1026/1026 [00:00<00:00, 3455.30it/s]
+{
+  "best_checkpoint": "step-00000010",
+  "best_score": 3.75,
+  "cursor": 80,
+  "run_identity": "34dfa5c26f2e04a10f7484a684072200327445d43c3bb498dd5f9ea3b3095846",
+  "step": 20,
+  "updates": 20
+}

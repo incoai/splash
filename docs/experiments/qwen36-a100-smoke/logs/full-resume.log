@@ -1,0 +1,19 @@
+Loading weights:   0%|          | 0/1026 [00:00<?, ?it/s]Loading weights:  44%|████▍     | 455/1026 [00:00<00:00, 4503.47it/s]Loading weights:  88%|████████▊ | 906/1026 [00:00<00:00, 3487.80it/s]Loading weights: 100%|██████████| 1026/1026 [00:00<00:00, 3548.88it/s]
+step 11/20: unary CE 0.1142
+step 12/20: unary CE 0.6651
+step 13/20: unary CE 0.0033
+step 14/20: unary CE 0.0621
+step 15/20: unary CE 0.8123
+step 16/20: unary CE 0.1316
+step 17/20: unary CE 0.7262
+step 18/20: unary CE 3.0374
+step 19/20: unary CE 4.1426
+step 20/20: unary CE 4.5397
+{
+  "best_checkpoint": "step-00000010",
+  "best_score": 3.75,
+  "cursor": 80,
+  "run_identity": "34dfa5c26f2e04a10f7484a684072200327445d43c3bb498dd5f9ea3b3095846",
+  "step": 20,
+  "updates": 20
+}
