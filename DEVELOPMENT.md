@@ -107,6 +107,7 @@ access.
 | `--cache-dir` | `~/Library/Caches/Splash/prefix-cache` | Where `--persistent-cache` keeps its files; needs `--persistent-cache`. |
 | `--served-model-name` | None | Additional model name the API accepts; repeatable. See [API model aliases](#api-model-aliases). |
 | `--announce-served-name` | Off | Report the first `--served-model-name` in responses; needs `--served-model-name`. |
+| `--no-safeguards` | Off | Ignore the Messages `safeguards` field instead of reviewing each tool call of a response that asks for it and returning `safeguard_results`, Claude Code auto mode's server-side classifier. See [action review](#action-review). |
 | `--default-reasoning-effort` | `SPLASH_DEFAULT_REASONING_EFFORT` or the template's | Effort of Chat and Responses requests that set none. See [default reasoning effort](#default-reasoning-effort). |
 | `--thinking-token-budget` | `SPLASH_THINKING_TOKEN_BUDGET` or none | Thinking tokens of a request that sets no budget. See [thinking token budget](#thinking-token-budget). |
 | `--thinking-end-text` | `SPLASH_THINKING_END_TEXT` or `</think>` | Text that ends thinking where a budget runs out, `</think>` its last token. See [thinking token budget](#thinking-token-budget). |
@@ -842,6 +843,12 @@ Agents must already be installed; `splash claude|opencode|codex|hermes|pi`
 connects to the running server. Arguments pass through, for example
 `splash codex resume --last` or `splash hermes chat -q "Hello"`.
 
+`splash claude` starts Claude Code in auto mode (`--permission-mode auto`,
+which a `--permission-mode` argument overrides). Splash reviews each tool
+call itself ([action review](#action-review)); with `splash serve
+--no-safeguards`, Claude Code's own classifier requests reach Splash as
+ordinary Messages requests instead.
+
 `splash pi` adds a `splash` provider to Pi's `models.json` (`splash-<port>` for
 a server on another port), preserving other providers, settings and sessions.
 The chat page names no model, and the launchers configure each client with the
@@ -913,6 +920,7 @@ Messages requires it.
 | `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit |
 | `POST /tokenize`, `/apply-template` | A text's tokens, or a conversation's rendered prompt, without inference |
 | `POST /v1/judgments`, `/v1/systemone` | Scores over fixed answers ([judgment contracts](#judgment-contracts)) |
+| `POST /v1/safeguards` | Whether to block an agent's tool call ([action review](#action-review)) |
 | `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](#explicit-weights-release)). It takes no body (or `{}`); `200` with `{"released": true, "weights": …}`, `409 engine_busy` while the engine serves a request or restores its weights, `503 engine_busy` when the engine does not answer within 5 s, and `503 engine_recovering` or `server_shutdown` while the engine restarts or the server stops |
 | `GET /status`, `/metrics` | JSON status and Prometheus metrics ([status](#status-readiness-and-metrics)) |
 | `GET /health` | 200 while the server answers; public |
@@ -1494,6 +1502,62 @@ softmax over the declared answer slots. Choice/score `confidence` is normalized
 entropy concentration, `1 - H(p) / log(K)`, not an estimate of correctness.
 Score answers are probability-weighted level indices. Measure accuracy and
 calibrate on representative held-out data before using decision thresholds.
+
+### Action review
+
+`POST /v1/safeguards` reviews one tool call an agent wants to run without
+asking its user, and answers whether to block it:
+
+```bash
+curl http://127.0.0.1:8000/v1/safeguards \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "action": {"name": "Bash", "input": {"command": "git push --force"}},
+    "intent": "Fix the typo in the README"
+  }'
+```
+
+`action` takes the tool's `name` and its JSON `input`; `intent`, optional, is
+what the user asked for. `context`, optional, takes the shape of Claude Code's
+auto-mode `classifier_context` (the `safeguards` request field): the review
+reads its permission rules, auto-mode `allow`/`soft_deny`/`hard_deny` rules and
+`environment` notes as policy, and its working directory, trusted directories
+and git state as evidence, and ignores its other fields. It also takes `model`,
+`timeout`, `priority` and `cache_salt` as the generation APIs do.
+
+A review is one [judgment](#judgment-contracts) with thinking off and no
+generation: Splash's policy (`server/safeguards.py`) as fixed options, allowed
+first and then each category it blocks, such as running downloaded code,
+discarding uncommitted work or rewriting shared git history, and sending
+secrets elsewhere. The most likely option decides. The response carries
+`outcome` (`flagged` or `not_flagged`), the blocked `category` and its
+description as `explanation` (both null when not flagged), the per-option
+`probabilities`, `prompt_version` and `usage`. Like other judgments these are
+uncalibrated local model scores, not a guarantee.
+
+Splash also answers Claude Code's auto mode on `/v1/messages`. In auto mode
+Claude Code sends a `safeguards` field
+(`[{"type": "dangerous_tool_use", "classifier_context": {…}}]`) and reads
+verdicts back from the response, in place of making classifier requests of its
+own. Splash reviews each tool call of the response as above, the user's
+intent being the text of their latest turn without `<system-reminder>` blocks,
+and returns the results, on the final `message_delta` of a stream or at the
+top level of a complete response:
+
+```json
+"safeguard_results": [{"type": "dangerous_tool_use", "status": {
+  "type": "available",
+  "tool_uses": {"<tool_use id>": {"type": "evaluated", "outcome": "flagged",
+                                  "explanation": "…"}}}}]
+```
+
+The reviews run once the output ends, keeping the stream alive with `ping`
+events, one judgment per call under the request's deadline. A call the output
+cut, or whose review fails, times out or exceeds the context, has no verdict
+(`{"type": "unavailable", "reason": "truncated" | "error" | "timeout" |
+"input_too_long"}`), which Claude Code denies rather than run unreviewed.
+With `--no-safeguards` the field is ignored, and Claude Code falls back to its
+own classifier requests, which reach Splash as ordinary Messages requests.
 
 ### Status, readiness and metrics
 

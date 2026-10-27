@@ -188,8 +188,9 @@ def _claude(path, server, environment, arguments):
         CLAUDE_CODE_USE_VERTEX="0",
         CLAUDE_CODE_USE_FOUNDRY="0",
     )
-    # Auto mode adds classifier inference to tool approval. Start in the
-    # normal approval mode, even if the user's global default is auto.
+    # Start in auto mode: Splash reviews each tool call itself, or with serve
+    # --no-safeguards Claude Code's own classifier requests reach Splash as
+    # Messages requests. A --permission-mode argument overrides it.
     return [
         path,
         "--disallowedTools",
@@ -197,7 +198,7 @@ def _claude(path, server, environment, arguments):
         "--model",
         server.model,
         "--permission-mode",
-        "default",
+        "auto",
         *arguments,
     ]
 

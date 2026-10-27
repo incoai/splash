@@ -12,7 +12,7 @@ from pathlib import Path
 from jinja2 import TemplateError
 
 from . import images as image_input
-from . import json_codec, judgments
+from . import json_codec, judgments, safeguards
 from . import protocol as wire
 from .api_shapes import (
     IMAGE_PAD_TOKEN,
@@ -682,6 +682,31 @@ class Frontend:
             judgments.validate_row(body)
         except ValueError as error:
             raise APIError(400, str(error)) from error
+        return self._judgment_job(body, body, deadline, disconnected), body
+
+    def prepare_safeguard(self, body, *, deadline, disconnected):
+        """The score job reviewing a POST /v1/safeguards action."""
+        action, intent, context = safeguards.validate_review(body)
+        if not self.accepts_model(body.get("model")):
+            raise APIError(404, f"model {body['model']} not found", "model_not_found")
+        return self.prepare_review(
+            action, intent, context, body, deadline=deadline, disconnected=disconnected
+        )
+
+    def prepare_review(self, action, intent, context, body, *, deadline, disconnected):
+        """The score job reviewing `action` for a user who asked for
+        `intent` under a caller `context`; `body` carries the priority and
+        cache_salt."""
+        row = safeguards.review_row(action, intent, context)
+        try:
+            judgments.validate_row(row)
+        except ValueError as error:
+            raise APIError(400, str(error)) from error
+        return self._judgment_job(row, body, deadline, disconnected)
+
+    def _judgment_job(self, row, body, deadline, disconnected):
+        """The score job of a validated judgment row; `body` carries the
+        request's priority and cache_salt."""
         priority = self._priority(body)
         cache_salt = self._cache_salt(body)
         checkpoint = _preparation_checkpoint(deadline, disconnected)
@@ -693,8 +718,8 @@ class Frontend:
                     raise ContextLengthError(prompt_tokens, self.max_context)
 
             tokens, slots, prompt = self._encode_score_prompt(
-                judgments.judgment_messages(body),
-                judgments.LETTERS[: len(body["options"])],
+                judgments.judgment_messages(row),
+                judgments.LETTERS[: len(row["options"])],
                 admit,
                 checkpoint,
                 "judgment",
@@ -708,7 +733,7 @@ class Frontend:
                 judgments.digest(prompt),
                 cache_salt,
             )
-        return job, body
+        return job
 
     def prepare_systemone(self, body, *, deadline, disconnected):
         details = []

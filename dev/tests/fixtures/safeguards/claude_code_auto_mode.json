@@ -1,0 +1,192 @@
+{
+  "note": "Captured from Claude Code 2.1.310 auto mode against api.anthropic.com, sanitized.",
+  "anthropic_beta": "dangerous-tool-use-2026-09-03",
+  "safeguards": [
+    {
+      "type": "dangerous_tool_use",
+      "classifier_context": {
+        "v": 1,
+        "permission_mode": "auto",
+        "platform": "macos",
+        "live_cwd": "/tmp/project",
+        "home_dir": "/Users/dev",
+        "rule_roots": {
+          "userSettings": "/Users/dev/.claude",
+          "projectSettings": "/tmp/project",
+          "localSettings": "/tmp/project",
+          "flagSettings": "/tmp/project",
+          "policySettings": "/tmp/project",
+          "cliArg": "/tmp/project",
+          "command": "/tmp/project",
+          "session": "/tmp/project",
+          "toolsNarrowing": "/tmp/project",
+          "mcpServerPolicy": "/tmp/project",
+          "hostCredential": "/tmp/project"
+        },
+        "trusted_directories": {
+          "primary": {
+            "path": "/tmp/project",
+            "resolved": [
+              "/tmp/project"
+            ]
+          },
+          "additional": [
+            {
+              "path": "/tmp/project",
+              "resolved": [
+                "/tmp/project",
+                "/tmp/project"
+              ],
+              "source": "session"
+            }
+          ],
+          "network": [],
+          "block_reads_outside_working_directories": false
+        },
+        "rules": {
+          "allow": [
+            {
+              "rule": "Bash(npm test:*)",
+              "source": "userSettings"
+            }
+          ],
+          "deny": [
+            {
+              "rule": "Bash(rm -rf:*)",
+              "source": "userSettings"
+            }
+          ],
+          "ask": []
+        },
+        "auto_mode": {
+          "allow": [],
+          "soft_deny": [
+            "Never push to the release branch"
+          ],
+          "hard_deny": [],
+          "environment": [
+            "### Org-wide",
+            "**Organization**: None configured",
+            "**Trusted repo**: /tmp/project and its remote github.com:example/project.git"
+          ]
+        },
+        "artifact_consent_holdback": true,
+        "case_insensitive_paths": false,
+        "restricted": false,
+        "is_remote_mode": false,
+        "classify_all_shell": false,
+        "user_identity": "dev",
+        "git_state": {
+          "cwd": "/tmp/project",
+          "root": "/tmp/project",
+          "branch": null,
+          "default_branch": null,
+          "status": {
+            "clean": true,
+            "counts": {
+              "staged": 0,
+              "modified": 0,
+              "untracked": null,
+              "untracked_normal": 0
+            },
+            "porcelain": null,
+            "truncated": false
+          },
+          "visibility": {
+            "origin": null,
+            "push_remote": "origin",
+            "remotes": [],
+            "visibility_cache": []
+          }
+        },
+        "prior_turn_context": [
+          {
+            "tool_use_ids": [
+              "toolu_015oEC5Gainoz1aqBnbUGSJy"
+            ],
+            "context": {
+              "git_state": {
+                "cwd": "/tmp/project",
+                "root": "/tmp/project",
+                "branch": null,
+                "default_branch": null,
+                "status": {
+                  "clean": true,
+                  "counts": {
+                    "staged": 0,
+                    "modified": 0,
+                    "untracked": null,
+                    "untracked_normal": 0
+                  },
+                  "porcelain": null,
+                  "truncated": false
+                },
+                "visibility": {
+                  "origin": null,
+                  "push_remote": "origin",
+                  "remotes": [],
+                  "visibility_cache": []
+                }
+              },
+              "live_cwd": "/tmp/project",
+              "platform": "macos"
+            }
+          }
+        ],
+        "artifacts": {}
+      }
+    }
+  ],
+  "tool_use_block": {
+    "type": "tool_use",
+    "id": "toolu_01PW3Q8uqQLtXn5RYainH3ug",
+    "name": "Bash",
+    "input": {},
+    "caller": {
+      "type": "direct"
+    }
+  },
+  "message_deltas": [
+    {
+      "type": "message_delta",
+      "delta": {
+        "stop_reason": "tool_use",
+        "stop_sequence": null,
+        "stop_details": null,
+        "container": null,
+        "safeguard_results": [
+          {
+            "type": "dangerous_tool_use",
+            "status": {
+              "type": "available",
+              "tool_uses": {
+                "toolu_01PW3Q8uqQLtXn5RYainH3ug": {
+                  "type": "evaluated",
+                  "outcome": "not_flagged"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "message_delta",
+      "delta": {
+        "stop_reason": "end_turn",
+        "stop_sequence": null,
+        "stop_details": null,
+        "container": null,
+        "safeguard_results": [
+          {
+            "type": "dangerous_tool_use",
+            "status": {
+              "type": "available",
+              "tool_uses": {}
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

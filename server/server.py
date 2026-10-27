@@ -26,7 +26,7 @@ from install import assembly
 from install.models import ModelError
 
 from . import images as image_input
-from . import json_codec, judgments, serve_options
+from . import json_codec, judgments, safeguards, serve_options
 from . import protocol as wire
 from . import runtime as engine_runtime
 from .api_shapes import (
@@ -63,6 +63,7 @@ from .errors import (
     RETRY_STATUSES,
     SYSTEMONE_ERRORS,
     APIError,
+    ContextLengthError,
     ErrorDialect,
     RequestValidationError,
     field_error,
@@ -216,6 +217,7 @@ POST_ROUTES = {
     ),
     "/v1/judgments": PostRoute("_post_judgments", OPENAI_ERRORS),
     "/v1/systemone": PostRoute("_post_systemone", SYSTEMONE_ERRORS),
+    "/v1/safeguards": PostRoute("_post_safeguards", OPENAI_ERRORS),
     "/v1/memory/release": PostRoute(
         "_post_memory_release", OPENAI_ERRORS, fieldless=True
     ),
@@ -772,6 +774,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
         chat, thinking_display = anthropic_to_chat_body(
             body, thinking_resolver=self.app.thinking_codec.decode
         )
+        # With --no-safeguards the field is ignored, as an unknown field is,
+        # and Claude Code makes its own classifier requests.
+        review = safeguards.messages_request(body) if self.server.safeguards else None
         job = self.app.prepare(
             chat,
             deadline=deadline,
@@ -780,8 +785,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
         )
         job.flags |= progress
         if body.get("stream"):
-            return job, self._anthropic_stream
-        return job, self._anthropic_complete
+            return job, partial(self._anthropic_stream, review=review)
+        return job, partial(self._anthropic_complete, review=review)
 
     def _post_count_tokens(self, body, deadline):
         prompt = anthropic_to_chat_prompt(
@@ -805,6 +810,21 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._json(
             200,
             judgments.judgment_response(self.app.response_model, row, job, result),
+        )
+
+    def _post_safeguards(self, body, deadline):
+        job = self.app.prepare_safeguard(
+            body, deadline=deadline, disconnected=self._client_disconnected
+        )
+        self._submit(job)
+        result = self._await_done(job)
+        self._json(
+            200,
+            safeguards.review_response(
+                self.app.response_model,
+                result,
+                judgments.softmax(list(result.option_logits)),
+            ),
         )
 
     def _post_memory_release(self, body, deadline):
@@ -852,11 +872,59 @@ class FrontendHandler(BaseHTTPRequestHandler):
             },
         )
 
-    def _await_done(self, job):
+    def _await_done(self, job, on_idle=None):
         """The result of a score job, which emits only start and done."""
-        while (event := self._next_event(job))[0] != "done":
+        while (event := self._next_event(job, on_idle))[0] != "done":
             pass
         return event[1]
+
+    def _safeguard_results(self, job, review, blocks, on_idle=None):
+        """The safeguard_results of a Messages response that asked for them:
+        each tool call in `blocks` reviewed in turn, within the request's
+        deadline. A call the output cut has no verdict."""
+        context, intent, scheduling = review
+        tool_uses = {}
+        for block in blocks:
+            if block.kind != "tool":
+                continue
+            tool_uses[block.call_id] = (
+                self._review_call(job, block, context, intent, scheduling, on_idle)
+                if block.status == "completed"
+                else safeguards.unavailable("truncated")
+            )
+        return safeguards.messages_results(tool_uses)
+
+    def _review_call(self, job, block, context, intent, scheduling, on_idle):
+        """One tool call's safeguard result, reviewed under the request's
+        priority and cache_salt. A review that fails leaves the call without
+        a verdict, which its client denies; only the client's leaving ends the
+        response."""
+        action = {"name": block.name, "input": json_codec.loads(block.text)}
+        try:
+            review = self.app.prepare_review(
+                action,
+                intent,
+                context,
+                scheduling,
+                deadline=job.deadline,
+                disconnected=self._client_disconnected,
+            )
+            self._submit(review)
+            result = self._await_done(review, on_idle)
+            return safeguards.evaluated(judgments.softmax(list(result.option_logits)))
+        except ConnectionResetError:
+            raise
+        except ContextLengthError:
+            return safeguards.unavailable("input_too_long")
+        except APIError as error:
+            if error.code == "request_timeout":
+                return safeguards.unavailable("timeout")
+            if error.status >= 500:
+                self._log_api_error(error.code)
+            return safeguards.unavailable("error")
+        except Exception as error:
+            log_unexpected(error)
+            return safeguards.unavailable("error")
 
     def _next_event(self, job, on_idle=None):
         while True:
@@ -1029,7 +1097,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             ),
         )
 
-    def _anthropic_complete(self, job):
+    def _anthropic_complete(self, job, review=None):
         sequencer = BlockSequencer()
         collected = self._collect(
             job,
@@ -1046,19 +1114,19 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if collected.reasoning and job.thinking_display == "omitted"
             else ""
         )
-        self._json(
-            200,
-            anthropic_response(
-                self.app.response_model,
-                job,
-                blocks,
-                result,
-                collected.called,
-                signature,
-            ),
+        response = anthropic_response(
+            self.app.response_model,
+            job,
+            blocks,
+            result,
+            collected.called,
+            signature,
         )
+        if review is not None:
+            response["safeguard_results"] = self._safeguard_results(job, review, blocks)
+        self._json(200, response)
 
-    def _anthropic_stream(self, job):
+    def _anthropic_stream(self, job, review=None):
         omitted = job.thinking_display == "omitted"
 
         def send(event, payload):
@@ -1139,18 +1207,25 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 ),
             )
             result = collected.result
-            sequencer.finish(collected.cut, collected.reasoning_open)
+            blocks = sequencer.finish(collected.cut, collected.reasoning_open)
+            delta = {
+                "stop_reason": anthropic_stop(
+                    result,
+                    collected.called,
+                    job.output_clamped_to_context,
+                ),
+                "stop_sequence": result.stop_sequence,
+            }
+            # Claude Code reads the results on the final message_delta. The
+            # reviews run after the output, the stream kept alive meanwhile.
+            if review is not None:
+                delta["safeguard_results"] = self._safeguard_results(
+                    job, review, blocks, keepalive
+                )
             send(
                 "message_delta",
                 {
-                    "delta": {
-                        "stop_reason": anthropic_stop(
-                            result,
-                            collected.called,
-                            job.output_clamped_to_context,
-                        ),
-                        "stop_sequence": result.stop_sequence,
-                    },
+                    "delta": delta,
                     "usage": {"output_tokens": result.completion_tokens},
                 },
             )
@@ -1519,6 +1594,7 @@ class FrontendServer(HTTPServer):
         webui=True,
         max_request_bytes=serve_options.DEFAULT_MAX_REQUEST_BYTES,
         allowed_origins=(),
+        safeguards=False,
     ):
         if (
             isinstance(max_request_bytes, bool)
@@ -1532,6 +1608,8 @@ class FrontendServer(HTTPServer):
         )
         self.api_key = api_key
         self.webui = webui
+        # Whether Messages requests asking for safeguard_results get them.
+        self.safeguards = safeguards
         self.allowed_hosts = {
             host.lower().rstrip(".")
             for host in (*allowed_hosts, address[0], "localhost", "127.0.0.1", "::1")
@@ -1753,6 +1831,7 @@ def main():
             webui=not args.no_webui,
             max_request_bytes=args.max_request_size,
             allowed_origins=args.allowed_origin,
+            safeguards=not args.no_safeguards,
         )
         server.server_bind()
         if ANY_ORIGIN in args.allowed_origin and args.api_key is None:
