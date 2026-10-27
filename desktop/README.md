@@ -3,6 +3,15 @@
 A native macOS chat window for the Splash server. No sidebar, accounts, web
 wrapper, or JavaScript dependencies. Built with SwiftUI and Foundation.
 
+## Screenshots
+
+The native welcome window and a sample chat with code formatting. The sample
+conversation uses a local test runtime to demonstrate the interface.
+
+![Splash welcome window](screenshots/welcome.jpg)
+
+![Splash sample chat with a Python code block](screenshots/chat.jpg)
+
 ## Run
 
 With Xcode or the Swift 6 command line tools installed, build and open the app
