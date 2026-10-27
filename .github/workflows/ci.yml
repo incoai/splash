@@ -40,7 +40,7 @@ jobs:
         with:
           python-version: "3.13"
       - name: Build production and run CPU runtime checks
-        run: make check-source check-native-cpu PYTHON_CANDIDATES=python3
+        run: make check-source check-native-cpu PYTHON_CANDIDATES="$pythonLocation/bin/python3.13"
       - name: Build every native test and tool
         run: make check-native-build
       - name: Run native sanitizers
@@ -67,7 +67,7 @@ jobs:
         run: HOMEBREW_NO_AUTO_UPDATE=1 brew install fish
       - name: Run the Python tests and source checks
         run: |
-          make check-python PYTHON_CANDIDATES=python3
+          make check-python PYTHON_CANDIDATES="$pythonLocation/bin/python${{ matrix.python-version }}"
           actual=$(.venv/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
           test "$actual" = "${{ matrix.python-version }}"
 
