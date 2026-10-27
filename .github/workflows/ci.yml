@@ -36,11 +36,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: "3.13"
+      - name: Install Python 3.13
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install python@3.13
       - name: Build production and run CPU runtime checks
-        run: make check-source check-native-cpu PYTHON_CANDIDATES="$pythonLocation/bin/python3.13"
+        run: make check-source check-native-cpu PYTHON_CANDIDATES="$(brew --prefix python@3.13)/bin/python3.13"
       - name: Build every native test and tool
         run: make check-native-build
       - name: Run native sanitizers
@@ -56,18 +55,11 @@ jobs:
         python-version: ["3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: |
-            install/requirements.txt
-            dev/requirements.txt
-      - name: Install fish for the completion tests
-        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install fish
+      - name: Install Python and fish for the completion tests
+        run: HOMEBREW_NO_AUTO_UPDATE=1 brew install python@${{ matrix.python-version }} fish
       - name: Run the Python tests and source checks
         run: |
-          make check-python PYTHON_CANDIDATES="$pythonLocation/bin/python${{ matrix.python-version }}"
+          make check-python PYTHON_CANDIDATES="$(brew --prefix python@${{ matrix.python-version }})/bin/python${{ matrix.python-version }}"
           actual=$(.venv/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
           test "$actual" = "${{ matrix.python-version }}"
 
