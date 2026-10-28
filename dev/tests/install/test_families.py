@@ -31,6 +31,7 @@ UNUSABLE = {
         "--sparse-kv-memory",
         "--disable-ane",
         "--max-image-pixels",
+        "--reasoning",
         "--default-reasoning-effort",
         "--thinking-token-budget",
         "--thinking-end-text",
