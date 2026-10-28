@@ -73,6 +73,7 @@ from .output import (
     validate_response_content,
 )
 from .protocol import MAX_IMAGE_SPANS
+from .request_fields import sampling_from_headers
 from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
 
 # Request bodies held at once, from upload through preparation and, for what
@@ -679,6 +680,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
             body = {key: value for key, value in body.items() if value is not None}
             if route.fieldless and body:
                 raise APIError(400, "this endpoint takes no fields")
+            if self.app.sampling_headers and body:
+                body = sampling_from_headers(self.headers, body)
         return route.handler(self, body, self.app.request_deadline(body, started_at))
 
     def _generate(self, job, respond, started_at):
@@ -1409,6 +1412,7 @@ def main():
             response_store=dialects.responses.ResponseStore(),
             served_model_names=args.served_model_name,
             announce_served_name=args.announce_served_name,
+            sampling_headers=args.sampling_headers,
             default_reasoning_effort=args.default_reasoning_effort,
             default_thinking_token_budget=args.thinking_token_budget,
         )

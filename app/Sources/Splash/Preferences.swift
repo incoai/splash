@@ -471,6 +471,10 @@ extension LaunchOption {
             help: "Replies and the model list give the first served model name rather than the model’s own.",
             section: .api, kind: .toggle(on: true),
             requires: [Requirement("Needs a served model name.") { $0["--served-model-name"] != nil }]),
+        LaunchOption(
+            flag: "--sampling-headers", title: "Sampling from headers",
+            help: "Reads each request’s sampling from its X-Temperature, X-Presence-Penalty and X-Repetition-Penalty headers, for apps such as Claude Code that can’t set it in the request.",
+            section: .api, kind: .toggle(on: true)),
     ]
 
     private static let requests: [LaunchOption] = [
