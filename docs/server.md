@@ -99,6 +99,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--cache-dir` | `~/Library/Caches/Splash/prefix-cache` | Where `--persistent-cache` keeps its files; needs `--persistent-cache`. |
 | `--served-model-name` | None | Additional model name the API accepts; repeatable. See [API model aliases](#api-model-aliases). |
 | `--announce-served-name` | Off | Report the first `--served-model-name` in responses; needs `--served-model-name`. |
+| `--reasoning` | `SPLASH_REASONING` or `auto` | `off` makes the server decide that no request reasons. See [reasoning](#default-reasoning-effort). |
 | `--default-reasoning-effort` | `SPLASH_DEFAULT_REASONING_EFFORT` or the template's | Effort of Chat and Responses requests that set none. See [default reasoning effort](#default-reasoning-effort). |
 | `--thinking-token-budget` | `SPLASH_THINKING_TOKEN_BUDGET` or none | Thinking tokens of a request that sets no budget. See [thinking token budget](#thinking-token-budget). |
 | `--thinking-end-text` | `SPLASH_THINKING_END_TEXT` or `</think>` | Text that ends thinking where a budget runs out, `</think>` its last token. See [thinking token budget](#thinking-token-budget). |
@@ -754,6 +755,16 @@ reasoning, and any other reply is all answer
 
 ```sh
 splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort none
+```
+
+`--reasoning off` (or `SPLASH_REASONING=off`) makes the server, not the request,
+decide: no request reasons whatever its reasoning effort, Messages `thinking` or
+`enable_thinking` asks, as with llama-server's `--reasoning off`. Use it for
+clients such as Claude Code, which send a thinking config on every Messages
+request. `auto`, the default, leaves each request to decide.
+
+```sh
+splash serve --model mlx-community/Qwen3.8-27B-4bit --reasoning off
 ```
 
 `/v1/models` reports, as `reasoning`, what efforts do to the model's default

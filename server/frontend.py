@@ -39,7 +39,11 @@ from .errors import (
 from .latency import LatencyMetrics
 from .lru import LRUCache
 from .metrics import is_finite_number
-from .serve_options import REASONING_EFFORTS, parse_served_model_name
+from .serve_options import (
+    REASONING_EFFORTS,
+    REASONING_MODES,
+    parse_served_model_name,
+)
 from .tokenization import PromptTokenizer, tokenizable
 from .tool_schema import (
     ToolPolicy,
@@ -253,6 +257,7 @@ class Frontend:
         announce_served_name=False,
         default_reasoning_effort=None,
         default_thinking_token_budget=None,
+        reasoning=None,
     ):
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
             raise ValueError("frontend preparation capacity must be positive")
@@ -293,6 +298,12 @@ class Frontend:
         ):
             raise ValueError("invalid default_thinking_token_budget")
         self.default_thinking_token_budget = default_thinking_token_budget
+        if reasoning is not None and reasoning not in REASONING_MODES:
+            raise ValueError("invalid reasoning")
+        # --reasoning off: the server, not the request, decides that no
+        # request reasons. A client such as Claude Code sends a thinking
+        # config on every Messages request and cannot be told otherwise.
+        self.reasoning_off = reasoning == "off"
         self.max_context = max_context
         self.request_timeout = request_timeout
         self.constraint_factory = constraint_factory
@@ -329,7 +340,8 @@ class Frontend:
             return {"thinks": None, "efforts": [], "default": None}
         template = self.chat_templates.select(None)
         reasoning = dict(template.reasoning)
-        if (effort := self.default_reasoning_effort) is not None:
+        effort = "none" if self.reasoning_off else self.default_reasoning_effort
+        if effort is not None:
             reasoning["thinks"] = effort != "none"
             reasoning["default"] = template.effort_names.get(effort)
         return reasoning
@@ -896,6 +908,9 @@ class Frontend:
             raise APIError(
                 400, "chat_template_kwargs enable_thinking must be a boolean"
             )
+        if self.reasoning_off:
+            # After the checks, so a malformed request still fails as before.
+            reasoning_effort, enable_thinking = "none", False
         messages = template_messages(
             normalize_messages(
                 body.get("messages"),

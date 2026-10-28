@@ -7,6 +7,7 @@ from unittest import mock
 
 from dev.tests import server_fixtures as fixtures
 from install import launcher
+from server import backend as backend_api
 from server import server as api
 
 SERVER_ARGS = ["model", "--model", "owner/repo"]
@@ -226,3 +227,78 @@ class DefaultReasoningTests(unittest.TestCase):
                         ),
                         explicit is not None,
                     )
+
+    def test_reasoning_off_ignores_every_request_that_asks_for_thinking(self):
+        harness = self.harness(None, reasoning="off")
+        for path, body in (
+            ("/v1/chat/completions", fixtures.chat_body(reasoning_effort="high")),
+            (
+                "/v1/chat/completions",
+                fixtures.chat_body(chat_template_kwargs={"enable_thinking": True}),
+            ),
+            ("/v1/responses", fixtures.responses_body(reasoning={"effort": "high"})),
+            ("/v1/messages", fixtures.anthropic_body(thinking={"type": "adaptive"})),
+            (
+                "/v1/messages",
+                fixtures.anthropic_body(
+                    thinking={"type": "enabled", "budget_tokens": 2048}
+                ),
+            ),
+        ):
+            with self.subTest(path=path, body=body):
+                status, _, payload = harness.request("POST", path, body)
+                self.assertEqual(status, 200, payload)
+                self.assert_effort(harness, "none")
+
+    def test_reasoning_off_still_refuses_a_malformed_effort(self):
+        for reasoning in ("off", None):
+            with self.subTest(reasoning=reasoning):
+                harness = self.harness(None, reasoning=reasoning)
+                body = fixtures.chat_body(reasoning_effort="huge")
+                status, _, payload = harness.request(
+                    "POST", "/v1/chat/completions", body
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(harness.backend.runtime.requests, [])
+
+    def test_reasoning_off_reports_that_the_model_does_not_think(self):
+        harness = self.harness(None, reasoning="off")
+        self.assertEqual(
+            harness.app.reasoning,
+            {"thinks": False, "efforts": [], "default": None},
+        )
+        # Off outranks a default effort: the report says what requests get.
+        harness = self.harness("xhigh", reasoning="off")
+        self.assertIs(harness.app.reasoning["thinks"], False)
+
+    def test_reasoning_auto_and_unset_behave_as_before(self):
+        plain = self.harness(None)
+        for reasoning in (None, "auto"):
+            with self.subTest(reasoning=reasoning):
+                harness = self.harness(None, reasoning=reasoning)
+                self.assertEqual(harness.app.reasoning, plain.app.reasoning)
+                status, _, payload = harness.request(
+                    "POST",
+                    "/v1/chat/completions",
+                    fixtures.chat_body(reasoning_effort="high"),
+                )
+                self.assertEqual(status, 200, payload)
+                self.assert_effort(harness, "high")
+
+    def test_frontend_refuses_an_unknown_reasoning_mode(self):
+        tokenizer = fixtures.FakeTokenizer()
+        backend = backend_api.NativeBackend(
+            fixtures.FakeRuntime(), tokenizer, lambda _record: None
+        )
+        self.addCleanup(backend.close)
+        with self.assertRaises(ValueError):
+            fixtures.make_frontend(
+                tokenizer,
+                backend,
+                "test-model",
+                128,
+                1,
+                2,
+                vision=True,
+                reasoning="on",
+            )
