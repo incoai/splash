@@ -93,7 +93,10 @@ LoadedModel loadModel(metal::MetalBackend &backend,
         const std::filesystem::path directory = root / "target";
         switch (result.descriptor.targetSource) {
         case TargetSource::Safetensors: {
-          SafetensorsTargetLoader loader(backend, images, directory, layout, experts);
+          SparseRowStoreOptions table = streamedTableRows(layout);
+          table.cacheBytes = options.streamedTableBytes;
+          table.readers = options.readers;
+          SafetensorsTargetLoader loader(backend, images, directory, layout, experts, table);
           return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {

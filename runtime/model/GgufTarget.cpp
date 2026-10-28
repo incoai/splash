@@ -61,7 +61,7 @@ WeightFile GgufTargetLoader::table() {
   return open(planned_->layers + 2);
 }
 
-std::optional<GgufTargetLoader::StreamedTable> GgufTargetLoader::streamTable() const {
+std::optional<StreamedTable> GgufTargetLoader::streamTable() const {
   const gguf::Image *plan = tablePlan();
   if (!plan || !plan->streamedRows) return std::nullopt;
   const gguf::StreamedRows &rows = *plan->streamedRows;

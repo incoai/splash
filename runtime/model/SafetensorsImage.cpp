@@ -146,6 +146,90 @@ public:
     floatRows(module, rows, columns, image_.section(bytes));
   }
 
+  // Hyper-connection injection weights have no descriptor: the norm reads
+  // their F32 values directly.
+  void injection(const std::string &module, uint64_t rows, uint64_t columns) {
+    floatRows(module, rows, columns, image_.section(rows * columns * sizeof(float)));
+  }
+
+  // QSA stores its query and key projection together. The runtime reads
+  // two F32 projections, with the original row order and precision.
+  void indexer(const std::string &prefix) {
+    const uint64_t queries = uint64_t{geometry_.indexerHeads} * geometry_.indexerHeadDimension;
+    const uint64_t keys = geometry_.indexerHeadDimension, hidden = geometry_.hiddenSize;
+    const std::string module = prefix + "index_qk_proj";
+    const auto quantizedSource = quantized(module, queries + keys, hidden);
+    TensorRows source;
+    Conversion conversion;
+    if (quantizedSource) {
+      source = *quantizedSource;
+      conversion = Conversion::DequantizeToFloat32;
+    } else {
+      const SourceTensor &weight = require(module + ".weight", {"BF16", "F32"}, {queries + keys, hidden});
+      source = rows(module, weight, weight.dtype == "BF16" ? ggml::kBF16 : ggml::kF32,
+                    queries + keys, weight.bytes / (queries + keys));
+      conversion = weight.dtype == "BF16" ? Conversion::WidenToFloat32 : Conversion::None;
+    }
+    for (const uint64_t count : {queries, keys}) {
+      image_.descriptor(ggml::kF32, count, hidden, {}, {count * hidden * sizeof(float), 0, 0}, module);
+      TensorRows part = source;
+      part.rows = count;
+      image_.copy(std::move(part), conversion);
+      source.first += count;
+    }
+    norm(prefix + "q_layernorm", geometry_.indexerHeadDimension);
+    norm(prefix + "k_layernorm", geometry_.indexerHeadDimension);
+  }
+
+  void pleConvolution(const std::string &module) {
+    const SourceTensor &weight = require(module + ".weight", {"BF16"},
+                                         {geometry_.streamWidth(), geometry_.pleConvolutionTaps, 1});
+    image_.copy(rows(module, weight, ggml::kBF16, 1, weight.bytes), Conversion::WidenToFloat32);
+  }
+
+  // One native-row table, concatenating the checkpoint's numbered shards.
+  // Streaming reads exactly these same rows through SparseRowStore.
+  void pleTable(const std::string &module, bool stream) {
+    std::vector<TensorRows> sources;
+    uint64_t total = 0;
+    const bool external = externalPle();
+    for (uint32_t shard = 0; shard < 1024; ++shard) {
+      if (external && shard) break;
+      const std::string name = external ? "ngram_table" : module + ".shards." + std::to_string(shard);
+      const SourceTensor *weight = checkpoint_.find(name + ".weight");
+      if (!weight) break;
+      if (weight->shape.size() != 2 || !weight->shape[0])
+        throw WeightStoreError("invalid PLE table shard: " + name);
+      const uint64_t count = weight->shape[0], width = geometry_.pleHeadDimension;
+      auto source = quantized(name, count, width);
+      if (!source) {
+        const SourceTensor &table = require(name + ".weight", {"BF16"}, {count, width});
+        source = rows(name, table, ggml::kBF16, count, width * sizeof(uint16_t));
+      }
+      if (!gguf_embedding_format(gguf_format_of(source->type)))
+        throw WeightStoreError(name + " is in a format the PLE gather does not read");
+      if (!sources.empty() && source->type != sources.front().type)
+        throw WeightStoreError("PLE table shards must share a quantization format");
+      total += count;
+      if (total > UINT32_MAX) throw WeightStoreError("PLE table has more rows than 32-bit ids address");
+      sources.push_back(*source);
+    }
+    if (sources.empty())
+      throw WeightStoreError("missing PLE table: expected " + module +
+                              ".shards.N tensors in safetensors or an mlx-serve ngram_table.bin");
+    const TensorRows &first = sources.front();
+    image_.descriptor(first.type, total, geometry_.pleHeadDimension, {}, {total * first.rowBytes, 0, 0}, module);
+    const uint64_t destination = image_.section(total * first.rowBytes);
+    uint64_t offset = 0;
+    for (const auto &source : sources) {
+      image_.copyAt(destination + offset, source, Conversion::None);
+      offset += source.rows * source.rowBytes;
+    }
+    table_ = gguf::StreamedRows{module, 0, 0, total, uint32_t(first.rowBytes), gguf_format_of(first.type),
+                                std::move(sources)};
+    streamTable_ = stream;
+  }
+
   // The token table's rows, which the embedding kernel gathers: native rows
   // of its quantized format, or its bf16 rows as stored.
   void embedding(const std::string &module) {
@@ -162,7 +246,11 @@ public:
     image_.copy(rows(module + ".weight", table, ggml::kBF16, vocabulary, table.bytes / vocabulary));
   }
 
-  [[nodiscard]] gguf::Image finish() { return image_.finish(); }
+  [[nodiscard]] gguf::Image finish() {
+    auto result = image_.finish();
+    if (streamTable_) result.streamedRows = std::move(table_);
+    return result;
+  }
 
 private:
   const SourceTensor &require(const std::string &name, std::initializer_list<std::string_view> dtypes,
@@ -187,9 +275,19 @@ private:
   // A norm's bf16 weight, as stored from MLX names, or converted to F32 as
   // `transformers` says from transformers names.
   void normWeight(const std::string &name, uint64_t elements, Conversion transformers) {
-    if (!float32Norms(names_)) return stored(name + ".weight", {"BF16"}, {elements});
+    if (!float32Norms(names_) && !geometry_.hyperConnected())
+      return stored(name + ".weight", {"BF16"}, {elements});
     const SourceTensor &tensor = require(name + ".weight", {"BF16"}, {elements});
-    image_.copy(rows(name + ".weight", tensor, ggml::kBF16, 1, tensor.bytes), transformers);
+    // The mlx-serve sidecar packs fold 1 + w at conversion time. Standard
+    // Flash-Next MLX exports preserve the upstream centered weights.
+    image_.copy(rows(name + ".weight", tensor, ggml::kBF16, 1, tensor.bytes),
+                  externalPle() ? Conversion::WidenToFloat32 : transformers);
+  }
+
+  bool externalPle() const {
+    return geometry_.hasPle() && checkpoint_.find("ngram_table.weight") &&
+             !checkpoint_.find(modelPrefix(names_) + "layers." + std::to_string(geometry_.pleLayer) +
+                                  ".ple.ple_embedding.ngram_embedding.shards.0.weight");
   }
 
   // The module's native rows, which must be quantized.
@@ -313,6 +411,8 @@ private:
   const QwenTargetDimensions &geometry_;
   const ModuleNames names_;
   gguf::ImageBuilder image_;
+  std::optional<gguf::StreamedRows> table_;
+  bool streamTable_ = false;
 };
 
 // Plans nothing, and names the modules a walk of the images reads only
@@ -335,18 +435,30 @@ struct QuantizedModules {
   void alphaBeta(const std::string &, const std::string &) {}
   void router(const std::string &, uint64_t, uint64_t) {}
   void floatTensor(const std::string &, uint64_t, uint64_t) {}
+  void injection(const std::string &, uint64_t, uint64_t) {}
+  void indexer(const std::string &) {}
+  void pleConvolution(const std::string &) {}
   void embedding(const std::string &) {}
 
   ModuleNames names;
   std::vector<std::string> modules;
 };
 
+template <class Walk>
+void walkHyper(Walk &b, const QwenTargetDimensions &g, const std::string &prefix, bool inject) {
+  b.norm(prefix + "hc_norm", g.streamWidth());
+  b.projection(prefix + "input_mix_weight_down", g.hyperRank, g.streamWidth());
+  b.projection(prefix + "input_mix_weight_up", g.streamWidth(), g.hyperRank);
+  if (inject) b.injection(prefix + "block_inject_weight", g.hyperConnections, g.streamWidth());
+}
+
 // The sections of each image, in their order, which a Builder plans and
 // QuantizedModules names: a layer's, the head's and the embedding's.
 template <class Walk>
 void walkLayer(Walk &b, const QwenTargetDimensions &g, ModuleNames names, uint32_t index) {
   const std::string prefix = modelPrefix(names) + "layers." + std::to_string(index) + ".";
-  b.norm(prefix + "input_layernorm", g.hiddenSize);
+  if (g.hyperConnected()) walkHyper(b, g, prefix + "attn_hyper_connection.", true);
+  else b.norm(prefix + "input_layernorm", g.hiddenSize);
   if (g.isFullAttentionLayer(index)) {
     const std::string attention = prefix + "self_attn.";
     const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
@@ -356,6 +468,7 @@ void walkLayer(Walk &b, const QwenTargetDimensions &g, ModuleNames names, uint32
     b.norm(attention + "q_norm", g.attentionHeadDimension);
     b.norm(attention + "k_norm", g.attentionHeadDimension);
     b.projection(attention + "o_proj", g.hiddenSize, g.attentionWidth);
+    if (g.hasIndexer()) b.indexer(attention + "indexer.");
   } else {
     const std::string gdn = prefix + "linear_attn.";
     b.projection(gdn + "in_proj_qkv", g.convolutionDimension, g.hiddenSize);
@@ -367,7 +480,8 @@ void walkLayer(Walk &b, const QwenTargetDimensions &g, ModuleNames names, uint32
     b.gatedNorm(gdn + "norm", g.gdnHeadDimension);
     b.projection(gdn + "out_proj", g.hiddenSize, g.attentionWidth);
   }
-  b.norm(prefix + "post_attention_layernorm", g.hiddenSize);
+  if (g.hyperConnected()) walkHyper(b, g, prefix + "mlp_hyper_connection.", true);
+  else b.norm(prefix + "post_attention_layernorm", g.hiddenSize);
   const std::string mlp = prefix + "mlp.";
   if (g.ffnKind == QwenFfnKind::SparseMoe) {
     const uint64_t width = g.expertIntermediateSize;
@@ -384,10 +498,20 @@ void walkLayer(Walk &b, const QwenTargetDimensions &g, ModuleNames names, uint32
     b.projection(mlp + "up_proj", g.intermediateSize, g.hiddenSize);
     b.projection(mlp + "down_proj", g.hiddenSize, g.intermediateSize);
   }
+  if (g.hasPle() && index == g.pleLayer) {
+    const std::string ple = prefix + "ple.";
+    b.projection(ple + "key_proj", g.streamWidth(), g.pleWidth());
+    b.projection(ple + "value_proj", g.hiddenSize, g.pleWidth());
+    b.norm(ple + "norm_key", g.streamWidth());
+    b.norm(ple + "norm_query", g.streamWidth());
+    b.norm(ple + "norm_conv", g.streamWidth());
+    b.pleConvolution(ple + "conv1d");
+  }
 }
 
 template <class Walk> void walkHead(Walk &b, const QwenTargetDimensions &g, ModuleNames names) {
-  b.norm(modelPrefix(names) + "norm", g.hiddenSize);
+  if (g.hyperConnected()) walkHyper(b, g, modelPrefix(names) + "hyper_connection_mixer.", false);
+  else b.norm(modelPrefix(names) + "norm", g.hiddenSize);
   b.projection(headName(names), g.vocabularySize, g.hiddenSize);
 }
 
@@ -418,6 +542,12 @@ std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, con
   Builder embedding(checkpoint, geometry, names, "embedding.bin", geometry.vocabularySize, geometry.hiddenSize);
   walkEmbedding(embedding, names);
   images.push_back(embedding.finish());
+  if (geometry.hasPle()) {
+    Builder table(checkpoint, geometry, names, "ple.bin", geometry.pleLayer, 3);
+    table.pleTable(modelPrefix(names) + "layers." + std::to_string(geometry.pleLayer) +
+                       ".ple.ple_embedding.ngram_embedding", options.streamTable);
+    images.push_back(table.finish());
+  }
   return images;
 }
 

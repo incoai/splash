@@ -8,8 +8,10 @@
 // tensors hold: MLX affine (metal/abi/QuantFormat.h), mxfp4 or nvfp4 as MLX
 // infers it, or NVFP4 or FP8 as the other two store them: projections and
 // experts as planes, a quantized token table as native rows. An unquantized
-// token table is copied as its bf16 rows. Norms are bf16 as MLX stores them, or the F32 1 + w of the w
-// transformers stores; the convolution and dt_bias are copied as stored, and
+// token table is copied as its bf16 rows. Norms are bf16 as MLX stores them,
+// or the F32 1 + w of Flash-Next's and transformers' centered weights (an
+// mlx-serve sidecar pack has already folded that offset); the convolution
+// and dt_bias are copied as stored, and
 // the GDN decay is float(-exp(double(A_log))). The MoE router keeps the
 // format it is stored in, as native rows when quantized, which the float
 // projection decodes; the shared-expert gate, which the MoE selection reads
@@ -43,7 +45,8 @@ enum class ModuleNames : uint8_t { Mlx, Transformers };
 // MLX's bf16 norms as stored.
 [[nodiscard]] constexpr bool float32Norms(ModuleNames names) noexcept { return names == ModuleNames::Transformers; }
 
-// The layers' images, then the head's and the embedding's. The checkpoint
+// The layers' images, then the head's, the embedding's and a PLE table's,
+// where the family has one. The checkpoint
 // outlives them: their rows read its tensors.
 [[nodiscard]] std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint,
                                                   const QwenTargetDimensions &geometry,

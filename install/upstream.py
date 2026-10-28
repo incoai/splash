@@ -338,6 +338,8 @@ def mlx_target(repo, language_only):
     # tower in a shard of its own is not the target's (an OptiQ checkpoint
     # keeps it in a subdirectory).
     files |= {"target/" + n: n for n in _weight_files(repo, exclude=VISION_TOWER)}
+    if family.name == "Qwen3.8-Flash-Next" and "ngram_table.bin" in repo.files:
+        files["target/ngram_table.bin"] = "ngram_table.bin"
     vision_format = "none"
     if not language_only:
         # The text passed, so a refusal of the tower's processor, shards or

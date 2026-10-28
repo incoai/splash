@@ -4,6 +4,7 @@
 #include "model/QwenTargetLoader.hpp"
 #include "model/SparseRowStore.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <optional>
 #include <span>
@@ -20,8 +21,8 @@ namespace {
 constexpr double kMultiplierLimit = 0x1p53, kHeadValueLimit = 0x1p31;
 
 // The sections of one mix, in the image's order (GgufImage.cpp hyperImage).
-Qwen4HyperWeights readHyper(WeightFile &file, const Qwen4ExpLayout &layout, bool inject, const std::string &label) {
-  const BlockTargetFormat format;
+Qwen4HyperWeights readHyper(WeightFile &file, const Qwen4ExpLayout &layout, const BlockTargetFormat &format,
+                             bool inject, const std::string &label) {
   const uint32_t streams = layout.streamWidth();
   Qwen4HyperWeights hyper;
   hyper.norm = format.norm(file, streams, label + "-norm");
@@ -32,8 +33,7 @@ Qwen4HyperWeights readHyper(WeightFile &file, const Qwen4ExpLayout &layout, bool
   return hyper;
 }
 
-Qwen4IndexerWeights readIndexer(WeightFile &file, const Qwen4ExpLayout &layout) {
-  const BlockTargetFormat format;
+Qwen4IndexerWeights readIndexer(WeightFile &file, const Qwen4ExpLayout &layout, const BlockTargetFormat &format) {
   Qwen4IndexerWeights indexer;
   indexer.query = format.projection(file, layout.indexerHeads * layout.indexerHeadDimension, layout.hiddenSize,
                                     "indexer-query");
@@ -98,27 +98,62 @@ Qwen4PleHash readPleHash(const GgufFile &file, const Qwen4ExpLayout &layout) {
   return hash;
 }
 
+Qwen4PleHash readPleHash(GgufTargetLoader &source, const Qwen4ExpLayout &layout) {
+  return readPleHash(source.file(), layout);
+}
+
+// MLX preserves the hash's integer buffers in safetensors. Read those
+// exact values rather than regenerating the primes or the random seed.
+Qwen4PleHash readPleHash(SafetensorsTargetLoader &source, const Qwen4ExpLayout &layout) {
+  const std::string prefix = "language_model.model.layers." + std::to_string(layout.pleLayer) +
+                              ".ple.ple_embedding.";
+  const auto integers = [&](const std::string &name, uint32_t count, uint64_t limit) {
+    const SourceTensor &tensor = source.checkpoint().require(prefix + name);
+    if ((tensor.dtype != "I64" && tensor.dtype != "U64") || tensor.shape != std::vector<uint64_t>{count})
+      throw WeightStoreError("invalid PLE hash tensor: " + prefix + name);
+    std::vector<uint64_t> values(count);
+    tensor.read(0, {reinterpret_cast<uint8_t *>(values.data()), values.size() * sizeof(uint64_t)});
+    for (const uint64_t value : values)
+      if (value >= limit) throw WeightStoreError("invalid PLE hash value: " + prefix + name);
+    return values;
+  };
+  Qwen4PleHash hash;
+  const auto multipliers = integers("layer_multipliers", layout.pleNgram, uint64_t{1} << 53);
+  std::copy(multipliers.begin(), multipliers.end(), hash.multipliers.begin());
+  const auto offsets = integers("ngram_heads_offsets", layout.pleHeads(), uint64_t{1} << 31);
+  const auto sizes = integers("ngram_heads_vocab_sizes", layout.pleHeads(), uint64_t{1} << 31);
+  hash.tableRows = source.tableRows();
+  for (uint32_t head = 0; head < layout.pleHeads(); ++head) {
+    if (!sizes[head] || offsets[head] > hash.tableRows || sizes[head] > hash.tableRows - offsets[head])
+      throw WeightStoreError("a PLE head's rows lie outside the safetensors table");
+    hash.headOffsets.push_back(uint32_t(offsets[head]));
+    hash.headVocabularies.push_back(uint32_t(sizes[head]));
+  }
+  source.checkpoint().checkUnchanged();
+  return hash;
+}
+
 } // namespace
 
 Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend, Qwen4ExpLayout layout,
                                     const QwenTargetFiles &files) {
   requireQwen4Layout(layout);
   return loadQwenTarget<Qwen4ExpWeights>(
-      backend, layout, files, [&](GgufTargetLoader &gguf, const BlockTargetFormat &format, const MoeExperts &experts) {
+      backend, layout, files, [&](auto &source, const BlockTargetFormat &format, const MoeExperts &experts) {
         Qwen4ExpWeights result;
         result.layout = layout;
-        // The PLE hash first, from the GGUF's metadata, before any image loads.
-        result.pleHash = readPleHash(gguf.file(), layout);
+        // The PLE hash first, from source metadata, before any image loads.
+        result.pleHash = readPleHash(source, layout);
         result.layers.reserve(layout.layers);
         const uint32_t streams = layout.streamWidth();
         for (uint32_t index = 0; index < layout.layers; ++index) {
           const bool fullAttention = layout.isFullAttentionLayer(index);
-          WeightFile file = gguf.layer(index);
+          WeightFile file = source.layer(index);
           Qwen4ExpLayerWeights &layer = result.layers.emplace_back();
-          layer.mixerHyper = readHyper(file, layout, true, "mixer-hyper");
+          layer.mixerHyper = readHyper(file, layout, format, true, "mixer-hyper");
           layer.mixer = readQwenMixer(file, format, layout, fullAttention);
-          if (fullAttention) layer.indexer = readIndexer(file, layout);
-          layer.ffnHyper = readHyper(file, layout, true, "ffn-hyper");
+          if (fullAttention) layer.indexer = readIndexer(file, layout, format);
+          layer.ffnHyper = readHyper(file, layout, format, true, "ffn-hyper");
           layer.ffn = readMoeBlock(file, layout, experts, index);
           if (index == layout.pleLayer) {
             Qwen4PleWeights ple;
@@ -135,27 +170,27 @@ Qwen4ExpWeights loadQwen4ExpWeights(metal::MetalBackend &backend, Qwen4ExpLayout
           result.files.push_back(file.record());
         }
         {
-          WeightFile file = gguf.head();
-          result.finalHyper = readHyper(file, layout, false, "final-hyper");
+          WeightFile file = source.head();
+          result.finalHyper = readHyper(file, layout, format, false, "final-hyper");
           result.logitsProjection = format.projection(file, layout.vocabularySize, layout.hiddenSize, "logits");
           result.logitsProjection.destination = ops::FloatOutput::Float32;
           file.finish();
           result.files.push_back(file.record());
         }
         {
-          WeightFile file = gguf.embedding();
+          WeightFile file = source.embedding();
           result.tokenEmbedding = format.embedding(file, layout.vocabularySize, layout.hiddenSize);
           file.finish();
           result.files.push_back(file.record());
         }
-        if (std::optional<GgufTargetLoader::StreamedTable> table = gguf.streamTable()) {
+        if (auto table = source.streamTable()) {
           if (table->store->table().rows != result.pleHash.tableRows)
-            throw WeightStoreError("the GGUF's PLE table does not match its hash");
+            throw WeightStoreError("the PLE table does not match its hash");
           result.streamedTable = std::move(table->store);
           result.pleFormat = table->format;
           result.files.push_back(std::move(table->record));
         } else {
-          WeightFile file = gguf.table();
+          WeightFile file = source.table();
           result.pleTable = readBlockEmbedding(file, static_cast<uint32_t>(result.pleHash.tableRows),
                                                layout.pleHeadDimension, "ple-table");
           file.finish();

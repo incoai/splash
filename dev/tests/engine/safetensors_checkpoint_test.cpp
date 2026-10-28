@@ -48,6 +48,15 @@ int main() {
     rejects([&] { SafetensorsCheckpoint invalid(root); }, "duplicate source tensor: a",
             "duplicate tensor accepted");
     std::filesystem::remove(root / "extra.safetensors");
+    shard(root / "ngram_table.bin",
+          R"({"__metadata__":{"format":"mlx-serve-ngram"},"weight":{"dtype":"BF16","shape":[2,4],"data_offsets":[0,16]}})");
+    SafetensorsCheckpoint withTable(root);
+    require(withTable.require("ngram_table.weight").shape == std::vector<uint64_t>({2, 4}),
+            "an external PLE table was not indexed under its namespace");
+    shard(root / "ngram_table.bin", valid);
+    rejects([&] { SafetensorsCheckpoint invalid(root); }, "must be an mlx-serve-ngram",
+            "an unidentified sidecar was accepted with folded norms");
+    std::filesystem::remove(root / "ngram_table.bin");
     for (const auto &[header, error] : std::initializer_list<std::pair<std::string_view, std::string_view>>{
              {R"({"a":{"dtype":"U32","shape":[2,2],"data_offsets":[0,15]}})", "safetensors data range is invalid"},
              {R"({"a":{"dtype":"U32","shape":[2,2],"data_offsets":[1,17]}})", "safetensors data range is invalid"},

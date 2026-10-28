@@ -29,12 +29,6 @@ public:
   // reads them, their format (GGUF_FMT_*), and the record of its image, which
   // the weights' fingerprint takes as when the table loads, as the rows
   // gathered are the same.
-  struct StreamedTable final {
-    std::shared_ptr<SparseRowStore> store;
-    uint32_t format = 0;
-    WeightFileRecord record;
-  };
-
   // Plans every image of the GGUF of `architecture` (its family's layout's
   // ggufArchitecture) from its metadata once. With a table store
   // (table.cacheBytes), the rows of a table the family's GGUF holds stream

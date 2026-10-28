@@ -18,6 +18,7 @@ The paths an assembly links, and what reads each:
   target/<shard>         the MLX safetensors shards except those holding only
                          vision_tower.* (SafetensorsCheckpoint.mm)
   target/<name>.gguf     the GGUF target, or the parts of a split one
+  target/ngram_table.bin an MLX Flash-Next pack's external PLE table, when present
                          (GgufTarget.cpp findTargetGgufs)
   tokenizer/config.json  the same configuration again, from which the
                          server's AutoTokenizer.from_pretrained chooses the

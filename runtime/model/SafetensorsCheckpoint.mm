@@ -68,7 +68,8 @@ constexpr size_t kMaxTensors = size_t{1} << 20;
 
 // Adds the tensors of a shard's header to tensors, whose count and the
 // checkpoint's metadataBytes are bounded, and sets where its data starts.
-void indexShard(WeightSource &file, TensorIndex &tensors, uint64_t &metadataBytes) {
+void indexShard(WeightSource &file, TensorIndex &tensors, uint64_t &metadataBytes,
+                 std::string_view prefix = {}) {
   if (file.bytes() < 8) throw WeightStoreError("truncated safetensors file");
   uint64_t headerBytes = 0;
   readWeightBytes(file.descriptor(), 0, {reinterpret_cast<uint8_t *>(&headerBytes), 8});
@@ -80,6 +81,11 @@ void indexShard(WeightSource &file, TensorIndex &tensors, uint64_t &metadataByte
   readWeightBytes(file.descriptor(), 8, {static_cast<uint8_t *>(header.mutableBytes), static_cast<size_t>(headerBytes)});
   NSDictionary *index = [NSJSONSerialization JSONObjectWithData:header options:0 error:nil];
   if (![index isKindOfClass:[NSDictionary class]]) throw WeightStoreError("invalid safetensors JSON object");
+  if (!prefix.empty()) {
+    NSDictionary *metadata = index[@"__metadata__"];
+    if (![metadata isKindOfClass:[NSDictionary class]] || ![metadata[@"format"] isEqual:@"mlx-serve-ngram"])
+      throw WeightStoreError("ngram_table.bin must be an mlx-serve-ngram safetensors table");
+  }
   std::vector<std::pair<uint64_t, uint64_t>> ranges;
   for (id key in index) {
     if (![key isKindOfClass:[NSString class]] || [key lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > 1024)
@@ -88,7 +94,7 @@ void indexShard(WeightSource &file, TensorIndex &tensors, uint64_t &metadataByte
     if (tensors.size() == kMaxTensors) throw WeightStoreError("source tensor metadata exceeds bounds");
     SourceTensor tensor = tensorRecord(index[key], file, file.bytes() - file.dataOffset());
     if (tensor.bytes) ranges.emplace_back(tensor.offset, tensor.offset + tensor.bytes);
-    const std::string name = [key UTF8String];
+    const std::string name = std::string(prefix) + [key UTF8String];
     if (!tensors.emplace(name, std::move(tensor)).second)
       throw WeightStoreError("duplicate source tensor: " + name);
   }
@@ -127,6 +133,13 @@ SafetensorsCheckpoint::SafetensorsCheckpoint(const std::filesystem::path &direct
         indexShard(*file, impl_->tensors, metadataBytes);
         impl_->files.push_back(std::move(file));
       }
+    }
+    // mlx-serve's sidecar uses the safetensors wire format, with the short
+    // tensor names weight, scales and biases (or just a BF16 weight).
+    if (std::filesystem::exists(directory / "ngram_table.bin")) {
+      auto table = std::make_unique<WeightSource>(directory / "ngram_table.bin");
+      indexShard(*table, impl_->tensors, metadataBytes, "ngram_table.");
+      impl_->files.push_back(std::move(table));
     }
   }
 }
