@@ -281,6 +281,13 @@ memory, a state's prefill command can end at the state's boundary instead of
 capturing it inside a longer command, which changes the chunks. Either way the
 logits differ slightly.
 
+With `--sampling-headers`, `X-Temperature` (above 0 up to 2) overrides the body's
+temperature, while `X-Presence-Penalty` (-2 to 2) and `X-Repetition-Penalty` (above
+0 up to 3) only fill a field the body leaves out. Claude Code's only per-request
+channel is `ANTHROPIC_CUSTOM_HEADERS`, so on the Messages route these headers are
+the only way to set the penalties, which Anthropic Messages does not define:
+`ANTHROPIC_CUSTOM_HEADERS="X-Temperature: 0.5" claude`.
+
 ## Output limits and streaming
 
 Chat's `max_completion_tokens` or `max_tokens`, Responses' `max_output_tokens`,

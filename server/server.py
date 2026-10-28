@@ -68,7 +68,7 @@ from .errors import (
     RequestValidationError,
     field_error,
 )
-from .frontend import Frontend
+from .frontend import Frontend, sampling_from_headers
 from .http_security import (
     OriginRefused,
     RefusedOriginLog,
@@ -712,6 +712,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
             body = {key: value for key, value in body.items() if value is not None}
             if route.fieldless and body:
                 raise APIError(400, "this endpoint takes no fields")
+            if self.app.sampling_headers and body:
+                body = sampling_from_headers(self.headers, body)
         serve = getattr(self, route.method)
         return serve(body, self.app.request_deadline(body, started_at))
 
@@ -774,6 +776,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
         chat, thinking_display = anthropic_to_chat_body(
             body, thinking_resolver=self.app.thinking_codec.decode
         )
+        # The translation keeps only temperature, top_p and top_k, so the
+        # headers apply to the chat body it produces.
+        if self.app.sampling_headers:
+            chat = sampling_from_headers(self.headers, chat)
         job = self.app.prepare(
             chat,
             deadline=deadline,
@@ -1849,6 +1855,7 @@ def main():
             thinking_codec=thinking_codec,
             served_model_names=args.served_model_name,
             announce_served_name=args.announce_served_name,
+            sampling_headers=args.sampling_headers,
             default_reasoning_effort=args.default_reasoning_effort,
             default_thinking_token_budget=args.thinking_token_budget,
             vision=readiness.vision,

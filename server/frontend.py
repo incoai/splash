@@ -92,6 +92,33 @@ TOP_K_DEFAULT = 20
 assert set(SAMPLING_NUMBERS) | {"top_k"} == set(wire.SAMPLING_FIELDS)
 
 
+def sampling_from_headers(headers, body):
+    """Set in body, which is returned, the sampling fields that a request's
+    X-Temperature, X-Presence-Penalty and X-Repetition-Penalty headers name.
+    Claude Code cannot put sampling fields in its body: its only per-request
+    channel is ANTHROPIC_CUSTOM_HEADERS, which adds headers. The temperature
+    header overrides the body; the penalties only fill a body that has none.
+    A value that does not parse, is NaN or is out of range is ignored, so a
+    header never fails a request."""
+    for header, name, accepts, overrides in (
+        ("X-Temperature", "temperature", lambda v: 0 < v <= 2, True),
+        ("X-Presence-Penalty", "presence_penalty", lambda v: -2 <= v <= 2, False),
+        ("X-Repetition-Penalty", "repetition_penalty", lambda v: 0 < v <= 3, False),
+    ):
+        value = headers.get(header)
+        if value is None:
+            continue
+        try:
+            number = float(str(value).strip())
+        except ValueError:
+            continue
+        if not is_finite_number(number) or not accepts(number):
+            continue
+        if overrides or name not in body:
+            body[name] = number
+    return body
+
+
 def _preparation_checkpoint(deadline, disconnected):
     """A check that a request's preparation may go on: its deadline has not
     passed, and its client has not left."""
@@ -251,6 +278,7 @@ class Frontend:
         max_image_pixels=image_input.MAX_PIXELS,
         served_model_names=(),
         announce_served_name=False,
+        sampling_headers=False,
         default_reasoning_effort=None,
         default_thinking_token_budget=None,
     ):
@@ -276,6 +304,8 @@ class Frontend:
             raise ValueError("announce_served_name needs a served model name")
         # The name generation and scoring responses report.
         self.response_model = served[0] if announce_served_name else model
+        # Whether a request's sampling headers set its sampling fields.
+        self.sampling_headers = bool(sampling_headers)
         # /v1/models order: the name responses report first, so a client
         # configured from data[0] (splash <client>) requests the name it gets
         # back. Every name stays accepted.
