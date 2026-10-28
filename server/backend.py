@@ -339,8 +339,14 @@ class NativeBackend:
         wire.FinishReason.CANCELLED: "cancelled",
     }
 
-    def __init__(self, runtime, tokenizer, request_logger, thinking_end=None):
+    def __init__(
+        self, runtime, tokenizer, request_logger, thinking_end=None, on_exit=None
+    ):
         self.runtime = runtime
+        # --engine-failure exit: called, in place of a relaunch, when an
+        # engine that reached Ready fails, so that the server exits and its
+        # supervisor starts it again. None relaunches in-process.
+        self.on_exit = on_exit
         self.tokenizer = tokenizer
         self.request_logger = request_logger
         # What the engine selects where a thinking budget runs out
@@ -399,6 +405,7 @@ class NativeBackend:
         )
 
     def _failed(self, event, failure):
+        exiting = False
         # Clients get the reason with every refusal until a status succeeds.
         with self.lock:
             if self.closing or self.stop_reason is not None:
@@ -407,13 +414,20 @@ class NativeBackend:
             if self.status_snapshot is not None:
                 # A failed engine's readiness is no longer evidence.
                 self.status_snapshot["ready"] = False
-            if failure.exit_status is not None:
-                self.failure_to_count = failure
-            delay = self.policy.after(failure)
-            if delay is None:
-                self._stop_restarting_locked(self._stop_message(failure))
+            if self.on_exit is not None and event == "Engine failed":
+                # --engine-failure exit: no relaunch is owed and the restart
+                # policy is not consulted, so requests until the server exits
+                # are refused as recovering (503), not as failed for good.
+                self.restart_due = None
+                exiting = True
             else:
-                self.restart_due = time.monotonic() + delay
+                if failure.exit_status is not None:
+                    self.failure_to_count = failure
+                delay = self.policy.after(failure)
+                if delay is None:
+                    self._stop_restarting_locked(self._stop_message(failure))
+                else:
+                    self.restart_due = time.monotonic() + delay
             stopped = self.stop_reason
             self._ensure_recovery_locked()
         print_status(f"{event} · {failure.message}", error=True)
@@ -421,6 +435,12 @@ class NativeBackend:
             print_status(f"Engine stopped · {stopped}", error=True)
             if self.on_stopped is not None:
                 self.on_stopped(stopped)
+        if exiting:
+            print_status(
+                "Exiting · --engine-failure exit leaves the restart to the supervisor",
+                error=True,
+            )
+            self.on_exit()
 
     def _closed_error_locked(self):
         """What a request gets from a server closing: why its engine stopped

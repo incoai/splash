@@ -97,6 +97,9 @@ DESCRIPTOR_LIMIT = 10240
 # EX_UNAVAILABLE.
 ENGINE_STOPPED_STATUS = os.EX_UNAVAILABLE
 SSE_KEEPALIVE_SECONDS = 2.0
+# The exit status of --engine-failure exit: EX_TEMPFAIL, a failure that a
+# restart may clear.
+ENGINE_FAILURE_EXIT_CODE = 75
 # A client gone without a FIN or RST (a Mac asleep, off its network) sends
 # nothing a non-streaming request reads; keepalive probes the idle connection
 # and drops it once its peer stops answering, 60 s after its last data.
@@ -1378,11 +1381,19 @@ def main():
             serve_record.warming(args.serve_record, event.steps_done, event.steps)
 
         runtime.on_warming = warming
+        engine_failed = threading.Event()
+
+        def exit_for_supervisor():
+            # serve_forever returns, and the finally below stops the engine.
+            engine_failed.set()
+            threading.Thread(target=server.shutdown, daemon=True).start()
+
         backend = NativeBackend(
             runtime,
             tokenizer,
             request_logger=print_request,
             thinking_end=thinking_end,
+            on_exit=exit_for_supervisor if args.engine_failure == "exit" else None,
         )
         # A server that serves nothing more stops as on SIGTERM and exits
         # ENGINE_STOPPED_STATUS below.
@@ -1423,6 +1434,8 @@ def main():
         mode = "" if served.vision else " · text only"
         print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
         server.serve_forever()
+        if engine_failed.is_set():
+            raise SystemExit(ENGINE_FAILURE_EXIT_CODE)
     except engine_runtime.EngineStartFailed as error:
         _start_failed(args, error, serve_record.engine_failure(error.event, str(error)))
     except ListenError as error:
