@@ -151,6 +151,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--cache-dir` | `~/Library/Caches/Splash/prefix-cache` | Where `--persistent-cache` keeps its files; needs `--persistent-cache`. |
 | `--served-model-name` | None | Additional model name the API accepts; repeatable. See [API model aliases](#api-model-aliases). |
 | `--announce-served-name` | Off | Report the first `--served-model-name` in responses; needs `--served-model-name`. |
+| `--sampling-default` | None (the served family's published `temperature`, `top_p` and `top_k`; the neutral value for the rest) | Value of a sampling field that a request leaves out; repeatable, e.g. `temperature=0.6`. See [sampling](api.md#sampling). |
 | `--default-reasoning-effort` | `SPLASH_DEFAULT_REASONING_EFFORT` or the template's | Effort of Chat and Responses requests that set none. See [default reasoning effort](#default-reasoning-effort). |
 | `--thinking-token-budget` | `SPLASH_THINKING_TOKEN_BUDGET` or none | Thinking tokens of a request that sets no budget. See [thinking token budget](#thinking-token-budget). |
 | `--thinking-end-text` | `SPLASH_THINKING_END_TEXT` or the template's close | Text that ends thinking where a budget runs out, `</think>` its last token; unset, the close the chat template writes after a reasoning. See [thinking token budget](#thinking-token-budget). |
