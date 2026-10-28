@@ -319,6 +319,17 @@ def parse_api_key(value):
         raise argparse.ArgumentTypeError(str(error)) from None
 
 
+ENGINE_FAILURE_ACTIONS = ("relaunch", "exit")
+
+
+def parse_engine_failure(value):
+    if value not in ENGINE_FAILURE_ACTIONS:
+        raise argparse.ArgumentTypeError(
+            f"must be one of {', '.join(ENGINE_FAILURE_ACTIONS)}"
+        )
+    return value
+
+
 def parse_reasoning_effort(value):
     if value not in REASONING_EFFORTS:
         raise argparse.ArgumentTypeError(
@@ -675,6 +686,19 @@ SERVE_OPTIONS = (
             help="requests admitted at once, running or waiting; more get 503 "
             f"(default: {DEFAULT_QUEUE_SIZE})",
         ),
+    ),
+    ServeOption(
+        "--engine-failure",
+        "requests",
+        dict(
+            type=parse_engine_failure,
+            metavar="ACTION",
+            help="what a failure of an engine that was ready does: relaunch "
+            "starts a new engine in this server; exit stops the server with "
+            "status 75 so that a supervisor starts it again (default: "
+            "SPLASH_ENGINE_FAILURE, else relaunch)",
+        ),
+        environment="SPLASH_ENGINE_FAILURE",
     ),
     ServeOption(
         "--decode-share",

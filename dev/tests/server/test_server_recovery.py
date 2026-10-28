@@ -71,9 +71,9 @@ class ServerRecoveryTests(HarnessTestCase):
                 raise AssertionError("test condition did not become true")
             time.sleep(0.005)
 
-    def backend(self, runtime):
+    def backend(self, runtime, on_exit=None):
         backend = backend_api.NativeBackend(
-            runtime, FakeTokenizer(), lambda _record: None
+            runtime, FakeTokenizer(), lambda _record: None, on_exit=on_exit
         )
         self.addCleanup(backend.close)
         return backend
@@ -217,6 +217,49 @@ class ServerRecoveryTests(HarnessTestCase):
                 f"Engine stopped · {backend.fatal_error}",
             ],
         )
+
+    def test_engine_failure_with_exit_calls_on_exit_and_owes_no_relaunch(self):
+        runtime = RecoveringRuntime()
+        exits = []
+        backend = self.backend(runtime, on_exit=lambda: exits.append(True))
+        with mock.patch.object(backend_api, "print_status") as console:
+            runtime.fail(backend)
+            self.assertEqual(exits, [True])
+            self.assertIsNone(backend.restart_due)
+            refusal = backend.refusal()
+        self.assertEqual((refusal.status, refusal.code), (503, "engine_recovering"))
+        self.assertIn("native protocol reached EOF", refusal.message)
+        self.assertIn(
+            "Exiting · --engine-failure exit",
+            [call.args[0] for call in console.call_args_list][-1],
+        )
+        self.assertEqual(exits, [True])
+        time.sleep(0.05)
+        self.assertEqual(runtime.startup_calls, 0)
+
+    def test_engine_restart_failure_with_exit_follows_the_normal_path(self):
+        runtime = RecoveringRuntime()
+        exits = []
+        backend = self.backend(runtime, on_exit=lambda: exits.append(True))
+        with mock.patch.object(backend_api, "print_status"):
+            backend._failed(
+                "Engine restart failed",
+                engine_runtime.EngineUnhealthy("bad start"),
+                0.0,
+            )
+        self.assertEqual(exits, [])
+        self.assertIsNotNone(backend.restart_due)
+        self.relaunched(runtime, backend)
+        self.assertEqual(runtime.startup_calls, 1)
+
+    def test_engine_failure_without_exit_still_schedules_a_relaunch(self):
+        runtime = RecoveringRuntime()
+        backend = self.backend(runtime)
+        with mock.patch.object(backend_api, "print_status"):
+            runtime.fail(backend)
+        self.assertIsNotNone(backend.restart_due)
+        self.relaunched(runtime, backend)
+        self.assertEqual(runtime.startup_calls, 1)
 
     def test_changed_ready_limits_stop_restarting_at_once(self):
         factory = FakeFactory(handler=answer_status)
