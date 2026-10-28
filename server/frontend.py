@@ -92,6 +92,25 @@ TOP_K_DEFAULT = 20
 assert set(SAMPLING_NUMBERS) | {"top_k"} == set(wire.SAMPLING_FIELDS)
 
 
+def sampling_defaults(pairs):
+    """--sampling-default's (name, value) pairs as name -> value, the last of
+    a name winning. Each value passes the check a request's own value meets,
+    so a default never makes a request that sets nothing fail."""
+    defaults = {}
+    for name, value in pairs:
+        if name == "top_k":
+            if not isinstance(value, int) or isinstance(value, bool) or value < -1:
+                raise ValueError(
+                    "top_k must be 0 or -1 (disabled) or a positive integer"
+                )
+        else:
+            _, accepts, requirement = SAMPLING_NUMBERS[name]
+            if not is_finite_number(value) or not accepts(value):
+                raise ValueError(f"{name} must be {requirement}")
+        defaults[name] = value
+    return defaults
+
+
 def _preparation_checkpoint(deadline, disconnected):
     """A check that a request's preparation may go on: its deadline has not
     passed, and its client has not left."""
@@ -253,6 +272,7 @@ class Frontend:
         announce_served_name=False,
         default_reasoning_effort=None,
         default_thinking_token_budget=None,
+        sampling_default=(),
     ):
         if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
             raise ValueError("frontend preparation capacity must be positive")
@@ -293,6 +313,9 @@ class Frontend:
         ):
             raise ValueError("invalid default_thinking_token_budget")
         self.default_thinking_token_budget = default_thinking_token_budget
+        # A sampling parameter a request leaves out takes its value from
+        # here, before SAMPLING_NUMBERS' and TOP_K_DEFAULT's.
+        self.sampling_defaults = sampling_defaults(sampling_default)
         self.max_context = max_context
         self.request_timeout = request_timeout
         self.constraint_factory = constraint_factory
@@ -1143,7 +1166,7 @@ class Frontend:
     def _generation_options(self, body):
         numbers = {}
         for name, (default, accepts, requirement) in SAMPLING_NUMBERS.items():
-            value = body.get(name, default)
+            value = body.get(name, self.sampling_defaults.get(name, default))
             if not is_finite_number(value) or not accepts(value):
                 raise APIError(400, f"{name} must be {requirement}")
             numbers[name] = float(value)
@@ -1152,7 +1175,7 @@ class Frontend:
         # A top_k of 0 or -1 keeps every token, which the frame says with 0. A
         # top_k past the vocabulary keeps every token too, so one past the
         # frame's u32 is sent as its largest value.
-        top_k = body.get("top_k", TOP_K_DEFAULT)
+        top_k = body.get("top_k", self.sampling_defaults.get("top_k", TOP_K_DEFAULT))
         if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < -1:
             raise APIError(
                 400, "top_k must be 0 or -1 (disabled) or a positive integer"

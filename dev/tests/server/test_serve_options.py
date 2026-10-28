@@ -60,6 +60,12 @@ OPTIONS = {
         ("", "has space", "a?b", "a#b", "a%b", "a\\b", "/a", "a//b", "a/../b"),
         repeatable=True,
     ),
+    "--sampling-default": values(
+        "--sampling-default",
+        {"temperature=0.6": ("temperature", 0.6), "top_k=40": ("top_k", 40)},
+        ("temperature", "nope=1", "top_k=1.5", "top_p=x"),
+        repeatable=True,
+    ),
     "--announce-served-name": (
         [(["--announce-served-name", "--served-model-name=local"], True)],
         [["--announce-served-name"]],
@@ -329,6 +335,11 @@ class ServeOptionsTests(unittest.TestCase):
                     getattr(parse(required), option.dest).append("changed")
                     self.assertEqual(getattr(parse(required), option.dest), [])
 
+    def test_server_refuses_a_sampling_default_no_request_may_set(self):
+        self.refuse(
+            api.parse_args, [*SERVER_ARGS, "--sampling-default", "temperature=5"]
+        )
+
     def test_launcher_forwards_exactly_what_the_server_parses(self):
         launched = [
             *(
@@ -339,6 +350,7 @@ class ServeOptionsTests(unittest.TestCase):
             ),
             # A repeatable option keeps every value, in order.
             "--served-model-name=stable",
+            "--sampling-default=presence_penalty=1.5",
             "--allowed-host=proxy.local",
             "--allowed-origin=tauri://localhost",
         ]
