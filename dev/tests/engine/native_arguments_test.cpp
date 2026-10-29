@@ -183,6 +183,18 @@ void testServerCommandLines(const char *path) {
       // Auto is the engine's default, which the server leaves out.
       {"expert_memory_auto", [](NativeArguments &) {}},
       {"sparse_kv_memory", [](NativeArguments &read) { read.sparseKvMemory = 1200 * (kGiB >> 10); }},
+      {"control_vector", [](NativeArguments &read) { read.controlVector.path = "/srv/steer.gguf"; }},
+      {"control_vector_options",
+       [](NativeArguments &read) {
+         read.controlVector = {.path = "/srv/steer.gguf",
+                               .scale = 0.5F,
+                               .firstLayer = 4,
+                               .lastLayer = 44,
+                               .mode = model::ControlVectorMode::Project};
+       }},
+      // The scale 1 and add are the engine's defaults, which the server
+      // leaves out.
+      {"control_vector_defaults", [](NativeArguments &read) { read.controlVector.path = "/srv/steer.gguf"; }},
   };
   // Every field but the model inspected from the directory, whose RoPE
   // scaling MAX_CONTEXT sets.
@@ -203,7 +215,7 @@ void testServerCommandLines(const char *path) {
            read.neuralEngine == meant.neuralEngine && read.pleMemory == meant.pleMemory &&
            read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
            read.kvSpillAlways == meant.kvSpillAlways && read.kvWindowTrim == meant.kvWindowTrim &&
-           read.verifyRows == meant.verifyRows;
+           read.verifyRows == meant.verifyRows && read.controlVector == meant.controlVector;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -298,6 +310,21 @@ void testRefusals() {
             "--expert-memory requires a positive byte count, auto or off");
   for (const char *size : {"0", "off", "1200M", ""})
     refuses({"auto", "auto", "--sparse-kv-memory", size}, "--sparse-kv-memory requires a positive byte count or auto");
+  refuses({"auto", "auto", "--control-vector", ""}, "--control-vector requires a file");
+  for (const char *scale : {"nan", "inf", "1e39", "half", ""})
+    refuses({"auto", "auto", "--control-vector", "/srv/steer.gguf", "--control-vector-scale", scale},
+            "--control-vector-scale requires a finite number");
+  for (const char *range : {"44-4", "4", "4-", "-4", "a-b", "4-44-48", ""})
+    refuses({"auto", "auto", "--control-vector", "/srv/steer.gguf", "--control-vector-layer-range", range},
+            "--control-vector-layer-range requires FIRST-LAST, two layers in order");
+  for (const char *mode : {"subtract", "PROJECT", ""})
+    refuses({"auto", "auto", "--control-vector", "/srv/steer.gguf", "--control-vector-mode", mode},
+            "--control-vector-mode requires add or project");
+  // A vector's settings without the vector.
+  for (const auto &[option, value] : {std::pair{"--control-vector-scale", "0.5"},
+                                      std::pair{"--control-vector-layer-range", "4-44"},
+                                      std::pair{"--control-vector-mode", "project"}})
+    refuses({"auto", "auto", option, value}, "require --control-vector");
   for (const char *spill : {"never", "auto", ""})
     refuses({"auto", "auto", "--kv-spill", spill}, "--kv-spill requires always");
   for (const char *trim : {"never", "auto", ""})

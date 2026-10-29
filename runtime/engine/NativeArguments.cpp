@@ -89,6 +89,19 @@ StreamedSetting parseStreamedSetting(std::string_view option, std::string_view v
   return result;
 }
 
+// FIRST-LAST, two layers, the first no later than the last.
+void parseLayerRange(std::string_view value, model::ControlVectorOptions &result) {
+  const size_t dash = value.find('-');
+  const auto layer = [](std::string_view text, uint32_t &layer) {
+    const char *end = text.data() + text.size();
+    const auto parsed = std::from_chars(text.data(), end, layer);
+    return !text.empty() && parsed.ec == std::errc{} && parsed.ptr == end;
+  };
+  if (dash == std::string_view::npos || !layer(value.substr(0, dash), result.firstLayer) ||
+      !layer(value.substr(dash + 1), result.lastLayer) || result.firstLayer > result.lastLayer)
+    throw UsageError("--control-vector-layer-range requires FIRST-LAST, two layers in order");
+}
+
 std::filesystem::path requireModelRoot(std::string_view argument) {
   std::error_code error;
   const std::filesystem::path root =
@@ -112,6 +125,8 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
   NativeArguments result;
   // Read once the model's own context is known.
   std::optional<std::string_view> relaunchContext;
+  // Whether a control vector's scale, range or mode was given.
+  bool steeringOptions = false;
   int next = 5;
   if (next < argc && !std::string_view(argv[next]).starts_with("--")) {
     const std::string_view quota(argv[next++]);
@@ -178,6 +193,25 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "auto" && value != "all")
         throw UsageError("--verify-rows requires auto or all");
       result.verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
+    } else if (option == "--control-vector") {
+      if (value.empty())
+        throw UsageError("--control-vector requires a file");
+      result.controlVector.path = std::filesystem::absolute(std::filesystem::path(value));
+    } else if (option == "--control-vector-scale") {
+      double scale = 0.0;
+      if (!parseFinite(value, scale) || std::fabs(scale) > std::numeric_limits<float>::max())
+        throw UsageError("--control-vector-scale requires a finite number");
+      result.controlVector.scale = static_cast<float>(scale);
+      steeringOptions = true;
+    } else if (option == "--control-vector-layer-range") {
+      parseLayerRange(value, result.controlVector);
+      steeringOptions = true;
+    } else if (option == "--control-vector-mode") {
+      if (value != "add" && value != "project")
+        throw UsageError("--control-vector-mode requires add or project");
+      result.controlVector.mode =
+          value == "project" ? model::ControlVectorMode::Project : model::ControlVectorMode::Add;
+      steeringOptions = true;
     } else if (option == "--relaunch-context") {
       relaunchContext = value;
     } else {
@@ -190,6 +224,9 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
     throw UsageError("--max-cache-disk-writes requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
   if (!result.cacheRoot.empty() && !result.persistentCache)
     throw UsageError("--cache-dir requires --persistent-cache on");
+  if (steeringOptions && !result.controlVector)
+    throw UsageError("--control-vector-scale, --control-vector-layer-range and --control-vector-mode require "
+                     "--control-vector");
   result.modelRoot = requireModelRoot(argv[2]);
   model::ModelDescriptor inspected = model::inspectModelRoot(result.modelRoot);
   result.maxContext = parseMaxContext(argv[3]);

@@ -16,7 +16,10 @@
 //   the tail block after the row's complete ones), with YaRN too, to the end
 //   of its window; the scratch a target's window takes;
 // - the capture of a layer's output for the DFlash2 draft (the mean of its
-//   streams); the GPU PLE hash against the CPU's.
+//   streams); the GPU PLE hash against the CPU's;
+// - a control vector: its kernel's projection and addition on every stream
+//   of the rows, and its GGUF as model/ControlVector.cpp reads it, refusals
+//   included.
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/model/Qwen4Exp.hpp"
@@ -24,9 +27,14 @@
 #include "../../../runtime/ops/BlockIndexer.hpp"
 #include "../../../runtime/ops/HyperConnection.hpp"
 #include "../../../runtime/ops/NgramEmbedding.hpp"
+#include "../../../runtime/ops/ResidualSteer.hpp"
 #include "../../../runtime/ops/RoPE.hpp"
 #include "../../../runtime/ops/Sampling.hpp"
+#include "../../../runtime/model/ControlVector.hpp"
+#include "../../../runtime/model/GgufFile.hpp"
 #include "LinearInputReference.hpp"
+#include "TestFiles.hpp"
+#include "TestGguf.hpp"
 #include "metal/abi/BlockIndexer.h"
 #include "metal/abi/KvExtent.h"
 #include "metal/abi/HyperConnection.h"
@@ -947,6 +955,216 @@ void pleHashTest(MetalBackend &backend) {
   check(ok, "PLE hash: GPU rows equal the CPU's");
 }
 
+// The control vector on a Qwen3.5-family target's bf16 residual
+// (ops::addResidualSteer): each steered row loses scale times its component
+// along the unit direction (project) or gains the scaled direction (add),
+// against an fp64 reference of the decoded bf16 inputs within their bf16
+// step; a projection of scale 1 leaves no component along the direction
+// beyond every value's bf16 rounding; the rows past the dispatch's, and the
+// other layers' directions, are not read or written. Both Qwen3.5 families'
+// hidden sizes and the decode dispatch's 1 to 32 rows.
+void residualSteerTest(MetalBackend &backend) {
+  std::mt19937 rng(31);
+  const uint32_t layers = 3, layer = 2, extra = 2;
+  for (const uint32_t hidden : {2048u, 5120u})
+    for (const uint32_t rows : {1u, 8u, 32u})
+      for (const bool project : {false, true})
+        for (const float scale : {1.0f, -0.5f, 2.0f}) {
+          std::vector<float> directions = randoms(rng, layers * hidden, 0.05f);
+          double squares = 0.0;
+          for (uint32_t d = 0; d < hidden; ++d)
+            squares += double(directions[layer * hidden + d]) * directions[layer * hidden + d];
+          if (project)
+            for (uint32_t d = 0; d < hidden; ++d)
+              directions[layer * hidden + d] = float(directions[layer * hidden + d] / std::sqrt(squares));
+          const auto values = bf16s(randoms(rng, (rows + extra) * hidden, 3.0f));
+          MetalBuffer residual = upload(backend, values);
+          CommandGraph graph;
+          ops::addResidualSteer(graph, residual, upload(backend, directions), {layer, project, scale}, hidden, rows);
+          run(backend, graph);
+          const auto got = download<uint16_t>(residual, values.size());
+          const float *v = directions.data() + layer * hidden;
+          bool ok = true, orthogonal = true;
+          for (uint32_t r = 0; r < rows + extra; ++r) {
+            const uint16_t *x = values.data() + r * hidden;
+            const uint16_t *y = got.data() + r * hidden;
+            if (r >= rows) {
+              ok &= std::memcmp(x, y, hidden * sizeof(uint16_t)) == 0;
+              continue;
+            }
+            double dot = 0.0, after = 0.0, rowSquares = 0.0;
+            for (uint32_t d = 0; d < hidden; ++d) dot += double(f32(x[d])) * v[d];
+            for (uint32_t d = 0; d < hidden; ++d) {
+              const double in = f32(x[d]);
+              const double want = project ? in - scale * dot * v[d] : in + double(scale) * v[d];
+              ok &= closeBf16(f32(y[d]), want, 1e-2);
+              after += double(f32(y[d])) * v[d];
+              rowSquares += in * in;
+            }
+            if (project && scale == 1.0f) orthogonal &= std::fabs(after) <= 0.02 * std::sqrt(rowSquares);
+          }
+          check(ok && orthogonal, std::string("residual steer ") + (project ? "project" : "add") + ", " +
+                                      std::to_string(hidden) + " values x " + std::to_string(rows) + " rows");
+        }
+}
+
+// The control vector after a steered layer: each stream of each of the
+// dispatch's rows loses scale times its component along the unit direction
+// (project) or gains the scaled direction (add), against an fp64 reference,
+// and a projection of scale 1 leaves no component along it; the rows past
+// the dispatch's, and the other layers' directions, are not read or written.
+void steerTest(MetalBackend &backend) {
+  std::mt19937 rng(23);
+  const uint32_t layers = 3, layer = 2, extra = 2;
+  for (const uint32_t rows : {1u, 8u, 32u})
+    for (const bool project : {false, true})
+      for (const float scale : {1.0f, -0.5f, 2.0f}) {
+        std::vector<float> directions = randoms(rng, layers * kHidden, 0.05f);
+        double squares = 0.0;
+        for (uint32_t d = 0; d < kHidden; ++d) squares += double(directions[layer * kHidden + d]) * directions[layer * kHidden + d];
+        if (project)
+          for (uint32_t d = 0; d < kHidden; ++d)
+            directions[layer * kHidden + d] = float(directions[layer * kHidden + d] / std::sqrt(squares));
+        const auto values = randoms(rng, (rows + extra) * kStreams * kHidden, 3.0f);
+        MetalBuffer streams = upload(backend, values);
+        CommandGraph graph;
+        ops::HyperConnection::addSteer(graph, streams, upload(backend, directions), {layer, project, scale},
+                                       {kHidden, kStreams, kRank}, rows);
+        run(backend, graph);
+        const auto got = download<float>(streams, values.size());
+        const float *v = directions.data() + layer * kHidden;
+        bool ok = true, orthogonal = true;
+        for (uint32_t r = 0; r < rows + extra; ++r)
+          for (uint32_t s = 0; s < kStreams; ++s) {
+            const float *x = values.data() + (r * kStreams + s) * kHidden;
+            const float *y = got.data() + (r * kStreams + s) * kHidden;
+            if (r >= rows) {
+              ok &= std::memcmp(x, y, kHidden * sizeof(float)) == 0;
+              continue;
+            }
+            double dot = 0.0, after = 0.0;
+            for (uint32_t d = 0; d < kHidden; ++d) dot += double(x[d]) * v[d];
+            for (uint32_t d = 0; d < kHidden; ++d) {
+              const double want = project ? x[d] - scale * dot * v[d] : x[d] + double(scale) * v[d];
+              ok &= std::fabs(y[d] - want) <= 1e-5 * std::fabs(want) + 1e-5;
+              after += double(y[d]) * v[d];
+            }
+            if (project && scale == 1.0f) orthogonal &= std::fabs(after) <= 1e-4;
+          }
+        check(ok && orthogonal, std::string("control vector ") + (project ? "project" : "add") + ", " +
+                                    std::to_string(rows) + " rows, scale " + std::to_string(scale));
+      }
+}
+
+// A control vector's GGUF as llama.cpp writes one, of `tensors` directions.
+std::filesystem::path controlVectorFile(const std::filesystem::path &directory, std::string_view name,
+                                        const std::vector<splash::test::gguf::Tensor> &tensors,
+                                        std::string_view architecture = "controlvector",
+                                        std::string_view hint = "qwen4exp") {
+  namespace gguf = splash::test::gguf;
+  std::vector<gguf::Key> keys{gguf::stringKey("general.architecture", architecture)};
+  if (!hint.empty()) keys.push_back(gguf::stringKey("controlvector.model_hint", hint));
+  keys.push_back(gguf::uint32Key("controlvector.layer_count", static_cast<uint32_t>(tensors.size())));
+  const std::filesystem::path path = directory / name;
+  splash::test::writeFile(path, gguf::file(keys, tensors));
+  return path;
+}
+
+splash::test::gguf::Tensor direction(uint32_t layer, const std::vector<float> &values,
+                                     uint32_t type = splash::model::ggml::kF32) {
+  splash::test::gguf::Tensor tensor{"direction." + std::to_string(layer), {values.size()}, type, {}};
+  const auto *bytes = reinterpret_cast<const uint8_t *>(values.data());
+  tensor.data.assign(bytes, bytes + values.size() * sizeof(float));
+  return tensor;
+}
+
+// The file of a target of 6 layers of 8 values: its directions in the range
+// with a nonzero one, a projection's of unit length, the others zero; what
+// it does named by its mode, scale, layers and directions; its upload; and
+// the files and ranges it refuses, with why.
+void controlVectorFileTest(MetalBackend &backend) {
+  namespace gguf = splash::test::gguf;
+  const splash::test::TemporaryDirectory directory("splash-control-vector");
+  const uint32_t layers = 6, hidden = 8;
+  std::vector<gguf::Tensor> tensors;
+  for (uint32_t layer = 1; layer < layers; ++layer) {
+    std::vector<float> values(hidden);
+    for (uint32_t d = 0; d < hidden; ++d) values[d] = layer == 3 ? 0.0f : float(layer) * (d % 3 == 0 ? 2.0f : -1.0f);
+    tensors.push_back(direction(layer, values));
+  }
+  const std::filesystem::path file = controlVectorFile(directory.path(), "vector.gguf", tensors);
+  const auto read = [&](model::ControlVectorOptions options) {
+    if (options.path.empty()) options.path = file;
+    return model::readControlVector(options, "qwen4exp", layers, hidden);
+  };
+  const model::ControlVectorTable added = read({.scale = 0.5f});
+  bool ok = added.layers == std::vector<uint32_t>{1, 2, 4, 5} && added.mode == model::ControlVectorMode::Add &&
+            added.scale == 0.5f && added.directions.size() == layers * hidden;
+  for (uint32_t layer = 0; layer < layers; ++layer)
+    for (uint32_t d = 0; d < hidden; ++d) {
+      const float want = layer == 0 || layer == 3 ? 0.0f : float(layer) * (d % 3 == 0 ? 2.0f : -1.0f);
+      ok &= added.directions[layer * hidden + d] == want;
+    }
+  check(ok, "control vector file: added directions as the file holds them, layers with one");
+  const model::ControlVectorTable projected =
+      read({.firstLayer = 2, .lastLayer = 4, .mode = model::ControlVectorMode::Project});
+  ok = projected.layers == std::vector<uint32_t>{2, 4};
+  for (uint32_t layer = 0; layer < layers; ++layer) {
+    double squares = 0.0;
+    for (uint32_t d = 0; d < hidden; ++d) squares += double(projected.directions[layer * hidden + d]) * projected.directions[layer * hidden + d];
+    ok &= std::fabs(squares - (layer == 2 || layer == 4 ? 1.0 : 0.0)) < 1e-6;
+  }
+  check(ok, "control vector file: a projection's directions of unit length, in its range only");
+  const auto sha = [&](model::ControlVectorOptions options) { return read(options).sha256; };
+  check(sha({}) == sha({}) && sha({}) != sha({.scale = 0.5f}) &&
+            sha({}) != sha({.mode = model::ControlVectorMode::Project}) && sha({}) != sha({.firstLayer = 2}) &&
+            sha({.firstLayer = 0, .lastLayer = 2}) == sha({.firstLayer = 1, .lastLayer = 2}) &&
+            sha({}) == sha({.lastLayer = 5}),
+        "control vector file: its digest names what it does");
+  const model::ControlVector loaded = model::loadControlVector(backend, projected);
+  check(loaded.steers(2) && loaded.steers(4) && !loaded.steers(3) && !loaded.steers(0) &&
+            loaded.describe() == "project, layers 2..4 (2 steered), scale 1" &&
+            download<float>(loaded.directions, layers * hidden) == projected.directions,
+        "control vector file: its upload");
+
+  const auto refuses = [&](const std::filesystem::path &path, model::ControlVectorOptions options,
+                           std::string_view why) {
+    options.path = path;
+    try {
+      static_cast<void>(model::readControlVector(options, "qwen4exp", layers, hidden));
+    } catch (const std::exception &error) {
+      const bool ok = std::string_view(error.what()).find(why) != std::string_view::npos;
+      if (!ok) std::cout << "  refused with: " << error.what() << '\n';
+      check(ok, "control vector file refused: " + std::string(why));
+      return;
+    }
+    check(false, "control vector file refused: " + std::string(why));
+  };
+  const std::vector<float> values(hidden, 1.0f);
+  refuses(controlVectorFile(directory.path(), "llama.gguf", {direction(1, values)}, "llama"), {},
+          "general.architecture is not controlvector");
+  refuses(controlVectorFile(directory.path(), "hint.gguf", {direction(1, values)}, "controlvector", "qwen35"), {},
+          "it is for qwen35, the target is qwen4exp");
+  refuses(controlVectorFile(directory.path(), "zero.gguf", {direction(0, values)}), {}, "direction.0 names no layer");
+  refuses(controlVectorFile(directory.path(), "past.gguf", {direction(6, values)}), {}, "direction.6 names no layer");
+  refuses(controlVectorFile(directory.path(), "name.gguf", {{"output.weight", {hidden}, model::ggml::kF32,
+                                                              gguf::Bytes(hidden * sizeof(float))}}),
+          {}, "tensor output.weight is not a direction.L");
+  refuses(controlVectorFile(directory.path(), "f16.gguf", {direction(1, values, model::ggml::kF16)}), {},
+          "direction.1 is not F32 of 8 values");
+  refuses(controlVectorFile(directory.path(), "width.gguf", {direction(1, std::vector<float>(hidden * 2, 1.0f))}),
+          {}, "direction.1 is not F32 of 8 values");
+  refuses(controlVectorFile(directory.path(), "nan.gguf",
+                            {direction(1, {1.0f, std::numeric_limits<float>::quiet_NaN(), 0, 0, 0, 0, 0, 0})}),
+          {}, "direction.1 holds a value that is not finite");
+  refuses(controlVectorFile(directory.path(), "none.gguf", {direction(1, std::vector<float>(hidden, 0.0f))}), {},
+          "it steers no layer");
+  refuses(file, {.firstLayer = 3, .lastLayer = 3}, "it steers no layer");
+  refuses(file, {.firstLayer = 6}, "lies outside the target's 6 layers");
+  refuses(file, {.firstLayer = 4, .lastLayer = 2}, "lies outside the target's 6 layers");
+  refuses(file, {.scale = std::numeric_limits<float>::infinity()}, "the scale is not finite");
+}
+
 } // namespace
 
 int main(int argc, const char *argv[]) {
@@ -988,6 +1206,9 @@ int main(int argc, const char *argv[]) {
         qsaSelectRefusesNarrowScratch(backend);
         streamMeanTest(backend);
         pleHashTest(backend);
+        steerTest(backend);
+        residualSteerTest(backend);
+        controlVectorFileTest(backend);
       }
     } catch (const std::exception &error) {
       std::cerr << "qwen4 kernel test error: " << error.what() << '\n';

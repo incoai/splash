@@ -60,6 +60,10 @@ struct RuntimeCacheIdentity {
   model::RopeScaling ropeScaling;
   // The target model's manifest.
   std::string targetModelSha256;
+  // What the target's control vector does (model::ControlVector::sha256),
+  // which every state and KV page it computed went through; empty without
+  // one.
+  std::string controlVectorSha256;
 };
 
 [[nodiscard]] RuntimeCacheIdentity
@@ -161,6 +165,9 @@ struct RuntimeResourcesConfig {
   // (model::budgetsVerifyRows); a benchmark round verifies every row so that
   // rounds repeat one another.
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // --control-vector: the control vector the target runs, which names the
+  // persistent caches it computes; no file for none.
+  model::ControlVectorOptions controlVector;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.

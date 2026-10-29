@@ -40,3 +40,6 @@ expert_memory | --expert-memory 16G | auto auto --expert-memory 17179869184
 expert_memory_off | --expert-memory off | auto auto --expert-memory off
 expert_memory_auto | --expert-memory auto --ple-memory auto | auto auto
 sparse_kv_memory | --sparse-kv-memory 1200M | auto auto --sparse-kv-memory 1258291200
+control_vector | --control-vector /srv/steer.gguf | auto auto --control-vector /srv/steer.gguf
+control_vector_options | --control-vector /srv/steer.gguf --control-vector-scale 0.5 --control-vector-layer-range 4-44 --control-vector-mode project | auto auto --control-vector /srv/steer.gguf --control-vector-scale 0.5 --control-vector-layer-range 4-44 --control-vector-mode project
+control_vector_defaults | --control-vector /srv/steer.gguf --control-vector-scale 1 --control-vector-mode add | auto auto --control-vector /srv/steer.gguf
