@@ -29,7 +29,7 @@ from .chat_templates import (
     render_chat_template,
     template_options,
 )
-from .diagnostics import print_status
+from .diagnostics import print_request, print_status
 from .errors import (
     APIError,
     ContextLengthError,
@@ -37,6 +37,7 @@ from .errors import (
     field_error,
 )
 from .latency import LatencyMetrics
+from .llama_cpp_compat import lane_map as compat_lane_map
 from .lru import LRUCache
 from .metrics import is_finite_number
 from .serve_options import REASONING_EFFORTS, parse_served_model_name
@@ -251,6 +252,8 @@ class Frontend:
         max_image_pixels=image_input.MAX_PIXELS,
         served_model_names=(),
         announce_served_name=False,
+        llama_cpp_compat=False,
+        llama_cpp_queue_size=1,
         default_reasoning_effort=None,
         default_thinking_token_budget=None,
     ):
@@ -276,6 +279,20 @@ class Frontend:
             raise ValueError("announce_served_name needs a served model name")
         # The name generation and scoring responses report.
         self.response_model = served[0] if announce_served_name else model
+        # --llama-cpp-compat (llama_cpp_compat): the lane map a generation
+        # response stamps as id_slot; None without the option, which stamps
+        # nothing and accepts no id_slot. It folds each request's terminal
+        # into the map by wrapping the log records the backend runs through
+        # its request_logger (NativeBackend), which is why the wiring runs
+        # here: the map must exist before any job does, and the backend is
+        # built with this frontend's log_request as its own logger.
+        self.llama_cpp_compat = bool(llama_cpp_compat)
+        self.lane_map = None
+        # The console's request logger, which the compat wiring wraps.
+        self.log_request = print_request
+        if self.llama_cpp_compat:
+            self.lane_map = compat_lane_map(self, llama_cpp_queue_size)
+            backend.request_logger = self.log_request
         # /v1/models order: the name responses report first, so a client
         # configured from data[0] (splash <client>) requests the name it gets
         # back. Every name stays accepted.
@@ -306,6 +323,10 @@ class Frontend:
         self.preparation_waiting = 0
         self.response_store = ResponseStore()
         self.thinking_codec = thinking_codec
+
+    def log_compat(self, message):
+        """One console line from --llama-cpp-compat (llama_cpp_compat)."""
+        print_status(f"Compat · {message}", error=True)
 
     def accepts_model(self, model):
         """Whether a request may name `model`: a name the server answers to,
@@ -532,6 +553,7 @@ class Frontend:
                 raise APIError(
                     404, f"model {body['model']} not found", "model_not_found"
                 )
+            self._check_id_slot(body)
             # A request generates one text and returns only that text.
             for field in ("suffix", "logprobs"):
                 if field in body:
@@ -557,7 +579,13 @@ class Frontend:
                 prompt_tokens,
                 "max_tokens",
             )
-            return self._generation_job(options, prompt_tokens, max_new, deadline)
+            return self._generation_job(
+                options,
+                prompt_tokens,
+                max_new,
+                deadline,
+                id_slot=self._lane_of(body),
+            )
 
     def _completion_prompt(self, prompt):
         """A string encodes as a raw prompt, with the tokenizer's own special
@@ -869,6 +897,12 @@ class Frontend:
             self.preparation_active -= 1
         self.preparation_slots.release()
 
+    def _lane_of(self, body):
+        """The lane --llama-cpp-compat reads from a generation body. A Chat
+        body is the request's own, except for a Messages request, whose
+        translation carries the field over (anthropic_to_chat_body)."""
+        return body.get("id_slot") if self.llama_cpp_compat else None
+
     def _prepare_prompt(self, body, tool_namespaces, *, deadline, without_slot):
         if not self.accepts_model(body.get("model")):
             raise APIError(404, f"model {body['model']} not found", "model_not_found")
@@ -1002,6 +1036,18 @@ class Frontend:
             rendered, tokens, images, positions, thinking, generation_prompt_tokens
         )
 
+    def _check_id_slot(self, body):
+        """id_slot, the lane a proxy pins the request to: accepted under
+        --llama-cpp-compat, where the response stamps it back, and refused as
+        an unsupported field without it."""
+        if "id_slot" not in body:
+            return
+        if not self.llama_cpp_compat:
+            raise APIError(400, "unsupported fields: id_slot")
+        value = body["id_slot"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise APIError(400, "id_slot must be a non-negative integer")
+
     def _prepare(
         self,
         body,
@@ -1013,7 +1059,10 @@ class Frontend:
         thinking_display,
     ):
         # Fields checked without the prompt fail before it is prepared, which
-        # can render documents and build validators.
+        # can render documents and build validators. The lane the proxy pinned
+        # the request to is the one field --llama-cpp-compat carries through
+        # this translation (llama_cpp_compat).
+        self._check_id_slot(body)
         options = self._generation_options(body)
         n = body.get("n", 1)
         logprobs = body.get("logprobs")
@@ -1118,6 +1167,7 @@ class Frontend:
             tools_signature=tools_signature,
             generation_prompt_tokens=rendered.generation_prompt_tokens,
             output_clamped_to_context=requested is not None and max_new < requested,
+            id_slot=self._lane_of(body),
         )
 
     def _call_openings(self, policy, thinking):
@@ -1221,10 +1271,20 @@ class Frontend:
             raise APIError(400, f"{field} must be a positive integer")
         return min(max_new, remaining)
 
-    def _generation_job(self, options, prompt_tokens, max_new, deadline, **fields):
+    def _generation_job(
+        self, options, prompt_tokens, max_new, deadline, *, id_slot, **fields
+    ):
         """The job for a prepared prompt, with the endpoint's own fields."""
+        request_id = next(self.ids)
+        if self.lane_map is not None:
+            # --llama-cpp-compat: the request takes its lane here, at the
+            # arrival of its generation, and holds it until the engine
+            # reports it done, errored or cancelled. A lane out of range is
+            # the proxy's own cap exceeded: the request still generates, it
+            # just gets no /slots row (llama_cpp_compat).
+            self.lane_map.note_slot(request_id, id_slot)
         return Job(
-            request_id=next(self.ids),
+            request_id=request_id,
             prompt_tokens=prompt_tokens,
             max_new_tokens=max_new,
             seed=options.seed,
@@ -1239,6 +1299,7 @@ class Frontend:
                 else wire.RequestFlag(0)
             ),
             public_id=secrets.token_hex(16),
+            lane_map=self.lane_map,
             **fields,
         )
 
@@ -1252,6 +1313,7 @@ class Frontend:
             not isinstance(previous_id, str) or not previous_id
         ):
             raise APIError(400, "previous_response_id must be a non-empty string")
+        self._check_id_slot(body)
         with self._preparation(deadline) as without_slot:
             previous_items = []
             if previous_id is not None:
@@ -1268,7 +1330,9 @@ class Frontend:
                 reserve_input(len(previous.history_json))
                 previous_items = json_codec.loads(previous.history_json)
             items = [*previous_items, *canonical_responses_input(body.get("input"))]
-            chat, namespaces = responses_to_chat_body(body, items)
+            chat, namespaces = responses_to_chat_body(
+                body, items, llama_cpp_compat=self.llama_cpp_compat
+            )
             job = self._prepare(
                 chat,
                 namespaces,

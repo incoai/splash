@@ -66,12 +66,14 @@ class DiagnosticsTests(HarnessTestCase):
         self.assertNotIn("queue_ms", record)
         self.assertNotIn("queue_ms", record["metrics"])
         self.assertNotIn("hello", json.dumps(records))
+        # The engine's lane rides along, for --llama-cpp-compat's cross-check.
+        self.assertEqual(started["lane"], 0)
 
         for logged, pattern in (
             (
                 started,
                 r"^\d{2}:\d{2}:\d{2} Started · input \d+ · cached \d+"
-                r" · effort none · thinking off\n$",
+                r" · lane \d+ · effort none · thinking off\n$",
             ),
             (record, r"^\d{2}:\d{2}:\d{2} Done · input [^\n]*\n$"),
         ):

@@ -70,6 +70,10 @@ def print_request(record):
             f"input {record['prompt_tokens']:,}",
             f"cached {record['cached_tokens']:,}",
         ]
+        if "lane" in record:
+            # The engine's own lane, shown only where a reader cares
+            # (--llama-cpp-compat cross-checks it against the proxy's).
+            parts.append(f"lane {record['lane']}")
         if "reasoning" in record:
             parts.extend(_reasoning_parts(record["reasoning"]))
         print_status(" · ".join(parts))

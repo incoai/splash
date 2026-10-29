@@ -502,7 +502,7 @@ class NativeBackendContractTests(unittest.TestCase):
             self.assertEqual(self.terminal(job)[0], "done")
         lines = [line.split(" ", 1)[1] for line in console.getvalue().splitlines()]
         self.assertEqual(len(lines), 2)
-        self.assertEqual(lines[0], "Started · input 4 · cached 0")
+        self.assertEqual(lines[0], "Started · input 4 · cached 0 · lane 0")
         self.assertTrue(lines[1].startswith("Done · input 4 · cached 0 · output 1"))
 
     def test_finalized_request_returns_its_image_budget(self):

@@ -30,6 +30,7 @@ from server import api_shapes, documents, images, serve_options
 from server import backend as backend_api
 from server import errors as api_errors
 from server import frontend as request_frontend
+from server import llama_cpp_compat as compat_wiring
 from server import protocol as wire
 from server import runtime as engine_runtime
 from server import server as api
@@ -785,6 +786,7 @@ def main_args(**overrides):
             "model": "test-model",
             "served_model_name": [],
             "announce_served_name": False,
+            "llama_cpp_compat": False,
             "default_reasoning_effort": None,
             "thinking_token_budget": None,
             "thinking_end_text": None,
@@ -906,9 +908,22 @@ class Harness:
         allowed_origins=(),
         vision=True,
         thinking_end=None,
+        llama_cpp_compat=False,
         **frontend_options,
     ):
         self.tokenizer = tokenizer or FakeTokenizer()
+        self.llama_cpp_compat = llama_cpp_compat
+        frontend_options["llama_cpp_compat"] = llama_cpp_compat
+        frontend_options["llama_cpp_queue_size"] = queue_size
+        # The window the status document reports, which /slots and /props
+        # translate as n_ctx; the fake engine answers a fixed document, so the
+        # harness gives it the window its frontend serves - unless the test
+        # built its own status document, which it owns.
+        if runtime.status_event == FakeRuntime().status_event:
+            runtime.status_event = native_peer.status_event(
+                maximum_context_tokens=max_context,
+                memory_plan={"model": {"model_name": "test-model"}},
+            )
         runtime.pending_limit = queue_size
         self.backend = backend_api.NativeBackend(
             runtime,
@@ -941,7 +956,10 @@ class Harness:
             max_request_bytes=max_request_bytes,
             allowed_hosts=allowed_hosts,
             allowed_origins=map(parse_allowed_origin, allowed_origins),
+            llama_cpp_compat=self.llama_cpp_compat,
         )
+        if self.llama_cpp_compat:
+            compat_wiring.attach_probes(self.server, self.app.lane_map, queue_size)
         # The server reads HTTP_IO_TIMEOUT per connection. A harness given its
         # own holds it until close(); patching only once setup has succeeded
         # never leaves it patched.
