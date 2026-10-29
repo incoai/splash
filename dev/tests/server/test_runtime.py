@@ -1962,6 +1962,120 @@ class RuntimeTests(unittest.TestCase):
         self.assertIsNotNone(factory.processes[0].wait(0.5))
         self.assertFalse(runtime.ready)
 
+    def guard_command(self, script):
+        """A --spawn-guard command in a script file, cleaned up after. The
+        marker names the script's path, so a test that waits on the guard
+        finds only its own processes."""
+        directory = self.enterContext(TemporaryDirectory())
+        path = Path(directory) / "guard.sh"
+        path.write_text(script)
+        return f"sh {path}"
+
+    def test_spawn_guard_exit_zero_lets_the_engine_spawn(self):
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory,
+            eager_start=True,
+            spawn_guard=self.guard_command("exit 0"),
+        )
+        self.addCleanup(runtime.close)
+        self.assertTrue(runtime.wait_ready(2))
+        self.assertEqual(len(factory.processes), 1)
+
+    def test_spawn_guard_refusal_names_its_stderr_and_spawns_nothing(self):
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory,
+            spawn_guard=self.guard_command("echo busy >&2; exit 3"),
+        )
+        self.addCleanup(runtime.close)
+        with self.assertRaises(engine_runtime.EngineUnhealthy) as caught:
+            runtime.wait_ready(2)
+        self.assertIn("busy", str(caught.exception))
+        self.assertEqual(factory.processes, [])
+
+    def test_spawn_guard_without_the_option_runs_no_subprocess(self):
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        self.addCleanup(runtime.close)
+        with mock.patch.object(engine_runtime.subprocess, "Popen") as spawned:
+            self.assertTrue(runtime.wait_ready(2))
+        spawned.assert_not_called()
+        self.assertEqual(len(factory.processes), 1)
+
+    def test_spawn_guard_sees_the_server_pid(self):
+        factory = FakeFactory()
+        directory = self.enterContext(TemporaryDirectory())
+        recorded = Path(directory) / "pid"
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory,
+            eager_start=True,
+            spawn_guard=f'printf %s "$SPLASH_SERVER_PID" > {recorded}',
+        )
+        self.addCleanup(runtime.close)
+        self.assertTrue(runtime.wait_ready(2))
+        self.assertEqual(int(recorded.read_text()), os.getpid())
+
+    def test_spawn_guard_past_the_deadline_is_killed_and_refused(self):
+        factory = FakeFactory()
+        directory = self.enterContext(TemporaryDirectory())
+        started = Path(directory) / "started"
+        # The guard waits far past the attempt's deadline, and ignores
+        # SIGTERM: only the attempt's kill ends it. The deadline kill takes
+        # the guard's whole process group, guard and sleep together.
+        guard = self.guard_command(f"touch {started}; trap '' TERM; sleep 30; exit 0")
+
+        groups = []
+        real_popen = engine_runtime.subprocess.Popen
+
+        def watch_popen(*args, **kwargs):
+            # The guard's process group is the Popen the option makes; the
+            # test waits on exactly that group, not on any other sleep.
+            child = real_popen(*args, **kwargs)
+            groups.append(child.pid)
+            return child
+
+        def wait_guard_out(own):
+            # The attempt's deadline is short; on a busy box the guard's
+            # death can land a beat after the attempt already failed. Wait
+            # only for the group this test started. A group whose leader is
+            # reaped is gone: the watchdog killed the whole group with it.
+            limit = time.monotonic() + 2.0
+            while time.monotonic() < limit:
+                try:
+                    os.kill(own[0], 0)
+                except ProcessLookupError:
+                    return True
+                time.sleep(0.05)
+            return False
+
+        messages = []
+        for _round in range(3):
+            # The guard's refusal and the attempt's own expiry race at the
+            # deadline; the guard wins on a quiet box and loses one beat
+            # into a loaded one. Either way nothing spawns and the guard
+            # dies; the message check runs on a round that recorded it.
+            groups.clear()
+            started.unlink(missing_ok=True)
+            with mock.patch.object(engine_runtime.subprocess, "Popen", watch_popen):
+                runtime = engine_runtime.MultiplexedRuntime(
+                    process_factory=factory, startup_timeout=1.0, spawn_guard=guard
+                )
+                with self.assertRaises(engine_runtime.EngineUnhealthy) as caught:
+                    runtime.wait_ready(10)
+            runtime.close()
+            messages.append(str(caught.exception))
+            self.assertEqual(factory.processes, [])
+            self.assertTrue(started.exists())
+            self.assertEqual(len(groups), 1)
+            self.assertTrue(wait_guard_out(groups), "guard outlived the attempt")
+            if "spawn guard refused" in messages[-1]:
+                break
+        self.assertTrue(
+            any("spawn guard refused" in message for message in messages),
+            messages,
+        )
+
     def test_write_lock_waits_consume_request_and_status_deadlines(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(

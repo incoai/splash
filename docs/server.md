@@ -3,8 +3,8 @@
 ## Build and run
 
 ```sh
-git clone https://github.com/incoai/splash.git
-cd splash
+git clone https://github.com/pcvelz/splash-claude.git
+cd splash-claude
 make -j4
 ./splash serve --model mlx-community/Qwen3.8-27B-4bit
 ```
@@ -43,6 +43,14 @@ options give it the same concurrency and image input, and without
 ([Neural Engine prefill](internals.md#neural-engine-prefill)). One that announces other
 limits, as once the Mac's memory budget shrank below that context, stops the
 restarts at once.
+
+`--spawn-guard COMMAND` (or `SPLASH_SPAWN_GUARD=COMMAND`) runs `COMMAND`
+through `/bin/sh -c`, with `SPLASH_SERVER_PID` set to the server's pid,
+before every engine spawn, relaunches included. Exit 0 lets the spawn
+proceed; any other exit refuses it, and the attempt fails naming the guard's
+stderr. The guard may block, waiting for another engine to exit, until the
+attempt's deadline, which kills it and refuses. A supervisor uses it for a
+machine-wide check, e.g. that no other server already holds the model file.
 
 Timeouts and keep-alives count only time the Mac is awake: a request in flight
 when the Mac sleeps continues when it wakes. While requests run, Splash keeps
@@ -106,6 +114,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
 | `--request-timeout` | None | Time a request may take from its arrival; a request's own `timeout` can only shorten it. |
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
+| `--spawn-guard` | `SPLASH_SPAWN_GUARD` or none | A command run through `/bin/sh -c` before every engine spawn, with `SPLASH_SERVER_PID` set to the server's pid; exit 0 lets the spawn proceed, any other exit refuses it. See the engine restart rules above. |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
 | `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](internals.md#neural-engine-prefill). |
 | `--verify-rows` | `auto` | The rows of each draft block decode cycles verify: `auto` lets the verify budget choose a MoE target's rows, which is faster but makes its greedy and seeded outputs vary from run to run, and verifies every row of a dense target; `all` verifies every row the output limit leaves on every target, so those outputs repeat when a request runs alone with the same cached prefixes. See [drafts](models.md#drafts) and [sampling](api.md#sampling). |

@@ -210,6 +210,11 @@ OPTIONS = {
     "--queue-size": values(
         "--queue-size", {"64": 64, "1": 1}, ("0", "-1", "1.5", "many")
     ),
+    "--spawn-guard": values(
+        "--spawn-guard",
+        {'test -z "$(pgrep -x splash)"': 'test -z "$(pgrep -x splash)"'},
+        ("", " "),
+    ),
     "--api-key": values(
         "--api-key",
         {"secret-key": "secret-key"},

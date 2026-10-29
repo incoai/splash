@@ -1811,6 +1811,7 @@ def main():
             ),
             startup_timeout=NATIVE_START_TIMEOUT,
             pending_limit=args.queue_size,
+            spawn_guard=args.spawn_guard,
         )
         backend = NativeBackend(
             runtime,

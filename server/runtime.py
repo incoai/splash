@@ -13,6 +13,7 @@ import itertools
 import math
 import os
 import selectors
+import signal
 import subprocess
 import threading
 import time
@@ -451,6 +452,12 @@ class MultiplexedRuntime:
         eager_start: bool = False,
         # CPU token-mask workers; None lets the executor choose.
         mask_workers: int | None = None,
+        # --spawn-guard: a command run through /bin/sh -c before every engine
+        # spawn, with SPLASH_SERVER_PID set to this process's pid. Exit 0 lets
+        # the spawn proceed; any other exit refuses the attempt. It may block
+        # (waiting for another engine to exit) only until the attempt's
+        # deadline, which kills it. None spawns without asking.
+        spawn_guard: str | None = None,
     ):
         if process_factory is None and not command:
             raise ValueError("command or process_factory is required")
@@ -462,6 +469,7 @@ class MultiplexedRuntime:
         self._command = tuple(command) if command else None
         self._relaunch_command = relaunch_command
         self._process_factory = process_factory
+        self._spawn_guard = spawn_guard
         self._startup_timeout = startup_timeout
         self._pending_limit = pending_limit
         self._admission_slots = threading.BoundedSemaphore(pending_limit)
@@ -525,6 +533,89 @@ class MultiplexedRuntime:
             stderr=None,
             bufsize=0,
         )
+
+    def _spawn_guard_allows(self, attempt: _StartupAttempt) -> EngineUnhealthy | None:
+        """None when --spawn-guard lets this attempt spawn; the refusal
+        otherwise. The guard runs through /bin/sh -c with SPLASH_SERVER_PID
+        set to this process's pid, and may block (waiting for another engine
+        to exit) only until the attempt's deadline, which kills it and
+        refuses. Without the option nothing runs and nothing is refused."""
+        if self._spawn_guard is None:
+            return None
+        guard = subprocess.Popen(
+            ["/bin/sh", "-c", self._spawn_guard],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            env={**os.environ, "SPLASH_SERVER_PID": str(os.getpid())},
+            start_new_session=True,
+        )
+        # The guard may block (waiting for another engine to exit), but only
+        # until the attempt's deadline: a watchdog kills its process group
+        # there, and its death refuses the spawn. The group is the guard's
+        # own (a fresh /bin/sh leads it), so the kill takes the guard and any
+        # command it started with it. The kill fires a beat before the
+        # deadline so the guard's refusal is what the attempt records, rather
+        # than racing its expiry to a bare timeout; the beat bounds only how
+        # late the kill starts, never how late it lands.
+        outlived = threading.Event()
+        kill_at = attempt.deadline - 0.05
+
+        def kill_at_deadline():
+            if outlived.wait(max(0.0, kill_at - time.monotonic())):
+                return
+            while not outlived.is_set():
+                try:
+                    os.killpg(guard.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                # A kill can be swallowed by a process mid-exec; repeat it
+                # until the guard is gone or this call has ended.
+                try:
+                    os.kill(guard.pid, 0)
+                except ProcessLookupError:
+                    break
+                outlived.wait(0.05)
+
+        watchdog = threading.Thread(
+            target=kill_at_deadline, name="splash-spawn-guard", daemon=True
+        )
+        watchdog.start()
+        # The wait ends at the attempt's deadline at the latest; the
+        # watchdog's kill is what ends a guard that blocks past it.
+        try:
+            stderr = guard.stderr.read()
+            returncode = guard.wait(max(0.0, attempt.deadline + 0.2 - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            # The deadline passed while the guard ran: kill it, and refuse
+            # the spawn for a guard that outlived the attempt.
+            outlived.set()
+            try:
+                os.killpg(guard.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            guard.wait()
+            watchdog.join(timeout=2.0)
+            return EngineUnhealthy("spawn guard refused (outlived the deadline)")
+        finally:
+            # Whatever ended this call (a refusal, a deadline kill, or a
+            # close() interrupting it), no guard is left running behind it.
+            outlived.set()
+            try:
+                os.killpg(guard.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            watchdog.join(timeout=2.0)
+        if returncode == 0:
+            return None
+        # A refusal names the guard's stderr, or its exit code when it wrote
+        # none; a guard killed at the deadline has no code worth naming.
+        reason = stderr.decode("utf-8", errors="replace").strip()[:500]
+        if reason:
+            return EngineUnhealthy(reason)
+        if outlived.is_set():
+            return EngineUnhealthy("spawn guard refused (outlived the deadline)")
+        return EngineUnhealthy(f"spawn guard refused (exit {returncode})")
 
     @property
     def pending_limit(self) -> int:
@@ -833,6 +924,11 @@ class MultiplexedRuntime:
         with self._state_lock:
             if self._startup_attempt is not attempt or attempt.event.is_set():
                 return
+            # A thread that was still starting the engine may record its own
+            # failure the moment the deadline passes; let it set the event
+            # with its own reason, which says more than a bare timeout.
+            if attempt.error is not None:
+                return
             generation = attempt.generation
             if generation is None:
                 stopping = attempt.stopping
@@ -891,6 +987,14 @@ class MultiplexedRuntime:
         process = None
         try:
             command = self._launch_command()
+            refusal = self._spawn_guard_allows(attempt)
+            if refusal is not None:
+                # A refusal still owns the attempt even if its deadline
+                # passed while the guard ran: _expire_startup_attempt would
+                # race to its own timeout message first, and the guard's
+                # reason is the truer one.
+                self._complete_startup_attempt(attempt, refusal)
+                return
             process = (
                 self._spawn(command)
                 if self._process_factory is None

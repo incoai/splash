@@ -282,6 +282,12 @@ def parse_max_image_pixels(value):
     return pixels
 
 
+def parse_spawn_guard(value):
+    if not isinstance(value, str) or not value.strip():
+        raise argparse.ArgumentTypeError("must name a command for /bin/sh -c")
+    return value
+
+
 def parse_served_model_name(value):
     if (
         not isinstance(value, str)
@@ -675,6 +681,19 @@ SERVE_OPTIONS = (
             help="requests admitted at once, running or waiting; more get 503 "
             f"(default: {DEFAULT_QUEUE_SIZE})",
         ),
+    ),
+    ServeOption(
+        "--spawn-guard",
+        "requests",
+        dict(
+            type=parse_spawn_guard,
+            metavar="COMMAND",
+            help="run this command through /bin/sh -c before every native "
+            "engine spawn, with SPLASH_SERVER_PID set to the server's pid; "
+            "exit 0 lets the spawn proceed, any other exit refuses it (default: "
+            "SPLASH_SPAWN_GUARD, else no guard)",
+        ),
+        environment="SPLASH_SPAWN_GUARD",
     ),
     ServeOption(
         "--decode-share",
