@@ -213,6 +213,8 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   executorTelemetry.stateHeldImageBytes = 7;
   executorTelemetry.imageRowsBytes = 8;
   executorTelemetry.aneFfnReruns = 1;
+  executorTelemetry.copyspecHits = 4;
+  executorTelemetry.copyspecTokens = 12;
   executorTelemetry.verifyBudget = true;
   const AneFfnSnapshot aneFfn{AneFfnSnapshot::State::Stopped,
                               "an evaluation did not complete within 2 s",
@@ -310,6 +312,9 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   require(json.find("\"decode_wall_ms\":10,\"decode_cycle_ms\":12.5,") !=
               std::string::npos,
           "status lost the decode command wall or the engine's decode cycle");
+  require(json.find("\"copyspec_hits\":4,\"copyspec_tokens\":12") !=
+              std::string::npos,
+          "status lost the prompt-lookup copying counters");
   require(json.find("\"model_timing\":{\"scope\":\"model_lifetime\","
                     "\"prefill\":{\"last_gpu_ms\":5250,\"last_wall_ms\":116921.479,"
                     "\"total_gpu_ms\":500500,\"total_wall_ms\":700250},"

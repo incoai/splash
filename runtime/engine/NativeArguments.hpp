@@ -80,10 +80,10 @@ struct NativeArguments final {
   // --verify-rows auto|all: the rows of the draft's block a decode
   // cycle verifies (RuntimeResourcesConfig::verifyRows).
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
-  // --copyspec-mode off|conservative|auto: whether a request's decode cycles
-  // may draft by copying the request's own earlier tokens
-  // (RuntimeResourcesConfig::copyspecMode).
-  model::CopySpecMode copyspecMode = model::CopySpecMode::Conservative;
+  // --copyspec-mode off|conservative: whether a request's decode cycles
+  // may draft by copying the request's own earlier tokens; off unless asked
+  // for (RuntimeResourcesConfig::copyspecMode).
+  model::CopySpecMode copyspecMode = model::CopySpecMode::Off;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

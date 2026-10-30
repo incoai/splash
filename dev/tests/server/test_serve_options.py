@@ -89,8 +89,8 @@ OPTIONS = {
     ),
     "--copyspec-mode": values(
         "--copyspec-mode",
-        {"off": "off", "conservative": "conservative", "auto": "auto"},
-        ("", "on", "none", "Conservative"),
+        {"off": "off", "conservative": "conservative"},
+        ("", "on", "none", "Conservative", "auto"),
     ),
     "--ple-memory": values(
         "--ple-memory",

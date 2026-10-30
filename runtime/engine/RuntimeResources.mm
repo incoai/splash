@@ -440,19 +440,11 @@ void reportVerifyRows(const model::LoadedModel &loaded, model::VerifyRows rows) 
 // The prompt-lookup copying a request's decode cycles may draft with
 // (--copyspec-mode), and what each mode means.
 void reportCopySpecMode(model::CopySpecMode mode) {
-  switch (mode) {
-  case model::CopySpecMode::Off:
+  if (mode == model::CopySpecMode::Off)
     logLine("Decode cycles never copy a request's own earlier tokens (--copyspec-mode off).");
-    break;
-  case model::CopySpecMode::Conservative:
+  else
     logLine("Decode cycles may copy a request's own earlier tokens to draft (--copyspec-mode "
             "conservative): a copied block that verifies nothing stops copying for the request.");
-    break;
-  case model::CopySpecMode::Auto:
-    logLine("Decode cycles may copy a request's own earlier tokens to draft (--copyspec-mode auto), "
-            "gated on the throughput copying measures.");
-    break;
-  }
 }
 
 // Why a target's long requests keep their KV in memory, empty when they

@@ -179,8 +179,8 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
         throw UsageError("--verify-rows requires auto or all");
       result.verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
     } else if (option == "--copyspec-mode") {
-      if (value != "off" && value != "conservative" && value != "auto")
-        throw UsageError("--copyspec-mode requires off, conservative or auto");
+      if (value != "off" && value != "conservative")
+        throw UsageError("--copyspec-mode requires off or conservative");
       result.copyspecMode = model::copySpecMode(value);
     } else if (option == "--relaunch-context") {
       relaunchContext = value;
