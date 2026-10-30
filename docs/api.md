@@ -536,7 +536,9 @@ least 4 and at most 768, all resized to one size that keeps them within
 lists applied, cropped to their clean aperture at their pixel aspect ratio,
 turned upright as the track's display transform says (a quarter turn,
 optionally mirrored), converted to RGB with the stream's own matrix and
-resized bicubic as images are. Each two consecutive
+resized bicubic as images are. An HDR stream (HLG or PQ) is tone mapped to
+SDR BT.709, as the system displays it, where transformers' decoders convert
+its YUV without its transfer and show it washed out. Each two consecutive
 frames are one temporal patch, introduced by the mean of their times as
 `<t seconds>`, as Qwen3VLProcessor writes it; an odd count repeats the last
 frame. A request's `mm_processor_kwargs` may set
