@@ -183,6 +183,8 @@ bool NativeRuntime::handle(protocol::ClientMessage &message) {
           return handleMask(typed);
         } else if constexpr (std::is_same_v<T, protocol::ReleaseRequestFrame>) {
           return handleRelease(typed);
+        } else if constexpr (std::is_same_v<T, protocol::StopFrame>) {
+          return handleStop(typed);
         } else {
           return handleStatus(typed);
         }
@@ -249,6 +251,13 @@ bool NativeRuntime::handleCancel(const protocol::CancelFrame &cancel) {
   // Cancel can arrive after the terminal event; it is then a no-op.
   if (telemetry_.contains(cancel.requestId))
     core_.cancel(cancel.requestId);
+  return true;
+}
+
+bool NativeRuntime::handleStop(const protocol::StopFrame &stop) {
+  // Stop can arrive after the terminal event; it is then a no-op.
+  if (telemetry_.contains(stop.requestId))
+    core_.stop(stop.requestId);
   return true;
 }
 

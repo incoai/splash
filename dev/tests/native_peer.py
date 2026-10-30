@@ -232,6 +232,8 @@ def decode_client_frame(frame_type: int, payload: bytes) -> wire.ClientMessage:
             return wire.StatusRequestFrame(*_ID.unpack(payload))
         case wire.FrameType.RELEASE_REQUEST:
             return wire.ReleaseRequestFrame(*_ID.unpack(payload))
+        case wire.FrameType.STOP:
+            return wire.StopFrame(*_ID.unpack(payload))
     raise ValueError(f"frame type {frame_type:#06x} is not a client frame")
 
 

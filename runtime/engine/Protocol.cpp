@@ -24,7 +24,8 @@ std::string_view frameTypeName(FrameType type);
 std::string_view failureClassName(FailureClass failureClass);
 
 constexpr std::array<uint8_t, 4> kMagic{'S', 'P', 'L', 'H'};
-constexpr uint64_t kCancelFixedBytes = 8;
+// Cancel and Stop: one u64 request id.
+constexpr uint64_t kRequestEndFixedBytes = 8;
 constexpr uint64_t kMaskResponseFixedBytes = 20;
 constexpr uint64_t kStatusRequestFixedBytes = 8;
 constexpr uint64_t kReleaseRequestFixedBytes = 8;
@@ -80,7 +81,8 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
     // Image pixels dominate prompt tokens; the frame limit is the bound.
     return bounded(kRequestFixedBytes, limits.maxFramePayloadBytes);
   case FrameType::Cancel:
-    return bounded(kCancelFixedBytes, kCancelFixedBytes);
+  case FrameType::Stop:
+    return bounded(kRequestEndFixedBytes, kRequestEndFixedBytes);
   case FrameType::MaskResponse:
     if (!checkedMultiply(limits.maxMaskWords, sizeof(uint32_t), variable) ||
         !checkedAdd(kMaskResponseFixedBytes, variable, maximum)) {
@@ -130,6 +132,7 @@ bool clientFrameType(uint16_t raw, FrameType &type) {
   case FrameType::MaskResponse:
   case FrameType::StatusRequest:
   case FrameType::ReleaseRequest:
+  case FrameType::Stop:
     type = static_cast<FrameType>(raw);
     return true;
   default:
@@ -389,13 +392,6 @@ std::optional<ProtocolIssue> validateRequest(const RequestFrame &request,
                    "only unconstrained generation can ignore end-of-sequence");
   }
   return std::nullopt;
-}
-
-std::optional<ProtocolIssue> validateCancel(const CancelFrame &cancel) {
-  if (cancel.requestId)
-    return std::nullopt;
-  return requestIssue(IssueCode::InvalidRequestId, 0,
-                      "cancel request id must be non-zero");
 }
 
 std::optional<ProtocolIssue>
@@ -850,18 +846,22 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
   return success(ClientMessage{std::move(request)});
 }
 
-ProtocolResult<ClientMessage> decodeCancel(const Frame &frame) {
+// Cancel and Stop: a payload of one non-zero u64 request id.
+template <typename RequestEnd>
+ProtocolResult<ClientMessage> decodeRequestEnd(const Frame &frame) {
+  const std::string name(frameTypeName(frame.type));
   Reader reader(frame.payload);
-  CancelFrame cancel;
-  if (!reader.u64(cancel.requestId) || reader.remaining()) {
+  RequestEnd end;
+  if (!reader.u64(end.requestId) || reader.remaining()) {
     return failure<ClientMessage>(
         makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
-                  0, "cancel payload has an invalid length"));
+                  0, name + " payload has an invalid length"));
   }
-  if (auto issue = validateCancel(cancel)) {
-    return failure<ClientMessage>(std::move(*issue));
+  if (!end.requestId) {
+    return failure<ClientMessage>(requestIssue(
+        IssueCode::InvalidRequestId, 0, name + " request id must be non-zero"));
   }
-  return success(ClientMessage{cancel});
+  return success(ClientMessage{end});
 }
 
 ProtocolResult<ClientMessage> decodeMaskResponse(const Frame &frame,
@@ -928,6 +928,8 @@ std::string_view frameTypeName(FrameType type) {
     return "status_request";
   case FrameType::ReleaseRequest:
     return "release_request";
+  case FrameType::Stop:
+    return "stop";
   case FrameType::Ready:
     return "ready";
   case FrameType::PromptProgress:
@@ -1058,13 +1060,15 @@ ProtocolResult<ClientMessage> decodeFrame(Frame &&frame,
     case FrameType::Request:
       return decodeRequest(std::move(frame.payload), limits);
     case FrameType::Cancel:
-      return decodeCancel(frame);
+      return decodeRequestEnd<CancelFrame>(frame);
     case FrameType::MaskResponse:
       return decodeMaskResponse(frame, limits);
     case FrameType::StatusRequest:
       return decodeStatusRequest(frame);
     case FrameType::ReleaseRequest:
       return decodeReleaseRequest(frame);
+    case FrameType::Stop:
+      return decodeRequestEnd<StopFrame>(frame);
     default:
       break;
     }

@@ -36,6 +36,7 @@ enum class FrameType : uint16_t {
   MaskResponse = 0x0003,
   StatusRequest = 0x0004,
   ReleaseRequest = 0x0005,
+  Stop = 0x0006,
 
   Ready = 0x0100,
   Start = 0x0101,
@@ -194,6 +195,7 @@ struct RequestFrame {
 //   MaskResponse   u64 requestId, u64 maskRequestId, u32 count, u32 words
 //   StatusRequest  u64 correlationId
 //   ReleaseRequest u64 correlationId
+//   Stop           u64 requestId
 //   Ready          u32 maxConcurrentRequests, u32 maxContextTokens, u8 vision,
 //                  u32 vocabularySize, u32 maskRows, u32 stop token count,
 //                  u32 stop tokens
@@ -242,6 +244,15 @@ struct ReleaseRequestFrame {
   uint64_t correlationId = 0;
 
   bool operator==(const ReleaseRequestFrame &) const = default;
+};
+
+// The client matched a stop condition: the engine finishes the request as
+// Stop, a completion, or cancels it before its first token. The Done event
+// still ends the request.
+struct StopFrame {
+  uint64_t requestId = 0;
+
+  bool operator==(const StopFrame &) const = default;
 };
 
 // Sent before Ready once the engine holds its weights: what remains of its
@@ -412,7 +423,8 @@ struct StartFailedEvent {
 };
 
 using ClientMessage = std::variant<RequestFrame, CancelFrame, MaskResponseFrame,
-                                   StatusRequestFrame, ReleaseRequestFrame>;
+                                   StatusRequestFrame, ReleaseRequestFrame,
+                                   StopFrame>;
 using EngineEvent =
     std::variant<ReadyEvent, StartEvent, PromptProgressEvent, TokensEvent,
                  MaskRequestEvent, DoneEvent, ErrorEvent, StatusJsonEvent,

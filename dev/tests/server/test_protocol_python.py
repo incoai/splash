@@ -122,6 +122,7 @@ def client_messages():
         ),
         "status_request": p.StatusRequestFrame(808),
         "release_request": p.ReleaseRequestFrame(808),
+        "stop": p.StopFrame(91),
     }
 
 
@@ -1125,6 +1126,11 @@ class ProtocolPythonTests(unittest.TestCase):
             ),
             (
                 p.CancelFrame(0),
+                p.IssueCode.INVALID_REQUEST_ID,
+                p.FailureClass.PROTOCOL_FATAL,
+            ),
+            (
+                p.StopFrame(0),
                 p.IssueCode.INVALID_REQUEST_ID,
                 p.FailureClass.PROTOCOL_FATAL,
             ),

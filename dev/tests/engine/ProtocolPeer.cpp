@@ -144,6 +144,11 @@ FrameType write(Writer &out, const ReleaseRequestFrame &request) {
   return FrameType::ReleaseRequest;
 }
 
+FrameType write(Writer &out, const StopFrame &stop) {
+  out.u64(stop.requestId);
+  return FrameType::Stop;
+}
+
 struct Header {
   FrameType type;
   uint64_t payloadBytes;

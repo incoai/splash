@@ -2074,6 +2074,12 @@ but no sampling policy or DFlash decode. Successful scoring emits no Tokens
 event, finishes with Stop, and reports zero decode time. Cancelled requests
 carry no logits.
 
+A Stop frame, its payload a request's u64 id, ends a request whose output
+matched a client stop condition: the engine finishes the request as Stop, a
+completion, where a Cancel frame would finish it cancelled. A Stop before the
+request's first token cancels it, and one for a request that has already
+ended is ignored.
+
 An engine sends Warming once it holds its weights, then its Ready event when
 its warm-up runs are done; the server writes the first engine's Warming to
 its serve record, where the app shows it as the start's Warming up step.

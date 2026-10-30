@@ -230,6 +230,7 @@ const std::vector<std::pair<std::string, ClientMessage>> &clientMessages() {
        MaskResponseFrame{91, 7, {0xffffffffU, 0, 0xa5a5a5a5U}}},
       {"status_request", StatusRequestFrame{808}},
       {"release_request", ReleaseRequestFrame{808}},
+      {"stop", StopFrame{91}},
   };
   return messages;
 }
@@ -1119,6 +1120,8 @@ void testUnnamedRequestFailuresAreFatal() {
   expect(unnamed, IssueCode::LimitExceeded, FailureClass::ProtocolFatal,
          fourTokens);
   expect(CancelFrame{0}, IssueCode::InvalidRequestId,
+         FailureClass::ProtocolFatal);
+  expect(StopFrame{0}, IssueCode::InvalidRequestId,
          FailureClass::ProtocolFatal);
   expect(MaskResponseFrame{0, 7, {1}}, IssueCode::InvalidRequestId,
          FailureClass::ProtocolFatal);

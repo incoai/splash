@@ -988,6 +988,43 @@ void testCancelledScoreReturnsEmptyLogits() {
   require(doneCount == 1, "cancelled score did not emit Done");
 }
 
+// A Stop frame ends a request that still has output budget left with one
+// Done reporting Stop, counted completed.
+void testStopFrameEndsTheRequestAsStopped() {
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  // The fake model never ends the request itself, so only the Stop can.
+  fixture.executor.decodeFinishes = false;
+  loop.announceReady(protocol::peer::kTestReady);
+  constexpr uint32_t kOutputBudget = 512;
+  require(loop.receive(protocol::peer::serialize(request(41, kOutputBudget))), "stop request wire failed");
+  const auto emitted = [&] {
+    return std::ranges::any_of(fixture.events(), [](const protocol::EngineEvent &message) {
+      return std::holds_alternative<protocol::TokensEvent>(message);
+    });
+  };
+  for (uint32_t step = 0; step < 32 && !emitted(); ++step)
+    static_cast<void>(loop.tick());
+  require(emitted(), "stop request emitted no token");
+
+  require(loop.receive(protocol::peer::serialize(protocol::StopFrame{41})), "stop frame failed");
+  runUntilIdle(loop);
+  uint32_t doneCount = 0;
+  for (const protocol::EngineEvent &message : fixture.events()) {
+    if (const auto *done = std::get_if<protocol::DoneEvent>(&message)) {
+      ++doneCount;
+      require(done->requestId == 41 && done->reason == EngineFinishReason::Stop &&
+                  done->completionTokens < kOutputBudget,
+              "a stop frame did not end the request early as Stop");
+    }
+  }
+  const EngineSnapshot stopped = loop.statusSnapshot();
+  require(doneCount == 1 && stopped.completed == 1 && stopped.cancelled == 0,
+          "a stopped request did not end with one Done, counted completed");
+}
+
 // A request's prefill time runs from when the engine starts it, even when
 // its clock reads zero then, not from its arrival.
 void testPrefillTimeCountsFromTheStart() {
@@ -1287,6 +1324,7 @@ std::span<const test::TestCase> wireTests() {
       {"testStepTokensFitTheWire", testStepTokensFitTheWire},
       {"testScoreRequestCompletesAfterFullPrompt", testScoreRequestCompletesAfterFullPrompt},
       {"testCancelledScoreReturnsEmptyLogits", testCancelledScoreReturnsEmptyLogits},
+      {"testStopFrameEndsTheRequestAsStopped", testStopFrameEndsTheRequestAsStopped},
       {"testPrefillTimeCountsFromTheStart", testPrefillTimeCountsFromTheStart},
       {"testInvalidScoreFailsOneRequestAndKeepsTheBatch", testInvalidScoreFailsOneRequestAndKeepsTheBatch},
       {"testConstrainedMaskExchange", testConstrainedMaskExchange},
