@@ -151,6 +151,19 @@ void Engine::cancel(uint64_t id) {
     settle(found->second, {LaneOutcome::Cancelled, {}});
 }
 
+void Engine::stop(uint64_t id) {
+  const auto found = requests_.find(id);
+  if (found == requests_.end())
+    return;
+  Request &active = found->second;
+  // Nothing generated yet, so nothing to stop on: the request is cancelled.
+  if (generatedTokens(active) == 0) {
+    settle(active, {LaneOutcome::Cancelled, {}});
+    return;
+  }
+  settle(active, {.outcome = LaneOutcome::Cancelled, .stopped = true});
+}
+
 void Engine::failRequest(uint64_t id, LaneOutcome outcome, std::string message) {
   settle(request(id), {outcome, std::move(message)});
 }
@@ -2657,7 +2670,9 @@ void Engine::settle(Request &active, LaneEnd end) {
       active.restore->ticket->cancel();
     return;
   }
-  if (end.outcome == LaneOutcome::Cancelled)
+  if (end.stopped)
+    finish(active, EngineFinishReason::Stop, {});
+  else if (end.outcome == LaneOutcome::Cancelled)
     finish(active, EngineFinishReason::Cancelled, {});
   else
     finishFailure(active, std::move(end));

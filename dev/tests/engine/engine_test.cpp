@@ -59,10 +59,11 @@ public:
     maskRequests.emplace_back(
         requestId, std::vector<uint32_t>(simulation.begin(), simulation.end()));
   }
-  void completed(uint64_t id, EngineFinishReason, bool bounded, uint32_t prompt,
+  void completed(uint64_t id, EngineFinishReason reason, bool bounded, uint32_t prompt,
                  uint32_t completion, uint32_t deduplicated,
                  std::span<const float>, const SpeculativeCounts &speculation) override {
     ++completedCount;
+    reasons[id] = reason;
     if (bounded)
       boundedIds.push_back(id);
     usage[id] = {prompt, completion};
@@ -90,6 +91,7 @@ public:
   std::vector<uint64_t> boundedIds;
   std::unordered_map<uint64_t, uint32_t> deduplicatedTokens;
   std::unordered_map<uint64_t, SpeculativeCounts> speculativeCounts;
+  std::unordered_map<uint64_t, EngineFinishReason> reasons;
   std::vector<std::string> failures;
   std::vector<std::pair<std::string, bool>> failureDetails;
   // When each failure said a retry may succeed, in seconds.
@@ -10555,6 +10557,144 @@ void testAsyncRestoreLifecycle() {
   }
 }
 
+// A client stop finishes a request that has output as Stop, counted
+// completed; one that has generated nothing yet is cancelled; a repeated or
+// unknown id is ignored.
+void testStopFinishesARequestAsStopped() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor;
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, executor, events);
+  guardReleases(storage, engine);
+  EngineRequest generating = request(1, std::vector<uint32_t>(40, 3));
+  generating.maxNewTokens = 64;
+  engine.submit(generating);
+  double now = 1;
+  tickUntil(engine, now, [&] { return !events.outputs[1].empty(); },
+            "the request produced no output");
+
+  engine.stop(1);
+  engine.submit(request(2, std::vector<uint32_t>(40, 5)));
+  engine.stop(2);
+  tickUntil(engine, now, [&] { return idle(engine); }, "the stopped requests did not end");
+
+  require(events.reasons.at(1) == EngineFinishReason::Stop &&
+              events.usage.at(1).second < generating.maxNewTokens,
+          "a stopped request did not finish early as Stop");
+  require(events.reasons.at(2) == EngineFinishReason::Cancelled,
+          "a request stopped before any output was not cancelled");
+  const EngineSnapshot counts = engine.snapshot();
+  require(counts.completed == 1 && counts.cancelled == 1 && counts.failed == 0,
+          "a stopped request was not counted completed");
+
+  engine.stop(1);
+  engine.stop(999);
+
+  const EngineSnapshot after = engine.snapshot();
+  require(events.completedCount == 2 && events.failedCount == 0 &&
+              after.completed == 1 && after.cancelled == 1 && after.failed == 0,
+          "a stop of a finished or unknown id was not ignored");
+}
+
+// A stop of a lane inside the in-flight batch waits for the batch to drain,
+// then finishes as Stop without emitting that batch's output.
+void testStopInFlightFinishesAfterTheBatch() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor;
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine(test::engineConfig(), cache, executor, events);
+  guardReleases(storage, engine);
+  EngineRequest generating = request(1, std::vector<uint32_t>(40, 3));
+  generating.maxNewTokens = 64;
+  engine.submit(generating);
+  double now = 1;
+  tickUntil(engine, now, [&] { return !events.outputs[1].empty(); },
+            "the request produced no output");
+  executor.holdDecodeUntil = std::make_shared<std::atomic<bool>>(false);
+  tickUntil(engine, now, [&] { return engine.commandInFlight(); },
+            "the request did not launch a held decode");
+  const size_t emittedBefore = events.outputs.at(1).size();
+
+  engine.stop(1);
+  static_cast<void>(engine.tick(now++));
+  require(engine.commandInFlight() && events.completedCount == 0,
+          "an in-flight stop finished before its batch drained");
+  *executor.holdDecodeUntil = true;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the stopped request did not end");
+
+  const EngineSnapshot counts = engine.snapshot();
+  require(events.reasons.at(1) == EngineFinishReason::Stop &&
+              counts.completed == 1 && counts.cancelled == 0 &&
+              events.outputs.at(1).size() == emittedBefore,
+          "an in-flight stop did not finish as Stop after its batch");
+}
+
+// A stop of a lane that has output and is restoring its state from disk
+// waits for the read to drain, then finishes as Stop.
+void testStopWhileRestoringFinishesAfterTheRestore() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor;
+  executor.decodeFinishes = false;
+  // The prompt's state stays on disk only: no lane captures another, and the
+  // restore keeps no copy in memory, so the lane's resumption reads it again.
+  executor.deniedReservations = std::numeric_limits<uint32_t>::max();
+  executor.restoreControl->ready = true;
+  executor.restoreControl->promotionDenied = true;
+  Events events;
+  engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
+  guardReleases(storage, engine);
+  const std::vector<uint32_t> prompt(65, 17);
+  publishDiskState(cache, prompt);
+  // Lane 1, with the shortest prompt the least work, yields its lane to a
+  // Foreground arrival once all the lanes are full.
+  for (uint64_t id = 1; id <= 4; ++id) {
+    EngineRequest lane = request(id, id == 1 ? prompt : std::vector<uint32_t>(129, id));
+    lane.maxNewTokens = 1000;
+    engine.submit(std::move(lane));
+  }
+  double now = 1;
+  const auto decoding = [&] {
+    return std::ranges::all_of(std::array<uint64_t, 4>{1, 2, 3, 4},
+                               [&](uint64_t id) { return !events.outputs[id].empty(); });
+  };
+  tickUntil(engine, now, decoding, "the lanes did not decode");
+  // Once the arrival finishes, lane 1 resumes into a restore that is held:
+  // the second read of the only state on disk.
+  executor.restoreControl = std::make_shared<RestoreControl>();
+  executor.restoreControl->promotionDenied = true;
+  EngineRequest arriving = request(5, std::vector<uint32_t>(9, 5));
+  arriving.priority = RequestPriority::Foreground;
+  engine.submit(std::move(arriving));
+  tickUntil(engine, now, [&] { return events.usage.contains(5) && executor.diskReads == 2; },
+            "the suspended lane did not resume into a disk restore");
+  require(engine.snapshot().prioritySuspensions == 1 && !events.reasons.contains(1),
+          "the arrival did not suspend the lane");
+
+  engine.stop(1);
+  static_cast<void>(engine.tick(now++));
+  require(!events.reasons.contains(1) && executor.restoreControl->cancelled,
+          "a stop while restoring finished before the restore drained");
+  executor.restoreControl->ready = true;
+  tickUntil(engine, now, [&] { return events.reasons.contains(1); },
+            "the stopped request did not end");
+  for (uint64_t id = 2; id <= 4; ++id)
+    engine.cancel(id);
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+
+  const EngineSnapshot counts = engine.snapshot();
+  require(events.reasons.at(1) == EngineFinishReason::Stop &&
+              counts.completed == 2 && counts.cancelled == 3 && counts.failed == 0,
+          "a stop while restoring did not finish as Stop after the restore");
+}
+
 void testDiskHitWithNoActiveMemory() {
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
@@ -12925,6 +13065,9 @@ int main() {
     testNothingInFlightIsNotPending();
     testKvGrowthProceedsThroughDemotion();
     testAsyncRestoreLifecycle();
+    testStopFinishesARequestAsStopped();
+    testStopInFlightFinishesAfterTheBatch();
+    testStopWhileRestoringFinishesAfterTheRestore();
     testDiskHitWithNoActiveMemory();
     testCancelledColdPrefillResumesItsLatestCheckpoint();
     testConcurrentProgressRetainsAtMostOnePointPerLane();

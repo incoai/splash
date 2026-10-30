@@ -229,7 +229,7 @@ struct EngineSnapshot final {
 // (Types.hpp): its own result, which the engine reports and survives. submit()
 // reports an invalid request with std::invalid_argument, which the caller
 // answers with that request's error. Any other exception out of submit(), and
-// every exception out of tick(), cancel(), failRequest(), provideMask(),
+// every exception out of tick(), cancel(), stop(), failRequest(), provideMask(),
 // reclaimMemory() and flushRestorePoints(), is engine-fatal: NativeRuntime
 // reports EngineUnhealthy and the process exits. Code below them therefore
 // does not roll back on an exception; the only cleanup on that path is RAII
@@ -247,6 +247,12 @@ public:
     scheduler_.observePrefill(rows, wallMilliseconds, hostMilliseconds);
   }
   void cancel(uint64_t requestId);
+  // Finishes a started request as EngineFinishReason::Stop: counted
+  // completed, as a request that ends at its stop token is. A lane inside the
+  // in-flight command or a restore finishes once that work drains, emitting
+  // none of its output; a request that has generated nothing yet finishes as
+  // Cancelled; an unknown or finished id is ignored.
+  void stop(uint64_t requestId);
   void failRequest(uint64_t requestId, LaneOutcome outcome, std::string message);
   void provideMask(uint64_t requestId, std::span<const uint32_t> words);
   void setCompletionNotifier(std::function<void()> notifier);
@@ -340,6 +346,9 @@ private:
     LaneOutcome outcome;
     std::string message;
     uint32_t retryAfterSeconds = 0;
+    // A client stop (Engine::stop): the lane completes as
+    // EngineFinishReason::Stop rather than as its outcome, Cancelled.
+    bool stopped = false;
   };
 
   struct ResourceWait final {
