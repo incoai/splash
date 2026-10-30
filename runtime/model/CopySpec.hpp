@@ -3,11 +3,12 @@
 // Prompt-lookup ("copyspec") drafting: a request drafts by copying its own
 // earlier tokens wherever they repeat what it is about to say, instead of
 // running the DFlash draft. The lookup finds where the request's history
-// last held the window its pending anchor ends, and copies what followed
+// first held the window its pending anchor ends, and copies what followed
 // there; the verify is the target's unchanged, so a wrong copy costs only
-// the cycle's draft work. Repetition-heavy traffic (code, agent loops)
-// gains the acceptance of near-oracle drafts; fresh text misses and falls
-// back to DFlash for free.
+// the verify rows its block claims, which follow the request's measured
+// acceptance of its copies (CopySpecAcceptance). Repetition-heavy traffic
+// (code, agent loops) gains the acceptance of near-oracle drafts; fresh text
+// misses and falls back to DFlash for free.
 //
 // The index (CopySpecIndex) hashes every window of W = 6 token ids with
 // 64-bit FNV-1a into a map from hash to the ends of the windows that hash
@@ -19,10 +20,9 @@
 // whole as well.
 //
 // Whether a request copies is per request and per mode (CopySpecMode): off
-// never consults its index, conservative stops copying for the rest of the
-// request once a copied block verifies nothing (one strike; lookup misses
-// are free and never strike), and auto leaves it to a windowed A/B latch
-// (CopySpecAutoGate) that measures the throughput copying gives.
+// never consults its index, and conservative stops copying for the rest of
+// the request once a copied block verifies nothing (one strike; lookup
+// misses are free and never strike).
 
 #include <cstdint>
 #include <span>
@@ -33,7 +33,7 @@
 
 namespace splash::model {
 
-enum class CopySpecMode : uint8_t { Off, Conservative, Auto };
+enum class CopySpecMode : uint8_t { Off, Conservative };
 CopySpecMode copySpecMode(std::string_view);
 
 struct CopySpecIndex {
@@ -63,41 +63,31 @@ private:
   void indexWindow(uint32_t start);
 };
 
-struct CopySpecAutoGate {
-  static constexpr uint32_t kProbeOffCycles = 24;
-  static constexpr uint32_t kProbeOnMinCopy = 6;
-  static constexpr uint32_t kProbeOnMaxCycles = 48;
-  static constexpr uint32_t kLatchCycles = 200;
-  static constexpr uint32_t kBackoffCap = 4;
-  bool engageCopy() const;                    // phase is measure_on|engaged
-  void recordCycle(bool sourceCopy, uint32_t commitCount, uint64_t costNs);
-  bool takeReset();                           // one-shot pending-reset flag
+// A request's measured acceptance of its copied proposals: the chance that a
+// copied proposal the verify reaches (every proposal before it accepted) is
+// accepted too, the per-position rate the verify rows' acceptance model
+// speaks in (ops::VerifyRowsModel). It starts from a Beta(3, 1) prior, so a
+// request's first copy claims a block about as long as a confident draft's,
+// and each verified copy moves it toward what the request's copies earn.
+struct CopySpecAcceptance {
+  static constexpr double kPriorAccepted = 3.0;
+  static constexpr double kPriorRejected = 1.0;
+  // A copied block's verification: `accepted` of its first `verified`
+  // proposals matched the target. Each accepted proposal is a reached
+  // acceptance, and the first refused one, if the verify reached it, a
+  // reached rejection.
+  void observe(uint32_t verified, uint32_t accepted);
+  double rate() const;
 
 private:
-  // The four phases: measure_off gathers a baseline with copying suppressed,
-  // measure_on probes with it allowed, engaged keeps it on for
-  // kLatchCycles cycles once the probe saw it win, and dormant keeps it off
-  // for a backoff while it loses.
-  enum class Phase : uint8_t { MeasureOff, MeasureOn, Engaged, Dormant };
-  Phase phase_ = Phase::MeasureOff;
-  // The current window's realized throughput.
-  uint64_t windowCommits_ = 0;
-  uint64_t windowCostNs_ = 0;
-  uint32_t windowCycles_ = 0;
-  uint32_t windowCopies_ = 0;
-  double offRate_ = 0.0;
-  bool hasOffRate_ = false;
-  uint32_t latchRemaining_ = 0;
-  // Consecutive disengagements lengthen the dormant backoff; any engage
-  // resets them, so a workload that turns copy-heavy stays responsive.
-  uint32_t consecutiveLosses_ = 0;
-  bool pendingReset_ = false;
+  uint64_t reached_ = 0;
+  uint64_t accepted_ = 0;
 };
 
 struct CopySpecState {
   CopySpecIndex index;
   bool disabled = false;
-  CopySpecAutoGate gate;
+  CopySpecAcceptance acceptance;
 };
 
 } // namespace splash::model

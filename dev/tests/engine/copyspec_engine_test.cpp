@@ -11,15 +11,13 @@
 //
 // The loop follows the documented semantics exactly: blockLen =
 // clamp(1, 8, remaining); the index is consulted only for a mode that is on
-// and a request the one-strike rule has not disabled, and the auto gate only
-// on a lookup hit; on a hit the copied span replaces the draft block; the
+// and a request the one-strike rule has not disabled; on a hit the copied
+// span replaces the draft block; the
 // commit is the anchor plus the accepted proposals (1 + acceptanceLen) and
 // the target's token at the first mismatch, or the bonus token, is the next
 // anchor; every committed id is appended to the index, so generated text
 // becomes copy source; a verified copy block that accepted nothing is
-// conservative mode's one strike and a lookup miss is not; the gate is
-// recorded to every cycle that ran a real draft and its one-shot reset is
-// consumed where the engine would reset its adaptive policy.
+// conservative mode's one strike and a lookup miss is not.
 //
 // What this test cannot reach: the production seams the core workstream
 // owns in Runtime.cpp — the host step that overwrites a hit lane's
@@ -42,7 +40,6 @@
 #include <string>
 #include <vector>
 
-using splash::model::CopySpecAutoGate;
 using splash::model::CopySpecIndex;
 using splash::model::CopySpecMode;
 using splash::model::CopySpecState;
@@ -52,7 +49,6 @@ namespace {
 
 constexpr uint32_t kBlockRows = 8;
 constexpr uint32_t kProposals = kBlockRows - 1;
-constexpr uint64_t kCycleCostNs = 1000;
 // A fallback draft's wrong token: outside every scenario's vocabulary.
 constexpr uint32_t kFiller = 0;
 
@@ -71,8 +67,6 @@ struct Run final {
   uint32_t copyspecHits = 0;
   uint32_t copyspecTokens = 0;
   bool disabled = false;
-  // The cycles whose recordCycle handed out takeReset().
-  std::vector<uint32_t> resetAfterCycles;
   // What the raw index would still draft at the end, whatever the state
   // allows: the one-strike rule suppresses consulting, not the index.
   uint32_t rawFinalLookup = 0;
@@ -97,7 +91,7 @@ bool consults(const CopySpecState &state, CopySpecMode mode) {
 Run run(const Request &request, CopySpecMode mode) {
   require(request.script.size() >= request.maxNewTokens,
           "the scripted target ends before its budget");
-  CopySpecState state{CopySpecIndex(request.prompt), false, CopySpecAutoGate{}};
+  CopySpecState state{CopySpecIndex(request.prompt), false, {}};
   Run result;
   uint32_t generated = 0;
   uint32_t staged = request.script[0];
@@ -113,10 +107,6 @@ Run run(const Request &request, CopySpecMode mode) {
             staged, maxTokens, {}, std::span<uint32_t>(proposals).first(maxTokens));
         require(count == 0 || count == maxTokens,
                 "the lookup returned a partial block");
-        // The gate is consulted only where a lookup hit exists (PLAN.md): a
-        // hit the gate suppresses falls back to the DFlash draft.
-        if (count && mode == CopySpecMode::Auto && !state.gate.engageCopy())
-          count = 0;
         if (count) {
           cycle.usedCopyBlock = true;
           cycle.drafted = count;
@@ -159,13 +149,6 @@ Run run(const Request &request, CopySpecMode mode) {
     if (mode == CopySpecMode::Conservative && cycle.usedCopyBlock &&
         cycle.accepted == 0)
       state.disabled = true;
-    if (blockLen > 1) {
-      state.gate.recordCycle(cycle.usedCopyBlock, 1 + cycle.accepted,
-                             kCycleCostNs);
-      if (state.gate.takeReset())
-        result.resetAfterCycles.push_back(
-            static_cast<uint32_t>(result.cycles.size() + 1));
-    }
     result.cycles.push_back(std::move(cycle));
     // The next anchor is the target's token at the first mismatch, or the
     // bonus token; the loop may end before it is committed.
@@ -313,37 +296,6 @@ void lookupMissesDoNotDisable() {
   requireAgreeingCycles(run0, "lookup misses");
 }
 
-// The auto gate's wiring: measure_off suppresses the first 24 cycles though
-// every query hits, the probe drafts from its first cycle, the latch holds
-// 200 cycles and hands out one reset, and the measure_off window after it
-// suppresses 24 more before copying resumes.
-void autoGateEngagement() {
-  const Request request{pattern(24), pattern(1920), 1800};
-  const Run run0 = run(request, CopySpecMode::Auto);
-  require(run0.cycles.size() > 255,
-          "the auto run ended before its second probe");
-  for (uint32_t cycle = 1; cycle <= 24; ++cycle)
-    require(!run0.cycles[cycle - 1].usedCopyBlock,
-            "measure_off used a copy block at cycle " + std::to_string(cycle));
-  for (uint32_t cycle = 25; cycle <= 230; ++cycle)
-    require(run0.cycles[cycle - 1].usedCopyBlock,
-            "the probe or latch did not draft at cycle " + std::to_string(cycle));
-  for (uint32_t cycle = 231; cycle <= 254; ++cycle)
-    require(!run0.cycles[cycle - 1].usedCopyBlock,
-            "the measure_off window used a copy block at cycle " +
-                std::to_string(cycle));
-  require(run0.cycles[254].usedCopyBlock,
-          "copying did not resume after the measure_off window");
-  require(run0.resetAfterCycles == std::vector<uint32_t>{230},
-          "the latch did not hand out one reset at cycle 230");
-  require(!run0.disabled, "the auto gate one-striked");
-  for (const Cycle &cycle : run0.cycles)
-    if (cycle.usedCopyBlock)
-      require(cycle.accepted == cycle.drafted,
-              "an auto copy cycle the target agreed with lost a token");
-  requireAgreeingCycles(run0, "auto gate");
-}
-
 // The copy source is the whole buffer: a query whose only match lies in
 // generated output copies from it, which needs no repeat in the prompt at
 // all. The prompt here holds nothing that repeats.
@@ -379,7 +331,6 @@ int main() {
     repeatedNgramOutputsIdentical();
     oneStrikeOnVerifiedZeroAcceptance();
     lookupMissesDoNotDisable();
-    autoGateEngagement();
     generatedTextIsCopySource();
   } catch (const std::exception &error) {
     std::cerr << "copyspec_engine_test: FAIL: " << error.what() << '\n';

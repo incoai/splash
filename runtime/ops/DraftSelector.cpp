@@ -3,6 +3,7 @@
 #include "metal/abi/Sampling.h"
 #include "ops/BufferExtent.hpp"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <stdexcept>
@@ -126,6 +127,54 @@ void DraftSelector::addVerifyRows(metal::CommandGraph &graph, const metal::Metal
   requireBytes(confidence, uint64_t{lanes} * kPositions * sizeof(float), "proposal confidence");
   requireBytes(verifyRows, uint64_t{lanes} * sizeof(uint32_t), "verify rows");
   graph.add("draft_verify_rows", {confidence, verifyRows}, params, {1, 1, 1}, {1, 1, 1});
+}
+
+void DraftSelector::addFixedProposals(metal::CommandGraph &graph, std::span<const FixedProposals> lanes,
+                                      const metal::MetalBuffer &proposedTokens,
+                                      const metal::MetalBuffer &confidence) {
+  if (lanes.empty() || lanes.size() > SPLASH_MAXIMUM_BATCH_WIDTH)
+    throw std::invalid_argument("invalid fixed proposals batch");
+  // The writer fills a lane whose cutoff row is 0 with its first count
+  // values; a row past the block leaves the lane alone. The confidence row
+  // goes through it as its float32 bits.
+  ThinkingCutoffParams tokens{};
+  tokens.rows = SPLASH_TARGET_VERIFY_ROWS;
+  tokens.drafted_rows = kPositions;
+  ThinkingCutoffParams confidences = tokens;
+  uint32_t written = 0;
+  for (uint32_t lane = 0; lane < lanes.size(); ++lane) {
+    const FixedProposals &fixed = lanes[lane];
+    if (fixed.count > kPositions)
+      throw std::invalid_argument("fixed proposals overflow the draft block");
+    tokens.row[lane] = confidences.row[lane] = fixed.count ? 0 : SPLASH_TARGET_VERIFY_ROWS;
+    tokens.count[lane] = confidences.count[lane] = fixed.count;
+    for (uint32_t position = 0; position < fixed.count; ++position) {
+      tokens.tokens[lane][position] = fixed.tokens[position];
+      confidences.tokens[lane][position] = std::bit_cast<uint32_t>(fixed.confidence[position]);
+    }
+    if (fixed.count)
+      written = lane + 1;
+  }
+  if (!written)
+    return;
+  requireBytes(proposedTokens, uint64_t{written} * kPositions * sizeof(uint32_t), "proposed token");
+  requireBytes(confidence, uint64_t{written} * kPositions * sizeof(float), "proposal confidence");
+  graph.add("decode_draft_thinking_cutoff", {proposedTokens}, tokens, {written, 1, 1}, {1, 1, 1});
+  graph.add("decode_draft_thinking_cutoff", {confidence}, confidences, {written, 1, 1}, {1, 1, 1});
+}
+
+float DraftSelector::confidenceFor(const VerifyRowsModel &model, uint32_t position, double acceptance) {
+  if (position >= kPositions || !(acceptance > 0.0 && acceptance < 1.0))
+    throw std::invalid_argument("invalid fixed proposal acceptance");
+  // draft_verify_rows clamps confidence to [1e-6, 1 - 1e-6].
+  static constexpr double kClamp = 1.0e-6;
+  const auto clamped = [](double value) {
+    return static_cast<float>(std::clamp(value, kClamp, 1.0 - kClamp));
+  };
+  if (model.everyRow || !(std::abs(model.slope) > 1.0e-3F))
+    return clamped(acceptance);
+  const double logit = (std::log(acceptance / (1.0 - acceptance)) - model.intercepts[position]) / model.slope;
+  return clamped(1.0 / (1.0 + std::exp(-logit)));
 }
 
 } // namespace splash::ops
