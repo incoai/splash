@@ -287,7 +287,8 @@ std::string runtimeStatusJson(
     const NativeLoopTiming &loop, const WeightsSnapshot &weights,
     const AneFfnSnapshot &aneFfn, ThermalState thermalState,
     const std::optional<model::SparseRowStats> &streamedTable,
-    const std::optional<model::ExpertStoreStats> &streamedExperts, const std::optional<KvSpillStatus> &kvSpill) {
+    const std::optional<model::ExpertStoreStats> &streamedExperts, const std::optional<KvSpillStatus> &kvSpill,
+    uint32_t kvZipOverflowSlabs) {
   const auto &resources = core.resources;
   const auto &scheduler = core.scheduler;
   const auto &pool = resources.pool;
@@ -341,11 +342,19 @@ std::string runtimeStatusJson(
       << json::quote(cacheIdentity.targetModelSha256)
       << ",\"format\":" << json::quote(kv::formatName(kvFormat))
       << ",\"quantization\":"
-      << json::quote(kvFormat == kv::Format::Int8 ? "symmetric_int8" : "none")
+      << json::quote(kvFormat == kv::Format::Int8          ? "symmetric_int8"
+                     : kvFormat == kv::Format::ZipBFloat16 ? "lossless_exponent_window"
+                                                           : "none")
       << ",\"scale_type\":" << json::quote(kvFormat == kv::Format::Int8 ? "float32" : "none")
       << ",\"key_layout\":\"token_major\""
       << ",\"value_layout\":"
-      << json::quote(cacheIdentity.kvLayout.valuesTokenMajor ? "token_major" : "dimension_major") << "}},"
+      << json::quote(kvFormat == kv::Format::ZipBFloat16 || cacheIdentity.kvLayout.valuesTokenMajor
+                         ? "token_major"
+                         : "dimension_major");
+  // ZBF16 slabs that stored escapes past their table (abi/KvZip.h).
+  if (kvFormat == kv::Format::ZipBFloat16)
+    out << ",\"overflow_slabs\":" << kvZipOverflowSlabs;
+  out << "}},"
       << "\"memory_plan\":" << plan.toStatusJson()
       << ",\"memory_actual\":{\"allocated_bytes\":" << metalMemory.allocatedBytes
       << ",\"current_bytes\":" << currentBytes

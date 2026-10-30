@@ -15,9 +15,15 @@
 // usage: attention-sweep METALLIB [--histories 0,2048,...]
 //                        [--shapes 27b,35b,122b,fn,flint-window,flint-full]
 //                        [--lanes 1,4] [--repeat N] [--phases both|verify|prefill]
-//                        [--compare-metallib PATH] [--kv-format int8|bf16]
+//                        [--prefill-rows N]
+//                        [--compare-metallib PATH] [--kv-format int8|bf16|zbf16]
 //                        [--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer]
-//                        [--located]
+//                        [--located] [--kv-sample SHAPE=PATH[,SHAPE=PATH]]
+//
+// --kv-sample fills BF16 and ZBF16 history with real KV pages a persistent
+// cache wrote for that shape's model (AttentionFixture.hpp KvSample), so
+// ZBF16 decodes real escapes; INT8 keeps the synthetic history. ZBF16 runs
+// the 27b and 35b shapes.
 //
 // flint-window and flint-full are Flint's two kinds of layers: 32 query heads
 // over 4 KV heads of 128 dimensions with a learned sink per query head, 35
@@ -90,6 +96,7 @@ using test::AttentionFixture;
 using test::AttentionFixturePlan;
 using test::AttentionShape;
 using test::HostKvExtents;
+using test::KvSample;
 using test::moveBlock;
 
 constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
@@ -192,9 +199,9 @@ std::vector<uint32_t> qsaBitmaps(const AttentionFixturePlan &plan, const std::st
   return bits;
 }
 
-// The prefill chunk on one lane, or the verify rows of `lanes` lanes, all
-// after `history` tokens, with their plan's scratch.
-AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes,
+// A prefill chunk of `prefillRows` rows on one lane, or the verify rows of
+// `lanes` lanes, all after `history` tokens, with their plan's scratch.
+AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t prefillRows, uint32_t lanes,
                               uint32_t history, uint32_t extentPages) {
   const kv::Layout layout{.attentionLayers = 1, .kvHeads = shape.kvHeads, .headDimension = shape.headDimension,
                           .format = shape.format, .valuesTokenMajor = shape.valuesTokenMajor};
@@ -202,12 +209,12 @@ AttentionFixturePlan casePlan(AttentionShape shape, bool prefill, uint32_t lanes
   AttentionFixturePlan::Histories histories{};
   std::fill_n(histories.begin(), caseLanes, history);
   const AttentionWorkspace scratch =
-      prefill ? PagedAttention::prefillPlan(kPrefillRows, shape.queryHeads, layout, shape.variant)
+      prefill ? PagedAttention::prefillPlan(prefillRows, shape.queryHeads, layout, shape.variant)
                     .workspace
               : PagedAttention::verifyPlan(caseLanes, shape.queryHeads, layout,
                                            std::span(histories).first(caseLanes), shape.variant)
                     .workspace;
-  return AttentionFixturePlan::make(shape, caseLanes, prefill ? kPrefillRows : kVerifyRows,
+  return AttentionFixturePlan::make(shape, caseLanes, prefill ? prefillRows : kVerifyRows,
                                     histories, scratch, {kLayer + 1, kLayer, extentPages});
 }
 
@@ -464,7 +471,8 @@ double median(std::vector<double> values) {
 // and must give the same output reading them through their locations.
 std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
                           const AttentionFixturePlan &plan, bool prefill, uint32_t repeat,
-                          double warmupSeconds, const std::string &qsa, bool located) {
+                          double warmupSeconds, const std::string &qsa, bool located,
+                          const KvSample *sample = nullptr) {
   std::vector<std::unique_ptr<AttentionFixture>> fixtures;
   std::vector<QsaBlocks> blocks;
   std::vector<metal::CommandGraph> graphs;
@@ -476,7 +484,7 @@ std::vector<Case> measure(std::span<metal::MetalBackend *> backends,
   for (size_t i = 0; i < backends.size(); ++i) {
     fixtures.push_back(
         std::make_unique<AttentionFixture>(*backends[i], plan, "attention-sweep-fixture"));
-    fixtures.back()->fill();
+    fixtures.back()->fill({}, sample);
     blocks.push_back(qsaBlocks(*backends[i], plan, prefill, bitmaps, words, qsa == "indexer", located));
     graphs.push_back(caseGraph(*fixtures.back(), prefill, blocks.back()));
     if (located) {
@@ -584,8 +592,8 @@ int main(int argc, const char *argv[]) {
     if (argc < 2) {
       std::cerr << "usage: attention-sweep METALLIB [--histories LIST] "
                    "[--shapes 27b,35b,122b,fn,flint-window,flint-full] "
-                   "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] "
-                   "[--compare-metallib PATH] [--kv-format int8|bf16] "
+                   "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] [--prefill-rows N] "
+                   "[--compare-metallib PATH] [--kv-format int8|bf16|zbf16] [--kv-sample SHAPE=PATH,...] "
                    "[--extent-pages N] [--qsa shared|independent|overlapping|pages|indexer] "
                    "[--located]\n";
       return 64;
@@ -594,11 +602,13 @@ int main(int argc, const char *argv[]) {
     std::vector<uint32_t> lanes{1, 4};
     std::vector<std::string> shapes{"27b", "35b"};
     uint32_t repeat = 5;
+    uint32_t prefillRows = kPrefillRows;
     // Zero: the largest extent the memory plan picks for the model's K/V
     // pages (Flash-Next's without its index regions, which no case reads).
     uint32_t extentPages = 0;
     kv::Format format = kv::Format::Int8;
     std::string comparisonLibrary, phases = "both", qsa;
+    std::map<std::string, std::string> samples;
     bool located = false;
     for (int index = 2; index < argc; ++index) {
       const std::string option(argv[index]);
@@ -613,14 +623,30 @@ int main(int argc, const char *argv[]) {
         histories = parseList(value, 0, kv::kMaximumPhysicalTokens - kPrefillRows, option);
       else if (option == "--lanes")
         lanes = parseList(value, 1, kMaximumLanes, option);
+      else if (option == "--prefill-rows")
+        prefillRows = parseCount(value, 1, kPrefillRows, option);
       else if (option == "--repeat")
         repeat = parseCount(value, 1, std::numeric_limits<uint32_t>::max(), option);
       else if (option == "--extent-pages")
         extentPages = parseCount(value, 1, SPLASH_KV_PAGE_INDEX_MASK, option);
       else if (option == "--kv-format") {
-        if (value != "int8" && value != "bf16")
-          throw std::invalid_argument("--kv-format takes int8 or bf16");
-        format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+        if (value != "int8" && value != "bf16" && value != "zbf16")
+          throw std::invalid_argument("--kv-format takes int8, bf16 or zbf16");
+        format = value == "int8"   ? kv::Format::Int8
+                 : value == "bf16" ? kv::Format::BFloat16
+                                   : kv::Format::ZipBFloat16;
+      }
+      else if (option == "--kv-sample") {
+        size_t start = 0;
+        while (start < value.size()) {
+          const size_t comma = std::min(value.find(',', start), value.size());
+          const std::string item = value.substr(start, comma - start);
+          const size_t equals = item.find('=');
+          if (equals == std::string::npos)
+            throw std::invalid_argument("--kv-sample takes SHAPE=PATH");
+          samples[item.substr(0, equals)] = item.substr(equals + 1);
+          start = comma + 1;
+        }
       }
       else if (option == "--compare-metallib") comparisonLibrary = value;
       else if (option == "--qsa") {
@@ -682,6 +708,9 @@ int main(int argc, const char *argv[]) {
                             .maximumExtentPages();
       // Only the GQA-12 kernels attend sparsely.
       const std::string shapeQsa = shape == "fn" ? qsa : std::string();
+      std::unique_ptr<KvSample> sample;
+      if (samples.count(shape))
+        sample = std::make_unique<KvSample>(samples[shape], modelLayers(shape), geometry.kvHeads);
       std::cerr << "\n" << name << "  (" << geometry.queryHeads << " query heads, "
                 << geometry.kvHeads << " KV heads, d=" << geometry.headDimension
                 << ", extents of " << shapeExtentPages << " pages"
@@ -691,8 +720,8 @@ int main(int argc, const char *argv[]) {
           // Only a verify with lists reads its blocks through locations.
           const bool caseLocated = located && !prefill && !shapeQsa.empty();
           const auto cases =
-              measure(backends, casePlan(geometry, prefill, lane, history, shapeExtentPages),
-                      prefill, repeat, warmupSeconds, shapeQsa, caseLocated);
+              measure(backends, casePlan(geometry, prefill, prefillRows, lane, history, shapeExtentPages),
+                      prefill, repeat, warmupSeconds, shapeQsa, caseLocated, sample.get());
           warmupSeconds = 0.1;
           for (size_t i = 0; i < cases.size(); ++i) {
             std::cout << (firstCase ? "" : ",")

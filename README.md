@@ -118,7 +118,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--idle-release off` | Keep the model in memory while idle (default: release after 10m). |
 | `--max-context 100K` | Set the context limit. Up to `1M` tokens. |
 | `--language-only` | Skip vision; serve text only. |
-| `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
+| `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). `zbf16` keeps BF16 bit for bit in 0.81 of its memory. |
 | `--state-format bf16` | Use BF16 recurrent states, half the size. Default: FP32. |
 | `--disable-ane` | Prefill on the GPU alone. Default: the 27B also uses the Neural Engine. |
 | `--max-cache-disk 16G` | Cap the SSD cache (default: auto, up to 32 GiB; `0` turns it off). |

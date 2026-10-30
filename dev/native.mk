@@ -137,6 +137,7 @@ TEST_EXECUTION_PLANS := $(ENGINE_TEST_BUILD)/execution-plans
 TEST_MODEL_EXECUTION_PLANS := $(ENGINE_TEST_BUILD)/model-execution-plans
 TEST_ATTENTION_PLAN := $(ENGINE_TEST_BUILD)/paged-attention-plan
 TEST_ATTENTION_VARIANTS := $(ENGINE_TEST_BUILD)/attention-variants
+TEST_KV_ZIP := $(ENGINE_TEST_BUILD)/kv-zip
 TEST_LINEAR_PLAN := $(ENGINE_TEST_BUILD)/linear-plan
 TEST_DFLASH_BATCH_CONTROL_TEST := $(ENGINE_TEST_BUILD)/dflash-batch-control
 TEST_DRAFT_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/draft-attention
@@ -238,6 +239,7 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_GGUF_PREPARATION) \
 	$(TEST_ATTENTION_PLAN) \
 	$(TEST_ATTENTION_VARIANTS) \
+	$(TEST_KV_ZIP) \
 	$(TEST_LINEAR_PLAN) \
 	$(TEST_RESOURCES_TEST) \
 	$(TEST_KV_PAGE_TIER_TEST) \
@@ -416,6 +418,8 @@ $(TEST_ATTENTION_PLAN): dev/tests/engine/paged_attention_plan_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_ATTENTION_VARIANTS): dev/tests/engine/attention_variants_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_KV_ZIP): dev/tests/engine/kv_zip_metal_test.mm \
+		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_LINEAR_PLAN): dev/tests/engine/linear_plan_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_DFLASH_BATCH_CONTROL_TEST): dev/tests/engine/dflash_batch_control_metal_test.mm \
@@ -466,7 +470,7 @@ $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(TEST_ANE_FFN) \
 		$(TEST_KV_PAGE_TIER_TEST) $(TEST_QWEN_STATE_TEST) $(TEST_Q8_ATTENTION_TEST) \
 		$(TEST_Q8_PREFILL_TEST) $(TEST_GGUF_MOE) $(TEST_GGUF_MOE_E512) $(TEST_GGUF_MOE_SIGMOID) \
 		$(TEST_EXPERT_STORE) $(TEST_KV_BLOCK_CACHE) $(TEST_KV_HISTORY_STREAM) $(TEST_QWEN4_KERNELS) \
-		$(TEST_GDN_METAL_TEST) $(TEST_ATTENTION_PLAN) $(TEST_LINEAR_PLAN) \
+		$(TEST_GDN_METAL_TEST) $(TEST_ATTENTION_PLAN) $(TEST_KV_ZIP) $(TEST_LINEAR_PLAN) \
 		$(TEST_DFLASH_BATCH_CONTROL_TEST) $(TEST_DRAFT_ATTENTION_TEST) \
 		$(TEST_GDN_DECODE_TEST) $(TEST_DRAFT_SELECTOR_TEST) \
 		$(TEST_TARGET_SAMPLING_TEST) $(TEST_VISION_ATTENTION_TEST) \
@@ -612,6 +616,7 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(TEST_QWEN4_KERNELS) $(LIB) bitwise
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_PLAN) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_VARIANTS) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_KV_ZIP) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_LINEAR_PLAN) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_RESOURCES_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_KV_PAGE_TIER_TEST) $(TEST_METAL_BACKEND_LIB)
@@ -673,7 +678,8 @@ teacher-logits: preflight $(TARGET) $(TEST_TEACHER_LOGITS) $(LIB)
 	$(TEST_TEACHER_LOGITS) $(LIB) "$(MODEL_ROOT)" $(TEACHER_LOGITS_ARGS)
 
 # Attention kernels alone on one layer of synthetic Q8 history across cache
-# lengths; ATTENTION_SWEEP_ARGS passes --histories/--shapes/--lanes/--repeat.
+# lengths; ATTENTION_SWEEP_ARGS passes --histories/--shapes/--lanes/--repeat
+# (and --kv-format/--kv-sample).
 benchmark-attention-sweep: $(TEST_ATTENTION_SWEEP) $(LIB)
 	$(TEST_ATTENTION_SWEEP) $(LIB) $(ATTENTION_SWEEP_ARGS)
 
@@ -694,8 +700,9 @@ benchmark-gguf-projection: $(TEST_GGUF_PROJECTION_BENCHMARK) $(LIB)
 benchmark-gguf-moe: $(TEST_GGUF_MOE_BENCHMARK) $(LIB)
 	$(TEST_GGUF_MOE_BENCHMARK) $(LIB) $(GGUF_MOE_ARGS)
 
+# BACKEND_BENCHMARK_ARGS passes --kv-format/--scenario/--samples/--max-context.
 benchmark-backend: preflight $(TARGET) $(TEST_BACKEND_BENCHMARK) $(LIB)
-	$(TEST_BACKEND_BENCHMARK) $(LIB) "$(MODEL_ROOT)"
+	$(TEST_BACKEND_BENCHMARK) $(LIB) "$(MODEL_ROOT)" $(BACKEND_BENCHMARK_ARGS)
 
 # CPU tests that also run under the sanitizers: each is built three times
 # from the same sources, once as the CPU tests above are and once under each

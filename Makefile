@@ -318,6 +318,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/model/ModelFactory.cpp \
 	runtime/model/ModelSizing.cpp \
 	runtime/model/SlotFile.cpp \
+	runtime/model/KvZipBases.cpp \
 	runtime/model/KvCopyRead.cpp \
 	runtime/model/KvBlockCache.cpp \
 	runtime/model/KvHistoryStream.cpp \

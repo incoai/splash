@@ -280,7 +280,15 @@ layers compare with (`dev/tools/flint_reference.py` writes Flint's,
 `fc` reads them, makes them its captures.
 
 `benchmark-backend` lists the contexts the memory plan cannot hold in its
-report. Its cache checks reuse each context's cached prefix, so they need that
+report. It takes `--kv-format int8|bf16|zbf16`
+(`make benchmark-backend MODEL=... BACKEND_BENCHMARK_ARGS='--kv-format zbf16'`);
+when the startup runway spans more than one extent, the warmup timings are
+skipped. The attention sweep (`make benchmark-attention-sweep
+ATTENTION_SWEEP_ARGS='--kv-format zbf16 --kv-sample 27b=PATH'`) fills BF16 and
+ZBF16 history from real KV pages a persistent cache captured (`kv.slots` in its
+directory), so ZBF16 decodes the escapes real KV has; `--compare-metallib`
+checks a candidate's bits and times against another build's kernels. Its cache
+checks reuse each context's cached prefix, so they need that
 memory free: when other programs leave too little, the engine evicts cached
 prefixes and the checks fail, naming what each lookup found.
 

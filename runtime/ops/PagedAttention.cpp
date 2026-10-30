@@ -119,7 +119,66 @@ std::string projectionKernel(std::string_view phase, const CompiledAttention &co
 }
 
 // A layout's KV format, as its kernels' names hold it.
-std::string kernelFormat(kv::Layout layout) { return layout.format == kv::Format::BFloat16 ? "bf16" : "q8"; }
+std::string kernelFormat(kv::Layout layout) {
+  return layout.format == kv::Format::ZipBFloat16 ? "zip" : layout.format == kv::Format::BFloat16 ? "bf16" : "q8";
+}
+// The format of a layout's prefill split: ZBF16 prefill attends the BF16
+// scratch its history expands into (KvZipPrefill).
+std::string prefillSplitFormat(kv::Layout layout) {
+  return layout.format == kv::Format::ZipBFloat16 ? "bf16" : kernelFormat(layout);
+}
+
+// The most query tiles a ZBF16 prefill's split decodes its pages for, each
+// tile decoding every page it reads; a longer chunk expands its history into
+// the BF16 scratch once and attends that. At four tiles (32 rows) decoding
+// is 9-24% faster than expanding from 8K tokens of history on both models
+// (the 35B's 5% slower at 2K); at eight, up to 15% slower on the 35B at
+// 2K-8K and 2% on the 27B at 64K (M5 Pro, captured KV).
+constexpr uint32_t kZipDirectTiles = 4;
+
+// The longest lane history the 35B's ZBF16 verify takes its split with own
+// page scores at (kernels/common/paged_attention_zip_tile.h); past it the
+// scores share the decoded tile. Both compute the same bits.
+constexpr uint32_t kZipOwnScoresHistory = 16384;
+
+// A verify split's kernel suffix past its geometry's and window's.
+std::string_view verifySplitSuffix(const CompiledAttention &compiled, kv::Layout layout,
+                                   std::span<const uint32_t> historyTokens) {
+  if (layout.format != kv::Format::ZipBFloat16 || compiled.queryHeads != 8 * compiled.kvHeads)
+    return "";
+  return std::ranges::max(historyTokens) <= kZipOwnScoresHistory ? "_short" : "";
+}
+
+// ZBF16 kernels bind the codec before their parameters.
+void requireCodec(kv::Layout layout, const metal::MetalBuffer &codec) {
+  if (layout.format == kv::Format::ZipBFloat16 && !codec)
+    throw std::invalid_argument("ZBF16 attention requires the KV codec buffer");
+}
+
+// ZBF16 prefill's codec, BF16 scratch and its table, whole.
+void requireZipPrefill(kv::Layout layout, const KvZipPrefill &zip) {
+  if (layout.format != kv::Format::ZipBFloat16)
+    return;
+  requireCodec(layout, zip.codec);
+  const kv::Layout scratch = kv::zipScratchLayout(layout);
+  requireBytes(zip.scratch, uint64_t{kv::zipScratchPages()} * scratch.bytesPerModelPage(),
+               "ZBF16 prefill scratch");
+  requireBytes(zip.scratchTable, uint64_t{kv::zipScratchPages()} * sizeof(SplashKvPage),
+               "ZBF16 prefill scratch table");
+}
+
+// Where the scratch's only layer lies in its single extent.
+SplashKvLayer zipScratchLayer(kv::Layout layout) {
+  const kv::Layout scratch = kv::zipScratchLayout(layout);
+  return splash_kv_layer(kv::zipScratchPages(), static_cast<uint32_t>(scratch.dataBytesPerLayerPage()), 0, 0);
+}
+
+// The pages a chunk's rows touch: a ZBF16 store encodes one page's rows of a
+// KV head per threadgroup.
+uint32_t chunkPages(const kv::ChunkedPrefillParams &params) {
+  const uint32_t last = params.committed_tokens + params.chunk_tokens - 1;
+  return last / kv::kPageTokens - params.committed_tokens / kv::kPageTokens + 1;
+}
 
 // One dispatch normalizes both the queries and the keys, so their norms must
 // share a stored type.
@@ -250,14 +309,17 @@ PrefillAttentionPlan PagedAttention::prefillPlan(
   const uint32_t splits = prefillSplits(tiles, variant.windowTokens);
   const uint32_t fusedRows =
       kv::kPrefillAttentionTileRows * (queryHeads / layout.kvHeads);
+  const bool zipExpand = layout.format == kv::Format::ZipBFloat16 && tiles > kZipDirectTiles;
   return {rows, splits,
           attentionWorkspace(uint64_t{tiles} * splits * layout.kvHeads * fusedRows,
                              layout.headDimension),
-          kernelName("prefill", kernelFormat(layout) + (kernel.valuesTokenMajor ? "_sparse" : "_split"),
+          kernelName("prefill",
+                     (zipExpand ? prefillSplitFormat(layout) : kernelFormat(layout)) +
+                         (kernel.valuesTokenMajor ? "_sparse" : "_split"),
                      splitSuffix(kernel, variant)),
           reduceKernel("prefill", kernel, variant),
           {layout.kvHeads * tileParts(queryHeads, layout), tiles, splits},
-          {layout.kvHeads, fusedRows, tiles}, layout.valuesTokenMajor, kernel.sinks,
+          {layout.kvHeads, fusedRows, tiles}, layout.valuesTokenMajor, kernel.sinks, zipExpand,
           layout, queryHeads};
 }
 
@@ -282,7 +344,7 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
   return {lanes, laneSplits, splits,
           verifyWorkspaceBound(lanes, queryHeads, layout),
           kernelName("verify", kernelFormat(layout) + (kernel.valuesTokenMajor ? "_sparse" : "_split"),
-                     splitSuffix(kernel, variant)),
+                     splitSuffix(kernel, variant) + std::string(verifySplitSuffix(kernel, layout, historyTokens))),
           reduceKernel("verify", kernel, variant),
           // A sparse lane's list fills only the first of the plan's splits.
           // Its split grid is one-dimensional, x the KV head and then the
@@ -296,7 +358,10 @@ VerifyAttentionPlan PagedAttention::verifyPlan(
           layout.valuesTokenMajor, kernel.sinks,
           kernel.valuesTokenMajor ? kernelName("verify", kernelFormat(layout) + "_sparse_located", kernel.suffix) : "",
           kernelName("verify", kernelFormat(layout) + "_store", storeSuffix(layout)),
-          {uint64_t{lanes} * 2 * kv::kVerifyRows * layout.kvHeads, 1, 1},
+          // ZBF16: per lane, a threadgroup per (tensor, KV head) of the two
+          // pages eight rows can touch; otherwise one per row.
+          {uint64_t{lanes} * 2 * (layout.format == kv::Format::ZipBFloat16 ? 2 : kv::kVerifyRows) * layout.kvHeads,
+           1, 1},
           {layout.headDimension, 1, 1}, layout, queryHeads};
 }
 
@@ -453,7 +518,8 @@ void PagedAttention::addPrefillStore(
     metal::CommandGraph &graph, SplashKvLayer layer,
     metal::MetalBuffer chunkKeys, metal::MetalBuffer chunkValues,
     metal::MetalBuffer pageTable,
-    const kv::ChunkedPrefillParams &params, kv::Layout layout) {
+    const kv::ChunkedPrefillParams &params, kv::Layout layout, const KvZipPrefill &zip) {
+  requireZipPrefill(layout, zip);
   const std::string store = kernelName("prefill", kernelFormat(layout) + "_store", storeSuffix(layout));
   const Staging staging{layout.kvHeads, params.chunk_stride, params.chunk_tokens};
   requireBytes(chunkKeys, staging.rowBytes(1, layout.headDimension), "attention key");
@@ -461,6 +527,13 @@ void PagedAttention::addPrefillStore(
   requirePageTable(pageTable, params);
   kv::ChunkedPrefillParams layerParams = params;
   layerParams.kv = layer;
+  if (layout.format == kv::Format::ZipBFloat16) {
+    // A threadgroup encodes a KV head's rows of one page.
+    graph.add(std::string(store), {std::move(chunkKeys), std::move(chunkValues), std::move(pageTable), zip.codec},
+              layerParams, {uint64_t{2} * chunkPages(params) * layout.kvHeads, 1, 1},
+              {layout.headDimension, 1, 1});
+    return;
+  }
   graph.add(std::string(store),
             {std::move(chunkKeys), std::move(chunkValues), std::move(pageTable)},
             layerParams, {uint64_t{2} * params.chunk_tokens * layout.kvHeads, 1, 1},
@@ -472,7 +545,9 @@ void PagedAttention::addPrefill(
     metal::MetalBuffer queries, metal::MetalBuffer output,
     metal::MetalBuffer partials, metal::MetalBuffer statistics,
     metal::MetalBuffer pageTable, const kv::ChunkedPrefillParams &chunk,
-    const PrefillAttentionPlan &plan, AttentionBlocks blocks, metal::MetalBuffer sinks) {
+    const PrefillAttentionPlan &plan, AttentionBlocks blocks, metal::MetalBuffer sinks,
+    const KvZipPrefill &zip) {
+  requireZipPrefill(plan.layout, zip);
   if (chunk.chunk_tokens != plan.rows)
     throw std::invalid_argument("prefill attention rows do not match plan");
   const std::string_view error = kv::chunkedPrefillValidationError(chunk);
@@ -489,10 +564,25 @@ void PagedAttention::addPrefill(
   requireBlocks(blocks, plan.sparse, plan.tiles);
   if (blocks.locations) throw std::invalid_argument("prefill attention takes no block locations");
   requireSinks(sinks, plan.sinks, plan.queryHeads);
+  // A long ZBF16 chunk attends through the BF16 split and reduce: the history
+  // it reads here, the chunk's rows included, expands into the BF16 scratch
+  // first.
+  const bool expands = plan.zipExpand;
+  if (expands) {
+    kv::ChunkedPrefillParams expand = chunk;
+    expand.kv = layer;
+    const uint32_t visiblePages = kv::chunkedPrefillRequiredPages(chunk);
+    graph.add(kernelName("prefill", "zip_expand", storeSuffix(plan.layout)),
+              {pageTable, zip.scratchTable, zip.codec}, SplashKvZipExpandParams{expand, zipScratchLayer(plan.layout)},
+              {uint64_t{2} * visiblePages * plan.layout.kvHeads, 1, 1}, {plan.layout.headDimension, 1, 1});
+  }
   const kv::PrefillAttentionParams params{
       chunk.committed_tokens, chunk.chunk_tokens, chunk.chunk_stride,
-      chunk.page_table_entries, layer, plan.splits, blocks.stride, blocks.list};
-  std::vector<metal::MetalBuffer> split{std::move(queries), partials, statistics, std::move(pageTable)};
+      chunk.page_table_entries, expands ? zipScratchLayer(plan.layout) : layer, plan.splits, blocks.stride,
+      blocks.list};
+  std::vector<metal::MetalBuffer> split{std::move(queries), partials, statistics,
+                                        expands ? zip.scratchTable : std::move(pageTable)};
+  if (plan.layout.format == kv::Format::ZipBFloat16 && !expands) split.push_back(zip.codec);
   std::vector<metal::MetalBuffer> reduce{partials, statistics, std::move(output)};
   if (plan.sparse) {
     const auto [lists, counts] = blockBindings(blocks, partials);
@@ -546,13 +636,16 @@ void PagedAttention::addVerify(metal::CommandGraph &graph, SplashKvLayer layer,
                        plan.laneSplits[lane], plan.splits, blocks.stride,
                        blocks.list + lane};
   }
+  requireCodec(plan.layout, buffers.kvCodec);
+  const bool zipped = plan.layout.format == kv::Format::ZipBFloat16;
   const auto &tables = buffers.pageTables;
-  graph.add(std::string(plan.storePipeline_),
-            {buffers.chunkKeys, buffers.chunkValues, tables[0], tables[1], tables[2],
-             tables[3]},
-            stores, plan.storeGroups_, plan.storeThreads_);
+  std::vector<metal::MetalBuffer> store{buffers.chunkKeys, buffers.chunkValues, tables[0], tables[1], tables[2],
+                                        tables[3]};
+  if (zipped) store.push_back(buffers.kvCodec);
+  graph.add(std::string(plan.storePipeline_), std::move(store), stores, plan.storeGroups_, plan.storeThreads_);
   std::vector<metal::MetalBuffer> split{buffers.queries, buffers.partials, buffers.statistics,
                                         tables[0], tables[1], tables[2], tables[3]};
+  if (zipped) split.push_back(buffers.kvCodec);
   std::vector<metal::MetalBuffer> reduce{buffers.partials, buffers.statistics, buffers.output};
   if (plan.sparse) {
     const auto [lists, counts] = blockBindings(blocks, buffers.partials);

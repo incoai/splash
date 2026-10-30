@@ -18,6 +18,7 @@ persistent_auto | --persistent-cache | auto auto --persistent-cache on
 persistent | --max-cache-disk 5G --persistent-cache | auto auto 5368709120 --persistent-cache on
 persistent_dir | --max-cache-disk 5G --persistent-cache --cache-dir /srv/cache | auto auto 5368709120 --persistent-cache on --cache-dir /srv/cache
 bf16 | --kv-format bf16 | auto auto --kv-format bf16
+zbf16 | --kv-format zbf16 | auto auto --kv-format zbf16
 disk_bf16 | --max-cache-disk 5G --kv-format bf16 | auto auto 5368709120 --kv-format bf16
 state_bf16 | --state-format bf16 | auto auto --state-format bf16
 idle_release | --idle-release 30m | auto auto --idle-release 1800.0

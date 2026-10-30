@@ -304,6 +304,6 @@ struct KvSpillStatus final {
     const AneFfnSnapshot &aneFfn, ThermalState thermalState,
     const std::optional<model::SparseRowStats> &streamedTable = std::nullopt,
     const std::optional<model::ExpertStoreStats> &streamedExperts = std::nullopt,
-    const std::optional<KvSpillStatus> &kvSpill = std::nullopt);
+    const std::optional<KvSpillStatus> &kvSpill = std::nullopt, uint32_t kvZipOverflowSlabs = 0);
 
 } // namespace splash::engine

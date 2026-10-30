@@ -298,7 +298,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
         queries, keys, values, sequence.rows, sequence.attentionStride, geometry_.attentionQueryHeads,
         geometry_.kvLayout, variant);
     ops::PagedAttention::addPrefillStore(step.graph, step.kvLayers[layer], keys, values, sequence.pageTable,
-                                         sequence.chunk, geometry_.kvLayout);
+                                         sequence.chunk, geometry_.kvLayout, b.kvZip);
     const uint32_t firstPage = sequence.chunk.committed_tokens / kv::kPageTokens;
     const PrefillKv attended =
         step.spilled.prefill(step.graph, layer, sequence.lane, firstPage,
@@ -306,7 +306,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
                              {sequence.pageTable, step.kvLayers[layer]});
     ops::PagedAttention::addPrefill(step.graph, attended.kv, queries, attentionRows, b.attentionPartials,
                                     b.attentionStatistics, attended.table, sequence.chunk, plans[index],
-                                    blocks.empty() ? ops::AttentionBlocks{} : blocks[index], mixer.sinks);
+                                    blocks.empty() ? ops::AttentionBlocks{} : blocks[index], mixer.sinks, b.kvZip);
     ops::PagedAttention::addPrefillGate(
         step.graph, u16Rows(b.fullPacked, sequence, geometry_.packedFullWidth), attentionRows,
         u16Rows(b.attentionHidden, sequence, geometry_.attentionWidth), sequence.rows, sequence.attentionStride,
@@ -375,7 +375,7 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mi
   }
   ops::PagedAttention::addVerify(step.graph, step.kvLayers[layer],
                                  {b.chunkKeys[layer], b.chunkValues[layer], b.fullQueries, b.attentionPartials,
-                                  b.attentionStatistics, b.fullAttention, b.pageTables, mixer.sinks},
+                                  b.attentionStatistics, b.fullAttention, b.pageTables, mixer.sinks, b.kvCodec},
                                  step.chunks, variant.windowTokens ? *step.windowedAttention : step.attention,
                                  attended);
   const ops::LinearPlan outputPlan = linear.decodePlan(

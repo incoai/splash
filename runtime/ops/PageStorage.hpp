@@ -37,11 +37,15 @@ class PageStorage final : public ExtentStorage {
 public:
   // pageCount must be a whole number of extents of extentPages pages, a
   // whole number of the layout's alignment units (Layout::extentPagesFor).
+  // A ZBF16 layout needs zipBases: per attention layer, keys then values,
+  // per KV head, base3[256] then base4[256] (abi/KvZip.h); other formats
+  // take none.
   PageStorage(metal::MetalBackend &backend,
               metal::AllocationAdmission admitAllocation,
               Layout layout,
               uint32_t pageCount,
-              uint32_t extentPages);
+              uint32_t extentPages,
+              std::span<const uint8_t> zipBases = {});
 
   PageStorage(const PageStorage &) = delete;
   PageStorage &operator=(const PageStorage &) = delete;
@@ -132,6 +136,13 @@ public:
   [[nodiscard]] std::array<std::span<std::byte>, 4> layerSpans(uint32_t page, uint32_t layer) const;
   [[nodiscard]] std::vector<std::span<std::byte>> indexSpans(uint32_t page) const;
 
+  // ZBF16's codec buffer, which its store and attention kernels bind: a
+  // header with the overflow count, then the bases. Empty for other formats.
+  [[nodiscard]] const metal::MetalBuffer &codec() const noexcept { return codec_; }
+  // Slabs whose ZBF16 store dropped escapes since startup (abi/KvZip.h);
+  // zero for other formats.
+  [[nodiscard]] uint32_t zipOverflowSlabs() const noexcept;
+
 private:
   struct Extent final {
     // Empty while the extent is not allocated.
@@ -164,6 +175,8 @@ private:
   // The layer of each region, in region order (Layout::region).
   std::vector<uint32_t> regionLayers_;
   std::vector<Extent> extents_;
+  // ZBF16's codec buffer (codec()); empty for other formats.
+  metal::MetalBuffer codec_;
 };
 
 } // namespace splash::kv

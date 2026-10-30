@@ -879,7 +879,7 @@ int main(int argc, char **argv) {
       std::cerr << "usage: backend-benchmark METALLIB MODEL_ROOT "
                    "[--samples COUNT] [--progress PATH] "
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
-                   "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
+                   "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] [--kv-format int8|bf16|zbf16] "
                    "[--logits DIR [--logits-from DIR] [--logits-width LANES]]\n"
                    "  NAME: decode, partial, short, transcripts, context, exact, logits or resume "
                    "(default: decode,partial,context)\n"
@@ -902,6 +902,7 @@ int main(int argc, char **argv) {
     std::optional<double> aneFfnShare;
     std::optional<uint32_t> aneFfnMinimumRows;
     uint32_t maxContext = 0;
+    kv::Format kvFormat = kv::Format::Int8;
     std::optional<std::filesystem::path> logitsDirectory, logitsFrom;
     uint32_t logitsWidth = 1;
     bool logitsOptions = false;
@@ -921,6 +922,13 @@ int main(int argc, char **argv) {
         aneFfnMinimumRows = parseAneFfnMinimumRows(argv[index + 1]);
       } else if (option == "--max-context") {
         maxContext = parseMaxContext(argv[index + 1]);
+      } else if (option == "--kv-format") {
+        const std::string_view value(argv[index + 1]);
+        if (value != "int8" && value != "bf16" && value != "zbf16")
+          throw std::invalid_argument("--kv-format takes int8, bf16 or zbf16");
+        kvFormat = value == "int8"   ? kv::Format::Int8
+                   : value == "bf16" ? kv::Format::BFloat16
+                                     : kv::Format::ZipBFloat16;
       } else if (option == "--logits") {
         logitsDirectory = std::filesystem::path(argv[index + 1]);
       } else if (option == "--logits-from") {
@@ -950,6 +958,7 @@ int main(int argc, char **argv) {
     config.modelRoot = std::filesystem::path(argv[2]);
     config.model = model::servedFor(model::inspectModelRoot(config.modelRoot), maxContext);
     config.buildId = SPLASH_BUILD_ID;
+    config.kvFormat = kvFormat;
     config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
     // The verify budget's rows follow the wall times and acceptance of the
     // cycles before them, so a MoE target's outputs would not repeat from
@@ -1006,13 +1015,23 @@ int main(int argc, char **argv) {
     if (progress)
       progress->identity(identity);
 
+    // The warmups run on the startup runway, pages [0, warmupKvPages). After
+    // startup the pool keeps one warm extent, which holds the runway only
+    // when one extent covers it: otherwise the warmup timings are skipped and
+    // reported as 0.
+    bool runway = true;
+    for (uint32_t page = 0; page < model::ExecutionLimits::warmupKvPages; ++page)
+      runway = runway && resources->kvPages().isAllocated(page);
+    if (!runway)
+      std::cerr << "backend-benchmark: the startup runway was released; skipping warmup timings\n";
     if (progress)
       progress->begin("warmup", "prefill_2048", 0,
                       model::ExecutionLimits::prefillTokenBudget);
     const model::WarmupStepResult prefillWarmup =
-        executor->warmupPrefill(model::ExecutionLimits::prefillTokenBudget);
+        runway ? executor->warmupPrefill(model::ExecutionLimits::prefillTokenBudget)
+               : model::WarmupStepResult{};
     const double prefillWarmupGpuMilliseconds =
-        executor->telemetry().lastPrefillGpuSeconds * 1000.0;
+        runway ? executor->telemetry().lastPrefillGpuSeconds * 1000.0 : 0.0;
     if (progress) {
       progress->complete("prefill_warmup", "prefill_2048", 0,
                          model::ExecutionLimits::prefillTokenBudget, 0,
@@ -1024,7 +1043,7 @@ int main(int argc, char **argv) {
     std::array<double, model::ExecutionLimits::maximumBatchWidth>
         decodeWarmupGpu{};
     std::vector<std::string> performanceFailures;
-    for (uint32_t width = 1; width <= decodeWarmupWall.size(); ++width) {
+    for (uint32_t width = 1; runway && width <= decodeWarmupWall.size(); ++width) {
       decodeWarmupWall[width - 1] =
           executor->warmupDecodeBatch(width).wallSeconds * 1000.0;
       decodeWarmupGpu[width - 1] =

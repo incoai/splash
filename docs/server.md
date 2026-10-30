@@ -87,7 +87,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--no-webui` | Off | Disable the chat page. |
 | `--max-memory` | Auto | Lower the ceiling on Metal allocations, e.g. `28G`; not combined process RSS. See [memory and context](#memory-and-context). |
 | `--max-context` | Auto | Set the context limit, e.g. `100K` or `1M` (K = 1024 tokens, M = 1,000,000), up to 1,010,000 tokens; past the 256K native window it turns on YaRN. See [memory and context](#memory-and-context). |
-| `--kv-format` | `int8` | Target KV storage: `int8` or `bf16`. See [KV cache precision](#kv-cache-precision). |
+| `--kv-format` | `int8` | Target KV storage: `int8`, `bf16` or `zbf16` (BF16 compressed losslessly). See [KV cache precision](#kv-cache-precision). |
 | `--state-format` | `fp32` | Recurrent state storage: `fp32` or `bf16`. See [state precision](#state-precision). |
 | `--ple-memory` | Auto | Qwen3.8-Flash-Next: read the PLE n-gram table from the SSD through a host row cache of this size, e.g. `2G`; `off` loads the whole table. Auto loads it where memory holds it, else streams it through its share of the budget. See [PLE table streaming](#ple-table-streaming). |
 | `--expert-memory` | Auto | MoE targets: hold routed experts in this much memory, e.g. `16G`, and read the others from the SSD when a step routes them; `off` loads every expert. Auto loads them all where memory holds them, else gives them what the context leaves. See [streamed experts](#streamed-experts). |
@@ -415,8 +415,25 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --kv-format bf16
 BF16 avoids target KV quantization, uses approximately twice the target KV
 memory, and can be slower at long contexts. Model weights are unchanged. Restart
 to switch formats. Omit `--kv-format` or use `--kv-format int8` for the default.
-The [SSD cache](#ssd-cache) supports both formats, preserving their stored
+The [SSD cache](#ssd-cache) supports every format, preserving their stored
 bytes without further quantization.
+
+`--kv-format zbf16` keeps BF16 KV bit for bit in 0.81 of its memory (1.63 MiB
+instead of 2 MiB per 27B page, so 23% more context in the same memory): each
+value's sign and mantissa as they are, and its exponent as a 4-bit code in a
+16-binade window that each (layer, KV head, dimension) calibrates per model
+family, with the rare value outside its window listed as an escape
+(`runtime/metal/abi/KvZip.h`; the coding follows SplitZip). Outputs match
+`--kv-format bf16` bit for bit: prefill decodes the history a chunk attends into
+a BF16 scratch and runs the BF16 kernels, and decode's attention decodes each
+page into threadgroup memory and attends as BF16 does. Prefill costs about what
+BF16's does; decode attention is as fast as BF16's on the 27B and within 4-7%
+on the 35B (`dev/benchmarks/kv-formats.md`). Only dense model families with a
+calibration start (Qwen3.8-27B, Qwen3.6-35B-A3B); calibrate one from BF16 pages
+the persistent cache captured with `dev/tools/kvzip_calibrate.py`. A slab with
+more escapes than its table holds (252 per 8,192 values; real and repetitive
+prompts need under 200) stores the rest approximately: `/status` counts such
+slabs as `identity.kv.overflow_slabs` and the server logs an error.
 
 ### State precision
 

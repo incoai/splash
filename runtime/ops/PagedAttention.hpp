@@ -147,17 +147,21 @@ struct PrefillAttentionPlan final {
   // Whether the reduce adds the layer's learned sinks, which addPrefill then
   // takes: its geometry's (kCompiledAttention).
   const bool sinks;
+  // Whether ZBF16 history expands into the BF16 scratch (KvZipPrefill)
+  // before the split; a short chunk's split decodes its pages itself.
+  const bool zipExpand;
 
 private:
   friend class PagedAttention;
   PrefillAttentionPlan(uint32_t rows, uint32_t splits, AttentionWorkspace workspace,
                        std::string splitPipeline, std::string reducePipeline,
                        metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
-                       bool sparse, bool sinks, kv::Layout layout, uint32_t queryHeads)
+                       bool sparse, bool sinks, bool zipExpand, kv::Layout layout, uint32_t queryHeads)
       : layout(layout), queryHeads(queryHeads), rows(rows), tiles(kv::prefillAttentionTiles(rows)),
         splits(splits), workspace(workspace),
         splitPipeline(std::move(splitPipeline)), reducePipeline(std::move(reducePipeline)),
-        splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse), sinks(sinks) {}
+        splitGroups(splitGroups), reduceGroups(reduceGroups), sparse(sparse), sinks(sinks),
+        zipExpand(zipExpand) {}
 };
 
 struct VerifyAttentionPlan final {
@@ -243,9 +247,23 @@ struct PagedVerifyBuffers final {
   // The layer's learned sinks, an F32 per query head, for a plan whose
   // reduce adds them (VerifyAttentionPlan::sinks); none otherwise.
   metal::MetalBuffer sinks{};
+  // ZBF16's codec (kv::PageStorage::codec()); unused by other formats.
+  metal::MetalBuffer kvCodec{};
 };
 
-// Target attention over paged INT8 or BF16 history. Prefill and verify read
+// What ZBF16 prefill needs beside the BF16 path's buffers; empty for other
+// formats. A long chunk attends ZBF16 history through the BF16 kernels:
+// before the split it expands the history it attends, the chunk's rows
+// included, into the scratch, a BF16 extent of one layer whose pages
+// scratchTable names in logical order (kv::zipScratchPages()). A short one
+// reads the codec alone (PrefillAttentionPlan::zipExpand).
+struct KvZipPrefill final {
+  metal::MetalBuffer codec{};
+  metal::MetalBuffer scratch{};
+  metal::MetalBuffer scratchTable{};
+};
+
+// Target attention over paged INT8, BF16 or ZBF16 history. Prefill and verify read
 // the history one Page32 at a time, or, sparse, the blocks of their lists a
 // few at a time; neither changes cache ownership or commit semantics. A
 // layer's AttentionVariant selects its geometry's kernels: the projection's
@@ -331,7 +349,8 @@ public:
                               metal::MetalBuffer chunkValues,
                               metal::MetalBuffer pageTable,
                               const kv::ChunkedPrefillParams &params,
-                              kv::Layout layout);
+                              kv::Layout layout,
+                              const KvZipPrefill &zip = {});
   // Queries and output are [KV head][row][query head in group][dimension] and
   // must not alias. Encode the store before attention; both stay in one
   // compute encoder. The plan owns both dispatch grids and their exact scratch.
@@ -346,7 +365,7 @@ public:
                          metal::MetalBuffer pageTable,
                          const kv::ChunkedPrefillParams &chunk,
                          const PrefillAttentionPlan &plan, AttentionBlocks blocks = {},
-                         metal::MetalBuffer sinks = {});
+                         metal::MetalBuffer sinks = {}, const KvZipPrefill &zip = {});
   // Stores each lane's chunk (verifyParams, one per plan lane) and attends
   // its verify rows with the plan's split counts; with block locations, a
   // sparse plan's located split reads each listed block where its location

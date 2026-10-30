@@ -157,6 +157,10 @@ enum class PrefillTensor : uint32_t {
   // A prefill group's scratch GDN cell, which carries the state from a chunk
   // to the next when the lane's cells cannot (Runtime's prefill groups).
   GroupCell,
+  // ZBF16 prefill's BF16 scratch and its page table (ops::KvZipPrefill);
+  // empty for other KV formats.
+  ZipScratch,
+  ZipScratchTable,
   Count,
 };
 
@@ -222,8 +226,12 @@ public:
                 const ops::ExecutionPlans &operators)
       : bytes_(prefillArenaBytes(geometry, operators)), chunks_(geometry.prefillChunks) {
     const auto sizes = prefillTensorBytes(geometry, operators);
-    base_ = backend.allocateBuffer(bytes_, metal::BufferStorage::Shared,
-                                   "qwen-shared-prefill");
+    // ZBF16's scratch table names the scratch's pages by address, which
+    // only an Addressed allocation has.
+    base_ = backend.allocateBuffer(bytes_, metal::BufferStorage::Shared, "qwen-shared-prefill",
+                                   sizes[static_cast<uint32_t>(PrefillTensor::ZipScratch)]
+                                       ? metal::BufferReach::Addressed
+                                       : metal::BufferReach::Bound);
     uint64_t cursor = 0;
     for (uint32_t index = 0; index < sizes.size(); ++index) {
       if (sizes[index]) {
@@ -256,6 +264,13 @@ public:
     // Split projections return their counters to zero; they start there.
     if (const metal::MetalBuffer counters = get(PrefillTensor::LinearCounters))
       std::memset(counters.contents(), 0, counters.sizeBytes());
+    // The ZBF16 scratch's table names its pages in order.
+    if (const metal::MetalBuffer table = get(PrefillTensor::ZipScratchTable)) {
+      auto *entries = static_cast<SplashKvPage *>(table.contents());
+      const uint64_t extent = get(PrefillTensor::ZipScratch).gpuAddress();
+      for (uint32_t page = 0; page < kv::zipScratchPages(); ++page)
+        entries[page] = splash_kv_page_entry(extent, page);
+    }
   }
 
   // Chunk `chunk`'s view of a group's tensor (prefillGroupTensor), or the

@@ -134,6 +134,18 @@ RuntimeBootstrap::~RuntimeBootstrap() {
   resources_->backend().stop();
 }
 
+void RuntimeBootstrap::reportKvZipOverflow() {
+  const uint32_t slabs = resources_->kvPages().zipOverflowSlabs();
+  if (slabs == kvZipOverflowLogged_)
+    return;
+  logLine("error: ", slabs - kvZipOverflowLogged_,
+          " ZBF16 KV slabs had more escapes than their table holds and lost exponent "
+          "bits (", slabs, " since start); the requests that wrote them attend "
+          "approximate values. Recalibrate the model's bases "
+          "(dev/tools/kvzip_calibrate.py) or serve with --kv-format bf16.");
+  kvZipOverflowLogged_ = slabs;
+}
+
 std::string RuntimeBootstrap::statusJson(const RuntimeMetricsSnapshot &metrics,
                                          const NativeLoopTiming &loop) {
   // Status can arrive during GPU work; allocation/command boundaries and
@@ -147,7 +159,8 @@ std::string RuntimeBootstrap::statusJson(const RuntimeMetricsSnapshot &metrics,
       healthy, healthy ? std::string{} : backend.unhealthyReason(),
       nativeLoop_->resourceWaitSnapshot(), loop, nativeLoop_->weightsSnapshot(),
       resources_->aneFfnSnapshot(), thermalState_.state(), resources_->streamedTableStats(),
-      resources_->streamedExpertStats(), resources_->kvSpillStatus());
+      resources_->streamedExpertStats(), resources_->kvSpillStatus(),
+      resources_->kvPages().zipOverflowSlabs());
 }
 
 void RuntimeBootstrap::sampleThermalState() {

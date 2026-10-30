@@ -9,6 +9,7 @@
 #include "model/ExpertStore.hpp"
 #include "model/ModelSizing.hpp"
 #include "model/RuntimeArenas.hpp"
+#include "model/KvZipBases.hpp"
 #include "model/WeightStore.hpp"
 #include "ops/AneFfnMeasurement.hpp"
 #include "ops/KvSlotFormat.hpp"
@@ -520,7 +521,8 @@ makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
 }
 
 std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
-                                     const model::CompositeStateLayout &states) {
+                                     const model::CompositeStateLayout &states,
+                                     std::span<const uint8_t> kvZipBases) {
   const kv::Layout &kv = identity.kvLayout;
   const model::GdnStateLayout &gdn = states.target;
   const model::DraftStateLayout &draft = states.draft;
@@ -565,6 +567,9 @@ std::string persistentCacheNamespace(const RuntimeCacheIdentity &identity,
   if (const model::RopeScaling &rope = identity.ropeScaling; rope.yarn())
     canonical << "rope yarn " << std::setprecision(std::numeric_limits<double>::max_digits10) << rope.factor
               << ' ' << rope.originalContextTokens << '\n';
+  if (!kvZipBases.empty())
+    canonical << "kv bases " << model::weightDigest(kvZipBases) << " layout " << SPLASH_KVZIP_LAYOUT_VERSION
+              << '\n';
   // 128 bits name it.
   return model::weightDigest(canonical.str()).substr(0, CacheDirectory::kNamespaceDigits);
 }
@@ -617,6 +622,19 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         "metallib path, model root, a valid model layout, KV and state format, "
         "host memory and volume probes, build id and a merge-aligned image "
         "patch limit no larger than the protocol's are required");
+  }
+  // ZBF16 pages need their model family's calibrated exponent windows.
+  std::span<const uint8_t> kvZipBases;
+  if (config.kvFormat == kv::Format::ZipBFloat16) {
+    kv::Layout layout = config.model.targetKvLayout;
+    layout.format = config.kvFormat;
+    kvZipBases = model::kvZipBases(config.model.family(), layout);
+    if (!layout.valid() || kvZipBases.empty()) {
+      throw RuntimeResourcesError(
+          RuntimeResourceStage::Configuration,
+          "--kv-format zbf16 has no KV calibration for " + std::string(config.model.family()) +
+              "; calibrate one with dev/tools/kvzip_calibrate.py or use --kv-format bf16");
+    }
   }
   std::unique_ptr<metal::MetalBackend> backend;
   try {
@@ -1031,7 +1049,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // them whatever room the volume has, as the first engine's context it
     // keeps may rest on them.
     const std::string cacheNamespace =
-        persistentCacheNamespace(cacheIdentity, loaded.stateLayout(config.stateFormat));
+        persistentCacheNamespace(cacheIdentity, loaded.stateLayout(config.stateFormat), kvZipBases);
     // The KV file's slots hold a page as the tier lays it out, checksummed by
     // segment when persistent, and the writes of both files hold back while
     // a step waits for reads.
@@ -1102,7 +1120,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         std::numeric_limits<uint32_t>::max() / budget.kvExtentPages);
     auto kvPages = std::make_unique<kv::PageStorage>(
         *backend, memoryGovernor->allocationAdmission(), kvLayout,
-        static_cast<uint32_t>(poolExtents * budget.kvExtentPages), budget.kvExtentPages);
+        static_cast<uint32_t>(poolExtents * budget.kvExtentPages), budget.kvExtentPages,
+        kvZipBases);
     auto kvPool = std::make_unique<KvPool>(*kvPages, model::ExecutionLimits::warmupKvPages);
     auto stateStorage = std::make_unique<model::QwenStateStorage>(
         *backend, memoryGovernor->allocationAdmission(), loaded.stateLayout(config.stateFormat),

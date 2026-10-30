@@ -144,6 +144,7 @@ public:
     // (MemoryControl::run).
     [[nodiscard]] bool controlPass(MemoryPressure pressure) {
         sampleThermalState();
+        reportKvZipOverflow();
         resources_->cache().keepDiskLimit();
         return memoryControl_.run(pressure);
     }
@@ -171,6 +172,11 @@ private:
     MemoryControl memoryControl_;
     RuntimeBootstrapReport report_;
     ThermalStateReporter thermalState_;
+    // ZBF16 overflowing slabs already logged (reportKvZipOverflow).
+    uint32_t kvZipOverflowLogged_ = 0;
+
+    // Logs ZBF16 slabs that dropped escapes since the last pass.
+    void reportKvZipOverflow();
 };
 
 }  // namespace splash::engine

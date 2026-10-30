@@ -290,6 +290,8 @@ struct QwenTargetPrefillBuffers final {
   metal::MetalBuffer ropeInverseFrequencies;
   metal::MetalBuffer chunkKeys;
   metal::MetalBuffer chunkValues;
+  // ZBF16's codec and BF16 scratch; empty for other formats.
+  ops::KvZipPrefill kvZip;
   ops::MoeScratch moe;
 
   // The dense FFN's buffers among these.
@@ -350,6 +352,8 @@ struct QwenTargetVerifyBuffers final {
   // Each lane's pages' block index, for a layout with one
   // (ops::BlockIndex::tables).
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> indexTables;
+  // ZBF16's KV codec (kv::PageStorage::codec()); empty for other formats.
+  metal::MetalBuffer kvCodec;
   ops::MoeScratch moe;
   // Each lane's verify rows (ops::DraftSelector::addVerifyRows), which a MoE target's
   // steps route alone (ops::MoeBuffers::verifyRows).

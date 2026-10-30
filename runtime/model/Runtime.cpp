@@ -250,6 +250,8 @@ QwenTargetPrefillBuffers prefillBuffers(const PrefillArena &arena, uint32_t chun
   buffers.ropeInverseFrequencies = arena.get(PrefillTensor::TargetInverseFrequencies);
   buffers.chunkKeys = arena.get(PrefillTensor::ChunkKeys);
   buffers.chunkValues = arena.get(PrefillTensor::ChunkValues);
+  buffers.kvZip.scratch = arena.get(PrefillTensor::ZipScratch);
+  buffers.kvZip.scratchTable = arena.get(PrefillTensor::ZipScratchTable);
   buffers.moe = arena.moeScratch(chunk);
   return buffers;
 }
@@ -1775,6 +1777,7 @@ struct Runtime::Impl {
       const auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor, c); };
       QwenTargetPrefillChunk &model = modelChunks.emplace_back();
       model.buffers = prefillBuffers(*prefillArena, c);
+      model.buffers.kvZip.codec = kvPages.codec();
       model.rows = chunk.rows;
       if (begins) {
         addRopeTables(graph, p(PrefillTensor::TargetPositions), chunk.rows, p(PrefillTensor::DraftPositions),
@@ -2045,6 +2048,7 @@ struct Runtime::Impl {
     buffers.chunkKeys = chunkKeys;
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
+    buffers.kvCodec = kvPages.codec();
     buffers.verifyRows = decodeArena->batchSlice(DecodeTensor::VerifyRows, lanes);
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chunks[lane] = ops::PagedAttention::verifyParams(

@@ -77,7 +77,9 @@ OPTIONS = {
         {"</think>": "</think>", "Time is up.\n</think>": "Time is up.\n</think>"},
         (),
     ),
-    "--kv-format": values("--kv-format", {"int8": "int8", "bf16": "bf16"}, ("fp16",)),
+    "--kv-format": values(
+        "--kv-format", {"int8": "int8", "bf16": "bf16", "zbf16": "zbf16"}, ("fp16",)
+    ),
     "--state-format": values(
         "--state-format", {"fp32": "fp32", "bf16": "bf16"}, ("fp16", "int8")
     ),
