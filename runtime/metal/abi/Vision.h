@@ -29,10 +29,12 @@ static_assert(sizeof(VisionNormParams) == 4,
 struct VisionGridParams {
   uint32_t grid_height;
   uint32_t grid_width;
+  // 1 for an image, 2 for a video temporal patch of two distinct frames.
+  uint32_t frames;
 };
 
-static_assert(sizeof(VisionGridParams) == 8,
-              "Vision grid parameters are 8 bytes on both sides");
+static_assert(sizeof(VisionGridParams) == 12,
+              "Vision grid parameters are 12 bytes on both sides");
 
 struct VisionQkvParams {
   uint32_t tokens;

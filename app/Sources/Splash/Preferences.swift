@@ -444,6 +444,13 @@ extension LaunchOption {
                                                                            parse: whole)),
             requires: [Requirement("Needs the model’s vision (Text only off).") { $0["--language-only"] != "true" }]),
         LaunchOption(
+            flag: "--max-video-pixels", title: "Video pixels",
+            help: "The pixels all sampled frames of one video may total, 1,024 to 83,886,080; the model’s own is 25,165,824, about 12K tokens.",
+            section: .requests,
+            kind: .choice(standard: "The model’s", choices: [], custom: Value(prompt: "25165824", message: "Pixels, 1,024 to 83,886,080.",
+                                                                              parse: whole)),
+            requires: [Requirement("Needs the model’s vision (Text only off).") { $0["--language-only"] != "true" }]),
+        LaunchOption(
             flag: "--decode-share", title: "Decode share",
             help: "Seconds of answering for each second spent reading a new prompt: more keeps answers flowing, less starts the new one sooner; 0 takes turns step by step.",
             section: .requests,

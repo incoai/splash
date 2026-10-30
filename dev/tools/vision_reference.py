@@ -238,7 +238,19 @@ def block_major_positions(grid_h: int, grid_w: int):
 
 
 def patchify(pixels: np.ndarray) -> tuple[np.ndarray, int, int]:
-    """pixels: (H, W, 3) uint8 with sides divisible by 32 -> (tokens, 1536)."""
+    """pixels: (H, W, 3) uint8 with sides divisible by 32, or (2, H, W, 3) for
+    a video temporal patch of two frames -> (tokens, 1536). An image's single
+    frame fills both temporal positions, as Qwen's processor repeats it."""
+    if pixels.ndim == 4:
+        if pixels.shape[0] != 2:
+            raise ValueError("a temporal patch holds two frames")
+        (first, grid_h, grid_w), (second, _, _) = (
+            patchify(pixels[0]),
+            patchify(pixels[1]),
+        )
+        tokens = grid_h * grid_w
+        frames = [p.reshape(tokens, 3, 2, -1)[:, :, 0] for p in (first, second)]
+        return np.stack(frames, axis=2).reshape(tokens, -1), grid_h, grid_w
     height, width, channels = pixels.shape
     if channels != 3 or height % (PATCH * MERGE) or width % (PATCH * MERGE):
         raise ValueError("image must be RGB with sides divisible by 32")
@@ -364,19 +376,23 @@ def fixture_image(height: int = 96, width: int = 128) -> np.ndarray:
     return np.clip(np.stack([red, green, blue], axis=-1), 0, 255).astype(np.uint8)
 
 
-def write_fixture(root: Path, out: Path, height: int = 96, width: int = 128) -> None:
+def write_fixture(
+    root: Path, out: Path, height: int = 96, width: int = 128, frames: int = 1
+) -> None:
     layout, weights = load_model(root)
     pixels = fixture_image(height, width)
+    if frames == 2:
+        # A second frame that differs everywhere: the image moved and darkened.
+        pixels = np.stack([pixels, np.roll(pixels, (8, 24), axis=(0, 1)) // 2])
     expected = encode(layout, weights, pixels).astype(np.float32)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "grid.txt").write_text(
-        f"{pixels.shape[0] // PATCH} {pixels.shape[1] // PATCH}\n"
-    )
+    grid = f"{height // PATCH} {width // PATCH}" + (" 2" if frames == 2 else "")
+    (out / "grid.txt").write_text(grid + "\n")
     (out / "pixels.bin").write_bytes(pixels.tobytes())
     (out / "expected_fp32.bin").write_bytes(expected.tobytes())
     print(
-        f"wrote parity fixture for grid {pixels.shape[0] // PATCH}x"
-        f"{pixels.shape[1] // PATCH}: {expected.shape} embeddings"
+        f"wrote parity fixture for grid {height // PATCH}x{width // PATCH}, "
+        f"{frames} frame(s): {expected.shape} embeddings"
     )
 
 
@@ -386,5 +402,6 @@ if __name__ == "__main__":
     parser.add_argument("output", type=Path)
     parser.add_argument("--height", type=int, default=96)
     parser.add_argument("--width", type=int, default=128)
+    parser.add_argument("--frames", type=int, choices=(1, 2), default=1)
     args = parser.parse_args()
-    write_fixture(args.model, args.output, args.height, args.width)
+    write_fixture(args.model, args.output, args.height, args.width, args.frames)

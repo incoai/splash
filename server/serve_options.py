@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
-from . import images, origins
+from . import images, origins, videos
 from .chat_format import REASONING_EFFORTS
 from .http_security import validate_api_key
 from .protocol import MAX_THINKING_END_TOKENS
@@ -277,6 +277,18 @@ def parse_max_image_pixels(value):
     if not images.MIN_PIXELS <= pixels <= images.MAX_PIXELS:
         raise argparse.ArgumentTypeError(
             f"must be between {images.MIN_PIXELS} and {images.MAX_PIXELS} pixels"
+        )
+    return pixels
+
+
+def parse_max_video_pixels(value):
+    try:
+        pixels = int(value)
+    except ValueError:
+        pixels = 0
+    if not videos.MIN_PIXELS <= pixels <= videos.MAX_PIXELS:
+        raise argparse.ArgumentTypeError(
+            f"must be between {videos.MIN_PIXELS} and {videos.MAX_PIXELS} pixels"
         )
     return pixels
 
@@ -717,6 +729,20 @@ SERVE_OPTIONS = (
             "--max-image-patches", text=lambda pixels: str(images.max_patches(pixels))
         ),
         needs="vision",
+    ),
+    ServeOption(
+        "--max-video-pixels",
+        "requests",
+        dict(
+            type=parse_max_video_pixels,
+            default=None,
+            metavar="PIXELS",
+            help="pixels all sampled frames of one video may total, in place "
+            "of the model's video processor size.longest_edge, "
+            f"{videos.MIN_PIXELS}–{videos.MAX_PIXELS} (default: the model's, "
+            f"{videos.PUBLISHED_CONFIG.max_pixels} for the Qwen models, about "
+            "12K tokens)",
+        ),
     ),
     ServeOption(
         "--request-timeout",

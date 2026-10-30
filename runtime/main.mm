@@ -6,6 +6,7 @@
 #include "engine/Bootstrap.hpp"
 #include "engine/Json.hpp"
 #include "engine/NativeArguments.hpp"
+#include "engine/VideoFrames.hpp"
 #include "model/ModelDescriptor.hpp"
 
 #include <IOKit/pwr_mgt/IOPMLib.h>
@@ -158,6 +159,8 @@ void printUsage(std::string_view executable) {
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_HEADERS [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " device-check");
+  writeStderrLine("       " + command + " video-frames probe FILE");
+  writeStderrLine("       " + command + " video-frames decode FILE WIDTH HEIGHT [--software]");
   writeStderrLine("       " + command + " families");
 }
 
@@ -508,6 +511,8 @@ int main(int argc, char **argv) {
         return splash::checkDevice(argc);
       if (command == "model-check")
         return splash::checkModel(argc, argv);
+      if (command == "video-frames")
+        return splash::video::runVideoFrames(argc, argv);
       if (command == "families")
         return splash::printFamilies(argc);
       if (command == "serve-native")
