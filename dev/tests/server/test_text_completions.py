@@ -174,7 +174,7 @@ class TextCompletionTests(unittest.TestCase):
         self.assertEqual(response["choices"][0]["text"], "first ")
         self.assertEqual(response["choices"][0]["finish_reason"], "stop")
         self.assertEqual(response["usage"]["completion_tokens"], 2)
-        self.assertEqual(runtime.cancel_count, 1)
+        self.assertEqual((runtime.stop_count, runtime.cancel_count), (1, 0))
         for stop in ("", ["x"] * 5, 3):
             with self.subTest(stop=stop):
                 status, response = self.complete(harness, stop=stop)

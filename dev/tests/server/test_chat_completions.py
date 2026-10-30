@@ -143,7 +143,7 @@ class ChatCompletionTests(HarnessTestCase):
         self.assertEqual(response["choices"][0]["message"]["content"], "first ")
         self.assertEqual(response["choices"][0]["finish_reason"], "stop")
         self.assertEqual(response["usage"]["completion_tokens"], 2)
-        self.assertEqual(runtime.cancel_count, 1)
+        self.assertEqual((runtime.stop_count, runtime.cancel_count), (1, 0))
 
     def test_usage_counts_only_tokens_before_the_thinking_delimiter(self):
         # The fake vocabulary's </think> is token 26.

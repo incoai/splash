@@ -757,7 +757,7 @@ class NativeBackend:
             with self.lock:
                 call = state.call
             if call is not None:
-                call.cancel()
+                call.stop()
 
         def emit(text):
             job.events.put(("text", text))
@@ -918,10 +918,11 @@ class NativeBackend:
             if (
                 job.constraint is not None
                 and done.reason != wire.FinishReason.CANCELLED
+                and state.streamer.stop_sequence is None
             ):
                 # The grammar checks what was generated after the last mask. A
-                # cancelled request needs no check, and its last mask may
-                # still be computing.
+                # cancelled request, or one a stop sequence ended, needs no
+                # check, and its last mask may still be computing.
                 job.constraint.finish()
             state.streamer.end()
             job.reasoning_tokens = state.streamer.count_reasoning_tokens(

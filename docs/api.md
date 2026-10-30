@@ -642,7 +642,7 @@ Proxy consumers can use these fields; additional fields may be added:
 
 | Field | Meaning |
 | --- | --- |
-| `requests.submitted`, `completed`, `cancelled`, `failed` | Native request counters since engine start |
+| `requests.submitted`, `completed`, `cancelled`, `failed` | Native request counters since engine start; a request a stop sequence ended counts as `completed`, not `cancelled` |
 | `active_requests` | Each request the engine holds, ordered by `id`: its `id`, `phase` (`queued`, `waiting_resources`, `waiting_prefix`, `prefill`, `decode` or `waiting_mask`, and `failed` for one whose deadline passed while a cached state it restores was being read from disk, until that read drains), `priority`, `prompt_tokens` and how many of them are encoded (`prompt_processed`, cached ones included), `generated_tokens` of `max_new_tokens`, where a block-sparse target keeps its KV (`kv_mode`: `resident` or `spill`, only while its KV can go to the SSD), and `age_ms` since it arrived |
 | `memory_actual.current_bytes`, `peak_bytes` | Metal allocations, not process RSS |
 | `weights.idle_release_seconds`, `released`, `restoring`, `restores`, `restore_failures` | `--idle-release` in seconds (`null` for `off`), whether the weights' memory is released now, whether a request's restore of it is under way (it stays `released` until the last image is back), the times it was restored for a request since engine start, and the restores that gave up for want of memory |

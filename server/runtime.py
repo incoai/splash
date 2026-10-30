@@ -227,11 +227,29 @@ class RuntimeCall:
             return self._result
 
     def cancel(self) -> bool:
+        """Ask native to abandon this request; it finishes as cancelled.
+
+        Returns False, writing nothing, once the call is done or a cancel or
+        stop was already requested.
+        """
+        return self._request_end(wire.CancelFrame(self.request_id))
+
+    def stop(self) -> bool:
+        """Ask native to end this request at a client stop condition.
+
+        Native finishes it as stopped, a normal completion, or as cancelled
+        when it never started. Shares `cancel`'s latch: returns False, writing
+        nothing, once the call is done or a cancel or stop was already
+        requested.
+        """
+        return self._request_end(wire.StopFrame(self.request_id))
+
+    def _request_end(self, frame: wire.CancelFrame | wire.StopFrame) -> bool:
         with self._lock:
             if self._event.is_set() or self._cancel_requested:
                 return False
             self._cancel_requested = True
-        self._client._cancel_call(self)
+        self._client._cancel_call(self, frame)
         return True
 
     def _emit(self, message: wire.EngineEvent) -> None:
@@ -1043,9 +1061,11 @@ class MultiplexedRuntime:
         if failure:
             raise failure
 
-    def _cancel_call(self, call: RuntimeCall) -> None:
+    def _cancel_call(
+        self, call: RuntimeCall, frame: wire.CancelFrame | wire.StopFrame
+    ) -> None:
         try:
-            encoded = wire.serialize_message(wire.CancelFrame(call.request_id))
+            encoded = wire.serialize_message(frame)
             self._write_bytes(encoded, call.generation, call=call)
             with call._lock:
                 if not call.done:

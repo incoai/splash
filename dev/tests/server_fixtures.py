@@ -317,6 +317,7 @@ class Plan:
         if not block:
             self.release.set()
         self.cancelled = threading.Event()
+        self.stopped = False
         self.start_release = threading.Event()
         self.terminal = threading.Event()
         self.terminal_release = threading.Event()
@@ -384,12 +385,28 @@ class FakeCall:
                 return False
             self.cancel_requested = True
         self.runtime.cancel_count += 1
+        self._release_plan()
+        return True
+
+    def stop(self):
+        """A client stop condition: shares cancel's latch, and the request
+        still finishes as stopped."""
+        with self._lock:
+            if self._done or self.cancel_requested:
+                return False
+            self.cancel_requested = True
+        self.runtime.stop_count += 1
+        if self.plan is not None:
+            self.plan.stopped = True
+        self._release_plan()
+        return True
+
+    def _release_plan(self):
         if self.plan is not None:
             self.plan.cancelled.set()
             self.plan.start_release.set()
             self.plan.release.set()
             self.plan.terminal_release.set()
-        return True
 
 
 class FakeRuntime:
@@ -403,6 +420,7 @@ class FakeRuntime:
         self.requests = []
         self.calls = []
         self.cancel_count = 0
+        self.stop_count = 0
         self.closed = False
         self.ready = True
         self.readiness = READY
@@ -485,7 +503,9 @@ class FakeRuntime:
                 completion += len(tokens)
                 plan.cancelled.wait(plan.delay)
         reason = (
-            wire.FinishReason.CANCELLED
+            wire.FinishReason.STOP
+            if plan.stopped
+            else wire.FinishReason.CANCELLED
             if plan.cancelled.is_set()
             else {
                 "stop": wire.FinishReason.STOP,
