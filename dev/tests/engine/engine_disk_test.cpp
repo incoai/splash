@@ -11,6 +11,7 @@
 #include "engine/Engine.hpp"
 
 #include <algorithm>
+#include <array>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -1504,6 +1505,66 @@ void testAsyncRestoreLifecycle() {
   }
 }
 
+// A stop of a lane that has output and is restoring its state from disk
+// waits for the read to drain, then finishes as Stop.
+void testStopWhileRestoringFinishesAfterTheRestore() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor;
+  executor.decodeFinishes = false;
+  // The prompt's state stays on disk only: no lane captures another, and the
+  // restore keeps no copy in memory, so the lane's resumption reads it again.
+  executor.deniedReservations = std::numeric_limits<uint32_t>::max();
+  executor.restoreControl->ready = true;
+  executor.restoreControl->promotionDenied = true;
+  Events events;
+  engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
+  guardReleases(storage, engine);
+  const std::vector<uint32_t> prompt(65, 17);
+  publishDiskState(cache, prompt);
+  // Lane 1, with the shortest prompt the least work, yields its lane to a
+  // Foreground arrival once all the lanes are full.
+  for (uint64_t id = 1; id <= 4; ++id) {
+    EngineRequest lane = request(id, id == 1 ? prompt : std::vector<uint32_t>(129, id));
+    lane.maxNewTokens = 1000;
+    engine.submit(std::move(lane));
+  }
+  double now = 1;
+  tickUntil(engine, now,
+            [&] {
+              return std::ranges::all_of(std::array<uint64_t, 4>{1, 2, 3, 4},
+                                         [&](uint64_t id) { return !events.outputs[id].empty(); });
+            },
+            "the lanes did not decode");
+  // Once the arrival finishes, lane 1 resumes into a restore that is held:
+  // the second read of the only state on disk.
+  executor.restoreControl = std::make_shared<RestoreControl>();
+  executor.restoreControl->promotionDenied = true;
+  EngineRequest arriving = request(5, std::vector<uint32_t>(9, 5));
+  arriving.priority = RequestPriority::Foreground;
+  engine.submit(std::move(arriving));
+  tickUntil(engine, now, [&] { return events.usage.contains(5) && executor.diskReads == 2; },
+            "the suspended lane did not resume into a disk restore");
+  require(engine.snapshot().prioritySuspensions == 1 && !events.reasons.contains(1),
+          "the arrival did not suspend the lane");
+
+  engine.stop(1);
+  static_cast<void>(engine.tick(now++));
+  require(!events.reasons.contains(1) && executor.restoreControl->cancelled,
+          "a stop while restoring finished before the restore drained");
+  executor.restoreControl->ready = true;
+  tickUntil(engine, now, [&] { return events.reasons.contains(1); }, "the stopped request did not end");
+  for (uint64_t id = 2; id <= 4; ++id)
+    engine.cancel(id);
+  tickUntil(engine, now, [&] { return idle(engine); }, "the engine did not become idle");
+
+  const EngineSnapshot counts = engine.snapshot();
+  require(events.reasons.at(1) == EngineFinishReason::Stop && counts.completed == 2 &&
+              counts.cancelled == 3 && counts.failed == 0,
+          "a stop while restoring did not finish as Stop after the restore");
+}
+
 // A disk hit refused memory drops its own pin and activates without the prefix, then finds the
 // state again and reads it only once it holds its lane.
 void testDiskHitWithNoActiveMemory() {
@@ -2225,6 +2286,7 @@ std::span<const test::TestCase> diskTests() {
       {"testNothingInFlightIsNotPending", testNothingInFlightIsNotPending},
       {"testKvGrowthProceedsThroughDemotion", testKvGrowthProceedsThroughDemotion},
       {"testAsyncRestoreLifecycle", testAsyncRestoreLifecycle},
+      {"testStopWhileRestoringFinishesAfterTheRestore", testStopWhileRestoringFinishesAfterTheRestore},
       {"testDiskHitWithNoActiveMemory", testDiskHitWithNoActiveMemory},
       {"testABatchRefusalOfNothingOnItsWayBackHoldsNoOne", testABatchRefusalOfNothingOnItsWayBackHoldsNoOne},
       {"testStateWithoutACacheSlotGoesToDisk", testStateWithoutACacheSlotGoesToDisk},

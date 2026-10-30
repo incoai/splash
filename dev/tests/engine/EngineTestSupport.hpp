@@ -55,10 +55,11 @@ public:
     maskRequests.emplace_back(
         requestId, std::vector<uint32_t>(simulation.begin(), simulation.end()));
   }
-  void completed(uint64_t id, engine::EngineFinishReason, bool bounded, uint32_t prompt,
+  void completed(uint64_t id, engine::EngineFinishReason reason, bool bounded, uint32_t prompt,
                  uint32_t completion, uint32_t deduplicated,
                  std::span<const float>, const engine::SpeculativeCounts &speculation) override {
     ++completedCount;
+    reasons[id] = reason;
     if (bounded)
       boundedIds.push_back(id);
     usage[id] = {prompt, completion};
@@ -87,6 +88,7 @@ public:
   std::vector<uint64_t> startIds;
   std::unordered_map<uint64_t, std::vector<uint32_t>> outputs;
   std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> usage;
+  std::unordered_map<uint64_t, engine::EngineFinishReason> reasons;
   // The requests that ended at a bound of the engine's own.
   std::vector<uint64_t> boundedIds;
   std::unordered_map<uint64_t, uint32_t> deduplicatedTokens;

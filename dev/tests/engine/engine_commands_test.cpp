@@ -452,6 +452,50 @@ void testALaneSuspendedBetweenPassesAbandonsItsCommand() {
   }
 }
 
+// A stop that reaches a lane between its command's passes ends it with that
+// command: a lane with output is there only when it resumes from a
+// suspension and replays its tokens. It finishes as Stop, counted completed,
+// and emits nothing more.
+void testAStopBetweenPassesFinishesAsStop() {
+  PassingEngine passing;
+  // Lane 1, with the shortest prompt the least work, yields its lane to a
+  // Foreground arrival.
+  for (uint64_t id = 1; id <= 4; ++id) {
+    EngineRequest lane = request(id, std::vector<uint32_t>(id == 1 ? 100 : 300, static_cast<uint32_t>(id)));
+    lane.priority = RequestPriority::Background;
+    lane.maxNewTokens = 1000;
+    passing.engine.submit(std::move(lane));
+  }
+  passing.tickUntil(
+      [&] {
+        return std::ranges::all_of(std::array<uint64_t, 4>{1, 2, 3, 4},
+                                   [&](uint64_t id) { return !passing.events.outputs[id].empty(); });
+      },
+      "the Background lanes did not decode");
+  passing.submit(5, 100, RequestPriority::Foreground);
+  const size_t arrived = passing.commands.size();
+  const auto replayBetweenPasses = [&] {
+    if (passing.engine.commandInFlight() || passing.commands.size() == arrived)
+      return false;
+    const PassingEngine::Command &last = passing.commands.back();
+    return last.kind == WorkKind::Prefill && last.lanes == std::vector<uint64_t>{1} && last.pass + 1 < last.passes;
+  };
+  passing.tickUntil([&] { return passing.events.usage.contains(5) && replayBetweenPasses(); },
+                    "the suspended lane did not resume into a replay in passes");
+  require(passing.engine.snapshot().prioritySuspensions == 1, "the arrival did not suspend the lane");
+  const size_t emitted = passing.events.outputs.at(1).size();
+
+  passing.engine.stop(1);
+  passing.tickUntil([&] { return passing.events.reasons.contains(1); }, "the stopped lane did not end");
+  for (uint64_t id = 2; id <= 4; ++id)
+    passing.engine.cancel(id);
+  passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
+  const EngineSnapshot counts = passing.engine.snapshot();
+  require(passing.events.reasons.at(1) == EngineFinishReason::Stop && passing.events.outputs.at(1).size() == emitted &&
+              counts.completed == 2 && counts.cancelled == 3 && counts.failed == 0,
+          "a stop between a replay's passes did not finish as Stop with nothing more emitted");
+}
+
 // A higher-priority prompt refused its KV takes the memory of the Background
 // command between its passes, which a suspension would abandon anyway, before
 // any lane yields: no lane is suspended, and the command reruns from a first pass.
@@ -1273,6 +1317,7 @@ std::span<const test::TestCase> commandsTests() {
       {"testAHigherPriorityIsNotHeldBehindPasses", testAHigherPriorityIsNotHeldBehindPasses},
       {"testLanesCancelledBetweenPassesHoldNoArrivalBack", testLanesCancelledBetweenPassesHoldNoArrivalBack},
       {"testALaneSuspendedBetweenPassesAbandonsItsCommand", testALaneSuspendedBetweenPassesAbandonsItsCommand},
+      {"testAStopBetweenPassesFinishesAsStop", testAStopBetweenPassesFinishesAsStop},
       {"testAHigherPriorityTakesWhatACommandBetweenPassesHolds",
        testAHigherPriorityTakesWhatACommandBetweenPassesHolds},
       {"testAHigherPriorityStartBesideACommandBetweenPassesIsAStart",

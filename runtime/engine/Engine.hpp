@@ -237,8 +237,8 @@ struct EngineSnapshot final {
 // (Types.hpp): its own result, which the engine reports and survives. submit()
 // reports an invalid request with std::invalid_argument, which the caller
 // answers with that request's error. Any other exception out of submit(), and
-// every exception out of tick(), cancel(), failRequest(), provideMask(),
-// collectLandings() and flushRestorePoints(), is
+// every exception out of tick(), cancel(), stop(), failRequest(),
+// provideMask(), collectLandings() and flushRestorePoints(), is
 // engine-fatal: NativeRuntime reports EngineUnhealthy and the process exits.
 // Code below them therefore does not roll back on an exception; the only
 // cleanup on that path is RAII teardown itself needs (state IO drains,
@@ -256,6 +256,10 @@ public:
   // server's per-image patch cap.
   void submit(EngineRequest request);
   void cancel(uint64_t requestId);
+  // Ends a request as cancel() does (settle), but as EngineFinishReason::Stop,
+  // counted completed as one that ends at its stop token is. One that has
+  // generated nothing yet is cancelled; an unknown id is ignored.
+  void stop(uint64_t requestId);
   void failRequest(uint64_t requestId, LaneOutcome outcome, std::string message);
   void provideMask(uint64_t requestId, std::span<const uint32_t> words);
   void setCompletionNotifier(std::function<void()> notifier);
@@ -1076,9 +1080,9 @@ private:
   // waits there (the command's mask wait is abandoned, the restore's read
   // cancelled) and apply()/pollRestores() settle it once that work drains;
   // so it does while the command between its passes holds it
-  // (PassCommand::laneEnded). Otherwise the request ends now:
-  // Cancelled completes it, any other outcome fails it. A lane of either
-  // command ends at its deadline so (tick).
+  // (PassCommand::laneEnded). Otherwise the request ends now: Cancelled and
+  // Stopped complete it (as Cancelled and Stop), any other outcome fails it.
+  // A lane of either command ends at its deadline so (tick).
   void settle(Request &request, LaneEnd end);
   [[nodiscard]] static LaneEnd deadlineEnd();
   [[nodiscard]] static LaneEnd capacityExhausted(std::string_view what,

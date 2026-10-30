@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -1885,6 +1886,70 @@ void testImpossibleSpeculativeCountsFailOnlyTheirOwnLane() {
           "invalid speculative counts poisoned another request's completion");
 }
 
+// A client stop finishes a request that has output as Stop, counted
+// completed; one that has generated nothing yet is cancelled; a repeated or
+// unknown id is ignored.
+void testStopFinishesARequestAsStopped() {
+  test::EngineHarness h;
+  h.model.decodeFinishes = false;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
+  EngineRequest generating = h.request(1, std::vector<uint32_t>(40, 3));
+  generating.maxNewTokens = 64;
+  engine.submit(generating);
+  h.runUntil([&] { return !events.outputs[1].empty(); }, "the request produced no output", 1000);
+
+  engine.stop(1);
+  engine.submit(h.request(2, std::vector<uint32_t>(40, 5)));
+  engine.stop(2);
+  h.runUntilIdle(1000);
+
+  require(events.reasons.at(1) == EngineFinishReason::Stop &&
+              events.usage.at(1).second < generating.maxNewTokens,
+          "a stopped request did not finish early as Stop");
+  require(events.reasons.at(2) == EngineFinishReason::Cancelled,
+          "a request stopped before any output was not cancelled");
+  const EngineSnapshot counts = engine.snapshot();
+  require(counts.completed == 1 && counts.cancelled == 1 && counts.failed == 0,
+          "a stopped request was not counted completed");
+
+  engine.stop(1);
+  engine.stop(999);
+
+  const EngineSnapshot after = engine.snapshot();
+  require(events.completedCount == 2 && events.failedCount == 0 && after.completed == 1 &&
+              after.cancelled == 1 && after.failed == 0,
+          "a stop of a finished or unknown id was not ignored");
+}
+
+// A stop of a lane inside the in-flight command waits for the command to
+// drain, then finishes as Stop without emitting that command's output.
+void testStopInFlightFinishesAfterTheCommand() {
+  test::EngineHarness h;
+  h.model.decodeFinishes = false;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
+  EngineRequest generating = h.request(1, std::vector<uint32_t>(40, 3));
+  generating.maxNewTokens = 64;
+  engine.submit(generating);
+  h.runUntil([&] { return !events.outputs[1].empty(); }, "the request produced no output", 1000);
+  h.model.holdDecodeUntil = std::make_shared<std::atomic<bool>>(false);
+  h.runUntil([&] { return engine.commandInFlight(); }, "the request did not launch a held decode", 1000);
+  const size_t emittedBefore = events.outputs.at(1).size();
+
+  engine.stop(1);
+  static_cast<void>(h.tick());
+  require(engine.commandInFlight() && events.completedCount == 0,
+          "an in-flight stop finished before its command drained");
+  *h.model.holdDecodeUntil = true;
+  h.runUntilIdle(1000);
+
+  const EngineSnapshot counts = engine.snapshot();
+  require(events.reasons.at(1) == EngineFinishReason::Stop && counts.completed == 1 &&
+              counts.cancelled == 0 && events.outputs.at(1).size() == emittedBefore,
+          "an in-flight stop did not finish as Stop after its command");
+}
+
 } // namespace
 
 std::span<const test::TestCase> requestsTests() {
@@ -1951,6 +2016,8 @@ std::span<const test::TestCase> requestsTests() {
        testNonFiniteFirstStepAfterARestoreInvalidatesTheState},
       {"testNonFiniteLaterStepKeepsTheRestoredState", testNonFiniteLaterStepKeepsTheRestoredState},
       {"testNonFiniteStepAfterCancellationInvalidatesTheState", testNonFiniteStepAfterCancellationInvalidatesTheState},
+      {"testStopFinishesARequestAsStopped", testStopFinishesARequestAsStopped},
+      {"testStopInFlightFinishesAfterTheCommand", testStopInFlightFinishesAfterTheCommand},
   };
   return kTests;
 }
