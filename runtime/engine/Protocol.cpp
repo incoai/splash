@@ -28,6 +28,7 @@ constexpr uint64_t kCancelFixedBytes = 8;
 constexpr uint64_t kMaskResponseFixedBytes = 20;
 constexpr uint64_t kStatusRequestFixedBytes = 8;
 constexpr uint64_t kReleaseRequestFixedBytes = 8;
+constexpr uint64_t kStopFixedBytes = 8;
 constexpr uint64_t kReadyFixedBytes = 9;
 constexpr uint64_t kStartFixedBytes = 16;
 constexpr uint64_t kPromptProgressFixedBytes = 20;
@@ -90,6 +91,8 @@ std::optional<PayloadBounds> payloadBounds(FrameType type,
     return bounded(kStatusRequestFixedBytes, kStatusRequestFixedBytes);
   case FrameType::ReleaseRequest:
     return bounded(kReleaseRequestFixedBytes, kReleaseRequestFixedBytes);
+  case FrameType::Stop:
+    return bounded(kStopFixedBytes, kStopFixedBytes);
   default:
     // The engine never receives an event.
     return std::nullopt;
@@ -129,6 +132,7 @@ bool clientFrameType(uint16_t raw, FrameType &type) {
   case FrameType::MaskResponse:
   case FrameType::StatusRequest:
   case FrameType::ReleaseRequest:
+  case FrameType::Stop:
     type = static_cast<FrameType>(raw);
     return true;
   default:
@@ -395,6 +399,13 @@ std::optional<ProtocolIssue> validateCancel(const CancelFrame &cancel) {
     return std::nullopt;
   return requestIssue(IssueCode::InvalidRequestId, 0,
                       "cancel request id must be non-zero");
+}
+
+std::optional<ProtocolIssue> validateStop(const StopFrame &stop) {
+  if (stop.requestId)
+    return std::nullopt;
+  return requestIssue(IssueCode::InvalidRequestId, 0,
+                      "stop request id must be non-zero");
 }
 
 std::optional<ProtocolIssue>
@@ -809,6 +820,20 @@ ProtocolResult<ClientMessage> decodeCancel(const Frame &frame) {
   return success(ClientMessage{cancel});
 }
 
+ProtocolResult<ClientMessage> decodeStop(const Frame &frame) {
+  Reader reader(frame.payload);
+  StopFrame stop;
+  if (!reader.u64(stop.requestId) || reader.remaining()) {
+    return failure<ClientMessage>(
+        makeIssue(FailureClass::ProtocolFatal, IssueCode::InvalidPayloadLength,
+                  0, "stop payload has an invalid length"));
+  }
+  if (auto issue = validateStop(stop)) {
+    return failure<ClientMessage>(std::move(*issue));
+  }
+  return success(ClientMessage{stop});
+}
+
 ProtocolResult<ClientMessage> decodeMaskResponse(const Frame &frame,
                                                  const ProtocolLimits &limits) {
   Reader reader(frame.payload);
@@ -873,6 +898,8 @@ std::string_view frameTypeName(FrameType type) {
     return "status_request";
   case FrameType::ReleaseRequest:
     return "release_request";
+  case FrameType::Stop:
+    return "stop";
   case FrameType::Ready:
     return "ready";
   case FrameType::PromptProgress:
@@ -1006,6 +1033,8 @@ ProtocolResult<ClientMessage> decodeFrame(Frame &&frame,
       return decodeStatusRequest(frame);
     case FrameType::ReleaseRequest:
       return decodeReleaseRequest(frame);
+    case FrameType::Stop:
+      return decodeStop(frame);
     default:
       break;
     }

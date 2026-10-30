@@ -1699,6 +1699,11 @@ but no sampling policy or DFlash decode. Successful scoring emits no Tokens
 event, finishes with Stop, and reports zero decode time. Cancelled requests
 carry no logits.
 
+The native wire is version 12. The server ends a request whose output matched
+a stop condition with a Stop frame, its payload the request's u64 id: the
+engine finishes the request as Stop, a completion, where a Cancel frame would
+finish it cancelled, and ignores a Stop for a request that has already ended.
+
 An engine sends its Ready event first. One whose bootstrap fails, as when
 `--max-context` exceeds what its budget holds, writes its report to stderr,
 sends the report's reason as an engine failure in its place and exits; the

@@ -15,7 +15,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 11
+PROTOCOL_VERSION = 12
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -52,6 +52,7 @@ _CANCEL = struct.Struct("<Q")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _STATUS_REQUEST = struct.Struct("<Q")
 _RELEASE_REQUEST = struct.Struct("<Q")
+_STOP = struct.Struct("<Q")
 _READY = struct.Struct("<IIB")
 _START = struct.Struct("<QII")
 _PROMPT_PROGRESS = struct.Struct("<QIQ")
@@ -85,6 +86,7 @@ class FrameType(IntEnum):
     MASK_RESPONSE = 0x0003
     STATUS_REQUEST = 0x0004
     RELEASE_REQUEST = 0x0005
+    STOP = 0x0006
 
     READY = 0x0100
     START = 0x0101
@@ -294,6 +296,14 @@ class CancelFrame:
 
 
 @dataclass(slots=True, frozen=True)
+class StopFrame:
+    """A client stop-condition match: the engine finishes the request as
+    stopped, a normal completion, and still ends it with a Done frame."""
+
+    request_id: int
+
+
+@dataclass(slots=True, frozen=True)
 class MaskResponseFrame:
     request_id: int
     mask_request_id: int
@@ -419,6 +429,7 @@ ClientMessage: TypeAlias = (
     | MaskResponseFrame
     | StatusRequestFrame
     | ReleaseRequestFrame
+    | StopFrame
 )
 EngineEvent: TypeAlias = (
     ReadyEvent
@@ -569,6 +580,8 @@ def _payload_bounds(frame_type: FrameType) -> tuple[int, int]:
             bounds = (_STATUS_REQUEST.size, _STATUS_REQUEST.size)
         case FrameType.RELEASE_REQUEST:
             bounds = (_RELEASE_REQUEST.size, _RELEASE_REQUEST.size)
+        case FrameType.STOP:
+            bounds = (_STOP.size, _STOP.size)
         case FrameType.READY:
             bounds = (_READY.size, _READY.size)
         case FrameType.PROMPT_PROGRESS:
@@ -868,6 +881,17 @@ def _cancel_frame(cancel: CancelFrame) -> bytearray:
     return frame
 
 
+def _stop_frame(stop: StopFrame) -> bytearray:
+    try:
+        if not _u64(stop.request_id, "stop request id"):
+            raise ValueError("stop request id must be non-zero")
+    except ValueError as error:
+        _fail_request(IssueCode.INVALID_REQUEST_ID, str(error))
+    frame = _frame(FrameType.STOP, _STOP.size)
+    _STOP.pack_into(frame, FRAME_HEADER_BYTES, stop.request_id)
+    return frame
+
+
 def _mask_response_frame(response: MaskResponseFrame) -> bytearray:
     request_id = 0
     try:
@@ -925,6 +949,8 @@ def serialize_message(message: ClientMessage) -> bytearray:
             return _status_request_frame(message)
         if isinstance(message, ReleaseRequestFrame):
             return _release_request_frame(message)
+        if isinstance(message, StopFrame):
+            return _stop_frame(message)
     except MemoryError as error:
         raise ProtocolError(
             _allocation_issue("allocation failed while serializing a client frame")

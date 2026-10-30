@@ -1080,6 +1080,70 @@ void testCancelledScoreReturnsEmptyLogits() {
   require(doneCount == 1, "cancelled score did not emit Done");
 }
 
+// A client stop match arrives as a Stop frame while the request still has
+// output budget left; the request ends with one Done reporting Stop. A
+// repeated Stop, and one naming an unknown request, change nothing.
+void testStopFrameEndsTheRequestAsStopped() {
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  LoopFixture fixture(config);
+  engine::NativeRuntime &loop = fixture.loop;
+  // The fake model never ends the request itself, so only the Stop can.
+  fixture.executor.decodeFinishes = false;
+  loop.announceReady();
+  constexpr uint32_t kOutputBudget = 512;
+  require(loop.receive(protocol::peer::serialize(request(41, kOutputBudget))),
+          "stop request wire failed");
+  const auto emittedTokens = [&] {
+    size_t tokens = 0;
+    for (const protocol::EngineEvent &message : fixture.events()) {
+      if (const auto *event = std::get_if<protocol::TokensEvent>(&message))
+        tokens += event->tokens.size();
+    }
+    return tokens;
+  };
+  for (uint32_t step = 0; step < 32 && emittedTokens() == 0; ++step)
+    static_cast<void>(loop.tick());
+  require(emittedTokens() > 0, "stop request emitted no token");
+  require(loop.snapshot().completed == 0,
+          "the request ended before the stop frame");
+
+  require(loop.receive(protocol::peer::serialize(protocol::StopFrame{41})),
+          "stop frame failed");
+  runUntilIdle(loop);
+
+  uint32_t doneCount = 0;
+  for (const protocol::EngineEvent &message : fixture.events()) {
+    if (const auto *done = std::get_if<protocol::DoneEvent>(&message)) {
+      ++doneCount;
+      require(done->requestId == 41, "stop ended the wrong request");
+      require(done->reason == EngineFinishReason::Stop,
+              "stop frame did not finish the request as Stop");
+      require(done->completionTokens < kOutputBudget,
+              "stop frame did not end the request early");
+    }
+  }
+  require(doneCount == 1, "stopped request did not emit one Done");
+  const EngineSnapshot stopped = loop.snapshot();
+  require(stopped.completed == 1 && stopped.cancelled == 0,
+          "a stopped request did not count as completed");
+
+  const size_t eventCount = fixture.events().size();
+  require(loop.receive(protocol::peer::serialize(protocol::StopFrame{41})),
+          "repeated stop frame failed");
+  require(loop.receive(protocol::peer::serialize(protocol::StopFrame{999})),
+          "unknown stop frame failed");
+  runUntilIdle(loop);
+  const EngineSnapshot after = loop.snapshot();
+  require(fixture.events().size() == eventCount,
+          "a stop for an ended or unknown request emitted an event");
+  require(after.submitted == stopped.submitted &&
+              after.completed == stopped.completed &&
+              after.cancelled == stopped.cancelled &&
+              after.failed == stopped.failed,
+          "a stop for an ended or unknown request changed the counts");
+}
+
 // A request's prefill time runs from when the engine starts it, even when
 // its clock reads zero then, not from its arrival.
 void testPrefillTimeCountsFromTheStart() {
@@ -2658,6 +2722,7 @@ int main() {
     testStepTokensFitTheWire();
     testScoreRequestCompletesAfterFullPrompt();
     testCancelledScoreReturnsEmptyLogits();
+    testStopFrameEndsTheRequestAsStopped();
     testPrefillTimeCountsFromTheStart();
     testInvalidScoreFailsOneRequestAndKeepsTheBatch();
     testConstrainedMaskExchange();

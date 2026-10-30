@@ -228,6 +228,7 @@ const std::vector<std::pair<std::string, ClientMessage>> &clientMessages() {
        MaskResponseFrame{91, 7, {0xffffffffU, 0, 0xa5a5a5a5U}}},
       {"status_request", StatusRequestFrame{808}},
       {"release_request", ReleaseRequestFrame{808}},
+      {"stop", StopFrame{91}},
   };
   return messages;
 }
@@ -640,6 +641,36 @@ void testHeaderFailures() {
   CHECK(test, first.issue);
   rejects([&] { static_cast<void>(sticky.consume(valid)); },
           "native frame parser used after it failed", "a failed parser consumed more bytes");
+}
+
+// A Stop frame is a client frame of its own carrying only the request id;
+// the Cancel frame beside it keeps its type and payload.
+void testStopFrame() {
+  constexpr std::string_view test = "stop frame";
+  const std::vector<uint8_t> stopWire = peer::serialize(StopFrame{91});
+  const std::vector<uint8_t> cancelWire = peer::serialize(CancelFrame{91});
+  CHECK(test, stopWire.size() == kFrameHeaderBytes + 8);
+  CHECK(test, loadU64(stopWire, kFrameHeaderBytes) == 91);
+  CHECK(test, cancelWire.size() == stopWire.size());
+  CHECK(test, roundTrip(StopFrame{91}) == StopFrame{91});
+
+  // A Stop that names no request cannot be answered as a request's error,
+  // as for a Cancel: the stream closes.
+  std::vector<uint8_t> zero = stopWire;
+  storeU64(zero, kFrameHeaderBytes, 0);
+  const auto decodedZero = decodeClient(zero, kLimits);
+  CHECK(test, !decodedZero);
+  if (decodedZero.issue) {
+    CHECK(test, decodedZero.issue->failureClass == FailureClass::ProtocolFatal);
+    CHECK(test, decodedZero.issue->code == IssueCode::InvalidRequestId);
+  }
+
+  // The header alone refuses a Stop whose payload is not one u64.
+  std::vector<uint8_t> shortStop(stopWire.begin(), stopWire.end() - 1);
+  storeU64(shortStop, 8, 7);
+  ProtocolIssue shortIssue = parserIssue(shortStop, kLimits);
+  CHECK(test, shortIssue.failureClass == FailureClass::ProtocolFatal);
+  CHECK(test, shortIssue.code == IssueCode::InvalidPayloadLength);
 }
 
 void testTruncationAtEveryBoundary() {
@@ -1162,6 +1193,7 @@ int main(int argc, char **argv) {
     testLargeIncrementalFrameHasNoGeometricCapacitySlack();
     testImagePixelsMoveOutOfThePayload();
     testHeaderFailures();
+    testStopFrame();
     testTruncationAtEveryBoundary();
     testMalformedPayloadClassification();
     testPromptAndImageSpanRejections();

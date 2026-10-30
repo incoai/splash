@@ -122,6 +122,7 @@ def client_messages():
         ),
         "status_request": p.StatusRequestFrame(808),
         "release_request": p.ReleaseRequestFrame(808),
+        "stop": p.StopFrame(91),
     }
 
 
@@ -1052,6 +1053,11 @@ class ProtocolPythonTests(unittest.TestCase):
                 p.FailureClass.PROTOCOL_FATAL,
             ),
             (
+                p.StopFrame(0),
+                p.IssueCode.INVALID_REQUEST_ID,
+                p.FailureClass.PROTOCOL_FATAL,
+            ),
+            (
                 p.MaskResponseFrame(0, 7, bytes(4)),
                 p.IssueCode.INVALID_REQUEST_ID,
                 p.FailureClass.PROTOCOL_FATAL,
@@ -1077,6 +1083,15 @@ class ProtocolPythonTests(unittest.TestCase):
                     issue.request_id,
                     91 if failure_class is p.FailureClass.REQUEST_ERROR else 0,
                 )
+
+    def test_stop_frame_payload_is_one_request_id(self):
+        """A Stop frame's payload is exactly one u64 request id; any other
+        length fails the stream before it is written."""
+        self.assert_protocol_error(
+            p.FailureClass.PROTOCOL_FATAL,
+            p.IssueCode.INVALID_PAYLOAD_LENGTH,
+            lambda: p.serialize_frame(p.Frame(p.FrameType.STOP, bytes(7))),
+        )
 
     def test_overflow_lengths_fail_before_allocation(self):
         valid = native_peer.serialize_event(engine_events()["tokens"])
