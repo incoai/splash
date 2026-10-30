@@ -1810,7 +1810,7 @@ class AnthropicHTTPContractTest(HarnessTestCase):
                     self.assertEqual(finish["stop_reason"], "stop_sequence")
                     self.assertEqual(finish["stop_sequence"], "second")
                     self.assertEqual(content, "first ")
-                    self.assertEqual(runtime.cancel_count, 1)
+                    self.assertEqual((runtime.stop_count, runtime.cancel_count), (1, 0))
 
     def test_usage_reports_the_tokens_spent_thinking(self):
         # The same output as Chat, whose reasoning_tokens count them too.

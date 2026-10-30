@@ -347,7 +347,9 @@ class Plan:
         self.release = threading.Event()
         if not block:
             self.release.set()
+        # Set by the call's cancel or stop; `stopped` says which.
         self.cancelled = threading.Event()
+        self.stopped = False
         self.start_release = threading.Event()
         self.terminal = threading.Event()
         self.terminal_release = threading.Event()
@@ -371,7 +373,7 @@ class FakeCall:
         # Every event it emitted.
         self.events = []
         self.callback_error = None
-        self.cancel_requested = False
+        self.end_requested = False
         self._result = None
         self._error = None
         self._done = False
@@ -417,12 +419,23 @@ class FakeCall:
             return self._result
 
     def cancel(self):
+        return self._request_end(stopped=False)
+
+    def stop(self):
+        return self._request_end(stopped=True)
+
+    def _request_end(self, stopped):
+        """RuntimeCall's one latch for a cancel or a stop."""
         with self._lock:
-            if self._done or self.cancel_requested:
+            if self._done or self.end_requested:
                 return False
-            self.cancel_requested = True
-        self.runtime.cancel_count += 1
+            self.end_requested = True
+        if stopped:
+            self.runtime.stop_count += 1
+        else:
+            self.runtime.cancel_count += 1
         if self.plan is not None:
+            self.plan.stopped = stopped
             self.plan.cancelled.set()
             self.plan.start_release.set()
             self.plan.release.set()
@@ -441,6 +454,7 @@ class FakeRuntime:
         self.requests = []
         self.calls = []
         self.cancel_count = 0
+        self.stop_count = 0
         self.closed = False
         self.ready = True
         self.capabilities = READY
@@ -523,8 +537,11 @@ class FakeRuntime:
                 offset += len(tokens)
                 completion += len(tokens)
                 plan.cancelled.wait(plan.delay)
+        # As the engine does, a stop before any output cancels the request.
         reason = (
-            wire.FinishReason.CANCELLED
+            wire.FinishReason.STOP
+            if plan.stopped and completion
+            else wire.FinishReason.CANCELLED
             if plan.cancelled.is_set()
             else {
                 "stop": wire.FinishReason.STOP,

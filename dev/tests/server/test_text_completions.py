@@ -166,7 +166,7 @@ class TextCompletionTests(unittest.TestCase):
                 self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
                 self.assertTrue(all("usage" not in chunk for chunk in chunks))
 
-    def test_stop_string_ends_the_text_and_cancels_generation(self):
+    def test_stop_string_ends_the_text_and_stops_generation(self):
         harness, runtime = self.harness(
             Plan([[14], [15], [4]], reason="length", delay=0.01)
         )
@@ -175,7 +175,7 @@ class TextCompletionTests(unittest.TestCase):
         self.assertEqual(response["choices"][0]["text"], "first ")
         self.assertEqual(response["choices"][0]["finish_reason"], "stop")
         self.assertEqual(response["usage"]["completion_tokens"], 2)
-        self.assertEqual(runtime.cancel_count, 1)
+        self.assertEqual((runtime.stop_count, runtime.cancel_count), (1, 0))
         for stop in ("", ["x"] * 5, 3):
             with self.subTest(stop=stop):
                 status, response = self.complete(harness, stop=stop)

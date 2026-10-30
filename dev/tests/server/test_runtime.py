@@ -621,6 +621,68 @@ class RuntimeTests(unittest.TestCase):
         finally:
             runtime.close()
 
+    def test_stop_is_a_correlated_frame_that_latches_the_call(self):
+        mask_requests = []
+
+        def provider(event):
+            mask_requests.append(event)
+            return array("I", (1,) * (event.words_per_mask * event.mask_rows)).tobytes()
+
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
+        self.addCleanup(runtime.close)
+        process = factory.processes[0]
+        call = runtime.submit(
+            request(
+                32,
+                constraint=wire.ConstraintMode.TOKEN_MASK,
+                mask_provider=provider,
+            )
+        )
+        process.send(wire.StartEvent(call.request_id, 0, 0))
+
+        self.assertTrue(call.stop())
+        stop = process.stdin.wait_for(wire.StopFrame)[0]
+        self.assertFalse(call.cancel())
+        self.assertFalse(call.stop())
+        process.send(wire.MaskRequestEvent(call.request_id, 89, 2, (5, 6)))
+        process.send(
+            wire.DoneEvent(call.request_id, wire.FinishReason.STOP, 2, 0, 0, 0, 10, ())
+        )
+        result = call.result(1.0)
+
+        self.assertEqual(stop.request_id, call.request_id)
+        self.assertEqual(result.reason, wire.FinishReason.STOP)
+        self.assertEqual(mask_requests, [])
+        self.assertEqual(process.stdin.messages(wire.CancelFrame), [])
+        self.assertEqual(process.stdin.messages(wire.MaskResponseFrame), [])
+        self.assertTrue(runtime.ready)
+
+    def test_cancel_latches_the_call_against_a_later_stop(self):
+        factory = FakeFactory()
+        runtime = engine_runtime.MultiplexedRuntime(
+            process_factory=factory, eager_start=True
+        )
+        self.addCleanup(runtime.close)
+        process = factory.processes[0]
+        call = runtime.submit(request(33))
+
+        self.assertTrue(call.cancel())
+        process.stdin.wait_for(wire.CancelFrame)
+        self.assertFalse(call.stop())
+        process.send(
+            wire.DoneEvent(
+                call.request_id, wire.FinishReason.CANCELLED, 2, 0, 0, 0, 10, ()
+            )
+        )
+        result = call.result(1.0)
+
+        self.assertEqual(result.reason, wire.FinishReason.CANCELLED)
+        self.assertEqual(process.stdin.messages(wire.StopFrame), [])
+        self.assertEqual(len(process.stdin.messages(wire.CancelFrame)), 1)
+
     def test_cancelled_score_done_returns_no_logits(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
@@ -801,7 +863,7 @@ class RuntimeTests(unittest.TestCase):
         process.send(wire.StartEvent(call.request_id, 0, 0))
         process.send(wire.MaskRequestEvent(call.request_id, 88, 2, ()))
         process.stdin.wait_for(wire.CancelFrame)
-        self.assertTrue(call.cancel_requested)
+        self.assertTrue(call.end_requested)
         self.assertFalse(call.cancel())
         process.send(wire.MaskRequestEvent(call.request_id, 89, 2, ()))
         process.send(
@@ -2192,7 +2254,7 @@ class RuntimeTests(unittest.TestCase):
         with runtime._write_lock:
             self.assertTrue(call.cancel())
         with self.assertRaisesRegex(
-            engine_runtime.EngineUnhealthy, "cancel write timed out"
+            engine_runtime.EngineUnhealthy, "end write timed out"
         ):
             call.result(0.5)
         self.assertEqual(runtime.pending_count, 0)

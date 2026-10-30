@@ -307,7 +307,7 @@ class RequestLifetimeTests(unittest.TestCase):
                         raise RuntimeError("callback failed") from cause
 
                 # A failed event callback cancels its call.
-                client = SimpleNamespace(_cancel_call=lambda _call: None)
+                client = SimpleNamespace(_end_call=lambda _call, _frame: None)
                 call = engine_runtime.RuntimeCall(
                     client,
                     1,
@@ -318,7 +318,7 @@ class RequestLifetimeTests(unittest.TestCase):
                 )
                 if not completion:
                     call._emit(None)
-                    self.assertTrue(call.cancel_requested)
+                    self.assertTrue(call.end_requested)
                 call._set_terminal(error=engine_runtime.RuntimeClosed("finished"))
                 failure = call.callback_error
                 self.assertIsInstance(failure, RuntimeError)

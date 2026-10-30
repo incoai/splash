@@ -615,6 +615,26 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(result.reason, "cancelled")
         self.assertEqual(constraint.finish_calls, 0)
 
+    def test_stop_sequence_end_skips_the_trailing_grammar_check(self):
+        constraint = FakeConstraint(
+            finish_error=api_errors.ConstraintError("invalid token")
+        )
+        transport, runtime = self.make_transport()
+        job = make_job(constraint=constraint)
+        job.stop_sequences = ("7",)
+        transport.submit(job)
+        call = runtime.calls[0]
+
+        call.emit(wire.TokensEvent(call.request_id, 0, (7,)))
+        call.complete(result=success_result(call, tokens=(7,)))
+
+        kind, result = self.terminal(job)
+        self.assertEqual(kind, "done")
+        self.assertEqual(result.reason, "stop")
+        self.assertEqual(result.stop_sequence, "7")
+        self.assertEqual((runtime.stop_count, runtime.cancel_count), (1, 0))
+        self.assertEqual(constraint.finish_calls, 0)
+
     def test_token_constraint_consumes_committed_batches_only_at_mask_or_finish(self):
         matcher = FakeMatcher()
         constraint = generation_constraints.TokenConstraint(matcher, None, READY)

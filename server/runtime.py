@@ -232,17 +232,18 @@ class RuntimeCall:
         self._next_token_offset = 0
         self._mask_error: MaskComputationFailed | None = None
         self._callback_error: BaseException | None = None
-        self._cancel_requested = False
-        self._cancel_timer = None
+        self._end_requested = False
+        self._end_timer = None
 
     @property
     def done(self) -> bool:
         return self._event.is_set()
 
     @property
-    def cancel_requested(self) -> bool:
+    def end_requested(self) -> bool:
+        """Whether a cancel or a stop was asked for: the call takes one."""
         with self._lock:
-            return self._cancel_requested
+            return self._end_requested
 
     @property
     def started(self) -> bool:
@@ -266,11 +267,29 @@ class RuntimeCall:
             return self._result
 
     def cancel(self) -> bool:
+        """Ask native to abandon this request; it finishes as cancelled.
+
+        Returns False, writing nothing, once the call is done or a cancel or
+        stop was already requested.
+        """
+        return self._request_end(wire.CancelFrame(self.request_id))
+
+    def stop(self) -> bool:
+        """Ask native to end this request at a client stop condition.
+
+        Native finishes it as stopped, a normal completion, or as cancelled
+        before its first token. Shares `cancel`'s latch: returns False, writing
+        nothing, once the call is done or a cancel or stop was already
+        requested.
+        """
+        return self._request_end(wire.StopFrame(self.request_id))
+
+    def _request_end(self, frame: wire.CancelFrame | wire.StopFrame) -> bool:
         with self._lock:
-            if self._event.is_set() or self._cancel_requested:
+            if self._event.is_set() or self._end_requested:
                 return False
-            self._cancel_requested = True
-        self._client._cancel_call(self)
+            self._end_requested = True
+        self._client._end_call(self, frame)
         return True
 
     def _emit(self, message: wire.EngineEvent) -> None:
@@ -375,7 +394,7 @@ class RuntimeCall:
                     f"match streamed count {completion_tokens}"
                 )
             if self._start is None and not (
-                self._cancel_requested
+                self._end_requested
                 and done.reason is wire.FinishReason.CANCELLED
                 and not completion_tokens
             ):
@@ -437,9 +456,9 @@ class RuntimeCall:
             self._on_event = None
             callback, self._on_complete = self._on_complete, None
             self._event.set()
-            if self._cancel_timer is not None:
-                self._cancel_timer.cancel()
-                self._cancel_timer = None
+            if self._end_timer is not None:
+                self._end_timer.cancel()
+                self._end_timer = None
         if callback is not None:
             try:
                 callback(self)
@@ -1102,37 +1121,39 @@ class MultiplexedRuntime:
         if failure:
             raise failure
 
-    def _cancel_call(self, call: RuntimeCall) -> None:
+    def _end_call(
+        self, call: RuntimeCall, frame: wire.CancelFrame | wire.StopFrame
+    ) -> None:
         try:
-            encoded = wire.serialize_message(wire.CancelFrame(call.request_id))
+            encoded = wire.serialize_message(frame)
             self._write_bytes(encoded, call.generation, call=call)
             with call._lock:
                 if not call.done:
                     timer = threading.Timer(
                         self._thresholds.cancel_acknowledgement,
-                        self._cancel_unacknowledged,
+                        self._end_unacknowledged,
                         (call,),
                     )
                     timer.daemon = True
-                    call._cancel_timer = timer
+                    call._end_timer = timer
                     timer.start()
         except TimeoutError:
-            # Unlike a request that has not been sent, cancellation cannot be
-            # dropped while leaving the generation healthy and doing work.
+            # Unlike a request that has not been sent, a cancel or stop cannot
+            # be dropped while leaving the generation healthy and doing work.
             self._fail_generation(
-                call.generation, EngineUnhealthy("native cancel write timed out")
+                call.generation, EngineUnhealthy("native end write timed out")
             )
         except EngineRuntimeError:
             # Generation failure is already delivered to every in-flight call.
             return
 
-    def _cancel_unacknowledged(self, call):
+    def _end_unacknowledged(self, call):
         with self._state_lock:
             if self._pending.get(call.request_id) is not call or call.done:
                 return
             finish = self._begin_generation_failure(
                 call.generation,
-                EngineUnhealthy("native did not acknowledge cancellation"),
+                EngineUnhealthy("native did not acknowledge the request's end"),
             )
         if finish:
             finish()
@@ -1363,7 +1384,7 @@ class MultiplexedRuntime:
             waiter.event.set()
 
     def _submit_mask(self, call: RuntimeCall, event: wire.MaskRequestEvent) -> None:
-        if call.cancel_requested or call.done:
+        if call.end_requested or call.done:
             return
         provider = call.mask_provider
         if not self._mask_slots.acquire(blocking=False):
@@ -1373,7 +1394,7 @@ class MultiplexedRuntime:
             return
 
         def compute():
-            if call.cancel_requested or call.done:
+            if call.end_requested or call.done:
                 return b""
             return provider(event)
 
@@ -1386,7 +1407,7 @@ class MultiplexedRuntime:
 
         def complete(completed) -> None:
             try:
-                if call.cancel_requested or call.done:
+                if call.end_requested or call.done:
                     return
                 result = completed.result()
                 expected = 4 * event.words_per_mask * event.mask_rows
@@ -1404,7 +1425,7 @@ class MultiplexedRuntime:
                     call.request_id, event.mask_request_id, result
                 )
                 encoded = wire.serialize_message(response)
-                if call.cancel_requested or call.done:
+                if call.end_requested or call.done:
                     return
                 self._write_bytes(encoded, call.generation, call=call)
             except BaseException as error:
