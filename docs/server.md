@@ -76,7 +76,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--model-dir` | None | Prepare a local GGUF file or GGUF/MLX model directory without the Hub. See [local model files](models.md#local-model-files). |
 | `--mmproj` | None | A local GGUF target's vision projector; requires `--model-dir`. |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
-| `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place; required for a family without a released draft. See [drafts](models.md#drafts). |
+| `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place, required for a family without a released draft; `none` serves the model without a draft, one token a decode cycle. See [drafts](models.md#drafts). |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](models.md#vision). |
 | `--offline` | Off | Start the installed model without asking the Hub, as `HF_HUB_OFFLINE=1` does. See [revisions](#revisions). |
 | `--port` | `SPLASH_PORT` or `8000` | HTTP port. |

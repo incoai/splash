@@ -405,7 +405,9 @@ void reportStreamedStores(const model::LoadedModel &loaded, const model::Streama
 
 // The rows the target's decode cycles verify (--verify-rows), and why.
 void reportVerifyRows(const model::LoadedModel &loaded, model::VerifyRows rows) {
-  if (model::budgetsVerifyRows(loaded, rows))
+  if (!loaded.descriptor.draft.present())
+    logLine("Decode cycles select one token each: ", loaded.name(), " was installed without a draft (--draft-model none).");
+  else if (model::budgetsVerifyRows(loaded, rows))
     logLine("Decode cycles verify the rows the verify budget chooses (--verify-rows auto, as ", loaded.name(),
             " is a MoE target): greedy and seeded outputs can differ from run to run.");
   else if (rows == model::VerifyRows::All)
@@ -469,7 +471,7 @@ std::array<uint8_t, 32> parseSha256(std::string_view value) {
 
 void requireLoadedModel(const model::LoadedModel &loaded) {
   if (!loaded.targetActualAllocatedBytes() ||
-      !loaded.draft.actualAllocatedBytes ||
+      (loaded.descriptor.draft.present() && !loaded.draft.actualAllocatedBytes) ||
       (loaded.descriptor.hasVision() && !loaded.vision.actualAllocatedBytes) ||
       loaded.manifestFingerprintSha256.empty() ||
       loaded.targetManifestFingerprint().empty()) {

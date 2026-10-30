@@ -79,13 +79,16 @@ constexpr std::string_view kLargeMoeGgufConfig =
     R"("max_position_embeddings":262144,"num_attention_heads":32,"num_key_value_heads":2,)"
     R"("head_dim":256,"num_experts":256,"num_hidden_layers":48,"vocab_size":248320}})";
 
-// The descriptor inspection makes of model's assembly.
-model::ModelDescriptor inspect(const SourceModel &model) {
+// The descriptor inspection makes of model's assembly, whose root holds the
+// draft's config unless `draft` is false.
+model::ModelDescriptor inspect(const SourceModel &model, bool draft = true) {
   const test::TemporaryDirectory root("splash-source-model");
-  std::filesystem::create_directory(root.path() / "draft");
   test::writeFile(root.path() / "model.json", model.record);
   test::writeFile(root.path() / "config.json", model.config);
-  test::writeFile(root.path() / "draft" / "config.json", model.draft);
+  if (draft) {
+    std::filesystem::create_directory(root.path() / "draft");
+    test::writeFile(root.path() / "draft" / "config.json", model.draft);
+  }
   return model::inspectModelRoot(root.path());
 }
 
@@ -224,11 +227,57 @@ void testSources() {
   require(!described(model::TargetSource{}, model::VisionSource::None).valid() &&
               !described(model::TargetSource::Safetensors, model::VisionSource{}).valid(),
           "a descriptor without a source was valid");
+  // A model installed without a draft has the zero draft layout, and no
+  // draft state; a layout of no layers that states anything else is none.
+  const model::ModelDescriptor undrafted =
+      described(model::TargetSource::Safetensors, model::VisionSource::None, {});
+  require(undrafted.valid() && !undrafted.draft.present() && undrafted.stateLayout.draft == model::DraftStateLayout{} &&
+              undrafted.stateLayout.laneBytes() < described(model::TargetSource::Safetensors, model::VisionSource::None)
+                                                      .stateLayout.laneBytes(),
+          "a descriptor without a draft was not valid, or held draft state");
+  model::DFlashDraftLayout layerless = test::qwen3_8Draft();
+  layerless.layers = 0;
+  require(!described(model::TargetSource::Safetensors, model::VisionSource::None, layerless).valid(),
+          "a draft of no layers was valid");
   constexpr std::array<uint32_t, 2> pastLastLayer{5, 64};
   require(!described(model::TargetSource::Safetensors, model::VisionSource::None,
                      model::draftLayout(5120, 248320, 5, 17408, 1e7F, pastLastLayer))
                .valid(),
           "a descriptor whose draft reads past the target's last layer was valid");
+}
+
+// A record whose draft source is null (--draft-model none) names a model
+// without a draft, whose root holds no draft/; a root that disagrees with its
+// record is refused either way.
+void testWithoutDraft(const std::filesystem::path &fixtures) {
+  const SourceModel drafted =
+      mlxModel(fixtures, "qwen3.8-27b")
+          .with(&SourceModel::record, R"("vision_format":"none")",
+                R"("vision_format":"none","sources":{"target":{"repo":"community/fine-tune","revision":null},)"
+                R"("draft":{"repo":"incoai/Qwen3.8-27B-DFlash2","revision":null}})");
+  const SourceModel undrafted =
+      drafted.with(&SourceModel::record, R"("draft":{"repo":"incoai/Qwen3.8-27B-DFlash2","revision":null})",
+                   R"("draft":null)");
+  const model::ModelDescriptor descriptor = inspect(undrafted, false);
+  require(descriptor.valid() && descriptor.draft == model::DFlashDraftLayout{} &&
+              std::holds_alternative<model::Qwen3_8Layout>(descriptor.target),
+          "a record without a draft did not make a descriptor without one");
+  require(inspect(drafted).draft == test::qwen3_8Draft(), "a record naming its draft lost it");
+  rejects([&] { static_cast<void>(inspect(undrafted)); }, "the model's root holds a draft/ its record does not name",
+          "a draft/ the record does not name was loaded");
+  rejects([&] { static_cast<void>(inspect(drafted, false)); },
+          "the model's root holds no draft/ for its DFlash2 draft", "a record's draft was not required");
+  // Flint's vocabulary keeps no mask token and its target no GDN state: a
+  // cycle without a draft would have no proposals, and a cached state
+  // nothing, of its own.
+  const SourceModel flint =
+      mlxModel(fixtures, "flint")
+          .with(&SourceModel::record, R"("mlx-affine")", R"("gguf")")
+          .with(&SourceModel::record, R"("vision_format":"none")",
+                R"("vision_format":"none","sources":{"target":{"repo":"community/fine-tune","revision":null},)"
+                R"("draft":null})");
+  rejects([&] { static_cast<void>(inspect(flint, false)); }, "Flint serves only with a DFlash2 draft",
+          "a Flint without a draft was accepted");
 }
 
 // Each config is checked where the descriptor is made, once, and each number
@@ -932,6 +981,7 @@ int main(int argc, char **argv) {
     if (argc != 2) throw std::invalid_argument("usage: model-configuration FIXTURES");
     testFamilies(argv[1]);
     testSources();
+    testWithoutDraft(argv[1]);
     testOneRulePerValue(argv[1]);
     testQuantization(argv[1]);
     testVisionConfig(argv[1]);
@@ -939,8 +989,8 @@ int main(int argc, char **argv) {
     testConfigurationCheck(argv[1]);
     testYarn(argv[1]);
     testFlint(argv[1]);
-    std::cout << "model configuration: every family, sources, one rule per value, quantization, vision, pruned "
-                 "experts, the installer's check, YaRN, Flint PASS\n";
+    std::cout << "model configuration: every family, sources, without a draft, one rule per value, quantization, vision, "
+                 "pruned experts, the installer's check, YaRN, Flint PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

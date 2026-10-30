@@ -35,7 +35,8 @@ model::DFlashDraftLayout draftOf() {
 }
 
 // A target of Weights' architecture at the sizes of `family`, its first
-// family's by default, paired with `draft`.
+// family's by default, paired with `draft` -- an empty layout installs
+// no draft (--draft-model none).
 template <class Weights>
 model::LoadedModel loadedModel(const decltype(Weights::layout) &family = {},
                                const model::DFlashDraftLayout &draft = draftOf<Weights>()) {
@@ -176,11 +177,12 @@ void checkGateUpLayers() {
 void checkLaneScratch(const model::LoadedModel &loaded) {
   const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
   const auto &d = geometry.draft;
-  std::vector<ops::LinearMatrix> matrices{
-      {d.dynamicSize, d.hiddenSize}, {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
-      {d.hiddenSize, d.attentionSize},
-      {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
-      {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize()}};
+  std::vector<ops::LinearMatrix> matrices;
+  if (d.present())
+    matrices = {{d.dynamicSize, d.hiddenSize}, {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
+                {d.hiddenSize, d.attentionSize},
+                {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
+                {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize()}};
   for (const auto &p : geometry.target.decodeProjections) matrices.push_back({p.outputSize, p.inputSize});
   for (uint32_t family : {9U, 10U, 11U})
     for (uint32_t cores : {12U, 20U, 40U}) {
@@ -239,6 +241,27 @@ void checkIndexTables() {
               !decodeBytes(geometry(loadedModel<model::Qwen3_8Weights>()), model::DecodeTensor::IndexTable) &&
               !decodeBytes(geometry(loadedModel<model::Qwen3_6MoeWeights>()), model::DecodeTensor::IndexTable),
           "a lane's index table is not its block index's alone");
+}
+
+// A model without a draft has a geometry without one: it captures no target
+// layer, and its decode arena holds none of a draft's rows nor its RoPE,
+// while what the target verifies stays as it is with a draft.
+template <class Weights>
+void checkWithoutDraft() {
+  const auto drafted = model::RuntimeGeometry::from(loadedModel<Weights>(), kv::Format::Int8,
+                                                    ops::GdnStateFormat::Float32);
+  const auto undrafted = model::RuntimeGeometry::from(loadedModel<Weights>({}, model::DFlashDraftLayout{}), kv::Format::Int8,
+                                                      ops::GdnStateFormat::Float32);
+  require(undrafted.draft == model::DFlashDraftLayout{} && !undrafted.target.captureLayerCount &&
+              drafted.target.captureLayerCount,
+          "a geometry without a draft captured target layers");
+  for (const auto tensor : {model::DecodeTensor::DraftHidden0, model::DecodeTensor::DraftProposalQkv,
+                            model::DecodeTensor::DraftFinalHidden, model::DecodeTensor::DraftRopeCos})
+    require(decodeBytes(drafted, tensor) && !decodeBytes(undrafted, tensor),
+            "a decode arena without a draft holds a draft's rows");
+  for (const auto tensor : {model::DecodeTensor::VerifyRows, model::DecodeTensor::ProposedTokens})
+    require(decodeBytes(undrafted, tensor) == decodeBytes(drafted, tensor),
+            "a decode arena without a draft verifies otherwise");
 }
 
 // A runtime whose K/V spills (one given the readers of spilled K/V,
@@ -388,10 +411,14 @@ int main() {
     checkIndexTables();
     checkSpilledKvGeometry();
     checkArenasWithoutGdnLayers();
+    checkWithoutDraft<model::Qwen3_8Weights>();
+    checkWithoutDraft<model::Qwen3_6MoeWeights>();
+    checkWithoutDraft<model::Qwen4ExpWeights>();
     checkLaneScratch(loadedModel<model::Qwen3_8Weights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
-    std::cout << "model execution plans: PASS (three paired geometries)\n";
+    checkLaneScratch(loadedModel<model::Qwen3_8Weights>({}, model::DFlashDraftLayout{}));
+    std::cout << "model execution plans: PASS (three paired geometries, three without a draft)\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

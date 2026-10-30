@@ -434,7 +434,9 @@ struct Runtime::Impl {
   ModelTelemetry counters;
   ops::Sampling sampling;
   std::unique_ptr<QwenTarget> targetModel;
-  DFlashDraft draftModel;
+  // None for a model installed without a draft, whose cycles verify only
+  // their anchors.
+  std::optional<DFlashDraft> draftModel;
   // The acceptance model and cycle costs the decode cycles' verify rows
   // follow where the budget chooses them (budgetsVerifyRows); none where
   // the cycles verify every row.
@@ -469,13 +471,14 @@ struct Runtime::Impl {
                                                 geometry.prefillChunks);
                         },
                         value.model.target)),
-        draftModel(value.model.draft, value.backend, operators),
         aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream) {
     if (states.layout() != model.stateLayout(states.layout().target.format) ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format) || !blockCache != !historyStream) {
       throw std::invalid_argument(
           "model runtime resources do not match the loaded model");
     }
+    if (geometry.draft.present())
+      draftModel.emplace(value.model.draft, value.backend, operators);
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
     penaltyTable =
@@ -993,11 +996,20 @@ struct Runtime::Impl {
                      uint32_t draftRows, MetalBuffer targetCos,
                      MetalBuffer targetSin, MetalBuffer draftCos,
                      MetalBuffer draftSin) const {
+    MetalBuffer targetFrequencies = prefillArena->get(PrefillTensor::TargetInverseFrequencies);
+    MetalBuffer draftFrequencies = prefillArena->get(PrefillTensor::DraftInverseFrequencies);
+    if (!draftModel) {
+      // A model without a draft has no draft RoPE, nor its buffers: the
+      // kernel writes no draft row, and takes the target's in their place.
+      draftRows = 0;
+      draftPositions = targetPositions;
+      draftFrequencies = targetFrequencies;
+      draftCos = targetCos;
+      draftSin = targetSin;
+    }
     ops::RoPE::addTables(
-        graph, std::move(targetPositions), std::move(draftPositions),
-        prefillArena->get(PrefillTensor::TargetInverseFrequencies),
-        prefillArena->get(PrefillTensor::DraftInverseFrequencies),
-        std::move(targetCos), std::move(targetSin), std::move(draftCos),
+        graph, std::move(targetPositions), std::move(draftPositions), std::move(targetFrequencies),
+        std::move(draftFrequencies), std::move(targetCos), std::move(targetSin), std::move(draftCos),
         std::move(draftSin),
         {.target_rows = targetRows,
          .draft_rows = draftRows,
@@ -1613,14 +1625,16 @@ struct Runtime::Impl {
     return chunks;
   }
 
-  // Computes a restored lane's draft rings from its context window.
+  // Computes a restored lane's draft rings from its context window. A model
+  // without a draft keeps the lengths alone.
   void addDraftRebuild(CommandGraph &graph, uint32_t lane,
                        const Request::DraftRebuild &rebuild) const {
+    if (!draftModel) return;
     auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor, 0); };
     ops::RoPE::addDraftRangeTables(graph, p(PrefillTensor::DraftInverseFrequencies),
                                    p(PrefillTensor::DraftRopeCos), p(PrefillTensor::DraftRopeSin),
                                    rebuild.rows, rebuild.begin, kPrefillRows);
-    draftModel.addContextRebuild(graph, draftPrefillBuffers(*prefillArena, 0), states.window(lane),
+    draftModel->addContextRebuild(graph, draftPrefillBuffers(*prefillArena, 0), states.window(lane),
                                  states.draft(lane), rebuild.rows, rebuild.begin);
   }
 
@@ -1633,7 +1647,7 @@ struct Runtime::Impl {
   // takes the lane's window.
   void addDraftContext(CommandGraph &graph, std::span<const PrefillChunk> chunks, uint32_t index) {
     const PrefillChunk &chunk = chunks[index];
-    if (!chunk.capturedRows) return;
+    if (!chunk.capturedRows || !draftModel) return;
     std::array<DFlashPrefillSpan, kLaneCount * 2> spans{};
     uint32_t spanCount = 0;
     std::vector<DFlashWindowCapture> windowCaptures;
@@ -1661,7 +1675,7 @@ struct Runtime::Impl {
           }
         }
     }
-    draftModel.addContextPrefill(graph, draftPrefillBuffers(*prefillArena, index), chunk.capturedRows,
+    draftModel->addContextPrefill(graph, draftPrefillBuffers(*prefillArena, index), chunk.capturedRows,
                                  std::span(spans).first(spanCount), windowCaptures);
   }
 
@@ -1876,6 +1890,14 @@ struct Runtime::Impl {
     draftInput[0] = *entry.pendingToken;
     std::fill(draftInput + 1, draftInput + kDecodeRows,
               geometry.target.maskToken);
+    // Without a draft, the verify's rows past the anchor and greedy
+    // acceptance read mask tokens as the lane's proposals, which no row
+    // verifies.
+    if (!draftModel) {
+      auto *proposed = contents<uint32_t>(decodeArena->get(lane, DecodeTensor::ProposedTokens),
+                                          "proposed tokens");
+      std::fill(proposed, proposed + kDraftProposalTokens, geometry.target.maskToken);
+    }
     targetModel->prepareVerifyLane(lane, item.logicalPosition, targetRequest(entry));
 
     auto *positions =
@@ -1921,8 +1943,9 @@ struct Runtime::Impl {
   // Lanes of storage a draft step of `lanes` lanes binds: its own
   // projections' and the target's, whose vocabulary head it shares.
   uint32_t draftStorageLanes(uint32_t lanes) const {
-    return std::max(targetModel->decodeStorageLanes(lanes),
-                    draftModel.decodeStorageLanes(lanes));
+    return draftModel ? std::max(targetModel->decodeStorageLanes(lanes),
+                                 draftModel->decodeStorageLanes(lanes))
+                      : targetModel->decodeStorageLanes(lanes);
   }
 
   // The draft's proposals for each lane and how many rows of its block it
@@ -1943,6 +1966,14 @@ struct Runtime::Impl {
     auto d = [&](DecodeTensor tensor) {
       return decodeArena->batchSlice(tensor, storage);
     };
+    if (!draftModel) {
+      // Each lane verifies its anchor alone, the one token a cycle selects.
+      std::array<uint32_t, kLaneCount> anchors{};
+      anchors.fill(1);
+      ops::DraftSelector::addVerifyRows(graph, d(DecodeTensor::VerifyConfidence), d(DecodeTensor::VerifyRows),
+                                        {}, std::span(anchors).first(lanes));
+      return;
+    }
     std::array<uint32_t, kLaneCount> cacheLengths{};
     for (uint32_t lane = 0; lane < lanes; ++lane)
       cacheLengths[lane] = static_cast<uint32_t>(logicalPositions[lane]);
@@ -1970,7 +2001,7 @@ struct Runtime::Impl {
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.gateScratch = decodeArena->gateScratch();
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
-    draftModel.addDecode(graph, std::move(buffers),
+    draftModel->addDecode(graph, std::move(buffers),
                          targetModel->vocabularyProjection(),
                          std::span(cacheLengths).first(lanes));
     std::array<uint32_t, kLaneCount> anchors{};
@@ -1982,7 +2013,7 @@ struct Runtime::Impl {
       anchors[lane] = *entry.pendingToken;
       policies[lane] = samplingPolicy(entry);
     }
-    draftModel.addSelection(
+    draftModel->addSelection(
         graph,
         {d(DecodeTensor::Logits), d(DecodeTensor::TopPartialIds),
          d(DecodeTensor::TopPartialValues), d(DecodeTensor::Candidates),
@@ -2094,7 +2125,8 @@ struct Runtime::Impl {
 #endif
     sampling.addVerify(graph, std::span(policies).first(lanes),
                        samplingBuffers(lanes), geometry.target.stopTokens,
-                       {penaltyTable, std::span(stateLanes).first(lanes)});
+                       {penaltyTable, std::span(stateLanes).first(lanes)},
+                       draftModel.has_value());
   }
 
   void encodeDraftStateCommitBatch(CommandGraph &graph,
@@ -2104,6 +2136,7 @@ struct Runtime::Impl {
         entries.size() != items.size()) {
       throw std::invalid_argument("invalid draft state commit batch");
     }
+    if (!draftModel) return;
     const uint32_t lanes = static_cast<uint32_t>(entries.size());
     const uint32_t storage = draftStorageLanes(lanes);
     auto d = [&](DecodeTensor tensor) {
@@ -2123,7 +2156,7 @@ struct Runtime::Impl {
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.retainedCounts = d(DecodeTensor::RetainedCount);
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
-    draftModel.addContextCommit(graph, std::move(buffers),
+    draftModel->addContextCommit(graph, std::move(buffers),
                                 std::span(startPositions).first(lanes));
   }
 
@@ -3058,10 +3091,12 @@ Runtime::decodeAsync(const BatchPlan &plan,
       impl_->decodeArena->batchSlice(DecodeTensor::RopeSin, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
       impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
-  impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
-                              DecodeTensor::DraftHidden0, width);
-  impl_->draftModel.addMaskRows(commandGraph, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
-                                width);
+  if (impl_->draftModel) {
+    impl_->encodeBatchEmbedding(commandGraph, DecodeTensor::DraftInputTokens,
+                                DecodeTensor::DraftHidden0, width);
+    impl_->draftModel->addMaskRows(commandGraph, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
+                                   width);
+  }
   impl_->encodeDraftBatchGraph(commandGraph, entries,
                                {logicalPositions.data(), width},
                                {maximumRetained.data(), width}, constrained);
@@ -3485,6 +3520,7 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   result.visionArenaBytes = impl_->vision ? impl_->vision->arenaBytes() : 0;
   result.embeddingCacheBytes = impl_->embeddingCacheBytes;
   result.verifyBudget = impl_->verifyBudget.has_value();
+  result.drafted = impl_->draftModel.has_value();
   result.stateHeldImageBytes = impl_->heldRowsBytes(false);
   for (const auto &[_, held] : impl_->imageRows) {
     if (const std::shared_ptr<const Impl::ImageRows> rows = held.lock())
@@ -3525,7 +3561,8 @@ ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
 bool budgetsVerifyRows(const LoadedModel &model, VerifyRows rows) noexcept {
   const bool moe =
       std::visit([](const auto &layout) { return layout.ffnKind == QwenFfnKind::SparseMoe; }, model.descriptor.target);
-  return moe && rows == VerifyRows::Auto;
+  // A model without a draft verifies only its anchors.
+  return moe && rows == VerifyRows::Auto && model.descriptor.draft.present();
 }
 
 std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {

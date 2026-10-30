@@ -693,8 +693,10 @@ struct ModelTelemetry final {
   // work for them failed (Runtime::prefillAsync).
   uint64_t aneFfnReruns = 0;
   // Whether decode cycles verify the rows the verify budget chooses
-  // (budgetsVerifyRows) rather than every row.
+  // (budgetsVerifyRows) rather than every row, and whether they verify a
+  // draft's at all: a model installed without one verifies its anchors.
   bool verifyBudget = false;
+  bool drafted = true;
   double lastConstrainedTargetForwardGpuSeconds = 0.0;
   double totalConstrainedTargetForwardGpuSeconds = 0.0;
   double lastConstrainedMaskWaitSeconds = 0.0;
