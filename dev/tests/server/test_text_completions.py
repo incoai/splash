@@ -174,6 +174,9 @@ class TextCompletionTests(unittest.TestCase):
         self.assertEqual(response["choices"][0]["text"], "first ")
         self.assertEqual(response["choices"][0]["finish_reason"], "stop")
         self.assertEqual(response["usage"]["completion_tokens"], 2)
+        # The response can end before the stop reaches the call: count once
+        # the stopped call has released its plan.
+        self.assertTrue(runtime.calls[0].plan.cancelled.wait(1.0))
         self.assertEqual((runtime.stop_count, runtime.cancel_count), (1, 0))
         for stop in ("", ["x"] * 5, 3):
             with self.subTest(stop=stop):

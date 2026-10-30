@@ -1795,6 +1795,9 @@ class AnthropicHTTPContractTest(HarnessTestCase):
                     self.assertEqual(finish["stop_reason"], "stop_sequence")
                     self.assertEqual(finish["stop_sequence"], "second")
                     self.assertEqual(content, "first ")
+                    # The response can end before the stop reaches the call: count once
+                    # the stopped call has released its plan.
+                    self.assertTrue(runtime.calls[0].plan.cancelled.wait(1.0))
                     self.assertEqual((runtime.stop_count, runtime.cancel_count), (1, 0))
 
     def test_usage_reports_the_tokens_spent_thinking(self):
