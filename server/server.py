@@ -29,6 +29,7 @@ from . import images as image_input
 from . import json_codec, judgments, serve_options
 from . import protocol as wire
 from . import runtime as engine_runtime
+from . import videos as video_input
 from .api_shapes import (
     anthropic_block,
     anthropic_response,
@@ -1833,6 +1834,11 @@ def main():
             )
         effective_context = readiness.max_context_tokens
         constraint_factory = ConstraintFactory(tokenizer, family.chat_format)
+        # How the model's video processor samples, from its installation.
+        try:
+            video_config = video_input.installed_config(model_root / "vision")
+        except video_input.VideoError as error:
+            raise ModelError(f"{args.model}: {error}: prepare it again") from None
         app = Frontend(
             tokenizer,
             backend,
@@ -1846,6 +1852,9 @@ def main():
             chat_templates=chat_templates,
             chat_format=family.chat_format,
             max_image_pixels=args.max_image_pixels,
+            max_video_pixels=args.max_video_pixels,
+            video_config=video_config,
+            video_decoder=args.binary,
             thinking_codec=thinking_codec,
             served_model_names=args.served_model_name,
             announce_served_name=args.announce_served_name,

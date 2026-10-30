@@ -494,7 +494,7 @@ reference a remote document, and cannot combine `unevaluatedProperties` with
 final output; it does not inject formatting instructions into the prompt.
 Clients should describe their output requirements in their own messages.
 
-## Images and PDFs
+## Images, PDFs and videos
 
 Images arrive inline as base64 `data:` URLs: Chat `image_url` parts, Responses
 `input_image` items and Messages `image` blocks with a `base64` source; an image
@@ -513,7 +513,51 @@ opening passwords and citations are unsupported. PDFs render one at a time: a
 request waits for its turn and renders without holding any of the server's
 preparation capacity, so other requests prepare meanwhile.
 
-A model served with `--language-only` refuses both with 400 ([vision](models.md#vision)).
+Videos arrive inline as base64 `data:video/` URLs in Chat `video_url` parts,
+vLLM's convention. Containers and codecs:
+
+| Container | Codecs |
+|---|---|
+| MP4, QuickTime, 3GP | H.264, HEVC 8- and 10-bit, ProRes, MPEG-4 Part 2, MPEG-2, Motion JPEG, VP9, AV1 |
+| MPEG transport stream (with M2TS), MPEG program stream | H.264, MPEG-2 |
+| AVI | Motion JPEG |
+
+AVFoundation reads them, the container told by the file's first bytes, not its
+name. VP9 decodes on Apple's hardware decoder only, AV1 only on Macs that have
+one (M3 and later). A codec without a decoder, as H.264 in AVI or DNxHD, returns
+400 naming it; other containers, as Matroska and WebM, return 400 too.
+
+A video is sampled as the model's video processor configuration says
+([vision](models.md#vision)): for the Qwen models, 2 frames per second, at
+least 4 and at most 768, all resized to one size that keeps them within
+`size.longest_edge` pixels together (25,165,824, about 12K tokens;
+`--max-video-pixels` replaces it) and each within 768 tokens and
+`--max-image-pixels`. The frames are taken at their presentation times, edit
+lists applied, cropped to their clean aperture at their pixel aspect ratio,
+turned upright as the track's display transform says (a quarter turn,
+optionally mirrored), converted to RGB with the stream's own matrix and
+resized bicubic as images are. Each two consecutive
+frames are one temporal patch, introduced by the mean of their times as
+`<t seconds>`, as Qwen3VLProcessor writes it; an odd count repeats the last
+frame. A request's `mm_processor_kwargs` may set
+`fps` or `num_frames`, `min_frames`, `max_frames` and `size`
+(`shortest_edge`, `longest_edge`, at most 83,886,080). A file that ends early
+gives the frames before its cut. Images, PDF pages and temporal patches share
+a request's 1024 vision spans (768 frames take 384), images and pages at most
+64 of them.
+
+Videos decode one at a time, in a disposable process (`splash video-frames`)
+that the server bounds to 120 s and 1 GiB, without holding preparation
+capacity, and prepared videos are reused when history sends them again with
+the same options. Apple's hardware decoder stops returning frames when wired
+memory nears the kernel's limit (`vm.global_user_wire_limit`), which a model
+can bring it to where `iogpu.wired_limit_mb` is raised above that limit:
+after 5 s without a frame the video is decoded again in software, to the
+same pixels, its ranges on all cores, and videos decode in software first
+for the next 10 minutes. VP9 and AV1 have no software decoder: they are tried
+in hardware whichever comes first, and a stall returns 400 saying so.
+
+A model served with `--language-only` refuses all three with 400 ([vision](models.md#vision)).
 
 ## Responses state
 
@@ -656,7 +700,7 @@ Proxy consumers can use these fields; additional fields may be added:
 | `loop.max_tick_ms` | Longest control pass and engine step of the native loop. A reader thread keeps reading requests meanwhile, so a request frame whose write stalls 5 s after it started fails the engine only when the process stopped reading; while requests are pending the server asks for status every 10 s and fails an engine whose loop does not answer within 30 s. |
 | `maximum_context_tokens` | Declared context limit; available memory may limit admission |
 | `thermal_state` | The Mac's thermal state as macOS reports it: `nominal`, `fair`, `serious` or `critical`. As the Mac heats, its CPU and GPU clocks drop and prefill and decode slow down, on some Macs already at `fair`; readiness ignores it. The engine samples it twice a second and logs each change (`Thermal state: fair → serious`) |
-| `vision`, `input_modalities` | Whether image and PDF input is accepted; `false` and `["text"]` after `--language-only` |
+| `vision`, `input_modalities` | Whether image, PDF and video input is accepted; `false` and `["text"]` after `--language-only` |
 | `reasoning_switch` | Whether a request's reasoning effort or `enable_thinking` turns the model's reasoning on and off ([default reasoning effort](server.md#default-reasoning-effort)): `true` for the Qwen families, `false` for Flint, whose model decides each turn |
 | `chat_template.later_system` | `native`, `patched` or `unsupported`: how system messages after the first render (per name for named templates) |
 | `transport.recovering`, `transport.stopped`, `transport.error` | The engine is restarting, or Splash stopped restarting it after repeated failures; `error` names its failure, the last failed restart, or why restarts stopped |

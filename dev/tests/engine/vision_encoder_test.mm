@@ -167,9 +167,13 @@ int main(int argc, char **argv) {
           splash::model::loadVisionWeights(backend, images, loader.get());
       const std::string fixture = argv[3];
 
+      // grid.txt holds "HEIGHT WIDTH" and, for a video temporal patch whose
+      // pixels.bin holds two frames, a third value 2.
       ImageGrid grid;
       std::ifstream gridFile(fixture + "/grid.txt");
       gridFile >> grid.height >> grid.width;
+      if (!(gridFile >> grid.frames))
+        grid.frames = 1;
       if (!grid.valid())
         throw std::runtime_error("fixture grid is invalid");
       const std::vector<uint8_t> pixelBytes = readFile(fixture + "/pixels.bin");
@@ -199,9 +203,9 @@ int main(int argc, char **argv) {
       std::printf("embedding SHA-256: %s\n", digest.c_str());
       const Parity parity =
           compare(first, expected, descriptor.vision.outputHiddenSize);
-      std::printf("grid %ux%u: relative_error %.4f max_abs %.4f "
+      std::printf("grid %ux%u, %u frame(s): relative_error %.4f max_abs %.4f "
                   "worst_row_error %.4f gpu %.2f ms\n",
-                  grid.height, grid.width, parity.relativeError,
+                  grid.height, grid.width, grid.frames, parity.relativeError,
                   parity.maxAbsolute, parity.worstRowError, gpuSeconds * 1e3);
       // The tower's bf16 activations drift ~1-2.5% relative from fp32 over
       // 27 blocks, by the tower and how the shaders are compiled; that is the
@@ -216,6 +220,42 @@ int main(int argc, char **argv) {
       if (first != second) {
         std::printf("FAIL: encoding is not deterministic\n");
         pass = false;
+      }
+
+      // A video temporal patch of two identical frames is exactly the image
+      // its single frame makes; swapping two distinct frames changes it.
+      {
+        const uint64_t frameBytes =
+            splash::ops::imagePixelBytes(grid.height, grid.width);
+        const std::vector<uint8_t> single(pixelBytes.begin(),
+                                          pixelBytes.begin() + frameBytes);
+        std::vector<uint8_t> inverted = single;
+        for (uint8_t &value : inverted)
+          value = static_cast<uint8_t>(255 - value);
+        const auto joined = [](const std::vector<uint8_t> &a,
+                               const std::vector<uint8_t> &b) {
+          std::vector<uint8_t> both = a;
+          both.insert(both.end(), b.begin(), b.end());
+          return both;
+        };
+        const uint32_t width = model.tensors.layout.outputHiddenSize;
+        const ImageGrid image{grid.height, grid.width, 1};
+        const ImageGrid pair{grid.height, grid.width, 2};
+        const auto encodePair = [&](const std::vector<uint8_t> &bytes) {
+          MetalBuffer buffer = upload(backend, bytes, "temporal patch");
+          return encodeOnce(backend, encoder, pair, buffer, width, nullptr);
+        };
+        MetalBuffer singleBuffer = upload(backend, single, "single frame");
+        if (encodeOnce(backend, encoder, image, singleBuffer, width, nullptr) !=
+            encodePair(joined(single, single))) {
+          std::printf("FAIL: two identical frames differ from the image\n");
+          pass = false;
+        }
+        if (encodePair(joined(single, inverted)) ==
+            encodePair(joined(inverted, single))) {
+          std::printf("FAIL: frame order does not reach the patch embedding\n");
+          pass = false;
+        }
       }
 
       // A different grid through the same arena after a larger image: the

@@ -758,9 +758,12 @@ ProtocolResult<ClientMessage> decodeRequest(std::vector<uint8_t> &&payload,
   request.imageSpans.resize(imageSpanCount);
   uint64_t pixelBytes = 0;
   for (ImageSpan &span : request.imageSpans) {
+    uint32_t reserved = 0;
     if (!reader.u32(span.offset) || !reader.u32(span.tokens) ||
         !reader.u32(span.gridHeight) || !reader.u32(span.gridWidth) ||
         !reader.u64(span.digestLo) || !reader.u64(span.digestHi) ||
+        !reader.u32(span.frames) || !reader.u32(reserved) || reserved ||
+        !ops::validImageFrames(span.frames) ||
         !checkedAdd(pixelBytes, span.pixelBytes(), pixelBytes)) {
       return failure<ClientMessage>(
           requestIssue(IssueCode::InvalidPayloadLength, request.requestId,

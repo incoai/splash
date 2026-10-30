@@ -47,6 +47,12 @@ BlockIdentity blockImageIdentity(uint64_t blockBegin, uint32_t blockTokens,
       lo = mix(lo, value);
       hi = mix(hi, ~value);
     }
+    // Video temporal patches also fold their frame count; images keep the
+    // identity earlier caches stored.
+    if (span.frames != 1) {
+      lo = mix(lo, span.frames);
+      hi = mix(hi, ~uint64_t{span.frames});
+    }
     identity = {lo, hi};
   }
   return identity;

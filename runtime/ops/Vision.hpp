@@ -63,19 +63,28 @@ struct VisionWeights final {
 inline constexpr uint32_t kImagePatchPixels = 16;
 inline constexpr uint32_t kImageChannels = 3;
 inline constexpr uint32_t kMaximumImagePatches = 16384;
+// The patch embedding covers two frames. An image supplies one frame, which
+// fills both; a video temporal patch supplies two consecutive frames.
+inline constexpr uint32_t kTemporalPatchFrames = 2;
 [[nodiscard]] constexpr uint64_t imagePixelBytes(uint32_t gridHeight,
-                                                 uint32_t gridWidth) noexcept {
+                                                 uint32_t gridWidth,
+                                                 uint32_t frames = 1) noexcept {
   return uint64_t{gridHeight} * kImagePatchPixels * gridWidth *
-         kImagePatchPixels * kImageChannels;
+         kImagePatchPixels * kImageChannels * frames;
+}
+[[nodiscard]] constexpr bool validImageFrames(uint32_t frames) noexcept {
+  return frames == 1 || frames == kTemporalPatchFrames;
 }
 // Patch-grid sides are multiples of the 2x2 spatial merge. Each merged token
 // covers four patches and follows row-major order over the merged grid.
 struct ImageGrid final {
   uint32_t height = 0; // patches
   uint32_t width = 0;
+  uint32_t frames = 1;
 
   [[nodiscard]] bool valid() const noexcept {
-    return height >= 2 && width >= 2 && height % 2 == 0 && width % 2 == 0;
+    return height >= 2 && width >= 2 && height % 2 == 0 && width % 2 == 0 &&
+           validImageFrames(frames);
   }
   // Exact for any sides, so a grid past a patch limit cannot wrap under it.
   [[nodiscard]] uint64_t patches() const noexcept {
@@ -85,7 +94,7 @@ struct ImageGrid final {
     return (height / 2) * (width / 2);
   }
   [[nodiscard]] uint64_t pixelBytes() const noexcept {
-    return imagePixelBytes(height, width);
+    return imagePixelBytes(height, width, frames);
   }
 };
 

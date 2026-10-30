@@ -168,10 +168,13 @@ struct ImageSpan final {
   uint32_t gridWidth = 0;
   uint64_t digestLo = 0;
   uint64_t digestHi = 0;
+  // 1 for an image; 2 for one video temporal patch, whose pixels hold two
+  // consecutive frames.
+  uint32_t frames = 1;
 
   [[nodiscard]] uint32_t end() const noexcept { return offset + tokens; }
   [[nodiscard]] ops::ImageGrid grid() const noexcept {
-    return {gridHeight, gridWidth};
+    return {gridHeight, gridWidth, frames};
   }
   [[nodiscard]] uint64_t pixelBytes() const noexcept {
     return grid().pixelBytes();

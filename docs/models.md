@@ -387,7 +387,14 @@ BF16. The processor configuration (MLX `preprocessor_config.json`, or the
 `image_processor` object of `processor_config.json`, where newer Transformers
 releases save it; the GGUF's `clip.vision` metadata) must describe the one
 preprocessing Splash implements (`server/images.py`); it is checked before any
-weight download and not installed. The models of a family without a vision
+weight download and not installed. The video processor's (MLX
+`video_preprocessor_config.json`, or the `video_processor` object of
+`processor_config.json`) is checked too, its preprocessing, and its frame rate,
+frame range and pixel budget within what Splash serves (`server/videos.py`),
+and installed: the server samples a model's videos by it, with the keys it
+leaves out at transformers' Qwen3VLVideoProcessor defaults. A GGUF repository
+has none, and its videos are sampled as Qwen publishes for these models: 2
+frames per second, 4–768 frames, 4,096–25,165,824 pixels. The models of a family without a vision
 tower (Flint; `vision` in `install/families.py`) serve text only: their
 installation reads no projector, with or without `--language-only`.
 
@@ -414,8 +421,8 @@ memory accounting. It skips a GGUF's mmproj download and an MLX shard that
 holds only the tower (OptiQ keeps the tower in a subdirectory shard of its own);
 vision tensors in the language model's shards download with them. The native
 Ready event
-announces vision only when the model loaded it. Without it, image and PDF input
-fails with a 400 naming the modality. Every API shape converts its media to
+announces vision only when the model loaded it. Without it, image, PDF and
+video input fails with a 400 naming the modality. Every API shape converts its media to
 image and file parts, and message normalization, the one place that accepts or
 rejects them, checks before any image is decoded or PDF rendered, in user
 turns, tool results and stored Responses history alike. `/status` and

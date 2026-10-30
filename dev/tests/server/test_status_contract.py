@@ -276,7 +276,10 @@ class StatusRouteTests(HarnessTestCase):
         self.assertFalse(json.loads(payload)["ready"])
 
     def test_vision_capability_is_advertised_by_status_and_models(self):
-        for vision, modalities in ((True, ["text", "image", "pdf"]), (False, ["text"])):
+        for vision, modalities in (
+            (True, ["text", "image", "video", "pdf"]),
+            (False, ["text"]),
+        ):
             with self.subTest(vision=vision):
                 harness = self.harness(
                     FakeRuntime(), vision=vision, served_model_names=("local",)

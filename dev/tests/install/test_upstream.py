@@ -35,6 +35,7 @@ from dev.tests.installer_fixtures import (
     selection,
 )
 from install import assembly, families, hub, models, paths, upstream
+from server import videos
 
 # The engine's refusal of a model of no family Splash serves, naming what
 # tells it apart.
@@ -847,6 +848,85 @@ class UpstreamTest(unittest.TestCase):
                     self.assertNotIn(
                         f"{model}/model-00001-of-00002.safetensors", fake.downloads
                     )
+
+    def test_mlx_vision_links_the_video_processor_configuration(self):
+        # The server samples videos by the repository's video processor
+        # configuration (server/videos.py), its own file first, as
+        # transformers reads it, else processor_config.json's object, else as
+        # Qwen publishes for its models.
+        video = {
+            "size": {"longest_edge": 25165824, "shortest_edge": 4096},
+            "video_processor_type": "Qwen3VLVideoProcessor",
+            **PROCESSOR,
+        }
+
+        def target(files):
+            def build(root):
+                mlx_target(root, DENSE)
+                (root / "model.safetensors").unlink()
+                shards = {
+                    "vision_tower.blocks.0.attn.qkv.weight": "model-00001-of-00002.safetensors",
+                    "language_model.lm_head.weight": "model-00002-of-00002.safetensors",
+                }
+                (root / "model.safetensors.index.json").write_text(
+                    json.dumps({"weight_map": shards})
+                )
+                for name in set(shards.values()):
+                    (root / name).write_text(name)
+                (root / "preprocessor_config.json").write_text(json.dumps(PROCESSOR))
+                for name, content in files.items():
+                    (root / name).write_text(json.dumps(content))
+
+            return build
+
+        fake = fake_hub(self, self.cache)
+        for model, files, linked, fps in (
+            (
+                "someone/published",
+                {"video_preprocessor_config.json": video},
+                "video_preprocessor_config.json",
+                2.0,
+            ),
+            (
+                "someone/saved-by-transformers-5",
+                {"processor_config.json": {"video_processor": video | {"fps": 1}}},
+                "processor_config.json",
+                1.0,
+            ),
+            ("someone/no-video-config", {}, None, 2.0),
+        ):
+            with self.subTest(model=model):
+                fake.publish(model, "a" * 40, target(files))
+                chosen = selection(self.root, model, language_only=False)
+                self.prepare(chosen)
+                names = assembly.verify(chosen.link)["files"]
+                video_files = {
+                    name
+                    for name in names
+                    if name.startswith("vision/") and "processor" in name
+                }
+                self.assertEqual(video_files, {f"vision/{linked}"} if linked else set())
+                self.assertEqual(
+                    videos.installed_config(chosen.link / "vision"),
+                    dataclasses.replace(videos.PUBLISHED_CONFIG, fps=fps),
+                )
+        fake.publish(
+            "someone/other-video-patches",
+            "a" * 40,
+            target({"video_preprocessor_config.json": video | {"patch_size": 14}}),
+        )
+        with self.assertRaisesRegex(
+            models.ModelError,
+            "video_preprocessor_config.json: unsupported video preprocessing "
+            "configuration; use --language-only",
+        ):
+            self.prepare(
+                selection(self.root, "someone/other-video-patches", language_only=False)
+            )
+        self.assertNotIn(
+            "someone/other-video-patches/model-00001-of-00002.safetensors",
+            fake.downloads,
+        )
 
     def test_a_tower_in_a_shard_of_its_own_is_not_the_targets(self):
         # OptiQ keeps the tower in a subdirectory shard: the target links the

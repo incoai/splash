@@ -26,6 +26,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from server import videos
+
 from . import assembly, families, gguf, hub, models
 
 # The tokenizer files an MLX target may supply, linked when present.
@@ -45,6 +47,9 @@ VISION_TOWER = ("vision_tower.", "model.visual.")
 # its own, or the image_processor object of processor_config.json, where newer
 # Transformers releases save it.
 PROCESSOR_FILES = ("preprocessor_config.json", "processor_config.json")
+# Where it keeps its video processor's: a file of its own, or the
+# video_processor object of processor_config.json.
+VIDEO_PROCESSOR_FILE = "video_preprocessor_config.json"
 # A DFlash2 release's BF16 embedding of its mask token, beside its weights,
 # which its draft reads in place of the target's token table row
 # (DraftCheckpoint.hpp kDraftMaskEmbedding; docs/models.md, Drafts).
@@ -344,6 +349,7 @@ def mlx_target(repo, language_only):
         # configuration refuses the vision alone.
         try:
             _validate_processor(_image_processor(repo))
+            video_processor = _video_processor(repo)
             shards = _weight_files(repo, VISION_TOWER)
         except models.ModelError as error:
             raise models.VisionError(str(error)) from None
@@ -356,6 +362,8 @@ def mlx_target(repo, language_only):
             raise models.VisionError(str(error)) from None
         files["vision/config.json"] = "config.json"
         files |= {"vision/" + n: n for n in shards}
+        if video_processor is not None:
+            files["vision/" + video_processor] = video_processor
     return Target("mlx-affine", vision_format, config, None, family, files)
 
 
@@ -370,6 +378,28 @@ def _image_processor(repo):
             f"{repo.name}'s processor_config.json has no image_processor"
         )
     return config
+
+
+def _video_processor(repo):
+    """The file holding an MLX target's video processor configuration, which
+    the server samples videos by (server/videos.py installed_config), checked
+    before any weight download; None for a repository with neither, whose
+    videos are sampled as Qwen publishes for its models."""
+    if VIDEO_PROCESSOR_FILE in repo.files:
+        name = VIDEO_PROCESSOR_FILE
+        config = models.read_json(repo.file(name))
+    elif "processor_config.json" in repo.files:
+        name = "processor_config.json"
+        config = models.read_json(repo.file(name)).get("video_processor")
+        if config is None:
+            return None
+    else:
+        return None
+    try:
+        videos.video_config(config)
+    except videos.VideoError as error:
+        raise models.ModelError(f"{name}: {error}") from None
+    return name
 
 
 def _weight_files(repo, prefix="", exclude=None):

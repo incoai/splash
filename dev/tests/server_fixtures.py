@@ -799,6 +799,7 @@ def main_args(**overrides):
             "disable_ane": False,
             "verify_rows": "auto",
             "max_image_pixels": images.MAX_PIXELS,
+            "max_video_pixels": None,
             "request_timeout": None,
             "queue_size": 1,
             "host": "127.0.0.1",
