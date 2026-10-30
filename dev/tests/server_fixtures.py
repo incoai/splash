@@ -1004,7 +1004,7 @@ def no_signed_thinking(signature):
     raise AssertionError(f"unexpected thinking signature {signature!r}")
 
 
-def make_job(request_id=101, *, constraint=None, temperature=0.0):
+def make_job(request_id=101, *, constraint=None, temperature=0.0, stop_sequences=()):
     return backend_api.Job(
         request_id=request_id,
         prompt_tokens=[11, 12, 13, 14],
@@ -1021,6 +1021,7 @@ def make_job(request_id=101, *, constraint=None, temperature=0.0):
         ),
         deadline=time.monotonic() + 10.0,
         priority=wire.RequestPriority.FOREGROUND,
+        stop_sequences=stop_sequences,
         constraint=constraint,
     )
 
