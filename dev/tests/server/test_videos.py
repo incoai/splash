@@ -604,6 +604,20 @@ class DecoderTest(unittest.TestCase):
         except AssertionError as error:
             self.assertIn("has no decoder on this Mac", str(error))
 
+    def test_hdr_is_tone_mapped_to_sdr(self):
+        probed = probe("index_hlg.mp4")
+        self.assertTrue(probed["hdr"])
+        self.assertFalse(probe("index.mp4")["hdr"])
+        hardware = decode("index_hlg.mp4", 160, 96)
+        software = decode("index_hlg.mp4", 160, 96, software=True)
+        for frames in (hardware, software):
+            self.assert_indices(frames, range(12))
+        # The two paths upsample chroma differently at sharp edges only.
+        self.assertLess(np.abs(hardware.astype(int) - software).mean(), 2)
+        # HLG's grey sits darker than the same code value as SDR.
+        sdr = decode("index.mp4", 160, 96)[:12]
+        self.assertLess(hardware[:, -10:, -10:].mean(), sdr[:, -10:, -10:].mean() - 10)
+
     def test_unreadable_files_name_the_reason(self):
         for name, message in (
             ("index.flv", "no video track"),

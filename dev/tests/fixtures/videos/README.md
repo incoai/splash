@@ -18,6 +18,7 @@ back, so a test sees exactly which frame the decoder returned.
 - `index_vp9.mp4`: VP9, which decodes in hardware only.
 - `index_av1.mp4`: the first 20 frames as AV1, which decodes only on Macs
   with a hardware AV1 decoder.
+- `index_hlg.mp4`: the first 12 as 10-bit HEVC tagged HLG, tone mapped to SDR.
 - `index.ts`: the first 30 frames in an MPEG transport stream.
 - `index_sar2.mp4`: four frames of pixels twice as wide as tall.
 - `index.flv`: H.264 in FLV, a container AVFoundation does not read.

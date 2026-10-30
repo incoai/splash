@@ -203,6 +203,9 @@ struct Video {
   int width = 0, height = 0;
   Orientation orientation;
   int32_t timescale = 1;
+  // Whether the stream's transfer is HDR (PQ or HLG): its frames are mapped
+  // to SDR BT.709, as they are displayed.
+  bool hdr = false;
   // The codec's FourCC, as errors name it.
   std::string codec;
 
@@ -213,6 +216,12 @@ struct Video {
     return orientation.swapsAxes() ? width : height;
   }
 };
+
+bool isHdrTransfer(CFTypeRef transfer) {
+  return transfer &&
+         (CFEqual(transfer, kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG) ||
+          CFEqual(transfer, kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ));
+}
 
 // mime names the container where its file's name would not: AVFoundation
 // chooses a reader by the extension, and the server's file has none of its
@@ -255,6 +264,8 @@ Video openAVFoundation(const char *path, NSString *mime) {
     const auto format = (__bridge CMVideoFormatDescriptionRef)track.formatDescriptions[0];
     // The clean aperture at the pixel aspect ratio, as it is displayed.
     size = CMVideoFormatDescriptionGetPresentationDimensions(format, true, true);
+    video.hdr = isHdrTransfer(
+        CMFormatDescriptionGetExtension(format, kCMFormatDescriptionExtension_TransferFunction));
     const FourCharCode code = CMFormatDescriptionGetMediaSubType(format);
     for (int shift = 24; shift >= 0; shift -= 8) {
       const char c = static_cast<char>(code >> shift & 0xFF);
@@ -387,7 +398,8 @@ int probe(const char *path) {
   const Index found = frameIndex(video);
   std::string json = "{\"width\":" + std::to_string(video.displayWidth()) +
                      ",\"height\":" + std::to_string(video.displayHeight()) +
-                     ",\"timescale\":" + std::to_string(video.timescale) + ",\"frames\":[";
+                     ",\"timescale\":" + std::to_string(video.timescale) +
+                     ",\"hdr\":" + (video.hdr ? "true" : "false") + ",\"frames\":[";
   for (size_t i = 0; i < found.frames.size(); ++i)
     json += (i ? "," : "") + std::to_string(found.frames[i]);
   json += "],\"keyframes\":[";
@@ -561,15 +573,29 @@ std::string missing(const Request &request, size_t index) {
   return "a frame at " + std::to_string(request.seconds(index)) + " s could not be decoded";
 }
 
+// The colour VideoToolbox converts an HDR stream to: SDR BT.709, tone mapped
+// as the system displays it.
+NSDictionary *sdrColour() {
+  return @{
+    AVVideoColorPrimariesKey : AVVideoColorPrimaries_ITU_R_709_2,
+    AVVideoTransferFunctionKey : AVVideoTransferFunction_ITU_R_709_2,
+    AVVideoYCbCrMatrixKey : AVVideoYCbCrMatrix_ITU_R_709_2
+  };
+}
+
 // AVFoundation decodes, on Apple's hardware decoder for the codecs it has
 // one for. VideoToolbox converts with the stream's own matrix and range, and
-// no colour management, as FFmpeg's YUV to RGB conversion does.
+// no colour management, as FFmpeg's YUV to RGB conversion does, except that
+// an HDR stream is tone mapped to SDR.
 int decodeHardware(const Request &request, const Video &video, int width, int height) {
   NSError *error = nil;
   AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:video.asset error:&error];
   if (!reader)
     throw VideoError("the video cannot be read");
-  NSDictionary *settings = @{(id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA)};
+  NSMutableDictionary *settings =
+      [@{(id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA)} mutableCopy];
+  if (video.hdr)
+    settings[AVVideoColorPropertiesKey] = sdrColour();
   AVAssetReaderTrackOutput *output =
       [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:video.track
                                                  outputSettings:settings];
@@ -702,6 +728,14 @@ int decodeSoftware(const Request &request, const Video &video, int width, int he
   // Without an IOSurface, the decoder's buffer is ordinary memory.
   NSDictionary *destination =
       @{(id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA)};
+  NSDictionary *transfer = @{
+    (id)kVTPixelTransferPropertyKey_DestinationColorPrimaries :
+        (id)kCVImageBufferColorPrimaries_ITU_R_709_2,
+    (id)kVTPixelTransferPropertyKey_DestinationTransferFunction :
+        (id)kCVImageBufferTransferFunction_ITU_R_709_2,
+    (id)kVTPixelTransferPropertyKey_DestinationYCbCrMatrix :
+        (id)kCVImageBufferYCbCrMatrix_ITU_R_709_2
+  };
   Result *out = results.data();
   const Span *spanAt = spans.data();
   dispatch_apply(spans.size(), DISPATCH_APPLY_AUTO, ^(size_t s) {
@@ -771,6 +805,9 @@ int decodeSoftware(const Request &request, const Video &video, int width, int he
                                              &session) != noErr)
               throw NoSoftwareDecoder("the video's codec " + video.codec +
                                       " has no software decoder");
+            if (video.hdr)
+              VTSessionSetProperty(session, kVTDecompressionPropertyKey_PixelTransferProperties,
+                                   (__bridge CFDictionaryRef)transfer);
           }
           // A sample the decoder rejects, as a damaged one, gives no frame;
           // the frames that need it are reported missing. Decoding runs

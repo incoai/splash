@@ -156,6 +156,17 @@ def main():
         ["-c:v", "libsvtav1", "-pix_fmt", "yuv420p", "-g", "12", "-svtav1-params"]
         + ["log-level=0"],
     )
+    # HLG, as phones record HDR: tone mapped to SDR.
+    encode(
+        "index_hlg.mp4",
+        indexed[:12],
+        WIDTH,
+        HEIGHT,
+        ["-c:v", "libx265", "-pix_fmt", "yuv420p10le", "-tag:v", "hvc1", "-x265-params"]
+        + [
+            "log-level=error:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc"
+        ],
+    )
     # MPEG transport stream, which AVFoundation reads when told its type.
     encode("index.ts", indexed[:30], WIDTH, HEIGHT, x264 + ["-g", "12"])
     # Pixels twice as wide as tall: displayed at 320x96.
