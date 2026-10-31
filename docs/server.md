@@ -918,7 +918,11 @@ splash serve --model mlx-community/Qwen3.8-27B-4bit --thinking-token-budget 1200
 
 A budget applies only where generation starts in a thinking block, and one the
 output limit reaches first changes nothing; the output limit can also cut the
-end short. A model that opens its thinking itself, as Flint does, never starts
+end short. Where the context leaves a request less room than its output limit,
+its budget gives up the difference, down to none, so that the answer keeps the
+room the request left it: a budget of 24,576 under a limit of 32,768 with
+20,000 tokens of context left ends thinking at 11,808. A model that opens its
+thinking itself, as Flint does, never starts
 in one, and a budget caps nothing for it. Where the output may call a tool, a
 call's opening ends thinking too, so the end never lands inside a call. The
 engine takes any `<tool_call>` token for that opening, while the reply's

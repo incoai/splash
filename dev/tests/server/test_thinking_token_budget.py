@@ -92,6 +92,21 @@ class ThinkingTokenBudgetTests(unittest.TestCase):
             )
         self.assertEqual(self.frames(runtime), [None, None, budget(5)])
 
+    def test_thinking_gives_up_the_room_the_context_does_not_leave(self):
+        harness, runtime = self.harness()
+        self.post(harness, "/v1/chat/completions", fixtures.chat_body())
+        room = runtime.requests[0].frame.logical_max_output_tokens
+        # The answer keeps the room the request left it, all of the room
+        # where that is more; a request that asks for all the room left the
+        # answer none to keep.
+        for fields in (
+            {"max_tokens": room + 4, "thinking_token_budget": room - 6},
+            {"max_tokens": room + 4, "thinking_token_budget": 3},
+            {"thinking_token_budget": room},
+        ):
+            self.post(harness, "/v1/chat/completions", fixtures.chat_body(**fields))
+        self.assertEqual(self.frames(runtime)[1:], [budget(room - 10), budget(0), None])
+
     def test_a_call_opening_also_ends_thinking_where_a_call_may_follow(self):
         harness, runtime = self.harness()
         for choice in ("auto", "none"):
