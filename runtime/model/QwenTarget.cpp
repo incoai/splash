@@ -183,7 +183,9 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
           sequence.rows, geometry_.attentionQueryHeads, geometry_.kvLayout, {.windowTokens = window}));
   }
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe) step.moe = operators_.moePrefill(geometry_.moeShape(), chunk.rows);
-  if (aneFfn && aneFfn->splits(chunk.rows)) step.aneFfn = aneFfn;
+  // A score request's chunk runs on the GPU alone: the Neural Engine's fp16
+  // share of the dense FFN would make its logits depend on the split.
+  if (aneFfn && !chunk.buffers.splitFree && aneFfn->splits(chunk.rows)) step.aneFfn = aneFfn;
   return step;
 }
 
@@ -220,12 +222,12 @@ namespace {
 // A mixer's output projection of a prefill step's `hidden` rows.
 void addPrefillOutput(const ops::Linear &linear, metal::CommandGraph &graph, metal::MetalBuffer hidden,
                       const ops::Projection &projection, uint32_t rows, ops::LinearScratch scratch,
-                      metal::MetalBuffer output, metal::MetalBuffer residual) {
+                      metal::MetalBuffer output, metal::MetalBuffer residual, bool splitFree) {
   if (residual)
     linear.addPrefillResidual(graph, std::move(hidden), projection, std::move(residual), std::move(output), rows,
-                              scratch);
+                              scratch, splitFree);
   else
-    linear.addPrefill(graph, std::move(hidden), projection, std::move(output), rows, scratch);
+    linear.addPrefill(graph, std::move(hidden), projection, std::move(output), rows, scratch, splitFree);
 }
 
 } // namespace
@@ -234,7 +236,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
   const QwenTargetPrefillBuffers &b = step.buffers;
   const uint32_t layer = step.gdnLayer++;
   operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked, step.rows,
-                                 b.linearScratch);
+                                 b.linearScratch, b.splitFree);
   for (const QwenTargetPrefillSequence &sequence : step.sequences) {
     const auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
       return rowsOf<uint16_t>(buffer, sequence.rowBegin, sequence.rows, width);
@@ -257,7 +259,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
         geometry_.gdnShape(), sequence.rows, geometry_.stateLayout.format, mixer.outputHeadOrder, captures);
   }
   addPrefillOutput(operators_.linear(), step.graph, b.gdnHidden, mixer.outputProjection, step.rows, b.linearScratch,
-                   std::move(output.rows), std::move(output.residual));
+                   std::move(output.rows), std::move(output.residual), b.splitFree);
 }
 
 // A sequence with blocks attends through the lists of its tiles of rows,
@@ -282,7 +284,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
     return rowsOf<float>(buffer, sequence.rowBegin, sequence.rows, width);
   };
   operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.rows,
-                                 b.linearScratch);
+                                 b.linearScratch, b.splitFree);
   for (size_t index = 0; index < step.sequences.size(); ++index) {
     const QwenTargetPrefillSequence &sequence = step.sequences[index];
     const uint64_t headBytes = uint64_t{sequence.attentionStride} * geometry_.attentionHeadDimension * sizeof(uint16_t);
@@ -313,7 +315,7 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
         geometry_.attentionQueryHeads, geometry_.kvLayout);
   }
   addPrefillOutput(operators_.linear(), step.graph, b.attentionHidden, mixer.outputProjection, step.rows,
-                   b.linearScratch, std::move(output.rows), std::move(output.residual));
+                   b.linearScratch, std::move(output.rows), std::move(output.residual), b.splitFree);
 }
 
 ops::LinearInput QwenTarget::decodeInput(const ops::Projection &projection, uint32_t lanes) const {
@@ -398,7 +400,7 @@ void QwenTarget::addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops
     step.aneFfn->add(step.graph, index, buffers, std::move(residual), std::move(output), step.rows);
   else
     operators_.linear().addPrefillSwiGlu(step.graph, ffn, buffers, std::move(residual), std::move(output),
-                                         step.rows);
+                                         step.rows, step.buffers.splitFree);
 }
 
 void QwenTarget::addPrefillMoeRouting(PrefillStep &step, const ops::NormWeights &norm,

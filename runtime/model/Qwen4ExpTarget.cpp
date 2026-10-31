@@ -105,9 +105,9 @@ void Qwen4ExpTarget::addPrefillMix(PrefillStep &step, const Qwen4HyperWeights &h
   const ops::HyperShape hs = hyperShape(geometry_);
   ops::HyperConnection::addNorm(step.graph, h.streams, hyper.norm, hyper.inject, h.normalized, h.weights, hs,
                                 step.rows);
-  linear.addPrefill(step.graph, h.normalized, hyper.down, h.low, step.rows, b.linearScratch);
+  linear.addPrefill(step.graph, h.normalized, hyper.down, h.low, step.rows, b.linearScratch, b.splitFree);
   ops::HyperConnection::addLow(step.graph, h.low, hs, step.rows);
-  linear.addPrefill(step.graph, h.low, hyper.up, h.gate, step.rows, b.linearScratch);
+  linear.addPrefill(step.graph, h.low, hyper.up, h.gate, step.rows, b.linearScratch, b.splitFree);
   ops::HyperConnection::addMix(step.graph, h.normalized, h.gate, std::move(output), hs, step.rows);
 }
 
@@ -136,8 +136,8 @@ void Qwen4ExpTarget::addPrefillLayer(PrefillStep &step, uint32_t index) const {
     const ops::NgramShape ps = ngramShape(geometry_);
     const ops::Linear &linear = operators_.linear();
     addPleGather(step.graph, h, rows * geometry_.pleHeads());
-    linear.addPrefill(step.graph, h.pleRows, ple.key, h.gate, rows, b.linearScratch);
-    linear.addPrefill(step.graph, h.pleRows, ple.value, h.pleValue, rows, b.linearScratch);
+    linear.addPrefill(step.graph, h.pleRows, ple.key, h.gate, rows, b.linearScratch, b.splitFree);
+    linear.addPrefill(step.graph, h.pleRows, ple.value, h.pleValue, rows, b.linearScratch, b.splitFree);
     ops::NgramEmbedding::addGate(step.graph, h.gate, h.pleValue, h.streams, ple.keyNorm, ple.queryNorm,
                                  ple.convolutionNorm, h.pleGated, h.pleConvolution, ps, rows);
     for (const QwenTargetPrefillSequence &sequence : step.sequences) {

@@ -472,8 +472,12 @@ LinearConfig Linear::ggufBaseline(LinearWorkload w, std::span<const Projection *
   // which reads the weights once: 0.48 ms there, and 6-43% less than the
   // prefill tile over the 27B's Q4_K, MLX 4-bit and Q8_0 projections at the
   // split law's choice (gguf-projection-benchmark prefill=33,48,64). Apple9
-  // is unmeasured and keeps the prefill tile.
+  // is unmeasured and keeps the prefill tile. A split-free workload keeps one
+  // K pass, whose outputs equal the prefill tile's bit for bit, and the
+  // prefill tile past kMaximumDecodeTileRows rows.
   if (w.phase == LinearPhase::Prefill) {
+    if (w.splitFree)
+      return LinearConfig{.tile = w.rows <= kMaximumDecodeTileRows ? LinearTile::GgufStaged : LinearTile::GgufPrefill};
     const bool staged = w.rows <= kMaximumDecodeTileRows ||
                         (family_ == GpuFamilyClass::Apple10 && w.rows <= kMaximumStagedPrefillRows);
     return staged ? stagedDecode(n, k, w.rows, weightBits16(projections, shape), gpuCores_, family_)

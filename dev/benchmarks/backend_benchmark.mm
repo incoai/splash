@@ -98,7 +98,7 @@ public:
 
   void completed(uint64_t requestId, EngineFinishReason, bool, uint32_t,
                  uint32_t, uint32_t, std::span<const float> optionLogits,
-                 const SpeculativeCounts &) override {
+                 const SpeculativeCounts &, const engine::ScoreReadout &) override {
     Observation &value = observations_[requestId];
     value.completed = true;
     value.optionLogits.assign(optionLogits.begin(), optionLogits.end());
