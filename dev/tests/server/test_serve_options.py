@@ -216,6 +216,7 @@ OPTIONS = {
         ("", "two words", "key\n", "非ASCII"),
     ),
     "--allow-idle-sleep": ([(["--allow-idle-sleep"], True)], []),
+    "--llama-cpp-compat": ([(["--llama-cpp-compat"], True)], []),
     "--no-webui": ([(["--no-webui"], True)], []),
 }
 
@@ -328,6 +329,27 @@ class ServeOptionsTests(unittest.TestCase):
                 with self.subTest(parser=parse.__module__, flag=option.flag):
                     getattr(parse(required), option.dest).append("changed")
                     self.assertEqual(getattr(parse(required), option.dest), [])
+
+    def test_both_parsers_take_llama_cpp_compat_from_the_environment(self):
+        # store_true has no value of its own: the variable only gives the
+        # default, which is why it is not in the environment-check table.
+        for parse, required in PARSERS:
+            with (
+                self.subTest(parser=parse.__module__),
+                mock.patch.dict(os.environ, {"SPLASH_LLAMA_CPP_COMPAT": "1"}),
+            ):
+                self.assertIs(parse(required).llama_cpp_compat, True)
+                # The command line outranks the environment: an absent flag
+                # stays absent, and the flag itself turns it on.
+                self.assertIs(
+                    parse([*required, "--llama-cpp-compat"]).llama_cpp_compat, True
+                )
+            with (
+                self.subTest(parser=parse.__module__, default=True),
+                mock.patch.dict(os.environ),
+            ):
+                os.environ.pop("SPLASH_LLAMA_CPP_COMPAT", None)
+                self.assertIs(parse(required).llama_cpp_compat, False)
 
     def test_launcher_forwards_exactly_what_the_server_parses(self):
         launched = [

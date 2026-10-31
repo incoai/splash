@@ -8,6 +8,7 @@ from . import json_codec
 from . import protocol as wire
 from .documents import DocumentBudget, document_parts, file_content
 from .errors import APIError
+from .llama_cpp_compat import stamp_id_slot
 from .metrics import timings_dict, usage_dict
 from .tool_schema import TAG_NAME_RULE, is_tag_name
 
@@ -535,11 +536,13 @@ def _responses_format(text):
     }
 
 
-def responses_to_chat_body(body, items):
+def responses_to_chat_body(body, items, llama_cpp_compat=False):
     """A Responses request as a Chat body, and how the request names each
     tool the model sees under another name or shape (normalize_responses_tools).
     `items` are the request's canonical input items after those of the
-    response it continues."""
+    response it continues. With llama_cpp_compat the body's id_slot - the lane
+    a proxy pinned the request to - carries over into the Chat body, where the
+    generation reads it (llama_cpp_compat)."""
     if body.get("conversation") is not None:
         raise APIError(400, "conversation is not supported")
     if body.get("background") not in (None, False):
@@ -601,6 +604,8 @@ def responses_to_chat_body(body, items):
     ):
         if field_name in body and body[field_name] is not None:
             chat[aliases.get(field_name, field_name)] = body[field_name]
+    if llama_cpp_compat:
+        chat["id_slot"] = body.get("id_slot")
     return chat, namespaces
 
 
@@ -656,10 +661,12 @@ def _anthropic_content(value, label):
     return _media_content(parts)
 
 
-def anthropic_to_chat_body(body, *, thinking_resolver):
+def anthropic_to_chat_body(body, *, thinking_resolver, llama_cpp_compat=False):
     """A Messages generation request as a Chat body, and how its response
     shows reasoning. count_tokens converts only the prompt, so it still
-    counts a final assistant message."""
+    counts a final assistant message. With llama_cpp_compat the body's
+    id_slot - the lane a proxy pinned the request to - carries over into the
+    Chat body, where the generation reads it (llama_cpp_compat)."""
     max_tokens = body.get("max_tokens")
     if (
         not isinstance(max_tokens, int)
@@ -689,6 +696,8 @@ def anthropic_to_chat_body(body, *, thinking_resolver):
         priority=body.get("priority"),
         cache_salt=body.get("cache_salt"),
     )
+    if llama_cpp_compat:
+        chat["id_slot"] = body.get("id_slot")
     chat = {key: value for key, value in chat.items() if value is not None}
     return chat, thinking_display
 
@@ -1087,6 +1096,8 @@ def _anthropic_tool_choice(choice):
 
 
 def responses_response(model, job, status, output, result=None, error=None):
+    """A Responses API response document; stamp_id_slot adds the compat lane
+    to every one, the streamed response.created included."""
     usage = None
     if result is not None:
         cache = result.cache
@@ -1108,32 +1119,35 @@ def responses_response(model, job, status, output, result=None, error=None):
     text_format = job.response_format or {"type": "text"}
     if text_format.get("type") == "json_schema":
         text_format = {"type": "json_schema", **text_format["json_schema"]}
-    return {
-        "id": f"resp_{job.public_id}",
-        "object": "response",
-        "created_at": job.created_at,
-        "status": status,
-        "incomplete_details": (
-            {"reason": "max_output_tokens"} if status == "incomplete" else None
-        ),
-        "error": error,
-        "model": model,
-        "output": output,
-        "parallel_tool_calls": (
-            job.tool_policy.parallel if job.tool_policy is not None else True
-        ),
-        "store": job.response_store,
-        "previous_response_id": job.response_previous_id,
-        "text": {"format": text_format},
-        "usage": usage,
-        # Once complete, Chat's timings (timings_dict).
-        **({} if result is None else {"timings": timings_dict(result)}),
-        "end_turn": result is not None
-        and result.reason == "stop"
-        and not any(
-            item["type"] in ("function_call", "custom_tool_call") for item in output
-        ),
-    }
+    return stamp_id_slot(
+        {
+            "id": f"resp_{job.public_id}",
+            "object": "response",
+            "created_at": job.created_at,
+            "status": status,
+            "incomplete_details": (
+                {"reason": "max_output_tokens"} if status == "incomplete" else None
+            ),
+            "error": error,
+            "model": model,
+            "output": output,
+            "parallel_tool_calls": (
+                job.tool_policy.parallel if job.tool_policy is not None else True
+            ),
+            "store": job.response_store,
+            "previous_response_id": job.response_previous_id,
+            "text": {"format": text_format},
+            "usage": usage,
+            # Once complete, Chat's timings (timings_dict).
+            **({} if result is None else {"timings": timings_dict(result)}),
+            "end_turn": result is not None
+            and result.reason == "stop"
+            and not any(
+                item["type"] in ("function_call", "custom_tool_call") for item in output
+            ),
+        },
+        job,
+    )
 
 
 def finish_reason(result, called):
@@ -1145,45 +1159,53 @@ def finish_reason(result, called):
 
 
 def completion_response(model, job, result, message, called):
-    return {
-        "id": f"chatcmpl-{job.public_id}",
-        "object": "chat.completion",
-        "created": job.created_at,
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": message,
-                "finish_reason": finish_reason(result, called),
-            }
-        ],
-        "usage": usage_dict(result, job),
-        "metrics": result.metrics,
-        "timings": timings_dict(result),
-    }
+    return stamp_id_slot(
+        {
+            "id": f"chatcmpl-{job.public_id}",
+            "object": "chat.completion",
+            "created": job.created_at,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": message,
+                    "finish_reason": finish_reason(result, called),
+                }
+            ],
+            "usage": usage_dict(result, job),
+            "metrics": result.metrics,
+            "timings": timings_dict(result),
+        },
+        job,
+    )
 
 
 def text_completion_response(model, job, result, text):
-    return {
-        "id": f"cmpl-{job.public_id}",
-        "object": "text_completion",
-        "created": job.created_at,
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "text": text,
-                "logprobs": None,
-                "finish_reason": result.reason,
-            }
-        ],
-        "usage": usage_dict(result, job),
-        "metrics": result.metrics,
-        "timings": timings_dict(result),
-    }
+    return stamp_id_slot(
+        {
+            "id": f"cmpl-{job.public_id}",
+            "object": "text_completion",
+            "created": job.created_at,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "text": text,
+                    "logprobs": None,
+                    "finish_reason": result.reason,
+                }
+            ],
+            "usage": usage_dict(result, job),
+            "metrics": result.metrics,
+            "timings": timings_dict(result),
+        },
+        job,
+    )
 
 
-def _chunk(object_type, chunk_id, created, model, choice, usage, metrics, timings):
+def _chunk(
+    object_type, chunk_id, created, model, choice, usage, metrics, timings, job=None
+):
     chunk = {
         "id": chunk_id,
         "object": object_type,
@@ -1198,7 +1220,9 @@ def _chunk(object_type, chunk_id, created, model, choice, usage, metrics, timing
         chunk["metrics"] = metrics
     if timings is not None:
         chunk["timings"] = timings
-    return chunk
+    # A proxy scans every stream frame for id_slot and the last occurrence
+    # wins, so every chunk of a compat generation carries its lane.
+    return stamp_id_slot(chunk, job) if job is not None else chunk
 
 
 def stream_chunk(
@@ -1210,6 +1234,7 @@ def stream_chunk(
     usage=None,
     metrics=None,
     timings=None,
+    job=None,
 ):
     return _chunk(
         "chat.completion.chunk",
@@ -1220,6 +1245,7 @@ def stream_chunk(
         usage,
         metrics,
         timings,
+        job,
     )
 
 
@@ -1232,6 +1258,7 @@ def text_completion_chunk(
     usage=None,
     metrics=None,
     timings=None,
+    job=None,
 ):
     return _chunk(
         "text_completion",
@@ -1242,6 +1269,7 @@ def text_completion_chunk(
         usage,
         metrics,
         timings,
+        job,
     )
 
 
@@ -1390,19 +1418,24 @@ def anthropic_response(model, job, blocks, result, called, thinking_signature):
     content = [anthropic_block(job, block, thinking_signature) for block in blocks]
     if all(item["type"] == "thinking" for item in content):
         content.append({"type": "text", "text": ""})
-    return {
-        "id": f"msg_{job.public_id}",
-        "type": "message",
-        "role": "assistant",
-        "model": model,
-        "content": content,
-        "stop_reason": anthropic_stop(result, called, job.output_clamped_to_context),
-        "stop_sequence": result.stop_sequence,
-        "usage": anthropic_usage(
-            result.prompt_tokens,
-            result.completion_tokens,
-            result.cache,
-            job.reasoning_tokens,
-        ),
-        "timings": timings_dict(result),
-    }
+    return stamp_id_slot(
+        {
+            "id": f"msg_{job.public_id}",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": content,
+            "stop_reason": anthropic_stop(
+                result, called, job.output_clamped_to_context
+            ),
+            "stop_sequence": result.stop_sequence,
+            "usage": anthropic_usage(
+                result.prompt_tokens,
+                result.completion_tokens,
+                result.cache,
+                job.reasoning_tokens,
+            ),
+            "timings": timings_dict(result),
+        },
+        job,
+    )

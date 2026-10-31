@@ -174,6 +174,9 @@ class Job:
     response_history_items: list | None = None
     # Option token ids for score-only jobs; empty means ordinary generation.
     score_tokens: tuple = ()
+    # --llama-cpp-compat: the lane map stamping this job's responses as
+    # id_slot; None without the option (llama_cpp_compat).
+    lane_map: object | None = None
     # Trailing prompt tokens of the chat template's generation prompt; zero
     # when unknown.
     generation_prompt_tokens: int = 0
@@ -853,8 +856,12 @@ class NativeBackend:
                 job.cache = cache
             record = {
                 "outcome": "started",
+                "request_id": job.request_id,
                 "prompt_tokens": len(job.prompt_tokens),
                 "cached_tokens": cache.matched_tokens,
+                # The engine's own lane; --llama-cpp-compat cross-checks it
+                # against the lane its proxy assigned (llama_cpp_compat).
+                "lane": event.lane,
             }
             if job.reasoning is not None:
                 record["reasoning"] = {
@@ -1045,6 +1052,7 @@ class NativeBackend:
     def _record(self, job, result=None, error=None):
         record = {
             "outcome": result.reason if result else "error",
+            "request_id": job.request_id,
             "prompt_tokens": len(job.prompt_tokens),
         }
         if result:

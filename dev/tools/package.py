@@ -52,6 +52,7 @@ SERVER_FILES = (
     "judgments.py",
     "diagnostics.py",
     "api_shapes.py",
+    "llama_cpp_compat.py",
     "chat_format.py",
     "tool_schema.py",
     "tokenization.py",

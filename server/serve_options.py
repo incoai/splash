@@ -372,9 +372,17 @@ class ServeOption:
         return self.flag.removeprefix("--").replace("-", "_")
 
     def default(self):
-        if self.environment is not None:
-            return os.environ.get(self.environment)
-        return self.options.get("default")
+        if self.environment is None:
+            return self.options.get("default")
+        value = os.environ.get(self.environment)
+        if value is None:
+            # An unset variable leaves the option's own default.
+            return self.options.get("default")
+        if self.options.get("action") == "store_true":
+            # A boolean option's variable gives its default, not a value:
+            # any text but an empty one, 0 or off turns it on.
+            return value.strip().lower() not in ("", "0", "off", "false", "no")
+        return value
 
 
 SERVE_OPTIONS = (
@@ -597,6 +605,19 @@ SERVE_OPTIONS = (
             "it first in /v1/models; /status keeps the loaded model ID (needs "
             "--served-model-name)",
         ),
+    ),
+    ServeOption(
+        "--llama-cpp-compat",
+        "api",
+        dict(
+            action="store_true",
+            default=False,
+            help="answer llama.cpp's /slots and /props probes from this server's "
+            "own status, keep one llama.cpp slot lane per generation, and stamp "
+            "it back as id_slot, for a proxy that supervises children as it does "
+            "llama-server (default: off)",
+        ),
+        environment="SPLASH_LLAMA_CPP_COMPAT",
     ),
     ServeOption(
         "--default-reasoning-effort",

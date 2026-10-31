@@ -76,6 +76,9 @@ from .http_security import (
     validate_headers,
 )
 from .latency import RequestLatency
+from .llama_cpp_compat import QUIET_PROBES as COMPAT_PROBES
+from .llama_cpp_compat import attach_probes as attach_llama_cpp_compat
+from .llama_cpp_compat import stamp_id_slot
 from .metrics import prometheus_metrics, timings_dict, usage_dict
 from .origins import ANY_ORIGIN
 from .output import (
@@ -432,6 +435,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._send(status, data, "application/json", retry_after)
 
     def _log_api_error(self, code):
+        if self.route in COMPAT_PROBES and self.server.compat_probes:
+            # A probe stays as quiet in the console as the 404
+            # --llama-cpp-compat replaced, even when its status cannot be
+            # read. Without the option the probe is just another unknown
+            # path, and its 404 logs as any other.
+            return
         path = "".join(char if char.isprintable() else "?" for char in self.route)
         print_status(f"Error · {code} · {self.command} {path[:256]}", error=True)
 
@@ -568,6 +577,12 @@ class FrontendHandler(BaseHTTPRequestHandler):
             return
         if path == "/status":
             self._json(200, self.server.status())
+            return
+        if path in COMPAT_PROBES and self.server.compat_probes:
+            # --llama-cpp-compat: llama.cpp's status probes, answered from
+            # this server's own status document and kept quiet in the console
+            # (a poll per second would bury the Started/Done lines).
+            self.server.compat_probes(self)
             return
         if path == "/metrics":
             self._send(
@@ -775,7 +790,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def _post_messages(self, body, deadline):
         progress = _progress_flag(body)
         chat, thinking_display = anthropic_to_chat_body(
-            body, thinking_resolver=self.app.thinking_codec.decode
+            body,
+            thinking_resolver=self.app.thinking_codec.decode,
+            llama_cpp_compat=self.app.llama_cpp_compat,
         )
         job = self.app.prepare(
             chat,
@@ -1077,21 +1094,20 @@ class FrontendHandler(BaseHTTPRequestHandler):
             # Cache accounting is known at native admission. Keep the socket
             # alive while queued, but do not publish guessed input usage.
             self._start_event_stream()
-            send(
-                "message_start",
-                {
-                    "message": {
-                        "id": f"msg_{job.public_id}",
-                        "type": "message",
-                        "role": "assistant",
-                        "model": self.app.response_model,
-                        "content": [],
-                        "stop_reason": None,
-                        "stop_sequence": None,
-                        "usage": anthropic_usage(len(job.prompt_tokens), 0, job.cache),
-                    }
-                },
-            )
+            message = {
+                "id": f"msg_{job.public_id}",
+                "type": "message",
+                "role": "assistant",
+                "model": self.app.response_model,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": anthropic_usage(len(job.prompt_tokens), 0, job.cache),
+            }
+            # The Messages stream carries its message object here, at the
+            # engine's start, which is where --llama-cpp-compat stamps the
+            # lane (stamp_id_slot).
+            send("message_start", {"message": stamp_id_slot(message, job)})
 
         def keepalive():
             self._start_event_stream()
@@ -1465,6 +1481,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.app.response_model,
             job.public_id,
             job.created_at,
+            # Every chunk of a --llama-cpp-compat generation carries its lane
+            # (a proxy scans the frames and the last id_slot wins).
+            job=job,
         )
         empty = {} if chat else ""
         started = False
@@ -1546,6 +1565,7 @@ class FrontendServer(HTTPServer):
         webui=True,
         max_request_bytes=serve_options.DEFAULT_MAX_REQUEST_BYTES,
         allowed_origins=(),
+        llama_cpp_compat=False,
     ):
         if (
             isinstance(max_request_bytes, bool)
@@ -1554,6 +1574,9 @@ class FrontendServer(HTTPServer):
         ):
             raise ValueError("max_request_bytes must be a positive integer")
         self.max_request_bytes = max_request_bytes
+        # --llama-cpp-compat: set once the app exists, by
+        # llama_cpp_compat.attach; None answers /slots and /props 404.
+        self.compat_probes = None
         self.request_bodies = HttpAdmission(
             max(DEFAULT_REQUEST_BODY_BUDGET, 2 * max_request_bytes)
         )
@@ -1819,6 +1842,10 @@ def main():
             startup_timeout=NATIVE_START_TIMEOUT,
             pending_limit=args.queue_size,
         )
+        # Built before the engine is waited on, so a startup failure has a
+        # backend to close. --llama-cpp-compat rewires its request_logger to
+        # the frontend's wrapped one when the frontend is built
+        # (Frontend.__init__), which is where the lane map comes to exist.
         backend = NativeBackend(
             runtime,
             tokenizer,
@@ -1856,10 +1883,18 @@ def main():
             thinking_codec=thinking_codec,
             served_model_names=args.served_model_name,
             announce_served_name=args.announce_served_name,
+            llama_cpp_compat=args.llama_cpp_compat,
+            llama_cpp_queue_size=args.queue_size,
             default_reasoning_effort=args.default_reasoning_effort,
             default_thinking_token_budget=args.thinking_token_budget,
             vision=readiness.vision,
         )
+        if args.llama_cpp_compat:
+            # The frontend built the lane map in its __init__ (its
+            # llama_cpp_compat option); the backend it was built with logs
+            # through the frontend's wrapped request logger, so the map sees
+            # every record. Here the two probe routes join it.
+            attach_llama_cpp_compat(server, app.lane_map, args.queue_size)
         server.app = app
         server.server_activate()
         address = f"http://{args.host}:{server.server_port}"
