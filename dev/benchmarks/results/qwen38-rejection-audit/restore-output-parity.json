@@ -1,0 +1,150 @@
+{
+  "scope": "Whole emitted greedy streams across32cycles for16restore/materialized pairs",
+  "all_output_tokens_equal": true,
+  "pairs": [
+    {
+      "family": "clinic-access",
+      "context": "2k",
+      "output_tokens": [
+        105,
+        105
+      ],
+      "all_output_tokens_equal": true
+    },
+    {
+      "family": "clinic-access",
+      "context": "8k",
+      "output_tokens": [
+        99,
+        99
+      ],
+      "all_output_tokens_equal": true
+    },
+    {
+      "family": "deployment-calendar",
+      "context": "2k",
+      "output_tokens": [
+        169,
+        169
+      ],
+      "all_output_tokens_equal": true
+    },
+    {
+      "family": "deployment-calendar",
+      "context": "8k",
+      "output_tokens": [
+        146,
+        146
+      ],
+      "all_output_tokens_equal": true
+    },
+    {
+      "family": "divisibility-induction",
+      "context": "2k",
+      "output_tokens": [
+        156,
+        156
+      ],
+      "all_output_tokens_equal": true
+    },
+    {
+      "family": "divisibility-induction",
+      "context": "8k",
+      "output_tokens": [
+        172,
+        172
+      ],
+      "all_output_tokens_equal": true
+    },
+    {
+      "family": "inclusion-exclusion",
+      "context": "2k",
+      "output_tokens": [
+        174,
+        174
+      ],
+      "all_output_tokens_equal": true
+    },
+    {
+      "family": "inclusion-exclusion",
+      "context": "8k",
+      "output_tokens": [
+        173,
+        173
+      ],
+      "all_output_tokens_equal": true
+    },
+    {
+      "family": "rollback-dsu",
+      "context": "2k",
+      "output_tokens": [
+        105,
+        105
+      ],
+      "all_output_tokens_equal": true
+    },
+    {
+      "family": "rollback-dsu",
+      "context": "8k",
+      "output_tokens": [
+        98,
+        98
+      ],
+      "all_output_tokens_equal": true
+    },
+    {
+      "family": "school-meals",
+      "context": "2k",
+      "output_tokens": [
+        104,
+        104
+      ],
+      "all_output_tokens_equal": true
+    },
+    {
+      "family": "school-meals",
+      "context": "8k",
+      "output_tokens": [
+        87,
+        87
+      ],
+      "all_output_tokens_equal": true
+    },
+    {
+      "family": "stream-csv",
+      "context": "2k",
+      "output_tokens": [
+        84,
+        84
+      ],
+      "all_output_tokens_equal": true
+    },
+    {
+      "family": "stream-csv",
+      "context": "8k",
+      "output_tokens": [
+        97,
+        97
+      ],
+      "all_output_tokens_equal": true
+    },
+    {
+      "family": "warehouse-transfers",
+      "context": "2k",
+      "output_tokens": [
+        185,
+        185
+      ],
+      "all_output_tokens_equal": true
+    },
+    {
+      "family": "warehouse-transfers",
+      "context": "8k",
+      "output_tokens": [
+        185,
+        185
+      ],
+      "all_output_tokens_equal": true
+    }
+  ]
+}

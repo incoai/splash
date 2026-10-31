@@ -1,0 +1,99 @@
+{
+  "started_utc": 1792953283.8734632,
+  "phases": [
+    {
+      "name": "audit-development-analysis",
+      "command": [
+        "${SPLASH_ROOT}/.venv/bin/python",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/audit_analysis.py"
+      ],
+      "seconds": 5.093672037124634,
+      "exit_code": 0
+    },
+    {
+      "name": "policy-capture",
+      "command": [
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/native/rejection-policy",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/native/splash.metallib",
+        "${SPLASH_ROOT}/install/models/mlx-community/Qwen3.8-27B-4bit",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/policy-protocol.json"
+      ],
+      "seconds": 10.948493242263794,
+      "exit_code": 0
+    },
+    {
+      "name": "policy-analysis",
+      "command": [
+        "${SPLASH_ROOT}/.venv/bin/python",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/analyze_policy.py"
+      ],
+      "seconds": 0.2874941825866699,
+      "exit_code": 0
+    },
+    {
+      "name": "frozen-dataset-build",
+      "command": [
+        "${SPLASH_ROOT}/.venv/bin/python",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/frozen_selector.py",
+        "dataset"
+      ],
+      "seconds": 6.170464038848877,
+      "exit_code": 0
+    },
+    {
+      "name": "mps-quantization-check",
+      "command": [
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/train-venv/bin/python",
+        "-c",
+        "import sys,json,torch,numpy as np\nfrom pathlib import Path\nsys.path.insert(0,'build/qwen38-rejection-audit');from frozen_selector import source_tensors,widen\nsys.path.insert(0,'/private/tmp/splash-dflash-543');from draft_training.quantization import fake_affine4\ntorch.set_num_threads(2);assert torch.backends.mps.is_available()\nw=torch.tensor(widen(source_tensors()('candidate_selector.hidden_projection.weight')))\na=fake_affine4(w).detach();b=fake_affine4(w.to('mps')).detach().cpu();assert torch.equal(a,b),torch.max(torch.abs(a-b)).item()\nPath('build/qwen38-rejection-audit/mps-quantization-parity.json').write_text(json.dumps({'torch':torch.__version__,'device':'mps','weights':w.numel(),'all_weights_exact_cpu_mps':True})+'\\n')\nprint('all selector weights exact CPU/MPS fake-quant parity')\n"
+      ],
+      "seconds": 0.9309887886047363,
+      "exit_code": 0
+    },
+    {
+      "name": "selector-training",
+      "command": [
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/train-venv/bin/python",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/frozen_selector.py",
+        "train"
+      ],
+      "seconds": 11.400193929672241,
+      "exit_code": 0
+    },
+    {
+      "name": "selector-native-export",
+      "command": [
+        "${SPLASH_ROOT}/.venv/bin/python",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/export_selector.py",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/selector-fits/bf16-lr0.001-step100.bf16",
+        "selected"
+      ],
+      "seconds": 6.263303995132446,
+      "exit_code": 0
+    },
+    {
+      "name": "selector-native-validation",
+      "command": [
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/native/rejection-audit",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/native/splash.metallib",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/model-assemblies/selected",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/candidate-validation-protocol.json"
+      ],
+      "seconds": 40.99129605293274,
+      "exit_code": 0
+    }
+  ],
+  "active": "complete",
+  "selection": {
+    "initial_proxy": 4.285805663976287,
+    "candidate_proxy": 4.312250073659887,
+    "improves_proxy": true,
+    "trial": "bf16-lr0.001",
+    "step": 100,
+    "tensor_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/selector-fits/bf16-lr0.001-step100.bf16",
+    "tensor_sha256": "21b9cc1b35b2ea73cafe4a8dec1f75eccbf7dd2bf804babe7b35f5039e1c3c0d",
+    "test_used": false,
+    "scope": "candidate selection only; native rollout qualification still required"
+  },
+  "finished_utc": 1792953365.964136
+}

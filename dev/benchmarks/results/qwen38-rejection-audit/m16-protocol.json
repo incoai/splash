@@ -1,0 +1,773 @@
+{
+  "method": "fresh-process ABBA,8 independent task families x2 thinking modes x2 contexts;original target/draft in both arms;128 output tokens;complete native cycle/actual emitted tokens;TTFT separately",
+  "cases": [
+    {
+      "id": "chinese-6-bus-information-2k-think",
+      "family": "bus-information",
+      "domain": "chinese",
+      "context": "2k",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 167d7015e3bf.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Supporting context records:\n现场记录bus-information-0000：片区10在第1次巡查中收到1条反馈，观察到5次高峰使用。居民提到夜间信息难以辨认；协调人建议明确每日检查责任。\n现场记录bus-information-0001：片区17在第2次巡查中收到12条反馈，观察到17次高峰使用。居民提到高峰时段拥挤；协调人建议将维护任务分批安排。\n现场记录bus-information-0002：片区18在第3次巡查中收到1条反馈，观察到28次高峰使用。居民提到高峰时段拥挤；协调人建议将维护任务分批安排。\n现场记录bus-information-0003：片区14在第4次巡查中收到7条反馈，观察到20次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n现场记录bus-information-0004：片区8在第5次巡查中收到34条反馈，观察到7次高峰使用。居民提到等候时间不稳定；协调人建议先小范围试行再复核。\n现场记录bus-information-0005：片区5在第6次巡查中收到15条反馈，观察到25次高峰使用。居民提到夜间信息难以辨认；协调人建议将维护任务分批安排。\n现场记录bus-information-0006：片区14在第7次巡查中收到8条反馈，观察到21次高峰使用。居民提到夜间信息难以辨认；协调人建议将维护任务分批安排。\n现场记录bus-information-0007：片区11在第8次巡查中收到4条反馈，观察到26次高峰使用。居民提到标识不清晰；协调人建议将维护任务分批安排。\n现场记录bus-information-0008：片区0在第9次巡查中收到7条反馈，观察到21次高峰使用。居民提到设备维护不及时；协调人建议保留人工反馈渠道。\n现场记录bus-information-0009：片区1在第10次巡查中收到21条反馈，观察到19次高峰使用。居民提到高峰时段拥挤；协调人建议将维护任务分批安排。\n现场记录bus-information-0010：片区10在第11次巡查中收到33条反馈，观察到26次高峰使用。居民提到夜间信息难以辨认；协调人建议明确每日检查责任。\n现场记录bus-information-0011：片区18在第12次巡查中收到6条反馈，观察到3次高峰使用。居民提到等候时间不稳定；协调人建议保留人工反馈渠道。\n现场记录bus-information-0012：片区7在第13次巡查中收到12条反馈，观察到19次高峰使用。居民提到标识不清晰；协调人建议将维护任务分批安排。\n现场记录bus-information-0013：片区4在第14次巡查中收到8条反馈，观察到26次高峰使用。居民提到标识不清晰；协调人建议先小范围试行再复核。\n现场记录bus-information-0014：片区18在第15次巡查中收到19条反馈，观察到2次高峰使用。居民提到设备维护不及时；协调人建议将维护任务分批安排。\n现场记录bus-information-0015：片区13在第16次巡查中收到3条反馈，观察到26次高峰使用。居民提到等候时间不稳定；协调人建议将维护任务分批安排。\n现场记录bus-information-0016：片区1在第17次巡查中收到34条反馈，观察到5次高峰使用。居民提到夜间信息难以辨认；协调人建议将维护任务分批安排。\n现场记录bus-information-0017：片区18在第18次巡查中收到14条反馈，观察到2次高峰使用。居民提到设备维护不及时；协调人建议先小范围试行再复核。\n现场记录bus-information-0018：片区14在第19次巡查中收到27条反馈，观察到7次高峰使用。居民提到等候时间不稳定；协调人建议明确每日检查责任。\n现场记录bus-information-0019：片区15在第20次巡查中收到27条反馈，观察到8次高峰使用。居民提到标识不清晰；协调人建议先小范围试行再复核。\n现场记录bus-information-0020：片区11在第21次巡查中收到4条反馈，观察到8次高峰使用。居民提到高峰时段拥挤；协调人建议将维护任务分批安排。\n现场记录bus-information-0021：片区1在第22次巡查中收到14条反馈，观察到20次高峰使用。居民提到夜间信息难以辨认；协调人建议先小范围试行再复核。\n现场记录bus-information-0022：片区3在第23次巡查中收到2条反馈，观察到19次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n现场记录bus-information-0023：片区13在第24次巡查中收到30条反馈，观察到0次高峰使用。居民提到等候时间不稳定；协调人建议保留人工反馈渠道。\n现场记录bus-information-0024：片区3在第25次巡查中收到21条反馈，观察到0次高峰使用。居民提到标识不清晰；协调人建议先小范围试行再复核。\n现场记录bus-information-0025：片区14在第26次巡查中收到12条反馈，观察到20次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n现场记录bus-information-0026：片区6在第27次巡查中收到30条反馈，观察到2次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n现场记录bus-information-0027：片区11在第28次巡查中收到10条反馈，观察到2次高峰使用。居民提到标识不清晰；协调人建议先小范围试行再复核。\n现场记录bus-information-0028：片区2在第29次巡查中收到0条反馈，观察到12次高峰使用。居民提到高峰时段拥挤；协调人建议先小范围试行再复核。\n现场记录bus-information-0029：片区15在第30次巡查中收到24条反馈，观察到17次高峰使用。居民提到设备维护不及时；协调人建议明确每日检查责任。\n现场记录bus-information-0030：片区6在第31次巡查中收到32条反馈，观察到19次高峰使用。居民提到高峰时段拥挤；协调人建议将维护任务分批安排。\n现场记录bus-information-0031：片区4在第32次巡查中收到29条反馈，观察到9次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n现场记录bus-information-0032：片区9在第33次巡查中收到5条反馈，观察到25次高峰使用。居民提到高峰时段拥挤；协调人建议先小范围试行再复核。\n现场记录bus-information-0033：片区17在第34次巡查中收到28条反馈，观察到9次高峰使用。居民提到设备维护不及时；协调人建议先小范围试行再复核。\n现场记录bus-information-0034：片区16在第35次巡查中收到16条反馈，观察到1次高峰使用。居民提到等候时间不稳定；协调人建议明确每日检查责任。\n现场记录bus-information-0035：片区12在第36次巡查中收到19条反馈，观察到23次高峰使用。居民提到夜间信息难以辨认；协调人建议保留人工反馈渠道。\n现场记录bus-information-0036：片区14在第37次巡查中收到14条反馈，观察到10次高峰使用。居民提到夜间信息难以辨认；协调人建议将维护任务分批安排。\n现场记录bus-information-0037：片区8在第38次巡查中收到11条反馈，观察到4次高峰使用。居民提到标识不清晰；协调人建议先小范围试行再复核。\n现场记录bus-information-0038：片区6在第39次巡查中收到7条反馈，观察到1次高峰使用。居民提到设备维护不及时；协调人建议保留人工反馈渠道。\n现场记录bus-information-0039：片区16在第40次巡查中收到15条反馈，观察到25次高峰使用。居民提到标识不清晰；协调人建议保留人工反馈渠道。\n现场记录bus-information-0040：片区14在第41次巡查中收到20条反馈，观察到15次高峰使用。居民提到标识不清晰；协调人建议将维护任务分批安排。\n现场记录bus-information-0041：片区3在第42次巡查中收到11条反馈，观察到3次高峰使用。居民提到标识不清晰；协调人建议明确每日检查责任。\n\nFinal task:\n请为社区公交站的信息展示提出改进建议。考虑临时改道、老年乘客、夜间辨识、手机使用困难和维护责任，说明信息如何更新、验证和纠错。"
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "medium"
+      }
+    },
+    {
+      "id": "json-7-backup-manifest-2k-direct",
+      "family": "backup-manifest",
+      "domain": "json",
+      "context": "2k",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 2d2b1f5a5356.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Supporting context records:\nReference entry backup-manifest-0000: owner=team14; site=site18; version=7; observed_count=306; review_step=record recovery evidence.\nReference entry backup-manifest-0001: owner=team16; site=site8; version=7; observed_count=377; review_step=verify unique identifier.\nReference entry backup-manifest-0002: owner=team16; site=site17; version=5; observed_count=309; review_step=confirm references.\nReference entry backup-manifest-0003: owner=team1; site=site20; version=7; observed_count=184; review_step=record recovery evidence.\nReference entry backup-manifest-0004: owner=team15; site=site21; version=6; observed_count=87; review_step=check ordering.\nReference entry backup-manifest-0005: owner=team0; site=site12; version=9; observed_count=358; review_step=verify unique identifier.\nReference entry backup-manifest-0006: owner=team6; site=site2; version=3; observed_count=304; review_step=confirm references.\nReference entry backup-manifest-0007: owner=team6; site=site6; version=4; observed_count=138; review_step=confirm references.\nReference entry backup-manifest-0008: owner=team5; site=site9; version=6; observed_count=94; review_step=check ordering.\nReference entry backup-manifest-0009: owner=team13; site=site16; version=4; observed_count=107; review_step=record recovery evidence.\nReference entry backup-manifest-0010: owner=team1; site=site14; version=2; observed_count=246; review_step=check ordering.\nReference entry backup-manifest-0011: owner=team13; site=site1; version=7; observed_count=329; review_step=confirm references.\nReference entry backup-manifest-0012: owner=team10; site=site0; version=6; observed_count=429; review_step=record recovery evidence.\nReference entry backup-manifest-0013: owner=team14; site=site0; version=1; observed_count=284; review_step=confirm references.\nReference entry backup-manifest-0014: owner=team12; site=site6; version=8; observed_count=339; review_step=check ordering.\nReference entry backup-manifest-0015: owner=team10; site=site11; version=1; observed_count=40; review_step=confirm references.\nReference entry backup-manifest-0016: owner=team2; site=site13; version=9; observed_count=205; review_step=confirm references.\nReference entry backup-manifest-0017: owner=team9; site=site13; version=1; observed_count=457; review_step=check ordering.\nReference entry backup-manifest-0018: owner=team10; site=site4; version=10; observed_count=1; review_step=verify unique identifier.\nReference entry backup-manifest-0019: owner=team10; site=site13; version=4; observed_count=258; review_step=verify unique identifier.\nReference entry backup-manifest-0020: owner=team15; site=site4; version=5; observed_count=204; review_step=confirm references.\nReference entry backup-manifest-0021: owner=team8; site=site12; version=7; observed_count=141; review_step=confirm references.\nReference entry backup-manifest-0022: owner=team3; site=site21; version=2; observed_count=241; review_step=record recovery evidence.\nReference entry backup-manifest-0023: owner=team0; site=site4; version=9; observed_count=396; review_step=confirm references.\nReference entry backup-manifest-0024: owner=team8; site=site17; version=10; observed_count=120; review_step=verify unique identifier.\nReference entry backup-manifest-0025: owner=team16; site=site5; version=4; observed_count=114; review_step=confirm references.\nReference entry backup-manifest-0026: owner=team4; site=site8; version=2; observed_count=485; review_step=confirm references.\nReference entry backup-manifest-0027: owner=team5; site=site4; version=3; observed_count=211; review_step=record recovery evidence.\nReference entry backup-manifest-0028: owner=team3; site=site7; version=9; observed_count=104; review_step=record recovery evidence.\nReference entry backup-manifest-0029: owner=team1; site=site3; version=8; observed_count=98; review_step=verify unique identifier.\nReference entry backup-manifest-0030: owner=team15; site=site15; version=7; observed_count=22; review_step=confirm references.\nReference entry backup-manifest-0031: owner=team2; site=site20; version=5; observed_count=90; review_step=check ordering.\nReference entry backup-manifest-0032: owner=team9; site=site14; version=0; observed_count=409; review_step=record recovery evidence.\nReference entry backup-manifest-0033: owner=team3; site=site9; version=1; observed_count=274; review_step=confirm references.\nReference entry backup-manifest-0034: owner=team16; site=site8; version=6; observed_count=406; review_step=verify unique identifier.\nReference entry backup-manifest-0035: owner=team6; site=site2; version=4; observed_count=183; review_step=record recovery evidence.\nReference entry backup-manifest-0036: owner=team4; site=site6; version=3; observed_count=116; review_step=confirm references.\nReference entry backup-manifest-0037: owner=team9; site=site14; version=8; observed_count=236; review_step=record recovery evidence.\nReference entry backup-manifest-0038: owner=team12; site=site12; version=9; observed_count=456; review_step=verify unique identifier.\nReference entry backup-manifest-0039: owner=team12; site=site7; version=2; observed_count=123; review_step=record recovery evidence.\nReference entry backup-manifest-0040: owner=team1; site=site2; version=7; observed_count=289; review_step=verify unique identifier.\nReference entry backup-manifest-0041: owner=team0; site=site16; version=8; observed_count=195; review_step=confirm references.\nReference entry backup-manifest-0042: owner=team10; site=site0; version=2; observed_count=147; review_step=record recovery evidence.\nReference entry backup-manifest-0043: owner=team15; site=site4; version=10; observed_count=371; review_step=record recovery evidence.\nReference entry backup-manifest-0044: owner=team2; site=site4; version=9; observed_count=428; review_step=confirm references.\nReference entry backup-manifest-0045: owner=team15; site=site12; version=9; observed_count=306; review_step=check ordering.\nReference entry backup-manifest-0046: owner=team2; site=site18; version=6; observed_count=115; review_step=confirm references.\nReference entry backup-manifest-0047: owner=team5; site=site16; version=10; observed_count=496; review_step=confirm references.\n\nFinal task:\nReturn only JSON for a fictional backup manifest with at least24 resources. Include resource IDs, retention, dependencies, recovery order, owners and verification steps, with consistent references."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "none"
+      }
+    },
+    {
+      "id": "json-7-backup-manifest-short-think",
+      "family": "backup-manifest",
+      "domain": "json",
+      "context": "short",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference abf18e5a69c7.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Return only JSON for a fictional backup manifest with at least24 resources. Include resource IDs, retention, dependencies, recovery order, owners and verification steps, with consistent references."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "medium"
+      }
+    },
+    {
+      "id": "json-6-conference-rooms-2k-think",
+      "family": "conference-rooms",
+      "domain": "json",
+      "context": "2k",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference c5e0930ff41c.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Supporting context records:\nReference entry conference-rooms-0000: owner=team14; site=site14; version=2; observed_count=402; review_step=confirm references.\nReference entry conference-rooms-0001: owner=team5; site=site20; version=8; observed_count=38; review_step=check ordering.\nReference entry conference-rooms-0002: owner=team16; site=site10; version=0; observed_count=373; review_step=confirm references.\nReference entry conference-rooms-0003: owner=team2; site=site19; version=2; observed_count=216; review_step=check ordering.\nReference entry conference-rooms-0004: owner=team4; site=site22; version=6; observed_count=414; review_step=check ordering.\nReference entry conference-rooms-0005: owner=team12; site=site13; version=9; observed_count=188; review_step=confirm references.\nReference entry conference-rooms-0006: owner=team1; site=site13; version=8; observed_count=418; review_step=record recovery evidence.\nReference entry conference-rooms-0007: owner=team14; site=site1; version=9; observed_count=132; review_step=record recovery evidence.\nReference entry conference-rooms-0008: owner=team6; site=site8; version=1; observed_count=169; review_step=confirm references.\nReference entry conference-rooms-0009: owner=team11; site=site7; version=1; observed_count=419; review_step=verify unique identifier.\nReference entry conference-rooms-0010: owner=team10; site=site2; version=5; observed_count=199; review_step=record recovery evidence.\nReference entry conference-rooms-0011: owner=team6; site=site5; version=7; observed_count=116; review_step=verify unique identifier.\nReference entry conference-rooms-0012: owner=team15; site=site14; version=9; observed_count=273; review_step=record recovery evidence.\nReference entry conference-rooms-0013: owner=team5; site=site15; version=5; observed_count=358; review_step=check ordering.\nReference entry conference-rooms-0014: owner=team1; site=site0; version=9; observed_count=302; review_step=confirm references.\nReference entry conference-rooms-0015: owner=team4; site=site7; version=9; observed_count=356; review_step=check ordering.\nReference entry conference-rooms-0016: owner=team2; site=site22; version=9; observed_count=309; review_step=record recovery evidence.\nReference entry conference-rooms-0017: owner=team12; site=site21; version=6; observed_count=22; review_step=record recovery evidence.\nReference entry conference-rooms-0018: owner=team13; site=site0; version=3; observed_count=47; review_step=confirm references.\nReference entry conference-rooms-0019: owner=team6; site=site6; version=7; observed_count=459; review_step=check ordering.\nReference entry conference-rooms-0020: owner=team15; site=site16; version=4; observed_count=146; review_step=check ordering.\nReference entry conference-rooms-0021: owner=team11; site=site7; version=2; observed_count=129; review_step=confirm references.\nReference entry conference-rooms-0022: owner=team9; site=site7; version=5; observed_count=103; review_step=check ordering.\nReference entry conference-rooms-0023: owner=team12; site=site7; version=0; observed_count=238; review_step=check ordering.\nReference entry conference-rooms-0024: owner=team9; site=site4; version=9; observed_count=234; review_step=record recovery evidence.\nReference entry conference-rooms-0025: owner=team13; site=site18; version=1; observed_count=395; review_step=record recovery evidence.\nReference entry conference-rooms-0026: owner=team8; site=site0; version=9; observed_count=420; review_step=check ordering.\nReference entry conference-rooms-0027: owner=team10; site=site10; version=2; observed_count=193; review_step=record recovery evidence.\nReference entry conference-rooms-0028: owner=team14; site=site18; version=3; observed_count=65; review_step=record recovery evidence.\nReference entry conference-rooms-0029: owner=team15; site=site6; version=2; observed_count=94; review_step=check ordering.\nReference entry conference-rooms-0030: owner=team6; site=site4; version=6; observed_count=266; review_step=verify unique identifier.\nReference entry conference-rooms-0031: owner=team1; site=site4; version=4; observed_count=483; review_step=confirm references.\nReference entry conference-rooms-0032: owner=team15; site=site17; version=9; observed_count=211; review_step=check ordering.\nReference entry conference-rooms-0033: owner=team6; site=site11; version=8; observed_count=61; review_step=confirm references.\nReference entry conference-rooms-0034: owner=team15; site=site18; version=3; observed_count=364; review_step=verify unique identifier.\nReference entry conference-rooms-0035: owner=team3; site=site19; version=6; observed_count=119; review_step=confirm references.\nReference entry conference-rooms-0036: owner=team0; site=site7; version=6; observed_count=166; review_step=verify unique identifier.\nReference entry conference-rooms-0037: owner=team11; site=site14; version=9; observed_count=30; review_step=record recovery evidence.\nReference entry conference-rooms-0038: owner=team6; site=site21; version=6; observed_count=485; review_step=confirm references.\nReference entry conference-rooms-0039: owner=team4; site=site18; version=1; observed_count=345; review_step=record recovery evidence.\nReference entry conference-rooms-0040: owner=team8; site=site20; version=2; observed_count=239; review_step=confirm references.\nReference entry conference-rooms-0041: owner=team7; site=site14; version=10; observed_count=55; review_step=verify unique identifier.\nReference entry conference-rooms-0042: owner=team3; site=site13; version=5; observed_count=327; review_step=verify unique identifier.\nReference entry conference-rooms-0043: owner=team4; site=site7; version=6; observed_count=7; review_step=confirm references.\nReference entry conference-rooms-0044: owner=team9; site=site1; version=8; observed_count=162; review_step=verify unique identifier.\nReference entry conference-rooms-0045: owner=team9; site=site8; version=4; observed_count=368; review_step=confirm references.\nReference entry conference-rooms-0046: owner=team6; site=site1; version=9; observed_count=498; review_step=confirm references.\nReference entry conference-rooms-0047: owner=team3; site=site18; version=10; observed_count=313; review_step=record recovery evidence.\n\nFinal task:\nReturn only JSON describing a fictional conference schedule with at least24 sessions. Include rooms, speakers, setup dependencies, accessibility notes and contingency actions. Keep references internally consistent."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "medium"
+      }
+    },
+    {
+      "id": "code-6-topological-order-short-think",
+      "family": "topological-order",
+      "domain": "code",
+      "context": "short",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference b0eaf3175c2b.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Implement a Python dependency planner that returns a deterministic topological order or a concrete cycle. Handle disconnected nodes and duplicate edges. Give code, tests, invariants and complexity."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "medium"
+      }
+    },
+    {
+      "id": "code-6-topological-order-2k-think",
+      "family": "topological-order",
+      "domain": "code",
+      "context": "2k",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 1fa5fc951fe2.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Supporting context records:\nFixture topological-order-0000: request_key=k288; worker=w9; tick=4; action=retry; prior_revision=0; expected_observation=pending work preserved.\nFixture topological-order-0001: request_key=k351; worker=w7; tick=79; action=remove; prior_revision=0; expected_observation=no duplicate result.\nFixture topological-order-0002: request_key=k198; worker=w7; tick=113; action=enqueue; prior_revision=0; expected_observation=no duplicate result.\nFixture topological-order-0003: request_key=k350; worker=w11; tick=383; action=retry; prior_revision=8; expected_observation=stable order.\nFixture topological-order-0004: request_key=k396; worker=w11; tick=132; action=enqueue; prior_revision=0; expected_observation=expired state removed.\nFixture topological-order-0005: request_key=k488; worker=w8; tick=460; action=retry; prior_revision=2; expected_observation=stable order.\nFixture topological-order-0006: request_key=k443; worker=w4; tick=554; action=retry; prior_revision=2; expected_observation=expired state removed.\nFixture topological-order-0007: request_key=k302; worker=w4; tick=204; action=update; prior_revision=5; expected_observation=pending work preserved.\nFixture topological-order-0008: request_key=k319; worker=w6; tick=180; action=retry; prior_revision=4; expected_observation=stable order.\nFixture topological-order-0009: request_key=k103; worker=w0; tick=609; action=remove; prior_revision=4; expected_observation=expired state removed.\nFixture topological-order-0010: request_key=k232; worker=w4; tick=451; action=retry; prior_revision=7; expected_observation=stable order.\nFixture topological-order-0011: request_key=k122; worker=w12; tick=475; action=update; prior_revision=5; expected_observation=stable order.\nFixture topological-order-0012: request_key=k409; worker=w6; tick=448; action=retry; prior_revision=4; expected_observation=expired state removed.\nFixture topological-order-0013: request_key=k117; worker=w2; tick=617; action=complete; prior_revision=0; expected_observation=pending work preserved.\nFixture topological-order-0014: request_key=k143; worker=w7; tick=467; action=retry; prior_revision=8; expected_observation=expired state removed.\nFixture topological-order-0015: request_key=k63; worker=w12; tick=544; action=enqueue; prior_revision=0; expected_observation=no duplicate result.\nFixture topological-order-0016: request_key=k3; worker=w9; tick=478; action=complete; prior_revision=3; expected_observation=stable order.\nFixture topological-order-0017: request_key=k43; worker=w1; tick=645; action=remove; prior_revision=7; expected_observation=no duplicate result.\nFixture topological-order-0018: request_key=k366; worker=w4; tick=717; action=complete; prior_revision=6; expected_observation=pending work preserved.\nFixture topological-order-0019: request_key=k12; worker=w0; tick=739; action=retry; prior_revision=3; expected_observation=pending work preserved.\nFixture topological-order-0020: request_key=k159; worker=w1; tick=435; action=complete; prior_revision=6; expected_observation=stable order.\nFixture topological-order-0021: request_key=k419; worker=w10; tick=359; action=enqueue; prior_revision=5; expected_observation=stable order.\nFixture topological-order-0022: request_key=k174; worker=w10; tick=688; action=update; prior_revision=3; expected_observation=pending work preserved.\nFixture topological-order-0023: request_key=k298; worker=w4; tick=507; action=complete; prior_revision=1; expected_observation=stable order.\nFixture topological-order-0024: request_key=k475; worker=w4; tick=861; action=retry; prior_revision=7; expected_observation=no duplicate result.\nFixture topological-order-0025: request_key=k116; worker=w12; tick=885; action=update; prior_revision=8; expected_observation=pending work preserved.\nFixture topological-order-0026: request_key=k155; worker=w9; tick=619; action=update; prior_revision=2; expected_observation=pending work preserved.\nFixture topological-order-0027: request_key=k74; worker=w10; tick=882; action=update; prior_revision=2; expected_observation=pending work preserved.\nFixture topological-order-0028: request_key=k19; worker=w0; tick=931; action=retry; prior_revision=1; expected_observation=stable order.\nFixture topological-order-0029: request_key=k358; worker=w6; tick=516; action=enqueue; prior_revision=7; expected_observation=expired state removed.\nFixture topological-order-0030: request_key=k426; worker=w6; tick=958; action=complete; prior_revision=3; expected_observation=expired state removed.\nFixture topological-order-0031: request_key=k277; worker=w11; tick=724; action=remove; prior_revision=7; expected_observation=expired state removed.\nFixture topological-order-0032: request_key=k169; worker=w12; tick=908; action=retry; prior_revision=7; expected_observation=pending work preserved.\nFixture topological-order-0033: request_key=k430; worker=w7; tick=581; action=update; prior_revision=7; expected_observation=stable order.\nFixture topological-order-0034: request_key=k433; worker=w8; tick=1004; action=retry; prior_revision=1; expected_observation=stable order.\nFixture topological-order-0035: request_key=k174; worker=w5; tick=995; action=update; prior_revision=3; expected_observation=stable order.\nFixture topological-order-0036: request_key=k472; worker=w7; tick=867; action=retry; prior_revision=4; expected_observation=stable order.\nFixture topological-order-0037: request_key=k462; worker=w6; tick=877; action=update; prior_revision=3; expected_observation=no duplicate result.\nFixture topological-order-0038: request_key=k452; worker=w0; tick=667; action=complete; prior_revision=2; expected_observation=expired state removed.\nFixture topological-order-0039: request_key=k166; worker=w12; tick=727; action=complete; prior_revision=4; expected_observation=expired state removed.\nFixture topological-order-0040: request_key=k128; worker=w3; tick=846; action=retry; prior_revision=2; expected_observation=no duplicate result.\nFixture topological-order-0041: request_key=k62; worker=w4; tick=853; action=retry; prior_revision=8; expected_observation=stable order.\nFixture topological-order-0042: request_key=k407; worker=w1; tick=989; action=enqueue; prior_revision=2; expected_observation=expired state removed.\nFixture topological-order-0043: request_key=k192; worker=w12; tick=995; action=complete; prior_revision=3; expected_observation=expired state removed.\n\nFinal task:\nImplement a Python dependency planner that returns a deterministic topological order or a concrete cycle. Handle disconnected nodes and duplicate edges. Give code, tests, invariants and complexity."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "medium"
+      }
+    },
+    {
+      "id": "code-7-rolling-median-2k-direct",
+      "family": "rolling-median",
+      "domain": "code",
+      "context": "2k",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 121239d616e5.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Supporting context records:\nFixture rolling-median-0000: request_key=k311; worker=w2; tick=110; action=retry; prior_revision=5; expected_observation=stable order.\nFixture rolling-median-0001: request_key=k444; worker=w1; tick=64; action=update; prior_revision=3; expected_observation=pending work preserved.\nFixture rolling-median-0002: request_key=k162; worker=w8; tick=304; action=remove; prior_revision=0; expected_observation=expired state removed.\nFixture rolling-median-0003: request_key=k71; worker=w0; tick=446; action=enqueue; prior_revision=8; expected_observation=expired state removed.\nFixture rolling-median-0004: request_key=k103; worker=w12; tick=311; action=retry; prior_revision=4; expected_observation=no duplicate result.\nFixture rolling-median-0005: request_key=k75; worker=w0; tick=336; action=enqueue; prior_revision=3; expected_observation=stable order.\nFixture rolling-median-0006: request_key=k266; worker=w0; tick=560; action=update; prior_revision=5; expected_observation=stable order.\nFixture rolling-median-0007: request_key=k200; worker=w6; tick=291; action=enqueue; prior_revision=2; expected_observation=no duplicate result.\nFixture rolling-median-0008: request_key=k371; worker=w5; tick=261; action=complete; prior_revision=2; expected_observation=stable order.\nFixture rolling-median-0009: request_key=k81; worker=w3; tick=304; action=enqueue; prior_revision=0; expected_observation=pending work preserved.\nFixture rolling-median-0010: request_key=k381; worker=w1; tick=368; action=retry; prior_revision=3; expected_observation=no duplicate result.\nFixture rolling-median-0011: request_key=k316; worker=w6; tick=273; action=enqueue; prior_revision=1; expected_observation=stable order.\nFixture rolling-median-0012: request_key=k34; worker=w1; tick=336; action=update; prior_revision=7; expected_observation=expired state removed.\nFixture rolling-median-0013: request_key=k225; worker=w0; tick=710; action=enqueue; prior_revision=0; expected_observation=stable order.\nFixture rolling-median-0014: request_key=k401; worker=w6; tick=300; action=remove; prior_revision=5; expected_observation=expired state removed.\nFixture rolling-median-0015: request_key=k154; worker=w3; tick=514; action=update; prior_revision=1; expected_observation=stable order.\nFixture rolling-median-0016: request_key=k109; worker=w5; tick=680; action=complete; prior_revision=1; expected_observation=no duplicate result.\nFixture rolling-median-0017: request_key=k232; worker=w2; tick=445; action=enqueue; prior_revision=7; expected_observation=pending work preserved.\nFixture rolling-median-0018: request_key=k444; worker=w3; tick=344; action=enqueue; prior_revision=3; expected_observation=pending work preserved.\nFixture rolling-median-0019: request_key=k468; worker=w10; tick=672; action=retry; prior_revision=0; expected_observation=stable order.\nFixture rolling-median-0020: request_key=k221; worker=w7; tick=823; action=remove; prior_revision=5; expected_observation=stable order.\nFixture rolling-median-0021: request_key=k402; worker=w2; tick=537; action=complete; prior_revision=6; expected_observation=expired state removed.\nFixture rolling-median-0022: request_key=k394; worker=w10; tick=681; action=complete; prior_revision=7; expected_observation=no duplicate result.\nFixture rolling-median-0023: request_key=k458; worker=w2; tick=685; action=enqueue; prior_revision=8; expected_observation=pending work preserved.\nFixture rolling-median-0024: request_key=k315; worker=w9; tick=528; action=complete; prior_revision=0; expected_observation=stable order.\nFixture rolling-median-0025: request_key=k496; worker=w10; tick=800; action=retry; prior_revision=1; expected_observation=stable order.\nFixture rolling-median-0026: request_key=k463; worker=w5; tick=931; action=remove; prior_revision=4; expected_observation=expired state removed.\nFixture rolling-median-0027: request_key=k431; worker=w3; tick=803; action=update; prior_revision=8; expected_observation=stable order.\nFixture rolling-median-0028: request_key=k343; worker=w10; tick=947; action=complete; prior_revision=1; expected_observation=no duplicate result.\nFixture rolling-median-0029: request_key=k370; worker=w4; tick=873; action=remove; prior_revision=1; expected_observation=no duplicate result.\nFixture rolling-median-0030: request_key=k124; worker=w11; tick=512; action=enqueue; prior_revision=7; expected_observation=no duplicate result.\nFixture rolling-median-0031: request_key=k59; worker=w5; tick=982; action=remove; prior_revision=5; expected_observation=stable order.\nFixture rolling-median-0032: request_key=k382; worker=w2; tick=806; action=update; prior_revision=4; expected_observation=stable order.\nFixture rolling-median-0033: request_key=k336; worker=w10; tick=868; action=complete; prior_revision=3; expected_observation=stable order.\nFixture rolling-median-0034: request_key=k357; worker=w9; tick=741; action=complete; prior_revision=6; expected_observation=no duplicate result.\nFixture rolling-median-0035: request_key=k351; worker=w7; tick=799; action=retry; prior_revision=0; expected_observation=pending work preserved.\nFixture rolling-median-0036: request_key=k242; worker=w5; tick=752; action=complete; prior_revision=8; expected_observation=stable order.\nFixture rolling-median-0037: request_key=k103; worker=w0; tick=1114; action=update; prior_revision=4; expected_observation=expired state removed.\nFixture rolling-median-0038: request_key=k251; worker=w6; tick=776; action=remove; prior_revision=8; expected_observation=expired state removed.\nFixture rolling-median-0039: request_key=k367; worker=w2; tick=759; action=complete; prior_revision=7; expected_observation=pending work preserved.\nFixture rolling-median-0040: request_key=k195; worker=w5; tick=945; action=retry; prior_revision=6; expected_observation=stable order.\nFixture rolling-median-0041: request_key=k392; worker=w7; tick=1046; action=enqueue; prior_revision=5; expected_observation=stable order.\nFixture rolling-median-0042: request_key=k141; worker=w2; tick=1107; action=remove; prior_revision=6; expected_observation=pending work preserved.\nFixture rolling-median-0043: request_key=k24; worker=w4; tick=924; action=remove; prior_revision=6; expected_observation=pending work preserved.\n\nFinal task:\nImplement an exact sliding-window median in Python using two heaps and lazy deletion. Explain balancing and duplicate values, and include tests that repeatedly expire the current median."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "none"
+      }
+    },
+    {
+      "id": "json-6-conference-rooms-short-think",
+      "family": "conference-rooms",
+      "domain": "json",
+      "context": "short",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference d7c41ed90bcf.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Return only JSON describing a fictional conference schedule with at least24 sessions. Include rooms, speakers, setup dependencies, accessibility notes and contingency actions. Keep references internally consistent."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "medium"
+      }
+    },
+    {
+      "id": "chinese-7-shared-laundry-2k-think",
+      "family": "shared-laundry",
+      "domain": "chinese",
+      "context": "2k",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 45840affd7b0.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Supporting context records:\n现场记录shared-laundry-0000：片区14在第1次巡查中收到2条反馈，观察到21次高峰使用。居民提到等候时间不稳定；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0001：片区15在第2次巡查中收到8条反馈，观察到19次高峰使用。居民提到标识不清晰；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0002：片区6在第3次巡查中收到9条反馈，观察到12次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0003：片区10在第4次巡查中收到26条反馈，观察到20次高峰使用。居民提到等候时间不稳定；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0004：片区16在第5次巡查中收到24条反馈，观察到23次高峰使用。居民提到高峰时段拥挤；协调人建议将维护任务分批安排。\n现场记录shared-laundry-0005：片区16在第6次巡查中收到7条反馈，观察到24次高峰使用。居民提到设备维护不及时；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0006：片区12在第7次巡查中收到15条反馈，观察到9次高峰使用。居民提到高峰时段拥挤；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0007：片区9在第8次巡查中收到15条反馈，观察到9次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0008：片区15在第9次巡查中收到26条反馈，观察到4次高峰使用。居民提到等候时间不稳定；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0009：片区7在第10次巡查中收到20条反馈，观察到13次高峰使用。居民提到设备维护不及时；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0010：片区8在第11次巡查中收到27条反馈，观察到20次高峰使用。居民提到夜间信息难以辨认；协调人建议将维护任务分批安排。\n现场记录shared-laundry-0011：片区13在第12次巡查中收到11条反馈，观察到6次高峰使用。居民提到标识不清晰；协调人建议明确每日检查责任。\n现场记录shared-laundry-0012：片区6在第13次巡查中收到4条反馈，观察到16次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0013：片区14在第14次巡查中收到33条反馈，观察到3次高峰使用。居民提到等候时间不稳定；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0014：片区0在第15次巡查中收到13条反馈，观察到3次高峰使用。居民提到标识不清晰；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0015：片区10在第16次巡查中收到30条反馈，观察到28次高峰使用。居民提到等候时间不稳定；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0016：片区3在第17次巡查中收到0条反馈，观察到1次高峰使用。居民提到设备维护不及时；协调人建议明确每日检查责任。\n现场记录shared-laundry-0017：片区1在第18次巡查中收到10条反馈，观察到16次高峰使用。居民提到等候时间不稳定；协调人建议将维护任务分批安排。\n现场记录shared-laundry-0018：片区10在第19次巡查中收到14条反馈，观察到2次高峰使用。居民提到夜间信息难以辨认；协调人建议将维护任务分批安排。\n现场记录shared-laundry-0019：片区13在第20次巡查中收到36条反馈，观察到12次高峰使用。居民提到夜间信息难以辨认；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0020：片区13在第21次巡查中收到21条反馈，观察到23次高峰使用。居民提到高峰时段拥挤；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0021：片区13在第22次巡查中收到14条反馈，观察到4次高峰使用。居民提到夜间信息难以辨认；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0022：片区0在第23次巡查中收到24条反馈，观察到25次高峰使用。居民提到等候时间不稳定；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0023：片区10在第24次巡查中收到6条反馈，观察到10次高峰使用。居民提到夜间信息难以辨认；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0024：片区3在第25次巡查中收到24条反馈，观察到10次高峰使用。居民提到设备维护不及时；协调人建议明确每日检查责任。\n现场记录shared-laundry-0025：片区2在第26次巡查中收到9条反馈，观察到1次高峰使用。居民提到高峰时段拥挤；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0026：片区14在第27次巡查中收到25条反馈，观察到9次高峰使用。居民提到设备维护不及时；协调人建议将维护任务分批安排。\n现场记录shared-laundry-0027：片区10在第28次巡查中收到15条反馈，观察到15次高峰使用。居民提到高峰时段拥挤；协调人建议将维护任务分批安排。\n现场记录shared-laundry-0028：片区14在第29次巡查中收到33条反馈，观察到2次高峰使用。居民提到设备维护不及时；协调人建议明确每日检查责任。\n现场记录shared-laundry-0029：片区6在第30次巡查中收到10条反馈，观察到28次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0030：片区1在第31次巡查中收到35条反馈，观察到20次高峰使用。居民提到高峰时段拥挤；协调人建议将维护任务分批安排。\n现场记录shared-laundry-0031：片区4在第32次巡查中收到7条反馈，观察到0次高峰使用。居民提到夜间信息难以辨认；协调人建议将维护任务分批安排。\n现场记录shared-laundry-0032：片区7在第33次巡查中收到21条反馈，观察到11次高峰使用。居民提到高峰时段拥挤；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0033：片区1在第34次巡查中收到25条反馈，观察到5次高峰使用。居民提到高峰时段拥挤；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0034：片区16在第35次巡查中收到26条反馈，观察到12次高峰使用。居民提到夜间信息难以辨认；协调人建议明确每日检查责任。\n现场记录shared-laundry-0035：片区4在第36次巡查中收到29条反馈，观察到8次高峰使用。居民提到高峰时段拥挤；协调人建议将维护任务分批安排。\n现场记录shared-laundry-0036：片区12在第37次巡查中收到15条反馈，观察到13次高峰使用。居民提到等候时间不稳定；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0037：片区10在第38次巡查中收到18条反馈，观察到24次高峰使用。居民提到设备维护不及时；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0038：片区1在第39次巡查中收到33条反馈，观察到2次高峰使用。居民提到等候时间不稳定；协调人建议明确每日检查责任。\n现场记录shared-laundry-0039：片区9在第40次巡查中收到15条反馈，观察到11次高峰使用。居民提到设备维护不及时；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0040：片区11在第41次巡查中收到7条反馈，观察到13次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n\nFinal task:\n请为公寓共享洗衣房制定公平可行的使用安排。讨论预约、超时占用、设备故障、清洁责任和邻里纠纷，给出试行步骤及可衡量的效果指标。"
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "medium"
+      }
+    },
+    {
+      "id": "math-6-bezout-inverse-short-think",
+      "family": "bezout-inverse",
+      "domain": "math",
+      "context": "short",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 838796d041a7.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Derive the extended Euclidean algorithm and use it to find the multiplicative inverse of 37 modulo 101. Verify the result and explain when such an inverse exists."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "medium"
+      }
+    },
+    {
+      "id": "math-7-counting-paths-short-direct",
+      "family": "counting-paths",
+      "domain": "math",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference ca42763d57a9.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Count shortest lattice paths from (0,0) to (7,5) that avoid (3,2). Derive the counting method, show the arithmetic, and explain how to generalize to two forbidden points."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "none"
+      }
+    },
+    {
+      "id": "code-7-rolling-median-short-think",
+      "family": "rolling-median",
+      "domain": "code",
+      "context": "short",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference ba4ba86831eb.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Implement an exact sliding-window median in Python using two heaps and lazy deletion. Explain balancing and duplicate values, and include tests that repeatedly expire the current median."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "medium"
+      }
+    },
+    {
+      "id": "json-7-backup-manifest-short-direct",
+      "family": "backup-manifest",
+      "domain": "json",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 5e79bf20b1fa.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Return only JSON for a fictional backup manifest with at least24 resources. Include resource IDs, retention, dependencies, recovery order, owners and verification steps, with consistent references."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "none"
+      }
+    },
+    {
+      "id": "json-6-conference-rooms-2k-direct",
+      "family": "conference-rooms",
+      "domain": "json",
+      "context": "2k",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 93793737719e.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Supporting context records:\nReference entry conference-rooms-0000: owner=team14; site=site14; version=2; observed_count=402; review_step=confirm references.\nReference entry conference-rooms-0001: owner=team5; site=site20; version=8; observed_count=38; review_step=check ordering.\nReference entry conference-rooms-0002: owner=team16; site=site10; version=0; observed_count=373; review_step=confirm references.\nReference entry conference-rooms-0003: owner=team2; site=site19; version=2; observed_count=216; review_step=check ordering.\nReference entry conference-rooms-0004: owner=team4; site=site22; version=6; observed_count=414; review_step=check ordering.\nReference entry conference-rooms-0005: owner=team12; site=site13; version=9; observed_count=188; review_step=confirm references.\nReference entry conference-rooms-0006: owner=team1; site=site13; version=8; observed_count=418; review_step=record recovery evidence.\nReference entry conference-rooms-0007: owner=team14; site=site1; version=9; observed_count=132; review_step=record recovery evidence.\nReference entry conference-rooms-0008: owner=team6; site=site8; version=1; observed_count=169; review_step=confirm references.\nReference entry conference-rooms-0009: owner=team11; site=site7; version=1; observed_count=419; review_step=verify unique identifier.\nReference entry conference-rooms-0010: owner=team10; site=site2; version=5; observed_count=199; review_step=record recovery evidence.\nReference entry conference-rooms-0011: owner=team6; site=site5; version=7; observed_count=116; review_step=verify unique identifier.\nReference entry conference-rooms-0012: owner=team15; site=site14; version=9; observed_count=273; review_step=record recovery evidence.\nReference entry conference-rooms-0013: owner=team5; site=site15; version=5; observed_count=358; review_step=check ordering.\nReference entry conference-rooms-0014: owner=team1; site=site0; version=9; observed_count=302; review_step=confirm references.\nReference entry conference-rooms-0015: owner=team4; site=site7; version=9; observed_count=356; review_step=check ordering.\nReference entry conference-rooms-0016: owner=team2; site=site22; version=9; observed_count=309; review_step=record recovery evidence.\nReference entry conference-rooms-0017: owner=team12; site=site21; version=6; observed_count=22; review_step=record recovery evidence.\nReference entry conference-rooms-0018: owner=team13; site=site0; version=3; observed_count=47; review_step=confirm references.\nReference entry conference-rooms-0019: owner=team6; site=site6; version=7; observed_count=459; review_step=check ordering.\nReference entry conference-rooms-0020: owner=team15; site=site16; version=4; observed_count=146; review_step=check ordering.\nReference entry conference-rooms-0021: owner=team11; site=site7; version=2; observed_count=129; review_step=confirm references.\nReference entry conference-rooms-0022: owner=team9; site=site7; version=5; observed_count=103; review_step=check ordering.\nReference entry conference-rooms-0023: owner=team12; site=site7; version=0; observed_count=238; review_step=check ordering.\nReference entry conference-rooms-0024: owner=team9; site=site4; version=9; observed_count=234; review_step=record recovery evidence.\nReference entry conference-rooms-0025: owner=team13; site=site18; version=1; observed_count=395; review_step=record recovery evidence.\nReference entry conference-rooms-0026: owner=team8; site=site0; version=9; observed_count=420; review_step=check ordering.\nReference entry conference-rooms-0027: owner=team10; site=site10; version=2; observed_count=193; review_step=record recovery evidence.\nReference entry conference-rooms-0028: owner=team14; site=site18; version=3; observed_count=65; review_step=record recovery evidence.\nReference entry conference-rooms-0029: owner=team15; site=site6; version=2; observed_count=94; review_step=check ordering.\nReference entry conference-rooms-0030: owner=team6; site=site4; version=6; observed_count=266; review_step=verify unique identifier.\nReference entry conference-rooms-0031: owner=team1; site=site4; version=4; observed_count=483; review_step=confirm references.\nReference entry conference-rooms-0032: owner=team15; site=site17; version=9; observed_count=211; review_step=check ordering.\nReference entry conference-rooms-0033: owner=team6; site=site11; version=8; observed_count=61; review_step=confirm references.\nReference entry conference-rooms-0034: owner=team15; site=site18; version=3; observed_count=364; review_step=verify unique identifier.\nReference entry conference-rooms-0035: owner=team3; site=site19; version=6; observed_count=119; review_step=confirm references.\nReference entry conference-rooms-0036: owner=team0; site=site7; version=6; observed_count=166; review_step=verify unique identifier.\nReference entry conference-rooms-0037: owner=team11; site=site14; version=9; observed_count=30; review_step=record recovery evidence.\nReference entry conference-rooms-0038: owner=team6; site=site21; version=6; observed_count=485; review_step=confirm references.\nReference entry conference-rooms-0039: owner=team4; site=site18; version=1; observed_count=345; review_step=record recovery evidence.\nReference entry conference-rooms-0040: owner=team8; site=site20; version=2; observed_count=239; review_step=confirm references.\nReference entry conference-rooms-0041: owner=team7; site=site14; version=10; observed_count=55; review_step=verify unique identifier.\nReference entry conference-rooms-0042: owner=team3; site=site13; version=5; observed_count=327; review_step=verify unique identifier.\nReference entry conference-rooms-0043: owner=team4; site=site7; version=6; observed_count=7; review_step=confirm references.\nReference entry conference-rooms-0044: owner=team9; site=site1; version=8; observed_count=162; review_step=verify unique identifier.\nReference entry conference-rooms-0045: owner=team9; site=site8; version=4; observed_count=368; review_step=confirm references.\nReference entry conference-rooms-0046: owner=team6; site=site1; version=9; observed_count=498; review_step=confirm references.\nReference entry conference-rooms-0047: owner=team3; site=site18; version=10; observed_count=313; review_step=record recovery evidence.\n\nFinal task:\nReturn only JSON describing a fictional conference schedule with at least24 sessions. Include rooms, speakers, setup dependencies, accessibility notes and contingency actions. Keep references internally consistent."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "none"
+      }
+    },
+    {
+      "id": "chinese-7-shared-laundry-short-direct",
+      "family": "shared-laundry",
+      "domain": "chinese",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference f4e2bcab2adc.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "请为公寓共享洗衣房制定公平可行的使用安排。讨论预约、超时占用、设备故障、清洁责任和邻里纠纷，给出试行步骤及可衡量的效果指标。"
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "none"
+      }
+    },
+    {
+      "id": "chinese-6-bus-information-2k-direct",
+      "family": "bus-information",
+      "domain": "chinese",
+      "context": "2k",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference e29e2efdf127.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Supporting context records:\n现场记录bus-information-0000：片区10在第1次巡查中收到1条反馈，观察到5次高峰使用。居民提到夜间信息难以辨认；协调人建议明确每日检查责任。\n现场记录bus-information-0001：片区17在第2次巡查中收到12条反馈，观察到17次高峰使用。居民提到高峰时段拥挤；协调人建议将维护任务分批安排。\n现场记录bus-information-0002：片区18在第3次巡查中收到1条反馈，观察到28次高峰使用。居民提到高峰时段拥挤；协调人建议将维护任务分批安排。\n现场记录bus-information-0003：片区14在第4次巡查中收到7条反馈，观察到20次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n现场记录bus-information-0004：片区8在第5次巡查中收到34条反馈，观察到7次高峰使用。居民提到等候时间不稳定；协调人建议先小范围试行再复核。\n现场记录bus-information-0005：片区5在第6次巡查中收到15条反馈，观察到25次高峰使用。居民提到夜间信息难以辨认；协调人建议将维护任务分批安排。\n现场记录bus-information-0006：片区14在第7次巡查中收到8条反馈，观察到21次高峰使用。居民提到夜间信息难以辨认；协调人建议将维护任务分批安排。\n现场记录bus-information-0007：片区11在第8次巡查中收到4条反馈，观察到26次高峰使用。居民提到标识不清晰；协调人建议将维护任务分批安排。\n现场记录bus-information-0008：片区0在第9次巡查中收到7条反馈，观察到21次高峰使用。居民提到设备维护不及时；协调人建议保留人工反馈渠道。\n现场记录bus-information-0009：片区1在第10次巡查中收到21条反馈，观察到19次高峰使用。居民提到高峰时段拥挤；协调人建议将维护任务分批安排。\n现场记录bus-information-0010：片区10在第11次巡查中收到33条反馈，观察到26次高峰使用。居民提到夜间信息难以辨认；协调人建议明确每日检查责任。\n现场记录bus-information-0011：片区18在第12次巡查中收到6条反馈，观察到3次高峰使用。居民提到等候时间不稳定；协调人建议保留人工反馈渠道。\n现场记录bus-information-0012：片区7在第13次巡查中收到12条反馈，观察到19次高峰使用。居民提到标识不清晰；协调人建议将维护任务分批安排。\n现场记录bus-information-0013：片区4在第14次巡查中收到8条反馈，观察到26次高峰使用。居民提到标识不清晰；协调人建议先小范围试行再复核。\n现场记录bus-information-0014：片区18在第15次巡查中收到19条反馈，观察到2次高峰使用。居民提到设备维护不及时；协调人建议将维护任务分批安排。\n现场记录bus-information-0015：片区13在第16次巡查中收到3条反馈，观察到26次高峰使用。居民提到等候时间不稳定；协调人建议将维护任务分批安排。\n现场记录bus-information-0016：片区1在第17次巡查中收到34条反馈，观察到5次高峰使用。居民提到夜间信息难以辨认；协调人建议将维护任务分批安排。\n现场记录bus-information-0017：片区18在第18次巡查中收到14条反馈，观察到2次高峰使用。居民提到设备维护不及时；协调人建议先小范围试行再复核。\n现场记录bus-information-0018：片区14在第19次巡查中收到27条反馈，观察到7次高峰使用。居民提到等候时间不稳定；协调人建议明确每日检查责任。\n现场记录bus-information-0019：片区15在第20次巡查中收到27条反馈，观察到8次高峰使用。居民提到标识不清晰；协调人建议先小范围试行再复核。\n现场记录bus-information-0020：片区11在第21次巡查中收到4条反馈，观察到8次高峰使用。居民提到高峰时段拥挤；协调人建议将维护任务分批安排。\n现场记录bus-information-0021：片区1在第22次巡查中收到14条反馈，观察到20次高峰使用。居民提到夜间信息难以辨认；协调人建议先小范围试行再复核。\n现场记录bus-information-0022：片区3在第23次巡查中收到2条反馈，观察到19次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n现场记录bus-information-0023：片区13在第24次巡查中收到30条反馈，观察到0次高峰使用。居民提到等候时间不稳定；协调人建议保留人工反馈渠道。\n现场记录bus-information-0024：片区3在第25次巡查中收到21条反馈，观察到0次高峰使用。居民提到标识不清晰；协调人建议先小范围试行再复核。\n现场记录bus-information-0025：片区14在第26次巡查中收到12条反馈，观察到20次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n现场记录bus-information-0026：片区6在第27次巡查中收到30条反馈，观察到2次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n现场记录bus-information-0027：片区11在第28次巡查中收到10条反馈，观察到2次高峰使用。居民提到标识不清晰；协调人建议先小范围试行再复核。\n现场记录bus-information-0028：片区2在第29次巡查中收到0条反馈，观察到12次高峰使用。居民提到高峰时段拥挤；协调人建议先小范围试行再复核。\n现场记录bus-information-0029：片区15在第30次巡查中收到24条反馈，观察到17次高峰使用。居民提到设备维护不及时；协调人建议明确每日检查责任。\n现场记录bus-information-0030：片区6在第31次巡查中收到32条反馈，观察到19次高峰使用。居民提到高峰时段拥挤；协调人建议将维护任务分批安排。\n现场记录bus-information-0031：片区4在第32次巡查中收到29条反馈，观察到9次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n现场记录bus-information-0032：片区9在第33次巡查中收到5条反馈，观察到25次高峰使用。居民提到高峰时段拥挤；协调人建议先小范围试行再复核。\n现场记录bus-information-0033：片区17在第34次巡查中收到28条反馈，观察到9次高峰使用。居民提到设备维护不及时；协调人建议先小范围试行再复核。\n现场记录bus-information-0034：片区16在第35次巡查中收到16条反馈，观察到1次高峰使用。居民提到等候时间不稳定；协调人建议明确每日检查责任。\n现场记录bus-information-0035：片区12在第36次巡查中收到19条反馈，观察到23次高峰使用。居民提到夜间信息难以辨认；协调人建议保留人工反馈渠道。\n现场记录bus-information-0036：片区14在第37次巡查中收到14条反馈，观察到10次高峰使用。居民提到夜间信息难以辨认；协调人建议将维护任务分批安排。\n现场记录bus-information-0037：片区8在第38次巡查中收到11条反馈，观察到4次高峰使用。居民提到标识不清晰；协调人建议先小范围试行再复核。\n现场记录bus-information-0038：片区6在第39次巡查中收到7条反馈，观察到1次高峰使用。居民提到设备维护不及时；协调人建议保留人工反馈渠道。\n现场记录bus-information-0039：片区16在第40次巡查中收到15条反馈，观察到25次高峰使用。居民提到标识不清晰；协调人建议保留人工反馈渠道。\n现场记录bus-information-0040：片区14在第41次巡查中收到20条反馈，观察到15次高峰使用。居民提到标识不清晰；协调人建议将维护任务分批安排。\n现场记录bus-information-0041：片区3在第42次巡查中收到11条反馈，观察到3次高峰使用。居民提到标识不清晰；协调人建议明确每日检查责任。\n\nFinal task:\n请为社区公交站的信息展示提出改进建议。考虑临时改道、老年乘客、夜间辨识、手机使用困难和维护责任，说明信息如何更新、验证和纠错。"
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "none"
+      }
+    },
+    {
+      "id": "json-6-conference-rooms-short-direct",
+      "family": "conference-rooms",
+      "domain": "json",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 10d34486229f.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Return only JSON describing a fictional conference schedule with at least24 sessions. Include rooms, speakers, setup dependencies, accessibility notes and contingency actions. Keep references internally consistent."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "none"
+      }
+    },
+    {
+      "id": "chinese-7-shared-laundry-2k-direct",
+      "family": "shared-laundry",
+      "domain": "chinese",
+      "context": "2k",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference e12989fadd44.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Supporting context records:\n现场记录shared-laundry-0000：片区14在第1次巡查中收到2条反馈，观察到21次高峰使用。居民提到等候时间不稳定；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0001：片区15在第2次巡查中收到8条反馈，观察到19次高峰使用。居民提到标识不清晰；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0002：片区6在第3次巡查中收到9条反馈，观察到12次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0003：片区10在第4次巡查中收到26条反馈，观察到20次高峰使用。居民提到等候时间不稳定；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0004：片区16在第5次巡查中收到24条反馈，观察到23次高峰使用。居民提到高峰时段拥挤；协调人建议将维护任务分批安排。\n现场记录shared-laundry-0005：片区16在第6次巡查中收到7条反馈，观察到24次高峰使用。居民提到设备维护不及时；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0006：片区12在第7次巡查中收到15条反馈，观察到9次高峰使用。居民提到高峰时段拥挤；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0007：片区9在第8次巡查中收到15条反馈，观察到9次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0008：片区15在第9次巡查中收到26条反馈，观察到4次高峰使用。居民提到等候时间不稳定；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0009：片区7在第10次巡查中收到20条反馈，观察到13次高峰使用。居民提到设备维护不及时；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0010：片区8在第11次巡查中收到27条反馈，观察到20次高峰使用。居民提到夜间信息难以辨认；协调人建议将维护任务分批安排。\n现场记录shared-laundry-0011：片区13在第12次巡查中收到11条反馈，观察到6次高峰使用。居民提到标识不清晰；协调人建议明确每日检查责任。\n现场记录shared-laundry-0012：片区6在第13次巡查中收到4条反馈，观察到16次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0013：片区14在第14次巡查中收到33条反馈，观察到3次高峰使用。居民提到等候时间不稳定；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0014：片区0在第15次巡查中收到13条反馈，观察到3次高峰使用。居民提到标识不清晰；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0015：片区10在第16次巡查中收到30条反馈，观察到28次高峰使用。居民提到等候时间不稳定；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0016：片区3在第17次巡查中收到0条反馈，观察到1次高峰使用。居民提到设备维护不及时；协调人建议明确每日检查责任。\n现场记录shared-laundry-0017：片区1在第18次巡查中收到10条反馈，观察到16次高峰使用。居民提到等候时间不稳定；协调人建议将维护任务分批安排。\n现场记录shared-laundry-0018：片区10在第19次巡查中收到14条反馈，观察到2次高峰使用。居民提到夜间信息难以辨认；协调人建议将维护任务分批安排。\n现场记录shared-laundry-0019：片区13在第20次巡查中收到36条反馈，观察到12次高峰使用。居民提到夜间信息难以辨认；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0020：片区13在第21次巡查中收到21条反馈，观察到23次高峰使用。居民提到高峰时段拥挤；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0021：片区13在第22次巡查中收到14条反馈，观察到4次高峰使用。居民提到夜间信息难以辨认；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0022：片区0在第23次巡查中收到24条反馈，观察到25次高峰使用。居民提到等候时间不稳定；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0023：片区10在第24次巡查中收到6条反馈，观察到10次高峰使用。居民提到夜间信息难以辨认；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0024：片区3在第25次巡查中收到24条反馈，观察到10次高峰使用。居民提到设备维护不及时；协调人建议明确每日检查责任。\n现场记录shared-laundry-0025：片区2在第26次巡查中收到9条反馈，观察到1次高峰使用。居民提到高峰时段拥挤；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0026：片区14在第27次巡查中收到25条反馈，观察到9次高峰使用。居民提到设备维护不及时；协调人建议将维护任务分批安排。\n现场记录shared-laundry-0027：片区10在第28次巡查中收到15条反馈，观察到15次高峰使用。居民提到高峰时段拥挤；协调人建议将维护任务分批安排。\n现场记录shared-laundry-0028：片区14在第29次巡查中收到33条反馈，观察到2次高峰使用。居民提到设备维护不及时；协调人建议明确每日检查责任。\n现场记录shared-laundry-0029：片区6在第30次巡查中收到10条反馈，观察到28次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0030：片区1在第31次巡查中收到35条反馈，观察到20次高峰使用。居民提到高峰时段拥挤；协调人建议将维护任务分批安排。\n现场记录shared-laundry-0031：片区4在第32次巡查中收到7条反馈，观察到0次高峰使用。居民提到夜间信息难以辨认；协调人建议将维护任务分批安排。\n现场记录shared-laundry-0032：片区7在第33次巡查中收到21条反馈，观察到11次高峰使用。居民提到高峰时段拥挤；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0033：片区1在第34次巡查中收到25条反馈，观察到5次高峰使用。居民提到高峰时段拥挤；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0034：片区16在第35次巡查中收到26条反馈，观察到12次高峰使用。居民提到夜间信息难以辨认；协调人建议明确每日检查责任。\n现场记录shared-laundry-0035：片区4在第36次巡查中收到29条反馈，观察到8次高峰使用。居民提到高峰时段拥挤；协调人建议将维护任务分批安排。\n现场记录shared-laundry-0036：片区12在第37次巡查中收到15条反馈，观察到13次高峰使用。居民提到等候时间不稳定；协调人建议先小范围试行再复核。\n现场记录shared-laundry-0037：片区10在第38次巡查中收到18条反馈，观察到24次高峰使用。居民提到设备维护不及时；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0038：片区1在第39次巡查中收到33条反馈，观察到2次高峰使用。居民提到等候时间不稳定；协调人建议明确每日检查责任。\n现场记录shared-laundry-0039：片区9在第40次巡查中收到15条反馈，观察到11次高峰使用。居民提到设备维护不及时；协调人建议保留人工反馈渠道。\n现场记录shared-laundry-0040：片区11在第41次巡查中收到7条反馈，观察到13次高峰使用。居民提到高峰时段拥挤；协调人建议保留人工反馈渠道。\n\nFinal task:\n请为公寓共享洗衣房制定公平可行的使用安排。讨论预约、超时占用、设备故障、清洁责任和邻里纠纷，给出试行步骤及可衡量的效果指标。"
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "none"
+      }
+    },
+    {
+      "id": "chinese-6-bus-information-short-direct",
+      "family": "bus-information",
+      "domain": "chinese",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 62b0ee54e791.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "请为社区公交站的信息展示提出改进建议。考虑临时改道、老年乘客、夜间辨识、手机使用困难和维护责任，说明信息如何更新、验证和纠错。"
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "none"
+      }
+    },
+    {
+      "id": "math-6-bezout-inverse-short-direct",
+      "family": "bezout-inverse",
+      "domain": "math",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 15a3ed51dcf7.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Derive the extended Euclidean algorithm and use it to find the multiplicative inverse of 37 modulo 101. Verify the result and explain when such an inverse exists."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "none"
+      }
+    },
+    {
+      "id": "code-7-rolling-median-2k-think",
+      "family": "rolling-median",
+      "domain": "code",
+      "context": "2k",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 5d646e41ee7f.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Supporting context records:\nFixture rolling-median-0000: request_key=k311; worker=w2; tick=110; action=retry; prior_revision=5; expected_observation=stable order.\nFixture rolling-median-0001: request_key=k444; worker=w1; tick=64; action=update; prior_revision=3; expected_observation=pending work preserved.\nFixture rolling-median-0002: request_key=k162; worker=w8; tick=304; action=remove; prior_revision=0; expected_observation=expired state removed.\nFixture rolling-median-0003: request_key=k71; worker=w0; tick=446; action=enqueue; prior_revision=8; expected_observation=expired state removed.\nFixture rolling-median-0004: request_key=k103; worker=w12; tick=311; action=retry; prior_revision=4; expected_observation=no duplicate result.\nFixture rolling-median-0005: request_key=k75; worker=w0; tick=336; action=enqueue; prior_revision=3; expected_observation=stable order.\nFixture rolling-median-0006: request_key=k266; worker=w0; tick=560; action=update; prior_revision=5; expected_observation=stable order.\nFixture rolling-median-0007: request_key=k200; worker=w6; tick=291; action=enqueue; prior_revision=2; expected_observation=no duplicate result.\nFixture rolling-median-0008: request_key=k371; worker=w5; tick=261; action=complete; prior_revision=2; expected_observation=stable order.\nFixture rolling-median-0009: request_key=k81; worker=w3; tick=304; action=enqueue; prior_revision=0; expected_observation=pending work preserved.\nFixture rolling-median-0010: request_key=k381; worker=w1; tick=368; action=retry; prior_revision=3; expected_observation=no duplicate result.\nFixture rolling-median-0011: request_key=k316; worker=w6; tick=273; action=enqueue; prior_revision=1; expected_observation=stable order.\nFixture rolling-median-0012: request_key=k34; worker=w1; tick=336; action=update; prior_revision=7; expected_observation=expired state removed.\nFixture rolling-median-0013: request_key=k225; worker=w0; tick=710; action=enqueue; prior_revision=0; expected_observation=stable order.\nFixture rolling-median-0014: request_key=k401; worker=w6; tick=300; action=remove; prior_revision=5; expected_observation=expired state removed.\nFixture rolling-median-0015: request_key=k154; worker=w3; tick=514; action=update; prior_revision=1; expected_observation=stable order.\nFixture rolling-median-0016: request_key=k109; worker=w5; tick=680; action=complete; prior_revision=1; expected_observation=no duplicate result.\nFixture rolling-median-0017: request_key=k232; worker=w2; tick=445; action=enqueue; prior_revision=7; expected_observation=pending work preserved.\nFixture rolling-median-0018: request_key=k444; worker=w3; tick=344; action=enqueue; prior_revision=3; expected_observation=pending work preserved.\nFixture rolling-median-0019: request_key=k468; worker=w10; tick=672; action=retry; prior_revision=0; expected_observation=stable order.\nFixture rolling-median-0020: request_key=k221; worker=w7; tick=823; action=remove; prior_revision=5; expected_observation=stable order.\nFixture rolling-median-0021: request_key=k402; worker=w2; tick=537; action=complete; prior_revision=6; expected_observation=expired state removed.\nFixture rolling-median-0022: request_key=k394; worker=w10; tick=681; action=complete; prior_revision=7; expected_observation=no duplicate result.\nFixture rolling-median-0023: request_key=k458; worker=w2; tick=685; action=enqueue; prior_revision=8; expected_observation=pending work preserved.\nFixture rolling-median-0024: request_key=k315; worker=w9; tick=528; action=complete; prior_revision=0; expected_observation=stable order.\nFixture rolling-median-0025: request_key=k496; worker=w10; tick=800; action=retry; prior_revision=1; expected_observation=stable order.\nFixture rolling-median-0026: request_key=k463; worker=w5; tick=931; action=remove; prior_revision=4; expected_observation=expired state removed.\nFixture rolling-median-0027: request_key=k431; worker=w3; tick=803; action=update; prior_revision=8; expected_observation=stable order.\nFixture rolling-median-0028: request_key=k343; worker=w10; tick=947; action=complete; prior_revision=1; expected_observation=no duplicate result.\nFixture rolling-median-0029: request_key=k370; worker=w4; tick=873; action=remove; prior_revision=1; expected_observation=no duplicate result.\nFixture rolling-median-0030: request_key=k124; worker=w11; tick=512; action=enqueue; prior_revision=7; expected_observation=no duplicate result.\nFixture rolling-median-0031: request_key=k59; worker=w5; tick=982; action=remove; prior_revision=5; expected_observation=stable order.\nFixture rolling-median-0032: request_key=k382; worker=w2; tick=806; action=update; prior_revision=4; expected_observation=stable order.\nFixture rolling-median-0033: request_key=k336; worker=w10; tick=868; action=complete; prior_revision=3; expected_observation=stable order.\nFixture rolling-median-0034: request_key=k357; worker=w9; tick=741; action=complete; prior_revision=6; expected_observation=no duplicate result.\nFixture rolling-median-0035: request_key=k351; worker=w7; tick=799; action=retry; prior_revision=0; expected_observation=pending work preserved.\nFixture rolling-median-0036: request_key=k242; worker=w5; tick=752; action=complete; prior_revision=8; expected_observation=stable order.\nFixture rolling-median-0037: request_key=k103; worker=w0; tick=1114; action=update; prior_revision=4; expected_observation=expired state removed.\nFixture rolling-median-0038: request_key=k251; worker=w6; tick=776; action=remove; prior_revision=8; expected_observation=expired state removed.\nFixture rolling-median-0039: request_key=k367; worker=w2; tick=759; action=complete; prior_revision=7; expected_observation=pending work preserved.\nFixture rolling-median-0040: request_key=k195; worker=w5; tick=945; action=retry; prior_revision=6; expected_observation=stable order.\nFixture rolling-median-0041: request_key=k392; worker=w7; tick=1046; action=enqueue; prior_revision=5; expected_observation=stable order.\nFixture rolling-median-0042: request_key=k141; worker=w2; tick=1107; action=remove; prior_revision=6; expected_observation=pending work preserved.\nFixture rolling-median-0043: request_key=k24; worker=w4; tick=924; action=remove; prior_revision=6; expected_observation=pending work preserved.\n\nFinal task:\nImplement an exact sliding-window median in Python using two heaps and lazy deletion. Explain balancing and duplicate values, and include tests that repeatedly expire the current median."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "medium"
+      }
+    },
+    {
+      "id": "code-6-topological-order-2k-direct",
+      "family": "topological-order",
+      "domain": "code",
+      "context": "2k",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 77ce2a6927a1.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Supporting context records:\nFixture topological-order-0000: request_key=k288; worker=w9; tick=4; action=retry; prior_revision=0; expected_observation=pending work preserved.\nFixture topological-order-0001: request_key=k351; worker=w7; tick=79; action=remove; prior_revision=0; expected_observation=no duplicate result.\nFixture topological-order-0002: request_key=k198; worker=w7; tick=113; action=enqueue; prior_revision=0; expected_observation=no duplicate result.\nFixture topological-order-0003: request_key=k350; worker=w11; tick=383; action=retry; prior_revision=8; expected_observation=stable order.\nFixture topological-order-0004: request_key=k396; worker=w11; tick=132; action=enqueue; prior_revision=0; expected_observation=expired state removed.\nFixture topological-order-0005: request_key=k488; worker=w8; tick=460; action=retry; prior_revision=2; expected_observation=stable order.\nFixture topological-order-0006: request_key=k443; worker=w4; tick=554; action=retry; prior_revision=2; expected_observation=expired state removed.\nFixture topological-order-0007: request_key=k302; worker=w4; tick=204; action=update; prior_revision=5; expected_observation=pending work preserved.\nFixture topological-order-0008: request_key=k319; worker=w6; tick=180; action=retry; prior_revision=4; expected_observation=stable order.\nFixture topological-order-0009: request_key=k103; worker=w0; tick=609; action=remove; prior_revision=4; expected_observation=expired state removed.\nFixture topological-order-0010: request_key=k232; worker=w4; tick=451; action=retry; prior_revision=7; expected_observation=stable order.\nFixture topological-order-0011: request_key=k122; worker=w12; tick=475; action=update; prior_revision=5; expected_observation=stable order.\nFixture topological-order-0012: request_key=k409; worker=w6; tick=448; action=retry; prior_revision=4; expected_observation=expired state removed.\nFixture topological-order-0013: request_key=k117; worker=w2; tick=617; action=complete; prior_revision=0; expected_observation=pending work preserved.\nFixture topological-order-0014: request_key=k143; worker=w7; tick=467; action=retry; prior_revision=8; expected_observation=expired state removed.\nFixture topological-order-0015: request_key=k63; worker=w12; tick=544; action=enqueue; prior_revision=0; expected_observation=no duplicate result.\nFixture topological-order-0016: request_key=k3; worker=w9; tick=478; action=complete; prior_revision=3; expected_observation=stable order.\nFixture topological-order-0017: request_key=k43; worker=w1; tick=645; action=remove; prior_revision=7; expected_observation=no duplicate result.\nFixture topological-order-0018: request_key=k366; worker=w4; tick=717; action=complete; prior_revision=6; expected_observation=pending work preserved.\nFixture topological-order-0019: request_key=k12; worker=w0; tick=739; action=retry; prior_revision=3; expected_observation=pending work preserved.\nFixture topological-order-0020: request_key=k159; worker=w1; tick=435; action=complete; prior_revision=6; expected_observation=stable order.\nFixture topological-order-0021: request_key=k419; worker=w10; tick=359; action=enqueue; prior_revision=5; expected_observation=stable order.\nFixture topological-order-0022: request_key=k174; worker=w10; tick=688; action=update; prior_revision=3; expected_observation=pending work preserved.\nFixture topological-order-0023: request_key=k298; worker=w4; tick=507; action=complete; prior_revision=1; expected_observation=stable order.\nFixture topological-order-0024: request_key=k475; worker=w4; tick=861; action=retry; prior_revision=7; expected_observation=no duplicate result.\nFixture topological-order-0025: request_key=k116; worker=w12; tick=885; action=update; prior_revision=8; expected_observation=pending work preserved.\nFixture topological-order-0026: request_key=k155; worker=w9; tick=619; action=update; prior_revision=2; expected_observation=pending work preserved.\nFixture topological-order-0027: request_key=k74; worker=w10; tick=882; action=update; prior_revision=2; expected_observation=pending work preserved.\nFixture topological-order-0028: request_key=k19; worker=w0; tick=931; action=retry; prior_revision=1; expected_observation=stable order.\nFixture topological-order-0029: request_key=k358; worker=w6; tick=516; action=enqueue; prior_revision=7; expected_observation=expired state removed.\nFixture topological-order-0030: request_key=k426; worker=w6; tick=958; action=complete; prior_revision=3; expected_observation=expired state removed.\nFixture topological-order-0031: request_key=k277; worker=w11; tick=724; action=remove; prior_revision=7; expected_observation=expired state removed.\nFixture topological-order-0032: request_key=k169; worker=w12; tick=908; action=retry; prior_revision=7; expected_observation=pending work preserved.\nFixture topological-order-0033: request_key=k430; worker=w7; tick=581; action=update; prior_revision=7; expected_observation=stable order.\nFixture topological-order-0034: request_key=k433; worker=w8; tick=1004; action=retry; prior_revision=1; expected_observation=stable order.\nFixture topological-order-0035: request_key=k174; worker=w5; tick=995; action=update; prior_revision=3; expected_observation=stable order.\nFixture topological-order-0036: request_key=k472; worker=w7; tick=867; action=retry; prior_revision=4; expected_observation=stable order.\nFixture topological-order-0037: request_key=k462; worker=w6; tick=877; action=update; prior_revision=3; expected_observation=no duplicate result.\nFixture topological-order-0038: request_key=k452; worker=w0; tick=667; action=complete; prior_revision=2; expected_observation=expired state removed.\nFixture topological-order-0039: request_key=k166; worker=w12; tick=727; action=complete; prior_revision=4; expected_observation=expired state removed.\nFixture topological-order-0040: request_key=k128; worker=w3; tick=846; action=retry; prior_revision=2; expected_observation=no duplicate result.\nFixture topological-order-0041: request_key=k62; worker=w4; tick=853; action=retry; prior_revision=8; expected_observation=stable order.\nFixture topological-order-0042: request_key=k407; worker=w1; tick=989; action=enqueue; prior_revision=2; expected_observation=expired state removed.\nFixture topological-order-0043: request_key=k192; worker=w12; tick=995; action=complete; prior_revision=3; expected_observation=expired state removed.\n\nFinal task:\nImplement a Python dependency planner that returns a deterministic topological order or a concrete cycle. Handle disconnected nodes and duplicate edges. Give code, tests, invariants and complexity."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "none"
+      }
+    },
+    {
+      "id": "chinese-6-bus-information-short-think",
+      "family": "bus-information",
+      "domain": "chinese",
+      "context": "short",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 4b57c7648381.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "请为社区公交站的信息展示提出改进建议。考虑临时改道、老年乘客、夜间辨识、手机使用困难和维护责任，说明信息如何更新、验证和纠错。"
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "medium"
+      }
+    },
+    {
+      "id": "math-6-bezout-inverse-2k-think",
+      "family": "bezout-inverse",
+      "domain": "math",
+      "context": "2k",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 65a251909c7a.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Supporting context records:\nPractice note bezout-inverse-0000: a=82, b=469, c=235; a+b=551; a*b=38458; division a by b gives quotient 0 and remainder 82. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0001: a=474, b=98, c=240; a+b=572; a*b=46452; division a by b gives quotient 4 and remainder 82. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0002: a=206, b=70, c=208; a+b=276; a*b=14420; division a by b gives quotient 2 and remainder 66. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0003: a=468, b=149, c=82; a+b=617; a*b=69732; division a by b gives quotient 3 and remainder 21. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0004: a=181, b=252, c=158; a+b=433; a*b=45612; division a by b gives quotient 0 and remainder 181. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0005: a=180, b=455, c=145; a+b=635; a*b=81900; division a by b gives quotient 0 and remainder 180. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0006: a=141, b=331, c=266; a+b=472; a*b=46671; division a by b gives quotient 0 and remainder 141. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0007: a=54, b=121, c=324; a+b=175; a*b=6534; division a by b gives quotient 0 and remainder 54. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0008: a=91, b=229, c=3; a+b=320; a*b=20839; division a by b gives quotient 0 and remainder 91. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0009: a=237, b=252, c=215; a+b=489; a*b=59724; division a by b gives quotient 0 and remainder 237. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0010: a=83, b=364, c=344; a+b=447; a*b=30212; division a by b gives quotient 0 and remainder 83. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0011: a=431, b=79, c=51; a+b=510; a*b=34049; division a by b gives quotient 5 and remainder 36. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0012: a=292, b=225, c=166; a+b=517; a*b=65700; division a by b gives quotient 1 and remainder 67. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0013: a=169, b=121, c=480; a+b=290; a*b=20449; division a by b gives quotient 1 and remainder 48. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0014: a=221, b=314, c=227; a+b=535; a*b=69394; division a by b gives quotient 0 and remainder 221. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0015: a=485, b=337, c=370; a+b=822; a*b=163445; division a by b gives quotient 1 and remainder 148. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0016: a=313, b=116, c=93; a+b=429; a*b=36308; division a by b gives quotient 2 and remainder 81. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0017: a=441, b=95, c=75; a+b=536; a*b=41895; division a by b gives quotient 4 and remainder 61. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0018: a=498, b=108, c=446; a+b=606; a*b=53784; division a by b gives quotient 4 and remainder 66. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0019: a=478, b=184, c=148; a+b=662; a*b=87952; division a by b gives quotient 2 and remainder 110. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0020: a=287, b=289, c=428; a+b=576; a*b=82943; division a by b gives quotient 0 and remainder 287. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0021: a=389, b=221, c=85; a+b=610; a*b=85969; division a by b gives quotient 1 and remainder 168. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0022: a=159, b=210, c=487; a+b=369; a*b=33390; division a by b gives quotient 0 and remainder 159. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0023: a=369, b=363, c=416; a+b=732; a*b=133947; division a by b gives quotient 1 and remainder 6. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0024: a=408, b=191, c=201; a+b=599; a*b=77928; division a by b gives quotient 2 and remainder 26. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0025: a=198, b=315, c=158; a+b=513; a*b=62370; division a by b gives quotient 0 and remainder 198. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0026: a=482, b=353, c=47; a+b=835; a*b=170146; division a by b gives quotient 1 and remainder 129. Distinguish worked examples from the proof of the general statement.\n\nFinal task:\nDerive the extended Euclidean algorithm and use it to find the multiplicative inverse of 37 modulo 101. Verify the result and explain when such an inverse exists."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "medium"
+      }
+    },
+    {
+      "id": "code-7-rolling-median-short-direct",
+      "family": "rolling-median",
+      "domain": "code",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 9e86dafd5551.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Implement an exact sliding-window median in Python using two heaps and lazy deletion. Explain balancing and duplicate values, and include tests that repeatedly expire the current median."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "none"
+      }
+    },
+    {
+      "id": "math-7-counting-paths-2k-direct",
+      "family": "counting-paths",
+      "domain": "math",
+      "context": "2k",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference bea249e3a5c9.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Supporting context records:\nPractice note counting-paths-0000: a=30, b=154, c=420; a+b=184; a*b=4620; division a by b gives quotient 0 and remainder 30. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0001: a=393, b=43, c=347; a+b=436; a*b=16899; division a by b gives quotient 9 and remainder 6. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0002: a=126, b=311, c=208; a+b=437; a*b=39186; division a by b gives quotient 0 and remainder 126. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0003: a=166, b=25, c=231; a+b=191; a*b=4150; division a by b gives quotient 6 and remainder 16. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0004: a=495, b=190, c=461; a+b=685; a*b=94050; division a by b gives quotient 2 and remainder 115. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0005: a=13, b=97, c=489; a+b=110; a*b=1261; division a by b gives quotient 0 and remainder 13. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0006: a=210, b=479, c=300; a+b=689; a*b=100590; division a by b gives quotient 0 and remainder 210. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0007: a=262, b=180, c=368; a+b=442; a*b=47160; division a by b gives quotient 1 and remainder 82. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0008: a=268, b=350, c=219; a+b=618; a*b=93800; division a by b gives quotient 0 and remainder 268. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0009: a=133, b=394, c=368; a+b=527; a*b=52402; division a by b gives quotient 0 and remainder 133. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0010: a=233, b=199, c=116; a+b=432; a*b=46367; division a by b gives quotient 1 and remainder 34. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0011: a=50, b=170, c=420; a+b=220; a*b=8500; division a by b gives quotient 0 and remainder 50. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0012: a=283, b=346, c=13; a+b=629; a*b=97918; division a by b gives quotient 0 and remainder 283. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0013: a=158, b=56, c=460; a+b=214; a*b=8848; division a by b gives quotient 2 and remainder 46. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0014: a=387, b=234, c=98; a+b=621; a*b=90558; division a by b gives quotient 1 and remainder 153. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0015: a=226, b=432, c=251; a+b=658; a*b=97632; division a by b gives quotient 0 and remainder 226. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0016: a=412, b=341, c=405; a+b=753; a*b=140492; division a by b gives quotient 1 and remainder 71. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0017: a=60, b=278, c=266; a+b=338; a*b=16680; division a by b gives quotient 0 and remainder 60. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0018: a=472, b=6, c=307; a+b=478; a*b=2832; division a by b gives quotient 78 and remainder 4. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0019: a=6, b=313, c=190; a+b=319; a*b=1878; division a by b gives quotient 0 and remainder 6. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0020: a=371, b=280, c=358; a+b=651; a*b=103880; division a by b gives quotient 1 and remainder 91. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0021: a=200, b=80, c=12; a+b=280; a*b=16000; division a by b gives quotient 2 and remainder 40. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0022: a=101, b=449, c=352; a+b=550; a*b=45349; division a by b gives quotient 0 and remainder 101. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0023: a=156, b=108, c=140; a+b=264; a*b=16848; division a by b gives quotient 1 and remainder 48. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0024: a=455, b=193, c=249; a+b=648; a*b=87815; division a by b gives quotient 2 and remainder 69. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0025: a=430, b=183, c=368; a+b=613; a*b=78690; division a by b gives quotient 2 and remainder 64. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0026: a=356, b=424, c=490; a+b=780; a*b=150944; division a by b gives quotient 0 and remainder 356. Distinguish worked examples from the proof of the general statement.\n\nFinal task:\nCount shortest lattice paths from (0,0) to (7,5) that avoid (3,2). Derive the counting method, show the arithmetic, and explain how to generalize to two forbidden points."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "none"
+      }
+    },
+    {
+      "id": "json-7-backup-manifest-2k-think",
+      "family": "backup-manifest",
+      "domain": "json",
+      "context": "2k",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 5d08c1e26c96.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Supporting context records:\nReference entry backup-manifest-0000: owner=team14; site=site18; version=7; observed_count=306; review_step=record recovery evidence.\nReference entry backup-manifest-0001: owner=team16; site=site8; version=7; observed_count=377; review_step=verify unique identifier.\nReference entry backup-manifest-0002: owner=team16; site=site17; version=5; observed_count=309; review_step=confirm references.\nReference entry backup-manifest-0003: owner=team1; site=site20; version=7; observed_count=184; review_step=record recovery evidence.\nReference entry backup-manifest-0004: owner=team15; site=site21; version=6; observed_count=87; review_step=check ordering.\nReference entry backup-manifest-0005: owner=team0; site=site12; version=9; observed_count=358; review_step=verify unique identifier.\nReference entry backup-manifest-0006: owner=team6; site=site2; version=3; observed_count=304; review_step=confirm references.\nReference entry backup-manifest-0007: owner=team6; site=site6; version=4; observed_count=138; review_step=confirm references.\nReference entry backup-manifest-0008: owner=team5; site=site9; version=6; observed_count=94; review_step=check ordering.\nReference entry backup-manifest-0009: owner=team13; site=site16; version=4; observed_count=107; review_step=record recovery evidence.\nReference entry backup-manifest-0010: owner=team1; site=site14; version=2; observed_count=246; review_step=check ordering.\nReference entry backup-manifest-0011: owner=team13; site=site1; version=7; observed_count=329; review_step=confirm references.\nReference entry backup-manifest-0012: owner=team10; site=site0; version=6; observed_count=429; review_step=record recovery evidence.\nReference entry backup-manifest-0013: owner=team14; site=site0; version=1; observed_count=284; review_step=confirm references.\nReference entry backup-manifest-0014: owner=team12; site=site6; version=8; observed_count=339; review_step=check ordering.\nReference entry backup-manifest-0015: owner=team10; site=site11; version=1; observed_count=40; review_step=confirm references.\nReference entry backup-manifest-0016: owner=team2; site=site13; version=9; observed_count=205; review_step=confirm references.\nReference entry backup-manifest-0017: owner=team9; site=site13; version=1; observed_count=457; review_step=check ordering.\nReference entry backup-manifest-0018: owner=team10; site=site4; version=10; observed_count=1; review_step=verify unique identifier.\nReference entry backup-manifest-0019: owner=team10; site=site13; version=4; observed_count=258; review_step=verify unique identifier.\nReference entry backup-manifest-0020: owner=team15; site=site4; version=5; observed_count=204; review_step=confirm references.\nReference entry backup-manifest-0021: owner=team8; site=site12; version=7; observed_count=141; review_step=confirm references.\nReference entry backup-manifest-0022: owner=team3; site=site21; version=2; observed_count=241; review_step=record recovery evidence.\nReference entry backup-manifest-0023: owner=team0; site=site4; version=9; observed_count=396; review_step=confirm references.\nReference entry backup-manifest-0024: owner=team8; site=site17; version=10; observed_count=120; review_step=verify unique identifier.\nReference entry backup-manifest-0025: owner=team16; site=site5; version=4; observed_count=114; review_step=confirm references.\nReference entry backup-manifest-0026: owner=team4; site=site8; version=2; observed_count=485; review_step=confirm references.\nReference entry backup-manifest-0027: owner=team5; site=site4; version=3; observed_count=211; review_step=record recovery evidence.\nReference entry backup-manifest-0028: owner=team3; site=site7; version=9; observed_count=104; review_step=record recovery evidence.\nReference entry backup-manifest-0029: owner=team1; site=site3; version=8; observed_count=98; review_step=verify unique identifier.\nReference entry backup-manifest-0030: owner=team15; site=site15; version=7; observed_count=22; review_step=confirm references.\nReference entry backup-manifest-0031: owner=team2; site=site20; version=5; observed_count=90; review_step=check ordering.\nReference entry backup-manifest-0032: owner=team9; site=site14; version=0; observed_count=409; review_step=record recovery evidence.\nReference entry backup-manifest-0033: owner=team3; site=site9; version=1; observed_count=274; review_step=confirm references.\nReference entry backup-manifest-0034: owner=team16; site=site8; version=6; observed_count=406; review_step=verify unique identifier.\nReference entry backup-manifest-0035: owner=team6; site=site2; version=4; observed_count=183; review_step=record recovery evidence.\nReference entry backup-manifest-0036: owner=team4; site=site6; version=3; observed_count=116; review_step=confirm references.\nReference entry backup-manifest-0037: owner=team9; site=site14; version=8; observed_count=236; review_step=record recovery evidence.\nReference entry backup-manifest-0038: owner=team12; site=site12; version=9; observed_count=456; review_step=verify unique identifier.\nReference entry backup-manifest-0039: owner=team12; site=site7; version=2; observed_count=123; review_step=record recovery evidence.\nReference entry backup-manifest-0040: owner=team1; site=site2; version=7; observed_count=289; review_step=verify unique identifier.\nReference entry backup-manifest-0041: owner=team0; site=site16; version=8; observed_count=195; review_step=confirm references.\nReference entry backup-manifest-0042: owner=team10; site=site0; version=2; observed_count=147; review_step=record recovery evidence.\nReference entry backup-manifest-0043: owner=team15; site=site4; version=10; observed_count=371; review_step=record recovery evidence.\nReference entry backup-manifest-0044: owner=team2; site=site4; version=9; observed_count=428; review_step=confirm references.\nReference entry backup-manifest-0045: owner=team15; site=site12; version=9; observed_count=306; review_step=check ordering.\nReference entry backup-manifest-0046: owner=team2; site=site18; version=6; observed_count=115; review_step=confirm references.\nReference entry backup-manifest-0047: owner=team5; site=site16; version=10; observed_count=496; review_step=confirm references.\n\nFinal task:\nReturn only JSON for a fictional backup manifest with at least24 resources. Include resource IDs, retention, dependencies, recovery order, owners and verification steps, with consistent references."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "medium"
+      }
+    },
+    {
+      "id": "chinese-7-shared-laundry-short-think",
+      "family": "shared-laundry",
+      "domain": "chinese",
+      "context": "short",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 60df635ba12c.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "请为公寓共享洗衣房制定公平可行的使用安排。讨论预约、超时占用、设备故障、清洁责任和邻里纠纷，给出试行步骤及可衡量的效果指标。"
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "medium"
+      }
+    },
+    {
+      "id": "math-7-counting-paths-short-think",
+      "family": "counting-paths",
+      "domain": "math",
+      "context": "short",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 6cdc858a5012.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Count shortest lattice paths from (0,0) to (7,5) that avoid (3,2). Derive the counting method, show the arithmetic, and explain how to generalize to two forbidden points."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "medium"
+      }
+    },
+    {
+      "id": "math-6-bezout-inverse-2k-direct",
+      "family": "bezout-inverse",
+      "domain": "math",
+      "context": "2k",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 501f411d67c7.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Supporting context records:\nPractice note bezout-inverse-0000: a=82, b=469, c=235; a+b=551; a*b=38458; division a by b gives quotient 0 and remainder 82. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0001: a=474, b=98, c=240; a+b=572; a*b=46452; division a by b gives quotient 4 and remainder 82. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0002: a=206, b=70, c=208; a+b=276; a*b=14420; division a by b gives quotient 2 and remainder 66. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0003: a=468, b=149, c=82; a+b=617; a*b=69732; division a by b gives quotient 3 and remainder 21. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0004: a=181, b=252, c=158; a+b=433; a*b=45612; division a by b gives quotient 0 and remainder 181. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0005: a=180, b=455, c=145; a+b=635; a*b=81900; division a by b gives quotient 0 and remainder 180. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0006: a=141, b=331, c=266; a+b=472; a*b=46671; division a by b gives quotient 0 and remainder 141. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0007: a=54, b=121, c=324; a+b=175; a*b=6534; division a by b gives quotient 0 and remainder 54. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0008: a=91, b=229, c=3; a+b=320; a*b=20839; division a by b gives quotient 0 and remainder 91. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0009: a=237, b=252, c=215; a+b=489; a*b=59724; division a by b gives quotient 0 and remainder 237. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0010: a=83, b=364, c=344; a+b=447; a*b=30212; division a by b gives quotient 0 and remainder 83. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0011: a=431, b=79, c=51; a+b=510; a*b=34049; division a by b gives quotient 5 and remainder 36. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0012: a=292, b=225, c=166; a+b=517; a*b=65700; division a by b gives quotient 1 and remainder 67. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0013: a=169, b=121, c=480; a+b=290; a*b=20449; division a by b gives quotient 1 and remainder 48. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0014: a=221, b=314, c=227; a+b=535; a*b=69394; division a by b gives quotient 0 and remainder 221. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0015: a=485, b=337, c=370; a+b=822; a*b=163445; division a by b gives quotient 1 and remainder 148. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0016: a=313, b=116, c=93; a+b=429; a*b=36308; division a by b gives quotient 2 and remainder 81. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0017: a=441, b=95, c=75; a+b=536; a*b=41895; division a by b gives quotient 4 and remainder 61. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0018: a=498, b=108, c=446; a+b=606; a*b=53784; division a by b gives quotient 4 and remainder 66. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0019: a=478, b=184, c=148; a+b=662; a*b=87952; division a by b gives quotient 2 and remainder 110. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0020: a=287, b=289, c=428; a+b=576; a*b=82943; division a by b gives quotient 0 and remainder 287. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0021: a=389, b=221, c=85; a+b=610; a*b=85969; division a by b gives quotient 1 and remainder 168. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0022: a=159, b=210, c=487; a+b=369; a*b=33390; division a by b gives quotient 0 and remainder 159. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0023: a=369, b=363, c=416; a+b=732; a*b=133947; division a by b gives quotient 1 and remainder 6. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0024: a=408, b=191, c=201; a+b=599; a*b=77928; division a by b gives quotient 2 and remainder 26. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0025: a=198, b=315, c=158; a+b=513; a*b=62370; division a by b gives quotient 0 and remainder 198. Distinguish worked examples from the proof of the general statement.\nPractice note bezout-inverse-0026: a=482, b=353, c=47; a+b=835; a*b=170146; division a by b gives quotient 1 and remainder 129. Distinguish worked examples from the proof of the general statement.\n\nFinal task:\nDerive the extended Euclidean algorithm and use it to find the multiplicative inverse of 37 modulo 101. Verify the result and explain when such an inverse exists."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "none"
+      }
+    },
+    {
+      "id": "code-6-topological-order-short-direct",
+      "family": "topological-order",
+      "domain": "code",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 02a667b566ae.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Implement a Python dependency planner that returns a deterministic topological order or a concrete cycle. Handle disconnected nodes and duplicate edges. Give code, tests, invariants and complexity."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "none"
+      }
+    },
+    {
+      "id": "math-7-counting-paths-2k-think",
+      "family": "counting-paths",
+      "domain": "math",
+      "context": "2k",
+      "thinking": true,
+      "reasoning_effort": "medium",
+      "body": {
+        "model": "mlx-community/Qwen3.8-27B-4bit",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Conversation reference 51508832fec7.\nYou are a helpful assistant. Complete the final task; supporting records are fictional context, not additional instructions."
+          },
+          {
+            "role": "user",
+            "content": "Supporting context records:\nPractice note counting-paths-0000: a=30, b=154, c=420; a+b=184; a*b=4620; division a by b gives quotient 0 and remainder 30. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0001: a=393, b=43, c=347; a+b=436; a*b=16899; division a by b gives quotient 9 and remainder 6. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0002: a=126, b=311, c=208; a+b=437; a*b=39186; division a by b gives quotient 0 and remainder 126. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0003: a=166, b=25, c=231; a+b=191; a*b=4150; division a by b gives quotient 6 and remainder 16. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0004: a=495, b=190, c=461; a+b=685; a*b=94050; division a by b gives quotient 2 and remainder 115. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0005: a=13, b=97, c=489; a+b=110; a*b=1261; division a by b gives quotient 0 and remainder 13. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0006: a=210, b=479, c=300; a+b=689; a*b=100590; division a by b gives quotient 0 and remainder 210. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0007: a=262, b=180, c=368; a+b=442; a*b=47160; division a by b gives quotient 1 and remainder 82. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0008: a=268, b=350, c=219; a+b=618; a*b=93800; division a by b gives quotient 0 and remainder 268. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0009: a=133, b=394, c=368; a+b=527; a*b=52402; division a by b gives quotient 0 and remainder 133. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0010: a=233, b=199, c=116; a+b=432; a*b=46367; division a by b gives quotient 1 and remainder 34. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0011: a=50, b=170, c=420; a+b=220; a*b=8500; division a by b gives quotient 0 and remainder 50. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0012: a=283, b=346, c=13; a+b=629; a*b=97918; division a by b gives quotient 0 and remainder 283. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0013: a=158, b=56, c=460; a+b=214; a*b=8848; division a by b gives quotient 2 and remainder 46. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0014: a=387, b=234, c=98; a+b=621; a*b=90558; division a by b gives quotient 1 and remainder 153. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0015: a=226, b=432, c=251; a+b=658; a*b=97632; division a by b gives quotient 0 and remainder 226. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0016: a=412, b=341, c=405; a+b=753; a*b=140492; division a by b gives quotient 1 and remainder 71. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0017: a=60, b=278, c=266; a+b=338; a*b=16680; division a by b gives quotient 0 and remainder 60. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0018: a=472, b=6, c=307; a+b=478; a*b=2832; division a by b gives quotient 78 and remainder 4. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0019: a=6, b=313, c=190; a+b=319; a*b=1878; division a by b gives quotient 0 and remainder 6. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0020: a=371, b=280, c=358; a+b=651; a*b=103880; division a by b gives quotient 1 and remainder 91. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0021: a=200, b=80, c=12; a+b=280; a*b=16000; division a by b gives quotient 2 and remainder 40. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0022: a=101, b=449, c=352; a+b=550; a*b=45349; division a by b gives quotient 0 and remainder 101. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0023: a=156, b=108, c=140; a+b=264; a*b=16848; division a by b gives quotient 1 and remainder 48. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0024: a=455, b=193, c=249; a+b=648; a*b=87815; division a by b gives quotient 2 and remainder 69. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0025: a=430, b=183, c=368; a+b=613; a*b=78690; division a by b gives quotient 2 and remainder 64. Distinguish worked examples from the proof of the general statement.\nPractice note counting-paths-0026: a=356, b=424, c=490; a+b=780; a*b=150944; division a by b gives quotient 0 and remainder 356. Distinguish worked examples from the proof of the general statement.\n\nFinal task:\nCount shortest lattice paths from (0,0) to (7,5) that avoid (3,2). Derive the counting method, show the arithmetic, and explain how to generalize to two forbidden points."
+          }
+        ],
+        "max_completion_tokens": 128,
+        "temperature": 0,
+        "reasoning_effort": "medium"
+      }
+    }
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "started_utc": 1792955062.859026,
+  "phases": [
+    {
+      "name": "forensic-released",
+      "command": [
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/native/rejection-forensic",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/native/splash.metallib",
+        "${SPLASH_ROOT}/install/models/mlx-community/Qwen3.8-27B-4bit",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/forensic-released-protocol.json"
+      ],
+      "exit_code": 0,
+      "seconds": 21.785890102386475
+    },
+    {
+      "name": "forensic-selected",
+      "command": [
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/native/rejection-forensic",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/native/splash.metallib",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/model-assemblies/selected",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/forensic-selected-protocol.json"
+      ],
+      "exit_code": 0,
+      "seconds": 20.895712852478027
+    },
+    {
+      "name": "forced-released",
+      "command": [
+        "${SPLASH_ROOT}/build/engine-tests/teacher-logits",
+        "${SPLASH_ROOT}/build/splash.metallib",
+        "${SPLASH_ROOT}/install/models/mlx-community/Qwen3.8-27B-4bit",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/forensic/forced.u32",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/forensic/forced-released",
+        "--window",
+        "8335:128",
+        "--kv-format",
+        "int8",
+        "--state-format",
+        "fp32"
+      ],
+      "exit_code": 0,
+      "seconds": 20.583178997039795
+    },
+    {
+      "name": "forced-selected",
+      "command": [
+        "${SPLASH_ROOT}/build/engine-tests/teacher-logits",
+        "${SPLASH_ROOT}/build/splash.metallib",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/model-assemblies/selected",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/forensic/forced.u32",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/forensic/forced-selected",
+        "--window",
+        "8335:128",
+        "--kv-format",
+        "int8",
+        "--state-format",
+        "fp32"
+      ],
+      "exit_code": 0,
+      "seconds": 20.826910972595215
+    }
+  ],
+  "active": "complete",
+  "finished_utc": 1792955146.9539819
+}

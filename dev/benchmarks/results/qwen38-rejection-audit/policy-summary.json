@@ -1,0 +1,4673 @@
+{
+  "scope": "FP64 unit-temperature unfiltered policy reference applied to native FP32 pre-policy logits at identical correct prefixes; target mass outside top16 is retained; greedy-context sample, not sampled rollouts, native policy probability parity, or a serving-speed claim",
+  "validated_native_raw_argmax_and_proposal_replay": true,
+  "rows": [
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 0,
+      "position": 4,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9997576258637454,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5538700137212326,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.5538700137212326,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.5538700137212326,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 0,
+      "position": 4,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9997578294912509,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5538700010267373,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.5538700010267373,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.5538875658882657,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 0,
+      "position": 4,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9997574558257033,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5538700243217017,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.5538700243217017,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.5538553583030156,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 1,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9940154331156628,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5402573676719342,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.5402573676719342,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.5402573676719342,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 1,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9940222799173433,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5402588255272666,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.540258836430416,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.5402629256887258,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 1,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9940097158037,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5402560488261122,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.5402561412099063,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.5402527265739596,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 2,
+      "position": 3,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9399238064450772,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.21246973245099118,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.21246973245099118,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.21246973245099118,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 2,
+      "position": 3,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9399237261580354,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.2124683654759466,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.21268147134289916,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.21269233574018162,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 2,
+      "position": 3,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9399238734881873,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.21247087393354633,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.21229342231848541,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.21228440240264324,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 3,
+      "position": 0,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.954859308968958,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.35625103718996254,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.35625103718996254,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.35625103718996254,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 3,
+      "position": 0,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9548594996704042,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.3562510690935306,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.3562510690935306,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.3562510690935306,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 3,
+      "position": 0,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9548591497246625,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.3562510105490464,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.3562510105490464,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.3562510105490464,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 4,
+      "position": 0,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9596296024536555,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.18524207350572086,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.18524207350572086,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.18524207350572086,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 4,
+      "position": 0,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9626143547217413,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.18563163332436375,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.18563163332436375,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.18563163332436375,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 4,
+      "position": 0,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9571513448469237,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.1849186196652961,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.1849186196652961,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.1849186196652961,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 5,
+      "position": 2,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.882694464231934,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.23873432382591245,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.23873432382591245,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.23873432382591245,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 5,
+      "position": 2,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.874746025821674,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.23262937069647788,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.2352279693023978,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.2352279693023978,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 5,
+      "position": 2,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.888596690191887,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.23700344956144598,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.2407067262441665,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.2407067262441665,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 6,
+      "position": 1,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.393930692174856,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.3732129887902601,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.3732129887902601,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.3732129887902601,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 6,
+      "position": 1,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.20036329841535527,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.1633211933757145,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.18483535984665755,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.18483535984665755,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 6,
+      "position": 1,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.4958371330061856,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.48307594137467597,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.47412315735941335,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.47412315735941335,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 7,
+      "position": 0,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.98139918980508,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5189163632769118,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.5189163632769118,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.5189163632769118,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 7,
+      "position": 0,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9596111410083431,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.6982045664202204,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.5020608421166292,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.5020608421166292,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "stream-csv",
+      "domain": "code",
+      "case": "code-1-stream-csv-short-direct-policy",
+      "cycle": 7,
+      "position": 0,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9871685700026572,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.4686386241886446,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.5751437385206982,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.5751437385206982,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 0,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9999206006188177,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9899896220862058,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9899896220862058,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9899896220862058,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 0,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.999920600790481,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9899895709140503,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9899895709140503,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9900309506134707,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 0,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9999206004754708,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9899896648172539,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9899896648172539,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9899551135573017,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 1,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9892394063274808,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.6482818680116403,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.6482818680116403,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.6482818680116403,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 1,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9893183810840993,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.6483255366310617,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.6489778266073135,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.6490533103028179,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 1,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9891734706998422,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.6482454093006176,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.6477320491353974,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.6476764299103052,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 2,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9999708495845301,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9903608646512574,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9903608646512574,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9903608646512574,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 2,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9999709524327943,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9903608459681332,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9903608459681332,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9903610725137744,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 2,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9999707637016212,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9903608802525039,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9903608802525039,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9903606910767798,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 3,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9997422962011606,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.969099502896979,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.969099502896979,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.969099502896979,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 3,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9989103335083429,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.961556111921435,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.8872592438824467,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.8872617504631991,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 3,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9998423221940855,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9628208977217,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9807837840795751,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9807833858815601,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 4,
+      "position": 0,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.999156124375751,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5447215160238027,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.5447215160238027,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.5447215160238027,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 4,
+      "position": 0,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9991795944256983,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5451016451625371,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.5448405938854091,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.5448405938854091,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 4,
+      "position": 0,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9991366071349297,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5444048475400373,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.5446232299627916,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.5446232299627916,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 5,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9748097380296763,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9748097380296763,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9748097380296763,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9748097380296763,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 5,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9748361825856815,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9748361825856815,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9748361825856815,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9748361825856815,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 5,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9747876567377834,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9747876514542111,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.974787651454181,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9747876567377834,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 6,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9999972019219602,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9998821916968472,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9998821916968472,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9998821916968472,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 6,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9999875122851934,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9998397913744793,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9998397913870811,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9994791548339488,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 6,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9999982971984707,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9998629652559453,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9998628529470204,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9999277766228051,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 7,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9999974267114932,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9999339321523615,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9999339321523615,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9999339321523615,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 7,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9999887891629531,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9999352229660321,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.999966762344862,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9998448378501351,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "case": "math-1-inclusion-exclusion-short-direct-policy",
+      "cycle": 7,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9999984028608332,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9999337741687936,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9999069175911963,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9999440018214963,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 0,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.7738502920779525,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.10487677235709748,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.10487677235709748,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.10487677235709748,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 0,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.7738532538312677,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.10487699670575973,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.10487699670575973,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.10487699670575973,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 0,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.7738478188980433,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.10487658501718589,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.10487658501718589,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.10487658501718589,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 1,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9999926612143306,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9996663470115223,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9996663470115223,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9996663470115223,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 1,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9999672609760171,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9996387548065171,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9996387786914193,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9996387585956916,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 1,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9999955318103214,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9996694649336626,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9996694626323254,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9996694649033673,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 2,
+      "position": 4,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9999187051964878,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.07981093004583216,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.07981093004583216,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.07981093004583216,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 2,
+      "position": 4,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9996360191229517,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.0798359253982132,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.07961069798318646,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.07961069798318646,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 2,
+      "position": 4,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9999506627962262,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.07980810432662806,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.0798336381448044,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.0798336381448044,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 3,
+      "position": 1,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9974191156325787,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.19623828416585865,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.19623828416585865,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.19623828416585865,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 3,
+      "position": 1,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9974191193092814,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.19623828262706394,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.19623833798246798,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.19623833798246798,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 3,
+      "position": 1,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9974191125623668,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.19623828545082153,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.1962382392318503,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.1962382392318503,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 4,
+      "position": 4,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9999814824469699,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.28045284105358614,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.28045284105358614,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.28045284105358614,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 4,
+      "position": 4,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9999818022625564,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.28026147581780253,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.2802641124366862,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.2807417256496463,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 4,
+      "position": 4,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9999812155039771,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.2806125691484591,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.2806103675859319,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.28021589885621795,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 5,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9999856684140088,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9999841961562822,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9999841961562822,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9999841961562822,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 5,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9999516549559838,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9999490872902184,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9999491515394057,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9999491515400792,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 5,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9999895124608555,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9999881640011802,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9999881567402877,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9999881567402349,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 6,
+      "position": 4,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.6231586776865276,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.4170559628983781,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.4170559628983781,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.4170559628983781,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 6,
+      "position": 4,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.6231666364805691,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.41705861971139035,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.4170624131477382,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.4170624131477382,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 6,
+      "position": 4,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.6231520320588988,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.41705374445279175,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.4170505835604995,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.4170505835604995,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 7,
+      "position": 0,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9981691731480863,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.472589523284069,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.472589523284069,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.472589523284069,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 7,
+      "position": 0,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9971615276116739,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.17396201193045888,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.21626682141098283,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.21626682141098283,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "case": "json-1-warehouse-transfers-short-direct-policy",
+      "cycle": 7,
+      "position": 0,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9985870631531878,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5964267817824345,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.5912798392157211,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.5912798392157211,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 0,
+      "position": 4,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.7945898706503902,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.029195290218545285,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.029195290218545285,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.029195290218545285,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 0,
+      "position": 4,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.7945688981132621,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.029095251605648912,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.029095251605648912,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.0393521332043268,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 0,
+      "position": 4,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.7946073803797521,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.02927881130265913,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.02927881130265913,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.02661682734244805,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 1,
+      "position": 2,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.8758379475534814,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.3529574440827244,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.3529574440827244,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.3529574440827244,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 1,
+      "position": 2,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.8758385848291974,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.3529555247089767,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.3529555247089767,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.3544239617469843,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 1,
+      "position": 2,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.8758374154028532,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.3529590468361009,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.3529590468361009,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.3517473402598936,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 2,
+      "position": 1,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.5038584269107482,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.12114826552475372,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.12114826552475372,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.12114826552475372,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 2,
+      "position": 1,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.503855747190529,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.1211405239987175,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.12534839784164548,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.1289849370161029,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 2,
+      "position": 1,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.5038606645553108,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.12115472992485289,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.11787622549106756,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.1153771744056842,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 3,
+      "position": 0,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.623611808279144,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.1708799022255666,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.1708799022255666,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.1708799022255666,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 3,
+      "position": 0,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.6242721810851972,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.17094923929926287,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.17094923929926287,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.17094923929926287,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 3,
+      "position": 0,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.6230614367652636,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.17082211494258265,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.17082211494258265,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.17082211494258265,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 4,
+      "position": 2,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.8705177062117413,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.13366125126962944,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.13366125126962944,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.13366125126962944,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 4,
+      "position": 2,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.8705192467815438,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.13366117972093652,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.13366117972093652,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.1351785956434618,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 4,
+      "position": 2,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.8705164197710179,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.13366131101580392,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.13366131101580392,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.13242030193349286,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 5,
+      "position": 1,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9057263416267446,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.23448214515401636,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.23448214515401636,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.23448214515401636,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 5,
+      "position": 1,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9056770179858042,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.234053685211844,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.23472469168454724,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.23472652923272144,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 5,
+      "position": 1,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9057674871290867,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.23483956401664147,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.23433549669626919,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.23433425523510662,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 6,
+      "position": 1,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9712689087135333,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.38429134226807377,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.38429134226807377,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.38429134226807377,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 6,
+      "position": 1,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9714459969573334,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.38431983223521304,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.39265305743046097,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.39265305743046097,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 6,
+      "position": 1,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9711210873763181,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.3842675607625973,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.37798656704582584,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.37798656704582584,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 7,
+      "position": 2,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.6963456493347707,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.3147629937307189,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.3147629937307189,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.3147629937307189,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 7,
+      "position": 2,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.6963740802306316,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.31473562977248565,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.3185708808891565,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.3185708808891565,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "clinic-access",
+      "domain": "chinese",
+      "case": "chinese-0-clinic-access-short-direct-policy",
+      "cycle": 7,
+      "position": 2,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.6963219132590686,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.31478583905319196,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.3117856547580703,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.3117856547580703,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 0,
+      "position": 2,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.6270246582454244,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.6045133522235104,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.6045133522235104,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.6045133522235104,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 0,
+      "position": 2,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.6270247560623621,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.6045133960351385,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.6045133960351385,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.6045133960351385,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 0,
+      "position": 2,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.6270245765639034,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.6045133156388399,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.6045133156388399,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.6045133156388399,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 1,
+      "position": 4,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9973908548920085,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5284977932338587,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.5284977932338587,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.5284977932338587,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 1,
+      "position": 4,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9979196136547116,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5286523017891533,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.5286523017891533,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.5286609105783517,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 1,
+      "position": 4,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9969497480152877,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.528368463723562,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.528368463723562,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.5283617091863352,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 2,
+      "position": 4,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.48597673109248446,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.1267132877107215,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.1267132877107215,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.1267132877107215,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 2,
+      "position": 4,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.4868539261896164,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.1268575171742023,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.1268575171742023,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.1268575171742023,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 2,
+      "position": 4,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.4852466519466816,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.12659324722731935,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.12659324722731935,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.12659324722731935,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 3,
+      "position": 3,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.6699667138657756,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.3244838438788438,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.3244838438788438,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.3244838438788438,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 3,
+      "position": 3,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.6700038446774332,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.324490619194605,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.324512867651372,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.324512867651372,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 3,
+      "position": 3,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.66993571112048,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.3244781867606862,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.32445961204816065,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.32445961204816065,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 4,
+      "position": 3,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.3746065838045454,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.3746065838045454,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.3746065838045454,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.3746065838045454,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 4,
+      "position": 3,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.5681925034362667,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5681925034362667,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.5681925034362667,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.5681925034362667,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 4,
+      "position": 3,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.2916720986625599,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.2916720986625599,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.2916720986625599,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.2916720986625599,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 5,
+      "position": 0,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9616255122027833,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.43485242308015365,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.43485242308015365,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.43485242308015365,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 5,
+      "position": 0,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9610564871661416,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.43574665972666576,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.43316095682092026,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.43316095682092026,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 5,
+      "position": 0,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9620817715193608,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.42868331308440133,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.4363742421419024,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.4363742421419024,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 6,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9995128212929539,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9983613595819608,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9983613595819608,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9983613595819608,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 6,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9995197718097898,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9983682980288469,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9983683134320253,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9983683159068851,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 6,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9995070173913451,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9983555657591423,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9983555528983384,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9983555508322547,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 7,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9959049323951773,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9744409917005528,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9744409917005528,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9744409917005528,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 7,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9958124302616725,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.952195432807507,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9891155729299012,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9891155729299012,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "rollback-dsu",
+      "domain": "code",
+      "case": "code-0-rollback-dsu-short-direct-policy",
+      "cycle": 7,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9959790592811046,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9922675427645007,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.963499117914983,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.963499117914983,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 0,
+      "position": 3,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.30634626172323226,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.30542434577061883,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.30542434577061883,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.30542434577061883,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 0,
+      "position": 3,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.30634626208910315,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.3054243461320456,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.3054243461320456,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.3054243461320456,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 0,
+      "position": 3,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.30634626141771365,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.3054243454688113,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.3054243454688113,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.3054243454688113,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 1,
+      "position": 0,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9517514853677712,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.23988422626780084,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.23988422626780084,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.23988422626780084,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 1,
+      "position": 0,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9517515044684852,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.23988423073991702,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.23988423073991702,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.23988423073991702,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 1,
+      "position": 0,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9517514694178163,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.23988422253338273,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.23988422253338273,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.23988422253338273,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 2,
+      "position": 5,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9263715981049514,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.2583963575039401,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.2583963575039401,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.2583963575039401,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 2,
+      "position": 5,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9257421628247238,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.24999908973403598,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.2577868715898127,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.25779090862231513,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 2,
+      "position": 5,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.926889086544414,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.26530014750507075,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.2591615531862374,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.2591585495311597,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 3,
+      "position": 4,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.48311507373266654,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.1912756034345588,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.1912756034345588,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.1912756034345588,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 3,
+      "position": 4,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.48312450283041714,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.19127803814414301,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.1912870395981974,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.1912870395981974,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 3,
+      "position": 4,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.48310720035637583,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.1912735704314844,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.19126613978807622,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.19126613978807622,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 4,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.999977888633673,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9382818316358725,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9382818316358725,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9382818316358725,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 4,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9999009118254336,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9382830441694663,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9309768854828334,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9309784807214357,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 4,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9999865886211042,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9382816945942469,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9391145929063223,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9391144094597208,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 5,
+      "position": 1,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9999939248159047,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.2975534136475455,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.2975534136475455,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.2975534136475455,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 5,
+      "position": 1,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9999948934619296,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.2974887956087493,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.29754114444118007,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.29754114499324624,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 5,
+      "position": 1,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9999931160814611,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.29760732170545146,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.2975637257674887,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.297563725478594,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 6,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.854043603773381,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5297160263706252,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.5297160263706252,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.5297160263706252,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 6,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.8549988700132991,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5302496300590033,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.5319141288079067,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.5319141288079067,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 6,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.8532475857879599,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5292713774180228,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.5279716952799336,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.5279716952799336,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 7,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9999949147729197,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9990868375677103,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9990868375677103,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9990868375677103,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 7,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.999997734625216,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9990868366657895,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9990868455092088,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9990868455092088,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "deployment-calendar",
+      "domain": "json",
+      "case": "json-0-deployment-calendar-short-direct-policy",
+      "cycle": 7,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.999992560081564,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9990868383208519,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9990868309361991,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9990868309361991,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 0,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9999999046716228,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9997418766978081,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9997418766978081,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9997418766978081,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 0,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9999999046733231,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9997418729368269,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9997418729368269,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9997426408575288,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 0,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9999999046702028,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9997418775722088,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9997418775722088,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9997412385909635,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 1,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9999954004744306,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9924892709869049,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9924892709869049,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9924892709869049,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 1,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.999995792242922,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.992488790578776,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9924955715967194,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9975889129130887,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 1,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9999950733306371,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9924896721486638,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9924840097639834,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9882706420108227,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 2,
+      "position": 5,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9963008747677693,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5430733250845767,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.5430733250845767,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.5430733250845767,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 2,
+      "position": 5,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9963015989584281,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5430733827822014,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.5442267225849708,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.5442267225849708,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 2,
+      "position": 5,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9963002700371163,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.5430732769045551,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.542120158237482,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.542120158237482,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 3,
+      "position": 0,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9997651212420573,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.06086654910732958,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.06086654910732958,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.06086654910732958,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 3,
+      "position": 0,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.999765943417734,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.060779669323189546,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.06086474559584689,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.06086474559584689,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 3,
+      "position": 0,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9997644348010934,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.060939085725078536,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.06086831149996985,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.06086831149996985,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 4,
+      "position": 1,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9994860141236418,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.20819579989656298,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.20819579989656298,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.20819579989656298,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 4,
+      "position": 1,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.999685744117244,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.07307750115561129,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.13829079557053522,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.13829079557053522,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 4,
+      "position": 1,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9993587585497826,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.2940971914983932,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.28515549840719945,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.28515549840719945,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 5,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9999640198353398,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9998070334888519,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9998070334888519,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9998070334888519,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 5,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.999964015996533,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9997041134403898,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9999569037220726,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9999569037220726,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 5,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9999640230402528,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9998918409383308,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9996819657851722,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9996819657851722,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 6,
+      "position": 2,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.999845216921972,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.6390607259106027,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.6390607259106027,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.6390607259106027,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 6,
+      "position": 2,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9998919395769218,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.6390489455756752,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.6390607272406376,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.6390607272406376,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 6,
+      "position": 2,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9998062061535139,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.6390580286602814,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.6390607240105832,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.6390607240105832,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 7,
+      "position": 6,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9998944187849937,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9373355002509046,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9373355002509046,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9373355002509046,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 7,
+      "position": 6,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9999025083623364,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9373350319633702,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.9402109794316599,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.9402109794316599,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "divisibility-induction",
+      "domain": "math",
+      "case": "math-0-divisibility-induction-short-direct-policy",
+      "cycle": 7,
+      "position": 6,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9998876637341133,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.9373357755601338,
+          "greedy_agreement": 1
+        },
+        "history": {
+          "overlap": 0.934947792768279,
+          "greedy_agreement": 1
+        },
+        "history_and_prefix": {
+          "overlap": 0.934947792768279,
+          "greedy_agreement": 1
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 0,
+      "position": 0,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9521029111939341,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.2392097517818564,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.2392097517818564,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.2392097517818564,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 0,
+      "position": 0,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.952103022967669,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.23920975267955172,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.23920975267955172,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.23920975267955172,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 0,
+      "position": 0,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9521028178578564,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.2392097510322406,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.2392097510322406,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.2392097510322406,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 1,
+      "position": 3,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9903760473729034,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.005422980463700833,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.005422980463700833,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.005422980463700833,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 1,
+      "position": 3,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9903760328118798,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.005416764059639775,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.005416764059639775,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.005416920368872382,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 1,
+      "position": 3,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9903760595318736,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.005428171381130562,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.005428171381130562,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.005428040863044514,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 2,
+      "position": 3,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.3668085779682554,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.3564202471037139,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.3564202471037139,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.3564202471037139,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 2,
+      "position": 3,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.3668156237255763,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.3564261250000569,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.3564261250000569,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.3564261250000569,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 2,
+      "position": 3,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.3668026946512519,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.3564153389688003,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.3564153389688003,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.3564153389688003,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 3,
+      "position": 0,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9814443520631544,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.4682419969918691,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.4682419969918691,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.4682419969918691,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 3,
+      "position": 0,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9814444682939384,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.46824200119731507,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.46824200119731507,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.46824200119731507,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 3,
+      "position": 0,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9814442550052411,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.4682419934801332,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.4682419934801332,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.4682419934801332,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 4,
+      "position": 0,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9587697270995591,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.6702076843509159,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.6702076843509159,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.6702076843509159,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 4,
+      "position": 0,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9587697281430488,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.6702075881749963,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.6711191647283643,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.6711191647283643,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 4,
+      "position": 0,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9587697262282042,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.6702077646621156,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.6694502179193466,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.6694502179193466,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 5,
+      "position": 2,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.28681635646919196,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.1520292653384822,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.1520292653384822,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.1520292653384822,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 5,
+      "position": 2,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.28680204807656445,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.15200014069358095,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.15200014069358095,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.15349276508202095,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 5,
+      "position": 2,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.2868283025272276,
+      "target_greedy_token_in_support": false,
+      "variants": {
+        "existing": {
+          "overlap": 0.15205358146692788,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.15205358146692788,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.1509547228782725,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 6,
+      "position": 0,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.8015566052061521,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.20186074205769605,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.20186074205769605,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.20186074205769605,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 6,
+      "position": 0,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.8119000550202944,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.2041011299717264,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.2041011299717264,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.2041011299717264,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 6,
+      "position": 0,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.7931191562788806,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.20003319332477124,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.20003319332477124,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.20003319332477124,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 7,
+      "position": 0,
+      "presence_penalty": 0.0,
+      "target_mass_in_candidate_support": 0.9961996687641335,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.3308115566444729,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.3308115566444729,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.3308115566444729,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 7,
+      "position": 0,
+      "presence_penalty": 1.5,
+      "target_mass_in_candidate_support": 0.9962073912471059,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.33071921772701474,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.3309880961282591,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.3309880961282591,
+          "greedy_agreement": 0
+        }
+      }
+    },
+    {
+      "family": "school-meals",
+      "domain": "chinese",
+      "case": "chinese-1-school-meals-short-direct-policy",
+      "cycle": 7,
+      "position": 0,
+      "presence_penalty": -0.5,
+      "target_mass_in_candidate_support": 0.9961932216368914,
+      "target_greedy_token_in_support": true,
+      "variants": {
+        "existing": {
+          "overlap": 0.3308886459371632,
+          "greedy_agreement": 0
+        },
+        "history": {
+          "overlap": 0.33066498762404045,
+          "greedy_agreement": 0
+        },
+        "history_and_prefix": {
+          "overlap": 0.33066498762404045,
+          "greedy_agreement": 0
+        }
+      }
+    }
+  ],
+  "aggregates": {
+    "0.0": {
+      "rows": 64,
+      "families": 8,
+      "mean_support_mass": 0.8697844527750328,
+      "variants": {
+        "existing": {
+          "mean_overlap": 0.4893585814218347,
+          "greedy_agreements": 18
+        },
+        "history": {
+          "mean_overlap": 0.4893585814218347,
+          "greedy_agreements": 18
+        },
+        "history_and_prefix": {
+          "mean_overlap": 0.4893585814218347,
+          "greedy_agreements": 18
+        }
+      }
+    },
+    "1.5": {
+      "rows": 64,
+      "families": 8,
+      "mean_support_mass": 0.8695291487848642,
+      "variants": {
+        "existing": {
+          "mean_overlap": 0.48449366750015055,
+          "greedy_agreements": 19
+        },
+        "history": {
+          "mean_overlap": 0.483255936685074,
+          "greedy_agreements": 19
+        },
+        "history_and_prefix": {
+          "mean_overlap": 0.48362514594151623,
+          "greedy_agreements": 19
+        }
+      }
+    },
+    "-0.5": {
+      "rows": 64,
+      "families": 8,
+      "mean_support_mass": 0.8700714356034182,
+      "variants": {
+        "existing": {
+          "mean_overlap": 0.4923984343868498,
+          "greedy_agreements": 19
+        },
+        "history": {
+          "mean_overlap": 0.49332387968765634,
+          "greedy_agreements": 19
+        },
+        "history_and_prefix": {
+          "mean_overlap": 0.4931153133798657,
+          "greedy_agreements": 19
+        }
+      }
+    }
+  }
+}

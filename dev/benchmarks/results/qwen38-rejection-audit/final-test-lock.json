@@ -1,0 +1,7 @@
+{
+  "selected_tensor_sha256": "21b9cc1b35b2ea73cafe4a8dec1f75eccbf7dd2bf804babe7b35f5039e1c3c0d",
+  "training_plan_sha256": "d38aac1e46c6866b6d5e6863501296f3e11ce6ae94dae42cd4ebce82f4ce2723",
+  "final_protocol_sha256": "fd8404f04a82d5e4e839742d364fb1cb8d8f0b2f589646315207abdc868f7b07",
+  "test_metrics_inspected_before_lock": false,
+  "frozen_utc": 1792953738.5547562
+}

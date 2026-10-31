@@ -1,0 +1,51 @@
+{
+  "started_utc": 1792953738.553184,
+  "phases": [
+    {
+      "name": "released-control-export",
+      "command": [
+        "${SPLASH_ROOT}/.venv/bin/python",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/export_selector.py",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/selector-fits/released-hidden-projection.bf16",
+        "released-control"
+      ],
+      "seconds": 6.336336135864258,
+      "exit_code": 0
+    },
+    {
+      "name": "released-control-native",
+      "command": [
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/native/rejection-audit",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/native/splash.metallib",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/model-assemblies/released-control",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/released-control-protocol.json"
+      ],
+      "seconds": 4.696213960647583,
+      "exit_code": 0
+    },
+    {
+      "name": "selector-native-final-test",
+      "command": [
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/native/rejection-audit",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/native/splash.metallib",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/model-assemblies/selected",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/final-test-protocol.json"
+      ],
+      "seconds": 463.0031170845032,
+      "exit_code": 0
+    },
+    {
+      "name": "restore-native",
+      "command": [
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/native/rejection-audit",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/native/splash.metallib",
+        "${SPLASH_ROOT}/install/models/mlx-community/Qwen3.8-27B-4bit",
+        "${SPLASH_ROOT}/build/qwen38-rejection-audit/restore-protocol.json"
+      ],
+      "seconds": 457.97836208343506,
+      "exit_code": 0
+    }
+  ],
+  "active": "complete",
+  "finished_utc": 1792954670.572725
+}

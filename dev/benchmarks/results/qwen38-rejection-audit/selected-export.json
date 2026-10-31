@@ -1,0 +1,10 @@
+{
+  "model_root": "${SPLASH_ROOT}/build/qwen38-rejection-audit/model-assemblies/selected",
+  "source_draft_sha256": "67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c",
+  "export_draft_sha256": "143dcc17382d54ec618211a36ceaa043ec8d3c1568b96a4d02b3b402c34daa21",
+  "tensor_sha256": "21b9cc1b35b2ea73cafe4a8dec1f75eccbf7dd2bf804babe7b35f5039e1c3c0d",
+  "all_non_selector_draft_bytes_equal": true,
+  "original_source_unchanged": true,
+  "target_tokenizer_vision": "original read-only source symlinks",
+  "same_geometry": true
+}

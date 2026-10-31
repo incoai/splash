@@ -1,0 +1,20 @@
+{
+  "same_build_single_vs_batch_all_fields_equal": true,
+  "cycles": 8,
+  "checked_fields": [
+    "proposed",
+    "candidates",
+    "unary",
+    "edges",
+    "confidence",
+    "accepted",
+    "retained",
+    "target_tokens",
+    "output_tokens",
+    "context_sha256"
+  ],
+  "hidden_bytes": 655360,
+  "production_preprocessing_equal": true,
+  "shader_validation_control_passed_replay": true,
+  "historical_note": "October22 scores differ from current-head captures; historical payload is not a bitwise reference for this build. Native greedy/confidence replay passes on both."
+}

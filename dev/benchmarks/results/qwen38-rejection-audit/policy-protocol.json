@@ -1,0 +1,386 @@
+{
+  "schema": "qwen38-rejection-audit-v1",
+  "seed": 20261025,
+  "method": "Native raw target logits at first rejection or last reached position; policy reference evaluates unit-temperature unfiltered p/q at identical correct prefixes; no native sampled rollout or serving policy change",
+  "context_scope": "Long contexts contain unique deterministic synthetic supporting records; this is an acceptance study, not a real-world retrieval/task-accuracy benchmark. Record templates are shared across families.",
+  "families": [
+    {
+      "domain": "code",
+      "index": 0,
+      "family": "rollback-dsu",
+      "split": "development",
+      "task": "Implement a Python disjoint-set union structure supporting snapshot and rollback. State which optimizations are safe, provide the implementation and focused tests, and explain time and space bounds."
+    },
+    {
+      "domain": "code",
+      "index": 1,
+      "family": "stream-csv",
+      "split": "development",
+      "task": "Implement an incremental CSV parser in Python that accepts arbitrary string chunks, quoted fields, escaped quotes, CRLF and embedded newlines. Explain how state persists across chunks and give tests."
+    },
+    {
+      "domain": "code",
+      "index": 2,
+      "family": "fair-scheduler",
+      "split": "development",
+      "task": "Design and implement a small Python job scheduler that respects per-tenant concurrency limits and rotates fairly among ready tenants. Explain cancellation and completion races and give tests."
+    },
+    {
+      "domain": "code",
+      "index": 3,
+      "family": "autocomplete",
+      "split": "development",
+      "task": "Implement a trie-based autocomplete index in Python supporting insert, removal, prefix search and deterministic top suggestions. Explain invariants and complexity, including shared prefixes."
+    },
+    {
+      "domain": "code",
+      "index": 4,
+      "family": "cursor-pages",
+      "split": "validation",
+      "task": "Implement cursor-based pagination over records sorted by timestamp and unique ID. Explain duplicate timestamps, concurrent inserts and deletes, and give a Python implementation with tests."
+    },
+    {
+      "domain": "code",
+      "index": 5,
+      "family": "token-bucket",
+      "split": "validation",
+      "task": "Implement a thread-safe token-bucket rate limiter in Python using a monotonic clock. Inject the clock for deterministic tests and explain bursts, clock advancement and nonblocking rejection."
+    },
+    {
+      "domain": "code",
+      "index": 6,
+      "family": "topological-order",
+      "split": "test",
+      "task": "Implement a Python dependency planner that returns a deterministic topological order or a concrete cycle. Handle disconnected nodes and duplicate edges. Give code, tests, invariants and complexity."
+    },
+    {
+      "domain": "code",
+      "index": 7,
+      "family": "rolling-median",
+      "split": "test",
+      "task": "Implement an exact sliding-window median in Python using two heaps and lazy deletion. Explain balancing and duplicate values, and include tests that repeatedly expire the current median."
+    },
+    {
+      "domain": "math",
+      "index": 0,
+      "family": "divisibility-induction",
+      "split": "development",
+      "task": "Prove that n cubed minus n is divisible by six for every integer n, using two independent arguments. Explain the role of consecutive integers and address negative n."
+    },
+    {
+      "domain": "math",
+      "index": 1,
+      "family": "inclusion-exclusion",
+      "split": "development",
+      "task": "Explain inclusion-exclusion for three finite sets, prove the formula using element multiplicities, and give a worked numerical example with consistent intersections."
+    },
+    {
+      "domain": "math",
+      "index": 2,
+      "family": "convex-jensen",
+      "split": "development",
+      "task": "Prove the midpoint inequality for the square function, extend it to weighted averages, and explain its equality cases and its relation to variance."
+    },
+    {
+      "domain": "math",
+      "index": 3,
+      "family": "binary-gcd",
+      "split": "development",
+      "task": "Explain the binary greatest-common-divisor algorithm. Prove the transformations, work through gcd(462,1071), and give pseudocode with a termination argument."
+    },
+    {
+      "domain": "math",
+      "index": 4,
+      "family": "geometric-series",
+      "split": "validation",
+      "task": "Derive the finite geometric-series formula and use it to establish convergence when the absolute ratio is below one. Explain exceptional cases and provide numerical examples."
+    },
+    {
+      "domain": "math",
+      "index": 5,
+      "family": "pigeonhole",
+      "split": "validation",
+      "task": "Give a rigorous proof that any n+1 integers contain two whose difference is divisible by n. Then discuss why replacing n+1 by n fails, with examples."
+    },
+    {
+      "domain": "math",
+      "index": 6,
+      "family": "bezout-inverse",
+      "split": "test",
+      "task": "Derive the extended Euclidean algorithm and use it to find the multiplicative inverse of 37 modulo 101. Verify the result and explain when such an inverse exists."
+    },
+    {
+      "domain": "math",
+      "index": 7,
+      "family": "counting-paths",
+      "split": "test",
+      "task": "Count shortest lattice paths from (0,0) to (7,5) that avoid (3,2). Derive the counting method, show the arithmetic, and explain how to generalize to two forbidden points."
+    },
+    {
+      "domain": "chinese",
+      "index": 0,
+      "family": "clinic-access",
+      "split": "development",
+      "task": "请为社区诊所制定改善预约和现场排队的方案。解释老人、临时急需就诊者和上班族的不同需求，分析预约爽约、人员安排和执行成本，提出可检验的改进指标。"
+    },
+    {
+      "domain": "chinese",
+      "index": 1,
+      "family": "school-meals",
+      "split": "development",
+      "task": "请分析学校食堂减少食物浪费的可行方案。结合学生选择、菜单反馈、份量和食品安全，说明如何试行和评估，避免用简单的处罚替代管理。"
+    },
+    {
+      "domain": "chinese",
+      "index": 2,
+      "family": "storm-drains",
+      "split": "development",
+      "task": "请为住宅区雨水排水沟制定雨季前后的维护方案。说明检查顺序、居民反馈、垃圾堵塞、积水记录和施工协作，区分可以自行处理与需要专业人员处理的问题。"
+    },
+    {
+      "domain": "chinese",
+      "index": 3,
+      "family": "bicycle-parking",
+      "split": "development",
+      "task": "请讨论老城区自行车和电动车停车空间的安排。平衡行人通行、消防通道、商户装卸和居民便利，提出可逐步试行的设计和反馈机制。"
+    },
+    {
+      "domain": "chinese",
+      "index": 4,
+      "family": "library-reuse",
+      "split": "validation",
+      "task": "请提出社区旧图书馆改造的方案。考虑安静阅读、儿童活动、无障碍通行、设备维护与志愿者安排，解释空间和预算取舍，并说明如何评价使用效果。"
+    },
+    {
+      "domain": "chinese",
+      "index": 5,
+      "family": "waste-collection",
+      "split": "validation",
+      "task": "请分析社区分类垃圾收集的运行问题。讨论收集时段、标识、异味、清洁人员工作量和居民参与，提出务实的试点方案及评估方法。"
+    },
+    {
+      "domain": "chinese",
+      "index": 6,
+      "family": "bus-information",
+      "split": "test",
+      "task": "请为社区公交站的信息展示提出改进建议。考虑临时改道、老年乘客、夜间辨识、手机使用困难和维护责任，说明信息如何更新、验证和纠错。"
+    },
+    {
+      "domain": "chinese",
+      "index": 7,
+      "family": "shared-laundry",
+      "split": "test",
+      "task": "请为公寓共享洗衣房制定公平可行的使用安排。讨论预约、超时占用、设备故障、清洁责任和邻里纠纷，给出试行步骤及可衡量的效果指标。"
+    },
+    {
+      "domain": "json",
+      "index": 0,
+      "family": "deployment-calendar",
+      "split": "development",
+      "task": "Return only a JSON object describing a fictional deployment calendar. Include at least20 milestones with unique IDs, dependency IDs, owners, status, and rollback actions. Keep references consistent."
+    },
+    {
+      "domain": "json",
+      "index": 1,
+      "family": "warehouse-transfers",
+      "split": "development",
+      "task": "Return only a JSON document describing at least24 fictional warehouse transfers. Include product IDs, origin, destination, quantity, checks and approval records, with consistent references and varied values."
+    },
+    {
+      "domain": "json",
+      "index": 2,
+      "family": "museum-program",
+      "split": "development",
+      "task": "Return only JSON for a fictional museum program with at least20 events, rooms, guides, accessibility details and dependencies. Use consistent IDs and sensible schedules."
+    },
+    {
+      "domain": "json",
+      "index": 3,
+      "family": "device-maintenance",
+      "split": "development",
+      "task": "Return only JSON describing a fictional maintenance plan for at least24 devices. Include device IDs, locations, owners, inspection steps and follow-up actions with consistent references."
+    },
+    {
+      "domain": "json",
+      "index": 4,
+      "family": "support-triage",
+      "split": "validation",
+      "task": "Return only JSON representing a fictional support triage queue of at least24 tickets. Include severity, evidence, routing, owner, dependencies and resolution checks. Use unique IDs and coherent references."
+    },
+    {
+      "domain": "json",
+      "index": 5,
+      "family": "research-catalog",
+      "split": "validation",
+      "task": "Return only JSON for a fictional research artifact catalog with at least24 artifacts. Include provenance, authors, versions, linked datasets and validation steps, keeping identifiers consistent."
+    },
+    {
+      "domain": "json",
+      "index": 6,
+      "family": "conference-rooms",
+      "split": "test",
+      "task": "Return only JSON describing a fictional conference schedule with at least24 sessions. Include rooms, speakers, setup dependencies, accessibility notes and contingency actions. Keep references internally consistent."
+    },
+    {
+      "domain": "json",
+      "index": 7,
+      "family": "backup-manifest",
+      "split": "test",
+      "task": "Return only JSON for a fictional backup manifest with at least24 resources. Include resource IDs, retention, dependencies, recovery order, owners and verification steps, with consistent references."
+    }
+  ],
+  "cases": [
+    {
+      "id": "code-1-stream-csv-short-direct-policy",
+      "family": "stream-csv",
+      "domain": "code",
+      "split": "development",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "cycles": 8,
+      "capture_hidden": false,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/code-1-stream-csv-short-direct.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/policy-captures/code-1-stream-csv-short-direct.jsonl",
+      "prompt_tokens": 74,
+      "prompt_sha256": "7b0e26870bfbe2b182ca24a70ec717db2ec920d6f468f4277cd74fa70061e2f0",
+      "content_sha256": "79a59ec451a028086d5e275d3c670702fe7ed4d60d1592b75c7a7dd1bc8d2c53",
+      "restore_prefix": 0,
+      "materialize_prefix": 0,
+      "capture_policy": true
+    },
+    {
+      "id": "math-1-inclusion-exclusion-short-direct-policy",
+      "family": "inclusion-exclusion",
+      "domain": "math",
+      "split": "development",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "cycles": 8,
+      "capture_hidden": false,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/math-1-inclusion-exclusion-short-direct.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/policy-captures/math-1-inclusion-exclusion-short-direct.jsonl",
+      "prompt_tokens": 66,
+      "prompt_sha256": "ec12c7fa0f11aaa9f86041dd172ee854e612040bdd371eacf36ff0c8d93cf4f9",
+      "content_sha256": "bd10af53275f28af539a6a00f1d4e9ff95738fe7d211b126000a606485036cb1",
+      "restore_prefix": 0,
+      "materialize_prefix": 0,
+      "capture_policy": true
+    },
+    {
+      "id": "json-1-warehouse-transfers-short-direct-policy",
+      "family": "warehouse-transfers",
+      "domain": "json",
+      "split": "development",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "cycles": 8,
+      "capture_hidden": false,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/json-1-warehouse-transfers-short-direct.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/policy-captures/json-1-warehouse-transfers-short-direct.jsonl",
+      "prompt_tokens": 74,
+      "prompt_sha256": "12d118e57a84225a1d774c37544e599ceb9effd7619115b91d478c5ddf56adda",
+      "content_sha256": "aa2e1420b5e76f04b3ed96460bbcb32bee540101609d1e9e7ac5dd7e5039c7aa",
+      "restore_prefix": 0,
+      "materialize_prefix": 0,
+      "capture_policy": true
+    },
+    {
+      "id": "chinese-0-clinic-access-short-direct-policy",
+      "family": "clinic-access",
+      "domain": "chinese",
+      "split": "development",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "cycles": 8,
+      "capture_hidden": false,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/chinese-0-clinic-access-short-direct.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/policy-captures/chinese-0-clinic-access-short-direct.jsonl",
+      "prompt_tokens": 79,
+      "prompt_sha256": "5c433d6bb825320835ac16860c2212fc5a1adefae5f15e2c912c8d028d6052bf",
+      "content_sha256": "de37f13a697bc592048c41c6ff63793a593bd85dec4bb7e4747110c5116ad392",
+      "restore_prefix": 0,
+      "materialize_prefix": 0,
+      "capture_policy": true
+    },
+    {
+      "id": "code-0-rollback-dsu-short-direct-policy",
+      "family": "rollback-dsu",
+      "domain": "code",
+      "split": "development",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "cycles": 8,
+      "capture_hidden": false,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/code-0-rollback-dsu-short-direct.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/policy-captures/code-0-rollback-dsu-short-direct.jsonl",
+      "prompt_tokens": 70,
+      "prompt_sha256": "b449fd98e7827b953e8fc157cf93190b5521377d1b1fa410ffcf8bc452fc3fa4",
+      "content_sha256": "5457b15df49ffde2c05c060821ca7ae838977b7101a4689165f366e82f6f4e64",
+      "restore_prefix": 0,
+      "materialize_prefix": 0,
+      "capture_policy": true
+    },
+    {
+      "id": "json-0-deployment-calendar-short-direct-policy",
+      "family": "deployment-calendar",
+      "domain": "json",
+      "split": "development",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "cycles": 8,
+      "capture_hidden": false,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/json-0-deployment-calendar-short-direct.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/policy-captures/json-0-deployment-calendar-short-direct.jsonl",
+      "prompt_tokens": 74,
+      "prompt_sha256": "2bf1646d9e0b5ac6758a4ba0805cc6baefe7c4d2dfa723ed627b05b549a935da",
+      "content_sha256": "7731f133c0f35b8b6a09d6a3864b3085f0f66770e64d56811bdcad7a2eb18bee",
+      "restore_prefix": 0,
+      "materialize_prefix": 0,
+      "capture_policy": true
+    },
+    {
+      "id": "math-0-divisibility-induction-short-direct-policy",
+      "family": "divisibility-induction",
+      "domain": "math",
+      "split": "development",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "cycles": 8,
+      "capture_hidden": false,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/math-0-divisibility-induction-short-direct.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/policy-captures/math-0-divisibility-induction-short-direct.jsonl",
+      "prompt_tokens": 71,
+      "prompt_sha256": "3888b70fb1e9d41089fae51f933386ab5b2a3140266424b458bb91640d3e9c7f",
+      "content_sha256": "be6e5f5948796ee22fae4864138cebcf08f920c7852c8637fe1b93575419ff55",
+      "restore_prefix": 0,
+      "materialize_prefix": 0,
+      "capture_policy": true
+    },
+    {
+      "id": "chinese-1-school-meals-short-direct-policy",
+      "family": "school-meals",
+      "domain": "chinese",
+      "split": "development",
+      "context": "short",
+      "thinking": false,
+      "reasoning_effort": "none",
+      "cycles": 8,
+      "capture_hidden": false,
+      "prompt_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/prompts/chinese-1-school-meals-short-direct.u32",
+      "output_file": "${SPLASH_ROOT}/build/qwen38-rejection-audit/policy-captures/chinese-1-school-meals-short-direct.jsonl",
+      "prompt_tokens": 73,
+      "prompt_sha256": "87a67ef70ffe37fbbb91abde43beb37020a0fdb6e746c227fc203486a44f319b",
+      "content_sha256": "4688b88d7c4f0d4533872ed6cee31f73969e753b3040b05db69d30dfe7b188e7",
+      "restore_prefix": 0,
+      "materialize_prefix": 0,
+      "capture_policy": true
+    }
+  ]
+}

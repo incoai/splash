@@ -1,0 +1,65 @@
+{
+  "case": "math-7-counting-paths-8k-direct",
+  "first_output_difference": 138,
+  "absolute_target_position": 8313,
+  "common_prefix_tokens": 138,
+  "raw_capture_reproduces_original_rollouts_exactly": {
+    "released": true,
+    "selected": true
+  },
+  "same_correct_prefix_before_difference": true,
+  "predictions": {
+    "released": {
+      "cycle": 21,
+      "verify_start_position": 8307,
+      "logit_row": 5,
+      "retained": 6,
+      "top5_token_ids": [
+        332,
+        92217,
+        159034,
+        4417,
+        318
+      ],
+      "top5_logits": [
+        23.54752540588379,
+        23.532344818115234,
+        20.32469940185547,
+        18.167064666748047,
+        18.159664154052734
+      ],
+      "top1_margin": 0.015180587768554688
+    },
+    "selected": {
+      "cycle": 24,
+      "verify_start_position": 8307,
+      "logit_row": 5,
+      "retained": 8,
+      "top5_token_ids": [
+        92217,
+        332,
+        159034,
+        318,
+        4417
+      ],
+      "top5_logits": [
+        23.558849334716797,
+        23.55487060546875,
+        20.32851219177246,
+        18.14003562927246,
+        18.126916885375977
+      ],
+      "top1_margin": 0.003978729248046875
+    }
+  },
+  "centered_logit_difference_RMSE": 0.020924547322412196,
+  "centered_logit_difference_max_abs": 0.11396245265080651,
+  "fixed_schedule_teacher_forced_logits_bitwise_equal": true,
+  "fixed_schedule_logits_sha256": {
+    "released": "42af5cba1528fdabb9244de88286605eaac70b7057e9c2979653fee5032f5dbc",
+    "selected": "42af5cba1528fdabb9244de88286605eaac70b7057e9c2979653fee5032f5dbc"
+  },
+  "fixed_schedule_rows": 129,
+  "fixed_schedule_vocabulary": 248320,
+  "interpretation": "Unchanged target weights produce bitwise-equal target logits on an identical forced prefix/verification schedule. Natural rollouts reached the same correct prefix through different draft acceptance schedules and produced different logits at a close argmax. This is consistent with finite-precision scheduling sensitivity; it is not a proven kernel-level root cause, a task-quality assessment, or permission to waive greedy-output qualification."
+}

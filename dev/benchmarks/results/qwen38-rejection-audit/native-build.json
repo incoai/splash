@@ -1,0 +1,12 @@
+{
+  "production_preprocessing_bitwise_equal": true,
+  "production_preprocessed_sha256": "15661741f14efcfe5d18336e0b623311193b4297c89b7b70e6c23734799d3863",
+  "combined_production_base": "950ffef9",
+  "diagnostics_source": "PR550 ef0e95d4 +PR556 b4006b12 development-only accessors",
+  "files": {
+    "runtime/model/Runtime.cpp": "eaf70fa47cb263d83731c75752724787d3d714a6dd7d99a3a21e3e80aafc1002",
+    "runtime/model/RuntimeInstrumentation.hpp": "329081240c18765755c377796768d005486d0cc25ee3cd9b182e604593ebecb7",
+    "dev/benchmarks/decode_profile.mm": "0a6aa148cfebcdd9580792121aab76befd0d3883dd3b7f3d87f88f26939c8433"
+  },
+  "binary_sha256": "551ad228a8611b34887d28facbcde220d24dc30e3893ee6d7f2736a2c45973b1"
+}

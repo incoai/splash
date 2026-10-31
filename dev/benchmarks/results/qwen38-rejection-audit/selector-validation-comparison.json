@@ -1,0 +1,442 @@
+{
+  "scope": "native natural greedy rollout acceptance;32 cycles maximum; identical target/backbone/codebooks, merged selector-H update; bootstrap clusters task families and does not treat cycles as independent; not timed serving throughput",
+  "cases": [
+    {
+      "id": "math-5-pigeonhole-short-think",
+      "family": "pigeonhole",
+      "domain": "math",
+      "context": "short",
+      "thinking": true,
+      "baseline_tau": 4.53125,
+      "candidate_tau": 4.65625,
+      "tau_ratio": 1.0275862068965518,
+      "common_prefix_tokens": 145,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 22,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 21,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "chinese-5-waste-collection-short-think",
+      "family": "waste-collection",
+      "domain": "chinese",
+      "context": "short",
+      "thinking": true,
+      "baseline_tau": 3.4375,
+      "candidate_tau": 3.53125,
+      "tau_ratio": 1.0272727272727273,
+      "common_prefix_tokens": 110,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 24,
+        "candidate_recall": 5,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 24,
+        "candidate_recall": 5,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "json-5-research-catalog-short-think",
+      "family": "research-catalog",
+      "domain": "json",
+      "context": "short",
+      "thinking": true,
+      "baseline_tau": 4.375,
+      "candidate_tau": 4.375,
+      "tau_ratio": 1.0,
+      "common_prefix_tokens": 140,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 24,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 22,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "math-4-geometric-series-short-think",
+      "family": "geometric-series",
+      "domain": "math",
+      "context": "short",
+      "thinking": true,
+      "baseline_tau": 5.125,
+      "candidate_tau": 4.96875,
+      "tau_ratio": 0.9695121951219512,
+      "common_prefix_tokens": 159,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 20,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 22,
+        "candidate_recall": 0,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "code-4-cursor-pages-short-direct",
+      "family": "cursor-pages",
+      "domain": "code",
+      "context": "short",
+      "thinking": false,
+      "baseline_tau": 2.96875,
+      "candidate_tau": 3.15625,
+      "tau_ratio": 1.063157894736842,
+      "common_prefix_tokens": 95,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 27,
+        "candidate_recall": 5,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 25,
+        "candidate_recall": 7,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "json-4-support-triage-short-direct",
+      "family": "support-triage",
+      "domain": "json",
+      "context": "short",
+      "thinking": false,
+      "baseline_tau": 4.375,
+      "candidate_tau": 4.1875,
+      "tau_ratio": 0.9571428571428572,
+      "common_prefix_tokens": 134,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 17,
+        "candidate_recall": 7,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 18,
+        "candidate_recall": 6,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "math-4-geometric-series-short-direct",
+      "family": "geometric-series",
+      "domain": "math",
+      "context": "short",
+      "thinking": false,
+      "baseline_tau": 5.53125,
+      "candidate_tau": 5.5625,
+      "tau_ratio": 1.0056497175141244,
+      "common_prefix_tokens": 177,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 19,
+        "candidate_recall": 0,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 19,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "code-5-token-bucket-short-think",
+      "family": "token-bucket",
+      "domain": "code",
+      "context": "short",
+      "thinking": true,
+      "baseline_tau": 4.0625,
+      "candidate_tau": 4.03125,
+      "tau_ratio": 0.9923076923076923,
+      "common_prefix_tokens": 129,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 24,
+        "candidate_recall": 3,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 24,
+        "candidate_recall": 3,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "chinese-4-library-reuse-short-think",
+      "family": "library-reuse",
+      "domain": "chinese",
+      "context": "short",
+      "thinking": true,
+      "baseline_tau": 3.4375,
+      "candidate_tau": 3.40625,
+      "tau_ratio": 0.990909090909091,
+      "common_prefix_tokens": 109,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 23,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 23,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "json-4-support-triage-short-think",
+      "family": "support-triage",
+      "domain": "json",
+      "context": "short",
+      "thinking": true,
+      "baseline_tau": 3.71875,
+      "candidate_tau": 3.59375,
+      "tau_ratio": 0.9663865546218487,
+      "common_prefix_tokens": 115,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 21,
+        "candidate_recall": 6,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 19,
+        "candidate_recall": 7,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "math-5-pigeonhole-short-direct",
+      "family": "pigeonhole",
+      "domain": "math",
+      "context": "short",
+      "thinking": false,
+      "baseline_tau": 4.15625,
+      "candidate_tau": 4.5625,
+      "tau_ratio": 1.0977443609022557,
+      "common_prefix_tokens": 133,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 23,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 22,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "code-5-token-bucket-short-direct",
+      "family": "token-bucket",
+      "domain": "code",
+      "context": "short",
+      "thinking": false,
+      "baseline_tau": 3.3125,
+      "candidate_tau": 3.6875,
+      "tau_ratio": 1.1132075471698113,
+      "common_prefix_tokens": 106,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 26,
+        "candidate_recall": 2,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 25,
+        "candidate_recall": 3,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "json-5-research-catalog-short-direct",
+      "family": "research-catalog",
+      "domain": "json",
+      "context": "short",
+      "thinking": false,
+      "baseline_tau": 4.34375,
+      "candidate_tau": 4.34375,
+      "tau_ratio": 1.0,
+      "common_prefix_tokens": 139,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 17,
+        "candidate_recall": 8,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 17,
+        "candidate_recall": 8,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "chinese-5-waste-collection-short-direct",
+      "family": "waste-collection",
+      "domain": "chinese",
+      "context": "short",
+      "thinking": false,
+      "baseline_tau": 2.59375,
+      "candidate_tau": 2.625,
+      "tau_ratio": 1.0120481927710843,
+      "common_prefix_tokens": 83,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 24,
+        "candidate_recall": 6,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 23,
+        "candidate_recall": 7,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "chinese-4-library-reuse-short-direct",
+      "family": "library-reuse",
+      "domain": "chinese",
+      "context": "short",
+      "thinking": false,
+      "baseline_tau": 2.78125,
+      "candidate_tau": 2.65625,
+      "tau_ratio": 0.9550561797752809,
+      "common_prefix_tokens": 85,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 22,
+        "candidate_recall": 9,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 24,
+        "candidate_recall": 7,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    },
+    {
+      "id": "code-4-cursor-pages-short-think",
+      "family": "cursor-pages",
+      "domain": "code",
+      "context": "short",
+      "thinking": true,
+      "baseline_tau": 3.9375,
+      "candidate_tau": 3.9375,
+      "tau_ratio": 1.0,
+      "common_prefix_tokens": 126,
+      "first_output_difference": null,
+      "common_output_prefix_equal": true,
+      "baseline_first_rejections": {
+        "selection": 25,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "candidate_first_rejections": {
+        "selection": 24,
+        "candidate_recall": 4,
+        "censored": 0
+      },
+      "baseline_cycles": 32,
+      "candidate_cycles": 32
+    }
+  ],
+  "geometric_mean_tau_gain_pct": 1.015627958810339,
+  "family_cluster_bootstrap_95pct_gain_interval": [
+    -1.278075029510739,
+    3.3701136098584556
+  ],
+  "independent_task_families": 8,
+  "all_initial_non_selector_forwards_bitwise_equal": true,
+  "all_common_output_prefixes_equal": true,
+  "domains": {
+    "chinese": {
+      "cases": 4,
+      "tau_gain_pct": -0.4050263676492416
+    },
+    "code": {
+      "cases": 4,
+      "tau_gain_pct": 4.101039729162537
+    },
+    "json": {
+      "cases": 4,
+      "tau_gain_pct": -1.9309630689348878
+    },
+    "math": {
+      "cases": 4,
+      "tau_gain_pct": 2.407054134967801
+    }
+  },
+  "strata": {
+    "short/direct": {
+      "cases": 8,
+      "tau_gain_pct": 2.39790989662223
+    },
+    "short/think": {
+      "cases": 8,
+      "tau_gain_pct": -0.34799438568047236
+    }
+  },
+  "acceptance_promotion_gate": false
+}

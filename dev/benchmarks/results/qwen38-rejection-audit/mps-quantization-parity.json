@@ -1,0 +1,6 @@
+{
+  "torch": "2.13.0",
+  "device": "mps",
+  "weights": 1310720,
+  "all_weights_exact_cpu_mps": true
+}
