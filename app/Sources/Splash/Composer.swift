@@ -275,6 +275,9 @@ private struct EffortMenu: View {
     }
 }
 
+/// The images attached to a draft, each with a button that takes it off. Each has a hairline, so
+/// that a white one keeps its edge on the composer, and its button a solid disc, which stands out
+/// over any image in either appearance.
 private struct Attachments: View {
     let draft: Draft
 
@@ -289,9 +292,12 @@ private struct Attachments: View {
                                 .scaledToFill()
                                 .frame(width: 56, height: 56)
                                 .clipShape(.rect(cornerRadius: 10))
+                                .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(.separator) }
                         }
                         Button { draft.remove(at: index) } label: {
-                            Image(systemName: "xmark.circle.fill").symbolRenderingMode(.hierarchical)
+                            Image(systemName: "xmark.circle.fill")
+                                .symbolRenderingMode(.palette)
+                                .foregroundStyle(.white, .black.opacity(0.6))
                         }
                         .buttonStyle(.borderless)
                         .offset(x: 6, y: -6)
