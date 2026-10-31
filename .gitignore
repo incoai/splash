@@ -11,3 +11,4 @@ __pycache__/
 dist/
 app/.build/
 install/download-token
+desktop/.build/
