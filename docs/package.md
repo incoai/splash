@@ -99,7 +99,10 @@ taken from the cache, and the Metal memory it holds, with each request's line
 of the server's log, folded. Its chat is its own, not the chat page: it streams
 `/v1/chat/completions` and keeps each conversation as a JSON file in
 `~/Library/Application Support/Splash/Chats`, so a conversation outlives a
-switch of models. Its icon is `app/AppIcon.icon`, an Icon Composer document
+switch of models. The window's drawer, ⌘J or the toolbar's terminal button,
+holds terminals, each the user's login shell in the home folder, through
+SwiftTerm, and the server's and the downloads' logs as they are written. Its
+icon is `app/AppIcon.icon`, an Icon Composer document
 `actool` compiles, which needs the full Xcode; its mark, three arcs of water
 springing from a rippled surface, is the menu bar's too (`SplashMark`), and the
 chat page's (`server/favicon.svg`). `swift test --package-path app` runs its

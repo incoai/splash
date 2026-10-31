@@ -58,12 +58,20 @@ struct Runtime: Sendable {
         return process
     }
 
-    /// The environment of the programs the app runs: the app's own (an app does not get the shell's),
-    /// kept from the user's site-packages in the programs Python starts, and without an API key the
-    /// server would require of the app. Run with -B, the launcher keeps them from writing bytecode.
+    /// The environment of the programs the app runs: `userEnvironment`, kept from the user's
+    /// site-packages in the programs Python starts. Run with -B, the launcher keeps them from
+    /// writing bytecode.
     var environment: [String: String] {
-        var environment = ProcessInfo.processInfo.environment
+        var environment = userEnvironment
         environment["PYTHONNOUSERSITE"] = "1"
+        return environment
+    }
+
+    /// The app's own environment (an app does not get the shell's), without an API key the server
+    /// would require of the app: the drawer's terminals', whose commands are the user's, finding
+    /// the user's site-packages as in their terminal.
+    var userEnvironment: [String: String] {
+        var environment = ProcessInfo.processInfo.environment
         environment.removeValue(forKey: "SPLASH_API_KEY")
         environment.removeValue(forKey: "SPLASH_RUNTIME")
         return environment

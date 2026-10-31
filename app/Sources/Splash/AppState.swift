@@ -37,6 +37,11 @@ final class AppState {
     var showsSidebar = UserDefaults.standard.object(forKey: Preference.sidebar) as? Bool ?? true {
         didSet { UserDefaults.standard.set(showsSidebar, forKey: Preference.sidebar) }
     }
+    /// The terminals and logs under the window's content, whether they show, as ⌘J has it, and
+    /// the height the user dragged them to.
+    let drawer = Drawer()
+    var showsDrawer = false
+    var drawerHeight: CGFloat = 280
     private(set) var installed: [InstalledModel] = []
     private(set) var blocker: Blocker?
     /// Whether the checks of `launch` are done; nothing starts before.
@@ -228,11 +233,13 @@ final class AppState {
         installer.install(model)
     }
 
-    /// Stops the download, the model and the installer of cached models for the app to quit, and
-    /// starts nothing after. The last gets SIGINT, as Ctrl+C sends, and SIGTERM 5 s later.
+    /// Stops the download, the model, the drawer's terminals and the installer of cached models for
+    /// the app to quit, and starts nothing after. The installer gets SIGINT, as Ctrl+C sends, and
+    /// SIGTERM 5 s later.
     func quit() {
         quitting = true
         chats.stop()
+        drawer.endAll()
         installer.cancel()
         server.stop()
         if let cachedInstaller {

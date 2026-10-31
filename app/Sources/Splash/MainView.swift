@@ -8,7 +8,7 @@ struct MainView: View {
     var body: some View {
         // The window works out its least size from its content: the frame's minimum alone, without
         // laying either screen out for it on every change.
-        Offered { content }
+        Offered { WithDrawer { content } }
             .frame(minWidth: 800, minHeight: 560)
             .navigationTitle("Splash")
             .toolbar(removing: .title)
@@ -39,6 +39,12 @@ struct MainView: View {
                     }
                 }
                 if state.available {
+                    ToolbarItem {
+                        Button { state.toggleDrawer() } label: {
+                            Label("Terminal and Logs", systemImage: "terminal")
+                        }
+                        .help(state.showsDrawer ? "Hide Terminal and Logs (⌘J)" : "Show Terminal and Logs (⌘J)")
+                    }
                     ToolbarItem { ServerButton() }
                         .sharedBackgroundVisibility(.hidden)
                 }
@@ -97,7 +103,7 @@ struct SectionSwitch: View {
 }
 
 /// Segments in a well, the picked one on a pill that slides to the next picked: the window's
-/// switch. None is picked while `selected` is none of theirs.
+/// switch, and the drawer's. None is picked while `selected` is none of theirs.
 struct Segments<Value: Hashable>: View {
     struct Segment {
         let title: String
@@ -171,6 +177,28 @@ struct WithSidebar<Side: View, Content: View>: View {
 }
 
 extension AppState {
+    /// A terminal in the home folder.
+    @discardableResult
+    func newTerminal() -> TerminalSession {
+        let session = TerminalSession(environment: runtime.userEnvironment)
+        drawer.add(session)
+        return session
+    }
+
+    /// Opens or closes the drawer, sliding; opened on the terminals, it starts one where there is
+    /// none.
+    func toggleDrawer() {
+        withAnimation(Motion.settle) { showsDrawer.toggle() }
+        if showsDrawer && drawer.part == .terminal && drawer.terminals.isEmpty { newTerminal() }
+    }
+
+    /// Opens the drawer on `part`.
+    func showDrawer(_ part: Drawer.Part) {
+        drawer.part = part
+        if part == .terminal && drawer.terminals.isEmpty { newTerminal() }
+        withAnimation(Motion.settle) { showsDrawer = true }
+    }
+
     /// Hides the sidebar shown, or shows the one hidden, sliding.
     func toggleSidebar() {
         withAnimation(Motion.settle) { showsSidebar.toggle() }

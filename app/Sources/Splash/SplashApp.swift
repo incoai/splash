@@ -33,6 +33,15 @@ struct SplashApp: App {
                 Button(state.showsSidebar ? "Hide Sidebar" : "Show Sidebar") { state.toggleSidebar() }
                     .keyboardShortcut("b")
                     .disabled(!state.available || state.section == .server)
+                Button(state.showsDrawer ? "Hide Terminal and Logs" : "Show Terminal and Logs") { state.toggleDrawer() }
+                    .keyboardShortcut("j")
+                    .disabled(!state.available)
+                Button("New Terminal") {
+                    state.newTerminal()
+                    state.showDrawer(.terminal)
+                }
+                .keyboardShortcut("t", modifiers: [.command, .shift])
+                .disabled(!state.available)
                 Divider()
                 Button("Server") { state.section = .server }
                     .keyboardShortcut("1")

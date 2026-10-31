@@ -33,14 +33,14 @@ struct ServerView: View {
                     }
                     if case .failed(let message) = state.server.phase, let model = state.server.model {
                         ProblemRow(title: "\(state.displayName(of: model)) ran into a problem", message: message,
-                                   log: Server.log, dismiss: state.server.dismissFailure,
+                                   log: .server, dismiss: state.server.dismissFailure,
                                    // Files on this Mac that can't serve won't serve on a second try.
                                    action: model.hasPrefix("/") && !state.server.running
                                        ? ("Remove from List", { state.server.dismissFailure(); state.removeLocal(model) }) : nil)
                     }
                     if let failure = state.installer.failure {
                         ProblemRow(title: "\(state.displayName(of: failure.model)) couldn’t download",
-                                   message: failure.message, log: Installer.log, dismiss: state.installer.dismissFailure,
+                                   message: failure.message, log: .downloads, dismiss: state.installer.dismissFailure,
                                    action: ("Download Again", { state.download(failure.model) }))
                     }
                     if state.installer.running { DownloadRow() }
@@ -445,9 +445,11 @@ struct SectionTitle: View {
 
 /// Something that failed: why, in a line or three, with any log and a way out.
 private struct ProblemRow: View {
+    @Environment(AppState.self) private var state
     let title: String
     let message: String
-    var log: URL?
+    /// The log that says more, which Show Log opens in the window's drawer.
+    var log: LogSource?
     var dismiss: (() -> Void)?
     /// The way out, with its button's title.
     var action: (title: String, run: () -> Void)?
@@ -465,7 +467,12 @@ private struct ProblemRow: View {
                     .help(message)
             }
             Spacer(minLength: 12)
-            if let log { Button("Show Log") { NSWorkspace.shared.open(log) } }
+            if let log {
+                Button("Show Log") {
+                    state.drawer.log = log
+                    state.showDrawer(.logs)
+                }
+            }
             if let action { Button(action.title, action: action.run) }
             if let dismiss {
                 Button(action: dismiss) { Image(systemName: "xmark") }
