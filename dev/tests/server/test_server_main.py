@@ -88,6 +88,7 @@ class ServerMainTests(unittest.TestCase):
             relaunch_command=mock.ANY,
             startup_timeout=api.NATIVE_START_TIMEOUT,
             pending_limit=1,
+            spawn_guard=None,
         )
         # Every relaunch keeps the context the first engine served.
         relaunch_command = runtime_type.call_args.kwargs["relaunch_command"]
