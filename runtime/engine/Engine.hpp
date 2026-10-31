@@ -275,10 +275,12 @@ public:
   // (Cache.hpp) gives, returning the buffers an evicted state handed back to
   // the model's pool after each step: what nothing in use holds while that
   // frees some; then, while the host is short
-  // (MemoryReclaimDirective::hostShort), the expert store's chunks above its
-  // floor, one per step (Model::releaseExpertChunk); then, up to InUse, what
-  // is in use. What nothing in use holds that waits for a transfer in flight
-  // holds the last two back: the pass ends Pending. While the target is
+  // (MemoryReclaimDirective::hostShort), escalate()'s rungs short of what is
+  // in use, a step at a time: a Resident lane's conversion to Spill, then the
+  // expert store's chunks above its floor (Model::releaseExpertChunk); then,
+  // up to InUse, what is in use. What nothing in use holds that waits for a
+  // transfer in flight, and memory a conversion has on its way back, hold
+  // the rest back: the pass ends Pending. While the target is
   // still unmet, it then takes the image rows only evicted states held. A
   // pass counts only memory that leaves the engine: released KV extents,
   // store chunks, the caches and idle buffers the model returns; evicting a
@@ -290,8 +292,9 @@ public:
   // Live command buffers are never eviction candidates. A pass first collects
   // the transfers that landed, so one that continues a reclaim they held back
   // takes what they freed. The result says whether the directive's target is
-  // met, waits for transfers in flight, or finds nothing left that the
-  // directive lets it take: with hostShort, the store is at its floor too.
+  // met, waits for transfers in flight or a conversion's memory, or finds
+  // nothing left that the directive lets it take: with hostShort, no lane
+  // converts and the store is at its floor too.
   [[nodiscard]] MemoryReclaimResult reclaimMemory(const MemoryReclaimDirective &directive);
   // Takes back one chunk of the expert store toward its cap
   // (Model::growExperts) for the control pass, which decides when memory
@@ -684,7 +687,6 @@ private:
   // refused buffers of its own takes those of a checkpoint the command
   // captures before it.
   [[nodiscard]] uint32_t reserveCaptures(Request &request, const BatchItem &item,
-                                         ReclaimClass upTo,
                                          std::vector<StateCapture> &states,
                                          std::vector<Capture> &captures);
   // Takes the buffers of the state of class `kind` the lane's command
@@ -709,24 +711,36 @@ private:
   // (Cache::reclaimOneState) at a time, until `take` gets them, nothing more
   // of the class goes, or the extents given cover one state; true once
   // `take` got them. Between commands only. The prompt's replay point, once
-  // nothing else of its class goes, takes the expert store's chunks above its
-  // floor (releaseExpertChunk), one at a time until they cover its buffers,
-  // while the host lets the engine grow, and only then another request's
-  // state in use (Cache::reclaimInUseState).
+  // nothing else of its class goes at once, climbs the ladder every refusal
+  // of the engine's limit climbs while the host lets the engine grow: the
+  // cache nothing in use holds that needs a copy on the SSD cache first,
+  // then escalate()'s rungs short of what is in use, until they cover its
+  // buffers; memory on its way back refuses it for now. Only then does
+  // another request's state in use go (Cache::reclaimInUseState).
   template <class Take> [[nodiscard]] bool makeStateRoom(StateClass kind, Take &&take);
-  // The reclaim steps for a lane's state and for KV pages the engine's limit
-  // refused. Idle memory of the kind refused stays for it to reuse; idle
-  // memory of the other kind is released first. Each takes cache up to the
-  // class allocate() is given. Memory for later, an optional allocation of
-  // the model's memory, takes no rebuildable cache of the model's and keeps
-  // the next request's empty extent. Both take a chunk of the expert store
-  // above its floor between the cache nothing in use holds and what is in
-  // use. Memory for later and an optional allocation take neither: growth
-  // that only shortens a command or fills a cache takes nothing ranked above
-  // the cache nothing in use holds.
+  // The rungs above the cache nothing in use holds that every refusal of the
+  // engine's limit climbs, one step a call (Engine.cpp has the ladder): a
+  // Resident lane converting to Spill on a target whose KV can live on the
+  // SSD cache, the requester's own first (`convertRequester`), whose memory
+  // is on its way back (pending), as Spill lanes' owed copies' is; a chunk
+  // of the expert store above its floor; what is in use (`takeInUse`).
+  // Between commands only.
+  [[nodiscard]] CacheReclaimResult escalate(const std::function<bool()> &convertRequester,
+                                            const std::function<CacheReclaimResult()> &takeInUse);
+  // The reclaim steps for a lane's state (and the model's memory for reading
+  // spilled KV) and for KV pages the engine's limit refused. Idle memory of
+  // the kind refused stays for it to reuse; idle memory of the other kind is
+  // released first. Each takes the cache nothing in use holds, then climbs
+  // escalate()'s rungs, what is in use only up to the class allocate() is
+  // given. Memory for later, an optional allocation of the model's memory,
+  // takes no rebuildable cache of the model's and keeps the next request's
+  // empty extent. Memory for later and an optional allocation climb no rung:
+  // growth that only shortens a command or fills a cache takes nothing ranked
+  // above the cache nothing in use holds.
   [[nodiscard]] CacheReclaimResult reclaimForState(ReclaimClass upTo, bool forLater = false);
   [[nodiscard]] CacheReclaimResult reclaimForKv(const TokenAdmission &admission,
-                                                ReclaimClass upTo, bool optional);
+                                                ReclaimClass upTo, bool optional,
+                                                const std::function<bool()> &convertRequester);
   // Each gives back one chunk of the expert store above its floor
   // (Model::releaseExpertChunk), or every one (Model::releaseExpertsToFloor),
   // and counts the step; their bytes, or zero.
@@ -779,6 +793,24 @@ private:
   // running.
   [[nodiscard]] std::function<bool(const Denial &)>
   spillFallback(Request &request, const CacheLookup *restoring = nullptr);
+  // Converts a Resident lane to Spill on a target whose KV can live on the
+  // SSD cache (Cache::convertToSpill), committing its projection's pages
+  // without a copy, the chain it holds or, at admission, the one it restores
+  // (`restoring`) counted; false when it cannot (no SSD cache, the tier
+  // closed, its quota short, or a lane already Spill) or must not: a lane
+  // between the passes of a command, which reads all its history from
+  // memory. Its pages whose copies landed spill at once, but in a command
+  // whose lanes' forms are reserved already (commandShaped_).
+  [[nodiscard]] bool convertToSpill(Request &request, const CacheLookup *restoring = nullptr);
+  // Whether converting the lane to Spill gives memory back: whether the Full
+  // pages it holds past those a Spill request keeps Full (its dense, window
+  // and prefill groups' pages, SpillGeometry::spillFloorBytes) outweigh the
+  // hot block cache its reads then add (SpillGeometry::laneReadBytes).
+  [[nodiscard]] bool spillFrees(const Request &request) const;
+  // Converts the Resident lane holding the most KV whose conversion gives
+  // memory back (spillFrees), among those whose admission is complete;
+  // false when none can.
+  [[nodiscard]] bool convertLargestResidentLane();
   // What a lane does about memory it could not get, the sooner way back
   // first. Pending memory returns by itself: the lane waits. While other
   // lanes hold memory or the host refuses it, a running lane yields its
@@ -812,12 +844,15 @@ private:
   // when that gives nothing, a request in service retries as one
   // (EngineConfig::serving), which only the engine's limit and critical
   // pressure refuse. A refusal from the engine's limit reclaims cache and,
-  // unless the allocation is optional, a chunk of the expert store above its
-  // floor before anything in use (reclaimForState, reclaimForKv). When
-  // neither gives anything, fallback, given the denial so far, may let go of
-  // what the request itself pins or turn its KV to Spill, which allocates
-  // nothing, so the host's refusal offers it too; the allocation is then
-  // attempted again. An optional allocation, whose refusal only shortens a
+  // unless the allocation is optional, climbs escalate()'s rungs: a KV
+  // allocation's own conversion to Spill (through fallback), another
+  // Resident lane's, a chunk of the expert store above its floor, then what
+  // is in use (reclaimForState, reclaimForKv). When none gives anything,
+  // fallback, given the denial so far, may let go of what the request itself
+  // pins or turn its KV to Spill, which allocates nothing, so the host's
+  // refusal offers it too; the allocation is then attempted again. Memory on
+  // its way back, another lane's conversion included, leaves the denial
+  // pending: the request waits. An optional allocation, whose refusal only shortens a
   // command or leaves memory for later, records no failure
   // (allocationFailed_).
   template <class Attempt>
@@ -905,6 +940,11 @@ private:
   EngineEventSink &events_;
   Scheduler scheduler_;
   std::unordered_map<uint64_t, Request> requests_;
+  // Set while prepare() reserves the memory its lanes' KV forms need (the
+  // reads of spilled KV) and after: a lane that converts to Spill from then
+  // on keeps its pages Full in that command, which the next one's start
+  // spills (Cache::spillWritten). False between commands.
+  bool commandShaped_ = false;
   // Pressure preempted work, a lane is still resident, and memory is still
   // short (growth is paused or allocationFailed_), up to the drain's end.
   [[nodiscard]] bool drainingForRecovery() const;

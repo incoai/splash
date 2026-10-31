@@ -437,20 +437,26 @@ off` loads every expert, as a SIZE that holds them all does.
   a file was written) fails its command, and every later load fails too.
 - The chunks above the floor are elastic. Where requests need memory the
   engine's limit refuses, or the host is really short (its headroom below
-  the margin a reclaim pass keeps, or macOS reporting critical pressure;
-  macOS's warning alone never), the engine first evicts the cached prefixes
-  nothing in use holds, waiting for those whose copy to the SSD cache is
-  being written, then gives back the store's last chunk, one at a time, and
-  only then anything in use
-  ([admission and eviction](internals.md#admission-and-eviction)). A chunk
+  the margin a reclaim pass keeps; macOS's warning alone never), the engine
+  first evicts the cached prefixes nothing in use holds, waiting for those
+  whose copy to the SSD cache is being written; on a target whose KV can
+  stay on the SSD cache it then [spills](#kv-on-the-ssd) a request whose KV
+  is in memory; then it gives back the store's last chunk, one at a time,
+  and only then anything in use
+  ([admission and eviction](internals.md#admission-and-eviction)). The
+  order is the same whichever of these is short: a request's KV, its state,
+  the memory for reading spilled KV, or the host's headroom. A chunk
   given back keeps its experts that fit: they are copied to free slots below
   it, the experts the slots' recycling would recycle first evicted to make
   room, and later steps read the evicted ones from the SSD again. Critical
-  pressure takes the store down to its floor at once, in one copy per format
-  rather than one per chunk. Once memory allows again, between commands,
-  the store takes one chunk back per pass, its slots empty, as long as macOS
-  reports no memory pressure, no request waits for memory, 30 s have passed
-  since a chunk last went and the weights are not released. While the
+  pressure takes the store down to its floor at once, spilling no request
+  first, in one copy per format rather than one per chunk. Once memory
+  allows again, between commands, the store takes one chunk back per pass,
+  its slots empty, as long as macOS reports no memory pressure, no request
+  waits for memory, 30 s have passed since a chunk last went and the
+  weights are not released. A chunk taken back that goes again within that
+  wait doubles it, up to 4 minutes, since the requests still needed its
+  memory; one that stays for the whole wait restores it. While the
   engine holds a request, resident or queued, the chunk takes only memory
   `--max-memory` leaves free, and only while the host has the chunk and
   2 GiB to spare. With none, the chunk is an exchange, the store ranking
@@ -675,7 +681,15 @@ what memory holds, as a dense target's is.
   spills. A request in memory whose KV cannot grow spills from then on
   rather than yield its lane or fail: its pages whose copies landed before,
   as a prefix restored from the SSD cache has them, spill at once, and it
-  waits while the others' copies land.
+  waits while the others' copies land. When any other memory is short, a
+  state, a spilling request's reads, or the host's, the request in memory
+  holding the most KV spills the same way, once the cached prefixes nothing
+  in use holds are gone and before the [expert store](#streamed-experts)
+  gives a chunk back: spilled, its KV needs only its dense and window pages
+  and the index of the rest, while every decode step reads the experts. A
+  request that cannot spill, the SSD cache closed or its quota short, or
+  whose KV fits in the pages a spilling request keeps whole anyway, keeps
+  its KV in memory, and the store gives the chunk back.
 - A spilling request writes each committed page once to the SSD cache. Once
   the copy has landed, the page keeps only its index, 24 KiB of the int8
   page's 414 KiB. Alone at the memory wall, it waits while its writes land

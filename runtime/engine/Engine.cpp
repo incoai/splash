@@ -1046,25 +1046,53 @@ void Engine::waitForDiskQuota(Request &active, double now) {
   deferResourceRetry(active, now, {.diskQuota = true});
 }
 
+bool Engine::convertToSpill(Request &active, const CacheLookup *restoring) {
+  if (!config_.spill.capable || active.kvMode != KvMode::Resident || active.passCommand)
+    return false;
+  const uint64_t end = restoring ? chainEnd(*restoring) : chainEnd(active);
+  if (!cache_.convertToSpill(active.request.id, spillPages(active, end), !commandShaped_))
+    return false;
+  active.kvMode = KvMode::Spill;
+  scheduler_.setPrefillGroupRows(active.request.id, model_.prefillGroupRows(true));
+  // A start that converts starts as a Spill request, which completeAdmission
+  // counts, and one refused all the same decides its mode afresh at its next
+  // attempt; a lane that ran Resident before converts once.
+  counters_.spill.converted += !restoring || scheduler_.suspended(active.request.id);
+  return true;
+}
+
+bool Engine::spillFrees(const Request &active) const {
+  const SpillGeometry &geometry = config_.spill.geometry;
+  const uint64_t held = kvCapacity(active.request.id);
+  return geometry.residentBytes(held) > geometry.spillFloorBytes(held) + geometry.laneReadBytes;
+}
+
+bool Engine::convertLargestResidentLane() {
+  if (!config_.spill.capable)
+    return false;
+  // A lane being admitted, its chain's restore in flight or its start not
+  // complete, holds the chain it restores, which only its admission's own
+  // conversion counts (spillFallback's `restoring`).
+  const auto admitted = [&](uint64_t id, const Request &active) {
+    const Phase phase = scheduler_.phase(id);
+    return active.lane && !active.restore && (phase == Phase::Prefill || phase == Phase::Decode);
+  };
+  std::vector<std::pair<uint64_t, Request *>> lanes;
+  for (auto &[id, active] : requests_)
+    if (admitted(id, active) && !active.finalized && active.kvMode == KvMode::Resident &&
+        spillFrees(active))
+      lanes.emplace_back(kvCapacity(id), &active);
+  std::ranges::sort(lanes, std::greater{}, &std::pair<uint64_t, Request *>::first);
+  return std::ranges::any_of(lanes, [&](const auto &lane) { return convertToSpill(*lane.second); });
+}
+
 std::function<bool(const Engine::Denial &)> Engine::spillFallback(Request &active,
                                                                   const CacheLookup *restoring) {
   if (!config_.spill.capable)
     return {};
-  // A start that converts starts as a Spill request, which completeAdmission
-  // counts, and one refused all the same decides its mode afresh at its next
-  // attempt; a lane that ran Resident before converts once.
-  const bool started = !restoring || scheduler_.suspended(active.request.id);
   // Memory on its way back comes without it.
-  return [this, &active, restoring, started](const Denial &denial) {
-    if (denial.pending || active.kvMode != KvMode::Resident ||
-        !cache_.convertToSpill(active.request.id,
-                               spillPages(active, restoring ? chainEnd(*restoring)
-                                                            : chainEnd(active))))
-      return false;
-    active.kvMode = KvMode::Spill;
-    scheduler_.setPrefillGroupRows(active.request.id, model_.prefillGroupRows(true));
-    counters_.spill.converted += started;
-    return true;
+  return [this, &active, restoring](const Denial &denial) {
+    return !denial.pending && convertToSpill(active, restoring);
   };
 }
 
@@ -1531,6 +1559,11 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
                                  std::vector<std::vector<Capture>> &captures, double now) {
   const bool prefill = plan.kind == WorkKind::Prefill;
   const bool spill = config_.spill.capable;
+  // However the command is left, the next one's lanes are not shaped yet.
+  struct Shaping final {
+    bool &shaped;
+    ~Shaping() { shaped = false; }
+  } const shaping{commandShaped_};
   // Whether a lane, of the given KV mode if one is named, is in service.
   const auto inService = [&](std::optional<KvMode> mode) {
     return std::any_of(requests_.begin(), requests_.end(), [&](const auto &entry) {
@@ -1645,8 +1678,10 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
   // have made it stream, converting it at once where its restored chain's
   // copies had landed, which the plan, made before, did not know. A lane
   // refused its memory leaves the command, and the lanes after it take that
-  // shape without it.
+  // shape without it. A lane a refusal converts from here on keeps that
+  // shape in this command (commandShaped_).
   if (spill) {
+    commandShaped_ = true;
     std::vector<BatchItem> kept;
     kept.reserve(admitted.size());
     for (const BatchItem &scheduled : admitted) {
@@ -1712,16 +1747,24 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
     plan.items = std::move(admitted);
     std::vector<std::vector<StateCapture>> states(plan.items.size());
     captures.assign(plan.items.size(), {});
+    // A command in passes runs one lane, whose history stays in memory.
+    Request &leader = request(plan.items.front().requestId);
+    const bool leaderResident = leader.kvMode == KvMode::Resident;
     for (size_t index = 0; prefill && index < plan.items.size(); ++index) {
       BatchItem &item = plan.items[index];
       Request &active = request(item.requestId);
-      const uint32_t rows =
-          reserveCaptures(active, item, growthClass(active), states[index], captures[index]);
+      const uint32_t rows = reserveCaptures(active, item, states[index], captures[index]);
       if (rows != item.tokenCount) {
         item.tokenCount = rows;
         ++counters_.captureCuts;
       }
     }
+    // A lane a refusal converted while the command took shape keeps its pages
+    // Full in it, but the next pass's start would spill those whose copies
+    // landed: it runs the command whole, as the spill section has a lane
+    // that streams run it.
+    if (plan.passes > 1 && leaderResident && leader.kvMode == KvMode::Spill)
+      plan.passes = 1;
     // The items come last: making room for a state's buffers may move KV
     // pages out of an extent, which rewrites the page lists of the lanes
     // on them.
@@ -1814,7 +1857,7 @@ Engine::Prepared Engine::prepare(BatchPlan &plan, std::vector<ModelBatchItem> &i
   return Prepared::Yielded;
 }
 
-uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item, ReclaimClass upTo,
+uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
                                  std::vector<StateCapture> &states,
                                  std::vector<Capture> &captures) {
   const uint32_t start = item.promptOffset;
@@ -1876,11 +1919,13 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item, Reclaim
     // The KV up to the next boundary, as prepare() takes the first, but its
     // refusal only ends the command here, which then captures a checkpoint
     // it would have passed: the lane runs, and its next command asks again.
+    // So it takes nothing in use, the host refusing it or not.
     const uint32_t next = index + 1 < boundaries.size() && boundaries[index + 1].tokens < end
                               ? boundaries[index + 1].tokens
                               : end;
     const auto kv = allocate(
-        [&] { return cache_.ensureTokens(active.request.id, next); }, true, upTo, {}, true);
+        [&] { return cache_.ensureTokens(active.request.id, next); }, true, ReclaimClass::Ordinary,
+        {}, true);
     if (!kv.admission.granted()) {
       if (passed)
         static_cast<void>(reserve(index));
@@ -1914,9 +1959,10 @@ Engine::Reservation Engine::reserveCapture(Request &active, StateClass kind, uin
   if (result.fromLane)
     return result;
   // Room comes from what this state's class may take: cached KV unless it
-  // is an optional checkpoint, and the expert store's chunks above its
-  // floor, then states in use, only for the prompt's replay point, which is
-  // in use itself. A pin keeps the lane's checkpoint, if any, out of it.
+  // is an optional checkpoint, and, only for the prompt's replay point,
+  // which is in use itself, the cache that needs a copy on the SSD cache
+  // first, escalate()'s rungs short of what is in use (makeStateRoom), then
+  // states in use. A pin keeps the lane's checkpoint, if any, out of it.
   result.recycled = makeStateRoom(kind, [&] {
     result.buffers = model_.reserveState(id, tokens, refusal);
     return result.buffers != nullptr;
@@ -1958,19 +2004,34 @@ template <class Take> bool Engine::makeStateRoom(StateClass kind, Take &&take) {
   const Room made = makeRoom([&] { return cache_.reclaimOneState(kind, growth); });
   if (made != Room::Exhausted || kind != StateClass::InUse)
     return made == Room::Taken;
-  // The prompt's replay point then takes chunks of the expert store above
-  // its floor, until they cover its buffers, before another request's state
-  // in use, while the host lets the engine grow: the paced reclaim shrinks
-  // the store for the host.
+  // The prompt's replay point then climbs the ladder every refusal of the
+  // engine's limit climbs, while the host lets the engine grow (the paced
+  // reclaim makes room for the host): the cache nothing in use holds whose
+  // memory needs its copy on the SSD cache first, which reclaimOneState
+  // leaves, then escalate()'s rungs short of what is in use, a step at a
+  // time until they cover its buffers. Memory on its way back refuses the
+  // state's buffers: its command ends at the boundary, and the point is kept
+  // as a refused one is, from the lane after the command
+  // (publishReachedStateBoundaries).
   while (growth && released < needed) {
-    const uint64_t chunk = releaseExpertChunk();
-    if (!chunk)
+    CacheReclaimResult step = cache_.reclaimForMemory(ReclaimClass::Ordinary, false);
+    if (!step.madeProgress && !step.pending) {
+      const bool evictedKv = step.evictedKv;
+      step = escalate({}, {});
+      step.evictedKv = step.evictedKv || evictedKv;
+    }
+    if (step.madeProgress || step.evictedKv)
+      signalResourceProgress();
+    if (!step.madeProgress) {
+      if (step.pending)
+        return false;
       break;
-    released += chunk;
-    signalResourceProgress();
+    }
+    released += step.reclaimedBytes;
     if (take())
       return true;
   }
+  // Another request's state in use goes last.
   return makeRoom([&] { return cache_.reclaimInUseState(); }) == Room::Taken;
 }
 
@@ -2075,8 +2136,15 @@ auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
     if constexpr (std::is_same_v<Admission, StateAdmission>)
       reclaimed = paused ? reuseCachedStateWhilePaused(upTo) : reclaimForState(upTo, optional);
     else if constexpr (std::is_same_v<Admission, TokenAdmission>)
+      // A KV allocation's fallback converts its lane to Spill (spillFallback):
+      // the first rung above the cache nothing in use holds.
       reclaimed = paused ? reuseCachedPagesWhilePaused(admission, upTo)
-                         : reclaimForKv(admission, upTo, optional);
+                         : reclaimForKv(admission, upTo, optional, [&] {
+                             return fallback &&
+                                    fallback({.allocationFailure = admission.allocationFailure,
+                                              .pages = admission.additionalPages,
+                                              .form = admission.form});
+                           });
     else
       // The model's memory for reads of spilled KV (a hot block cache floor,
       // a history's staging) takes what a state takes; while the host
@@ -2116,21 +2184,55 @@ auto Engine::allocate(Attempt &&attempt, bool inService, ReclaimClass upTo,
   return result;
 }
 
-// The reclaim step for a lane's state the engine's limit refused. The pooled
-// buffers a lane starts from stay for its activation to take: idle model
-// memory beyond them goes first (a pooled buffer, else the idle vision
-// arena, else one rebuildable cache entry), then the cache gives up what
-// gives memory back: an extent, or a state (Cache::reclaimForMemory), which
-// makes progress, and the allocation is asked for again, only once memory
-// has come back. The KV it evicts before then frees pages other KV may
-// take, so it wakes the requests waiting for memory as progress does. What
-// nothing in use holds goes first, then a chunk of the expert store above
-// its floor (releaseExpertChunk), then, up to InUse, what is in use; memory
-// on its way back holds back the last two.
+// The rungs a refusal of the engine's limit climbs once the cache nothing in
+// use holds gave nothing: each is tried only when the ones below it gave
+// nothing, the same for every allocation the limit refuses (a lane's state,
+// its KV, the model's memory for reading spilled KV, the prompt's replay
+// point) and for a pass the host is short for (reclaimMemory). They rank what
+// a byte is worth where it is:
+// - On a target whose KV can live on the SSD cache, a Resident lane converts
+//   to Spill (convertToSpill): beyond its dense and window pages a page then
+//   keeps only its index in memory, and the rest comes back as the copies
+//   land. The requester's own lane goes first (`convertRequester`): that
+//   allocates nothing, and the allocation is tried again. While the copies
+//   Spill lanes owe return an extent's Full pages as they land
+//   (Cache::owedCopiesReturn), that memory is on its way (pending), and
+//   nothing more converts or goes for it. Otherwise the lane holding the
+//   most KV converts (convertLargestResidentLane), its memory on its way
+//   too: an attempt that finds it fell short climbs on, to the next lane
+//   and then the store, so each lane that converts delays the store by one
+//   attempt at most. A target whose KV stays in memory skips this rung, and
+//   so does one whose lanes would give back less than spilling costs them.
+// - Then one chunk of the expert store above its floor, which every decode
+//   step of a streamed MoE target reads.
+// - Then what is in use (`takeInUse`), which only work that would not yield
+//   for it may take.
+CacheReclaimResult Engine::escalate(const std::function<bool()> &convertRequester,
+                                    const std::function<CacheReclaimResult()> &takeInUse) {
+  if (convertRequester && convertRequester())
+    return {.madeProgress = true};
+  if (cache_.owedCopiesReturn(0, kv::PageForm::Full) || convertLargestResidentLane())
+    return {.pending = true};
+  if (const uint64_t chunk = releaseExpertChunk())
+    return {.madeProgress = true, .reclaimedBytes = chunk};
+  return takeInUse ? takeInUse() : CacheReclaimResult{};
+}
+
+// The reclaim step for a lane's state, or the model's memory for reading
+// spilled KV, the engine's limit refused. The pooled buffers a lane starts
+// from stay for its activation to take: idle model memory beyond them goes
+// first (a pooled buffer, else the idle vision arena, else one rebuildable
+// cache entry), then the cache nothing in use holds gives up what gives
+// memory back: an extent, or a state (Cache::reclaimForMemory), starting the
+// copies to the SSD cache what it takes needs, whose memory is then on its
+// way back. The KV it evicts before then frees pages other KV may take, so it
+// wakes the requests waiting for memory as progress does. Then the rungs
+// above it (escalate), what is in use only up to InUse; memory on its way
+// back holds them back.
 // Memory for later (the hot block cache's growth toward its planned size,
 // any optional allocation) takes no rebuildable cache entry, among which
 // that very cache's slots past its floor are, nor the empty extent kept for
-// the next request, nor the expert store, nor anything in use.
+// the next request, nor any rung above the cache nothing in use holds.
 // A host refusal comes to neither step but to the reuse path (allocate()):
 // the pressure controller owns that shrink, and evicting for an allocator
 // that refuses all the same would drain the cache, and the caches the model
@@ -2141,15 +2243,12 @@ CacheReclaimResult Engine::reclaimForState(ReclaimClass upTo, bool forLater) {
     return {true, 0};
   CacheReclaimResult reclaimed = cache_.reclaimForMemory(ReclaimClass::Ordinary, forLater);
   if (!reclaimed.madeProgress && !reclaimed.pending && !forLater) {
-    if (const uint64_t chunk = releaseExpertChunk()) {
-      signalResourceProgress();
-      return {.madeProgress = true, .reclaimedBytes = chunk, .evictedKv = reclaimed.evictedKv};
-    }
-    if (upTo == ReclaimClass::InUse) {
-      const bool evictedKv = reclaimed.evictedKv;
-      reclaimed = cache_.reclaimForMemory(ReclaimClass::InUse, forLater);
-      reclaimed.evictedKv = reclaimed.evictedKv || evictedKv;
-    }
+    const bool evictedKv = reclaimed.evictedKv;
+    reclaimed = escalate({}, [&] {
+      return upTo == ReclaimClass::InUse ? cache_.reclaimForMemory(ReclaimClass::InUse, forLater)
+                                         : CacheReclaimResult{};
+    });
+    reclaimed.evictedKv = reclaimed.evictedKv || evictedKv;
   }
   if (reclaimed.madeProgress || reclaimed.evictedKv)
     signalResourceProgress();
@@ -2158,17 +2257,18 @@ CacheReclaimResult Engine::reclaimForState(ReclaimClass upTo, bool forLater) {
 
 // The reclaim step for KV pages the engine's limit refused. Allocated extents
 // stay for the pages to reuse; idle state memory beyond the lane's pooled
-// buffers goes first, then the cache gives up what covers the shortfall, of
-// the pages' form, in one step: what nothing in use holds, then a chunk of
-// the expert store above its floor (releaseExpertChunk), then, up to InUse,
-// what is in use; memory on its way back holds back the last two, and so
-// does an optional allocation (a capture's KV past its first boundary, whose
-// refusal only ends the command early). The lane's buffers go last. Their
-// draft ring is the one buffer no cached state holds: while it stays, a
-// request that waits can start beside this one from cached states' cells and
-// windows.
+// buffers goes first, then the cache nothing in use holds gives up what
+// covers the shortfall, of the pages' form, in one step, starting the copies
+// what it takes needs; then the rungs above it (escalate), the requester's
+// own conversion to Spill first (`convertRequester`), what is in use only up
+// to InUse. Memory on its way back holds the rungs back, and so does an
+// optional allocation (a capture's KV past its first boundary, whose refusal
+// only ends the command early). The lane's buffers go last. Their draft ring
+// is the one buffer no cached state holds: while it stays, a request that
+// waits can start beside this one from cached states' cells and windows.
 CacheReclaimResult Engine::reclaimForKv(const TokenAdmission &admission, ReclaimClass upTo,
-                                        bool optional) {
+                                        bool optional,
+                                        const std::function<bool()> &convertRequester) {
   if (reclaimIdleState(true, model::IdleMemory::BuffersThenCaches))
     return {true, 0};
   const auto reclaimPages = [&](ReclaimClass reach) {
@@ -2176,14 +2276,10 @@ CacheReclaimResult Engine::reclaimForKv(const TokenAdmission &admission, Reclaim
                                   admission.form);
   };
   CacheReclaimResult reclaimed = reclaimPages(ReclaimClass::Ordinary);
-  if (!reclaimed.madeProgress && !reclaimed.pending && !optional) {
-    if (const uint64_t chunk = releaseExpertChunk()) {
-      signalResourceProgress();
-      return {.madeProgress = true, .reclaimedBytes = chunk};
-    }
-    if (upTo == ReclaimClass::InUse)
-      reclaimed = reclaimPages(ReclaimClass::InUse);
-  }
+  if (!reclaimed.madeProgress && !reclaimed.pending && !optional)
+    reclaimed = escalate(convertRequester, [&] {
+      return upTo == ReclaimClass::InUse ? reclaimPages(ReclaimClass::InUse) : CacheReclaimResult{};
+    });
   if (reclaimed.madeProgress)
     signalResourceProgress();
   if (!reclaimed.madeProgress && !reclaimed.pending &&
@@ -2375,6 +2471,9 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
     }
   };
   reclaimModelCaches();
+  // Whether the pass stopped on memory on its way back rather than on nothing
+  // left to take.
+  bool pending = false;
   // The expert store's chunks above its floor go after what nothing in use
   // holds and before what is in use.
   if (directive.critical) {
@@ -2405,20 +2504,24 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
       return false;
     };
     // Cache nothing in use holds that waits for a transfer, an SSD demotion
-    // or a state write, still ranks below the store and what is in use: the
-    // pass ends Pending, and the pass that continues it once the transfer
-    // landed takes it first.
-    if (!reclaimUpTo(ReclaimClass::Ordinary)) {
-      if (directive.hostShort)
-        while (targetUnmet()) {
-          const uint64_t chunk = releaseExpertChunk();
-          if (!chunk)
-            break;
-          released += chunk;
-        }
-      if (directive.upTo == ReclaimClass::InUse)
-        static_cast<void>(reclaimUpTo(ReclaimClass::InUse));
-    }
+    // or a state write, still ranks below the rungs above it: the pass ends
+    // Pending, and the pass that continues it once the transfer landed takes
+    // it first. A host that is really short then climbs escalate()'s rungs
+    // short of what is in use, a Resident lane's conversion to Spill before
+    // the expert store; what a conversion frees comes back as its copies
+    // land, or at the next command's start, which the pass waits for as
+    // well: the pass that continues it takes the extents its pages empty.
+    pending = reclaimUpTo(ReclaimClass::Ordinary);
+    if (!pending && directive.hostShort)
+      while (targetUnmet()) {
+        const CacheReclaimResult step = escalate({}, {});
+        pending = step.pending;
+        if (!step.madeProgress)
+          break;
+        released += step.reclaimedBytes;
+      }
+    if (!pending && directive.upTo == ReclaimClass::InUse)
+      static_cast<void>(reclaimUpTo(ReclaimClass::InUse));
   }
   // Image rows only an evicted state held are ordinary cache entries now.
   reclaimModelCaches();
@@ -2428,8 +2531,8 @@ MemoryReclaimResult Engine::reclaimMemory(const MemoryReclaimDirective &directiv
     return {released, ReclaimOutcome::Untargeted};
   if (!targetUnmet())
     return {released, ReclaimOutcome::Met};
-  return {released, cache_.transfersInFlight() ? ReclaimOutcome::Pending
-                                               : ReclaimOutcome::Exhausted};
+  return {released, pending || cache_.transfersInFlight() ? ReclaimOutcome::Pending
+                                                          : ReclaimOutcome::Exhausted};
 }
 
 void Engine::apply(const Pending &command, std::span<const ModelStepResult> results,

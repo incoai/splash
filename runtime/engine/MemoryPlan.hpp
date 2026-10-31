@@ -125,6 +125,8 @@ struct KvSpillPlan final {
   uint32_t groupPages = 0;
   uint64_t slotBytes = 0;
   uint64_t laneSlots = 0;
+  // The hot block cache one more lane decoding over Index pages adds.
+  uint64_t laneReadBytes = 0;
   uint64_t hotFloorBytes = 0;
   uint64_t hotTargetBytes = 0;
   // The most the hot cache holds: its target, or the floor of every lane
@@ -410,6 +412,9 @@ struct SpillGeometry final {
   uint32_t densePages = 0;
   uint32_t windowPages = 0;
   uint32_t groupPages = 0;
+  // What the readers of a Spill request's spilled KV add once it decodes:
+  // one lane's more of the hot block cache (KvSpillPlan::laneReadBytes).
+  uint64_t laneReadBytes = 0;
 
   // A Resident request's KV at `tokens` tokens: its pages, Full.
   [[nodiscard]] uint64_t residentBytes(uint64_t tokens) const noexcept { return pages(tokens) * fullPageBytes; }

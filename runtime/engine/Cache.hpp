@@ -459,9 +459,10 @@ public:
   // Turns a Resident request whose growth was denied into a Spill request:
   // checks the tier, the write budget and the room for `pages` pages,
   // commits them, starts write-through of its published blocks and moves
-  // those whose copies landed already into free Index pages. It allocates
-  // nothing; false, changing nothing, when spilling cannot relieve it.
-  [[nodiscard]] bool convertToSpill(uint64_t requestId, uint32_t pages);
+  // those whose copies landed already into free Index pages, at once or,
+  // without `spillNow`, at the next spillWritten(). It allocates nothing;
+  // false, changing nothing, when spilling cannot relieve it.
+  [[nodiscard]] bool convertToSpill(uint64_t requestId, uint32_t pages, bool spillNow = true);
   // The blocks on the chain that ends at this block (none for 0) whose K/V
   // has a copy, landed or being written: pages of a Spill request that
   // holds them need no commitment.

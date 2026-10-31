@@ -1089,7 +1089,7 @@ bool Cache::commitSpill(uint64_t requestId, uint32_t pages) {
   return kvTierWritable() && commit(active, pages);
 }
 
-bool Cache::convertToSpill(uint64_t requestId, uint32_t pages) {
+bool Cache::convertToSpill(uint64_t requestId, uint32_t pages, bool spillNow) {
   Request &active = request(requestId);
   if (!spill_ || active.mode == KvMode::Spill || spillGate() != SpillGate::Open ||
       !commit(active, pages))
@@ -1100,11 +1100,12 @@ bool Cache::convertToSpill(uint64_t requestId, uint32_t pages) {
   // The blocks it shares with Spill requests may spill now, and its own
   // writes start at once: what lands frees pages its retry waits for
   // (pendingPages). Its blocks whose copies landed before, as a chain it
-  // restored has them, spill at once into free Index pages, whose Full
-  // pages the retry takes.
+  // restored has them, spill into free Index pages, whose Full pages the
+  // retry takes: at once, or at the next spillWritten().
   rescanSpills();
   static_cast<void>(writeThrough());
-  static_cast<void>(moveLandedPages(false));
+  if (spillNow)
+    static_cast<void>(moveLandedPages(false));
   return true;
 }
 

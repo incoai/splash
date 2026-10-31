@@ -85,13 +85,21 @@ void MemoryControl::noteExpertReleases(double now) {
   if (releases == expertReleases_)
     return;
   expertReleases_ = releases;
+  if (expertGrowthMilliseconds_ && now - *expertGrowthMilliseconds_ < expertCooldownMilliseconds_)
+    expertCooldownMilliseconds_ =
+        std::min(2 * expertCooldownMilliseconds_, kExpertGrowthCooldownLimitMilliseconds);
+  expertGrowthMilliseconds_.reset();
   expertReleaseMilliseconds_ = now;
 }
 
 void MemoryControl::growExperts(const MemoryGovernorSnapshot &memory, bool requestWaiting,
                                 double now) {
+  if (expertGrowthMilliseconds_ && now - *expertGrowthMilliseconds_ >= expertCooldownMilliseconds_) {
+    expertGrowthMilliseconds_.reset();
+    expertCooldownMilliseconds_ = kExpertGrowthCooldownMilliseconds;
+  }
   if (requestWaiting || !memory.hostGrowthAllowed ||
-      (expertReleaseMilliseconds_ && now - *expertReleaseMilliseconds_ < kExpertGrowthCooldownMilliseconds))
+      (expertReleaseMilliseconds_ && now - *expertReleaseMilliseconds_ < expertCooldownMilliseconds_))
     return;
   const uint64_t bytes = loop_.expertGrowthBytes();
   if (!bytes)
@@ -114,6 +122,8 @@ void MemoryControl::growExperts(const MemoryGovernorSnapshot &memory, bool reque
     const GrowthCredit credit(governor_, returned);
     grown = loop_.growExperts(memory.headroomBytes + returned);
   }
+  if (grown)
+    expertGrowthMilliseconds_ = now;
   if (grown || returned)
     static_cast<void>(backend_.refreshMemoryStats());
 }

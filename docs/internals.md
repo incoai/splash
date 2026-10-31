@@ -1143,8 +1143,11 @@ that continues it once the transfer landed takes that cache first. macOS's
 warning alone never takes the store. Once memory allows again the control
 pass takes one chunk back per pass, its slots empty: when macOS reports no
 memory pressure, no request waits for memory, the host lets growth go on, the
-weights are neither released nor being restored, and 30 s have passed since a
-chunk last went. The chunk takes from the host only its headroom beyond the
+weights are neither released nor being restored, and the cool-down has passed
+since a chunk last went: 30 s, doubled up to 4 minutes each time a chunk taken
+back goes again within it, which shows the requests still needed its memory,
+and back to 30 s once a chunk taken back stays for a whole cool-down
+(`MemoryControl`). The chunk takes from the host only its headroom beyond the
 2 GiB recovery margin, and from the engine only room `--max-memory` leaves
 free. While the engine holds any request, resident, queued or draining, it
 takes only that. With none the chunk is an exchange for cache nothing in use
@@ -1216,10 +1219,34 @@ holds and before what is in use, in one compaction per format. Refused at
 `--max-memory`, a lane's state, or the model's memory for reading KV from the
 SSD cache, takes cached KV only while evicting it can empty an extent, and is
 tried again only once an extent or a state has gone. Any growth `--max-memory`
-refuses, a start's beside a resident request too, takes a chunk of the expert
-store above its floor once nothing outside what is in use is left and before
-anything in use, and is tried again; so does the prompt's replay point before
-it recycles another request's state in use. Growth that only shortens a command
+refuses, a start's beside a resident request too, then climbs one ladder
+(`Engine::escalate`), a rung only when the ones below gave nothing. On a
+target whose KV can live on the SSD cache, a Resident lane converts to
+Spill, which allocates nothing and gives its pages back as their copies
+land: the requester's own lane first, and the allocation is tried again at
+once; else, unless the copies Spill lanes owe already bring an extent's
+pages back, the lane holding the most KV whose Full pages past those a Spill
+lane keeps outweigh the hot block cache its reads add, and the request waits
+for that memory. An attempt that finds it fell short climbs on, to the next
+lane and then the store, so each conversion delays the store by one attempt
+at most. Then a chunk of the expert store above its floor; then, for work
+that may, anything in use. Only lanes whose admission is complete convert
+this way. A lane that cannot convert, the tier closed or its quota short,
+is passed over, as on a target whose KV stays in memory, and so is a lane
+between the passes of its prefill command, which reads its whole history
+from memory. A lane converted once the command being built has reserved its
+lanes' reads of spilled KV keeps its pages Full in that command, and the
+next command's start spills those whose copies landed; a command in passes
+whose lane converted so, its history now one that streams, runs whole. The
+prompt's replay point climbs the same rungs short of what is in use before
+it recycles another request's state in use, after the cache nothing in use
+holds whose KV needs its copy on the SSD cache first: it starts that copy,
+and while memory is on its way the command ends at the boundary without the
+state's buffers, and the point is kept from the lane after the command, as
+a refused one is. A paced pass the host is really short for climbs them
+too, short of what is in use, once its cache waits for no transfer, and
+ends Pending while a conversion's memory is on its way.
+Growth that only shortens a command
 (the KV a prefill captures past its first state boundary) or leaves memory for
 later takes neither the store nor anything in use, a junction or checkpoint
 capture never takes the store, and neither does a refusal of the host, which
@@ -1235,8 +1262,9 @@ becomes the newest ordinary state; the older points on its chain keep their age.
 Cache victims come in three classes: checkpoints, then ordinary states and KV
 (first the KV no state restores through, which saves no prefill), then what is
 in use. No work displaces anything of a class above its own. The expert store's
-chunks above its floor rank between the last two: they go once nothing ordinary
-is left, before anything in use, for work that may take what is in use and for
+chunks above its floor rank between the last two, just above a Resident lane's
+conversion to Spill: they go once nothing ordinary is left and no lane can
+convert, before anything in use, for work that may take what is in use and for
 needed growth whose class stops at ordinary, but never for growth that only
 shortens a command or leaves memory for later, which takes nothing in use
 either. One exception is kept: a paced pass a request waits for under macOS's

@@ -2094,8 +2094,9 @@ void settleCommand(engine::NativeRuntime &loop) {
 // recovery margin to spare beyond the chunk, or the idle engine returns the
 // rest to the system first, no request waits for memory, the weights are
 // neither released nor being restored, and the cool-down after reclaim last
-// gave a chunk back has passed. Beside a resident lane it takes only room
-// the engine's limit has free, and asks for none it lacks.
+// gave a chunk back has passed, twice as long after a chunk it took back
+// went again. Beside a resident lane it takes only room the engine's limit
+// has free, and asks for none it lacks.
 void testControlPassGrowsTheExpertStoreWhenMemoryIsAmple() {
   engine::NativeLoopConfig config;
   config.engine.maxContext = 1024;
@@ -2159,7 +2160,9 @@ void testControlPassGrowsTheExpertStoreWhenMemoryIsAmple() {
   runUntilIdle(loop);
 
   // A host short of the warning margin takes a chunk back; the store grows
-  // again only once the cool-down after it has passed.
+  // again only once the cool-down after it has passed. The chunk last taken
+  // back has stayed for a cool-down, which keeps it at its 30 s.
+  fixture.monotonic += kExpertGrowthCooldownMilliseconds;
   available = hostReserve + kHostWarningMarginBytes / 2;
   require(pass() == 2 && loop.expertReleases() == 1,
           "a short host did not take a chunk of the store");
@@ -2180,6 +2183,25 @@ void testControlPassGrowsTheExpertStoreWhenMemoryIsAmple() {
   runUntilIdle(loop);
   require(!fixture.weights.released() && pass() == 3,
           "the store did not grow once the weights were back");
+
+  // A chunk taken back that goes again within the cool-down doubles the
+  // next; one that stays for a whole cool-down restores it.
+  available = hostReserve + kHostWarningMarginBytes / 2;
+  const uint64_t releases = loop.expertReleases();
+  require(pass(1000.0) == 2 && loop.expertReleases() == releases + 1,
+          "a short host did not take the chunk taken back");
+  available = hostReserve + (16ULL << 30);
+  require(pass(kExpertGrowthCooldownMilliseconds) == 2 &&
+              pass(kExpertGrowthCooldownMilliseconds - 1.0) == 2,
+          "the store grew back within twice the cool-down after a chunk it took back went");
+  require(pass(1.0) == 3, "the store did not grow back after twice the cool-down");
+  require(pass(2 * kExpertGrowthCooldownMilliseconds) == 4 && pass(kExpertGrowthCooldownMilliseconds) == 4,
+          "the store did not grow to its cap");
+  available = hostReserve + kHostWarningMarginBytes / 2;
+  require(pass(1000.0) == 3, "a short host did not take a chunk");
+  available = hostReserve + (16ULL << 30);
+  require(pass(kExpertGrowthCooldownMilliseconds - 1001.0) == 3 && pass(1001.0) == 4,
+          "a chunk that stayed for the cool-down did not restore it");
 }
 
 // A conversation that finishes leaves its replay point, and a prompt of its
