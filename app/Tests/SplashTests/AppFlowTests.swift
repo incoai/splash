@@ -33,9 +33,12 @@ enum AppFlow {
     }
 }
 
+/// A class, so that each test's instance, which Swift Testing lets go as the test ends, however it
+/// ends, quits what the test started: the server, a download. A test that failed threw before its
+/// own stop, and left the model server running, its model resident beside the next run's.
 @MainActor
 @Suite(.serialized, .enabled(if: AppFlow.models != nil))
-struct AppFlowTests {
+final class AppFlowTests {
     static let environment = AppFlow.environment
     static let models = AppFlow.models
     static let port = AppFlow.port
@@ -62,8 +65,12 @@ struct AppFlowTests {
         #expect(!state.server.running)
     }
 
+    isolated deinit {
+        state.quit()
+    }
+
     @Test func thisMacIsSupportedAndGetsSuggestions() async throws {
-        #expect(state.runtime.unsupportedReason() == nil)
+        #expect(await state.runtime.unsupportedReason() == nil)
         let suggestions = state.catalog.suggestions(memory: Catalog.memory)
         print("Suggested for \(Catalog.memory) GB: \(suggestions.map(\.id))")
         #expect(!suggestions.isEmpty)
@@ -102,6 +109,7 @@ struct AppFlowTests {
         let conversation = try #require(state.chats.current)
         #expect(conversation.messages.map(\.role) == [.user, .assistant])
         #expect(conversation.messages[1].model == model)
+        state.chats.flush()
         #expect(ChatStore(folder: chats).conversations.first?.messages == conversation.messages, "saved")
         await Snapshot.save("chat-ready", MainView().environment(state))
         #expect(state.server.requestLog.contains { $0.outcome == .done && ($0.output ?? 0) > 0 })

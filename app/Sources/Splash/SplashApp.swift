@@ -114,6 +114,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
+    /// The chats' files written before the app ends, a reply stopped as it quit among them.
+    func applicationWillTerminate(_ notification: Notification) {
+        state.chats.flush()
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let state = state
         guard state.busy else { return .terminateNow }

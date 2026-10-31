@@ -76,6 +76,63 @@ final class ChildProcess: @unchecked Sendable {
     }
 }
 
+/// A program run to its end for what it says on its error output, as the engine's device check
+/// is: its exit status and that output, read as it writes it, so that it never waits on a pipe
+/// nobody reads; nil where it does not start. One still running after `timeout` is ended, and so
+/// is one whose caller no longer waits for it. The read and the wait for its end hold no thread of
+/// Swift's own pool: waitUntilExit there once never returned for a process that had exited.
+enum Program {
+    static func run(_ command: [String], timeout: Duration) async -> (status: Int32, error: String)? {
+        let process = Process(), errors = Pipe()
+        process.executableURL = URL(filePath: command[0])
+        process.arguments = Array(command.dropFirst())
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = errors
+        let ended = AsyncStream<Void> { continuation in process.terminationHandler = { _ in continuation.finish() } }
+        guard (try? process.run()) != nil else { return nil }
+        let deadline = Task {
+            try? await Task.sleep(for: timeout)
+            if process.isRunning { process.terminate() }
+        }
+        defer { deadline.cancel() }
+        return await withTaskCancellationHandler {
+            let error = String(decoding: await reading(errors.fileHandleForReading), as: UTF8.self)
+            await end(ended)
+            return (process.terminationStatus, error)
+        } onCancel: {
+            if process.isRunning { process.terminate() }
+        }
+    }
+
+    /// Waits for `ended`, the stream a process's termination handler finishes, to finish: in a task
+    /// of its own, which the caller's cancellation does not reach. A cancelled task's `for await`
+    /// returns at once, before the process has exited, and terminationStatus, read then, raises
+    /// "task still running".
+    private static func end(_ ended: AsyncStream<Void>) async {
+        await Task { for await _ in ended {} }.value
+    }
+
+    /// Reads what a program writes to `handle` as it writes it, until the program ends: on a thread
+    /// of its own, blocking there, rather than on FileHandle's async bytes, which read every handle
+    /// on one actor.
+    private static func reading(_ handle: FileHandle) async -> Data {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                var data = Data()
+                var chunk = [UInt8](repeating: 0, count: 65536)
+                while true {
+                    let count = read(handle.fileDescriptor, &chunk, chunk.count)
+                    if count < 0 && errno == EINTR { continue }
+                    guard count > 0 else { break }
+                    data.append(contentsOf: chunk[..<count])
+                }
+                continuation.resume(returning: data)
+            }
+        }
+    }
+}
+
 /// Follows a log file as it grows, one call per complete line, on the main queue.
 @MainActor
 final class LogTail {

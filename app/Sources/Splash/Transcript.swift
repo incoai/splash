@@ -19,6 +19,8 @@ final class Transcript: NSObject {
     private(set) var webView: WKWebView?
     /// Whether the page has loaded, and takes data.
     private(set) var loaded = false
+    /// When the page's process ended lately, which bounds how often it loads again.
+    private var terminations: [ContinuousClock.Instant] = []
     /// What the page shows, or will once it has loaded.
     private var shown: TranscriptPage?
 
@@ -130,9 +132,13 @@ extension Transcript: WKNavigationDelegate {
     }
 
     /// The page's process ended, as when the system took its memory back: the page loads again
-    /// and shows what it showed.
+    /// and shows what it showed. Not a fourth time within a minute: what it shows is then what
+    /// ends it, and loading it again and again would only spend the Mac's time.
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         loaded = false
+        let now = ContinuousClock.now
+        terminations = terminations.filter { now - $0 < .seconds(60) } + [now]
+        guard terminations.count <= 3 else { return }
         webView.reload()
     }
 }

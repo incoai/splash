@@ -154,8 +154,7 @@ final class AppState {
     /// then, in the background, installs the models the Hugging Face cache holds.
     func launch() async {
         defer { launched = true }
-        let runtime = runtime
-        if let reason = await Task.detached(operation: { runtime.unsupportedReason() }).value {
+        if let reason = await runtime.unsupportedReason() {
             blocker = Blocker(title: "This Mac Can’t Run Splash", symbol: "exclamationmark.triangle", message: reason)
             return
         }

@@ -71,6 +71,10 @@ final class ChatStore {
 
     private let folder: URL
     private var reply: Task<Void, Never>?
+    /// Writes and removes the conversations' files in the order they change, off the main thread:
+    /// a conversation with images takes milliseconds to encode and write, which a send and a
+    /// reply's end would otherwise wait for.
+    private let files = DispatchQueue(label: "ChatStore.files", qos: .utility)
 
     init(folder: URL = ChatStore.folder) {
         self.folder = folder
@@ -92,7 +96,8 @@ final class ChatStore {
     func delete(_ id: UUID) {
         if streaming == id { stop() }
         conversations.removeAll { $0.id == id }
-        try? FileManager.default.removeItem(at: file(id))
+        let file = file(id)
+        files.async { try? FileManager.default.removeItem(at: file) }
         if selection == id { selection = nil }
     }
 
@@ -196,8 +201,16 @@ final class ChatStore {
     }
 
     private func write(_ conversation: Conversation) {
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        try? JSONEncoder().encode(conversation).write(to: file(conversation.id), options: .atomic)
+        let (folder, file) = (folder, file(conversation.id))
+        files.async {
+            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try? JSONEncoder().encode(conversation).write(to: file, options: .atomic)
+        }
+    }
+
+    /// Returns once every change made so far is on disk, as the app quits.
+    func flush() {
+        files.sync {}
     }
 
     private func file(_ id: UUID) -> URL {

@@ -100,21 +100,12 @@ struct Runtime: Sendable {
     }
 
     /// Why this Mac cannot run Splash, or nil when it can: the engine's own check, which the
-    /// launcher repeats before every start.
-    func unsupportedReason() -> String? {
-        let process = Process()
-        process.executableURL = engine
-        process.arguments = ["device-check"]
-        let errors = Pipe()
-        process.standardError = errors
-        process.standardOutput = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return nil }
-        let message = errors.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard process.terminationStatus != 0 else { return nil }
-        return String(decoding: message, as: UTF8.self)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacing(#/^error: /#, with: "")
+    /// launcher repeats before every start; nil too where the check does not answer in 30 s.
+    func unsupportedReason() async -> String? {
+        guard let ran = await Program.run([engine.path, "device-check"], timeout: .seconds(30)), ran.status != 0
+        else { return nil }
+        let reason = ran.error.trimmingCharacters(in: .whitespacesAndNewlines).replacing(#/^error: /#, with: "")
+        return reason.isEmpty ? nil : reason
     }
 }
 

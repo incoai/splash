@@ -440,11 +440,14 @@ struct ChatTests {
         let answer = try #require(store.current?.messages.last)
         #expect(answer.role == .assistant && answer.model == "a/b" && answer.error != nil)
         store.rename(store.conversations[0].id, to: "Greeting")
+        // Written off the main thread, on disk once flushed, as the app does as it quits.
+        store.flush()
         let reloaded = ChatStore(folder: folder)
         #expect(reloaded.conversations.map(\.title) == ["Greeting"])
         #expect(reloaded.conversations[0].messages == store.conversations[0].messages)
         store.delete(store.conversations[0].id)
         #expect(store.conversations.isEmpty && store.selection == nil)
+        store.flush()
         #expect(ChatStore(folder: folder).conversations.isEmpty)
     }
 
