@@ -6,7 +6,7 @@ These documents run from using Splash to working on it:
   models are kept, API model aliases, reasoning and thinking settings, agent
   launchers, and upgrading.
 - [API](api.md): the endpoints, request fields and limits, sampling, streaming,
-  tool calls, structured output, images and PDFs, status and errors.
+  tool calls, structured output, images, PDFs and videos, status and errors.
 - [Models](models.md): the model formats Splash loads, drafts, vision, chat
   templates, local model files and Splash packages.
 - [Internals](internals.md): the code's boundaries, installation, weight

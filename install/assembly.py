@@ -33,6 +33,9 @@ The paths an assembly links, and what reads each:
   vision/<shard>         the MLX shards holding vision_tower.*
                          (VisionLoader.cpp, through SafetensorsCheckpoint.mm)
   vision/mmproj.gguf     the GGUF vision projector (VisionLoader.cpp)
+  vision/video_preprocessor_config.json, or vision/processor_config.json
+                         the MLX repository's video processor configuration,
+                         when it has one (server/videos.py installed_config)
 """
 
 from __future__ import annotations

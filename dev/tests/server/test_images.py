@@ -3,6 +3,7 @@ import gc
 import hashlib
 import io
 import json
+import math
 import random
 import struct
 import unittest
@@ -394,6 +395,7 @@ class ImageRequestTest(HarnessTestCase):
                 digest_lo=i,
                 digest_hi=0,
                 pixels=bytes([i]),
+                frames=1,
             )
             for i in (1, 2)
         ]
@@ -408,6 +410,97 @@ class ImageRequestTest(HarnessTestCase):
         self.assertEqual(pixels, b"\x01\x02")
         with self.assertRaisesRegex(api.APIError, "image count"):
             app._expand_image_pads(tokens, prepared[:1], positions)
+
+    def test_video_renders_one_timestamped_placeholder_per_temporal_patch(self):
+        from tokenizers import pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        from server import videos
+
+        backend = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+        backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            additional_special_tokens=[
+                api_shapes.IMAGE_PAD_TOKEN,
+                videos.VIDEO_PAD_TOKEN,
+                "<|vision_start|>",
+                "<|vision_end|>",
+            ],
+        )
+        # The vision branches of the Qwen3.x chat template.
+        tokenizer.chat_template = (
+            "{% for message in messages %}{{ message.role }}: "
+            "{% for part in message.content %}"
+            "{% if 'image' in part or 'image_url' in part %}"
+            "{{ '<|vision_start|><|image_pad|><|vision_end|>' }}"
+            "{% elif 'video' in part or part.type == 'video' %}"
+            "{{ '<|vision_start|><|video_pad|><|vision_end|>' }}"
+            "{% else %}{{ part.text }}{% endif %}{% endfor %}"
+            "{{ '\\n' }}{% endfor %}"
+        )
+        app = object.__new__(request_frontend.Frontend)
+        app.tokenizer = tokenizer
+        from server.latency import LatencyMetrics
+
+        app.latencies = LatencyMetrics()
+        app.max_context = 1024
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": "unused"}},
+                    {"type": "video", "video": {"url": "unused"}},
+                    {"type": "text", "text": " what happens?"},
+                ],
+            }
+        ]
+        template = {
+            "tokenize": True,
+            "return_dict": False,
+            "chat_template": tokenizer.chat_template,
+        }
+        video = SimpleNamespace(timestamps=(0.32, 1.64))
+        tokens, positions, rendered = app._render_image_tokens(
+            messages, template, [video]
+        )
+        # Qwen3VLProcessor's expansion of the template's video placeholder.
+        self.assertEqual(
+            rendered,
+            "user: <|vision_start|><|image_pad|><|vision_end|>"
+            "<0.3 seconds><|vision_start|><|video_pad|><|vision_end|>"
+            "<1.6 seconds><|vision_start|><|video_pad|><|vision_end|>"
+            " what happens?\n",
+        )
+        self.assertEqual(
+            tokens, tokenizer(rendered, add_special_tokens=False)["input_ids"]
+        )
+        image_pad = tokenizer.convert_tokens_to_ids(api_shapes.IMAGE_PAD_TOKEN)
+        video_pad = tokenizer.convert_tokens_to_ids(videos.VIDEO_PAD_TOKEN)
+        self.assertEqual(
+            [tokens[i] for i in positions], [image_pad, video_pad, video_pad]
+        )
+        units = [
+            SimpleNamespace(
+                tokens=4,
+                grid_height=4,
+                grid_width=4,
+                digest_lo=i,
+                digest_hi=0,
+                pixels=bytes([i]) * frames,
+                frames=frames,
+            )
+            for i, frames in ((1, 1), (2, 2), (3, 2))
+        ]
+        expanded, spans, pixels = app._expand_image_pads(tokens, units, positions)
+        self.assertEqual([span.frames for span in spans], [1, 2, 2])
+        for span, pad in zip(spans, (image_pad, video_pad, video_pad), strict=True):
+            self.assertEqual(expanded[span.offset : span.offset + 4], [pad] * 4)
+        self.assertEqual(pixels, b"\x01\x02\x02\x03\x03")
+        with self.assertRaisesRegex(api.APIError, "video count"):
+            app._render_image_tokens(messages, template, [])
+        with self.assertRaisesRegex(api.APIError, "image count"):
+            app._expand_image_pads(tokens, [units[1], units[0], units[2]], positions)
 
     def test_image_render_marker_is_stable_across_requests(self):
         app = self.harness(FakeRuntime(), tokenizer=ImagePadTokenizer()).app
@@ -438,6 +531,7 @@ class ImageRequestTest(HarnessTestCase):
             grid_width=4,
             digest_lo=0,
             digest_hi=0,
+            frames=1,
         )
         pad = app.tokenizer.convert_tokens_to_ids(api_shapes.IMAGE_PAD_TOKEN)
         with self.assertRaisesRegex(api.APIError, "request size limit"):
@@ -451,8 +545,10 @@ class ImageRequestTest(HarnessTestCase):
         image = png_data_url()
         pdf = base64.b64encode(pdf_bytes()).decode()
         pdf_url = "data:application/pdf;base64," + pdf
+        video = "data:video/mp4;base64," + base64.b64encode(b"not decoded").decode()
         chat = {
             "image_url": {"type": "image_url", "image_url": {"url": image}},
+            "video_url": {"type": "video_url", "video_url": {"url": video}},
             "file": {
                 "type": "file",
                 "file": {"filename": "a.pdf", "file_data": pdf_url},
@@ -493,6 +589,7 @@ class ImageRequestTest(HarnessTestCase):
             "image_url": "image",
             "input_image": "image",
             "image": "image",
+            "video_url": "video",
             "file": "PDF",
             "input_file": "PDF",
             "document": "PDF",
@@ -672,7 +769,7 @@ class ImageRequestTest(HarnessTestCase):
     def test_image_count_is_checked_before_decoding(self):
         app = self.harness(FakeRuntime(), tokenizer=ImagePadTokenizer()).app
         part = image_message()["content"][1]
-        limit = native_wire.MAX_IMAGE_SPANS
+        limit = native_wire.MAX_REQUEST_IMAGES
         messages = [
             {"role": "user", "content": [part] * limit},
             {"role": "tool", "content": [part]},
@@ -696,6 +793,7 @@ class ImageRequestTest(HarnessTestCase):
             grid_width=32,
             digest_lo=0,
             digest_hi=0,
+            frames=1,
         )
         pad = app.tokenizer.convert_tokens_to_ids(api_shapes.IMAGE_PAD_TOKEN)
         with self.assertRaisesRegex(api.APIError, "context window"):

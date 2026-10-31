@@ -44,6 +44,8 @@ class PreparedImage:
     pixels: bytes
     digest_lo: int
     digest_hi: int
+    # 2 for a video temporal patch: ``pixels`` holds its two frames in order.
+    frames: int = 1
 
     @property
     def tokens(self) -> int:
@@ -154,6 +156,9 @@ class PreparedImages(list):
         super().__init__()
         self._cache = cache
         self._bytes = 0
+        # Prepared videos whose temporal patches this batch holds, in order;
+        # the rendered prompt carries their timestamps.
+        self.videos = []
 
     def append(self, image):
         size = len(image.pixels)

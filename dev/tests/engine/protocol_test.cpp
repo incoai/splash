@@ -6,6 +6,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -316,6 +317,24 @@ void testRequestRoundTrip() {
   CHECK(test, roundTrip(withImage) == withImage);
   RequestFrame progress = exampleProgressRequest();
   CHECK(test, roundTrip(progress) == progress);
+
+  // A video temporal patch: its frame count travels after the digest, then a
+  // reserved zero word, and its pixels hold two frames.
+  RequestFrame withVideo = exampleImageRequest();
+  withVideo.imageSpans[0].frames = 2;
+  withVideo.imagePixels.resize(withVideo.imageSpans[0].pixelBytes());
+  CHECK(test, withVideo.imagePixels.size() == 2 * withImage.imagePixels.size());
+  CHECK(test, roundTrip(withVideo) == withVideo);
+  const std::vector<uint8_t> wire = peer::serialize(withVideo);
+  const size_t spanOffset =
+      kFrameHeaderBytes + kRequestFixedBytes + 4 * withVideo.promptTokens.size();
+  for (const auto &[frames, reserved] :
+       {std::pair<uint32_t, uint32_t>{3, 0}, {0, 0}, {2, 1}}) {
+    std::vector<uint8_t> corrupt = wire;
+    std::memcpy(corrupt.data() + spanOffset + 32, &frames, 4);
+    std::memcpy(corrupt.data() + spanOffset + 36, &reserved, 4);
+    CHECK(test, !decodeClient(corrupt, kLimits));
+  }
 }
 
 // A request's error carries its id, so the stream survives it.

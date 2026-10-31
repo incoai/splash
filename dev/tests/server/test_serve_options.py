@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from install import launcher
-from server import images, serve_options
+from server import images, serve_options, videos
 from server import server as api
 from server.origins import ANY_ORIGIN
 
@@ -201,6 +201,11 @@ OPTIONS = {
         "--max-image-pixels",
         {str(images.MIN_PIXELS): images.MIN_PIXELS, "1048576": 1048576},
         (str(images.MIN_PIXELS - 1), str(images.MAX_PIXELS + 1), "-1", "many"),
+    ),
+    "--max-video-pixels": values(
+        "--max-video-pixels",
+        {str(videos.MIN_PIXELS): videos.MIN_PIXELS, "50000000": 50_000_000},
+        (str(videos.MIN_PIXELS - 1), str(videos.MAX_PIXELS + 1), "-1", "many"),
     ),
     "--request-timeout": values(
         "--request-timeout",

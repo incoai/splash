@@ -9,7 +9,7 @@ from server import protocol as wire
 
 _HEADER = struct.Struct("<4sHHQ")
 _REQUEST = struct.Struct("<QBBQQIIIffIffffQIIIQQIII")
-_IMAGE_SPAN = struct.Struct("<IIIIQQ")
+_IMAGE_SPAN = struct.Struct("<IIIIQQII")
 _MASK_RESPONSE = struct.Struct("<QQI")
 _ID = struct.Struct("<Q")
 
@@ -165,9 +165,10 @@ def _decode_request(payload: bytes) -> wire.RequestFrame:
     offset = _REQUEST.size
     prompt = _words(payload, offset, prompt_count)
     offset += 4 * prompt_count
+    # Each span ends with its frame count and a reserved zero word.
     spans = tuple(
         wire.ImageSpan(
-            *_IMAGE_SPAN.unpack_from(payload, offset + index * _IMAGE_SPAN.size)
+            *_IMAGE_SPAN.unpack_from(payload, offset + index * _IMAGE_SPAN.size)[:-1]
         )
         for index in range(span_count)
     )

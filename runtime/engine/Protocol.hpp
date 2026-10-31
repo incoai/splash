@@ -18,7 +18,7 @@
 // pins the bytes both sides agree on.
 namespace splash::protocol {
 
-inline constexpr uint16_t kProtocolVersion = 11;
+inline constexpr uint16_t kProtocolVersion = 12;
 // A frame is its header, the magic "SPLH", the u16 protocol version, the
 // u16 FrameType and the u64 payload length, then the payload.
 inline constexpr size_t kFrameHeaderBytes = 16;
@@ -111,7 +111,8 @@ struct ProtocolLimits {
   uint32_t maxTokenBatch = 4096;
   uint32_t maxSimulationTokens = 32;
   uint32_t maxMaskWords = 1U << 20;
-  uint32_t maxImageSpans = 64;
+  // Images and video temporal patches together: a 768-frame video fills 384.
+  uint32_t maxImageSpans = 1024;
 };
 
 [[nodiscard]] std::optional<ProtocolIssue>

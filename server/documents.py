@@ -12,12 +12,12 @@ from dataclasses import asdict, dataclass
 
 from .errors import APIError
 from .lru import LRUCache
-from .protocol import MAX_IMAGE_SPANS
+from .protocol import MAX_REQUEST_IMAGES
 
 MAX_REQUEST_DOCUMENT_BYTES = 64 * 1024 * 1024
 MAX_PDF_BYTES = MAX_REQUEST_DOCUMENT_BYTES
 # Every rendered page becomes one image in the native request.
-MAX_PAGES = MAX_IMAGE_SPANS
+MAX_PAGES = MAX_REQUEST_IMAGES
 MAX_PAGE_PIXELS = 1024 * 1024
 MAX_TEXT_CHARACTERS = 1_000_000
 MAX_RENDERED_BYTES = 32 * 1024 * 1024

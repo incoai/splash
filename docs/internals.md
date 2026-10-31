@@ -20,7 +20,15 @@ requests and history; `backend.py` owns native request lifecycles. `judgments.py
 owns finite-choice prompts, validation and typed answer math. `output.py` parses
 generated text as it arrives, one parser serving streamed and complete
 responses alike, in the family's chat format (`chat_format.py`), and
-`constraints.py` compiles token constraints. Messages and
+`constraints.py` compiles token constraints. `workers.py` runs the decoders of
+untrusted input, PDFium for PDF pages (`document_worker.py`) and the engine's
+`video-frames` command for video frames (`videos.py`), each in a disposable
+process within the time, memory and output budgets it supervises. A decode
+whose hardware decoder stalls exits with 75, and the server decodes again
+with `--software`: VideoToolbox's software decoder on the compressed samples,
+each range read from the keyframe before it to the keyframe after it, the
+ranges on all cores. A codec with no software decoder exits with 69 from
+`--software`, and only hardware is left to try. Messages and
 Responses build streamed and complete responses from the same block sequence;
 the one difference is a call cut by the token limit or a stop sequence, which a
 complete Messages response leaves out. `make architecture-check` prevents lower
@@ -1698,6 +1706,13 @@ token needs a reserved position. The final prefill chunk runs the target head
 but no sampling policy or DFlash decode. Successful scoring emits no Tokens
 event, finishes with Stop, and reports zero decode time. Cancelled requests
 carry no logits.
+
+A request's image spans, at most 1024, images and PDF pages at most 64 of
+them, each name one frame, an image, or two, a video's temporal patch: its
+pixels hold the patch's two frames one after the other, which `vision_patchify`
+reads into the patch's two temporal slots, where an image fills both with its
+one frame. A span's grid, M-RoPE positions and encode are an image's; its
+digest covers both frames. Version 12 of the wire added the frame count.
 
 An engine sends its Ready event first. One whose bootstrap fails, as when
 `--max-context` exceeds what its budget holds, writes its report to stderr,

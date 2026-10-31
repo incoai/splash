@@ -4,7 +4,8 @@ import hashlib
 import json
 import secrets
 import threading
-from contextlib import contextmanager
+from collections.abc import Callable
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from itertools import count
 from pathlib import Path
@@ -14,6 +15,7 @@ from jinja2 import TemplateError
 from . import images as image_input
 from . import json_codec, judgments
 from . import protocol as wire
+from . import videos as video_input
 from .api_shapes import (
     IMAGE_PAD_TOKEN,
     canonical_responses_input,
@@ -111,6 +113,7 @@ COMPLETION_DEFAULT_MAX_TOKENS = 16
 
 # A stable marker lets repeated image requests reuse the compiled template.
 IMAGE_RENDER_MARKER = f"__splash_image_{secrets.token_hex(16)}__"
+VIDEO_RENDER_MARKER = f"__splash_video_{secrets.token_hex(16)}__"
 
 
 def _generation_prompt(probed, rendered, tokens):
@@ -204,6 +207,11 @@ class Prompt:
     template_kwargs: dict = field(default_factory=dict)
     # The reasoning effort the request sent; None where it sent none.
     sent_effort: str | None = None
+    # Frame sampling and size budget of the request's videos.
+    video_options: object = None
+    # A context manager under which the request holds no preparation slot,
+    # to wait for and use the video worker (Frontend._preparation).
+    without_slot: Callable = nullcontext
 
 
 @dataclass
@@ -249,6 +257,9 @@ class Frontend:
         thinking_codec,
         vision,
         max_image_pixels=image_input.MAX_PIXELS,
+        max_video_pixels=None,
+        video_config=video_input.PUBLISHED_CONFIG,
+        video_decoder=None,
         served_model_names=(),
         announce_served_name=False,
         default_reasoning_effort=None,
@@ -298,6 +309,14 @@ class Frontend:
         self.constraint_factory = constraint_factory
         self.max_image_pixels = max_image_pixels
         self.images = image_input.ImageCache()
+        # The request defaults: the model's video processor configuration,
+        # its pixel budget replaced by --max-video-pixels when given, and
+        # each frame within the image patch limit.
+        self.video_defaults = video_input.VideoOptions.from_config(
+            video_config, max_video_pixels, max_image_pixels
+        )
+        # The engine binary, whose video-frames command decodes videos.
+        self.videos = video_input.VideoCache(video_decoder)
         self.ids = count(1)
         self.preparation_capacity = preparation_capacity
         self.preparation_slots = threading.BoundedSemaphore(preparation_capacity)
@@ -317,7 +336,7 @@ class Frontend:
     @property
     def input_modalities(self):
         """The one list /status, /v1/models and client setup report."""
-        return ["text", "image", "pdf"] if self.vision else ["text"]
+        return ["text", "image", "video", "pdf"] if self.vision else ["text"]
 
     @property
     def reasoning(self):
@@ -349,45 +368,77 @@ class Frontend:
         status["grammar_cache"] = self.constraint_factory.stats()
         status["response_store"] = self.response_store.stats()
         status["image_cache"] = self.images.stats()
+        status["video_cache"] = self.videos.stats()
         status["tokenizer_cache"] = self.prompt_tokenizer.stats()
         status["latency"] = self.latencies.snapshot()
         return status
 
-    def _prepare_images(self, messages, deadline, *, check_context=True):
-        """Prepared images in template render order: content parts in message
-        order, images in document order."""
+    def _prepare_images(
+        self,
+        messages,
+        deadline,
+        video_options=None,
+        without_slot=nullcontext,
+        *,
+        check_context=True,
+    ):
+        """Prepared media in template render order: content parts in message
+        order, images in document order. Returns the engine's units, one per
+        image and one per video temporal patch in prompt order; the batch's
+        ``videos`` lists the prepared videos whose timestamps the rendered
+        prompt carries."""
         parts = [
             part
             for message in messages
             if isinstance(message.get("content"), list)
             for part in message["content"]
-            if part.get("type") == "image_url"
+            if part.get("type") in ("image_url", "video")
         ]
-        limit = wire.MAX_IMAGE_SPANS
-        if len(parts) > limit:
+        limit = wire.MAX_REQUEST_IMAGES
+        if sum(part["type"] == "image_url" for part in parts) > limit:
             raise APIError(400, f"requests support at most {limit} images")
+        if video_options is None:
+            video_options = self.video_defaults
         prepared = self.images.request_batch()
         tokens = pixel_bytes = 0
         for part in parts:
-            # An image can take a few hundred milliseconds to decode; an
-            # expired request starts no more of them.
+            # An image can take a few hundred milliseconds to decode, a video
+            # seconds; an expired request starts no more of them.
             remaining_request_time(deadline)
             try:
-                payload = image_input.decode_data_url(part["image_url"]["url"])
-                image = self.images.prepare(payload, self.max_image_pixels)
-                tokens += image.tokens
-                pixel_bytes += len(image.pixels)
-                self._check_image_request_size(
-                    tokens,
-                    len(prepared) + 1,
-                    pixel_bytes,
-                    check_context=check_context,
-                    image_tokens_only=True,
-                )
-                prepared.append(image)
+                if part["type"] == "image_url":
+                    payload = image_input.decode_data_url(part["image_url"]["url"])
+                    units = (self.images.prepare(payload, self.max_image_pixels),)
+                else:
+                    payload = video_input.decode_data_url(part["video"]["url"])
+                    video = self.videos.prepare(
+                        payload,
+                        video_options,
+                        lambda: remaining_request_time(deadline),
+                        without_slot,
+                    )
+                    prepared.videos.append(video)
+                    units = video.patches
+                if len(prepared) + len(units) > wire.MAX_IMAGE_SPANS:
+                    raise APIError(
+                        400,
+                        "images and video temporal patches exceed "
+                        f"{wire.MAX_IMAGE_SPANS} per request",
+                    )
+                for unit in units:
+                    tokens += unit.tokens
+                    pixel_bytes += len(unit.pixels)
+                    self._check_image_request_size(
+                        tokens,
+                        len(prepared) + 1,
+                        pixel_bytes,
+                        check_context=check_context,
+                        image_tokens_only=True,
+                    )
+                    prepared.append(unit)
             except image_input.ImageCapacityError as error:
                 raise APIError(503, str(error), "frontend_overloaded") from error
-            except image_input.ImageError as error:
+            except (image_input.ImageError, video_input.VideoError) as error:
                 raise APIError(400, str(error)) from error
         return prepared
 
@@ -415,32 +466,74 @@ class Frontend:
         if frame_bytes > wire.MAX_FRAME_PAYLOAD_BYTES:
             raise APIError(400, "images exceed the request size limit")
 
-    def _render_image_tokens(self, messages, template):
+    def _render_image_tokens(self, messages, template, videos=()):
         """Track placeholders emitted by the template, not quoted in input text.
 
-        A temporary render marker is removed before tokenization, so the pinned
+        Temporary render markers are removed before tokenization, so the pinned
         template's final text and token IDs remain unchanged. Token offsets tie
         each real image to its placeholder even when a coding agent has read
         documentation or source containing literal vision tokens.
+
+        A video's ``<|vision_start|><|video_pad|><|vision_end|>`` becomes, as
+        in Qwen3VLProcessor, one ``<t seconds><|vision_start|><|video_pad|>
+        <|vision_end|>`` per temporal patch; each pad is tracked like an
+        image's and widened later.
         """
         rendered = self._apply_chat_template(
             messages,
             {
                 **template,
                 "tokenize": False,
-                "chat_template": template["chat_template"].replace(
-                    IMAGE_PAD_TOKEN, IMAGE_RENDER_MARKER
-                ),
+                "chat_template": template["chat_template"]
+                .replace(IMAGE_PAD_TOKEN, IMAGE_RENDER_MARKER)
+                .replace(video_input.VIDEO_PAD_TOKEN, VIDEO_RENDER_MARKER),
             },
         )
-        parts = rendered.split(IMAGE_RENDER_MARKER)
-        image_offsets = set()
-        offset = 0
-        for part in parts[:-1]:
-            offset += len(part)
-            image_offsets.add((offset, offset + len(IMAGE_PAD_TOKEN)))
-            offset += len(IMAGE_PAD_TOKEN)
-        rendered = IMAGE_PAD_TOKEN.join(parts)
+        wrapped = (
+            video_input.VISION_START_TOKEN
+            + VIDEO_RENDER_MARKER
+            + video_input.VISION_END_TOKEN
+        )
+        pieces, pad_offsets = [], set()
+        offset = cursor = video_count = 0
+
+        def emit(text, pad=None):
+            nonlocal offset
+            if pad is not None:
+                pad_offsets.add((offset, offset + len(pad)))
+            pieces.append(text)
+            offset += len(text)
+
+        while True:
+            image_at = rendered.find(IMAGE_RENDER_MARKER, cursor)
+            video_at = rendered.find(VIDEO_RENDER_MARKER, cursor)
+            if image_at < 0 and video_at < 0:
+                break
+            if video_at < 0 or 0 <= image_at < video_at:
+                emit(rendered[cursor:image_at])
+                emit(IMAGE_PAD_TOKEN, IMAGE_PAD_TOKEN)
+                cursor = image_at + len(IMAGE_RENDER_MARKER)
+                continue
+            if video_count >= len(videos):
+                raise APIError(400, "video count does not match the rendered template")
+            # The processor replaces the template's wrapped placeholder when it
+            # is present, otherwise the bare pad token.
+            start = video_at - len(video_input.VISION_START_TOKEN)
+            if start >= cursor and rendered.startswith(wrapped, start):
+                emit(rendered[cursor:start])
+                cursor = start + len(wrapped)
+            else:
+                emit(rendered[cursor:video_at])
+                cursor = video_at + len(VIDEO_RENDER_MARKER)
+            for timestamp in videos[video_count].timestamps:
+                emit(f"<{timestamp:.1f} seconds>{video_input.VISION_START_TOKEN}")
+                emit(video_input.VIDEO_PAD_TOKEN, video_input.VIDEO_PAD_TOKEN)
+                emit(video_input.VISION_END_TOKEN)
+            video_count += 1
+        emit(rendered[cursor:])
+        rendered = "".join(pieces)
+        if video_count != len(videos):
+            raise APIError(400, "video count does not match the rendered template")
         encoded = self._tokenize(
             rendered,
             add_special_tokens=False,
@@ -449,21 +542,26 @@ class Frontend:
         positions = [
             index
             for index, span in enumerate(encoded["offset_mapping"])
-            if tuple(span) in image_offsets
+            if tuple(span) in pad_offsets
         ]
         return list(encoded["input_ids"]), positions, rendered
 
+    def _pad_id(self, unit):
+        token = video_input.VIDEO_PAD_TOKEN if unit.frames > 1 else IMAGE_PAD_TOKEN
+        return self.tokenizer.convert_tokens_to_ids(token)
+
     def _image_token_count(self, prompt_tokens, prepared, positions):
-        pad_id = self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN)
         if len(positions) != len(prepared) or any(
-            prompt_tokens[position] != pad_id for position in positions
+            prompt_tokens[position] != self._pad_id(unit)
+            for position, unit in zip(positions, prepared)
         ):
             raise APIError(400, "image count does not match the rendered template")
         return len(prompt_tokens) + sum(image.tokens - 1 for image in prepared)
 
     def _expand_image_pads(self, prompt_tokens, prepared, positions):
-        """Widens the template's single placeholder per image to the image's
-        merged token count and returns the spans the engine injects into."""
+        """Widens the template's single placeholder per image (or video
+        temporal patch) to its merged token count and returns the spans the
+        engine injects into."""
         token_count = self._image_token_count(prompt_tokens, prepared, positions)
         # Validate lengths before expanding tokens or copying repeated pixels.
         # HTTP body and image-cache limits do not bound decoded request size.
@@ -473,7 +571,6 @@ class Frontend:
             sum(len(image.pixels) for image in prepared),
         )
         expanded, spans, cursor = [], [], 0
-        pad_id = self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN)
         for position, image in zip(positions, prepared):
             expanded.extend(prompt_tokens[cursor:position])
             spans.append(
@@ -484,9 +581,10 @@ class Frontend:
                     image.grid_width,
                     image.digest_lo,
                     image.digest_hi,
+                    image.frames,
                 )
             )
-            expanded.extend([pad_id] * image.tokens)
+            expanded.extend([prompt_tokens[position]] * image.tokens)
             cursor = position + 1
         expanded.extend(prompt_tokens[cursor:])
         pixels = b"".join(image.pixels for image in prepared)
@@ -913,6 +1011,12 @@ class Frontend:
         response_schema, response_validator = normalize_response_format(
             body.get("response_format")
         )
+        try:
+            video_options = video_input.video_options(
+                body.get("mm_processor_kwargs"), self.video_defaults
+            )
+        except video_input.VideoError as error:
+            raise APIError(400, str(error)) from error
         return Prompt(
             messages,
             tools,
@@ -924,6 +1028,8 @@ class Frontend:
             enable_thinking,
             template_kwargs,
             body.get("reasoning_effort"),
+            video_options,
+            without_slot,
         )
 
     def _tokenize(self, text, **options):
@@ -955,16 +1061,25 @@ class Frontend:
         }
         with self.latencies.measure("images"):
             images = self._prepare_images(
-                prompt.messages, deadline, check_context=check_context
+                prompt.messages,
+                deadline,
+                prompt.video_options,
+                prompt.without_slot,
+                check_context=check_context,
             )
+        videos = getattr(images, "videos", ())
         remaining_request_time(deadline)
         if images and self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN) is None:
             raise APIError(400, "the tokenizer does not define the image pad token")
+        if videos and (
+            self.tokenizer.convert_tokens_to_ids(video_input.VIDEO_PAD_TOKEN) is None
+        ):
+            raise APIError(400, "the tokenizer does not define the video pad token")
         positions = []
         try:
             if images:
                 tokens, positions, rendered = self._render_image_tokens(
-                    prompt.messages, template
+                    prompt.messages, template, videos
                 )
             else:
                 rendered = self._apply_chat_template(prompt.messages, template)

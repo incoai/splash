@@ -85,6 +85,16 @@ def example_image_request():
     )
 
 
+def example_video_request():
+    span = p.ImageSpan(1, 1, 2, 2, 0x1111222233334444, 0x5555666677778888, 2)
+    return replace(
+        example_request(),
+        prompt_tokens=(7, 3, 9),
+        image_spans=(span,),
+        image_pixels=bytes((i * 5 + 3) & 0xFF for i in range(span.pixel_bytes)),
+    )
+
+
 def example_score_request():
     return replace(
         example_request(),
@@ -443,7 +453,7 @@ class ProtocolPythonTests(unittest.TestCase):
                 request.thinking_budget.also_ends,
             )
             + struct.pack(f"<{len(request.prompt_tokens)}I", *request.prompt_tokens)
-            + struct.pack(p._IMAGE_SPAN.format, *astuple(span))
+            + struct.pack(p._IMAGE_SPAN.format, *astuple(span), 0)
             + request.image_pixels
             + struct.pack("<2I", *request.thinking_budget.end)
         )
@@ -681,12 +691,27 @@ class ProtocolPythonTests(unittest.TestCase):
             1,
         )
         self.assertEqual(
-            struct.unpack_from("<IIIIQQ", wire, span_offset),
-            (1, 1, 2, 2, 0x1111222233334444, 0x5555666677778888),
+            struct.unpack_from("<IIIIQQII", wire, span_offset),
+            (1, 1, 2, 2, 0x1111222233334444, 0x5555666677778888, 1, 0),
         )
         # The thinking end tokens follow the pixels.
-        self.assertEqual(wire[span_offset + 32 : -8], image.image_pixels)
+        self.assertEqual(wire[span_offset + 40 : -8], image.image_pixels)
         self.assertEqual(decode_client(wire), image)
+
+        # A video temporal patch carries its frame count and two frames.
+        video = example_video_request()
+        wire = p.serialize_message(video)
+        self.assertEqual(struct.unpack_from("<II", wire, span_offset + 32), (2, 0))
+        self.assertEqual(len(wire[span_offset + 40 : -8]), 2 * 2 * 16 * 2 * 16 * 3)
+        self.assertEqual(decode_client(wire), video)
+        with self.assertRaises(p.ProtocolError):
+            p.serialize_message(
+                replace(
+                    video,
+                    image_spans=(replace(video.image_spans[0], frames=3),),
+                    image_pixels=bytes(3 * 2 * 16 * 2 * 16 * 3),
+                )
+            )
 
     def test_thinking_budget_follows_the_cache_salt(self):
         offset = p.FRAME_HEADER_BYTES + OFFSET["thinking_tokens"]

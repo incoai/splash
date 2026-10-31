@@ -558,11 +558,15 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 {"type": "text", "text": "Describe"},
             ],
         }
-        # Image rendering swaps the pad token for a marker in that template.
+        # Image rendering swaps the image and video pad tokens for markers in
+        # that template.
         chosen_sources = {
             chosen.source,
             chosen.source.replace(
                 api_shapes.IMAGE_PAD_TOKEN, request_frontend.IMAGE_RENDER_MARKER
+            ).replace(
+                request_frontend.video_input.VIDEO_PAD_TOKEN,
+                request_frontend.VIDEO_RENDER_MARKER,
             ),
         }
         for path, render in (

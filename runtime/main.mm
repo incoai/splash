@@ -5,6 +5,7 @@
 #include "engine/Bootstrap.hpp"
 #include "engine/NativeArguments.hpp"
 #include "engine/Status.hpp"
+#include "engine/VideoFrames.hpp"
 #include "model/ModelDescriptor.hpp"
 
 #include <IOKit/pwr_mgt/IOPMLib.h>
@@ -156,6 +157,8 @@ void printUsage(std::string_view executable) {
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_METADATA [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " device-check");
+  writeStderrLine("       " + command + " video-frames probe FILE");
+  writeStderrLine("       " + command + " video-frames decode FILE WIDTH HEIGHT [--software]");
 }
 
 std::filesystem::path executablePath() {
@@ -434,6 +437,8 @@ int main(int argc, char **argv) {
         return splash::checkDevice();
       if (argc > 1 && std::string_view(argv[1]) == "model-check")
         return splash::checkModel(argc, argv);
+      if (argc > 1 && std::string_view(argv[1]) == "video-frames")
+        return splash::video::runVideoFrames(argc, argv);
       const splash::engine::NativeArguments arguments =
           splash::engine::parseNativeArguments(argc, argv);
       return splash::runNative(arguments);
