@@ -350,8 +350,14 @@ class NativeBackend:
         wire.FinishReason.CANCELLED: "cancelled",
     }
 
-    def __init__(self, runtime, tokenizer, request_logger, thinking_end=None):
+    def __init__(
+        self, runtime, tokenizer, request_logger, thinking_end=None, on_exit=None
+    ):
         self.runtime = runtime
+        # --engine-failure exit: called, in place of a relaunch, when an
+        # engine that reached Ready fails, so that the server exits and its
+        # supervisor starts it again. None relaunches in-process.
+        self.on_exit = on_exit
         self.tokenizer = tokenizer
         self.request_logger = request_logger
         # What the engine selects where a thinking budget runs out
@@ -396,6 +402,7 @@ class NativeBackend:
         self._failed("Engine failed", error, served_seconds)
 
     def _failed(self, event, error, served_seconds):
+        exiting = False
         # Clients get the reason with every refusal until a status succeeds.
         with self.lock:
             if self.closing or self.fatal_error is not None:
@@ -404,7 +411,12 @@ class NativeBackend:
             if self.status_snapshot is not None:
                 # A failed engine's readiness is no longer evidence.
                 self.status_snapshot["ready"] = False
-            if (unchangeable := self.runtime.fatal_error) is not None:
+            if self.on_exit is not None and event == "Engine failed":
+                # No relaunch is owed, so requests until the server exits
+                # are refused as recovering (503), not as failed for good.
+                self.restart_due = None
+                exiting = True
+            elif (unchangeable := self.runtime.fatal_error) is not None:
                 # Changed limits would recur at every relaunch; the error says
                 # how to recover.
                 self._stop_restarting_locked(str(unchangeable))
@@ -430,6 +442,12 @@ class NativeBackend:
         print_status(f"{event} · {error}", error=True)
         if stopped is not None:
             print_status(f"Engine stopped · {stopped}", error=True)
+        if exiting:
+            print_status(
+                "Exiting · --engine-failure exit leaves the restart to the supervisor",
+                error=True,
+            )
+            self.on_exit()
 
     def _restart_delay_locked(self, served_seconds):
         """Seconds until the relaunch a failure owes; None once a crash loop

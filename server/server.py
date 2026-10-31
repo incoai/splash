@@ -12,6 +12,7 @@ import select
 import signal
 import socket
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -104,6 +105,9 @@ REFUSED_LINGER_SECONDS = 2.0
 DESCRIPTOR_LIMIT = 10240
 SSE_KEEPALIVE_SECONDS = 2.0
 NATIVE_START_TIMEOUT = 600.0
+# The exit status of --engine-failure exit: EX_TEMPFAIL, a failure that a
+# restart may clear.
+ENGINE_FAILURE_EXIT_CODE = 75
 ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
 CHAT_ASSETS = {
@@ -1819,11 +1823,19 @@ def main():
             startup_timeout=NATIVE_START_TIMEOUT,
             pending_limit=args.queue_size,
         )
+        engine_failed = threading.Event()
+
+        def exit_for_supervisor():
+            # serve_forever returns, and the finally below stops the engine.
+            engine_failed.set()
+            threading.Thread(target=server.shutdown, daemon=True).start()
+
         backend = NativeBackend(
             runtime,
             tokenizer,
             request_logger=print_request,
             thinking_end=thinking_end,
+            on_exit=exit_for_supervisor if args.engine_failure == "exit" else None,
         )
         if not runtime.wait_ready():
             raise engine_runtime.EngineUnhealthy("native runtime did not become ready")
@@ -1871,6 +1883,8 @@ def main():
         mode = "" if readiness.vision else " · text only"
         print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
         server.serve_forever()
+        if engine_failed.is_set():
+            raise SystemExit(ENGINE_FAILURE_EXIT_CODE)
     except (
         engine_runtime.EngineRuntimeError,
         ModelError,

@@ -100,6 +100,7 @@ class ServerMainTests(unittest.TestCase):
             tokenizer,
             request_logger=diagnostics.print_request,
             thinking_end=None,
+            on_exit=None,
         )
         self.assertEqual(app_type.call_args.args[3], 262144)
         # No --request-timeout, no deadline.
@@ -112,6 +113,49 @@ class ServerMainTests(unittest.TestCase):
         server.server_bind.assert_called_once_with()
         server.server_activate.assert_called_once_with()
         self.assertEqual(order, ["bind", "runtime"])
+
+    def test_engine_failure_exit_stops_the_server_with_status_75(self):
+        args = main_args(engine_failure="exit")
+        runtime = mock.Mock()
+        runtime.readiness = native_wire.ReadyEvent(4, 131072, False)
+        backend = mock.Mock()
+        server = mock.Mock(server_port=8000)
+        order = []
+
+        def serve():
+            # The backend reports an engine that was ready as failed.
+            backend_type.call_args.kwargs["on_exit"]()
+            order.append("exit")
+
+        runtime.wait_ready.side_effect = lambda: order.append("ready") or True
+        server.serve_forever.side_effect = serve
+        backend.close.side_effect = lambda: order.append("closed")
+        with (
+            mock.patch.object(api, "parse_args", return_value=args),
+            unprepared_hold(),
+            mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(
+                api.AutoTokenizer, "from_pretrained", return_value=object()
+            ),
+            mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "ChatTemplates"),
+            mock.patch.object(
+                api.engine_runtime, "MultiplexedRuntime", return_value=runtime
+            ),
+            mock.patch.object(
+                api, "NativeBackend", return_value=backend
+            ) as backend_type,
+            mock.patch.object(api, "ConstraintFactory"),
+            mock.patch.object(api, "Frontend", return_value=mock.Mock()),
+            mock.patch.object(api, "FrontendServer", return_value=server),
+            mock.patch.object(api.signal, "signal"),
+            mock.patch.object(api, "print_status"),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            api.main()
+        self.assertEqual(raised.exception.code, 75)
+        self.assertEqual(order, ["ready", "exit", "closed"])
+        backend.close.assert_called_once()
 
     def test_main_takes_vision_from_the_ready_event(self):
         args = main_args()

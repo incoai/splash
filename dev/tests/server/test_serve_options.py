@@ -210,6 +210,11 @@ OPTIONS = {
     "--queue-size": values(
         "--queue-size", {"64": 64, "1": 1}, ("0", "-1", "1.5", "many")
     ),
+    "--engine-failure": values(
+        "--engine-failure",
+        {"relaunch": "relaunch", "exit": "exit"},
+        ("restart", "none", ""),
+    ),
     "--api-key": values(
         "--api-key",
         {"secret-key": "secret-key"},

@@ -44,6 +44,14 @@ options give it the same concurrency and image input, and without
 limits, as once the Mac's memory budget shrank below that context, stops the
 restarts at once.
 
+`--engine-failure exit` (or `SPLASH_ENGINE_FAILURE=exit`) makes a failure of an
+engine that was ready end the server instead: it exits with status 75
+(`EX_TEMPFAIL`), and a supervisor such as launchd, systemd or a proxy such as
+llama-swap starts the whole process again, in place of an in-process relaunch.
+Requests that arrive before it exits get 503 `engine_recovering`. A failure
+during startup follows the rules above. Example: `splash serve --model ...
+--engine-failure exit`.
+
 Timeouts and keep-alives count only time the Mac is awake: a request in flight
 when the Mac sleeps continues when it wakes. While requests run, Splash keeps
 the Mac from sleeping automatically, as `caffeinate -i` does; the display may
@@ -106,6 +114,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--max-image-pixels` | `4194304` | Maximum resized pixels per image. An image's vision scratch grows with its patches (pixels / 256), to about 600 MiB at the default. |
 | `--request-timeout` | None | Time a request may take from its arrival; a request's own `timeout` can only shorten it. |
 | `--queue-size` | `32` | Requests admitted at once, running or waiting; more get 503 with `Retry-After`. |
+| `--engine-failure` | `SPLASH_ENGINE_FAILURE` or `relaunch` | What a failure of an engine that was ready does: `relaunch` starts a new engine in this server; `exit` stops the server with status 75 so that a supervisor starts it again. See the engine restart rules above. |
 | `--decode-share` | `0.5` | Decode time owed per unit of prefill time while other requests generate. Higher keeps their output faster during a long prompt and slows that prompt; `0` alternates one command each. |
 | `--disable-ane` | Off | Prefill on the GPU alone. By default a dense model's long prompts also use the Neural Engine when that is faster. See [Neural Engine prefill](internals.md#neural-engine-prefill). |
 | `--verify-rows` | `auto` | The rows of each draft block decode cycles verify: `auto` lets the verify budget choose a MoE target's rows, which is faster but makes its greedy and seeded outputs vary from run to run, and verifies every row of a dense target; `all` verifies every row the output limit leaves on every target, so those outputs repeat when a request runs alone with the same cached prefixes. See [drafts](models.md#drafts) and [sampling](api.md#sampling). |
