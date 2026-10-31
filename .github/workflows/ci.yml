@@ -45,6 +45,8 @@ jobs:
         run: make check-source check-native-cpu PYTHON_CANDIDATES="$(brew --prefix python@3.13)/bin/python3.13"
       - name: Build every native test and tool
         run: make check-native-build
+      - name: Build and test the desktop chat app
+        run: make desktop test-desktop
       - name: Run native sanitizers
         run: make test-sanitizers
       - name: Test the desktop app

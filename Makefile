@@ -77,6 +77,17 @@ HOST_STEP_LIB := $(BUILD)/host-step.metallib
 
 all: $(TARGET)
 
+# The desktop client builds independently of the inference engine and model weights.
+.PHONY: desktop desktop-open test-desktop
+desktop:
+	sh desktop/build.sh
+
+desktop-open: desktop
+	open "build/Splash.app"
+
+test-desktop:
+	swift test --package-path desktop
+
 # The installer checks a model's configuration with the engine (build/splash
 # model-check) before it downloads any weight. It takes the models' own lock
 # for what it writes; the download holds up no other setup of the

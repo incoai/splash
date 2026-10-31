@@ -41,6 +41,10 @@ For a server started with another `--port`, pass the same `--port` to the agent.
 Press Ctrl+C in the server terminal to stop Splash.
 For LM Studio Bionic, follow its [Splash setup guide](https://lmstudio.ai/blog/splash-engine).
 
+Prefer a desktop window? From a source checkout, run `make desktop-open` to
+build and open the native macOS chat app. It connects to your running Splash
+server. [Desktop app setup and controls](desktop/README.md).
+
 ## Use the API
 
 OpenAI Chat Completions, Responses and Completions, and Anthropic Messages,
