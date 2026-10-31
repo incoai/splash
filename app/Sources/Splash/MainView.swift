@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// The main window: the Server or the Chat, as the switch at the toolbar's start picks. Its toolbar
-/// holds, besides, a download under way.
+/// The main window: the Chat, as the switch at the toolbar's start picks, or the Server, which the
+/// button at its end opens and the window opens on, as the app starts models.
 struct MainView: View {
     @Environment(AppState.self) private var state
 
@@ -12,19 +12,22 @@ struct MainView: View {
             .frame(minWidth: 800, minHeight: 560)
             .navigationTitle("Splash")
             .toolbar(removing: .title)
+            // No band of its own behind the toolbar, which the window put there once a transcript
+            // scrolled under it, over the sidebar too: the sidebar runs up to the window's top,
+            // and a transcript draws its own line under the toolbar.
+            .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
             .toolbar {
                 if state.available {
+                    ToolbarItem(placement: .navigation) { SidebarButton() }
+                        .sharedBackgroundVisibility(.hidden)
                     ToolbarItem(placement: .navigation) { SectionSwitch() }
                         .sharedBackgroundVisibility(.hidden)
                 }
-                // In both sections: an item that came and went with the switch left its glass
-                // behind, sliding under the switch.
-                if state.installer.running {
-                    ToolbarItem { DownloadButton() }
-                }
+                // At the toolbar's end, clear of the sidebar: what the Chat makes, then the Server,
+                // last in every part, where an item that came and went with the part would leave it
+                // in place.
+                ToolbarSpacer(.flexible)
                 if state.available && state.section == .chat {
-                    // At the toolbar's end, clear of the sidebar.
-                    ToolbarSpacer(.flexible)
                     ToolbarItem {
                         Button {
                             state.chats.newChat()
@@ -34,6 +37,10 @@ struct MainView: View {
                         }
                         .help("New Chat (⌘N)")
                     }
+                }
+                if state.available {
+                    ToolbarItem { ServerButton() }
+                        .sharedBackgroundVisibility(.hidden)
                 }
             }
             .onChange(of: state.status) { _, status in
@@ -77,67 +84,220 @@ struct Offered: Layout {
                            subviews: Subviews, cache: inout ()) -> CGFloat? { nil }
 }
 
-/// The switch between the Server and the Chat.
+/// The switch of the window's parts but the Server, which the button at the toolbar's end opens:
+/// the Chat, not picked while the Server shows.
 struct SectionSwitch: View {
     @Environment(AppState.self) private var state
+
+    var body: some View {
+        Segments(selected: state.section, height: 28, pick: { state.section = $0 }, segments: [
+            .init(title: "Chat", value: .chat, help: "Chat with the model that runs (⌘2)"),
+        ])
+    }
+}
+
+/// Segments in a well, the picked one on a pill that slides to the next picked: the window's
+/// switch. None is picked while `selected` is none of theirs.
+struct Segments<Value: Hashable>: View {
+    struct Segment {
+        let title: String
+        let value: Value
+        var help = ""
+    }
+
+    let selected: Value
+    var height: CGFloat = 24
+    let pick: (Value) -> Void
+    let segments: [Segment]
     @Environment(\.colorScheme) private var colorScheme
     @Namespace private var pill
 
     var body: some View {
         HStack(spacing: 2) {
-            segment("Server", .server, help: "Models and how they run (⌘1)")
-            segment("Chat", .chat, help: "Chat with the model that runs (⌘2)")
+            ForEach(segments, id: \.value) { segment in
+                let picked = segment.value == selected
+                Button { pick(segment.value) } label: {
+                    Text(segment.title)
+                        .font(height < 28 ? .subheadline.weight(.medium) : .callout.weight(.medium))
+                        .foregroundStyle(picked ? .primary : .secondary)
+                        .padding(.horizontal, height < 28 ? 11 : 14)
+                        .frame(height: height)
+                        .background {
+                            if picked {
+                                Capsule.pill(colorScheme)
+                                    .matchedGeometryEffect(id: "pill", in: pill)
+                            }
+                        }
+                        .contentShape(.capsule)
+                }
+                .buttonStyle(HoverStyle(padding: EdgeInsets(), shape: AnyShape(.capsule)))
+                .help(segment.help)
+                .accessibilityAddTraits(picked ? .isSelected : [])
+            }
         }
         .padding(2)
-        .background(.primary.opacity(colorScheme == .dark ? 0.08 : 0.06), in: .capsule)
-        // The pill slides; the window's content swaps at once.
-        .animation(Motion.settle, value: state.section)
-    }
-
-    private func segment(_ title: String, _ section: AppState.Section, help: String) -> some View {
-        let selected = state.section == section
-        return Button { state.section = section } label: {
-            Text(title)
-                .font(.callout.weight(.medium))
-                .foregroundStyle(selected ? .primary : .secondary)
-                .padding(.horizontal, 14)
-                .frame(height: 28)
-                .background {
-                    if selected {
-                        Capsule()
-                            .fill(colorScheme == .dark ? AnyShapeStyle(.white.opacity(0.16)) : AnyShapeStyle(.white))
-                            .shadow(color: .black.opacity(0.12), radius: 1.5, y: 0.5)
-                            .matchedGeometryEffect(id: "pill", in: pill)
-                    }
-                }
-                .contentShape(.capsule)
-        }
-        .buttonStyle(HoverStyle(padding: EdgeInsets(), shape: AnyShape(.capsule)))
-        .help(help)
-        .accessibilityAddTraits(selected ? .isSelected : [])
+        .background(Capsule.track(colorScheme))
+        // The pill slides; what it picks changes at once.
+        .animation(Motion.settle, value: selected)
     }
 }
 
-/// A download under way; opens the Server, which shows it.
-struct DownloadButton: View {
+/// The Chat's sidebar beside its content, a column of the window's height, up through the toolbar,
+/// that slides away as the toolbar's button and ⌘B hide it. Hidden, it keeps its place in the
+/// window at no width, with what was typed in it and how far it scrolled.
+struct WithSidebar<Side: View, Content: View>: View {
+    static var width: CGFloat { 280 }
+
+    @Environment(AppState.self) private var state
+    @ViewBuilder let side: Side
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        let shown = state.showsSidebar
+        HStack(spacing: 0) {
+            HStack(spacing: 0) {
+                side.frame(width: Self.width)
+                // Up through the toolbar, as far as the sidebar's background goes.
+                Divider().ignoresSafeArea(edges: .top)
+            }
+            // Slides out at its leading edge as its column narrows.
+            .frame(width: shown ? nil : 0, alignment: .trailing)
+            .clipped()
+            .allowsHitTesting(shown)
+            .accessibilityHidden(!shown)
+            content
+        }
+    }
+}
+
+extension AppState {
+    /// Hides the sidebar shown, or shows the one hidden, sliding.
+    func toggleSidebar() {
+        withAnimation(Motion.settle) { showsSidebar.toggle() }
+    }
+}
+
+/// Hides and shows the Chat's sidebar, as ⌘B does; the Server has none.
+struct SidebarButton: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
-        Button { state.section = .server } label: {
-            // It spins until the download has told its size, rather than show an empty ring.
-            Group {
-                if let progress = state.installer.progress, progress.total > 0 {
-                    ProgressView(value: progress.fraction)
-                } else {
-                    ProgressView()
-                }
-            }
-            .progressViewStyle(.circular)
-            .controlSize(.small)
+        Button { state.toggleSidebar() } label: {
+            Image(systemName: "sidebar.left")
+                .font(.system(size: 15))
+                .foregroundStyle(.secondary)
+                .frame(width: 32, height: 32)
+                .contentShape(.circle)
         }
-        .help(state.downloadStatus ?? "")
-        .accessibilityLabel("Download")
-        .accessibilityValue(state.downloadStatus ?? "")
+        .buttonStyle(HoverStyle(padding: EdgeInsets(), shape: AnyShape(.circle)))
+        .accessibilityLabel(state.showsSidebar ? "Hide Sidebar" : "Show Sidebar")
+        .help(state.showsSidebar ? "Hide Sidebar (⌘B)" : "Show Sidebar (⌘B)")
+        .disabled(state.section == .server)
+    }
+}
+
+/// The Server, at the toolbar's end: a light and the model that runs, with its speed while it
+/// answers, or the word Server while none does; a spinner and the step while one starts, the
+/// download's ring while one comes. It opens the Server, and shows picked while the Server shows,
+/// as the switch's segments do.
+struct ServerButton: View {
+    @Environment(AppState.self) private var state
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        let selected = state.section == .server
+        Button { state.section = .server } label: {
+            HStack(spacing: 7) {
+                indicator
+                    .frame(width: 12, height: 12)
+                Text(title)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: 220)
+            }
+            .font(.callout.weight(.medium))
+            .foregroundStyle(selected ? .primary : .secondary)
+            .padding(.horizontal, 12)
+            .frame(height: 28)
+            .background {
+                if selected { Capsule.pill(colorScheme) }
+            }
+            .padding(2)
+            .background(Capsule.track(colorScheme))
+            .contentShape(.capsule)
+        }
+        .buttonStyle(HoverStyle(padding: EdgeInsets(), shape: AnyShape(.capsule)))
+        .animation(Motion.settle, value: selected)
+        .help("\(state.downloadStatus ?? state.status) (⌘1)")
+        .accessibilityLabel("Server")
+        .accessibilityValue(state.downloadStatus ?? state.status)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    /// The model's name while one starts, its step with it, runs, its speed with it while it
+    /// answers, or stops; the download while one comes.
+    private var title: String {
+        if state.installer.running {
+            guard let progress = state.installer.progress, progress.total > 0 else { return "Downloading…" }
+            return "Downloading \(progress.fraction.formatted(.percent.precision(.fractionLength(0))))"
+        }
+        guard let name = state.server.model.map(state.displayName(of:)) else { return "Server" }
+        switch state.server.phase {
+        case .starting: return "\(name) · \(state.server.step.rawValue)"
+        case .ready:
+            // Its speed while it answers, which the status brings every 2 s.
+            let activity = state.server.activity
+            guard activity.running > 0, let rate = activity.generation else { return name }
+            return "\(name) · \(rate.formatted(.number.precision(.fractionLength(0)))) tok/s"
+        case .stopping: return name
+        case .stopped, .failed: return "Server"
+        }
+    }
+
+    @ViewBuilder private var indicator: some View {
+        if state.installer.running {
+            if let progress = state.installer.progress, progress.total > 0 {
+                Ring(fraction: progress.fraction, tint: Color.splash, size: 11)
+            } else {
+                ProgressView().controlSize(.mini)
+            }
+        } else {
+            switch state.server.phase {
+            case .starting, .stopping: ProgressView().controlSize(.mini)
+            case .ready:
+                switch state.server.serving {
+                case .running: Light()
+                case .sleeping: Light(color: .splash.opacity(0.4))
+                case .recovering: ProgressView().controlSize(.mini)
+                }
+            case .failed: Light(color: .red)
+            case .stopped: Light(color: .secondary.opacity(0.5))
+            }
+        }
+    }
+}
+
+extension Capsule {
+    /// The well the switch's segments and the Server's button sit in.
+    static func track(_ scheme: ColorScheme) -> some View {
+        Capsule().fill(.primary.opacity(scheme == .dark ? 0.08 : 0.06))
+    }
+
+    /// The pill under what is picked.
+    static func pill(_ scheme: ColorScheme) -> some View {
+        Capsule()
+            .fill(scheme == .dark ? AnyShapeStyle(.white.opacity(0.16)) : AnyShapeStyle(.white))
+            .shadow(color: .black.opacity(0.12), radius: 1.5, y: 0.5)
+    }
+}
+
+/// The Server button's light: the mark's color while a model runs, fainter while it sleeps, red
+/// where it failed, gray while none runs.
+struct Light: View {
+    var color = Color.splash
+
+    var body: some View {
+        Circle().fill(color).frame(width: 6, height: 6)
     }
 }
 

@@ -27,8 +27,13 @@ struct SplashApp: App {
                 .keyboardShortcut("n")
                 .disabled(!state.available)
             }
-            // The toolbar holds the switch between the Server and the Chat; it is not to be hidden.
+            // The toolbar holds the switch to the Chat and the Server's button; it is not to be
+            // hidden. The sidebar is.
             CommandGroup(replacing: .toolbar) {
+                Button(state.showsSidebar ? "Hide Sidebar" : "Show Sidebar") { state.toggleSidebar() }
+                    .keyboardShortcut("b")
+                    .disabled(!state.available || state.section == .server)
+                Divider()
                 Button("Server") { state.section = .server }
                     .keyboardShortcut("1")
                     .disabled(!state.available)

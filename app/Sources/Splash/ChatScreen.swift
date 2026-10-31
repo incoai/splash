@@ -4,17 +4,16 @@ import SwiftUI
 /// that the two line up.
 private let column: CGFloat = 680
 
-/// The conversations at the side of the open one. The window's toolbar is the Server's, so the
-/// switch between the two stays where it is.
+/// The conversations at the side of the open one, in a sidebar that hides (`WithSidebar`). The
+/// window's toolbar is the Server's too, so that the switch and the Server's button stay where
+/// they are.
 struct ChatScreen: View {
     @Environment(AppState.self) private var state
 
     var body: some View {
-        HStack(spacing: 0) {
+        WithSidebar {
             ChatList()
-                .frame(width: 260)
-            // Up through the toolbar, as far as the sidebar's background goes.
-            Divider().ignoresSafeArea(edges: .top)
+        } content: {
             ConversationView()
         }
         .onAppear { state.draft.focus() }

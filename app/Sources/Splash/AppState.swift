@@ -6,8 +6,9 @@ import Observation
 /// conversations.
 @MainActor @Observable
 final class AppState {
-    /// The window's two parts: the Server, where models download, start and change, and the Chat
-    /// with the model that runs. The window opens on the Server.
+    /// The window's two parts: the Server, where models download, start and change, which the
+    /// button at the toolbar's end opens, and the Chat with the model that runs. The window opens
+    /// on the Server.
     enum Section: Hashable { case server, chat }
 
     /// Why the app cannot run models here.
@@ -31,6 +32,11 @@ final class AppState {
     /// The open conversation's page, kept while the window shows something else, so that the Chat
     /// shows again at once.
     let transcript: Transcript
+    /// Whether the Chat shows its sidebar, as the toolbar's button and ⌘B have it, from one launch
+    /// to the next.
+    var showsSidebar = UserDefaults.standard.object(forKey: Preference.sidebar) as? Bool ?? true {
+        didSet { UserDefaults.standard.set(showsSidebar, forKey: Preference.sidebar) }
+    }
     private(set) var installed: [InstalledModel] = []
     private(set) var blocker: Blocker?
     /// Whether the checks of `launch` are done; nothing starts before.

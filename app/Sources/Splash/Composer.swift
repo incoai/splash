@@ -140,22 +140,15 @@ private struct ContextRing: View {
     let usage: ContextUsage
 
     var body: some View {
-        ZStack {
-            Circle().stroke(.quaternary, lineWidth: 2)
-            Circle()
-                .trim(from: 0, to: usage.fraction)
-                .stroke(tint, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                .rotationEffect(.degrees(-90))
-        }
-        .frame(width: 14, height: 14)
-        // Room around the ring for the pointer to find its help.
-        .padding(5)
-        .contentShape(.rect)
-        .animation(Motion.settle, value: usage)
-        .help(usage.explanation)
-        .accessibilityElement()
-        .accessibilityLabel("Context")
-        .accessibilityValue(usage.explanation)
+        Ring(fraction: usage.fraction, tint: tint, size: 14)
+            // Room around the ring for the pointer to find its help.
+            .padding(5)
+            .contentShape(.rect)
+            .animation(Motion.settle, value: usage)
+            .help(usage.explanation)
+            .accessibilityElement()
+            .accessibilityLabel("Context")
+            .accessibilityValue(usage.explanation)
     }
 
     private var tint: AnyShapeStyle {
@@ -164,6 +157,26 @@ private struct ContextRing: View {
         case .tight: AnyShapeStyle(.orange)
         case .full: AnyShapeStyle(.red)
         }
+    }
+}
+
+/// How full something is, as a ring that `fraction`, from 0 to 1, fills in `tint` from the top
+/// clockwise, over a faint track, `size` points across: the context in the Chat's composer
+/// (`ContextRing`), and a download in the Server's button (`ServerButton`).
+struct Ring<Tint: ShapeStyle>: View {
+    let fraction: Double
+    let tint: Tint
+    let size: CGFloat
+
+    var body: some View {
+        ZStack {
+            Circle().stroke(.quaternary, lineWidth: 2)
+            Circle()
+                .trim(from: 0, to: fraction)
+                .stroke(tint, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+        }
+        .frame(width: size, height: size)
     }
 }
 

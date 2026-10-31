@@ -8,6 +8,8 @@ enum Preference {
     /// The model files on this Mac the user added, by path, which `splash serve` prepares.
     static let localModels = "localModels"
     static let agentFolder = "agentFolder"
+    /// Whether the Chat shows its sidebar.
+    static let sidebar = "sidebar"
     /// The reasoning effort chosen for each model, by its ID; none for its default.
     static let efforts = "efforts"
     /// The launch options set, by flag (`ServeSettings`).

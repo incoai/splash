@@ -72,7 +72,10 @@ the launch options picked in the app that differ from the server's defaults,
 ready once the port's lock names that process and `/health` answers; stopping
 is Ctrl+C's SIGINT to the group. Switching models stops one server and starts
 the next. The app starts nothing by itself: its window opens on the Server,
-where models download, start and switch, beside the Chat. Models, locks and
+where models download, start and switch, beside the Chat. The toolbar's switch
+opens the Chat, whose sidebar of conversations ⌘B hides, and the Server's
+button at its end the Server: it shows the model that runs, a start's step,
+the speed of an answer and a download's progress. Models, locks and
 downloads are the ones a packaged `splash` uses, in `~/Library/Application
 Support/Splash` and the Hugging Face cache. The app offers
 `install/suggested-models.tsv`, per model the variant meant for the Mac's
