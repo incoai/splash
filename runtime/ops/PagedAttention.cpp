@@ -230,12 +230,19 @@ std::array<metal::MetalBuffer, 2> blockBindings(const AttentionBlocks &blocks, c
 // dimension.
 metal::DispatchSize reduceThreads(kv::Layout layout) { return {layout.headDimension, 1, 1}; }
 
-// Each query tile's history splits: the maximum shared out over the chunk's
-// tiles, at least one, and with a window of windowTokens keys before each
-// row no more than the pages it reads (a split each).
+// Each query tile's history splits: the threadgroups a full chunk's tiles
+// fill, shared out over the chunk's tiles, at least one and at most the
+// kernel's maximum, and with a window of windowTokens keys before each row no
+// more than the pages it reads (a split each). A short chunk over a long
+// history (an agent's turn appended to a cached conversation) otherwise ran
+// one threadgroup per tile and KV head, each walking the whole history alone:
+// 300 rows over 9K tokens were 80 threadgroups on a 40-core GPU. The
+// workspace bound stays the full chunk's, since tiles * splits never exceeds
+// its tiles.
 uint32_t prefillSplits(uint32_t tiles, uint32_t windowTokens) {
+  constexpr uint32_t budget = kv::prefillAttentionTiles(kv::kChunkedPrefillMaximumRows);
   constexpr uint32_t maximum = SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS;
-  const uint32_t splits = std::clamp(maximum / tiles, 1U, maximum);
+  const uint32_t splits = std::clamp(budget / tiles, 1U, maximum);
   return windowTokens ? std::min(splits, kv::windowAttentionPages(windowTokens)) : splits;
 }
 

@@ -25,8 +25,9 @@ void attention() {
     for (uint32_t rows = 1; rows <= 2048; ++rows) {
       // Split counts decrease as the M8 tile count grows, so a shorter
       // request can need more scratch than the exact requested row count.
+      // A chunk shares the full chunk's 256 tile slots over its own tiles.
       const uint32_t tiles = (rows + 7) / 8;
-      const uint32_t splits = std::clamp(32U / tiles, 1U, 32U);
+      const uint32_t splits = std::clamp(256U / tiles, 1U, 32U);
       maximumSlots = std::max(maximumSlots, tiles * splits);
       const auto workspace = ops::PagedAttention::prefillWorkspace(rows, queryHeads, layout);
       require(workspace.partialsBytes == uint64_t{maximumSlots} * 8 * queryHeads * 256 * 4,
