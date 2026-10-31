@@ -37,11 +37,14 @@ SANDBOX_FAILED = 71
 # it is given, and reaches no network, no service and no other program. Of the
 # sysctls it reads those os.uname() needs. The rest it tries (the time zone,
 # the locale's data, the user database, the log) is refused and changes
-# nothing it writes: the pages are byte-identical outside the sandbox. No
-# profile refuses kern.procargs2, which tells any process of the user
-# another's arguments and the environment it started with, the server's
-# included. _sandbox() adds the interpreter's prefixes, which it reads, and
-# the symbolic links on the way to them.
+# nothing it writes: the pages are byte-identical outside the sandbox. It
+# learns nothing of other processes: kern.procargs2 tells any process of the
+# user another's arguments and the environment it started with, the server's
+# included, and the kernel checks it as process-info-pidinfo, which (deny
+# default) leaves open and (deny process-info*) refuses. Of itself it may
+# learn all: PDFium asks as it loads a page, and stops the worker (SIGTRAP)
+# when refused. _sandbox() adds the interpreter's prefixes, which it reads,
+# and the symbolic links on the way to them.
 PROFILE = """(version 1)
 (deny default)
 (allow process-exec (literal (param "PYTHON")))
@@ -58,6 +61,8 @@ PROFILE = """(version 1)
   (subpath "/Library/Fonts")
   (literal (param "ROOT"))
   (subpath (param "SERVER")))
+(deny process-info*)
+(allow process-info* (target self))
 """
 # The most symbolic links the kernel follows in resolving a path (MAXSYMLINKS).
 MAX_LINKS = 32
@@ -159,23 +164,28 @@ def _sandbox():
         "ROOT": str(ROOT),
         "SERVER": str(ROOT / "server"),
     }
-    profile = [PROFILE]
-    for operation, kind, name, paths in (
-        ("file-read*", "subpath", "PREFIX", map(os.path.realpath, prefixes)),
-        ("file-read-metadata", "literal", "LINK", map(str, links)),
-    ):
+
+    def allow(operation, kind, name, paths):
+        """The rule that allows `operation` on each of `paths`, a filter of
+        `kind` each, whose paths go in as the parameters NAME0, NAME1, ...;
+        none for no paths, as an allow without a filter allows the
+        operation everywhere."""
         filters = []
         for index, path in enumerate(dict.fromkeys(paths)):
             parameters[f"{name}{index}"] = path
             filters.append(f'\n  ({kind} (param "{name}{index}"))')
-        # An allow without a filter allows the operation everywhere.
-        if filters:
-            profile.append(f"(allow {operation}{''.join(filters)})\n")
+        return f"(allow {operation}{''.join(filters)})\n" if filters else ""
+
+    profile = (
+        PROFILE
+        + allow("file-read*", "subpath", "PREFIX", map(os.path.realpath, prefixes))
+        + allow("file-read-metadata", "literal", "LINK", map(str, links))
+    )
     return [
         SANDBOX_EXEC,
         *(f"-D{name}={value}" for name, value in parameters.items()),
         "-p",
-        "".join(profile),
+        profile,
         "--",
     ]
 

@@ -21,12 +21,17 @@ from server import document_worker, documents
 from server.errors import APIError
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "documents"
+# A variable another process of the user's started with, as the server did
+# with SPLASH_API_KEY.
+OTHERS = {"SPLASH_PROBE": "another process's secret"}
 # What an exploited PDFium could try, each attempt True when it succeeds; then
 # it starts another program, which prints nothing, or says it was refused.
 PROBE = r"""
 import ctypes, json, os, socket, sys
 
-home, private, folder, port, beside = sys.argv[1:]
+home, private, folder, port, beside, other = sys.argv[1:]
+# OTHERS, as the environment holds it.
+SECRET = "SPLASH_PROBE=another process's secret"
 system = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
 
 
@@ -54,6 +59,18 @@ def service():
         raise OSError("bootstrap_look_up")
 
 
+def environment(pid):
+    # kern.procargs2 (CTL_KERN, KERN_PROCARGS2): a process's arguments and
+    # the environment it started with.
+    name = (ctypes.c_int * 3)(1, 49, pid)
+    size = ctypes.c_size_t(1 << 16)
+    found = ctypes.create_string_buffer(size.value)
+    if system.sysctl(name, 3, found, ctypes.byref(size), None, 0):
+        raise OSError("sysctl")
+    if SECRET.encode() not in found.raw[: size.value]:
+        raise OSError("not its environment")
+
+
 print(json.dumps({
     "home": attempt(lambda: os.listdir(home)),
     "private": attempt(lambda: open(private).read()),
@@ -64,6 +81,7 @@ print(json.dumps({
     ),
     "fork": attempt(fork),
     "service": attempt(service),
+    "others": attempt(lambda: environment(int(other))),
     "environment": dict(os.environ),
 }), flush=True)
 try:
@@ -233,6 +251,10 @@ class SandboxTests(unittest.TestCase):
             socket.create_server(("127.0.0.1", 0)) as listener,
             mock.patch.dict(os.environ, {"SPLASH_API_KEY": "server secret"}),
         ):
+            other = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"], env=OTHERS
+            )
+            self.addCleanup(document_worker._stop, other)
             private = Path(folder, "private")
             private.write_text("private")
             arguments = [
@@ -244,6 +266,7 @@ class SandboxTests(unittest.TestCase):
                 str(listener.getsockname()[1]),
                 # The folder holding server/, beside the server package.
                 str(document_worker.ROOT / "docs" / "api.md"),
+                str(other.pid),
             ]
             outputs = {
                 sandboxed: run(arguments, sandboxed=sandboxed)
@@ -257,6 +280,7 @@ class SandboxTests(unittest.TestCase):
             "connect",
             "fork",
             "service",
+            "others",
         )
         for sandboxed, (status, output) in outputs.items():
             self.assertEqual(status, 0)
