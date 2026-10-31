@@ -1,7 +1,7 @@
 import SwiftUI
 
-/// The width of the composer: the transcript's column (`main`'s max-width in
-/// Transcript/transcript.css), so that the two line up.
+/// The width of the composer: the transcript's column (`main`'s max-width in Shared/page.css), so
+/// that the two line up.
 private let column: CGFloat = 680
 
 /// The conversations at the side of the open one. The window's toolbar is the Server's, so the
@@ -120,7 +120,7 @@ private struct ConversationView: View {
         let shown = state.chats.current.flatMap { $0.messages.isEmpty ? nil : $0 }
         VStack(spacing: 0) {
             if let conversation = shown {
-                TranscriptView(transcript: state.transcript, page: page(conversation))
+                LiveTranscript(page: page(conversation))
                     // The line the window draws under its toolbar over a scroll view there, which
                     // a web view isn't to it.
                     .overlay(alignment: .top) { Rectangle().fill(.separator).frame(height: 1 / displayScale) }
@@ -149,12 +149,26 @@ private struct ConversationView: View {
             .padding(.bottom, 24)
     }
 
-    /// `conversation` as the page shows it, its reply streaming and Ask Again as the Server allows.
+    /// `conversation` as the page shows it, Ask Again as the Server allows.
     private func page(_ conversation: Conversation) -> TranscriptPage {
         let server = state.server
         let askAgain = TranscriptPage.AskAgain(enabled: server.answers && state.chats.streaming == nil,
                                                help: "Ask \(server.model.map(state.displayName(of:)) ?? "the model") Again")
-        return TranscriptPage(conversation, live: state.chats.live, asleep: server.asleep, askAgain: askAgain,
-                              name: state.displayName(of:))
+        return TranscriptPage(conversation, askAgain: askAgain, name: state.displayName(of:))
+    }
+}
+
+/// The transcript of the open conversation, with the reply that streams in it: a view of its own,
+/// the one that reads the reply, so that each flush of it draws the transcript alone, which sends
+/// the page that reply, and the conversation, the same, is neither built nor compared again.
+private struct LiveTranscript: View {
+    @Environment(AppState.self) private var state
+    let page: TranscriptPage
+
+    var body: some View {
+        let reply = state.chats.reply.flatMap { $0.conversation == page.id ? $0 : nil }
+        TranscriptView(transcript: state.transcript, page: page, reply: reply.map {
+            TranscriptMessage($0.message, live: $0.live, asleep: state.server.asleep, name: state.displayName(of:))
+        })
     }
 }

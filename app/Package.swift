@@ -18,8 +18,9 @@ let package = Package(
             name: "Splash",
             dependencies: [.product(name: "Sparkle", package: "Sparkle")],
             path: "Sources/Splash",
-            // The Chat's transcript is a web page, in Transcript/.
-            resources: [.copy("Transcript")],
+            // The Chat's transcript is a web page, in Transcript/, with what the app's pages share
+            // in Shared/.
+            resources: [.copy("Transcript"), .copy("Shared")],
             // Where the executable finds Sparkle.framework: in Contents/Frameworks of Splash.app, and
             // beside it in .build, for a build run from there.
             linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks",

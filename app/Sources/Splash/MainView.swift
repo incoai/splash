@@ -40,7 +40,7 @@ struct MainView: View {
                 AccessibilityNotification.Announcement(status).post()
             }
             // The Chat's page loads with the window, so that the Chat shows at once.
-            .onAppear { state.transcript.load() }
+            .onAppear { state.transcript.page.load() }
     }
 
     @ViewBuilder private var content: some View {

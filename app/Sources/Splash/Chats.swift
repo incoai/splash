@@ -59,18 +59,35 @@ final class ChatStore {
         var read: Double?
     }
 
+    /// The reply that streams as it stands, apart from the conversations, which hold it empty until
+    /// it ends and goes into its conversation, once: an object of its own, which the transcript
+    /// alone reads, so that each flush of it draws the transcript and nothing else, not the list of
+    /// conversations and its search, nor the composer, which read the conversations.
+    @MainActor @Observable
+    final class Reply {
+        let conversation: UUID
+        fileprivate(set) var message: ChatMessage
+        fileprivate(set) var live: Live
+
+        fileprivate init(_ message: ChatMessage, in conversation: UUID) {
+            self.conversation = conversation
+            self.message = message
+            live = Live(conversation: conversation, asked: .now)
+        }
+    }
+
     private(set) var conversations: [Conversation] = []
     /// The open conversation; nil is a new one, saved once it has a message.
     var selection: UUID?
-    private(set) var live: Live?
+    private(set) var reply: Reply?
 
     /// The conversation whose reply streams now, the open one or another.
-    var streaming: UUID? { live?.conversation }
+    var streaming: UUID? { reply?.conversation }
 
     static let folder = URL.applicationSupportDirectory.appending(path: "Splash/Chats")
 
     private let folder: URL
-    private var reply: Task<Void, Never>?
+    private var replying: Task<Void, Never>?
     /// Writes and removes the conversations' files in the order they change, off the main thread:
     /// a conversation with images takes milliseconds to encode and write, which a send and a
     /// reply's end would otherwise wait for.
@@ -129,7 +146,7 @@ final class ChatStore {
 
     /// Stops the reply; what it said so far stays.
     func stop() {
-        reply?.cancel()
+        replying?.cancel()
     }
 
     private func stream(_ conversation: Conversation, to server: ChatTarget) {
@@ -140,8 +157,9 @@ final class ChatStore {
         conversation.updated = .now
         put(conversation)
         selection = conversation.id
-        live = Live(conversation: conversation.id, asked: .now)
-        reply = Task { [weak self] in
+        let reply = Reply(answer, in: conversation.id)
+        self.reply = reply
+        replying = Task { [weak self] in
             var shown = ContinuousClock.now
             var thinking: Date?
             var read: Double?
@@ -149,7 +167,7 @@ final class ChatStore {
                 for try await delta in ChatClient.stream(history, with: server) {
                     if !delta.reasoning.isEmpty, thinking == nil {
                         thinking = .now
-                        self?.live?.thinking = thinking
+                        reply.live.thinking = thinking
                     }
                     if !delta.text.isEmpty, answer.text.isEmpty, let thinking {
                         answer.thinkingTime = Date.now.timeIntervalSince(thinking)
@@ -161,11 +179,12 @@ final class ChatStore {
                     read = delta.read ?? read
                     // Asked for no limit, a reply runs to the end of the context.
                     if delta.cut { answer.error = "The reply reached the end of the model’s context." }
-                    // A redraw of the whole reply per token would be wasted work.
+                    // A redraw per token would be wasted work: the page lets out what comes at an
+                    // even pace (Shared/page.js).
                     if ContinuousClock.now - shown > .milliseconds(50) {
                         shown = .now
-                        self?.live?.read = read
-                        self?.update(conversation.id, answer, save: false)
+                        reply.live.read = read
+                        reply.message = answer
                     }
                 }
                 // Cancelled, the stream just ends; what it said stays.
@@ -175,22 +194,20 @@ final class ChatStore {
             }
             // A reply that ended while the model still thought.
             if let thinking, answer.thinkingTime == nil { answer.thinkingTime = Date.now.timeIntervalSince(thinking) }
-            self?.update(conversation.id, answer, save: true)
-            self?.live = nil
+            self?.finish(answer, in: conversation.id)
+            self?.reply = nil
         }
     }
 
-    private func update(_ conversation: UUID, _ message: ChatMessage, save: Bool) {
+    /// Puts the reply that ended, `message`, in its conversation, which it brings to the top, and
+    /// writes it.
+    private func finish(_ message: ChatMessage, in conversation: UUID) {
         guard var updated = conversations.first(where: { $0.id == conversation }),
               let index = updated.messages.firstIndex(where: { $0.id == message.id })
         else { return }
         updated.messages[index] = message
-        if save {
-            updated.updated = .now
-            put(updated)
-        } else if let position = conversations.firstIndex(where: { $0.id == conversation }) {
-            conversations[position] = updated
-        }
+        updated.updated = .now
+        put(updated)
     }
 
     /// Keeps `conversation` first, the most recent, and writes it.

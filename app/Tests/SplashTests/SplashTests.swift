@@ -451,6 +451,63 @@ struct ChatTests {
         #expect(ChatStore(folder: folder).conversations.isEmpty)
     }
 
+    @MainActor @Test func aReplyStreamsApartFromTheConversationsUntilItEnds() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        // A server that streams a reply in three parts, apart in time, on the port it prints.
+        let server = Process()
+        server.executableURL = URL(filePath: "/usr/bin/python3")
+        server.arguments = ["-c", """
+            import sys, time
+            from http.server import BaseHTTPRequestHandler, HTTPServer
+            class Handler(BaseHTTPRequestHandler):
+                def log_message(self, *args): pass
+                def do_POST(self):
+                    self.rfile.read(int(self.headers['Content-Length']))
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.end_headers()
+                    for part in ['One', ' two', ' three']:
+                        self.wfile.write(('data: {"choices":[{"delta":{"content":"%s"}}]}\\n\\n' % part).encode())
+                        self.wfile.flush()
+                        time.sleep(0.4)
+                    self.wfile.write(b'data: [DONE]\\n\\n')
+            server = HTTPServer(('127.0.0.1', 0), Handler)
+            print(server.server_port, flush=True)
+            server.handle_request()
+            """]
+        let output = Pipe()
+        server.standardOutput = output
+        try server.run()
+        defer { server.terminate() }
+        let port = try #require(String(data: output.fileHandleForReading.availableData, encoding: .utf8)
+            .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
+        let store = ChatStore(folder: folder)
+        store.send("Hi", images: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
+        func waitFor(_ condition: () -> Bool) async throws {
+            let deadline = ContinuousClock.now + .seconds(10)
+            while !condition() {
+                try #require(ContinuousClock.now < deadline, "timed out")
+                try await Task.sleep(for: .milliseconds(10))
+            }
+        }
+        // While it streams, the reply holds what came, and the conversation, which the list and
+        // the composer read, holds it empty and changes no more.
+        try await waitFor { store.reply?.message.text.isEmpty == false }
+        let first = store.reply?.message.text ?? ""
+        #expect(store.current?.messages.last?.text == "")
+        nonisolated(unsafe) var changed = false
+        withObservationTracking { _ = store.conversations } onChange: { changed = true }
+        try await waitFor { store.reply.map { $0.message.text != first } ?? true }
+        #expect(store.reply?.message.text.hasPrefix(first) == true)
+        #expect(!changed && store.current?.messages.last?.text == "")
+        // Once it ends, it goes into its conversation, which is written.
+        try await waitFor { store.streaming == nil }
+        #expect(changed && store.reply == nil && store.current?.messages.last?.text == "One two three")
+        store.flush()
+        #expect(ChatStore(folder: folder).conversations.first?.messages.last?.text == "One two three")
+    }
+
     @MainActor @Test func anAnswerTheAppQuitDuringSaysSo() throws {
         let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: folder) }
