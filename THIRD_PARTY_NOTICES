@@ -35,6 +35,15 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+oMLX (https://github.com/jundot/omlx)
+
+The INT8-activation prefill in runtime/metal/kernels/shared/gguf_prefill_a8.metal
+(its fragment schedule, the per-group affine correction and the activation
+quantizer) is adapted from oMLX's oQ A8 NAX kernel,
+omlx/custom_kernels/qwen35_prefill/csrc/qwen35_oq_a8_nax.metal and
+qwen35_oq_a8.metal, to Splash's weight planes. oMLX is licensed under the
+Apache License, Version 2.0, the license of Splash itself (LICENSE).
+
 markdown-it 15.0.2 (https://github.com/markdown-it/markdown-it)
 
 The chat page uses the vendored browser bundle in

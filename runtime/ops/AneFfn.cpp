@@ -390,12 +390,12 @@ std::string AneFfn::program(const Shape &shape, std::span<const Input> inputs, c
 }
 
 AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
-               std::function<bool()> interrupted)
-    : AneFfn(backend, layers, aneUnits, std::move(interrupted), functionRows()) {}
+               std::function<bool()> interrupted, bool prefillInt8)
+    : AneFfn(backend, layers, aneUnits, std::move(interrupted), functionRows(), prefillInt8) {}
 
 AneFfn::AneFfn(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, uint32_t aneUnits,
-               std::function<bool()> interrupted, std::span<const uint32_t> functionRows)
-    : backend_(backend), linear_(backend.capabilities()), shape_(shapeOf(layers, aneUnits)),
+               std::function<bool()> interrupted, std::span<const uint32_t> functionRows, bool prefillInt8)
+    : backend_(backend), linear_(backend.capabilities(), prefillInt8), shape_(shapeOf(layers, aneUnits)),
       handoff_(backend, kHandoffBound) {
   // What Metal allocates, which the memory audit compares with the plan.
   memory_ = allocate(

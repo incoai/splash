@@ -20,7 +20,8 @@ namespace splash::ops::ane_ffn {
 class Measurement final {
 public:
   Measurement(metal::MetalBackend &backend, std::span<const SwiGluProjections> layers, const PrefillFfnBuffers &ffn,
-              const std::array<metal::MetalBuffer, 2> &hidden, std::function<bool()> interrupted);
+              const std::array<metal::MetalBuffer, 2> &hidden, std::function<bool()> interrupted,
+              bool prefillInt8 = false);
 
   // The split's GPU part alone and its split layer of full chunks with the
   // ANE taking the channel units nearest two shares, and the GPU's FFN
