@@ -110,22 +110,31 @@ bool oneGateUpPass(const MoePlan &plan) noexcept { return plan.configuration().g
 // expertIntermediate (oneGateUpPass), or gate into expertOutput (the down
 // pass overwrites it after the up pass consumed it) and up with silu(gate)
 // into expertIntermediate; then down into expertOutput. The gate/up passes
-// read the grouped rows the gather writes into groupedInput, as Table16 tiles
-// on register plans, whose down pass reads the tiles a prepare dispatch
-// writes there.
+// read the grouped rows the gather writes into groupedInput: as Table16 tiles
+// on register prefill plans, whose down pass reads the tiles a prepare
+// dispatch writes there, and as bf16 rows on register decode plans, which
+// run the live-row passes (MoePlan::liveRows) and whose down pass reads the
+// up pass's output.
 void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const BlockMoeWeights &weights,
                 const MoePlan &plan, const MoeGroupParams &group) {
   const MoeShape shape = plan.shape();
   const uint32_t tiles = plan.maximumTiles();
-  const bool table16 = plan.configuration().ggufTile == MoeGgufTile::Register;
-  if (table16)
+  // Decode on the register tile runs the live-row passes over bf16 rows;
+  // prefill on it the register tile over Table16 tiles.
+  const bool registerTile = plan.configuration().ggufTile == MoeGgufTile::Register;
+  if (registerTile)
     for (const BlockExpertProjection *projection : {&weights.gate, &weights.up, &weights.down})
       for (const QuantizedSegment *s : {&projection->routed, &projection->shared})
         if (!quant_register_tensor(s->formatId, s->inputSize))
           throw std::invalid_argument(std::string("the register expert tile does not take ") + s->name() +
                                       " weights of " + std::to_string(s->inputSize) + " inputs");
-  const uint32_t threads = table16 ? GGUF_REGISTER_THREADS : GGUF_STAGED_THREADS;
-  const std::string kernel = table16 ? "moe_expert_gguf_sg" : "moe_expert_gguf_m" + std::to_string(plan.tileRows());
+  const bool liveRows = plan.liveRows();
+  const bool table16 = registerTile && !liveRows;
+  const uint32_t threads =
+      liveRows ? GGUF_EXPERT_ROWS_THREADS : table16 ? GGUF_REGISTER_THREADS : GGUF_STAGED_THREADS;
+  const std::string kernel = liveRows  ? "moe_expert_gguf_rows"
+                             : table16 ? "moe_expert_gguf_sg"
+                                       : "moe_expert_gguf_m" + std::to_string(plan.tileRows());
   // The passes' instances for the shape's shared slices.
   const std::string slices(compiledRouting(shape).slicesSuffix);
   const metal::IndirectGrid gateUpGrid{scratch.tileCount, offsetof(MoeTileCount, gate_up_grid)};
@@ -265,7 +274,7 @@ void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
   const uint32_t tiles = plan.maximumTiles();
   const MoeScratch &scratch = buffers.scratch;
   const MoeGatherParams gather{tileRows, shape.hiddenSize, shape.routesPerToken()};
-  if (plan.configuration().ggufTile == MoeGgufTile::Register)
+  if (plan.configuration().ggufTile == MoeGgufTile::Register && !plan.liveRows())
     graph.add("moe_gather_table16",
               {buffers.input, scratch.groupedRoutes, scratch.tileCount,
                scratch.groupedInput, scratch.groupedSums},

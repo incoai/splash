@@ -401,6 +401,11 @@ public:
   [[nodiscard]] const MoeWorkspace &workspace() const noexcept {
     return workspace_;
   }
+  // Whether the expert passes run on the tiles' live rows
+  // (kernels/decode/moe_rows.metal): decode plans on the register tile.
+  [[nodiscard]] bool liveRows() const noexcept {
+    return phase_ == MoePhase::Decode && config_.ggufTile == MoeGgufTile::Register;
+  }
 
 private:
   friend struct MoE;
