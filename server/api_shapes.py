@@ -196,18 +196,29 @@ def normalize_messages(messages, *, vision, deadline, without_slot):
     return normalized
 
 
-def template_messages(messages):
-    """Keep a call whose arguments are text, not an object, as text, without
-    presenting it as a complete call."""
+def template_messages(messages, *, syntax=None):
+    """Keep as text, without presenting it as a complete call, a call whose
+    arguments are text, not an object, and one whose function's name the
+    chat template refuses, as `syntax`, the layout of its calls, says
+    (ToolCallSyntax.refuses_name): a model that calls tools freely may call
+    one by any name, made up or read in a page, and the conversation that
+    holds the call goes on."""
+
+    def as_text(call):
+        function = call["function"]
+        return isinstance(function["arguments"], str) or (
+            syntax is not None and syntax.refuses_name(function["name"])
+        )
+
     result = []
     for message in messages:
         calls = message.get("tool_calls", [])
-        if not any(isinstance(call["function"]["arguments"], str) for call in calls):
+        if not any(as_text(call) for call in calls):
             result.append(message)
             continue
         current = {key: value for key, value in message.items() if key != "tool_calls"}
         for call in calls:
-            if not isinstance(call["function"]["arguments"], str):
+            if not as_text(call):
                 current.setdefault("tool_calls", []).append(call)
                 continue
             if any(

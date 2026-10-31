@@ -238,20 +238,30 @@ class LocalModelTest(unittest.TestCase):
         ):
             self.prepare(target)
 
-    def test_a_family_without_a_released_draft_needs_a_draft(self):
+    def test_a_family_without_a_released_draft_prepares_without_one(self):
         target = self.gguf(self.root / "model-Q2_0.gguf", FLASH_NEXT)
         unreleased = dataclasses.replace(FLASH_NEXT, draft_repo=None)
         with mock.patch.object(families, "FAMILIES", (unreleased,)):
-            with self.assertRaisesRegex(
-                models.ModelError,
-                "no DFlash2 draft is released for Qwen3.8-Flash-Next; pass the "
-                "directory of one as draft",
-            ):
-                self.prepare(target)
+            alone = self.prepare(target)
             record = assembly.verify(
                 self.prepare(target, draft_dir(self.root / "draft", FLASH_NEXT))
             )
+        self.assertEqual(
+            assembly.verify(alone)["sources"]["draft"],
+            {"repo": models.NO_DRAFT, "revision": None},
+        )
+        self.assertFalse((alone / "draft").exists())
         self.assertEqual(record["family"], FLASH_NEXT.name)
+
+    def test_draft_none_prepares_the_target_alone(self):
+        target = self.gguf(self.root / "model-Q2_0.gguf", FLASH_NEXT)
+        alone = self.prepare(target, models.NO_DRAFT)
+        record = assembly.verify(alone)
+        self.assertEqual(
+            record["sources"]["draft"], {"repo": models.NO_DRAFT, "revision": None}
+        )
+        self.assertFalse((alone / "draft").exists())
+        self.assertNotIn("draft/config.json", record["files"])
 
     def test_an_mlx_target_serves_images_with_its_own_tower(self):
         shards = {
@@ -454,6 +464,26 @@ class LocalModelTest(unittest.TestCase):
             models.ModelError, f"{prepared} names no model Splash prepared"
         ):
             assembly.hold(prepared)
+
+    def test_a_new_selection_reads_no_digest_another_installation_records(self):
+        # A file another installation records, unchanged since, is not read
+        # again for its digest: another draft for an installed target reads
+        # the draft's files alone.
+        target = self.gguf(self.root / "model" / "model-Q4_K_M.gguf")
+        self.prepare(target, draft_dir(self.root / "draft", MOE))
+        other = draft_dir(self.root / "other-draft", MOE)
+        hashed = []
+        hash_file = models.hash_file
+
+        def counted(path, digest):
+            hashed.append(Path(path).resolve())
+            return hash_file(path, digest)
+
+        with mock.patch.object(models, "hash_file", counted):
+            again = self.prepare(target, other)
+        self.assertNotIn(target.resolve(), hashed)
+        self.assertIn((other / "model.safetensors").resolve(), hashed)
+        assembly.verify(again, full=True)
 
     def test_a_files_digest_is_read_before_the_installation_lock(self):
         # A file's first digest is read before the installation lock, which

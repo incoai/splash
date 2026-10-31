@@ -1,13 +1,16 @@
 # What the engine's memory and caches take from each family Splash serves
 # (model::kFamilies), as dev/tests/engine/family_values_test.cpp writes it,
 # family by family in kFamilies' order, each with the draft
-# dev/tests/fixtures/model-configs describes for it:
+# dev/tests/fixtures/model-configs describes for it, or none for a family
+# that decodes without one (DeepSeek-V4.1-Flash):
 #
 #   kv: the target's KV layout (kv::Layout) and its sliding window, if it
 #     has one;
-#   kv <format>: a page's bytes, Full and Index (kv::PageForm), and Slim for
-#     a layout whose pages can be Slim (kv::Layout::slimmable), the extent
-#     alignment and the smallest and largest extent, in pages;
+#   kv <format>: with --kv-format <format>, in the family's own format
+#     where it fixes one (ModelDescriptor::kvLayout): a page's bytes, Full
+#     and Index (kv::PageForm), and Slim for a layout whose pages can be Slim
+#     (kv::Layout::slimmable), the extent alignment and the smallest and
+#     largest extent, in pages;
 #   kv <format> extent-pages: the extent of a pool of so many pages
 #     (kv::Layout::extentPagesFor);
 #   state <format>: a GDN cell's, a lane's and a cached state's bytes
@@ -78,3 +81,15 @@ namespace bf16 fp32 b06e435b51f8c94636cf3a72acdcfc26
 state bf16 cell 0 lane 10747904 cached 2359296
 namespace int8 bf16 b0dbac8e4f941ecd3e28c87cc3d2c58a
 namespace bf16 bf16 b06e435b51f8c94636cf3a72acdcfc26
+family DeepSeek-V4.1-Flash
+kv layers 4 heads 1 dimension 512 index 0 values-token-major
+kv int8 page 262144 index-page 0 alignment 2 extents 256..768
+kv int8 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:0 129:0 255:0 256:256 257:256 511:510 512:512 1000:500 4095:372 4096:512 10000:500 65535:434 65536:512 100000:500 262144:512 1000000:500
+kv bf16 page 262144 index-page 0 alignment 2 extents 256..768
+kv bf16 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:0 129:0 255:0 256:256 257:256 511:510 512:512 1000:500 4095:372 4096:512 10000:500 65535:434 65536:512 100000:500 262144:512 1000000:500
+state fp32 cell 5259264 lane 10518528 cached 5259264
+namespace int8 fp32 40e32131f7bc468476c4bebd81d5de8c
+namespace bf16 fp32 40e32131f7bc468476c4bebd81d5de8c
+state bf16 cell 5259264 lane 10518528 cached 5259264
+namespace int8 bf16 40e32131f7bc468476c4bebd81d5de8c
+namespace bf16 bf16 40e32131f7bc468476c4bebd81d5de8c

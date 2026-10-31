@@ -259,6 +259,19 @@ void requireMetadata(const GgufMetadata &metadata, std::string_view architecture
 [[nodiscard]] std::vector<Image> planImages(const GgufFile &file, std::string_view architecture,
                                             const QwenTargetDimensions &geometry, PlanOptions options = {});
 
+// The images of a DSpark draft's GGUF (architecture dflash, model/DSpark.hpp):
+// each of its layers' (DeepSeek-V4.1's of window attention alone, `layers`
+// its geometry, DeepSeek41Gguf::layer), then its head's: the norm of the
+// target's rows (enc.output_norm) and their projection from `mainLayers`
+// target layers' (fc), its output norm, its Markov head's projection of rank
+// `markovRank` (markov_w2, run in fp32) and its confidence head's weights
+// (conf_proj); then its Markov head's embedding rows (markov_w1) in the
+// embedding's place, as it borrows the target's token embedding and head.
+// Checks the metadata as planImages does a target's; throws GgufError naming
+// every mismatch.
+[[nodiscard]] std::vector<Image> planDSparkImages(const GgufFile &file, const QwenTargetDimensions &layers,
+                                                  uint32_t mainLayers, uint32_t markovRank);
+
 // Where the GGUF holds the rows of the tensor `name`, a table of `columns`
 // values a row whose image copies its native rows as stored (a family's
 // table), for reading them from the file. Throws GgufError for a tensor of a

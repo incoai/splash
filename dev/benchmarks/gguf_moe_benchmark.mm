@@ -1,9 +1,11 @@
 // GPU time of one sparse MoE layer in GGUF formats through ops::MoE, the numbers behind the MoE plans of ops/MoE.cpp,
 // at the 35B's shape (hidden 2048, 256 experts, top 8, intermediate 512), Qwen3.8-Flash-Next's (hidden 2560, 512
-// experts, top 10, intermediate 640) or Flint's (hidden 2048, 256 experts, top 6 by a sigmoid router, intermediate
-// 512, an ungated shared expert of two 512-wide slices), by default in the 35B UD-Q4_K_M's formats (Q4_K gate/up and
-// Q5_K down experts, a Q8_0 shared expert) with an F32 router:
-//   gguf-moe-benchmark <metallib> [35b|flash-next|flint] [rounds] [gate/up format] [down format] [shared format]
+// experts, top 10, intermediate 640), Flint's (hidden 2048, 256 experts, top 6 by a sigmoid router, intermediate
+// 512, an ungated shared expert of two 512-wide slices) or DeepSeek-V4.1-Flash's (hidden 5120, 384 experts, top 6
+// by a sqrt-softplus router, intermediate 2304, an ungated shared expert), by default in the 35B UD-Q4_K_M's formats
+// (Q4_K gate/up and Q5_K down experts, a Q8_0 shared expert) with an F32 router:
+//   gguf-moe-benchmark <metallib> [35b|flash-next|flint|deepseek] [rounds] [gate/up format] [down format]
+//                      [shared format]
 // - decode steps of one to four lanes of 8 rows on the device's plan and on the other GGUF tile, each row routed to
 //   top-k experts drawn at random from all of them (random) or, per lane of 8 rows, from a pool of three times top-k
 //   (pooled: the rows of a verify sharing their experts), with the share of the plan's expert tiles that run the
@@ -88,7 +90,13 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
   // An ungated block's weights carry no scalar gate.
   const QuantizedSegment sharedGateSegment =
       shape.sharedGate ? floatSegment(backend, sharedGate, 1, H) : QuantizedSegment{};
-  BlockMoeWeights gguf{routerSegment, sharedGateSegment,
+  // A sqrt-softplus router's selection bias, none.
+  const MetalBuffer selectionBias =
+      shape.router == splash::ops::MoeRouter::SqrtSoftplusNormalized
+          ? backend.allocateBuffer(uint64_t{E} * sizeof(float), BufferStorage::Shared, "selection-bias")
+          : MetalBuffer{};
+  if (selectionBias) std::memset(selectionBias.contents(), 0, uint64_t{E} * sizeof(float));
+  BlockMoeWeights gguf{routerSegment, sharedGateSegment, selectionBias,
                        {planes(gateUpFormat, E * I, H), planes(sharedFormat, shape.sharedSlices * I, H)},
                        {planes(gateUpFormat, E * I, H), planes(sharedFormat, shape.sharedSlices * I, H)},
                        {planes(downFormat, E * H, I), planes(sharedFormat, shape.sharedSlices * H, I)},
@@ -217,18 +225,26 @@ int main(int argc, const char *argv[]) {
     const std::string shapeName = argc > 2 ? argv[2] : "35b";
     const Fmt gateUp = argc > 4 ? fmtNamed(argv[4]) : Q4K, down = argc > 5 ? fmtNamed(argv[5]) : Q5K,
               shared = argc > 6 ? fmtNamed(argv[6]) : Q80;
-    if (argc < 2 || argc > 7 || (shapeName != "35b" && shapeName != "flash-next" && shapeName != "flint") ||
+    if (argc < 2 || argc > 7 ||
+        (shapeName != "35b" && shapeName != "flash-next" && shapeName != "flint" && shapeName != "deepseek") ||
         gateUp == FMT_COUNT || down == FMT_COUNT || shared == FMT_COUNT) {
-      std::cerr << "usage: gguf-moe-benchmark <metallib> [35b|flash-next|flint] [rounds] [gate/up format] "
+      std::cerr << "usage: gguf-moe-benchmark <metallib> [35b|flash-next|flint|deepseek] [rounds] [gate/up format] "
                    "[down format] [shared format]\n";
       return 2;
     }
-    const bool flashNext = shapeName == "flash-next", flint = shapeName == "flint";
-    const uint32_t H = flashNext ? 2560 : 2048, I = flashNext ? 640 : 512;
+    const bool flashNext = shapeName == "flash-next", flint = shapeName == "flint", deepseek = shapeName == "deepseek";
+    // DeepSeek-V4.1-Flash's (hidden 5120, 384 experts, top 6, intermediate
+    // 2304, one ungated shared expert, a sqrt-softplus router).
+    const uint32_t H = deepseek ? 5120 : flashNext ? 2560 : 2048, I = deepseek ? 2304 : flashNext ? 640 : 512;
     // gate and up hold most of the routed expert weights.
-    MoeShape shape{H, flashNext ? 512u : 256u, flashNext ? 10u : flint ? 6u : 8u, I, uint32_t(gateUp),
+    MoeShape shape{H, deepseek ? 384u : flashNext ? 512u : 256u, flashNext ? 10u : flint || deepseek ? 6u : 8u, I,
+                   uint32_t(gateUp),
                    quant_register_tensor(gateUp, H) && quant_register_tensor(down, I) &&
                        quant_register_tensor(shared, H) && quant_register_tensor(shared, I)};
+    if (deepseek) {
+      shape.router = splash::ops::MoeRouter::SqrtSoftplusNormalized;
+      shape.sharedGate = false;
+    }
     if (flint) {
       shape.router = splash::ops::MoeRouter::SigmoidNormalized;
       shape.sharedSlices = 2;

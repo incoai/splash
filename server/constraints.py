@@ -12,7 +12,7 @@ from llguidance.numpy import (
 )
 
 from . import runtime as engine_runtime
-from .chat_format import THINK_END, THINK_START, TOOL_CALL_OPEN
+from .chat_format import THINK_END, THINK_START
 from .errors import APIError, ConstraintError
 from .lru import LRUCache
 
@@ -110,8 +110,8 @@ def validate_tokenizer(tokenizer, chat_format):
     the engine and the server read the model's output by, as that format
     has them: its vocabulary must fit the model's, the engine's stop tokens,
     the close of thinking, the model's own opening of it where the model
-    opens it, and a call's opening must each be one token, and its EOS one
-    of the stop tokens."""
+    opens it, and the marker a call's opening holds must each be one token,
+    and its EOS one of the stop tokens."""
     vocabulary = tokenizer.get_vocab()
     if not vocabulary or any(
         type(token_id) is not int or not 0 <= token_id < chat_format.vocabulary
@@ -123,7 +123,7 @@ def validate_tokenizer(tokenizer, chat_format):
     expected = {
         **dict(chat_format.stop_tokens),
         THINK_END: chat_format.think_end_id,
-        TOOL_CALL_OPEN: chat_format.call_open_id,
+        chat_format.call_syntax.marker: chat_format.call_open_id,
     }
     if chat_format.think_start_id is not None:
         expected[THINK_START] = chat_format.think_start_id

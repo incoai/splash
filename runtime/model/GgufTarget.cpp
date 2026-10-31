@@ -43,6 +43,18 @@ GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &i
   planned_->experts = experts;
 }
 
+GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
+                                   const std::vector<std::filesystem::path> &paths,
+                                   const std::function<std::vector<gguf::Image>(const GgufFile &)> &plan,
+                                   uint32_t layers, std::string directory)
+    : backend_(backend), images_(images), planned_(std::make_shared<Planned>(paths)),
+      directory_(std::move(directory)) {
+  planned_->images = plan(planned_->source.file());
+  if (planned_->images.size() < uint64_t{layers} + 2)
+    throw GgufError("a GGUF's plan holds no head or embedding past its layers");
+  planned_->layers = layers;
+}
+
 StreamedBlocks GgufTargetLoader::streamedExperts() const {
   const std::span layers = std::span(planned_->images).first(planned_->layers);
   return {gguf::streamedExperts(layers.subspan(planned_->firstMoeLayer)), planned_,
@@ -74,12 +86,12 @@ std::optional<GgufTargetLoader::StreamedTable> GgufTargetLoader::streamTable() c
                                        planned_->table),
       rows.format,
       // As WeightImages::load records the image (WeightFile).
-      {"target/" + plan->name, plan->magic, plan->layer, plan->type, plan->bytes, images_.contentIdentity()}};
+      {directory_ + plan->name, plan->magic, plan->layer, plan->type, plan->bytes, images_.contentIdentity()}};
 }
 
 WeightFile GgufTargetLoader::open(size_t index) {
   const gguf::Image &plan = planned_->images[index];
-  return images_.load({"target/" + plan.name, plan.magic, plan.layer, plan.type, plan.bytes,
+  return images_.load({directory_ + plan.name, plan.magic, plan.layer, plan.type, plan.bytes,
                        [&backend = backend_, planned = planned_, index](std::span<uint8_t>,
                                                                          const metal::MetalBuffer &buffer) {
                          writeGgufImage(backend, buffer, planned->images[index]);

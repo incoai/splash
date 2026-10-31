@@ -427,7 +427,10 @@ void reportStreamedStores(const model::LoadedModel &loaded, const model::Streama
 
 // The rows the target's decode cycles verify (--verify-rows), and why.
 void reportVerifyRows(const model::LoadedModel &loaded, model::VerifyRows rows) {
-  if (model::budgetsVerifyRows(loaded, rows))
+  if (!loaded.descriptor.draft.present())
+    logLine("Decode cycles verify each lane's anchor alone: ", loaded.name(),
+            " has no draft (--draft-model none), and decodes one token a cycle.");
+  else if (model::budgetsVerifyRows(loaded, rows))
     logLine("Decode cycles verify the rows the verify budget chooses (--verify-rows auto, as ", loaded.name(),
             " is a MoE target): greedy and seeded outputs can differ from run to run.");
   else if (rows == model::VerifyRows::All)
@@ -491,7 +494,7 @@ std::array<uint8_t, 32> parseSha256(std::string_view value) {
 
 void requireLoadedModel(const model::LoadedModel &loaded) {
   if (!loaded.targetActualAllocatedBytes() ||
-      !loaded.draft.actualAllocatedBytes ||
+      (loaded.descriptor.draft.present() && !loaded.draft.actualAllocatedBytes) ||
       (loaded.descriptor.hasVision() && !loaded.vision.actualAllocatedBytes) ||
       loaded.manifestFingerprintSha256.empty() ||
       loaded.targetManifestFingerprint().empty()) {
@@ -724,8 +727,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // rest on its weights' formats, but which one load gives for whatever
   // streams of it (model::StreamedParts); and on the SSD cache's room for
   // active KV and whether its KV file opened.
-  kv::Layout kvLayout = config.model.targetKvLayout;
-  kvLayout.format = config.kvFormat;
+  kv::Layout kvLayout = config.model.kvLayout(config.kvFormat);
   // How the KV tier lays a page out in its slot, and so the slots' size.
   const kv::SlotFormat kvFormat(kvLayout);
   const uint64_t kvSlotBytes = model::SlotFile::slotBytesFor(kvFormat.payloadBytes());
@@ -778,7 +780,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
          .requestedContextTokens = requestedContextTokens,
          .relaunchContextTokens = relaunchContext,
          .experts = {streamable.expertBytes, streamable.expertMinimumBytes, experts},
-         .table = {streamable.tableBytes, streamable.tableMinimumBytes, table},
+         .table = {streamable.tableBytes, streamable.tableMinimumBytes, table, streamable.tableStreamsOnly},
          .hotCacheBytes = config.sparseKvMemory,
          .sparseKv = config.model.capabilities.sparseKv,
          .tierWritable = stagingBytes && kvFileOpen,
@@ -836,6 +838,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     streamable = model::streamableWeights(
         config.modelRoot, config.model,
         {.streamExperts = true, .streamTable = config.pleMemory.mode != StreamedSetting::Mode::Off});
+    // A table that only streams never loads with the weights.
+    if (streamable.tableStreamsOnly && config.pleMemory.mode == StreamedSetting::Mode::Off)
+      throw RuntimeResourcesError(RuntimeResourceStage::Configuration,
+                                  "--ple-memory off cannot load " + std::string(config.model.family()) +
+                                      "'s table: it only streams from its file");
     if (!streamable.tableRefusal.empty()) {
       if (config.pleMemory.mode == StreamedSetting::Mode::Size)
         throw RuntimeResourcesError(RuntimeResourceStage::Configuration,

@@ -394,7 +394,9 @@ uint64_t QwenStateStorage::missingBytes(uint32_t cells, bool rings) const noexce
 }
 
 uint32_t QwenStateStorage::statesToActivate() const noexcept {
-  if (!idleRings())
+  // No cached state holds draft rings; a model without a draft has rings of
+  // no bytes, which take nothing.
+  if (!idleRings() && layout_.draft.ringBytes())
     return std::numeric_limits<uint32_t>::max();
   // A lane takes no cell when its cells have no bytes.
   const uint32_t laneCells = emptyCell_ ? 0 : CompositeStateLayout::kLaneGdnCells;

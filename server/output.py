@@ -8,7 +8,7 @@ from jsonschema.exceptions import ValidationError
 from referencing.exceptions import Unresolvable
 
 from . import json_codec
-from .chat_format import THINK_END, THINK_START, TOOL_CALL_CLOSE
+from .chat_format import THINK_END, THINK_START
 from .errors import APIError
 from .schema_validation import SchemaEvaluationError
 from .tool_schema import (
@@ -122,6 +122,9 @@ class ReasoningSplitter:
 
 
 _NOT_JSON = object()
+# The types a value its template marks as JSON (DSML's string="false") reads by
+# where its schema gives it none: the JSON it spells, whatever its kind.
+_MARKED_JSON = frozenset(JSON_TYPES.values()) - {"string"}
 # A template that writes a value through Jinja's string filter, as Nex's and
 # some of Qwen's do, spells a boolean or null as Python does.
 _PYTHON_LITERALS = {"True": True, "False": False, "None": None}
@@ -181,23 +184,27 @@ class StreamingToolCallProjector:
     JSON argument deltas, for streamed and complete responses alike.
 
     A call opens at the syntax's call_open and names its function up to its
-    name_end. Each parameter is key_open, a name up to key_close, and a
-    value, without the value_open the template sets before it, that ends at
-    value_close where the next parameter's opening, the arguments' close or
-    the call's close follows (value_ends), so a value may hold the tags in
-    any other order. The arguments' close or the call's close ends the call,
-    and the </tool_call> after an arguments' close (Qwen's </function>) may
-    be left out. Names lose the space around them; an opening that names no
-    function, or a name too long to be one, opens no call and reads as the
-    text the model wrote, other text inside a call is dropped, and a repeated
-    parameter keeps its first value, which may have streamed. A value whose
-    schema gives it no type, or the type string alone, is its text and
-    streams as it is written; any other converts at its end by the types its
-    tool declares for it (convert_value). Text outside calls streams as it
+    name_end. Each parameter is key_open, a name up to one of its
+    key_closes, and a value, without the value_open the template sets before
+    it, that ends at value_close where the next parameter's opening, the
+    arguments' close or the call's close follows (value_ends), so a value
+    may hold the tags in any other order. The arguments' close or the call's
+    close ends the call, and the </tool_call> after an arguments' close
+    (Qwen's </function>) may be left out. Names lose the space around them;
+    an opening that names no function, or a name too long to be one, opens
+    no call and reads as the text the model wrote, other text inside a call
+    is dropped, and a repeated parameter keeps its first value, which may
+    have streamed. A value whose schema gives it no type, or the type string
+    alone, is its text and streams as it is written; any other converts at
+    its end by the types its tool declares for it (convert_value), and one
+    whose schema gives it none but that its template marks as JSON (DSML's
+    string="false") as the JSON it spells. Text outside calls streams as it
     arrives, after a call as before one, and a </think> there is dropped: a
     model may write one again after its reasoning has ended, after its own
     </think>, a call's opening or a budget's forced end, or with thinking
-    off.
+    off. So are the tags around a block of calls (DSML's calls), and the
+    whitespace after them frames the calls as the whitespace after a call
+    does.
 
     Without a tool policy the output has no calls: a call's opening is text,
     and the projector only drops the </think>s, so that every answer reads
@@ -211,7 +218,9 @@ class StreamingToolCallProjector:
         # The layout its calls are read in, which a tool policy needs.
         self.syntax = syntax
         self.text_tags = (
-            (syntax.call_open, THINK_END) if policy is not None else (THINK_END,)
+            (syntax.call_open, THINK_END, *syntax.block_tags)
+            if policy is not None
+            else (THINK_END,)
         )
         self.pending = ""
         self.state = "output" if structured else "content"
@@ -311,7 +320,7 @@ class StreamingToolCallProjector:
         self.parameter_count += 1
         return f"{separator}{json_codec.dumps(name)}:"
 
-    def _begin_parameter(self, name, events):
+    def _begin_parameter(self, name, events, marked_json=False):
         name = name.strip(NAME_SPACE)
         # A repeated parameter keeps its first value, which may have streamed;
         # a parameter without a name, or of a call that names no function,
@@ -320,6 +329,8 @@ class StreamingToolCallProjector:
         self.parameter_names.add(name)
         self.parameter_name = name if kept else None
         self.value_types = self.parameter_types.get(name, self.other_types)
+        if marked_json and not self.value_types:
+            self.value_types = _MARKED_JSON
         # A value whose schema gives it no type, or the type string alone, is
         # its text and streams as it is written; any other waits for its end
         # to convert.
@@ -387,16 +398,22 @@ class StreamingToolCallProjector:
         found = [(index, tag) for tag in tags if (index := self.pending.find(tag)) >= 0]
         return min(found) if found else (-1, None)
 
-    def _name(self, end, keep=False):
-        """The name the pending text spells up to `end`, taken off the text
-        with `end` unless `end` is kept; "" for a longer one, and None while
-        it may yet end."""
-        index = self.pending.find(end, 0, MAX_NAME_LENGTH + len(end))
-        if index < 0:
-            return None if len(self.pending) < MAX_NAME_LENGTH + len(end) else ""
+    def _name(self, *ends, keep=False):
+        """The name the pending text spells up to the first of `ends` it
+        reaches, with that end, taken off the text with the end unless ends
+        are kept; "" for a longer one, and None while it may yet end."""
+        found = [
+            (index, end)
+            for end in ends
+            if (index := self.pending.find(end, 0, MAX_NAME_LENGTH + len(end))) >= 0
+        ]
+        if not found:
+            longest = max(len(end) for end in ends)
+            return None if len(self.pending) < MAX_NAME_LENGTH + longest else ("", None)
+        index, end = min(found)
         name = self.pending[:index]
         self.pending = self.pending[index if keep else index + len(end) :]
-        return name
+        return name, end
 
     def put(self, text):
         self.pending += text
@@ -422,16 +439,20 @@ class StreamingToolCallProjector:
                     break
                 self._emit_content(self.pending[:start], events)
                 self.pending = self.pending[start + len(tag) :]
-                if tag != THINK_END:
-                    # A call's opening, the other tag.
+                if tag == THINK_END:
+                    continue
+                if tag == syntax.call_open:
                     self.state = "name"
+                else:
+                    # The opening or close of a block of calls.
+                    self.text_visible = False
                 continue
             if self.state == "name":
                 # The character that ends the name stays: the arguments drop
                 # it, or read the tag it begins.
-                if (name := self._name(syntax.name_end, keep=True)) is None:
+                if (found := self._name(syntax.name_end, keep=True)) is None:
                     break
-                self._begin_call(name, events)
+                self._begin_call(found[0], events)
                 continue
             if self.state == "arguments":
                 # Text between parameters is dropped, but for a tag it may
@@ -446,13 +467,17 @@ class StreamingToolCallProjector:
                     self.state = "parameter"
                 else:
                     self._finish_call(events)
-                    if tag == TOOL_CALL_CLOSE:
+                    # A call without a close of its own ends at its arguments'.
+                    if not syntax.call_close or tag == syntax.call_close:
                         self.state = "content"
                 continue
             if self.state == "parameter":
-                if (name := self._name(syntax.key_close)) is None:
+                if (found := self._name(*syntax.key_closes)) is None:
                     break
-                self._begin_parameter(name, events)
+                name, end = found
+                self._begin_parameter(
+                    name, events, end is not None and end == syntax.json_key_close
+                )
                 continue
             if self.state == "value":
                 # Before the value starts, the start of the value_open the
@@ -478,9 +503,9 @@ class StreamingToolCallProjector:
             if self.state == "closing":
                 # After </function>, the template closes the call's block.
                 rest = self.pending.lstrip(NAME_SPACE)
-                if rest.startswith(TOOL_CALL_CLOSE):
-                    self.pending = rest[len(TOOL_CALL_CLOSE) :]
-                elif TOOL_CALL_CLOSE.startswith(rest):
+                if rest.startswith(syntax.call_close):
+                    self.pending = rest[len(syntax.call_close) :]
+                elif syntax.call_close.startswith(rest):
                     break
                 self.state = "content"
         return events
@@ -528,8 +553,8 @@ class StreamingToolCallProjector:
                 and any(tag.startswith(self.pending) for tag in self.text_tags)
             )
         ):
-            self.content_fragments.append(self.pending)
-        elif self.closed_calls:
+            self._emit_content(self.pending, events)
+        if self.closed_calls and not self.text_visible:
             # Whitespace held after the last text only framed the calls.
             del self.content_fragments[self.streamed_count :]
         self.pending = ""

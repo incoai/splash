@@ -22,7 +22,11 @@ namespace splash::ops {
 // by the softmax of their scores; SigmoidNormalized, by each one's
 // sigmoid(score) over the sum of theirs plus 1e-20, in fp32. A sigmoid
 // router selects by score as it would by sigmoid(score), which is monotonic.
-enum class MoeRouter : uint8_t { Softmax, SigmoidNormalized };
+// SqrtSoftplusNormalized (DeepSeek-V4.1's) selects by sqrt(softplus(score))
+// plus the block's selection bias (BlockMoeWeights::selectionBias) and weights
+// each expert by its sqrt(softplus(score)) over the sum of theirs plus 1e-20,
+// times MoeShape::routeScale.
+enum class MoeRouter : uint8_t { Softmax, SigmoidNormalized, SqrtSoftplusNormalized };
 
 // The routings the MoE kernels compile (kernels/shared/moe.metal,
 // kernels/shared/moe_gguf.metal, kernels/decode/linear_gguf_sgmatrix.metal):
@@ -42,6 +46,9 @@ inline constexpr std::array kCompiledMoeRoutings{
     // Flint's: a sigmoid router, and an ungated shared expert twice the
     // routed experts' width.
     CompiledMoeRouting{MoeRouter::SigmoidNormalized, 2, false, "_sigmoid_s2", "_s2"},
+    // DeepSeek-V4.1's: a biased sqrt-softplus router, and an ungated shared
+    // expert of the routed experts' width.
+    CompiledMoeRouting{MoeRouter::SqrtSoftplusNormalized, 1, false, "_sqrtsoftplus_s1", ""},
 };
 
 // The shared expert is sharedSlices experts every row visits after its
@@ -62,6 +69,12 @@ struct MoeShape final {
   // (quant_register_tensor).
   bool registerFormats = true;
   MoeRouter router = MoeRouter::Softmax;
+  // The factor of the routed experts' weights (DeepSeek-V4.1's 1.5).
+  float routeScale = 1.0f;
+  // The SwiGLU clamp of every expert, routed and shared: up to [-limit,
+  // limit] and gate to at most limit before silu(gate) * up (DeepSeek-V4.1's
+  // 10); 0 for none.
+  float swigluLimit = 0.0f;
   uint32_t sharedSlices = 1;
   bool sharedGate = true;
   // The format of the router's rows (QuantizedSegment::rows), which picks its
@@ -96,11 +109,12 @@ struct MoeShape final {
 
 // A GGUF expert projection: the routed experts' format and size, slots * N
 // rows of K inputs, whose planes the block's chunks hold (ExpertChunks; a
-// resident block's routed planes are its one chunk's), and the shared
-// expert's segment, whose format may differ, of its sharedSlices slices' N
-// rows each in their order (the rows of slice s of a shared gate or up, rows
-// s * N on; the column window s of a shared down, which a planner lays out
-// so: gguf::TensorRows::windows).
+// resident block's routed planes are its one chunk's, an expert store's
+// those of its slots, each of which keeps an expert's planes together), and
+// the shared expert's segment, whose format may differ, of its sharedSlices
+// slices' N rows each in their order (the rows of slice s of a shared gate or
+// up, rows s * N on; the column window s of a shared down, which a planner
+// lays out so: gguf::TensorRows::windows).
 struct BlockExpertProjection final {
   QuantizedSegment routed;
   QuantizedSegment shared;
@@ -114,16 +128,19 @@ struct BlockExpertProjection final {
 // (metal::AddressTable). Slot s < floorSlots is local slot s of chunk 0; any
 // other is local slot (s - floorSlots) % chunkSlots of chunk
 // 1 + (s - floorSlots) / chunkSlots. A local slot l's planes start at row
-// l * N of its chunk's regions. The blocks of a store size share the chunks
-// and how many of them are live: a store gives its last chunks back while
-// memory is short and takes them again, between commands (keep), and every
-// copy's list names the live chunks alone, one list per count of them, so
-// that the dispatches of a command share one address table, which never
-// names memory given back. The chunks are checked view by view once, where
-// `of` makes them, for the slots, floor and chunk slots and routed formats
-// and sizes it records, which stay those of every chunk; a block's expert
-// passes then only require its own slots and segments to be those
-// (checkedFor). A default value is empty.
+// l * N of its chunk's regions; or, in chunks of slotBytes() bytes a slot,
+// which keep each slot's planes together (an expert store's), each view
+// starts at its plane in the chunk's first slot, and slot l's plane
+// l * slotBytes() bytes after it. The blocks of a store size (in such
+// chunks, those of a layout of formats) share the chunks' views and how many
+// of them are live: a store gives its last chunks back while memory is short
+// and takes them again, between commands (keep), and every copy's list names
+// the live chunks alone, one list per count of them, so that the dispatches
+// of a command share one address table, which never names memory given back.
+// The chunks are checked view by view once, where `of` makes them, for the
+// slots, floor and chunk slots and routed formats and sizes it records, which
+// stay those of every chunk; a block's expert passes then only require its
+// own slots and segments to be those (checkedFor). A default value is empty.
 class ExpertChunks final {
 public:
   ExpertChunks() = default;
@@ -134,11 +151,14 @@ public:
   // chunks, together `slots` slots or more, and each view of a chunk holds
   // its slots' planes (the floor chunk min(floorSlots, slots) slots, each
   // elastic chunk chunkSlots of them but the last that holds slots, which
-  // holds the rest) as requireSegmentPlanes counts a segment of their rows. A
-  // format without plane1 has its meta view in plane1's entry.
+  // holds the rest) as requireSegmentPlanes counts a segment of their rows,
+  // or, with slotBytes, its last slot's plane from (held - 1) * slotBytes on,
+  // as it counts a segment of an expert's rows. A format without plane1 has
+  // its meta view in plane1's entry.
   [[nodiscard]] static ExpertChunks of(std::vector<metal::MetalBuffer> planes, uint32_t floorSlots,
                                        uint32_t chunkSlots, uint32_t slots, const QuantizedSegment &gate,
-                                       const QuantizedSegment &up, const QuantizedSegment &down);
+                                       const QuantizedSegment &up, const QuantizedSegment &down,
+                                       uint32_t slotBytes = 0);
 
   // The live chunks' views, MOE_EXPERT_CHUNK_ADDRESSES per chunk in the
   // expert kernels' order; null for a default value.
@@ -148,6 +168,9 @@ public:
   }
   [[nodiscard]] uint32_t floorSlots() const noexcept { return floorSlots_; }
   [[nodiscard]] uint32_t chunkSlots() const noexcept { return chunkSlots_; }
+  // The bytes from a slot's planes to the next slot's, 0 for views of a
+  // region's slots of the projection's rows in turn.
+  [[nodiscard]] uint32_t slotBytes() const noexcept { return slotBytes_; }
   [[nodiscard]] bool empty() const noexcept { return !live_; }
   // Every chunk, and the first of them that are live, all of them until
   // keep() keeps fewer.
@@ -188,6 +211,7 @@ private:
   uint32_t floorSlots_ = 0;
   uint32_t chunkSlots_ = 0;
   uint32_t slots_ = 0;
+  uint32_t slotBytes_ = 0;
   std::array<Routed, 3> routed_{}; // gate, up, down
 };
 
@@ -210,6 +234,8 @@ enum class MoePhase : uint8_t { Prefill, Decode };
 struct BlockMoeWeights final {
   QuantizedSegment router;           // [experts][hidden]
   QuantizedSegment sharedScalarGate; // [1][hidden]
+  // A SqrtSoftplusNormalized router's selection bias, F32 [experts].
+  metal::MetalBuffer selectionBias;
   BlockExpertProjection gate;
   BlockExpertProjection up;
   BlockExpertProjection down;
@@ -239,10 +265,31 @@ struct MoeLoadPart final {
 // passes, what makes the experts their tiles name resident and the block's
 // table name their slots; it may read a step's input (MoeBuffers::input).
 // Several steps' parts load the union of their experts at once.
+// The tile descriptors of a decode step's two expert passes around a split
+// load (MoeExpertStream::addSplitLoadStart): every live tile in each, those
+// of the experts that were resident and the shared expert's in `resident`,
+// those of the experts the load reads in `loaded`, the other pass's tiles of
+// no rows (which the passes skip).
+struct MoeSplitTiles final {
+  metal::MetalBuffer resident;
+  metal::MetalBuffer loaded;
+};
+
 class MoeExpertStream {
 public:
   virtual ~MoeExpertStream() = default;
   virtual void addLoad(metal::CommandGraph &graph, std::span<const MoeLoadPart> parts, uint32_t block) const = 0;
+  // A decode step's load of block `block`, split around the expert passes of
+  // the experts that were resident, which the GPU runs while the stream
+  // reads the others: the start routes the step, starts the reads and writes
+  // `tiles`; the finish, after the resident passes, waits for the reads and
+  // makes the experts resident, before the loaded passes. False, and nothing
+  // added, for a step whose load does not split (it adds addLoad instead).
+  [[nodiscard]] virtual bool addSplitLoadStart(metal::CommandGraph &, const MoeLoadPart &, uint32_t,
+                                               MoeSplitTiles &) const {
+    return false;
+  }
+  virtual void addSplitLoadFinish(metal::CommandGraph &, const MoeLoadPart &, uint32_t) const {}
 };
 
 // Grouped-row scratch. Routes are sorted by expert into tiles of tileRows
@@ -325,6 +372,12 @@ inline constexpr auto kMoeWorkspaceFields = [] {
 // changing it never changes the physical rows in a command. Plans run their
 // passes on M8 tiles, or on M32 tiles to prefill (moeGgufPrefillTile).
 enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
+
+// The tiles each pass of a split load writes at most (MoeSplitTiles): a
+// decode step's of `rows` rows on any expert tile, the most on M8 tiles.
+[[nodiscard]] constexpr uint32_t moeSplitTileCapacity(uint32_t rows, MoeShape shape) noexcept {
+  return moeMaximumTiles(rows, shape, static_cast<uint32_t>(MoeExpertTile::M8));
+}
 
 // The expert tile of GGUF plans, which run grouped passes (gate, up with
 // silu(gate), down; the staged tile runs gate and up in one pass) over the
@@ -445,11 +498,12 @@ struct MoE final {
   // `sharedScalarGate` (unread without shape.sharedGate): the router's fp32
   // scores in `scores` (rows of shape.routerWidth()), then each row's top-k
   // experts and the shared slices with their routing weights in `selected`
-  // and `routingWeights` (shape.routesPerToken() per row).
+  // and `routingWeights` (shape.routesPerToken() per row). A
+  // SqrtSoftplusNormalized router ranks by `selectionBias` too.
   static void addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input, const QuantizedSegment &router,
                         const QuantizedSegment &sharedScalarGate, const metal::MetalBuffer &scores,
                         const metal::MetalBuffer &selected, const metal::MetalBuffer &routingWeights, uint32_t rows,
-                        MoeShape shape, FloatTile routerTile);
+                        MoeShape shape, FloatTile routerTile, const metal::MetalBuffer &selectionBias = {});
   // A streamed experts' load (MoeExpertStream::addLoad): the gate, up and
   // down projections of up to `jobs` experts, job j's projection z's native
   // rows in `staging` from sources[3j + z] (bytes) on, repacked into the

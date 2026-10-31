@@ -96,7 +96,14 @@ class ChatTemplateError(ValueError):
 
 # What a template that rejects one of the REASONING_EFFORTS renders instead;
 # one that rejects none renders by enable_thinking alone (render_chat_template).
-REASONING_EFFORT_ALIASES = {"high": "xhigh", "max": "xhigh", "minimal": "low"}
+# DeepSeek-V4.1's knows low, high (its default) and max alone.
+REASONING_EFFORT_ALIASES = {
+    "high": "xhigh",
+    "max": "xhigh",
+    "minimal": "low",
+    "medium": "high",
+    "xhigh": "max",
+}
 
 
 def template_options(
@@ -129,17 +136,20 @@ def template_options(
     return options
 
 
-def render_chat_template(tokenizer, messages, options):
+def render_chat_template(
+    tokenizer, messages, options, aliases=REASONING_EFFORT_ALIASES
+):
     """Render as requests and the startup probe do: a template that rejects
-    the reasoning effort renders its alias instead, and one that rejects
-    "none" while thinking is off renders by enable_thinking alone."""
+    the reasoning effort renders its alias instead (the probe renders without
+    aliases too, to find the efforts a template renders itself), and one that
+    rejects "none" while thinking is off renders by enable_thinking alone."""
     try:
         return tokenizer.apply_chat_template(messages, **options)
     except TemplateError as error:
         effort = options.get("reasoning_effort")
         retry = dict(options)
-        if effort in REASONING_EFFORT_ALIASES:
-            retry["reasoning_effort"] = REASONING_EFFORT_ALIASES[effort]
+        if effort in aliases:
+            retry["reasoning_effort"] = aliases[effort]
         elif effort == "none" and options.get("enable_thinking") is False:
             del retry["reasoning_effort"]
         else:
@@ -259,9 +269,12 @@ def _generation_description(prompts):
 
 
 def _renderer(tokenizer):
-    def render(source, messages, options):
+    def render(source, messages, options, aliases=REASONING_EFFORT_ALIASES):
         return render_chat_template(
-            tokenizer, messages, {**options, "chat_template": source, "tokenize": False}
+            tokenizer,
+            messages,
+            {**options, "chat_template": source, "tokenize": False},
+            aliases,
         )
 
     return render
@@ -411,12 +424,20 @@ def _reasoning(render, source):
     renders, and differently, each named by the one of those rendering alike
     that its alias does not stand in for, none where all render alike; and
     the one a request that sends none renders like, None where it is none of
-    them. The names: each effort that renders like one of them -> that one."""
+    them. The names: each effort that renders like one of them -> that one.
+    An alias that renders alike stands in for an effort unless the template
+    renders the effort itself and not the alias: xhigh and max are each
+    other's aliases, and a template renders one of them for the other."""
 
-    def rendered(effort):
+    def rendered(effort, aliases=REASONING_EFFORT_ALIASES):
         options = _effort_options(effort)
         return tuple(
-            _outcome(render, source, messages, options)
+            _outcome(
+                lambda *rendering: render(*rendering, aliases),
+                source,
+                messages,
+                options,
+            )
             for messages in ([_ASK], [_SYSTEM, _ASK])
         )
 
@@ -427,11 +448,22 @@ def _reasoning(render, source):
             # An effort the template rejects renders no prompt (_outcome).
             if all(isinstance(prompt, str) for prompt in prompts):
                 groups.setdefault(prompts, []).append(effort)
+
+    def itself(effort):
+        """Whether the template renders this effort without its alias."""
+        return all(isinstance(prompt, str) for prompt in rendered(effort, {}))
+
     names = {}
     if len(groups) > 1:
         for group in groups.values():
             name = next(
-                e for e in group if REASONING_EFFORT_ALIASES.get(e) not in group
+                (
+                    e
+                    for e in group
+                    if REASONING_EFFORT_ALIASES.get(e) not in group
+                    or (itself(e) and not itself(REASONING_EFFORT_ALIASES[e]))
+                ),
+                group[0],
             )
             names |= dict.fromkeys(group, name)
     default = rendered(None)

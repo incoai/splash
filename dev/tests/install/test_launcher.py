@@ -1243,7 +1243,7 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(failed.exception.code, 2)
                 self.assertIn(
                     "argument --draft-model: must be a local DFlash2 draft "
-                    "directory or a Hugging Face repository ID",
+                    "directory, a local DSpark GGUF, a Hugging Face repository ID",
                     error.getvalue(),
                 )
                 install.assert_not_called()

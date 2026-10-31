@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DFlashDraft.hpp"
+#include "DeepSeek41.hpp"
 #include "Flint.hpp"
 #include "Model.hpp"
 #include "Qwen3_6Moe.hpp"
@@ -19,14 +20,14 @@
 
 namespace splash::model {
 
-using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout, Qwen4ExpLayout, FlintLayout>;
+using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout, Qwen4ExpLayout, FlintLayout, DeepSeek41Layout>;
 
 // The families Splash serves, values of the layout types TargetLayout holds,
 // one type for each architecture's code. A family of an architecture is one
 // more value here. Refusals name them in this order, and a config's model type
 // finds its family among those of its type in it (describeSourceModel).
 inline constexpr std::tuple kFamilies{Qwen3_8Layout{}, Qwen3_6MoeLayout{}, kQwen3_5_122BLayout, Qwen4ExpLayout{},
-                                      FlintLayout{}};
+                                      FlintLayout{}, DeepSeek41Layout{}};
 
 // Calls `use` with each family's layout, in kFamilies' order.
 template <class Use> constexpr void forEachFamily(Use use) {
@@ -70,6 +71,14 @@ struct ModelDescriptor final {
   }
   [[nodiscard]] std::string_view family() const noexcept {
     return std::visit([](const auto &layout) { return layout.family; }, target);
+  }
+  // The target's KV layout in the format the runtime stores KV in
+  // (--kv-format), or in its own where the family fixes it
+  // (QwenHybridLayout::fixedKvFormat).
+  [[nodiscard]] kv::Layout kvLayout(kv::Format format) const noexcept {
+    kv::Layout layout = targetKvLayout;
+    if (!std::visit([](const auto &layout) { return layout.fixedKvFormat(); }, target)) layout.format = format;
+    return layout;
   }
   [[nodiscard]] bool valid() const noexcept;
 };

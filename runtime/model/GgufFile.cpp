@@ -84,6 +84,10 @@ uint64_t scalarBytes(uint32_t type) {
 // The longest metadata array kept: the vision metadata read from it has one
 // entry per block or channel, and tokenizer arrays are far longer.
 constexpr uint64_t kMaximumKeptArray = 1024;
+// DeepSeek-V4.1's Engram token map (deepseek41.engram.token_map), kept up to
+// its own bound: a compressed id for each token of the vocabulary.
+constexpr std::string_view kTokenMapSuffix = ".engram.token_map";
+constexpr uint64_t kMaximumTokenMap = uint64_t{1} << 20;
 // Prism ML's rotation keys (GgufRotation), whose arrays are kept whole: a
 // tensor name per rotated tensor and a sign per input of each width.
 constexpr std::string_view kRotationPrefix = "prism.hadamard.";
@@ -220,7 +224,7 @@ void GgufFile::parse(WeightSource &source, uint32_t file) {
     case kArray: {
       // Small numeric arrays of any key are kept; strings and long arrays
       // (vocabularies, merges, token types) are skipped without reading them,
-      // but for the rotation's.
+      // but for the rotation's and the Engram token map.
       const uint32_t element = reader.scalar<uint32_t>();
       const uint64_t count = reader.scalar<uint64_t>();
       if (key.starts_with(kRotationPrefix)) {
@@ -236,7 +240,8 @@ void GgufFile::parse(WeightSource &source, uint32_t file) {
         }
         break;
       }
-      if (count > kMaximumKeptArray || element == kString || element == kArray) {
+      const uint64_t kept = key.ends_with(kTokenMapSuffix) ? kMaximumTokenMap : kMaximumKeptArray;
+      if (count > kept || element == kString || element == kArray) {
         skipArray(reader, element, count, 0);
         break;
       }

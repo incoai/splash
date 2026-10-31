@@ -28,6 +28,8 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
                                  threadgroup half2 *tl) {
   if (group.y >= *tile_count) return;
   const MoeTileDescriptor tile = tiles[group.y];
+  // A tile of no rows is the other pass's of a split load (ops::MoeSplitTiles).
+  if (!tile.rows) return;
   const MoeGgufSegment s = moe_gguf_segment<Shared>(tile.expert, p, slots, chunks, sw0, sw1, smeta);
   device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
   const ulong out = ulong(group.y) * Rows * p.output_size;
@@ -39,7 +41,7 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
                                          sums);
     for (uint row = 0; row < tile.rows; ++row) {
       const ulong o = out + ulong(row) * p.output_size + origin + simd_lane;
-      output[o] = gguf_epilogue<Ep>(sums[row], aux, o);
+      output[o] = gguf_epilogue<Ep>(sums[row], aux, o, p.swiglu_limit);
     }
     return;
   }
@@ -52,7 +54,7 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
                                             simd_group * 32 + simd_lane, simd_lane, 0, p.input_size / GGUF_STAGED_STEP, 0, acc);
     gguf_elements(acc, [&](uint row, uint column, float v) {
       const ulong o = out + ulong(row) * p.output_size + origin + column;
-      output[o] = gguf_epilogue<Ep>(v, aux, o);
+      output[o] = gguf_epilogue<Ep>(v, aux, o, p.swiglu_limit);
     });
   };
   moe_live_rows<Rows>(tile.rows, run);
@@ -104,7 +106,8 @@ template [[host_name("moe_expert_gguf_m32_g_s2")]] kernel MoeExpertGgufKernel mo
 // branch.
 __attribute__((noinline)) void moe_gate_up_column(device bfloat *x, uint rows, uint K, uint N, MoeGgufSegment s,
                                                   uint origin, uint simd_lane, threadgroup half2 *table, bool up,
-                                                  threadgroup bfloat *gate, device bfloat *output, ulong out) {
+                                                  threadgroup bfloat *gate, device bfloat *output, ulong out,
+                                                  float swiglu_limit) {
   float sums[MOE_GGUF_COLUMN_ROWS];
   quant_format_switch(s.format, [&](auto f) {
     column_dot<decltype(f), MOE_GGUF_COLUMN_ROWS>(x, rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0, K / 32, table,
@@ -116,7 +119,8 @@ __attribute__((noinline)) void moe_gate_up_column(device bfloat *x, uint rows, u
   if (up)
     for (uint row = 0; row < rows; ++row)
       output[out + ulong(row) * N + origin + simd_lane] =
-          bfloat(float(bfloat(sums[row])) * splash_silu(float(gate[row * GGUF_STAGED_COLUMNS + simd_lane])));
+          bfloat(splash_swiglu(float(bfloat(sums[row])), float(gate[row * GGUF_STAGED_COLUMNS + simd_lane]),
+                               swiglu_limit));
 }
 template <ushort Rows, ushort Tables, uint Shared>
 kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
@@ -134,13 +138,16 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
   threadgroup half stage[kStagedStages]; threadgroup half2 tl[Tables * kQuantPairTableEntries];
   if (group.y >= *tile_count) return;
   const MoeTileDescriptor tile = tiles[group.y];
+  if (!tile.rows) return;
   const bool up = simd_group == 1;
   const MoeGgufSegment gs = moe_gguf_segment<Shared>(tile.expert, p.experts, p.input_size, p.output_size,
-                                                     p.gate_routed_format, p.gate_shared_format, slots, chunks,
-                                                     p.floor_slots, p.chunk_slots, 0, gsw0, gsw1, gsmeta);
+                                                     p.gate_routed_format, p.gate_shared_format, p.routed_slot_bytes,
+                                                     slots, chunks, p.floor_slots, p.chunk_slots, 0, gsw0, gsw1,
+                                                     gsmeta);
   const MoeGgufSegment us = moe_gguf_segment<Shared>(tile.expert, p.experts, p.input_size, p.output_size,
-                                                     p.up_routed_format, p.up_shared_format, slots, chunks,
-                                                     p.floor_slots, p.chunk_slots, 1, usw0, usw1, usmeta);
+                                                     p.up_routed_format, p.up_shared_format, p.routed_slot_bytes,
+                                                     slots, chunks, p.floor_slots, p.chunk_slots, 1, usw0, usw1,
+                                                     usmeta);
   const uint thread_index = simd_group * 32 + simd_lane;
   bool tables = false;
   quant_format_switch(gs.format, [&](auto f) {
@@ -160,7 +167,7 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
   threadgroup bfloat *gate = reinterpret_cast<threadgroup bfloat *>(stage);
   if (moe_column_tile(tiles, group.y)) {
-    moe_gate_up_column(x, tile.rows, K, N, s, origin, simd_lane, table, up, gate, output, out);
+    moe_gate_up_column(x, tile.rows, K, N, s, origin, simd_lane, table, up, gate, output, out, p.swiglu_limit);
     return;
   }
   const auto run = [&](auto rows) {
@@ -178,7 +185,7 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
     if (up)
       gguf_elements(acc, [&](uint row, uint column, float v) {
         output[out + ulong(row) * N + origin + column] =
-            bfloat(float(bfloat(v)) * splash_silu(float(gate[row * GGUF_STAGED_COLUMNS + column])));
+            bfloat(splash_swiglu(float(bfloat(v)), float(gate[row * GGUF_STAGED_COLUMNS + column]), p.swiglu_limit));
       });
   };
   moe_live_rows<Rows>(tile.rows, run);

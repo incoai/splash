@@ -7,6 +7,7 @@
 #include "ops/StopTokens.hpp"
 
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <string_view>
@@ -14,6 +15,73 @@
 namespace splash::model {
 
 enum class QwenFfnKind : uint8_t { Dense, SparseMoe };
+
+// DeepSeek-V4.1's dimensions beyond the blocks the Qwen targets share
+// (model/DeepSeek41.hpp), all zero for the Qwen families. Its layers attend
+// through latents: queries from a low-rank latent of queryRank values, one
+// latent per token that is its key and its value, and an output of
+// outputGroups low-rank groups of outputRank values each. Past each layer's
+// window, the layers of compressedLayers (a bit per layer, bit l for layer l)
+// attend groups of compressed latents, of 2 tokens each on pairedLayers and
+// of 1 on the others, which the compressor of the last of compressorLayers at
+// or before the layer makes; the indexer of the last of indexerLayers at or
+// before it selects indexerTopGroups of them, its indexerHeads heads of
+// indexerHeadDimension values each scoring every group, and from
+// candidateLayer on only among the candidateTopBlocks blocks of
+// candidateBlockGroups groups that layer's scores rank highest. An Engram
+// feeds each of engramLayers from a table of its own, engramHeads rows of
+// engramHeadDimension values for each n-gram of 2 to engramNgram tokens. The
+// residual is manifold hyper-connected (ops/ManifoldHyperConnection.hpp),
+// its mixes balanced by sinkhornIterations; its norms take normEpsilon, its
+// SwiGLUs clamp at swigluLimit, its routers scale their weights by
+// routeScale, and its RoPE stretches by YaRN (RopeScaling's values, always
+// on) beside its compressed latents' own base.
+struct DeepSeek41Dimensions final {
+  uint32_t queryRank = 0;
+  uint32_t outputRank = 0;
+  uint32_t outputGroups = 0;
+  uint64_t compressedLayers = 0;
+  uint64_t pairedLayers = 0;
+  uint64_t compressorLayers = 0;
+  uint64_t indexerLayers = 0;
+  uint32_t indexerHeads = 0;
+  uint32_t indexerHeadDimension = 0;
+  uint32_t indexerTopGroups = 0;
+  uint32_t candidateLayer = 0;
+  uint32_t candidateBlockGroups = 0;
+  uint32_t candidateTopBlocks = 0;
+  uint64_t engramLayers = 0;
+  uint32_t engramHeads = 0;
+  uint32_t engramHeadDimension = 0;
+  uint32_t engramNgram = 0;
+  uint32_t engramPadToken = 0;
+  uint32_t sinkhornIterations = 0;
+  float hcEpsilon = 0.0F;
+  float normEpsilon = 0.0F;
+  float swigluLimit = 0.0F;
+  float routeScale = 0.0F;
+  float compressRopeTheta = 0.0F;
+  float yarnFactor = 0.0F;
+  uint32_t yarnOriginalContextTokens = 0;
+  float yarnBetaFast = 0.0F;
+  float yarnBetaSlow = 0.0F;
+
+  // Whether a target is DeepSeek-V4.1's.
+  [[nodiscard]] constexpr bool present() const noexcept { return queryRank != 0; }
+  [[nodiscard]] static constexpr bool has(uint64_t layers, uint32_t layer) noexcept {
+    return layer < 64 && (layers >> layer & 1);
+  }
+  // The width of the values its attention's output groups project: a
+  // group's share of the heads' values.
+  [[nodiscard]] constexpr uint32_t groupWidth(uint32_t attentionWidth) const noexcept {
+    return outputGroups ? attentionWidth / outputGroups : 0;
+  }
+  // An Engram's gathered values and its key per stream plus value.
+  [[nodiscard]] constexpr uint32_t engramWidth() const noexcept {
+    return engramNgram ? (engramNgram - 1) * engramHeads * engramHeadDimension : 0;
+  }
+  bool operator==(const DeepSeek41Dimensions &) const = default;
+};
 
 // The dimensions and tokens of a Qwen hybrid target: GDN layers, every
 // fullAttentionPeriod-th layer an attention layer instead (every layer with
@@ -110,6 +178,7 @@ struct QwenTargetDimensions {
   uint32_t pleHeadsPerNgram = 0;
   uint32_t pleHeadDimension = 0;
   uint32_t pleConvolutionTaps = 0;
+  DeepSeek41Dimensions deepseek{};
 
   [[nodiscard]] constexpr bool
   isFullAttentionLayer(uint32_t layer) const noexcept {
@@ -128,13 +197,16 @@ struct QwenTargetDimensions {
   }
   [[nodiscard]] constexpr uint32_t moeBlock(uint32_t layer) const noexcept { return layer - leadingDenseLayers; }
   // The shape of the MoE blocks but for the formats of their expert weights,
-  // which the loaded weights give (QwenTargetGeometry::moeShape).
+  // which the loaded weights give (QwenTargetGeometry::moeShape), with
+  // DeepSeek-V4.1's routing scale and SwiGLU clamp.
   [[nodiscard]] constexpr ops::MoeShape moeBlockShape() const noexcept {
     return {.hiddenSize = hiddenSize,
             .experts = experts,
             .expertsPerToken = expertsPerToken,
             .expertIntermediateSize = expertIntermediateSize,
             .router = moeRouter,
+            .routeScale = deepseek.present() ? deepseek.routeScale : 1.0F,
+            .swigluLimit = deepseek.present() ? deepseek.swigluLimit : 0.0F,
             .sharedSlices = sharedExpertSlices,
             .sharedGate = sharedExpertGate};
   }
@@ -174,6 +246,23 @@ struct QwenTargetDimensions {
   }
   // The tokens a QSA row attends to sparsely past (the indexer's top_k).
   [[nodiscard]] constexpr uint32_t indexerTokens() const noexcept { return indexerTopBlocks * indexerBlockTokens; }
+  // DeepSeek-V4.1's KV sources (its compressor layers): the attention
+  // layers of its pages (QwenHybridLayout::kvLayout).
+  [[nodiscard]] constexpr uint32_t deepseekKvSources() const noexcept {
+    return static_cast<uint32_t>(std::popcount(deepseek.compressorLayers));
+  }
+  // A DeepSeek-V4.1 sequence's state beside its pages, a cell's auxiliary
+  // bytes (gdnStateLayout): every layer's ring of its window's latents, bf16,
+  // position p at place p % slidingWindow; then each paired KV source's open
+  // group, the fp32 kv and gate projections of the first token of a group
+  // whose second is to come.
+  [[nodiscard]] constexpr uint64_t deepseekWindowBytes() const noexcept {
+    return uint64_t{layers} * slidingWindow * attentionHeadDimension * GdnStateLayout::bfloat16Bytes;
+  }
+  [[nodiscard]] constexpr uint64_t deepseekOpenGroupBytes() const noexcept {
+    return uint64_t{static_cast<uint32_t>(std::popcount(deepseek.compressorLayers & deepseek.pairedLayers))} * 2 *
+           attentionHeadDimension * sizeof(float);
+  }
   // The QSA indexer's pending keys in a state cell, after the PLE history:
   // per attention layer the raw keys (bf16) of the tokens of the block a
   // sequence has not completed, all but its last, which no page holds
@@ -203,7 +292,17 @@ struct QwenHybridLayout : QwenTargetDimensions {
   // The KV pages, which also hold a QSA indexer's pooled keys; a QSA target's
   // sparse attention gathers blocks of tokens, so its values are token-major.
   // A sliding layer reads the slidingWindow - 1 keys before its row's.
+  // DeepSeek-V4.1's hold each KV source's compressed groups instead: a
+  // group's latent as the key of the place of the position that completes
+  // it, its index key in that place's value, token-major, in BF16, which
+  // holds their FP4 values exactly (fixedKvFormat).
   [[nodiscard]] constexpr kv::Layout kvLayout() const noexcept {
+    if (deepseek.present())
+      return {.attentionLayers = deepseekKvSources(),
+              .kvHeads = 1,
+              .headDimension = attentionHeadDimension,
+              .format = kv::Format::BFloat16,
+              .valuesTokenMajor = true};
     return {.attentionLayers = attentionLayerCount(),
             .kvHeads = attentionKvHeads,
             .headDimension = attentionHeadDimension,
@@ -213,8 +312,10 @@ struct QwenHybridLayout : QwenTargetDimensions {
             .windowedLayers = slidingLayers};
   }
   // The GDN layers' state and, after it in a cell, a PLE convolution's
-  // history and the QSA indexer's pending keys.
+  // history and the QSA indexer's pending keys; DeepSeek-V4.1's windows and
+  // open groups alone.
   [[nodiscard]] constexpr GdnStateLayout gdnStateLayout() const noexcept {
+    if (deepseek.present()) return {.auxiliaryBytes = deepseekWindowBytes() + deepseekOpenGroupBytes()};
     return {.layers = gdnLayerCount(),
             .convolutionHistory = gdnLayerCount() ? kGdnConvolutionTaps - 1 : 0,
             .convolutionChannels = convolutionDimension,
@@ -223,6 +324,9 @@ struct QwenHybridLayout : QwenTargetDimensions {
             .recurrentColumns = gdnHeadDimension,
             .auxiliaryBytes = pleHistoryBytes() + indexerPendingBytes()};
   }
+  // Whether its KV pages take the format kvLayout gives them rather than the
+  // runtime's (--kv-format): DeepSeek-V4.1's BF16.
+  [[nodiscard]] constexpr bool fixedKvFormat() const noexcept { return deepseek.present(); }
   bool operator==(const QwenHybridLayout &) const = default;
 };
 

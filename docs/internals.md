@@ -82,8 +82,12 @@ concurrent installation cannot collect the assembly they serve. It is local
 installation metadata, not a file model publishers supply. It records each
 file's path, size, times and digest: a Hub cache file's is the blob's name,
 any other file's its SHA-256, which an assembly that replaces another keeps
-for each file it still links unchanged in path, size and times, so only a
-new or changed file is read for it, before the installation lock is taken.
+for each file it still links unchanged in path, size and times, and a new
+selection takes from any installed assembly that links the file so
+(`assembly.recorded_files`), so only a new or changed file is read for it,
+before the installation lock is taken: another `--draft-model` for an
+installed DeepSeek-V4.1-Flash, whose Engram tables (110.6 GB) a Hub cache
+may keep outside `blobs/<digest>`, no longer reads them for two minutes.
 
 Installation resolves each source's revision to a commit once, downloads by
 that commit and records it in `model.json`, so a repository update cannot mix
@@ -146,8 +150,10 @@ deleted assembly. `install/cached.py` installs this way every model the Hub
 cache holds whole that Splash serves, leaving out what the installer refuses,
 for the desktop app to offer: a GGUF by the ID `install/suggested-models.tsv`
 gives it, or else by its split parts' folder or by its name past the model's,
-`MODEL-VARIANT.gguf` as `OWNER/MODEL-GGUF:VARIANT`, an ID that selects it from
-the Hub's listing too. The installer never rewrites upstream files.
+`MODEL-VARIANT.gguf` as `OWNER/MODEL-GGUF:VARIANT` (and the parts of a split
+GGUF at the root, `MODEL-VARIANT-0000K-of-0000N.gguf`, as one), an ID that
+selects it from the Hub's listing too. The installer never rewrites upstream
+files.
 
 ## Weight loading
 
@@ -640,15 +646,28 @@ plan, the staged 8- and 32-row tiles and the Apple9 register tile whatever GPU r
 every format it takes as each routed and shared expert tensor, against fp64, bitwise against
 the full grids and two gate/up passes, and with the experts in permuted slots across a floor
 chunk and elastic chunks of other, few slots, the last of fewer, bitwise as in one chunk, and
-refuses floor and elastic chunks one unit short, a malformed chunk list or chunks made for
-another block; `gguf-moe-e512` runs all of it at Qwen3.8-Flash-Next's 512 experts and
-`gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated shared slices;
-and `expert-store`, streamed experts at four shapes bitwise against the resident ones, in loads
-of every kind, through a release and a restore, in a floor and three smaller elastic chunks,
-beside a size of one block, which the store reads whole into its floor
-chunk, and refuses a size its largest buffer holds in more than 48 chunks and a size of one
-block it does not hold; `expert-chunk-layout`, in `make test-engine-cpu`, checks the chunk
-layout rule itself. The goldens and how to regenerate them are
+in an expert store's slots of one size across such chunks, bitwise as in their own layout, and
+refuses floor and elastic chunks one unit short, slots narrower than a plane, a malformed chunk
+list or chunks made for another block; `gguf-moe-e512` runs all of it at Qwen3.8-Flash-Next's
+512 experts, `gguf-moe-sigmoid` at Flint's routing, a sigmoid router's top 6 and two ungated
+shared slices, and `gguf-moe-deepseek` at DeepSeek-V4.1's: 384 experts, the top 6 by
+sqrt(softplus) plus a selection bias, weights times 1.5, one ungated shared slice and the
+experts' SwiGLU clamp; and `expert-store`, streamed experts at five shapes bitwise against the
+resident ones, in loads of every kind (a decode step's split around the experts that were
+resident), through a release and a restore, in a floor and three smaller elastic chunks, blocks
+of other formats in the slots of the widest expert's size, also as its chunks go and come back,
+a store of one block, which it reads whole into its floor chunk, and refuses slots its largest
+buffer holds in more than 48 chunks and a store of one block it does not hold;
+`expert-chunk-layout`, in `make test-engine-cpu`, checks the chunk layout rule itself.
+`deepseek41-kernels` checks DeepSeek-V4.1's own kernels (its manifold-constrained
+hyper-connections, latent attention, rotations and FP8/FP4 grids, compressor, indexer, top-k
+selection and candidate blocks, the Engram hash and gate) against CPU references of
+`dev/tools/deepseek41_reference.py`, the attention's matrix passes of a prefill's rows among
+them, and those of a sequence's pages and state ([Latent attention](#latent-attention)): the
+groups a store writes to their places and nowhere else, the indexer and the attention through a
+page table bitwise against pools of the same keys, of a verify's rows and of a prefill's, a
+step's key lists, and the rings and open groups after a prefill's or a verify lane's retained
+rows; with `bench` it times them at the model's shapes. The goldens and how to regenerate them are
 in `dev/tests/fixtures/weight-goldens/`; with `SPLASH_GGML_ORACLE=<libggml-base.dylib>`,
 `gguf-reference` also compares the reference with GGML directly and prints GGML's hashes.
 
@@ -665,8 +684,12 @@ chunk of `R` rows (more than 32), and for `R` up to 64 the staged 64-row tile at
 a quantized format's native rows (such as `float-af8g64`), time the float projection
 (`ops::addGgufFloat`, widths of any multiple of 8) on both float tiles instead, marking
 `Linear::ggufFloatTile`'s pick; `make benchmark-gguf-moe` times one MoE layer at the 35B shape,
-or at Qwen3.8-Flash-Next's or Flint's (`GGUF_MOE_ARGS='flash-next'` or `'flint'`), on the
-device's plans and the other GGUF tile.
+or at Qwen3.8-Flash-Next's, Flint's or DeepSeek-V4.1-Flash's (`GGUF_MOE_ARGS='flash-next'`,
+`'flint'` or `'deepseek 20 iq1s iq1s q80'`), on the device's plans and the other GGUF tile. At
+DeepSeek-V4.1-Flash's shape in IQ1_S on a 48 GB M4 Pro a decode step of one lane takes 2.0 ms
+a layer with its rows sharing their experts and 3.0 ms routed at random, its experts' weights
+read at 60-100 GB/s; running an expert's only tile of up to four rows on the column tile
+instead of two (MOE_GGUF_COLUMN_ROWS) made both slower (2.1 and 3.5 ms).
 
 Target attention runs the geometries of `kCompiledAttention` (`runtime/ops/PagedAttention.cpp`):
 query heads over KV heads of a head dimension (`_d128` in the names of 128-wide heads' kernels;
@@ -775,6 +798,64 @@ chunk, which returns the table and layer of the history staged for it; and
 `layerEnd` after a prefill layer, which hands the history's reads on to the
 next. A command none of whose requests holds such a page encodes as without
 them.
+
+## Latent attention
+
+DeepSeek-V4.1-Flash's layers attend latents (`model/DeepSeek41Target.hpp`,
+`ops::LatentAttention`): a row's 64 query heads share its keys, latents of 512
+values that are their own values too, beside a sink per head. A row's keys
+are the window, the latents of its layer at the last 128 positions, and up to
+512 compressed groups of its KV source that its indexer selects. The KV
+sources are the compressor layers, each of which compresses the projections
+of its rows into groups of one position or, a paired source, of two; the
+layers after one up to the next read its groups. The engine keeps them as
+follows:
+
+- A sequence's pages hold each KV source's groups (`QwenHybridLayout::kvLayout`,
+  a layer of one head of 512 per source): a group's latent as the key at the
+  place of the position that completes it, its index key in that place's
+  value, token-major. They are BF16 whatever `--kv-format` says, which holds
+  their FP4 values exactly (`fixedKvFormat`); half the places of a paired
+  source stay unused.
+- A sequence's state (`gdnStateLayout`: the auxiliary bytes of its state
+  cells, 5 MiB) holds each layer's ring of its window's last 128 latents and
+  each paired source's open group, the fp32 kv and gate projections of a
+  group's first position until its second arrives.
+- A step's rows attend the ring before the step and the step's own latents
+  (`LatentAttention::SplitKeys`), and the groups through the sequence's page
+  table. A prefill stores each source's groups as its rows complete them, of
+  the open group's projections too, and writes the rings and open group after
+  its rows and at each state capture. A verify stores the groups of all its
+  rows, which the next step's rows overwrite where they were not retained, and
+  leaves the state to its commit, which writes each lane's rings and open
+  groups after its retained rows from the step's latents and projections.
+- A prefill runs a layer's queries, attention and output projections in tiles
+  of 256 rows, each sequence's rows of a tile through its indexer in pieces
+  whose scores of every group fit 64 MiB. Its indexer layers wait for the
+  host after every 512 rows of a chunk: their scores grow with the context,
+  and a layer's attention of a command's 8192 rows at 60K tokens took 2.5 s
+  on an M4 Pro and past Metal's 5 s bound on a wait while it was hot
+  ([Host steps](#host-steps)). A step of more than 16 rows
+  multiplies each row's 64 heads by its keys, and their weights by the keys'
+  values, in 8x8 simdgroup matrices (`latent_attention_scores_mma`,
+  `latent_attention_values_mma`: bf16 products and fp32 weights summed in
+  fp32), 6.7 times faster at 256 rows than the passes a decode's few rows
+  take, which split their keys into parts instead. The model has no draft: a decode
+  cycle verifies each lane's anchor alone, and attends its anchor's row
+  alone, as the rows after it repeat it.
+- The runtime's arenas hold no paged attention's scratch for it
+  (`QwenTargetGeometry::pagedAttention`): the target keeps its own, a
+  prefill chunk's and a verify's, beside them (`qwenTargetScratchBytes`).
+- The Engram layers' table rows stream from the split GGUF's last part, one
+  table of every Engram layer's heads whose hash the metadata states; each
+  layer's offsets count from its own first row, where the metadata's
+  absolute offsets put its first head
+  ([PLE table streaming](server.md#ple-table-streaming), the same `SparseRowStore`): a
+  prefill hashes its rows' n-grams on the host and stages their rows before
+  its command, and reads the next command's rows ahead while it runs; a
+  verify hashes them on the GPU from each lane's prior tokens and stages them
+  in a host step of its command. They never load whole: `--ple-memory off` is
+  refused (`StreamedPart::streamsOnly`).
 
 ## Neural Engine prefill
 

@@ -745,6 +745,11 @@ class ToolCallTests(HarnessTestCase):
             "files:read/v2",
             "天气",
             "n" * 256,
+            # DeepSeek's DSML markup, which Qwen's tags do not hold, and a
+            # name DeepSeek's template refuses, which Qwen's writes.
+            'say "hi"',
+            "read｜DSML｜file",
+            "a::b::c",
         ]
         status, _, payload = harness.request(
             "POST",

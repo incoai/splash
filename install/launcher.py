@@ -490,7 +490,8 @@ def parse_args(argv=None):
         type=model_artifacts.parse_draft_model,
         metavar="DRAFT",
         help="DFlash2 draft repository or local directory to use instead of the "
-        "automatically selected one (a local directory with --model-dir)",
+        "automatically selected one (a local directory with --model-dir), or "
+        "none to decode one token a cycle without a draft",
     )
     model.add_argument(
         "--language-only",
@@ -541,9 +542,13 @@ def parse_args(argv=None):
         if args.model_dir is not None:
             if args.revision is not None:
                 parser.error("--revision cannot be used with --model-dir")
-            if args.draft_model is not None and not Path(args.draft_model).is_dir():
+            if (
+                args.draft_model not in (None, model_artifacts.NO_DRAFT)
+                and not Path(args.draft_model).is_dir()
+            ):
                 parser.error(
-                    "--draft-model must be a local DFlash2 draft directory with --model-dir"
+                    "--draft-model must be a local DFlash2 draft directory or "
+                    f"{model_artifacts.NO_DRAFT} with --model-dir"
                 )
         elif args.mmproj is not None:
             parser.error("--mmproj requires --model-dir")

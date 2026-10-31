@@ -97,7 +97,9 @@ QwenTarget::QwenTarget(const QwenTargetWeightsBase &weights, const QwenTargetGeo
                        metal::MetalBackend &backend, const ops::ExecutionPlans &operators)
     : weightsBase_(weights), geometry_(geometry), backend_(backend), operators_(operators) {
   if (!geometry_.valid()) throw std::invalid_argument("Qwen target weights do not match execution geometry");
-  if (!ops::PagedAttention::compiles(geometry_.attentionQueryHeads, geometry_.kvLayout, geometry_.attentionGate,
+  // DeepSeek-V4.1's latent attention reads its pages itself.
+  if (!geometry_.deepseek.present() &&
+      !ops::PagedAttention::compiles(geometry_.attentionQueryHeads, geometry_.kvLayout, geometry_.attentionGate,
                                      geometry_.rotaryPairs))
     throw std::invalid_argument("no attention kernel for the target's output gate and RoPE");
 }

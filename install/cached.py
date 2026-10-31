@@ -45,12 +45,13 @@ def candidates(name, files, suggested_models):
     """The model IDs repository name's cached files may install as, one for
     each GGUF target they hold whole: the first of its suggested IDs that
     selects it from them (upstream.select_gguf), or else its own, if that
-    does: its split parts' folder, or its root file's name past the words
-    it starts with of the model the repository is named for (the name
-    without -GGUF), and past its first at least. Repositories name their
-    files MODEL-VARIANT.gguf, so that ID selects the same file from the
-    Hub's listing of all of them. Without any, the repository itself: an
-    MLX model, or files the installer refuses."""
+    does: its split parts' folder, or its root file's name (its root split
+    parts' before their -0000K-of-0000N) past the words it starts with of
+    the model the repository is named for (the name without -GGUF), and
+    past its first at least. Repositories name their files
+    MODEL-VARIANT.gguf, so that ID selects the same file from the Hub's
+    listing of all of them. Without any, the repository itself: an MLX
+    model, or files the installer refuses."""
     from . import upstream
 
     def selected(model_id):
@@ -76,10 +77,22 @@ def candidates(name, files, suggested_models):
             pass  # not a whole split GGUF
     for file in upstream.root_ggufs(files):
         if not upstream.projector_named(file):
-            words = Path(file).stem.split("-")
+            split = upstream.SPLIT_NAME.search(file)
+            words = (file[: split.start()] if split else Path(file).stem).split("-")
             shared = os.path.commonprefix([[w.lower() for w in words], model])
             variant = "-".join(words[max(len(shared), 1) :])
-            targets.append((f"{name}:{variant}" if variant else name, [file]))
+            if not split:
+                targets.append((f"{name}:{variant}" if variant else name, [file]))
+                continue
+            # A split GGUF's parts at the root, beside other variants'
+            # (upstream.root_split_gguf): one target, named before their
+            # -0000K-of-0000N.
+            try:
+                parts = upstream.root_split_gguf(files, variant)
+            except models.ModelError:
+                continue  # not a whole split GGUF
+            if (f"{name}:{variant}", parts) not in targets:
+                targets.append((f"{name}:{variant}", parts))
     ids = []
     for own, target in targets:
         for model_id in (*suggested_models.get(name, ()), own):

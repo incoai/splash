@@ -776,6 +776,26 @@ void testOverridesAndRefusals() {
           "floors beyond the budget were planned");
 }
 
+// A table that only streams, DeepSeek-V4.1's Engram tables, streams where the
+// budget would hold it whole, through a store of all of it where a setting
+// would load it, and is refused off by name.
+void testTableThatOnlyStreams() {
+  StreamedMemoryInputs inputs = k35BQ2.inputs(kM5Pro);
+  inputs.table = {.allBytes = 2 * kGiB, .minimumBytes = 16 * kMiB};
+  require(!requirePlan(inputs).tableBytes, "a table the budget holds did not load whole");
+  inputs.table.streamsOnly = true;
+  const uint64_t automatic = requirePlan(inputs).tableBytes;
+  require(automatic >= 16 * kMiB && automatic < 2 * kGiB, "a table that only streams loaded whole");
+  inputs.table.setting = {StreamedSetting::Mode::Size, 4 * kGiB};
+  require(requirePlan(inputs).tableBytes == 2 * kGiB,
+          "a table that only streams did not stream through a store that holds all of it");
+  inputs.table.setting = {StreamedSetting::Mode::Off, 0};
+  const StreamedMemoryResult refused = planStreamedMemory(inputs);
+  require(!refused.plan && refused.error.find("--ple-memory off cannot load a part that only streams") !=
+                               std::string::npos,
+          "a table that only streams was not refused off by name");
+}
+
 // A target spills only with a spillable layout, its shape without a local
 // window its rows read whole, and an SSD cache that takes writes, and only
 // where its floors hold an empty Spill request; otherwise it plans as a dense
@@ -995,6 +1015,7 @@ int main() {
     testDenseExplicitContextStreamsExperts();
     testArenasFollowWhatStreams();
     testOverridesAndRefusals();
+    testTableThatOnlyStreams();
     testSpillNeedsATierAndRoom();
     testSpillHoldsTheArenasOfASpillingRuntime();
     testDiskBoundsTheSpilledContext();

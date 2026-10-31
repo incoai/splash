@@ -52,6 +52,10 @@ MAX_JSON_BYTES = 64 * 1024 * 1024
 # What installation_kind finds at a selection link: an assembly, or a Splash
 # package an earlier release installed.
 ASSEMBLY, PACKAGE = "assembly", "package"
+# The --draft-model of an installation without a draft, which decodes one
+# token a cycle (docs/models.md, Drafts), as is the installation of a family
+# no draft is released for.
+NO_DRAFT = "none"
 # Splash packages, the prebuilt format that predated upstream loading, are no
 # longer loaded: each package format names the MLX model of its family.
 PACKAGE_REPLACEMENTS = {
@@ -153,16 +157,22 @@ def split_model_id(value: str) -> tuple[str, str | None]:
 
 
 def parse_draft_model(value: str) -> str:
-    # A local draft directory is recorded as an absolute path, so the
+    # NO_DRAFT installs the target without a draft. A local draft directory,
+    # or a DSpark draft's GGUF, is recorded as an absolute path, so the
     # installation it selects does not depend on the working directory.
+    if value == NO_DRAFT:
+        return value
     if value and (local := Path(value).expanduser()).is_dir():
         return str(local.resolve())
+    # A GGUF keeps its name, which a Hub cache's link to its blob holds.
+    if value and local.suffix == ".gguf" and local.is_file():
+        return os.path.abspath(local)
     try:
         return validate_repo_id(value)
     except ModelError:
         raise argparse.ArgumentTypeError(
-            "must be a local DFlash2 draft directory or a Hugging Face "
-            "repository ID (owner/repo)"
+            "must be a local DFlash2 draft directory, a local DSpark GGUF, a "
+            f"Hugging Face repository ID (owner/repo), or {NO_DRAFT} for no draft"
         ) from None
 
 
@@ -359,7 +369,8 @@ def parse_args(argv=None):
         "--draft-model",
         type=parse_draft_model,
         help="the DFlash2 draft's repository or local directory, in place of the "
-        "family's released one (required for a family without one)",
+        f"family's released one, or {NO_DRAFT} to decode one token a cycle "
+        "without a draft (as a family without a released draft does)",
     )
     parser.add_argument(
         "--language-only",

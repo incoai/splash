@@ -22,7 +22,7 @@ from .api_shapes import (
     template_messages,
 )
 from .backend import Job, ReasoningRequest, remaining_request_time
-from .chat_format import THINK_END, THINK_START, TOOL_CALL_OPEN
+from .chat_format import THINK_END, THINK_START
 from .chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
     RESERVED_TEMPLATE_KWARGS,
@@ -111,6 +111,12 @@ COMPLETION_DEFAULT_MAX_TOKENS = 16
 
 # A stable marker lets repeated image requests reuse the compiled template.
 IMAGE_RENDER_MARKER = f"__splash_image_{secrets.token_hex(16)}__"
+# Stands in a chat template's source for the placeholder the template refuses
+# in a message's text (ChatFormat.refused_placeholder) while requests render
+# it. No request's text holds it, so the template's refusal never applies to
+# a message, and its own image blocks write the marker, which the rendered
+# prompt gets back as the placeholder. Stable, as IMAGE_RENDER_MARKER is.
+PLACEHOLDER_RENDER_MARKER = f"__splash_placeholder_{secrets.token_hex(16)}__"
 
 
 def _generation_prompt(probed, rendered, tokens):
@@ -658,9 +664,11 @@ class Frontend:
         """The tokens, answer-slot token ids and text of a scoring prompt. The
         request's input drives the render, so a failure is its error."""
         try:
+            # A scoring prompt holds no image, so the template writes no
+            # placeholder whose marker it would get back.
             return judgments.encode_prompt(
                 self.prompt_tokenizer,
-                self.chat_templates.select(None).source,
+                self._request_source(self.chat_templates.select(None).source),
                 messages,
                 labels,
                 chat_format=self.chat_format,
@@ -902,13 +910,15 @@ class Frontend:
                 vision=self.vision,
                 deadline=deadline,
                 without_slot=without_slot,
-            )
+            ),
+            syntax=self.chat_format.call_syntax,
         )
         tools, tool_policy = normalize_tools(
             body.get("tools"),
             body.get("tool_choice"),
             body.get("parallel_tool_calls", True),
             tool_namespaces,
+            syntax=self.chat_format.call_syntax,
         )
         response_schema, response_validator = normalize_response_format(
             body.get("response_format")
@@ -930,9 +940,30 @@ class Frontend:
         with self.latencies.measure("tokenization"):
             return self.tokenizer(tokenizable(text), **options)
 
+    def _request_source(self, source):
+        """A chat template's source as requests render it: with
+        PLACEHOLDER_RENDER_MARKER in place of the placeholder the template
+        refuses in a message's text (ChatFormat.refused_placeholder), so that
+        no message of a request meets that refusal."""
+        placeholder = self.chat_format.refused_placeholder
+        if placeholder is None:
+            return source
+        return source.replace(placeholder, PLACEHOLDER_RENDER_MARKER)
+
     def _apply_chat_template(self, messages, template):
+        """The prompt `template` renders from its request source
+        (_request_source), with the placeholder where the template wrote
+        one."""
+        template = {
+            **template,
+            "chat_template": self._request_source(template["chat_template"]),
+        }
         with self.latencies.measure("template"):
-            return render_chat_template(self.tokenizer, messages, template)
+            rendered = render_chat_template(self.tokenizer, messages, template)
+        placeholder = self.chat_format.refused_placeholder
+        if placeholder is None:
+            return rendered
+        return rendered.replace(PLACEHOLDER_RENDER_MARKER, placeholder)
 
     def _render_prompt(
         self, prompt, deadline, *, check_context=True, add_generation_prompt=True
@@ -1121,18 +1152,17 @@ class Frontend:
         )
 
     def _call_openings(self, policy, thinking):
-        """The tokens that begin each strict tool's call, after the close of
-        the reasoning the generation prompt opened. Its parameter names may
-        come next, so a tool with more of them than the parser admits fails
-        there."""
+        """The tokens that begin each strict tool's call as a turn's first,
+        after the close of the reasoning the generation prompt opened. Its
+        parameter names may come next, so a tool with more of them than the
+        parser admits fails there."""
         chat_format = self.chat_format
         reasoning = [chat_format.think_end_id] if thinking else []
         return [
             (
                 reasoning
                 + self._tokenize(
-                    TOOL_CALL_OPEN + chat_format.call_syntax.function_opening(name),
-                    add_special_tokens=False,
+                    chat_format.call_syntax.opening(name), add_special_tokens=False
                 )["input_ids"],
                 f"tool {name} has too many parameters to constrain",
             )

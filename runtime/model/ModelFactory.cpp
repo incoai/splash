@@ -6,6 +6,7 @@
 #include "model/VisionLoader.hpp"
 
 #include <functional>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -14,12 +15,12 @@ namespace splash::model {
 
 void requireCompatibleModel(const LoadedModel &model) {
   if (!model.descriptor.valid() ||
-      model.descriptor.draft != model.draft.layout ||
+      model.descriptor.draft != model.draft.layout || model.descriptor.draft.dspark() != model.dspark.has_value() ||
       !std::visit(
           [&](const auto &target) {
             return model.descriptor.target == TargetLayout{target.layout} &&
-                   target.layout.vocabularySize ==
-                       model.draft.layout.vocabularySize;
+                   (!model.draft.layout.present() ||
+                    target.layout.vocabularySize == model.draft.layout.vocabularySize);
           },
           model.target)) {
     throw std::invalid_argument(
@@ -59,6 +60,10 @@ TargetWeights readTarget(metal::MetalBackend &backend, const FlintLayout &layout
   return loadFlintWeights(backend, layout, files);
 }
 
+TargetWeights readTarget(metal::MetalBackend &backend, const DeepSeek41Layout &layout, const QwenTargetFiles &files) {
+  return loadDeepSeek41Weights(backend, layout, files);
+}
+
 } // namespace
 
 SparseRowStoreOptions streamedTableRows(const Qwen3_8Layout &) { return {}; }
@@ -85,7 +90,9 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   // Every source's metadata is checked before the first image is written:
   // the vision tower's and the draft's here, the target's by its loader.
   const auto vision = planVisionLoader(root, result.descriptor);
-  DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
+  std::optional<DraftCheckpointLoader> draft;
+  if (result.descriptor.draft.dflash())
+    draft.emplace(backend, images, root / "draft", result.descriptor.draft);
   // The weights that stream from their files read on the engine's readers.
   const ExpertStoreOptions experts{
       .memoryBytes = options.expertMemoryBytes, .floorBytes = options.expertFloorBytes, .readers = options.readers};
@@ -111,7 +118,27 @@ LoadedModel loadModel(metal::MetalBackend &backend,
         throw std::invalid_argument("unknown target source");
       },
       result.descriptor.target);
-  result.draft = loadDFlashDraftWeights(backend, draft, result.descriptor.draft);
+  if (draft)
+    result.draft = loadDFlashDraftWeights(backend, *draft, result.descriptor.draft);
+  if (result.descriptor.draft.dspark()) {
+    // DSpark, every expert loading with its layer, its images the model's
+    // draft/ components.
+    const auto *target = std::get_if<DeepSeek41Layout>(&result.descriptor.target);
+    const std::optional<std::filesystem::path> path = findDSparkGguf(root / "draft");
+    if (!target || !path) throw std::invalid_argument("a DSpark draft serves DeepSeek-V4.1 from its GGUF in draft/");
+    DSparkLayout layout;
+    {
+      const OpenGguf file(std::vector<std::filesystem::path>{*path});
+      layout = readDSparkLayout(file.file(), *target);
+    }
+    if (dsparkDraftLayout(layout) != result.descriptor.draft)
+      throw std::invalid_argument("the DSpark GGUF in draft/ is not the draft the model was described with");
+    const uint64_t before = backend.memoryStats().allocatedBytes;
+    result.dspark.emplace(loadDSparkWeights(backend, images, *path, layout));
+    result.draft.layout = result.descriptor.draft;
+    result.draft.files = result.dspark->files;
+    result.draft.actualAllocatedBytes = metal::allocationDelta(before, backend.memoryStats().allocatedBytes);
+  }
   result.vision = loadVisionWeights(backend, images, vision.get());
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),

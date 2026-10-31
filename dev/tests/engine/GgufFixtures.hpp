@@ -10,6 +10,8 @@
 #include "GgufFormatReference.hpp"
 #include "TestFiles.hpp"
 #include "TestGguf.hpp"
+#include "metal/abi/ManifoldHyperConnection.h"
+#include "model/DeepSeek41.hpp"
 #include "model/GgufFile.hpp"
 #include "model/GgufImage.hpp"
 #include "model/GgufImageLayout.hpp"
@@ -18,6 +20,7 @@
 #include "model/StateLayout.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -228,9 +231,11 @@ inline uint32_t typeOf(const TensorTypes &types, const std::string &name) {
 }
 
 // The architecture of a GGUF of a fixture geometry, each layout's
-// ggufArchitecture: flint for one without GDN layers, qwen4exp for
-// hyper-connected streams, else qwen35moe or qwen35 by its FFN.
+// ggufArchitecture: deepseek41 for DeepSeek-V4.1's dimensions, flint for one
+// without GDN layers, qwen4exp for hyper-connected streams, else qwen35moe or
+// qwen35 by its FFN.
 inline std::string architecture(const model::QwenTargetDimensions &g) {
+  if (g.deepseek.present()) return "deepseek41";
   if (g.layers && !g.gdnLayerCount()) return "flint";
   return g.hyperConnected() ? "qwen4exp" : g.ffnKind == model::QwenFfnKind::SparseMoe ? "qwen35moe" : "qwen35";
 }
@@ -571,6 +576,228 @@ inline std::vector<test_gguf::Key> metadata(const model::QwenTargetDimensions &g
     keys.push_back(test_gguf::boolArrayKey(arch + ".attention.sliding_window_pattern", sliding));
     keys.push_back(test_gguf::boolArrayKey(arch + ".attention.rope_pattern", rotated));
   }
+  return keys;
+}
+
+// A small DeepSeek-V4.1 target, its GGUF as ISTA-DASLab's converter writes
+// DeepSeek-V4.1's: four layers of latent attention over their windows, of
+// which layers 1 to 3 also attend compressed groups, of 2 tokens on layer 1
+// and of 1 on the others, from the compressors of layers 1 and 2 and the
+// indexers of layers 1 to 3; an Engram on layers 0 and 2; on every layer a
+// MoE of eight experts beside a shared expert of their width.
+inline model::QwenTargetDimensions deepseekGeometry() {
+  model::QwenTargetDimensions g;
+  g.layers = 4;
+  g.hiddenSize = 256;
+  g.vocabularySize = 256;
+  // Two query heads over latents of the width the kernels are compiled for.
+  g.attentionWidth = 2 * LATENT_ATTENTION_DIM;
+  g.attentionQueryHeads = 2;
+  g.attentionKvHeads = 1;
+  g.attentionHeadDimension = LATENT_ATTENTION_DIM;
+  g.attentionGate = false;
+  g.rotaryPairs = 32;
+  g.rotaryTheta = 1e4F;
+  g.slidingWindow = 128;
+  g.slidingLayers = 0b1111;
+  g.fullAttentionPeriod = 1;
+  g.ffnKind = model::QwenFfnKind::SparseMoe;
+  g.experts = 8;
+  g.expertsPerToken = 2;
+  g.expertIntermediateSize = 256;
+  g.moeRouter = splash::ops::MoeRouter::SqrtSoftplusNormalized;
+  g.sharedExpertSlices = 1;
+  g.sharedExpertGate = false;
+  // The family's epsilons, scales and YaRN, at a smaller shape.
+  model::DeepSeek41Dimensions &d = g.deepseek = model::DeepSeek41Layout{}.deepseek;
+  d.queryRank = 128;
+  d.outputRank = 128;
+  d.outputGroups = 2;
+  d.compressedLayers = 0b1110;
+  d.pairedLayers = 0b0010;
+  d.compressorLayers = 0b0110;
+  d.indexerLayers = 0b1110;
+  d.indexerHeads = 2;
+  d.indexerHeadDimension = LATENT_INDEX_DIM;
+  d.indexerTopGroups = 16;
+  d.candidateLayer = 2;
+  d.candidateBlockGroups = 4;
+  d.candidateTopBlocks = 8;
+  d.engramLayers = 0b0101;
+  d.engramHeads = 2;
+  d.engramHeadDimension = 64;
+  d.engramNgram = 3;
+  return g;
+}
+
+// The Engram hash of the DeepSeek-V4.1 geometry, as llama.cpp's metadata
+// states it: per Engram layer its multipliers, and its heads' vocabularies
+// (primes, 1009 + 3 i) back to back in the one table from its first row on.
+inline std::vector<uint64_t> deepseekEngramPrimes(const model::QwenTargetDimensions &g) {
+  const model::DeepSeek41Dimensions &d = g.deepseek;
+  std::vector<uint64_t> primes(std::popcount(d.engramLayers) * uint64_t{d.engramNgram - 1} * d.engramHeads);
+  for (size_t head = 0; head < primes.size(); ++head) primes[head] = 1009 + 3 * head;
+  return primes;
+}
+
+// Every tensor of the DeepSeek-V4.1 geometry, zero, as llama.cpp's converter
+// types them: F32 norms, mixes, biases and Engram gates; Q8_0 projections;
+// BF16 compressors, indexers and routers; Q4_K routed experts; the image
+// router's bias, which text does not read; and the Engram's IQ4_NL tables.
+inline std::vector<Tensor> deepseekTensors(const model::QwenTargetDimensions &g) {
+  const model::DeepSeek41Dimensions &d = g.deepseek;
+  std::vector<Tensor> tensors;
+  const auto add = [&](std::string name, std::vector<uint64_t> dims, uint32_t type) {
+    const model::GgmlTypeTraits &traits = *model::ggmlTypeTraits(type);
+    uint64_t elements = 1;
+    for (uint64_t dim : dims) elements *= dim;
+    tensors.push_back(
+        {std::move(name), std::move(dims), type, test_gguf::Bytes(elements / traits.blockElements * traits.blockBytes)});
+  };
+  using model::ggml::kBF16, model::ggml::kF32;
+  const uint64_t hidden = g.hiddenSize, latent = g.attentionHeadDimension, streams = uint64_t{MHC_STREAMS} * hidden;
+  const auto has = [](uint64_t bits, uint32_t layer) { return model::DeepSeek41Dimensions::has(bits, layer); };
+  const auto mix = [&](const std::string &stem) {
+    add(stem + "_fn.weight", {streams, MHC_MIXES}, kF32);
+    add(stem + "_scale.weight", {3}, kF32);
+    add(stem + "_base.weight", {MHC_MIXES}, kF32);
+  };
+  for (uint32_t layer = 0; layer < g.layers; ++layer) {
+    const std::string p = "blk." + std::to_string(layer) + ".";
+    if (has(d.engramLayers, layer)) {
+      add(p + "engram_kv.weight", {d.engramWidth(), (MHC_STREAMS + 1) * hidden}, kQ8_0);
+      add(p + "engram_gate.weight", {hidden, MHC_STREAMS}, kF32);
+    }
+    mix(p + "hc_attn");
+    add(p + "attn_norm.weight", {hidden}, kF32);
+    add(p + "attn_q_a.weight", {hidden, d.queryRank}, kQ8_0);
+    add(p + "attn_q_a_norm.weight", {d.queryRank}, kF32);
+    add(p + "attn_q_b.weight", {d.queryRank, g.attentionWidth}, kQ8_0);
+    add(p + "attn_kv.weight", {hidden, latent}, kQ8_0);
+    add(p + "attn_kv_a_norm.weight", {latent}, kF32);
+    add(p + "attn_sinks.weight", {g.attentionQueryHeads}, kF32);
+    if (has(d.compressorLayers, layer)) {
+      add(p + "attn_compressor_kv.weight", {hidden, latent}, kBF16);
+      if (has(d.pairedLayers, layer)) add(p + "attn_compressor_gate.weight", {hidden, latent}, kBF16);
+      add(p + "attn_compressor_norm.weight", {latent}, kF32);
+      add(p + "indexer.attn_k.weight", {latent, d.indexerHeadDimension}, kBF16);
+      add(p + "indexer.k_norm.weight", {d.indexerHeadDimension}, kF32);
+    }
+    if (has(d.indexerLayers, layer)) {
+      add(p + "indexer.attn_q_b.weight", {d.queryRank, uint64_t{d.indexerHeads} * d.indexerHeadDimension}, kBF16);
+      add(p + "indexer.proj.weight", {hidden, d.indexerHeads}, kBF16);
+    }
+    add(p + "attn_output_a.weight", {d.groupWidth(g.attentionWidth), uint64_t{d.outputGroups} * d.outputRank}, kQ8_0);
+    add(p + "attn_output_b.weight", {uint64_t{d.outputGroups} * d.outputRank, hidden}, kQ8_0);
+    mix(p + "hc_ffn");
+    add(p + "ffn_norm.weight", {hidden}, kF32);
+    const uint64_t experts = g.experts, width = g.expertIntermediateSize;
+    add(p + "ffn_gate_inp.weight", {hidden, experts}, kBF16);
+    add(p + "ffn_gate_exps.weight", {hidden, width, experts}, kQ4_K);
+    add(p + "ffn_up_exps.weight", {hidden, width, experts}, kQ4_K);
+    add(p + "ffn_down_exps.weight", {width, hidden, experts}, kQ4_K);
+    add(p + "ffn_gate_shexp.weight", {hidden, width}, kQ8_0);
+    add(p + "ffn_up_shexp.weight", {hidden, width}, kQ8_0);
+    add(p + "ffn_down_shexp.weight", {width, hidden}, kQ8_0);
+    add(p + "exp_probs_b.bias", {experts}, kF32);
+    add(p + "exp_probs_b_vl.bias", {experts}, kF32);
+  }
+  add("output_norm.weight", {hidden}, kF32);
+  add("output.weight", {hidden, g.vocabularySize}, kQ8_0);
+  add("token_embd.weight", {hidden, g.vocabularySize}, kQ8_0);
+  uint64_t rows = 0;
+  for (const uint64_t prime : deepseekEngramPrimes(g)) rows += prime;
+  add("per_layer_token_embd.weight", {d.engramHeadDimension, rows}, model::ggml::kIQ4_NL);
+  return tensors;
+}
+
+// The metadata of a GGUF of the DeepSeek-V4.1 geometry, as llama.cpp's
+// converter writes it: the sizes every architecture's states, the family's
+// own, the layers of each role as ids, each layer's compress ratio (and,
+// after them, its draft layers'), each layer's SwiGLU clamps, its RoPE's YaRN
+// and the Engram hash: a token map (3 t + 11), multipliers (2^40 + 3 i) and
+// each head's vocabulary and offset (deepseekEngramPrimes).
+inline std::vector<test_gguf::Key> deepseekMetadata(const model::QwenTargetDimensions &g) {
+  const model::DeepSeek41Dimensions &d = g.deepseek;
+  const std::string arch = "deepseek41";
+  std::vector<test_gguf::Key> keys{test_gguf::stringKey("general.architecture", arch)};
+  const auto key = [&](const char *name, uint32_t value) {
+    keys.push_back(test_gguf::uint32Key(arch + "." + name, value));
+  };
+  const auto real = [&](const char *name, float value) {
+    keys.push_back(test_gguf::float32Key(arch + "." + name, value));
+  };
+  const auto ids = [&](const char *name, uint64_t bits) {
+    std::vector<int32_t> layers;
+    for (uint32_t layer = 0; layer < 64; ++layer)
+      if (bits >> layer & 1) layers.push_back(int32_t(layer));
+    keys.push_back(test_gguf::int32ArrayKey(arch + "." + name, layers));
+  };
+  key("block_count", g.layers);
+  key("embedding_length", g.hiddenSize);
+  key("attention.head_count", g.attentionQueryHeads);
+  key("attention.head_count_kv", g.attentionKvHeads);
+  key("attention.key_length", g.attentionHeadDimension);
+  key("attention.value_length", g.attentionHeadDimension);
+  key("rope.dimension_count", 2 * g.rotaryPairs);
+  real("rope.freq_base", g.rotaryTheta);
+  key("expert_count", g.experts);
+  key("expert_used_count", g.expertsPerToken);
+  key("expert_feed_forward_length", g.expertIntermediateSize);
+  key("expert_shared_count", g.sharedExpertSlices);
+  key("expert_gating_func", 4);
+  keys.push_back(test_gguf::boolKey(arch + ".expert_weights_norm", true));
+  real("expert_weights_scale", d.routeScale);
+  key("hash_layer_count", 0);
+  key("attention.q_lora_rank", d.queryRank);
+  key("attention.output_lora_rank", d.outputRank);
+  key("attention.output_group_count", d.outputGroups);
+  key("attention.sliding_window", g.slidingWindow);
+  key("attention.indexer.head_count", d.indexerHeads);
+  key("attention.indexer.key_length", d.indexerHeadDimension);
+  key("attention.indexer.top_k", d.indexerTopGroups);
+  key("attention.indexer.candidate_source_layer", d.candidateLayer);
+  key("attention.indexer.candidate_block_size", d.candidateBlockGroups);
+  key("attention.indexer.candidate_top_k_blocks", d.candidateTopBlocks);
+  real("attention.layer_norm_rms_epsilon", d.normEpsilon);
+  real("attention.compress_rope_freq_base", d.compressRopeTheta);
+  key("hyper_connection.count", MHC_STREAMS);
+  key("hyper_connection.sinkhorn_iterations", d.sinkhornIterations);
+  real("hyper_connection.epsilon", d.hcEpsilon);
+  key("ple.heads_per_ngram", d.engramHeads);
+  key("embedding_length_per_layer_input", d.engramHeadDimension);
+  key("ple.ngram_size", d.engramNgram);
+  key("engram.pad_token_id", d.engramPadToken);
+  keys.push_back(test_gguf::stringKey(arch + ".rope.scaling.type", "yarn"));
+  real("rope.scaling.factor", d.yarnFactor);
+  real("rope.scaling.yarn_beta_fast", d.yarnBetaFast);
+  real("rope.scaling.yarn_beta_slow", d.yarnBetaSlow);
+  key("rope.scaling.original_context_length", d.yarnOriginalContextTokens);
+  std::vector<int32_t> tokens(g.vocabularySize);
+  for (uint32_t token = 0; token < g.vocabularySize; ++token) tokens[token] = int32_t(3 * token + 11);
+  keys.push_back(test_gguf::int32ArrayKey(arch + ".engram.token_map", tokens));
+  std::vector<uint64_t> multipliers(std::popcount(d.engramLayers) * uint64_t{d.engramNgram});
+  for (size_t i = 0; i < multipliers.size(); ++i) multipliers[i] = (uint64_t{1} << 40) + 3 * i;
+  keys.push_back(test_gguf::uint64ArrayKey(arch + ".ple.layer_multipliers", multipliers));
+  const std::vector<uint64_t> primes = deepseekEngramPrimes(g);
+  std::vector<uint64_t> offsets;
+  for (uint64_t next = 0; const uint64_t prime : primes) {
+    offsets.push_back(next);
+    next += prime;
+  }
+  keys.push_back(test_gguf::uint64ArrayKey(arch + ".ple.head_vocab_sizes", primes));
+  keys.push_back(test_gguf::uint64ArrayKey(arch + ".ple.head_offsets", offsets));
+  std::vector<int32_t> ratios;
+  for (uint32_t layer = 0; layer < g.layers; ++layer)
+    ratios.push_back(!(d.compressedLayers >> layer & 1) ? 0 : (d.pairedLayers >> layer & 1) ? 2 : 1);
+  ratios.insert(ratios.end(), {0, 0, 0});
+  keys.push_back(test_gguf::int32ArrayKey(arch + ".attention.compress_ratios", ratios));
+  ids("attention.kv_source_layers", d.compressorLayers);
+  ids("attention.indexer.source_layers", d.indexerLayers);
+  ids("ple.layers", d.engramLayers);
+  const std::vector<float> clamps(g.layers, d.swigluLimit);
+  keys.push_back(test_gguf::float32ArrayKey(arch + ".swiglu_clamp_exp", clamps));
+  keys.push_back(test_gguf::float32ArrayKey(arch + ".swiglu_clamp_shexp", clamps));
   return keys;
 }
 

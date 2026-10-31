@@ -1,6 +1,7 @@
 #include "TestChecks.hpp"
 #include "TestDrafts.hpp"
 #include "TestModel.hpp"
+#include "model/DeepSeek41.hpp"
 #include "model/ModelDescriptor.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/QwenTargetLoader.hpp"
@@ -359,8 +360,14 @@ void checkGdnWidths() {
   withoutGates.packedGdnWidth = shipped.convolutionDimension + shipped.attentionWidth;
   rejects([&] { sizeArenas(withoutGates); }, "invalid model runtime geometry",
           "packed GDN rows without the gates reached arena sizing");
-  // Every family's layout, the 122B's among them, passes the layout check.
-  model::forEachFamily([](const auto &family) { model::requireQwenLayout(family); });
+  // Every family's layout, the 122B's among them, passes its layout check:
+  // DeepSeek-V4.1's, whose attention is its own, requireDeepSeek41Layout.
+  model::forEachFamily([](const auto &family) {
+    if constexpr (std::is_same_v<std::decay_t<decltype(family)>, model::DeepSeek41Layout>)
+      model::requireDeepSeek41Layout(family);
+    else
+      model::requireQwenLayout(family);
+  });
   // A layout without GDN layers sets none of the GDN dimensions.
   auto strayGdn = model::FlintLayout{};
   strayGdn.gdnKeyHeads = 16;

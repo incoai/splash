@@ -1,0 +1,50 @@
+{
+  "float": {
+    "deepseek41.attention.compress_rope_freq_base": 160000.0,
+    "deepseek41.attention.layer_norm_rms_epsilon": 9.999999682655225e-21,
+    "deepseek41.expert_weights_scale": 1.5,
+    "deepseek41.hyper_connection.epsilon": 9.999999974752427e-07,
+    "deepseek41.rope.freq_base": 10000.0,
+    "deepseek41.rope.scaling.factor": 16.0,
+    "deepseek41.rope.scaling.yarn_beta_fast": 32.0,
+    "deepseek41.rope.scaling.yarn_beta_slow": 1.0
+  },
+  "string": {
+    "deepseek41.rope.scaling.type": "yarn",
+    "general.architecture": "deepseek41"
+  },
+  "unsigned": {
+    "deepseek41.attention.head_count": 64,
+    "deepseek41.attention.head_count_kv": 1,
+    "deepseek41.attention.indexer.candidate_block_size": 8,
+    "deepseek41.attention.indexer.candidate_source_layer": 20,
+    "deepseek41.attention.indexer.candidate_top_k_blocks": 2048,
+    "deepseek41.attention.indexer.head_count": 32,
+    "deepseek41.attention.indexer.key_length": 128,
+    "deepseek41.attention.indexer.top_k": 512,
+    "deepseek41.attention.key_length": 512,
+    "deepseek41.attention.output_group_count": 8,
+    "deepseek41.attention.output_lora_rank": 1024,
+    "deepseek41.attention.q_lora_rank": 1280,
+    "deepseek41.attention.sliding_window": 128,
+    "deepseek41.attention.value_length": 512,
+    "deepseek41.block_count": 40,
+    "deepseek41.context_length": 1048576,
+    "deepseek41.embedding_length": 5120,
+    "deepseek41.embedding_length_per_layer_input": 256,
+    "deepseek41.engram.pad_token_id": 2,
+    "deepseek41.expert_count": 384,
+    "deepseek41.expert_feed_forward_length": 2304,
+    "deepseek41.expert_gating_func": 4,
+    "deepseek41.expert_shared_count": 1,
+    "deepseek41.expert_used_count": 6,
+    "deepseek41.expert_weights_norm": 1,
+    "deepseek41.hash_layer_count": 0,
+    "deepseek41.hyper_connection.count": 4,
+    "deepseek41.hyper_connection.sinkhorn_iterations": 20,
+    "deepseek41.ple.heads_per_ngram": 8,
+    "deepseek41.ple.ngram_size": 4,
+    "deepseek41.rope.dimension_count": 64,
+    "deepseek41.rope.scaling.original_context_length": 65536
+  }
+}

@@ -36,6 +36,9 @@ struct StreamableWeights final {
   // Why the table cannot stream (gguf::tableRows), which then loads with
   // the weights: among loadedBytes, with no part of its own.
   std::string tableRefusal;
+  // Whether the table only streams (DeepSeek-V4.1's Engram tables, which its
+  // target reads through their store alone): never loaded whole.
+  bool tableStreamsOnly = false;
 };
 
 // The model's weights in `root`, planned from its files' metadata as its

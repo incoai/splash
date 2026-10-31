@@ -243,6 +243,15 @@ class Repository:
         return cls.local_files(str(path), _paths(path))
 
     @classmethod
+    def local_draft(cls, path):
+        """A local draft: a DFlash2 draft's directory, or a DSpark draft's
+        GGUF file, the one file of its source."""
+        path = Path(path)
+        if path.suffix == ".gguf" and path.is_file():
+            return cls.local_files(str(path), {path.name: path})
+        return cls.local_directory(path)
+
+    @classmethod
     def local_files(cls, name, paths):
         """name, the local files paths maps each file name to, wherever each
         lies."""
@@ -264,7 +273,7 @@ class Repository:
     def recorded(cls, source):
         """A source as an assembly record names it, without the Hub."""
         if source["revision"] is None:
-            return cls.local_directory(source["repo"])
+            return cls.local_draft(source["repo"])
         return cls.cached(source["repo"], source["revision"])
 
     @classmethod
@@ -274,8 +283,8 @@ class Repository:
         """name at the commit revision names now. This decides whether the
         Hub is asked.
 
-        Only an absolute path is a local directory: parse_draft_model makes a
-        --draft-model directory absolute, and a target is always a Hub ID,
+        Only an absolute path is local: parse_draft_model makes a
+        --draft-model directory or GGUF absolute, and a target is always a Hub ID,
         whatever the working directory holds. installed is the commit a
         verified installation of this selection records; its links name its
         files, wherever HF_HUB_CACHE points now. A commit revision never
@@ -295,7 +304,7 @@ class Repository:
         from huggingface_hub import HfApi, constants
 
         if Path(name).is_absolute():
-            return cls.local_directory(name)
+            return cls.local_draft(name)
         models.validate_repo_id(name)
         if installed and (
             constants.HF_HUB_OFFLINE or models.is_hex_digest(revision, 40)

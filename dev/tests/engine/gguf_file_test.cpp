@@ -186,6 +186,19 @@ int main() {
       gguf::append<uint64_t>(nested, 1);
     }
     rejects("excessive nesting", array(nested), "nesting is too deep");
+    // Numeric arrays longer than vision metadata's are skipped, as tokenizer
+    // arrays are, but DeepSeek-V4.1's Engram token map, an id per token.
+    {
+      const std::vector<int32_t> ids(129280, 7);
+      splash::test::writeFile(path, gguf::file({gguf::int32ArrayKey("deepseek41.engram.token_map", ids),
+                                                gguf::int32ArrayKey("fixture.long", ids)},
+                                               {}));
+      splash::model::WeightSource arrays(path);
+      const splash::model::GgufFile file(arrays);
+      const auto map = file.numericArray("deepseek41.engram.token_map");
+      require(map && map->size() == ids.size() && (*map)[129279] == 7 && !file.numericArray("fixture.long"),
+              "the Engram token map is kept whole and other long arrays are skipped");
+    }
     checkSplit(directory.path());
     checkMetadataPart(directory.path());
     std::cout << "GGUF parser bounds tests passed\n";

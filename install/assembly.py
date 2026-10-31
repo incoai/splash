@@ -18,7 +18,10 @@ The paths an assembly links, and what reads each:
   target/<shard>         the MLX safetensors shards except those holding only
                          vision_tower.* (SafetensorsCheckpoint.mm)
   target/<name>.gguf     the GGUF target, or the parts of a split one
-                         (GgufTarget.cpp findTargetGgufs)
+                         (GgufTarget.cpp findTargetGgufs), the last of them
+                         under the name the others imply where the variants
+                         share it, as DeepSeek-V4.1's Engram tables
+                         (upstream.shared_last_part)
   tokenizer/config.json  the same configuration again, from which the
                          server's AutoTokenizer.from_pretrained chooses the
                          tokenizer class
@@ -30,6 +33,8 @@ The paths an assembly links, and what reads each:
                          DraftCheckpoint.cpp), with the mask token's
                          embedding, draft/mask_embedding.safetensors, when
                          the release ships one
+  draft/<name>.gguf      a DeepSeek-V4.1 target's DSpark draft
+                         (ModelDescriptor.mm, DSpark.cpp)
   vision/<shard>         the MLX shards holding vision_tower.*
                          (VisionLoader.cpp, through SafetensorsCheckpoint.mm)
   vision/mmproj.gguf     the GGUF vision projector (VisionLoader.cpp)
@@ -245,6 +250,21 @@ def recorded(link: Path):
     except models.ModelError:
         return None
     return record if _well_formed(record) else None
+
+
+def recorded_files(models_root: Path):
+    """Each file entry the assemblies under models_root record, by the path it
+    records (file_record), for reusing a digest a file whose path, size and
+    times are unchanged already has: a new selection of the same sources
+    reads none of them again. Records of another shape are skipped."""
+    entries = {}
+    resolved = models_root / ".resolved"
+    for assembly in sorted(resolved.iterdir()) if resolved.is_dir() else ():
+        record = recorded(assembly)
+        for entry in record["files"].values() if record else ():
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str):
+                entries.setdefault(entry["path"], entry)
+    return entries
 
 
 def family(path: Path):

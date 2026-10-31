@@ -8,6 +8,7 @@ import re
 import shutil
 import stat
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -19,6 +20,7 @@ from dev.tests.installer_fixtures import (
     CONFIGS,
     DENSE,
     DRAFT_COMMIT,
+    DRAFTLESS,
     GGUF_ONLY,
     MODEL,
     MOE,
@@ -83,15 +85,21 @@ class UpstreamTest(unittest.TestCase):
                     ),
                     family,
                 )
-        # Qwen3.8-Flash-Next and Flint load from a GGUF: the config and
-        # metadata the installer derives from it name the family, with and
-        # without its draft (Flint's flat config, its release's keys, and a
-        # test draft naming one of its reserved tokens as its mask), and
-        # another family's draft is refused.
+        # Qwen3.8-Flash-Next, Flint and DeepSeek-V4.1-Flash load from a GGUF:
+        # the config and metadata the installer derives from it name the
+        # family, with and without its draft (Flint's flat config, its
+        # release's keys, and a test draft naming one of its reserved tokens as
+        # its mask; DeepSeek-V4.1-Flash, which has none, by its release's
+        # config), and another family's draft is refused.
         for family in GGUF_ONLY:
             configs = CONFIGS / family.name.lower()
             gguf_check = {"gguf_metadata": configs / "gguf-metadata.json"}
-            for arguments in ({}, {"draft": configs / "draft" / "config.json"}):
+            drafts = (
+                ({},)
+                if family in DRAFTLESS
+                else ({}, {"draft": configs / "draft" / "config.json"})
+            )
+            for arguments in drafts:
                 self.assertIs(
                     upstream.check_model(
                         "gguf",
@@ -101,6 +109,18 @@ class UpstreamTest(unittest.TestCase):
                         **arguments,
                     ),
                     family,
+                )
+        for family in DRAFTLESS:
+            configs = CONFIGS / family.name.lower()
+            with self.assertRaisesRegex(
+                models.ModelError, "decodes without a DFlash2 draft"
+            ):
+                upstream.check_model(
+                    "gguf",
+                    "none",
+                    configs / "config.json",
+                    gguf_metadata=configs / "gguf-metadata.json",
+                    draft=draft_dir(self.root / "draft", DENSE) / "config.json",
                 )
         flash = families.named("Qwen3.8-Flash-Next")
         configs = CONFIGS / flash.name.lower()
@@ -697,6 +717,23 @@ class UpstreamTest(unittest.TestCase):
             "draft/" + upstream.DRAFT_MASK_EMBEDDING,
             assembly.verify(chosen.link)["files"],
         )
+
+    def test_draft_model_none_installs_the_target_alone(self):
+        fake = FakeHub(self, self.cache)
+        fake.publish(
+            "someone/my-favourite-model", "a" * 40, lambda p: mlx_target(p, MOE)
+        )
+        chosen = selection(
+            self.root, "someone/my-favourite-model", draft_model=models.NO_DRAFT
+        )
+        self.prepare(chosen)
+        self.prepare(chosen)
+        self.assertNotIn(MOE.draft_repo, [repo for repo, _ in fake.requests])
+        record = assembly.verify(chosen.link)
+        self.assertEqual(
+            record["sources"]["draft"], {"repo": models.NO_DRAFT, "revision": None}
+        )
+        self.assertFalse((chosen.link / "draft").exists())
 
     def test_source_assembly_pairs_the_draft_by_architecture(self):
         fake = FakeHub(self, self.cache)
@@ -1827,6 +1864,69 @@ class UpstreamTest(unittest.TestCase):
             link.parent.mkdir(parents=True, exist_ok=True)
             link.symlink_to(self.root)
         self.assertEqual(set(models.selection_links(self.root / "models")), links)
+
+
+class DSparkDraftTest(unittest.TestCase):
+    """DeepSeek-V4.1-Flash's DSpark drafts: the one dspark*.gguf file of a
+    repository, or a --draft-model GGUF whatever its name, linked as
+    draft/<name>.gguf."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.target = types.SimpleNamespace(
+            family=families.named("DeepSeek-V4.1-Flash")
+        )
+
+    def files(self, *names):
+        paths = {}
+        for name in names:
+            (self.root / name).write_bytes(b"GGUF")
+            paths[name] = self.root / name
+        return paths
+
+    def test_a_repository_installs_its_one_dspark_gguf(self):
+        paths = self.files("dspark-Model-Q8_0.gguf", "Model-Q4_K_M.gguf", "config.json")
+        repo = hub.Repository("unsloth/Model-GGUF", "a" * 40, set(paths), paths)
+        self.assertEqual(
+            upstream.draft_files(repo, self.target),
+            {"draft/dspark-Model-Q8_0.gguf": paths["dspark-Model-Q8_0.gguf"]},
+        )
+
+    def test_a_repository_of_none_or_several_is_refused(self):
+        for names in (("Model-Q4_K_M.gguf",), ("dspark-a.gguf", "DSpark-b.gguf")):
+            paths = self.files(*names)
+            repo = hub.Repository("unsloth/Model-GGUF", "a" * 40, set(paths), paths)
+            with (
+                self.subTest(names=names),
+                self.assertRaisesRegex(
+                    models.ModelError, "does not hold one DSpark GGUF"
+                ),
+            ):
+                upstream.draft_files(repo, self.target)
+
+    def test_a_local_gguf_is_the_draft_whatever_its_name(self):
+        path = self.files("my-draft.gguf")["my-draft.gguf"]
+        repo = hub.Repository.local_draft(path)
+        self.assertEqual(
+            upstream.draft_files(repo, self.target), {"draft/my-draft.gguf": path}
+        )
+
+    def test_draft_model_keeps_the_name_of_a_link_to_a_blob(self):
+        # A Hub cache's snapshot links each file to its blob, which has no
+        # .gguf name.
+        blob = self.root / ("b" * 64)
+        blob.write_bytes(b"GGUF")
+        link = self.root / "dspark-Model-Q8_0.gguf"
+        link.symlink_to(blob)
+        with contextlib.chdir(self.root):
+            self.assertEqual(
+                models.parse_draft_model("dspark-Model-Q8_0.gguf"), str(link)
+            )
+        self.assertEqual(
+            hub.Repository.local_draft(link).files, {"dspark-Model-Q8_0.gguf"}
+        )
 
 
 if __name__ == "__main__":

@@ -123,6 +123,23 @@ class CachedTest(unittest.TestCase):
                             variant,
                         )[0],
                     )
+        # A split GGUF's parts at the root beside another variant's
+        # (upstream.root_split_gguf), as ISTA-DASLab's DeepSeek-V4.1 GGUFs
+        # keep theirs, are one target; an incomplete split holds none.
+        root_split = {
+            "m-Q8_0.gguf",
+            "m-IQ1_M-00001-of-00002.gguf",
+            "m-IQ1_M-00002-of-00002.gguf",
+            "m-IQ2_M-00001-of-00002.gguf",
+        }
+        self.assertEqual(
+            cached.candidates("owner/m-GGUF", root_split, {}),
+            ["owner/m-GGUF:IQ1_M", "owner/m-GGUF:Q8_0"],
+        )
+        self.assertEqual(
+            upstream.select_gguf(root_split, "IQ1_M")[0],
+            ["m-IQ1_M-00001-of-00002.gguf", "m-IQ1_M-00002-of-00002.gguf"],
+        )
         # A suggested repository's cached files take its suggested IDs, and
         # the others their own.
         self.assertEqual(

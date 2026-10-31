@@ -79,7 +79,10 @@ delta, and an assistant message sent back may carry its `reasoning_content`
 `output_text` and `input_image` parts too, and a `refusal` part, an assistant's
 refusal, is text. A history tool call whose `arguments` are not a JSON object,
 such as one the output limit cut, is kept as text, so the conversation
-continues. `n` other than 1 and `logprobs: true` return 400.
+continues, and so is one whose name the chat template refuses, as DeepSeek's
+refuses a name that holds `::` more than once: a model that calls tools
+freely may call one by any name, and the call returns as written.
+`n` other than 1 and `logprobs: true` return 400.
 
 `POST /v1/completions` serves OpenAI's legacy text completions. `prompt` is one
 string, which the loaded tokenizer encodes as a raw prompt, adding its own
@@ -425,9 +428,12 @@ syntax ([chat formats](models.md#chat-formats)). In Qwen's XML a call opens at
 `\n</parameter>\n` where the next parameter, `</function>` or `</tool_call>`
 follows; in Flint's GLM tags a call opens at `<tool_call>`, the function's name
 follows it up to the first tag, and a value ends at `</arg_value>` where the
-next `<arg_key>` or `</tool_call>` follows. A value may hold the tags in any
-other order, as a file an agent writes may. Tags written otherwise are text.
-Besides:
+next `<arg_key>` or `</tool_call>` follows; in DeepSeek's DSML a call opens at
+`<｜DSML｜ invoke name="`, its name ends at the quote, a parameter's name ends
+at `" string="true">` or `" string="false">`, and a value ends at
+`</｜DSML｜ parameter>` and the newline where the next parameter or
+`</｜DSML｜ invoke>` follows. A value may hold the tags in any other order, as
+a file an agent writes may. Tags written otherwise are text. Besides:
 
 - names lose the space around them, and a call that names no function is
   dropped, as is a `</think>` in text;
@@ -443,11 +449,15 @@ Besides:
   as a `tool_use` block's `input` in a Messages history, five levels into the
   body;
 - a call's opening also ends the reasoning where a call may follow, but for a
-  model that opens its reasoning itself, as Flint does, which closes it before
-  a call.
+  model that closes its reasoning before a call, as Flint's and DeepSeek's do;
+- DeepSeek's block of calls, `<｜DSML｜ calls>` to `</｜DSML｜ calls>`, is dropped
+  from the content with the blank line its template sets before it, and a value
+  marked `string="false"` reads as the JSON it spells where its schema gives it
+  no type (a declared type decides as for any family).
 
 `dev/tests/server/test_tool_call_reading.py` holds model outputs with the calls
-and content they read as, and `dev/tests/server/test_chat_formats.py` Flint's.
+and content they read as, `dev/tests/server/test_chat_formats.py` Flint's and
+`dev/tests/server/test_deepseek_format.py` DeepSeek's.
 
 A strict tool's schema is checked against its JSON Schema dialect on arrival,
 and every tool's arguments are framed through schema composition and local
@@ -483,6 +493,10 @@ A tool's name is written in its calls' tags and read back from them, so it
 holds 1 to 256 characters in Unicode NFC, which a tokenizer such as Qwen's
 keeps text in, other than `<`, `>`, line breaks and lone surrogates, and does
 not start or end with whitespace; a `tool_reference` names a tool the same way.
+Where DeepSeek's DSML lays the calls out, a tool's name also holds neither
+`｜DSML｜`, which opens each of its tags, nor the quote a function's name ends
+at, nor `::` more than once, as its template reads the text before the first
+`::` as the tool's namespace; the 400 names the tool.
 A Chat tool or named `tool_choice` that gives no `type` is a function. A
 Responses `namespace` function goes by `namespace__name`. Hosted search is
 unsupported; configure client-owned tools such as MCP.

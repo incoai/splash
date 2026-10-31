@@ -490,8 +490,10 @@ std::string runtimeStatusJson(
       << ",\"resets\":" << executorTelemetry.draftStateResets << "}"
       // The rows decode cycles verify (--verify-rows): auto where the verify
       // budget chooses them, all where they are every row up to each lane's
-      // retention limit.
-      << ",\"verify_rows\":" << json::quote(executorTelemetry.verifyBudget ? "auto" : "all")
+      // retention limit, anchor where a model without a draft verifies its
+      // anchor alone.
+      << ",\"verify_rows\":"
+      << json::quote(executorTelemetry.verifyBudget ? "auto" : executorTelemetry.drafts ? "all" : "anchor")
       // Model-lifetime timings include warmup; request metrics do not.
       << ",\"model_timing\":{\"scope\":\"model_lifetime\""
       << ",\"prefill\":{\"last_gpu_ms\":"

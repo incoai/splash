@@ -37,7 +37,7 @@ import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
 
-from . import hub, models, paths, upstream
+from . import gguf, hub, models, paths, upstream
 from .models import ModelError
 
 __all__ = ["ModelError", "prepare_local_model"]
@@ -54,10 +54,12 @@ def prepare_local_model(
     tokenizer files and a safetensors checkpoint) or else a single GGUF
     target, whole or split, beside any vision projector named mmproj.
     draft: the directory of a DFlash2 draft (config.json and safetensors
-    weights) trained for the target's family. Without one, the draft
-    released for the family is taken from the Hugging Face cache
-    (HF_HUB_CACHE), at the commit last recorded there for its default
-    branch, as `hf download REPO` and `splash serve` record it.
+    weights) trained for the target's family, or "none" (models.NO_DRAFT)
+    to decode one token a cycle without one, as a family no draft is
+    released for does. Without one, the draft released for the family is
+    taken from the Hugging Face cache (HF_HUB_CACHE), at the commit last
+    recorded there for its default branch, as `hf download REPO` and
+    `splash serve` record it.
     mmproj: a GGUF target's vision projector, a GGUF file, with which it
     serves images; a GGUF target serves text only without one, as one of a
     family without a vision tower (Flint) always does. An MLX target's
@@ -85,7 +87,8 @@ def prepare_local_model(
     its reason; an OSError is a failure of the file system.
     """
     target = _path(target)
-    draft = None if draft is None else _path(draft)
+    if draft is not None and draft != models.NO_DRAFT:
+        draft = _path(draft)
     mmproj = None if mmproj is None else _path(mmproj)
     models_root = Path(models_dir).expanduser().resolve()
     try:
@@ -101,7 +104,7 @@ def _prepare(target, draft, mmproj, language_only, models_root):
             f"{mmproj} is a vision projector, which a model that serves text "
             "only (language_only) does not load"
         )
-    if draft and not draft.is_dir():
+    if draft and draft != models.NO_DRAFT and not draft.is_dir():
         raise ModelError(
             f"draft {draft} is not a directory: a DFlash2 draft is the "
             "directory of its config.json and safetensors weights"
@@ -116,7 +119,9 @@ def _prepare(target, draft, mmproj, language_only, models_root):
     with tempfile.TemporaryDirectory(prefix="splash-target-") as scratch:
         source, inspected = _inspect(target, mmproj, language_only, Path(scratch))
         repo = _draft(inspected.family, draft)
-        files = upstream.draft_files(repo, inspected)
+        files = (
+            {} if repo is upstream.NO_DRAFT else upstream.draft_files(repo, inspected)
+        )
     files |= {path: source.paths[name] for path, name in inspected.files.items()}
     record = upstream.assembly_record(str(target), inspected, source, repo)
     return upstream.publish(models_root, link, record, files)
@@ -148,16 +153,31 @@ def _inspect(target, mmproj, language_only, scratch):
                 raise models.VisionError(
                     f"{error}; pass language_only=True to serve text only"
                 ) from None
-        directory, names = target, _gguf_in(repo.files)
+        directory = target
     elif target.is_file():
         if not target.name.endswith(".gguf"):
             raise ModelError(
                 "it is not a GGUF file; a target is a GGUF file or a model directory"
             )
-        directory, names = target.parent, _split_parts(target)
+        directory = target.parent
     else:
         raise ModelError("it does not exist")
-    files = {name: directory / name for name in names}
+    # The last part a split GGUF's variants share under a name of its own, as
+    # DeepSeek-V4.1's Engram tables, is no target; where one lies at the
+    # root, the split GGUF beside it may lack its last part, which
+    # upstream.gguf_target finds by its header among them.
+    shared = {
+        path.name: path
+        for path in sorted(directory.iterdir())
+        if _shared_part(directory, path.name)
+    }
+    if target.is_dir():
+        names = _gguf_in(
+            {n for n in repo.files if n not in shared}, shared_last=bool(shared)
+        )
+    else:
+        names = _split_parts(target, shared_last=bool(shared))
+    files = {name: directory / name for name in names} | shared
     projector = None
     if mmproj:
         if mmproj.name in files:
@@ -177,6 +197,26 @@ def _inspect(target, mmproj, language_only, scratch):
     return repo, inspected
 
 
+def _shared_part(directory, name):
+    """Whether the file name of directory is a GGUF at its root, not named as
+    a split GGUF's part, whose header makes it a later part of one: the last
+    part the variants of a split GGUF share under a name of its own
+    (gguf.last_part), as DeepSeek-V4.1's Engram tables."""
+    path = directory / name
+    if (
+        "/" in name
+        or not name.endswith(".gguf")
+        or upstream.SPLIT_NAME.search(name)
+        or not path.is_file()
+    ):
+        return False
+    try:
+        part = gguf.Metadata(path).values.get("split.no")
+    except (ModelError, OSError):
+        return False
+    return type(part) is int and part > 0
+
+
 def _model_of(name):
     """The model a GGUF file holds: NAME for a split GGUF's part,
     NAME-0000K-of-0000N.gguf, else the file's own name."""
@@ -184,10 +224,10 @@ def _model_of(name):
     return name[: match.start()] if match else name
 
 
-def _gguf_in(files):
+def _gguf_in(files, *, shared_last=False):
     """The files of the one GGUF target at the root of a directory of files,
-    in split order, whatever vision projectors (named mmproj) lie beside
-    it."""
+    in split order, whatever vision projectors (named mmproj) lie beside it;
+    with shared_last, a split GGUF's but its last (upstream.split_order)."""
     candidates = [
         name
         for name in upstream.root_ggufs(files)
@@ -205,12 +245,13 @@ def _gguf_in(files):
         )
     if _model_of(candidates[0]) == candidates[0]:
         return candidates
-    return upstream.split_order(candidates, "its split GGUF")
+    return upstream.split_order(candidates, "its split GGUF", shared_last=shared_last)
 
 
-def _split_parts(target):
+def _split_parts(target, *, shared_last=False):
     """The files of the GGUF target, in split order: target alone, or every
-    part of the split GGUF it is one part of, beside it."""
+    part of the split GGUF it is one part of, beside it (with shared_last,
+    every part but the last, upstream.split_order)."""
     model = _model_of(target.name)
     if model == target.name:
         return [target.name]
@@ -221,7 +262,9 @@ def _split_parts(target):
         and path.name.endswith(".gguf")
         and _model_of(path.name) == model
     ]
-    return upstream.split_order(parts, f"the split GGUF {model} in {target.parent}")
+    return upstream.split_order(
+        parts, f"the split GGUF {model} in {target.parent}", shared_last=shared_last
+    )
 
 
 def _projector(mmproj, repo):
@@ -243,14 +286,12 @@ def _draft(family, draft):
     """The draft's files: the directory draft, or else, without one, the
     draft released for family at the commit the Hugging Face cache records
     for its default branch, with no request to the Hub
-    (hub.Repository.resolve)."""
+    (hub.Repository.resolve). "none", and a family no draft is released for
+    without one, install none (upstream.NO_DRAFT)."""
+    if draft == models.NO_DRAFT or (not draft and family.draft_repo is None):
+        return upstream.NO_DRAFT
     if draft:
         return hub.Repository.local_directory(draft)
-    if family.draft_repo is None:
-        raise ModelError(
-            f"no DFlash2 draft is released for {family.name}; pass the "
-            "directory of one as draft"
-        )
     try:
         return hub.Repository.resolve(
             family.draft_repo,

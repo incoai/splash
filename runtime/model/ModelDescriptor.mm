@@ -1,4 +1,5 @@
 #include "ModelDescriptor.hpp"
+#include "DSpark.hpp"
 #include "GgufImage.hpp"
 #include "SafetensorsImage.hpp"
 #include "WeightStore.hpp"
@@ -373,6 +374,92 @@ void validateTextConfig(NSDictionary *text, const FlintLayout &target, TargetSou
     if (text[@(key)]) requireBooleans(text, "text config", {{key, false}});
 }
 
+// Numbers the layout holds as floats, which a config states as the float's
+// value or, derived from a GGUF's float32 header (install/gguf.py), as that
+// value widened: each must round to the layout's float.
+void requireFloats(NSDictionary *object, std::string_view source, std::string_view where,
+                   std::initializer_list<std::pair<const char *, float>> fields) {
+  for (const auto &[key, expected] : fields) {
+    const std::string label = std::string(where) + " " + key;
+    NSNumber *number = requireNumber(object[@(key)], label);
+    if (static_cast<float>(number.doubleValue) != expected)
+      throw std::invalid_argument(label + " mismatch: " + std::string(source) + " " + number.description.UTF8String +
+                                  ", runtime " + @(expected).description.UTF8String);
+  }
+}
+
+// DeepSeek-V4.1's text configuration, as the installer derives it from its
+// GGUF's header (install/gguf.py deepseek41_text_config) and its release's
+// config.json states it: the sizes every family's holds (sizeDifference),
+// then its own as the layout's values make them: the low-rank query and
+// grouped output projections, its RoPE, YaRN and the compressed layers'
+// RoPE base, the router and the SwiGLU clamp, the window, the compression
+// ratio of each layer (past them its multi-token prediction layers', which
+// the target does not run), the KV and index sources, the indexer and its
+// candidate blocks, the hyper-connections, the Engram's layers and shape,
+// and the token that ends a turn.
+void validateTextConfig(NSDictionary *text, const DeepSeek41Layout &target, TargetSource source) {
+  const std::string_view name = sourceName(source);
+  if (const auto difference = sizeDifference(text, target, source)) throw unsupportedModel(difference->difference);
+  const DeepSeek41Dimensions &d = target.deepseek;
+  requireNumbers(text, name, "text config",
+                 {{"q_lora_rank", d.queryRank},
+                  {"o_lora_rank", d.outputRank},
+                  {"o_groups", d.outputGroups},
+                  {"qk_rope_head_dim", 2 * target.rotaryPairs},
+                  {"moe_intermediate_size", target.expertIntermediateSize},
+                  {"n_shared_experts", target.sharedExpertSlices},
+                  {"num_experts_per_tok", target.expertsPerToken},
+                  {"sliding_window", target.slidingWindow},
+                  {"index_n_heads", d.indexerHeads},
+                  {"index_head_dim", d.indexerHeadDimension},
+                  {"index_topk", d.indexerTopGroups},
+                  {"candidate_source_layer_id", d.candidateLayer},
+                  {"candidate_topk_blocks", d.candidateTopBlocks},
+                  {"candidate_block_size", d.candidateBlockGroups},
+                  {"hc_mult", MHC_STREAMS},
+                  {"hc_sinkhorn_iters", d.sinkhornIterations},
+                  {"engram_max_ngram_size", d.engramNgram},
+                  {"engram_n_heads", d.engramHeads},
+                  {"engram_head_dim", d.engramHeadDimension},
+                  {"engram_pad_token_id", d.engramPadToken}});
+  requireFloats(text, name, "text config",
+                {{"routed_scaling_factor", d.routeScale},
+                 {"swiglu_limit", d.swigluLimit},
+                 {"rms_norm_eps", d.normEpsilon},
+                 {"rope_theta", target.rotaryTheta},
+                 {"compress_rope_theta", d.compressRopeTheta},
+                 {"hc_eps", d.hcEpsilon}});
+  requireEqual(requireString(text, @"scoring_func", "text config scoring_func"), "sqrtsoftplus", name,
+               "text config scoring_func");
+  requireBooleans(text, "text config", {{"norm_topk_prob", true}});
+  NSDictionary *rope = requireObject(text, @"rope_scaling", "text config rope_scaling");
+  requireEqual(requireString(rope, @"rope_type", "text config rope_scaling rope_type"), "yarn", name,
+               "text config rope_scaling rope_type");
+  requireFloats(rope, name, "text config rope_scaling",
+                {{"factor", d.yarnFactor}, {"beta_fast", d.yarnBetaFast}, {"beta_slow", d.yarnBetaSlow}});
+  requireNumbers(rope, name, "text config rope_scaling",
+                 {{"original_max_position_embeddings", d.yarnOriginalContextTokens}});
+  std::vector<uint32_t> ratios;
+  for (uint32_t layer = 0; layer < target.layers; ++layer)
+    ratios.push_back(!d.has(d.compressedLayers, layer) ? 0 : d.has(d.pairedLayers, layer) ? 2 : 1);
+  NSArray *stated = requireArray(text, @"compress_ratios", "text config compress_ratios");
+  if (stated.count < target.layers)
+    throw std::invalid_argument("text config compress_ratios holds fewer values than the target's layers");
+  requireWholes([stated subarrayWithRange:NSMakeRange(0, target.layers)], ratios, name,
+                "text config compress_ratios");
+  requireWholes(requireArray(text, @"kv_source_layer_ids", "text config kv_source_layer_ids"),
+                layersOf(d.compressorLayers, target.layers), name, "text config kv_source_layer_ids");
+  requireWholes(requireArray(text, @"index_source_layer_ids", "text config index_source_layer_ids"),
+                layersOf(d.indexerLayers, target.layers), name, "text config index_source_layer_ids");
+  requireWholes(requireArray(text, @"engram_layer_ids", "text config engram_layer_ids"),
+                layersOf(d.engramLayers, target.layers), name, "text config engram_layer_ids");
+  // The derived config states the token that ends a turn; the release's
+  // states it beside its text config.
+  if (text[@"eos_token_id"])
+    requireNumbers(text, name, "text config", {{"eos_token_id", target.stopTokens.tokens().front()}});
+}
+
 // The mask token a DFlash2 draft of a family whose drafts choose theirs
 // names (dflash_config.mask_token_id), which must be one of the target's
 // reserved tokens; readDraftLayout then holds the draft to it.
@@ -412,6 +499,14 @@ uint32_t ggufRoutedExperts(NSDictionary *text, const QwenHybridLayout &target) {
   throw unsupportedModel("text config num_experts: GGUF " + std::to_string(experts) + ", " +
                          std::string(target.family) + " a multiple of " + std::to_string(routerTile) + " from " +
                          std::to_string(fewest) + " to " + std::to_string(target.experts));
+}
+
+// The routed experts of a DeepSeek-V4.1 GGUF: its header's expert_count,
+// which the installer derives into the config's n_routed_experts, the
+// family's.
+uint32_t ggufRoutedExperts(NSDictionary *text, const DeepSeek41Layout &target) {
+  requireNumbers(text, "GGUF", "text config", {{"n_routed_experts", target.experts}});
+  return target.experts;
 }
 
 // An MLX target's quantization, the "quantization" object of its config.json:
@@ -788,9 +883,9 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   else if (visionFormat == "safetensors") visionSource = VisionSource::Safetensors;
   else if (visionFormat == "gguf") visionSource = VisionSource::Gguf;
   else throw std::invalid_argument("unsupported vision source format: " + std::string(visionFormat));
-  // Without a draft config the descriptor names the family but has no draft
-  // (inspectSourceConfiguration), and is not valid; a model root always
-  // holds its draft's.
+  // Without a draft config the descriptor has no draft: the installer's check
+  // before it chose one (inspectSourceConfiguration), or a model installed
+  // without one.
   DFlashDraftLayout dflashLayout;
   std::visit([&](auto &layout) {
     if (targetSource == TargetSource::Safetensors && !layout.loadsSafetensors)
@@ -799,6 +894,10 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
     if (targetSource == TargetSource::Safetensors) requireQuantization(config, layout);
     if (targetSource == TargetSource::Gguf && layout.ffnKind == QwenFfnKind::SparseMoe)
       layout.experts = ggufRoutedExperts(text, layout);
+    // DeepSeek-V4.1 has no DFlash2 draft: it decodes a token a cycle, or a
+    // block with its DSpark (inspectModelRoot).
+    if (draft && layout.deepseek.present())
+      throw std::invalid_argument(std::string(layout.family) + " decodes without a DFlash2 draft");
     if (draft && layout.draftChoosesMaskToken()) layout.maskToken = draftMaskToken(draft, layout);
     if (draft) dflashLayout = readDraftLayout(draft, layout);
   }, *target);
@@ -886,13 +985,23 @@ bool ModelDescriptor::valid() const noexcept {
       !capabilities.vocabularySize ||
       !capabilities.maximumContextTokens ||
       !targetKvLayout.valid() || !stateLayout.valid() ||
-      stateLayout.draft != draft.stateLayout() ||
-      vision.outputHiddenSize != draft.hiddenSize) {
+      stateLayout.draft != draft.stateLayout()) {
     return false;
   }
   return std::visit(
       [&](const auto &layout) {
+        // A draft reads the target's rows and shares its vocabulary head; a
+        // model without one decodes one token a cycle.
+        const bool draftFits =
+            !draft.present() ||
+            (layout.hiddenSize == draft.hiddenSize && draft.targetLayerCount &&
+             draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
+             draft.targetLayers[draft.targetLayerCount - 1] < layout.layers &&
+             // A family whose drafts choose the mask token holds its draft's.
+             (!layout.draftChoosesMaskToken() ||
+              (layout.maskToken >= layout.firstDraftMaskToken && layout.maskToken <= layout.lastDraftMaskToken)));
         return layout.vocabularySize == capabilities.vocabularySize &&
+               vision.outputHiddenSize == layout.hiddenSize && draftFits &&
                layout.servedContextTokens(ropeScaling) ==
                    capabilities.maximumContextTokens &&
                // YaRN stretches the native window, at most to the family's
@@ -902,12 +1011,6 @@ bool ModelDescriptor::valid() const noexcept {
                  capabilities.maximumContextTokens <= layout.yarnContextTokens)) &&
                capabilities.sparseKv == sparseKvShape(layout) &&
                (!capabilities.sparseKv || capabilities.sparseKv->blockTokens == SPLASH_ATTENTION_BLOCK_TOKENS) &&
-               layout.hiddenSize == draft.hiddenSize &&
-               draft.targetLayerCount && draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
-               draft.targetLayers[draft.targetLayerCount - 1] < layout.layers &&
-               // A family whose drafts choose the mask token holds its draft's.
-               (!layout.draftChoosesMaskToken() ||
-                (layout.maskToken >= layout.firstDraftMaskToken && layout.maskToken <= layout.lastDraftMaskToken)) &&
                layout.kvLayout() == targetKvLayout &&
                layout.gdnStateLayout() == stateLayout.target;
       },
@@ -933,6 +1036,28 @@ ModelDescriptor servedFor(ModelDescriptor model, uint32_t contextTokens) {
   return model;
 }
 
+namespace {
+
+// `described`, a DeepSeek-V4.1 described without a draft, with the DSpark
+// of the GGUF at `path`: its draft layout (dsparkDraftLayout), and its noise
+// token the target's mask token, which fills the rows of a block after its
+// anchor.
+ModelDescriptor withDSpark(ModelDescriptor described, const std::filesystem::path &path) {
+  auto *target = std::get_if<DeepSeek41Layout>(&described.target);
+  if (!target) throw std::invalid_argument(std::string(described.family()) + " has no DSpark draft");
+  DSparkLayout layout;
+  {
+    const OpenGguf file(std::vector<std::filesystem::path>{path});
+    layout = readDSparkLayout(file.file(), *target);
+  }
+  target->maskToken = layout.noiseToken;
+  ModelDescriptor result = makeModelDescriptor(std::move(described.name), *target, dsparkDraftLayout(layout),
+                                               described.vision, described.targetSource, described.visionSource);
+  return result;
+}
+
+} // namespace
+
 ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
   @autoreleasepool {
     std::string sourceIdentity;
@@ -942,11 +1067,15 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
     const std::string targetFormat = requireString(record, @"target_format", "target format");
     const std::string visionFormat = requireString(record, @"vision_format", "vision format");
     NSDictionary *config = readObject(root / "config.json", "upstream model config");
-    // Every family decodes with its DFlash2 draft, in draft/.
-    if (!std::filesystem::exists(root / "draft"))
-      throw std::invalid_argument("the model's root holds no draft/ for its DFlash2 draft");
-    NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
+    // A model decodes with its draft, in draft/: a DFlash2 draft, or
+    // DeepSeek-V4.1's DSpark, its GGUF there; or, installed without one
+    // (--draft-model none), one token a cycle.
+    const std::optional<std::filesystem::path> dspark = findDSparkGguf(root / "draft");
+    NSDictionary *draft = std::filesystem::exists(root / "draft") && !dspark
+                              ? readObject(root / "draft" / "config.json", "draft config")
+                              : nil;
     ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft);
+    if (dspark) result = withDSpark(std::move(result), *dspark);
     result.sourceIdentity = std::move(sourceIdentity);
     if (!result.valid()) throw std::invalid_argument("incompatible target and draft model");
     return result;

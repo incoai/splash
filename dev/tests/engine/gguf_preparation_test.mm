@@ -522,6 +522,78 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
   }
 }
 
+// A DeepSeek-V4.1 target read from a GGUF through the production loader
+// (model/DeepSeek41.cpp) in the order the planner lays its images out
+// (GgufImage.cpp DeepSeek41Gguf): each layer's parts of its roles alone, its
+// output groups block projections of their own, its compressor's and
+// indexer's BF16 projections into fp32, its Engram gate's F32 weights, the
+// head's logits into fp32 and the Engram hash the metadata states, each
+// Engram layer's offsets from its first row in the tables. The loader reads
+// every section of every image, or throws.
+void checkDeepSeekTarget(MetalBackend &backend, const std::filesystem::path &directory) {
+  const model::QwenTargetDimensions g = deepseekGeometry();
+  const model::DeepSeek41Layout layout{model::QwenHybridLayout{g, "DeepSeek-V4.1-Flash"}};
+  const model::DeepSeek41Dimensions &d = layout.deepseek;
+  const std::vector<Tensor> tensors = deepseekTensors(g);
+  const auto target = directory / "deepseek41";
+  std::filesystem::create_directory(target);
+  splash::test::writeFile(target / "target.gguf", test_gguf::file(deepseekMetadata(g), tensors));
+  model::WeightImages images(backend, "fixture");
+  model::GgufTargetLoader files(backend, images, model::findTargetGgufs(target), layout.ggufArchitecture, layout);
+  const model::DeepSeek41Weights weights = model::loadDeepSeek41Weights(backend, layout, files);
+  check(weights.layers.size() == layout.layers, "DeepSeek-V4.1 target: every layer");
+  const uint32_t hidden = layout.hiddenSize, latent = layout.attentionHeadDimension;
+  for (uint32_t index = 0; index < weights.layers.size(); ++index) {
+    const model::DeepSeek41LayerWeights &layer = weights.layers[index];
+    const std::string at = "DeepSeek-V4.1 target layer " + std::to_string(index) + ": ";
+    const auto has = [&](uint64_t layers) { return model::DeepSeek41Dimensions::has(layers, index); };
+    check(bool(layer.engram) == has(d.engramLayers) && bool(layer.compressor) == has(d.compressorLayers) &&
+              (!layer.compressor || bool(layer.compressor->gate) == has(d.pairedLayers)) &&
+              bool(layer.indexer) == has(d.indexerLayers),
+          at + "the parts of its roles alone");
+    check(blockProjection(layer.queryA, d.queryRank, hidden, {d.queryRank}) &&
+              blockProjection(layer.queryB, layout.attentionWidth, d.queryRank, {layout.attentionWidth}) &&
+              blockProjection(layer.kv, latent, hidden, {latent}) && layer.queryNorm.float32 && layer.kvNorm.float32,
+          at + "query latent, queries and latent block projections with F32 norms");
+    bool groups = layer.outputA.size() == d.outputGroups;
+    for (const ops::Projection &group : layer.outputA)
+      groups = groups && blockProjection(group, d.outputRank, d.groupWidth(layout.attentionWidth), {d.outputRank});
+    check(groups && blockProjection(layer.outputB, hidden, d.outputGroups * d.outputRank, {hidden}),
+          at + "output groups block projections of their own, then theirs");
+    if (layer.compressor)
+      check(layer.compressor->kv.destination == ops::FloatOutput::Float32 && layer.compressor->kv.outputSize == latent &&
+                layer.compressor->indexKey.destination == ops::FloatOutput::Float32 &&
+                layer.compressor->indexKey.inputSize == latent,
+            at + "compressor and index key into fp32");
+    if (layer.indexer)
+      check(layer.indexer->query.destination == ops::FloatOutput::Float32 &&
+                layer.indexer->query.outputSize == d.indexerHeads * d.indexerHeadDimension &&
+                layer.indexer->weights.outputSize == d.indexerHeads,
+            at + "indexer queries and head weights into fp32");
+    if (layer.engram)
+      check(blockProjection(layer.engram->kv, (MHC_STREAMS + 1) * hidden, d.engramWidth(), {(MHC_STREAMS + 1) * hidden}) &&
+                layer.engram->gate.sizeBytes() == uint64_t{MHC_STREAMS} * hidden * 4,
+            at + "Engram projection of its gathered rows into a key per stream and a value, and F32 gate weights");
+    check(layer.attentionMix.fn.sizeBytes() == uint64_t{MHC_MIXES} * MHC_STREAMS * hidden * 4 &&
+              layer.ffnMix.base.sizeBytes() == MHC_MIXES * 4 &&
+              layer.ffn.selectionBias.sizeBytes() == uint64_t{layout.experts} * 4 &&
+              layer.sinks.sizeBytes() == uint64_t{layout.attentionQueryHeads} * 4,
+          at + "F32 mixes, sinks and router bias");
+  }
+  check(weights.finalNorm.float32 && weights.logitsProjection.destination == ops::FloatOutput::Float32 &&
+            blockProjection(weights.logitsProjection, layout.vocabularySize, hidden, {layout.vocabularySize}),
+        "DeepSeek-V4.1 target: F32 final norm and fp32 logits");
+  // Heads 0 to 3 are the first Engram layer's, from row 0; heads 4 to 7 the
+  // second's, from the first's 1009 + 1012 + 1015 + 1018 rows on.
+  const model::EngramHashTables hash = weights.engramHash();
+  check(hash.tokenMap.size() == layout.vocabularySize && hash.tokenMap[5] == 26 && hash.multipliers.size() == 6 &&
+            hash.multipliers[1] == (int64_t{1} << 40) + 3 && hash.primes.size() == 8 && hash.primes[7] == 1030 &&
+            hash.offsets.size() == 8 && hash.offsets[2] == 1009 + 1012 && hash.offsets[4] == 0 &&
+            hash.offsets[5] == 1021 && weights.engramFirstRows == std::vector<uint32_t>{0, 4054} && hash.layers == 2 &&
+            hash.ngram == d.engramNgram && hash.heads == d.engramHeads,
+        "DeepSeek-V4.1 target: the Engram hash the metadata states, each layer's offsets from its first row");
+}
+
 // The tensor data section's offset in the executor's source file: not zero,
 // so reads must add it.
 constexpr uint64_t kSourceOffset = 96;
@@ -949,6 +1021,7 @@ int main(int argc, char **argv) {
     guarded("preparation of quantized alpha/beta", [&] { checkQuantizedAlphaBeta(backend, directory.path()); });
     guarded("llama.cpp NVFP4", [&] { checkGgufNvfp4(backend, directory.path()); });
     guarded("the target loader", [&] { checkDenseTarget(backend, directory.path()); });
+    guarded("the DeepSeek-V4.1 target loader", [&] { checkDeepSeekTarget(backend, directory.path()); });
     guarded("MLX sources", [&] { checkMlxSources(backend, directory.path(), argv[3]); });
     guarded("NVFP4 and FP8 sources", [&] { checkFloatSources(backend, directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF preparation tests FAILED" : "GGUF preparation tests passed",

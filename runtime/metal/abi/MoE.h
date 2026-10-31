@@ -21,10 +21,12 @@ struct MoeRouteParams {
   uint32_t input_size;
   uint32_t experts;
   uint32_t top_k;
+  // The factor of the routed experts' weights (ops::MoeShape::routeScale).
+  float route_scale;
 };
 
-static_assert(sizeof(MoeRouteParams) == 16,
-              "MoE routing parameters are 16 bytes on both sides");
+static_assert(sizeof(MoeRouteParams) == 20,
+              "MoE routing parameters are 20 bytes on both sides");
 
 // Every row carries top_k routed experts followed by the slices of the shared
 // expert, ids `experts` on, whose routing weight is the sigmoid of the
@@ -115,18 +117,21 @@ static_assert(sizeof(MoeGatherParams) == 12,
 // meta regions, at z * 3 + 0, 1 and 2; a format without plane1 has its meta
 // region's address in plane1's entry. A region holds its chunk's slots in
 // order, each the projection's rows, so local slot l starts at row l * rows
-// of it. A table holds at most MOE_EXPERT_MAX_CHUNKS chunks, which setBytes
-// passes (4 KiB).
+// of it; or, where a chunk keeps each slot's planes together, slots
+// routed_slot_bytes apart (an expert store's, model/ExpertStore.cpp), each
+// entry is its plane's place in the chunk's first slot, so local slot l's
+// plane starts l * routed_slot_bytes bytes after it. A table holds at most
+// MOE_EXPERT_MAX_CHUNKS chunks, which setBytes passes (4 KiB).
 #define MOE_EXPERT_CHUNK_ADDRESSES 9u
 #define MOE_EXPERT_MAX_CHUNKS 48u
 
 // A GGUF expert pass (ops/MoE.cpp) of projection z (0 gate, 1 up, 2 down):
 // routed expert e's planes start at row local * output_size of the
 // projection's regions in the chunk that holds slot slots[e] (local is the
-// slot's place in it); the shared expert's slices (ids `experts` on) have a
-// segment of their own, slice s's planes from tile
-// s * output_size / QUANT_TILE_ROWS on. Formats are GGUF_FMT_*
-// (metal/abi/QuantFormat.h).
+// slot's place in it), or local * routed_slot_bytes bytes into them; the
+// shared expert's slices (ids `experts` on) have a segment of their own,
+// slice s's planes from tile s * output_size / QUANT_TILE_ROWS on. Formats
+// are GGUF_FMT_* (metal/abi/QuantFormat.h).
 struct MoeGgufExpertParams {
   uint32_t input_size;
   uint32_t output_size; // per expert
@@ -136,15 +141,20 @@ struct MoeGgufExpertParams {
   uint32_t floor_slots;
   uint32_t chunk_slots;
   uint32_t projection;
+  // The up pass's SwiGLU clamp (ops::MoeShape::swigluLimit), 0 for none.
+  float swiglu_limit;
+  // The bytes from a routed expert's slot to the next one's, 0 for a
+  // region's slots of the projection's rows in turn.
+  uint32_t routed_slot_bytes;
 };
 
-static_assert(sizeof(MoeGgufExpertParams) == 32,
-              "MoE GGUF expert parameters are 32 bytes on both sides");
+static_assert(sizeof(MoeGgufExpertParams) == 40,
+              "MoE GGUF expert parameters are 40 bytes on both sides");
 
 // The gate and up passes in one (moe_expert_gguf_m<rows>_gate_up[_mixed]):
-// their sizes, expert count, floor and chunk slots, as MoeGgufExpertParams
-// holds them, and each pass's routed and shared formats. Gate reads
-// projection 0 and up projection 1 of the same chunk.
+// their sizes, expert count, floor and chunk slots and routed experts' slot
+// bytes, as MoeGgufExpertParams holds them, and each pass's routed and shared
+// formats. Gate reads projection 0 and up projection 1 of the same chunk.
 struct MoeGgufGateUpParams {
   uint32_t input_size;
   uint32_t output_size; // per expert
@@ -155,16 +165,19 @@ struct MoeGgufGateUpParams {
   uint32_t up_shared_format;
   uint32_t floor_slots;
   uint32_t chunk_slots;
+  float swiglu_limit;
+  uint32_t routed_slot_bytes;
 };
 
-static_assert(sizeof(MoeGgufGateUpParams) == 36,
-              "MoE GGUF gate/up parameters are 36 bytes on both sides");
+static_assert(sizeof(MoeGgufGateUpParams) == 44,
+              "MoE GGUF gate/up parameters are 44 bytes on both sides");
 
 // One projection (gate, up or down) of the experts a load writes into their
 // slots (moe_expert_load, model/ExpertStore.cpp): rows x columns in `format`,
 // job j's native rows of row_bytes each staged from wherever the job's source
 // names, and its plane0, plane1 and meta planes slot_bytes[i] bytes per slot
-// in the regions of the slot's chunk.
+// in the regions of the slot's chunk (each the slot's bytes where the chunk
+// keeps a slot's planes together).
 struct MoeExpertLoadProjection {
   uint32_t format;
   uint32_t rows;
@@ -188,7 +201,7 @@ static_assert(sizeof(MoeExpertLoadParams) == 128,
               "MoE expert load parameters are 128 bytes on both sides");
 
 // The threads of a moe_expert_load threadgroup, each of which repacks one
-// (row, 32-wide K group) pair.
+// (row, native block) pair.
 #define MOE_EXPERT_LOAD_THREADS 256u
 
 struct MoeCombineParams {

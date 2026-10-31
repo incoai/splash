@@ -13,7 +13,8 @@
 // rejected, but for those whose confidence is not a probability (a draft row
 // that is not finite); the model is refit every kRefitCycles cycles over the
 // last kLabels labels by damped Newton steps (IRLS) on their log-likelihood
-// with a Gaussian prior around kPrior, which also stands before any label.
+// with a Gaussian prior around its prior (kPrior, or a draft's own), which
+// also stands before any label.
 //
 // The costs: a cycle of L lanes that verify R rows in all takes about
 // a + b * R milliseconds, fit to the wall times of the latest cycles of L
@@ -68,6 +69,14 @@ public:
   // The fit of the measured targets' logged cycles (Qwen3.8-Flash-Next,
   // Qwen3.6-35B-A3B: slopes 0.65-0.71).
   static constexpr Acceptance kPrior{0.7F, {0.0F, -0.35F, -0.8F, -0.75F, -0.75F, -0.85F, -0.45F}};
+  // DeepSeek-V4.1-Flash's DSpark, whose confidence is the sigmoid of its
+  // confidence head's score: the fit of 1371 labels of its cycles on a 48 GB
+  // M4 Pro (prose, chat and arithmetic), its five proposals' positions;
+  // the two past its block keep kPrior's, which no label reaches.
+  static constexpr Acceptance kDSparkPrior{0.82F, {0.0F, 0.29F, 0.4F, 0.2F, -0.16F, -0.85F, -0.45F}};
+
+  // Cycles whose acceptance model starts from `prior`, and is held to it.
+  explicit VerifyBudget(const Acceptance &prior = kPrior) : prior_(prior), acceptance_(prior) {}
 
   // A label: a proposal at `position`, whose confidence had logit `feature`,
   // that the target accepted or rejected.
@@ -99,9 +108,10 @@ public:
 
   // The labels kept, oldest first.
   [[nodiscard]] std::vector<Label> labels() const;
-  // The maximum a posteriori model of `labels` under the prior, by damped
+  // The maximum a posteriori model of `labels` under `prior`, by damped
   // Newton steps from `start`.
-  [[nodiscard]] static Acceptance fit(std::span<const Label> labels, const Acceptance &start);
+  [[nodiscard]] static Acceptance fit(std::span<const Label> labels, const Acceptance &start,
+                                      const Acceptance &prior = kPrior);
   // The shape of a cycle's cost by its rows (a cycle of every row costs 1).
   [[nodiscard]] static double seed(uint32_t lanes, uint32_t rows);
 
@@ -119,6 +129,7 @@ private:
   // The fit's intercept and slope; none before any cycle.
   [[nodiscard]] std::optional<std::pair<double, double>> line(uint32_t lanes, bool constrained) const;
 
+  Acceptance prior_ = kPrior;
   Acceptance acceptance_ = kPrior;
   std::vector<Label> labels_;
   size_t next_ = 0;

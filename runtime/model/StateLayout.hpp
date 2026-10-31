@@ -73,7 +73,8 @@ struct GdnStateLayout final {
 // One ring of SPLASH_DRAFT_SLIDING_WINDOW slots per KV head for the keys and
 // one for the values of every draft layer, and the context window the rings
 // are computed from: the draft's context row (contextWidth values) of each
-// slot, in 4-bit codes (metal/abi/DraftAttention.h).
+// slot, in 4-bit codes (metal/abi/DraftAttention.h). A model without a draft
+// has none: every size zero, and no bytes.
 struct DraftStateLayout final {
   static constexpr uint32_t bfloat16Bytes = 2;
 
@@ -82,8 +83,11 @@ struct DraftStateLayout final {
   uint32_t headDimension = 0;
   uint32_t contextWidth = 0;
 
+  [[nodiscard]] constexpr bool present() const noexcept { return layers != 0; }
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return layers && kvHeads && headDimension && contextWidth &&
+    if (!present())
+      return !kvHeads && !headDimension && !contextWidth;
+    return kvHeads && headDimension && contextWidth &&
            contextWidth % SPLASH_DRAFT_CONTEXT_GROUP == 0;
   }
   [[nodiscard]] constexpr uint64_t tensorBytes() const noexcept {

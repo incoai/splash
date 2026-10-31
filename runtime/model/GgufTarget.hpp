@@ -5,6 +5,7 @@
 // weights (BlockTargetFormat).
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -45,6 +46,14 @@ public:
                    const std::vector<std::filesystem::path> &paths, std::string_view architecture,
                    const QwenTargetDimensions &geometry, SparseRowStoreOptions table = {},
                    ExpertStoreOptions experts = {});
+  // The images `plan` makes of the GGUF at `paths` instead (a DSpark draft's,
+  // gguf::planDSparkImages): each of `layers` layers' image, then the head's
+  // and the embedding's, every routed expert loading with its layer, each a
+  // component of `directory` (draft/ for a draft's) of the model.
+  GgufTargetLoader(metal::MetalBackend &backend, WeightImages &images,
+                   const std::vector<std::filesystem::path> &paths,
+                   const std::function<std::vector<gguf::Image>(const GgufFile &)> &plan, uint32_t layers,
+                   std::string directory = "target/");
   GgufTargetLoader(const GgufTargetLoader &) = delete;
   GgufTargetLoader &operator=(const GgufTargetLoader &) = delete;
 
@@ -61,6 +70,10 @@ public:
   // The GGUF's header, for what a family reads beside its images (Flash-Next's
   // PLE hash).
   [[nodiscard]] const GgufFile &file() const noexcept { return planned_->source.file(); }
+  // The row store's options of a streamed table, its memory none where the
+  // table loads: a family whose table lies in a file of its own
+  // (DeepSeek-V4.1's Engram) streams it through them.
+  [[nodiscard]] const SparseRowStoreOptions &tableOptions() const noexcept { return planned_->table; }
   // The input rotation of a Prism ML GGUF, which planImages checked names
   // every quantized tensor of the target and its token table.
   [[nodiscard]] const std::optional<GgufRotation> &rotation() const noexcept { return file().rotation(); }
@@ -92,6 +105,8 @@ private:
   metal::MetalBackend &backend_;
   WeightImages &images_;
   std::shared_ptr<Planned> planned_;
+  // The model's directory its images are components of.
+  std::string directory_ = "target/";
 };
 
 } // namespace splash::model

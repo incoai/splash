@@ -2,10 +2,12 @@
 
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
+#include "metal/abi/ManifoldHyperConnection.h"
 #include "model/GgufImageLayout.hpp"
 #include "model/StateLayout.hpp"
 #include "model/WeightLayout.hpp"
 
+#include <bit>
 #include <cmath>
 #include <limits>
 #include <optional>
@@ -315,6 +317,26 @@ public:
     return {from, headRows, geometry_.gdnKeyHeads, geometry_.gdnValueHeads / geometry_.gdnKeyHeads};
   }
 
+  // Quantized rows [groups * N, K] repacked as `groups` tensors [N, K] of
+  // their own, group g's rows from row g * N on: DeepSeek-V4.1's grouped
+  // output projection, whose 3-D tensor holds a projection per group.
+  void quantizedGroups(const std::string &name, uint32_t groups, uint64_t rows, uint64_t columns) {
+    const GgufTensor *tensor = find(name, quantizedType);
+    if (!tensor) return;
+    if (tensor->rows() != groups * rows || tensor->columns() != columns)
+      throw GgufError("unexpected shape for " + name);
+    const uint32_t format = imageFormat(tensor->type);
+    const TensorRows all = tensorRows(*tensor, groups * rows, ggufRowBytes(kQuantFormats[format], columns));
+    for (uint32_t group = 0; group < groups; ++group) {
+      Repack repack = image_.planes(format, rows, columns, name);
+      TensorRows source = all;
+      source.first = group * rows;
+      source.rows = rows;
+      repack.sources.push_back(std::move(source));
+      image_.repack(std::move(repack));
+    }
+  }
+
   // A tensor the target's blocks would not apply, which changes what the
   // model computes where a GGUF holds it: `what` names it in the error.
   void absent(const std::string &name, std::string_view what) {
@@ -431,13 +453,15 @@ void mixerImage(Builder &b, const QwenTargetDimensions &g, const std::string &p,
 }
 
 // Layer `index`'s dense FFN or sparse MoE, which every family's layers hold:
-// a MoE layer's router, routed experts and shared expert of its slices
-// (QwenTargetDimensions::sharedExpertSlices) and, where its blocks have one,
-// the shared expert's scalar gate; a dense layer's SwiGLU.
+// a MoE layer's router, a SqrtSoftplusNormalized router's selection bias
+// (DeepSeek-V4.1's exp_probs_b, F32), its routed experts and shared expert of
+// its slices (QwenTargetDimensions::sharedExpertSlices) and, where its blocks
+// have one, the shared expert's scalar gate; a dense layer's SwiGLU.
 void ffnImage(Builder &b, const QwenTargetDimensions &g, const std::string &p, uint32_t index) {
   if (g.isMoeLayer(index)) {
     const uint64_t routed = g.experts, width = g.expertIntermediateSize;
     b.router(p + "ffn_gate_inp.weight", routed, g.hiddenSize);
+    if (g.moeRouter == ops::MoeRouter::SqrtSoftplusNormalized) b.floatNorm(p + "exp_probs_b.bias", routed);
     b.routedExperts(p, routed, width, g.hiddenSize);
     b.sharedExpert(p, g.sharedExpertSlices, width, g.hiddenSize);
     if (g.sharedExpertGate) b.floatRows(p + "ffn_gate_inp_shexp.weight", 1, g.hiddenSize, true);
@@ -626,12 +650,160 @@ struct FlintGguf final {
                      std::vector<Image> &) {}
 };
 
+// A DeepSeek-V4.1 sublayer's manifold hyper-connection mix
+// (DeepSeek41MixWeights): its projection's F32 rows, then its scale and base.
+void mixImage(Builder &b, const std::string &stem, uint64_t streams) {
+  b.floatRows(stem + "_fn.weight", MHC_MIXES, streams, false);
+  b.floatNorm(stem + "_scale.weight", 3);
+  b.floatNorm(stem + "_base.weight", MHC_MIXES);
+}
+
+// DeepSeek-V4.1's GGUFs (deepseek41, model/DeepSeek41.hpp) in llama.cpp's
+// layout, each layer in its weights' order (DeepSeek41LayerWeights): an
+// Engram layer's projection and gate weights; the attention's mix (hc_attn),
+// norm, query latent and its norm, queries, latent and its norm and sinks; a
+// compressor layer's compressor and indexer key, an indexer layer's queries
+// and head weights; the output's groups, each a projection of its own, and
+// their projection; the FFN's mix (hc_ffn) and norm, its MoE, and its
+// router's selection bias (the image router's, exp_probs_b_vl, is not read).
+// The head holds the output norm before the logits. The Engram hash lies in
+// the metadata (engram.token_map and the ple.* arrays) and the Engram's
+// tables in the split's last part (per_layer_token_embd), which stream
+// (DeepSeek41.cpp). Its norms take its own epsilon and its RoPE YaRN's
+// scaling, which requireMetadata leaves to it.
+struct DeepSeek41Gguf final {
+  static constexpr std::string_view architecture = "deepseek41";
+  // The expert_gating_func of its sqrt(softplus) router, as its GGUFs state it.
+  static constexpr uint64_t kSqrtSoftplusGating = 4;
+
+  template <class Expect, class ExpectFloat>
+  static void metadata(const Expect &expect, const ExpectFloat &expectFloat, const QwenTargetDimensions &g) {
+    const DeepSeek41Dimensions &d = g.deepseek;
+    expect("attention.q_lora_rank", d.queryRank);
+    expect("attention.output_lora_rank", d.outputRank);
+    expect("attention.output_group_count", d.outputGroups);
+    expect("attention.sliding_window", g.slidingWindow);
+    expect("attention.indexer.head_count", d.indexerHeads);
+    expect("attention.indexer.key_length", d.indexerHeadDimension);
+    expect("attention.indexer.top_k", d.indexerTopGroups);
+    expect("attention.indexer.candidate_source_layer", d.candidateLayer);
+    expect("attention.indexer.candidate_block_size", d.candidateBlockGroups);
+    expect("attention.indexer.candidate_top_k_blocks", d.candidateTopBlocks);
+    expect("hyper_connection.count", MHC_STREAMS);
+    expect("hyper_connection.sinkhorn_iterations", d.sinkhornIterations);
+    expect("expert_shared_count", g.sharedExpertSlices);
+    expect("expert_gating_func", kSqrtSoftplusGating);
+    expect("expert_weights_norm", 1);
+    // No layer routes by token hashes, which its MoE would not apply.
+    expect("hash_layer_count", 0);
+    expect("ple.heads_per_ngram", d.engramHeads);
+    expect("embedding_length_per_layer_input", d.engramHeadDimension);
+    expect("ple.ngram_size", d.engramNgram);
+    expect("engram.pad_token_id", d.engramPadToken);
+    expect("rope.scaling.original_context_length", d.yarnOriginalContextTokens);
+    expectFloat("attention.layer_norm_rms_epsilon", d.normEpsilon);
+    expectFloat("hyper_connection.epsilon", d.hcEpsilon);
+    expectFloat("expert_weights_scale", d.routeScale);
+    expectFloat("attention.compress_rope_freq_base", d.compressRopeTheta);
+    expectFloat("rope.scaling.factor", d.yarnFactor);
+    expectFloat("rope.scaling.yarn_beta_fast", d.yarnBetaFast);
+    expectFloat("rope.scaling.yarn_beta_slow", d.yarnBetaSlow);
+  }
+
+  // The arrays and strings the installer's copy of the scalar metadata leaves
+  // out: each layer's compress ratio (the array also holds its draft
+  // layers'), the layers of each role, one SwiGLU clamp for every expert, and
+  // RoPE's scaling. One error names every mismatch.
+  static void arrays(const GgufFile &file, const QwenTargetDimensions &g) {
+    const DeepSeek41Dimensions &d = g.deepseek;
+    const std::string arch(architecture);
+    std::string mismatched;
+    const auto mismatch = [&](std::string_view key) {
+      mismatched += (mismatched.empty() ? "" : ", ") + std::string(key);
+    };
+    const auto ratios = file.numericArray(arch + ".attention.compress_ratios");
+    bool matches = ratios && ratios->size() >= g.layers;
+    for (uint32_t layer = 0; matches && layer < g.layers; ++layer)
+      matches = (*ratios)[layer] == (!d.has(d.compressedLayers, layer) ? 0.0
+                                     : d.has(d.pairedLayers, layer)   ? 2.0
+                                                                      : 1.0);
+    if (!matches) mismatch("attention.compress_ratios");
+    const auto layers = [&](const char *key, uint64_t bits) {
+      const auto ids = file.numericArray(arch + "." + key);
+      uint64_t found = 0;
+      bool valid = ids && ids->size() == static_cast<size_t>(std::popcount(bits));
+      for (size_t i = 0; valid && i < ids->size(); ++i) {
+        const double id = (*ids)[i];
+        valid = id >= 0 && id < g.layers && id == std::floor(id);
+        if (valid) found |= uint64_t{1} << static_cast<uint32_t>(id);
+      }
+      if (!valid || found != bits) mismatch(key);
+    };
+    layers("attention.kv_source_layers", d.compressorLayers);
+    layers("attention.indexer.source_layers", d.indexerLayers);
+    layers("ple.layers", d.engramLayers);
+    for (const char *key : {"swiglu_clamp_exp", "swiglu_clamp_shexp"}) {
+      const auto clamps = file.numericArray(arch + "." + key);
+      bool same = clamps && clamps->size() >= g.layers;
+      for (uint32_t layer = 0; same && layer < g.layers; ++layer) same = (*clamps)[layer] == double(d.swigluLimit);
+      if (!same) mismatch(key);
+    }
+    const auto text = [&](const char *key, std::string_view value) {
+      const std::optional<std::string> found = file.metadata().stringValue(arch + "." + key);
+      if (!found || *found != value) mismatch(key);
+    };
+    text("rope.scaling.type", "yarn");
+    if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
+  }
+
+  static void layer(Builder &b, const QwenTargetDimensions &g, uint32_t index) {
+    const DeepSeek41Dimensions &d = g.deepseek;
+    const std::string p = prefix(index);
+    const uint64_t latent = g.attentionHeadDimension, streams = uint64_t{MHC_STREAMS} * g.hiddenSize;
+    if (d.has(d.engramLayers, index)) {
+      b.quantized(p + "engram_kv.weight", uint64_t{MHC_STREAMS + 1} * g.hiddenSize, d.engramWidth());
+      b.floatRows(p + "engram_gate.weight", MHC_STREAMS, g.hiddenSize, false);
+    }
+    mixImage(b, p + "hc_attn", streams);
+    b.floatNorm(p + "attn_norm.weight", g.hiddenSize);
+    b.quantized(p + "attn_q_a.weight", d.queryRank, g.hiddenSize);
+    b.floatNorm(p + "attn_q_a_norm.weight", d.queryRank);
+    b.quantized(p + "attn_q_b.weight", g.attentionWidth, d.queryRank);
+    b.quantized(p + "attn_kv.weight", latent, g.hiddenSize);
+    b.floatNorm(p + "attn_kv_a_norm.weight", latent);
+    b.floatNorm(p + "attn_sinks.weight", g.attentionQueryHeads);
+    if (d.has(d.compressorLayers, index)) {
+      b.floatTensor(p + "attn_compressor_kv.weight", latent, g.hiddenSize);
+      if (d.has(d.pairedLayers, index)) b.floatTensor(p + "attn_compressor_gate.weight", latent, g.hiddenSize);
+      else b.absent(p + "attn_compressor_gate.weight", "a gate of groups of one token");
+      b.floatNorm(p + "attn_compressor_norm.weight", latent);
+      b.floatTensor(p + "indexer.attn_k.weight", d.indexerHeadDimension, latent);
+      b.floatNorm(p + "indexer.k_norm.weight", d.indexerHeadDimension);
+    }
+    if (d.has(d.indexerLayers, index)) {
+      b.floatTensor(p + "indexer.attn_q_b.weight", uint64_t{d.indexerHeads} * d.indexerHeadDimension, d.queryRank);
+      b.floatTensor(p + "indexer.proj.weight", d.indexerHeads, g.hiddenSize);
+    }
+    b.quantizedGroups(p + "attn_output_a.weight", d.outputGroups, d.outputRank, d.groupWidth(g.attentionWidth));
+    b.quantized(p + "attn_output_b.weight", g.hiddenSize, uint64_t{d.outputGroups} * d.outputRank);
+    mixImage(b, p + "hc_ffn", streams);
+    b.floatNorm(p + "ffn_norm.weight", g.hiddenSize);
+    ffnImage(b, g, p, index);
+  }
+
+  static void head(Builder &b, const QwenTargetDimensions &g) { b.floatNorm("output_norm.weight", g.hiddenSize); }
+
+  static void tables(const GgufFile &, const QwenTargetDimensions &, PlanOptions, std::vector<std::string> &,
+                     std::vector<Image> &) {}
+};
+
 // Calls `use` with what the GGUFs of `architecture` hold: Qwen3.8-Flash-Next's
-// (Qwen4ExpGguf), Flint's (FlintGguf), or else the Qwen3.5 hybrid's
-// (HybridGguf).
+// (Qwen4ExpGguf), Flint's (FlintGguf), DeepSeek-V4.1's (DeepSeek41Gguf), or
+// else the Qwen3.5 hybrid's (HybridGguf).
 template <class Use> decltype(auto) withFamily(std::string_view architecture, Use &&use) {
   if (architecture == Qwen4ExpGguf::architecture) return use(Qwen4ExpGguf{});
   if (architecture == FlintGguf::architecture) return use(FlintGguf{});
+  if (architecture == DeepSeek41Gguf::architecture) return use(DeepSeek41Gguf{});
   return use(HybridGguf{});
 }
 
@@ -837,8 +1009,13 @@ void requireMetadata(const GgufMetadata &metadata, std::string_view architecture
       metadata.unsignedValue(arch + ".rope.dimension_count"))
     expect("rope.dimension_count", 2ull * geometry.rotaryPairs);
   expectFloat("rope.freq_base", geometry.rotaryTheta);
-  expectFloat("attention.layer_norm_rms_epsilon", SPLASH_RMS_EPSILON);
-  if (const auto scaling = metadata.stringValue(arch + ".rope.scaling.type"); scaling && *scaling != "none")
+  // DeepSeek-V4.1's norms take its own epsilon and its RoPE YaRN's scaling
+  // (DeepSeek41Gguf::metadata); the other families' kernels compile Splash's
+  // epsilon and read no scaling.
+  const bool deepseek = geometry.deepseek.present();
+  if (!deepseek) expectFloat("attention.layer_norm_rms_epsilon", SPLASH_RMS_EPSILON);
+  if (const auto scaling = metadata.stringValue(arch + ".rope.scaling.type");
+      !deepseek && scaling && *scaling != "none")
     mismatched += (mismatched.empty() ? "" : ", ") + std::string("rope.scaling.type ") + *scaling + " (expected none)";
   if (geometry.gdnLayerCount()) {
     expect("full_attention_interval", geometry.fullAttentionPeriod);
@@ -853,8 +1030,11 @@ void requireMetadata(const GgufMetadata &metadata, std::string_view architecture
     expect("expert_count", geometry.experts);
     expect("expert_used_count", geometry.expertsPerToken);
     expect("expert_feed_forward_length", geometry.expertIntermediateSize);
-    expect("expert_shared_feed_forward_length",
-           uint64_t{geometry.sharedExpertSlices} * geometry.expertIntermediateSize);
+    // DeepSeek-V4.1's GGUFs state their shared experts as a count of routed
+    // widths (expert_shared_count, DeepSeek41Gguf::metadata).
+    if (!deepseek)
+      expect("expert_shared_feed_forward_length",
+             uint64_t{geometry.sharedExpertSlices} * geometry.expertIntermediateSize);
   } else {
     expect("feed_forward_length", geometry.intermediateSize);
   }
@@ -867,6 +1047,84 @@ std::vector<Image> planImages(const GgufFile &file, std::string_view architectur
   std::vector<Image> images = withFamily(
       architecture, [&](auto family) { return familyImages<decltype(family)>(file, geometry, options); });
   if (file.rotation()) requireRotation(file, geometry, images);
+  return images;
+}
+
+std::vector<Image> planDSparkImages(const GgufFile &file, const QwenTargetDimensions &g, uint32_t mainLayers,
+                                    uint32_t markovRank) {
+  const GgufMetadata &metadata = file.metadata();
+  const std::string arch = "dflash";
+  if (metadata.architecture() != arch)
+    throw GgufError("GGUF architecture is " + metadata.architecture() + ", but a DSpark draft's is " + arch);
+  const DeepSeek41Dimensions &d = g.deepseek;
+  std::string mismatched;
+  const auto mismatch = [&](std::string_view key) { mismatched += (mismatched.empty() ? "" : ", ") + std::string(key); };
+  const auto expect = [&](const char *key, uint64_t value) {
+    if (metadata.unsignedValue(arch + "." + key) != value) mismatch(key);
+  };
+  const auto expectFloat = [&](const char *key, double value) {
+    const std::optional<double> found = metadata.floatValue(arch + "." + key);
+    if (!found || std::abs(*found - value) > value * 1e-6) mismatch(key);
+  };
+  expect("block_count", g.layers);
+  expect("embedding_length", g.hiddenSize);
+  expect("attention.head_count", g.attentionWidth / g.attentionHeadDimension);
+  expect("attention.head_count_kv", g.attentionKvHeads);
+  expect("attention.key_length", g.attentionHeadDimension);
+  expect("attention.value_length", g.attentionHeadDimension);
+  expect("rope.dimension_count", 2ull * g.rotaryPairs);
+  expect("attention.q_lora_rank", d.queryRank);
+  expect("attention.output_lora_rank", d.outputRank);
+  expect("attention.output_group_count", d.outputGroups);
+  expect("attention.sliding_window", g.slidingWindow);
+  expect("hyper_connection.count", MHC_STREAMS);
+  expect("hyper_connection.sinkhorn_iterations", d.sinkhornIterations);
+  expect("expert_count", g.experts);
+  expect("expert_used_count", g.expertsPerToken);
+  expect("expert_feed_forward_length", g.expertIntermediateSize);
+  expect("expert_shared_count", g.sharedExpertSlices);
+  expect("expert_gating_func", DeepSeek41Gguf::kSqrtSoftplusGating);
+  expect("expert_weights_norm", 1);
+  expectFloat("rope.freq_base", g.rotaryTheta);
+  expectFloat("attention.layer_norm_rms_epsilon", d.normEpsilon);
+  expectFloat("hyper_connection.epsilon", d.hcEpsilon);
+  expectFloat("expert_weights_scale", d.routeScale);
+  // Every layer attends its window alone, and clamps every SwiGLU.
+  const auto every = [&](const char *key, double value) {
+    const auto values = file.numericArray(arch + "." + key);
+    bool same = values && values->size() == g.layers;
+    for (uint32_t layer = 0; same && layer < g.layers; ++layer) same = (*values)[layer] == value;
+    if (!same) mismatch(key);
+  };
+  every("attention.compress_ratios", 0.0);
+  every("swiglu_clamp_exp", d.swigluLimit);
+  every("swiglu_clamp_shexp", d.swigluLimit);
+  if (!mismatched.empty()) throw GgufError("DSpark GGUF metadata does not match its target: " + mismatched);
+
+  std::vector<std::string> problems;
+  std::vector<Image> images;
+  for (uint32_t index = 0; index < g.layers; ++index) {
+    Builder layer(file, g, problems, "dspark-layer-" + std::to_string(index) + ".bin", index, 1);
+    DeepSeek41Gguf::layer(layer, g, index);
+    images.push_back(layer.finish());
+  }
+  Builder head(file, g, problems, "dspark-head.bin", g.layers, 2);
+  head.floatNorm("enc.output_norm.weight", g.hiddenSize);
+  head.quantized("fc.weight", g.hiddenSize, uint64_t{mainLayers} * g.hiddenSize);
+  head.floatNorm("output_norm.weight", g.hiddenSize);
+  head.floatTensor("markov_w2.weight", g.vocabularySize, markovRank);
+  head.floatNorm("conf_proj.weight", uint64_t{g.hiddenSize} + markovRank);
+  images.push_back(head.finish());
+  Builder markov(file, g, problems, "dspark-markov.bin", g.vocabularySize, markovRank);
+  if (const GgufTensor *rows = file.find("markov_w1.weight"); rows && rows->rows() != g.vocabularySize)
+    throw GgufError("unexpected shape for markov_w1.weight");
+  markov.nativeTable("markov_w1.weight", markovRank);
+  images.push_back(markov.finish());
+  if (!problems.empty()) {
+    std::string names;
+    for (const std::string &problem : problems) names += (names.empty() ? "" : ", ") + problem;
+    throw GgufError("DSpark GGUF tensors this build cannot load: " + names);
+  }
   return images;
 }
 

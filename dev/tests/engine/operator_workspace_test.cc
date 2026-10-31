@@ -2,6 +2,7 @@
 #include "metal/abi/MoE.h"
 #include "model/WeightLayout.hpp"
 #include "ops/DraftSelector.hpp"
+#include "ops/LatentIndex.hpp"
 #include "ops/MoE.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/Sampling.hpp"
@@ -187,6 +188,41 @@ void sampling() {
           "SPLASH_NO_TOKEN was taken as a stop token");
 }
 
+// An indexer's pieces of a prefill tile's 256 rows, a verify's 32 and a
+// decode row, at every count of groups up to DeepSeek-V4.1-Flash's context
+// of 2^20 tokens, which its layers from the candidate layer on compress 1:1:
+// as many rows as their scores fit, and their blocks of the model's 8 groups,
+// and of 3, which do not divide the scores, in the block scratch of their
+// tile's rows. A piece of fewer of a tile's rows is no larger.
+void latentIndex() {
+  using splash::ops::LatentIndex;
+  for (const uint32_t block : {8U, 3U})
+    for (const uint32_t rows : {256U, 32U, 1U}) {
+      const uint64_t blockBytes = LatentIndex::blockBytes(block, rows);
+      for (uint32_t groups = 1; groups <= 1U << 20; ++groups) {
+        const uint64_t piece = LatentIndex::pieceRows(groups, rows), blocks = (groups + block - 1) / block;
+        const uint64_t scoreBytes = piece * groups * sizeof(float);
+        if (!piece || piece > rows || scoreBytes > LatentIndex::kScoreBytes ||
+            (piece < rows && scoreBytes + groups * sizeof(float) <= LatentIndex::kScoreBytes) ||
+            piece * blocks * sizeof(float) > blockBytes)
+          throw std::runtime_error("latent index piece of " + std::to_string(rows) + " rows of " +
+                                   std::to_string(groups) + " groups in blocks of " + std::to_string(block) +
+                                   " does not fit its scratch, or leaves rows that would");
+      }
+    }
+  // A fresh prompt of 65,793 tokens: 255 rows of 8,225 blocks a piece.
+  require(LatentIndex::pieceRows(65'793, 256) == 255 && LatentIndex::blockBytes(8, 256) >= 255 * 8'225 * 4,
+          "latent index piece past 65,536 groups changed");
+  rejects([] { (void)LatentIndex::pieceRows(0, 256); }, "invalid latent index piece",
+          "a latent index piece of no groups was sized");
+  rejects([] { (void)LatentIndex::pieceRows(1, 0); }, "invalid latent index piece",
+          "a latent index piece of no rows was sized");
+  rejects([] { (void)LatentIndex::blockBytes(0, 256); }, "invalid latent block scratch",
+          "a latent block scratch of no groups a block was sized");
+  rejects([] { (void)LatentIndex::blockBytes(8, 0); }, "invalid latent block scratch",
+          "a latent block scratch of no rows was sized");
+}
+
 } // namespace
 
 int main() {
@@ -194,6 +230,7 @@ int main() {
     attention();
     moe();
     sampling();
+    latentIndex();
     std::cout << "operator workspace: PASS\n";
   } catch (const std::exception &error) {
     std::cerr << "operator workspace: FAIL: " << error.what() << '\n';

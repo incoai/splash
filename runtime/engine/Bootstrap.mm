@@ -314,12 +314,14 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   // watchdog: past it, at depths only YaRN serves, commands take fewer rows.
   // A row of a target with an indexer attends to its top blocks at any depth,
   // and only the indexer's scores grow with it, a hundredth of attention's,
-  // so its commands keep their rows.
+  // so its commands keep their rows; so do DeepSeek-V4.1's, whose rows attend
+  // their window and their indexer's top groups.
   constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
   config.nativeLoop.engine.maximumPrefillAttentionPairs = std::visit(
       [](const auto &layout) {
-        return layout.hasIndexer() ? std::numeric_limits<uint64_t>::max()
-                                   : Scheduler::attentionPairs(layout.nativeContextTokens - chunk, chunk);
+        return layout.hasIndexer() || layout.deepseek.present()
+                   ? std::numeric_limits<uint64_t>::max()
+                   : Scheduler::attentionPairs(layout.nativeContextTokens - chunk, chunk);
       },
       config.resources.model.target);
   // Images are admitted up to the server's pixel cap; a model without vision

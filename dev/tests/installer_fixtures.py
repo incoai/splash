@@ -23,8 +23,12 @@ DENSE = families.named("Qwen3.8-27B")
 MOE = families.named("Qwen3.6-35B-A3B")
 FLASH_NEXT = families.named("Qwen3.8-Flash-Next")
 FLINT = families.named("Flint")
+DEEPSEEK = families.named("DeepSeek-V4.1-Flash")
 # The families whose targets the engine loads from a GGUF only.
-GGUF_ONLY = (FLASH_NEXT, FLINT)
+GGUF_ONLY = (FLASH_NEXT, FLINT, DEEPSEEK)
+# The families without a released DFlash2 draft, which decode a token a
+# cycle: the engine refuses a draft for them.
+DRAFTLESS = (DEEPSEEK,)
 MODEL = "mlx-community/Qwen3.8-27B-4bit"
 # An MLX config.json (of a GGUF_ONLY family, the one the installer derives
 # from its GGUF), a DFlash2 draft config and the scalar metadata of a GGUF
@@ -93,6 +97,11 @@ GGML = {
     "Q6_K": 14,
     "IQ2_XXS": 16,
     "IQ3_XXS": 18,
+    "IQ1_S": 19,
+    "IQ4_NL": 20,
+    "IQ2_S": 22,
+    "I32": 26,
+    "I64": 27,
     "IQ3_S": 21,
     "IQ4_XS": 23,
     "IQ1_M": 29,

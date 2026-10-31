@@ -170,12 +170,24 @@ FLINT_PATTERNS = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
     r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 )
+# The joyai-llm profile, as DeepSeek-V4.1's tokenizer.json splits text before
+# its byte-level BPE (llama.cpp's convert names that pre-tokenizer joyai-llm),
+# without a normalizer: digits in runs of up to three, runs of Han, hiragana
+# and katakana, then DeepSeek's pattern.
+DEEPSEEK_PATTERNS = (
+    r"\p{N}{1,3}",
+    "[一-龥぀-ゟ゠-ヿ]+",
+    r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+"
+    r"|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
+    r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+)
 # Each GGUF tokenizer profile (tokenizer.ggml.pre) Splash derives a tokenizer
 # for: the patterns that split text, each isolating its matches, in order,
 # and whether text is NFC-normalized before them.
 TOKENIZER_PROFILES = {
     "qwen35": ((QWEN35_PATTERN,), True),
     "flint": (FLINT_PATTERNS, False),
+    "joyai-llm": (DEEPSEEK_PATTERNS, False),
 }
 # The GGUF token types (llama_token_type) a byte-level BPE vocabulary uses:
 # control tokens are special added tokens, user-defined ones added tokens
@@ -321,7 +333,20 @@ def tokenizer_files(metadata):
     }
 
 
+def require_first_part(metadata):
+    """Reject a part of a split GGUF but its first, which alone describes the
+    model, as DeepSeek-V4.1's variants share their Engram tables as a last
+    part."""
+    part = metadata.values.get("split.no")
+    if type(part) is int and part > 0:
+        raise ModelError(
+            f"this GGUF is part {part + 1} of a split GGUF, which only its first "
+            "part describes; select a variant"
+        )
+
+
 def text_architecture(metadata):
+    require_first_part(metadata)
     arch = metadata.require("general.architecture", str)
     if arch not in ARCHITECTURES:
         raise ModelError("unsupported GGUF model architecture: " + arch)
@@ -422,6 +447,8 @@ def layer_pattern(metadata, arch, name):
 # The router functions of llama_expert_gating_func_type, by its value, as a
 # configuration's router_score_function names them.
 EXPERT_GATING_FUNCTIONS = {1: "softmax", 2: "sigmoid"}
+# DeepSeek-V4.1's router, sqrt(softplus) of its logits, as llama.cpp numbers it.
+SQRT_SOFTPLUS_GATING = 4
 
 
 def flint_text_config(metadata, arch):
@@ -462,6 +489,139 @@ def flint_text_config(metadata, arch):
         ],
         "eos_token_id": stops,
     }
+
+
+def deepseek41_text_config(metadata, arch):
+    """What DeepSeek-V4.1's config.json states beyond the sizes every
+    architecture's does, from its header in llama.cpp's layout, by that file's
+    keys: the low-rank query and grouped output projections, the RoPE and its
+    YaRN scaling, the router (its sqrt-softplus gating as scoring_func, its
+    correction bias implied by the tensors), the sliding window, the
+    compressed KV and its sources, the two-level indexer, the
+    hyper-connections, the Engram tables (the ple.* keys) and the token that
+    ends a turn. The header states the Engram hash's primes, not the
+    vocabularies they were chosen from (engram_vocab_size and
+    engram_compressed_vocab_size). The SwiGLU clamp must be one value for
+    every routed and shared expert."""
+
+    def number(key, kind=int):
+        value = metadata.require(f"{arch}.{key}", kind)
+        if kind is int and value < 0:
+            raise ModelError(f"invalid GGUF metadata: {arch}.{key}")
+        return value
+
+    def numbers(key, kind=int):
+        values = metadata.values.get(f"{arch}.{key}")
+        if (
+            type(values) is not list
+            or not values
+            or any(type(v) is not kind for v in values)
+        ):
+            raise ModelError(f"missing or invalid GGUF metadata: {arch}.{key}")
+        return values
+
+    if f"{arch}.engram.file" in metadata.values:
+        raise ModelError(
+            "this GGUF holds DeepSeek-V4.1 in the layout ISTA-DASLab published "
+            "until October 27, 2026, its Engram tables in a file the backbone "
+            "names; Splash reads llama.cpp's layout (b11870 and newer): install "
+            "the repository's current revision, or convert local files with its "
+            "convert_ds41_upstream.py"
+        )
+    if number("expert_gating_func") != SQRT_SOFTPLUS_GATING:
+        raise ModelError(f"unsupported GGUF expert gating function in {arch}")
+    if metadata.require(f"{arch}.rope.scaling.type", str) != "yarn":
+        raise ModelError(f"unsupported GGUF RoPE scaling in {arch}")
+    if number("attention.value_length") != number("attention.key_length"):
+        raise ModelError(f"invalid GGUF metadata: {arch}.attention.value_length")
+    clamps = set(numbers("swiglu_clamp_exp", float)) | set(
+        numbers("swiglu_clamp_shexp", float)
+    )
+    if len(clamps) != 1:
+        raise ModelError(f"unsupported GGUF SwiGLU clamps in {arch}")
+    engram_layers = layer_ids(metadata, "ple.layers")
+    return {
+        "moe_intermediate_size": metadata.positive(
+            arch + ".expert_feed_forward_length"
+        ),
+        "qk_rope_head_dim": metadata.positive(arch + ".rope.dimension_count"),
+        "q_lora_rank": metadata.positive(arch + ".attention.q_lora_rank"),
+        "o_lora_rank": metadata.positive(arch + ".attention.output_lora_rank"),
+        "o_groups": metadata.positive(arch + ".attention.output_group_count"),
+        "swiglu_limit": clamps.pop(),
+        "rms_norm_eps": number("attention.layer_norm_rms_epsilon", float),
+        "rope_theta": number("rope.freq_base", float),
+        "rope_scaling": {
+            "rope_type": "yarn",
+            "factor": number("rope.scaling.factor", float),
+            "beta_fast": number("rope.scaling.yarn_beta_fast", float),
+            "beta_slow": number("rope.scaling.yarn_beta_slow", float),
+            "original_max_position_embeddings": metadata.positive(
+                arch + ".rope.scaling.original_context_length"
+            ),
+        },
+        "n_routed_experts": metadata.positive(arch + ".expert_count"),
+        "n_shared_experts": metadata.positive(arch + ".expert_shared_count"),
+        "num_experts_per_tok": metadata.positive(arch + ".expert_used_count"),
+        "scoring_func": "sqrtsoftplus",
+        "norm_topk_prob": metadata.require(arch + ".expert_weights_norm", bool),
+        "routed_scaling_factor": number("expert_weights_scale", float),
+        "sliding_window": metadata.positive(arch + ".attention.sliding_window"),
+        "compress_ratios": numbers("attention.compress_ratios"),
+        "compress_rope_theta": number("attention.compress_rope_freq_base", float),
+        "kv_source_layer_ids": layer_ids(metadata, "attention.kv_source_layers"),
+        "index_source_layer_ids": layer_ids(
+            metadata, "attention.indexer.source_layers"
+        ),
+        "index_n_heads": metadata.positive(arch + ".attention.indexer.head_count"),
+        "index_head_dim": metadata.positive(arch + ".attention.indexer.key_length"),
+        "index_topk": metadata.positive(arch + ".attention.indexer.top_k"),
+        "candidate_source_layer_id": number("attention.indexer.candidate_source_layer"),
+        "candidate_topk_blocks": metadata.positive(
+            arch + ".attention.indexer.candidate_top_k_blocks"
+        ),
+        "candidate_block_size": metadata.positive(
+            arch + ".attention.indexer.candidate_block_size"
+        ),
+        "hc_mult": metadata.positive(arch + ".hyper_connection.count"),
+        "hc_sinkhorn_iters": metadata.positive(
+            arch + ".hyper_connection.sinkhorn_iterations"
+        ),
+        "hc_eps": number("hyper_connection.epsilon", float),
+        "engram_layer_ids": engram_layers,
+        "engram_num_embeddings": engram_rows(metadata, arch, len(engram_layers)),
+        "engram_max_ngram_size": metadata.positive(arch + ".ple.ngram_size"),
+        "engram_n_heads": metadata.positive(arch + ".ple.heads_per_ngram"),
+        "engram_head_dim": metadata.positive(
+            arch + ".embedding_length_per_layer_input"
+        ),
+        "engram_pad_token_id": number("engram.pad_token_id"),
+        "eos_token_id": metadata.require("tokenizer.ggml.eos_token_id", int),
+    }
+
+
+def engram_rows(metadata, arch, layers):
+    """The rows of each of DeepSeek-V4.1's `layers` Engram layers in their
+    one table (per_layer_token_embd): the sum of its heads' vocabularies,
+    (ple.ngram_size - 1) * ple.heads_per_ngram of ple.head_vocab_sizes per
+    layer, which lie back to back in the table from its first row, each from
+    its entry of ple.head_offsets."""
+    heads = (metadata.positive(arch + ".ple.ngram_size") - 1) * metadata.positive(
+        arch + ".ple.heads_per_ngram"
+    )
+    sizes = metadata.values.get(arch + ".ple.head_vocab_sizes")
+    offsets = metadata.values.get(arch + ".ple.head_offsets")
+    if (
+        type(sizes) is not list
+        or len(sizes) != layers * heads
+        or any(type(size) is not int or size <= 0 for size in sizes)
+    ):
+        raise ModelError(
+            f"missing or invalid GGUF metadata: {arch}.ple.head_vocab_sizes"
+        )
+    if offsets != [sum(sizes[:head]) for head in range(len(sizes))]:
+        raise ModelError(f"missing or invalid GGUF metadata: {arch}.ple.head_offsets")
+    return [sum(sizes[layer * heads : (layer + 1) * heads]) for layer in range(layers)]
 
 
 def vision_config(vision):
@@ -541,6 +701,9 @@ TENSOR_TYPES = {
     40: "NVFP4",
     42: "Q2_0",
     142: "PQ2_0",
+    # The integers of DeepSeek-V4.1's Engram hashes (DEEPSEEK41_MODEL_TENSORS).
+    26: "I32",
+    27: "I64",
 }
 QUANTIZED_TYPES = {
     "Q2_K",
@@ -700,6 +863,134 @@ FLINT_MOE_TENSORS = {
     if name != "ffn_gate_inp_shexp.weight"
 }
 
+# DeepSeek-V4.1 (deepseek41): every layer a latent attention, its query and
+# its grouped output projections low-rank, with learned sinks, between two
+# Sinkhorn-balanced hyper-connection mixes (hc_*, F32 as the GGUFs keep
+# them), and a MoE whose router has a correction bias and whose shared
+# expert has no gate. The layers attention.kv_source_layers names also
+# compress KV (a pooling gate where their compress ratio pools two or more
+# tokens) and project the indexer's keys; those
+# attention.indexer.source_layers names project its queries; those ple.layers
+# names project the rows they gather from the Engram tables, one table of
+# every Engram layer's heads (per_layer_token_embd, the last part of the
+# split GGUF, which the variants share), whose hash the header's ple.* arrays
+# and engram.token_map state. The image router's bias (exp_probs_b_vl) is not
+# read.
+DEEPSEEK41_MODEL_TENSORS = MODEL_TENSORS | {
+    "per_layer_token_embd.weight": EMBEDDING_TYPES,
+}
+DEEPSEEK41_LAYER_TENSORS = (
+    {
+        "attn_norm.weight": NORM_TYPES,
+        "ffn_norm.weight": NORM_TYPES,
+        "attn_q_a.weight": FORMAT_TYPES,
+        "attn_q_a_norm.weight": NORM_TYPES,
+        "attn_q_b.weight": FORMAT_TYPES,
+        "attn_kv.weight": FORMAT_TYPES,
+        "attn_kv_a_norm.weight": NORM_TYPES,
+        "attn_output_a.weight": FORMAT_TYPES,
+        "attn_output_b.weight": FORMAT_TYPES,
+        "attn_sinks.weight": F32,
+        "exp_probs_b.bias": F32,
+    }
+    | {
+        f"hc_{part}_{name}.weight": F32
+        for part in ("attn", "ffn")
+        for name in ("fn", "base", "scale")
+    }
+    | FLINT_MOE_TENSORS
+)
+DEEPSEEK41_KV_SOURCE_TENSORS = {
+    "attn_compressor_kv.weight": FORMAT_TYPES,
+    "attn_compressor_norm.weight": NORM_TYPES,
+    "indexer.attn_k.weight": FORMAT_TYPES,
+    "indexer.k_norm.weight": NORM_TYPES,
+}
+DEEPSEEK41_POOLING_TENSORS = {"attn_compressor_gate.weight": FORMAT_TYPES}
+DEEPSEEK41_INDEX_SOURCE_TENSORS = {
+    "indexer.attn_q_b.weight": FORMAT_TYPES,
+    "indexer.proj.weight": FORMAT_TYPES,
+}
+# An Engram layer's projection of its gathered rows and its gate, the
+# product of DeepSeek's gate query and key, which llama.cpp stores in F32.
+DEEPSEEK41_ENGRAM_TENSORS = {
+    "engram_kv.weight": FORMAT_TYPES,
+    "engram_gate.weight": F32,
+}
+
+
+def layer_ids(metadata, key):
+    """The header's array `key` of layer indices, ascending, each a loaded
+    layer's."""
+    arch = text_architecture(metadata)
+    values = metadata.values.get(f"{arch}.{key}")
+    layers = loaded_layers(metadata, arch)
+    if (
+        type(values) is not list
+        or any(type(value) is not int or not 0 <= value < layers for value in values)
+        or values != sorted(set(values))
+    ):
+        raise ModelError(f"missing or invalid GGUF metadata: {arch}.{key}")
+    return values
+
+
+def compress_ratios(metadata):
+    """The compress ratio of each loaded layer of a DeepSeek-V4.1 target: 0
+    for a layer that attends its sliding window alone, else the tokens its
+    KV source pools into one compressed row."""
+    arch = text_architecture(metadata)
+    key = arch + ".attention.compress_ratios"
+    values = metadata.values.get(key)
+    layers = loaded_layers(metadata, arch)
+    if (
+        type(values) is not list
+        or len(values) < layers
+        or any(type(value) is not int or value < 0 for value in values)
+    ):
+        raise ModelError("missing or invalid GGUF metadata: " + key)
+    return values[:layers]
+
+
+def deepseek41_tensors(metadata, arch):
+    """The tensors of a DeepSeek-V4.1 target (DEEPSEEK41_LAYER_TENSORS and the
+    parts its layers' roles add)."""
+    ratios = compress_ratios(metadata)
+    kv_sources = set(layer_ids(metadata, "attention.kv_source_layers"))
+    index_sources = set(layer_ids(metadata, "attention.indexer.source_layers"))
+    engram = set(layer_ids(metadata, "ple.layers"))
+    tensors = dict(DEEPSEEK41_MODEL_TENSORS)
+    for layer in range(loaded_layers(metadata, arch)):
+        parts = dict(DEEPSEEK41_LAYER_TENSORS)
+        if layer in kv_sources:
+            parts |= DEEPSEEK41_KV_SOURCE_TENSORS
+            if ratios[layer] > 1:
+                parts |= DEEPSEEK41_POOLING_TENSORS
+        if layer in index_sources:
+            parts |= DEEPSEEK41_INDEX_SOURCE_TENSORS
+        if layer in engram:
+            parts |= DEEPSEEK41_ENGRAM_TENSORS
+        for name, types in parts.items():
+            tensors[f"blk.{layer}.{name}"] = types
+    return tensors
+
+
+def last_part(first, header):
+    """Whether header is the last part of the split GGUF whose first part's
+    header is first, by their split.* keys alone: as DeepSeek-V4.1's variants
+    share their Engram tables, a repository may keep that part once, under a
+    name of its own (llama.cpp's layout links it beside each variant's
+    parts)."""
+    count = first.values.get("split.count")
+    return (
+        type(count) is int
+        and count > 1
+        and "general.architecture" not in header.values
+        and header.values.get("split.no") == count - 1
+        and header.values.get("split.count") == count
+        and header.values.get("split.tensors.count")
+        == first.values.get("split.tensors.count")
+    )
+
 
 @dataclass(frozen=True)
 class Architecture:
@@ -736,6 +1027,10 @@ class Architecture:
     # Whether its configuration is flat, the text model's at its top, as
     # Flint's is; otherwise under text_config, as Qwen's is.
     flat: bool = False
+    # The tensors of an architecture whose layers differ by the roles its
+    # header's arrays give them, given the metadata and the architecture's
+    # name (DeepSeek-V4.1's); None for those loaded_tensors derives.
+    tensors: Callable | None = None
 
 
 # The GGUF text architectures Splash serves, by general.architecture; the
@@ -767,6 +1062,15 @@ ARCHITECTURES = {
         text_config=flint_text_config,
         flat=True,
     ),
+    "deepseek41": Architecture(
+        "deepseek_v41_text",
+        DEEPSEEK41_MODEL_TENSORS,
+        DEEPSEEK41_LAYER_TENSORS,
+        moe=True,
+        hybrid=False,
+        text_config=deepseek41_text_config,
+        tensors=deepseek41_tensors,
+    ),
 }
 
 
@@ -780,6 +1084,8 @@ def loaded_tensors(metadata):
     the two. A PLE layer reads the n-gram embedding's tensors too."""
     arch = text_architecture(metadata)
     architecture = ARCHITECTURES[arch]
+    if architecture.tensors is not None:
+        return architecture.tensors(metadata, arch)
     period = (
         metadata.positive(arch + ".full_attention_interval")
         if architecture.hybrid
@@ -838,8 +1144,11 @@ def require_arrays(metadata):
 def merged_split(headers):
     """One target's metadata from the headers of its split files (a split
     GGUF's parts), in split order: the first file's keys, whose split.* keys
-    must describe these files, and every file's tensor types."""
+    must describe these files, and every file's tensor types. A later part
+    alone is refused as no target."""
     first = headers[0]
+    if len(headers) == 1:
+        require_first_part(first)
     count = first.values.get("split.count", 1)
     if type(count) is not int or count != len(headers):
         raise ModelError("the GGUF's split files do not match its split.count")

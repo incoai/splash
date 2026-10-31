@@ -34,6 +34,7 @@ from server import backend as backend_api
 from server import frontend as request_frontend
 from server import protocol as native_wire
 from server import server as api
+from server.chat_format import QWEN
 
 
 def png_bytes(width, height, color=(200, 30, 30)):
@@ -349,6 +350,7 @@ class ImageRequestTest(HarnessTestCase):
 
         app.latencies = LatencyMetrics()
         app.max_context = 1024
+        app.chat_format = QWEN
         quoted = "中文 📷 <|vision_start|><|image_pad|><|vision_end|>"
         messages = [
             {"role": "system", "content": "Document: " + api_shapes.IMAGE_PAD_TOKEN},

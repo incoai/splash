@@ -930,6 +930,107 @@ void checkFlint(const std::filesystem::path &directory) {
         "planner refuses a router bias");
 }
 
+// DeepSeek-V4.1's GGUF plans each layer's parts of its roles alone: an
+// Engram layer's projection and gate weights, a compressor layer's
+// compressor (with its gate on a layer of groups of 2) and indexer key, an
+// indexer layer's queries and head weights; every layer's output groups as
+// projections of their own, its mixes, sinks and router bias as stored; the
+// head the Engram hash's tables as stored. It streams every layer's experts.
+// Its metadata names each mismatch: another epsilon or RoPE scaling, other
+// layers of a role or ratios, another router or clamp; and its tensors a
+// missing gate and one of groups of one token.
+void checkDeepSeek(const std::filesystem::path &directory) {
+  const model::QwenTargetDimensions g = deepseekGeometry();
+  const model::DeepSeek41Dimensions &d = g.deepseek;
+  std::vector<Tensor> tensors = deepseekTensors(g);
+  const auto path = directory / "deepseek41.gguf";
+  const auto planned = [&](const std::vector<test_gguf::Key> &keys, const std::vector<Tensor> &written,
+                           model::gguf::PlanOptions options = {}) {
+    splash::test::writeFile(path, test_gguf::file(keys, written));
+    return plan(path, g, options);
+  };
+  const Plan deepseek = planned(deepseekMetadata(g), tensors);
+  check(!deepseek.error && deepseek.images.size() == g.layers + 2,
+        "planner plans the DeepSeek-V4.1 target" + (deepseek.error ? ": " + *deepseek.error : ""));
+  if (deepseek.error) return;
+  for (uint32_t layer = 0; layer < g.layers; ++layer) {
+    const model::gguf::Image &image = deepseek.images[layer];
+    const std::string p = "blk." + std::to_string(layer) + ".", at = "layer " + std::to_string(layer) + "'s ";
+    const auto has = [&](uint64_t bits) { return model::DeepSeek41Dimensions::has(bits, layer); };
+    check(bool(repackOf(image, p + "engram_kv.weight")) == has(d.engramLayers) &&
+              bool(copyOf(image, p + "engram_gate.weight")) == has(d.engramLayers),
+          "planner plans " + at + "Engram where it has one");
+    check(bool(copyOf(image, p + "attn_compressor_kv.weight")) == has(d.compressorLayers) &&
+              bool(copyOf(image, p + "indexer.attn_k.weight")) == has(d.compressorLayers) &&
+              bool(copyOf(image, p + "attn_compressor_gate.weight")) ==
+                  (has(d.compressorLayers) && has(d.pairedLayers)),
+          "planner plans " + at + "compressor where it has one, gated on groups of 2");
+    check(bool(copyOf(image, p + "indexer.attn_q_b.weight")) == has(d.indexerLayers) &&
+              bool(copyOf(image, p + "indexer.proj.weight")) == has(d.indexerLayers),
+          "planner plans " + at + "indexer where it has one");
+    uint32_t groups = 0;
+    bool ordered = true;
+    for (const model::gguf::Repack &repack : image.repacks) {
+      if (repack.sources.front().name != p + "attn_output_a.weight") continue;
+      const model::gguf::TensorRows &rows = repack.sources.front();
+      ordered = ordered && repack.sources.size() == 1 && repack.rows == d.outputRank &&
+                repack.columns == d.groupWidth(g.attentionWidth) && rows.first == uint64_t{groups} * d.outputRank &&
+                rows.rows == d.outputRank;
+      ++groups;
+    }
+    check(groups == d.outputGroups && ordered, "planner plans " + at + "output groups as projections of their own");
+    for (const std::string name : {"hc_attn_fn.weight", "hc_ffn_base.weight", "attn_sinks.weight", "exp_probs_b.bias"})
+      check(asStored(copyOf(image, p + name), tensorNamed(tensors, p + name).data),
+            "planner copies the F32 tensor as stored: " + p + name);
+    check(!copyOf(image, p + "exp_probs_b_vl.bias"), "planner leaves " + at + "image router's bias out");
+  }
+  // The Engram's tables stream from the GGUF (DeepSeek41.cpp), past every
+  // image.
+  for (const model::gguf::Image &image : deepseek.images)
+    check(!copyOf(image, "per_layer_token_embd.weight") && !repackOf(image, "per_layer_token_embd.weight"),
+          "planner leaves the Engram's tables out of " + image.name);
+  const Plan streamed = planned(deepseekMetadata(g), tensors, {.streamExperts = true});
+  check(!streamed.error && streamsExperts(deepseek, streamed) &&
+            model::gguf::streamedExperts(std::span(streamed.images).first(g.layers)).size() == g.layers,
+        "planner streams every layer's experts");
+
+  const auto withKey = [&](const test_gguf::Key &replacement) {
+    std::vector<test_gguf::Key> keys = deepseekMetadata(g);
+    for (test_gguf::Key &key : keys)
+      if (key.name == replacement.name) key = replacement;
+    return keys;
+  };
+  check(names(planned(withKey(test_gguf::float32Key("deepseek41.attention.layer_norm_rms_epsilon", 1e-6F)), tensors),
+              {"attention.layer_norm_rms_epsilon 1e-06 (expected 1e-20"}),
+        "planner names another norm epsilon");
+  check(names(planned(withKey(test_gguf::stringKey("deepseek41.rope.scaling.type", "none")), tensors),
+              {"does not match the target: rope.scaling.type"}),
+        "planner names a RoPE without YaRN");
+  check(names(planned(withKey(test_gguf::int32ArrayKey("deepseek41.attention.kv_source_layers", {1})), tensors),
+              {"does not match the target: attention.kv_source_layers"}),
+        "planner names other compressor layers");
+  check(names(planned(withKey(test_gguf::int32ArrayKey("deepseek41.attention.compress_ratios", {0, 2, 2, 1})),
+                      tensors),
+              {"does not match the target: attention.compress_ratios"}),
+        "planner names other compress ratios");
+  check(names(planned(withKey(test_gguf::float32ArrayKey("deepseek41.swiglu_clamp_shexp", {10, 10, 7, 10})), tensors),
+              {"does not match the target: swiglu_clamp_shexp"}),
+        "planner names another SwiGLU clamp");
+  check(names(planned(withKey(test_gguf::uint32Key("deepseek41.expert_gating_func", 2)), tensors),
+              {"expert_gating_func 2 (expected 4)"}),
+        "planner refuses another router");
+  std::vector<Tensor> ungated = tensors;
+  std::erase_if(ungated, [](const Tensor &tensor) { return tensor.name == "blk.1.attn_compressor_gate.weight"; });
+  check(names(planned(deepseekMetadata(g), ungated), {"blk.1.attn_compressor_gate.weight (missing)"}),
+        "planner names a missing compressor gate");
+  std::vector<Tensor> gated = tensors;
+  gated.push_back(tensorNamed(tensors, "blk.1.attn_compressor_gate.weight"));
+  gated.back().name = "blk.2.attn_compressor_gate.weight";
+  check(names(planned(deepseekMetadata(g), gated),
+              {"blk.2.attn_compressor_gate.weight (a gate of groups of one token)"}),
+        "planner refuses a gate on groups of one token");
+}
+
 } // namespace
 
 int main() {
@@ -945,6 +1046,7 @@ int main() {
     guarded("planner on Flash-Next's PLE table", [&] { checkPleTable(directory.path()); });
     guarded("planner on a split GGUF", [&] { checkSplit(directory.path()); });
     guarded("planner on Flint", [&] { checkFlint(directory.path()); });
+    guarded("planner on DeepSeek-V4.1", [&] { checkDeepSeek(directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF planner tests FAILED" : "GGUF planner tests passed", failures);
     return failures ? 1 : 0;
   }

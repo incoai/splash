@@ -95,11 +95,9 @@ std::filesystem::path requireModelRoot(std::string_view argument) {
       std::filesystem::canonical(std::filesystem::path(argument), error);
   if (error || !std::filesystem::is_directory(root, error))
     throw UsageError("MODEL_DIRECTORY must name an existing directory");
-  for (const char *role : {"target", "draft"}) {
-    if (!std::filesystem::is_directory(root / role, error))
-      throw UsageError(
-          "MODEL_DIRECTORY must hold the model's target/ and draft/ directories");
-  }
+  // A model installed without a draft (--draft-model none) holds no draft/.
+  if (!std::filesystem::is_directory(root / "target", error))
+    throw UsageError("MODEL_DIRECTORY must hold the model's target/ directory");
   return root;
 }
 

@@ -35,6 +35,9 @@
 //   matmul reads marked empty and the rows past it unwritten. Concentrated and
 //   skewed router loads on the staged 32-row tiles of one format, at ragged
 //   row counts. A verify step that routes its lanes' verify rows alone.
+//   Routed experts read through a permuted slot table, from a floor chunk
+//   and elastic chunks (ops::ExpertChunks), and from an expert store's slots
+//   of one size in such chunks (ops::ExpertChunks::slotBytes).
 // - The router and the shared expert's slices are the build's
 //   (ops::kCompiledMoeRoutings): softmax weights and one gated shared slice by
 //   default; gguf-moe-sigmoid builds Flint's, sigmoid weights over the sum of
@@ -111,7 +114,10 @@ using namespace moe_fixture;
 // gguf-moe-e512 builds the test at Qwen3.8-Flash-Next's routing: 512
 // experts, top 10, a 640-wide intermediate; gguf-moe-sigmoid at Flint's:
 // 256 experts, top 6 by a sigmoid router, a 512-wide intermediate and a
-// shared expert of two ungated slices, at hidden 256.
+// shared expert of two ungated slices, at hidden 256; gguf-moe-deepseek at
+// DeepSeek-V4.1's: 384 experts, top 6 by sqrt(softplus) plus a selection
+// bias, weights times 1.5, one ungated shared slice, and the experts' SwiGLU
+// clamp, here at 0.75 so that many values reach it.
 #ifndef GGUF_MOE_HIDDEN
 #define GGUF_MOE_HIDDEN 1024
 #define GGUF_MOE_INTERMEDIATE 512
@@ -122,6 +128,10 @@ using namespace moe_fixture;
 #define GGUF_MOE_ROUTER Softmax
 #define GGUF_MOE_SHARED_SLICES 1
 #define GGUF_MOE_SHARED_GATE true
+#endif
+#ifndef GGUF_MOE_ROUTE_SCALE
+#define GGUF_MOE_ROUTE_SCALE 1.0f
+#define GGUF_MOE_SWIGLU_LIMIT 0.0f
 #endif
 constexpr uint32_t kHidden = GGUF_MOE_HIDDEN;
 constexpr uint32_t kIntermediate = GGUF_MOE_INTERMEDIATE;
@@ -134,6 +144,8 @@ constexpr MoeShape kShape{.hiddenSize = kHidden,
                           .expertsPerToken = kTopK,
                           .expertIntermediateSize = kIntermediate,
                           .router = splash::ops::MoeRouter::GGUF_MOE_ROUTER,
+                          .routeScale = GGUF_MOE_ROUTE_SCALE,
+                          .swigluLimit = GGUF_MOE_SWIGLU_LIMIT,
                           .sharedSlices = kSharedSlices,
                           .sharedGate = GGUF_MOE_SHARED_GATE};
 static_assert(kShape.valid(), "the test's routing is compiled");
@@ -156,6 +168,19 @@ void require(bool condition, const std::string &message) {
 }
 
 double silu(double value) { return value / (1.0 + std::exp(-value)); }
+// A SqrtSoftplusNormalized router's weight of a score.
+double sqrtSoftplus(double value) {
+  return std::sqrt(std::max(value, 0.0) + std::log1p(std::exp(-std::fabs(value))));
+}
+// A SwiGLU input as the experts clamp it: up to [-limit, limit], gate to at
+// most limit (MoeShape::swigluLimit), none at 0.
+double clampUp(double value) {
+  return kShape.swigluLimit > 0 ? std::clamp(value, -double(kShape.swigluLimit), double(kShape.swigluLimit)) : value;
+}
+double clampGate(double value) {
+  return kShape.swigluLimit > 0 ? std::min(value, double(kShape.swigluLimit)) : value;
+}
+constexpr bool kBiasedRouter = kShape.router == splash::ops::MoeRouter::SqrtSoftplusNormalized;
 // Where silu has its minimum (silu' = 0).
 constexpr double kSiluArgmin = -1.2784645427610738;
 
@@ -671,13 +696,14 @@ std::vector<ComputeDispatch> fullGridsTwoPasses(const CommandGraph &graph, const
       pass.buffers.push_back({6, up ? dispatch.buffers[9].buffer : scratch.expertOutput});
       pass.buffers.push_back({7, scratch.expertOutput});
       pass.buffers.push_back({8, dispatch.buffers[10].buffer});
-      // The pass's own parameters: the passes' sizes, floor and chunk slots, and
-      // this pass's projection and formats.
+      // The pass's own parameters: the passes' sizes, floor and chunk slots,
+      // SwiGLU clamp and slot bytes, and this pass's projection and formats.
       MoeGgufGateUpParams both;
       std::memcpy(&both, dispatch.bytes[0].data, sizeof(both));
       const MoeGgufExpertParams &params = passes.emplace_back(MoeGgufExpertParams{
           both.input_size, both.output_size, both.experts, up ? both.up_routed_format : both.gate_routed_format,
-          up ? both.up_shared_format : both.gate_shared_format, both.floor_slots, both.chunk_slots, up ? 1u : 0u});
+          up ? both.up_shared_format : both.gate_shared_format, both.floor_slots, both.chunk_slots, up ? 1u : 0u,
+          both.swiglu_limit, both.routed_slot_bytes});
       pass.bytes[0] = {9, &params, sizeof(params)};
       pass.addresses.index = 10;
       pass.threadgroups.x = dispatch.threadgroups.x * GGUF_STAGED_COLUMNS / GGUF_TILE_COLUMNS;
@@ -859,38 +885,53 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
     const float *x = b.input.data() + uint64_t{r} * kHidden;
     // Routes: the fp64 top-k by descending score, ascending id; the GPU's fp32
     // scores may reorder only experts closer than their error bounds.
-    std::array<double, kExperts> score{}, bound{};
+    // A biased router ranks by sqrt(softplus(score)) plus the selection
+    // bias, whose interval over the score's bounds bounds its error.
+    std::array<double, kExperts> score{}, bound{}, key{}, keyBound{};
     for (uint32_t e = 0; e < kExperts; ++e) {
       const Dot d = dot(x, m.router.row(e), kHidden);
       score[e] = d.value;
       bound[e] = floatBound(d, kHidden, plan.configuration().ggufRouterTile);
+      key[e] = score[e];
+      keyBound[e] = bound[e];
+      if (kBiasedRouter) {
+        key[e] = sqrtSoftplus(score[e]) + m.selectionBias.row(0)[e];
+        keyBound[e] = sqrtSoftplus(score[e] + bound[e]) - sqrtSoftplus(score[e] - bound[e]) + 1e-7;
+      }
     }
     std::array<uint32_t, kExperts> order;
     std::iota(order.begin(), order.end(), 0u);
     std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t c) {
-      return score[a] != score[c] ? score[a] > score[c] : a < c;
+      return key[a] != key[c] ? key[a] > key[c] : a < c;
     });
     for (uint32_t rank = 0; rank < kTopK; ++rank) {
       const uint32_t got = selected[r * kRoutes + rank], want = order[rank];
-      require(got == want || std::fabs(score[got] - score[want]) <= bound[got] + bound[want],
+      require(got == want || std::fabs(key[got] - key[want]) <= keyBound[got] + keyBound[want],
               label + ": row " + std::to_string(r) + " routes expert " + std::to_string(got) + " at rank " +
                   std::to_string(rank) + ", fp64 ranks " + std::to_string(want));
     }
-    // fp32 weights: a softmax weight moves by at most twice the largest score
-    // error of the routes (relative), a sigmoid by its argument's error, and
-    // a sigmoid over the sum of the top k's sigmoids by twice it.
+    // fp32 weights of the routes taken: their experts, which may be others
+    // than the fp64 top k where keys tie within their bounds, and weigh
+    // apart under a biased router, whose weights leave out the bias. A
+    // softmax weight moves by at most twice the largest score error of the
+    // routes (relative), a sigmoid by its argument's error, and a sigmoid
+    // over the sum of the top k's sigmoids by twice it; a sqrt-softplus
+    // weight by its interval over the score's bounds (relative), and over
+    // the sum of the top k's by twice it.
     const auto sigmoid = [](double value) { return 1.0 / (1.0 + std::exp(-value)); };
     const auto weight = [&](uint32_t rank) {
-      return kShape.router == splash::ops::MoeRouter::Softmax ? std::exp(score[order[rank]] - score[order[0]])
-                                                              : sigmoid(score[order[rank]]);
+      const double s = score[selected[r * kRoutes + rank]];
+      if (kBiasedRouter) return sqrtSoftplus(s);
+      return kShape.router == splash::ops::MoeRouter::Softmax ? std::exp(s - score[order[0]]) : sigmoid(s);
     };
     double denominator = 0, scoreError = 0;
     for (uint32_t rank = 0; rank < kTopK; ++rank) {
+      const uint32_t expert = selected[r * kRoutes + rank];
       denominator += weight(rank);
-      scoreError = std::max(scoreError, bound[order[rank]]);
+      scoreError = std::max(scoreError, kBiasedRouter ? keyBound[expert] / weight(rank) : bound[expert]);
     }
     for (uint32_t rank = 0; rank < kTopK; ++rank) {
-      const double want = weight(rank) / denominator;
+      const double want = weight(rank) / denominator * kShape.routeScale;
       require(std::fabs(routing[r * kRoutes + rank] - want) <= want * (2 * scoreError + std::ldexp(1.0, -18)),
               label + ": routing weight of row " + std::to_string(r) + " differs from the fp64 router's");
     }
@@ -932,19 +973,19 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
         // bf16(u) * silu(bf16(g)) rounded to bf16: silu over the gate's
         // interval (its minimum inside if the interval holds it) times the up
         // interval.
-        const double g0 = bf16(g.value - eg), g1 = bf16(g.value + eg);
+        const double g0 = clampGate(bf16(g.value - eg)), g1 = clampGate(bf16(g.value + eg));
         double s0 = std::min(silu(g0), silu(g1)), s1 = std::max(silu(g0), silu(g1));
         if (g0 < kSiluArgmin && g1 > kSiluArgmin) s0 = silu(kSiluArgmin);
         double lo = 1e300, hi = -1e300;
         for (const double sc : {s0, s1})
-          for (const double uc : {double(bf16(u.value - eu)), double(bf16(u.value + eu))}) {
+          for (const double uc : {clampUp(bf16(u.value - eu)), clampUp(bf16(u.value + eu))}) {
             lo = std::min(lo, uc * sc);
             hi = std::max(hi, uc * sc);
           }
         const double slack = std::ldexp(std::max(std::fabs(lo), std::fabs(hi)), -8) + 1e-7;
         const float got = float(intermediate[uint64_t{grouped} * kIntermediate + n]);
         h[n] = got;
-        const double exact = double(bf16(u.value)) * silu(bf16(g.value));
+        const double exact = clampUp(bf16(u.value)) * silu(clampGate(bf16(g.value)));
         if (!(got >= bf16(lo - slack) && got <= bf16(hi + slack)))
           fail(label + ": gate/up of row " + std::to_string(r) + " expert " + std::to_string(expert) + " column " +
                std::to_string(n) + ": " + std::to_string(got) + " outside [" + std::to_string(lo) + ", " +
@@ -999,6 +1040,82 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
   return result;
 }
 
+// The weights of `m` in an expert store's slots of one size
+// (ops::ExpertChunks::slotBytes, model/ExpertStore.cpp): every plane of an
+// expert together in its slot, projection z's plane i of bytes[z][i] from
+// offsets[z][i] on, each from a multiple of 256 bytes, expert e in slot
+// slotOf(e) of `slots` through the slot table, in a floor chunk of
+// kMultiChunkFloorSlots slots and elastic chunks of kMultiChunkSlots after
+// it, the last of fewer, each one buffer of its slots in turn, and the
+// chunks' views from each plane's place in a slot on; the slots `width`
+// bytes apart. The routed segments give the slots' format and size.
+struct SlottedWeights final {
+  BlockMoeWeights weights;
+  uint64_t width = 0;
+  std::array<std::array<uint64_t, 3>, 3> offsets{}, bytes{};
+};
+template <class SlotOf>
+SlottedWeights slottedWeights(MetalBackend &backend, const Model &m, uint32_t slots, SlotOf slotOf) {
+  SlottedWeights slotted{m.weights};
+  BlockExpertProjection *const projections[] = {&slotted.weights.gate, &slotted.weights.up, &slotted.weights.down};
+  for (size_t z = 0; z < 3; ++z) {
+    const QuantizedSegment &routed = projections[z]->routed;
+    const QuantFormat &f = routed.format();
+    const uint64_t groups = uint64_t{routed.outputSize / kExperts} * (routed.inputSize / 32);
+    slotted.bytes[z] = {groups * f.plane0_bytes, groups * f.plane1_bytes, groups / f.meta_groups * f.meta_bytes};
+    for (size_t i = 0; i < 3; ++i) {
+      slotted.offsets[z][i] = slotted.width;
+      slotted.width += (slotted.bytes[z][i] + 255) / 256 * 256;
+    }
+  }
+  const uint64_t width = slotted.width;
+  const auto &offsets = slotted.offsets;
+  const auto &bytes = slotted.bytes;
+  MetalBuffer table =
+      backend.allocateBuffer(uint64_t{kExperts} * sizeof(uint32_t), BufferStorage::Shared, "slotted-table");
+  std::vector<MetalBuffer> chunks, planes;
+  for (uint32_t first = 0; first < slots; first += first ? kMultiChunkSlots : kMultiChunkFloorSlots) {
+    const uint64_t held = std::min(first ? kMultiChunkSlots : kMultiChunkFloorSlots, slots - first);
+    const MetalBuffer &chunk =
+        chunks.emplace_back(backend.allocateBuffer(held * width, BufferStorage::Shared, "slotted-chunk"));
+    std::memset(chunk.contents(), 0xa5, held * width);
+    for (size_t z = 0; z < 3; ++z) {
+      const auto plane = [&](size_t i) { return backend.view(chunk, offsets[z][i], held * width - offsets[z][i]); };
+      const MetalBuffer meta = plane(2);
+      planes.push_back(plane(0));
+      planes.push_back(bytes[z][1] ? plane(1) : meta);
+      planes.push_back(meta);
+    }
+  }
+  const auto slotAt = [&](uint32_t slot) {
+    const uint32_t chunk = slot < kMultiChunkFloorSlots ? 0 : 1 + (slot - kMultiChunkFloorSlots) / kMultiChunkSlots;
+    const uint32_t local = chunk ? slot - kMultiChunkFloorSlots - (chunk - 1) * kMultiChunkSlots : slot;
+    return static_cast<uint8_t *>(chunks[chunk].contents()) + uint64_t{local} * width;
+  };
+  for (uint32_t expert = 0; expert < kExperts; ++expert) {
+    static_cast<uint32_t *>(table.contents())[expert] = slotOf(expert);
+    for (size_t z = 0; z < 3; ++z) {
+      const QuantizedSegment &routed = projections[z]->routed;
+      const MetalBuffer *source[] = {&routed.plane0, &routed.plane1, &routed.meta};
+      for (size_t i = 0; i < 3; ++i)
+        if (bytes[z][i])
+          std::memcpy(slotAt(slotOf(expert)) + offsets[z][i],
+                      static_cast<const uint8_t *>(source[i]->contents()) + expert * bytes[z][i], bytes[z][i]);
+    }
+  }
+  for (size_t z = 0; z < 3; ++z) {
+    const QuantizedSegment routed = projections[z]->routed;
+    projections[z]->routed = QuantizedSegment::planes(routed.formatId, slots * (routed.outputSize / kExperts),
+                                                      routed.inputSize, {}, {}, {});
+  }
+  slotted.weights.slotTable = table;
+  slotted.weights.slots = slots;
+  slotted.weights.chunks = ExpertChunks::of(std::move(planes), kMultiChunkFloorSlots, kMultiChunkSlots, slots,
+                                            slotted.weights.gate.routed, slotted.weights.up.routed,
+                                            slotted.weights.down.routed, static_cast<uint32_t>(width));
+  return slotted;
+}
+
 // Each buffer a register decode plan and a staged 32-row prefill plan reach,
 // at its extent and one element short, and each weight: the planes of every
 // shared expert tensor and each region of every chunk of the routed experts
@@ -1009,9 +1126,11 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
 // weights. A region of the floor chunk or of an elastic chunk one element
 // short, chunks that hold fewer slots than the block, a floor or elastic
 // chunks of more slots than their views hold and a malformed list of them
-// are refused where the chunks are made (ExpertChunks::of); a block
-// without chunks, or with chunks made for another block, is refused by its
-// MoE.
+// are refused where the chunks are made (ExpertChunks::of); so are, in
+// chunks of an expert store's slots of one size (slottedWeights), a view
+// one byte short of its last slot's plane and slots narrower than a plane of
+// an expert. A block without chunks, or with chunks made for another block,
+// is refused by its MoE.
 void bufferExtents(MetalBackend &backend) {
   const MoeShape shape = kShape;
   const Model m = makeModel(backend, shape, 0, false);
@@ -1031,8 +1150,8 @@ void bufferExtents(MetalBackend &backend) {
   const BlockMoeWeights &blocks = m.weights;
   const uint32_t floorSlots = kMultiChunkFloorSlots, chunkSlots = kMultiChunkSlots;
   const BlockMoeWeights chunked = chunkedWeights(backend, m, floorSlots, chunkSlots);
-  const BlockMoeWeights chunkedPlane1 =
-      chunkedWeights(backend, makeModel(backend, shape, Q5K, false), floorSlots, chunkSlots);
+  const Model chunkedPlaneModel = makeModel(backend, shape, Q5K, false);
+  const BlockMoeWeights chunkedPlane1 = chunkedWeights(backend, chunkedPlaneModel, floorSlots, chunkSlots);
   // The chunks `planes`, a floor of `floor` slots and elastic chunks of
   // `elastic` slots each, for the routed experts of `weights`
   // (ExpertChunks::of).
@@ -1110,6 +1229,37 @@ void bufferExtents(MetalBackend &backend) {
           "have elastic chunks of more slots than their views");
   refused({planes.begin(), planes.end() - 1}, floorSlots, chunkSlots, "MoE expert chunks take",
           "end inside a chunk");
+  // Each view of each chunk of slots of one size, which holds its last
+  // slot's plane from (held - 1) slots on, also of routed formats with a
+  // second plane; and slots narrower than a plane of an expert.
+  const auto identity = [](uint32_t expert) { return expert; };
+  for (const Model *model : {&m, &chunkedPlaneModel}) {
+    const SlottedWeights slotted = slottedWeights(backend, *model, kExperts, identity);
+    const BlockMoeWeights &weights = slotted.weights;
+    const std::vector<MetalBuffer> &views = *weights.chunks.planes();
+    const auto slottedOf = [&](std::vector<MetalBuffer> changed, uint64_t width) {
+      return ExpertChunks::of(std::move(changed), floorSlots, chunkSlots, weights.slots, weights.gate.routed,
+                              weights.up.routed, weights.down.routed, static_cast<uint32_t>(width));
+    };
+    for (uint32_t z = 0; z < 3; ++z)
+      for (uint32_t chunk = 0, first = 0; first < weights.slots; first += chunk++ ? chunkSlots : floorSlots) {
+        const uint64_t held = std::min(chunk ? chunkSlots : floorSlots, weights.slots - first);
+        for (uint32_t plane = 0; plane < 3; ++plane) {
+          if (!slotted.bytes[z][plane]) continue;
+          const size_t entry = size_t{chunk} * MOE_EXPERT_CHUNK_ADDRESSES + z * 3 + plane;
+          requireWeightExtent(weights, views[entry], (held - 1) * slotted.width + slotted.bytes[z][plane], 1,
+                              std::string("MoE expert ") + std::array{"gate", "up", "down"}[z] + " chunk " +
+                                  std::to_string(chunk) + std::array{" plane0", " plane1", " meta"}[plane],
+                              [&](BlockMoeWeights &changed, const MetalBuffer &view) {
+                                std::vector<MetalBuffer> replaced = views;
+                                replaced[entry] = view;
+                                changed.chunks = slottedOf(std::move(replaced), slotted.width);
+                              });
+        }
+      }
+    splash::test::rejects([&] { static_cast<void>(slottedOf(views, slotted.bytes[0][0] - 1)); },
+                          "MoE expert gate plane0 takes", "MoE expert slots narrower than a plane were made");
+  }
   // A block without chunks, or with the chunks made for another block's
   // routed formats.
   for (const auto &[chunks, expected, what] :
@@ -1243,7 +1393,8 @@ int moe(MetalBackend &backend) {
   return failures;
 }
 
-// Concentrated and skewed loads: a router whose expert e scores 4 x[e], and
+// Concentrated and skewed loads: a router whose expert e scores 4 x[e] (a
+// biased router without its bias), and
 // rows whose first kExperts inputs rank the experts, the first at 1, the next
 // expert at 0.5. When experts outnumber hidden columns, paired experts read
 // the same column with opposite signs; the remaining inputs stay below 0.5.
@@ -1265,6 +1416,12 @@ int routingLoads(MetalBackend &backend) {
     m.router.values[uint64_t{e} * kHidden + column(e)] = 4.0f * sign(e);
   m.router.segment = floatSegment(backend, m.router.values, kExperts, kHidden);
   m.weights.router = m.router.segment;
+  if (kBiasedRouter) {
+    // The loads rank the experts by their scores alone.
+    m.selectionBias.values.assign(kExperts, 0.0f);
+    m.selectionBias.segment = floatSegment(backend, m.selectionBias.values, 1, kExperts);
+    m.weights.selectionBias = m.selectionBias.segment.plane0;
+  }
   const std::string formats = formatNames(m);
   int failures = 0;
   for (const Load load : {Load::Concentrated, Load::Skewed}) {
@@ -1386,8 +1543,9 @@ int nativeRouter(MetalBackend &backend) {
 } // namespace
 
 // The kernels read each routed expert from the slot its table names: the
-// experts in slots permuted by sigma, with each expert's router row moved to
-// match (expert e routes as e' did where sigma(e) = e'), give the identity
+// experts in slots permuted by sigma, with each expert's router row and
+// selection bias moved to match (expert e routes as e' did where sigma(e) =
+// e'), give the identity
 // table's output bit for bit, in decode and in prefill, on the staged tile
 // and on the register tile (Apple9's, which binds the table on its own).
 int permutedSlots(MetalBackend &backend) {
@@ -1406,6 +1564,13 @@ int permutedSlots(MetalBackend &backend) {
     }
     permuted.weights.slotTable = table;
     permuted.weights.router = floatSegment(backend, router, kExperts, kHidden);
+    if (kBiasedRouter) {
+      // The selection bias is the expert's routing too.
+      std::vector<float> bias(kExperts);
+      for (uint32_t expert = 0; expert < kExperts; ++expert) bias[expert] = m.selectionBias.row(0)[sigma(expert)];
+      permuted.selectionBias.segment = floatSegment(backend, bias, 1, kExperts);
+      permuted.weights.selectionBias = permuted.selectionBias.segment.plane0;
+    }
     Buffers b;
     b.input = activations(uint64_t{kMaximumRows} * kHidden);
     b.residual = activations(uint64_t{kMaximumRows} * kHidden);
@@ -1436,6 +1601,70 @@ int permutedSlots(MetalBackend &backend) {
            tile == MoeGgufTile::Register ? "register" : "staged  ", kMaximumRows, tileFailures ? "FAIL" : "ok");
     failures += tileFailures;
   }
+  return failures;
+}
+
+// The kernels read the routed experts of an expert store's slots
+// (ops::ExpertChunks::slotBytes, model/ExpertStore.cpp): every plane of an
+// expert together in one slot, each plane from a multiple of 256 bytes, the
+// slots three more than the experts and in reverse order, in a floor chunk
+// of kMultiChunkFloorSlots slots and elastic chunks of kMultiChunkSlots, the
+// last of fewer, give the planes' own layout's output bit for bit, in decode
+// and in prefill, on the staged tile (gate and up in their formats, and in
+// one, which runs them in one pass where the device spreads its walks) and
+// on the register tile.
+int slottedExperts(MetalBackend &backend) {
+  const MoeShape shape = kShape;
+  const uint32_t slots = kExperts + 3;
+  const auto slotOf = [&](uint32_t expert) { return slots - 1 - expert; };
+  int failures = 0;
+  for (const MoeGgufTile tile : {MoeGgufTile::Staged, MoeGgufTile::Register})
+    for (const bool upInGateFormats : {false, true}) {
+      if (upInGateFormats && tile == MoeGgufTile::Register) continue;
+      const Model m = makeModel(backend, shape, tileFormats(tile).front(), upInGateFormats, tile);
+      Model slotted = m;
+      const SlottedWeights inSlots = slottedWeights(backend, m, slots, slotOf);
+      slotted.weights = inSlots.weights;
+      const uint64_t width = inSlots.width;
+      Buffers b;
+      b.input = activations(uint64_t{kMaximumRows} * kHidden);
+      b.residual = activations(uint64_t{kMaximumRows} * kHidden);
+      b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
+      b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
+      b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
+      const auto run = [&](const Model &model, const MoePlan &plan) {
+        allocate(backend, b, plan);
+        std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
+        CommandGraph graph;
+        MoE::add(graph, b.moe, model.weights, plan);
+        static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+        const auto *output = static_cast<const uint16_t *>(b.moe.output.contents());
+        return std::vector<uint16_t>(output, output + uint64_t{plan.rows()} * kHidden);
+      };
+      // The register tile prefills on the 8-row tiles of its decode
+      // (ExecutionPlans::moePrefill), the staged one on 8- and 32-row tiles.
+      std::vector<MoePlan> plans;
+      for (const uint32_t lanes : {1u, 4u})
+        plans.push_back(MoE::decodePlan(shape, lanes, MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = tile}));
+      plans.push_back(
+          MoE::prefillPlan(shape, kMaximumRows, MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = tile}));
+      if (tile == MoeGgufTile::Staged)
+        plans.push_back(
+            MoE::prefillPlan(shape, kMaximumRows, MoeConfig{.expertTile = MoeExpertTile::M32, .ggufTile = tile}));
+      int tileFailures = 0;
+      for (const MoePlan &plan : plans)
+        if (run(m, plan) != run(slotted, plan)) {
+          printf("  slotted experts, %s %u rows on %u-row tiles: the output differs from the planes' own layout's "
+                 "FAIL\n",
+                 plan.phase() == splash::ops::MoePhase::Decode ? "decode" : "prefill", plan.rows(), plan.tileRows());
+          ++tileFailures;
+        }
+      printf("%-20s %s experts in slots of %llu bytes in chunks of %u and %u, decode B1/B4 and prefill %u: %s\n",
+             formatNames(m).c_str(), tile == MoeGgufTile::Register ? "register" : "staged  ",
+             (unsigned long long)width, kMultiChunkFloorSlots, kMultiChunkSlots, kMaximumRows,
+             tileFailures ? "FAIL" : "ok");
+      failures += tileFailures;
+    }
   return failures;
 }
 
@@ -1482,6 +1711,12 @@ int chunkedSlots(MetalBackend &backend) {
       }
       chunked.slotTable = table;
       chunked.router = floatSegment(backend, router, kExperts, kHidden);
+      if (kBiasedRouter) {
+        // The selection bias is the expert's routing too.
+        std::vector<float> bias(kExperts);
+        for (uint32_t expert = 0; expert < kExperts; ++expert) bias[expert] = m.selectionBias.row(0)[sigma(expert)];
+        chunked.selectionBias = floatSegment(backend, bias, 1, kExperts).plane0;
+      }
       const MoeExpertTile prefillTile = tile == MoeGgufTile::Register ? MoeExpertTile::M8 : MoeExpertTile::M32;
       std::vector<MoePlan> plans;
       for (uint32_t lanes = 1; lanes <= 4; ++lanes)
@@ -1631,7 +1866,7 @@ int main(int argc, const char *argv[]) {
                            nativePairs(backend) + floatPairs(backend) +
                            floatSegments(backend, 64) + floatSegments(backend, 96) + floatOnlyChain(backend) +
                            moe(backend) + routingLoads(backend) + nativeRouter(backend) + permutedSlots(backend) +
-                           verifiedRows(backend) + chunkedSlots(backend);
+                           slottedExperts(backend) + verifiedRows(backend) + chunkedSlots(backend);
       if (failures) {
         std::cerr << "gguf_moe_test: " << failures << " failures\n";
         return 1;

@@ -75,11 +75,14 @@ struct StreamedSetting final {
 // MoE target's routed experts (model::ExpertStore) or the table its GGUF
 // holds (model::SparseRowStore). allBytes is what it takes loaded whole, zero
 // for a model without it, and minimumBytes the smallest store that streams
-// it.
+// it. A part that only streams (DeepSeek-V4.1's Engram tables, which its
+// target reads through their store alone) streams whatever the budget holds,
+// and cannot be set off.
 struct StreamedPart final {
   uint64_t allBytes = 0;
   uint64_t minimumBytes = 0;
   StreamedSetting setting;
+  bool streamsOnly = false;
 };
 
 // Inputs that the memory planner needs from a loaded model. Model tensor and

@@ -367,9 +367,10 @@ void testRefusals() {
                  "expected the serve-native command");
   commandRefused({"serve-native", (model.path() / "missing").string(), "auto", "auto"},
                  "MODEL_DIRECTORY must name an existing directory");
+  // A model installed without a draft holds target/ alone.
   const test::TemporaryDirectory empty("splash-native-arguments-empty");
   commandRefused({"serve-native", empty.path().string(), "auto", "auto"},
-                 "MODEL_DIRECTORY must hold the model's target/ and draft/ directories");
+                 "MODEL_DIRECTORY must hold the model's target/ directory");
 }
 
 } // namespace

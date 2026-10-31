@@ -29,7 +29,8 @@ namespace {
 using splash::test::require;
 
 // The draft each family's values are taken with: the one
-// dev/tests/fixtures/model-configs describes for it (TestDrafts.hpp).
+// dev/tests/fixtures/model-configs describes for it (TestDrafts.hpp), none for
+// a family that decodes without one.
 model::DFlashDraftLayout draftOf(std::string_view family) {
   if (family == model::Qwen3_8Layout{}.family)
     return test::qwen3_8Draft();
@@ -41,6 +42,8 @@ model::DFlashDraftLayout draftOf(std::string_view family) {
     return test::flashNextDraft();
   if (family == model::FlintLayout{}.family)
     return test::flintDraft();
+  if (family == model::DeepSeek41Layout{}.family)
+    return {};
   throw std::logic_error(std::string(family) + " has no draft to take its values with");
 }
 
@@ -59,7 +62,7 @@ std::string familyValues() {
     if (target.draftChoosesMaskToken()) target.maskToken = target.firstDraftMaskToken;
     const model::ModelDescriptor model =
         model::makeModelDescriptor(std::string(family.family), target, draft,
-                                   {.outputHiddenSize = draft.hiddenSize}, model::TargetSource::Gguf,
+                                   {.outputHiddenSize = target.hiddenSize}, model::TargetSource::Gguf,
                                    model::VisionSource::None);
     require(model.valid(), std::string(family.family) + "'s descriptor is not valid");
     const kv::Layout &kv = model.targetKvLayout;
@@ -69,9 +72,10 @@ std::string familyValues() {
     if (kv.windowedLayers)
       out << " window " << kv.windowTokens << " layers 0x" << std::hex << kv.windowedLayers << std::dec;
     out << '\n';
+    // Each --kv-format's pages as the runtime stores them: a family that
+    // fixes its format holds its own in either.
     for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
-      kv::Layout layout = kv;
-      layout.format = format;
+      const kv::Layout layout = model.kvLayout(format);
       out << "kv " << kv::formatName(format) << " page " << layout.bytesPerModelPage(kv::PageForm::Full)
           << " index-page " << layout.bytesPerModelPage(kv::PageForm::Index)
           << (layout.slimmable() ? " slim-page " + std::to_string(layout.bytesPerModelPage(kv::PageForm::Slim)) : "")
@@ -89,8 +93,7 @@ std::string familyValues() {
           << states.target.cellBytes() << " lane " << states.laneBytes() << " cached " << states.cachedBytes()
           << '\n';
       for (const kv::Format kvFormat : {kv::Format::Int8, kv::Format::BFloat16}) {
-        kv::Layout layout = kv;
-        layout.format = kvFormat;
+        const kv::Layout layout = model.kvLayout(kvFormat);
         const engine::RuntimeCacheIdentity identity = engine::makeRuntimeCacheIdentity(
             std::string(64, 'a'), std::string(64, 'b'), "build", layout, model.ropeScaling);
         out << "namespace " << kv::formatName(kvFormat) << ' '

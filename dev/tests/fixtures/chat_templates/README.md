@@ -19,3 +19,14 @@ not templates distributed with the runtime.
   (revision `20468edfc38ab43d6914cc88b08cbecb05d0fc62`) holds byte for byte.
   The chat format tests (`dev/tests/server/test_chat_formats.py`) render it
   too.
+- `deepseek41.jinja`: embedded `tokenizer.chat_template` of
+  `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf` in
+  `ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF`, revision
+  `653a9874aa38c356233c5f3cc8c96b19a43b57eb`, which adapts Unsloth's
+  DeepSeek-V4.1 template to DeepSeek's `encoding/encoding.py`.
+- `deepseek41-encoding/`: the cases of DeepSeek's reference encoder,
+  `encoding/tests/test_input_N.json` with the prompts it renders,
+  `test_output_N.txt`, in
+  [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/tree/1bae0e1088993b9b82de08f59de5be5a34e42170/encoding/tests)
+  (MIT license), revision `1bae0e1088993b9b82de08f59de5be5a34e42170`, which
+  `deepseek41.jinja` renders alike (`dev/tests/server/test_deepseek_format.py`).

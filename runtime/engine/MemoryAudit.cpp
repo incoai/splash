@@ -45,9 +45,10 @@ std::string_view memoryAuditErrorName(MemoryAuditError error) {
 MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
                                     ActualMemoryReport actual) {
   const EngineMemoryBreakdown &budget = plan.breakdown();
-  // Vision weights are absent without a vision tower. Loading already
-  // requires them for a model with vision.
-  if (!actual.targetWeightsBytes || !actual.draftWeightsBytes ||
+  // Vision weights are absent without a vision tower, and draft weights
+  // without a draft. Loading already requires them for a model with either
+  // (requireLoadedModel).
+  if (!actual.targetWeightsBytes ||
       !actual.stateAllocatedBytes || !actual.sharedPrefillBytes ||
       !actual.sharedDecodeBytes || !actual.kvAllocatedBytes ||
       !actual.backendAllocatedBytes || !actual.deviceCurrentAllocatedBytes ||

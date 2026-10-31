@@ -15,6 +15,7 @@ GGUF_TYPE_FLOAT32 = 6
 GGUF_TYPE_BOOL = 7
 GGUF_TYPE_STRING = 8
 GGUF_TYPE_ARRAY = 9
+GGUF_TYPE_UINT64 = 10
 
 
 def weight_file(magic, layer, kind, sections):
@@ -58,21 +59,25 @@ def _gguf_string(text):
     return struct.pack("<Q", len(data)) + data
 
 
-def _gguf_value(value):
-    """The GGUF value type and encoding of a string, bool, int (uint32),
-    float (float32) or list of one of them."""
+def _gguf_value(value, wide=False):
+    """The GGUF value type and encoding of a string, bool, int (uint32, or
+    uint64 where it or, in a list, any of them is wide), float (float32) or
+    list of one of them."""
     if isinstance(value, str):
         return GGUF_TYPE_STRING, _gguf_string(value)
     if isinstance(value, bool):
         return GGUF_TYPE_BOOL, struct.pack("<?", value)
     if isinstance(value, int):
+        if wide or value > 0xFFFFFFFF:
+            return GGUF_TYPE_UINT64, struct.pack("<Q", value)
         return GGUF_TYPE_UINT32, struct.pack("<I", value)
     if isinstance(value, float):
         return GGUF_TYPE_FLOAT32, struct.pack("<f", value)
     if isinstance(value, list):
-        kind = _gguf_value(value[0])[0] if value else GGUF_TYPE_UINT32
+        wide = any(type(x) is int and x > 0xFFFFFFFF for x in value)
+        kind = _gguf_value(value[0], wide)[0] if value else GGUF_TYPE_UINT32
         return GGUF_TYPE_ARRAY, struct.pack("<IQ", kind, len(value)) + b"".join(
-            _gguf_value(x)[1] for x in value
+            _gguf_value(x, wide)[1] for x in value
         )
     raise AssertionError(value)
 

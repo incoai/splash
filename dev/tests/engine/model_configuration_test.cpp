@@ -13,10 +13,12 @@
 #include "TestDrafts.hpp"
 #include "TestFiles.hpp"
 #include "TestModel.hpp"
+#include "model/DSpark.hpp"
 #include "model/ModelDescriptor.hpp"
 #include "model/RopeScaling.hpp"
 #include "model/WeightStore.hpp"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -927,9 +929,38 @@ void testFlint(const std::filesystem::path &fixtures) {
           "a Flint config under text_config was accepted");
 }
 
+// DeepSeek-V4.1-Flash's DSpark as the runtime sizes it (dsparkDraftLayout):
+// its own layers and block, its target's widths and vocabulary, its latent as
+// one KV head and the target layers it reads, none of a DFlash2 draft's
+// sizes; a cycle retains its anchor and each proposal of its block, a
+// DFlash2 draft's all eight rows and a model without a draft its anchor.
+void testDSpark() {
+  model::DSparkLayout dspark;
+  dspark.layers.layers = 3;
+  dspark.blockSize = 5;
+  dspark.noiseToken = 128799;
+  dspark.markovRank = 256;
+  dspark.targetLayerValues = {37, 38, 39};
+  dspark.targetLayerCount = 3;
+  const model::DFlashDraftLayout layout = model::dsparkDraftLayout(dspark);
+  require(layout.dspark() && !layout.dflash() && layout.present() && layout.layers == 3 &&
+              layout.hiddenSize == 5120 && layout.vocabularySize == 129280 && layout.kvHeads == 1 &&
+              layout.attentionHeadDimension == 512 && layout.blockSize == 5 &&
+              std::ranges::equal(layout.targetLayerIds(), dspark.targetLayers()) &&
+              layout.targetHiddenSize() == 3 * 5120 && !layout.qkvSize && !layout.intermediateSize &&
+              !layout.selectorRank,
+          "DSpark's runtime layout was not its target's widths and its own block");
+  require(layout.stateLayout() == model::DraftStateLayout{3, 1, 512, 5120} && layout.stateLayout().valid(),
+          "DSpark's lane state was not three rings of one latent head and its context window");
+  require(layout.retainedRows() == 6 && test::flintDraft().retainedRows() == 8 &&
+              model::DFlashDraftLayout{}.retainedRows() == 1,
+          "a cycle's retained rows were not its anchor's and its draft's proposals'");
+}
+
 int main(int argc, char **argv) {
   try {
     if (argc != 2) throw std::invalid_argument("usage: model-configuration FIXTURES");
+    testDSpark();
     testFamilies(argv[1]);
     testSources();
     testOneRulePerValue(argv[1]);
@@ -939,8 +970,8 @@ int main(int argc, char **argv) {
     testConfigurationCheck(argv[1]);
     testYarn(argv[1]);
     testFlint(argv[1]);
-    std::cout << "model configuration: every family, sources, one rule per value, quantization, vision, pruned "
-                 "experts, the installer's check, YaRN, Flint PASS\n";
+    std::cout << "model configuration: DSpark, every family, sources, one rule per value, quantization, vision, "
+                 "pruned experts, the installer's check, YaRN, Flint PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;
