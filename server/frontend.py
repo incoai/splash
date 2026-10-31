@@ -2,8 +2,10 @@
 
 import hashlib
 import json
+import re
 import secrets
 import threading
+from bisect import bisect
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from itertools import count
@@ -22,7 +24,7 @@ from .api_shapes import (
     template_messages,
 )
 from .backend import Job, ReasoningRequest, remaining_request_time
-from .chat_format import THINK_END, THINK_START, TOOL_CALL_OPEN
+from .chat_format import THINK_END, THINK_START, TOOL_CALL_CLOSE, TOOL_CALL_OPEN
 from .chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
     RESERVED_TEMPLATE_KWARGS,
@@ -40,7 +42,7 @@ from .latency import LatencyMetrics
 from .lru import LRUCache
 from .metrics import is_finite_number
 from .serve_options import REASONING_EFFORTS, parse_served_model_name
-from .tokenization import PromptTokenizer, tokenizable
+from .tokenization import PromptTokenizer, plain_tokens, tokenizable
 from .tool_schema import (
     ToolPolicy,
     json_grammar,
@@ -111,6 +113,112 @@ COMPLETION_DEFAULT_MAX_TOKENS = 16
 
 # A stable marker lets repeated image requests reuse the compiled template.
 IMAGE_RENDER_MARKER = f"__splash_image_{secrets.token_hex(16)}__"
+
+# The chat template's own tags, which the tokenizer matches as their added
+# tokens wherever the prompt spells them. Quoted in a message's text, as by a
+# tool result that reads a tool-call parser's source, they would hand the
+# model a real call opening or tool-result marker, which it then copies, or
+# stops at, where it means to quote the tag. Marked before the template
+# renders, they encode as their characters; the tags the template writes
+# itself keep their tokens. An assistant message's reasoning quotes them too,
+# but keeps its <think> and </think>, where the template looks for them to
+# split reasoning a client sends inline.
+QUOTED_TAGS = (
+    TOOL_CALL_OPEN,
+    TOOL_CALL_CLOSE,
+    "<tool_response>",
+    "</tool_response>",
+    THINK_START,
+    THINK_END,
+)
+QUOTED_TAG_MARKER = f"__splash_quoted_{secrets.token_hex(16)}_"
+_QUOTED_TAG_MARK = re.compile(re.escape(QUOTED_TAG_MARKER) + r"(\d+)__")
+
+
+def _mark_quoted_tags(value, tags=QUOTED_TAGS):
+    """`value` with each spelling of `tags` in its strings replaced by the
+    tag's marker."""
+    if isinstance(value, str):
+        for tag in tags:
+            if tag in value:
+                value = value.replace(
+                    tag, f"{QUOTED_TAG_MARKER}{QUOTED_TAGS.index(tag)}__"
+                )
+        return value
+    if isinstance(value, dict):
+        return {key: _mark_quoted_tags(item, tags) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_mark_quoted_tags(item, tags) for item in value]
+    return value
+
+
+_TOOL_TAGS = QUOTED_TAGS[:4]
+_RESULT_OPEN_MARK = f"{QUOTED_TAG_MARKER}{QUOTED_TAGS.index('<tool_response>')}__"
+_RESULT_CLOSE_MARK = f"{QUOTED_TAG_MARKER}{QUOTED_TAGS.index('</tool_response>')}__"
+
+
+def _keep_tool_result_frame(content):
+    """A user message's marked content with the outer <tool_response> pair
+    restored where its whole text is one: a client that writes a tool result
+    in the template's layout sends it so, and the template tells such a turn
+    from a question by that pair."""
+    if isinstance(content, str):
+        texts = [content]
+    elif (
+        isinstance(content, list)
+        and content
+        and all(
+            isinstance(part, dict) and isinstance(part.get("text"), str)
+            for part in content
+        )
+    ):
+        texts = [part["text"] for part in content]
+    else:
+        return content
+    if not (
+        texts[0].lstrip().startswith(_RESULT_OPEN_MARK)
+        and texts[-1].rstrip().endswith(_RESULT_CLOSE_MARK)
+    ):
+        return content
+    texts[0] = texts[0].replace(_RESULT_OPEN_MARK, "<tool_response>", 1)
+    head, _, tail = texts[-1].rpartition(_RESULT_CLOSE_MARK)
+    texts[-1] = head + "</tool_response>" + tail
+    if isinstance(content, str):
+        return texts[0]
+    return [{**part, "text": text} for part, text in zip(content, texts)]
+
+
+def _mark_quoted_messages(messages):
+    """The messages with the tags their text quotes marked: in every field
+    but the role, an assistant's <think> and </think> aside."""
+    marked = []
+    for message in messages:
+        role = message.get("role")
+        tags = _TOOL_TAGS if role == "assistant" else QUOTED_TAGS
+        message = {
+            key: value if key == "role" else _mark_quoted_tags(value, tags)
+            for key, value in message.items()
+        }
+        if role == "user" and "content" in message:
+            message["content"] = _keep_tool_result_frame(message["content"])
+        marked.append(message)
+    return marked
+
+
+def _unmark_quoted_tags(rendered):
+    """The rendered text with its quoted tags spelled again, and their spans
+    in it."""
+    parts, spans, end, length = [], set(), 0, 0
+    for match in _QUOTED_TAG_MARK.finditer(rendered):
+        text = rendered[end : match.start()]
+        tag = QUOTED_TAGS[int(match.group(1))]
+        length += len(text)
+        parts += [text, tag]
+        spans.add((length, length + len(tag)))
+        length += len(tag)
+        end = match.end()
+    parts.append(rendered[end:])
+    return "".join(parts), spans
 
 
 def _generation_prompt(probed, rendered, tokens):
@@ -267,6 +375,13 @@ class Frontend:
         # The served family's: how its output reasons and calls tools.
         self.chat_format = chat_format
         self.prompt_tokenizer = PromptTokenizer(tokenizer, chat_format.message_boundary)
+        # Quoted tags encode as text where the tokenizer gives offsets, as a
+        # fast one does; another encodes them as before.
+        self.quoted_tag_tokens = (
+            {tag: plain_tokens(tokenizer, tag) for tag in QUOTED_TAGS}
+            if getattr(tokenizer, "is_fast", False)
+            else None
+        )
         self.backend = backend
         # The model id the engine loaded. /status reports it, so an alias
         # can never hide what served a request (#81).
@@ -433,6 +548,18 @@ class Frontend:
                 ),
             },
         )
+        rendered, quoted = _unmark_quoted_tags(rendered)
+        # A quoted tag after an image marker moves as the pad replaces it.
+        marker_ends = [
+            match.end()
+            for match in re.finditer(re.escape(IMAGE_RENDER_MARKER), rendered)
+        ]
+        shift = len(IMAGE_PAD_TOKEN) - len(IMAGE_RENDER_MARKER)
+        quoted = {
+            (start + shift * moved, end + shift * moved)
+            for start, end in quoted
+            for moved in (bisect(marker_ends, start),)
+        }
         parts = rendered.split(IMAGE_RENDER_MARKER)
         image_offsets = set()
         offset = 0
@@ -441,17 +568,28 @@ class Frontend:
             image_offsets.add((offset, offset + len(IMAGE_PAD_TOKEN)))
             offset += len(IMAGE_PAD_TOKEN)
         rendered = IMAGE_PAD_TOKEN.join(parts)
+        tokens, positions = self._encode_quoting(rendered, quoted, image_offsets)
+        return tokens, positions, rendered
+
+    def _encode_quoting(self, rendered, quoted, image_offsets=frozenset()):
+        """The tokens of `rendered` with each tag at a span of `quoted` as the
+        tokens of its characters, and the indices of the image pads at
+        `image_offsets` among them."""
         encoded = self._tokenize(
             rendered,
             add_special_tokens=False,
             return_offsets_mapping=True,
         )
-        positions = [
-            index
-            for index, span in enumerate(encoded["offset_mapping"])
-            if tuple(span) in image_offsets
-        ]
-        return list(encoded["input_ids"]), positions, rendered
+        tokens, positions = [], []
+        for token, span in zip(encoded["input_ids"], encoded["offset_mapping"]):
+            span = tuple(span)
+            if span in quoted and self.quoted_tag_tokens is not None:
+                tokens.extend(self.quoted_tag_tokens[rendered[span[0] : span[1]]])
+                continue
+            if span in image_offsets:
+                positions.append(len(tokens))
+            tokens.append(token)
+        return tokens, positions
 
     def _image_token_count(self, prompt_tokens, prepared, positions):
         pad_id = self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN)
@@ -947,7 +1085,7 @@ class Frontend:
             **template_options(
                 reasoning_effort=prompt.reasoning_effort,
                 preserve_thinking=prompt.preserve_thinking,
-                tools=prompt.tools,
+                tools=_mark_quoted_tags(prompt.tools),
                 add_generation_prompt=add_generation_prompt,
                 enable_thinking=prompt.enable_thinking,
             ),
@@ -961,15 +1099,21 @@ class Frontend:
         if images and self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN) is None:
             raise APIError(400, "the tokenizer does not define the image pad token")
         positions = []
+        messages = _mark_quoted_messages(prompt.messages)
         try:
             if images:
                 tokens, positions, rendered = self._render_image_tokens(
-                    prompt.messages, template
+                    messages, template
                 )
             else:
-                rendered = self._apply_chat_template(prompt.messages, template)
-                with self.latencies.measure("tokenization"):
-                    tokens = self.prompt_tokenizer.encode(rendered)
+                rendered = self._apply_chat_template(messages, template)
+                rendered, quoted = _unmark_quoted_tags(rendered)
+                if quoted and self.quoted_tag_tokens is not None:
+                    # _tokenize measures the tokenization itself.
+                    tokens = self._encode_quoting(rendered, quoted)[0]
+                else:
+                    with self.latencies.measure("tokenization"):
+                        tokens = self.prompt_tokenizer.encode(rendered)
         except APIError:
             raise
         except Exception as error:
