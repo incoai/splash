@@ -69,6 +69,9 @@ OPTIONS = {
         {effort: effort for effort in serve_options.REASONING_EFFORTS},
         ("", "turbo", "XHIGH"),
     ),
+    "--reasoning": values(
+        "--reasoning", {"auto": "auto", "off": "off"}, ("on", "none", "")
+    ),
     "--thinking-token-budget": values(
         "--thinking-token-budget", {"0": 0, "4096": 4096}, ("-1", "1.5", "many")
     ),

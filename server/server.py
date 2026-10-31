@@ -1858,6 +1858,7 @@ def main():
             announce_served_name=args.announce_served_name,
             default_reasoning_effort=args.default_reasoning_effort,
             default_thinking_token_budget=args.thinking_token_budget,
+            reasoning=args.reasoning,
             vision=readiness.vision,
         )
         server.app = app

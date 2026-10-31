@@ -20,6 +20,9 @@ from .http_security import validate_api_key
 from .protocol import MAX_THINKING_END_TOKENS
 
 REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+# --reasoning: auto lets each request decide, off never reasons, as
+# llama-server's --reasoning off.
+REASONING_MODES = ("auto", "off")
 # The targets' native window, the most context without --max-context, and
 # the most context --max-context takes, which YaRN stretches the native window
 # to and Qwen validates (QwenTargetDimensions::nativeContextTokens,
@@ -319,6 +322,12 @@ def parse_api_key(value):
         raise argparse.ArgumentTypeError(str(error)) from None
 
 
+def parse_reasoning_mode(value):
+    if value not in REASONING_MODES:
+        raise argparse.ArgumentTypeError(f"must be one of {', '.join(REASONING_MODES)}")
+    return value
+
+
 def parse_reasoning_effort(value):
     if value not in REASONING_EFFORTS:
         raise argparse.ArgumentTypeError(
@@ -597,6 +606,18 @@ SERVE_OPTIONS = (
             "it first in /v1/models; /status keeps the loaded model ID (needs "
             "--served-model-name)",
         ),
+    ),
+    ServeOption(
+        "--reasoning",
+        "api",
+        dict(
+            type=parse_reasoning_mode,
+            metavar="MODE",
+            help="off: no request reasons, whatever its reasoning_effort, "
+            "Messages thinking or enable_thinking asks; auto: each request "
+            "decides (default: SPLASH_REASONING, else auto)",
+        ),
+        environment="SPLASH_REASONING",
     ),
     ServeOption(
         "--default-reasoning-effort",

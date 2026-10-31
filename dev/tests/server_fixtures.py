@@ -786,6 +786,7 @@ def main_args(**overrides):
             "served_model_name": [],
             "announce_served_name": False,
             "default_reasoning_effort": None,
+            "reasoning": None,
             "thinking_token_budget": None,
             "thinking_end_text": None,
             "max_context": None,
