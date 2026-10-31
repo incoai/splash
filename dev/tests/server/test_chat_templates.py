@@ -220,6 +220,21 @@ class ChatTemplateProbeTests(unittest.TestCase):
                     "generation prompt 1 token",
                 )
 
+    def test_the_close_of_thinking_is_probed(self):
+        # As the template writes it after a reply's reasoning, the close a
+        # thinking budget ends with by default.
+        for name, close in (
+            ("qwen36", "\n</think>"),
+            ("qwen36_gguf", "\n</think>"),
+            ("qwen38", "\n</think>"),
+            ("qwen38_gguf", "\n</think>"),
+            ("flint", "</think>"),
+        ):
+            with self.subTest(name=name):
+                templates = ChatTemplates(tokenizer(source(name)))
+                self.assertEqual(templates.select(None).thinking_end, close)
+        self.assertIsNone(ChatTemplates(tokenizer(BY_EFFORT)).select(None).thinking_end)
+
     def test_original_templates_reject_or_drop_what_the_patch_renders(self):
         for name in UPSTREAM:
             with self.subTest(name=name):

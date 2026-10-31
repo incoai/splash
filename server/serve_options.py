@@ -631,7 +631,8 @@ SERVE_OPTIONS = (
             help="text that ends thinking where a thinking budget runs out, such "
             "as a sentence that turns to the answer, then </think> as its last "
             f"token; at most {MAX_THINKING_END_TOKENS} tokens (default: "
-            "SPLASH_THINKING_END_TEXT, else </think> alone)",
+            "SPLASH_THINKING_END_TEXT, else the close the chat template writes "
+            "after a reasoning)",
         ),
         environment="SPLASH_THINKING_END_TEXT",
     ),

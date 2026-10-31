@@ -14,6 +14,9 @@ from server import protocol as native_wire
 from server import server as api
 from server.origins import ANY_ORIGIN
 
+# Templates whose probe found no close of thinking: the close alone ends it.
+NO_THINKING_END = {"return_value.select.return_value.thinking_end": None}
+
 
 class ServerMainTests(unittest.TestCase):
     def test_sigterm_uses_the_normal_main_cleanup_path(self):
@@ -59,7 +62,7 @@ class ServerMainTests(unittest.TestCase):
                 api.AutoTokenizer, "from_pretrained", return_value=tokenizer
             ),
             mock.patch.object(api, "validate_tokenizer"),
-            mock.patch.object(api, "ChatTemplates"),
+            mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
             mock.patch.object(
                 api.engine_runtime, "MultiplexedRuntime", return_value=runtime
             ) as runtime_type,
@@ -127,7 +130,9 @@ class ServerMainTests(unittest.TestCase):
                         api.AutoTokenizer, "from_pretrained", return_value=object()
                     ),
                     mock.patch.object(api, "validate_tokenizer"),
-                    mock.patch.object(api, "ChatTemplates") as templates_type,
+                    mock.patch.object(
+                        api, "ChatTemplates", **NO_THINKING_END
+                    ) as templates_type,
                     mock.patch.object(
                         api.engine_runtime,
                         "MultiplexedRuntime",
@@ -192,7 +197,7 @@ class ServerMainTests(unittest.TestCase):
                         api.AutoTokenizer, "from_pretrained", return_value=object()
                     ),
                     mock.patch.object(api, "validate_tokenizer"),
-                    mock.patch.object(api, "ChatTemplates"),
+                    mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
                     mock.patch.object(
                         api.engine_runtime, "MultiplexedRuntime", return_value=runtime
                     ),
@@ -245,7 +250,7 @@ class ServerMainTests(unittest.TestCase):
                         api.AutoTokenizer, "from_pretrained", return_value=object()
                     ),
                     mock.patch.object(api, "validate_tokenizer"),
-                    mock.patch.object(api, "ChatTemplates"),
+                    mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
                     mock.patch.object(
                         api.engine_runtime,
                         "MultiplexedRuntime",
@@ -282,7 +287,7 @@ class ServerMainTests(unittest.TestCase):
                 api.AutoTokenizer, "from_pretrained", return_value=object()
             ),
             mock.patch.object(api, "validate_tokenizer"),
-            mock.patch.object(api, "ChatTemplates"),
+            mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
             mock.patch.object(
                 api.engine_runtime, "MultiplexedRuntime", return_value=runtime
             ),
@@ -375,7 +380,7 @@ class ServerMainTests(unittest.TestCase):
                 api.assembly, "family", return_value=families.named("Qwen3.8-27B")
             ),
             mock.patch.object(api, "validate_tokenizer"),
-            mock.patch.object(api, "ChatTemplates"),
+            mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
             mock.patch.object(
                 api.engine_runtime, "MultiplexedRuntime", side_effect=start
             ) as runtime_type,

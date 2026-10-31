@@ -835,6 +835,7 @@ class ServedFamilyTests(unittest.TestCase):
                 api.AutoTokenizer, "from_pretrained", return_value=tokenizer
             ),
             mock.patch.object(api, "validate_tokenizer") as validate,
+            mock.patch.object(api, "thinking_end_tokens", return_value=None),
             mock.patch.object(api, "ChatTemplates"),
             mock.patch.object(
                 api.engine_runtime, "MultiplexedRuntime", return_value=runtime

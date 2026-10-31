@@ -1811,6 +1811,13 @@ def main():
         )
         chat_templates = ChatTemplates(tokenizer)
         print_status(f"Chat template · {chat_templates.describe()}")
+        # Unset, a budget ends thinking as the template closes it, so that the
+        # reply renders back as it was generated and the next request resumes
+        # at the state where it ended.
+        if thinking_end is None:
+            thinking_end = thinking_end_tokens(
+                tokenizer, chat_templates.select(None).thinking_end, family.chat_format
+            )
         runtime = engine_runtime.MultiplexedRuntime(
             _native_command(args, model_root),
             relaunch_command=lambda first: _native_command(

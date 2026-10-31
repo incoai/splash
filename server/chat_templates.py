@@ -46,6 +46,7 @@ from jinja2 import Environment, TemplateError, TemplateSyntaxError, nodes
 from jinja2.ext import Extension
 from jinja2.lexer import Token
 
+from .chat_format import THINK_END
 from .lru import LRUCache, memoized
 from .serve_options import REASONING_EFFORTS
 
@@ -169,6 +170,9 @@ class ChatTemplate:
     # effort each renders like (_reasoning).
     reasoning: dict
     effort_names: dict
+    # What the template writes from a reasoning's end through its close, such
+    # as Qwen's line break and </think>; None where the probe found none.
+    thinking_end: str | None
 
     def accepts(self, messages):
         """Whether requests with these normalized messages are served: a
@@ -302,7 +306,34 @@ def _prepare(render, encode, source):
         _generation_prompts(render, encode, source),
         probe,
         *_reasoning(render, source),
+        _thinking_end(render, source),
     )
+
+
+def _thinking_end(render, source):
+    """What the template writes from the end of a reply's reasoning through
+    its close: the close alone, or after line breaks, as Qwen's templates
+    write one. A reply whose thinking a budget ended renders back as it was
+    generated only where the budget ends it so. None where the template
+    renders no reasoning in a turn, or writes more than line breaks."""
+    rendered = _outcome(
+        render,
+        source,
+        [_SYSTEM, _ASK, _CALL, _RESULT],
+        template_options(
+            reasoning_effort=None,
+            preserve_thinking=None,
+            tools=_TOOLS,
+            add_generation_prompt=False,
+        ),
+    )
+    reasoning = _CALL["reasoning_content"]
+    start = rendered.find(reasoning) if isinstance(rendered, str) else -1
+    end = rendered.find(THINK_END, start) if start >= 0 else -1
+    if end < 0:
+        return None
+    between = rendered[start + len(reasoning) : end]
+    return between + THINK_END if between.strip(" \n") == "" else None
 
 
 # Probe conversations. Leading system messages are already merged, as request
