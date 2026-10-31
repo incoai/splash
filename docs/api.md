@@ -518,7 +518,10 @@ source/rendering budget and the native 64-image limit (one image per page).
 Model context and isolated rendering limits also apply. URL inputs, `file_id`,
 opening passwords and citations are unsupported. PDFs render one at a time: a
 request waits for its turn and renders without holding any of the server's
-preparation capacity, so other requests prepare meanwhile.
+preparation capacity, so other requests prepare meanwhile. Each renders in a
+process of its own, with no environment variables, sandboxed to read only the
+system's libraries and fonts and Splash's runtime, and to write nothing, reach
+no network and start no program.
 
 A model served with `--language-only` refuses both with 400 ([vision](models.md#vision)).
 

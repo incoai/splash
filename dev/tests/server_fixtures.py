@@ -1187,12 +1187,26 @@ def openai_client(harness):
 
 
 def pdf_bytes(
-    text="ALPHA 42", *, pages=1, width=200, height=200, encrypted=False, padding_bytes=0
+    text="ALPHA 42",
+    *,
+    pages=1,
+    width=200,
+    height=200,
+    encrypted=False,
+    padding_bytes=0,
+    font=None,
 ):
+    """A PDF of `pages` pages, each with `text`, a PDF string's contents, in
+    Helvetica; or, with `font`, in that TrueType font, which the PDF names in
+    WinAnsiEncoding without embedding it, so that PDFium looks it up among
+    the system's fonts and `text` can escape characters beyond ASCII."""
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"",
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+        if font is None
+        else f"<< /Type /Font /Subtype /TrueType /BaseFont /{font} "
+        "/Encoding /WinAnsiEncoding >>".encode(),
     ]
     kids = []
     for index in range(pages):

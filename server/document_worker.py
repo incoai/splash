@@ -1,9 +1,12 @@
-"""Run PDFium in a disposable process with supervised memory and time budgets."""
+"""Run PDFium in a disposable, sandboxed process with supervised memory and
+time budgets."""
 
 import atexit
 import ctypes
+import functools
 import json
 import math
+import os
 import resource
 import subprocess
 import sys
@@ -19,6 +22,45 @@ MAX_SECONDS = 30.0
 MAX_MEMORY_BYTES = 1024 * 1024 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 POLL_SECONDS = 0.01
+# The folder that holds the server package: the worker runs there, so that -m
+# imports the package however the server was started.
+ROOT = Path(__file__).resolve().parents[1]
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+# sandbox-exec's status (EX_OSERR) when it cannot apply the profile or start
+# the interpreter, as inside another sandbox; the worker never exits with it.
+SANDBOX_FAILED = 71
+# PDFium parses whatever PDF a request sends, which a model may have fetched
+# from the web, so the worker runs under a profile that refuses all that
+# rendering does without: it reads the system's libraries and fonts (PDFium
+# names ~/Library/Fonts too, but never expands it), the interpreter and the
+# server package, and nothing of the user's; it writes only to the descriptors
+# it is given, and reaches no network, no service and no other program. Of the
+# sysctls it reads those os.uname() needs. The rest it tries (the time zone,
+# the locale's data, the user database, the log) is refused and changes
+# nothing it writes: the pages are byte-identical outside the sandbox. No
+# profile refuses kern.procargs2, which tells any process of the user
+# another's arguments and the environment it started with, the server's
+# included. _sandbox() adds the interpreter's prefixes, which it reads, and
+# the symbolic links on the way to them.
+PROFILE = """(version 1)
+(deny default)
+(allow process-exec (literal (param "PYTHON")))
+(allow sysctl-read
+  (sysctl-name "hw.machine")
+  (sysctl-name "kern.hostname")
+  (sysctl-name "kern.osrelease")
+  (sysctl-name "kern.ostype")
+  (sysctl-name "kern.version"))
+(allow file-read*
+  (literal "/") ; the interpreter aborts as it starts without it
+  (subpath "/System")
+  (subpath "/usr/lib")
+  (subpath "/Library/Fonts")
+  (literal (param "ROOT"))
+  (subpath (param "SERVER")))
+"""
+# The most symbolic links the kernel follows in resolving a path (MAXSYMLINKS).
+MAX_LINKS = 32
 _workers = set()
 _workers_lock = threading.Lock()
 
@@ -76,32 +118,100 @@ def _close_workers():
         _stop(process)
 
 
+def _links(path):
+    """The symbolic links that resolving the absolute `path` follows."""
+    links = []
+    resolved = Path("/")
+    pending = list(Path(path).parts[1:])
+    while pending and len(links) < MAX_LINKS:
+        part = pending.pop(0)
+        if part == "..":
+            resolved = resolved.parent
+            continue
+        candidate = resolved / part
+        if not candidate.is_symlink():
+            resolved = candidate
+            continue
+        links.append(candidate)
+        target = Path(os.readlink(candidate))
+        if target.is_absolute():
+            resolved = Path("/")
+            pending[:0] = target.parts[1:]
+        else:
+            pending[:0] = target.parts
+    return links
+
+
+@functools.cache
+def _sandbox():
+    """sandbox-exec's command that runs the interpreter under PROFILE.
+
+    The kernel checks a path the worker opens by its real path, and each
+    symbolic link it follows to get there as a read of the link: a venv's
+    interpreter is one, and a folder on the way to it or to a prefix may be
+    one. So the profile lets it read its prefixes by their real paths and
+    the links on the way to them, and start the interpreter's real file.
+    Paths go in as parameters, which need no quoting; -- ends the options."""
+    prefixes = (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
+    links = [link for path in (sys.executable, *prefixes) for link in _links(path)]
+    parameters = {
+        "PYTHON": os.path.realpath(sys.executable),
+        "ROOT": str(ROOT),
+        "SERVER": str(ROOT / "server"),
+    }
+    profile = [PROFILE]
+    for operation, kind, name, paths in (
+        ("file-read*", "subpath", "PREFIX", map(os.path.realpath, prefixes)),
+        ("file-read-metadata", "literal", "LINK", map(str, links)),
+    ):
+        filters = []
+        for index, path in enumerate(dict.fromkeys(paths)):
+            parameters[f"{name}{index}"] = path
+            filters.append(f'\n  ({kind} (param "{name}{index}"))')
+        # An allow without a filter allows the operation everywhere.
+        if filters:
+            profile.append(f"(allow {operation}{''.join(filters)})\n")
+    return [
+        SANDBOX_EXEC,
+        *(f"-D{name}={value}" for name, value in parameters.items()),
+        "-p",
+        "".join(profile),
+        "--",
+    ]
+
+
+def _start(arguments, source, output):
+    """The interpreter, started with `arguments` as the worker starts: under
+    the sandbox, in ROOT, and with no environment, so that no secret of the
+    server's, such as SPLASH_API_KEY, reaches a process parsing untrusted
+    PDFs. With -E and -s, neither the environment nor the user's
+    site-packages decides what it imports; with -B it writes no bytecode,
+    which the profile would refuse."""
+    return subprocess.Popen(
+        [*_sandbox(), sys.executable, "-E", "-s", "-B", *arguments],
+        stdin=source,
+        stdout=output,
+        stderr=subprocess.DEVNULL,
+        cwd=ROOT,
+        env={},
+    )
+
+
 def render(payload, limits, remaining):
     """Render a PDF in a worker within the `remaining` seconds of its request,
     infinite when it has no deadline, and the worker's own time limit."""
     duration = min(MAX_SECONDS, remaining)
     deadline = time.monotonic() + duration
-    command = [
-        sys.executable,
-        "-m",
-        "server.document_worker",
-        json.dumps(limits),
-        str(duration),
-    ]
     # TemporaryFile is private and unlinked. File-backed transport also lets
     # the child enforce its output limit without blocking on a pipe reader.
     with tempfile.TemporaryFile() as source, tempfile.TemporaryFile() as output:
         source.write(payload)
         source.seek(0)
         try:
-            # From the directory that holds the server package, so the worker
-            # imports it however the server was started.
-            process = subprocess.Popen(
-                command,
-                stdin=source,
-                stdout=output,
-                stderr=subprocess.DEVNULL,
-                cwd=Path(__file__).resolve().parents[1],
+            process = _start(
+                ["-m", "server.document_worker", json.dumps(limits), str(duration)],
+                source,
+                output,
             )
         except OSError:
             raise APIError(
@@ -131,6 +241,10 @@ def render(payload, limits, remaining):
                     process.wait(timeout=POLL_SECONDS)
                 except subprocess.TimeoutExpired:
                     pass
+            if process.returncode == SANDBOX_FAILED:
+                raise APIError(
+                    503, "document worker could not start", "document_unavailable"
+                )
             if process.returncode != 0:
                 raise APIError(
                     400, "PDF processing failed or exceeded its resource limit"

@@ -235,9 +235,10 @@ def serve(args):
         os.environ["HF_HUB_OFFLINE"] = "1"
     if sys.dont_write_bytecode:
         # A child inherits the environment, not -B: every Python program
-        # serve starts, down to the server's PDF workers, writes no bytecode
-        # either, so a runtime inside a signed app never gains __pycache__
-        # folders, which break its signature.
+        # serve starts writes no bytecode either (the server's PDF workers,
+        # started with no environment, have -B of their own), so a runtime
+        # inside a signed app never gains __pycache__ folders, which break
+        # its signature.
         os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     # Keep both locks across exec until the foreground server exits.
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
