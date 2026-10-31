@@ -68,7 +68,7 @@ from .errors import (
     RequestValidationError,
     field_error,
 )
-from .frontend import Frontend
+from .frontend import Frontend, sampling_defaults
 from .http_security import (
     OriginRefused,
     RefusedOriginLog,
@@ -1673,6 +1673,11 @@ def parse_args(argv=None):
     serve_options.add_serve_arguments(parser)
     args = parser.parse_args(argv)
     serve_options.check_serve_arguments(parser, args)
+    # Before the engine loads, not when the frontend is built after it.
+    try:
+        sampling_defaults(args.sampling_default)
+    except ValueError as error:
+        parser.error(f"--sampling-default: {error}")
     if not 0 <= args.port <= 65535:
         parser.error("--port must be in [0, 65535]")
     return args
@@ -1851,6 +1856,7 @@ def main():
             announce_served_name=args.announce_served_name,
             default_reasoning_effort=args.default_reasoning_effort,
             default_thinking_token_budget=args.thinking_token_budget,
+            sampling_default=args.sampling_default,
             vision=readiness.vision,
         )
         server.app = app

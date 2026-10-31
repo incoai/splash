@@ -256,6 +256,49 @@ class SamplingTests(HarnessTestCase):
                     job = app.prepare(chat_body(seed=seed), deadline=FOREVER)
                     self.assertEqual(job.seed, expected)
 
+    def sampling_frontend(self, **options):
+        tokenizer = FakeTokenizer()
+        backend = backend_api.NativeBackend(
+            FakeRuntime(), tokenizer, lambda _record: None
+        )
+        self.addCleanup(backend.close)
+        return make_frontend(
+            tokenizer, backend, "test-model", 128, 1, 2, vision=True, **options
+        )
+
+    def test_sampling_defaults_fill_the_fields_a_request_leaves_out(self):
+        app = self.sampling_frontend(
+            sampling_default=[
+                ("temperature", 0.6),
+                ("top_k", 40),
+                ("presence_penalty", 1.5),
+            ]
+        )
+        body = chat_body()
+        body.pop("temperature")
+        sampling = app.prepare(body, deadline=FOREVER).sampling
+        self.assertEqual(
+            (sampling.temperature, sampling.top_k, sampling.presence_penalty),
+            (0.6, 40, 1.5),
+        )
+        # A request's own value wins over the default.
+        sampling = app.prepare(chat_body(temperature=0.2), deadline=FOREVER).sampling
+        self.assertEqual(sampling.temperature, 0.2)
+        self.assertEqual(sampling.top_k, 40)
+
+    def test_the_last_sampling_default_of_a_name_wins(self):
+        app = self.sampling_frontend(
+            sampling_default=[("temperature", 0.6), ("temperature", 0.9)]
+        )
+        body = chat_body()
+        body.pop("temperature")
+        self.assertEqual(app.prepare(body, deadline=FOREVER).sampling.temperature, 0.9)
+
+    def test_sampling_defaults_are_checked_when_the_frontend_is_built(self):
+        for pairs in ([("temperature", 5.0)], [("top_k", -2)]):
+            with self.subTest(pairs=pairs), self.assertRaises(ValueError):
+                self.sampling_frontend(sampling_default=pairs)
+
 
 if __name__ == "__main__":
     unittest.main()
