@@ -13,9 +13,12 @@
   --tertiary: -apple-system-tertiary-label;
   --quaternary: -apple-system-quaternary-label;
   --separator: -apple-system-separator;
-  /* Fills WebKit doesn't name, as shares of the quaternary label color: the user's messages,
-     inline code (the tertiary system fill), a button under the pointer. */
-  --bubble: color-mix(in srgb, var(--quaternary) 70%, transparent);
+  /* The mark's color (Color.splash in Mark.swift), the app's one accent: the user's messages are
+     tinted with it. */
+  --splash: color(display-p3 0.055 0.604 0.588);
+  --bubble: color-mix(in srgb, var(--splash) 11%, transparent);
+  /* Fills WebKit doesn't name, as shares of the quaternary label color: inline code (the tertiary
+     system fill), a button under the pointer. */
   --fill: color-mix(in srgb, var(--quaternary) 48%, transparent);
   --hover: color-mix(in srgb, var(--quaternary) 75%, transparent);
   /* The system's link color, which WebKit's isn't. */
@@ -26,7 +29,11 @@
 }
 
 @media (prefers-color-scheme: dark) {
-  :root { --link: rgb(65 156 255); }
+  :root {
+    --link: rgb(65 156 255);
+    --splash: color(display-p3 0.345 0.902 0.878);
+    --bubble: color-mix(in srgb, var(--splash) 14%, transparent);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -189,8 +189,9 @@ private struct InkCircle: ButtonStyle {
         configuration.label
             .foregroundStyle(.background)
             .frame(width: 28, height: 28)
-            .background(.primary, in: .circle)
-            .opacity(isEnabled ? (configuration.isPressed ? 0.7 : 1) : 0.4)
+            // The mark's color while it sends or stops, the app's one accent; gray while it can't.
+            .background(isEnabled ? AnyShapeStyle(Color.splash) : AnyShapeStyle(.tertiary), in: .circle)
+            .opacity(configuration.isPressed ? 0.7 : 1)
     }
 }
 
