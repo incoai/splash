@@ -599,6 +599,17 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--sampling-headers",
+        "api",
+        dict(
+            action="store_true",
+            default=False,
+            help="read per-request sampling from the X-Temperature, "
+            "X-Presence-Penalty and X-Repetition-Penalty headers, for clients "
+            "such as Claude Code that cannot set sampling fields in the body",
+        ),
+    ),
+    ServeOption(
         "--default-reasoning-effort",
         "api",
         dict(

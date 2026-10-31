@@ -256,6 +256,111 @@ class SamplingTests(HarnessTestCase):
                     job = app.prepare(chat_body(seed=seed), deadline=FOREVER)
                     self.assertEqual(job.seed, expected)
 
+    def test_sampling_headers_set_the_fields_they_name(self):
+        headers = {
+            "X-Temperature": "0.5",
+            "X-Presence-Penalty": " 1.5 ",
+            "X-Repetition-Penalty": "1.1",
+        }
+        # The temperature header overrides the body, the penalties only fill.
+        body = request_frontend.sampling_from_headers(
+            headers, {"temperature": 0.9, "presence_penalty": 0.25}
+        )
+        self.assertEqual(
+            body,
+            {"temperature": 0.5, "presence_penalty": 0.25, "repetition_penalty": 1.1},
+        )
+        body = request_frontend.sampling_from_headers(headers, {})
+        self.assertEqual(
+            body,
+            {"temperature": 0.5, "presence_penalty": 1.5, "repetition_penalty": 1.1},
+        )
+
+    def test_sampling_headers_outside_their_range_or_unparsable_are_ignored(self):
+        for header, value in (
+            ("X-Temperature", "0"),
+            ("X-Temperature", "2.5"),
+            ("X-Temperature", "-0.5"),
+            ("X-Temperature", "nan"),
+            ("X-Temperature", "inf"),
+            ("X-Temperature", "warm"),
+            ("X-Temperature", ""),
+            ("X-Presence-Penalty", "2.5"),
+            ("X-Presence-Penalty", "-2.5"),
+            ("X-Presence-Penalty", "nan"),
+            ("X-Presence-Penalty", "high"),
+            ("X-Repetition-Penalty", "0"),
+            ("X-Repetition-Penalty", "3.5"),
+            ("X-Repetition-Penalty", "nan"),
+            ("X-Repetition-Penalty", "many"),
+        ):
+            with self.subTest(header=header, value=value):
+                body = request_frontend.sampling_from_headers(
+                    {header: value}, {"temperature": 0.7}
+                )
+                self.assertEqual(body, {"temperature": 0.7})
+
+    def test_sampling_headers_accept_a_plain_dict(self):
+        body = request_frontend.sampling_from_headers(
+            {"x-temperature": "0.3"}, {"temperature": 0.9}
+        )
+        # A plain dict is case-sensitive, so only the exact name is read.
+        self.assertEqual(body, {"temperature": 0.9})
+        body = request_frontend.sampling_from_headers(
+            {"X-Temperature": 0.3, "X-Repetition-Penalty": 2}, {}
+        )
+        self.assertEqual(body, {"temperature": 0.3, "repetition_penalty": 2.0})
+
+    def test_messages_keep_the_penalties_of_sampling_headers(self):
+        headers = {
+            "X-Temperature": "0.5",
+            "X-Presence-Penalty": "1.5",
+            "X-Repetition-Penalty": "1.1",
+        }
+        runtime = FakeRuntime()
+        harness = self.harness(runtime, sampling_headers=True)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/messages",
+            anthropic_body(temperature=0.9),
+            headers={"Content-Type": "application/json", **headers},
+        )
+        self.assertEqual(status, 200, payload)
+        sampling = runtime.requests[0].frame.sampling
+        self.assertEqual(
+            (
+                sampling.temperature,
+                sampling.presence_penalty,
+                sampling.repetition_penalty,
+            ),
+            (0.5, 1.5, 1.1),
+        )
+
+    def test_sampling_headers_are_off_unless_asked_for(self):
+        runtime = FakeRuntime()
+        harness = self.harness(runtime)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/messages",
+            anthropic_body(),
+            headers={
+                "Content-Type": "application/json",
+                "X-Presence-Penalty": "1.5",
+                "X-Repetition-Penalty": "1.1",
+                "X-Temperature": "0.5",
+            },
+        )
+        self.assertEqual(status, 200, payload)
+        sampling = runtime.requests[0].frame.sampling
+        self.assertEqual(
+            (
+                sampling.temperature,
+                sampling.presence_penalty,
+                sampling.repetition_penalty,
+            ),
+            (0.0, 0.0, 1.0),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

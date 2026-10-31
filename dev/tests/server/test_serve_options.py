@@ -216,6 +216,7 @@ OPTIONS = {
         ("", "two words", "key\n", "非ASCII"),
     ),
     "--allow-idle-sleep": ([(["--allow-idle-sleep"], True)], []),
+    "--sampling-headers": ([(["--sampling-headers"], True)], []),
     "--no-webui": ([(["--no-webui"], True)], []),
 }
 
