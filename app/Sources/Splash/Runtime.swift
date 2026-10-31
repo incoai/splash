@@ -99,15 +99,6 @@ struct Runtime: Sendable {
         return (try? JSONDecoder().decode(Owner.self, from: data))?.pid
     }
 
-    /// Whether `pid` runs this runtime's Python.
-    func runsPython(_ pid: pid_t) -> Bool {
-        var path = [UInt8](repeating: 0, count: Int(MAXPATHLEN))
-        let length = proc_pidpath(pid, &path, UInt32(path.count))
-        guard length > 0 else { return false }
-        return URL(filePath: String(decoding: path.prefix(Int(length)), as: UTF8.self)).resolvingSymlinksInPath()
-            == python.resolvingSymlinksInPath()
-    }
-
     /// Why this Mac cannot run Splash, or nil when it can: the engine's own check, which the
     /// launcher repeats before every start.
     func unsupportedReason() -> String? {

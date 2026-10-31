@@ -45,6 +45,7 @@ final class Installer {
 
     private let runtime: Runtime
     private var child: ChildProcess?
+    private let record = ChildRecord(key: Preference.installerPID)
     private var tail: LogTail?
     private var cancelled = false
     private var firstError: String?
@@ -87,7 +88,7 @@ final class Installer {
             self.model = nil
             return
         }
-        UserDefaults.standard.set(Int(child!.pid), forKey: Preference.installerPID)
+        record.keep(child!)
         tail = LogTail(Self.log) { [weak self] in self?.received($0) }
         // A download takes long; the Mac must not sleep through it.
         activity = ProcessInfo.processInfo.beginActivity(
@@ -114,10 +115,7 @@ final class Installer {
     /// Stops the download this app started before it quit or crashed, if it still runs; its record
     /// stays until then, for the next launch should this one end first.
     func stopLeftover() async {
-        let pid = pid_t(UserDefaults.standard.integer(forKey: Preference.installerPID))
-        defer { UserDefaults.standard.removeObject(forKey: Preference.installerPID) }
-        guard pid > 0, runtime.runsPython(pid) else { return }
-        await stopProcessGroup(pid)
+        await record.stopLeftover()
     }
 
     private func received(_ line: String) {
@@ -148,7 +146,7 @@ final class Installer {
         tail?.finish()
         tail = nil
         child = nil
-        UserDefaults.standard.removeObject(forKey: Preference.installerPID)
+        record.forget()
         activity.map(ProcessInfo.processInfo.endActivity)
         activity = nil
         guard let model else { return }

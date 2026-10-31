@@ -106,6 +106,7 @@ final class Server {
     private let runtime: Runtime
     private let log: URL
     private var child: ChildProcess?
+    private let record = ChildRecord(key: Preference.serverPID)
     private var tail: LogTail?
     private var stopRequested = false
     private var firstError: String?
@@ -156,16 +157,11 @@ final class Server {
         if child != nil { stop() } else { phase = .stopped }
     }
 
-    /// Stops the server this app started before it quit or crashed, if it still serves, and waits
-    /// until it has given its port and memory back; its record stays until then, for the next
-    /// launch should this one end first.
+    /// Stops the server an app started before it quit or crashed, if it still serves, and waits
+    /// until it has given its port and memory back. It stops by itself once that app has ended
+    /// (`SPLASH_APP_PID`); this stops one that has not yet, or that an older app started.
     func stopLeftover() async {
-        let defaults = UserDefaults.standard
-        let pid = pid_t(defaults.integer(forKey: Preference.serverPID))
-        let port = defaults.integer(forKey: Preference.serverPort)
-        defer { defaults.removeObject(forKey: Preference.serverPID) }
-        guard pid > 0, runtime.serveLockOwner(port: port) == pid, runtime.runsPython(pid) else { return }
-        await stopProcessGroup(pid)
+        await record.stopLeftover()
     }
 
     private func launch(_ model: String, settings: ServeSettings) {
@@ -189,9 +185,12 @@ final class Server {
         stepSince = .now
         phase = .starting
         do {
+            // It stops as Ctrl+C stops it once this app has ended, a crash too, giving its memory
+            // back then rather than at the app's next launch.
             child = try ChildProcess(
                 command: runtime.command(settings.serveArguments(model: model)),
-                environment: runtime.environment.merging(settings.environment) { $1 },
+                environment: runtime.environment.merging(settings.environment) { $1 }
+                    .merging(["SPLASH_APP_PID": String(getpid())]) { $1 },
                 log: log,
                 exited: { [weak self] in self?.exited($0) }
             )
@@ -201,8 +200,7 @@ final class Server {
         }
         tail = LogTail(log) { [weak self] in self?.received($0) }
         let pid = child!.pid
-        UserDefaults.standard.set(Int(pid), forKey: Preference.serverPID)
-        UserDefaults.standard.set(settings.port, forKey: Preference.serverPort)
+        record.keep(child!)
         watch = Task { [weak self] in await self?.follow(pid) }
     }
 
@@ -230,7 +228,7 @@ final class Server {
         tail = nil
         child = nil
         watch?.cancel()
-        UserDefaults.standard.removeObject(forKey: Preference.serverPID)
+        record.forget()
         if let queued {
             self.queued = nil
             launch(queued.model, settings: queued.settings)

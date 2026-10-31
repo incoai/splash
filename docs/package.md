@@ -83,7 +83,10 @@ as it starts. Its launch options are every option `splash serve` takes but the
 ones of one model (`--revision`, `--draft-model`, `--mmproj`) and the ones it
 sets itself, from one table (`LaunchOption.all`) the tests hold to `splash
 serve --help`; the API key reaches the server as `SPLASH_API_KEY`, from the
-Keychain, and nothing starts while the Keychain does not give it. It serves
+Keychain, and nothing starts while the Keychain does not give it. The server
+stops as Ctrl+C stops it once the app has ended, by a crash too, since the app
+passes its process ID as `SPLASH_APP_PID`; the app's next launch stops one an
+older app left, by the process ID and start time it keeps. It serves
 model files on this Mac the user adds with `splash serve --model local/NAME
 --model-dir PATH`, NAME being the file's or folder's name made a repository
 name, and at launch it runs `install/cached.py`. While a model runs, the Server

@@ -7,6 +7,8 @@ import Foundation
 /// if the app quits or crashes.
 final class ChildProcess: @unchecked Sendable {
     let pid: pid_t
+    /// When it started (`processStart`), which tells it apart from a later process given its ID.
+    let started: Int?
     private let exitSource: DispatchSourceProcess
 
     /// Starts `command` with `environment`, standard input from /dev/null and standard output and
@@ -52,6 +54,7 @@ final class ChildProcess: @unchecked Sendable {
         let status = posix_spawn(&pid, command[0], &actions, &attributes, argv, envp)
         guard status == 0 else { throw POSIXError(.init(rawValue: status) ?? .EIO) }
         self.pid = pid
+        started = processStart(pid)
 
         exitSource = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .main)
         exitSource.setEventHandler { [exitSource] in
@@ -111,6 +114,41 @@ final class LogTail {
             if !text.isEmpty { line(text) }
         }
     }
+}
+
+/// A program this app started, as the defaults keep it for the next launch should this one end
+/// without stopping it: its process ID and when it started. Together they name it whichever copy
+/// of the app started it, and never a later process given the same ID.
+struct ChildRecord {
+    let key: String
+
+    /// Keeps `child` as the program this record names.
+    func keep(_ child: ChildProcess) {
+        guard let started = child.started else { return forget() }
+        UserDefaults.standard.set([Int(child.pid), started], forKey: key)
+    }
+
+    func forget() {
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+
+    /// Stops the program kept, if it still runs, and forgets it once it has ended; one still
+    /// running stays kept, for the launch after.
+    func stopLeftover() async {
+        guard let kept = UserDefaults.standard.array(forKey: key) as? [Int], kept.count == 2,
+              let pid = pid_t(exactly: kept[0])
+        else { return forget() }
+        if processStart(pid) == kept[1] { await stopProcessGroup(pid) }
+        if processStart(pid) != kept[1] { forget() }
+    }
+}
+
+/// When process `pid` started, in microseconds since 1970, or nil where no such process runs.
+func processStart(_ pid: pid_t) -> Int? {
+    var info = proc_bsdinfo()
+    let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+    guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+    return Int(info.pbi_start_tvsec) * 1_000_000 + Int(info.pbi_start_tvusec)
 }
 
 /// Stops the process group `pid` leads, as `ChildProcess.signal` would, when this app no longer

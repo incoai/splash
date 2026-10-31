@@ -272,6 +272,43 @@ struct ServerTests {
     }
 }
 
+/// A program the app started, kept for the next launch: stopped then, whichever copy of the app
+/// started it, and never a later process given its ID.
+@MainActor
+struct ChildRecordTests {
+    @Test func stopsTheProgramItKeepsAndForgetsIt() async throws {
+        let record = ChildRecord(key: "test.child.\(UUID().uuidString)")
+        defer { record.forget() }
+        let log = FileManager.default.temporaryDirectory.appending(path: "child-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: log) }
+        let child = try ChildProcess(command: ["/bin/sleep", "60"], environment: [:], log: log) { _ in }
+        #expect(child.started != nil)
+        record.keep(child)
+        await record.stopLeftover()
+        #expect(processStart(child.pid) == nil)
+        #expect(UserDefaults.standard.object(forKey: record.key) == nil)
+    }
+
+    @Test func leavesAnotherProcessWithTheIDAlone() async throws {
+        let record = ChildRecord(key: "test.child.\(UUID().uuidString)")
+        defer { record.forget() }
+        let log = FileManager.default.temporaryDirectory.appending(path: "child-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: log) }
+        let other = try ChildProcess(command: ["/bin/sleep", "60"], environment: [:], log: log) { _ in }
+        defer { other.signal(SIGKILL) }
+        // Kept with another start: an earlier process that had the ID, or a record an older app
+        // kept as the ID alone.
+        UserDefaults.standard.set([Int(other.pid), try #require(other.started) - 1], forKey: record.key)
+        await record.stopLeftover()
+        #expect(processStart(other.pid) != nil)
+        #expect(UserDefaults.standard.object(forKey: record.key) == nil)
+        UserDefaults.standard.set(Int(other.pid), forKey: record.key)
+        await record.stopLeftover()
+        #expect(processStart(other.pid) != nil)
+        #expect(UserDefaults.standard.object(forKey: record.key) == nil)
+    }
+}
+
 struct AgentTests {
     @Test func runsInTheFolderPickedWithTheServersKey() {
         let runtime = Runtime(root: URL(filePath: "/opt/splash"))

@@ -12,6 +12,7 @@ import select
 import signal
 import socket
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -1752,6 +1753,31 @@ def _interrupt(_signum, _frame):
     raise KeyboardInterrupt
 
 
+def _stop_with(pid):
+    """Interrupts the server, as Ctrl+C does, once process `pid` has ended.
+
+    The desktop app passes its own process ID as SPLASH_APP_PID, so a model
+    it started gives its memory back when the app crashes, rather than at
+    the app's next launch. A process already gone stops the server at once.
+    """
+
+    def watch():
+        queue = select.kqueue()
+        exited = select.kevent(
+            pid,
+            filter=select.KQ_FILTER_PROC,
+            flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+            fflags=select.KQ_NOTE_EXIT,
+        )
+        try:
+            queue.control([exited], 1, None)
+        except ProcessLookupError:
+            pass
+        os.kill(os.getpid(), signal.SIGINT)
+
+    threading.Thread(target=watch, name="stop-with-app", daemon=True).start()
+
+
 def main():
     args = parse_args()
     server = None
@@ -1766,6 +1792,8 @@ def main():
         # The launcher blocks both across its exec: one sent while this module
         # imported arrives here and ends the startup cleanly.
         signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
+        if app := os.environ.get("SPLASH_APP_PID"):
+            _stop_with(int(app))
         _raise_descriptor_limit()
         # Bind before loading the tokenizer or model so duplicates fail early.
         # Activate only after the runtime is ready, keeping a partially started

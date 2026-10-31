@@ -12,10 +12,9 @@ enum Preference {
     static let efforts = "efforts"
     /// The launch options set, by flag (`ServeSettings`).
     static let launchOptions = "launchOptions"
-    /// The server and the download the app runs, kept until they exit, to stop them on the next
-    /// launch should the app quit without stopping them.
+    /// The server and the download the app runs (`ChildRecord`), kept until they exit, to stop
+    /// them on the next launch should the app quit without stopping them.
     static let serverPID = "serverPID"
-    static let serverPort = "serverPort"
     static let installerPID = "installerPID"
 }
 
