@@ -156,6 +156,12 @@ void testServerCommandLines(const char *path) {
       {"verify_rows_all", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::All; }},
       // Auto is the engine's default, which the server leaves out.
       {"verify_rows_auto", [](NativeArguments &) {}},
+      // Off is the engine's default, which the server leaves out.
+      {"copyspec_mode_off", [](NativeArguments &) {}},
+      {"copyspec_mode_conservative",
+       [](NativeArguments &read) {
+         read.copyspecMode = model::CopySpecMode::Conservative;
+       }},
       // A relaunch keeps the first engine's context; with --max-context,
       // which every start holds, its command is the first one's.
       {"relaunch", [](NativeArguments &read) { read.relaunchContext = 61433; }},
@@ -203,7 +209,7 @@ void testServerCommandLines(const char *path) {
            read.neuralEngine == meant.neuralEngine && read.pleMemory == meant.pleMemory &&
            read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
            read.kvSpillAlways == meant.kvSpillAlways && read.kvWindowTrim == meant.kvWindowTrim &&
-           read.verifyRows == meant.verifyRows;
+           read.verifyRows == meant.verifyRows && read.copyspecMode == meant.copyspecMode;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -235,6 +241,19 @@ void testVerifyRows() {
   require(parse(model, {"auto", "auto"}).verifyRows == model::VerifyRows::Auto &&
               parse(model, {"auto", "auto", "--verify-rows", "auto"}).verifyRows == model::VerifyRows::Auto,
           "--verify-rows auto was not the engine's rule");
+}
+
+// --copyspec-mode off, the engine's rule, is what the server leaves out;
+// conservative opts a request's decode cycles into copying its own earlier
+// tokens.
+void testCopySpecMode() {
+  const ModelDirectory model;
+  require(parse(model, {"auto", "auto"}).copyspecMode == model::CopySpecMode::Off &&
+              parse(model, {"auto", "auto", "--copyspec-mode", "off"})
+                      .copyspecMode == model::CopySpecMode::Off &&
+              parse(model, {"auto", "auto", "--copyspec-mode", "conservative"})
+                      .copyspecMode == model::CopySpecMode::Conservative,
+          "--copyspec-mode did not reach the arguments as given");
 }
 
 // The stores' memory is the planner's unless set, which the server writes
@@ -290,6 +309,9 @@ void testRefusals() {
   refuses({"auto", "auto", "--ane", "gpu"}, "--ane requires on or off");
   for (const char *rows : {"budget", "every", "ALL", ""})
     refuses({"auto", "auto", "--verify-rows", rows}, "--verify-rows requires auto or all");
+  for (const char *mode : {"on", "none", "Conservative", "", "auto"})
+    refuses({"auto", "auto", "--copyspec-mode", mode},
+            "--copyspec-mode requires off or conservative");
   // The server passes bytes, auto or off.
   for (const char *size : {"0", "2G", "OFF", ""})
     refuses({"auto", "auto", "--ple-memory", size}, "--ple-memory requires a positive byte count, auto or off");
@@ -384,6 +406,7 @@ int main(int argc, char **argv) {
     testServerCommandLines(argv[1]);
     testNeuralEngine();
     testVerifyRows();
+    testCopySpecMode();
     testStreamedMemoryAndSpill();
     testWindowTrim();
     testRefusals();

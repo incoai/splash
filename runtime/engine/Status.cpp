@@ -571,6 +571,11 @@ std::string runtimeStatusJson(
       << ",\"drafted_tokens\":" << metrics.draftedTokens
       << ",\"accepted_draft_tokens\":" << metrics.acceptedDraftTokens
       << ",\"draft_acceptance_rate\":" << metrics.draftAcceptanceRate
+      // Decode cycles whose draft block a prompt-lookup copy filled
+      // (model::ModelTelemetry::copyspecHits) and the draft tokens those
+      // blocks proposed.
+      << ",\"copyspec_hits\":" << executorTelemetry.copyspecHits
+      << ",\"copyspec_tokens\":" << executorTelemetry.copyspecTokens
       << ",\"capacity_failures\":" << metrics.capacityFailures
       << ",\"metal_failures\":" << metrics.metalFailures
       << ",\"current_prefill_batch\":";

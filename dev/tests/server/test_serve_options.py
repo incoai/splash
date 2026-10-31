@@ -87,6 +87,11 @@ OPTIONS = {
         {"auto": "auto", "all": "all"},
         ("", "budget", "every", "ALL"),
     ),
+    "--copyspec-mode": values(
+        "--copyspec-mode",
+        {"off": "off", "conservative": "conservative"},
+        ("", "on", "none", "Conservative", "auto"),
+    ),
     "--ple-memory": values(
         "--ple-memory",
         {

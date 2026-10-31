@@ -711,6 +711,18 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--copyspec-mode",
+        "requests",
+        dict(
+            choices=("off", "conservative"),
+            default="off",
+            help="prompt-lookup drafting of a request's own earlier tokens, "
+            "off unless asked for: off never copies, conservative copies until "
+            "a copied block verifies nothing, which stops copying for the rest "
+            "of the request (default: off)",
+        ),
+    ),
+    ServeOption(
         "--allow-idle-sleep",
         "requests",
         dict(

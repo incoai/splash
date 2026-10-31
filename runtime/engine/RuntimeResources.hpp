@@ -9,6 +9,7 @@
 #include "engine/MemoryGovernor.hpp"
 #include "engine/KvPageTier.hpp"
 #include "ops/PageStorage.hpp"
+#include "model/CopySpec.hpp"
 #include "model/KvBlockCache.hpp"
 #include "model/KvHistoryStream.hpp"
 #include "model/ModelFactory.hpp"
@@ -161,6 +162,10 @@ struct RuntimeResourcesConfig {
   // (model::budgetsVerifyRows); a benchmark round verifies every row so that
   // rounds repeat one another.
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // --copyspec-mode: whether a request's decode cycles may draft by copying
+  // the request's own earlier tokens (model::CopySpecMode); off unless asked
+  // for, so a benchmark round's outputs repeat one another.
+  model::CopySpecMode copyspecMode = model::CopySpecMode::Off;
   // The prefill FFN's Neural Engine split (startAneFfn): off with
   // --disable-ane, and a benchmark round runs the split of the first so that
   // rounds repeat one another.
@@ -324,7 +329,7 @@ private:
                    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
                    std::unique_ptr<model::KvBlockCache> blockCache,
                    std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
-                   model::VerifyRows verifyRows);
+                   model::VerifyRows verifyRows, model::CopySpecMode copyspecMode);
   // Takes back the restore points the last process left in a persistent
   // tier (Cache::adopt) and opens its files for this one.
   void adoptPersistentCache();
@@ -358,6 +363,8 @@ private:
   bool spillAlways_ = false;
   // --verify-rows, which modelContext() passes on.
   model::VerifyRows verifyRows_ = model::VerifyRows::Auto;
+  // --copyspec-mode, which modelContext() passes on.
+  model::CopySpecMode copyspecMode_ = model::CopySpecMode::Off;
   // Ends a probation once it has lasted, unless the process stops first.
   std::thread probation_;
   std::mutex probationMutex_;

@@ -415,6 +415,16 @@ void reportVerifyRows(const model::LoadedModel &loaded, model::VerifyRows rows) 
             " is dense).");
 }
 
+// The prompt-lookup copying a request's decode cycles may draft with
+// (--copyspec-mode), and what each mode means.
+void reportCopySpecMode(model::CopySpecMode mode) {
+  if (mode == model::CopySpecMode::Off)
+    logLine("Decode cycles never copy a request's own earlier tokens (--copyspec-mode off).");
+  else
+    logLine("Decode cycles may copy a request's own earlier tokens to draft (--copyspec-mode "
+            "conservative): a copied block that verifies nothing stops copying for the request.");
+}
+
 // Why a target's long requests keep their KV in memory, empty when they
 // spill.
 std::string spillOffReason(const model::ModelDescriptor &model, const kv::Layout &layout,
@@ -589,7 +599,7 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
     std::unique_ptr<model::KvBlockCache> blockCache,
     std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
-    model::VerifyRows verifyRows)
+    model::VerifyRows verifyRows, model::CopySpecMode copyspecMode)
     : persistentCache_(std::move(persistentCache)),
       backend_(std::move(backend)), readers_(std::move(readers)), model_(std::move(model)),
       operators_(std::move(operators)),
@@ -601,7 +611,8 @@ RuntimeResources::RuntimeResources(
       cache_(std::move(cache)), aneFfn_(std::move(aneFfn)),
       blockCache_(std::move(blockCache)), historyStream_(std::move(historyStream)),
       releasableMemory_({model_.images.get(), model_.expertStore()}, idleSplit(aneFfn_.get())),
-      aneFfnOutcome_(std::move(aneFfnOutcome)), spillAlways_(spillAlways), verifyRows_(verifyRows) {}
+      aneFfnOutcome_(std::move(aneFfnOutcome)), spillAlways_(spillAlways), verifyRows_(verifyRows),
+      copyspecMode_(copyspecMode) {}
 
 std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config,
@@ -966,6 +977,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   }
   reportStreamedStores(loaded, streamable, config.expertMemory, config.pleMemory);
   reportVerifyRows(loaded, config.verifyRows);
+  reportCopySpecMode(config.copyspecMode);
   // The model's side of the split (startAneFfn).
   const AneFfnModel splitModel =
       aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled);
@@ -1159,7 +1171,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         std::move(memoryGovernor), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(disk.space), std::move(kvPool), std::move(cache),
         std::move(aneFfn.split), std::move(aneFfn.outcome), std::move(blockCache),
-        std::move(historyStream), config.kvSpillAlways, config.verifyRows));
+        std::move(historyStream), config.kvSpillAlways, config.verifyRows,
+        config.copyspecMode));
     result->adoptPersistentCache();
     return result;
   } catch (const RuntimeResourcesError &) {
@@ -1286,6 +1299,7 @@ model::RuntimeContext RuntimeResources::modelContext() noexcept {
       blockCache_.get(),
       historyStream_.get(),
       verifyRows_,
+      copyspecMode_,
   };
 }
 
