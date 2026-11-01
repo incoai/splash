@@ -345,6 +345,43 @@ class SandboxTests(unittest.TestCase):
         # Without the links, sandbox-exec cannot start it.
         self.assertEqual(refused, (document_worker.SANDBOX_FAILED, b""))
 
+    def test_a_framework_interpreter_starts_its_app(self):
+        # Homebrew's and python.org's interpreter is a launcher that resolves
+        # its folder and starts the framework's Python.app, as CI's does;
+        # Homebrew's prefix is a link (/opt/homebrew/opt), and the kernel
+        # checks what starts by its real path.
+        document_worker._sandbox.cache_clear()
+        self.addCleanup(document_worker._sandbox.cache_clear)
+        with tempfile.TemporaryDirectory() as folder:
+            real = Path(os.path.realpath(folder), "Cellar", "Versions", "3.13")
+            app = real / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+            launcher = real / "bin" / "python3.13"
+            app.parent.mkdir(parents=True)
+            launcher.parent.mkdir()
+            app.touch()
+            launcher.touch()
+            Path(folder, "opt").symlink_to(real.parent.parent)
+            base = Path(folder, "opt", "Versions", "3.13")
+            with mock.patch.multiple(
+                sys, executable=str(base / "bin" / "python3.13"), base_prefix=str(base)
+            ):
+                command = document_worker._sandbox()
+        parameters = dict(
+            argument[2:].split("=", 1)
+            for argument in command
+            if argument.startswith("-D")
+        )
+        started = {
+            value for name, value in parameters.items() if name.startswith("PYTHON")
+        }
+        self.assertEqual(started, {str(launcher), str(app)})
+        # The folders by their real paths, the linked one where its link leads.
+        folders = {
+            value for name, value in parameters.items() if name.startswith("FOLDER")
+        }
+        self.assertLessEqual({str(launcher.parent), str(real), "/"}, folders)
+        self.assertNotIn(str(base / "bin"), folders)
+
     def test_a_sandbox_that_cannot_start_is_unavailable(self):
         refusing = [
             document_worker.SANDBOX_EXEC,

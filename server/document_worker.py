@@ -43,11 +43,10 @@ SANDBOX_FAILED = 71
 # included, and the kernel checks it as process-info-pidinfo, which (deny
 # default) leaves open and (deny process-info*) refuses. Of itself it may
 # learn all: PDFium asks as it loads a page, and stops the worker (SIGTRAP)
-# when refused. _sandbox() adds the interpreter's prefixes, which it reads,
-# and the symbolic links on the way to them.
+# when refused. _sandbox() adds the interpreter, which it starts, its
+# prefixes, which it reads, and the symbolic links on the way to them.
 PROFILE = """(version 1)
 (deny default)
-(allow process-exec (literal (param "PYTHON")))
 (allow sysctl-read
   (sysctl-name "hw.machine")
   (sysctl-name "kern.hostname")
@@ -56,6 +55,7 @@ PROFILE = """(version 1)
   (sysctl-name "kern.version"))
 (allow file-read*
   (literal "/") ; the interpreter aborts as it starts without it
+  (literal "/dev/urandom") ; its seed, where it was built without getentropy
   (subpath "/System")
   (subpath "/usr/lib")
   (subpath "/Library/Fonts")
@@ -156,11 +156,29 @@ def _sandbox():
     interpreter is one, and a folder on the way to it or to a prefix may be
     one. So the profile lets it read its prefixes by their real paths and
     the links on the way to them, and start the interpreter's real file.
-    Paths go in as parameters, which need no quoting; -- ends the options."""
+    A framework build's interpreter, Homebrew's and python.org's, is a
+    launcher: it resolves the folder it was started from, which takes the
+    metadata of each folder on the way, and starts the interpreter in the
+    framework's Python.app. Paths go in as parameters, which need no
+    quoting; -- ends the options."""
     prefixes = (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
     links = [link for path in (sys.executable, *prefixes) for link in _links(path)]
+    app = Path(sys.base_prefix, "Resources/Python.app/Contents/MacOS/Python")
+    # By their real paths, which the kernel checks: Homebrew's prefix is a link.
+    interpreters = [
+        os.path.realpath(path) for path in (sys.executable, app) if Path(path).is_file()
+    ]
+    # The kernel checks each folder by its real path, the links on the way
+    # apart (links): a folder reached through a link, as /var is, is checked
+    # where the link leads.
+    folders = {
+        str(folder)
+        for path in (sys.executable, os.path.realpath(sys.executable))
+        for parent in Path(path).parents
+        for real in [Path(os.path.realpath(parent))]
+        for folder in (real, *real.parents)
+    }
     parameters = {
-        "PYTHON": os.path.realpath(sys.executable),
         "ROOT": str(ROOT),
         "SERVER": str(ROOT / "server"),
     }
@@ -178,8 +196,10 @@ def _sandbox():
 
     profile = (
         PROFILE
+        + allow("process-exec", "literal", "PYTHON", interpreters)
         + allow("file-read*", "subpath", "PREFIX", map(os.path.realpath, prefixes))
         + allow("file-read-metadata", "literal", "LINK", map(str, links))
+        + allow("file-read-metadata", "literal", "FOLDER", sorted(folders))
     )
     return [
         SANDBOX_EXEC,
