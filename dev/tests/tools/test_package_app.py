@@ -73,7 +73,7 @@ class PackageAppTests(unittest.TestCase):
     def test_the_resource_bundle_is_the_one_the_app_reads(self):
         # SwiftPM names it after the package and its target, and the app looks
         # for it by that name in Contents/Resources.
-        source = (package_app.ROOT / "app/Sources/Splash/Transcript.swift").read_text()
+        source = (package_app.ROOT / "app/Sources/Splash/WebPage.swift").read_text()
         name, extension = package_app.RESOURCE_BUNDLE.rsplit(".", 1)
         self.assertIn(
             f'Bundle.main.url(forResource: "{name}", withExtension: "{extension}")',
