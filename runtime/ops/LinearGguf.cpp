@@ -550,8 +550,12 @@ bool Linear::sixteenRowLane(LinearWorkload w, uint32_t splits, std::span<const P
              return p && ggufBaseline({w.matrix, w.rows}, std::span(&p, 1)).sixteenRows;
            });
   if (!projections.empty()) shape = projections.front()->shape();
+  // Measured on the 20-core M5 Pro: the existing 16-row storage tile also
+  // improves one unsplit lane at exactly 4.5 stored bits per weight. Keep
+  // this in the shared allocation/dispatch rule, after the gate/up check
+  // above, so both tensors of a pair reserve the rows its kernel reads.
   return family_ == GpuFamilyClass::Apple10 && w.rows == SPLASH_TARGET_VERIFY_ROWS && splits == 1 &&
-         shape.underFourAndHalfBits();
+         (shape.underFourAndHalfBits() || (gpuCores_ == 20 && shape.weightBits16 == 72));
 }
 
 LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, bool registerFormats) const {
