@@ -2,6 +2,7 @@
 
 #include <dispatch/dispatch.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -12,6 +13,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace splash::ane {
 namespace {
@@ -172,6 +174,14 @@ void Handoff::queue(uint64_t ready, uint64_t done, const Start &start) {
 }
 
 std::optional<AwakeClock::duration> Handoff::finish() {
+  std::optional<std::vector<AwakeClock::duration>> each = finishEach();
+  if (!each) return std::nullopt;
+  AwakeClock::duration ran{};
+  for (const AwakeClock::duration &job : *each) ran += job;
+  return ran;
+}
+
+std::optional<std::vector<AwakeClock::duration>> Handoff::finishEach() {
   State &state = *state_;
   std::unique_lock lock(state.mutex);
   const auto settled = [&] {
@@ -186,15 +196,20 @@ std::optional<AwakeClock::duration> Handoff::finish() {
     for (auto &[id, job] : state.jobs)
       if (job.phase != Phase::Succeeded)
         state.overrun(job.phase, "an evaluation did not report within " + seconds(state.bound) + " s of its command");
-  std::optional<AwakeClock::duration> ran = AwakeClock::duration{};
+  // Job ids rise in the order queue() took the jobs.
+  std::vector<std::pair<uint64_t, AwakeClock::duration>> jobs;
+  std::optional<std::vector<AwakeClock::duration>> ran = std::vector<AwakeClock::duration>{};
   for (const auto &[id, job] : state.jobs) {
     if (job.phase != Phase::Succeeded) {
       ran.reset();
       break;
     }
-    *ran += job.ran;
+    jobs.emplace_back(id, job.ran);
   }
   state.jobs.clear();
+  if (!ran) return ran;
+  std::ranges::sort(jobs);
+  for (const auto &[id, duration] : jobs) ran->push_back(duration);
   return ran;
 }
 

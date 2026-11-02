@@ -268,3 +268,80 @@ kernel void ane_ffn_join(device bfloat *output [[buffer(0)]],
     output[index] = bfloat(float(output[index]) + staged[position.x][j] * scale[j]);
   }
 }
+
+// A mixer's projection split by output channel, in tiles as ane_ffn_join's:
+// tiles over the GPU's channels copy its part's rows into their columns; the
+// ANE's transpose its channel-major partial and take each token's input scale
+// in fp32, into the columns their range maps to. With Residual, either adds
+// the residual's value in fp32. Each output rounds to bf16 once. A partial
+// value or token scale of a row of the chunk that is not finite sets
+// `status`. Every range holds whole tiles, so no tile straddles two.
+template <bool Residual>
+inline void ane_proj_join_tile(device bfloat *output, device const bfloat *gpu_part, device const half *partial,
+                               device const half *token_scale, device atomic_uint *status,
+                               device const bfloat *residual, constant AneProjJoinParams &params, uint2 tile,
+                               uint2 position, threadgroup float (&staged)[ANE_FFN_TILE][ANE_FFN_TILE + 1],
+                               threadgroup float (&scale)[ANE_FFN_TILE]) {
+  const uint row = tile.x * ANE_FFN_TILE, channel = tile.y * ANE_FFN_TILE;
+  const uint ane = channel - params.gpu, after = ane - params.length1;
+  const uint column = channel < params.gpu    ? channel
+                      : ane < params.length1  ? params.begin1 + ane
+                      : params.block_length   ? params.begin2 + (after / params.block_length) * params.block_stride +
+                                                  after % params.block_length
+                                              : params.begin2 + after;
+  const auto store = [&](uint j, float value) {
+    const uint index = (row + j) * params.width + column + position.x;
+    output[index] = bfloat(Residual ? float(residual[index]) + value : value);
+  };
+  if (channel < params.gpu) {
+    for (uint j = position.y; j < ANE_FFN_TILE; j += ANE_FFN_TILE_ROWS)
+      if (row + j < params.rows) store(j, float(gpu_part[(row + j) * params.gpu + channel + position.x]));
+    return;
+  }
+  const uint token = row + position.x;
+  const bool chunk = token < params.rows;
+  bool finite = true;
+  for (uint j = position.y; j < ANE_FFN_TILE; j += ANE_FFN_TILE_ROWS) {
+    const half value = partial[(ane + j) * params.stride + token];
+    finite &= !(chunk && ane_ffn_not_finite(value));
+    staged[j][position.x] = float(value);
+  }
+  if (position.y == 0) {
+    const half input = token_scale[token];
+    finite &= !(chunk && ane_ffn_not_finite(input));
+    scale[position.x] = float(input);
+  }
+  if (!finite) atomic_store_explicit(status, 1u, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint j = position.y; j < ANE_FFN_TILE; j += ANE_FFN_TILE_ROWS)
+    if (row + j < params.rows) store(j, staged[position.x][j] * scale[j]);
+}
+
+kernel void ane_proj_join(device bfloat *output [[buffer(0)]],
+                          device const bfloat *gpu_part [[buffer(1)]],
+                          device const half *partial [[buffer(2)]],
+                          device const half *token_scale [[buffer(3)]],
+                          device atomic_uint *status [[buffer(4)]],
+                          constant AneProjJoinParams &params [[buffer(5)]],
+                          uint2 tile [[threadgroup_position_in_grid]],
+                          uint2 position [[thread_position_in_threadgroup]]) {
+  threadgroup float staged[ANE_FFN_TILE][ANE_FFN_TILE + 1];
+  threadgroup float scale[ANE_FFN_TILE];
+  ane_proj_join_tile<false>(output, gpu_part, partial, token_scale, status, nullptr, params, tile, position, staged,
+                            scale);
+}
+
+kernel void ane_proj_join_residual(device bfloat *output [[buffer(0)]],
+                                   device const bfloat *gpu_part [[buffer(1)]],
+                                   device const half *partial [[buffer(2)]],
+                                   device const half *token_scale [[buffer(3)]],
+                                   device atomic_uint *status [[buffer(4)]],
+                                   device const bfloat *residual [[buffer(5)]],
+                                   constant AneProjJoinParams &params [[buffer(6)]],
+                                   uint2 tile [[threadgroup_position_in_grid]],
+                                   uint2 position [[thread_position_in_threadgroup]]) {
+  threadgroup float staged[ANE_FFN_TILE][ANE_FFN_TILE + 1];
+  threadgroup float scale[ANE_FFN_TILE];
+  ane_proj_join_tile<true>(output, gpu_part, partial, token_scale, status, residual, params, tile, position, staged,
+                           scale);
+}

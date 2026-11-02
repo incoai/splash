@@ -147,4 +147,123 @@ ChunkTimings Measurement::chunks(AneFfn &split) {
   return timings;
 }
 
+ProjectionBuffers projectionBuffers(ProjectionKind kind, const PrefillFfnBuffers &ffn,
+                                    const std::array<metal::MetalBuffer, 2> &hidden) {
+  if (kind == ProjectionKind::GdnOutput || kind == ProjectionKind::AttentionOutput)
+    return {ffn.intermediate, hidden[1], hidden[0], ffn.scratch};
+  return {ffn.normalized, ffn.intermediate, {}, ffn.scratch};
+}
+
+// Commands of all the layers of `layout`, as layer() times the FFN's. A split
+// layer follows the GPU alone's projection of the same layer, which stands in
+// for the mixer: an input projection's deferred columns are joined after it,
+// as after the scan or the attention, and an output projection's ANE part
+// idles as long before it. Each split layer stages the next one's rows, as
+// the FFN between them does in a prefill.
+double Measurement::projectionLayer(const ProjectionLayout &layout, const ProjectionBuffers &buffers, uint32_t rows,
+                                    AneFfn *split, double standIn) {
+  const auto count = static_cast<uint32_t>(layout.layers.size());
+  const auto alone = [&](metal::CommandGraph &graph, uint32_t index) {
+    if (buffers.residual)
+      linear_.addPrefillResidual(graph, buffers.input, *layout.layers[index], buffers.residual, buffers.output, rows,
+                                 buffers.scratch);
+    else
+      linear_.addPrefill(graph, buffers.input, *layout.layers[index], buffers.output, rows, buffers.scratch);
+  };
+  const bool deferred = split && split->projection(layout.kind)->deferred.count;
+  const auto command = [&] {
+    metal::CommandGraph graph;
+    if (split && !split->begin()) throw std::runtime_error("ANE FFN split stopped (" + split->reason() + ")");
+    for (uint32_t index = 0; index < count; ++index) {
+      alone(graph, index);
+      if (!split) continue;
+      if (deferred && index) split->addDeferredJoin(layout.kind, graph, buffers.output, rows);
+      split->addProjection(layout.kind, graph, index, buffers.input, buffers.output, rows, buffers.scratch,
+                           buffers.residual);
+      split->addNextProjectionWeights(graph);
+    }
+    if (deferred) split->addDeferredJoin(layout.kind, graph, buffers.output, rows);
+    const auto start = AwakeClock::now();
+    if (split) {
+      static_cast<void>(split->commit(graph, {}).wait());
+      if (!split->completed())
+        throw std::runtime_error(std::string("ANE split of the ") + projectionName(layout.kind) + " projections of " +
+                                 std::to_string(rows) + " rows failed (" + split->reason() + ")");
+    } else {
+      static_cast<void>(backend_.submitCommandAsync(graph.command()).wait());
+    }
+    return millisecondsSince(start) / count;
+  };
+  return usable(median(command) - standIn);
+}
+
+// As gpuPart(): commands of all the layers of `layout` and of the first
+// alone, whose difference cancels each command's fixed costs. The joins read
+// partial outputs the ANE does not write, whose status a later command must
+// not find.
+double Measurement::projectionGpuPart(const ProjectionLayout &layout, const ProjectionBuffers &buffers,
+                                      AneFfn &split) {
+  const bool deferred = split.projection(layout.kind)->deferred.count;
+  const auto command = [&](uint32_t count) {
+    return median([&] {
+      metal::CommandGraph graph;
+      if (!split.begin()) throw std::runtime_error("ANE FFN split stopped (" + split.reason() + ")");
+      for (uint32_t index = 0; index < count; ++index) {
+        split.encodeProjection(layout.kind, graph, index, buffers.input, buffers.output, AneFfn::kMaximumRows,
+                               buffers.scratch, buffers.residual, AneFfn::Parts::Gpu);
+        if (deferred)
+          split.encodeDeferredJoin(layout.kind, graph, buffers.output, AneFfn::kMaximumRows, AneFfn::Parts::Gpu);
+        split.addNextProjectionWeights(graph);
+      }
+      const auto start = AwakeClock::now();
+      static_cast<void>(backend_.submitCommandAsync(graph.command()).wait());
+      return millisecondsSince(start);
+    });
+  };
+  const auto count = static_cast<uint32_t>(layout.layers.size());
+  const double milliseconds = (command(count) - command(1)) / (count - 1);
+  *static_cast<uint32_t *>(split.memory_.status.contents()) = 0;
+  return usable(milliseconds);
+}
+
+ProjectionTimings Measurement::projection(AneFfn &split, const ProjectionLayout &layout) {
+  if (const char *reason = AneFfn::unsupportedProjections(layout)) throw std::invalid_argument(reason);
+  const ProjectionBuffers buffers = projectionBuffers(layout.kind, ffn_, hidden_);
+  AneFfn::fillNormalized(buffers.input);
+  if (buffers.residual) std::memset(buffers.residual.contents(), 0, buffers.residual.sizeBytes());
+  // A model of fewer layers times some twice.
+  ProjectionLayout sampled = layout;
+  sampled.layers.clear();
+  for (uint32_t index = 0; index < kSampledLayers; ++index)
+    sampled.layers.push_back(layout.layers[index * (layout.layers.size() - 1) / (kSampledLayers - 1)]);
+  constexpr uint32_t kRows = AneFfn::kMaximumRows;
+  const std::vector<uint32_t> rows = split.functionRowsOf();
+  ProjectionTimings timings;
+  timings.timings.gpuAlone = projectionLayer(sampled, buffers, kRows);
+  timings.gpu = {ChunkTimings::Gpu{rows.front(), projectionLayer(sampled, buffers, rows.front())},
+                 ChunkTimings::Gpu{rows.back(), projectionLayer(sampled, buffers, rows.back())}};
+  const auto measure = [&](double share) {
+    const uint32_t aneUnits = nearestUnits(share, layout.units);
+    split.addProjections(sampled, aneUnits, std::array{kRows});
+    try {
+      const Timing timing{static_cast<double>(aneUnits) / layout.units, projectionGpuPart(sampled, buffers, split),
+                          projectionLayer(sampled, buffers, kRows, &split, timings.timings.gpuAlone)};
+      split.removeProjections(layout.kind);
+      return timing;
+    } catch (...) {
+      // A split whose evaluations may still run keeps the kind, never to
+      // split it.
+      try {
+        split.removeProjections(layout.kind);
+      } catch (const std::logic_error &) {
+        split.projection(layout.kind)->lost = true;
+      }
+      throw;
+    }
+  };
+  timings.timings.low = measure(kTimedShares[0]);
+  timings.timings.high = measure(kTimedShares[1]);
+  return timings;
+}
+
 } // namespace splash::ops::ane_ffn

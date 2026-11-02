@@ -230,11 +230,28 @@ void addPrefillOutput(const ops::Linear &linear, metal::CommandGraph &graph, met
 
 } // namespace
 
+// A step the Neural Engine splits may split the mixer's input and output
+// projections too (ops::AneFfn::addProjection), each kind as calibrated. The
+// input projection's deferred columns are joined before the first gate that
+// reads them, after the scan or the attention the ANE computed them during.
 void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, BlockOutput output) const {
+  using ops::ane_ffn::ProjectionKind;
   const QwenTargetPrefillBuffers &b = step.buffers;
   const uint32_t layer = step.gdnLayer++;
-  operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked, step.rows,
-                                 b.linearScratch);
+  ops::AneFfn *ane = step.aneFfn;
+  bool joined = true;
+  if (ane && ane->projects(ProjectionKind::GdnInput, step.rows)) {
+    ane->addProjection(ProjectionKind::GdnInput, step.graph, layer, b.normalized, b.gdnPacked, step.rows,
+                       b.linearScratch);
+    joined = false;
+  } else {
+    operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.gdnPacked, step.rows,
+                                   b.linearScratch);
+  }
+  const auto joinGate = [&] {
+    if (!std::exchange(joined, true))
+      ane->addDeferredJoin(ProjectionKind::GdnInput, step.graph, b.gdnPacked, step.rows);
+  };
   for (const QwenTargetPrefillSequence &sequence : step.sequences) {
     const auto u16 = [&](const metal::MetalBuffer &buffer, uint32_t width) {
       return rowsOf<uint16_t>(buffer, sequence.rowBegin, sequence.rows, width);
@@ -254,10 +271,14 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
          mixer.timeBias, f32(b.gdnDecay, geometry_.gdnValueHeads), u16(b.gdnBeta, geometry_.gdnValueHeads),
          sequence.recurrentIn[layer], sequence.recurrentOut[layer], u16(b.recurrent, geometry_.attentionWidth),
          mixer.mixerNorm, u16(b.gdnHidden, geometry_.attentionWidth)},
-        geometry_.gdnShape(), sequence.rows, geometry_.stateLayout.format, mixer.outputHeadOrder, captures);
+        geometry_.gdnShape(), sequence.rows, geometry_.stateLayout.format, mixer.outputHeadOrder, captures, joinGate);
   }
-  addPrefillOutput(operators_.linear(), step.graph, b.gdnHidden, mixer.outputProjection, step.rows, b.linearScratch,
-                   std::move(output.rows), std::move(output.residual));
+  if (ane && output.residual && ane->projects(ProjectionKind::GdnOutput, step.rows))
+    ane->addProjection(ProjectionKind::GdnOutput, step.graph, layer, b.gdnHidden, std::move(output.rows), step.rows,
+                       b.linearScratch, std::move(output.residual));
+  else
+    addPrefillOutput(operators_.linear(), step.graph, b.gdnHidden, mixer.outputProjection, step.rows,
+                     b.linearScratch, std::move(output.rows), std::move(output.residual));
 }
 
 // A sequence with blocks attends through the lists of its tiles of rows,
@@ -281,8 +302,17 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
                            uint32_t width) {
     return rowsOf<float>(buffer, sequence.rowBegin, sequence.rows, width);
   };
-  operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.rows,
-                                 b.linearScratch);
+  using ops::ane_ffn::ProjectionKind;
+  ops::AneFfn *ane = step.aneFfn;
+  bool joined = true;
+  if (ane && ane->projects(ProjectionKind::AttentionInput, step.rows)) {
+    ane->addProjection(ProjectionKind::AttentionInput, step.graph, layer, b.normalized, b.fullPacked, step.rows,
+                       b.linearScratch);
+    joined = false;
+  } else {
+    operators_.linear().addPrefill(step.graph, b.normalized, mixer.inputProjection, b.fullPacked, step.rows,
+                                   b.linearScratch);
+  }
   for (size_t index = 0; index < step.sequences.size(); ++index) {
     const QwenTargetPrefillSequence &sequence = step.sequences[index];
     const uint64_t headBytes = uint64_t{sequence.attentionStride} * geometry_.attentionHeadDimension * sizeof(uint16_t);
@@ -307,13 +337,19 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
     ops::PagedAttention::addPrefill(step.graph, attended.kv, queries, attentionRows, b.attentionPartials,
                                     b.attentionStatistics, attended.table, sequence.chunk, plans[index],
                                     blocks.empty() ? ops::AttentionBlocks{} : blocks[index], mixer.sinks);
+    if (!std::exchange(joined, true))
+      ane->addDeferredJoin(ProjectionKind::AttentionInput, step.graph, b.fullPacked, step.rows);
     ops::PagedAttention::addPrefillGate(
         step.graph, u16Rows(b.fullPacked, sequence, geometry_.packedFullWidth), attentionRows,
         u16Rows(b.attentionHidden, sequence, geometry_.attentionWidth), sequence.rows, sequence.attentionStride,
         geometry_.attentionQueryHeads, geometry_.kvLayout);
   }
-  addPrefillOutput(operators_.linear(), step.graph, b.attentionHidden, mixer.outputProjection, step.rows,
-                   b.linearScratch, std::move(output.rows), std::move(output.residual));
+  if (ane && output.residual && ane->projects(ProjectionKind::AttentionOutput, step.rows))
+    ane->addProjection(ProjectionKind::AttentionOutput, step.graph, layer, b.attentionHidden, std::move(output.rows),
+                       step.rows, b.linearScratch, std::move(output.residual));
+  else
+    addPrefillOutput(operators_.linear(), step.graph, b.attentionHidden, mixer.outputProjection, step.rows,
+                     b.linearScratch, std::move(output.rows), std::move(output.residual));
 }
 
 ops::LinearInput QwenTarget::decodeInput(const ops::Projection &projection, uint32_t lanes) const {

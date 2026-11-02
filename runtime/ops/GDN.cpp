@@ -115,7 +115,7 @@ void requireStates(const GdnShape &shape, GdnStateStrides strides, uint32_t laye
 void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &backend,
                      GdnPrefillBuffers buffers, GdnShape shape, uint32_t tokens,
                      GdnStateFormat state, GdnHeadOrder order,
-                     std::span<const GdnPrefillCapture> captures) {
+                     std::span<const GdnPrefillCapture> captures, const std::function<void()> &beforeGate) {
   if (!tokens || !validFormat(state))
     throw std::invalid_argument("invalid GDN prefill geometry");
   const CompiledGdn &kernel = compiledGdn(shape);
@@ -180,6 +180,7 @@ void GDN::addPrefill(metal::CommandGraph &graph, const metal::MetalBackend &back
     recurrent = recurrentOut;
     begin = end;
   }
+  if (beforeGate) beforeGate();
   graph.add(gate, {buffers.recurrentRows, buffers.packed, buffers.mixerNorm.buffer, buffers.hidden},
             GDNGatePrefillParams{headFlags(shape, order)}, {uint64_t{tokens} * shape.valueHeads, 1, 1},
             {128, 1, 1});

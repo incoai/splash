@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace splash::ane {
 
@@ -67,6 +68,8 @@ public:
   // otherwise. Waits at most one bound for their reports: a job that has not
   // reported by then has failed. Forgets the command's jobs either way.
   [[nodiscard]] std::optional<AwakeClock::duration> finish();
+  // finish() job by job: each job's time in the order queue() took them.
+  [[nodiscard]] std::optional<std::vector<AwakeClock::duration>> finishEach();
   // The command will not be committed: retires with `reason`, forgets its
   // jobs, and waits at most one bound for the agent to report those it
   // started.

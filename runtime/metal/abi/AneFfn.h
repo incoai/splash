@@ -73,7 +73,29 @@ struct AneFfnJoinParams {
   uint32_t rows;
 };
 
+// A mixer's projection split by output channel (ane_proj_join): the
+// output's leading `gpu` columns from the GPU's part, rows of `gpu` values;
+// the ANE's channel a from partial[a][t] * token_scale[t] in fp32, at column
+// begin1 + a while a < length1, and past it, with b = a - length1, at
+// begin2 + b, or with block_length set at
+// begin2 + (b / block_length) * block_stride + b % block_length; for rows
+// t < rows; stride halves per channel of the partial; width is the output's
+// row length. With a residual, either part adds its row's value in fp32.
+struct AneProjJoinParams {
+  uint32_t width;
+  uint32_t gpu;
+  uint32_t stride;
+  uint32_t rows;
+  uint32_t begin1;
+  uint32_t length1;
+  uint32_t begin2;
+  uint32_t block_length;
+  uint32_t block_stride;
+  uint32_t reserved;
+};
+
 static_assert(sizeof(AneFfnRotateParams) == 4, "ANE FFN rotate parameters are 4 bytes");
 static_assert(sizeof(AneFfnPackParams) == 12, "ANE FFN pack parameters are 12 bytes");
 static_assert(sizeof(AneFfnWeightParams) == 28, "ANE FFN weight parameters are 28 bytes");
 static_assert(sizeof(AneFfnJoinParams) == 12, "ANE FFN join parameters are 12 bytes");
+static_assert(sizeof(AneProjJoinParams) == 40, "ANE projection join parameters are 40 bytes");
