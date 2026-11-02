@@ -78,6 +78,13 @@ public:
   // Whether the agent has reported every job it started, so that none of
   // them still runs.
   [[nodiscard]] bool idle() const;
+  // Whether it retired because a job ran past the bound, rather than failing.
+  [[nodiscard]] bool overran() const;
+  // A handoff retired by an overrun, once idle: starts over on a new event,
+  // as if just constructed, so a stall the agent recovered from (a slow
+  // report under memory pressure) stops it for a moment rather than for good.
+  // False, changing nothing, otherwise.
+  bool restart(metal::MetalBackend &backend);
   // Why the handoff retired, the first failure's; empty until it does.
   [[nodiscard]] std::string reason() const;
 

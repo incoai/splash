@@ -33,8 +33,10 @@ class Measurement;
 // (ane::Handoff). Any failure of the ANE's work stops the split for the life
 // of the process: finish() then reports the command's results unusable, and
 // the caller runs the chunk again on the GPU alone, which every later chunk
-// runs too. A split that loses to the GPU alone stops the same way, after a
-// command whose results are usable (setBreaker).
+// runs too. An evaluation that only ran late stops it until the ANE has
+// reported it, a few times at most, and the next command starts over. A split
+// that loses to the GPU alone stops for good, after a command whose results
+// are usable (setBreaker).
 class AneFfn final {
 public:
   // A chunk runs on the smallest of the program's functions that holds it,
@@ -272,6 +274,9 @@ private:
   // From a release() that unloaded the program until restore().
   bool released_ = false;
   bool warned_ = false;
+  // Restarts after a late evaluation so far (begin()).
+  uint32_t restarts_ = 0;
+  [[nodiscard]] bool restartable() const;
   uint64_t allocatedBytes_ = 0;
   // Destroyed first: it waits for the evaluations the ANE has not reported.
   ane::Handoff handoff_;

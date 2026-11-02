@@ -54,6 +54,12 @@ struct Handoff::State final {
     phase = Phase::Failed;
     retire(std::move(why));
   }
+  // Fails the job of `phase`, which ran or reported past the bound, with
+  // `why`; a handoff it retires is one restart() may start over. Under `mutex`.
+  void overrun(Phase &phase, std::string why) {
+    if (!retired) overran = true;
+    fail(phase, std::move(why));
+  }
 
   // The event reached the `ready` of job `id`: its bound starts.
   static void reached(std::shared_ptr<State> state, uint64_t id) noexcept {
@@ -78,7 +84,7 @@ struct Handoff::State final {
       std::lock_guard lock(state->mutex);
       const auto job = state->jobs.find(id);
       if (job != state->jobs.end() && job->second.phase == Phase::Started)
-        state->fail(job->second.phase, "an evaluation did not complete within " + seconds(state->bound) + " s");
+        state->overrun(job->second.phase, "an evaluation did not complete within " + seconds(state->bound) + " s");
     } catch (...) {
     }
   }
@@ -114,6 +120,7 @@ struct Handoff::State final {
   std::unordered_set<uint64_t> outstanding;
   uint64_t lastJob = 0;
   bool retired = false;
+  bool overran = false;
   std::string reason;
 };
 
@@ -178,7 +185,7 @@ std::optional<AwakeClock::duration> Handoff::finish() {
   if (!state.changed.wait_until(lock, AwakeClock::now() + state.bound, settled))
     for (auto &[id, job] : state.jobs)
       if (job.phase != Phase::Succeeded)
-        state.fail(job.phase, "an evaluation did not report within " + seconds(state.bound) + " s of its command");
+        state.overrun(job.phase, "an evaluation did not report within " + seconds(state.bound) + " s of its command");
   std::optional<AwakeClock::duration> ran = AwakeClock::duration{};
   for (const auto &[id, job] : state.jobs) {
     if (job.phase != Phase::Succeeded) {
@@ -212,6 +219,21 @@ bool Handoff::retired() const {
 bool Handoff::idle() const {
   std::lock_guard lock(state_->mutex);
   return state_->outstanding.empty();
+}
+
+bool Handoff::overran() const {
+  std::lock_guard lock(state_->mutex);
+  return state_->overran;
+}
+
+bool Handoff::restart(metal::MetalBackend &backend) {
+  {
+    std::lock_guard lock(state_->mutex);
+    if (!state_->retired || !state_->overran || !state_->outstanding.empty()) return false;
+  }
+  // Reports and notices still due on the old state find it alone.
+  state_ = std::make_shared<State>(backend.newSharedEvent(), state_->bound);
+  return true;
 }
 
 std::string Handoff::reason() const {

@@ -63,6 +63,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -482,8 +483,9 @@ Forward forward(MetalBackend &backend, const Linear &linear, const Model &model,
   const auto &[ffn, hidden] = chunk;
   std::memset(hidden[0].contents(), 0, hidden[0].sizeBytes());
   CommandGraph graph;
-  const bool splits = split && split->splits(rows);
+  // As the runtime does: begin() first, which may restart a split a late evaluation stopped.
   if (split) static_cast<void>(split->begin());
+  const bool splits = split && split->splits(rows);
   for (uint32_t layer = 0; layer < kLayers; ++layer) {
     const MetalBuffer &residual = hidden[layer & 1], &output = hidden[(layer & 1) ^ 1];
     if (splits)
@@ -780,6 +782,24 @@ void stops(MetalBackend &backend, const Linear &linear, const Model &model, cons
     fail(label + ": the GPU's forward after the split stopped differs from the GPU's alone");
 }
 
+// An evaluation that runs late stops the split, with its command's results unusable, until the Neural Engine has
+// reported it; the next command then starts over on the ANE and computes, bit for bit, what a split that never
+// stalled computes.
+void resumes(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
+  constexpr uint32_t kRows = AneFfn::kMaximumRows;
+  constexpr auto kDelay = std::chrono::milliseconds(3000);
+  const auto healthy = std::make_unique<AneFfn>(backend, model.layers, kAneUnits, nullptr);
+  const Forward expected = forward(backend, linear, model, healthy.get(), chunk, kRows);
+  ane::ProgramInstrumentation::arm({.delayedEvaluation = 2, .delay = kDelay});
+  const auto split = std::make_unique<AneFfn>(backend, model.layers, kAneUnits, nullptr);
+  if (forward(backend, linear, model, split.get(), chunk, kRows).usable || !split->retired())
+    fail("a late evaluation: the split did not stop");
+  std::this_thread::sleep_for(kDelay + std::chrono::milliseconds(500));
+  const Forward resumed = forward(backend, linear, model, split.get(), chunk, kRows);
+  if (!resumed.usable || split->retired()) fail("a late evaluation: the split did not resume: " + split->reason());
+  if (resumed.bits != expected.bits) fail("a late evaluation: the resumed split computes other values");
+}
+
 // A Neural Engine slower than the GPU alone: every evaluation starts a lag after its event reaches its wait, twice the
 // longer of the GPU alone's layer of its rows and the Neural Engine's own evaluation of them as timed here, so that on
 // a fast GPU as on a slow one the lag is most of the time the evaluations take and alone makes them take twice what
@@ -876,8 +896,9 @@ void faults(MetalBackend &backend) {
       {"a throwing enqueue", [](uint64_t at) { return Faults{.throwingEnqueue = at}; }, "could not start"},
       {"a failed evaluation", [](uint64_t at) { return Faults{.failingEvaluation = at}; }, "an evaluation failed"},
       {"a stalled evaluation", [](uint64_t at) { return Faults{.stalledEvaluation = at}; }, "did not complete"},
+      // Late enough not to report before stops() runs the GPU alone after it; resumes() lets one report.
       {"a late evaluation",
-       [](uint64_t at) { return Faults{.delayedEvaluation = at, .delay = std::chrono::milliseconds(3000)}; },
+       [](uint64_t at) { return Faults{.delayedEvaluation = at, .delay = std::chrono::milliseconds(10000)}; },
        "did not complete"},
       {"an infinite output", [](uint64_t at) { return Faults{.poisonedEvaluation = at}; }, "not finite"},
   };
@@ -888,6 +909,8 @@ void faults(MetalBackend &backend) {
               std::string(kind.name) + " at layer " + std::to_string(layer), count, kind.reason);
     section(std::string("faults: ") + kind.name + " at each layer of chunks of 512, 700 and 2048 rows");
   }
+  resumes(backend, linear, model, buffers);
+  section("faults: a late evaluation stops the split until it reports, and the next command resumes it");
 
   // A program that does not load again after the idle release.
   ane::ProgramInstrumentation::arm({.failingLoad = true});

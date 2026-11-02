@@ -63,6 +63,11 @@ constexpr auto kProgramLimit = std::chrono::seconds(120);
 // Mac still finishes, and one that stopped answering stops the split instead
 // of holding the engine longer.
 constexpr auto kReloadLimit = std::chrono::seconds(10);
+// How many times a split stopped by an evaluation that ran late starts over
+// once the Neural Engine has reported it: a stall a busy Mac recovers from
+// costs one chunk's rerun on the GPU, and one that keeps coming back stops
+// the split for good after the last.
+constexpr uint32_t kHandoffRestarts = 3;
 
 // The GPU's channels of `intermediate` with the ANE taking `aneUnits`.
 uint32_t gpuChannels(uint32_t intermediate, uint32_t aneUnits) {
@@ -504,6 +509,8 @@ void AneFfn::addWeights(metal::CommandGraph &graph, uint32_t layer, uint32_t set
   }
 }
 
+bool AneFfn::restartable() const { return handoff_.overran() && restarts_ < kHandoffRestarts; }
+
 bool AneFfn::begin() {
   // A command committed but never finished failed on the GPU, and the
   // evaluations it queued with it.
@@ -513,6 +520,10 @@ bool AneFfn::begin() {
   }
   jobs_.clear();
   nextLayer_ = 0;
+  if (handoff_.retired() && !released_ && restartable() && handoff_.restart(backend_)) {
+    warned_ = false;
+    logLine("Neural Engine split resumed after a late evaluation (", ++restarts_, " of ", kHandoffRestarts, ")");
+  }
   return !handoff_.retired();
 }
 
@@ -627,8 +638,8 @@ bool AneFfn::release() {
 }
 
 void AneFfn::restore() noexcept {
-  // A stopped split keeps its program unloaded.
-  if (!released_ || handoff_.retired()) return;
+  // A stopped split keeps its program unloaded, unless it may still restart.
+  if (!released_ || (handoff_.retired() && !restartable())) return;
   released_ = false;
   const auto start = AwakeClock::now();
   std::string failure = "an unknown exception";
@@ -648,7 +659,9 @@ void AneFfn::restore() noexcept {
 void AneFfn::warnStopped() {
   if (std::exchange(warned_, true)) return;
   logWarning("Neural Engine FFN split stopped (", handoff_.reason(),
-             "); the GPU runs the prefill FFN alone until the engine restarts.");
+             restartable() ? "); the GPU runs the prefill FFN alone until the Neural Engine reports the evaluation, "
+                             "then the split resumes."
+                           : "); the GPU runs the prefill FFN alone until the engine restarts.");
 }
 
 void AneFfn::queue(const Job &job) {
