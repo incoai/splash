@@ -49,6 +49,16 @@ struct VerifyRowsModel final {
   bool everyRow = true;
 };
 
+// A lane's block that a decode cycle fills without the draft (a prompt-lookup
+// copy, model::CopySpecIndex): its first `count` proposals and its
+// confidence at each of them, which the verify rows read as they read the
+// draft's. A count of 0 leaves the lane the draft's block.
+struct FixedProposals final {
+  uint32_t count = 0;
+  std::array<uint32_t, SPLASH_DRAFT_PROPOSAL_TOKENS> tokens{};
+  std::array<float, SPLASH_DRAFT_PROPOSAL_TOKENS> confidence{};
+};
+
 // The draft's selector codebooks, which score the edge from a proposal
 // position's predecessor candidate to each of its candidates.
 struct DraftCodebooks final {
@@ -78,6 +88,21 @@ public:
   static void addVerifyRows(metal::CommandGraph &graph, const metal::MetalBuffer &confidence,
                             const metal::MetalBuffer &verifyRows, const VerifyRowsModel &model,
                             std::span<const uint32_t> maximumRows);
+  // After add, or in its place where every lane's block is fixed, and before
+  // addVerifyRows: writes each lane's fixed proposals and their confidence
+  // over the draft's, in the cycle's command (the thinking end's proposal
+  // writer, decode_draft_thinking_cutoff, writes both rows). Lanes whose
+  // count is 0 keep the draft's block.
+  static void addFixedProposals(metal::CommandGraph &graph, std::span<const FixedProposals> lanes,
+                                const metal::MetalBuffer &proposedTokens,
+                                const metal::MetalBuffer &confidence);
+  // The confidence `model` reads as acceptance probability `acceptance` at
+  // proposal `position`: the inverse of its logit(p) = slope *
+  // logit(confidence) + intercepts[position], within the clamp
+  // draft_verify_rows reads confidence through. Under everyRow, or a slope
+  // that leaves confidence no say, the acceptance itself.
+  [[nodiscard]] static float confidenceFor(const VerifyRowsModel &model, uint32_t position,
+                                           double acceptance);
 
 private:
   uint32_t vocabulary_ = 0;

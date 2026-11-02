@@ -673,6 +673,10 @@ struct ModelTelemetry final {
   uint64_t draftContextRowsAvoided = 0;
   uint64_t draftStateRestoreSkipped = 0;
   uint64_t draftStateResets = 0;
+  // Decode cycles whose draft block a prompt-lookup copy filled
+  // (CopySpecIndex) and the draft tokens those blocks proposed.
+  uint64_t copyspecHits = 0;
+  uint64_t copyspecTokens = 0;
   uint64_t imageEncodes = 0;
   uint64_t imageEmbeddingReuses = 0;
   // Entries the embedding cache let go of, past its bytes or to a reclaim:

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ops/Vision.hpp"
+#include "CopySpec.hpp"
 #include "DFlashDraft.hpp"
 #include "ModelDescriptor.hpp"
 #include "Qwen3_6Moe.hpp"
@@ -137,6 +138,9 @@ struct RuntimeContext final {
   // (engine::MemoryGovernor::growthAdmission).
   // Without it the store never grows, as in the tools that keep it fixed.
   metal::AllocationAdmission expertAdmission = {};
+  // Whether a request's decode cycles may draft by copying the request's own
+  // earlier tokens (--copyspec-mode); off unless asked for.
+  CopySpecMode copyspecMode = CopySpecMode::Off;
 };
 
 // Validates only the interface between independently defined target and draft
