@@ -82,8 +82,12 @@ picks, from a script that holds the running server's API key and removes itself
 as it starts. Its launch options are every option `splash serve` takes but the
 ones of one model (`--revision`, `--draft-model`, `--mmproj`) and the ones it
 sets itself, from one table (`LaunchOption.all`) the tests hold to `splash
-serve --help`; the API key reaches the server as `SPLASH_API_KEY`, from the
-Keychain, and nothing starts while the Keychain does not give it. It serves
+serve --help`. While a model runs, Pending Changes reviews the running and
+next-start values, including edits under Advanced; Discard Changes restores
+the running settings without restarting the model. API key changes are named
+without displaying either key. The API key reaches the server as
+`SPLASH_API_KEY`, from the Keychain, and nothing starts while the Keychain does
+not give it. It serves
 model files on this Mac the user adds with `splash serve --model local/NAME
 --model-dir PATH`, NAME being the file's or folder's name made a repository
 name, and at launch it runs `install/cached.py`. While a model runs, the Server

@@ -7,11 +7,16 @@ import SwiftUI
 struct LaunchOptions: View {
     @Environment(AppState.self) private var state
     @State var advanced = false
+    /// For pictures of the pending changes expanded, independently of Advanced.
+    var reviewChanges = false
     /// The Advanced row, which opening it scrolls to the top, the options under it in view.
     @State private var row = ScrollTarget()
 
     var body: some View {
         Section {
+            if !state.pendingOptions.isEmpty {
+                PendingOptionsReview(changes: state.pendingOptions, open: reviewChanges, discard: state.discardOptions)
+            }
             ForEach(Self.options(.main)) { OptionRow(option: $0) }
             DisclosureRow(title: "Advanced", open: $advanced)
                 .background(ViewAnchor { row.view = $0 })
@@ -47,6 +52,36 @@ struct LaunchOptions: View {
 
     private static func options(_ section: LaunchOption.Section) -> [LaunchOption] {
         LaunchOption.all.filter { $0.section == section }
+    }
+}
+
+/// A compact review of the current and next-start values, and a way back to the running settings.
+private struct PendingOptionsReview: View {
+    let changes: [LaunchOption.Change]
+    @State var open = false
+    let discard: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            DisclosureRow(title: "Pending Changes", open: $open, detail: String(changes.count))
+            Button("Discard Changes", action: discard)
+                .controlSize(.small)
+                .help("Use the running server’s settings for the next start")
+        }
+        if open {
+            ForEach(changes) { change in
+                LabeledContent(change.title) {
+                    Text(change.detail)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.trailing)
+                        .textSelection(.enabled)
+                }
+                .font(.callout)
+            }
+            Text("Changes apply the next time a model starts. The running server is unchanged.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
     }
 }
 

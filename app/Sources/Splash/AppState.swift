@@ -143,6 +143,18 @@ final class AppState {
         return server.settings.differs(from: options, model: model)
     }
 
+    /// Effective edits to review before the next start, including those under Advanced.
+    var pendingOptions: [LaunchOption.Change] {
+        guard server.phase == .ready else { return [] }
+        return options.changes(from: server.settings)
+    }
+
+    /// Reverts edits to the running server's settings, without restarting it or restoring defaults.
+    func discardOptions() {
+        guard server.phase == .ready else { return }
+        options = server.settings
+    }
+
     /// The name to show for model `id`; its variant tells installed variants of a model apart.
     func displayName(of id: String) -> String {
         let name = catalog.name(of: id)
