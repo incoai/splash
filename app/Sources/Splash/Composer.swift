@@ -14,6 +14,13 @@ final class Draft {
 
     func focus() { focusRequests += 1 }
 
+    /// An example helps start an empty draft; text and attachments already being written stay.
+    func suggest(_ text: String) {
+        guard isEmpty else { return }
+        self.text = text
+        focus()
+    }
+
     /// Attaches `images` in a form the server takes: at most 2048 pixels on the long side (its
     /// limit is about four million pixels), PNG when they have transparency and JPEG otherwise.
     func attach(_ images: [NSImage]) {

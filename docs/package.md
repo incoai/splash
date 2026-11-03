@@ -72,8 +72,12 @@ the launch options picked in the app that differ from the server's defaults,
 ready once the port's lock names that process and `/health` answers; stopping
 is Ctrl+C's SIGINT to the group. Switching models stops one server and starts
 the next. The app starts nothing by itself: its window opens on the Server,
-where models download, start and switch, beside the Chat. Models, locks and
-downloads are the ones a packaged `splash` uses, in `~/Library/Application
+where models download, start and switch, beside the Chat. Before the first
+message, a short guide follows Download a model, Start Model and Open Chat;
+download sizes are labeled as downloads. Empty chats offer everyday examples
+that fill the draft for editing, preserving existing text and attachments and
+leaving Send to the user. Models, locks and downloads are the ones a packaged
+`splash` uses, in `~/Library/Application
 Support/Splash` and the Hugging Face cache. The app offers
 `install/suggested-models.tsv`, per model the variant meant for the Mac's
 memory with its download size and a few words about the model, and starts

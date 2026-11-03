@@ -143,6 +143,20 @@ final class AppState {
         return server.settings.differs(from: options, model: model)
     }
 
+    /// First-use guidance ends with the first message, without a separate onboarding preference.
+    var firstUseStage: FirstUseStage? {
+        guard keyProblem == nil, !chats.conversations.contains(where: { !$0.messages.isEmpty }) else { return nil }
+        switch server.phase {
+        case .starting: return .starting
+        case .ready: return server.recovering ? .starting : .chat
+        case .stopped:
+            if installed.isEmpty { return installer.running ? .downloading : .download }
+            guard let selection, installed.contains(where: { $0.id == selection && !$0.missing }) else { return nil }
+            return .start
+        case .stopping, .failed: return nil
+        }
+    }
+
     /// The name to show for model `id`; its variant tells installed variants of a model apart.
     func displayName(of id: String) -> String {
         let name = catalog.name(of: id)
