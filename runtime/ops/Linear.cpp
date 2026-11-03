@@ -6,8 +6,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -255,4 +258,49 @@ void Linear::addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer
       prefillPlan(up, rows, LinearEpilogue::UpWithGate));
 }
 
+Projection Projection::withAffineCoefficientDictionary(metal::MetalBackend &backend) const {
+  if (rotation || planeInputs_ || weights_.segments.size() != 1) return *this;
+  const auto &source = weights_.segments.front();
+  if (source.formatId != GGUF_FMT_AF4G64 || source.layout != QuantizedSegment::Layout::Planes ||
+      source.outputSize % QUANT_TILE_ROWS || source.inputSize % 64 || source.coefficientDictionary)
+    return *this;
+  requireSegmentPlanes(source, "affine dictionary");
+  const uint64_t units = uint64_t{source.outputSize} * (source.inputSize / 64);
+  const auto *raw = static_cast<const uint8_t *>(source.meta.contents());
+  if (!raw || !units || units > std::numeric_limits<uint32_t>::max()) return *this;
+  std::vector<uint16_t> indices(units);
+  std::vector<uint32_t> pairs;
+  std::unordered_map<uint32_t, uint16_t> found;
+  found.reserve(65536);
+  for (uint64_t unit = 0; unit < units; ++unit) {
+    uint32_t pair;
+    std::memcpy(&pair, raw + unit * 4, 4);
+    auto at = found.find(pair);
+    if (at == found.end()) {
+      if (pairs.size() == 65536) return *this;
+      const auto index = uint16_t(pairs.size());
+      pairs.push_back(pair);
+      at = found.emplace(pair, index).first;
+    }
+    indices[unit] = at->second;
+  }
+  // Audit every original coefficient bit, with no floating-point conversion.
+  for (uint64_t unit = 0; unit < units; ++unit) {
+    uint32_t pair;
+    std::memcpy(&pair, raw + unit * 4, 4);
+    if (pairs[indices[unit]] != pair) throw std::logic_error("affine dictionary reconstruction differs");
+  }
+  auto dictionary = std::make_shared<AffineCoefficientDictionary>();
+  dictionary->indices = backend.allocateBuffer(indices.size() * 2, metal::BufferStorage::Shared,
+                                               "affine dictionary indices");
+  dictionary->pairs = backend.allocateBuffer(pairs.size() * 4, metal::BufferStorage::Shared,
+                                             "affine coefficient pairs");
+  std::memcpy(dictionary->indices.contents(), indices.data(), indices.size() * 2);
+  std::memcpy(dictionary->pairs.contents(), pairs.data(), pairs.size() * 4);
+  dictionary->entries = uint32_t(pairs.size());
+  dictionary->units = units;
+  Projection result = *this;
+  result.weights_.segments.front().coefficientDictionary = std::move(dictionary);
+  return result;
+}
 } // namespace splash::ops

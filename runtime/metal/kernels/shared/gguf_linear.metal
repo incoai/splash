@@ -9,24 +9,13 @@
 #pragma clang fp reassociate(off)
 #include "metal/kernels/common/gguf_staged_tile.h"
 #include "metal/kernels/common/split_reduce.h"
+#include "metal/kernels/common/gguf_staged_decode.h"
 
 // A tile's sums over every K partition, handed to store(row, column, sum). One partition stores its own; more publish
 // fp32 partials [split][Rows][destination column] (kernels/common/split_reduce.h) and the last arriving partition adds
 // them in split order. `column0` is the simdgroup's first destination column, `counter` its threadgroup's (one per 64
 // destination columns: the segments of a projection never share one).
-template <ushort Rows, class Acc, class Store>
-inline void gguf_store_sums(thread Acc &acc, uint splits, uint split, device coherent(device) float *partials,
-                            device atomic_uint *counter, uint stride, uint column0, uint thread_index,
-                            threadgroup uint *arrival, Store store) {
-  if (splits == 1) { gguf_elements(acc, store); return; }
-  const auto at = [&](uint s, uint row, uint column) { return (ulong(s) * Rows + row) * stride + column0 + column; };
-  gguf_elements(acc, [&](uint row, uint column, float v) { partials[at(split, row, column)] = v; });
-  if (!split_arrive_last(counter, splits, thread_index, arrival)) return;
-  gguf_elements(acc, [&](uint row, uint column, float v) {
-    store(row, column, split_sum(v, split, splits, [&](uint s) { return partials[at(s, row, column)]; }));
-  });
-  split_release(counter, thread_index);
-}
+
 
 // ---------------- prefill tiles: a shared B stage (TileN x KS, all threads dequantize), each simdgroup owns RowsPerSG
 // rows. `rows` counts the chunk's rows from the tile's first: simdgroups past them (the last tile of a chunk that is not
@@ -69,24 +58,7 @@ constant constexpr uint kPrefillStages = 2 * GGUF_TILE_COLUMNS * GGUF_PREFILL_ST
 // up value, as the Apple9 register kernels do. The destination's type Out is bf16, or fp32 for the plain epilogue's
 // logits (a_f32, ops::Projection::destination). Each column tile walks its partition from the step staged_first_step
 // gives it (kernels/common/gguf_staged_tile.h): in lockstep, or spread when p.spread is set.
-template <class F, ushort Rows, GgufEpilogue Ep, class Out>
-inline void gguf_decode_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device Out *output,
-                             device coherent(device) float *partials, device atomic_uint *counters, device bfloat *aux,
-                             constant GgufDecodeParams &p, uint2 group, uint simd_lane, uint simd_group,
-                             threadgroup half *stage, threadgroup half2 *tl, threadgroup uint *arrival) {
-  const uint per = p.input_size / GGUF_STAGED_STEP / p.splits, sb = group.y * per, se = sb + per,
-             origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS, column0 = p.out_offset + origin;
-  threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
-  auto acc = staged_accumulator<Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, p.input_size, my);
-  gguf_zero(acc);
-  staged_accumulate<F, Rows, GGUF_STAGED_COLUMNS, GGUF_STAGED_STEP>(input, w0, w1, meta, p.input_size, origin, my, tl, simd_lane, sb, se,
-                                          staged_first_step(group.x, sb, se, p.spread), acc);
-  gguf_store_sums<Rows>(acc, p.splits, group.y, partials, counters + p.out_offset / GGUF_TILE_COLUMNS + group.x, p.out_stride, column0,
-                        simd_group * 32 + simd_lane, arrival, [&](uint row, uint column, float v) {
-    const ulong o = ulong(row) * p.out_stride + column0 + column;
-    output[o] = gguf_epilogue<Ep, Out>(v, aux, o);
-  });
-}
+
 // The staged decode kernels: grid (column tiles, K partitions), two simdgroups.
 template <class F, ushort Rows, GgufEpilogue Ep, class Out>
 kernel void gguf_decode(device bfloat *input [[buffer(0)]], device uchar *w0 [[buffer(1)]], device uchar *w1 [[buffer(2)]],

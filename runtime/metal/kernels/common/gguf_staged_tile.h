@@ -61,10 +61,18 @@ inline uint staged_first_step(uint tile, uint step_begin, uint step_end, uint sp
 // payload while the step's matmul runs, and so its meta unit when the next step enters a new one (a unit spans
 // F::MetaGroups groups): both DRAM round trips overlap a matmul. Both go to the registers the step has just
 // dequantized from, so the prefetch holds no second meta unit.
-template <class F, ushort Rows, ushort Cols, ushort KS, ushort Threads, class Acc>
+// The default metadata reader is the original format's exact packed load.
+// A development-only reader can change metadata representation while the
+// payload, affine arithmetic, matrix geometry and reduction remain shared.
+template <class F> struct StagedMeta {
+  static constexpr constant uint Bytes = F::MetaBytes;
+  typename F::Meta operator()(device uchar *p) const thread { return F::loadMeta(p); }
+};
+
+template <class F, ushort Rows, ushort Cols, ushort KS, ushort Threads, class Acc, class Meta = StagedMeta<F>>
 inline void gguf_staged_steps(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size,
                               uint output_origin, threadgroup half *stage, threadgroup half2 *tl, uint thread_index,
-                              uint step_begin, uint step_end, uint step_first, bool matmuls, thread Acc &acc) {
+                              uint step_begin, uint step_end, uint step_first, bool matmuls, thread Acc &acc, Meta load_meta = {}) {
   constexpr ushort GPS = KS / 32, Items = Cols * GPS, IPT = (Items + Threads - 1) / Threads;
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
   constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
@@ -73,7 +81,7 @@ inline void gguf_staged_steps(device bfloat *input, device uchar *w0, device uch
   const uint plane_tile = output_origin / QUANT_TILE_ROWS, plane_row = output_origin % QUANT_TILE_ROWS;
   device uchar *tw0 = w0 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P0;
   device uchar *tw1 = w1 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P1;
-  device uchar *tmeta = meta + (ulong(plane_tile) * units * QUANT_TILE_ROWS + plane_row) * F::MetaBytes;
+  device uchar *tmeta = meta + (ulong(plane_tile) * units * QUANT_TILE_ROWS + plane_row) * Meta::Bytes;
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(stage + KS * Cols, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
   auto b0 = bt0.slice<KS, Cols>(0, 0), b1 = bt1.slice<KS, Cols>(0, 0);
@@ -85,7 +93,7 @@ inline void gguf_staged_steps(device bfloat *input, device uchar *w0, device uch
     const uint col = live ? item % Cols : 0, gi = live ? item / Cols : 0;
     const ulong g = ulong(step_first) * GPS + gi;
     if (live && step_begin < step_end) packed[it] = F::load(tw0 + (g * QUANT_TILE_ROWS + col) * F::P0, tw1 + (g * QUANT_TILE_ROWS + col) * F::P1);
-    hdr[it] = F::loadMeta(tmeta + (ulong(g / F::MetaGroups) * QUANT_TILE_ROWS + col) * F::MetaBytes);
+    hdr[it] = load_meta(tmeta + (ulong(g / F::MetaGroups) * QUANT_TILE_ROWS + col) * Meta::Bytes);
   }
   // One step: dequantize `step` into stage `buffer`, load `next`'s payload and meta unit when there is a next step
   // (`more`), and run the step's matmul.
@@ -107,7 +115,7 @@ inline void gguf_staged_steps(device bfloat *input, device uchar *w0, device uch
         packed[it] = F::load(tw0 + (g * QUANT_TILE_ROWS + col) * F::P0, tw1 + (g * QUANT_TILE_ROWS + col) * F::P1);
         const uint unit = uint(g / F::MetaGroups);
         if (unit != (step * GPS + gi) / F::MetaGroups)
-          hdr[it] = F::loadMeta(tmeta + (ulong(unit) * QUANT_TILE_ROWS + col) * F::MetaBytes);
+          hdr[it] = load_meta(tmeta + (ulong(unit) * QUANT_TILE_ROWS + col) * Meta::Bytes);
       }
     }
     if (matmuls) {
@@ -131,12 +139,12 @@ inline void gguf_staged_steps(device bfloat *input, device uchar *w0, device uch
 
 // The decode tile loop of one simdgroup without the store: its Cols columns over steps [step_begin, step_end) of K
 // from step_first.
-template <class F, ushort Rows, ushort Cols, ushort KS, class Acc>
+template <class F, ushort Rows, ushort Cols, ushort KS, class Acc, class Meta = StagedMeta<F>>
 inline void staged_accumulate(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size, uint output_origin,
                      threadgroup half *stage, threadgroup half2 *tl, uint simd_lane, uint step_begin, uint step_end,
-                     uint step_first, thread Acc &acc) {
+                     uint step_first, thread Acc &acc, Meta load_meta = {}) {
   gguf_staged_steps<F, Rows, Cols, KS, 32>(input, w0, w1, meta, input_size, output_origin, stage, tl, simd_lane, step_begin,
-                                           step_end, step_first, true, acc);
+                                           step_end, step_first, true, acc, load_meta);
   simdgroup_barrier(mem_flags::mem_threadgroup);   // the stage may be reused by a following accumulate
 }
 
@@ -145,20 +153,22 @@ inline void staged_accumulate(device bfloat *input, device uchar *w0, device uch
 // and that step's meta unit.
 static_assert(GGUF_GATE_UP_THREADS == 32 && GGUF_STAGED_COLUMNS == 32 && GGUF_STAGED_STEP == 32,
               "lane l of one simdgroup stages column l, one 32-input group per step");
-template <class F> struct StagedColumn {
+template <class F, class Meta = StagedMeta<F>> struct StagedColumn {
   device uchar *w0, *w1, *meta;
   typename F::Payload packed;
   typename F::Meta hdr;
+  Meta load_meta;
   // The planes of column `origin + lane`, and step `first`'s payload (when the walk has a step) and meta unit.
   void begin(device uchar *p0, device uchar *p1, device uchar *m, uint input_size, uint origin, uint lane, uint first,
-             bool any) thread {
+             bool any, Meta reader = {}) thread {
+    load_meta = reader;
     const uint groups = input_size / 32, units = groups / F::MetaGroups;
     const uint plane_tile = origin / QUANT_TILE_ROWS, plane_row = origin % QUANT_TILE_ROWS + lane;
     w0 = p0 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P0;
     w1 = p1 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P1;
-    meta = m + (ulong(plane_tile) * units * QUANT_TILE_ROWS + plane_row) * F::MetaBytes;
+    meta = m + (ulong(plane_tile) * units * QUANT_TILE_ROWS + plane_row) * Meta::Bytes;
     if (any) packed = F::load(w0 + ulong(first) * QUANT_TILE_ROWS * F::P0, w1 + ulong(first) * QUANT_TILE_ROWS * F::P1);
-    hdr = F::loadMeta(meta + ulong(first / F::MetaGroups) * QUANT_TILE_ROWS * F::MetaBytes);
+    hdr = load_meta(meta + ulong(first / F::MetaGroups) * QUANT_TILE_ROWS * Meta::Bytes);
   }
   // Dequantizes `step` into the lane's column of `stage`.
   void stage(uint step, threadgroup half2 *tl, threadgroup half *stage, uint lane) thread {
@@ -168,7 +178,7 @@ template <class F> struct StagedColumn {
   void load(uint step, uint next) thread {
     packed = F::load(w0 + ulong(next) * QUANT_TILE_ROWS * F::P0, w1 + ulong(next) * QUANT_TILE_ROWS * F::P1);
     const uint unit = next / F::MetaGroups;
-    if (unit != step / F::MetaGroups) hdr = F::loadMeta(meta + ulong(unit) * QUANT_TILE_ROWS * F::MetaBytes);
+    if (unit != step / F::MetaGroups) hdr = load_meta(meta + ulong(unit) * QUANT_TILE_ROWS * Meta::Bytes);
   }
 };
 
@@ -177,11 +187,11 @@ template <class F> struct StagedColumn {
 // into their stages (one each), meets at a barrier, loads both tensors' next payloads, runs both matmuls on the step's
 // input and meets again before the stages are rewritten. Each tensor sums its steps in the order of its own decode
 // tile, so gate and up hold the bits of the gate and up passes over the same steps.
-template <class F, ushort Rows, class Acc>
+template <class F, ushort Rows, class Acc, class Meta = StagedMeta<F>>
 inline void gguf_staged_pair_steps(device bfloat *input, device uchar *gw0, device uchar *gw1, device uchar *gmeta,
                                    device uchar *uw0, device uchar *uw1, device uchar *umeta, uint input_size,
                                    uint origin, threadgroup half *stage, threadgroup half2 *tl, uint lane,
-                                   uint step_begin, uint step_end, uint step_first, thread Acc &gate, thread Acc &up) {
+                                   uint step_begin, uint step_end, uint step_first, thread Acc &gate, thread Acc &up, Meta gate_meta = {}, Meta up_meta = {}) {
   constexpr ushort Cols = GGUF_STAGED_COLUMNS, KS = GGUF_STAGED_STEP;
   auto a = tensor(input, dextents<int, 2>{int(input_size), Rows}, array<int, 2>{1, int(input_size)});
   constexpr auto descriptor = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
@@ -189,9 +199,9 @@ inline void gguf_staged_pair_steps(device bfloat *input, device uchar *gw0, devi
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt0(stage, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
   tensor<threadgroup half, dextents<int, 2>, tensor_inline> bt1(stage + KS * Cols, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
   auto bg = bt0.slice<KS, Cols>(0, 0), bu = bt1.slice<KS, Cols>(0, 0);
-  StagedColumn<F> g, u;
-  g.begin(gw0, gw1, gmeta, input_size, origin, lane, step_first, step_begin < step_end);
-  u.begin(uw0, uw1, umeta, input_size, origin, lane, step_first, step_begin < step_end);
+  StagedColumn<F, Meta> g, u;
+  g.begin(gw0, gw1, gmeta, input_size, origin, lane, step_first, step_begin < step_end, gate_meta);
+  u.begin(uw0, uw1, umeta, input_size, origin, lane, step_first, step_begin < step_end, up_meta);
   const auto run_step = [&](uint step, uint next, bool more) __attribute__((always_inline)) {
     g.stage(step, tl, stage, lane);
     u.stage(step, tl, stage + KS * Cols, lane);

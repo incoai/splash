@@ -329,6 +329,13 @@ Outcome run(MetalBackend &backend, const Linear &linear, const LinearPlan &plan,
   scratch.poison(poison);
   CommandGraph graph;
   static_cast<void>(linear.add(graph, o.bindings(plan, scratch), p, plan, gate));
+  if (plan.workload().phase == LinearPhase::Decode && plan.configuration().tile == LinearTile::GgufStaged &&
+      p.blocks().segments.size() == 1 && p.blocks().segments.front().coefficientDictionary) {
+    const bool used = std::any_of(graph.dispatches().begin(), graph.dispatches().end(), [](const auto &d) {
+      return d.pipelineName.starts_with("experiment_affine4_dictionary_");
+    });
+    if (!used) fail(label + ": dictionary route was not used");
+  }
   // A spread plan's dispatches are staged decode tiles, each binding its parameters with spread set.
   if (plan.configuration().spread)
     for (const ComputeDispatch &dispatch : graph.dispatches()) {
@@ -1058,6 +1065,110 @@ void gatherExtents(MetalBackend &backend) {
           "element short");
 }
 
+
+void affineDictionary(MetalBackend &backend, const Linear &linear) {
+  constexpr uint32_t N = 512, K = 2304, columns = N + kPadding;
+  Tensor weight = tensor(backend, Fmt(GGUF_FMT_AF4G64), N, K);
+  const Tensor g = tensor(backend, Fmt(GGUF_FMT_AF4G64), N, K);
+  // Metadata is a nonzero-offset view, as loaded image segments can be.
+  const auto oldMeta = weight.segment.meta;
+  auto backing = backend.allocateBuffer(oldMeta.sizeBytes() + 64, splash::metal::BufferStorage::Shared, "offset metadata");
+  std::memcpy(static_cast<uint8_t *>(backing.contents()) + 32, oldMeta.contents(), oldMeta.sizeBytes());
+  weight.segment.meta = backend.view(backing, 32, oldMeta.sizeBytes());
+  const auto original = projection({&weight}, columns), gate = projection({&g}, columns);
+  const auto indexed = original.withAffineCoefficientDictionary(backend);
+  const auto indexedGate = gate.withAffineCoefficientDictionary(backend);
+  for (const auto *p : {&indexed, &indexedGate}) {
+    const auto &segment = p->blocks().segments.front();
+    const auto &dictionary = segment.coefficientDictionary;
+    if (!dictionary) throw std::runtime_error("AF4 dictionary construction fell back");
+    auto restored = backend.allocateBuffer(dictionary->units * 4, splash::metal::BufferStorage::Shared, "restored metadata");
+    CommandGraph graph;
+    graph.add("experiment_affine_dictionary_roundtrip", {dictionary->indices, dictionary->pairs, restored},
+              uint32_t(dictionary->units), {uint32_t((dictionary->units + 255) / 256), 1, 1}, {256, 1, 1});
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
+    if (std::memcmp(restored.contents(), segment.meta.contents(), dictionary->units * 4))
+      fail("GPU dictionary reconstruction differs");
+  }
+  if (indexed.leadingRows(backend, QUANT_TILE_ROWS).blocks().segments.front().coefficientDictionary ||
+      indexed.leadingInputs(K / 2).blocks().segments.front().coefficientDictionary)
+    fail("plane views retained an unsupported dictionary");
+  const auto x = activations(Inputs::Dense, kMaximumRows, K);
+  const auto aux = residuals(kMaximumRows, columns);
+  const auto dots = products({&weight}, columns, x, kMaximumRows);
+  const auto gateDots = products({&g}, columns, x, kMaximumRows);
+  for (const bool spread : {false, true})
+    for (const uint32_t lanes : {1U, 2U, 3U, 4U})
+      for (const uint32_t splits : kSplits) {
+        if (!takesSplits(LinearTile::GgufStaged, weight.format, K, splits)) continue;
+        for (const auto ep : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
+          const auto work = decode({columns, K}, lanes, ep);
+          auto c = config(LinearTile::GgufStaged, work, splits, spread);
+          for (const bool wide : {false, true}) {
+            if (wide && lanes != 1) continue;
+            c.sixteenRows = wide;
+            const auto plan = Linear::plan(work, c, FloatOutput::BFloat16);
+            const auto rows = storageRows(x, K, work.rows, plan.storageRows());
+            const auto residual = storageRows(aux, columns, work.rows, plan.storageRows());
+            const std::string label = "dictionary L=" + std::to_string(lanes) + " S=" + std::to_string(splits) +
+                                      " " + epilogueName(ep);
+            const auto a = run(backend, linear, plan, original, ep == LinearEpilogue::GateUp ? &gate : nullptr,
+                                rows, residual, kPoisonNaN, N, label + " original");
+            const auto b = run(backend, linear, plan, indexed, ep == LinearEpilogue::GateUp ? &indexedGate : nullptr,
+                                rows, residual, kPoisonFinite, N, label);
+            if (a.output != b.output || a.gate != b.gate) fail(label + ": output bits differ");
+            checkValues(b, dots, gateDots, residual, work, work.rows, N, true, label);
+            if (ep == LinearEpilogue::None) {
+              auto fp32 = Linear::plan(work, c, FloatOutput::Float32);
+              floatOutput(backend, linear, fp32, indexed, rows, b, dots, N, true, label);
+            }
+            if (ep == LinearEpilogue::GateUp) {
+              c.oneGateUpPass = true;
+              const auto one = Linear::plan(work, c, FloatOutput::BFloat16);
+              const auto fused = run(backend, linear, one, indexed, &indexedGate, rows, {},
+                                      kPoisonFinite, N, label + " one pass");
+              if (a.output != fused.output) fail(label + ": dictionary fused gate/up differs");
+              c.oneGateUpPass = false;
+            }
+          }
+        }
+      }
+  // Attached dictionaries do not change unsupported consumers: prefill
+  // and register plans still use the original metadata planes.
+  {
+    const LinearWorkload work{{columns, K}, 33, LinearPhase::Prefill, LinearEpilogue::None};
+    const auto plan = Linear::plan(work, {.tile = LinearTile::GgufPrefill}, FloatOutput::BFloat16);
+    const auto values = activations(Inputs::Dense, work.rows, K);
+    const auto rows = storageRows(values, K, work.rows, plan.storageRows());
+    const auto a = run(backend, linear, plan, original, nullptr, rows, {}, kPoisonNaN, N, "prefill original");
+    const auto b = run(backend, linear, plan, indexed, nullptr, rows, {}, kPoisonFinite, N, "prefill fallback");
+    if (a.output != b.output) fail("attached dictionary changed prefill fallback");
+    checkValues(b, products({&weight}, columns, values, work.rows), {}, {}, work, work.rows, N, true,
+                "prefill dictionary fallback");
+  }
+  {
+    const auto work = decode({columns, K}, 1, LinearEpilogue::None);
+    const auto plan = Linear::plan(work, {.tile = LinearTile::GgufRegister}, FloatOutput::BFloat16);
+    const auto rows = storageRows(x, K, work.rows, plan.storageRows());
+    const auto a = run(backend, linear, plan, original, nullptr, rows, {}, kPoisonNaN, N, "register original");
+    const auto b = run(backend, linear, plan, indexed, nullptr, rows, {}, kPoisonFinite, N, "register fallback");
+    if (a.output != b.output) fail("attached dictionary changed register fallback");
+    checkValues(b, dots, {}, {}, work, work.rows, N, false, "register dictionary fallback");
+  }
+  const auto other = tensor(backend, Q4K, 64, 1024);
+  if (projection({&other}, 64).withAffineCoefficientDictionary(backend).blocks().segments.front().coefficientDictionary)
+    fail("unsupported format did not fall back");
+  Tensor capacity = tensor(backend, Fmt(GGUF_FMT_AF4G64), 128, 65536);
+  auto *pairs = static_cast<uint32_t *>(capacity.segment.meta.contents());
+  const uint32_t units = capacity.N * capacity.K / 64;
+  std::iota(pairs, pairs + units, 0U);
+  if (projection({&capacity}, capacity.N).withAffineCoefficientDictionary(backend)
+          .blocks().segments.front().coefficientDictionary)
+    fail("more than65536 raw pairs did not fall back");
+  section("exact AF4 coefficient dictionary: GPU roundtrip, offset view, rows/splits/epilogues/fused pairs, "
+          "full output bits and fp64 bounds; unsupported format and capacity fallbacks");
+}
+
 int main(int argc, char **argv) {
   @autoreleasepool {
     if (argc != 2) {
@@ -1067,6 +1178,7 @@ int main(int argc, char **argv) {
     try {
       MetalBackend backend(argv[1]);
       const Linear linear(backend.capabilities());
+      affineDictionary(backend, linear);
       for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {
         decodeTile(backend, linear, tile, false, decodeInputs(false), tileFormats(tile));
         fusedDecode(backend, linear, tile, false);

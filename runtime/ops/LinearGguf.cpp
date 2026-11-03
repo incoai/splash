@@ -16,6 +16,20 @@
 namespace splash::ops {
 namespace {
 
+// Experimental dictionaries are attached explicitly by development tools;
+// serving loaders never construct them. Every other plan keeps its old image.
+const AffineCoefficientDictionary *dictionaryFor(const QuantizedSegment &s, LinearPhase phase, uint32_t rows) {
+  if (phase != LinearPhase::Decode || s.formatId != GGUF_FMT_AF4G64 ||
+      (rows != 8 && rows != 16 && rows != 32) || !s.coefficientDictionary)
+    return nullptr;
+  const auto &d = *s.coefficientDictionary;
+  if (!d.entries || d.entries > 65536 || d.units != uint64_t{s.outputSize} * s.inputSize / 64)
+    throw std::invalid_argument("affine dictionary shape mismatch");
+  requireBytes(d.indices, d.units * 2, "affine dictionary indices");
+  requireBytes(d.pairs, uint64_t{d.entries} * 4, "affine coefficient pairs");
+  return &d;
+}
+
 // The segments one fused decode dispatch runs.
 constexpr size_t kFusedSegments = std::extent_v<decltype(GgufDecodeFusedParams::cols)>;
 
@@ -643,8 +657,13 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
   const auto [partials, counters] = splitScratch(b, splits);
   const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
                           const metal::MetalBuffer &aux) {
-    graph.add(kernelInstance(decodeKernel(s.name(), rows, epilogue), plan.destination()),
-              {b.input, s.plane0, s.plane1Slot(), s.meta, output, partials, counters, aux},
+    const auto *dictionary = dictionaryFor(s, w.phase, rows);
+    std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(),
+        dictionary ? dictionary->indices : s.meta, output, partials, counters, aux};
+    if (dictionary) bindings.push_back(dictionary->pairs);
+    const std::string name = dictionary ? "experiment_affine4_dictionary_m" + std::to_string(rows) + "_" + epilogue
+                                        : decodeKernel(s.name(), rows, epilogue);
+    graph.add(kernelInstance(name, plan.destination()), std::move(bindings),
               GgufDecodeParams{k, splits, n, s.columnOffset, config.spread},
               {s.outputSize / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
   };
@@ -685,10 +704,14 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
     if (segments.size() != 1 || gates.size() != 1 || gates.front().formatId != segments.front().formatId)
       throw std::invalid_argument("a one-pass block gate/up takes single tensors of one format");
     const QuantizedSegment &g = gates.front(), &u = segments.front();
-    graph.add(std::string("gguf_decode_") + u.name() + "_m" + std::to_string(rows) + "_gate_up",
-              {b.input, g.plane0, g.plane1Slot(), g.meta, u.plane0, u.plane1Slot(), u.meta, b.output, partials,
-               counters},
-              GgufDecodeParams{k, splits, n, u.columnOffset, config.spread},
+    const auto *gd = dictionaryFor(g, w.phase, rows), *ud = dictionaryFor(u, w.phase, rows);
+    const bool indexed = gd && ud;
+    std::vector<metal::MetalBuffer> bindings{b.input, g.plane0, g.plane1Slot(), indexed ? gd->indices : g.meta,
+        u.plane0, u.plane1Slot(), indexed ? ud->indices : u.meta, b.output, partials, counters};
+    if (indexed) bindings.insert(bindings.end(), {gd->pairs, ud->pairs});
+    const std::string name = indexed ? "experiment_affine4_dictionary_m" + std::to_string(rows) + "_gate_up"
+                                     : std::string("gguf_decode_") + u.name() + "_m" + std::to_string(rows) + "_gate_up";
+    graph.add(name, std::move(bindings), GgufDecodeParams{k, splits, n, u.columnOffset, config.spread},
               {u.outputSize / GGUF_STAGED_COLUMNS, splits, 1}, {GGUF_GATE_UP_THREADS, 1, 1});
     return;
   }

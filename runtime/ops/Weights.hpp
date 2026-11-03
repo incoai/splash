@@ -5,6 +5,7 @@
 
 #include <compare>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -53,6 +54,15 @@ enum class FloatOutput : uint8_t { BFloat16, Float32 };
 [[nodiscard]] constexpr uint64_t elementBytes(FloatOutput type) noexcept {
   return type == FloatOutput::Float32 ? sizeof(float) : sizeof(uint16_t);
 }
+
+// An opt-in experimental representation, owned by its projection's lifetime.
+// Original metadata remains available to every unsupported consumer.
+struct AffineCoefficientDictionary final {
+  metal::MetalBuffer indices; // u16, in the original plane's metadata order
+  metal::MetalBuffer pairs;   // u32, exact raw BF16 scale/bias pairs
+  uint32_t entries = 0;
+  uint64_t units = 0;
+};
 
 // A prepared tensor occupying a projection's output columns
 // [columnOffset, columnOffset + outputSize), in one of two layouts. Planes:
@@ -108,6 +118,7 @@ struct QuantizedSegment final {
   // The buffer bound in plane1's slot: a format without a second plane binds
   // its meta plane there, which its kernels never read as plane1.
   [[nodiscard]] const metal::MetalBuffer &plane1Slot() const noexcept { return plane1 ? plane1 : meta; }
+  std::shared_ptr<const AffineCoefficientDictionary> coefficientDictionary{};
 };
 
 struct BlockWeights final {
@@ -121,6 +132,10 @@ struct BlockWeights final {
 class Projection final {
 public:
   Projection() = default;
+  // Development experiment for one unrotated AF4G64 plane tensor. Returns
+  // the original projection when unsupported or dictionary capacity is
+  // exceeded. The returned copy retains original metadata: no RAM saving.
+  [[nodiscard]] Projection withAffineCoefficientDictionary(metal::MetalBackend &backend) const;
   Projection(uint32_t output, uint32_t input, BlockWeights weights)
       : outputSize(output), inputSize(input), weights_(std::move(weights)) {
     if (weights_.segments.empty()) throw std::invalid_argument("block projection has no segments");
