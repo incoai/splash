@@ -150,8 +150,14 @@ struct ServerView: View {
                     .font(.body)
                     .foregroundStyle(.secondary)
                 }
+            } else if let stage = state.firstUseStage {
+                GettingStartedGuide(stage: stage)
             } else {
-                GettingStartedGuide(stage: state.firstUseStage ?? .download)
+                // Existing chats or a blocking problem should not advertise a healthy setup step.
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Welcome to Splash").font(.title2.weight(.semibold)).foregroundStyle(.primary)
+                    Text("Splash runs AI models privately on this Mac.").font(.body).foregroundStyle(.secondary)
+                }
             }
         }
         .textCase(nil)
