@@ -3,6 +3,7 @@
 #include "metal/abi/KvExtent.h"
 #include "model/Runtime.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -16,6 +17,18 @@ namespace splash::model {
 // these; production binaries never link it.
 class RuntimeInstrumentation final {
 public:
+  // Dense B1 experiment, available only in an instrumented runtime. A
+  // fixedRows in [1,8] caps the verified prefix; zero uses these supplied,
+  // positive cycle costs for rows 1..8 and the existing learned acceptance
+  // model. The caller must measure costs on calibration prompts, not task
+  // answers. Only GDN suffix work is skipped in this first prototype;
+  // dense projections, attention and the draft still run their full rows.
+  struct DenseVerifyExperiment final {
+    uint32_t fixedRows = 8;
+    std::array<float, SPLASH_TARGET_VERIFY_ROWS + 1> costs{};
+    bool prefixGdn = true;
+  };
+  static void setDenseVerifyExperiment(Runtime &runtime, std::optional<DenseVerifyExperiment> experiment);
   // The PLE rows the last decode step gathered for batch lane `lane`'s
   // verify rows, each row's heads' in order (Qwen3.8-Flash-Next), until the
   // next decode step; none for a target without them.

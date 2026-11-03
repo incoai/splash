@@ -193,6 +193,10 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
   const CompiledGdn &kernel = compiledGdn(shape);
   // Lane l's rows of the packed and hidden rows are rows [8 l, 8 l + 8).
   const uint64_t rows = uint64_t{lanes} * SPLASH_TARGET_VERIFY_ROWS;
+  if (buffers.verifyRows)
+    requireBytes(buffers.verifyRows, uint64_t{lanes} * sizeof(uint32_t), "GDN verify rows");
+  if (buffers.verifyRows && state.format != GdnStateFormat::Float32)
+    throw std::invalid_argument("prefix GDN experiment requires fp32 state");
   requireBytes(buffers.packed, packedBytes(shape, rows), "GDN packed");
   requireMixerWeights(shape, buffers.convolutionWeights, buffers.decayWeights, buffers.timeBias);
   requireBytes(buffers.hidden, rows * valueWidth(shape) * 2, "GDN hidden");
@@ -245,7 +249,9 @@ PreparedInput GDN::addDecode(metal::CommandGraph &graph, GdnDecodeBuffers buffer
                    buffers.hidden});
   if (prepare)
     bindings.insert(bindings.end(), {buffers.linearScratch.input, buffers.linearScratch.sums});
-  const std::string name = std::string("verify_gdn_fused") + tableSuffix(input) + std::string(kernel.suffix);
+  if (buffers.verifyRows) bindings.push_back(buffers.verifyRows);
+  const std::string name = std::string("verify_gdn_fused") + (buffers.verifyRows ? "_prefix" : "") +
+                           tableSuffix(input) + std::string(kernel.suffix);
   graph.add(stateKernel(normKernel(name, buffers.mixerNorm, shape.headDimension), state.format),
             std::move(bindings), params, {shape.valueHeads, lanes, 1});
   if (!prepare) return {};

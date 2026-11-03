@@ -1241,12 +1241,109 @@ void bfloatState(MetalBackend &backend, const GdnShape &shape, uint32_t lanes, b
   std::cout << where << ": the fp32 decode's rows and its state rounded\n";
 }
 
+
+// The selected suffix is never a pending committed prefix. Poison only the
+// current step's tape and compare every live output/tape bit and the full
+// resulting state against the unchanged eight-row entry.
+void prefixRows(MetalBackend &backend, const GdnShape &shape, uint32_t lanes,
+                bool float32, GdnHeadOrder order, LinearInput layout) {
+  Fixture full(backend, shape, lanes, float32), prefix(backend, shape, lanes, float32);
+  auto limits = backend.allocateBuffer(kMaxLanes * sizeof(uint32_t), BufferStorage::Shared, "GDN live prefixes");
+  const uint64_t width = uint64_t{shape.valueHeads} * kHeadDim;
+  CommandGraph seed;
+  encodeDecode(full, seed, "full seed");
+  encodeDecode(prefix, seed, "prefix seed");
+  (void)backend.submitCommandAsync(seed.dispatches()).wait();
+  std::array<uint32_t, kMaxLanes> retained{};
+  full.advance(retained);
+  prefix.advance(retained);
+  full.fillPacked();
+  prefix.fillPacked();
+  for (uint32_t round = 0; round <= kRows; ++round) {
+    full.clear();
+    prefix.clear();
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      full.tapeLanes[lane].pendingRows = prefix.tapeLanes[lane].pendingRows = (round + lane) % (kRows + 1);
+      static_cast<uint32_t *>(limits.contents())[lane] = 1 + (round + 3 * lane) % kRows;
+      std::memset(static_cast<uint8_t *>(prefix.tape.contents()) + prefix.tapeLanes[lane].stepSlot,
+                  0xA5, kLayers * prefix.tapeBytes);
+    }
+    std::optional<PreparedTables> tables;
+    if (layout != LinearInput::Plain) tables.emplace(backend, layout, width, lanes);
+    PreparedInput prepared;
+    CommandGraph graph;
+    for (uint32_t layer = 0; layer < kLayers; ++layer) {
+      (void)GDN::addDecode(graph, full.decodeBuffers(layer), shape, lanes, layer, full.cell.strides(), order,
+                            LinearInput::Plain);
+      auto buffers = prefix.decodeBuffers(layer);
+      buffers.verifyRows = limits;
+      if (tables) buffers.linearScratch = tables->scratch();
+      prepared = GDN::addDecode(graph, buffers, shape, lanes, layer, prefix.cell.strides(), order, layout);
+    }
+    if (tables) tables->addReference(graph, prefix.hidden);
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
+    if (tables) tables->requireWritten(prepared, prefix.hidden, "prefix table");
+    const auto compareField = [&](const void *a, const void *b, uint64_t bytes, bool live) {
+      if (live) require(!std::memcmp(a, b, bytes), "GDN prefix tape differs");
+      else {
+        const auto *first = static_cast<const uint8_t *>(b);
+        require(std::all_of(first, first + bytes, [](uint8_t x) { return x == 0xA5; }),
+                "GDN suffix tape was touched");
+      }
+    };
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+      const uint32_t live = static_cast<const uint32_t *>(limits.contents())[lane];
+      require(!std::memcmp(full.next[lane].contents(), prefix.next[lane].contents(), full.cell.bytes),
+              "GDN prefix changed committed state");
+      const auto *a = static_cast<const uint16_t *>(full.hidden.contents()) + lane * kRows * width;
+      const auto *b = static_cast<const uint16_t *>(prefix.hidden.contents()) + lane * kRows * width;
+      require(!std::memcmp(a, b, live * width * 2), "GDN live hidden rows differ");
+      require(std::all_of(b + live * width, b + kRows * width, [](uint16_t x) { return x == 0; }),
+              "GDN dead hidden rows are not zero");
+      for (uint32_t layer = 0; layer < kLayers; ++layer)
+        for (uint32_t row = 0; row < kRows; ++row) {
+          const auto f = full.tapeLanes[lane].stepSlot, p = prefix.tapeLanes[lane].stepSlot;
+          compareField(full.tapeInputs(f, layer, row), prefix.tapeInputs(p, layer, row),
+                        shape.convolutionDimension * 2, row < live);
+          compareField(full.tapeKv(f, layer, row), prefix.tapeKv(p, layer, row), prefix.kvWidth * 2, row < live);
+          compareField(full.tapeDecay(f, layer, row), prefix.tapeDecay(p, layer, row), shape.valueHeads * 4,
+                        row < live);
+          compareField(full.tapeBeta(f, layer, row), prefix.tapeBeta(p, layer, row), shape.valueHeads * 2,
+                        row < live);
+        }
+    }
+  }
+  auto unsupported = prefix.decodeBuffers(0);
+  unsupported.verifyRows = limits;
+  auto narrowState = prefix.cell.strides();
+  narrowState.format = GdnStateFormat::BFloat16;
+  CommandGraph rejected;
+  rejects([&] { (void)GDN::addDecode(rejected, unsupported, shape, lanes, 0, narrowState, order, layout); },
+          "prefix GDN experiment requires fp32 state", "unsupported prefix state format");
+  require(rejected.empty(), "unsupported prefix state partially encoded");
+  auto invalid = prefix.decodeBuffers(0);
+  if (lanes > 1) {
+    invalid.verifyRows = backend.view(limits, 0, (lanes - 1) * sizeof(uint32_t));
+    CommandGraph graph;
+    rejects([&] { (void)GDN::addDecode(graph, invalid, shape, lanes, 0, prefix.cell.strides(), order, layout); },
+            "GDN verify rows", "short GDN prefix buffer");
+    require(graph.empty(), "invalid GDN prefix partially encoded");
+  }
+}
+
 int main(int argc, char **argv) {
   try {
     if (argc != 2)
       throw std::invalid_argument("usage: gdn-decode METALLIB");
     MetalBackend backend(argv[1]);
     rejectsInvalid(backend);
+    for (const GdnShape &shape : kShapes)
+      for (const uint32_t lanes : {1U, kMaxLanes})
+        for (const bool float32 : {false, true})
+          for (const auto order : {GdnHeadOrder::Grouped, GdnHeadOrder::Tiled})
+            for (const auto layout : {LinearInput::Plain, LinearInput::Table16})
+              prefixRows(backend, shape, lanes, float32, order, layout);
+
     for (const GdnShape &shape : kShapes)
       for (const uint32_t lanes : {1U, kMaxLanes})
         for (const bool float32 : {false, true}) bufferExtents(backend, shape, LinearInput::Table16, float32, lanes);

@@ -453,6 +453,7 @@ struct Runtime::Impl {
   // Whether commands copy the target's logits before their policy
   // (RuntimeInstrumentation::captureTargetLogits), and the copies, one per
   // batch lane of the last command that made them.
+  std::optional<RuntimeInstrumentation::DenseVerifyExperiment> denseVerifyExperiment;
   bool capturingTargetLogits = false;
   std::vector<std::vector<float>> capturedTargetLogits;
 #endif
@@ -1999,8 +2000,28 @@ struct Runtime::Impl {
       const VerifyBudget::Acceptance &acceptance = verifyBudget->acceptance();
       verify = {acceptance.slope, acceptance.intercepts, verifyBudget->costs(lanes, constrained), false};
     }
+    std::span<const uint32_t> rowLimits = maximumRows;
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+    std::array<uint32_t, kLaneCount> experimentLimits{};
+    if (denseVerifyExperiment) {
+      if (lanes != 1)
+        throw std::invalid_argument("dense verification experiment supports one lane");
+      const auto &experiment = *denseVerifyExperiment;
+      if (experiment.fixedRows) {
+        experimentLimits[0] = std::min(maximumRows[0], experiment.fixedRows);
+        rowLimits = std::span(experimentLimits).first(1);
+        verify.everyRow = true;
+      } else if (!verifyBudget->explores(lanes, constrained)) {
+        const auto &acceptance = verifyBudget->acceptance();
+        verify.slope = acceptance.slope;
+        verify.intercepts = acceptance.intercepts;
+        std::copy(experiment.costs.begin(), experiment.costs.end(), verify.costs.begin());
+        verify.everyRow = false;
+      }
+    }
+#endif
     ops::DraftSelector::addVerifyRows(graph, d(DecodeTensor::VerifyConfidence), d(DecodeTensor::VerifyRows),
-                                      verify, maximumRows);
+                                      verify, rowLimits);
     sampling.addThinkingDrafts(graph, std::span(policies).first(lanes),
                                d(DecodeTensor::ProposedTokens));
   }
@@ -2050,6 +2071,9 @@ struct Runtime::Impl {
     buffers.chunkValues = chunkValues;
     buffers.moe = decodeArena->moeScratch(storage);
     buffers.verifyRows = decodeArena->batchSlice(DecodeTensor::VerifyRows, lanes);
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+    buffers.prefixGdn = denseVerifyExperiment && denseVerifyExperiment->prefixGdn;
+#endif
     for (uint32_t lane = 0; lane < lanes; ++lane)
       chunks[lane] = ops::PagedAttention::verifyParams(
           items[lane].logicalPosition,
@@ -3566,6 +3590,28 @@ std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {
 }
 
 #ifdef SPLASH_RUNTIME_INSTRUMENTATION
+void RuntimeInstrumentation::setDenseVerifyExperiment(Runtime &runtime,
+                                                      std::optional<DenseVerifyExperiment> experiment) {
+  auto &impl = *runtime.impl_;
+  if (impl.geometry.target.ffnKind == QwenFfnKind::SparseMoe || !impl.geometry.target.stateLayout.layers)
+    throw std::invalid_argument("dense verification experiment needs a dense GDN target");
+  if (impl.states.layout().target.format != ops::GdnStateFormat::Float32)
+    throw std::invalid_argument("dense verification experiment requires fp32 state");
+  if (!impl.requests.empty())
+    throw std::invalid_argument("change dense verification experiment only between requests");
+  if (experiment) {
+    if (experiment->fixedRows > ExecutionLimits::targetVerifyRows)
+      throw std::invalid_argument("dense verification rows exceed the physical block");
+    if (!experiment->fixedRows)
+      for (uint32_t row = 1; row <= ExecutionLimits::targetVerifyRows; ++row)
+        if (!(std::isfinite(experiment->costs[row]) && experiment->costs[row] > 0.0F))
+          throw std::invalid_argument("dense verification costs must be finite and positive");
+  }
+  impl.denseVerifyExperiment = experiment;
+  impl.verifyBudget.reset();
+  if (experiment) impl.verifyBudget.emplace();
+}
+
 std::vector<uint32_t> RuntimeInstrumentation::lastTableRows(const Runtime &runtime, uint32_t lane) {
   return runtime.impl_->targetModel->verifyTableRows(lane);
 }

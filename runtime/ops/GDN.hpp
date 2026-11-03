@@ -128,6 +128,10 @@ struct GdnDecodeBuffers final {
   NormWeights mixerNorm;
   metal::MetalBuffer hidden;
   LinearScratch linearScratch{};
+  // Optional GPU-selected prefix lengths, one u32 per lane. The prefix
+  // variant skips current-step suffix work; pending committed rows still
+  // fold into the state in full. Storage and tape strides stay eight rows.
+  metal::MetalBuffer verifyRows{};
 };
 
 class GDN final {

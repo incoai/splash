@@ -357,6 +357,9 @@ struct QwenTargetVerifyBuffers final {
   // Each lane's auxiliary state before the step; the commit writes the one
   // after it (addStateCommit).
   std::array<metal::MetalBuffer, ExecutionLimits::maximumBatchWidth> auxiliary;
+  // Development instrumentation may skip a dense target's current-step
+  // GDN suffix. Dense projections and attention keep their physical rows.
+  bool prefixGdn = false;
 };
 
 // The auxiliary state after the rows each lane of a verify retained, which
