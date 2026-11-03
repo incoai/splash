@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <optional>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <variant>
 
@@ -281,12 +282,23 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer,
                      b.linearScratch, std::move(output.rows), std::move(output.residual));
 }
 
+uint32_t QwenTarget::prefillTailRows(const PrefillStep &step, uint32_t index) const {
+  if (index + 1 != geometry_.layers || geometry_.ffnKind != QwenFfnKind::Dense || step.sequences.size() != 1 ||
+      step.sequences.front().rows <= kPrefillTailRows || geometry_.attentionVariant(step.attentionLayer).windowTokens)
+    return 0;
+  bool captured = false;
+  forEachPrefillCapture(step, index, [&](uint32_t, uint32_t, uint32_t, uint32_t) { captured = true; });
+  return captured ? 0 : kPrefillTailRows;
+}
+
 // A sequence with blocks attends through the lists of its tiles of rows,
 // and one whose history holds Index pages attends staging, which the step's
 // reads of spilled K/V fill with the layer's history and the chunk's pages
-// once stored.
+// once stored. A tail's rows attend as the chunk's last rows: past the
+// committed tokens and its other rows, through views that keep the queries'
+// head stride.
 void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer, BlockOutput output,
-                                 std::span<const ops::AttentionBlocks> blocks) const {
+                                 std::span<const ops::AttentionBlocks> blocks, uint32_t tailRows) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   const uint32_t layer = step.attentionLayer++;
   const ops::AttentionVariant variant = geometry_.attentionVariant(layer);
@@ -294,6 +306,8 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
       variant.windowTokens ? step.windowedAttention : step.attention;
   if (!blocks.empty() && blocks.size() != step.sequences.size())
     throw std::invalid_argument("Qwen prefill attention blocks do not match its sequences");
+  if (tailRows && (!blocks.empty() || step.sequences.size() != 1 || tailRows > step.sequences.front().rows))
+    throw std::invalid_argument("Qwen prefill attention computes a tail of one sequence's rows, without blocks");
   const auto u16Rows = [&](const metal::MetalBuffer &buffer, const QwenTargetPrefillSequence &sequence,
                            uint32_t width) {
     return rowsOf<uint16_t>(buffer, sequence.rowBegin, sequence.rows, width);
@@ -334,6 +348,29 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
         step.spilled.prefill(step.graph, layer, sequence.lane, firstPage,
                              kv::chunkedPrefillRequiredPages(sequence.chunk) - firstPage,
                              {sequence.pageTable, step.kvLayers[layer]});
+    if (tailRows) {
+      // A row's queries: each KV head's query heads, row by row
+      // (splash_prefill_attention_tile).
+      const uint32_t first = sequence.rows - tailRows, begin = sequence.rowBegin + first;
+      const uint64_t skipped = uint64_t{first} * (geometry_.attentionQueryHeads / geometry_.attentionKvHeads) *
+                               geometry_.attentionHeadDimension * sizeof(uint16_t);
+      const metal::MetalBuffer tailAttention =
+          backend_.view(b.fullAttention, sequence.queryOffset + skipped, queryBytes - skipped);
+      kv::ChunkedPrefillParams tail = sequence.chunk;
+      tail.committed_tokens += first;
+      tail.chunk_tokens = tailRows;
+      ops::PagedAttention::addPrefill(
+          step.graph, attended.kv, backend_.view(b.fullQueries, sequence.queryOffset + skipped, queryBytes - skipped),
+          tailAttention, b.attentionPartials, b.attentionStatistics, attended.table, tail,
+          operators_.prefillAttention(tailRows, geometry_.attentionQueryHeads, geometry_.kvLayout), {}, mixer.sinks);
+      if (!std::exchange(joined, true))
+        ane->addDeferredJoin(ProjectionKind::AttentionInput, step.graph, b.fullPacked, step.rows);
+      ops::PagedAttention::addPrefillGate(
+          step.graph, rowsOf<uint16_t>(b.fullPacked, begin, tailRows, geometry_.packedFullWidth), tailAttention,
+          rowsFrom<uint16_t>(b.attentionHidden, begin, geometry_.attentionWidth), tailRows, sequence.attentionStride,
+          geometry_.attentionQueryHeads, geometry_.kvLayout);
+      continue;
+    }
     ops::PagedAttention::addPrefill(step.graph, attended.kv, queries, attentionRows, b.attentionPartials,
                                     b.attentionStatistics, attended.table, sequence.chunk, plans[index],
                                     blocks.empty() ? ops::AttentionBlocks{} : blocks[index], mixer.sinks);
@@ -344,7 +381,15 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
         u16Rows(b.attentionHidden, sequence, geometry_.attentionWidth), sequence.rows, sequence.attentionStride,
         geometry_.attentionQueryHeads, geometry_.kvLayout);
   }
-  if (ane && output.residual && ane->projects(ProjectionKind::AttentionOutput, step.rows))
+  if (tailRows) {
+    const QwenTargetPrefillSequence &sequence = step.sequences.front();
+    const uint32_t begin = sequence.rowBegin + sequence.rows - tailRows;
+    addPrefillOutput(operators_.linear(), step.graph,
+                     rowsFrom<uint16_t>(b.attentionHidden, begin, geometry_.attentionWidth), mixer.outputProjection,
+                     tailRows, b.linearScratch, rowsFrom<uint16_t>(output.rows, begin, geometry_.hiddenSize),
+                     output.residual ? rowsFrom<uint16_t>(output.residual, begin, geometry_.hiddenSize)
+                                     : metal::MetalBuffer{});
+  } else if (ane && output.residual && ane->projects(ProjectionKind::AttentionOutput, step.rows))
     ane->addProjection(ProjectionKind::AttentionOutput, step.graph, layer, b.attentionHidden, std::move(output.rows),
                        step.rows, b.linearScratch, std::move(output.residual));
   else
@@ -427,9 +472,23 @@ void QwenTarget::addVerifyMixer(VerifyStep &step, const QwenAttentionWeights &mi
 
 void QwenTarget::addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops::NormWeights &norm,
                                     ops::SwiGluProjections ffn, metal::MetalBuffer residual,
-                                    metal::MetalBuffer output) const {
-  ops::Normalization::addRms(step.graph, residual, norm, step.buffers.normalized, geometry_.hiddenSize, step.rows);
-  const ops::PrefillFfnBuffers buffers = step.buffers.ffn();
+                                    metal::MetalBuffer output, uint32_t tailRows) const {
+  ops::PrefillFfnBuffers buffers = step.buffers.ffn();
+  if (tailRows) {
+    // The tail's rows on the GPU alone: the Neural Engine's functions take
+    // whole chunks.
+    const QwenTargetPrefillSequence &sequence = step.sequences.front();
+    const uint32_t begin = sequence.rowBegin + sequence.rows - tailRows;
+    buffers.normalized = rowsFrom<uint16_t>(buffers.normalized, begin, geometry_.hiddenSize);
+    buffers.gateScratch = rowsFrom<uint16_t>(buffers.gateScratch, begin, geometry_.intermediateSize);
+    buffers.intermediate = rowsFrom<uint16_t>(buffers.intermediate, begin, geometry_.intermediateSize);
+    residual = rowsFrom<uint16_t>(residual, begin, geometry_.hiddenSize);
+    output = rowsFrom<uint16_t>(output, begin, geometry_.hiddenSize);
+    ops::Normalization::addRms(step.graph, residual, norm, buffers.normalized, geometry_.hiddenSize, tailRows);
+    operators_.linear().addPrefillSwiGlu(step.graph, ffn, buffers, std::move(residual), std::move(output), tailRows);
+    return;
+  }
+  ops::Normalization::addRms(step.graph, residual, norm, buffers.normalized, geometry_.hiddenSize, step.rows);
   if (step.aneFfn)
     step.aneFfn->add(step.graph, index, buffers, std::move(residual), std::move(output), step.rows);
   else
@@ -570,14 +629,20 @@ private:
     const QwenTargetPrefillBuffers &b = step.buffers;
     const metal::MetalBuffer input = b.hidden[index & 1];
     ops::Normalization::addRms(step.graph, input, layer.inputNorm, b.normalized, geometry_.hiddenSize, step.rows);
+    uint32_t tailRows = 0;
     const metal::MetalBuffer residual = std::visit(
         [&](const auto &mixer) {
           const BlockOutput block{mixerOutput(b, mixer), input};
-          addPrefillMixer(step, mixer, block);
+          if constexpr (std::is_same_v<std::decay_t<decltype(mixer)>, QwenAttentionWeights>) {
+            tailRows = prefillTailRows(step, index);
+            addPrefillMixer(step, mixer, block, {}, tailRows);
+          } else {
+            addPrefillMixer(step, mixer, block);
+          }
           return block.rows;
         },
         layer.mixer);
-    addPrefillFfn(step, index, layer, residual, b.hidden[(index & 1) ^ 1]);
+    addPrefillFfn(step, index, layer, residual, b.hidden[(index & 1) ^ 1], tailRows);
   }
   [[nodiscard]] const ops::BlockMoeWeights *moe(uint32_t index) const { return qwenMoeBlock(weights_.layers[index]); }
   void addPrefillExperts(PrefillStep &step, uint32_t index) const {
@@ -594,11 +659,12 @@ private:
   // The FFN of layer `index` (QwenTarget::addPrefillDenseFfn and its kin): a
   // dense FFN, or a MoE's routing, whose routed work addPrefillExperts adds.
   void addPrefillFfn(PrefillStep &step, uint32_t index, const Qwen3_8LayerWeights &layer,
-                     metal::MetalBuffer residual, metal::MetalBuffer output) const {
-    addPrefillDenseFfn(step, index, layer.postAttentionNorm, swiGlu(layer), std::move(residual), std::move(output));
+                     metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t tailRows) const {
+    addPrefillDenseFfn(step, index, layer.postAttentionNorm, swiGlu(layer), std::move(residual), std::move(output),
+                       tailRows);
   }
   void addPrefillFfn(PrefillStep &step, uint32_t, const Qwen3_6MoeLayerWeights &layer,
-                     metal::MetalBuffer residual, metal::MetalBuffer output) const {
+                     metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t) const {
     addPrefillMoeRouting(step, layer.postAttentionNorm, layer.ffn, std::move(residual), std::move(output));
   }
 

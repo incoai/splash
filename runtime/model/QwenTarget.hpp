@@ -640,9 +640,11 @@ protected:
   // the layer's sinks where its geometry adds them, and, when given, only the
   // blocks of their lists (`blocks`, a prefill's per sequence, a verify's for
   // the step), through the step's reads of spilled K/V.
+  // With `tailRows`, an attention stores all its rows' K/V but computes the
+  // rest of the layer for its last `tailRows` rows only (prefillTailRows).
   void addPrefillMixer(PrefillStep &step, const QwenGdnWeights &mixer, BlockOutput output) const;
   void addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &mixer, BlockOutput output,
-                       std::span<const ops::AttentionBlocks> blocks = {}) const;
+                       std::span<const ops::AttentionBlocks> blocks = {}, uint32_t tailRows = 0) const;
   // A verify's normalized rows are in the table `normalized` describes,
   // which the mixer's input projection reads (decodeInput).
   void addVerifyMixer(VerifyStep &step, const QwenGdnWeights &mixer, ops::PreparedInput normalized,
@@ -665,7 +667,15 @@ protected:
   // load (addPrefillLayers, ops::MoE::addRouted with step.ffn), and a verify's
   // whole block.
   void addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops::NormWeights &norm,
-                          ops::SwiGluProjections ffn, metal::MetalBuffer residual, metal::MetalBuffer output) const;
+                          ops::SwiGluProjections ffn, metal::MetalBuffer residual, metal::MetalBuffer output,
+                          uint32_t tailRows = 0) const;
+  // The rows of layer `index` a prefill step computes past its K/V store: the
+  // last layer's output is read only at a prompt's last row (the first
+  // token's), so a dense model's last layer, when it is a full attention and
+  // the draft does not capture it, computes its last kPrefillTailRows rows of
+  // a one-sequence step. Zero means all rows.
+  [[nodiscard]] uint32_t prefillTailRows(const PrefillStep &step, uint32_t index) const;
+  static constexpr uint32_t kPrefillTailRows = 256;
   void addPrefillMoeRouting(PrefillStep &step, const ops::NormWeights &norm, const ops::BlockMoeWeights &ffn,
                             metal::MetalBuffer residual, metal::MetalBuffer output) const;
   void addVerifyDenseFfn(VerifyStep &step, const ops::NormWeights &norm, ops::SwiGluProjections ffn,
@@ -698,6 +708,14 @@ protected:
   [[nodiscard]] metal::MetalBuffer rowsOf(const metal::MetalBuffer &buffer, uint32_t begin, uint32_t count,
                                           uint32_t width) const {
     return backend_.view(buffer, uint64_t{begin} * width * sizeof(T), uint64_t{count} * width * sizeof(T));
+  }
+  // The rows of a row-major buffer from `begin` on, with the padding past
+  // them that the prefill linear tiles read.
+  template <class T>
+  [[nodiscard]] metal::MetalBuffer rowsFrom(const metal::MetalBuffer &buffer, uint32_t begin,
+                                            uint32_t width) const {
+    const uint64_t offset = uint64_t{begin} * width * sizeof(T);
+    return backend_.view(buffer, offset, buffer.sizeBytes() - offset);
   }
 
   const QwenTargetWeightsBase &weightsBase_;
