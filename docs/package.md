@@ -90,7 +90,10 @@ name, and at launch it runs `install/cached.py`. While a model runs, the Server
 shows its context limit, from `/v1/models`, and its `/status`: requests,
 answering and prompt speed, time to first token, the tokens generated, read and
 taken from the cache, and the Metal memory it holds, with each request's line
-of the server's log, folded. Its chat is its own, not the chat page: it streams
+of the server's log, folded. A Connect to the API section shows the running
+server's base URL and model ID to copy, with a folded cURL example; an API key
+stays out of the example, which reads `SPLASH_API_KEY` from the shell instead.
+Its chat is its own, not the chat page: it streams
 `/v1/chat/completions` and keeps each conversation as a JSON file in
 `~/Library/Application Support/Splash/Chats`, so a conversation outlives a
 switch of models. Its icon is `app/AppIcon.icon`, an Icon Composer document

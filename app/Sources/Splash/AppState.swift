@@ -309,6 +309,12 @@ final class AppState {
         }
     }
 
+    /// What clients can connect to now; pending options and a newly picked model do not change it.
+    var apiConnection: APIConnection? {
+        guard server.phase == .ready, let model = server.model else { return nil }
+        return APIConnection(settings: server.settings, model: model)
+    }
+
     func copyAPIAddress() {
         let settings = server.running ? server.settings : options
         NSPasteboard.put(settings.url.appending(path: "v1").absoluteString)

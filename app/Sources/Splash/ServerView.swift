@@ -24,6 +24,9 @@ struct ServerView: View {
             if state.server.phase == .ready {
                 ActivitySection(advanced: advanced)
             }
+            if let connection = state.apiConnection {
+                APIConnectionSection(connection: connection, example: advanced)
+            }
             if first || failed || state.installer.failure != nil || state.installer.running || state.keyProblem != nil {
                 Section {
                     if let problem = state.keyProblem {

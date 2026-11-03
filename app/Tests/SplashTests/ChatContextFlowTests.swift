@@ -136,7 +136,7 @@ struct ChatContextFlowTests {
 }
 
 @MainActor
-private final class ContextFixture {
+final class ContextFixture {
     let root = FileManager.default.temporaryDirectory.appending(path: "splash-context-flow-\(UUID())")
     let history = Conversation(title: "Saved chat", messages: [ChatMessage(role: .user, text: String(repeating: "h", count: 800)),
                                                               ChatMessage(role: .assistant, text: "Saved answer")])
