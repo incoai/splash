@@ -77,6 +77,14 @@ OPTIONS = {
         {"</think>": "</think>", "Time is up.\n</think>": "Time is up.\n</think>"},
         (),
     ),
+    "--chat-template-file": values(
+        "--chat-template-file",
+        {
+            "/srv/template.jinja": Path("/srv/template.jinja"),
+            "~/template.jinja": Path.home() / "template.jinja",
+        },
+        ("", " "),
+    ),
     "--kv-format": values("--kv-format", {"int8": "int8", "bf16": "bf16"}, ("fp16",)),
     "--state-format": values(
         "--state-format", {"fp32": "fp32", "bf16": "bf16"}, ("fp16", "int8")
