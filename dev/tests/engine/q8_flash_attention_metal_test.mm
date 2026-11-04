@@ -6,6 +6,7 @@
 #include "TestFamilies.hpp"
 #include "ops/PagedAttention.hpp"
 #include "Q8PageFormatReference.hpp"
+#include "ops/KernelCalibration.hpp"
 
 #include <algorithm>
 #include <array>
@@ -25,6 +26,10 @@ using splash::test::HostKvExtents;
 
 namespace {
 
+// The pages per prefill attention split these plans take: the Apple10 row's
+// (KernelCalibration.hpp).
+constexpr uint32_t kPagesPerSplit = splash::ops::kAttention.prefillPagesPerSplit;
+
 constexpr uint32_t kStride = 32;
 constexpr uint32_t kQueryStride = kStride;
 constexpr uint32_t kRows = kVerifyRows;
@@ -40,10 +45,10 @@ static_assert(kStride == SPLASH_VERIFY_CHUNK_STRIDE);
 struct Shape {
   uint32_t kvHeads;
   uint32_t queryHeadsPerKvHead;
-  bool tokenMajor;
+  splash::kv::Reads reads;
   uint32_t queryHeads() const { return kvHeads * queryHeadsPerKvHead; }
   uint32_t fusedRows() const { return kRows * queryHeadsPerKvHead; }
-  bool sparse() const { return tokenMajor; }
+  bool sparse() const { return reads == splash::kv::Reads::SelectedBlocks; }
   uint32_t parts() const { return sparse() ? 1 : SPLASH_ATTENTION_TILE_PARTS(queryHeadsPerKvHead); }
   // The partial of a fused row of the tile of KV head `head` from split
   // `split` of `slotSplits`: [KV head][part][split][part's fused row].
@@ -53,7 +58,7 @@ struct Shape {
   }
   Layout layout() const {
     return {.attentionLayers = 1, .kvHeads = kvHeads, .headDimension = kHeadDimension,
-            .valuesTokenMajor = sparse()};
+            .valuesTokenMajor = splash::kv::valuesTokenMajorFor(reads), .reads = reads};
   }
   // A phase's ("verify" or "prefill") split and reduce entries, as its plans
   // name them.
@@ -66,7 +71,7 @@ struct Shape {
 
 private:
   splash::ops::PrefillAttentionPlan prefillPlan() const {
-    return splash::ops::PagedAttention::prefillPlan(kRows, queryHeads(), layout());
+    return splash::ops::PagedAttention::prefillPlan(kRows, 0, queryHeads(), layout(), kPagesPerSplit);
   }
   splash::ops::VerifyAttentionPlan verifyPlan() const {
     const std::array<uint32_t, 1> history{0};
@@ -76,7 +81,7 @@ private:
 const std::vector<Shape> kShapes = [] {
   std::vector<Shape> shapes;
   for (const splash::test::AttentionGeometry &geometry : splash::test::familyAttentionGeometries())
-    shapes.push_back({geometry.kvHeads, geometry.queryHeads / geometry.kvHeads, geometry.valuesTokenMajor});
+    shapes.push_back({geometry.kvHeads, geometry.queryHeads / geometry.kvHeads, geometry.reads});
   return shapes;
 }();
 
