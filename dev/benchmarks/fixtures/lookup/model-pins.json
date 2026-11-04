@@ -105,6 +105,21 @@
       "source_revision": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818",
       "source_filename": "vocab.json",
       "metadata_content_sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+    },
+    "vision/config.json": {
+      "bytes": 4932,
+      "recorded_source_digest": "3fb03e916f494e6745aa23df751da26f79e06470",
+      "source_repo": "mlx-community/Qwen3.8-27B-4bit",
+      "source_revision": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818",
+      "source_filename": "config.json",
+      "metadata_content_sha256": "14b65a0ee06517060a6bbd979bb1a8ff54e7b304b1a1f01d54344b88b8285e85"
+    },
+    "vision/model-00001-of-00003.safetensors": {
+      "bytes": 5343268662,
+      "recorded_source_digest": "6cc1508e96fb5d0865dfd5753a79f4ec60651bf3e2a82844a7e8ae9c60528c0d",
+      "source_repo": "mlx-community/Qwen3.8-27B-4bit",
+      "source_revision": "10c35caafbb80f7dc6a7a432cdd11af10a6d4818",
+      "source_filename": "model-00001-of-00003.safetensors"
     }
   }
 }

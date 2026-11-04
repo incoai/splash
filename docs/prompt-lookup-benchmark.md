@@ -19,6 +19,9 @@ that model's tokenizer and template. The runner verifies source revisions, file
 sizes and content hashes, including all model weights, before and after the run.
 It rejects a different model rather than retokenizing or changing quantization.
 Model binaries and tokenizer assets are not part of this change.
+The identity reference includes the installer's vision configuration and shard
+aliases, which resolve to the same pinned target sources. Those aliases are
+checked for complete installation coverage; these cohorts perform text inference.
 
 Build the production benchmark on an otherwise idle Apple Silicon Mac, commit
 the source being tested, and put results outside the checkout:
