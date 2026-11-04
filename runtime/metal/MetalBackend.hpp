@@ -28,10 +28,9 @@ enum class BufferStorage {
 // How kernels reach a buffer: bound to the dispatches that use it, or only
 // through its GPU address held in a table, another buffer. A Bound buffer
 // may also be reached through a dispatch's address table (AddressTable),
-// which the backend writes per dispatch and declares once per encoder. The
-// table that holds an Addressed buffer's address names it
-// (MetalBackend::setTableReach), and the backend declares it for each
-// encoder that uses that table.
+// which the backend writes per dispatch. The table that holds an Addressed
+// buffer's address names it (MetalBackend::setTableReach), and the backend
+// declares it for each encoder that uses that table.
 enum class BufferReach {
   Bound,
   Addressed,
@@ -141,14 +140,13 @@ struct IndirectGrid {
 // each one's address at encode time, in order, as a constant ulong table at
 // `index` (setBytes, so at most 512 of them), and makes their memory resident
 // for the encoder's dispatches from this one on (useResources, for reading,
-// or reading and writing when `writes`, declared once per table and usage per
-// encoder), with what the bytes of any of them reach as a table
-// (MetalBackend::setTableReach).
+// or reading and writing when `writes`), with what the bytes of any of them
+// reach as a table (MetalBackend::setTableReach).
 // Addresses are the buffers' when the command is encoded, so a buffer
 // released and restored since the graph was built is reached where it is
 // now; released memory is refused like a binding of it. Dispatches that
 // reach the same buffers share one list, which the backend resolves once per
-// command and declares once per encoder.
+// command.
 struct AddressTable {
   uint32_t index = 0;
   std::shared_ptr<const std::vector<MetalBuffer>> buffers; // none when null
@@ -425,12 +423,11 @@ public:
   void restoreMemory(const MetalBuffer &buffer);
   // Names the Addressed buffers whose GPU addresses the bytes of `table`, a
   // view of a Shared buffer, hold: each encoder that uses the table makes
-  // them resident (useResources, for reading and writing), each buffer once
-  // per encoder however many tables reach it, as the command is encoded. An
-  // encoder uses the table when its dispatches bind or list (AddressTable) a
-  // view holding any of those bytes, or reach its buffer through another
-  // table: a kernel may follow an address to the entries of the
-  // table it names, so what an encoder makes resident brings what it
+  // them resident (useResources, for reading and writing) as the command is
+  // encoded. An encoder uses the table when its dispatches bind or list
+  // (AddressTable) a view holding any of those bytes, or reach its buffer
+  // through another table: a kernel may follow an address to the entries of
+  // the table it names, so what an encoder makes resident brings what it
   // reaches. It replaces what the same bytes named before, so the owner
   // calls it whenever it rewrites the table's entries, for every buffer they
   // reach. The table holds them weakly: memory released or freed since is

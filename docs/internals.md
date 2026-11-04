@@ -1132,14 +1132,14 @@ made resident in one of two ways. KV extents (`BufferReach::Addressed`) are
 reached through GPU tables of page entries, and each table names the extents
 its entries reach as it is written (`PageStorage::writeEntries`,
 `MetalBackend::setTableReach`): every encoder whose dispatches bind the table
-makes them resident (`useResources`, each extent once in each encoder however
-many tables reach it), so an extent only the cache holds costs commands
-nothing. A dispatch may instead list buffers in an address table
+makes them resident (`useResources`), so an extent only the cache holds costs
+commands nothing. A dispatch may instead list buffers in an address table
 (`metal::AddressTable`, `CommandGraph::addresses`): the backend writes their GPU
 addresses as it encodes the command, after the dispatch's parameters
 (`setBytes`, so at most 512), and makes them resident from that dispatch to the
-end of its encoder (`useResources`, for reading, or reading and writing,
-declared once per table and usage in each encoder).
+end of its encoder (`useResources`, for reading, or reading and writing).
+An encoder declares each buffer once per usage, however many dispatches list it
+or tables reach it (`EncoderResidency` in `MetalBackend.mm`).
 The addresses are those of the buffers' memory when the command is encoded, so
 a buffer released and restored since (which comes back at another address) is
 reached where it is, and an address table that lists released memory is

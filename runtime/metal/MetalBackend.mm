@@ -31,7 +31,6 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 
 #include <pthread.h>
@@ -330,6 +329,9 @@ struct MetalAllocation {
     // may outlive the backend. The set retains the buffer, and with it its
     // memory, so the last view takes it out.
     std::weak_ptr<Residency> residency;
+    // The last encoder that declared the buffer for reading, and for reading
+    // and writing (MetalBackend::Impl::EncoderResidency, its only writer).
+    uint64_t declaredIn[2] = {};
 
     // Takes the buffer, which joins the residency set and the accounting.
     void attach(id<MTLBuffer> allocated) {
@@ -351,30 +353,6 @@ struct MetalAllocation {
 
     ~MetalAllocation() { detach(); }
 };
-
-namespace {
-
-// Appends the memory of the buffers `reached` names that is allocated now,
-// and what the tables among them reach in turn: a kernel may follow an
-// address it reads in one table to the entries of another. Each table is
-// followed once (`tables`), so one that reaches itself ends; a buffer two
-// tables reach may be appended twice.
-void appendReached(const std::vector<std::weak_ptr<MetalAllocation>> &reached,
-                   std::vector<__unsafe_unretained id<MTLResource>> &resources,
-                   std::vector<const MetalAllocation *> &tables) {
-    for (const std::weak_ptr<MetalAllocation> &weak : reached) {
-        const std::shared_ptr<MetalAllocation> allocation = weak.lock();
-        if (!allocation || !allocation->buffer) continue;
-        if (!allocation->reaches.empty()) {
-            if (std::ranges::find(tables, allocation.get()) != tables.end()) continue;
-            tables.push_back(allocation.get());
-        }
-        resources.push_back(allocation->buffer);
-        for (const TableReach &reach : allocation->reaches) appendReached(*reach.reached, resources, tables);
-    }
-}
-
-}  // namespace
 
 // Every Impl has an allocation, whose buffer is nil only while its memory is
 // released: only reserveBuffer, wrapSharedMemory and view create one.
@@ -974,6 +952,157 @@ struct MetalBackend::Impl {
         std::vector<std::shared_ptr<MetalAllocation>> retainedAllocations;
     };
 
+    // What an encoder makes resident for its dispatches (useResources), as
+    // opposed to the residency set (Residency), which keeps memory wired
+    // between commands. The rule: an encoder declares each buffer once per
+    // usage, from the first dispatch that uses it to the encoder's end, the
+    // buffers its dispatches list (AddressTable) for reading, or for reading
+    // and writing where a dispatch writes, and the Addressed buffers the
+    // bytes of a view a dispatch binds or lists reach as a table
+    // (setTableReach), and in turn the tables among them, for reading and
+    // writing. Metal makes a buffer resident for every usage an encoder
+    // declared. A buffer, a table or a reach is declared in an encoder when
+    // its stamp (declaredIn) holds the encoder's number, which counts the
+    // backend's encoders, so nothing is cleared between encoders. One serves
+    // a command and keeps nothing alive: the ticket keeps what its
+    // dispatches bind and list, the owner of a table what the table reaches.
+    class EncoderResidency final {
+    public:
+        // `encoders` counts the backend's encoders over all its commands.
+        explicit EncoderResidency(uint64_t &encoders) : encoders_(encoders) {}
+
+        // Declares for `encoder`, which follows the last one; the caller
+        // holds it until it ends.
+        void begin(id<MTLComputeCommandEncoder> encoder) {
+            encoder_ = encoder;
+            current_ = ++encoders_;
+        }
+
+        // Declares what the bytes of `view`, which a dispatch binds or
+        // lists, reach.
+        void reach(const MetalBuffer::Impl &view) {
+            for (const TableReach &range : view.allocation->reaches) {
+                if (range.offsetBytes >= view.offsetBytes + view.lengthBytes ||
+                    view.offsetBytes >= range.offsetBytes + range.lengthBytes)
+                    continue;
+                Reach &resolved = resolve(range.reached);
+                if (resolved.declaredIn == current_) continue;
+                resolved.declaredIn = current_;
+                use(resolved.allocations, true);
+            }
+        }
+
+        // Declares the buffers of `source`, an address table a dispatch
+        // lists, and what they reach; returns their GPU addresses as the
+        // command is encoded.
+        std::span<const uint64_t> listed(const std::vector<MetalBuffer> &source, bool writes) {
+            Table &table = resolve(source);
+            uint64_t &declared = table.declaredIn[writes];
+            if (declared != current_) {
+                declared = current_;
+                use(table.allocations, writes);
+                for (const MetalBuffer::Impl *view : table.reaching) reach(*view);
+            }
+            return table.addresses;
+        }
+
+    private:
+        // An address table (AddressTable), resolved once: its buffers' GPU
+        // addresses, their allocations, each once, and the entries whose
+        // bytes reach other buffers as a table.
+        struct Table {
+            const std::vector<MetalBuffer> *source = nullptr;
+            std::vector<uint64_t> addresses;
+            std::vector<MetalAllocation *> allocations;
+            std::vector<const MetalBuffer::Impl *> reaching;
+            uint64_t declaredIn[2] = {};
+        };
+
+        // A table reach (TableReach), resolved once: the allocations of the
+        // buffers it names that hold memory, and of what the tables among
+        // them reach in turn. It holds the names, so that no other vector
+        // takes their address while the command is encoded.
+        struct Reach {
+            std::shared_ptr<const std::vector<std::weak_ptr<MetalAllocation>>> source;
+            std::vector<MetalAllocation *> allocations;
+            uint64_t declaredIn = 0;
+        };
+
+        Table &resolve(const std::vector<MetalBuffer> &source) {
+            const auto known = std::ranges::find(tables_, &source, &Table::source);
+            if (known != tables_.end()) return *known;
+            Table &table = tables_.emplace_back();
+            table.source = &source;
+            table.addresses.reserve(source.size());
+            for (const MetalBuffer &entry : source) {
+                MetalAllocation *allocation = entry.impl_->allocation.get();
+                table.addresses.push_back(allocation->buffer.gpuAddress + entry.impl_->offsetBytes);
+                if (std::ranges::find(table.allocations, allocation) == table.allocations.end())
+                    table.allocations.push_back(allocation);
+                if (!allocation->reaches.empty()) table.reaching.push_back(entry.impl_.get());
+            }
+            return table;
+        }
+
+        Reach &resolve(const std::shared_ptr<const std::vector<std::weak_ptr<MetalAllocation>>> &source) {
+            const auto known = std::ranges::find(reaches_, source, &Reach::source);
+            if (known != reaches_.end()) return *known;
+            Reach &added = reaches_.emplace_back();
+            added.source = source;
+            std::vector<const MetalAllocation *> tables;
+            appendReached(*source, added.allocations, tables);
+            return added;
+        }
+
+        // Appends the allocations of the buffers `reached` names that hold
+        // memory, and what the tables among them reach in turn: a kernel may
+        // follow an address it reads in one table to the entries of another.
+        // Each table is followed once (`tables`), so one that reaches itself
+        // ends.
+        static void appendReached(const std::vector<std::weak_ptr<MetalAllocation>> &reached,
+                                  std::vector<MetalAllocation *> &allocations,
+                                  std::vector<const MetalAllocation *> &tables) {
+            for (const std::weak_ptr<MetalAllocation> &weak : reached) {
+                const std::shared_ptr<MetalAllocation> allocation = weak.lock();
+                if (!allocation || !allocation->buffer) continue;
+                if (!allocation->reaches.empty()) {
+                    if (std::ranges::find(tables, allocation.get()) != tables.end()) continue;
+                    tables.push_back(allocation.get());
+                }
+                allocations.push_back(allocation.get());
+                for (const TableReach &reach : allocation->reaches)
+                    appendReached(*reach.reached, allocations, tables);
+            }
+        }
+
+        // Makes the buffers of `allocations` the encoder has not declared for
+        // this usage resident, in one call: the backend's only useResources.
+        void use(std::span<MetalAllocation *const> allocations, bool writes) {
+            pending_.clear();
+            for (MetalAllocation *allocation : allocations) {
+                uint64_t &declared = allocation->declaredIn[writes];
+                if (declared == current_) continue;
+                declared = current_;
+                pending_.push_back(allocation->buffer);
+            }
+            if (!pending_.empty())
+                [encoder_ useResources:pending_.data()
+                                 count:pending_.size()
+                                 usage:writes ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead];
+        }
+
+        uint64_t &encoders_;
+        uint64_t current_ = 0;
+        __unsafe_unretained id<MTLComputeCommandEncoder> encoder_ = nil;
+        std::vector<Table> tables_;
+        std::vector<Reach> reaches_;
+        std::vector<__unsafe_unretained id<MTLResource>> pending_;
+    };
+
+    // Counts the encoders of the backend's commands (EncoderResidency). Used
+    // only by the submitting thread.
+    uint64_t encoderSequence = 0;
+
     std::function<void()> operationGuard;
 
 #ifdef SPLASH_BACKEND_INSTRUMENTATION
@@ -1485,104 +1614,7 @@ struct MetalBackend::Impl {
                 // keep the buffers alive.
                 __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
                 NSUInteger offsets[kBufferArgumentEntries];
-                // The command's address tables (AddressTable), each resolved
-                // once: its buffers' GPU addresses as they are now, the
-                // distinct Metal buffers behind them, and what the bytes of
-                // the tables among them reach (TableReach), as for a binding.
-                struct ResolvedTable {
-                    const std::vector<MetalBuffer> *source = nullptr;
-                    std::vector<uint64_t> addresses;
-                    std::vector<__unsafe_unretained id<MTLResource>> resources;
-                    std::vector<__unsafe_unretained id<MTLResource>> reached;
-                };
-                std::vector<ResolvedTable> tables;
-                // The command's table reaches (TableReach), each resolved once:
-                // the memory of the buffers it names that is allocated now,
-                // and what they reach in turn (appendReached).
-                struct ResolvedReach {
-                    std::shared_ptr<const std::vector<std::weak_ptr<MetalAllocation>>> source;
-                    std::vector<__unsafe_unretained id<MTLResource>> resources;
-                };
-                std::vector<ResolvedReach> reaches;
-                // Whether the bytes of `view` hold any of `reach`'s entries.
-                const auto overlaps = [](const TableReach &reach, const MetalBuffer::Impl &view) {
-                    return reach.offsetBytes < view.offsetBytes + view.lengthBytes &&
-                           view.offsetBytes < reach.offsetBytes + reach.lengthBytes;
-                };
-                const auto resolve = [&](const std::vector<MetalBuffer> &source) -> const ResolvedTable & {
-                    for (const ResolvedTable &table : tables)
-                        if (table.source == &source) return table;
-                    ResolvedTable &table = tables.emplace_back();
-                    table.source = &source;
-                    table.addresses.reserve(source.size());
-                    std::vector<const void *> sources;
-                    std::vector<const MetalAllocation *> followed;
-                    for (const MetalBuffer &entry : source) {
-                        const MetalBuffer::Impl &buffer = *entry.impl_;
-                        id<MTLBuffer> memory = buffer.allocation->buffer;
-                        table.addresses.push_back(memory.gpuAddress + buffer.offsetBytes);
-                        if (std::ranges::find(table.resources, memory) == table.resources.end())
-                            table.resources.push_back(memory);
-                        for (const TableReach &reach : buffer.allocation->reaches) {
-                            if (!overlaps(reach, buffer) ||
-                                std::ranges::find(sources, reach.reached.get()) != sources.end())
-                                continue;
-                            sources.push_back(reach.reached.get());
-                            appendReached(*reach.reached, table.reached, followed);
-                        }
-                    }
-                    return table;
-                };
-                // The tables and reaches `encoder` already made resident, and
-                // whether for writing, and the memory reaches made resident:
-                // a declaration lasts for the encoder.
-                std::vector<std::pair<const void *, bool>> declared;
-                std::unordered_set<const void *> declaredReached;
-                std::vector<__unsafe_unretained id<MTLResource>> undeclared;
-                // Makes memory tables reach resident, for reading and
-                // writing, each buffer once in the encoder.
-                const auto useReached = [&](const std::vector<__unsafe_unretained id<MTLResource>> &resources) {
-                    undeclared.clear();
-                    for (id<MTLResource> memory : resources)
-                        if (declaredReached.insert((__bridge const void *)memory).second)
-                            undeclared.push_back(memory);
-                    if (!undeclared.empty())
-                        [encoder useResources:undeclared.data()
-                                        count:undeclared.size()
-                                        usage:MTLResourceUsageRead | MTLResourceUsageWrite];
-                };
-                const auto declare = [&](const ResolvedTable &table, bool writes) {
-                    const std::pair use{static_cast<const void *>(table.source), writes};
-                    if (std::ranges::find(declared, use) != declared.end()) return;
-                    if (!table.resources.empty())
-                        [encoder useResources:table.resources.data()
-                                        count:table.resources.size()
-                                        usage:writes ? MTLResourceUsageRead | MTLResourceUsageWrite
-                                                     : MTLResourceUsageRead];
-                    declared.push_back(use);
-                    useReached(table.reached);
-                };
-                // Declares what the bytes a dispatch binds of a table reach.
-                const auto declareReach = [&](const MetalBuffer::Impl &bound) {
-                    for (const TableReach &reach : bound.allocation->reaches) {
-                        if (!overlaps(reach, bound)) continue;
-                        auto resolved = std::ranges::find(reaches, reach.reached, &ResolvedReach::source);
-                        if (resolved == reaches.end()) {
-                            ResolvedReach &added = reaches.emplace_back();
-                            added.source = reach.reached;
-                            added.resources.reserve(reach.reached->size());
-                            std::vector<const MetalAllocation *> followed;
-                            appendReached(*reach.reached, added.resources, followed);
-                            resolved = std::prev(reaches.end());
-                        }
-                        // Tables that reach the same memory (a lane's page and
-                        // index tables, lanes sharing a prefix) declare it once.
-                        const std::pair use{static_cast<const void *>(resolved->source.get()), true};
-                        if (std::ranges::find(declared, use) != declared.end()) continue;
-                        declared.push_back(use);
-                        useReached(resolved->resources);
-                    }
-                };
+                EncoderResidency encoderResidency(encoderSequence);
                 for (size_t index = 0; index < dispatches.size(); ++index) {
                     encodeSteps(index);
                     const PreparedDispatch &item = dispatches[index];
@@ -1592,15 +1624,14 @@ struct MetalBackend::Impl {
                         if (!encoder) {
                             failEncoding("unable to create Metal compute encoder");
                         }
-                        declared.clear();
-                        declaredReached.clear();
+                        encoderResidency.begin(encoder);
                     }
                     [encoder setComputePipelineState:item.pipeline];
                     for (const BufferBinding &binding : dispatch.buffers) {
                         const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
                         buffers[binding.index] = buffer.allocation->buffer;
                         offsets[binding.index] = buffer.offsetBytes;
-                        if (!buffer.allocation->reaches.empty()) declareReach(buffer);
+                        encoderResidency.reach(buffer);
                     }
                     // One call per run of consecutive entries: a command graph's
                     // dispatch binds a single run.
@@ -1618,11 +1649,11 @@ struct MetalBackend::Impl {
                                   atIndex:binding.index];
                     }
                     if (const std::vector<MetalBuffer> *source = dispatch.addresses.buffers.get()) {
-                        const ResolvedTable &table = resolve(*source);
-                        [encoder setBytes:table.addresses.data()
-                                   length:table.addresses.size() * sizeof(uint64_t)
+                        const std::span<const uint64_t> addresses =
+                            encoderResidency.listed(*source, dispatch.addresses.writes);
+                        [encoder setBytes:addresses.data()
+                                   length:addresses.size_bytes()
                                   atIndex:dispatch.addresses.index];
-                        declare(table, dispatch.addresses.writes);
                     }
                     const IndirectGrid &grid = dispatch.indirectThreadgroups;
                     if (grid.buffer) {

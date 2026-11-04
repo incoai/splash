@@ -26,6 +26,7 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -1352,6 +1353,77 @@ void tablesBringWhatTheyReach(const std::string &metallibPath) {
     require(declaredOnce({"outer", "inner", "leaf"}),
             "an encoder did not make what a table reaching itself reaches resident once");
     std::cout << "PASS tables bring what they reach\n";
+}
+
+// An encoder declares each buffer once per usage, however many of its
+// dispatches list it or tables reach it: x listed by two tables, y listed
+// for writing and then for reading by one, l listed for writing and reached
+// by a bound table, and r, a table that reaches rleaf, listed first for
+// writing and then for reading.
+void encodersDeclareEachUseOnce(const std::string &metallibPath) {
+    EncoderUses recorded;
+    MetalBackend backend(metallibPath);
+    constexpr uint64_t kBytes = 256;
+    const auto buffer = [&](const char *label, BufferReach reach = BufferReach::Bound) {
+        return backend.allocateBuffer(kBytes, BufferStorage::Shared, label, reach);
+    };
+    const MetalBuffer x = buffer("x"), y = buffer("y"), l = buffer("l", BufferReach::Addressed);
+    const MetalBuffer t = buffer("t"), r = buffer("r"), rleaf = buffer("rleaf", BufferReach::Addressed);
+    *static_cast<uint64_t *>(t.contents()) = l.gpuAddress();
+    backend.setTableReach(backend.view(t, 0, sizeof(uint64_t)), std::span(&l, 1));
+    *static_cast<uint64_t *>(r.contents()) = rleaf.gpuAddress();
+    backend.setTableReach(backend.view(r, 0, sizeof(uint64_t)), std::span(&rleaf, 1));
+    MetalBuffer mismatches = sharedBuffer(backend, sizeof(uint32_t));
+    const auto list = [](const MetalBuffer &buffer) { return std::make_shared<std::vector<MetalBuffer>>(1, buffer); };
+
+    // Kernels that touch no word: the test is what the encoder declares.
+    struct TableParams {
+        uint32_t words;
+        uint32_t seed;
+    };
+    const TableParams none{0, 0};
+    const uint32_t words = 0, seed = 0;
+    CommandGraph graph;
+    const auto read = [&](std::shared_ptr<std::vector<MetalBuffer>> table) {
+        graph.add("address_table_check_u32", {mismatches}, none, {1, 1, 1}, {1, 1, 1});
+        graph.addresses(std::move(table));
+    };
+    const auto write = [&](std::shared_ptr<std::vector<MetalBuffer>> table) {
+        graph.add("address_table_write_u32", {}, none, {1, 1, 1}, {1, 1, 1});
+        graph.addresses(std::move(table), true);
+    };
+    read(list(x));
+    read(list(x));
+    const auto ys = list(y);
+    write(ys);
+    read(ys);
+    write(list(l));
+    const auto rs = list(r);
+    write(rs);
+    read(rs);
+    // t, bound after l is listed, reaches l.
+    std::vector<ComputeDispatch> dispatches(graph.dispatches().begin(), graph.dispatches().end());
+    dispatches.insert(dispatches.begin() + 5,
+                      {"addressed_check_u32", {{0, t}, {3, mismatches}},
+                       {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}}, {1, 1, 1}, {1, 1, 1}});
+
+    recorded.uses.clear();
+    (void)backend.submitCommandAsync(dispatches).wait();
+    // How many times the encoder declared each buffer for reading ("r") and
+    // for writing ("w").
+    using Uses = std::map<std::string, int>;
+    Uses declared;
+    for (const EncoderUses::Use &use : recorded.uses)
+        for (const std::string &label : use.labels)
+            ++declared[label + (use.usage & MTLResourceUsageWrite ? ":w" : ":r")];
+    const Uses expected{{"x:r", 1}, {"y:w", 1}, {"y:r", 1}, {"l:w", 1}, {"r:w", 1}, {"r:r", 1}, {"rleaf:w", 1}};
+    const auto describe = [](const Uses &uses) {
+        std::string text;
+        for (const auto &[use, count] : uses) text += " " + use + "=" + std::to_string(count);
+        return text;
+    };
+    require(declared == expected, "the encoder declared" + describe(declared) + " instead of" + describe(expected));
+    std::cout << "PASS encoders declare each use once\n";
 }
 
 // Bindings of consecutive entries reach Metal as one run, each buffer at its
@@ -2789,6 +2861,7 @@ std::span<const splash::test::TestCase> behaviourTests() {
         {"buffersReachedThroughTables", [] { buffersReachedThroughTables(metallib); }},
         {"addressTables", [] { addressTables(metallib); }},
         {"tablesBringWhatTheyReach", [] { tablesBringWhatTheyReach(metallib); }},
+        {"encodersDeclareEachUseOnce", [] { encodersDeclareEachUseOnce(metallib); }},
         {"run", [] { run(metallib); }},
     };
     return kTests;
