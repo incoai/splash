@@ -13,8 +13,6 @@
 namespace splash::engine {
 namespace {
 
-uint64_t remaining(uint64_t bytes, uint64_t taken) noexcept { return bytes > taken ? bytes - taken : 0; }
-
 std::string bytesAndMiB(uint64_t bytes) {
   std::ostringstream out;
   out << bytes << " bytes (" << std::fixed << std::setprecision(2)
@@ -455,7 +453,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
       .window = model.maximumContextTokens,
       .resident = static_cast<uint32_t>(std::min<uint64_t>(
           model.maximumContextTokens,
-          remaining(breakdown.kvCapacityTokens, model::ExecutionLimits::speculativeScratchTokens))),
+          saturatingSubtract(breakdown.kvCapacityTokens, model::ExecutionLimits::speculativeScratchTokens))),
       .spilled = spill.memoryTokens,
       .disk = spill.diskTokens};
   if (!breakdown.kvExtentPages ||

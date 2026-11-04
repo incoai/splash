@@ -22,8 +22,6 @@ constexpr uint32_t kSpillWindowPages = 64;
 
 uint64_t pagesOf(uint64_t tokens) noexcept { return (tokens + kv::kPageTokens - 1) / kv::kPageTokens; }
 
-uint64_t remaining(uint64_t bytes, uint64_t taken) noexcept { return bytes > taken ? bytes - taken : 0; }
-
 // The KV of a context of `tokens` tokens holds its speculative rows too.
 uint64_t kvTokens(uint64_t tokens) noexcept { return tokens + model::ExecutionLimits::speculativeScratchTokens; }
 
@@ -112,7 +110,7 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
           extentsBytes(shape.requiredSlots(1) >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS, extentPages,
                        layout.kvBytesPerModelPage()),
       .indexRunwayBytes = uint64_t{extentPages} * layout.indexBytesPerModelPage()};
-  const uint64_t room = remaining(in.hardBudgetBytes, floors);
+  const uint64_t room = saturatingSubtract(in.hardBudgetBytes, floors);
   const auto fits = [&](uint32_t tokens) { return spillFloors.bytes(tokens, 1) <= room; };
   if (!fits(0)) return spill;
   // The longest context the floors hold, and the longest the SSD cache's
@@ -134,8 +132,9 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
   spill.diskTokens = static_cast<uint32_t>(std::min<uint64_t>(
       in.windowTokens,
       std::max<uint64_t>(in.relaunchContextTokens,
-                         in.kvSlotBytes ? remaining(in.activeLimitBytes, states) / in.kvSlotBytes * kv::kPageTokens
-                                        : 0)));
+                         in.kvSlotBytes
+                             ? saturatingSubtract(in.activeLimitBytes, states) / in.kvSlotBytes * kv::kPageTokens
+                             : 0)));
   spill.floorTokens = std::min({in.requestedContextTokens ? in.requestedContextTokens : in.windowTokens,
                                 spill.memoryTokens, spill.diskTokens});
   // One buffer until the stores are placed (planParts).
@@ -177,7 +176,7 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
   // A plan that spills holds the arenas of a runtime whose K/V spills
   // instead, at least as large, beside which its spill floors must fit.
   uint64_t spillFloors = 0;
-  if (!checkedAdd(floors, remaining(spillArenaBytes, arenaBytes), spillFloors)) return overflow();
+  if (!checkedAdd(floors, saturatingSubtract(spillArenaBytes, arenaBytes), spillFloors)) return overflow();
   StreamedMemoryPlan plan{.spill = planSpill(in, spillFloors)};
   KvSpillPlan &spill = plan.spill;
   if (spill.enabled) floors = spillFloors;
@@ -197,7 +196,7 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
       return {std::nullopt, "--sparse-kv-memory of " + std::to_string(target / kMiB) +
                                 " MiB is less than the hot block cache's floor, " +
                                 std::to_string(spill.hotFloorBytes / kMiB) + " MiB"};
-    const uint64_t readers = spill.readerBytes(), added = remaining(target, readers);
+    const uint64_t readers = spill.readerBytes(), added = saturatingSubtract(target, readers);
     if (added > in.hardBudgetBytes - floors)
       return {std::nullopt, "--sparse-kv-memory of " + std::to_string(target / kMiB) +
                                 " MiB is more than the readers' floor, the larger of the hot block cache's floor "
@@ -231,10 +230,12 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
     // extents of its own.
     const uint32_t floorPages = kvWindowFloorPages(layout, streaming ? in.groupPages : 0);
     return static_cast<int64_t>(
-        remaining(kvPagesBytes(layout, budget, floorPages, layout.extentPagesFor(budget)), runwayBytes));
+        saturatingSubtract(kvPagesBytes(layout, budget, floorPages, layout.extentPagesFor(budget)), runwayBytes));
   };
   const int64_t tableShare =
-      table.automatic ? static_cast<int64_t>(remaining(std::min(table.all, in.tableShareBytes), table.charged)) : 0;
+      table.automatic
+          ? static_cast<int64_t>(saturatingSubtract(std::min(table.all, in.tableShareBytes), table.charged))
+          : 0;
   bool expertsStream = experts.streams;
   plan.expertBytes = experts.streams ? experts.charged : 0;
   if (experts.automatic) {

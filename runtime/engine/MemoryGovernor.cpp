@@ -1,5 +1,6 @@
 #include "engine/MemoryGovernor.hpp"
 
+#include "Checked.hpp"
 #include "engine/Engine.hpp"
 #include "engine/MemoryPlan.hpp"
 
@@ -30,10 +31,7 @@ uint64_t compressionSavings(const HostMemoryPages &pages) noexcept {
 // The host's spare memory above its spare reserve, beside `reservedBytes`
 // being allocated: the room growth no request in service needs takes from.
 uint64_t spareHeadroom(const HostMemory &host, uint64_t spareReserveBytes, uint64_t reservedBytes) noexcept {
-  if (host.spare <= spareReserveBytes)
-    return 0;
-  const uint64_t spareAfterReserve = host.spare - spareReserveBytes;
-  return reservedBytes < spareAfterReserve ? spareAfterReserve - reservedBytes : 0;
+  return saturatingSubtract(saturatingSubtract(host.spare, spareReserveBytes), reservedBytes);
 }
 
 // The host's page counts and page size; false when macOS reports neither.
@@ -61,15 +59,13 @@ HostMemory estimateHostMemory(const HostMemoryPages &statistics, uint64_t pageSi
   // free_count includes the speculative pages, which external_page_count
   // also counts; wired file pages are in neither.
   if (!pageSize || statistics.speculative > statistics.free) return {};
-  const uint64_t maximum = std::numeric_limits<uint64_t>::max();
   uint64_t pages = statistics.free - statistics.speculative;
-  for (uint64_t reclaimable : {statistics.fileBacked, statistics.purgeable}) {
-    if (reclaimable > maximum - pages) return {};
-    pages += reclaimable;
-  }
+  for (uint64_t reclaimable : {statistics.fileBacked, statistics.purgeable})
+    if (!checkedAdd(pages, reclaimable, pages)) return {};
   const uint64_t credit = compression ? compressionSavings(statistics) : 0;
-  if (credit > maximum - pages || pages + credit > maximum / pageSize) return {};
-  return {(pages + credit) * pageSize, (pages + credit / 2) * pageSize};
+  uint64_t available = 0;
+  if (!checkedAdd(pages, credit, available) || !checkedMultiply(available, pageSize, available)) return {};
+  return {available, (pages + credit / 2) * pageSize};
 }
 
 std::optional<HostMemory> queryHostMemory() noexcept {
@@ -187,12 +183,8 @@ MemoryGovernor::chargedBytes(bool refreshDevice) const noexcept {
       : backend_.memoryStats();
   // The backend's buffers are charged in full, the rest of the device's
   // footprint only where it exceeds the untracked reserve.
-  const uint64_t limit = std::numeric_limits<uint64_t>::max();
-  const uint64_t accounted = untrackedReserveBytes_ <= limit - memory.allocatedBytes
-      ? memory.allocatedBytes + untrackedReserveBytes_
-      : limit;
-  const uint64_t device = std::max(accounted, memory.deviceCurrentAllocatedBytes);
-  return hostHeldBytes_ <= limit - device ? device + hostHeldBytes_ : limit;
+  const uint64_t accounted = saturatingAdd(memory.allocatedBytes, untrackedReserveBytes_);
+  return saturatingAdd(std::max(accounted, memory.deviceCurrentAllocatedBytes), hostHeldBytes_);
 }
 
 std::optional<HostMemory> MemoryGovernor::sampleHost() const noexcept {
@@ -211,8 +203,8 @@ uint64_t MemoryGovernor::hostHeadroomBytes(const std::optional<HostMemory> &host
 uint64_t MemoryGovernor::unseenGrowthBytes(const std::optional<HostMemory> &host) const noexcept {
   if (!host || clockMilliseconds_ >= unseenGrowthUntilMilliseconds_)
     return 0;
-  const uint64_t fallen = unseenGrowthHeadroom_ - std::min(unseenGrowthHeadroom_, hostHeadroomBytes(host, 0));
-  return unseenGrowthBytes_ - std::min(unseenGrowthBytes_, fallen);
+  const uint64_t fallen = saturatingSubtract(unseenGrowthHeadroom_, hostHeadroomBytes(host, 0));
+  return saturatingSubtract(unseenGrowthBytes_, fallen);
 }
 
 std::optional<MemoryGovernor::Reservation>
@@ -222,15 +214,12 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   }
   if (!scope_)
     throw std::logic_error("memory was allocated outside a claim's scope");
-  uint64_t observed = chargedBytes(true);
-  bool overflows =
-      reservedBytes_ > std::numeric_limits<uint64_t>::max() - bytes;
-  uint64_t requested =
-      overflows ? std::numeric_limits<uint64_t>::max() : reservedBytes_ + bytes;
+  const uint64_t observed = chargedBytes(true);
+  uint64_t requested = 0;
+  const bool overflows = !checkedAdd(reservedBytes_, bytes, requested);
   const std::optional<HostMemory> host = sampleHost();
   sampleHostRule(host);
-  bool engineFits = !overflows && observed <= limitBytes_ &&
-                    requested <= limitBytes_ - observed;
+  const bool engineFits = !overflows && observed <= limitBytes_ && requested <= limitBytes_ - observed;
   // The room claims ranked above the scope's claim hold is not its, and the
   // host admits it by its class.
   const ClaimState &claim = ledger_.claim(scope_);
@@ -299,13 +288,8 @@ MemoryGovernorSnapshot MemoryGovernor::evaluate() noexcept {
 MemoryGovernorSnapshot
 MemoryGovernor::snapshot(const std::optional<HostMemory> &hostMemory,
                          const HostRule &rule) const noexcept {
-  uint64_t observed = chargedBytes();
-  uint64_t used = observed;
-  if (reservedBytes_ <= std::numeric_limits<uint64_t>::max() - used) {
-    used += reservedBytes_;
-  } else {
-    used = std::numeric_limits<uint64_t>::max();
-  }
+  const uint64_t observed = chargedBytes();
+  const uint64_t used = saturatingAdd(observed, reservedBytes_);
   uint64_t hostHeadroom = hostHeadroomBytes(hostMemory, reservedBytes_ + unseenGrowthBytes(hostMemory));
   const MemoryPressure pressure = rule.level() == MemoryPressure::Critical ? MemoryPressure::Critical
                                   : rule.constrained()                     ? MemoryPressure::Warning
@@ -314,7 +298,7 @@ MemoryGovernor::snapshot(const std::optional<HostMemory> &hostMemory,
   MemoryGovernorSnapshot snapshot{
       limitBytes_,
       observed,
-      used < limitBytes_ ? limitBytes_ - used : 0,
+      saturatingSubtract(limitBytes_, used),
       pressure,
       deniedReservations_,
       hostMemory.has_value(),
@@ -330,13 +314,7 @@ MemoryGovernor::snapshot(const std::optional<HostMemory> &hostMemory,
   return snapshot;
 }
 
-void MemoryGovernor::release(uint64_t bytes) noexcept {
-  if (bytes > reservedBytes_) {
-    reservedBytes_ = 0;
-    return;
-  }
-  reservedBytes_ -= bytes;
-}
+void MemoryGovernor::release(uint64_t bytes) noexcept { reservedBytes_ = saturatingSubtract(reservedBytes_, bytes); }
 
 MemoryGovernor::Scope::Scope(MemoryGovernor &governor, ClaimId claim) noexcept
     : governor_(governor), previousClaim_(std::exchange(governor.scope_, claim)) {}
@@ -372,11 +350,8 @@ uint64_t MemoryGovernor::HostRule::deficitBytes(uint64_t refusedWaitingBytes, ui
   // memory must be given back.
   if (!measured_)
     return 0;
-  const uint64_t wanted = refusedWaitingBytes <= std::numeric_limits<uint64_t>::max() - kHostMarginBytes
-                              ? kHostMarginBytes + refusedWaitingBytes
-                              : std::numeric_limits<uint64_t>::max();
-  const uint64_t lacking = wanted > headroom_ ? wanted - headroom_ : 0;
-  return lacking > returningBytes ? lacking - returningBytes : 0;
+  const uint64_t lacking = saturatingSubtract(saturatingAdd(kHostMarginBytes, refusedWaitingBytes), headroom_);
+  return saturatingSubtract(lacking, returningBytes);
 }
 
 void MemoryGovernor::sampleHostRule(const std::optional<HostMemory> &host) noexcept {
@@ -388,8 +363,7 @@ void MemoryGovernor::sampleHostRule(const std::optional<HostMemory> &host) noexc
 }
 
 uint64_t MemoryGovernor::roomBytes() const noexcept {
-  const uint64_t used = chargedBytes();
-  return used <= limitBytes_ && reservedBytes_ <= limitBytes_ - used ? limitBytes_ - used - reservedBytes_ : 0;
+  return saturatingSubtract(saturatingSubtract(limitBytes_, chargedBytes()), reservedBytes_);
 }
 
 Need MemoryGovernor::need(ClaimId claim, const std::optional<Need> &inPlace) const {
@@ -407,7 +381,7 @@ std::array<uint32_t, 3> MemoryGovernor::heldPages(ClaimId claim) const {
   const std::optional<HostMemory> host = sampleHost();
   const uint64_t headroom = hostHeadroomBytes(host, reservedBytes_ + unseenGrowthBytes(host));
   const uint64_t hostRoom =
-      host && systemPressure_ == MemoryPressure::Normal && headroom > kHostMarginBytes ? headroom - kHostMarginBytes : 0;
+      host && systemPressure_ == MemoryPressure::Normal ? saturatingSubtract(headroom, kHostMarginBytes) : 0;
   return ledger_.heldPages(claim, std::min(roomBytes(), hostRoom));
 }
 
@@ -451,8 +425,7 @@ FreeResult MemoryGovernor::hostPass(uint64_t target, bool critical) {
 uint64_t MemoryGovernor::hostBytes(ClaimClass cls, uint64_t bytes) const noexcept {
   if (cls != ClaimClass::Growth)
     return bytes;
-  const uint64_t more = ledger_.laneDemandBytes();
-  return bytes <= std::numeric_limits<uint64_t>::max() - more ? bytes + more : std::numeric_limits<uint64_t>::max();
+  return saturatingAdd(bytes, ledger_.laneDemandBytes());
 }
 
 GrowthHost MemoryGovernor::growthHost(bool paced) {
