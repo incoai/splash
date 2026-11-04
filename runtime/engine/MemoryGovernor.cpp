@@ -1,5 +1,6 @@
 #include "engine/MemoryGovernor.hpp"
 
+#include "engine/Engine.hpp"
 #include "engine/MemoryPlan.hpp"
 
 #include <dispatch/dispatch.h>
@@ -26,6 +27,33 @@ uint64_t compressionSavings(const HostMemoryPages &pages) noexcept {
          static_cast<uint64_t>(static_cast<unsigned __int128>(pages.anonymous) * pages.compressor / pages.compressed);
 }
 
+// The host's spare memory above its spare reserve, beside `reservedBytes`
+// being allocated: the room growth no request in service needs takes from.
+uint64_t spareHeadroom(const HostMemory &host, uint64_t spareReserveBytes, uint64_t reservedBytes) noexcept {
+  if (host.spare <= spareReserveBytes)
+    return 0;
+  const uint64_t spareAfterReserve = host.spare - spareReserveBytes;
+  return reservedBytes < spareAfterReserve ? spareAfterReserve - reservedBytes : 0;
+}
+
+// The host's page counts and page size; false when macOS reports neither.
+bool sampleHostPages(vm_statistics64_data_t &pages, vm_size_t &pageSize) noexcept {
+  mach_port_t host = mach_host_self();
+  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+  const kern_return_t pageResult = host_page_size(host, &pageSize);
+  const kern_return_t pagesResult =
+      pageResult == KERN_SUCCESS
+          ? host_statistics64(host, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&pages), &count)
+          : pageResult;
+  mach_port_deallocate(mach_task_self(), host);
+  return pagesResult == KERN_SUCCESS && pageSize;
+}
+
+// The class whose rule the host applies to a claim: memory a lane in
+// service takes in any case (ClaimSpec::laneNeeds) it judges as the lane's
+// growth.
+ClaimClass hostClass(const ClaimSpec &spec) noexcept { return spec.laneNeeds ? ClaimClass::InService : spec.cls; }
+
 } // namespace
 
 HostMemory estimateHostMemory(const HostMemoryPages &statistics, uint64_t pageSize,
@@ -45,18 +73,9 @@ HostMemory estimateHostMemory(const HostMemoryPages &statistics, uint64_t pageSi
 }
 
 std::optional<HostMemory> queryHostMemory() noexcept {
-  mach_port_t host = mach_host_self();
   vm_size_t pageSize = 0;
   vm_statistics64_data_t statistics{};
-  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-  kern_return_t pageResult = host_page_size(host, &pageSize);
-  kern_return_t statisticsResult = pageResult == KERN_SUCCESS
-      ? host_statistics64(host, HOST_VM_INFO64,
-                          reinterpret_cast<host_info64_t>(&statistics),
-                          &count)
-      : pageResult;
-  mach_port_deallocate(mach_task_self(), host);
-  if (statisticsResult != KERN_SUCCESS || !pageSize) return std::nullopt;
+  if (!sampleHostPages(statistics, pageSize)) return std::nullopt;
 
   return estimateHostMemory(
       {.free = statistics.free_count,
@@ -67,6 +86,31 @@ std::optional<HostMemory> queryHostMemory() noexcept {
        .compressor = statistics.compressor_page_count,
        .compressed = statistics.total_uncompressed_pages_in_compressor},
       pageSize, querySystemMemoryPressure().value_or(MemoryPressure::Critical) != MemoryPressure::Critical);
+}
+
+HostTelemetry hostTelemetryOf(const task_vm_info &task, const vm_statistics64 &pages, uint64_t fileCacheMinimumPages,
+                              uint64_t pageSize) noexcept {
+  return {.physFootprintBytes = task.phys_footprint,
+          .compressedBytes = task.compressed,
+          .fileBackedBytes = uint64_t{pages.external_page_count} * pageSize,
+          .inactiveBytes = (uint64_t{pages.inactive_count} + pages.speculative_count) * pageSize,
+          .fileCacheMinimumBytes = fileCacheMinimumPages * pageSize};
+}
+
+std::optional<HostTelemetry> queryHostTelemetry() noexcept {
+  task_vm_info_data_t task{};
+  mach_msg_type_number_t taskCount = TASK_VM_INFO_COUNT;
+  if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&task), &taskCount) != KERN_SUCCESS)
+    return std::nullopt;
+  vm_size_t pageSize = 0;
+  vm_statistics64_data_t pages{};
+  uint32_t fileCacheMinimum = 0;
+  size_t size = sizeof(fileCacheMinimum);
+  if (!sampleHostPages(pages, pageSize) ||
+      sysctlbyname("vm.vm_page_filecache_min", &fileCacheMinimum, &size, nullptr, 0) != 0 ||
+      size != sizeof(fileCacheMinimum))
+    return std::nullopt;
+  return hostTelemetryOf(task, pages, fileCacheMinimum, pageSize);
 }
 
 std::optional<MemoryPressure> querySystemMemoryPressure() noexcept {
@@ -161,79 +205,63 @@ std::optional<HostMemory> MemoryGovernor::sampleHost() const noexcept {
 
 uint64_t MemoryGovernor::hostHeadroomBytes(const std::optional<HostMemory> &host,
                                            uint64_t reservedBytes) const noexcept {
-  if (!host || host->spare <= hostSpareReserveBytes_)
+  return host ? spareHeadroom(*host, hostSpareReserveBytes_, reservedBytes) : 0;
+}
+
+uint64_t MemoryGovernor::unseenGrowthBytes(const std::optional<HostMemory> &host) const noexcept {
+  if (!host || clockMilliseconds_ >= unseenGrowthUntilMilliseconds_)
     return 0;
-  const uint64_t spareAfterReserve = host->spare - hostSpareReserveBytes_;
-  return reservedBytes < spareAfterReserve ? spareAfterReserve - reservedBytes : 0;
+  const uint64_t fallen = unseenGrowthHeadroom_ - std::min(unseenGrowthHeadroom_, hostHeadroomBytes(host, 0));
+  return unseenGrowthBytes_ - std::min(unseenGrowthBytes_, fallen);
 }
 
 std::optional<MemoryGovernor::Reservation>
-MemoryGovernor::tryReserve(uint64_t bytes, bool optional, metal::AllocationFailure &failure) {
+MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   if (!bytes) {
     throw std::invalid_argument("memory reservation must be positive");
   }
+  if (!scope_)
+    throw std::logic_error("memory was allocated outside a claim's scope");
   uint64_t observed = chargedBytes(true);
   bool overflows =
       reservedBytes_ > std::numeric_limits<uint64_t>::max() - bytes;
   uint64_t requested =
       overflows ? std::numeric_limits<uint64_t>::max() : reservedBytes_ + bytes;
   const std::optional<HostMemory> host = sampleHost();
-  host_ = hostState(host);
-  const MemoryPressure pressure = effectivePressure(host_);
+  sampleHostRule(host);
   bool engineFits = !overflows && observed <= limitBytes_ &&
                     requested <= limitBytes_ - observed;
-  // Growth leaves the warning margin free above the host's spare reserve,
-  // stops while macOS warns and, while a request waits for memory, waits for
-  // the recovery margin once the host has run short, unless a request in
-  // service needs it (setServing). Optional growth leaves the recovery
-  // margin free, whatever the mark, but takes from the host only the bytes
-  // beyond those the engine returned to the system for it (setGrowthCredit):
-  // with none beyond them, no margin holds it back on a measured host.
-  const bool serving = serving_ && !optional;
-  const uint64_t hostRoom = hostHeadroomBytes(host, 0);
-  const uint64_t margin = optional ? kHostRecoveryMarginBytes : kHostWarningMarginBytes;
-  const uint64_t credited = optional ? std::min(bytes, growthCreditBytes_) : 0;
-  const uint64_t hostRequested = requested - credited;
-  const bool hostRoomFits =
-      host && (credited == bytes || (hostRequested <= hostRoom && hostRoom - hostRequested >= margin));
-  // A request that only the host headroom refuses waits for host memory
-  // while the idle headroom may still clear the margin. Hold host pressure:
-  // once a control pass finds the request waiting, the paced reclaim frees
-  // toward the recovery margin for it. Optional growth that the host
-  // refuses is done without, and asks no reclaim.
-  if (engineFits && !serving && !optional && !hostRoomFits)
-    host_.constrained = true;
-  const bool hostRefuses =
-      pressure == MemoryPressure::Critical ||
-      (!serving && (systemPressure_ == MemoryPressure::Warning || !hostRoomFits ||
-                    growthHeld(host_)));
-  if (hostRefuses || !engineFits) {
+  // The room claims ranked above the scope's claim hold is not its, and the
+  // host admits it by its class.
+  const ClaimState &claim = ledger_.claim(scope_);
+  const bool fits = engineFits && ledger_.heldBytes(scope_) <= limitBytes_ - observed - requested;
+  const ClaimClass cls = hostClass(claim.spec);
+  const bool hostAdmits = hostRule_.admits(cls, hostBytes(cls, bytes), claim.hostExempt);
+  if (!fits || !hostAdmits) {
     // The host's refusal lifts with its pressure, the limit's only once
     // memory is freed: a refusal they share is the host's.
-    failure = hostRefuses ? metal::AllocationFailure::HostPressure
-                          : metal::AllocationFailure::EngineBudget;
-    if (deniedReservations_ != std::numeric_limits<uint64_t>::max()) {
+    failure = hostAdmits ? metal::AllocationFailure::EngineBudget : metal::AllocationFailure::HostPressure;
+    if (deniedReservations_ != std::numeric_limits<uint64_t>::max())
       ++deniedReservations_;
-    }
+    ledger_.refused(scope_, {.bytes = bytes, .hostRefused = !hostAdmits});
     return std::nullopt;
+  }
+  // A pool's growth reaches the host's counters only as it fills: until
+  // they show it, or the host has settled, the host's rule counts what it
+  // admitted on its margin.
+  if (claim.spec.cls == ClaimClass::Growth && host) {
+    unseenGrowthBytes_ = unseenGrowthBytes(host) + bytes;
+    unseenGrowthHeadroom_ = hostHeadroomBytes(host, 0);
+    unseenGrowthUntilMilliseconds_ = clockMilliseconds_ + kHostSettleMilliseconds;
   }
   reservedBytes_ = requested;
   return Reservation(this, bytes);
 }
 
 metal::AllocationAdmission MemoryGovernor::allocationAdmission() noexcept {
-  return admission(false);
-}
-
-metal::AllocationAdmission MemoryGovernor::growthAdmission() noexcept {
-  return admission(true);
-}
-
-metal::AllocationAdmission MemoryGovernor::admission(bool optional) noexcept {
-  return [this, optional](uint64_t bytes, const std::function<void()> &allocate)
-             -> metal::AllocationResult {
+  return [this](uint64_t bytes, const std::function<void()> &allocate) -> metal::AllocationResult {
     metal::AllocationFailure failure;
-    auto reservation = tryReserve(bytes, optional, failure);
+    auto reservation = tryReserve(bytes, failure);
     if (!reservation)
       return failure;
     try {
@@ -246,42 +274,31 @@ metal::AllocationAdmission MemoryGovernor::admission(bool optional) noexcept {
   };
 }
 
-bool MemoryGovernor::setServing(bool serving) noexcept {
-  return std::exchange(serving_, serving);
-}
-
-uint64_t MemoryGovernor::setGrowthCredit(uint64_t bytes) noexcept {
-  return std::exchange(growthCreditBytes_, bytes);
-}
-
-void MemoryGovernor::setRequestWaiting(bool waiting) noexcept {
-  requestWaiting_ = waiting;
-}
-
 void MemoryGovernor::setPressure(MemoryPressure pressure) noexcept {
   systemPressure_ = pressure;
 }
 
-void MemoryGovernor::reclaimed(ReclaimOutcome outcome) noexcept {
-  if (outcome == ReclaimOutcome::Untargeted)
-    return;
-  host_.reclaimExhausted = host_.constrained && outcome == ReclaimOutcome::Exhausted;
-}
-
 MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   const std::optional<HostMemory> host = sampleHost();
-  return snapshot(host, hostState(host));
+  // The rule at this sample, from the one the governor last moved.
+  HostRule rule = hostRule_;
+  rule.sample(host, hostSpareReserveBytes_, reservedBytes_ + unseenGrowthBytes(host), systemPressure_,
+              growthUnitBytes_, ledger_.hostRefusedWaitingBytes(), bandWaived_);
+  MemoryGovernorSnapshot result = snapshot(host, rule);
+  result.hostTelemetry = queryHostTelemetry();
+  return result;
 }
 
 MemoryGovernorSnapshot MemoryGovernor::evaluate() noexcept {
   const std::optional<HostMemory> host = sampleHost();
-  host_ = hostState(host);
-  return snapshot(host, host_);
+  growthUnitBytes_ = ledger_.largestGrowthUnit();
+  sampleHostRule(host);
+  return snapshot(host, hostRule_);
 }
 
 MemoryGovernorSnapshot
 MemoryGovernor::snapshot(const std::optional<HostMemory> &hostMemory,
-                         const HostState &host) const noexcept {
+                         const HostRule &rule) const noexcept {
   uint64_t observed = chargedBytes();
   uint64_t used = observed;
   if (reservedBytes_ <= std::numeric_limits<uint64_t>::max() - used) {
@@ -289,11 +306,12 @@ MemoryGovernor::snapshot(const std::optional<HostMemory> &hostMemory,
   } else {
     used = std::numeric_limits<uint64_t>::max();
   }
-  uint64_t hostHeadroom = hostHeadroomBytes(hostMemory, reservedBytes_);
-  const MemoryPressure pressure = effectivePressure(host);
-  bool hostGrowthAllowed = systemPressure_ == MemoryPressure::Normal &&
-      !growthHeld(host) && hostHeadroom >= kHostWarningMarginBytes;
-  return {
+  uint64_t hostHeadroom = hostHeadroomBytes(hostMemory, reservedBytes_ + unseenGrowthBytes(hostMemory));
+  const MemoryPressure pressure = rule.level() == MemoryPressure::Critical ? MemoryPressure::Critical
+                                  : rule.constrained()                     ? MemoryPressure::Warning
+                                                                           : rule.level();
+  const bool hostGrowthAllowed = rule.admits(ClaimClass::Growth, 0, false);
+  MemoryGovernorSnapshot snapshot{
       limitBytes_,
       observed,
       used < limitBytes_ ? limitBytes_ - used : 0,
@@ -308,29 +326,8 @@ MemoryGovernor::snapshot(const std::optional<HostMemory> &hostMemory,
       systemPressure_,
       hostGrowthAllowed,
   };
-}
-
-MemoryGovernor::HostState
-MemoryGovernor::hostState(const std::optional<HostMemory> &hostMemory) const noexcept {
-  const uint64_t hostHeadroom = hostHeadroomBytes(hostMemory, reservedBytes_);
-  HostState next;
-  next.constrained = !hostMemory ||
-      hostHeadroom < kHostWarningMarginBytes ||
-      (host_.constrained && hostHeadroom < kHostRecoveryMarginBytes);
-  next.reclaimExhausted = host_.reclaimExhausted && next.constrained;
-  return next;
-}
-
-MemoryPressure
-MemoryGovernor::effectivePressure(const HostState &host) const noexcept {
-  // Availability and the system's warning control growth and paced reclaim.
-  // Only the system's critical signal warrants dropping every evictable cache
-  // entry.
-  if (systemPressure_ == MemoryPressure::Critical)
-    return MemoryPressure::Critical;
-  if (host.constrained || systemPressure_ == MemoryPressure::Warning)
-    return MemoryPressure::Warning;
-  return MemoryPressure::Normal;
+  ledger_.fill(snapshot, observed);
+  return snapshot;
 }
 
 void MemoryGovernor::release(uint64_t bytes) noexcept {
@@ -341,70 +338,187 @@ void MemoryGovernor::release(uint64_t bytes) noexcept {
   reservedBytes_ -= bytes;
 }
 
-std::optional<MemoryReclaimDirective> MemoryPressurePolicy::update(
-    const MemoryGovernorSnapshot &snapshot, double nowMilliseconds,
-    bool requestWaiting) noexcept {
-  if (snapshot.pressure == MemoryPressure::Normal) {
-    nextReclaimMilliseconds_ = 0.0;
-    return std::nullopt;
+MemoryGovernor::Scope::Scope(MemoryGovernor &governor, ClaimId claim) noexcept
+    : governor_(governor), previousClaim_(std::exchange(governor.scope_, claim)) {}
+
+MemoryGovernor::Scope::~Scope() { governor_.scope_ = previousClaim_; }
+
+void MemoryGovernor::HostRule::sample(const std::optional<HostMemory> &host, uint64_t spareReserve, uint64_t inFlight,
+                                      MemoryPressure system, uint64_t hysteresisBytes, uint64_t refusedWaitingBytes,
+                                      bool reclaimShort) noexcept {
+  measured_ = host.has_value();
+  headroom_ = host ? spareHeadroom(*host, spareReserve, inFlight) : 0;
+  system_ = system;
+  const uint64_t reach = refusedWaitingBytes ? std::min(hysteresisBytes, refusedWaitingBytes) : hysteresisBytes;
+  if (!measured_ || headroom_ < kHostMarginBytes)
+    constrained_ = true;
+  else if (reclaimShort || headroom_ - kHostMarginBytes >= reach)
+    constrained_ = false;
+}
+
+bool MemoryGovernor::HostRule::admits(ClaimClass cls, uint64_t bytes, bool hostExempt) const noexcept {
+  if (system_ == MemoryPressure::Critical)
+    return false;
+  if (cls == ClaimClass::Floor || ((cls == ClaimClass::InService || cls == ClaimClass::Growth) && hostExempt))
+    return true;
+  const bool keepsMargin = measured_ && headroom_ >= bytes && headroom_ - bytes >= kHostMarginBytes;
+  if (cls == ClaimClass::InService)
+    return keepsMargin && system_ == MemoryPressure::Normal;
+  return keepsMargin && system_ == MemoryPressure::Normal && !constrained_;
+}
+
+uint64_t MemoryGovernor::HostRule::deficitBytes(uint64_t refusedWaitingBytes, uint64_t returningBytes) const noexcept {
+  // Missing telemetry holds elective work back but is no evidence that
+  // memory must be given back.
+  if (!measured_)
+    return 0;
+  const uint64_t wanted = refusedWaitingBytes <= std::numeric_limits<uint64_t>::max() - kHostMarginBytes
+                              ? kHostMarginBytes + refusedWaitingBytes
+                              : std::numeric_limits<uint64_t>::max();
+  const uint64_t lacking = wanted > headroom_ ? wanted - headroom_ : 0;
+  return lacking > returningBytes ? lacking - returningBytes : 0;
+}
+
+void MemoryGovernor::sampleHostRule(const std::optional<HostMemory> &host) noexcept {
+  hostRule_.sample(host, hostSpareReserveBytes_, reservedBytes_ + unseenGrowthBytes(host), systemPressure_,
+                   growthUnitBytes_, ledger_.hostRefusedWaitingBytes(), bandWaived_);
+  // A waiver lasts the band it ended: the next band starts unwaived.
+  if (!hostRule_.constrained())
+    bandWaived_ = false;
+}
+
+uint64_t MemoryGovernor::roomBytes() const noexcept {
+  const uint64_t used = chargedBytes();
+  return used <= limitBytes_ && reservedBytes_ <= limitBytes_ - used ? limitBytes_ - used - reservedBytes_ : 0;
+}
+
+Need MemoryGovernor::need(ClaimId claim, const std::optional<Need> &inPlace) const {
+  Need need = ledger_.claim(claim).refusal;
+  if (inPlace) {
+    need.pages = inPlace->pages;
+    need.form = inPlace->form;
+    need.stateBuffers = inPlace->stateBuffers;
+    need.keptPages = inPlace->keptPages;
   }
-  if (snapshot.pressure == MemoryPressure::Critical)
-    return MemoryReclaimDirective{.critical = true, .hostShort = true};
-  if (nowMilliseconds < nextReclaimMilliseconds_)
-    return continued_.value_or(MemoryReclaimDirective{});
-  continued_.reset();
-
-  // Missing telemetry pauses allocation, but is not evidence that live
-  // cache must be discarded. Empty extents can still be returned.
-  if (!snapshot.hostMeasurementValid &&
-      snapshot.systemPressure == MemoryPressure::Normal)
-    return MemoryReclaimDirective{};
-
-  // A pass a request waits for frees toward the recovery margin, where growth
-  // reopens (hostState). One that nothing waits for only restores the warning
-  // margin that growth leaves free: freeing on to the recovery margin would
-  // discard cache nothing needs, on every pass while the host's idle headroom
-  // stays below it. Such a pass also keeps the resume point, whose loss costs
-  // the next request a replay of its whole prompt; a waiting request outranks
-  // it. Nor does such a pass take what is in use: the states of the requests
-  // in service and the KV they restore through. The replay point it would
-  // take is the next resume point, and what it would free goes back to those
-  // requests' growth, which neither the margin nor macOS's warning holds
-  // back. macOS's warning asks caches to give memory back, whatever the
-  // headroom: while it lasts, every pass returns as much as a pass may,
-  // still short of what is in use unless a request waits, and keeps the
-  // resume point even for a waiting request, whose growth the warning
-  // refuses as well, so that what the pass frees would not reach it. Only a
-  // measured deficit has the pass take the expert store above its floor: the
-  // warning alone asks caches, and the experts a smaller store evicts are
-  // read from the SSD again at every step that routes them.
-  const bool warning = snapshot.systemPressure == MemoryPressure::Warning;
-  const uint64_t margin = requestWaiting ? kHostRecoveryMarginBytes : kHostWarningMarginBytes;
-  const uint64_t deficit =
-      snapshot.hostHeadroomBytes < margin ? margin - snapshot.hostHeadroomBytes : 0;
-  const bool hostShort = snapshot.hostMeasurementValid && deficit != 0;
-  const uint64_t desired = warning ? kHostWarningMarginBytes : deficit;
-  // The host samples every 500 ms. Allow counters to settle after a pass
-  // with a target, but keep responding if another application continues
-  // consuming memory. A pass with none leaves nothing to settle: a request
-  // that starts waiting gets its pass at once.
-  if (desired)
-    nextReclaimMilliseconds_ = nowMilliseconds + 1000.0;
-  return MemoryReclaimDirective{
-      .targetBytes = std::min(desired, kHostWarningMarginBytes),
-      .keepResumePoint = !requestWaiting || warning,
-      .upTo = requestWaiting ? ReclaimClass::InUse : ReclaimClass::Ordinary,
-      .hostShort = hostShort};
+  return need;
 }
 
-void MemoryPressurePolicy::reclaimed(const MemoryReclaimDirective &directive,
-                                     const MemoryReclaimResult &result) noexcept {
-  continued_.reset();
-  // Every critical pass evicts everything again by itself.
-  if (result.outcome != ReclaimOutcome::Pending || directive.critical)
-    return;
-  continued_ = directive;
-  continued_->targetBytes -= std::min(result.releasedBytes, directive.targetBytes);
+std::array<uint32_t, 3> MemoryGovernor::heldPages(ClaimId claim) const {
+  const std::optional<HostMemory> host = sampleHost();
+  const uint64_t headroom = hostHeadroomBytes(host, reservedBytes_ + unseenGrowthBytes(host));
+  const uint64_t hostRoom =
+      host && systemPressure_ == MemoryPressure::Normal && headroom > kHostMarginBytes ? headroom - kHostMarginBytes : 0;
+  return ledger_.heldPages(claim, std::min(roomBytes(), hostRoom));
 }
+
+FreeResult MemoryGovernor::free(ClaimId claim, const Need &need) {
+  const ClaimClass cls = hostClass(ledger_.claim(claim).spec);
+  return ledger_.free(claim, need, roomBytes(), hostRule_.level() == MemoryPressure::Critical,
+                      cls == ClaimClass::Floor || cls == ClaimClass::InService);
+}
+
+uint64_t MemoryGovernor::available(const ClaimSpec &spec, const Need &need, const RestoredChains *kept) const {
+  return ledger_.available(spec, need, roomBytes(), hostRule_.level() == MemoryPressure::Critical, kept);
+}
+
+bool MemoryGovernor::admits(ClaimClass cls) const noexcept { return hostRule_.admits(cls, 0, false); }
+
+bool MemoryGovernor::copyDemand() const noexcept { return ledger_.copyDemand(); }
+
+bool MemoryGovernor::claimWaiting() const noexcept { return ledger_.claimWaiting(); }
+
+// The host's claim of what the pass finds, up to `target`, or of what lands,
+// which it then waits for; under macOS's critical pressure only of what it
+// finds, taken at once. free() gives back the units that cost nothing and
+// are sized only when taken (the idle state buffers) first either way. A
+// pass that freed nothing now or later is Short: it found nothing to take.
+FreeResult MemoryGovernor::hostPass(uint64_t target, bool critical) {
+  const ClaimSpec spec{.cls = ClaimClass::Host,
+                       .reach = critical ? ReclaimClass::InUse : ReclaimClass::Ordinary,
+                       .timing = critical ? NeedTiming::Immediate : NeedTiming::CanWait};
+  const uint64_t found = ledger_.available(spec, {.bytes = target}, 0, critical);
+  const uint64_t landing = critical ? 0 : ledger_.returning().landingBytes;
+  const ClaimId claim = ledger_.open(spec);
+  FreeResult result = ledger_.free(claim, {.bytes = std::min(target, std::max(found, landing))}, 0, critical);
+  ledger_.close(claim);
+  if (result.outcome == FreeOutcome::Met && !result.nowBytes && !result.laterBytes)
+    result.outcome = FreeOutcome::Short;
+  return result;
+}
+
+uint64_t MemoryGovernor::hostBytes(ClaimClass cls, uint64_t bytes) const noexcept {
+  if (cls != ClaimClass::Growth)
+    return bytes;
+  const uint64_t more = ledger_.laneDemandBytes();
+  return bytes <= std::numeric_limits<uint64_t>::max() - more ? bytes + more : std::numeric_limits<uint64_t>::max();
+}
+
+GrowthHost MemoryGovernor::growthHost(bool paced) {
+  // Each unit at a fresh sample, which counts the units grown before it.
+  return {.admits =
+              [this](uint64_t bytes, uint64_t funded) {
+                sampleHostRule(sampleHost());
+                // A unit the cache funds whole changes the host by nothing:
+                // it needs only no critical pressure and no deficit, under
+                // macOS's warning too. The rest is judged as growth.
+                if (funded >= bytes)
+                  return hostRule_.level() != MemoryPressure::Critical &&
+                         !hostRule_.deficitBytes(ledger_.hostRefusedWaitingBytes(), ledger_.returning().landingBytes);
+                return hostRule_.admits(ClaimClass::Growth, hostBytes(ClaimClass::Growth, bytes - funded), false);
+              },
+          .paced = paced,
+          .grow = [this](ClaimId claim, model::ElasticPool &pool) {
+            // The pass admitted the unit on its net change (admits): its
+            // allocation passes the host.
+            ledger_.setHostExempt(claim, true);
+            const Scope scope(*this, claim);
+            return pool.grow(allocationAdmission());
+          }};
+}
+
+bool MemoryGovernor::controlPass(double nowMilliseconds) {
+  clockMilliseconds_ = nowMilliseconds;
+  ledger_.setNow(nowMilliseconds / 1000.0);
+  growthUnitBytes_ = ledger_.largestGrowthUnit();
+  sampleHostRule(sampleHost());
+  const bool critical = hostRule_.level() == MemoryPressure::Critical;
+  std::optional<FreeResult> pass;
+  if (nowMilliseconds >= nextHostPassMilliseconds_) {
+    const uint64_t refused = ledger_.hostRefusedWaitingBytes();
+    if (critical) {
+      // One sized claim per settled second, resampled while critical
+      // pressure lasts: the margin and what the host refused, in the one
+      // order, the store down to its floor at most.
+      pass = hostPass(kHostMarginBytes + refused, true);
+      nextHostPassMilliseconds_ = nowMilliseconds + kHostSettleMilliseconds;
+    } else if (const uint64_t deficit = hostRule_.deficitBytes(refused, ledger_.returning().landingBytes)) {
+      pass = hostPass(std::min(kHostMarginBytes, deficit), false);
+    }
+  }
+  // After the host's claim: growth goes only where the host admits it, so
+  // it never competes with what the host takes.
+  if (!critical)
+    ledger_.grow(roomBytes(), growthHost(true));
+  if (pass) {
+    // Only a pass while the host is short can waive the band: one that found
+    // nothing to take, since only other applications could return the rest.
+    if (hostRule_.constrained())
+      bandWaived_ = pass->outcome == FreeOutcome::Short;
+    if (pass->nowBytes || pass->laterBytes)
+      nextHostPassMilliseconds_ = nowMilliseconds + kHostSettleMilliseconds;
+  }
+  return pass && pass->outcome == FreeOutcome::Pending;
+}
+
+void MemoryGovernor::growToTargets(double nowMilliseconds, MemoryPressure pressure) {
+  clockMilliseconds_ = nowMilliseconds;
+  ledger_.setNow(nowMilliseconds / 1000.0);
+  systemPressure_ = pressure;
+  growthUnitBytes_ = ledger_.largestGrowthUnit();
+  sampleHostRule(sampleHost());
+  ledger_.grow(roomBytes(), growthHost(false));
+}
+
+void connectToGovernor(EngineConfig &config, MemoryGovernor &governor) { config.governor = &governor; }
 
 } // namespace splash::engine
