@@ -1,6 +1,6 @@
 // The memory books under a scripted host on Metal (DESIGN §7.11, V.md §4.2,
 // amend/V.md binding 9): a synthetic MoE target whose experts stream, started
-// by RuntimeBootstrap::start as serve starts it, its host a script the test
+// by ServingRuntime::start as serve starts it, its host a script the test
 // moves, request frames into its native loop and the production control pass
 // between commands. Bytes and counts only, so shader validation and the
 // machine's speed do not change the verdicts. Minutes on the Studio or the M5
@@ -75,7 +75,7 @@ struct Served final {
     };
     config.resources.memoryPressure = [host = host] { return host->pressure; };
     log = test::capturedStderr([&] {
-      bootstrap = RuntimeBootstrap::start(
+      bootstrap = ServingRuntime::start(
           std::move(config),
           [this](std::span<const uint8_t> bytes) { output.insert(output.end(), bytes.begin(), bytes.end()); },
           [] { return std::string(); });
@@ -149,7 +149,7 @@ struct Served final {
   std::set<uint64_t> submitted;
   std::map<uint64_t, std::string> ended;
   std::string log;
-  std::unique_ptr<RuntimeBootstrap> bootstrap;
+  std::unique_ptr<ServingRuntime> bootstrap;
 };
 
 // The books at a sample (G9): the accounts sum to what the governor

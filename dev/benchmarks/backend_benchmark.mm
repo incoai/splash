@@ -976,12 +976,12 @@ int main(int argc, char **argv) {
     // refused memory the host or Metal may give back, as while the previous
     // engine's memory settles, retries as serve's does (main.mm): within the
     // same window, opened at its first such refusal.
-    std::unique_ptr<engine::RuntimeBootstrap> bootstrap;
+    std::unique_ptr<engine::ServingRuntime> bootstrap;
     engine::StartupRetryWindow recovery(supervision::kStartRetryWindow);
     std::optional<AwakeClock::time_point> firstRefusal;
     while (!bootstrap) {
       try {
-        bootstrap = engine::RuntimeBootstrap::start(
+        bootstrap = engine::ServingRuntime::start(
             bootstrapConfig, [](std::span<const uint8_t>) {},
             []() -> std::string {
               throw std::logic_error("benchmark does not accept native status requests");

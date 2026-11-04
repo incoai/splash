@@ -805,7 +805,7 @@ void testACommandOutOfMemoryInAssemblyIsCommandMemory(const char *metallibPath) 
 }
 
 // What a start allocates, the KV runway and then the arenas and the warmup as
-// RuntimeBootstrap::start allocates them, is memory a request in service
+// ServingRuntime::start allocates them, is memory a request in service
 // needs: neither the warning margin above the spare reserve nor macOS's
 // warning refuses it, only what refuses loading, and a claim the engine
 // opens meanwhile leaves the start's admission in place. Once serving
@@ -880,9 +880,9 @@ void testStartChecksTheReserveWithWhatItServes(const char *metallibPath) {
     }
     return host();
   };
-  std::unique_ptr<RuntimeBootstrap> bootstrap;
+  std::unique_ptr<ServingRuntime> bootstrap;
   static_cast<void>(test::capturedStderr([&] {
-    bootstrap = RuntimeBootstrap::start(config, [](std::span<const uint8_t>) {},
+    bootstrap = ServingRuntime::start(config, [](std::span<const uint8_t>) {},
                                         [] { return std::string(); });
     bootstrap->announceReady();
   }));
@@ -1197,9 +1197,9 @@ void testAnExplicitRelaunchServesItsFirstContext(const char *metallibPath) {
   // reports), and its log.
   config.nativeLoop.engine.maxContext = first;
   const auto relaunch = [&] {
-    std::unique_ptr<RuntimeBootstrap> bootstrap;
+    std::unique_ptr<ServingRuntime> bootstrap;
     const std::string log = test::capturedStderr([&] {
-      bootstrap = RuntimeBootstrap::start(config, [](std::span<const uint8_t>) {}, [] { return std::string(); });
+      bootstrap = ServingRuntime::start(config, [](std::span<const uint8_t>) {}, [] { return std::string(); });
       bootstrap->announceReady();
     });
     const std::string status = bootstrap->statusJson(0.0);
@@ -1296,14 +1296,14 @@ void testTwoLaunchesGetOneFloor(const RuntimeResourcesConfig &config) {
 // A start of `resources` as the server makes one, asked for `maxContext`
 // tokens (--max-context, zero for the automatic context), whose log it keeps
 // in `log`.
-std::unique_ptr<RuntimeBootstrap> bootstrapOf(const RuntimeResourcesConfig &resources, std::string &log,
-                                              uint32_t maxContext = 0) {
+std::unique_ptr<ServingRuntime> bootstrapOf(const RuntimeResourcesConfig &resources, std::string &log,
+                                            uint32_t maxContext = 0) {
   RuntimeBootstrapConfig config;
   config.resources = resources;
   config.nativeLoop.engine.maxContext = maxContext;
-  std::unique_ptr<RuntimeBootstrap> bootstrap;
+  std::unique_ptr<ServingRuntime> bootstrap;
   log = test::capturedStderr([&] {
-    bootstrap = RuntimeBootstrap::start(config, [](std::span<const uint8_t>) {}, [] { return std::string(); });
+    bootstrap = ServingRuntime::start(config, [](std::span<const uint8_t>) {}, [] { return std::string(); });
     bootstrap->announceReady();
   });
   return bootstrap;
@@ -1322,7 +1322,7 @@ const MemoryAccountSnapshot *accountOf(const MemoryGovernorSnapshot &memory, std
 // charged bytes exactly.
 void testLedgerAccountsSumToTheBackend(const RuntimeResourcesConfig &config) {
   std::string log;
-  const std::unique_ptr<RuntimeBootstrap> bootstrap = bootstrapOf(config, log);
+  const std::unique_ptr<ServingRuntime> bootstrap = bootstrapOf(config, log);
   RuntimeResources &resources = bootstrap->resources();
   const MemoryGovernorSnapshot memory = resources.memoryGovernor().snapshot();
   const MemoryAccountSnapshot *kv = accountOf(memory, "kv"), *states = accountOf(memory, "states"),
@@ -1353,7 +1353,7 @@ void testStartupGrowsByTheHostRule(const RuntimeResourcesConfig &config) {
   std::string log;
   model::ExpertStoreStats grown;
   {
-    const std::unique_ptr<RuntimeBootstrap> roomy = bootstrapOf(config, log, kContext);
+    const std::unique_ptr<ServingRuntime> roomy = bootstrapOf(config, log, kContext);
     grown = *roomy->resources().streamedExpertStats();
     const MemoryGovernorSnapshot memory = roomy->resources().memoryGovernor().snapshot();
     const MemoryAccountSnapshot *experts = accountOf(memory, "experts");
@@ -1379,7 +1379,7 @@ void testStartupGrowsByTheHostRule(const RuntimeResourcesConfig &config) {
   bounded.hostMemory = [spareReserve] {
     return std::optional<HostMemory>(HostMemory{64 * kGiB, spareReserve + kHostMarginBytes / 2});
   };
-  const std::unique_ptr<RuntimeBootstrap> held = bootstrapOf(bounded, log, kContext);
+  const std::unique_ptr<ServingRuntime> held = bootstrapOf(bounded, log, kContext);
   const model::ExpertStoreStats floor = *held->resources().streamedExpertStats();
   require(floor.liveBytes == floor.floorBytes && floor.floorBytes == grown.floorBytes && !floor.regrows &&
               log.find("Memory: experts grew") == std::string::npos,

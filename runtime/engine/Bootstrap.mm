@@ -167,11 +167,11 @@ protocol::StartFailedEvent startFailedEvent(const RuntimeBootstrapReport &report
   return {kind, report.shortfall.value_or(protocol::StartShortfall{}), report.message};
 }
 
-RuntimeBootstrap::RuntimeBootstrap(std::unique_ptr<RuntimeResources> resources,
-                                   std::unique_ptr<model::RuntimeModel> modelRuntime,
-                                   std::unique_ptr<NativeRuntime> nativeLoop,
-                                   protocol::ReadyEvent ready,
-                                   RuntimeBootstrapReport report)
+ServingRuntime::ServingRuntime(std::unique_ptr<RuntimeResources> resources,
+                               std::unique_ptr<model::RuntimeModel> modelRuntime,
+                               std::unique_ptr<NativeRuntime> nativeLoop,
+                               protocol::ReadyEvent ready,
+                               RuntimeBootstrapReport report)
     : resources_(std::move(resources)), model_(std::move(modelRuntime)),
       nativeLoop_(std::move(nativeLoop)),
       memoryControl_(resources_->memoryGovernor(), resources_->backend(),
@@ -180,13 +180,13 @@ RuntimeBootstrap::RuntimeBootstrap(std::unique_ptr<RuntimeResources> resources,
   sampleThermalState();
 }
 
-RuntimeBootstrap::~RuntimeBootstrap() {
+ServingRuntime::~ServingRuntime() {
   // Refuse new commands before the loop, the model and the resources they
   // reach are destroyed.
   resources_->backend().stop();
 }
 
-void RuntimeBootstrap::announceReady() {
+void ServingRuntime::announceReady() {
   // The per-operation guard RuntimeResources installed is only for startup:
   // once Ready, the engine meets memory pressure between its ticks.
   resources_->backend().setOperationGuard({});
@@ -194,7 +194,7 @@ void RuntimeBootstrap::announceReady() {
   resources_->beginServing();
 }
 
-std::string RuntimeBootstrap::statusJson(double loopMaxTickMilliseconds) {
+std::string ServingRuntime::statusJson(double loopMaxTickMilliseconds) {
   // Status can arrive during GPU work; allocation/command boundaries and
   // the safe-point pressure monitor already refresh the cached sample.
   metal::MetalBackend &backend = resources_->backend();
@@ -224,13 +224,13 @@ std::string RuntimeBootstrap::statusJson(double loopMaxTickMilliseconds) {
                            sample);
 }
 
-void RuntimeBootstrap::sampleThermalState() {
+void ServingRuntime::sampleThermalState() {
   const std::string transition = thermalState_.update(queryThermalState());
   if (!transition.empty())
     logLine(transition);
 }
 
-RuntimeBootstrapReport RuntimeBootstrap::requireWarmup(
+RuntimeBootstrapReport ServingRuntime::requireWarmup(
     const EngineMemoryPlan &memoryPlan, model::RuntimeModel &modelRuntime, KvPool &kvPool,
     ActualMemoryReporter memoryReporter) {
   RuntimeBootstrapReport report = reportForPlan(memoryPlan);
@@ -330,7 +330,7 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmup(
   return report;
 }
 
-std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
+std::unique_ptr<ServingRuntime> ServingRuntime::start(
     RuntimeBootstrapConfig config,
     NativeRuntime::ByteSink output,
     NativeRuntime::StatusProvider statusProvider) {
@@ -497,9 +497,9 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
         return report;
       });
 
-  return std::unique_ptr<RuntimeBootstrap>(
-      new RuntimeBootstrap(std::move(resources), std::move(modelRuntime),
-                           std::move(nativeLoop), ready, std::move(report)));
+  return std::unique_ptr<ServingRuntime>(
+      new ServingRuntime(std::move(resources), std::move(modelRuntime),
+                         std::move(nativeLoop), ready, std::move(report)));
 }
 
 } // namespace splash::engine

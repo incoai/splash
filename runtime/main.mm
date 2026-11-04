@@ -291,7 +291,7 @@ constexpr auto kFlushBudget = supervision::kFlush;
 // that fails meanwhile writes nothing more, and its cache counts as ending
 // uncleanly.
 void closePersistentCache(engine::FdTransport &transport,
-                          engine::RuntimeBootstrap &bootstrap) {
+                          engine::ServingRuntime &bootstrap) {
   engine::NativeRuntime &loop = bootstrap.nativeLoop();
   const bool flushed = transport.runFlush(loop, kFlushBudget);
   if (!loop.engineHealthy()) {
@@ -347,12 +347,12 @@ int serveNative(int argc, char **argv) {
   ShutdownSignals signals(transport);
   std::optional<MemoryPressureMonitor> pressureMonitor;
   IdleSleepAssertion idleSleep;
-  engine::RuntimeBootstrap *published = nullptr;
+  engine::ServingRuntime *published = nullptr;
   auto statusProvider = [&] {
     return published->statusJson(transport.maxTickMilliseconds());
   };
 
-  std::unique_ptr<engine::RuntimeBootstrap> bootstrap;
+  std::unique_ptr<engine::ServingRuntime> bootstrap;
   try {
     const engine::NativeArguments arguments = engine::parseNativeArguments(argc, argv);
     pressureMonitor.emplace(transport.controlNotifier());
@@ -367,7 +367,7 @@ int serveNative(int argc, char **argv) {
       if (arguments.preventIdleSleep)
         config.nativeLoop.holdingRequests = [&](bool held) { idleSleep.hold(held); };
       try {
-        bootstrap = engine::RuntimeBootstrap::start(
+        bootstrap = engine::ServingRuntime::start(
             std::move(config), transport.outputSink(), statusProvider);
       } catch (const engine::RuntimeBootstrapError &error) {
         if (transport.shutdownRequested())

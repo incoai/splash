@@ -130,9 +130,9 @@ using ActualMemoryReporter = std::function<ActualMemoryReport()>;
 // The serving runtime: start() returns it built, warmed up and audited, and
 // it serves once announceReady() has sent Ready. Everything that can refuse
 // a start (StartFailed) runs in start(), so that nothing after Ready can.
-class RuntimeBootstrap final {
+class ServingRuntime final {
 public:
-    [[nodiscard]] static std::unique_ptr<RuntimeBootstrap> start(
+    [[nodiscard]] static std::unique_ptr<ServingRuntime> start(
         RuntimeBootstrapConfig config,
         NativeRuntime::ByteSink output,
         NativeRuntime::StatusProvider statusProvider);
@@ -146,9 +146,9 @@ public:
         KvPool &kvPool,
         ActualMemoryReporter memoryReporter);
 
-    RuntimeBootstrap(const RuntimeBootstrap &) = delete;
-    RuntimeBootstrap &operator=(const RuntimeBootstrap &) = delete;
-    ~RuntimeBootstrap();
+    ServingRuntime(const ServingRuntime &) = delete;
+    ServingRuntime &operator=(const ServingRuntime &) = delete;
+    ~ServingRuntime();
 
     [[nodiscard]] RuntimeResources &resources() noexcept {
         return *resources_;
@@ -177,10 +177,10 @@ public:
     [[nodiscard]] std::string statusJson(double loopMaxTickMilliseconds);
 
 private:
-    RuntimeBootstrap(std::unique_ptr<RuntimeResources> resources,
-                     std::unique_ptr<model::RuntimeModel> modelRuntime,
-                     std::unique_ptr<NativeRuntime> nativeLoop,
-                     protocol::ReadyEvent ready, RuntimeBootstrapReport report);
+    ServingRuntime(std::unique_ptr<RuntimeResources> resources,
+                   std::unique_ptr<model::RuntimeModel> modelRuntime,
+                   std::unique_ptr<NativeRuntime> nativeLoop,
+                   protocol::ReadyEvent ready, RuntimeBootstrapReport report);
 
     // Records the thermal state macOS reports for the status document, and
     // logs a change: nothing else tells why serving slowed down. The control

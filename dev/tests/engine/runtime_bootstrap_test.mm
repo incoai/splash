@@ -205,7 +205,7 @@ private:
 };
 
 RuntimeBootstrapReport warmup(Harness &harness, const EngineMemoryPlan &plan) {
-  return RuntimeBootstrap::requireWarmup(plan, harness.executor(), harness.pool(),
+  return ServingRuntime::requireWarmup(plan, harness.executor(), harness.pool(),
                                          [&] { return validActual(plan); });
 }
 
@@ -369,7 +369,7 @@ void testFinalHostPressurePreventsReady() {
   const EngineMemoryPlan plan = memoryPlan();
   Harness harness;
   try {
-    static_cast<void>(RuntimeBootstrap::requireWarmup(
+    static_cast<void>(ServingRuntime::requireWarmup(
         plan, harness.executor(), harness.pool(), []() -> ActualMemoryReport {
           throw metal::MetalAllocationError("pressure after warmup",
                                              metal::AllocationFailure::HostPressure);
@@ -443,7 +443,7 @@ void testExceptionsAndMemoryAreFailClosed() {
   {
     Harness harness(3);
     try {
-      static_cast<void>(engine::RuntimeBootstrap::requireWarmup(
+      static_cast<void>(engine::ServingRuntime::requireWarmup(
           plan, harness.executor(), harness.pool(), [] { return ActualMemoryReport{}; }));
       throw std::runtime_error("warmup exception passed");
     } catch (const engine::RuntimeBootstrapError &error) {
@@ -456,7 +456,7 @@ void testExceptionsAndMemoryAreFailClosed() {
   {
     Harness harness;
     try {
-      static_cast<void>(engine::RuntimeBootstrap::requireWarmup(
+      static_cast<void>(engine::ServingRuntime::requireWarmup(
           plan, harness.executor(), harness.pool(), [] { return ActualMemoryReport{}; }));
       throw std::runtime_error("invalid memory report passed");
     } catch (const engine::RuntimeBootstrapError &error) {

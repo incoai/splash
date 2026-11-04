@@ -283,7 +283,7 @@ inline bool answeredStatus(const LoopFixture &fixture, uint64_t correlationId) {
 
 // Sends a release request and returns the weights' snapshot its answer reports:
 // the status document that answers it is written from the loop's snapshot of the
-// moment (RuntimeBootstrap::statusJson).
+// moment (ServingRuntime::statusJson).
 inline engine::WeightsSnapshot releaseAnswer(LoopFixture &fixture, uint64_t correlationId) {
   std::optional<engine::WeightsSnapshot> reported;
   fixture.status = [&] {

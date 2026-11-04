@@ -1201,7 +1201,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // The ledger's accounts of the KV pages and the lane states, which it
     // reads from their storage. The engine registers the cache and its own
     // victims as it is built, and the model's pools follow
-    // (RuntimeBootstrap::start).
+    // (ServingRuntime::start).
     MemoryLedger &ledger = memoryGovernor->ledger();
     ledger.addAccount("kv", AccountRole::Kv, [pages = kvPages.get()] { return pages->actualAllocatedBytes(); });
     ledger.addAccount("states", AccountRole::States,
