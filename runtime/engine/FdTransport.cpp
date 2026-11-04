@@ -56,11 +56,6 @@ int pollTimeout(const NativeRuntime &loop) {
   return timeout;
 }
 
-NativeProcessExit loopFailure(const NativeRuntime &loop) {
-  return loop.engineHealthy() ? NativeProcessExit::ProtocolFailure
-                              : NativeProcessExit::EngineFailure;
-}
-
 } // namespace
 
 struct FdTransport::LoopWake {
@@ -305,11 +300,12 @@ NativeProcessExit FdTransport::run(NativeRuntime &loop) {
   while (!loop.connectionMustClose()) {
     if (shutdownRequested())
       return NativeProcessExit::CleanEof;
+    const auto stepStarted = AwakeClock::now();
     {
       InputReader::Input input = reader.take();
       for (; !input.chunks.empty(); input.chunks.pop_front())
         if (!loop.receive(input.chunks.front()))
-          return loopFailure(loop);
+          return loopEnded(loop);
       if (input.end) {
         if (*input.end == ENOMEM) {
           failure_ = "the native input reader ran out of memory";
@@ -321,11 +317,10 @@ NativeProcessExit FdTransport::run(NativeRuntime &loop) {
           return NativeProcessExit::IoFailure;
         }
         return loop.finishInput() ? NativeProcessExit::CleanEof
-                                  : loopFailure(loop);
+                                  : loopEnded(loop);
       }
     } // What was taken is freed before control, tick and poll.
 
-    const auto stepStarted = AwakeClock::now();
     deferredControl = wake->takeControl() || deferredControl;
     if (deferredControl && !loop.commandInFlight()) {
       deferredControl = loop.runControl(controlHandler_);
@@ -338,7 +333,7 @@ NativeProcessExit FdTransport::run(NativeRuntime &loop) {
     if (progressed)
       continue;
     if (loop.connectionMustClose())
-      return loopFailure(loop);
+      return loopEnded(loop);
 
     // Input, completions, control notifications and shutdown all wake the
     // loop through this pipe.
@@ -356,7 +351,7 @@ NativeProcessExit FdTransport::run(NativeRuntime &loop) {
     // A zero result is a deadline, health-check or admission-retry wake; the
     // next iteration takes input, runs control and ticks.
   }
-  return loopFailure(loop);
+  return loopEnded(loop);
 }
 
 bool FdTransport::runFlush(NativeRuntime &loop, std::chrono::milliseconds budget) {
@@ -393,24 +388,42 @@ void FdTransport::requestShutdown() noexcept {
   wake_->notify();
 }
 
-void FdTransport::writeAll(std::span<const uint8_t> bytes) const {
+NativeProcessExit FdTransport::loopEnded(const NativeRuntime &loop) {
+  if (!loop.engineHealthy())
+    return NativeProcessExit::EngineFailure;
+  if (!outputError_)
+    return NativeProcessExit::ProtocolFailure;
+  // A server that closed its end or is stopping the engine ends it as a
+  // shutdown, which still flushes a persistent cache.
+  if (outputError_ == EPIPE || shutdownRequested())
+    return NativeProcessExit::CleanEof;
+  failure_ = "write(native output): " + std::string(std::strerror(outputError_));
+  return NativeProcessExit::IoFailure;
+}
+
+void FdTransport::writeAll(std::span<const uint8_t> bytes) {
   size_t offset = 0;
   while (offset < bytes.size()) {
-    ssize_t count =
+    // Once a shutdown is requested no write starts or resumes: the server
+    // may have stopped draining the pipe, and its one stop signal has
+    // already been spent, so nothing would end a blocked write.
+    if (shutdownRequested())
+      outputFailed(EINTR);
+    const ssize_t count =
         write(outputFd_, bytes.data() + offset, bytes.size() - offset);
     if (count > 0) {
       offset += static_cast<size_t>(count);
       continue;
     }
-    // The signal that requests a shutdown also ends a write the server has
-    // stopped draining.
-    if (count < 0 && errno == EINTR && !shutdownRequested())
+    if (count < 0 && errno == EINTR)
       continue;
-    if (count == 0) {
-      throw std::runtime_error("native output accepted zero bytes");
-    }
-    throwIo("write(native output)");
+    outputFailed(count < 0 ? errno : EIO);
   }
+}
+
+void FdTransport::outputFailed(int error) {
+  outputError_ = error;
+  throw std::system_error(error, std::generic_category(), "write(native output)");
 }
 
 } // namespace splash::engine

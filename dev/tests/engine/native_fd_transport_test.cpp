@@ -29,6 +29,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 using namespace splash;
 using namespace splash::engine;
@@ -68,9 +69,9 @@ using splash::test::require;
 
 struct Harness final {
   explicit Harness(size_t inputQueueBytes = engine::FdTransport::kInputQueueBytes,
-                   int inputFd = -1)
-      : transport(inputFd < 0 ? pipes.input[0] : inputFd, pipes.output[1],
-                  inputQueueBytes) {
+                   int inputFd = -1, int outputFd = -1)
+      : transport(inputFd < 0 ? pipes.input[0] : inputFd,
+                  outputFd < 0 ? pipes.output[1] : outputFd, inputQueueBytes) {
     storage.commandInFlight = [this] { return loop.commandInFlight(); };
   }
   Pipes pipes;
@@ -85,11 +86,10 @@ struct Harness final {
   RuntimeMetrics metrics;
   test::Weights weights;
   engine::NativeRuntime loop{
-      {.engine = test::engineConfig(),
-       .metrics = &metrics,
-       .weights = &weights,
-       .weightAdmission = test::admitAll, .growthAdmission = test::admitAll},
-      metal::kResidencyKeepAliveSeconds, resources, executor, transport.outputSink(),
+      {.engine = test::engineConfig(
+           {.weights = engine::WeightResidencyConfig{.weights = &weights, .admit = test::admitAll}}),
+       .metrics = &metrics},
+      resources, executor, transport.outputSink(),
       [this] { return status(); }, protocol::ProtocolLimits{}};
 };
 
@@ -116,11 +116,10 @@ struct PersistentHarness final {
   RuntimeMetrics metrics;
   test::Weights weights;
   engine::NativeRuntime loop{
-      {.engine = test::engineConfig(),
-       .metrics = &metrics,
-       .weights = &weights,
-       .weightAdmission = test::admitAll, .growthAdmission = test::admitAll},
-      metal::kResidencyKeepAliveSeconds, resources, executor, transport.outputSink(),
+      {.engine = test::engineConfig(
+           {.weights = engine::WeightResidencyConfig{.weights = &weights, .admit = test::admitAll}}),
+       .metrics = &metrics},
+      resources, executor, transport.outputSink(),
       test::readyStatusJson, protocol::ProtocolLimits{}};
 };
 
@@ -290,7 +289,7 @@ void testControlWaitsForTheCommandInFlight() {
     harness.transport.requestShutdown();
     return false;
   });
-  harness.loop.announceReady();
+  harness.loop.announceReady(protocol::peer::kTestReady);
   writeAll(harness.pipes.input[1],
            protocol::peer::serialize(requestFrame(7, 30'000'000)));
   auto loop = start(harness);
@@ -310,29 +309,30 @@ void testControlWaitsForTheCommandInFlight() {
           "the deferred control pass did not run once after the command");
 }
 
-// The loop records its longest control pass and tick, and keeps it as later
-// ones are shorter.
+// The loop records its longest iteration, the input it hands the loop
+// included, and keeps it as later ones are shorter.
 void testLoopRecordsItsLongestTick() {
   Harness harness;
   require(harness.transport.maxTickMilliseconds() == 0.0,
           "a loop that never ran reported a tick");
-  int invocations = 0;
-  double recorded = 0.0;
-  harness.transport.setControlHandler([&] {
-    if (++invocations == 1) {
+  // The loop answers a status request while it takes the input.
+  int answers = 0;
+  harness.status = [&] {
+    if (++answers == 1)
       std::this_thread::sleep_for(std::chrono::milliseconds(40));
-      wakeWithStatusRequest(harness, 1);
-      return true;
-    }
-    recorded = harness.transport.maxTickMilliseconds();
-    harness.transport.requestShutdown();
-    return false;
-  });
-  harness.transport.controlNotifier()();
-  require(harness.transport.run(harness.loop) == engine::NativeProcessExit::CleanEof,
-          "control-driven shutdown did not end the loop cleanly");
-  require(recorded >= 40.0 && harness.transport.maxTickMilliseconds() >= recorded,
-          "the loop did not keep its longest control pass and tick");
+    return test::readyStatusJson();
+  };
+  auto loop = start(harness);
+  for (uint64_t id : {1, 2}) {
+    wakeWithStatusRequest(harness, id);
+    require(awaitStatus(harness.pipes.output[0], id, std::chrono::seconds(5)),
+            "the loop did not answer a status request");
+  }
+  harness.transport.requestShutdown();
+  require(finish(loop) == engine::NativeProcessExit::CleanEof,
+          "a shutdown did not end the loop cleanly");
+  require(harness.transport.maxTickMilliseconds() >= 40.0,
+          "the loop did not keep its longest iteration");
 }
 
 // With no input and no command in flight, the loop sleeps until the
@@ -349,11 +349,10 @@ void testLoopWakesForAnEngineDeadline() {
   RuntimeMetrics metrics;
   test::Weights weights;
   engine::NativeRuntime loop{
-      {.engine = test::engineConfig(),
-       .metrics = &metrics,
-       .weights = &weights,
-       .weightAdmission = test::admitAll, .growthAdmission = test::admitAll},
-      metal::kResidencyKeepAliveSeconds, resources, executor,
+      {.engine = test::engineConfig(
+           {.weights = engine::WeightResidencyConfig{.weights = &weights, .admit = test::admitAll}}),
+       .metrics = &metrics},
+      resources, executor,
       [&](std::span<const uint8_t> bytes) {
         for (const auto &event : protocol::peer::decodeEvents(bytes)) {
           if (const auto *error = std::get_if<protocol::ErrorEvent>(&event)) {
@@ -364,7 +363,7 @@ void testLoopWakesForAnEngineDeadline() {
       },
       test::readyStatusJson, protocol::ProtocolLimits{}};
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
-  loop.announceReady();
+  loop.announceReady(protocol::peer::kTestReady);
   const auto wire = protocol::peer::serialize(requestFrame(5, 20'000));
   require(write(pipes.input[1], wire.data(), wire.size()) ==
               static_cast<ssize_t>(wire.size()),
@@ -552,9 +551,21 @@ void testInputEndsAfterItsBytes() {
   close(listener);
 }
 
+// Fills the output pipe, so the loop's next write blocks.
+void fillOutput(Harness &harness) {
+  const int output = harness.pipes.output[1];
+  const int flags = fcntl(output, F_GETFL);
+  require(fcntl(output, F_SETFL, flags | O_NONBLOCK) == 0,
+          "could not make the output nonblocking");
+  const std::vector<uint8_t> filler(64 * 1024, 0);
+  while (writeAvailable(output, filler)) {
+  }
+  require(fcntl(output, F_SETFL, flags) == 0, "could not restore the output");
+}
+
 // The signal that requests a shutdown ends an output write the server has
 // stopped draining, which would otherwise hold the loop forever: run()
-// returns at once with the engine failed.
+// returns at once, as a shutdown, with the engine healthy.
 void testShutdownInterruptsABlockedOutputWrite() {
   Harness harness;
   // The loop builds the status reply right before it writes it.
@@ -571,15 +582,7 @@ void testShutdownInterruptsABlockedOutputWrite() {
   struct sigaction previous {};
   require(sigaction(SIGUSR1, &action, &previous) == 0,
           "could not install the test signal handler");
-  // Fill the output pipe, so the reply's write blocks.
-  const int output = harness.pipes.output[1];
-  const int flags = fcntl(output, F_GETFL);
-  require(fcntl(output, F_SETFL, flags | O_NONBLOCK) == 0,
-          "could not make the output nonblocking");
-  const std::vector<uint8_t> filler(64 * 1024, 0);
-  while (writeAvailable(output, filler)) {
-  }
-  require(fcntl(output, F_SETFL, flags) == 0, "could not restore the output");
+  fillOutput(harness);
   std::promise<engine::NativeProcessExit> exited;
   auto exit = exited.get_future();
   std::thread loop([&] { exited.set_value(harness.transport.run(harness.loop)); });
@@ -599,8 +602,54 @@ void testShutdownInterruptsABlockedOutputWrite() {
   }
   loop.join();
   sigaction(SIGUSR1, &previous, nullptr);
-  require(exit.get() == engine::NativeProcessExit::EngineFailure,
-          "an interrupted output write did not fail the engine");
+  require(exit.get() == engine::NativeProcessExit::CleanEof && harness.loop.engineHealthy(),
+          "an interrupted output write did not end the loop as a shutdown");
+}
+
+// No output write starts after a shutdown request: the server may have
+// stopped draining the output, and no second signal would end the write.
+void testNoOutputWriteStartsAfterAShutdown() {
+  Harness harness;
+  fillOutput(harness);
+  harness.status = [&] {
+    harness.transport.requestShutdown();
+    return test::readyStatusJson();
+  };
+  auto loop = start(harness);
+  wakeWithStatusRequest(harness, 14);
+  require(finish(loop) == engine::NativeProcessExit::CleanEof && harness.loop.engineHealthy(),
+          "a write after a shutdown request did not end the loop as a shutdown");
+}
+
+// A server that closed its end of the output ends the loop as a shutdown;
+// any other write error ends it as an I/O failure that names the error. The
+// engine stays healthy either way.
+void testFailedOutputEndsTheLoop() {
+  {
+    // As in the process (main.mm), the write fails with EPIPE.
+    struct sigaction ignore {};
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    struct sigaction previous {};
+    require(sigaction(SIGPIPE, &ignore, &previous) == 0, "could not ignore SIGPIPE");
+    Harness harness;
+    close(harness.pipes.output[0]);
+    harness.pipes.output[0] = -1;
+    wakeWithStatusRequest(harness, 13);
+    const auto exit = harness.transport.run(harness.loop);
+    sigaction(SIGPIPE, &previous, nullptr);
+    require(exit == engine::NativeProcessExit::CleanEof && harness.loop.engineHealthy(),
+            "a closed output did not end the loop as a shutdown");
+  }
+  Pipes unwritable;
+  // A pipe's read end refuses writes with EBADF.
+  Harness harness(engine::FdTransport::kInputQueueBytes, -1, unwritable.output[0]);
+  wakeWithStatusRequest(harness, 15);
+  require(harness.transport.run(harness.loop) == engine::NativeProcessExit::IoFailure &&
+              harness.loop.engineHealthy(),
+          "a failed output write did not end the loop as an I/O failure");
+  require(harness.transport.failure().find(std::strerror(EBADF)) != std::string::npos,
+          "the transport did not report the write error that ended it");
 }
 
 // A reader that may queue no input would never hand the loop a frame.
@@ -628,13 +677,13 @@ void testFlushEndsOrStopsAtItsDeadline() {
             "a flush with nothing waiting did not end");
   }
   PersistentHarness harness;
-  harness.loop.announceReady();
+  harness.loop.announceReady(protocol::peer::kTestReady);
   protocol::RequestFrame frame = requestFrame(1, 30'000'000);
   frame.promptTokens.assign(2060, 7);
   require(harness.loop.receive(protocol::peer::serialize(frame)), "the request was refused");
-  for (uint32_t step = 0; step < 16 && !harness.loop.snapshot().writeBehind.waiting; ++step)
+  for (uint32_t step = 0; step < 16 && !harness.loop.statusSnapshot().writeBehind.waiting; ++step)
     static_cast<void>(harness.loop.tick());
-  require(harness.loop.snapshot().writeBehind.waiting == 1,
+  require(harness.loop.statusSnapshot().writeBehind.waiting == 1,
           "the replay point did not wait to be written");
   const auto started = std::chrono::steady_clock::now();
   require(!harness.transport.runFlush(harness.loop, 50ms) &&
@@ -657,6 +706,8 @@ int main() {
     testShutdownJoinsTheReader();
     testInputEndsAfterItsBytes();
     testShutdownInterruptsABlockedOutputWrite();
+    testNoOutputWriteStartsAfterAShutdown();
+    testFailedOutputEndsTheLoop();
     testFlushEndsOrStopsAtItsDeadline();
     std::cout << "native fd transport tests passed\n";
     return EXIT_SUCCESS;

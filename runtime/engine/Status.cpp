@@ -1,9 +1,10 @@
 #include "engine/Status.hpp"
 
+#include "Supervision.hpp"
 #include "engine/Json.hpp"
 #include "engine/Protocol.hpp"
 #include "engine/RuntimeResources.hpp"
-#include "metal/abi/ExecutionGeometry.h"
+#include "model/Model.hpp"
 
 #include <algorithm>
 #include <iomanip>
@@ -104,6 +105,13 @@ const char *writesGatedName(DiskWritesGate gate) noexcept {
 // (model::SparseRowUse, and ops::MoePhase for model::ExpertStoreStats::uses).
 constexpr std::string_view kStreamedUses[] = {"prefill", "decode"};
 static_assert(std::size(kStreamedUses) == model::kSparseRowUses);
+// What held requests before their first tokens, by TtftPart.
+constexpr std::string_view kTtftPartNames[] = {"own_prefill", "claim_wait", "decode", "other_prefill", "rest"};
+static_assert(std::size(kTtftPartNames) == kTtftParts);
+// The causes of decode gaps past the bound, by GapCause.
+constexpr std::string_view kGapCauseNames[] = {"prefill_unit", "claim_wait",   "ssd_read",
+                                               "pool_release", "replan", "other"};
+static_assert(std::size(kGapCauseNames) == kGapCauses);
 
 // A latency histogram (model::LatencyStats) in milliseconds, as ttft_ms is:
 // its quantiles, maximum and total, and its samples.
@@ -209,15 +217,15 @@ void appendKvWindow(std::ostringstream &out, const KvWindowSnapshot &window, con
 }
 
 // A spill-capable target's KV on the SSD cache (kv_spill): the engine's
-// requests by KV mode, conversions, bounds, ends and refusals, and the starts
+// requests by KV mode, conversions, bounds, ends (and of those, the converted
+// lanes' bounds and ends) and refusals, and the starts
 // waiting for the quota; the pages that hold only their index, the pool's
 // pages of that form in use (each a spilled block's, which requests may hold
 // as the cache does), of `indexPageBytes` each, and those spilled; the
 // write-through of Spill requests' pages; the moves between page forms,
 // rewrites and restores; the quota of active KV; the Index runway, the free
-// pages of that form; and the readers' memory and reads, with the commands
-// that streamed a history beside decoders and the decoders' gaps across them.
-// A target that keeps its KV in memory has none: its /status is main's.
+// pages of that form; and the readers' memory and reads. A target that keeps
+// its KV in memory has no kv_spill section.
 void appendKvSpill(std::ostringstream &out, const KvSpillStatus &spill, uint64_t indexPageBytes,
                    const engine::EngineSnapshot &core, const ResourceWaitSnapshot &resourceWait) {
   const KvSpillSnapshot &cache = spill.cache;
@@ -226,7 +234,9 @@ void appendKvSpill(std::ostringstream &out, const KvSpillStatus &spill, uint64_t
   const uint32_t indexPages = index.pagesAllocated - index.pagesFree;
   out << "{\"requests\":{\"spill\":" << requests.spill << ",\"resident\":" << requests.resident
       << ",\"converted\":" << requests.converted << ",\"bounded\":" << requests.bounded
-      << ",\"length_ends\":" << requests.lengthEnds << ",\"refused\":{\"quota\":" << requests.refusedQuota
+      << ",\"length_ends\":" << requests.lengthEnds << ",\"converted_bounded\":" << requests.convertedBounded
+      << ",\"converted_length_ends\":" << requests.convertedLengthEnds
+      << ",\"refused\":{\"quota\":" << requests.refusedQuota
       << ",\"write_budget\":" << requests.refusedWriteBudget << ",\"closed\":" << requests.refusedClosed
       << "},\"waiting_quota\":" << resourceWait.diskQuota << '}'
       << ",\"pages\":{\"index\":" << indexPages << ",\"index_bytes\":" << indexPages * indexPageBytes
@@ -262,21 +272,37 @@ void appendKvSpill(std::ostringstream &out, const KvSpillStatus &spill, uint64_t
   }
   out << ",\"history_stream\":";
   if (const std::optional<model::KvHistoryStreamStats> &stream = spill.historyStream) {
-    out << "{\"commands\":" << stream->commands
-        << ",\"contended_commands\":" << core.scheduler.contendedStreamingPrefillBatches
-        << ",\"layers\":" << stream->layers << ",\"pages\":" << stream->pages << ",\"bytes\":" << stream->bytes
-        << ",\"staging_bytes\":" << stream->stagingBytes << ",\"buffers\":" << stream->buffers
-        << ",\"read_ms\":";
+    out << "{\"commands\":" << stream->commands << ",\"layers\":" << stream->layers << ",\"pages\":" << stream->pages
+        << ",\"bytes\":" << stream->bytes << ",\"staging_bytes\":" << stream->stagingBytes
+        << ",\"buffers\":" << stream->buffers << ",\"read_ms\":";
     appendLatency(out, stream->read);
     out << ",\"wait_ms\":";
     appendLatency(out, stream->wait);
-    out << ",\"decode_gap_ms\":";
-    appendLatency(out, core.scheduler.decodeGap);
     out << '}';
   } else {
     out << "null";
   }
   out << '}';
+}
+
+// The memory ledger in memory_governor (MemoryGovernorSnapshot): each
+// account's floor, current bytes and cap, its unit, and the units it took
+// and gave back; the bytes transfers will return; and the claims that wait
+// for memory.
+void appendMemoryLedger(std::ostringstream &out, const MemoryGovernorSnapshot &governor) {
+  out << ",\"accounts\":[";
+  for (size_t index = 0; index < governor.accounts.size(); ++index) {
+    const MemoryAccountSnapshot &account = governor.accounts[index];
+    out << (index ? "," : "") << "{\"name\":" << json::quote(account.name)
+        << ",\"floor_bytes\":" << account.floorBytes << ",\"current_bytes\":" << account.currentBytes
+        << ",\"cap_bytes\":" << account.capBytes << ",\"unit_bytes\":" << account.unitBytes
+        << ",\"grows\":" << account.grows << ",\"shrinks\":" << account.shrinks << '}';
+  }
+  out << "],\"owed\":{\"transfers\":" << governor.owed.transfers
+      << ",\"bytes\":" << governor.owed.bytes << ",\"to_claims_bytes\":" << governor.owed.toClaimsBytes
+      << ",\"oldest_ms\":" << governor.owed.oldestMilliseconds << "},\"claims\":{\"waiting\":"
+      << governor.claims.waiting << ",\"bytes\":" << governor.claims.bytes
+      << ",\"oldest_ms\":" << governor.claims.oldestMilliseconds << '}';
 }
 
 } // namespace
@@ -333,8 +359,10 @@ std::string runtimeStatusJson(
       << ",\"suspended\":" << resourceWait.suspended
       << ",\"draining\":" << boolean(resourceWait.draining)
       << ",\"oldest_wait_ms\":" << resourceWait.oldestWaitMilliseconds << "}"
-      << ",\"loop\":{\"max_tick_ms\":" << loop.maxTickMilliseconds << "}"
-      << ",\"identity\":{\"cache\":{"
+      << ",\"loop\":{\"max_tick_ms\":" << loop.maxTickMilliseconds
+      << ",\"stall_budget_ms\":" << supervision::kLoopStall.count() << ",\"tick_host_ms\":";
+  appendLatency(out, core.tickHostMilliseconds);
+  out << "},\"identity\":{\"cache\":{"
       << "\"loaded_model_layout_sha256\":"
       << json::quote(cacheIdentity.modelLayoutSha256)
       << ",\"build_id\":" << json::quote(cacheIdentity.buildId)
@@ -368,7 +396,15 @@ std::string runtimeStatusJson(
       << ",\"host_reserve_bytes\":" << memoryGovernor.hostReserveBytes
       << ",\"host_spare_bytes\":" << memoryGovernor.hostSpareBytes
       << ",\"host_spare_reserve_bytes\":" << memoryGovernor.hostSpareReserveBytes
-      << ",\"host_headroom_bytes\":" << memoryGovernor.hostHeadroomBytes << "}"
+      << ",\"host_headroom_bytes\":" << memoryGovernor.hostHeadroomBytes << ",\"host_telemetry\":";
+  if (const std::optional<HostTelemetry> &host = memoryGovernor.hostTelemetry)
+    out << "{\"phys_footprint_bytes\":" << host->physFootprintBytes << ",\"compressed_bytes\":" << host->compressedBytes
+        << ",\"file_backed_bytes\":" << host->fileBackedBytes << ",\"inactive_bytes\":" << host->inactiveBytes
+        << ",\"filecache_min_bytes\":" << host->fileCacheMinimumBytes << '}';
+  else
+    out << "null";
+  appendMemoryLedger(out, memoryGovernor);
+  out << "}"
       << ",\"memory_audit\":" << memoryAudit.toStatusJson()
       << ",\"weights\":";
   appendWeights(out, weights);
@@ -385,6 +421,8 @@ std::string runtimeStatusJson(
   out << ",\"kv\":{\"block_tokens\":" << kv::kPageTokens
       << ",\"pages_allocated\":" << pool.pagesAllocated
       << ",\"pages_active\":" << pool.pagesActive
+      << ",\"extents_active\":" << pool.extentsActive
+      << ",\"active_bytes\":" << pool.activeBytes
       << ",\"pages_cache\":" << pool.pagesPrefix
       << ",\"pages_free\":" << pool.pagesFree
       << ",\"allocated_bytes\":" << pool.allocatedBytes
@@ -535,12 +573,20 @@ std::string runtimeStatusJson(
       << ",\"prefill_batches\":" << scheduler.prefillBatches
       << ",\"prefill_rows\":" << scheduler.prefillRows
       << ",\"decode_batches\":" << scheduler.decodeBatches
-      << ",\"decode_batches_by_width\":{\"b1\":"
-      << scheduler.decodeBatchesByWidth[0]
-      << ",\"b2\":" << scheduler.decodeBatchesByWidth[1]
-      << ",\"b3\":" << scheduler.decodeBatchesByWidth[2]
-      << ",\"b4\":" << scheduler.decodeBatchesByWidth[3] << "}}";
-  out << ",\"active_requests\":[";
+      << ",\"decode_batches_by_width\":{";
+  for (uint32_t width = 1; width <= model::ExecutionLimits::maximumBatchWidth; ++width)
+    out << (width > 1 ? "," : "") << "\"b" << width
+        << "\":" << scheduler.decodeBatchesByWidth[width - 1];
+  out << "}"
+      << ",\"decode_gap_target_ms\":" << scheduler.decodeGapTargetMilliseconds
+      << ",\"contended_prefill_ms\":";
+  appendLatency(out, scheduler.contendedPrefill);
+  out << ",\"prefill_units\":" << scheduler.prefillUnits
+      << ",\"pass_commands\":" << scheduler.passCommands
+      << ",\"abandoned_pass_commands\":" << scheduler.abandonedPassCommands
+      << ",\"bound_cuts\":" << scheduler.boundCuts
+      << ",\"index_page_conflicts\":" << scheduler.indexPageConflicts
+      << ",\"replans\":" << core.replans << "},\"active_requests\":[";
   for (size_t index = 0; index < core.activeRequests.size(); ++index) {
     const engine::ActiveRequestSnapshot &request = core.activeRequests[index];
     out << (index ? "," : "") << "{\"id\":" << request.id
@@ -563,10 +609,21 @@ std::string runtimeStatusJson(
       << ",\"metrics\":{\"ttft_ms\":{\"p50\":" << metrics.ttftP50Milliseconds
       << ",\"p95\":" << metrics.ttftP95Milliseconds
       << ",\"samples\":" << metrics.ttftSamples
-      << "},\"itl_ms\":{\"p50\":" << metrics.itlP50Milliseconds
+      << "},\"ttft_parts_ms\":{";
+  for (size_t part = 0; part < kTtftParts; ++part) {
+    out << (part ? "," : "") << json::quote(kTtftPartNames[part]) << ':';
+    appendLatency(out, metrics.ttftParts[part]);
+  }
+  out << "},\"itl_ms\":{\"p50\":" << metrics.itlP50Milliseconds
       << ",\"p95\":" << metrics.itlP95Milliseconds
-      << ",\"samples\":" << metrics.itlSamples
-      << "},\"prefill_input_tokens\":" << metrics.prefillInputTokens
+      << ",\"samples\":" << metrics.itlSamples << "},\"decode_gap_ms\":";
+  appendLatency(out, metrics.decodeGap);
+  out << ",\"decode_gap_causes\":{";
+  for (size_t cause = 0; cause < kGapCauses; ++cause)
+    out << json::quote(kGapCauseNames[cause]) << ":{\"gaps\":" << core.decodeGapCauses.gaps[cause]
+        << ",\"ms\":" << core.decodeGapCauses.milliseconds[cause] << "},";
+  out << "\"prefill_ms\":" << core.decodeGapCauses.prefillMilliseconds << '}';
+  out << ",\"prefill_input_tokens\":" << metrics.prefillInputTokens
       << ",\"prefill_wall_ms\":" << metrics.prefillWallMilliseconds
       << ",\"prefill_tokens_per_second\":" << metrics.prefillTokensPerSecond
       << ",\"decode_output_tokens\":" << metrics.decodeOutputTokens
@@ -582,16 +639,11 @@ std::string runtimeStatusJson(
   appendBatch(out, metrics.currentPrefillBatch);
   out << ",\"current_decode_batch\":";
   appendBatch(out, metrics.currentDecodeBatch);
-  const std::string prefillName =
-      "prefill_" + std::to_string(SPLASH_PREFILL_TOKEN_BUDGET);
-  const std::pair<std::string_view, WarmupStepStatus> warmupSteps[] = {
-      {prefillName, warmup.maximumPrefill},
-      {"decode_b1", warmup.decodeBatches[0]},
-      {"decode_b2", warmup.decodeBatches[1]},
-      {"decode_b3", warmup.decodeBatches[2]},
-      {"decode_b4", warmup.decodeBatches[3]},
-      {"composite_state_restore", warmup.compositeStateRestore},
-  };
+  std::vector<std::pair<std::string, WarmupStepStatus>> warmupSteps{
+      {"prefill_" + std::to_string(model::ExecutionLimits::prefillTokenBudget), warmup.maximumPrefill}};
+  for (uint32_t width = 1; width <= model::ExecutionLimits::maximumBatchWidth; ++width)
+    warmupSteps.emplace_back("decode_b" + std::to_string(width), warmup.decodeBatches[width - 1]);
+  warmupSteps.emplace_back("composite_state_restore", warmup.compositeStateRestore);
   out << "},\"warmup\":{";
   for (const auto &[name, status] : warmupSteps) {
     out << json::quote(name) << ':'

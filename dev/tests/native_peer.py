@@ -59,12 +59,29 @@ def status_event(correlation_id: int = 1, **fields) -> wire.StatusJsonEvent:
 
 def _event_payload(event: wire.EngineEvent) -> tuple[wire.FrameType, bytes]:
     match event:
+        case wire.WarmingEvent():
+            return wire.FrameType.WARMING, b""
         case wire.ReadyEvent():
             return wire.FrameType.READY, struct.pack(
-                "<IIB",
+                f"<IIBIII{len(event.stop_token_ids)}I",
                 event.max_concurrent_requests,
                 event.max_context_tokens,
                 event.vision,
+                event.vocabulary_size,
+                event.mask_rows,
+                len(event.stop_token_ids),
+                *event.stop_token_ids,
+            )
+        case wire.StartFailedEvent():
+            return wire.FrameType.START_FAILED, struct.pack(
+                f"<BBQQII{len(event.message)}s",
+                event.kind,
+                event.bound,
+                event.required_bytes,
+                event.budget_bytes,
+                event.plan_context_tokens,
+                len(event.message),
+                event.message,
             )
         case wire.StartEvent():
             return wire.FrameType.START, struct.pack(

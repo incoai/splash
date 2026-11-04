@@ -28,7 +28,7 @@ constexpr uint64_t kCancelFixedBytes = 8;
 constexpr uint64_t kMaskResponseFixedBytes = 20;
 constexpr uint64_t kStatusRequestFixedBytes = 8;
 constexpr uint64_t kReleaseRequestFixedBytes = 8;
-constexpr uint64_t kReadyFixedBytes = 9;
+constexpr uint64_t kReadyFixedBytes = 21;
 constexpr uint64_t kStartFixedBytes = 16;
 constexpr uint64_t kPromptProgressFixedBytes = 20;
 constexpr uint64_t kTokensFixedBytes = 16;
@@ -36,6 +36,7 @@ constexpr uint64_t kMaskRequestFixedBytes = 24;
 constexpr uint64_t kDoneFixedBytes = 62;
 constexpr uint64_t kErrorFixedBytes = 22;
 constexpr uint64_t kStatusJsonFixedBytes = 8;
+constexpr uint64_t kStartFailedFixedBytes = 26;
 
 struct PayloadBounds {
   uint64_t minimum = 0;
@@ -419,10 +420,16 @@ ProtocolIssue invalidEvent(IssueCode code, uint64_t requestId,
 }
 
 std::optional<ProtocolIssue> validateReady(const ReadyEvent &event) {
-  if (event.maxConcurrentRequests && event.maxContextTokens)
-    return std::nullopt;
-  return invalidEvent(IssueCode::InvalidCount, 0,
-                      "ready event capacities must be non-zero");
+  if (!event.maxConcurrentRequests || !event.maxContextTokens ||
+      !event.vocabularySize || !event.maskRows || event.stopTokens.empty())
+    return invalidEvent(IssueCode::InvalidCount, 0,
+                        "ready event capacities and stop tokens must be "
+                        "non-zero");
+  for (uint32_t token : event.stopTokens)
+    if (token >= event.vocabularySize)
+      return invalidEvent(IssueCode::InvalidCount, 0,
+                          "ready event stop token is outside the vocabulary");
+  return std::nullopt;
 }
 
 std::optional<ProtocolIssue> validateStart(const StartEvent &event) {
@@ -562,6 +569,27 @@ std::optional<ProtocolIssue> validateError(const ErrorEvent &event,
   return std::nullopt;
 }
 
+std::optional<ProtocolIssue>
+validateStartFailed(const StartFailedEvent &event,
+                    const ProtocolLimits &limits) {
+  using Kind = StartFailureKind;
+  using Bound = ShortfallBound;
+  if (!validEnum(static_cast<uint8_t>(event.kind),
+                 {Kind::Internal, Kind::HostMemory, Kind::DriverAllocation,
+                  Kind::MemoryBudget, Kind::ContextBudget, Kind::Configuration,
+                  Kind::Model, Kind::Device, Kind::CommandMemory}) ||
+      !validEnum(static_cast<uint8_t>(event.shortfall.bound),
+                 {Bound::DeviceMemory, Bound::MaxMemory, Bound::Disk})) {
+    return invalidEvent(IssueCode::InvalidEnumValue, 0,
+                        "start failure kind or bound is invalid");
+  }
+  if (event.message.size() > limits.maxErrorStringBytes) {
+    return invalidEvent(IssueCode::LimitExceeded, 0,
+                        "start failure message exceeds its safe limit");
+  }
+  return std::nullopt;
+}
+
 std::optional<ProtocolIssue> validateStatusJson(const StatusJsonEvent &event,
                                                 const ProtocolLimits &limits) {
   if (event.json.empty() || event.json.size() > limits.maxStatusJsonBytes) {
@@ -573,13 +601,24 @@ std::optional<ProtocolIssue> validateStatusJson(const StatusJsonEvent &event,
 
 using EncodedEvent = ProtocolResult<std::vector<uint8_t>>;
 
+EncodedEvent encodeWarming() {
+  return success(frameWriter(FrameType::Warming, 0).take());
+}
+
 EncodedEvent encodeReady(const ReadyEvent &event) {
   if (auto issue = validateReady(event))
     return failure<std::vector<uint8_t>>(std::move(*issue));
-  Writer writer = frameWriter(FrameType::Ready, kReadyFixedBytes);
+  Writer writer =
+      frameWriter(FrameType::Ready,
+                  kReadyFixedBytes + event.stopTokens.size() * sizeof(uint32_t));
   writer.u32(event.maxConcurrentRequests);
   writer.u32(event.maxContextTokens);
   writer.u8(event.vision);
+  writer.u32(event.vocabularySize);
+  writer.u32(event.maskRows);
+  writer.u32(static_cast<uint32_t>(event.stopTokens.size()));
+  for (uint32_t token : event.stopTokens)
+    writer.u32(token);
   return success(writer.take());
 }
 
@@ -675,6 +714,22 @@ EncodedEvent encodeError(const ErrorEvent &event,
   writer.u32(static_cast<uint32_t>(event.code.size()));
   writer.u32(static_cast<uint32_t>(event.message.size()));
   writer.text(event.code);
+  writer.text(event.message);
+  return success(writer.take());
+}
+
+EncodedEvent encodeStartFailed(const StartFailedEvent &event,
+                               const ProtocolLimits &limits) {
+  if (auto issue = validateStartFailed(event, limits))
+    return failure<std::vector<uint8_t>>(std::move(*issue));
+  Writer writer = frameWriter(FrameType::StartFailed,
+                              kStartFailedFixedBytes + event.message.size());
+  writer.u8(static_cast<uint8_t>(event.kind));
+  writer.u8(static_cast<uint8_t>(event.shortfall.bound));
+  writer.u64(event.shortfall.requiredBytes);
+  writer.u64(event.shortfall.budgetBytes);
+  writer.u32(event.shortfall.planContextTokens);
+  writer.u32(static_cast<uint32_t>(event.message.size()));
   writer.text(event.message);
   return success(writer.take());
 }
@@ -889,6 +944,10 @@ std::string_view frameTypeName(FrameType type) {
     return "error";
   case FrameType::StatusJson:
     return "status_json";
+  case FrameType::StartFailed:
+    return "start_failed";
+  case FrameType::Warming:
+    return "warming";
   }
   return "unknown";
 }
@@ -1043,6 +1102,10 @@ serializeEvent(const EngineEvent &event, const ProtocolLimits &limits) {
             return encodeDone(value);
           } else if constexpr (std::is_same_v<T, ErrorEvent>) {
             return encodeError(value, limits);
+          } else if constexpr (std::is_same_v<T, StartFailedEvent>) {
+            return encodeStartFailed(value, limits);
+          } else if constexpr (std::is_same_v<T, WarmingEvent>) {
+            return encodeWarming();
           } else {
             return encodeStatusJson(value, limits);
           }

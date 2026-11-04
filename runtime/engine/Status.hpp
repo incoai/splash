@@ -8,6 +8,7 @@
 #include "engine/ThermalState.hpp"
 #include "model/ExpertStoreStats.hpp"
 #include "model/KvReadStats.hpp"
+#include "model/LatencyHistogram.hpp"
 #include "model/SparseRowStore.hpp"
 
 #include <algorithm>
@@ -60,6 +61,16 @@ struct RuntimeMetricsSnapshot {
   double itlP50Milliseconds = 0.0;
   double itlP95Milliseconds = 0.0;
   uint32_t itlSamples = 0;
+  // Every gap a request saw between two of its token events after its first:
+  // the wall time from one TokensEvent to the next, undivided by the tokens
+  // the event carries (the ITL divides), whatever ran meanwhile (commands of
+  // other lanes, suspensions and replays, a constrained lane's mask round
+  // trip). Lifetime; quantiles within a factor of two, maximum exact.
+  model::LatencyStats decodeGap;
+  // Each request's time to its first token by what held it (TtftPart
+  // order: own prefill, claim wait, decode, other prefill, rest), which sum
+  // to its TTFT. Lifetime; quantiles within a factor of two, maximum exact.
+  std::array<model::LatencyStats, engine::kTtftParts> ttftParts{};
   double prefillTokensPerSecond = 0.0;
   double decodeTokensPerSecond = 0.0;
   // Lifetime native batch counters. Consumers take two status snapshots and
@@ -95,6 +106,8 @@ public:
   void tokens(double submittedMilliseconds,
               std::optional<double> previousTokenMilliseconds,
               uint32_t count, double nowMilliseconds);
+  // A first token's TTFT by what held the request, its parts summing to it.
+  void ttftParts(const engine::TtftParts &parts);
   void batchCompleted(WorkKind kind, uint32_t width, uint32_t inputTokens,
                       uint32_t outputTokens, uint32_t draftedTokens,
                       uint32_t acceptedDraftTokens, double wallMilliseconds,
@@ -111,6 +124,8 @@ private:
   uint32_t latencyWindow_ = 0;
   std::deque<double> ttftMilliseconds_;
   std::deque<double> itlMilliseconds_;
+  model::LatencyHistogram decodeGaps_;
+  std::array<model::LatencyHistogram, engine::kTtftParts> ttftParts_;
   uint64_t prefillTokens_ = 0;
   uint64_t decodeTokens_ = 0;
   double prefillWallMilliseconds_ = 0.0;
@@ -145,8 +160,18 @@ inline void RuntimeMetrics::tokens(
              nowMilliseconds >= *previousTokenMilliseconds) {
     append(itlMilliseconds_,
            (nowMilliseconds - *previousTokenMilliseconds) / count);
+    decodeGaps_.add(
+        uint64_t((nowMilliseconds - *previousTokenMilliseconds) * 1e6));
   } else {
     throw std::invalid_argument("metrics token clock moved backwards");
+  }
+}
+
+inline void RuntimeMetrics::ttftParts(const engine::TtftParts &parts) {
+  for (size_t part = 0; part < engine::kTtftParts; ++part) {
+    if (!std::isfinite(parts[part]) || parts[part] < 0.0)
+      throw std::invalid_argument("invalid TTFT part");
+    ttftParts_[part].add(uint64_t(parts[part] * 1e6));
   }
 }
 
@@ -200,6 +225,9 @@ inline RuntimeMetricsSnapshot RuntimeMetrics::snapshot() const {
   result.itlP50Milliseconds = percentile(itlMilliseconds_, 0.50);
   result.itlP95Milliseconds = percentile(itlMilliseconds_, 0.95);
   result.itlSamples = static_cast<uint32_t>(itlMilliseconds_.size());
+  result.decodeGap = decodeGaps_.snapshot();
+  for (size_t part = 0; part < engine::kTtftParts; ++part)
+    result.ttftParts[part] = ttftParts_[part].snapshot();
   if (prefillWallMilliseconds_ > 0.0) {
     result.prefillTokensPerSecond =
         double(prefillTokens_) * 1000.0 / prefillWallMilliseconds_;
