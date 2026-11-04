@@ -33,14 +33,14 @@ struct ServerView: View {
                     }
                     if case .failed(let message) = state.server.phase, let model = state.server.model {
                         ProblemRow(title: "\(state.displayName(of: model)) ran into a problem", message: message,
-                                   log: Server.log, dismiss: state.server.dismissFailure,
+                                   log: .server, dismiss: state.server.dismissFailure,
                                    // Files on this Mac that can't serve won't serve on a second try.
                                    action: model.hasPrefix("/") && !state.server.running
                                        ? ("Remove from List", { state.server.dismissFailure(); state.removeLocal(model) }) : nil)
                     }
                     if let failure = state.installer.failure {
                         ProblemRow(title: "\(state.displayName(of: failure.model)) couldn’t download",
-                                   message: failure.message, log: Installer.log, dismiss: state.installer.dismissFailure,
+                                   message: failure.message, log: .downloads, dismiss: state.installer.dismissFailure,
                                    action: ("Download Again", { state.download(failure.model) }))
                     }
                     if state.installer.running { DownloadRow() }
@@ -208,11 +208,13 @@ private struct ControlBar: View {
         if case .failed = state.server.phase { state.server.model == state.selection } else { false }
     }
 
-    /// The mark's look, for the model the bar names: a failure of another one isn't its.
-    private var look: MarkLook {
-        if case .failed = state.server.phase, !state.server.running, !failedPicked { return .off }
-        return state.markLook
+    /// Whether the server's failure is of another model than the one the bar names, which then
+    /// shows as not running.
+    private var othersFailure: Bool {
+        if case .failed = state.server.phase { !state.server.running && !failedPicked } else { false }
     }
+
+    private var look: MarkLook { othersFailure ? .off : state.serverStatus.look }
 
     @ViewBuilder private var detail: some View {
         let server = state.server
@@ -225,15 +227,7 @@ private struct ControlBar: View {
                 Text(seconds < 3 ? "\(step)…" : "\(step) · \(seconds)s").monospacedDigit()
             }
             .help(server.step == .warming ? "Running the model once so that its first answer comes quickly. The first start after an update also prepares its GPU programs, which can take a minute." : "")
-        case .stopping:
-            if let next = server.next {
-                Text(next == server.model ? "Restarting…" : "Switching to \(state.displayName(of: next))…")
-            } else {
-                Text("Stopping…")
-            }
-        case .ready where server.recovering:
-            Text(server.serving.rawValue)
-        case .ready:
+        case .ready where !server.recovering:
             HStack(spacing: 4) {
                 Text(verbatim: "\(server.serving.rawValue) · Port \(server.settings.port)")
                     .help(server.asleep ? "It freed its memory while idle and loads again with the next message." : "")
@@ -242,12 +236,10 @@ private struct ControlBar: View {
                     .help("Copy API Address: \(server.settings.url.appending(path: "v1").absoluteString)")
                     .accessibilityLabel("Copy API Address")
             }
-        case .failed where server.running:
-            Text("Not responding")
-        case .failed where failedPicked:
-            Text("Ran into a problem")
-        default:
+        case .failed where othersFailure:
             Text("Not running")
+        default:
+            Text(state.serverStatus.phrase)
         }
     }
 
@@ -311,7 +303,7 @@ private struct ActivityFigures: View {
 
     var body: some View {
         let latency = activity.firstToken.map(Format.latency)
-        let memory = activity.memory.map { Format.parts(Format.size($0)) }
+        let memory = activity.memory.map { Format.parts(Format.memory($0)) }
         HStack(spacing: 0) {
             Figure(value: activity.generation.map(Format.whole), unit: "tok/s", caption: "Answering",
                    help: "Average since the model started")
@@ -416,8 +408,7 @@ private struct AgentsPopup: View {
                       + [PopupItem(id: Self.copy, title: "Copy API Address", separated: true)],
                   chosen: nil, above: true) { choice in
             if let agent = Agent(rawValue: choice) {
-                NSApp.activate()
-                agent.open(runtime: state.runtime, settings: state.server.settings)
+                state.open(agent)
             } else {
                 state.copyAPIAddress()
             }
@@ -445,9 +436,11 @@ struct SectionTitle: View {
 
 /// Something that failed: why, in a line or three, with any log and a way out.
 private struct ProblemRow: View {
+    @Environment(AppState.self) private var state
     let title: String
     let message: String
-    var log: URL?
+    /// The log that says more, which Show Log opens in the window's drawer.
+    var log: LogSource?
     var dismiss: (() -> Void)?
     /// The way out, with its button's title.
     var action: (title: String, run: () -> Void)?
@@ -465,7 +458,9 @@ private struct ProblemRow: View {
                     .help(message)
             }
             Spacer(minLength: 12)
-            if let log { Button("Show Log") { NSWorkspace.shared.open(log) } }
+            if let log {
+                Button("Show Log") { state.showLog(log) }
+            }
             if let action { Button(action.title, action: action.run) }
             if let dismiss {
                 Button(action: dismiss) { Image(systemName: "xmark") }
@@ -564,14 +559,10 @@ private struct ModelRow: View {
     private var phase: String? {
         let server = state.server
         if server.next == model.id && server.model != model.id { return "Up next" }
-        guard server.running, server.model == model.id else { return nil }
-        switch server.phase {
-        case .ready: return server.serving.rawValue
-        case .starting: return "\(server.step.rawValue)…"
-        case .stopping: return server.next == model.id ? "Restarting…" : "Stopping…"
-        case .failed: return "Not responding"
-        case .stopped: return nil
-        }
+        guard server.running, server.model == model.id, server.phase != .stopped else { return nil }
+        // Switched away from, it says Stopping…: the next model's own row says Up next.
+        if server.phase == .stopping, server.next != model.id { return "Stopping…" }
+        return state.serverStatus.phrase
     }
 }
 

@@ -4,10 +4,16 @@ import Foundation
 /// A program run as a terminal runs a foreground job: in a process group of its own, so a signal
 /// reaches it and every program it starts (the installer, the engine), the way Ctrl+C does. Its
 /// output goes to a log file rather than a pipe, so it never waits on this app, and keeps working
-/// if the app quits or crashes.
+/// if the app quits or crashes. Every program the app runs but the drawer's shells, which need a
+/// terminal of their own, runs as one.
 final class ChildProcess: @unchecked Sendable {
     let pid: pid_t
+    /// When it started (`processStart`), which tells it apart from a later process given its ID.
+    let started: Int?
     private let exitSource: DispatchSourceProcess
+    /// Main queue only: whether it has ended, and whether it was asked to stop.
+    private var ended = false
+    private var stopping = false
 
     /// Starts `command` with `environment`, standard input from /dev/null and standard output and
     /// error appended to `log`. `exited` gets the exit status, as a shell reports it, on the main
@@ -52,10 +58,12 @@ final class ChildProcess: @unchecked Sendable {
         let status = posix_spawn(&pid, command[0], &actions, &attributes, argv, envp)
         guard status == 0 else { throw POSIXError(.init(rawValue: status) ?? .EIO) }
         self.pid = pid
+        started = processStart(pid)
 
         exitSource = DispatchSource.makeProcessSource(identifier: pid, eventMask: .exit, queue: .main)
-        exitSource.setEventHandler { [exitSource] in
+        exitSource.setEventHandler { [self, exitSource] in
             exitSource.cancel()
+            ended = true
             // The event can come just before the program can be reaped, and comes once: wait for
             // it, which takes no time now that it has ended.
             var status: Int32 = 0
@@ -67,9 +75,43 @@ final class ChildProcess: @unchecked Sendable {
         exitSource.resume()
     }
 
-    /// Sends `signal` to the program's process group.
-    func signal(_ signal: Int32) {
+    /// Stops the program as a terminal stops a job: `signal` to its process group, once, as a
+    /// second one could cut what the first lets it finish; SIGKILL to the group if the program
+    /// still runs `killAfter` later.
+    @MainActor
+    func stop(_ signal: Int32, killAfter: Duration) {
+        guard !stopping, !ended else { return }
+        stopping = true
         killpg(pid, signal)
+        Task { @MainActor [self] in
+            try? await Task.sleep(for: killAfter)
+            if !ended { killpg(pid, SIGKILL) }
+        }
+    }
+
+    /// Runs `command` to its end, as `init` does: its exit status, as a shell reports it; nil where
+    /// it does not start, or runs past `timeout`, which kills it. One whose caller no longer waits
+    /// for it is killed too.
+    @MainActor
+    static func run(_ command: [String], environment: [String: String], log: URL, timeout: Duration) async -> Int32? {
+        let (statuses, end) = AsyncStream.makeStream(of: Int32.self)
+        guard let child = try? ChildProcess(command: command, environment: environment, log: log, exited: {
+            end.yield($0)
+            end.finish()
+        }) else { return nil }
+        let deadline = Task {
+            try await Task.sleep(for: timeout)
+            child.stop(SIGKILL, killAfter: .zero)
+        }
+        let status: Int32? = await withTaskCancellationHandler {
+            for await status in statuses { return status }
+            return nil
+        } onCancel: {
+            Task { @MainActor in child.stop(SIGKILL, killAfter: .zero) }
+        }
+        deadline.cancel()
+        // The deadline passed only where it was not cancelled.
+        return (try? await deadline.value) == nil ? status : nil
     }
 }
 
@@ -113,12 +155,67 @@ final class LogTail {
     }
 }
 
-/// Stops the process group `pid` leads, as `ChildProcess.signal` would, when this app no longer
-/// holds it: SIGINT, then SIGKILL if it still runs 20 s later; returns once it has ended.
-func stopProcessGroup(_ pid: pid_t) async {
-    killpg(pid, SIGINT)
-    for tick in 1...300 where kill(pid, 0) == 0 {
-        if tick == 200 { killpg(pid, SIGKILL) }
+/// The engine's stop budget (runtime/Supervision.hpp `kStop`, which
+/// dev/tests/engine/protocol_golden.txt pins): from a stop signal to the engine's exit, its flush
+/// included. A server stops its engine with SIGTERM and kills it past this, then waits this long
+/// more for it to exit, so a server stopping takes at most twice it.
+enum Supervision {
+    static let stop = Duration.seconds(15)
+}
+
+/// A program this app started, as the defaults keep it for the next launch should this one end
+/// without stopping it: its process ID and when it started. Together they name it whichever copy
+/// of the app started it, and never a later process given the same ID.
+struct ChildRecord {
+    let key: String
+    /// The signal a later launch stops it with, once: a second one could cut what the first lets
+    /// it finish.
+    let stop: Int32
+    /// How long after that signal its process group is killed if it still runs.
+    let killAfter: Duration
+
+    /// Keeps `child` as the program this record names.
+    func keep(_ child: ChildProcess) {
+        guard let started = child.started else { return forget() }
+        UserDefaults.standard.set([Int(child.pid), started], forKey: key)
+    }
+
+    func forget() {
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+
+    /// Stops the program kept, if it still runs, and forgets it once it has ended; one still
+    /// running stays kept, for the launch after. A record of the ID alone, as an older app kept
+    /// it, is forgotten, and its program left running.
+    func stopLeftover() async {
+        guard let kept = UserDefaults.standard.array(forKey: key) as? [Int], kept.count == 2,
+              let pid = pid_t(exactly: kept[0])
+        else { return forget() }
+        if processStart(pid) == kept[1] { await stopProcessGroup(pid, with: stop, killAfter: killAfter) }
+        if processStart(pid) != kept[1] { forget() }
+    }
+}
+
+/// When process `pid` started, in microseconds since 1970, or nil where no such process runs.
+func processStart(_ pid: pid_t) -> Int? {
+    var info = proc_bsdinfo()
+    let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+    guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+    return Int(info.pbi_start_tvsec) * 1_000_000 + Int(info.pbi_start_tvusec)
+}
+
+/// Stops the process group `pid` leads, as `ChildProcess.stop` does, when this app no longer
+/// holds it: `signal`, then SIGKILL if it still runs `killAfter` later; returns once its leader
+/// has ended, or 10 s after the SIGKILL.
+func stopProcessGroup(_ pid: pid_t, with signal: Int32, killAfter: Duration) async {
+    killpg(pid, signal)
+    let killAt = ContinuousClock.now + killAfter
+    var killed = false
+    while kill(pid, 0) == 0, ContinuousClock.now < killAt + .seconds(10) {
+        if !killed, ContinuousClock.now >= killAt {
+            killpg(pid, SIGKILL)
+            killed = true
+        }
         try? await Task.sleep(for: .milliseconds(100))
     }
 }
@@ -148,25 +245,4 @@ func portInUse(_ port: Int) -> Bool {
 func resetLog(_ url: URL) {
     try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
     FileManager.default.createFile(atPath: url.path, contents: nil)
-}
-
-/// A failure of `model`'s in words a user can act on; the log keeps the original.
-func plainProblem(_ message: String, model: String) -> String {
-    if let reason = message.firstMatch(of: /^cannot prepare .+?: (.+)$/)?.1 {
-        return "Splash can’t serve these files: \(reason)"
-    }
-    if message.contains("Repository Not Found") || message.contains("404 Client Error") {
-        return "Hugging Face has no public model named \(model.split(separator: ":")[0]). Check the name, then try again."
-    }
-    if message.contains("ConnectionError") || message.contains("Max retries exceeded") || message.contains("nodename nor servname") {
-        return "Splash couldn’t reach Hugging Face. Check the internet connection, then try again."
-    }
-    return message
-}
-
-/// The message of an error line, without its prefix: `error: ...` from the launcher, installer
-/// and engine, `HH:MM:SS Error · ...` from the server, `PROGRAM: error: ...` from an argument
-/// parser refusing its command line.
-func errorMessage(_ line: String) -> String? {
-    line.firstMatch(of: /^(?:error: |\d\d:\d\d:\d\d Error · |[\w.\- ]+: error: )(.+)/).map { String($0.1) }
 }

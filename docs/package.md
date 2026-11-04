@@ -72,7 +72,10 @@ the launch options picked in the app that differ from the server's defaults,
 ready once the port's lock names that process and `/health` answers; stopping
 is Ctrl+C's SIGINT to the group. Switching models stops one server and starts
 the next. The app starts nothing by itself: its window opens on the Server,
-where models download, start and switch, beside the Chat. Models, locks and
+where models download, start and switch, beside the Chat. The toolbar's switch
+opens the Chat, whose sidebar of conversations ⌘B hides, and the Server's
+button at its end the Server: it shows the model that runs, a start's step,
+the speed of an answer and a download's progress. Models, locks and
 downloads are the ones a packaged `splash` uses, in `~/Library/Application
 Support/Splash` and the Hugging Face cache. The app offers
 `install/suggested-models.tsv`, per model the variant meant for the Mac's
@@ -83,7 +86,11 @@ as it starts. Its launch options are every option `splash serve` takes but the
 ones of one model (`--revision`, `--draft-model`, `--mmproj`) and the ones it
 sets itself, from one table (`LaunchOption.all`) the tests hold to `splash
 serve --help`; the API key reaches the server as `SPLASH_API_KEY`, from the
-Keychain, and nothing starts while the Keychain does not give it. It serves
+Keychain, and nothing starts while the Keychain does not give it. The server
+stops as Ctrl+C stops it once the app has ended, by a crash too, since the app
+passes its process ID as `SPLASH_APP_PID`; the app's next launch stops one still
+running, by the process ID and start time it keeps. An older app kept the ID
+alone: that record is forgotten, and its server left running. It serves
 model files on this Mac the user adds with `splash serve --model local/NAME
 --model-dir PATH`, NAME being the file's or folder's name made a repository
 name, and at launch it runs `install/cached.py`. While a model runs, the Server
@@ -93,7 +100,10 @@ taken from the cache, and the Metal memory it holds, with each request's line
 of the server's log, folded. Its chat is its own, not the chat page: it streams
 `/v1/chat/completions` and keeps each conversation as a JSON file in
 `~/Library/Application Support/Splash/Chats`, so a conversation outlives a
-switch of models. Its icon is `app/AppIcon.icon`, an Icon Composer document
+switch of models. The window's drawer, ⌘J or the toolbar's terminal button,
+holds terminals, each the user's login shell in the home folder, through
+SwiftTerm, and the server's and the downloads' logs as they are written. Its
+icon is `app/AppIcon.icon`, an Icon Composer document
 `actool` compiles, which needs the full Xcode; its mark, three arcs of water
 springing from a rippled surface, is the menu bar's too (`SplashMark`), and the
 chat page's (`server/favicon.svg`). `swift test --package-path app` runs its

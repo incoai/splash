@@ -8,14 +8,15 @@ enum Preference {
     /// The model files on this Mac the user added, by path, which `splash serve` prepares.
     static let localModels = "localModels"
     static let agentFolder = "agentFolder"
+    /// Whether the Chat shows its sidebar.
+    static let sidebar = "sidebar"
     /// The reasoning effort chosen for each model, by its ID; none for its default.
     static let efforts = "efforts"
     /// The launch options set, by flag (`ServeSettings`).
     static let launchOptions = "launchOptions"
-    /// The server and the download the app runs, kept until they exit, to stop them on the next
-    /// launch should the app quit without stopping them.
+    /// The server and the download the app runs (`ChildRecord`), kept until they exit, to stop
+    /// them on the next launch should the app quit without stopping them.
     static let serverPID = "serverPID"
-    static let serverPort = "serverPort"
     static let installerPID = "installerPID"
 }
 
@@ -37,9 +38,6 @@ struct ServeSettings: Equatable {
     }
 
     var port: Int { values["--port"].flatMap(Int.init) ?? Self.defaultPort }
-
-    /// The memory limit set, in GB.
-    var memoryLimit: Int? { values["--max-memory"].flatMap { Int($0.dropLast()) } }
 
     /// The options UserDefaults keeps, of the flags the app offers and values they take; no key.
     static func current(_ defaults: UserDefaults = .standard) -> ServeSettings {
@@ -88,7 +86,7 @@ struct ServeSettings: Equatable {
     }
 
     /// The server's address: it listens on the loopback address, alone or with every other one, and
-    /// the app's chat, health and status requests and the coding agents go there.
+    /// the app's chat and status requests and the coding agents go there.
     var url: URL { URL(string: "http://127.0.0.1:\(port)")! }
 
     /// A request to `path` on the server, with the API key it asks for.
@@ -228,7 +226,7 @@ extension LaunchOption {
             section: .memory, kind: .choice(standard: "32-bit", choices: [("bf16", "16-bit")], custom: nil)),
         LaunchOption(
             flag: "--expert-memory", title: "Expert memory",
-            help: "The least memory a MoE model’s experts keep; they take all the memory the plan leaves them and give it back while requests need it, taking it again once memory is free, and the rest are read from the SSD as tokens need them. Off keeps every expert in memory.",
+            help: "Memory for a MoE model’s experts, kept at exactly this size; the rest are read from the SSD as tokens need them. Auto gives them what the context leaves and gives it back while requests need it. Off keeps every expert in memory.",
             section: .memory, kind: .choice(standard: "Auto", choices: [("off", "Off")], custom: size(example: "16G"))),
         LaunchOption(
             flag: "--ple-memory", title: "PLE table memory",
@@ -321,7 +319,7 @@ extension LaunchOption {
             flag: "--thinking-end-text", title: "Thinking end text",
             help: "What closes thinking where its budget runs out, such as a sentence that turns to the answer.",
             section: .api,
-            kind: .text(Value(prompt: "</think>", message: "", parse: { $0.isEmpty ? nil : $0 }), list: false)),
+            kind: .text(Value(prompt: "Model’s Default", message: "", parse: { $0.isEmpty ? nil : $0 }), list: false)),
         LaunchOption(
             flag: "--served-model-name", title: "Other model names",
             help: "More names requests may give the model, such as gpt-4o for an app that asks for it.",
@@ -364,7 +362,7 @@ extension LaunchOption {
                                                                      parse: { Double($0).flatMap { $0 >= 0 ? String($0) : nil } }))),
         LaunchOption(
             flag: "--verify-rows", title: "Repeatable answers",
-            help: "A MoE model’s greedy and seeded answers repeat exactly from run to run, at some cost in speed.",
+            help: "A MoE model’s greedy and seeded answers repeat when a request runs alone with the same prompts cached, at some cost in speed. A prompt sent again reads from the cache, so its answer can differ.",
             section: .requests, kind: .choice(standard: "Off", choices: [("all", "On")], custom: nil)),
         LaunchOption(
             flag: "--disable-ane", title: "Neural Engine for long prompts",

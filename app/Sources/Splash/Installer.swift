@@ -30,6 +30,43 @@ final class Installer {
         }
     }
 
+    /// A failure the installer reports as it ends: its class, which the app words, and its own
+    /// message for the rest; for a disk without room, that names the bytes needed and free.
+    struct Failure: Decodable, Equatable {
+        /// "not_found", "offline" and "auth" are worded by the app; any other shows the message.
+        let kind: String?
+        let message: String
+
+        /// The failure a line of the installer's output reports, if it is an error event.
+        init?(line: String) {
+            struct Event: Decodable {
+                let event: String
+                let kind: String?
+                let message: String
+            }
+            guard line.hasPrefix("{"),
+                  let event = try? JSONDecoder().decode(Event.self, from: Data(line.utf8)),
+                  event.event == "error"
+            else { return nil }
+            (kind, message) = (event.kind, event.message)
+        }
+    }
+
+    /// A failure installing `model`, in words a user can act on.
+    nonisolated static func problem(_ failure: Failure, model: String) -> String {
+        let name = model.split(separator: ":")[0]
+        switch failure.kind {
+        case "not_found":
+            return "Hugging Face has no public model named \(name). Check the name, then try again."
+        case "offline":
+            return "Splash couldn’t reach Hugging Face. Check the internet connection, then try again."
+        case "auth":
+            return "Hugging Face refused access to \(name). Sign in with an account that can read it (hf auth login), then try again."
+        default:
+            return failure.message
+        }
+    }
+
     /// The model installing.
     private(set) var model: String?
     /// The download of the model's own files. A model's draft downloads first; it is small, and
@@ -41,19 +78,22 @@ final class Installer {
     /// Gets each model once it is installed.
     @ObservationIgnored var installed: (String) -> Void = { _ in }
 
-    static let log = URL.libraryDirectory.appending(path: "Logs/Splash/install.log")
-
+    /// The downloads' log, which each download begins again.
+    let log: URL
     private let runtime: Runtime
     private var child: ChildProcess?
+    /// A leftover download gets Ctrl+C, which removes its temporary files as it ends.
+    let record = ChildRecord(key: Preference.installerPID, stop: SIGINT, killAfter: .seconds(20))
     private var tail: LogTail?
     private var cancelled = false
-    private var firstError: String?
+    private var reported: Failure?
     private var activity: NSObjectProtocol?
     /// When and at how many bytes the model's own download was first reported.
     private var began: (date: Date, done: Int64)?
 
-    init(runtime: Runtime) {
+    init(runtime: Runtime, log: URL) {
         self.runtime = runtime
+        self.log = log
     }
 
     var running: Bool { child != nil }
@@ -72,14 +112,14 @@ final class Installer {
         progress = nil
         began = nil
         failure = nil
-        firstError = nil
+        reported = nil
         cancelled = false
-        resetLog(Self.log)
+        resetLog(log)
         do {
             child = try ChildProcess(
                 command: runtime.installCommand(model),
                 environment: runtime.environment,
-                log: Self.log,
+                log: log,
                 exited: { [weak self] in self?.exited($0) }
             )
         } catch {
@@ -87,8 +127,8 @@ final class Installer {
             self.model = nil
             return
         }
-        UserDefaults.standard.set(Int(child!.pid), forKey: Preference.installerPID)
-        tail = LogTail(Self.log) { [weak self] in self?.received($0) }
+        record.keep(child!)
+        tail = LogTail(log) { [weak self] in self?.received($0) }
         // A download takes long; the Mac must not sleep through it.
         activity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated, .idleSystemSleepDisabled], reason: "Downloading \(model)")
@@ -99,11 +139,7 @@ final class Installer {
     func cancel() {
         guard let child else { return }
         cancelled = true
-        child.signal(SIGINT)
-        Task { [weak self] in
-            try? await Task.sleep(for: .seconds(5))
-            if self?.child === child { child.signal(SIGKILL) }
-        }
+        child.stop(SIGINT, killAfter: .seconds(5))
     }
 
     /// Clears a failure the user has read.
@@ -114,41 +150,25 @@ final class Installer {
     /// Stops the download this app started before it quit or crashed, if it still runs; its record
     /// stays until then, for the next launch should this one end first.
     func stopLeftover() async {
-        let pid = pid_t(UserDefaults.standard.integer(forKey: Preference.installerPID))
-        defer { UserDefaults.standard.removeObject(forKey: Preference.installerPID) }
-        guard pid > 0, runtime.runsPython(pid) else { return }
-        await stopProcessGroup(pid)
+        await record.stopLeftover()
     }
 
     private func received(_ line: String) {
-        guard let event = Progress(line: line) else {
-            if firstError == nil { firstError = errorMessage(line) }
+        if let reported = Failure(line: line) {
+            self.reported = reported
             return
         }
-        if event.done == 0 { checkSpace(event) }
+        guard let event = Progress(line: line) else { return }
         guard let model, event.repo == model.split(separator: ":")[0] else { return }
         if began == nil { began = (.now, event.done) }
         progress = event
-    }
-
-    /// Stops a download the disk has no room for, before it fills the disk. macOS frees purgeable
-    /// space as it is needed, so what counts is the capacity for important use.
-    private func checkSpace(_ event: Progress) {
-        let cache = URL.homeDirectory.appending(path: ".cache")
-        guard let available = try? cache.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-            .volumeAvailableCapacityForImportantUsage,
-            event.total > available, let model
-        else { return }
-        cancel()
-        failure = (model, "Not enough disk space: the download needs \(Format.size(event.total)), "
-            + "and \(Format.size(available)) is available.")
     }
 
     private func exited(_ status: Int32) {
         tail?.finish()
         tail = nil
         child = nil
-        UserDefaults.standard.removeObject(forKey: Preference.installerPID)
+        record.forget()
         activity.map(ProcessInfo.processInfo.endActivity)
         activity = nil
         guard let model else { return }
@@ -157,7 +177,7 @@ final class Installer {
         if status == 0 {
             installed(model)
         } else if !cancelled {
-            failure = (model, firstError.map { plainProblem($0, model: model) }
+            failure = (model, reported.map { Self.problem($0, model: model) }
                 ?? "The download stopped unexpectedly. The log has the details.")
         }
     }

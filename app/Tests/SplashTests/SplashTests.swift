@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 
@@ -88,7 +89,6 @@ struct ServeSettingsTests {
         #expect(settings.environment == ["SPLASH_API_KEY": "secret"])
         #expect(settings.request("status").value(forHTTPHeaderField: "Authorization") == "Bearer secret")
         #expect(settings.url.absoluteString == "http://127.0.0.1:8100")
-        #expect(settings.memoryLimit == 48)
     }
 
     @Test func leavesOutOptionsTheOthersLeaveNoEffect() {
@@ -117,22 +117,41 @@ struct ServeSettingsTests {
         #expect(ServeSettings.memoryLimits(memory: 36) == [8, 12, 16, 24, 32])
     }
 
-    @Test func saysWhatMakesRoomForAModel() {
-        let floors = "runtime bootstrap failed [resource_assembly/memory_planning]: model weights with the runtime reserves, one lane's state, the KV runway and any SSD cache state staging require 10858659840 bytes but the Metal memory budget is 1073741824 bytes"
-        #expect(Server.memoryProblem(floors, settings: ServeSettings(values: ["--max-memory": "1G"]))
-            == "It needs 10.1 GB of memory but the memory limit is 1 GB. Raise the memory limit in Launch Options.")
-        #expect(Server.memoryProblem(floors, settings: ServeSettings())
-            == "It needs 10.1 GB of memory but this Mac can give it 1 GB. Choose a smaller model.")
-        let context = { (bound: String) in
-            "runtime bootstrap failed [model_creation]: --max-context 262144 exceeds the 73721 tokens the model and \(bound) allow; omit it or pass at most 73721"
+    @Test func wordsAStartFailureByItsClass() {
+        func failure(_ kind: String, _ bound: String? = nil, required: Int64? = nil, budget: Int64? = nil,
+                     plan: Int? = nil, message: String = "the engine's words") -> ServeRecord.Failure {
+            ServeRecord.Failure(kind: kind, message: message, bound: bound,
+                                required_bytes: required, budget_bytes: budget, plan_context_tokens: plan)
         }
-        #expect(Server.memoryProblem(context("this Mac's memory"), settings: ServeSettings(values: ["--max-context": "262144"]))
-            == "Its context fits up to 71K tokens on this Mac. Choose a shorter context length, or Auto.")
-        #expect(Server.memoryProblem(context("--max-memory"), settings: ServeSettings(values: ["--max-context": "262144"]))
-            == "Its context fits up to 71K tokens within the memory limit. Choose a shorter context length, or raise the memory limit.")
-        #expect(Server.memoryProblem(context("the SSD cache's room for its KV"), settings: ServeSettings(values: ["--max-context": "262144"]))
-            == "Its context fits up to 71K tokens in the SSD cache. Choose a shorter context length, or a larger SSD cache.")
-        #expect(Server.memoryProblem("error: something else", settings: ServeSettings()) == nil)
+        func problem(_ failure: ServeRecord.Failure) -> String { Server.problem(failure, port: 8000) }
+        #expect(problem(failure("memory_budget", "max_memory", required: 10_858_659_840, budget: 1_073_741_824))
+            == "It needs 10.1 GB of memory but the memory limit is 1 GB. Raise the memory limit in Launch Options.")
+        #expect(problem(failure("memory_budget", "device_memory", required: 10_858_659_840, budget: 1_073_741_824))
+            == "It needs 10.1 GB of memory but this Mac can give it 1 GB. Choose a smaller model.")
+        #expect(problem(failure("context_budget", "device_memory", plan: 73728))
+            == "Its context fits up to 72K tokens on this Mac. Choose a shorter context length, or Auto.")
+        #expect(problem(failure("context_budget", "max_memory", plan: 73721))
+            == "Its context fits up to 73,721 tokens within the memory limit. Choose a shorter context length, or raise the memory limit.")
+        #expect(problem(failure("context_budget", "disk", plan: 73721))
+            == "Its context fits up to 73,721 tokens in the SSD cache. Choose a shorter context length, or a larger SSD cache.")
+        #expect(problem(failure("host_memory"))
+            == "Other apps are using the memory it needs. Quit some, then start it again.")
+        #expect(problem(failure("command_memory"))
+            == "Another app is using the GPU memory this model needs, such as another Splash server. Quit it, then start again.")
+        #expect(problem(failure("port"))
+            == "Port 8000 is in use by another app. Quit that app, or choose another port in Launch Options › Advanced.")
+        #expect(problem(failure("upgrade"))
+            == "Splash is being updated. Wait for the update to finish, then start it again.")
+        #expect(problem(failure("install", message: "a/b is not installed"))
+            == "Splash couldn’t prepare its files: a/b is not installed")
+        #expect(problem(failure("model", message: "no supported model has this architecture (Llama)"))
+            == "Splash can’t serve this model: no supported model has this architecture (Llama)")
+        #expect(problem(failure("internal"))
+            == "It stopped while starting: the engine's words. The log has the details.")
+        // The rest in the engine's words, as its refusal of a MAX_CONTEXT past the model's.
+        for kind in ["configuration", "memory_budget", "device"] {
+            #expect(problem(failure(kind)) == "the engine's words")
+        }
     }
 
     @Test func keepsTheOptionsAndReadsBadOnesAsDefaults() throws {
@@ -222,7 +241,7 @@ struct AppStateTests {
         let root = FileManager.default.temporaryDirectory.appending(path: "splash-state-tests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
         try keychain.write("first")
-        let state = AppState(runtime: Runtime(root: root), chats: ChatStore(folder: root.appending(path: "Chats")), keychain: keychain)
+        let state = AppState(runtime: Runtime(root: root), folders: .init(in: root.appending(path: "Chats")), keychain: keychain)
         #expect(state.options.apiKey == "first" && state.keyProblem == nil)
         state.options.apiKey = "second"
         #expect(try keychain.read() == "second")
@@ -250,25 +269,278 @@ struct ServerTests {
         #expect(Server.report(Data("not json".utf8)) == nil)
     }
 
-    @Test func readsTheRequestsTheLogFinishes() throws {
-        // As diagnostics.print_request writes them.
-        let done = try #require(RequestEntry("12:01:09 Done · input 4,096 · cached 1,024 · output 574 · TTFT 0.4s · 36.8 tok/s · 1.9 tok/cycle"))
-        #expect(done.time == "12:01:09" && done.outcome == .done)
-        #expect((done.input, done.cached, done.output, done.firstToken, done.rate) == (4096, 1024, 574, 0.4, 36.8))
-        let cancelled = try #require(RequestEntry("12:02:00 Cancelled · input 69 · cached 0 · output 12"))
-        #expect(cancelled.outcome == .cancelled && cancelled.output == 12 && cancelled.rate == nil)
-        let error = try #require(RequestEntry("12:03:00 Error · invalid_request_error · POST /v1/messages"))
-        #expect(error.outcome == .error && error.message == "invalid_request_error · POST /v1/messages")
-        #expect(RequestEntry("12:01:02 Started · input 4,096 · cached 0 · thinking on") == nil)
-        #expect(RequestEntry("12:00:58 Ready · http://127.0.0.1:8000") == nil)
+    /// The request lines the server writes, as the golden the server's tests check them against
+    /// holds them.
+    @Test func readsTheRequestLinesTheServerWrites() throws {
+        let golden = try String(contentsOf: ServerTests.goldens.appending(path: "server/log_lines_golden.txt"), encoding: .utf8)
+        let lines = golden.split(separator: "\n").map(String.init).filter { !$0.hasPrefix("#") }
+        try #require(lines.count == 4)
+        #expect(RequestEntry(lines[0]) == nil)
+        let done = try #require(RequestEntry(lines[1]))
+        #expect(done.outcome == .done && (done.input, done.cached, done.output, done.firstToken, done.rate)
+            == (4096, 1024, 574, 0.4, 36.8))
+        let cancelled = try #require(RequestEntry(lines[2]))
+        #expect(cancelled.outcome == .cancelled && cancelled.output == 12)
+        let error = try #require(RequestEntry(lines[3]))
+        #expect(error.outcome == .error && error.message == "invalid_request_error")
     }
 
-    @Test func followsTheStepsOfAStart() {
-        // As server.py and the engine write them, in order.
-        #expect(Server.Step("16:14:43 Loading · mlx-community/Qwen3.6-35B-A3B-4bit") == .loading)
-        #expect(Server.Step("16:14:44 Chat template · patched to render later system messages in place") == nil)
-        #expect(Server.Step("16:14:50 Weights loaded in 6.52 s.") == .warming)
-        #expect(Server.Step("16:14:50 Kernel policy for GPU family 10 with 32 cores.") == nil)
+    /// The goldens the server's tests write, as the app reads them.
+    static let goldens = URL(filePath: #filePath).deletingLastPathComponent().appending(path: "../../../dev/tests")
+
+    @Test func readsAStoppedServersStatus() throws {
+        let golden = Self.goldens.appending(path: "server/status_transport_golden.json")
+        let report = try #require(Server.report(try Data(contentsOf: golden)))
+        #expect(report.context == 131072)
+        #expect(report.stopped?.hasPrefix("Splash stopped restarting the engine: --kv-format bf16 is refused.") == true)
+        #expect(!report.recovering)
+    }
+
+    @Test func readsTheServeRecord() throws {
+        let golden = Self.goldens.appending(path: "server/serve_record_golden.json")
+        let record = try JSONDecoder().decode(ServeRecord.self, from: Data(contentsOf: golden))
+        #expect(record.pid == 4242 && record.phase == .failed)
+        let failure = try #require(record.failure)
+        #expect(Server.problem(failure, port: 8000)
+            == "It needs 10.1 GB of memory but the memory limit is 1 GB. Raise the memory limit in Launch Options.")
+    }
+
+    @Test func wordsAFailedStartByItsOwnRecord() throws {
+        let golden = Self.goldens.appending(path: "server/serve_record_golden.json")
+        let record = try JSONDecoder().decode(ServeRecord.self, from: Data(contentsOf: golden))
+        let words = "It needs 10.1 GB of memory but the memory limit is 1 GB. Raise the memory limit in Launch Options."
+        func problem(_ record: ServeRecord?, pid: pid_t, holder: pid_t? = nil) -> String {
+            Server.startProblem(record: record, pid: pid, port: 8000, holder: holder)
+        }
+        #expect(problem(record, pid: 4242) == words)
+        // A record of another start, as one a server before this one wrote, or none.
+        let unknown = "It stopped unexpectedly. The log has the details."
+        #expect(problem(record, pid: 4243) == unknown)
+        #expect(problem(nil, pid: 4242) == unknown)
+        let starting = try JSONDecoder().decode(ServeRecord.self, from: Data(#"{"pid":4242,"phase":"starting"}"#.utf8))
+        #expect(problem(starting, pid: 4242) == unknown)
+        // Refused the port's lock, which another server holds, with its record.
+        #expect(problem(starting, pid: 4243, holder: 4242)
+            == "Another Splash server is using port 8000. Stop it, or choose another port in Launch Options › Advanced.")
+        // Its own lock, which an engine it started may hold a moment longer.
+        #expect(problem(nil, pid: 4242, holder: 4242) == unknown)
+    }
+
+    @Test func findsTheProcessHoldingAPortsLock() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: "splash-lock-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = Runtime(root: root)
+        try FileManager.default.createDirectory(at: runtime.locks, withIntermediateDirectories: true)
+        let lock = runtime.locks.appending(path: "serve-8123.lock")
+        // What a launcher that held the lock left there.
+        try Data(#"{"pid":4242,"model":"a/b","port":8123}"#.utf8).write(to: lock)
+        #expect(runtime.serveLockHolder(port: 8123) == nil)
+        let held = open(lock.path, O_RDONLY)
+        defer { close(held) }
+        #expect(flock(held, LOCK_EX | LOCK_NB) == 0)
+        #expect(runtime.serveLockHolder(port: 8123) == 4242)
+    }
+
+    /// The app gives a server the engine's stop budget twice, the longest the server's own stop of
+    /// its engine takes, as the golden both sides read holds it.
+    @Test func appStopBudgetIsTheEngines() throws {
+        let golden = try String(contentsOf: Self.goldens.appending(path: "engine/protocol_golden.txt"), encoding: .utf8)
+        let line = try #require(golden.split(separator: "\n").first { $0.hasPrefix("supervision ") })
+        let hex = Array(line.dropFirst("supervision ".count))
+        let bytes = stride(from: 0, to: hex.count, by: 2).compactMap { UInt8(String(hex[$0...$0 + 1]), radix: 16) }
+        // Little-endian u32 milliseconds.
+        let budgets = stride(from: 0, to: bytes.count, by: 4).map { offset in
+            bytes[offset..<offset + 4].enumerated().reduce(UInt32(0)) { $0 | UInt32($1.element) << (8 * $1.offset) }
+        }
+        // command timeout, loop stall, stop, probation, start retry window, mask wait.
+        #expect(budgets.count == 6)
+        #expect(Duration.milliseconds(budgets[2]) == Supervision.stop)
+        #expect(Server.killAfter == Supervision.stop * 2)
+    }
+
+    /// A stop interrupts the server once, as Ctrl+C does, which stops its engine with its flush;
+    /// a second interrupt would stop the engine at once. Only its kill budget later is the server
+    /// killed.
+    @MainActor @Test func aStopInterruptsOnceThenKills() async throws {
+        // A checkout whose Python says its process ID, then each interrupt, and runs on.
+        let root = FileManager.default.temporaryDirectory.appending(path: "splash-stop-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = Runtime(root: root)
+        try FileManager.default.createDirectory(at: runtime.python.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "#!/bin/sh\necho $$\ntrap 'echo INT' INT\nwhile :; do sleep 0.1; done\n"
+            .write(to: runtime.python, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: runtime.python.path)
+        let log = root.appending(path: "server.log")
+        let killAfter = Duration.seconds(1)
+        let server = Server(runtime: runtime, log: log, killAfter: killAfter)
+        server.start("a/b", settings: ServeSettings(values: ["--port": "0"]))
+        var started: String { (try? String(contentsOf: log, encoding: .utf8)) ?? "" }
+        try await waitFor(started.hasSuffix("\n"), "the start")
+        let pid = try #require(pid_t(started.trimmingCharacters(in: .whitespacesAndNewlines)))
+        defer { killpg(pid, SIGKILL) }
+        let stopped = ContinuousClock.now
+        server.stop()
+        try await waitFor(!server.running, "the kill", seconds: 11)
+        #expect(ContinuousClock.now - stopped >= killAfter)
+        #expect(started.split(separator: "\n").filter { $0 == "INT" }.count == 1)
+    }
+
+    @MainActor @Test func givesTheServerTheAppsProcessID() async throws {
+        // A checkout whose Python says what SPLASH_APP_PID it was given, and ends.
+        let root = FileManager.default.temporaryDirectory.appending(path: "splash-server-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = Runtime(root: root)
+        try FileManager.default.createDirectory(at: runtime.python.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "#!/bin/sh\necho \"SPLASH_APP_PID=$SPLASH_APP_PID\"\n".write(to: runtime.python, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: runtime.python.path)
+        let log = root.appending(path: "server.log")
+        let server = Server(runtime: runtime, log: log)
+        // On a port nothing serves.
+        server.start("a/b", settings: ServeSettings(values: ["--port": "0"]))
+        try await waitFor(!server.running, "the end")
+        #expect(try String(contentsOf: log, encoding: .utf8) == "SPLASH_APP_PID=\(getpid())\n")
+    }
+}
+
+/// A program the app started, kept for the next launch: stopped then, whichever copy of the app
+/// started it, and never a later process given its ID.
+@MainActor
+struct ChildRecordTests {
+    @Test func stopsTheProgramItKeepsAndForgetsIt() async throws {
+        let record = ChildRecord(key: "test.child.\(UUID().uuidString)", stop: SIGINT, killAfter: .seconds(20))
+        defer { record.forget() }
+        let log = FileManager.default.temporaryDirectory.appending(path: "child-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: log) }
+        let child = try ChildProcess(command: ["/bin/sleep", "60"], environment: [:], log: log) { _ in }
+        #expect(child.started != nil)
+        record.keep(child)
+        await record.stopLeftover()
+        #expect(processStart(child.pid) == nil)
+        #expect(UserDefaults.standard.object(forKey: record.key) == nil)
+    }
+
+    @Test func leavesAnotherProcessWithTheIDAlone() async throws {
+        let record = ChildRecord(key: "test.child.\(UUID().uuidString)", stop: SIGINT, killAfter: .seconds(20))
+        defer { record.forget() }
+        let log = FileManager.default.temporaryDirectory.appending(path: "child-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: log) }
+        let other = try ChildProcess(command: ["/bin/sleep", "60"], environment: [:], log: log) { _ in }
+        defer { other.stop(SIGKILL, killAfter: .zero) }
+        // Kept with another start: an earlier process that had the ID, or a record an older app
+        // kept as the ID alone.
+        UserDefaults.standard.set([Int(other.pid), try #require(other.started) - 1], forKey: record.key)
+        await record.stopLeftover()
+        #expect(processStart(other.pid) != nil)
+        #expect(UserDefaults.standard.object(forKey: record.key) == nil)
+        UserDefaults.standard.set(Int(other.pid), forKey: record.key)
+        await record.stopLeftover()
+        #expect(processStart(other.pid) != nil)
+        #expect(UserDefaults.standard.object(forKey: record.key) == nil)
+    }
+
+    /// A leftover server stops by itself once its app has ended, as Ctrl+C stops it, and a second
+    /// Ctrl+C would stop its engine at once: the next launch sends what it ignores by then, and
+    /// waits for it.
+    @Test func aLeftoverServerAlreadyStoppingIsLeftToFinish() async throws {
+        let log = try await Self.leftover("trap 'echo interrupted' INT; trap '' TERM; echo ready; sleep 1",
+                                          stoppedBy: Server(runtime: Showcase.runtime, log: URL(filePath: "/dev/null")).record.stop)
+        #expect(log == "ready\n")
+    }
+
+    /// A leftover download gets Ctrl+C, which removes its temporary files as it ends.
+    @Test func aLeftoverDownloadIsInterrupted() async throws {
+        let log = try await Self.leftover("trap 'echo interrupted; exit' INT; echo ready; sleep 60",
+                                          stoppedBy: Installer(runtime: Showcase.runtime, log: URL(filePath: "/dev/null")).record.stop)
+        #expect(log == "ready\ninterrupted\n")
+    }
+
+    /// A leftover that ignores its stop signal is killed, with its process group, once the record's
+    /// delay has passed, and the next launch waits that and at most 10 s more. A server's record
+    /// gives it as long as the server's own stop of its engine takes.
+    @Test func aLeftoverIgnoringItsStopIsKilledAfterItsDelay() async throws {
+        #expect(Server(runtime: Showcase.runtime, log: URL(filePath: "/dev/null")).record.killAfter == Server.killAfter)
+        let killAfter = Duration.seconds(1)
+        let record = ChildRecord(key: "test.child.\(UUID().uuidString)", stop: SIGTERM, killAfter: killAfter)
+        defer { record.forget() }
+        let log = FileManager.default.temporaryDirectory.appending(path: "child-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: log) }
+        // A shell that ignores SIGTERM, and a program of its group, which ignores it too, whose
+        // process ID it writes.
+        let child = try ChildProcess(command: ["/bin/sh", "-c", "trap '' TERM; sleep 60 & echo $!; wait"],
+                                     environment: [:], log: log) { _ in }
+        defer { child.stop(SIGKILL, killAfter: .zero) }
+        var written: String { (try? String(contentsOf: log, encoding: .utf8)) ?? "" }
+        try await waitFor(written.hasSuffix("\n"), "the start")
+        let member = try #require(pid_t(written.trimmingCharacters(in: .whitespacesAndNewlines)))
+        record.keep(child)
+        let stopping = ContinuousClock.now
+        await record.stopLeftover()
+        let took = ContinuousClock.now - stopping
+        #expect(processStart(child.pid) == nil)
+        #expect(took >= killAfter && took < killAfter + .seconds(10))
+        // Once its parent is gone, launchd reaps it.
+        let reaped = ContinuousClock.now + .seconds(2)
+        while processStart(member) != nil, ContinuousClock.now < reaped {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(processStart(member) == nil)
+    }
+
+    /// What `script` wrote by the time a record that stops with `signal` has stopped it, once it
+    /// has written `ready`.
+    private static func leftover(_ script: String, stoppedBy signal: Int32) async throws -> String {
+        let record = ChildRecord(key: "test.child.\(UUID().uuidString)", stop: signal, killAfter: .seconds(20))
+        defer { record.forget() }
+        let log = FileManager.default.temporaryDirectory.appending(path: "child-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: log) }
+        let child = try ChildProcess(command: ["/bin/sh", "-c", script], environment: [:], log: log) { _ in }
+        defer { child.stop(SIGKILL, killAfter: .zero) }
+        try await waitFor((try? String(contentsOf: log, encoding: .utf8)) == "ready\n", "the start")
+        record.keep(child)
+        await record.stopLeftover()
+        #expect(processStart(child.pid) == nil)
+        return try String(contentsOf: log, encoding: .utf8)
+    }
+}
+
+/// A program run to its end, as the engine's device check is.
+@MainActor
+struct ChildProcessRunTests {
+    @Test func killsOneThatRunsPastItsTimeoutAndGivesNothing() async {
+        let started = ContinuousClock.now
+        #expect(await Self.run(["/bin/sh", "-c", "exec sleep 60"], timeout: .milliseconds(300)) == nil)
+        #expect(ContinuousClock.now - started < .seconds(10))
+    }
+
+    @Test func killsOneItsCallerNoLongerWaitsFor() async {
+        let started = ContinuousClock.now
+        let run = Task { await Self.run(["/bin/sleep", "60"], timeout: .seconds(60)) }
+        try? await Task.sleep(for: .milliseconds(300))
+        run.cancel()
+        #expect(await run.value == nil)
+        #expect(ContinuousClock.now - started < .seconds(10))
+    }
+
+    private static func run(_ command: [String], timeout: Duration) async -> Int32? {
+        let log = FileManager.default.temporaryDirectory.appending(path: "run-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: log) }
+        return await ChildProcess.run(command, environment: [:], log: log, timeout: timeout)
+    }
+
+    @Test func theDeviceCheckGivesItsReasonOrPasses() async throws {
+        // A checkout's engine, which runs the check.
+        let root = FileManager.default.temporaryDirectory.appending(path: "splash-check-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = Runtime(root: root)
+        try FileManager.default.createDirectory(at: runtime.engine.deletingLastPathComponent(), withIntermediateDirectories: true)
+        func check(_ script: String) async throws -> String? {
+            try "#!/bin/sh\n\(script)\n".write(to: runtime.engine, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: runtime.engine.path)
+            return await runtime.unsupportedReason()
+        }
+        #expect(try await check("echo 'error: no Metal GPU' >&2; exit 1") == "no Metal GPU")
+        #expect(try await check("exit 1") == nil)
+        #expect(try await check("exit 0") == nil)
     }
 }
 
@@ -288,17 +560,22 @@ struct AgentTests {
 }
 
 struct OutputTests {
-    @Test func findsErrorLines() {
-        #expect(errorMessage("error: model download or verification failed") == "model download or verification failed")
-        #expect(errorMessage("12:01:02 Error · unable to start HTTP server: [Errno 48]")
-            == "unable to start HTTP server: [Errno 48]")
-        #expect(errorMessage("12:01:02 Loading · a/b") == nil)
-        #expect(errorMessage("Warning: something") == nil)
-    }
-
-    @Test func saysWhyFilesCannotServe() {
-        #expect(plainProblem("cannot prepare /m/d: no supported model has this architecture (X)", model: "/m/d")
-            == "Splash can’t serve these files: no supported model has this architecture (X)")
+    /// The installer classes a Hub or network failure as it ends (install/hub.py failure_kind),
+    /// which the app words; any other failure keeps the installer's message.
+    @Test func installerErrorsAreWordedByKind() throws {
+        func words(_ kind: String) throws -> String {
+            let line = #"{"event": "error", "kind": "\#(kind)", "message": "cannot install a/b: refused"}"#
+            return Installer.problem(try #require(Installer.Failure(line: line)), model: "a/b:Q4")
+        }
+        #expect(try words("not_found") == "Hugging Face has no public model named a/b. Check the name, then try again.")
+        #expect(try words("offline") == "Splash couldn’t reach Hugging Face. Check the internet connection, then try again.")
+        #expect(try words("auth")
+            == "Hugging Face refused access to a/b. Sign in with an account that can read it (hf auth login), then try again.")
+        let unclassed = try #require(Installer.Failure(
+            line: #"{"event": "error", "kind": null, "message": "cannot install a/b: no supported model"}"#))
+        #expect(Installer.problem(unclassed, model: "a/b") == "cannot install a/b: no supported model")
+        #expect(Installer.Failure(line: #"{"event": "download", "repo": "a/b", "done": 1, "total": 2}"#) == nil)
+        #expect(Installer.Failure(line: "error: cannot install a/b") == nil)
     }
 
     @Test func readsDownloadEvents() {
@@ -323,6 +600,10 @@ struct OutputTests {
         #expect(Format.size(10_980_000_000) == "11 GB")
         #expect(Format.size(21_250_000_000) == "21 GB")
         #expect(Format.size(Format.gigabytes(24)) == "24 GB")
+        // Memory counts as the memory limit does: a 16 GB limit is 16 GiB.
+        #expect(Format.memory(16 << 30) == "16 GB")
+        #expect(Format.memory(18_467_000_000) == "17.2 GB")
+        #expect(Format.memory(512 << 20) == "512 MB")
     }
 }
 
@@ -403,12 +684,80 @@ struct ChatTests {
         let answer = try #require(store.current?.messages.last)
         #expect(answer.role == .assistant && answer.model == "a/b" && answer.error != nil)
         store.rename(store.conversations[0].id, to: "Greeting")
+        // Written off the main thread, on disk once flushed, as the app does as it quits.
+        store.flush()
         let reloaded = ChatStore(folder: folder)
         #expect(reloaded.conversations.map(\.title) == ["Greeting"])
         #expect(reloaded.conversations[0].messages == store.conversations[0].messages)
         store.delete(store.conversations[0].id)
         #expect(store.conversations.isEmpty && store.selection == nil)
+        store.flush()
         #expect(ChatStore(folder: folder).conversations.isEmpty)
+    }
+
+    @MainActor @Test func aReplyStreamsApartFromTheConversationsUntilItEnds() async throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        // A server that streams a reply in three parts, apart in time, on the port it prints.
+        let server = Process()
+        server.executableURL = URL(filePath: "/usr/bin/python3")
+        server.arguments = ["-c", """
+            import sys, time
+            from http.server import BaseHTTPRequestHandler, HTTPServer
+            class Handler(BaseHTTPRequestHandler):
+                def log_message(self, *args): pass
+                def do_POST(self):
+                    self.rfile.read(int(self.headers['Content-Length']))
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.end_headers()
+                    for part in ['One', ' two', ' three']:
+                        self.wfile.write(('data: {"choices":[{"delta":{"content":"%s"}}]}\\n\\n' % part).encode())
+                        self.wfile.flush()
+                        time.sleep(0.4)
+                    self.wfile.write(b'data: [DONE]\\n\\n')
+            server = HTTPServer(('127.0.0.1', 0), Handler)
+            print(server.server_port, flush=True)
+            server.handle_request()
+            """]
+        let output = Pipe()
+        server.standardOutput = output
+        try server.run()
+        defer { server.terminate() }
+        let port = try #require(String(data: output.fileHandleForReading.availableData, encoding: .utf8)
+            .flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) })
+        let store = ChatStore(folder: folder)
+        store.send("Hi", images: [], to: ChatTarget(url: URL(string: "http://127.0.0.1:\(port)")!, model: "a/b", acceptsImages: false, effort: ""))
+        // While it streams, the reply holds what came, and the conversation, which the list and
+        // the composer read, holds it empty and changes no more.
+        try await waitFor(store.reply?.message.text.isEmpty == false)
+        let first = store.reply?.message.text ?? ""
+        #expect(store.current?.messages.last?.text == "")
+        nonisolated(unsafe) var changed = false
+        withObservationTracking { _ = store.conversations } onChange: { changed = true }
+        try await waitFor(store.reply.map { $0.message.text != first } ?? true)
+        #expect(store.reply?.message.text.hasPrefix(first) == true)
+        #expect(!changed && store.current?.messages.last?.text == "")
+        // Once it ends, it goes into its conversation, which is written.
+        try await waitFor(store.streaming == nil)
+        #expect(changed && store.reply == nil && store.current?.messages.last?.text == "One two three")
+        store.flush()
+        #expect(ChatStore(folder: folder).conversations.first?.messages.last?.text == "One two three")
+    }
+
+    /// What changed last is on disk by when the app has ended, though writes go to a queue. Large,
+    /// so that the queue is still writing it when the app goes on to end.
+    @MainActor @Test func theAppEndsOnceTheChatsAreWritten() throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let conversation = Conversation(title: "Before", messages: [ChatMessage(role: .user, text: "Hi", images: [Data(count: 8_000_000)])])
+        try JSONEncoder().encode(conversation).write(to: folder.appending(path: "\(conversation.id.uuidString).json"))
+        let state = AppState.forTests(in: folder)
+        let delegate = AppDelegate(state: state)
+        state.chats.rename(conversation.id, to: "After")
+        delegate.applicationWillTerminate(Notification(name: NSApplication.willTerminateNotification))
+        #expect(ChatStore(folder: folder).conversations.first?.title == "After")
     }
 
     @MainActor @Test func anAnswerTheAppQuitDuringSaysSo() throws {

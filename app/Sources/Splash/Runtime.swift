@@ -33,37 +33,43 @@ struct Runtime: Sendable {
     /// Where `splash serve` keeps its locks.
     var locks: URL { packaged ? data.appending(path: "runtime") : root.appending(path: "build/runtime") }
 
-    /// The command line of `splash ARGUMENTS`. Isolated from the user's Python settings and
-    /// site-packages, and never writing bytecode into the signed bundle.
+    /// The command line of `splash ARGUMENTS`.
     func command(_ arguments: [String]) -> [String] {
-        [python.path, "-I", "-B", "-u", root.appending(path: "install/launcher.py").path] + arguments
+        scriptCommand("install/launcher.py", arguments)
     }
 
     /// The command line that downloads and installs `model`, the installer `splash serve` runs
     /// before it serves, reporting download progress as JSON lines.
     func installCommand(_ model: String) -> [String] {
-        [python.path, "-I", "-B", "-u", root.appending(path: "install/models.py").path,
-         "--model", model, "prepare", "--json-progress"]
+        scriptCommand("install/models.py", ["--model", model, "prepare", "--json-progress"])
     }
 
-    /// The installer of the models the Hugging Face cache holds whole that Splash serves, without
-    /// the Hub (`install/cached.py`), to run.
-    func cachedInstaller() -> Process {
-        let process = Process()
-        process.executableURL = python
-        process.arguments = ["-I", "-B", "-u", root.appending(path: "install/cached.py").path, "--models", models.path]
-        process.environment = environment
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        return process
+    /// The command line of the installer of the models the Hugging Face cache holds whole that
+    /// Splash serves, without the Hub (`install/cached.py`).
+    var cachedInstallCommand: [String] {
+        scriptCommand("install/cached.py", ["--models", models.path])
     }
 
-    /// The environment of the programs the app runs: the app's own (an app does not get the shell's),
-    /// kept from the user's site-packages in the programs Python starts, and without an API key the
-    /// server would require of the app. Run with -B, the launcher keeps them from writing bytecode.
+    /// The command line of the Python `script` in the runtime: isolated from the user's Python
+    /// settings and site-packages, unbuffered, and never writing bytecode into the signed bundle.
+    private func scriptCommand(_ script: String, _ arguments: [String]) -> [String] {
+        [python.path, "-I", "-B", "-u", root.appending(path: script).path] + arguments
+    }
+
+    /// The environment of the programs the app runs: `userEnvironment`, kept from the user's
+    /// site-packages in the programs Python starts. Run with -B, the launcher keeps them from
+    /// writing bytecode.
     var environment: [String: String] {
-        var environment = ProcessInfo.processInfo.environment
+        var environment = userEnvironment
         environment["PYTHONNOUSERSITE"] = "1"
+        return environment
+    }
+
+    /// The app's own environment (an app does not get the shell's), without an API key the server
+    /// would require of the app: the drawer's terminals', whose commands are the user's, finding
+    /// the user's site-packages as in their terminal.
+    var userEnvironment: [String: String] {
+        var environment = ProcessInfo.processInfo.environment
         environment.removeValue(forKey: "SPLASH_API_KEY")
         environment.removeValue(forKey: "SPLASH_RUNTIME")
         return environment
@@ -91,40 +97,71 @@ struct Runtime: Sendable {
             .sorted { $0.id < $1.id }
     }
 
-    /// The process serving `port`, as `splash serve` records it in the port's lock: it holds the
-    /// lock from before it checks the port until it exits, so a server answering the port is it.
-    func serveLockOwner(port: Int) -> pid_t? {
+    /// The process holding `port`'s lock, as it records itself there; nil while none holds it. The
+    /// probe takes the lock shared without waiting, which only a holder refuses.
+    func serveLockHolder(port: Int) -> pid_t? {
+        let lock = locks.appending(path: "serve-\(port).lock")
+        let descriptor = open(lock.path, O_RDONLY | O_CLOEXEC)
+        guard descriptor >= 0 else { return nil }
+        defer { close(descriptor) }
+        guard flock(descriptor, LOCK_SH | LOCK_NB) != 0 else {
+            flock(descriptor, LOCK_UN)
+            return nil
+        }
         struct Owner: Decodable { let pid: Int32 }
-        guard let data = try? Data(contentsOf: locks.appending(path: "serve-\(port).lock")) else { return nil }
+        guard errno == EWOULDBLOCK, let data = try? Data(contentsOf: lock) else { return nil }
         return (try? JSONDecoder().decode(Owner.self, from: data))?.pid
     }
 
-    /// Whether `pid` runs this runtime's Python.
-    func runsPython(_ pid: pid_t) -> Bool {
-        var path = [UInt8](repeating: 0, count: Int(MAXPATHLEN))
-        let length = proc_pidpath(pid, &path, UInt32(path.count))
-        guard length > 0 else { return false }
-        return URL(filePath: String(decoding: path.prefix(Int(length)), as: UTF8.self)).resolvingSymlinksInPath()
-            == python.resolvingSymlinksInPath()
+    /// What the launcher serving `port`, or the server it runs as, last wrote of its start
+    /// (`server/serve_record.py`), beside the port's lock; nil before one has.
+    func serveRecord(port: Int) -> ServeRecord? {
+        guard let data = try? Data(contentsOf: locks.appending(path: "serve-\(port).json")) else { return nil }
+        return try? JSONDecoder().decode(ServeRecord.self, from: data)
     }
 
-    /// Why this Mac cannot run Splash, or nil when it can: the engine's own check, which the
-    /// launcher repeats before every start.
-    func unsupportedReason() -> String? {
-        let process = Process()
-        process.executableURL = engine
-        process.arguments = ["device-check"]
-        let errors = Pipe()
-        process.standardError = errors
-        process.standardOutput = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return nil }
-        let message = errors.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        guard process.terminationStatus != 0 else { return nil }
-        return String(decoding: message, as: UTF8.self)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacing(#/^error: /#, with: "")
+    /// Why this Mac cannot run Splash, as the engine's own check says, which the launcher repeats
+    /// before every start; nil where the check passes or gives no reason: it does not start, runs
+    /// past 30 s, or fails saying nothing.
+    @MainActor
+    func unsupportedReason() async -> String? {
+        let output = FileManager.default.temporaryDirectory.appending(path: "splash-device-check-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: output) }
+        guard let status = await ChildProcess.run([engine.path, "device-check"], environment: environment, log: output,
+                                                   timeout: .seconds(30)),
+              status != 0, let said = try? String(contentsOf: output, encoding: .utf8)
+        else { return nil }
+        let reason = said.trimmingCharacters(in: .whitespacesAndNewlines).replacing(#/^error: /#, with: "")
+        return reason.isEmpty ? nil : reason
     }
+}
+
+/// What a launcher writes of its start, as itself or as the server it runs as: the process, the
+/// phase of its start, and, for a start that failed, why: the class of the failure, with what it
+/// needed against what it had for a shortfall, and its message.
+struct ServeRecord: Decodable, Equatable {
+    /// Starting; loading the model's weights; running the model once (warming); answering; or
+    /// failed.
+    enum Phase: String, Decodable {
+        case starting, loading, warming, ready, failed
+    }
+
+    struct Failure: Decodable, Equatable {
+        /// The class of the failure: a `StartFailureKind` name, lowercased, which the engine, the
+        /// launcher or the server writes, or the frontend's own "port", "upgrade" or "install"
+        /// (`server/serve_record.py`).
+        let kind: String
+        let message: String
+        /// What bounds a memory or context shortfall: "device_memory", "max_memory" or "disk".
+        let bound: String?
+        let required_bytes: Int64?
+        let budget_bytes: Int64?
+        let plan_context_tokens: Int?
+    }
+
+    let pid: Int32
+    let phase: Phase
+    let failure: Failure?
 }
 
 struct InstalledModel: Identifiable, Hashable, Sendable {

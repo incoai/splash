@@ -6,9 +6,19 @@ import Observation
 /// conversations.
 @MainActor @Observable
 final class AppState {
-    /// The window's two parts: the Server, where models download, start and change, and the Chat
-    /// with the model that runs. The window opens on the Server.
+    /// The window's two parts: the Server, where models download, start and change, which the
+    /// button at the toolbar's end opens, and the Chat with the model that runs. The window opens
+    /// on the Server.
     enum Section: Hashable { case server, chat }
+
+    /// Where the app keeps what it writes: the logs of its server and downloads, and the chats.
+    struct Folders {
+        let logs: URL
+        let chats: URL
+
+        static let user = Folders(logs: URL.libraryDirectory.appending(path: "Logs/Splash"),
+                                  chats: URL.applicationSupportDirectory.appending(path: "Splash/Chats"))
+    }
 
     /// Why the app cannot run models here.
     struct Blocker: Equatable {
@@ -31,6 +41,16 @@ final class AppState {
     /// The open conversation's page, kept while the window shows something else, so that the Chat
     /// shows again at once.
     let transcript: Transcript
+    /// Whether the Chat shows its sidebar, as the toolbar's button and ⌘B have it, from one launch
+    /// to the next.
+    var showsSidebar = UserDefaults.standard.object(forKey: Preference.sidebar) as? Bool ?? true {
+        didSet { UserDefaults.standard.set(showsSidebar, forKey: Preference.sidebar) }
+    }
+    /// The terminals and logs under the window's content, whether they show, as ⌘J has it, and
+    /// the height the user dragged them to.
+    let drawer = Drawer()
+    var showsDrawer = false
+    var drawerHeight: CGFloat = 280
     private(set) var installed: [InstalledModel] = []
     private(set) var blocker: Blocker?
     /// Whether the checks of `launch` are done; nothing starts before.
@@ -51,18 +71,18 @@ final class AppState {
     /// Set once the app quits: nothing starts any more.
     private(set) var quitting = false
     /// The installer of the models the Hugging Face cache holds, while it runs (`launch`).
-    private var cachedInstaller: Process?
+    private var cachedInstaller: ChildProcess?
     /// The model files the user added, by path, as last measured (`refresh`), and the count of
     /// measurements started, so that only the latest one counts.
     @ObservationIgnored private var measured: [String: InstalledModel] = [:]
     @ObservationIgnored private var measurements = 0
 
-    init(runtime: Runtime, chats: ChatStore = ChatStore(), keychain: Keychain = .app, server: Server? = nil) {
+    init(runtime: Runtime, folders: Folders = .user, keychain: Keychain = .app) {
         self.runtime = runtime
         self.keychain = keychain
-        self.chats = chats
-        self.server = server ?? Server(runtime: runtime)
-        installer = Installer(runtime: runtime)
+        chats = ChatStore(folder: folders.chats)
+        server = Server(runtime: runtime, log: folders.logs.appending(path: "server.log"))
+        installer = Installer(runtime: runtime, log: folders.logs.appending(path: "install.log"))
         catalog = Catalog(contentsOf: runtime.suggestedModels)
         transcript = Transcript(runtime: runtime)
         installer.installed = { [weak self] in self?.didInstall($0) }
@@ -88,34 +108,39 @@ final class AppState {
     /// Whether the models the Hugging Face cache holds are still being looked for.
     var findingCachedModels: Bool { cachedInstaller != nil }
 
-    /// What runs, in a sentence: VoiceOver announces it, and the Chat's composer says it while a
-    /// model starts or stops.
-    var status: String {
-        let name = server.model.map(displayName(of:)) ?? ""
-        switch server.phase {
-        case .stopped: return "No model running"
-        case .starting: return "\(name) · \(server.step.rawValue)…"
-        case .stopping:
-            guard let next = server.next else { return "Stopping \(name)…" }
-            return next == server.model ? "Restarting \(name)…" : "Switching to \(displayName(of: next))…"
-        case .ready: return "\(name) · \(server.serving.rawValue)"
-        case .failed: return "\(name) ran into a problem"
-        }
+    /// What the server does: the look of its mark, and the phrase most views say of the model
+    /// that runs.
+    struct ServerStatus {
+        let look: MarkLook
+        let phrase: String
     }
 
-    /// What the server does, as the mark shows it.
-    var markLook: MarkLook {
+    var serverStatus: ServerStatus {
         switch server.phase {
-        case .starting: .loading
+        case .stopped:
+            return ServerStatus(look: .off, phrase: "Not running")
+        case .starting:
+            return ServerStatus(look: .loading, phrase: "\(server.step.rawValue)…")
+        case .stopping:
+            guard let next = server.next else { return ServerStatus(look: .off, phrase: "Stopping…") }
+            return ServerStatus(look: .off, phrase: next == server.model ? "Restarting…" : "Switching to \(displayName(of: next))…")
         case .ready:
-            switch server.serving {
+            let look: MarkLook = switch server.serving {
             case .running: .on
             case .sleeping: .asleep
             case .recovering: .loading
             }
-        case .failed: .failed
-        case .stopped, .stopping: .off
+            return ServerStatus(look: look, phrase: server.serving.rawValue)
+        case .failed:
+            return ServerStatus(look: .failed, phrase: server.running ? "Not responding" : "Ran into a problem")
         }
+    }
+
+    /// What runs, in a sentence: VoiceOver announces it, and the Chat's composer says it while a
+    /// model starts, stops or fails.
+    var status: String {
+        guard server.phase != .stopped, let model = server.model else { return "No model running" }
+        return "\(displayName(of: model)) · \(serverStatus.phrase)"
     }
 
     /// The download under way, in the words the menus use.
@@ -154,8 +179,7 @@ final class AppState {
     /// then, in the background, installs the models the Hugging Face cache holds.
     func launch() async {
         defer { launched = true }
-        let runtime = runtime
-        if let reason = await Task.detached(operation: { runtime.unsupportedReason() }).value {
+        if let reason = await runtime.unsupportedReason() {
             blocker = Blocker(title: "This Mac Can’t Run Splash", symbol: "exclamationmark.triangle", message: reason)
             return
         }
@@ -172,15 +196,11 @@ final class AppState {
     /// Installs, without downloading, the models other tools or a source checkout of Splash left
     /// in the Hugging Face cache that Splash serves (`install/cached.py`), then lists them.
     private func installCached() {
-        let process = runtime.cachedInstaller()
-        process.terminationHandler = { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.cachedInstaller = nil
-                self?.refresh()
-            }
+        cachedInstaller = try? ChildProcess(command: runtime.cachedInstallCommand, environment: runtime.environment,
+                                            log: URL(filePath: "/dev/null")) { [weak self] _ in
+            self?.cachedInstaller = nil
+            self?.refresh()
         }
-        guard (try? process.run()) != nil else { return }
-        cachedInstaller = process
     }
 
     /// Reads the API key kept; a Keychain that doesn't give it is a problem to solve first.
@@ -218,25 +238,28 @@ final class AppState {
         server.stop()
     }
 
+    /// The model Stop names, while a server runs: the one a switch goes to, else the one that runs;
+    /// and whether Stop does anything now, which it doesn't once a stop with no switch is under way.
+    var stopItem: (model: String, enabled: Bool)? {
+        guard server.running, let model = server.next ?? server.model else { return nil }
+        return (model, !(server.phase == .stopping && server.next == nil))
+    }
+
     func download(_ model: String) {
         guard ready else { return }
         installer.install(model)
     }
 
-    /// Stops the download, the model and the installer of cached models for the app to quit, and
-    /// starts nothing after. The last gets SIGINT, as Ctrl+C sends, and SIGTERM 5 s later.
+    /// Stops the download, the model and the installer of cached models, which the app waits for
+    /// as it quits, and the drawer's terminals, and starts nothing after. The installer of cached
+    /// models gets SIGINT, as Ctrl+C sends, and SIGKILL 5 s later.
     func quit() {
         quitting = true
         chats.stop()
+        drawer.endAll()
         installer.cancel()
         server.stop()
-        if let cachedInstaller {
-            cachedInstaller.interrupt()
-            Task {
-                try? await Task.sleep(for: .seconds(5))
-                if cachedInstaller.isRunning { cachedInstaller.terminate() }
-            }
-        }
+        cachedInstaller?.stop(SIGINT, killAfter: .seconds(5))
     }
 
     /// The next prompt, the open conversation and the draft, for the composer to count; nil while
@@ -307,6 +330,12 @@ final class AppState {
                 UserDefaults.standard.set(efforts, forKey: Preference.efforts)
             }
         }
+    }
+
+    /// Opens `agent` in Terminal, on the model that serves.
+    func open(_ agent: Agent) {
+        NSApp.activate()
+        agent.open(runtime: runtime, settings: server.settings)
     }
 
     func copyAPIAddress() {
