@@ -1059,19 +1059,27 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
   // a state that leaves only once written, or once the write in flight has
   // landed; a block a writable tier writes before its page frees; a
   // demotion in flight.
+  // The states the walk takes count by the same split.
   std::vector<uint64_t> later = kept;
+  ReclaimReach result;
+  Walk states = walk;
+  states.scope = {.upTo = upTo, .statesOnly = true};
   WalkCursor cursor;
-  for (std::optional<WalkUnit> unit; (unit = nextUnit({.upTo = upTo, .statesOnly = true}, cursor));)
+  for (std::optional<WalkUnit> unit; (unit = nextStepUnit(states, cursor));) {
     if (states_.reclaimOutcome(unit->candidate.id, StateCache::Unwritten::Wait).pending ||
-        states_.reclaimWrites(unit->candidate.id))
+        states_.reclaimWrites(unit->candidate.id)) {
       later.push_back(unit->candidate.id);
+      ++result.later.states;
+    } else {
+      ++result.now.states;
+    }
+  }
   for (const Write &write : writes_)
     if (write.write == WriteClass::Reclaim)
       later.push_back(write.block);
   const std::array<uint32_t, 3> keptPages = kv_.idlePagesOnChains(kept);
   const std::array<uint32_t, 3> laterPages = kv_.idlePagesOnChains(later, kvTierWritable());
   const std::array<uint32_t, 3> landing = demotedPages();
-  ReclaimReach result;
   std::array<uint32_t, 3> now{}, all{};
   for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index}) {
     const auto index = static_cast<size_t>(form);
@@ -1110,7 +1118,6 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
   const uint32_t free = pool_.freePageCount(walk.form);
   result.now.pages = pagesNow - std::min(pagesNow, free);
   result.later.pages = pagesAll - std::min(pagesAll, std::max(pagesNow, free));
-  result.now.states = evictableStates(upTo);
   return result;
 }
 

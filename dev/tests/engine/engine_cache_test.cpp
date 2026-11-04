@@ -5871,6 +5871,26 @@ void testCopiedCacheGoesBeforeAWrite() {
   cache.checkInvariants();
 }
 
+// Growth takes nothing when what the cache frees now cannot fund its unit: a state that leaves only
+// once written counts for nothing, so the dead chain beside it stays (one of its two extents would
+// go, the other is the runway growth keeps).
+void testGrowthCountsNoStateThatNeedsAWrite() {
+  test::TestKvStorage storage{8, 100, 1};
+  KvPool pool{storage, 1};
+  engine::Cache cache(pool, nullptr, nullptr);
+  const uint64_t dead = cacheConversation(cache, 1, 2);
+  static_cast<void>(cacheConversation(cache, 2, 1, std::make_shared<TieredState>(std::make_shared<TransferControl>())));
+  static_cast<void>(cache.releaseEmptyExtents(false));
+  engine::MemoryLedger ledger;
+  ledger.addSource(cache);
+  ledger.setBufferBytes([](uint32_t states) { return uint64_t{states} * 100; });
+  const engine::ClaimId claim = ledger.open({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate});
+  const FreeResult freed = ledger.free(claim, {.bytes = 200}, 0, false);
+  ledger.close(claim);
+  require(freed.outcome == FreeOutcome::Short && !freed.nowBytes && cache.residentChainPages({&dead, 1}),
+          "growth took the dead leaf for a unit only a state's write could fund");
+}
+
 int main() {
   try {
     testStateInUseGoesLast();
@@ -6031,6 +6051,7 @@ int main() {
     testPageNeedReachesParentsAndLeavesUnderStates();
     testDeviceUnitWeighsWhatItsDemotionsReturn();
     testCopiedCacheGoesBeforeAWrite();
+    testGrowthCountsNoStateThatNeedsAWrite();
     std::cout << "engine cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {

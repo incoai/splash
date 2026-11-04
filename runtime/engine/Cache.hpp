@@ -734,9 +734,6 @@ public:
   // allocated page of the form no request holds, but with Ordinary not the
   // idle KV that states in use restore through.
   [[nodiscard]] uint32_t reusablePages(ReclaimClass upTo, kv::PageForm form = kv::PageForm::Full) const;
-  [[nodiscard]] uint32_t evictableStates(ReclaimClass upTo) const noexcept {
-    return states_.evictableStates(upTo == ReclaimClass::InUse);
-  }
   [[nodiscard]] CacheSnapshot snapshot() const;
   [[nodiscard]] KvSpillSnapshot spillSnapshot() const;
   // Tests, between commands: std::logic_error unless the blocks, pages,
@@ -1002,10 +999,11 @@ private:
   // form, the whole extents of the pages within the class's reach, but the
   // idle pages of the chains it keeps, the free pages a KV need takes and
   // the runway it keeps, as compaction gathers what stays; now, all but the
-  // pages of the demotions in flight and the chains of what frees only later
-  // (a state or a block that leaves only once written, a demotion in
-  // flight), later the rest. A page walk that trims also frees the Full pages it
-  // moves into Slim ones. States: every RAM copy the class may free, now.
+  // pages of the demotions in flight and the chains of what frees only
+  // later (a state or a block that leaves only once written, a demotion in
+  // flight), later the rest. A page walk that trims also frees the Full
+  // pages it moves into Slim ones. States: the RAM copies the walk takes,
+  // later those that leave only once written.
   struct ReclaimReach final {
     struct Amount final {
       uint64_t bytes = 0;
