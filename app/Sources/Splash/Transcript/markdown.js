@@ -1,17 +1,17 @@
-// The model's Markdown as the transcript draws it, with the runtime's markdown-it and highlight.js,
-// which the app adds to the page before its scripts: no raw HTML, its line breaks kept, only web
-// and mail links, and an image as a link to it, so that what the model writes never loads anything
-// by itself.
+// The model's Markdown as the transcript draws it, with the runtime's markdown-it, highlight.js and
+// the web chat's link rules (markdown-links.js), which the app adds to the page before its scripts:
+// no raw HTML, and its line breaks kept.
 'use strict';
 
 const markdown = (() => {
   const escape = text => text.replace(/[&<>"']/g, character => `&#${character.charCodeAt(0)};`);
-  const web = url => /^(https?|mailto):/i.test(url ?? '');
   // A copy button's symbols, which turn into a check (page.css).
   const copyGlyphs = '<span class="glyph copy"></span><span class="glyph check"></span>';
   const bullets = ['•', '◦', '▪'];
 
-  const parser = window.markdownit ? configured(window.markdownit({html: false, breaks: true})) : null;
+  // None without the link rules too: markdown-it alone draws images, which load by themselves.
+  const parser = window.markdownit && window.markdownLinks
+    ? configured(window.markdownit({html: false, breaks: true}).use(window.markdownLinks)) : null;
 
   // What highlight.js made of each closed code block, by its language and code, and the HTML of
   // each text drawn whole, by the text, the latest of each up to its bound: a reply that streams
@@ -40,8 +40,6 @@ const markdown = (() => {
   }
 
   function configured(parser) {
-    // Every link reaches the rule below, which keeps web and mail links and the text of others.
-    parser.validateLink = () => true;
     parser.core.ruler.push('splash', state => {
       let cell = false;
       for (const token of state.tokens) {
@@ -49,9 +47,7 @@ const markdown = (() => {
         if (token.type === 'paragraph_open' || token.type === 'paragraph_close') token.hidden = false;
         if (token.type === 'th_open' || token.type === 'td_open') cell = true;
         if (token.type === 'th_close' || token.type === 'td_close') cell = false;
-        if (token.type !== 'inline') continue;
-        token.children = links(token.children, state);
-        if (cell) token.children = lineBreaks(token.children, state);
+        if (cell && token.type === 'inline') token.children = lineBreaks(token.children, state);
       }
     });
     const rules = parser.renderer.rules;
@@ -90,33 +86,6 @@ const markdown = (() => {
       rules[`${cell}_close`] = (tokens, index, options, env, self) => '</div>' + self.renderToken(tokens, index, options);
     }
     return parser;
-  }
-
-  // The inline tokens with only web and mail links left links, and images as links to them.
-  function links(children, state) {
-    const kept = [];
-    const dropped = [];
-    for (const token of children) {
-      if (token.type === 'link_open') {
-        dropped.push(!web(token.attrGet('href')));
-        if (!dropped.at(-1)) kept.push(token);
-      } else if (token.type === 'link_close') {
-        if (!dropped.pop()) kept.push(token);
-      } else if (token.type === 'image') {
-        const text = Object.assign(new state.Token('text', '', 0), {content: state.md.renderer.renderInlineAsText(token.children, {}, {})});
-        // An image in a link is that link's text.
-        if (web(token.attrGet('src')) && !dropped.includes(false)) {
-          const open = new state.Token('link_open', 'a', 1);
-          open.attrs = [['href', token.attrGet('src')]];
-          kept.push(open, text, new state.Token('link_close', 'a', -1));
-        } else {
-          kept.push(text);
-        }
-      } else {
-        kept.push(token);
-      }
-    }
-    return kept;
   }
 
   // A table cell's <br>s as line breaks, as GitHub shows them.

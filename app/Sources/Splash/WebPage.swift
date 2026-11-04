@@ -3,8 +3,8 @@ import WebKit
 
 /// The web page the Chat's transcript is (`Transcript`), shown in the system's WebKit: its text
 /// selectable across what it shows and scrolled by WebKit off the main thread. It loads once, from
-/// the app's resources with the runtime's markdown-it and highlight.js; after that only data goes
-/// to it, as JSON. It outlives the views it shows in, so that showing it again never loads it
+/// the app's resources with the runtime's Markdown scripts (`Runtime.markdownScripts`); after that
+/// only data goes to it, as JSON. It outlives the views it shows in, so that showing it again never loads it
 /// again.
 @MainActor
 final class WebPage: NSObject {
