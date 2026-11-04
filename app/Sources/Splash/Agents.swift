@@ -17,20 +17,20 @@ enum Agent: String, CaseIterable, Identifiable {
         }
     }
 
-    /// Asks for the project folder, then opens the agent there in Terminal, on the model served with
-    /// `settings`.
+    /// Asks for the project folder, starting where `defaults` keep the last one picked, then opens
+    /// the agent there in Terminal, on the model served with `settings`.
     @MainActor
-    func open(runtime: Runtime, settings: ServeSettings) {
+    func open(runtime: Runtime, settings: ServeSettings, defaults: UserDefaults) {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.prompt = "Open \(title)"
         panel.message = "Choose the project folder \(title) works in."
-        if let folder = UserDefaults.standard.url(forKey: Preference.agentFolder) {
+        if let folder = defaults.url(forKey: Preference.agentFolder) {
             panel.directoryURL = folder
         }
         guard panel.runModal() == .OK, let folder = panel.url else { return }
-        UserDefaults.standard.set(folder, forKey: Preference.agentFolder)
+        defaults.set(folder, forKey: Preference.agentFolder)
         let script = script(runtime: runtime, port: settings.port, folder: folder, apiKey: settings.apiKey)
         do {
             let directory = FileManager.default.temporaryDirectory.appending(path: "Splash")

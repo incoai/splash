@@ -163,10 +163,12 @@ enum Supervision {
     static let stop = Duration.seconds(15)
 }
 
-/// A program this app started, as the defaults keep it for the next launch should this one end
+/// A program this app started, as `defaults` keep it for the next launch should this one end
 /// without stopping it: its process ID and when it started. Together they name it whichever copy
 /// of the app started it, and never a later process given the same ID.
+@MainActor
 struct ChildRecord {
+    let defaults: UserDefaults
     let key: String
     /// The signal a later launch stops it with, once: a second one could cut what the first lets
     /// it finish.
@@ -177,18 +179,18 @@ struct ChildRecord {
     /// Keeps `child` as the program this record names.
     func keep(_ child: ChildProcess) {
         guard let started = child.started else { return forget() }
-        UserDefaults.standard.set([Int(child.pid), started], forKey: key)
+        defaults.set([Int(child.pid), started], forKey: key)
     }
 
     func forget() {
-        UserDefaults.standard.removeObject(forKey: key)
+        defaults.removeObject(forKey: key)
     }
 
     /// Stops the program kept, if it still runs, and forgets it once it has ended; one still
     /// running stays kept, for the launch after. A record of the ID alone, as an older app kept
     /// it, is forgotten, and its program left running.
     func stopLeftover() async {
-        guard let kept = UserDefaults.standard.array(forKey: key) as? [Int], kept.count == 2,
+        guard let kept = defaults.array(forKey: key) as? [Int], kept.count == 2,
               let pid = pid_t(exactly: kept[0])
         else { return forget() }
         if processStart(pid) == kept[1] { await stopProcessGroup(pid, with: stop, killAfter: killAfter) }

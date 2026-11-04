@@ -40,13 +40,13 @@ struct ServeSettings: Equatable {
     var port: Int { values["--port"].flatMap(Int.init) ?? Self.defaultPort }
 
     /// The options UserDefaults keeps, of the flags the app offers and values they take; no key.
-    static func current(_ defaults: UserDefaults = .standard) -> ServeSettings {
+    static func current(_ defaults: UserDefaults) -> ServeSettings {
         let kept = defaults.dictionary(forKey: Preference.launchOptions) as? [String: String] ?? [:]
         return ServeSettings(values: kept.filter { flag, value in LaunchOption.all.contains { $0.flag == flag && $0.accepts(value) } })
     }
 
     /// Keeps the options in UserDefaults; the key is kept apart.
-    func save(_ defaults: UserDefaults = .standard) {
+    func save(_ defaults: UserDefaults) {
         defaults.set(values, forKey: Preference.launchOptions)
     }
 

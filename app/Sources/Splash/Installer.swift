@@ -83,7 +83,7 @@ final class Installer {
     private let runtime: Runtime
     private var child: ChildProcess?
     /// A leftover download gets Ctrl+C, which removes its temporary files as it ends.
-    let record = ChildRecord(key: Preference.installerPID, stop: SIGINT, killAfter: .seconds(20))
+    let record: ChildRecord
     private var tail: LogTail?
     private var cancelled = false
     private var reported: Failure?
@@ -91,9 +91,10 @@ final class Installer {
     /// When and at how many bytes the model's own download was first reported.
     private var began: (date: Date, done: Int64)?
 
-    init(runtime: Runtime, log: URL) {
+    init(runtime: Runtime, log: URL, defaults: UserDefaults) {
         self.runtime = runtime
         self.log = log
+        record = ChildRecord(defaults: defaults, key: Preference.installerPID, stop: SIGINT, killAfter: .seconds(20))
     }
 
     var running: Bool { child != nil }

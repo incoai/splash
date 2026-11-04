@@ -30,6 +30,8 @@ final class AppState {
     let runtime: Runtime
     /// Where the API key is kept.
     let keychain: Keychain
+    /// Where the preferences and the records of what the app runs (`ChildRecord`) are kept.
+    let defaults: UserDefaults
     let server: Server
     let installer: Installer
     let catalog: Catalog
@@ -43,12 +45,12 @@ final class AppState {
     let transcript: Transcript
     /// Whether the Chat shows its sidebar, as the toolbar's button and ⌘B have it, from one launch
     /// to the next.
-    var showsSidebar = UserDefaults.standard.object(forKey: Preference.sidebar) as? Bool ?? true {
-        didSet { UserDefaults.standard.set(showsSidebar, forKey: Preference.sidebar) }
+    var showsSidebar: Bool {
+        didSet { defaults.set(showsSidebar, forKey: Preference.sidebar) }
     }
     /// The terminals and logs under the window's content, whether they show, as ⌘J has it, and
     /// the height the user dragged them to.
-    let drawer = Drawer()
+    let drawer: Drawer
     var showsDrawer = false
     var drawerHeight: CGFloat = 280
     private(set) var installed: [InstalledModel] = []
@@ -57,9 +59,9 @@ final class AppState {
     private(set) var launched = false
     var section = Section.server
     /// The launch options the next start uses.
-    var options = ServeSettings.current() {
+    var options: ServeSettings {
         didSet {
-            options.save()
+            options.save(defaults)
             if options.apiKey != keptKey { keep(options.apiKey) }
         }
     }
@@ -77,12 +79,17 @@ final class AppState {
     @ObservationIgnored private var measured: [String: InstalledModel] = [:]
     @ObservationIgnored private var measurements = 0
 
-    init(runtime: Runtime, folders: Folders = .user, keychain: Keychain = .app) {
+    init(runtime: Runtime, folders: Folders = .user, keychain: Keychain = .app, defaults: UserDefaults = .standard,
+         shell: @escaping () -> Shell = { .login }) {
         self.runtime = runtime
         self.keychain = keychain
+        self.defaults = defaults
+        showsSidebar = defaults.object(forKey: Preference.sidebar) as? Bool ?? true
+        options = ServeSettings.current(defaults)
+        drawer = Drawer(shell: shell)
         chats = ChatStore(folder: folders.chats)
-        server = Server(runtime: runtime, log: folders.logs.appending(path: "server.log"))
-        installer = Installer(runtime: runtime, log: folders.logs.appending(path: "install.log"))
+        server = Server(runtime: runtime, log: folders.logs.appending(path: "server.log"), defaults: defaults)
+        installer = Installer(runtime: runtime, log: folders.logs.appending(path: "install.log"), defaults: defaults)
         catalog = Catalog(contentsOf: runtime.suggestedModels)
         transcript = Transcript(runtime: runtime)
         installer.installed = { [weak self] in self?.didInstall($0) }
@@ -156,10 +163,10 @@ final class AppState {
     var selection: String? {
         get {
             access(keyPath: \.selection)
-            let picked = UserDefaults.standard.string(forKey: Preference.model)
+            let picked = defaults.string(forKey: Preference.model)
             return picked.flatMap { isInstalled($0) ? $0 : nil } ?? installed.first?.id
         }
-        set { withMutation(keyPath: \.selection) { UserDefaults.standard.set(newValue, forKey: Preference.model) } }
+        set { withMutation(keyPath: \.selection) { defaults.set(newValue, forKey: Preference.model) } }
     }
 
     /// Whether the model that runs would start otherwise with the options set now.
@@ -319,15 +326,15 @@ final class AppState {
     var effort: String {
         get {
             access(keyPath: \.effort)
-            let efforts = UserDefaults.standard.dictionary(forKey: Preference.efforts) as? [String: String]
+            let efforts = defaults.dictionary(forKey: Preference.efforts) as? [String: String]
             return server.model.flatMap { efforts?[$0] } ?? ""
         }
         set {
             guard let model = server.model else { return }
             withMutation(keyPath: \.effort) {
-                var efforts = UserDefaults.standard.dictionary(forKey: Preference.efforts) as? [String: String] ?? [:]
+                var efforts = defaults.dictionary(forKey: Preference.efforts) as? [String: String] ?? [:]
                 efforts[model] = newValue.isEmpty ? nil : newValue
-                UserDefaults.standard.set(efforts, forKey: Preference.efforts)
+                defaults.set(efforts, forKey: Preference.efforts)
             }
         }
     }
@@ -335,7 +342,7 @@ final class AppState {
     /// Opens `agent` in Terminal, on the model that serves.
     func open(_ agent: Agent) {
         NSApp.activate()
-        agent.open(runtime: runtime, settings: server.settings)
+        agent.open(runtime: runtime, settings: server.settings, defaults: defaults)
     }
 
     func copyAPIAddress() {
@@ -364,8 +371,8 @@ final class AppState {
     }
 
     private var localModels: [String] {
-        get { UserDefaults.standard.stringArray(forKey: Preference.localModels) ?? [] }
-        set { UserDefaults.standard.set(newValue, forKey: Preference.localModels) }
+        get { defaults.stringArray(forKey: Preference.localModels) ?? [] }
+        set { defaults.set(newValue, forKey: Preference.localModels) }
     }
 
     /// Adds model files on this Mac, a GGUF file or a model's folder, and picks them: Start has

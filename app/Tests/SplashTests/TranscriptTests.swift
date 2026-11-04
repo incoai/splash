@@ -721,7 +721,7 @@ struct TranscriptPictures {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let conversation = Showcase.conversation
         try JSONEncoder().encode(conversation).write(to: folder.appending(path: "\(conversation.id.uuidString).json"))
-        let state = AppState.forTests(in: folder)
+        let state = AppState.forTests(in: folder, runtime: Showcase.runtime)
         state.section = .chat
         state.chats.selection = conversation.id
         state.transcript.page.load()

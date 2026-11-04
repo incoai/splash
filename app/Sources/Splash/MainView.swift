@@ -182,7 +182,7 @@ struct WithSidebar<Side: View, Content: View>: View {
 extension AppState {
     /// A terminal in the home folder.
     func newTerminal() {
-        drawer.add(TerminalSession(environment: runtime.userEnvironment))
+        drawer.add(TerminalSession(shell: drawer.shell(), environment: runtime.userEnvironment))
     }
 
     /// Opens or closes the drawer, sliding; opened on the terminals, it starts one where there is

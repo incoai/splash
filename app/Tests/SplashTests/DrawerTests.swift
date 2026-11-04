@@ -7,7 +7,7 @@ import Testing
 @testable import Splash
 
 /// The drawer's terminals and logs, as its tabs, the menus and the app's end drive them; each
-/// terminal a login shell of the user's.
+/// terminal runs `Shell.bare`.
 @MainActor
 @Suite(.serialized)
 struct DrawerTests {

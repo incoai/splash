@@ -155,9 +155,9 @@ struct ServeSettingsTests {
     }
 
     @Test func keepsTheOptionsAndReadsBadOnesAsDefaults() throws {
-        let name = "splash-tests-\(UUID().uuidString)"
-        let defaults = try #require(UserDefaults(suiteName: name))
-        defer { defaults.removePersistentDomain(forName: name) }
+        let folder = FileManager.default.temporaryDirectory.appending(path: "splash-options-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let defaults = UserDefaults.kept(in: folder)
         #expect(ServeSettings.current(defaults).values.isEmpty)
         let settings = ServeSettings(values: ["--port": "9000", "--max-context": "100000", "--max-memory": "20G",
                                               "--allowed-host": "mymac.local", "--allow-idle-sleep": "true"])
@@ -241,7 +241,8 @@ struct AppStateTests {
         let root = FileManager.default.temporaryDirectory.appending(path: "splash-state-tests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
         try keychain.write("first")
-        let state = AppState(runtime: Runtime(root: root), folders: .init(in: root.appending(path: "Chats")), keychain: keychain)
+        let state = AppState(runtime: Runtime(root: root), folders: .init(in: root.appending(path: "Chats")), keychain: keychain,
+                             defaults: .kept(in: root), shell: { .bare })
         #expect(state.options.apiKey == "first" && state.keyProblem == nil)
         state.options.apiKey = "second"
         #expect(try keychain.read() == "second")
@@ -372,7 +373,7 @@ struct ServerTests {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: runtime.python.path)
         let log = root.appending(path: "server.log")
         let killAfter = Duration.seconds(1)
-        let server = Server(runtime: runtime, log: log, killAfter: killAfter)
+        let server = Server(runtime: runtime, log: log, defaults: .kept(in: root), killAfter: killAfter)
         server.start("a/b", settings: ServeSettings(values: ["--port": "0"]))
         var started: String { (try? String(contentsOf: log, encoding: .utf8)) ?? "" }
         try await waitFor(started.hasSuffix("\n"), "the start")
@@ -394,7 +395,7 @@ struct ServerTests {
         try "#!/bin/sh\necho \"SPLASH_APP_PID=$SPLASH_APP_PID\"\n".write(to: runtime.python, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: runtime.python.path)
         let log = root.appending(path: "server.log")
-        let server = Server(runtime: runtime, log: log)
+        let server = Server(runtime: runtime, log: log, defaults: .kept(in: root))
         // On a port nothing serves.
         server.start("a/b", settings: ServeSettings(values: ["--port": "0"]))
         try await waitFor(!server.running, "the end")
@@ -407,50 +408,52 @@ struct ServerTests {
 @MainActor
 struct ChildRecordTests {
     @Test func stopsTheProgramItKeepsAndForgetsIt() async throws {
-        let record = ChildRecord(key: "test.child.\(UUID().uuidString)", stop: SIGINT, killAfter: .seconds(20))
-        defer { record.forget() }
-        let log = FileManager.default.temporaryDirectory.appending(path: "child-\(UUID().uuidString).log")
-        defer { try? FileManager.default.removeItem(at: log) }
-        let child = try ChildProcess(command: ["/bin/sleep", "60"], environment: [:], log: log) { _ in }
+        let folder = Self.folder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let defaults = UserDefaults.kept(in: folder)
+        let record = ChildRecord(defaults: defaults, key: "child", stop: SIGINT, killAfter: .seconds(20))
+        let child = try ChildProcess(command: ["/bin/sleep", "60"], environment: [:], log: folder.appending(path: "child.log")) { _ in }
         #expect(child.started != nil)
         record.keep(child)
         await record.stopLeftover()
         #expect(processStart(child.pid) == nil)
-        #expect(UserDefaults.standard.object(forKey: record.key) == nil)
+        #expect(defaults.object(forKey: record.key) == nil)
     }
 
     @Test func leavesAnotherProcessWithTheIDAlone() async throws {
-        let record = ChildRecord(key: "test.child.\(UUID().uuidString)", stop: SIGINT, killAfter: .seconds(20))
-        defer { record.forget() }
-        let log = FileManager.default.temporaryDirectory.appending(path: "child-\(UUID().uuidString).log")
-        defer { try? FileManager.default.removeItem(at: log) }
-        let other = try ChildProcess(command: ["/bin/sleep", "60"], environment: [:], log: log) { _ in }
+        let folder = Self.folder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let defaults = UserDefaults.kept(in: folder)
+        let record = ChildRecord(defaults: defaults, key: "child", stop: SIGINT, killAfter: .seconds(20))
+        let other = try ChildProcess(command: ["/bin/sleep", "60"], environment: [:], log: folder.appending(path: "child.log")) { _ in }
         defer { other.stop(SIGKILL, killAfter: .zero) }
         // Kept with another start: an earlier process that had the ID, or a record an older app
         // kept as the ID alone.
-        UserDefaults.standard.set([Int(other.pid), try #require(other.started) - 1], forKey: record.key)
+        defaults.set([Int(other.pid), try #require(other.started) - 1], forKey: record.key)
         await record.stopLeftover()
         #expect(processStart(other.pid) != nil)
-        #expect(UserDefaults.standard.object(forKey: record.key) == nil)
-        UserDefaults.standard.set(Int(other.pid), forKey: record.key)
+        #expect(defaults.object(forKey: record.key) == nil)
+        defaults.set(Int(other.pid), forKey: record.key)
         await record.stopLeftover()
         #expect(processStart(other.pid) != nil)
-        #expect(UserDefaults.standard.object(forKey: record.key) == nil)
+        #expect(defaults.object(forKey: record.key) == nil)
     }
 
     /// A leftover server stops by itself once its app has ended, as Ctrl+C stops it, and a second
     /// Ctrl+C would stop its engine at once: the next launch sends what it ignores by then, and
     /// waits for it.
     @Test func aLeftoverServerAlreadyStoppingIsLeftToFinish() async throws {
-        let log = try await Self.leftover("trap 'echo interrupted' INT; trap '' TERM; echo ready; sleep 1",
-                                          stoppedBy: Server(runtime: Showcase.runtime, log: URL(filePath: "/dev/null")).record.stop)
+        let log = try await Self.leftover("trap 'echo interrupted' INT; trap '' TERM; echo ready; sleep 1") {
+            Server(runtime: Showcase.runtime, log: URL(filePath: "/dev/null"), defaults: $0).record
+        }
         #expect(log == "ready\n")
     }
 
     /// A leftover download gets Ctrl+C, which removes its temporary files as it ends.
     @Test func aLeftoverDownloadIsInterrupted() async throws {
-        let log = try await Self.leftover("trap 'echo interrupted; exit' INT; echo ready; sleep 60",
-                                          stoppedBy: Installer(runtime: Showcase.runtime, log: URL(filePath: "/dev/null")).record.stop)
+        let log = try await Self.leftover("trap 'echo interrupted; exit' INT; echo ready; sleep 60") {
+            Installer(runtime: Showcase.runtime, log: URL(filePath: "/dev/null"), defaults: $0).record
+        }
         #expect(log == "ready\ninterrupted\n")
     }
 
@@ -458,12 +461,13 @@ struct ChildRecordTests {
     /// delay has passed, and the next launch waits that and at most 10 s more. A server's record
     /// gives it as long as the server's own stop of its engine takes.
     @Test func aLeftoverIgnoringItsStopIsKilledAfterItsDelay() async throws {
-        #expect(Server(runtime: Showcase.runtime, log: URL(filePath: "/dev/null")).record.killAfter == Server.killAfter)
+        let folder = Self.folder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let defaults = UserDefaults.kept(in: folder)
+        #expect(Server(runtime: Showcase.runtime, log: URL(filePath: "/dev/null"), defaults: defaults).record.killAfter == Server.killAfter)
         let killAfter = Duration.seconds(1)
-        let record = ChildRecord(key: "test.child.\(UUID().uuidString)", stop: SIGTERM, killAfter: killAfter)
-        defer { record.forget() }
-        let log = FileManager.default.temporaryDirectory.appending(path: "child-\(UUID().uuidString).log")
-        defer { try? FileManager.default.removeItem(at: log) }
+        let record = ChildRecord(defaults: defaults, key: "child", stop: SIGTERM, killAfter: killAfter)
+        let log = folder.appending(path: "child.log")
         // A shell that ignores SIGTERM, and a program of its group, which ignores it too, whose
         // process ID it writes.
         let child = try ChildProcess(command: ["/bin/sh", "-c", "trap '' TERM; sleep 60 & echo $!; wait"],
@@ -486,13 +490,13 @@ struct ChildRecordTests {
         #expect(processStart(member) == nil)
     }
 
-    /// What `script` wrote by the time a record that stops with `signal` has stopped it, once it
-    /// has written `ready`.
-    private static func leftover(_ script: String, stoppedBy signal: Int32) async throws -> String {
-        let record = ChildRecord(key: "test.child.\(UUID().uuidString)", stop: signal, killAfter: .seconds(20))
-        defer { record.forget() }
-        let log = FileManager.default.temporaryDirectory.appending(path: "child-\(UUID().uuidString).log")
-        defer { try? FileManager.default.removeItem(at: log) }
+    /// What `script` wrote by the time `record`, made on a test's own defaults, has stopped it,
+    /// once it has written `ready`.
+    private static func leftover(_ script: String, record: (UserDefaults) -> ChildRecord) async throws -> String {
+        let folder = Self.folder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let record = record(.kept(in: folder))
+        let log = folder.appending(path: "child.log")
         let child = try ChildProcess(command: ["/bin/sh", "-c", script], environment: [:], log: log) { _ in }
         defer { child.stop(SIGKILL, killAfter: .zero) }
         try await waitFor((try? String(contentsOf: log, encoding: .utf8)) == "ready\n", "the start")
@@ -500,6 +504,12 @@ struct ChildRecordTests {
         await record.stopLeftover()
         #expect(processStart(child.pid) == nil)
         return try String(contentsOf: log, encoding: .utf8)
+    }
+
+    /// A folder of a test's own, for its record's defaults and its program's log, which
+    /// `UserDefaults.kept(in:)` makes.
+    private static func folder() -> URL {
+        FileManager.default.temporaryDirectory.appending(path: "splash-record-\(UUID().uuidString)")
     }
 }
 

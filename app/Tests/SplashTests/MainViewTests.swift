@@ -9,23 +9,22 @@ import Testing
 @MainActor
 @Suite(.serialized)
 struct MainViewTests {
-    /// The sidebar shows or hides at launch as it did when the app last quit.
+    /// The sidebar shows or hides at launch as it did when the app last quit, as its own defaults
+    /// keep it: another app's are not changed.
     @Test func theSidebarIsKeptFromOneLaunchToTheNext() {
-        let kept = UserDefaults.standard.object(forKey: Preference.sidebar)
-        defer { UserDefaults.standard.set(kept, forKey: Preference.sidebar) }
         let (state, folder) = AppState.forTests()
-        defer { try? FileManager.default.removeItem(at: folder) }
+        let (other, otherFolder) = AppState.forTests()
+        defer { [folder, otherFolder].forEach { try? FileManager.default.removeItem(at: $0) } }
         state.showsSidebar = false
-        #expect(!AppState.forTests().0.showsSidebar)
+        #expect(!AppState.forTests(in: folder).showsSidebar)
+        #expect(other.showsSidebar && AppState.forTests(in: otherFolder).showsSidebar)
         state.showsSidebar = true
-        #expect(AppState.forTests().0.showsSidebar)
+        #expect(AppState.forTests(in: folder).showsSidebar)
     }
 
     /// The sidebar hidden takes the keyboard from its search field, where what is typed would
     /// filter a list no one sees.
     @Test func hidingTheSidebarTakesTheKeyboardFromIt() async throws {
-        let kept = UserDefaults.standard.object(forKey: Preference.sidebar)
-        defer { UserDefaults.standard.set(kept, forKey: Preference.sidebar) }
         let (state, folder) = AppState.forTests()
         defer { try? FileManager.default.removeItem(at: folder) }
         state.showsSidebar = true

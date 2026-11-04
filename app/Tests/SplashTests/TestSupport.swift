@@ -31,6 +31,22 @@ func freePort() -> Int {
     return Int(UInt16(bigEndian: address.sin_port))
 }
 
+extension UserDefaults {
+    /// Defaults of a test's own, kept in `folder`, apart from the user's and every other test's: a
+    /// domain named by a path keeps its file there, which goes with the folder. A write after the
+    /// folder is gone makes it again, so a test stops what writes them before it removes the folder.
+    static func kept(in folder: URL) -> UserDefaults {
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return UserDefaults(suiteName: folder.appending(path: "defaults").path(percentEncoded: false))!
+    }
+}
+
+extension Shell {
+    /// zsh without the user's startup files, which can take seconds, or wait for input, before
+    /// the shell reads what a test types.
+    static let bare = Shell(path: "/bin/zsh", arguments: ["-f"], name: "zsh")
+}
+
 extension AppState.Folders {
     /// The chats in `folder`, the logs in its Logs: a test's own, apart from the user's.
     init(in folder: URL) {
@@ -39,10 +55,13 @@ extension AppState.Folders {
 }
 
 extension AppState {
-    /// An app on `runtime` whose chats are in `folder` and its logs in its Logs, and whose API key
-    /// is not the user's either.
-    static func forTests(in folder: URL, runtime: Runtime = Showcase.runtime) -> AppState {
-        AppState(runtime: runtime, folders: Folders(in: folder), keychain: Keychain(service: "Splash Tests"))
+    /// An app whose chats are in `folder`, its logs in its Logs and its defaults `defaults`, else
+    /// there too, on `runtime`, else on an empty one in the folder; its API key is not the user's
+    /// either, and its terminals run `Shell.bare`. Apps made with one folder's defaults are
+    /// launches of one app.
+    static func forTests(in folder: URL, runtime: Runtime? = nil, defaults: UserDefaults? = nil) -> AppState {
+        AppState(runtime: runtime ?? Runtime(root: folder.appending(path: "Runtime")), folders: Folders(in: folder),
+                 keychain: Keychain(service: "Splash Tests"), defaults: defaults ?? .kept(in: folder), shell: { .bare })
     }
 
     /// The same in a new temporary folder, with that folder, for the test to remove.

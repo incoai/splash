@@ -15,6 +15,10 @@ enum AppFlow {
     static let models = environment["SPLASH_APP_MODELS"]
         .map { $0.split(separator: " ").map(String.init) }.flatMap { $0.isEmpty ? nil : $0 }
     static let port = Int(environment["SPLASH_APP_PORT"] ?? "") ?? freePort()
+    /// The defaults of every test and every run, kept from one to the next as an app's are, apart
+    /// from the user's: each test's launch is a relaunch of one app, which stops the server an
+    /// earlier one left running before it starts its own on the same port.
+    @MainActor static let defaults = UserDefaults.kept(in: FileManager.default.temporaryDirectory.appending(path: "splash-app-flow"))
 }
 
 /// A class, so that each test's instance, which Swift Testing lets go as the test ends, however it
@@ -28,20 +32,20 @@ final class AppFlowTests {
     static let port = AppFlow.port
 
     /// The launch options of every run: the server's defaults, on the test's port.
-    static let defaults = ServeSettings(values: ["--port": String(port)])
+    static let options = ServeSettings(values: ["--port": String(port)])
     /// The seconds a server is given to reach each step of a start, a switch or a failure.
     static let stepTimeout = 600.0
 
     let state: AppState
     let model: String
-    /// The conversations of this run, apart from the user's.
-    let chats = FileManager.default.temporaryDirectory.appending(path: "splash-chats-\(UUID().uuidString)")
+    /// The conversations and logs of this test, apart from the user's.
+    let folder = FileManager.default.temporaryDirectory.appending(path: "splash-app-flow-\(UUID().uuidString)")
 
     init() async throws {
-        Self.defaults.save()
+        Self.options.save(AppFlow.defaults)
         let runtime = try #require(Runtime.locate(), "SPLASH_RUNTIME names no runtime")
         #expect(runtime.packaged)
-        state = AppState.forTests(in: chats, runtime: runtime)
+        state = AppState.forTests(in: folder, runtime: runtime, defaults: AppFlow.defaults)
         model = Self.models![0]
         await state.launch()
         // The window opens on the Server, and nothing starts until the user starts it.
@@ -51,6 +55,12 @@ final class AppFlowTests {
 
     isolated deinit {
         state.quit()
+        try? FileManager.default.removeItem(at: folder)
+    }
+
+    /// The next launch of the app, as after a quit or a crash of this one.
+    func relaunch() -> AppState {
+        AppState.forTests(in: folder, runtime: state.runtime, defaults: AppFlow.defaults)
     }
 
     @Test func thisMacIsSupportedAndGetsSuggestions() async throws {
@@ -63,10 +73,10 @@ final class AppFlowTests {
         state.section = .chat
         await Snapshot.save("chat-stopped", MainView().environment(state))
         // A Mac with no model yet: a runtime whose models folder is empty.
-        let fresh = FileManager.default.temporaryDirectory.appending(path: "splash-first-run-\(getpid())")
+        let fresh = folder.appending(path: "first-run")
         try FileManager.default.createDirectory(at: fresh.appending(path: "install"), withIntermediateDirectories: true)
         try? FileManager.default.copyItem(at: state.runtime.suggestedModels, to: Runtime(root: fresh).suggestedModels)
-        let first = AppState.forTests(in: chats, runtime: Runtime(root: fresh))
+        let first = AppState.forTests(in: fresh, runtime: Runtime(root: fresh))
         #expect(first.installed.isEmpty && first.selection == nil)
         await first.launch()
         await Snapshot.save("server-first-run", MainView().environment(first))
@@ -94,7 +104,7 @@ final class AppFlowTests {
         #expect(conversation.messages.map(\.role) == [.user, .assistant])
         #expect(conversation.messages[1].model == model)
         state.chats.flush()
-        #expect(ChatStore(folder: chats).conversations.first?.messages == conversation.messages, "saved")
+        #expect(ChatStore(folder: folder).conversations.first?.messages == conversation.messages, "saved")
         await Snapshot.save("chat-ready", MainView().environment(state))
         #expect(state.server.requestLog.contains { $0.outcome == .done && ($0.output ?? 0) > 0 })
         #expect(state.server.activity.generated > 0)
@@ -122,7 +132,6 @@ final class AppFlowTests {
         try await waitFor(state.server.phase == .starting, "restarting (\(state.server.phase))", seconds: Self.stepTimeout)
         #expect(state.server.settings["--max-context"] == "32768" && !state.optionsChanged)
         try await ready()
-        state.options = Self.defaults
         let pid = try #require(state.runtime.serveRecord(port: Self.port)?.pid)
         state.stop()
         #expect(state.server.phase == .stopping)
@@ -184,7 +193,6 @@ final class AppFlowTests {
 
     @Test func aStartThatFailsSaysWhy() async throws {
         state.options["--max-memory"] = "1G"
-        defer { state.options = Self.defaults }
         state.start(model)
         try await waitFor({ if case .failed = state.server.phase { true } else { false } }(),
                           "failed (\(state.server.phase))", seconds: Self.stepTimeout)
@@ -237,7 +245,7 @@ final class AppFlowTests {
         state.start(model)
         #expect(!state.server.running)
         // The model stays picked for the next launch, which starts nothing by itself.
-        #expect(AppState.forTests(in: chats, runtime: state.runtime).selection == model)
+        #expect(relaunch().selection == model)
     }
 
     @Test func aRelaunchStopsTheServerACrashLeftBehind() async throws {
@@ -245,8 +253,7 @@ final class AppFlowTests {
         try await ready()
         let pid = try #require(state.runtime.serveRecord(port: Self.port)?.pid)
         // The next launch of the app, as after a crash of this one.
-        let relaunch = AppState.forTests(in: chats, runtime: state.runtime)
-        await relaunch.server.stopLeftover()
+        await relaunch().server.stopLeftover()
         #expect(kill(pid, 0) != 0)
         try await waitFor({ if case .failed = state.server.phase { true } else { false } }(),
                           "noticed (\(state.server.phase))", seconds: Self.stepTimeout)
@@ -270,8 +277,8 @@ final class AppFlowTests {
         // A crash of the app leaves the download running; the next launch stops it.
         installer.install(download)
         try await waitFor((installer.progress?.done ?? 0) > 0, "progress again", seconds: 120)
-        let pid = pid_t(try #require((UserDefaults.standard.array(forKey: Preference.installerPID) as? [Int])?.first))
-        await AppState.forTests(in: chats, runtime: state.runtime).installer.stopLeftover()
+        let pid = pid_t(try #require((state.defaults.array(forKey: Preference.installerPID) as? [Int])?.first))
+        await relaunch().installer.stopLeftover()
         #expect(kill(pid, 0) != 0)
         try await waitFor(!installer.running, "noticed", seconds: 30)
         try await install(download)

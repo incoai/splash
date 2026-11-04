@@ -118,11 +118,11 @@ final class Server {
     private var stopRequested = false
     private var watch: Task<Void, Never>?
 
-    init(runtime: Runtime, log: URL, killAfter: Duration = Server.killAfter) {
+    init(runtime: Runtime, log: URL, defaults: UserDefaults, killAfter: Duration = Server.killAfter) {
         self.runtime = runtime
         self.log = log
         self.killAfter = killAfter
-        record = ChildRecord(key: Preference.serverPID, stop: SIGTERM, killAfter: killAfter)
+        record = ChildRecord(defaults: defaults, key: Preference.serverPID, stop: SIGTERM, killAfter: killAfter)
     }
 
     var running: Bool { child != nil }

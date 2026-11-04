@@ -2,17 +2,23 @@ import AppKit
 import SwiftTerm
 import SwiftUI
 
-/// What the drawer under the window's content holds (`WithDrawer`): terminals, each a login shell
-/// in the home folder, and the logs of what the app runs. Whether it shows,
+/// What the drawer under the window's content holds (`WithDrawer`): terminals, each running the
+/// program `shell` names as it starts, in the home folder, and the logs of what the app runs. Whether it shows,
 /// and its height, are the window's (`AppState.showsDrawer`), as the sidebar's are.
 @MainActor @Observable
 final class Drawer {
     enum Part: Hashable { case terminal, logs }
 
+    /// Asked for each terminal, so that a login shell the user changes (chsh) runs in the next one.
+    let shell: () -> Shell
     var part = Part.terminal
     private(set) var terminals: [TerminalSession] = []
     var terminal: TerminalSession.ID?
     var log = LogSource.server
+
+    init(shell: @escaping () -> Shell) {
+        self.shell = shell
+    }
 
     func add(_ session: TerminalSession) {
         terminals.append(session)
@@ -40,10 +46,25 @@ extension Array {
     }
 }
 
-/// A login shell in a pseudo-terminal, as Terminal opens one, in the home folder, with the app's
-/// own environment (`Runtime.userEnvironment`), which the login shell completes as in Terminal,
-/// and Option typing what the keyboard layout gives, as there. Its view outlives the drawer's, so
-/// that a terminal keeps what it shows while the drawer is closed or the window shows another part.
+/// The program a terminal runs.
+struct Shell {
+    let path: String
+    let arguments: [String]
+    /// The name it runs under, which starts with "-" for a login shell.
+    let name: String
+
+    /// The user's login shell, as Terminal starts it, which completes the app's environment from
+    /// the user's startup files.
+    static var login: Shell {
+        let path = String(cString: getpwuid(getuid()).pointee.pw_shell)
+        return Shell(path: path, arguments: [], name: "-" + (path as NSString).lastPathComponent)
+    }
+}
+
+/// A shell in a pseudo-terminal, as Terminal opens one, in the home folder, with the app's own
+/// environment (`Runtime.userEnvironment`), and Option typing what the keyboard layout gives, as
+/// there. Its view outlives the drawer's, so that a terminal keeps what it shows while the drawer
+/// is closed or the window shows another part.
 @MainActor @Observable
 final class TerminalSession: Identifiable {
     let id = UUID()
@@ -53,7 +74,7 @@ final class TerminalSession: Identifiable {
     @ObservationIgnored let view: LocalProcessTerminalView
     @ObservationIgnored private var delegate: Delegate?
 
-    init(environment: [String: String]) {
+    init(shell: Shell, environment: [String: String]) {
         let folder = URL.homeDirectory
         title = folder.lastPathComponent
         view = LocalProcessTerminalView(frame: NSRect(x: 0, y: 0, width: 640, height: 280))
@@ -62,14 +83,13 @@ final class TerminalSession: Identifiable {
         let delegate = Delegate(self)
         self.delegate = delegate
         view.processDelegate = delegate
-        let shell = String(cString: getpwuid(getuid()).pointee.pw_shell)
         var environment = environment
         environment["TERM"] = "xterm-256color"
         environment["COLORTERM"] = "truecolor"
         environment["TERM_PROGRAM"] = "Splash"
         if environment["LANG"] == nil { environment["LANG"] = "en_US.UTF-8" }
-        view.startProcess(executable: shell, environment: environment.map { "\($0.key)=\($0.value)" },
-                          execName: "-" + (shell as NSString).lastPathComponent, currentDirectory: folder.path)
+        view.startProcess(executable: shell.path, args: shell.arguments, environment: environment.map { "\($0.key)=\($0.value)" },
+                          execName: shell.name, currentDirectory: folder.path)
         // Only the app holds the terminal's master, not the shells started after this one, nor what
         // they leave running: the app's end hangs this shell up, however it ends.
         _ = fcntl(view.process.childfd, F_SETFD, FD_CLOEXEC)
