@@ -16,7 +16,9 @@
 //   the tail block after the row's complete ones), with YaRN too, to the end
 //   of its window; the scratch a target's window takes;
 // - the capture of a layer's output for the DFlash2 draft (the mean of its
-//   streams); the GPU PLE hash against the CPU's.
+//   streams); the GPU PLE hash against the CPU's;
+// - each buffer the hyper-connection and PLE kernels reach, at its extent and
+//   one element short, and their refusal of norms not F32.
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/model/Qwen4Exp.hpp"
@@ -27,6 +29,7 @@
 #include "../../../runtime/ops/RoPE.hpp"
 #include "../../../runtime/ops/Sampling.hpp"
 #include "LinearInputReference.hpp"
+#include "TestBuffers.hpp"
 #include "metal/abi/BlockIndexer.h"
 #include "metal/abi/KvExtent.h"
 #include "metal/abi/HyperConnection.h"
@@ -358,7 +361,9 @@ void pleTest(MetalBackend &backend) {
              hist = randoms(rng, history * width, 1.0f);
   auto plus = [](std::vector<float> v) { for (float &e : v) e += 1.0f; return v; };
   const auto knP = plus(kn), qnP = plus(qn), cnP = plus(cn);
-  MetalBuffer gated = scratch(backend, rows * width * 4), conv = scratch(backend, rows * width * 2);
+  // The convolution input of a verify step's rows, which the commit reads.
+  MetalBuffer gated = scratch(backend, rows * width * 4),
+              conv = scratch(backend, uint64_t{SPLASH_TARGET_VERIFY_ROWS} * width * 2);
   MetalBuffer streamsBuffer = upload(backend, x), histIn = upload(backend, bf16s(hist)),
               histOut = scratch(backend, history * width * 2);
   CommandGraph graph;
@@ -559,6 +564,7 @@ void qsaTest(MetalBackend &backend, QsaCase c) {
     for (uint32_t index : x.table)
       entries.push_back((extent.gpuAddress() + index / kExtentPages * extentBytes) | index % kExtentPages);
     x.tableBuffer = upload(backend, entries);
+    backend.setTableReach(x.tableBuffer, std::span(&extent, 1));
     tables.push_back(x.tableBuffer);
     firstPositions.push_back(x.first);
   }
@@ -791,6 +797,7 @@ void qsaRollbackTest(MetalBackend &backend) {
     std::vector<uint64_t> entries;
     for (uint32_t index : lane.table) entries.push_back(extent.gpuAddress() | index);
     lane.tableBuffer = upload(backend, entries);
+    backend.setTableReach(lane.tableBuffer, std::span(&extent, 1));
     for (MetalBuffer &pending : lane.pending) pending = upload(backend, std::vector<uint16_t>(kQsaPendingBytes / 2, 0));
     std::vector<float> knP(D, 1.0f), invFreq(32);
     for (uint32_t i = 0; i < 32; ++i) invFreq[i] = std::pow(10'000'000.0f, -float(i) / 32);
@@ -947,6 +954,154 @@ void pleHashTest(MetalBackend &backend) {
   check(ok, "PLE hash: GPU rows equal the CPU's");
 }
 
+using Extents = std::initializer_list<splash::test::BufferExtent>;
+using Buffers = std::vector<MetalBuffer>;
+
+// Each buffer the hyper-connection kernels reach, at Flash-Next's shape over
+// five rows: the streams (fp32), the norm's F32 weights, every stream's
+// injection weights of the normalized rows and each row's weight per stream,
+// the normalized and gate rows (bf16), the low rank's rows, the block's input
+// and branch, and the stream mean's rows; and the norm's refusal of bf16
+// weights.
+void hyperExtentsTest(MetalBackend &backend) {
+  const uint32_t rows = 5, hidden = kHidden, streams = kStreams, rank = kRank, width = hidden * streams;
+  const ops::HyperShape shape{hidden, streams, rank};
+  const uint64_t streamBytes = uint64_t{rows} * width * 4, weightBytes = uint64_t{rows} * streams * 4;
+  const uint64_t normalizedBytes = uint64_t{rows} * width * 2, hiddenBytes = uint64_t{rows} * hidden * 2;
+  splash::test::requireExtents(backend,
+                               Extents{{0, hiddenBytes, 2, "hyper-connection embedding"},
+                                       {1, streamBytes, 4, "hyper-connection streams"}},
+                               [&](CommandGraph &graph, const Buffers &b) {
+                                 ops::HyperConnection::addInit(graph, b[0], b[1], shape, rows);
+                               });
+  splash::test::requireExtents(backend,
+                               Extents{{0, streamBytes, 4, "hyper-connection streams"},
+                                       {1, uint64_t{width} * 4, 4, "hyper-connection norm"},
+                                       {2, uint64_t{streams} * width * 4, 4, "hyper-connection injection"},
+                                       {3, normalizedBytes, 2, "hyper-connection normalized"},
+                                       {4, weightBytes, 4, "hyper-connection weight"}},
+                               [&](CommandGraph &graph, const Buffers &b) {
+                                 ops::HyperConnection::addNorm(graph, b[0], {b[1], true}, b[2], b[3], b[4], shape,
+                                                               rows);
+                               });
+  splash::test::requireExtents(backend, Extents{{0, uint64_t{rows} * rank * 2, 2, "hyper-connection low"}},
+                               [&](CommandGraph &graph, const Buffers &b) {
+                                 ops::HyperConnection::addLow(graph, b[0], shape, rows);
+                               });
+  splash::test::requireExtents(backend,
+                               Extents{{0, normalizedBytes, 2, "hyper-connection normalized"},
+                                       {1, normalizedBytes, 2, "hyper-connection gate"},
+                                       {2, hiddenBytes, 2, "hyper-connection mix"}},
+                               [&](CommandGraph &graph, const Buffers &b) {
+                                 ops::HyperConnection::addMix(graph, b[0], b[1], b[2], shape, rows);
+                               });
+  splash::test::requireExtents(backend,
+                               Extents{{0, streamBytes, 4, "hyper-connection streams"},
+                                       {1, hiddenBytes, 2, "hyper-connection branch"},
+                                       {2, weightBytes, 4, "hyper-connection weight"}},
+                               [&](CommandGraph &graph, const Buffers &b) {
+                                 ops::HyperConnection::addCombine(graph, b[0], b[1], b[2], shape, rows);
+                               });
+  // Into column `hidden` of rows of three hidden widths, from row 2.
+  splash::test::requireExtents(backend,
+                               Extents{{0, streamBytes, 4, "stream mean input"},
+                                       {1, uint64_t{2 + rows} * 3 * hidden * 2, 2, "stream mean output"}},
+                               [&](CommandGraph &graph, const Buffers &b) {
+                                 ops::HyperConnection::addStreamMean(graph, b[0], b[1], {2, 3 * hidden, hidden},
+                                                                     shape, rows);
+                               });
+  CommandGraph refused;
+  splash::test::rejects(
+      [&] {
+        ops::HyperConnection::addNorm(refused, scratch(backend, streamBytes), {scratch(backend, width * 4), false},
+                                      scratch(backend, uint64_t{streams} * width * 4),
+                                      scratch(backend, normalizedBytes), scratch(backend, weightBytes), shape, rows);
+      },
+      "the hyper-connection norm is not F32", "a hyper-connection norm of bf16 weights was encoded");
+  check(refused.empty(), "hyper-connection buffers at their extents, and bf16 norm weights refused");
+}
+
+// Each buffer the PLE kernels reach, over seven rows of four streams of 256
+// values and a history of three taps three rows apart: the gate's key, value
+// and stream rows, its three F32 norms, gated values and convolution input;
+// the convolution's input rows, history before and after, taps, gated values
+// and streams; the history after a sequence's first rows and after a lane's
+// retained rows, of a verify step's rows, and the retained count; the hash's
+// tokens, each lane's tokens before it (19 rows: two whole lanes and three
+// rows of a third) and its row ids; and the gate's refusal of each of its
+// norms in bf16.
+void pleExtentsTest(MetalBackend &backend) {
+  const uint32_t rows = 7, hidden = 256, streams = 4, taps = 4, dilation = 3, width = hidden * streams;
+  const ops::NgramShape shape{hidden, streams, taps, dilation};
+  const uint64_t history = uint64_t{shape.history()} * width * 2;
+  const uint64_t inputBytes = uint64_t{rows} * width * 2, floatBytes = uint64_t{rows} * width * 4;
+  splash::test::requireExtents(backend,
+                               Extents{{0, inputBytes, 2, "n-gram embedding key"},
+                                       {1, uint64_t{rows} * hidden * 2, 2, "n-gram embedding value"},
+                                       {2, floatBytes, 4, "n-gram embedding streams"},
+                                       {3, uint64_t{width} * 4, 4, "n-gram embedding key norm"},
+                                       {4, uint64_t{width} * 4, 4, "n-gram embedding query norm"},
+                                       {5, uint64_t{width} * 4, 4, "n-gram embedding convolution norm"},
+                                       {6, floatBytes, 4, "n-gram embedding gated"},
+                                       {7, inputBytes, 2, "n-gram embedding convolution input"}},
+                               [&](CommandGraph &graph, const Buffers &b) {
+                                 ops::NgramEmbedding::addGate(graph, b[0], b[1], b[2], {b[3], true}, {b[4], true},
+                                                              {b[5], true}, b[6], b[7], shape, rows);
+                               });
+  splash::test::requireExtents(backend,
+                               Extents{{0, inputBytes, 2, "n-gram embedding convolution input"},
+                                       {1, history, 2, "n-gram embedding history"},
+                                       {2, history, 2, "n-gram embedding next history"},
+                                       {3, uint64_t{width} * taps * 4, 4, "n-gram embedding convolution taps"},
+                                       {4, floatBytes, 4, "n-gram embedding gated"},
+                                       {5, floatBytes, 4, "n-gram embedding streams"}},
+                               [&](CommandGraph &graph, const Buffers &b) {
+                                 ops::NgramEmbedding::addConvolution(graph, b[0], b[1], b[2], b[3], b[4], b[5], shape,
+                                                                     rows);
+                               });
+  splash::test::requireExtents(backend,
+                               Extents{{0, inputBytes, 2, "n-gram embedding convolution input"},
+                                       {1, history, 2, "n-gram embedding history"},
+                                       {2, history, 2, "n-gram embedding next history"}},
+                               [&](CommandGraph &graph, const Buffers &b) {
+                                 ops::NgramEmbedding::addHistory(graph, b[0], b[1], b[2], shape, rows);
+                               });
+  splash::test::requireExtents(
+      backend,
+      Extents{{0, uint64_t{SPLASH_TARGET_VERIFY_ROWS} * width * 2, 2, "n-gram embedding convolution input"},
+              {1, history, 2, "n-gram embedding history"},
+              {2, history, 2, "n-gram embedding next history"},
+              {3, 4, 4, "n-gram embedding retained rows"}},
+      [&](CommandGraph &graph, const Buffers &b) {
+        ops::NgramEmbedding::addCommit(graph, b[0], b[1], b[2], b[3], shape);
+      });
+  NgramHashParams params{};
+  params.rows = 2 * SPLASH_TARGET_VERIFY_ROWS + 3;
+  params.ngram = 3;
+  params.heads_per_ngram = 8;
+  const uint32_t heads = 16;
+  splash::test::requireExtents(backend,
+                               Extents{{0, uint64_t{params.rows} * 4, 4, "n-gram hash token"},
+                                       {1, 3 * 2 * 4, 4, "n-gram hash prior token"},
+                                       {2, uint64_t{params.rows} * heads * 4, 4, "n-gram hash index"}},
+                               [&](CommandGraph &graph, const Buffers &b) {
+                                 ops::NgramEmbedding::addHash(graph, b[0], b[1], b[2], params, heads);
+                               });
+  CommandGraph refused;
+  const MetalBuffer norm = scratch(backend, uint64_t{width} * 4);
+  // The key, query and convolution norms in turn in bf16.
+  for (uint32_t bfloat16 = 0; bfloat16 < 3; ++bfloat16)
+    splash::test::rejects(
+        [&] {
+          ops::NgramEmbedding::addGate(refused, scratch(backend, inputBytes), scratch(backend, inputBytes),
+                                       scratch(backend, floatBytes), {norm, bfloat16 != 0}, {norm, bfloat16 != 1},
+                                       {norm, bfloat16 != 2}, scratch(backend, floatBytes),
+                                       scratch(backend, inputBytes), shape, rows);
+        },
+        "the n-gram embedding norms are not F32", "a PLE gate of a bf16 norm was encoded");
+  check(refused.empty(), "PLE buffers at their extents, and each bf16 norm refused");
+}
+
 } // namespace
 
 int main(int argc, const char *argv[]) {
@@ -988,6 +1143,8 @@ int main(int argc, const char *argv[]) {
         qsaSelectRefusesNarrowScratch(backend);
         streamMeanTest(backend);
         pleHashTest(backend);
+        hyperExtentsTest(backend);
+        pleExtentsTest(backend);
       }
     } catch (const std::exception &error) {
       std::cerr << "qwen4 kernel test error: " << error.what() << '\n';

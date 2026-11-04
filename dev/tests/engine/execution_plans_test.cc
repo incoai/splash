@@ -6,6 +6,8 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string>
+#include <utility>
 
 namespace {
 using namespace splash;
@@ -25,6 +27,8 @@ constexpr std::array draftShapes{
     DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128},
     DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128}};
 constexpr MoeShape routedShape{2048, 256, 8, 512};
+// Experts of no quantized format the plans tell apart: the device's tile.
+constexpr MoeFormats kFormats{};
 constexpr std::array moeShapes{
     routedShape, MoeShape{768, 7, 3, 256}, MoeShape{256, 1, 1, 256}};
 constexpr std::array matrices{
@@ -87,8 +91,9 @@ void baselinePlans() {
     for (const auto &[queryHeads, kvLayout] : attentionShapes) {
       const auto memory = plans.prefillAttentionWorkspace(2048, queryHeads, kvLayout);
       for (uint32_t rows = 1; rows <= 2048; ++rows)
-        covers(memory, plans.prefillAttention(rows, queryHeads, kvLayout).workspace, 1,
-               attentionFields);
+        for (const uint32_t history : {0U, 32768U, 1'000'000U})
+          covers(memory, plans.prefillAttention(rows, history, queryHeads, kvLayout).workspace, 1,
+                 attentionFields);
       const auto stride = plans.verifyAttentionWorkspacePerLane(queryHeads, kvLayout);
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         const std::array<uint32_t, 4> histories{0, 31, 2048, 8192};
@@ -112,13 +117,13 @@ void baselinePlans() {
         covers(stride, plans.draftAttention(shape, lanes).workspace(), lanes, draftFields);
     }
     for (auto shape : moeShapes) {
-      const auto stride = plans.moeDecodeWorkspacePerLane(shape);
-      require(stride == plans.moeDecode(shape, 1).workspace(), "workspace bound changed");
-      const auto prefill = plans.moePrefillWorkspace(shape, 2048);
+      const auto stride = plans.moeDecodeWorkspacePerLane(shape, kFormats);
+      require(stride == plans.moeDecode(shape, kFormats, 1).workspace(), "workspace bound changed");
+      const auto prefill = plans.moePrefillWorkspace(shape, kFormats, 2048);
       for (uint32_t rows = 1; rows <= 2048; ++rows)
-        covers(prefill, plans.moePrefill(shape, rows).workspace(), 1, kMoeWorkspaceFields);
+        covers(prefill, plans.moePrefill(shape, kFormats, rows).workspace(), 1, kMoeWorkspaceFields);
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-        const auto selected = plans.moeDecode(shape, lanes);
+        const auto selected = plans.moeDecode(shape, kFormats, lanes);
         require(selected.tileRows() == 8, "MoE decode baseline changed");
         covers(stride, selected.workspace(), lanes, kMoeWorkspaceFields);
       }
@@ -143,11 +148,10 @@ void ggufMoePlans() {
     DeviceCapabilities capabilities = device(family);
     capabilities.gpuCoreCount = reportedCores;
     ExecutionPlans plans(capabilities);
-    const uint32_t cores = plannedGpuCores(capabilities);
-    require(moeGgufTile(gpuFamilyClass(family), cores, shape) == expected,
+    require(selectMoe(plans.calibration(), shape, kFormats, 8, MoePhase::Decode).ggufTile == expected,
             "GGUF expert tile is not gated on GPU family 9 of more than 10 cores");
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const MoePlan plan = plans.moeDecode(shape, lanes);
+      const MoePlan plan = plans.moeDecode(shape, kFormats, lanes);
       require(plan.configuration().ggufTile == expected && plan.tileRows() == 8 &&
                   plan.configuration().ggufRouterTile == FloatTile::Simdgroup,
               "GGUF MoE decode plan left its device tile");
@@ -155,41 +159,40 @@ void ggufMoePlans() {
       require(plan.workspace().groupedSumsBytes ==
                   (expected == MoeGgufTile::Register ? uint64_t{plan.maximumTiles()} * 2048 * 3 : 0),
               "GGUF register plan sums its Table16 tiles");
-      covers(plans.moeDecodeWorkspacePerLane(shape), plan.workspace(), lanes, kMoeWorkspaceFields);
+      covers(plans.moeDecodeWorkspacePerLane(shape, kFormats), plan.workspace(), lanes, kMoeWorkspaceFields);
     }
     // Apple9 stages experts mostly in a format it stages (IQ2_XS: UD-Q2_K_XL),
     // and the others (Q4_K: UD-Q4_K_M) take the device's tile.
-    MoeShape staged = shape, q4k = shape;
-    staged.expertFormat = GGUF_FMT_IQ2XS;
-    q4k.expertFormat = GGUF_FMT_Q4K;
-    require(moeGgufTile(gpuFamilyClass(family), cores, staged) == MoeGgufTile::Staged &&
-                moeGgufTile(gpuFamilyClass(family), cores, q4k) == expected,
+    const MoeFormats staged{.experts = {.formatClass = FormatClass::GridLookup}},
+        q4k{.experts = {.formatClass = FormatClass::FourBitsOrMore}};
+    require(selectMoe(plans.calibration(), shape, staged, 8, MoePhase::Decode).ggufTile == MoeGgufTile::Staged &&
+                selectMoe(plans.calibration(), shape, q4k, 8, MoePhase::Decode).ggufTile == expected,
             "GGUF expert tile does not follow the experts' format on GPU family 9");
     // An expert weight in a format the register tile does not take (F16) stages the experts.
-    MoeShape f16 = q4k;
-    f16.registerFormats = false;
-    require(moeGgufTile(gpuFamilyClass(family), cores, f16) == MoeGgufTile::Staged,
+    MoeFormats f16 = q4k;
+    f16.experts.registerTakes = false;
+    require(selectMoe(plans.calibration(), shape, f16, 8, MoePhase::Decode).ggufTile == MoeGgufTile::Staged,
             "GGUF experts with an F16 weight took the register tile");
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const MoePlan plan = plans.moeDecode(staged, lanes);
+      const MoePlan plan = plans.moeDecode(shape, staged, lanes);
       require(plan.configuration().ggufTile == MoeGgufTile::Staged && plan.workspace().groupedSumsBytes == 0,
               "GGUF MoE plan of staged experts took the register tile");
-      covers(plans.moeDecodeWorkspacePerLane(staged), plan.workspace(), lanes, kMoeWorkspaceFields);
+      covers(plans.moeDecodeWorkspacePerLane(shape, staged), plan.workspace(), lanes, kMoeWorkspaceFields);
     }
     // Prefill: the register tile's 8 rows, or staged 8-row tiles while the
     // routes average at most one row per expert (32 rows of 8 of 256
-    // experts). The router's float tile follows Linear::ggufFloatTile and the
+    // experts). The router's float tile follows selectFloatTile and the
     // router's format (32 assumed cores: the neural accelerator from 321
     // rows of BF16 values, 449 of F32 values and 705 of a quantized format's
     // rows, never on Apple9).
     for (const auto [routerFormat, first] :
          {std::pair{uint32_t{GGUF_FMT_BF16}, 321U}, std::pair{QuantizedSegment::kFloat32, 449U},
           std::pair{uint32_t{GGUF_FMT_AF8G64}, 705U}}) {
-      MoeShape routed = shape;
-      routed.routerFormat = routerFormat;
-      const MoeWorkspace bound = plans.moePrefillWorkspace(routed, 2048);
+      MoeFormats routed = kFormats;
+      routed.router = routerFormat;
+      const MoeWorkspace bound = plans.moePrefillWorkspace(shape, routed, 2048);
       for (uint32_t rows : {1U, 8U, 17U, 32U, 33U, 100U, 256U, 257U, 320U, 321U, 448U, 449U, 704U, 705U, 2048U}) {
-        const MoePlan plan = plans.moePrefill(routed, rows);
+        const MoePlan plan = plans.moePrefill(shape, routed, rows);
         const uint32_t tileRows = expected == MoeGgufTile::Register || rows <= 32 ? 8 : 32;
         const FloatTile router = family != 9 && rows >= first ? FloatTile::NeuralAccelerator : FloatTile::Simdgroup;
         require(plan.configuration().ggufTile == expected && plan.tileRows() == tileRows &&
@@ -204,10 +207,10 @@ void ggufMoePlans() {
     // the staged 32-row tiles it never runs (26624).
     MoeWorkspace devicePlans;
     for (uint32_t rows = 1; rows <= 2048; ++rows) {
-      const MoeWorkspace workspace = plans.moePrefill(shape, rows).workspace();
+      const MoeWorkspace workspace = plans.moePrefill(shape, kFormats, rows).workspace();
       for (const auto field : kMoeWorkspaceFields) devicePlans.*field = std::max(devicePlans.*field, workspace.*field);
     }
-    require(plans.moePrefillWorkspace(shape, 2048) == devicePlans,
+    require(plans.moePrefillWorkspace(shape, kFormats, 2048) == devicePlans,
             "GGUF MoE prefill bound is not the bound of the device's plans");
   }
   // The register tile reads 8-row tiles only, and the kernels exist for
@@ -221,12 +224,32 @@ void ggufMoePlans() {
           "invalid MoE expert tile configuration", "a decode plan took 32-row tiles");
 }
 
+// A dense prefill tile's history splits follow the device's pages per split
+// (KernelCalibration.hpp): one per 64 pages on Apple9 GPUs of 10 cores or
+// fewer, one per 32 elsewhere. Qwen3.6-35B-A3B's attention: a 512-row chunk
+// after 4K tokens (144 pages) and a 64-row chunk after 32K (1026 pages).
+void prefillSplitsFollowTheDeviceRow() {
+  const kv::Layout layout{1, 2, 256};
+  struct Expected final {
+    uint32_t rows, history, small, other;
+  };
+  for (const auto [rows, history, small, other] : {Expected{512, 4096, 2, 4}, Expected{64, 32768, 16, 32}})
+    for (const auto [family, cores] : {std::pair{9U, 10U}, {9U, 1U}, {9U, 11U}, {9U, 40U}, {10U, 12U}, {10U, 32U}}) {
+      DeviceCapabilities capabilities = device(family);
+      capabilities.gpuCoreCount = cores;
+      const uint32_t splits = ExecutionPlans(capabilities).prefillAttention(rows, history, 16, layout).splits;
+      require(splits == (family == 9 && cores <= 10 ? small : other),
+              "a prefill attention plan of family " + std::to_string(family) + ", " + std::to_string(cores) +
+                  " cores took " + std::to_string(splits) + " splits");
+    }
+}
+
 // A device that reports no core count gets the plans of kAssumedGpuCores
 // cores, Linear and MoE alike.
 void unknownCoreCount() {
   for (uint32_t family : {9U, 10U}) {
     DeviceCapabilities assumed = device(family);
-    assumed.gpuCoreCount = kAssumedGpuCores;
+    assumed.gpuCoreCount = DeviceCapabilities::kAssumedGpuCores;
     const ExecutionPlans unknown(device(family)), planned(assumed);
     for (auto matrix : matrices)
       for (uint32_t lanes = 1; lanes <= 4; ++lanes)
@@ -236,8 +259,8 @@ void unknownCoreCount() {
                   "an unknown core count planned a decode projection for other than the assumed cores");
         }
     for (uint32_t lanes = 1; lanes <= 4; ++lanes)
-      require(unknown.moeDecode(routedShape, lanes).configuration() ==
-                  planned.moeDecode(routedShape, lanes).configuration(),
+      require(unknown.moeDecode(routedShape, kFormats, lanes).configuration() ==
+                  planned.moeDecode(routedShape, kFormats, lanes).configuration(),
               "an unknown core count planned a MoE decode step for other than the assumed cores");
   }
 }
@@ -258,7 +281,7 @@ void workspaceBounds() {
                   uint64_t{8} * kv::kVerifyMaximumSplits * 24 * 2 * 4,
           "verify workspace does not cover the maximum split count");
   // 65 tiles of 8 grouped rows per lane at every width.
-  const auto moe = plans.moeDecodeWorkspacePerLane(routedShape);
+  const auto moe = plans.moeDecodeWorkspacePerLane(routedShape, kFormats);
   require(moe.groupedInputBytes == 2129920 && moe.expertOutputBytes == 2129920 &&
               moe.expertIntermediateBytes == 532480 && moe.groupedRoutesBytes == 2080 &&
               moe.tileDescriptorsBytes == 520 && moe.tileCountBytes == 28,
@@ -286,15 +309,15 @@ void invalidLookupsAndContextEdges() {
           "invalid verify attention history vector", "a verify plan without a history per lane was accepted");
   rejects([&] { (void)plans.verifyAttention(1, 24, {}, std::span(histories).first(1)); },
           "no KV store kernel for layout", "a verify plan of an empty KV layout was accepted");
-  rejects([&] { (void)plans.prefillAttention(1, 24, {}); }, "no KV store kernel for layout",
+  rejects([&] { (void)plans.prefillAttention(1, 0, 24, {}); }, "no KV store kernel for layout",
           "a prefill plan of an empty KV layout was accepted");
   for (const uint32_t rows : {0U, UINT32_MAX})
     rejects([&] { (void)plans.prefillAttentionWorkspace(rows, 24, kvLayout); },
             "invalid attention workspace rows", "a prefill workspace of no rows or past the budget was accepted");
   for (const uint32_t lanes : {UINT32_MAX, 0U})
-    rejects([&] { (void)plans.moeDecode(routedShape, lanes); }, "invalid MoE decode width",
+    rejects([&] { (void)plans.moeDecode(routedShape, kFormats, lanes); }, "invalid MoE decode width",
             "a MoE decode of no lanes or past a batch was accepted");
-  rejects([&] { (void)plans.moePrefillWorkspace(routedShape, 0); }, "invalid MoE prefill rows",
+  rejects([&] { (void)plans.moePrefillWorkspace(routedShape, kFormats, 0); }, "invalid MoE prefill rows",
           "a MoE prefill workspace of no rows was accepted");
   rejects([&] { (void)plans.gateUpWorkspace({256, 32}); }, "invalid linear matrix",
           "a gate/up workspace of a partial 64-input span was accepted");
@@ -316,6 +339,7 @@ int main() {
     baselinePlans();
     ggufMoePlans();
     unknownCoreCount();
+    prefillSplitsFollowTheDeviceRow();
     workspaceBounds();
     invalidLookupsAndContextEdges();
     std::cout << "PASS execution plans: device policies, device MoE tiles, B1-B4 "
