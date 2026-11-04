@@ -14,6 +14,7 @@ import socket
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from functools import partial
 from http import HTTPStatus
@@ -176,12 +177,12 @@ class Route:
     request_id_header hold for its whole path, so every route on one path
     states the same ones: path_errors and _send read the first."""
 
-    # The FrontendHandler method that serves a request. A POST route's takes
-    # the request's body and deadline: it answers the request, or prepares
-    # the generation the request asks for and returns its job and the method
-    # that answers with the job's output. Another route's takes what its path
-    # pattern captures.
-    handler: str
+    # What serves a request, called with the FrontendHandler that reads it.
+    # A POST route's also takes the request's body and deadline: it answers
+    # the request, or prepares the generation the request asks for and
+    # returns its job and the function that answers with the job's output.
+    # Another route's takes what its path pattern captures.
+    handler: Callable
     # How the endpoint's API answers errors, on its path by any method.
     errors: ErrorDialect = OPENAI_ERRORS
     # Whether it answers without the API key: the chat page and the probes.
@@ -197,75 +198,6 @@ class Route:
     # too, a fresh request id: TypeSafe's SDK reads one on the routes it
     # calls.
     request_id_header: str | None = None
-
-
-_RESPONSE_PATH = re.compile(r"/v1/responses/(resp_[A-Za-z0-9_]+)")
-_MODEL_PATH = re.compile(r"/v1/models/(.*)", re.DOTALL)
-_TYPESAFE_REQUEST_ID = "x-typesafe-request-id"
-_PAGE = Route("_get_page", public=True)
-
-# Every endpoint, by its method and its path or path pattern.
-ROUTES = {
-    **{
-        ("GET", path): _PAGE
-        for path in ("/", "/index.html", "/favicon.ico", *CHAT_ASSETS)
-    },
-    ("GET", "/health"): Route("_get_health", public=True),
-    ("GET", "/ready"): Route("_get_ready", public=True),
-    ("GET", "/status"): Route("_get_status"),
-    ("GET", "/metrics"): Route("_get_metrics"),
-    ("GET", _RESPONSE_PATH): Route("_get_response"),
-    ("DELETE", _RESPONSE_PATH): Route("_delete_response"),
-    ("GET", "/v1/models"): Route("_get_models", request_id_header=_TYPESAFE_REQUEST_ID),
-    ("GET", _MODEL_PATH): Route("_get_model", request_id_header=_TYPESAFE_REQUEST_ID),
-    ("POST", "/v1/chat/completions"): Route("_post_chat_completions"),
-    ("POST", "/v1/chat/completions/count_tokens"): Route(
-        "_post_chat_count_tokens", prompt_only=True
-    ),
-    ("POST", "/v1/completions"): Route("_post_completions"),
-    ("POST", "/v1/responses"): Route("_post_responses"),
-    ("POST", "/v1/messages"): Route("_post_messages", ANTHROPIC_ERRORS),
-    ("POST", "/v1/messages/count_tokens"): Route(
-        "_post_count_tokens", ANTHROPIC_ERRORS, prompt_only=True
-    ),
-    ("POST", "/tokenize"): Route("_post_tokenize", prompt_only=True),
-    ("POST", "/apply-template"): Route("_post_apply_template", prompt_only=True),
-    ("POST", "/v1/judgments"): Route("_post_judgments"),
-    ("POST", "/v1/systemone"): Route(
-        "_post_systemone",
-        SYSTEMONE_ERRORS,
-        request_id_header=_TYPESAFE_REQUEST_ID,
-    ),
-    ("POST", "/v1/memory/release"): Route("_post_memory_release", fieldless=True),
-}
-
-
-def find_route(path, method=None):
-    """The route serving `method` on `path`, a route of any method when None,
-    and what its path pattern captures; (None, ()) when no route does. HEAD
-    is served by GET's route."""
-    if method == "HEAD":
-        method = "GET"
-    for (route_method, key), route in ROUTES.items():
-        if method not in (None, route_method):
-            continue
-        if isinstance(key, str):
-            if key == path:
-                return route, ()
-        elif match := key.fullmatch(path):
-            return route, match.groups()
-    return None, ()
-
-
-def path_errors(path):
-    """How every error on `path` is answered, whatever its method and
-    whether it arises before a handler runs or in one: as the API of its
-    route answers it, on Anthropic's other paths, those under /v1/messages,
-    as that API does, and elsewhere as OpenAI's."""
-    route, _ = find_route(path)
-    if route is not None:
-        return route.errors
-    return ANTHROPIC_ERRORS if path.startswith("/v1/messages/") else OPENAI_ERRORS
 
 
 @dataclass(slots=True)
@@ -376,7 +308,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if isinstance(error, OriginRefused):
                 self.server.refused_origins.report(error.origin)
             self.close_connection = True
-            self._safe_error(error, log=False)
+            self.safe_error(error, log=False)
             return False
         return True
 
@@ -390,9 +322,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self.request_version = self.protocol_version
         status = HTTPStatus(code)
         error_code = status.name.lower() if code >= 500 else "invalid_request_error"
-        self._safe_error(
-            APIError(code, message or status.phrase, error_code), log=False
-        )
+        self.safe_error(APIError(code, message or status.phrase, error_code), log=False)
 
     @property
     def app(self):
@@ -445,7 +375,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             data = json_codec.encode(payload)
         except json_codec.JSONEncodingError as error:
             log_unexpected(error)
-            self._safe_error(
+            self.safe_error(
                 APIError(500, "internal server error", "internal_server_error"),
                 log=False,
             )
@@ -456,7 +386,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         path = "".join(char if char.isprintable() else "?" for char in self.route)
         print_status(f"Error · {code} · {self.command} {path[:256]}", error=True)
 
-    def _safe_error(self, error, *, log=True):
+    def safe_error(self, error, *, log=True):
         """Answer with `error` as its path's API answers it, unless the
         response has begun."""
         if self.response_started:
@@ -575,14 +505,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
         """Serve a request of `method`, which carries no body, by its route."""
         route, captured = find_route(self.route, method)
         if route is None:
-            self._safe_error(APIError(404, "not found", "not_found"))
+            self.safe_error(APIError(404, "not found", "not_found"))
         else:
-            getattr(self, route.handler)(*captured)
+            route.handler(self, *captured)
 
     def _get_page(self):
         path = self.route
         if not self.server.webui:
-            self._safe_error(APIError(404, "not found", "not_found"))
+            self.safe_error(APIError(404, "not found", "not_found"))
         elif path == "/favicon.ico":
             self._send(200, FAVICON_SVG, "image/svg+xml")
         elif path in CHAT_ASSETS:
@@ -613,13 +543,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def _get_response(self, response_id):
         stored = self.app.response_store.get(response_id)
         if stored is None:
-            self._safe_error(APIError(404, "response not found", "not_found_error"))
+            self.safe_error(APIError(404, "response not found", "not_found_error"))
         else:
             self.send_json(200, stored.response)
 
     def _delete_response(self, response_id):
         if not self.app.response_store.delete(response_id):
-            self._safe_error(APIError(404, "response not found", "not_found_error"))
+            self.safe_error(APIError(404, "response not found", "not_found_error"))
             return
         self.send_json(
             200,
@@ -663,7 +593,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def _get_model(self, name):
         model = next((item for item in self._models() if item["id"] == name), None)
         if model is None:
-            self._safe_error(APIError(404, "model not found", "model_not_found"))
+            self.safe_error(APIError(404, "model not found", "model_not_found"))
         else:
             self.send_json(200, model)
 
@@ -671,11 +601,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
         started_at = time.monotonic()
         route, _ = find_route(self.route, "POST")
         if route is None:
-            self._safe_error(APIError(404, "not found", "not_found"))
+            self.safe_error(APIError(404, "not found", "not_found"))
             return
         refusal = None if route.prompt_only else self.app.backend.refusal()
         if refusal is not None:
-            self._safe_error(refusal, log=False)
+            self.safe_error(refusal, log=False)
             return
         # Hold one ingress slot through body parsing, preparation, and the
         # complete response. Slow uploads/readers cannot accumulate outside
@@ -684,7 +614,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             self.server.token_counts if route.prompt_only else self.server.requests
         )
         if not admission.acquire():
-            self._safe_error(
+            self.safe_error(
                 APIError(
                     503,
                     "frontend request capacity is exhausted",
@@ -704,17 +634,17 @@ class FrontendHandler(BaseHTTPRequestHandler):
         except TimeoutError:
             self._cancel_submitted()
             error = APIError(408, "HTTP I/O timed out", "request_timeout")
-            self._safe_error(error, log=self._submitted is None)
+            self.safe_error(error, log=self._submitted is None)
         except APIError as error:
             self._cancel_submitted()
             # The native outcome was already logged; a server-side failure
             # after submission must still reach the console.
-            self._safe_error(error, log=self._submitted is None or error.status >= 500)
+            self.safe_error(error, log=self._submitted is None or error.status >= 500)
         except Exception as error:
             self._cancel_submitted()
             log_unexpected(error)
             error = APIError(500, "internal server error", "internal_server_error")
-            self._safe_error(error, log=False)
+            self.safe_error(error, log=False)
         finally:
             if self._body_reservation is not None:
                 self._body_reservation.release()
@@ -728,8 +658,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _serve(self, route, started_at):
         """Read the request and serve it: answer it, or prepare the
-        generation it asks for and return its job and the method that answers
-        with the job's output."""
+        generation it asks for and return its job and the function that
+        answers with the job's output."""
         if route.fieldless and not self._unread_body:
             body = {}
         else:
@@ -740,8 +670,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             body = {key: value for key, value in body.items() if value is not None}
             if route.fieldless and body:
                 raise APIError(400, "this endpoint takes no fields")
-        serve = getattr(self, route.handler)
-        return serve(body, self.app.request_deadline(body, started_at))
+        return route.handler(self, body, self.app.request_deadline(body, started_at))
 
     def _generate(self, job, respond, started_at):
         """Submit a prepared generation and answer with its output. The
@@ -749,17 +678,22 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._body_reservation.retain_for(job)
         self._body_reservation = None
         job.latency = RequestLatency(self.app.latencies, started_at)
-        self._submit(job)
+        self.submit(job)
         respond(job)
 
-    def _submit(self, job):
+    def submit(self, job):
         """Submit `job` unless its deadline has passed or its client has
         left; from then on a failure cancels it."""
         remaining_request_time(job.deadline)
-        if self._client_disconnected():
+        if self.client_disconnected():
             raise ConnectionResetError("client disconnected before submission")
         self.app.backend.submit(job)
         self._submitted = job
+
+    def reserve_input(self, size):
+        """Reserve `size` more bytes of the request body budget for input the
+        request's preparation adds, such as the stored history it continues."""
+        self._body_reservation.grow(size)
 
     def _cancel_submitted(self):
         if self._submitted is not None:
@@ -790,7 +724,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def _post_responses(self, body, deadline):
         progress = _progress_flag(body)
         job = self.app.prepare_responses(
-            body, deadline=deadline, reserve_input=self._body_reservation.grow
+            body, deadline=deadline, reserve_input=self.reserve_input
         )
         job.flags |= progress
         if body.get("stream"):
@@ -834,9 +768,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _post_judgments(self, body, deadline):
         job, row = self.app.prepare_judgment(
-            body, deadline=deadline, disconnected=self._client_disconnected
+            body, deadline=deadline, disconnected=self.client_disconnected
         )
-        self._submit(job)
+        self.submit(job)
         result = self._await_done(job)
         self.send_json(
             200,
@@ -851,7 +785,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             return
         # An answer about the engine's state, not a failure: the console does
         # not log it.
-        self._safe_error(
+        self.safe_error(
             APIError(
                 409,
                 "the engine is serving requests or restoring its weights; it "
@@ -865,7 +799,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         answers = {}
         input_tokens = 0
         entries = self.app.prepare_systemone(
-            body, deadline=deadline, disconnected=self._client_disconnected
+            body, deadline=deadline, disconnected=self.client_disconnected
         )
         for qid, spec, job in entries:
             if job is None:
@@ -873,7 +807,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 continue
             # One admitted job per HTTP request preserves the existing
             # queue bound and lets later questions reuse the state prefix.
-            self._submit(job)
+            self.submit(job)
             result = self._await_done(job)
             input_tokens += result.prompt_tokens
             answers[qid] = judgments.systemone_answer(
@@ -890,13 +824,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _await_done(self, job):
         """The result of a score job, which emits only start and done."""
-        while (event := self._next_event(job))[0] != "done":
+        while (event := self.next_event(job))[0] != "done":
             pass
         return event[1]
 
-    def _next_event(self, job, on_idle=None):
+    def next_event(self, job, on_idle=None):
         while True:
-            if self._client_disconnected():
+            if self.client_disconnected():
                 self.app.backend.cancel(job)
                 raise ConnectionResetError
             remaining = job.deadline - time.monotonic()
@@ -922,7 +856,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if event is not None:
                 return event
 
-    def _client_disconnected(self):
+    def client_disconnected(self):
         # A poll object holds no descriptor: running out of descriptors
         # must not read as a disconnect.
         poller = select.poll()
@@ -1005,7 +939,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 publish([(field, text)])
 
         while result is None:
-            kind, value = self._next_event(job, on_idle)
+            kind, value = self.next_event(job, on_idle)
             if kind == "start" and on_start is not None:
                 on_start()
             elif kind == "text":
@@ -1102,6 +1036,83 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 )
             except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 pass
+
+
+_RESPONSE_PATH = re.compile(r"/v1/responses/(resp_[A-Za-z0-9_]+)")
+_MODEL_PATH = re.compile(r"/v1/models/(.*)", re.DOTALL)
+_TYPESAFE_REQUEST_ID = "x-typesafe-request-id"
+_PAGE = Route(FrontendHandler._get_page, public=True)
+
+# Every endpoint, by its method and its path or path pattern.
+ROUTES = {
+    **{
+        ("GET", path): _PAGE
+        for path in ("/", "/index.html", "/favicon.ico", *CHAT_ASSETS)
+    },
+    ("GET", "/health"): Route(FrontendHandler._get_health, public=True),
+    ("GET", "/ready"): Route(FrontendHandler._get_ready, public=True),
+    ("GET", "/status"): Route(FrontendHandler._get_status),
+    ("GET", "/metrics"): Route(FrontendHandler._get_metrics),
+    ("GET", _RESPONSE_PATH): Route(FrontendHandler._get_response),
+    ("DELETE", _RESPONSE_PATH): Route(FrontendHandler._delete_response),
+    ("GET", "/v1/models"): Route(
+        FrontendHandler._get_models, request_id_header=_TYPESAFE_REQUEST_ID
+    ),
+    ("GET", _MODEL_PATH): Route(
+        FrontendHandler._get_model, request_id_header=_TYPESAFE_REQUEST_ID
+    ),
+    ("POST", "/v1/chat/completions"): Route(FrontendHandler._post_chat_completions),
+    ("POST", "/v1/chat/completions/count_tokens"): Route(
+        FrontendHandler._post_chat_count_tokens, prompt_only=True
+    ),
+    ("POST", "/v1/completions"): Route(FrontendHandler._post_completions),
+    ("POST", "/v1/responses"): Route(FrontendHandler._post_responses),
+    ("POST", "/v1/messages"): Route(FrontendHandler._post_messages, ANTHROPIC_ERRORS),
+    ("POST", "/v1/messages/count_tokens"): Route(
+        FrontendHandler._post_count_tokens, ANTHROPIC_ERRORS, prompt_only=True
+    ),
+    ("POST", "/tokenize"): Route(FrontendHandler._post_tokenize, prompt_only=True),
+    ("POST", "/apply-template"): Route(
+        FrontendHandler._post_apply_template, prompt_only=True
+    ),
+    ("POST", "/v1/judgments"): Route(FrontendHandler._post_judgments),
+    ("POST", "/v1/systemone"): Route(
+        FrontendHandler._post_systemone,
+        SYSTEMONE_ERRORS,
+        request_id_header=_TYPESAFE_REQUEST_ID,
+    ),
+    ("POST", "/v1/memory/release"): Route(
+        FrontendHandler._post_memory_release, fieldless=True
+    ),
+}
+
+
+def find_route(path, method=None):
+    """The route serving `method` on `path`, a route of any method when None,
+    and what its path pattern captures; (None, ()) when no route does. HEAD
+    is served by GET's route."""
+    if method == "HEAD":
+        method = "GET"
+    for (route_method, key), route in ROUTES.items():
+        if method not in (None, route_method):
+            continue
+        if isinstance(key, str):
+            if key == path:
+                return route, ()
+        elif match := key.fullmatch(path):
+            return route, match.groups()
+    return None, ()
+
+
+def path_errors(path):
+    """How every error on `path` is answered, whatever its method and
+    whether it arises before a handler runs or in one: as the API of its
+    route answers it, on Anthropic's other paths, those under /v1/messages,
+    as that API does, and elsewhere as OpenAI's."""
+    route, _ = find_route(path)
+    if route is not None:
+        return route.errors
+    return ANTHROPIC_ERRORS if path.startswith("/v1/messages/") else OPENAI_ERRORS
 
 
 class FrontendServer(HTTPServer):

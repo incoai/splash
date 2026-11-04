@@ -144,7 +144,7 @@ class StreamKeepaliveTests(HarnessTestCase):
         handler.wfile = io.BytesIO()
         handler._last_sse_write = 0.0
         handler.response_started = False
-        handler._client_disconnected = lambda: False
+        handler.client_disconnected = lambda: False
         handler.send_response = mock.Mock()
         handler.send_header = mock.Mock()
         handler.end_headers = mock.Mock()
@@ -233,7 +233,7 @@ class StreamKeepaliveTests(HarnessTestCase):
         handler.wfile = io.BytesIO()
         handler._last_sse_write = 0.0
         handler.response_started = True
-        handler._client_disconnected = lambda: False
+        handler.client_disconnected = lambda: False
         clock = [0.0]
         snapshots = []
         fragments = [
@@ -282,7 +282,7 @@ class StreamKeepaliveTests(HarnessTestCase):
         handler = object.__new__(api.FrontendHandler)
         handler.wfile = io.BytesIO()
         handler._last_sse_write = 0.0
-        handler._client_disconnected = lambda: False
+        handler.client_disconnected = lambda: False
         clock = [0.0]
         job = SimpleNamespace(
             deadline=100, events=SimpleNamespace(get=lambda **_: ("text", "x"))
@@ -291,7 +291,7 @@ class StreamKeepaliveTests(HarnessTestCase):
         with mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]):
             for index in range(12):
                 clock[0] += 0.5
-                handler._next_event(job, heartbeat)
+                handler.next_event(job, heartbeat)
                 if index % 2:
                     handler.event_sse("event", {"text": "x"})
                 else:
@@ -300,7 +300,7 @@ class StreamKeepaliveTests(HarnessTestCase):
 
     def test_result_that_lands_at_the_deadline_is_answered(self):
         handler = object.__new__(api.FrontendHandler)
-        handler._client_disconnected = lambda: False
+        handler.client_disconnected = lambda: False
         handler.server = mock.Mock()
         clock = [0.0]
 
@@ -310,7 +310,7 @@ class StreamKeepaliveTests(HarnessTestCase):
 
         job = SimpleNamespace(deadline=1.0, events=SimpleNamespace(get=finish))
         with mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]):
-            self.assertEqual(handler._next_event(job), ("done", "result"))
+            self.assertEqual(handler.next_event(job), ("done", "result"))
         handler.server.app.backend.cancel.assert_not_called()
 
     def test_anthropic_stream_pings_during_prefill_and_decode_waits(self):
