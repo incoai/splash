@@ -21,6 +21,7 @@ from dev.tests.server_fixtures import (
     responses_body,
 )
 from server import server as api
+from server.dialects import responses as responses_dialect
 
 
 class EndFailTokenizer(FakeTokenizer):
@@ -53,7 +54,7 @@ class RequestFailureTests(HarnessTestCase):
         blocking = Plan([[4]], block=True)
         runtime = FakeRuntime(blocking)
         harness = self.harness(runtime)
-        with mock.patch.object(api.FrontendHandler, "_sse", side_effect=TimeoutError):
+        with mock.patch.object(api.FrontendHandler, "sse", side_effect=TimeoutError):
             status, _, _ = harness.request(
                 "POST",
                 "/v1/chat/completions",
@@ -237,8 +238,8 @@ class RequestFailureTests(HarnessTestCase):
             "could not allocate KV target: engine memory budget exceeded "
             "(additional_pages=12, free_pages=0); the request does not fit in the "
             "memory this server may use, even after every cached prefix was "
-            "evicted: restart the server with a larger --max-memory or a smaller "
-            "--max-context"
+            "evicted: restart the server with a smaller --max-context, or with a "
+            "larger --max-memory where one lowered it"
         )
         records = []
         capacity = [
@@ -369,7 +370,7 @@ class RequestFailureTests(HarnessTestCase):
                 harness.backend, "cancel", wraps=harness.backend.cancel
             ) as cancel,
             mock.patch.object(
-                api.FrontendHandler, "_complete", side_effect=RuntimeError("boom")
+                api.FrontendHandler, "collect", side_effect=RuntimeError("boom")
             ),
             mock.patch.object(api.sys, "stderr", stderr),
         ):
@@ -379,11 +380,12 @@ class RequestFailureTests(HarnessTestCase):
         self.assertEqual(status, 500, payload)
         self.assertEqual(json.loads(payload)["error"]["code"], "internal_server_error")
         cancel.assert_called_once()
-        # Where the server last had the error, and not its message.
+        # Where the server, in a subpackage too, last had the error, and not
+        # its message.
         self.assertRegex(
             stderr.getvalue(),
             r"^\d{2}:\d{2}:\d{2} Error · internal_server_error · RuntimeError · "
-            r"server/server\.py:\d+\n$",
+            r"server/dialects/openai\.py:\d+\n$",
         )
         self.assertNotIn("boom", stderr.getvalue())
 
@@ -401,7 +403,7 @@ class RequestFailureTests(HarnessTestCase):
             for path, body, target, name in (
                 ("/v1/chat/completions", chat_body(), "app", "prepare"),
                 ("/v1/systemone", systemone, "app", "prepare_systemone"),
-                ("/v1/chat/completions", chat_body(), "handler", "_complete"),
+                ("/v1/chat/completions", chat_body(), "handler", "collect"),
             ):
                 with self.subTest(error=type(error).__name__, path=path, name=name):
                     harness = self.harness(FakeRuntime(Plan([[4]], block=True)))
@@ -433,7 +435,9 @@ class RequestFailureTests(HarnessTestCase):
             mock.patch.object(
                 harness.backend, "cancel", wraps=harness.backend.cancel
             ) as cancel,
-            mock.patch.object(api, "responses_item", side_effect=RuntimeError("boom")),
+            mock.patch.object(
+                responses_dialect, "responses_item", side_effect=RuntimeError("boom")
+            ),
             mock.patch.object(api.sys, "stderr", stderr),
         ):
             status, _, payload = harness.request(
@@ -452,7 +456,7 @@ class RequestFailureTests(HarnessTestCase):
         self.assertRegex(
             stderr.getvalue(),
             r"^\d{2}:\d{2}:\d{2} Error · internal_server_error · RuntimeError · "
-            r"server/server\.py:\d+\n$",
+            r"server/dialects/responses\.py:\d+\n$",
         )
 
     def test_streamer_end_error_does_not_kill_backend(self):

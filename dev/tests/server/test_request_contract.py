@@ -1,5 +1,6 @@
 import array
 import base64
+import dataclasses
 import errno
 import http.client
 import json
@@ -8,7 +9,6 @@ import socket
 import struct
 import sys
 import unittest
-from contextlib import nullcontext
 from functools import partial
 from unittest import mock
 
@@ -230,8 +230,6 @@ class RequestContractTests(HarnessTestCase):
             normalize_messages(
                 [{"role": "user", "content": "Hi"}, *messages],
                 vision=True,
-                deadline=FOREVER,
-                without_slot=nullcontext,
             )[1]["tool_calls"][0]["id"],
             "call_42",
         )
@@ -266,8 +264,6 @@ class RequestContractTests(HarnessTestCase):
                 {"role": "user", "content": "why?"},
             ],
             vision=True,
-            deadline=FOREVER,
-            without_slot=nullcontext,
         )
         self.assertEqual(
             normalized[0]["content"],
@@ -297,8 +293,6 @@ class RequestContractTests(HarnessTestCase):
                             {"role": role, "content": [{"type": kind, "text": "x"}]},
                         ],
                         vision=True,
-                        deadline=FOREVER,
-                        without_slot=nullcontext,
                     )
                 self.assertEqual(caught.exception.status, 400)
 
@@ -754,7 +748,9 @@ class RequestContractTests(HarnessTestCase):
         factory = FakeFactory()
         engine = runtime.MultiplexedRuntime(process_factory=factory, eager_start=True)
         self.addCleanup(engine.close)
-        engine._cancel_grace_seconds = 0.02
+        engine._thresholds = dataclasses.replace(
+            engine._thresholds, cancel_acknowledgement=0.02
+        )
         call = engine.submit(request(10))
         call.cancel()
         with self.assertRaises(runtime.EngineUnhealthy):

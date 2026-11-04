@@ -27,7 +27,7 @@ class PdfProtocolTests(unittest.TestCase):
         }
 
     def chat(self, file=None, deadline=FOREVER):
-        return api_shapes.normalize_messages(
+        return self.render(
             [
                 {
                     "role": "user",
@@ -36,7 +36,13 @@ class PdfProtocolTests(unittest.TestCase):
                     ],
                 }
             ],
-            vision=True,
+            deadline,
+        )
+
+    @staticmethod
+    def render(messages, deadline=FOREVER):
+        return documents.render_files(
+            api_shapes.normalize_messages(messages, vision=True),
             deadline=deadline,
             without_slot=nullcontext,
         )
@@ -58,12 +64,7 @@ class PdfProtocolTests(unittest.TestCase):
                 }
             ],
         )
-        actual = api_shapes.normalize_messages(
-            response["messages"],
-            vision=True,
-            deadline=FOREVER,
-            without_slot=nullcontext,
-        )[0]["content"]
+        actual = self.render(response["messages"])[0]["content"]
         self.assertEqual(
             actual,
             [
@@ -226,6 +227,28 @@ class PdfProtocolTests(unittest.TestCase):
             response["messages"][0]["content"], [{"type": "file", "file": self.file}]
         )
 
+    def test_a_malformed_request_is_refused_before_its_pdf_renders(self):
+        # A render holds the one PDF worker for up to 30 s; a request that
+        # fails a cheap check must not wait for it.
+        harness = Harness(
+            FakeRuntime(), tokenizer=ImagePadTokenizer(), max_context=65536
+        )
+        self.addCleanup(harness.close)
+        body = {
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": [{"type": "file", "file": self.file}]}
+            ],
+            "tools": "read",
+        }
+        with mock.patch.object(
+            documents, "pdf_content", wraps=documents.pdf_content
+        ) as render:
+            status, _, payload = harness.request("POST", "/v1/chat/completions", body)
+        render.assert_not_called()
+        self.assertEqual(status, 400, payload)
+        self.assertIn("tools", json.loads(payload)["error"]["message"])
+
     def test_user_and_tool_files_share_one_request_budget(self):
         budget = documents.DocumentBudget(deadline=FOREVER)
         documents.file_content(self.file, budget=budget)
@@ -236,11 +259,9 @@ class PdfProtocolTests(unittest.TestCase):
                 deadline=FOREVER, remaining_bytes=remaining_bytes
             )
             with mock.patch.object(
-                api_shapes, "DocumentBudget", return_value=request_budget
+                documents, "DocumentBudget", return_value=request_budget
             ):
-                api_shapes.normalize_messages(
-                    messages, vision=True, deadline=FOREVER, without_slot=nullcontext
-                )
+                self.render(messages)
 
         for dialect in ("chat", "responses"):
             with self.subTest(dialect=dialect):
@@ -300,11 +321,8 @@ class PdfProtocolTests(unittest.TestCase):
         ):
             for file in values:
                 with self.subTest(file=file), self.assertRaises(APIError):
-                    api_shapes.normalize_messages(
-                        [{"role": "user", "content": [{"type": "file", "file": file}]}],
-                        vision=True,
-                        deadline=FOREVER,
-                        without_slot=nullcontext,
+                    self.render(
+                        [{"role": "user", "content": [{"type": "file", "file": file}]}]
                     )
 
     def test_input_bound_checked_before_decode(self):

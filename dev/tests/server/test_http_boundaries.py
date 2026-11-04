@@ -18,8 +18,8 @@ from dev.tests.server_fixtures import (
     chat_body,
     make_frontend,
 )
+from server import api_shapes, crash_trace, http_security, images, origins
 from server import backend as backend_api
-from server import crash_trace, http_security, images, origins
 from server import server as api
 from server.errors import APIError
 
@@ -362,14 +362,14 @@ class HttpBoundaryTests(HarnessTestCase):
         self.assertEqual((first_job.request_id, second_job.request_id), (1, 1))
         self.assertNotEqual(first_job.public_id, second_job.public_id)
         result = backend_api.NativeResult("stop", 2, 1, 1, 1, 1)
-        first_id = api.completion_response(
+        first_id = api_shapes.completion_response(
             "test-model",
             first_job,
             result,
             {"role": "assistant", "content": "x"},
             False,
         )["id"]
-        second_id = api.completion_response(
+        second_id = api_shapes.completion_response(
             "test-model",
             second_job,
             result,
@@ -378,11 +378,12 @@ class HttpBoundaryTests(HarnessTestCase):
         )["id"]
         self.assertNotEqual(first_id, second_id)
         self.assertEqual(
-            api.stream_chunk("test-model", first_job.public_id, 1, {})["id"], first_id
+            api_shapes.stream_chunk("test-model", first_job.public_id, 1, {})["id"],
+            first_id,
         )
         first_job.created_at = 123
         with mock.patch.object(api.time, "time", return_value=999):
-            response = api.responses_response(
+            response = api_shapes.responses_response(
                 "test-model", first_job, "in_progress", []
             )
         self.assertEqual(response["created_at"], 123)

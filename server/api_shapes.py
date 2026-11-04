@@ -6,15 +6,12 @@ import json
 
 from . import json_codec
 from . import protocol as wire
-from .documents import DocumentBudget, document_parts, file_content
+from .documents import checked_file, document_parts
 from .errors import APIError
 from .metrics import timings_dict, usage_dict
 from .tool_schema import TAG_NAME_RULE, is_tag_name
 
-IMAGE_PAD_TOKEN = "<|image_pad|>"
-VISION_UNAVAILABLE = (
-    "this model is serving without vision (started with --language-only)"
-)
+VISION_UNAVAILABLE = "this model is serving without vision"
 
 
 def _field(value, key, default):
@@ -71,13 +68,14 @@ def _require_vision(modality, vision):
         raise APIError(400, f"{modality} input is not supported: {VISION_UNAVAILABLE}")
 
 
-def _user_content(content, document_budget, vision):
+def _user_content(content, vision):
     """Text for plain user content; a canonical parts list when it carries
-    images, so the chat template places each image where the author put it.
+    images or PDFs, so the chat template places each where the author put it.
 
     The one place media is accepted or rejected: every API shape converts its
     image and PDF parts to image_url and file parts that reach this point
-    before anything is decoded or rendered."""
+    before anything is decoded or rendered (documents.render_files renders
+    the file parts once the whole request is checked)."""
     if not isinstance(content, list):
         return _text_content(content)
     parts = []
@@ -94,7 +92,8 @@ def _user_content(content, document_budget, vision):
             parts.append({"type": "text", "text": _part_text(part)})
         elif kind == "file":
             _require_vision("PDF", vision)
-            parts.extend(file_content(part.get("file"), budget=document_budget))
+            data = checked_file(part.get("file"))
+            parts.append({"type": "file", "file": {"file_data": data}})
         elif kind in ("video", "video_url", "input_audio"):
             raise APIError(400, f"{kind} content is not supported")
         else:
@@ -119,11 +118,9 @@ def _call_arguments(arguments):
     return arguments if isinstance(arguments, dict) else json_codec.dumps(arguments)
 
 
-def normalize_messages(messages, *, vision, deadline, without_slot):
-    """`messages` checked and in canonical form, each PDF rendered to its
-    pages under `without_slot`, which gives a request in preparation its
-    slot back meanwhile."""
-    document_budget = DocumentBudget(deadline=deadline, without_slot=without_slot)
+def normalize_messages(messages, *, vision):
+    """`messages` checked and in canonical form, each PDF a file part of its
+    checked data, not yet rendered."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "messages must be a non-empty array")
     normalized = []
@@ -149,7 +146,7 @@ def normalize_messages(messages, *, vision, deadline, without_slot):
         content = message.get("content")
         item = {
             "role": role,
-            "content": _user_content(content, document_budget, vision)
+            "content": _user_content(content, vision)
             if role in ("user", "tool")
             else _text_content(content),
         }
@@ -483,8 +480,6 @@ def normalize_responses_tools(tools):
         if isinstance(tool, dict) and tool.get("type") == "custom":
             function = _custom_function(tool)
             name = function["function"]["name"]
-            if name in namespaces:
-                raise APIError(400, f"duplicate tool name: {name}")
             namespaces[name] = (CUSTOM_TOOL, name)
             output.append(function)
             continue
@@ -497,8 +492,6 @@ def normalize_responses_tools(tools):
                     raise APIError(400, "only function namespace tools are supported")
                 name = child.get("name")
                 alias = _namespace_alias(namespace, name)
-                if alias in namespaces:
-                    raise APIError(400, f"duplicate tool name: {alias}")
                 namespaces[alias] = (namespace, name)
                 output.append(_response_function(child, alias))
             continue

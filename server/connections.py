@@ -165,23 +165,20 @@ class WaitingConnections:
     thread: ones given a slot, until the heads of their requests arrive, and
     ones answered without their requests read, until their clients close.
 
-    One given a slot is looked at as it is handed over and again each time
-    its client sends more, which kqueue reports once per arrival; what the
-    client sent is left unread, for the connection's thread to read. Once it
-    is _ready, it keeps its slot (`slots.arrived`) and goes to
-    `dispatch(connection, address)`. One not ready by the deadline it was
-    given at its accept is closed without a response; one that gives its
-    slot away comes back here answered.
+    One given a slot is looked at, left unread for its thread, as it is
+    handed over and on each arrival kqueue reports. Once _ready, it keeps its
+    slot (`slots.arrived`) and goes to `dispatch(connection, address)`; one
+    not ready by its accept deadline is closed without a response; one that
+    gives its slot away comes back here answered.
 
-    Closing a connection with request bytes unread resets it, and the reset
-    can destroy the answer before the client reads it, as it does when the
-    client sends its request only after the close. An answered one is
-    half-closed instead; what its client still sends is read and dropped,
-    and it is closed once the client has closed or `linger` seconds after
-    its answer. At most `capacity` linger at once: one more takes the place
-    of the longest lingering, whose client has had the longest to read its
-    answer. At most `capacity` more wait for the thread to take them; any
-    beyond them are closed at once.
+    Closing a connection with request bytes unread resets it, which can
+    destroy the answer before the client reads it. An answered one is
+    half-closed instead, what its client still sends is dropped, and it is
+    closed once the client has closed or `linger` seconds after its answer.
+    At most `capacity` linger at once, a new one replacing the longest
+    lingering, whose client has had the longest to read its answer; at most
+    `capacity` more wait for this thread to take them; any beyond are closed
+    at once.
     """
 
     # The most events the thread takes at once.
@@ -360,23 +357,21 @@ class ConnectionSlots:
 
     A connection waits for its request without a thread, held by `waiting`,
     until the head of its request has arrived; it then keeps its slot, and
-    one of `workers`, a thread per slot started with the server, reads and
-    serves the request with `serve(connection, address)`. No thread starts
-    while connections arrive: they are taken as fast as they arrive, before
-    the kernel's queue overflows, and one whose client sends nothing, or
-    only part of a head, ties up no thread.
+    one of `workers`, a thread per slot started with the server, serves it
+    with `serve(connection, address)`. No thread starts while connections
+    arrive, so they are taken before the kernel's queue overflows, and a
+    client that sends nothing, or part of a head, ties up no thread.
 
-    One whose request's head has yet to arrive, or that drains an upload
-    refused unread, gives its slot to a new connection when no slot is free,
-    the longest waiting first, so stalled connections, however many and from
-    however many addresses, cannot keep others out. When every slot has a
-    request whose head has arrived, whether or not the waiting thread has
-    looked at it yet, the new connection is refused. One that gives way
-    awaiting its request gets the 503 of a connection refused at the accept,
-    as its request may be on its way, and is closed as a refused one is,
-    lingering, among at most `refused_capacity`, for up to `linger` seconds.
-    One draining a refused upload has its response already: it is shut
-    down, for its thread to see the end of its input.
+    When no slot is free, one still awaiting its head, or draining an upload
+    refused unread, gives its slot to the new connection, the longest
+    waiting first, so stalled connections, however many and from however
+    many addresses, cannot keep others out; when every slot has a request
+    whose head has arrived (looked at yet or not), the new connection is
+    refused. One that gives way awaiting its request gets the 503 of a
+    refused connection, as its request may be on its way, and lingers as
+    one, among at most `refused_capacity`, for up to `linger` seconds; one
+    draining a refused upload, already answered, is shut down for its thread
+    to see the end of its input.
     """
 
     # What a connection with a slot is doing.

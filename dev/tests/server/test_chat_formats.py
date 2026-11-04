@@ -107,11 +107,18 @@ def flint_format(tokenizer):
     ids = tokenizer.convert_tokens_to_ids
     return replace(
         FLINT,
-        vocabulary=len(tokenizer),
-        stop_tokens=tuple((text, ids(text)) for text, _ in FLINT.stop_tokens),
         think_end_id=ids("</think>"),
         think_start_id=ids("<think>"),
         call_open_id=ids("<tool_call>"),
+    )
+
+
+def flint_ready(tokenizer):
+    """What an engine serving Flint over `tokenizer`'s token IDs announces:
+    its vocabulary and the IDs of Flint's stop texts."""
+    ids = tokenizer.convert_tokens_to_ids
+    return wire.ReadyEvent(
+        4, 4096, False, len(tokenizer), 9, tuple(map(ids, FLINT.stop_tokens))
     )
 
 
@@ -351,7 +358,8 @@ class GlmGrammarTests(unittest.TestCase):
     def setUpClass(cls):
         cls.tokenizer = flint_tokenizer()
         cls.chat_format = flint_format(cls.tokenizer)
-        cls.factory = constraints.ConstraintFactory(cls.tokenizer, cls.chat_format)
+        cls.ready = flint_ready(cls.tokenizer)
+        cls.factory = constraints.ConstraintFactory(cls.tokenizer, cls.ready)
 
     def policy(self, choice="auto", parallel=True, strict=False):
         tools = [
@@ -455,10 +463,10 @@ class GlmGrammarTests(unittest.TestCase):
         grammar = tool_schema.tool_grammar(
             self.policy(), False, chat_format=self.chat_format
         )
-        for stop, token in self.chat_format.stop_tokens:
+        for stop, token in zip(self.chat_format.stop_tokens, self.ready.stop_token_ids):
             with self.subTest(stop=stop):
                 constraint = self.factory.create(grammar)
-                self.assertEqual(constraint.eos_tokens, self.chat_format.stop_ids)
+                self.assertEqual(constraint.eos_tokens, self.ready.stop_token_ids)
                 constraint.commit(
                     self.tokenizer.encode("Done.", add_special_tokens=False)
                 )
@@ -539,21 +547,60 @@ class FlintTokenizerContractTests(unittest.TestCase):
                         ),
                     )
         with self.assertRaisesRegex(
-            fixtures.engine_runtime.EngineUnhealthy, "vocabulary does not fit"
+            fixtures.engine_runtime.EngineUnhealthy, "stop text '<\\|user\\|>x'"
         ):
             constraints.validate_tokenizer(
-                tokenizer, replace(chat_format, vocabulary=len(tokenizer) - 1)
+                tokenizer,
+                replace(chat_format, stop_tokens=("<|end_of_text|>", "<|user|>x")),
             )
+
+    def test_flint_s_tokenizer_is_checked_against_the_engines_ready(self):
+        """Once the engine is Ready: the tokenizer fits its vocabulary, its
+        stop texts encode as exactly the engine's stop tokens, its EOS is one
+        of them, and an engine serving images needs the template's one-token
+        image placeholder, which Flint's has not."""
+        tokenizer = flint_tokenizer()
+        chat_format = flint_format(tokenizer)
+        ready = flint_ready(tokenizer)
+        constraints.check_capabilities(tokenizer, chat_format, ready)
+        vision = replace(ready, vision=True)
+        for changed, refusal, served_format in (
+            (
+                replace(ready, vocabulary_size=len(tokenizer) - 1),
+                "does not fit",
+                chat_format,
+            ),
+            (
+                replace(ready, stop_token_ids=ready.stop_token_ids[1:]),
+                "stops at",
+                chat_format,
+            ),
+            (
+                replace(ready, stop_token_ids=(*ready.stop_token_ids[:-1], 0)),
+                "stops at",
+                chat_format,
+            ),
+            (vision, "no image placeholder", chat_format),
+            (
+                vision,
+                "image placeholder '<\\|user\\|>x'",
+                replace(chat_format, image_pad="<|user|>x"),
+            ),
+        ):
+            with self.subTest(refusal=refusal, ready=changed):
+                with self.assertRaisesRegex(
+                    fixtures.engine_runtime.EngineUnhealthy, refusal
+                ):
+                    constraints.check_capabilities(tokenizer, served_format, changed)
 
     def test_the_real_ids_are_flint_s(self):
         self.assertEqual(
+            (FLINT.stop_tokens, FLINT.think_start_id, FLINT.think_end_id),
             (
-                FLINT.vocabulary,
-                FLINT.stop_ids,
-                FLINT.think_start_id,
-                FLINT.think_end_id,
+                ("<|end_of_text|>", "<|user|>", "<|observation|>", "<|developer|>"),
+                150006,
+                150007,
             ),
-            (150144, (150001, 150003, 150005, 150018), 150006, 150007),
         )
         self.assertEqual((FLINT.call_open_id, FLINT.call_syntax), (150010, GLM_ARGS))
         self.assertFalse(FLINT.calls_end_reasoning)
@@ -690,7 +737,9 @@ class FlintPromptTests(unittest.TestCase):
             ]
         )
         backend.post_processor = processors.ByteLevel(trim_offsets=False)
-        cache = PromptTokenizer(tokenizer, FLINT.message_boundary)
+        cache = PromptTokenizer(
+            tokenizer, FLINT.message_boundary, fixtures.NATIVE_CONTEXT
+        )
         self.assertTrue(cache.enabled)
         first = "<|user|>" + "Paris 12345 " * 400 + "<|assistant|>"
         later = first + "Sunny.<|user|>And Rome?<|assistant|>"
@@ -825,7 +874,7 @@ class ServedFamilyTests(unittest.TestCase):
 
     def main(self, family):
         runtime = mock.Mock()
-        runtime.readiness = wire.ReadyEvent(4, 131072, False)
+        runtime.capabilities = fixtures.engine_ready(131072)
         tokenizer = object()
         with (
             mock.patch.object(api, "parse_args", return_value=fixtures.main_args()),
@@ -835,6 +884,8 @@ class ServedFamilyTests(unittest.TestCase):
                 api.AutoTokenizer, "from_pretrained", return_value=tokenizer
             ),
             mock.patch.object(api, "validate_tokenizer") as validate,
+            mock.patch.object(api, "check_capabilities") as check,
+            mock.patch.object(api, "thinking_end_tokens", return_value=None),
             mock.patch.object(api, "ChatTemplates"),
             mock.patch.object(
                 api.engine_runtime, "MultiplexedRuntime", return_value=runtime
@@ -855,6 +906,7 @@ class ServedFamilyTests(unittest.TestCase):
         return SimpleNamespace(
             tokenizer=tokenizer,
             validate=validate,
+            check=check,
             factory_type=factory_type,
             app_type=app_type,
             runtime_type=runtime_type,
@@ -868,8 +920,11 @@ class ServedFamilyTests(unittest.TestCase):
                 started.validate.assert_called_once_with(
                     started.tokenizer, family.chat_format
                 )
+                started.check.assert_called_once_with(
+                    started.tokenizer, family.chat_format, fixtures.engine_ready(131072)
+                )
                 started.factory_type.assert_called_once_with(
-                    started.tokenizer, family.chat_format
+                    started.tokenizer, fixtures.engine_ready(131072)
                 )
                 self.assertIs(
                     started.app_type.call_args.kwargs["chat_format"], family.chat_format

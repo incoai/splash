@@ -3,11 +3,11 @@ how its model frames reasoning and lays out tool calls, which the server
 reads its output by and constrains it to, and the tokens it shares with the
 engine and the tokenizer.
 
-A format's token IDs are the engine's: the vocabulary and stop tokens of the
-family's target layout (runtime/model/), and the tokens its tokenizer must
+The vocabulary and stop tokens come from the engine's Ready; a format names
+the texts its tokenizer encodes as those stop tokens, and the tokens it must
 encode the template's tags as, which startup checks
-(constraints.validate_tokenizer). It imports only the standard library, as
-the installer reads it through families.py."""
+(constraints.validate_tokenizer, check_capabilities). It imports only the
+standard library, as the installer reads it through families.py."""
 
 from dataclasses import dataclass
 
@@ -107,13 +107,9 @@ GLM_ARGS = ToolCallSyntax(
 class ChatFormat:
     """What the server reads, writes and checks in a family's tokens."""
 
-    # The model's vocabulary, the rows of its logits that a constraint's
-    # masks cover: its target layout's vocabularySize, which may exceed its
-    # tokenizer's.
-    vocabulary: int
-    # The engine's stop tokens (its target layout's stopTokens), each with the
-    # text its tokenizer encodes as that token; the tokenizer's EOS is one.
-    stop_tokens: tuple[tuple[str, int], ...]
+    # The texts its tokenizer encodes as the engine's stop tokens (Ready's
+    # stop_token_ids), one token each; the tokenizer's EOS is one of them.
+    stop_tokens: tuple[str, ...]
     # The token of THINK_END, which closes the reasoning.
     think_end_id: int
     # The token of THINK_START where the model opens its reasoning itself, as
@@ -127,18 +123,16 @@ class ChatFormat:
     # The template's special token after which prompt tokenization reuses a
     # cached prompt's tokens (tokenization.PromptTokenizer).
     message_boundary: str
-
-    @property
-    def stop_ids(self):
-        return tuple(token for _text, token in self.stop_tokens)
+    # The template's placeholder for one image, one token, which the server
+    # widens to the image's tokens; None for a template without one.
+    image_pad: str | None
 
     @property
     def reasoning_switch(self):
-        """Whether a request turns the model's reasoning on and off: its
-        reasoning effort or enable_thinking opens the think block in the
-        generation prompt, or leaves it out. A model that opens its reasoning
-        itself decides each turn whether to reason, whatever the request
-        says."""
+        """Whether a request turns the model's reasoning on and off, its
+        effort or enable_thinking opening the generation prompt's think block
+        or leaving it out; a model that opens its reasoning itself decides
+        each turn, whatever the request says."""
         return self.think_start_id is None
 
     @property
@@ -151,33 +145,28 @@ class ChatFormat:
         return self.think_start_id is None
 
 
-# The Qwen families' (Qwen3_8.hpp, Qwen3_6Moe.hpp, Qwen4Exp.hpp): a padded
-# vocabulary, <|endoftext|> and the turn end <|im_end|> as stop tokens, and a
-# generation prompt that opens the think block when the request thinks.
+# The Qwen families' (Qwen3_8.hpp, Qwen3_6Moe.hpp, Qwen4Exp.hpp):
+# <|endoftext|> and the turn end <|im_end|> as stop tokens, and a generation
+# prompt that opens the think block when the request thinks.
 QWEN = ChatFormat(
-    vocabulary=248320,
-    stop_tokens=(("<|endoftext|>", 248044), ("<|im_end|>", 248046)),
+    stop_tokens=("<|endoftext|>", "<|im_end|>"),
     think_end_id=248069,
     think_start_id=None,
     call_open_id=248058,
     call_syntax=QWEN_XML,
     message_boundary="<|im_end|>",
+    image_pad="<|image_pad|>",
 )
-# Flint's: a vocabulary its tokenizer fills, <|end_of_text|> and the role
-# tokens <|user|>, <|observation|> and <|developer|> as stop tokens, and a
-# generation prompt, <|assistant|> alone, that leaves reasoning to the model.
-# Every chat prompt ends with the assistant's role token.
+# Flint's: <|end_of_text|> and the role tokens <|user|>, <|observation|> and
+# <|developer|> as stop tokens, and a generation prompt, <|assistant|> alone,
+# that leaves reasoning to the model. Every chat prompt ends with the
+# assistant's role token.
 FLINT = ChatFormat(
-    vocabulary=150144,
-    stop_tokens=(
-        ("<|end_of_text|>", 150001),
-        ("<|user|>", 150003),
-        ("<|observation|>", 150005),
-        ("<|developer|>", 150018),
-    ),
+    stop_tokens=("<|end_of_text|>", "<|user|>", "<|observation|>", "<|developer|>"),
     think_end_id=150007,
     think_start_id=150006,
     call_open_id=150010,
     call_syntax=GLM_ARGS,
     message_boundary="<|assistant|>",
+    image_pad=None,
 )

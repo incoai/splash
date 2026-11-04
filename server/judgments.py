@@ -133,12 +133,8 @@ def digest(text):
 
 
 def concentration(probabilities):
-    """Normalized-entropy concentration in [0, 1].
-
-    This is a local measure of how spread the option distribution is. It is
-    not a calibrated confidence and makes no parity claim with any hosted
-    judgment service.
-    """
+    """Normalized-entropy concentration in [0, 1]: how spread the option
+    distribution is, not a calibrated confidence."""
     if len(probabilities) < 2:
         return 1.0
     entropy = -sum(p * math.log(p) for p in probabilities if p > 0.0)
@@ -188,24 +184,24 @@ def encode_prompt(
     admit,
     checkpoint,
 ):
-    """Render messages with chat_template, without thinking as a request
+    """Render messages with chat_template without thinking, as a request
     with effort none renders, and verify single-token answer slots. A model
-    that opens its reasoning itself (chat_format.think_start_id), which the
-    effort leaves reasoning, would start it where the generation prompt
-    ends: its prompt ends with an empty think block, after which it
-    answers. The prompt is the rendered text as every prompt is tokenized,
-    with each surrogate code point as U+FFFD (tokenizable): the one text its
-    tokens, the slot checks and its digest read.
+    that opens its reasoning itself (chat_format.think_start_id), which
+    effort none leaves reasoning, gets an empty think block at the prompt's
+    end, after which it answers. The
+    prompt is the rendered text as every prompt is tokenized, each surrogate
+    code point as U+FFFD: the one text its tokens, the slot checks and its
+    digest read.
 
-    Mirrors SemIf semif_phase1.direct.encode_prompt: each slot label must be
-    one exact round-trip token, and appending the label to the rendered
-    prompt must extend the token ids by exactly that token. A label can only
-    change the tokens of the text after the prompt's last message boundary,
-    which encodes on its own (PromptTokenizer.split), so the boundary pass
-    encodes that end, the generation prompt, with each label: the whole
-    prompt only where the tokenizer has no such boundary. `admit` receives
-    the prepared prompt token count before that pass begins and `checkpoint`
-    runs once per slot inside it; either may raise to abandon preparation.
+    As SemIf's semif_phase1.direct.encode_prompt: each slot label must be
+    one exact round-trip token, and appending it to the rendered prompt must
+    extend the token ids by exactly that token. A label can change only the
+    tokens after the prompt's last message boundary, which encodes on its
+    own (PromptTokenizer.split), so only that end is encoded with each
+    label, the whole prompt where the tokenizer has no such boundary.
+    `admit` receives the prompt token count before that pass and
+    `checkpoint` runs once per slot inside it; either may raise to abandon
+    preparation.
     """
     tokenizer = prompt_tokenizer.tokenizer
     rendered = render_chat_template(

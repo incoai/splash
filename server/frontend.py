@@ -15,7 +15,6 @@ from . import images as image_input
 from . import json_codec, judgments
 from . import protocol as wire
 from .api_shapes import (
-    IMAGE_PAD_TOKEN,
     canonical_responses_input,
     normalize_messages,
     responses_to_chat_body,
@@ -30,6 +29,7 @@ from .chat_templates import (
     template_options,
 )
 from .diagnostics import print_status
+from .documents import render_files
 from .errors import (
     APIError,
     ContextLengthError,
@@ -39,6 +39,7 @@ from .errors import (
 from .latency import LatencyMetrics
 from .lru import LRUCache
 from .metrics import is_finite_number
+from .output import MAX_STOP_CHARACTERS
 from .serve_options import REASONING_EFFORTS, parse_served_model_name
 from .tokenization import PromptTokenizer, tokenizable
 from .tool_schema import (
@@ -61,11 +62,12 @@ FLOAT32_MAX = float.fromhex("0x1.fffffep127")
 # vllm/sampling_params.py); Splash does the same.
 MIN_SAMPLING_TEMPERATURE = 0.01
 
-# The sampling numbers a request may set: each with its default (Qwen's
-# generation config for temperature and top_p, and otherwise the value that
-# leaves the logits unchanged, as in vLLM), the values the engine accepts and
-# how a 400 names them. A nonzero top_p or repetition_penalty must not round
-# to zero in the engine's float32, which would make the value invalid.
+# The sampling numbers a request may set: each with its default, the value
+# that leaves the logits unchanged, the values the engine accepts and how a
+# 400 names them. The served family's published defaults
+# (Frontend.sampling_defaults) take the place of these. A nonzero top_p or
+# repetition_penalty must not round to zero in the engine's float32, which
+# would make the value invalid.
 SAMPLING_NUMBERS = {
     "temperature": (
         1.0,
@@ -73,7 +75,7 @@ SAMPLING_NUMBERS = {
         "a number in [0, 2]",
     ),
     "top_p": (
-        0.95,
+        1.0,
         lambda value: MIN_FLOAT32_SUBNORMAL <= value <= 1,
         "a number in (0, 1]",
     ),
@@ -86,10 +88,19 @@ SAMPLING_NUMBERS = {
     ),
     "min_p": (0.0, lambda value: 0 <= value <= 1, "a number in [0, 1]"),
 }
-# top_k's default, from Qwen's generation config as temperature's and top_p's
-# are. With it, the table covers every sampling option the frame carries.
-TOP_K_DEFAULT = 20
+# With top_k, whose default 0 keeps every token, the table covers every
+# sampling option the frame carries.
 assert set(SAMPLING_NUMBERS) | {"top_k"} == set(wire.SAMPLING_FIELDS)
+
+
+def accepts_sampling(name, value):
+    """Whether a request may set the sampling option name to value. A top_k
+    of 0 or -1 keeps every token."""
+    if name == "top_k":
+        return isinstance(value, int) and not isinstance(value, bool) and value >= -1
+    return name in SAMPLING_NUMBERS and (
+        is_finite_number(value) and SAMPLING_NUMBERS[name][1](value)
+    )
 
 
 def _preparation_checkpoint(deadline, disconnected):
@@ -239,26 +250,26 @@ class Frontend:
         tokenizer,
         backend,
         model,
-        max_context,
         request_timeout,
-        preparation_capacity,
         *,
         constraint_factory,
         chat_templates,
         chat_format,
         thinking_codec,
-        vision,
         max_image_pixels=image_input.MAX_PIXELS,
         served_model_names=(),
         announce_served_name=False,
         default_reasoning_effort=None,
         default_thinking_token_budget=None,
+        sampling_defaults=None,
     ):
-        if not isinstance(preparation_capacity, int) or preparation_capacity <= 0:
-            raise ValueError("frontend preparation capacity must be positive")
-        # Announced by the engine in its Ready event. Without it, message
-        # normalization rejects image and PDF input before any decoding.
-        self.vision = vision
+        # What the engine serves, from its Ready (backend.runtime.capabilities):
+        # the context follows the latest engine (max_context); its lanes and
+        # vision are the model's. Without vision, message normalization
+        # rejects image and PDF input before any decoding.
+        served = backend.runtime.capabilities
+        preparation_capacity = served.max_concurrent_requests
+        self.vision = served.vision
         self.latencies = LatencyMetrics()
         self.tokenizer = tokenizer
         # Probed at startup; requests choose among these, never the
@@ -266,10 +277,13 @@ class Frontend:
         self.chat_templates = chat_templates
         # The served family's: how its output reasons and calls tools.
         self.chat_format = chat_format
-        self.prompt_tokenizer = PromptTokenizer(tokenizer, chat_format.message_boundary)
+        # Sized by the first engine's context, which every relaunch asks for.
+        self.prompt_tokenizer = PromptTokenizer(
+            tokenizer, chat_format.message_boundary, served.max_context_tokens
+        )
         self.backend = backend
         # The model id the engine loaded. /status reports it, so an alias
-        # can never hide what served a request (#81).
+        # can never hide what served a request.
         self.model = model
         served = tuple(parse_served_model_name(name) for name in served_model_names)
         if announce_served_name and not served:
@@ -293,7 +307,13 @@ class Frontend:
         ):
             raise ValueError("invalid default_thinking_token_budget")
         self.default_thinking_token_budget = default_thinking_token_budget
-        self.max_context = max_context
+        # The served family's published sampling, by field: what a request
+        # gets for each of these it leaves out. Each is a value a request may
+        # send, so a request that leaves it out is never refused for it.
+        self.sampling_defaults = dict(sampling_defaults or {})
+        for name, value in self.sampling_defaults.items():
+            if not accepts_sampling(name, value):
+                raise ValueError(f"invalid sampling default {name}={value!r}")
         self.request_timeout = request_timeout
         self.constraint_factory = constraint_factory
         self.max_image_pixels = max_image_pixels
@@ -313,6 +333,12 @@ class Frontend:
         return model in (None, "") or (
             isinstance(model, str) and model in self.model_names
         )
+
+    @property
+    def max_context(self):
+        """The context the latest engine serves: a relaunch whose plan holds
+        less serves that, until a later one regains the first's."""
+        return self.backend.runtime.capabilities.max_context_tokens
 
     @property
     def input_modalities(self):
@@ -336,6 +362,8 @@ class Frontend:
 
     def status(self):
         status = self.backend.status()
+        # The app shows the context the server serves now.
+        status["capabilities"] = {"max_context_tokens": self.max_context}
         status["vision"] = self.vision
         status["input_modalities"] = self.input_modalities
         status["reasoning_switch"] = self.chat_format.reasoning_switch
@@ -423,13 +451,14 @@ class Frontend:
         each real image to its placeholder even when a coding agent has read
         documentation or source containing literal vision tokens.
         """
+        pad = self.chat_format.image_pad
         rendered = self._apply_chat_template(
             messages,
             {
                 **template,
                 "tokenize": False,
                 "chat_template": template["chat_template"].replace(
-                    IMAGE_PAD_TOKEN, IMAGE_RENDER_MARKER
+                    pad, IMAGE_RENDER_MARKER
                 ),
             },
         )
@@ -438,9 +467,9 @@ class Frontend:
         offset = 0
         for part in parts[:-1]:
             offset += len(part)
-            image_offsets.add((offset, offset + len(IMAGE_PAD_TOKEN)))
-            offset += len(IMAGE_PAD_TOKEN)
-        rendered = IMAGE_PAD_TOKEN.join(parts)
+            image_offsets.add((offset, offset + len(pad)))
+            offset += len(pad)
+        rendered = pad.join(parts)
         encoded = self._tokenize(
             rendered,
             add_special_tokens=False,
@@ -454,7 +483,7 @@ class Frontend:
         return list(encoded["input_ids"]), positions, rendered
 
     def _image_token_count(self, prompt_tokens, prepared, positions):
-        pad_id = self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN)
+        pad_id = self.tokenizer.convert_tokens_to_ids(self.chat_format.image_pad)
         if len(positions) != len(prepared) or any(
             prompt_tokens[position] != pad_id for position in positions
         ):
@@ -473,7 +502,7 @@ class Frontend:
             sum(len(image.pixels) for image in prepared),
         )
         expanded, spans, cursor = [], [], 0
-        pad_id = self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN)
+        pad_id = self.tokenizer.convert_tokens_to_ids(self.chat_format.image_pad)
         for position, image in zip(positions, prepared):
             expanded.extend(prompt_tokens[cursor:position])
             spans.append(
@@ -896,14 +925,7 @@ class Frontend:
             raise APIError(
                 400, "chat_template_kwargs enable_thinking must be a boolean"
             )
-        messages = template_messages(
-            normalize_messages(
-                body.get("messages"),
-                vision=self.vision,
-                deadline=deadline,
-                without_slot=without_slot,
-            )
-        )
+        messages = normalize_messages(body.get("messages"), vision=self.vision)
         tools, tool_policy = normalize_tools(
             body.get("tools"),
             body.get("tool_choice"),
@@ -912,6 +934,11 @@ class Frontend:
         )
         response_schema, response_validator = normalize_response_format(
             body.get("response_format")
+        )
+        # PDFs render only once the whole request is checked: a render holds
+        # the one PDF worker for up to 30 s.
+        messages = template_messages(
+            render_files(messages, deadline=deadline, without_slot=without_slot)
         )
         return Prompt(
             messages,
@@ -958,8 +985,6 @@ class Frontend:
                 prompt.messages, deadline, check_context=check_context
             )
         remaining_request_time(deadline)
-        if images and self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN) is None:
-            raise APIError(400, "the tokenizer does not define the image pad token")
         positions = []
         try:
             if images:
@@ -1092,8 +1117,14 @@ class Frontend:
                 else "max_tokens"
             )
         max_new = self._output_budget(requested, prompt_tokens, output_field)
-        # A budget the output limit reaches first closes nothing.
         budget = options.thinking_token_budget
+        if budget is not None and requested is not None:
+            # Where the context leaves less room than the request's limit, the
+            # thinking keeps its share of that room, and the answer the rest; a
+            # limit past the budget plus the room counts as the budget plus the
+            # room.
+            budget = budget * max_new // min(requested, budget + max_new)
+        # A budget the output limit reaches first closes nothing.
         return self._generation_job(
             options,
             prompt_tokens,
@@ -1142,9 +1173,9 @@ class Frontend:
 
     def _generation_options(self, body):
         numbers = {}
-        for name, (default, accepts, requirement) in SAMPLING_NUMBERS.items():
-            value = body.get(name, default)
-            if not is_finite_number(value) or not accepts(value):
+        for name, (default, _, requirement) in SAMPLING_NUMBERS.items():
+            value = body.get(name, self.sampling_defaults.get(name, default))
+            if not accepts_sampling(name, value):
                 raise APIError(400, f"{name} must be {requirement}")
             numbers[name] = float(value)
         if 0 < numbers["temperature"] < MIN_SAMPLING_TEMPERATURE:
@@ -1152,8 +1183,8 @@ class Frontend:
         # A top_k of 0 or -1 keeps every token, which the frame says with 0. A
         # top_k past the vocabulary keeps every token too, so one past the
         # frame's u32 is sent as its largest value.
-        top_k = body.get("top_k", TOP_K_DEFAULT)
-        if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k < -1:
+        top_k = body.get("top_k", self.sampling_defaults.get("top_k", 0))
+        if not accepts_sampling("top_k", top_k):
             raise APIError(
                 400, "top_k must be 0 or -1 (disabled) or a positive integer"
             )
@@ -1171,6 +1202,10 @@ class Frontend:
             stop_sequences = tuple(stop)
         else:
             raise APIError(400, "stop must be a string or up to four strings")
+        if any(len(value) > MAX_STOP_CHARACTERS for value in stop_sequences):
+            raise APIError(
+                400, f"each stop must be at most {MAX_STOP_CHARACTERS} characters"
+            )
         # Splash does not implement logit_bias, so only an empty one (null or
         # {}) is accepted; a non-empty one is refused rather than ignored.
         if body.get("logit_bias") not in (None, {}):

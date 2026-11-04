@@ -12,6 +12,7 @@ from transformers import PreTrainedTokenizerFast
 from dev.tests import server_fixtures as fixtures
 from server import api_shapes, chat_templates
 from server import frontend as request_frontend
+from server.chat_format import QWEN
 from server.chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
     NATIVE,
@@ -219,6 +220,31 @@ class ChatTemplateProbeTests(unittest.TestCase):
                     f"(the original template {ORIGINAL[name]} them), "
                     "generation prompt 1 token",
                 )
+
+    def test_the_close_of_thinking_is_probed(self):
+        # As the template writes it after a reply's reasoning, the close a
+        # thinking budget ends with by default.
+        for name, close in (
+            ("qwen36", "\n</think>"),
+            ("qwen36_gguf", "\n</think>"),
+            ("qwen38", "\n</think>"),
+            ("qwen38_gguf", "\n</think>"),
+            ("flint", "</think>"),
+        ):
+            with self.subTest(name=name):
+                templates = ChatTemplates(tokenizer(source(name)))
+                self.assertEqual(templates.select(None).thinking_end, close)
+        # Whatever the template writes there.
+        written = BY_EFFORT.replace(
+            "{{ m.content }}",
+            "{% if m.reasoning_content %}<think>{{ m.reasoning_content }} Done.\n"
+            "</think>{% endif %}{{ m.content }}",
+        )
+        self.assertEqual(
+            ChatTemplates(tokenizer(written)).select(None).thinking_end,
+            " Done.\n</think>",
+        )
+        self.assertIsNone(ChatTemplates(tokenizer(BY_EFFORT)).select(None).thinking_end)
 
     def test_original_templates_reject_or_drop_what_the_patch_renders(self):
         for name in UPSTREAM:
@@ -561,9 +587,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         # Image rendering swaps the pad token for a marker in that template.
         chosen_sources = {
             chosen.source,
-            chosen.source.replace(
-                api_shapes.IMAGE_PAD_TOKEN, request_frontend.IMAGE_RENDER_MARKER
-            ),
+            chosen.source.replace(QWEN.image_pad, request_frontend.IMAGE_RENDER_MARKER),
         }
         for path, render in (
             (
@@ -640,9 +664,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             )
 
         for name in ("qwen36_gguf", "qwen38_gguf"):
-            app = frontend(
-                name, "<|im_start|>", "<|im_end|>", api_shapes.IMAGE_PAD_TOKEN
-            )
+            app = frontend(name, "<|im_start|>", "<|im_end|>", QWEN.image_pad)
             self.assertTrue(
                 app.chat_templates.describe().endswith("generation prompt 5-7 tokens")
             )
@@ -1068,8 +1090,6 @@ class LeadingSystemMergeTests(unittest.TestCase):
                 {"role": "system", "content": "Later still"},
             ],
             vision=True,
-            deadline=fixtures.FOREVER,
-            without_slot=nullcontext,
         )
         self.assertEqual(
             merged,
@@ -1087,8 +1107,6 @@ class LeadingSystemMergeTests(unittest.TestCase):
                     {"role": "user", "content": "x"},
                 ],
                 vision=True,
-                deadline=fixtures.FOREVER,
-                without_slot=nullcontext,
             )[0],
             {"role": "system", "content": "  Only  "},
         )
@@ -1115,12 +1133,7 @@ class LeadingSystemMergeTests(unittest.TestCase):
         for messages in (responses, anthropic):
             with self.subTest(messages=messages):
                 self.assertEqual(
-                    api_shapes.normalize_messages(
-                        messages,
-                        vision=True,
-                        deadline=fixtures.FOREVER,
-                        without_slot=nullcontext,
-                    ),
+                    api_shapes.normalize_messages(messages, vision=True),
                     [
                         {"role": "system", "content": "Base\n\nDeveloper"},
                         {"role": "user", "content": "Ask"},

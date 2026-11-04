@@ -717,6 +717,90 @@ class ToolSchemaCompositionTests(HarnessTestCase):
             self.assertIn("%json", grammar)
             self.assertNotIn("RAW_START", grammar)
 
+    def test_a_union_of_ref_members_builds_a_grammar_linear_in_its_schema(self):
+        """The members of a strict parameter's union that list no value are
+        one JSON schema: twice the members make about twice the grammar,
+        where a schema of each member with its own copy of the definitions
+        made four times."""
+
+        def grammar(members):
+            definitions = {
+                f"d{index}": {
+                    "type": "object",
+                    "properties": {f"k{index}": {"type": "integer"}},
+                    "required": [f"k{index}"],
+                }
+                for index in range(members)
+            }
+            union = [{"$ref": f"#/$defs/d{index}"} for index in range(members)]
+            return argument_grammar(
+                {
+                    "type": "object",
+                    "properties": {"value": {"anyOf": union}},
+                    "$defs": definitions,
+                }
+            )
+
+        self.assertLessEqual(len(grammar(400)) / len(grammar(200)), 2.2)
+
+    def test_a_union_of_ref_members_accepts_what_it_accepted(self):
+        """A union of literals and members that refer to definitions takes
+        the values it took when each such member had a JSON schema of its
+        own, recorded here from that grammar."""
+        policy = strict_policy(
+            {
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "anyOf": [
+                            {"const": "auto"},
+                            {"$ref": "#/$defs/point"},
+                            {"$ref": "#/$defs/pair"},
+                            {"enum": [1, 2]},
+                        ]
+                    }
+                },
+                "required": ["value"],
+                "$defs": {
+                    "point": {
+                        "type": "object",
+                        "properties": {
+                            "x": {"type": "integer"},
+                            "y": {"type": "integer"},
+                        },
+                        "required": ["x", "y"],
+                        "additionalProperties": False,
+                    },
+                    "pair": {"type": "array", "items": {"type": "number"}},
+                },
+            }
+        )
+        accepted = {
+            "auto": True,
+            '{"x": 1, "y": 2}': True,
+            "[1.5, 2]": True,
+            "[]": True,
+            "1": True,
+            "2": True,
+            "manual": False,
+            '{"x": 1}': False,
+            '{"x": 1, "y": 2, "z": 3}': False,
+            '["a"]': False,
+            "3": False,
+            "null": False,
+        }
+        self.assertEqual(
+            {
+                value: self.accepts(
+                    policy,
+                    "<tool_call>\n<function=t0>\n<parameter=value>\n"
+                    f"{value}\n</parameter>\n</function>\n</tool_call>",
+                )
+                for value in accepted
+            },
+            accepted,
+        )
+
     def test_cyclic_tool_alternatives_compile_without_recursing(self):
         runtime = FakeRuntime()
         factory = FakeConstraintFactory()

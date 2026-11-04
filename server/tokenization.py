@@ -23,20 +23,27 @@ def tokenizable(text):
 class PromptTokenizer:
     """Encodes prompts reusing a cached prompt's tokens up to its last
     `marker`, the chat template's special token at a message boundary
-    (ChatFormat.message_boundary), where the tokenizer splits its input."""
+    (ChatFormat.message_boundary), where the tokenizer splits its input.
+    It keeps CAPACITY prompts of up to `max_context` tokens, the served
+    context."""
 
     MIN_PREFIX_CHARS = 4096
-    BUDGET_BYTES = 8 * 1024 * 1024
     CAPACITY = 4
+    # The bytes a kept prompt takes per token, at most: the token's 4 and its
+    # text, up to about 5 characters (code's; prose's are 4) at the 4 bytes
+    # CPython stores each of a text that holds any past U+FFFF, as an emoji.
+    BYTES_PER_TOKEN = 24
 
-    def __init__(self, tokenizer, marker):
+    def __init__(self, tokenizer, marker, max_context):
         self.tokenizer = tokenizer
         self.marker = marker
         self.enabled = self._supports_boundaries(tokenizer, marker)
         self.marker_id = (
             tokenizer.backend_tokenizer.token_to_id(marker) if self.enabled else None
         )
-        self.entries = LRUCache(self.BUDGET_BYTES, self.CAPACITY)
+        self.entries = LRUCache(
+            self.CAPACITY * max_context * self.BYTES_PER_TOKEN, self.CAPACITY
+        )
         self.hits = self.reused_tokens = 0
         self.lock = threading.Lock()
 
@@ -116,7 +123,7 @@ class PromptTokenizer:
                 return self._encode(text)
             token_bytes = array("I", tokens).tobytes()
             size = sys.getsizeof(prefix) + sys.getsizeof(token_bytes)
-            if size <= self.BUDGET_BYTES:
+            if size <= self.entries.budget_bytes:
                 with self.lock:
                     # An extension replaces its earlier prefix; unrelated
                     # concurrent conversations retain their own LRU entries.

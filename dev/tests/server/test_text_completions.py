@@ -9,6 +9,7 @@ from openai import OpenAI
 from dev.tests.server_fixtures import FakeRuntime, FakeTokenizer, Harness, Plan
 from server import protocol as wire
 from server import server as api
+from server.output import MAX_STOP_CHARACTERS
 
 CHAT = ("/v1/chat/completions", {"messages": [{"role": "user", "content": "Hi"}]})
 COMPLETION = ("/v1/completions", {"prompt": "once upon a time"})
@@ -183,6 +184,11 @@ class TextCompletionTests(unittest.TestCase):
                     response["error"]["message"],
                     "stop must be a string or up to four strings",
                 )
+        status, response = self.complete(
+            harness, stop=["x" * (MAX_STOP_CHARACTERS + 1)]
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("each stop must be at most", response["error"]["message"])
 
     def test_unsupported_fields_are_rejected_by_name(self):
         harness, runtime = self.harness()

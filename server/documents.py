@@ -255,8 +255,6 @@ def document_parts(block):
 
 def pdf_content(encoded, *, budget):
     """Render an inline PDF through the shared bounded document pipeline."""
-    if len(encoded) > 4 * ((MAX_PDF_BYTES + 2) // 3):
-        raise APIError(400, "PDF document exceeds the size limit")
     parts = []
     for page in _pages(encoded, budget):
         parts.append({"type": "text", "text": page.text})
@@ -265,7 +263,38 @@ def pdf_content(encoded, *, budget):
 
 
 def file_content(file, *, budget):
-    """Render a file part's inline PDF as canonical text/image parts."""
+    """Check and render one request file part's inline PDF as canonical
+    text/image parts."""
+    return pdf_content(checked_file(file), budget=budget)
+
+
+def render_files(messages, *, deadline, without_slot):
+    """`messages`, canonical (each file part's data already checked), with
+    each file part replaced by its PDF's pages as text and image parts, all
+    under one request budget; the PDF worker is waited for and used under
+    `without_slot`, which gives a request in preparation its slot back
+    meanwhile."""
+    budget = DocumentBudget(deadline=deadline, without_slot=without_slot)
+    rendered = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            part["type"] == "file" for part in content
+        ):
+            parts = []
+            for part in content:
+                if part["type"] == "file":
+                    parts.extend(pdf_content(part["file"]["file_data"], budget=budget))
+                else:
+                    parts.append(part)
+            message = {**message, "content": parts}
+        rendered.append(message)
+    return rendered
+
+
+def checked_file(file):
+    """A file part's inline PDF, checked without decoding it: its base64
+    data."""
     if not isinstance(file, dict):
         raise APIError(400, "file must be an object")
     if file.get("file_id") is not None or file.get("file_url") is not None:
@@ -282,4 +311,6 @@ def file_content(file, *, budget):
         if not data.startswith(PDF_DATA_URL_PREFIX):
             raise APIError(400, "only application/pdf file data is supported")
         data = data[len(PDF_DATA_URL_PREFIX) :]
-    return pdf_content(data, budget=budget)
+    if len(data) > 4 * ((MAX_PDF_BYTES + 2) // 3):
+        raise APIError(400, "PDF document exceeds the size limit")
+    return data

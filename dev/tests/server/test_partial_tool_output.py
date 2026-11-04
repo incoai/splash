@@ -2,11 +2,9 @@ import json
 import random
 import re
 import unittest
-from contextlib import nullcontext
 from unittest import mock
 
 from dev.tests.server_fixtures import (
-    FOREVER,
     FakeRuntime,
     FakeTokenizer,
     Harness,
@@ -607,8 +605,6 @@ class PartialToolOutputTests(unittest.TestCase):
                                 {"role": "user", "content": "Continue"},
                             ],
                             vision=True,
-                            deadline=FOREVER,
-                            without_slot=nullcontext,
                         )
                         actual = normalized[0]["tool_calls"][0]["function"]
                         self.assertEqual(actual["arguments"], arguments)
@@ -1100,8 +1096,6 @@ class PartialToolOutputTests(unittest.TestCase):
                     {"role": "user", "content": "continue"},
                 ],
                 vision=True,
-                deadline=FOREVER,
-                without_slot=nullcontext,
             )
             return messages[1]["tool_calls"][0]["function"]["arguments"]
 
