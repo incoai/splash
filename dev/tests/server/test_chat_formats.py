@@ -537,7 +537,7 @@ class FlintTokenizerContractTests(unittest.TestCase):
         ):
             with self.subTest(field=field):
                 with self.assertRaisesRegex(
-                    fixtures.engine_runtime.EngineUnhealthy,
+                    constraints.TokenizerContractError,
                     f"tokenizer must encode '{text}' as native token",
                 ):
                     constraints.validate_tokenizer(
@@ -547,7 +547,7 @@ class FlintTokenizerContractTests(unittest.TestCase):
                         ),
                     )
         with self.assertRaisesRegex(
-            fixtures.engine_runtime.EngineUnhealthy, "stop text '<\\|user\\|>x'"
+            constraints.TokenizerContractError, "stop text '<\\|user\\|>x'"
         ):
             constraints.validate_tokenizer(
                 tokenizer,
@@ -589,7 +589,7 @@ class FlintTokenizerContractTests(unittest.TestCase):
         ):
             with self.subTest(refusal=refusal, ready=changed):
                 with self.assertRaisesRegex(
-                    fixtures.engine_runtime.EngineUnhealthy, refusal
+                    constraints.TokenizerContractError, refusal
                 ):
                     constraints.check_capabilities(tokenizer, served_format, changed)
 

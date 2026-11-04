@@ -226,7 +226,8 @@ class ServerMainTests(unittest.TestCase):
 
     def test_main_checks_the_tokenizer_against_the_engines_ready(self):
         """Once the engine is Ready, a tokenizer whose stop texts are not its
-        stop tokens fails the start, naming both."""
+        stop tokens fails the start as the model's, naming both."""
+        record = Path(self.enterContext(tempfile.TemporaryDirectory())) / "s.json"
         runtime = mock.Mock()
         runtime.capabilities = engine_ready(131072)
         tokenizer = mock.Mock(eos_token_id=248046)
@@ -236,17 +237,67 @@ class ServerMainTests(unittest.TestCase):
             "<|im_end|>": [248046],
         }[text]
         with contextlib.ExitStack() as stack:
-            for patch in self.main_starting(main_args(), runtime, tokenizer):
+            for patch in self.main_starting(
+                main_args(serve_record=record), runtime, tokenizer
+            ):
                 stack.enter_context(patch)
             status = stack.enter_context(mock.patch.object(api, "print_status"))
             with self.assertRaises(SystemExit):
                 api.main()
-        status.assert_any_call(
-            "Error · the tokenizer encodes the stop texts ('<|endoftext|>', "
+        message = (
+            "the tokenizer encodes the stop texts ('<|endoftext|>', "
             "'<|im_end|>') as tokens (248045, 248046), but the native model "
-            "stops at (248044, 248046)",
-            error=True,
+            "stops at (248044, 248046)"
         )
+        status.assert_any_call(f"Error · {message}", error=True)
+        self.assertEqual(
+            json.loads(record.read_text())["failure"],
+            {"kind": "model", "message": message},
+        )
+
+    def test_every_failed_start_records_its_kind(self):
+        """A tokenizer the loader cannot read fails the start as the model's;
+        an error the server does not expect, as internal, its traceback kept.
+        Either way the record names the failure, so the app reports it
+        instead of a crash."""
+        record = Path(self.enterContext(tempfile.TemporaryDirectory())) / "s.json"
+        for fault, ends, written in (
+            (
+                mock.patch.object(
+                    api.AutoTokenizer,
+                    "from_pretrained",
+                    side_effect=KeyError("added_tokens"),
+                ),
+                SystemExit,
+                {
+                    "kind": "model",
+                    "message": "cannot load the tokenizer of test-model: "
+                    "KeyError: 'added_tokens'",
+                },
+            ),
+            (
+                mock.patch.object(
+                    api, "check_capabilities", side_effect=AttributeError("vision")
+                ),
+                AttributeError,
+                {"kind": "internal", "message": "AttributeError: vision"},
+            ),
+        ):
+            with self.subTest(kind=written["kind"]):
+                runtime = mock.Mock()
+                with contextlib.ExitStack() as stack:
+                    for patch in self.main_starting(
+                        main_args(serve_record=record), runtime
+                    ):
+                        stack.enter_context(patch)
+                    stack.enter_context(fault)
+                    stack.enter_context(mock.patch.object(api, "print_status"))
+                    with self.assertRaises(ends):
+                        api.main()
+                self.assertEqual(
+                    json.loads(record.read_text()),
+                    {"pid": 4242, "phase": "failed", "failure": written},
+                )
 
     def test_a_start_writes_its_serve_record(self):
         """The record says the server is loading while the engine starts,

@@ -39,7 +39,12 @@ from .backend import (
 )
 from .chat_templates import ChatTemplateError, ChatTemplates
 from .connections import ConnectionSlots, HttpAdmission, RequestBodyReservation
-from .constraints import ConstraintFactory, check_capabilities, validate_tokenizer
+from .constraints import (
+    ConstraintFactory,
+    TokenizerContractError,
+    check_capabilities,
+    validate_tokenizer,
+)
 from .diagnostics import log_unexpected, print_request, print_status
 from .errors import (
     ANTHROPIC_ERRORS,
@@ -1393,9 +1398,18 @@ def main():
                 f"{args.model} is not prepared as a model of a family this "
                 "release serves: prepare it again"
             )
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_root / "tokenizer", local_files_only=True, trust_remote_code=False
-        )
+        # A tokenizer the loader cannot read fails with whatever its parsers
+        # raise, such as a KeyError for a tokenizer.json without added_tokens:
+        # each is the model's.
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_root / "tokenizer", local_files_only=True, trust_remote_code=False
+            )
+        except Exception as error:
+            raise ModelError(
+                f"cannot load the tokenizer of {args.model}: "
+                f"{type(error).__name__}: {error}"
+            ) from error
         validate_tokenizer(tokenizer, family.chat_format)
         thinking_end = thinking_end_tokens(
             tokenizer, args.thinking_end_text, family.chat_format
@@ -1461,12 +1475,28 @@ def main():
         _start_failed(args, error, serve_record.engine_failure(error.event, str(error)))
     except ListenError as error:
         _start_failed(args, error, serve_record.failure(serve_record.PORT, str(error)))
-    except (ModelError, ChatTemplateError, ThinkingEndError) as error:
+    except (
+        ModelError,
+        ChatTemplateError,
+        ThinkingEndError,
+        TokenizerContractError,
+    ) as error:
         _start_failed(args, error, serve_record.failure(serve_record.MODEL, str(error)))
     except (engine_runtime.EngineRuntimeError, ThinkingKeyError, OSError) as error:
         _start_failed(
             args, error, serve_record.failure(serve_record.INTERNAL, str(error))
         )
+    except Exception as error:
+        # An error no clause above names is a bug: the record still names the
+        # failure, so that the app reports it instead of a crash, and the
+        # traceback reaches the log.
+        serve_record.failed(
+            args.serve_record,
+            serve_record.failure(
+                serve_record.INTERNAL, f"{type(error).__name__}: {error}"
+            ),
+        )
+        raise
     except KeyboardInterrupt:
         pass
     finally:

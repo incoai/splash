@@ -11,7 +11,6 @@ from llguidance.numpy import (
     fill_next_token_bitmask_par_with_draft_tokens,
 )
 
-from . import runtime as engine_runtime
 from .chat_format import THINK_END, THINK_START, TOOL_CALL_OPEN
 from .errors import APIError, ConstraintError
 from .lru import LRUCache
@@ -103,6 +102,11 @@ class TokenConstraint:
                 )
 
 
+class TokenizerContractError(ValueError):
+    """The model's tokenizer does not encode the tokens its chat format or
+    its engine serves by."""
+
+
 def validate_tokenizer(tokenizer, chat_format):
     """Before the engine starts, refuse a tokenizer that does not encode the
     tags chat_format reads the model's output by as that format has them:
@@ -121,12 +125,12 @@ def validate_tokenizer(tokenizer, chat_format):
         if vocabulary.get(token) != token_id or tokenizer.encode(
             token, add_special_tokens=False
         ) != [token_id]:
-            raise engine_runtime.EngineUnhealthy(
+            raise TokenizerContractError(
                 f"tokenizer must encode {token!r} as native token {token_id}"
             )
     for stop in chat_format.stop_tokens:
         if len(tokenizer.encode(stop, add_special_tokens=False)) != 1:
-            raise engine_runtime.EngineUnhealthy(
+            raise TokenizerContractError(
                 f"tokenizer must encode the stop text {stop!r} as one token"
             )
 
@@ -141,7 +145,7 @@ def check_capabilities(tokenizer, chat_format, ready):
         type(token_id) is not int or not 0 <= token_id < ready.vocabulary_size
         for token_id in vocabulary.values()
     ):
-        raise engine_runtime.EngineUnhealthy(
+        raise TokenizerContractError(
             "tokenizer vocabulary does not fit the native model"
         )
     stops = tuple(
@@ -149,23 +153,23 @@ def check_capabilities(tokenizer, chat_format, ready):
         for stop in chat_format.stop_tokens
     )
     if sorted(stops) != sorted(ready.stop_token_ids):
-        raise engine_runtime.EngineUnhealthy(
+        raise TokenizerContractError(
             f"the tokenizer encodes the stop texts {chat_format.stop_tokens} as "
             f"tokens {stops}, but the native model stops at {ready.stop_token_ids}"
         )
     if tokenizer.eos_token_id not in ready.stop_token_ids:
-        raise engine_runtime.EngineUnhealthy(
+        raise TokenizerContractError(
             "tokenizer EOS token does not match the native model"
         )
     if ready.vision:
         pad = chat_format.image_pad
         if pad is None:
-            raise engine_runtime.EngineUnhealthy(
+            raise TokenizerContractError(
                 "the native model serves images, but its chat template has no "
                 "image placeholder"
             )
         if len(tokenizer.encode(pad, add_special_tokens=False)) != 1:
-            raise engine_runtime.EngineUnhealthy(
+            raise TokenizerContractError(
                 f"tokenizer must encode the image placeholder {pad!r} as one token"
             )
 

@@ -33,7 +33,7 @@ class TokenizerContractTests(unittest.TestCase):
                 tokenizer = self.tokenizer()
                 tokenizer.get_vocab()[token] += 1
                 with self.assertRaisesRegex(
-                    server.engine_runtime.EngineUnhealthy, "native token"
+                    generation_constraints.TokenizerContractError, "native token"
                 ):
                     generation_constraints.validate_tokenizer(tokenizer, QWEN)
 
@@ -45,7 +45,7 @@ class TokenizerContractTests(unittest.TestCase):
                 tokenizer.get_vocab()[token] += 1
                 generation_constraints.validate_tokenizer(tokenizer, QWEN)
                 with self.assertRaisesRegex(
-                    server.engine_runtime.EngineUnhealthy, "stops at"
+                    generation_constraints.TokenizerContractError, "stops at"
                 ):
                     generation_constraints.check_capabilities(tokenizer, QWEN, READY)
 
@@ -54,7 +54,7 @@ class TokenizerContractTests(unittest.TestCase):
         tokenizer.encode.return_value = [1, 2]
         tokenizer.encode.side_effect = None
         with self.assertRaisesRegex(
-            server.engine_runtime.EngineUnhealthy, "native token"
+            generation_constraints.TokenizerContractError, "native token"
         ):
             generation_constraints.validate_tokenizer(tokenizer, QWEN)
 
@@ -64,14 +64,16 @@ class TokenizerContractTests(unittest.TestCase):
                 tokenizer = self.tokenizer()
                 tokenizer.get_vocab()["community-token"] = token_id
                 with self.assertRaisesRegex(
-                    server.engine_runtime.EngineUnhealthy, "vocabulary"
+                    generation_constraints.TokenizerContractError, "vocabulary"
                 ):
                     generation_constraints.check_capabilities(tokenizer, QWEN, READY)
 
     def test_eos_configuration_must_match_a_native_stop_token(self):
         tokenizer = self.tokenizer()
         tokenizer.eos_token_id = 0
-        with self.assertRaisesRegex(server.engine_runtime.EngineUnhealthy, "EOS token"):
+        with self.assertRaisesRegex(
+            generation_constraints.TokenizerContractError, "EOS token"
+        ):
             generation_constraints.check_capabilities(tokenizer, QWEN, READY)
 
     def test_startup_rejects_tokenizer_before_starting_the_native_worker(self):
