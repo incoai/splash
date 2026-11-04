@@ -933,6 +933,20 @@ struct MetalBackend::Impl {
     explicit Impl(double commandTimeoutSeconds)
         : asyncState(std::make_shared<BackendAsyncState>(commandTimeoutSeconds)) {}
 
+    // An address table of a command (AddressTable), resolved as the command
+    // is prepared: its buffers' GPU addresses at that point, their
+    // allocations, each once, and the entries whose bytes reach other
+    // buffers as a table (setTableReach).
+    struct PreparedTable {
+        const std::vector<MetalBuffer> *source = nullptr;
+        std::vector<uint64_t> addresses;
+        std::vector<MetalAllocation *> allocations;
+        std::vector<const MetalBuffer::Impl *> reaching;
+        // The last encoder that declared the table for reading, and for
+        // reading and writing (EncoderResidency).
+        uint64_t declaredIn[2] = {};
+    };
+
     // One dispatch of a command, validated and resolved to its pipeline.
     struct PreparedDispatch {
         const ComputeDispatch *source = nullptr;
@@ -942,13 +956,17 @@ struct MetalBackend::Impl {
         // The argument table entries its buffers take, one bit each.
         uint32_t bufferIndices = 0;
         __strong id<MTLComputePipelineState> pipeline = nil;
+        // Its address table, one of its command's tables; null without one.
+        PreparedTable *table = nullptr;
     };
 
-    // A command as submission encodes it: its dispatches and every
-    // allocation they bind or reach through an address table, which its
-    // ticket retains.
+    // A command as submission encodes it: its dispatches, their address
+    // tables, each once (dispatches that reach the same buffers share one
+    // list), and every allocation they bind or list, which its ticket
+    // retains.
     struct PreparedCommand {
         std::vector<PreparedDispatch> dispatches;
+        std::vector<PreparedTable> tables;
         std::vector<std::shared_ptr<MetalAllocation>> retainedAllocations;
     };
 
@@ -992,32 +1010,17 @@ struct MetalBackend::Impl {
             }
         }
 
-        // Declares the buffers of `source`, an address table a dispatch
-        // lists, and what they reach; returns their GPU addresses as the
-        // command is encoded.
-        std::span<const uint64_t> listed(const std::vector<MetalBuffer> &source, bool writes) {
-            Table &table = resolve(source);
+        // Declares the buffers of `table`, which a dispatch lists, and what
+        // they reach.
+        void listed(PreparedTable &table, bool writes) {
             uint64_t &declared = table.declaredIn[writes];
-            if (declared != current_) {
-                declared = current_;
-                use(table.allocations, writes);
-                for (const MetalBuffer::Impl *view : table.reaching) reach(*view);
-            }
-            return table.addresses;
+            if (declared == current_) return;
+            declared = current_;
+            use(table.allocations, writes);
+            for (const MetalBuffer::Impl *view : table.reaching) reach(*view);
         }
 
     private:
-        // An address table (AddressTable), resolved once: its buffers' GPU
-        // addresses, their allocations, each once, and the entries whose
-        // bytes reach other buffers as a table.
-        struct Table {
-            const std::vector<MetalBuffer> *source = nullptr;
-            std::vector<uint64_t> addresses;
-            std::vector<MetalAllocation *> allocations;
-            std::vector<const MetalBuffer::Impl *> reaching;
-            uint64_t declaredIn[2] = {};
-        };
-
         // A table reach (TableReach), resolved once: the allocations of the
         // buffers it names that hold memory, and of what the tables among
         // them reach in turn. It holds the names, so that no other vector
@@ -1027,22 +1030,6 @@ struct MetalBackend::Impl {
             std::vector<MetalAllocation *> allocations;
             uint64_t declaredIn = 0;
         };
-
-        Table &resolve(const std::vector<MetalBuffer> &source) {
-            const auto known = std::ranges::find(tables_, &source, &Table::source);
-            if (known != tables_.end()) return *known;
-            Table &table = tables_.emplace_back();
-            table.source = &source;
-            table.addresses.reserve(source.size());
-            for (const MetalBuffer &entry : source) {
-                MetalAllocation *allocation = entry.impl_->allocation.get();
-                table.addresses.push_back(allocation->buffer.gpuAddress + entry.impl_->offsetBytes);
-                if (std::ranges::find(table.allocations, allocation) == table.allocations.end())
-                    table.allocations.push_back(allocation);
-                if (!allocation->reaches.empty()) table.reaching.push_back(entry.impl_.get());
-            }
-            return table;
-        }
 
         Reach &resolve(const std::shared_ptr<const std::vector<std::weak_ptr<MetalAllocation>>> &source) {
             const auto known = std::ranges::find(reaches_, source, &Reach::source);
@@ -1094,7 +1081,6 @@ struct MetalBackend::Impl {
         uint64_t &encoders_;
         uint64_t current_ = 0;
         __unsafe_unretained id<MTLComputeCommandEncoder> encoder_ = nil;
-        std::vector<Table> tables_;
         std::vector<Reach> reaches_;
         std::vector<__unsafe_unretained id<MTLResource>> pending_;
     };
@@ -1207,10 +1193,10 @@ struct MetalBackend::Impl {
         }
         PreparedCommand command;
         command.dispatches.reserve(dispatches.size());
+        // Room for a table per dispatch, so the tables stay where the
+        // dispatches point.
+        command.tables.reserve(dispatches.size());
         size_t bindings = 0;
-        // The address tables of the command, each checked once: the
-        // dispatches that reach the same buffers share one list.
-        std::vector<const std::vector<MetalBuffer> *> tables;
         for (const ComputeDispatch &dispatch : dispatches) {
             PreparedDispatch item;
             item.source = &dispatch;
@@ -1270,17 +1256,21 @@ struct MetalBackend::Impl {
                 claim(binding.index);
             }
             // An address table takes its entry as bytes do; its buffers are
-            // checked as bindings are.
-            if (const std::vector<MetalBuffer> *table = dispatch.addresses.buffers.get()) {
-                if (table->empty() || table->size() * sizeof(uint64_t) > kBytesArgumentLimit) {
+            // checked as bindings are, and resolved, once per command.
+            if (const std::vector<MetalBuffer> *source = dispatch.addresses.buffers.get()) {
+                if (source->empty() || source->size() * sizeof(uint64_t) > kBytesArgumentLimit) {
                     std::ostringstream message;
-                    message << "compute dispatch '" << dispatch.pipelineName << "' reaches " << table->size()
+                    message << "compute dispatch '" << dispatch.pipelineName << "' reaches " << source->size()
                             << " addresses; a table holds 1 to " << kBytesArgumentLimit / sizeof(uint64_t);
                     throw MetalBackendError(message.str());
                 }
-                if (std::ranges::find(tables, table) == tables.end()) {
-                    for (size_t entry = 0; entry < table->size(); ++entry) {
-                        const MetalBuffer &buffer = (*table)[entry];
+                auto table = std::ranges::find(command.tables, source, &PreparedTable::source);
+                if (table == command.tables.end()) {
+                    table = command.tables.emplace(table);
+                    table->source = source;
+                    table->addresses.reserve(source->size());
+                    for (size_t entry = 0; entry < source->size(); ++entry) {
+                        const MetalBuffer &buffer = (*source)[entry];
                         if (!buffer.impl_) {
                             std::ostringstream message;
                             message << "compute dispatch '" << dispatch.pipelineName
@@ -1296,10 +1286,15 @@ struct MetalBackend::Impl {
                                     << "' reaches released memory at address " << entry;
                             throw MetalBackendError(message.str());
                         }
+                        MetalAllocation *allocation = buffer.impl_->allocation.get();
+                        table->addresses.push_back(allocation->buffer.gpuAddress + buffer.impl_->offsetBytes);
+                        if (std::ranges::find(table->allocations, allocation) == table->allocations.end())
+                            table->allocations.push_back(allocation);
+                        if (!allocation->reaches.empty()) table->reaching.push_back(buffer.impl_.get());
                     }
-                    tables.push_back(table);
-                    bindings += table->size();
+                    bindings += source->size();
                 }
+                item.table = &*table;
                 claim(dispatch.addresses.index);
             }
             // Metal reads an indirect grid's three counts at a multiple of 4
@@ -1343,8 +1338,8 @@ struct MetalBackend::Impl {
                 bound.push_back(
                     &dispatch.indirectThreadgroups.buffer.impl_->allocation);
         }
-        for (const std::vector<MetalBuffer> *table : tables) {
-            for (const MetalBuffer &buffer : *table)
+        for (const PreparedTable &table : command.tables) {
+            for (const MetalBuffer &buffer : *table.source)
                 bound.push_back(&buffer.impl_->allocation);
         }
         const auto allocation =
@@ -1648,11 +1643,10 @@ struct MetalBackend::Impl {
                                    length:binding.sizeBytes
                                   atIndex:binding.index];
                     }
-                    if (const std::vector<MetalBuffer> *source = dispatch.addresses.buffers.get()) {
-                        const std::span<const uint64_t> addresses =
-                            encoderResidency.listed(*source, dispatch.addresses.writes);
-                        [encoder setBytes:addresses.data()
-                                   length:addresses.size_bytes()
+                    if (PreparedTable *table = item.table) {
+                        encoderResidency.listed(*table, dispatch.addresses.writes);
+                        [encoder setBytes:table->addresses.data()
+                                   length:table->addresses.size() * sizeof(uint64_t)
                                   atIndex:dispatch.addresses.index];
                     }
                     const IndirectGrid &grid = dispatch.indirectThreadgroups;
@@ -1722,7 +1716,7 @@ struct MetalBackend::Impl {
                                  CommandCompletion completion) {
         if (std::ranges::any_of(events, [](const EventStep &step) { return step.kind != EventStep::Kind::Host; }))
             throw MetalBackendError("dispatch profiling does not replay event steps");
-        const PreparedCommand command = prepare(dispatches);
+        PreparedCommand command = prepare(dispatches);
         CommandTiming total;
         auto step = events.begin();
         const auto runSteps = [&](size_t before) {
