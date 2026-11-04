@@ -651,11 +651,13 @@ for (const [name, overrides, shouldSend] of [
   let content = chat.elements.chat.children.at(-1).querySelector('.content');
   assert.match(content.innerHTML, /hljs-keyword/);
   await chunk({content: '\n```\n\n```unknown-lang\n<b>literal</b>\n```\n\n' +
-    '<img src=x onerror=alert(1)>\n\n[bad](javascript:alert(1))\n\n[good](https://example.com)\n\n' +
+    '<img src=x onerror=alert(1)>\n\n[bad](javascript:alert(1))\n\n[app](x-app:open)\n\n[good](https://example.com)\n\n' +
     '![x](https://example.com/a.png)'});
   assert.match(content.innerHTML, /&lt;b&gt;literal&lt;\/b&gt;/);
-  assert.doesNotMatch(content.innerHTML, /href="javascript:/);
+  assert.doesNotMatch(content.innerHTML, /href="(javascript|x-app):/, 'only web and mail links are links');
+  assert.match(content.innerHTML, /<p>app<\/p>/, 'another link keeps its text');
   assert.doesNotMatch(content.innerHTML, /<img/, 'a reply must not load images');
+  assert.match(content.innerHTML, /<p><a href="https:\/\/example.com\/a.png"[^>]*>x<\/a><\/p>/, 'an image is a link to it');
   assert.match(content.innerHTML, /href="https:\/\/example.com" target="_blank" rel="noopener noreferrer"/,
     'a link must open in a new tab');
   const reasoning = '**thinking**\n\n```python\ndef think():\n    return 1\n```';

@@ -221,6 +221,7 @@
 
 <script src="/chat-assets/markdown-it-15.0.2.min.js"></script>
 <script src="/chat-assets/highlight-11.12.0.min.js"></script>
+<script src="/chat-assets/markdown-links.js"></script>
 <script>
   const $ = selector => document.querySelector(selector);
   const chat = $('#chat');
@@ -251,7 +252,7 @@
       }
       return ''; // Markdown escapes code for unknown or omitted languages.
     }
-  }).disable('image'); // A reply's image would load its URL without a click.
+  }).use(markdownLinks);
   for (const rule of ['fence', 'code_block']) {
     const renderCode = markdown.renderer.rules[rule];
     markdown.renderer.rules[rule] = (tokens, index, ...args) => {

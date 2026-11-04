@@ -87,6 +87,7 @@ DIALECT_FILES = (
 CHAT_ASSET_FILES = (
     "markdown-it-15.0.2.min.js",
     "highlight-11.12.0.min.js",
+    "markdown-links.js",
     "github-11.12.0.min.css",
     "github-dark-11.12.0.min.css",
 )
