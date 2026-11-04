@@ -1131,18 +1131,17 @@ nothing. A dispatch may instead list buffers in an address table
 addresses as it encodes the command, after the dispatch's parameters
 (`setBytes`, so at most 512), and makes them resident from that dispatch to the
 end of its encoder (`useResources`, for reading, or reading and writing,
-declared once per table and usage in each encoder). Whatever an encoder makes
-resident brings what it reaches as a table, listed or reached through another
-table as well as bound: a kernel may follow an address to the entries of the
-table it names.
+declared once per table and usage in each encoder).
 The addresses are those of the buffers' memory when the command is encoded, so
 a buffer released and restored since (which comes back at another address) is
-reached where it is, and a table that reaches released memory is refused like
-a binding of it. The routed experts are reached this way, the expert store's
-chunks as a resident model's routed planes: a decode command reads few of
-them, and in a residency set attached to the queue the 18 GiB of a streamed
-35B's chunks made every command buffer wait for all of them, a decode cycle
-ten times longer.
+reached where it is, and an address table that lists released memory is
+refused like a binding of it. The routed experts are reached this way, the
+expert store's chunks as a resident model's routed planes: a decode command
+reads few of them, and in a residency set attached to the queue the 18 GiB of a
+streamed 35B's chunks made every command buffer wait for all of them, a decode
+cycle ten times longer. Whatever an encoder makes resident brings what its bytes
+reach as a table, listed or reached through another table as well as bound: a
+kernel may follow an address to the entries of the table it names.
 
 KV pages live in extents: ordinary shared Metal buffers of one size per pool,
 between half and one and a half times 128 MiB, in which every tensor region of

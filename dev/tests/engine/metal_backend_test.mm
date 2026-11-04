@@ -1287,9 +1287,9 @@ void addressTables(const std::string &metallibPath) {
 // A kernel may follow an address to the entries of the table it names
 // (setTableReach), so what an encoder makes resident brings what it reaches:
 // a bound table brings the tables it reaches and what they reach, and a table
-// listed in an AddressTable what it reaches, each buffer once, also when a
-// table reaches itself, as a test fixture's tables lie in the memory they
-// reach.
+// listed in an AddressTable what the listed bytes reach, each buffer once,
+// also when a table reaches itself, as a test fixture's tables lie in the
+// memory they reach.
 void tablesBringWhatTheyReach(const std::string &metallibPath) {
     EncoderUses recorded;
     MetalBackend backend(metallibPath);
@@ -1305,14 +1305,14 @@ void tablesBringWhatTheyReach(const std::string &metallibPath) {
     backend.setTableReach(innerEntry, std::span(&leaf, 1));
     backend.setTableReach(backend.view(outer, 0, sizeof(uint64_t)), std::span(&inner, 1));
     MetalBuffer mismatches = sharedBuffer(backend, sizeof(uint32_t));
+    const auto declared = [&](const char *label) {
+        size_t count = 0;
+        for (const EncoderUses::Use &use : recorded.uses)
+            count += std::count(use.labels.begin(), use.labels.end(), std::string(label));
+        return count;
+    };
     const auto declaredOnce = [&](std::initializer_list<const char *> labels) {
-        for (const char *label : labels) {
-            size_t count = 0;
-            for (const EncoderUses::Use &use : recorded.uses)
-                count += std::count(use.labels.begin(), use.labels.end(), std::string(label));
-            if (count != 1) return false;
-        }
-        return true;
+        return std::ranges::all_of(labels, [&](const char *label) { return declared(label) == 1; });
     };
 
     // The kernel reads inner through outer's entry.
@@ -1335,6 +1335,15 @@ void tablesBringWhatTheyReach(const std::string &metallibPath) {
     (void)backend.submitCommandAsync(graph.dispatches()).wait();
     require(declaredOnce({"outer", "inner", "leaf"}),
             "an encoder listing a table in an address table did not make what it reaches resident once");
+    // Listed bytes of outer past its entry reach nothing, as bound ones.
+    CommandGraph past;
+    past.add("address_table_check_u32", {mismatches}, TableParams{0, 0}, {1, 1, 1}, {1, 1, 1});
+    past.addresses(std::make_shared<std::vector<MetalBuffer>>(
+        1, backend.view(outer, sizeof(uint64_t), sizeof(uint64_t))));
+    recorded.uses.clear();
+    (void)backend.submitCommandAsync(past.dispatches()).wait();
+    require(declared("outer") == 1 && declared("inner") == 0 && declared("leaf") == 0,
+            "listed bytes of a table that hold none of its entries made what it reaches resident");
 
     const std::array<MetalBuffer, 2> itself{leaf, inner};
     backend.setTableReach(innerEntry, itself);

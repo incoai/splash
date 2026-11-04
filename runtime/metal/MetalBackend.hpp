@@ -142,7 +142,7 @@ struct IndirectGrid {
 // `index` (setBytes, so at most 512 of them), and makes their memory resident
 // for the encoder's dispatches from this one on (useResources, for reading,
 // or reading and writing when `writes`, declared once per table and usage per
-// encoder), with what any of them reaches as a table
+// encoder), with what the bytes of any of them reach as a table
 // (MetalBackend::setTableReach).
 // Addresses are the buffers' when the command is encoded, so a buffer
 // released and restored since the graph was built is reached where it is
@@ -427,9 +427,9 @@ public:
   // view of a Shared buffer, hold: each encoder that uses the table makes
   // them resident (useResources, for reading and writing), each buffer once
   // per encoder however many tables reach it, as the command is encoded. An
-  // encoder uses the table when its dispatches bind any of those bytes, list
-  // a view of its buffer in an AddressTable, or reach that buffer through
-  // another table: a kernel may follow an address to the entries of the
+  // encoder uses the table when its dispatches bind or list (AddressTable) a
+  // view holding any of those bytes, or reach its buffer through another
+  // table: a kernel may follow an address to the entries of the
   // table it names, so what an encoder makes resident brings what it
   // reaches. It replaces what the same bytes named before, so the owner
   // calls it whenever it rewrites the table's entries, for every buffer they

@@ -320,8 +320,8 @@ struct MetalAllocation {
     __strong NSString *label = nil;
     BufferReach reach = BufferReach::Bound;
     // A table's: the Addressed buffers each range of its bytes holds the
-    // addresses of (MetalBackend::setTableReach), which an encoder binding
-    // any of those bytes declares. Ranges never overlap.
+    // addresses of (MetalBackend::setTableReach), which each encoder that
+    // uses those bytes declares. Ranges never overlap.
     std::vector<TableReach> reaches;
     // The owner of wrapped memory (MetalBackend::wrapSharedMemory), which is
     // never released: our views keep it as well as Metal's deallocator.
@@ -1486,9 +1486,8 @@ struct MetalBackend::Impl {
                 NSUInteger offsets[kBufferArgumentEntries];
                 // The command's address tables (AddressTable), each resolved
                 // once: its buffers' GPU addresses as they are now, the
-                // distinct Metal buffers behind them, and what the tables
-                // among them reach (TableReach), every range of each: a kernel
-                // holding an address is not held to a view's bytes.
+                // distinct Metal buffers behind them, and what the bytes of
+                // the tables among them reach (TableReach), as for a binding.
                 struct ResolvedTable {
                     const std::vector<MetalBuffer> *source = nullptr;
                     std::vector<uint64_t> addresses;
@@ -1504,12 +1503,18 @@ struct MetalBackend::Impl {
                     std::vector<__unsafe_unretained id<MTLResource>> resources;
                 };
                 std::vector<ResolvedReach> reaches;
+                // Whether the bytes of `view` hold any of `reach`'s entries.
+                const auto overlaps = [](const TableReach &reach, const MetalBuffer::Impl &view) {
+                    return reach.offsetBytes < view.offsetBytes + view.lengthBytes &&
+                           view.offsetBytes < reach.offsetBytes + reach.lengthBytes;
+                };
                 const auto resolve = [&](const std::vector<MetalBuffer> &source) -> const ResolvedTable & {
                     for (const ResolvedTable &table : tables)
                         if (table.source == &source) return table;
                     ResolvedTable &table = tables.emplace_back();
                     table.source = &source;
                     table.addresses.reserve(source.size());
+                    std::vector<const void *> sources;
                     std::vector<const MetalAllocation *> followed;
                     for (const MetalBuffer &entry : source) {
                         const MetalBuffer::Impl &buffer = *entry.impl_;
@@ -1517,8 +1522,13 @@ struct MetalBackend::Impl {
                         table.addresses.push_back(memory.gpuAddress + buffer.offsetBytes);
                         if (std::ranges::find(table.resources, memory) == table.resources.end())
                             table.resources.push_back(memory);
-                        for (const TableReach &reach : buffer.allocation->reaches)
+                        for (const TableReach &reach : buffer.allocation->reaches) {
+                            if (!overlaps(reach, buffer) ||
+                                std::ranges::find(sources, reach.reached.get()) != sources.end())
+                                continue;
+                            sources.push_back(reach.reached.get());
                             appendReached(*reach.reached, table.reached, followed);
+                        }
                     }
                     return table;
                 };
@@ -1554,9 +1564,7 @@ struct MetalBackend::Impl {
                 // Declares what the bytes a dispatch binds of a table reach.
                 const auto declareReach = [&](const MetalBuffer::Impl &bound) {
                     for (const TableReach &reach : bound.allocation->reaches) {
-                        if (reach.offsetBytes >= bound.offsetBytes + bound.lengthBytes ||
-                            bound.offsetBytes >= reach.offsetBytes + reach.lengthBytes)
-                            continue;
+                        if (!overlaps(reach, bound)) continue;
                         auto resolved = std::ranges::find(reaches, reach.reached, &ResolvedReach::source);
                         if (resolved == reaches.end()) {
                             ResolvedReach &added = reaches.emplace_back();
