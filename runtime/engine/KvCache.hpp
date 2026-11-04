@@ -209,14 +209,14 @@ public:
   // moves, of a block that is not poisoned. Pass the previous candidate to
   // continue the scan.
   [[nodiscard]] std::optional<CacheEvictionCandidate> trimCandidate(uint64_t after) const;
-  // The resident pages of the form, on the chains of these blocks (each
-  // block and every block above it), that no request holds and no transfer
-  // moves; each counts once. A request holds every page of its chain, so a
-  // chain's count stops at the first page one holds.
-  [[nodiscard]] uint32_t idlePagesOnChains(std::span<const uint64_t> blocks, kv::PageForm form) const;
-  // Calls `visit` with each resident block whose page no request holds and
-  // no transfer moves, and its page: the KV a reclaim may take.
-  void forEachIdleBlock(const std::function<void(uint64_t blockId, uint32_t page)> &visit) const;
+  // The resident pages of each form, on the chains of these blocks (each
+  // block and every block above it), and with `unwritten` of every resident
+  // block without a copy that a state at it or below it needs, which a
+  // writable tier writes before its page frees, that no request holds and
+  // no transfer moves; each counts once. A request holds every page of its
+  // chain, so a chain's count stops at the first page one holds.
+  [[nodiscard]] std::array<uint32_t, 3> idlePagesOnChains(std::span<const uint64_t> blocks,
+                                                          bool unwritten = false) const;
   // Resident, without resident children, users or holders: its page can go
   // once no transfer moves it.
   [[nodiscard]] bool residentLeaf(uint64_t blockId) const;
@@ -350,6 +350,8 @@ private:
     RecencyOrder::Node unneededNode;
     // With a window alone.
     RecencyOrder::Node trimNode;
+    // The idlePagesOnChains call that reached it last.
+    mutable uint64_t chainWalk = 0;
   };
 
   // The orders a block waits in, as its fields stand.
@@ -413,6 +415,7 @@ private:
   uint64_t rewrites_ = 0;
   uint64_t upgrades_ = 0;
   uint32_t pinnedBlocks_ = 0;
+  mutable uint64_t chainWalks_ = 0;
 };
 
 } // namespace splash::engine

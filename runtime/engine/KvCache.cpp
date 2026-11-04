@@ -434,31 +434,31 @@ std::optional<CacheEvictionCandidate> KvCache::trimCandidate(uint64_t after) con
   return trimmable_.next({after, block(after).lastUsed});
 }
 
-uint32_t KvCache::idlePagesOnChains(std::span<const uint64_t> blocks, kv::PageForm form) const {
-  std::unordered_set<uint64_t> visited;
-  uint32_t pages = 0;
-  for (uint64_t blockId : blocks) {
-    while (blockId && visited.insert(blockId).second) {
-      const Block &entry = block(blockId);
-      if (entry.page != noPage) {
+std::array<uint32_t, 3> KvCache::idlePagesOnChains(std::span<const uint64_t> blocks, bool unwritten) const {
+  // A block a chain reached before, and every block above it, is counted.
+  const uint64_t walk = ++chainWalks_;
+  std::array<uint32_t, 3> pages{};
+  const auto climb = [&](const Block *entry) {
+    while (entry && entry->chainWalk != walk) {
+      entry->chainWalk = walk;
+      if (entry->page != noPage) {
         // The request holding this page holds every page above it too.
-        if (pool_.pageActive(entry.page))
-          break;
-        if (entry.transfer == Transfer::None && entry.form == form)
-          ++pages;
+        if (pool_.pageActive(entry->page))
+          return;
+        if (entry->transfer == Transfer::None)
+          ++pages[static_cast<size_t>(entry->form)];
       }
       // A disk-only block holds no page; the walk goes on above it.
-      blockId = entry.parent;
+      entry = entry->parent ? &block(entry->parent) : nullptr;
     }
-  }
+  };
+  for (const uint64_t blockId : blocks)
+    climb(&block(blockId));
+  if (unwritten)
+    for (const auto &[_, entry] : blocks_)
+      if (entry.page != noPage && !entry.slot && (entry.statesHere || entry.statesBelow))
+        climb(&entry);
   return pages;
-}
-
-void KvCache::forEachIdleBlock(const std::function<void(uint64_t blockId, uint32_t page)> &visit) const {
-  for (const auto &[id, entry] : blocks_)
-    if (entry.page != noPage && entry.transfer == Transfer::None && !entry.held && !entry.activeUsers &&
-        !pool_.pageActive(entry.page))
-      visit(id, entry.page);
 }
 
 bool KvCache::residentLeaf(uint64_t blockId) const {

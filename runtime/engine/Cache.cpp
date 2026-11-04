@@ -1057,22 +1057,19 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
     kept.push_back(point);
   // What frees only later holds its chain above it too, which frees later:
   // a state that leaves only once written, or once the write in flight has
-  // landed; a block a writable tier writes before its page frees (no copy,
-  // a state needs it); a demotion in flight.
+  // landed; a block a writable tier writes before its page frees; a
+  // demotion in flight.
   std::vector<uint64_t> later = kept;
   WalkCursor cursor;
   for (std::optional<WalkUnit> unit; (unit = nextUnit({.upTo = upTo, .statesOnly = true}, cursor));)
     if (states_.reclaimOutcome(unit->candidate.id, StateCache::Unwritten::Wait).pending ||
         states_.reclaimWrites(unit->candidate.id))
       later.push_back(unit->candidate.id);
-  if (kvTierWritable())
-    kv_.forEachIdleBlock([&](uint64_t block, uint32_t) {
-      if (!kv_.slot(block) && kvNeededByState(block))
-        later.push_back(block);
-    });
   for (const Write &write : writes_)
     if (write.write == WriteClass::Reclaim)
       later.push_back(write.block);
+  const std::array<uint32_t, 3> keptPages = kv_.idlePagesOnChains(kept);
+  const std::array<uint32_t, 3> laterPages = kv_.idlePagesOnChains(later, kvTierWritable());
   const std::array<uint32_t, 3> landing = demotedPages();
   ReclaimReach result;
   std::array<uint32_t, 3> now{}, all{};
@@ -1080,10 +1077,8 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
     const auto index = static_cast<size_t>(form);
     const uint32_t allocated = pool_.allocatedExtents(form) * extent;
     const uint32_t reusable = pool_.reusablePages(form);
-    const uint32_t keptPages = kv_.idlePagesOnChains(kept, form);
-    const uint32_t laterPages = kv_.idlePagesOnChains(later, form) - keptPages;
-    all[index] = std::min(allocated, reusable - std::min(reusable, keptPages));
-    now[index] = all[index] - std::min(all[index], landing[index] + laterPages);
+    all[index] = std::min(allocated, reusable - std::min(reusable, keptPages[index]));
+    now[index] = all[index] - std::min(all[index], landing[index] + laterPages[index] - keptPages[index]);
     // Compaction gathers the pages that stay into the fewest extents, and
     // the rest empty, but for the free pages a KV need takes and the
     // runway the walk keeps.
@@ -1390,7 +1385,7 @@ uint32_t Cache::reusablePages(ReclaimClass upTo, kv::PageForm form) const {
   const uint32_t unheld = pool_.reusablePages(form);
   if (upTo == ReclaimClass::InUse)
     return unheld;
-  return unheld - kv_.idlePagesOnChains(states_.usedStates(), form);
+  return unheld - kv_.idlePagesOnChains(states_.usedStates())[static_cast<size_t>(form)];
 }
 
 Cache::ReclaimResult Cache::recycleState(const Walk &walk) {
