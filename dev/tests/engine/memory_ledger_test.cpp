@@ -1202,6 +1202,26 @@ void testZeroCostUnsizedUnitsGoFirst() {
           "the unsized buffers did not go first and end the need");
 }
 
+// The host's claim takes its target: the idle buffers that go first count in it. Taking the whole target beyond
+// them gave the host 256 MiB more than it asked for here.
+void testTheHostClaimCountsTheIdleBuffersInItsTarget() {
+  MemoryLedger ledger;
+  TestSource engine("engine"), cache("cache");
+  Victim buffers = unit(1, 0);
+  buffers.sized = false;
+  engine.units = {buffers};
+  engine.unsizedBytes = 256 * kMiB;
+  for (uint64_t key = 2; key <= 5; ++key)
+    cache.units.push_back(unit(key, 128 * kMiB));
+  ledger.addSource(cache);
+  ledger.addSource(engine);
+  const ClaimId claim = ledger.open({.cls = ClaimClass::Host});
+  const FreeResult freed = ledger.free(claim, {.bytes = 512 * kMiB}, 0, false);
+  ledger.close(claim);
+  require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 512 * kMiB && cache.taken.size() == 2,
+          "the host's claim took " + std::to_string(freed.nowBytes / kMiB) + " MiB for a target of 512 MiB");
+}
+
 // A claim that takes no units (ClaimSpec::takesUnits) takes only what costs nothing and what lands.
 void testAClaimThatTakesNoUnitsTakesNone() {
   MemoryLedger ledger;
@@ -2036,6 +2056,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testHostRefusedNeedIsMetInPlaceFirst", testHostRefusedNeedIsMetInPlaceFirst},
       {"testAnExemptRetryPassesTheHostWithEachReservation", testAnExemptRetryPassesTheHostWithEachReservation},
       {"testZeroCostUnsizedUnitsGoFirst", testZeroCostUnsizedUnitsGoFirst},
+      {"testTheHostClaimCountsTheIdleBuffersInItsTarget", testTheHostClaimCountsTheIdleBuffersInItsTarget},
       {"testAClaimThatTakesNoUnitsTakesNone", testAClaimThatTakesNoUnitsTakesNone},
       {"testAvailableTakesNothing", testAvailableTakesNothing},
       {"testAvailableCountsWhatLandsForAClaimThatCanWait", testAvailableCountsWhatLandsForAClaimThatCanWait},

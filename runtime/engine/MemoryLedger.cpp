@@ -536,11 +536,12 @@ uint64_t MemoryLedger::takeUnsized(const VictimQuery &query) {
 // bytes lacks what admission asks beyond the room: its need plus the room
 // held against it. A need met in place lacks no bytes. A need the host
 // refused counts only units that leave memory in place, and the host's claim
-// lacks its whole need, since room under the engine's limit returns nothing
-// to the host. State buffers the units free meet a need of bytes once they
-// leave the model's pool, so the units that cost nothing go again (a need in
-// place keeps them). A claim that can wait, short only by the room waiting
-// claims ranked above it hold, waits as their holds end.
+// lacks its need beyond the units that cost nothing, since room under the
+// engine's limit returns nothing to the host. State buffers the units free
+// meet a need of bytes once they leave the model's pool, so the units that
+// cost nothing go again (a need in place keeps them). A claim that can
+// wait, short only by the room waiting claims ranked above it hold, waits
+// as their holds end.
 FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBytes, bool critical, bool exempts) {
   const uint32_t id = claimId.value;
   ClaimState &claim = claims_.at(id);
@@ -554,7 +555,9 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
   // projected growth room a pool's growth leaves them.
   const uint64_t held = host ? 0 : heldFor(spec, id);
   const uint64_t forClaim = less(room, held);
-  const uint64_t lackingBytes = need.hostRefused || !need.bytes ? 0 : less(plus(need.bytes, held), room);
+  const uint64_t lackingBytes = need.hostRefused || !need.bytes ? 0
+                                : host ? less(need.bytes, result.nowBytes)
+                                       : less(plus(need.bytes, held), room);
   const uint32_t lackingPages = need.pages;
   const bool canWait = spec.timing == NeedTiming::CanWait && !need.hostRefused;
 
