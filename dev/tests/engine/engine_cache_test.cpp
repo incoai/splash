@@ -5516,6 +5516,69 @@ void testDeviceNeedReachesTheLeavesPastTheStates() {
   cache.checkInvariants();
 }
 
+// A lone request's KV growth that needs the extents of every idle chain but the resume point's, while
+// each chain's states need writes and one write holds the write slot: the claim's own first write,
+// or with `inFlight` the write of a unit taken before the claim (takeFirst). The walk takes each
+// state behind that write as a unit that lands later, the ordinary ones at the chains' leaves (with
+// `inUse` held in use) and with `checkpoints` the checkpoints on the chains' second blocks, and the
+// newer states of its phase follow it, so the walk reaches every chain's pages and the claim waits
+// instead of being short. The writes land one at a time, each releasing its chain's extent to the
+// claims that follow.
+void growPastAStateWrite(bool checkpoints, bool inUse, bool inFlight) {
+  const std::string label = std::string(checkpoints ? "checkpoints" : "leaf states") + (inUse ? " in use" : "") +
+                            (inFlight ? ", write in flight: " : ": ");
+  test::TestKvStorage storage{48, 100, 4};
+  KvPool pool{storage, 4};
+  engine::Cache cache(pool, nullptr, nullptr);
+  auto control = std::make_shared<TransferControl>();
+  std::vector<StateUse> uses;
+  for (uint64_t id = 1; id <= 5; ++id) {
+    std::vector<uint32_t> prompt(4 * KvCache::pageTokens + 1);
+    std::iota(prompt.begin(), prompt.end(), 1000 * id);
+    cache.beginRequest(id);
+    require(admitTokens(cache, id, prompt.size()).granted(), label + "a conversation's pages were denied");
+    cache.publishCommittedBlocks(id, prompt, 4 * KvCache::pageTokens, {});
+    const uint64_t inner = cache.blockAt(id, 2 * KvCache::pageTokens);
+    const uint64_t leaf = cache.blockAt(id, 4 * KvCache::pageTokens);
+    cache.endRequest(id);
+    if (checkpoints)
+      cache.publishCompositeState(inner, std::make_shared<TieredState>(control), true);
+    cache.publishCompositeState(leaf, std::make_shared<TieredState>(control), !checkpoints && id == 1);
+    if (inUse)
+      uses.push_back(cache.useState(leaf));
+  }
+  static_cast<void>(cache.releaseEmptyExtents(false));
+  const uint64_t extent = storage.extentPages() * 100, need = 4 * extent;
+  const uint64_t allocated = pool.allocatedBytes();
+  const auto released = [&] { return allocated - pool.allocatedBytes(); };
+  const auto claim = [&](const char *when) {
+    const FreeResult freed = test::freeFromCache(cache, test::kInServiceGrowth, {.bytes = need - released()});
+    require(freed.outcome != FreeOutcome::Short,
+            label + "growth was short with idle chains behind the state write " + when);
+  };
+  if (inFlight)
+    require(test::takeFirst(cache, test::kInServiceGrowth, {.bytes = need}).outcome != FreeOutcome::Short,
+            label + "the first unit was short");
+  if (released() < need)
+    claim("before the writes landed");
+  control->ready = true;
+  for (int round = 0; round < 16 && released() < need; ++round) {
+    static_cast<void>(cache.pollTransfers());
+    if (released() < need)
+      claim("as the writes landed");
+  }
+  require(released() >= need, label + "the idle chains did not free their extents once the writes landed: " +
+                                  std::to_string(released()) + " bytes released");
+  cache.checkInvariants();
+}
+
+void testGrowthPastAStateWriteReachesTheIdleChains() {
+  for (const bool checkpoints : {false, true})
+    for (const bool inUse : {false, true})
+      for (const bool inFlight : {false, true})
+        growPastAStateWrite(checkpoints, inUse, inFlight);
+}
+
 // A state of TestState's bytes that counts the cache's looks at it: its
 // bytes, and whether the tier takes its write.
 class CountedState final : public CompositeState {
@@ -6210,6 +6273,7 @@ int main() {
     testBurstReclaimTakesWholeExtentsOncePerNeed();
     testGrowthNeedKeepsTheFreePagesItTakes();
     testDeviceNeedReachesTheLeavesPastTheStates();
+    testGrowthPastAStateWriteReachesTheIdleChains();
     testDeviceNeedWeighsALargeCacheAtOnce();
     testDeviceNeedKeepsKvBesideTheIndexRunway();
     testDeviceNeedPassesOverLeavesOfFormsOutOfReach();

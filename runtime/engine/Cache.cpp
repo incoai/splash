@@ -1483,9 +1483,14 @@ Cache::ReclaimPlan::Step Cache::ReclaimPlan::evict() {
     visit(Checkpoints);
     if (keptState(checkpoint->id))
       continue;
+    // As evictPhase's states: one that waits for its write goes as a unit
+    // that lands later and the newer checkpoints follow it; one that waits
+    // and is not taken holds them back.
     const StateEviction goes = stateGoes(checkpoint->id);
-    if (goes.evicted) {
-      took();
+    const bool later = goes.pending && writes(checkpoint->id) && !keptPoint(checkpoint->id, generation_ + 1);
+    if (goes.evicted || later) {
+      if (goes.evicted)
+        took();
       return {.progress = true, .pages = takeState(checkpoint->id, false), .state = true};
     }
     checkpointsDone_ = goes.pending;
@@ -1529,10 +1534,12 @@ Cache::ReclaimPlan::Step Cache::ReclaimPlan::evictPhase(bool inUse) {
       // One that needs a write and waits for the write slot frees its memory
       // as a unit that lands later, once that write and its own have landed,
       // unless it is the resume point by then; the newer states of its phase
-      // follow it.
+      // follow it, each a unit of its own. One that waits and is not taken
+      // holds them back.
       const StateEviction goes = stateGoes(state->id);
-      held = goes.pending;
-      if (goes.evicted || (goes.pending && writes(state->id) && !keptPoint(state->id, generation_ + 1))) {
+      const bool later = goes.pending && writes(state->id) && !keptPoint(state->id, generation_ + 1);
+      held = goes.pending && !later;
+      if (goes.evicted || later) {
         if (goes.evicted)
           took();
         return {.progress = true, .pages = takeState(state->id, inUse), .state = true};
@@ -1616,10 +1623,14 @@ Cache::ReclaimPlan::Step Cache::ReclaimPlan::recycle() {
         visit(order);
         continue;
       }
-      if (!stateGoes(state->id).evicted)
+      // One that waits for its write goes as a unit that lands later, as in
+      // evictPhase; one that waits and is not taken ends the recycling.
+      const StateEviction goes = stateGoes(state->id);
+      if (!goes.evicted && !(goes.pending && writes(state->id) && !keptPoint(state->id, generation_ + 1)))
         return {};
       visit(order);
-      took();
+      if (goes.evicted)
+        took();
       return {.progress = true, .pages = takeState(state->id, order == RecycledUsed), .state = true};
     }
   }
