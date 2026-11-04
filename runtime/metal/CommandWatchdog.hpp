@@ -13,7 +13,7 @@ namespace splash::metal {
 // returns, so that a command split by host steps (a streamed prefill reading
 // its history layer by layer) may run as long as each part ends within the
 // timeout. Metal holds each part to less: it fails the wait after a part
-// whose work and step take more than 5 s (EventStep).
+// whose work and step take more than supervision::kGpuWaitLimit (EventStep).
 class CommandWatchdog final {
 public:
   explicit CommandWatchdog(double timeoutSeconds)

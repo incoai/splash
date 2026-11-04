@@ -31,6 +31,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <pthread.h>
@@ -284,9 +285,25 @@ id<MTLLibrary> loadLibrary(id<MTLDevice> device, const std::string &metallibPath
 
 }  // namespace
 
+bool commandOutOfMemory(NSError *error) noexcept {
+    return error && [error.domain isEqualToString:MTLCommandBufferErrorDomain] &&
+           error.code == MTLCommandBufferErrorOutOfMemory;
+}
+
 struct AllocationAccounting {
     std::atomic<uint64_t> allocatedBytes{0};
     std::atomic<uint64_t> peakAllocatedBytes{0};
+};
+
+struct MetalAllocation;
+
+// The Addressed buffers whose addresses a range of a table's bytes holds
+// (MetalBackend::setTableReach), held weakly: the owner releases them only
+// while no command reaches them.
+struct TableReach {
+    uint64_t offsetBytes = 0;
+    uint64_t lengthBytes = 0;
+    std::shared_ptr<const std::vector<std::weak_ptr<MetalAllocation>>> reached;
 };
 
 struct MetalAllocation {
@@ -302,6 +319,10 @@ struct MetalAllocation {
     BufferStorage storage = BufferStorage::Shared;
     __strong NSString *label = nil;
     BufferReach reach = BufferReach::Bound;
+    // A table's: the Addressed buffers each range of its bytes holds the
+    // addresses of (MetalBackend::setTableReach), which an encoder binding
+    // any of those bytes declares. Ranges never overlap.
+    std::vector<TableReach> reaches;
     // The owner of wrapped memory (MetalBackend::wrapSharedMemory), which is
     // never released: our views keep it as well as Metal's deallocator.
     std::shared_ptr<void> owner;
@@ -314,7 +335,7 @@ struct MetalAllocation {
     void attach(id<MTLBuffer> allocated) {
         buffer = allocated;
         bytes = allocated.allocatedSize;
-        if (auto kept = residency.lock()) kept->add(buffer, reach);
+        if (auto kept = residency.lock()) kept->add(buffer);
         raisePeak(accounting->peakAllocatedBytes,
                   accounting->allocatedBytes.fetch_add(
                       bytes, std::memory_order_relaxed) + bytes);
@@ -322,7 +343,7 @@ struct MetalAllocation {
     // Lets the buffer go: it leaves the residency set and the accounting.
     void detach() noexcept {
         if (!buffer) return;
-        if (auto kept = residency.lock()) kept->remove(buffer, reach);
+        if (auto kept = residency.lock()) kept->remove(buffer);
         accounting->allocatedBytes.fetch_sub(bytes, std::memory_order_relaxed);
         buffer = nil;
         bytes = 0;
@@ -332,7 +353,7 @@ struct MetalAllocation {
 };
 
 // Every Impl has an allocation, whose buffer is nil only while its memory is
-// released: only allocateBuffer, wrapSharedMemory and view create one.
+// released: only reserveBuffer, wrapSharedMemory and view create one.
 struct MetalBuffer::Impl {
     std::shared_ptr<MetalAllocation> allocation;
     uint64_t offsetBytes = 0;
@@ -503,9 +524,10 @@ struct BackendAsyncState {
 // the work after it waits for. A shared event holds the value written last,
 // and a GPU signal can land after a later value the CPU wrote to the same
 // event (M5 Max, macOS 27: about once in a million steps), which puts it back
-// and holds the work waiting for the CPU's value until Metal fails it after 5
-// s ("Caused GPU Timeout Error"). Past ranEvent of a step that keeps the GPU
-// awake the runner raises the backend's release counter to the step's value,
+// and holds the work waiting for the CPU's value until Metal fails it after
+// supervision::kGpuWaitLimit ("Caused GPU Timeout Error"). Past ranEvent of a
+// step that keeps the GPU awake the runner raises the backend's release
+// counter to the step's value,
 // which ends the GPU's spin through it (host_step_wait), and then runs the
 // step's `then` once its work returned. Each step runs unless the command
 // buffer before it failed or an earlier step of its command did not run or
@@ -534,7 +556,8 @@ struct HostSteps {
     std::shared_ptr<BackendAsyncState> backend;
     // The command's submission (BackendAsyncState::beginSubmission).
     uint64_t sequence = 0;
-    // The spin's release buffer (HostStepSpin), once a step spins.
+    // The spin's release buffer (HostStepSpin) while awake steps spin, set
+    // before the first step reaches the runner, which reads it.
     __strong id<MTLBuffer> releases = nil;
     // A deque, so that the runner holds on to a step while the submission
     // appends the next.
@@ -562,25 +585,20 @@ struct HostSteps {
         step.done = done;
     }
     // Hands each step that ran its round trip, once every buffer of the
-    // command completed, and returns how long the command's GPU work waited
-    // on them (CommandTiming::hostSeconds).
-    double report() {
+    // command completed.
+    void report() {
         std::lock_guard lock(mutex);
-        if (reported) return 0.0;
+        if (reported) return;
         reported = true;
-        double waited = 0.0;
         for (const Step &step : steps) {
             id<MTLCommandBuffer> before = step.before, after = step.after;
-            if (!step.done || !before || !after) continue;
-            waited += std::max(0.0, after.GPUStartTime - before.GPUEndTime);
-            if (!step.timed) continue;
+            if (!step.done || !before || !after || !step.timed) continue;
             HostStepTiming timing;
             timing.pickupSeconds = std::max(0.0, step.pickup - before.GPUEndTime);
             timing.workSeconds = step.done - step.pickup;
             timing.resumeSeconds = std::max(0.0, after.GPUStartTime - step.done);
             step.timed(timing);
         }
-        return waited;
     }
     // A failed command's account of the steps that ran: how many, the longest
     // work, and the longest pickup (from the end of the GPU work before a
@@ -763,6 +781,8 @@ struct CommandTicket::State {
     std::vector<id<MTLCommandBuffer>> leadingCommands;
     std::shared_ptr<HostSteps> hostSteps;
     std::string error;
+    // The failure was a command buffer's want of GPU memory.
+    bool outOfMemory = false;
     bool completed = false;
     bool released = false;
 
@@ -806,16 +826,16 @@ struct CommandTicket::State {
         }
         if (hostSteps && error.empty()) {
             try {
-                timing.hostSeconds = hostSteps->report();
+                hostSteps->report();
             } catch (...) {
                 backend->markUnhealthy("Metal host step timing callback threw an exception");
             }
         }
 
-        finish(timing, std::move(error));
+        finish(timing, std::move(error), host.empty() && failed && commandOutOfMemory(failed.error));
     }
 
-    void finish(CommandTiming result, std::string failure) {
+    void finish(CommandTiming result, std::string failure, bool failedOutOfMemory) {
         CommandCompletion notify;
         {
             std::lock_guard lock(mutex);
@@ -826,6 +846,7 @@ struct CommandTicket::State {
             if (!failure.empty()) backend->markUnhealthy(failure);
             timing = result;
             error = std::move(failure);
+            outOfMemory = failedOutOfMemory;
             completed = true;
             notify = completion;
         }
@@ -968,8 +989,12 @@ struct MetalBackend::Impl {
         asyncState->markUnhealthy(std::move(reason));
     }
 
-    id<MTLBuffer> newBuffer(uint64_t bytes, BufferStorage storage,
-                            NSString *label) {
+    // Returned retained, never autoreleased: a buffer's memory returns with
+    // its last reference though the serving thread's autorelease pool never
+    // drains, also where ARC cannot elide an autoreleased return (a
+    // ThreadSanitizer build's instrumentation keeps it from doing so).
+    NS_RETURNS_RETAINED id<MTLBuffer> newBuffer(uint64_t bytes, BufferStorage storage,
+                                                NSString *label) {
         MTLResourceOptions options = storage == BufferStorage::Shared
             ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate;
         id<MTLBuffer> buffer = [device newBufferWithLength:bytes
@@ -1212,24 +1237,27 @@ struct MetalBackend::Impl {
             steps->readyEvent = [device newSharedEvent];
             steps->ranEvent = [device newSharedEvent];
             if (!steps->readyEvent || !steps->ranEvent) failEncoding("unable to create Metal shared event");
+            if (hostStepSpin) steps->releases = hostStepSpin->releases;
         }
         const uint64_t ready = steps->steps.size() + 1;
         [command encodeSignalEvent:steps->readyEvent value:ready];
-        leading.push_back(command);
+        id<MTLCommandBuffer> awake = nil;
         std::optional<uint32_t> released;
         if (step.gpu == HostStepGpu::Awake && hostStepSpin) {
-            id<MTLCommandBuffer> awake = [queue commandBuffer];
+            awake = [queue commandBuffer];
             if (!awake) failEncoding("unable to create Metal command buffer");
             released = encodeSpin(*hostStepSpin, awake, failEncoding);
-            steps->releases = hostStepSpin->releases;
-            leading.push_back(awake);
         }
         id<MTLCommandBuffer> next = [queue commandBuffer];
         if (!next) failEncoding("unable to create Metal command buffer");
         [next encodeWaitForEvent:steps->ranEvent value:ready];
         steps->steps.push_back({ready, step.work, step.timed, step.then, command, next, 0.0, 0.0, released});
-        for (auto buffer = leading.end() - (released ? 2 : 1); buffer != leading.end(); ++buffer)
-            [*buffer commit];
+        // `leading` holds the buffers committed, nothing failing in between.
+        for (id<MTLCommandBuffer> buffer : {command, awake}) {
+            if (!buffer) continue;
+            leading.push_back(buffer);
+            [buffer commit];
+        }
         hostStepRunner->add(steps, steps->steps.back());
         return next;
     }
@@ -1369,17 +1397,18 @@ struct MetalBackend::Impl {
         residency->use();
         // Metal may autorelease the command and its encoder, and the serving
         // loop's pool never drains, so their temporary ownership ends with
-        // this submission (under the validation layer an autoreleased
-        // command holds every member of its queue's residency set). The
-        // command retains everything the GPU still needs.
+        // this submission. The command retains everything the GPU still
+        // needs.
         @autoreleasepool {
-            // The buffers before `command`, each ended by an event signal or
-            // a host step.
+            // The buffers before `command` committed, each ended by an event
+            // signal or a host step.
             std::vector<id<MTLCommandBuffer>> leading;
             // Any failure while encoding, such as Metal creating no buffer or
             // encoder, marks the backend unhealthy. The buffers already
             // committed run on, with the host steps after them, so the backend
-            // keeps their command's state, and with it its allocations.
+            // keeps their command's state, with its allocations, and its
+            // submission, which owners read as a command in flight before
+            // they free memory the buffers may reach by address (KV pages).
             try {
                 id<MTLCommandBuffer> command = [queue commandBuffer];
                 if (!command) {
@@ -1440,6 +1469,13 @@ struct MetalBackend::Impl {
                     std::vector<__unsafe_unretained id<MTLResource>> resources;
                 };
                 std::vector<ResolvedTable> tables;
+                // The command's table reaches (TableReach), each resolved once:
+                // the memory of the buffers it names that is allocated now.
+                struct ResolvedReach {
+                    std::shared_ptr<const std::vector<std::weak_ptr<MetalAllocation>>> source;
+                    std::vector<__unsafe_unretained id<MTLResource>> resources;
+                };
+                std::vector<ResolvedReach> reaches;
                 const auto resolve = [&](const std::vector<MetalBuffer> &source) -> const ResolvedTable & {
                     for (const ResolvedTable &table : tables)
                         if (table.source == &source) return table;
@@ -1455,9 +1491,54 @@ struct MetalBackend::Impl {
                     }
                     return table;
                 };
-                // The tables `encoder` already made resident, and whether for
-                // writing: a declaration lasts for the encoder.
-                std::vector<std::pair<const std::vector<MetalBuffer> *, bool>> declared;
+                // The tables and reaches `encoder` already made resident, and
+                // whether for writing, and the memory reaches made resident:
+                // a declaration lasts for the encoder.
+                std::vector<std::pair<const void *, bool>> declared;
+                std::unordered_set<const void *> declaredReached;
+                std::vector<__unsafe_unretained id<MTLResource>> undeclared;
+                const auto declare = [&](const void *source, bool writes,
+                                         const std::vector<__unsafe_unretained id<MTLResource>> &resources) {
+                    const std::pair use{source, writes};
+                    if (std::ranges::find(declared, use) != declared.end()) return;
+                    if (!resources.empty())
+                        [encoder useResources:resources.data()
+                                        count:resources.size()
+                                        usage:writes ? MTLResourceUsageRead | MTLResourceUsageWrite
+                                                     : MTLResourceUsageRead];
+                    declared.push_back(use);
+                };
+                // Declares what the bytes a dispatch binds of a table reach.
+                const auto declareReach = [&](const MetalBuffer::Impl &bound) {
+                    for (const TableReach &reach : bound.allocation->reaches) {
+                        if (reach.offsetBytes >= bound.offsetBytes + bound.lengthBytes ||
+                            bound.offsetBytes >= reach.offsetBytes + reach.lengthBytes)
+                            continue;
+                        auto resolved = std::ranges::find(reaches, reach.reached, &ResolvedReach::source);
+                        if (resolved == reaches.end()) {
+                            ResolvedReach &added = reaches.emplace_back();
+                            added.source = reach.reached;
+                            added.resources.reserve(reach.reached->size());
+                            for (const std::weak_ptr<MetalAllocation> &weak : *reach.reached)
+                                if (const auto allocation = weak.lock(); allocation && allocation->buffer)
+                                    added.resources.push_back(allocation->buffer);
+                            resolved = std::prev(reaches.end());
+                        }
+                        // Tables that reach the same memory (a lane's page and
+                        // index tables, lanes sharing a prefix) declare it once.
+                        const std::pair use{static_cast<const void *>(resolved->source.get()), true};
+                        if (std::ranges::find(declared, use) != declared.end()) continue;
+                        declared.push_back(use);
+                        undeclared.clear();
+                        for (id<MTLResource> memory : resolved->resources)
+                            if (declaredReached.insert((__bridge const void *)memory).second)
+                                undeclared.push_back(memory);
+                        if (!undeclared.empty())
+                            [encoder useResources:undeclared.data()
+                                            count:undeclared.size()
+                                            usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+                    }
+                };
                 for (size_t index = 0; index < dispatches.size(); ++index) {
                     encodeSteps(index);
                     const PreparedDispatch &item = dispatches[index];
@@ -1468,12 +1549,14 @@ struct MetalBackend::Impl {
                             failEncoding("unable to create Metal compute encoder");
                         }
                         declared.clear();
+                        declaredReached.clear();
                     }
                     [encoder setComputePipelineState:item.pipeline];
                     for (const BufferBinding &binding : dispatch.buffers) {
                         const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
                         buffers[binding.index] = buffer.allocation->buffer;
                         offsets[binding.index] = buffer.offsetBytes;
+                        if (!buffer.allocation->reaches.empty()) declareReach(buffer);
                     }
                     // One call per run of consecutive entries: a command graph's
                     // dispatch binds a single run.
@@ -1495,15 +1578,7 @@ struct MetalBackend::Impl {
                         [encoder setBytes:table.addresses.data()
                                    length:table.addresses.size() * sizeof(uint64_t)
                                   atIndex:dispatch.addresses.index];
-                        const std::pair use{source, dispatch.addresses.writes};
-                        if (std::ranges::find(declared, use) == declared.end()) {
-                            [encoder useResources:table.resources.data()
-                                            count:table.resources.size()
-                                            usage:dispatch.addresses.writes
-                                                      ? MTLResourceUsageRead | MTLResourceUsageWrite
-                                                      : MTLResourceUsageRead];
-                            declared.push_back(use);
-                        }
+                        declare(source, dispatch.addresses.writes, table.resources);
                     }
                     const IndirectGrid &grid = dispatch.indirectThreadgroups;
                     if (grid.buffer) {
@@ -1546,10 +1621,11 @@ struct MetalBackend::Impl {
                 } catch (...) {
                 }
                 markUnhealthy(std::move(reason));
-                asyncState->releaseSubmission(ticketState->sequence);
                 // The state holds the committed buffers too: a host step's
                 // runner reaches the buffer before it only through that.
-                if (!leading.empty()) {
+                if (leading.empty()) {
+                    asyncState->releaseSubmission(ticketState->sequence);
+                } else {
                     ticketState->leadingCommands = leading;
                     abandonedCommands.push_back(ticketState);
                 }
@@ -1613,7 +1689,8 @@ struct MetalBackend::Impl {
     AwakeClock::time_point nextSpinCheck{};
     // Commands whose encoding failed after their first buffers were
     // committed (commit): those buffers, which these hold, still run on these
-    // commands' allocations, with the host steps after them.
+    // commands' allocations, with the host steps after them, and each keeps
+    // its submission, as a command the watchdog gave up does.
     std::vector<std::shared_ptr<CommandTicket::State>> abandonedCommands;
     // Last, so that it stops first, raising the steps it holds.
     std::unique_ptr<HostStepRunner> hostStepRunner;
@@ -1729,13 +1806,15 @@ CommandTiming CommandTicket::wait() {
     }
     CommandTiming timing;
     std::string error;
+    bool outOfMemory = false;
     {
         std::lock_guard lock(state_->mutex);
         timing = state_->timing;
         error = state_->error;
+        outOfMemory = state_->outOfMemory;
     }
     state_->release();
-    if (!error.empty()) throw MetalBackendError(error);
+    if (!error.empty()) throw MetalBackendError(error, outOfMemory);
     return timing;
 }
 
@@ -1787,7 +1866,7 @@ MetalBackend::MetalBackend(std::string metallibPath, double residencyKeepAliveSe
         // Ending residency dispatches a kernel built here, so no pipeline or
         // driver program is compiled when a keep-alive lapses.
         impl_->residency = std::make_shared<Residency>(
-            impl_->device, impl_->queue,
+            impl_->device,
             impl_->newPipeline(impl_->library, Residency::kKickPipeline), residencyKeepAliveSeconds);
     }
     impl_->sampleDeviceMemory();
@@ -1832,6 +1911,15 @@ MetalBuffer MetalBackend::allocateBuffer(uint64_t bytes,
                                          BufferStorage storage,
                                          std::string_view label,
                                          BufferReach reach) {
+    MetalBuffer buffer = reserveBuffer(bytes, storage, label, reach);
+    restoreMemory(buffer);
+    return buffer;
+}
+
+MetalBuffer MetalBackend::reserveBuffer(uint64_t bytes,
+                                        BufferStorage storage,
+                                        std::string_view label,
+                                        BufferReach reach) {
     checkOperation();
     if (!bytes) throw MetalBackendError("Metal buffer size must be positive");
     if (bytes > impl_->capabilities.maxBufferLengthBytes) {
@@ -1846,8 +1934,6 @@ MetalBuffer MetalBackend::allocateBuffer(uint64_t bytes,
     allocation->reach = reach;
     if (!label.empty()) allocation->label = checkedNSString(label, "buffer label");
     allocation->residency = impl_->residency;
-    allocation->attach(impl_->newBuffer(bytes, storage, allocation->label));
-    impl_->sampleDeviceMemory();
     auto result = std::make_shared<MetalBuffer::Impl>();
     result->lengthBytes = bytes;
     result->allocation = std::move(allocation);
@@ -1912,6 +1998,41 @@ void MetalBackend::restoreMemory(const MetalBuffer &buffer) {
     allocation.attach(impl_->newBuffer(allocation.length, allocation.storage,
                                        allocation.label));
     impl_->sampleDeviceMemory();
+}
+
+void MetalBackend::setTableReach(const MetalBuffer &table, std::span<const MetalBuffer> reached) {
+    const auto owned = [&](const MetalBuffer &buffer) {
+        return buffer.impl_ && buffer.impl_->allocation->accounting.get() == impl_->accounting.get();
+    };
+    if (!owned(table)) throw MetalBackendError("Metal buffer is not a buffer of this backend");
+    MetalAllocation &allocation = *table.impl_->allocation;
+    if (allocation.storage != BufferStorage::Shared)
+        throw MetalBackendError("only a Shared Metal buffer holds addresses the host writes");
+    auto weak = std::make_shared<std::vector<std::weak_ptr<MetalAllocation>>>();
+    weak->reserve(reached.size());
+    for (const MetalBuffer &buffer : reached) {
+        if (!owned(buffer)) throw MetalBackendError("Metal buffer is not a buffer of this backend");
+        if (buffer.impl_->allocation->reach != BufferReach::Addressed)
+            throw MetalBackendError("only a Metal buffer allocated BufferReach::Addressed is reached by address");
+        weak->push_back(buffer.impl_->allocation);
+    }
+    const uint64_t offset = table.impl_->offsetBytes, length = table.impl_->lengthBytes;
+    // The new range replaces what the old ranges said of its bytes; the
+    // bytes of theirs outside it keep their reach.
+    std::vector<TableReach> kept;
+    for (TableReach &reach : allocation.reaches) {
+        const uint64_t end = reach.offsetBytes + reach.lengthBytes;
+        if (end <= offset || offset + length <= reach.offsetBytes) {
+            kept.push_back(std::move(reach));
+            continue;
+        }
+        if (reach.offsetBytes < offset)
+            kept.push_back({reach.offsetBytes, offset - reach.offsetBytes, reach.reached});
+        if (offset + length < end)
+            kept.push_back({offset + length, end - offset - length, reach.reached});
+    }
+    if (!weak->empty()) kept.push_back({offset, length, std::move(weak)});
+    allocation.reaches = std::move(kept);
 }
 
 MetalBuffer MetalBackend::view(const MetalBuffer &base,
@@ -2055,6 +2176,11 @@ std::optional<bool> BackendInstrumentation::awakeHostStepsSpin(MetalBackend &bac
     MetalBackend::Impl &impl = *backend.impl_;
     if (!impl.hostStepSpin && impl.nextSpinCheck != AwakeClock::time_point::max())
         impl.checkHostStepSpin();
+    return hostStepSpinDecision(backend);
+}
+
+std::optional<bool> BackendInstrumentation::hostStepSpinDecision(const MetalBackend &backend) {
+    const MetalBackend::Impl &impl = *backend.impl_;
     if (impl.hostStepSpin) return true;
     if (impl.nextSpinCheck == AwakeClock::time_point::max()) return false;
     return std::nullopt;
