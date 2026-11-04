@@ -492,6 +492,7 @@ $(WEIGHT_DIGESTS): | $(ENGINE_TEST_BUILD)
 
 $(TEST_BACKEND_BENCHMARK): dev/benchmarks/backend_benchmark.mm \
 		dev/benchmarks/PrefillWork.hpp dev/benchmarks/TranscriptPrompts.hpp \
+		dev/benchmarks/LookupHeldoutPrompts.hpp dev/benchmarks/LookupFreshPrompts.hpp \
 		$(ENGINE_LIBRARY) $(LIB) $(BUILD_ID_HEADER) \
 		| $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_OBJCXXFLAGS) -include $(BUILD_ID_HEADER) $< \
