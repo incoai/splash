@@ -176,13 +176,14 @@ void PageStorage::writeTable(std::span<const uint32_t> pages, uint32_t first,
         throw std::invalid_argument(
             "KV page table entries start past the end of its pages");
     }
-    // The extents of all the table's pages, the entries kept as well as the
-    // ones written: the table reaches each of them (setTableReach).
+    // The extents the table's entries reach, the entries kept as well as the
+    // ones written (setTableReach); an absent entry reaches none.
     std::vector<uint32_t> reachedExtents;
     for (size_t index = 0; index < pages.size(); ++index) {
         const uint32_t page = pages[index];
         const Extent &extent = allocatedExtent(page);
         if (index >= first) entries[index] = entry(extent, page % extentPages_);
+        if (entries[index] == SPLASH_KV_PAGE_ABSENT) continue;
         if (reachedExtents.empty() || reachedExtents.back() != page / extentPages_)
             reachedExtents.push_back(page / extentPages_);
     }

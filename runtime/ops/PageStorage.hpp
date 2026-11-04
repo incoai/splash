@@ -29,13 +29,14 @@ namespace splash::kv {
 // layer's region sits at one offset in every extent that holds it, so its
 // SplashKvLayer serves a Full page and a Slim one alike. Kernels reach a
 // page through its entries in a GPU table, so extents are allocated
-// metal::BufferReach::Addressed, and each table names the extents of its
-// pages as it is written (metal::MetalBackend::setTableReach): a command
-// makes resident only the extents its tables reach, on the encoders that
-// read them, so an extent only the cache holds costs commands nothing. The host reaches the
-// same bytes through the page's spans(). Active requests may overwrite slots
-// at or beyond their logical commit index. Cached KV blocks reference only
-// fully committed pages, which are immutable while shared.
+// metal::BufferReach::Addressed, and each table names the extents its
+// entries reach as it is written (metal::MetalBackend::setTableReach): a
+// command makes resident only the extents its tables reach, on the encoders
+// that read them, so an extent only the cache holds costs commands nothing.
+// The host reaches the same bytes through the page's spans(). Active
+// requests may overwrite slots at or beyond their logical commit index.
+// Cached KV blocks reference only fully committed pages, which are
+// immutable while shared.
 class PageStorage final : public ExtentStorage {
 public:
   // pageCount must be a whole number of extents of extentPages pages, a
@@ -108,11 +109,12 @@ public:
   // before `first` are left as they are. An Index page's entry is
   // SPLASH_KV_PAGE_ABSENT; a Slim page's reaches the regions it holds, all
   // that a row its window has passed reads of it. The table then names the
-  // extents of all of `pages` (metal::MetalBackend::setTableReach), which
-  // each encoder whose dispatches bind it makes resident. Throws
-  // std::logic_error for a table that is not CPU-visible or too small and
-  // for a page whose extent is not allocated (a GPU table holds only pages
-  // of allocated extents); std::invalid_argument for `first` past the pages.
+  // extents its entries reach, all of `pages` but Index ones
+  // (metal::MetalBackend::setTableReach), which each encoder that uses it
+  // makes resident. Throws std::logic_error for a table that is not
+  // CPU-visible or too small and for a page whose extent is not allocated (a
+  // GPU table holds only pages of allocated extents); std::invalid_argument
+  // for `first` past the pages.
   void writeEntries(std::span<const uint32_t> pages, uint32_t first,
                     const metal::MetalBuffer &table) const;
   // The same for an index table (ops::BlockIndex::tables), whose entries

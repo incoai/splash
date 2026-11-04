@@ -241,6 +241,19 @@ void indexPagesHoldOnlyTheirIndex(metal::MetalBackend &backend, MemoryGovernor &
         storage.writeEntries(firsts, 0, table);
         const SplashKvPage kvEntry = entries[0];
         require(kvEntry && entries[1] == SPLASH_KV_PAGE_ABSENT, "an Index page's K/V entry is not absent");
+        {
+            // The page table reaches the Full extent only: its kernel reads
+            // nothing of the Index extent.
+            const test::EncoderUses uses;
+            const metal::MetalBuffer mismatches = test::sharedBuffer(backend, sizeof(uint32_t));
+            const uint32_t words = 256, seed = 0;
+            (void)backend.submit({"addressed_check_u32", {{0, table}, {3, mismatches}},
+                                  {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}},
+                                  {1, 1, 1}, {words, 1, 1}});
+            require(uses.declares(@"kv-extent-0") &&
+                        !uses.declares(@(("kv-index-extent-" + std::to_string(extent)).c_str())),
+                    "a page table reached the extent of an Index page");
+        }
         storage.writeIndexEntries(firsts, 0, table);
         require(entries[0] == kvEntry + uint64_t{extent} * layout.kvBytesPerModelPage() && entries[1] &&
                     !(entries[1] & SPLASH_KV_PAGE_INDEX_MASK),
