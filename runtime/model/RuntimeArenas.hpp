@@ -116,12 +116,11 @@ struct RuntimeGeometry final {
 // (QwenTarget::requirePrefill), and at the rate of its larger commands from
 // the least rows of a chunk the split takes (`aneFfnRows`,
 // ops::AneFfn::minimumRows; 0 without the split); one lane whose rows run
-// past a chunk, as a prefill group passes each
-// lane's state between its parts through its one scratch cell
-// (PrefillArena::groupCell); the history of one lane streamed
-// (KvHistoryStream) where K/V spills, none where it stays in memory; whether
-// its experts stream; and in one attention layer the pairs of a full chunk
-// at the end of the native window.
+// past a chunk, as a prefill group passes each lane's state between its
+// parts through its one scratch cell (PrefillArena::groupCell); the history
+// of one lane streamed (KvHistoryStream) where K/V spills, none where it
+// stays in memory; whether its experts stream; and in one attention layer
+// the pairs of a full chunk at the end of the native window.
 [[nodiscard]] inline CommandLimits commandLimits(const RuntimeGeometry &geometry, uint32_t aneFfnRows) noexcept {
   return {.commandRows = geometry.prefillChunks * kPrefillRows,
           .layers = geometry.target.layers,

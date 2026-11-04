@@ -102,7 +102,7 @@ void testPassesTheModelDoesNotRunBreakThePassRule() {
   requireBreaks(inPasses(1, 1, 1), "passes", "a pass past a prefill's passes broke no rule");
   requireBreaks(inPasses(0, 49, 0), "passes", "more passes than the model runs broke no rule");
   requireBreaks(inPasses(0, 2, 0), "passes", "passes where the model runs a command whole broke no rule",
-                {.commandRows = kChunk, .maximumPasses = 1});
+                {.commandRows = kChunk, .layers = 48, .maximumPasses = 1});
   requireBreaks(inPasses(1, 2, 0), "passes", "a later pass from the first layer broke no rule");
   requireBreaks(inPasses(0, 2, 24), "passes", "a first pass past the first layer broke no rule");
   requireBreaks(inPasses(1, 3, 47), "passes", "more passes left than layers left broke no rule");

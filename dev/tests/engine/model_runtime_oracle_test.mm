@@ -1708,8 +1708,8 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
 // A prefill command run in passes over the target's layers
 // (BatchPlan::passes), each its own command, leaves what it leaves run
 // whole: its score logits, KV, GDN cell, PLE history, lengths, draft rings
-// and window, and the states it captures, at three passes and at one a
-// layer (CommandLimits::layers), and with an image its first pass
+// and window, and the states it captures, at three passes and at the most
+// (CommandLimits::maximumPasses), and with an image its first pass
 // encodes when the target serves vision; so does each lane of a command of
 // two, each capturing a state inside its rows and one at their end. On a
 // runtime whose commands hold a prefill group's chunks, the command spans
@@ -4024,11 +4024,11 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
                                                          "whose K/V stayed, at step " + std::to_string(step));
   // Prompts whose commands run in passes over the target's layers, each pass
   // a command that streams the spilled history of its attention layers
-  // (KvHistoryStream), give what they give whole: in three passes and in one
-  // a layer.
+  // (KvHistoryStream), give what they give whole: in three passes and in the
+  // most (CommandLimits::maximumPasses).
   const uint64_t streamedCommands = spill.historyStream().stats().commands;
-  const uint32_t layerPasses = runtime.commandLimits().maximumPasses;
-  for (const uint32_t passes : {3u, layerPasses}) {
+  const uint32_t mostPasses = runtime.commandLimits().maximumPasses;
+  for (const uint32_t passes : {3u, mostPasses}) {
     const SpillRecord passed = run(passes == 3 ? 4031 : 4041, {true, false, true, false}, passes);
     for (size_t step = 0; step < resident.steps.size(); ++step)
       require(passed.steps[step] == resident.steps[step],
