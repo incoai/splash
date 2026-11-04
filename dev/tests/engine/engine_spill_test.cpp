@@ -583,6 +583,43 @@ void testPrefillGroupsFollowIndexPages() {
   }
 }
 
+// A Resident lane that comes to hold a Spill request's blocks as it prefills runs the rest of its
+// prompt as prefill groups: it shares that request's prefix but no state on it, so it starts from
+// nothing, and the blocks its first chunk computes take the Spill request's Index pages
+// (KvCache::insert).
+void testALaneThatTakesSpilledBlocksAsItPrefillsRunsPrefillGroups() {
+  Spilling spill(1024, true, 100'000, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget));
+  spill.model.time(test::heavyHistoryTarget());
+  // Eight pages, four more of its own and a token: its pages but its dense
+  // and window pages spill.
+  std::vector<uint32_t> prompt(8 * KvCache::pageTokens, 1);
+  prompt.resize(prompt.size() + 4 * KvCache::pageTokens + 1, 9);
+  EngineRequest spilling = request(1, prompt);
+  spilling.maxNewTokens = 4'096;
+  spill.engine.submit(std::move(spilling));
+  spill.runUntil([&] { return spill.cache.spillSnapshot().spilledPages == 10 && !spill.engine.commandInFlight(); },
+                 "the Spill request's pages did not spill");
+  // Its eight pages, then 120 pages and a token: three chunks, the first of
+  // which takes the seven spilled pages among them. It starts Resident while
+  // the SSD cache takes no writes.
+  prompt.resize(8 * KvCache::pageTokens);
+  prompt.resize(prompt.size() + 120 * KvCache::pageTokens + 1, 2);
+  EngineRequest continuing = request(2, std::move(prompt));
+  continuing.maxNewTokens = 1;
+  spill.tier.writableFile = false;
+  spill.engine.submit(std::move(continuing));
+  spill.runUntil([&] { return spill.events.startIds.size() == 2; }, "the Resident request did not start");
+  spill.tier.writableFile = true;
+  spill.runUntil([&] { return spill.events.usage.contains(2); }, "the Resident request did not run");
+  const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+  // The two chunks left run as one group.
+  require(counts.resident == 1 && counts.spill == 1 && spill.events.starts.back() == 0 &&
+              spill.model.prefillChunks.at(2) == 2,
+          "a Resident lane that took spilled blocks as it prefilled ran the rest a chunk a command");
+  spill.engine.cancel(1);
+  spill.runUntilIdle();
+}
+
 // Full extents a spill empties are released, all but one runway while a spilling prompt grows or
 // the host holds growth back.
 void testSpilledFullExtentsLeaveOnceNoPromptGrows() {
@@ -2110,6 +2147,8 @@ std::span<const test::TestCase> spillTests() {
        testAStartThatCannotSpillStartsResidentWithinTheResidentContext},
       {"testWriteBudgetRefusalSaysWhenToRetry", testWriteBudgetRefusalSaysWhenToRetry},
       {"testPrefillGroupsFollowIndexPages", testPrefillGroupsFollowIndexPages},
+      {"testALaneThatTakesSpilledBlocksAsItPrefillsRunsPrefillGroups",
+       testALaneThatTakesSpilledBlocksAsItPrefillsRunsPrefillGroups},
       {"testSpilledFullExtentsLeaveOnceNoPromptGrows", testSpilledFullExtentsLeaveOnceNoPromptGrows},
       {"testSpillMovesThroughTheHostPause", testSpillMovesThroughTheHostPause},
       {"testSpillResumeCommitsAgain", testSpillResumeCommitsAgain},
