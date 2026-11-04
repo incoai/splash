@@ -28,6 +28,7 @@ let package = Package(
             linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks",
                                            "-Xlinker", "-rpath", "-Xlinker", "@executable_path"])]
         ),
-        .testTarget(name: "SplashTests", dependencies: ["Splash"], path: "Tests/SplashTests"),
+        // The fake servers the tests run, Python scripts in Fakes/.
+        .testTarget(name: "SplashTests", dependencies: ["Splash"], path: "Tests/SplashTests", resources: [.copy("Fakes")]),
     ]
 )

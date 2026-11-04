@@ -708,28 +708,9 @@ struct ChatTests {
     @MainActor @Test func aReplyStreamsApartFromTheConversationsUntilItEnds() async throws {
         let folder = FileManager.default.temporaryDirectory.appending(path: "splash-chat-tests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: folder) }
-        // A server that streams a reply in three parts, apart in time, on the port it prints.
         let server = Process()
         server.executableURL = URL(filePath: "/usr/bin/python3")
-        server.arguments = ["-c", """
-            import sys, time
-            from http.server import BaseHTTPRequestHandler, HTTPServer
-            class Handler(BaseHTTPRequestHandler):
-                def log_message(self, *args): pass
-                def do_POST(self):
-                    self.rfile.read(int(self.headers['Content-Length']))
-                    self.send_response(200)
-                    self.send_header('Content-Type', 'text/event-stream')
-                    self.end_headers()
-                    for part in ['One', ' two', ' three']:
-                        self.wfile.write(('data: {"choices":[{"delta":{"content":"%s"}}]}\\n\\n' % part).encode())
-                        self.wfile.flush()
-                        time.sleep(0.4)
-                    self.wfile.write(b'data: [DONE]\\n\\n')
-            server = HTTPServer(('127.0.0.1', 0), Handler)
-            print(server.server_port, flush=True)
-            server.handle_request()
-            """]
+        server.arguments = [try #require(Bundle.module.path(forResource: "streaming_server", ofType: "py", inDirectory: "Fakes"))]
         let output = Pipe()
         server.standardOutput = output
         try server.run()
