@@ -68,7 +68,8 @@ public:
   void abandon();
   // engineIdle: Engine::idle(). idleOnly: the idle release, after
   // idleReleaseMilliseconds without a request, else a release request.
-  // Releases only held weights; true when it released.
+  // Releases only held weights, and logs which release it was; true when it
+  // released.
   [[nodiscard]] bool release(double nowMilliseconds, bool engineIdle, bool idleOnly);
   // The idle period begins: at Ready, when the engine's last request left,
   // and when the weights were restored.

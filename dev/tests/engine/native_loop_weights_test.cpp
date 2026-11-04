@@ -6,6 +6,7 @@
 #include "TestKvTier.hpp"
 #include "TestMetalStatistics.hpp"
 #include "TestRegistry.hpp"
+#include "TestStderr.hpp"
 #include "engine/MemoryControl.hpp"
 #include "engine/NativeRuntime.hpp"
 #include "engine/ReleasableMemory.hpp"
@@ -15,6 +16,8 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <sstream>
+#include <string>
 #include <vector>
 
 using namespace splash;
@@ -515,6 +518,37 @@ void testReleaseRequestGivesTheWeightsBackWhenIdle() {
           "the engine did not release once its request ended");
 }
 
+// The loop logs each release once, as the release it was: the idle release,
+// after its time without a request, or a release request.
+void testEachReleaseLogsOnce() {
+  constexpr double kIdleReleaseSeconds = 2.0;
+  Weights weights;
+  engine::NativeLoopConfig config;
+  config.engine.maxContext = 1024;
+  config.engine.weights = WeightResidencyConfig{.weights = &weights};
+  LoopFixture fixture(config, {}, {}, kIdleReleaseSeconds);
+  engine::NativeRuntime &loop = fixture.loop;
+  loop.announceReady(protocol::peer::kTestReady);
+  // The lines of `log` that report a release.
+  const auto releases = [](const std::string &log) {
+    std::vector<std::string> lines;
+    std::istringstream stream(log);
+    for (std::string line; std::getline(stream, line);)
+      if (line.find("Weights released") != std::string::npos)
+        lines.push_back(line);
+    return lines;
+  };
+  fixture.monotonic += 1000.0 * kIdleReleaseSeconds;
+  const auto idle = releases(test::capturedStderr([&] { loop.releaseIdleWeights(); }));
+  require(weights.released() && idle.size() == 1 && idle[0].find("without a request") != std::string::npos,
+          "the idle release did not log itself once");
+  require(loop.receive(protocol::peer::serialize(request(1))), "the request after the idle release failed");
+  runUntilIdle(loop);
+  const auto asked = releases(test::capturedStderr([&] { static_cast<void>(releaseAnswer(fixture, 5)); }));
+  require(weights.released() && asked.size() == 1 && asked[0].find("on request") != std::string::npos,
+          "a release request did not log itself once");
+}
+
 // The loop reports that it holds requests from the first it takes to the end
 // of its last, the span the process keeps the Mac from idle sleep for.
 void testHoldingRequestsSpansFirstToLastRequest() {
@@ -848,6 +882,7 @@ std::span<const test::TestCase> weightsTests() {
       {"testRefusedRestoreWaitsForMemory", testRefusedRestoreWaitsForMemory},
       {"testIdleReleaseOffReleasesOnlyOnRequest", testIdleReleaseOffReleasesOnlyOnRequest},
       {"testReleaseRequestGivesTheWeightsBackWhenIdle", testReleaseRequestGivesTheWeightsBackWhenIdle},
+      {"testEachReleaseLogsOnce", testEachReleaseLogsOnce},
       {"testHoldingRequestsSpansFirstToLastRequest", testHoldingRequestsSpansFirstToLastRequest},
       {"testDeadlineEndsARequestWaitingForTheWeights", testDeadlineEndsARequestWaitingForTheWeights},
       {"testTransfersLandWhileTheWeightsAreRestored", testTransfersLandWhileTheWeightsAreRestored},

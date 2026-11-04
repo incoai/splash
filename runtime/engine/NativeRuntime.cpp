@@ -118,9 +118,7 @@ bool NativeRuntime::flushRestorePoints() {
 }
 
 void NativeRuntime::releaseIdleWeights() {
-  if (core_.releaseIdleWeights(config_.monotonicMilliseconds()))
-    logLine("Weights released after ", core_.weightsSnapshot().idleReleaseSeconds,
-            " s without a request; the next request restores them");
+  static_cast<void>(core_.releaseIdleWeights(config_.monotonicMilliseconds()));
 }
 
 void NativeRuntime::executionFailed(std::exception_ptr failure) {
@@ -284,8 +282,7 @@ bool NativeRuntime::handleStatus(const protocol::StatusRequestFrame &status) {
 // when they are given back, as a restore leaves them `released` until its last
 // image is written back.
 bool NativeRuntime::handleRelease(const protocol::ReleaseRequestFrame &release) {
-  if (core_.releaseWeights(config_.monotonicMilliseconds()))
-    logLine("Weights released on request; the next request restores them");
+  static_cast<void>(core_.releaseWeights(config_.monotonicMilliseconds()));
   return handleStatus(protocol::StatusRequestFrame{release.correlationId});
 }
 

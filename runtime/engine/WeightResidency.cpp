@@ -64,6 +64,11 @@ bool WeightResidency::release(double now, bool engineIdle, bool idleOnly) {
   if (!held() || !engineIdle || (idleOnly && now - idleSince_ < config_.idleReleaseMilliseconds))
     return false;
   config_.weights->release();
+  if (idleOnly)
+    logLine("Weights released after ", config_.idleReleaseMilliseconds / 1000.0,
+            " s without a request; the next request restores them");
+  else
+    logLine("Weights released on request; the next request restores them");
   return true;
 }
 
