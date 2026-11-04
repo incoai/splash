@@ -47,6 +47,25 @@ class LauncherError(RuntimeError):
         self.kind = kind
 
 
+class ArgumentRefusal(SystemExit):
+    """A command line the launcher refuses, with argparse's status 2."""
+
+    def __init__(self, message):
+        super().__init__(2)
+        self.message = message
+
+
+class _Parser(argparse.ArgumentParser):
+    """An argument parser whose refusal carries its message (ArgumentRefusal),
+    which serve records."""
+
+    def error(self, message):
+        try:
+            super().error(message)
+        except SystemExit:
+            raise ArgumentRefusal(message) from None
+
+
 class StopSignal(KeyboardInterrupt):
     """One of STOP_SIGNALS, raised where it arrives, as Ctrl+C is."""
 
@@ -317,6 +336,34 @@ def _server(args, model_dir, record):
     return command, environment
 
 
+def _serve_lock(port):
+    return RUNTIME_DIR / f"serve-{port}.lock"
+
+
+def _serve_record(port):
+    """Beside the port's lock, which cannot be replaced atomically without
+    breaking its flock: the app follows a start there. It is the lock
+    holder's to write."""
+    return RUNTIME_DIR / f"serve-{port}.json"
+
+
+def _record_refusal(port, failure):
+    """Record a start refused before it held the port's lock, under that lock.
+    While another process holds the lock, the record is that process's and
+    stays. The refusal printed is the answer; a record that cannot be written
+    leaves the app only the exit status."""
+    try:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        with _serve_lock(port).open("a+") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            serve_record.failed(_serve_record(port), failure)
+    except OSError:
+        pass
+
+
 def serve(args):
     # Started in the background from a non-interactive shell, the launcher
     # inherits SIGINT as ignored; take both stop signals from the start.
@@ -334,11 +381,9 @@ def serve(args):
         os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
     # Keep both locks across exec until the foreground server exits.
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    # Beside the lock, which cannot be replaced atomically without breaking
-    # its flock: the app follows a start there.
-    record = RUNTIME_DIR / f"serve-{args.port}.json"
+    record = _serve_record(args.port)
     with (
-        (RUNTIME_DIR / f"serve-{args.port}.lock").open("a+") as lock,
+        _serve_lock(args.port).open("a+") as lock,
         (RUNTIME_DIR / "serve.lock").open("a+") as installation,
     ):
         try:
@@ -483,7 +528,7 @@ def parse_args(argv=None):
     if not is_client and "--" in argv:
         boundary = argv.index("--")
         argv, client_args = argv[:boundary], argv[boundary + 1 :]
-    parser = argparse.ArgumentParser(
+    parser = _Parser(
         prog="splash",
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -565,10 +610,9 @@ def parse_args(argv=None):
         action="store_true",
         help="start the installed model without contacting the Hugging Face Hub (as HF_HUB_OFFLINE=1)",
     )
-    groups["network"].add_argument(
-        "--port",
-        type=_parse_port,
-        help=f"HTTP port (default: SPLASH_PORT or {serve_options.DEFAULT_PORT})",
+    _add_port(
+        groups["network"],
+        f"HTTP port (default: SPLASH_PORT or {serve_options.DEFAULT_PORT})",
     )
     serve_options.add_serve_arguments(server, groups)
     for name in clients.INSTALL_URLS:
@@ -578,10 +622,9 @@ def parse_args(argv=None):
             add_help=False,
             allow_abbrev=False,
         )
-        client.add_argument(
-            "--port",
-            type=_parse_port,
-            help=f"server port (default: SPLASH_PORT or {serve_options.DEFAULT_PORT})",
+        _add_port(
+            client,
+            f"server port (default: SPLASH_PORT or {serve_options.DEFAULT_PORT})",
         )
     if is_client:
         # Only --port belongs to Splash; preserve the agent's other arguments,
@@ -595,9 +638,7 @@ def parse_args(argv=None):
     args.explicit_port = args.port is not None
     if not args.explicit_port:
         try:
-            args.port = _parse_port(
-                os.environ.get("SPLASH_PORT", str(serve_options.DEFAULT_PORT))
-            )
+            args.port = _environment_port()
         except argparse.ArgumentTypeError as error:
             parser.error(f"SPLASH_PORT: {error}")
     if args.command == "serve":
@@ -619,8 +660,44 @@ def parse_args(argv=None):
     return args
 
 
+def _add_port(parser, help_text=None):
+    """The --port option, which serve, the agent commands and a refused serve
+    command line (_serve_port) read alike."""
+    parser.add_argument("--port", type=_parse_port, help=help_text)
+
+
+def _environment_port():
+    return _parse_port(os.environ.get("SPLASH_PORT", str(serve_options.DEFAULT_PORT)))
+
+
+def _serve_port(argv):
+    """The port a serve command line names, read alone, so that a refusal of
+    its other arguments still reaches the record there; None for another
+    command, or a port that does not parse."""
+    if argv[:1] != ["serve"]:
+        return None
+    # As serve's parser: no abbreviations.
+    probe = argparse.ArgumentParser(
+        add_help=False, allow_abbrev=False, exit_on_error=False
+    )
+    _add_port(probe)
+    try:
+        port = probe.parse_known_args(argv[1:])[0].port
+        return _environment_port() if port is None else port
+    except (argparse.ArgumentError, argparse.ArgumentTypeError):
+        return None
+
+
 def main(argv=None):
-    args = parse_args(argv)
+    argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        args = parse_args(argv)
+    except ArgumentRefusal as refusal:
+        if (port := _serve_port(argv)) is not None:
+            _record_refusal(
+                port, serve_record.failure(serve_record.CONFIGURATION, refusal.message)
+            )
+        raise
     try:
         return serve(args) if args.command == "serve" else coding_client(args)
     except (LauncherError, clients.ClientError, OSError) as error:

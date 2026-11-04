@@ -64,9 +64,12 @@ class LauncherTests(unittest.TestCase):
         ):
             os.environ.pop(name, None)
         keep_stop_signals(self)
-        # Serve installs models under a models root of the test's.
+        # Serve installs models under a models root of the test's, and keeps
+        # its locks and records in a runtime directory of the test's.
         models = Path(self.enterContext(tempfile.TemporaryDirectory())) / "models"
         self.enterContext(mock.patch.object(launcher.paths, "MODELS", models))
+        runtime = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.object(launcher, "RUNTIME_DIR", runtime))
 
     def test_serve_requires_exact_repository_id_before_build(self):
         for arguments in (
@@ -1563,6 +1566,67 @@ class LauncherTests(unittest.TestCase):
                     self.assertEqual(launcher.main(["serve", "--model", MODEL_ID]), 1)
             self.assertIn("Splash is already serving", error.getvalue())
             self.assertEqual(record.read_text(), '{"pid":123,"phase":"starting"}')
+
+    def test_a_refused_serve_command_line_is_recorded_at_its_port(self):
+        """A serve command line the launcher refuses is recorded with the
+        message it printed at the port it names, under that port's lock, over
+        a record an earlier process left; one another process holds keeps
+        that process's."""
+        stale = json.dumps({"pid": os.getpid(), "phase": "ready"})
+        for arguments in (
+            ["--port", "9123"],
+            ["--model", MODEL_ID, "--port=9123", "--max-memory", "1Q"],
+            ["--model", MODEL_ID, "--port", "9123", "--revision", "main"]
+            + ["--model-dir", "/m"],
+        ):
+            for held in (False, True):
+                with (
+                    self.subTest(arguments=arguments, held=held),
+                    tempfile.TemporaryDirectory() as temporary,
+                    mock.patch.object(launcher, "RUNTIME_DIR", Path(temporary)),
+                    mock.patch("sys.stderr", io.StringIO()) as error,
+                    (Path(temporary) / "serve-9123.lock").open("a+") as holder,
+                ):
+                    record = Path(temporary) / "serve-9123.json"
+                    record.write_text(stale)
+                    if held:
+                        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    with self.assertRaises(SystemExit) as refused:
+                        launcher.main(["serve", *arguments])
+                    self.assertEqual(refused.exception.code, 2)
+                    _, refusal, printed = (
+                        error.getvalue().splitlines()[-1].partition(": error: ")
+                    )
+                    self.assertTrue(refusal)
+                    self.assertEqual(
+                        json.loads(record.read_text()),
+                        json.loads(stale)
+                        if held
+                        else {
+                            "pid": os.getpid(),
+                            "phase": "failed",
+                            "failure": {
+                                "kind": "configuration",
+                                "message": printed,
+                            },
+                        },
+                    )
+
+    def test_a_refusal_whose_record_cannot_be_written_stays_a_refusal(self):
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch("sys.stderr", io.StringIO()),
+        ):
+            # A runtime directory under a file cannot be created.
+            (Path(temporary) / "file").touch()
+            with (
+                mock.patch.object(
+                    launcher, "RUNTIME_DIR", Path(temporary) / "file" / "run"
+                ),
+                self.assertRaises(SystemExit) as refused,
+            ):
+                launcher.main(["serve", "--port", "9123"])
+            self.assertEqual(refused.exception.code, 2)
 
     def test_metadata_write_failure_releases_lock_before_model_work(self):
         with (

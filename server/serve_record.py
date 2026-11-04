@@ -20,6 +20,7 @@ def _name(kind: StartFailureKind) -> str:
 # The kinds of a failed start: the engine's StartFailureKind names, which the
 # launcher and the server share where their failure is of the same class, and
 # the frontend's own.
+CONFIGURATION = _name(StartFailureKind.CONFIGURATION)
 MODEL = _name(StartFailureKind.MODEL)
 DEVICE = _name(StartFailureKind.DEVICE)
 INTERNAL = _name(StartFailureKind.INTERNAL)
