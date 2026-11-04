@@ -167,7 +167,7 @@ void Engine::syncClaims(double now) {
     if (!active.claim.id)
       continue;
     ResourceWait &wait = active.resourceWait;
-    const bool retried = active.lane ? !belowRunnable(active)
+    const bool retried = active.lane ? !belowRunnable(active) && !wait.passedOver
                                      : admissionTries(active, tier, draining) && !holdsBack(active.heldBehind);
     const double deadline = resourceDeadline(active);
     wait.holdEnded = (wait.pendingSinceMilliseconds &&
@@ -184,6 +184,23 @@ void Engine::syncClaims(double now) {
     // A lane that sent tokens waits in its next decode gap.
     active.gapSince.claimWaited =
         active.gapSince.claimWaited || ((waiting || hostRefused) && active.lastTokenMilliseconds);
+  }
+}
+
+void Engine::passOver(const BatchPlan &plan, std::span<const uint64_t> excluded) {
+  // A lane the plan leaves out while ready to retry waits for its command,
+  // not for memory: its claim holds no room the plan's lanes would take
+  // more for, and its wait does not read as memory's. A prompt that led by
+  // fewer rows left one submitted before it 31 s on its claim.
+  const Phase kind = plan.kind == WorkKind::Prefill ? Phase::Prefill : Phase::Decode;
+  for (auto &[id, active] : requests_) {
+    ResourceWait &wait = active.resourceWait;
+    if (!active.lane || !wait.pending || scheduler_.phase(id) != kind ||
+        std::ranges::find(excluded, id) != excluded.end())
+      continue;
+    wait.passedOver = std::ranges::find(plan.items, id, &BatchItem::requestId) == plan.items.end();
+    if (wait.passedOver)
+      governor().ledger().setWaiting(active.claim.id, false);
   }
 }
 

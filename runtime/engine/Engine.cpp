@@ -354,6 +354,7 @@ bool Engine::tick(double now) {
     // lanes. It is abandoned once that plan runs, so that the command goes
     // on while that one waits for memory.
     const bool supersedes = scheduler_.abandonsPasses(*plan, in);
+    passOver(*plan, excluded);
     std::vector<ModelBatchItem> items;
     std::vector<std::vector<Capture>> captures;
     const size_t planned = excluded.size();

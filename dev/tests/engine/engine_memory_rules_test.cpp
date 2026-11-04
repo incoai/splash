@@ -612,25 +612,22 @@ void testARestoredStateIsPromotedInAClaim() {
   }
 }
 
-// A unit of `bytes` that leaves memory once it lands, at no cost: a claim
-// whose free() takes it waits for it.
+// A unit of `bytes` that leaves memory once it lands, at no cost: until it
+// has landed, each claim whose free() takes it waits for it.
 class LandingUnit final : public VictimSource {
 public:
   explicit LandingUnit(uint64_t bytes) : bytes_(bytes) {}
   [[nodiscard]] std::string_view name() const noexcept override { return "landing"; }
   [[nodiscard]] std::optional<Victim> peek(const VictimQuery &, const Victim *after) const override {
-    if (after || taken_)
+    if (after || landed)
       return std::nullopt;
     return Victim{.key = 1, .bytes = bytes_, .later = true};
   }
-  FreeResult take(const VictimQuery &, const Victim &) override {
-    taken_ = true;
-    return {FreeOutcome::Pending, 0, bytes_};
-  }
+  FreeResult take(const VictimQuery &, const Victim &) override { return {FreeOutcome::Pending, 0, bytes_}; }
+  bool landed = false;
 
 private:
   uint64_t bytes_;
-  bool taken_ = false;
 };
 
 // A lane below a waiting claim, refused an extent by the host, takes in place the pages it lacks beyond those held
@@ -771,6 +768,84 @@ void testTtftPartsSumToTtft() {
                 parts[static_cast<size_t>(TtftPart::Decode)] > 0.0 && counted <= first - arrived + 1e-6,
             "the TTFT parts did not cover the commands that held the prompt within its TTFT");
   }
+}
+
+// Two prompts whose claims wait for `landing`: the first runs a command, then the second, of fewer rows than the first
+// has left, leads, its plans leaving the first out.
+struct LeftOutLane final {
+  test::EngineHarness harness{{.pages = 256, .memory = test::FakeMemory::Config{}, .timing = &test::kM6FlashNextQ2}};
+  MemoryLedger &ledger = harness.governor->ledger();
+  LandingUnit landing{1ULL << 30};
+
+  LeftOutLane() {
+    EngineRequest first = harness.request(1, std::vector<uint32_t>(5048, 1));
+    first.maxNewTokens = 2;
+    first.deadlineMilliseconds = 1e9;
+    harness.engine.submit(std::move(first));
+    harness.runUntil([&] { return harness.commands().size() == 1 && !harness.engine.commandInFlight(); },
+                     "the first prompt did not run its first command");
+    harness.model.beginObserver = [this] {
+      harness.memory->hold("limit", harness.governor->snapshot().headroomBytes - 32);
+      ledger.addSource(landing);
+    };
+    EngineRequest second = harness.request(2, std::vector<uint32_t>(2900, 2));
+    second.maxNewTokens = 2;
+    second.deadlineMilliseconds = 1e9;
+    harness.engine.submit(std::move(second));
+    harness.runUntil([&] { return waiting(1) && waiting(2); }, "the claims did not wait for the landing");
+  }
+  ~LeftOutLane() { ledger.removeSource(landing); }
+  LeftOutLane(const LeftOutLane &) = delete;
+  LeftOutLane &operator=(const LeftOutLane &) = delete;
+
+  [[nodiscard]] bool waiting(uint64_t id) const {
+    return std::ranges::any_of(ledger.claims(), [&](const auto &entry) {
+      return entry.second.spec.requestId == id && entry.second.waiting;
+    });
+  }
+};
+
+// A lane a prefill command leaves out while it is ready to retry waits for that command, not on its claim: its claim
+// holds no room the command's lanes must take for it, and its TTFT counts the command as another's prefill.
+void testALaneAPlanLeavesOutWaitsForItsCommandNotOnItsClaim() {
+  LeftOutLane lanes;
+  test::EngineHarness &harness = lanes.harness;
+  bool heldWhileLeftOut = false;
+  harness.model.submitObserver = [&] { heldWhileLeftOut = heldWhileLeftOut || lanes.waiting(1); };
+  harness.memory->release("limit", harness.memory->held("limit"));
+  lanes.landing.landed = true;
+  const size_t before = harness.commands().size();
+  harness.runUntil([&] { return harness.events.tokenTimes.contains(1); }, "the first prompt did not answer");
+  harness.model.submitObserver = nullptr;
+  const test::EngineHarness::Command &leftOut = harness.commands().at(before);
+  require(leftOut.lanes == std::vector<uint64_t>{2}, "the second prompt's command did not leave the first out");
+  const TtftParts &parts = harness.events.ttftParts.at(1);
+  require(!heldWhileLeftOut && parts[static_cast<size_t>(TtftPart::OtherPrefill)] >= leftOut.wallMilliseconds &&
+              parts[static_cast<size_t>(TtftPart::ClaimWait)] < leftOut.wallMilliseconds,
+          "a lane the command left out waited on its claim: claim wait " +
+              std::to_string(parts[static_cast<size_t>(TtftPart::ClaimWait)]) + " ms, other prefill " +
+              std::to_string(parts[static_cast<size_t>(TtftPart::OtherPrefill)]) + " ms, the command " +
+              std::to_string(leftOut.wallMilliseconds) + " ms");
+  harness.runUntilIdle();
+  require(harness.events.completedCount == 2 && harness.events.failedCount == 0, "the prompts did not finish");
+}
+
+// A lane each retry's plan leaves out before it retries it in turn holds room for the resource wait's limit from its
+// first refusal that waited, not from its latest.
+void testALeftOutLaneHoldsRoomForTheLimitFromItsFirstWait() {
+  LeftOutLane lanes;
+  test::EngineHarness &harness = lanes.harness;
+  const double waited = harness.now();
+  double lastHeld = waited;
+  harness.runUntil(
+      [&] {
+        if (lanes.waiting(1))
+          lastHeld = harness.now();
+        return harness.now() >= waited + 2 * kResourceWaitTimeoutMilliseconds || harness.events.failedCount == 2;
+      },
+      "the waits did not end", 10'000'000);
+  require(lastHeld < waited + kResourceWaitTimeoutMilliseconds + kResourceRetryBackoffMilliseconds,
+          "the left-out lane's claim held room " + std::to_string(lastHeld - waited) + " ms after it first waited");
 }
 
 // The time a start waits for the host to admit it counts as its claim's wait, not as the decode commands' that ran
@@ -1027,6 +1102,9 @@ std::span<const test::TestCase> rulesTests() {
       {"testAHostRefusedStartIsFreedForByThePass", testAHostRefusedStartIsFreedForByThePass},
       {"testAStartRanksByTheWorkItHolds", testAStartRanksByTheWorkItHolds},
       {"testCopiesAheadForRegrowthStayWithinAUnit", testCopiesAheadForRegrowthStayWithinAUnit},
+      {"testALaneAPlanLeavesOutWaitsForItsCommandNotOnItsClaim",
+       testALaneAPlanLeavesOutWaitsForItsCommandNotOnItsClaim},
+      {"testALeftOutLaneHoldsRoomForTheLimitFromItsFirstWait", testALeftOutLaneHoldsRoomForTheLimitFromItsFirstWait},
   };
   return kTests;
 }

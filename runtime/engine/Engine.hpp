@@ -344,6 +344,10 @@ private:
     // That limit, or its wait's deadline, has passed: its claim may go on
     // waiting but holds nothing, a retry's refusal too (syncClaims).
     bool holdEnded = false;
+    // A plan of its kind left the lane out while it was ready to retry: it
+    // waits for that plan's command, not for memory, until a plan retries
+    // it (passOver).
+    bool passedOver = false;
     // It waits for the SSD cache's quota of active KV, which other requests'
     // active KV holds, rather than for memory.
     bool diskQuota = false;
@@ -1047,18 +1051,25 @@ private:
   void deferWait(Request &request) noexcept;
   // Keeps each request's claim waiting (MemoryLedger::setWaiting) while it
   // waits for memory on its way back and the engine retries it next: a lane
-  // of a priority the scheduler plans (belowRunnable), or one without a
-  // lane that admission tries and holds behind no refusal, whose latest
-  // refusal free() left pending (ResourceWait::pending), up to the resource
-  // wait limit from when its refusals began waiting
-  // (ResourceWait::pendingSinceMilliseconds) and within its wait's deadline
-  // (resourceDeadline). A waiting claim holds room against claims ranked
-  // below it; past that limit or deadline it holds none,
-  // whatever its retries find (ResourceWait::holdEnded); a wait for the SSD
-  // cache's quota is no memory claim. One whose latest refusal was the
-  // host's, retried within its deadline, counts in the host's deficit
-  // (MemoryLedger::setHostRefusedWaiting).
+  // of a priority the scheduler plans (belowRunnable) that no plan of its
+  // kind passed over (ResourceWait::passedOver), or one without a lane that
+  // admission tries and holds behind no refusal, whose latest refusal free()
+  // left pending (ResourceWait::pending), up to the resource wait limit from
+  // when its refusals began waiting (ResourceWait::pendingSinceMilliseconds)
+  // and within its wait's deadline (resourceDeadline). A waiting claim holds
+  // room against claims ranked below it; past that limit or deadline it
+  // holds none, whatever its retries find (ResourceWait::holdEnded); a wait
+  // for the SSD cache's quota is no memory claim. One whose latest refusal
+  // was the host's, retried within its deadline, counts in the host's
+  // deficit (MemoryLedger::setHostRefusedWaiting).
   void syncClaims(double nowMilliseconds);
+  // Before the plan's memory is decided, marks each lane of the plan's kind
+  // that waits for memory on its way back and is ready to retry (not in
+  // `excluded`) as passed over while the plan leaves it out, its claim no
+  // longer waiting, and as retried while the plan holds it. Its wait's
+  // record stays, so its claim's hold limit runs from its first refusal
+  // that waited.
+  void passOver(const BatchPlan &plan, std::span<const uint64_t> excluded);
   // What copies ahead are worth now (WriteBehind::run): none unless a
   // recent free() reached cache a copy would have let go at once
   // (MemoryGovernor::copyDemand), else the larger of twice the KV the
