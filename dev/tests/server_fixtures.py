@@ -5,6 +5,7 @@ launcher arguments several tests build."""
 
 import base64
 import contextlib
+import dataclasses
 import http.client
 import inspect
 import io
@@ -26,14 +27,14 @@ from tokenizers import Regex, Tokenizer, decoders, models, pre_tokenizers
 
 from dev.tests import native_peer
 from install import families, launcher
-from server import api_shapes, documents, images, serve_options
 from server import backend as backend_api
+from server import documents, images, serve_options
 from server import errors as api_errors
 from server import frontend as request_frontend
 from server import protocol as wire
 from server import runtime as engine_runtime
 from server import server as api
-from server.chat_format import QWEN
+from server.chat_format import FLINT, QWEN
 from server.chat_templates import ChatTemplates
 from server.lru import LRUCache
 from server.origins import parse_allowed_origin
@@ -41,7 +42,36 @@ from server.thinking import ThinkingCodec
 
 # The deadline of a request prepared directly, which never expires.
 FOREVER = math.inf
-READY = wire.ReadyEvent(4, 131_072, False)
+# The targets' native window, the context a start serves without --max-context
+# (QwenTargetDimensions::nativeContextTokens).
+NATIVE_CONTEXT = 262144
+# The vocabulary and stop tokens the engine of each chat format's targets
+# announces in Ready (runtime/model/Qwen3_8.hpp, Flint.hpp).
+ENGINE_TOKENS = {
+    QWEN: (248_320, (248_044, 248_046)),
+    FLINT: (150_144, (150_001, 150_003, 150_005, 150_018)),
+}
+
+
+def engine_ready(context=131_072, *, vision=False, concurrency=4, chat_format=QWEN):
+    """The Ready an engine of `chat_format`'s family serving `context` tokens
+    announces, with the mask rows of a draft of eight."""
+    vocabulary, stops = ENGINE_TOKENS[chat_format]
+    return wire.ReadyEvent(concurrency, context, vision, vocabulary, 9, stops)
+
+
+READY = engine_ready()
+
+
+def serve_context(app, tokens):
+    """Have `app`'s engine serve `tokens` of context from now on, as a relaunch
+    whose plan holds that much announces."""
+    runtime = app.backend.runtime
+    runtime.capabilities = dataclasses.replace(
+        runtime.capabilities, max_context_tokens=tokens
+    )
+
+
 # The generation APIs: Chat Completions, Responses and Messages.
 PATHS = ("/v1/chat/completions", "/v1/responses", "/v1/messages")
 # The weights section of the status document an engine answers a release
@@ -232,11 +262,11 @@ class ImagePadTokenizer(FakeTokenizer):
 
     # Stands for the template: rendering emits the source per image part,
     # so the frontend's image render marker appears where it replaced it.
-    chat_template = api_shapes.IMAGE_PAD_TOKEN
+    chat_template = QWEN.image_pad
 
     def __call__(self, text, **kwargs):
-        count = text.count(api_shapes.IMAGE_PAD_TOKEN)
-        width = len(api_shapes.IMAGE_PAD_TOKEN)
+        count = text.count(QWEN.image_pad)
+        width = len(QWEN.image_pad)
         return {
             "input_ids": [101, *([50] * count), 102],
             "offset_mapping": [
@@ -253,7 +283,7 @@ class ImagePadTokenizer(FakeTokenizer):
             content = message.get("content")
             if isinstance(content, list):
                 rendered += "".join(
-                    kwargs.get("chat_template", api_shapes.IMAGE_PAD_TOKEN)
+                    kwargs.get("chat_template", QWEN.image_pad)
                     for part in content
                     if part.get("type") == "image_url"
                 )
@@ -267,7 +297,7 @@ class ImagePadTokenizer(FakeTokenizer):
         )
 
     def convert_tokens_to_ids(self, token):
-        if token == api_shapes.IMAGE_PAD_TOKEN:
+        if token == QWEN.image_pad:
             return 50
         return super().convert_tokens_to_ids(token)
 
@@ -337,6 +367,8 @@ class FakeCall:
         self.on_event = on_event
         self.on_complete = on_complete
         self.plan = plan
+        # Every event it emitted.
+        self.events = []
         self.callback_error = None
         self.cancel_requested = False
         self._result = None
@@ -349,7 +381,12 @@ class FakeCall:
         with self._lock:
             return self._done
 
+    @property
+    def started(self):
+        return any(isinstance(event, wire.StartEvent) for event in self.events)
+
     def emit(self, event):
+        self.events.append(event)
         if self.on_event is None:
             return
         try:
@@ -405,10 +442,11 @@ class FakeRuntime:
         self.cancel_count = 0
         self.closed = False
         self.ready = True
-        self.readiness = READY
-        self.fatal_error = None
+        self.capabilities = READY
         self.pending_limit = 32
         self.restart_count = 0
+        self.last_start_seconds = 0.0
+        self.spawned_at = None
         self.last_crash_trace = None
         self.status_event = native_peer.status_event()
         self.release_event = native_peer.status_event(weights=RELEASED_WEIGHTS)
@@ -637,6 +675,9 @@ class FakeProcess:
         self.stdin = FakeInput(self)
         self._condition = threading.Condition()
         self._exit_code = None
+        # The fault signal it is dying by (crash), which no other signal
+        # changes.
+        self._fault = None
         if initial_output is None:
             self.send(READY)
         elif initial_output:
@@ -648,12 +689,23 @@ class FakeProcess:
     def close_stdout(self):
         self.stdout.close()
 
+    def crash(self, fault):
+        """Dies by signal `fault` as a real engine does: its output ends
+        first, and its exit status is there to read a moment later."""
+        with self._condition:
+            self._fault = fault
+        self.stdout.close()
+        exit_later = threading.Timer(0.05, self._exit, (-fault,))
+        exit_later.daemon = True
+        exit_later.start()
+
     def poll(self):
         with self._condition:
             return self._exit_code
 
     def terminate(self):
-        self._exit(-15)
+        # The engine stops on SIGTERM as on stdin's end, and exits with EX_OK.
+        self._exit(0)
 
     def kill(self):
         self._exit(-9)
@@ -662,7 +714,7 @@ class FakeProcess:
         with self._condition:
             if self._exit_code is not None:
                 return
-            self._exit_code = code
+            self._exit_code = code if self._fault is None else -self._fault
             self._condition.notify_all()
         self.stdin.close()
         self.stdout.close()
@@ -701,7 +753,6 @@ def request(
     seed=0,
     constraint=wire.ConstraintMode.NONE,
     mask_provider=None,
-    image_owner=None,
     return_progress=False,
     score_tokens=(),
     generation_prompt_tokens=0,
@@ -724,7 +775,10 @@ def request(
         generation_prompt_tokens=generation_prompt_tokens,
     )
     return engine_runtime.GenerationRequest(
-        frame, time.monotonic() + deadline, mask_provider, image_owner
+        frame,
+        time.monotonic() + deadline,
+        mask_provider,
+        wire.request_fingerprint(frame),
     )
 
 
@@ -815,6 +869,7 @@ def main_args(**overrides):
             "sparse_kv_memory": None,
             "kv_format": "int8",
             "state_format": "fp32",
+            "serve_record": None,
             **overrides,
         }
     )
@@ -834,23 +889,45 @@ def unprepared_hold(family="Qwen3.8-27B"):
 
 def make_frontend(
     tokenizer,
-    *args,
+    backend,
+    model,
+    max_context,
+    request_timeout,
+    capacity,
+    *,
+    vision,
     constraint_factory=None,
     thinking_codec=None,
     chat_format=QWEN,
     **options,
 ):
     """A frontend over the tokenizer, with its chat templates probed as
-    startup probes them. Unless a test passes its own, generation is
-    unconstrained, thinking is signed with a fresh key and the output is
-    read in the Qwen families' chat format."""
+    startup probes them, serving what an engine of `capacity` lanes announces
+    for `max_context` tokens with or without `vision`: the Ready its
+    backend's runtime holds, or a stand-in backend's where the test passes
+    none. Unless a test passes its own, generation is unconstrained, thinking
+    is signed with a fresh key and the output is read in the Qwen families'
+    chat format."""
     if constraint_factory is None:
         constraint_factory = PassThroughConstraintFactory()
     if thinking_codec is None:
         thinking_codec = ThinkingCodec()
+    capabilities = engine_ready(max_context, vision=vision, concurrency=capacity)
+    backend = backend or SimpleNamespace()
+    runtime = getattr(backend, "runtime", None)
+    if runtime is None:
+        backend.runtime = SimpleNamespace(capabilities=capabilities)
+    elif not isinstance(runtime, engine_runtime.MultiplexedRuntime):
+        # A runtime that runs engines serves what they announce.
+        runtime.capabilities = capabilities
+    # Unless a test passes its own, requests get the sampling the Qwen
+    # families publish, as the server serving one does.
+    options.setdefault("sampling_defaults", dataclasses.asdict(families.QWEN_SAMPLING))
     return request_frontend.Frontend(
         tokenizer,
-        *args,
+        backend,
+        model,
+        request_timeout,
         constraint_factory=constraint_factory,
         chat_templates=ChatTemplates(tokenizer),
         chat_format=chat_format,
@@ -1187,12 +1264,26 @@ def openai_client(harness):
 
 
 def pdf_bytes(
-    text="ALPHA 42", *, pages=1, width=200, height=200, encrypted=False, padding_bytes=0
+    text="ALPHA 42",
+    *,
+    pages=1,
+    width=200,
+    height=200,
+    encrypted=False,
+    padding_bytes=0,
+    font=None,
 ):
+    """A PDF of `pages` pages, each with `text`, a PDF string's contents, in
+    Helvetica; or, with `font`, in that TrueType font, which the PDF names in
+    WinAnsiEncoding without embedding it, so that PDFium looks it up among
+    the system's fonts and `text` can escape characters beyond ASCII."""
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"",
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+        if font is None
+        else f"<< /Type /Font /Subtype /TrueType /BaseFont /{font} "
+        "/Encoding /WinAnsiEncoding >>".encode(),
     ]
     kids = []
     for index in range(pages):

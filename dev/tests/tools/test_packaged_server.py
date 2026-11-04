@@ -17,12 +17,7 @@ def stage_release(directory):
     root = directory / "source"
     stage = directory / "stage"
     stage.mkdir()
-    for folder, names in (
-        ("server", package.SERVER_FILES),
-        ("server/chat-assets", package.CHAT_ASSET_FILES),
-        ("install", package.INSTALL_FILES),
-        ("install/completions", package.COMPLETION_FILES),
-    ):
+    for folder, names in package.SOURCE_FOLDERS:
         (root / folder).mkdir(parents=True)
         for name in names:
             shutil.copy2(package.ROOT / folder / name, root / folder / name)

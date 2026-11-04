@@ -1,8 +1,10 @@
 import contextlib
+import errno
 import fcntl
 import io
 import json
 import os
+import re
 import select
 import signal
 import socket
@@ -147,6 +149,10 @@ class LauncherTests(unittest.TestCase):
                 served = api.parse_args(server_arguments(execute.call_args.args[1]))
                 self.assertEqual(served.host, expected)
                 self.assertEqual(served.allowed_host, ["proxy.example"])
+                # The app reads why a start failed beside the port's lock.
+                self.assertEqual(
+                    served.serve_record, Path(temporary) / "serve-9123.json"
+                )
 
     def test_invalid_bind_address_fails_before_model_work(self):
         with (
@@ -258,7 +264,13 @@ class LauncherTests(unittest.TestCase):
             install.assert_called_once_with(selection(launcher.paths.MODELS))
             execute.assert_called_once()
             self.assertEqual(
-                {p.name for p in runtime.iterdir()}, {"serve.lock", "serve-8000.lock"}
+                {p.name for p in runtime.iterdir()},
+                {"serve.lock", "serve-8000.lock", "serve-8000.json"},
+            )
+            # The start's record, which the server, keeping the pid, ends.
+            self.assertEqual(
+                json.loads((runtime / "serve-8000.json").read_text()),
+                {"pid": os.getpid(), "phase": "starting"},
             )
             with (runtime / "serve-8000.lock").open("a+") as released:
                 fcntl.flock(released, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -568,6 +580,32 @@ class LauncherTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 launcher.parse_args(["serve", "--help"])
         self.assertIn("SPLASH_PORT or 8123", " ".join(output.getvalue().split()))
+
+    def test_the_apps_launch_options_are_the_serve_options(self):
+        # The desktop app offers every option of splash serve but those of one
+        # model and those it sets itself, from one table (LaunchOption.all,
+        # docs/package.md): a flag it keeps that serve no longer takes would
+        # fail every start, and a new option would never show.
+        with (
+            mock.patch("sys.stdout", io.StringIO()) as output,
+            self.assertRaises(SystemExit),
+        ):
+            launcher.parse_args(["serve", "--help"])
+        flags = set(re.findall(r"(?m)^  (--[a-z-]+)", output.getvalue())) - {
+            "--help",
+            "--model",
+            "--model-dir",
+            "--offline",
+            "--revision",
+            "--draft-model",
+            "--mmproj",
+        }
+        self.assertIn("--max-memory", flags)
+        table = Path(launcher.__file__).resolve().parents[1] / (
+            "app/Sources/Splash/Preferences.swift"
+        )
+        options = set(re.findall(r'flag: "(--[a-z-]+)"', table.read_text()))
+        self.assertEqual(options, flags)
 
     def test_distinct_ports_have_independent_locks_and_same_port_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary, socket.socket() as listener:
@@ -1269,8 +1307,8 @@ class LauncherTests(unittest.TestCase):
     def test_python_programs_write_bytecode_only_as_the_launcher_does(self):
         # A runtime inside a signed app must not gain __pycache__ folders: a
         # launcher run with -B or PYTHONDONTWRITEBYTECODE gives the installer
-        # and the server PYTHONDONTWRITEBYTECODE, which the server's PDF
-        # workers inherit from it.
+        # and the server PYTHONDONTWRITEBYTECODE (the server's PDF workers,
+        # started with no environment, have -B of their own).
         for flag in (False, True):
             with (
                 self.subTest(dont_write_bytecode=flag),
@@ -1367,6 +1405,164 @@ class LauncherTests(unittest.TestCase):
             with (Path(temporary) / "serve-8000.lock").open("a+") as released:
                 fcntl.flock(released, fcntl.LOCK_EX | fcntl.LOCK_NB)
         execute.assert_not_called()
+
+    def test_a_refused_start_says_why_in_its_serve_record(self):
+        """The app words a start the launcher refuses by the record's kind."""
+
+        @contextlib.contextmanager
+        def upgrading(runtime):
+            with (runtime / "serve.lock").open("a+") as installation:
+                fcntl.flock(installation, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                yield
+
+        def helper(output):
+            def run(command, *, stdout, **_options):
+                stdout.write(output)
+                return 1
+
+            return mock.patch.object(launcher, "_run_held", side_effect=run)
+
+        def installer(runtime):
+            # Its messages, and its failure as an error event, on stdout.
+            program = runtime / "python"
+            program.write_text(
+                "#!/bin/sh\necho 'Selected a/b.'\necho '"
+                '{"event":"error","kind":null,"message":"a/b is not installed"}'
+                "'\nexit 1\n"
+            )
+            program.chmod(0o755)
+            return mock.patch.object(launcher.paths, "PYTHON", program)
+
+        unsupported = "Splash needs Apple GPU family 9 or newer (M3 or later)"
+        for case, setup, arguments, failure, output in (
+            (
+                "upgrade",
+                lambda runtime: [upgrading(runtime)],
+                [],
+                {
+                    "kind": "upgrade",
+                    "message": "Splash is being upgraded; wait for the upgrade to finish",
+                },
+                "",
+            ),
+            (
+                "port",
+                lambda _: [
+                    mock.patch.object(
+                        launcher,
+                        "_check_port",
+                        side_effect=OSError(errno.EADDRINUSE, "Address already in use"),
+                    )
+                ],
+                [],
+                {
+                    "kind": "port",
+                    "message": "cannot bind 127.0.0.1:8000: [Errno 48] Address already in use",
+                },
+                "",
+            ),
+            (
+                "device",
+                lambda _: [
+                    mock.patch.object(
+                        launcher.subprocess,
+                        "run",
+                        return_value=subprocess.CompletedProcess([], 0),
+                    ),
+                    mock.patch.object(
+                        launcher.model_artifacts,
+                        "run_engine",
+                        side_effect=launcher.model_artifacts.ModelError(unsupported),
+                    ),
+                ],
+                [],
+                {"kind": "device", "message": unsupported},
+                "",
+            ),
+            (
+                "install",
+                lambda runtime: [
+                    mock.patch.object(launcher, "_ensure_runtime"),
+                    installer(runtime),
+                ],
+                [],
+                {"kind": "install", "message": "a/b is not installed"},
+                "Selected a/b.\n",
+            ),
+            (
+                "local",
+                lambda _: [
+                    mock.patch.object(launcher, "_ensure_runtime"),
+                    helper('{"kind":"model","message":"it is not a GGUF file"}'),
+                ],
+                ["--model-dir", "/m.gguf"],
+                {"kind": "model", "message": "it is not a GGUF file"},
+                "",
+            ),
+            (
+                "local crash",
+                lambda _: [mock.patch.object(launcher, "_ensure_runtime"), helper("")],
+                ["--model-dir", "/m.gguf"],
+                {"kind": "internal", "message": "local model preparation failed"},
+                "",
+            ),
+            (
+                "exec",
+                lambda _: [
+                    mock.patch.object(
+                        launcher, "_prepare_start", return_value=Path("/m")
+                    )
+                ],
+                [],
+                {"kind": "internal", "message": "[Errno 2] No such file or directory"},
+                "",
+            ),
+        ):
+            with (
+                self.subTest(case),
+                tempfile.TemporaryDirectory() as temporary,
+                contextlib.ExitStack() as stack,
+            ):
+                runtime = Path(temporary)
+                stack.enter_context(mock.patch.object(launcher, "RUNTIME_DIR", runtime))
+                stack.enter_context(mock.patch.object(launcher.socket, "socket"))
+                stack.enter_context(
+                    mock.patch.object(
+                        launcher.os,
+                        "execve",
+                        side_effect=FileNotFoundError(
+                            errno.ENOENT, "No such file or directory"
+                        ),
+                    )
+                )
+                error = stack.enter_context(mock.patch("sys.stderr", io.StringIO()))
+                relayed = stack.enter_context(mock.patch("sys.stdout", io.StringIO()))
+                for patch in setup(runtime):
+                    stack.enter_context(patch)
+                self.assertEqual(
+                    launcher.main(["serve", "--model", MODEL_ID, *arguments]), 1
+                )
+                self.assertEqual(
+                    json.loads((runtime / "serve-8000.json").read_text()),
+                    {"pid": os.getpid(), "phase": "failed", "failure": failure},
+                )
+                self.assertEqual(error.getvalue(), f"error: {failure['message']}\n")
+                self.assertEqual(relayed.getvalue(), output)
+
+    def test_a_start_refused_the_lock_leaves_the_servers_record(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary)
+            record = runtime / "serve-8000.json"
+            record.write_text('{"pid":123,"phase":"starting"}')
+            with (runtime / "serve-8000.lock").open("a+") as held:
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with (
+                    mock.patch.object(launcher, "RUNTIME_DIR", runtime),
+                    mock.patch("sys.stderr", io.StringIO()) as error,
+                ):
+                    self.assertEqual(launcher.main(["serve", "--model", MODEL_ID]), 1)
+            self.assertIn("Splash is already serving", error.getvalue())
+            self.assertEqual(record.read_text(), '{"pid":123,"phase":"starting"}')
 
     def test_metadata_write_failure_releases_lock_before_model_work(self):
         with (

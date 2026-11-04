@@ -225,7 +225,7 @@ class ReleaseAppTests(unittest.TestCase):
 
     def test_a_release_carries_the_command_lines_files_of_its_version(self):
         with mock.patch.object(release_app, "ROOT", self.root):
-            files, formula, problem = release_app.command_line("1.5.0")
+            files, formula, problem = release_app.command_line("1.5.0", "26.4")
             self.assertEqual(
                 problem,
                 f"dist/ has no {ARCHIVE}, {ARCHIVE}.sha256, "
@@ -234,13 +234,13 @@ class ReleaseAppTests(unittest.TestCase):
             made = self.command_line()
             (self.root / "dist/splash-1.4.1.arm64_tahoe.bottle.tar.gz").touch()
             self.assertEqual(
-                release_app.command_line("1.5.0"),
+                release_app.command_line("1.5.0", "26.4"),
                 (made, self.root / "dist/splash.rb", None),
             )
             # A formula of other files, as an earlier release's.
             self.command_line(formula=False)
             self.assertRegex(
-                release_app.command_line("1.5.0")[2],
+                release_app.command_line("1.5.0", "26.4")[2],
                 f"^dist/splash.rb is not the formula of {re.escape(ARCHIVE)}",
             )
 
