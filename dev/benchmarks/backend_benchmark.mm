@@ -958,8 +958,6 @@ int main(int argc, char **argv) {
       progress = std::make_unique<ProgressJournal>(*progressPath, samples);
 
     engine::RuntimeBootstrapConfig bootstrapConfig;
-    engine::RuntimeMetrics metrics;
-    bootstrapConfig.nativeLoop.metrics = &metrics;
     auto &config = bootstrapConfig.resources;
     config.metallibPath = std::filesystem::path(argv[1]);
     config.modelRoot = std::filesystem::path(argv[2]);

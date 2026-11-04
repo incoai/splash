@@ -102,7 +102,7 @@ struct LoopOptions final {
 
 // A native loop over the fake model, collecting the bytes it writes. Its
 // config is completed with the engine's (test::engineConfig), and the
-// fixture's metrics and weights (EngineConfig::weights), each weight
+// fixture's weights (EngineConfig::weights), each weight
 // allocation admitted (test::admitAll, or the governor's with memory), where
 // the test gave none; the weights' idle release is production's unless the
 // test gives one. Its unix clock stands still and its awake clock reads
@@ -164,8 +164,6 @@ struct LoopFixture {
     if (governor)
       engine::connectToGovernor(config.engine, *governor);
     config.engine = test::engineConfig(std::move(config.engine));
-    if (!config.metrics)
-      config.metrics = &metrics;
     if (!config.engine.weights)
       config.engine.weights.emplace();
     engine::WeightResidencyConfig &residency = *config.engine.weights;
@@ -246,7 +244,6 @@ public:
   std::function<std::string()> status = test::readyStatusJson;
   double monotonic = 100.0;
   double clockStep = 0.0;
-  engine::RuntimeMetrics metrics;
   Weights weights;
   engine::NativeRuntime loop;
   std::optional<engine::MemoryControl> control;

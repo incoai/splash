@@ -194,8 +194,7 @@ void RuntimeBootstrap::announceReady() {
   resources_->beginServing();
 }
 
-std::string RuntimeBootstrap::statusJson(const RuntimeMetricsSnapshot &metrics,
-                                         double loopMaxTickMilliseconds) {
+std::string RuntimeBootstrap::statusJson(double loopMaxTickMilliseconds) {
   // Status can arrive during GPU work; allocation/command boundaries and
   // the safe-point pressure monitor already refresh the cached sample.
   metal::MetalBackend &backend = resources_->backend();
@@ -203,7 +202,7 @@ std::string RuntimeBootstrap::statusJson(const RuntimeMetricsSnapshot &metrics,
   StatusSample sample{.engine = nativeLoop_->statusSnapshot(),
                       .resourceWait = nativeLoop_->resourceWaitSnapshot(),
                       .weights = nativeLoop_->weightsSnapshot(),
-                      .metrics = metrics,
+                      .metrics = nativeLoop_->metricsSnapshot(),
                       .telemetry = model_->telemetry(),
                       .metalMemory = backend.memoryStats(),
                       .metalHealthy = healthy,

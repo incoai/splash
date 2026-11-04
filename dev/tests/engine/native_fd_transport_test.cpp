@@ -83,12 +83,10 @@ struct Harness final {
   engine::FdTransport transport;
   // What the loop answers a status request with.
   std::function<std::string()> status = test::readyStatusJson;
-  RuntimeMetrics metrics;
   test::Weights weights;
   engine::NativeRuntime loop{
       {.engine = test::engineConfig(
-           {.weights = engine::WeightResidencyConfig{.weights = &weights, .admit = test::admitAll}}),
-       .metrics = &metrics},
+           {.weights = engine::WeightResidencyConfig{.weights = &weights, .admit = test::admitAll}})},
       resources, executor, transport.outputSink(),
       [this] { return status(); }, protocol::ProtocolLimits{}};
 };
@@ -113,12 +111,10 @@ struct PersistentHarness final {
   engine::Cache resources{pool, &tier, nullptr};
   test::Executor executor;
   engine::FdTransport transport{pipes.input[0], pipes.output[1]};
-  RuntimeMetrics metrics;
   test::Weights weights;
   engine::NativeRuntime loop{
       {.engine = test::engineConfig(
-           {.weights = engine::WeightResidencyConfig{.weights = &weights, .admit = test::admitAll}}),
-       .metrics = &metrics},
+           {.weights = engine::WeightResidencyConfig{.weights = &weights, .admit = test::admitAll}})},
       resources, executor, transport.outputSink(),
       test::readyStatusJson, protocol::ProtocolLimits{}};
 };
@@ -346,12 +342,10 @@ void testLoopWakesForAnEngineDeadline() {
   test::Executor executor{0};
   engine::FdTransport transport{pipes.input[0], pipes.output[1]};
   std::vector<protocol::ErrorEvent> errors;
-  RuntimeMetrics metrics;
   test::Weights weights;
   engine::NativeRuntime loop{
       {.engine = test::engineConfig(
-           {.weights = engine::WeightResidencyConfig{.weights = &weights, .admit = test::admitAll}}),
-       .metrics = &metrics},
+           {.weights = engine::WeightResidencyConfig{.weights = &weights, .admit = test::admitAll}})},
       resources, executor,
       [&](std::span<const uint8_t> bytes) {
         for (const auto &event : protocol::peer::decodeEvents(bytes)) {

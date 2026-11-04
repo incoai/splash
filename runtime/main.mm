@@ -347,10 +347,9 @@ int serveNative(int argc, char **argv) {
   ShutdownSignals signals(transport);
   std::optional<MemoryPressureMonitor> pressureMonitor;
   IdleSleepAssertion idleSleep;
-  engine::RuntimeMetrics metrics;
   engine::RuntimeBootstrap *published = nullptr;
   auto statusProvider = [&] {
-    return published->statusJson(metrics.snapshot(), transport.maxTickMilliseconds());
+    return published->statusJson(transport.maxTickMilliseconds());
   };
 
   std::unique_ptr<engine::RuntimeBootstrap> bootstrap;
@@ -365,7 +364,6 @@ int serveNative(int argc, char **argv) {
       engine::RuntimeBootstrapConfig config = bootstrapConfig(arguments);
       config.resources.memoryPressure = [&] { return pressureMonitor->pressure(); };
       config.resources.cancelled = [&] { return transport.shutdownRequested(); };
-      config.nativeLoop.metrics = &metrics;
       if (arguments.preventIdleSleep)
         config.nativeLoop.holdingRequests = [&](bool held) { idleSleep.hold(held); };
       try {

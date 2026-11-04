@@ -22,11 +22,10 @@ namespace splash::engine {
 // on.
 [[nodiscard]] uint64_t systemUnixMicros() noexcept;
 
-// The loop's constructor refuses a config without its metrics, the engine's
-// weights (EngineConfig::weights) or its clocks.
+// The loop's constructor refuses a config without the engine's weights
+// (EngineConfig::weights) or its clocks.
 struct NativeLoopConfig {
   engine::EngineConfig engine;
-  RuntimeMetrics *metrics = nullptr;
   // Told true when the engine takes a request while it holds none, and false
   // when its last request ends; the process keeps the Mac from idle sleep in
   // between (main.mm). It must not throw. Empty where nothing needs to know.
@@ -103,6 +102,9 @@ public:
   // arrival, on the runtime's clock.
   [[nodiscard]] engine::EngineSnapshot statusSnapshot() const;
   [[nodiscard]] WeightsSnapshot weightsSnapshot() const { return core_.weightsSnapshot(); }
+  // The requests' latencies and the batches' throughput, which only the
+  // loop records, from its engine's events.
+  [[nodiscard]] RuntimeMetricsSnapshot metricsSnapshot() const { return metrics_.snapshot(); }
   // The engine's (Engine::resourceWaitSnapshot), on the runtime's clock.
   [[nodiscard]] engine::ResourceWaitSnapshot resourceWaitSnapshot() const {
     return core_.resourceWaitSnapshot(config_.monotonicMilliseconds());
@@ -175,6 +177,8 @@ private:
   StatusProvider statusProvider_;
   protocol::ProtocolLimits limits_;
   protocol::FrameParser parser_;
+  // Before core_, which reports to it through this loop's EngineEventSink.
+  RuntimeMetrics metrics_;
   engine::Engine core_;
   std::unordered_map<uint64_t, RequestTelemetry> telemetry_;
   std::unordered_map<uint64_t, PendingMask> pendingMasks_;

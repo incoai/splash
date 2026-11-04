@@ -603,7 +603,6 @@ void testTransfersLandWhileTheWeightsAreRestored() {
   Executor executor;
   executor.keptTier = std::make_shared<test::OffloadControl>();
   executor.keptTier->ready = true;
-  RuntimeMetrics metrics;
   Weights weights;
   bool refuse = false;
   double now = 100.0;
@@ -612,7 +611,6 @@ void testTransfersLandWhileTheWeightsAreRestored() {
       {.engine = test::engineConfig(
            {.maxContext = 102400,
             .weights = WeightResidencyConfig{.weights = &weights, .admit = refusing(refuse)}}),
-       .metrics = &metrics,
        .unixMicros = [] { return uint64_t{1'000'000}; },
        .monotonicMilliseconds = [&] { return now; }},
       cache, executor,

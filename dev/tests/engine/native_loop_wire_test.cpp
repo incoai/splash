@@ -618,9 +618,7 @@ void testControlFailureUsesExecutionBoundary() {
 void testFrameFailureUsesExecutionBoundary() {
   enum class Thrown { Standard, Metal, Foreign };
   for (const Thrown thrown : {Thrown::Standard, Thrown::Metal, Thrown::Foreign}) {
-    RuntimeMetrics metrics;
     engine::NativeLoopConfig config;
-    config.metrics = &metrics;
     uint32_t told = 0;
     config.engineFailed = [&told] { ++told; };
     LoopFixture fixture(config, {.pages = 8});
@@ -650,7 +648,7 @@ void testFrameFailureUsesExecutionBoundary() {
       }
     }
     require(errors == 1 && told == 1 &&
-                metrics.snapshot().metalFailures == (thrown == Thrown::Metal ? 1U : 0U),
+                loop.metricsSnapshot().metalFailures == (thrown == Thrown::Metal ? 1U : 0U),
             "a frame exception was reported, told or counted other than once");
   }
 }
@@ -664,26 +662,18 @@ void testInvalidLimitsAreRejectedAtConstruction() {
           "the loop accepted invalid protocol limits");
 }
 
-// The loop refuses a config without the metrics or the weights the bootstrap
-// always gives it; each case lacks one of them.
+// The loop refuses a config without the weights the bootstrap always gives
+// it.
 void testLoopNeedsItsComponents() {
-  for (const int lacking : {0, 1}) {
-    test::TestKvStorage storage(8, 4096, 4);
-    KvPool pool(storage, 8);
-    engine::Cache cache(pool, nullptr, nullptr);
-    Executor executor;
-    RuntimeMetrics runtimeMetrics;
-    Weights weights;
-    NativeLoopConfig config{.engine = test::engineConfig(),
-                            .metrics = lacking == 0 ? nullptr : &runtimeMetrics};
-    if (lacking != 1)
-      config.engine.weights = WeightResidencyConfig{.weights = &weights, .admit = test::admitAll};
-    rejects([&] {
-      engine::NativeRuntime(std::move(config), cache, executor, [](std::span<const uint8_t>) {},
-                            test::readyStatusJson, protocol::ProtocolLimits{});
-    }, "the native engine loop lacks a component it needs",
-            "a loop without its metrics or its weights was built");
-  }
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 8);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor;
+  NativeLoopConfig config{.engine = test::engineConfig()};
+  rejects([&] {
+    engine::NativeRuntime(std::move(config), cache, executor, [](std::span<const uint8_t>) {},
+                          test::readyStatusJson, protocol::ProtocolLimits{});
+  }, "the native engine loop lacks a component it needs", "a loop without its weights was built");
 }
 
 // An exception while the engine admits a request is engine-fatal: nothing

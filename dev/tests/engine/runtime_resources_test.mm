@@ -863,8 +863,6 @@ void testStartChecksTheReserveWithWhatItServes(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-start-reserve");
   RuntimeBootstrapConfig config;
   config.resources = loadableConfig(metallibPath, root.path(), "start-reserve-test");
-  RuntimeMetrics metrics;
-  config.nativeLoop.metrics = &metrics;
   // The process's Metal memory at the last check of the host. Once the start
   // has given back a lane's state, the host refuses its next two checks, as
   // macOS would before it counts what Metal freed.
@@ -895,7 +893,7 @@ void testStartChecksTheReserveWithWhatItServes(const char *metallibPath) {
   // still see.
   require(checked < device.currentAllocatedSize + 2 * lane,
           "the start's last check of the host counted the lanes' state its warmups left idle");
-  require(bootstrap->statusJson(metrics.snapshot(), {}).find("\"memory_limited_steps\":[]") !=
+  require(bootstrap->statusJson(0.0).find("\"memory_limited_steps\":[]") !=
               std::string::npos,
           "the start did not warm every decode width");
 }
@@ -1199,14 +1197,12 @@ void testAnExplicitRelaunchServesItsFirstContext(const char *metallibPath) {
   // reports), and its log.
   config.nativeLoop.engine.maxContext = first;
   const auto relaunch = [&] {
-    RuntimeMetrics metrics;
-    config.nativeLoop.metrics = &metrics;
     std::unique_ptr<RuntimeBootstrap> bootstrap;
     const std::string log = test::capturedStderr([&] {
       bootstrap = RuntimeBootstrap::start(config, [](std::span<const uint8_t>) {}, [] { return std::string(); });
       bootstrap->announceReady();
     });
-    const std::string status = bootstrap->statusJson(metrics.snapshot(), {});
+    const std::string status = bootstrap->statusJson(0.0);
     const std::string field = "\"maximum_context_tokens\":";
     const size_t at = status.find(field);
     require(at != std::string::npos, "the status names no context");
@@ -1300,11 +1296,10 @@ void testTwoLaunchesGetOneFloor(const RuntimeResourcesConfig &config) {
 // A start of `resources` as the server makes one, asked for `maxContext`
 // tokens (--max-context, zero for the automatic context), whose log it keeps
 // in `log`.
-std::unique_ptr<RuntimeBootstrap> bootstrapOf(const RuntimeResourcesConfig &resources, RuntimeMetrics &metrics,
-                                              std::string &log, uint32_t maxContext = 0) {
+std::unique_ptr<RuntimeBootstrap> bootstrapOf(const RuntimeResourcesConfig &resources, std::string &log,
+                                              uint32_t maxContext = 0) {
   RuntimeBootstrapConfig config;
   config.resources = resources;
-  config.nativeLoop.metrics = &metrics;
   config.nativeLoop.engine.maxContext = maxContext;
   std::unique_ptr<RuntimeBootstrap> bootstrap;
   log = test::capturedStderr([&] {
@@ -1326,9 +1321,8 @@ const MemoryAccountSnapshot *accountOf(const MemoryGovernorSnapshot &memory, std
 // account holds the rest, so that the accounts' current bytes add up to the
 // charged bytes exactly.
 void testLedgerAccountsSumToTheBackend(const RuntimeResourcesConfig &config) {
-  RuntimeMetrics metrics;
   std::string log;
-  const std::unique_ptr<RuntimeBootstrap> bootstrap = bootstrapOf(config, metrics, log);
+  const std::unique_ptr<RuntimeBootstrap> bootstrap = bootstrapOf(config, log);
   RuntimeResources &resources = bootstrap->resources();
   const MemoryGovernorSnapshot memory = resources.memoryGovernor().snapshot();
   const MemoryAccountSnapshot *kv = accountOf(memory, "kv"), *states = accountOf(memory, "states"),
@@ -1356,11 +1350,10 @@ void testLedgerAccountsSumToTheBackend(const RuntimeResourcesConfig &config) {
 // backend's buffers.
 void testStartupGrowsByTheHostRule(const RuntimeResourcesConfig &config) {
   constexpr uint32_t kContext = 98'304;
-  RuntimeMetrics metrics;
   std::string log;
   model::ExpertStoreStats grown;
   {
-    const std::unique_ptr<RuntimeBootstrap> roomy = bootstrapOf(config, metrics, log, kContext);
+    const std::unique_ptr<RuntimeBootstrap> roomy = bootstrapOf(config, log, kContext);
     grown = *roomy->resources().streamedExpertStats();
     const MemoryGovernorSnapshot memory = roomy->resources().memoryGovernor().snapshot();
     const MemoryAccountSnapshot *experts = accountOf(memory, "experts");
@@ -1386,7 +1379,7 @@ void testStartupGrowsByTheHostRule(const RuntimeResourcesConfig &config) {
   bounded.hostMemory = [spareReserve] {
     return std::optional<HostMemory>(HostMemory{64 * kGiB, spareReserve + kHostMarginBytes / 2});
   };
-  const std::unique_ptr<RuntimeBootstrap> held = bootstrapOf(bounded, metrics, log, kContext);
+  const std::unique_ptr<RuntimeBootstrap> held = bootstrapOf(bounded, log, kContext);
   const model::ExpertStoreStats floor = *held->resources().streamedExpertStats();
   require(floor.liveBytes == floor.floorBytes && floor.floorBytes == grown.floorBytes && !floor.regrows &&
               log.find("Memory: experts grew") == std::string::npos,

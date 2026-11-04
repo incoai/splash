@@ -74,7 +74,6 @@ struct Served final {
       return std::optional<HostMemory>(HostMemory{host->availableBytes, host->availableBytes});
     };
     config.resources.memoryPressure = [host = host] { return host->pressure; };
-    config.nativeLoop.metrics = &metrics;
     log = test::capturedStderr([&] {
       bootstrap = RuntimeBootstrap::start(
           std::move(config),
@@ -145,7 +144,6 @@ struct Served final {
   std::shared_ptr<Host> host;
   std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
   uint64_t controlPasses = 0;
-  RuntimeMetrics metrics;
   std::vector<uint8_t> output;
   protocol::peer::EventReader reader;
   std::set<uint64_t> submitted;

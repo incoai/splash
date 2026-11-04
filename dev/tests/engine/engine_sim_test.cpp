@@ -413,7 +413,7 @@ void testChurnKeepsTheStoreThroughAHostEpisode() {
   const engine::EngineSnapshot counts = serving.fixture.loop.statusSnapshot();
   const double gapLimit = counts.scheduler.decodeGapTargetMilliseconds +
                           decodeCommand(*machine.profile, 3, double(machine.store.floor) / machine.store.whole, 3);
-  const double longestGap = serving.fixture.metrics.snapshot().decodeGap.maximumMilliseconds;
+  const double longestGap = serving.fixture.loop.metricsSnapshot().decodeGap.maximumMilliseconds;
   require(churn.finished.size() >= 6, at(machine) + "the churn finished " + std::to_string(churn.finished.size()) +
                                           " requests in 15 minutes");
   require(longestGap <= gapLimit, at(machine) + "a decode gap of " + std::to_string(longestGap) +

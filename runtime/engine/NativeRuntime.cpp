@@ -27,7 +27,7 @@ NativeRuntime::NativeRuntime(NativeLoopConfig config, engine::Cache &cache,
     : config_(std::move(config)), output_(std::move(output)),
       statusProvider_(std::move(statusProvider)), limits_(limits),
       parser_(limits_), core_(config_.engine, cache, model, *this) {
-  if (!output_ || !statusProvider_ || !config_.metrics || !config_.engine.weights ||
+  if (!output_ || !statusProvider_ || !config_.engine.weights ||
       !config_.unixMicros || !config_.monotonicMilliseconds)
     throw std::invalid_argument("the native engine loop lacks a component it needs");
   if (auto issue = protocol::validateLimits(limits_))
@@ -129,7 +129,7 @@ void NativeRuntime::executionFailed(std::exception_ptr failure) {
   try {
     std::rethrow_exception(failure);
   } catch (const metal::MetalBackendError &error) {
-    config_.metrics->metalFailed();
+    metrics_.metalFailed();
     // A command short of GPU memory says nothing about the requests it ran
     // (server/supervision.py Quarantine counts the other failures).
     engineError(error.outOfMemory() ? "metal_out_of_memory" : "metal_execution_failed",
@@ -382,7 +382,7 @@ void NativeRuntime::batchCompleted(WorkKind kind, uint32_t width,
                                    uint32_t acceptedDraftTokens,
                                    double wallMilliseconds,
                                    double cycleMilliseconds) {
-  config_.metrics->batchCompleted(kind, width, inputTokens, outputTokens,
+  metrics_.batchCompleted(kind, width, inputTokens, outputTokens,
                                   draftedTokens, acceptedDraftTokens,
                                   wallMilliseconds, cycleMilliseconds);
 }
@@ -431,13 +431,13 @@ void NativeRuntime::tokens(uint64_t requestId,
       if (part != static_cast<size_t>(TtftPart::Rest))
         counted += parts[part];
     parts[static_cast<size_t>(TtftPart::Rest)] = std::max(0.0, ttft - counted);
-    config_.metrics->ttftParts(parts);
+    metrics_.ttftParts(parts);
     logLine("TTFT of request ", requestId, ": ", ttft, " ms: own prefill ", parts[0], ", claim wait ", parts[1],
             ", decode ", parts[2], ", other prefill ", parts[3], ", rest ", parts[4]);
   }
   uint32_t offset = telemetry.emittedTokens;
   telemetry.emittedTokens += static_cast<uint32_t>(values.size());
-  config_.metrics->tokens(telemetry.arrivedMilliseconds,
+  metrics_.tokens(telemetry.arrivedMilliseconds,
                           telemetry.lastTokenMilliseconds,
                           static_cast<uint32_t>(values.size()), now);
   telemetry.lastTokenMilliseconds = now;
@@ -491,7 +491,7 @@ void NativeRuntime::failed(uint64_t requestId, LaneOutcome outcome,
                            std::string message, uint32_t retryAfterSeconds) {
   const LaneOutcomeWire wire = laneOutcomeWire(outcome);
   if (outcome == LaneOutcome::CapacityExhausted)
-    config_.metrics->capacityFailed();
+    metrics_.capacityFailed();
   requestError(requestId, std::string(wire.code), std::move(message),
                wire.retryable, retryAfterSeconds);
   ended(requestId);
