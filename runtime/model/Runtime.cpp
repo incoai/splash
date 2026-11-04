@@ -62,18 +62,21 @@ using metal::MetalBuffer;
 // its reads brought (SpilledKvReads::readBytes); a decode's, also the
 // host-step work of the hot block cache's reads in the same span
 // (KvBlockCacheStats::work), which the backend counts before the command
-// completes (metal::EventStep).
+// completes (metal::EventStep). It holds the command's reads, which its
+// completion ends, until it realizes the work.
 class WorkCount final {
 public:
-  WorkCount(CommandWork work, const ExpertStore *store, const KvBlockCache *blockCache = nullptr)
-      : work_(work), store_(store), blockCache_(blockCache), weightReadBytes_(store ? store->readBytes() : 0),
+  WorkCount(CommandWork work, const ExpertStore *store, std::shared_ptr<const SpilledKvReads> reads = {},
+            const KvBlockCache *blockCache = nullptr)
+      : work_(work), store_(store), reads_(std::move(reads)), blockCache_(blockCache),
+        weightReadBytes_(store ? store->readBytes() : 0),
         hotBlockMilliseconds_(blockCache ? blockCache->stats().work.totalMilliseconds : 0.0) {}
 
-  // Once the command completed.
-  [[nodiscard]] CommandWork realized(uint64_t spilledKvReadBytes) const {
+  // Once the command completed; lets go of its reads.
+  [[nodiscard]] CommandWork realize() {
     CommandWork work = work_;
     work.weightReadBytes = store_ ? store_->readBytes() - weightReadBytes_ : 0;
-    work.spilledKvReadBytes = spilledKvReadBytes;
+    if (reads_) work.spilledKvReadBytes = std::exchange(reads_, {})->readBytes();
     return work;
   }
   [[nodiscard]] double spilledKvReadMilliseconds() const {
@@ -83,6 +86,7 @@ public:
 private:
   CommandWork work_;
   const ExpertStore *store_ = nullptr;
+  std::shared_ptr<const SpilledKvReads> reads_;
   const KvBlockCache *blockCache_ = nullptr;
   uint64_t weightReadBytes_ = 0;
   double hotBlockMilliseconds_ = 0.0;
@@ -96,19 +100,15 @@ public:
   // Submits the command once the image encodes ahead of it took `encodes`.
   using Submission = std::function<CommandTicket(const CommandTiming &encodes)>;
 
-  // `reads` are the command's reads of spilled K/V, which its completion
-  // ends; `count` counts its work from before its submission.
-  DeferredMetalTicket(CommandTicket ticket, Completion completion, WorkCount count,
-                      std::shared_ptr<const SpilledKvReads> reads = {})
-      : count_(std::move(count)), completion_(std::move(completion)), reads_(std::move(reads)),
-        ticket_(std::move(ticket)) {}
+  // `count` counts its work from before its submission.
+  DeferredMetalTicket(CommandTicket ticket, Completion completion, WorkCount count)
+      : count_(std::move(count)), completion_(std::move(completion)), ticket_(std::move(ticket)) {}
 
   // A command submitted once `encodes`, the command of the image encodes
   // ahead of it, has completed (Runtime::prefillAsync).
-  DeferredMetalTicket(CommandTicket encodes, Submission submit, Completion completion, WorkCount count,
-                      std::shared_ptr<const SpilledKvReads> reads)
-      : count_(std::move(count)), completion_(std::move(completion)), reads_(std::move(reads)),
-        submit_(std::move(submit)), ticket_(std::move(encodes)) {}
+  DeferredMetalTicket(CommandTicket encodes, Submission submit, Completion completion, WorkCount count)
+      : count_(std::move(count)), completion_(std::move(completion)), submit_(std::move(submit)),
+        ticket_(std::move(encodes)) {}
 
   void advance() override {
     if (submit_ && ticket_.ready())
@@ -135,12 +135,7 @@ public:
     Completion completion = std::move(completion_);
     std::vector<ModelStepResult> results = completion(timing);
     wallMilliseconds_ = timing.wallSeconds * 1000.0;
-    uint64_t spilledKvReadBytes = 0;
-    if (reads_) {
-      const std::shared_ptr<const SpilledKvReads> reads = std::exchange(reads_, {});
-      spilledKvReadBytes = reads->readBytes();
-    }
-    work_ = count_.realized(spilledKvReadBytes);
+    work_ = count_.realize();
     spilledKvReadMilliseconds_ = count_.spilledKvReadMilliseconds();
     // Work the completion added takes wall time, but is no sample of the
     // command's rows.
@@ -173,7 +168,6 @@ private:
   // such as the state reservations of its items and the staging its reads
   // of spilled K/V fill.
   Completion completion_;
-  std::shared_ptr<const SpilledKvReads> reads_;
   // The command's submission, while the ticket is its encodes'.
   Submission submit_;
   CommandTicket ticket_;
@@ -2667,7 +2661,8 @@ struct Runtime::Impl {
       // The page sources of the items and the reads go with the command,
       // before the engine applies its results (DeferredMetalTicket::wait).
       items_.clear();
-      work_ = count_.realized(std::exchange(reads_, {})->readBytes());
+      reads_.reset();
+      work_ = count_.realize();
       spilledKvReadMilliseconds_ = count_.spilledKvReadMilliseconds();
       return results;
     }
@@ -3174,9 +3169,9 @@ Runtime::prefillAsync(const BatchPlan &plan,
     lanes[lane] = {static_cast<uint32_t>(items[lane].logicalPosition), items[lane].tokenCount};
   WorkCount count(prefillCommandWork(impl_->geometry.target, std::span(lanes).first(items.size()), plan.layer,
                                      plan.passes - plan.pass),
-                  impl_->model.expertStore());
+                  impl_->model.expertStore(), reads);
   if (encodes.empty())
-    return std::make_unique<DeferredMetalTicket>(submit({}), std::move(finish), std::move(count), reads);
+    return std::make_unique<DeferredMetalTicket>(submit({}), std::move(finish), std::move(count));
   // Metal fails an event wait unmet 5 s after its queue reached it, which it
   // does for a command's first host step or Neural Engine wait as the
   // command is submitted, whatever work runs ahead of it (MetalBackend.hpp,
@@ -3184,7 +3179,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
   // as a command of their own, and the command is submitted once they have
   // completed.
   return std::make_unique<DeferredMetalTicket>(impl_->backend.submitCommandAsync(encodes.command(), completion),
-                                               submit, std::move(finish), std::move(count), reads);
+                                               submit, std::move(finish), std::move(count));
 }
 
 std::vector<ModelStepResult>
@@ -3270,8 +3265,9 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                {logicalPositions.data(), width},
                                {maximumRetained.data(), width}, constrained);
   std::shared_ptr<SpilledKvReads> reads = impl_->decodeReads(items);
-  // The weights it reads on demand and the hot blocks it resolves.
-  WorkCount count({}, impl_->model.expertStore(), impl_->blockCache);
+  // The weights it reads on demand, the spilled K/V its reads bring and the
+  // hot blocks they resolve.
+  WorkCount count({}, impl_->model.expertStore(), reads, impl_->blockCache);
   if (constrained) {
     return std::make_unique<Impl::ConstrainedDecodeTicket>(*impl_, std::move(lanes), items, std::move(reads),
                                                            commandGraph, std::move(count), std::move(completion));
@@ -3290,8 +3286,7 @@ Runtime::decodeAsync(const BatchPlan &plan,
   };
   CommandTicket command = impl_->backend.submitCommandAsync(
       commandGraph.command(), std::move(completion));
-  return std::make_unique<DeferredMetalTicket>(std::move(command), std::move(finish), std::move(count),
-                                               std::move(reads));
+  return std::make_unique<DeferredMetalTicket>(std::move(command), std::move(finish), std::move(count));
 }
 
 uint32_t Runtime::residentLane(uint64_t requestId) const {

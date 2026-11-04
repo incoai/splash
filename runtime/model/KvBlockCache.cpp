@@ -424,10 +424,12 @@ std::vector<KvReadFailure> KvBlockCache::takeFailures() {
   return failures;
 }
 
-void KvBlockCache::mergeStats(const KvReadStats &stats) {
-  // Under the directory's lock, which the host steps that counted held.
+uint64_t KvBlockCache::mergeStats(const KvReadStats &stats) {
+  // Under the directory's lock, which the host steps that count hold: a
+  // dropped command's steps can still be running.
   const std::lock_guard lock(impl_->mutex);
   impl_->totals += stats;
+  return stats.readBytes;
 }
 
 KvBlockCacheStats KvBlockCache::stats() const {

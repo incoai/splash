@@ -122,8 +122,8 @@ public:
   [[nodiscard]] std::vector<KvReadFailure> takeFailures();
 
   // Engine thread, once a command completed: its resolves' counts, and the
-  // totals of every command's.
-  void mergeStats(const KvReadStats &stats);
+  // totals of every command's. Returns the bytes its resolves read.
+  uint64_t mergeStats(const KvReadStats &stats);
   [[nodiscard]] KvBlockCacheStats stats() const;
 
 private:
