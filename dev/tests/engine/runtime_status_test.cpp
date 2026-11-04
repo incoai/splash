@@ -26,8 +26,8 @@ namespace {
 using splash::test::capturedStderr;
 using splash::test::require;
 
-// The 27B's plan, or with another KV layout.
-EngineMemoryPlan plan(const kv::Layout &kvLayout = kv::Layout{16, 4, 256}) {
+// The 27B's plan, or with another KV layout and a spill plan.
+EngineMemoryPlan plan(const kv::Layout &kvLayout = kv::Layout{16, 4, 256}, const KvSpillPlan &spill = {}) {
   DeviceCapabilities device;
   device.deviceName = "test";
   device.appleGpuFamily = 9;
@@ -41,6 +41,7 @@ EngineMemoryPlan plan(const kv::Layout &kvLayout = kv::Layout{16, 4, 256}) {
   device.hasUnifiedMemory = true;
   ModelMemoryProfile profile = test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB);
   profile.targetKvLayout = kvLayout;
+  profile.spill = spill;
   return test::requireMemoryPlan(device, profile);
 }
 
@@ -65,10 +66,37 @@ MemoryAuditResult audit(const EngineMemoryPlan &memoryPlan) {
   return auditActualMemory(memoryPlan, actual);
 }
 
-// A representative status document, every section of it set, and the golden
-// copy of the whole document that the server's reading of it is tested on
-// (dev/tests/server/test_status_contract.py).
-void testCleanRuntimeStatus(const char *goldenPath) {
+// What one status document is written from.
+struct StatusInputs {
+  EngineMemoryPlan memoryPlan;
+  engine::EngineSnapshot engine;
+  metal::MetalMemoryStats metal;
+  WarmupReport warmup;
+  MemoryAuditResult memoryAudit;
+  RuntimeMetricsSnapshot metrics;
+  model::ModelTelemetry telemetry;
+  engine::RuntimeCacheIdentity identity;
+  MemoryGovernorSnapshot governor;
+  bool metalHealthy = true;
+  std::string metalFailureReason;
+  ResourceWaitSnapshot wait;
+  NativeLoopTiming loop;
+  WeightsSnapshot weights;
+  AneFfnSnapshot aneFfn;
+  ThermalState thermalState = ThermalState::Nominal;
+  std::optional<model::SparseRowStats> streamedTable;
+  std::optional<model::ExpertStoreStats> streamedExperts;
+  std::optional<KvSpillStatus> kvSpill;
+
+  [[nodiscard]] std::string json() const {
+    return runtimeStatusJson(memoryPlan, engine, metal, warmup, memoryAudit, metrics, telemetry, identity, governor,
+                             metalHealthy, metalFailureReason, wait, loop, weights, aneFfn, thermalState,
+                             streamedTable, streamedExperts, kvSpill);
+  }
+};
+
+// A representative status document, every section of it set.
+StatusInputs representativeStatus() {
   EngineMemoryPlan memoryPlan = plan();
   engine::EngineSnapshot engine;
   engine.maximumContextTokens = 102400;
@@ -331,10 +359,31 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   const ResourceWaitSnapshot wait{.memory = 2, .concurrency = 1, .heldBehindRefusal = 4,
                                   .restoring = 1, .suspended = 1,
                                   .oldestWaitMilliseconds = 1250.0, .draining = true};
-  const std::string json = runtimeStatusJson(
-      memoryPlan, engine, metal, warmup, audit(memoryPlan), metrics, executorTelemetry,
-      identity, governor, true, {}, wait, NativeLoopTiming{1843.25}, {600.0, false, false, 2, 1}, aneFfn,
-      ThermalState::Fair, table, experts, spill);
+  const MemoryAuditResult memoryAudit = audit(memoryPlan);
+  return {.memoryPlan = std::move(memoryPlan),
+          .engine = std::move(engine),
+          .metal = metal,
+          .warmup = std::move(warmup),
+          .memoryAudit = memoryAudit,
+          .metrics = metrics,
+          .telemetry = executorTelemetry,
+          .identity = std::move(identity),
+          .governor = std::move(governor),
+          .wait = wait,
+          .loop = NativeLoopTiming{1843.25},
+          .weights = {600.0, false, false, 2, 1},
+          .aneFfn = aneFfn,
+          .thermalState = ThermalState::Fair,
+          .streamedTable = std::move(table),
+          .streamedExperts = experts,
+          .kvSpill = std::move(spill)};
+}
+
+// The representative document and the golden copy of it that the server's
+// reading of it is tested on (dev/tests/server/test_status_contract.py).
+void testCleanRuntimeStatus(const char *goldenPath) {
+  const StatusInputs status = representativeStatus();
+  const std::string json = status.json();
   std::ifstream golden(goldenPath);
   const std::string expected{std::istreambuf_iterator<char>(golden), {}};
   require(golden && json + '\n' == expected,
@@ -374,34 +423,27 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                   std::string::npos &&
               json.find("runtime_cache_namespace") == std::string::npos,
           "status lost the cache identity or reported a cache namespace");
-  auto bf16Identity = identity;
-  bf16Identity.kvLayout = kv::Layout{16, 4, 256, kv::Format::BFloat16};
-  const auto bf16Status = runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
-                        metrics, executorTelemetry, bf16Identity, governor, true,
-                        {}, {}, {}, {}, {}, {});
+  StatusInputs bf16 = status;
+  bf16.identity.kvLayout = kv::Layout{16, 4, 256, kv::Format::BFloat16};
+  const std::string bf16Status = bf16.json();
   require(bf16Status.find("\"format\":\"bf16\"") != std::string::npos &&
               bf16Status.find("\"scale_type\":\"none\"") != std::string::npos,
           "BF16 cache identity advertised INT8 storage");
   // YaRN's factor, to the digits that read back as it, as a context of a
   // million tokens takes it, and its original window, which every key went
   // through; the rest of the document keeps its precision.
-  auto yarnIdentity = identity;
-  yarnIdentity.ropeScaling = {3.814697265625, 262144};
+  StatusInputs yarn = status;
+  yarn.identity.ropeScaling = {3.814697265625, 262144};
   std::string yarnExpected = json;
   const std::string unscaled = "\"rope_scaling\":null";
   yarnExpected.replace(yarnExpected.find(unscaled), unscaled.size(),
                        "\"rope_scaling\":{\"type\":\"yarn\",\"factor\":3.814697265625,"
                        "\"original_context_tokens\":262144}");
-  require(runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan), metrics, executorTelemetry,
-                            yarnIdentity, governor, true, {}, wait, NativeLoopTiming{1843.25},
-                            {600.0, false, false, 2, 1}, aneFfn, ThermalState::Fair, table, experts,
-                            spill) == yarnExpected,
+  require(yarn.json() == yarnExpected,
           "the cache identity did not report YaRN, or the status after it lost its precision");
-  auto tokenMajorIdentity = identity;
-  tokenMajorIdentity.kvLayout.valuesTokenMajor = true;
-  const auto tokenMajorStatus = runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
-                        metrics, executorTelemetry, tokenMajorIdentity, governor, true,
-                        {}, {}, {}, {}, {}, {});
+  StatusInputs tokenMajor = status;
+  tokenMajor.identity.kvLayout.valuesTokenMajor = true;
+  const std::string tokenMajorStatus = tokenMajor.json();
   require(tokenMajorStatus.find("\"dtype\":\"q8s8_f32_scale_per_token_head_k_token_major_v_token_major\"") !=
                   std::string::npos &&
               tokenMajorStatus.find("\"value_layout\":\"token_major\"") != std::string::npos,
@@ -428,9 +470,9 @@ void testCleanRuntimeStatus(const char *goldenPath) {
               std::string::npos,
           "status lost model GPU/wall timing, scope, or milliseconds units");
 
-  const std::string unmeasured =
-      runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
-                        metrics, {}, identity, governor, true, {}, {}, {}, {}, {}, {});
+  StatusInputs unmeasuredInputs = status;
+  unmeasuredInputs.telemetry = {};
+  const std::string unmeasured = unmeasuredInputs.json();
   require(unmeasured.find("\"model_timing\":{\"scope\":\"model_lifetime\","
                           "\"prefill\":{\"last_gpu_ms\":0,\"last_wall_ms\":0,"
                           "\"total_gpu_ms\":0,\"total_wall_ms\":0},"
@@ -511,6 +553,83 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                     "wait_ms\":1.5,\"total_residual_wait_ms\":12}") !=
               std::string::npos,
       "status lacks the engine's memory, cache or constraint counters");
+}
+
+// Whole documents for the branches the representative one leaves out. A
+// spilling target: the plan's kv_spill, readers not yet built, a Spill
+// request, the Neural Engine split serving, SSD writes closed and two warmup
+// steps memory-limited. A resident target with windows: the plan's kv_window,
+// no kv_spill or kv.window, no host telemetry, the idle release off, the
+// split off, the streamed stores absent, SSD writes open, Metal failed with a
+// reason that needs escaping, YaRN, BF16 token-major KV, no requests, no
+// ledger accounts and one warmup step memory-limited.
+std::vector<std::pair<const char *, StatusInputs>> statusVariants() {
+  const StatusInputs representative = representativeStatus();
+
+  StatusInputs spilling = representative;
+  spilling.memoryPlan = plan(test::sparseKvLayout(), KvSpillPlan{.enabled = true,
+                                                                 .densePages = 64,
+                                                                 .windowPages = 65,
+                                                                 .groupPages = 256,
+                                                                 .slotBytes = 425'984,
+                                                                 .laneSlots = 4'096,
+                                                                 .hotFloorBytes = 408'944'640,
+                                                                 .hotTargetBytes = 817'889'280,
+                                                                 .hotLimitBytes = 1'635'778'560,
+                                                                 .stagingBuffers = 2,
+                                                                 .stagingBytes = 1'056'440'320,
+                                                                 .indexRunwayBytes = 6'291'456,
+                                                                 .floorTokens = 2'048,
+                                                                 .floorBytes = 1'500'000'000,
+                                                                 .memoryTokens = 300'000,
+                                                                 .diskTokens = 400'000});
+  spilling.memoryAudit = audit(spilling.memoryPlan);
+  spilling.kvSpill->blockCache.reset();
+  spilling.kvSpill->historyStream.reset();
+  spilling.engine.activeRequests[1].kvMode = engine::KvMode::Spill;
+  spilling.aneFfn = {AneFfnSnapshot::State::Split, "at share 0.41 for chunks of 640 rows or more", 0.41, 640, 3,
+                     192, 1234.5};
+  spilling.engine.resources.kvTier.writesGated = engine::DiskWritesGate::Closed;
+  spilling.warmup.decodeBatches[2] = WarmupStepStatus::MemoryLimited;
+  spilling.warmup.decodeBatches[3] = WarmupStepStatus::MemoryLimited;
+
+  constexpr uint64_t windowedLayers = [] {
+    uint64_t layers = (uint64_t{1} << 48) - 4;
+    for (uint32_t layer = 5; layer < 48; layer += 4)
+      layers &= ~(uint64_t{1} << layer);
+    return layers;
+  }();
+  StatusInputs resident = representative;
+  resident.memoryPlan = plan(kv::Layout{49, 4, 128, kv::Format::Int8, 0, false, 512, windowedLayers});
+  resident.memoryAudit = audit(resident.memoryPlan);
+  resident.kvSpill.reset();
+  resident.engine.resources.window.reset();
+  resident.engine.activeRequests.clear();
+  resident.governor.hostTelemetry.reset();
+  resident.governor.accounts.clear();
+  resident.weights.idleReleaseSeconds = std::numeric_limits<double>::infinity();
+  resident.aneFfn = {.reason = "as given"};
+  resident.streamedTable.reset();
+  resident.streamedExperts.reset();
+  resident.engine.resources.kvTier.writesGated = engine::DiskWritesGate::No;
+  resident.metalHealthy = false;
+  resident.metalFailureReason = "command buffer \"decode\" failed:\n\tGPU timeout";
+  resident.identity.ropeScaling = {3.814697265625, 262144};
+  resident.identity.kvLayout = kv::Layout{16, 4, 256, kv::Format::BFloat16};
+  resident.identity.kvLayout.valuesTokenMajor = true;
+  resident.warmup.maximumPrefill = WarmupStepStatus::Pending;
+  resident.warmup.compositeStateRestore = WarmupStepStatus::MemoryLimited;
+  return {{"spilling", std::move(spilling)}, {"resident", std::move(resident)}};
+}
+
+void testStatusVariants(const char *goldenPath) {
+  std::string documents;
+  for (const auto &[name, inputs] : statusVariants())
+    documents += std::string("{\"variant\":\"") + name + "\",\"status\":" + inputs.json() + "}\n";
+  std::ifstream golden(goldenPath);
+  const std::string expected{std::istreambuf_iterator<char>(golden), {}};
+  require(golden && documents == expected,
+          std::string(goldenPath) + " is not the variant documents, which are now:\n" + documents);
 }
 
 void testCurrentReadinessAndSimultaneousPeak() {
@@ -1061,12 +1180,13 @@ void testNoticesCarryTheTime() {
 } // namespace
 
 int main(int argc, char **argv) {
-  if (argc != 2) {
-    std::cerr << "usage: " << argv[0] << " status_golden.json\n";
+  if (argc != 3) {
+    std::cerr << "usage: " << argv[0] << " status_golden.json status_variants_golden.jsonl\n";
     return 2;
   }
   try {
     testCleanRuntimeStatus(argv[1]);
+    testStatusVariants(argv[2]);
     testCurrentReadinessAndSimultaneousPeak();
     testWarmupStepsReportMeasurementTruth();
     testMemoryPressureTelemetry();

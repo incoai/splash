@@ -651,7 +651,7 @@ test-engine-cpu: $(TEST_CPU_TARGETS) $(TEST_ATTENTION_SWEEP) $(TEST_BACKEND_BENC
 	$(ENGINE_CPU_STEP) $(TEST_MEMORY_AUDIT_TEST)
 	$(ENGINE_CPU_STEP) $(TEST_MEMORY_GOVERNOR_TEST)
 	$(ENGINE_CPU_STEP) $(TEST_MEMORY_LEDGER)
-	$(ENGINE_CPU_STEP) $(TEST_STATUS_TEST) dev/tests/engine/status_golden.json
+	$(ENGINE_CPU_STEP) $(TEST_STATUS_TEST) dev/tests/engine/status_golden.json dev/tests/engine/status_variants_golden.jsonl
 	$(ENGINE_CPU_STEP) $(TEST_Q8_CPU_TEST)
 	$(ENGINE_CPU_STEP) $(TEST_ENGINE_SIM)
 	@if [ -s $(ENGINE_CPU_FAILED) ]; then echo "test-engine-cpu failed:"; sed "s/^/  /" $(ENGINE_CPU_FAILED); exit 1; fi
@@ -928,7 +928,7 @@ test-sanitizers: $(SANITIZER_CONFIG_TARGETS)
 	$(TSAN_TEST_ENV) $(TEST_SLOT_RECYCLER_TSAN)
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_PLAN_ASAN)
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_AUDIT_ASAN)
-	$(ASAN_TEST_ENV) $(TEST_STATUS_ASAN) dev/tests/engine/status_golden.json
+	$(ASAN_TEST_ENV) $(TEST_STATUS_ASAN) dev/tests/engine/status_golden.json dev/tests/engine/status_variants_golden.jsonl
 	$(ASAN_TEST_ENV) $(TEST_MEMORY_LEDGER_ASAN)
 
 # The Metal tests of the backend, whose host-step runner shares each
