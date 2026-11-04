@@ -117,6 +117,43 @@ DFlashDraftRing::~DFlashDraftRing() {
   tracker_->bytes.fetch_sub(actualAllocatedBytes_, std::memory_order_relaxed);
 }
 
+std::shared_ptr<RebuiltDraftRingCache::Entry>
+RebuiltDraftRingCache::acquire(
+    const std::shared_ptr<const CompositeState> &source, uint32_t begin,
+    uint32_t rows, const std::function<std::shared_ptr<DFlashDraftRing>()> &allocate) {
+  // Full windows overwrite every K/V slot. A shorter rebuild deliberately
+  // leaves unused ring slots alone, so its bytes are not a reusable image.
+  if (!source || !source->residentBytes() || rows != SPLASH_DRAFT_SLIDING_WINDOW)
+    return {};
+  if (entry_) {
+    const auto owner = entry_->source.lock();
+    if (owner && owner == source && entry_->begin == begin &&
+        entry_->rows == rows && entry_->ready)
+      return entry_;
+    if (entry_.use_count() != 1)
+      return {};
+  } else {
+    auto ring = allocate();
+    if (!ring || ring->allocatedBytes() > maximumBytes)
+      return {};
+    entry_ = std::make_shared<Entry>();
+    entry_->ring = std::move(ring);
+  }
+  entry_->source = source;
+  entry_->begin = begin;
+  entry_->rows = rows;
+  entry_->ready = false;
+  return entry_;
+}
+
+uint64_t RebuiltDraftRingCache::release() noexcept {
+  if (!entry_ || entry_.use_count() != 1)
+    return 0;
+  const uint64_t bytes = entry_->ring->allocatedBytes();
+  entry_.reset();
+  return bytes;
+}
+
 DFlashContextWindow::DFlashContextWindow(
     metal::MetalBackend &backend, std::shared_ptr<StateAllocationTracker> tracker,
     DraftStateLayout layout, std::string_view label)

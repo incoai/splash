@@ -344,6 +344,7 @@ struct Runtime::Impl {
     struct DraftRebuild final {
       uint32_t begin = 0;
       uint32_t rows = 0;
+      std::shared_ptr<RebuiltDraftRingCache::Entry> cached;
     };
     std::optional<DraftRebuild> draftRebuild;
     std::vector<ImageState> images;
@@ -433,6 +434,8 @@ struct Runtime::Impl {
   std::vector<std::weak_ptr<const HeldState>> stateHolds;
   std::array<PageTableBinding, kLaneCount> pageTableBindings{};
   ModelTelemetry counters;
+  bool experimentalDraftRingReuse = false;
+  RebuiltDraftRingCache rebuiltDraftRings;
   ops::Sampling sampling;
   std::unique_ptr<QwenTarget> targetModel;
   DFlashDraft draftModel;
@@ -687,8 +690,9 @@ struct Runtime::Impl {
     return holder != requests.end() && holder->second.resident && !holder->second.promptComplete;
   }
 
-  // Frees one cache that can be rebuilt and returns its bytes. The vision
-  // arena goes first, when no image waits for its encode and nothing holds
+  // Frees one cache that can be rebuilt and returns its bytes. The optional
+  // reconstructed draft ring goes first once no request holds it. The vision
+  // arena follows, when no image waits for its encode and nothing holds
   // it: an image whose rows are encoded never needs it, and the next start
   // that does builds one sized for its own images. Then the memory of the
   // readers of spilled K/V while no command reads through them: the staging
@@ -701,6 +705,10 @@ struct Runtime::Impl {
   // a time, since only an encode rebuilds it. An entry something else holds
   // is skipped, since dropping it frees nothing.
   uint64_t releaseOneCache() noexcept {
+    if (const uint64_t bytes = rebuiltDraftRings.release()) {
+      ++counters.draftRingCacheEvictions;
+      return bytes;
+    }
     if (vision && vision.use_count() == 1 && visionIdle()) {
       const uint64_t bytes = vision->arenaBytes();
       vision.reset();
@@ -1619,13 +1627,40 @@ struct Runtime::Impl {
 
   // Computes a restored lane's draft rings from its context window.
   void addDraftRebuild(CommandGraph &graph, uint32_t lane,
-                       const Request::DraftRebuild &rebuild) const {
+                       const Request::DraftRebuild &rebuild) {
+    const auto copyRing = [&] {
+      const auto &from = rebuild.cached->ring->layers();
+      const auto &to = states.draft(lane);
+      if (from.size() != to.size())
+        throw std::logic_error("rebuilt draft ring layer mismatch");
+      for (uint32_t layer = 0; layer < from.size(); ++layer) {
+        const auto copy = [&](const MetalBuffer &source, const MetalBuffer &destination) {
+          if (source.sizeBytes() != destination.sizeBytes() || source.sizeBytes() % (2 * 128))
+            throw std::logic_error("rebuilt draft ring tensor mismatch");
+          ops::RowCopy::add(graph, source, {0, 128, 0}, destination, {0, 128, 0},
+                            static_cast<uint32_t>(source.sizeBytes() / (2 * 128)), 128);
+        };
+        copy(from[layer].keys, to[layer].keys);
+        copy(from[layer].values, to[layer].values);
+      }
+    };
+    if (rebuild.cached && rebuild.cached->ready) {
+      copyRing();
+      ++counters.draftRingCacheHits;
+      return;
+    }
     auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor, 0); };
     ops::RoPE::addDraftRangeTables(graph, p(PrefillTensor::DraftInverseFrequencies),
                                    p(PrefillTensor::DraftRopeCos), p(PrefillTensor::DraftRopeSin),
                                    rebuild.rows, rebuild.begin, kPrefillRows);
     draftModel.addContextRebuild(graph, draftPrefillBuffers(*prefillArena, 0), states.window(lane),
-                                 states.draft(lane), rebuild.rows, rebuild.begin);
+                                 rebuild.cached ? rebuild.cached->ring->layers() : states.draft(lane),
+                                 rebuild.rows, rebuild.begin);
+    counters.draftRingRebuildRows += rebuild.rows;
+    if (rebuild.cached) {
+      copyRing();
+      ++counters.draftRingCacheBuilds;
+    }
   }
 
   // The draft's context of chunk `index` of a command's chunks: the rows its
@@ -2554,6 +2589,13 @@ Runtime::~Runtime() = default;
 
 void Runtime::checkHealth() { impl_->backend.checkHealth(); }
 
+void Runtime::experimentalDraftRingReuse(bool enabled) {
+  if (!impl_->requests.empty() || impl_->backend.commandInFlight())
+    throw std::logic_error("draft ring reuse changes only while the runtime is idle");
+  static_cast<void>(impl_->rebuiltDraftRings.release());
+  impl_->experimentalDraftRingReuse = enabled;
+}
+
 void Runtime::beginColdRequest(const ModelRequest &request,
                                uint32_t stateLane) {
   if (const StateAdmission admission = beginAt(request, stateLane); !admission.granted()) {
@@ -2667,13 +2709,14 @@ std::unique_ptr<StateRestore> Runtime::beginRestore(
   if (!entry.resident || !state || boundary >= entry.promptTokens)
     throw std::invalid_argument("invalid state restore");
   return impl_->states.beginRestore(entry.stateLane, *state, restoreDraft,
-      std::move(completion), [this, requestId, boundary, restoreDraft] {
-        finishRestore(requestId, boundary, restoreDraft);
+      std::move(completion), [this, requestId, boundary, restoreDraft, state] {
+        finishRestore(requestId, boundary, restoreDraft, state);
       });
 }
 
 void Runtime::finishRestore(uint64_t requestId, uint32_t restoredPrefixLength,
-                            bool restoreDraftState) {
+                            bool restoreDraftState,
+                            const std::shared_ptr<const CompositeState> &source) {
   Impl::Request &entry = impl_->request(requestId);
   // A shorter restore would replay rows of images that were never staged.
   if (restoredPrefixLength < entry.restoredTokens)
@@ -2705,9 +2748,21 @@ void Runtime::finishRestore(uint64_t requestId, uint32_t restoredPrefixLength,
   }
   entry.draftContextPlan.reset();
   entry.draftRebuild.reset();
-  if (restoreDraftState)
+  if (restoreDraftState) {
     entry.draftRebuild = Impl::Request::DraftRebuild{
-        static_cast<uint32_t>(lengths.draftBase), lengths.draftLength};
+        static_cast<uint32_t>(lengths.draftBase), lengths.draftLength, {}};
+    // ANE can rerun after overwriting the lane window, and short windows do
+    // not overwrite every ring slot. Both retain the original rebuild path.
+    if (impl_->experimentalDraftRingReuse && !impl_->aneFfn && source->residentBytes() &&
+        lengths.draftLength == kDraftCacheStride) {
+      auto &rebuild = *entry.draftRebuild;
+      rebuild.cached = impl_->rebuiltDraftRings.acquire(source, rebuild.begin, rebuild.rows, [&] {
+        return impl_->states.reserveRebuiltDraftRing();
+      });
+      if (!rebuild.cached)
+        ++impl_->counters.draftRingCacheRefusals;
+    }
+  }
 }
 
 void Runtime::setDraftContextPlan(uint64_t requestId, DraftContextPlan plan) {
@@ -2867,7 +2922,6 @@ Runtime::prefillAsync(const BatchPlan &plan,
         }
       }
       impl->states.swapParity(entry.stateLane);
-      entry.draftRebuild.reset();
       QwenLogicalLengths lengths = impl->states.metadata(entry.stateLane).lengths;
       lengths.targetTokens = nextLength;
       for (const DispatchDraftCaptureSpan &capture : outputs.captures[lane]) {
@@ -2928,8 +2982,12 @@ Runtime::prefillAsync(const BatchPlan &plan,
       }
       if (entry.promptComplete)
         entry.replayingGeneration = false;
-      if (result.failure.empty())
+      if (result.failure.empty()) {
         result.capturedStates = impl->sealStates(entry, outputs.stateCaptures[lane]);
+        if (entry.draftRebuild && entry.draftRebuild->cached)
+          entry.draftRebuild->cached->ready = true;
+      }
+      entry.draftRebuild.reset();
       results.push_back(std::move(result));
     }
 
@@ -3515,6 +3573,7 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   result.idleGdnCells = impl_->states.idleCells();
   result.idleDraftRings = impl_->states.idleRings();
   result.idleContextWindows = impl_->states.idleWindows();
+  result.draftRingCacheBytes = impl_->rebuiltDraftRings.bytes();
   result.visionArenaBytes = impl_->vision ? impl_->vision->arenaBytes() : 0;
   result.embeddingCacheBytes = impl_->embeddingCacheBytes;
   result.verifyBudget = impl_->verifyBudget.has_value();

@@ -705,6 +705,87 @@ void testAttentionOnlyTarget(metal::MetalBackend &backend) {
           "an attention-only storage's buffers outlived it");
 }
 
+void testRebuiltDraftRingCache(metal::MetalBackend &backend) {
+  struct Identity final : CompositeState {
+    bool resident = true;
+    uint64_t bytes() const noexcept override { return 1; }
+    uint64_t residentBytes() const noexcept override { return resident ? 1 : 0; }
+  };
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes,
+                          1, 1, queryHostMemory, 0);
+  bool allowed = false;
+  uint32_t admissions = 0;
+  auto admit = [real = governor.allocationAdmission(), &allowed, &admissions](
+                   uint64_t bytes, const std::function<void()> &allocate) -> metal::AllocationResult {
+    ++admissions;
+    return allowed ? real(bytes, allocate) : metal::AllocationResult{metal::AllocationFailure::EngineBudget};
+  };
+  model::QwenStateStorage storage(backend, admit, kStateLayout, nullptr);
+  model::RebuiltDraftRingCache cache;
+  auto source = std::make_shared<Identity>();
+  auto other = std::make_shared<Identity>();
+  const auto allocate = [&] { return storage.reserveRebuiltDraftRing(); };
+  require(!cache.acquire(source, 0, 2016, allocate) && admissions == 0,
+          "a partial window attempted a ring cache allocation");
+  source->resident = false;
+  require(!cache.acquire(source, 0, 2048, allocate) && admissions == 0,
+          "a disk-only state attempted a ring cache allocation");
+  source->resident = true;
+  require(!cache.acquire(source, 2048, 2048, allocate) && admissions == 1 &&
+              cache.bytes() == 0 && storage.actualAllocatedBytes() == 0,
+          "ring cache admission denial retained memory");
+  allowed = true;
+  auto fill = cache.acquire(source, 2048, 2048, allocate);
+  require(fill && !fill->ready && admissions == 2 &&
+              cache.bytes() >= kDraftState.ringBytes() &&
+              cache.bytes() == storage.actualAllocatedBytes(),
+          "a ring cache fill was not admitted/accounted once");
+  const auto *physical = fill->ring.get();
+  require(cache.release() == 0 && !cache.acquire(other, 2048, 2048, allocate),
+          "an in-flight fill was reclaimed or replaced");
+  require(!cache.acquire(source, 2048, 2048, allocate),
+          "an uncompleted fill became a cache hit");
+  // A cancelled/failed fill drops its lease without publishing ready. Its
+  // retry must overwrite the same allocation completely before publication.
+  fill.reset();
+  auto retry = cache.acquire(source, 2048, 2048, allocate);
+  require(retry && !retry->ready && retry->ring.get() == physical && admissions == 2,
+          "a cancelled fill was reused as valid or allocated twice");
+  retry->ready = true;
+  retry.reset();
+  auto hit = cache.acquire(source, 2048, 2048, allocate);
+  require(hit && hit->ready && hit->ring.get() == physical && admissions == 2,
+          "a repeated immutable state missed its reconstructed ring");
+  require(cache.release() == 0 && !cache.acquire(source, 4096, 2048, allocate),
+          "an active hit was reclaimed or reused at another position");
+  hit.reset();
+  auto distinct = cache.acquire(other, 2048, 2048, allocate);
+  require(distinct && !distinct->ready && distinct->ring.get() == physical && admissions == 2,
+          "a distinct state hit stale rings or allocated a second entry");
+  // Source eviction may overlap an in-flight fill: the command reads the
+  // restored lane window and owns the ring lease, not the composite source.
+  std::weak_ptr<const CompositeState> expired = other;
+  other.reset();
+  require(expired.expired(), "an in-flight fill kept its composite source resident");
+  require(!cache.acquire(source, 2048, 2048, allocate) && cache.release() == 0,
+          "source expiration allowed an in-flight fill to be replaced or reclaimed");
+  distinct->ready = true;
+  distinct.reset();
+  auto afterEviction = cache.acquire(source, 2048, 2048, allocate);
+  require(afterEviction && !afterEviction->ready,
+          "an expired identity reused a ready ring");
+  afterEviction.reset();
+  const uint64_t allocated = cache.bytes();
+  require(cache.release() == allocated && !cache.bytes() && !storage.actualAllocatedBytes(),
+          "reclaim did not release the complete optional ring allocation");
+  // Nine layers exceed the fixed64MiB cap and never call admission.
+  auto oversized = kStateLayout;
+  oversized.draft.layers = 9;
+  model::QwenStateStorage tooLarge(backend, admit, oversized, nullptr);
+  require(!tooLarge.reserveRebuiltDraftRing() && admissions == 2,
+          "an oversized ring cache bypassed its hard byte cap");
+}
+
 void run(const std::string &metallib) {
   using model::QwenCompositeState;
   using model::QwenLogicalLengths;
@@ -712,6 +793,7 @@ void run(const std::string &metallib) {
 
   testLayoutFormulas();
   metal::MetalBackend backend(metallib);
+  testRebuiltDraftRingCache(backend);
   testOffloadAllocationFailure(backend);
   testDiskRestore(backend);
   testDirectDiskSnapshot(backend);

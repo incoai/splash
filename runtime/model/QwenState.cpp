@@ -276,6 +276,20 @@ QwenStateStorage::~QwenStateStorage() {
   pool_->windows.clear();
 }
 
+std::shared_ptr<DFlashDraftRing> QwenStateStorage::reserveRebuiltDraftRing() {
+  if (layout_.draft.ringBytes() > RebuiltDraftRingCache::maximumBytes)
+    return {};
+  std::shared_ptr<DFlashDraftRing> ring;
+  if (!admitAllocation_(layout_.draft.ringBytes(), [&] {
+        ring = std::make_shared<DFlashDraftRing>(
+            backend_, allocations_, layout_.draft, "rebuilt-draft-ring-cache");
+      }))
+    return {};
+  if (ring->allocatedBytes() > RebuiltDraftRingCache::maximumBytes)
+    return {};
+  return ring;
+}
+
 const QwenLaneMetadata &QwenStateStorage::metadata(uint32_t index) const {
   return lane(index).metadata;
 }

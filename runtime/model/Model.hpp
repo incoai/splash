@@ -673,6 +673,14 @@ struct ModelTelemetry final {
   uint64_t draftContextRowsAvoided = 0;
   uint64_t draftStateRestoreSkipped = 0;
   uint64_t draftStateResets = 0;
+  // Encoded rebuild/copy paths, including a command abandoned unconsumed.
+  // Cache bytes are currently retained; stateAllocatedBytes includes them.
+  uint64_t draftRingRebuildRows = 0;
+  uint64_t draftRingCacheHits = 0;
+  uint64_t draftRingCacheBuilds = 0;
+  uint64_t draftRingCacheRefusals = 0;
+  uint64_t draftRingCacheEvictions = 0;
+  uint64_t draftRingCacheBytes = 0;
   uint64_t imageEncodes = 0;
   uint64_t imageEmbeddingReuses = 0;
   // Entries the embedding cache let go of, past its bytes or to a reclaim:

@@ -1176,7 +1176,8 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
 // checkpoint.
 void requireFullWindowRestore(model::Runtime &executor,
                               const metal::MetalBackend &backend,
-                              const model::QwenStateStorage &states) {
+                              const model::QwenStateStorage &states,
+                              bool exerciseRingReuse) {
   constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
   constexpr uint32_t boundary = window + 64;
   std::vector<uint32_t> prompt(boundary + 64);
@@ -1203,9 +1204,64 @@ void requireFullWindowRestore(model::Runtime &executor,
   request.id = 105;
   beginCold(executor, request, 0);
   restoreActivePrefix(executor, request.id, prompt.size(), boundary, checkpoint);
-  prefillChunk(executor, request.id, boundary, tokens.subspan(boundary), pages);
+  const auto referenceStep = prefillChunk(executor, request.id, boundary, tokens.subspan(boundary), pages);
   compareCommittedSamples(expected, sampleCommittedState(backend, states, 0, boundary), true);
+  const auto referenceState = committedState(executor, states, 0);
+  const auto referenceWindow = bytesOf(states.window(0));
   executor.end(request.id);
+  if (exerciseRingReuse) {
+    executor.experimentalDraftRingReuse(true);
+    // Preemption before the command must release its cache lease. A ticket
+    // dropped unconsumed drains GPU work but never publishes a ready entry.
+    request.id = 106;
+    beginCold(executor, request, 0);
+    restoreActivePrefix(executor, request.id, prompt.size(), boundary, checkpoint);
+    const uint64_t cacheBytes = executor.telemetry().draftRingCacheBytes;
+    require(cacheBytes && cacheBytes <= model::RebuiltDraftRingCache::maximumBytes,
+            "ring cache did not admit exactly one bounded allocation");
+    while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {}
+    require(executor.telemetry().draftRingCacheBytes == cacheBytes,
+            "reclaim released a ring held by an admitted restore");
+    executor.suspend(request.id);
+    require(executor.resume(request.modelView()).granted(), "ring-cache preemption did not resume");
+    restoreActivePrefix(executor, request.id, prompt.size(), boundary, checkpoint);
+    const BatchPlan plan{.kind = WorkKind::Prefill, .items = {{request.id, 64}},
+                          .decodeStage = DecodeStage::Regular};
+    ModelBatchItem item = withRevision({request.id, boundary, 64, pages});
+    item.inputTokens = tokens.subspan(boundary);
+    auto abandoned = executor.submit(plan, std::span<const ModelBatchItem>(&item, 1), {});
+    abandoned.reset();
+    executor.end(request.id);
+
+    std::shared_ptr<const CompositeState> distinct;
+    for (uint32_t probe = 0; probe < 3; ++probe) {
+      request.id = 107 + probe;
+      beginCold(executor, request, 0);
+      restoreActivePrefix(executor, request.id, prompt.size(), boundary, probe == 2 ? distinct : checkpoint);
+      if (!probe) distinct = executor.snapshot(request.id);
+      const auto before = executor.telemetry();
+      const auto actualStep = prefillChunk(executor, request.id, boundary, tokens.subspan(boundary), pages);
+      const auto after = executor.telemetry();
+      const auto actualState = committedState(executor, states, 0);
+      require(actualStep.outputTokens == referenceStep.outputTokens &&
+                  actualStep.firstToken == referenceStep.firstToken &&
+                  actualState.lengths == referenceState.lengths &&
+                  actualState.pendingRows == 0 && referenceState.pendingRows == 0 &&
+                  actualState.retained == referenceState.retained &&
+                  actualState.cell == referenceState.cell &&
+                  actualState.rings == referenceState.rings &&
+                  bytesOf(states.window(0)) == referenceWindow,
+              "cached rebuilt ring changed a restored prefill's outputs or complete state bytes");
+      require(after.draftRingCacheBuilds - before.draftRingCacheBuilds == (probe == 1 ? 0U : 1U) &&
+                  after.draftRingCacheHits - before.draftRingCacheHits == (probe == 1 ? 1U : 0U),
+              "cancelled fill/repeated hit/distinct-state sequence reused a stale ring");
+      executor.end(request.id);
+    }
+    while (executor.reclaimIdleState(false, IdleMemory::BuffersThenCaches)) {}
+    require(!executor.telemetry().draftRingCacheBytes, "idle ring cache did not reclaim");
+    executor.experimentalDraftRingReuse(false);
+    std::cout << "rebuilt_ring_reuse=PASS preemption abandoned_ticket fill hit distinct full_state_bytes\n";
+  }
   std::cout << "full_window_restore=PASS\n";
 }
 
@@ -3935,6 +3991,7 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
 int main(int argc, char **argv) {
   try {
     bool imagesOnly = false, warmupEosOnly = false, prefillGroupsOnly = false, spillOnly = false;
+    bool draftRingReuseOnly = false;
     SpillOptions spill;
     kv::Format format = kv::Format::Int8;
     ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
@@ -3962,12 +4019,13 @@ int main(int argc, char **argv) {
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
            "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-memory SIZE] "
            "[--expert-memory SIZE] [--max-context TOKENS] [--spill-tokens N] [--spill-window PAGES] "
-           "[--spill-buffers 1|2] [--images-only | --warmup-eos-only | --prefill-groups-only | --spill-only]");
+           "[--spill-buffers 1|2] [--images-only | --warmup-eos-only | --prefill-groups-only | --spill-only | --draft-ring-reuse-only]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
       else if (option == "--warmup-eos-only") warmupEosOnly = true;
       else if (option == "--prefill-groups-only") prefillGroupsOnly = true;
+      else if (option == "--draft-ring-reuse-only") draftRingReuseOnly = true;
       else if (option == "--spill-only") spillOnly = true;
       else if ((option == "--spill-tokens" || option == "--spill-window" || option == "--spill-buffers") &&
                i + 1 < argc) {
@@ -4090,7 +4148,8 @@ int main(int argc, char **argv) {
     // A block-sparse target's spill check runs before the split is set up, on
     // a pool and a runtime of its own that the context the oracle asks the
     // split to leave does not count.
-    if (model.descriptor.capabilities.sparseKv && (spillOnly || !(imagesOnly || warmupEosOnly || prefillGroupsOnly)))
+    if (model.descriptor.capabilities.sparseKv &&
+        (spillOnly || !(imagesOnly || warmupEosOnly || prefillGroupsOnly || draftRingReuseOnly)))
       requireSpilledKvMatchesResident(backend, model, operators, governed, format, stateFormat, spill);
     if (spillOnly) {
       require(model.descriptor.capabilities.sparseKv.has_value(), "--spill-only needs a block-sparse target");
@@ -4237,6 +4296,12 @@ int main(int argc, char **argv) {
       return 0;
     }
     model::Runtime &executor = *runtime;
+    if (draftRingReuseOnly) {
+      require(!aneFfn, "draft ring reuse oracle requires --ane-ffn-share 0");
+      requireFullWindowRestore(executor, backend, states, true);
+      std::cout << "PASS model-runtime-oracle scope=draft-ring-reuse-only model=" << model.name() << '\n';
+      return 0;
+    }
     // Warmup runs on the KV runway and never allocates: without it, after
     // actual state activation, warmupPrefill fails and cleans up.
     pages.releaseExtent(0);
@@ -6221,7 +6286,7 @@ int main(int argc, char **argv) {
       executor.end(93);
       std::cout << "discontinuous_capture_fails=PASS\n";
     }
-    requireFullWindowRestore(executor, backend, states);
+    requireFullWindowRestore(executor, backend, states, false);
 
     const auto rowsBeforeInvalidWarmup = executor.telemetry().targetPrefillRows;
     for (uint32_t rows : {0U, model::ExecutionLimits::prefillTokenBudget + 1,

@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <array>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -41,11 +42,42 @@ public:
   [[nodiscard]] const std::vector<DFlashDraftRingLayer> &layers() const noexcept {
     return layers_;
   }
+  [[nodiscard]] uint64_t allocatedBytes() const noexcept { return actualAllocatedBytes_; }
 
 private:
   std::shared_ptr<StateAllocationTracker> tracker_;
   std::vector<DFlashDraftRingLayer> layers_;
   uint64_t actualAllocatedBytes_ = 0;
+};
+
+// Experimental one-entry cache of rings reconstructed from a composite
+// state's compact window. The key does not keep a composite state resident.
+// The rebuild reads the already-restored lane-owned window, so only the
+// returned entry must remain alive until GPU completion. While held it cannot
+// be replaced or reclaimed. An expired weak identity can never become a hit.
+class RebuiltDraftRingCache final {
+public:
+  static constexpr uint64_t maximumBytes = 64ULL << 20;
+  struct Entry final {
+    std::weak_ptr<const CompositeState> source;
+    std::shared_ptr<DFlashDraftRing> ring;
+    uint32_t begin = 0;
+    uint32_t rows = 0;
+    // Only a successful prefill completion publishes a reconstructed ring.
+    bool ready = false;
+  };
+
+  [[nodiscard]] std::shared_ptr<Entry>
+  acquire(const std::shared_ptr<const CompositeState> &source, uint32_t begin,
+          uint32_t rows, const std::function<std::shared_ptr<DFlashDraftRing>()> &allocate);
+  // Returns actual allocation bytes released; an in-use entry stays put.
+  [[nodiscard]] uint64_t release() noexcept;
+  [[nodiscard]] uint64_t bytes() const noexcept {
+    return entry_ ? entry_->ring->allocatedBytes() : 0;
+  }
+
+private:
+  std::shared_ptr<Entry> entry_;
 };
 
 // The context window of a lane or a cached state: the context rows the

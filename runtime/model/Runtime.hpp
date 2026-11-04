@@ -15,6 +15,9 @@ public:
   explicit Runtime(RuntimeContext context);
   ~Runtime() override;
   void checkHealth() override;
+  // Opt-in investigation control; only changed while no requests exist.
+  // Production and startup warmup keep the original rebuild path.
+  void experimentalDraftRingReuse(bool enabled);
   [[nodiscard]] uint32_t statesToActivate() const noexcept override;
   [[nodiscard]] uint64_t idleBufferBytes(uint32_t evictedStates) const noexcept override;
   [[nodiscard]] uint32_t prefillGroupRows(bool spills) const noexcept override;
@@ -79,7 +82,8 @@ private:
   // The state lane of a resident request; the storage checks that its
   // committed state can be cached.
   [[nodiscard]] uint32_t residentLane(uint64_t requestId);
-  void finishRestore(uint64_t requestId, uint32_t boundary, bool restoreDraft);
+  void finishRestore(uint64_t requestId, uint32_t boundary, bool restoreDraft,
+                     const std::shared_ptr<const CompositeState> &source);
   void prepareWarmupDecode(uint64_t requestId, uint32_t anchor);
   [[nodiscard]] StateAdmission beginAt(const ModelRequest &request,
                                        uint32_t stateLane);
