@@ -67,7 +67,8 @@ struct CommandWork final {
                                     // split a layer); compared with CommandLimits::attentionPairs
   uint64_t indexPairs = 0;          // rows * complete blocks a block index scores, over the layers run; 0 without one
   uint64_t weightReadBytes = 0;     // weights read from the SSD on demand (streamed experts)
-  uint64_t spilledKvReadBytes = 0;  // spilled K/V read from the SSD (a streaming lane's history; hot-block misses)
+  uint64_t spilledKvReadBytes = 0;  // spilled K/V read from the SSD: a streaming lane's history, a decode's hot-block
+                                    // misses
   bool operator==(const CommandWork &) const = default;
 };
 

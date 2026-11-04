@@ -3601,7 +3601,8 @@ public:
   // A decode cycle of the requests together, in lanes in their order;
   // `during`, if any, runs while its command is in flight. Its sample
   // carries the host-step work of the hot block cache's reads during it,
-  // some once a lane holds Index pages and none otherwise.
+  // some once a lane holds Index pages and none otherwise, and the bytes
+  // its misses read.
   std::vector<SpillStep> decode(std::span<SpillRequest *const> requests, const std::function<void()> &during = {}) {
     BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
     std::vector<ModelBatchItem> items;
@@ -3619,9 +3620,14 @@ public:
       items.push_back(item(*request, request->committed, 0, {}));
     }
     const double resolving = cache_.stats().work.totalMilliseconds;
+    const uint64_t reading = cache_.stats().reads.readBytes;
     const std::unique_ptr<ModelBatchTicket> ticket = runtime_->submit(plan, items, {});
     if (during) during();
     std::vector<ModelStepResult> results = ticket->wait();
+    const uint64_t read = cache_.stats().reads.readBytes - reading;
+    require(ticket->sample().work.spilledKvReadBytes == read,
+            "a decode's sample carried " + std::to_string(ticket->sample().work.spilledKvReadBytes) +
+                " bytes of spilled K/V, not the " + std::to_string(read) + " its misses read");
     const double resolved = ticket->sample().spilledKvReadMilliseconds;
     require(resolved == cache_.stats().work.totalMilliseconds - resolving && (resolved > 0.0) == indexed,
             "a decode's sample carried " + std::to_string(resolved) + " ms of hot-block reads, not the " +

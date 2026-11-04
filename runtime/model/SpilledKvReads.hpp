@@ -75,7 +75,8 @@ public:
   void end();
   // What end() kept of every run: the blocks the command's reads could not
   // read, each with the command's lane that needed it, and the bytes they
-  // brought (a decode's resolves count theirs in the cache's statistics).
+  // brought (a decode's resolves count theirs in the cache's statistics
+  // too).
   [[nodiscard]] std::span<const KvReadFailure> failures() const noexcept { return failures_; }
   [[nodiscard]] uint64_t readBytes() const noexcept { return readBytes_; }
 

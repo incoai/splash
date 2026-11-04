@@ -58,10 +58,11 @@ using metal::MetalBuffer;
 // What a command's sample reports of its work (ModelBatchTicket::sample):
 // the work it encodes, with the weights it read on demand as the store's
 // reads moved from before its submission to its completion
-// (ExpertStore::readBytes), as commands never overlap, and the spilled
-// history its reads streamed; a decode's, the host-step work of the hot
-// block cache's reads in the same span (KvBlockCacheStats::work), which the
-// backend counts before the command completes (metal::EventStep).
+// (ExpertStore::readBytes), as commands never overlap, and the spilled K/V
+// its reads brought (SpilledKvReads::readBytes); a decode's, also the
+// host-step work of the hot block cache's reads in the same span
+// (KvBlockCacheStats::work), which the backend counts before the command
+// completes (metal::EventStep).
 class WorkCount final {
 public:
   WorkCount(CommandWork work, const ExpertStore *store, const KvBlockCache *blockCache = nullptr)
@@ -2668,8 +2669,7 @@ struct Runtime::Impl {
       // The page sources of the items and the reads go with the command,
       // before the engine applies its results (DeferredMetalTicket::wait).
       items_.clear();
-      reads_.reset();
-      work_ = count_.realized(0);
+      work_ = count_.realized(std::exchange(reads_, {})->readBytes());
       spilledKvReadMilliseconds_ = count_.spilledKvReadMilliseconds();
       return results;
     }
@@ -3288,13 +3288,14 @@ Runtime::decodeAsync(const BatchPlan &plan,
 
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();
-  auto finish = [impl, lanes = std::move(lanes), reads = std::move(reads),
+  auto finish = [impl, lanes = std::move(lanes), reads,
                  items = std::move(copiedItems)](CommandTiming timing) mutable {
     return impl->finalizeDecode(lanes, items, timing, *reads, false);
   };
   CommandTicket command = impl_->backend.submitCommandAsync(
       commandGraph.command(), std::move(completion));
-  return std::make_unique<DeferredMetalTicket>(std::move(command), std::move(finish), std::move(count));
+  return std::make_unique<DeferredMetalTicket>(std::move(command), std::move(finish), std::move(count),
+                                               std::move(reads));
 }
 
 uint32_t Runtime::residentLane(uint64_t requestId) const {

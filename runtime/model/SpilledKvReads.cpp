@@ -67,6 +67,8 @@ void SpilledKvReads::end() {
   running_ = false;
   if (cache_) {
     cache_->mergeStats(*stats_);
+    // After the merge, whose lock the host steps that counted held.
+    readBytes_ += stats_->readBytes;
     const std::vector<KvReadFailure> failed = cache_->takeFailures();
     failures_.insert(failures_.end(), failed.begin(), failed.end());
     return;
