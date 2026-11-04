@@ -571,6 +571,62 @@ void testRegrowthAfterABurstTakesOnlyCopiedOrDeadCache() {
        " s after " + std::to_string(copiedBytes / double(1 << 20)) + " MiB of copies while idle");
 }
 
+// Critical pressure after the same burst, macOS's level sampled every half second for 6 s: each settled
+// second takes about the margin, cache that frees now before the store's chunk above its floor, never
+// the store below its floor, and the newest resume point stays in RAM while older cache covers the
+// margin.
+void testCriticalTakesTheMarginASecondAndKeepsTheResumePoint() {
+  const Machine &machine = k35BStudio18G;
+  constexpr double critical = 66'000.0, normal = 72'000.0;
+  std::vector<test::HostEvent> script;
+  for (double at = critical; at < normal; at += 500.0)
+    script.push_back({at, machine.otherBytes, engine::MemoryPressure::Critical});
+  script.push_back({normal, machine.otherBytes, engine::MemoryPressure::Normal});
+  Serving serving(machine, std::move(script));
+  const std::vector<std::vector<uint32_t>> prompts = burst(serving, {});
+  const auto held = [&] {
+    return serving.fixture.memory->held("kv") + serving.fixture.memory->held("states") +
+           uint64_t{serving.experts->units()} * machine.store.unitBytes;
+  };
+  const std::optional<uint64_t> newest = resumeBlocks(serving, prompts).back();
+  require(serving.now() < critical && serving.experts->units() == machine.store.floor + 1 && newest &&
+              serving.fixture.cache.stateResident(*newest),
+          at(machine) + "the burst did not leave a store chunk above the floor and a resume point in RAM");
+  // What each critical pass took, of the cache, the states and the store,
+  // and whether the newest resume point stayed in RAM.
+  struct Pass final {
+    double at = 0.0;
+    uint64_t bytes = 0;
+    uint32_t units = 0;
+    bool resumePoint = false;
+  };
+  std::vector<Pass> passes;
+  uint64_t last = held();
+  uint32_t lowest = serving.experts->units();
+  serving.run([&] { return serving.now() >= normal + 5'000.0; }, [&] {
+    lowest = std::min(lowest, serving.experts->units());
+    if (const uint64_t now = held(); now < last) {
+      passes.push_back(
+          {serving.now(), last - now, serving.experts->units(), serving.fixture.cache.stateResident(*newest)});
+      last = now;
+    }
+  }, "the critical episode did not pass");
+  require(passes.size() >= 2 && std::ranges::all_of(passes, [&](const Pass &pass) {
+            return pass.at >= critical && pass.at < normal && pass.bytes < 2 * engine::kHostMarginBytes;
+          }) && passes[0].bytes >= engine::kHostMarginBytes &&
+              passes[1].at - passes[0].at >= engine::kHostSettleMilliseconds,
+          at(machine) + "a critical pass took more or less than about the margin, or two ran within a settled second");
+  require(passes[0].units == machine.store.floor + 1 && lowest == machine.store.floor,
+          at(machine) + "critical pressure took the store before the cache that frees now, or below its floor");
+  require(passes[0].resumePoint,
+          at(machine) + "critical pressure took the newest resume point while older cache covered the margin");
+  std::string taken;
+  for (const Pass &pass : passes)
+    taken += " " + std::to_string(pass.bytes >> 20) + " MiB at " + std::to_string(pass.at / 1000.0) + " s" +
+             (pass.resumePoint ? "" : ", the resume point with it") + ";";
+  note(at(machine) + "critical passes took" + taken);
+}
+
 } // namespace
 
 std::span<const test::TestCase> simTests() {
@@ -578,6 +634,8 @@ std::span<const test::TestCase> simTests() {
       {"testLongPromptBesideTwoDecoders", testLongPromptBesideTwoDecoders},
       {"testChurnKeepsTheStoreThroughAHostEpisode", testChurnKeepsTheStoreThroughAHostEpisode},
       {"testRegrowthAfterABurstTakesOnlyCopiedOrDeadCache", testRegrowthAfterABurstTakesOnlyCopiedOrDeadCache},
+      {"testCriticalTakesTheMarginASecondAndKeepsTheResumePoint",
+       testCriticalTakesTheMarginASecondAndKeepsTheResumePoint},
   };
   return kTests;
 }
