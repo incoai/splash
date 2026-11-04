@@ -97,7 +97,7 @@ struct DrawerTests {
     @Test func optionTypesWhatTheLayoutGives() async throws {
         let (state, folder) = AppState.forTests()
         let window = Self.window(WithDrawer { Color.clear }.environment(state))
-        defer { window.orderOut(nil); state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
+        defer { Self.close(window); state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
         state.toggleDrawer()
         let session = try #require(state.drawer.terminals.first)
         try await waitFor(window.firstResponder === session.view)
@@ -167,7 +167,7 @@ struct DrawerTests {
     @Test func closingTheDrawerKeepsItsTerminalsSize() async throws {
         let (state, folder) = AppState.forTests()
         let window = Self.window(WithDrawer { Color.clear }.environment(state))
-        defer { window.orderOut(nil); state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
+        defer { Self.close(window); state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
         state.toggleDrawer()
         let session = try #require(state.drawer.terminals.first)
         try await waitFor(session.view.window === window)
@@ -189,7 +189,7 @@ struct DrawerTests {
     @Test func theTerminalShownHasTheKeyboardAndWhatHidesGivesItUp() async throws {
         let (state, folder) = AppState.forTests()
         let window = Self.window(WithDrawer { Color.clear }.environment(state))
-        defer { window.orderOut(nil); state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
+        defer { Self.close(window); state.drawer.endAll(); try? FileManager.default.removeItem(at: folder) }
         state.toggleDrawer()
         let first = try #require(state.drawer.terminals.first)
         try await waitFor(window.firstResponder === first.view)
@@ -217,7 +217,7 @@ struct DrawerTests {
     @Test func aLogShowsItsLast512KBThenWhatIsWritten() async throws {
         let (folder, file) = try Self.log((1...50_000).map { String(format: "line %06d\n", $0) }.joined())
         let window = Self.window(LogText(url: file))
-        defer { window.orderOut(nil); try? FileManager.default.removeItem(at: folder) }
+        defer { Self.close(window); try? FileManager.default.removeItem(at: folder) }
         let text = try await Self.shownText(in: window)
         let written = try Data(contentsOf: file)
         #expect(written.count > 512 * 1024)
@@ -231,7 +231,7 @@ struct DrawerTests {
     @Test func aLogWrittenAgainFromItsStartShowsOnlyWhatIsNew() async throws {
         let (folder, file) = try Self.log(String(repeating: "an older line\n", count: 100))
         let window = Self.window(LogText(url: file))
-        defer { window.orderOut(nil); try? FileManager.default.removeItem(at: folder) }
+        defer { Self.close(window); try? FileManager.default.removeItem(at: folder) }
         let text = try await Self.shownText(in: window)
         let handle = try FileHandle(forWritingTo: file)
         try handle.truncate(atOffset: 0)
@@ -249,7 +249,7 @@ struct DrawerTests {
         let folder = FileManager.default.temporaryDirectory.appending(path: "splash-drawer-\(UUID().uuidString)")
         let file = folder.appending(path: "Logs/Splash/server.log")
         let window = Self.window(LogText(url: file))
-        defer { window.orderOut(nil); try? FileManager.default.removeItem(at: folder) }
+        defer { Self.close(window); try? FileManager.default.removeItem(at: folder) }
         try await waitFor(Self.textView(in: window) != nil)
         let text = try #require(Self.textView(in: window))
         resetLog(file)
@@ -261,7 +261,7 @@ struct DrawerTests {
     @Test func findShowsTheFindBarOfTheLogWithTheKeyboard() async throws {
         let (folder, file) = try Self.log("a line to find\n")
         let window = Self.window(LogText(url: file))
-        defer { window.orderOut(nil); try? FileManager.default.removeItem(at: folder) }
+        defer { Self.close(window); try? FileManager.default.removeItem(at: folder) }
         let text = try await Self.shownText(in: window)
         let scroll = try #require(text.enclosingScrollView)
         window.makeFirstResponder(text)
@@ -278,6 +278,13 @@ struct DrawerTests {
         window.setFrameOrigin(NSPoint(x: -30000, y: -30000))
         window.orderFrontRegardless()
         return window
+    }
+
+    /// Takes the window's views down, as closing it does: a log they follow, which makes its file
+    /// again once it is removed, lets the test's folder go.
+    private static func close(_ window: NSWindow) {
+        window.contentViewController = nil
+        window.orderOut(nil)
     }
 
     /// What SwiftUI owes the window, done now.
