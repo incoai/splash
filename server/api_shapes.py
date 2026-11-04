@@ -8,7 +8,7 @@ from . import json_codec
 from . import protocol as wire
 from .documents import checked_file, document_parts
 from .errors import APIError
-from .metrics import timings_dict, usage_dict
+from .metrics import timings_dict
 from .tool_schema import TAG_NAME_RULE, is_tag_name
 
 VISION_UNAVAILABLE = "this model is serving without vision"
@@ -1127,115 +1127,6 @@ def responses_response(model, job, status, output, result=None, error=None):
             item["type"] in ("function_call", "custom_tool_call") for item in output
         ),
     }
-
-
-def finish_reason(result, called):
-    """OpenAI finish_reason: the output's whole tool calls count only when
-    the token limit did not end it."""
-    if called and result.reason != "length":
-        return "tool_calls"
-    return result.reason
-
-
-def completion_response(model, job, result, message, called):
-    return {
-        "id": f"chatcmpl-{job.public_id}",
-        "object": "chat.completion",
-        "created": job.created_at,
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": message,
-                "finish_reason": finish_reason(result, called),
-            }
-        ],
-        "usage": usage_dict(result, job),
-        "metrics": result.metrics,
-        "timings": timings_dict(result),
-    }
-
-
-def text_completion_response(model, job, result, text):
-    return {
-        "id": f"cmpl-{job.public_id}",
-        "object": "text_completion",
-        "created": job.created_at,
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "text": text,
-                "logprobs": None,
-                "finish_reason": result.reason,
-            }
-        ],
-        "usage": usage_dict(result, job),
-        "metrics": result.metrics,
-        "timings": timings_dict(result),
-    }
-
-
-def _chunk(object_type, chunk_id, created, model, choice, usage, metrics, timings):
-    chunk = {
-        "id": chunk_id,
-        "object": object_type,
-        "created": created,
-        "model": model,
-        "choices": [choice],
-    }
-    if usage is not None:
-        chunk["choices"] = []
-        chunk["usage"] = usage
-    if metrics is not None:
-        chunk["metrics"] = metrics
-    if timings is not None:
-        chunk["timings"] = timings
-    return chunk
-
-
-def stream_chunk(
-    model,
-    request_id,
-    created,
-    delta,
-    finish_reason=None,
-    usage=None,
-    metrics=None,
-    timings=None,
-):
-    return _chunk(
-        "chat.completion.chunk",
-        f"chatcmpl-{request_id}",
-        created,
-        model,
-        {"index": 0, "delta": delta, "finish_reason": finish_reason},
-        usage,
-        metrics,
-        timings,
-    )
-
-
-def text_completion_chunk(
-    model,
-    request_id,
-    created,
-    text,
-    finish_reason=None,
-    usage=None,
-    metrics=None,
-    timings=None,
-):
-    return _chunk(
-        "text_completion",
-        f"cmpl-{request_id}",
-        created,
-        model,
-        {"index": 0, "text": text, "logprobs": None, "finish_reason": finish_reason},
-        usage,
-        metrics,
-        timings,
-    )
 
 
 _RESPONSES_ITEM_PREFIXES = {

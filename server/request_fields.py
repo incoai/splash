@@ -9,6 +9,17 @@ from .errors import APIError
 _PRIORITIES = {priority.name.lower(): priority for priority in wire.RequestPriority}
 
 
+def progress_flag(body):
+    """The request flag of a generation request's return_progress, which only
+    a stream takes."""
+    value = body.get("return_progress", False)
+    if not isinstance(value, bool) or (value and body.get("stream") is not True):
+        raise APIError(
+            400, "return_progress requires stream: true and must be a boolean"
+        )
+    return wire.RequestFlag.RETURN_PROGRESS if value else wire.RequestFlag(0)
+
+
 def priority(body):
     """The scheduling priority the request names; normal without one."""
     priority_name = body.get("priority", "normal")

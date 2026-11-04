@@ -27,8 +27,7 @@ from transformers import AutoTokenizer
 from install import assembly
 from install.models import ModelError
 
-from . import dialects, json_codec, serve_options, serve_record
-from . import protocol as wire
+from . import dialects, json_codec, request_fields, serve_options, serve_record
 from . import runtime as engine_runtime
 from .api_shapes import anthropic_to_chat_body, anthropic_to_chat_prompt
 from .backend import (
@@ -142,32 +141,6 @@ def _normalize_path(raw_path):
     if trailing and normalized != "/":
         normalized += "/"
     return normalized
-
-
-def _progress_flag(body):
-    """The request flag of a generation request's return_progress, which only
-    a stream takes."""
-    value = body.get("return_progress", False)
-    if not isinstance(value, bool) or (value and body.get("stream") is not True):
-        raise APIError(
-            400, "return_progress requires stream: true and must be a boolean"
-        )
-    return wire.RequestFlag.RETURN_PROGRESS if value else wire.RequestFlag(0)
-
-
-def _stream_options(body):
-    """A Chat or text completion request's stream and its stream_options."""
-    stream = body.get("stream", False)
-    options = body.get("stream_options", {})
-    if not isinstance(stream, bool) or not isinstance(options, dict):
-        raise APIError(400, "invalid streaming options")
-    # A null include_usage is one left out, as a null field is.
-    include_usage = options.get("include_usage")
-    if include_usage is None:
-        include_usage = False
-    if not isinstance(include_usage, bool):
-        raise APIError(400, "invalid streaming options")
-    return stream, {"include_usage": include_usage}
 
 
 @dataclass(frozen=True, slots=True)
@@ -696,30 +669,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
         if self._submitted is not None:
             self.app.backend.cancel(self._submitted)
 
-    def _post_chat_completions(self, body, deadline):
-        progress = _progress_flag(body)
-        stream, stream_options = _stream_options(body)
-        job = self.app.prepare(body, deadline=deadline)
-        job.flags |= progress
-        if stream:
-            return job, partial(
-                dialects.openai.stream, self, stream_options=stream_options, chat=True
-            )
-        return job, partial(dialects.openai.complete, self, chat=True)
-
-    def _post_completions(self, body, deadline):
-        progress = _progress_flag(body)
-        stream, stream_options = _stream_options(body)
-        job = self.app.prepare_completion(body, deadline=deadline)
-        job.flags |= progress
-        if stream:
-            return job, partial(
-                dialects.openai.stream, self, stream_options=stream_options, chat=False
-            )
-        return job, partial(dialects.openai.complete, self, chat=False)
-
     def _post_responses(self, body, deadline):
-        progress = _progress_flag(body)
+        progress = request_fields.progress_flag(body)
         job = self.app.prepare_responses(
             body, deadline=deadline, reserve_input=self.reserve_input
         )
@@ -729,7 +680,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         return job, partial(dialects.responses.complete, self)
 
     def _post_messages(self, body, deadline):
-        progress = _progress_flag(body)
+        progress = request_fields.progress_flag(body)
         chat, thinking_display = anthropic_to_chat_body(
             body, thinking_resolver=self.app.thinking_codec.decode
         )
@@ -743,10 +694,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
         if body.get("stream"):
             return job, partial(dialects.anthropic.stream, self)
         return job, partial(dialects.anthropic.complete, self)
-
-    def _post_chat_count_tokens(self, body, deadline):
-        tokens = self.app.count_tokens(body, deadline=deadline)
-        self.send_json(200, {"input_tokens": tokens})
 
     def _post_count_tokens(self, body, deadline):
         prompt = anthropic_to_chat_prompt(
@@ -1014,11 +961,11 @@ ROUTES = {
     ("GET", _MODEL_PATH): Route(
         FrontendHandler._get_model, request_id_header=dialects.scoring.REQUEST_ID_HEADER
     ),
-    ("POST", "/v1/chat/completions"): Route(FrontendHandler._post_chat_completions),
+    ("POST", "/v1/chat/completions"): Route(dialects.openai.post_chat),
     ("POST", "/v1/chat/completions/count_tokens"): Route(
-        FrontendHandler._post_chat_count_tokens, prompt_only=True
+        dialects.openai.post_chat_count_tokens, prompt_only=True
     ),
-    ("POST", "/v1/completions"): Route(FrontendHandler._post_completions),
+    ("POST", "/v1/completions"): Route(dialects.openai.post_completion),
     ("POST", "/v1/responses"): Route(FrontendHandler._post_responses),
     ("POST", "/v1/messages"): Route(FrontendHandler._post_messages, ANTHROPIC_ERRORS),
     ("POST", "/v1/messages/count_tokens"): Route(

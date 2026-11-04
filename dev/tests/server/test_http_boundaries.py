@@ -21,6 +21,7 @@ from dev.tests.server_fixtures import (
 from server import api_shapes, crash_trace, http_security, images, origins
 from server import backend as backend_api
 from server import server as api
+from server.dialects import openai as openai_dialect
 from server.errors import APIError
 
 INVALID_ORIGINS = (
@@ -362,14 +363,14 @@ class HttpBoundaryTests(HarnessTestCase):
         self.assertEqual((first_job.request_id, second_job.request_id), (1, 1))
         self.assertNotEqual(first_job.public_id, second_job.public_id)
         result = backend_api.NativeResult("stop", 2, 1, 1, 1, 1)
-        first_id = api_shapes.completion_response(
+        first_id = openai_dialect.completion_response(
             "test-model",
             first_job,
             result,
             {"role": "assistant", "content": "x"},
             False,
         )["id"]
-        second_id = api_shapes.completion_response(
+        second_id = openai_dialect.completion_response(
             "test-model",
             second_job,
             result,
@@ -378,7 +379,7 @@ class HttpBoundaryTests(HarnessTestCase):
         )["id"]
         self.assertNotEqual(first_id, second_id)
         self.assertEqual(
-            api_shapes.stream_chunk("test-model", first_job.public_id, 1, {})["id"],
+            openai_dialect.stream_chunk("test-model", first_job.public_id, 1, {})["id"],
             first_id,
         )
         first_job.created_at = 123

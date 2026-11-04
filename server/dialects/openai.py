@@ -1,16 +1,52 @@
-"""The OpenAI Chat and text completion answers: a completion, or its chunks
-as server-sent events. Text completions have no tools."""
+"""OpenAI's Chat and text completions: their routes, answers and builders.
+A completion answers whole, or as chunks in server-sent events. Text
+completions have no tools."""
 
 from functools import partial
 
-from ..api_shapes import (
-    completion_response,
-    finish_reason,
-    stream_chunk,
-    text_completion_chunk,
-    text_completion_response,
-)
+from .. import request_fields
+from ..errors import APIError
 from ..metrics import timings_dict, usage_dict
+
+
+def post_chat(exchange, body, deadline):
+    return _post(exchange, body, deadline, exchange.app.prepare, chat=True)
+
+
+def post_completion(exchange, body, deadline):
+    return _post(exchange, body, deadline, exchange.app.prepare_completion, chat=False)
+
+
+def post_chat_count_tokens(exchange, body, deadline):
+    tokens = exchange.app.count_tokens(body, deadline=deadline)
+    exchange.send_json(200, {"input_tokens": tokens})
+
+
+def _post(exchange, body, deadline, prepare, *, chat):
+    """Prepare a Chat or text completion, and the answer that writes its
+    output: whole, or as a stream."""
+    progress = request_fields.progress_flag(body)
+    streamed, stream_options = _stream_options(body)
+    job = prepare(body, deadline=deadline)
+    job.flags |= progress
+    if streamed:
+        return job, partial(stream, exchange, stream_options=stream_options, chat=chat)
+    return job, partial(complete, exchange, chat=chat)
+
+
+def _stream_options(body):
+    """A Chat or text completion request's stream and its stream_options."""
+    stream = body.get("stream", False)
+    options = body.get("stream_options", {})
+    if not isinstance(stream, bool) or not isinstance(options, dict):
+        raise APIError(400, "invalid streaming options")
+    # A null include_usage is one left out, as a null field is.
+    include_usage = options.get("include_usage")
+    if include_usage is None:
+        include_usage = False
+    if not isinstance(include_usage, bool):
+        raise APIError(400, "invalid streaming options")
+    return stream, {"include_usage": include_usage}
 
 
 def complete(exchange, job, *, chat):
@@ -93,3 +129,112 @@ def stream(exchange, job, stream_options, *, chat):
         exchange.sse("[DONE]")
 
     exchange.guarded_stream(job, run, send_error)
+
+
+def finish_reason(result, called):
+    """OpenAI finish_reason: the output's whole tool calls count only when
+    the token limit did not end it."""
+    if called and result.reason != "length":
+        return "tool_calls"
+    return result.reason
+
+
+def completion_response(model, job, result, message, called):
+    return {
+        "id": f"chatcmpl-{job.public_id}",
+        "object": "chat.completion",
+        "created": job.created_at,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason(result, called),
+            }
+        ],
+        "usage": usage_dict(result, job),
+        "metrics": result.metrics,
+        "timings": timings_dict(result),
+    }
+
+
+def text_completion_response(model, job, result, text):
+    return {
+        "id": f"cmpl-{job.public_id}",
+        "object": "text_completion",
+        "created": job.created_at,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "text": text,
+                "logprobs": None,
+                "finish_reason": result.reason,
+            }
+        ],
+        "usage": usage_dict(result, job),
+        "metrics": result.metrics,
+        "timings": timings_dict(result),
+    }
+
+
+def _chunk(object_type, chunk_id, created, model, choice, usage, metrics, timings):
+    chunk = {
+        "id": chunk_id,
+        "object": object_type,
+        "created": created,
+        "model": model,
+        "choices": [choice],
+    }
+    if usage is not None:
+        chunk["choices"] = []
+        chunk["usage"] = usage
+    if metrics is not None:
+        chunk["metrics"] = metrics
+    if timings is not None:
+        chunk["timings"] = timings
+    return chunk
+
+
+def stream_chunk(
+    model,
+    request_id,
+    created,
+    delta,
+    finish_reason=None,
+    usage=None,
+    metrics=None,
+    timings=None,
+):
+    return _chunk(
+        "chat.completion.chunk",
+        f"chatcmpl-{request_id}",
+        created,
+        model,
+        {"index": 0, "delta": delta, "finish_reason": finish_reason},
+        usage,
+        metrics,
+        timings,
+    )
+
+
+def text_completion_chunk(
+    model,
+    request_id,
+    created,
+    text,
+    finish_reason=None,
+    usage=None,
+    metrics=None,
+    timings=None,
+):
+    return _chunk(
+        "text_completion",
+        f"cmpl-{request_id}",
+        created,
+        model,
+        {"index": 0, "text": text, "logprobs": None, "finish_reason": finish_reason},
+        usage,
+        metrics,
+        timings,
+    )
