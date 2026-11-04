@@ -105,7 +105,7 @@ struct StateEviction final {
   bool pending = false;
 };
 
-// What one step of making a restore point durable for the next process did
+// What one step of giving a restore point its copies ahead of need did
 // (Cache::persist, StateCache::persist).
 enum class PersistStatus : uint8_t {
   // Every copy it needs is complete on disk.
@@ -143,10 +143,8 @@ public:
   // pending; a write the quota refuses still drops it. Keep: the state goes
   // only when it keeps a copy, a disk copy it has or a write that starts
   // now; it stays otherwise, reported pending while the write in flight
-  // holds the staging buffer. Stay: no write starts; the state goes only
-  // when it needs none, through a disk copy it has or because the tier takes
-  // no write of it, which drops it, and stays otherwise.
-  enum class Unwritten : uint8_t { Drop, Wait, Keep, Stay };
+  // holds the staging buffer.
+  enum class Unwritten : uint8_t { Drop, Wait, Keep };
 
   // makeRoom gives up disk copies for a state's write the quota refuses. In
   // a persistent tier every write labels its disk copy (CompositeState::label).
@@ -214,13 +212,15 @@ public:
   [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
   // A disk copy exists, written or being written.
   [[nodiscard]] bool onDisk(uint64_t kvBlock) const noexcept;
-  // In a persistent tier, writes a disk copy of a RAM copy from the RAM
-  // copy's own buffers, which stay: the next process takes the disk copy
-  // back. Until the write lands the RAM copy is no eviction candidate, and
-  // the write is the one in flight. Durable once a disk copy has landed;
-  // busy while the write budget holds the state back, and refused once its
-  // file takes no write of a copy in use either.
-  [[nodiscard]] PersistStatus persist(uint64_t kvBlock);
+  // Writes a disk copy of a RAM copy from the RAM copy's own buffers, which
+  // stay, ahead of need (Cache::persist): a reclaim then frees the RAM copy
+  // without a write, and a persistent tier's next process takes the disk
+  // copy back. Until the write lands the RAM copy is no eviction candidate, and
+  // the write is the one in flight. Only with makeRoom does the write give
+  // up disk copies for its quota. Durable once a disk copy has landed; busy
+  // while the write budget holds the state back, and refused once its file
+  // takes no write of a copy in use either, or the quota has no room for it.
+  [[nodiscard]] PersistStatus persist(uint64_t kvBlock, bool makeRoom);
   // In a persistent tier, labels every disk copy again, with its state's
   // block, class and current recency.
   void relabel() const;
@@ -230,47 +230,62 @@ public:
     return static_cast<uint32_t>(ordinary_.size() + checkpoints_.size() +
                                  (withInUse ? inUse_.size() : 0));
   }
-  // The RAM copies a reclaim that starts no write frees, each at once: the
-  // oldest checkpoint, then the oldest ordinary state, freed with Stay until
-  // none is left, keeping the resume point (Cache::reclaimForExchange).
-  // Appends to `staying` the blocks of the RAM copies it leaves but those in
-  // use: in either class the first that needs a write and every newer one,
-  // which never becomes the class's oldest, the resume point, and the copies
-  // in no order, pinned or read by the write in flight.
-  [[nodiscard]] uint32_t freedWithoutWrites(std::vector<uint64_t> &staying) const;
   // The resume point a reclaim may keep (keepResumePoint): the newest
   // unpinned ordinary state in RAM, else the newest such checkpoint; 0
   // without either.
   [[nodiscard]] uint64_t resumePoint() const noexcept;
-  // Oldest unpinned checkpoint in RAM, the first class a reclaim frees.
-  // keepResumePoint withholds the resume point when it is a checkpoint: the
-  // newest one, while no ordinary state is in RAM.
+  // Oldest unpinned checkpoint in RAM, the first class a reclaim frees, or
+  // the next after `after`, a candidate that stayed. keepResumePoint
+  // withholds the resume point when it is a checkpoint: the newest one,
+  // while no ordinary state is in RAM. The states at `kept` are withheld
+  // too, and the next oldest is the candidate.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
-  checkpointCandidate(bool keepResumePoint) const noexcept;
-  // Oldest unpinned ordinary state in RAM. keepResumePoint withholds the
-  // resume point, the newest of them.
+  checkpointCandidate(bool keepResumePoint, std::span<const uint64_t> kept = {},
+                      std::optional<CacheEvictionCandidate> after = std::nullopt) const noexcept;
+  // Oldest unpinned ordinary state in RAM, or the next after `after`.
+  // keepResumePoint withholds the resume point, the newest of them, and
+  // `kept` as for checkpoints.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
-  ordinaryCandidate(bool keepResumePoint) const noexcept;
+  ordinaryCandidate(bool keepResumePoint, std::span<const uint64_t> kept = {},
+                    std::optional<CacheEvictionCandidate> after = std::nullopt) const noexcept;
   // Oldest RAM copy of a state in use, which only work of class InUse takes
-  // (ReclaimClass). The resume point is never in use.
-  [[nodiscard]] std::optional<CacheEvictionCandidate> inUseCandidate() const noexcept;
+  // (ReclaimClass), or the next after `after`. The resume point is never in
+  // use.
+  [[nodiscard]] std::optional<CacheEvictionCandidate>
+  inUseCandidate(std::optional<CacheEvictionCandidate> after = std::nullopt) const noexcept;
   // Frees the RAM copy of a candidate above (an unpinned RAM copy; anything
   // else throws std::logic_error): for nothing when a disk copy exists, by
-  // writing one when the tier takes it (makeRoom frees quota on its behalf)
-  // and `unwritten` is not Stay, otherwise as `unwritten` says. Its buffers
-  // return to the model's pool, which reclaimIdleState gives back to the
-  // host. A RAM copy a write in flight reads (persist) stays until it lands:
-  // pending.
+  // writing one when the tier takes it (makeRoom frees quota on its behalf),
+  // otherwise as `unwritten` says. Its buffers return to the model's pool,
+  // which releaseIdleBuffer gives back to the host. A RAM copy a write in
+  // flight reads (persist) stays until it lands: pending.
   [[nodiscard]] StateEviction reclaim(uint64_t kvBlock, Unwritten unwritten);
+  // The state at this block may be given to reclaim(): an unpinned, valid
+  // RAM copy.
+  [[nodiscard]] bool reclaimable(uint64_t kvBlock) const noexcept;
+  // A lease holds the state at this block (acquireDeepest), and with it the
+  // block.
+  [[nodiscard]] bool pinned(uint64_t kvBlock) const noexcept;
+  // When the state at this block was last used; 0 without one.
+  [[nodiscard]] uint64_t lastUsed(uint64_t kvBlock) const noexcept;
+  // A reclaim of the state at this block writes it: it has no disk copy and
+  // the tier takes its write.
+  [[nodiscard]] bool reclaimWrites(uint64_t kvBlock) const noexcept;
+  // What reclaim(kvBlock, unwritten) of a reclaimable state does, doing
+  // nothing: evicted, pending, or neither while it stays. A write the quota
+  // refuses drops the state, which counts as evicted, but with Keep, which
+  // keeps it: this cannot know the quota, and reports it evicted.
+  [[nodiscard]] StateEviction reclaimOutcome(uint64_t kvBlock, Unwritten unwritten) const noexcept;
   // Removes an unpinned state from both tiers.
   void evict(uint64_t kvBlock) noexcept;
   // Disk replacement: the oldest unpinned disk copy that is redundant (a RAM
   // copy exists) or, without duplicate, one that is the only copy of a state
-  // not in use.
+  // not in use; the next such copy after `after`.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
-  diskCandidate(bool duplicate) const noexcept;
-  // The oldest only copy of a state in use.
-  [[nodiscard]] std::optional<CacheEvictionCandidate> inUseDiskCandidate() const noexcept;
+  diskCandidate(bool duplicate, const std::optional<CacheEvictionCandidate> &after = {}) const noexcept;
+  // The oldest only copy of a state in use; the next after `after`.
+  [[nodiscard]] std::optional<CacheEvictionCandidate>
+  inUseDiskCandidate(const std::optional<CacheEvictionCandidate> &after = {}) const noexcept;
   // Drops a redundant disk copy.
   void dropDisk(uint64_t kvBlock);
   // A read of this copy failed: it leaves once unpinned, a RAM copy stays.
@@ -288,6 +303,11 @@ public:
   void promotionSkipped() noexcept { ++promotionsSkipped_; }
   // The one state write is in flight; its RAM or quota returns when it lands.
   [[nodiscard]] bool writing() const noexcept { return pending_.has_value(); }
+  // The bytes of the RAM copy a write ahead of need reads (persist), which a
+  // reclaim frees at once after it lands.
+  [[nodiscard]] uint64_t persistingBytes() const noexcept {
+    return pending_ && pending_->source ? pending_->source->bytes() : 0;
+  }
   [[nodiscard]] bool pollOffload();
   [[nodiscard]] StateCacheSnapshot snapshot() const noexcept;
 
@@ -314,9 +334,11 @@ private:
     std::unique_ptr<StateOffload> transfer;
   };
 
-  // The order's oldest entry, unless keepResumePoint withholds it.
+  // The order's oldest entry, or the next after `after`, that
+  // keepResumePoint and `kept` do not withhold.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
-  oldestOf(const RecencyOrder &order, bool keepResumePoint) const noexcept;
+  oldestOf(const RecencyOrder &order, bool keepResumePoint, std::span<const uint64_t> kept,
+           std::optional<CacheEvictionCandidate> after) const noexcept;
   [[nodiscard]] static const std::shared_ptr<const CompositeState> &
   copy(const Entry &entry) noexcept {
     return entry.ram ? entry.ram : entry.disk;
@@ -329,13 +351,14 @@ private:
   // keeps its lifetime; an ordinary publication upgrades a checkpoint in
   // either tier so rolling retirement cannot erase it.
   [[nodiscard]] Entry &publicationEntry(uint64_t kvBlock, bool checkpoint);
-  // Starts the write of the block's state, giving up quota through makeRoom
-  // while the tier refuses one; null while the one write in flight holds the
-  // staging buffer. makeRoom leaves states in RAM alone: reclaim holds the
-  // entry it writes. The disk copy counts for the KV from the first attempt
-  // (KvCache::countDiskState), and no longer once none starts.
-  [[nodiscard]] std::unique_ptr<StateOffload> startWrite(uint64_t kvBlock,
-                                                         const StateWriter &write);
+  // Starts the write of the block's state, giving up quota through
+  // makeRoom_ while the tier refuses one, unless told not to make room; null
+  // while the one write in flight holds the staging buffer. makeRoom_ leaves
+  // states in RAM alone: reclaim holds the entry it writes. The disk copy
+  // counts for the KV from the first attempt (KvCache::countDiskState), and
+  // no longer once none starts.
+  [[nodiscard]] std::unique_ptr<StateOffload> startWrite(uint64_t kvBlock, const StateWriter &write,
+                                                         bool makeRoom = true);
   // The disk copy this write carries, counted since startWrite, becomes the
   // entry's; the write is the one in flight, reading `source` in place when
   // given.

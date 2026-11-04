@@ -417,8 +417,6 @@ void KvCache::noteState(uint64_t blockId) { block(blockId).hadState = true; }
 
 bool KvCache::hadState(uint64_t blockId) const { return block(blockId).hadState; }
 
-bool KvCache::windowPinned(uint64_t blockId) const { return block(blockId).windowPins != 0; }
-
 bool KvCache::tailFull(uint64_t blockId) const {
   for (uint32_t index = 0; blockId && index < windowPages_; ++index) {
     const Block &entry = block(blockId);
@@ -456,18 +454,15 @@ uint32_t KvCache::idlePagesOnChains(std::span<const uint64_t> blocks, kv::PageFo
   return pages;
 }
 
-std::vector<uint64_t> KvCache::uncopiedBlocks() const {
-  std::vector<uint64_t> blocks;
-  for (const auto &[id, entry] : blocks_)
-    if (entry.page != noPage && (!entry.slot || entry.transfer != Transfer::None))
-      blocks.push_back(id);
-  return blocks;
-}
-
 bool KvCache::residentLeaf(uint64_t blockId) const {
   const Block &entry = block(blockId);
   return entry.page != noPage && !entry.residentChildren && !entry.activeUsers &&
-         !entry.held && entry.transfer == Transfer::None && !entry.poisoned;
+         !entry.held && !entry.poisoned;
+}
+
+bool KvCache::leafOnceChildrenLeave(uint64_t blockId) const {
+  const Block &entry = block(blockId);
+  return entry.page != noPage && !entry.activeUsers && !entry.held && !entry.poisoned;
 }
 
 void KvCache::setTransfer(uint64_t blockId, Transfer transfer) {

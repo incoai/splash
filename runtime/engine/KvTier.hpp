@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace splash::model {
@@ -35,9 +36,9 @@ public:
 
 // What a write to the tier is for, each with its share of the writes in
 // flight (KvPageTier), so that one kind never starves another: a page whose
-// RAM a reclaim frees once its copy lands, a copy a persistent tier keeps of
-// a page that stays (Cache::persist), and a Spill request's page written
-// through (Cache::writeThrough).
+// RAM a reclaim frees once its copy lands, a copy of a page that stays,
+// which a restore point's chain gets ahead of need (Cache::persist), and a
+// Spill request's page written through (Cache::writeThrough).
 enum class WriteClass : uint8_t { Reclaim, Persist, Spill };
 
 // The disk tier for KV pages as the engine drives it. Until a transfer is
@@ -61,6 +62,10 @@ public:
   // writable tier. The write budget holds no KV write back
   // (model::DiskBudget).
   [[nodiscard]] virtual bool canDemote(WriteClass write) const noexcept = 0;
+  // How many writes of the class canDemote() admits now, one after another,
+  // for a reclaim weighed before it is made (Cache::peek); none when the
+  // tier does not say.
+  [[nodiscard]] virtual std::optional<uint32_t> demotionRoom(WriteClass) const noexcept { return std::nullopt; }
   // Engine-thread admission probe, before building a restore's arguments.
   [[nodiscard]] virtual bool canRestore() const noexcept = 0;
   // Null when the tier is at its limit for the draw (model::DiskBudget::
@@ -81,9 +86,8 @@ public:
   restore(std::shared_ptr<KvDiskSlot> slot, uint32_t page,
           std::function<void()> completion) = 0;
   // Starts the restores queued since the last call, in batches that each
-  // run their first restore's completion once all of theirs have landed; a
-  // tier that starts each as it comes has none to start.
-  virtual void submitRestores() {}
+  // run their first restore's completion once all of theirs have landed.
+  virtual void submitRestores() = 0;
   // The slot's copy as reads of spilled K/V reach it (model::KvPageSource),
   // on any thread, for as long as they hold it.
   [[nodiscard]] virtual std::shared_ptr<const model::KvCopy>

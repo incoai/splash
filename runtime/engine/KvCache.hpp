@@ -83,7 +83,7 @@ public:
   // copies no state needs in an order of their own (unneededCopy). With a
   // window of windowPages pages (kv::Layout::windowPages), a state pins the
   // windowPages blocks that end at its block, its tail, which a restore
-  // reads whole (windowPinned), and the Full blocks no tail holds wait in an
+  // reads whole (countState), and the Full blocks no tail holds wait in an
   // order of their own (trimCandidate).
   KvCache(KvPool &pool, CacheRecency &recency, bool spill = false, bool persistent = false,
           uint32_t windowPages = 0)
@@ -144,8 +144,7 @@ public:
   // holds the page: neither quota nor RAM reclaim takes a held block or its
   // copy, unless the copy holds what another command computed (kvCopied),
   // which no request reads. Only a cache whose requests may spill
-  // (CacheSpillPolicy) holds blocks; on a layout that cannot, quota strips
-  // and evicts copies as it always has. A poisoned block leaves once nothing
+  // (CacheSpillPolicy) holds blocks. A poisoned block leaves once nothing
   // holds it or keeps it otherwise.
   void holdPage(uint32_t page);
   void unholdPage(uint32_t page);
@@ -200,9 +199,6 @@ public:
   // block; lookups that find the block without one report a lost state.
   void noteState(uint64_t blockId);
   [[nodiscard]] bool hadState(uint64_t blockId) const;
-  // With a window: the tail of a state, its own or one below it, holds the
-  // block (countState), whose page stays Full.
-  [[nodiscard]] bool windowPinned(uint64_t blockId) const;
   // Whether the windowPages blocks that end at this one, its tail, hold
   // every layer's K/V, in RAM (a Full page) or, without a page, in their
   // copy (copyForm): what a state at the block needs to restore.
@@ -218,11 +214,12 @@ public:
   // moves; each counts once. A request holds every page of its chain, so a
   // chain's count stops at the first page one holds.
   [[nodiscard]] uint32_t idlePagesOnChains(std::span<const uint64_t> blocks, kv::PageForm form) const;
-  // The resident blocks whose page a reclaim cannot free through a disk
-  // copy: those without one, and those whose page a transfer moves.
-  [[nodiscard]] std::vector<uint64_t> uncopiedBlocks() const;
-  // Resident, without resident children, users or holders: its page can go.
+  // Resident, without resident children, users or holders: its page can go
+  // once no transfer moves it.
   [[nodiscard]] bool residentLeaf(uint64_t blockId) const;
+  // Resident, without users or holders: a resident leaf once its resident
+  // children leave.
+  [[nodiscard]] bool leafOnceChildrenLeave(uint64_t blockId) const;
   // Starts a transfer of the block's page, or ends it with None; one at a
   // time.
   void setTransfer(uint64_t blockId, Transfer transfer);
@@ -243,10 +240,13 @@ public:
   // Abandons an unsubmitted restore at an unused leaf, keeping its disk copy.
   [[nodiscard]] bool abandonRestore(uint64_t blockId);
   // A restore or a read of its copy that failed: the block matches nothing
-  // any more and leaves once its subtree, users and holders are gone. Its
-  // copy goes at once, unless a request holds the block or its page holds
-  // only its index: then it leaves with the block.
+  // any more and leaves once its subtree, users, holders and transfer are
+  // gone. Its copy goes at once, unless a request holds the block or its
+  // page holds only its index: then it leaves with the block.
   void poison(uint64_t blockId);
+  // Erases the block if it is poisoned and nothing refers to it any more: no
+  // child, user, holder or transfer.
+  void erasePoisonedLeaf(uint64_t blockId) noexcept;
 
   // Oldest resident leaf (no resident children) that no request uses. Pass
   // the previous candidate to continue the scan without a lookup.
@@ -261,9 +261,11 @@ public:
   // In a persistent cache, the oldest holder of a disk copy that no request
   // reads and no state needs: a redundant copy once no state with a disk
   // copy sits at its block or below, as a state in RAM restores through the
-  // page, and the only copy of a spilled or disk-only leaf without a state.
-  [[nodiscard]] std::optional<CacheEvictionCandidate> unneededCopy() const noexcept {
-    return unneeded_.oldest();
+  // page, and the only copy of a spilled or disk-only leaf without a state;
+  // the next after `after`.
+  [[nodiscard]] std::optional<CacheEvictionCandidate>
+  unneededCopy(const std::optional<CacheEvictionCandidate> &after = {}) const noexcept {
+    return after ? unneeded_.next(*after) : unneeded_.oldest();
   }
   // The blocks below a block, each after its children, visiting only that
   // subtree; empty when one of them is in transfer or active. Below a
@@ -287,7 +289,7 @@ public:
   // Blocks that left their page for that of a writer that computed them
   // again (insert).
   [[nodiscard]] uint64_t upgrades() const noexcept { return upgrades_; }
-  // Blocks a state's tail holds (windowPinned).
+  // Blocks a state's tail holds (countState).
   [[nodiscard]] uint32_t pinnedBlocks() const noexcept { return pinnedBlocks_; }
   // Tests: std::logic_error unless every block's links, counts, form and
   // held mark agree with the graph and the pool, every order holds exactly
@@ -378,8 +380,6 @@ private:
   // Applies count to every block above this one.
   template <typename Count>
   void countAbove(uint64_t blockId, const Count &count) noexcept;
-  // A poisoned block leaves as soon as nothing refers to it.
-  void erasePoisonedLeaf(uint64_t blockId) noexcept;
 
   KvPool &pool_;
   CacheRecency &recency_;
