@@ -5644,8 +5644,7 @@ void testImmediateWalksOfferWhatLandsLaterInItsPlace() {
   // tier takes writes: the unit of its demotion, which the tier and the
   // quota have room for, frees its page as the copy lands.
   test::TestKvTier tier;
-  test::RoomTier room(tier);
-  CacheFixture kv(&room, false, std::make_shared<model::DiskBudget>(1000));
+  CacheFixture kv(&tier, false, std::make_shared<model::DiskBudget>(1000));
   auto written = std::make_shared<TransferControl>();
   written->ready = true;
   kv.cache.publishCompositeState(kv.blocks[3], std::make_shared<TieredState>(written), false);
@@ -5813,10 +5812,9 @@ void testDeviceUnitWeighsWhatItsDemotionsReturn() {
   test::TestKvStorage storage{8, 100, 1};
   KvPool pool{storage, 1};
   test::TestKvTier tier;
-  test::RoomTier room(tier);
   auto budget = std::make_shared<model::DiskBudget>(1000);
   tier.budget = budget;
-  engine::Cache cache(pool, &room, budget);
+  engine::Cache cache(pool, &tier, budget);
   auto control = std::make_shared<TransferControl>();
   control->ready = true;
   const uint64_t last = cacheConversation(cache, 1, 4, std::make_shared<TieredState>(control));

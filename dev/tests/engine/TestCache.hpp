@@ -14,48 +14,6 @@
 
 namespace splash::test {
 
-// A test tier that says how many demotions it admits now, as KvPageTier
-// does (KvTier::demotionRoom): those its transfer limit and its share of
-// the class's writes leave. It is the tier it wraps otherwise.
-class RoomTier final : public engine::KvTier {
-public:
-  explicit RoomTier(TestKvTier &tier) : tier_(tier) {}
-  uint64_t slotBytes() const noexcept override { return tier_.slotBytes(); }
-  bool writable() const noexcept override { return tier_.writable(); }
-  bool persistent() const noexcept override { return tier_.persistent(); }
-  void label(const std::shared_ptr<engine::KvDiskSlot> &slot, std::vector<std::byte> label) override {
-    tier_.label(slot, std::move(label));
-  }
-  bool canDemote(engine::WriteClass write) const noexcept override { return tier_.canDemote(write); }
-  std::optional<uint32_t> demotionRoom(engine::WriteClass write) const noexcept override {
-    if (!tier_.canDemote(write))
-      return 0u;
-    const auto ofClass = static_cast<uint32_t>(std::ranges::count_if(
-        tier_.transfers, [&](const auto &transfer) { return !transfer->finished && transfer->write == write; }));
-    return std::min(tier_.transferLimit - tier_.inFlight(), tier_.writeLimits[static_cast<size_t>(write)] - ofClass);
-  }
-  bool canRestore() const noexcept override { return tier_.canRestore(); }
-  std::shared_ptr<engine::KvDiskSlot> acquireSlot(model::DiskBudget::Draw draw) override {
-    return tier_.acquireSlot(draw);
-  }
-  std::unique_ptr<engine::KvTransfer> demote(uint32_t page, std::shared_ptr<engine::KvDiskSlot> slot,
-                                             engine::WriteClass write, std::function<void()> completion) override {
-    return tier_.demote(page, std::move(slot), write, std::move(completion));
-  }
-  std::unique_ptr<engine::KvTransfer> restore(std::shared_ptr<engine::KvDiskSlot> slot, uint32_t page,
-                                              std::function<void()> completion) override {
-    return tier_.restore(std::move(slot), page, std::move(completion));
-  }
-  void submitRestores() override { tier_.submitRestores(); }
-  std::shared_ptr<const model::KvCopy> copy(const std::shared_ptr<engine::KvDiskSlot> &slot) const override {
-    return tier_.copy(slot);
-  }
-  void poll() override { tier_.poll(); }
-
-private:
-  TestKvTier &tier_;
-};
-
 // Publishes the request's committed blocks and returns the deepest one, 0
 // while no block is complete.
 inline uint64_t publishBlocks(engine::Cache &cache, uint64_t requestId,
