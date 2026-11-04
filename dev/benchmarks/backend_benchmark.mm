@@ -3,6 +3,7 @@
 #include "engine/Json.hpp"
 #include "engine/RuntimeResources.hpp"
 #include "model/Runtime.hpp"
+#include "Supervision.hpp"
 #include "PrefillWork.hpp"
 #include "TranscriptPrompts.hpp"
 
@@ -959,12 +960,13 @@ int main(int argc, char **argv) {
     bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
     const std::string modelRoot = config.modelRoot.string();
     const auto &capabilities = config.model.capabilities;
-    // Complete production warmup and memory audit before measuring. Retry
-    // host-capacity refusals while memory from the previous engine settles.
+    // Complete production warmup and memory audit before measuring. A start
+    // refused memory the host or Metal may give back, as while the previous
+    // engine's memory settles, retries as serve's does (main.mm): within the
+    // same window, opened at its first such refusal.
     std::unique_ptr<engine::RuntimeBootstrap> bootstrap;
-    const auto memoryDeadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(180);
-    bool waitingAnnounced = false;
+    engine::StartupRetryWindow recovery(supervision::kStartRetryWindow);
+    std::optional<AwakeClock::time_point> firstRefusal;
     while (!bootstrap) {
       try {
         bootstrap = engine::RuntimeBootstrap::start(
@@ -973,18 +975,24 @@ int main(int argc, char **argv) {
               throw std::logic_error("benchmark does not accept native status requests");
             });
       } catch (const engine::RuntimeBootstrapError &error) {
-        if (error.report().resourceFailure !=
-                engine::RuntimeResourceFailure::HostCapacity ||
-            std::chrono::steady_clock::now() >= memoryDeadline)
+        const auto now = AwakeClock::now();
+        const auto retryUntil = recovery.retryUntil(error.report(), now);
+        if (!retryUntil)
           throw;
-        if (!waitingAnnounced) {
+        if (!firstRefusal) {
           std::cerr << "backend-benchmark: waiting for host memory to settle "
                        "before loading the model\n";
-          waitingAnnounced = true;
+          firstRefusal = now;
         }
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+        std::this_thread::sleep_until(
+            std::min(now + engine::kStartupMemoryRecoveryPoll, *retryUntil));
       }
     }
+    // How long the start waited for memory (0 without a refusal), which the
+    // report records: a wait near the window says the window is short.
+    const double startWaitMilliseconds =
+        firstRefusal ? std::chrono::duration<double, std::milli>(AwakeClock::now() - *firstRefusal).count()
+                     : 0.0;
     // start() returns once the loop has announced Ready.
     if (!bootstrap->nativeLoop().engineHealthy() ||
         bootstrap->nativeLoop().commandInFlight())
@@ -1007,10 +1015,16 @@ int main(int argc, char **argv) {
       progress->identity(identity);
 
     // These warmups run after serving began, and widths 2-4 each add a lane.
-    // Like a start's warmup, what they allocate is memory a request in
-    // service needs (MemoryGovernor::setServing): unmarked, the host's
-    // margins refuse a lane the plan holds, and the run fails.
-    const bool wasServing = resources->memoryGovernor().setServing(true);
+    // They are lanes alone in service, which the engine passes through the
+    // host's margins allocation by allocation once nothing in place meets
+    // one; a warmup retries none, so like a start's warmup they run inside a
+    // Floor claim: only the engine's limit and macOS's critical pressure
+    // refuse what they allocate. Like a start's warmup too, they hold the KV
+    // runway they run on.
+    MemoryGovernor &governor = resources->memoryGovernor();
+    const ClaimId warmups = governor.ledger().open({.cls = ClaimClass::Floor});
+    std::optional<MemoryGovernor::Scope> warmupScope(std::in_place, governor, warmups);
+    std::optional<engine::KvPool::RunwayHold> runway(std::in_place, resources->kvPool());
     if (progress)
       progress->begin("warmup", "prefill_2048", 0,
                       model::ExecutionLimits::prefillTokenBudget);
@@ -1035,11 +1049,13 @@ int main(int argc, char **argv) {
       decodeWarmupGpu[width - 1] =
           executor->telemetry().lastDecodeGpuSeconds * 1000.0;
     }
-    resources->memoryGovernor().setServing(wasServing);
+    runway.reset();
+    warmupScope.reset();
+    governor.ledger().close(warmups);
 
     Events events;
     engine::EngineConfig engineConfig;
-    engineConfig.maxContext = bootstrap->nativeLoop().snapshot().maximumContextTokens;
+    engineConfig.maxContext = bootstrap->nativeLoop().statusSnapshot().maximumContextTokens;
     engineConfig.vocabularySize = capabilities.vocabularySize;
     engine::connectToGovernor(engineConfig, resources->memoryGovernor());
     engine::Engine engine(engineConfig, resources->cache(),
@@ -1544,7 +1560,8 @@ int main(int argc, char **argv) {
               << ",\"batch_width\":" << model::ExecutionLimits::maximumBatchWidth
               << ",\"kv_block_tokens\":"
               << kv::kPageTokens
-              << "},\"warmup\":{\"prefill_2048_wall_ms\":"
+              << "},\"start_wait_ms\":" << startWaitMilliseconds
+              << ",\"warmup\":{\"prefill_2048_wall_ms\":"
               << prefillWarmup.wallSeconds * 1000.0
               << ",\"prefill_2048_gpu_ms\":"
               << prefillWarmupGpuMilliseconds

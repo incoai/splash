@@ -74,11 +74,8 @@ void testImageIdentityKeysBlocks() {
   std::cout << "KV image identity ok\n";
 }
 
-// A persistent tier records each block's identity (KvBlockLabel), and a later
-// process's lookups compute it again: a change to blockIdentity's mixing or
-// seeds would leave the salted and image chains it holds matching nothing.
-// Such a change bumps kPersistentCacheFormat (engine/RuntimeResources.mm) and
-// pins the new values here.
+// A persistent tier's recorded block identities must match a later process's lookups; a change to
+// blockIdentity bumps kPersistentCacheFormat and pins the new values here.
 void testBlockIdentitiesArePinned() {
   const CacheSalt salt{0x0123456789abcdefULL, 0xfedcba9876543210ULL};
   // Two images in the first block, the second through the third.
@@ -326,9 +323,8 @@ void testCandidateOrderThroughChurn() {
           "candidate churn leaked a block or physical reference");
 }
 
-// On random trees grown by inserts and shrunk by leaf erasures, subtree()
-// returns every block below each block, each before its parent, or nothing
-// while one of them is in use.
+// On random trees grown by inserts and shrunk by leaf erasures, subtree() returns every block below
+// a block, each before its parent, or nothing while one of them is in use.
 void testSubtreeThroughChurn() {
   constexpr uint32_t steps = 1000;
   test::TestKvStorage storage(steps, 100, 1);
@@ -506,9 +502,8 @@ void testDiskTierTransitions() {
           "erasing both tiers leaked a page or a copy");
 }
 
-// Publishing the content of a disk-only block gives it the writer's page. A
-// poisoned block matches nothing, leaves with its last user, and takes a
-// poisoned parent with it once the subtree is gone.
+// A disk-only block whose content is published takes the writer's page; a poisoned block matches
+// nothing and leaves with its last user, taking a poisoned parent once its subtree is gone.
 void testDiskOnlyAdoptionAndPoison() {
   test::TestKvStorage storage(8, 100, 1);
   KvPool pool(storage, 8);
@@ -565,9 +560,8 @@ void testDiskOnlyAdoptionAndPoison() {
           "a poisoned parent outlived its subtree");
 }
 
-// A block is matchable while find() can return it: in the graph and not
-// poisoned. A poisoned block its user still holds is in the graph but no
-// longer matchable.
+// A block is matchable while find() can return it; a poisoned block its user still holds stays in
+// the graph but is not matchable.
 void testMatchableExcludesPoisonedBlocks() {
   test::TestKvStorage storage(8, 100, 1);
   KvPool pool(storage, 8);
@@ -592,11 +586,8 @@ void testMatchableExcludesPoisonedBlocks() {
 }
 
 
-// A cache whose requests may spill: a request's reference to a page marks
-// the block on it held, from its insertion on, until the last one goes; a
-// held block is in no order, so neither RAM reclaim nor quota takes it or
-// its copy. Without a spill policy nothing is held and quota strips a copy
-// requests still read through their pages, as it always has.
+// With spilling, a block a request's page reference holds is in no order, so neither RAM reclaim
+// nor quota takes it or its copy; without a spill policy nothing is held.
 void testRequestsHoldTheirBlocks() {
   for (const bool spill : {true, false}) {
     test::TestKvStorage storage(8, 100, 1, 10);
@@ -633,11 +624,8 @@ void testRequestsHoldTheirBlocks() {
   }
 }
 
-// A block's page moves to the other form with its holders' references: a
-// spilled block keeps its index in RAM and its K/V in its copy alone, which
-// it cannot give up and quota takes only with the block, from a leaf; it is
-// a RAM leaf like any other, whose page frees at once. Back on a Full page
-// its copy is redundant again.
+// A spilled block keeps its index in RAM and its K/V only in its copy, which quota takes only with
+// the block; back on a Full page its copy is redundant again.
 void testSpilledBlocksTakeTheirPagesForm() {
   test::TestKvStorage storage(16, 100, 4, 10);
   KvPool pool(storage, 4);
@@ -673,15 +661,8 @@ void testSpilledBlocksTakeTheirPagesForm() {
   cache.checkInvariants();
 }
 
-// A block's page moves to the Slim form of a windowed layout with its
-// holders' references, and the block keeps its K/V there: its copy is
-// redundant as a Full page's is. A copy holds what the page held when it
-// was written (copyForm): one of the Full page it had before holds more and
-// stays its copy, one written from the Slim page holds that, a disk-only
-// block keeps it, and so does one an earlier process left. A writer that
-// computes such a block again gives it a Full page, beside which a copy of
-// the Slim page holds less and goes: whatever copy a block keeps holds what
-// its page does, should the page leave.
+// A block on a Slim page keeps its K/V there, and its copy holds what its page held when written;
+// a writer's Full page drops a copy of the Slim page, which holds less.
 void testSlimBlocksKeepWhatTheirCopiesHold() {
   test::TestKvStorage storage(16, 100, 4, 0, 30);
   KvPool pool(storage, 4);
@@ -737,13 +718,8 @@ void testSlimBlocksKeepWhatTheirCopiesHold() {
   next.checkInvariants();
 }
 
-// With a window of three pages, a state pins its tail, the three blocks
-// that end at its block, in a walk of three rather than the whole chain:
-// states two blocks apart pin five blocks, removing one unpins what only
-// its tail held, and a Full block no tail holds waits as a trim candidate.
-// A block on a Slim page takes a writer's Full page, and its tail is Full
-// again, unless a transfer moves its own: a copy of the Slim page goes, and
-// one of the Full page before stays as another command's K/V.
+// With a window of three pages a state pins only the three blocks ending at it; a Slim block takes
+// a writer's Full page, making its tail Full again, unless a write is reading it.
 void testStateTailsPinBoundedWindows() {
   test::TestKvStorage storage(32, 100, 4, 0, 30);
   KvPool pool(storage, 4);
@@ -763,12 +739,14 @@ void testStateTailsPinBoundedWindows() {
   };
   cache.countState(chain[9], true, false);
   cache.countState(chain[7], true, false);
-  require(cache.pinnedBlocks() == 5 && cache.windowPinned(chain[5]) && !cache.windowPinned(chain[4]) &&
+  require(cache.pinnedBlocks() == 5 &&
               candidates() == std::vector<uint64_t>(chain.begin(), chain.begin() + 5),
           "two states two blocks apart did not pin five blocks, or the rest were no trim candidates");
   cache.countState(chain[9], false, false);
-  require(cache.pinnedBlocks() == 3 && !cache.windowPinned(chain[8]) && cache.windowPinned(chain[7]) &&
-              candidates().size() == 7 && cache.tailFull(chain[7]),
+  require(cache.pinnedBlocks() == 3 &&
+              candidates() == std::vector<uint64_t>{chain[0], chain[1], chain[2], chain[3],
+                                                    chain[4], chain[8], chain[9]} &&
+              cache.tailFull(chain[7]),
           "a state's removal did not unpin what its tail alone held");
   cache.checkInvariants();
 
@@ -796,13 +774,8 @@ void testStateTailsPinBoundedWindows() {
   cache.checkInvariants();
 }
 
-// A writer moves onto its block's page while a write reads it, whose bytes
-// are final, and keeps its own while a restore fills it. A disk-only block
-// that adopts the writer's page keeps its copy, which holds what another
-// command computed: the block's K/V has no copy until one of the page
-// replaces it, or the page goes and the copy holds the block's only K/V.
-// No request reads that copy, so it is no active KV, and quota may take it
-// beside the page the writer holds.
+// A writer moves onto its block's page while a write reads it and keeps its own while a restore
+// fills it; an adopted disk-only block's copy of another command's K/V is no active KV.
 void testWritersAndTheContentOfABlock() {
   for (const bool spill : {true, false}) {
     test::TestKvStorage storage(8, 100, 1, 10);
@@ -851,13 +824,8 @@ void testWritersAndTheContentOfABlock() {
   }
 }
 
-// A poisoned block that requests hold keeps its copy, which they may still
-// read; it leaves with the block once the last of them lets go. A block
-// written once more after its copy went counts as written again. A reader
-// holds a copy while a request holds its block; one that outlives the
-// holders, as a command's cut does while the engine applies its results,
-// keeps the slot of a block that left until it lets go, and the invariants
-// find it while the block stays.
+// A copy leaves with its block once the last request holding it lets go; a reader that outlives
+// them, as a command's cut does, keeps the slot until it lets go.
 void testCopiesLeaveWithTheirBlocks() {
   test::TestKvStorage storage(8, 100, 1, 10);
   KvPool pool(storage, 8);
