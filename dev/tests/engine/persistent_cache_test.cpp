@@ -1369,7 +1369,7 @@ void testCopiesFollowDemandNotAWindow() {
           "a point was not copied ahead on the memory's demand");
 }
 
-// Copy demand weighs only cache that goes at once without a write: one byte beyond it copies a
+// Copy demand counts only cache that goes at once without a write: one byte beyond it copies a
 // point.
 void testCopyDemandCountsOnlyWhatGoesAtOnce() {
   constexpr double kDelay = WriteBehind::kDelayMilliseconds;
