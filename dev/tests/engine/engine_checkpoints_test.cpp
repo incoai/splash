@@ -274,7 +274,7 @@ void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
               resources.lookup(prompt, {}).resumeBoundary() == 17984,
           "pinned recovery point was overwritten or blocked ordinary publication");
   pinned = {};
-  require(resources.reclaimOneState(StateClass::Ordinary, false) &&
+  require(test::took(test::stateStep(resources)) &&
               resources.snapshot().stateCache.checkpointEntries == 0 &&
               resources.lookup(prompt, {}).resumeBoundary() == 17984,
           "released recovery pin did not rejoin the lower-priority queue");
@@ -780,8 +780,7 @@ void testKeptCheckpointGoesFirstUnderPressure() {
     return prompt;
   };
   const std::vector<uint32_t> first = keep(2, 28);
-  require(resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse)
-                  .madeProgress &&
+  require(test::took(test::evictStep(resources)) &&
               resources.snapshot().stateCache.checkpointEvictions == 1 &&
               resources.snapshot().stateCache.entries == 2 &&
               resources.lookup(hot, {}).resumeBoundary() == 64 &&

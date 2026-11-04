@@ -146,14 +146,14 @@ struct Process final {
   }
 
   // Everything leaves RAM: each state is written as it goes, and each KV
-  // leaf a state needs is demoted, landing before the next step.
+  // leaf a state needs is demoted, landing before the next step. Memory
+  // reclaims: a windowed cache's page need would trim first.
   void writeEverything() {
     for (;;) {
-      const CacheReclaimResult step =
-          cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
+      const FreeResult step = test::releaseStep(cache);
       tier.complete();
       const bool landed = cache.pollTransfers();
-      if (!step.madeProgress && !landed)
+      if (!test::took(step) && !landed)
         return;
     }
   }
@@ -189,9 +189,8 @@ std::vector<uint32_t> promptOf(uint32_t seed, uint32_t pages) {
 // needs are written out, and nothing of it stays in RAM.
 void runShortOfMemory(Process &process) {
   process.publish(process.cachePrompt(900, promptOf(9000, 1))[0]);
-  require(process.cache.reclaimOneState(StateClass::Ordinary, false) &&
-              process.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary)
-                  .madeProgress,
+  require(test::took(test::stateStep(process.cache)) &&
+              test::took(test::evictStep(process.cache, ReclaimClass::Ordinary)),
           "memory did not run short");
   process.tier.complete();
   require(process.cache.pollTransfers() && process.tier.demotions == 1 &&
@@ -606,7 +605,7 @@ void testPointKeepsItsChainWhileItsStateIsWritten() {
   process.cache.checkInvariants();
   process.shelf->capacity = 1;
   require(keep(chain[3]) == PersistStatus::Started && process.tier.slots == 4 &&
-              process.cache.reclaimOneState(StateClass::Ordinary, false) &&
+              test::took(test::stateStep(process.cache)) &&
               !process.cache.stateResident(chain[3]),
           "the deeper point did not reach the tier and leave RAM");
   // The deeper point, on disk alone, gives way to the next one.
@@ -643,8 +642,7 @@ void testPointGivenUpForItselfIsRefused() {
   // The state is written, and the two leaves under it are demoted: the
   // chain is two resident pages without copies over two disk-only blocks.
   while (process.tier.slots < 2) {
-    require(process.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse)
-                .madeProgress,
+    require(test::took(test::evictStep(process.cache)),
             "the point did not leave RAM");
     process.tier.complete();
     static_cast<void>(process.cache.pollTransfers());
@@ -683,13 +681,15 @@ void testPersistingStateStaysInRam() {
   require(process.cache.persist(block) == PersistStatus::Started, "the point was not written");
   process.tier.complete();
   static_cast<void>(process.cache.pollTransfers());
-  static_cast<void>(process.cache.reclaimOne(CacheReclaimMode::ReusePages, ReclaimClass::InUse));
+  const auto scan = [&] {
+    return test::took(test::takeStep(process.cache, test::kInServiceGrowth, {.hostRefused = true, .pages = 1}));
+  };
+  static_cast<void>(scan());
   require(process.cache.stateResident(block), "a page scan freed a state its write still read");
   process.shelf->ready = true;
   static_cast<void>(process.cache.pollTransfers());
   require(process.cache.persist(block) == PersistStatus::Durable &&
-              process.cache.reclaimOne(CacheReclaimMode::ReusePages, ReclaimClass::InUse)
-                  .madeProgress &&
+              scan() &&
               !process.cache.stateResident(block),
           "the state's RAM copy did not go once its write landed");
 }
@@ -969,11 +969,10 @@ void testCopiesWaitForWritesNeededNow() {
     process.publish(point);
     // The older state is written as it leaves RAM, and its leaf, which that
     // state needs, is demoted.
-    require(process.cache.reclaimOneState(StateClass::Ordinary, false) &&
+    require(test::took(test::stateStep(process.cache)) &&
                 process.cache.pollTransfers() && !process.cache.stateResident(demoted),
             "the older state did not leave for the SSD");
-    require(process.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary)
-                    .madeProgress &&
+    require(test::took(test::evictStep(process.cache, ReclaimClass::Ordinary)) &&
                 process.tier.demotions == 1 && process.cache.pendingPages(kv::PageForm::Full) == 1,
             "the older state's leaf was not demoted");
     require(process.cache.persist(point) == PersistStatus::Busy && process.tier.demotions == 1 &&
@@ -1246,7 +1245,7 @@ void testRefusedDemotionTakesTheLeafBesideCopiesAhead() {
   Process process(true);
   const uint64_t leaf = process.cachePrompt(1, promptOf(1000, 1))[0];
   process.publish(leaf);
-  require(process.cache.reclaimOneState(StateClass::Ordinary, false) && process.cache.pollTransfers() &&
+  require(test::took(test::stateStep(process.cache)) && process.cache.pollTransfers() &&
               !process.cache.stateResident(leaf),
           "the leaf's state did not move to the SSD");
   const std::vector<uint32_t> prompt = promptOf(2000, 3);
@@ -1261,8 +1260,8 @@ void testRefusedDemotionTakesTheLeafBesideCopiesAhead() {
           "the running request's point was not copied ahead");
   process.tier.capacity = process.tier.slots;
   const uint32_t demotions = process.tier.demotions, prefix = process.cache.snapshot().pool.pagesPrefix;
-  const CacheReclaimResult step = process.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary);
-  require(step.madeProgress && process.tier.demotions == demotions &&
+  const FreeResult step = test::evictStep(process.cache, ReclaimClass::Ordinary);
+  require(test::took(step) && process.tier.demotions == demotions &&
               process.cache.snapshot().pool.pagesPrefix == prefix - 1,
           "a leaf the quota could not demote stayed beside copies ahead that return no room");
   process.tier.complete();
@@ -1307,8 +1306,10 @@ void testTemporaryPointsWaitForTheirRequests() {
     require(process.cache.pollTransfers() && writes.run(kDelay + 4, kCopiesDemanded, false) &&
                 writes.snapshot().durable == 2 && !writes.snapshot().waiting,
             "the point whose request ended did not get its copies");
-    require(process.cache.evictAll(ReclaimClass::Ordinary).madeProgress &&
-                !process.cache.transfersInFlight() && process.tier.demotions == 4 &&
+    bool reclaimed = false;
+    while (test::took(test::releaseStep(process.cache, ReclaimClass::Ordinary)))
+      reclaimed = true;
+    require(reclaimed && !process.cache.transfersInFlight() && process.tier.demotions == 4 &&
                 !process.cache.snapshot().pool.pagesPrefix &&
                 !process.cache.stateResident(used[1]) && !process.cache.stateResident(unused),
             "a reclaim wrote the copied points again or waited for a write");
@@ -1487,7 +1488,7 @@ void testCommittedPagesTakeTheSpilledChainOfAStateInRam() {
   const uint64_t point = process.cache.blockAt(1, 3 * KvCache::pageTokens);
   process.publish(point);
   process.cache.endRequest(1);
-  require(process.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary).madeProgress &&
+  require(test::took(test::evictStep(process.cache, ReclaimClass::Ordinary)) &&
               process.tier.slots == 4 && process.cache.stateResident(point),
           "the tail below the replay point did not leave RAM");
   const std::vector<uint32_t> next = promptOf(5000, 3);
@@ -1528,10 +1529,10 @@ void testAPrefixWithoutOwnCopiesHoldsBackNoSpill() {
   cache.endRequest(1);
   publish(prefixEnd);
   for (;;) {
-    const CacheReclaimResult step = cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse);
+    const FreeResult step = test::evictStep(cache);
     tier.complete();
     const bool landed = cache.pollTransfers();
-    if (!step.madeProgress && !landed)
+    if (!test::took(step) && !landed)
       break;
   }
   require(!cache.snapshot().pool.pagesPrefix, "the first conversation's prefix stayed in RAM");

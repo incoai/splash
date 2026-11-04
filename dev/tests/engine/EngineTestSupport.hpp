@@ -317,8 +317,7 @@ inline void cacheBlocksUnderDiskStates(engine::Cache &cache, uint32_t count) {
     const auto block = test::publishBlocks(cache, id, prompt, 32);
     cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer), false);
     cache.endRequest(id);
-    require(cache.reclaimOneState(engine::StateClass::Ordinary, false) && cache.pollTransfers(),
-            "state was not demoted");
+    require(took(stateStep(cache)) && cache.pollTransfers(), "state was not demoted");
   }
 }
 
@@ -328,7 +327,7 @@ inline void demoteState(engine::Cache &cache, uint64_t block) {
   auto transfer = std::make_shared<OffloadControl>();
   transfer->ready = true;
   cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer), false);
-  require(cache.reclaimOneState(engine::StateClass::Ordinary, false) && cache.pollTransfers() &&
+  require(took(stateStep(cache)) && cache.pollTransfers() &&
               cache.snapshot().stateCache.bytes == 0,
           "fixture state did not move to disk");
 }

@@ -740,9 +740,11 @@ void testFinishedConversationsLeaveAtOnce() {
       tickUntil(engine, now, [&] { return idle(engine); }, "the lane ahead did not end");
       continue;
     }
-    const CacheReclaimResult reclaimed = cache.evictAll(ReclaimClass::Ordinary);
+    const bool reclaimed = test::took(test::releaseStep(cache, ReclaimClass::Ordinary));
+    while (test::took(test::releaseStep(cache, ReclaimClass::Ordinary))) {
+    }
     const CacheSnapshot left = cache.snapshot();
-    require(reclaimed.madeProgress && !cache.transfersInFlight() && tier.demotions == writes + 64 &&
+    require(reclaimed && !cache.transfersInFlight() && tier.demotions == writes + 64 &&
                 left.kvTier.demotions == before.kvTier.demotions && !left.pool.pagesPrefix &&
                 !left.stateCache.bytes &&
                 left.stateCache.diskBytes == before.stateCache.diskBytes + 64 &&
@@ -1306,12 +1308,12 @@ void testCopiesAheadDoNotWaitForARequestARecoveryLeavesUntried() {
   demoteState(cache, test::publishBlocks(cache, 999, prefix, 64));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 2; ++written) {
-    require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
+    require(test::took(test::evictStep(cache)),
             "KV block was not written");
     tier.complete();
     require(cache.pollTransfers(), "written block did not land");
   }
-  require(cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse).madeProgress &&
+  require(test::took(test::releaseStep(cache)) &&
               storage.allocatedPages() == 0,
           "the prefix did not move to disk whole");
   // The leaves the refusal demotes, under states on the SSD.
@@ -1577,7 +1579,6 @@ void testFailedDiskRestoreKeepsShallowerState() {
 
 // A prefix whose state and KV are on disk comes back, state and pages, before the lane runs.
 void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
-  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
   test::TestKvTier tier;
@@ -1594,10 +1595,10 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
   const auto block = test::publishBlocks(cache, 999, prompt, 64);
   cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer), false);
   cache.endRequest(999);
-  require(cache.reclaimOne(reuse, ReclaimClass::InUse).evictedState && cache.pollTransfers(),
+  require(test::evictStep(cache).stateBuffers && cache.pollTransfers(),
           "state was not demoted");
   for (uint32_t written = 1; written <= 2; ++written) {
-    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
+    require(test::took(test::evictStep(cache)) && tier.demotions == written,
             "KV block was not written");
     tier.complete();
     require(cache.pollTransfers(), "written block did not land");
@@ -1751,7 +1752,6 @@ void testALaterPromptWaitsForARestoringPromptThatLeadsIt() {
 // A request that skips the cache waits for no restoring producer, and no producer plans a junction
 // for it.
 void testSkipCacheRequestDoesNotWaitForAProducer() {
-  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
   test::TestKvTier tier;
@@ -1770,16 +1770,16 @@ void testSkipCacheRequestDoesNotWaitForAProducer() {
   const auto block = test::publishBlocks(cache, 999, prompt, 64);
   cache.publishCompositeState(block, std::make_shared<OffloadState>(transfer), false);
   cache.endRequest(999);
-  require(cache.reclaimOne(reuse, ReclaimClass::InUse).evictedState && cache.pollTransfers(),
+  require(test::evictStep(cache).stateBuffers && cache.pollTransfers(),
           "state was not demoted");
   for (uint32_t written = 1; written <= 2; ++written) {
-    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
+    require(test::took(test::evictStep(cache)) && tier.demotions == written,
             "KV block was not written");
     tier.complete();
     require(cache.pollTransfers(), "written block did not land");
   }
   while (pool.snapshot().pagesAllocated)
-    require(cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse).madeProgress,
+    require(test::took(test::releaseStep(cache)),
             "an empty extent was not released");
   // Alone, with no page the budget grants, its restore fails: it skips the
   // cache from then on.
@@ -1835,7 +1835,6 @@ void testSkipCacheRequestDoesNotWaitForAProducer() {
 
 // A request whose prefix restore cannot fit alone is not probed again, and starts cold.
 void testSkipCacheCandidateIsNotProbed() {
-  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
   test::TestKvTier tier;
@@ -1851,11 +1850,11 @@ void testSkipCacheCandidateIsNotProbed() {
   demoteState(cache, test::publishBlocks(cache, 999, prompt, 64));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 2; ++written) {
-    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress, "KV block was not written");
+    require(test::took(test::evictStep(cache)), "KV block was not written");
     tier.complete();
     require(cache.pollTransfers(), "written block did not land");
   }
-  require(cache.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse).madeProgress &&
+  require(test::took(test::releaseStep(cache)) &&
               storage.allocatedPages() == 0 && cache.snapshot().kvTier.diskBlocks == 2,
           "the prefix did not move to disk whole");
   // No page can be allocated until the request starts again.
@@ -1985,7 +1984,7 @@ void testCancelledDiskPrefixStopsQueuedReads() {
   demoteState(cache, block);
   cache.endRequest(999);
   for (int page = 0; page < 4; ++page) {
-    require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
+    require(test::took(test::evictStep(cache)),
             "fixture KV did not demote");
     tier.complete();
     static_cast<void>(cache.pollTransfers());
@@ -2108,7 +2107,7 @@ void testAStartQueuedBetweenRefusalsHoldsFromTheFirst() {
   demoteState(cache, test::publishBlocks(cache, 999, prompt, 128));
   cache.endRequest(999);
   for (int page = 0; page < 4; ++page) {
-    require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
+    require(test::took(test::evictStep(cache)),
             "fixture KV did not demote");
     tier.complete();
     static_cast<void>(cache.pollTransfers());

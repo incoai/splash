@@ -355,9 +355,12 @@ private:
   }
 
   void reclaim() {
-    const CacheReclaimMode mode = std::array{CacheReclaimMode::KeepExtents, CacheReclaimMode::ReleaseExtents,
-                                             CacheReclaimMode::ReusePages}[pick(0, 2)];
-    static_cast<void>(cache_.reclaimOne(mode, chance(50) ? ReclaimClass::InUse : ReclaimClass::Ordinary));
+    // A step of in-service work's take: an eviction, a memory reclaim or a
+    // page scan's eviction.
+    const Need need = std::array{Need{.pages = 1}, Need{.bytes = 1}, Need{.hostRefused = true, .pages = 1}}[pick(0, 2)];
+    const ClaimSpec claim{.cls = ClaimClass::InService,
+                          .reach = chance(50) ? ReclaimClass::InUse : ReclaimClass::Ordinary};
+    static_cast<void>(test::takeStep(cache_, claim, need));
   }
 
   // The volume's room changes, and the quota follows it, which the state

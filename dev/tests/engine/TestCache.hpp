@@ -121,4 +121,45 @@ inline engine::FreeResult freeFromCache(engine::Cache &cache, const engine::Clai
 inline constexpr engine::ClaimSpec kInServiceGrowth{.cls = engine::ClaimClass::InService,
                                                     .reach = engine::ReclaimClass::InUse};
 
+// Whether a claim or a step took something: it is met, or it freed bytes,
+// pages or state buffers, now or as what it started lands.
+inline bool took(const engine::FreeResult &result) {
+  return result.outcome == engine::FreeOutcome::Met || result.nowBytes || result.laterBytes || result.pages ||
+         result.stateBuffers;
+}
+// One step of the cache's take for a claim (Cache::take, as
+// MemoryLedger::free makes them): its units in order, past those a claim
+// that cannot wait passes over, until one takes something. For a page or a
+// device need that is one eviction or one memory reclaim; Short when none
+// takes anything, Pending when a transfer in flight holds what it needs.
+inline engine::FreeResult takeStep(engine::Cache &cache, const engine::ClaimSpec &spec, const engine::Need &need) {
+  const engine::VictimQuery query{.claim = &spec, .need = need};
+  const bool immediate = spec.timing == engine::NeedTiming::Immediate || need.hostRefused;
+  engine::FreeResult result;
+  for (std::optional<engine::Victim> unit = cache.peek(query, nullptr); unit; unit = cache.peek(query, &*unit)) {
+    if (immediate && unit->later)
+      continue;
+    const engine::FreeResult taken = cache.take(query, *unit);
+    if (took(taken))
+      return taken;
+    if (taken.outcome == engine::FreeOutcome::Pending)
+      result.outcome = engine::FreeOutcome::Pending;
+  }
+  return result;
+}
+// In-service work's step for a page (an eviction), for an extent's bytes
+// (a memory reclaim), of what is in use too unless `reach` says otherwise,
+// or for one state's buffers (the oldest checkpoint, else the oldest state,
+// written when the tier takes it), of ordinary states unless `reach` says
+// otherwise.
+inline engine::FreeResult evictStep(engine::Cache &cache, engine::ReclaimClass reach = engine::ReclaimClass::InUse) {
+  return takeStep(cache, {.cls = engine::ClaimClass::InService, .reach = reach}, {.pages = 1});
+}
+inline engine::FreeResult releaseStep(engine::Cache &cache, engine::ReclaimClass reach = engine::ReclaimClass::InUse) {
+  return takeStep(cache, {.cls = engine::ClaimClass::InService, .reach = reach}, {.bytes = 1});
+}
+inline engine::FreeResult stateStep(engine::Cache &cache, engine::ReclaimClass reach = engine::ReclaimClass::Ordinary) {
+  return takeStep(cache, {.cls = engine::ClaimClass::InService, .reach = reach}, {.stateBuffers = 1});
+}
+
 } // namespace splash::test

@@ -480,10 +480,25 @@ Measurement runRequest(engine::Engine &engine, Driver &driver,
   return result;
 }
 
-// One reclaim pass evicts every unpinned entry and releases the extents it
-// empties.
+// In-service work's claim of the cache (MemoryLedger::free) for `need`:
+// whether it took something.
+bool claimCache(engine::Cache &resources, const engine::Need &need) {
+  engine::MemoryLedger ledger;
+  ledger.addSource(resources);
+  const engine::ClaimId claim =
+      ledger.open({.cls = engine::ClaimClass::InService, .reach = engine::ReclaimClass::InUse});
+  const engine::FreeResult freed = ledger.free(claim, need, 0, false);
+  ledger.close(claim);
+  return freed.outcome == engine::FreeOutcome::Met || freed.nowBytes || freed.laterBytes || freed.pages ||
+         freed.stateBuffers;
+}
+
+// Claims of an extent's bytes until none takes anything: every unpinned
+// entry goes and the extents leave.
 void evictAllCache(engine::Cache &resources) {
-  static_cast<void>(resources.evictAll());
+  while (claimCache(resources, {.bytes = 1})) {
+  }
+  static_cast<void>(resources.releaseEmptyExtents(false));
   const engine::CacheSnapshot snapshot = resources.snapshot();
   if (snapshot.stateCache.entries || snapshot.pool.pagesPrefix)
     throw std::logic_error("native benchmark cache did not drain");
@@ -492,7 +507,7 @@ void evictAllCache(engine::Cache &resources) {
 // Evicts every cached state, one at a time, and leaves the KV graph intact.
 void evictAllCompositeState(engine::Cache &resources) {
   while (resources.snapshot().stateCache.entries) {
-    if (!resources.reclaimStateForLane(engine::ReclaimClass::InUse).madeProgress)
+    if (!claimCache(resources, {.stateBuffers = 1}))
       throw std::logic_error("native benchmark state cache made no progress");
   }
 }

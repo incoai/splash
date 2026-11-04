@@ -697,7 +697,7 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
       const FreeOutcome outcome = !run->covered ? (landing ? FreeOutcome::Pending : FreeOutcome::Short)
                                   : alone        ? taken.outcome
                                                  : FreeOutcome::Pending;
-      result = {outcome, plus(result.nowBytes, taken.nowBytes), taken.laterBytes};
+      result = {outcome, plus(result.nowBytes, taken.nowBytes), taken.laterBytes, run->pages, run->buffers};
     } else {
       // Short only by the room waiting claims ranked above it hold, it waits
       // for them and takes nothing: Short would end a lone lane as if at its

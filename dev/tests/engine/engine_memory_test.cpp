@@ -1713,7 +1713,7 @@ void testRefusedStartKeepsItsLeaseWhileMemoryIsPending() {
       test::publishBlocks(resources, 999, std::vector<uint32_t>(64, 9), 64),
       std::make_shared<OffloadState>(write), false);
   resources.endRequest(999);
-  require(resources.reclaimOneState(StateClass::Ordinary, false) &&
+  require(test::took(test::stateStep(resources)) &&
               resources.snapshot().stateCache.bytes == 0,
           "the fixture state was not written");
   double now = 1;
@@ -2875,7 +2875,7 @@ void testLongDecodePreemptionPlansTheCurrentReplayBoundary() {
   constexpr uint32_t retainedKvTokens = 6144;
   while (resources.snapshot().pool.pagesPrefix >
          retainedKvTokens / KvCache::pageTokens) {
-    require(resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
+    require(test::took(test::evictStep(resources)),
             "could not reclaim the suspended decode's KV tail");
   }
   {
@@ -3004,8 +3004,7 @@ struct LostReplayPoint {
                 resources.snapshot().stateCache.entries == 0,
             "the decode was not suspended without its point");
     // Its KV goes too, and so do the extents it held.
-    while (resources.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse)
-               .madeProgress) {
+    while (test::took(test::releaseStep(resources))) {
     }
     require(resources.snapshot().pool.pagesPrefix == 0 && pool.snapshot().pagesAllocated == 0,
             "the suspended lane's KV stayed");
@@ -3537,7 +3536,7 @@ struct ScatteredPages {
     }
     static_cast<void>(cache.lookup(prompt(1000, 97), {}));
     for (uint32_t victim = 0; victim < 4; ++victim) {
-      require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
+      require(test::took(test::evictStep(cache)),
               "the second prompt was not evicted");
     }
   }
@@ -4423,7 +4422,7 @@ void testRefusedRestoreClosesAdmission() {
     demoteState(cache, test::publishBlocks(cache, 999, prompt, 64));
     cache.endRequest(999);
     for (uint32_t written = 1; written <= 2; ++written) {
-      require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
+      require(test::took(test::evictStep(cache)),
               "KV block was not written");
       tier.complete();
       require(cache.pollTransfers(), "written block did not land");
@@ -4553,7 +4552,6 @@ void testAHigherPriorityThatWaitsLeavesACommandItsPasses() {
 
 // A lane whose pages keep landing is never failed for waiting: the resource limit measures time without progress.
 void testWaitWithProgressOutlivesTheResourceLimit() {
-  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvStorage storage(12, 4096, 4);
   storage.budgetPages = 8;
   KvPool pool(storage, 0);
@@ -4572,7 +4570,7 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
   demoteState(cache, test::publishBlocks(cache, 999, prompt, 96));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 3; ++written) {
-    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
+    require(test::took(test::evictStep(cache)) && tier.demotions == written,
             "prefix block was not written");
     tier.complete();
     require(cache.pollTransfers(), "prefix block did not land");
@@ -4587,7 +4585,7 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
     cache.publishCompositeState(test::publishBlocks(cache, id, filler, 32),
                                 std::make_shared<OffloadState>(transfer), false);
     cache.endRequest(id);
-    require(cache.reclaimOneState(StateClass::Ordinary, false) && cache.pollTransfers(),
+    require(test::took(test::stateStep(cache)) && cache.pollTransfers(),
             "filler state was not demoted");
   }
   require(pool.freePageCount() == 2, "fixture pages are off");
@@ -4616,7 +4614,6 @@ void testWaitWithProgressOutlivesTheResourceLimit() {
 // An admission rolled back in the same pass is no progress: the request fails at the limit of its first refused
 // attempt.
 void testRolledBackAdmissionKeepsItsWaitLimit() {
-  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvStorage storage(12, 4096, 4);
   storage.budgetPages = 8;
   KvPool pool(storage, 0);
@@ -4634,7 +4631,7 @@ void testRolledBackAdmissionKeepsItsWaitLimit() {
   demoteState(cache, test::publishBlocks(cache, 999, prompt, 96));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 3; ++written) {
-    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
+    require(test::took(test::evictStep(cache)) && tier.demotions == written,
             "prefix block was not written");
     tier.complete();
     require(cache.pollTransfers(), "prefix block did not land");
@@ -4649,7 +4646,7 @@ void testRolledBackAdmissionKeepsItsWaitLimit() {
     cache.publishCompositeState(test::publishBlocks(cache, id, filler, 32),
                                 std::make_shared<OffloadState>(transfer), false);
     cache.endRequest(id);
-    require(cache.reclaimOneState(StateClass::Ordinary, true) && cache.pollTransfers(),
+    require(test::took(test::stateStep(cache)) && cache.pollTransfers(),
             "filler state was not demoted");
   }
   require(pool.freePageCount() == 2, "fixture pages are off");
@@ -4674,7 +4671,6 @@ void testRolledBackAdmissionKeepsItsWaitLimit() {
 
 // A wait limit that landed pages pushed past, until the next attempt, is no wake-up: tick() does not act on it.
 void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
-  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvStorage storage(16, 4096, 2);
   storage.budgetPages = 14;
   KvPool pool(storage, 0);
@@ -4694,7 +4690,7 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
   demoteState(cache, test::publishBlocks(cache, 999, prompt, 256));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 8; ++written) {
-    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
+    require(test::took(test::evictStep(cache)) && tier.demotions == written,
             "prefix block was not written");
     tier.complete();
     require(cache.pollTransfers(), "prefix block did not land");
@@ -4709,7 +4705,7 @@ void testLimitOutlivedByProgressDoesNotWakeTheLoop() {
     cache.publishCompositeState(test::publishBlocks(cache, id, filler, 32),
                                 std::make_shared<OffloadState>(transfer), false);
     cache.endRequest(id);
-    require(cache.reclaimOneState(StateClass::Ordinary, false) && cache.pollTransfers(),
+    require(test::took(test::stateStep(cache)) && cache.pollTransfers(),
             "filler state was not demoted");
   }
   EngineRequest running = request(1, std::vector<uint32_t>(33, 5));
@@ -4824,7 +4820,6 @@ void testLaneAdmittedBeforeASuspensionHoldsTheWaitOpen() {
 // A restoring lane whose pages are all held by a resident lane waits for
 // that lane instead of giving up its prefix or failing for capacity.
 void testRestoringLaneWaitsForResidentLanes() {
-  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvStorage storage(12, 4096, 4);
   storage.budgetPages = 8;
   KvPool pool(storage, 0);
@@ -4842,7 +4837,7 @@ void testRestoringLaneWaitsForResidentLanes() {
   demoteState(cache, test::publishBlocks(cache, 999, prompt, 64));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 2; ++written) {
-    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
+    require(test::took(test::evictStep(cache)) && tier.demotions == written,
             "block was not written");
     tier.complete();
     require(cache.pollTransfers(), "block did not land");
@@ -4876,7 +4871,6 @@ void testRestoringLaneWaitsForResidentLanes() {
 
 // A restore completes beside a tool-using lane that keeps the model busy every tick.
 void testRestoreCompletesWhileAConstrainedLaneDecodes() {
-  constexpr auto reuse = CacheReclaimMode::KeepExtents;
   test::TestKvStorage storage(128, 4096, 4);
   KvPool pool(storage, 0);
   test::TestKvTier tier;
@@ -4893,7 +4887,7 @@ void testRestoreCompletesWhileAConstrainedLaneDecodes() {
   demoteState(cache, test::publishBlocks(cache, 999, prompt, 64));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 2; ++written) {
-    require(cache.reclaimOne(reuse, ReclaimClass::InUse).madeProgress && tier.demotions == written,
+    require(test::took(test::evictStep(cache)) && tier.demotions == written,
             "block was not written");
     tier.complete();
     require(cache.pollTransfers(), "block did not land");
@@ -5078,15 +5072,14 @@ void testResumedLaneKeepsThePromptReplayPoint() {
   require(idle(engine), "the resumed lane did not finish");
   // The first state reclaim takes is the history's checkpoint.
   while (resources.snapshot().stateCache.entries == 3) {
-    require(resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
+    require(test::took(test::evictStep(resources)),
             "the cache could not be reclaimed");
   }
   require(resources.snapshot().stateCache.checkpointEntries == 0 &&
               resources.probe(history, {}).cachedTokens() == 32,
           "the history's point outlasted the prompt's");
   // A shrink that keeps the resume point keeps the prompt's point.
-  while (resources.reclaimOne(CacheReclaimMode::ReleaseExtents, ReclaimClass::InUse, true)
-             .madeProgress) {
+  while (test::took(test::takeStep(resources, {.cls = ClaimClass::Host}, {.bytes = 1}))) {
   }
   // The next turn keeps the text before the generation prompt.
   std::vector<uint32_t> next(35, static_cast<uint32_t>(id));
@@ -5151,7 +5144,7 @@ void testRestoredHistoryCheckpointStaysDisposable() {
           "the lane did not resume from its history's checkpoint, or made it ordinary");
   const uint32_t entries = resources.snapshot().stateCache.entries;
   while (resources.snapshot().stateCache.entries == entries) {
-    require(resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
+    require(test::took(test::evictStep(resources)),
             "the cache could not be reclaimed");
   }
   require(resources.snapshot().stateCache.checkpointEntries == 0 &&
@@ -5276,8 +5269,7 @@ void testHeldBackStartTakesNothingInUse() {
       demoteState(resources, test::publishBlocks(resources, 999, held, 64));
       resources.endRequest(999);
       for (uint32_t written = 1; written <= 2; ++written) {
-        require(resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse)
-                        .madeProgress &&
+        require(test::took(test::evictStep(resources)) &&
                     tier.demotions == written,
                 "block was not written");
         tier.complete();
@@ -5293,8 +5285,7 @@ void testHeldBackStartTakesNothingInUse() {
     tickUntil(engine, now, [&] { return events.outputs[1].size() >= 2; },
               "the running request did not decode");
     // Nothing but what is in use is left to reclaim.
-    while (resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary)
-               .madeProgress) {
+    while (test::took(test::evictStep(resources, ReclaimClass::Ordinary))) {
     }
     // The one state in RAM is the running request's replay point.
     require(resources.snapshot().stateCache.inUse == 1 &&
@@ -5354,8 +5345,7 @@ void testLaneThatWouldYieldTakesNothingInUse() {
             "the conversation did not decode");
   require(resources.snapshot().stateCache.inUse == 1,
           "the decode did not use its replay point");
-  while (resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary)
-             .madeProgress) {
+  while (test::took(test::evictStep(resources, ReclaimClass::Ordinary))) {
   }
   storage.growthBlocked = true;
   engine.submit(request(2, std::vector<uint32_t>(65, 2)));
@@ -5636,7 +5626,7 @@ struct Store {
 // A copy ahead of the leaf a refusal would free holds it back as a demotion does; a host-refused need waits for no
 // copy and is short instead.
 void testCopyAheadOfALeafHoldsARefusalBack() {
-  for (const CacheReclaimMode mode : {CacheReclaimMode::KeepExtents, CacheReclaimMode::ReusePages}) {
+  for (const bool hostRefused : {false, true}) {
     test::TestKvStorage storage(4, 100, 1);
     KvPool pool(storage, 0);
     test::TestKvTier tier;
@@ -5663,12 +5653,11 @@ void testCopyAheadOfALeafHoldsARefusalBack() {
             "the fixture's copies did not start");
     const uint32_t pages = pool.freePageCount() + 1;
     // A page scan is the need of a refusal the host refused.
-    const Need need{.hostRefused = mode == CacheReclaimMode::ReusePages, .pages = pages};
+    const Need need{.hostRefused = hostRefused, .pages = pages};
     FreeResult refused;
     do
       refused = test::freeFromCache(cache, test::kInServiceGrowth, need);
     while (refused.outcome == FreeOutcome::Met);
-    const bool hostRefused = mode == CacheReclaimMode::ReusePages;
     require(refused.outcome == (hostRefused ? FreeOutcome::Short : FreeOutcome::Pending) &&
                 (hostRefused || !cache.stateResident(leaf)) && cache.stateResident(used) &&
                 !cache.snapshot().stateCache.inUseEvictions && pool.snapshot().pagesPrefix == 2 &&
@@ -5688,8 +5677,7 @@ void testCaptureKvPastABoundaryTakesNothingInUse() {
   StoreFixture fixture(2, 1);
   Executor &executor = fixture.executor;
   engine::Engine &engine = fixture.engine;
-  while (fixture.resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary)
-             .madeProgress) {
+  while (test::took(test::evictStep(fixture.resources, ReclaimClass::Ordinary))) {
   }
   static_cast<void>(fixture.resources.releaseEmptyExtents(false));
   Store store(fixture.host, executor, 1);
@@ -5756,8 +5744,7 @@ void testReplayPointTakesTheExpertStoreBeforeWhatIsInUse() {
   for (const bool atFloor : {false, true}) {
     StoreFixture fixture;
     Executor &executor = fixture.executor;
-    while (fixture.resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary)
-               .madeProgress) {
+    while (test::took(test::evictStep(fixture.resources, ReclaimClass::Ordinary))) {
     }
     static_cast<void>(fixture.resources.releaseEmptyExtents(false));
     Store store(fixture.host, executor, atFloor ? 0 : 2);
@@ -5811,7 +5798,7 @@ void testReplayPointCopiesCacheBeforeTheExpertStore() {
       leaf, std::make_shared<OffloadState>(transfer, executor.evictedStateBytes), false);
   cache.endRequest(1);
   // The state goes first, written to the disk; its pages stay.
-  require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary).madeProgress,
+  require(test::took(test::evictStep(cache, ReclaimClass::Ordinary)),
           "the fixture's state did not go");
   static_cast<void>(cache.pollTransfers());
   require(!cache.stateResident(leaf) && pool.snapshot().pagesPrefix != 0 && tier.demotions == 0,

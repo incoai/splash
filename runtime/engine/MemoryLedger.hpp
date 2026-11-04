@@ -122,9 +122,9 @@ struct FreeResult final {
   FreeOutcome outcome = FreeOutcome::Short;
   uint64_t nowBytes = 0;     // left memory now (extents, chunks, buffers)
   uint64_t laterBytes = 0;   // leave memory when transfers it started land
-  // A stepwise unit's step (Victim::stepwise): the free KV pages of the
-  // need's form it gave, now or as its transfers land, and the pooled state
-  // buffers it freed.
+  // The free KV pages of the need's form it gave, now or as its transfers
+  // land, and the pooled state buffers it freed: a stepwise unit's step
+  // (Victim::stepwise), and free()'s units.
   uint32_t pages = 0;
   uint32_t stateBuffers = 0;
 };

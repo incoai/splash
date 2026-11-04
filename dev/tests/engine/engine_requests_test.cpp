@@ -244,7 +244,8 @@ void testSharedPrefillEvictedPublicationFallsBack() {
   static_cast<void>(tickAt(h, 1));
   // The producer's replay point is in use, so pressure takes it, not an
   // ordinary publication.
-  static_cast<void>(cache.evictAll());
+  while (test::took(test::releaseStep(cache))) {
+  }
   require(cache.snapshot().stateCache.entries == 0,
           "published shared prefix was pinned against pressure reclamation");
   h.runUntilIdle();
@@ -421,7 +422,7 @@ void testLateSiblingBoundaryNeedsAWholeDraftWindow() {
   h.runUntilIdle();
   engine.submit(request(2, branch(6400, 900'000)));
   h.runUntilIdle();
-  require(resources.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress &&
+  require(test::took(test::evictStep(resources)) &&
               resources.snapshot().stateCache.checkpointEntries == 0,
           "the other conversation's checkpoint was not evicted");
   engine.submit(request(3, prompt));
@@ -629,7 +630,7 @@ void testColdPublishesReplayStateAndRebuildsALostOne() {
   require(events.starts.size() == 1 && events.starts[0] == 0,
           "cold request reported a cache hit");
 
-  require(resources.reclaimStateForLane(ReclaimClass::InUse).madeProgress,
+  require(test::took(test::stateStep(resources, ReclaimClass::InUse)),
           "test could not remove the latest replay state");
   engine.submit(request(2, prompt));
   h.runUntilIdle();
