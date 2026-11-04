@@ -488,11 +488,13 @@ MemoryLedger::Run MemoryLedger::bound(const ClaimSpec &spec, const VictimQuery &
 // something its source is peeked again from its head; a unit whose take
 // frees nothing is passed over: a transfer in flight may hold it (pending),
 // or nothing of it is left. A claim that can wait takes nothing of a later
-// stage than a pending unit's: it waits for that transfer, as the cache's
-// units come before the store's and what is in use. Every take frees
-// something of a finite cache or pool, or passes one of a source's finitely
-// many units, so the walk ends. A unit's state buffers count for a need of
-// bytes as in bound(). An Immediate claim passes over what lands later.
+// stage than a pending unit's, unless its takes started transfers of that
+// source: it waits for the transfer, as the cache's units come before the
+// store's and what is in use; what its own transfers return it counts. Every take frees
+// something of a finite cache or pool, or passes one of a source's
+// finitely many units, so the walk ends. A unit's state buffers count for
+// a need of bytes as in bound(). An Immediate claim passes over what lands
+// later.
 MemoryLedger::Run MemoryLedger::take(const ClaimSpec &spec, const VictimQuery &query, const Lacking &lack) {
   Order order(*this, spec, query);
   Run run{.freed = {.outcome = FreeOutcome::Met}};
@@ -500,8 +502,10 @@ MemoryLedger::Run MemoryLedger::take(const ClaimSpec &spec, const VictimQuery &q
     return lack.meets(victim) || (lack.bytes && victim.stateBuffers);
   };
   // A claim that can wait waits for what a transfer in flight returns of a
-  // unit before it takes a unit of a later stage.
+  // unit before it takes a unit of a later stage, unless it started
+  // transfers of that source itself: what they return it counts already.
   int ceiling = std::numeric_limits<int>::max();
+  std::vector<bool> started(order.heads.size());
   while (!lack.none() && !lack.covered(run.bytes, run.pages, run.buffers)) {
     Order::Head *best = nullptr;
     for (Order::Head &head : order.heads) {
@@ -542,7 +546,8 @@ MemoryLedger::Run MemoryLedger::take(const ClaimSpec &spec, const VictimQuery &q
     if (!took) {
       if (taken.outcome == FreeOutcome::Pending && !order.immediate) {
         run.pending = true;
-        ceiling = std::min(ceiling, Order::stage(*best));
+        if (!started[static_cast<size_t>(best - order.heads.data())])
+          ceiling = std::min(ceiling, Order::stage(*best));
       }
       order.pass(*best);
       continue;
@@ -558,6 +563,8 @@ MemoryLedger::Run MemoryLedger::take(const ClaimSpec &spec, const VictimQuery &q
     run.pages += taken.pages;
     run.buffers += taken.stateBuffers;
     run.costly = run.costly || Order::stage(*best) >= Order::kCostlyStage;
+    if (taken.laterBytes || taken.outcome == FreeOutcome::Pending)
+      started[static_cast<size_t>(best - order.heads.data())] = true;
     if (!run.took.empty() && run.took.back().source == best->source && run.took.back().pool == best->pool &&
         run.took.back().unit.key == unit.key)
       run.took.back().bytes = plus(run.took.back().bytes, plus(taken.nowBytes, taken.laterBytes));

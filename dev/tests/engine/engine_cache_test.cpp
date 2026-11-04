@@ -5838,10 +5838,29 @@ void testDeviceUnitWeighsWhatItsDemotionsReturn() {
   require(cache.releaseEmptyExtents(true) == 100, "the extent the landed page completed was not released");
 }
 
-// A claim that can wait takes the cache that frees now before it waits for a write, within the one
-// recency order: a newer copied leaf meets an extent's need while an older leaf a state on the SSD
-// needs, without a copy, stays; only the next extent's need demotes it.
-void testCopiedCacheGoesBeforeAWrite() {
+// One unit of 100 bytes above an empty floor: a pool that costs only its rebuild (an idle vision
+// arena) or one the lanes read through (the expert store).
+class UnitPool final : public model::ElasticPool {
+public:
+  explicit UnitPool(bool rebuildOnly) : rebuildOnly_(rebuildOnly) {}
+  [[nodiscard]] model::PoolState state() const override {
+    return {.name = "unit", .currentBytes = units * 100, .capBytes = 100, .releaseUnitBytes = units ? 100u : 0u,
+            .rebuildOnly = rebuildOnly_};
+  }
+  [[nodiscard]] uint64_t release(uint64_t) override { return std::exchange(units, 0) * 100; }
+  [[nodiscard]] metal::AllocationResult grow(const metal::AllocationAdmission &) override { return {}; }
+  uint64_t units = 1;
+
+private:
+  bool rebuildOnly_;
+};
+
+// A claim that can wait takes the units in the one order: the cache that frees now before it waits
+// for a write, within the one recency order, then a pool that costs only its rebuild, then the
+// store. A newer copied leaf meets an extent's need while an older leaf a state on the SSD needs,
+// without a copy, stays; a need of three extents then demotes it and takes the arena, and the store
+// only after both.
+void testClaimTakesCopiedCacheThenWritesThenPools() {
   test::TestKvStorage storage{8, 100, 1};
   KvPool pool{storage, 1};
   test::TestKvTier tier;
@@ -5853,21 +5872,31 @@ void testCopiedCacheGoesBeforeAWrite() {
   const uint64_t older = cacheConversation(cache, 1, 1, std::make_shared<TieredState>(control));
   const uint64_t newer = cacheConversation(cache, 2, 1, std::make_shared<TieredState>(control));
   for (int state = 0; state < 2; ++state)
-    require(test::freeFromCache(cache, test::kInServiceGrowth, {.stateBuffers = 1}).outcome == FreeOutcome::Met &&
-                cache.pollTransfers(),
-            "a state was not written to the SSD");
+    require(test::took(test::stateStep(cache)) && cache.pollTransfers(), "a state was not written to the SSD");
   require(cache.persist(newer) == PersistStatus::Started, "the newer leaf was not copied ahead");
   tier.complete();
   static_cast<void>(cache.pollTransfers());
   static_cast<void>(cache.releaseEmptyExtents(false));
+  UnitPool arena(true), store(false);
+  engine::MemoryLedger ledger;
+  ledger.addSource(cache);
+  static_cast<void>(ledger.addPool(arena));
+  static_cast<void>(ledger.addPool(store));
+  const auto claim = [&](uint64_t bytes) {
+    const engine::ClaimId id = ledger.open(test::kInServiceGrowth);
+    const FreeResult freed = ledger.free(id, {.bytes = bytes}, 0, false);
+    ledger.close(id);
+    return freed;
+  };
   const auto inMemory = [&](uint64_t block) { return cache.residentChainPages({&block, 1}) != 0; };
   const uint64_t demotions = tier.demotions;
-  require(test::freeFromCache(cache, test::kInServiceGrowth, {.bytes = 100}).outcome == FreeOutcome::Met &&
-              tier.demotions == demotions && !inMemory(newer) && inMemory(older),
-          "a claim that can wait demoted the older leaf while a copied one met its need");
-  require(test::freeFromCache(cache, test::kInServiceGrowth, {.bytes = 100}).outcome == FreeOutcome::Pending &&
-              tier.demotions == demotions + 1,
-          "the next extent's need did not demote the older leaf");
+  require(claim(100).outcome == FreeOutcome::Met && tier.demotions == demotions && !inMemory(newer) &&
+              inMemory(older) && arena.units && store.units,
+          "a claim that can wait took more than the copied leaf that met its need");
+  const FreeResult freed = claim(300);
+  require(freed.outcome == FreeOutcome::Pending && tier.demotions == demotions + 1 && !arena.units && !store.units &&
+              freed.laterBytes == 100,
+          "a claim did not demote the older leaf and take the arena before the store");
   cache.checkInvariants();
 }
 
@@ -6050,7 +6079,7 @@ int main() {
     testEngineRefusedPageNeedIsADeviceNeed();
     testPageNeedReachesParentsAndLeavesUnderStates();
     testDeviceUnitWeighsWhatItsDemotionsReturn();
-    testCopiedCacheGoesBeforeAWrite();
+    testClaimTakesCopiedCacheThenWritesThenPools();
     testGrowthCountsNoStateThatNeedsAWrite();
     std::cout << "engine cache tests passed\n";
     return 0;
