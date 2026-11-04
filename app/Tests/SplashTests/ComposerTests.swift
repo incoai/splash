@@ -46,13 +46,32 @@ struct ComposerTests {
         try await waitFor(window.firstResponder === composer)
     }
 
+    /// The ring of the composer's context and the Server button's download: its fraction filled in
+    /// its tint from the top clockwise, the rest a faint track, as wide as asked.
+    @Test func aRingFillsItsFractionClockwiseFromTheTop() throws {
+        let size: CGFloat = 20, scale: CGFloat = 4
+        let renderer = ImageRenderer(content: Ring(fraction: 0.25, tint: Color.red, size: size))
+        renderer.scale = scale
+        let bitmap = NSBitmapImageRep(cgImage: try #require(renderer.cgImage))
+        #expect(bitmap.pixelsWide == Int(size * scale) && bitmap.pixelsHigh == Int(size * scale))
+        // Whether the ring is in its tint `degrees` clockwise from the top, within its stroke.
+        func tinted(_ degrees: Double) -> Bool {
+            let center = size * scale / 2, radius = center - scale / 2, angle = degrees * .pi / 180
+            let x = Int(center + radius * sin(angle)), y = Int(center - radius * cos(angle))
+            guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.sRGB) else { return false }
+            return color.alphaComponent > 0.5 && color.redComponent > 0.8 && color.greenComponent < 0.5
+        }
+        #expect(tinted(20) && tinted(45) && tinted(70))
+        #expect(!tinted(135) && !tinted(225) && !tinted(315))
+    }
+
     /// A window showing the Chat of a conversation with one exchange.
     private func chat() throws -> (AppState, NSWindow, URL) {
         let folder = FileManager.default.temporaryDirectory.appending(path: "splash-composer-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let conversation = Conversation(messages: [ChatMessage(role: .user, text: "Hi"), ChatMessage(role: .assistant, text: "Hello.")])
         try JSONEncoder().encode(conversation).write(to: folder.appending(path: "\(conversation.id.uuidString).json"))
-        let state = AppState(runtime: Showcase.runtime, chats: ChatStore(folder: folder), keychain: Keychain(service: "Splash Tests"))
+        let state = AppState.forTests(in: folder)
         state.chats.selection = conversation.id
         _ = NSApplication.shared
         let window = NSWindow(contentViewController: NSHostingController(rootView: ChatScreen().environment(state)))
@@ -80,13 +99,5 @@ struct ComposerTests {
     private static func update(_ window: NSWindow) {
         window.contentView?.layoutSubtreeIfNeeded()
         window.displayIfNeeded()
-    }
-
-    private func waitFor(_ condition: @autoclosure () -> Bool, seconds: Double = 10) async throws {
-        let deadline = ContinuousClock.now + .seconds(seconds)
-        while !condition() {
-            try #require(ContinuousClock.now < deadline, "timed out")
-            try await Task.sleep(for: .milliseconds(20))
-        }
     }
 }

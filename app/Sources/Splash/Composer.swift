@@ -140,22 +140,15 @@ private struct ContextRing: View {
     let usage: ContextUsage
 
     var body: some View {
-        ZStack {
-            Circle().stroke(.quaternary, lineWidth: 2)
-            Circle()
-                .trim(from: 0, to: usage.fraction)
-                .stroke(tint, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                .rotationEffect(.degrees(-90))
-        }
-        .frame(width: 14, height: 14)
-        // Room around the ring for the pointer to find its help.
-        .padding(5)
-        .contentShape(.rect)
-        .animation(Motion.settle, value: usage)
-        .help(usage.explanation)
-        .accessibilityElement()
-        .accessibilityLabel("Context")
-        .accessibilityValue(usage.explanation)
+        Ring(fraction: usage.fraction, tint: tint, size: 14)
+            // Room around the ring for the pointer to find its help.
+            .padding(5)
+            .contentShape(.rect)
+            .animation(Motion.settle, value: usage)
+            .help(usage.explanation)
+            .accessibilityElement()
+            .accessibilityLabel("Context")
+            .accessibilityValue(usage.explanation)
     }
 
     private var tint: AnyShapeStyle {
@@ -167,8 +160,28 @@ private struct ContextRing: View {
     }
 }
 
-/// The send and stop button: a circle in the label color, the composer's one solid element, faded
-/// as the app's controls fade while it can't be used.
+/// How full something is, as a ring that `fraction`, from 0 to 1, fills in `tint` from the top
+/// clockwise, over a faint track, `size` points across: the context in the Chat's composer
+/// (`ContextRing`), and a download in the Server's button (`ServerButton`).
+struct Ring<Tint: ShapeStyle>: View {
+    let fraction: Double
+    let tint: Tint
+    let size: CGFloat
+
+    var body: some View {
+        ZStack {
+            Circle().stroke(.quaternary, lineWidth: 2)
+            Circle()
+                .trim(from: 0, to: fraction)
+                .stroke(tint, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+        }
+        .frame(width: size, height: size)
+    }
+}
+
+/// The send and stop button: a circle, the composer's one solid element, in the mark's color, the
+/// app's one accent, while it can send or stop; gray while it can't.
 private struct InkCircle: ButtonStyle {
     @Environment(\.isEnabled) private var isEnabled
 
@@ -176,8 +189,8 @@ private struct InkCircle: ButtonStyle {
         configuration.label
             .foregroundStyle(.background)
             .frame(width: 28, height: 28)
-            .background(.primary, in: .circle)
-            .opacity(isEnabled ? (configuration.isPressed ? 0.7 : 1) : 0.4)
+            .background(isEnabled ? AnyShapeStyle(Color.splash) : AnyShapeStyle(.tertiary), in: .circle)
+            .opacity(configuration.isPressed ? 0.7 : 1)
     }
 }
 
@@ -191,16 +204,14 @@ private struct EngineSlot: View {
         let server = state.server
         let name = server.model.map(state.displayName(of:)) ?? ""
         let words = switch server.phase {
-        case .ready where server.recovering: state.status
-        case .ready: name
-        case .starting, .stopping: state.status
-        case .failed: "\(name) ran into a problem"
+        case .ready where !server.recovering: name
         case .stopped: state.installed.isEmpty ? "No model on this Mac" : "No model running"
+        default: state.status
         }
         let blocked = if case .failed = server.phase { true } else { server.phase == .stopped }
         Button { state.section = .server } label: {
             HStack(spacing: 6) {
-                StatusMark(look: state.markLook, since: server.since, size: 12)
+                StatusMark(look: state.serverStatus.look, since: server.since, size: 12)
                 Text(words).foregroundStyle(.secondary)
                 if blocked { Text("Open Server").foregroundStyle(.tint) }
             }
@@ -261,6 +272,9 @@ private struct EffortMenu: View {
     }
 }
 
+/// The images attached to a draft, each with a button that takes it off. Each has a hairline, so
+/// that a white one keeps its edge on the composer, and its button a solid disc, which stands out
+/// over any image in either appearance.
 private struct Attachments: View {
     let draft: Draft
 
@@ -275,9 +289,12 @@ private struct Attachments: View {
                                 .scaledToFill()
                                 .frame(width: 56, height: 56)
                                 .clipShape(.rect(cornerRadius: 10))
+                                .overlay { RoundedRectangle(cornerRadius: 10).strokeBorder(.separator) }
                         }
                         Button { draft.remove(at: index) } label: {
-                            Image(systemName: "xmark.circle.fill").symbolRenderingMode(.hierarchical)
+                            Image(systemName: "xmark.circle.fill")
+                                .symbolRenderingMode(.palette)
+                                .foregroundStyle(.white, .black.opacity(0.6))
                         }
                         .buttonStyle(.borderless)
                         .offset(x: 6, y: -6)
@@ -425,7 +442,7 @@ private final class MessageTextView: NSTextView {
 
     // A plain-text view turns Paste off for a clipboard of image data alone.
     override func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
-        if item.action == #selector(paste(_:)), !images(in: .general).isEmpty { return true }
+        if item.action == #selector(paste(_:)), holdsImages(.general) { return true }
         return super.validateUserInterfaceItem(item)
     }
 
@@ -436,11 +453,11 @@ private final class MessageTextView: NSTextView {
 
     // A text view takes only text it can read; images it takes here, when the model sees them.
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        images(in: sender.draggingPasteboard).isEmpty ? super.draggingEntered(sender) : .copy
+        holdsImages(sender.draggingPasteboard) ? .copy : super.draggingEntered(sender)
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        images(in: sender.draggingPasteboard).isEmpty ? super.draggingUpdated(sender) : .copy
+        holdsImages(sender.draggingPasteboard) ? .copy : super.draggingUpdated(sender)
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
@@ -455,13 +472,23 @@ private final class MessageTextView: NSTextView {
         return true
     }
 
-    /// The images `pasteboard` holds, image files too, when the model sees images; none for text
-    /// that comes with a picture of itself, as copied rich text does.
+    /// Whether `pasteboard` holds images to attach, when the model sees images: image files, or
+    /// images without text, as copied rich text comes with a picture of itself. Told by their
+    /// types alone: Paste's menu item and every move of a drag ask, so nothing is read until they
+    /// are attached.
+    private func holdsImages(_ pasteboard: NSPasteboard) -> Bool {
+        guard coordinator?.field.acceptsImages == true else { return false }
+        if pasteboard.canReadObject(forClasses: [NSURL.self], options: Self.imageFiles) { return true }
+        return pasteboard.string(forType: .string) == nil && pasteboard.canReadObject(forClasses: [NSImage.self])
+    }
+
+    /// The images `pasteboard` holds to attach (`holdsImages`), image files read.
     private func images(in pasteboard: NSPasteboard) -> [NSImage] {
-        guard coordinator?.field.acceptsImages == true else { return [] }
-        let files = (pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingContentsConformToTypes: [UTType.image.identifier]]) as? [URL]) ?? []
+        guard holdsImages(pasteboard) else { return [] }
+        let files = (pasteboard.readObjects(forClasses: [NSURL.self], options: Self.imageFiles) as? [URL]) ?? []
         if !files.isEmpty { return files.compactMap(NSImage.init(contentsOf:)) }
-        guard pasteboard.string(forType: .string) == nil else { return [] }
         return (pasteboard.readObjects(forClasses: [NSImage.self]) as? [NSImage]) ?? []
     }
+
+    private static let imageFiles: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingContentsConformToTypes: [UTType.image.identifier]]
 }

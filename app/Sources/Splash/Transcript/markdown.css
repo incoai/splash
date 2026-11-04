@@ -1,0 +1,158 @@
+/* The model's Markdown as the transcript draws it (markdown.js): text in the reading font, code
+   outlined under its language, lists with their markers in a column, tables with rules between
+   their rows, and code colored as Xcode colors it. */
+
+.markdown, .item, blockquote {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.item { gap: 10px; }
+
+.markdown p {
+  margin-block: -2.5px;
+  line-height: 24px;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+h1 { font-size: 20px; line-height: 24px; }
+h2 { font-size: 17px; line-height: 20px; }
+.markdown > * + :is(h1, h2, h3, h4, h5, h6) { margin-top: 6px; }
+
+a {
+  color: var(--link);
+  text-decoration: none;
+}
+
+/* Filled as high as the line's text reaches. */
+code {
+  padding-top: 1.5px;
+  font: 13.5px ui-monospace, monospace;
+  background: var(--fill);
+}
+
+:is(h1, h2, h3, h4, h5, h6) code {
+  font-size: calc(1em - 1.5px);
+  font-weight: inherit;
+}
+
+/* Lists: markers in a column as wide as the widest, so that the items' text lines up. */
+ul, ol {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 8px;
+  row-gap: 8px;
+  padding: 0 0 0 4px;
+  list-style: none;
+}
+
+li {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: first baseline;
+}
+
+.marker {
+  text-align: right;
+  color: var(--secondary);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
+/* Quotes, like the model's thinking, are set apart by a rule at their side. */
+blockquote, .reasoning {
+  position: relative;
+  padding-left: 14px;
+}
+
+blockquote { color: var(--secondary); }
+
+blockquote::before, .reasoning::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--tertiary);
+}
+
+hr {
+  height: 1px;
+  margin: 4px 0;
+  border: 0;
+  background: var(--separator);
+}
+
+/* Code, outlined, apart from what is said, which the user's messages show filled; the outline is
+   inside its edge, so that it takes no room. */
+figure.code {
+  overflow: hidden;
+  outline: 1px solid var(--separator);
+  outline-offset: -1px;
+  border-radius: 10px;
+}
+
+figcaption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 32px;
+  padding: 0 8px 0 14px;
+  border-bottom: 1px solid var(--separator);
+  font-size: 11px;
+  color: var(--secondary);
+  user-select: none;
+}
+
+figcaption button { font-size: 12px; line-height: 15px; }
+
+/* SF Mono's lines are as tall as AppKit sets them, 16 pt at 13. */
+pre {
+  padding: 12.5px 14px;
+  overflow-x: auto;
+  font: 13px/19px ui-monospace, monospace;
+}
+
+pre code {
+  font: inherit;
+  background: none;
+}
+
+/* Tables at the width their cells need, a cell wrapping at 320 pt, rows apart by a rule. */
+.table { overflow-x: auto; }
+
+/* Each cell draws its own rule, once, where collapsed borders would draw the translucent
+   separator twice, darker. */
+table { border-spacing: 0; }
+
+th, td {
+  padding: 8px 0;
+  vertical-align: top;
+  text-align: left;
+}
+
+th { padding-top: 0; font-weight: 600; }
+tbody tr:last-child td { padding-bottom: 0; }
+tbody td { border-top: 1px solid var(--separator); }
+:is(th, td) + :is(th, td) { padding-left: 20px; }
+:is(th, td) > div { max-width: 320px; }
+
+/* Code's colors, the system's own, after Xcode's. */
+.hljs-comment, .hljs-quote { color: var(--secondary); }
+.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-doctag { color: -apple-system-purple; }
+.hljs-string, .hljs-regexp, .hljs-template-tag, .hljs-char.escape_ { color: -apple-system-red; }
+.hljs-number, .hljs-symbol, .hljs-bullet { color: -apple-system-blue; }
+.hljs-title, .hljs-section, .hljs-selector-id, .hljs-selector-class { color: -apple-system-blue; }
+.hljs-type, .hljs-built_in, .hljs-class .hljs-title, .hljs-title.class_ { color: -apple-system-brown; }
+.hljs-attr, .hljs-attribute, .hljs-variable, .hljs-template-variable, .hljs-params, .hljs-property { color: -apple-system-orange; }
+.hljs-meta, .hljs-meta .hljs-keyword { color: -apple-system-brown; }
+.hljs-addition { color: -apple-system-green; }
+.hljs-deletion { color: -apple-system-red; }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 600; }
