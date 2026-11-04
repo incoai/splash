@@ -427,22 +427,24 @@ bool MemoryGovernor::copyDemand() const noexcept { return ledger_.copyDemand(); 
 
 bool MemoryGovernor::claimWaiting() const noexcept { return ledger_.claimWaiting(); }
 
-// The host's claim of what the pass finds, up to `target`, or of what lands,
-// which it then waits for; under macOS's critical pressure only of what it
-// finds, taken at once. free() gives back the units that cost nothing and
-// are sized only when taken (the idle state buffers) first either way. A
-// pass that freed nothing now or later is Short: it found nothing to take.
+// The host's claim of what the pass finds, up to `target`, taken at once:
+// the target is net of what lands already (HostRule::deficitBytes). Under
+// macOS's critical pressure it reaches units in use too; otherwise it may
+// take units that free later. free() gives back the units that cost nothing
+// and are sized only when taken (the idle state buffers) first either way.
+// A pass that freed nothing now or later waits (Pending) while memory lands
+// for a claim that can wait, else is Short: it found nothing to take.
 FreeResult MemoryGovernor::hostPass(uint64_t target, bool critical) {
   const ClaimSpec spec{.cls = ClaimClass::Host,
                        .reach = critical ? ReclaimClass::InUse : ReclaimClass::Ordinary,
                        .timing = critical ? NeedTiming::Immediate : NeedTiming::CanWait};
   const uint64_t found = ledger_.available(spec, {.bytes = target}, 0, critical);
-  const uint64_t landing = critical ? 0 : ledger_.returning().landingBytes;
   const ClaimId claim = ledger_.open(spec);
-  FreeResult result = ledger_.free(claim, {.bytes = std::min(target, std::max(found, landing))}, 0, critical);
+  FreeResult result = ledger_.free(claim, {.bytes = std::min(target, found)}, 0, critical);
   ledger_.close(claim);
   if (result.outcome == FreeOutcome::Met && !result.nowBytes && !result.laterBytes)
-    result.outcome = FreeOutcome::Short;
+    result.outcome = spec.timing == NeedTiming::CanWait && ledger_.returning().landingBytes ? FreeOutcome::Pending
+                                                                                            : FreeOutcome::Short;
   return result;
 }
 
@@ -504,7 +506,10 @@ bool MemoryGovernor::controlPass(double nowMilliseconds) {
     // nothing to take, since only other applications could return the rest.
     if (hostRule_.constrained())
       bandWaived_ = pass->outcome == FreeOutcome::Short;
-    if (pass->nowBytes || pass->laterBytes)
+    // A pass that waits for what lands is judged again once the host has
+    // settled too: run again at every command-free point, it reran the
+    // whole control pass each loop iteration while a landing lasted.
+    if (pass->nowBytes || pass->laterBytes || pass->outcome == FreeOutcome::Pending)
       nextHostPassMilliseconds_ = nowMilliseconds + kHostSettleMilliseconds;
   }
   return pass && pass->outcome == FreeOutcome::Pending;

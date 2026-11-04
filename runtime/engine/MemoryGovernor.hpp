@@ -264,8 +264,9 @@ public:
   // host claim frees the lesser of the margin and the deficit; then the
   // pools grow. macOS's warning alone takes nothing; it holds back growth
   // from free room and elective admission. True when the host claim waits
-  // for memory on its way back: the transport runs the pass again at the
-  // next command-free point.
+  // for memory on its way back. The transport then runs the pass again at
+  // the next command-free point, which lands transfers and grows the pools;
+  // the host claim itself is judged again once the host has settled.
   [[nodiscard]] bool controlPass(double nowMilliseconds);
   // At startup, before Ready: grows the pools into the free room, by the
   // host's rule at macOS's `pressure` now.
@@ -320,8 +321,7 @@ private:
     MemoryPressure system_ = MemoryPressure::Normal;
     bool constrained_ = true;
   };
-  // The host claim's pass: up to `target` of what it may take, or what is
-  // landing.
+  // The host claim's pass: up to `target` of what it may take.
   [[nodiscard]] FreeResult hostPass(uint64_t target, bool critical);
   // Room under the limit beside what is charged and being allocated.
   [[nodiscard]] uint64_t roomBytes() const noexcept;
@@ -370,9 +370,9 @@ private:
   // how far past the margin the band reaches. Kept, so that an admission a
   // pool's growth runs inside does not read the pool.
   uint64_t growthUnitBytes_ = 0;
-  // When the host has settled from the last pass that returned memory, and
-  // whether the last host pass in the band found nothing to take (the band's
-  // waiver).
+  // When the host has settled from the last pass that returned memory or
+  // waits for what lands, and whether the last host pass in the band found
+  // nothing to take (the band's waiver).
   double nextHostPassMilliseconds_ = 0.0;
   bool bandWaived_ = false;
   // The latest control pass's clock, or the start growth's.

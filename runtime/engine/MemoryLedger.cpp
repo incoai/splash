@@ -528,8 +528,9 @@ uint64_t MemoryLedger::takeUnsized(const VictimQuery &query) {
 }
 
 // The one rule. The units that cost nothing and cannot be sized go first.
-// Then a claim that can wait waits when what is landing, with its own lanes'
-// owed copies, meets its need (or would, but for claims ranked above it).
+// Then a claim that can wait (never the host's, whose pass's target is net
+// of what lands) waits when what is landing, with its own lanes' owed
+// copies, meets its need (or would, but for claims ranked above it).
 // Else the units the dry run reaches first that meet the rest are taken, all
 // or none, and it waits for what lands unless they meet it alone. Else it
 // waits when every copy in flight or owed would meet it. A claim refused
@@ -559,7 +560,9 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
                                 : host ? less(need.bytes, result.nowBytes)
                                        : less(plus(need.bytes, held), room);
   const uint32_t lackingPages = need.pages;
-  const bool canWait = spec.timing == NeedTiming::CanWait && !need.hostRefused;
+  // The host's claim waits for nothing that lands: its pass's target is net
+  // of it already (MemoryGovernor::controlPass).
+  const bool canWait = spec.timing == NeedTiming::CanWait && !need.hostRefused && !host;
 
   // What a claim that can wait may wait for: what lands of every transfer
   // in flight and every owed copy, and the copies its own lane owes; the
@@ -586,11 +589,9 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
   };
   // What lands and its own lanes' owed copies count before victims also in
   // part: the dry run covers only what they do not. The room held above the
-  // claim is in what it lacks already; the host's pass sizes its claim by
-  // what lands (MemoryGovernor::controlPass, hostPass).
-  const uint64_t creditBytes = host ? 0 : plus(all.landingBytes, own.owedBytes);
-  const uint64_t creditPages =
-      host ? 0 : less(uint64_t{all.landingPages[form]} + own.owedPages[form], heldPagesAbove);
+  // claim is in what it lacks already.
+  const uint64_t creditBytes = plus(all.landingBytes, own.owedBytes);
+  const uint64_t creditPages = less(uint64_t{all.landingPages[form]} + own.owedPages[form], heldPagesAbove);
 
   std::optional<DryRun> run;
   // A refusal of bytes the room covers once the units that cost nothing

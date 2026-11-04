@@ -31,7 +31,7 @@ public:
 
   // One memory-control pass at a command-free point. True while the host
   // claim waits for memory on its way back: the transport runs it again at
-  // the next command-free point.
+  // the next command-free point (MemoryGovernor::controlPass).
   [[nodiscard]] bool run(MemoryPressure pressure);
 
 private:

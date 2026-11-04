@@ -1447,6 +1447,36 @@ void testRerunWhileTheDeficitWaitsOnLandings() {
   require(!fixture.pass(3.0), "a pass with nothing returning asked to run again");
 }
 
+// What lands counts once: the deficit is net of it, and the host's claim takes the rest at once. Counted again
+// by the claim, 640 MiB landing met its 384 MiB claim, and the host stayed short for the whole landing.
+void testTheHostClaimTakesTheDeficitBeyondWhatLands() {
+  // No headroom beside the cache's 1 GiB: 1 GiB short of the margin, 640 MiB
+  // of it landing.
+  Fixture fixture(host(kGiB));
+  TestSource cache("cache", &fixture.memory);
+  for (uint64_t key = 1; key <= 8; ++key)
+    cache.units.push_back(unit(key, 128 * kMiB));
+  fixture.memory.hold("cache", kGiB);
+  fixture.ledger().addSource(cache);
+  fixture.ledger().setReturning([] { return Returning{.landingBytes = 640 * kMiB}; },
+                                [](std::span<const uint64_t>) { return Returning{}; });
+  static_cast<void>(fixture.pass(1.0));
+  require(cache.taken.size() == 3, "the host pass took " + std::to_string(cache.taken.size()) +
+                                       " units of 128 MiB for a deficit of 384 MiB beyond what lands");
+}
+
+// A host pass that finds nothing while memory lands waits for it, judged again once the host has settled: run at
+// every command-free point, the whole control pass reran each loop iteration while the landing lasted.
+void testAHostPassWaitingOnLandingsRunsOncePerSettle() {
+  Fixture fixture(host(kGiB));
+  fixture.memory.hold("cache", kGiB);
+  fixture.ledger().setReturning([] { return Returning{.landingBytes = 640 * kMiB}; },
+                                [](std::span<const uint64_t>) { return Returning{}; });
+  require(fixture.pass(1.0), "a host pass that found nothing while memory lands did not wait for it");
+  require(!fixture.pass(1.001), "the host pass ran again before the host settled");
+  require(fixture.pass(2.0), "the host pass was not judged again once the host settled");
+}
+
 // A deficit under macOS's warning takes about the deficit of cache, never a pool unit or a conversion.
 void testAWarningDeficitTakesNoPoolUnit() {
   Fixture fixture(host(800 * kMiB + 3 * kGiB, MemoryPressure::Warning));
@@ -2068,6 +2098,8 @@ std::span<const test::TestCase> ledgerTests() {
       {"testDeficitNetOfReturning", testDeficitNetOfReturning},
       {"testMissingTelemetryGivesNoCacheBack", testMissingTelemetryGivesNoCacheBack},
       {"testRerunWhileTheDeficitWaitsOnLandings", testRerunWhileTheDeficitWaitsOnLandings},
+      {"testTheHostClaimTakesTheDeficitBeyondWhatLands", testTheHostClaimTakesTheDeficitBeyondWhatLands},
+      {"testAHostPassWaitingOnLandingsRunsOncePerSettle", testAHostPassWaitingOnLandingsRunsOncePerSettle},
       {"testAWarningDeficitTakesNoPoolUnit", testAWarningDeficitTakesNoPoolUnit},
       {"testTheHostTakesNoStoreUnitShortOfCritical", testTheHostTakesNoStoreUnitShortOfCritical},
       {"testAPoolDoesNotGrowWhileAClaimWaits", testAPoolDoesNotGrowWhileAClaimWaits},
