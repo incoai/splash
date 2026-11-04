@@ -27,8 +27,8 @@ struct HoverStyle: ButtonStyle {
                 .padding(padding)
                 .background(.quaternary.opacity(!enabled ? 0 : configuration.isPressed || held ? 1 : hovering ? 0.75 : 0), in: shape)
                 .contentShape(shape)
-                // At once, as AppKit's own controls light up: a fade redrew the window in each of
-                // its frames, as the pointer crossed one row after another.
+                // At once, as AppKit's own controls light up: a fade would redraw the window in
+                // each of its frames as the pointer crosses one row after another.
                 .onHover { hovering = $0 }
         }
     }
