@@ -208,11 +208,11 @@ public:
   void setPressure(MemoryPressure pressure) noexcept;
   // What the governor makes of a fresh sample of the host. Reading it
   // changes nothing: the host's band moves only with the samples a
-  // reservation or the control pass (evaluate) takes, so /status does not
-  // move admission.
+  // reservation or the control pass takes, so /status does not move
+  // admission.
   [[nodiscard]] MemoryGovernorSnapshot snapshot() const noexcept;
-  // The control pass's evaluation: snapshot(), with the host's band moved
-  // to its sample, as a reservation's moves it.
+  // snapshot(), with the host's band moved to its sample, as a
+  // reservation's and the control pass's move it.
   MemoryGovernorSnapshot evaluate() noexcept;
 
   // The accounts, claims and victim sources the governor's rule works on.

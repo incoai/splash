@@ -34,13 +34,13 @@ bool MemoryControl::run(MemoryPressure pressure) {
   const double now = loop_.monotonicMilliseconds();
   loop_.collectLandings(now);
   static_cast<void>(backend_.refreshMemoryStats());
-  static_cast<void>(governor_.evaluate());
+  const bool again = governor_.controlPass(now);
+  static_cast<void>(backend_.refreshMemoryStats());
+  // Read after the pass, at the last sample of the host it took.
   const std::string diagnostic =
       reporter_.update(loop_.resourceWaitSnapshot(), governor_.admits(ClaimClass::Growth));
   if (!diagnostic.empty())
     logLine(diagnostic);
-  const bool again = governor_.controlPass(now);
-  static_cast<void>(backend_.refreshMemoryStats());
   return again;
 }
 

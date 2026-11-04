@@ -21,8 +21,8 @@ private:
 // an engine left without a request (NativeRuntime::releaseIdleWeights),
 // records the system's pressure, lands finished transfers and gives the
 // ledger the lanes' demand and the wanted chains
-// (NativeRuntime::collectLandings), logs a change in what requests wait for,
-// and runs the governor's control pass (MemoryGovernor::controlPass).
+// (NativeRuntime::collectLandings), runs the governor's control pass
+// (MemoryGovernor::controlPass) and logs a change in what requests wait for.
 class MemoryControl final {
 public:
   MemoryControl(MemoryGovernor &governor, metal::MetalBackend &backend,
