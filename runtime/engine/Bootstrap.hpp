@@ -43,6 +43,13 @@ struct RuntimeBootstrapReport {
     WarmupReport warmup;
     MemoryAuditResult memoryAudit;
     std::string budgetDescription;
+    // What a start refused for want of memory or context needed against what
+    // it had: RuntimeResourcesError::shortfall, or the --max-context check.
+    std::optional<protocol::StartShortfall> shortfall;
+    // A command of the start failed for want of GPU memory
+    // (metal::MetalBackendError::outOfMemory): a warmup's, or one of
+    // resource assembly (RuntimeResourcesError::commandOutOfMemory).
+    bool commandOutOfMemory = false;
 
     [[nodiscard]] std::string describe() const;
 };
@@ -59,6 +66,11 @@ public:
 private:
     RuntimeBootstrapReport report_;
 };
+
+// The failure a start reports in place of Ready (main.mm), classed for the
+// server's restart policy and the app's words.
+[[nodiscard]] protocol::StartFailedEvent startFailedEvent(
+    const RuntimeBootstrapReport &report);
 
 // Startup retries a temporary host or driver allocation failure for a
 // bounded time. The window opens at the first such failure, not at process
@@ -86,10 +98,10 @@ private:
         reached_;
 };
 
-// Temporary host/driver allocation failures can recover during startup.
-// Preserve the desktop reserve and bound retries; configuration and compute
-// failures remain immediate and fail-closed.
-inline constexpr auto kStartupMemoryRecoveryTimeout = std::chrono::seconds(30);
+// Temporary host/driver allocation failures can recover during startup,
+// within supervision::kStartRetryWindow, checked this often. Configuration
+// and compute failures, a command's want of GPU memory among them, remain
+// immediate and fail-closed.
 inline constexpr auto kStartupMemoryRecoveryPoll = std::chrono::seconds(1);
 
 // The wire limits of a model served with maxContext tokens: prompts and
@@ -99,12 +111,18 @@ inline constexpr auto kStartupMemoryRecoveryPoll = std::chrono::seconds(1);
 protocolLimitsFor(const model::ModelCapabilities &capabilities,
                   uint32_t maxContext) noexcept;
 
+// What a model served under `engine` and `limits` (protocolLimitsFor)
+// announces in Ready.
+[[nodiscard]] protocol::ReadyEvent readyEventFor(
+    const model::ModelDescriptor &model, const EngineConfig &engine,
+    const protocol::ProtocolLimits &limits);
+
 struct RuntimeBootstrapConfig {
     RuntimeResourcesConfig resources;
-    // A zero engine maxContext is a relaunch's context
-    // (RuntimeResourcesConfig::relaunchContext), or else what the memory
-    // plan holds, as serve's default; another one larger than the plan
-    // holds fails the bootstrap.
+    // A relaunch serves its context (RuntimeResourcesConfig::relaunchContext)
+    // as far as the memory plan holds it. Otherwise a zero engine maxContext
+    // is what the plan holds, as serve's default, and another one larger
+    // than the plan holds fails the bootstrap.
     NativeLoopConfig nativeLoop;
 };
 
@@ -119,12 +137,16 @@ public:
         NativeRuntime::ByteSink output,
         NativeRuntime::StatusProvider statusProvider);
 
-    // Completes warmup and validation before announcing readiness.
+    // Completes warmup and validation before announcing `ready`. Warmup
+    // runs on kvPool's runway (model::ExecutionLimits::warmupKvPages) and
+    // holds its pages while it runs (KvPool::RunwayHold).
     [[nodiscard]] static RuntimeBootstrapReport requireWarmupAndAnnounce(
         const EngineMemoryPlan &memoryPlan,
         model::RuntimeModel &modelRuntime,
+        KvPool &kvPool,
         ActualMemoryReporter memoryReporter,
-        NativeRuntime &nativeLoop);
+        NativeRuntime &nativeLoop,
+        const protocol::ReadyEvent &ready);
 
     RuntimeBootstrap(const RuntimeBootstrap &) = delete;
     RuntimeBootstrap &operator=(const RuntimeBootstrap &) = delete;

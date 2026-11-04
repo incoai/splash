@@ -5,8 +5,12 @@
 #include "TestImmediateTicket.hpp"
 #include "TestKvPool.hpp"
 #include "TestStatus.hpp"
+#include "Supervision.hpp"
 #include "engine/Cache.hpp"
 #include "engine/Bootstrap.hpp"
+#include "engine/MemoryGovernor.hpp"
+#include "metal/MetalBackend.hpp"
+#include "model/ModelDescriptor.hpp"
 #include "TestModel.hpp"
 
 #import <Foundation/Foundation.h>
@@ -140,14 +144,13 @@ public:
                                      : decode(plan, items),
                                  completion);
   }
-  uint64_t snapshotBytes() const noexcept override { return 64; }
   std::shared_ptr<StateReservation> reserveState(uint64_t, uint32_t,
                                                  metal::AllocationFailure &refusal) override {
     refusal = metal::AllocationFailure::EngineBudget;
     return {};
   }
   std::shared_ptr<const CompositeState> snapshot(uint64_t) override { return {}; }
-  uint64_t reclaimIdleState(bool, model::IdleMemory) noexcept override { return 0; }
+  uint64_t releaseIdleBuffer(bool) noexcept override { return 0; }
   std::optional<std::string> provideMask(uint64_t,
                                          std::span<const uint32_t>) override {
     return std::nullopt;
@@ -157,7 +160,7 @@ public:
   model::WarmupStepResult warmupPrefill(uint32_t rows) override {
     if (!rows || rows > model::ExecutionLimits::prefillTokenBudget)
       throw std::invalid_argument("invalid prefill warmup rows");
-    lastPrefillRows = rows;
+    prefillRows.push_back(rows);
     return warmup(0);
   }
   model::WarmupStepResult warmupDecodeBatch(uint32_t width) override {
@@ -177,7 +180,7 @@ public:
   }
 
   std::vector<int> calls;
-  uint32_t lastPrefillRows = 0;
+  std::vector<uint32_t> prefillRows;
   std::function<void(int, model::WarmupStepResult &)> warmupHook;
 
 private:
@@ -195,14 +198,26 @@ private:
   int throwingStep_ = -1;
 };
 
+// The Metal library the tests' backend loads (main's argument).
+std::string gMetallibPath;
+
+// This Mac's backend, under each harness's governor: a limit and a host
+// every engine's claims fit, for an engine that allocates nothing through
+// it but needs one for the claims it keeps.
+metal::MetalBackend &ampleGovernorBackend() {
+  static metal::MetalBackend backend(gMetallibPath);
+  return backend;
+}
+
 class Harness final {
 public:
   explicit Harness(int throwingStep = -1, bool failReadyWrite = false)
-      : backing_(16, 4096, 4), pool_(backing_, 16),
+      : backing_(model::ExecutionLimits::warmupKvPages, 4096, 4),
+        pool_(backing_, model::ExecutionLimits::warmupKvPages),
         resources_(pool_, nullptr, nullptr),
         executor_(throwingStep),
         loop_(
-            loopConfig(), metal::kResidencyKeepAliveSeconds, resources_, executor_,
+            loopConfig(), resources_, executor_,
             [this, failReadyWrite](std::span<const uint8_t> bytes) {
               if (failReadyWrite) {
                 throw std::runtime_error("injected output failure");
@@ -214,16 +229,17 @@ public:
   }
 
   Executor &executor() noexcept { return executor_; }
+  KvPool &pool() noexcept { return pool_; }
   engine::NativeRuntime &loop() noexcept { return loop_; }
   const std::vector<uint8_t> &output() const noexcept { return output_; }
 
 private:
   engine::NativeLoopConfig loopConfig() {
-    return {.engine = test::engineConfig({.maxContext = 1024}),
-            .metrics = &metrics_,
-            .weights = &weights_,
-            .weightAdmission = test::admitAll,
-            .growthAdmission = test::admitAll};
+    return {.engine = test::engineConfig(
+                {.maxContext = 1024,
+                 .governor = &governor_,
+                 .weights = engine::WeightResidencyConfig{.weights = &weights_, .admit = test::admitAll}}),
+            .metrics = &metrics_};
   }
 
   test::TestKvStorage backing_;
@@ -233,6 +249,10 @@ private:
   std::vector<uint8_t> output_;
   RuntimeMetrics metrics_;
   test::Weights weights_;
+  // Its own: the engine registers its cache and victims with it, and the
+  // ledger keeps them while it lives.
+  engine::MemoryGovernor governor_{ampleGovernorBackend(), 1ULL << 50, 1, 0,
+                                   [] { return std::optional<HostMemory>({1ULL << 50, 1ULL << 50}); }, 0};
   engine::NativeRuntime loop_;
 };
 
@@ -242,24 +262,24 @@ void testAllNativeWarmupsPrecedeReady() {
   require(harness.output().empty(),
           "runtime became visible before warmup");
   auto report = engine::RuntimeBootstrap::requireWarmupAndAnnounce(
-      plan, harness.executor(), [&] { return validActual(plan); },
-      harness.loop());
+      plan, harness.executor(), harness.pool(), [&] { return validActual(plan); },
+      harness.loop(), protocol::peer::kTestReady);
   const auto events = protocol::peer::decodeEvents(harness.output());
   require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid &&
               events.size() == 1 && std::holds_alternative<protocol::ReadyEvent>(events.front()),
           "successful native bootstrap was incomplete");
   require(harness.executor().calls == std::vector<int>({0, 1, 2, 3, 4, 5}),
-          "bootstrap did not warm fixed prefill and B1/B2/B3/B4 in order");
-  require(harness.executor().lastPrefillRows == model::ExecutionLimits::prefillTokenBudget,
-          "bootstrap memory warmup did not explicitly use maximum prefill rows");
+          "bootstrap did not warm a prefill and B1/B2/B3/B4 in order");
+  require(harness.executor().prefillRows == std::vector<uint32_t>({model::ExecutionLimits::prefillTokenBudget}),
+          "bootstrap did not warm a prefill of maximum rows");
   require(report.warmup.decodeBatches[2] == WarmupStepStatus::Complete,
           "bootstrap report omitted the real B3 graph");
 }
 
 RuntimeBootstrapReport warmup(Harness &harness, const EngineMemoryPlan &plan) {
   return RuntimeBootstrap::requireWarmupAndAnnounce(
-      plan, harness.executor(), [&] { return validActual(plan); },
-      harness.loop());
+      plan, harness.executor(), harness.pool(), [&] { return validActual(plan); },
+      harness.loop(), protocol::peer::kTestReady);
 }
 
 void requireReadyWithoutReducingConcurrency(
@@ -271,6 +291,24 @@ void requireReadyWithoutReducingConcurrency(
   const auto *ready = std::get_if<protocol::ReadyEvent>(&events.front());
   require(ready && ready->maxConcurrentRequests == 4,
           "startup budget permanently reduced the advertised concurrency");
+}
+
+// Warmup runs on the KV runway and holds its pages as a request holds its
+// own, so that commands reach their extents (KvPool::RunwayHold); none is
+// held once the engine is Ready.
+void testWarmupHoldsTheRunway() {
+  const EngineMemoryPlan plan = memoryPlan();
+  Harness harness;
+  int warmups = 0;
+  harness.executor().warmupHook = [&](int, model::WarmupStepResult &) {
+    ++warmups;
+    for (uint32_t page = 0; page < model::ExecutionLimits::warmupKvPages; ++page)
+      require(harness.pool().pageActive(page), "a warmup ran on a runway page no request held");
+  };
+  const auto report = warmup(harness, plan);
+  require(report.stage == RuntimeBootstrapStage::Ready && warmups == 6 &&
+              harness.pool().snapshot().pagesActive == 0,
+          "warmup held the runway past Ready");
 }
 
 void testBudgetLimitedWarmupKeepsRuntimeConcurrency() {
@@ -399,11 +437,11 @@ void testFinalHostPressurePreventsReady() {
   Harness harness;
   try {
     static_cast<void>(RuntimeBootstrap::requireWarmupAndAnnounce(
-        plan, harness.executor(),
+        plan, harness.executor(), harness.pool(),
         []() -> ActualMemoryReport {
           throw metal::MetalAllocationError("pressure after warmup",
                                              metal::AllocationFailure::HostPressure);
-        }, harness.loop()));
+        }, harness.loop(), protocol::peer::kTestReady));
     throw std::runtime_error("final pressure check announced ready");
   } catch (const RuntimeBootstrapError &error) {
     require(error.report().resourceFailure == RuntimeResourceFailure::HostCapacity &&
@@ -476,22 +514,22 @@ void testExceptionsMemoryAndReadyWriteAreFailClosed() {
     Harness harness(3);
     try {
       static_cast<void>(engine::RuntimeBootstrap::requireWarmupAndAnnounce(
-          plan, harness.executor(), [] { return ActualMemoryReport{}; },
-          harness.loop()));
+          plan, harness.executor(), harness.pool(), [] { return ActualMemoryReport{}; },
+          harness.loop(), protocol::peer::kTestReady));
       throw std::runtime_error("warmup exception announced ready");
     } catch (const engine::RuntimeBootstrapError &error) {
       require(error.report().stage ==
                       engine::RuntimeBootstrapStage::DecodeWarmup &&
-                  harness.output().empty(),
-              "warmup exception was not contained");
+                  harness.output().empty() && harness.pool().snapshot().pagesActive == 0,
+              "warmup exception was not contained or kept the runway held");
     }
   }
   {
     Harness harness;
     try {
       static_cast<void>(engine::RuntimeBootstrap::requireWarmupAndAnnounce(
-          plan, harness.executor(), [] { return ActualMemoryReport{}; },
-          harness.loop()));
+          plan, harness.executor(), harness.pool(), [] { return ActualMemoryReport{}; },
+          harness.loop(), protocol::peer::kTestReady));
       throw std::runtime_error("invalid memory report announced ready");
     } catch (const engine::RuntimeBootstrapError &error) {
       require(error.report().stage ==
@@ -504,8 +542,8 @@ void testExceptionsMemoryAndReadyWriteAreFailClosed() {
     Harness harness(-1, true);
     try {
       static_cast<void>(engine::RuntimeBootstrap::requireWarmupAndAnnounce(
-          plan, harness.executor(), [&] { return validActual(plan); },
-          harness.loop()));
+          plan, harness.executor(), harness.pool(), [&] { return validActual(plan); },
+          harness.loop(), protocol::peer::kTestReady));
       throw std::runtime_error("failed Ready write left runtime ready");
     } catch (const engine::RuntimeBootstrapError &error) {
       require(error.report().stage ==
@@ -575,12 +613,118 @@ void testProtocolLimitsFollowTheModel() {
           "the protocol limits do not follow the model and the served context");
 }
 
+// Ready says what the start serves: the engine's lanes, the context it
+// resolved, vision iff it admits images, and the target's vocabulary, stop
+// tokens and mask rows, which the server sizes its constraints by.
+void testReadyEventForTheServedModel() {
+  model::ModelDescriptor flint;
+  flint.target = model::FlintLayout{};
+  flint.capabilities.vocabularySize = 150144;
+  EngineConfig engine;
+  engine.maxContext = 73721;
+  engine.maxImagePatches = 16384;
+  const protocol::ReadyEvent vision =
+      readyEventFor(flint, engine, protocolLimitsFor(flint.capabilities, engine.maxContext));
+  require(vision == protocol::ReadyEvent{4, 73721, true, 150144, {150001, 150003, 150005, 150018}, 9},
+          "Ready did not announce what a start serving Flint with images serves");
+  model::ModelDescriptor dense;
+  dense.target = model::Qwen3_8Layout{};
+  dense.capabilities.vocabularySize = 248320;
+  engine.maxContext = 262144;
+  engine.maxImagePatches = 0;
+  const protocol::ReadyEvent text =
+      readyEventFor(dense, engine, protocolLimitsFor(dense.capabilities, engine.maxContext));
+  require(text == protocol::ReadyEvent{4, 262144, false, 248320, {248044, 248046}, 9},
+          "Ready did not announce what a start serving a model without images serves");
+}
+
+// The failure a start reports in place of Ready names its class, which the
+// server's restart policy and the app's words read, with what a memory or
+// context refusal needed against what it had.
+void testStartFailuresAreClassed() {
+  using Kind = protocol::StartFailureKind;
+  using Bound = protocol::ShortfallBound;
+  require(memoryBound(kGiB, kGiB) == Bound::MaxMemory && memoryBound(0, 24 * kGiB) == Bound::DeviceMemory &&
+              memoryBound(64 * kGiB, 24 * kGiB) == Bound::DeviceMemory,
+          "a budget --max-memory set was not told from this Mac's own");
+  const protocol::StartShortfall memory{Bound::MaxMemory, 10'858'659'840ULL, kGiB, 0};
+  const RuntimeBootstrapError refused(RuntimeResourcesError(
+      RuntimeResourceStage::MemoryPlanning, "the plan's floors require more", "budget",
+      RuntimeResourceFailure::EngineCapacity, memory));
+  const protocol::StartFailedEvent plan = startFailedEvent(refused.report());
+  require(plan.kind == Kind::MemoryBudget && plan.shortfall == memory &&
+              plan.message == "the plan's floors require more",
+          "a plan the budget cannot hold was not a memory budget failure with its numbers");
+  RuntimeBootstrapReport context;
+  context.stage = RuntimeBootstrapStage::ModelCreation;
+  context.shortfall = protocol::StartShortfall{.bound = Bound::Disk, .planContextTokens = 73721};
+  require(startFailedEvent(context).kind == Kind::ContextBudget &&
+              startFailedEvent(context).shortfall == *context.shortfall,
+          "a context the plan cannot hold was not a context budget failure");
+  const auto kindOf = [](std::optional<RuntimeResourceStage> stage, RuntimeResourceFailure failure) {
+    RuntimeBootstrapReport report;
+    report.resourceStage = stage;
+    report.resourceFailure = failure;
+    const protocol::StartFailedEvent event = startFailedEvent(report);
+    require(event.shortfall == protocol::StartShortfall{}, "a failure without numbers reported a shortfall");
+    return event.kind;
+  };
+  using Stage = RuntimeResourceStage;
+  using Failure = RuntimeResourceFailure;
+  require(kindOf(Stage::ModelLoading, Failure::HostCapacity) == Kind::HostMemory &&
+              kindOf(std::nullopt, Failure::HostCapacity) == Kind::HostMemory &&
+              kindOf(Stage::StorageAllocation, Failure::DriverAllocation) == Kind::DriverAllocation &&
+              kindOf(std::nullopt, Failure::EngineCapacity) == Kind::MemoryBudget &&
+              kindOf(Stage::Configuration, Failure::Other) == Kind::Configuration &&
+              kindOf(Stage::CapabilityValidation, Failure::Other) == Kind::Device &&
+              kindOf(Stage::ModelLoading, Failure::Other) == Kind::Model &&
+              kindOf(Stage::MemoryPlanning, Failure::Other) == Kind::MemoryBudget &&
+              kindOf(Stage::BackendCreation, Failure::Other) == Kind::Internal &&
+              kindOf(std::nullopt, Failure::Other) == Kind::Internal,
+          "a start failure was not classed by its resource failure and stage");
+}
+
+// A warmup command that ran out of GPU memory fails the start as
+// CommandMemory, which the start never retries: another process holds what
+// the model's commands need, and a retry would take it from that process. A
+// command failure of another kind is Internal.
+void testAStartCommandOutOfMemoryIsCommandMemoryAndNotRetried() {
+  const EngineMemoryPlan plan = memoryPlan();
+  for (const bool outOfMemory : {true, false}) {
+    Harness harness;
+    harness.executor().warmupHook = [&](int step, model::WarmupStepResult &) {
+      if (step == 0)
+        throw metal::MetalBackendError("Metal command 3 failed", outOfMemory);
+    };
+    try {
+      static_cast<void>(warmup(harness, plan));
+      throw std::runtime_error("a failed warmup command announced ready");
+    } catch (const RuntimeBootstrapError &error) {
+      const RuntimeBootstrapReport &report = error.report();
+      require(report.commandOutOfMemory == outOfMemory &&
+                  startFailedEvent(report).kind ==
+                      (outOfMemory ? protocol::StartFailureKind::CommandMemory
+                                   : protocol::StartFailureKind::Internal),
+              "a warmup command's want of GPU memory was not classed as CommandMemory");
+      StartupRetryWindow window(supervision::kStartRetryWindow);
+      require(!window.retryUntil(report, StartupRetryWindow::Clock::now()),
+              "a start whose command failed was retried in-process");
+    }
+  }
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  if (argc != 2) {
+    std::cerr << "usage: runtime-bootstrap METALLIB\n";
+    return EXIT_FAILURE;
+  }
+  gMetallibPath = argv[1];
   try {
     testRuntimeCacheIdentityReportsTheLoadedModel();
     testAllNativeWarmupsPrecedeReady();
+    testWarmupHoldsTheRunway();
     testBudgetLimitedWarmupKeepsRuntimeConcurrency();
     testOptionalAllocationFailuresAreMemoryLimited();
     testResourceFailureClassificationSurvivesBootstrap();
@@ -590,6 +734,9 @@ int main() {
     testExceptionsMemoryAndReadyWriteAreFailClosed();
     testStartupRetryWindowOpensAtFirstFailure();
     testProtocolLimitsFollowTheModel();
+    testReadyEventForTheServedModel();
+    testStartFailuresAreClassed();
+    testAStartCommandOutOfMemoryIsCommandMemoryAndNotRetried();
     std::cout << "native bootstrap tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

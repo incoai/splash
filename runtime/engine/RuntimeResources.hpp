@@ -16,6 +16,7 @@
 #include "model/SparseRowStore.hpp"
 #include "model/SsdReaders.hpp"
 #include "engine/MemoryAudit.hpp"
+#include "engine/Protocol.hpp"
 #include "engine/ReleasableMemory.hpp"
 #include "engine/Status.hpp"
 #include "ops/ExecutionPlans.hpp"
@@ -33,8 +34,6 @@
 #include <thread>
 
 namespace splash::engine {
-
-struct EngineConfig;
 
 enum class RuntimeResourceStage {
   Configuration,
@@ -143,13 +142,11 @@ struct RuntimeResourcesConfig {
   // a target without one, and a size that holds the whole table loads it.
   StreamedSetting pleMemory;
   // --expert-memory: a MoE target's routed experts stream from their files
-  // through a store whose floor is a size (its slots, staging and tables),
-  // the least it keeps however short memory is, and whose cap is all that
-  // the memory plan leaves it beside that floor, so at least that size; or
-  // load with their layers (off); auto leaves them to the memory plan, the
-  // floor to the store. A size loads them with their layers, as auto does,
-  // where memory holds every one, and so does a size that holds every one;
-  // both say it is ignored, and so does a dense target.
+  // through a store of exactly a size (its slots, staging and tables), all
+  // of it its floor, so it neither grows nor gives memory back; or load with
+  // their layers (off); auto leaves them to the memory plan, the floor to the
+  // store. A size that holds every expert loads them with their layers and
+  // says it is ignored, and so does a dense target.
   StreamedSetting expertMemory;
   // --sparse-kv-memory: the target of a spill-capable target's hot block
   // cache, at least its floor; none (auto) keeps its floor.
@@ -169,13 +166,15 @@ struct RuntimeResourcesConfig {
   // rounds repeat one another.
   AneFfnSetting aneFfn;
   // A relaunch's context (--relaunch-context): the context the server's
-  // first engine served without --max-context, which the server passes to
-  // every relaunch. The relaunch decides the rest as an automatic start, as
-  // that engine did, the SSD cache's staging among it, but its split takes at
+  // first engine served, which the server passes to its relaunches. The
+  // relaunch decides the rest as that engine did, for --max-context or as
+  // an automatic start, the SSD cache's staging among it, but the room the
+  // SSD cache's volume has left bounds its plan only above this context, and
+  // where its plan spills its SSD cache opens whatever room the volume has
+  // (RuntimeResources::create); without --max-context its split takes at
   // most the units whose plan holds this context, the GPU alone where none
-  // does (startAneFfn), where its plan spills its SSD cache opens whatever
-  // room the volume has (RuntimeResources::create), and it serves this
-  // context where its plan holds it (RuntimeBootstrap::start). Zero for none.
+  // does (startAneFfn); and it serves this context where its plan holds it
+  // (RuntimeBootstrap::start). Zero for none.
   uint32_t relaunchContext = 0;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation
@@ -212,7 +211,12 @@ public:
   RuntimeResourcesError(RuntimeResourceStage stage, std::string message,
                         std::string budgetDescription = {},
                         RuntimeResourceFailure failure =
-                            RuntimeResourceFailure::Other);
+                            RuntimeResourceFailure::Other,
+                        std::optional<protocol::StartShortfall> shortfall =
+                            std::nullopt);
+  // A step whose Metal command failed, with whether for want of GPU memory.
+  RuntimeResourcesError(RuntimeResourceStage stage, const metal::MetalBackendError &error,
+                        std::string budgetDescription = {});
 
   [[nodiscard]] RuntimeResourceStage stage() const noexcept { return stage_; }
   [[nodiscard]] RuntimeResourceFailure failure() const noexcept {
@@ -221,12 +225,34 @@ public:
   [[nodiscard]] const std::string &budgetDescription() const noexcept {
     return budgetDescription_;
   }
+  // What the plan's floors require against the budget, for a plan the budget
+  // cannot hold (stage MemoryPlanning, failure EngineCapacity).
+  [[nodiscard]] const std::optional<protocol::StartShortfall> &
+  shortfall() const noexcept {
+    return shortfall_;
+  }
+  // A Metal command of the step failed for want of GPU memory
+  // (metal::MetalBackendError::outOfMemory), as before any warmup the
+  // Neural Engine split's setup and calibration or the expert store's fill
+  // may: the start fails as CommandMemory, which it never retries.
+  [[nodiscard]] bool commandOutOfMemory() const noexcept { return commandOutOfMemory_; }
 
 private:
   RuntimeResourceStage stage_;
   RuntimeResourceFailure failure_;
   std::string budgetDescription_;
+  std::optional<protocol::StartShortfall> shortfall_;
+  bool commandOutOfMemory_ = false;
 };
+
+// The bound of a Metal memory budget: --max-memory where it set the budget,
+// else this Mac's own.
+[[nodiscard]] constexpr protocol::ShortfallBound
+memoryBound(uint64_t configuredLimitBytes, uint64_t hardBudgetBytes) noexcept {
+  return configuredLimitBytes && hardBudgetBytes == configuredLimitBytes
+             ? protocol::ShortfallBound::MaxMemory
+             : protocol::ShortfallBound::DeviceMemory;
+}
 
 // Owns every process-wide native resource exactly once. Members go in
 // reverse declaration order: what the engine gives back while idle -> the
@@ -257,8 +283,8 @@ public:
   RuntimeResources &operator=(const RuntimeResources &) = delete;
   ~RuntimeResources();
 
-  // The engine is Ready: what the start allocated as memory a request in
-  // service needs is in place, so the governor's mark for it ends, and a
+  // The engine is Ready: what the start allocated under its Floor claim is
+  // in place, so the claim's scope ends and the claim closes, and a
   // persistent tier's directory marks this process serving, on probation for
   // its first minute (CacheDirectory::beginServing).
   void beginServing();
@@ -281,6 +307,8 @@ public:
   [[nodiscard]] engine::Cache &cache() noexcept {
     return *cache_;
   }
+  // Startup warmup holds its runway (KvPool::RunwayHold).
+  [[nodiscard]] KvPool &kvPool() noexcept { return *kvPool_; }
   [[nodiscard]] const RuntimeCacheIdentity &cacheIdentity() const noexcept {
     return cacheIdentity_;
   }
@@ -317,7 +345,8 @@ private:
                    model::LoadedModel model, ops::ExecutionPlans operators,
                    EngineMemoryPlan memoryPlan,
                    RuntimeCacheIdentity cacheIdentity,
-                   std::unique_ptr<MemoryGovernor> memoryGovernor,
+                   std::unique_ptr<MemoryGovernor> memoryGovernor, ClaimId startClaim,
+                   std::unique_ptr<MemoryGovernor::Scope> startScope,
                    std::unique_ptr<kv::PageStorage> kvPages,
                    std::unique_ptr<model::QwenStateStorage> stateStorage,
                    std::unique_ptr<KvPageTier> kvTier,
@@ -343,6 +372,10 @@ private:
   EngineMemoryPlan memoryPlan_;
   RuntimeCacheIdentity cacheIdentity_;
   std::unique_ptr<MemoryGovernor> memoryGovernor_;
+  // The start's Floor claim and its scope, from the governor's construction
+  // until serving begins; the scope goes before the governor.
+  ClaimId startClaim_;
+  std::unique_ptr<MemoryGovernor::Scope> startScope_;
   std::unique_ptr<kv::PageStorage> kvPages_;
   std::unique_ptr<model::QwenStateStorage> stateStorage_;
   std::unique_ptr<KvPageTier> kvTier_;
@@ -378,10 +411,5 @@ private:
 [[nodiscard]] AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                                       const ops::ExecutionPlans &operators, kv::Format format,
                                       std::string_view buildId, std::function<bool()> cancelled);
-
-// Connects an engine to the governor that admits its memory: the engine asks
-// it whether the host pauses growth, and marks the allocations a request in
-// service makes. Every engine that runs against a governor connects through it.
-void connectToGovernor(EngineConfig &config, MemoryGovernor &governor);
 
 } // namespace splash::engine
