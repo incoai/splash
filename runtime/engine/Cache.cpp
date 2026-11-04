@@ -1218,7 +1218,7 @@ FreeResult Cache::take(const VictimQuery &query, const engine::Victim &victim) {
     const std::array<uint32_t, 3> landing = demotedPages();
     const auto form = static_cast<size_t>(walk.form);
     const uint32_t pagesBefore = pool_.freePageCount(walk.form) + landing[form];
-    const CacheReclaimResult reclaimed = walk.device ? takeReclaim(each, demotionPages(), landing) : evictOne(each);
+    const ReclaimResult reclaimed = walk.device ? takeReclaim(each, demotionPages(), landing) : evictOne(each);
     if (!walk.device && reclaimed.evictedState && trims(walk))
       static_cast<void>(trimWindows(false));
     if (!reclaimed.madeProgress && !reclaimed.evictedKv)
@@ -1284,7 +1284,7 @@ uint64_t Cache::releaseEmptyExtents(bool keepRunway) {
   return pool_.reclaimEmptyExtents(keepRunway, std::numeric_limits<uint32_t>::max());
 }
 
-CacheReclaimResult Cache::evictOne(const Walk &walk, std::optional<std::array<bool, 3>> reach) {
+Cache::ReclaimResult Cache::evictOne(const Walk &walk, std::optional<std::array<bool, 3>> reach) {
   if (const std::optional<Victim> victim = takeOldest(walk, {}, reach))
     return {.madeProgress = true, .evictedState = !victim->kv};
   // Nothing to reclaim now. Transfers land only in pollTransfers(), so what
@@ -1348,11 +1348,11 @@ uint64_t Cache::releaseOtherForms(kv::PageForm form) {
   return released;
 }
 
-CacheReclaimResult Cache::takeReclaim(const Walk &walk, const std::array<uint32_t, 3> &demotions,
+Cache::ReclaimResult Cache::takeReclaim(const Walk &walk, const std::array<uint32_t, 3> &demotions,
                                       const std::array<uint32_t, 3> &unit) {
   // Free pages first, as the extent they fill; one that empties the runway
   // kept gives nothing yet, and the next one does.
-  for (CacheReclaimResult released; (released = releaseExtent(walk)).madeProgress;)
+  for (ReclaimResult released; (released = releaseExtent(walk)).madeProgress;)
     if (released.reclaimedBytes)
       return released;
   // Then the walk's victims while KV of some form can empty an extent past
@@ -1364,7 +1364,7 @@ CacheReclaimResult Cache::takeReclaim(const Walk &walk, const std::array<uint32_
   // demotions in flight before it hold theirs, of their form. Whatever it
   // returns says whether KV went.
   bool evictedKv = false;
-  const auto outcome = [&](CacheReclaimResult result) {
+  const auto outcome = [&](ReclaimResult result) {
     result.evictedKv = evictedKv;
     return result;
   };
@@ -1373,12 +1373,12 @@ CacheReclaimResult Cache::takeReclaim(const Walk &walk, const std::array<uint32_
     if (std::ranges::none_of(reach, std::identity{}))
       break;
     const size_t writes = writes_.size();
-    const CacheReclaimResult evicted = evictOne(walk, reach);
+    const ReclaimResult evicted = evictOne(walk, reach);
     if (!evicted.madeProgress || evicted.evictedState)
       return outcome(evicted);
     evictedKv = true;
     demoteChainsAbove(walk, writes, [&] { return landedSince(walk, unit) != 0; });
-    if (const CacheReclaimResult released = releaseExtent(walk); released.reclaimedBytes)
+    if (const ReclaimResult released = releaseExtent(walk); released.reclaimedBytes)
       return outcome(released);
     if (landedSince(walk, unit))
       return outcome({.madeProgress = true});
@@ -1393,7 +1393,7 @@ uint32_t Cache::reusablePages(ReclaimClass upTo, kv::PageForm form) const {
   return unheld - kv_.idlePagesOnChains(states_.usedStates(), form);
 }
 
-CacheReclaimResult Cache::recycleState(const Walk &walk) {
+Cache::ReclaimResult Cache::recycleState(const Walk &walk) {
   // The oldest checkpoint, else the oldest ordinary state; running work
   // takes a state in use after every other, once no transfer in flight can
   // return what is needed first.
@@ -1508,7 +1508,7 @@ std::array<bool, 3> Cache::formsInReach(const Walk &walk, const std::array<uint3
   return reach;
 }
 
-CacheReclaimResult Cache::releaseExtent(const Walk &walk) {
+Cache::ReclaimResult Cache::releaseExtent(const Walk &walk) {
   constexpr std::array kForms{kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index};
   const auto releases = [&](kv::PageForm form) {
     return walk.releases(form, pool_.freePageCount(form), pool_.extentPages());

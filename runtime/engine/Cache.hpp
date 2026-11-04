@@ -267,25 +267,6 @@ struct CacheWindowPolicy final {
 // write budget does not cover the writes Spill requests have committed.
 enum class SpillGate : uint8_t { Open, TierClosed, WriteBudget };
 
-struct CacheReclaimResult final {
-  bool madeProgress = false;
-  // Bytes of the KV extents the step released.
-  uint64_t reclaimedBytes = 0;
-  // Nothing was reclaimed, but a transfer in flight (a KV demotion, a KV
-  // restore or the one state write) holds what the next reclaim needs.
-  // Retry when it lands rather than treating the cache as empty.
-  bool pending = false;
-  // The step evicted a state from RAM. That frees nothing by itself: the
-  // state's buffers return to the model's pool, which releaseIdleBuffer gives
-  // back to the host.
-  bool evictedState = false;
-  // The step evicted KV, whose pages are free for other KV, or will be once
-  // their demotion lands. Only a memory reclaim (takeReclaim) reports it:
-  // its progress is memory that came back, which KV gives only as an extent
-  // it empties.
-  bool evictedKv = false;
-};
-
 // What becomes of the Full extents a spill's moves leave empty
 // (Cache::spillWritten): they leave memory but one, the runway the next
 // Full pages come from without an allocation; or the Full pages left
@@ -842,6 +823,25 @@ private:
     Impossible,
   };
 
+  // What one reclaim step did.
+  struct ReclaimResult final {
+    bool madeProgress = false;
+    // Bytes of the KV extents the step released.
+    uint64_t reclaimedBytes = 0;
+    // Nothing was reclaimed, but a transfer in flight (a KV demotion, a KV
+    // restore or the one state write) holds what the next reclaim needs.
+    // Retry when it lands rather than treating the cache as empty.
+    bool pending = false;
+    // The step evicted a state from RAM. That frees nothing by itself: the
+    // state's buffers return to the model's pool, which releaseIdleBuffer
+    // gives back to the host.
+    bool evictedState = false;
+    // The step evicted KV, whose pages are free for other KV, or will be
+    // once their demotion lands. Only a memory reclaim (takeReclaim) reports
+    // it: its progress is memory that came back, which KV gives only as an
+    // extent it empties.
+    bool evictedKv = false;
+  };
   // What one reclaim step gave up: a state, whose buffers return to the
   // model's pool, or a KV leaf, whose memory returns with the extent it
   // leaves empty.
@@ -1080,7 +1080,7 @@ private:
   // scan has no checkpoints. A step that finds nothing reports pending while
   // a transfer in flight can return what is needed (returns). With `reach`,
   // a leaf goes only where it leads to an extent in reach (takeOldest).
-  [[nodiscard]] CacheReclaimResult evictOne(const Walk &walk, std::optional<std::array<bool, 3>> reach = std::nullopt);
+  [[nodiscard]] ReclaimResult evictOne(const Walk &walk, std::optional<std::array<bool, 3>> reach = std::nullopt);
   // The units of the walk from the cursor on, each taken in turn until one
   // goes, which it returns. One that waits for a transfer in flight leaves
   // the others to go: a checkpoint ends the checkpoints, a state holds back
@@ -1095,7 +1095,7 @@ private:
   // oldest checkpoint, else the oldest ordinary state, then, up to InUse, a
   // state in use. A state that needs a write the walk passes over leaves the
   // next.
-  [[nodiscard]] CacheReclaimResult recycleState(const Walk &walk);
+  [[nodiscard]] ReclaimResult recycleState(const Walk &walk);
   // One memory reclaim of a unit of the walk, which began with `demotions`
   // pages held by the demotions in flight (demotionPages) and `unit` pages
   // landing (demotedPages), by form: free pages first, as the extent they
@@ -1104,7 +1104,7 @@ private:
   // (formsInReach), the walk's victims, its leaves that lead to such an
   // extent alone (leadsToReach), until one is released, those pages
   // complete one or a state goes; otherwise a state (recycleState).
-  [[nodiscard]] CacheReclaimResult takeReclaim(const Walk &walk, const std::array<uint32_t, 3> &demotions,
+  [[nodiscard]] ReclaimResult takeReclaim(const Walk &walk, const std::array<uint32_t, 3> &demotions,
                                                const std::array<uint32_t, 3> &unit);
   // Oldest resident KV leaf after `after` no state restores through: nothing
   // sits on it or below it, so it saves no prefill, and it frees its page
@@ -1242,7 +1242,7 @@ private:
   // kept. It leaves each form the runway the walk keeps, and an extent of
   // the form whose free pages it keeps goes only past them (Walk::releases).
   // No progress when the free pages fill none.
-  [[nodiscard]] CacheReclaimResult releaseExtent(const Walk &walk);
+  [[nodiscard]] ReclaimResult releaseExtent(const Walk &walk);
   // Empties one extent that still holds pages, of the form or of any
   // (KvPool::compactExtent); the blocks and requests on its pages follow
   // them. A page a transfer reads or writes stays where it is until the

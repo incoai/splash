@@ -245,11 +245,10 @@ struct MemoryLedger::Run final {
   };
   std::vector<Took> took;
   // Now and later, with the bytes its state buffers give once they leave
-  // the model's pool (bufferBytes).
+  // the model's pool.
   uint64_t bytes = 0;
   uint32_t pages = 0;
   uint32_t buffers = 0;
-  uint64_t bufferBytes = 0;
   bool covered = false;
   // take: what it freed now and as the transfers it started land.
   FreeResult freed;
@@ -258,8 +257,8 @@ struct MemoryLedger::Run final {
   bool pending = false;
   // It reached a cached unit that frees memory only once its copy lands.
   bool uncopied = false;
-  // It counted or took a unit whose loss costs work later: a store chunk,
-  // the command between its passes, a conversion, a unit in use.
+  // take: it took a unit whose loss costs work later: a store chunk, the
+  // command between its passes, a conversion, a unit in use.
   bool costly = false;
 };
 
@@ -461,8 +460,7 @@ MemoryLedger::Run MemoryLedger::bound(const ClaimSpec &spec, const VictimQuery &
     if (!best)
       break;
     Victim &held = carried[static_cast<size_t>(best - order.heads.data())];
-    const Victim units = withCarried(*best);
-    const Victim victim = counted(units);
+    const Victim victim = counted(withCarried(*best));
     if (victim.later && victim.kind == VictimKind::Memory)
       run.uncopied = true;
     if (victim.later && order.immediate) {
@@ -472,11 +470,9 @@ MemoryLedger::Run MemoryLedger::bound(const ClaimSpec &spec, const VictimQuery &
     if (!spec.takesUnits)
       break;
     run.bytes = plus(run.bytes, victim.bytes);
-    run.bufferBytes = plus(run.bufferBytes, victim.bytes - units.bytes);
     if (victim.form == lack.form)
       run.pages += victim.pages;
     run.buffers += victim.stateBuffers;
-    run.costly = run.costly || Order::stage(*best) >= Order::kCostlyStage;
     held = {};
     order.pass(*best);
     if (lack.covered(run.bytes, run.pages, run.buffers)) {
@@ -560,7 +556,6 @@ MemoryLedger::Run MemoryLedger::take(const ClaimSpec &spec, const VictimQuery &q
     run.freed.nowBytes = plus(run.freed.nowBytes, taken.nowBytes);
     run.freed.laterBytes = plus(run.freed.laterBytes, taken.laterBytes);
     run.bytes = plus(run.bytes, plus(plus(taken.nowBytes, taken.laterBytes), buffers));
-    run.bufferBytes = plus(run.bufferBytes, buffers);
     run.pages += taken.pages;
     run.buffers += taken.stateBuffers;
     run.costly = run.costly || Order::stage(*best) >= Order::kCostlyStage;
@@ -677,7 +672,7 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
     const Run most = bound(spec, query, lack);
     if (most.uncopied)
       uncopiedReachedSeconds_ = nowSeconds_;
-    if (most.covered && spec.takesUnits) {
+    if (most.covered) {
       run = take(spec, query, lack);
       if (run->uncopied)
         uncopiedReachedSeconds_ = nowSeconds_;
