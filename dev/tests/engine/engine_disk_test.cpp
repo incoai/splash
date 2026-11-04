@@ -740,8 +740,8 @@ void testFinishedConversationsLeaveAtOnce() {
       tickUntil(engine, now, [&] { return idle(engine); }, "the lane ahead did not end");
       continue;
     }
-    const bool reclaimed = test::took(test::releaseStep(cache, ReclaimClass::Ordinary));
-    while (test::took(test::releaseStep(cache, ReclaimClass::Ordinary))) {
+    const bool reclaimed = test::releaseStep(cache, ReclaimClass::Ordinary).gave();
+    while (test::releaseStep(cache, ReclaimClass::Ordinary).gave()) {
     }
     const CacheSnapshot left = cache.snapshot();
     require(reclaimed && !cache.transfersInFlight() && tier.demotions == writes + 64 &&
@@ -1308,12 +1308,12 @@ void testCopiesAheadDoNotWaitForARequestARecoveryLeavesUntried() {
   demoteState(cache, test::publishBlocks(cache, 999, prefix, 64));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 2; ++written) {
-    require(test::took(test::evictStep(cache)),
+    require(test::evictStep(cache).gave(),
             "KV block was not written");
     tier.complete();
     require(cache.pollTransfers(), "written block did not land");
   }
-  require(test::took(test::releaseStep(cache)) &&
+  require(test::releaseStep(cache).gave() &&
               storage.allocatedPages() == 0,
           "the prefix did not move to disk whole");
   // The leaves the refusal demotes, under states on the SSD.
@@ -1598,7 +1598,7 @@ void testDiskKvPrefixIsRestoredBeforeTheLaneRuns() {
   require(test::evictStep(cache).stateBuffers && cache.pollTransfers(),
           "state was not demoted");
   for (uint32_t written = 1; written <= 2; ++written) {
-    require(test::took(test::evictStep(cache)) && tier.demotions == written,
+    require(test::evictStep(cache).gave() && tier.demotions == written,
             "KV block was not written");
     tier.complete();
     require(cache.pollTransfers(), "written block did not land");
@@ -1773,13 +1773,13 @@ void testSkipCacheRequestDoesNotWaitForAProducer() {
   require(test::evictStep(cache).stateBuffers && cache.pollTransfers(),
           "state was not demoted");
   for (uint32_t written = 1; written <= 2; ++written) {
-    require(test::took(test::evictStep(cache)) && tier.demotions == written,
+    require(test::evictStep(cache).gave() && tier.demotions == written,
             "KV block was not written");
     tier.complete();
     require(cache.pollTransfers(), "written block did not land");
   }
   while (pool.snapshot().pagesAllocated)
-    require(test::took(test::releaseStep(cache)),
+    require(test::releaseStep(cache).gave(),
             "an empty extent was not released");
   // Alone, with no page the budget grants, its restore fails: it skips the
   // cache from then on.
@@ -1850,11 +1850,11 @@ void testSkipCacheCandidateIsNotProbed() {
   demoteState(cache, test::publishBlocks(cache, 999, prompt, 64));
   cache.endRequest(999);
   for (uint32_t written = 1; written <= 2; ++written) {
-    require(test::took(test::evictStep(cache)), "KV block was not written");
+    require(test::evictStep(cache).gave(), "KV block was not written");
     tier.complete();
     require(cache.pollTransfers(), "written block did not land");
   }
-  require(test::took(test::releaseStep(cache)) &&
+  require(test::releaseStep(cache).gave() &&
               storage.allocatedPages() == 0 && cache.snapshot().kvTier.diskBlocks == 2,
           "the prefix did not move to disk whole");
   // No page can be allocated until the request starts again.
@@ -1984,7 +1984,7 @@ void testCancelledDiskPrefixStopsQueuedReads() {
   demoteState(cache, block);
   cache.endRequest(999);
   for (int page = 0; page < 4; ++page) {
-    require(test::took(test::evictStep(cache)),
+    require(test::evictStep(cache).gave(),
             "fixture KV did not demote");
     tier.complete();
     static_cast<void>(cache.pollTransfers());
@@ -2107,7 +2107,7 @@ void testAStartQueuedBetweenRefusalsHoldsFromTheFirst() {
   demoteState(cache, test::publishBlocks(cache, 999, prompt, 128));
   cache.endRequest(999);
   for (int page = 0; page < 4; ++page) {
-    require(test::took(test::evictStep(cache)),
+    require(test::evictStep(cache).gave(),
             "fixture KV did not demote");
     tier.complete();
     static_cast<void>(cache.pollTransfers());

@@ -489,8 +489,7 @@ bool claimCache(engine::Cache &resources, const engine::Need &need) {
       ledger.open({.cls = engine::ClaimClass::InService, .reach = engine::ReclaimClass::InUse});
   const engine::FreeResult freed = ledger.free(claim, need, 0, false);
   ledger.close(claim);
-  return freed.outcome == engine::FreeOutcome::Met || freed.nowBytes || freed.laterBytes || freed.pages ||
-         freed.stateBuffers;
+  return freed.gave();
 }
 
 // Claims of an extent's bytes until none takes anything: every unpinned

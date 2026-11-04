@@ -534,11 +534,9 @@ MemoryLedger::Run MemoryLedger::take(const ClaimSpec &spec, const VictimQuery &q
       if (unit.later && unit.kind == VictimKind::Memory)
         run.uncopied = true;
     }
-    // It took something when Met or when it freed something: a stepwise
-    // unit's step, measured; a whole unit, at the pages and buffers peek
-    // gave.
-    const bool took = taken.outcome == FreeOutcome::Met || taken.nowBytes || taken.laterBytes ||
-                      (unit.stepwise && (taken.pages || taken.stateBuffers));
+    // A stepwise unit's step reports what it freed; a whole unit frees the
+    // pages and buffers peek gave.
+    const bool took = taken.gave();
     if (took && !unit.stepwise) {
       taken.pages = unit.form == lack.form ? unit.pages : 0;
       taken.stateBuffers = unit.stateBuffers;
@@ -592,25 +590,23 @@ uint64_t MemoryLedger::takeUnsized(const VictimQuery &query) {
   return bytes;
 }
 
-// The one rule. The units that cost nothing and cannot be sized go first.
-// Then a claim that can wait (never the host's, whose pass's target is net
-// of what lands) waits when what is landing, with its own lanes' owed
-// copies, meets its need (or would, but for claims ranked above it).
-// Else, when the most the order gives (bound) meets the rest, its units are
-// taken one at a time until what they freed now and later meets it (take),
-// and the claim waits for what lands unless they meet it alone; one they do
-// not meet waits while what it reached or started lands, else is Short.
-// Else nothing is taken, and it waits when every copy in flight or owed
-// would meet it. A claim refused
-// bytes lacks what admission asks beyond the room: its need plus the room
-// held against it. A need met in place lacks no bytes. A need the host
-// refused counts only units that leave memory in place, and the host's claim
-// lacks its need beyond the units that cost nothing, since room under the
-// engine's limit returns nothing to the host. State buffers the units free
-// meet a need of bytes once they leave the model's pool, so the units that
-// cost nothing go again (a need in place keeps them). A claim that can
-// wait, short only by the room waiting claims ranked above it hold, waits
-// as their holds end.
+// The one rule. The units that cost nothing and cannot be sized go first. Then
+// a claim that can wait (never the host's, whose pass's target is net of what
+// lands) waits when what is landing, with its own lanes' owed copies, meets its
+// need (or would, but for claims ranked above it). Else, when the most the
+// order gives (bound) meets the rest, its units are taken one at a time until
+// what they freed now and later meets it (take), and the claim waits for what
+// lands unless they meet it alone; one they do not meet waits while what it
+// reached or started lands, else is Short. Else nothing is taken, and it waits
+// when every copy in flight or owed would meet it. A claim refused bytes lacks
+// what admission asks beyond the room: its need plus the room held against it.
+// A need met in place lacks no bytes. A need the host refused counts only units
+// that leave memory in place, and the host's claim lacks its need beyond the
+// units that cost nothing, since room under the engine's limit returns nothing
+// to the host. State buffers the units free meet a need of bytes once they
+// leave the model's pool, so the units that cost nothing go again (a need in
+// place keeps them). A claim that can wait, short only by the room waiting
+// claims ranked above it hold, waits as their holds end.
 FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBytes, bool critical, bool exempts) {
   const uint32_t id = claimId.value;
   ClaimState &claim = claims_.at(id);

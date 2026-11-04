@@ -79,17 +79,12 @@ inline engine::FreeResult freeFromCache(engine::Cache &cache, const engine::Clai
 inline constexpr engine::ClaimSpec kInServiceGrowth{.cls = engine::ClaimClass::InService,
                                                     .reach = engine::ReclaimClass::InUse};
 
-// Whether a claim or a step took something: it is met, or it freed bytes,
-// pages or state buffers, now or as what it started lands.
-inline bool took(const engine::FreeResult &result) {
-  return result.outcome == engine::FreeOutcome::Met || result.nowBytes || result.laterBytes || result.pages ||
-         result.stateBuffers;
-}
-// One step of the cache's take for a claim (Cache::take, as
-// MemoryLedger::free makes them): its units in order, past those a claim
-// that cannot wait passes over, until one takes something. For a page or a
-// device need that is one eviction or one memory reclaim; Short when none
-// takes anything, Pending when a transfer in flight holds what it needs.
+// One step of the cache's take for a claim (Cache::take): its units in
+// order, past those a claim that cannot wait passes over, until one gives
+// something. For a page or a device need that is one eviction or one
+// memory reclaim; Short when none gives anything, Pending when a transfer
+// in flight holds what it needs. The ledger's order across sources and its
+// stop at a pending unit are not part of it (freeFromCache has them).
 inline engine::FreeResult takeStep(engine::Cache &cache, const engine::ClaimSpec &spec, const engine::Need &need) {
   const engine::VictimQuery query{.claim = &spec, .need = need};
   const bool immediate = spec.timing == engine::NeedTiming::Immediate || need.hostRefused;
@@ -98,7 +93,7 @@ inline engine::FreeResult takeStep(engine::Cache &cache, const engine::ClaimSpec
     if (immediate && unit->later)
       continue;
     const engine::FreeResult taken = cache.take(query, *unit);
-    if (took(taken))
+    if (taken.gave())
       return taken;
     if (taken.outcome == engine::FreeOutcome::Pending)
       result.outcome = engine::FreeOutcome::Pending;

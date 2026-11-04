@@ -279,7 +279,7 @@ enum class SpilledExtents : uint8_t { KeepRunway, Released };
 // first, and its page returns when the copy lands. Immediate (a state's
 // buffers, taken between commands): only leaves whose page frees now go,
 // through their disk copy or erased; a leaf that needs a demotion is passed
-// over. What happens to a state is the caller's StateCache::Unwritten.
+// over. A state that needs a write waits for it.
 enum class ReclaimTiming : uint8_t { CanWait, Immediate };
 
 // The class of a state a command captures, which bounds what is taken for
@@ -689,8 +689,6 @@ public:
   [[nodiscard]] std::optional<engine::Victim> peek(const VictimQuery &query,
                                                    const engine::Victim *after) const override;
   FreeResult take(const VictimQuery &query, const engine::Victim &victim) override;
-  // The phases of a device or a page need's reclaims (Unit::Reclaim).
-  enum class ReclaimPhase : uint8_t { Now, Later, UsedNow, UsedLater };
   // What the transfers in flight and the copies Spill requests owe free as
   // they land. Landing: demotions whose pages free as they land
   // (freesOnLanding), by the form of their pages, and the pages
@@ -846,15 +844,15 @@ private:
     bool kv = false;
   };
 
-  // The units of the walk peek() and take() go over, and the reclaim steps
-  // with them (Victim::key holds the unit above the block's id): the empty
-  // extents of the other forms released, for a page need; a windowed
-  // cache's trims; a phase of the reclaims for a device or a page need
-  // (takeReclaim, evictOne), whose id holds the phase; a checkpoint in RAM;
-  // a KV leaf no state restores through; an ordinary state in RAM or a
-  // resident KV leaf, or in a page scan the state in RAM on the leaf that
-  // goes next; and the same of what is in use. peek() gives a state need's states as units of their own,
-  // and the reclaim steps take the leaves.
+  // The units of the walk peek() and take() go over, and the reclaim steps with
+  // them (Victim::key holds the unit above the block's id): the empty extents
+  // of the other forms released, for a page need; a windowed cache's trims; a
+  // phase of the reclaims for a device or a page need (takeReclaim, evictOne),
+  // whose id holds the phase; a checkpoint in RAM; a KV leaf no state restores
+  // through; an ordinary state in RAM or a resident KV leaf, or in a page scan
+  // the state in RAM on the leaf that goes next; and the same of what is in
+  // use. peek() gives a state need's states as units of their own, and the
+  // reclaim steps take the leaves.
   enum class Unit : uint8_t {
     Extent = 1,
     Trim,
@@ -995,6 +993,8 @@ private:
   // What peek() reports of a state unit the walk reaches, none when taking
   // it frees nothing.
   [[nodiscard]] std::optional<engine::Victim> victimOf(const WalkUnit &unit) const;
+  // The phases of a device or a page need's reclaims (Unit::Reclaim).
+  enum class ReclaimPhase : uint8_t { Now, Later, UsedNow, UsedLater };
   // At most what a walk's reclaims of a class free, from counts: of each
   // form, the whole extents of the pages within the class's reach, but the
   // idle pages of the chains it keeps, the free pages a KV need takes and
@@ -1079,16 +1079,15 @@ private:
   // a transfer in flight can return what is needed (returns). With `reach`,
   // a leaf goes only where it leads to an extent in reach (takeOldest).
   [[nodiscard]] ReclaimResult evictOne(const Walk &walk, std::optional<std::array<bool, 3>> reach = std::nullopt);
-  // The units of the walk from the cursor on, each taken in turn until one
-  // goes, which it returns. One that waits for a transfer in flight leaves
-  // the others to go: a checkpoint ends the checkpoints, a state holds back
-  // the newer states of its class, and once a demotion has to wait for the
-  // tier, the leaves of its class that need one stay. Nothing once all
-  // stay. With `reach`, the forms whose extents evicting KV may still empty
-  // (formsInReach), a leaf that leads to none of them (leadsToReach) frees
-  // no memory, and the walk passes over it.
-  [[nodiscard]] std::optional<Victim> takeOldest(const Walk &walk, WalkCursor cursor,
-                                                 std::optional<std::array<bool, 3>> reach = std::nullopt);
+  // The units of the walk, each taken in turn until one goes, which it returns.
+  // One that waits for a transfer in flight leaves the others to go: a
+  // checkpoint ends the checkpoints, a state holds back the newer states of its
+  // class, and once a demotion has to wait for the tier, the leaves of its
+  // class that need one stay. Nothing once all stay. With `reach`, the forms
+  // whose extents evicting KV may still empty (formsInReach), a leaf that leads
+  // to none of them (leadsToReach) frees no memory, and the walk passes over
+  // it.
+  [[nodiscard]] std::optional<Victim> takeOldest(const Walk &walk, std::optional<std::array<bool, 3>> reach);
   // The first state of the walk, of states alone, goes as the walk says: the
   // oldest checkpoint, else the oldest ordinary state, then, up to InUse, a
   // state in use. A state that needs a write the walk passes over leaves the
@@ -1164,8 +1163,7 @@ private:
   // that hold the only K/V of its chain's blocks: a redundant copy goes
   // once no state on disk restores through it.
   [[nodiscard]] bool freeDiskSpace(bool inUse, bool active);
-  // freeDiskSpace's choice, without giving it up: the copy it gives up
-  // next.
+  // freeDiskSpace's choice: the copy it gives up next.
   enum class DiskVictim : uint8_t { KvCopy, StateCopy, KvLeaf, StateOnly, StateInUse };
   struct DiskReplacement final {
     DiskVictim kind;

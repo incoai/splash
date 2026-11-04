@@ -127,6 +127,11 @@ struct FreeResult final {
   // (Victim::stepwise), and free()'s units.
   uint32_t pages = 0;
   uint32_t stateBuffers = 0;
+
+  // It gave something: met, or memory, pages or buffers.
+  [[nodiscard]] bool gave() const noexcept {
+    return outcome == FreeOutcome::Met || nowBytes || laterBytes || pages || stateBuffers;
+  }
 };
 
 // What taking a unit gives up besides its bytes, which the claim's class
@@ -148,8 +153,7 @@ struct Victim final {
   // bytes are at least what peek gives (available() counts them)
   bool sized = true;
   // Taken a step at a time (the cache's reclaims): each take makes one step
-  // and reports what it freed, pages and buffers too, and the unit stays at
-  // the head of its source while steps free something. Any other unit goes
+  // and reports what it freed, pages and buffers too. Any other unit goes
   // whole in one take, at the pages and buffers peek gave.
   bool stepwise = false;
   ReclaimClass cls = ReclaimClass::Ordinary;

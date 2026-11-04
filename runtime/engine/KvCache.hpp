@@ -264,12 +264,8 @@ public:
   // In a persistent cache, the oldest holder of a disk copy that no request
   // reads and no state needs: a redundant copy once no state with a disk
   // copy sits at its block or below, as a state in RAM restores through the
-  // page, and the only copy of a spilled or disk-only leaf without a state;
-  // the next after `after`.
-  [[nodiscard]] std::optional<CacheEvictionCandidate>
-  unneededCopy(const std::optional<CacheEvictionCandidate> &after = {}) const noexcept {
-    return after ? unneeded_.next(*after) : unneeded_.oldest();
-  }
+  // page, and the only copy of a spilled or disk-only leaf without a state.
+  [[nodiscard]] std::optional<CacheEvictionCandidate> unneededCopy() const noexcept { return unneeded_.oldest(); }
   // The blocks below a block, each after its children, visiting only that
   // subtree; empty when one of them is in transfer or active. Below a
   // resident leaf they are disk-only; below a poisoned block some may be
