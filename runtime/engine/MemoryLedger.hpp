@@ -373,6 +373,9 @@ private:
   // memory that appears. A claim of no request never holds it (requests
   // first).
   [[nodiscard]] bool holdsGrowth() const noexcept;
+  // What `added` state buffers give a need of bytes as they leave the
+  // model's pool, beyond the `before` ones counted already (setBufferBytes).
+  [[nodiscard]] uint64_t bufferBytes(const Lacking &lack, uint32_t before, uint32_t added) const;
   // The most the units the claim's class may take give it, counted in the
   // one order without taking any, up to the lack.
   [[nodiscard]] Run bound(const ClaimSpec &spec, const VictimQuery &query, const Lacking &lack) const;

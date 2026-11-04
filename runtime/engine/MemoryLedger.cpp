@@ -54,9 +54,10 @@ struct MemoryLedger::Lacking final {
   uint32_t buffers = 0;
 
   [[nodiscard]] bool none() const noexcept { return !bytes && !pages && !buffers; }
-  // Whether a unit meets any of the need, in any measure.
+  // Whether a unit meets any of the need, in any measure; a need of bytes
+  // counts its state buffers too, once they leave the model's pool.
   [[nodiscard]] bool meets(const Victim &victim) const noexcept {
-    return (bytes && victim.bytes) || (pages && victim.form == form && victim.pages) ||
+    return (bytes && (victim.bytes || victim.stateBuffers)) || (pages && victim.form == form && victim.pages) ||
            (buffers && victim.stateBuffers);
   }
   // Whether these amounts meet it, in any measure.
@@ -414,72 +415,45 @@ private:
   bool inService_ = false;
 };
 
-// The most the order gives a claim, counted without taking: each unit at
-// what its source says it frees at most (VictimSource::peek). A unit's
-// state buffers count for a need of bytes as what the model's pool releases
-// of them beyond the units counted before (setBufferBytes). A unit whose
-// buffers the pool keeps (they refill those a lane starts from) meets no
-// need of bytes alone: it is carried to the next unit counted from its
-// source and counted with it. A unit that meets none of the need otherwise,
-// or that lands later for an Immediate claim, is skipped.
+uint64_t MemoryLedger::bufferBytes(const Lacking &lack, uint32_t before, uint32_t added) const {
+  if (!lack.bytes || !added || !bufferBytes_)
+    return 0;
+  return less(bufferBytes_(before + added), bufferBytes_(before));
+}
+
+// The most the order gives a claim, counted without taking: the units
+// take() would take, in its order, each at what its source says it frees
+// at most (VictimSource::peek). A unit's state buffers count for a need of
+// bytes as what the model's pool releases of them beyond the units counted
+// before (setBufferBytes). A unit that meets none of the need, or that
+// lands later for an Immediate claim, is skipped.
 MemoryLedger::Run MemoryLedger::bound(const ClaimSpec &spec, const VictimQuery &query, const Lacking &lack) const {
   Order order(*this, spec, query);
-  std::vector<Victim> carried(order.heads.size());
-  const auto withCarried = [&](const Order::Head &head) {
-    Victim unit = *head.victim;
-    const Victim &each = carried[static_cast<size_t>(&head - order.heads.data())];
-    unit.bytes = plus(unit.bytes, each.bytes);
-    if (each.form == unit.form)
-      unit.pages += each.pages;
-    unit.stateBuffers += each.stateBuffers;
-    unit.later = unit.later || each.later;
-    return unit;
-  };
   Run run;
-  const auto counted = [&](const Victim &victim) {
-    Victim unit = victim;
-    if (lack.bytes && victim.stateBuffers && bufferBytes_)
-      unit.bytes = plus(unit.bytes, less(bufferBytes_(run.buffers + victim.stateBuffers), bufferBytes_(run.buffers)));
-    return unit;
-  };
   for (;;) {
     Order::Head *best = nullptr;
     for (Order::Head &head : order.heads) {
-      // Keep a unit that lands later in an Immediate claim's way, to note
-      // that the run reached it.
-      while (head.victim) {
-        if (!order.mayTake(*head.victim)) {
-          order.pass(head);
-        } else if (lack.meets(counted(withCarried(head)))) {
-          break;
-        } else if (lack.bytes && head.victim->stateBuffers && !(order.immediate && head.victim->later)) {
-          carried[static_cast<size_t>(&head - order.heads.data())] = withCarried(head);
-          order.pass(head);
-        } else {
-          order.pass(head);
-        }
-      }
+      while (head.victim && (!order.mayTake(*head.victim) || !lack.meets(*head.victim)))
+        order.pass(head);
       if (head.victim && (!best || Order::stage(head) < Order::stage(*best)))
         best = &head;
     }
     if (!best)
       break;
-    Victim &held = carried[static_cast<size_t>(best - order.heads.data())];
-    const Victim victim = counted(withCarried(*best));
+    const Victim victim = *best->victim;
+    order.pass(*best);
     if (victim.later && victim.kind == VictimKind::Memory)
       run.uncopied = true;
-    if (victim.later && order.immediate) {
-      order.pass(*best);
+    // Kept in an Immediate claim's way until here, to note that the run
+    // reached it.
+    if (victim.later && order.immediate)
       continue;
-    }
     if (!spec.takesUnits)
       break;
-    run.bytes = plus(run.bytes, victim.bytes);
+    run.bytes = plus(run.bytes, plus(victim.bytes, bufferBytes(lack, run.buffers, victim.stateBuffers)));
     if (victim.form == lack.form)
       run.pages += victim.pages;
     run.buffers += victim.stateBuffers;
-    held = {};
-    order.pass(*best);
     if (lack.covered(run.bytes, run.pages, run.buffers)) {
       run.covered = true;
       break;
@@ -502,18 +476,12 @@ MemoryLedger::Run MemoryLedger::bound(const ClaimSpec &spec, const VictimQuery &
 MemoryLedger::Run MemoryLedger::take(const ClaimSpec &spec, const VictimQuery &query, const Lacking &lack) {
   Order order(*this, spec, query);
   Run run{.freed = {.outcome = FreeOutcome::Met}};
-  const auto useful = [&](const Victim &victim) {
-    return lack.meets(victim) || (lack.bytes && victim.stateBuffers);
-  };
-  // A claim that can wait waits for what a transfer in flight returns of a
-  // unit before it takes a unit of a later stage, unless it started
-  // transfers of that source itself: what they return it counts already.
+  // A pending unit holds back the stages after the cache's writes.
   int ceiling = std::numeric_limits<int>::max();
-  std::vector<bool> started(order.heads.size());
   while (!lack.none() && !lack.covered(run.bytes, run.pages, run.buffers)) {
     Order::Head *best = nullptr;
     for (Order::Head &head : order.heads) {
-      while (head.victim && (!order.mayTake(*head.victim) || !useful(*head.victim) ||
+      while (head.victim && (!order.mayTake(*head.victim) || !lack.meets(*head.victim) ||
                              (order.immediate && head.victim->later))) {
         if (head.victim->later && head.victim->kind == VictimKind::Memory && order.mayTake(*head.victim))
           run.uncopied = true;
@@ -553,9 +521,7 @@ MemoryLedger::Run MemoryLedger::take(const ClaimSpec &spec, const VictimQuery &q
       order.pass(*best);
       continue;
     }
-    const uint64_t buffers = lack.bytes && taken.stateBuffers && bufferBytes_
-                                 ? less(bufferBytes_(run.buffers + taken.stateBuffers), bufferBytes_(run.buffers))
-                                 : 0;
+    const uint64_t buffers = bufferBytes(lack, run.buffers, taken.stateBuffers);
     if (taken.outcome == FreeOutcome::Pending)
       run.freed.outcome = FreeOutcome::Pending;
     run.freed.nowBytes = plus(run.freed.nowBytes, taken.nowBytes);
@@ -684,7 +650,7 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
       // the need in place: a need of bytes beside buffers no state can give
       // (Model::statesToActivate with no ring idle) is met by their bytes.
       const bool metInPlace = need.stateBuffers && run->buffers >= need.stateBuffers;
-      if (run->buffers && !metInPlace)
+      if (bufferBytes(lack, 0, run->buffers) && !metInPlace)
         taken.nowBytes = plus(taken.nowBytes, takeUnsized(query));
       const bool alone = (lackingBytes && run->bytes >= lackingBytes) ||
                          (lackingPages && run->pages >= lackingPages) ||

@@ -685,10 +685,8 @@ void testSourceOrderIsKeptWithinASource() {
           "free() skipped ahead inside a source's order");
 }
 
-// A source's units keyed by their place in its order, as the cache's
-// reclaims are (steps from its state as it stands): taking one moves every
-// unit after it up a place. Cumulative, taking one takes every unit before
-// it too, as taking a reclaim takes the steps before it.
+// A source's units keyed by their place in its order: taking one moves
+// every unit after it up a place and leaves those before it in place.
 class PlacedSource final : public VictimSource {
 public:
   [[nodiscard]] std::string_view name() const noexcept override { return "placed"; }
@@ -701,23 +699,17 @@ public:
     return victim;
   }
   FreeResult take(const VictimQuery &, const Victim &victim) override {
-    const size_t first = cumulative ? 0 : victim.key;
-    uint64_t bytes = 0;
-    for (size_t place = first; place <= victim.key; ++place) {
-      taken.push_back(units.at(place).first);
-      bytes += units[place].second.bytes;
-    }
-    units.erase(units.begin() + static_cast<std::ptrdiff_t>(first),
-                units.begin() + static_cast<std::ptrdiff_t>(victim.key + 1));
+    taken.push_back(units.at(victim.key).first);
+    const uint64_t bytes = units[victim.key].second.bytes;
+    units.erase(units.begin() + static_cast<std::ptrdiff_t>(victim.key));
     return {.outcome = FreeOutcome::Met, .nowBytes = bytes};
   }
   std::vector<std::pair<uint64_t, Victim>> units;  // the test's name for each unit, and the unit
   std::vector<uint64_t> taken;
-  bool cumulative = false;
 };
 
-// free() takes the units its dry run chose from a source keyed by place, each at its place after the takes before
-// it; skipped units stay.
+// free() takes the units of a source keyed by place, each at its place after the takes before it; a unit the
+// claim's class may not take stays.
 void testUnitsKeyedByTheirPlaceAreTakenAsChosen() {
   MemoryLedger ledger;
   PlacedSource placed;
@@ -733,29 +725,23 @@ void testUnitsKeyedByTheirPlaceAreTakenAsChosen() {
           "the claim was not met");
   require(placed.taken == std::vector<uint64_t>{1, 3, 4} && other.taken == std::vector<uint64_t>{5} &&
               placed.units.size() == 1 && placed.units.front().first == 2,
-          "free() did not take the units its dry run chose from a source keyed by place");
+          "free() did not take the units of a source keyed by place at their places");
 }
 
-// A state whose buffers the model's pool keeps meets none of a bytes need alone; free() takes it together with the
-// next unit its dry run weighed.
-void testAStateThePoolKeepsGoesWithTheNextUnitOfItsSource() {
+// A need of bytes counts the state buffers its units free as what the model's pool releases of them: the first
+// state's buffer the pool keeps gives nothing, the second's gives its bytes, so the two states and one unit meet a
+// need of two units.
+void testStateBuffersCountBeyondThoseThePoolKeeps() {
   MemoryLedger ledger;
   PlacedSource placed;
-  placed.cumulative = true;
   const Victim state{.stateBuffers = 1};
-  placed.units = {{1, unit(0, kGiB)}, {2, state}, {3, unit(0, kGiB)}, {4, state}, {5, unit(0, kGiB)}};
+  placed.units = {{1, state}, {2, state}, {3, unit(0, kGiB)}, {4, unit(0, kGiB)}};
   ledger.addSource(placed);
-  ledger.setBufferBytes([](uint32_t) { return uint64_t{0}; });
+  ledger.setBufferBytes([](uint32_t buffers) { return buffers > 1 ? uint64_t{buffers - 1} * kGiB : 0; });
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
-  FreeResult freed;
-  try {
-    freed = ledger.free(claim, {.bytes = 3 * kGiB}, 0, false);
-  } catch (const std::logic_error &error) {
-    require(false, std::string("free() took other units than its dry run weighed: ") + error.what());
-  }
-  require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 3 * kGiB &&
-              placed.taken == std::vector<uint64_t>{1, 2, 3, 4, 5},
-          "free() did not take the states with the units after them, as its dry run weighed");
+  const FreeResult freed = ledger.free(claim, {.bytes = 2 * kGiB}, 0, false);
+  require(freed.outcome == FreeOutcome::Met && placed.taken == std::vector<uint64_t>{1, 2, 3},
+          "free() did not count the bytes of the state buffers the model's pool releases");
 }
 
 // What each claim class may take, from units of distinct sizes: the take table of free now, certain reuse,
@@ -1255,8 +1241,8 @@ void testAvailableTakesNothing() {
   require(cache.taken.empty() && pool.units() == 3 && pool.shrinks == 0, "available() took something");
 }
 
-// available() is free() as a dry run: what lands and what the claim's request owes count for a claim that can wait,
-// not for an Immediate one.
+// available() counts what free() would take, taking nothing: what lands and what the claim's request owes count for
+// a claim that can wait, not for an Immediate one.
 void testAvailableCountsWhatLandsForAClaimThatCanWait() {
   MemoryLedger ledger;
   TestSource cache("cache");
@@ -2073,7 +2059,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testGrowthLeavesTheHostWhatAStartItRefusedWaitsFor", testGrowthLeavesTheHostWhatAStartItRefusedWaitsFor},
       {"testSourceOrderIsKeptWithinASource", testSourceOrderIsKeptWithinASource},
       {"testUnitsKeyedByTheirPlaceAreTakenAsChosen", testUnitsKeyedByTheirPlaceAreTakenAsChosen},
-      {"testAStateThePoolKeepsGoesWithTheNextUnitOfItsSource", testAStateThePoolKeepsGoesWithTheNextUnitOfItsSource},
+      {"testStateBuffersCountBeyondThoseThePoolKeeps", testStateBuffersCountBeyondThoseThePoolKeeps},
       {"testClassBoundsEligibility", testClassBoundsEligibility},
       {"testAHostRefusedNeedTakesOnlyWhatFreesNow", testAHostRefusedNeedTakesOnlyWhatFreesNow},
       {"testRoomHeldForHigherRanksMakesAWait", testRoomHeldForHigherRanksMakesAWait},
