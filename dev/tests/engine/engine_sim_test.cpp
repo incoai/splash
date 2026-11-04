@@ -94,6 +94,25 @@ const Machine kStudio18G{
     .commandRows = 8192,
 };
 
+// Qwen3.6-35B-A3B at --max-memory 18G on the Studio, streaming its experts
+// without HiSparse: no Index pages, no Spill, the store's floor 10 of its 12
+// chunks (0.85 of the cap, whole chunks).
+const Machine k35BStudio18G{
+    .name = "studio-18g-35b",
+    .profile = &test::k35BStudio18G,
+    .limitBytes = 19'327'352'832,
+    .untrackedBytes = 805'306'368,
+    .fixedBytes = 18'378'746'256 - 805'306'368 - 12ULL * 560 * 1'911'603,
+    .hostBytes = 38'654'705'664,
+    .otherBytes = 38'654'705'664 - 16'091'482'912 - 12'678'086'656,
+    .hostReserveBytes = 2'147'483'648,
+    .hostSpareReserveBytes = 2'705'829'392,
+    .pageBytes = 332'800,
+    .laneStateBytes = 181'469'184 / 4,
+    .store = {.unitBytes = 560 * 1'911'603, .floor = 10, .cap = 12, .whole = 18},
+    .commandRows = 8192,
+};
+
 std::string at(const Machine &machine) { return std::string(machine.name) + ": "; }
 
 // A scenario's numbers, beside its verdict.
@@ -173,7 +192,7 @@ struct Serving final {
   static engine::NativeLoopConfig config(const Machine &machine) {
     engine::NativeLoopConfig result;
     result.engine.maxContext = 262'144;
-    result.engine.spill = {.capable = true,
+    result.engine.spill = {.capable = machine.spill.fullPageBytes != 0,
                            .denseTokens = machine.spill.densePages * engine::KvCache::pageTokens,
                            .geometry = machine.spill};
     return result;
@@ -208,7 +227,8 @@ struct Serving final {
                                     .transferLimit = 64,
                                     .bytesPerMillisecond = 100.0 * machine.profile->weightBytesPerMillisecond /
                                                            (64.0 * double(machine.pageBytes))};
-    result.cacheSpill = engine::CacheSpillPolicy{machine.spill.densePages, machine.spill.windowPages};
+    if (machine.spill.fullPageBytes)
+      result.cacheSpill = engine::CacheSpillPolicy{machine.spill.densePages, machine.spill.windowPages};
     return result;
   }
 
@@ -486,12 +506,78 @@ void testLongPromptBesideTwoDecoders() {
        std::to_string(alone) + " ms alone");
 }
 
+// Three 60K prompts at once, 2,000 tokens of output each, with the model's states written behind to the
+// SSD cache as the 35B's are; runs until they end, observing each step, and gives their prompts.
+std::vector<std::vector<uint32_t>> burst(Serving &serving, const std::function<void()> &observe) {
+  serving.fixture.executor.keptTier = std::make_shared<test::OffloadControl>();
+  serving.fixture.executor.keptTier->ready = true;
+  std::vector<std::vector<uint32_t>> prompts;
+  for (uint64_t id = 1; id <= 3; ++id) {
+    prompts.push_back(prompt(id, 60'000));
+    serving.submit(id, prompts.back(), 2'000);
+  }
+  serving.run([&] { return serving.ended.size() == 3; }, observe, "the burst did not end");
+  require(serving.errors.empty(), at(serving.machine) + "a request of the burst failed");
+  return prompts;
+}
+
+// The block each prompt's resume point sits on, none without one. A probe leaves the LRU as it is.
+std::vector<std::optional<uint64_t>> resumeBlocks(Serving &serving,
+                                                  const std::vector<std::vector<uint32_t>> &prompts) {
+  std::vector<std::optional<uint64_t>> result;
+  for (const std::vector<uint32_t> &tokens : prompts) {
+    const engine::CacheProbe probe = serving.fixture.cache.probe(tokens, {});
+    const std::span<const uint64_t> chain = probe.restoredChain();
+    result.push_back(chain.empty() ? std::nullopt : std::optional<uint64_t>(chain.back()));
+  }
+  return result;
+}
+
+// The 35B (store floor 0.85 of its cap) after a burst of three 60K prompts that took a store chunk: the
+// chunk comes back no sooner than a quiet period after the burst took it and within a minute of the
+// last request's end, from cache that frees now: no write starts for it, the newest conversation's
+// resume point stays in RAM, and the copies written ahead while idle stay within the chunk.
+void testRegrowthAfterABurstTakesOnlyCopiedOrDeadCache() {
+  const Machine &machine = k35BStudio18G;
+  Serving serving(machine);
+  std::vector<std::pair<double, uint32_t>> moves;
+  const auto observe = [&] {
+    if (const uint32_t units = serving.experts->units(); moves.empty() ? units != machine.store.cap
+                                                                        : units != moves.back().second)
+      moves.emplace_back(serving.now(), units);
+  };
+  const std::vector<std::vector<uint32_t>> prompts = burst(serving, observe);
+  require(moves.size() == 1 && moves.front().second == machine.store.cap - 1,
+          at(machine) + "the burst did not take exactly one store chunk");
+  const double taken = moves.front().first, ended = serving.now();
+  const std::optional<uint64_t> newest = resumeBlocks(serving, prompts).back();
+  require(newest && serving.fixture.cache.stateResident(*newest),
+          at(machine) + "the burst did not leave its newest conversation a resume point in RAM");
+  const engine::CacheSnapshot idle = serving.fixture.cache.snapshot();
+  serving.run([&] { return serving.now() >= ended + 90'000.0; }, observe, "the idle time did not pass");
+  const engine::CacheSnapshot regrown = serving.fixture.cache.snapshot();
+  const double copiedBytes = double(regrown.kvTier.copies - idle.kvTier.copies) * double(machine.pageBytes);
+  require(moves.size() == 2 && moves.back().second == machine.store.cap &&
+              moves.back().first >= taken + 1000.0 * engine::kRegrowQuietSeconds &&
+              moves.back().first <= ended + 60'000.0,
+          at(machine) + "the store did not regrow its chunk between a quiet period after the burst took it and " +
+              "a minute after the last request");
+  require(serving.fixture.cache.stateResident(*newest) && regrown.kvTier.demotions == idle.kvTier.demotions &&
+              copiedBytes <= double(machine.store.unitBytes),
+          at(machine) + "regrowth took the newest resume point, wrote cache to take it, or copied more than " +
+              "a chunk ahead");
+  note(at(machine) + "the burst took a chunk at " + std::to_string(taken / 1000.0) + " s, the last request ended at " +
+       std::to_string(ended / 1000.0) + " s, the chunk came back at " + std::to_string(moves.back().first / 1000.0) +
+       " s after " + std::to_string(copiedBytes / double(1 << 20)) + " MiB of copies while idle");
+}
+
 } // namespace
 
 std::span<const test::TestCase> simTests() {
   static constexpr test::TestCase kTests[] = {
       {"testLongPromptBesideTwoDecoders", testLongPromptBesideTwoDecoders},
       {"testChurnKeepsTheStoreThroughAHostEpisode", testChurnKeepsTheStoreThroughAHostEpisode},
+      {"testRegrowthAfterABurstTakesOnlyCopiedOrDeadCache", testRegrowthAfterABurstTakesOnlyCopiedOrDeadCache},
   };
   return kTests;
 }
