@@ -993,7 +993,7 @@ int main(int argc, char **argv) {
     const double startWaitMilliseconds =
         firstRefusal ? std::chrono::duration<double, std::milli>(AwakeClock::now() - *firstRefusal).count()
                      : 0.0;
-    // start() returns once the loop has announced Ready.
+    bootstrap->announceReady();
     if (!bootstrap->nativeLoop().engineHealthy() ||
         bootstrap->nativeLoop().commandInFlight())
       throw std::runtime_error("benchmark production bootstrap did not finish idle and ready");

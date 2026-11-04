@@ -396,9 +396,19 @@ int serveNative(int argc, char **argv) {
   } catch (const std::exception &) {
     return refuseStart(transport, argv[0]);
   }
-  if (transport.shutdownRequested())
-    return static_cast<int>(engine::NativeProcessExit::CleanEof);
   published = bootstrap.get();
+  // Ready follows the start, out of refuseStart's reach: the server takes a
+  // StartFailed after Ready for a protocol failure, so a failure from Ready
+  // on ends the process with its report alone.
+  try {
+    bootstrap->announceReady();
+  } catch (const std::exception &) {
+    // A stop requested meanwhile ends the process as a stop: it cuts the
+    // Ready write short (FdTransport::writeAll), which is no failure.
+    if (transport.shutdownRequested())
+      return static_cast<int>(engine::NativeProcessExit::CleanEof);
+    throw;
+  }
 
   transport.setControlHandler([&pressureMonitor, published] {
     return published->controlPass(pressureMonitor->pressure());

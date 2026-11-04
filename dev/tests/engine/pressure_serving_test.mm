@@ -80,6 +80,7 @@ struct Served final {
           std::move(config),
           [this](std::span<const uint8_t> bytes) { output.insert(output.end(), bytes.begin(), bytes.end()); },
           [] { return std::string(); });
+      bootstrap->announceReady();
     });
     require(bootstrap && resources().streamedExpertStats() && resources().streamedExpertStats()->capChunks > 1,
             "the target's experts did not stream in chunks");

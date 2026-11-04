@@ -62,8 +62,6 @@ std::string_view runtimeBootstrapStageName(RuntimeBootstrapStage stage) {
     return "composite_state_restore";
   case RuntimeBootstrapStage::MemoryAudit:
     return "memory_audit";
-  case RuntimeBootstrapStage::AnnounceReady:
-    return "announce_ready";
   case RuntimeBootstrapStage::Ready:
     return "ready";
   }
@@ -172,12 +170,13 @@ protocol::StartFailedEvent startFailedEvent(const RuntimeBootstrapReport &report
 RuntimeBootstrap::RuntimeBootstrap(std::unique_ptr<RuntimeResources> resources,
                                    std::unique_ptr<model::RuntimeModel> modelRuntime,
                                    std::unique_ptr<NativeRuntime> nativeLoop,
+                                   protocol::ReadyEvent ready,
                                    RuntimeBootstrapReport report)
     : resources_(std::move(resources)), model_(std::move(modelRuntime)),
       nativeLoop_(std::move(nativeLoop)),
       memoryControl_(resources_->memoryGovernor(), resources_->backend(),
                      *nativeLoop_),
-      report_(std::move(report)) {
+      ready_(std::move(ready)), report_(std::move(report)) {
   sampleThermalState();
 }
 
@@ -185,6 +184,14 @@ RuntimeBootstrap::~RuntimeBootstrap() {
   // Refuse new commands before the loop, the model and the resources they
   // reach are destroyed.
   resources_->backend().stop();
+}
+
+void RuntimeBootstrap::announceReady() {
+  // The per-operation guard RuntimeResources installed is only for startup:
+  // once Ready, the engine meets memory pressure between its ticks.
+  resources_->backend().setOperationGuard({});
+  nativeLoop_->announceReady(ready_);
+  resources_->beginServing();
 }
 
 std::string RuntimeBootstrap::statusJson(const RuntimeMetricsSnapshot &metrics,
@@ -209,10 +216,9 @@ void RuntimeBootstrap::sampleThermalState() {
     logLine(transition);
 }
 
-RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
+RuntimeBootstrapReport RuntimeBootstrap::requireWarmup(
     const EngineMemoryPlan &memoryPlan, model::RuntimeModel &modelRuntime, KvPool &kvPool,
-    ActualMemoryReporter memoryReporter, NativeRuntime &nativeLoop,
-    const protocol::ReadyEvent &ready) {
+    ActualMemoryReporter memoryReporter) {
   RuntimeBootstrapReport report = reportForPlan(memoryPlan);
   auto run = [&](RuntimeBootstrapStage stage, WarmupStepStatus &status,
                  auto &&operation, bool optional = false) {
@@ -304,16 +310,6 @@ RuntimeBootstrapReport RuntimeBootstrap::requireWarmupAndAnnounce(
   if (!report.memoryAudit.valid) {
     fail(report, RuntimeBootstrapStage::MemoryAudit,
          report.memoryAudit.describe());
-  }
-
-  try {
-    nativeLoop.announceReady(ready);
-  } catch (const std::exception &error) {
-    fail(report, RuntimeBootstrapStage::AnnounceReady,
-         std::string("ReadyEvent announcement failed: ") + error.what());
-  } catch (...) {
-    fail(report, RuntimeBootstrapStage::AnnounceReady,
-         "ReadyEvent announcement failed with an unknown exception");
   }
   report.stage = RuntimeBootstrapStage::Ready;
   report.message = "required warmup paths and memory audit passed";
@@ -452,7 +448,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   RuntimeResources *resourcesPointer = resources.get();
   model::RuntimeModel *modelPointer = modelRuntime.get();
   NativeRuntime *loopPointer = nativeLoop.get();
-  RuntimeBootstrapReport report = requireWarmupAndAnnounce(
+  RuntimeBootstrapReport report = requireWarmup(
       resources->memoryPlan(), *modelRuntime, resources->kvPool(),
       [resourcesPointer, modelPointer, loopPointer, pressure = config.resources.memoryPressure] {
         // Audit every attempted warmup before reclaiming idle buffers.
@@ -485,16 +481,11 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
         resourcesPointer->memoryGovernor().growToTargets(loopPointer->monotonicMilliseconds(),
                                                          pressure ? pressure() : MemoryPressure::Normal);
         return report;
-      },
-      *nativeLoop, ready);
+      });
 
-  // The per-operation guard RuntimeResources installed is only for startup:
-  // once Ready, the engine meets memory pressure between its ticks.
-  resources->backend().setOperationGuard({});
-  resources->beginServing();
   return std::unique_ptr<RuntimeBootstrap>(
       new RuntimeBootstrap(std::move(resources), std::move(modelRuntime),
-                           std::move(nativeLoop), std::move(report)));
+                           std::move(nativeLoop), ready, std::move(report)));
 }
 
 } // namespace splash::engine

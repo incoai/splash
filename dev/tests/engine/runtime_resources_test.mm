@@ -886,6 +886,7 @@ void testStartChecksTheReserveWithWhatItServes(const char *metallibPath) {
   static_cast<void>(test::capturedStderr([&] {
     bootstrap = RuntimeBootstrap::start(config, [](std::span<const uint8_t>) {},
                                         [] { return std::string(); });
+    bootstrap->announceReady();
   }));
   require(refused == 2, "the start checked the host before it gave back its warmups' idle state");
   // The warmups leave three lanes' state idle beside the lane the engine
@@ -1203,6 +1204,7 @@ void testAnExplicitRelaunchServesItsFirstContext(const char *metallibPath) {
     std::unique_ptr<RuntimeBootstrap> bootstrap;
     const std::string log = test::capturedStderr([&] {
       bootstrap = RuntimeBootstrap::start(config, [](std::span<const uint8_t>) {}, [] { return std::string(); });
+      bootstrap->announceReady();
     });
     const std::string status = bootstrap->statusJson(metrics.snapshot(), {});
     const std::string field = "\"maximum_context_tokens\":";
@@ -1307,6 +1309,7 @@ std::unique_ptr<RuntimeBootstrap> bootstrapOf(const RuntimeResourcesConfig &reso
   std::unique_ptr<RuntimeBootstrap> bootstrap;
   log = test::capturedStderr([&] {
     bootstrap = RuntimeBootstrap::start(config, [](std::span<const uint8_t>) {}, [] { return std::string(); });
+    bootstrap->announceReady();
   });
   return bootstrap;
 }

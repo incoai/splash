@@ -26,7 +26,6 @@ enum class RuntimeBootstrapStage {
     DecodeWarmup,
     CompositeStateRestore,
     MemoryAudit,
-    AnnounceReady,
     Ready,
 };
 
@@ -128,8 +127,9 @@ struct RuntimeBootstrapConfig {
 
 using ActualMemoryReporter = std::function<ActualMemoryReport()>;
 
-// Complete owner returned only after the native loop has sent its
-// ReadyEvent. No partially warmed instance escapes start().
+// The serving runtime: start() returns it built, warmed up and audited, and
+// it serves once announceReady() has sent Ready. Everything that can refuse
+// a start (StartFailed) runs in start(), so that nothing after Ready can.
 class RuntimeBootstrap final {
 public:
     [[nodiscard]] static std::unique_ptr<RuntimeBootstrap> start(
@@ -137,16 +137,14 @@ public:
         NativeRuntime::ByteSink output,
         NativeRuntime::StatusProvider statusProvider);
 
-    // Completes warmup and validation before announcing `ready`. Warmup
-    // runs on kvPool's runway (model::ExecutionLimits::warmupKvPages) and
-    // holds its pages while it runs (KvPool::RunwayHold).
-    [[nodiscard]] static RuntimeBootstrapReport requireWarmupAndAnnounce(
+    // Completes warmup and validation, at stage Ready. Warmup runs on
+    // kvPool's runway (model::ExecutionLimits::warmupKvPages) and holds its
+    // pages while it runs (KvPool::RunwayHold).
+    [[nodiscard]] static RuntimeBootstrapReport requireWarmup(
         const EngineMemoryPlan &memoryPlan,
         model::RuntimeModel &modelRuntime,
         KvPool &kvPool,
-        ActualMemoryReporter memoryReporter,
-        NativeRuntime &nativeLoop,
-        const protocol::ReadyEvent &ready);
+        ActualMemoryReporter memoryReporter);
 
     RuntimeBootstrap(const RuntimeBootstrap &) = delete;
     RuntimeBootstrap &operator=(const RuntimeBootstrap &) = delete;
@@ -159,6 +157,11 @@ public:
     [[nodiscard]] NativeRuntime &nativeLoop() noexcept {
         return *nativeLoop_;
     }
+
+    // Ends the start: sends Ready and begins serving. It throws when Ready
+    // cannot be sent or serving cannot begin, which ends the process: the
+    // server takes a StartFailed after Ready for a protocol failure.
+    void announceReady();
 
     // The control pass the transport runs at a command-free point: it
     // samples the thermal state, keeps the disk tier within what its volume
@@ -178,7 +181,7 @@ private:
     RuntimeBootstrap(std::unique_ptr<RuntimeResources> resources,
                      std::unique_ptr<model::RuntimeModel> modelRuntime,
                      std::unique_ptr<NativeRuntime> nativeLoop,
-                     RuntimeBootstrapReport report);
+                     protocol::ReadyEvent ready, RuntimeBootstrapReport report);
 
     // Records the thermal state macOS reports for the status document, and
     // logs a change: nothing else tells why serving slowed down. The control
@@ -191,6 +194,7 @@ private:
     std::unique_ptr<model::RuntimeModel> model_;
     std::unique_ptr<NativeRuntime> nativeLoop_;
     MemoryControl memoryControl_;
+    protocol::ReadyEvent ready_;
     RuntimeBootstrapReport report_;
     ThermalStateReporter thermalState_;
 };

@@ -728,6 +728,20 @@ void testOutputFailureClosesTheConnection() {
           "a failed output write failed the engine");
 }
 
+// A Ready the connection cannot carry fails the start, which serve-native
+// reports before it exits, instead of counting as announced.
+void testReadyThatCannotBeSentThrows() {
+  LoopFixture fixture({}, {.pages = 8});
+  fixture.writeFailure = std::system_error(EPIPE, std::generic_category(),
+                                           "write(native output)");
+  try {
+    fixture.loop.announceReady(protocol::peer::kTestReady);
+  } catch (const std::runtime_error &) {
+    return;
+  }
+  throw std::runtime_error("a Ready that was not sent counted as announced");
+}
+
 // Every path that stops the engine keeps its reason for the exit log, not
 // only the ones that report through engineError().
 void testEngineFailureNamesItsReason() {
@@ -1260,6 +1274,7 @@ std::span<const test::TestCase> wireTests() {
       {"testAdmissionExceptionStopsTheEngineOnce", testAdmissionExceptionStopsTheEngineOnce},
       {"testFrameFailureUsesExecutionBoundary", testFrameFailureUsesExecutionBoundary},
       {"testOutputFailureClosesTheConnection", testOutputFailureClosesTheConnection},
+      {"testReadyThatCannotBeSentThrows", testReadyThatCannotBeSentThrows},
       {"testEngineFailureNamesItsReason", testEngineFailureNamesItsReason},
       {"testOutOfVocabularyTokensStayRequestScoped", testOutOfVocabularyTokensStayRequestScoped},
       {"testAnnounceReadySendsTheReadyItIsGiven", testAnnounceReadySendsTheReadyItIsGiven},
