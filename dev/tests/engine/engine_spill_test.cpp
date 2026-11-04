@@ -186,6 +186,36 @@ void testConversionSpillsAHistoryWithCopies() {
           "the lane whose history had copies did not spill them when it converted");
 }
 
+// A lane that converts at the wall where a start is not admitted, so that landed moves would keep an
+// empty Full extent as the runway, releases every Full extent its moves empty, compacted, and decodes
+// without a yield.
+void testAConvertedLanesMovesReleaseTheExtentsTheyEmpty() {
+  Spilling spill(1024);
+  const auto freeFullPages = [&] {
+    const KvPoolSnapshot pool = spill.pool.snapshot();
+    return pool.pagesFree - pool.index.pagesFree;
+  };
+  // Seven pages of prompt start Resident while the SSD cache takes no
+  // writes, and convert at the wall of the extents they hold.
+  spill.tier.writableFile = false;
+  spill.engine.submit(Spilling::prompt(1, 1, 7, 400));
+  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the lane did not decode");
+  spill.tier.writableFile = true;
+  spill.storage.budgetPages = static_cast<uint32_t>(spill.storage.allocatedBytes() / 100);
+  spill.runUntil([&] { return spill.engine.snapshot().spill.converted == 1; }, "the lane did not convert");
+  require(!spill.host.governor.admits(ClaimClass::Start), "a start was admitted at the wall");
+  spill.storage.budgetPages = 256;
+  // All its pages but the dense history and the window spill.
+  spill.runUntil([&] { return spill.cache.spillSnapshot().spilledPages >= 5 && !spill.engine.commandInFlight(); },
+                 "the converted lane's pages did not spill");
+  require(freeFullPages() < spill.pool.extentPages(),
+          "the converted lane's moves kept a Full extent they emptied at the wall");
+  spill.runUntilIdle();
+  require(spill.events.completedCount == 1 && spill.events.failedCount == 0 &&
+              spill.engine.snapshot().resourceSuspensions == 0,
+          "the converted lane failed or yielded");
+}
+
 // Flash-Next's proportions: 256-page extents, 423,936 B Full and 24,576 B Index pages, a 390 MiB hot
 // block floor, and a dense history and tail window of a page each.
 struct FlashNextLanes {
@@ -2132,6 +2162,7 @@ std::span<const test::TestCase> spillTests() {
       {"testSpillCommitmentCoversTheChainWithoutCopies", testSpillCommitmentCoversTheChainWithoutCopies},
       {"testConversionCommitsTheHistoryWithoutCopies", testConversionCommitsTheHistoryWithoutCopies},
       {"testConversionSpillsAHistoryWithCopies", testConversionSpillsAHistoryWithCopies},
+      {"testAConvertedLanesMovesReleaseTheExtentsTheyEmpty", testAConvertedLanesMovesReleaseTheExtentsTheyEmpty},
       {"testALongDecodingLaneConvertsItselfAtTheWall", testALongDecodingLaneConvertsItselfAtTheWall},
       {"testALaneConvertsOnlyWithAnIndexRunway", testALaneConvertsOnlyWithAnIndexRunway},
       {"testAGrowthTheHostRefusesDoesNotConvert", testAGrowthTheHostRefusesDoesNotConvert},
