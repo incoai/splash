@@ -1,12 +1,14 @@
 #pragma once
 
+#include "engine/Engine.hpp"
 #include "engine/MemoryGovernor.hpp"
-#include "engine/NativeRuntime.hpp"
 #include "metal/MetalBackend.hpp"
 
 #include <string>
 
 namespace splash::engine {
+
+class NativeRuntime;
 
 // Emits only transitions; retry counts and queue depth do not produce logs.
 class MemoryStatusReporter final {

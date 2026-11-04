@@ -1,6 +1,7 @@
 #include "engine/MemoryControl.hpp"
 
 #include "StderrLine.hpp"
+#include "engine/NativeRuntime.hpp"
 
 #include <sstream>
 
