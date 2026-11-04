@@ -1,4 +1,4 @@
-"""Prepare API requests for generation and manage Responses history."""
+"""Prepare API requests for generation."""
 
 import hashlib
 import json
@@ -12,14 +12,9 @@ from pathlib import Path
 from jinja2 import TemplateError
 
 from . import images as image_input
-from . import json_codec, request_fields
 from . import protocol as wire
-from .api_shapes import (
-    canonical_responses_input,
-    normalize_messages,
-    responses_to_chat_body,
-    template_messages,
-)
+from . import request_fields
+from .api_shapes import normalize_messages, template_messages
 from .backend import Job, ReasoningRequest
 from .chat_format import REASONING_EFFORTS, THINK_END, THINK_START, TOOL_CALL_OPEN
 from .chat_templates import (
@@ -38,7 +33,6 @@ from .errors import (
     remaining_request_time,
 )
 from .latency import LatencyMetrics
-from .lru import LRUCache
 from .metrics import is_finite_number
 from .output import MAX_STOP_CHARACTERS
 from .tokenization import PromptTokenizer, tokenizable
@@ -126,63 +120,6 @@ def _generation_prompt(probed, rendered, tokens):
     )
 
 
-@dataclass(frozen=True, slots=True)
-class StoredResponse:
-    response_json: bytes
-    history_json: bytes
-
-    @property
-    def size(self):
-        return len(self.response_json) + len(self.history_json)
-
-    @property
-    def response(self):
-        return json_codec.loads(self.response_json)
-
-
-class ResponseStore:
-    """Process-local Responses state with one strict byte-budgeted LRU."""
-
-    BUDGET_BYTES = 64 * 1024 * 1024
-
-    def __init__(self):
-        self.records = LRUCache(self.BUDGET_BYTES)
-        self.hits = 0
-        self.misses = 0
-        self.lock = threading.Lock()
-
-    def get(self, response_id):
-        with self.lock:
-            record = self.records.get(response_id)
-            if record is None:
-                self.misses += 1
-            else:
-                self.hits += 1
-        return record
-
-    def put(self, response, history_items):
-        record = StoredResponse(
-            json_codec.encode(response), json_codec.encode(history_items)
-        )
-        with self.lock:
-            return self.records.put(response["id"], record, record.size)
-
-    def delete(self, response_id):
-        with self.lock:
-            return self.records.pop(response_id) is not None
-
-    def stats(self):
-        with self.lock:
-            return {
-                "entries": len(self.records),
-                "bytes": self.records.bytes,
-                "budget_bytes": self.records.budget_bytes,
-                "evictions": self.records.evictions,
-                "hits": self.hits,
-                "misses": self.misses,
-            }
-
-
 @dataclass
 class Prompt:
     messages: list
@@ -240,6 +177,7 @@ class Frontend:
         chat_templates,
         chat_format,
         thinking_codec,
+        response_store,
         max_image_pixels=image_input.MAX_PIXELS,
         served_model_names=(),
         announce_served_name=False,
@@ -308,7 +246,8 @@ class Frontend:
         self.preparation_lock = threading.Lock()
         self.preparation_active = 0
         self.preparation_waiting = 0
-        self.response_store = ResponseStore()
+        # The Responses API's stored responses, which /status reports.
+        self.response_store = response_store
         self.thinking_codec = thinking_codec
 
     def accepts_model(self, model):
@@ -519,8 +458,11 @@ class Frontend:
         """A Chat request, or a Messages request converted to Chat.
         Output limit errors name output_field, that API's own field."""
         with self.preparation(deadline) as without_slot:
-            return self._prepare(
-                body, None, deadline, without_slot, output_field=output_field
+            return self.chat_job(
+                body,
+                deadline=deadline,
+                without_slot=without_slot,
+                output_field=output_field,
             )
 
     def prepare_completion(self, body, *, deadline):
@@ -820,15 +762,13 @@ class Frontend:
             rendered, tokens, images, positions, thinking, generation_prompt_tokens
         )
 
-    def _prepare(
-        self,
-        body,
-        tool_namespaces,
-        deadline,
-        without_slot,
-        *,
-        output_field,
+    def chat_job(
+        self, body, *, deadline, without_slot, output_field=None, tool_namespaces=None
     ):
+        """The generation job of a Chat body, prepared while the caller holds
+        a preparation slot (preparation(), which yields `without_slot`).
+        tool_namespaces names each tool the model sees under another name, as
+        the request names it."""
         # Fields checked without the prompt fail before it is prepared, which
         # can render documents and build validators.
         options = self._generation_options(body)
@@ -1067,53 +1007,3 @@ class Frontend:
             public_id=secrets.token_hex(16),
             **fields,
         )
-
-    def prepare_responses(self, body, *, deadline, reserve_input):
-        store = body.get("store")
-        if store is not None and not isinstance(store, bool):
-            raise APIError(400, "store must be a boolean")
-        store = True if store is None else store
-        previous_id = body.get("previous_response_id")
-        if previous_id is not None and (
-            not isinstance(previous_id, str) or not previous_id
-        ):
-            raise APIError(400, "previous_response_id must be a non-empty string")
-        with self.preparation(deadline) as without_slot:
-            previous_items = []
-            if previous_id is not None:
-                previous = self.response_store.get(previous_id)
-                if previous is None:
-                    # Clients key on this code to resend the full history.
-                    raise APIError(
-                        404,
-                        "previous response not found",
-                        "previous_response_not_found",
-                    )
-                # The immutable record remains valid if the store evicts it.
-                # Reserve its input bytes before materializing the history.
-                reserve_input(len(previous.history_json))
-                previous_items = json_codec.loads(previous.history_json)
-            items = [*previous_items, *canonical_responses_input(body.get("input"))]
-            chat, namespaces = responses_to_chat_body(body, items)
-            job = self._prepare(
-                chat,
-                namespaces,
-                deadline,
-                without_slot,
-                output_field="max_output_tokens",
-            )
-            job.response_store = store
-            job.response_previous_id = previous_id
-            if store:
-                job.response_history_items = items
-            return job
-
-    def persist_response(self, job, response, output):
-        if not job.response_store:
-            return
-        # The store encodes the history at once, so later changes to the
-        # request's items or the output cannot reach it.
-        history = [*job.response_history_items, *output]
-        if not self.response_store.put(response, history):
-            response["store"] = False
-            job.response_store = False

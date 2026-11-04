@@ -23,6 +23,7 @@ from server.chat_templates import (
     template_options,
 )
 from server.dialects import anthropic as anthropic_dialect
+from server.dialects import responses as responses_dialect
 from server.dialects import scoring
 from server.errors import APIError
 
@@ -1015,7 +1016,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 {"type": "message", "role": "user", "content": "Continue"},
             ],
         }
-        chat, _ = api_shapes.responses_to_chat_body(body, body["input"])
+        chat, _ = responses_dialect.to_chat_body(body, body["input"])
         prompt = harness.app._render_prompt(
             harness.app._prepare_prompt(
                 chat, None, deadline=fixtures.FOREVER, without_slot=nullcontext
@@ -1115,7 +1116,7 @@ class LeadingSystemMergeTests(unittest.TestCase):
         )
 
     def test_every_api_shape_leads_with_one_system_message(self):
-        responses = api_shapes.responses_to_chat_body(
+        responses = responses_dialect.to_chat_body(
             {"instructions": "Base"},
             [
                 {"role": "developer", "content": "Developer"},

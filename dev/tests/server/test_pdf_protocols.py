@@ -15,6 +15,7 @@ from dev.tests.server_fixtures import (
     render_pdf,
 )
 from server import api_shapes, documents
+from server.dialects import responses as responses_dialect
 from server.errors import APIError
 
 
@@ -51,7 +52,7 @@ class PdfProtocolTests(unittest.TestCase):
         expected = render_pdf(pdf_bytes(pages=2))
         chat = self.chat()[0]["content"]
         self.assertEqual(chat, expected)
-        response, _ = api_shapes.responses_to_chat_body(
+        response, _ = responses_dialect.to_chat_body(
             {},
             [
                 {
@@ -214,7 +215,7 @@ class PdfProtocolTests(unittest.TestCase):
         with mock.patch.object(
             documents, "_render", side_effect=AssertionError("early render")
         ):
-            response, _ = api_shapes.responses_to_chat_body(
+            response, _ = responses_dialect.to_chat_body(
                 {},
                 [
                     {
@@ -289,9 +290,7 @@ class PdfProtocolTests(unittest.TestCase):
                             "output": [{"type": "input_file", **self.file}],
                         },
                     ]
-                    messages = api_shapes.responses_to_chat_body({}, items)[0][
-                        "messages"
-                    ]
+                    messages = responses_dialect.to_chat_body({}, items)[0]["messages"]
                 normalize(messages, 2 * one_file)
                 with self.assertRaisesRegex(APIError, "request size limit"):
                     normalize(messages, 2 * one_file - 1)

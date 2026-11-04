@@ -441,7 +441,7 @@ class RequestFailureTests(HarnessTestCase):
                 harness.backend, "cancel", wraps=harness.backend.cancel
             ) as cancel,
             mock.patch.object(
-                responses_dialect, "responses_item", side_effect=RuntimeError("boom")
+                responses_dialect, "output_item", side_effect=RuntimeError("boom")
             ),
             mock.patch.object(api.sys, "stderr", stderr),
         ):

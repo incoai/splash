@@ -36,6 +36,7 @@ from server import runtime as engine_runtime
 from server import server as api
 from server.chat_format import FLINT, QWEN
 from server.chat_templates import ChatTemplates
+from server.dialects import responses as responses_dialect
 from server.lru import LRUCache
 from server.origins import parse_allowed_origin
 from server.thinking import ThinkingCodec
@@ -932,6 +933,7 @@ def make_frontend(
         chat_templates=ChatTemplates(tokenizer),
         chat_format=chat_format,
         thinking_codec=thinking_codec,
+        response_store=responses_dialect.ResponseStore(),
         **options,
     )
 

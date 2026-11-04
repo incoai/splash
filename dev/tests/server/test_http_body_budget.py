@@ -18,6 +18,7 @@ from PIL import Image
 from dev.tests import server_fixtures as fixtures
 from server import frontend, json_codec, serve_options
 from server import server as api
+from server.dialects import responses as responses_dialect
 from server.errors import RequestValidationError
 
 
@@ -430,7 +431,8 @@ class HttpBodyBudgetTests(unittest.TestCase):
             {"id": "resp_previous"}, [{"role": "user", "content": "old history"}]
         )
         reservation = api.RequestBodyReservation(harness.server.request_bodies, 100)
-        job = harness.app.prepare_responses(
+        job = responses_dialect.prepare(
+            harness.app,
             {
                 "input": "continue",
                 "previous_response_id": "resp_previous",
@@ -451,7 +453,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
         )
         body = {"input": "continue", "previous_response_id": "resp_previous"}
         with mock.patch.object(
-            harness.app, "_prepare", side_effect=api.APIError(400, "invalid input")
+            harness.app, "chat_job", side_effect=api.APIError(400, "invalid input")
         ):
             self.assertEqual(harness.request("POST", "/v1/responses", body)[0], 400)
         self.wait_bytes(harness, 0)

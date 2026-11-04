@@ -151,7 +151,6 @@ class StreamKeepaliveTests(HarnessTestCase):
         app = SimpleNamespace(
             response_model="test-model",
             backend=SimpleNamespace(cancel=mock.Mock()),
-            persist_response=mock.Mock(),
         )
         handler.server = SimpleNamespace(app=app)
         job = backend_api.Job(
@@ -184,7 +183,10 @@ class StreamKeepaliveTests(HarnessTestCase):
             return event
 
         job.events = SimpleNamespace(get=next_event)
-        with mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]):
+        with (
+            mock.patch.object(api.time, "monotonic", side_effect=lambda: clock[0]),
+            mock.patch.object(responses_dialect, "persist") as persist,
+        ):
             responses_dialect.stream(handler, job)
 
         raw = handler.wfile.getvalue()
@@ -216,7 +218,7 @@ class StreamKeepaliveTests(HarnessTestCase):
         self.assertEqual(response["id"], "resp_prefill-heartbeat")
         self.assertEqual(response["output"][0]["content"][0]["text"], "answer")
         app.backend.cancel.assert_not_called()
-        app.persist_response.assert_called_once()
+        persist.assert_called_once()
 
     def test_buffered_tool_generation_keeps_stream_alive(self):
         schema = {

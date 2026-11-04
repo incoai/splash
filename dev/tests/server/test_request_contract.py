@@ -36,6 +36,7 @@ from server import protocol as wire
 from server import server as api
 from server.api_shapes import normalize_messages
 from server.dialects import anthropic as anthropic_dialect
+from server.dialects import responses as responses_dialect
 from server.errors import APIError
 
 
@@ -763,7 +764,8 @@ class RequestContractTests(HarnessTestCase):
         for value in ("urgent", 0, None, []):
             with self.assertRaisesRegex(api.APIError, "priority"):
                 harness.app.prepare(chat_body(priority=value), deadline=FOREVER)
-        job = harness.app.prepare_responses(
+        job = responses_dialect.prepare(
+            harness.app,
             responses_body(priority="foreground"),
             deadline=FOREVER,
             reserve_input=reserve_unbounded,

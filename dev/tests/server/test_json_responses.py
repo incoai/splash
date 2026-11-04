@@ -25,7 +25,7 @@ from dev.tests.server_fixtures import (
     stream_events,
     tool_request,
 )
-from server import frontend, json_codec
+from server import json_codec
 from server import server as api
 from server.dialects import anthropic as anthropic_dialect
 from server.dialects import openai as openai_dialect
@@ -222,7 +222,7 @@ class JsonResponseTests(unittest.TestCase):
         )
 
     def test_stored_response_roundtrip_and_atomic_failures(self):
-        store = frontend.ResponseStore()
+        store = responses_dialect.ResponseStore()
         for value in (TEXT, "\ud800", "\udfff"):
             response = {"id": "resp_test", "value": value}
             history = [{"role": "assistant", "content": value}]
@@ -259,7 +259,7 @@ class JsonResponseTests(unittest.TestCase):
         harness = self.harness()
         functions = (
             (openai_dialect, "completion_response"),
-            (responses_dialect, "responses_response"),
+            (responses_dialect, "response_object"),
             (anthropic_dialect, "message_response"),
         )
         for path, (dialect, function) in zip(PATHS, functions, strict=True):

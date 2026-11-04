@@ -36,6 +36,7 @@ from server import protocol as native_wire
 from server import server as api
 from server.chat_format import QWEN
 from server.dialects import anthropic as anthropic_dialect
+from server.dialects import responses as responses_dialect
 
 
 def png_bytes(width, height, color=(200, 30, 30)):
@@ -598,7 +599,7 @@ class ImageRequestTest(HarnessTestCase):
         image = png_data_url()
         document = document_block(title="Report", context="Fixture")
         anthropic = anthropic_dialect.to_chat_prompt
-        responses = api_shapes.responses_to_chat_body
+        responses = responses_dialect.to_chat_body
         with (
             mock.patch.object(images, "decode_data_url", side_effect=AssertionError),
             mock.patch.object(documents, "_render", side_effect=AssertionError),

@@ -16,7 +16,6 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from functools import partial
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -27,7 +26,7 @@ from transformers import AutoTokenizer
 from install import assembly
 from install.models import ModelError
 
-from . import dialects, json_codec, request_fields, serve_options, serve_record
+from . import dialects, json_codec, serve_options, serve_record
 from . import runtime as engine_runtime
 from .backend import (
     NativeBackend,
@@ -510,22 +509,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
             "text/plain; version=0.0.4; charset=utf-8",
         )
 
-    def _get_response(self, response_id):
-        stored = self.app.response_store.get(response_id)
-        if stored is None:
-            self.safe_error(APIError(404, "response not found", "not_found_error"))
-        else:
-            self.send_json(200, stored.response)
-
-    def _delete_response(self, response_id):
-        if not self.app.response_store.delete(response_id):
-            self.safe_error(APIError(404, "response not found", "not_found_error"))
-            return
-        self.send_json(
-            200,
-            {"id": response_id, "object": "response", "deleted": True},
-        )
-
     def _models(self):
         return [
             {
@@ -666,16 +649,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def _cancel_submitted(self):
         if self._submitted is not None:
             self.app.backend.cancel(self._submitted)
-
-    def _post_responses(self, body, deadline):
-        progress = request_fields.progress_flag(body)
-        job = self.app.prepare_responses(
-            body, deadline=deadline, reserve_input=self.reserve_input
-        )
-        job.flags |= progress
-        if body.get("stream"):
-            return job, partial(dialects.responses.stream, self)
-        return job, partial(dialects.responses.complete, self)
 
     def _post_tokenize(self, body, deadline):
         self.send_json(200, {"tokens": self.app.tokenize(body, deadline=deadline)})
@@ -913,7 +886,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 pass
 
 
-_RESPONSE_PATH = re.compile(r"/v1/responses/(resp_[A-Za-z0-9_]+)")
 _MODEL_PATH = re.compile(r"/v1/models/(.*)", re.DOTALL)
 _PAGE = Route(FrontendHandler._get_page, public=True)
 
@@ -927,8 +899,8 @@ ROUTES = {
     ("GET", "/ready"): Route(FrontendHandler._get_ready, public=True),
     ("GET", "/status"): Route(FrontendHandler._get_status),
     ("GET", "/metrics"): Route(FrontendHandler._get_metrics),
-    ("GET", _RESPONSE_PATH): Route(FrontendHandler._get_response),
-    ("DELETE", _RESPONSE_PATH): Route(FrontendHandler._delete_response),
+    ("GET", dialects.responses.RESPONSE_PATH): Route(dialects.responses.get),
+    ("DELETE", dialects.responses.RESPONSE_PATH): Route(dialects.responses.delete),
     ("GET", "/v1/models"): Route(
         FrontendHandler._get_models,
         request_id_header=dialects.scoring.REQUEST_ID_HEADER,
@@ -941,7 +913,7 @@ ROUTES = {
         dialects.openai.post_chat_count_tokens, prompt_only=True
     ),
     ("POST", "/v1/completions"): Route(dialects.openai.post_completion),
-    ("POST", "/v1/responses"): Route(FrontendHandler._post_responses),
+    ("POST", "/v1/responses"): Route(dialects.responses.post),
     ("POST", "/v1/messages"): Route(
         dialects.anthropic.post_messages, dialects.anthropic.ERRORS
     ),
@@ -1350,6 +1322,7 @@ def main():
             sampling_defaults=asdict(family.sampling),
             max_image_pixels=args.max_image_pixels,
             thinking_codec=thinking_codec,
+            response_store=dialects.responses.ResponseStore(),
             served_model_names=args.served_model_name,
             announce_served_name=args.announce_served_name,
             default_reasoning_effort=args.default_reasoning_effort,

@@ -18,10 +18,11 @@ from dev.tests.server_fixtures import (
     chat_body,
     make_frontend,
 )
-from server import api_shapes, crash_trace, http_security, images, origins
 from server import backend as backend_api
+from server import crash_trace, http_security, images, origins
 from server import server as api
 from server.dialects import openai as openai_dialect
+from server.dialects import responses as responses_dialect
 from server.errors import APIError
 
 INVALID_ORIGINS = (
@@ -384,7 +385,7 @@ class HttpBoundaryTests(HarnessTestCase):
         )
         first_job.created_at = 123
         with mock.patch.object(api.time, "time", return_value=999):
-            response = api_shapes.responses_response(
+            response = responses_dialect.response_object(
                 "test-model", first_job, "in_progress", []
             )
         self.assertEqual(response["created_at"], 123)
