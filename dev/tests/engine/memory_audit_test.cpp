@@ -1,4 +1,5 @@
 #include "TestChecks.hpp"
+#include "TestJson.hpp"
 #include "TestModel.hpp"
 #include "engine/MemoryAudit.hpp"
 
@@ -68,7 +69,7 @@ void testUnifiedDynamicAudit() {
   auto valid = auditActualMemory(memoryPlan, actual);
   require(valid.valid && valid.error == MemoryAuditError::None,
           "valid elastic memory report failed audit");
-  require(valid.toStatusJson().find("\"scope\":\"startup_warmup\"") !=
+  require(test::jsonOf(valid).find("\"scope\":\"startup_warmup\"") !=
               std::string::npos,
           "memory audit status does not identify its startup scope");
 

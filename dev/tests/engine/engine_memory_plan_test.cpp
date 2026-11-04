@@ -1,4 +1,5 @@
 #include "TestChecks.hpp"
+#include "TestJson.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/StreamedMemoryPlan.hpp"
 #include "TestModel.hpp"
@@ -68,7 +69,7 @@ void testUnifiedElasticBudget() {
                                  budget.kvCapacityTokens -
                                      model::ExecutionLimits::speculativeScratchTokens),
           "advertised context exceeds elastic KV capacity");
-  const std::string json = plan.toStatusJson();
+  const std::string json = test::jsonOf(plan);
   require(json.find("\"dynamic_budget_bytes\"") != std::string::npos &&
               json.find("\"kv_extent_pages\":128") != std::string::npos,
           "elastic state/KV budget is missing from memory status");
@@ -94,7 +95,7 @@ void testBf16BudgetAndStatus() {
   require(budget.kvCapacityBytes <= budget.dynamicBudgetBytes &&
               budget.kvCapacityPages < int8.breakdown().kvCapacityPages,
           "BF16 KV capacity exceeded the shared budget");
-  const auto json = bf16.toStatusJson();
+  const auto json = test::jsonOf(bf16);
   require(json.find("\"kv_format\":\"bf16\"") != std::string::npos &&
               json.find("\"kv_scale_value_bytes\"") == std::string::npos &&
               json.find("\"kv_quantization_bits\"") == std::string::npos,
@@ -109,9 +110,9 @@ void testBf16BudgetAndStatus() {
 void testStateFormatStatus() {
   auto profile = model();
   profile.stateFormat = ops::GdnStateFormat::BFloat16;
-  require(test::requireMemoryPlan(device(), profile).toStatusJson().find("\"state_format\":\"bf16\"") !=
+  require(test::jsonOf(test::requireMemoryPlan(device(), profile)).find("\"state_format\":\"bf16\"") !=
                   std::string::npos &&
-              test::requireMemoryPlan(device(), model()).toStatusJson().find("\"state_format\":\"fp32\"") !=
+              test::jsonOf(test::requireMemoryPlan(device(), model())).find("\"state_format\":\"fp32\"") !=
                   std::string::npos,
           "the memory status did not name the state format");
   profile.stateFormat = {};
@@ -204,14 +205,14 @@ void testDiskTierStateStagingIsBudgeted() {
   // The room the host held back of the streamed stores, none here, follows
   // the staging among the fixed parts.
   const std::string field = "\"state_staging_bytes\":" + std::to_string(staging);
-  require(with.toStatusJson().find(field + ",\"host_held_back_bytes\":0,\"fixed_runtime_bytes\"") !=
+  require(test::jsonOf(with).find(field + ",\"host_held_back_bytes\":0,\"fixed_runtime_bytes\"") !=
                   std::string::npos &&
-              with.toStatusJson().find(field + "}}") != std::string::npos &&
+              test::jsonOf(with).find(field + "}}") != std::string::npos &&
               budget.describe().find("SSD cache state staging: " +
                                      std::to_string(staging)) != std::string::npos,
           "state staging is missing from the memory plan status");
   require(without.breakdown().stateStagingBytes == 0 &&
-              without.toStatusJson().find("\"state_staging_bytes\":0,") !=
+              test::jsonOf(without).find("\"state_staging_bytes\":0,") !=
                   std::string::npos,
           "a plan without the disk tier reported state staging");
 }
@@ -231,11 +232,11 @@ void testNeuralEngineSplitIsBudgeted() {
               budget.fixedRuntimeBytes == without.breakdown().fixedRuntimeBytes + surfaces &&
               with.maximumContextTokens() < without.maximumContextTokens(),
           "the split was not planned as fixed runtime memory out of the KV cache");
-  require(with.toStatusJson().find("\"ane_ffn_bytes\":" + std::to_string(surfaces) +
+  require(test::jsonOf(with).find("\"ane_ffn_bytes\":" + std::to_string(surfaces) +
                                    ",\"state_staging_bytes\"") != std::string::npos &&
               budget.describe().find("Neural Engine split: " + std::to_string(surfaces)) !=
                   std::string::npos &&
-              without.toStatusJson().find("\"ane_ffn_bytes\":0,") != std::string::npos,
+              test::jsonOf(without).find("\"ane_ffn_bytes\":0,") != std::string::npos,
           "the split is missing from the memory plan status");
 }
 
@@ -253,7 +254,7 @@ void testStreamedTableIsBudgeted() {
               budget.fixedRuntimeBytes == without.breakdown().fixedRuntimeBytes + cache &&
               with.maximumContextTokens() <= without.maximumContextTokens(),
           "a streamed table's cache was not planned as fixed runtime memory");
-  require(with.toStatusJson().find("\"streamed_table_bytes\":" + std::to_string(cache) + ",\"ane_ffn_bytes\"") !=
+  require(test::jsonOf(with).find("\"streamed_table_bytes\":" + std::to_string(cache) + ",\"ane_ffn_bytes\"") !=
                   std::string::npos &&
               budget.describe().find("streamed table cache: " + std::to_string(cache)) != std::string::npos,
           "a streamed table's cache is missing from the memory plan status");
@@ -304,9 +305,9 @@ void testModelProvidedKvGeometry() {
                   compact.targetKvLayout.extentPagesFor(budgetPages(budget)) &&
               budget.kvExtentPages % 256 == 0,
           "memory plan ignored model-provided Q8 geometry");
-  require(plan.toStatusJson().find("\"attention_layers\":10") !=
+  require(test::jsonOf(plan).find("\"attention_layers\":10") !=
               std::string::npos &&
-              plan.toStatusJson().find("\"kv_heads\":2") !=
+              test::jsonOf(plan).find("\"kv_heads\":2") !=
                   std::string::npos,
           "model-provided Q8 geometry is missing from status");
 }
@@ -349,9 +350,9 @@ void testWindowedKvCostsSlimPages() {
   require(full.kvSlimPageBytes == 0 && full.kvWindowFloorPages == 0 &&
               full.kvCapacityBytes == uint64_t{full.kvCapacityPages} * fullBytes,
           "a layout without a window planned Slim pages");
-  require(windowedPlan.toStatusJson().find("\"kv_window\":{\"slim_page_bytes\":473088,\"floor_pages\":81}") !=
+  require(test::jsonOf(windowedPlan).find("\"kv_window\":{\"slim_page_bytes\":473088,\"floor_pages\":81}") !=
                   std::string::npos &&
-              test::requireMemoryPlan(device(), unwindowed).toStatusJson().find("kv_window") == std::string::npos,
+              test::jsonOf(test::requireMemoryPlan(device(), unwindowed)).find("kv_window") == std::string::npos,
           "the status did not name the Slim pages of a windowed layout alone");
   flint.commandPages = 256;
   require(test::requireMemoryPlan(device(), flint).breakdown().kvWindowFloorPages == 273,
@@ -628,7 +629,7 @@ void testDense35BKeepsMainsPlan() {
     const EngineMemoryPlan mains = test::requireMemoryPlan(deviceOf(mac), target.profile());
     require(mains.maximumContextTokens() == context && mains.breakdown().kvCapacityTokens == capacityTokens &&
                 mains.breakdown().contextBounds.bound() != std::string_view("disk") &&
-                mains.toStatusJson().find("\"kv_spill\":null") != std::string::npos,
+                test::jsonOf(mains).find("\"kv_spill\":null") != std::string::npos,
             std::string("the 35B's plan on the ") + mac.name + " is not main's");
   }
 }
@@ -1025,7 +1026,7 @@ void testPlanSetsTheStoresFloor() {
               budget.dynamicBudgetBytes == mains.breakdown().dynamicBudgetBytes &&
               budget.kvCapacityTokens == mains.breakdown().kvCapacityTokens &&
               budget.hostHeldBackBytes == heldBack &&
-              held.toStatusJson().find("\"host_held_back_bytes\":" + std::to_string(heldBack) +
+              test::jsonOf(held).find("\"host_held_back_bytes\":" + std::to_string(heldBack) +
                                        ",\"fixed_runtime_bytes\"") != std::string::npos &&
               budget.describe().find("expert store above its floor at the start: " + std::to_string(heldBack)) !=
                   std::string::npos,
@@ -1047,8 +1048,8 @@ void testEnginePlanServesTheSpilledContext() {
                 (streamed.expertBytes ? bounds.resident < bounds.disk : bounds.resident == bounds.window) &&
                 plan.maximumContextTokens() == std::min(bounds.spilled, bounds.disk),
             std::string("Flash-Next's context on the ") + mac.name + " is not what spilling serves");
-    require(plan.toStatusJson().find("\"context_bounds\":{\"window\":1010000") != std::string::npos &&
-                plan.toStatusJson().find("\"kv_spill\":{\"dense_pages\":64") != std::string::npos,
+    require(test::jsonOf(plan).find("\"context_bounds\":{\"window\":1010000") != std::string::npos &&
+                test::jsonOf(plan).find("\"kv_spill\":{\"dense_pages\":64") != std::string::npos,
             "the memory status does not report the spill plan");
     const SpillGeometry geometry = plan.spillGeometry();
     require(geometry.fullPageBytes == 423'936 && geometry.indexPageBytes == 24'576 &&

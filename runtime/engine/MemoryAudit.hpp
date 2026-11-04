@@ -6,6 +6,10 @@
 #include <string>
 #include <string_view>
 
+namespace splash::json {
+class Writer;
+} // namespace splash::json
+
 namespace splash::engine {
 
 enum class MemoryAuditError {
@@ -66,9 +70,11 @@ struct MemoryAuditResult {
     uint32_t devicePeakDeviationBasisPoints = 0;
     uint64_t actualHeadroomBytes = 0;
 
-    [[nodiscard]] std::string toStatusJson() const;
     [[nodiscard]] std::string describe() const;
 };
+
+// The audit as /status reports it (memory_audit).
+void writeJson(json::Writer &w, const MemoryAuditResult &audit);
 
 inline constexpr uint32_t kMaximumDevicePeakDeviationBasisPoints = 500;
 

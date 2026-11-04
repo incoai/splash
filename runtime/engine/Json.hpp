@@ -12,44 +12,6 @@
 
 namespace splash::json {
 
-// The one escaping rule: `value` as the inside of a JSON string, handed to
-// `append` in runs of plain characters and escapes.
-template <class Append> void escape(std::string_view value, Append &&append) {
-  constexpr char hex[] = "0123456789abcdef";
-  size_t run = 0;
-  for (size_t index = 0; index < value.size(); ++index) {
-    const auto character = static_cast<unsigned char>(value[index]);
-    char control[] = {'\\', 'u', '0', '0', hex[character >> 4], hex[character & 0x0f]};
-    std::string_view escaped;
-    switch (character) {
-    case '"': escaped = "\\\""; break;
-    case '\\': escaped = "\\\\"; break;
-    case '\b': escaped = "\\b"; break;
-    case '\f': escaped = "\\f"; break;
-    case '\n': escaped = "\\n"; break;
-    case '\r': escaped = "\\r"; break;
-    case '\t': escaped = "\\t"; break;
-    default:
-      if (character >= 0x20)
-        continue;
-      escaped = {control, sizeof(control)};
-    }
-    append(value.substr(run, index - run));
-    append(escaped);
-    run = index + 1;
-  }
-  append(value.substr(run));
-}
-
-[[nodiscard]] inline std::string quote(std::string_view value) {
-  std::string result;
-  result.reserve(value.size() + 2);
-  result.push_back('"');
-  escape(value, [&](std::string_view part) { result.append(part); });
-  result.push_back('"');
-  return result;
-}
-
 // An object member's name. A name spelled in the source is written as it is:
 // its constructor runs at compile time and refuses anything but a string
 // literal free of quotes, backslashes and control characters, so a character
@@ -215,9 +177,34 @@ private:
     put(bracket);
     return *this;
   }
+  // The one escaping rule: runs of plain characters as they are, the rest
+  // as JSON escapes.
   void string(std::string_view text) {
+    constexpr char hex[] = "0123456789abcdef";
     put('"');
-    escape(text, [this](std::string_view part) { put(part); });
+    size_t run = 0;
+    for (size_t index = 0; index < text.size(); ++index) {
+      const auto character = static_cast<unsigned char>(text[index]);
+      const char control[] = {'\\', 'u', '0', '0', hex[character >> 4], hex[character & 0x0f]};
+      std::string_view escaped;
+      switch (character) {
+      case '"': escaped = "\\\""; break;
+      case '\\': escaped = "\\\\"; break;
+      case '\b': escaped = "\\b"; break;
+      case '\f': escaped = "\\f"; break;
+      case '\n': escaped = "\\n"; break;
+      case '\r': escaped = "\\r"; break;
+      case '\t': escaped = "\\t"; break;
+      default:
+        if (character >= 0x20)
+          continue;
+        escaped = {control, sizeof(control)};
+      }
+      put(text.substr(run, index - run));
+      put(escaped);
+      run = index + 1;
+    }
+    put(text.substr(run));
     put('"');
   }
   // Punctuation, keys and strings go straight to the stream's buffer;

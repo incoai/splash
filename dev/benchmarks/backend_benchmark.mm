@@ -1020,11 +1020,13 @@ int main(int argc, char **argv) {
     const uint32_t ranAneFfnMinimumRows = resources->aneFfnMinimumRows();
     auto *executor = &bootstrap->modelRuntime();
     const auto &cacheIdentity = resources->cacheIdentity();
-    const std::string identity =
-        "{\"model_root\":" + json::quote(modelRoot) +
-        ",\"loaded_model_layout_sha256\":" +
-        json::quote(cacheIdentity.modelLayoutSha256) + ",\"device\":" +
-        json::quote(resources->backend().capabilities().deviceName) + "}";
+    json::Writer writer;
+    writer.object([&] {
+      writer.field("model_root", modelRoot)
+          .field("loaded_model_layout_sha256", cacheIdentity.modelLayoutSha256)
+          .field("device", resources->backend().capabilities().deviceName);
+    });
+    const std::string identity = writer.str();
     if (progress)
       progress->identity(identity);
 

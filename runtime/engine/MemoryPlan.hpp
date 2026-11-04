@@ -12,6 +12,10 @@
 #include <string>
 #include <string_view>
 
+namespace splash::json {
+class Writer;
+} // namespace splash::json
+
 namespace splash::engine {
 
 inline constexpr uint64_t kMiB = 1024ULL * 1024;
@@ -298,7 +302,6 @@ struct EngineMemoryBreakdown {
   uint64_t minimumRequiredBytes = 0;
   uint64_t deficitBytes = 0;
 
-  [[nodiscard]] std::string toStatusJson() const;
   [[nodiscard]] std::string describe() const;
 };
 
@@ -371,7 +374,9 @@ public:
   // What admission decides which requests spill by (EngineSpillConfig).
   [[nodiscard]] SpillGeometry spillGeometry() const noexcept;
 
-  [[nodiscard]] std::string toStatusJson() const;
+  // The plan as /status reports it (memory_plan): the device, the model and
+  // the budget.
+  friend void writeJson(json::Writer &w, const EngineMemoryPlan &plan);
 
 private:
   EngineMemoryPlan(DeviceCapabilities device, ModelMemoryProfile model,

@@ -42,7 +42,6 @@ void testStrings() {
   require(writer.str() == R"({"literal":"token_major","pointer":"text","owned":"owned",)"
                           R"("escaped":"q\"b\\n\n\t\u0001","dynamic\"key":1})",
           "a string printed as something else or was not escaped: " + writer.str());
-  require(json::quote("q\"\x1f") == R"("q\"\u001f")", "quote escapes differently");
 }
 
 void testNumbers() {

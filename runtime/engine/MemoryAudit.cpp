@@ -1,5 +1,6 @@
 #include "engine/MemoryAudit.hpp"
 #include "Checked.hpp"
+#include "engine/Json.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -203,25 +204,21 @@ MemoryAuditResult auditActualMemory(const EngineMemoryPlan &plan,
   return result;
 }
 
-std::string MemoryAuditResult::toStatusJson() const {
-  std::ostringstream out;
-  out << '{' << "\"scope\":\"startup_warmup\","
-      << "\"valid\":" << (valid ? "true" : "false") << ',' << "\"error\":\""
-      << memoryAuditErrorName(error) << "\","
-      << "\"categorized_bytes\":" << categorizedBytes << ','
-      << "\"backend_unclassified_bytes\":" << backendUnclassifiedBytes << ','
-      << "\"device_untracked_bytes\":" << deviceUntrackedBytes << ','
-      << "\"device_peak_deviation_basis_points\":"
-      << devicePeakDeviationBasisPoints << ','
-      << "\"actual_headroom_bytes\":" << actualHeadroomBytes << ','
-      << "\"backend_allocated_bytes\":" << actual.backendAllocatedBytes << ','
-      << "\"device_current_allocated_bytes\":"
-      << actual.deviceCurrentAllocatedBytes << ','
-      << "\"device_peak_allocated_bytes\":" << actual.devicePeakAllocatedBytes
-      << ','
-      << "\"backend_peak_allocated_bytes\":" << actual.backendPeakAllocatedBytes
-      << '}';
-  return out.str();
+void writeJson(json::Writer &w, const MemoryAuditResult &audit) {
+  w.object([&] {
+    w.field("scope", "startup_warmup")
+        .field("valid", audit.valid)
+        .field("error", memoryAuditErrorName(audit.error))
+        .field("categorized_bytes", audit.categorizedBytes)
+        .field("backend_unclassified_bytes", audit.backendUnclassifiedBytes)
+        .field("device_untracked_bytes", audit.deviceUntrackedBytes)
+        .field("device_peak_deviation_basis_points", audit.devicePeakDeviationBasisPoints)
+        .field("actual_headroom_bytes", audit.actualHeadroomBytes)
+        .field("backend_allocated_bytes", audit.actual.backendAllocatedBytes)
+        .field("device_current_allocated_bytes", audit.actual.deviceCurrentAllocatedBytes)
+        .field("device_peak_allocated_bytes", audit.actual.devicePeakAllocatedBytes)
+        .field("backend_peak_allocated_bytes", audit.actual.backendPeakAllocatedBytes);
+  });
 }
 
 std::string MemoryAuditResult::describe() const {

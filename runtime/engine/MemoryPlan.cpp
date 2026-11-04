@@ -45,68 +45,122 @@ std::string_view budgetErrorCodeName(BudgetErrorCode code) {
 
 // A spill-capable target's plan (KvSpillPlan), as /status reports it; null
 // for a target that keeps its KV in memory.
-std::string spillStatusJson(const KvSpillPlan &spill) {
-  if (!spill.enabled) return "null";
-  std::ostringstream out;
-  out << "{\"dense_pages\":" << spill.densePages
-      << ",\"window_pages\":" << spill.windowPages << ",\"group_pages\":" << spill.groupPages
-      << ",\"slot_bytes\":" << spill.slotBytes << ",\"lane_slots\":" << spill.laneSlots
-      << ",\"hot_floor_bytes\":" << spill.hotFloorBytes << ",\"hot_target_bytes\":" << spill.hotTargetBytes
-      << ",\"hot_limit_bytes\":" << spill.hotLimitBytes
-      << ",\"staging_buffers\":" << spill.stagingBuffers << ",\"staging_bytes\":" << spill.stagingBytes
-      << ",\"index_runway_bytes\":" << spill.indexRunwayBytes << ",\"floor_tokens\":" << spill.floorTokens
-      << ",\"floor_bytes\":" << spill.floorBytes << '}';
-  return out.str();
+void writeSpillPlan(json::Writer &w, const KvSpillPlan &spill) {
+  if (!spill.enabled) {
+    w.null();
+    return;
+  }
+  w.object([&] {
+    w.field("dense_pages", spill.densePages)
+        .field("window_pages", spill.windowPages)
+        .field("group_pages", spill.groupPages)
+        .field("slot_bytes", spill.slotBytes)
+        .field("lane_slots", spill.laneSlots)
+        .field("hot_floor_bytes", spill.hotFloorBytes)
+        .field("hot_target_bytes", spill.hotTargetBytes)
+        .field("hot_limit_bytes", spill.hotLimitBytes)
+        .field("staging_buffers", spill.stagingBuffers)
+        .field("staging_bytes", spill.stagingBytes)
+        .field("index_runway_bytes", spill.indexRunwayBytes)
+        .field("floor_tokens", spill.floorTokens)
+        .field("floor_bytes", spill.floorBytes);
+  });
 }
 
-std::string deviceStatusJson(const DeviceCapabilities &device) {
-  std::ostringstream out;
-  out << '{' << "\"device_name\":" << json::quote(device.deviceName) << ','
-      << "\"macos_version\":" << json::quote(device.macosVersion()) << ','
-      << "\"apple_gpu_family\":" << device.appleGpuFamily << ','
-      << "\"gpu_core_count\":" << device.gpuCoreCount << ','
-      << "\"physical_memory_bytes\":" << device.physicalMemoryBytes << ','
-      << "\"recommended_max_working_set_bytes\":"
-      << device.recommendedMaxWorkingSetBytes << ','
-      << "\"max_buffer_length_bytes\":" << device.maxBufferLengthBytes << ','
-      << "\"max_threadgroup_memory_bytes\":"
-      << device.maxThreadgroupMemoryBytes << ','
-      << "\"max_threadgroup_width\":" << device.maxThreadgroupWidth << ','
-      << "\"has_unified_memory\":"
-      << (device.hasUnifiedMemory ? "true" : "false") << '}';
-  return out.str();
+void writeDevice(json::Writer &w, const DeviceCapabilities &device) {
+  w.object([&] {
+    w.field("device_name", device.deviceName)
+        .field("macos_version", device.macosVersion())
+        .field("apple_gpu_family", device.appleGpuFamily)
+        .field("gpu_core_count", device.gpuCoreCount)
+        .field("physical_memory_bytes", device.physicalMemoryBytes)
+        .field("recommended_max_working_set_bytes", device.recommendedMaxWorkingSetBytes)
+        .field("max_buffer_length_bytes", device.maxBufferLengthBytes)
+        .field("max_threadgroup_memory_bytes", device.maxThreadgroupMemoryBytes)
+        .field("max_threadgroup_width", device.maxThreadgroupWidth)
+        .field("has_unified_memory", device.hasUnifiedMemory);
+  });
 }
 
-std::string modelStatusJson(const ModelMemoryProfile &model) {
-  std::ostringstream out;
-  out << '{' << "\"model_name\":" << json::quote(model.name) << ','
-      << "\"maximum_context_tokens\":" << model.maximumContextTokens << ','
-      << "\"attention_layers\":" << model.targetKvLayout.attentionLayers << ','
-      << "\"kv_heads\":" << model.targetKvLayout.kvHeads << ','
-      << "\"head_dimension\":" << model.targetKvLayout.headDimension << ','
-      << "\"kv_page_tokens\":" << kv::kPageTokens << ','
-      << "\"kv_format\":" << json::quote(kv::formatName(model.targetKvLayout.format)) << ','
-      << "\"kv_elements_per_scale\":"
-      << model.targetKvLayout.elementsPerScale() << ','
-      << "\"kv_page_bytes\":" << model.targetKvLayout.bytesPerModelPage() << ','
-      << "\"state_format\":" << json::quote(ops::formatName(model.stateFormat)) << ','
-      << "\"memory\":{" << "\"target_weights_bytes\":"
-      << model.footprint.targetWeightsBytes << ','
-      << "\"draft_weights_bytes\":" << model.footprint.draftWeightsBytes << ','
-      << "\"vision_weights_bytes\":" << model.footprint.visionWeightsBytes << ','
-      << "\"lane_state_bytes\":"
-      << model.footprint.runtime.laneStatePlannedAllocatedBytes << ','
-      << "\"shared_prefill_bytes\":"
-      << model.footprint.runtime.sharedPrefillPlannedAllocatedBytes << ','
-      << "\"shared_decode_bytes\":"
-      << model.footprint.runtime.sharedDecodePlannedAllocatedBytes << ','
-      << "\"pipeline_reserve_bytes\":" << model::kPipelineReserveBytes << ','
-      << "\"runtime_overhead_reserve_bytes\":"
-      << model::kRuntimeOverheadReserveBytes << ','
-      << "\"streamed_table_bytes\":" << model.footprint.streamedTableBytes << ','
-      << "\"ane_ffn_bytes\":" << model.footprint.aneFfnBytes << ','
-      << "\"state_staging_bytes\":" << model.footprint.stateStagingBytes << "}}";
-  return out.str();
+void writeModel(json::Writer &w, const ModelMemoryProfile &model) {
+  const ModelMemoryFootprint &footprint = model.footprint;
+  w.object([&] {
+    w.field("model_name", model.name)
+        .field("maximum_context_tokens", model.maximumContextTokens)
+        .field("attention_layers", model.targetKvLayout.attentionLayers)
+        .field("kv_heads", model.targetKvLayout.kvHeads)
+        .field("head_dimension", model.targetKvLayout.headDimension)
+        .field("kv_page_tokens", kv::kPageTokens)
+        .field("kv_format", kv::formatName(model.targetKvLayout.format))
+        .field("kv_elements_per_scale", model.targetKvLayout.elementsPerScale())
+        .field("kv_page_bytes", model.targetKvLayout.bytesPerModelPage())
+        .field("state_format", ops::formatName(model.stateFormat));
+    w.object("memory", [&] {
+      w.field("target_weights_bytes", footprint.targetWeightsBytes)
+          .field("draft_weights_bytes", footprint.draftWeightsBytes)
+          .field("vision_weights_bytes", footprint.visionWeightsBytes)
+          .field("lane_state_bytes", footprint.runtime.laneStatePlannedAllocatedBytes)
+          .field("shared_prefill_bytes", footprint.runtime.sharedPrefillPlannedAllocatedBytes)
+          .field("shared_decode_bytes", footprint.runtime.sharedDecodePlannedAllocatedBytes)
+          .field("pipeline_reserve_bytes", model::kPipelineReserveBytes)
+          .field("runtime_overhead_reserve_bytes", model::kRuntimeOverheadReserveBytes)
+          .field("streamed_table_bytes", footprint.streamedTableBytes)
+          .field("ane_ffn_bytes", footprint.aneFfnBytes)
+          .field("state_staging_bytes", footprint.stateStagingBytes);
+    });
+  });
+}
+
+void writeBudget(json::Writer &w, const EngineMemoryBreakdown &budget) {
+  w.object([&] {
+    w.field("physical_memory_bytes", budget.physicalMemoryBytes)
+        .field("recommended_working_set_bytes", budget.recommendedWorkingSetBytes)
+        .field("configured_memory_limit_bytes", budget.configuredMemoryLimitBytes)
+        .field("working_set_margin_bytes", budget.workingSetMarginBytes)
+        .field("hard_budget_bytes", budget.hardBudgetBytes)
+        .field("target_weights_bytes", budget.targetWeightsBytes)
+        .field("draft_weights_bytes", budget.draftWeightsBytes)
+        .field("vision_weights_bytes", budget.visionWeightsBytes)
+        .field("maximum_batch_width", budget.maximumBatchWidth)
+        .field("lane_state_bytes", budget.laneStateBytes)
+        .field("shared_prefill_bytes", budget.sharedPrefillBytes)
+        .field("shared_decode_bytes", budget.sharedDecodeBytes)
+        .field("pipeline_reserve_bytes", budget.pipelineReserveBytes)
+        .field("runtime_overhead_reserve_bytes", budget.runtimeOverheadReserveBytes)
+        .field("streamed_table_bytes", budget.streamedTableBytes)
+        .field("ane_ffn_bytes", budget.aneFfnBytes)
+        .field("state_staging_bytes", budget.stateStagingBytes)
+        .field("host_held_back_bytes", budget.hostHeldBackBytes)
+        .field("fixed_runtime_bytes", budget.fixedRuntimeBytes)
+        .field("dynamic_budget_bytes", budget.dynamicBudgetBytes)
+        .field("kv_page_tokens", budget.kvPageTokens)
+        .field("kv_page_bytes", budget.kvPageBytes)
+        .field("kv_extent_pages", budget.kvExtentPages)
+        .field("kv_extent_bytes", budget.kvExtentBytes)
+        .field("kv_capacity_pages", budget.kvCapacityPages)
+        .field("kv_capacity_bytes", budget.kvCapacityBytes)
+        .field("kv_capacity_tokens", budget.kvCapacityTokens)
+        .field("kv_index_page_bytes", budget.kvIndexPageBytes);
+    // A windowed layout's Slim pages; nothing for another layout.
+    if (budget.kvSlimPageBytes) {
+      w.object("kv_window", [&] {
+        w.field("slim_page_bytes", budget.kvSlimPageBytes).field("floor_pages", budget.kvWindowFloorPages);
+      });
+    }
+    w.key("kv_spill");
+    writeSpillPlan(w, budget.kvSpill);
+    w.object("context_bounds", [&] {
+      const ContextBounds &bounds = budget.contextBounds;
+      w.field("window", bounds.window)
+          .field("resident", bounds.resident)
+          .field("spilled", bounds.spilled)
+          .field("disk", bounds.disk)
+          .field("bound", bounds.bound());
+    });
+    w.field("minimum_dynamic_bytes", budget.minimumDynamicBytes)
+        .field("minimum_required_bytes", budget.minimumRequiredBytes)
+        .field("deficit_bytes", budget.deficitBytes);
+  });
 }
 
 } // namespace
@@ -208,51 +262,6 @@ uint64_t ModelMemoryProfile::fixedRuntimeBytes() const {
   return result;
 }
 
-std::string EngineMemoryBreakdown::toStatusJson() const {
-  std::ostringstream out;
-  out << '{' << "\"physical_memory_bytes\":" << physicalMemoryBytes << ','
-      << "\"recommended_working_set_bytes\":" << recommendedWorkingSetBytes
-      << ','
-      << "\"configured_memory_limit_bytes\":" << configuredMemoryLimitBytes
-      << ',' << "\"working_set_margin_bytes\":" << workingSetMarginBytes << ','
-      << "\"hard_budget_bytes\":" << hardBudgetBytes << ','
-      << "\"target_weights_bytes\":" << targetWeightsBytes << ','
-      << "\"draft_weights_bytes\":" << draftWeightsBytes << ','
-      << "\"vision_weights_bytes\":" << visionWeightsBytes << ','
-      << "\"maximum_batch_width\":" << maximumBatchWidth << ','
-      << "\"lane_state_bytes\":" << laneStateBytes << ','
-      << "\"shared_prefill_bytes\":" << sharedPrefillBytes << ','
-      << "\"shared_decode_bytes\":" << sharedDecodeBytes << ','
-      << "\"pipeline_reserve_bytes\":" << pipelineReserveBytes << ','
-      << "\"runtime_overhead_reserve_bytes\":" << runtimeOverheadReserveBytes
-      << ',' << "\"streamed_table_bytes\":" << streamedTableBytes << ','
-      << "\"ane_ffn_bytes\":" << aneFfnBytes << ','
-      << "\"state_staging_bytes\":" << stateStagingBytes << ','
-      << "\"host_held_back_bytes\":" << hostHeldBackBytes << ','
-      << "\"fixed_runtime_bytes\":" << fixedRuntimeBytes << ','
-      << "\"dynamic_budget_bytes\":" << dynamicBudgetBytes << ','
-      << "\"kv_page_tokens\":" << kvPageTokens << ','
-      << "\"kv_page_bytes\":" << kvPageBytes << ','
-      << "\"kv_extent_pages\":" << kvExtentPages << ','
-      << "\"kv_extent_bytes\":" << kvExtentBytes << ','
-      << "\"kv_capacity_pages\":" << kvCapacityPages << ','
-      << "\"kv_capacity_bytes\":" << kvCapacityBytes << ','
-      << "\"kv_capacity_tokens\":" << kvCapacityTokens << ','
-      << "\"kv_index_page_bytes\":" << kvIndexPageBytes << ',';
-  // A windowed layout's Slim pages; nothing for another layout.
-  if (kvSlimPageBytes)
-    out << "\"kv_window\":{\"slim_page_bytes\":" << kvSlimPageBytes << ",\"floor_pages\":" << kvWindowFloorPages
-        << "},";
-  out << "\"kv_spill\":" << spillStatusJson(kvSpill) << ','
-      << "\"context_bounds\":{\"window\":" << contextBounds.window
-      << ",\"resident\":" << contextBounds.resident << ",\"spilled\":" << contextBounds.spilled
-      << ",\"disk\":" << contextBounds.disk << ",\"bound\":" << json::quote(contextBounds.bound()) << "},"
-      << "\"minimum_dynamic_bytes\":" << minimumDynamicBytes << ','
-      << "\"minimum_required_bytes\":" << minimumRequiredBytes << ','
-      << "\"deficit_bytes\":" << deficitBytes << '}';
-  return out.str();
-}
-
 std::string EngineMemoryBreakdown::describe() const {
   std::ostringstream out;
   out << "physical memory: " << bytesAndMiB(physicalMemoryBytes) << '\n'
@@ -335,14 +344,15 @@ SpillGeometry EngineMemoryPlan::spillGeometry() const noexcept {
           .groupPages = spill.groupPages};
 }
 
-std::string EngineMemoryPlan::toStatusJson() const {
-  std::ostringstream out;
-  out << '{' << "\"valid\":true,"
-      << "\"maximum_context_tokens\":" << maximumContextTokens() << ','
-      << "\"device\":" << deviceStatusJson(device_) << ','
-      << "\"model\":" << modelStatusJson(model_) << ','
-      << "\"budget\":" << breakdown_.toStatusJson() << '}';
-  return out.str();
+void writeJson(json::Writer &w, const EngineMemoryPlan &plan) {
+  w.object([&] {
+    w.field("valid", true).field("maximum_context_tokens", plan.maximumContextTokens()).key("device");
+    writeDevice(w, plan.device_);
+    w.key("model");
+    writeModel(w, plan.model_);
+    w.key("budget");
+    writeBudget(w, plan.breakdown_);
+  });
 }
 
 EngineMemoryPlanResult
