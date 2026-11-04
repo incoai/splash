@@ -197,11 +197,15 @@ public:
       countedPages += unit->form == form ? unit->pages : 0;
       units.push_back(*unit);
     }
+    // The free pages of the form, and for a claim that can wait the landing ones.
     const auto pagesOf = [&] {
-      return pool_.freePageCount(form) + cache_.demotedPages()[static_cast<size_t>(form)];
+      return pool_.freePageCount(form) + (immediate ? 0 : cache_.demotedPages()[static_cast<size_t>(form)]);
     };
     const uint32_t pagesBefore = pagesOf();
+    // What the takes report, as the ledger sums it, and what left memory now.
     uint64_t freed = 0;
+    uint64_t releasedNow = 0;
+    uint32_t reportedPages = 0;
     for (const engine::Victim &unit : units) {
       // A stepwise unit's steps until one takes nothing, each a reclaim of
       // a finite cache.
@@ -211,10 +215,10 @@ public:
         const uint64_t released = before - std::min(before, pool_.allocatedBytes());
         require(taken.nowBytes <= released, "a take released " + std::to_string(released) + " bytes, reported " +
                                                 std::to_string(taken.nowBytes));
-        freed += released + taken.laterBytes;
-        const bool took = taken.outcome == FreeOutcome::Met || released || taken.laterBytes || taken.pages ||
-                          taken.stateBuffers;
-        if (!unit.stepwise || !took)
+        freed += taken.nowBytes + taken.laterBytes;
+        releasedNow += released;
+        reportedPages += taken.pages;
+        if (!unit.stepwise || !taken.gave())
           break;
         ++steps;
       }
@@ -229,10 +233,12 @@ public:
     if (!wanted.empty())
       cache_.setWantedChains({});
     // A device need counts bytes, a page need pages of its form.
-    require(device ? freed <= counted : freedPages <= countedPages,
+    require(device ? freed <= counted && releasedNow <= counted
+                   : freedPages <= countedPages && reportedPages <= countedPages,
             "the claim's takes freed more than peek counted: counted " + std::to_string(counted) + " bytes and " +
-                std::to_string(countedPages) + " pages, freed " + std::to_string(freed) + " bytes and " +
-                std::to_string(freedPages) + " pages");
+                std::to_string(countedPages) + " pages, freed " + std::to_string(freed) + " bytes (" +
+                std::to_string(releasedNow) + " now) and " +
+                std::to_string(freedPages) + " pages (" + std::to_string(reportedPages) + " reported)");
   }
 
 private:

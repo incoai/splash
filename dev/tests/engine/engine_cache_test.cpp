@@ -5928,6 +5928,95 @@ void testOwnDemotionsHoldBackTheStore() {
   cache.checkInvariants();
 }
 
+// A memory reclaim demotes only what completes an extent beside the free pages: with half an
+// extent free, half an extent of demotions meets an extent's need.
+void testDemotionsStopWhereTheyCompleteAnExtent() {
+  test::TestKvStorage storage{24, 100, 8};
+  KvPool pool{storage, 1};
+  test::TestKvTier tier;
+  tier.transferLimit = 64;
+  auto budget = std::make_shared<model::DiskBudget>(10000);
+  tier.budget = budget;
+  engine::Cache cache(pool, &tier, budget);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  static_cast<void>(cacheConversation(cache, 1, 8, std::make_shared<TieredState>(control)));
+  require(test::stateStep(cache).gave() && cache.pollTransfers(), "the state was not written to the SSD");
+  // A request holds half of the second extent.
+  cache.beginRequest(2);
+  require(admitTokens(cache, 2, 4 * KvCache::pageTokens).granted(), "the request's pages were denied");
+  static_cast<void>(cache.releaseEmptyExtents(false));
+  engine::MemoryLedger ledger;
+  ledger.addSource(cache);
+  const FreeResult freed = claimBytes(ledger, 800);
+  require(freed.outcome == FreeOutcome::Pending && freed.laterBytes == 800 && tier.demotions == 4,
+          "a claim demoted " + std::to_string(tier.demotions) + " pages for an extent half free");
+  cache.endRequest(2);
+  cache.checkInvariants();
+}
+
+// A claim that can wait counts the extent a landing page completes beside the free pages as landing;
+// a release of those free pages now is not counted again, since the landing then completes none. A
+// leaf's demotion lands beside three free pages; a request then holds them, and a dead page beside
+// three new free pages completes an extent now: a claim of two extents takes that extent and the
+// store, not that extent alone.
+void testAReleaseOfWhatALandingCompletesCountsOnce() {
+  test::TestKvStorage storage{16, 100, 4};
+  KvPool pool{storage, 1};
+  test::TestKvTier tier;
+  auto budget = std::make_shared<model::DiskBudget>(10000);
+  tier.budget = budget;
+  engine::Cache cache(pool, &tier, budget);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  static_cast<void>(cacheConversation(cache, 1, 1, std::make_shared<TieredState>(control)));
+  require(test::stateStep(cache).gave() && cache.pollTransfers(), "the state was not written to the SSD");
+  static_cast<void>(cache.releaseEmptyExtents(false));
+  UnitPool store(false, 400);
+  engine::MemoryLedger ledger;
+  ledger.addSource(cache);
+  ledger.setReturning([&cache] { return cache.returning(); },
+                      [&cache](std::span<const uint64_t> requestIds) { return cache.returningFor(requestIds); });
+  static_cast<void>(ledger.addPool(store));
+  require(claimBytes(ledger, 100).laterBytes == 400 && store.units, "the leaf's demotion did not complete an extent");
+  cache.beginRequest(2);
+  require(admitTokens(cache, 2, 3 * KvCache::pageTokens).granted(), "the request's pages were denied");
+  const uint64_t dead = cacheConversation(cache, 3, 1);
+  require(pool.freePageCount() == 3 && cache.returning().landingBytes == 400, "fixture geometry changed");
+  static_cast<void>(claimBytes(ledger, 800));
+  require(!cache.residentChainPages({&dead, 1}) && !store.units,
+          "a claim counted the free pages a landing completes an extent with twice");
+  cache.endRequest(2);
+  cache.checkInvariants();
+}
+
+// Growth counts no page a copy in flight holds: the copy frees nothing until it lands, so the dead
+// leaf beside it, which alone cannot fund the unit, stays.
+void testGrowthCountsNoPageInTransfer() {
+  test::TestKvStorage storage{8, 100, 1};
+  KvPool pool{storage, 1};
+  test::TestKvTier tier;
+  tier.transferLimit = 64;
+  auto budget = std::make_shared<model::DiskBudget>(10000);
+  tier.budget = budget;
+  engine::Cache cache(pool, &tier, budget);
+  tier.capacity = 16;
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  const uint64_t dead = cacheConversation(cache, 1, 1);
+  const uint64_t copied = cacheConversation(cache, 2, 3, std::make_shared<TieredState>(control));
+  require(test::stateStep(cache).gave() && cache.pollTransfers(), "the state was not written to the SSD");
+  require(cache.persist(copied) == PersistStatus::Started, "the chain was not copied ahead");
+  static_cast<void>(cache.releaseEmptyExtents(false));
+  engine::MemoryLedger ledger;
+  ledger.addSource(cache);
+  const engine::ClaimId claim = ledger.open({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate});
+  const FreeResult freed = ledger.free(claim, {.bytes = 300}, 0, false);
+  ledger.close(claim);
+  require(freed.outcome == FreeOutcome::Short && !freed.nowBytes && cache.residentChainPages({&dead, 1}),
+          "growth took the dead leaf for a unit only copies in flight could fund");
+}
+
 // Growth takes nothing when what the cache frees now cannot fund its unit: a state that leaves only
 // once written counts for nothing, so the dead chain beside it stays (one of its two extents would
 // go, the other is the runway growth keeps).
@@ -6109,6 +6198,9 @@ int main() {
     testDeviceUnitReportsWhatItsDemotionsReturn();
     testClaimTakesCopiedCacheThenRebuiltPoolsThenWrites();
     testOwnDemotionsHoldBackTheStore();
+    testDemotionsStopWhereTheyCompleteAnExtent();
+    testAReleaseOfWhatALandingCompletesCountsOnce();
+    testGrowthCountsNoPageInTransfer();
     testGrowthCountsNoStateThatNeedsAWrite();
     std::cout << "engine cache tests passed\n";
     return 0;

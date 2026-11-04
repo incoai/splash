@@ -434,30 +434,41 @@ std::optional<CacheEvictionCandidate> KvCache::trimCandidate(uint64_t after) con
   return trimmable_.next({after, block(after).lastUsed});
 }
 
-std::array<uint32_t, 3> KvCache::idlePagesOnChains(std::span<const uint64_t> blocks, bool unwritten) const {
+std::array<uint32_t, 3> KvCache::idlePagesOnChains(std::span<const uint64_t> blocks) const {
   // A block a chain reached before, and every block above it, is counted.
   const uint64_t walk = ++chainWalks_;
   std::array<uint32_t, 3> pages{};
-  const auto climb = [&](const Block *entry) {
-    while (entry && entry->chainWalk != walk) {
+  for (const uint64_t blockId : blocks) {
+    for (const Block *entry = &block(blockId); entry && entry->chainWalk != walk;) {
       entry->chainWalk = walk;
       if (entry->page != noPage) {
         // The request holding this page holds every page above it too.
         if (pool_.pageActive(entry->page))
-          return;
+          break;
         if (entry->transfer == Transfer::None)
           ++pages[static_cast<size_t>(entry->form)];
       }
       // A disk-only block holds no page; the walk goes on above it.
       entry = entry->parent ? &block(entry->parent) : nullptr;
     }
-  };
-  for (const uint64_t blockId : blocks)
-    climb(&block(blockId));
-  if (unwritten)
-    for (const auto &[_, entry] : blocks_)
-      if (entry.page != noPage && !entry.slot && (entry.statesHere || entry.statesBelow))
-        climb(&entry);
+  }
+  return pages;
+}
+
+std::vector<uint64_t> KvCache::laterBlocks(bool unwritten) const {
+  std::vector<uint64_t> blocks;
+  for (const auto &[id, entry] : blocks_)
+    if (entry.page != noPage &&
+        (entry.transfer != Transfer::None || (unwritten && !entry.slot && (entry.statesHere || entry.statesBelow))))
+      blocks.push_back(id);
+  return blocks;
+}
+
+std::array<uint32_t, 3> KvCache::movingPages() const {
+  std::array<uint32_t, 3> pages{};
+  for (const auto &[_, entry] : blocks_)
+    if (entry.page != noPage && entry.transfer != Transfer::None && !pool_.pageActive(entry.page))
+      ++pages[static_cast<size_t>(entry.form)];
   return pages;
 }
 

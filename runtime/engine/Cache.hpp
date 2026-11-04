@@ -677,14 +677,16 @@ public:
   // peek() changes nothing: a phase's unit counts at most what its reclaims
   // free (reach), from the pool's extent and page counts, and none is given
   // once that is nothing. take() makes one reclaim of the unit's phase and
-  // reports what it freed: the bytes of the extents released now, of those
-  // the demotions it started complete as they land (laterBytes), the pages
-  // of the need's form free now or landing, and the state buffers it gave
-  // up. A device need's reclaim that demotes a leaf starts the demotions of
-  // its chain above it, child before parent, while the tier and the quota
-  // have room (a waiting claim's chain lands in about ceil(pages/64) ticks
-  // rather than one tick a page). Pending when it took nothing and a
-  // transfer in flight holds what the walk needs, Short when nothing goes.
+  // reports what it freed: the bytes of the extents released now, and those
+  // it adds to the extents the landing pages complete beside the free ones
+  // (laterBytes, landingFill), less any of them a release took; the pages
+  // of the need's form free now, or for a claim that can wait landing; and
+  // the state buffers it gave up. A device need's reclaim that demotes a
+  // leaf starts the demotions of its chain above it, child before parent,
+  // while the tier and the quota have room (a waiting claim's chain lands in
+  // about ceil(pages/64) ticks rather than one tick a page). Pending when it
+  // took nothing and a transfer in flight holds what the walk needs, Short
+  // when nothing goes.
   [[nodiscard]] std::string_view name() const noexcept override { return "cache"; }
   [[nodiscard]] std::optional<engine::Victim> peek(const VictimQuery &query,
                                                    const engine::Victim *after) const override;
@@ -999,11 +1001,13 @@ private:
   // form, the whole extents of the pages within the class's reach, but the
   // idle pages of the chains it keeps, the free pages a KV need takes and
   // the runway it keeps, as compaction gathers what stays; now, all but the
-  // pages of the demotions in flight and the chains of what frees only
-  // later (a state or a block that leaves only once written, a demotion in
-  // flight), later the rest. A page walk that trims also frees the Full
-  // pages it moves into Slim ones. States: the RAM copies the walk takes,
-  // later those that leave only once written.
+  // pages transfers move and the chains of what frees only later (a state
+  // or a block that leaves only once written, a block a transfer moves);
+  // later the rest, but the extents the landing pages complete beside the
+  // free ones (landingExtents), which the ledger counts as landing. A page
+  // walk that trims also frees the Full pages it moves into Slim ones.
+  // States: the RAM copies the walk takes, later those that leave only once
+  // written.
   struct ReclaimReach final {
     struct Amount final {
       uint64_t bytes = 0;
@@ -1094,15 +1098,15 @@ private:
   // next.
   [[nodiscard]] ReclaimResult recycleState(const Walk &walk);
   // One memory reclaim of a unit of the walk, which began with `demotions`
-  // pages held by the demotions in flight (demotionPages) and `unit` pages
-  // landing (demotedPages), by form: free pages first, as the extent they
-  // fill; then, while KV of some form, with the pages the unit's demotions
-  // free as they land, can empty an extent past the runway the walk keeps
-  // (formsInReach), the walk's victims, its leaves that lead to such an
-  // extent alone (leadsToReach), until one is released, those pages
-  // complete one or a state goes; otherwise a state (recycleState).
+  // pages held by the demotions in flight (demotionPages) and the landing
+  // pages filling `fillBefore` bytes of extents (landingFill): free pages
+  // first, as the extent they fill; then, while KV of some form can empty an
+  // extent past the runway the walk keeps (formsInReach), the walk's
+  // victims, its leaves that lead to such an extent alone (leadsToReach),
+  // until one is released, the landing pages fill one more or a state goes;
+  // otherwise a state (recycleState).
   [[nodiscard]] ReclaimResult takeReclaim(const Walk &walk, const std::array<uint32_t, 3> &demotions,
-                                               const std::array<uint32_t, 3> &unit);
+                                          uint64_t fillBefore);
   // Oldest resident KV leaf after `after` no state restores through: nothing
   // sits on it or below it, so it saves no prefill, and it frees its page
   // with no IO.
@@ -1221,12 +1225,13 @@ private:
   // Index pages above its Full tail and a windowed one's Slim pages above its
   // window do.
   [[nodiscard]] bool leadsToReach(uint64_t block, const std::array<bool, 3> &reach) const;
-  // The bytes of the extents the pages of the demotions started since
-  // `before` pages were landing, by form, complete among the landing pages
-  // as they land, past the runway the walk keeps; none for a walk that
-  // cannot wait. The free pages beside them are not counted: a release may
-  // take them before the copies land, and would count them twice.
-  [[nodiscard]] uint64_t landedSince(const Walk &walk, const std::array<uint32_t, 3> &before) const noexcept;
+  // The extents `landing` pages of the form complete beside its free pages,
+  // past the runway the walk keeps.
+  [[nodiscard]] uint32_t landingExtents(const Walk &walk, kv::PageForm form, uint32_t landing) const noexcept;
+  // The bytes of the extents the pages of the demotions landing complete
+  // (landingExtents); none for a walk that cannot wait. A reclaim gives
+  // what it releases now and what it adds to this.
+  [[nodiscard]] uint64_t landingFill(const Walk &walk) const noexcept;
   // For a shortfall of pages of the form in a cache that spills or trims:
   // the empty extents of the other forms beyond the runway each keeps, and
   // for Index pages, when none is, a Full extent compaction empties (the Full

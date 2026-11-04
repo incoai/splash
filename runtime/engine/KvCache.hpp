@@ -209,14 +209,17 @@ public:
   // moves, of a block that is not poisoned. Pass the previous candidate to
   // continue the scan.
   [[nodiscard]] std::optional<CacheEvictionCandidate> trimCandidate(uint64_t after) const;
-  // The resident pages of each form, on the chains of these blocks (each
-  // block and every block above it), and with `unwritten` of every resident
-  // block without a copy that a state at it or below it needs, which a
-  // writable tier writes before its page frees, that no request holds and
-  // no transfer moves; each counts once. A request holds every page of its
-  // chain, so a chain's count stops at the first page one holds.
-  [[nodiscard]] std::array<uint32_t, 3> idlePagesOnChains(std::span<const uint64_t> blocks,
-                                                          bool unwritten = false) const;
+  // The resident pages of each form on the chains of these blocks (each
+  // block and every block above it) that no request holds and no transfer
+  // moves; each counts once. A request holds every page of its chain, so a
+  // chain's count stops at the first page one holds.
+  [[nodiscard]] std::array<uint32_t, 3> idlePagesOnChains(std::span<const uint64_t> blocks) const;
+  // The resident blocks whose page frees only later: one a transfer moves,
+  // and with `unwritten` one without a copy that a state at it or below it
+  // needs, which a writable tier writes before its page frees.
+  [[nodiscard]] std::vector<uint64_t> laterBlocks(bool unwritten) const;
+  // The resident pages of each form a transfer moves that no request holds.
+  [[nodiscard]] std::array<uint32_t, 3> movingPages() const;
   // Resident, without resident children, users or holders: its page can go
   // once no transfer moves it.
   [[nodiscard]] bool residentLeaf(uint64_t blockId) const;
