@@ -10,7 +10,9 @@
 // before it ran, and one given up while a host step waits on its reads
 // without the reads not yet taken, drains when it goes with reads in flight,
 // and refuses chunks past the command's pages and a prefill that writes an
-// Index page.
+// Index page. Passes over some of the layers each stage and read what one
+// command over all of them does of their layers, and none starts reads past
+// its last layer; reserve() takes what shortfallBytes() says.
 #include "TestAdmission.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
@@ -59,7 +61,9 @@ constexpr uint32_t kExtentPages = 256, kLayers = 3;
 // 10 pages each.
 constexpr uint32_t kHistoryPages = 80, kPages = 100, kChunkPages = 10;
 
-constexpr kv::Layout layoutOf(kv::Format format) { return {kLayers, 2, 256, format, 128, true}; }
+constexpr kv::Layout layoutOf(kv::Format format) {
+  return {kLayers, 2, 256, format, 128, true, 0, 0, kv::Reads::SelectedBlocks};
+}
 
 std::vector<std::byte> layerBytes(const kv::PageStorage &storage, uint32_t page, uint32_t layer) {
   std::vector<std::byte> bytes;
@@ -165,13 +169,14 @@ KvHistoryStream makeStream(MetalBackend &backend, kv::Layout layout, uint32_t bu
                          std::make_shared<model::SsdReaders>(8), kv::SlotFormat(layout), buffers);
 }
 
-// A prefill command over the sequence, as a target's layers encode it, each
-// layer's staged pages copied to `readback`, if any (one layer a buffer's),
-// before its attention would read them.
+// A prefill command over the sequence, or a pass of it over `layers`, as a
+// target's layers encode it, each layer's staged pages copied to `readback`,
+// if any (one layer a buffer's), before its attention would read them.
 metal::CommandGraph prefillGraph(KvHistoryStream &stream, const Sequence &sequence,
-                                 const kv::PageStorage *readback = nullptr, const MetalBuffer &readbackTable = {}) {
+                                 const kv::PageStorage *readback = nullptr, const MetalBuffer &readbackTable = {},
+                                 model::AttentionLayers layers = {0, kLayers}) {
   metal::CommandGraph graph;
-  for (uint32_t layer = 0; layer < sequence.layout.attentionLayers; ++layer) {
+  for (uint32_t layer = layers.first; layer < layers.end; ++layer) {
     const model::PrefillKv staged = stream.addLayer(graph, layer);
     for (uint32_t first = kHistoryPages; first < kPages; first += kChunkPages)
       stream.addChunk(graph, layer, first, kChunkPages);
@@ -183,20 +188,51 @@ metal::CommandGraph prefillGraph(KvHistoryStream &stream, const Sequence &sequen
   return graph;
 }
 
-// One prefill command; returns what the stream's end says.
+// One prefill command, or a pass of it over `layers`; returns what the
+// stream's end says. A host step and the readback's copy of a page after its
+// last layer hold the command's end until the steps before them ran their
+// `then` (the backend's runner runs each step's `then` before the next
+// step): what the command's steps started has started when it ends.
 KvStreamResult prefill(MetalBackend &backend, KvHistoryStream &stream, const Sequence &sequence,
-                       const kv::PageStorage &readback, const MetalBuffer &readbackTable) {
-  stream.begin(*sequence.sources, kPages, sequence.table, sequence.pool.layers());
-  const metal::CommandGraph graph = prefillGraph(stream, sequence, &readback, readbackTable);
+                       const kv::PageStorage &readback, const MetalBuffer &readbackTable,
+                       model::AttentionLayers layers = {0, kLayers}) {
+  stream.begin(*sequence.sources, kPages, sequence.table, sequence.pool.layers(), layers);
+  metal::CommandGraph graph = prefillGraph(stream, sequence, &readback, readbackTable, layers);
+  graph.host([] {});
+  ops::PagedAttention::addStageLayer(graph, sequence.pool.layers()[0], sequence.table, readback.layers()[0],
+                                     readbackTable, 0, 1, sequence.layout);
   static_cast<void>(backend.submitCommandAsync(graph.command()).wait());
   return stream.end();
 }
+
+// The staging that reads the staged pages back, one page per page of the
+// sequence, at page j.
+struct Readback final {
+  Readback(MetalBackend &backend, kv::Layout layout)
+      : storage(backend, test::admitAll, withoutIndex(layout), kExtentPages, kExtentPages),
+        table(test::sharedBuffer(backend, kPages * sizeof(SplashKvPage))) {
+    require(static_cast<bool>(storage.allocateExtent(0)), "the readback extent was refused");
+    std::vector<uint32_t> pages(kPages);
+    std::iota(pages.begin(), pages.end(), 0u);
+    storage.writeEntries(pages, 0, table);
+  }
+  static kv::Layout withoutIndex(kv::Layout layout) {
+    layout.indexDimension = 0;
+    return layout;
+  }
+
+  kv::PageStorage storage;
+  MetalBuffer table;
+};
 
 void streams(MetalBackend &backend, kv::Format format, uint32_t buffers) {
   const kv::Layout layout = layoutOf(format);
   Sequence sequence(backend, layout);
   KvHistoryStream stream = makeStream(backend, layout, buffers);
-  require(stream.reserve(kPages).granted() &&
+  // holds() tells reserve() it would take nothing, by whole extents.
+  require(!stream.holds(1), "staging nothing reserved held a page");
+  require(stream.reserve(kPages).granted() && stream.holds(kPages) && stream.holds(kExtentPages) &&
+              !stream.holds(kExtentPages + 1) &&
               stream.stats().stagingBytes == uint64_t{buffers} * kExtentPages * layout.bytesPerLayerPage() &&
               stream.stats().buffers == buffers,
           "staging does not hold a sequence's pages in each buffer");
@@ -244,35 +280,129 @@ void streams(MetalBackend &backend, kv::Format format, uint32_t buffers) {
   require(next.failures.empty() && layerBytes(readback, kUnreadable, 2) == sequence.expected[kUnreadable][2] &&
               stream.stats().commands == 2,
           "a second command did not stream the history again");
-  require(stream.releaseIdle() == stats.stagingBytes && stream.stats().stagingBytes == 0,
+  require(stream.releaseIdle() == stats.stagingBytes && stream.stats().stagingBytes == 0 &&
+              !stream.holds(1),
           "an idle reclaim did not give staging back");
   std::cout << "kv_history_stream_test: " << kv::formatName(format) << ", " << buffers << " buffer"
             << (buffers == 1 ? "" : "s") << ", " << index << " pages read a layer PASS\n";
 }
 
+// A command run in passes over the layers [0, h) and [h, kLayers), each its
+// own command, stages what a command over all of them stages, byte for byte,
+// and reads each page that holds only its index once a layer, as that
+// command does: each pass starts its first layer's reads and none past its
+// last layer's, with one buffer or two; each says the bytes it read, its
+// pages times a page's of a layer. A layer outside the pass is none of its
+// stream's.
+void passesStageWhatOneCommandStages(MetalBackend &backend, uint32_t buffers) {
+  const kv::Layout layout = layoutOf(kv::Format::Int8);
+  Sequence sequence(backend, layout);
+  KvHistoryStream stream = makeStream(backend, layout, buffers);
+  require(stream.reserve(kPages).granted(), "staging was refused");
+  const uint64_t pageBytes = kv::SlotFormat(layout).layerRange(0).bytes;
+  const uint64_t index = sequence.copies.size();
+  for (uint32_t split = 1; split < kLayers; ++split) {
+    Readback readback(backend, layout);
+    const model::KvHistoryStreamStats before = stream.stats();
+    std::vector<uint64_t> reads;
+    for (const auto &copy : sequence.copies) reads.push_back(copy->reads());
+    for (const model::AttentionLayers pass :
+         {model::AttentionLayers{0, split}, model::AttentionLayers{split, kLayers}}) {
+      const model::KvHistoryStreamStats started = stream.stats();
+      const KvStreamResult result = prefill(backend, stream, sequence, readback.storage, readback.table, pass);
+      const model::KvHistoryStreamStats ended = stream.stats();
+      require(result.failures.empty() && ended.layers - started.layers == pass.end - pass.first &&
+                  ended.pages - started.pages == index * (pass.end - pass.first),
+              "a pass over layers [" + std::to_string(pass.first) + ", " + std::to_string(pass.end) + ") with " +
+                  std::to_string(buffers) + " buffers read other layers than its own");
+      require(result.readBytes == (ended.pages - started.pages) * pageBytes &&
+                  ended.bytes - started.bytes == result.readBytes,
+              "a pass's read bytes are not its pages' records of a layer");
+    }
+    for (uint32_t layer = 0; layer < kLayers; ++layer)
+      for (uint32_t page = 0; page < kPages; ++page)
+        require(layerBytes(readback.storage, page, layer) == sequence.expected[page][layer],
+                "two passes staged other bytes than one command: layer " + std::to_string(layer) + ", page " +
+                    std::to_string(page));
+    for (size_t copy = 0; copy < sequence.copies.size(); ++copy)
+      require(sequence.copies[copy]->reads() - reads[copy] == kLayers,
+              "two passes read a page other than once a layer");
+    require(stream.stats().commands == before.commands + 2, "two passes were not two commands");
+  }
+  stream.begin(*sequence.sources, kPages, sequence.table, sequence.pool.layers(), {1, 2});
+  metal::CommandGraph outside;
+  rejects([&] { static_cast<void>(stream.addLayer(outside, 0)); }, "outside its stream",
+          "a pass staged a layer before its own");
+  rejects([&] { static_cast<void>(stream.addLayer(outside, 2)); }, "outside its stream",
+          "a pass staged a layer past its own");
+  rejects([&] { stream.addChunk(outside, 2, kHistoryPages, kChunkPages); }, "outside its stream",
+          "a pass staged a chunk of a layer past its own");
+  static_cast<void>(stream.end());
+  for (const model::AttentionLayers none : {model::AttentionLayers{1, 1}, model::AttentionLayers{2, kLayers + 1}})
+    rejects([&] { stream.begin(*sequence.sources, kPages, sequence.table, sequence.pool.layers(), none); },
+            "no layer or layers past", "a stream began over no layer or past the pool's");
+  std::cout << "kv_history_stream_test: passes with " << buffers << " buffer" << (buffers == 1 ? "" : "s")
+            << " PASS\n";
+}
+
+// reserve() allocates in each buffer the extents shortfallBytes() says it
+// lacks, under one admission of them all, and then lacks none.
+void reservesItsShortfall(MetalBackend &backend) {
+  const kv::Layout layout = layoutOf(kv::Format::Int8);
+  uint64_t allocated = 0;
+  uint32_t admissions = 0;
+  const metal::AllocationAdmission counting = [&](uint64_t bytes, const std::function<void()> &allocate) {
+    allocated += bytes;
+    ++admissions;
+    return test::admitAll(bytes, allocate);
+  };
+  KvHistoryStream stream = makeStream(backend, layout, 2, counting);
+  for (const uint32_t pages : {1u, kExtentPages, kExtentPages + 1, 3 * kExtentPages}) {
+    const uint64_t shortfall = stream.shortfallBytes(pages);
+    allocated = 0;
+    admissions = 0;
+    require((shortfall == 0) == stream.holds(pages) && stream.reserve(pages).granted() && allocated == shortfall &&
+                !stream.shortfallBytes(pages) && stream.holds(pages),
+            "staging for " + std::to_string(pages) + " pages did not allocate its shortfall");
+    require(admissions == (shortfall ? 1u : 0u), "staging for " + std::to_string(pages) + " pages took " +
+                                                     std::to_string(admissions) + " admissions, not one of its shortfall");
+  }
+  require(stream.shortfallBytes(1) == 0 && stream.releaseIdle() &&
+              stream.shortfallBytes(1) == 2 * kExtentPages * layout.bytesPerLayerPage(),
+          "staging given back lacked other than an extent in each buffer");
+  std::cout << "kv_history_stream_test: shortfall PASS\n";
+}
+
 void lifecycle(MetalBackend &backend) {
   const kv::Layout layout = layoutOf(kv::Format::Int8);
   Sequence sequence(backend, layout);
-  // Staging the budget refuses changes nothing, the second buffer's extent
-  // refused too.
-  uint32_t grants = 1;
+  // Staging the budget refuses changes nothing, with room for one buffer's
+  // extent of two: refused, it asked for both, which is what the ledger
+  // frees for.
+  uint64_t room = kExtentPages * layout.bytesPerLayerPage();
+  std::vector<uint64_t> asked;
   KvHistoryStream refused = makeStream(backend, layout, 2, [&](uint64_t bytes, const std::function<void()> &allocate) {
-    if (!grants) return metal::AllocationResult(metal::AllocationFailure::EngineBudget);
-    --grants;
+    asked.push_back(bytes);
+    if (bytes > room) return metal::AllocationResult(metal::AllocationFailure::EngineBudget);
+    room -= bytes;
     return test::admitAll(bytes, allocate);
   });
+  const uint64_t shortfall = refused.shortfallBytes(kPages);
   const model::ModelMemoryAdmission admission = refused.reserve(kPages);
   require(!admission.granted() && admission.allocationFailure == metal::AllocationFailure::EngineBudget &&
               refused.stats().stagingBytes == 0,
           "refused staging kept an extent");
-  rejects([&] { refused.begin(*sequence.sources, kPages, sequence.table, sequence.pool.layers()); },
+  require(!asked.empty() && asked.back() == shortfall,
+          "refused staging asked its admission for " + std::to_string(asked.empty() ? 0 : asked.back()) +
+              " bytes at once, not the " + std::to_string(shortfall) + " it lacks");
+  rejects([&] { refused.begin(*sequence.sources, kPages, sequence.table, sequence.pool.layers(), {0, kLayers}); },
           "staging do not hold", "a stream began without staging for its pages");
   KvHistoryStream stream = makeStream(backend, layout, 1);
   require(stream.reserve(kPages).granted(), "staging was refused");
   // A command given up before it ran ends with its reads stopped, and the
   // next begins.
-  stream.begin(*sequence.sources, kPages, sequence.table, sequence.pool.layers());
-  rejects([&] { stream.begin(*sequence.sources, kPages, sequence.table, sequence.pool.layers()); },
+  stream.begin(*sequence.sources, kPages, sequence.table, sequence.pool.layers(), {0, kLayers});
+  rejects([&] { stream.begin(*sequence.sources, kPages, sequence.table, sequence.pool.layers(), {0, kLayers}); },
           "before the last command's ended", "a stream began twice");
   rejects([&] { static_cast<void>(stream.releaseIdle()); }, "while a command streams",
           "staging was released while a command streamed");
@@ -284,13 +414,13 @@ void lifecycle(MetalBackend &backend) {
   rejects([&] { stream.addChunk(refusedChunks, 0, kHistoryPages - kChunkPages, kChunkPages); },
           "writes a page that holds only its index", "a prefill wrote an Index page");
   require(stream.end().failures.empty() && stream.end().failures.empty(), "a command given up failed a page");
-  stream.begin(*sequence.sources, kPages, sequence.table, sequence.pool.layers());
+  stream.begin(*sequence.sources, kPages, sequence.table, sequence.pool.layers(), {0, kLayers});
   require(stream.end().failures.empty(), "a stream did not begin again once the last ended");
   // A stream that goes with reads in flight drains them first.
   {
     KvHistoryStream going = makeStream(backend, layout, 2);
     require(going.reserve(kPages).granted(), "staging was refused");
-    going.begin(*sequence.sources, kPages, sequence.table, sequence.pool.layers());
+    going.begin(*sequence.sources, kPages, sequence.table, sequence.pool.layers(), {0, kLayers});
   }
   for (const auto &copy : sequence.copies)
     require(copy->reads() <= 3, "a page was read past the commands that read it");
@@ -316,7 +446,7 @@ void endsTheReadsOfACommandGivenUp(MetalBackend &backend) {
   const std::shared_ptr<const KvPageSources> sources = sourcesOf(pages);
   KvHistoryStream stream = makeStream(backend, layout, 1);
   require(stream.reserve(kPages).granted(), "staging was refused");
-  stream.begin(*sources, kPages, sequence.table, sequence.pool.layers());
+  stream.begin(*sources, kPages, sequence.table, sequence.pool.layers(), {0, kLayers});
   const metal::CommandGraph graph = prefillGraph(stream, sequence);
   metal::CommandTicket command = backend.submitCommandAsync(graph.command());
   constexpr uint32_t kTaken = 9;
@@ -349,6 +479,8 @@ int main(int argc, const char *argv[]) {
       MetalBackend backend(argv[1]);
       for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16})
         for (const uint32_t buffers : {1u, 2u}) streams(backend, format, buffers);
+      for (const uint32_t buffers : {1u, 2u}) passesStageWhatOneCommandStages(backend, buffers);
+      reservesItsShortfall(backend);
       lifecycle(backend);
       endsTheReadsOfACommandGivenUp(backend);
       std::cout << "kv_history_stream_test: PASS\n";
