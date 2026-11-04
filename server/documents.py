@@ -262,12 +262,6 @@ def pdf_content(encoded, *, budget):
     return parts
 
 
-def file_content(file, *, budget):
-    """Check and render one request file part's inline PDF as canonical
-    text/image parts."""
-    return pdf_content(checked_file(file), budget=budget)
-
-
 def render_files(messages, *, deadline, without_slot):
     """`messages`, canonical (each file part's data already checked), with
     each file part replaced by its PDF's pages as text and image parts, all

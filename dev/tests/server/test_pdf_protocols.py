@@ -251,7 +251,7 @@ class PdfProtocolTests(unittest.TestCase):
 
     def test_user_and_tool_files_share_one_request_budget(self):
         budget = documents.DocumentBudget(deadline=FOREVER)
-        documents.file_content(self.file, budget=budget)
+        documents.pdf_content(self.encoded, budget=budget)
         one_file = documents.MAX_REQUEST_DOCUMENT_BYTES - budget.remaining_bytes
 
         def normalize(messages, remaining_bytes):

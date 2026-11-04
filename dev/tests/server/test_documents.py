@@ -130,8 +130,8 @@ class DocumentTests(unittest.TestCase):
                 self.subTest(encoded=encoded),
                 self.assertRaisesRegex(APIError, "PDF data is not valid base64"),
             ):
-                documents.file_content(
-                    {"file_data": encoded},
+                documents.pdf_content(
+                    encoded,
                     budget=documents.DocumentBudget(deadline=math.inf),
                 )
 

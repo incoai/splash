@@ -1373,8 +1373,8 @@ def render_pdf(payload=None, budget=None):
     """A PDF's page text and image parts, rendered as request preparation
     renders a file part."""
     encoded = base64.b64encode(pdf_bytes() if payload is None else payload).decode()
-    return documents.file_content(
-        {"file_data": encoded},
+    return documents.pdf_content(
+        encoded,
         budget=documents.DocumentBudget(deadline=math.inf)
         if budget is None
         else budget,

@@ -42,9 +42,9 @@ class PackagedServerTests(unittest.TestCase):
                     "-c",
                     "import math, os, sys; sys.path.insert(0, os.getcwd()); "
                     "from server import server, documents; "
-                    "file = {'file_data': sys.stdin.read()}; "
                     "budget = documents.DocumentBudget(deadline=math.inf); "
-                    "print(documents.file_content(file, budget=budget)[0]['text'])",
+                    "pages = documents.pdf_content(sys.stdin.read(), budget=budget); "
+                    "print(pages[0]['text'])",
                 ],
                 cwd=stage,
                 input=base64.b64encode(pdf_bytes()).decode(),
