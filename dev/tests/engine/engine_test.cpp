@@ -1225,11 +1225,9 @@ void testOneRequestPublishesJunctionAndLatestReplayState() {
           "one request did not retain both sparse composite states");
 }
 
-// A junction costs a cached state, its capture and a draft window of
-// draft context, so it is planned only where it saves a later request at
-// least a draft window of prefill: at a branch point that far past the state
-// the request resumes from.
-void testLazyJunctionNeedsADraftWindowOfGain() {
+// A junction costs a cached state and its capture: even a branch that could
+// reuse existing draft work must save the minimum number of target rows.
+void testLazyJunctionRequiresMinimumGain() {
   test::TestKvStorage storage(256, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, nullptr, nullptr);
@@ -1274,6 +1272,224 @@ void testLazyJunctionNeedsADraftWindowOfGain() {
                            }) &&
               engine.snapshot().junctionMaterializations == 1,
           "a branch point 96 tokens past the resumed state planned a junction");
+}
+
+// The experimental gain policy changes only which existing prefill boundary
+// is materialized. A subsequent *different* sibling must actually restore
+// there, while the explicit 2048 control restores the ordinary 4096 state.
+void testConfigurableLazyJunctionGain() {
+  for (uint32_t minimum : {256U, 512U, 1024U, 1536U, 2048U}) {
+    for (uint32_t gain : {256U, 512U, 1024U, 1536U}) {
+      test::TestKvStorage storage(512, 4096, 4);
+      KvPool pool(storage, 0);
+      engine::Cache resources(pool, nullptr, nullptr);
+      Executor executor(1);
+      Events events;
+      auto config = test::engineConfig();
+      config.minimumJunctionGainTokens = minimum;
+      engine::Engine engine(config, resources, executor, events);
+      guardReleases(storage, engine);
+      std::vector<uint32_t> seed(9216);
+      std::iota(seed.begin(), seed.end(), 1);
+      std::vector<uint32_t> base(seed.begin(), seed.begin() + 4097);
+      engine.submit(request(1, base));
+      runUntilIdle(engine);
+      engine.submit(request(2, seed));
+      runUntilIdle(engine);
+      require(events.starts.back() == 4096 && resources.lookup(base, {}).resumeBoundary() == 4096,
+              "the long seed retired the ordinary base replay state");
+      const uint32_t shared = 4096 + gain;
+      const auto sibling = [&](uint32_t token) {
+        std::vector<uint32_t> value(seed.begin(), seed.begin() + shared);
+        value.resize(shared + 64, token);
+        return value;
+      };
+      engine.submit(request(3, sibling(20'000)));
+      runUntilIdle(engine);
+      const bool materializes = gain >= minimum;
+      require(events.starts.back() == 4096 &&
+                  engine.snapshot().junctionMaterializations == (materializes ? 1U : 0U),
+              "the junction policy changed its source state or planned the wrong branch boundary");
+      engine.submit(request(4, sibling(30'000)));
+      runUntilIdle(engine);
+      const auto snapshot = engine.snapshot();
+      require(events.starts.back() == (materializes ? shared : 4096) &&
+                  snapshot.junctionMaterializations == (materializes ? 1U : 0U) &&
+                  snapshot.junctionMaterializationFailures == 0 && snapshot.resources.stateCache.evictions == 0 &&
+                  events.completedCount == 4 && events.failedCount == 0 &&
+                  events.outputs[3] == std::vector<uint32_t>{42} &&
+                  events.outputs[4] == std::vector<uint32_t>{42} &&
+                  resources.lookup(base, {}).resumeBoundary() == 4096,
+              "the policy failed distinct-sibling reuse, altered output, or retired the ordinary base");
+    }
+  }
+}
+
+void testRefusedSmallJunctionKeepsServing() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor(1);
+  Events events;
+  auto config = test::engineConfig();
+  config.minimumJunctionGainTokens = 256;
+  engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> seed(9216);
+  std::iota(seed.begin(), seed.end(), 1);
+  std::vector<uint32_t> base(seed.begin(), seed.begin() + 4097);
+  engine.submit(request(1, base));
+  runUntilIdle(engine);
+  engine.submit(request(2, seed));
+  runUntilIdle(engine);
+  auto pinnedBase = resources.lookup(base, {});
+  require(pinnedBase.resumeBoundary() == 4096, "the pressure fixture did not pin its ordinary fallback");
+  constexpr uint32_t shared = 4608;
+  const auto sibling = [&](uint32_t token) {
+    std::vector<uint32_t> value(seed.begin(), seed.begin() + shared);
+    value.resize(shared + 64, token);
+    return value;
+  };
+  executor.denyReservationAt = shared;
+  engine.submit(request(3, sibling(20'000)));
+  runUntilIdle(engine);
+  require(events.starts.back() == 4096 && engine.snapshot().junctionMaterializationFailures == 1 &&
+              engine.snapshot().junctionMaterializations == 0 && events.completedCount == 3 &&
+              events.failedCount == 0 && events.outputs[3] == std::vector<uint32_t>{42} &&
+              resources.lookup(base, {}).resumeBoundary() == 4096,
+          "refusal of an optional small junction blocked inference or evicted its pinned fallback");
+  executor.denyReservationAt.reset();
+  engine.submit(request(4, sibling(30'000)));
+  runUntilIdle(engine);
+  require(events.starts.back() == 4096 && engine.snapshot().junctionMaterializations == 1 &&
+              events.completedCount == 4 && events.failedCount == 0,
+          "a later sibling did not recover after a refused optional junction");
+}
+
+// Default short-tail improvement and its explicit old-policy control. The
+// equal-row case at 6176 still requires a guard: a new junction would force
+// a 2048-row draft restore even though the projected row count stays 2080.
+void testSmallJunctionRequiresUnchangedDraftWork() {
+  for (bool control : {false, true}) {
+    for (uint32_t tail : {64U, 1536U, 1568U, 2048U}) {
+      test::TestKvStorage storage(512, 4096, 4);
+      KvPool pool(storage, 0);
+      engine::Cache resources(pool, nullptr, nullptr);
+      Executor executor(1);
+      Events events;
+      auto config = test::engineConfig();
+      require(config.minimumJunctionGainTokens == 512, "the engine test hid the production junction default");
+      if (control) config.minimumJunctionGainTokens = 2048;
+      engine::Engine engine(config, resources, executor, events);
+      guardReleases(storage, engine);
+      std::vector<uint32_t> seed(9216);
+      std::iota(seed.begin(), seed.end(), 1);
+      engine.submit(request(1, std::vector<uint32_t>(seed.begin(), seed.begin() + 4097)));
+      runUntilIdle(engine);
+      engine.submit(request(2, seed));
+      runUntilIdle(engine);
+      constexpr uint32_t shared = 4608;
+      const auto sibling = [&](uint32_t token) {
+        std::vector<uint32_t> value(seed.begin(), seed.begin() + shared);
+        value.resize(shared + tail, token);
+        return value;
+      };
+      engine.submit(request(3, sibling(20'000)));
+      runUntilIdle(engine);
+      const bool restores = tail <= 1536;
+      const bool materializes = restores && !control;
+      const DraftContextPlan &plan = executor.plans.at(3);
+      const uint32_t expectedBegin = tail == 2048 ? 4576 : 4096;
+      require(events.starts.back() == 4096 && plan.restoresDraftState == restores &&
+                  plan.captureSpans.size() == 1 && plan.captureSpans[0].begin == expectedBegin &&
+                  plan.captureSpans[0].end == shared + tail &&
+                  plan.captureSpans[0].resetDraftState == !restores &&
+                  engine.snapshot().junctionMaterializations == (materializes ? 1U : 0U),
+              "a small junction changed the baseline draft restore, capture rows or reset schedule");
+      engine.submit(request(4, sibling(30'000)));
+      runUntilIdle(engine);
+      require(events.starts.back() == (materializes ? shared : 4096) &&
+                  engine.snapshot().junctionMaterializations == (materializes ? 1U : 0U) &&
+                  events.outputs[3] == std::vector<uint32_t>{42} &&
+                  events.outputs[4] == std::vector<uint32_t>{42} && events.failedCount == 0,
+              "the guarded default or explicit 2048 control restored the wrong sibling state");
+    }
+  }
+}
+
+// An earlier mandatory shared boundary already needs the restored draft
+// window, but a later small lazy junction could still extend its capture
+// span across work the long suffix otherwise skips. Restore flags alone
+// are therefore insufficient: the exact capture spans must stay the same.
+void testSmallJunctionDoesNotExtendSharedDraftSpan() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor(1);
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+  std::vector<uint32_t> seed(9216);
+  std::iota(seed.begin(), seed.end(), 1);
+  engine.submit(request(1, std::vector<uint32_t>(seed.begin(), seed.begin() + 4097)));
+  runUntilIdle(engine);
+  engine.submit(request(2, seed));
+  runUntilIdle(engine);
+  std::vector<uint32_t> branch(seed.begin(), seed.begin() + 5632);
+  branch.resize(8192, 20'000);
+  auto producer = request(3, branch);
+  producer.priority = RequestPriority::Foreground;
+  engine.submit(std::move(producer));
+  std::vector<uint32_t> peer(seed.begin(), seed.begin() + 4352);
+  peer.resize(4416, 30'000);
+  engine.submit(request(4, peer));
+  runUntilIdle(engine);
+  const DraftContextPlan &plan = executor.plans.at(3);
+  require(plan.restoresDraftState && plan.captureSpans.size() == 2 &&
+              plan.captureSpans[0].begin == 4096 && plan.captureSpans[0].end == 4352 &&
+              !plan.captureSpans[0].resetDraftState && plan.captureSpans[1].begin == 6112 &&
+              plan.captureSpans[1].end == 8192 && plan.captureSpans[1].resetDraftState &&
+              std::none_of(plan.boundaries.begin(), plan.boundaries.end(),
+                           [](const DraftBoundaryPlan &point) { return point.boundary == 5632; }),
+          "a small lazy junction extended draft work despite an already required restore");
+  std::vector<uint32_t> probe(seed.begin(), seed.begin() + 5632);
+  probe.resize(5696, 40'000);
+  require(resources.lookup(probe, {}).resumeBoundary() == 4352 && events.completedCount == 4 &&
+              events.failedCount == 0,
+          "a rejected lazy junction was published or lost the existing shared recovery point");
+}
+
+// The existing >=2048 rule remains intact, including cases where its
+// materialization deliberately adds draft work. The new guard is only for
+// a smaller gain; it cannot silently remove an existing recovery policy.
+void testLargeJunctionKeepsExistingPolicy() {
+  for (uint32_t minimum : {512U, 2048U}) {
+    test::TestKvStorage storage(512, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, nullptr, nullptr);
+    Executor executor(1);
+    Events events;
+    auto config = test::engineConfig();
+    config.minimumJunctionGainTokens = minimum;
+    engine::Engine engine(config, resources, executor, events);
+    guardReleases(storage, engine);
+    std::vector<uint32_t> seed(9216);
+    std::iota(seed.begin(), seed.end(), 1);
+    engine.submit(request(1, std::vector<uint32_t>(seed.begin(), seed.begin() + 4097)));
+    runUntilIdle(engine);
+    engine.submit(request(2, seed));
+    runUntilIdle(engine);
+    std::vector<uint32_t> branch(seed.begin(), seed.begin() + 6144);
+    branch.resize(8192, 20'000);
+    engine.submit(request(3, branch));
+    runUntilIdle(engine);
+    const DraftContextPlan &plan = executor.plans.at(3);
+    require(events.starts.back() == 4096 && engine.snapshot().junctionMaterializations == 1 &&
+                !plan.restoresDraftState && draftContextRows(plan) == 4096 &&
+                std::any_of(plan.boundaries.begin(), plan.boundaries.end(),
+                            [](const DraftBoundaryPlan &point) { return point.boundary == 6144; }),
+            "the new small-gain guard removed the existing full-window junction");
+  }
 }
 
 // Buffers refused for the latest replay state come from recycling the least
@@ -8349,6 +8565,21 @@ void testDecodeShareValidation() {
   }
 }
 
+void testJunctionGainValidation() {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor(1);
+  Events events;
+  for (uint32_t invalid : {0U, 768U, std::numeric_limits<uint32_t>::max()}) {
+    rejects([&] {
+      engine::Engine(test::engineConfig({.minimumJunctionGainTokens = invalid}),
+                     resources, executor, events);
+    }, "minimum junction gain must be 256, 512, 1024, 1536 or 2048 tokens",
+       "unsupported junction gain was accepted");
+  }
+}
+
 // The engine refuses a config the bootstrap has not completed: one without
 // its context window, its vocabulary or either of the governor's hooks.
 void testIncompleteConfigIsRefused() {
@@ -12955,6 +13186,7 @@ int main() {
     testDefaultCheckpointRestoresLatestCommittedPrefix();
     testCheckpointsSkipNearResumeAndReplayBoundaries();
     testDecodeShareValidation();
+    testJunctionGainValidation();
     testIncompleteConfigIsRefused();
     testUnwritableTierKeepsRequestsResident();
     testAdmissionSpillsWhatMemoryCannotHold();
@@ -12998,7 +13230,12 @@ int main() {
     testImageSpansKeyPrefixIdentity();
     testSharedPrefillBoundaryStopsAtTheFirstDifferentImage();
     testOneRequestPublishesJunctionAndLatestReplayState();
-    testLazyJunctionNeedsADraftWindowOfGain();
+    testLazyJunctionRequiresMinimumGain();
+    testConfigurableLazyJunctionGain();
+    testRefusedSmallJunctionKeepsServing();
+    testSmallJunctionRequiresUnchangedDraftWork();
+    testSmallJunctionDoesNotExtendSharedDraftSpan();
+    testLargeJunctionKeepsExistingPolicy();
     testLatestReplayDenialRecyclesOlderStateNotTheJunction();
     testCancellationAfterJunctionDiscardsLaterState();
     testPublicationInvariantFailureIsFatal();

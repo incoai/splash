@@ -25,4 +25,31 @@ if [ "$status" -ne 1 ] ||
     exit 1
 fi
 test ! -s "$work/out"
+
+# These options must fail before even reading a model configuration, as well
+# as before opening the missing Metal library or acquiring a device.
+rejects_junction_option() {
+    expected_error=$1
+    shift
+    status=0
+    "$binary" "$work/missing.metallib" "$work/missing-model" "$@" >"$work/out" 2>"$work/err" || status=$?
+    if [ "$status" -ne 1 ] ||
+        ! grep -Fqx "backend-benchmark: $expected_error" "$work/err" ||
+        test -s "$work/out"; then
+        echo "backend-benchmark did not reject the junction arguments before model loading: $*" >&2
+        cat "$work/err" >&2
+        exit 1
+    fi
+}
+
+rejects_junction_option 'junction benchmark options take positive integers' --minimum-junction-gain 0
+rejects_junction_option 'junction benchmark options take positive integers' --minimum-junction-gain text
+rejects_junction_option 'junction benchmark options take positive integers' --minimum-junction-gain 512x
+rejects_junction_option 'junction benchmark options take positive integers' --minimum-junction-gain 4294967296
+rejects_junction_option 'junction benchmark option is outside its supported range' --minimum-junction-gain 768
+rejects_junction_option 'junction benchmark option is outside its supported range' --junction-shared-gain 2048
+rejects_junction_option 'junction benchmark option is outside its supported range' --junction-reuse-count 17
+rejects_junction_option 'junction benchmark option is outside its supported range' --junction-output-tokens 513
+rejects_junction_option 'benchmark option requires a value' --junction-output-tokens
+
 echo 'backend-benchmark CLI validation: PASS'

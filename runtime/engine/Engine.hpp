@@ -64,6 +64,10 @@ struct EngineConfig final {
   uint64_t maximumPrefillAttentionPairs = std::numeric_limits<uint64_t>::max();
   // The prefill checkpoint interval and the resource wait limit.
   uint32_t prefillCheckpointTokens = kPrefillCheckpointTokens;
+  // Minimum target-prefill rows a lazy junction saves on a later sibling.
+  // Below a draft window, it is admitted only when the existing draft
+  // restore and capture spans remain unchanged. Not exposed by the CLI.
+  uint32_t minimumJunctionGainTokens = 512;
   double resourceWaitTimeoutMilliseconds = kResourceWaitTimeoutMilliseconds;
   // Host growth admission, supplied by the runtime governor. Queried while
   // resident lanes drain after a suspension, and when a boundary's state

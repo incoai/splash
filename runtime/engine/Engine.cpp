@@ -17,10 +17,6 @@ constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 // A mask request the server leaves unanswered this long fails its request;
 // the batch's command slot is not held longer.
 constexpr int kMaskWaitLimitMilliseconds = 5000;
-// A junction costs a cached state, its capture and up to a draft window of
-// draft-context rows; a later request must save at least that much prefill.
-constexpr uint32_t kMinimumJunctionGain = model::ExecutionLimits::draftContextTokens;
-
 // What the request's KV blocks are cached under beside its tokens.
 PromptIdentity promptIdentity(const EngineRequest &request) noexcept {
   return {request.images, request.cacheSalt};
@@ -80,6 +76,10 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
     throw std::invalid_argument("the engine needs the governor's growth pause and serving mark");
   if (!std::isfinite(config_.decodeShare) || config_.decodeShare < 0.0)
     throw std::invalid_argument("decode share must be nonnegative and finite");
+  if (config_.minimumJunctionGainTokens != 256 && config_.minimumJunctionGainTokens != 512 &&
+      config_.minimumJunctionGainTokens != 1024 && config_.minimumJunctionGainTokens != 1536 &&
+      config_.minimumJunctionGainTokens != 2048)
+    throw std::invalid_argument("minimum junction gain must be 256, 512, 1024, 1536 or 2048 tokens");
   if (config_.spill.capable &&
       (!config_.spill.geometry.fullPageBytes || !config_.spill.geometry.slotBytes))
     throw std::invalid_argument("a target that can spill needs its page and slot sizes");
@@ -1268,7 +1268,8 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
            stateBoundary, latestReplayBoundary, config_.prefillCheckpointTokens)) {
     addStateBoundary(active, stateBoundary, checkpoint, true, true);
   }
-  if (junctionBoundary >= stateBoundary + kMinimumJunctionGain)
+  constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
+  if (uint64_t{junctionBoundary} >= uint64_t{stateBoundary} + window)
     addStateBoundary(active, stateBoundary, junctionBoundary, false, true);
   addStateBoundary(active, stateBoundary, latestReplayBoundary,
                    latestReplayBoundary != promptReplayBoundary(active), true);
@@ -1277,7 +1278,32 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   addStateBoundary(active, stateBoundary, promptReplayBoundary(active), false, true);
 
   static_cast<void>(addSharedPrefillBoundaries(active, stateBoundary, true));
-  return pendingDraftStatePlan(active, stateBoundary);
+  DraftContextPlan baseline = pendingDraftStatePlan(active, stateBoundary);
+  if (!baseline.restoresDraftState || junctionBoundary > latestReplayBoundary ||
+      uint64_t{junctionBoundary} < uint64_t{stateBoundary} + config_.minimumJunctionGainTokens ||
+      uint64_t{junctionBoundary} >= uint64_t{stateBoundary} + window)
+    return baseline;
+  // A small junction is useful only when its draft context is already being
+  // computed. Compare a local proposal before mutating the live boundaries:
+  // adding an existing boundary can promote a checkpoint to ordinary state.
+  std::vector<uint32_t> boundaries;
+  boundaries.reserve(active.stateBoundaries.size() + 1);
+  for (const auto &point : active.stateBoundaries)
+    boundaries.push_back(point.tokens);
+  const auto at = std::lower_bound(boundaries.begin(), boundaries.end(), junctionBoundary);
+  if (at == boundaries.end() || *at != junctionBoundary)
+    boundaries.insert(at, junctionBoundary);
+  DraftContextPlan proposed = planDraftContext(stateBoundary, active.replayTokens, boundaries);
+  const bool sameWork = proposed.restoresDraftState == baseline.restoresDraftState &&
+      std::equal(baseline.captureSpans.begin(), baseline.captureSpans.end(),
+                 proposed.captureSpans.begin(), proposed.captureSpans.end(),
+                 [](const DraftCaptureSpan &a, const DraftCaptureSpan &b) {
+                   return a.begin == b.begin && a.end == b.end && a.resetDraftState == b.resetDraftState;
+                 });
+  if (!sameWork)
+    return baseline;
+  addStateBoundary(active, stateBoundary, junctionBoundary, false, true);
+  return proposed;
 }
 
 bool Engine::addStateBoundary(Request &active, uint32_t after, uint32_t tokens,
