@@ -129,7 +129,8 @@ struct LoopFixture {
                 throw *writeFailure;
               output.insert(output.end(), bytes.begin(), bytes.end());
             },
-            [this] { return status(); }, limits) {
+            limits) {
+    loop.serveStatus([this] { return status(); });
     storage.commandInFlight = [this] { return loop.commandInFlight(); };
     if (memory) {
       memory->hold("weights", uint64_t{weights.held()} * Weights::kImageBytes);

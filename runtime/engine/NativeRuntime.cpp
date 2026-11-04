@@ -22,17 +22,21 @@ uint64_t systemUnixMicros() noexcept {
 
 NativeRuntime::NativeRuntime(NativeLoopConfig config, engine::Cache &cache,
                              model::Model &model, ByteSink output,
-                             StatusProvider statusProvider,
                              protocol::ProtocolLimits limits)
-    : config_(std::move(config)), output_(std::move(output)),
-      statusProvider_(std::move(statusProvider)), limits_(limits),
+    : config_(std::move(config)), output_(std::move(output)), limits_(limits),
       parser_(limits_), core_(config_.engine, cache, model, *this) {
-  if (!output_ || !statusProvider_ || !config_.engine.weights ||
+  if (!output_ || !config_.engine.weights ||
       !config_.unixMicros || !config_.monotonicMilliseconds)
     throw std::invalid_argument("the native engine loop lacks a component it needs");
   if (auto issue = protocol::validateLimits(limits_))
     throw std::invalid_argument(issue->describe());
   core_.startIdleClock(config_.monotonicMilliseconds());
+}
+
+void NativeRuntime::serveStatus(StatusProvider provider) {
+  if (!provider)
+    throw std::invalid_argument("the native engine loop was given no status source");
+  statusProvider_ = std::move(provider);
 }
 
 bool NativeRuntime::receive(std::span<const uint8_t> bytes) {

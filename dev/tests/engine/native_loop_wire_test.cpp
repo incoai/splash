@@ -672,8 +672,22 @@ void testLoopNeedsItsComponents() {
   NativeLoopConfig config{.engine = test::engineConfig()};
   rejects([&] {
     engine::NativeRuntime(std::move(config), cache, executor, [](std::span<const uint8_t>) {},
-                          test::readyStatusJson, protocol::ProtocolLimits{});
+                          protocol::ProtocolLimits{});
   }, "the native engine loop lacks a component it needs", "a loop without its weights was built");
+}
+
+// The loop refuses an empty status source.
+void testStatusNeedsASource() {
+  test::TestKvStorage storage(8, 4096, 4);
+  KvPool pool(storage, 8);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor;
+  Weights weights;
+  engine::NativeRuntime loop(
+      {.engine = test::engineConfig(
+           {.weights = WeightResidencyConfig{.weights = &weights, .admit = test::admitAll}})},
+      cache, executor, [](std::span<const uint8_t>) {}, protocol::ProtocolLimits{});
+  rejects([&] { loop.serveStatus({}); }, "no status source", "an empty status source was connected");
 }
 
 // An exception while the engine admits a request is engine-fatal: nothing
@@ -1256,6 +1270,7 @@ std::span<const test::TestCase> wireTests() {
       {"testFatalFramingClosesConnection", testFatalFramingClosesConnection},
       {"testInvalidLimitsAreRejectedAtConstruction", testInvalidLimitsAreRejectedAtConstruction},
       {"testLoopNeedsItsComponents", testLoopNeedsItsComponents},
+      {"testStatusNeedsASource", testStatusNeedsASource},
       {"testRequestErrorKeepsFraming", testRequestErrorKeepsFraming},
       {"testCommandWatchdogAndPendingHealthWake", testCommandWatchdogAndPendingHealthWake},
       {"testDuplicateLiveRequestClosesWithoutAmbiguousError", testDuplicateLiveRequestClosesWithoutAmbiguousError},

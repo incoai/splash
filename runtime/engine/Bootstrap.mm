@@ -171,13 +171,17 @@ ServingRuntime::ServingRuntime(std::unique_ptr<RuntimeResources> resources,
                                std::unique_ptr<model::RuntimeModel> modelRuntime,
                                std::unique_ptr<NativeRuntime> nativeLoop,
                                protocol::ReadyEvent ready,
-                               RuntimeBootstrapReport report)
+                               RuntimeBootstrapReport report,
+                               std::function<double()> loopMaxTick)
     : resources_(std::move(resources)), model_(std::move(modelRuntime)),
       nativeLoop_(std::move(nativeLoop)),
       memoryControl_(resources_->memoryGovernor(), resources_->backend(),
                      *nativeLoop_),
-      ready_(std::move(ready)), report_(std::move(report)) {
+      ready_(std::move(ready)), report_(std::move(report)), loopMaxTick_(std::move(loopMaxTick)) {
   sampleThermalState();
+  // The runtime owns the loop and is never moved, so the loop never calls
+  // a runtime that is gone.
+  nativeLoop_->serveStatus([this] { return statusJson(); });
 }
 
 ServingRuntime::~ServingRuntime() {
@@ -194,7 +198,7 @@ void ServingRuntime::announceReady() {
   resources_->beginServing();
 }
 
-std::string ServingRuntime::statusJson(double loopMaxTickMilliseconds) {
+std::string ServingRuntime::statusJson() {
   // Status can arrive during GPU work; allocation/command boundaries and
   // the safe-point pressure monitor already refresh the cached sample.
   metal::MetalBackend &backend = resources_->backend();
@@ -210,7 +214,7 @@ std::string ServingRuntime::statusJson(double loopMaxTickMilliseconds) {
                       .memoryGovernor = resources_->memoryGovernor().snapshot(),
                       .aneFfn = resources_->aneFfnSnapshot(),
                       .thermalState = thermalState_.state(),
-                      .loopMaxTickMilliseconds = loopMaxTickMilliseconds,
+                      .loopMaxTickMilliseconds = loopMaxTick_(),
                       .streamedTable = resources_->streamedTableStats(),
                       .streamedExperts = resources_->streamedExpertStats()};
   if (std::optional<KvSpillSnapshot> spill = resources_->kvSpillSnapshot())
@@ -333,7 +337,9 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
 std::unique_ptr<ServingRuntime> ServingRuntime::start(
     RuntimeBootstrapConfig config,
     NativeRuntime::ByteSink output,
-    NativeRuntime::StatusProvider statusProvider) {
+    std::function<double()> loopMaxTick) {
+  if (!loopMaxTick)
+    throw std::invalid_argument("the serving runtime was given no measure of its loop's ticks");
   std::unique_ptr<RuntimeResources> resources;
   try {
     resources = RuntimeResources::create(config.resources, config.nativeLoop.engine.maxContext);
@@ -448,7 +454,7 @@ std::unique_ptr<ServingRuntime> ServingRuntime::start(
     config.nativeLoop.engineFailed = [owner = resources.get()] { owner->engineFailed(); };
     nativeLoop = std::make_unique<NativeRuntime>(
         config.nativeLoop, resources->cache(),
-        *modelRuntime, std::move(output), std::move(statusProvider), limits);
+        *modelRuntime, std::move(output), limits);
   } catch (const metal::MetalAllocationError &error) {
     base.resourceFailure = resourceAllocationFailure(error.failure());
     fail(std::move(base), RuntimeBootstrapStage::ModelCreation,
@@ -498,8 +504,8 @@ std::unique_ptr<ServingRuntime> ServingRuntime::start(
       });
 
   return std::unique_ptr<ServingRuntime>(
-      new ServingRuntime(std::move(resources), std::move(modelRuntime),
-                         std::move(nativeLoop), ready, std::move(report)));
+      new ServingRuntime(std::move(resources), std::move(modelRuntime), std::move(nativeLoop), ready,
+                         std::move(report), std::move(loopMaxTick)));
 }
 
 } // namespace splash::engine

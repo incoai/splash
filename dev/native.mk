@@ -431,7 +431,7 @@ $(TEST_GGUF_PREPARATION): dev/tests/engine/gguf_preparation_test.mm $(ENGINE_LIB
 $(TEST_BOOTSTRAP_TEST): dev/tests/engine/runtime_bootstrap_test.mm \
 		dev/tests/engine/ProtocolPeer.cpp $(ENGINE_LIBRARY)
 $(TEST_RESOURCES_TEST): dev/tests/engine/runtime_resources_test.mm dev/tools/LoadOptions.hpp \
-		$(ENGINE_LIBRARY) $(LIB)
+		dev/tests/engine/ProtocolPeer.cpp $(ENGINE_LIBRARY) $(LIB)
 $(TEST_KV_PAGE_TIER_TEST): dev/tests/engine/kv_page_tier_test.mm \
 		$(ENGINE_LIBRARY)
 $(TEST_QWEN_STATE_TEST): dev/tests/engine/qwen_state_storage_test.mm \

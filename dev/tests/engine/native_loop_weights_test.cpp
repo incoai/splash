@@ -649,7 +649,8 @@ void testTransfersLandWhileTheWeightsAreRestored() {
        .monotonicMilliseconds = [&] { return now; }},
       cache, executor,
       [&](std::span<const uint8_t> bytes) { output.insert(output.end(), bytes.begin(), bytes.end()); },
-      test::readyStatusJson, protocol::ProtocolLimits{});
+      protocol::ProtocolLimits{});
+  loop.serveStatus(test::readyStatusJson);
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady(protocol::peer::kTestReady);
   // A conversation leaves its replay point, whose copies start once it has

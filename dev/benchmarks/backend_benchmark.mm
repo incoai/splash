@@ -982,10 +982,7 @@ int main(int argc, char **argv) {
     while (!bootstrap) {
       try {
         bootstrap = engine::ServingRuntime::start(
-            bootstrapConfig, [](std::span<const uint8_t>) {},
-            []() -> std::string {
-              throw std::logic_error("benchmark does not accept native status requests");
-            });
+            bootstrapConfig, [](std::span<const uint8_t>) {}, [] { return 0.0; });
       } catch (const engine::RuntimeBootstrapError &error) {
         const auto now = AwakeClock::now();
         const auto retryUntil = recovery.retryUntil(error.report(), now);

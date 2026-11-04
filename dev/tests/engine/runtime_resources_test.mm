@@ -1,4 +1,5 @@
 #include "ClaimScope.hpp"
+#include "ProtocolPeer.hpp"
 #include "SyntheticModels.hpp"
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
@@ -881,9 +882,11 @@ void testStartChecksTheReserveWithWhatItServes(const char *metallibPath) {
     return host();
   };
   std::unique_ptr<ServingRuntime> bootstrap;
+  std::vector<uint8_t> output;
   static_cast<void>(test::capturedStderr([&] {
-    bootstrap = ServingRuntime::start(config, [](std::span<const uint8_t>) {},
-                                        [] { return std::string(); });
+    bootstrap = ServingRuntime::start(
+        config, [&](std::span<const uint8_t> bytes) { output.insert(output.end(), bytes.begin(), bytes.end()); },
+        [] { return 0.0; });
     bootstrap->announceReady();
   }));
   require(refused == 2, "the start checked the host before it gave back its warmups' idle state");
@@ -893,9 +896,16 @@ void testStartChecksTheReserveWithWhatItServes(const char *metallibPath) {
   // still see.
   require(checked < device.currentAllocatedSize + 2 * lane,
           "the start's last check of the host counted the lanes' state its warmups left idle");
-  require(bootstrap->statusJson(0.0).find("\"memory_limited_steps\":[]") !=
-              std::string::npos,
-          "the start did not warm every decode width");
+  // The runtime answers its loop's status requests itself.
+  require(bootstrap->nativeLoop().receive(protocol::peer::serialize(protocol::StatusRequestFrame{1})),
+          "the loop refused a status request");
+  std::string status;
+  for (const protocol::EngineEvent &event : protocol::peer::decodeEvents(output))
+    if (const auto *answer = std::get_if<protocol::StatusJsonEvent>(&event); answer && answer->correlationId == 1)
+      status = answer->json;
+  require(status.find("\"memory_limited_steps\":[]") != std::string::npos &&
+              status.find("\"memory_audit\":{\"scope\":\"startup_warmup\",\"valid\":true,") != std::string::npos,
+          "the start did not warm every decode width, or its loop did not answer with its status: " + status);
 }
 
 // A model served with YaRN starts and runs as any other, with YaRN all the
@@ -1199,14 +1209,10 @@ void testAnExplicitRelaunchServesItsFirstContext(const char *metallibPath) {
   const auto relaunch = [&] {
     std::unique_ptr<ServingRuntime> bootstrap;
     const std::string log = test::capturedStderr([&] {
-      bootstrap = ServingRuntime::start(config, [](std::span<const uint8_t>) {}, [] { return std::string(); });
+      bootstrap = ServingRuntime::start(config, [](std::span<const uint8_t>) {}, [] { return 0.0; });
       bootstrap->announceReady();
     });
-    const std::string status = bootstrap->statusJson(0.0);
-    const std::string field = "\"maximum_context_tokens\":";
-    const size_t at = status.find(field);
-    require(at != std::string::npos, "the status names no context");
-    return std::pair{static_cast<uint32_t>(std::stoul(status.substr(at + field.size()))), log};
+    return std::pair{bootstrap->nativeLoop().statusSnapshot().maximumContextTokens, log};
   };
   require(relaunch().first == first, "a relaunch on its first engine's budget served less than its --max-context");
   config.resources.maximumMemoryBytes -= 32 * kMiB;
@@ -1303,7 +1309,7 @@ std::unique_ptr<ServingRuntime> bootstrapOf(const RuntimeResourcesConfig &resour
   config.nativeLoop.engine.maxContext = maxContext;
   std::unique_ptr<ServingRuntime> bootstrap;
   log = test::capturedStderr([&] {
-    bootstrap = ServingRuntime::start(config, [](std::span<const uint8_t>) {}, [] { return std::string(); });
+    bootstrap = ServingRuntime::start(config, [](std::span<const uint8_t>) {}, [] { return 0.0; });
     bootstrap->announceReady();
   });
   return bootstrap;

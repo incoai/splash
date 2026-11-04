@@ -72,6 +72,7 @@ struct Harness final {
                    int inputFd = -1, int outputFd = -1)
       : transport(inputFd < 0 ? pipes.input[0] : inputFd,
                   outputFd < 0 ? pipes.output[1] : outputFd, inputQueueBytes) {
+    loop.serveStatus([this] { return status(); });
     storage.commandInFlight = [this] { return loop.commandInFlight(); };
   }
   Pipes pipes;
@@ -87,8 +88,7 @@ struct Harness final {
   engine::NativeRuntime loop{
       {.engine = test::engineConfig(
            {.weights = engine::WeightResidencyConfig{.weights = &weights, .admit = test::admitAll}})},
-      resources, executor, transport.outputSink(),
-      [this] { return status(); }, protocol::ProtocolLimits{}};
+      resources, executor, transport.outputSink(), protocol::ProtocolLimits{}};
 };
 
 // A loop over a persistent tier, with room for a 2060-token prompt, that
@@ -115,8 +115,7 @@ struct PersistentHarness final {
   engine::NativeRuntime loop{
       {.engine = test::engineConfig(
            {.weights = engine::WeightResidencyConfig{.weights = &weights, .admit = test::admitAll}})},
-      resources, executor, transport.outputSink(),
-      test::readyStatusJson, protocol::ProtocolLimits{}};
+      resources, executor, transport.outputSink(), protocol::ProtocolLimits{}};
 };
 
 // A request for three prompt tokens and one output token: its wall-clock
@@ -355,7 +354,7 @@ void testLoopWakesForAnEngineDeadline() {
           }
         }
       },
-      test::readyStatusJson, protocol::ProtocolLimits{}};
+      protocol::ProtocolLimits{}};
   storage.commandInFlight = [&] { return loop.commandInFlight(); };
   loop.announceReady(protocol::peer::kTestReady);
   const auto wire = protocol::peer::serialize(requestFrame(5, 20'000));

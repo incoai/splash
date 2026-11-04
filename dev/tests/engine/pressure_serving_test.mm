@@ -78,7 +78,7 @@ struct Served final {
       bootstrap = ServingRuntime::start(
           std::move(config),
           [this](std::span<const uint8_t> bytes) { output.insert(output.end(), bytes.begin(), bytes.end()); },
-          [] { return std::string(); });
+          [] { return 0.0; });
       bootstrap->announceReady();
     });
     require(bootstrap && resources().streamedExpertStats() && resources().streamedExpertStats()->capChunks > 1,

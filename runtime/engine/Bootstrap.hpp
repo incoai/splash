@@ -132,10 +132,12 @@ using ActualMemoryReporter = std::function<ActualMemoryReport()>;
 // a start (StartFailed) runs in start(), so that nothing after Ready can.
 class ServingRuntime final {
 public:
+    // loopMaxTick: the loop's longest tick, which its transport measures,
+    // for the status document. Throws std::invalid_argument without it.
     [[nodiscard]] static std::unique_ptr<ServingRuntime> start(
         RuntimeBootstrapConfig config,
         NativeRuntime::ByteSink output,
-        NativeRuntime::StatusProvider statusProvider);
+        std::function<double()> loopMaxTick);
 
     // Completes warmup and validation, at stage Ready. Warmup runs on
     // kvPool's runway (model::ExecutionLimits::warmupKvPages) and holds its
@@ -172,15 +174,16 @@ public:
         resources_->cache().keepDiskLimit();
         return memoryControl_.run(pressure);
     }
-    // The status document, with the loop's longest tick, which the
-    // transport measures.
-    [[nodiscard]] std::string statusJson(double loopMaxTickMilliseconds);
-
 private:
+    // Connects the loop's status requests to statusJson().
     ServingRuntime(std::unique_ptr<RuntimeResources> resources,
                    std::unique_ptr<model::RuntimeModel> modelRuntime,
                    std::unique_ptr<NativeRuntime> nativeLoop,
-                   protocol::ReadyEvent ready, RuntimeBootstrapReport report);
+                   protocol::ReadyEvent ready, RuntimeBootstrapReport report,
+                   std::function<double()> loopMaxTick);
+
+    // The status document the loop answers a status request with.
+    [[nodiscard]] std::string statusJson();
 
     // Records the thermal state macOS reports for the status document, and
     // logs a change: nothing else tells why serving slowed down. The control
@@ -196,6 +199,7 @@ private:
     protocol::ReadyEvent ready_;
     RuntimeBootstrapReport report_;
     ThermalStateReporter thermalState_;
+    std::function<double()> loopMaxTick_;
 };
 
 }  // namespace splash::engine

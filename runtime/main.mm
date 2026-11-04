@@ -291,8 +291,8 @@ constexpr auto kFlushBudget = supervision::kFlush;
 // that fails meanwhile writes nothing more, and its cache counts as ending
 // uncleanly.
 void closePersistentCache(engine::FdTransport &transport,
-                          engine::ServingRuntime &bootstrap) {
-  engine::NativeRuntime &loop = bootstrap.nativeLoop();
+                          engine::ServingRuntime &runtime) {
+  engine::NativeRuntime &loop = runtime.nativeLoop();
   const bool flushed = transport.runFlush(loop, kFlushBudget);
   if (!loop.engineHealthy()) {
     writeStderrLine("error: the engine failed while it saved its newest restore points (" +
@@ -301,7 +301,7 @@ void closePersistentCache(engine::FdTransport &transport,
   }
   if (!flushed)
     logLine("Persistent cache: stopping before every newest restore point reached the disk.");
-  if (!bootstrap.resources().closePersistentCache())
+  if (!runtime.resources().closePersistentCache())
     writeStderrLine("error: the persistent cache did not reach the disk; the next start takes it "
                     "back on probation.");
 }
@@ -347,18 +347,14 @@ int serveNative(int argc, char **argv) {
   ShutdownSignals signals(transport);
   std::optional<MemoryPressureMonitor> pressureMonitor;
   IdleSleepAssertion idleSleep;
-  engine::ServingRuntime *published = nullptr;
-  auto statusProvider = [&] {
-    return published->statusJson(transport.maxTickMilliseconds());
-  };
 
-  std::unique_ptr<engine::ServingRuntime> bootstrap;
+  std::unique_ptr<engine::ServingRuntime> runtime;
   try {
     const engine::NativeArguments arguments = engine::parseNativeArguments(argc, argv);
     pressureMonitor.emplace(transport.controlNotifier());
     engine::StartupRetryWindow recovery(supervision::kStartRetryWindow);
     bool reportedRecoveryWait = false;
-    while (!bootstrap) {
+    while (!runtime) {
       if (transport.shutdownRequested())
         return static_cast<int>(engine::NativeProcessExit::CleanEof);
       engine::RuntimeBootstrapConfig config = bootstrapConfig(arguments);
@@ -367,8 +363,8 @@ int serveNative(int argc, char **argv) {
       if (arguments.preventIdleSleep)
         config.nativeLoop.holdingRequests = [&](bool held) { idleSleep.hold(held); };
       try {
-        bootstrap = engine::ServingRuntime::start(
-            std::move(config), transport.outputSink(), statusProvider);
+        runtime = engine::ServingRuntime::start(std::move(config), transport.outputSink(),
+                                                [&transport] { return transport.maxTickMilliseconds(); });
       } catch (const engine::RuntimeBootstrapError &error) {
         if (transport.shutdownRequested())
           return static_cast<int>(engine::NativeProcessExit::CleanEof);
@@ -392,12 +388,11 @@ int serveNative(int argc, char **argv) {
   } catch (const std::exception &) {
     return refuseStart(transport, argv[0]);
   }
-  published = bootstrap.get();
   // Ready follows the start, out of refuseStart's reach: the server takes a
   // StartFailed after Ready for a protocol failure, so a failure from Ready
   // on ends the process with its report alone.
   try {
-    bootstrap->announceReady();
+    runtime->announceReady();
   } catch (const std::exception &) {
     // A stop requested meanwhile ends the process as a stop: it cuts the
     // Ready write short (FdTransport::writeAll), which is no failure.
@@ -406,10 +401,10 @@ int serveNative(int argc, char **argv) {
     throw;
   }
 
-  transport.setControlHandler([&pressureMonitor, published] {
-    return published->controlPass(pressureMonitor->pressure());
+  transport.setControlHandler([&pressureMonitor, &runtime] {
+    return runtime->controlPass(pressureMonitor->pressure());
   });
-  const auto exit = transport.run(bootstrap->nativeLoop());
+  const auto exit = transport.run(runtime->nativeLoop());
   switch (exit) {
   case engine::NativeProcessExit::CleanEof:
     break;
@@ -420,13 +415,13 @@ int serveNative(int argc, char **argv) {
   case engine::NativeProcessExit::EngineFailure:
     writeStderrLine(
         "error: native transport stopped after an engine failure (" +
-        (transport.failure().empty() ? bootstrap->nativeLoop().engineFailure()
+        (transport.failure().empty() ? runtime->nativeLoop().engineFailure()
                                      : transport.failure()) +
         ")");
     // A command the backend gave up on may never complete; teardown would
     // wait for it. The OS and the driver reclaim everything, as after
     // SIGKILL.
-    if (!bootstrap->resources().backend().healthy()) {
+    if (!runtime->resources().backend().healthy()) {
       writeStderrLine(
           "error: the Metal backend is unhealthy; exiting without teardown");
       _exit(static_cast<int>(exit));
@@ -440,8 +435,8 @@ int serveNative(int argc, char **argv) {
   }
   // Not only a clean stop: a protocol or I/O failure leaves the engine
   // healthy, and its newest restore points still reach the disk.
-  if (bootstrap->resources().cache().persistent() && bootstrap->nativeLoop().engineHealthy())
-    closePersistentCache(transport, *bootstrap);
+  if (runtime->resources().cache().persistent() && runtime->nativeLoop().engineHealthy())
+    closePersistentCache(transport, *runtime);
   return static_cast<int>(exit);
 }
 

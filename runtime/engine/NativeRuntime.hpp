@@ -54,8 +54,13 @@ public:
   using StatusProvider = std::function<std::string()>;
 
   NativeRuntime(NativeLoopConfig config, engine::Cache &cache, model::Model &model,
-                ByteSink output, StatusProvider statusProvider,
-                protocol::ProtocolLimits limits);
+                ByteSink output, protocol::ProtocolLimits limits);
+
+  // Answers status requests with `provider`'s document. The serving runtime
+  // connects itself once it is built, before any frame arrives; a status
+  // request without a source fails the engine. Throws std::invalid_argument
+  // for an empty provider.
+  void serveStatus(StatusProvider provider);
 
   // Processes every complete frame in bytes. False means the connection
   // must close. Request-scoped errors return true and preserve framing.
