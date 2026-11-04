@@ -28,9 +28,10 @@ enum class BufferStorage {
 // How kernels reach a buffer: bound to the dispatches that use it, or only
 // through its GPU address held in a table, another buffer. A Bound buffer
 // may also be reached through a dispatch's address table (AddressTable),
-// which the backend writes per dispatch and declares once per encoder. The table that holds an Addressed buffer's address names
-// it (MetalBackend::setTableReach), and the backend declares it for each
-// encoder whose dispatches bind that table.
+// which the backend writes per dispatch and declares once per encoder. The
+// table that holds an Addressed buffer's address names it
+// (MetalBackend::setTableReach), and the backend declares it for each
+// encoder that uses that table.
 enum class BufferReach {
   Bound,
   Addressed,
@@ -141,7 +142,8 @@ struct IndirectGrid {
 // `index` (setBytes, so at most 512 of them), and makes their memory resident
 // for the encoder's dispatches from this one on (useResources, for reading,
 // or reading and writing when `writes`, declared once per table and usage per
-// encoder).
+// encoder), with what any of them reaches as a table
+// (MetalBackend::setTableReach).
 // Addresses are the buffers' when the command is encoded, so a buffer
 // released and restored since the graph was built is reached where it is
 // now; released memory is refused like a binding of it. Dispatches that
@@ -385,7 +387,7 @@ public:
   // back to macOS when the engine releases it, not when macOS chooses. A
   // command makes resident only the memory it uses: the buffers its
   // dispatches bind or list (AddressTable), and the Addressed buffers the
-  // tables they bind reach (setTableReach), declared on each encoder that
+  // tables among those reach (setTableReach), declared on each encoder that
   // uses them. Nothing is resident for the queue as a whole, so memory no
   // command uses costs no command buffer anything.
   [[nodiscard]] MetalBuffer
@@ -422,15 +424,19 @@ public:
   void releaseMemory(const MetalBuffer &buffer);
   void restoreMemory(const MetalBuffer &buffer);
   // Names the Addressed buffers whose GPU addresses the bytes of `table`, a
-  // view of a Shared buffer, hold: each encoder whose dispatches bind any of
-  // those bytes makes them resident (useResources, for reading and writing),
-  // each buffer once per encoder however many tables reach it, as the
-  // command is encoded. It replaces what the same
-  // bytes named before, so the owner calls it whenever it rewrites the
-  // table's entries, for every buffer they reach. The table holds them
-  // weakly: memory released or freed since is not declared, as no command
-  // may reach it then. MetalBackendError for another backend's buffers, a
-  // table that is not Shared or a reached buffer that is not Addressed.
+  // view of a Shared buffer, hold: each encoder that uses the table makes
+  // them resident (useResources, for reading and writing), each buffer once
+  // per encoder however many tables reach it, as the command is encoded. An
+  // encoder uses the table when its dispatches bind any of those bytes, list
+  // a view of its buffer in an AddressTable, or reach that buffer through
+  // another table: a kernel may follow an address to the entries of the
+  // table it names, so what an encoder makes resident brings what it
+  // reaches. It replaces what the same bytes named before, so the owner
+  // calls it whenever it rewrites the table's entries, for every buffer they
+  // reach. The table holds them weakly: memory released or freed since is
+  // not declared, as no command may reach it then. MetalBackendError for
+  // another backend's buffers, a table that is not Shared or a reached
+  // buffer that is not Addressed.
   void setTableReach(const MetalBuffer &table, std::span<const MetalBuffer> reached);
 
   // Encodes exactly one compute dispatch, commits it, waits for completion,

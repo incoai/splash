@@ -352,6 +352,30 @@ struct MetalAllocation {
     ~MetalAllocation() { detach(); }
 };
 
+namespace {
+
+// Appends the memory of the buffers `reached` names that is allocated now,
+// and what the tables among them reach in turn: a kernel may follow an
+// address it reads in one table to the entries of another. Each table is
+// followed once (`tables`), so one that reaches itself ends; a buffer two
+// tables reach may be appended twice.
+void appendReached(const std::vector<std::weak_ptr<MetalAllocation>> &reached,
+                   std::vector<__unsafe_unretained id<MTLResource>> &resources,
+                   std::vector<const MetalAllocation *> &tables) {
+    for (const std::weak_ptr<MetalAllocation> &weak : reached) {
+        const std::shared_ptr<MetalAllocation> allocation = weak.lock();
+        if (!allocation || !allocation->buffer) continue;
+        if (!allocation->reaches.empty()) {
+            if (std::ranges::find(tables, allocation.get()) != tables.end()) continue;
+            tables.push_back(allocation.get());
+        }
+        resources.push_back(allocation->buffer);
+        for (const TableReach &reach : allocation->reaches) appendReached(*reach.reached, resources, tables);
+    }
+}
+
+}  // namespace
+
 // Every Impl has an allocation, whose buffer is nil only while its memory is
 // released: only reserveBuffer, wrapSharedMemory and view create one.
 struct MetalBuffer::Impl {
@@ -1461,16 +1485,20 @@ struct MetalBackend::Impl {
                 __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
                 NSUInteger offsets[kBufferArgumentEntries];
                 // The command's address tables (AddressTable), each resolved
-                // once: its buffers' GPU addresses as they are now, and the
-                // distinct Metal buffers behind them.
+                // once: its buffers' GPU addresses as they are now, the
+                // distinct Metal buffers behind them, and what the tables
+                // among them reach (TableReach), every range of each: a kernel
+                // holding an address is not held to a view's bytes.
                 struct ResolvedTable {
                     const std::vector<MetalBuffer> *source = nullptr;
                     std::vector<uint64_t> addresses;
                     std::vector<__unsafe_unretained id<MTLResource>> resources;
+                    std::vector<__unsafe_unretained id<MTLResource>> reached;
                 };
                 std::vector<ResolvedTable> tables;
                 // The command's table reaches (TableReach), each resolved once:
-                // the memory of the buffers it names that is allocated now.
+                // the memory of the buffers it names that is allocated now,
+                // and what they reach in turn (appendReached).
                 struct ResolvedReach {
                     std::shared_ptr<const std::vector<std::weak_ptr<MetalAllocation>>> source;
                     std::vector<__unsafe_unretained id<MTLResource>> resources;
@@ -1482,12 +1510,15 @@ struct MetalBackend::Impl {
                     ResolvedTable &table = tables.emplace_back();
                     table.source = &source;
                     table.addresses.reserve(source.size());
+                    std::vector<const MetalAllocation *> followed;
                     for (const MetalBuffer &entry : source) {
                         const MetalBuffer::Impl &buffer = *entry.impl_;
                         id<MTLBuffer> memory = buffer.allocation->buffer;
                         table.addresses.push_back(memory.gpuAddress + buffer.offsetBytes);
                         if (std::ranges::find(table.resources, memory) == table.resources.end())
                             table.resources.push_back(memory);
+                        for (const TableReach &reach : buffer.allocation->reaches)
+                            appendReached(*reach.reached, table.reached, followed);
                     }
                     return table;
                 };
@@ -1497,16 +1528,28 @@ struct MetalBackend::Impl {
                 std::vector<std::pair<const void *, bool>> declared;
                 std::unordered_set<const void *> declaredReached;
                 std::vector<__unsafe_unretained id<MTLResource>> undeclared;
-                const auto declare = [&](const void *source, bool writes,
-                                         const std::vector<__unsafe_unretained id<MTLResource>> &resources) {
-                    const std::pair use{source, writes};
+                // Makes memory tables reach resident, for reading and
+                // writing, each buffer once in the encoder.
+                const auto useReached = [&](const std::vector<__unsafe_unretained id<MTLResource>> &resources) {
+                    undeclared.clear();
+                    for (id<MTLResource> memory : resources)
+                        if (declaredReached.insert((__bridge const void *)memory).second)
+                            undeclared.push_back(memory);
+                    if (!undeclared.empty())
+                        [encoder useResources:undeclared.data()
+                                        count:undeclared.size()
+                                        usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+                };
+                const auto declare = [&](const ResolvedTable &table, bool writes) {
+                    const std::pair use{static_cast<const void *>(table.source), writes};
                     if (std::ranges::find(declared, use) != declared.end()) return;
-                    if (!resources.empty())
-                        [encoder useResources:resources.data()
-                                        count:resources.size()
+                    if (!table.resources.empty())
+                        [encoder useResources:table.resources.data()
+                                        count:table.resources.size()
                                         usage:writes ? MTLResourceUsageRead | MTLResourceUsageWrite
                                                      : MTLResourceUsageRead];
                     declared.push_back(use);
+                    useReached(table.reached);
                 };
                 // Declares what the bytes a dispatch binds of a table reach.
                 const auto declareReach = [&](const MetalBuffer::Impl &bound) {
@@ -1519,9 +1562,8 @@ struct MetalBackend::Impl {
                             ResolvedReach &added = reaches.emplace_back();
                             added.source = reach.reached;
                             added.resources.reserve(reach.reached->size());
-                            for (const std::weak_ptr<MetalAllocation> &weak : *reach.reached)
-                                if (const auto allocation = weak.lock(); allocation && allocation->buffer)
-                                    added.resources.push_back(allocation->buffer);
+                            std::vector<const MetalAllocation *> followed;
+                            appendReached(*reach.reached, added.resources, followed);
                             resolved = std::prev(reaches.end());
                         }
                         // Tables that reach the same memory (a lane's page and
@@ -1529,14 +1571,7 @@ struct MetalBackend::Impl {
                         const std::pair use{static_cast<const void *>(resolved->source.get()), true};
                         if (std::ranges::find(declared, use) != declared.end()) continue;
                         declared.push_back(use);
-                        undeclared.clear();
-                        for (id<MTLResource> memory : resolved->resources)
-                            if (declaredReached.insert((__bridge const void *)memory).second)
-                                undeclared.push_back(memory);
-                        if (!undeclared.empty())
-                            [encoder useResources:undeclared.data()
-                                            count:undeclared.size()
-                                            usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+                        useReached(resolved->resources);
                     }
                 };
                 for (size_t index = 0; index < dispatches.size(); ++index) {
@@ -1578,7 +1613,7 @@ struct MetalBackend::Impl {
                         [encoder setBytes:table.addresses.data()
                                    length:table.addresses.size() * sizeof(uint64_t)
                                   atIndex:dispatch.addresses.index];
-                        declare(source, dispatch.addresses.writes, table.resources);
+                        declare(table, dispatch.addresses.writes);
                     }
                     const IndirectGrid &grid = dispatch.indirectThreadgroups;
                     if (grid.buffer) {

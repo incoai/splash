@@ -1284,6 +1284,67 @@ void addressTables(const std::string &metallibPath) {
     std::cout << "PASS address tables\n";
 }
 
+// A kernel may follow an address to the entries of the table it names
+// (setTableReach), so what an encoder makes resident brings what it reaches:
+// a bound table brings the tables it reaches and what they reach, and a table
+// listed in an AddressTable what it reaches, each buffer once, also when a
+// table reaches itself, as a test fixture's tables lie in the memory they
+// reach.
+void tablesBringWhatTheyReach(const std::string &metallibPath) {
+    EncoderUses recorded;
+    MetalBackend backend(metallibPath);
+    constexpr uint32_t kWords = 256;
+    constexpr uint64_t kBytes = uint64_t{kWords} * sizeof(uint32_t);
+    // outer, a Bound table, reaches inner, an Addressed table that reaches leaf.
+    MetalBuffer leaf = backend.allocateBuffer(kBytes, BufferStorage::Shared, "leaf", BufferReach::Addressed);
+    MetalBuffer inner = backend.allocateBuffer(kBytes, BufferStorage::Shared, "inner", BufferReach::Addressed);
+    MetalBuffer outer = backend.allocateBuffer(kBytes, BufferStorage::Shared, "outer");
+    *static_cast<uint64_t *>(inner.contents()) = leaf.gpuAddress();
+    *static_cast<uint64_t *>(outer.contents()) = inner.gpuAddress();
+    const MetalBuffer innerEntry = backend.view(inner, 0, sizeof(uint64_t));
+    backend.setTableReach(innerEntry, std::span(&leaf, 1));
+    backend.setTableReach(backend.view(outer, 0, sizeof(uint64_t)), std::span(&inner, 1));
+    MetalBuffer mismatches = sharedBuffer(backend, sizeof(uint32_t));
+    const auto declaredOnce = [&](std::initializer_list<const char *> labels) {
+        for (const char *label : labels) {
+            size_t count = 0;
+            for (const EncoderUses::Use &use : recorded.uses)
+                count += std::count(use.labels.begin(), use.labels.end(), std::string(label));
+            if (count != 1) return false;
+        }
+        return true;
+    };
+
+    // The kernel reads inner through outer's entry.
+    const uint32_t words = kWords, seed = 0;
+    recorded.uses.clear();
+    (void)backend.submit({"addressed_check_u32", {{0, outer}, {3, mismatches}},
+                          {{1, &words, sizeof(words)}, {2, &seed, sizeof(seed)}}, {1, 1, 1}, {kWords, 1, 1}});
+    require(declaredOnce({"inner", "leaf"}),
+            "an encoder binding a table did not make the table it reaches and what that reaches resident once");
+
+    // The kernel reads outer through the address table.
+    struct TableParams {
+        uint32_t words;
+        uint32_t seed;
+    };
+    CommandGraph graph;
+    graph.add("address_table_check_u32", {mismatches}, TableParams{kWords, 0}, {1, 1, 1}, {kWords, 1, 1});
+    graph.addresses(std::make_shared<std::vector<MetalBuffer>>(1, outer));
+    recorded.uses.clear();
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
+    require(declaredOnce({"outer", "inner", "leaf"}),
+            "an encoder listing a table in an address table did not make what it reaches resident once");
+
+    const std::array<MetalBuffer, 2> itself{leaf, inner};
+    backend.setTableReach(innerEntry, itself);
+    recorded.uses.clear();
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
+    require(declaredOnce({"outer", "inner", "leaf"}),
+            "an encoder did not make what a table reaching itself reaches resident once");
+    std::cout << "PASS tables bring what they reach\n";
+}
+
 // Bindings of consecutive entries reach Metal as one run, each buffer at its
 // own offset, in whatever order the dispatch lists them.
 void bindingRunsKeepOffsets(MetalBackend &backend) {
@@ -2684,6 +2745,7 @@ std::span<const splash::test::TestCase> behaviourTests() {
         {"residencyReturnsRemovedBuffers", [] { residencyReturnsRemovedBuffers(metallib); }},
         {"buffersReachedThroughTables", [] { buffersReachedThroughTables(metallib); }},
         {"addressTables", [] { addressTables(metallib); }},
+        {"tablesBringWhatTheyReach", [] { tablesBringWhatTheyReach(metallib); }},
         {"run", [] { run(metallib); }},
     };
     return kTests;
