@@ -865,10 +865,10 @@ public:
     return 0;
   }
   // The state bytes a lane's start and `states` cached states it captures
-  // beside it allocate: the lane's buffers the idle pool lacks, as begin()
-  // takes them, and each state's whole buffers, as reserveState() takes
-  // them, since the idle buffers beyond one lane's are memory of their own
-  // (idleBufferBytes). Zero by default.
+  // beside it cost, against idleBufferBytes, which counts the pooled buffers
+  // beyond those one lane starts from as room: the buffers it allocates and
+  // those it takes from the pool that evicted states refill before any of
+  // theirs frees memory. Zero by default.
   [[nodiscard]] virtual uint64_t startStateBytes(uint32_t states) const noexcept {
     static_cast<void>(states);
     return 0;

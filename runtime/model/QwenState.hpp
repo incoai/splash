@@ -286,9 +286,15 @@ public:
   // each allocation covers: a lane keeps two cells, the draft rings and a
   // window, and cells of no bytes count none.
   [[nodiscard]] uint64_t idleBytes(uint32_t evictedStates) const noexcept;
-  // What a lane's activation and `states` cached states beside it allocate:
-  // what the pool lacks of the lane's buffers (acquire), and each state's
-  // cell and context window whole (reserve).
+  // What a lane's activation and `states` cached states beside it cost,
+  // against idleBytes, which counts the pool's buffers beyond one lane's as
+  // room: cells and windows whole, since the next evicted states refill what
+  // the start takes from the pool before any of theirs frees memory; draft
+  // rings, which no state returns, nothing when the pool keeps exactly one
+  // lane's ring, else one ring. Exact once the start's claims evict the
+  // states that refill the pool's lane; a start that evicts none from a pool
+  // holding one lane's buffers is charged two cells and a window it does not
+  // allocate.
   [[nodiscard]] uint64_t startBytes(uint32_t states) const noexcept;
 
   // Hot-path metadata operations; none performs a buffer copy. A step makes

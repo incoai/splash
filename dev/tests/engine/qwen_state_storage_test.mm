@@ -718,6 +718,49 @@ void testAttentionOnlyTarget(metal::MetalBackend &backend) {
           "an attention-only storage's buffers outlived it");
 }
 
+// A start and the state it captures, beside the idle bytes counted for the
+// states its claims evict, allocate no more than startBytes: the evicted
+// states refill the lane's buffers the start took from the pool before any
+// of theirs frees memory, and the draft rings no state returns. Exact once
+// three states go, from an empty pool and from pools holding one and two
+// lanes' buffers.
+void testStartBytes(metal::MetalBackend &backend) {
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
+  for (uint32_t pooledLanes = 0; pooledLanes < 3; ++pooledLanes) {
+    for (uint32_t evicted = 0; evicted < 4; ++evicted) {
+      model::QwenStateStorage storage(backend, governor.allocationAdmission(), kStateLayout, nullptr);
+      metal::AllocationFailure refusal;
+      std::vector<std::shared_ptr<model::QwenStateReservation>> cached;
+      for (uint32_t each = 0; each < evicted; ++each)
+        cached.push_back(storage.reserve(refusal));
+      for (uint32_t lane = 0; lane < pooledLanes; ++lane)
+        require(static_cast<bool>(storage.tryActivateLane(lane, lane + 1)), "a pool lane did not start");
+      for (uint32_t lane = 0; lane < pooledLanes; ++lane)
+        storage.releaseLane(lane, lane + 1);
+      const std::string name = std::to_string(evicted) + " evicted states beside " +
+                               std::to_string(pooledLanes) + " pooled lanes";
+      require(std::ranges::all_of(cached, [](const auto &state) { return state != nullptr; }) &&
+                  storage.idleRings() == pooledLanes,
+              "the fixture of " + name + " did not hold its states and pool");
+      const uint64_t charged = storage.startBytes(1);
+      const uint64_t credited = storage.idleBytes(evicted);
+      const uint64_t before = storage.actualAllocatedBytes();
+      require(static_cast<bool>(storage.tryActivateLane(0, 9)), "the start of " + name + " failed");
+      const auto capture = storage.reserve(refusal);
+      require(capture != nullptr, "the capture of " + name + " failed");
+      cached.clear();
+      static_cast<void>(releaseAllIdle(storage, true));
+      const uint64_t after = storage.actualAllocatedBytes();
+      require(after + credited <= before + charged, "the start of " + name + " allocated more than charged");
+      require(evicted < 3 || after + credited == before + charged,
+              "the start of " + name + " was charged more than it allocated");
+      storage.releaseLane(0, 9);
+    }
+  }
+}
+
 void run(const std::string &metallib) {
   using model::QwenCompositeState;
   using model::QwenLogicalLengths;
@@ -734,6 +777,7 @@ void run(const std::string &metallib) {
   testPersistKeepsTheRamCopy(backend);
   testReservations(backend);
   testAttentionOnlyTarget(backend);
+  testStartBytes(backend);
   MemoryGovernor governor(
       backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
       queryHostMemory, 0);

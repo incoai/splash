@@ -412,9 +412,8 @@ uint64_t QwenStateStorage::idleBytes(uint32_t evictedStates) const noexcept {
 }
 
 uint64_t QwenStateStorage::startBytes(uint32_t states) const noexcept {
-  const uint32_t laneCells = emptyCell_ ? 0 : CompositeStateLayout::kLaneGdnCells;
-  const uint64_t state = (emptyCell_ ? 0 : layout_.target.cellBytes()) + layout_.draft.windowBytes();
-  return missingBytes(laneCells, true) + uint64_t{states} * state;
+  const uint64_t ring = layout_.draft.ringBytes();
+  return layout_.laneBytes() - ring + (idleRings() == 1 ? 0 : ring) + uint64_t{states} * layout_.cachedBytes();
 }
 
 void QwenStateStorage::updateLengths(uint32_t index,

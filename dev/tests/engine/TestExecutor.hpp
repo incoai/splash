@@ -648,12 +648,14 @@ public:
   uint32_t statesToActivate() const noexcept override {
     return statesLacked ? statesLacked() : 0;
   }
-  // As the production pool: what the pooled buffers a lane starts from
-  // lack of its footprint, and each state's buffers whole.
+  // As the production pool counts its cells and windows: the lane's
+  // footprint and each state's buffers whole, since evicted states refill
+  // the footprint before they free. The fake's footprint has no draft rings,
+  // which no state refills.
   uint64_t startStateBytes(uint32_t states) const noexcept override {
     if (!memory)
       return 0;
-    return laneFootprintBytes - std::min(laneFootprintBytes, pooledLaneBytes) + uint64_t{states} * State().bytes();
+    return laneFootprintBytes + uint64_t{states} * State().bytes();
   }
   // The production model's pool releases the buffers beyond a lane's
   // (QwenStateStorage::idleBytes); the fake's are those of the states the

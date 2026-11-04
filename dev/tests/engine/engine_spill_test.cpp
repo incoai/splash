@@ -1958,6 +1958,38 @@ void testPlacementCountsWholeExtentsAndTheLanesStates() {
   }
 }
 
+// Placement counts the state buffers a start takes from the pool whole:
+// the states a claim evicts refill them before any of theirs frees memory.
+// Beside three cached conversations' states and a lane's buffers in the
+// pool, a 20-page prompt prefilled a page a command spills in a room short
+// of what its start takes, and runs Resident in that room plus the lane's
+// buffers and a state. Charged only what the pool lacked, it started
+// Resident in the first room and failed at its KV.
+void testPlacementCountsTheLanesBuffersAStartTakesFromThePool() {
+  constexpr uint64_t lane = 128, state = 64, shortRoom = 1'100;
+  for (const uint64_t room : {shortRoom, shortRoom + lane + state}) {
+    Spilling spill(Spilling::Governed{}, 1024, false, Spilling::Extent{4}, 0, test::commandShape(KvCache::pageTokens));
+    spill.host.bookStates(spill.model);
+    spill.model.laneFootprintBytes = lane;
+    spill.model.decodeFinishes = true;
+    for (uint32_t each = 2; each < 5; ++each) {
+      spill.engine.submit(Spilling::prompt(each, each, 3, 1));
+      spill.runUntilIdle();
+    }
+    require(spill.model.pooledLaneBytes == lane && spill.host.memory.held("states") == lane + 3 * state,
+            "the conversations did not leave a lane's buffers and three states");
+    spill.limit(spill.held() + room);
+    spill.engine.submit(Spilling::prompt(1, 1, 20, 1));
+    spill.runUntil([&] { return std::ranges::find(spill.events.startIds, 1) != spill.events.startIds.end(); },
+                   "the prompt did not start");
+    const SpillRequestsSnapshot placed = spill.engine.snapshot().spill;
+    spill.runUntilIdle();
+    const std::string name = "the prompt in room for " + std::to_string(room) + " B";
+    require(spill.events.failedCount == 0 && spill.events.completedCount == 4, name + " failed");
+    require(placed.spill == (room == shortRoom ? 1U : 0U), name + (room == shortRoom ? " started Resident" : " spilled"));
+  }
+}
+
 // Placement counts the Resident lanes' projected growth with the prompt's,
 // in whole extents past the free pages, as their claims take both from the
 // same extents: beside a lane that projects 6 pages more, a prompt that
@@ -2057,6 +2089,7 @@ std::span<const test::TestCase> spillTests() {
       {"testPlacementCountsTheChainItRestoresInMemory", testPlacementCountsTheChainItRestoresInMemory},
       {"testPlacementCountsWholeExtentsAndTheLanesStates", testPlacementCountsWholeExtentsAndTheLanesStates},
       {"testPlacementCountsTheLanesGrowthInTheSameExtents", testPlacementCountsTheLanesGrowthInTheSameExtents},
+      {"testPlacementCountsTheLanesBuffersAStartTakesFromThePool", testPlacementCountsTheLanesBuffersAStartTakesFromThePool},
       {"testAClosedTierRefusesAStartPastTheResidentContext", testAClosedTierRefusesAStartPastTheResidentContext},
       {"testAdmissionSpillsWhatMemoryCannotHold", testAdmissionSpillsWhatMemoryCannotHold},
       {"testSpillCommitmentCoversTheChainWithoutCopies", testSpillCommitmentCoversTheChainWithoutCopies},
