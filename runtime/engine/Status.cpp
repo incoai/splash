@@ -7,8 +7,11 @@
 #include "model/Model.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <iterator>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace splash::engine {
 namespace {
@@ -109,9 +112,6 @@ const char *writesGatedName(DiskWritesGate gate) noexcept {
 // (model::SparseRowUse, and ops::MoePhase for model::ExpertStoreStats::uses).
 constexpr std::string_view kStreamedUses[] = {"prefill", "decode"};
 static_assert(std::size(kStreamedUses) == model::kSparseRowUses);
-// What held requests before their first tokens, by TtftPart.
-constexpr std::string_view kTtftPartNames[] = {"own_prefill", "claim_wait", "decode", "other_prefill", "rest"};
-static_assert(std::size(kTtftPartNames) == kTtftParts);
 // The causes of decode gaps past the bound, by GapCause.
 constexpr std::string_view kGapCauseNames[] = {"prefill_unit", "claim_wait",   "ssd_read",
                                                "pool_release", "replan", "other"};
@@ -263,7 +263,7 @@ void writeKvWindow(json::Writer &w, const KvWindowSnapshot &window, const KvPool
 // rewrites and restores; the quota of active KV; the Index runway, the free
 // pages of that form; and the readers' memory and reads. A target that keeps
 // its KV in memory has no kv_spill section.
-void writeKvSpill(json::Writer &w, const KvSpillStatus &spill, uint64_t indexPageBytes,
+void writeKvSpill(json::Writer &w, const StatusSample::KvSpill &spill, uint64_t indexPageBytes,
                   const engine::EngineSnapshot &core, const ResourceWaitSnapshot &resourceWait) {
   const KvSpillSnapshot &cache = spill.cache;
   const engine::SpillRequestsSnapshot &requests = core.spill;
@@ -704,18 +704,13 @@ void writeWarmup(json::Writer &w, const WarmupReport &warmup) {
 
 } // namespace
 
-std::string runtimeStatusJson(
-    const EngineMemoryPlan &plan, const engine::EngineSnapshot &core,
-    const metal::MetalMemoryStats &metalMemory, const WarmupReport &warmup,
-    const MemoryAuditResult &memoryAudit, const RuntimeMetricsSnapshot &metrics,
-    const model::ModelTelemetry &executorTelemetry,
-    const engine::RuntimeCacheIdentity &cacheIdentity,
-    const MemoryGovernorSnapshot &memoryGovernor, bool metalHealthy,
-    std::string metalFailureReason, const ResourceWaitSnapshot &resourceWait,
-    const NativeLoopTiming &loop, const WeightsSnapshot &weights,
-    const AneFfnSnapshot &aneFfn, ThermalState thermalState,
-    const std::optional<model::SparseRowStats> &streamedTable,
-    const std::optional<model::ExpertStoreStats> &streamedExperts, const std::optional<KvSpillStatus> &kvSpill) {
+std::string runtimeStatusJson(const StatusStart &start, const StatusSample &sample) {
+  const EngineMemoryPlan &plan = start.plan;
+  const EngineSnapshot &core = sample.engine;
+  const metal::MetalMemoryStats &metalMemory = sample.metalMemory;
+  const MemoryGovernorSnapshot &memoryGovernor = sample.memoryGovernor;
+  const ResourceWaitSnapshot &resourceWait = sample.resourceWait;
+  const model::ModelTelemetry &executorTelemetry = sample.telemetry;
   const uint64_t currentBytes = std::max(
       metalMemory.allocatedBytes, metalMemory.deviceCurrentAllocatedBytes);
   const uint64_t peakBytes = std::max(
@@ -726,7 +721,7 @@ std::string runtimeStatusJson(
   // only after warmup and the memory audit passed. The thermal state slows
   // serving but never stops it, so it is reported and readiness ignores it.
   const bool hostSafe = memoryGovernor.pressure != MemoryPressure::Critical;
-  const bool ready = metalHealthy && hostSafe &&
+  const bool ready = sample.metalHealthy && hostSafe &&
                      currentBytes <= plan.breakdown().hardBudgetBytes;
 
   json::Writer w;
@@ -735,7 +730,7 @@ std::string runtimeStatusJson(
         .field("ready", ready)
         .field("maximum_context_tokens", core.maximumContextTokens)
         .field("memory_pressure", memoryPressureName(memoryGovernor.pressure))
-        .field("thermal_state", thermalStateName(thermalState));
+        .field("thermal_state", thermalStateName(sample.thermalState));
     w.object("admission", [&] {
       w.field("waiting", resourceWait.memory + resourceWait.concurrency)
           .field("waiting_memory", resourceWait.memory)
@@ -747,13 +742,13 @@ std::string runtimeStatusJson(
           .field("oldest_wait_ms", resourceWait.oldestWaitMilliseconds);
     });
     w.object("loop", [&] {
-      w.field("max_tick_ms", loop.maxTickMilliseconds)
+      w.field("max_tick_ms", sample.loopMaxTickMilliseconds)
           .field("stall_budget_ms", supervision::kLoopStall.count())
           .key("tick_host_ms");
       writeLatency(w, core.tickHostMilliseconds);
     });
     w.key("identity");
-    writeIdentity(w, cacheIdentity);
+    writeIdentity(w, start.cacheIdentity);
     w.key("memory_plan");
     writeJson(w, plan);
     w.object("memory_actual", [&] {
@@ -764,19 +759,19 @@ std::string runtimeStatusJson(
     w.key("memory_governor");
     writeMemoryGovernor(w, memoryGovernor);
     w.key("memory_audit");
-    writeJson(w, memoryAudit);
+    writeJson(w, start.memoryAudit);
     w.key("weights");
-    writeWeights(w, weights);
+    writeWeights(w, sample.weights);
     w.key("streamed_table");
-    writeStreamedTable(w, streamedTable);
+    writeStreamedTable(w, sample.streamedTable);
     w.key("streamed_experts");
-    writeStreamedExperts(w, streamedExperts);
-    if (kvSpill) {
+    writeStreamedExperts(w, sample.streamedExperts);
+    if (sample.kvSpill) {
       w.key("kv_spill");
-      writeKvSpill(w, *kvSpill, plan.breakdown().kvIndexPageBytes, core, resourceWait);
+      writeKvSpill(w, *sample.kvSpill, plan.breakdown().kvIndexPageBytes, core, resourceWait);
     }
     w.key("ane_ffn");
-    writeAneFfn(w, aneFfn, executorTelemetry.aneFfnReruns);
+    writeAneFfn(w, sample.aneFfn, executorTelemetry.aneFfnReruns);
     w.key("kv");
     writeKv(w, core.resources);
     w.key("state");
@@ -819,7 +814,7 @@ std::string runtimeStatusJson(
     w.key("scheduler");
     writeScheduler(w, core);
     w.key("active_requests");
-    writeActiveRequests(w, core, kvSpill.has_value());
+    writeActiveRequests(w, core, sample.kvSpill.has_value());
     w.object("requests", [&] {
       w.field("submitted", core.submitted)
           .field("completed", core.completed)
@@ -827,11 +822,11 @@ std::string runtimeStatusJson(
           .field("failed", core.failed);
     });
     w.key("metrics");
-    writeMetrics(w, metrics, core);
+    writeMetrics(w, sample.metrics, core);
     w.key("warmup");
-    writeWarmup(w, warmup);
+    writeWarmup(w, start.warmup);
     w.object("metal", [&] {
-      w.field("healthy", metalHealthy).field("failure_reason", metalFailureReason);
+      w.field("healthy", sample.metalHealthy).field("failure_reason", sample.metalFailureReason);
     });
   });
   return w.str();

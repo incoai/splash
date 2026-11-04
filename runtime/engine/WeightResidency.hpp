@@ -9,7 +9,21 @@
 
 namespace splash::engine {
 
-struct WeightsSnapshot;
+// The model's weights as /status reports them (WeightResidency::snapshot,
+// and Engine::weightsSnapshot for a restore a request waits for).
+struct WeightsSnapshot {
+  // --idle-release: infinite with `off`, when only a release request frees them.
+  double idleReleaseSeconds = 0.0;
+  // From a release until the restore has written the last image back.
+  bool released = false;
+  // From the request that found them released until the restore ends.
+  bool restoring = false;
+  // The times they were written back, each for a request.
+  uint64_t restores = 0;
+  // The restores that gave up for want of memory: their requests failed
+  // retryably and the weights were released again.
+  uint64_t restoreFailures = 0;
+};
 
 // What the engine gives back while idle and takes again before it runs the
 // next request (EngineConfig::weights).

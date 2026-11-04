@@ -172,10 +172,10 @@ public:
         resources_->cache().keepDiskLimit();
         return memoryControl_.run(pressure);
     }
-    // The status document, with the metrics and the loop timing the
-    // transport keeps.
+    // The status document, with the metrics and the loop's longest tick,
+    // which the transport keeps.
     [[nodiscard]] std::string statusJson(const RuntimeMetricsSnapshot &metrics,
-                                         const NativeLoopTiming &loop);
+                                         double loopMaxTickMilliseconds);
 
 private:
     RuntimeBootstrap(std::unique_ptr<RuntimeResources> resources,

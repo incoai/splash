@@ -1,7 +1,6 @@
 #include "engine/WeightResidency.hpp"
 
 #include "StderrLine.hpp"
-#include "engine/Status.hpp"
 
 #include <iomanip>
 #include <stdexcept>

@@ -5,7 +5,6 @@
 #include "engine/FdTransport.hpp"
 #include "engine/Bootstrap.hpp"
 #include "engine/NativeArguments.hpp"
-#include "engine/Status.hpp"
 #include "model/ModelDescriptor.hpp"
 
 #include <IOKit/pwr_mgt/IOPMLib.h>
@@ -351,9 +350,7 @@ int serveNative(int argc, char **argv) {
   engine::RuntimeMetrics metrics;
   engine::RuntimeBootstrap *published = nullptr;
   auto statusProvider = [&] {
-    return published->statusJson(
-        metrics.snapshot(),
-        engine::NativeLoopTiming{transport.maxTickMilliseconds()});
+    return published->statusJson(metrics.snapshot(), transport.maxTickMilliseconds());
   };
 
   std::unique_ptr<engine::RuntimeBootstrap> bootstrap;

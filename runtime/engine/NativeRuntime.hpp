@@ -3,7 +3,7 @@
 #include "AwakeClock.hpp"
 #include "engine/Engine.hpp"
 #include "engine/Protocol.hpp"
-#include "engine/Status.hpp"
+#include "engine/RuntimeMetrics.hpp"
 
 #include <cstdint>
 #include <exception>

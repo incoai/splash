@@ -1387,15 +1387,20 @@ EngineSpillConfig RuntimeResources::spillConfig() const noexcept {
           .geometry = memoryPlan_.spillGeometry()};
 }
 
-std::optional<KvSpillStatus> RuntimeResources::kvSpillStatus() const {
+std::optional<KvSpillSnapshot> RuntimeResources::kvSpillSnapshot() const {
   if (!memoryPlan_.breakdown().kvSpill.enabled)
     return std::nullopt;
-  KvSpillStatus result{.cache = cache_->spillSnapshot()};
-  if (blockCache_)
-    result.blockCache = blockCache_->stats();
-  if (historyStream_)
-    result.historyStream = historyStream_->stats();
-  return result;
+  return cache_->spillSnapshot();
+}
+
+std::optional<model::KvBlockCacheStats> RuntimeResources::kvBlockCacheStats() const {
+  if (blockCache_) return blockCache_->stats();
+  return std::nullopt;
+}
+
+std::optional<model::KvHistoryStreamStats> RuntimeResources::kvHistoryStreamStats() const {
+  if (historyStream_) return historyStream_->stats();
+  return std::nullopt;
 }
 
 std::optional<model::SparseRowStats> RuntimeResources::streamedTableStats() const {

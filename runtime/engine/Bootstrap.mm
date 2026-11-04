@@ -195,19 +195,34 @@ void RuntimeBootstrap::announceReady() {
 }
 
 std::string RuntimeBootstrap::statusJson(const RuntimeMetricsSnapshot &metrics,
-                                         const NativeLoopTiming &loop) {
+                                         double loopMaxTickMilliseconds) {
   // Status can arrive during GPU work; allocation/command boundaries and
   // the safe-point pressure monitor already refresh the cached sample.
   metal::MetalBackend &backend = resources_->backend();
   const bool healthy = backend.healthy();
-  return runtimeStatusJson(
-      resources_->memoryPlan(), nativeLoop_->statusSnapshot(), backend.memoryStats(),
-      report_.warmup, report_.memoryAudit, metrics, model_->telemetry(),
-      resources_->cacheIdentity(), resources_->memoryGovernor().snapshot(),
-      healthy, healthy ? std::string{} : backend.unhealthyReason(),
-      nativeLoop_->resourceWaitSnapshot(), loop, nativeLoop_->weightsSnapshot(),
-      resources_->aneFfnSnapshot(), thermalState_.state(), resources_->streamedTableStats(),
-      resources_->streamedExpertStats(), resources_->kvSpillStatus());
+  StatusSample sample{.engine = nativeLoop_->statusSnapshot(),
+                      .resourceWait = nativeLoop_->resourceWaitSnapshot(),
+                      .weights = nativeLoop_->weightsSnapshot(),
+                      .metrics = metrics,
+                      .telemetry = model_->telemetry(),
+                      .metalMemory = backend.memoryStats(),
+                      .metalHealthy = healthy,
+                      .metalFailureReason = healthy ? std::string{} : backend.unhealthyReason(),
+                      .memoryGovernor = resources_->memoryGovernor().snapshot(),
+                      .aneFfn = resources_->aneFfnSnapshot(),
+                      .thermalState = thermalState_.state(),
+                      .loopMaxTickMilliseconds = loopMaxTickMilliseconds,
+                      .streamedTable = resources_->streamedTableStats(),
+                      .streamedExperts = resources_->streamedExpertStats()};
+  if (std::optional<KvSpillSnapshot> spill = resources_->kvSpillSnapshot())
+    sample.kvSpill = StatusSample::KvSpill{.cache = std::move(*spill),
+                                           .blockCache = resources_->kvBlockCacheStats(),
+                                           .historyStream = resources_->kvHistoryStreamStats()};
+  return runtimeStatusJson({.plan = resources_->memoryPlan(),
+                            .cacheIdentity = resources_->cacheIdentity(),
+                            .warmup = report_.warmup,
+                            .memoryAudit = report_.memoryAudit},
+                           sample);
 }
 
 void RuntimeBootstrap::sampleThermalState() {

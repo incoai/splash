@@ -5,7 +5,7 @@
 #include "TestKvPool.hpp"
 #include "TestMetalMemory.hpp"
 #include "engine/Engine.hpp"
-#include "engine/Status.hpp"
+#include "engine/RuntimeMetrics.hpp"
 
 #include <cmath>
 #include <cstdlib>

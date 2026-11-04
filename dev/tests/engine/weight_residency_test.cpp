@@ -2,7 +2,6 @@
 #include "TestEngine.hpp"
 #include "TestRegistry.hpp"
 #include "engine/ReleasableMemory.hpp"
-#include "engine/Status.hpp"
 #include "engine/WeightResidency.hpp"
 
 #include <cmath>

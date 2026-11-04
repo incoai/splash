@@ -6,10 +6,12 @@
 #include "engine/Cache.hpp"
 #include "engine/CacheDirectory.hpp"
 #include "engine/DiskSpace.hpp"
+#include "engine/Engine.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/KvPageTier.hpp"
 #include "ops/PageStorage.hpp"
 #include "model/KvBlockCache.hpp"
+#include "model/ExpertStoreStats.hpp"
 #include "model/KvHistoryStream.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/QwenState.hpp"
@@ -18,7 +20,7 @@
 #include "engine/MemoryAudit.hpp"
 #include "engine/Protocol.hpp"
 #include "engine/ReleasableMemory.hpp"
-#include "engine/Status.hpp"
+#include "metal/MetalBackend.hpp"
 #include "ops/ExecutionPlans.hpp"
 
 #include <condition_variable>
@@ -326,9 +328,13 @@ public:
   [[nodiscard]] std::optional<model::ExpertStoreStats> streamedExpertStats() const;
   // Which requests keep their KV on the SSD cache (EngineConfig::spill).
   [[nodiscard]] EngineSpillConfig spillConfig() const noexcept;
-  // Spilling as it stands, for /status, none for a target that keeps its KV
-  // in memory; engine thread.
-  [[nodiscard]] std::optional<KvSpillStatus> kvSpillStatus() const;
+  // What the SSD cache holds and did of spilled KV (Cache::spillSnapshot), for
+  // /status, none for a target that keeps its KV in memory; engine thread.
+  [[nodiscard]] std::optional<KvSpillSnapshot> kvSpillSnapshot() const;
+  // The readers of spilled KV, which only a target whose KV spills has: the
+  // hot block cache and the history stream.
+  [[nodiscard]] std::optional<model::KvBlockCacheStats> kvBlockCacheStats() const;
+  [[nodiscard]] std::optional<model::KvHistoryStreamStats> kvHistoryStreamStats() const;
 
   [[nodiscard]] model::RuntimeContext modelContext() noexcept;
   // What the engine gives back while idle (NativeLoopConfig::weights): the

@@ -66,33 +66,24 @@ MemoryAuditResult audit(const EngineMemoryPlan &memoryPlan) {
   return auditActualMemory(memoryPlan, actual);
 }
 
-// What one status document is written from.
+// The document of `sample` under `memoryPlan`, with an empty cache identity
+// unless one is given.
+std::string statusOf(const EngineMemoryPlan &memoryPlan, const StatusSample &sample, const WarmupReport &warmup = {},
+                     const MemoryAuditResult &memoryAudit = {}, const engine::RuntimeCacheIdentity &identity = {}) {
+  return runtimeStatusJson(
+      {.plan = memoryPlan, .cacheIdentity = identity, .warmup = warmup, .memoryAudit = memoryAudit}, sample);
+}
+
+// What one status document is written from: what the start fixed, and a
+// sample.
 struct StatusInputs {
   EngineMemoryPlan memoryPlan;
-  engine::EngineSnapshot engine;
-  metal::MetalMemoryStats metal;
+  engine::RuntimeCacheIdentity identity;
   WarmupReport warmup;
   MemoryAuditResult memoryAudit;
-  RuntimeMetricsSnapshot metrics;
-  model::ModelTelemetry telemetry;
-  engine::RuntimeCacheIdentity identity;
-  MemoryGovernorSnapshot governor;
-  bool metalHealthy = true;
-  std::string metalFailureReason;
-  ResourceWaitSnapshot wait;
-  NativeLoopTiming loop;
-  WeightsSnapshot weights;
-  AneFfnSnapshot aneFfn;
-  ThermalState thermalState = ThermalState::Nominal;
-  std::optional<model::SparseRowStats> streamedTable;
-  std::optional<model::ExpertStoreStats> streamedExperts;
-  std::optional<KvSpillStatus> kvSpill;
+  StatusSample sample;
 
-  [[nodiscard]] std::string json() const {
-    return runtimeStatusJson(memoryPlan, engine, metal, warmup, memoryAudit, metrics, telemetry, identity, governor,
-                             metalHealthy, metalFailureReason, wait, loop, weights, aneFfn, thermalState,
-                             streamedTable, streamedExperts, kvSpill);
-  }
+  [[nodiscard]] std::string json() const { return statusOf(memoryPlan, sample, warmup, memoryAudit, identity); }
 };
 
 // A representative status document, every section of it set.
@@ -296,7 +287,7 @@ StatusInputs representativeStatus() {
                                   .regrows = 1};
   experts.uses[1] = {
       .loads = 480, .routed = 4000, .read = 1000, .prefetched = 600, .readAhead = 900, .readBytes = 1973000000};
-  KvSpillStatus spill;
+  StatusSample::KvSpill spill;
   spill.cache = {.spilledPages = 640,
                  .spilledBytes = 272'629'760,
                  .writeThroughPages = 640,
@@ -361,22 +352,22 @@ StatusInputs representativeStatus() {
                                   .oldestWaitMilliseconds = 1250.0, .draining = true};
   const MemoryAuditResult memoryAudit = audit(memoryPlan);
   return {.memoryPlan = std::move(memoryPlan),
-          .engine = std::move(engine),
-          .metal = metal,
+          .identity = std::move(identity),
           .warmup = std::move(warmup),
           .memoryAudit = memoryAudit,
-          .metrics = metrics,
-          .telemetry = executorTelemetry,
-          .identity = std::move(identity),
-          .governor = std::move(governor),
-          .wait = wait,
-          .loop = NativeLoopTiming{1843.25},
-          .weights = {600.0, false, false, 2, 1},
-          .aneFfn = aneFfn,
-          .thermalState = ThermalState::Fair,
-          .streamedTable = std::move(table),
-          .streamedExperts = experts,
-          .kvSpill = std::move(spill)};
+          .sample = {.engine = std::move(engine),
+                     .resourceWait = wait,
+                     .weights = {600.0, false, false, 2, 1},
+                     .metrics = metrics,
+                     .telemetry = executorTelemetry,
+                     .metalMemory = metal,
+                     .memoryGovernor = std::move(governor),
+                     .aneFfn = aneFfn,
+                     .thermalState = ThermalState::Fair,
+                     .loopMaxTickMilliseconds = 1843.25,
+                     .streamedTable = std::move(table),
+                     .streamedExperts = experts,
+                     .kvSpill = std::move(spill)}};
 }
 
 // The representative document and the golden copy of it that the server's
@@ -471,7 +462,7 @@ void testCleanRuntimeStatus(const char *goldenPath) {
           "status lost model GPU/wall timing, scope, or milliseconds units");
 
   StatusInputs unmeasuredInputs = status;
-  unmeasuredInputs.telemetry = {};
+  unmeasuredInputs.sample.telemetry = {};
   const std::string unmeasured = unmeasuredInputs.json();
   require(unmeasured.find("\"model_timing\":{\"scope\":\"model_lifetime\","
                           "\"prefill\":{\"last_gpu_ms\":0,\"last_wall_ms\":0,"
@@ -584,12 +575,12 @@ std::vector<std::pair<const char *, StatusInputs>> statusVariants() {
                                                                  .memoryTokens = 300'000,
                                                                  .diskTokens = 400'000});
   spilling.memoryAudit = audit(spilling.memoryPlan);
-  spilling.kvSpill->blockCache.reset();
-  spilling.kvSpill->historyStream.reset();
-  spilling.engine.activeRequests[1].kvMode = engine::KvMode::Spill;
-  spilling.aneFfn = {AneFfnSnapshot::State::Split, "at share 0.41 for chunks of 640 rows or more", 0.41, 640, 3,
+  spilling.sample.kvSpill->blockCache.reset();
+  spilling.sample.kvSpill->historyStream.reset();
+  spilling.sample.engine.activeRequests[1].kvMode = engine::KvMode::Spill;
+  spilling.sample.aneFfn = {AneFfnSnapshot::State::Split, "at share 0.41 for chunks of 640 rows or more", 0.41, 640, 3,
                      192, 1234.5};
-  spilling.engine.resources.kvTier.writesGated = engine::DiskWritesGate::Closed;
+  spilling.sample.engine.resources.kvTier.writesGated = engine::DiskWritesGate::Closed;
   spilling.warmup.decodeBatches[2] = WarmupStepStatus::MemoryLimited;
   spilling.warmup.decodeBatches[3] = WarmupStepStatus::MemoryLimited;
 
@@ -602,18 +593,18 @@ std::vector<std::pair<const char *, StatusInputs>> statusVariants() {
   StatusInputs resident = representative;
   resident.memoryPlan = plan(kv::Layout{49, 4, 128, kv::Format::Int8, 0, false, 512, windowedLayers});
   resident.memoryAudit = audit(resident.memoryPlan);
-  resident.kvSpill.reset();
-  resident.engine.resources.window.reset();
-  resident.engine.activeRequests.clear();
-  resident.governor.hostTelemetry.reset();
-  resident.governor.accounts.clear();
-  resident.weights.idleReleaseSeconds = std::numeric_limits<double>::infinity();
-  resident.aneFfn = {.reason = "as given"};
-  resident.streamedTable.reset();
-  resident.streamedExperts.reset();
-  resident.engine.resources.kvTier.writesGated = engine::DiskWritesGate::No;
-  resident.metalHealthy = false;
-  resident.metalFailureReason = "command buffer \"decode\" failed:\n\tGPU timeout";
+  resident.sample.kvSpill.reset();
+  resident.sample.engine.resources.window.reset();
+  resident.sample.engine.activeRequests.clear();
+  resident.sample.memoryGovernor.hostTelemetry.reset();
+  resident.sample.memoryGovernor.accounts.clear();
+  resident.sample.weights.idleReleaseSeconds = std::numeric_limits<double>::infinity();
+  resident.sample.aneFfn = {.reason = "as given"};
+  resident.sample.streamedTable.reset();
+  resident.sample.streamedExperts.reset();
+  resident.sample.engine.resources.kvTier.writesGated = engine::DiskWritesGate::No;
+  resident.sample.metalHealthy = false;
+  resident.sample.metalFailureReason = "command buffer \"decode\" failed:\n\tGPU timeout";
   resident.identity.ropeScaling = {3.814697265625, 262144};
   resident.identity.kvLayout = kv::Layout{16, 4, 256, kv::Format::BFloat16};
   resident.identity.kvLayout.valuesTokenMajor = true;
@@ -652,8 +643,7 @@ void testCurrentReadinessAndSimultaneousPeak() {
   memory.deviceCurrentAllocatedBytes = 22 * kGiB;
   memory.devicePeakAllocatedBytes = 22 * kGiB;
   auto status = [&] {
-    return runtimeStatusJson(memoryPlan, {}, memory, warmup, audit(memoryPlan),
-                             {}, {}, {}, governor, true, {}, {}, {}, {}, {}, {});
+    return statusOf(memoryPlan, {.metalMemory = memory, .memoryGovernor = governor}, warmup, audit(memoryPlan));
   };
   const std::string healthy = status();
   require(healthy.find("\"ready\":true") != std::string::npos &&
@@ -703,8 +693,7 @@ void testWarmupStepsReportMeasurementTruth() {
   governor.hostAvailableBytes = 8 * kGiB;
   governor.hostReserveBytes = 2 * kGiB;
   auto status = [&] {
-    return runtimeStatusJson(memoryPlan, {}, {}, warmup, audit(memoryPlan),
-                             {}, {}, {}, governor, true, {}, {}, {}, {}, {}, {});
+    return statusOf(memoryPlan, {.memoryGovernor = governor}, warmup, audit(memoryPlan));
   };
   require(status().find("\"memory_limited_steps\":[]") != std::string::npos,
           "fully measured warmup listed a memory-limited step");
@@ -759,8 +748,7 @@ void testMemoryPressureTelemetry() {
   governor.pressure = MemoryPressure::Critical;
   governor.hostGrowthAllowed = false;
   auto status = [&] {
-    return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, governor, true, {},
-                             {}, {}, {}, {}, {});
+    return statusOf(memoryPlan, {.memoryGovernor = governor});
   };
   const std::string hostLimited = status();
   require(hostLimited.find("\"memory_pressure\":\"critical\"") !=
@@ -790,17 +778,14 @@ void testResourceWaitDiagnostics() {
                             .restoring = 1, .suspended = 1,
                             .oldestWaitMilliseconds = 1250.0, .draining = true};
   const auto memoryPlan = plan();
-  const std::string json = runtimeStatusJson(
-      memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, wait, {}, {}, {}, {});
+  const std::string json = statusOf(memoryPlan, {.resourceWait = wait});
   require(json.find("\"admission\":{\"waiting\":3,\"waiting_memory\":2,"
                     "\"waiting_concurrency\":1,\"held_behind_refusal\":4,\"restoring\":1,"
                     "\"suspended\":1,\"draining\":true,"
                     "\"oldest_wait_ms\":1250},\"loop\":{\"max_tick_ms\":0,\"stall_budget_ms\":30000,") !=
               std::string::npos,
           "resource wait summary is missing or inaccurate");
-  const std::string ticked = runtimeStatusJson(
-      memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, wait,
-      NativeLoopTiming{1843.25}, {}, {}, {});
+  const std::string ticked = statusOf(memoryPlan, {.resourceWait = wait, .loopMaxTickMilliseconds = 1843.25});
   require(ticked.find("\"loop\":{\"max_tick_ms\":1843.25,\"stall_budget_ms\":30000,\"tick_host_ms\":{\"p50\":0,"
                       "\"p95\":0,\"p99\":0,\"max\":0,\"total\":0,\"samples\":0}}") != std::string::npos &&
               ticked.find("\"schema_version\":8") != std::string::npos,
@@ -814,8 +799,7 @@ void testResourceWaitDiagnostics() {
 void testWeightsStatus() {
   const auto memoryPlan = plan();
   const auto status = [&](WeightsSnapshot weights) {
-    return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, {}, {},
-                             weights, {}, {});
+    return statusOf(memoryPlan, {.weights = weights});
   };
   require(status({600.0, true, false, 2, 1})
                   .find("\"weights\":{\"idle_release_seconds\":600,\"released\":true,"
@@ -845,8 +829,7 @@ void testWeightsStatus() {
 void testStreamedExpertsStatus() {
   const auto memoryPlan = plan();
   const auto status = [&](const std::optional<model::ExpertStoreStats> &experts) {
-    return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, {}, {}, {}, {}, {}, std::nullopt,
-                             experts);
+    return statusOf(memoryPlan, {.streamedExperts = experts});
   };
   require(status(std::nullopt).find(",\"streamed_experts\":null,") != std::string::npos,
           "a model without streamed experts does not report null");
@@ -929,7 +912,7 @@ void testKvSpillStatus() {
                                  .allocatedBytes = 31'506 * 24'576ULL};
   ResourceWaitSnapshot wait;
   wait.diskQuota = 1;
-  KvSpillStatus spill;
+  StatusSample::KvSpill spill;
   spill.cache = {.spilledPages = 31'250,
                  .spilledBytes = 13'312'000'000,
                  .writeThroughPages = 31'250,
@@ -965,9 +948,8 @@ void testKvSpillStatus() {
       .buffers = 2,
       .read = {.count = 24, .totalMilliseconds = 5'000, .maximumMilliseconds = 250, .p50Milliseconds = 262.144,
                .p95Milliseconds = 262.144, .p99Milliseconds = 262.144}};
-  const auto status = [&](const EngineMemoryPlan &memoryPlan, const std::optional<KvSpillStatus> &kvSpill) {
-    return runtimeStatusJson(memoryPlan, engine, {}, {}, {}, {}, {}, {}, {}, true, {}, wait, {}, {}, {}, {},
-                             std::nullopt, std::nullopt, kvSpill);
+  const auto status = [&](const EngineMemoryPlan &memoryPlan, const std::optional<StatusSample::KvSpill> &kvSpill) {
+    return statusOf(memoryPlan, {.engine = engine, .resourceWait = wait, .kvSpill = kvSpill});
   };
   const std::string resident = status(plan(), std::nullopt);
   const size_t planned = resident.find("\"kv_spill\":null");
@@ -1013,7 +995,7 @@ void testKvWindowStatus() {
   engine.resources.pool = {.pagesAllocated = 1024, .pagesFree = 124, .pagesActive = 300, .pagesPrefix = 700};
   engine.resources.pool.slim = {.pagesAllocated = 768, .pagesFree = 68, .allocatedBytes = 768 * 473'088ULL};
   const auto status = [&] {
-    return runtimeStatusJson(plan(), engine, {}, {}, {}, {}, {}, {}, {}, true, {}, {}, {}, {}, {}, {});
+    return statusOf(plan(), {.engine = engine});
   };
   require(status().find("\"window_pages\"") == std::string::npos, "a target without a window reported one");
   engine.resources.window = engine::KvWindowSnapshot{
@@ -1030,7 +1012,7 @@ void testKvWindowStatus() {
 void testStreamedTableStatus() {
   const auto memoryPlan = plan();
   const auto status = [&](const std::optional<model::SparseRowStats> &table) {
-    return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, {}, {}, {}, {}, {}, table);
+    return statusOf(memoryPlan, {.streamedTable = table});
   };
   require(status(std::nullopt).find(",\"streamed_table\":null,") != std::string::npos,
           "a model without a streamed table does not report null");
@@ -1070,8 +1052,7 @@ void testAneFfnStatus() {
   const auto status = [&](const AneFfnSnapshot &split, uint64_t reruns) {
     model::ModelTelemetry telemetry;
     telemetry.aneFfnReruns = reruns;
-    return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, telemetry, {}, {}, true, {}, {}, {},
-                             {}, split, {});
+    return statusOf(memoryPlan, {.telemetry = telemetry, .aneFfn = split});
   };
   require(status({.reason = "as given"}, 0)
                   .find("\"ane_ffn\":{\"state\":\"off\",\"share\":0,\"minimum_rows\":0,"
@@ -1106,8 +1087,7 @@ void testAneFfnStatus() {
 void testThermalStateStatus() {
   const auto memoryPlan = plan();
   const auto status = [&](ThermalState state) {
-    return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, {}, {},
-                             {}, {}, state);
+    return statusOf(memoryPlan, {.thermalState = state});
   };
   for (const auto &[state, name] :
        {std::pair{ThermalState::Nominal, "nominal"}, std::pair{ThermalState::Fair, "fair"},
