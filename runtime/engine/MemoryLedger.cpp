@@ -262,13 +262,14 @@ struct MemoryLedger::Run final {
   bool costly = false;
 };
 
-// The one order units are counted and taken in: memory nothing needs now
-// (the cache's units, by its walk); the units of pools that cost only their
-// rebuild; the claimant's own conversion to Spill and the command between
-// its passes; the other pools' units (the expert store's chunks, top first)
-// down to their floors, which cost reads while they stay away; last what
-// another request uses, since its state in use costs it a re-prefill of its
-// whole prompt while a store chunk costs only reads until it regrows.
+// The one order units are counted and taken in: memory nothing needs that
+// frees now (the cache's units that need no write, by its walk); the units
+// of pools that cost only their rebuild; the cache's units that free once a
+// write lands; the claimant's own conversion to Spill and the command
+// between its passes; the other pools' units (the expert store's chunks, top
+// first) down to their floors, which cost reads while they stay away; last
+// what another request uses, since its state in use costs it a re-prefill
+// of its whole prompt while a store chunk costs only reads until it regrows.
 // Within a stage the source registered first goes first, then the pools;
 // each source's own order is kept. A unit the claim's class may not take is
 // skipped, not stopped at.
@@ -347,15 +348,19 @@ public:
     return false;
   }
 
-  // The head's stage in the order; from kCostlyStage on, a unit whose loss
-  // costs work later (Run::costly).
-  static constexpr int kCostlyStage = 2;
+  // The head's stage in the order: kWriteStage is the cache's units that
+  // free once a write lands, and from kCostlyStage on, a unit's loss costs
+  // work later (Run::costly).
+  static constexpr int kWriteStage = 2;
+  static constexpr int kCostlyStage = 3;
   [[nodiscard]] static int stage(const Head &head) {
     if (head.pool)
-      return head.state.rebuildOnly ? 1 : 3;
+      return head.state.rebuildOnly ? 1 : 4;
     if (head.victim->kind != VictimKind::Memory)
-      return 2;
-    return head.victim->cls == ReclaimClass::InUse ? 4 : 0;
+      return kCostlyStage;
+    if (head.victim->cls == ReclaimClass::InUse)
+      return 5;
+    return head.victim->later ? kWriteStage : 0;
   }
 
   // Moves past the head's unit, which stays in its source's order (or which
@@ -487,10 +492,9 @@ MemoryLedger::Run MemoryLedger::bound(const ClaimSpec &spec, const VictimQuery &
 // the transfers they started land, covers the lack. After a take that freed
 // something its source is peeked again from its head; a unit whose take
 // frees nothing is passed over: a transfer in flight may hold it (pending),
-// or nothing of it is left. A claim that can wait takes nothing of a later
-// stage than a pending unit's, unless its takes started transfers of that
-// source: it waits for the transfer, as the cache's units come before the
-// store's and what is in use; what its own transfers return it counts. Every take frees
+// or nothing of it is left. A claim that can wait takes nothing past the
+// cache's units that need a write once a unit is pending: it waits for the
+// transfer rather than take what costs work later. Every take frees
 // something of a finite cache or pool, or passes one of a source's
 // finitely many units, so the walk ends. A unit's state buffers count for
 // a need of bytes as in bound(). An Immediate claim passes over what lands
@@ -544,8 +548,7 @@ MemoryLedger::Run MemoryLedger::take(const ClaimSpec &spec, const VictimQuery &q
     if (!took) {
       if (taken.outcome == FreeOutcome::Pending && !order.immediate) {
         run.pending = true;
-        if (!started[static_cast<size_t>(best - order.heads.data())])
-          ceiling = std::min(ceiling, Order::stage(*best));
+        ceiling = std::min(ceiling, std::max(Order::stage(*best), Order::kWriteStage));
       }
       order.pass(*best);
       continue;
@@ -561,8 +564,6 @@ MemoryLedger::Run MemoryLedger::take(const ClaimSpec &spec, const VictimQuery &q
     run.pages += taken.pages;
     run.buffers += taken.stateBuffers;
     run.costly = run.costly || Order::stage(*best) >= Order::kCostlyStage;
-    if (taken.laterBytes || taken.outcome == FreeOutcome::Pending)
-      started[static_cast<size_t>(best - order.heads.data())] = true;
     if (!run.took.empty() && run.took.back().source == best->source && run.took.back().pool == best->pool &&
         run.took.back().unit.key == unit.key)
       run.took.back().bytes = plus(run.took.back().bytes, plus(taken.nowBytes, taken.laterBytes));
