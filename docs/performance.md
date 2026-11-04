@@ -94,8 +94,8 @@ memory (2 to 7 GiB) and a 1 GiB margin, 3 GiB on these Macs. It gives cached
 memory back when that spare memory runs short of the margin, not for macOS's
 warning alone, but a request in service still takes the memory it needs within
 `--max-memory`, so these models leave other applications little room. A request that cannot get memory waits for it,
-and so does every request that arrived after it, except one of a higher
-priority. While an earlier request is at work, as one prefilling a prompt near
+and so do the requests of its priority or below that the scheduler would start
+after it. While an earlier request is at work, as one prefilling a prompt near
 the context limit can be for many minutes, they wait with no time limit; without
 one, the request refused memory fails after 30 s with `resource_timeout`: close
 memory-heavy applications, or serve with `--language-only`. To bound the wait,

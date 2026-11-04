@@ -811,7 +811,8 @@ void testFullLanesSkipAdmissionAttempts() {
   executor.decodeFinishes = false;
   // The first pass starts the three short prompts and tries request 5, the
   // fourth of its batch, which meets pressure. Request 4 arrived before it
-  // with a long prompt, so it is not held back and takes the last lane.
+  // with a longer prompt: request 5 leads it and holds it back, and takes the
+  // last lane at its retry.
   executor.beginGrowthBlocked = [&] { return executor.beginAttempts == 4; };
   Events events;
   engine::Engine engine(test::engineConfig({.resourceWaitTimeoutMilliseconds = 1000.0}),
@@ -832,11 +833,14 @@ void testFullLanesSkipAdmissionAttempts() {
           "fixture did not leave one request waiting for memory");
   for (double now = 2; now <= 6; ++now)
     static_cast<void>(engine.tick(now));
-  require(executor.requests.size() == 4 && executor.requests.contains(4) &&
+  require(executor.requests.size() == 3 && executor.beginAttempts == 4,
+          "the request the refused one leads was tried while it backed off");
+  static_cast<void>(engine.tick(200));
+  require(executor.requests.size() == 4 && executor.requests.contains(5) &&
               executor.beginAttempts == 5,
           "fixture did not make every lane resident");
 
-  for (double now : {200.0, 201.0, 1200.0, 1201.0})
+  for (double now : {201.0, 1200.0, 1201.0})
     static_cast<void>(engine.tick(now));
   const auto waiting = engine.resourceWaitSnapshot(1201);
   require(executor.beginAttempts == 5 && events.failedCount == 0 &&
@@ -844,7 +848,7 @@ void testFullLanesSkipAdmissionAttempts() {
           "full lanes retried admission or kept the memory wait limit");
   engine.cancel(1);
   require(engine.tick(1202) && executor.beginAttempts == 6 &&
-              events.startIds.back() == 5,
+              events.startIds.back() == 4,
           "a released lane did not admit the waiting request");
   for (uint64_t id : {2, 3, 4, 5})
     engine.cancel(id);
@@ -1298,7 +1302,7 @@ void testAdmissionWaitsOutEarlierLanes() {
 }
 
 // A lane submitted after a waiting request does not extend its wait: the wait fails at its limit, retryably, while
-// that lane still runs.
+// that lane, which leads it, still runs.
 void testLaterLanesDoNotExtendAResourceWait() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
@@ -1315,20 +1319,19 @@ void testLaterLanesDoNotExtendAResourceWait() {
   config.resourceWaitTimeoutMilliseconds = 50.0;
   engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
-  engine.submit(request(320, {320}));
+  engine.submit(request(320, std::vector<uint32_t>(65, 320)));
   static_cast<void>(engine.tick(1));
   require(engine.resourceWaitSnapshot(1).memory == 1 && !executor.requests.contains(320),
           "the first request did not wait for memory");
-  // A higher priority is ahead of the waiting request in admission order and
-  // is not held back.
+  // A shorter prompt leads the waiting request and is not held back; the
+  // waiting one stays the next start the scheduler wants.
   auto later = request(321, {321});
-  later.priority = RequestPriority::Foreground;
   later.maxNewTokens = 1000;
   engine.submit(std::move(later));
   double now = 1;
   while (!events.failedCount && now < 1000) {
     static_cast<void>(engine.tick(now += 10));
-    require(executor.requests.contains(321), "the higher priority did not run beside the wait");
+    require(executor.requests.contains(321), "the later lane did not run beside the wait");
   }
   require(now == 51 && events.failures == std::vector<std::string>{"resource_timeout"} &&
               events.failureDetails.back().second && !events.completedCount,
@@ -2033,9 +2036,10 @@ void testMemoryWaitHoldsBackLaterArrivals() {
           "a request held back behind a memory wait did not finish");
 }
 
-// A request waiting for memory closes admission behind it: later arrivals of its priority wait and start in order;
-// a higher priority still starts.
-void testMemoryWaitClosesAdmissionBesideAResidentLane() {
+// A request refused memory beside a resident lane holds back only the starts it leads: a later, shorter arrival,
+// which leads it, starts; a later, longer one the scheduler wants after it waits, untried, until it starts; a higher
+// priority still starts.
+void testARefusedStartHoldsOnlyWhatItLeads() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, nullptr, nullptr);
@@ -2046,25 +2050,31 @@ void testMemoryWaitClosesAdmissionBesideAResidentLane() {
   bool refused = true;
   executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
   executor.beginGrowthBlocked = [&] { return refused && executor.lastBeginId == 2; };
+  std::vector<uint64_t> tried;
+  executor.beginObserver = [&] { tried.push_back(executor.lastBeginId); };
   double now = 1;
   engine.submit(request(1, std::vector<uint32_t>(16385, 1)));
   require(engine.tick(now++) && executor.requests.contains(1), "the first request did not start");
-  engine.submit(request(2, std::vector<uint32_t>(4097, 2)));
+  engine.submit(request(2, std::vector<uint32_t>(129, 2)));
   tickUntil(engine, now, [&] { return engine.resourceWaitSnapshot(now).memory == 1; },
             "the refused request is not waiting for memory");
+  // Request 3 leads the refused one; request 4 is led by it, and the command
+  // that ends its prompt would end request 4's too.
   engine.submit(request(3, std::vector<uint32_t>(65, 3)));
+  engine.submit(request(4, std::vector<uint32_t>(257, 4)));
   for (uint32_t step = 0; step < 4; ++step)
     static_cast<void>(engine.tick(now++));
-  require(!executor.requests.contains(3) && !events.usage.contains(3) &&
-              engine.resourceWaitSnapshot(now).memory == 1 && events.failedCount == 0,
-          "a later arrival started ahead of a request that waits for memory");
-  auto urgent = request(4, std::vector<uint32_t>(65, 4));
+  require((executor.requests.contains(3) || events.usage.contains(3)) &&
+              std::ranges::find(tried, 4) == tried.end() && engine.resourceWaitSnapshot(now).memory == 1 &&
+              engine.resourceWaitSnapshot(now).heldBehindRefusal == 1 && events.failedCount == 0,
+          "a refused request held back a later arrival that leads it, or let one it leads be tried");
+  auto urgent = request(5, std::vector<uint32_t>(65, 5));
   urgent.priority = RequestPriority::Foreground;
   engine.submit(std::move(urgent));
-  tickUntil(engine, now, [&] { return executor.requests.contains(4) || events.usage.contains(4); },
-            "closed admission held back a higher priority");
-  require(!executor.requests.contains(3) && !events.usage.contains(3),
-          "admission reopened for a later arrival of the same priority");
+  tickUntil(engine, now, [&] { return executor.requests.contains(5) || events.usage.contains(5); },
+            "a refused request held back a higher priority");
+  require(!executor.requests.contains(4) && !events.usage.contains(4),
+          "a later arrival the refused request leads started ahead of it");
   refused = false;
   now += 100;
   tickUntil(engine, now, [&] { return executor.requests.contains(2); },
@@ -2073,14 +2083,58 @@ void testMemoryWaitClosesAdmissionBesideAResidentLane() {
   const auto started = [&](uint64_t id) {
     return std::find(events.startIds.begin(), events.startIds.end(), id) - events.startIds.begin();
   };
-  require(events.completedCount == 4 && events.failedCount == 0 && started(2) < started(3) &&
-              executor.prefillRows == 16385 + 4097 + 65 + 65,
-          "closed admission lost work or started it out of order");
+  require(events.completedCount == 5 && events.failedCount == 0 && started(2) < started(4) &&
+              executor.prefillRows == 16385 + 129 + 65 + 257 + 65,
+          "the held request lost work or started ahead of the refused one");
 }
 
-// The request that closed admission is cancelled: what queued behind it
-// starts without it.
-void testClosedAdmissionReopensWhenTheWaitEnds() {
+// Younger, shorter prompts that lead a refused start overtake it by at most the aging bound: once the commands that
+// served them ran maximumBatchWidth - 1 times its remaining rows, one prompt past that at most, it leads them and
+// holds them back until it starts.
+void testAgingBoundsHowFarShorterArrivalsPassARefusedStart() {
+  test::TestKvStorage storage(2048, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor;
+  Events events;
+  engine::Engine engine(test::engineConfig(), resources, executor, events);
+  guardReleases(storage, engine);
+  bool refused = true;
+  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  executor.beginGrowthBlocked = [&] { return refused && executor.lastBeginId == 1; };
+  constexpr uint32_t kRefusedRows = 129, kShortRows = 33;
+  double now = 1;
+  engine.submit(request(1, std::vector<uint32_t>(kRefusedRows, 1)));
+  tickUntil(engine, now, [&] { return engine.resourceWaitSnapshot(now).memory == 1; },
+            "the first request is not waiting for memory");
+  // One shorter prompt at a time, the next once the last has ended.
+  uint64_t latest = 100;
+  engine.submit(request(latest, std::vector<uint32_t>(kShortRows, static_cast<uint32_t>(latest))));
+  for (uint32_t step = 0; step < 400; ++step) {
+    if (events.usage.contains(latest)) {
+      ++latest;
+      engine.submit(request(latest, std::vector<uint32_t>(kShortRows, static_cast<uint32_t>(latest))));
+    }
+    static_cast<void>(engine.tick(now++));
+  }
+  const auto overtaken = static_cast<uint32_t>(std::ranges::count_if(events.startIds, [](uint64_t id) { return id >= 100; }));
+  const uint32_t bound = (model::ExecutionLimits::maximumBatchWidth - 1) * kRefusedRows + kShortRows;
+  require(overtaken != 0 && overtaken * kShortRows <= bound && !executor.requests.contains(latest) &&
+              engine.resourceWaitSnapshot(now).heldBehindRefusal == 1,
+          "shorter prompts overtook the refused start by " + std::to_string(overtaken * kShortRows) +
+              " rows, not within the aging bound of " + std::to_string(bound));
+  refused = false;
+  now += 100;
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+  const auto started = [&](uint64_t id) {
+    return std::find(events.startIds.begin(), events.startIds.end(), id) - events.startIds.begin();
+  };
+  require(events.failedCount == 0 && started(1) < started(latest),
+          "the refused start did not start ahead of the prompts it held back");
+}
+
+// The refused request is cancelled: the start it held back starts without it.
+void testAHeldStartProceedsOnceTheRefusedOneIsCancelled() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, nullptr, nullptr);
@@ -2093,27 +2147,28 @@ void testClosedAdmissionReopensWhenTheWaitEnds() {
   double now = 1;
   engine.submit(request(1, std::vector<uint32_t>(16385, 1)));
   require(engine.tick(now++) && executor.requests.contains(1), "the first request did not start");
-  engine.submit(request(2, std::vector<uint32_t>(4097, 2)));
+  engine.submit(request(2, std::vector<uint32_t>(129, 2)));
   tickUntil(engine, now, [&] { return engine.resourceWaitSnapshot(now).memory == 1; },
             "the refused request is not waiting for memory");
-  engine.submit(request(3, std::vector<uint32_t>(65, 3)));
+  // Led by the refused request, which the command that ends its prompt would
+  // join.
+  engine.submit(request(3, std::vector<uint32_t>(257, 3)));
   for (uint32_t step = 0; step < 4; ++step)
     static_cast<void>(engine.tick(now++));
   require(!executor.requests.contains(3) && !events.usage.contains(3),
-          "admission did not close behind the request that waits for memory");
+          "the refused request did not hold back a later arrival it leads");
   engine.cancel(2);
   tickUntil(engine, now, [&] { return executor.requests.contains(3) || events.usage.contains(3); },
-            "admission stayed closed after the waiting request was cancelled");
+            "the held request did not start once the refused one was cancelled");
   tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
   // The cancelled request is reported as ended, without a row of its own.
   require(events.completedCount == 3 && events.failedCount == 0 &&
-              engine.snapshot().cancelled == 1 && executor.prefillRows == 16385 + 65,
+              engine.snapshot().cancelled == 1 && executor.prefillRows == 16385 + 257,
           "a cancelled wait left work behind");
 }
 
-// A refused request that then waits for a prefix still holds admission closed: a later short request stays queued
-// until it starts.
-void testPrefixWaitKeepsAdmissionClosedBehindARefusal() {
+// A refused request that then waits for a prefix holds back nothing: a later short request starts while it waits.
+void testARefusedRequestWaitingForAPrefixHoldsBackNothing() {
   test::TestKvStorage storage(1024, 4096, 4);
   KvPool pool(storage, 0);
   engine::Cache resources(pool, nullptr, nullptr);
@@ -2149,25 +2204,22 @@ void testPrefixWaitKeepsAdmissionClosedBehindARefusal() {
   hostRefuses = false;
   require(engine.tick(2), "the first requests did not prefill");
   engine.cancel(2);
-  engine.submit(request(5, {5}));
   // The producer starts in the freed lane with a junction for request 4,
   // which then waits for it; a decode runs before the producer's prefill.
   require(engine.tick(3) && executor.requests.contains(3) &&
               engine.snapshot().scheduler.waitingPrefix == 1,
           "the refused request did not wait for the producer's prefix");
+  engine.submit(request(5, {5}));
   double now = 4;
-  while (!executor.requests.contains(4) && now < 100) {
-    require(!executor.requests.contains(5) && !events.usage.contains(5),
-            "a later arrival started while a refused request waited for a prefix");
-    static_cast<void>(engine.tick(now++));
-  }
+  tickUntil(engine, now, [&] { return executor.requests.contains(5) || events.usage.contains(5); },
+            "a later arrival waited behind a refused request that waits for a prefix");
   tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
   const auto started = [&](uint64_t id) {
     return std::find(events.startIds.begin(), events.startIds.end(), id) - events.startIds.begin();
   };
-  require(events.completedCount == 5 && events.failedCount == 0 && started(4) < started(5) &&
+  require(events.completedCount == 5 && events.failedCount == 0 && started(5) < started(4) &&
               executor.restored == 960,
-          "the refused request did not start first from the producer's junction");
+          "the refused request did not start from the producer's junction after the later arrival");
 }
 
 // Suspended requests resume one at a time in admission order: a refused resume holds back later ones even if they
@@ -2224,6 +2276,50 @@ void testRefusedResumeHoldsBackLaterSuspendedLanes() {
           "the suspended requests did not resume in admission order");
 }
 
+// During recovery admission admits one request a pass: the starts above every suspended request, then the
+// resumes.
+void testRecoveryAdmitsOneRequestAPass() {
+  test::TestKvStorage storage(64, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache resources(pool, nullptr, nullptr);
+  Executor executor;
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine(test::engineConfig({.resourceWaitTimeoutMilliseconds = 1000.0}),
+                        resources, executor, events);
+  guardReleases(storage, engine);
+  auto resident = request(1, std::vector<uint32_t>(97, 1));
+  resident.maxNewTokens = 1000;
+  engine.submit(std::move(resident));
+  double now = 1;
+  tickUntil(engine, now, [&] { return events.emitted != 0; }, "the resident lane did not decode");
+  // The host refuses growth: both later requests are suspended at their
+  // first prefill. Then it allows it, and two higher priorities arrive.
+  storage.growthBlocked = true;
+  storage.allocationFailure = metal::AllocationFailure::HostPressure;
+  engine.submit(request(2, std::vector<uint32_t>(33, 2)));
+  engine.submit(request(3, std::vector<uint32_t>(33, 3)));
+  tickUntil(engine, now, [&] { return executor.suspensions == 2; },
+            "the later requests were not suspended");
+  storage.growthBlocked = false;
+  for (const uint64_t id : {4, 5}) {
+    EngineRequest value = request(id, {static_cast<uint32_t>(id)});
+    value.priority = RequestPriority::Foreground;
+    engine.submit(std::move(value));
+  }
+  const auto admitted = [&] { return events.startIds.size() + engine.snapshot().resourceResumptions; };
+  std::vector<uint64_t> order;
+  for (const double end = now + 5000; now < end && engine.snapshot().resourceResumptions < 2; now += 101) {
+    const size_t before = admitted();
+    static_cast<void>(engine.tick(now));
+    require(admitted() <= before + 1, "recovery admitted more than one request in a pass");
+  }
+  require(engine.snapshot().resourceResumptions == 2 && events.failedCount == 0 &&
+              std::ranges::find(events.startIds, 4) != events.startIds.end() &&
+              std::ranges::find(events.startIds, 5) != events.startIds.end(),
+          "recovery did not start the higher priorities and resume the suspended requests");
+}
+
 // A suspended request held behind a refused resume is not tried, so it keeps no retry time and does not run out its
 // wait.
 void testHeldSuspendedRequestNeitherWakesNorExpires() {
@@ -2266,8 +2362,8 @@ void testHeldSuspendedRequestNeitherWakesNorExpires() {
           "a request held behind a refused resume ran out its wait meanwhile");
 }
 
-// /status counts the requests a refused one holds back, the refused one among them while it is deferred, with its
-// wait age from its first refusal.
+// /status counts the starts a refused one holds back while the scheduler wants it, never the refused one itself; its
+// wait age runs from its first refusal across a pass that declines it.
 void testStatusCountsRequestsHeldBehindARefusal() {
   test::TestKvStorage storage(2048, 4096, 4);
   KvPool pool(storage, 0);
@@ -2282,19 +2378,21 @@ void testStatusCountsRequestsHeldBehindARefusal() {
   double now = 1;
   engine.submit(request(1, std::vector<uint32_t>(16385, 1)));
   require(engine.tick(now++) && executor.requests.contains(1), "the first request did not start");
-  engine.submit(request(2, std::vector<uint32_t>(4097, 2)));
+  engine.submit(request(2, std::vector<uint32_t>(129, 2)));
   tickUntil(engine, now, [&] { return engine.resourceWaitSnapshot(now).memory == 1; },
             "the refused request is not waiting for memory");
   const double refusedBy = now;
-  engine.submit(request(3, std::vector<uint32_t>(65, 3)));
-  engine.submit(request(4, std::vector<uint32_t>(65, 4)));
+  // Both led by the refused request, which the command that ends its prompt
+  // would join.
+  engine.submit(request(3, std::vector<uint32_t>(257, 3)));
+  engine.submit(request(4, std::vector<uint32_t>(257, 4)));
   tickUntil(engine, now, [&] { return engine.resourceWaitSnapshot(now).heldBehindRefusal == 2; },
             "the requests behind a refusal were not counted");
   auto wait = engine.resourceWaitSnapshot(now);
   require(wait.memory == 1, "the refused request left its memory wait");
   // A higher priority arrives by the refused request's next retry and starts
   // in that pass, which defers the refused request for scheduling: it leaves
-  // its memory wait.
+  // its memory wait and holds back nothing.
   auto urgent = request(5, std::vector<uint32_t>(65, 5));
   urgent.priority = RequestPriority::Foreground;
   engine.submit(std::move(urgent));
@@ -2302,8 +2400,8 @@ void testStatusCountsRequestsHeldBehindARefusal() {
   tickUntil(engine, now, [&] { return engine.resourceWaitSnapshot(now).memory == 0; },
             "the refused request was not deferred for scheduling");
   wait = engine.resourceWaitSnapshot(now);
-  require(wait.heldBehindRefusal == 3 && !executor.requests.contains(3),
-          "a refused request deferred for scheduling, or what it holds back, was not counted");
+  require(wait.heldBehindRefusal == 0 && !executor.requests.contains(3),
+          "a refused request deferred for scheduling, or what it leads, was counted as held");
   tickUntil(engine, now, [&] { return engine.resourceWaitSnapshot(now).memory == 1; },
             "the refused request did not wait for memory again");
   wait = engine.resourceWaitSnapshot(now);
@@ -2333,11 +2431,13 @@ void testHeldRequestsCountWhileTheirRefusalStands() {
     double now = 1;
     engine.submit(request(1, std::vector<uint32_t>(16385, 1)));
     require(engine.tick(now++) && executor.requests.contains(1), "the first request did not start");
-    engine.submit(request(2, std::vector<uint32_t>(4097, 2)));
+    engine.submit(request(2, std::vector<uint32_t>(129, 2)));
     tickUntil(engine, now, [&] { return engine.resourceWaitSnapshot(now).memory == 1; },
               "the refused request is not waiting for memory");
-    engine.submit(request(3, std::vector<uint32_t>(65, 3)));
-    engine.submit(request(4, std::vector<uint32_t>(65, 4)));
+    // Both led by the refused request, which the command that ends its
+    // prompt would join.
+    engine.submit(request(3, std::vector<uint32_t>(257, 3)));
+    engine.submit(request(4, std::vector<uint32_t>(257, 4)));
     tickUntil(engine, now, [&] { return engine.resourceWaitSnapshot(now).heldBehindRefusal == 2; },
               "the requests behind a refusal were not counted");
     if (cancel) {
@@ -6107,10 +6207,12 @@ std::span<const test::TestCase> memoryTests() {
       {"testUnselectableCandidatesAreNotProbed", testUnselectableCandidatesAreNotProbed},
       {"testWaitingCandidateProbeIsRefreshedNotRepeated", testWaitingCandidateProbeIsRefreshedNotRepeated},
       {"testMemoryWaitHoldsBackLaterArrivals", testMemoryWaitHoldsBackLaterArrivals},
-      {"testMemoryWaitClosesAdmissionBesideAResidentLane", testMemoryWaitClosesAdmissionBesideAResidentLane},
-      {"testClosedAdmissionReopensWhenTheWaitEnds", testClosedAdmissionReopensWhenTheWaitEnds},
-      {"testPrefixWaitKeepsAdmissionClosedBehindARefusal", testPrefixWaitKeepsAdmissionClosedBehindARefusal},
+      {"testARefusedStartHoldsOnlyWhatItLeads", testARefusedStartHoldsOnlyWhatItLeads},
+      {"testAHeldStartProceedsOnceTheRefusedOneIsCancelled", testAHeldStartProceedsOnceTheRefusedOneIsCancelled},
+      {"testAgingBoundsHowFarShorterArrivalsPassARefusedStart", testAgingBoundsHowFarShorterArrivalsPassARefusedStart},
+      {"testARefusedRequestWaitingForAPrefixHoldsBackNothing", testARefusedRequestWaitingForAPrefixHoldsBackNothing},
       {"testRefusedResumeHoldsBackLaterSuspendedLanes", testRefusedResumeHoldsBackLaterSuspendedLanes},
+      {"testRecoveryAdmitsOneRequestAPass", testRecoveryAdmitsOneRequestAPass},
       {"testHeldSuspendedRequestNeitherWakesNorExpires", testHeldSuspendedRequestNeitherWakesNorExpires},
       {"testStatusCountsRequestsHeldBehindARefusal", testStatusCountsRequestsHeldBehindARefusal},
       {"testHeldRequestsCountWhileTheirRefusalStands", testHeldRequestsCountWhileTheirRefusalStands},

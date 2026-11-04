@@ -5,6 +5,7 @@
 #include "EngineHarness.hpp"
 #include "FakeElasticPool.hpp"
 #include "FakeMemory.hpp"
+#include "LandingUnit.hpp"
 #include "LoopFixture.hpp"
 #include "ProtocolPeer.hpp"
 #include "TestChecks.hpp"
@@ -429,11 +430,13 @@ void testChurnKeepsTheStoreThroughAHostEpisode() {
 }
 
 // The engine harness running `profile`'s commands on its clock, a pass a
-// layer, the first token at the prompt's end.
+// layer, the first token at the prompt's end; with `memory`, under a
+// governor over FakeMemory.
 struct TimedHarness final {
-  explicit TimedHarness(const test::TimingProfile &profile)
+  explicit TimedHarness(const test::TimingProfile &profile, std::optional<test::FakeMemory::Config> memory = {})
       : harness({.pages = 8192,
                  .engine = {.maxContext = 262'144},
+                 .memory = std::move(memory),
                  .timing = &profile,
                  .shape = [&profile](test::Executor &model) {
                    model.groupRows = model::ExecutionLimits::prefillTokenBudget;
@@ -629,6 +632,63 @@ void testCriticalTakesTheMarginASecondAndKeepsTheResumePoint() {
   note(at(machine) + "critical passes took" + taken);
 }
 
+// A younger short prompt, as a resend's uncached rows, starts beside a
+// running prefill that leads an older, longer prompt refused memory: the
+// refusal holds back only the starts the scheduler wants after it, and the
+// refused prompt's claim holds no room while the scheduler does not want it.
+void testAResendStartsBesideARefusedLongerPrompt() {
+  test::LandingUnit landing{1ULL << 30};
+  TimedHarness served(test::kDense27B, test::FakeMemory::Config{});
+  test::EngineHarness &harness = served.harness;
+  engine::MemoryLedger &ledger = harness.governor->ledger();
+  harness.model.laneFootprintBytes = 64 << 10;
+  const auto waiting = [&](uint64_t id) {
+    return std::ranges::any_of(ledger.claims(), [&](const auto &entry) {
+      return entry.second.spec.requestId == id && entry.second.waiting;
+    });
+  };
+  const auto phase = [&](uint64_t id) {
+    for (const engine::ActiveRequestSnapshot &active : harness.engine.snapshot().activeRequests)
+      if (active.id == id)
+        return active.phase;
+    return engine::Phase::Completed;
+  };
+  // P (30K) finds no free lane at its first attempt, so R (45K), which
+  // arrived after it, is tried alone and refused memory that lands later.
+  harness.model.maximumLanes = 0;
+  served.submit(1, prompt(1, 30'000), kTokensPerCommand);
+  static_cast<void>(harness.tick());
+  harness.model.maximumLanes = model::ExecutionLimits::maximumBatchWidth;
+  harness.memory->hold("limit", harness.governor->snapshot().headroomBytes - 32);
+  ledger.addSource(landing);
+  served.submit(2, prompt(2, 45'000), kTokensPerCommand);
+  static_cast<void>(harness.tick());
+  require(waiting(2) && !harness.model.requests.contains(1) && !harness.model.requests.contains(2),
+          "the longer prompt was not refused memory that lands later");
+  harness.memory->release("limit", harness.memory->held("limit"));
+  landing.landed = true;
+  harness.runUntil([&] { return harness.model.requests.contains(1); }, "P did not start at its retry");
+  // S (1.5K) arrives while P prefills.
+  served.submit(3, prompt(3, 1536), kTokensPerCommand);
+  bool heldRoom = false;
+  harness.runUntil(
+      [&] {
+        heldRoom = heldRoom || (waiting(2) && phase(2) != engine::Phase::WaitingResources);
+        return test::idle(harness.engine);
+      },
+      "the prompts did not finish");
+  const auto first = [&](uint64_t id) { return harness.events.tokenTimes.at(id).front(); };
+  require(first(3) < first(1),
+          "the younger short prompt waited for P's prefill behind the refused one: its first token at " +
+              std::to_string(first(3) / 1000.0) + " s, P's at " + std::to_string(first(1) / 1000.0) + " s");
+  require(!heldRoom, "the refused prompt's claim held room while the scheduler did not want it");
+  require(first(2) > first(1) && harness.events.completedCount == 3 && harness.events.failedCount == 0,
+          "the refused prompt did not start after P, or a prompt failed");
+  note("the 27B's 1.5K prompt answered " + std::to_string(*served.ttft(3) / 1000.0) +
+       " s after it arrived beside P's 30K prefill and a refused 45K prompt; P answered at " +
+       std::to_string(*served.ttft(1) / 1000.0) + " s");
+}
+
 } // namespace
 
 std::span<const test::TestCase> simTests() {
@@ -638,6 +698,7 @@ std::span<const test::TestCase> simTests() {
       {"testRegrowthAfterABurstTakesOnlyCopiedOrDeadCache", testRegrowthAfterABurstTakesOnlyCopiedOrDeadCache},
       {"testCriticalTakesTheMarginASecondAndKeepsTheResumePoint",
        testCriticalTakesTheMarginASecondAndKeepsTheResumePoint},
+      {"testAResendStartsBesideARefusedLongerPrompt", testAResendStartsBesideARefusedLongerPrompt},
   };
   return kTests;
 }

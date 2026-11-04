@@ -1203,14 +1203,15 @@ the loop shows in `loop.max_tick_ms`.
 ## Admission and eviction
 
 `/status.admission` distinguishes memory and concurrency waits, counts the
-requests held back behind one refused memory or the SSD cache's room for its
-KV (`held_behind_refusal`; during recovery only the suspended ones and those of
-a strictly higher priority, and the refused request itself while a pass defers
-it, even one that recovery does not try, which still waits for what it was
-refused) and those waiting for a disk restore
+starts the scheduler wanted that the latest admission pass held back, untried,
+behind one refused memory or the SSD cache's room for its KV
+(`held_behind_refusal`; during recovery also the suspended requests held back
+behind a refused resume or start) and those waiting for a disk restore
 (`restoring`), reports suspended requests, recovery draining and the oldest
-current wait age, which for a request holding admission closed runs from when
-its wait began. Memory transitions also appear in the console.
+current wait age, which for a refused request runs from when its wait began.
+`held_behind_refusal` is usually 0: the scheduler leaves out the starts a
+refused prompt leads unless their command ends their prompts. Memory
+transitions also appear in the console.
 
 ### Memory claims
 
@@ -1449,8 +1450,9 @@ it takes only what the engine already holds, such as a lane's state buffers that
 a finished request left in the pool or an idle cache the model rebuilds on use;
 and the first start refused holds back the starts it leads, its wait's limit
 restarting while the long request works (below).
-`/status` shows it: `admission.held_behind_refusal` counts the requests held
-back, `memory_governor.growth_allowed` and `host_headroom_bytes` show whether
+`/status` shows it: `admission.held_behind_refusal` counts the wanted starts
+held back untried (above), `memory_governor.growth_allowed` and
+`host_headroom_bytes` show whether
 and how far the host lets the engine grow, and `state.idle_gdn_cells`,
 `idle_draft_rings` and `idle_context_windows` count the pooled lane buffers a
 start can take. A request's `timeout`, or `--request-timeout`, bounds the wait.
@@ -1458,11 +1460,13 @@ start can take. A request's `timeout`, or `--request-timeout`, bounds the wait.
 After a suspension, suspended requests resume before new work of their priority
 or below, one at a time, higher priority first and then in the order they
 arrived; the suspended requests a refused one holds back keep their resource
-waits from running out. When every lane is taken, or a new request's start is
-refused memory that no copy being written to disk is about to free, the
-resident of the lowest priority below it is suspended for it
-(`cache.priority_suspensions` in `/status`) and resumes once a lane and its
-memory are free. A new request below the priority of a running lane neither
+waits from running out. An unstarted request of a higher priority than every
+suspended one starts first, by the same rule as outside recovery; while one is
+refused, or waits for scheduling, no suspended request resumes. When every
+lane is taken, or a new request's start is refused memory that no copy being
+written to disk is about to free, the resident of the lowest priority below it
+is suspended for it (`cache.priority_suspensions` in `/status`) and resumes
+once a lane and its memory are free. A new request below the priority of a running lane neither
 starts nor takes a lane until no lane of that priority runs, since it could not
 run before.
 

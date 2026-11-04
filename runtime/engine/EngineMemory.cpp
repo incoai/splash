@@ -31,9 +31,8 @@ ResourceWaitSnapshot Engine::resourceWaitSnapshot(double now) const {
     }
     const bool waiting = scheduler_.phase(id) == Phase::WaitingResources;
     // Requests the latest admission pass held back, in any phase, while the
-    // request they wait behind is still refused, and a request refused
-    // resources that a pass keeps out of its wait.
-    if (holdsBack(active.heldBehind) || (active.refusedResources && !waiting))
+    // request they wait behind is still refused.
+    if (holdsBack(active.heldBehind))
       ++result.heldBehindRefusal;
     if (!waiting)
       continue;
@@ -442,18 +441,26 @@ void Engine::noteRefusal(Request &active, double now, const Denial &denial) noex
   wait.epoch = resourceEpoch_;
 }
 
-void Engine::deferWait(Request &active) noexcept {
+void Engine::deferWait(Request &active) {
   ResourceWait kept;
-  // A start refused memory keeps when its wait began, and when its claim
-  // first waited for memory on its way back, which bounds what that claim
-  // holds.
+  // A start refused resources keeps when its wait began, what refused it,
+  // and when its claim first waited for memory on its way back, which bounds
+  // what that claim holds.
   if (active.refusedResources) {
     kept.startedMilliseconds = active.resourceWait.startedMilliseconds;
+    kept.diskQuota = active.resourceWait.diskQuota;
     kept.pendingSinceMilliseconds = active.resourceWait.pendingSinceMilliseconds;
     kept.holdEnded = active.resourceWait.holdEnded;
     kept.admittedBefore = active.resourceWait.admittedBefore;
   }
   active.resourceWait = kept;
+  // Its claim holds no room from this pass on: the starts admission tries
+  // after it in the same pass may take that room, and are placed again.
+  MemoryLedger &ledger = governor().ledger();
+  if (active.claim.id && ledger.claim(active.claim.id).waiting) {
+    ledger.setWaiting(active.claim.id, false);
+    ++ledgerChanges_;
+  }
 }
 
 double Engine::resourceDeadline(const Request &active) const noexcept {

@@ -5,6 +5,7 @@
 #include "EngineTestSupport.hpp"
 #include "FakeElasticPool.hpp"
 #include "GovernedHost.hpp"
+#include "LandingUnit.hpp"
 #include "MemoryPasses.hpp"
 #include "TestChecks.hpp"
 #include "TestEngine.hpp"
@@ -38,6 +39,7 @@ using splash::test::Executor;
 using splash::test::HarnessOptions;
 using splash::test::guardReleases;
 using splash::test::idle;
+using splash::test::LandingUnit;
 using splash::test::request;
 using splash::test::runUntilIdle;
 using splash::test::Spilling;
@@ -612,24 +614,6 @@ void testARestoredStateIsPromotedInAClaim() {
   }
 }
 
-// A unit of `bytes` that leaves memory once it lands, at no cost: until it
-// has landed, each claim whose free() takes it waits for it.
-class LandingUnit final : public VictimSource {
-public:
-  explicit LandingUnit(uint64_t bytes) : bytes_(bytes) {}
-  [[nodiscard]] std::string_view name() const noexcept override { return "landing"; }
-  [[nodiscard]] std::optional<Victim> peek(const VictimQuery &, const Victim *after) const override {
-    if (after || landed)
-      return std::nullopt;
-    return Victim{.key = 1, .bytes = bytes_, .later = true};
-  }
-  FreeResult take(const VictimQuery &, const Victim &) override { return {FreeOutcome::Pending, 0, bytes_}; }
-  bool landed = false;
-
-private:
-  uint64_t bytes_;
-};
-
 // A lane below a waiting claim, refused an extent by the host, takes in place the pages it lacks beyond those held
 // for the claim, and keeps its lane.
 void testALaneBelowAWaitingClaimTakesWhatItLacksBeyondTheHeldPages() {
@@ -846,6 +830,72 @@ void testALeftOutLaneHoldsRoomForTheLimitFromItsFirstWait() {
       "the waits did not end", 10'000'000);
   require(lastHeld < waited + kResourceWaitTimeoutMilliseconds + kResourceRetryBackoffMilliseconds,
           "the left-out lane's claim held room " + std::to_string(lastHeld - waited) + " ms after it first waited");
+}
+
+// A start refused memory that lands later holds no room on its claim from the pass in which the scheduler declines
+// it, while a prompt that leads it prefills. Wanted and refused again, its claim waits again, its wait's age kept from
+// its first refusal, within the resource wait limit from its first wait only.
+void testADeclinedRefusalHoldsNoClaimRoom() {
+  for (const bool pastLimit : {false, true}) {
+    LandingUnit landing{1ULL << 30};
+    landing.landed = true;
+    test::EngineHarness harness({.pages = 4096, .memory = test::FakeMemory::Config{}});
+    MemoryLedger &ledger = harness.governor->ledger();
+    ledger.addSource(landing);
+    harness.model.laneFootprintBytes = 64 << 10;
+    // Each start of request 2 finds memory short of its state until the
+    // landing lands.
+    bool refuses = true;
+    harness.model.beginObserver = [&] {
+      if (refuses && harness.model.lastBeginId == 2 && !harness.memory->held("limit")) {
+        harness.memory->hold("limit", harness.governor->snapshot().headroomBytes - 32);
+        landing.landed = false;
+      }
+    };
+    const auto land = [&] {
+      harness.memory->release("limit", harness.memory->held("limit"));
+      landing.landed = true;
+    };
+    const auto waiting = [&] {
+      return std::ranges::any_of(ledger.claims(), [](const auto &entry) {
+        return entry.second.spec.requestId == 2 && entry.second.waiting;
+      });
+    };
+    const auto submit = [&](uint64_t id, uint32_t tokens) {
+      EngineRequest value = harness.request(id, std::vector<uint32_t>(tokens, static_cast<uint32_t>(id)));
+      value.deadlineMilliseconds = 1e9;
+      harness.engine.submit(std::move(value));
+    };
+    // Request 1 finds no free lane at its first attempt, so request 2,
+    // submitted after it, is tried alone.
+    harness.model.maximumLanes = 0;
+    submit(1, 8193);
+    static_cast<void>(harness.tick());
+    harness.model.maximumLanes = model::ExecutionLimits::maximumBatchWidth;
+    submit(2, 16385);
+    static_cast<void>(harness.tick());
+    require(waiting() && harness.engine.resourceWaitSnapshot(harness.now()).memory == 1,
+            "the start was not refused memory that lands later");
+    const double refused = harness.now();
+    land();
+    // Request 1 starts at its retry and leads request 2.
+    harness.runUntil([&] { return harness.model.requests.contains(1); }, "the first request did not start");
+    require(!waiting() && harness.engine.resourceWaitSnapshot(harness.now()).memory == 0,
+            "a start the scheduler declined held room on its claim");
+    if (pastLimit)
+      harness.advanceTo(refused + kResourceWaitTimeoutMilliseconds);
+    // Request 1's last command wants request 2 again, which is refused again.
+    harness.runUntil([&] { return harness.engine.resourceWaitSnapshot(harness.now()).memory == 1; },
+                     "the declined start was not tried again");
+    require(waiting() == !pastLimit &&
+                harness.engine.resourceWaitSnapshot(harness.now()).oldestWaitMilliseconds >= harness.now() - refused,
+            pastLimit ? "a declined start's claim held room again past the limit from its first wait"
+                      : "a declined start's claim did not wait again once wanted, or its wait's age restarted");
+    refuses = false;
+    land();
+    harness.runUntilIdle();
+    require(harness.events.completedCount == 2 && harness.events.failedCount == 0, "the prompts did not finish");
+  }
 }
 
 // The time a start waits for the host to admit it counts as its claim's wait, not as the decode commands' that ran
@@ -1105,6 +1155,7 @@ std::span<const test::TestCase> rulesTests() {
       {"testALaneAPlanLeavesOutWaitsForItsCommandNotOnItsClaim",
        testALaneAPlanLeavesOutWaitsForItsCommandNotOnItsClaim},
       {"testALeftOutLaneHoldsRoomForTheLimitFromItsFirstWait", testALeftOutLaneHoldsRoomForTheLimitFromItsFirstWait},
+      {"testADeclinedRefusalHoldsNoClaimRoom", testADeclinedRefusalHoldsNoClaimRoom},
   };
   return kTests;
 }

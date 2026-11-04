@@ -539,8 +539,8 @@ void testAStartRefusedMemoryCountsNoConversion() {
           "a start was not counted once, by the mode it started in");
 }
 
-// A Spill start short of quota is bounded to what it holds, waits for other commitments ahead of
-// later arrivals, or is refused (kv_disk_quota) when the quota cannot hold it alone.
+// A Spill start short of quota is bounded to what it holds, waits for other commitments behind
+// a later arrival that leads it, or is refused (kv_disk_quota) when the quota cannot hold it alone.
 void testShortQuotaBoundsWaitsOrRefusesASpillStart() {
   {
     // 3 pages of prompt and 200 tokens of output project 9 pages: 5 hold
@@ -562,7 +562,8 @@ void testShortQuotaBoundsWaitsOrRefusesASpillStart() {
     spill.runUntil([&] { return spill.events.outputs.contains(1); },
                    "the first request did not decode");
     // The second needs 4 for its prompt and a page of output, and waits; the
-    // third, which arrives then, would fit in the 2 left.
+    // third, which arrives then, leads it with one page of prompt and fits in
+    // the 2 left.
     spill.engine.submit(Spilling::prompt(2, 2, 3, 200));
     spill.runUntil([&] { return spill.engine.resourceWaitSnapshot(spill.now).diskQuota == 1; },
                    "the second request did not wait for the quota");
@@ -572,11 +573,11 @@ void testShortQuotaBoundsWaitsOrRefusesASpillStart() {
       spill.tier.complete();
     }
     const ResourceWaitSnapshot waits = spill.engine.resourceWaitSnapshot(spill.now);
-    require(spill.events.startIds == std::vector<uint64_t>{1} && waits.diskQuota == 1 &&
-                waits.memory == 0 && waits.heldBehindRefusal == 1,
-            "a start waiting for the quota let a later arrival take it");
+    require(spill.events.startIds == std::vector<uint64_t>{1, 3} && waits.diskQuota == 1 &&
+                waits.memory == 0 && waits.heldBehindRefusal == 0,
+            "a start waiting for the quota held back a later arrival that leads it");
     spill.runUntilIdle();
-    require(spill.events.startIds == std::vector<uint64_t>{1, 2, 3} &&
+    require(spill.events.startIds == std::vector<uint64_t>{1, 3, 2} &&
                 spill.events.completedCount == 3 && spill.events.usage.at(2).second == 200 &&
                 spill.events.usage.at(3).second == 31 && spill.events.boundedIds.empty() &&
                 spill.committedSlots() == 0,
@@ -593,6 +594,93 @@ void testShortQuotaBoundsWaitsOrRefusesASpillStart() {
                 spill.engine.snapshot().spill.refusedQuota == 1 && spill.committedSlots() == 0,
             "a start the quota cannot hold even alone was not refused naming it");
   }
+}
+
+// A start waiting for the SSD cache's quota holds back only the Spill starts it leads: a later
+// Resident start it leads, which needs none of the quota, starts beside it.
+void testAQuotaWaitHoldsBackOnlySpillStarts() {
+  // The room beside the lanes holds 20 pages, so a projection past it spills;
+  // one within a page stays Resident, and none fits the resident context
+  // alone.
+  Spilling spill(10, false, 0, KvCache::pageTokens, {4}, {}, {.limitBytes = 20 * 100});
+  const auto submit = [&](uint64_t id, uint32_t tokens, uint32_t output) {
+    EngineRequest value = request(id, std::vector<uint32_t>(tokens, static_cast<uint32_t>(id)));
+    value.maxNewTokens = output;
+    spill.engine.submit(std::move(value));
+  };
+  const auto mode = [&](uint64_t id) {
+    for (const ActiveRequestSnapshot &active : spill.engine.snapshot().activeRequests)
+      if (active.id == id)
+        return std::optional<KvMode>(active.kvMode);
+    return std::optional<KvMode>();
+  };
+  // The first request commits the whole quota, its output bounded to it; the
+  // second, refused the page its prompt needs, waits.
+  submit(1, 33, 4000);
+  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the first request did not decode");
+  submit(2, 8, 4000);
+  spill.runUntil([&] { return spill.engine.resourceWaitSnapshot(spill.now).diskQuota == 1; },
+                 "the second request did not wait for the quota");
+  // Both led by the second, the third Resident and the fourth Spill.
+  std::vector<uint64_t> tried;
+  spill.model.beginObserver = [&] { tried.push_back(spill.model.lastBeginId); };
+  submit(3, 12, 1);
+  submit(4, 12, 4000);
+  for (int step = 0; step < 5; ++step) {
+    static_cast<void>(spill.engine.tick(spill.now++));
+    spill.tier.complete();
+  }
+  const ResourceWaitSnapshot waits = spill.engine.resourceWaitSnapshot(spill.now);
+  require(mode(1) == KvMode::Spill && mode(2) == KvMode::Spill && std::ranges::find(tried, 3) != tried.end() &&
+              std::ranges::find(tried, 4) == tried.end() && waits.diskQuota == 1 && waits.heldBehindRefusal == 1,
+          "a start waiting for the quota held back a Resident start, or let a Spill start be tried");
+  spill.runUntilIdle();
+  const auto started = [&](uint64_t id) {
+    return std::ranges::find(spill.events.startIds, id) - spill.events.startIds.begin();
+  };
+  require(spill.events.completedCount == 4 && spill.events.failedCount == 0 && started(3) < started(2) &&
+              started(2) < started(4) && spill.committedSlots() == 0,
+          "the starts did not run in the order the quota wait allows");
+}
+
+// A start refused the SSD cache's quota stays a quota refusal while a higher priority keeps it
+// waiting for scheduling: the pass its retry starts it, it holds back only the Spill starts it
+// leads, and a Resident one starts beside it.
+void testADeclinedQuotaRefusalKeepsItsScope() {
+  // As in testAQuotaWaitHoldsBackOnlySpillStarts: the first request commits
+  // the whole quota and the second waits for it.
+  Spilling spill(10, false, 0, KvCache::pageTokens, {4}, {}, {.limitBytes = 20 * 100});
+  const auto submit = [&](uint64_t id, uint32_t tokens, uint32_t output,
+                          RequestPriority priority = RequestPriority::Normal) {
+    EngineRequest value = request(id, std::vector<uint32_t>(tokens, static_cast<uint32_t>(id)));
+    value.maxNewTokens = output;
+    value.priority = priority;
+    spill.engine.submit(std::move(value));
+  };
+  submit(1, 33, 4000);
+  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the first request did not decode");
+  submit(2, 8, 4000);
+  spill.runUntil([&] { return spill.engine.resourceWaitSnapshot(spill.now).diskQuota == 1; },
+                 "the second request did not wait for the quota");
+  // A higher priority runs; the second, the third (Resident) and the fourth
+  // (Spill) wait for scheduling.
+  submit(5, 12, 400, RequestPriority::Foreground);
+  spill.runUntil([&] { return spill.events.outputs.contains(5); }, "the higher priority did not decode");
+  submit(3, 12, 1);
+  submit(4, 12, 4000);
+  for (int step = 0; step < 2; ++step) {
+    static_cast<void>(spill.engine.tick(spill.now++));
+    spill.tier.complete();
+  }
+  // The higher priority and the first end in the same pass: the second's
+  // retry gets the quota.
+  std::vector<uint64_t> tried;
+  spill.model.beginObserver = [&] { tried.push_back(spill.model.lastBeginId); };
+  spill.engine.cancel(5);
+  spill.engine.cancel(1);
+  spill.runUntil([&] { return !tried.empty(); }, "nothing started once the higher priority ended");
+  require(tried == std::vector<uint64_t>{2, 3} && spill.events.failedCount == 0,
+          "a declined quota refusal held back a Resident start, or let a Spill start be tried");
 }
 
 // A start that cannot spill, the tier closed or the quota short, starts Resident where its
@@ -2341,6 +2429,8 @@ std::span<const test::TestCase> spillTests() {
       {"testLaneDemandCountsTheHotFloorALaneWaitsFor", testLaneDemandCountsTheHotFloorALaneWaitsFor},
       {"testAStartRefusedMemoryCountsNoConversion", testAStartRefusedMemoryCountsNoConversion},
       {"testShortQuotaBoundsWaitsOrRefusesASpillStart", testShortQuotaBoundsWaitsOrRefusesASpillStart},
+      {"testAQuotaWaitHoldsBackOnlySpillStarts", testAQuotaWaitHoldsBackOnlySpillStarts},
+      {"testADeclinedQuotaRefusalKeepsItsScope", testADeclinedQuotaRefusalKeepsItsScope},
       {"testAStartThatCannotSpillStartsResidentWithinTheResidentContext",
        testAStartThatCannotSpillStartsResidentWithinTheResidentContext},
       {"testWriteBudgetRefusalSaysWhenToRetry", testWriteBudgetRefusalSaysWhenToRetry},

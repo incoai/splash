@@ -109,11 +109,11 @@ struct ResourceWaitSnapshot final {
   // Starts that wait for the SSD cache's quota of active KV, which other
   // requests' active KV holds.
   uint32_t diskQuota = 0;
-  // Requests the latest admission pass held back behind the first one
-  // refused memory or that quota, whatever they wait for themselves, and a
-  // request refused them while a pass keeps it out of its wait. During recovery
-  // admission tries only suspended requests and those of a strictly higher
-  // priority, and holds back only those.
+  // The starts the scheduler wanted that the latest admission pass held back
+  // behind one refused memory or that quota, without trying them, and during
+  // recovery the suspended requests held back behind a refused resume or
+  // start. Usually none: the scheduler leaves out the starts a refused one
+  // leads unless their command ends their prompts.
   uint32_t heldBehindRefusal = 0;
   // Requests admitted into a restore of their prefix from disk, waiting for
   // its reads rather than for memory.
@@ -349,8 +349,9 @@ private:
     // waits for that plan's command, not for memory, until a plan retries
     // it (passOver).
     bool passedOver = false;
-    // It waits for the SSD cache's quota of active KV, which other requests'
-    // active KV holds, rather than for memory.
+    // It was refused the SSD cache's quota of active KV, which other
+    // requests' active KV holds, rather than memory: what it waits for, and
+    // while its refusal stands, what it holds back (Request::refusedResources).
     bool diskQuota = false;
   };
 
@@ -430,12 +431,10 @@ private:
     ResourceWait resourceWait;
     ClaimHandle claim;
     // The latest attempt to start it was refused memory, or the SSD cache's
-    // quota of active KV. Until it starts, nothing that comes after it in
-    // admission order is admitted, in ordinary admission or among suspended
-    // requests during recovery (admitQueued): what reclaim, finishing lanes
-    // and returned commitments free would otherwise keep going to later
-    // arrivals that need less of it. A pass that does not schedule it or a
-    // prefix wait leaves it in place.
+    // quota of active KV. While the scheduler wants it, it holds back the
+    // starts the scheduler wants after it, and a suspended one the resumes
+    // after it (admitQueued). A pass that does not want it or a prefix wait
+    // leaves it in place.
     bool refusedResources = false;
     // The request refused resources that the latest admission pass held it
     // back behind, without trying it. It counts as held while that request
@@ -659,9 +658,9 @@ private:
   [[nodiscard]] SpillAdmission admitSpill(Request &request, bool resuming, uint64_t chainEnd,
                                           double nowMilliseconds);
   // A start the SSD cache's quota of active KV refused while other requests'
-  // active KV holds what it lacks: it waits for them to end, and closes
-  // admission behind it as a start refused memory does
-  // (Request::refusedResources).
+  // active KV holds what it lacks: it waits for them to end, and holds back
+  // the Spill starts the scheduler wants after it (Request::
+  // refusedResources).
   void waitForDiskQuota(Request &request, double nowMilliseconds);
   // Whether the lane's history may gain Index pages between a command's
   // passes: in Spill mode, a prompt `processed` rows in reaches past its
@@ -1050,10 +1049,11 @@ private:
   // has one.
   void noteRefusal(Request &request, double nowMilliseconds, const Denial &denial) noexcept;
   // Waiting for scheduling or for a prefix does not consume the memory
-  // wait limit, so the wait's record is reset. A request that holds
-  // admission closed (Request::refusedResources) keeps when its wait began and
-  // which lanes were admitted before it was refused.
-  void deferWait(Request &request) noexcept;
+  // wait limit, so the wait's record is reset, and its claim stops waiting.
+  // A request refused resources (Request::refusedResources) keeps when its
+  // wait began, what refused it and which lanes were admitted before it was
+  // refused.
+  void deferWait(Request &request);
   // Keeps each request's claim waiting (MemoryLedger::setWaiting) while it
   // waits for memory on its way back and the engine retries it next: a lane
   // of a priority the scheduler plans (belowRunnable) that no plan of its
@@ -1199,8 +1199,9 @@ private:
   bool allocationFailed_ = false;
   // Counts what changes the memory a placement reads: what the ledger takes
   // for an allocation, a lane that starts (its projected growth) or ends,
-  // and every landing, the tick's and those the control pass collects
-  // (Request::placementState). A grant of a lane's growth leaves the room
+  // a claim that stops holding room for a start waiting for scheduling
+  // (deferWait), and every landing, the tick's and those the control pass
+  // collects (Request::placementState). A grant of a lane's growth leaves the room
   // beside the lanes' projections where it was.
   uint64_t ledgerChanges_ = 1;
   EngineSnapshot counters_;
