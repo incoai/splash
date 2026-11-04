@@ -123,8 +123,9 @@ public:
   KvPool(kv::ExtentStorage &storage, uint32_t runwayPages);
 
   // Holds the runway's pages, as a request holds its own, while it lives:
-  // startup warmup runs on them, and commands reach only the extents of
-  // pages requests hold. Rethrows, holding none, when the pool refuses one.
+  // startup warmup runs on them without acquiring them, so the pool neither
+  // hands them out nor releases their extents meanwhile. Rethrows, holding
+  // none, when the pool refuses one.
   class RunwayHold final {
   public:
     explicit RunwayHold(KvPool &pool);

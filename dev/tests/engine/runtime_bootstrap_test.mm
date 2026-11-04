@@ -229,8 +229,7 @@ void testAllNativeWarmupsPrecedeReady() {
 }
 
 // Warmup runs on the KV runway and holds its pages as a request holds its
-// own, so that commands reach their extents (KvPool::RunwayHold); none is
-// held once the engine is Ready.
+// own (KvPool::RunwayHold); none is held once the engine is Ready.
 void testWarmupHoldsTheRunway() {
   const EngineMemoryPlan plan = memoryPlan();
   Harness harness;
