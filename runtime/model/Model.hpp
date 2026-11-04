@@ -161,7 +161,7 @@ struct ModelRequest final {
 
 // One image in the prompt: the run of placeholder tokens it occupies (one per
 // merged 2x2 patch group, row-major over the merged grid), the patch grid of
-// the frontend's resized pixels, and a 128-bit digest of that content.
+// the image's resized pixels, and a 128-bit digest of that content.
 // Placeholder token ids are identical for every image, so cache identity keys
 // on the digest as well as the tokens.
 struct ImageSpan final {
@@ -874,13 +874,11 @@ public:
     return 0;
   }
   // What one prefill command may hold (commandViolation): by default a
-  // chunk's rows in one pass, one lane past a chunk and one lane whose
-  // history streams, at one rate a row from one row.
+  // chunk's rows in one pass over one layer, one lane past a chunk and no
+  // lane whose history holds Index pages, as a model without readers of
+  // spilled K/V keeps its K/V in memory; at one rate a row from one row.
   [[nodiscard]] virtual CommandLimits commandLimits() const noexcept {
-    return {.commandRows = ExecutionLimits::prefillTokenBudget,
-            .maximumPasses = 1,
-            .lanesPastChunk = 1,
-            .indexPageLanes = 1};
+    return {.commandRows = ExecutionLimits::prefillTokenBudget, .lanesPastChunk = 1};
   }
   // By default a command's lanes, rows, chunks and the attention pairs of
   // one layer, each row attending to every key up to its own
