@@ -114,7 +114,6 @@ final class Server {
     /// SIGTERM, which a running server takes for Ctrl+C and one already stopping ignores, where a
     /// second Ctrl+C would stop its engine at once.
     let record: ChildRecord
-    private var tail: LogTail?
     private var stopRequested = false
     private var watch: Task<Void, Never>?
 
@@ -186,21 +185,20 @@ final class Server {
         do {
             // It stops as Ctrl+C stops it once this app has ended, a crash too, giving its memory
             // back then rather than at the app's next launch.
-            child = try ChildProcess(
-                command: runtime.command(settings.serveArguments(model: model)),
+            child = try record.start(
+                runtime.command(settings.serveArguments(model: model)),
                 environment: runtime.environment.merging(settings.environment) { $1 }
                     .merging(["SPLASH_APP_PID": String(getpid())]) { $1 },
                 log: log,
+                line: { [weak self] in self?.received($0) },
                 exited: { [weak self] in self?.exited($0) }
             )
         } catch {
             phase = .failed("Splash couldn’t start it: \(error.localizedDescription)")
             return
         }
-        tail = LogTail(log) { [weak self] in self?.received($0) }
         let pid = child!.pid
         self.pid = pid
-        record.keep(child!)
         watch = Task { [weak self] in await self?.follow(pid) }
     }
 
@@ -218,11 +216,8 @@ final class Server {
     }
 
     private func exited(_ status: Int32) {
-        tail?.finish()
-        tail = nil
         child = nil
         watch?.cancel()
-        record.forget()
         if let queued {
             self.queued = nil
             launch(queued.model, settings: queued.settings)

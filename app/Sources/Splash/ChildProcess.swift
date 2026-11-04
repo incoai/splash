@@ -176,6 +176,22 @@ struct ChildRecord {
     /// How long after that signal its process group is killed if it still runs.
     let killAfter: Duration
 
+    /// Starts `command` as `ChildProcess` does and keeps it as the program this record names until
+    /// it exits, giving `line` each line of `log` as it is written; `exited` gets its status once
+    /// the log has been read to its end.
+    func start(_ command: [String], environment: [String: String], log: URL, line: @escaping (String) -> Void,
+               exited: @escaping @MainActor (Int32) -> Void) throws -> ChildProcess {
+        var tail: LogTail?
+        let child = try ChildProcess(command: command, environment: environment, log: log) { status in
+            tail?.finish()
+            forget()
+            exited(status)
+        }
+        tail = LogTail(log, line: line)
+        keep(child)
+        return child
+    }
+
     /// Keeps `child` as the program this record names.
     func keep(_ child: ChildProcess) {
         guard let started = child.started else { return forget() }

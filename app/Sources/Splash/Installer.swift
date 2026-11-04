@@ -84,7 +84,6 @@ final class Installer {
     private var child: ChildProcess?
     /// A leftover download gets Ctrl+C, which removes its temporary files as it ends.
     let record: ChildRecord
-    private var tail: LogTail?
     private var cancelled = false
     private var reported: Failure?
     private var activity: NSObjectProtocol?
@@ -117,10 +116,11 @@ final class Installer {
         cancelled = false
         resetLog(log)
         do {
-            child = try ChildProcess(
-                command: runtime.installCommand(model),
+            child = try record.start(
+                runtime.installCommand(model),
                 environment: runtime.environment,
                 log: log,
+                line: { [weak self] in self?.received($0) },
                 exited: { [weak self] in self?.exited($0) }
             )
         } catch {
@@ -128,8 +128,6 @@ final class Installer {
             self.model = nil
             return
         }
-        record.keep(child!)
-        tail = LogTail(log) { [weak self] in self?.received($0) }
         // A download takes long; the Mac must not sleep through it.
         activity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiated, .idleSystemSleepDisabled], reason: "Downloading \(model)")
@@ -166,10 +164,7 @@ final class Installer {
     }
 
     private func exited(_ status: Int32) {
-        tail?.finish()
-        tail = nil
         child = nil
-        record.forget()
         activity.map(ProcessInfo.processInfo.endActivity)
         activity = nil
         guard let model else { return }
