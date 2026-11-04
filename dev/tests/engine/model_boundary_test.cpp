@@ -28,10 +28,10 @@ using splash::test::require;
 
 constexpr uint32_t kChunk = model::ExecutionLimits::prefillTokenBudget;
 // A streamed target whose K/V spills: four chunks' rows in up to 48
-// passes, the rows of one lane past a chunk, the history of one lane
-// streamed.
+// passes over its 48 layers, the rows of one lane past a chunk, the history
+// of one lane streamed.
 constexpr model::CommandLimits kLimits{
-    .commandRows = 4 * kChunk, .maximumPasses = 48, .lanesPastChunk = 1, .indexPageLanes = 1};
+    .commandRows = 4 * kChunk, .layers = 48, .maximumPasses = 48, .lanesPastChunk = 1, .indexPageLanes = 1};
 
 struct Command final {
   BatchPlan plan;
@@ -108,6 +108,15 @@ void testPassesTheModelDoesNotRunBreakThePassRule() {
   requireBreaks(inPasses(1, 3, 47), "passes", "more passes left than layers left broke no rule");
 }
 
+// The most passes bound a command's passes, not its layers: passes run from
+// a layer of the target whatever the most passes (4 of 48 layers here).
+void testTheMostPassesBoundPassesNotLayers() {
+  const model::CommandLimits fewPasses{.commandRows = kChunk, .layers = 48, .maximumPasses = 4};
+  requireKeeps(inPasses(1, 2, 24), "a second pass from layer 24 of 48 broke a rule where 4 passes run", fewPasses);
+  requireKeeps(inPasses(3, 4, 36), "the last of 4 passes from layer 36 broke a rule", fewPasses);
+  requireBreaks(inPasses(0, 5, 0), "passes", "5 passes broke no rule where 4 run", fewPasses);
+}
+
 void testRowsPastTheCommandsBreakTheRowRule() {
   requireBreaks(prefill({kChunk, kChunk, 2 * kChunk + 1}), "rows exceed", "a row past a command's broke no rule");
   requireKeeps(prefill({kChunk, kChunk, 2 * kChunk}), "a command's rows broke a rule");
@@ -124,6 +133,7 @@ void testTwoLanesPastAChunkBreakTheChunkRule() {
 // A model without GDN state lets every lane's rows run past a chunk.
 void testLanesPastAChunkAreTheModels() {
   const model::CommandLimits stateless{.commandRows = 4 * kChunk,
+                                       .layers = 48,
                                        .maximumPasses = 48,
                                        .lanesPastChunk = model::ExecutionLimits::maximumBatchWidth,
                                        .indexPageLanes = 1};
@@ -141,7 +151,7 @@ void testALaneEndingAtAChunkDoesNotRunPastIt() {
 void testStreamingLanesPastTheModelsBreakTheIndexRule() {
   requireBreaks(prefill({100, 100}, 2), "streams", "a prefill of two lanes over Index pages broke no rule");
   requireBreaks(prefill({100}, 1), "streams", "a streaming lane broke no rule where the model streams none",
-                {.commandRows = 4 * kChunk, .maximumPasses = 48, .indexPageLanes = 0});
+                {.commandRows = 4 * kChunk, .layers = 48, .maximumPasses = 48, .indexPageLanes = 0});
   // Each decode lane reads its spilled K/V through the hot block cache.
   requireKeeps(command(WorkKind::Decode, {0, 0, 0, 0}, 4), "a decode of four lanes over Index pages broke a rule");
 }
@@ -216,11 +226,11 @@ void testABlockSparseLayerSaturatesAtTheSelectionAndTail() {
 }
 
 // A model of the default work (Model::prefillWork) whose commands run in up
-// to 48 passes.
+// to 48 passes over 48 layers.
 class DefaultModel final : public model::Model {
 public:
   model::CommandLimits commandLimits() const noexcept override {
-    return {.commandRows = kChunk, .maximumPasses = 48, .lanesPastChunk = 1, .indexPageLanes = 1};
+    return {.commandRows = kChunk, .layers = 48, .maximumPasses = 48, .lanesPastChunk = 1, .indexPageLanes = 1};
   }
   StateAdmission begin(const ModelRequest &) override { return {}; }
   void suspend(uint64_t) override {}
@@ -258,7 +268,7 @@ void testTheDefaultLayerPairsIgnoreThePass() {
                  target.commandLimits());
     require(target.prefillWork(lanes, first, 19 - pass).layerAttentionPairs == whole,
             "pass " + std::to_string(pass) + " of 19 changed the default's pairs of a layer");
-    first = model::passLayers(first, 19 - pass, target.commandLimits().maximumPasses).end;
+    first = model::passLayers(first, 19 - pass, target.commandLimits().layers).end;
   }
 }
 
@@ -269,6 +279,7 @@ int main() {
     testCommandsWithinTheLimitsBreakNoRule();
     testAWideCommandBreaksTheWidth();
     testPassesTheModelDoesNotRunBreakThePassRule();
+    testTheMostPassesBoundPassesNotLayers();
     testRowsPastTheCommandsBreakTheRowRule();
     testTwoLanesPastAChunkBreakTheChunkRule();
     testLanesPastAChunkAreTheModels();

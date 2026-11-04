@@ -141,6 +141,7 @@ void testLimitsAreTheRuntimes() {
   for (const auto &runtime : runtimes) {
     const model::CommandLimits limits = model::commandLimits(runtime.geometry, 0);
     require(limits == model::CommandLimits{.commandRows = runtime.rows,
+                                           .layers = runtime.geometry.target.layers,
                                            .maximumPasses = runtime.geometry.target.layers,
                                            .lanesPastChunk = 1,
                                            .indexPageLanes = runtime.streams,
@@ -151,7 +152,8 @@ void testLimitsAreTheRuntimes() {
     // chunk's rows) is the fewest rows of a command at its rate.
     for (const uint32_t least : {512u, 640u, kChunk}) {
       const model::CommandLimits split = model::commandLimits(runtime.geometry, least);
-      require(split.maximumPasses == 1, "a runtime with the Neural Engine's FFN split ran passes");
+      require(split.maximumPasses == 1 && split.layers == runtime.geometry.target.layers,
+              "a runtime with the Neural Engine's FFN split ran passes, or its commands lost layers");
       require(split.minimumUnitRows == least, "a runtime with the Neural Engine's FFN split from " +
                                                   std::to_string(least) + " rows planned units from " +
                                                   std::to_string(split.minimumUnitRows));

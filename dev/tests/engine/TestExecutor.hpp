@@ -541,10 +541,12 @@ public:
       submitObserver();
     return ticket;
   }
-  // A command holds groupRows rows in up to `passes` passes, the rows of one
-  // lane at most past a chunk, and streams the history of one lane at most.
+  // A command holds groupRows rows in up to `passes` passes over as many
+  // layers, the rows of one lane at most past a chunk, and streams the
+  // history of one lane at most.
   model::CommandLimits commandLimits() const noexcept override {
     return {.commandRows = groupRows,
+            .layers = passes,
             .maximumPasses = passes,
             .lanesPastChunk = 1,
             .indexPageLanes = 1,
@@ -914,8 +916,8 @@ public:
   // The most rows of a prefill command (CommandLimits::commandRows): a
   // chunk's, or a prefill group's, as where experts stream.
   uint32_t groupRows = model::ExecutionLimits::prefillTokenBudget;
-  // The most passes over its layers a prefill command runs in
-  // (CommandLimits::maximumPasses).
+  // The target's layers, over which a prefill command runs in as many passes
+  // at most (CommandLimits::layers, maximumPasses).
   uint32_t passes = 1;
   // Whether its experts stream (CommandLimits::streamsWeights).
   bool streamedExperts = false;

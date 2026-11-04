@@ -1709,7 +1709,7 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
 // (BatchPlan::passes), each its own command, leaves what it leaves run
 // whole: its score logits, KV, GDN cell, PLE history, lengths, draft rings
 // and window, and the states it captures, at three passes and at one a
-// layer (CommandLimits::maximumPasses), and with an image its first pass
+// layer (CommandLimits::layers), and with an image its first pass
 // encodes when the target serves vision; so does each lane of a command of
 // two, each capturing a state inside its rows and one at their end. On a
 // runtime whose commands hold a prefill group's chunks, the command spans
@@ -1774,7 +1774,7 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
       }
       BatchPlan plan{
           .kind = WorkKind::Prefill, .items = {{id, rows}}, .decodeStage = DecodeStage::Regular, .passes = split};
-      for (; plan.pass < split; plan = followingPass(plan, executor.commandLimits().maximumPasses)) {
+      for (; plan.pass < split; plan = followingPass(plan, executor.commandLimits().layers)) {
         const uint32_t pass = plan.pass;
         std::vector<ModelStepResult> results = executor.submit(plan, std::span(&item, 1), {})->wait();
         require(results.size() == 1 && results[0].requestId == id && results[0].failure.empty(),
@@ -1864,7 +1864,7 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
       items.push_back(std::move(item));
     }
     std::vector<ModelStepResult> last;
-    for (; plan.pass < split; plan = followingPass(plan, executor.commandLimits().maximumPasses)) {
+    for (; plan.pass < split; plan = followingPass(plan, executor.commandLimits().layers)) {
       const uint32_t pass = plan.pass;
       std::vector<ModelStepResult> results = executor.submit(plan, items, {})->wait();
       require(results.size() == 2 && results[0].requestId == ids[0] && results[1].requestId == ids[1] &&
@@ -3576,7 +3576,7 @@ public:
                    .items = {{request.id, end - position}},
                    .decodeStage = DecodeStage::Regular,
                    .passes = passes};
-    for (; plan.pass < passes; plan = followingPass(plan, runtime_->commandLimits().maximumPasses)) {
+    for (; plan.pass < passes; plan = followingPass(plan, runtime_->commandLimits().layers)) {
       const uint32_t pass = plan.pass;
       results = runtime_->submit(plan, items, {})->wait();
       if (pass + 1 == passes) break;

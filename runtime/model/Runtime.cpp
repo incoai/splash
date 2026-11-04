@@ -1143,8 +1143,7 @@ struct Runtime::Impl {
   // BatchPlan::layer, an even share of the layers left over the passes left
   // (model::passLayers), all of them for a command that runs whole.
   [[nodiscard]] QwenPrefillLayers passLayers(const BatchPlan &plan) const noexcept {
-    const LayerRange layers =
-        splash::model::passLayers(plan.layer, plan.passes - plan.pass, geometry.target.layers);
+    const LayerRange layers = splash::model::passLayers(plan.layer, plan.passes - plan.pass, limits.layers);
     return {layers.first, layers.end};
   }
 

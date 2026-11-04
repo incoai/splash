@@ -25,8 +25,9 @@ struct LayerRange final {
 // The constant ones stay in ExecutionLimits (maximumBatchWidth, prefillTokenBudget).
 struct CommandLimits final {
   uint32_t commandRows = 0;      // rows of one command, all lanes: prefillTokenBudget * RuntimeGeometry::prefillChunks
-  uint32_t maximumPasses = 1;    // the target's layers; 1 with the Neural Engine FFN split
-                                 // (QwenTarget::requirePrefill)
+  uint32_t layers = 1;           // the target's layers, over which passes run (BatchPlan::layer, passLayers)
+  uint32_t maximumPasses = 1;    // the most passes of one command: a layer each, so `layers`; 1 with the Neural
+                                 // Engine FFN split, which takes a chunk's layers whole (QwenTarget::requirePrefill)
   uint32_t minimumUnitRows = 1;  // the fewest rows of a command its faster path takes: with the Neural Engine FFN
                                  // split the least rows of a chunk it takes (ops::AneFfn::minimumRows), as fewer
                                  // run the FFN on the GPU alone at a higher cost a row; else 1. A planning bound

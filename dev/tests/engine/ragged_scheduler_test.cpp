@@ -39,6 +39,7 @@ constexpr double kGap = 500.0;
 model::CommandLimits limits(uint32_t commandRows = kChunk, uint32_t passes = 1, uint32_t indexPageLanes = 1,
                             uint64_t attentionPairs = std::numeric_limits<uint64_t>::max()) {
   return {.commandRows = commandRows,
+          .layers = passes,
           .maximumPasses = passes,
           .lanesPastChunk = 1,
           .indexPageLanes = indexPageLanes,

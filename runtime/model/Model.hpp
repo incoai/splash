@@ -311,7 +311,7 @@ struct BatchPlan final {
   std::vector<BatchItem> items;
   DecodeStage decodeStage = DecodeStage::Regular;
   // A prefill command may run in passes over the target's layers
-  // (CommandLimits::maximumPasses), every one of the same items: this
+  // (CommandLimits::layers, maximumPasses), every one of the same items: this
   // command is pass `pass` of `passes` and runs from layer `layer`, 0 for
   // its first pass, an even share of the layers left over the passes left
   // (model::passLayers). The passes left may be planned again after a pass
@@ -635,16 +635,16 @@ static_assert(ExecutionLimits::targetVerifyRows ==
               ExecutionLimits::draftQueryRows);
 
 // The first rule a command breaks, or none: at most maximumBatchWidth
-// lanes; and for a prefill, pass `pass` of its passes, from layer 0 for the
-// first and past it for a later one, with no more passes left than layers
-// left of maximumPasses, at most commandRows rows, at most lanesPastChunk
-// lanes whose rows run past a chunk as the lanes fill the chunks in order,
-// and at most indexPageLanes lanes whose history holds Index pages. Any lane
-// of a decode may hold Index pages: each reads its spilled K/V through the
-// hot block cache (Runtime::Impl::decodeReads). CommandLimits::
-// attentionPairs and minimumUnitRows bound planning and are not checked
-// here. Neither the runtime nor the engine tests' model runs a command that
-// breaks one.
+// lanes; and for a prefill, pass `pass` of at most maximumPasses passes,
+// from layer 0 for the first and past it for a later one, with no more
+// passes left than layers left of the target's `layers`, at most
+// commandRows rows, at most lanesPastChunk lanes whose rows run past a chunk
+// as the lanes fill the chunks in order, and at most indexPageLanes lanes
+// whose history holds Index pages. Any lane of a decode may hold Index
+// pages: each reads its spilled K/V through the hot block cache.
+// CommandLimits::attentionPairs and minimumUnitRows bound planning and are
+// not checked here. Neither the runtime nor the engine tests' model runs a
+// command that breaks one.
 [[nodiscard]] inline std::optional<std::string_view>
 commandViolation(const CommandLimits &limits, const BatchPlan &plan,
                  std::span<const ModelBatchItem> items) noexcept {
@@ -652,8 +652,8 @@ commandViolation(const CommandLimits &limits, const BatchPlan &plan,
     return "a command's lanes exceed the batch width";
   if (plan.kind != WorkKind::Prefill)
     return std::nullopt;
-  if (plan.pass >= plan.passes || !plan.pass != !plan.layer ||
-      plan.layer + (plan.passes - plan.pass) > limits.maximumPasses)
+  if (plan.pass >= plan.passes || plan.passes > limits.maximumPasses || !plan.pass != !plan.layer ||
+      plan.layer + (plan.passes - plan.pass) > limits.layers)
     return "a prefill command's passes are not ones the runtime runs";
   constexpr uint64_t chunk = ExecutionLimits::prefillTokenBudget;
   uint64_t rows = 0;

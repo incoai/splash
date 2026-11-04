@@ -1437,7 +1437,7 @@ std::vector<ModelStepResult> prefillInPasses(model::Runtime &runtime, uint64_t i
   try {
     BatchPlan plan{
         .kind = WorkKind::Prefill, .items = {{id, tokens}}, .decodeStage = DecodeStage::Regular, .passes = passes};
-    for (; plan.pass < passes; plan = followingPass(plan, runtime.commandLimits().maximumPasses)) {
+    for (; plan.pass < passes; plan = followingPass(plan, runtime.commandLimits().layers)) {
       const uint32_t pass = plan.pass;
       results = runtime.submit(plan, std::span(&item, 1), {})->wait();
       require(results.size() == 1 && results[0].failure.empty() &&
@@ -1482,6 +1482,7 @@ void testDenseRuntimeBoundary(const char *metallibPath) {
   rejects([&] { static_cast<void>(prefillInPasses(*runtime, 901, 64, layers + 1)); }, "passes are not ones",
           "a command in more passes than the target's layers ran");
   require(runtime->commandLimits() == model::CommandLimits{.commandRows = kChunk,
+                                                           .layers = layers,
                                                            .maximumPasses = layers,
                                                            .lanesPastChunk = 1,
                                                            .indexPageLanes = 0,
@@ -1516,6 +1517,7 @@ void testStreamedRuntimeBoundary(RuntimeResourcesConfig moe) {
   const std::unique_ptr<model::Runtime> runtime = runtimeOf(*resources);
   require(resources->streamedExpertStats().has_value(), "the MoE start did not stream its experts");
   require(runtime->commandLimits() == model::CommandLimits{.commandRows = 4 * kChunk,
+                                                           .layers = kMoeLayers,
                                                            .maximumPasses = kMoeLayers,
                                                            .lanesPastChunk = 1,
                                                            .indexPageLanes = 0,
@@ -1578,6 +1580,7 @@ void testSpilledRuntimeBoundary(const char *metallibPath) {
   const std::unique_ptr<model::Runtime> runtime = runtimeOf(*resources);
   const uint32_t layers = std::get<model::Qwen4ExpLayout>(config.model.target).layers;
   require(runtime->commandLimits() == model::CommandLimits{.commandRows = 4 * kChunk,
+                                                           .layers = layers,
                                                            .maximumPasses = layers,
                                                            .lanesPastChunk = 1,
                                                            .indexPageLanes = 1,

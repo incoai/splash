@@ -111,11 +111,12 @@ struct RuntimeGeometry final {
 };
 
 // What one prefill command of a runtime of `geometry` may hold: its chunks'
-// rows; a pass per target layer, or with the Neural Engine's FFN split one,
-// as the split takes a chunk's layers whole (QwenTarget::requirePrefill),
-// and at the rate of its larger commands from the least rows of a chunk the
-// split takes (`aneFfnRows`, ops::AneFfn::minimumRows; 0 without the split);
-// one lane whose rows run past a chunk, as a prefill group passes each
+// rows; passes over the target's layers, at most one a layer, or with the
+// Neural Engine's FFN split one, as the split takes a chunk's layers whole
+// (QwenTarget::requirePrefill), and at the rate of its larger commands from
+// the least rows of a chunk the split takes (`aneFfnRows`,
+// ops::AneFfn::minimumRows; 0 without the split); one lane whose rows run
+// past a chunk, as a prefill group passes each
 // lane's state between its parts through its one scratch cell
 // (PrefillArena::groupCell); the history of one lane streamed
 // (KvHistoryStream) where K/V spills, none where it stays in memory; whether
@@ -123,6 +124,7 @@ struct RuntimeGeometry final {
 // at the end of the native window.
 [[nodiscard]] inline CommandLimits commandLimits(const RuntimeGeometry &geometry, uint32_t aneFfnRows) noexcept {
   return {.commandRows = geometry.prefillChunks * kPrefillRows,
+          .layers = geometry.target.layers,
           .maximumPasses = aneFfnRows ? 1u : geometry.target.layers,
           .minimumUnitRows = aneFfnRows ? aneFfnRows : 1u,
           .lanesPastChunk = 1,
