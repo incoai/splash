@@ -156,29 +156,16 @@ struct RuntimeGeometry final {
 }
 
 // What a pass from layer `first` with `passesLeft` passes left (passLayers)
-// of a prefill command of `lanes` computes on `target`, the lanes filling
-// its chunks in order (Model::prefillWork): each attention layer's pairs
-// over the lanes' rows at its reach, the most of them over every attention
-// layer whatever the pass (a pass does not split a layer), and over the
-// pass's layers their sum and the scores of a block index, which scores
-// each lane's part of a chunk apart (Qwen4ExpTarget's prefill). What the
-// pass reads is the runtime's to add.
+// of a prefill command of `lanes` computes on `target` (Model::prefillWork):
+// each attention layer's pairs over the lanes' rows at its reach, the most of
+// them over every attention layer whatever the pass (a pass does not split a
+// layer), and their sum over the pass's layers. What the pass reads is the
+// runtime's to add.
 [[nodiscard]] inline CommandWork prefillCommandWork(const QwenTargetGeometry &target,
                                                     std::span<const PrefillLane> lanes, uint32_t first,
                                                     uint32_t passesLeft) noexcept {
   const LayerRange run = passLayers(first, passesLeft, target.layers);
-  CommandWork work{.lanes = static_cast<uint32_t>(lanes.size()), .layers = run.end - run.first};
-  const bool selectsBlocks = target.kvLayout.reads == kv::Reads::SelectedBlocks;
-  uint64_t scores = 0;
-  for (const PrefillLane &lane : lanes) {
-    for (uint32_t done = 0; selectsBlocks && done < lane.rows;) {
-      const uint32_t part = std::min(lane.rows - done, kPrefillRows - (work.rows + done) % kPrefillRows);
-      scores += indexPairs(uint64_t{lane.position} + done, part, target.indexerBlockTokens, target.indexerTopBlocks);
-      done += part;
-    }
-    work.rows += lane.rows;
-  }
-  work.chunks = (work.rows + kPrefillRows - 1) / kPrefillRows;
+  CommandWork work;
   for (uint32_t layer = 0, attention = 0; layer < target.layers; ++layer) {
     if (!target.isFullAttentionLayer(layer))
       continue;
@@ -187,10 +174,8 @@ struct RuntimeGeometry final {
     for (const PrefillLane &lane : lanes)
       pairs += attentionPairs(reach, lane.position, lane.rows);
     work.layerAttentionPairs = std::max(work.layerAttentionPairs, pairs);
-    if (layer >= run.first && layer < run.end) {
+    if (layer >= run.first && layer < run.end)
       work.attentionPairs += pairs;
-      work.indexPairs += scores;
-    }
   }
   return work;
 }

@@ -10,12 +10,12 @@
 // never lower a layer's pairs; Flint past its native window exceeds it as a
 // dense target does, its full-history layers being the heaviest; Flash-Next
 // keeps its group within 3.2 % of it at any depth. A
-// command holds its chunks' rows, a pass a layer (one with the Neural
-// Engine's FFN split, whose least chunk is the fewest rows of a command at
-// its rate), one lane past a chunk, and one lane's streamed history where K/V
-// spills. A pass counts the pairs and block-index scores of its own
-// layers, and the heaviest layer's pairs of the target whatever the pass; a
-// block index scores each lane's part of a chunk apart.
+// command holds its chunks' rows, passes over the target's layers at a pass
+// a layer (one with the Neural Engine's FFN split, whose least chunk is the
+// fewest rows of a command at its rate), one lane past a chunk, and one
+// lane's streamed history where K/V spills. A pass counts the pairs of its
+// own layers, and the heaviest layer's pairs of the target whatever the
+// pass.
 #include "TestChecks.hpp"
 #include "model/Flint.hpp"
 #include "model/Qwen3_6Moe.hpp"
@@ -169,50 +169,17 @@ void testPassesCountTheirOwnLayers() {
         {{.position = 300, .rows = 1500}, {.position = 140'000, .rows = 3000}}};
     const model::CommandWork whole = model::prefillCommandWork(geometry.target, lanes, 0, 1);
     for (const uint32_t passes : {3u, geometry.target.layers}) {
-      model::CommandWork summed{};
+      uint64_t summed = 0;
       for (uint32_t pass = 0, first = 0; pass < passes; ++pass) {
         const model::CommandWork work = model::prefillCommandWork(geometry.target, lanes, first, passes - pass);
-        first += work.layers;
-        require(work.lanes == whole.lanes && work.rows == whole.rows && work.chunks == whole.chunks &&
-                    work.layerAttentionPairs == whole.layerAttentionPairs,
-                "a pass's lanes, rows, chunks or heaviest layer's pairs are not the command's");
-        summed.layers += work.layers;
-        summed.attentionPairs += work.attentionPairs;
-        summed.indexPairs += work.indexPairs;
+        require(work.layerAttentionPairs == whole.layerAttentionPairs,
+                "a pass's heaviest layer's pairs are not the command's");
+        summed += work.attentionPairs;
+        first = model::passLayers(first, passes - pass, geometry.target.layers).end;
       }
-      require(summed.layers == whole.layers && summed.attentionPairs == whole.attentionPairs &&
-                  summed.indexPairs == whole.indexPairs && whole.layers == geometry.target.layers,
-              "a command's passes did not count its layers' pairs and scores once each");
+      require(summed == whole.attentionPairs, "a command's passes did not count its layers' pairs once each");
     }
   }
-}
-
-// The block index scores of `rows` rows from `position` as the indexer
-// dispatches them, row by row.
-uint64_t scoresByRow(uint64_t position, uint32_t rows, uint32_t blockTokens, uint32_t topBlocks) {
-  if ((position + rows) / blockTokens <= topBlocks) return 0;
-  uint64_t scores = 0;
-  for (uint64_t row = position; row < position + rows; ++row) scores += (row + 1) / blockTokens;
-  return scores;
-}
-
-void testBlockIndexScoresEachPartOfAChunk() {
-  const model::Qwen4ExpLayout layout;
-  const model::RuntimeGeometry geometry = geometryOf<model::Qwen4ExpLayout>(true, true);
-  const uint32_t block = layout.indexerBlockTokens, top = layout.indexerTopBlocks;
-  // The first lane's 1000 rows attend densely; the second's run past the
-  // first chunk, in a part of 1048 rows and one of 1952.
-  const std::array<model::PrefillLane, 2> lanes{{{.position = 0, .rows = 1000}, {.position = 131'072, .rows = 3000}}};
-  const uint64_t perLayer =
-      scoresByRow(131'072, 1048, block, top) + scoresByRow(131'072 + 1048, 1952, block, top);
-  require(scoresByRow(0, 1000, block, top) == 0 && model::indexPairs(0, 1000, block, top) == 0 &&
-              model::indexPairs(131'072, 1048, block, top) == scoresByRow(131'072, 1048, block, top),
-          "a block index's scores are not each row's complete blocks, or rows that attend densely scored some");
-  require(model::prefillCommandWork(geometry.target, lanes, 0, 1).indexPairs ==
-              perLayer * layout.attentionLayerCount(),
-          "a command's block-index scores are not its lanes' parts of chunks', over its attention layers");
-  require(model::prefillCommandWork(geometryOf<model::Qwen3_6MoeLayout>(true).target, lanes, 0, 1).indexPairs == 0,
-          "a target without a block index scored blocks");
 }
 
 } // namespace
@@ -226,7 +193,6 @@ int main() {
     testFlashNextKeepsItsGroupAtAnyDepth();
     testLimitsAreTheRuntimes();
     testPassesCountTheirOwnLayers();
-    testBlockIndexScoresEachPartOfAChunk();
     std::cout << "command limits tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

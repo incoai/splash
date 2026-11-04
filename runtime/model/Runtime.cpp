@@ -1540,8 +1540,7 @@ struct Runtime::Impl {
       return results;
     };
     // It selects from rows the prompts left, through no layer.
-    return std::make_unique<DeferredMetalTicket>(std::move(command), std::move(finish),
-                                                 WorkCount({.lanes = width}, nullptr));
+    return std::make_unique<DeferredMetalTicket>(std::move(command), std::move(finish), WorkCount({}, nullptr));
   }
 
   ChunkedPrefillParams chunkParams(uint64_t logicalPosition,
@@ -3271,10 +3270,8 @@ Runtime::decodeAsync(const BatchPlan &plan,
                                {logicalPositions.data(), width},
                                {maximumRetained.data(), width}, constrained);
   std::shared_ptr<SpilledKvReads> reads = impl_->decodeReads(items);
-  // The rows its graph verifies over every layer of the target, the weights
-  // it reads on demand and the hot blocks it resolves.
-  WorkCount count({.lanes = width, .rows = ropeRows, .layers = impl_->geometry.target.layers},
-                  impl_->model.expertStore(), impl_->blockCache);
+  // The weights it reads on demand and the hot blocks it resolves.
+  WorkCount count({}, impl_->model.expertStore(), impl_->blockCache);
   if (constrained) {
     return std::make_unique<Impl::ConstrainedDecodeTicket>(*impl_, std::move(lanes), items, std::move(reads),
                                                            commandGraph, std::move(count), std::move(completion));

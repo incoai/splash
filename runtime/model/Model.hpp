@@ -880,19 +880,15 @@ public:
   [[nodiscard]] virtual CommandLimits commandLimits() const noexcept {
     return {.commandRows = ExecutionLimits::prefillTokenBudget, .lanesPastChunk = 1};
   }
-  // By default a command's lanes, rows, chunks and the attention pairs of
-  // one layer, each row attending to every key up to its own
-  // (model::denseAttentionPairs, which engine code does not include), in
-  // any of its passes, over no layers and with nothing read.
+  // By default the attention pairs of one layer, each row attending to every
+  // key up to its own (model::denseAttentionPairs, which engine code does not
+  // include), in any of its passes, with nothing read.
   [[nodiscard]] CommandWork prefillWork(std::span<const PrefillLane> lanes, uint32_t,
                                         uint32_t) const override {
-    CommandWork work{.lanes = static_cast<uint32_t>(lanes.size())};
-    for (const PrefillLane &lane : lanes) {
-      work.rows += lane.rows;
+    CommandWork work;
+    for (const PrefillLane &lane : lanes)
       work.attentionPairs += lane.rows * uint64_t{lane.position} + uint64_t{lane.rows} * (lane.rows + 1) / 2;
-    }
     work.layerAttentionPairs = work.attentionPairs;
-    work.chunks = (work.rows + ExecutionLimits::prefillTokenBudget - 1) / ExecutionLimits::prefillTokenBudget;
     return work;
   }
   // Releases one pooled state buffer no lane holds (keepLane keeps those one

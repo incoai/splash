@@ -1069,8 +1069,7 @@ private:
         lanes.push_back({.position = static_cast<uint32_t>(item.logicalPosition),
                          .rows = item.tokenCount,
                          .indexPages = item.pageSources ? item.pageSources->indexPages() : 0});
-      const model::CommandWork work = timing->prefillWork(lanes, plan.layer, plan.passes - plan.pass);
-      times = prefillTimes(profile, work);
+      times = timing->times(lanes, plan.layer, plan.passes - plan.pass);
     } else {
       const auto width = static_cast<uint32_t>(items.size());
       const uint32_t rows = width * model::ExecutionLimits::targetVerifyRows;
@@ -1083,10 +1082,7 @@ private:
               ? std::min(routed, static_cast<uint64_t>(decodeBytesPerToken(profile, share) * rows /
                                                        double(profile.experts.expertBytes)))
               : 0;
-      times.sample.work = {.lanes = width,
-                           .rows = rows,
-                           .layers = profile.layers,
-                           .weightReadBytes = misses * profile.experts.expertBytes};
+      times.sample.work = {.weightReadBytes = misses * profile.experts.expertBytes};
     }
     if (profile.noise)
       times.wallMilliseconds *= std::max(0.0, 1.0 + profile.noise * std::normal_distribution<double>()(noise_));

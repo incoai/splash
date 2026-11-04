@@ -36,7 +36,7 @@ test::CommandTimes timesOf(const TimingProfile &profile, const MeasuredCommand &
   if (command.warmup)
     return work.warmupTimes(command.rows);
   const model::PrefillLane lane{.rows = command.rows};
-  return test::prefillTimes(profile, work.prefillWork({&lane, 1}, 0, 1));
+  return work.times({&lane, 1}, 0, 1);
 }
 
 // The worst and mean relative error of a profile's walls on its commands.
@@ -59,7 +59,7 @@ double promptMilliseconds(const TimingProfile &profile, const MeasuredPrompt &pr
   for (uint32_t done = 0; done < prompt.rows;) {
     const model::PrefillLane lane{.position = prompt.position + done,
                                   .rows = std::min(prompt.rows - done, model::ExecutionLimits::prefillTokenBudget)};
-    total += test::prefillTimes(profile, work.prefillWork({&lane, 1}, 0, 1)).wallMilliseconds;
+    total += work.times({&lane, 1}, 0, 1).wallMilliseconds;
     done += lane.rows;
   }
   return total;
@@ -120,8 +120,8 @@ void testHalvingTheResidencyAddsItsReadTime() {
     const TimedWork half(*profile, [&] { return share / 2; });
     const model::CommandWork fullWork = full.prefillWork({&lane, 1}, 0, 1);
     const model::CommandWork halfWork = half.prefillWork({&lane, 1}, 0, 1);
-    const test::CommandTimes before = test::prefillTimes(*profile, fullWork);
-    const test::CommandTimes after = test::prefillTimes(*profile, halfWork);
+    const test::CommandTimes before = full.times({&lane, 1}, 0, 1);
+    const test::CommandTimes after = half.times({&lane, 1}, 0, 1);
     require(halfWork.weightReadBytes > fullWork.weightReadBytes && after.wallMilliseconds > before.wallMilliseconds &&
                 std::abs((after.wallMilliseconds - before.wallMilliseconds) -
                          (after.hostWaitMilliseconds - before.hostWaitMilliseconds)) < 1e-6,
@@ -144,7 +144,7 @@ void testAStoreLessCommandPaysItsHistoryReads() {
   const TimedWork work(profile);
   const auto times = [&](uint32_t indexPages) {
     const model::PrefillLane lane{.position = 65'536, .rows = 2048, .indexPages = indexPages};
-    return test::prefillTimes(profile, work.prefillWork({&lane, 1}, 0, 1));
+    return work.times({&lane, 1}, 0, 1);
   };
   const test::CommandTimes resident = times(0);
   require(resident.hostWaitMilliseconds == 0,
@@ -195,21 +195,21 @@ void testThePassesSplitTheLayersAndTheirWork() {
   for (const TimingProfile *profile : {&test::kM6FlashNextQ2, &test::kFlint}) {
     const TimedWork work(*profile);
     const model::PrefillLane lanes[] = {{.position = 70'000, .rows = 6000, .indexPages = 100}, {.rows = 2000}};
-    const model::CommandWork whole = work.prefillWork(lanes, 0, 1);
-    model::CommandWork sum;
+    const test::TimedCommand whole = work.command(lanes, 0, 1);
+    test::TimedCommand sum;
     for (uint32_t pass = 0; pass < profile->layers; ++pass) {
-      const model::CommandWork part = work.prefillWork(lanes, pass, profile->layers - pass);
-      require(part.rows == whole.rows && part.chunks == whole.chunks && part.lanes == 2,
-              "a pass does not run the command's rows");
+      const test::TimedCommand part = work.command(lanes, pass, profile->layers - pass);
+      require(part.rows == whole.rows && part.chunks == whole.chunks, "a pass does not run the command's rows");
       sum.layers += part.layers;
-      sum.attentionPairs += part.attentionPairs;
+      sum.work.attentionPairs += part.work.attentionPairs;
       sum.indexPairs += part.indexPairs;
-      sum.weightReadBytes += part.weightReadBytes;
-      sum.spilledKvReadBytes += part.spilledKvReadBytes;
+      sum.work.weightReadBytes += part.work.weightReadBytes;
+      sum.work.spilledKvReadBytes += part.work.spilledKvReadBytes;
     }
-    require(sum.layers == whole.layers && sum.attentionPairs == whole.attentionPairs &&
-                sum.indexPairs == whole.indexPairs && sum.weightReadBytes <= whole.weightReadBytes &&
-                whole.weightReadBytes - sum.weightReadBytes < 64 && sum.spilledKvReadBytes == whole.spilledKvReadBytes,
+    require(sum.layers == whole.layers && sum.work.attentionPairs == whole.work.attentionPairs &&
+                sum.indexPairs == whole.indexPairs && sum.work.weightReadBytes <= whole.work.weightReadBytes &&
+                whole.work.weightReadBytes - sum.work.weightReadBytes < 64 &&
+                sum.work.spilledKvReadBytes == whole.work.spilledKvReadBytes,
             std::string(profile->name) + ": the passes' work does not add up to the command's");
   }
   // Flint: the full-attention layers compute every key, the windowed ones at
@@ -240,7 +240,7 @@ void testEveryPassReportsTheTargetsHeaviestLayer() {
                 std::string(profile->name) + ": pass " + std::to_string(pass) + " of " + std::to_string(passes) +
                     " reports " + std::to_string(part.layerAttentionPairs) +
                     " pairs in a layer, not the target's heaviest layer's " + std::to_string(whole));
-        first += part.layers;
+        first = model::passLayers(first, passes - pass, profile->layers).end;
       }
   }
   require(TimedWork(test::kM6FlashNextQ2).prefillWork(lanes, 0, 1).layerAttentionPairs ==
@@ -276,15 +276,15 @@ void testEveryProfileIsWhole() {
 // A ticket's sample is its times' work with its wall; a timed ticket is not
 // ready before the clock reaches its end and cannot complete before.
 void testTicketsSampleTheirWorkAndWaitForTheirEnd() {
-  const test::CommandTimes times{.wallMilliseconds = 40.0, .sample = {.work = {.lanes = 1, .rows = 300}}};
+  const test::CommandTimes times{.wallMilliseconds = 40.0, .sample = {.work = {.attentionPairs = 300}}};
   const model::CommandSample sample = test::ImmediateTicket({}, times).sample();
-  require(sample.work.rows == 300 && sample.wallMilliseconds == 40.0, "a ticket's sample is not its times");
+  require(sample.work.attentionPairs == 300 && sample.wallMilliseconds == 40.0, "a ticket's sample is not its times");
   double now = 10.0;
   test::TimedTicket ticket({}, times, [&] { return now; }, 50.0);
   require(!ticket.ready(), "a timed ticket was ready before its end");
   test::rejects([&] { static_cast<void>(ticket.wait()); }, "before its end", "a timed ticket completed early");
   now = 50.0;
-  require(ticket.ready() && ticket.sample().work.rows == 300, "a timed ticket was not ready at its end");
+  require(ticket.ready() && ticket.sample().work.attentionPairs == 300, "a timed ticket was not ready at its end");
 }
 
 // On the harness's clock a command takes the profile's time: the first
@@ -303,9 +303,7 @@ void testTheHarnessClockRunsCommandsForTheirTime() {
   require(commands.size() == 4 && commands[0].kind == WorkKind::Prefill && commands[0].rows == std::vector<uint32_t>{305},
           "the record is not the prefill and three decodes");
   const model::PrefillLane lane{.rows = 305};
-  const double prefill =
-      test::prefillTimes(test::kM6FlashNextQ2, TimedWork(test::kM6FlashNextQ2).prefillWork({&lane, 1}, 0, 1))
-          .wallMilliseconds;
+  const double prefill = TimedWork(test::kM6FlashNextQ2).times({&lane, 1}, 0, 1).wallMilliseconds;
   require(commands[0].startMilliseconds == 1.0 && commands[0].wallMilliseconds == prefill,
           "the prefill did not take the profile's time");
   for (size_t index = 1; index < commands.size(); ++index)

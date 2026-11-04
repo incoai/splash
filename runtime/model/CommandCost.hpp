@@ -56,17 +56,12 @@ struct PrefillLane final {
   bool operator==(const PrefillLane &) const = default;
 };
 
-// What a command or one pass of it does. Counts cover the layers the pass runs.
+// What a command or one pass of it does, as planning and the decode gap's attribution read it.
 struct CommandWork final {
-  uint32_t lanes = 0;
-  uint32_t rows = 0;                // prefill: prompt rows; decode: verify rows of all lanes
-  uint32_t chunks = 0;              // prefill chunks the rows fill in order; 0 for decode
-  uint32_t layers = 0;              // target layers run
   uint64_t attentionPairs = 0;      // query-key pairs over the attention layers run, each within its reach
   uint64_t layerAttentionPairs = 0; // the lanes' query-key pairs in the heaviest attention layer of the target, each
                                     // layer at its reach, over all its layers whatever the pass (a pass does not
                                     // split a layer); compared with CommandLimits::attentionPairs
-  uint64_t indexPairs = 0;          // rows * complete blocks a block index scores, over the layers run; 0 without one
   uint64_t weightReadBytes = 0;     // weights read from the SSD on demand (streamed experts)
   uint64_t spilledKvReadBytes = 0;  // spilled K/V read from the SSD: a streaming lane's history, a decode's hot-block
                                     // misses

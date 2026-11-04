@@ -194,10 +194,8 @@ struct PassingEngine {
       if (plan.kind == WorkKind::Decode)
         return test::CommandTimes{.wallMilliseconds = 100.0};
       if (targetTimes)
-        return test::CommandTimes{
-            .wallMilliseconds =
-                test::prefillTimes(test::passingTarget(), model.prefillWork(lanes, plan.layer, plan.passes - plan.pass))
-                    .wallMilliseconds};
+        return test::CommandTimes{.wallMilliseconds =
+                                      model.timing->times(lanes, plan.layer, plan.passes - plan.pass).wallMilliseconds};
       uint32_t rows = 0;
       for (const model::PrefillLane &lane : lanes)
         rows += lane.rows;

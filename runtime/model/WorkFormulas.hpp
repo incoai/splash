@@ -1,8 +1,8 @@
 #pragma once
 
-// The formulas behind a model's CommandWork counts (model/CommandCost.hpp): the query-key pairs an attention
-// layer's rows compute at its reach and the scores a block indexer computes. Model internals: the engine plans
-// from the counts a model reports, never from these.
+// The formula behind a model's CommandWork pairs (model/CommandCost.hpp): the query-key pairs an attention
+// layer's rows compute at its reach. Model internals: the engine plans from the counts a model reports, never
+// from these.
 
 #include <algorithm>
 #include <cstdint>
@@ -47,19 +47,6 @@ struct AttentionReach final {
 // The pairs of `rows` rows from `position` that each attend to every key up to their own.
 [[nodiscard]] constexpr uint64_t denseAttentionPairs(uint64_t position, uint32_t rows) noexcept {
   return attentionPairs({}, position, rows);
-}
-// The scores a block indexer computes for `rows` rows from `position` that it dispatches together: each row's
-// complete blocks of blockTokens, its own key included (ops::BlockIndexer::completeBlocks), summed over the
-// rows when one of them has more than topBlocks of them and attends sparsely (ops::BlockIndexer::sparse), none
-// otherwise.
-[[nodiscard]] constexpr uint64_t indexPairs(uint64_t position, uint32_t rows, uint32_t blockTokens,
-                                            uint32_t topBlocks) noexcept {
-  // The complete blocks summed over rows of 1 to `keys` keys.
-  const auto blocks = [blockTokens](uint64_t keys) {
-    const uint64_t whole = keys / blockTokens;
-    return whole ? blockTokens * (whole * (whole - 1) / 2) + whole * (keys % blockTokens + 1) : 0;
-  };
-  return (position + rows) / blockTokens > topBlocks ? blocks(position + rows) - blocks(position) : 0;
 }
 
 } // namespace splash::model

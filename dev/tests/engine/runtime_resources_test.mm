@@ -1491,13 +1491,10 @@ void testDenseRuntimeBoundary(const char *metallibPath) {
   const std::array<model::PrefillLane, 1> chunk{{{.position = 0, .rows = kChunk}}};
   const model::CommandWork whole = runtime->prefillWork(chunk, 0, 1);
   const uint64_t pairs = model::denseAttentionPairs(0, kChunk);
-  require(whole == model::CommandWork{.lanes = 1, .rows = kChunk, .chunks = 1, .layers = layers,
-                                      .attentionPairs = pairs, .layerAttentionPairs = pairs},
+  require(whole == model::CommandWork{.attentionPairs = pairs, .layerAttentionPairs = pairs},
           "a chunk's work is not its attention layer's pairs over the target's layers");
   // The planned model's one attention layer is its last.
-  require(runtime->prefillWork(chunk, 0, 2) == model::CommandWork{.lanes = 1, .rows = kChunk, .chunks = 1,
-                                                                    .layers = layers / 2,
-                                                                    .layerAttentionPairs = pairs} &&
+  require(runtime->prefillWork(chunk, 0, 2) == model::CommandWork{.layerAttentionPairs = pairs} &&
               runtime->prefillWork(chunk, layers / 2, 1).attentionPairs == pairs,
           "a pass's work does not count its own layers' pairs and the heaviest layer's of the target");
   require(poolNames(*runtime) == std::vector<std::string>{"vision_arena", "embeddings"},

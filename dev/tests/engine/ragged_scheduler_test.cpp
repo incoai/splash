@@ -142,8 +142,7 @@ public:
     std::vector<StepResult> results;
     const bool last = plan.pass + 1 == plan.passes;
     if (plan.kind == WorkKind::Prefill) {
-      times = test::prefillTimes(work.profile(),
-                                 work.prefillWork(lanes(plan.items), plan.layer, plan.passes - plan.pass));
+      times = work.times(lanes(plan.items), plan.layer, plan.passes - plan.pass);
       for (const BatchItem &item : plan.items)
         results.push_back({item.requestId, last ? item.tokenCount : 0, false, DecodeStage::Regular});
     } else {
@@ -1127,7 +1126,7 @@ void testTurnsTtftAloneTogetherAndApart() {
   test::TimedWork work(profile);
   const auto whole = [&](uint32_t turns) {
     std::vector<model::PrefillLane> lanes(turns, model::PrefillLane{8192, 300, 0});
-    return test::prefillTimes(profile, work.prefillWork(lanes, 0, 1)).wallMilliseconds;
+    return work.times(lanes, 0, 1).wallMilliseconds;
   };
   const std::array lone{0.0};
   const double own = runTurns(lone)[0];
@@ -1370,7 +1369,7 @@ void testAgingBoundsALongLaneUnderArrivals() {
   double cost = 0.0;
   for (uint32_t command = 0; command < 6; ++command) {
     const std::array item{BatchItem{1, kChunk, command * kChunk}};
-    cost += test::prefillTimes(sim.work.profile(), sim.work.prefillWork(sim.lanes(item), 0, 1)).wallMilliseconds;
+    cost += sim.work.times(sim.lanes(item), 0, 1).wallMilliseconds;
   }
   // A shorter prompt arrives as each one before it ends.
   uint64_t arrival = 0;

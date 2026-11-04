@@ -130,18 +130,30 @@ struct MeasuredPrompt final {
   return std::min({experts, double(rows) * profile.experts.topK, double(profile.experts.experts)});
 }
 
-// What a prefill command or pass takes on the profile, its work's layers
-// routing `distinctPerLayer` experts each: compute (its layers' share of the
-// whole command's, the pairs it counts and its experts), the reads compute
-// does not hide, at least its layers' share of the host floor, and its
+// What the profile's time of a prefill command or pass counts: the work the
+// model reports (Model::prefillWork), and the rows, the chunks they fill in
+// order, the layers run and the block-index pairs over them, which the
+// engine does not read.
+struct TimedCommand final {
+  model::CommandWork work;
+  uint32_t rows = 0, chunks = 0, layers = 0;
+  uint64_t indexPairs = 0;
+};
+
+// What a prefill command or pass takes on the profile, its layers routing
+// `distinctPerLayer` experts each: compute (its layers' share of the whole
+// command's, the pairs it counts and its experts), the reads compute does
+// not hide, at least its layers' share of the host floor, and its
 // turnaround.
-[[nodiscard]] inline CommandTimes prefillTimes(const TimingProfile &profile, const model::CommandWork &work,
+[[nodiscard]] inline CommandTimes prefillTimes(const TimingProfile &profile, const TimedCommand &command,
                                                double distinctPerLayer) noexcept {
-  const double layers = double(work.layers) / profile.layers;
-  const double compute = layers * (work.chunks * profile.chunkMilliseconds + work.rows * profile.rowMilliseconds) +
-                         double(work.attentionPairs) * profile.megapairMilliseconds / 1e6 +
-                         double(work.indexPairs) * profile.indexMegapairMilliseconds / 1e6 +
-                         work.layers * distinctPerLayer * profile.expertMilliseconds;
+  const model::CommandWork &work = command.work;
+  const double layers = double(command.layers) / profile.layers;
+  const double compute =
+      layers * (command.chunks * profile.chunkMilliseconds + command.rows * profile.rowMilliseconds) +
+      double(work.attentionPairs) * profile.megapairMilliseconds / 1e6 +
+      double(command.indexPairs) * profile.indexMegapairMilliseconds / 1e6 +
+      command.layers * distinctPerLayer * profile.expertMilliseconds;
   const double weights =
       profile.weightBytesPerMillisecond ? double(work.weightReadBytes) / profile.weightBytesPerMillisecond : 0.0;
   const double stream = profile.spilledKvBytesPerMillisecond
@@ -156,8 +168,8 @@ struct MeasuredPrompt final {
           .sample = {.work = work}};
 }
 // A command of the profile's measured routing.
-[[nodiscard]] inline CommandTimes prefillTimes(const TimingProfile &profile, const model::CommandWork &work) noexcept {
-  return prefillTimes(profile, work, distinctExperts(profile, work.rows));
+[[nodiscard]] inline CommandTimes prefillTimes(const TimingProfile &profile, const TimedCommand &command) noexcept {
+  return prefillTimes(profile, command, distinctExperts(profile, command.rows));
 }
 
 // A decode command of `width` lanes verifying `rows` rows at the experts'
@@ -187,19 +199,29 @@ public:
 
   [[nodiscard]] model::CommandWork prefillWork(std::span<const model::PrefillLane> lanes, uint32_t first,
                                                uint32_t passesLeft) const override {
+    return command(lanes, first, passesLeft).work;
+  }
+  // What the profile times of the pass (TimedCommand).
+  [[nodiscard]] TimedCommand command(std::span<const model::PrefillLane> lanes, uint32_t first,
+                                     uint32_t passesLeft) const {
     uint32_t rows = 0;
     for (const model::PrefillLane &lane : lanes)
       rows += lane.rows;
-    return work(lanes, first, passesLeft, distinctExperts(profile_, rows));
+    return timed(lanes, first, passesLeft, distinctExperts(profile_, rows));
+  }
+  // The time the pass takes (prefillTimes).
+  [[nodiscard]] CommandTimes times(std::span<const model::PrefillLane> lanes, uint32_t first,
+                                   uint32_t passesLeft) const {
+    return prefillTimes(profile_, command(lanes, first, passesLeft));
   }
   // A prompt of one repeated token from position 0: it routes the
   // warm-up's experts.
-  [[nodiscard]] model::CommandWork warmupWork(uint32_t rows) const {
+  [[nodiscard]] TimedCommand warmupCommand(uint32_t rows) const {
     const model::PrefillLane lane{.rows = rows};
-    return work({&lane, 1}, 0, 1, profile_.warmupDistinctExperts);
+    return timed({&lane, 1}, 0, 1, profile_.warmupDistinctExperts);
   }
   [[nodiscard]] CommandTimes warmupTimes(uint32_t rows) const {
-    return prefillTimes(profile_, warmupWork(rows), profile_.warmupDistinctExperts);
+    return prefillTimes(profile_, warmupCommand(rows), profile_.warmupDistinctExperts);
   }
   [[nodiscard]] double residentShare() const {
     return residentShare_ ? residentShare_() : profile_.measuredResidentShare;
@@ -207,8 +229,8 @@ public:
   [[nodiscard]] const TimingProfile &profile() const noexcept { return profile_; }
 
 private:
-  [[nodiscard]] model::CommandWork work(std::span<const model::PrefillLane> lanes, uint32_t first,
-                                        uint32_t passesLeft, double distinctPerLayer) const {
+  [[nodiscard]] TimedCommand timed(std::span<const model::PrefillLane> lanes, uint32_t first, uint32_t passesLeft,
+                                   double distinctPerLayer) const {
     const model::LayerRange range = model::passLayers(first, passesLeft, profile_.layers);
     // The attending and full-attention layers the pass runs, and the
     // target's.
@@ -224,7 +246,8 @@ private:
       }
     }
     const uint32_t allAttending = profile_.layers / profile_.attentionEvery;
-    model::CommandWork result{.lanes = static_cast<uint32_t>(lanes.size()), .layers = range.end - range.first};
+    TimedCommand result{.layers = range.end - range.first};
+    model::CommandWork &work = result.work;
     uint64_t reachPairs = 0, densePairs = 0, indexPairs = 0, indexPages = 0;
     const uint64_t block = profile_.reach.blockTokens;
     // Complete blocks before each row of [0, end), summed.
@@ -242,15 +265,15 @@ private:
     }
     result.chunks = (result.rows + model::ExecutionLimits::prefillTokenBudget - 1) /
                     model::ExecutionLimits::prefillTokenBudget;
-    result.attentionPairs = (attending - full) * reachPairs + full * densePairs;
+    work.attentionPairs = (attending - full) * reachPairs + full * densePairs;
     // The target's heaviest attention layer whatever layers the pass runs: a
     // pass does not split a layer (CommandWork::layerAttentionPairs).
-    result.layerAttentionPairs = allFull ? densePairs : allAttending ? reachPairs : 0;
+    work.layerAttentionPairs = allFull ? densePairs : allAttending ? reachPairs : 0;
     result.indexPairs = (attending - full) * indexPairs;
-    result.weightReadBytes = static_cast<uint64_t>(result.layers * distinctPerLayer *
-                                                   (1.0 - prefillHit(profile_, residentShare())) *
-                                                   double(profile_.experts.expertBytes));
-    result.spilledKvReadBytes = allAttending ? indexPages * profile_.spilledPageBytes * attending / allAttending : 0;
+    work.weightReadBytes = static_cast<uint64_t>(result.layers * distinctPerLayer *
+                                                 (1.0 - prefillHit(profile_, residentShare())) *
+                                                 double(profile_.experts.expertBytes));
+    work.spilledKvReadBytes = allAttending ? indexPages * profile_.spilledPageBytes * attending / allAttending : 0;
     return result;
   }
 
