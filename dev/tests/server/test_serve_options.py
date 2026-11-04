@@ -10,6 +10,7 @@ from unittest import mock
 from install import launcher
 from server import images, serve_options
 from server import server as api
+from server.chat_format import REASONING_EFFORTS
 from server.origins import ANY_ORIGIN
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -66,7 +67,7 @@ OPTIONS = {
     ),
     "--default-reasoning-effort": values(
         "--default-reasoning-effort",
-        {effort: effort for effort in serve_options.REASONING_EFFORTS},
+        {effort: effort for effort in REASONING_EFFORTS},
         ("", "turbo", "XHIGH"),
     ),
     "--thinking-token-budget": values(

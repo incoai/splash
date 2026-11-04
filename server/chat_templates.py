@@ -45,9 +45,8 @@ from jinja2 import Environment, TemplateError, TemplateSyntaxError, nodes
 from jinja2.ext import Extension
 from jinja2.lexer import Token
 
-from .chat_format import THINK_END
+from .chat_format import REASONING_EFFORTS, THINK_END
 from .lru import LRUCache, memoized
-from .serve_options import REASONING_EFFORTS
 
 # Template arguments request preparation sets itself, and apply_chat_template's
 # own controls: a request's template kwargs cannot set them.

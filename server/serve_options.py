@@ -16,10 +16,10 @@ from decimal import Decimal
 from pathlib import Path
 
 from . import images, origins
+from .chat_format import REASONING_EFFORTS
 from .http_security import validate_api_key
 from .protocol import MAX_THINKING_END_TOKENS
 
-REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 # The most context --max-context takes, which YaRN stretches the targets'
 # native window to and Qwen validates (QwenTargetDimensions::yarnContextTokens).
 MAX_YARN_CONTEXT_TOKENS = 1010000

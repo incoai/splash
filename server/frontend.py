@@ -21,7 +21,7 @@ from .api_shapes import (
     template_messages,
 )
 from .backend import Job, ReasoningRequest, remaining_request_time
-from .chat_format import THINK_END, THINK_START, TOOL_CALL_OPEN
+from .chat_format import REASONING_EFFORTS, THINK_END, THINK_START, TOOL_CALL_OPEN
 from .chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
     RESERVED_TEMPLATE_KWARGS,
@@ -40,7 +40,6 @@ from .latency import LatencyMetrics
 from .lru import LRUCache
 from .metrics import is_finite_number
 from .output import MAX_STOP_CHARACTERS
-from .serve_options import REASONING_EFFORTS, parse_served_model_name
 from .tokenization import PromptTokenizer, tokenizable
 from .tool_schema import (
     ToolPolicy,
@@ -285,15 +284,15 @@ class Frontend:
         # The model id the engine loaded. /status reports it, so an alias
         # can never hide what served a request.
         self.model = model
-        served = tuple(parse_served_model_name(name) for name in served_model_names)
-        if announce_served_name and not served:
+        names = tuple(served_model_names)
+        if announce_served_name and not names:
             raise ValueError("announce_served_name needs a served model name")
         # The name generation and scoring responses report.
-        self.response_model = served[0] if announce_served_name else model
+        self.response_model = names[0] if announce_served_name else model
         # /v1/models order: the name responses report first, so a client
         # configured from data[0] (splash <client>) requests the name it gets
         # back. Every name stays accepted.
-        self.model_names = tuple(dict.fromkeys((self.response_model, model, *served)))
+        self.model_names = tuple(dict.fromkeys((self.response_model, model, *names)))
         if (
             default_reasoning_effort is not None
             and default_reasoning_effort not in REASONING_EFFORTS

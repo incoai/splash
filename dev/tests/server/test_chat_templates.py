@@ -12,12 +12,11 @@ from transformers import PreTrainedTokenizerFast
 from dev.tests import server_fixtures as fixtures
 from server import api_shapes, chat_templates
 from server import frontend as request_frontend
-from server.chat_format import QWEN
+from server.chat_format import QWEN, REASONING_EFFORTS
 from server.chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
     NATIVE,
     PATCHED,
-    REASONING_EFFORTS,
     UNSUPPORTED,
     ChatTemplateError,
     ChatTemplates,
@@ -442,7 +441,7 @@ class ChatTemplateProbeTests(unittest.TestCase):
         # The guard also raises for the leading system message under one
         # effort, so there the patch would render that message twice.
         guard = "{%- if not loop.first %}"
-        for effort in chat_templates.REASONING_EFFORTS:
+        for effort in REASONING_EFFORTS:
             text = source("qwen36").replace(
                 guard, f"{{%- if not loop.first or reasoning_effort == '{effort}' %}}"
             )

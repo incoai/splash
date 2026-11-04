@@ -6,8 +6,10 @@ engine and the tokenizer.
 The vocabulary and stop tokens come from the engine's Ready; a format names
 the texts its tokenizer encodes as those stop tokens, and the tokens it must
 encode the template's tags as, which startup checks
-(constraints.validate_tokenizer, check_capabilities). It imports only the
-standard library, as the installer reads it through families.py."""
+(constraints.validate_tokenizer, check_capabilities). It also holds the
+reasoning efforts that requests, templates and the CLI name. It imports only
+the standard library, as the installer reads it through families.py and the
+launcher through serve_options."""
 
 from dataclasses import dataclass
 
@@ -17,6 +19,9 @@ THINK_START = "<think>"
 THINK_END = "</think>"
 TOOL_CALL_OPEN = "<tool_call>"
 TOOL_CALL_CLOSE = "</tool_call>"
+# The reasoning efforts a request or --default-reasoning-effort may name,
+# least first.
+REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
 @dataclass(frozen=True, kw_only=True)
