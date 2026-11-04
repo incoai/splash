@@ -5,8 +5,7 @@ models beside the ones it downloaded:
 
     python install/cached.py [--models DIR]
 
-prints, one JSON line each, {"model": ID} for each model it installed. A
-repository it cannot serve installs nothing: a model of no family Splash
+A repository it cannot serve installs nothing: a model of no family Splash
 serves, one missing files, or no model at all, such as a draft.
 """
 
@@ -15,7 +14,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
-import json
 import os
 import sys
 from pathlib import Path
@@ -44,13 +42,12 @@ def suggested():
 def candidates(name, files, suggested_models):
     """The model IDs repository name's cached files may install as, one for
     each GGUF target they hold whole: the first of its suggested IDs that
-    selects it from them (upstream.select_gguf), or else its own, if that
-    does: its split parts' folder, or its root file's name past the words
-    it starts with of the model the repository is named for (the name
-    without -GGUF), and past its first at least. Repositories name their
-    files MODEL-VARIANT.gguf, so that ID selects the same file from the
-    Hub's listing of all of them. Without any, the repository itself: an
-    MLX model, or files the installer refuses."""
+    selects it (upstream.select_gguf), or else its own if that does: its
+    split parts' folder, or its root file's name past the leading words of
+    the repository's model name (without -GGUF), at least the first, which
+    selects the same MODEL-VARIANT.gguf from the Hub's full listing. Without
+    any, the repository itself: an MLX model, or files the installer
+    refuses."""
     from . import upstream
 
     def selected(model_id):
@@ -91,7 +88,7 @@ def candidates(name, files, suggested_models):
 
 def install_cached(models_root):
     """Install each model the Hub cache holds whole that is not installed in
-    models_root, without the Hub; yield the IDs installed."""
+    models_root, without the Hub."""
     from . import hub, upstream
 
     suggested_models = suggested()
@@ -108,8 +105,7 @@ def install_cached(models_root):
                 with contextlib.redirect_stdout(io.StringIO()):
                     upstream.prepare(selection)
             except (models.ModelError, OSError):
-                continue
-            yield model
+                pass  # the installer refuses it
 
 
 def main(argv=None):
@@ -118,8 +114,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     # Only what the cache holds: the Hub is never asked.
     os.environ["HF_HUB_OFFLINE"] = "1"
-    for model in install_cached(args.models):
-        print(json.dumps({"model": model}), flush=True)
+    install_cached(args.models)
     return 0
 
 

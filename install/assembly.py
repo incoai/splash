@@ -11,10 +11,6 @@ The paths an assembly links, and what reads each:
   config.json            the target configuration: the MLX config.json, or
                          the one derived from the GGUF (ModelDescriptor.mm
                          inspectSourceModel)
-  target/config.json, vision/config.json
-                         the MLX config.json again, as each checkpoint
-                         directory's own config, read by engines up to 1.2,
-                         which a release check runs on this installation
   target/<shard>         the MLX safetensors shards except those holding only
                          vision_tower.* (SafetensorsCheckpoint.mm)
   target/<name>.gguf     the GGUF target, or the parts of a split one
@@ -335,15 +331,13 @@ def _check_metadata(entry):
 
 def hold(path: Path):
     """The assembly path names, an assembly or a selection link to one, and
-    what holds it: its model.json opened under a shared lock. While that
-    file is open, in this process or one that inherited it, collect_garbage
-    keeps the assembly. path is read under the installation lock of the
-    models root the assembly was built in (MODELS/.resolved/<record>), which
-    may be another checkout's, where collection runs, so there is no moment
-    the assembly is neither linked nor held; the lock needs write access to
-    that root. A ModelError refuses a path that names no assembly, such as
-    one collection removed, and one the file system keeps from being held,
-    such as in a root this process cannot write."""
+    what holds it: its model.json opened under a shared lock, which keeps
+    the assembly from collect_garbage while open in this process or one that
+    inherited it. path is read under the installation lock of the models
+    root the assembly was built in, where collection runs, so the assembly
+    is never neither linked nor held; the lock needs write access to that
+    root. A ModelError refuses a path that names no assembly or cannot be
+    held."""
     resolved = path.resolve().parent
     if resolved.name != ".resolved":
         raise models.ModelError(f"{path} is not a model directory Splash prepared")

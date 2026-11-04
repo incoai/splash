@@ -15,7 +15,7 @@ from dev.tests.installer_fixtures import (
     mlx_target,
     selection,
 )
-from install import cached, upstream
+from install import cached, models, upstream
 
 
 def vision_target(root):
@@ -49,7 +49,7 @@ class CachedTest(unittest.TestCase):
 
     def install_cached(self):
         with mock.patch("huggingface_hub.constants.HF_HUB_OFFLINE", True):
-            return list(cached.install_cached(self.root / "app"))
+            cached.install_cached(self.root / "app")
 
     def test_installs_what_the_cache_holds_whole_without_the_hub(self):
         """A model another Splash downloaded installs here from the cache, at
@@ -75,8 +75,15 @@ class CachedTest(unittest.TestCase):
         (self.cache / "models--someone--notes/refs/main").write_text("b" * 40)
         cached_snapshot(self.cache, "someone/unrecorded", "c" * 40, readme)
         fake.requests.clear(), fake.downloads.clear()
-        self.assertEqual(self.install_cached(), [MODEL])
-        self.assertEqual(self.install_cached(), [])
+        # What the app lists once the script exits: the selection links.
+        app = (self.root / "app").resolve()
+        link = models.Selection.of(app, MODEL).link
+        self.install_cached()
+        self.assertEqual(models.selection_links(app), [link])
+        with mock.patch.object(upstream, "prepare", wraps=upstream.prepare) as prepare:
+            self.install_cached()
+        self.assertEqual(models.selection_links(app), [link])
+        self.assertNotIn(MODEL, [call.args[0].model for call in prepare.call_args_list])
         self.assertEqual((fake.requests, fake.downloads), ([], []))
 
     def test_candidates_follow_the_installer_s_names(self):

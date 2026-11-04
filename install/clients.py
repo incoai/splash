@@ -27,13 +27,12 @@ INSTALL_URLS = {
     "pi": "https://pi.dev/",
 }
 # The output one response may use in the OpenCode, Pi and Hermes
-# configurations the launchers write. Qwen recommends 32,768 for most Qwen3.6
-# queries and evaluated Qwen3.8-27B under Claude Code with it in a 256K
-# window; the 131,072 that model's card names is for the answer alone, beside
-# a separate reasoning limit, in a 1M window. OpenCode sends at most 32,000
-# of it unless OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX raises that; Pi, given
-# none, asks for 16,384. OpenCode and Hermes get a quarter of a window
-# smaller than four times this instead (_Server.response_tokens).
+# configurations the launchers write: Qwen's recommendation for most queries
+# (the 131,072 on the Qwen3.8-27B card is for the answer alone, beside a
+# separate reasoning limit). OpenCode sends at most 32,000 of it unless
+# OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX raises that; Pi, given none, asks
+# for 16,384. OpenCode and Hermes get a quarter of a window smaller than four
+# times this instead (_Server.response_tokens).
 CLIENT_RESPONSE_TOKENS = 32768
 OPENCODE_AGENTS = ("build", "plan", "general", "explore", "title", "compaction")
 OPENCODE_EFFORTS = ("none", "low", "medium", "high", "xhigh")

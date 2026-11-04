@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 import httpx
-from huggingface_hub.errors import IncompleteSnapshotError
+from huggingface_hub.errors import IncompleteSnapshotError, RepositoryNotFoundError
 
 from dev.tests.installer_fixtures import (
     CONFIGS,
@@ -28,11 +28,14 @@ from dev.tests.installer_fixtures import (
     draft_dir,
     fake_hub,
     family_config,
+    fixture,
     http_error,
     listing,
     mlx_target,
     pins,
     selection,
+    tensor_table,
+    write_target,
 )
 from install import assembly, families, hub, models, paths, upstream
 
@@ -62,7 +65,7 @@ class UpstreamTest(unittest.TestCase):
         return output.getvalue(), warnings.getvalue()
 
     def test_every_family_names_its_own_draft_repository(self):
-        repos = [family.draft_repo for family in families.FAMILIES if family.draft_repo]
+        repos = [family.draft_repo for family in families.FAMILIES]
         for repo in repos:
             with self.subTest(repo=repo):
                 self.assertEqual(models.validate_repo_id(repo), repo)
@@ -83,14 +86,23 @@ class UpstreamTest(unittest.TestCase):
                     ),
                     family,
                 )
-        # Qwen3.8-Flash-Next and Flint load from a GGUF: the config and
-        # metadata the installer derives from it name the family, with and
+
+        # Qwen3.8-Flash-Next and Flint load from a GGUF: the config the
+        # installer derives from it and its header name the family, with and
         # without its draft (Flint's flat config, its release's keys, and a
         # test draft naming one of its reserved tokens as its mask), and
         # another family's draft is refused.
+        def headers(family):
+            directory = self.root / family.name / "target"
+            directory.mkdir(parents=True, exist_ok=True)
+            write_target(
+                directory / "model.gguf", fixture(family=family), tensor_table(family)
+            )
+            return {"gguf_headers": directory}
+
         for family in GGUF_ONLY:
             configs = CONFIGS / family.name.lower()
-            gguf_check = {"gguf_metadata": configs / "gguf-metadata.json"}
+            gguf_check = headers(family)
             for arguments in ({}, {"draft": configs / "draft" / "config.json"}):
                 self.assertIs(
                     upstream.check_model(
@@ -104,7 +116,7 @@ class UpstreamTest(unittest.TestCase):
                 )
         flash = families.named("Qwen3.8-Flash-Next")
         configs = CONFIGS / flash.name.lower()
-        gguf_check = {"gguf_metadata": configs / "gguf-metadata.json"}
+        gguf_check = headers(flash)
         with self.assertRaisesRegex(
             models.ModelError, "draft config hidden_size mismatch: checkpoint 5120"
         ):
@@ -731,9 +743,11 @@ class UpstreamTest(unittest.TestCase):
             self.assertEqual(
                 (chosen.link / "tokenizer" / name).readlink(), snapshot / name
             )
-        # The paths the native loaders and the tokenizer read (assembly.py).
-        for name in ("config.json", "target/config.json", "tokenizer/config.json"):
+        # The paths the native loaders and the tokenizer read (assembly.py),
+        # and no other copy of the configuration.
+        for name in ("config.json", "tokenizer/config.json"):
             self.assertEqual((chosen.link / name).readlink(), snapshot / "config.json")
+        self.assertFalse((chosen.link / "target/config.json").exists())
         self.assertEqual(
             (chosen.link / "draft/model.safetensors").read_bytes(), b"draft"
         )
@@ -766,11 +780,11 @@ class UpstreamTest(unittest.TestCase):
         self.assertFalse((chosen.link / "processor").exists())
         self.assertEqual(
             sorted(p.name for p in (chosen.link / "vision").iterdir()),
-            ["config.json", "model-00001-of-00002.safetensors"],
+            ["model-00001-of-00002.safetensors"],
         )
         self.assertEqual(
             sorted(p.name for p in (chosen.link / "target").iterdir()),
-            ["config.json", *sorted(set(shards.values()))],
+            sorted(set(shards.values())),
         )
         # A checkpoint without the tower cannot serve images, nor can a
         # text-only conversion that keeps the processor but drops the tower's
@@ -874,11 +888,7 @@ class UpstreamTest(unittest.TestCase):
         self.prepare(chosen)
         self.assertEqual(
             sorted(p.name for p in (chosen.link / "target").iterdir()),
-            [
-                "config.json",
-                "model-00001-of-00002.safetensors",
-                "model-00002-of-00002.safetensors",
-            ],
+            ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"],
         )
         self.assertNotIn(f"{MODEL}/optiq/optiq_vision.safetensors", fake.downloads)
 
@@ -955,7 +965,7 @@ class UpstreamTest(unittest.TestCase):
         self.prepare(chosen)
         self.assertEqual(
             sorted(p.name for p in (chosen.link / "vision").iterdir()),
-            ["config.json", "model.safetensors"],
+            ["model.safetensors"],
         )
         fake.publish(
             "someone/text", "c" * 40, checkpoint(["language_model.lm_head.weight"])
@@ -1076,14 +1086,50 @@ class UpstreamTest(unittest.TestCase):
                 self.assertEqual(fake.requests, [(MODEL, None)])
 
     def test_unreachable_hub_without_an_installation_is_the_error(self):
+        """Classed as the Hub's failure is, which the app words: no such
+        repository, which the Hub answers with 401 when anonymous, or no
+        connection."""
         fake = fake_hub(self, self.cache)
-        fake.failure = http_error(404)
+        missing = RepositoryNotFoundError(
+            "401 Client Error. Repository Not Found", response=http_error(401).response
+        )
+        offline = httpx.ConnectError("[Errno 8] nodename nor servname provided")
+        for failure, kind in (
+            (http_error(404), "not_found"),
+            (missing, "not_found"),
+            (offline, "offline"),
+        ):
+            fake.failure = failure
+            reason = re.escape(hub.reason(failure))
+            with self.subTest(failure=failure):
+                with self.assertRaisesRegex(
+                    models.ModelError,
+                    f"cannot resolve someone/other: {reason}; neither this "
+                    "installation nor the Hub cache records a commit for the "
+                    "default branch",
+                ) as raised:
+                    self.prepare(selection(self.root, "someone/other"))
+                self.assertEqual(raised.exception.kind, kind)
+
+    def test_a_draft_the_cache_lacks_fails_as_the_hub_did_for_the_target(self):
+        """Offline, a target the Hub cache holds as `hf download` leaves it
+        installs without the Hub; the draft the cache lacks fails classed as
+        the target's request did, with no request of its own."""
+        fake = fake_hub(self, self.cache)
+        cached_snapshot(self.cache, MODEL, "a" * 40, lambda p: mlx_target(p, DENSE))
+        refs = self.cache / hub.folder_name(MODEL) / "refs"
+        refs.mkdir()
+        (refs / "main").write_text("a" * 40)
+        fake.failure = httpx.ConnectError("[Errno 8] nodename nor servname provided")
+        reason = re.escape(hub.reason(fake.failure))
         with self.assertRaisesRegex(
             models.ModelError,
-            "cannot resolve someone/other: 404 Client Error.*; neither this "
+            f"cannot resolve {DENSE.draft_repo}: {reason}; neither this "
             "installation nor the Hub cache records a commit for the default branch",
-        ):
-            self.prepare(selection(self.root, "someone/other"))
+        ) as raised:
+            self.prepare(selection(self.root))
+        self.assertEqual(raised.exception.kind, "offline")
+        self.assertEqual(fake.requests, [(MODEL, None)])
 
     def test_commit_and_offline_selections_make_no_request(self):
         fake = fake_hub(self, self.cache)

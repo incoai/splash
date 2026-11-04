@@ -1,5 +1,6 @@
 import _thread
 import contextlib
+import errno
 import fcntl
 import hashlib
 import inspect
@@ -7,6 +8,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import signal
 import tempfile
 import threading
@@ -142,12 +144,12 @@ class DownloadTest(unittest.TestCase):
             },
         )
 
-    def download(self, names=WEIGHTS, *, json_progress=True):
+    def download(self, names=WEIGHTS, *, json_progress=True, listed=None):
         with (
             mock.patch.object(hub, "json_progress", json_progress),
             contextlib.redirect_stdout(self.stdout),
         ):
-            return self.repository().download(names)
+            return self.repository(listed).download(names)
 
     def events(self):
         return [
@@ -228,6 +230,27 @@ class DownloadTest(unittest.TestCase):
         self.download({"config.json"})
         self.assertEqual(self.stdout.getvalue(), "")
         self.assertEqual(self.downloads, [["config.json"]])
+
+    def test_a_download_the_cache_volume_has_no_room_for_is_refused(self):
+        """Measured on the Hub cache's own volume, before anything is
+        fetched, so the disk is never filled; a model's first download, whose
+        folder is not there yet, measures the folder it goes in."""
+        shutil.rmtree(self.blobs.parent)
+        with (
+            mock.patch.object(
+                hub, "_available_bytes", wraps=hub._available_bytes
+            ) as measured,
+            self.assertRaises(hub.models.ModelError),
+        ):
+            self.download(listed={"model-1.safetensors": 1 << 60})
+        volume = measured.call_args.args[0]
+        self.assertIn(self.cache, [volume, *volume.parents])
+        self.assertEqual(self.downloads, [])
+        self.assertEqual(self.events(), [])
+        self.blobs.mkdir(parents=True)
+        with mock.patch.object(hub, "_available_bytes", lambda path: 500):
+            self.download()
+        self.assertEqual(self.downloads, [sorted(WEIGHTS)])
 
     def test_a_failed_download_reports_no_completion(self):
         def fail(done):
@@ -332,6 +355,35 @@ class DownloadTest(unittest.TestCase):
             (self.snapshot / name).unlink()
         self.download()
         self.assertEqual([path.exists() for path in live], [False, False])
+
+
+class FailureKindTest(unittest.TestCase):
+    def test_hub_failures_carry_their_kind(self):
+        """A Hub or network failure says which, as the app words it."""
+        import httpx
+        from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
+
+        request = httpx.Request("GET", f"https://huggingface.co/api/models/{REPO}")
+
+        def refused(status, kind=HfHubHTTPError):
+            return kind("refused", response=httpx.Response(status, request=request))
+
+        for error, kind in (
+            (refused(401, RepositoryNotFoundError), "not_found"),
+            (refused(404), "not_found"),
+            (refused(401), "auth"),
+            (refused(403), "auth"),
+            (httpx.ConnectError("no route", request=request), "offline"),
+            (httpx.ReadTimeout("slow", request=request), "offline"),
+            (OSError(errno.EACCES, "Permission denied"), None),
+            (refused(500), None),
+        ):
+            with self.subTest(error=error):
+                with self.assertRaises(hub.models.ModelError) as caught:
+                    with hub.as_model_errors(f"cannot install {REPO}"):
+                        raise error
+                self.assertEqual(caught.exception.kind, kind)
+                self.assertTrue(str(caught.exception).startswith("cannot install"))
 
 
 if __name__ == "__main__":

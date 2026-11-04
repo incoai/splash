@@ -3,17 +3,14 @@ trained for its architecture, as an assembly (assembly.py).
 
 The Hub owns downloads and snapshots; this module inspects the target,
 selects its components and decides when to follow the Hub. The engine owns
-the model rules, which it applies to the target's and the draft's
-configurations, and a GGUF's metadata, before any weight download
-(check_model), and its source adapters own tensor validation and
-preparation. A target's family is the one the engine finds its
-configuration (an MLX config, or the one derived from a GGUF header) to
-describe, paired with the draft trained for it (families.py); repository
-names play no part. Every start follows the target's revision, then its
+the model rules, which it applies to the configurations and a GGUF's headers
+before any weight download (check_model), and its source adapters own tensor
+validation and preparation. A target's family is the one the
+engine finds its configuration to describe (families.py), never its
+repository name. Every start follows the target's revision, then its
 draft's, with one Hub request each, and publishes a new commit's assembly
 atomically; the installed assembly starts when the Hub cannot answer or the
-new commit cannot be installed. local.py prepares a model from local files
-with the same inspection and publishing.
+new commit cannot be installed. local.py does the same from local files.
 """
 
 from __future__ import annotations
@@ -62,9 +59,9 @@ class Target:
     # The configuration the engine reads, the assembly's config.json: the MLX
     # repository's, or the one derived from the GGUF's metadata.
     config: Path
-    # A GGUF's scalar metadata, which the engine checks as it checks the
-    # GGUF's at every start (gguf.scalar_metadata); None for MLX.
-    gguf_metadata: Path | None
+    # The directory of a GGUF's headers, which the engine plans the target
+    # from as it plans the GGUF at every start (check_model); None for MLX.
+    gguf_headers: Path | None
     # The family the engine finds the configuration to describe.
     family: families.ModelFamily
     # Assembly path -> repository file, for every path a repository file
@@ -198,13 +195,12 @@ def select_vision(repo):
 
 def read_projector(repo, name):
     """The header of the GGUF name in repo; the precision of a vision
-    projector Splash loads, a clip model whose weights are BF16, F32 or F16,
-    or None for any other GGUF; and how a refusal describes what it is,
-    ARCHITECTURE: TYPES. The tower runs in BF16 and preparation never
-    rounds a weight: it converts F32 and F16 only where every value is
-    exact. An F16 projector made from a BF16 tower is: F16 rounds the
-    smallest BF16 weights onto its subnormal grid, and what that keeps is
-    still a BF16."""
+    projector Splash loads (a clip model of BF16, F32 or F16 weights), else
+    None; and how a refusal describes it, ARCHITECTURE: TYPES. The tower runs
+    in BF16 and preparation never rounds a weight: it converts F32 and F16
+    only where every value is exact, as in an F16 projector made from a BF16
+    tower, where F16 rounds the smallest BF16 weights onto its subnormal grid
+    and what that keeps is still a BF16."""
     with repo.open(name) as stream:
         header = gguf.Metadata(stream, tensors=True)
     architecture = header.values.get("general.architecture")
@@ -217,18 +213,17 @@ def read_projector(repo, name):
     return header, precision, f"{architecture}: {', '.join(sorted(types))}"
 
 
-def check_model(
-    target_format, vision_format, config, *, gguf_metadata=None, draft=None
-):
+def check_model(target_format, vision_format, config, *, gguf_headers=None, draft=None):
     """The family the engine finds a model's configuration to describe, by
     the rules it holds the model's assembly to at every start (its
     model-check command): config, the target's configuration, with the
-    source formats the record names; gguf_metadata, a GGUF target's
-    (gguf.scalar_metadata); and draft, its draft's config.json once chosen. A
-    ModelError gives the engine's reason when it refuses them."""
+    source formats the record names; gguf_headers, the directory of a GGUF
+    target's headers (gguf_target), each tensor of which it plans as it
+    loads it; and draft, its draft's config.json once chosen. A ModelError
+    gives the engine's reason when it refuses them."""
     arguments = ["model-check", target_format, vision_format, str(config)]
-    if gguf_metadata is not None:
-        arguments.append(str(gguf_metadata))
+    if gguf_headers is not None:
+        arguments.append(str(gguf_headers))
     if draft is not None:
         arguments.append(str(draft))
     name = json.loads(models.run_engine(arguments, "model check"))["family"]
@@ -242,7 +237,7 @@ def inspect_target(repo, variant, language_only, scratch):
     header read by range requests, or an MLX config and shard index, and the
     family the engine finds its configuration to describe. A :VARIANT names a
     GGUF, and so does a repository without a safetensors checkpoint; a GGUF's
-    configuration and metadata are written into scratch. The target's text
+    configuration and headers are written into scratch. The target's text
     configuration is checked first, then its vision tower and the tower's
     configuration, so a model Splash cannot serve is refused for that,
     whatever its tower; a refusal of the tower alone names --language-only."""
@@ -276,39 +271,41 @@ def _gguf_target(repo, variant, language_only, scratch):
 
 def gguf_target(repo, names, scratch, *, projector=None):
     """The GGUF target whose files in repo are names, one or a split GGUF's
-    parts in split order, its configuration and metadata written into
+    parts in split order, its configuration and headers written into
     scratch. projector, for a model that serves images, gives the name and
     header of its vision projector in repo (select_vision): called once the
     text configuration passed, for a family whose models have a vision
     tower; the others serve text only."""
+    # A split GGUF's parts lie side by side in target/, where the native
+    # loader finds them by their -0000K-of-0000N names, and their headers in
+    # scratch's target/, where the engine's model check finds them.
+    files = {"target/" + Path(part).name: part for part in names}
+    target = scratch / "target"
+    target.mkdir()
     headers = []
     for part in names:
         with repo.open(part) as stream:
             headers.append(gguf.Metadata(stream, tensors=True))
-    header = gguf.merged_split(headers)
-    # A split GGUF's parts lie side by side in target/, where the native
-    # loader finds them by their -0000K-of-0000N names.
-    files = {"target/" + Path(part).name: part for part in names}
-    config, metadata = scratch / "config.json", scratch / "gguf-metadata.json"
-    config.write_bytes(models.json_bytes(gguf.model_config(header)))
-    metadata.write_bytes(models.json_bytes(gguf.scalar_metadata(header)))
-    # The family bounds the layers whose tensors the screening lists.
-    family = check_model("gguf", "none", config, gguf_metadata=metadata)
-    gguf.require_loadable(header)
+        (target / Path(part).name).write_bytes(headers[-1].raw)
+    # The first part's metadata describes the model.
+    config = scratch / "config.json"
+    config.write_bytes(models.json_bytes(gguf.model_config(headers[0])))
+    gguf.require_quantized(headers)
+    family = check_model("gguf", "none", config, gguf_headers=target)
     vision_format = "none"
     if projector is not None and family.vision:
         name, vision_header = projector(repo)
         try:
             _validate_processor(gguf.processor_config(vision_header))
             config.write_bytes(
-                models.json_bytes(gguf.model_config(header, vision_header))
+                models.json_bytes(gguf.model_config(headers[0], vision_header))
             )
-            check_model("gguf", "gguf", config, gguf_metadata=metadata)
+            check_model("gguf", "gguf", config, gguf_headers=target)
         except models.ModelError as error:
             raise models.VisionError(f"vision projector {name}: {error}") from None
         files[assembly.GGUF_VISION] = name
         vision_format = "gguf"
-    return Target("gguf", vision_format, config, metadata, family, files)
+    return Target("gguf", vision_format, config, target, family, files)
 
 
 def mlx_target(repo, language_only):
@@ -329,10 +326,7 @@ def mlx_target(repo, language_only):
         )
     config = repo.file("config.json")
     family = check_model("mlx-affine", "none", config)
-    files = {
-        path: "config.json"
-        for path in ("config.json", "target/config.json", "tokenizer/config.json")
-    }
+    files = {path: "config.json" for path in ("config.json", "tokenizer/config.json")}
     files |= {"tokenizer/" + n: n for n in TOKENIZER_FILES if n in repo.files}
     # The target's shards: those holding a tensor other than the tower's. A
     # tower in a shard of its own is not the target's (an OptiQ checkpoint
@@ -354,7 +348,6 @@ def mlx_target(repo, language_only):
             check_model("mlx-affine", vision_format, config)
         except models.ModelError as error:
             raise models.VisionError(str(error)) from None
-        files["vision/config.json"] = "config.json"
         files |= {"vision/" + n: n for n in shards}
     return Target("mlx-affine", vision_format, config, None, family, files)
 
@@ -444,15 +437,11 @@ def _validate_processor(config):
 
 
 def prepare(selection):
-    """Start selection's model, installing what it needs.
-
-    Every start resolves the target's revision, then the default branch of
-    its draft's repository, with one Hub request each (hub.Repository.resolve
-    decides when none is made). The installed assembly of those commits
-    starts; a new commit is installed and published atomically; when the Hub
-    cannot answer, or a new commit cannot be installed, the verified
-    installation starts instead. A Splash package, installed or on the Hub,
-    is refused (models.refuse_package)."""
+    """Start selection's model, installing what it needs: the installed
+    assembly of the resolved commits, or a new commit installed and published
+    atomically, or the verified installation when the Hub cannot answer or the
+    new commit cannot be installed. A Splash package is refused
+    (models.refuse_package)."""
     kind = models.installation_kind(selection.link)
     if kind == models.PACKAGE:
         models.refuse_package(
@@ -487,9 +476,8 @@ def _start_installed(selection, target, installed):
     """Start the verified installation of the target's commit, assembled again
     first when its draft moved or this release changes it (_changes). The
     draft's repository is asked only when the Hub answered for the target, so
-    a commit revision holds its draft too. The installation's links name its
-    files; only assembling it again reads the commits' snapshots in the
-    current Hub cache."""
+    a commit revision holds its draft too. Only assembling it again reads the
+    Hub cache."""
     if target.unreachable_reason:
         print(
             f"Could not reach the Hub ({target.unreachable_reason}); "
@@ -703,18 +691,11 @@ def _changes(installed, family, draft):
 
 def _resolve_draft(family, selection, installed, target):
     """The draft's repository, --draft-model or else the family's DFlash2
-    release, at the commit its default branch names now: one Hub request, as
-    for the target, made only when the Hub answered for the target. Else the
-    installed draft stands in, unlisted, or without one a commit the Hub
-    cache holds for this selection; the installed draft also stands in, with
-    the reason, when the draft cannot be resolved. A family no draft is
-    released for takes --draft-model's."""
+    release, at its default branch's commit: one Hub request, made only when
+    the Hub answered for the target. Otherwise, or when it cannot be
+    resolved, the installed draft stands in; without one, a commit the Hub
+    cache holds, else it fails with the target's reason and class."""
     name = selection.draft_model or family.draft_repo
-    if name is None:
-        raise models.ModelError(
-            f"no DFlash2 draft is released for {family.name}; "
-            "name one with --draft-model"
-        )
     recorded = installed and installed["sources"]["draft"]
     asked = _answered(target)
     if recorded and not asked:
@@ -728,6 +709,7 @@ def _resolve_draft(family, selection, installed, target):
             unreachable=None
             if asked
             else target.unreachable_reason or "the Hub did not list the target",
+            unreachable_kind=target.unreachable_kind,
         )
     except models.ModelError as error:
         if not recorded:
@@ -775,10 +757,8 @@ def _at(repo):
 
 def draft_files(repo, target):
     """The DFlash2 draft in repo for target's family, downloaded, by assembly
-    path: its config.json and safetensors weights, model.safetensors or the
-    shards its index names, and the mask token's embedding when the release
-    ships one (DRAFT_MASK_EMBEDDING), at the root of the repository or
-    --draft-model directory, as a DFlash2 release holds them. The weights
+    path: config.json, the safetensors weights and the mask embedding when
+    shipped (DRAFT_MASK_EMBEDDING), at the repository's root. The weights
     download only once the engine accepts its configuration with the
     target's (check_model)."""
     family = target.family
@@ -797,7 +777,7 @@ def draft_files(repo, target):
             target.format,
             target.vision_format,
             target.config,
-            gguf_metadata=target.gguf_metadata,
+            gguf_headers=target.gguf_headers,
             draft=config,
         )
     except models.ModelError as error:

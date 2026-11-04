@@ -30,6 +30,7 @@ every start, at little cost.
 from __future__ import annotations
 
 import functools
+import json
 import os
 import signal
 import sys
@@ -69,15 +70,14 @@ def prepare_local_model(
     installations `splash serve` makes.
 
     The directory links the files and never changes. Preparing the same
-    files again returns it again: that reads their metadata and their sizes
-    and times, never their content. The first preparation reads each file
-    outside the Hugging Face cache once, for its digest. Once a file
-    changes, or a download moves the draft's default branch, preparing again
-    returns another directory: serve that one. The server holds the
-    directory it serves until it exits; one a later preparation no longer
-    returns is removed only once no server holds it. The server takes
-    models_dir's installation lock to hold it when it starts, so it needs
-    write access there.
+    files again returns it again, reading only their metadata, sizes and
+    times; the first preparation reads each file outside the Hugging Face
+    cache once, for its digest. Once a file changes, or a download moves the
+    draft's default branch, preparing again returns another directory: serve
+    that one. The server holds the directory it serves until it exits, and
+    takes models_dir's installation lock to hold it when it starts, so it
+    needs write access there; a directory a later preparation no longer
+    returns is removed only once no server holds it.
 
     A ModelError, "cannot prepare TARGET: REASON", refuses the files Splash
     cannot serve without a download (a missing file, an unsupported format,
@@ -85,13 +85,19 @@ def prepare_local_model(
     its reason; an OSError is a failure of the file system.
     """
     target = _path(target)
+    try:
+        return _prepare_paths(target, draft, mmproj, language_only, models_dir)
+    except ModelError as error:
+        raise type(error)(f"cannot prepare {target}: {error}") from None
+
+
+def _prepare_paths(target, draft, mmproj, language_only, models_dir):
+    """prepare_local_model of an absolute target, whose ModelError gives the
+    reason alone."""
     draft = None if draft is None else _path(draft)
     mmproj = None if mmproj is None else _path(mmproj)
     models_root = Path(models_dir).expanduser().resolve()
-    try:
-        return _prepare(target, draft, mmproj, language_only, models_root)
-    except ModelError as error:
-        raise type(error)(f"cannot prepare {target}: {error}") from None
+    return _prepare(target, draft, mmproj, language_only, models_root)
 
 
 def _prepare(target, draft, mmproj, language_only, models_root):
@@ -131,7 +137,7 @@ def _path(value) -> Path:
 
 def _inspect(target, mmproj, language_only, scratch):
     """target's files (hub.Repository) and the target upstream finds in
-    them, its configuration and metadata written into scratch."""
+    them, its configuration and headers written into scratch."""
     if target.is_dir():
         repo = hub.Repository.local_directory(target)
         # The files at its root are the target's: a safetensors file in a
@@ -246,11 +252,6 @@ def _draft(family, draft):
     (hub.Repository.resolve)."""
     if draft:
         return hub.Repository.local_directory(draft)
-    if family.draft_repo is None:
-        raise ModelError(
-            f"no DFlash2 draft is released for {family.name}; pass the "
-            "directory of one as draft"
-        )
     try:
         return hub.Repository.resolve(
             family.draft_repo,
@@ -265,8 +266,12 @@ def _draft(family, draft):
 
 def _main(argv=None):
     """The launcher's helper, run by Splash's Python after setup. Its stdout
-    is only prepare_local_model's result; preparation messages use stderr."""
+    is only prepare_local_model's result, or as it exits 1 its refusal, a
+    serve record failure the launcher reports, of the reason alone, without
+    the target the launcher was given. Preparation messages use stderr."""
     import argparse
+
+    from server import serve_record
 
     parser = argparse.ArgumentParser(description="Prepare local Splash model files")
     parser.add_argument("target")
@@ -278,16 +283,19 @@ def _main(argv=None):
     try:
         signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
         with redirect_stdout(sys.stderr):
-            prepared = prepare_local_model(
-                args.target,
+            prepared = _prepare_paths(
+                _path(args.target),
                 args.draft_model,
-                mmproj=args.mmproj,
-                language_only=args.language_only,
-                models_dir=args.models,
+                args.mmproj,
+                args.language_only,
+                args.models,
             )
         print(prepared)
-    except (ModelError, OSError) as error:
-        print(f"error: {error}", file=sys.stderr)
+    except ModelError as error:
+        print(json.dumps(serve_record.failure(serve_record.MODEL, str(error))))
+        return 1
+    except OSError as error:
+        print(json.dumps(serve_record.failure(serve_record.INTERNAL, str(error))))
         return 1
     except KeyboardInterrupt:
         return 130
