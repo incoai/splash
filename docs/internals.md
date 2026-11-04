@@ -1836,8 +1836,8 @@ a write that fails for another reason stops a file.
 
 The write budget, set only by `--max-cache-disk-writes`
 (`RuntimeResourcesConfig::cacheDiskWritesPerDay`), is a token bucket in the
-disk budget, counted at submission in whole slots by every write of either
-file. Without it the bucket has no rate and admits every write, so nothing
+disk budget, counted at submission in the host pages each write of either
+file stores. Without it the bucket has no rate and admits every write, so nothing
 below is ever held back. It is the process's: each start begins with a
 quarter of a day's. It decides which states are written, and nothing else: one gate on the engine thread, the state file writable, its
 limit holding a slot and the budget admitting the state's class (a state in

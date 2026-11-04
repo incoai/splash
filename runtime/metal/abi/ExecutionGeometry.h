@@ -1,7 +1,8 @@
 #pragma once
 
-// C/Metal ABI constants shared by host and shader compilation. Startup
-// static assertions check the corresponding model and operator contracts.
+// C/Metal ABI constants shared by host and shader compilation. Compile-time
+// static assertions, beside the model's ExecutionLimits (model/Model.hpp)
+// and the operators sized by these, check the contracts between them.
 #define SPLASH_DRAFT_QUERY_ROWS 8u
 #define SPLASH_DRAFT_PROPOSAL_TOKENS 7u
 #define SPLASH_TARGET_VERIFY_ROWS 8u
