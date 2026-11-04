@@ -286,12 +286,18 @@ enum ChatClient {
 
     /// The request counting `messages`: the prompt `stream` sends, as it sends it.
     static func countRequest(_ messages: [ChatMessage], with server: ChatTarget) throws -> URLRequest {
-        var request = URLRequest(url: server.url.appending(path: "v1/chat/completions/count_tokens"))
+        let json = try JSONSerialization.data(withJSONObject: prompt(messages, effort: server.effort, images: server.acceptsImages))
+        return request("v1/chat/completions/count_tokens", json, to: server, timeout: 30)
+    }
+
+    /// A POST of the JSON `body` to `path` on `server`, with the key it asks for.
+    private static func request(_ path: String, _ body: Data, to server: ChatTarget, timeout: TimeInterval) -> URLRequest {
+        var request = URLRequest(url: server.url.appending(path: path))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let key = server.apiKey { request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
-        request.httpBody = try JSONSerialization.data(withJSONObject: prompt(messages, effort: server.effort, images: server.acceptsImages))
-        request.timeoutInterval = 30
+        request.httpBody = body
+        request.timeoutInterval = timeout
         return request
     }
 
@@ -299,13 +305,8 @@ enum ChatClient {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    var request = URLRequest(url: server.url.appending(path: "v1/chat/completions"))
-                    request.httpMethod = "POST"
-                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                    if let key = server.apiKey { request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
-                    request.httpBody = try body(messages, effort: server.effort, images: server.acceptsImages)
-                    request.timeoutInterval = 3600
-                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                    let json = try body(messages, effort: server.effort, images: server.acceptsImages)
+                    let (bytes, response) = try await URLSession.shared.bytes(for: request("v1/chat/completions", json, to: server, timeout: 3600))
                     if let status = (response as? HTTPURLResponse)?.statusCode, status != 200 {
                         var data = Data()
                         for try await byte in bytes { data.append(byte) }
