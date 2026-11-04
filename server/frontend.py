@@ -515,26 +515,12 @@ class Frontend:
             )
         return started_at + min(timeout, self.request_timeout)
 
-    def prepare(
-        self,
-        body,
-        *,
-        deadline,
-        output_field=None,
-        thinking_display="summarized",
-    ):
+    def prepare(self, body, *, deadline, output_field=None):
         """A Chat request, or a Messages request converted to Chat.
-        Output limit errors name output_field, that API's own field.
-        thinking_display "omitted" hides Messages reasoning behind a
-        signature."""
+        Output limit errors name output_field, that API's own field."""
         with self.preparation(deadline) as without_slot:
             return self._prepare(
-                body,
-                None,
-                deadline,
-                without_slot,
-                output_field=output_field,
-                thinking_display=thinking_display,
+                body, None, deadline, without_slot, output_field=output_field
             )
 
     def prepare_completion(self, body, *, deadline):
@@ -842,7 +828,6 @@ class Frontend:
         without_slot,
         *,
         output_field,
-        thinking_display,
     ):
         # Fields checked without the prompt fail before it is prepared, which
         # can render documents and build validators.
@@ -945,7 +930,6 @@ class Frontend:
             thinking_token_budget=(
                 budget if thinking and budget is not None and budget < max_new else None
             ),
-            thinking_display=thinking_display,
             tool_policy=tool_policy,
             response_validator=response_validator,
             response_format=body.get("response_format"),
@@ -1117,7 +1101,6 @@ class Frontend:
                 deadline,
                 without_slot,
                 output_field="max_output_tokens",
-                thinking_display="summarized",
             )
             job.response_store = store
             job.response_previous_id = previous_id

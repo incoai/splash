@@ -29,7 +29,6 @@ from install.models import ModelError
 
 from . import dialects, json_codec, request_fields, serve_options, serve_record
 from . import runtime as engine_runtime
-from .api_shapes import anthropic_to_chat_body, anthropic_to_chat_prompt
 from .backend import (
     NativeBackend,
     NativeResult,
@@ -46,7 +45,6 @@ from .constraints import (
 )
 from .diagnostics import log_unexpected, print_request, print_status
 from .errors import (
-    ANTHROPIC_ERRORS,
     OPENAI_ERRORS,
     RETRY_STATUSES,
     APIError,
@@ -679,29 +677,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
             return job, partial(dialects.responses.stream, self)
         return job, partial(dialects.responses.complete, self)
 
-    def _post_messages(self, body, deadline):
-        progress = request_fields.progress_flag(body)
-        chat, thinking_display = anthropic_to_chat_body(
-            body, thinking_resolver=self.app.thinking_codec.decode
-        )
-        job = self.app.prepare(
-            chat,
-            deadline=deadline,
-            output_field="max_tokens",
-            thinking_display=thinking_display,
-        )
-        job.flags |= progress
-        if body.get("stream"):
-            return job, partial(dialects.anthropic.stream, self)
-        return job, partial(dialects.anthropic.complete, self)
-
-    def _post_count_tokens(self, body, deadline):
-        prompt = anthropic_to_chat_prompt(
-            body, thinking_resolver=self.app.thinking_codec.decode
-        )
-        tokens = self.app.count_tokens(prompt, deadline=deadline)
-        self.send_json(200, {"input_tokens": tokens})
-
     def _post_tokenize(self, body, deadline):
         self.send_json(200, {"tokens": self.app.tokenize(body, deadline=deadline)})
 
@@ -967,9 +942,13 @@ ROUTES = {
     ),
     ("POST", "/v1/completions"): Route(dialects.openai.post_completion),
     ("POST", "/v1/responses"): Route(FrontendHandler._post_responses),
-    ("POST", "/v1/messages"): Route(FrontendHandler._post_messages, ANTHROPIC_ERRORS),
+    ("POST", "/v1/messages"): Route(
+        dialects.anthropic.post_messages, dialects.anthropic.ERRORS
+    ),
     ("POST", "/v1/messages/count_tokens"): Route(
-        FrontendHandler._post_count_tokens, ANTHROPIC_ERRORS, prompt_only=True
+        dialects.anthropic.post_count_tokens,
+        dialects.anthropic.ERRORS,
+        prompt_only=True,
     ),
     ("POST", "/tokenize"): Route(FrontendHandler._post_tokenize, prompt_only=True),
     ("POST", "/apply-template"): Route(
@@ -1012,7 +991,9 @@ def path_errors(path):
     route, _ = find_route(path)
     if route is not None:
         return route.errors
-    return ANTHROPIC_ERRORS if path.startswith("/v1/messages/") else OPENAI_ERRORS
+    if path.startswith("/v1/messages/"):
+        return dialects.anthropic.ERRORS
+    return OPENAI_ERRORS
 
 
 class FrontendServer(HTTPServer):

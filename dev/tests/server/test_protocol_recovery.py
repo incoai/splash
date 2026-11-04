@@ -4,16 +4,13 @@ import unittest
 from itertools import product
 from unittest import mock
 
-from dev.tests.server_fixtures import FOREVER, FakeRuntime, Harness, Plan
+from dev.tests.server_fixtures import FakeRuntime, Harness, Plan
 from dev.tests.tool_output import argument_grammar, project
 from server import errors as api_errors
 from server import server as api
 from server import tool_schema
-from server.api_shapes import (
-    anthropic_to_chat_prompt,
-    normalize_messages,
-    template_messages,
-)
+from server.api_shapes import normalize_messages, template_messages
+from server.dialects import anthropic as anthropic_dialect
 from server.thinking import ThinkingCodec
 
 
@@ -139,9 +136,6 @@ class ProtocolRecoveryTests(unittest.TestCase):
         self.assertEqual(status, 200, payload)
         message = json.loads(payload)["choices"][0]["message"]
         self.assertEqual(message["reasoning_content"], "because ")
-        self.assertEqual(
-            harness.app.prepare(body, deadline=FOREVER).thinking_display, "summarized"
-        )
 
     def test_omitted_tool_roundtrip_and_summarized_compatibility(self):
         codec = ThinkingCodec()
@@ -174,7 +168,9 @@ class ProtocolRecoveryTests(unittest.TestCase):
                     },
                 ]
             )
-            chat = anthropic_to_chat_prompt(history, thinking_resolver=codec.decode)
+            chat = anthropic_dialect.to_chat_prompt(
+                history, thinking_resolver=codec.decode
+            )
             self.assertEqual(
                 chat["messages"][1]["reasoning_content"],
                 "inspect before acting" if signed else text,

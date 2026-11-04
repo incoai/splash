@@ -21,6 +21,7 @@ from dev.tests.tool_output import (
 )
 from server import api_shapes, tool_schema
 from server.chat_format import QWEN
+from server.dialects import anthropic as anthropic_dialect
 from server.errors import APIError
 from server.tool_schema import _grammar_compatible_schema
 
@@ -101,7 +102,7 @@ class ToolSchemaCompositionTests(HarnessTestCase):
             {"tools": [{"type": "function", **function}]},
             [{"role": "user", "content": "Create a note"}],
         )
-        messages, _ = api_shapes.anthropic_to_chat_body(
+        messages, _ = anthropic_dialect.to_chat_body(
             {
                 "model": "test",
                 "max_tokens": 128,

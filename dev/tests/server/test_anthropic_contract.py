@@ -24,11 +24,8 @@ from dev.tests.server_fixtures import (
 )
 from server import documents
 from server import frontend as request_frontend
-from server.api_shapes import (
-    anthropic_to_chat_body,
-    anthropic_to_chat_prompt,
-    normalize_messages,
-)
+from server.api_shapes import normalize_messages
+from server.dialects import anthropic as anthropic_dialect
 from server.errors import APIError
 from server.tool_schema import normalize_tools
 
@@ -144,10 +141,12 @@ class AnthropicAdapterTest(unittest.TestCase):
                 },
             ]
         )
-        counted = anthropic_to_chat_prompt(body, thinking_resolver=no_signed_thinking)
+        counted = anthropic_dialect.to_chat_prompt(
+            body, thinking_resolver=no_signed_thinking
+        )
         self.assertEqual(counted["messages"][-1]["role"], "assistant")
         with self.assertRaisesRegex(APIError, "final assistant message"):
-            anthropic_to_chat_body(body, thinking_resolver=no_signed_thinking)
+            anthropic_dialect.to_chat_body(body, thinking_resolver=no_signed_thinking)
 
     def test_tool_references_preserve_text_order_and_error_status(self):
         for is_error in (False, True):
@@ -162,7 +161,7 @@ class AnthropicAdapterTest(unittest.TestCase):
                 )
                 body["messages"][-1]["content"][0]["is_error"] = is_error
                 original = copy.deepcopy(body)
-                chat = anthropic_to_chat_prompt(
+                chat = anthropic_dialect.to_chat_prompt(
                     body, thinking_resolver=no_signed_thinking
                 )
                 expected = (
@@ -196,7 +195,9 @@ class AnthropicAdapterTest(unittest.TestCase):
                 {"type": "tool_reference", "tool_name": "time"},
             ]
         )
-        chat = anthropic_to_chat_prompt(body, thinking_resolver=no_signed_thinking)
+        chat = anthropic_dialect.to_chat_prompt(
+            body, thinking_resolver=no_signed_thinking
+        )
         self.assertEqual(
             chat["messages"][-1]["content"],
             [
@@ -210,13 +211,15 @@ class AnthropicAdapterTest(unittest.TestCase):
         name = "mcp__hindsight__recall"
         body = tool_search_body([{"type": "tool_reference", "tool_name": name}])
         del body["tools"]
-        chat = anthropic_to_chat_prompt(body, thinking_resolver=no_signed_thinking)
+        chat = anthropic_dialect.to_chat_prompt(
+            body, thinking_resolver=no_signed_thinking
+        )
         self.assertEqual(chat["messages"][-1]["content"], f"\nAvailable tool: {name}\n")
 
     def test_tool_references_name_tools_by_the_tool_name_rule(self):
         for name in ("mcp.search", "web search", "x" * 256):
             with self.subTest(name=name):
-                chat = anthropic_to_chat_prompt(
+                chat = anthropic_dialect.to_chat_prompt(
                     tool_search_body([{"type": "tool_reference", "tool_name": name}]),
                     thinking_resolver=no_signed_thinking,
                 )
@@ -233,7 +236,7 @@ class AnthropicAdapterTest(unittest.TestCase):
             "e\u0301",
         ):
             with self.subTest(name=name), self.assertRaises(APIError) as caught:
-                anthropic_to_chat_prompt(
+                anthropic_dialect.to_chat_prompt(
                     tool_search_body([{"type": "tool_reference", "tool_name": name}]),
                     thinking_resolver=no_signed_thinking,
                 )
@@ -243,7 +246,7 @@ class AnthropicAdapterTest(unittest.TestCase):
     def test_tool_references_are_only_supported_in_tool_results(self):
         for role in ("user", "assistant"):
             with self.subTest(role=role), self.assertRaises(APIError) as caught:
-                anthropic_to_chat_prompt(
+                anthropic_dialect.to_chat_prompt(
                     request_body(
                         messages=[
                             {
@@ -288,7 +291,7 @@ class AnthropicAdapterTest(unittest.TestCase):
             ]
         )
         original = copy.deepcopy(body)
-        translated = anthropic_to_chat_prompt(
+        translated = anthropic_dialect.to_chat_prompt(
             body, thinking_resolver=no_signed_thinking
         )
         messages = translated["messages"]
@@ -312,7 +315,7 @@ class AnthropicAdapterTest(unittest.TestCase):
                 self.subTest(role=role, data=data),
                 self.assertRaises(APIError) as caught,
             ):
-                anthropic_to_chat_prompt(
+                anthropic_dialect.to_chat_prompt(
                     request_body(
                         messages=[
                             {
@@ -337,7 +340,7 @@ class AnthropicAdapterTest(unittest.TestCase):
             with self.subTest(fields=fields):
                 self.assertNotIn(
                     "preserve_thinking",
-                    anthropic_to_chat_prompt(
+                    anthropic_dialect.to_chat_prompt(
                         request_body(**fields), thinking_resolver=no_signed_thinking
                     ),
                 )
@@ -350,7 +353,7 @@ class AnthropicAdapterTest(unittest.TestCase):
             with self.subTest(fields=fields):
                 body = request_body(**fields)
                 original = copy.deepcopy(body)
-                translated, _ = anthropic_to_chat_body(
+                translated, _ = anthropic_dialect.to_chat_body(
                     body, thinking_resolver=no_signed_thinking
                 )
                 self.assertEqual(body, original)
@@ -366,7 +369,7 @@ class AnthropicAdapterTest(unittest.TestCase):
             output_config={"effort": "xhigh", "format": FORMAT},
             tools=[{"name": "lookup", "input_schema": {"type": "object"}}],
         )
-        translated = anthropic_to_chat_prompt(
+        translated = anthropic_dialect.to_chat_prompt(
             body, thinking_resolver=no_signed_thinking
         )
         self.assertEqual(translated["reasoning_effort"], "xhigh")
@@ -379,7 +382,7 @@ class AnthropicAdapterTest(unittest.TestCase):
                 {"name": "lookup", "input_schema": {"type": "object"}, "strict": True}
             ],
         )
-        translated = anthropic_to_chat_prompt(
+        translated = anthropic_dialect.to_chat_prompt(
             body, thinking_resolver=no_signed_thinking
         )
         self.assertIs(translated["tools"][0]["function"]["strict"], True)
@@ -409,7 +412,7 @@ class AnthropicAdapterTest(unittest.TestCase):
             ):
                 with self.subTest(fields=fields, thinking=thinking):
                     with self.assertRaises(APIError):
-                        anthropic_to_chat_prompt(
+                        anthropic_dialect.to_chat_prompt(
                             request_body(thinking=thinking, **fields),
                             thinking_resolver=no_signed_thinking,
                         )
@@ -419,7 +422,7 @@ class AnthropicAdapterTest(unittest.TestCase):
             {"output_config": {"format": None}, "output_format": FORMAT},
         ):
             with self.subTest(fields=fields):
-                chat = anthropic_to_chat_prompt(
+                chat = anthropic_dialect.to_chat_prompt(
                     request_body(**fields), thinking_resolver=no_signed_thinking
                 )
                 self.assertEqual(
@@ -433,7 +436,7 @@ class AnthropicAdapterTest(unittest.TestCase):
                 )
 
     def test_anthropic_tool_history_and_choice_use_one_chat_pipeline(self):
-        translated, _ = anthropic_to_chat_body(
+        translated, _ = anthropic_dialect.to_chat_body(
             anthropic_body(
                 system=[{"type": "text", "text": "be exact"}],
                 messages=[
@@ -493,7 +496,7 @@ class AnthropicAdapterTest(unittest.TestCase):
         self.assertFalse(translated["parallel_tool_calls"])
 
     def test_anthropic_adaptive_thinking_maps_reasoning_effort(self):
-        translated, _ = anthropic_to_chat_body(
+        translated, _ = anthropic_dialect.to_chat_body(
             anthropic_body(
                 thinking={"type": "adaptive"},
                 output_config={"effort": "high"},
@@ -501,7 +504,7 @@ class AnthropicAdapterTest(unittest.TestCase):
             thinking_resolver=no_signed_thinking,
         )
         self.assertEqual(translated["reasoning_effort"], "high")
-        translated, _ = anthropic_to_chat_body(
+        translated, _ = anthropic_dialect.to_chat_body(
             anthropic_body(
                 thinking={"type": "adaptive"},
                 output_config={"effort": "low"},
@@ -512,7 +515,7 @@ class AnthropicAdapterTest(unittest.TestCase):
 
     def test_anthropic_strips_nonsemantic_billing_system_block(self):
         def translated(metadata):
-            chat, _ = anthropic_to_chat_body(
+            chat, _ = anthropic_dialect.to_chat_body(
                 anthropic_body(
                     system=[
                         {
@@ -539,7 +542,7 @@ class AnthropicAdapterTest(unittest.TestCase):
         )
 
     def test_anthropic_preserves_inline_system_messages(self):
-        translated, _ = anthropic_to_chat_body(
+        translated, _ = anthropic_dialect.to_chat_body(
             anthropic_body(
                 messages=[
                     {"role": "user", "content": "hello"},
@@ -562,7 +565,7 @@ class AnthropicAdapterTest(unittest.TestCase):
 
         body = anthropic_body(messages=[{"content": "missing role"}])
         with self.assertRaisesRegex(APIError, "require user/assistant/system roles"):
-            anthropic_to_chat_body(body, thinking_resolver=no_signed_thinking)
+            anthropic_dialect.to_chat_body(body, thinking_resolver=no_signed_thinking)
 
     def test_tool_changes_join_the_request_tools(self):
         body = request_body(
@@ -586,7 +589,9 @@ class AnthropicAdapterTest(unittest.TestCase):
             ],
         )
         original = copy.deepcopy(body)
-        chat = anthropic_to_chat_prompt(body, thinking_resolver=no_signed_thinking)
+        chat = anthropic_dialect.to_chat_prompt(
+            body, thinking_resolver=no_signed_thinking
+        )
         # A system message keeps its text where it is.
         self.assertEqual(
             chat["messages"],
@@ -663,7 +668,7 @@ class AnthropicAdapterTest(unittest.TestCase):
                 ]
             body = request_body(messages=messages, tools=[TIME, WEATHER])
             with self.subTest(changes=changes):
-                chat = anthropic_to_chat_prompt(
+                chat = anthropic_dialect.to_chat_prompt(
                     body, thinking_resolver=no_signed_thinking
                 )
                 self.assertEqual(
@@ -686,7 +691,9 @@ class AnthropicAdapterTest(unittest.TestCase):
             tools=[TIME, WEATHER],
             tool_choice={"type": "tool", "name": "weather"},
         )
-        chat = anthropic_to_chat_prompt(body, thinking_resolver=no_signed_thinking)
+        chat = anthropic_dialect.to_chat_prompt(
+            body, thinking_resolver=no_signed_thinking
+        )
         with self.assertRaisesRegex(APIError, "invalid named tool_choice"):
             normalize_tools(
                 chat["tools"], chat["tool_choice"], chat["parallel_tool_calls"]
@@ -738,7 +745,9 @@ class AnthropicAdapterTest(unittest.TestCase):
                     self.subTest(block=block),
                     self.assertRaisesRegex(APIError, error) as caught,
                 ):
-                    anthropic_to_chat_prompt(body, thinking_resolver=no_signed_thinking)
+                    anthropic_dialect.to_chat_prompt(
+                        body, thinking_resolver=no_signed_thinking
+                    )
                 self.assertEqual(caught.exception.status, 400)
 
         # Only a system message changes tools.
@@ -759,7 +768,9 @@ class AnthropicAdapterTest(unittest.TestCase):
                 self.subTest(placement=placement),
                 self.assertRaisesRegex(APIError, "unsupported") as caught,
             ):
-                anthropic_to_chat_prompt(body, thinking_resolver=no_signed_thinking)
+                anthropic_dialect.to_chat_prompt(
+                    body, thinking_resolver=no_signed_thinking
+                )
             self.assertEqual(caught.exception.status, 400)
 
         # A repeated tool name is rejected with tool changes as without them.
@@ -771,7 +782,7 @@ class AnthropicAdapterTest(unittest.TestCase):
             tools=[TIME, TIME],
         )
         with self.assertRaisesRegex(APIError, "duplicate tool name: time"):
-            anthropic_to_chat_prompt(body, thinking_resolver=no_signed_thinking)
+            anthropic_dialect.to_chat_prompt(body, thinking_resolver=no_signed_thinking)
 
     def test_anthropic_thinking_off_is_not_reenabled_by_effort(self):
         tokenizer = TemplateTokenizer(reasoning_template())
@@ -780,12 +791,14 @@ class AnthropicAdapterTest(unittest.TestCase):
             body = anthropic_body(output_config={"effort": "high"})
             if thinking is not None:
                 body["thinking"] = thinking
-            chat, _ = anthropic_to_chat_body(body, thinking_resolver=no_signed_thinking)
+            chat, _ = anthropic_dialect.to_chat_body(
+                body, thinking_resolver=no_signed_thinking
+            )
             job = app.prepare(chat, deadline=FOREVER)
             self.assertFalse(job.thinking)
             self.assertEqual(
                 app.count_tokens(
-                    anthropic_to_chat_prompt(
+                    anthropic_dialect.to_chat_prompt(
                         body, thinking_resolver=no_signed_thinking
                     ),
                     deadline=FOREVER,
@@ -809,7 +822,9 @@ class AnthropicAdapterTest(unittest.TestCase):
                     self.subTest(thinking=thinking, effort=effort),
                     self.assertRaisesRegex(APIError, "output_config.effort"),
                 ):
-                    anthropic_to_chat_prompt(body, thinking_resolver=no_signed_thinking)
+                    anthropic_dialect.to_chat_prompt(
+                        body, thinking_resolver=no_signed_thinking
+                    )
 
 
 class AnthropicHTTPContractTest(HarnessTestCase):
@@ -1189,7 +1204,7 @@ class AnthropicHTTPContractTest(HarnessTestCase):
         ):
             with self.subTest(tool_result=len(messages) > 1):
                 body = request_body(messages=messages)
-                translated, _ = anthropic_to_chat_body(
+                translated, _ = anthropic_dialect.to_chat_body(
                     body, thinking_resolver=no_signed_thinking
                 )
                 # Conversion leaves the PDF to request preparation.
@@ -1606,7 +1621,7 @@ class AnthropicHTTPContractTest(HarnessTestCase):
                         self.assertEqual(status, 200, payload)
                         counted = json.loads(payload)
                         self.assertEqual(set(counted), {"input_tokens"})
-                chat, _ = anthropic_to_chat_body(
+                chat, _ = anthropic_dialect.to_chat_body(
                     {**body, "max_tokens": 2048}, thinking_resolver=no_signed_thinking
                 )
                 job = harness.app.prepare(chat, deadline=FOREVER)
@@ -1641,7 +1656,7 @@ class AnthropicHTTPContractTest(HarnessTestCase):
         self.assertEqual(status, 200, payload)
         self.assertEqual(json.loads(payload), {"input_tokens": 130})
         self.assertEqual(harness.app.images.stats()["request_bytes"], 0)
-        chat, _ = anthropic_to_chat_body(
+        chat, _ = anthropic_dialect.to_chat_body(
             {**body, "max_tokens": 1}, thinking_resolver=no_signed_thinking
         )
         with self.assertRaisesRegex(APIError, "context window"):

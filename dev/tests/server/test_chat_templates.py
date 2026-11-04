@@ -22,6 +22,7 @@ from server.chat_templates import (
     ChatTemplates,
     template_options,
 )
+from server.dialects import anthropic as anthropic_dialect
 from server.dialects import scoring
 from server.errors import APIError
 
@@ -1121,7 +1122,7 @@ class LeadingSystemMergeTests(unittest.TestCase):
                 {"role": "user", "content": "Ask"},
             ],
         )[0]["messages"]
-        anthropic = api_shapes.anthropic_to_chat_prompt(
+        anthropic = anthropic_dialect.to_chat_prompt(
             {
                 "model": "m",
                 "system": "Base",

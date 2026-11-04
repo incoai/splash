@@ -77,35 +77,4 @@ class ErrorDialect:
         }
 
 
-class AnthropicErrors(ErrorDialect):
-    # The type of an error of each status Anthropic's API names one for; any
-    # other is an api_error from 500, else an invalid_request_error.
-    TYPES = {
-        401: "authentication_error",
-        403: "permission_error",
-        404: "not_found_error",
-        408: "timeout_error",
-        413: "request_too_large",
-        429: "rate_limit_error",
-        503: "overloaded_error",
-        504: "timeout_error",
-    }
-
-    def payload(self, error):
-        message = error.message
-        if isinstance(error, ContextLengthError):
-            message = (
-                f"prompt is too long: {error.input_tokens} tokens > "
-                f"{error.maximum_input_tokens} maximum input tokens"
-            )
-            if error.image_tokens_only:
-                message += " (image tokens alone; text not yet counted)"
-        error_type = self.TYPES.get(
-            error.status,
-            "api_error" if error.status >= 500 else "invalid_request_error",
-        )
-        return {"type": "error", "error": {"type": error_type, "message": message}}
-
-
 OPENAI_ERRORS = ErrorDialect()
-ANTHROPIC_ERRORS = AnthropicErrors()

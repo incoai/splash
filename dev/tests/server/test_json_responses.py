@@ -260,7 +260,7 @@ class JsonResponseTests(unittest.TestCase):
         functions = (
             (openai_dialect, "completion_response"),
             (responses_dialect, "responses_response"),
-            (anthropic_dialect, "anthropic_response"),
+            (anthropic_dialect, "message_response"),
         )
         for path, (dialect, function) in zip(PATHS, functions, strict=True):
             for stream in (False, True):

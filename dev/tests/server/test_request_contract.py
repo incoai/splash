@@ -34,7 +34,8 @@ from server import documents, json_codec, runtime, schema_validation, tool_schem
 from server import frontend as request_frontend
 from server import protocol as wire
 from server import server as api
-from server.api_shapes import anthropic_to_chat_prompt, normalize_messages
+from server.api_shapes import normalize_messages
+from server.dialects import anthropic as anthropic_dialect
 from server.errors import APIError
 
 
@@ -200,7 +201,7 @@ class RequestContractTests(HarnessTestCase):
 
     def test_enabled_thinking_honors_effort(self):
         for effort in ("low", "medium", "high", "xhigh", "max"):
-            converted = anthropic_to_chat_prompt(
+            converted = anthropic_dialect.to_chat_prompt(
                 {
                     "model": "test-model",
                     "messages": [{"role": "user", "content": "Hi"}],

@@ -132,7 +132,6 @@ class Job:
     # The thinking tokens the job may select before its thinking closes, set
     # only where that comes before the output limit; None for no cap.
     thinking_token_budget: int | None = None
-    thinking_display: str = "summarized"
     reasoning_tokens: int = 0
     events: queue.Queue = field(default_factory=queue.Queue)
     cancelled: threading.Event = field(default_factory=threading.Event)
