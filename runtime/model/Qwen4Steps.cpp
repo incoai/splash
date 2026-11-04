@@ -382,8 +382,9 @@ std::vector<uint32_t> Qwen4Steps::verifyPleRows(uint32_t lane) const {
   return {indices + uint64_t{lane} * kVerifyRows * heads, indices + uint64_t{lane + 1} * kVerifyRows * heads};
 }
 
-// The products stay below 2^63 (the multipliers are bounded by the
-// vocabulary), so the unsigned hash equals the reference's signed one.
+// The products stay below 2^63 (readPleHash bounds each multiplier by
+// INT64_MAX / vocabulary), so the unsigned hash equals the reference's signed
+// one.
 void qwen4PleRows(const Qwen4ExpWeights &weights, uint64_t position, std::span<const uint32_t> tokens,
                   std::span<const uint32_t> history, uint32_t *out) {
   const Qwen4ExpLayout &layout = weights.layout;

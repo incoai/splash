@@ -1,6 +1,7 @@
 #include "Checked.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "tests/engine/AllocationFailure.hpp"
+#include "tests/engine/ClaimScope.hpp"
 #include "model/QwenState.hpp"
 #include "tests/engine/TestChecks.hpp"
 
@@ -132,6 +133,9 @@ void testLayoutFormulas() {
 void testOffloadAllocationFailure(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
+  // What a case's storage allocates through the governor is a start's, in
+  // its Floor claim (design/M.md L7).
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   constexpr model::CompositeStateLayout layout{{1, 3, 128, 1, 128, 128},
                                                {1, 1, 4, 128}};
   const uint64_t slotBytes = model::SlotFile::slotBytesFor(layout.cachedBytes());
@@ -191,6 +195,7 @@ void testOffloadAllocationFailure(metal::MetalBackend &backend) {
 void testDiskRestore(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
@@ -270,6 +275,7 @@ void testDiskRestore(metal::MetalBackend &backend) {
 void testDirectDiskSnapshot(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
@@ -327,6 +333,7 @@ void testDirectDiskSnapshot(metal::MetalBackend &backend) {
 void testStateWritesDrawOnTheWriteBudget(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   double now = 0.0;
   auto budget = std::make_shared<model::DiskBudget>(4 * kStateSlotBytes, [&now] { return now; });
   // Two slots a day, half a slot at once.
@@ -351,9 +358,10 @@ void testStateWritesDrawOnTheWriteBudget(metal::MetalBackend &backend) {
   storage.releaseLane(0, 456);
 }
 
-// A state need not fill its slot: the write zeros the slot past it and the
-// read leaves the rest, in a slot one host page larger than an aligned state
-// and in the rounded-up slot of a state that is not aligned.
+// A state need not fill its slot: it comes back exactly from a slot one host
+// page larger than an aligned state and from the rounded-up slot of a state
+// that is not aligned. slot_file_test checks that a write stores only the
+// pages its state reaches.
 void testStateSmallerThanSlot(metal::MetalBackend &backend) {
   constexpr model::GdnStateLayout target{1, 3, 128, 1, 128, 128};
   constexpr model::CompositeStateLayout aligned{target, {1, 1, 4, 128}};
@@ -362,6 +370,7 @@ void testStateSmallerThanSlot(metal::MetalBackend &backend) {
                 unaligned.cachedBytes() % kHostPageBytes != 0);
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   for (const auto &[layout, slotBytes] :
        {std::pair{aligned, aligned.cachedBytes() + kHostPageBytes},
         std::pair{unaligned, model::SlotFile::slotBytesFor(unaligned.cachedBytes())}}) {
@@ -399,6 +408,7 @@ void testStateSmallerThanSlot(metal::MetalBackend &backend) {
 void testPersistentStateComesBack(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   std::string name = (std::filesystem::temp_directory_path() / "splash-states-XXXXXX").string();
   require(::mkdtemp(name.data()) != nullptr, "temporary directory could not be made");
   const std::filesystem::path directory = name;
@@ -467,6 +477,7 @@ void testPersistentStateComesBack(metal::MetalBackend &backend) {
 void testPersistKeepsTheRamCopy(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   model::QwenStateStorage storage(
       backend, governor.allocationAdmission(), kStateLayout,
       std::make_shared<model::SlotFile>(kStateSlotBytes,
@@ -505,6 +516,7 @@ void testPersistKeepsTheRamCopy(metal::MetalBackend &backend) {
 void testReservations(metal::MetalBackend &backend) {
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   bool admitNew = true;
   uint32_t admissions = 0;
   const metal::AllocationAdmission admit = [admit = governor.allocationAdmission(), &admitNew, &admissions](
@@ -625,6 +637,7 @@ void testAttentionOnlyTarget(metal::MetalBackend &backend) {
                 !model::GdnStateLayout{48, 3, 10'240, 48, 128, 0}.valid());
   MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
                           queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   uint32_t admissions = 0;
   const metal::AllocationAdmission admit = [admit = governor.allocationAdmission(), &admissions](
                                                uint64_t bytes, const std::function<void()> &allocate) {
@@ -724,6 +737,7 @@ void run(const std::string &metallib) {
   MemoryGovernor governor(
       backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
       queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
   // Switched off to prove that a pooled cache slot needs no new admission;
   // the count is of the admissions granted.
   bool admitNewAllocations = true;

@@ -286,6 +286,10 @@ public:
   // each allocation covers: a lane keeps two cells, the draft rings and a
   // window, and cells of no bytes count none.
   [[nodiscard]] uint64_t idleBytes(uint32_t evictedStates) const noexcept;
+  // What a lane's activation and `states` cached states beside it allocate:
+  // what the pool lacks of the lane's buffers (acquire), and each state's
+  // cell and context window whole (reserve).
+  [[nodiscard]] uint64_t startBytes(uint32_t states) const noexcept;
 
   // Hot-path metadata operations; none performs a buffer copy. A step makes
   // next() current. swapParity: a prefill step's, which read the lane's
