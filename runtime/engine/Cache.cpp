@@ -1058,8 +1058,7 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
   // What frees only later holds its chain above it too, which frees later:
   // a state that leaves only once written, or once the write in flight has
   // landed; a block a writable tier writes before its page frees; a
-  // demotion in flight.
-  // The states the walk takes count by the same split.
+  // demotion in flight. The states the walk takes count by the same split.
   std::vector<uint64_t> later = kept;
   ReclaimReach result;
   Walk states = walk;

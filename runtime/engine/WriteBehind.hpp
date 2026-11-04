@@ -102,9 +102,9 @@ private:
   // Copies are made now: always in a persistent tier; in a temporary one
   // on the demand last asked with.
   [[nodiscard]] bool copying() const noexcept;
-  // The cache's victims that go at once without a write, plus what the
-  // copies ahead in flight free once they land, hold less than
-  // `demandBytes`.
+  // What the cache's units that go at once without a write free at most
+  // (Cache::peek), plus what the copies ahead in flight free once they
+  // land, is less than `demandBytes`.
   [[nodiscard]] bool demanded(uint64_t demandBytes) const;
   // A temporary tier's point whose request has not ended.
   [[nodiscard]] bool inUse(uint64_t block) const noexcept;

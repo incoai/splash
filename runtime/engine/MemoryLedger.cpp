@@ -489,11 +489,10 @@ MemoryLedger::Run MemoryLedger::bound(const ClaimSpec &spec, const VictimQuery &
 // frees nothing is passed over: a transfer in flight may hold it (pending),
 // or nothing of it is left. A claim that can wait takes nothing of a later
 // stage than a pending unit's: it waits for that transfer, as the cache's
-// units come before the store's and what is in use. Every take either frees something of a finite
-// cache or pool or passes one of a source's finitely many units, so the
-// walk ends. A unit's state buffers
-// count for a need of bytes as in bound(). An Immediate claim passes over
-// what lands later.
+// units come before the store's and what is in use. Every take frees
+// something of a finite cache or pool, or passes one of a source's finitely
+// many units, so the walk ends. A unit's state buffers count for a need of
+// bytes as in bound(). An Immediate claim passes over what lands later.
 MemoryLedger::Run MemoryLedger::take(const ClaimSpec &spec, const VictimQuery &query, const Lacking &lack) {
   Order order(*this, spec, query);
   Run run{.freed = {.outcome = FreeOutcome::Met}};

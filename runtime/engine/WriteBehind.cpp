@@ -43,9 +43,9 @@ bool WriteBehind::settle(PersistStatus status) {
 bool WriteBehind::copying() const noexcept { return cache_.persistent() || demandBytes_ != 0; }
 
 bool WriteBehind::demanded(uint64_t demandBytes) const {
-  // What the cache gives a claim that cannot wait now, which starts no write
-  // and waits for none, and what the copies ahead in flight let go once they
-  // land.
+  // At most what the cache gives a claim that cannot wait now, which starts
+  // no write and waits for none, and what the copies ahead in flight let go
+  // once they land.
   const ClaimSpec atOnce{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate};
   const VictimQuery query{.claim = &atOnce, .need = {.bytes = demandBytes}};
   uint64_t covered = cache_.copyingAheadBytes();
