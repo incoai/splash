@@ -282,14 +282,15 @@ public:
   }
 };
 
-// The time a clean stop gives the newest restore points of a persistent
-// cache to reach the disk before it closes the cache; the server waits
-// supervision::kStop for the engine to exit.
+// The time the newest restore points of a persistent cache get to reach the
+// disk once the transport has ended, before the cache closes; the server
+// waits supervision::kStop for the engine to exit.
 constexpr auto kFlushBudget = supervision::kFlush;
 
-// A clean stop of a persistent cache: the newest restore points reach the
-// disk, then the cache closes. An engine that fails meanwhile writes nothing
-// more, and its cache counts as ending uncleanly.
+// A clean close of a persistent cache, however the transport ended: the
+// newest restore points reach the disk, then the cache closes. An engine
+// that fails meanwhile writes nothing more, and its cache counts as ending
+// uncleanly.
 void closePersistentCache(engine::FdTransport &transport,
                           engine::RuntimeBootstrap &bootstrap) {
   engine::NativeRuntime &loop = bootstrap.nativeLoop();
@@ -416,8 +417,6 @@ int serveNative(int argc, char **argv) {
   const auto exit = transport.run(bootstrap->nativeLoop());
   switch (exit) {
   case engine::NativeProcessExit::CleanEof:
-    if (bootstrap->resources().cache().persistent())
-      closePersistentCache(transport, *bootstrap);
     break;
   case engine::NativeProcessExit::ProtocolFailure:
     writeStderrLine(
@@ -444,6 +443,10 @@ int serveNative(int argc, char **argv) {
         transport.failure() + ")");
     break;
   }
+  // Not only a clean stop: a protocol or I/O failure leaves the engine
+  // healthy, and its newest restore points still reach the disk.
+  if (bootstrap->resources().cache().persistent() && bootstrap->nativeLoop().engineHealthy())
+    closePersistentCache(transport, *bootstrap);
   return static_cast<int>(exit);
 }
 
