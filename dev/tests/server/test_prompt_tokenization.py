@@ -16,8 +16,8 @@ from tokenizers import (
 from transformers import PreTrainedTokenizerFast
 
 from dev.tests.server_fixtures import NATIVE_CONTEXT
-from server import judgments
 from server.chat_format import QWEN
+from server.dialects import scoring
 from server.tokenization import PromptTokenizer, tokenizable
 
 
@@ -89,7 +89,7 @@ class PromptTokenizationTests(unittest.TestCase):
         # Encoding text and a label equals the split's tokens followed by the
         # encoded end and label, so a label extends the whole text's tokens
         # by its token exactly when it so extends the end's: a slot check
-        # need encode only the end (judgments.encode_prompt).
+        # need encode only the end (scoring.encode_prompt).
         randomizer = random.Random(1234)
         fragments = [
             "e\u0301",
@@ -160,7 +160,7 @@ class PromptTokenizationTests(unittest.TestCase):
             {"role": "system", "content": "Choose one."},
             {"role": "user", "content": "Release notes 中文 e\u0301. " * 2000},
         ]
-        labels = judgments.slot_labels(self.tokenizer)[:26]
+        labels = scoring.slot_labels(self.tokenizer)[:26]
         encode = self.tokenizer.encode
         encoded = []
 
@@ -169,7 +169,7 @@ class PromptTokenizationTests(unittest.TestCase):
             return encode(text, **options)
 
         with mock.patch.object(self.tokenizer, "encode", counted):
-            ids, slots, prompt = judgments.encode_prompt(
+            ids, slots, prompt = scoring.encode_prompt(
                 self.cache,
                 template,
                 messages,

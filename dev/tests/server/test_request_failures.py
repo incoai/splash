@@ -22,6 +22,7 @@ from dev.tests.server_fixtures import (
 )
 from server import server as api
 from server.dialects import responses as responses_dialect
+from server.dialects import scoring
 
 
 class EndFailTokenizer(FakeTokenizer):
@@ -402,12 +403,16 @@ class RequestFailureTests(HarnessTestCase):
         for error in (ValueError("late"), RecursionError()):
             for path, body, target, name in (
                 ("/v1/chat/completions", chat_body(), "app", "prepare"),
-                ("/v1/systemone", systemone, "app", "prepare_systemone"),
+                ("/v1/systemone", systemone, "scoring", "prepare_systemone"),
                 ("/v1/chat/completions", chat_body(), "handler", "collect"),
             ):
                 with self.subTest(error=type(error).__name__, path=path, name=name):
                     harness = self.harness(FakeRuntime(Plan([[4]], block=True)))
-                    owner = harness.app if target == "app" else api.FrontendHandler
+                    owner = {
+                        "app": harness.app,
+                        "scoring": scoring,
+                        "handler": api.FrontendHandler,
+                    }[target]
                     with (
                         mock.patch.object(owner, name, side_effect=error),
                         mock.patch.object(

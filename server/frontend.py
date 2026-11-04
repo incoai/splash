@@ -12,7 +12,7 @@ from pathlib import Path
 from jinja2 import TemplateError
 
 from . import images as image_input
-from . import json_codec, judgments
+from . import json_codec, request_fields
 from . import protocol as wire
 from .api_shapes import (
     canonical_responses_input,
@@ -20,7 +20,7 @@ from .api_shapes import (
     responses_to_chat_body,
     template_messages,
 )
-from .backend import Job, ReasoningRequest, remaining_request_time
+from .backend import Job, ReasoningRequest
 from .chat_format import REASONING_EFFORTS, THINK_END, THINK_START, TOOL_CALL_OPEN
 from .chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
@@ -35,6 +35,7 @@ from .errors import (
     ContextLengthError,
     RequestValidationError,
     field_error,
+    remaining_request_time,
 )
 from .latency import LatencyMetrics
 from .lru import LRUCache
@@ -50,10 +51,6 @@ from .tool_schema import (
 )
 
 PREPARATION_WAIT_SECONDS = 30.0
-
-# The priority a request names, by its lowercase wire name.
-_PRIORITIES = {priority.name.lower(): priority for priority in wire.RequestPriority}
-
 
 MIN_FLOAT32_SUBNORMAL = float.fromhex("0x1p-149")
 FLOAT32_MAX = float.fromhex("0x1.fffffep127")
@@ -100,18 +97,6 @@ def accepts_sampling(name, value):
     return name in SAMPLING_NUMBERS and (
         is_finite_number(value) and SAMPLING_NUMBERS[name][1](value)
     )
-
-
-def _preparation_checkpoint(deadline, disconnected):
-    """A check that a request's preparation may go on: its deadline has not
-    passed, and its client has not left."""
-
-    def checkpoint():
-        remaining_request_time(deadline)
-        if disconnected():
-            raise ConnectionResetError("client disconnected during preparation")
-
-    return checkpoint
 
 
 # Text completions' output budget when max_tokens is omitted: OpenAI's
@@ -542,7 +527,7 @@ class Frontend:
         Output limit errors name output_field, that API's own field.
         thinking_display "omitted" hides Messages reasoning behind a
         signature."""
-        with self._preparation(deadline) as without_slot:
+        with self.preparation(deadline) as without_slot:
             return self._prepare(
                 body,
                 None,
@@ -555,7 +540,7 @@ class Frontend:
     def prepare_completion(self, body, *, deadline):
         """A text completion: the prompt generates as given, with no chat
         template, reasoning split, tools or images."""
-        with self._preparation(deadline):
+        with self.preparation(deadline):
             if not self.accepts_model(body.get("model")):
                 raise APIError(
                     404, f"model {body['model']} not found", "model_not_found"
@@ -607,7 +592,7 @@ class Frontend:
         return list(tokens)
 
     def count_tokens(self, body, *, deadline):
-        with self._preparation(deadline) as without_slot:
+        with self.preparation(deadline) as without_slot:
             prompt = self._prepare_prompt(
                 body, None, deadline=deadline, without_slot=without_slot
             )
@@ -628,7 +613,7 @@ class Frontend:
                 raise APIError(
                     400, f"only {option}={str(supported).lower()} is supported"
                 )
-        with self._preparation(deadline):
+        with self.preparation(deadline):
             try:
                 tokens = self._tokenize(content, add_special_tokens=add_special)[
                     "input_ids"
@@ -638,36 +623,9 @@ class Frontend:
             remaining_request_time(deadline)
             return tokens
 
-    def _priority(self, body):
-        priority_name = body.get("priority", "normal")
-        if not isinstance(priority_name, str) or priority_name not in _PRIORITIES:
-            raise APIError(400, "priority must be foreground, normal, or background")
-        return _PRIORITIES[priority_name]
-
-    @staticmethod
-    def _cache_salt(body):
-        """The request's cache_salt as the engine keys its cache: 128 bits of
-        its hash, zero without one. A request shares cached prompts only with
-        requests of the same salt."""
-        salt = body.get("cache_salt")
-        if salt is None:
-            return 0
-        if not isinstance(salt, str) or not salt:
-            raise APIError(400, "cache_salt must be a non-empty string")
-        digest = hashlib.blake2b(
-            salt.encode("utf-8", "surrogatepass"), digest_size=16, person=b"splash-salt"
-        ).digest()
-        return int.from_bytes(digest, "little")
-
-    def _score_job(
-        self,
-        prompt_tokens,
-        slot_ids,
-        deadline,
-        priority,
-        prompt_sha256,
-        cache_salt,
-    ):
+    def score_job(self, prompt_tokens, slot_ids, deadline, priority, cache_salt):
+        """A job that reads the logits of `slot_ids` where the prompt ends and
+        generates nothing: what a scoring API submits."""
         return Job(
             request_id=next(self.ids),
             prompt_tokens=prompt_tokens,
@@ -678,164 +636,14 @@ class Frontend:
             priority=priority,
             score_tokens=tuple(slot_ids),
             public_id=secrets.token_hex(16),
-            prompt_sha256=prompt_sha256,
             cache_salt=cache_salt,
         )
-
-    def _encode_score_prompt(self, messages, labels, admit, checkpoint, what):
-        """The tokens, answer-slot token ids and text of a scoring prompt. The
-        request's input drives the render, so a failure is its error."""
-        try:
-            return judgments.encode_prompt(
-                self.prompt_tokenizer,
-                self.chat_templates.select(None).source,
-                messages,
-                labels,
-                chat_format=self.chat_format,
-                admit=admit,
-                checkpoint=checkpoint,
-            )
-        except judgments.ScoringUnsupported as error:
-            raise APIError(500, str(error), "scoring_unsupported") from error
-        except (APIError, ConnectionResetError):
-            # The request's own limits, deadline and client end preparation.
-            raise
-        except Exception as error:
-            raise APIError(400, f"{what} prompt could not be rendered") from error
-
-    def prepare_judgment(self, body, *, deadline, disconnected):
-        unknown = sorted(
-            set(body)
-            - {
-                "id",
-                "state",
-                "question",
-                "options",
-                "model",
-                "timeout",
-                "priority",
-                "cache_salt",
-            }
-        )
-        if unknown:
-            raise APIError(400, f"unsupported fields: {', '.join(unknown)}")
-        if not self.accepts_model(body.get("model")):
-            raise APIError(404, f"model {body['model']} not found", "model_not_found")
-        try:
-            judgments.validate_row(body)
-        except ValueError as error:
-            raise APIError(400, str(error)) from error
-        priority = self._priority(body)
-        cache_salt = self._cache_salt(body)
-        checkpoint = _preparation_checkpoint(deadline, disconnected)
-        with self._preparation(deadline):
-
-            def admit(prompt_tokens):
-                checkpoint()
-                if prompt_tokens > self.max_context:
-                    raise ContextLengthError(prompt_tokens, self.max_context)
-
-            tokens, slots, prompt = self._encode_score_prompt(
-                judgments.judgment_messages(body),
-                judgments.LETTERS[: len(body["options"])],
-                admit,
-                checkpoint,
-                "judgment",
-            )
-            checkpoint()
-            job = self._score_job(
-                tokens,
-                slots,
-                deadline,
-                priority,
-                judgments.digest(prompt),
-                cache_salt,
-            )
-        return job, body
-
-    def prepare_systemone(self, body, *, deadline, disconnected):
-        details = []
-        model = body.get("model")
-        if not isinstance(model, str) or not model:
-            details.append(field_error(["model"], "field required", "missing"))
-        elif not self.accepts_model(model):
-            details.append(
-                field_error(["model"], f"model {model} is not served by this endpoint")
-            )
-        state, specs, question_details = judgments.validate_systemone(body)
-        details.extend(question_details)
-        try:
-            priority = self._priority(body)
-        except APIError as error:
-            details.append(field_error(["priority"], error.message))
-        try:
-            cache_salt = self._cache_salt(body)
-        except APIError as error:
-            details.append(field_error(["cache_salt"], error.message))
-        if details:
-            raise RequestValidationError(details)
-        jobs = []
-        total_tokens = 0
-        checkpoint = _preparation_checkpoint(deadline, disconnected)
-        with self._preparation(deadline):
-            for qid, spec in specs:
-                if spec.deterministic:
-                    jobs.append((qid, spec, None))
-                    continue
-                slots = judgments.slot_labels(self.tokenizer)
-                if len(spec.labels) > len(slots):
-                    raise RequestValidationError(
-                        [
-                            field_error(
-                                ["questions", qid, "criteria"],
-                                f"the served tokenizer supports "
-                                f"{len(slots)} answer slots; "
-                                f"{len(spec.labels)} were requested",
-                            )
-                        ]
-                    )
-                labels = slots[: len(spec.labels)]
-
-                def admit(prompt_tokens, qid=qid, prepared=total_tokens):
-                    checkpoint()
-                    if prompt_tokens > self.max_context:
-                        raise ContextLengthError(prompt_tokens, self.max_context)
-                    if prepared + prompt_tokens > judgments.MAX_SYSTEMONE_TOTAL_TOKENS:
-                        raise RequestValidationError(
-                            [
-                                field_error(
-                                    ["questions", qid],
-                                    "total prepared question tokens exceed "
-                                    f"{judgments.MAX_SYSTEMONE_TOTAL_TOKENS}",
-                                )
-                            ]
-                        )
-
-                tokens, slot_ids, _ = self._encode_score_prompt(
-                    judgments.systemone_messages(state, spec, labels),
-                    labels,
-                    admit,
-                    checkpoint,
-                    "question",
-                )
-                checkpoint()
-                total_tokens += len(tokens)
-                jobs.append(
-                    (
-                        qid,
-                        spec,
-                        self._score_job(
-                            tokens, slot_ids, deadline, priority, None, cache_salt
-                        ),
-                    )
-                )
-        return jobs
 
     def apply_template(self, body, *, deadline):
         add_generation_prompt = body.get("add_generation_prompt", True)
         if not isinstance(add_generation_prompt, bool):
             raise APIError(400, "add_generation_prompt must be a boolean")
-        with self._preparation(deadline) as without_slot:
+        with self.preparation(deadline) as without_slot:
             prompt = self._prepare_prompt(
                 body, None, deadline=deadline, without_slot=without_slot
             )
@@ -847,7 +655,7 @@ class Frontend:
             ).text
 
     @contextmanager
-    def _preparation(self, deadline):
+    def preparation(self, deadline):
         """Hold a preparation slot while the request prepares. Yields a
         context manager under which the request holds none: it gives its
         slot back to wait for and use the PDF worker, which slots do not
@@ -1238,8 +1046,8 @@ class Frontend:
             stop_sequences,
             ignore_eos,
             seed,
-            self._priority(body),
-            self._cache_salt(body),
+            request_fields.priority(body),
+            request_fields.cache_salt(body),
             budget,
         )
 
@@ -1286,7 +1094,7 @@ class Frontend:
             not isinstance(previous_id, str) or not previous_id
         ):
             raise APIError(400, "previous_response_id must be a non-empty string")
-        with self._preparation(deadline) as without_slot:
+        with self.preparation(deadline) as without_slot:
             previous_items = []
             if previous_id is not None:
                 previous = self.response_store.get(previous_id)

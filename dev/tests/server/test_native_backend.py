@@ -346,7 +346,7 @@ class NativeBackendContractTests(unittest.TestCase):
             deadline=FOREVER,
         )
         self.assertEqual(
-            backend_api.remaining_request_time(job.deadline), threading.TIMEOUT_MAX
+            api_errors.remaining_request_time(job.deadline), threading.TIMEOUT_MAX
         )
 
         transport.submit(job)

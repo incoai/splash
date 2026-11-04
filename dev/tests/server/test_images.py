@@ -30,8 +30,7 @@ from dev.tests.server_fixtures import (
     response_events,
     responses_body,
 )
-from server import api_shapes, documents, images
-from server import backend as backend_api
+from server import api_shapes, documents, errors, images
 from server import frontend as request_frontend
 from server import protocol as native_wire
 from server import server as api
@@ -732,7 +731,7 @@ class ImageRequestTest(HarnessTestCase):
 
         with (
             mock.patch.object(
-                backend_api, "time", SimpleNamespace(monotonic=lambda: clock[0])
+                errors, "time", SimpleNamespace(monotonic=lambda: clock[0])
             ),
             mock.patch.object(app.images, "prepare", side_effect=prepare) as prepared,
             self.assertRaises(api.APIError) as caught,

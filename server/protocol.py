@@ -289,7 +289,7 @@ class RequestFrame:
     # when unknown. It must leave at least one prompt token.
     generation_prompt_tokens: int
     flags: RequestFlag
-    # The request's cache_salt hashed to 128 bits (Frontend._cache_salt);
+    # The request's cache_salt hashed to 128 bits (request_fields.cache_salt);
     # zero without one.
     cache_salt: int
     # Only a request that generates inside a thinking block has one; a score

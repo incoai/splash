@@ -21,7 +21,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Direct finite-option scoring shared by /v1/judgments and /v1/systemone.
+"""Finite-option scoring: Splash's /v1/judgments and TypeSafe's
+/v1/systemone, their preparation, answers and error shape.
 
 Both endpoints render the SemIf direct-options-v1 prompt shape (a fixed
 system instruction plus one JSON user payload, thinking disabled) and read
@@ -39,11 +40,19 @@ import string
 import weakref
 from dataclasses import dataclass
 
-from .chat_format import THINK_END, THINK_START
-from .chat_templates import render_chat_template, template_options
-from .errors import field_error
-from .protocol import MAX_SCORE_TOKENS
-from .tokenization import tokenizable
+from .. import request_fields
+from ..chat_format import THINK_END, THINK_START
+from ..chat_templates import render_chat_template, template_options
+from ..errors import (
+    APIError,
+    ContextLengthError,
+    ErrorDialect,
+    RequestValidationError,
+    field_error,
+    remaining_request_time,
+)
+from ..protocol import MAX_SCORE_TOKENS
+from ..tokenization import tokenizable
 
 LETTERS = "ABCDEFGHIJKLMNOP"
 DIRECT_SYSTEM = (
@@ -247,7 +256,7 @@ def encode_prompt(
     return ids, slots, prompt
 
 
-def judgment_response(model, row, job, result):
+def judgment_response(model, row, job, result, prompt_sha256):
     logits = list(result.option_logits)
     return {
         "id": row["id"],
@@ -256,7 +265,7 @@ def judgment_response(model, row, job, result):
         "option_logits": logits,
         "input_tokens": result.prompt_tokens,
         "answer_token_ids": list(job.score_tokens),
-        "prompt_sha256": job.prompt_sha256,
+        "prompt_sha256": prompt_sha256,
         "prompt_version": PROMPT_VERSION,
         "model": {"id": model},
         "readout": READOUT,
@@ -486,3 +495,244 @@ def systemone_answer(spec, probabilities):
 def deterministic_answer(spec):
     """A singleton option domain has one certain answer; no inference."""
     return systemone_answer(spec, [1.0])
+
+
+# TypeSafe's SDK reads a fresh request id in this header on the routes it
+# calls: /v1/systemone and the model list.
+REQUEST_ID_HEADER = "x-typesafe-request-id"
+
+
+class SystemOneErrors(ErrorDialect):
+    """/v1/systemone answers as the FastAPI service it stands in for:
+    invalid fields with 422 and what is wrong with each, an overload with
+    TypeSafe's 529, and other errors as OpenAI's APIs do."""
+
+    def answer(self, error):
+        if isinstance(error, RequestValidationError):
+            return 422, "unprocessable_entity", {"detail": error.details}
+        status, code, payload = super().answer(error)
+        return 529 if status == 503 else status, code, payload
+
+
+ERRORS = SystemOneErrors()
+
+
+def typed_models(models):
+    """The model list's "models" entries, which TypeSafe's SDK reads
+    (models.list())."""
+    return [
+        {
+            "name": item["id"],
+            "description": "Splash resident model",
+            "release_date": "",
+        }
+        for item in models
+    ]
+
+
+def post_judgments(exchange, body, deadline):
+    app = exchange.app
+    job, prompt_sha256 = prepare_judgment(
+        app, body, deadline=deadline, disconnected=exchange.client_disconnected
+    )
+    exchange.submit(job)
+    result = await_done(exchange, job)
+    exchange.send_json(
+        200, judgment_response(app.response_model, body, job, result, prompt_sha256)
+    )
+
+
+def post_systemone(exchange, body, deadline):
+    answers = {}
+    input_tokens = 0
+    entries = prepare_systemone(
+        exchange.app,
+        body,
+        deadline=deadline,
+        disconnected=exchange.client_disconnected,
+    )
+    for qid, spec, job in entries:
+        if job is None:
+            answers[qid] = deterministic_answer(spec)
+            continue
+        # One admitted job per HTTP request preserves the existing
+        # queue bound and lets later questions reuse the state prefix.
+        exchange.submit(job)
+        result = await_done(exchange, job)
+        input_tokens += result.prompt_tokens
+        answers[qid] = systemone_answer(spec, softmax(list(result.option_logits)))
+    exchange.send_json(
+        200,
+        {
+            "model": exchange.app.response_model,
+            "answers": answers,
+            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+        },
+    )
+
+
+def await_done(exchange, job):
+    """The result of a score job, which emits only start and done."""
+    while (event := exchange.next_event(job))[0] != "done":
+        pass
+    return event[1]
+
+
+def _preparation_checkpoint(deadline, disconnected):
+    """A check that a request's preparation may go on: its deadline has not
+    passed, and its client has not left."""
+
+    def checkpoint():
+        remaining_request_time(deadline)
+        if disconnected():
+            raise ConnectionResetError("client disconnected during preparation")
+
+    return checkpoint
+
+
+def _encode_score_prompt(app, messages, labels, admit, checkpoint, what):
+    """The tokens, answer-slot token ids and text of a scoring prompt. The
+    request's input drives the render, so a failure is its error."""
+    try:
+        return encode_prompt(
+            app.prompt_tokenizer,
+            app.chat_templates.select(None).source,
+            messages,
+            labels,
+            chat_format=app.chat_format,
+            admit=admit,
+            checkpoint=checkpoint,
+        )
+    except ScoringUnsupported as error:
+        raise APIError(500, str(error), "scoring_unsupported") from error
+    except (APIError, ConnectionResetError):
+        # The request's own limits, deadline and client end preparation.
+        raise
+    except Exception as error:
+        raise APIError(400, f"{what} prompt could not be rendered") from error
+
+
+def prepare_judgment(app, body, *, deadline, disconnected):
+    """A judgment's score job, and the digest of its rendered prompt."""
+    unknown = sorted(
+        set(body)
+        - {
+            "id",
+            "state",
+            "question",
+            "options",
+            "model",
+            "timeout",
+            "priority",
+            "cache_salt",
+        }
+    )
+    if unknown:
+        raise APIError(400, f"unsupported fields: {', '.join(unknown)}")
+    if not app.accepts_model(body.get("model")):
+        raise APIError(404, f"model {body['model']} not found", "model_not_found")
+    try:
+        validate_row(body)
+    except ValueError as error:
+        raise APIError(400, str(error)) from error
+    priority = request_fields.priority(body)
+    cache_salt = request_fields.cache_salt(body)
+    checkpoint = _preparation_checkpoint(deadline, disconnected)
+    with app.preparation(deadline):
+
+        def admit(prompt_tokens):
+            checkpoint()
+            if prompt_tokens > app.max_context:
+                raise ContextLengthError(prompt_tokens, app.max_context)
+
+        tokens, slots, prompt = _encode_score_prompt(
+            app,
+            judgment_messages(body),
+            LETTERS[: len(body["options"])],
+            admit,
+            checkpoint,
+            "judgment",
+        )
+        checkpoint()
+        job = app.score_job(tokens, slots, deadline, priority, cache_salt)
+    return job, digest(prompt)
+
+
+def prepare_systemone(app, body, *, deadline, disconnected):
+    """Each question's id, spec and score job; no job for a question its
+    spec answers without the model."""
+    details = []
+    model = body.get("model")
+    if not isinstance(model, str) or not model:
+        details.append(field_error(["model"], "field required", "missing"))
+    elif not app.accepts_model(model):
+        details.append(
+            field_error(["model"], f"model {model} is not served by this endpoint")
+        )
+    state, specs, question_details = validate_systemone(body)
+    details.extend(question_details)
+    try:
+        priority = request_fields.priority(body)
+    except APIError as error:
+        details.append(field_error(["priority"], error.message))
+    try:
+        cache_salt = request_fields.cache_salt(body)
+    except APIError as error:
+        details.append(field_error(["cache_salt"], error.message))
+    if details:
+        raise RequestValidationError(details)
+    jobs = []
+    total_tokens = 0
+    checkpoint = _preparation_checkpoint(deadline, disconnected)
+    with app.preparation(deadline):
+        for qid, spec in specs:
+            if spec.deterministic:
+                jobs.append((qid, spec, None))
+                continue
+            slots = slot_labels(app.tokenizer)
+            if len(spec.labels) > len(slots):
+                raise RequestValidationError(
+                    [
+                        field_error(
+                            ["questions", qid, "criteria"],
+                            f"the served tokenizer supports "
+                            f"{len(slots)} answer slots; "
+                            f"{len(spec.labels)} were requested",
+                        )
+                    ]
+                )
+            labels = slots[: len(spec.labels)]
+
+            def admit(prompt_tokens, qid=qid, prepared=total_tokens):
+                checkpoint()
+                if prompt_tokens > app.max_context:
+                    raise ContextLengthError(prompt_tokens, app.max_context)
+                if prepared + prompt_tokens > MAX_SYSTEMONE_TOTAL_TOKENS:
+                    raise RequestValidationError(
+                        [
+                            field_error(
+                                ["questions", qid],
+                                "total prepared question tokens exceed "
+                                f"{MAX_SYSTEMONE_TOTAL_TOKENS}",
+                            )
+                        ]
+                    )
+
+            tokens, slot_ids, _ = _encode_score_prompt(
+                app,
+                systemone_messages(state, spec, labels),
+                labels,
+                admit,
+                checkpoint,
+                "question",
+            )
+            checkpoint()
+            total_tokens += len(tokens)
+            jobs.append(
+                (
+                    qid,
+                    spec,
+                    app.score_job(tokens, slot_ids, deadline, priority, cache_salt),
+                )
+            )
+    return jobs

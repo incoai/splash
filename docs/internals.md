@@ -18,8 +18,9 @@ generation and guards its stream; `dialects/` writes each API's complete and
 streamed answer (`anthropic.py`, `responses.py`, `openai.py`) from what the
 handler collects. `connections.py` holds the HTTP ingress bounds and
 `errors.py` each API's error shape; `frontend.py` prepares requests and
-history; `backend.py` owns native request lifecycles. `judgments.py`
-owns finite-choice prompts, validation and typed answer math. `output.py` parses
+history; `backend.py` owns native request lifecycles. `dialects/scoring.py`
+owns /v1/judgments and /v1/systemone: their finite-choice prompts,
+validation, preparation and answers. `output.py` parses
 generated text as it arrives, one parser serving streamed and complete
 responses alike, in the family's chat format (`chat_format.py`), and
 `constraints.py` compiles token constraints. Messages and

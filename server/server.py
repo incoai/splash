@@ -27,7 +27,7 @@ from transformers import AutoTokenizer
 from install import assembly
 from install.models import ModelError
 
-from . import dialects, json_codec, judgments, serve_options, serve_record
+from . import dialects, json_codec, serve_options, serve_record
 from . import protocol as wire
 from . import runtime as engine_runtime
 from .api_shapes import anthropic_to_chat_body, anthropic_to_chat_prompt
@@ -35,7 +35,6 @@ from .backend import (
     NativeBackend,
     NativeResult,
     ThinkingEndError,
-    remaining_request_time,
     thinking_end_tokens,
 )
 from .chat_templates import ChatTemplateError, ChatTemplates
@@ -51,11 +50,11 @@ from .errors import (
     ANTHROPIC_ERRORS,
     OPENAI_ERRORS,
     RETRY_STATUSES,
-    SYSTEMONE_ERRORS,
     APIError,
     ErrorDialect,
     RequestValidationError,
     field_error,
+    remaining_request_time,
 )
 from .frontend import Frontend
 from .http_security import (
@@ -579,16 +578,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def _get_models(self):
         models = self._models()
-        # TypeSafe's SDK: its models.list() reads the "models" entries.
-        typed = [
+        self.send_json(
+            200,
             {
-                "name": item["id"],
-                "description": "Splash resident model",
-                "release_date": "",
-            }
-            for item in models
-        ]
-        self.send_json(200, {"object": "list", "data": models, "models": typed})
+                "object": "list",
+                "data": models,
+                "models": dialects.scoring.typed_models(models),
+            },
+        )
 
     def _get_model(self, name):
         model = next((item for item in self._models() if item["id"] == name), None)
@@ -766,17 +763,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
             200, {"prompt": self.app.apply_template(body, deadline=deadline)}
         )
 
-    def _post_judgments(self, body, deadline):
-        job, row = self.app.prepare_judgment(
-            body, deadline=deadline, disconnected=self.client_disconnected
-        )
-        self.submit(job)
-        result = self._await_done(job)
-        self.send_json(
-            200,
-            judgments.judgment_response(self.app.response_model, row, job, result),
-        )
-
     def _post_memory_release(self, body, deadline):
         weights = self.app.backend.release_weights().get("weights") or {}
         # A restore leaves the weights released until its last image is back.
@@ -794,39 +780,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
             ),
             log=False,
         )
-
-    def _post_systemone(self, body, deadline):
-        answers = {}
-        input_tokens = 0
-        entries = self.app.prepare_systemone(
-            body, deadline=deadline, disconnected=self.client_disconnected
-        )
-        for qid, spec, job in entries:
-            if job is None:
-                answers[qid] = judgments.deterministic_answer(spec)
-                continue
-            # One admitted job per HTTP request preserves the existing
-            # queue bound and lets later questions reuse the state prefix.
-            self.submit(job)
-            result = self._await_done(job)
-            input_tokens += result.prompt_tokens
-            answers[qid] = judgments.systemone_answer(
-                spec, judgments.softmax(list(result.option_logits))
-            )
-        self.send_json(
-            200,
-            {
-                "model": self.app.response_model,
-                "answers": answers,
-                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
-            },
-        )
-
-    def _await_done(self, job):
-        """The result of a score job, which emits only start and done."""
-        while (event := self.next_event(job))[0] != "done":
-            pass
-        return event[1]
 
     def next_event(self, job, on_idle=None):
         while True:
@@ -1040,7 +993,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
 _RESPONSE_PATH = re.compile(r"/v1/responses/(resp_[A-Za-z0-9_]+)")
 _MODEL_PATH = re.compile(r"/v1/models/(.*)", re.DOTALL)
-_TYPESAFE_REQUEST_ID = "x-typesafe-request-id"
 _PAGE = Route(FrontendHandler._get_page, public=True)
 
 # Every endpoint, by its method and its path or path pattern.
@@ -1056,10 +1008,11 @@ ROUTES = {
     ("GET", _RESPONSE_PATH): Route(FrontendHandler._get_response),
     ("DELETE", _RESPONSE_PATH): Route(FrontendHandler._delete_response),
     ("GET", "/v1/models"): Route(
-        FrontendHandler._get_models, request_id_header=_TYPESAFE_REQUEST_ID
+        FrontendHandler._get_models,
+        request_id_header=dialects.scoring.REQUEST_ID_HEADER,
     ),
     ("GET", _MODEL_PATH): Route(
-        FrontendHandler._get_model, request_id_header=_TYPESAFE_REQUEST_ID
+        FrontendHandler._get_model, request_id_header=dialects.scoring.REQUEST_ID_HEADER
     ),
     ("POST", "/v1/chat/completions"): Route(FrontendHandler._post_chat_completions),
     ("POST", "/v1/chat/completions/count_tokens"): Route(
@@ -1075,11 +1028,11 @@ ROUTES = {
     ("POST", "/apply-template"): Route(
         FrontendHandler._post_apply_template, prompt_only=True
     ),
-    ("POST", "/v1/judgments"): Route(FrontendHandler._post_judgments),
+    ("POST", "/v1/judgments"): Route(dialects.scoring.post_judgments),
     ("POST", "/v1/systemone"): Route(
-        FrontendHandler._post_systemone,
-        SYSTEMONE_ERRORS,
-        request_id_header=_TYPESAFE_REQUEST_ID,
+        dialects.scoring.post_systemone,
+        dialects.scoring.ERRORS,
+        request_id_header=dialects.scoring.REQUEST_ID_HEADER,
     ),
     ("POST", "/v1/memory/release"): Route(
         FrontendHandler._post_memory_release, fieldless=True

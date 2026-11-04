@@ -8,6 +8,7 @@ from unittest import mock
 from dev.tests import server_fixtures as fixtures
 from install import launcher
 from server import server as api
+from server.dialects import scoring
 
 SERVER_ARGS = ["model", "--model", "owner/repo"]
 EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
@@ -143,14 +144,16 @@ class DefaultReasoningTests(unittest.TestCase):
             harness = self.harness(
                 effort, tokenizer=fixtures.CharTokenizer(), max_context=8192
             )
-            job, _ = harness.app.prepare_judgment(
+            job, _ = scoring.prepare_judgment(
+                harness.app,
                 fixtures.judgment_body(),
                 deadline=fixtures.FOREVER,
                 disconnected=fixtures.stays_connected,
             )
             self.assertFalse(job.thinking)
             jobs.append((job.prompt_tokens, job.score_tokens))
-            systemone = harness.app.prepare_systemone(
+            systemone = scoring.prepare_systemone(
+                harness.app,
                 {
                     "model": "test-model",
                     "state": {},

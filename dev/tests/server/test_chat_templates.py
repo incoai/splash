@@ -22,6 +22,7 @@ from server.chat_templates import (
     ChatTemplates,
     template_options,
 )
+from server.dialects import scoring
 from server.errors import APIError
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures/chat_templates"
@@ -981,12 +982,14 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             tokenizer, None, "test-model", 8192, 10, 2, vision=True
         )
         tokenizer.templates.clear()
-        judgment, _ = app.prepare_judgment(
+        judgment, _ = scoring.prepare_judgment(
+            app,
             fixtures.judgment_body(),
             deadline=fixtures.FOREVER,
             disconnected=fixtures.stays_connected,
         )
-        systemone = app.prepare_systemone(
+        systemone = scoring.prepare_systemone(
+            app,
             {"model": "test-model", "state": {}, "questions": {"q": {"type": "noul"}}},
             deadline=fixtures.FOREVER,
             disconnected=fixtures.stays_connected,

@@ -63,15 +63,6 @@ def thinking_end_tokens(tokenizer, text, chat_format):
     return tokens
 
 
-def remaining_request_time(deadline):
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise APIError(504, "request timed out", "request_timeout")
-    # Callers wait this long, and waits reject a timeout above TIMEOUT_MAX;
-    # a request without a deadline has infinite time left.
-    return min(remaining, threading.TIMEOUT_MAX)
-
-
 @dataclass(frozen=True)
 class CacheInfo:
     status: str = "unknown"
@@ -174,8 +165,6 @@ class Job:
     # The request asked for more output than the context leaves, and
     # max_new_tokens was lowered to what it leaves.
     output_clamped_to_context: bool = False
-    # The digest of a judgment's rendered prompt, which its response reports.
-    prompt_sha256: str | None = None
     # The request's cache_salt hashed to 128 bits; zero without one.
     cache_salt: int = 0
     latency: RequestLatency | None = None

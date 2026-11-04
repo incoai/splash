@@ -1,11 +1,13 @@
-"""How each API dialect answers a generation, whole or as a stream.
+"""Each API's own module: how it reads its requests and writes its answers.
 
-Each module's complete(exchange, job, ...) and stream(exchange, job, ...)
-read the generation and write the response through the exchange, the HTTP
-handler (server.FrontendHandler) and its public methods; these modules hold
-no HTTP.
+A module's functions take the exchange, the HTTP handler
+(server.FrontendHandler), and use only its public methods: a route's
+handler answers its request or returns the generation it prepared, and
+complete(exchange, job, ...) and stream(exchange, job, ...) write a
+generation's answer whole or as a stream. The HTTP itself stays in the
+router.
 """
 
-from . import anthropic, openai, responses
+from . import anthropic, openai, responses, scoring
 
-__all__ = ("anthropic", "openai", "responses")
+__all__ = ("anthropic", "openai", "responses", "scoring")

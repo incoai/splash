@@ -49,7 +49,6 @@ SERVER_FILES = (
     "output.py",
     "frontend.py",
     "chat_templates.py",
-    "judgments.py",
     "diagnostics.py",
     "api_shapes.py",
     "chat_format.py",
@@ -60,6 +59,7 @@ SERVER_FILES = (
     "latency.py",
     "metrics.py",
     "errors.py",
+    "request_fields.py",
     "runtime.py",
     "protocol.py",
     "images.py",
@@ -83,6 +83,7 @@ DIALECT_FILES = (
     "anthropic.py",
     "openai.py",
     "responses.py",
+    "scoring.py",
 )
 CHAT_ASSET_FILES = (
     "markdown-it-15.0.2.min.js",

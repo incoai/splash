@@ -609,7 +609,7 @@ where its answer starts. Besides the row it takes `model`, `timeout`,
 `priority` and `cache_salt` as the generation APIs do ([request
 fields](#request-fields)); other generation controls return errors rather than
 silently changing the scoring protocol. SemIf-derived code retains its MIT
-notice in `server/judgments.py`.
+notice in `server/dialects/scoring.py`.
 
 `POST /v1/systemone` requires the served `model`, a string/object/array `state`,
 and a nonempty `questions` map, and takes `cache_salt` as the generation APIs

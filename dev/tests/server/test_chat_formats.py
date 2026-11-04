@@ -32,6 +32,7 @@ from server import protocol as wire
 from server import server as api
 from server.chat_format import FLINT, GLM_ARGS, QWEN, QWEN_XML, ToolCallSyntax
 from server.chat_templates import NATIVE, ChatTemplates
+from server.dialects import scoring
 from server.tokenization import PromptTokenizer
 
 TEMPLATE = (
@@ -706,12 +707,14 @@ class FlintPromptTests(unittest.TestCase):
         # the generation prompt ends: judgment and System One slots are read
         # after an empty think block, where its answer starts.
         frontend = self.frontend()
-        judgment, _ = frontend.prepare_judgment(
+        judgment, _ = scoring.prepare_judgment(
+            frontend,
             fixtures.judgment_body(),
             deadline=fixtures.FOREVER,
             disconnected=fixtures.stays_connected,
         )
-        systemone = frontend.prepare_systemone(
+        systemone = scoring.prepare_systemone(
+            frontend,
             {"model": "test-model", "state": {}, "questions": {"q": {"type": "noul"}}},
             deadline=fixtures.FOREVER,
             disconnected=fixtures.stays_connected,

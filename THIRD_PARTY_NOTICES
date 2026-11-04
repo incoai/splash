@@ -1,5 +1,5 @@
 Splash contains the third-party material below, which keeps its own license.
-The SemIf code in server/judgments.py carries its MIT notice in that file.
+The SemIf code in server/dialects/scoring.py carries its MIT notice in that file.
 
 llama.cpp (https://github.com/ggml-org/llama.cpp)
 

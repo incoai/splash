@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+
 # The statuses of a refusal the client may retry shortly, which a response
 # invites with Retry-After: the server is overloaded, restarting its engine
 # or shutting down. Each API answers these with 503, /v1/systemone with 529.
@@ -25,6 +28,16 @@ class RequestValidationError(APIError):
     def __init__(self, details):
         super().__init__(400, details[0]["msg"])
         self.details = list(details)
+
+
+def remaining_request_time(deadline):
+    """The seconds left before `deadline`; a 504 once it has passed."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise APIError(504, "request timed out", "request_timeout")
+    # Callers wait this long, and waits reject a timeout above TIMEOUT_MAX;
+    # a request without a deadline has infinite time left.
+    return min(remaining, threading.TIMEOUT_MAX)
 
 
 def field_error(loc, msg, error_type="value_error"):
@@ -94,18 +107,5 @@ class AnthropicErrors(ErrorDialect):
         return {"type": "error", "error": {"type": error_type, "message": message}}
 
 
-class SystemOneErrors(ErrorDialect):
-    """/v1/systemone answers as the FastAPI service it stands in for:
-    invalid fields with 422 and what is wrong with each, an overload with
-    TypeSafe's 529, and other errors as OpenAI's APIs do."""
-
-    def answer(self, error):
-        if isinstance(error, RequestValidationError):
-            return 422, "unprocessable_entity", {"detail": error.details}
-        status, code, payload = super().answer(error)
-        return 529 if status == 503 else status, code, payload
-
-
 OPENAI_ERRORS = ErrorDialect()
 ANTHROPIC_ERRORS = AnthropicErrors()
-SYSTEMONE_ERRORS = SystemOneErrors()
