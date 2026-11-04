@@ -122,6 +122,11 @@ struct FreeResult final {
   FreeOutcome outcome = FreeOutcome::Short;
   uint64_t nowBytes = 0;     // left memory now (extents, chunks, buffers)
   uint64_t laterBytes = 0;   // leave memory when transfers it started land
+  // A stepwise unit's step (Victim::stepwise): the free KV pages of the
+  // need's form it gave, now or as its transfers land, and the pooled state
+  // buffers it freed.
+  uint32_t pages = 0;
+  uint32_t stateBuffers = 0;
 };
 
 // What taking a unit gives up besides its bytes, which the claim's class
@@ -139,9 +144,14 @@ struct Victim final {
   uint32_t stateBuffers = 0;    // pooled state buffers it frees (in-place needs; bytes, setBufferBytes)
   bool later = false;           // frees on a landing (a demotion, a state write, a conversion's copies)
   bool certainReuse = false;    // in use, the newest resume point, a chain a queued request restores
-  // false: a unit that costs nothing, taken before any dry run, whose
+  // false: a unit that costs nothing, taken before any count, whose
   // bytes are at least what peek gives (available() counts them)
   bool sized = true;
+  // Taken a step at a time (the cache's reclaims): each take makes one step
+  // and reports what it freed, pages and buffers too, and the unit stays at
+  // the head of its source while steps free something. Any other unit goes
+  // whole in one take, at the pages and buffers peek gave.
+  bool stepwise = false;
   ReclaimClass cls = ReclaimClass::Ordinary;
   VictimKind kind = VictimKind::Memory;
 };
@@ -155,20 +165,20 @@ struct VictimQuery final {
 };
 
 // A source of the units free() takes, on the engine thread between commands.
-// peek changes nothing and may understate what later units free, never
-// overstate it: free() takes nothing unless what it peeked covers the need.
-// A later unit's bytes include what goes only once another of its transfers
-// lands: take starts what can start now, and the waiting claim takes the
-// rest on its retries. take takes exactly the unit the latest peek returned.
-// A key may name its unit only by its place in the source's order (the
-// cache's reclaims are steps from its current state); a conversion's key is
-// its lane's request id. free() finds each unit its dry run chose again by
-// peeking from the head, past as many units as the run passed over, so
-// taking a unit must leave the units before it in place and those after it
-// in order. A unit found again that is not the one chosen (another kind,
-// another lane's conversion) ends the take there; the claim's retry weighs
-// the rest afresh. Units that cost nothing and are sized only when taken
-// come first in a source's order.
+// peek changes nothing and gives the unit after `after` in the source's
+// order with at most what taking it frees, never less: free() takes nothing
+// unless what it peeked covers the need. take takes the unit, or one step of
+// it where the source frees it a step at a time (the cache's reclaims), and
+// reports what that freed: Met, or Pending on the transfers it started, when
+// it took something; else Pending while a transfer in flight holds the unit,
+// Short when nothing of it is left. A later unit's bytes include what goes
+// only once another of its transfers lands: take starts what can start now,
+// and the waiting claim takes the rest on its retries. A key may name its
+// unit only by its place in the source's order; a conversion's key is its
+// lane's request id. Taking a unit leaves the units before it in place and
+// those after it in order: free() peeks again from the unit before it. Units
+// that cost nothing and are sized only when taken come first in a source's
+// order.
 class VictimSource {
 public:
   virtual ~VictimSource() = default;
@@ -346,8 +356,9 @@ public:
 
 private:
   struct Account;
-  struct Choice;
-  struct DryRun;
+  struct Lacking;
+  struct Run;
+  class Order;
 
   // The needs of waiting claims ranked above `rank`.
   [[nodiscard]] uint64_t heldByClaims(const ClaimRank &rank, std::optional<uint32_t> self) const noexcept;
@@ -358,16 +369,17 @@ private:
   // memory that appears. A claim of no request never holds it (requests
   // first).
   [[nodiscard]] bool holdsGrowth() const noexcept;
-  [[nodiscard]] DryRun dryRun(const ClaimSpec &spec, const VictimQuery &query, uint64_t lackingBytes,
-                              uint32_t lackingPages) const;
-  // `whole`: false when a unit the run chose was no longer offered as
-  // chosen, where the take stopped.
-  [[nodiscard]] FreeResult take(const DryRun &run, const VictimQuery &query, bool &whole);
+  // The most the units the claim's class may take give it, counted in the
+  // one order without taking any, up to the lack.
+  [[nodiscard]] Run bound(const ClaimSpec &spec, const VictimQuery &query, const Lacking &lack) const;
+  // Takes those units in that order, one at a time, until what they freed
+  // now and later covers the lack, or none is left.
+  [[nodiscard]] Run take(const ClaimSpec &spec, const VictimQuery &query, const Lacking &lack);
   // Takes each source's units that cost nothing and are sized only when
   // taken, until one frees nothing; the bytes they freed.
   uint64_t takeUnsized(const VictimQuery &query);
 
-  void log(const ClaimSpec &spec, const Need &need, const DryRun *run, const FreeResult &result,
+  void log(const ClaimSpec &spec, const Need &need, const Run *run, const FreeResult &result,
            bool exempted) const;
 
   std::vector<Account> accounts_;

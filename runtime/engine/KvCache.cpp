@@ -454,6 +454,13 @@ uint32_t KvCache::idlePagesOnChains(std::span<const uint64_t> blocks, kv::PageFo
   return pages;
 }
 
+void KvCache::forEachIdleBlock(const std::function<void(uint64_t blockId, uint32_t page)> &visit) const {
+  for (const auto &[id, entry] : blocks_)
+    if (entry.page != noPage && entry.transfer == Transfer::None && !entry.held && !entry.activeUsers &&
+        !pool_.pageActive(entry.page))
+      visit(id, entry.page);
+}
+
 bool KvCache::residentLeaf(uint64_t blockId) const {
   const Block &entry = block(blockId);
   return entry.page != noPage && !entry.residentChildren && !entry.activeUsers &&

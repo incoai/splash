@@ -4875,23 +4875,6 @@ void testPoisonedBlockLeavesOnceItsWriteLands() {
   require(landed.pool.pagesPrefix == 1 && landed.kvTier.diskBlocks == 1,
           "the poisoned block did not leave with its page once its write landed");
   fixture.cache.checkInvariants();
-  // What the walk weighs its victims to free, for growth that displaces
-  // cache, writing nothing and waiting for nothing, is what taking them
-  // frees.
-  const ClaimSpec growth{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate};
-  const VictimQuery query{.claim = &growth, .need = {.bytes = fixture.pool.allocatedBytes()}};
-  std::vector<engine::Victim> victims;
-  uint64_t predicted = 0;
-  for (std::optional<engine::Victim> victim = fixture.cache.peek(query, nullptr); victim;
-       victim = fixture.cache.peek(query, &*victim)) {
-    predicted += victim->bytes;
-    victims.push_back(*victim);
-  }
-  const uint64_t allocated = fixture.pool.allocatedBytes();
-  for (const engine::Victim &victim : victims)
-    require(fixture.cache.take(query, victim).outcome == FreeOutcome::Met, "a victim the walk weighed stayed");
-  require(predicted && allocated - fixture.pool.allocatedBytes() == predicted,
-          "the bytes the walk weighed over its victims are not those taking them freed");
 }
 
 // A windowed layout's cache, of a window of two pages, over pages of 100
@@ -5118,15 +5101,14 @@ void testFullShortfallsKeepTheTailsOfStatesTheSsdKeeps() {
   cache.endRequest(1);
   require(cache.trimWindows() == 4 && windowed.slimPages() == 4, "the unpinned pages were not trimmed");
 
+  // A claim for a state's buffers writes the checkpoint first.
+  require(test::freeFromCache(cache, test::kInServiceGrowth, {.stateBuffers = 1}).outcome == FreeOutcome::Met &&
+              control->slots == 1 && cache.pollTransfers(),
+          "the checkpoint was not written to the SSD");
   cache.beginRequest(2);
   const TokenAdmission refused = cache.ensureTokens(2, 12 * KvCache::pageTokens);
   require(!refused.granted() && refused.form == kv::PageForm::Full, "the shortfall setup was granted");
-  // The refusal's first unit.
-  require(test::takeFirst(cache, test::kInServiceGrowth, {.pages = refused.additionalPages}).outcome ==
-                  FreeOutcome::Met &&
-              control->slots == 1,
-          "the refusal wrote no checkpoint");
-  require(cache.pollTransfers(), "the checkpoint was not written to the SSD");
+  static_cast<void>(test::takeFirst(cache, test::kInServiceGrowth, {.pages = refused.additionalPages}));
   const auto states = cache.snapshot().stateCache;
   require(states.entries == 1 && states.checkpointEntries == 1 && states.diskBytes == 100 && control->slots == 1 &&
               windowed.slimPages() == 6 && cache.stateTailFull(checkpoint),
@@ -5368,16 +5350,11 @@ void testResumePointAndWantedChainsAreCertainReuse() {
     }
     require(kept && offered == 2, "a claim that may take nothing of certain reuse was offered some, or not the rest");
   }
-  const ClaimSpec growth{.cls = ClaimClass::Growth};
-  const VictimQuery device{.claim = &growth, .need = {.bytes = pool.allocatedBytes()}};
-  std::vector<engine::Victim> reclaims;
-  for (std::optional<engine::Victim> victim = cache.peek(device, nullptr); victim; victim = cache.peek(device, &*victim))
-    reclaims.push_back(*victim);
-  for (const engine::Victim &victim : reclaims)
-    require(!victim.certainReuse && cache.take(device, victim).outcome == FreeOutcome::Met,
-            "growth took a memory reclaim of certain reuse");
+  const ClaimSpec growth{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate};
+  require(test::freeFromCache(cache, growth, {.pages = 2}).outcome == FreeOutcome::Met,
+          "growth did not take what is not of certain reuse");
   cache.refresh(probe, wanted, {});
-  require(!reclaims.empty() && probe.cachedTokens() == 2 * KvCache::pageTokens &&
+  require(probe.cachedTokens() == 2 * KvCache::pageTokens &&
               cache.stateResident(probe.restoredChain().back()) &&
               cache.probe(newest, {}).cachedTokens() == 2 * KvCache::pageTokens &&
               !cache.probe(other, {}).cachedTokens(),
@@ -5411,8 +5388,7 @@ void testInUseUnitsComeOnlyWithReachInUse() {
           "what is in use came to a claim that does not reach it, or before the rest");
 }
 
-// A device need's unit releases one whole extent, and each take frees exactly the extent its peek
-// weighed.
+// Each take of a device need releases one whole extent, taking only the leaves that empty it.
 void testBurstReclaimTakesWholeExtentsOncePerNeed() {
   test::TestKvStorage storage{64, 100, 4};
   KvPool pool{storage, 4};
@@ -5433,7 +5409,7 @@ void testBurstReclaimTakesWholeExtentsOncePerNeed() {
   for (uint32_t take = 0; take < 3; ++take) {
     const std::optional<engine::Victim> unit = cache.peek(query, nullptr);
     const uint64_t allocated = pool.allocatedBytes(), prefix = cache.snapshot().pool.pagesPrefix;
-    require(unit && unit->bytes == extent && cache.take(query, *unit).outcome == FreeOutcome::Met &&
+    require(unit && cache.take(query, *unit).outcome == FreeOutcome::Met &&
                 allocated - pool.allocatedBytes() == extent && prefix - cache.snapshot().pool.pagesPrefix == 4,
             "a memory reclaim did not take the leaves that empty one extent and release it");
   }
@@ -5471,8 +5447,8 @@ void testGrowthNeedKeepsTheFreePagesItTakes() {
               " B, found " + std::to_string(found) + " B");
 }
 
-// A device need's walk reaches the leaves past the states it gives up, each unit weighed at what
-// taking it releases.
+// A device need's walk reaches the leaves past the states it gives up: every extent goes, the
+// checkpoint written.
 void testDeviceNeedReachesTheLeavesPastTheStates() {
   test::TestKvStorage storage{48, 100, 4};
   KvPool pool{storage, 4};
@@ -5497,20 +5473,8 @@ void testDeviceNeedReachesTheLeavesPastTheStates() {
     static_cast<void>(cachePrompt(id, 4));
   static_cast<void>(cache.releaseEmptyExtents(false));
   const ClaimSpec claim{.cls = ClaimClass::InService};
-  const VictimQuery query{.claim = &claim, .need = {.bytes = pool.allocatedBytes()}};
-  std::vector<engine::Victim> units;
-  for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim; victim = cache.peek(query, &*victim))
-    units.push_back(*victim);
-  const uint64_t extent = 4 * 100;
-  require(units.size() == 8 && units[0].stateBuffers == 1 && units[0].later && !units[0].bytes &&
-              std::ranges::count_if(units, [](const engine::Victim &unit) { return unit.stateBuffers == 1; }) == 2,
-          "the checkpoint did not go first, or a state did not go as a unit of its own");
-  for (const engine::Victim &unit : units) {
-    const uint64_t allocated = pool.allocatedBytes();
-    require((unit.stateBuffers || unit.bytes == extent) && cache.take(query, unit).outcome == FreeOutcome::Met &&
-                allocated - pool.allocatedBytes() == unit.bytes,
-            "a unit did not release the extent it was weighed at");
-  }
+  require(test::freeFromCache(cache, claim, {.bytes = pool.allocatedBytes()}).outcome == FreeOutcome::Met,
+          "the cache did not give its extents");
   require(!pool.allocatedBytes() && cache.snapshot().stateCache.offloads == 1,
           "the units left extents, or the checkpoint unwritten");
   cache.checkInvariants();
@@ -5518,7 +5482,7 @@ void testDeviceNeedReachesTheLeavesPastTheStates() {
 
 // A lone request's KV growth that needs the extents of every idle chain but the resume point's, while
 // each chain's states need writes and one write holds the write slot: the claim's own first write,
-// or with `inFlight` the write of a unit taken before the claim (takeFirst). The walk takes each
+// or with `inFlight` the write of a claim before it. The walk takes each
 // state behind that write as a unit that lands later, the ordinary ones at the chains' leaves (with
 // `inUse` held in use) and with `checkpoints` the checkpoints on the chains' second blocks, and the
 // newer states of its phase follow it, so the walk reaches every chain's pages and the claim waits
@@ -5557,8 +5521,8 @@ void growPastAStateWrite(bool checkpoints, bool inUse, bool inFlight) {
             label + "growth was short with idle chains behind the state write " + when);
   };
   if (inFlight)
-    require(test::takeFirst(cache, test::kInServiceGrowth, {.bytes = need}).outcome != FreeOutcome::Short,
-            label + "the first unit was short");
+    require(test::freeFromCache(cache, test::kInServiceGrowth, {.bytes = extent}).outcome != FreeOutcome::Short,
+            label + "the first claim was short");
   if (released() < need)
     claim("before the writes landed");
   control->ready = true;
@@ -5577,68 +5541,6 @@ void testGrowthPastAStateWriteReachesTheIdleChains() {
     for (const bool inUse : {false, true})
       for (const bool inFlight : {false, true})
         growPastAStateWrite(checkpoints, inUse, inFlight);
-}
-
-// A state of TestState's bytes that counts the cache's looks at it: its
-// bytes, and whether the tier takes its write.
-class CountedState final : public CompositeState {
-public:
-  explicit CountedState(uint64_t &looks) : looks_(looks) {}
-  [[nodiscard]] uint64_t bytes() const noexcept override {
-    ++looks_;
-    return 100;
-  }
-  [[nodiscard]] bool canOffload(bool) const noexcept override {
-    ++looks_;
-    return false;
-  }
-
-private:
-  uint64_t &looks_;
-};
-
-// A device need weighs a large cache in one walk: twice the conversations cost about twice the
-// state looks, not four times.
-void testDeviceNeedWeighsALargeCacheAtOnce() {
-  constexpr uint32_t kConversations = 120, kPages = 32;
-  // The looks at the states that weighing every extent of a cache of
-  // `conversations` takes.
-  const auto weigh = [](uint32_t conversations) {
-    uint64_t looks = 0;
-    test::TestKvStorage storage{(conversations + 8) * kPages, 100, 64};
-    KvPool pool{storage, 64};
-    engine::Cache cache(pool, nullptr, nullptr);
-    for (uint64_t id = 1; id <= conversations; ++id) {
-      std::vector<uint32_t> prompt(kPages * KvCache::pageTokens + 1);
-      std::iota(prompt.begin(), prompt.end(), 100'000 * id);
-      cache.beginRequest(id);
-      require(admitTokens(cache, id, prompt.size()).granted(), "a conversation's pages were denied");
-      cache.publishCommittedBlocks(id, prompt, kPages * KvCache::pageTokens, {});
-      cache.publishCompositeState(cache.blockAt(id, kPages / 2 * KvCache::pageTokens),
-                                  std::make_shared<CountedState>(looks), true);
-      cache.publishCompositeState(cache.blockAt(id, kPages * KvCache::pageTokens),
-                                  std::make_shared<CountedState>(looks), false);
-      cache.endRequest(id);
-    }
-    const ClaimSpec claim{.cls = ClaimClass::InService};
-    const VictimQuery query{.claim = &claim, .need = {.bytes = pool.allocatedBytes()}};
-    looks = 0;
-    uint64_t weighed = 0;
-    uint32_t units = 0;
-    for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim;
-         victim = cache.peek(query, &*victim)) {
-      weighed += victim->bytes;
-      ++units;
-    }
-    const uint64_t allocated = pool.allocatedBytes();
-    require(weighed == allocated && units >= conversations * kPages / 64 && looks,
-            "the walk did not weigh every extent and state of the cache: " + std::to_string(weighed) + " of " +
-                std::to_string(allocated) + " bytes, " + std::to_string(looks) + " looks at its states");
-    return looks;
-  };
-  const uint64_t looks = weigh(kConversations), twice = weigh(2 * kConversations);
-  require(twice < 3 * looks, "weighing twice the conversations looked at their states " + std::to_string(twice) +
-                                 " times, against " + std::to_string(looks));
 }
 
 // A device need takes KV only while it can empty an extent past the kept runways; otherwise it
@@ -5700,108 +5602,6 @@ void testDeviceNeedPassesOverLeavesOfFormsOutOfReach() {
           "a device need took a leaf of a form no extent of which its KV could empty");
   spill.cache.checkInvariants();
   spill.cache.endRequest(3);
-}
-
-// A parent that becomes a leaf takes the recency of the child that leaves it last
-// (KvCache::inherit).
-void testParentTakesTheRecencyOfTheChildThatLeavesLast() {
-  // A dense history of four pages: the chain's pages are copied and stay Full.
-  Spilling spill(CacheSpillPolicy{4, 1});
-  const std::vector<uint32_t> prompt = Spilling::prompt(1000, 2);
-  spill.start(1, prompt, 2);
-  static_cast<void>(test::spillRound(spill.cache, spill.tier));
-  const uint64_t p = spill.block(1, 0), b = spill.block(1, 1);
-  spill.cache.endRequest(1);
-  std::vector<uint32_t> sibling = prompt;
-  for (size_t row = KvCache::pageTokens; row < sibling.size(); ++row)
-    sibling[row] = 5000 + static_cast<uint32_t>(row);
-  spill.start(2, sibling, 2, KvMode::Resident);
-  const uint64_t a = spill.block(2, 1);
-  spill.cache.endRequest(2);
-  spill.start(3, Spilling::prompt(9000, 2), 2, KvMode::Resident);
-  const uint64_t q = spill.block(3, 1);
-  spill.cache.endRequest(3);
-  // A state only the disk holds on each leaf; B's lookup leaves it the newest.
-  for (const uint64_t leaf : {b, a, q}) {
-    spill.publishState(leaf);
-    require(spill.cache.reclaimOneState(StateClass::Ordinary, false) && spill.cache.pollTransfers(),
-            "a leaf's state was not written");
-  }
-  static_cast<void>(spill.cache.lookup(prompt, {}));
-  require(spill.cache.copiedBlocks(b) == 2 && spill.cache.copiedBlocks(a) == 1 && !spill.cache.copiedBlocks(q),
-          "fixture copies changed");
-  // One demotion at a time.
-  spill.tier.writeLimits[static_cast<size_t>(WriteClass::Reclaim)] = 1;
-  const ClaimSpec claim{.cls = ClaimClass::InService};
-  const VictimQuery query{.claim = &claim, .need = {.pages = 1}};
-  const auto inMemory = [&](uint64_t block) { return spill.cache.residentChainPages({&block, 1}) != 0; };
-  const auto take = [&] {
-    const std::optional<engine::Victim> unit = spill.cache.peek(query, nullptr);
-    require(unit && spill.cache.take(query, *unit).outcome == FreeOutcome::Met, "a unit the walk weighed stayed");
-  };
-  // A's demotion, then B; once A's copy has landed, P before Q.
-  take();
-  take();
-  require(!inMemory(b) && inMemory(p) && inMemory(q),
-          "B did not go second, or P or Q went while A's demotion was in flight");
-  spill.tier.complete();
-  static_cast<void>(spill.cache.pollTransfers());
-  take();
-  require(!inMemory(p) && inMemory(q), "the retry did not take the parent before a leaf newer than its last child");
-  spill.cache.checkInvariants();
-}
-
-// Recency passes up through a parent whose demotion is still in flight to the grandparent
-// (KvCache::inherit).
-void testGrandparentTakesTheRecencyOfTheLeafThatLeftItsChild() {
-  test::TestKvStorage storage{16, 100, 4};
-  KvPool pool{storage, 16};
-  test::TestKvTier tier;
-  tier.transferLimit = 8;
-  // One demotion at a time.
-  tier.writeLimits[static_cast<size_t>(WriteClass::Reclaim)] = 1;
-  auto budget = std::make_shared<model::DiskBudget>(64 * 100);
-  tier.budget = budget;
-  engine::Cache cache(pool, &tier, budget);
-  const auto toDisk = [&](uint64_t block) {
-    auto control = std::make_shared<TransferControl>();
-    control->ready = true;
-    cache.publishCompositeState(block, std::make_shared<TieredState>(control), false);
-    require(cache.reclaimOneState(StateClass::Ordinary, false) && cache.pollTransfers(), "a state was not written");
-  };
-  const auto [prompt, chain] = cacheChain(cache, 1, 2);
-  toDisk(chain[1]);
-  require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary).madeProgress &&
-              tier.demotions == 1,
-          "P's demotion did not start");
-  // A request resumes from P's state and publishes L below P while P's copy
-  // is written; Q comes meanwhile.
-  CacheLookup lookup = cache.lookup(prompt, {});
-  cache.beginRequest(2);
-  require(lookup.state && admitRestore(cache, 2, lookup).granted(), "the request did not resume from P");
-  std::vector<uint32_t> longer(prompt.begin(), prompt.begin() + 2 * KvCache::pageTokens);
-  for (uint32_t row = 0; row <= KvCache::pageTokens; ++row)
-    longer.push_back(7000 + row);
-  require(admitTokens(cache, 2, 3 * KvCache::pageTokens).granted(), "L's page was denied");
-  cache.publishCommittedBlocks(2, longer, 3 * KvCache::pageTokens, {});
-  const uint64_t q = cacheChain(cache, 3, 2).second[1];
-  toDisk(q);
-  lookup = {};
-  cache.endRequest(2);
-  const ClaimSpec claim{.cls = ClaimClass::InService};
-  const VictimQuery query{.claim = &claim, .need = {.pages = 1}};
-  const auto inMemory = [&](uint64_t block) { return cache.residentChainPages({&block, 1}) != 0; };
-  // L, then Q before G.
-  std::optional<engine::Victim> unit = cache.peek(query, nullptr);
-  require(unit && cache.take(query, *unit).outcome == FreeOutcome::Met, "L did not go");
-  tier.complete();
-  static_cast<void>(cache.pollTransfers());
-  unit = cache.peek(query, nullptr);
-  require(unit && cache.take(query, *unit).outcome == FreeOutcome::Met, "the retry took nothing");
-  tier.complete();
-  static_cast<void>(cache.pollTransfers());
-  require(!inMemory(q) && inMemory(chain[0]), "the retry did not take Q before the grandparent");
-  cache.checkInvariants();
 }
 
 // Free pages held by higher-ranked claims are not room to wait for; the request reclaims instead.
@@ -5890,8 +5690,7 @@ void testImmediateWalksOfferWhatLandsLaterInItsPlace() {
 
   // The leaf a state on disk restores through, without a copy while the
   // tier takes writes: the unit of its demotion, which the tier and the
-  // quota have room for, frees its page as the copy lands. A claim that can
-  // wait gets each block above it next, a leaf once the copy below it lands.
+  // quota have room for, frees its page as the copy lands.
   test::TestKvTier tier;
   test::RoomTier room(tier);
   CacheFixture kv(&room, false, std::make_shared<model::DiskBudget>(1000));
@@ -5911,14 +5710,15 @@ void testImmediateWalksOfferWhatLandsLaterInItsPlace() {
     return units;
   };
   const std::vector<engine::Victim> demoted = leavesOf(NeedTiming::Immediate);
-  const std::vector<engine::Victim> demotes = leavesOf(NeedTiming::CanWait);
-  require(demoted.size() == 1 && demoted[0].later && demoted[0].pages == 1 && demotes.size() == 4 &&
-              std::ranges::all_of(demotes, [](const engine::Victim &unit) { return unit.later && unit.pages == 1; }),
-          "a claim that cannot wait was not offered the leaf that needs a demotion in its place, marked later, "
-          "or one that can wait not the blocks above it");
+  require(demoted.size() == 1 && demoted[0].later && demoted[0].pages,
+          "a claim that cannot wait was not offered the leaf that needs a demotion in its place, marked later");
+  require(test::freeFromCache(kv.cache, test::kInServiceGrowth, {.pages = 1}).outcome == FreeOutcome::Pending &&
+              tier.demotions == 1,
+          "a claim that can wait did not demote the leaf");
 }
 
-// An Immediate device need passes over cache only a write frees and takes the leaves after it.
+// An Immediate device need passes over cache only a write frees and takes the leaves after it,
+// writing nothing.
 void testImmediateDeviceWalkOffersWhatAWriteFreesFirst() {
   test::TestKvStorage storage{48, 100, 4};
   KvPool pool{storage, 4};
@@ -5942,32 +5742,11 @@ void testImmediateDeviceWalkOffersWhatAWriteFreesFirst() {
   for (uint64_t id = 2; id <= 5; ++id)
     static_cast<void>(cachePrompt(id, 4));
   static_cast<void>(cache.releaseEmptyExtents(false));
-  const auto unitsOf = [&](NeedTiming timing) {
-    const ClaimSpec claim{.cls = ClaimClass::Optional, .timing = timing};
-    const VictimQuery query{.claim = &claim, .need = {.bytes = pool.allocatedBytes()}};
-    std::vector<engine::Victim> units;
-    for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim; victim = cache.peek(query, &*victim))
-      units.push_back(*victim);
-    return units;
-  };
-  const std::vector<engine::Victim> waits = unitsOf(NeedTiming::CanWait);
-  const std::vector<engine::Victim> atOnce = unitsOf(NeedTiming::Immediate);
-  require(!waits.empty() && waits[0].later && waits[0].stateBuffers == 1 && atOnce.size() > 1 && atOnce[0].later &&
-              atOnce[0].bytes == waits[0].bytes && atOnce[0].stateBuffers == waits[0].stateBuffers &&
-              !atOnce[1].later,
-          "an Immediate claim's walk passed over the checkpoint that needs a write without offering what writing it "
-          "frees first");
   const ClaimSpec claim{.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate};
-  const VictimQuery query{.claim = &claim, .need = {.bytes = pool.allocatedBytes()}};
-  uint64_t released = 0;
-  for (const engine::Victim &unit : atOnce) {
-    if (unit.later)
-      continue;
-    const uint64_t allocated = pool.allocatedBytes();
-    require(cache.take(query, unit).outcome == FreeOutcome::Met && allocated - pool.allocatedBytes() == unit.bytes,
-            "a unit that goes at once did not release what it was weighed at");
-    released += unit.bytes;
-  }
+  const uint64_t allocated = pool.allocatedBytes();
+  require(test::freeFromCache(cache, claim, {.bytes = 2 * 4 * 100}).outcome == FreeOutcome::Met,
+          "an Immediate claim did not take the leaves after the checkpoint");
+  const uint64_t released = allocated - pool.allocatedBytes();
   require(released && !control->slots && !cache.snapshot().stateCache.offloads && cache.stateResident(oldest[0]),
           "the units that go at once wrote the checkpoint");
   cache.checkInvariants();
@@ -5990,23 +5769,21 @@ uint64_t cacheConversation(engine::Cache &cache, uint64_t id, uint32_t pages,
   return last;
 }
 
-// The pages a need's units weigh, and those taking them frees, of the
-// need's form: now, or as the demotions they start land.
+// The pages a need's units count at most (peek), and those its takes free,
+// of the need's form, now or as the demotions they start land, taken one at
+// a time until one takes nothing.
 std::pair<uint32_t, uint32_t> weighAndTakePages(engine::Cache &cache, KvPool &pool, const VictimQuery &query) {
-  std::vector<engine::Victim> units;
   uint32_t weighed = 0;
   for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim;
-       victim = cache.peek(query, &*victim)) {
+       victim = cache.peek(query, &*victim))
     weighed += victim->form == query.need.form ? victim->pages : 0;
-    units.push_back(*victim);
-  }
   const auto pages = [&] {
     return pool.freePageCount(query.need.form) +
            cache.returning().landingPages[static_cast<size_t>(query.need.form)];
   };
   const uint32_t before = pages();
-  for (const engine::Victim &unit : units)
-    require(cache.take(query, unit).outcome == FreeOutcome::Met, "a unit the walk weighed stayed");
+  while (test::takeFirst(cache, *query.claim, query.need).outcome != FreeOutcome::Short) {
+  }
   cache.checkInvariants();
   return {weighed, pages() - before};
 }
@@ -6030,7 +5807,8 @@ void testPageWalkOffersEachDeadLeafOnce() {
           "the walk weighed " + std::to_string(weighed) + " pages, taking its units freed " + std::to_string(freed));
 }
 
-// A need the engine's limit refused is a device need: its units release whole extents.
+// A need the engine's limit refused is a device need: each take releases whole extents, or gives
+// up a state.
 void testEngineRefusedPageNeedIsADeviceNeed() {
   test::TestKvStorage storage{16, 100, 1};
   KvPool pool{storage, 16};
@@ -6039,23 +5817,13 @@ void testEngineRefusedPageNeedIsADeviceNeed() {
     static_cast<void>(cacheConversation(cache, id, 2, std::make_shared<TestState>(100)));
   static_cast<void>(cache.releaseEmptyExtents(false));
   const ClaimSpec claim{.cls = ClaimClass::InService};
-  const VictimQuery query{.claim = &claim, .need = {.bytes = 100, .pages = 2}};
-  std::vector<engine::Victim> units;
-  uint64_t weighed = 0;
-  for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim;
-       victim = cache.peek(query, &*victim)) {
-    weighed += victim->bytes;
-    units.push_back(*victim);
-  }
-  require(units.size() == 9 && weighed == 600 && units[0].stateBuffers == 1 && !units[0].bytes,
-          "a need the engine's limit refused weighed " + std::to_string(weighed) + " bytes in " +
-              std::to_string(units.size()) + " units, not the extents the cache releases");
-  for (const engine::Victim &unit : units) {
-    const uint64_t allocated = pool.allocatedBytes();
-    require(cache.take(query, unit).outcome == FreeOutcome::Met && allocated - pool.allocatedBytes() == unit.bytes,
-            "a unit did not release the extent it was weighed at");
-  }
-  require(!pool.allocatedBytes() && !cache.snapshot().stateCache.entries, "the units left extents or states");
+  uint32_t takes = 0;
+  for (FreeResult step; (step = test::takeFirst(cache, claim, {.bytes = 100, .pages = 2})).outcome == FreeOutcome::Met;
+       ++takes)
+    require(step.nowBytes % 100 == 0 && (step.nowBytes || step.stateBuffers == 1),
+            "a take released no whole extent and gave up no state");
+  require(takes == 9 && !pool.allocatedBytes() && !cache.snapshot().stateCache.entries,
+          "the takes left extents or states");
 }
 
 // A page need's walk reaches parents that become leaves and leaves under states; each unit frees
@@ -6080,19 +5848,15 @@ void testPageNeedReachesParentsAndLeavesUnderStates() {
     for (uint64_t id = 1; id <= 3; ++id)
       static_cast<void>(cacheConversation(cache, id, 2, std::make_shared<TestState>(100)));
     const VictimQuery query{.claim = &claim, .need = {.hostRefused = hostRefused, .pages = 6}};
-    uint32_t buffers = 0;
-    for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim;
-         victim = cache.peek(query, &*victim))
-      buffers += victim->stateBuffers;
     const auto [weighed, freed] = weighAndTakePages(cache, pool, query);
-    require(weighed == 6 && freed == 6 && buffers == 3 && !cache.snapshot().stateCache.entries,
+    require(weighed == 6 && freed == 6 && !cache.snapshot().stateCache.entries,
             std::string(hostRefused ? "a page scan" : "a page need") + " under states weighed " +
                 std::to_string(weighed) + " pages, freed " + std::to_string(freed));
   }
 }
 
-// A device unit freed only by the demotions it starts is weighed at what lands, and take() reports
-// it as later bytes.
+// A device unit freed only by the demotions it starts is marked later, and take() reports the
+// extent its page completes as it lands as later bytes.
 void testDeviceUnitWeighsWhatItsDemotionsReturn() {
   test::TestKvStorage storage{8, 100, 1};
   KvPool pool{storage, 1};
@@ -6111,17 +5875,48 @@ void testDeviceUnitWeighsWhatItsDemotionsReturn() {
   const ClaimSpec host{.cls = ClaimClass::Host};
   const VictimQuery query{.claim = &host, .need = {.bytes = 100}};
   const std::optional<engine::Victim> unit = cache.peek(query, nullptr);
-  require(unit && unit->later && unit->bytes == 100,
-          "the unit that demotes the leaf was weighed at " + std::to_string(unit ? unit->bytes : 0) +
-              " bytes, not the extent its page completes as it lands");
+  require(unit && unit->later, "the unit that demotes the leaf was not marked later");
   const uint64_t allocated = pool.allocatedBytes();
   const FreeResult taken = cache.take(query, *unit);
-  require(taken.outcome == FreeOutcome::Met && !taken.nowBytes && taken.laterBytes == 100 &&
+  require(taken.outcome == FreeOutcome::Pending && !taken.nowBytes && taken.laterBytes == 100 &&
               pool.allocatedBytes() == allocated && tier.demotions == 1,
           "taking the unit did not start the demotion, or did not say what lands");
   tier.complete();
   static_cast<void>(cache.pollTransfers());
   require(cache.releaseEmptyExtents(true) == 100, "the extent the landed page completed was not released");
+}
+
+// A claim that can wait takes the cache that frees now before it waits for a write, within the one
+// recency order: a newer copied leaf meets an extent's need while an older leaf a state on the SSD
+// needs, without a copy, stays; only the next extent's need demotes it.
+void testCopiedCacheGoesBeforeAWrite() {
+  test::TestKvStorage storage{8, 100, 1};
+  KvPool pool{storage, 1};
+  test::TestKvTier tier;
+  auto budget = std::make_shared<model::DiskBudget>(1000);
+  tier.budget = budget;
+  engine::Cache cache(pool, &tier, budget);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  const uint64_t older = cacheConversation(cache, 1, 1, std::make_shared<TieredState>(control));
+  const uint64_t newer = cacheConversation(cache, 2, 1, std::make_shared<TieredState>(control));
+  for (int state = 0; state < 2; ++state)
+    require(test::freeFromCache(cache, test::kInServiceGrowth, {.stateBuffers = 1}).outcome == FreeOutcome::Met &&
+                cache.pollTransfers(),
+            "a state was not written to the SSD");
+  require(cache.persist(newer) == PersistStatus::Started, "the newer leaf was not copied ahead");
+  tier.complete();
+  static_cast<void>(cache.pollTransfers());
+  static_cast<void>(cache.releaseEmptyExtents(false));
+  const auto inMemory = [&](uint64_t block) { return cache.residentChainPages({&block, 1}) != 0; };
+  const uint64_t demotions = tier.demotions;
+  require(test::freeFromCache(cache, test::kInServiceGrowth, {.bytes = 100}).outcome == FreeOutcome::Met &&
+              tier.demotions == demotions && !inMemory(newer) && inMemory(older),
+          "a claim that can wait demoted the older leaf while a copied one met its need");
+  require(test::freeFromCache(cache, test::kInServiceGrowth, {.bytes = 100}).outcome == FreeOutcome::Pending &&
+              tier.demotions == demotions + 1,
+          "the next extent's need did not demote the older leaf");
+  cache.checkInvariants();
 }
 
 int main() {
@@ -6274,11 +6069,8 @@ int main() {
     testGrowthNeedKeepsTheFreePagesItTakes();
     testDeviceNeedReachesTheLeavesPastTheStates();
     testGrowthPastAStateWriteReachesTheIdleChains();
-    testDeviceNeedWeighsALargeCacheAtOnce();
     testDeviceNeedKeepsKvBesideTheIndexRunway();
     testDeviceNeedPassesOverLeavesOfFormsOutOfReach();
-    testParentTakesTheRecencyOfTheChildThatLeavesLast();
-    testGrandparentTakesTheRecencyOfTheLeafThatLeftItsChild();
     testHeldPagesAreNoRoomToWaitFor();
     testImmediateWalksOfferWhatLandsLaterInItsPlace();
     testImmediateDeviceWalkOffersWhatAWriteFreesFirst();
@@ -6286,6 +6078,7 @@ int main() {
     testEngineRefusedPageNeedIsADeviceNeed();
     testPageNeedReachesParentsAndLeavesUnderStates();
     testDeviceUnitWeighsWhatItsDemotionsReturn();
+    testCopiedCacheGoesBeforeAWrite();
     std::cout << "engine cache tests passed\n";
     return 0;
   } catch (const std::exception &error) {

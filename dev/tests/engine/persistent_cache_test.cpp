@@ -1382,15 +1382,15 @@ void testCopyDemandCountsOnlyWhatGoesAtOnce() {
   const ClaimSpec growth{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate};
   const VictimQuery query{.claim = &growth, .need = {.bytes = 1}};
   uint64_t atOnce = 0;
-  uint32_t later = 0;
+  bool later = false;
   for (std::optional<Victim> unit = process.cache.peek(query, nullptr); unit;
        unit = process.cache.peek(query, &*unit)) {
     if (unit->later)
-      later += unit->stateBuffers;
+      later = true;
     else
       atOnce += unit->bytes;
   }
-  require(atOnce && later, "the walk did not offer what writing the checkpoint frees before the KV that goes at once");
+  require(atOnce && later, "the walk did not offer what writing the checkpoint frees beside the KV that goes at once");
   require(!writes.run(kDelay, atOnce, false) && !process.tier.demotions && writes.snapshot().waiting == 1,
           "a point was copied ahead though what goes at once held the demand");
   require(!writes.run(kDelay, atOnce + 1, false) && process.tier.demotions == 1,

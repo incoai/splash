@@ -64,12 +64,12 @@ public:
     units.erase(unit);
     if (gone.later) {
       landing.push_back(gone);
-      return {.laterBytes = gone.bytes};
+      return {.outcome = FreeOutcome::Met, .laterBytes = gone.bytes};
     }
     const uint64_t bytes = gone.sized ? gone.bytes : unsizedBytes;
     if (memory_ && bytes)
       memory_->release(name_, bytes);
-    return {.nowBytes = bytes};
+    return {.outcome = FreeOutcome::Met, .nowBytes = bytes};
   }
   // The units taken to land later free their memory. With
   // landsIntoExtents, as the cache's demotions do, a landing only empties
@@ -709,7 +709,7 @@ public:
     }
     units.erase(units.begin() + static_cast<std::ptrdiff_t>(first),
                 units.begin() + static_cast<std::ptrdiff_t>(victim.key + 1));
-    return {.nowBytes = bytes};
+    return {.outcome = FreeOutcome::Met, .nowBytes = bytes};
   }
   std::vector<std::pair<uint64_t, Victim>> units;  // the test's name for each unit, and the unit
   std::vector<uint64_t> taken;

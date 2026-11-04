@@ -69,16 +69,14 @@ private:
 // beside reclaims, quota and failing transfers; every step checks Cache::checkInvariants.
 class Run final {
 public:
-  // With peeks, the walk's units for a device or a page need are weighed
-  // and taken too (checkPeek), and in half the runs the tier says how many
-  // demotions it admits (test::RoomTier), which the walk then counts on.
+  // With peeks, random claims count the walk's units and take them too
+  // (checkTake).
   // With usedStates, a request uses the state it resumes from, as the
   // engine's requests do (Cache::useState).
   Run(uint32_t seed, bool windowed, bool peeks = false, bool usedStates = false)
       : random_(seed), windowed_(windowed), peeks_(peeks), usedStates_(usedStates), tier_(chance(50)),
-        saysRoom_(peeks && chance(50)),
         budget_(std::make_shared<model::DiskBudget>(kSlots * 100)),
-        cache_(pool_, saysRoom_ ? static_cast<engine::KvTier *>(&room_) : &tier_, budget_,
+        cache_(pool_, &tier_, budget_,
                windowed ? std::nullopt : std::optional(CacheSpillPolicy{pick(0, 2), pick(1, 2)}),
                windowed ? std::optional(CacheWindowPolicy{pick(1, 3)}) : std::nullopt) {
     tier_.budget = budget_;
@@ -112,12 +110,12 @@ public:
     case 11: command(); break;
     case 12: persist(); break;
     case 13: failWrites(); break;
-    case 14: checkPeek(); break;
+    case 14: checkTake(); break;
     }
     cache_.checkInvariants();
   }
 
-  uint64_t exactUnits = 0, unsureUnits = 0, landingUnits = 0;
+  uint64_t steps = 0;
 
   // Every request ends, every transfer lands, and nothing leaks: the pool's
   // pages and the tier's slots belong to the cache's blocks alone.
@@ -153,9 +151,9 @@ public:
     cache_.checkInvariants();
   }
 
-  // The walk never overstates: taking a random claim's first units frees at least what peek
-  // weighed, and never takes in-use or certain-reuse units its class may not take.
-  void checkPeek() {
+  // A claim's takes never free more than peek counted for its units, and
+  // never take in-use or certain-reuse units its class may not take.
+  void checkTake() {
     const ClaimSpec claim{.cls = std::array{ClaimClass::InService, ClaimClass::Start, ClaimClass::Optional,
                                             ClaimClass::Floor, ClaimClass::Growth, ClaimClass::Host}[pick(0, 5)],
                           .reach = chance(50) ? ReclaimClass::InUse : ReclaimClass::Ordinary,
@@ -189,46 +187,40 @@ public:
       cache_.setWantedChains({wanted});
     }
     const bool wantedResident = !wanted.empty() && cache_.stateResident(wanted.back());
-    std::vector<engine::Victim> victims;
-    uint64_t predicted = 0;
-    uint32_t predictedPages = 0;
-    for (std::optional<engine::Victim> victim = cache_.peek(query, nullptr); victim && victims.size() < 4;
-         victim = cache_.peek(query, &*victim)) {
-      if (victim->later && immediate)
+    std::vector<engine::Victim> units;
+    uint64_t counted = 0;
+    uint32_t countedPages = 0;
+    for (std::optional<engine::Victim> unit = cache_.peek(query, nullptr); unit; unit = cache_.peek(query, &*unit)) {
+      if (unit->later && immediate)
         continue;
-      predicted += victim->bytes;
-      predictedPages += victim->form == form ? victim->pages : 0;
-      victims.push_back(*victim);
+      counted += unit->bytes;
+      countedPages += unit->form == form ? unit->pages : 0;
+      units.push_back(*unit);
     }
     const auto pagesOf = [&] {
       return pool_.freePageCount(form) + cache_.demotedPages()[static_cast<size_t>(form)];
     };
-    const size_t writes = tier_.writes.size();
-    const uint64_t offloads = cache_.snapshot().stateCache.offloads;
-    bool sure = true;
+    const uint32_t pagesBefore = pagesOf();
     uint64_t freed = 0;
-    uint32_t freedPages = 0;
-    for (const engine::Victim &victim : victims) {
-      sure = sure && !victim.later;
-      // A windowed cache's trims may take Slim extents for the Full pages
-      // they free.
-      const uint64_t before = pool_.allocatedBytes();
-      const uint32_t pagesBefore = pagesOf();
-      const FreeResult taken = cache_.take(query, victim);
-      const uint64_t released = before - std::min(before, pool_.allocatedBytes());
-      require(taken.nowBytes <= released, "a take released " + std::to_string(released) + " bytes, reported " +
-                                              std::to_string(taken.nowBytes));
-      freed += released + taken.laterBytes;
-      const uint32_t pagesAfter = pagesOf();
-      freedPages += pagesAfter - std::min(pagesAfter, pagesBefore);
-      sure = sure && tier_.writes.size() == writes && cache_.snapshot().stateCache.offloads == offloads;
-      if (!device)
-        continue;
-      landingUnits += taken.laterBytes != 0;
-      ++(sure ? exactUnits : unsureUnits);
-      require(!sure || released == victim.bytes,
-              "a unit released " + std::to_string(released) + " bytes, weighed at " + std::to_string(victim.bytes));
+    for (const engine::Victim &unit : units) {
+      // A stepwise unit's steps until one takes nothing, each a reclaim of
+      // a finite cache.
+      for (;;) {
+        const uint64_t before = pool_.allocatedBytes();
+        const FreeResult taken = cache_.take(query, unit);
+        const uint64_t released = before - std::min(before, pool_.allocatedBytes());
+        require(taken.nowBytes <= released, "a take released " + std::to_string(released) + " bytes, reported " +
+                                                std::to_string(taken.nowBytes));
+        freed += released + taken.laterBytes;
+        const bool took = taken.outcome == FreeOutcome::Met || released || taken.laterBytes || taken.pages ||
+                          taken.stateBuffers;
+        if (!unit.stepwise || !took)
+          break;
+        ++steps;
+      }
     }
+    const uint32_t pagesAfter = pagesOf();
+    const uint32_t freedPages = pagesAfter - std::min(pagesAfter, pagesBefore);
     for (const uint64_t block : inUse)
       require(reachesInUse || cache_.stateResident(block),
               "a claim that does not reach what is in use took a state in use");
@@ -236,34 +228,11 @@ public:
             "a claim that does not take what is of certain reuse took the state a waiting request restores");
     if (!wanted.empty())
       cache_.setWantedChains({});
-    // A unit's later steps free once the transfers before them land, which
-    // the claim's retries take: what was started lands, the pages that frees
-    // past the landing pages counted when it started count, and the query's
-    // units are taken again until they free what was weighed or none goes.
-    const auto landingOf = [&] { return cache_.demotedPages()[static_cast<size_t>(form)]; };
-    for (uint32_t retry = 0; retry < 64 && (freed < predicted || freedPages < predictedPages); ++retry) {
-      const uint64_t before = pool_.allocatedBytes();
-      const uint32_t freeBefore = pool_.freePageCount(form), landingBefore = landingOf();
-      tier_.complete();
-      static_cast<void>(cache_.pollTransfers());
-      const uint32_t freeAfter = pool_.freePageCount(form), landingAfter = landingOf();
-      const uint32_t landed = landingBefore - std::min(landingBefore, landingAfter);
-      freedPages += freeAfter - std::min(freeAfter, freeBefore + landed);
-      std::optional<engine::Victim> unit = cache_.peek(query, nullptr);
-      while (unit && unit->later && immediate)
-        unit = cache_.peek(query, &*unit);
-      const uint32_t pagesBefore = pagesOf();
-      const FreeResult taken = unit ? cache_.take(query, *unit) : FreeResult{};
-      freed += before - std::min(before, pool_.allocatedBytes()) + taken.laterBytes;
-      const uint32_t pagesAfter = pagesOf();
-      freedPages += pagesAfter - std::min(pagesAfter, pagesBefore);
-      if (taken.outcome != FreeOutcome::Met)
-        break;
-    }
-    require(freed >= predicted && freedPages >= predictedPages,
-            "the walk weighed its victims to free more than taking them freed: weighed " + std::to_string(predicted) +
-                " bytes and " + std::to_string(predictedPages) + " pages, freed " + std::to_string(freed) +
-                " bytes and " + std::to_string(freedPages) + " pages");
+    // A device need counts bytes, a page need pages of its form.
+    require(device ? freed <= counted : freedPages <= countedPages,
+            "the claim's takes freed more than peek counted: counted " + std::to_string(counted) + " bytes and " +
+                std::to_string(countedPages) + " pages, freed " + std::to_string(freed) + " bytes and " +
+                std::to_string(freedPages) + " pages");
   }
 
 private:
@@ -466,8 +435,6 @@ private:
   test::TestKvStorage storage_{1024, 100, 4, 10, 30};
   KvPool pool_{storage_, 4};
   test::TestKvTier tier_;
-  test::RoomTier room_{tier_};
-  bool saysRoom_;
   std::shared_ptr<model::DiskBudget> budget_;
   engine::Cache cache_;
   std::shared_ptr<Shelf> shelf_ = std::make_shared<Shelf>(Shelf{.budget = budget_});
@@ -502,11 +469,11 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
             << " windowed and windowed seed 9454\n";
 }
 
-// The same runs with peeks, again with requests using the states they resume from; the fixed
-// seeds reach walk paths the default seeds miss.
-void testPeekNeverOverstates(uint32_t plainSeeds, uint32_t windowedSeeds) {
-  uint64_t exact = 0, unsure = 0, landing = 0;
-  const auto check = [&](uint32_t seed, bool windowed, bool usedStates = false) {
+// The same runs with random claims counted and taken (checkTake), again with requests using the
+// states they resume from.
+void testTakeNeverExceedsPeek(uint32_t plainSeeds, uint32_t windowedSeeds) {
+  uint64_t steps = 0;
+  const auto check = [&](uint32_t seed, bool windowed, bool usedStates) {
     Run run(seed, windowed, true, usedStates);
     try {
       for (int step = 0; step < 600; ++step)
@@ -515,41 +482,17 @@ void testPeekNeverOverstates(uint32_t plainSeeds, uint32_t windowedSeeds) {
       run.drain();
     } catch (const std::exception &error) {
       throw std::runtime_error(std::string(usedStates ? "used states " : "") +
-                               (windowed ? "peek windowed " : "peek ") + "seed " + std::to_string(seed) + ": " +
+                               (windowed ? "take windowed " : "take ") + "seed " + std::to_string(seed) + ": " +
                                error.what());
     }
-    exact += run.exactUnits;
-    unsure += run.unsureUnits;
-    landing += run.landingUnits;
+    steps += run.steps;
   };
   for (const bool usedStates : {false, true})
     for (const bool windowed : {false, true})
       for (uint32_t seed = 1; seed <= (windowed ? windowedSeeds : plainSeeds); ++seed)
         check(seed, windowed, usedStates);
-  // Units around a block whose demotion is in flight: its last child, restores, a chain ending on it.
-  check(2484, true);
-  check(9349, true);
-  check(25949, true);
-  check(28462, true);
-  // A weighed page frees at a landing that lets a poisoned subtree go.
-  for (const uint32_t seed : {11208u, 99256u, 229505u})
-    check(seed, false);
-  // A leaf passes its recency to a parent with a disk-only subtree or a demotion landing.
-  check(1836083, true);
-  check(396221, false);
-  // The resume point lies below a poisoned block whose subtree goes as transfers land.
-  for (const uint32_t seed : {10248u, 15837u, 24025u, 105144u, 386046u, 470525u, 482345u, 247559u, 364835u})
-    check(seed, false);
-  // Retries release an extent placed elsewhere; Slim and Index units reach only their own form.
-  for (const uint32_t seed : {55544u, 63544u, 546782u, 1061965u, 1748006u, 2429048u})
-    check(seed, true);
-  for (const uint32_t seed : {415497u, 478646u, 483524u})
-    check(seed, false);
-  std::cout << "cache peek runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds
-            << " windowed and the fixed seeds; " << exact
-            << " units released what they were weighed at, "
-            << unsure << " after a copy or a write, " << landing
-            << " freeing extents as their copies land, never more than taken\n";
+  std::cout << "cache take runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds << " windowed; " << steps
+            << " reclaim steps, none freeing more than peek counted\n";
 }
 
 } // namespace
@@ -564,7 +507,7 @@ int main(int argc, char **argv) {
     const uint32_t plainSeeds = argc == 3 ? static_cast<uint32_t>(std::stoul(argv[1])) : 40u;
     const uint32_t windowedSeeds = argc == 3 ? static_cast<uint32_t>(std::stoul(argv[2])) : 400u;
     testRandomRuns(plainSeeds, windowedSeeds);
-    testPeekNeverOverstates(plainSeeds, windowedSeeds);
+    testTakeNeverExceedsPeek(plainSeeds, windowedSeeds);
     std::cout << "cache property tests passed\n";
     return 0;
   } catch (const std::exception &error) {

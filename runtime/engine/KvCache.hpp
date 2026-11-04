@@ -214,6 +214,9 @@ public:
   // moves; each counts once. A request holds every page of its chain, so a
   // chain's count stops at the first page one holds.
   [[nodiscard]] uint32_t idlePagesOnChains(std::span<const uint64_t> blocks, kv::PageForm form) const;
+  // Calls `visit` with each resident block whose page no request holds and
+  // no transfer moves, and its page: the KV a reclaim may take.
+  void forEachIdleBlock(const std::function<void(uint64_t blockId, uint32_t page)> &visit) const;
   // Resident, without resident children, users or holders: its page can go
   // once no transfer moves it.
   [[nodiscard]] bool residentLeaf(uint64_t blockId) const;
