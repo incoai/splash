@@ -995,6 +995,52 @@ void testRequestInServiceGrowsThroughTheHostPause() {
           "the paused request did not take the idle cached pages first");
 }
 
+// A growth the host refuses takes only what frees now: a leaf whose copies are on their way to the
+// SSD cache stays and no write starts for it, and the host exemption grows the lane.
+void testAHostRefusedGrowthTakesOnlyWhatFreesNow() {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  test::TestKvTier tier(true);
+  tier.transferLimit = 64;
+  tier.capacity = 128;
+  engine::Cache resources(pool, &tier, test::ampleDiskBudget());
+  Executor executor;
+  executor.keptTier = std::make_shared<OffloadControl>();
+  executor.keptTier->ready = true;
+  Events events;
+  HostPause host;
+  EngineConfig config = test::engineConfig({.maxContext = 102400});
+  host.attach(config, storage, pool);
+  engine::Engine engine(config, resources, executor, events);
+  guardReleases(storage, engine);
+  double now = 1;
+  // A finished conversation's 64 pages, the first 16 of whose copies start
+  // after the persistent tier's delay and stay in flight.
+  const std::vector<uint32_t> first(2060, 7);
+  engine.submit(request(1, first));
+  tickUntil(engine, now, [&] { return idle(engine); }, "the first request did not finish");
+  now = engine.nextWakeupMilliseconds().value_or(now);
+  static_cast<void>(engine.tick(now++));
+  require(tier.inFlight() == 16 && resources.lookup(first, {}).kvBoundary == 2048,
+          "the leaf's copies did not start");
+  executor.decodeFinishes = false;
+  auto running = request(2, std::vector<uint32_t>(65, 2));
+  running.maxNewTokens = 400;
+  running.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(running));
+  tickUntil(engine, now, [&] { return !events.outputs[2].empty(); }, "the lane did not decode");
+  host.pause();
+  const uint32_t writes = tier.demotions;
+  const uint32_t allocated = pool.snapshot().pagesAllocated;
+  for (uint32_t step = 0; step < 3000 && events.completedCount < 2; ++step)
+    static_cast<void>(engine.tick(now++));
+  require(events.completedCount == 2 && events.failedCount == 0 && events.outputs[2].size() == 400 &&
+              engine.snapshot().resourceSuspensions == 0 && pool.snapshot().pagesAllocated > allocated,
+          "the host exemption did not grow the lane through the pause");
+  require(tier.demotions == writes && resources.lookup(first, {}).kvBoundary == 2048,
+          "a growth the host refused took the leaf on its way to the SSD cache, or wrote it");
+}
+
 // With nothing in service the first request starts through the host pause; one beside it waits without evicting and
 // starts once the first is done.
 void testFirstRequestStartsThroughTheHostPause() {
@@ -6029,6 +6075,7 @@ std::span<const test::TestCase> memoryTests() {
       {"testHostPressureStillRecyclesLruStateForRefusedBuffers",
        testHostPressureStillRecyclesLruStateForRefusedBuffers},
       {"testRequestInServiceGrowsThroughTheHostPause", testRequestInServiceGrowsThroughTheHostPause},
+      {"testAHostRefusedGrowthTakesOnlyWhatFreesNow", testAHostRefusedGrowthTakesOnlyWhatFreesNow},
       {"testFirstRequestStartsThroughTheHostPause", testFirstRequestStartsThroughTheHostPause},
       {"testRequestThatNeedsNoGrowthStartsUnderTheHostPause", testRequestThatNeedsNoGrowthStartsUnderTheHostPause},
       {"testSuspendedRequestWaitsForTheHostBesideOneInService", testSuspendedRequestWaitsForTheHostBesideOneInService},
