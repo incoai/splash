@@ -143,8 +143,8 @@ void entriesFollowAReallocatedExtent(metal::MetalBackend &backend, kv::PageStora
 
 // A command makes resident only the extents its tables reach, on the
 // encoders that bind them, and nothing for the command queue: an extent only
-// the cache holds costs commands nothing. A table reaches the extents of all
-// its pages, the entries a partial rewrite keeps among them, and a kernel
+// the cache holds costs commands nothing. A table reaches the extents its
+// entries reach, the entries a partial rewrite keeps among them, and a kernel
 // reads through it what another wrote; after a compaction moves a page into
 // an extent only the cache held, the rewritten table reaches that extent
 // alone.
