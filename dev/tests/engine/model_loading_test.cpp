@@ -199,7 +199,7 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
         require(!retained.contents() && backend.memoryStats().allocatedBytes == baseline,
                 "released image memory remains");
         rejects([&] { (void)readBack(); }, "binds released memory", "a command bound released image memory");
-        require(images.restore(splash::test::admitAll, splash::test::admitAll) && !images.released() &&
+        require(images.restore(splash::test::admitAll) && !images.released() &&
                     backend.memoryStats().allocatedBytes >= baseline + fileBytes && readBack(),
                 "GPU read of a restored image section was incorrect");
         images.release();
@@ -209,7 +209,7 @@ void testWeightImages(MetalBackend &backend, const std::filesystem::path &root) 
                     pwrite(descriptor, &edit, sizeof(edit), kWeightFileAlignment) == sizeof(edit),
                 "unable to write the loaded file");
         close(descriptor);
-        rejects([&] { static_cast<void>(images.restore(splash::test::admitAll, splash::test::admitAll)); },
+        rejects([&] { static_cast<void>(images.restore(splash::test::admitAll)); },
                 "written while the model is loaded", "a restore read a file written since it was opened");
     }
     retained = MetalBuffer{};
@@ -298,7 +298,7 @@ void testRestoreAdmission(MetalBackend &backend, const std::filesystem::path &ro
 
     images.release();
     require(holdsNone(), "released images hold memory");
-    require(!images.restore(splash::test::admitAll, splash::test::admitAll) && !images.contents()[0].bytes.empty() &&
+    require(!images.restore(splash::test::admitAll) && !images.contents()[0].bytes.empty() &&
                 images.contents()[1].bytes.empty(),
             "a restore did not write back the first image alone");
     const uint64_t firstBack = backend.memoryStats().allocatedBytes;
@@ -309,17 +309,17 @@ void testRestoreAdmission(MetalBackend &backend, const std::filesystem::path &ro
     const splash::metal::AllocationAdmission refuse = [](uint64_t, const std::function<void()> &) {
         return splash::metal::AllocationResult{splash::metal::AllocationFailure::HostPressure};
     };
-    rejects([&] { static_cast<void>(images.restore(refuse, refuse)); }, "host memory reserve protected",
+    rejects([&] { static_cast<void>(images.restore(refuse)); }, "host memory reserve protected",
             "an image admission refused was restored");
     require(keepsTheFirst(), "an image admission refused holds memory, or the image before it went");
     writerRefused = true;
-    rejects([&] { static_cast<void>(images.restore(splash::test::admitAll, splash::test::admitAll)); },
+    rejects([&] { static_cast<void>(images.restore(splash::test::admitAll)); },
             "writer refused memory", "an image whose writer was refused memory was restored");
     require(keepsTheFirst(), "an image whose writer was refused memory holds its own, or the image before it went");
     writerRefused = false;
     images.release();
     require(holdsNone(), "a release during a restore kept an image it wrote back");
-    while (!images.restore(splash::test::admitAll, splash::test::admitAll)) {
+    while (!images.restore(splash::test::admitAll)) {
     }
     for (size_t index = 0; index < loaded.size(); ++index) {
         const auto restored = images.contents()[index].bytes;
@@ -619,10 +619,10 @@ void testSyntheticModel(MetalBackend &backend,
                         declaredBytes(model.draft.files) - declaredBytes(model.vision.files),
                 "released weights remain in backend accounting");
         // They come back an image at a time, in load order.
-        require(!model.images->restore(splash::test::admitAll, splash::test::admitAll) &&
+        require(!model.images->restore(splash::test::admitAll) &&
                     !model.images->contents()[0].bytes.empty() && model.images->contents()[1].bytes.empty(),
                 "a restore wrote back other than the next image");
-        while (!model.images->restore(splash::test::admitAll, splash::test::admitAll)) {
+        while (!model.images->restore(splash::test::admitAll)) {
         }
         const auto restored = model.images->contents();
         require(restored.size() == loaded.size() &&

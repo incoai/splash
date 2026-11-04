@@ -72,20 +72,12 @@ std::optional<GgufTargetLoader::StreamedTable> GgufTargetLoader::streamTable() c
       std::make_shared<SparseRowStore>(SparseRowTable{rows.tensor, rows.rows, rows.rowBytes, rows.offset},
                                        openRowReader(std::shared_ptr<const WeightSource>(planned_, &source)),
                                        planned_->table),
-      rows.format,
-      // As WeightImages::load records the image (WeightFile).
-      {"target/" + plan->name, plan->magic, plan->layer, plan->type, plan->bytes, images_.contentIdentity()}};
+      rows.format, imageRecord(images_, "target/", *plan)};
 }
 
 WeightFile GgufTargetLoader::open(size_t index) {
-  const gguf::Image &plan = planned_->images[index];
-  return images_.load({"target/" + plan.name, plan.magic, plan.layer, plan.type, plan.bytes,
-                       [&backend = backend_, planned = planned_, index](std::span<uint8_t>,
-                                                                         const metal::MetalBuffer &buffer) {
-                         writeGgufImage(backend, buffer, planned->images[index]);
-                         planned->source.checkUnchanged();
-                       },
-                       plan.residentBytes});
+  return loadImage(backend_, images_, "target/", {planned_, &planned_->images[index]},
+                   [planned = planned_] { planned->source.checkUnchanged(); });
 }
 
 WeightFile GgufTargetLoader::layer(uint32_t index) {

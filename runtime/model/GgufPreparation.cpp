@@ -661,4 +661,21 @@ void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &imag
   for (const gguf::Copy *copy : decoded) writeDecoded(backend, image, *copy, input, rowIds);
 }
 
+WeightFile loadImage(metal::MetalBackend &backend, WeightImages &images, std::string_view prefix,
+                     std::shared_ptr<const gguf::Image> plan, std::function<void()> checkUnchanged) {
+  ImagePlan image{std::string(prefix) + plan->name, plan->magic, plan->layer, plan->type, plan->bytes,
+                  [&backend, plan, checkUnchanged = std::move(checkUnchanged)](std::span<uint8_t>,
+                                                                               const metal::MetalBuffer &buffer) {
+                    writeGgufImage(backend, buffer, *plan);
+                    checkUnchanged();
+                  },
+                  plan->residentBytes};
+  return images.load(std::move(image));
+}
+
+WeightFileRecord imageRecord(const WeightImages &images, std::string_view prefix, const gguf::Image &plan) {
+  return {std::string(prefix) + plan.name, plan.magic, plan.layer, plan.type, plan.residentBytes,
+          images.contentIdentity()};
+}
+
 } // namespace splash::model

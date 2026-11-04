@@ -3,12 +3,13 @@
 // installer's check before any weight download, on configs built like each
 // supported family's: the MLX target's config.json and its DFlash2 draft's,
 // read from FIXTURES (dev/tests/fixtures/model-configs/<family>), and the
-// config the installer derives from a GGUF's metadata with the metadata it
-// copies (gguf-metadata.json there). Also the descriptor a context past the
-// native window makes of one, and YaRN's rotary frequencies.
+// config the installer derives from a GGUF's metadata with the headers it
+// copies. Also the descriptor a context past the native window makes of one,
+// and YaRN's rotary frequencies.
 //
 //   model-configuration FIXTURES
 
+#include "GgufFixtures.hpp"
 #include "TestChecks.hpp"
 #include "TestDrafts.hpp"
 #include "TestFiles.hpp"
@@ -17,6 +18,7 @@
 #include "model/RopeScaling.hpp"
 #include "model/WeightStore.hpp"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -34,6 +36,7 @@ namespace {
 using namespace splash;
 using test::rejects;
 using test::require;
+namespace test_gguf = test::gguf;
 
 // An upstream model as its assembly records it: model.json, the target's
 // config.json and the draft's.
@@ -628,21 +631,99 @@ void testPrunedExperts(const std::filesystem::path &fixtures) {
           "an MLX target of other experts than its family's was accepted");
 }
 
+// A GGUF target's headers as the installer copies them before any download:
+// the metadata of each part, the first's describing the model, and the
+// tensors of each, without data.
+struct GgufHeaders final {
+  std::vector<std::vector<test_gguf::Key>> keys;
+  std::vector<std::vector<test_gguf::Tensor>> tensors;
+
+  // These headers with `key` in place of the first part's key of its name,
+  // or added.
+  [[nodiscard]] GgufHeaders with(test_gguf::Key key) const {
+    GgufHeaders result = *this;
+    std::vector<test_gguf::Key> &keys = result.keys.front();
+    const auto found =
+        std::find_if(keys.begin(), keys.end(), [&](const test_gguf::Key &k) { return k.name == key.name; });
+    if (found == keys.end()) keys.push_back(std::move(key));
+    else *found = std::move(key);
+    return result;
+  }
+  // These headers with `change` applied to every tensor, but those it
+  // returns false for, which are left out.
+  template <class Change> [[nodiscard]] GgufHeaders changed(Change change) const {
+    GgufHeaders result = *this;
+    for (auto &part : result.tensors) {
+      std::vector<test_gguf::Tensor> kept;
+      for (test_gguf::Tensor &tensor : part)
+        if (change(tensor)) kept.push_back(std::move(tensor));
+      part = std::move(kept);
+    }
+    return result;
+  }
+  // These headers split into `count` parts, as GGUF's split files store
+  // them: every part's split keys, the first part's other keys, the tensors
+  // dealt to the parts in turn.
+  [[nodiscard]] GgufHeaders split(uint16_t count) const {
+    GgufHeaders result;
+    const std::vector<test_gguf::Tensor> &all = tensors.front();
+    for (uint16_t part = 0; part < count; ++part) {
+      std::vector<test_gguf::Key> partKeys = part ? std::vector<test_gguf::Key>{} : keys.front();
+      for (test_gguf::Key &key : test_gguf::splitKeys(part, count, int32_t(all.size())))
+        partKeys.push_back(std::move(key));
+      result.keys.push_back(std::move(partKeys));
+      result.tensors.emplace_back();
+      for (size_t index = part; index < all.size(); index += count) result.tensors.back().push_back(all[index]);
+    }
+    return result;
+  }
+};
+
+// The headers of a GGUF of the target `layout` describes: its metadata
+// (gguf_fixtures::metadata) and its tensors, Q8_0 where the planner reads a
+// format and F32 elsewhere.
+GgufHeaders ggufHeaders(const model::QwenTargetDimensions &layout) {
+  gguf_fixtures::TensorTypes types;
+  for (const char *name :
+       {"token_embd.weight", "output.weight", "attn_qkv.weight", "attn_gate.weight", "ssm_out.weight",
+        "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "ffn_gate.weight", "ffn_up.weight",
+        "ffn_down.weight", "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
+        "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight", "hc_attn_down.weight",
+        "hc_attn_up.weight", "hc_ffn_down.weight", "hc_ffn_up.weight", "output_hc_down.weight",
+        "output_hc_up.weight", "ple_key.weight", "ple_value.weight", "per_layer_token_embd.weight"})
+    types[name] = gguf_fixtures::kQ8_0;
+  return {{gguf_fixtures::metadata(layout)}, {gguf_fixtures::tensorTable(layout, types)}};
+}
+
 // The installer's check before any weight download (the engine's
 // model-check): the family of a target's configuration, alone while its
 // draft is not chosen and then with the draft's, by the rules a start
-// applies. It refuses the fine-tunes an installer's narrower copy of those
-// rules let through.
+// applies, a GGUF's with the headers it copied, which the planner plans the
+// target from as at every start. It refuses the fine-tunes an installer's
+// narrower copy of those rules let through.
 void testConfigurationCheck(const std::filesystem::path &fixtures) {
   const test::TemporaryDirectory directory("splash-model-check");
+  uint32_t checks = 0;
   const auto check = [&](std::string_view targetFormat, std::string_view visionFormat, std::string_view config,
-                         std::optional<std::string_view> ggufMetadata, std::optional<std::string_view> draft) {
-    test::writeFile(directory.path() / "config.json", config);
-    std::optional<std::filesystem::path> metadataFile, draftConfig;
-    if (ggufMetadata) test::writeFile(metadataFile.emplace(directory.path() / "gguf-metadata.json"), *ggufMetadata);
-    if (draft) test::writeFile(draftConfig.emplace(directory.path() / "draft.json"), *draft);
-    return std::string(model::inspectSourceConfiguration(targetFormat, visionFormat, directory.path() / "config.json",
-                                                         metadataFile, draftConfig));
+                         const std::optional<GgufHeaders> &headers, std::optional<std::string_view> draft) {
+    // Each check's files in a directory of their own.
+    const std::filesystem::path root = directory.path() / std::to_string(++checks);
+    std::filesystem::create_directory(root);
+    test::writeFile(root / "config.json", config);
+    std::optional<std::filesystem::path> headerDirectory, draftConfig;
+    if (headers) {
+      std::filesystem::create_directory(headerDirectory.emplace(root / "target"));
+      const size_t parts = headers->keys.size();
+      for (size_t part = 0; part < parts; ++part) {
+        const std::string name =
+            parts == 1 ? "model.gguf"
+                       : "model-0000" + std::to_string(part + 1) + "-of-0000" + std::to_string(parts) + ".gguf";
+        test::writeFile(*headerDirectory / name, test_gguf::file(headers->keys[part], headers->tensors[part]));
+      }
+    }
+    if (draft) test::writeFile(draftConfig.emplace(root / "draft.json"), *draft);
+    return std::string(model::inspectSourceConfiguration(targetFormat, visionFormat, root / "config.json",
+                                                         headerDirectory, draftConfig));
   };
   const SourceModel dense = mlxModel(fixtures, "qwen3.8-27b");
   const SourceModel moe = mlxModel(fixtures, "qwen3.6-35b-a3b");
@@ -655,23 +736,32 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
           "a target without its draft was refused");
   rejects([&] { static_cast<void>(check("mlx-affine", "none", moe.config, std::nullopt, dense.draft)); },
           "draft config hidden_size mismatch: checkpoint 5120, runtime 2048", "another family's draft was accepted");
-  // A GGUF's config with the metadata the installer copies from its header,
-  // which the planner checks in the GGUF at every start: what the config
-  // does not hold, such as the RoPE scaling, the epsilon, the FFN widths and
-  // the experts each token takes.
-  const std::string denseMetadata = text(fixtures / "qwen3.8-27b" / "gguf-metadata.json");
-  const std::string moeMetadata = text(fixtures / "qwen3.6-35b-a3b" / "gguf-metadata.json");
-  require(check("gguf", "none", kDenseGgufConfig, denseMetadata, dense.draft) == "Qwen3.8-27B" &&
-              check("gguf", "none", kMoeGgufConfig, moeMetadata, std::nullopt) == "Qwen3.6-35B-A3B",
-          "a GGUF's derived config and metadata were not found to be its family");
+  // A GGUF's config with the headers the installer copies, which the planner
+  // checks as in the GGUF at every start: what the config does not hold,
+  // such as the RoPE scaling, the epsilon, the FFN widths, the experts each
+  // token takes and every tensor.
+  const GgufHeaders denseHeaders = ggufHeaders(model::Qwen3_8Layout{});
+  const GgufHeaders moeHeaders = ggufHeaders(model::Qwen3_6MoeLayout{});
+  require(check("gguf", "none", kDenseGgufConfig, denseHeaders, dense.draft) == "Qwen3.8-27B" &&
+              check("gguf", "none", kMoeGgufConfig, moeHeaders, std::nullopt) == "Qwen3.6-35B-A3B",
+          "a GGUF's derived config and headers were not found to be its family");
+  // A split GGUF's headers, each part's under its name; a part alone is not
+  // the target.
+  require(check("gguf", "none", kMoeGgufConfig, moeHeaders.split(3), std::nullopt) == "Qwen3.6-35B-A3B",
+          "a split GGUF's headers were not found to be its family");
+  GgufHeaders firstPart = moeHeaders.split(2);
+  firstPart.keys.pop_back();
+  firstPart.tensors.pop_back();
+  rejects([&] { static_cast<void>(check("gguf", "none", kMoeGgufConfig, firstPart, std::nullopt)); },
+          "the GGUF's split.count does not match its 1 file", "a split GGUF's first part alone was accepted");
   // Qwen3.5-122B-A10B, of the same model type and GGUF architecture as the
   // Qwen3.6-35B-A3B, as its sizes tell; its draft, trained to fill a block
   // of 16, drafts the kernels' eight rows, and a block of fewer is refused.
   // Each family refuses the other's draft.
   const SourceModel largeMoe = mlxModel(fixtures, "qwen3.5-122b-a10b");
-  const std::string largeMoeMetadata = text(fixtures / "qwen3.5-122b-a10b" / "gguf-metadata.json");
   require(check("mlx-affine", "safetensors", largeMoe.config, std::nullopt, largeMoe.draft) == "Qwen3.5-122B-A10B" &&
-              check("gguf", "none", kLargeMoeGgufConfig, largeMoeMetadata, largeMoe.draft) == "Qwen3.5-122B-A10B",
+              check("gguf", "none", kLargeMoeGgufConfig, ggufHeaders(model::kQwen3_5_122BLayout), largeMoe.draft) ==
+                  "Qwen3.5-122B-A10B",
           "a Qwen3.5-122B-A10B's configuration was not found to be its family");
   rejects([&] { static_cast<void>(check("mlx-affine", "none", moe.config, std::nullopt, largeMoe.draft)); },
           "draft config hidden_size mismatch: checkpoint 3072, runtime 2048", "a larger family's draft was accepted");
@@ -683,21 +773,21 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
   }, "draft config dflash_config block_size is less than the 8 rows a cycle drafts",
           "a draft of a block shorter than the kernels' rows was accepted");
   rejects([&] { static_cast<void>(check("gguf", "none", kDenseGgufConfig, std::nullopt, std::nullopt)); },
-          "a GGUF target is checked with its metadata", "a GGUF was checked without its metadata");
+          "a GGUF target is checked with its headers", "a GGUF was checked without its headers");
   const auto replaced = [](std::string json, std::string_view from, std::string_view to) {
     const size_t at = json.find(from);
-    require(at != std::string::npos, "the config or metadata has no " + std::string(from));
+    require(at != std::string::npos, "the config has no " + std::string(from));
     return json.replace(at, from.size(), to);
   };
   // Qwen3.8-Flash-Next loads from a GGUF only; its metadata also states the
   // hyper-connections, the QSA indexer and the PLE n-gram embedding.
   const std::string flashConfig = text(fixtures / "qwen3.8-flash-next" / "config.json");
-  const std::string flashMetadata = text(fixtures / "qwen3.8-flash-next" / "gguf-metadata.json");
+  const GgufHeaders flashHeaders = ggufHeaders(model::Qwen4ExpLayout{});
   const std::string flashDraft = text(fixtures / "qwen3.8-flash-next" / "draft" / "config.json");
-  require(check("gguf", "none", flashConfig, flashMetadata, std::nullopt) == "Qwen3.8-Flash-Next" &&
-              check("gguf", "none", flashConfig, flashMetadata, flashDraft) == "Qwen3.8-Flash-Next",
-          "Qwen3.8-Flash-Next's GGUF config and metadata were not found to be its family");
-  rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, flashMetadata, dense.draft)); },
+  require(check("gguf", "none", flashConfig, flashHeaders, std::nullopt) == "Qwen3.8-Flash-Next" &&
+              check("gguf", "none", flashConfig, flashHeaders, flashDraft) == "Qwen3.8-Flash-Next",
+          "Qwen3.8-Flash-Next's GGUF config and headers were not found to be its family");
+  rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, flashHeaders, dense.draft)); },
           "draft config hidden_size mismatch: checkpoint 5120, runtime 2560", "another family's draft was accepted");
   // Its draft reads the mean of a layer's streams, which a config states or
   // leaves to the target.
@@ -706,65 +796,84 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
     const std::string_view from = R"("target_hidden_reduction": "stream_mean",)";
     return draft.replace(draft.find(from), from.size(), to);
   };
-  require(check("gguf", "none", flashConfig, flashMetadata, flashDraftWith("")) == "Qwen3.8-Flash-Next",
+  require(check("gguf", "none", flashConfig, flashHeaders, flashDraftWith("")) == "Qwen3.8-Flash-Next",
           "a Qwen3.8-Flash-Next draft without target_hidden_reduction was refused");
   const std::string otherReduction = flashDraftWith(R"("target_hidden_reduction": "none",)");
-  rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, flashMetadata, otherReduction)); },
+  rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, flashHeaders, otherReduction)); },
           "draft config dflash_config target_hidden_reduction mismatch: checkpoint none, runtime stream_mean",
           "a draft of another reduction was accepted");
   rejects([&] { static_cast<void>(check("mlx-affine", "none", flashConfig, std::nullopt, std::nullopt)); },
           "Qwen3.8-Flash-Next loads from a GGUF only", "Qwen3.8-Flash-Next was accepted from MLX");
-  for (const auto &[from, to, error] : std::initializer_list<std::array<std::string_view, 3>>{
-           {R"("qwen4exp.hyper_connection.count": 4)", R"("qwen4exp.hyper_connection.count": 2)",
+  // Its scalars and its arrays, each layer's QSA compress ratio and the PLE
+  // layer, are the planner's.
+  std::vector<int32_t> ratios(48, 0);
+  for (uint32_t layer = 3; layer < ratios.size(); layer += 4) ratios[layer] = 4;
+  std::vector<int32_t> shifted = ratios;
+  std::rotate(shifted.begin(), shifted.begin() + 1, shifted.end());
+  for (const auto &[key, error] : std::initializer_list<std::pair<test_gguf::Key, std::string_view>>{
+           {test_gguf::uint32Key("qwen4exp.hyper_connection.count", 2),
             "GGUF metadata does not match the target: hyper_connection.count 2 (expected 4)"},
-           {R"("qwen4exp.attention.indexer.top_k": 2048)", R"("qwen4exp.attention.indexer.top_k": 1024)",
-            "GGUF metadata does not match the target: attention.indexer.top_k 1024 (expected 2048)"}}) {
-    std::string metadata = flashMetadata;
-    const size_t at = metadata.find(from);
-    require(at != std::string::npos, "the GGUF metadata has no " + std::string(from));
-    metadata.replace(at, from.size(), to);
-    rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, metadata, std::nullopt)); }, error,
-            "Qwen3.8-Flash-Next accepted metadata the kernels do not compute");
-  }
+           {test_gguf::uint32Key("qwen4exp.attention.indexer.top_k", 1024),
+            "GGUF metadata does not match the target: attention.indexer.top_k 1024 (expected 2048)"},
+           {test_gguf::int32ArrayKey("qwen4exp.attention.compress_ratios", shifted),
+            "GGUF metadata does not match the target: attention.compress_ratios"},
+           {test_gguf::int32ArrayKey("qwen4exp.ple.layers", {2}),
+            "GGUF metadata does not match the target: ple.layers"}})
+    rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, flashHeaders.with(key), std::nullopt)); },
+            error, "Qwen3.8-Flash-Next accepted a header the kernels do not compute: " + key.name);
+  // One refusal names every mismatch, a scalar's and an array's.
+  const GgufHeaders mismatched = flashHeaders.with(test_gguf::uint32Key("qwen4exp.hyper_connection.count", 2))
+                                     .with(test_gguf::int32ArrayKey("qwen4exp.ple.layers", {2}));
+  rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, mismatched, std::nullopt)); },
+          "GGUF metadata does not match the target: hyper_connection.count 2 (expected 4), ple.layers",
+          "a header's scalar and array mismatches were not named in one refusal");
   // A pruned release, such as its Coder GGUF of 256 of the 512 routed
   // experts: the config derived from the header states the header's count,
-  // which the header holds it to, and every other value stays the family's.
+  // which the header and its expert tensors hold it to, and every other value
+  // stays the family's.
+  model::Qwen4ExpLayout coder;
+  coder.experts = 256;
   const std::string coderConfig = replaced(flashConfig, R"("num_experts": 512)", R"("num_experts": 256)");
-  const std::string coderMetadata =
-      replaced(flashMetadata, R"("qwen4exp.expert_count": 512)", R"("qwen4exp.expert_count": 256)");
-  require(check("gguf", "none", coderConfig, coderMetadata, std::nullopt) == "Qwen3.8-Flash-Next" &&
-              check("gguf", "none", coderConfig, coderMetadata, flashDraft) == "Qwen3.8-Flash-Next",
-          "a pruned Qwen3.8-Flash-Next GGUF's config and metadata were not found to be its family");
-  rejects([&] { static_cast<void>(check("gguf", "none", coderConfig, flashMetadata, std::nullopt)); },
+  require(check("gguf", "none", coderConfig, ggufHeaders(coder), std::nullopt) == "Qwen3.8-Flash-Next" &&
+              check("gguf", "none", coderConfig, ggufHeaders(coder), flashDraft) == "Qwen3.8-Flash-Next",
+          "a pruned Qwen3.8-Flash-Next GGUF's config and headers were not found to be its family");
+  rejects([&] { static_cast<void>(check("gguf", "none", coderConfig, flashHeaders, std::nullopt)); },
           "GGUF metadata does not match the target: expert_count 512 (expected 256)",
           "a config of other experts than its header's was accepted");
-  struct RefusedMetadata final {
+  struct RefusedHeader final {
     std::string_view config;
-    const std::string &metadata;
-    std::string_view from, to, error;
+    const GgufHeaders &headers;
+    test_gguf::Key key;
+    std::string_view error;
   };
-  for (const RefusedMetadata &refused : std::initializer_list<RefusedMetadata>{
-           {kMoeGgufConfig, moeMetadata, R"("qwen35moe.expert_used_count": 8)", R"("qwen35moe.expert_used_count": 16)",
+  for (const RefusedHeader &refused : std::initializer_list<RefusedHeader>{
+           {kMoeGgufConfig, moeHeaders, test_gguf::uint32Key("qwen35moe.expert_used_count", 16),
             "GGUF metadata does not match the target: expert_used_count 16 (expected 8)"},
-           {kDenseGgufConfig, denseMetadata, R"("string": {)", R"("string": {"qwen35.rope.scaling.type": "yarn",)",
+           {kDenseGgufConfig, denseHeaders, test_gguf::stringKey("qwen35.rope.scaling.type", "yarn"),
             "GGUF metadata does not match the target: rope.scaling.type yarn (expected none)"},
-           {kDenseGgufConfig, denseMetadata, "9.999999974752427e-07", "1e-05",
+           {kDenseGgufConfig, denseHeaders, test_gguf::float32Key("qwen35.attention.layer_norm_rms_epsilon", 1e-5F),
             "GGUF metadata does not match the target: attention.layer_norm_rms_epsilon 1e-05 (expected 1e-06)"},
-           {kDenseGgufConfig, denseMetadata, R"("qwen35.feed_forward_length": 17408)",
-            R"("qwen35.feed_forward_length": 18944)",
-            "GGUF metadata does not match the target: feed_forward_length 18944 (expected 17408)"},
-           // Each value of its kind, an unsigned one a whole number to 2^64 - 1.
-           {kDenseGgufConfig, denseMetadata, R"("qwen35.block_count": 65)", R"("qwen35.block_count": true)",
-            "GGUF metadata qwen35.block_count must be a whole number from 0 to 2^64 - 1"},
-           {kDenseGgufConfig, denseMetadata, R"("qwen35.block_count": 65)", R"("qwen35.block_count": -1)",
-            "GGUF metadata qwen35.block_count must be a whole number from 0 to 2^64 - 1"},
-           {kDenseGgufConfig, denseMetadata, R"("qwen35.block_count": 65)",
-            R"("qwen35.block_count": 18446744073709551615)", "block_count 18446744073709551615 (expected 65)"},
-       })
+           {kDenseGgufConfig, denseHeaders, test_gguf::uint32Key("qwen35.feed_forward_length", 18944),
+            "GGUF metadata does not match the target: feed_forward_length 18944 (expected 17408)"}})
     rejects([&] {
-      static_cast<void>(
-          check("gguf", "none", refused.config, replaced(refused.metadata, refused.from, refused.to), std::nullopt));
-    }, refused.error, "GGUF metadata was accepted with " + std::string(refused.to));
+      static_cast<void>(check("gguf", "none", refused.config, refused.headers.with(refused.key), std::nullopt));
+    }, refused.error, "a GGUF header was accepted with " + refused.key.name);
+  // Every tensor the planner reads must be in a header and of a type it
+  // loads; one refusal names each tensor and fault once, with the layers
+  // that have it, and a tensor outside the layers by its name.
+  const GgufHeaders missing =
+      moeHeaders.changed([](const test_gguf::Tensor &tensor) { return tensor.name != "blk.3.attn_q.weight"; });
+  const GgufHeaders unloadable = moeHeaders.changed([](test_gguf::Tensor &tensor) {
+    if (tensor.name.ends_with(".ffn_gate_exps.weight")) tensor.type = gguf_fixtures::ggmlType("Q8_1");
+    if (tensor.name == "token_embd.weight") tensor.type = gguf_fixtures::ggmlType("F32");
+    return true;
+  });
+  rejects([&] { static_cast<void>(check("gguf", "none", kMoeGgufConfig, missing, std::nullopt)); },
+          "GGUF tensors this build cannot load: attn_q.weight (missing) in 1 layer",
+          "a GGUF missing a tensor was accepted");
+  rejects([&] { static_cast<void>(check("gguf", "none", kMoeGgufConfig, unloadable, std::nullopt)); },
+          "GGUF tensors this build cannot load: ffn_gate_exps.weight (Q8_1) in 40 layers, token_embd.weight (F32)",
+          "a GGUF of experts and a token table of types the planner does not load was accepted");
   struct Refused final {
     const SourceModel &model;
     std::string SourceModel::*file;

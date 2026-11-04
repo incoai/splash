@@ -1,14 +1,17 @@
 #include "model/GgufImage.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
-#include "metal/abi/Gguf.h"
+#include "metal/abi/QuantFormat.h"
 #include "model/GgufImageLayout.hpp"
 #include "model/StateLayout.hpp"
 #include "model/WeightLayout.hpp"
 
+#include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <limits>
 #include <optional>
+#include <set>
 #include <sstream>
 
 namespace splash::model::gguf {
@@ -37,14 +40,14 @@ static_assert([] {
 // NVFP4's native rows from (TensorRows::ggufNvfp4RowBytes).
 uint32_t imageFormat(uint32_t type) { return type == ggml::kNVFP4 ? GGUF_FMT_NVFP4 : gguf_format_of(type); }
 
+// A type stored as a format's native rows, BF16 and F16 among them: the rows
+// projections multiply and the embedding kernels gather.
 bool quantizedType(uint32_t type) { return imageFormat(type) != GGUF_FMT_COUNT; }
 bool floatType(uint32_t type) { return type == ggml::kF32; }
 // The 16-bit float types: a norm of one widens to F32 (floatNorm), a
 // hyper-connection projection of one is prepared as Q8_0 (quantizedOrQ8_0),
 // and an alpha/beta pair of them is a float tensor (alphaBeta).
 bool float16Type(uint32_t type) { return type == ggml::kBF16 || type == ggml::kF16; }
-// The token rows the embedding kernels gather: native rows of a format.
-bool embeddingType(uint32_t type) { return gguf_embedding_format(imageFormat(type)); }
 // alpha/beta run as one segment: of their format when both are of one
 // quantized type but BF16 and F16 (one repacked tensor), else one float
 // tensor, of a BF16 pair's rows as stored or of F32.
@@ -79,13 +82,69 @@ Repack tiledRepack(uint32_t format, uint64_t rows, uint64_t columns, const std::
   return result;
 }
 
+// The tensors a plan cannot load, each named past its layer's blk.N. with
+// its fault (its type, missing, or unused) and counted in the layers it has
+// it in, in the order first found: one refusal names every fault once, as
+// "attn_q.weight (Q8_1) in 40 layers", however many layers. It also records
+// every tensor the plan reads, so that a tensor no block reads is refused
+// rather than silently dropped (a router or attention bias would change what
+// the model computes).
+class Problems final {
+public:
+  // Records `tensor` as one a block reads, whether or not its type loads, so
+  // a tensor carries one fault.
+  void read(const GgufTensor &tensor) { read_.insert(tensor.name); }
+  // Adds every tensor of `file` the plan did not read, but those of the
+  // `extraBlocks` multi-token prediction blocks after the target's `layers`
+  // (nextn_predict_layers), which the target does not run.
+  void addUnread(const GgufFile &file, uint32_t layers, uint64_t extraBlocks) {
+    for (const GgufTensor &tensor : file.tensors())
+      if (!read_.contains(tensor.name) && !inBlocks(tensor.name, layers, layers + extraBlocks))
+        add(tensor.name, "unused");
+  }
+  void add(std::string_view tensor, std::string fault) {
+    const size_t dot = tensor.starts_with("blk.") ? tensor.find('.', 4) : std::string_view::npos;
+    const bool layered = dot != std::string_view::npos;
+    if (layered) tensor.remove_prefix(dot + 1);
+    const auto found = std::find_if(faults_.begin(), faults_.end(),
+                                    [&](const Fault &f) { return f.tensor == tensor && f.fault == fault; });
+    Fault &entry = found != faults_.end() ? *found : faults_.emplace_back(Fault{std::string(tensor), std::move(fault)});
+    entry.layers += layered;
+  }
+  [[nodiscard]] bool empty() const noexcept { return faults_.empty(); }
+  [[nodiscard]] std::string text() const {
+    std::string result;
+    for (const Fault &f : faults_) {
+      result += (result.empty() ? "" : ", ") + f.tensor + " (" + f.fault + ")";
+      if (f.layers) result += " in " + std::to_string(f.layers) + (f.layers == 1 ? " layer" : " layers");
+    }
+    return result;
+  }
+
+private:
+  struct Fault {
+    std::string tensor, fault;
+    uint32_t layers = 0; // 0 for a tensor of no layer
+  };
+  // Whether `name` is a tensor of a block blk.N. with first <= N < end.
+  static bool inBlocks(std::string_view name, uint64_t first, uint64_t end) {
+    if (!name.starts_with("blk.")) return false;
+    uint64_t block = 0;
+    const char *last = name.data() + name.size();
+    const auto [at, error] = std::from_chars(name.data() + 4, last, block);
+    return error == std::errc{} && at != last && *at == '.' && block >= first && block < end;
+  }
+  std::vector<Fault> faults_;
+  std::set<std::string, std::less<>> read_;
+};
+
 // Plans one image. A missing tensor or one of a type this build cannot load
 // is added to `problems` and left out of the image, so the planner can name
 // every such tensor at once; a tensor of the wrong shape throws.
 class Builder {
 public:
-  Builder(const GgufFile &file, const QwenTargetDimensions &geometry, std::vector<std::string> &problems,
-          std::string name, uint32_t layer, uint32_t type, PlanOptions options = {})
+  Builder(const GgufFile &file, const QwenTargetDimensions &geometry, Problems &problems, std::string name,
+          uint32_t layer, uint32_t type, PlanOptions options = {})
       : file_(file), geometry_(geometry), problems_(problems),
         image_(std::move(name), layer, type, options.streamExperts) {}
 
@@ -127,6 +186,7 @@ public:
   void quantizedOrQ8_0(const std::string &name, uint64_t rows, uint64_t columns) {
     const GgufTensor *tensor = file_.find(name);
     if (!tensor || !float16Type(tensor->type)) return quantized(name, rows, columns);
+    problems_.read(*tensor);
     if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
     Repack repack = image_.planes(GGUF_FMT_Q80, rows, columns, name);
     TensorRows source = tensorRows(*tensor, rows, tensor->bytes / rows);
@@ -248,9 +308,14 @@ public:
       image_.copy(tensorRows(*tensor, heads, tensor->bytes / heads, grouped(0, 1)), conversion);
   }
 
+  // An F32 vector the kernels read as stored (Flint's attention sinks).
+  void floatValues(const std::string &name, uint64_t elements) {
+    if (const GgufTensor *tensor = floatVector(name, elements)) image_.copy(tensorRows(*tensor, 1, tensor->bytes));
+  }
+
   // Native token rows, gathered by the embedding kernel.
   void embeddingRows(const std::string &name) {
-    const GgufTensor *tensor = find(name, embeddingType);
+    const GgufTensor *tensor = find(name, quantizedType);
     if (!tensor) return;
     if (tensor->rows() != geometry_.vocabularySize || tensor->columns() != geometry_.hiddenSize)
       throw GgufError("unexpected shape for " + name);
@@ -300,11 +365,11 @@ public:
                              : Conversion::None);
   }
 
-  // A table's native rows [rows, columns] in an embedding format, after their
+  // A table's native rows [rows, columns] in a GGUF format, after their
   // descriptor (a family's table, which no projection reads), as stored but
   // for GGUF's NVFP4 (tableRows).
   void nativeTable(const std::string &name, uint64_t columns) {
-    const GgufTensor *tensor = find(name, embeddingType);
+    const GgufTensor *tensor = find(name, quantizedType);
     if (!tensor) return;
     if (tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
     copiedRows(*tensor, nativeRowBytes(*tensor));
@@ -315,22 +380,17 @@ public:
     return {from, headRows, geometry_.gdnKeyHeads, geometry_.gdnValueHeads / geometry_.gdnKeyHeads};
   }
 
-  // A tensor the target's blocks would not apply, which changes what the
-  // model computes where a GGUF holds it: `what` names it in the error.
-  void absent(const std::string &name, std::string_view what) {
-    if (file_.find(name)) problems_.push_back(name + " (" + std::string(what) + ")");
-  }
-
   Image finish() { return image_.finish(); }
 
 private:
   void reject(const std::string &name, const GgufTensor *tensor) {
-    problems_.push_back(name + (tensor ? " (" + ggmlTypeName(tensor->type) + ")" : " (missing)"));
+    problems_.add(name, tensor ? ggmlTypeName(tensor->type) : "missing");
   }
 
   // The tensor `name` when it is present and of an accepted type.
   const GgufTensor *find(const std::string &name, bool (*accepted)(uint32_t type)) {
     const GgufTensor *tensor = file_.find(name);
+    if (tensor) problems_.read(*tensor);
     if (tensor && accepted(tensor->type)) return tensor;
     reject(name, tensor);
     return nullptr;
@@ -347,18 +407,15 @@ private:
   // builds from its block_nvfp4 rows and the g of its .scale tensor. llama.cpp
   // multiplies a projection's products by its .scale, of one value, or an
   // expert's by its value of an experts tensor's (_exps), one per expert;
-  // only NVFP4's native rows hold such a scale, so a .scale beside any other
-  // tensor is refused.
+  // only NVFP4's native rows hold such a scale, so only theirs is read and a
+  // .scale beside any other tensor is refused as unused.
   TensorRows tensorRows(const GgufTensor &tensor, uint64_t count, uint64_t rowBytes, RowOrder order = {}) const {
-    const std::string stem = tensor.name.ends_with(".weight") ? tensor.name.substr(0, tensor.name.size() - 7) : "";
-    const GgufTensor *scale = stem.empty() ? nullptr : file_.find(stem + ".scale");
     if (tensor.type != ggml::kNVFP4) {
-      if (scale)
-        throw GgufError(scale->name + " scales a " + ggmlTypeName(tensor.type) +
-                        " tensor; Splash reads a .scale tensor beside an NVFP4 weight only");
       if (!count || count * rowBytes != tensor.bytes) throw GgufError("unexpected size for " + tensor.name);
       return {tensor.name, tensor.type, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
     }
+    const std::string stem = tensor.name.ends_with(".weight") ? tensor.name.substr(0, tensor.name.size() - 7) : "";
+    const GgufTensor *scale = stem.empty() ? nullptr : file_.find(stem + ".scale");
     const QuantFormat &format = kQuantFormats[GGUF_FMT_NVFP4];
     const GgmlTypeTraits &blocks = *ggmlTypeTraits(ggml::kNVFP4);
     const uint64_t sourceRowBytes =
@@ -373,6 +430,7 @@ private:
       if (scale->type != ggml::kF32 || scale->elements() != values || count % values)
         throw GgufError(scale->name + " must hold " + (values == 1 ? "one F32 value" : "one F32 value per expert") +
                         " for " + tensor.name);
+      problems_.read(*scale);
       rows.scale = {&file_.source(scale->file), scale->offset, scale->bytes, count / values};
     }
     return rows;
@@ -398,7 +456,7 @@ private:
 
   const GgufFile &file_;
   const QwenTargetDimensions &geometry_;
-  std::vector<std::string> &problems_;
+  Problems &problems_;
   ImageBuilder image_;
 };
 
@@ -465,16 +523,16 @@ void hyperImage(Builder &b, const QwenTargetDimensions &g, const std::string &st
 
 // What a family's GGUFs hold beside the mixers and FFNs every family's layers
 // hold, which requireMetadata and planImages take once from a GGUF's
-// architecture (withFamily): the metadata keys they add, the arrays they
-// declare, each layer's sections around its mixer and FFN, the head's before
-// the logits, and the images of the tables they add after the embedding's.
+// architecture (withFamily): the metadata keys and arrays they add, each
+// layer's sections around its mixer and FFN, the head's before the logits,
+// and the images of the tables they add after the embedding's.
 //
 // The Qwen3.5 hybrid's GGUFs (qwen35, qwen35moe): a norm before each layer's
 // mixer and FFN and before the logits.
 struct HybridGguf final {
-  template <class Expect, class ExpectFloat>
-  static void metadata(const Expect &, const ExpectFloat &, const QwenTargetDimensions &) {}
-  static void arrays(const GgufFile &, const QwenTargetDimensions &) {}
+  static constexpr std::array<std::string_view, 2> architectures{"qwen35", "qwen35moe"};
+  template <class Expect, class ExpectFloat, class ExpectArray>
+  static void metadata(const Expect &, const ExpectFloat &, const ExpectArray &, const QwenTargetDimensions &) {}
   static void layer(Builder &b, const QwenTargetDimensions &g, uint32_t index) {
     const std::string p = prefix(index);
     b.floatNorm(p + "attn_norm.weight", g.hiddenSize);
@@ -483,7 +541,7 @@ struct HybridGguf final {
     ffnImage(b, g, p, index);
   }
   static void head(Builder &b, const QwenTargetDimensions &g) { b.floatNorm("output_norm.weight", g.hiddenSize); }
-  static void tables(const GgufFile &, const QwenTargetDimensions &, PlanOptions, std::vector<std::string> &,
+  static void tables(const GgufFile &, const QwenTargetDimensions &, PlanOptions, Problems &,
                      std::vector<Image> &) {}
 };
 
@@ -494,8 +552,10 @@ struct HybridGguf final {
 struct Qwen4ExpGguf final {
   static constexpr std::string_view architecture = "qwen4exp";
 
-  template <class Expect, class ExpectFloat>
-  static void metadata(const Expect &expect, const ExpectFloat &, const QwenTargetDimensions &g) {
+  // Its arrays: each layer's QSA compress ratio and the PLE layer.
+  template <class Expect, class ExpectFloat, class ExpectArray>
+  static void metadata(const Expect &expect, const ExpectFloat &, const ExpectArray &expectArray,
+                       const QwenTargetDimensions &g) {
     expect("hyper_connection.count", g.hyperConnections);
     expect("hyper_connection.low_rank", g.hyperRank);
     expect("attention.indexer.head_count", g.indexerHeads);
@@ -505,23 +565,14 @@ struct Qwen4ExpGguf final {
     expect("ple.heads_per_ngram", g.pleHeadsPerNgram);
     expect("ple.conv_kernel", g.pleConvolutionTaps);
     expect("embedding_length_per_layer_input", g.pleHeadDimension);
-  }
-
-  // The arrays the installer's copy of the scalar metadata leaves out
-  // (requireMetadata checks the scalars): each layer's QSA compress ratio and
-  // the PLE layer. One error names every mismatch.
-  static void arrays(const GgufFile &file, const QwenTargetDimensions &g) {
-    const std::string arch(architecture);
-    std::string mismatched;
-    const auto ratios = file.numericArray(arch + ".attention.compress_ratios");
-    bool ratiosMatch = ratios && ratios->size() >= g.layers;
-    for (uint32_t layer = 0; ratiosMatch && layer < g.layers; ++layer)
-      ratiosMatch = (*ratios)[layer] == (g.isFullAttentionLayer(layer) ? g.indexerBlockTokens : 0);
-    if (!ratiosMatch) mismatched += "attention.compress_ratios";
-    const auto layers = file.numericArray(arch + ".ple.layers");
-    if (!layers || layers->size() != 1 || (*layers)[0] != g.pleLayer)
-      mismatched += (mismatched.empty() ? "" : ", ") + std::string("ple.layers");
-    if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
+    expectArray("attention.compress_ratios", [&](std::span<const double> ratios) {
+      bool matches = ratios.size() >= g.layers;
+      for (uint32_t layer = 0; matches && layer < g.layers; ++layer)
+        matches = ratios[layer] == (g.isFullAttentionLayer(layer) ? g.indexerBlockTokens : 0);
+      return matches;
+    });
+    expectArray("ple.layers",
+                [&](std::span<const double> layers) { return layers.size() == 1 && layers[0] == g.pleLayer; });
   }
 
   static void layer(Builder &b, const QwenTargetDimensions &g, uint32_t index) {
@@ -552,8 +603,8 @@ struct Qwen4ExpGguf final {
   // The PLE table's native rows in an image of their own (ple.bin), whose
   // rows stream from the file instead with streamTable once every tensor
   // the plan reads was found (planImages names those it misses first).
-  static void tables(const GgufFile &file, const QwenTargetDimensions &g, PlanOptions options,
-                     std::vector<std::string> &problems, std::vector<Image> &images) {
+  static void tables(const GgufFile &file, const QwenTargetDimensions &g, PlanOptions options, Problems &problems,
+                     std::vector<Image> &images) {
     const std::string table = "per_layer_token_embd.weight";
     Builder b(file, g, problems, "ple.bin", g.pleLayer, kTableImageType);
     b.nativeTable(table, g.pleHeadDimension);
@@ -579,9 +630,11 @@ struct FlintGguf final {
   static constexpr uint64_t kSoftmaxGating = 1, kSigmoidGating = 2;
 
   // Its routing weights are the selected experts' normalized scores, which
-  // nothing scales (expert_weights_scale 1).
-  template <class Expect, class ExpectFloat>
-  static void metadata(const Expect &expect, const ExpectFloat &expectFloat, const QwenTargetDimensions &g) {
+  // nothing scales (expert_weights_scale 1). Its arrays: each layer's
+  // sliding window and RoPE.
+  template <class Expect, class ExpectFloat, class ExpectArray>
+  static void metadata(const Expect &expect, const ExpectFloat &expectFloat, const ExpectArray &expectArray,
+                       const QwenTargetDimensions &g) {
     expect("attention.sliding_window", g.slidingWindow);
     expect("leading_dense_block_count", g.leadingDenseLayers);
     expect("feed_forward_length", g.intermediateSize);
@@ -589,57 +642,48 @@ struct FlintGguf final {
     expect("expert_gating_func", g.moeRouter == ops::MoeRouter::SigmoidNormalized ? kSigmoidGating : kSoftmaxGating);
     expect("expert_weights_norm", 1);
     expectFloat("expert_weights_scale", 1.0);
-  }
-
-  // The layer patterns the installer's copy of the scalar metadata leaves
-  // out: each layer's sliding window and RoPE. One error names every
-  // mismatch.
-  static void arrays(const GgufFile &file, const QwenTargetDimensions &g) {
-    const std::string arch(architecture);
-    std::string mismatched;
-    const auto pattern = [&](const char *key, uint64_t mask) {
-      const auto values = file.numericArray(arch + "." + key);
-      bool matches = values && values->size() == g.layers;
-      for (uint32_t layer = 0; matches && layer < g.layers; ++layer)
-        matches = (*values)[layer] == double(layer < 64 && (mask >> layer & 1));
-      if (!matches) mismatched += (mismatched.empty() ? "" : ", ") + std::string(key);
-    };
     // Every layer attends: a layer's bit is its attention layer's.
-    pattern("attention.sliding_window_pattern", g.slidingLayers);
-    pattern("attention.rope_pattern", ~g.unrotatedLayers);
-    if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
+    const auto pattern = [&g](uint64_t mask) {
+      return [&g, mask](std::span<const double> values) {
+        bool matches = values.size() == g.layers;
+        for (uint32_t layer = 0; matches && layer < g.layers; ++layer)
+          matches = values[layer] == double(layer < 64 && (mask >> layer & 1));
+        return matches;
+      };
+    };
+    expectArray("attention.sliding_window_pattern", pattern(g.slidingLayers));
+    expectArray("attention.rope_pattern", pattern(~g.unrotatedLayers));
   }
 
   static void layer(Builder &b, const QwenTargetDimensions &g, uint32_t index) {
     const std::string p = prefix(index);
     b.floatNorm(p + "attn_norm.weight", g.hiddenSize);
     mixerImage(b, g, p, true);
-    b.floatNorm(p + "attn_sinks.weight", g.attentionQueryHeads);
+    b.floatValues(p + "attn_sinks.weight", g.attentionQueryHeads);
     b.floatNorm(p + "ffn_norm.weight", g.hiddenSize);
     ffnImage(b, g, p, index);
-    // llama.cpp writes a router's expert bias (Flint's optional expert_bias)
-    // as ffn_exp_probs_b, which the router's selection would add.
-    b.absent(p + "ffn_exp_probs_b.bias", "a router bias");
   }
   static void head(Builder &b, const QwenTargetDimensions &g) { b.floatNorm("output_norm.weight", g.hiddenSize); }
-  static void tables(const GgufFile &, const QwenTargetDimensions &, PlanOptions, std::vector<std::string> &,
+  static void tables(const GgufFile &, const QwenTargetDimensions &, PlanOptions, Problems &,
                      std::vector<Image> &) {}
 };
 
 // Calls `use` with what the GGUFs of `architecture` hold: Qwen3.8-Flash-Next's
-// (Qwen4ExpGguf), Flint's (FlintGguf), or else the Qwen3.5 hybrid's
-// (HybridGguf).
+// (Qwen4ExpGguf), Flint's (FlintGguf) or the Qwen3.5 hybrid's (HybridGguf).
+// Another architecture is refused, so a layout without a family here fails
+// by name rather than planning as the hybrid.
 template <class Use> decltype(auto) withFamily(std::string_view architecture, Use &&use) {
   if (architecture == Qwen4ExpGguf::architecture) return use(Qwen4ExpGguf{});
   if (architecture == FlintGguf::architecture) return use(FlintGguf{});
+  if (std::ranges::find(HybridGguf::architectures, architecture) == HybridGguf::architectures.end())
+    throw GgufError("no GGUF family plans architecture " + std::string(architecture));
   return use(HybridGguf{});
 }
 
 // The images of a target from a GGUF of Family (planImages).
 template <class Family>
 std::vector<Image> familyImages(const GgufFile &file, const QwenTargetDimensions &g, PlanOptions options) {
-  Family::arrays(file, g);
-  std::vector<std::string> problems;
+  Problems problems;
   std::vector<Image> images;
   for (uint32_t index = 0; index < g.layers; ++index) {
     Builder layer(file, g, problems, "layer-" + std::to_string(index) + ".bin", index,
@@ -655,11 +699,10 @@ std::vector<Image> familyImages(const GgufFile &file, const QwenTargetDimensions
   embedding.embeddingRows("token_embd.weight");
   images.push_back(embedding.finish());
   Family::tables(file, g, options, problems, images);
-  if (!problems.empty()) {
-    std::string names;
-    for (const std::string &problem : problems) names += (names.empty() ? "" : ", ") + problem;
-    throw GgufError("GGUF tensors this build cannot load: " + names);
-  }
+  const GgufMetadata &metadata = file.metadata();
+  problems.addUnread(file, g.layers,
+                     metadata.unsignedValue(metadata.architecture() + ".nextn_predict_layers").value_or(0));
+  if (!problems.empty()) throw GgufError("GGUF tensors this build cannot load: " + problems.text());
   return images;
 }
 
@@ -694,10 +737,6 @@ std::vector<StreamedExperts> streamedExperts(std::span<const Image> layers) {
     result.push_back(*layer.experts);
   }
   return result;
-}
-
-uint64_t streamedTableBytes(const Image &image) {
-  return image.streamedRows ? image.streamedRows->rows * image.streamedRows->rowBytes : 0;
 }
 
 uint64_t loadedBytes(const Image &image) { return image.streamedRows ? 0 : image.bytes; }
@@ -802,8 +841,15 @@ Image ImageBuilder::finish() {
   return std::move(image_);
 }
 
-void requireMetadata(const GgufMetadata &metadata, std::string_view architecture,
-                     const QwenTargetDimensions &geometry) {
+namespace {
+
+// The target geometry a GGUF of `architecture` declares in its metadata, the
+// architecture included, with the rotary embedding and norms the kernels
+// compute: the RoPE base and rotated dimensions, the RMS epsilon and no RoPE
+// scaling; and the keys and arrays of what the family adds. Throws GgufError
+// naming every mismatch.
+void requireMetadata(const GgufFile &file, std::string_view architecture, const QwenTargetDimensions &geometry) {
+  const GgufMetadata &metadata = file.metadata();
   const std::string arch(architecture);
   if (metadata.architecture() != arch)
     throw GgufError("GGUF architecture is " + metadata.architecture() + ", but the model's target is " + arch);
@@ -824,6 +870,11 @@ void requireMetadata(const GgufMetadata &metadata, std::string_view architecture
     else text << "missing";
     text << " (expected " << value << ')';
     mismatched += text.str();
+  };
+  // An array, named alone, that `matches` takes.
+  const auto expectArray = [&](const char *key, const auto &matches) {
+    const std::optional<std::span<const double>> values = file.numericArray(arch + "." + key);
+    if (!values || !matches(*values)) mismatched += (mismatched.empty() ? "" : ", ") + std::string(key);
   };
   expect("block_count", geometry.layers + metadata.unsignedValue(arch + ".nextn_predict_layers").value_or(0));
   expect("embedding_length", geometry.hiddenSize);
@@ -848,7 +899,7 @@ void requireMetadata(const GgufMetadata &metadata, std::string_view architecture
     expect("ssm.state_size", geometry.gdnHeadDimension);
     expect("ssm.inner_size", uint64_t{geometry.gdnValueHeads} * geometry.gdnHeadDimension);
   }
-  withFamily(architecture, [&](auto family) { family.metadata(expect, expectFloat, geometry); });
+  withFamily(architecture, [&](auto family) { family.metadata(expect, expectFloat, expectArray, geometry); });
   if (geometry.ffnKind == QwenFfnKind::SparseMoe) {
     expect("expert_count", geometry.experts);
     expect("expert_used_count", geometry.expertsPerToken);
@@ -861,9 +912,11 @@ void requireMetadata(const GgufMetadata &metadata, std::string_view architecture
   if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
 }
 
+} // namespace
+
 std::vector<Image> planImages(const GgufFile &file, std::string_view architecture,
                               const QwenTargetDimensions &geometry, PlanOptions options) {
-  requireMetadata(file.metadata(), architecture, geometry);
+  requireMetadata(file, architecture, geometry);
   std::vector<Image> images = withFamily(
       architecture, [&](auto family) { return familyImages<decltype(family)>(file, geometry, options); });
   if (file.rotation()) requireRotation(file, geometry, images);
@@ -875,7 +928,7 @@ StreamedRows tableRows(const GgufFile &file, const std::string &name, uint64_t c
   if (file.rotation()) throw GgufError("the tables of a rotated GGUF do not stream: " + name);
   // A table's image holds its rows as stored (Builder::nativeTable,
   // copiedRows), but for NVFP4's, which the writer rebuilds.
-  if (!embeddingType(tensor.type) || tensor.type == ggml::kNVFP4)
+  if (!quantizedType(tensor.type) || tensor.type == ggml::kNVFP4)
     throw GgufError("a table of type " + ggmlTypeName(tensor.type) + " does not stream: " + name);
   if (tensor.columns() != columns || !tensor.rows()) throw GgufError("unexpected shape for " + name);
   const uint32_t format = imageFormat(tensor.type);

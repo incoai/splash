@@ -17,7 +17,7 @@ from huggingface_hub.hf_api import RepoSibling
 from tokenizers import pre_tokenizers
 
 from dev.tests import fixture_files
-from install import families, gguf, hub, models
+from install import families, hub, models
 
 DENSE = families.named("Qwen3.8-27B")
 MOE = families.named("Qwen3.6-35B-A3B")
@@ -27,9 +27,11 @@ FLINT = families.named("Flint")
 GGUF_ONLY = (FLASH_NEXT, FLINT)
 MODEL = "mlx-community/Qwen3.8-27B-4bit"
 # An MLX config.json (of a GGUF_ONLY family, the one the installer derives
-# from its GGUF), a DFlash2 draft config and the scalar metadata of a GGUF
-# (gguf.scalar_metadata) built like each family's, in its lower-case name,
-# which the native configuration test reads too.
+# from its GGUF), a DFlash2 draft config and, of Qwen3.6-35B-A3B and the
+# GGUF_ONLY families, a GGUF header's architecture metadata built like the
+# family's (gguf-metadata.json) and a real GGUF's tensor table
+# (gguf-tensors.json), in the family's lower-case name. The native
+# configuration test reads the configs too.
 CONFIGS = Path(__file__).resolve().parent / "fixtures" / "model-configs"
 # The commit the main branch of every family's draft repository names.
 DRAFT_COMMIT = "d" * 40
@@ -45,7 +47,8 @@ PROCESSOR = {
 
 def family_config(family, name="config.json"):
     """The family's fixture configuration at name: its MLX config.json,
-    draft/config.json, its DFlash2 draft's, or gguf-metadata.json."""
+    draft/config.json, its DFlash2 draft's, gguf-metadata.json or
+    gguf-tensors.json."""
     return json.loads((CONFIGS / family.name.lower() / name).read_text())
 
 
@@ -80,20 +83,24 @@ def draft_dir(root, family, **changes):
 # The GGUF specification's token types (llama_token_type), stated
 # independently of the reader under test.
 NORMAL, UNKNOWN, CONTROL, USER_DEFINED, UNUSED, BYTE = 1, 2, 3, 4, 5, 6
-# GGML tensor types (ggml_type), stated independently of gguf.TENSOR_TYPES.
+# GGML tensor types (ggml_type).
 GGML = {
     "F32": 0,
     "F16": 1,
     "Q5_0": 6,
     "Q5_1": 7,
     "Q8_0": 8,
+    "Q8_1": 9,
     "Q2_K": 10,
     "Q4_K": 12,
     "Q5_K": 13,
     "Q6_K": 14,
     "IQ2_XXS": 16,
     "IQ3_XXS": 18,
+    "IQ1_S": 19,
+    "IQ4_NL": 20,
     "IQ3_S": 21,
+    "IQ2_S": 22,
     "IQ4_XS": 23,
     "IQ1_M": 29,
     "BF16": 30,
@@ -102,16 +109,6 @@ GGML = {
     "NVFP4": 40,
     "Q2_0": 42,
     "PQ2_0": 142,
-}
-# The arrays of a Qwen3.8-Flash-Next header, which its gguf-metadata.json
-# leaves out as scalar_metadata does: each layer's QSA compress ratio, a
-# 4-token block for each full-attention layer (every fourth) and 0 for each
-# GDN one, and the one layer its PLE n-gram embedding feeds.
-FLASH_NEXT_ARRAYS = {
-    "qwen4exp.attention.compress_ratios": [
-        4 if layer % 4 == 3 else 0 for layer in range(48)
-    ],
-    "qwen4exp.ple.layers": [1],
 }
 
 
@@ -122,11 +119,30 @@ def write_gguf(path, values, tensors=()):
     return fixture_files.write_gguf(path, values, table)
 
 
+def tensor_table(family=MOE):
+    """The tensors of a real GGUF of family, in its order: name, extents
+    (innermost first) and GGML type. Qwen3.6-35B-A3B's are
+    unsloth/Qwen3.6-35B-A3B-GGUF's Qwen3.6-35B-A3B-UD-Q4_K_M.gguf (revision
+    a483e9e6cbd595906af30beda3187c2663a1118c), Qwen3.8-Flash-Next's the three
+    parts of unsloth/Qwen3.8-Flash-Next-GGUF's UD-IQ3_XXS (revision
+    766911a6b7369840a91dbcd95f9f997acaab6cd6), whose headers alone were read."""
+    return [
+        (name, extents, GGML[kind])
+        for name, (kind, extents) in family_config(family, "gguf-tensors.json").items()
+    ]
+
+
+def write_target(path, values, tensors):
+    """A GGUF header of the values and the tensors' (name, extents, GGML
+    type) without data, as tensor_table lists them."""
+    table = [(name, extents, kind, b"") for name, extents, kind in tensors]
+    return fixture_files.write_gguf(path, values, table)
+
+
 def fixture(*, native=False, family=MOE):
     """A GGUF's metadata of family's (Qwen3.6-35B-A3B's by default): its
-    architecture's, as the native configuration test reads it too, with
-    FLASH_NEXT_ARRAYS for Qwen3.8-Flash-Next, and a tokenizer's, native=True
-    of the family's vocabulary size."""
+    architecture's and a tokenizer's, native=True of Qwen's vocabulary
+    size."""
     tokens = sorted(pre_tokenizers.ByteLevel.alphabet())
     tokens += ["ab", "<|endoftext|>", "<|im_end|>", "<think>", "<|im_start|>"]
     types = [NORMAL] * 257 + [CONTROL, CONTROL, USER_DEFINED, CONTROL]
@@ -134,33 +150,16 @@ def fixture(*, native=False, family=MOE):
         padding = 248320 - len(tokens)
         tokens += [f"[unused{i}]" for i in range(padding)]
         types += [UNUSED] * padding
-    typed = family_config(family, "gguf-metadata.json")
-    return (
-        typed["unsigned"]
-        | typed["float"]
-        | typed["string"]
-        | (FLASH_NEXT_ARRAYS if family == FLASH_NEXT else {})
-        | {
-            "tokenizer.ggml.model": "gpt2",
-            "tokenizer.ggml.pre": "qwen35",
-            "tokenizer.ggml.tokens": tokens,
-            "tokenizer.ggml.token_type": types,
-            "tokenizer.ggml.merges": ["a b"],
-            "tokenizer.ggml.eos_token_id": 258,
-            "tokenizer.ggml.bos_token_id": 257,
-            "tokenizer.ggml.padding_token_id": 257,
-            "tokenizer.chat_template": "{% for message in messages %}{{ message.content }}<|im_end|>{% endfor %}",
-        }
-    )
-
-
-def loadable_tensors(values, directory):
-    """A tensor table the native loader accepts for the header values: each
-    tensor it reads, quantized as Q4_K or F32."""
-    header = gguf.Metadata(write_gguf(directory / "header.gguf", values))
-    return {
-        name: GGML[next(t for t in ("Q4_K", "F32") if t in types)]
-        for name, types in gguf.loaded_tensors(header).items()
+    return family_config(family, "gguf-metadata.json") | {
+        "tokenizer.ggml.model": "gpt2",
+        "tokenizer.ggml.pre": "qwen35",
+        "tokenizer.ggml.tokens": tokens,
+        "tokenizer.ggml.token_type": types,
+        "tokenizer.ggml.merges": ["a b"],
+        "tokenizer.ggml.eos_token_id": 258,
+        "tokenizer.ggml.bos_token_id": 257,
+        "tokenizer.ggml.padding_token_id": 257,
+        "tokenizer.chat_template": "{% for message in messages %}{{ message.content }}<|im_end|>{% endfor %}",
     }
 
 
@@ -302,10 +301,7 @@ def fake_hub(test, cache, *, target=DENSE, commit="a" * 40):
     fake = FakeHub(test, cache)
     fake.publish(MODEL, commit, lambda p: mlx_target(p, target))
     for family in families.FAMILIES:
-        if family.draft_repo:
-            fake.publish(
-                family.draft_repo, DRAFT_COMMIT, lambda p: draft_dir(p, family)
-            )
+        fake.publish(family.draft_repo, DRAFT_COMMIT, lambda p: draft_dir(p, family))
     return fake
 
 

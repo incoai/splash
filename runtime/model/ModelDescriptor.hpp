@@ -96,15 +96,16 @@ inspectModelRoot(const std::filesystem::path &root);
 // inspectModelRoot holds its assembly to: config, the target's config.json
 // or the one the installer derives from its GGUF; targetFormat and
 // visionFormat, the source formats its record names (mlx-affine or gguf;
-// none, safetensors or gguf); ggufMetadata, a GGUF target's scalar metadata
-// as the installer read it from the header, which every start's planner
-// checks in the GGUF (gguf::requireMetadata); and draft, once chosen, the
-// DFlash2 draft's config.json. The installer runs it before any weight
-// download (the engine's model-check command).
+// none, safetensors or gguf); ggufHeaders, the directory of a GGUF target's
+// headers as the installer read them (its one file's, or each split part's
+// under the part's name), from which it plans the target as every start
+// plans the GGUF (gguf::planImages); and draft, once chosen, the DFlash2
+// draft's config.json. The installer runs it before any weight download
+// (the engine's model-check command).
 [[nodiscard]] std::string_view
 inspectSourceConfiguration(std::string_view targetFormat, std::string_view visionFormat,
                            const std::filesystem::path &config,
-                           const std::optional<std::filesystem::path> &ggufMetadata,
+                           const std::optional<std::filesystem::path> &ggufHeaders,
                            const std::optional<std::filesystem::path> &draft);
 
 } // namespace splash::model

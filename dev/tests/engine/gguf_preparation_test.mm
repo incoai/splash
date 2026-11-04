@@ -108,7 +108,7 @@ void checkGoldenImages(MetalBackend &backend, const std::filesystem::path &path,
   });
   check(uint64_t(goldens) == loaded.size(), "every golden " + name + " image is prepared");
   images.release();
-  while (!images.restore(splash::test::admitAll, splash::test::admitAll)) {
+  while (!images.restore(splash::test::admitAll)) {
   }
   check(bytesOf(images) == loaded, "restored " + name + " images are the bytes loaded");
 }
@@ -920,7 +920,7 @@ void checkGgufNvfp4(MetalBackend &backend, const std::filesystem::path &director
     // A .scale beside a weight of another type, which llama.cpp would apply.
     std::vector<Tensor> beside = target.tensors;
     beside.push_back({"blk.0.ffn_gate.scale", {1}, 0, std::vector<uint8_t>{0x00, 0x00, 0x80, 0x3F}});
-    check(refusal(path, beside, g).find("blk.0.ffn_gate.scale scales a ") != std::string::npos,
+    check(refusal(path, beside, g).find("ffn_gate.scale (unused) in 1 layer") != std::string::npos,
           "a .scale tensor beside a weight of another type than NVFP4 is refused");
   }
 }

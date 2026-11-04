@@ -1,11 +1,11 @@
 #pragma once
 
 // Plans the images (model/GgufImageLayout.hpp) of a target read straight
-// from a GGUF of its family's architecture (each layout's
-// ggufArchitecture: qwen35, qwen35moe or qwen4exp), from its metadata alone:
-// section offsets, the header and descriptor bytes, and the source rows each
-// tensor section is written from (model/GgufPreparation.hpp). A 3-D expert
-// tensor is one quantized tensor of experts * N rows.
+// from a GGUF of its family's architecture (each layout's ggufArchitecture:
+// qwen35, qwen35moe, qwen4exp or flint), from its metadata alone: section
+// offsets, the header and descriptor bytes, and the source rows each tensor
+// section is written from (model/GgufPreparation.hpp). A 3-D expert tensor
+// is one quantized tensor of experts * N rows.
 
 #include <array>
 #include <cstdint>
@@ -151,7 +151,7 @@ struct StreamedRows final {
   uint64_t offset = 0; // of row 0, from the start of that file
   uint64_t rows = 0;
   uint32_t rowBytes = 0;
-  uint32_t format = 0; // its gguf_embedding_format (GGUF_FMT_*)
+  uint32_t format = 0; // its GGUF_FMT_*
 };
 struct Image {
   std::string name; // layer-N.bin, head.bin, embedding.bin, a family's table's (ple.bin)
@@ -188,9 +188,6 @@ struct PlanOptions {
 // The routed experts each layer's image streams (Image::experts), in layer
 // order; throws unless every layer's do.
 [[nodiscard]] std::vector<StreamedExperts> streamedExperts(std::span<const Image> layers);
-// The bytes of the table rows an image streams (Image::streamedRows), 0 for
-// none.
-[[nodiscard]] uint64_t streamedTableBytes(const Image &image);
 // The bytes an image takes once loaded: none for a table whose rows stream.
 [[nodiscard]] uint64_t loadedBytes(const Image &image);
 
@@ -240,22 +237,17 @@ private:
   uint32_t expertProjections_ = 0;
 };
 
-// The target geometry a GGUF of `architecture` (its family's layout's
-// ggufArchitecture) declares in its metadata, the architecture included,
-// with the rotary embedding and norms the kernels compute: the RoPE base and
-// rotated dimensions, the RMS epsilon and no RoPE scaling; and the keys of
-// what the family adds. planImages checks the file's first, and model-check
-// the installer's copy before any weight download. Throws GgufError naming
-// every mismatch.
-void requireMetadata(const GgufMetadata &metadata, std::string_view architecture,
-                     const QwenTargetDimensions &geometry);
-
-// The images of a target from its GGUF of `architecture`: each layer's, then
-// the head's and the embedding's, then those of the tables its family adds
-// (Qwen3.8-Flash-Next's PLE n-gram table, ple.bin). Checks the metadata
-// (requireMetadata, and the arrays a family's file declares) and each
-// tensor's shape; throws GgufError naming every missing tensor and every
-// tensor of a type this build cannot load.
+// The images of a target from its GGUF of `architecture` (its family's
+// layout's ggufArchitecture): each layer's, then the head's and the
+// embedding's, then those of the tables its family adds (Qwen3.8-Flash-Next's
+// PLE n-gram table, ple.bin). Checks first that the metadata declares the
+// geometry, the architecture included, with the rotary embedding and norms
+// the kernels compute (the RoPE base and rotated dimensions, the RMS epsilon
+// and no RoPE scaling) and what the family adds, its arrays included, then
+// each tensor's shape; throws GgufError naming every metadata mismatch, or
+// every missing tensor and every tensor of a type this build cannot load. It
+// reads the header alone: every start plans from the GGUF, and the engine's
+// model check from the installer's copy of its headers before any download.
 [[nodiscard]] std::vector<Image> planImages(const GgufFile &file, std::string_view architecture,
                                             const QwenTargetDimensions &geometry, PlanOptions options = {});
 

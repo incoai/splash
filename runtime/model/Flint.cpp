@@ -19,8 +19,9 @@ FlintWeights loadFlintWeights(metal::MetalBackend &backend, FlintLayout layout, 
           WeightFile file = gguf.layer(index);
           FlintLayerWeights &layer = result.layers.emplace_back();
           layer.inputNorm = format.norm(file, layout.hiddenSize, "input-norm");
-          layer.mixer = readQwenAttention(file, format, layout);
-          layer.mixer.sinks = file.section(uint64_t{layout.attentionQueryHeads} * kFloat32Bytes, "attention-sinks");
+          QwenAttentionWeights attention = readQwenAttention(file, format, layout);
+          attention.sinks = file.section(uint64_t{layout.attentionQueryHeads} * kFloat32Bytes, "attention-sinks");
+          layer.mixer = std::move(attention);
           layer.postAttentionNorm = format.norm(file, layout.hiddenSize, "post-attention-norm");
           if (layout.isMoeLayer(index)) {
             layer.ffn = readMoeBlock(file, layout, experts, layout.moeBlock(index));
@@ -42,10 +43,9 @@ const ops::BlockMoeWeights *qwenMoeBlock(const FlintLayerWeights &layer) noexcep
   return std::get_if<ops::BlockMoeWeights>(&layer.ffn);
 }
 
-void includeFamilyProjections(QwenTargetGeometry &geometry, const FlintWeights &weights) {
-  for (const FlintLayerWeights &layer : weights.layers)
-    if (const auto *dense = std::get_if<FlintDenseFfnWeights>(&layer.ffn))
-      includeDenseFfn(geometry, dense->projections());
+std::optional<ops::SwiGluProjections> denseFfn(const FlintLayerWeights &layer) noexcept {
+  if (const auto *dense = std::get_if<FlintDenseFfnWeights>(&layer.ffn)) return dense->projections();
+  return std::nullopt;
 }
 
 } // namespace splash::model
