@@ -673,6 +673,12 @@ struct ModelTelemetry final {
   uint64_t draftContextRowsAvoided = 0;
   uint64_t draftStateRestoreSkipped = 0;
   uint64_t draftStateResets = 0;
+  uint64_t promptLookupSearches = 0;
+  uint64_t promptLookupHits = 0;
+  uint64_t promptLookupBypassedCycles = 0;
+  uint64_t promptLookupProposedTokens = 0;
+  uint64_t promptLookupAcceptedTokens = 0;
+  double promptLookupSearchWallSeconds = 0;
   uint64_t imageEncodes = 0;
   uint64_t imageEmbeddingReuses = 0;
   // Entries the embedding cache let go of, past its bytes or to a reclaim:

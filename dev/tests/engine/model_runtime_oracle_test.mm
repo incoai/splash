@@ -19,6 +19,7 @@
 #include "model/Qwen4Exp.hpp"
 #include "model/Qwen4Steps.hpp"
 #include "model/RuntimeInstrumentation.hpp"
+#include "model/PromptLookup.hpp"
 #include "model/QwenState.hpp"
 #include "model/SpilledKvReads.hpp"
 #include "model/SsdReaders.hpp"
@@ -608,6 +609,105 @@ ModelStepResult decodeOne(model::Runtime &executor, uint64_t requestId,
   require(result.size() == 1 && result[0].requestId == requestId,
           "decode result mismatch");
   return std::move(result[0]);
+}
+
+// Pinned Qwen3.8-27B thinking-off repeat fixture: its 16-token matches are
+// real emitted text, never a test-only proposal. Compare all 256 outputs,
+// then alternate lookup/DFlash, rebuild after preemption, and cancel an
+// unconsumed lookup command before a fresh request reuses the same lane.
+void requirePromptLookupContinuity(model::Runtime &executor,
+                                   const model::QwenStateStorage &states) {
+  const std::vector<uint32_t> prompt{
+      248045,846,198,7734,279,2614,11316,6681,25292,2942,11,799,2880,791,1500,13,
+      3054,524,1324,279,4965,11,884,449,16308,11,466,38207,6290,279,2468,13,271,
+      760,8455,22839,16384,279,14590,13759,28428,279,11012,14367,11,12076,1396,
+      1067,303,264,6105,35935,11,321,11173,279,1788,16097,1716,1518,61665,13,
+      248046,198,248045,74455,198,248068,271,248069,271};
+  std::vector<uint32_t> pages(32);
+  for (uint32_t page = 0; page < pages.size(); ++page) pages[page] = page;
+  uint64_t id = 1800;
+  const auto run = [&](uint32_t mode, bool sampled = false) {
+    const bool enabled = mode != 0 && mode != 5;
+    executor.experimentalPromptLookup(enabled);
+    EngineRequest request = makeRequest(++id, prompt, sampled ? 32 : 256);
+    if (sampled) { request.sampling.temperature = 0.7F; request.sampling.seed = 481; }
+    beginCold(executor, request, 0);
+    rejects([&] { executor.experimentalPromptLookup(false); }, "only while the runtime is idle",
+            "serving lookup control changed inside a live request");
+    requireOpen(prefillChunk(executor, id, 0, prompt, pages), "lookup fixture");
+    auto history = prompt;
+    std::vector<uint32_t> output;
+    const auto before = executor.telemetry();
+    uint32_t cycles = 0, lookupCycles = 0, dflashCycles = 0;
+    bool suspended = false, cancelled = false, dflashAfterLookup = false;
+    while (output.size() < request.maxNewTokens) {
+      const auto anchor = model::RuntimeInstrumentation::pendingToken(executor, id);
+      require(anchor.has_value(), "lookup fixture lost its pending anchor");
+      const bool willMatch = model::PromptLookup::find(history, *anchor).has_value();
+      if (mode == 2)
+        model::RuntimeInstrumentation::promptLookupForNextCycle(executor, cycles % 2 == 0);
+      if ((mode == 3 || mode == 5) && willMatch && !suspended) {
+        executor.suspend(id);
+        request.prompt = history;
+        require(executor.resume(request.modelView()).granted(), "lookup preemption resume was refused");
+        executor.setDraftContextPlan(id, planDraftContext(0, history.size(), {}));
+        requireOpen(prefillChunk(executor, id, 0, history, pages), "lookup replay");
+        require(model::RuntimeInstrumentation::pendingToken(executor, id) == anchor,
+                "preemption changed the lookup anchor");
+        suspended = true;
+      }
+      if (mode == 4 && willMatch) {
+        const auto commits = executor.telemetry().promptLookupBypassedCycles;
+        BatchPlan plan{.kind=WorkKind::Decode, .items={{id,0}}, .decodeStage=DecodeStage::Regular};
+        auto item = withRevision({id, history.size(), 0, pages});
+        auto ticket = executor.submit(plan, std::span<const ModelBatchItem>(&item, 1), {});
+        ticket.reset(); // drains the GPU, without invoking the commit callback
+        require(executor.telemetry().promptLookupBypassedCycles == commits,
+                "an unconsumed lookup command was counted as committed");
+        cancelled = true;
+        break;
+      }
+      const auto hits = executor.telemetry().promptLookupBypassedCycles;
+      const auto step = decodeOne(executor, id, history.size(), pages);
+      require(step.failure.empty() && !step.outputTokens.empty(), "lookup decode failed or made no progress");
+      if (executor.telemetry().promptLookupBypassedCycles != hits) ++lookupCycles;
+      else { ++dflashCycles; dflashAfterLookup |= lookupCycles != 0; }
+      output.insert(output.end(), step.outputTokens.begin(), step.outputTokens.end());
+      history.insert(history.end(), step.outputTokens.begin(), step.outputTokens.end());
+      ++cycles;
+      if (step.finished) break;
+    }
+    const auto after = executor.telemetry();
+    if (mode == 4) require(cancelled, "lookup cancellation fixture never found a match");
+    else require(output.size() == request.maxNewTokens, "lookup fixture ended before its full output budget");
+    if (enabled && !sampled && mode != 4)
+      require(lookupCycles && after.promptLookupAcceptedTokens > before.promptLookupAcceptedTokens,
+              "lookup continuity fixture did not accept a lookup proposal");
+    if (mode == 2) require(dflashCycles && dflashAfterLookup,
+                           "alternating lookup fixture never returned to DFlash after a lookup hit");
+    if (mode == 3 || mode == 5) require(suspended, "lookup fixture never exercised preemption");
+    if (!enabled || sampled)
+      require(after.promptLookupHits == before.promptLookupHits &&
+                  after.promptLookupBypassedCycles == before.promptLookupBypassedCycles,
+              "disabled/sampled request used lookup proposals");
+    executor.end(id);
+    require(!states.metadata(0).assigned(), "lookup request left its state lane live");
+    executor.experimentalPromptLookup(false);
+    std::cout << "lookup_oracle mode=" << mode << " sampled=" << sampled << " cycles=" << cycles
+              << " lookup=" << lookupCycles << " dflash=" << dflashCycles << '\n';
+    return output;
+  };
+  const auto baseline = run(0);
+  const auto preemptedBaseline = run(5);
+  require(preemptedBaseline == baseline, "baseline replay changed tokens before lookup comparison");
+  require(run(1) == baseline, "lookup changed the complete greedy token sequence");
+  require(run(2) == baseline, "alternating lookup/DFlash changed the complete token sequence");
+  require(run(3) == preemptedBaseline, "lookup preemption changed the complete token sequence");
+  static_cast<void>(run(4));
+  require(run(1) == baseline, "lookup cancellation damaged the next request's complete sequence");
+  const auto sampled = run(0, true);
+  require(run(1, true) == sampled, "lookup flag changed sampled fallback outputs");
+  std::cout << "prompt_lookup_continuity=PASS full256 alternating preemption abandoned_ticket sampled_fallback\n";
 }
 
 // A stop token or a one-token budget is emitted by prefill itself; otherwise
@@ -3935,6 +4035,7 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
 int main(int argc, char **argv) {
   try {
     bool imagesOnly = false, warmupEosOnly = false, prefillGroupsOnly = false, spillOnly = false;
+    bool promptLookupOnly = false;
     SpillOptions spill;
     kv::Format format = kv::Format::Int8;
     ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
@@ -3962,13 +4063,14 @@ int main(int argc, char **argv) {
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
            "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-memory SIZE] "
            "[--expert-memory SIZE] [--max-context TOKENS] [--spill-tokens N] [--spill-window PAGES] "
-           "[--spill-buffers 1|2] [--images-only | --warmup-eos-only | --prefill-groups-only | --spill-only]");
+           "[--spill-buffers 1|2] [--images-only | --warmup-eos-only | --prefill-groups-only | --spill-only | --prompt-lookup-only]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
       else if (option == "--warmup-eos-only") warmupEosOnly = true;
       else if (option == "--prefill-groups-only") prefillGroupsOnly = true;
       else if (option == "--spill-only") spillOnly = true;
+      else if (option == "--prompt-lookup-only") promptLookupOnly = true;
       else if ((option == "--spill-tokens" || option == "--spill-window" || option == "--spill-buffers") &&
                i + 1 < argc) {
         const char *value = argv[++i];
@@ -4090,7 +4192,7 @@ int main(int argc, char **argv) {
     // A block-sparse target's spill check runs before the split is set up, on
     // a pool and a runtime of its own that the context the oracle asks the
     // split to leave does not count.
-    if (model.descriptor.capabilities.sparseKv && (spillOnly || !(imagesOnly || warmupEosOnly || prefillGroupsOnly)))
+    if (model.descriptor.capabilities.sparseKv && (spillOnly || !(imagesOnly || warmupEosOnly || prefillGroupsOnly || promptLookupOnly)))
       requireSpilledKvMatchesResident(backend, model, operators, governed, format, stateFormat, spill);
     if (spillOnly) {
       require(model.descriptor.capabilities.sparseKv.has_value(), "--spill-only needs a block-sparse target");
@@ -4237,6 +4339,17 @@ int main(int argc, char **argv) {
       return 0;
     }
     model::Runtime &executor = *runtime;
+    if (promptLookupOnly) {
+      const bool lookupFixtureModel =
+          model.name() == "Qwen3.8-27B" ||
+          model.name() == "mlx-community/Qwen3.8-27B-4bit";
+      require(!aneFfn && !model.expertStore() && states.layout().target.layers &&
+                  !states.layout().target.auxiliaryBytes && lookupFixtureModel,
+              "lookup fixture requires resident Qwen3.8-27B without ANE");
+      requirePromptLookupContinuity(executor, states);
+      std::cout << "PASS model-runtime-oracle scope=prompt-lookup-only model=" << model.name() << '\n';
+      return 0;
+    }
     // Warmup runs on the KV runway and never allocates: without it, after
     // actual state activation, warmupPrefill fails and cleans up.
     pages.releaseExtent(0);

@@ -15,6 +15,8 @@ public:
   explicit Runtime(RuntimeContext context);
   ~Runtime() override;
   void checkHealth() override;
+  // Experimental greedy B1 proposal bypass; change only between requests.
+  void experimentalPromptLookup(bool enabled);
   [[nodiscard]] uint32_t statesToActivate() const noexcept override;
   [[nodiscard]] uint64_t idleBufferBytes(uint32_t evictedStates) const noexcept override;
   [[nodiscard]] uint32_t prefillGroupRows(bool spills) const noexcept override;

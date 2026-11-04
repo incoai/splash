@@ -16,6 +16,9 @@ namespace splash::model {
 // these; production binaries never link it.
 class RuntimeInstrumentation final {
 public:
+  // An idle command boundary inside a request, for the oracle that alternates
+  // lookup and DFlash cycles and checks their shared persistent state.
+  static void promptLookupForNextCycle(Runtime &runtime, bool enabled);
   // The PLE rows the last decode step gathered for batch lane `lane`'s
   // verify rows, each row's heads' in order (Qwen3.8-Flash-Next), until the
   // next decode step; none for a target without them.
