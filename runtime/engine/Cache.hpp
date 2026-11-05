@@ -748,8 +748,10 @@ public:
   [[nodiscard]] uint64_t releaseEmptyExtents(bool keepRunway);
   // A KV demotion, a KV restore or the one state write is in flight, so
   // memory or quota returns by itself and its completion wakes the engine;
-  // so is a copy ahead whose landing lets a leaf go (copyAheadReturns), or a
-  // page written through or copied ahead that spills once its copy lands.
+  // so is a copy ahead whose block a reclaim that takes all it may then
+  // frees through it (copyAheadReturns), or a page written through or copied
+  // ahead that spills once its copy lands. A walk's takes wait for those
+  // that return to it (transfersInFlight(walk)).
   [[nodiscard]] bool transfersInFlight() const noexcept;
   // The most pages of the form a page need's evictions can leave free: every
   // allocated page of the form no request holds, but with Ordinary not the
@@ -853,7 +855,8 @@ private:
   enum class LeafReclaim : uint8_t {
     Started,
     // The tier's room, the quota or the state write's staging buffer is held
-    // by transfers in flight.
+    // by transfers in flight, or memory the walk takes returns as one lands
+    // (transfersInFlight(walk)).
     Pending,
     // reclaimKvLeaf: the leaf stays for now and scans move on to the next
     // one, because a state on it is pinned, a disk subtree depends on it
@@ -861,8 +864,9 @@ private:
     // subtree below it cannot drop yet (active, in transfer, or a state
     // write in flight), or the leaf needs a demotion an Immediate caller
     // cannot wait for. demoteKv: the leaf cannot be written, and may
-    // go without a copy, because the tier takes no writes, has no such
-    // room, or making room took the states the leaf was kept for.
+    // go without a copy, because the tier takes no writes, has no room
+    // while nothing in flight returns anything to the walk, or making room
+    // took the states the leaf was kept for.
     Impossible,
   };
 
@@ -1073,6 +1077,12 @@ private:
   // resume point while it keeps it and the states the chains it keeps
   // restore from.
   [[nodiscard]] std::vector<uint64_t> keptStates(const Walk &walk) const;
+  // The reasons whose chains a walk's reclaims of a class keep, as the KV
+  // cache counts them (KvCache::kChainKeeps): below InUse those of the
+  // states in use (Used), the waiting requests' unless the walk takes them
+  // (Wanted), the resume point's while it keeps it (ResumePoint). The chain
+  // a start reuses it walks instead (Walk::reused).
+  [[nodiscard]] static KvCache::Keeps keptChains(const Walk &walk, ReclaimClass upTo) noexcept;
   // The first state the walk writes through the idle staging buffer, in its
   // order; 0 for none, or while a write holds the buffer.
   [[nodiscard]] uint64_t stagedState(const Walk &walk) const;
@@ -1160,25 +1170,36 @@ private:
   // `pages`; refused (Denied) when the pool has not that many.
   [[nodiscard]] TokenAdmission admitPages(uint32_t count, std::vector<uint32_t> &pages, kv::PageForm form,
                                           uint32_t held);
-  // Whether a transfer in flight can still cover a shortfall once it lands.
-  // A restore, a demotion and the state write each hold back what a reclaim
-  // would take then: the block a restore fills, the page a demotion frees
-  // and the leaf above it, the states that wait for the write; so does a
-  // copy persist() writes of a leaf (copyAheadReturns). A page a Spill
-  // request holds, written through or copied ahead, holds back no cached
-  // block: it counts only by the Full page it frees once it spills
-  // (pendingPages), where those pages and the free ones cover the shortfall.
-  // Without spilling this is transfersInFlight().
-  [[nodiscard]] bool returnsInFlight(const Shortfall &shortfall) const noexcept;
+  // Whether a transfer in flight can still cover the walk's shortfall once
+  // it lands. A restore, a demotion and the state write each hold back what
+  // a reclaim would take then: the block a restore fills, the page a
+  // demotion frees and the leaf above it, the states that wait for the
+  // write; so does a copy persist() writes that returns to the walk
+  // (copyAheadReturns). A page a Spill request holds, written through or
+  // copied ahead, holds back no cached block: it counts only by the Full
+  // page it frees once it spills (pendingPages), where those pages and the
+  // free ones cover the shortfall. Without spilling this is
+  // transfersInFlight(walk).
+  [[nodiscard]] bool returnsInFlight(const Walk &walk, const Shortfall &shortfall) const noexcept;
+  // transfersInFlight() as the walk's takes wait for it: of the copies
+  // ahead, those that return to the walk.
+  [[nodiscard]] bool transfersInFlight(const Walk &walk) const noexcept;
   // A copy persist() writes frees nothing as it lands: its page stays. Until
-  // then it holds its block out of every order, which holds memory back only
-  // where the block is the leaf a reclaim would free through that copy: no
-  // request holds it and no block below it is resident. A state in RAM on it
-  // goes first, the leaf after it, in a page scan too. A copy of a page a
-  // Resident request holds, or of a block above other resident ones, frees
-  // nothing when it lands; one a Spill request holds frees its page as it
-  // spills (spillingWrites).
-  [[nodiscard]] bool copyAheadReturns() const noexcept;
+  // then it holds its block out of every order, and every block above it.
+  // Once it lands the block is idle, and a reclaim of the class frees it
+  // through the copy after the resident blocks below it, and those above it
+  // after it, where the walk's reach counts an idle page (KvCache::pageReach):
+  // nothing at the block or below it keeps it for a reason no reclaim takes
+  // (Busy: a block a request or a state's lease uses, a page a request
+  // holds) or for a chain the walk keeps (keptChains), and no chain a start
+  // reuses holds it (Walk::reused). The copy then returns memory to the
+  // walk: its reach counts the block and those above it (Cache::reach), and
+  // its takes wait for the copy (transfersInFlight(walk)). A state in RAM on
+  // the block goes first, the leaf after it, in a page scan too. A copy of a
+  // page a Spill request holds frees its page as it spills (spillingWrites).
+  [[nodiscard]] bool copyAheadReturns(const Write &write, const Walk &walk, ReclaimClass upTo) const noexcept;
+  // Some copy ahead in flight returns to the walk, of its own class.
+  [[nodiscard]] bool copyAheadReturns(const Walk &walk) const noexcept;
   // One eviction: the walk's first unit that goes. Disposable checkpoints,
   // KV leaves no state restores through, then ordinary states and resident
   // KV leaves in one oldest-first order; states in use and the KV they
@@ -1221,12 +1242,12 @@ private:
   // Frees the RAM of one resident KV leaf: through its disk copy when it has
   // one, by demotion when a state on it or below it depends on it, by
   // erasure otherwise, with any disk copies below it. Pending when the tier
-  // cannot take it right now. A leaf whose demotion cannot start, and no
-  // transfer in flight will change that, is erased, together with the disk
-  // subtree that depends on it. Immediate passes over a leaf that needs a
-  // demotion.
-  [[nodiscard]] LeafReclaim reclaimKvLeaf(uint64_t block, ReclaimTiming timing);
-  [[nodiscard]] LeafReclaim demoteKv(uint64_t block);
+  // cannot take it right now while a transfer in flight returns something
+  // to the walk (demoteKv). A leaf whose demotion cannot start while nothing
+  // does is erased, together with the disk subtree that depends on it.
+  // Immediate passes over a leaf that needs a demotion.
+  [[nodiscard]] LeafReclaim reclaimKvLeaf(const Walk &walk, uint64_t block, ReclaimTiming timing);
+  [[nodiscard]] LeafReclaim demoteKv(const Walk &walk, uint64_t block);
   // Only a state restores a disk-only chain, through its own block and every
   // block above.
   [[nodiscard]] bool kvNeededByState(uint64_t block) const {

@@ -250,6 +250,7 @@ private:
                                  snapshot.resources.kvTier.usedBytes,
                                  engine.commandInFlight(),
                                  cache.transfersInFlight(),
+                                 cache.copyingAheadBytes(),
                                  storage.allocatedBytes(),
                                  model.heldStateBytes,
                                  tier ? tier->transfers.size() : 0,

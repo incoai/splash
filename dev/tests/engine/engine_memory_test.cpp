@@ -5909,6 +5909,67 @@ void testCopyAheadOfALeafHoldsARefusalBack() {
   }
 }
 
+// A lone lane whose growth needs the pages of a cached chain whose copies ahead are in flight above its leaves
+// takes the leaves and waits for the copies to land: it does not end as if at its capacity. On the M6 a 32K prompt
+// that fit alone failed 24,576 rows in, its claim short while a restore point's chain was copied ahead.
+void testLoneGrowthWaitsForCopiesAheadAboveTheLeaves() {
+  test::TestKvStorage storage(16, 4096, 4);
+  GovernedHost host;
+  host.through(storage);
+  KvPool pool(storage, 0);
+  test::TestKvTier tier;
+  tier.capacity = 64;
+  tier.transferLimit = 8;
+  // The copies ahead of the chain's three top blocks stay in flight; those below have not started.
+  tier.writeLimits[static_cast<size_t>(WriteClass::Persist)] = 3;
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
+  // A finished conversation's eight blocks, two extents, its state at the leaf, the blocks without copies.
+  const auto transfer = std::make_shared<OffloadControl>();
+  transfer->ready = true;
+  std::vector<uint32_t> cached(8 * KvCache::pageTokens + 1);
+  std::iota(cached.begin(), cached.end(), 9000);
+  uint64_t leaf = 0;
+  {
+    const test::ClaimScope fixture(host.governor, ClaimClass::Floor);
+    cache.beginRequest(900);
+    require(cache.ensureTokens(900, 8 * KvCache::pageTokens).granted(), "fixture KV failed");
+    leaf = test::publishBlocks(cache, 900, cached, 8 * KvCache::pageTokens);
+    cache.publishCompositeState(leaf, std::make_shared<OffloadState>(transfer), false);
+    cache.endRequest(900);
+  }
+  require(cache.persist(leaf) == PersistStatus::Started && cache.pollTransfers() && tier.inFlight() == 3,
+          "the copies ahead of the chain did not start");
+  Executor executor;
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine(host.connect({}), cache, executor, events);
+  guardReleases(storage, engine);
+  // The engine's limit leaves one more extent: the lane's eleven pages are its four, the five below the copies,
+  // which their demotions free, and two of the three the copies hold, which go as they land.
+  host.leaveRoom(4 * 4096);
+  auto value = request(1, std::vector<uint32_t>(11 * KvCache::pageTokens - 8, 1));
+  value.maxNewTokens = 4;
+  engine.submit(std::move(value));
+  // Every write but the copies ahead lands as it is due.
+  const auto landWrites = [&] {
+    for (const auto &each : tier.transfers)
+      if (each->write != WriteClass::Persist && !each->finished)
+        each->ready = true;
+  };
+  double now = 1;
+  for (int tick = 0; tick < 200 && !events.failedCount && !idle(engine); ++tick) {
+    landWrites();
+    static_cast<void>(engine.tick(now += 5));
+  }
+  require(events.failedCount == 0 && !idle(engine) && tier.inFlight() == 3,
+          "a lone lane short of pages the copies in flight held ended (" +
+              (events.failureDetails.empty() ? std::string("no failure") : events.failureDetails.front().first) +
+              "), or did not wait for them");
+  tickUntil(engine, now, [&] { tier.complete(); return idle(engine); }, "the request did not finish");
+  require(events.completedCount == 1 && events.failedCount == 0 && events.outputs[1].size() == 4,
+          "the lane did not take the copied chain's pages once the copies landed");
+}
+
 // A lone request's prefix restore that only a cached state's buffers make room for takes them, though they refill the
 // buffers a next lane starts from: it restores its prefix rather than start cold.
 void testLoneRestoreTakesTheBuffersALaneStartsFrom() {
@@ -6283,6 +6344,7 @@ std::span<const test::TestCase> memoryTests() {
       {"testReplayPointCopiesCacheBeforeTheExpertStore", testReplayPointCopiesCacheBeforeTheExpertStore},
       {"testAHostRefusedReplayPointCutsNoCommand", testAHostRefusedReplayPointCutsNoCommand},
       {"testCopyAheadOfALeafHoldsARefusalBack", testCopyAheadOfALeafHoldsARefusalBack},
+      {"testLoneGrowthWaitsForCopiesAheadAboveTheLeaves", testLoneGrowthWaitsForCopiesAheadAboveTheLeaves},
       {"testLoneRestoreTakesTheBuffersALaneStartsFrom", testLoneRestoreTakesTheBuffersALaneStartsFrom},
       {"testCaptureKvPastABoundaryTakesNothingInUse", testCaptureKvPastABoundaryTakesNothingInUse},
       {"testCaptureKvPastTheMarginCutsNoCommand", testCaptureKvPastTheMarginCutsNoCommand},

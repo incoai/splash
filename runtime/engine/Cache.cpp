@@ -946,6 +946,18 @@ std::vector<uint64_t> Cache::keptStates(const Walk &walk) const {
   return kept;
 }
 
+KvCache::Keeps Cache::keptChains(const Walk &walk, ReclaimClass upTo) noexcept {
+  using Keep = KvCache::Keep;
+  KvCache::Keeps chains = 0;
+  if (upTo != ReclaimClass::InUse)
+    chains |= KvCache::keepBit(Keep::Used);
+  if (walk.restored)
+    chains |= KvCache::keepBit(Keep::Wanted);
+  if (walk.keepResumePoint)
+    chains |= KvCache::keepBit(Keep::ResumePoint);
+  return chains;
+}
+
 uint64_t Cache::stagedState(const Walk &walk) const {
   return states_.reclaims(walk.scope.upTo == ReclaimClass::InUse, keptStates(walk)).staged;
 }
@@ -970,7 +982,7 @@ Cache::UnitTaken Cache::takeUnit(const Walk &walk, const WalkUnit &unit, Reclaim
   case Unit::DeadLeaf:
   case Unit::Leaf:
   case Unit::UsedLeaf:
-    switch (reclaimKvLeaf(block, timing)) {
+    switch (reclaimKvLeaf(walk, block, timing)) {
     case LeafReclaim::Started:
       return {true, false};
     case LeafReclaim::Pending:
@@ -985,7 +997,7 @@ Cache::UnitTaken Cache::takeUnit(const Walk &walk, const WalkUnit &unit, Reclaim
 }
 
 bool Cache::returns(const Walk &walk) const noexcept {
-  if (walk.refused ? returnsInFlight(*walk.refused) : transfersInFlight())
+  if (walk.refused ? returnsInFlight(walk, *walk.refused) : transfersInFlight(walk))
     return true;
   // An extent's worth of free pages that compaction cannot gather while a
   // write in flight reads a page among them returns, for memory, as it
@@ -1068,7 +1080,6 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
   const bool inUse = upTo == ReclaimClass::InUse;
   // The states the walk keeps beside those in use, which it passes over:
   // the resume point and the states the chains it keeps restore from.
-  const uint64_t point = walk.keepResumePoint ? states_.resumePoint() : 0;
   const std::vector<uint64_t> kept = keptStates(walk);
   // The states the walk takes free now when they need no write; the first
   // that needs one while no write holds the staging buffer frees at once
@@ -1083,33 +1094,25 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
   // a write, which stays in RAM until its write starts and needs its chain
   // on the SSD after; with a writable tier, a block without a copy that a
   // state that stays needs; and the chains the walk keeps, which the KV
-  // cache counts as they change (with Ordinary those states in use restore
-  // through, the waiting requests' unless the walk takes them, the resume
-  // point's while the walk keeps it), but for the chain a start reuses,
-  // which it walks (KvCache::pageReach). Once the staged state's write has
-  // started, its chain holds only its blocks without a copy.
-  KvCache::Keeps mask = KvCache::keepBit(Keep::Busy) | KvCache::keepBit(Keep::Moving);
+  // cache counts as they change (keptChains), but for the chain a start
+  // reuses, which it walks (KvCache::pageReach). Once the staged state's
+  // write has started, its chain holds only its blocks without a copy.
+  KvCache::Keeps mask = KvCache::keepBit(Keep::Busy) | KvCache::keepBit(Keep::Moving) | keptChains(walk, upTo);
   if (kvTierWritable())
     mask |= KvCache::keepBit(Keep::Uncopied);
   if (states.writes)
     mask |= KvCache::keepBit(Keep::Writer);
   if (states.usedWrites)
     mask |= KvCache::keepBit(Keep::UsedWriter);
-  if (!inUse)
-    mask |= KvCache::keepBit(Keep::Used);
-  if (walk.restored)
-    mask |= KvCache::keepBit(Keep::Wanted);
-  if (point)
-    mask |= KvCache::keepBit(Keep::ResumePoint);
   if (walk.restored && walk.restored != &wanted_)
     throw std::logic_error("a walk restores chains the cache does not count");
   const std::span<const uint64_t> reused = walk.reused ? walk.reused->states() : std::span<const uint64_t>{};
   // A write in flight frees what it holds once it lands only where a take
-  // waits for it (returns): a demotion, a copy ahead of a leaf, a write
-  // through whose page spills as it lands. Above any other, no reclaim
-  // reaches a page until it has landed. The extents that hold a page a
-  // transfer reads or fills, which compaction does not move, empty only
-  // then too.
+  // waits for it (returns): a demotion, a copy ahead whose block a reclaim
+  // of the class then frees through it (copyAheadReturns), a write through
+  // whose page spills as it lands. Above any other, no reclaim reaches a
+  // page until it has landed. The extents that hold a page a transfer reads
+  // or fills, which compaction does not move, empty only then too.
   std::vector<uint64_t> unwaited;
   std::array<uint32_t, 3> pinned{};
   {
@@ -1121,8 +1124,7 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
     };
     for (const Write &write : writes_) {
       pin(write.block);
-      if (write.write != WriteClass::Reclaim &&
-          !(write.write == WriteClass::Persist && kv_.residentLeaf(write.block)) &&
+      if (write.write != WriteClass::Reclaim && !copyAheadReturns(write, walk, upTo) &&
           !(spill_ && spillsOnLanding(write)))
         unwaited.push_back(write.block);
     }
@@ -1420,7 +1422,7 @@ void Cache::demoteChainsAbove(const Walk &walk, size_t firstWrite, const std::fu
           (walk.scope.upTo == ReclaimClass::Ordinary && kvNeededByStateInUse(above)) ||
           !freesOnLanding(above, freeing))
         break;
-      if (enough() || demoteKv(above) != LeafReclaim::Started)
+      if (enough() || demoteKv(walk, above) != LeafReclaim::Started)
         return;
       freeing.insert(above);
     }
@@ -1586,7 +1588,7 @@ Cache::ReclaimResult Cache::recycleState(const Walk &walk) {
   return {.pending = returns(states)};
 }
 
-Cache::LeafReclaim Cache::reclaimKvLeaf(uint64_t block, ReclaimTiming timing) {
+Cache::LeafReclaim Cache::reclaimKvLeaf(const Walk &walk, uint64_t block, ReclaimTiming timing) {
   // No state in RAM sits on the leaf (nextUnit): one went first, in the
   // order every victim goes in, or just before its leaf in a page scan. A
   // state already on disk costs nothing and stays while the leaf has a disk
@@ -1605,7 +1607,7 @@ Cache::LeafReclaim Cache::reclaimKvLeaf(uint64_t block, ReclaimTiming timing) {
   if (kvNeededByState(block)) {
     if (timing == ReclaimTiming::Immediate && kvTierWritable())
       return LeafReclaim::Impossible;
-    const LeafReclaim demotion = demoteKv(block);
+    const LeafReclaim demotion = demoteKv(walk, block);
     if (demotion != LeafReclaim::Impossible)
       return demotion;
   }
@@ -1716,16 +1718,21 @@ void Cache::followMoves(const KvPageMoves &moves) {
 }
 
 bool Cache::transfersInFlight() const noexcept {
-  // A write counts by what its landing frees: a page written through or
-  // copied ahead holds no block a reclaim could take, and returns something
-  // only where it spills once its copy lands or is a leaf the copy then lets
-  // go.
-  return !restores_.empty() || writes(WriteClass::Reclaim) || copyAheadReturns() ||
-         states_.writing() || spillingWrites();
+  // The walk of a reclaim that takes all it may: what is in use, no chain
+  // kept.
+  return transfersInFlight(Walk{.scope = {.upTo = ReclaimClass::InUse}});
 }
 
-bool Cache::returnsInFlight(const Shortfall &shortfall) const noexcept {
-  if (!restores_.empty() || writes(WriteClass::Reclaim) || copyAheadReturns() || states_.writing())
+bool Cache::transfersInFlight(const Walk &walk) const noexcept {
+  // A write counts by what its landing frees: a page written through or
+  // copied ahead returns something only where it spills once its copy lands
+  // or, copied ahead, where the walk then frees its block through the copy.
+  return !restores_.empty() || writes(WriteClass::Reclaim) || copyAheadReturns(walk) || states_.writing() ||
+         spillingWrites();
+}
+
+bool Cache::returnsInFlight(const Walk &walk, const Shortfall &shortfall) const noexcept {
+  if (!restores_.empty() || writes(WriteClass::Reclaim) || copyAheadReturns(walk) || states_.writing())
     return true;
   // With no demotion in flight, the pages of the form that transfers free
   // are those written through that will spill.
@@ -1753,10 +1760,17 @@ uint32_t Cache::writes(WriteClass write) const noexcept {
       std::ranges::count(writes_, write, [](const Write &each) { return each.write; }));
 }
 
-bool Cache::copyAheadReturns() const noexcept {
-  return std::ranges::any_of(writes_, [&](const Write &each) {
-    return each.write == WriteClass::Persist && kv_.residentLeaf(each.block);
-  });
+bool Cache::copyAheadReturns(const Write &write, const Walk &walk, ReclaimClass upTo) const noexcept {
+  // Its block, idle once the copy lands, is in the walk's reach as
+  // KvCache::pageReach counts an idle page.
+  const KvCache::Keeps stays = KvCache::keepBit(KvCache::Keep::Busy) | keptChains(walk, upTo);
+  return write.write == WriteClass::Persist && !(kv_.keeps(write.block) & stays) &&
+         !(walk.reused && walk.reused->holds(write.block));
+}
+
+bool Cache::copyAheadReturns(const Walk &walk) const noexcept {
+  return std::ranges::any_of(writes_,
+                             [&](const Write &each) { return copyAheadReturns(each, walk, walk.scope.upTo); });
 }
 
 uint32_t Cache::spillingWrites() const noexcept {
@@ -2430,13 +2444,19 @@ void Cache::promoteState(const CacheLookup &lookup,
   else states_.promotionSkipped();
 }
 
-Cache::LeafReclaim Cache::demoteKv(uint64_t block) {
+Cache::LeafReclaim Cache::demoteKv(const Walk &walk, uint64_t block) {
   if (!kvTierWritable())
     return LeafReclaim::Impossible;
-  // Room in the quota or the tier that transfers in flight will free is
-  // worth waiting for; room that nothing will free is not, and the leaf
-  // goes.
-  const auto room = [&] { return transfersInFlight() ? LeafReclaim::Pending : LeafReclaim::Impossible; };
+  // A demotion that cannot start waits while a transfer in flight returns
+  // something to the walk (transfersInFlight(walk)): a reclaim write, which
+  // frees room in the tier or the quota, or a copy ahead whose block the
+  // walk then frees through it, which frees memory though no quota: with
+  // the quota full the walk waits for such a copy too. A copy ahead the walk
+  // cannot free through is not waited for; the tier's share keeps Reclaim
+  // writes in flight whenever its slots are full, so a full tier is always
+  // waited out. With nothing in flight for the walk, the leaf goes without
+  // a copy.
+  const auto room = [&] { return transfersInFlight(walk) ? LeafReclaim::Pending : LeafReclaim::Impossible; };
   // Do not discard a disk copy for a transfer that cannot start yet.
   if (!tier_->canDemote(WriteClass::Reclaim)) {
     ++kvTier_.demotionsRefused;

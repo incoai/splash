@@ -1253,34 +1253,60 @@ void testCopiesAheadOfSpilledPagesArePending() {
   process.cache.endRequest(2);
 }
 
-// A leaf the full quota cannot demote goes with its state at once, writing nothing, when only copies
-// ahead, which free no slot, are in flight.
+// A leaf the full quota cannot demote goes with its state at once, writing nothing, when only copies ahead that
+// return nothing to the reclaim are in flight, which free no slot either: copies of a point the reclaim cannot take,
+// or of the blocks above it alone, its request running, its state in use for a reclaim of the ordinary class, or
+// leased for any (KvCache::keeps). A start's claim, which keeps the chains of states in use, counts none of their
+// pages.
 void testRefusedDemotionTakesTheLeafBesideCopiesAhead() {
-  Process process(true);
-  const uint64_t leaf = process.cachePrompt(1, promptOf(1000, 1))[0];
-  process.publish(leaf);
-  require(test::stateStep(process.cache).gave() && process.cache.pollTransfers() &&
-              !process.cache.stateResident(leaf),
-          "the leaf's state did not move to the SSD");
-  const std::vector<uint32_t> prompt = promptOf(2000, 3);
-  process.cache.beginRequest(2);
-  require(admitTokens(process.cache, 2, prompt.size()).granted(), "the running request's KV was not admitted");
-  process.cache.publishCommittedBlocks(2, prompt, static_cast<uint32_t>(prompt.size()), {});
-  const uint64_t point = process.cache.blockAt(2, static_cast<uint32_t>(prompt.size()));
-  process.publish(point);
-  StateUse use = process.cache.useState(point);
-  require(process.cache.persist(point) == PersistStatus::Started && process.cache.pollTransfers() &&
-              process.tier.inFlight() == 3,
-          "the running request's point was not copied ahead");
-  process.tier.capacity = process.tier.slots;
-  const uint32_t demotions = process.tier.demotions, prefix = process.cache.snapshot().pool.pagesPrefix;
-  const FreeResult step = test::evictStep(process.cache, ReclaimClass::Ordinary);
-  require(step.gave() && process.tier.demotions == demotions &&
-              process.cache.snapshot().pool.pagesPrefix == prefix - 1,
-          "a leaf the quota could not demote stayed beside copies ahead that return no room");
-  process.tier.complete();
-  static_cast<void>(process.cache.pollTransfers());
-  process.cache.endRequest(2);
+  enum class Holder : uint8_t { Running, Used, Leased };
+  for (const Holder holder : {Holder::Running, Holder::Used, Holder::Leased})
+    for (const uint32_t copies : {3u, 2u}) {
+      Process process(true);
+      const uint64_t leaf = process.cachePrompt(1, promptOf(1000, 1))[0];
+      process.publish(leaf);
+      require(test::stateStep(process.cache).gave() && process.cache.pollTransfers() &&
+                  !process.cache.stateResident(leaf),
+              "the leaf's state did not move to the SSD");
+      std::vector<uint32_t> prompt = promptOf(2000, 3);
+      process.cache.beginRequest(2);
+      require(admitTokens(process.cache, 2, prompt.size()).granted(), "the request's KV was not admitted");
+      process.cache.publishCommittedBlocks(2, prompt, static_cast<uint32_t>(prompt.size()), {});
+      const uint64_t point = process.cache.blockAt(2, static_cast<uint32_t>(prompt.size()));
+      process.publish(point);
+      std::optional<StateUse> use;
+      if (holder != Holder::Leased)
+        use.emplace(process.cache.useState(point));
+      if (holder != Holder::Running)
+        process.cache.endRequest(2);
+      prompt.push_back(1);
+      const CacheLookup lookup = holder == Holder::Leased ? process.cache.lookup(prompt, {}) : CacheLookup{};
+      require(holder != Holder::Leased || (lookup.state && lookup.state->kvBlock() == point),
+              "the point's state was not leased");
+      // The copies of the chain's first blocks, root first, stay in flight.
+      process.tier.writeLimits[static_cast<size_t>(WriteClass::Persist)] = copies;
+      require(process.cache.persist(point) == PersistStatus::Started && process.cache.pollTransfers() &&
+                  process.tier.inFlight() == copies,
+              "the point's chain was not copied ahead");
+      process.tier.capacity = process.tier.slots;
+      const VictimQuery start = test::query({.cls = ClaimClass::Start}, {.pages = 8});
+      uint32_t counted = 0;
+      for (std::optional<Victim> unit = process.cache.peek(start, nullptr); unit;
+           unit = process.cache.peek(start, &*unit))
+        counted += unit->pages;
+      require(counted == 1, "a start's claim counted " + std::to_string(counted) +
+                                " pages, the leaf's and those of a held chain that copies ahead hold");
+      const uint32_t demotions = process.tier.demotions, prefix = process.cache.snapshot().pool.pagesPrefix;
+      const FreeResult step =
+          test::evictStep(process.cache, holder == Holder::Leased ? ReclaimClass::InUse : ReclaimClass::Ordinary);
+      require(step.gave() && process.tier.demotions == demotions &&
+                  process.cache.snapshot().pool.pagesPrefix == prefix - 1,
+              "a leaf the quota could not demote stayed beside copies ahead that return nothing to the reclaim");
+      process.tier.complete();
+      static_cast<void>(process.cache.pollTransfers());
+      if (holder == Holder::Running)
+        process.cache.endRequest(2);
+    }
 }
 
 // A temporary tier copies a point once its request ended, the points after it first, and a reclaim
