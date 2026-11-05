@@ -1272,95 +1272,34 @@ until serving begins (`/status`: `memory_governor.host_available_bytes` and
 `host_spare_bytes` and `host_spare_reserve_bytes`, and `host_headroom_bytes`
 is the room above them).
 
-### What a refused claim takes
+### Memory rules
 
-A refused claim lacks what it asked beyond the free room, plus the room
-claims ranked above it hold. The ledger first gives back what costs nothing,
-the idle state buffers. A claim that can wait then waits when what is landing
-meets its need: the transfers in flight and the copies its own lanes owe.
-Otherwise the ledger walks one fixed order, the same for every claimant. A
-unit the claim's rights (`TakeRights`) do not take is skipped, not a stop:
+**Take order** (`MemoryLedger::Order`, `runtime/engine/MemoryLedger.cpp`).
+Every claim walks one order. A unit the claim's rights (`TakeRights`) do not
+take is skipped, not a stop:
 
 1. Idle state buffers.
-2. The prefix cache's units that free memory now, in its one order
-   ([below](#replay-points-and-checkpoints)): those with a copy on the SSD
-   cache, those nothing needs, and those that need no write.
-3. The caches the model rebuilds on use: the vision encoder's scratch,
-   images' encoded rows, idle history staging, and the hot block cache while
-   no lane reads above its floor.
-4. The prefix cache's units that need a write first, in the same order, only
-   for a claim that can wait, which then waits for the write it starts; an
-   `Immediate` claim passes over them. A state needs a write only when a
-   restore from it is expected: one in use, the resume point, a queued
-   request's, or a point copies ahead of need would copy, the newest of its
-   conversation (`Cache::writesState`). Any other state, such as one its
-   conversation went on from or a checkpoint no request waits for, is
-   dropped like a unit no tier can copy, with no SSD cache or one whose
-   files stopped taking writes. KV whose write finds no slot, with the quota
-   full, nothing in it the take may give up and no transfer in flight, goes the
-   same way once this stage reaches it, a leaf with the copies below it that
-   need it (`Cache::reclaimKvLeaf`).
-5. The prefill command between its passes, given up for work that supersedes
-   it, then the claimant's own conversion to Spill (below).
-6. The pools' units above their floors: the expert store's chunks, the top
-   chunk first, and the hot block cache's extents while a lane reads above
-   its floor.
-7. What another request uses: its state in use costs it a re-prefill of its
-   prompt.
-8. Then the engine: it waits for the copies in flight where they cover the
-   need. Otherwise, when no lane's growth fits, the lane that yields first
-   (the lowest priority, a prefill before a decoding lane of its priority,
-   then the one with less completed work, then the later arrival) pays with
-   its own suspension; while other lanes fit, a refused lane waits for them,
-   resident, since they grow too and are refused in turn. A lane alone that
-   nothing meets fails with `capacity_exhausted` (below).
+2. Cached units that free memory now (copied, dead or needing no write), in
+   the cache's one order (`Cache::walkFor`).
+3. Caches the model rebuilds on use: the vision encoder's scratch, images'
+   encoded rows, idle history staging, and the hot block cache while no lane
+   reads above its floor.
+4. Cached units that need a write, for a claim that can wait.
+5. The command between its passes, then the claimant's own conversion to
+   Spill.
+6. Pool units above their floors: the expert store's chunks, top chunk first,
+   and the hot block cache's extents while a lane reads above its floor.
+7. Units another request uses.
+8. The engine: it waits for copies in flight that cover the need. Else, when
+   no lane's growth fits, the lane that yields first is suspended; while other
+   lanes fit, a refused lane waits for them, resident. A lane alone that
+   nothing meets fails with `capacity_exhausted` (`Engine::judge`).
 
-The order takes what costs least first: what frees without a write goes
-before anything that costs a write or later work. A cached unit costs a
-prefill only if a request comes back for it, a rebuilt cache its rebuild, a
-write its SSD bandwidth and the wait for it, a store chunk SSD reads for as
-long as it stays away, and a unit in use its request's prompt again. Inside
-the cache's one order, a claim that can wait takes the units that free now
-past an uncopied one before it waits for that unit's write, which stays at
-the head for copies ahead of need to make.
+Once a unit the claim reached waits for a transfer, it takes nothing past
+step 4.
 
-The ledger first counts the most the order gives, taking nothing
-(`MemoryLedger::bound`): each unit at what its source says it frees at most.
-Unless that covers what the claim lacks, nothing is taken. Otherwise it takes
-the units one at a time, each found again from the head of its source as it
-stands, until what they freed now and as their transfers land covers the
-need (`MemoryLedger::take`). A unit whose take frees nothing is passed over:
-a transfer in flight may hold it, or nothing of it is left. Once a take
-waits for a transfer, the claim takes nothing past the cache's units that
-need a write: it waits rather than take what costs work later. A claim met
-only by units that land later (a write it started, a conversion's copies)
-waits for them (`Pending`) and is retried as they land; one they do not meet
-waits while what it reached or started lands, and is `Short` otherwise. A
-refusal of KV counts the free pages of its form as its own: the ledger never
-releases their extent for it, which it would only allocate again.
-
-Three rules say who takes what. They are derived in one function
-(`takeRights`), whose `TakeRights` every source of units reads:
-
-- An `Immediate` claim, and any need the host refused, takes only units that
-  free memory now: never a unit that needs a write, a pool unit above its
-  floor, the command between its passes, a conversion or a unit in use. The
-  host's claim under critical pressure is the exception: it takes pool units
-  above their floors and units in use too.
-- Pool units above their floors, the command between its passes and the
-  conversion go only to an `InService` claim that can wait, and pool units
-  also to the host under critical pressure: the command only for work that
-  supersedes it, the conversion only for the KV growth of the claim's own
-  lane. Units in use go only to an `InService` claim that reaches them (a
-  replay point, a lane that would not yield for them) and to the host under
-  critical pressure.
-- Units of certain reuse, the newest resume point and the chains that queued
-  requests will restore, go to `InService` claims and to the host under
-  critical pressure, in the cache's order. `Start` and `Optional` claims may
-  take the resume point, never a queued request's chain; `Growth` and the host
-  short of critical pressure take neither.
-- A `Floor` claim takes nothing: it is a rule of the host's only, and the
-  ledger refuses to take or count units for one.
+**Who takes what**, derived in one function (`takeRights`) whose `TakeRights`
+every source of units reads (`MemoryLedger::Order`, `Cache::walkFor`):
 
 | Claimant | Cache that frees now | Cache that needs a write | Rebuilt caches | Pass command, own conversion | Pools above their floors | Resume point | Queued chains | In use |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -1371,38 +1310,145 @@ Three rules say who takes what. They are derived in one function
 | `Growth` | yes | no | no | no | no | no | no | no |
 | `Host` with a deficit | yes | yes | yes | no | no | no | no | no |
 | `Host` under critical pressure | yes | no | yes | no | yes | yes | yes | yes |
-| A need the host refused | yes | no | yes | no | no | as its class | as its class | no |
+| A need the host refused | in place | no | yes | no | no | as its class | as its class | no |
 
-A claim below the priority of a lane in service takes no pool unit: the pools
-serve every lane. A claim for memory nothing needs yet, such as the Index
-runway's refill with no Spill lane in service, takes only what costs nothing.
-A need the host refused takes cache in place, pages or states, and none of
-the caches the model rebuilds, which would not get it past the host.
-Pages whose copies landed leave memory at every point between commands where
-memory is judged, before admission and at each command's start
-(`Engine::spillLanded`) and in the control pass (`Engine::collectLandings`),
-so the next attempt finds what they gave back.
+The pass command goes only to work that supersedes it, a conversion only to
+its own lane's KV growth. A claim below the priority of a lane in service
+takes no pool's units, rebuilt or above a floor. A `Floor` claim, the start's
+or a weights restore's, takes nothing: it is a class of the host's rule only
+(`MemoryGovernor::HostRule::admits`).
+
+**Store floor and regrowth** (`planParts` in
+`runtime/engine/StreamedMemoryPlan.cpp`, `MemoryLedger::grow`). The expert
+store's floor is the whole store where the run can spill (a block-sparse
+target with an SSD cache that takes writes), else 0.85 of its slots;
+`--expert-memory` sets it exactly. No claim takes the store below its floor.
+After the host's pass a pool grows one unit, an elastic store chunk of about
+1 GiB, once 30 s have passed since its last try and since a request's claim
+went unmet or took a pool unit above a floor, the pass command, a conversion
+or a unit in use (`MemoryLedger::free`). Nothing grows while a request's claim waits. The
+unit goes first into free room beyond the waiting claims' holds and the lanes'
+projected growth, then takes by the `Growth` row. A unit the cache pays for
+whole needs only no critical pressure and no host deficit; one that needs free
+room needs normal pressure, the margin and the host out of its band
+(`MemoryGovernor::growthHost`). Nothing is taken before the host admits it.
+
+**Placement** (`Engine::placement`, `runtime/engine/EngineMemory.cpp`). A
+start's projection is its tokens plus up to 4096 output tokens. It runs
+Resident when that fits its dense history or costs no more than Spill's peak
+(its floors and the larger of its history staging and its hot block floor);
+else Resident when what a `Start` claim may take covers its Resident KV, its
+state buffers and the lanes' projected growth; else Spill. The lanes'
+projected growth (`Engine::laneDemand`) is each lane's KV up to its
+projection and the hot block floors the lanes that read spilled KV still
+lack. One rule prices a hot block floor in both
+(`KvBlockCache::lanesShortfallBytes`): the floors lacked count once for all
+lanes, in whole extents, and extents no lane reads above the floors are a
+rebuilt cache, not a lane's floor.
+
+**Self-conversion** (`Engine::EngineVictims::conversions`). On a target whose
+run can spill, a Resident lane in decode whose own KV growth the engine's
+limit refuses converts itself to Spill when its eligible pages
+(`Cache::convertiblePages`) times a Full page less an Index page, less the
+first lane's hot block floor (`Model::hotFloorBytes`), cover the missing
+bytes: about 46K tokens on Qwen3.8-Flash-Next. It needs the SSD cache's quota
+for its pages and a free page in the Index runway, an extent kept while
+spilling is possible (`Engine::spillLanded`). Its landed pages release the
+Full extents they empty (`Engine::landedExtents`), and it then follows the
+Spill rules ([KV on the SSD](server.md#kv-on-the-ssd)). No other claim
+converts a lane, and a prefill lane does not convert.
+
+**Hot block cache** (`HotBlocksPool`, `runtime/model/ModelPools.hpp`). The
+floor, 4,096 slots a layer for each decoding Spill lane that holds one and
+4,096 more, in whole extents, is taken all or none as a lane starts decoding
+(`KvBlockCache::reserveLane`). The cache grows toward `--sparse-kv-memory`
+only while a lane holds a floor, and is a rebuilt cache while no lane reads
+above the floor (`KvBlockCache::readsAboveFloor`). A lane's floor is no unit
+any claim takes: it goes only with its lane (`KvBlockCache::releaseLane`).
+
+**Host passes** (`MemoryGovernor::controlPass`). A pass that took something
+waits a settle second (1 s) before the next. With a deficit, a headroom below
+the 1 GiB margin plus what host-refused requests wait to retry, less what
+transfers return (`HostRule::deficitBytes`), the host takes up to the smaller
+of the margin and the deficit, by the `Host` with a deficit row. Without a
+deficit it takes nothing, under macOS's warning too; the warning still holds
+back elective admission and growth into free room. Under critical pressure
+one immediate host claim each settle second takes up to the margin plus what
+refused requests wait to retry, in the take order (`MemoryGovernor::hostPass`).
+A pass that finds nothing while the host is short waives the band until it
+ends.
+
+**Admission** (`Engine::admitQueued`, `runtime/engine/Engine.cpp`). Admission
+walks the starts the scheduler wants this round in its lead order
+(`Scheduler::prefillAdmissionOrder`) and stops at one that is refused or backs
+off from a refusal: the wanted starts after it are held, not tried, so the
+lanes that finish leave their memory to it. A refused start the scheduler
+does not want waits for scheduling: it holds back nothing, its claim holds no
+room and its wait's limit stops; it keeps its wait's age and its refusal. A
+refusal of the SSD cache's quota holds back only Spill starts. Aging bounds
+how long younger prompts lead a refused start
+([below](#prefill-and-decode-scheduling)). A refused resume holds back the
+later resumes.
+
+### What a refused claim takes
+
+A refused claim lacks what it asked beyond the free room, plus the room
+claims ranked above it hold. The ledger first gives back what costs nothing,
+the idle state buffers. A claim that can wait then waits when what is landing
+meets its need: the transfers in flight and the copies its own lanes owe.
+Otherwise the ledger walks the take order ([above](#memory-rules)), which
+takes what costs least first: a cached unit costs a prefill only if a request
+comes back for it, a rebuilt cache its rebuild, a write its SSD bandwidth and
+the wait for it, a store chunk SSD reads for as long as it stays away, and a
+unit in use its request's prompt again. Inside the cache's one order
+([below](#replay-points-and-checkpoints)), a claim that can wait takes the
+units that free now past an uncopied one before it waits for that unit's
+write, which stays at the head for copies ahead of need to make.
+
+A state needs a write only when a restore from it is expected: one in use,
+the resume point, a queued request's, or a point copies ahead of need would
+copy, the newest of its conversation (`Cache::writesState`). Any other state,
+such as one its conversation went on from or a checkpoint no request waits
+for, is dropped like a unit no tier can copy, with no SSD cache or one whose
+files stopped taking writes. KV whose write finds no slot, with the quota
+full, nothing in it the take may give up and no transfer in flight, goes the
+same way once the take reaches it, a leaf with the copies below it that need
+it (`Cache::reclaimKvLeaf`).
+
+The ledger first counts the most the order gives, taking nothing
+(`MemoryLedger::bound`): each unit at what its source says it frees at most.
+Unless that covers what the claim lacks, nothing is taken. Otherwise it takes
+the units one at a time, each found again from the head of its source as it
+stands, until what they freed now and as their transfers land covers the
+need (`MemoryLedger::take`). A unit whose take frees nothing is passed over:
+a transfer in flight may hold it, or nothing of it is left. A claim met
+only by units that land later (a write it started, a conversion's copies)
+waits for them (`Pending`) and is retried as they land; one they do not meet
+waits while what it reached or started lands, and is `Short` otherwise. A
+refusal of KV counts the free pages of its form as its own: the ledger never
+releases their extent for it, which it would only allocate again.
+
+A claim for memory nothing needs yet, such as the Index runway's refill with
+no Spill lane in service, takes only what costs nothing. Pages whose copies
+landed leave memory at every point between commands where memory is judged,
+before admission and at each command's start (`Engine::spillLanded`) and in
+the control pass (`Engine::collectLandings`), so the next attempt finds what
+they gave back.
 
 A request in service keeps growing through host pressure and macOS's warning,
 short of critical pressure, within `--max-memory`, first into cached pages no
 request holds: it takes cached KV, and a cached state only where it sits on
 the KV that goes next, since a state's buffers give it no page. A new request
 waits while another is in service unless what the `Start` row may take meets
-it, and with none in service it starts. A request whose start was refused
-memory, under host pressure or at `--max-memory`, holds back the requests that
-arrived after it until it starts, fails or is cancelled, so the lanes that
-finish leave their memory to it; a higher priority is not held back. So does a
-start that waits for the SSD cache's room for its KV, which other long
-requests hold. It keeps holding them back while it waits for a prefix another
-lane is computing.
+it, and with none in service it starts.
 
 A prompt near the context limit can hold back every other start of its priority
 or below until it ends, its prefill alone taking many minutes: in service, its
 KV grows into the host's spare memory, which pauses other growth; a start beside
 it takes only what the engine already holds, such as a lane's state buffers that
 a finished request left in the pool or an idle cache the model rebuilds on use;
-and the first start refused holds back the
-rest, its wait's limit restarting while the long request works (below).
+and the first start refused holds back the starts it leads, its wait's limit
+restarting while the long request works (below).
 `/status` shows it: `admission.held_behind_refusal` counts the requests held
 back, `memory_governor.growth_allowed` and `host_headroom_bytes` show whether
 and how far the host lets the engine grow, and `state.idle_gdn_cells`,
@@ -1411,110 +1457,33 @@ start can take. A request's `timeout`, or `--request-timeout`, bounds the wait.
 
 After a suspension, suspended requests resume before new work of their priority
 or below, one at a time, higher priority first and then in the order they
-arrived; one refused memory holds back the suspended requests after it, and
-their resource waits do not run out while it does. When every lane is taken,
-or a new request's start is refused memory that no copy being written to disk
-is about to free, the resident of the lowest priority below it is suspended for
-it (`cache.priority_suspensions` in `/status`) and resumes once a lane and its
+arrived; the suspended requests a refused one holds back keep their resource
+waits from running out. When every lane is taken, or a new request's start is
+refused memory that no copy being written to disk is about to free, the
+resident of the lowest priority below it is suspended for it
+(`cache.priority_suspensions` in `/status`) and resumes once a lane and its
 memory are free. A new request below the priority of a running lane neither
 starts nor takes a lane until no lane of that priority runs, since it could not
 run before.
 
-### Host passes
-
-Between commands the control pass samples the host's memory and macOS's
-pressure, and a pass that took something waits a settle second (1 s), the
-time the host's counters take to show it, before the next:
-
-- With a deficit, a headroom below the 1 GiB margin plus what the requests
-  the host refused wait to retry, less what transfers return, the host's claim takes up to the smaller of
-  the margin and the deficit, by the `Host` with a deficit row: cache and rebuilt caches,
-  never the store or a conversion.
-- Without a deficit it takes nothing, under macOS's warning too; the warning
-  still holds back elective admission and growth into free room.
-- Under critical pressure one immediate host claim each settle second takes
-  up to the margin plus what the refused requests wait to retry, in the same
-  order: store chunks above the floor, units of certain reuse and units in
-  use among them, but no more than that, and never the store below its floor.
-
-A pass that finds nothing to take while the host is short waives the band
-until it ends, since only other applications can return the rest.
-
 ### Expert store and regrowth
 
-The expert store's floor is the whole store where the run can spill, a
-block-sparse target whose KV can go to an SSD cache that takes writes, and
-0.85 of its slots otherwise; a store `--expert-memory SIZE` sets is all floor.
 A run that can spill gets memory back from its KV instead, while each chunk
-the store gives up costs expert reads from the SSD for the rest of the run.
-No claim takes the store below its floor. The store starts at its floor,
+the store gives up costs expert reads from the SSD for the rest of the run:
+hence its floor ([above](#memory-rules)). The store starts at its floor,
 whatever the host holds; before the engine is ready the ledger grows it into
 the room the host leaves by the host's rule for growth
 (`MemoryGovernor::growToTargets`), its cap the limit's, and the chunks above
 what it grew stay in the plan, so the context does not move.
 
-After the host's pass the control pass grows a pool by one unit, an elastic
-store chunk of about 1 GiB, once 30 s have passed since its last try and
-since a request's claim last went unmet or took a store chunk, the command
-between its passes, a conversion or a unit in use; a claim the cache met
-does not restart that clock. A chunk regrown sooner would go back to the
-next claim, and each cycle costs its refill and compaction; on 35B such
-retakes came 1-29 s apart. Nothing grows while a
-request's claim waits for memory or to retry what the host refused it: that
-room is the request's. The unit goes first into free room beyond what waiting
-claims hold and what the lanes in service are projected to grow into; the
-rest it takes from cache that frees memory now, never a unit of certain
-reuse, one in use or one that needs a write. The host judges the net
-change: a unit the cache pays for whole regrows at normal pressure or under
-macOS's warning while the host has no deficit, never under critical pressure;
-a unit that needs free room needs normal pressure, the margin to spare beyond
-it and the host out of its band. The ledger first counts what the cache
-funds at most, taking nothing (`MemoryLedger::grow`), the host then judges
-the unit, and only then the ledger takes the cache's units one at a time; a
-count short of the unit, or the host's refusal, takes nothing. A try that falls
-short asks a temporary SSD cache to copy ahead what it lacked
-([disk tier](#disk-tier)), so that a later try finds that cache free to go. A
-store a burst shrank so comes back a chunk per 30 s once requests stop going
-short, even when the burst's KV, cached, fills the room.
-`memory_governor.growth_allowed` is false while the host refuses growth into
-free room.
-
-The lanes' projected growth is each lane's KV up to its projection, its
-tokens now and up to 4096 more of its output (a Spill lane's floors at that
-length), and the hot block cache's shortfall counted once for all lanes: the
-floor extents of the lanes that read spilled KV, less the extents the cache
-has.
-
-### Conversion to Spill
-
-On a block-sparse target whose run can spill, the only conversion is a lane's
-own: a Resident lane in decode whose KV growth is refused converts itself to
-Spill, rather than yield or fail, where that frees what it lacks: its
-eligible pages (the Full pages only it holds, past its dense history and
-window) times a Full page less an Index page, less the hot block cache's
-floor its reads will need (the first lane's, 390 MiB on Qwen3.8-Flash-Next),
-must cover the missing bytes, which on Flash-Next takes about 46K tokens of
-history. It converts only while it decodes Resident, neither between passes
-nor restoring, for a need the host did not refuse, with the SSD cache's
-quota holding its pages and a free Index page for the first copies. The
-conversion allocates nothing: the pages' copies land in the Index runway, an
-extent the engine keeps while spilling is possible and refills between
-commands as memory allows, and each landed page's Full extent is compacted
-and released, so the hot block cache's
-floor gets real bytes. From then on the lane follows the Spill rules
-([KV on the SSD](server.md#kv-on-the-ssd)): it may end at its length when the
-quota stops its writes, and its resume may bound its output. No other claim
-converts a lane, neither another lane's growth nor a start nor the host, and
-a prefill lane does not convert.
-
-The hot block cache's floor, 4,096 slots a layer for each decoding Spill lane
-that holds one and 4,096 more, in whole extents, is taken all or none as a
-Spill lane starts decoding, and the cache grows toward `--sparse-kv-memory`
-only while a lane holds a floor. While no lane reads above the floor, with no
-lane holding one or a target at the floor, its extents, up to 975 MiB on
-Flash-Next after the last Spill lane ends, are a cache the model rebuilds
-(step 3). A decoding Spill lane's floor is no unit any claim takes: it goes
-only with its lane, as the lane yields or ends.
+Regrowth waits for a quiet period because a chunk regrown sooner would go back
+to the next claim, and each cycle costs its refill and compaction; on 35B such
+retakes came 1-29 s apart. A try that falls short asks a temporary SSD cache
+to copy ahead what it lacked ([disk tier](#disk-tier)), so that a later try
+finds that cache free to go. A store a burst shrank so comes back a chunk per
+30 s once requests stop going short, even when the burst's KV, cached, fills
+the room. `memory_governor.growth_allowed` is false while the host refuses
+growth into free room.
 
 ### Replay points and checkpoints
 
@@ -1527,7 +1496,7 @@ the KV it restores through. When the last request using it ends, the point
 becomes the newest ordinary state; the older points on its chain keep their age.
 Cache units come in three classes: checkpoints, then ordinary states and KV
 (first the KV no state restores through, which saves no prefill), then what is
-in use, which only the claims [above](#what-a-refused-claim-takes) may take.
+in use, which only the claims [above](#memory-rules) may take.
 A prefill command captures the state of each boundary it reaches, in buffers
 reserved before it runs. A junction or a checkpoint retires its lane's
 checkpoint once published, and a checkpoint the same command would capture before it is not captured at all; the prompt's
