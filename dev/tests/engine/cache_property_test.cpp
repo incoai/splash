@@ -123,10 +123,10 @@ public:
   }
 
   uint64_t steps = 0;
-  // Units taken, as peek offered them just before, by whether their takes
-  // freed, in the need's measure, all peek counted (exact) or less (short),
-  // and of those offered as needing no write the same. Peek counts an upper
-  // bound (VictimSource), so these are reported, not required.
+  // Units taken, by whether their takes freed, in the need's measure, all
+  // peek counted when it first offered them (exact) or less (short), and of
+  // those offered as needing no write the same: a short one of those is one
+  // of the classes checkTake names.
   uint64_t exactUnits = 0, shortUnits = 0, exactNoWrite = 0, shortNoWrite = 0;
 
   // Every request ends, every transfer lands, and nothing leaks: the pool's
@@ -243,11 +243,16 @@ public:
                         snapshot.stateCache.offloads,    tier_.demotions};
     };
     // Each unit's count when it was first offered, what its takes freed in
-    // the need's measure, and whether a take of it ended waiting.
+    // the need's measure, and what they reported, by the classes of unit
+    // that may free less than counted (below).
     struct Taken final {
       uint64_t counted = 0;
       uint64_t freed = 0;
       bool write = false;
+      bool pending = false;
+      uint64_t slimRoom = 0;
+      bool netted = false;
+      std::string takes;
     };
     std::map<uint64_t, Taken> taken;
     // The takes as the ledger takes (MemoryLedger::take): the first unit from
@@ -263,11 +268,15 @@ public:
       const bool firstTake = !taken.contains(unit->key);
       Taken &record = taken[unit->key];
       if (firstTake)
-        record = {.counted = measure(*unit), .write = unit->write};
+        record = {.counted = measure(*unit),
+                  .write = unit->write,
+                  .slimRoom = uint64_t{pool_.allocatedExtents(kv::PageForm::Slim)} * pool_.extentPages()};
       const auto unchanged = fingerprint();
       const uint64_t before = pool_.allocatedBytes();
       const uint64_t offloads = cache_.snapshot().stateCache.offloads;
       const uint32_t demotions = tier_.demotions;
+      const uint64_t landingBefore = cache_.returning().landingBytes;
+      const uint32_t slimBefore = pool_.freePageCount(kv::PageForm::Slim);
       const FreeResult result = cache_.take(query, *unit);
       const uint64_t released = before - std::min(before, pool_.allocatedBytes());
       require(result.nowBytes <= released, "a take released " + std::to_string(released) + " bytes, reported " +
@@ -287,6 +296,14 @@ public:
       require(gaveOf(result) <= through, "a take freed " + std::to_string(gaveOf(result)) +
                                              " where the units through it counted " + std::to_string(through));
       record.freed += gaveOf(result);
+      record.pending = record.pending || result.outcome == FreeOutcome::Pending;
+      const uint32_t slimAfter = pool_.freePageCount(kv::PageForm::Slim);
+      record.slimRoom += slimAfter - std::min(slimAfter, slimBefore);
+      record.netted = record.netted || (device && released > gaveOf(result) &&
+                                        cache_.returning().landingBytes < landingBefore);
+      record.takes += " [" + std::to_string(measure(*unit)) + " counted, " + std::to_string(gaveOf(result)) +
+                      " freed, " + std::to_string(released) + " released, " + std::to_string(result.stateBuffers) +
+                      " states, outcome " + std::to_string(static_cast<int>(result.outcome)) + "]";
       // Progress: a take that says it gave something changed the cache, so
       // the ledger's peek again from the head never finds the same unit for
       // ever; and a unit peek offers is one its first take gives something
@@ -302,11 +319,39 @@ public:
         unit = cache_.peek(query, &*unit);
       }
     }
-    for (const auto &[_, record] : taken) {
+    // Tightness: a unit offered as needing no write frees all it counted
+    // when first offered, but for three classes, each named by what its
+    // takes report:
+    // - Pending: a take of it ended Pending, a transfer in flight holding
+    //   the rest, which comes back as it lands.
+    // - Trims: a page need of Full pages in a windowed cache, short by at
+    //   most the Slim pages its trims could go into (those allocated when it
+    //   was first offered, and each its takes freed). Its count trims the
+    //   pages the windows passed and the tails of the states the phase lets
+    //   go into the Slim pages free or freed in the phase; its takes trim
+    //   only once a state goes, into the Slim pages free then, and only what
+    //   no other tail or window still holds, and the Trim unit before it
+    //   trims into the Slim pages its takes free: what it trims itself
+    //   depends on the order of the phase's takes.
+    // - Netted: a device need whose take released an extent the landing
+    //   pages would have completed, as the landing count dropped. The take
+    //   credits the release less the landing extent it cancels (net
+    //   nothing), while the count keeps the release as its least (Cache::
+    //   reach), so that a claim takes that memory now rather than waiting for
+    //   the landing (testAReleaseOfWhatALandingCompletesCountsOnce).
+    for (const auto &[key, record] : taken) {
       const bool exact = record.freed >= record.counted;
       ++(exact ? exactUnits : shortUnits);
       if (!record.write)
         ++(exact ? exactNoWrite : shortNoWrite);
+      const bool trims = windowed_ && !device && !states && form == kv::PageForm::Full &&
+                         record.counted - std::min(record.counted, record.freed) <= record.slimRoom;
+      require(exact || record.write || record.pending || trims || record.netted,
+              "a unit offered as needing no write freed " + std::to_string(record.freed) + " of the " +
+                  std::to_string(record.counted) + " it counted (unit " + std::to_string(key >> 56) + ":" +
+                  std::to_string(key & 0xff) + (device ? ", device" : states ? ", states" : ", pages") +
+                  (query.need.hostRefused ? ", scan" : "") + (immediate ? ", immediate" : "") +
+                  "); its takes:" + record.takes);
     }
     for (const uint64_t block : inUse)
       require(query.rights.inUse || cache_.stateResident(block),
@@ -584,7 +629,7 @@ void testTakeNeverExceedsPeek(uint32_t plainSeeds, uint32_t windowedSeeds) {
             << " reclaim steps taken as the ledger takes, each that gave something changing the cache and freeing no "
             << "more than the units through its own counted, every offered unit's first take giving something or "
             << "waiting; " << exact << " units freed all peek counted, " << shortOf << " less (" << exactNoWrite
-            << " and " << shortNoWrite << " of those needing no write)\n";
+            << " and " << shortNoWrite << " of those needing no write, each Pending, Trims or Netted)\n";
 }
 
 } // namespace
