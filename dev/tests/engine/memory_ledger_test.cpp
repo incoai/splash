@@ -536,8 +536,8 @@ void testOneHostRule() {
 // Memory a lane in service takes anyway (ClaimSpec::laneNeeds) is judged by the host as that lane's growth: by the
 // margin, not the band.
 void testTheHostJudgesWhatALaneNeedsAsItsGrowth() {
-  const ClaimSpec needed{.cls = ClaimClass::Optional, .laneNeeds = true};
-  const ClaimSpec optional{.cls = ClaimClass::Optional};
+  const ClaimSpec needed{.cls = ClaimClass::Optional, .requestId = 1, .laneNeeds = true};
+  const ClaimSpec optional{.cls = ClaimClass::Optional, .requestId = 1};
   // In the band, past the margin by less than the largest growth unit.
   {
     const uint64_t pool = 2 * kGiB;
@@ -803,48 +803,52 @@ void testTakeRightsTable() {
   };
   const std::vector<Row> rows{
       {"in service, can wait", rights(everything),
-       {.waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
+       {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = true,
         .convertLane = 7}},
       {"in service, can wait, ordinary reach", rights({.cls = ClaimClass::InService}),
-       {.waitsForWrites = true, .waitsForLandings = true, .inUse = false, .certainReuse = Reuse::All,
+       {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = false, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = false,
         .convertLane = 0}},
       {"in service, Immediate", rights(immediate),
-       {.waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::All,
+       {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
         .convertLane = 0}},
       {"start", rights(start),
-       {.waitsForWrites = true, .waitsForLandings = true, .inUse = false, .certainReuse = Reuse::ResumePoint,
+       {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = false, .certainReuse = Reuse::ResumePoint,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
         .convertLane = 0}},
       {"optional", rights(optional),
-       {.waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::ResumePoint,
+       {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::ResumePoint,
         .reserves = Reserves::None, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
         .convertLane = 0}},
-      {"growth", rights({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate}), TakeRights{}},
+      {"growth", rights({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate}), {.units = true}},
+      {"the engine's own optional work", rights({.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate}),
+       {.units = false, .waitsForWrites = false, .waitsForLandings = false, .inUse = false,
+        .certainReuse = Reuse::ResumePoint, .reserves = Reserves::None, .rebuiltPools = true,
+        .storeAboveFloor = false, .passCommand = false, .convertLane = 0}},
       {"the host with a deficit", rights({.cls = ClaimClass::Host}),
-       {.waitsForWrites = true, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::None,
+       {.units = true, .waitsForWrites = true, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::None,
         .reserves = Reserves::None, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
         .convertLane = 0}},
       {"the host at critical pressure", rights({.cls = ClaimClass::Host}, {.bytes = kMiB}, true),
-       {.waitsForWrites = false, .waitsForLandings = false, .inUse = true, .certainReuse = Reuse::All,
+       {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = true, .certainReuse = Reuse::All,
         .reserves = Reserves::All, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = false,
         .convertLane = 0}},
       {"a need the host refused in service", rights(everything, {.bytes = kMiB, .hostRefused = true}),
-       {.waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::All,
+       {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
         .convertLane = 0}},
       {"a need the host refused a start", rights(start, {.bytes = kMiB, .hostRefused = true}),
-       {.waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::ResumePoint,
+       {.units = true, .waitsForWrites = false, .waitsForLandings = false, .inUse = false, .certainReuse = Reuse::ResumePoint,
         .reserves = Reserves::NextExtent, .rebuiltPools = true, .storeAboveFloor = false, .passCommand = false,
         .convertLane = 0}},
       {"in service below a lane", rights(below, {.bytes = kMiB}, false, RequestPriority::Foreground),
-       {.waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
+       {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
         .reserves = Reserves::NextExtent, .rebuiltPools = false, .storeAboveFloor = false, .passCommand = true,
         .convertLane = 7}},
       {"in service at critical pressure", rights(everything, {.bytes = kMiB}, true),
-       {.waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
+       {.units = true, .waitsForWrites = true, .waitsForLandings = true, .inUse = true, .certainReuse = Reuse::All,
         .reserves = Reserves::All, .rebuiltPools = true, .storeAboveFloor = true, .passCommand = true,
         .convertLane = 7}},
   };
@@ -893,7 +897,7 @@ void testThePoolsAndWritesEachClaimTakes() {
   require(counted({.cls = ClaimClass::InService}, false, true) == 1 + 64,
           "a need the host refused took a write or the store");
   require(counted({.cls = ClaimClass::Start}) == 1 + 2 + 64, "a start took the store or no write");
-  require(counted({.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate}) == 1 + 64,
+  require(counted({.cls = ClaimClass::Optional, .requestId = 1, .timing = NeedTiming::Immediate}) == 1 + 64,
           "optional work took a write or the store");
   require(counted({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate}) == 1,
           "growth took more than cache that frees now");
@@ -1010,7 +1014,7 @@ void testImmediateSkipsLandings() {
   ledger.addSource(cache);
   ledger.setReturning([] { return Returning{.landingBytes = 4 * kGiB}; },
                       [](std::span<const uint64_t>) { return Returning{}; });
-  const ClaimId claim = ledger.open({.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate});
+  const ClaimId claim = ledger.open({.cls = ClaimClass::Optional, .requestId = 1, .timing = NeedTiming::Immediate});
   require(ledger.free(claim, {.bytes = kGiB}, 0, false).outcome == FreeOutcome::Met &&
               cache.taken == std::vector<uint64_t>{2},
           "an Immediate claim waited or took a unit that lands later");
@@ -1033,7 +1037,7 @@ void testImmediateTakesAWriteThatFreesNowAfterRebuiltPools() {
   ledger.addSource(cache);
   ledger.addPool(vision);
   const auto lacks = [&](uint64_t bytes) {
-    const ClaimId claim = ledger.open({.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate});
+    const ClaimId claim = ledger.open({.cls = ClaimClass::Optional, .requestId = 1, .timing = NeedTiming::Immediate});
     const FreeOutcome outcome = ledger.free(claim, {.bytes = bytes}, 0, false).outcome;
     ledger.close(claim);
     return outcome;
@@ -1370,19 +1374,20 @@ void testTheHostClaimCountsTheIdleBuffersInItsTarget() {
           "the host's claim took " + std::to_string(freed.nowBytes / kMiB) + " MiB for a target of 512 MiB");
 }
 
-// A claim that takes no units (ClaimSpec::takesUnits) takes only what costs nothing and what lands.
+// The engine's own optional work, an Optional claim of no request, takes no unit (TakeRights::units):
+// only what costs nothing and what lands. A request's optional work takes them.
 void testAClaimThatTakesNoUnitsTakesNone() {
   MemoryLedger ledger;
   TestSource cache("cache");
   cache.units = {unit(1, 512 * kMiB), unit(2, 512 * kMiB)};
   ledger.addSource(cache);
-  for (const bool takes : {false, true}) {
-    const ClaimId claim = ledger.open({.cls = ClaimClass::Optional, .takesUnits = takes});
+  for (const uint64_t requestId : {uint64_t{0}, uint64_t{7}}) {
+    const ClaimId claim = ledger.open({.cls = ClaimClass::Optional, .requestId = requestId});
     const FreeOutcome outcome = ledger.free(claim, {.bytes = kGiB}, 0, false).outcome;
     ledger.close(claim);
-    require(takes ? outcome == FreeOutcome::Met && cache.taken.size() == 2
-                  : outcome == FreeOutcome::Short && cache.taken.empty(),
-            "takesUnits did not decide whether the claim took the source's units");
+    require(requestId ? outcome == FreeOutcome::Met && cache.taken.size() == 2
+                      : outcome == FreeOutcome::Short && cache.taken.empty(),
+            "whether the Optional claim was of a request did not decide whether it took the source's units");
   }
 }
 
@@ -1900,7 +1905,7 @@ void testCopiesAheadOnlyAfterDemandReachedUncopiedCache() {
   ledger.addSource(cache);
   ledger.setNow(100.0);
   require(!ledger.copyDemand(), "copies ahead were wanted before any free()");
-  const ClaimId claim = ledger.open({.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate});
+  const ClaimId claim = ledger.open({.cls = ClaimClass::Optional, .requestId = 1, .timing = NeedTiming::Immediate});
   require(ledger.free(claim, {.bytes = kGiB}, 0, false).outcome == FreeOutcome::Met &&
               cache.taken == std::vector<uint64_t>{2},
           "the Immediate claim did not skip the uncopied unit");

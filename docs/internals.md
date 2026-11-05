@@ -1317,14 +1317,18 @@ every source of units reads (`MemoryLedger::Order`, `Cache::walkFor`):
 | `InService`, can wait | yes | yes | yes | yes | yes | yes | yes | where it reaches them |
 | `InService`, immediate | yes | no | yes | no | no | yes | yes | no |
 | `Start` | yes | yes | yes | no | no | yes | no | no |
-| `Optional` | yes | no | yes | no | no | yes | no | no |
+| `Optional` of a request | yes | no | yes | no | no | yes | no | no |
+| `Optional` of the engine's own, of no request | no | no | no | no | no | no | no | no |
 | `Growth` | yes | no | no | no | no | no | no | no |
 | `Host` with a deficit | yes | yes | yes | no | no | no | no | no |
 | `Host` under critical pressure | yes | no | yes | no | yes | yes | yes | yes |
 | A need the host refused | in place | no | yes | no | no | as its class | as its class | no |
 
-The pass command goes only to work that supersedes it, a conversion only to
-its own lane's KV growth. A claim below the priority of a lane in service
+The engine's own optional work (the Index runway's refill with no Spill lane
+in service, trims with no lane in service) takes no unit at all
+(`TakeRights::units`): only the idle state buffers and what lands. The pass
+command goes only to work that supersedes it, a conversion only to its own
+lane's KV growth. A claim below the priority of a lane in service
 takes no pool's units, rebuilt or above a floor. A `Floor` claim, the start's
 or a weights restore's, takes nothing: it is a class of the host's rule only
 (`MemoryGovernor::HostRule::admits`).

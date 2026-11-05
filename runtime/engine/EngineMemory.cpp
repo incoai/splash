@@ -404,7 +404,6 @@ void Engine::spillLanded(bool controlPass) {
                              {.cls = needed ? ClaimClass::InService : ClaimClass::Optional,
                               .rank = needed ? rankOf(*needed) : ClaimRank{},
                               .timing = NeedTiming::Immediate,
-                              .takesUnits = needed != nullptr,
                               .priority = needed ? needed->request.priority : RequestPriority::Foreground}));
 }
 

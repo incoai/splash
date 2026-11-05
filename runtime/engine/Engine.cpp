@@ -1505,8 +1505,7 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
     claim.governor = &governor();
     claim.id = governor().ledger().open(
         {.cls = inService ? ClaimClass::InService : ClaimClass::Optional,
-         .timing = NeedTiming::Immediate,
-         .takesUnits = inService});
+         .timing = NeedTiming::Immediate});
     const MemoryGovernor::Scope scope(governor(), claim.id);
     static_cast<void>(cache_.trimWindows());
     for (Need need = governor().need(claim.id); need.bytes; need = governor().need(claim.id)) {

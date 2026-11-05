@@ -160,8 +160,11 @@ public:
   // at most that state's write and is one state; a state that frees only
   // once a write lands gives nothing when taken.
   void checkTake() {
-    const ClaimSpec claim{.cls = std::array{ClaimClass::InService, ClaimClass::Start, ClaimClass::Optional,
-                                            ClaimClass::Growth, ClaimClass::Host}[pick(0, 4)],
+    const ClaimClass cls = std::array{ClaimClass::InService, ClaimClass::Start, ClaimClass::Optional,
+                                      ClaimClass::Growth, ClaimClass::Host}[pick(0, 4)];
+    // A request's claim, but the host's.
+    const ClaimSpec claim{.cls = cls,
+                          .requestId = cls == ClaimClass::Host ? 0u : 1u,
                           .reach = chance(50) ? ReclaimClass::InUse : ReclaimClass::Ordinary,
                           .timing = chance(50) ? NeedTiming::Immediate : NeedTiming::CanWait};
     const kv::PageForm form = !chance(50) ? kv::PageForm::Full : windowed_ ? kv::PageForm::Slim : kv::PageForm::Index;

@@ -1267,7 +1267,7 @@ void testCertainReuseByClass() {
     bool keepsResumePoint;
   };
   for (const Case each : {Case{{.cls = ClaimClass::Start}, true, true, false},
-                          Case{{.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate}, true, true, false},
+                          Case{{.cls = ClaimClass::Optional, .requestId = 1, .timing = NeedTiming::Immediate}, true, true, false},
                           Case{{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate}, false, true, true},
                           Case{{.cls = ClaimClass::InService}, true, false, true}}) {
     Prefixes prefixes;
@@ -4174,7 +4174,7 @@ void testAPageNeedOfAFormTheCacheHoldsNoneOfCountsNothing() {
   }
   require(spill.pool.reclaimEmptyExtents(false, 1, kv::PageForm::Index) && !spill.pool.allocatedExtents(kv::PageForm::Index),
           "the Index runway stayed");
-  const ClaimSpec refill{.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate, .takesUnits = false};
+  const ClaimSpec refill{.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate};
   const VictimQuery query =
       test::query(refill, {.bytes = 40, .hostRefused = true, .pages = 4, .form = kv::PageForm::Index});
   uint32_t evictions = 0;
@@ -6034,7 +6034,7 @@ void testImmediateDeviceWalkPassesOverWhatAWriteFrees() {
   for (uint64_t id = 2; id <= 5; ++id)
     static_cast<void>(cachePrompt(id, 4));
   static_cast<void>(cache.releaseEmptyExtents(false));
-  const ClaimSpec claim{.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate};
+  const ClaimSpec claim{.cls = ClaimClass::Optional, .requestId = 1, .timing = NeedTiming::Immediate};
   const uint64_t allocated = pool.allocatedBytes();
   require(test::freeFromCache(cache, claim, {.bytes = 2 * 4 * 100}).outcome == FreeOutcome::Met,
           "an Immediate claim did not take the leaves after the checkpoint");

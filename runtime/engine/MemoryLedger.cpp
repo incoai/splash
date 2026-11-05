@@ -55,7 +55,8 @@ TakeRights takeRights(const ClaimSpec &spec, const Need &need, bool critical,
   const bool hostCritical = host && critical;
   const bool waits = (host ? !critical : spec.timing == NeedTiming::CanWait) && !need.hostRefused;
   const bool belowALane = highestLane && *highestLane < spec.priority;
-  return {.waitsForWrites = waits,
+  return {.units = spec.cls != ClaimClass::Optional || spec.requestId != 0,
+          .waitsForWrites = waits,
           .waitsForLandings = waits && !host,
           .inUse = (inService && waits && spec.reach == ReclaimClass::InUse) || hostCritical,
           .certainReuse = inService || hostCritical ? Reuse::All
@@ -413,7 +414,7 @@ uint64_t MemoryLedger::pooledBytes(const VictimQuery &query, const Lacking &lack
 // the model's pool would release with them beyond what it releases now
 // (pooledBytes). A unit that meets none of the need, or that lands later
 // for an Immediate claim, is skipped.
-MemoryLedger::Run MemoryLedger::bound(const ClaimSpec &spec, const VictimQuery &query, const Lacking &lack) const {
+MemoryLedger::Run MemoryLedger::bound(const VictimQuery &query, const Lacking &lack) const {
   Order order(*this, query);
   Run run;
   const uint64_t pooledBefore = pooledBytes(query, lack, 0);
@@ -437,7 +438,7 @@ MemoryLedger::Run MemoryLedger::bound(const ClaimSpec &spec, const VictimQuery &
       order.pass(*best);
       continue;
     }
-    if (!spec.takesUnits)
+    if (!query.rights.units)
       break;
     unitBytes = plus(unitBytes, victim.bytes);
     if (victim.form == lack.form)
@@ -621,7 +622,7 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
                        .pages = static_cast<uint32_t>(less(lackingPages, creditPages)),
                        .form = need.form,
                        .buffers = need.stateBuffers};
-    const Run most = bound(spec, query, lack);
+    const Run most = bound(query, lack);
     if (most.uncopied)
       uncopiedReachedSeconds_ = nowSeconds_;
     if (most.covered) {
@@ -720,7 +721,7 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, const Need &need, uint64
   if (less(room, held) >= enough)
     return enough;
   const Lacking lack{.bytes = less(plus(enough, held), room)};
-  const uint64_t taken = bound(spec, query, lack).bytes;
+  const uint64_t taken = bound(query, lack).bytes;
   return std::min(enough, less(plus(room, taken), held));
 }
 
@@ -768,7 +769,7 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
       if (lacking) {
         const VictimQuery query{.rights = takeRights(spec, {.bytes = unit}, false, lanePriority_),
                                 .need = {.bytes = unit}};
-        const Run run = bound(spec, query, {.bytes = lacking});
+        const Run run = bound(query, {.bytes = lacking});
         if (run.uncopied)
           uncopiedReachedSeconds_ = nowSeconds_;
         grown = run.covered;

@@ -1179,7 +1179,7 @@ void testCopiesAheadForRegrowthStayWithinAUnit() {
     // An Immediate claim reached uncopied cache: copies ahead pay
     // (MemoryLedger::copyDemand), the lanes asking for none.
     MemoryLedger &ledger = host.governor.ledger();
-    const ClaimId reached = ledger.open({.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate});
+    const ClaimId reached = ledger.open({.cls = ClaimClass::Optional, .requestId = 1, .timing = NeedTiming::Immediate});
     static_cast<void>(ledger.free(reached, {.pages = 1}, 0, false));
     ledger.close(reached);
     require(host.governor.copyDemand() && !tier.demotions, "no claim reached uncopied cache");

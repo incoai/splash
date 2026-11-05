@@ -82,9 +82,6 @@ struct ClaimSpec final {
   // Its own lane's KV growth (Engine::growLane): the one claim that may
   // convert its lane to Spill.
   bool kvGrowth = false;
-  // false: it takes only the units that cost nothing (the idle buffers) and
-  // what lands, for memory its work can go without.
-  bool takesUnits = true;
   // The tier that decides what it may take from lanes: no pool unit while a
   // lane of a higher priority is in service (pools serve every lane); the
   // rank still orders held room. A claim of no lane (the host, a pool's
@@ -178,8 +175,8 @@ struct Victim final {
 
 // What a claim may take, derived once from its class and need (takeRights)
 // and read by every source and stage of the take. Each default is the
-// narrowest: TakeRights{} takes only the units that free now and cost
-// nothing.
+// narrowest: TakeRights{} takes only what costs nothing (the idle buffers)
+// and what lands.
 struct TakeRights final {
   // The units of certain reuse: none, the newest resume point, or that and
   // the chains queued requests restore.
@@ -188,6 +185,7 @@ struct TakeRights final {
   // extent the next request takes, or also the Index runway and the idle
   // buffers one lane starts from.
   enum class Reserves : uint8_t { None, NextExtent, All };
+  bool units = false;             // the sources' and pools' units at all: those that free now, and more below
   bool waitsForWrites = false;    // takes cache that frees only once its write lands
   bool waitsForLandings = false;  // waits for memory transfers return: the engine's limit refused it
   bool inUse = false;             // units other requests use
@@ -215,7 +213,10 @@ struct TakeRights final {
 // of; at critical pressure it is Immediate but takes the store, certain
 // reuse and units in use. No pool unit for a claim below a lane in service,
 // since the pools serve every lane, and none for a pool's growth. A Floor
-// claim takes nothing (logic_error).
+// claim takes nothing (logic_error). The engine's own optional work, an
+// Optional claim of no request (the Index runway's refill with no Spill lane
+// in service, trims with no lane in service), takes no unit: only what costs
+// nothing and what lands, for memory it can go without.
 [[nodiscard]] TakeRights takeRights(const ClaimSpec &spec, const Need &need, bool critical,
                                     std::optional<RequestPriority> highestLane);
 
@@ -444,7 +445,7 @@ private:
   [[nodiscard]] uint64_t pooledBytes(const VictimQuery &query, const Lacking &lack, uint32_t states) const;
   // The most the units the claim's rights take give it, counted in the
   // one order without taking any, up to the lack.
-  [[nodiscard]] Run bound(const ClaimSpec &spec, const VictimQuery &query, const Lacking &lack) const;
+  [[nodiscard]] Run bound(const VictimQuery &query, const Lacking &lack) const;
   // Takes those units in that order, one at a time, until what they freed
   // now and later covers the lack, or none is left.
   [[nodiscard]] Run take(const VictimQuery &query, const Lacking &lack);
