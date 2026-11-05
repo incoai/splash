@@ -672,18 +672,18 @@ public:
   // trims first. A state need's units are its states, one each.
   //
   // peek() changes nothing: a phase's unit counts at most what its reclaims
-  // free (reach), from the pool's extent and page counts, and none is given
-  // once that is nothing. take() makes one reclaim of the unit's phase and
-  // reports what it freed: the bytes of the extents released now, and those
-  // it adds to the extents the landing pages complete beside the free ones
-  // (laterBytes, landingFill), less any of them a release took; the pages
-  // of the need's form free now, or for a claim that can wait landing; and
-  // the state buffers it gave up. A device need's reclaim that demotes a
-  // leaf starts the demotions of its chain above it, child before parent,
-  // while the tier and the quota have room (a waiting claim's chain lands in
-  // about ceil(pages/64) ticks rather than one tick a page). Pending when it
-  // took nothing and a transfer in flight holds what the walk needs, Short
-  // when nothing goes.
+  // free (reach), from the pool's extent and page counts, what frees now up
+  // to the query's enough, and none is given once that is nothing. take()
+  // makes one reclaim of the unit's phase and reports what it freed: the
+  // bytes of the extents released now, and those it adds to the extents the
+  // landing pages complete beside the free ones (laterBytes, landingFill),
+  // less any of them a release took; the pages of the need's form free now,
+  // or for a claim that can wait landing; and the state buffers it gave up.
+  // A device need's reclaim that demotes a leaf starts the demotions of its
+  // chain above it, child before parent, while the tier and the quota have
+  // room (a waiting claim's chain lands in about ceil(pages/64) ticks rather
+  // than one tick a page). Pending when it took nothing and a transfer in
+  // flight holds what the walk needs, Short when nothing goes.
   [[nodiscard]] std::string_view name() const noexcept override { return "cache"; }
   [[nodiscard]] std::optional<engine::Victim> peek(const VictimQuery &query,
                                                    const engine::Victim *after) const override;
@@ -1002,14 +1002,16 @@ private:
   // At most what a walk's reclaims of a class free, from counts: of each
   // form, the whole extents of the pages within the class's reach, but the
   // idle pages of the chains it keeps, the free pages a KV need takes and
-  // the runway it keeps, as compaction gathers what stays; now, all but the
-  // pages transfers move and the chains of what frees only later (a state
-  // or a block that leaves only once written, a block a transfer moves);
-  // later the rest, but the extents the landing pages complete beside the
-  // free ones (landingExtents), which the ledger counts as landing. A page
-  // walk that trims also frees the Full pages it moves into Slim ones.
-  // States: the RAM copies the walk takes, later those that leave only once
-  // written.
+  // the runway it keeps, as compaction gathers what stays; now, the free
+  // pages and those nothing keeps or lets go only later
+  // (KvCache::pagesFreeingNow: a state or a block that leaves only once
+  // written, a block a transfer moves, and their chains); later the rest,
+  // but the extents the landing pages complete beside the free ones
+  // (landingExtents), which the ledger counts as landing. A page walk that
+  // trims also frees the Full pages it moves into Slim ones. States: the
+  // RAM copies the walk takes, later those that leave only once written.
+  // With `enough`, the pages that free now are counted from the oldest
+  // leaves until `enough` says the amount counted so far suffices.
   struct ReclaimReach final {
     struct Amount final {
       uint64_t bytes = 0;
@@ -1019,11 +1021,14 @@ private:
     Amount now;
     Amount later;
   };
-  [[nodiscard]] ReclaimReach reach(const Walk &walk, ReclaimClass upTo) const;
+  [[nodiscard]] ReclaimReach reach(const Walk &walk, ReclaimClass upTo,
+                                   const std::function<bool(const ReclaimReach &)> &enough) const;
   // The walk of a phase: of its class, Immediate for what frees now.
   [[nodiscard]] Walk phaseWalk(const Walk &walk, ReclaimPhase phase) const;
-  // peek()'s unit of a phase: reach's amount of it, none when nothing.
-  [[nodiscard]] std::optional<engine::Victim> reclaimUnit(const Walk &walk, ReclaimPhase phase) const;
+  // peek()'s unit of a phase: reach's amount of it, none when nothing; what
+  // frees now counted up to `enough` (VictimQuery::enough).
+  [[nodiscard]] std::optional<engine::Victim> reclaimUnit(const Walk &walk, ReclaimPhase phase,
+                                                          const VictimQuery::Enough &enough) const;
   // Starts the demotions of the blocks above each demotion from writes_
   // [firstWrite] on whose page frees as it lands, child before parent,
   // those that then free their pages as they land too (freesOnLanding), of

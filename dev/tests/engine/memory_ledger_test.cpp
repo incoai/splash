@@ -53,6 +53,7 @@ public:
   // only for a claim whose rights take them.
   [[nodiscard]] std::optional<Victim> peek(const VictimQuery &query, const Victim *after) const override {
     ++peeks;
+    peeked.push_back({after ? after->key : 0, query.enough.bytes});
     const auto takes = [&](const Victim &unit) {
       switch (unit.kind) {
       case VictimKind::Memory: return unit.cls != ReclaimClass::InUse || query.rights.inUse;
@@ -66,7 +67,12 @@ public:
       unit = std::next(std::ranges::find(units, after->key, &Victim::key));
     while (unit != units.end() && !takes(*unit))
       ++unit;
-    return unit == units.end() ? std::nullopt : std::optional<Victim>(*unit);
+    if (unit == units.end())
+      return std::nullopt;
+    Victim counted = *unit;
+    if (countsUpToEnough && query.enough.bytes)
+      counted.bytes = std::min(counted.bytes, query.enough.bytes);
+    return counted;
   }
   // A unit goes whole: its pages of the need's form and its state buffers.
   FreeResult take(const VictimQuery &query, const Victim &victim) override {
@@ -108,7 +114,17 @@ public:
   std::vector<Victim> landing;
   uint64_t unsizedBytes = 0;
   bool landsIntoExtents = false;
+  // Its units' bytes are counted up to the query's enough, as the cache
+  // counts what its reclaims free.
+  bool countsUpToEnough = false;
   mutable uint32_t peeks = 0;
+  // Each peek: the key it asked after (0 for the head) and the bytes it
+  // counted up to (VictimQuery::enough).
+  struct Peek final {
+    uint64_t after = 0;
+    uint64_t enoughBytes = 0;
+  };
+  mutable std::vector<Peek> peeked;
 
 private:
   std::string name_;
@@ -1338,6 +1354,29 @@ void testAvailableTakesNothing() {
   require(cache.taken.empty() && pool.units() == 3 && pool.shrinks == 0, "available() took something");
 }
 
+// free() and available() count each unit up to what the claim needs or lacks, and peek no unit past the one that
+// covers the lack: a count costs what the claim takes, not the cache behind it.
+void testCountsStopAtTheLack() {
+  MemoryLedger ledger;
+  TestSource cache("cache");
+  cache.units = {unit(1, 2 * kGiB), unit(2, kGiB)};
+  ledger.addSource(cache);
+  const auto countedUpTo = [&](uint64_t need) {
+    return std::ranges::all_of(cache.peeked, [&](const TestSource::Peek &peek) {
+      return peek.after != 1 && peek.enoughBytes && peek.enoughBytes <= need;
+    });
+  };
+  const ClaimSpec spec = request(1, RequestPriority::Normal);
+  require(ledger.available(spec, {.bytes = kGiB}, 256 * kMiB, false) == kGiB && countedUpTo(kGiB),
+          "available() counted past what the claim lacks");
+  cache.peeked.clear();
+  const ClaimId claim = ledger.open(spec);
+  require(ledger.free(claim, {.bytes = kGiB}, 256 * kMiB, false).outcome == FreeOutcome::Met &&
+              cache.taken == std::vector<uint64_t>{1} && countedUpTo(kGiB),
+          "free() counted past what the claim lacks");
+  ledger.close(claim);
+}
+
 // available() counts what free() would take, taking nothing: what lands and what the claim's request owes count for
 // a claim that can wait, not for an Immediate one.
 void testAvailableCountsWhatLandsForAClaimThatCanWait() {
@@ -2099,6 +2138,23 @@ void testWarningRegrowsOnlyWhatTheCacheFunds() {
   }
 }
 
+// Under macOS's warning a unit the cache funds whole regrows though the room lacks less than the unit: the cache
+// counts what it frees up to the whole unit, which the host judges, not only up to what the room lacks.
+void testWarningRegrowsAUnitTheCacheFundsBeyondTheLack() {
+  Fixture fixture(host(8 * kGiB + 7 * kGiB, MemoryPressure::Warning), 7 * kGiB + 512 * kMiB);
+  FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 3, 4, 2);
+  fixture.memory.hold("weights", 3 * kGiB);
+  fixture.memory.hold("cache", 2 * kGiB);
+  TestSource cache("cache", &fixture.memory);
+  cache.units = {unit(1, 2 * kGiB)};
+  cache.countsUpToEnough = true;
+  fixture.ledger().addPool(experts);
+  fixture.ledger().addSource(cache);
+  static_cast<void>(fixture.pass(kRegrowQuietSeconds + 1.0));
+  require(experts.units() == 3 && cache.taken == std::vector<uint64_t>{1},
+          "a unit the cache funds whole did not regrow under a warning when the room lacked less than the unit");
+}
+
 // A bytes need beside buffers no state can give is met by the bytes of the states it evicts, which leave the
 // model's pool; its decision says it lacks such a buffer, not a count of them.
 void testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes() {
@@ -2193,6 +2249,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testTheHostClaimCountsTheIdleBuffersInItsTarget", testTheHostClaimCountsTheIdleBuffersInItsTarget},
       {"testAClaimThatTakesNoUnitsTakesNone", testAClaimThatTakesNoUnitsTakesNone},
       {"testAvailableTakesNothing", testAvailableTakesNothing},
+      {"testCountsStopAtTheLack", testCountsStopAtTheLack},
       {"testAvailableCountsWhatLandsForAClaimThatCanWait", testAvailableCountsWhatLandsForAClaimThatCanWait},
       {"testGrowthRetakesFreeRoomBeyondLaneDemand", testGrowthRetakesFreeRoomBeyondLaneDemand},
       {"testGrowthTakesIdleCacheAfterABurst", testGrowthTakesIdleCacheAfterABurst},
@@ -2227,6 +2284,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testGrowthLeavesTheHostWhatTheLanesGrowInto", testGrowthLeavesTheHostWhatTheLanesGrowInto},
       {"testRequestsMetFromCacheLeaveRegrowthQuiet", testRequestsMetFromCacheLeaveRegrowthQuiet},
       {"testWarningRegrowsOnlyWhatTheCacheFunds", testWarningRegrowsOnlyWhatTheCacheFunds},
+      {"testWarningRegrowsAUnitTheCacheFundsBeyondTheLack", testWarningRegrowsAUnitTheCacheFundsBeyondTheLack},
       {"testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes",
        testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes},
       {"testABufferNoStateHoldsReachesNoCachedState", testABufferNoStateHoldsReachesNoCachedState},

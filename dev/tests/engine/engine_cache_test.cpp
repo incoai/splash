@@ -3010,6 +3010,18 @@ struct ExtentFixture {
   }
 };
 
+// What frees now is counted from the oldest leaf until it reaches the
+// query's enough, not over the whole cache.
+void testWhatFreesNowIsCountedUpToEnough() {
+  CacheFixture fixture;
+  VictimQuery query = test::query(test::kInServiceGrowth, {.pages = 1});
+  const std::optional<engine::Victim> whole = fixture.cache.peek(query, nullptr);
+  query.enough = {.pages = 1};
+  const std::optional<engine::Victim> counted = fixture.cache.peek(query, nullptr);
+  require(whole && counted && whole->pages == 4 && counted->pages == 1 && !counted->later,
+          "the walk counted what frees now past enough");
+}
+
 // A reclaim that releases extents releases an empty extent, then compacts scattered free pages,
 // before it evicts anything.
 void testCompactionReturnsFreePagesBeforeEvicting() {
@@ -6259,6 +6271,7 @@ int main() {
     testDuplicateProbePromotesStateWithoutLookupAccounting();
     testUnifiedRecencyAndReleasedByteAccounting();
     testFinishedRequestLeavesTailKvBeforeItsState();
+    testWhatFreesNowIsCountedUpToEnough();
     testCompactionReturnsFreePagesBeforeEvicting();
     testCompactionFollowsOnlyTheMovedBlocks();
     testCompactionLeavesTheRunway();

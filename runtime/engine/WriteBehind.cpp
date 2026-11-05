@@ -45,14 +45,18 @@ bool WriteBehind::copying() const noexcept { return cache_.persistent() || deman
 bool WriteBehind::demanded(uint64_t demandBytes) const {
   // At most what the cache gives a claim that cannot wait now, which starts
   // no write and waits for none, and what the copies ahead in flight let go
-  // once they land.
-  const VictimQuery query{.need = {.bytes = demandBytes}};
+  // once they land, each unit counted up to what is left of the demand.
   uint64_t covered = cache_.copyingAheadBytes();
-  for (std::optional<Victim> unit = cache_.peek(query, nullptr); unit && covered < demandBytes;
-       unit = cache_.peek(query, &*unit))
+  if (covered >= demandBytes)
+    return false;
+  const VictimQuery query{.need = {.bytes = demandBytes}, .enough = {.bytes = demandBytes - covered}};
+  for (std::optional<Victim> unit = cache_.peek(query, nullptr); unit; unit = cache_.peek(query, &*unit)) {
     if (!unit->later)
       covered += unit->bytes;
-  return covered < demandBytes;
+    if (covered >= demandBytes)
+      return false;
+  }
+  return true;
 }
 
 bool WriteBehind::inUse(uint64_t block) const noexcept {

@@ -214,13 +214,19 @@ public:
   // moves; each counts once. A request holds every page of its chain, so a
   // chain's count stops at the first page one holds.
   [[nodiscard]] std::array<uint32_t, 3> idlePagesOnChains(std::span<const uint64_t> blocks) const;
-  // The resident blocks whose page frees only later: one a transfer moves,
-  // and with `unwritten` one without a copy that a state at it or below it
-  // needs, which a writable tier writes before its page frees; the states
-  // at `dropped`, which leave with no copy, need none.
-  [[nodiscard]] std::vector<uint64_t> laterBlocks(bool unwritten, std::span<const uint64_t> dropped) const;
-  // The resident pages of each form a transfer moves that no request holds.
-  [[nodiscard]] std::array<uint32_t, 3> movingPages() const;
+  // The resident pages of each form that free now: nothing at the block or
+  // below it keeps the chain or lets it go only later (the `holding`
+  // states, kept or leaving only once written; a block in transfer; with
+  // `unwritten` a block without a copy that a state at it or below it
+  // needs, but for the `dropped` states, which leave with no copy), and no
+  // request uses the block or holds a page at it or below it, since no
+  // reclaim reaches such a page. Counted from the oldest resident leaf up, a
+  // block once every resident block below it is, until `enough` says the
+  // pages counted suffice: a count costs the leaves and the pages it
+  // reaches, not every block.
+  [[nodiscard]] std::array<uint32_t, 3>
+  pagesFreeingNow(std::span<const uint64_t> holding, std::span<const uint64_t> dropped, bool unwritten,
+                  const std::function<bool(const std::array<uint32_t, 3> &)> &enough) const;
   // Resident, without resident children, users or holders: its page can go
   // once no transfer moves it.
   [[nodiscard]] bool residentLeaf(uint64_t blockId) const;

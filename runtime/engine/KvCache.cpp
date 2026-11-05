@@ -455,30 +455,58 @@ std::array<uint32_t, 3> KvCache::idlePagesOnChains(std::span<const uint64_t> blo
   return pages;
 }
 
-std::vector<uint64_t> KvCache::laterBlocks(bool unwritten, std::span<const uint64_t> dropped) const {
-  // The dropped states at each block or below it.
-  std::unordered_map<uint64_t, uint32_t> leaving;
-  if (unwritten)
-    for (const uint64_t state : dropped)
-      for (uint64_t id = state; id; id = block(id).parent)
-        ++leaving[id];
-  std::vector<uint64_t> blocks;
-  for (const auto &[id, entry] : blocks_) {
-    if (entry.page == noPage)
-      continue;
-    const auto gone = leaving.find(id);
-    const uint32_t staying = entry.statesHere + entry.statesBelow - (gone == leaving.end() ? 0 : gone->second);
-    if (entry.transfer != Transfer::None || (unwritten && !entry.slot && staying))
-      blocks.push_back(id);
-  }
-  return blocks;
-}
-
-std::array<uint32_t, 3> KvCache::movingPages() const {
+std::array<uint32_t, 3>
+KvCache::pagesFreeingNow(std::span<const uint64_t> holding, std::span<const uint64_t> dropped, bool unwritten,
+                         const std::function<bool(const std::array<uint32_t, 3> &)> &enough) const {
+  // A state on a disk-only block restores through the first resident block
+  // above it.
+  const auto resident = [&](uint64_t id) {
+    while (id && block(id).page == noPage)
+      id = block(id).parent;
+    return id;
+  };
+  std::unordered_set<uint64_t> holds;
+  for (const uint64_t state : holding)
+    holds.insert(resident(state));
+  // Of each block the count reached: its resident children not counted yet,
+  // and the dropped states at it or below it.
+  struct Reached final {
+    uint32_t left = 0;
+    uint32_t dropped = 0;
+    bool started = false;
+  };
+  std::unordered_map<uint64_t, Reached> reached;
+  for (const uint64_t state : dropped)
+    if (const uint64_t id = resident(state))
+      ++reached[id].dropped;
   std::array<uint32_t, 3> pages{};
-  for (const auto &[_, entry] : blocks_)
-    if (entry.page != noPage && entry.transfer != Transfer::None && !pool_.pageActive(entry.page))
+  if (enough && enough(pages))
+    return pages;
+  for (std::optional<CacheEvictionCandidate> leaf = ramLeaves_.oldest(); leaf; leaf = ramLeaves_.next(*leaf)) {
+    for (uint64_t id = leaf->id;;) {
+      const Block &entry = block(id);
+      const auto found = reached.find(id);
+      const uint32_t droppedBelow = found == reached.end() ? 0 : found->second.dropped;
+      const bool needed = entry.statesHere + entry.statesBelow > droppedBelow;
+      if (entry.activeUsers || pool_.pageActive(entry.page) || entry.transfer != Transfer::None ||
+          holds.contains(id) || (unwritten && !entry.slot && needed))
+        break;
       ++pages[static_cast<size_t>(entry.form)];
+      if (enough && enough(pages))
+        return pages;
+      if (!entry.parent)
+        break;
+      Reached &parent = reached[entry.parent];
+      if (!parent.started) {
+        parent.left = block(entry.parent).residentChildren;
+        parent.started = true;
+      }
+      parent.dropped += droppedBelow;
+      if (--parent.left)
+        break;
+      id = entry.parent;
+    }
+  }
   return pages;
 }
 

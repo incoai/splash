@@ -74,7 +74,8 @@ public:
   // With usedStates, a request uses the state it resumes from, as the
   // engine's requests do (Cache::useState).
   Run(uint32_t seed, bool windowed, bool peeks = false, bool usedStates = false)
-      : random_(seed), windowed_(windowed), peeks_(peeks), usedStates_(usedStates), tier_(chance(50)),
+      : random_(seed), enoughRandom_(seed), windowed_(windowed), peeks_(peeks), usedStates_(usedStates),
+        tier_(chance(50)),
         budget_(std::make_shared<model::DiskBudget>(kSlots * 100)),
         cache_(pool_, &tier_, budget_,
                windowed ? std::nullopt : std::optional(CacheSpillPolicy{pick(0, 2), pick(1, 2)}),
@@ -184,6 +185,7 @@ public:
       cache_.setWantedChains({wanted});
     }
     const bool wantedResident = !wanted.empty() && cache_.stateResident(wanted.back());
+    checkCountUpTo(query);
     // Each unit, with the one before it in the cache's order.
     std::vector<std::pair<std::optional<engine::Victim>, engine::Victim>> units;
     uint64_t counted = 0;
@@ -244,6 +246,39 @@ public:
                 std::to_string(countedPages) + " pages, freed " + std::to_string(freed) + " bytes (" +
                 std::to_string(releasedNow) + " now) and " +
                 std::to_string(freedPages) + " pages (" + std::to_string(reportedPages) + " reported)");
+  }
+
+  // Counted up to a random enough (VictimQuery::enough), the walk gives the
+  // same units as counted whole, none of them more: below enough in every
+  // measure the whole unit, else at least enough in a measure enough has
+  // and the whole unit reaches.
+  void checkCountUpTo(const VictimQuery &whole) {
+    const auto pick = [&](uint32_t first, uint32_t last) {
+      return std::uniform_int_distribution<uint32_t>(first, last)(enoughRandom_);
+    };
+    const auto chance = [&](uint32_t percent) { return pick(1, 100) <= percent; };
+    VictimQuery query = whole;
+    query.enough = {.bytes = chance(50) ? pick(1, 8) * 400ull : 0,
+                    .pages = chance(50) ? pick(1, 8) : 0,
+                    .form = whole.need.form,
+                    .stateBuffers = chance(30) ? 1u : 0u};
+    const auto covers = [&](const engine::Victim &unit) {
+      return query.enough.reached(unit.bytes, unit.pages, unit.form, unit.stateBuffers);
+    };
+    std::optional<engine::Victim> all = cache_.peek(whole, nullptr);
+    std::optional<engine::Victim> counted = cache_.peek(query, nullptr);
+    for (; all || counted; all = cache_.peek(whole, &*all), counted = cache_.peek(query, &*counted)) {
+      require(all && counted && all->key == counted->key && all->later == counted->later,
+              "a walk counted up to enough gave other units than counted whole");
+      const bool same = all->bytes == counted->bytes && all->pages == counted->pages &&
+                        all->stateBuffers == counted->stateBuffers;
+      require(counted->bytes <= all->bytes && counted->pages <= all->pages &&
+                  counted->stateBuffers <= all->stateBuffers && (covers(*all) ? covers(*counted) : same),
+              "a unit counted up to enough gave " + std::to_string(counted->bytes) + " bytes, " +
+                  std::to_string(counted->pages) + " pages and " + std::to_string(counted->stateBuffers) +
+                  " states, counted whole " + std::to_string(all->bytes) + ", " + std::to_string(all->pages) +
+                  " and " + std::to_string(all->stateBuffers));
+    }
   }
 
 private:
@@ -441,6 +476,9 @@ private:
   }
 
   std::mt19937 random_;
+  // checkCountUpTo's own, so that a run's claims and takes follow the same
+  // paths with the check as without it.
+  std::mt19937 enoughRandom_;
   bool windowed_;
   bool peeks_;
   bool usedStates_;
@@ -483,8 +521,8 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
             << " windowed and windowed seed 9454\n";
 }
 
-// The same runs with random claims counted and taken (checkTake), again with requests using the
-// states they resume from.
+// The same runs with random claims counted, whole and up to a random enough (checkCountUpTo), and
+// taken (checkTake), again with requests using the states they resume from.
 void testTakeNeverExceedsPeek(uint32_t plainSeeds, uint32_t windowedSeeds) {
   uint64_t steps = 0;
   const auto check = [&](uint32_t seed, bool windowed, bool usedStates) {
