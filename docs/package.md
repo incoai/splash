@@ -3,12 +3,12 @@
 Release archives contain no Hugging Face credentials.
 Users accessing private models supply their own `HF_TOKEN` or Hugging Face login.
 
-Release versions are three-part, `x.y.z`, with no `v` prefix: after `1.2.1`
-comes `1.2.2` for a fix or `1.3.0` for a feature. Use the same version in all
+Release versions are three-part, `x.y.z`, with no `v` prefix: after `1.5.0`
+comes `1.5.1` for a fix or `1.6.0` for a feature. Use the same version in all
 three commands:
 
 ```sh
-VERSION=1.2.2  # the release being built
+VERSION=1.6.0  # the release being built
 make package RELEASE_VERSION=$VERSION
 make package-bottle RELEASE_VERSION=$VERSION
 make package-check RELEASE_VERSION=$VERSION
@@ -167,20 +167,22 @@ prerelease, never the latest.
 A release is made from its annotated tag, on the Mac that holds the Developer
 ID and the release key, once `make package` and `make package-bottle`
 ([package](#package)) have left the command line's files of its version in
-`dist/`, and published by hand:
+`dist/`, and published by hand. Its notes are `docs/release-notes/<version>.md`,
+committed before the tag; [1.6.0's](release-notes/1.6.0.md) are the first kept
+there, and earlier releases' are only on their GitHub releases:
 
 ```sh
 git tag -a $VERSION -m $VERSION    # on the release commit
 make release-app RELEASE_VERSION=$VERSION \
-    RELEASE_NOTES=$HOME/splash-releases/$VERSION.md \
+    RELEASE_NOTES=docs/release-notes/$VERSION.md \
     SIGN_IDENTITY="Developer ID Application: NAME (TEAMID)" \
     NOTARY_PROFILE=splash-notary
 ```
 
 `make release-app` (`dev/tools/release_app.py`) first lists what keeps the
 release from being whole, and stops on any of it: a change in the checkout,
-untracked files included, which is why the notes live outside it; a HEAD that
-is not the tag's commit, as the app shows the tag's `x.y.z`; an identity no
+untracked files included, which is why the notes are committed first; a HEAD
+that is not the tag's commit, as the app shows the tag's `x.y.z`; an identity no
 keychain holds; no notary credentials; an empty `SPARKLE_PUBLIC_KEY`; a
 `dist/release/<version>` already made; and, unless it is a release candidate,
 `x.y.z-rc.N`, which carries the app alone, a `dist/` without the version's
