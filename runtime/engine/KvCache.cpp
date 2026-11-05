@@ -683,8 +683,7 @@ KvCache::PageReach KvCache::countReach(Keeps mask, std::span<const uint64_t> kep
   // to one something busy holds already. Each block counts out once.
   std::unordered_set<uint64_t> passed, outOfReach, outOfNow;
   const auto cut = [&](uint64_t id, bool keptChain) {
-    std::unordered_set<uint64_t> visited;
-    for (; id && visited.insert(id).second;) {
+    while (id) {
       ++reachVisits_;
       passed.insert(id);
       const Block &entry = block(id);

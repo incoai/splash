@@ -1125,8 +1125,12 @@ private:
   // The walk of a phase: of its class; Immediate but for what frees as
   // writes land; no write for what frees with none.
   [[nodiscard]] Walk phaseWalk(const Walk &walk, ReclaimPhase phase) const;
-  // peek()'s unit of a phase: reach's amount of it, none when nothing.
-  [[nodiscard]] std::optional<engine::Victim> reclaimUnit(const Walk &walk, ReclaimPhase phase) const;
+  // peek()'s unit of a phase: its amount of what the walk's reclaims reach
+  // of the ordinary class (`ordinary`), or for a phase of what is in use, of
+  // what they reach of that class (`inUse`) beyond it; none when nothing.
+  [[nodiscard]] std::optional<engine::Victim> reclaimUnit(const Walk &walk, ReclaimPhase phase,
+                                                          const ReclaimReach &ordinary,
+                                                          const ReclaimReach *inUse) const;
   // Starts the demotions of the blocks above each demotion from writes_
   // [firstWrite] on whose page frees as it lands, child before parent,
   // those that then free their pages as they land too (freesOnLanding), of

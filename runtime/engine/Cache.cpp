@@ -1248,20 +1248,19 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
   return counted;
 }
 
-std::optional<engine::Victim> Cache::reclaimUnit(const Walk &walk, ReclaimPhase phase) const {
+std::optional<engine::Victim> Cache::reclaimUnit(const Walk &walk, ReclaimPhase phase, const ReclaimReach &ordinary,
+                                                 const ReclaimReach *inUse) const {
   const bool used = phase >= ReclaimPhase::UsedNow;
-  if (used && walk.scope.upTo != ReclaimClass::InUse)
-    return std::nullopt;
   const Walk each = phaseWalk(walk, phase);
-  ReclaimReach::Amount unit = reach(walk, used ? ReclaimClass::InUse : ReclaimClass::Ordinary).of(phase);
+  ReclaimReach::Amount unit = ordinary.of(phase);
   if (used) {
-    const ReclaimReach::Amount ordinary = reach(walk, ReclaimClass::Ordinary).of(phase);
     // The staging buffer writes an ordinary state before one in use.
-    if (phase == ReclaimPhase::UsedWritten && ordinary.states)
+    if (phase == ReclaimPhase::UsedWritten && unit.states)
       return std::nullopt;
-    unit = {.bytes = unit.bytes - std::min(unit.bytes, ordinary.bytes),
-            .pages = unit.pages - std::min(unit.pages, ordinary.pages),
-            .states = unit.states - std::min(unit.states, ordinary.states)};
+    const ReclaimReach::Amount &all = inUse->of(phase);
+    unit = {.bytes = all.bytes - std::min(all.bytes, unit.bytes),
+            .pages = all.pages - std::min(all.pages, unit.pages),
+            .states = all.states - std::min(all.states, unit.states)};
   }
   // A page need counts pages alone; a device need pages only in place,
   // where its take frees them; states only where they are units.
@@ -1301,13 +1300,25 @@ std::optional<engine::Victim> Cache::peek(const VictimQuery &query, const engine
     if (walk.pages && (!after || afterUnit == Unit::Extent))
       if (const uint32_t pages = trims(walk) ? std::min(passedPages(), pool_.freePageCount(kv::PageForm::Slim)) : 0)
         return engine::Victim{.key = unitKey(static_cast<uint8_t>(Unit::Trim), 0), .pages = pages};
-    // Then the reclaims, phase by phase.
+    // Then the reclaims, phase by phase, of what the walk's reclaims reach,
+    // counted once: of the ordinary class, and from the first phase of what
+    // is in use, for a walk that takes it, of that class too.
     auto phase = static_cast<uint8_t>(ReclaimPhase::Now);
     if (after && afterUnit == Unit::Reclaim)
       phase = static_cast<uint8_t>(blockOfKey(after->key) + 1);
-    for (; phase <= static_cast<uint8_t>(ReclaimPhase::UsedLater); ++phase)
-      if (std::optional<engine::Victim> unit = reclaimUnit(walk, static_cast<ReclaimPhase>(phase)))
+    std::optional<ReclaimReach> ordinary, inUse;
+    for (; phase <= static_cast<uint8_t>(ReclaimPhase::UsedLater); ++phase) {
+      const auto each = static_cast<ReclaimPhase>(phase);
+      const bool used = each >= ReclaimPhase::UsedNow;
+      if (used && walk.scope.upTo != ReclaimClass::InUse)
+        break;
+      if (!ordinary)
+        ordinary = reach(walk, ReclaimClass::Ordinary);
+      if (used && !inUse)
+        inUse = reach(walk, ReclaimClass::InUse);
+      if (std::optional<engine::Victim> unit = reclaimUnit(walk, each, *ordinary, used ? &*inUse : nullptr))
         return unit;
+    }
     return std::nullopt;
   }
   // A state need's units, a state each, counted in the walk's order: the
