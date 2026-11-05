@@ -7,8 +7,6 @@
 #include "TestRegistry.hpp"
 #include "TestStderr.hpp"
 
-#include "AwakeClock.hpp"
-
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -2151,12 +2149,12 @@ constexpr double kFastestSpinLoadSeconds = 0.22e-6;
 
 // The spins of a spin check run on `checker`, recorded by the replacements
 // below: each spin's bound in loads, the release.y its encoder passes
-// host_step_wait, and the seconds from its GPU start to the check's reading
-// of that start, which follows its release.
+// host_step_wait, and the seconds from its GPU start to its GPU end, which a
+// spin that sees its release reaches at it.
 std::atomic<std::thread::id> checker;
 std::vector<uint32_t> spinBounds;
-std::vector<double> spinReleases;
-IMP originalSetBytes = nullptr, originalGPUStartTime = nullptr;
+std::vector<double> spinRuns;
+IMP originalSetBytes = nullptr, originalGPUStartTime = nullptr, originalGPUEndTime = nullptr;
 
 void recordSpinBound(id encoder, SEL selector, const void *bytes, NSUInteger length, NSUInteger index) {
     if (std::this_thread::get_id() == checker && index == 1 && length == 2 * sizeof(uint32_t))
@@ -2165,46 +2163,48 @@ void recordSpinBound(id encoder, SEL selector, const void *bytes, NSUInteger len
                                                                                                bytes, length, index);
 }
 
-CFTimeInterval recordSpinStart(id command, SEL selector) {
-    const CFTimeInterval start = reinterpret_cast<CFTimeInterval (*)(id, SEL)>(originalGPUStartTime)(command, selector);
-    // GPUStartTime counts seconds of the awake clock.
+// The check reads a spin's start once it completed, so its end is known.
+CFTimeInterval recordSpinRun(id command, SEL selector) {
+    using Time = CFTimeInterval (*)(id, SEL);
+    const CFTimeInterval start = reinterpret_cast<Time>(originalGPUStartTime)(command, selector);
     if (std::this_thread::get_id() == checker)
-        spinReleases.push_back(std::chrono::duration<double>(splash::AwakeClock::now().time_since_epoch()).count() -
-                               start);
+        spinRuns.push_back(reinterpret_cast<Time>(originalGPUEndTime)(command, @selector(GPUEndTime)) - start);
     return start;
 }
 
 // Every spin of a spin check is still spinning at its release, at any clock:
 // its bound, at the fastest load host_step_wait makes, outlasts the time from
-// its GPU start to its release. Each spin is reported to end at once
-// (endedEarly), so the check runs all of them.
+// its GPU start to its end at its release. Each spin is reported to end at
+// once (endedEarly), so the check runs all of them.
 void hostStepCheckSpinsOutlastTheirRelease(const std::string &metallibPath) {
     MetalBackend backend(metallibPath);
     checker = std::this_thread::get_id();
     spinBounds.clear();
-    spinReleases.clear();
+    spinRuns.clear();
     {
         id<MTLCommandBuffer> command = [[MTLCreateSystemDefaultDevice() newCommandQueue] commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
         [encoder endEncoding];
         MethodReplacement bytes(encoder, @selector(setBytes:length:atIndex:), reinterpret_cast<IMP>(recordSpinBound));
-        MethodReplacement start(command, @selector(GPUStartTime), reinterpret_cast<IMP>(recordSpinStart));
+        MethodReplacement start(command, @selector(GPUStartTime), reinterpret_cast<IMP>(recordSpinRun));
         MethodReplacement end(command, @selector(GPUEndTime), reinterpret_cast<IMP>(endedEarly));
         originalSetBytes = bytes.original;
         originalGPUStartTime = start.original;
+        originalGPUEndTime = end.original;
         require(!BackendInstrumentation::awakeHostStepsSpin(backend).has_value(),
                 "a check whose spins all ended at once decided");
     }
     checker = std::thread::id{};
-    require(!spinBounds.empty() && spinBounds.size() == spinReleases.size(),
+    require(!spinBounds.empty() && spinBounds.size() == spinRuns.size(),
             "a spin check's spins were not recorded: " + std::to_string(spinBounds.size()) + " bounds, " +
-                std::to_string(spinReleases.size()) + " starts");
+                std::to_string(spinRuns.size()) + " runs");
     for (size_t spin = 0; spin < spinBounds.size(); ++spin) {
         const double bound = spinBounds[spin] * kFastestSpinLoadSeconds;
-        require(bound > spinReleases[spin],
-                "spin " + std::to_string(spin) + " of a check ends " + std::to_string(bound * 1e3) +
-                    " ms after its start at the fastest load (" + std::to_string(spinBounds[spin]) +
-                    " loads), before its release " + std::to_string(spinReleases[spin] * 1e3) + " ms after it");
+        require(bound > spinRuns[spin],
+                "the bound of spin " + std::to_string(spin) + " of a check, " + std::to_string(spinBounds[spin]) +
+                    " loads, ends " + std::to_string(bound * 1e3) +
+                    " ms after its start at the fastest load, within the " + std::to_string(spinRuns[spin] * 1e3) +
+                    " ms it ran");
     }
     std::cout << "PASS a spin check's spins outlast their release\n";
 }

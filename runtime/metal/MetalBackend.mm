@@ -170,8 +170,9 @@ constexpr std::chrono::milliseconds kHostStepCheckDelays[] = {std::chrono::milli
                                                               std::chrono::milliseconds(100)};
 // The most loads of a check's spin released `delay` after its commit: four
 // times the delay at the fastest load, so a spin that started before its
-// release still spins at it, at any clock. kHostStepWaitLoads would not do:
-// at the fastest load it ends 58 ms after its start, before the last release.
+// release still spins at it, at any clock, unless the CPU releases it more
+// than three delays late. kHostStepWaitLoads would not do: at the fastest
+// load it ends 58 ms after its start, before the last release.
 constexpr uint32_t hostStepCheckLoads(std::chrono::milliseconds delay) noexcept {
     return static_cast<uint32_t>(4 * delay / kHostStepFastestLoad);
 }
@@ -1496,7 +1497,8 @@ struct MetalBackend::Impl {
             // runs again, released later: one that started after it, as when
             // the GPU, busy with other work, started it late, or one that
             // ended before it, which its bound leaves to a GPU four times
-            // faster than any seen (hostStepCheckLoads).
+            // faster than any seen or a release more than three delays late
+            // (hostStepCheckLoads).
             if (buffer.GPUStartTime >= released || buffer.GPUEndTime <= released) continue;
             // A spin that saw its release at its first load proves nothing:
             // a release that came before that load shows to any load.
