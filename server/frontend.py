@@ -465,10 +465,19 @@ class Frontend:
             )
         return started_at + min(timeout, self.request_timeout)
 
-    def prepare(self, body, *, deadline, flags=wire.RequestFlag(0), output_field=None):
+    def prepare(
+        self,
+        body,
+        *,
+        deadline,
+        flags=wire.RequestFlag(0),
+        output_field=None,
+        stop_field="stop",
+    ):
         """A Chat request, or a Messages request converted to Chat, with the
-        request's own flags (request_fields.generation). Output limit errors
-        name output_field, that API's own field."""
+        request's own flags (request_fields.generation). Errors on the output
+        limit name output_field, and errors on the stops' limits stop_field,
+        that API's own fields."""
         with self.preparation(deadline) as without_slot:
             return self.chat_job(
                 body,
@@ -476,6 +485,7 @@ class Frontend:
                 without_slot=without_slot,
                 flags=flags,
                 output_field=output_field,
+                stop_field=stop_field,
             )
 
     def prepare_completion(self, body, *, deadline, flags=wire.RequestFlag(0)):
@@ -781,6 +791,7 @@ class Frontend:
         without_slot,
         flags=wire.RequestFlag(0),
         output_field=None,
+        stop_field="stop",
         tool_namespaces=None,
     ):
         """The generation job of a Chat body, prepared while the caller holds
@@ -790,7 +801,7 @@ class Frontend:
         names it."""
         # Fields checked without the prompt fail before it is prepared, which
         # can render documents and build validators.
-        options = self._generation_options(body)
+        options = self._generation_options(body, stop_field)
         n = body.get("n", 1)
         logprobs = body.get("logprobs")
         if (
@@ -922,7 +933,7 @@ class Frontend:
             if name in policy.strict
         ]
 
-    def _generation_options(self, body):
+    def _generation_options(self, body, stop_field="stop"):
         numbers = {}
         for name, (default, _, requirement) in SAMPLING_NUMBERS.items():
             value = body.get(name, self.sampling_defaults.get(name, default))
@@ -940,22 +951,27 @@ class Frontend:
                 400, "top_k must be 0 or -1 (disabled) or a positive integer"
             )
         top_k = min(max(top_k, 0), 0xFFFFFFFF)
+        # Chat's stop, which another API's dialect converts its own field to.
         stop = body.get("stop")
-        if stop in (None, []):
+        if stop is None:
             stop_sequences = ()
         elif isinstance(stop, str) and stop:
             stop_sequences = (stop,)
-        elif (
-            isinstance(stop, list)
-            and 1 <= len(stop) <= 4
-            and all(isinstance(value, str) and value for value in stop)
+        elif isinstance(stop, list) and all(
+            isinstance(value, str) and value for value in stop
         ):
             stop_sequences = tuple(stop)
         else:
             raise APIError(400, "stop must be a string or up to four strings")
+        # Splash's limits on stops, for every API; errors name stop_field, the
+        # API's own field.
+        if len(stop_sequences) > 4:
+            raise APIError(400, f"{stop_field} must be up to four strings")
         if any(len(value) > MAX_STOP_CHARACTERS for value in stop_sequences):
             raise APIError(
-                400, f"each stop must be at most {MAX_STOP_CHARACTERS} characters"
+                400,
+                f"each of {stop_field} must be at most {MAX_STOP_CHARACTERS} "
+                "characters",
             )
         # Splash does not implement logit_bias, so only an empty one (null or
         # {}) is accepted; a non-empty one is refused rather than ignored.

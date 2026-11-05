@@ -176,19 +176,20 @@ class TextCompletionTests(unittest.TestCase):
         self.assertEqual(response["choices"][0]["finish_reason"], "stop")
         self.assertEqual(response["usage"]["completion_tokens"], 2)
         self.assertEqual((runtime.stop_count, runtime.cancel_count), (1, 0))
-        for stop in ("", ["x"] * 5, 3):
-            with self.subTest(stop=stop):
+        shape = "stop must be a string or up to four strings"
+        for stop, message in (
+            ("", shape),
+            (3, shape),
+            (["x"] * 5, "stop must be up to four strings"),
+            (
+                ["x" * (MAX_STOP_CHARACTERS + 1)],
+                f"each of stop must be at most {MAX_STOP_CHARACTERS} characters",
+            ),
+        ):
+            with self.subTest(stop=repr(stop)[:40]):
                 status, response = self.complete(harness, stop=stop)
                 self.assertEqual(status, 400)
-                self.assertEqual(
-                    response["error"]["message"],
-                    "stop must be a string or up to four strings",
-                )
-        status, response = self.complete(
-            harness, stop=["x" * (MAX_STOP_CHARACTERS + 1)]
-        )
-        self.assertEqual(status, 400)
-        self.assertIn("each stop must be at most", response["error"]["message"])
+                self.assertEqual(response["error"]["message"], message)
 
     def test_unsupported_fields_are_rejected_by_name(self):
         harness, runtime = self.harness()

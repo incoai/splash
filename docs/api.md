@@ -51,8 +51,11 @@ Completions, text completions, Responses and Messages share these fields:
   `request_timeout`.
 - `seed`: a 64-bit integer, random when omitted or `-1`; another negative seed
   is taken as its 64 bits ([sampling](#sampling)).
-- `stop`, in Messages `stop_sequences`: a string or up to four strings, each of
-  at most 16,384 characters (a longer one returns 400). A stop string ends the
+- `stop`: a string or up to four strings, OpenAI's limit. Messages takes
+  `stop_sequences`, an array of strings that each hold a character other than
+  whitespace, as Anthropic requires; Anthropic sets no count, and Splash takes
+  up to four, which bound the memory and time of its stop search. A stop is at
+  most 16,384 characters (a longer one returns 400). A stop string ends the
   output where the model writes it, inside a tool call or structured output too,
   which it cuts as the token limit does: a call it cuts keeps the arguments it
   has, and no call of the output counts as made; a cut structured answer is not

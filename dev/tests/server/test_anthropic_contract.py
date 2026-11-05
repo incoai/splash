@@ -27,6 +27,7 @@ from server import frontend as request_frontend
 from server.chat_messages import normalize_messages
 from server.dialects import anthropic as anthropic_dialect
 from server.errors import APIError
+from server.output import MAX_STOP_CHARACTERS
 from server.tool_schema import normalize_tools
 
 SCHEMA = {
@@ -1733,6 +1734,42 @@ class AnthropicHTTPContractTest(HarnessTestCase):
         self._wait_for_http_active(harness.server.requests, 0)
         self.assertEqual(harness.app.preparation_waiting, 0)
         self.assertEqual(harness.backend.runtime.requests, [])
+
+    def test_stop_sequences_follow_messages_and_errors_name_them(self):
+        """stop_sequences is an array of strings that each hold a character
+        other than whitespace, as Messages requires, within Splash's limits
+        on stops; its errors name it."""
+        runtime = FakeRuntime(*(Plan([[10]]) for _ in range(3)))
+        harness = self.harness(runtime)
+        shape = "stop_sequences must be an array of strings"
+        blank = "each of stop_sequences must contain non-whitespace"
+        for stops, message in (
+            ("end", shape),
+            (["end", 1], shape),
+            (["end"] * 5, "stop_sequences must be up to four strings"),
+            ([""], blank),
+            (["end", "\n"], blank),
+            ([" \t"], blank),
+            (
+                ["x" * (MAX_STOP_CHARACTERS + 1)],
+                "each of stop_sequences must be at most "
+                f"{MAX_STOP_CHARACTERS} characters",
+            ),
+        ):
+            with self.subTest(stops=repr(stops)[:40]):
+                status, _, payload = harness.request(
+                    "POST", "/v1/messages", request_body(stop_sequences=stops)
+                )
+                self.assertEqual(status, 400, payload)
+                self.assertEqual(json.loads(payload)["error"]["message"], message)
+        self.assertEqual(runtime.requests, [])
+        for stops in (None, [], ["\nend "] * 4):
+            with self.subTest(stops=stops):
+                status, _, payload = harness.request(
+                    "POST", "/v1/messages", request_body(stop_sequences=stops)
+                )
+                self.assertEqual(status, 200, payload)
+        self.assertEqual(len(runtime.requests), 3)
 
     def test_anthropic_adaptive_effort_rejects_non_strings_before_admission(self):
         runtime = FakeRuntime(Plan(batches=[(3,)]))

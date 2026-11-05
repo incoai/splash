@@ -16,7 +16,13 @@ def post_messages(exchange, body, deadline):
     app = exchange.app
     streamed, flags = request_fields.generation(body)
     chat, omitted = to_chat_body(body, thinking_resolver=app.thinking_codec.decode)
-    job = app.prepare(chat, deadline=deadline, flags=flags, output_field="max_tokens")
+    job = app.prepare(
+        chat,
+        deadline=deadline,
+        flags=flags,
+        output_field="max_tokens",
+        stop_field="stop_sequences",
+    )
     respond = stream if streamed else complete
     return job, partial(respond, exchange, omitted=omitted)
 
@@ -102,7 +108,7 @@ def to_chat_body(body, *, thinking_resolver):
         )
     chat.update(
         max_completion_tokens=max_tokens,
-        stop=body.get("stop_sequences"),
+        stop=_stop_sequences(body.get("stop_sequences")),
         temperature=body.get("temperature"),
         top_p=body.get("top_p"),
         top_k=body.get("top_k"),
@@ -112,6 +118,19 @@ def to_chat_body(body, *, thinking_resolver):
     )
     chat = {key: value for key, value in chat.items() if value is not None}
     return chat, omitted
+
+
+def _stop_sequences(stops):
+    """A Messages request's stop_sequences, as Chat's stop: an array of
+    strings that each hold a character other than whitespace, as Anthropic
+    requires. Chat holds them to Splash's limits on stops."""
+    if stops is None:
+        return None
+    if not isinstance(stops, list) or not all(isinstance(stop, str) for stop in stops):
+        raise APIError(400, "stop_sequences must be an array of strings")
+    if not all(stop.strip() for stop in stops):
+        raise APIError(400, "each of stop_sequences must contain non-whitespace")
+    return stops
 
 
 def _preserve_thinking(context_management):
