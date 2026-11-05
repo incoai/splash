@@ -1886,6 +1886,30 @@ void testFailedRestoreReturnsTheCommitment() {
           "the start did not run from the prefix that remained");
 }
 
+// A KV need takes cached pages of its form in place, with no extent emptied. A Spill lane's landed
+// copies free pages in its extents, which a short Resident prompt beside it takes; the prompt
+// yields or ends, and the lane's next page comes from the prompt's cached pages: it runs to its end.
+void testALaneTakesCachedPagesInPlace() {
+  for (const uint64_t room : {0, 50, 100}) {
+    Spilling spill(Spilling::Governed{}, 1024, false, Spilling::Extent{4}, 0,
+                   test::commandShape(KvCache::pageTokens));
+    spill.limit(spill.held() + 1'100);
+    EngineRequest lane = Spilling::prompt(2, 2, 12, 200);
+    lane.deadlineMilliseconds = 1e9;
+    spill.engine.submit(std::move(lane));
+    // Its copies stay in flight until the prompt arrives.
+    for (int tick = 0; tick < 27; ++tick)
+      static_cast<void>(spill.engine.tick(spill.now++));
+    spill.limit(spill.held() + room);
+    spill.engine.submit(Spilling::prompt(1, 1, 3, 1));
+    spill.model.decodeFinishes = true;
+    spill.runUntilIdle();
+    require(spill.events.failedCount == 0 && spill.events.completedCount == 2,
+            "beside a prompt, in room for " + std::to_string(room) +
+                " B, a lane failed while cached pages fit its next page");
+  }
+}
+
 // With no Spill lane in service a refused Index runway refill is asked only in the control pass,
 // not at every tick or command.
 void testWithNoSpillLaneTheRunwayRefillsInTheControlPass() {
@@ -2354,6 +2378,7 @@ std::span<const test::TestCase> spillTests() {
       {"testUnreadableKvEndsOnlyItsLane", testUnreadableKvEndsOnlyItsLane},
       {"testFailedRestoreReturnsTheCommitment", testFailedRestoreReturnsTheCommitment},
       {"testARestoreOfTwoFormsKeepsTheFreePagesItTakes", testARestoreOfTwoFormsKeepsTheFreePagesItTakes},
+      {"testALaneTakesCachedPagesInPlace", testALaneTakesCachedPagesInPlace},
       {"testWithNoSpillLaneTheRunwayRefillsInTheControlPass", testWithNoSpillLaneTheRunwayRefillsInTheControlPass},
       {"testPreemptedSpillPrefillResumesFromItsDurablePrefix", testPreemptedSpillPrefillResumesFromItsDurablePrefix},
   };

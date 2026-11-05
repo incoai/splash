@@ -1215,7 +1215,8 @@ FreeResult Cache::take(const VictimQuery &query, const engine::Victim &victim) {
     const uint32_t landing = demotedPages()[form];
     const uint32_t pagesBefore = pages();
     const uint64_t fillBefore = walk.device ? landingFill(walk) : 0;
-    const ReclaimResult reclaimed = walk.device ? takeReclaim(each, demotionPages(), fillBefore) : evictOne(each);
+    const ReclaimResult reclaimed =
+        walk.device ? takeReclaim(each, demotionPages(), fillBefore, query.need.pages != 0) : evictOne(each);
     if (!walk.device && reclaimed.evictedState && trims(walk))
       static_cast<void>(trimWindows(false));
     if (!reclaimed.madeProgress && !reclaimed.evictedKv)
@@ -1350,26 +1351,35 @@ uint64_t Cache::releaseOtherForms(kv::PageForm form) {
 }
 
 Cache::ReclaimResult Cache::takeReclaim(const Walk &walk, const std::array<uint32_t, 3> &demotions,
-                                      uint64_t fillBefore) {
+                                      uint64_t fillBefore, bool inPlace) {
   // Free pages first, as the extent they fill; one that empties the runway
   // kept gives nothing yet, and the next one does.
   for (ReclaimResult released; (released = releaseExtent(walk)).madeProgress;)
     if (released.reclaimedBytes)
       return released;
-  // Then the walk's victims while KV of some form can empty an extent past
-  // the runway the walk keeps, the leaves that lead to such an extent
-  // alone, until one is released, the free and landing pages fill one more
-  // extent than when the take began (landingFill), or a state goes;
-  // otherwise only a state. A leaf it demotes starts the demotions of its
-  // chain above it (demoteChainsAbove), whose pages count toward the
-  // extent. Whatever it returns says whether KV went.
+  // Then the walk's victims while some form is in reach (formsInReach), the
+  // leaves that lead to such a form alone, until one is released, the free
+  // and landing pages fill one more extent than when the take began
+  // (landingFill), a need of pages (`inPlace`) has one more page of its form,
+  // free or, for a walk that can wait, landing (as Cache::take counts it), or
+  // a state goes; otherwise only a state. A leaf it demotes starts the
+  // demotions of its chain above it (demoteChainsAbove) until then. Whatever
+  // it returns says whether KV went.
   bool evictedKv = false;
   const auto outcome = [&](ReclaimResult result) {
     result.evictedKv = evictedKv;
     return result;
   };
+  const auto index = static_cast<size_t>(walk.form);
+  const auto inPlacePages = [&] {
+    return pool_.freePageCount(walk.form) + (walk.timing == ReclaimTiming::CanWait ? demotedPages()[index] : 0);
+  };
+  const uint32_t inPlaceBefore = inPlacePages();
+  const auto enough = [&] {
+    return landingFill(walk) > fillBefore || (inPlace && inPlacePages() > inPlaceBefore);
+  };
   for (;;) {
-    const std::array<bool, 3> reach = formsInReach(walk, demotions);
+    const std::array<bool, 3> reach = formsInReach(walk, demotions, inPlace);
     if (std::ranges::none_of(reach, std::identity{}))
       break;
     const size_t writes = writes_.size();
@@ -1377,10 +1387,10 @@ Cache::ReclaimResult Cache::takeReclaim(const Walk &walk, const std::array<uint3
     if (!evicted.madeProgress || evicted.evictedState)
       return outcome(evicted);
     evictedKv = true;
-    demoteChainsAbove(walk, writes, [&] { return landingFill(walk) > fillBefore; });
+    demoteChainsAbove(walk, writes, enough);
     if (const ReclaimResult released = releaseExtent(walk); released.reclaimedBytes)
       return outcome(released);
-    if (landingFill(walk) > fillBefore)
+    if (enough())
       return outcome({.madeProgress = true});
   }
   return outcome(recycleState(walk));
@@ -1497,11 +1507,15 @@ bool Cache::leadsToReach(uint64_t block, const std::array<bool, 3> &reach) const
   return false;
 }
 
-std::array<bool, 3> Cache::formsInReach(const Walk &walk, const std::array<uint32_t, 3> &demoting) const {
+std::array<bool, 3> Cache::formsInReach(const Walk &walk, const std::array<uint32_t, 3> &demoting,
+                                         bool inPlace) const {
   std::array<bool, 3> reach{};
   for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index}) {
     const auto index = static_cast<size_t>(form);
-    reach[index] = walk.reaches(form, reusablePages(walk.scope.upTo, form), demoting[index], pool_.extentPages());
+    const uint32_t reusable = reusablePages(walk.scope.upTo, form);
+    reach[index] = walk.reaches(form, reusable, demoting[index], pool_.extentPages()) ||
+                   (inPlace && form == walk.form &&
+                    reusable > pool_.freePageCount(form) + demotionPages()[index]);
   }
   return reach;
 }

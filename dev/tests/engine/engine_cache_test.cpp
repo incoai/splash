@@ -1901,6 +1901,41 @@ void testTierOnlyAddsToTierOff() {
 
 // A demotion must not cost a second state: with room for two states the tier keeps the hit a cache
 // without it gets.
+// A claim the engine's limit refused for one KV page takes a cached page in
+// place, as the count said, though no extent can empty: a lane's request
+// holds the rest of the pool. One page is written for it, not the chain.
+void testAMemoryClaimForAPageTakesACachedPageInPlace() {
+  test::TestKvTier tier;
+  tier.transferLimit = 64;
+  auto budget = std::make_shared<model::DiskBudget>(16 * tier.slotBytes());
+  tier.budget = budget;
+  test::TestKvStorage storage{12, 100, 4};
+  KvPool pool{storage, 4};
+  engine::Cache cache(pool, &tier, budget);
+  cache.beginRequest(1);
+  require(admitTokens(cache, 1, 10 * KvCache::pageTokens).granted(), "the lane's pages were denied");
+  std::vector<uint32_t> prompt(2 * KvCache::pageTokens + 1);
+  std::iota(prompt.begin(), prompt.end(), 1000);
+  cache.beginRequest(2);
+  require(admitTokens(cache, 2, 2 * KvCache::pageTokens).granted(), "the chain's pages were denied");
+  cache.publishCommittedBlocks(2, prompt, 2 * KvCache::pageTokens, {});
+  const uint64_t tail = cache.blockAt(2, 2 * KvCache::pageTokens);
+  cache.endRequest(2);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  cache.publishCompositeState(tail, std::make_shared<TieredState>(control), false);
+  require(test::stateStep(cache).gave() && cache.pollTransfers() && !cache.stateResident(tail),
+          "the chain's state was not written");
+  require(pool.freePageCount() == 0 && pool.reusablePages() == 2, "fixture geometry changed");
+  const uint32_t demotions = tier.demotions;
+  const FreeResult freed = test::freeFromCache(cache, test::kInServiceGrowth, {.bytes = 100, .pages = 1});
+  require(freed.outcome != FreeOutcome::Short && freed.pages == 1 && tier.demotions - demotions == 1,
+          "a memory claim for a page took " + std::to_string(freed.pages) + " pages with " +
+              std::to_string(tier.demotions - demotions) + " writes, outcome " +
+              std::to_string(static_cast<int>(freed.outcome)));
+  cache.checkInvariants();
+}
+
 void testDemotionCostsNoSecondState() {
   CacheFixture fixture;
   auto control = std::make_shared<TransferControl>();
@@ -6190,6 +6225,7 @@ int main() {
     testAFullTemporaryQuotaStillDemotesByReplacingItsOldestCopy();
     testALeafWhoseWriteFindsNoSlotGoesWithItsSubtree();
     testAWaitingClaimDemotesAWholeChainRunAtOnce();
+    testAMemoryClaimForAPageTakesACachedPageInPlace();
     testQuotaWithoutTheKvTier();
     testInvalidationDuringOffload();
     testDemotionFreesTheBufferAtOnce();
