@@ -147,7 +147,7 @@ const markdown = (() => {
     let at = start;
     let blank = false;
     let number = 0;
-    // The lines as the parser counts them, and an empty one after them.
+    // The lines as the text breaks them, which the parser numbers alike, and an empty one after them.
     for (const [line] of rest.matchAll(/[^\r\n]*(?:\r\n?|\n|$)/g)) {
       if (blank && blocks.has(number) && /^\S/.test(line) && !/^([-+*]|\d{1,9}[.)]?)(\s|$)/.test(line)) cut = at;
       blank = line.trim() === '';
@@ -155,10 +155,13 @@ const markdown = (() => {
       number++;
     }
     // The fence's code lines: its content ends each with a line break, but the last one where the
-    // text ends mid-line.
+    // text ends mid-line. It reaches the end of the text as the parser counts its lines, which
+    // leaves out a last line of only spaces, such as the indent of a line of code just begun. It
+    // counts them once each \r\n or \r is a \n, as `parse` makes it.
     const fence = tokens.findLast(token => token.type === 'fence');
     const code = fence?.content === '' ? 0 : fence?.content.replace(/\n$/, '').split('\n').length;
-    return {cut, open: fence?.map[1] === number - 1 && fence.map[1] - fence.map[0] === code + 1};
+    const lines = fence ? new parser.block.State(rest.replace(/\r\n?/g, '\n'), parser, {}, []).lineMax : 0;
+    return {cut, open: fence?.map[1] === lines && fence.map[1] - fence.map[0] === code + 1};
   }
 
   // Draws `text` into `container` as Markdown. Whole, it changes only the nodes that differ from
