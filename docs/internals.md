@@ -1278,32 +1278,33 @@ A refused claim lacks what it asked beyond the free room, plus the room
 claims ranked above it hold. The ledger first gives back what costs nothing,
 the idle state buffers. A claim that can wait then waits when what is landing
 meets its need: the transfers in flight and the copies its own lanes owe.
-Otherwise the ledger walks one fixed order, the same for every claimant, and
-takes the first units that cover what the claim lacks, all or none. A unit
-the claim's class may not take is skipped, not a stop:
+Otherwise the ledger walks one fixed order, the same for every claimant. A
+unit the claim's class may not take is skipped, not a stop:
 
 1. Idle state buffers.
-2. The prefix cache, in its one order
-   ([below](#replay-points-and-checkpoints)). A unit that needs a write
-   first goes only to a claim that can wait, which then waits for the write
-   it starts; an `Immediate` claim passes over it. A state needs a write
-   only when a restore from it is expected: one in use, the resume point, a
-   queued request's, or a point copies ahead of need would copy, the newest
-   of its conversation (`Cache::writesState`). Any other state, such as one
-   its conversation went on from or a checkpoint no request waits for, is
-   dropped like a unit no tier can copy, with no SSD cache or one whose
-   files stopped taking writes.
+2. The prefix cache's units that free memory now, in its one order
+   ([below](#replay-points-and-checkpoints)): those with a copy on the SSD
+   cache, those nothing needs, and those that need no write.
 3. The caches the model rebuilds on use: the vision encoder's scratch,
    images' encoded rows, idle history staging, and the hot block cache while
    no lane reads above its floor.
-4. The prefill command between its passes, given up for work that supersedes
+4. The prefix cache's units that need a write first, in the same order, only
+   for a claim that can wait, which then waits for the write it starts; an
+   `Immediate` claim passes over them. A state needs a write only when a
+   restore from it is expected: one in use, the resume point, a queued
+   request's, or a point copies ahead of need would copy, the newest of its
+   conversation (`Cache::writesState`). Any other state, such as one its
+   conversation went on from or a checkpoint no request waits for, is
+   dropped like a unit no tier can copy, with no SSD cache or one whose
+   files stopped taking writes.
+5. The prefill command between its passes, given up for work that supersedes
    it, then the claimant's own conversion to Spill (below).
-5. The pools' units above their floors: the expert store's chunks, the top
+6. The pools' units above their floors: the expert store's chunks, the top
    chunk first, and the hot block cache's extents while a lane reads above
    its floor.
-6. What another request uses: its state in use costs it a re-prefill of its
+7. What another request uses: its state in use costs it a re-prefill of its
    prompt.
-7. Then the engine: it waits for the copies in flight where they cover the
+8. Then the engine: it waits for the copies in flight where they cover the
    need. Otherwise, when no lane's growth fits, the lane that yields first
    (the lowest priority, a prefill before a decoding lane of its priority,
    then the one with less completed work, then the later arrival) pays with
@@ -1311,18 +1312,29 @@ the claim's class may not take is skipped, not a stop:
    resident, since they grow too and are refused in turn. A lane alone that
    nothing meets fails with `capacity_exhausted` (below).
 
-The order takes what costs least first: a cached unit costs a prefill only if
-a request comes back for it, a rebuilt cache its rebuild, a store chunk SSD
-reads for as long as it stays away, and a unit in use its request's prompt
-again. The ledger finds the units by a dry run over the order
-(`MemoryLedger::dryRun`) and takes nothing unless they cover the need; then
-it takes them in order, each found again from the head of its source as it
-stands, and a take that finds its source changed stops there, leaving the
-rest to the claim's retry. A claim met only by units that land later (a
-write it started, a conversion's copies) waits for them (`Pending`) and is
-retried as they land; one nothing meets is `Short`. A refusal of KV counts
-the free pages of its form as its own: the ledger never releases their
-extent for it, which it would only allocate again.
+The order takes what costs least first: what frees without a write goes
+before anything that costs a write or later work. A cached unit costs a
+prefill only if a request comes back for it, a rebuilt cache its rebuild, a
+write its SSD bandwidth and the wait for it, a store chunk SSD reads for as
+long as it stays away, and a unit in use its request's prompt again. Inside
+the cache's one order, a claim that can wait takes the units that free now
+past an uncopied one before it waits for that unit's write, which stays at
+the head for copies ahead of need to make.
+
+The ledger first counts the most the order gives, taking nothing
+(`MemoryLedger::bound`): each unit at what its source says it frees at most.
+Unless that covers what the claim lacks, nothing is taken. Otherwise it takes
+the units one at a time, each found again from the head of its source as it
+stands, until what they freed now and as their transfers land covers the
+need (`MemoryLedger::take`). A unit whose take frees nothing is passed over:
+a transfer in flight may hold it, or nothing of it is left. Once a take
+waits for a transfer, the claim takes nothing past the cache's units that
+need a write: it waits rather than take what costs work later. A claim met
+only by units that land later (a write it started, a conversion's copies)
+waits for them (`Pending`) and is retried as they land; one they do not meet
+waits while what it reached or started lands, and is `Short` otherwise. A
+refusal of KV counts the free pages of its form as its own: the ledger never
+releases their extent for it, which it would only allocate again.
 
 Three rules say who takes what:
 
@@ -1446,19 +1458,21 @@ retakes came 1-29 s apart. Nothing grows while a
 request's claim waits for memory or to retry what the host refused it: that
 room is the request's. The unit goes first into free room beyond what waiting
 claims hold and what the lanes in service are projected to grow into; the
-rest it takes from cache that frees memory now, all or none, never a unit of
-certain reuse, one in use or one that needs a write. The host judges the net
+rest it takes from cache that frees memory now, never a unit of certain
+reuse, one in use or one that needs a write. The host judges the net
 change: a unit the cache pays for whole regrows at normal pressure or under
 macOS's warning while the host has no deficit, never under critical pressure;
 a unit that needs free room needs normal pressure, the margin to spare beyond
-it and the host out of its band. A dry run finds what a `Growth` claim may
-take (`MemoryLedger::grow`), the host then judges the unit, and only then the
-ledger takes it; a refusal takes nothing. A try that falls short asks a temporary SSD cache
-to copy ahead what it lacked ([disk tier](#disk-tier)), so that a later try
-finds that cache free to go. A store a burst shrank so comes back a chunk per
-30 s once requests stop going short, even when the burst's KV, cached, fills
-the room. `memory_governor.growth_allowed` is false while the host refuses
-growth into free room.
+it and the host out of its band. The ledger first counts what the cache
+funds at most, taking nothing (`MemoryLedger::grow`), the host then judges
+the unit, and only then the ledger takes the cache's units one at a time; a
+count short of the unit, or the host's refusal, takes nothing. A try that falls
+short asks a temporary SSD cache to copy ahead what it lacked
+([disk tier](#disk-tier)), so that a later try finds that cache free to go. A
+store a burst shrank so comes back a chunk per 30 s once requests stop going
+short, even when the burst's KV, cached, fills the room.
+`memory_governor.growth_allowed` is false while the host refuses growth into
+free room.
 
 The lanes' projected growth is each lane's KV up to its projection, its
 tokens now and up to 4096 more of its output (a Spill lane's floors at that
@@ -1764,12 +1778,10 @@ extent holds pages of one form; the pool's page ids cover the Slim pages the
 hard budget could hold. A Full shortfall takes trims first, then, while the Slim
 pool has room for their tails, states, a checkpoint first, each followed by a
 trim of the tail it unpinned, while those trims free pages, before any KV leaf
-goes (`Cache::reclaimForPages`). At the memory wall, where the Slim runway
+goes (`Cache::peek`, `Cache::take`). At the memory wall, where the Slim runway
 cannot refill, no state goes for its tail, and the victims go as without a
 window, dead leaves before ordinary states. A state the SSD cache keeps unpins
-nothing: each step that keeps extents (`CacheReclaimMode::KeepExtents`) writes
-one more state there before any leaf goes. Empty Slim extents beyond the runway
-go for the retry to grow by.
+nothing. Empty Slim extents beyond the runway go for the retry to grow by.
 
 ## Disk tier
 
@@ -1983,26 +1995,26 @@ only for a copy in use, and last. Either way the only copy of a unit of
 certain reuse, the newest resume point's state or a state or KV block on a
 chain a queued request will restore, makes room only for a Spill lane's
 active KV, since a running lane goes before a queued one; and an ordinary
-state that finds no other room is dropped. A claim's dry run finds a write's slot the same
-way, through the one replacement order (`Cache::nextDiskReplacement`): a full
-quota with copies it may give up still counts a demotion, so the claim waits
-for it rather than come back short with nothing started. Before reclaim takes a state in RAM, only a
-spilling request's page takes the spilled KV under it, the state first,
-once nothing else is left. A freed slot returns its quota at once and its
-blocks to the volume (`F_PUNCHHOLE`) once its file's IO worker finishes the
-transfer it is in, so the two files together occupy about the live slots instead
-of each keeping its high-water mark; `/status` reports that as `disk.file_bytes`
-beside `disk.used_bytes`. Until the punch the other file can take that quota, so
+state that finds no other room is dropped. A claim's take finds a write's slot
+the same way, through the one replacement order (`Cache::nextDiskReplacement`):
+a full quota gives up the copies it may for the write, and the claim waits for
+the write. Before reclaim takes a state in RAM, only a spilling request's page
+takes the spilled KV under it, the state first, once nothing else is left. A
+freed slot returns its quota at once and its blocks to the volume
+(`F_PUNCHHOLE`) once its file's IO worker finishes the transfer it is in, so the
+two files together occupy about the live slots instead of each keeping its
+high-water mark; `/status` reports that as `disk.file_bytes` beside
+`disk.used_bytes`. Until the punch the other file can take that quota, so
 allocated blocks can briefly exceed the limit by the slots freed but not yet
 punched, bounded by the transfer each file's worker is in: about 2% of a 10G
 tier in a 25-minute churn run on an M5 Max. A write that finds the volume full
 anyway only reports it: its file goes on, and the engine measures the volume at
 once and shrinks to the new limit. If the volume still shows room above the
-floor, the write met a limit the measure cannot see, such as a volume quota or
-a disk image whose host is full, or the volume filled and freed again; after a
+floor, the write met a limit the measure cannot see, such as a volume quota or a
+disk image whose host is full, or the volume filled and freed again; after a
 second such write the tier keeps within what it holds, with one log line, while
-serving continues. On a volume that cannot punch holes the files keep the
-blocks of freed slots, which the runtime reports once; the limit counts them.
+serving continues. On a volume that cannot punch holes the files keep the blocks
+of freed slots, which the runtime reports once; the limit counts them.
 
 Transfers use `pread`/`pwrite` with `F_NOCACHE`, every one an aligned range.
 Those of the files' IO workers, every write and a state's reads, move whole

@@ -480,20 +480,21 @@ off` loads every expert, as a SIZE that holds them all does.
 - The chunks above the floor are elastic. Where a request in service needs
   memory the engine's limit refuses, the engine takes what can go in one
   fixed order ([admission and eviction](internals.md#admission-and-eviction)):
-  cached prefixes nothing in use holds, by the cache's order (a prefix whose
-  copy to the SSD cache is being written waits for it); the caches the model
-  rebuilds; on a target whose KV can stay on the SSD cache, that request's own
-  [spill](#kv-on-the-ssd); then the store's last chunk, one at a time; and
-  only then anything in use. A start, optional work and memory the host
-  refused never take a chunk. When the host runs short of its 1 GiB margin,
-  the engine gives it cached prefixes and the caches the model rebuilds, never
-  a chunk; macOS's warning alone takes nothing. A chunk given back keeps its
-  experts that fit: they are copied to free slots below it, the experts the
+  cached prefixes nothing in use holds that leave memory at once, by the
+  cache's order; the caches the model rebuilds; the cached prefixes that
+  first need a copy on the SSD cache, whose writes it waits for rather than
+  take what follows; on a target whose KV can stay on the SSD cache, that
+  request's own [spill](#kv-on-the-ssd); then the store's last chunk, one at
+  a time; and only then anything in use. A start, optional work and memory
+  the host refused never take a chunk. When the host runs short of its 1 GiB
+  margin, the engine gives it cached prefixes and the caches the model rebuilds,
+  never a chunk; macOS's warning alone takes nothing. A chunk given back keeps
+  its experts that fit: they are copied to free slots below it, the experts the
   slots' recycling would recycle first evicted to make room, and later steps
-  read the evicted ones from the SSD again. Under macOS's critical pressure
-  the engine gives the Mac, each second, the 1 GiB margin and what requests
-  the host refused wait for, in the same order, store chunks above the floor
-  among them, never the store below its floor.
+  read the evicted ones from the SSD again. Under macOS's critical pressure the
+  engine gives the Mac, each second, the 1 GiB margin and what requests the host
+  refused wait for, in the same order, store chunks above the floor among them,
+  never the store below its floor.
 - The store's cap is a reservation the engine repays: between commands, the
   store tries to take one chunk back, one it gave back or started without,
   its slots empty, once 30 s have passed since its last try and since a
@@ -502,19 +503,19 @@ off` loads every expert, as a SIZE that holds them all does.
   not count), as long as no request waits for memory and the weights are not
   released. The chunk takes memory `--max-memory` leaves free, which needs
   normal pressure and 1 GiB to spare beyond the chunk; for what that lacks
-  the engine evicts cached prefixes that leave memory at once, all or none,
-  never one in use, the prefix the newest conversation resumes from or those
-  that requests waiting to start would resume from. A chunk such prefixes pay
-  for whole comes back under macOS's warning too while the host keeps its
+  the engine evicts cached prefixes that leave memory at once, only when they
+  cover it, never one in use, the prefix the newest conversation resumes from or
+  those that requests waiting to start would resume from. A chunk such prefixes
+  pay for whole comes back under macOS's warning too while the host keeps its
   margin. A prefix that would first need a copy on the SSD cache stays; the
   engine copies such prefixes ahead for what the chunk lacked, so a later try
-  finds them free to go. A store a burst shrank thus comes back a chunk per
-  30 s once requests stop going short, even when the burst's KV, cached,
-  fills the room. Each chunk given back or taken back logs a line
+  finds them free to go. A store a burst shrank thus comes back a chunk per 30 s
+  once requests stop going short, even when the burst's KV, cached, fills the
+  room. Each chunk given back or taken back logs a line
   (`Expert store gave back`, `Expert store took back`). Elasticity serves
-  concurrency, the prefix cache and the rest of the Mac; the advertised
-  context is planned with the store at the cap the engine's limit gives it
-  and does not change.
+  concurrency, the prefix cache and the rest of the Mac; the advertised context
+  is planned with the store at the cap the engine's limit gives it and does not
+  change.
 - The store's live chunks and staging are released while idle with the
   weights and restored with them: its floor and staging, as the request
   waiting needs them; its elastic chunks come back afterwards as above, a
