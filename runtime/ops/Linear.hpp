@@ -246,7 +246,11 @@ enum class GpuFamilyClass : uint8_t { Apple9, Apple10 };
 // family class, core count and workload tile counts.
 class Linear final {
 public:
-  explicit Linear(const DeviceCapabilities &device) noexcept;
+  // decodeInt8 (splash serve --decode-int8): Apple10 decode plans that stage
+  // rotated PQ2_0 projections at 8 or 16 rows run them in int8 activations
+  // (LinearGguf.cpp pq2W8Tile).
+  explicit Linear(const DeviceCapabilities &device, bool decodeInt8 = false) noexcept;
+  [[nodiscard]] bool decodeInt8() const noexcept { return decodeInt8_; }
 
   [[nodiscard]] LinearPlan plan(LinearWorkload workload) const;
   // The plan of `workload` for the projection, into its destination type; a gate/up plan also runs `gate`.
@@ -333,6 +337,7 @@ private:
                             const Projection &projection, const LinearPlan &plan) const;
   GpuFamilyClass family_;
   uint32_t gpuCores_ = 0;
+  bool decodeInt8_ = false;
 };
 
 } // namespace splash::ops

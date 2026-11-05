@@ -7,6 +7,7 @@
 #include "ops/BufferExtent.hpp"
 
 #include <algorithm>
+#include <array>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -391,6 +392,94 @@ void addDecodeTensor(const LinearBuffers &b, LinearEpilogue epilogue, const Quan
   tensor(segment, epilogueSuffix(LinearEpilogue::UpWithGate), b.output, b.gateScratch);
 }
 
+
+// Int8-activation decode of rotated PQ2_0 projections (Linear(device, decodeInt8), splash serve --decode-int8):
+// gguf_rotate_a8 writes the rotated input as int8 rows with one fp32 scale per row and rotation block of 1024
+// inputs, and the W-A8 tile (kernels/shared/gguf_linear.metal gguf_pq2w8_m<rows>_*) multiplies them with the PQ2_0
+// codes in int8 (pq2W8Tile). It replaces gguf_rotate and the staged tile where the plan stages the projection at 8
+// or 16 rows on Apple10; every other plan (register tile, one-pass gate/up pairs, the 32- and 64-row tiles, Apple9)
+// keeps the bf16 kernels. The int8 rows start the rotated scratch, their scales follow them.
+uint64_t pq2A8Bytes(uint32_t k, uint32_t rows) {
+  return uint64_t{rows} * k + uint64_t{rows} * (k / GGUF_ROTATION_BLOCK) * sizeof(float);
+}
+bool allPq2(std::span<const QuantizedSegment> segments) noexcept {
+  return !segments.empty() && std::all_of(segments.begin(), segments.end(), [](const QuantizedSegment &s) {
+    return !s.isFloat() && s.formatId == GGUF_FMT_PQ20 && s.outputSize % GGUF_TILE_COLUMNS == 0;
+  });
+}
+// The W-A8 tile's K split for one lane: the fastest of 1-8 partitions on the 27B Bonsai's shapes
+// (gguf-projection-benchmark) on a 12-core M6 and a 16-core M5 Pro alike: two past 5120 inputs (down, attention
+// output), four for 16384 to 65535 columns of 5120 inputs (gate/up, GDN input), else one (attention input, the
+// vocabulary head). The wave law (apple10Staged) prices a split by bytes and waves only, where this tile is bound by
+// the latency of its int8 chains, so it does not pick these.
+uint32_t pq2W8Splits(uint32_t n, uint32_t k) { return k > 5120 ? 2 : n >= 16384 && n < 65536 ? 4 : 1; }
+bool pq2SplitFits(uint32_t k, uint32_t splits) { return splits && (k / 32) % splits == 0 && (k / 32 / splits) % 4 == 0; }
+// The W-A8 tile of a plan: its rows (8 or 16) and K split; rows 0 where the bf16 kernels keep the plan.
+struct Pq2W8Tile {
+  uint32_t rows = 0, splits = 0;
+};
+Pq2W8Tile pq2W8Tile(bool apple10, const LinearPlan &plan, const Projection &p, const Projection *gate,
+                    const LinearBuffers &b) {
+  const LinearWorkload w = plan.workload();
+  const LinearConfig c = plan.configuration();
+  const auto [n, k] = w.matrix;
+  const uint32_t rows = plan.storageRows();
+  const std::vector<QuantizedSegment> &segments = p.blocks().segments;
+  // An fp32 destination (the vocabulary head's logits) as one segment without an epilogue.
+  const bool f32 = plan.destination() == FloatOutput::Float32;
+  if (!apple10 || w.phase != LinearPhase::Decode || c.tile != LinearTile::GgufStaged || c.oneGateUpPass ||
+      (rows != 8 && rows != 16) || w.rows > rows || (f32 && (segments.size() != 1 || w.epilogue != LinearEpilogue::None)))
+    return {};
+  if (segments.size() > 3 || !allPq2(segments) || k % GGUF_ROTATION_BLOCK || !pq2SplitFits(k, c.splits))
+    return {};
+  if (w.epilogue == LinearEpilogue::GateUp
+          ? !(gate && gate->blocks().segments.size() == 1 && allPq2(gate->blocks().segments) && segments.size() == 1)
+          : !(w.epilogue == LinearEpilogue::None || segments.size() == 1))
+    return {};
+  if (w.rows > 8) return {rows, c.splits};
+  // One lane: the 8-row tile, also where the plan stages it on the 16-row tile, whose padding lane the int8 tile
+  // would compute in full, at its own split (pq2W8Splits) where the split scratch holds it, else unsplit.
+  const uint32_t splits = pq2W8Splits(n, k);
+  const bool fits = pq2SplitFits(k, splits) &&
+                    (splits == 1 || (b.scratch.partials && b.scratch.counters &&
+                                     b.scratch.partials.sizeBytes() >= uint64_t{splits} * 8 * n * sizeof(float) &&
+                                     b.scratch.counters.sizeBytes() >= uint64_t{n / GGUF_TILE_COLUMNS} * sizeof(uint32_t)));
+  return {8, fits ? splits : 1};
+}
+void addPq2W8(metal::CommandGraph &graph, const metal::MetalBuffer &a8, const LinearBuffers &b, const Projection &p,
+              const LinearPlan &plan, const Projection *gate, Pq2W8Tile tile,
+              const std::array<metal::MetalBuffer, 2> &split) {
+  const LinearWorkload w = plan.workload();
+  const auto [n, k] = w.matrix;
+  const metal::MetalBuffer &partials = split[0], &counters = split[1];
+  const std::string name = "gguf_pq2w8_m" + std::to_string(tile.rows) + "_";
+  const auto run = [&](std::span<const QuantizedSegment> group, char epilogue, const metal::MetalBuffer &output,
+                       const metal::MetalBuffer &aux) {
+    GgufPq2W8Params params{k, tile.splits, n, GGUF_ROTATION_BLOCK, 0, {0, 0, 0}, {0, 0, 0}, 0};
+    std::vector<metal::MetalBuffer> bindings{a8};
+    uint32_t columns = 0;
+    for (size_t i = 0; i < 3; ++i) {
+      const QuantizedSegment &s = group[std::min(i, group.size() - 1)];
+      if (i < group.size()) {
+        params.cols[i] = s.outputSize;
+        params.offset[i] = s.columnOffset;
+        columns += s.outputSize;
+      }
+      bindings.insert(bindings.end(), {s.plane0, s.meta});
+    }
+    bindings.insert(bindings.end(), {output, partials, counters, aux});
+    graph.add(name + epilogue + (plan.destination() == FloatOutput::Float32 ? "_f32" : ""), std::move(bindings), params,
+              {columns / GGUF_TILE_COLUMNS, tile.splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
+  };
+  const auto tensor = [&](const QuantizedSegment &s, char epilogue, const metal::MetalBuffer &output,
+                          const metal::MetalBuffer &aux) { run(std::span(&s, 1), epilogue, output, aux); };
+  const std::vector<QuantizedSegment> &segments = p.blocks().segments;
+  if (segments.size() == 1 || w.epilogue == LinearEpilogue::GateUp) {
+    addDecodeTensor(b, w.epilogue, segments.front(), gate, tensor);
+    return;
+  }
+  run(std::span(segments), epilogueSuffix(LinearEpilogue::None), b.output, b.output);
+}
 } // namespace
 
 void LinearPlan::requireConfiguration() const {
@@ -573,6 +662,10 @@ LinearScratchSize Linear::ggufDecodeScratchSize(LinearWorkload w, bool registerF
     size.include(LinearPlan(w, stagedDecode(n, k, w.rows, 0, gpuCores_, family_, gateUp)).scratchSize());
   if (gateUp && spreadsStagedDecode(family_, gpuCores_))
     size.include(LinearPlan(w, stagedDecode(n, k, w.rows, 0, gpuCores_, family_, true, Passes::One)).scratchSize());
+  // Int8-activation decode: one lane's 8-row W-A8 tile at its own split (pq2W8Tile).
+  if (decodeInt8_ && family_ == GpuFamilyClass::Apple10 && w.rows <= 8)
+    if (const uint32_t splits = pq2W8Splits(n, k); splits > 1 && pq2SplitFits(k, splits))
+      size.include(LinearPlan(w, LinearConfig{.tile = LinearTile::GgufStaged, .splits = splits}).scratchSize());
   return size;
 }
 
@@ -608,6 +701,18 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
     if (k % GGUF_ROTATION_BLOCK)
       throw std::invalid_argument("a rotated projection takes whole rotation blocks");
     requireBytes(p.rotation.signs, k, "rotation sign");
+    if (const Pq2W8Tile tile = decodeInt8_ ? pq2W8Tile(family_ == GpuFamilyClass::Apple10, plan, p, gate, b)
+                                           : Pq2W8Tile{};
+        tile.rows) {
+      // Int8 rows of the rotated input, quantized inside the rotation, then the W-A8 tile. Rows past the workload's
+      // are padding, as in the staged tile.
+      requireBytes(b.scratch.rotated, pq2A8Bytes(k, tile.rows), "projection int8 rotated input");
+      graph.add("gguf_rotate_a8", {b.input, p.rotation.signs, b.scratch.rotated},
+                GgufA8QuantParams{k, GGUF_ROTATION_BLOCK, 0, tile.rows, {0, 0, 0, 0}},
+                {k / GGUF_ROTATION_BLOCK, w.rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
+      addPq2W8(graph, b.scratch.rotated, b, p, plan, gate, tile, splitScratch(b, tile.splits));
+      return;
+    }
     graph.add("gguf_rotate", {b.input, p.rotation.signs, b.scratch.rotated}, GgufRotationParams{k},
               {k / GGUF_ROTATION_BLOCK, w.rows, 1}, {GGUF_ROTATION_THREADS, 1, 1});
     LinearBuffers rotated = b;

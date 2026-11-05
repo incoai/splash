@@ -82,6 +82,7 @@ OPTIONS = {
         "--state-format", {"fp32": "fp32", "bf16": "bf16"}, ("fp16", "int8")
     ),
     "--disable-ane": ([(["--disable-ane"], True)], []),
+    "--decode-int8": ([(["--decode-int8"], True)], []),
     "--verify-rows": values(
         "--verify-rows",
         {"auto": "auto", "all": "all"},

@@ -138,9 +138,9 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   requireConfiguration();
 }
 
-Linear::Linear(const DeviceCapabilities &device) noexcept
+Linear::Linear(const DeviceCapabilities &device, bool decodeInt8) noexcept
     : family_(gpuFamilyClass(device.appleGpuFamily)),
-      gpuCores_(plannedGpuCores(device)) {}
+      gpuCores_(plannedGpuCores(device)), decodeInt8_(decodeInt8) {}
 
 uint32_t Linear::decodeStorageRows(uint32_t rows, ProjectionShape shape) const {
   const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, LinearPhase::Decode, LinearEpilogue::None};
@@ -177,8 +177,10 @@ LinearScratchSize Linear::decodeScratchSize(ProjectionShape shape) const {
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
       bound.include(
           ggufDecodeScratchSize(decode({shape.outputSize, shape.inputSize}, lanes, epilogue), shape.registerFormats));
-  // Decode plans store at most every lane's rows.
+  // Decode plans store at most every lane's rows; the int8 rows and scales of
+  // the int8-activation tile's 16 rows (decodeInt8) take less than half that.
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, kMaximumDecodeTileRows);
+  static_assert(kMaximumDecodeTileRows >= 32);
   return bound;
 }
 
