@@ -189,3 +189,20 @@ output.py's pending machinery is shaped for but the chat format's
 single-token fields do not state. That is the remaining server work; until
 it lands, families.py stays without Ripple, so install does not open to a
 serve that would fail at startup.
+
+## The block composition's validation
+
+The post-norm block's pieces are individually tested: the mix and the
+placed value projection (ripple-value-mix), the attention kernels
+(attention-variants), the norms and the clamped epilogue (the goldens and
+the quantized kernel tests). The composition's ordering — which norm feeds
+which add, and where the residual joins — is code review against the
+pinned graph spec.
+
+The full numerical gate is the parity harness: a tiny Ripple model loaded
+end-to-end, its prefill run through the engine and through a CPU reference
+of the block graph, the logits compared. The test's block-level attempt
+found the float path's epilogue coverage too narrow for an isolated block
+test (the gated epilogues are quantized-path only); the harness runs the
+real quantized path through the full loading machinery, which the goldens
+and the planning tests already exercise.

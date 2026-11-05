@@ -836,7 +836,6 @@ TEST_RIPPLE_VALUE_MIX := $(ENGINE_TEST_BUILD)/ripple-value-mix
 RIPPLE_VARIANT_LIB := $(RIPPLE_METAL_BUILD)/ripple_draft_variant.metallib
 
 $(TEST_RIPPLE_VALUE_MIX): BUILD_CONFIG := $(TEST_CONFIG_DIGEST)
-
 $(TEST_RIPPLE_VALUE_MIX): dev/tests/engine/ripple_value_mix_test.mm \
 		$(ENGINE_LIBRARY) $(LIB) | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $< \
