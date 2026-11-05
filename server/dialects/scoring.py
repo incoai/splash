@@ -629,8 +629,7 @@ def prepare_judgment(app, body, *, deadline, disconnected):
     )
     if unknown:
         raise APIError(400, f"unsupported fields: {', '.join(unknown)}")
-    if not app.accepts_model(body.get("model")):
-        raise APIError(404, f"model {body['model']} not found", "model_not_found")
+    app.check_model(body)
     try:
         validate_row(body)
     except ValueError as error:

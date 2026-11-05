@@ -257,6 +257,12 @@ class Frontend:
             isinstance(model, str) and model in self.model_names
         )
 
+    def check_model(self, body):
+        """Refuse a request whose model is one the server does not answer to
+        (accepts_model)."""
+        if not self.accepts_model(body.get("model")):
+            raise APIError(404, f"model {body['model']} not found", "model_not_found")
+
     @property
     def max_context(self):
         """The context the latest engine serves: a relaunch whose plan holds
@@ -472,10 +478,7 @@ class Frontend:
         (request_fields.generation): the prompt generates as given, with no
         chat template, reasoning split, tools or images."""
         with self.preparation(deadline):
-            if not self.accepts_model(body.get("model")):
-                raise APIError(
-                    404, f"model {body['model']} not found", "model_not_found"
-                )
+            self.check_model(body)
             # A request generates one text and returns only that text.
             for field in ("suffix", "logprobs"):
                 if field in body:
@@ -639,8 +642,7 @@ class Frontend:
         self.preparation_slots.release()
 
     def _prepare_prompt(self, body, tool_namespaces, *, deadline, without_slot):
-        if not self.accepts_model(body.get("model")):
-            raise APIError(404, f"model {body['model']} not found", "model_not_found")
+        self.check_model(body)
         reasoning_effort = body.get("reasoning_effort")
         if reasoning_effort is None:
             reasoning_effort = self.default_reasoning_effort
