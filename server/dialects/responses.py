@@ -20,12 +20,13 @@ RESPONSE_PATH = re.compile(r"/v1/responses/(resp_[A-Za-z0-9_]+)")
 
 
 def post(exchange, body, deadline):
-    progress = request_fields.progress_flag(body)
+    streamed = request_fields.streaming(body)
+    progress = request_fields.progress_flag(body, streamed)
     job = prepare(
         exchange.app, body, deadline=deadline, reserve_input=exchange.reserve_input
     )
     job.flags |= progress
-    respond = stream if body.get("stream") else complete
+    respond = stream if streamed else complete
     return job, partial(respond, exchange)
 
 
@@ -471,8 +472,6 @@ def to_chat_body(body, items):
         raise APIError(400, "background responses are not supported")
     if body.get("truncation") not in (None, "disabled"):
         raise APIError(400, "only disabled truncation is supported")
-    if body.get("stream") is not None and not isinstance(body["stream"], bool):
-        raise APIError(400, "stream must be a boolean")
     chat = {
         "messages": normalize_input(body.get("instructions"), items),
         "parallel_tool_calls": body.get("parallel_tool_calls"),

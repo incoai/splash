@@ -14,11 +14,12 @@ from ..tool_schema import TAG_NAME_RULE, is_tag_name
 
 def post_messages(exchange, body, deadline):
     app = exchange.app
-    progress = request_fields.progress_flag(body)
+    streamed = request_fields.streaming(body)
+    progress = request_fields.progress_flag(body, streamed)
     chat, omitted = to_chat_body(body, thinking_resolver=app.thinking_codec.decode)
     job = app.prepare(chat, deadline=deadline, output_field="max_tokens")
     job.flags |= progress
-    respond = stream if body.get("stream") else complete
+    respond = stream if streamed else complete
     return job, partial(respond, exchange, omitted=omitted)
 
 
@@ -92,8 +93,6 @@ def to_chat_body(body, *, thinking_resolver):
         or max_tokens <= 0
     ):
         raise APIError(400, "max_tokens must be a positive integer")
-    if not isinstance(body.get("stream", False), bool):
-        raise APIError(400, "stream must be a boolean")
     chat, omitted = _chat(body, thinking_resolver)
     # Anthropic continues a final assistant message (a prefill); Splash would
     # close that turn and start another, so it refuses it.

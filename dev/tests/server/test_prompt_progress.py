@@ -166,52 +166,38 @@ class PromptProgressTests(unittest.TestCase):
         harness = Harness(runtime)
         self.addCleanup(harness.close)
         progress = "return_progress requires stream: true and must be a boolean"
-        # Each API's refusal of a stream that is not a boolean.
-        stream_refusals = {
-            "/v1/chat/completions": "invalid streaming options",
-            "/v1/completions": "invalid streaming options",
-            "/v1/responses": "stream must be a boolean",
-            "/v1/messages": "stream must be a boolean",
-        }
+        stream = "stream must be a boolean"
+        paths = (
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/responses",
+            "/v1/messages",
+        )
         cases = [
-            (path, extra, 400, message)
-            for path, stream_refusal in stream_refusals.items()
+            (path, extra, message)
+            for path in paths
             for extra, message in (
                 ({"return_progress": True}, progress),
                 ({"return_progress": True, "stream": False}, progress),
                 ({"return_progress": 1, "stream": True}, progress),
                 ({"return_progress": "true", "stream": True}, progress),
-                ({"stream": "true"}, stream_refusal),
+                ({"stream": "true"}, stream),
+                ({"stream": 1}, stream),
+                ({"stream": []}, stream),
+                # Every API reads stream before its other fields.
+                ({"stream": "true", "return_progress": True}, stream),
             )
         ]
-        # Where each API reads stream among its other fields.
         cases += [
-            (
-                "/v1/chat/completions",
-                {"return_progress": True, "stream": "true"},
-                400,
-                progress,
-            ),
             (
                 "/v1/responses",
                 {"stream": "true", "previous_response_id": "resp_unknown"},
-                404,
-                "previous response not found",
+                stream,
             ),
-            (
-                "/v1/responses",
-                {"stream": "true", "background": True},
-                400,
-                "background responses are not supported",
-            ),
-            (
-                "/v1/messages",
-                {"stream": "true", "max_tokens": None},
-                400,
-                "max_tokens must be a positive integer",
-            ),
+            ("/v1/responses", {"stream": "true", "background": True}, stream),
+            ("/v1/messages", {"stream": "true", "max_tokens": None}, stream),
         ]
-        for path, extra, status, message in cases:
+        for path, extra, message in cases:
             with self.subTest(path=path, extra=extra):
                 body = {
                     "model": "test-model",
@@ -224,7 +210,7 @@ class PromptProgressTests(unittest.TestCase):
                 answer, _, payload = harness.request("POST", path, body)
                 self.assertEqual(
                     (answer, json.loads(payload)["error"]["message"]),
-                    (status, message),
+                    (400, message),
                 )
         self.assertEqual(runtime.requests, [])
 

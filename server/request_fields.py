@@ -9,11 +9,21 @@ from .errors import APIError
 _PRIORITIES = {priority.name.lower(): priority for priority in wire.RequestPriority}
 
 
-def progress_flag(body):
+def streaming(body):
+    """Whether a generation request streams its answer. Every generation
+    API reads its stream here first, before its other fields, so an invalid
+    one is refused alike everywhere."""
+    stream = body.get("stream", False)
+    if not isinstance(stream, bool):
+        raise APIError(400, "stream must be a boolean")
+    return stream
+
+
+def progress_flag(body, streamed):
     """The request flag of a generation request's return_progress, which only
-    a stream takes."""
+    a stream takes; `streamed` is the request's streaming(body)."""
     value = body.get("return_progress", False)
-    if not isinstance(value, bool) or (value and body.get("stream") is not True):
+    if not isinstance(value, bool) or (value and not streamed):
         raise APIError(
             400, "return_progress requires stream: true and must be a boolean"
         )

@@ -25,8 +25,9 @@ def post_chat_count_tokens(exchange, body, deadline):
 def _post(exchange, body, deadline, prepare, *, chat):
     """Prepare a Chat or text completion, and the answer that writes its
     output: whole, or as a stream."""
-    progress = request_fields.progress_flag(body)
-    streamed, stream_options = _stream_options(body)
+    streamed = request_fields.streaming(body)
+    progress = request_fields.progress_flag(body, streamed)
+    stream_options = _stream_options(body)
     job = prepare(body, deadline=deadline)
     job.flags |= progress
     if streamed:
@@ -35,10 +36,9 @@ def _post(exchange, body, deadline, prepare, *, chat):
 
 
 def _stream_options(body):
-    """A Chat or text completion request's stream and its stream_options."""
-    stream = body.get("stream", False)
+    """A Chat or text completion request's stream_options."""
     options = body.get("stream_options", {})
-    if not isinstance(stream, bool) or not isinstance(options, dict):
+    if not isinstance(options, dict):
         raise APIError(400, "invalid streaming options")
     # A null include_usage is one left out, as a null field is.
     include_usage = options.get("include_usage")
@@ -46,7 +46,7 @@ def _stream_options(body):
         include_usage = False
     if not isinstance(include_usage, bool):
         raise APIError(400, "invalid streaming options")
-    return stream, {"include_usage": include_usage}
+    return {"include_usage": include_usage}
 
 
 def complete(exchange, job, *, chat):
