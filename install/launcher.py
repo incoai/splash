@@ -41,11 +41,14 @@ STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 
 class LauncherError(RuntimeError):
-    """A refusal of the launcher's, of a serve_record kind."""
+    """A refusal of the launcher's, of a serve_record kind. said: whether the
+    program that failed printed it already, so the launcher records it
+    without printing it again."""
 
-    def __init__(self, message, kind=serve_record.INTERNAL):
+    def __init__(self, message, kind=serve_record.INTERNAL, *, said=False):
         super().__init__(message)
         self.kind = kind
+        self.said = said
 
 
 class ArgumentRefusal(SystemExit):
@@ -172,8 +175,10 @@ def _ensure_installed(selection):
     if selection.language_only:
         command.insert(-1, "--language-only")
     # Its messages go on to the terminal; its failure, an error event
-    # (install/models.py main), is what the launcher says.
-    failure = "model download or verification failed"
+    # (install/models.py main), is what the launcher records. The installer
+    # prints that failure on stderr itself, so only one it ended without is
+    # the launcher's to say.
+    failure = None
 
     def relay(line):
         nonlocal failure
@@ -188,7 +193,11 @@ def _ensure_installed(selection):
             sys.stdout.flush()
 
     if _run_held(command, cwd=ROOT, relay=relay):
-        raise LauncherError(failure, serve_record.INSTALL)
+        if failure is None:
+            raise LauncherError(
+                "model download or verification failed", serve_record.INSTALL
+            )
+        raise LauncherError(failure, serve_record.INSTALL, said=True)
 
 
 def _prepare_local_model(args):
@@ -701,12 +710,11 @@ def main(argv=None):
         raise
     try:
         return serve(args) if args.command == "serve" else coding_client(args)
-    except (
-        LauncherError,
-        clients.ClientError,
-        OSError,
-        serve_record.NotRecorded,
-    ) as error:
+    except LauncherError as error:
+        if not error.said:
+            print(f"error: {error}", file=sys.stderr)
+        return 1
+    except (clients.ClientError, OSError, serve_record.NotRecorded) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
     except StopSignal as stop:

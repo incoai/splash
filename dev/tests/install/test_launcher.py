@@ -1549,8 +1549,64 @@ class LauncherTests(unittest.TestCase):
                     json.loads((runtime / "serve-8000.json").read_text()),
                     {"pid": os.getpid(), "phase": "failed", "failure": failure},
                 )
-                self.assertEqual(error.getvalue(), f"error: {failure['message']}\n")
+                # The installer says its own failure on stderr
+                # (test_an_installer_failure_is_said_once).
+                said = "" if case == "install" else f"error: {failure['message']}\n"
+                self.assertEqual(error.getvalue(), said)
                 self.assertEqual(relayed.getvalue(), output)
+
+    def test_an_installer_failure_is_said_once(self):
+        """The installer says its failure on stderr itself, beside the error
+        event the launcher records it by, so the launcher does not say it
+        again; an installer that ended without one is said by the launcher."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+            script = (
+                "import sys\nfrom pathlib import Path\nfrom install import launcher\n"
+                "root = Path(sys.argv[1])\n"
+                "launcher.RUNTIME_DIR = root / 'runtime'\n"
+                "launcher.paths.MODELS = root / 'models'\n"
+                "launcher.paths.PYTHON = Path(sys.argv[3])\n"
+                "launcher._ensure_runtime = lambda: None\n"
+                "raise SystemExit(launcher.main(\n"
+                "    ['serve', '--model', 'test/model', '--offline', '--port', sys.argv[2]]\n"
+                "))\n"
+            )
+            crashed = root / "crashed"
+            crashed.write_text("#!/bin/sh\nexit 1\n")
+            crashed.chmod(0o755)
+            unresolved = (
+                "cannot resolve test/model: HF_HUB_OFFLINE is set; neither this "
+                "installation nor the Hub cache records a commit for the default branch"
+            )
+            for case, python, message in (
+                # The real installer, offline, with an empty Hub cache.
+                ("installer", sys.executable, unresolved),
+                ("crashed", crashed, "model download or verification failed"),
+            ):
+                with self.subTest(case):
+                    result = subprocess.run(
+                        [sys.executable, "-c", script, str(root), str(port), python],
+                        cwd=Path(launcher.__file__).resolve().parents[1],
+                        env=dict(os.environ, HF_HUB_CACHE=str(root / "hub")),
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                    )
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertEqual(
+                        result.stderr.splitlines().count(f"error: {message}"),
+                        1,
+                        result.stderr,
+                    )
+                    record = root / f"runtime/serve-{port}.json"
+                    self.assertEqual(
+                        json.loads(record.read_text())["failure"],
+                        {"kind": "install", "message": message},
+                    )
 
     def test_a_start_refused_the_lock_leaves_the_servers_record(self):
         with tempfile.TemporaryDirectory() as temporary:
