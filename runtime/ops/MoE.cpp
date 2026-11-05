@@ -15,6 +15,34 @@
 #include <vector>
 
 namespace splash::ops {
+
+namespace {
+// The formats the W-A8 tile takes (kernels/common/gguf_staged_i8.h moe_i8_format).
+constexpr uint32_t kInt8Formats[] = {
+    GGUF_FMT_IQ2S, GGUF_FMT_IQ2XS, GGUF_FMT_IQ3S, GGUF_FMT_IQ3XXS, GGUF_FMT_IQ4XS,
+    GGUF_FMT_Q6K,  GGUF_FMT_Q80,   GGUF_FMT_Q2K,  GGUF_FMT_Q4K,    GGUF_FMT_Q5K,
+};
+uint64_t alignUp(uint64_t bytes) { return (bytes + 255) / 256 * 256; }
+} // namespace
+
+uint32_t moeInt8Formats() noexcept {
+  uint32_t mask = 0;
+  for (const uint32_t id : kInt8Formats) mask |= 1u << id;
+  return mask;
+}
+
+MoeInt8 moeInt8Decode() noexcept { return {.activations = 1, .formats = moeInt8Formats()}; }
+
+MoeInt8Layout moeInt8Layout(MoeShape shape, uint64_t groupedRows) noexcept {
+  MoeInt8Layout layout;
+  layout.x8 = 0;
+  layout.xScales = alignUp(groupedRows * shape.hiddenSize);
+  layout.d8 = alignUp(layout.xScales + groupedRows * sizeof(float));
+  layout.dScales = alignUp(layout.d8 + groupedRows * shape.expertIntermediateSize);
+  layout.bytes = layout.dScales + groupedRows * (shape.expertIntermediateSize / 32) * sizeof(float);
+  return layout;
+}
+
 namespace {
 
 // A GGUF tensor of output x input weights, of a GGUF_FMT_* format unless
@@ -51,6 +79,31 @@ void validate(const BlockMoeWeights &weights, MoeShape shape) {
   }
   if (!weights.slots) throw std::invalid_argument("MoE routed experts have no slots");
   requireBytes(weights.slotTable, uint64_t{shape.experts} * sizeof(uint32_t), "MoE slot table");
+  if (shape.ulmoeExperts() != weights.ulmoe.present())
+    throw std::invalid_argument("MoE ULMoE experts do not match the plan");
+  if (shape.ulmoeExperts()) {
+    // The ULMoE passes' grids and threadgroups: 64 columns per threadgroup, 256 threads per gathered or swiglu row.
+    if (hidden % 256 || intermediate % 256 || hidden > 4096 || intermediate > 2048 || weights.stream ||
+        shape.sharedSlices != 1)
+      throw std::invalid_argument("MoE ULMoE experts take resident blocks of one shared slice and widths of whole 256");
+    for (const auto &[projection, name, columns, inputs] :
+         {std::tuple{&weights.ulmoe.gateUp, "gate/up", 2 * intermediate, hidden},
+          std::tuple{&weights.ulmoe.down, "down", hidden, intermediate}}) {
+      const uint32_t residual = projection->residualSize;
+      if (residual % ULMOE_MACRO_GROUP || residual > inputs || inputs % ULMOE_MACRO_GROUP)
+        throw std::invalid_argument(std::string("MoE ULMoE ") + name + " residual does not match the plan");
+      const uint64_t groups = uint64_t{shape.experts} * ((inputs + residual) / ULMOE_MACRO_GROUP) * columns;
+      requireBytes(projection->codes, groups * 16, std::string("MoE ULMoE ") + name + " codes");
+      requireBytes(projection->meta, groups * 4, std::string("MoE ULMoE ") + name + " meta");
+      requireBytes(projection->anchors, uint64_t{columns} * sizeof(float), std::string("MoE ULMoE ") + name + " anchors");
+    }
+    requireBytes(weights.ulmoe.inputOrder, uint64_t{hidden} * sizeof(uint32_t), "MoE ULMoE input order");
+    for (const auto &[projection, name, output, input] :
+         {std::tuple{&weights.gate, "gate", intermediate, hidden}, std::tuple{&weights.up, "up", intermediate, hidden},
+          std::tuple{&weights.down, "down", hidden, intermediate}})
+      requireSegment(projection->shared, shape.sharedSlices * output, input, false, std::string("MoE shared ") + name);
+    return;
+  }
   for (const auto &[projection, name, output, input] :
        {std::tuple{&weights.gate, "gate", intermediate, hidden}, std::tuple{&weights.up, "up", intermediate, hidden},
         std::tuple{&weights.down, "down", hidden, intermediate}}) {
@@ -62,7 +115,7 @@ void validate(const BlockMoeWeights &weights, MoeShape shape) {
     throw std::invalid_argument("MoE expert chunks were checked for another block");
 }
 
-MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows, MoeGgufTile ggufTile) {
+MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows, MoeGgufTile ggufTile, bool int8) {
   if (!shape.valid())
     throw std::invalid_argument("invalid MoE workspace shape");
   const uint64_t routes = uint64_t{rows} * shape.routesPerToken();
@@ -74,7 +127,10 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows, MoeG
   // plans also hold the down pass's Table16 tiles there.
   const uint64_t scoreBytes = uint64_t{rows} * shape.routerWidth() * sizeof(float);
   const bool table16 = ggufTile == MoeGgufTile::Register;
-  const uint64_t sumsBytes = table16 ? tableSumsBytes(LinearInput::Table16, widest, groupedRows) : 0;
+  // Int8 plans (MoePlan::int8) keep their int8 rows there (moeInt8Layout).
+  const uint64_t sumsBytes = table16 ? tableSumsBytes(LinearInput::Table16, widest, groupedRows)
+                             : int8  ? moeInt8Layout(shape, groupedRows).bytes
+                                     : 0;
   return {routes * sizeof(uint32_t), routes * sizeof(float),
           uint64_t{tiles} * sizeof(MoeTileDescriptor), sizeof(MoeTileCount),
           groupedRows * sizeof(uint32_t), routes * sizeof(uint32_t),
@@ -97,6 +153,35 @@ std::string routingKernel(std::string name, MoeShape shape, std::string_view Com
   if (shape.routerWidth() == SPLASH_MOE_WIDE_EXPERT_SLOTS) name += "_e512";
   name += compiledRouting(shape).*suffix;
   return name;
+}
+
+// The int8 parameters of an int8 plan (MoePlan::int8): its layout in groupedSums and switches; the up epilogue
+// writes the down input's int8 rows where a down segment runs int8.
+MoeInt8Params int8Params(const MoePlan &plan, const BlockMoeWeights &weights) {
+  const MoeInt8 &int8 = plan.configuration().int8;
+  const MoeInt8Layout layout = moeInt8Layout(plan.shape(), uint64_t{plan.maximumTiles()} * plan.tileRows());
+  const auto takes = [&](const QuantizedSegment &segment) {
+    return segment.formatId < 32 && ((int8.formats >> segment.formatId) & 1u);
+  };
+  const uint32_t mode = (int8.pow2 ? MOE_A8_POW2 : 0u) |
+                        (takes(weights.down.routed) || takes(weights.down.shared) ? MOE_A8_DOWN : 0u);
+  return {int8.formats, mode, static_cast<uint32_t>(layout.x8), static_cast<uint32_t>(layout.xScales),
+          static_cast<uint32_t>(layout.d8), static_cast<uint32_t>(layout.dScales)};
+}
+
+// Whether a fake quantizing plan (MoeInt8::activations 2) rounds the gate/up input (`down` false) or the down input:
+// where the W-A8 tile would take the pass's segments (MoeInt8::formats; none named, every pass), so that a test
+// compares a bf16 pass with the int8 pass of the same formats.
+bool fakeRounds(const MoePlan &plan, const BlockMoeWeights &weights, bool down) {
+  const MoeInt8 &int8 = plan.configuration().int8;
+  if (!plan.int8() || int8.activations != 2) return false;
+  if (!int8.formats) return true;
+  const auto takes = [&](const QuantizedSegment &segment) {
+    return segment.formatId < 32 && ((int8.formats >> segment.formatId) & 1u);
+  };
+  return down ? takes(weights.down.routed) || takes(weights.down.shared)
+              : takes(weights.gate.routed) || takes(weights.gate.shared) || takes(weights.up.routed) ||
+                    takes(weights.up.shared);
 }
 
 // Whether a plan runs gate and up in one pass
@@ -153,6 +238,33 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
   };
   const uint32_t hidden = shape.hiddenSize;
   const uint32_t intermediate = shape.expertIntermediateSize;
+  // Int8 plans with W-A8 formats (MoeInt8::formats) run the int8 passes (kernels/shared/moe_gguf_i8.metal); a fake
+  // quantizing plan (MoeInt8::activations 2) rounds the intermediate before the down pass.
+  const bool wa8 = plan.int8() && plan.configuration().int8.activations == 1 && plan.configuration().int8.formats;
+  const bool fake = fakeRounds(plan, weights, true);
+  if (wa8) {
+    const MoeInt8Params a8 = int8Params(plan, weights);
+    const BlockExpertProjection &gate = weights.gate, &up = weights.up, &down = weights.down;
+    const bool mixed = gate.routed.formatId != up.routed.formatId || gate.shared.formatId != up.shared.formatId;
+    graph.add(std::string("moe_expert_gguf_i8_m8_gate_up") + (mixed ? "_mixed" : "") + slices,
+              {scratch.groupedInput, scratch.tileDescriptors, scratch.tileCount,
+               gate.shared.plane0, gate.shared.plane1Slot(), gate.shared.meta,
+               up.shared.plane0, up.shared.plane1Slot(), up.shared.meta,
+               scratch.expertIntermediate, weights.slotTable, scratch.groupedSums},
+              MoeGgufI8GateUpParams{{hidden, intermediate, shape.experts, gate.routed.formatId, gate.shared.formatId,
+                                     up.routed.formatId, up.shared.formatId, floorSlots, chunkSlots},
+                                    a8},
+              {group.gate_up_columns, tiles, 1}, gateUpGrid, {threads, 1, 1});
+    graph.addresses(weights.chunks.planes());
+    graph.add("moe_expert_gguf_i8_m8_a" + slices,
+              {scratch.expertIntermediate, scratch.tileDescriptors, scratch.tileCount, down.shared.plane0,
+               down.shared.plane1Slot(), down.shared.meta, scratch.expertOutput, scratch.expertOutput,
+               weights.slotTable, scratch.groupedSums},
+              MoeGgufI8ExpertParams{params(down, 2, hidden, intermediate), a8}, {group.down_columns, tiles, 1},
+              downGrid, {threads, 1, 1});
+    graph.addresses(weights.chunks.planes());
+    return;
+  }
   if (oneGateUpPass(plan)) {
     const BlockExpertProjection &gate = weights.gate, &up = weights.up;
     // One pair table where gate and up share their formats, one each otherwise.
@@ -172,6 +284,11 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
     pass(weights.up, 1, true, scratch.groupedInput, scratch.expertIntermediate,
          intermediate, hidden, group.gate_up_columns, gateUpGrid);
   }
+  if (fake)
+    graph.add("moe_a8_fake", {scratch.expertIntermediate, scratch.tileDescriptors, scratch.tileCount},
+              MoeA8FakeParams{plan.tileRows(), intermediate, 32,
+                              plan.configuration().int8.pow2 ? MOE_A8_POW2 : 0u},
+              {tiles, plan.tileRows(), 1}, {32, 1, 1});
   if (table16)
     graph.add("moe_prepare_table16",
               {scratch.expertIntermediate, scratch.tileCount,
@@ -180,6 +297,56 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
   pass(weights.down, 2, false,
        table16 ? scratch.groupedInput : scratch.expertIntermediate,
        scratch.expertOutput, hidden, intermediate, group.down_columns, downGrid);
+}
+
+MoeGroupParams groupParams(const MoePlan &plan);
+
+// ULMoE blocks: the gather (routed rows in the salience order, int8 with row scales on the int8
+// path; the shared expert's rows bf16 in model order), gate/up (2I columns, gate then up, bf16 into expertOutput,
+// which down overwrites after the swiglu consumed it), the swiglu into expertIntermediate (routed rows int8 with row
+// scales on the int8 path) and down into expertOutput, all through kernels/shared/moe_ulmoe.metal, whose gate/up and
+// down passes run the shared expert's tiles on the GGUF column GEMV beside the routed tiles. Tile t's input block is
+// its 8 bf16 rows' bytes, which hold the 8 int8 rows and their scales.
+void addUlmoeRouted(metal::CommandGraph &graph, const MoeBuffers &buffers, const BlockMoeWeights &weights,
+                    const MoePlan &plan) {
+  const MoeShape shape = plan.shape();
+  const MoeScratch &scratch = buffers.scratch;
+  const uint32_t tiles = plan.maximumTiles(), tileRows = plan.tileRows();
+  const uint32_t hidden = shape.hiddenSize, intermediate = shape.expertIntermediateSize;
+  if (tileRows != 8 || plan.configuration().ggufTile != MoeGgufTile::Staged)
+    throw std::invalid_argument("ULMoE experts run staged 8-row tiles");
+  const bool int8 = plan.configuration().ulmoeInt8;
+  const UlmoeMoeExperts &u = weights.ulmoe;
+  const MoeGroupParams group = groupParams(plan);
+  const metal::IndirectGrid gateUpGrid{scratch.tileCount, offsetof(MoeTileCount, gate_up_grid)};
+  const metal::IndirectGrid downGrid{scratch.tileCount, offsetof(MoeTileCount, down_grid)};
+  if (group.gate_up_columns * 64 != 2 * intermediate || group.down_columns * 64 != hidden)
+    throw std::invalid_argument("ULMoE passes take the staged grids of 64 columns");
+  graph.add(int8 ? "moe_gather_rows_ulmoe_a8" : "moe_gather_rows_ulmoe",
+            {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors, scratch.tileCount, scratch.groupedInput,
+             u.inputOrder},
+            MoeUlmoeGatherParams{tileRows, hidden, shape.routesPerToken(), shape.experts}, {tiles, tileRows, 1},
+            {256, 1, 1});
+  const std::string pass = int8 ? "moe_ulmoe_w8" : "moe_ulmoe_bf16";
+  const QuantizedSegment &gate = weights.gate.shared, &up = weights.up.shared, &down = weights.down.shared;
+  graph.add(pass,
+            {scratch.groupedInput, scratch.tileDescriptors, scratch.tileCount, u.gateUp.codes, u.gateUp.meta,
+             u.gateUp.anchors, scratch.expertOutput, gate.plane0, gate.plane1Slot(), gate.meta, up.plane0,
+             up.plane1Slot(), up.meta, scratch.groupedInput},
+            MoeUlmoeParams{hidden, u.gateUp.residualSize, 2 * intermediate, shape.experts, tileRows * hidden * 2,
+                           intermediate, gate.formatId, up.formatId},
+            {group.gate_up_columns, tiles, 1}, gateUpGrid, {64, 1, 1});
+  graph.add(int8 ? "moe_ulmoe_swiglu_a8" : "moe_ulmoe_swiglu",
+            {scratch.expertOutput, scratch.tileDescriptors, scratch.tileCount, scratch.expertIntermediate},
+            MoeUlmoeParams{intermediate, 0, intermediate, shape.experts, tileRows * intermediate * 2, 0, 0, 0},
+            {tiles, tileRows, 1}, {256, 1, 1});
+  graph.add(pass,
+            {scratch.expertIntermediate, scratch.tileDescriptors, scratch.tileCount, u.down.codes, u.down.meta,
+             u.down.anchors, scratch.expertOutput, down.plane0, down.plane1Slot(), down.meta, down.plane0,
+             down.plane1Slot(), down.meta, scratch.expertIntermediate},
+            MoeUlmoeParams{intermediate, u.down.residualSize, hidden, shape.experts, tileRows * intermediate * 2,
+                           hidden, down.formatId, down.formatId},
+            {group.down_columns, tiles, 1}, downGrid, {64, 1, 1});
 }
 
 } // namespace
@@ -193,7 +360,7 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
     throw std::invalid_argument("invalid MoE expert tile configuration");
   if (config.ggufTile == MoeGgufTile::Register && config.expertTile != MoeExpertTile::M8)
     throw std::invalid_argument("the register expert tile takes 8-row tiles");
-  workspace_ = workspaceFor(shape, rows, tileRows(), config.ggufTile);
+  workspace_ = workspaceFor(shape, rows, tileRows(), config.ggufTile, int8());
   maximumTiles_ = moeMaximumTiles(rows, shape, tileRows());
 }
 
@@ -265,16 +432,39 @@ void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
   const uint32_t tiles = plan.maximumTiles();
   const MoeScratch &scratch = buffers.scratch;
   const MoeGatherParams gather{tileRows, shape.hiddenSize, shape.routesPerToken()};
+  if (shape.ulmoeExperts()) {
+    addUlmoeRouted(graph, buffers, weights, plan);
+    graph.add("moe_combine",
+              {scratch.expertOutput, scratch.routeRows, scratch.routingWeights, buffers.residual, buffers.output},
+              MoeCombineParams{rows, shape.hiddenSize, shape.routesPerToken()}, {rows, shape.hiddenSize / 256, 1});
+    return;
+  }
   if (plan.configuration().ggufTile == MoeGgufTile::Register)
     graph.add("moe_gather_table16",
               {buffers.input, scratch.groupedRoutes, scratch.tileCount,
                scratch.groupedInput, scratch.groupedSums},
               gather, {tiles, shape.hiddenSize / 256, 1});
-  else
+  else if (plan.int8() && plan.configuration().int8.activations == 1) {
+    // The A8 pre-pass in the gather (MoeInt8::activations 1): the bf16 rows and the int8 rows with their scales.
+    const MoeInt8Layout layout = moeInt8Layout(shape, uint64_t{tiles} * tileRows);
+    graph.add("moe_gather_rows_a8",
+              {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors, scratch.tileCount,
+               scratch.groupedInput, scratch.groupedSums},
+              MoeGatherA8Params{tileRows, shape.hiddenSize, shape.routesPerToken(),
+                                plan.configuration().int8.pow2 ? MOE_A8_POW2 : 0u,
+                                static_cast<uint32_t>(layout.x8), static_cast<uint32_t>(layout.xScales)},
+              {tiles, shape.hiddenSize / 256, 1});
+  } else {
     graph.add("moe_gather_rows",
               {buffers.input, scratch.groupedRoutes, scratch.tileDescriptors,
                scratch.tileCount, scratch.groupedInput},
               gather, {tiles, shape.hiddenSize / 256, 1});
+    if (fakeRounds(plan, weights, false))
+      graph.add("moe_a8_fake", {scratch.groupedInput, scratch.tileDescriptors, scratch.tileCount},
+                MoeA8FakeParams{tileRows, shape.hiddenSize, shape.hiddenSize,
+                                plan.configuration().int8.pow2 ? MOE_A8_POW2 : 0u},
+                {tiles, tileRows, 1}, {32, 1, 1});
+  }
   addExperts(graph, scratch, weights, plan, groupParams(plan));
   graph.add("moe_combine",
             {scratch.expertOutput, scratch.routeRows, scratch.routingWeights,

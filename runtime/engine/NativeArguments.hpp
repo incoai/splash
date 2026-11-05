@@ -79,6 +79,9 @@ struct NativeArguments final {
   // --verify-rows auto|all: the rows of the draft's block a decode
   // cycle verifies (RuntimeResourcesConfig::verifyRows).
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // --moe-int8 on|off: whether decode plans run a MoE block's staged expert tiles
+  // in int8 activations (ops::ExecutionOptions::moeInt8).
+  bool moeInt8 = false;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

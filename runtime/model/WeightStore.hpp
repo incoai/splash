@@ -86,6 +86,13 @@ private:
 // a quantized format's native rows (the MoE router, which the float
 // projection runs in fp32).
 [[nodiscard]] ops::QuantizedSegment readFloatSegment(WeightFile &file, std::string_view label);
+// A GGUF tensor the image copies as stored, F32 or I32 (the ULMoE expert planes): its rows.
+struct RawTensor final {
+  metal::MetalBuffer rows;
+  uint32_t outputSize = 0; // rows
+  uint32_t inputSize = 0;  // 32-bit values per row
+};
+[[nodiscard]] RawTensor readRawTensor(WeightFile &file, uint32_t type, std::string_view label);
 // A single-tensor projection; its descriptor must hold the layout's sizes.
 [[nodiscard]] ops::Projection readBlockProjection(WeightFile &file, uint32_t outputSize,
                                                   uint32_t inputSize, std::string_view label);

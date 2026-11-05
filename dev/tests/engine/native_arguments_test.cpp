@@ -156,6 +156,7 @@ void testServerCommandLines(const char *path) {
       {"verify_rows_all", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::All; }},
       // Auto is the engine's default, which the server leaves out.
       {"verify_rows_auto", [](NativeArguments &) {}},
+      {"moe_int8", [](NativeArguments &read) { read.moeInt8 = true; }},
       // A relaunch keeps the first engine's context; with --max-context,
       // which every start holds, its command is the first one's.
       {"relaunch", [](NativeArguments &read) { read.relaunchContext = 61433; }},
@@ -203,7 +204,7 @@ void testServerCommandLines(const char *path) {
            read.neuralEngine == meant.neuralEngine && read.pleMemory == meant.pleMemory &&
            read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
            read.kvSpillAlways == meant.kvSpillAlways && read.kvWindowTrim == meant.kvWindowTrim &&
-           read.verifyRows == meant.verifyRows;
+           read.verifyRows == meant.verifyRows && read.moeInt8 == meant.moeInt8;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -260,6 +261,15 @@ void testWindowTrim() {
           "--kv-window-trim did not reach the arguments as given");
 }
 
+// --moe-int8 is off unless the server passes --moe-int8 on.
+void testMoeInt8() {
+  const ModelDirectory model;
+  require(!parse(model, {"auto", "auto"}).moeInt8 &&
+              parse(model, {"auto", "auto", "--moe-int8", "on"}).moeInt8 &&
+              !parse(model, {"auto", "auto", "--moe-int8", "off"}).moeInt8,
+          "--moe-int8 did not reach the arguments as given");
+}
+
 // A command line the server never writes is refused with what is wrong.
 void testRefusals() {
   const ModelDirectory model;
@@ -302,6 +312,7 @@ void testRefusals() {
     refuses({"auto", "auto", "--kv-spill", spill}, "--kv-spill requires always");
   for (const char *trim : {"never", "auto", ""})
     refuses({"auto", "auto", "--kv-window-trim", trim}, "--kv-window-trim requires on or off");
+  refuses({"auto", "auto", "--moe-int8", "yes"}, "--moe-int8 requires on or off");
   refuses({"auto", "auto", "--persistent-cache", "yes"}, "--persistent-cache requires on or off");
   refuses({"auto", "auto", "0", "--persistent-cache", "on"},
           "--persistent-cache requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
@@ -386,6 +397,7 @@ int main(int argc, char **argv) {
     testVerifyRows();
     testStreamedMemoryAndSpill();
     testWindowTrim();
+    testMoeInt8();
     testRefusals();
     std::cout << "native arguments tests passed\n";
     return EXIT_SUCCESS;

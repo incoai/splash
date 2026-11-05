@@ -71,6 +71,8 @@ struct MoeExperts final {
   std::shared_ptr<ExpertStore> store;
   metal::MetalBuffer resident;
   uint32_t experts = 0;
+  // The routed experts are ULMoE W2 planes (gguf::ulmoeExperts), resident.
+  bool ulmoe = false;
 };
 [[nodiscard]] MoeExperts openMoeExperts(metal::MetalBackend &backend, const QwenTargetFiles &files,
                                         const QwenTargetDimensions &target);

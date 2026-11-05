@@ -160,6 +160,60 @@ struct MoeGgufGateUpParams {
 static_assert(sizeof(MoeGgufGateUpParams) == 36,
               "MoE GGUF gate/up parameters are 36 bytes on both sides");
 
+// Int8 activations of the staged decode expert passes (ops::MoeInt8; splash serve --moe-int8, off by default).
+// The int8 rows live in the scratch's groupedSums (unused by staged plans) at these byte offsets: the gate/up input's
+// int8 rows (grouped row order, K = hidden) and one fp32 scale per grouped row, which the gather writes
+// (moe_gather_rows_a8); the down input's int8 rows (K = intermediate) and one fp32 scale per grouped row and 32
+// columns, which the up epilogue writes (MOE_A8_DOWN). `formats` is the GGUF_FMT_* bit mask the W-A8 tile takes.
+#define MOE_A8_POW2 1u      // power-of-two scales: s * q exact in bf16 (the int8 tests)
+#define MOE_A8_DOWN 4u      // the up epilogue writes the down input's int8 rows
+struct MoeInt8Params {
+  uint32_t formats;
+  uint32_t mode;
+  uint32_t x8;
+  uint32_t x_scales;
+  uint32_t d8;
+  uint32_t d_scales;
+};
+
+static_assert(sizeof(MoeInt8Params) == 24, "MoE int8 parameters are 24 bytes on both sides");
+
+struct MoeGgufI8GateUpParams {
+  struct MoeGgufGateUpParams g;
+  struct MoeInt8Params a;
+};
+
+static_assert(sizeof(MoeGgufI8GateUpParams) == 60, "MoE int8 gate/up parameters are 60 bytes on both sides");
+
+struct MoeGgufI8ExpertParams {
+  struct MoeGgufExpertParams e;
+  struct MoeInt8Params a;
+};
+
+static_assert(sizeof(MoeGgufI8ExpertParams) == 56, "MoE int8 expert parameters are 56 bytes on both sides");
+
+// The gather's int8 rows (moe_gather_rows_a8) and the bf16 passes' fake quantization (moe_a8_fake: rows of `width`
+// in blocks of `block`, the int8 rounding written back as bf16(s q); the reference of the int8 tests).
+struct MoeGatherA8Params {
+  uint32_t tile_rows;
+  uint32_t input_size;
+  uint32_t routes_per_row;
+  uint32_t mode;
+  uint32_t x8;
+  uint32_t x_scales;
+};
+
+static_assert(sizeof(MoeGatherA8Params) == 24, "MoE int8 gather parameters are 24 bytes on both sides");
+
+struct MoeA8FakeParams {
+  uint32_t tile_rows;
+  uint32_t width;
+  uint32_t block;
+  uint32_t mode;
+};
+
+static_assert(sizeof(MoeA8FakeParams) == 16, "MoE fake quantization parameters are 16 bytes on both sides");
+
 // One projection (gate, up or down) of the experts a load writes into their
 // slots (moe_expert_load, model/ExpertStore.cpp): rows x columns in `format`,
 // job j's native rows of row_bytes each staged from wherever the job's source
@@ -199,3 +253,44 @@ struct MoeCombineParams {
 
 static_assert(sizeof(MoeCombineParams) == 12,
               "MoE combine parameters are 12 bytes on both sides");
+
+// ULMoE W2 routed experts (kernels/shared/moe_ulmoe.metal, ops::UlmoeMoeExperts). Not a GGUF type,
+// so not a kQuantFormats row: a MoE block whose routed experts are ULMoE carries this id as MoeShape::expertFormat;
+// its shared expert stays GGUF and runs inside the ULMoE passes (column GEMV). Per expert and projection of N columns x (K + R) stored inputs (R residual
+// inputs repeat the first R): codes [G][N] uint4 (16 bytes: the 4 words of 16 inputs of a 64-input macro group, input
+// 4c + b of a word at bit 8b + 2c, restaged at load from the checkpoint's pair-permuted words) and meta [G][N] uint32
+// (bit 0 ladder index, bits 1-7 the integer macro scale m, bit 8 + j z_j - 1, bits 16 + 2j s_off_j of micro group j of
+// 8 inputs), G = (K + R) / 64, expert e at e * G * N; one fp32 anchor per column shared by the experts.
+// w = (q - z_j) * s_j * m * anchor, s_j = 2 + 2 * ladder + s_off_j.
+#define QUANT_FMT_ULMOE_W2 0x100u
+#define ULMOE_MACRO_GROUP 64u
+
+// One ULMoE pass over the grouped tiles: tile t's input block at byte t * input_tile_bytes of the input (bf16 rows of
+// input_size, or, for routed tiles on the int8 path, int8 rows of input_size followed by the 8 rows' fp32 scales),
+// its rows' outputs at row t * 8 + r of an output of output_size bf16 columns. The shared expert's tiles (expert
+// `experts`) read bf16 rows and the GGUF planes of shared_format0 for output columns below shared_split, of
+// shared_format1 (at column - shared_split) from it on.
+struct MoeUlmoeParams {
+  uint32_t input_size;
+  uint32_t residual_size;
+  uint32_t output_size;
+  uint32_t experts;
+  uint32_t input_tile_bytes;
+  uint32_t shared_split;
+  uint32_t shared_format0;
+  uint32_t shared_format1;
+};
+
+static_assert(sizeof(MoeUlmoeParams) == 32, "MoE ULMoE parameters are 32 bytes on both sides");
+
+// The ULMoE gather: moe_gather_rows with each routed tile's rows in the block's salience order (input k of a routed
+// row is input order[k] of its token), as bf16 rows or int8 rows with a fp32 scale per row; the shared expert's tiles
+// keep bf16 rows in model order.
+struct MoeUlmoeGatherParams {
+  uint32_t tile_rows;
+  uint32_t input_size;
+  uint32_t routes_per_row;
+  uint32_t experts;
+};
+
+static_assert(sizeof(MoeUlmoeGatherParams) == 16, "MoE ULMoE gather parameters are 16 bytes on both sides");

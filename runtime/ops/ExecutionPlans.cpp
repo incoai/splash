@@ -1,6 +1,8 @@
 #include "ops/ExecutionPlans.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <string_view>
 #include <stdexcept>
 
 namespace splash::ops {
@@ -23,8 +25,8 @@ void include(Workspace &bound, const Workspace &required,
 
 } // namespace
 
-ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
-    : linear_(device), family_(gpuFamilyClass(device.appleGpuFamily)),
+ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, ExecutionOptions options)
+    : linear_(device), family_(gpuFamilyClass(device.appleGpuFamily)), options_(options),
       gpuCores_(plannedGpuCores(device)) {}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
@@ -50,6 +52,14 @@ MoeConfig ExecutionPlans::moeConfig(MoeShape shape, uint32_t rows, MoePhase phas
   config.expertTile =
       phase == MoePhase::Prefill ? moeGgufPrefillTile(shape, rows, config.ggufTile) : MoeExpertTile::M8;
   config.ggufRouterTile = linear_.ggufFloatTile(rows, shape.experts, shape.routerFormat);
+  if (phase == MoePhase::Decode && options_.moeInt8) config.int8 = moeInt8Decode();
+  if (shape.ulmoeExperts()) {
+    // ULMoE blocks run staged 8-row tiles in both phases (their passes' tiles; a long prefill chunk streams an
+    // expert's weights once per 8 of its rows) and the int8 passes with --moe-int8, else the bf16 GEMV.
+    config.ggufTile = MoeGgufTile::Staged;
+    config.expertTile = MoeExpertTile::M8;
+    config.ulmoeInt8 = options_.moeInt8;
+  }
   return config;
 }
 

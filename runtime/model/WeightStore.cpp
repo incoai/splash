@@ -161,6 +161,13 @@ ops::QuantizedSegment readQuantizedSegment(WeightFile &file, std::string_view la
                                          std::move(plane1), std::move(meta));
 }
 
+RawTensor readRawTensor(WeightFile &file, uint32_t type, std::string_view label) {
+    const GgufTensorDescriptor d = readGgufDescriptor(file, label);
+    if ((type != ggml::kF32 && type != ggml::kI32) || d.type != type)
+        throw WeightStoreError("GGUF raw tensor is not of its type: " + std::string(label));
+    return {readRows(file, d, uint64_t{d.inputSize} * 4, label), d.outputSize, d.inputSize};
+}
+
 ops::QuantizedSegment readFloatSegment(WeightFile &file, std::string_view label) {
     const GgufTensorDescriptor d = readGgufDescriptor(file, label);
     return readFloatRows(file, d, label);

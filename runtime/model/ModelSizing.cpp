@@ -71,12 +71,15 @@ StreamableWeights streamableWeights(const std::filesystem::path &root, const Mod
         const std::filesystem::path directory = root / "target";
         if (descriptor.targetSource == TargetSource::Gguf) {
           const OpenGguf target(findTargetGgufs(directory));
+          // ULMoE W2 experts load resident: none of them streams.
+          gguf::PlanOptions options = streams;
+          if (gguf::ulmoeExperts(target.file())) options.streamExperts = false;
           return targetWeights(
               layout,
               [&](gguf::PlanOptions options) {
                 return gguf::planImages(target.file(), layout.ggufArchitecture, layout, options);
               },
-              streams);
+              options);
         }
         const SafetensorsCheckpoint checkpoint(directory);
         return targetWeights(
