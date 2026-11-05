@@ -1009,6 +1009,70 @@ void checkFlint(const std::filesystem::path &directory) {
   }
 }
 
+// llama.cpp NVFP4 weights each beside an F32 .scale and the .input_scale of
+// NVIDIA's W4A4 activations, of one value or one per expert of an experts
+// tensor: the planner reads the .input_scale, which a weights-only decode
+// does not apply, and plans the file. An .input_scale beside a weight of
+// another type is refused as unused, and one of another count than its
+// .scale by name.
+void checkNvfp4InputScale(const std::filesystem::path &directory) {
+  // `name` as llama.cpp NVFP4, beside an F32 .scale and .input_scale of
+  // `values` values each.
+  const auto nvfp4 = [](std::vector<Tensor> &tensors, const std::string &name, uint64_t values) {
+    Tensor &weight = tensorNamed(tensors, name);
+    uint64_t rows = 1;
+    for (size_t i = 1; i < weight.dims.size(); ++i) rows *= weight.dims[i];
+    weight.type = model::ggml::kNVFP4;
+    weight.data = blockNvfp4Fixture(uint32_t(rows), uint32_t(weight.dims[0]), 47);
+    const std::string stem = name.substr(0, name.size() - std::string_view(".weight").size());
+    for (const char *suffix : {".scale", ".input_scale"})
+      tensors.push_back({stem + suffix, {values}, model::ggml::kF32, floatValues(values, 48)});
+  };
+  for (const bool moe : {false, true}) {
+    SmallTarget target = smallTarget(moe);
+    const model::QwenTargetDimensions &g = target.geometry;
+    const std::string kind = moe ? "MoE" : "dense";
+    std::vector<Tensor> &tensors = target.tensors;
+    if (moe) {
+      for (const char *name : {"blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight", "blk.0.ffn_down_exps.weight"})
+        nvfp4(tensors, name, g.experts);
+      for (const char *name : {"blk.0.attn_gate.weight", "blk.0.ffn_up_shexp.weight", "output.weight"})
+        nvfp4(tensors, name, 1);
+    } else {
+      for (const char *name : {"blk.0.attn_gate.weight", "blk.0.ffn_up.weight", "blk.1.attn_output.weight"})
+        nvfp4(tensors, name, 1);
+    }
+    const auto path = directory / (kind + "-nvfp4-input-scale.gguf");
+    const auto planned = [&](const std::vector<Tensor> &withTensors) {
+      writeGguf(path, withTensors, g);
+      return plan(path, g);
+    };
+    const Plan scaled = planned(tensors);
+    check(!scaled.error, "planner plans the " + kind + " target's NVFP4 weights beside an .input_scale" +
+                             (scaled.error ? ": " + *scaled.error : ""));
+    // One of another count than its .scale.
+    const std::string input = moe ? "blk.0.ffn_gate_exps.input_scale" : "blk.0.ffn_up.input_scale";
+    const uint64_t other = moe ? 1 : 2;
+    std::vector<Tensor> miscounted = tensors;
+    tensorNamed(miscounted, input) = {input, {other}, model::ggml::kF32, floatValues(other, 49)};
+    check(names(planned(miscounted),
+                {input + (moe ? " must hold one F32 value per expert for " : " must hold one F32 value for ")}),
+          "planner refuses an .input_scale of another count than its .scale: " + input);
+    if (moe) continue;
+    // One beside a Q4_K weight.
+    std::vector<Tensor> beside = tensors;
+    beside.push_back({"blk.0.attn_qkv.input_scale", {1}, model::ggml::kF32, floatValues(1, 50)});
+    check(tensorNamed(beside, "blk.0.attn_qkv.weight").type == kQ4_K &&
+              names(planned(beside), {"attn_qkv.input_scale (unused) in 1 layer"}),
+          "planner refuses an .input_scale beside a Q4_K weight as unused");
+    // One with no weight.
+    std::vector<Tensor> alone = tensors;
+    alone.push_back({"blk.0.attn_k_proj.input_scale", {1}, model::ggml::kF32, floatValues(1, 51)});
+    check(names(planned(alone), {"attn_k_proj.input_scale (unused) in 1 layer"}),
+          "planner refuses an .input_scale with no weight as unused");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -1024,6 +1088,7 @@ int main() {
     guarded("planner on Flash-Next's PLE table", [&] { checkPleTable(directory.path()); });
     guarded("planner on a split GGUF", [&] { checkSplit(directory.path()); });
     guarded("planner on Flint", [&] { checkFlint(directory.path()); });
+    guarded("planner on NVFP4 activation scales", [&] { checkNvfp4InputScale(directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF planner tests FAILED" : "GGUF planner tests passed", failures);
     return failures ? 1 : 0;
   }

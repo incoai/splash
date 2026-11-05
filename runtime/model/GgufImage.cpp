@@ -419,14 +419,16 @@ private:
   // multiplies a projection's products by its .scale, of one value, or an
   // expert's by its value of an experts tensor's (_exps), one per expert;
   // only NVFP4's native rows hold such a scale, so only theirs is read and a
-  // .scale beside any other tensor is refused as unused.
+  // .scale beside any other tensor is refused as unused. An NVFP4 weight may
+  // also carry an .input_scale of as many values, the activation scale of
+  // NVIDIA's W4A4: a weights-only decode (ours, as llama.cpp's) never reads
+  // it, so it is held to that count and recorded as read, unused; beside any
+  // other tensor, or alone, it is refused as unused too.
   TensorRows tensorRows(const GgufTensor &tensor, uint64_t count, uint64_t rowBytes, RowOrder order = {}) const {
     if (tensor.type != ggml::kNVFP4) {
       if (!count || count * rowBytes != tensor.bytes) throw GgufError("unexpected size for " + tensor.name);
       return {tensor.name, tensor.type, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
     }
-    const std::string stem = tensor.name.ends_with(".weight") ? tensor.name.substr(0, tensor.name.size() - 7) : "";
-    const GgufTensor *scale = stem.empty() ? nullptr : file_.find(stem + ".scale");
     const QuantFormat &format = kQuantFormats[GGUF_FMT_NVFP4];
     const GgmlTypeTraits &blocks = *ggmlTypeTraits(ggml::kNVFP4);
     const uint64_t sourceRowBytes =
@@ -436,14 +438,22 @@ private:
                       " elements");
     TensorRows rows{tensor.name, QUANT_NVFP4_TYPE, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
     rows.ggufNvfp4RowBytes = sourceRowBytes;
-    if (scale) {
-      const uint64_t values = stem.ends_with("_exps") ? geometry_.experts : 1;
-      if (scale->type != ggml::kF32 || scale->elements() != values || count % values)
-        throw GgufError(scale->name + " must hold " + (values == 1 ? "one F32 value" : "one F32 value per expert") +
+    const std::string stem = tensor.name.ends_with(".weight") ? tensor.name.substr(0, tensor.name.size() - 7) : "";
+    const uint64_t values = stem.ends_with("_exps") ? geometry_.experts : 1;
+    // The weight's F32 tensor stem + suffix of `values` values, read, or
+    // nullptr without one.
+    const auto sidecar = [&](const char *suffix) -> const GgufTensor * {
+      const GgufTensor *found = stem.empty() ? nullptr : file_.find(stem + suffix);
+      if (!found) return nullptr;
+      if (found->type != ggml::kF32 || found->elements() != values || count % values)
+        throw GgufError(found->name + " must hold " + (values == 1 ? "one F32 value" : "one F32 value per expert") +
                         " for " + tensor.name);
-      problems_.read(*scale);
+      problems_.read(*found);
+      return found;
+    };
+    if (const GgufTensor *scale = sidecar(".scale"))
       rows.scale = {&file_.source(scale->file), scale->offset, scale->bytes, count / values};
-    }
+    sidecar(".input_scale");
     return rows;
   }
 

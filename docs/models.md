@@ -248,8 +248,10 @@ is `block_nvfp4`: 64 elements, a UE4M3 scale per 16 (an E4M3 byte whose bit 7
 llama.cpp ignores, reading 0x7F as 0) and E2M1 codes, beside an optional F32
 `.scale` tensor, one value for a projection or one per expert for an experts
 tensor (`_exps`), which llama.cpp multiplies the products by; a `.scale` beside
-a weight of another type is refused, as only NVFP4's rows hold one. It loads as
-Model Optimizer's NVFP4 does
+a weight of another type is refused, as only NVFP4's rows hold one. An F32
+`.input_scale` beside an NVFP4 weight (NVIDIA's activation scale, as many
+values as `.scale`) plays no part, as in Model Optimizer's targets; beside any
+other weight, or alone, it is refused. It loads as Model Optimizer's NVFP4 does
 ([Model Optimizer targets](#model-optimizer-targets)): four blocks make one
 256-element NVFP4 block, whose meta unit holds the `.scale` value as its `g`
 (1 without one), at 4.625 bits per weight for the file's 4.5.
