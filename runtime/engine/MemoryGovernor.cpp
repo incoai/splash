@@ -399,23 +399,24 @@ bool MemoryGovernor::copyDemand() const noexcept { return ledger_.copyDemand(); 
 bool MemoryGovernor::claimWaiting() const noexcept { return ledger_.claimWaiting(); }
 
 // The host's claim of what the pass finds, up to `target`, taken at once:
-// the target is net of what lands already (HostRule::deficitBytes). Under
-// macOS's critical pressure it reaches units in use too; otherwise it may
-// take units that free later. free() gives back the units that cost nothing
-// and are sized only when taken (the idle state buffers) first either way.
-// A pass that freed nothing now or later waits (Pending) while memory lands
-// for a claim that can wait, else is Short: it found nothing to take.
+// the target is net of what lands already (HostRule::deficitBytes). What it
+// may take its rights say (takeRights): under macOS's critical pressure
+// units in use too, otherwise units that free later. It asks with no room,
+// which returns nothing to the host. free() gives back the units that cost
+// nothing and are sized only when taken (the idle state buffers) first
+// either way. A pass that freed nothing now or later waits (Pending) while
+// memory lands if its rights wait for writes, else is Short: it found
+// nothing to take.
 FreeResult MemoryGovernor::hostPass(uint64_t target, bool critical) {
-  const ClaimSpec spec{.cls = ClaimClass::Host,
-                       .reach = critical ? ReclaimClass::InUse : ReclaimClass::Ordinary,
-                       .timing = critical ? NeedTiming::Immediate : NeedTiming::CanWait};
-  const uint64_t found = ledger_.available(spec, {.bytes = target}, 0, critical);
+  const ClaimSpec spec{.cls = ClaimClass::Host};
+  const Need need{.bytes = target};
+  const uint64_t found = ledger_.available(spec, need, 0, critical);
   const ClaimId claim = ledger_.open(spec);
   FreeResult result = ledger_.free(claim, {.bytes = std::min(target, found)}, 0, critical);
   ledger_.close(claim);
+  const bool waits = takeRights(spec, need, critical, std::nullopt).waitsForWrites;
   if (result.outcome == FreeOutcome::Met && !result.nowBytes && !result.laterBytes)
-    result.outcome = spec.timing == NeedTiming::CanWait && ledger_.returning().landingBytes ? FreeOutcome::Pending
-                                                                                            : FreeOutcome::Short;
+    result.outcome = waits && ledger_.returning().landingBytes ? FreeOutcome::Pending : FreeOutcome::Short;
   return result;
 }
 

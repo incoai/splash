@@ -556,6 +556,15 @@ void testBandWaivedWhenTheHostClaimFindsNothing() {
   require(fixture.allocate(probe, 128 * kMiB), "the band held after the host pass found nothing");
 }
 
+// A critical pass that finds nothing to take is Short while memory lands: the host's claim at critical pressure
+// waits for no write, so it never stays pending.
+void testACriticalPassThatFindsNothingIsShortWhileMemoryLands() {
+  Fixture fixture(host(8 * kGiB, MemoryPressure::Critical));
+  fixture.ledger().setReturning([] { return Returning{.landingBytes = kGiB, .transfers = 1}; },
+                                [](std::span<const uint64_t>) { return Returning{}; });
+  require(!fixture.pass(0.5), "a critical pass that found nothing waited for what lands");
+}
+
 // Every host pass gives back the idle state buffers, which cost nothing, whatever else it finds.
 void testEveryHostPassGivesBackIdleBuffers() {
   Fixture fixture(host(512 * kMiB));
@@ -2153,6 +2162,8 @@ std::span<const test::TestCase> ledgerTests() {
       {"testWhatALaneNeedsIsMetInPlaceBeforeTheHost", testWhatALaneNeedsIsMetInPlaceBeforeTheHost},
       {"testBandWaivedWhenTheHostClaimFindsNothing", testBandWaivedWhenTheHostClaimFindsNothing},
       {"testEveryHostPassGivesBackIdleBuffers", testEveryHostPassGivesBackIdleBuffers},
+      {"testACriticalPassThatFindsNothingIsShortWhileMemoryLands",
+       testACriticalPassThatFindsNothingIsShortWhileMemoryLands},
       {"testDeficitCountsHostRefusedClaimsNotAnIdleMargin", testDeficitCountsHostRefusedClaimsNotAnIdleMargin},
       {"testAHostRefusedStartIsAdmittedWithinTwoPasses", testAHostRefusedStartIsAdmittedWithinTwoPasses},
       {"testGrowthLeavesTheHostWhatAStartItRefusedWaitsFor", testGrowthLeavesTheHostWhatAStartItRefusedWaitsFor},

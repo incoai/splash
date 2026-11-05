@@ -195,6 +195,10 @@ uint64_t MemoryLedger::heldByClaims(const ClaimRank &rank, std::optional<uint32_
 }
 
 uint64_t MemoryLedger::heldFor(const ClaimSpec &spec, std::optional<uint32_t> self) const noexcept {
+  // The host's claim is for memory the host lacks, which no room under the
+  // engine's limit returns: nothing held there stands against it.
+  if (spec.cls == ClaimClass::Host)
+    return 0;
   const uint64_t lanes = spec.cls == ClaimClass::Growth ? laneDemandBytes_ : 0;
   return plus(lanes, heldByClaims(spec.rank, self));
 }
@@ -548,9 +552,9 @@ uint64_t MemoryLedger::takeUnsized(const VictimQuery &query) {
 // when every copy in flight or owed would meet it. A claim refused bytes lacks
 // what admission asks beyond the room: its need plus the room held against it.
 // A need met in place lacks no bytes. A need the host refused counts only units
-// that leave memory in place, and the host's claim lacks its need beyond the
-// units that cost nothing, since room under the engine's limit returns nothing
-// to the host. State buffers the units free meet a need of bytes once they
+// that leave memory in place. The host's pass asks with no room
+// (MemoryGovernor::hostPass), since room under the engine's limit returns
+// nothing to the host. State buffers the units free meet a need of bytes once they
 // leave the model's pool, so the units that cost nothing go again (a need in
 // place keeps them). A claim that can wait, short only by the room waiting
 // claims ranked above it hold, waits as their holds end.
@@ -561,20 +565,14 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
   const VictimQuery query{.rights = takeRights(spec, need, critical, lanePriority_), .need = need};
 
   FreeResult result{.nowBytes = takeUnsized(query)};
-  const bool host = spec.cls == ClaimClass::Host;
-  const uint64_t room = host ? 0 : plus(freeBytes, result.nowBytes);
+  const uint64_t room = plus(freeBytes, result.nowBytes);
   // Waiting claims ranked above it hold room it waits for, and the lanes'
   // projected growth room a pool's growth leaves them.
-  const uint64_t held = host ? 0 : heldFor(spec, id);
+  const uint64_t held = heldFor(spec, id);
   const uint64_t forClaim = less(room, held);
-  const uint64_t lackingBytes = need.hostRefused || !need.bytes ? 0
-                                : host ? less(need.bytes, result.nowBytes)
-                                       : less(plus(need.bytes, held), room);
+  const uint64_t lackingBytes = need.hostRefused || !need.bytes ? 0 : less(plus(need.bytes, held), room);
   const uint32_t lackingPages = need.pages;
-  // The host's claim waits for nothing that lands but what its own take
-  // reaches or starts: its pass's target is net of the rest
-  // (MemoryGovernor::controlPass).
-  const bool canWait = spec.timing == NeedTiming::CanWait && !need.hostRefused && !host;
+  const bool canWait = query.rights.waitsForLandings;
 
   // What a claim that can wait may wait for: what lands of every transfer
   // in flight and every owed copy, and the copies its own lane owes; the
@@ -706,15 +704,14 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, const Need &need, uint64
                                  const RestoredChains *kept) const {
   const VictimQuery query{.rights = takeRights(spec, need, critical, lanePriority_), .need = need, .kept = kept};
   const uint64_t enough = need.bytes;
-  const bool host = spec.cls == ClaimClass::Host;
-  const uint64_t held = host ? 0 : heldFor(spec, std::nullopt);
+  const uint64_t held = heldFor(spec, std::nullopt);
   uint64_t landing = 0;
-  if (!host && spec.timing == NeedTiming::CanWait) {
+  if (query.rights.waitsForLandings) {
     landing = returning().landingBytes;
     if (returningFor_ && spec.requestId)
       landing = plus(landing, returningFor_(std::span<const uint64_t>(&spec.requestId, 1)).owedBytes);
   }
-  const uint64_t room = host ? 0 : plus(freeBytes, landing);
+  const uint64_t room = plus(freeBytes, landing);
   if (less(room, held) >= enough)
     return enough;
   const uint64_t taken = bound(spec, query, {.bytes = less(plus(enough, held), room)}).bytes;

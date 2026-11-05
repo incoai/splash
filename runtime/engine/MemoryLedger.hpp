@@ -72,6 +72,8 @@ struct ClaimSpec final {
   ClaimClass cls = ClaimClass::InService;
   uint64_t requestId = 0;                       // 0: the engine's own, a pool's growth, the host
   ClaimRank rank;
+  // A Host claim's reach and timing follow macOS's pressure (takeRights),
+  // not these.
   ReclaimClass reach = ReclaimClass::Ordinary;  // InUse: may take what unfinished requests use
   NeedTiming timing = NeedTiming::CanWait;
   // May take the command between its passes, as the scheduler's decision

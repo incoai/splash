@@ -1,7 +1,7 @@
 #pragma once
 
 // The control pass's host claim as a test drives it on its engine's governor
-// (MemoryGovernor::controlPass), Immediate under critical pressure.
+// (MemoryGovernor::controlPass): its rights follow the pressure (takeRights).
 
 #include "engine/MemoryGovernor.hpp"
 #include "model/SlotFile.hpp"
@@ -16,9 +16,7 @@ namespace splash::test {
 inline engine::FreeResult hostPass(engine::MemoryGovernor &governor,
                                    uint64_t bytes = std::numeric_limits<uint64_t>::max(), bool critical = false) {
   engine::MemoryLedger &ledger = governor.ledger();
-  const engine::ClaimSpec spec{.cls = engine::ClaimClass::Host,
-                               .reach = critical ? engine::ReclaimClass::InUse : engine::ReclaimClass::Ordinary,
-                               .timing = critical ? engine::NeedTiming::Immediate : engine::NeedTiming::CanWait};
+  const engine::ClaimSpec spec{.cls = engine::ClaimClass::Host};
   const uint64_t found = ledger.available(spec, {.bytes = bytes}, 0, critical);
   const engine::ClaimId claim = ledger.open(spec);
   const engine::FreeResult result = ledger.free(claim, {.bytes = std::min(bytes, found)}, 0, critical);
