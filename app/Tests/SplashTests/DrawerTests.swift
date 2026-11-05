@@ -270,6 +270,19 @@ struct DrawerTests {
         #expect(lines == ["first", "Started · a/b", "last"])
     }
 
+    /// As a log grows, its oldest lines go: it keeps the lines that start in its last 512 K
+    /// characters.
+    @Test func aLogKeepsTheLinesOfItsLast512KCharactersAsItGrows() async throws {
+        let (folder, file) = try Self.log((1...50_000).map(Self.line).joined())
+        let window = Self.window(LogText(url: file))
+        defer { Self.close(window); try? FileManager.default.removeItem(at: folder) }
+        let text = try await Self.shownText(in: window)
+        try Self.append((50_001...60_000).map(Self.line).joined(), to: file)
+        try await waitFor(text.string.hasSuffix(Self.line(60_000)))
+        // The last 512 Ki of 720,000 start inside line 16,310.
+        #expect(text.string == (16_311...60_000).map(Self.line).joined())
+    }
+
     /// A log written again from its start, emptied in place or replaced as each start replaces
     /// the server's, shows only what is new.
     @Test func aLogWrittenAgainFromItsStartShowsOnlyWhatIsNew() async throws {

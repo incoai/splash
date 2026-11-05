@@ -325,11 +325,15 @@ private struct TerminalPane: View {
 }
 
 /// A log file, read only, as it grows, in whole lines (`LogLines`): those that start in its last
-/// 512 KB at first, then each line as it is written, kept in view while the end is; ⌘F finds in
-/// it. A file written again from its start, as the server's log is at each start, is read again
-/// from there.
+/// `limit` bytes at first, then each line as it is written, the oldest going past `limit`; kept in
+/// view while the end is; ⌘F finds in it. A file written again from its start, as the server's log
+/// is at each start, is read again from there.
 struct LogText: NSViewRepresentable {
     let url: URL
+
+    /// How much of a log it holds: 512 KiB of its end at first, then as many UTF-16 units, which
+    /// are never more than the bytes they decode from.
+    static let limit = 512 * 1024
 
     func makeNSView(context: Context) -> NSScrollView {
         let scroll = NSTextView.scrollableTextView()
@@ -387,9 +391,9 @@ struct LogText: NSViewRepresentable {
             let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
             self.handle = handle
             let size = (try? handle.seekToEnd()) ?? 0
-            // The lines that start in its last 512 KB: read from the byte before those, a newline
-            // where one starts with them.
-            let tail: UInt64 = 512 * 1024
+            // The lines that start in its last `limit` bytes: read from the byte before those, a
+            // newline where one starts with them.
+            let tail = UInt64(LogText.limit)
             offset = size > tail ? size - tail - 1 : 0
             lines = LogLines(inside: size > tail)
             read(scrolling: true)
@@ -427,6 +431,14 @@ struct LogText: NSViewRepresentable {
                 .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
                 .foregroundColor: NSColor.labelColor,
             ]))
+            // Past the limit, the lines that start in its last `limit` units stay. It holds whole
+            // lines, so a newline ends it.
+            let excess = storage.length - LogText.limit
+            if excess > 0 {
+                let newline = storage.mutableString.range(
+                    of: "\n", options: [], range: NSRange(location: excess - 1, length: storage.length - excess + 1))
+                storage.deleteCharacters(in: NSRange(location: 0, length: NSMaxRange(newline)))
+            }
             if atEnd { text.scrollToEndOfDocument(nil) }
             // At first the view has no size yet: to its end once it has been laid out.
             if scrolling { DispatchQueue.main.async { [weak text] in text?.scrollToEndOfDocument(nil) } }
