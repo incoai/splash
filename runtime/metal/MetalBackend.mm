@@ -312,13 +312,20 @@ struct AllocationAccounting {
 
 struct MetalAllocation;
 
-// The Addressed buffers whose addresses a range of a table's bytes holds
-// (MetalBackend::setTableReach), held weakly: the owner releases them only
-// while no command reaches them.
+// A view of an Addressed buffer whose address a table holds, held weakly:
+// the owner releases it only while no command reaches it.
+struct ReachedView {
+    std::weak_ptr<MetalAllocation> allocation;
+    uint64_t offsetBytes = 0;
+    uint64_t lengthBytes = 0;
+};
+
+// The views of Addressed buffers whose addresses a range of a table's bytes
+// holds (MetalBackend::setTableReach).
 struct TableReach {
     uint64_t offsetBytes = 0;
     uint64_t lengthBytes = 0;
-    std::shared_ptr<const std::vector<std::weak_ptr<MetalAllocation>>> reached;
+    std::shared_ptr<const std::vector<ReachedView>> reached;
 };
 
 struct MetalAllocation {
@@ -334,9 +341,9 @@ struct MetalAllocation {
     BufferStorage storage = BufferStorage::Shared;
     __strong NSString *label = nil;
     BufferReach reach = BufferReach::Bound;
-    // A table's: the Addressed buffers each range of its bytes holds the
-    // addresses of (MetalBackend::setTableReach), which each encoder that
-    // uses those bytes declares. Ranges never overlap.
+    // A table's: the views of Addressed buffers each range of its bytes
+    // holds the addresses of (MetalBackend::setTableReach), which each
+    // encoder that uses those bytes declares. Ranges never overlap.
     std::vector<TableReach> reaches;
     // The owner of wrapped memory (MetalBackend::wrapSharedMemory), which is
     // never released: our views keep it as well as Metal's deallocator.
@@ -993,13 +1000,14 @@ struct MetalBackend::Impl {
     // buffers its dispatches list (AddressTable) for reading, or for reading
     // and writing where a dispatch writes, and the Addressed buffers the
     // bytes of a view a dispatch binds or lists reach as a table
-    // (setTableReach), and in turn the tables among them, for reading and
-    // writing. Metal makes a buffer resident for every usage an encoder
-    // declared. A buffer, a table or a reach is declared in an encoder when
-    // its stamp (declaredIn) holds the encoder's number, which counts the
-    // backend's encoders, so nothing is cleared between encoders. One serves
-    // a command and keeps nothing alive: the ticket keeps what its
-    // dispatches bind and list, the owner of a table what the table reaches.
+    // (setTableReach), and in turn what the bytes of the views they name
+    // reach, for reading and writing. Metal makes a buffer resident for
+    // every usage an encoder declared. A buffer, a table or a reach is
+    // declared in an encoder when its stamp (declaredIn) holds the encoder's
+    // number, which counts the backend's encoders, so nothing is cleared
+    // between encoders. One serves a command and keeps nothing alive: the
+    // ticket keeps what its dispatches bind and list, the owner of a table
+    // what the table reaches.
     class EncoderResidency final {
     public:
         // `encoders` counts the backend's encoders over all its commands.
@@ -1012,17 +1020,23 @@ struct MetalBackend::Impl {
             current_ = ++encoders_;
         }
 
-        // Declares what the bytes of `view`, which a dispatch binds or
-        // lists, reach.
-        void reach(const MetalBuffer::Impl &view) {
-            for (const TableReach &range : view.allocation->reaches) {
-                if (range.offsetBytes >= view.offsetBytes + view.lengthBytes ||
-                    view.offsetBytes >= range.offsetBytes + range.lengthBytes)
+        // Declares what bytes [offsetBytes, offsetBytes + lengthBytes) of
+        // `allocation` reach: those of a view a dispatch binds or lists, and
+        // in turn those of each view a declared reach names, as a kernel may
+        // follow an address it reads in one table to the entries of another.
+        // A reach is declared once per encoder, so a table that reaches
+        // itself ends.
+        void reach(const MetalAllocation &allocation, uint64_t offsetBytes, uint64_t lengthBytes) {
+            for (const TableReach &range : allocation.reaches) {
+                if (range.offsetBytes >= offsetBytes + lengthBytes ||
+                    offsetBytes >= range.offsetBytes + range.lengthBytes)
                     continue;
                 Reach &resolved = resolve(range.reached);
                 if (resolved.declaredIn == current_) continue;
                 resolved.declaredIn = current_;
                 use(resolved.allocations, true);
+                for (const ReachedTable &table : resolved.tables)
+                    reach(*table.allocation, table.offsetBytes, table.lengthBytes);
             }
         }
 
@@ -1033,49 +1047,42 @@ struct MetalBackend::Impl {
             if (declared == current_) return;
             declared = current_;
             use(table.allocations, writes);
-            for (const MetalBuffer::Impl *view : table.reaching) reach(*view);
+            for (const MetalBuffer::Impl *view : table.reaching)
+                reach(*view->allocation, view->offsetBytes, view->lengthBytes);
         }
 
     private:
+        // A view a reach names whose allocation is a table.
+        struct ReachedTable {
+            const MetalAllocation *allocation = nullptr;
+            uint64_t offsetBytes = 0;
+            uint64_t lengthBytes = 0;
+        };
+
         // A table reach (TableReach), resolved once: the allocations of the
-        // buffers it names that hold memory, and of what the tables among
-        // them reach in turn. It holds the names, so that no other vector
+        // views it names that hold memory, and those views among them whose
+        // allocation is a table. It holds the names, so that no other vector
         // takes their address while the command is encoded.
         struct Reach {
-            std::shared_ptr<const std::vector<std::weak_ptr<MetalAllocation>>> source;
+            std::shared_ptr<const std::vector<ReachedView>> source;
             std::vector<MetalAllocation *> allocations;
+            std::vector<ReachedTable> tables;
             uint64_t declaredIn = 0;
         };
 
-        Reach &resolve(const std::shared_ptr<const std::vector<std::weak_ptr<MetalAllocation>>> &source) {
+        Reach &resolve(const std::shared_ptr<const std::vector<ReachedView>> &source) {
             const auto known = std::ranges::find(reaches_, source, &Reach::source);
             if (known != reaches_.end()) return *known;
             Reach &added = reaches_.emplace_back();
             added.source = source;
-            std::vector<const MetalAllocation *> tables;
-            appendReached(*source, added.allocations, tables);
-            return added;
-        }
-
-        // Appends the allocations of the buffers `reached` names that hold
-        // memory, and what the tables among them reach in turn: a kernel may
-        // follow an address it reads in one table to the entries of another.
-        // Each table is followed once (`tables`), so one that reaches itself
-        // ends.
-        static void appendReached(const std::vector<std::weak_ptr<MetalAllocation>> &reached,
-                                  std::vector<MetalAllocation *> &allocations,
-                                  std::vector<const MetalAllocation *> &tables) {
-            for (const std::weak_ptr<MetalAllocation> &weak : reached) {
-                const std::shared_ptr<MetalAllocation> allocation = weak.lock();
+            for (const ReachedView &view : *source) {
+                const std::shared_ptr<MetalAllocation> allocation = view.allocation.lock();
                 if (!allocation || !allocation->buffer) continue;
-                if (!allocation->reaches.empty()) {
-                    if (std::ranges::find(tables, allocation.get()) != tables.end()) continue;
-                    tables.push_back(allocation.get());
-                }
-                allocations.push_back(allocation.get());
-                for (const TableReach &reach : allocation->reaches)
-                    appendReached(*reach.reached, allocations, tables);
+                added.allocations.push_back(allocation.get());
+                if (!allocation->reaches.empty())
+                    added.tables.push_back({allocation.get(), view.offsetBytes, view.lengthBytes});
             }
+            return added;
         }
 
         // Makes the buffers of `allocations` the encoder has not declared for
@@ -1097,7 +1104,9 @@ struct MetalBackend::Impl {
         uint64_t &encoders_;
         uint64_t current_ = 0;
         __unsafe_unretained id<MTLComputeCommandEncoder> encoder_ = nil;
-        std::vector<Reach> reaches_;
+        // A deque, so a Reach stays where reach() holds it while the reaches
+        // it follows are resolved.
+        std::deque<Reach> reaches_;
         std::vector<__unsafe_unretained id<MTLResource>> pending_;
     };
 
@@ -1644,7 +1653,7 @@ struct MetalBackend::Impl {
                         const MetalBuffer::Impl &buffer = *binding.buffer.impl_;
                         buffers[binding.index] = buffer.allocation->buffer;
                         offsets[binding.index] = buffer.offsetBytes;
-                        encoderResidency.reach(buffer);
+                        encoderResidency.reach(*buffer.allocation, buffer.offsetBytes, buffer.lengthBytes);
                     }
                     // One call per run of consecutive entries: a command graph's
                     // dispatch binds a single run.
@@ -2095,13 +2104,13 @@ void MetalBackend::setTableReach(const MetalBuffer &table, std::span<const Metal
     MetalAllocation &allocation = *table.impl_->allocation;
     if (allocation.storage != BufferStorage::Shared)
         throw MetalBackendError("only a Shared Metal buffer holds addresses the host writes");
-    auto weak = std::make_shared<std::vector<std::weak_ptr<MetalAllocation>>>();
+    auto weak = std::make_shared<std::vector<ReachedView>>();
     weak->reserve(reached.size());
     for (const MetalBuffer &buffer : reached) {
         if (!owned(buffer)) throw MetalBackendError("Metal buffer is not a buffer of this backend");
         if (buffer.impl_->allocation->reach != BufferReach::Addressed)
             throw MetalBackendError("only a Metal buffer allocated BufferReach::Addressed is reached by address");
-        weak->push_back(buffer.impl_->allocation);
+        weak->push_back({buffer.impl_->allocation, buffer.impl_->offsetBytes, buffer.impl_->lengthBytes});
     }
     const uint64_t offset = table.impl_->offsetBytes, length = table.impl_->lengthBytes;
     // The new range replaces what the old ranges said of its bytes; the

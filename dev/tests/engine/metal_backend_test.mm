@@ -1289,10 +1289,10 @@ void addressTables(const std::string &metallibPath) {
 
 // A kernel may follow an address to the entries of the table it names
 // (setTableReach), so what an encoder makes resident brings what it reaches:
-// a bound table brings the tables it reaches and what they reach, and a table
-// listed in an AddressTable what the listed bytes reach, each buffer once,
-// also when a table reaches itself, as a test fixture's tables lie in the
-// memory they reach.
+// a bound table brings what its bytes reach and in turn what the bytes they
+// name reach, and a table listed in an AddressTable what the listed bytes
+// reach, each buffer once, also when a table reaches itself, as a test
+// fixture's tables lie in the memory they reach.
 void tablesBringWhatTheyReach(const std::string &metallibPath) {
     EncoderUses recorded;
     MetalBackend backend(metallibPath);
@@ -1354,6 +1354,15 @@ void tablesBringWhatTheyReach(const std::string &metallibPath) {
     (void)backend.submitCommandAsync(graph.dispatches()).wait();
     require(declaredOnce({"outer", "inner", "leaf"}),
             "an encoder did not make what a table reaching itself reaches resident once");
+
+    // Reached bytes of inner past its entry reach nothing in turn: each hop
+    // brings what its bytes reach, as the first does.
+    const MetalBuffer innerPast = backend.view(inner, sizeof(uint64_t), sizeof(uint64_t));
+    backend.setTableReach(backend.view(outer, 0, sizeof(uint64_t)), std::span(&innerPast, 1));
+    recorded.uses.clear();
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
+    require(declared("outer") == 1 && declared("inner") == 1 && declared("leaf") == 0,
+            "reached bytes of a table that hold none of its entries made what it reaches resident");
     std::cout << "PASS tables bring what they reach\n";
 }
 

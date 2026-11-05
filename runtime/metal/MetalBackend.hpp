@@ -425,8 +425,8 @@ public:
   // view of a Shared buffer, hold: each encoder that uses the table makes
   // them resident (useResources, for reading and writing) as the command is
   // encoded. An encoder uses the table when its dispatches bind or list
-  // (AddressTable) a view holding any of those bytes, or reach its buffer
-  // through another table: a kernel may follow an address to the entries of
+  // (AddressTable) a view holding any of those bytes, or another table
+  // reaches such a view: a kernel may follow an address to the entries of
   // the table it names, so what an encoder makes resident brings what it
   // reaches. It replaces what the same bytes named before, so the owner
   // calls it whenever it rewrites the table's entries, for every buffer they
