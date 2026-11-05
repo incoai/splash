@@ -155,9 +155,25 @@ constexpr auto kTicketWaitSlice = std::chrono::seconds(1);
 // The queue's outstanding command buffers; a command takes one, and one more
 // per buffer its event steps add (addedBuffers).
 constexpr NSUInteger kMaximumCommandBuffers = 512;
-// The most loads host_step_wait spins for: 60-190 ms on the M5 Max (0.23-0.71
-// us a load), longer than nearly every step's work.
+// The most loads host_step_wait spins for through an awake step: 60-190 ms on
+// the M5 Max (0.23-0.71 us a load), longer than nearly every step's work.
+// The spin check bounds its spins by their release (hostStepCheckLoads).
 constexpr uint32_t kHostStepWaitLoads = 1u << 18;
+// The fastest load host_step_wait makes: 0.23 us on the M5 Max, 0.226 us on
+// the 20-core M5 Pro, at the high clocks of a GPU busy with other work.
+constexpr std::chrono::nanoseconds kHostStepFastestLoad{220};
+// How long after its commit the spin check (checkHostStepSpin) releases each
+// of its spins: the later ones wait out a GPU busy with other work.
+constexpr std::chrono::milliseconds kHostStepCheckDelays[] = {std::chrono::milliseconds(2),
+                                                              std::chrono::milliseconds(20),
+                                                              std::chrono::milliseconds(100)};
+// The most loads of a check's spin released `delay` after its commit: four
+// times the delay at the fastest load, so a spin that started before its
+// release still spins at it, at any clock. kHostStepWaitLoads would not do:
+// at the fastest load it ends 58 ms after its start, before the last release.
+constexpr uint32_t hostStepCheckLoads(std::chrono::milliseconds delay) noexcept {
+    return static_cast<uint32_t>(4 * delay / kHostStepFastestLoad);
+}
 // Where in the spin's release buffer (HostStepSpin) host_step_wait writes the
 // release it saw and the loads it made before: a cache line past the counter
 // the CPU raises (word 0).
@@ -1394,7 +1410,7 @@ struct MetalBackend::Impl {
         if (step.gpu == HostStepGpu::Awake && hostStepSpin) {
             awake = [queue commandBuffer];
             if (!awake) failEncoding("unable to create Metal command buffer");
-            released = encodeSpin(*hostStepSpin, awake, failEncoding);
+            released = encodeSpin(*hostStepSpin, awake, kHostStepWaitLoads, failEncoding);
         }
         id<MTLCommandBuffer> next = [queue commandBuffer];
         if (!next) failEncoding("unable to create Metal command buffer");
@@ -1411,13 +1427,13 @@ struct MetalBackend::Impl {
     }
 
     // Encodes into `buffer` one host_step_wait thread, which spins until the
-    // release counter reaches the spin's next release value, and returns that
-    // value.
+    // release counter reaches the spin's next release value, at most `loads`
+    // loads, and returns that value.
     template <class Fail>
-    static uint32_t encodeSpin(HostStepSpin &spin, id<MTLCommandBuffer> buffer, Fail &&fail) {
+    static uint32_t encodeSpin(HostStepSpin &spin, id<MTLCommandBuffer> buffer, uint32_t loads, Fail &&fail) {
         id<MTLComputeCommandEncoder> encoder = [buffer computeCommandEncoder];
         if (!encoder) fail("unable to create Metal compute encoder");
-        const uint32_t release[2] = {++spin.sequence, kHostStepWaitLoads};
+        const uint32_t release[2] = {++spin.sequence, loads};
         [encoder setComputePipelineState:spin.pipeline];
         [encoder setBuffer:spin.releases offset:0 atIndex:0];
         [encoder setBytes:release length:sizeof(release) atIndex:1];
@@ -1439,11 +1455,10 @@ struct MetalBackend::Impl {
         if (!checkQueue) fail("unable to create Metal command queue");
         const auto *seen = reinterpret_cast<const uint32_t *>(
             static_cast<const uint8_t *>(spin.releases.contents) + kHostStepSeenOffset);
-        for (const auto delay : {std::chrono::milliseconds(2), std::chrono::milliseconds(20),
-                                 std::chrono::milliseconds(100)}) {
+        for (const auto delay : kHostStepCheckDelays) {
             id<MTLCommandBuffer> buffer = [checkQueue commandBuffer];
             if (!buffer) fail("unable to create Metal command buffer");
-            const uint32_t value = encodeSpin(spin, buffer, fail);
+            const uint32_t value = encodeSpin(spin, buffer, hostStepCheckLoads(delay), fail);
             [buffer commit];
             std::this_thread::sleep_for(delay);
             const double released = awakeSeconds();
@@ -1451,9 +1466,11 @@ struct MetalBackend::Impl {
             [buffer waitUntilCompleted];
             if (buffer.status != MTLCommandBufferStatusCompleted)
                 fail("a GPU spin failed: " + errorDescription(buffer.error));
-            // A spin that was not spinning at its release (started after it,
-            // or ended before it, as when the GPU, busy with other work,
-            // started it late) shows nothing, so it runs again, released later.
+            // A spin that was not spinning at its release shows nothing, so it
+            // runs again, released later: one that started after it, as when
+            // the GPU, busy with other work, started it late, or one that
+            // ended before it, which its bound leaves to a GPU four times
+            // faster than any seen (hostStepCheckLoads).
             if (buffer.GPUStartTime >= released || buffer.GPUEndTime <= released) continue;
             // A spin that saw its release at its first load proves nothing:
             // a release that came before that load shows to any load.
@@ -1471,8 +1488,9 @@ struct MetalBackend::Impl {
     // with an awake step is encoded, the backend builds the spin
     // (HostStepSpin), and one spin runs on a queue of its own and is released
     // 2 ms after its commit, while it spins: it must end at that release, not
-    // at its bound. A spin that started after its release, or ended before
-    // it, shows nothing and runs again, released 20, then 100 ms after commit.
+    // at its bound, which outlasts the release (hostStepCheckLoads). A spin
+    // that started after its release, or ended before it, shows nothing and
+    // runs again, released 20, then 100 ms after commit (kHostStepCheckDelays).
     // Once a spin ended at its release, awake steps spin. If one ran past its
     // release, or the spin cannot be built or run, awake steps run as plain
     // ones (encodeHostStep), which only gives up the spin's head start, and a

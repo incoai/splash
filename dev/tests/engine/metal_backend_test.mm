@@ -7,6 +7,8 @@
 #include "TestRegistry.hpp"
 #include "TestStderr.hpp"
 
+#include "AwakeClock.hpp"
+
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -2025,6 +2027,7 @@ void firstCommandSpinsThroughItsAwakeHostStep(const std::string &metallibPath) {
 id noCommandQueue(id, SEL) { return nil; }
 CFTimeInterval startedLate(id, SEL) { return std::numeric_limits<CFTimeInterval>::max(); }
 CFTimeInterval startedEarly(id, SEL) { return 0.0; }
+CFTimeInterval endedEarly(id, SEL) { return 0.0; }
 CFTimeInterval endedLate(id, SEL) { return std::numeric_limits<CFTimeInterval>::max(); }
 
 // The warning of awake host steps that run as plain ones.
@@ -2054,8 +2057,9 @@ void hostStepSpinFallsBack(const std::string &metallibPath) {
             require(seen == 1 && *value == 2, "an awake host step without its spin did not run between its work");
         }
     };
-    const auto fallsBack = [&](MetalBackend &backend, std::string_view cause) {
-        const std::string warnings = capturedStderr([&] { runAwakeSteps(backend); });
+    // `warnings` holds those of a check run before the awake steps.
+    const auto fallsBack = [&](MetalBackend &backend, std::string_view cause, std::string warnings = {}) {
+        warnings += capturedStderr([&] { runAwakeSteps(backend); });
         const size_t warning = warnings.find(kNoSpinWarning);
         require(warning != std::string::npos && warnings.find(cause) != std::string::npos &&
                     warnings.find(kNoSpinWarning, warning + 1) == std::string::npos,
@@ -2081,10 +2085,14 @@ void hostStepSpinFallsBack(const std::string &metallibPath) {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     {
         MetalBackend backend(library.string());
-        id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
-        MethodReplacement early(command, @selector(GPUStartTime), reinterpret_cast<IMP>(startedEarly));
-        MethodReplacement late(command, @selector(GPUEndTime), reinterpret_cast<IMP>(endedLate));
-        fallsBack(backend, "did not see the CPU's release");
+        std::string warnings;
+        {
+            id<MTLCommandBuffer> command = [[device newCommandQueue] commandBuffer];
+            MethodReplacement early(command, @selector(GPUStartTime), reinterpret_cast<IMP>(startedEarly));
+            MethodReplacement late(command, @selector(GPUEndTime), reinterpret_cast<IMP>(endedLate));
+            warnings = capturedStderr([&] { (void)BackendInstrumentation::awakeHostStepsSpin(backend); });
+        }
+        fallsBack(backend, "did not see the CPU's release", warnings);
     }
     {
         MetalBackend backend(metallibPath);
@@ -2107,30 +2115,89 @@ void hostStepSpinFallsBack(const std::string &metallibPath) {
     std::cout << "PASS awake host steps run as plain ones without a spin that sees its release\n";
 }
 
-// A check whose every spin ended before its release, as when the GPU, busy
-// with other work, starts a spin so late that it makes all its loads before
-// the CPU releases it, decides nothing and warns of nothing, like one whose
-// spins all started after their release: a later check spins. The test
-// library's host_step_wait ends at once, before any release.
+// A check whose every spin ended before its release, which only a GPU faster
+// than the spins' bounds allow for would show (their end times are reported
+// as zero), decides nothing and warns of nothing, like one whose spins all
+// started after their release: a later check spins.
 void hostStepSpinEndedEarlyDecidesNothing(const std::string &metallibPath) {
-    namespace fs = std::filesystem;
-    TemporaryDirectory directory("splash-host-step");
-    const fs::path library = directory.path() / "test.metallib";
-    const fs::path spinLibrary = directory.path() / "host-step.metallib";
-    fs::copy_file(metallibPath, library);
-    fs::copy_file(metallibPath, spinLibrary);
-    MetalBackend backend(library.string());
+    MetalBackend backend(metallibPath);
     std::optional<bool> decision;
-    const std::string warnings =
-        capturedStderr([&] { decision = BackendInstrumentation::awakeHostStepsSpin(backend); });
+    std::string warnings;
+    {
+        id<MTLCommandBuffer> command = [[MTLCreateSystemDefaultDevice() newCommandQueue] commandBuffer];
+        MethodReplacement ended(command, @selector(GPUEndTime), reinterpret_cast<IMP>(endedEarly));
+        warnings = capturedStderr([&] { decision = BackendInstrumentation::awakeHostStepsSpin(backend); });
+    }
     require(!decision.has_value(), "a check whose spins all ended before their release decided: " + warnings);
-    fs::copy_file(fs::path(metallibPath).replace_filename("host-step.metallib"), spinLibrary,
-                  fs::copy_options::overwrite_existing);
     require(warnings.find(kNoSpinWarning) == std::string::npos &&
                 spinCheck(backend, "a check after one that decided nothing").value_or(true),
             "a check whose spins all ended before their release warned, or kept a later check from spinning: " +
                 warnings);
     std::cout << "PASS a spin check whose spins all ended before their release decides nothing\n";
+}
+
+// The fastest load host_step_wait makes: 0.23 us on the M5 Max, 0.226 us on
+// the 20-core M5 Pro, at the high clocks of a GPU busy with other work.
+constexpr double kFastestSpinLoadSeconds = 0.22e-6;
+
+// The spins of a spin check run on `checker`, recorded by the replacements
+// below: each spin's bound in loads, the release.y its encoder passes
+// host_step_wait, and the seconds from its GPU start to the check's reading
+// of that start, which follows its release.
+std::atomic<std::thread::id> checker;
+std::vector<uint32_t> spinBounds;
+std::vector<double> spinReleases;
+IMP originalSetBytes = nullptr, originalGPUStartTime = nullptr;
+
+void recordSpinBound(id encoder, SEL selector, const void *bytes, NSUInteger length, NSUInteger index) {
+    if (std::this_thread::get_id() == checker && index == 1 && length == 2 * sizeof(uint32_t))
+        spinBounds.push_back(static_cast<const uint32_t *>(bytes)[1]);
+    reinterpret_cast<void (*)(id, SEL, const void *, NSUInteger, NSUInteger)>(originalSetBytes)(encoder, selector,
+                                                                                               bytes, length, index);
+}
+
+CFTimeInterval recordSpinStart(id command, SEL selector) {
+    const CFTimeInterval start = reinterpret_cast<CFTimeInterval (*)(id, SEL)>(originalGPUStartTime)(command, selector);
+    // GPUStartTime counts seconds of the awake clock.
+    if (std::this_thread::get_id() == checker)
+        spinReleases.push_back(std::chrono::duration<double>(splash::AwakeClock::now().time_since_epoch()).count() -
+                               start);
+    return start;
+}
+
+// Every spin of a spin check is still spinning at its release, at any clock:
+// its bound, at the fastest load host_step_wait makes, outlasts the time from
+// its GPU start to its release. Each spin is reported to end at once
+// (endedEarly), so the check runs all of them.
+void hostStepCheckSpinsOutlastTheirRelease(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    checker = std::this_thread::get_id();
+    spinBounds.clear();
+    spinReleases.clear();
+    {
+        id<MTLCommandBuffer> command = [[MTLCreateSystemDefaultDevice() newCommandQueue] commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+        [encoder endEncoding];
+        MethodReplacement bytes(encoder, @selector(setBytes:length:atIndex:), reinterpret_cast<IMP>(recordSpinBound));
+        MethodReplacement start(command, @selector(GPUStartTime), reinterpret_cast<IMP>(recordSpinStart));
+        MethodReplacement end(command, @selector(GPUEndTime), reinterpret_cast<IMP>(endedEarly));
+        originalSetBytes = bytes.original;
+        originalGPUStartTime = start.original;
+        require(!BackendInstrumentation::awakeHostStepsSpin(backend).has_value(),
+                "a check whose spins all ended at once decided");
+    }
+    checker = std::thread::id{};
+    require(!spinBounds.empty() && spinBounds.size() == spinReleases.size(),
+            "a spin check's spins were not recorded: " + std::to_string(spinBounds.size()) + " bounds, " +
+                std::to_string(spinReleases.size()) + " starts");
+    for (size_t spin = 0; spin < spinBounds.size(); ++spin) {
+        const double bound = spinBounds[spin] * kFastestSpinLoadSeconds;
+        require(bound > spinReleases[spin],
+                "spin " + std::to_string(spin) + " of a check ends " + std::to_string(bound * 1e3) +
+                    " ms after its start at the fastest load (" + std::to_string(spinBounds[spin]) +
+                    " loads), before its release " + std::to_string(spinReleases[spin] * 1e3) + " ms after it");
+    }
+    std::cout << "PASS a spin check's spins outlast their release\n";
 }
 
 // The buffers of a command before its last are committed as their encoding
@@ -2846,6 +2913,7 @@ std::span<const splash::test::TestCase> behaviourTests() {
         {"hostSteps", [] { (void)hostSteps(metallib); }},
         {"hostStepSpinFallsBack", [] { hostStepSpinFallsBack(metallib); }},
         {"hostStepSpinEndedEarlyDecidesNothing", [] { hostStepSpinEndedEarlyDecidesNothing(metallib); }},
+        {"hostStepCheckSpinsOutlastTheirRelease", [] { hostStepCheckSpinsOutlastTheirRelease(metallib); }},
         {"earlyBuffersRunWhileTheRestEncodes", [] { earlyBuffersRunWhileTheRestEncodes(metallib); }},
         {"encodingFailureAfterACommit", [] { encodingFailureAfterACommit(metallib); }},
         {"throwingHostStepFailsItsCommand", [] { throwingHostStepFailsItsCommand(metallib); }},
