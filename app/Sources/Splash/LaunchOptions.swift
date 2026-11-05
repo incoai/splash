@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// How a model starts: the `splash serve` options of `LaunchOption.all` the model picked can use,
 /// in one card, the main ones first and the others under Advanced, which opens them below it in the
@@ -39,7 +40,7 @@ struct LaunchOptions: View {
                 SectionTitle(text: LaunchOption.Section.main.rawValue)
                 Spacer()
                 // For the options the card shows.
-                let defaults = state.options.defaults(for: family)
+                let defaults = state.options.defaults(for: family, model: state.selection)
                 if state.options != defaults {
                     Button("Restore Defaults") { state.options = defaults }
                         .buttonStyle(.hover)
@@ -131,8 +132,11 @@ private struct OptionRow: View {
 
     var body: some View {
         @Bindable var state = state
-        let value = Binding(get: { state.options[option.flag] }, set: { state.options[option.flag] = $0 })
-        let applies = option.applies(state.options)
+        // An option of one model holds the value of the model picked, and applies to model files.
+        let value = Binding(get: { state.options[option, model: state.selection] },
+                            set: { state.options[option, model: state.selection] = $0 })
+        let notLocal = option.localOnly && state.selection?.hasPrefix("/") != true
+        let applies = option.applies(state.options) && !notLocal
         let takes = { family.takes(option.flag, $0) }
         VStack(alignment: .leading, spacing: 6) {
             Group {
@@ -149,6 +153,8 @@ private struct OptionRow: View {
                     TextRow(title: option.title, help: option.help, custom: custom, takes: takes, value: value)
                 case .folder:
                     FolderRow(title: option.title, help: option.help, value: value)
+                case .file:
+                    FileRow(title: option.title, help: option.help, value: value)
                 case .secret:
                     TextRow(title: option.title, help: option.help, custom: LaunchOption.Value(prompt: "None", message: "", parse: { $0.isEmpty ? nil : $0 }),
                             takes: takes, secure: true, value: $state.options.apiKey)
@@ -157,7 +163,7 @@ private struct OptionRow: View {
             }
             .disabled(!applies)
             .environment(\.optionRowHovered, hovered)
-            .environment(\.optionRowNeeds, option.lacks(state.options))
+            .environment(\.optionRowNeeds, option.lacks(state.options) ?? (notLocal ? "Needs model files on this Mac." : nil))
             .contentShape(.rect)
             .onHover { hovered = $0 }
             if let warning = option.warning(state.options) ?? value.wrappedValue.flatMap({ family.refusal(option.flag, $0) }) {
@@ -292,6 +298,39 @@ private struct FolderRow: View {
                     panel.canChooseDirectories = true
                     panel.canChooseFiles = false
                     panel.canCreateDirectories = true
+                    if panel.runModal() == .OK, let url = panel.url { value = url.path }
+                } label: {
+                    Text("Choose…").optionField()
+                }
+                .buttonStyle(.hoverFlush)
+            }
+        }
+    }
+}
+
+/// A file picked, or none.
+private struct FileRow: View {
+    let title: String
+    let help: String
+    @Binding var value: String?
+
+    var body: some View {
+        OptionLabeled(title: title, help: help) {
+            HStack {
+                Spacer(minLength: 0)
+                Text(value.map { URL(filePath: $0).lastPathComponent } ?? "None")
+                    .foregroundStyle(.secondary)
+                    .truncationMode(.middle)
+                    .layoutPriority(1)
+                    .help(value ?? "")
+                if value != nil {
+                    Button { value = nil } label: { Text("Use None").optionField() }.buttonStyle(.hoverFlush)
+                }
+                Button {
+                    let panel = NSOpenPanel()
+                    panel.canChooseDirectories = false
+                    panel.canChooseFiles = true
+                    if let gguf = UTType(filenameExtension: "gguf") { panel.allowedContentTypes = [gguf] }
                     if panel.runModal() == .OK, let url = panel.url { value = url.path }
                 } label: {
                     Text("Choose…").optionField()

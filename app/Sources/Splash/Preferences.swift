@@ -14,6 +14,9 @@ enum Preference {
     static let efforts = "efforts"
     /// The launch options set, by flag (`ServeSettings`).
     static let launchOptions = "launchOptions"
+    /// The launch options of model files on this Mac, by their path and then by flag
+    /// (`ServeSettings.localValues`).
+    static let localModelOptions = "localModelOptions"
     /// The server and the download the app runs (`ChildRecord`), kept until they exit, to stop
     /// them on the next launch should the app quit without stopping them.
     static let serverPID = "serverPID"
@@ -33,32 +36,64 @@ struct ServeSettings: Equatable {
     /// `splash serve` takes otherwise.
     var values: [String: String] = [:]
     var apiKey: String?
+    /// The value of each option of one model (`LaunchOption.localOnly`) set, by the path of the
+    /// model files and then by its flag; a path with none has no entry.
+    var localValues: [String: [String: String]] = [:]
 
     subscript(flag: String) -> String? {
         get { values[flag] }
         set { values[flag] = newValue }
     }
 
+    /// The value of `option` for `model`: the model's own for an option of one model, which only
+    /// model files have, and the one every start shares for any other.
+    subscript(option: LaunchOption, model model: String?) -> String? {
+        get {
+            guard option.localOnly else { return values[option.flag] }
+            return model.flatMap { $0.hasPrefix("/") ? localValues[$0]?[option.flag] : nil }
+        }
+        set {
+            guard option.localOnly else {
+                values[option.flag] = newValue
+                return
+            }
+            guard let model, model.hasPrefix("/") else { return }
+            localValues[model, default: [:]][option.flag] = newValue
+            if localValues[model]?.isEmpty == true { localValues[model] = nil }
+        }
+    }
+
     var port: Int { values["--port"].flatMap(Int.init) ?? Self.defaultPort }
 
     /// The options UserDefaults keeps, of the flags the app offers and values they take; no key.
     static func current(_ defaults: UserDefaults) -> ServeSettings {
+        func taken(_ kept: [String: String], localOnly: Bool) -> [String: String] {
+            kept.filter { flag, value in
+                LaunchOption.all.contains { $0.localOnly == localOnly && $0.flag == flag && $0.accepts(value) }
+            }
+        }
         let kept = defaults.dictionary(forKey: Preference.launchOptions) as? [String: String] ?? [:]
-        return ServeSettings(values: kept.filter { flag, value in LaunchOption.all.contains { $0.flag == flag && $0.accepts(value) } })
+        let local = defaults.dictionary(forKey: Preference.localModelOptions) as? [String: [String: String]] ?? [:]
+        return ServeSettings(values: taken(kept, localOnly: false),
+                             localValues: local.mapValues { taken($0, localOnly: true) }.filter { !$0.value.isEmpty })
     }
 
     /// Keeps the options in UserDefaults; the key is kept apart.
     func save(_ defaults: UserDefaults) {
         defaults.set(values, forKey: Preference.launchOptions)
+        defaults.set(localValues, forKey: Preference.localModelOptions)
     }
 
     /// What `splash serve` takes to serve `model`, a Hugging Face ID or the path of model files on
     /// this Mac, with these options.
     func serveArguments(model: String) -> [String] {
-        let source = model.hasPrefix("/") ? ["--model", Self.localID(model), "--model-dir", model] : ["--model", model]
+        // Model files on this Mac report the name set for them, or one made of their path.
+        let source = model.hasPrefix("/")
+            ? ["--model", localValues[model]?["--model"] ?? Self.localID(model), "--model-dir", model]
+            : ["--model", model]
         var arguments = ["serve"] + source + ["--port", String(port), "--offline"]
-        for option in LaunchOption.all where option.flag != "--port" && option.applies(self) {
-            arguments += option.arguments(values[option.flag])
+        for option in LaunchOption.all where option.flag != "--port" && option.flag != "--model" && option.applies(self) {
+            arguments += option.arguments(self[option, model: model])
         }
         return arguments
     }
@@ -77,6 +112,15 @@ struct ServeSettings: Equatable {
         return "local/" + (name.isEmpty ? "model" : name)
     }
 
+    /// `text` as a model ID `splash serve --model` takes (`serve_options.parse_model_id`), if it is one.
+    static func modelID(_ text: String) -> String? {
+        let value = text.trimmingCharacters(in: .whitespaces)
+        guard let match = value.wholeMatch(of: /([A-Za-z0-9_](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?\/[A-Za-z0-9_](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9_])?)(?::[A-Za-z0-9][A-Za-z0-9._-]{0,63})?/),
+              !value.contains(".."), !match.1.contains("--"), !match.1.hasSuffix(".git")
+        else { return nil }
+        return value
+    }
+
     /// What the server's environment adds: the API key it asks for.
     var environment: [String: String] {
         apiKey.map { ["SPLASH_API_KEY": $0] } ?? [:]
@@ -85,13 +129,18 @@ struct ServeSettings: Equatable {
     /// The options a model of `family` starts with: those set but the ones it does not take
     /// (`ModelFamily.takes`), whose values stay kept for a model that does.
     func usable(by family: ModelFamily) -> ServeSettings {
-        ServeSettings(values: values.filter { family.takes($0.key, $0.value) }, apiKey: apiKey)
+        ServeSettings(values: values.filter { family.takes($0.key, $0.value) }, apiKey: apiKey,
+                      localValues: localValues.mapValues { $0.filter { family.takes($0.key, $0.value) } }
+                          .filter { !$0.value.isEmpty })
     }
 
     /// These options with the ones a model of `family` can use, those the card shows, back at their
-    /// defaults, the API key too; values kept for the others stay, for a model that can use them.
-    func defaults(for family: ModelFamily) -> ServeSettings {
-        ServeSettings(values: values.filter { !family.uses($0.key) })
+    /// defaults, the API key too, and so do the options of `model`'s own files; values kept for
+    /// the others stay, for a model that can use them.
+    func defaults(for family: ModelFamily, model: String? = nil) -> ServeSettings {
+        var settings = ServeSettings(values: values.filter { !family.uses($0.key) }, localValues: localValues)
+        if let model { settings.localValues[model] = nil }
+        return settings
     }
 
     /// Whether a model of `family` started with these options would start otherwise with `other`.
@@ -118,12 +167,13 @@ struct ServeSettings: Equatable {
 }
 
 /// A `splash serve` option the Server screen offers: its flag, its words, its part of the screen,
-/// and how its value is chosen. `all` holds every option `splash serve` takes but those the app
-/// sets itself (`--model`, `--model-dir`, `--offline`) and those of one model rather than every
-/// start (`--revision`, `--draft-model`, `--mmproj`).
+/// and how its value is chosen. `all` holds every option `splash serve` takes but the ones the app
+/// sets itself (`--model-dir`, `--offline`) and `--revision`. Those of one model alone (`--model`
+/// as the name of model files on this Mac, `--mmproj`, `--draft-model`) are kept for each model's
+/// files (`ServeSettings.localValues`).
 struct LaunchOption: Identifiable, Sendable {
     enum Section: String, CaseIterable {
-        case main = "Launch Options", memory = "Memory", cache = "SSD Cache"
+        case main = "Launch Options", model = "Model Files", memory = "Memory", cache = "SSD Cache"
         case network = "Network and Access", api = "API", requests = "Requests"
     }
 
@@ -138,6 +188,8 @@ struct LaunchOption: Identifiable, Sendable {
         case text(Value, list: Bool)
         /// A folder picked.
         case folder
+        /// A file picked.
+        case file
         /// The API key, typed in a field that hides it and kept apart (`ServeSettings.apiKey`).
         case secret
     }
@@ -174,6 +226,8 @@ struct LaunchOption: Identifiable, Sendable {
     let help: String
     let section: Section
     let kind: Kind
+    /// Whether the option is one of model files on this Mac, each with a value of its own.
+    var localOnly = false
     /// What the option needs of the others to have effect; one that hasn't shows dimmed, a switch
     /// as off, says what it lacks, and doesn't reach the server.
     var requires: [Requirement] = []
@@ -210,7 +264,7 @@ struct LaunchOption: Identifiable, Sendable {
         switch kind {
         case .toggle: return value == "true" ? [flag] : []
         case .text(_, list: true): return Self.items(value).flatMap { [flag, $0] }
-        case .choice, .text, .folder: return [flag, value]
+        case .choice, .text, .folder, .file: return [flag, value]
         case .secret: return []
         }
     }
@@ -222,7 +276,7 @@ struct LaunchOption: Identifiable, Sendable {
         case .choice(_, let choices, let custom):
             choices.contains { $0.value == value } || custom.map { $0.parse($0.text(value)) == value } ?? false
         case .text(let custom, _): custom.parse(custom.text(value)) == value
-        case .folder: value.hasPrefix("/")
+        case .folder, .file: value.hasPrefix("/")
         case .secret: false
         }
     }
@@ -268,7 +322,7 @@ struct ModelFamily: Decodable, Equatable, Sendable {
 }
 
 extension LaunchOption {
-    static let all: [LaunchOption] = main + memory + cache + network + api + requests
+    static let all: [LaunchOption] = main + modelFiles + memory + cache + network + api + requests
 
     private static let main: [LaunchOption] = [
         LaunchOption(
@@ -299,6 +353,26 @@ extension LaunchOption {
             flag: "--language-only", title: "Text only",
             help: "Leaves the model’s vision out: it loads less, and refuses images and PDFs.",
             section: .main, kind: .toggle(on: true)),
+    ]
+
+    private static let modelFiles: [LaunchOption] = [
+        LaunchOption(
+            flag: "--model", title: "Model name",
+            help: "The name the API reports for model files on this Mac. Empty uses the file’s or folder’s name.",
+            section: .model,
+            kind: .text(Value(prompt: "local/model",
+                              message: "A model name the API accepts, in owner/model form, such as local/huihui-v2-q4.",
+                              parse: ServeSettings.modelID), list: false),
+            localOnly: true),
+        LaunchOption(
+            flag: "--mmproj", title: "Vision projector",
+            help: "The GGUF file that lets a GGUF model on this Mac see images and PDFs; without one it serves text only.",
+            section: .model, kind: .file, localOnly: true,
+            requires: [Requirement("Needs the model’s vision (Text only off).") { $0["--language-only"] != "true" }]),
+        LaunchOption(
+            flag: "--draft-model", title: "Draft model",
+            help: "The folder of the DFlash2 draft for model files on this Mac; Default uses the draft released for the model’s family, from the Hugging Face cache.",
+            section: .model, kind: .folder, localOnly: true),
     ]
 
     private static let memory: [LaunchOption] = [

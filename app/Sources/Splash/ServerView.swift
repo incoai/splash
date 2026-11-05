@@ -623,14 +623,9 @@ private struct CustomModelSheet: View {
         }
     }
 
-    /// The model typed or pasted, its Hugging Face address too, if `splash serve --model` takes it
-    /// (`serve_options.parse_model_id`'s rules).
+    /// The model typed or pasted, its Hugging Face address too, if `splash serve --model` takes it.
     private var id: String? {
-        let text = model.trimmingCharacters(in: .whitespaces).trimmingPrefix("https://huggingface.co/")
-        guard let match = text.wholeMatch(of: /([A-Za-z0-9_](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?\/[A-Za-z0-9_](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9_])?)(?::[A-Za-z0-9][A-Za-z0-9._-]{0,63})?/),
-              !text.contains(".."), !match.1.contains("--"), !match.1.hasSuffix(".git")
-        else { return nil }
-        return String(text)
+        ServeSettings.modelID(String(model.trimmingCharacters(in: .whitespaces).trimmingPrefix("https://huggingface.co/")))
     }
 
     private func download() {
