@@ -558,17 +558,8 @@ TokenAdmission Cache::ensureTokens(uint64_t requestId, uint64_t tokenCount,
 TokenAdmission Cache::admitPages(uint32_t count, std::vector<uint32_t> &pages,
                                   kv::PageForm form, uint32_t held) {
   KvPageAcquisition acquired = pool_.acquirePages(count, form, held);
-  if (!acquired.granted()) {
-    // Demoted and spilled pages free theirs when their copies land: wait
-    // once those on their way cover what the free pages beyond those held
-    // do not, and until then reclaim.
-    const uint32_t free = pool_.freePageCount(form);
-    const uint32_t missing = count - std::min(count, free - std::min(free, held));
-    const uint32_t pending = pendingPages(form);
-    const bool covered = pending > 0 && pending >= missing;
-    return {covered ? TokenAdmissionFailure::Pending : TokenAdmissionFailure::Denied,
-            count, pool_.freePageCount(form), acquired.failure, form};
-  }
+  if (!acquired.granted())
+    return {TokenAdmissionFailure::Denied, count, pool_.freePageCount(form), acquired.failure, form};
   pages = std::move(acquired.pages);
   return {};
 }
@@ -1641,10 +1632,6 @@ bool Cache::returnsInFlight(const Shortfall &shortfall) const noexcept {
          pool_.freePageCount(shortfall.form) + freed >= shortfall.pages;
 }
 
-uint64_t Cache::pendingBytes() const noexcept {
-  return uint64_t{pendingPages(kv::PageForm::Full)} * pool_.bytesPerPage();
-}
-
 uint32_t Cache::pendingPages(kv::PageForm form) const noexcept {
   // Only a Full page waits for its copy: an Index page's block has one
   // already, and its page frees at once.
@@ -1683,33 +1670,6 @@ uint32_t Cache::spillingWrites() const noexcept {
 bool Cache::spillsOnLanding(const Write &write) const {
   // pendingPages counts every demotion already (writes(Reclaim)).
   return write.write != WriteClass::Reclaim && spillEligibility(write.block) == Eligibility::Eligible;
-}
-
-bool Cache::owedCopiesReturn(uint32_t pages, kv::PageForm form) const {
-  if (form != kv::PageForm::Full)
-    return false;
-  const uint32_t needed = pages ? pages : pool_.extentPages();
-  const uint32_t free = std::min(pool_.freePageCount(kv::PageForm::Full), needed);
-  const uint32_t copies = copiesToSpill(std::max(needed - free, 1u));
-  return copies && free + copies >= needed;
-}
-
-uint32_t Cache::copiesToSpill(uint32_t enough) const {
-  if (!spill_)
-    return 0;
-  // Requests on one prefix owe its blocks each, one maybe a block another
-  // writes.
-  std::unordered_set<uint64_t> blocks;
-  for (const Write &write : writes_)
-    if (spillsOnLanding(write))
-      blocks.insert(write.block);
-  for (const auto &[_, active] : requests_)
-    for (auto block = active.owedCopies.begin(); writes(WriteClass::Spill) && active.mode == KvMode::Spill &&
-                                                 block != active.owedCopies.end() && blocks.size() < enough;
-         ++block)
-      if (spillEligibility(*block) == Eligibility::Eligible)
-        blocks.insert(*block);
-  return static_cast<uint32_t>(blocks.size());
 }
 
 // Spilling: commitments of quota, write-through of Spill requests' pages,

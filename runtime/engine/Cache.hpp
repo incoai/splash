@@ -196,13 +196,13 @@ struct CacheSnapshot final {
   std::optional<KvWindowSnapshot> window;
 };
 
+// Whether an admission of pages was refused. A refusal says no more than
+// that: what the pages it lacks wait for, or take, the memory ledger
+// decides (MemoryLedger::free), from what lands and what the walk reaches.
 enum class TokenAdmissionFailure : uint8_t {
   None,
   // The pool could not grow by an extent; allocationFailure says why.
   Denied,
-  // A transfer in flight (a KV demotion, a KV restore or the one state write)
-  // holds what the request needs; retry when it lands.
-  Pending,
 };
 
 struct TokenAdmission final {
@@ -546,14 +546,6 @@ public:
   // holds.
   [[nodiscard]] uint32_t indexPages(uint64_t requestId) const;
   [[nodiscard]] bool holdsIndexPages(uint64_t requestId) const;
-  // Whether the copies Spill requests owe give back what a refusal lacks
-  // while the SSD cache writes them: `pages` Full pages of KV, or with none
-  // named memory, an extent's Full pages, as a device need asks. The
-  // copies in flight land, the owed ones follow (writeThrough), and each
-  // frees its Full page as it spills: into the free Index pages and the
-  // Index extents the Full extents they empty fund. pendingPages counts only
-  // the copies in flight, as far as free Index pages take them.
-  [[nodiscard]] bool owedCopiesReturn(uint32_t pages, kv::PageForm form) const;
   // The block's copy could not be read (ModelStepResult::unreadableKvBlocks):
   // it matches nothing any more, and its copy goes with the block.
   void poisonCopy(uint64_t block);
@@ -748,9 +740,6 @@ public:
   // Releases every empty extent, but one with keepRunway, and returns the
   // bytes released.
   [[nodiscard]] uint64_t releaseEmptyExtents(bool keepRunway);
-  // Bytes of the Full pages transfers in flight will free (pendingPages);
-  // they return when the copies land.
-  [[nodiscard]] uint64_t pendingBytes() const noexcept;
   // A KV demotion, a KV restore or the one state write is in flight, so
   // memory or quota returns by itself and its completion wakes the engine;
   // so is a copy ahead whose landing lets a leaf go (copyAheadReturns), or a
@@ -1104,6 +1093,8 @@ private:
   // (transfersInFlight).
   [[nodiscard]] bool returns(const Walk &walk) const noexcept;
 
+  // Takes `count` free pages of the form, past the `held` ones, into
+  // `pages`; refused (Denied) when the pool has not that many.
   [[nodiscard]] TokenAdmission admitPages(uint32_t count, std::vector<uint32_t> &pages, kv::PageForm form,
                                           uint32_t held);
   // Whether a transfer in flight can still cover a shortfall once it lands.
@@ -1363,13 +1354,6 @@ private:
   // holds past its dense history and tail window, whatever wrote it but a
   // demotion.
   [[nodiscard]] bool spillsOnLanding(const Write &write) const;
-  // The blocks whose Full pages copies free as they land and spill: those
-  // being written (spillsOnLanding), then, while the SSD cache writes Spill
-  // requests' copies (a Spill write in flight), those still owed, counted up
-  // to `enough`. No owed one while no copy is being written through: what
-  // holds those writes back (the tier's share, the quota, a file that takes
-  // none) holds the owed ones back too.
-  [[nodiscard]] uint32_t copiesToSpill(uint32_t enough) const;
   // Whether a demotion of the block frees its page as its copy lands: no
   // state in RAM keeps the page (pollTierTransfers), no request holds it,
   // and each resident child leaves by a demotion of `freeing`, started

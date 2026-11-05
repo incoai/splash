@@ -130,32 +130,42 @@ private:
   SharedBudget &budget_;
 };
 
-// Admits pages the way the engine does: each denial asks the ledger for the
-// pages it lacks beyond the free ones (Engine's inPlace), until the pages
-// fit, what lands holds what they need, or nothing more can be taken.
-TokenAdmission admitLikeEngine(engine::Cache &cache,
-                               const std::function<TokenAdmission()> &attempt) {
-  TokenAdmission admission = attempt();
-  while (admission.failure == TokenAdmissionFailure::Denied) {
-    const uint32_t lacking =
-        admission.additionalPages - std::min(admission.additionalPages, admission.availablePages);
-    const FreeResult step =
-        test::freeFromCache(cache, test::kInServiceGrowth, {.pages = lacking, .form = admission.form});
-    if (step.outcome != FreeOutcome::Met) {
-      if (step.outcome == FreeOutcome::Pending)
-        admission.failure = TokenAdmissionFailure::Pending;
-      break;
-    }
-    admission = attempt();
-  }
-  return admission;
+// What the ledger answers the claim a refused admission makes, the cache its
+// only source (test::freeFromCache): the pages it lacks beyond the free ones,
+// as the engine asks for them (Engine's inPlace).
+FreeResult askLedger(engine::Cache &cache, const TokenAdmission &refused) {
+  const uint32_t lacking = refused.additionalPages - std::min(refused.additionalPages, refused.availablePages);
+  return test::freeFromCache(cache, test::kInServiceGrowth, {.pages = lacking, .form = refused.form});
 }
 
-TokenAdmission admitTokens(engine::Cache &cache, uint64_t requestId, uint64_t tokens) {
+// An admission made the way the engine makes it, and the ledger's answer to
+// its last refusal: Met once the pages fit (or at once), else Pending while
+// what lands covers what it lacks, Short when nothing does.
+struct Admitted final {
+  TokenAdmission admission;
+  FreeOutcome ledger = FreeOutcome::Met;
+  [[nodiscard]] bool granted() const noexcept { return admission.granted(); }
+};
+
+// Admits pages the way the engine does: each refusal asks the ledger for the
+// pages it lacks (askLedger), until the pages fit or the ledger answers
+// other than Met.
+Admitted admitLikeEngine(engine::Cache &cache, const std::function<TokenAdmission()> &attempt) {
+  Admitted admitted{attempt()};
+  while (!admitted.granted()) {
+    admitted.ledger = askLedger(cache, admitted.admission).outcome;
+    if (admitted.ledger != FreeOutcome::Met)
+      break;
+    admitted.admission = attempt();
+  }
+  return admitted;
+}
+
+Admitted admitTokens(engine::Cache &cache, uint64_t requestId, uint64_t tokens) {
   return admitLikeEngine(cache, [&] { return cache.ensureTokens(requestId, tokens); });
 }
 
-TokenAdmission admitRestore(engine::Cache &cache, uint64_t requestId,
+Admitted admitRestore(engine::Cache &cache, uint64_t requestId,
                             const CacheLookup &lookup) {
   return admitLikeEngine(cache, [&] { return cache.restoreRequest(requestId, lookup); });
 }
@@ -2254,7 +2264,7 @@ void testRefusedDemotionKeepsTheLeafWhileTransfersLand() {
               fixture.cache.snapshot().pool.pagesPrefix == 4,
           "a leaf was dropped or the wait was not reported while the tier was busy");
   fixture.cache.beginRequest(2);
-  require(admitTokens(fixture.cache, 2, 32).failure == TokenAdmissionFailure::Pending,
+  require(admitTokens(fixture.cache, 2, 32).ledger == FreeOutcome::Pending,
           "a request was failed while a transfer was landing");
   fixture.cache.endRequest(2);
   tier.complete();
@@ -2508,12 +2518,12 @@ void testFullTierStopsTheScan() {
   // that page rather than evicting more.
   tier.transferLimit = 1;
   p.cache.beginRequest(9);
-  require(admitTokens(p.cache, 9, 32).failure == TokenAdmissionFailure::Pending &&
+  require(admitTokens(p.cache, 9, 32).ledger == FreeOutcome::Pending &&
               tier.demotions == 1 && p.cache.snapshot().pool.pagesPrefix == 4,
           "the first leaf was not written, or a leaf was dropped");
   // A larger shortfall meets a tier that the transfer in flight fills. Every
   // leaf would answer the same, so the scan asks once and waits.
-  require(admitTokens(p.cache, 9, 64).failure == TokenAdmissionFailure::Pending &&
+  require(admitTokens(p.cache, 9, 64).ledger == FreeOutcome::Pending &&
               p.cache.snapshot().kvTier.demotionsRefused == 1 &&
               p.cache.snapshot().pool.pagesPrefix == 4,
           "a full tier was asked once per leaf, or a leaf was dropped");
@@ -2542,11 +2552,11 @@ void testRestoresInFlightReturnNothingToAShortfall() {
   require(admitRestore(fixture.cache, 2, lookup).granted() && fixture.pool.freePageCount() == 0,
           "restore did not take the free page");
   fixture.cache.beginRequest(3);
-  require(admitTokens(fixture.cache, 3, 32).failure == TokenAdmissionFailure::Denied,
+  require(admitTokens(fixture.cache, 3, 32).ledger == FreeOutcome::Short,
           "a shortfall during a restore waited for what the restore returns");
   tier.complete();
   require(fixture.cache.pollTransfers() &&
-              admitTokens(fixture.cache, 3, 32).failure == TokenAdmissionFailure::Denied,
+              admitTokens(fixture.cache, 3, 32).ledger == FreeOutcome::Short,
           "pages held by an active request were not exhausted");
   lookup = {};
   fixture.cache.endRequest(2);
@@ -2564,11 +2574,11 @@ void testPendingPagesGateAllocation() {
   control->ready = true;
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control), false);
   fixture.cache.beginRequest(2);
-  require(admitTokens(fixture.cache, 2, 32).failure == TokenAdmissionFailure::Pending &&
+  require(admitTokens(fixture.cache, 2, 32).ledger == FreeOutcome::Pending &&
               tier.demotions == 1 && fixture.cache.snapshot().pool.pagesPrefix == 4 &&
               fixture.cache.snapshot().kvTier.pendingPages == 1,
           "allocation evicted past the page on its way back");
-  require(admitTokens(fixture.cache, 2, 32).failure == TokenAdmissionFailure::Pending &&
+  require(admitTokens(fixture.cache, 2, 32).ledger == FreeOutcome::Pending &&
               tier.demotions == 1,
           "a retry before the copy landed demoted more");
   tier.complete();
@@ -2823,8 +2833,8 @@ void testRestoreKeepsTheBlockItExtends() {
   fixture.cache.beginRequest(4);
   // Making room demotes a leaf: the restore waits for its copy and holds no
   // page meanwhile.
-  const TokenAdmission waiting = admitRestore(fixture.cache, 4, lookup);
-  require(waiting.failure == TokenAdmissionFailure::Pending &&
+  const Admitted waiting = admitRestore(fixture.cache, 4, lookup);
+  require(waiting.ledger == FreeOutcome::Pending &&
               fixture.cache.pageTable(4).pages.empty(),
           "a restore without a page did not wait for the room being made");
   tier.complete();
@@ -4240,8 +4250,8 @@ void testPendingPagesCountWritesThatSpill() {
   spill.storage.growthBlocked = true;
   spill.cache.beginRequest(3);
   const uint32_t free = spill.pool.freePageCount();
-  require(spill.cache.ensureTokens(3, (free + 1) * KvCache::pageTokens).failure ==
-              TokenAdmissionFailure::Pending,
+  const TokenAdmission refused = spill.cache.ensureTokens(3, (free + 1) * KvCache::pageTokens);
+  require(!refused.granted() && askLedger(spill.cache, refused).outcome == FreeOutcome::Pending,
           "an admission the spilling writes cover did not wait for them");
   for (uint32_t page : index.pages)
     spill.pool.releasePage(page, false);
@@ -4273,8 +4283,8 @@ void testWritesThatFreeNothingHoldNothingBack() {
   spill.cache.endRequest(1);
 }
 
-// A refused allocation waits for spilling writes only when they and free pages cover what it lacks;
-// otherwise it reclaims.
+// A refused allocation waits for spilling writes only for what they and free pages cover; for the
+// rest it reclaims.
 void testWritesShortOfARefusalHoldNothingBack() {
   Spilling spill;
   spill.start(1, Spilling::prompt(1000, 6), 6);
@@ -4292,18 +4302,11 @@ void testWritesShortOfARefusalHoldNothingBack() {
   const uint64_t tokens =
       uint64_t{spill.pool.freePageCount() + spill.cache.pendingPages(kv::PageForm::Full) + 1} *
       KvCache::pageTokens;
-  TokenAdmission admission = spill.cache.ensureTokens(3, tokens);
-  require(admission.failure == TokenAdmissionFailure::Denied,
-          "the writes through covered more than they free");
-  while (admission.failure == TokenAdmissionFailure::Denied) {
-    const FreeResult reclaimed =
-        test::takeFirst(spill.cache, test::kInServiceGrowth, {.pages = admission.additionalPages});
-    require(reclaimed.outcome == FreeOutcome::Met,
-            "a refused page allocation waited for writes through that cannot cover it");
-    admission = spill.cache.ensureTokens(3, tokens);
-  }
-  require(admission.failure == TokenAdmissionFailure::Pending && !spill.cache.stateResident(block),
-          "the reclaim did not take what is in use until the writes through covered the rest");
+  // The ledger takes what is in use for the page the writes do not cover,
+  // and waits for them for the rest.
+  require(admitTokens(spill.cache, 3, tokens).ledger == FreeOutcome::Pending && !spill.cache.stateResident(block),
+          "the claim did not take what is in use for the page the writes through do not cover, or did not wait "
+          "for them for the rest");
   spill.cache.endRequest(3);
   spill.tier.complete();
   static_cast<void>(spill.cache.pollTransfers());
@@ -4364,7 +4367,8 @@ void testConversionWaitsForItsPagesToSpill() {
   require(spill.cache.convertToSpill(1, 4) && spill.budget->committedBytes() == 0 &&
               spill.tier.writes.size() == 6 && spill.storage.allocationAttempts == allocations,
           "the conversion did not commit and start its writes, or allocated");
-  require(spill.cache.ensureTokens(1, tokens).failure == TokenAdmissionFailure::Pending,
+  const TokenAdmission converted = spill.cache.ensureTokens(1, tokens);
+  require(!converted.granted() && askLedger(spill.cache, converted).outcome == FreeOutcome::Pending,
           "the converted request did not wait for its pages to spill");
   spill.tier.complete();
   static_cast<void>(spill.cache.pollTransfers());
@@ -4390,8 +4394,10 @@ void testConversionAtTheWallFindsTheRunway() {
   const uint64_t tokens = 5 * KvCache::pageTokens + 1;
   require(spill.cache.ensureTokens(2, tokens).failure == TokenAdmissionFailure::Denied,
           "the fixture's growth was not denied");
-  require(spill.cache.convertToSpill(2, 5) && spill.cache.pendingPages(kv::PageForm::Full) == 2 &&
-              spill.cache.ensureTokens(2, tokens).failure == TokenAdmissionFailure::Pending,
+  require(spill.cache.convertToSpill(2, 5) && spill.cache.pendingPages(kv::PageForm::Full) == 2,
+          "the request that converted at the wall did not start the writes of its pages");
+  const TokenAdmission converted = spill.cache.ensureTokens(2, tokens);
+  require(!converted.granted() && askLedger(spill.cache, converted).outcome == FreeOutcome::Pending,
           "the request that converted at the wall did not wait for its pages to spill");
   spill.tier.complete();
   static_cast<void>(spill.cache.pollTransfers());
@@ -5028,18 +5034,21 @@ void testOwedCopiesReturnWhileAnyIsWritten() {
   spill.tier.writeLimits[static_cast<size_t>(WriteClass::Spill)] = 1;
   const std::vector<uint32_t> tokens = Spilling::prompt(1, 12);
   spill.start(1, tokens, 12);
-  require(!spill.cache.owedCopiesReturn(1, kv::PageForm::Full),
-          "copies no write had started gave memory back");
+  // Whether a claim of in-service work that lacks `pages` of the form beyond
+  // the free ones waits for what lands and the copies owed (MemoryLedger::free).
+  const auto waits = [&](uint32_t pages, kv::PageForm form = kv::PageForm::Full) {
+    return test::freeFromCache(spill.cache, test::kInServiceGrowth, {.pages = pages, .form = form}).outcome ==
+           FreeOutcome::Pending;
+  };
+  require(!waits(1), "a claim waited for copies no write had started");
   require(spill.cache.writeThrough() == 1, "the first copy was not written");
   // Seven of its pages spill once their copies land: past the dense history
   // and before the window. Three Full pages are free, four Index pages.
   require(spill.pool.freePageCount(kv::PageForm::Full) == 3 &&
               spill.pool.freePageCount(kv::PageForm::Index) == 4,
           "the pool did not hold the expected free pages");
-  require(spill.cache.owedCopiesReturn(10, kv::PageForm::Full) &&
-              !spill.cache.owedCopiesReturn(11, kv::PageForm::Full),
-          "the copies owed behind the dense history's gave back other than their pages");
-  require(!spill.cache.owedCopiesReturn(1, kv::PageForm::Index), "owed copies gave back Index pages");
+  require(waits(7) && !waits(8), "a claim waited other than for the pages the copies owed behind the dense history's give back");
+  require(!waits(1, kv::PageForm::Index), "a claim of Index pages waited for owed copies");
   spill.tier.complete();
   static_cast<void>(spill.cache.pollTransfers());
   spill.cache.endRequest(1);
@@ -5875,8 +5884,10 @@ void testDeviceNeedPassesOverLeavesOfFormsOutOfReach() {
   spill.cache.endRequest(3);
 }
 
-// Free pages held by higher-ranked claims are not room to wait for; the request reclaims instead.
-void testHeldPagesAreNoRoomToWaitFor() {
+// A request short of a page waits for the one on its way back rather than demote more, and so does
+// one ranked below a claim that takes that page first: it waits as that hold ends
+// (MemoryLedger::free), taking nothing.
+void testARefusedRequestWaitsForThePageOnItsWayBack() {
   test::TestKvStorage storage{24, 100, 1};
   KvPool pool{storage, 16};
   test::TestKvTier tier;
@@ -5897,12 +5908,23 @@ void testHeldPagesAreNoRoomToWaitFor() {
   storage.growthBlocked = true;
   const uint32_t free = pool.freePageCount();
   cache.beginRequest(2);
-  constexpr uint64_t all = std::numeric_limits<uint64_t>::max();
-  require(free > 5 && cache.ensureTokens(2, 5 * KvCache::pageTokens, all, {free - 2, 0, 0}).failure ==
-                          TokenAdmissionFailure::Denied,
-          "a request waited for a landing that leaves it short of the pages held ones would give");
-  require(cache.ensureTokens(2, (free + 1) * KvCache::pageTokens).failure == TokenAdmissionFailure::Pending,
-          "a request did not wait for the page on its way back");
+  require(!cache.ensureTokens(2, (free + 1) * KvCache::pageTokens).granted(), "the fixture's growth was not refused");
+  for (const bool heldAbove : {false, true}) {
+    engine::MemoryLedger ledger;
+    ledger.addSource(cache);
+    ledger.setReturning([&cache] { return cache.returning(); },
+                        [&cache](std::span<const uint64_t> requestIds) { return cache.returningFor(requestIds); });
+    if (heldAbove) {
+      const engine::ClaimId above = ledger.open({.cls = ClaimClass::InService, .requestId = 3, .rank = {.priority = 2}});
+      require(ledger.free(above, {.pages = 1}, 0, false).outcome == FreeOutcome::Pending,
+              "the claim above did not wait for the page on its way back");
+    }
+    const engine::ClaimId below = ledger.open({.cls = ClaimClass::InService, .requestId = 2, .rank = {.priority = 1}});
+    const FreeOutcome outcome = ledger.free(below, {.pages = 1}, 0, false).outcome;
+    require(outcome == FreeOutcome::Pending && tier.demotions == 1,
+            heldAbove ? "a request below a claim that takes the page first did not wait as its hold ends"
+                      : "a request did not wait for the page on its way back");
+  }
   tier.complete();
   static_cast<void>(cache.pollTransfers());
   cache.endRequest(2);
@@ -6678,7 +6700,7 @@ int main() {
     testGrowthPastAStateWriteReachesTheIdleChains();
     testDeviceNeedKeepsKvBesideTheIndexRunway();
     testDeviceNeedPassesOverLeavesOfFormsOutOfReach();
-    testHeldPagesAreNoRoomToWaitFor();
+    testARefusedRequestWaitsForThePageOnItsWayBack();
     testImmediateWalksOfferWhatLandsLaterInItsPlace();
     testImmediateDeviceWalkPassesOverWhatAWriteFrees();
     testDeviceWalkOffersTheStagedWriteAsAUnit();

@@ -102,7 +102,7 @@ std::vector<std::vector<std::byte>> labels(const Shelf &shelf) {
 
 TokenAdmission admitTokens(engine::Cache &cache, uint64_t requestId, uint64_t tokens) {
   TokenAdmission admission = cache.ensureTokens(requestId, tokens);
-  while (admission.failure == TokenAdmissionFailure::Denied &&
+  while (!admission.granted() &&
          test::takeFirst(cache, test::kInServiceGrowth, {.pages = admission.additionalPages, .form = admission.form})
                  .outcome == FreeOutcome::Met)
     admission = cache.ensureTokens(requestId, tokens);
@@ -1233,11 +1233,17 @@ void testCopiesAheadOfSpilledPagesArePending() {
   const KvPageAcquisition held = process.pool.acquirePages(process.pool.freePageCount());
   // Its open page, past the restored chain.
   const uint64_t grown = prompt.size();
-  require(process.cache.ensureTokens(2, grown).failure == TokenAdmissionFailure::Pending,
-          "a page the copies ahead return was not pending");
-  require(process.cache.owedCopiesReturn(2, kv::PageForm::Full) &&
-              !process.cache.owedCopiesReturn(3, kv::PageForm::Full),
-          "the copies ahead of the Spill request's pages did not count as the copies it waits for");
+  // What the ledger answers a claim of in-service work that lacks `pages`
+  // Full pages (MemoryLedger::free): it waits for the page the copies ahead
+  // free as they spill into the free Index page (Cache::returning), and for
+  // no more.
+  const auto answer = [&](uint32_t pages) {
+    return test::freeFromCache(process.cache, test::kInServiceGrowth, {.pages = pages}).outcome;
+  };
+  require(!process.cache.ensureTokens(2, grown).granted() && answer(1) == FreeOutcome::Pending,
+          "a page the copies ahead return was not waited for");
+  require(answer(2) != FreeOutcome::Pending,
+          "a claim waited for more pages than the copies ahead free into the free Index pages");
   process.tier.complete();
   require(process.cache.pollTransfers(), "the copies did not land");
   static_cast<void>(process.cache.spillWritten(SpilledExtents::KeepRunway));
