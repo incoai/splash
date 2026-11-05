@@ -81,12 +81,17 @@ struct RuntimeGeometry final {
     result.target.ropeScaling = model.descriptor.ropeScaling;
     if (parts.kv) result.spilledKv = model.descriptor.capabilities.sparseKv;
     if (parts.experts || parts.kv) result.prefillChunks = kPrefillGroupChunks;
-    if (!result.target.valid() || !result.draft.stateLayout().valid() ||
+    // A target without a draft captures no rows for one.
+    const bool draftValid = result.draft.present()
+                                ? result.draft.stateLayout().valid() &&
+                                      result.target.hiddenSize == result.draft.hiddenSize &&
+                                      result.target.vocabularySize == result.draft.vocabularySize &&
+                                      result.target.capturedHiddenSize() == result.draft.targetHiddenSize() &&
+                                      result.target.captureLayerCount
+                                : result.draft == DFlashDraftLayout{} && !result.target.captureLayerCount;
+    if (!result.target.valid() || !draftValid ||
         (parts.kv && (!result.spilledKv || !result.target.kvLayout.spillable())) ||
-        result.target.contextTokens() != model.descriptor.capabilities.maximumContextTokens ||
-        result.target.hiddenSize != result.draft.hiddenSize ||
-        result.target.vocabularySize != result.draft.vocabularySize ||
-        result.target.capturedHiddenSize() != result.draft.targetHiddenSize()) {
+        result.target.contextTokens() != model.descriptor.capabilities.maximumContextTokens) {
       throw std::invalid_argument("invalid model runtime geometry");
     }
     // Sized from the geometry, once it is valid.
@@ -242,9 +247,10 @@ public:
       throw std::logic_error("prefill arena mismatch");
     auto *target = static_cast<float *>(
         get(PrefillTensor::TargetInverseFrequencies).contents());
+    // A model without a draft has no draft RoPE.
     auto *draft = static_cast<float *>(
         get(PrefillTensor::DraftInverseFrequencies).contents());
-    if (!target || !draft)
+    if (!target || (geometry.draft.present() && !draft))
       throw std::logic_error("RoPE frequencies are not CPU-visible");
     rotaryInverseFrequencies(geometry.target.rotaryTheta, geometry.target.rotaryPairs,
                              geometry.target.ropeScaling,
@@ -509,10 +515,13 @@ public:
   static uint64_t gateScratchBytes(const RuntimeGeometry &geometry,
                                   const ops::ExecutionPlans &operators) {
     // One private gate buffer is reused serially by the target dense FFN (when
-    // present) and the always-dense DFlash draft. Sparse target FFNs use their
-    // own route-major arena tensors, but must not remove the draft's scratch.
-    const uint64_t draft = operators.gateUpWorkspace(
-        {geometry.draft.intermediateSize, geometry.draft.hiddenSize});
+    // present) and the always-dense DFlash draft (when present). Sparse target
+    // FFNs use their own route-major arena tensors, but must not remove the
+    // draft's scratch.
+    const uint64_t draft =
+        geometry.draft.present()
+            ? operators.gateUpWorkspace({geometry.draft.intermediateSize, geometry.draft.hiddenSize})
+            : 0;
     uint64_t target = 0;
     for (const auto &p : geometry.target.gateUpProjections)
       target = std::max(target, operators.gateUpWorkspace(p));

@@ -272,7 +272,8 @@ the parameters, `GgufFile` and the planner check the rest).
 
 ## Drafts
 
-Every model decodes with a DFlash2 draft. Each family names the repository
+A model decodes with a DFlash2 draft unless it is installed without one
+(below). Each family names the repository
 of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
 it as the release publishes it: `config.json` and BF16 `model.safetensors`
 (or the shards its index names), and `mask_embedding.safetensors` when the
@@ -371,6 +372,27 @@ one for the rest, and `GgufPreparation` quantizes each projection into af4g64
 planes, 4 bits in groups of 64 as MLX's affine quantization rounds them, and
 copies every other tensor as stored. The draft runs on the block kernels its
 target's projections run on.
+
+`--draft-model none` installs the target alone: the installer asks the Hub for
+no draft, downloads none and links no `draft/`, and the installation's
+`model.json` records its draft source as `null`, so it is an installation of
+its own beside the drafted one ([Model cache](server.md#model-cache)). The engine then
+loads no draft weights and allocates neither the draft's rings, its context
+windows nor its decode rows (`DFlashDraftLayout{}`, whose `present()` is
+false), and every decode cycle selects one token: its proposals are mask tokens
+and the target verifies its anchor alone, sampled from the target's
+distribution as a request without a draft samples it. The target still runs
+the block's eight rows, since its kernels take eight rows a lane, but a MoE
+target routes experts for the anchor only. `--verify-rows` has no use there;
+the startup log says the cycles select one token each and `/status` reports
+`verify_rows` as `anchor`. Greedy and seeded outputs then repeat from run to
+run, on a MoE target too, and the memory the draft and its state took goes to
+the KV cache. Flint serves only with its draft: its vocabulary keeps no mask
+token of its own and its target no GDN state, so without one its cycles would
+have no proposals and its cached states nothing to hold, and the installer
+refuses it before any download (`families.FAMILIES`), as the engine does.
+[Local model files](#local-model-files) are always prepared with a draft:
+`--draft-model none` cannot be used with `--model-dir`.
 
 ## Vision
 

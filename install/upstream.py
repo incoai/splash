@@ -582,7 +582,7 @@ def _install(selection, repo, installed, draft=None):
     """Assemble repo's target and its draft, and publish the assembly at the
     selection link. draft is the draft's repository as this start resolved
     it, or None to resolve it here, asking the Hub only when it answered for
-    repo."""
+    repo; a selection without a draft (--draft-model none) assembles none."""
     # Every Hub request (header reads, downloads) happens here.
     with (
         hub.as_model_errors(f"cannot install {selection.model}"),
@@ -593,11 +593,11 @@ def _install(selection, repo, installed, draft=None):
         )
         if draft is None:
             draft = _resolve_draft(target.family, selection, installed, repo)
-        draft, files = _draft(target, installed, draft)
+        draft, files = _draft(target, installed, draft) if draft else (None, {})
         vision = "disabled" if target.vision_format == "none" else "enabled"
         print(
             f"Installing {selection.model} as {target.family.name} ({target.format}); "
-            f"draft {draft.name}; vision {vision}.",
+            f"draft {draft.name if draft else models.NO_DRAFT}; vision {vision}.",
             flush=True,
         )
         downloaded = repo.download(set(target.files.values()))
@@ -612,14 +612,15 @@ def _install(selection, repo, installed, draft=None):
 
 def assembly_record(model, target, repo, draft):
     """The record of model's assembly of target, inspected in repo, and the
-    draft repository draft, but for the files it links (publish)."""
+    draft repository draft, or None for none, but for the files it links
+    (publish)."""
     return {
         "version": 1,
         "model": model,
         "family": target.family.name,
         "target_format": target.format,
         "vision_format": target.vision_format,
-        "sources": {"target": repo.identity(), "draft": draft.identity()},
+        "sources": {"target": repo.identity(), "draft": draft and draft.identity()},
     }
 
 
@@ -688,7 +689,9 @@ def _changes(installed, family, draft):
         return [f"no supported family is named {installed['family']}"]
     changes = []
     recorded = installed["sources"]["draft"]
-    if draft.identity() != recorded:
+    # A selection's draft source, a draft or none, is the selection's own:
+    # only a draft's commit or its family's repository changes.
+    if draft and draft.identity() != recorded:
         changes.append(
             f"{draft.name} moved from {recorded['revision'][:12]} to {draft.revision[:12]}"
             if draft.name == recorded["repo"]
@@ -708,12 +711,22 @@ def _resolve_draft(family, selection, installed, target):
     installed draft stands in, unlisted, or without one a commit the Hub
     cache holds for this selection; the installed draft also stands in, with
     the reason, when the draft cannot be resolved. A family no draft is
-    released for takes --draft-model's."""
+    released for takes --draft-model's. None for a selection without a
+    draft (--draft-model none), which asks the Hub nothing for one, of a
+    family that serves without one."""
+    if selection.draft_model == models.NO_DRAFT:
+        if not family.draftless:
+            raise models.ModelError(
+                f"{family.name} serves only with a DFlash2 draft; "
+                f"--draft-model {models.NO_DRAFT} cannot be used for it"
+            )
+        return None
     name = selection.draft_model or family.draft_repo
     if name is None:
         raise models.ModelError(
             f"no DFlash2 draft is released for {family.name}; "
-            "name one with --draft-model"
+            f"name one with --draft-model, or serve it without one "
+            f"(--draft-model {models.NO_DRAFT})"
         )
     recorded = installed and installed["sources"]["draft"]
     asked = _answered(target)

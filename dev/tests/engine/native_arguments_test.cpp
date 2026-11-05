@@ -369,7 +369,7 @@ void testRefusals() {
                  "MODEL_DIRECTORY must name an existing directory");
   const test::TemporaryDirectory empty("splash-native-arguments-empty");
   commandRefused({"serve-native", empty.path().string(), "auto", "auto"},
-                 "MODEL_DIRECTORY must hold the model's target/ and draft/ directories");
+                 "MODEL_DIRECTORY must hold the model's target/ directory");
 }
 
 } // namespace
