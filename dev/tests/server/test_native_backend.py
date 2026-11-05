@@ -798,6 +798,28 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertFalse(status["ready"])
         self.assertIn("error", status["transport"])
 
+    def test_status_reads_a_number_the_engine_wrote_as_null(self):
+        # The engine writes a measurement that is not finite as null; a bare
+        # NaN is not JSON and would fail the whole document closed.
+        transport, runtime = self.make_transport()
+        runtime.status_event = native_peer.status_event(
+            loop={"max_tick_ms": None, "stall_budget_ms": 30000},
+            weights={"idle_release_seconds": None, "released": False},
+        )
+        status = transport.status()
+        self.assertTrue(status["ready"])
+        self.assertNotIn("error", status["transport"])
+        self.assertIsNone(status["loop"]["max_tick_ms"])
+        self.assertIsNone(status["weights"]["idle_release_seconds"])
+
+        runtime.status_event = wire.StatusJsonEvent(
+            1,
+            native_peer.status_event().json.replace(
+                b'"ready":true', b'"ready":true,"loop":{"max_tick_ms":NaN}'
+            ),
+        )
+        self.assertFalse(transport.status()["ready"])
+
     def test_status_adds_only_transport_accounting(self):
         transport, runtime = self.make_transport()
         status = transport.status()

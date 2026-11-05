@@ -1,7 +1,8 @@
 // json::Writer places every comma and colon of a document, in nested and
 // empty containers; escapes strings and non-literal keys; prints a string,
 // literal or not, as a string, small integers as numbers, a double to 10
-// digits and exact() to the digits that read back; and refuses a value
+// digits and exact() to the digits that read back, and a floating value that
+// is not finite as null; and refuses a value
 // without a key in an object, a key in an array, and an unfinished document.
 #include "TestChecks.hpp"
 #include "engine/Json.hpp"
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string>
 
 using namespace splash;
@@ -54,6 +56,25 @@ void testNumbers() {
   require(writer.str() == "[200,-5,18446744073709551615,0.3333333333,3.814697265625,0.33333333333333331,"
                           "0.6666666667,null]",
           "a number printed wrongly or exact() kept its precision: " + writer.str());
+}
+
+// JSON has no infinity or NaN: each is null, from value() or exact(), as a
+// float or a double, and the document around it stays JSON.
+void testNonFiniteNumbers() {
+  constexpr double infinity = std::numeric_limits<double>::infinity();
+  constexpr double nan = std::numeric_limits<double>::quiet_NaN();
+  json::Writer writer;
+  writer.object([&] {
+    writer.field("inf", infinity).field("minus_inf", -infinity).field("nan", nan).field("minus_nan", -nan);
+    writer.field("float_inf", std::numeric_limits<float>::infinity());
+    writer.field("float_nan", std::numeric_limits<float>::quiet_NaN());
+    writer.key("exact_inf").exact(infinity).key("exact_nan").exact(nan).key("after").exact(0.1);
+    writer.field("next", 0.5);
+  });
+  require(writer.str() == R"({"inf":null,"minus_inf":null,"nan":null,"minus_nan":null,"float_inf":null,)"
+                          R"("float_nan":null,"exact_inf":null,"exact_nan":null,"after":0.10000000000000001,)"
+                          R"("next":0.5})",
+          "a value that is not finite printed as something other than null: " + writer.str());
 }
 
 void testMisuse() {
@@ -103,6 +124,7 @@ int main() {
     testCommas();
     testStrings();
     testNumbers();
+    testNonFiniteNumbers();
     testMisuse();
     std::cout << "json writer tests passed\n";
     return EXIT_SUCCESS;

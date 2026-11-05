@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <concepts>
 #include <cstddef>
 #include <limits>
@@ -40,9 +41,10 @@ private:
 // Writes one JSON document and places every comma and colon: an object's
 // members are key() then a value, an array's are values. A double prints to
 // 10 significant digits; exact() prints one to the digits that read back as
-// it. str() throws std::logic_error for a document that is empty, unclosed
-// or holds a key without a value, as a value without a key in an object or a
-// key outside one throws at once.
+// it; one that is not finite, which JSON cannot spell, prints as null. str()
+// throws std::logic_error for a document that is empty, unclosed or holds a
+// key without a value, as a value without a key in an object or a key outside
+// one throws at once.
 class Writer final {
 public:
   Writer() { out_.precision(10); }
@@ -76,7 +78,7 @@ public:
   }
   template <std::floating_point T> Writer &value(T number) {
     beforeValue();
-    out_ << number;
+    floating(number);
     return *this;
   }
   Writer &value(const char *text) { return value(std::string_view(text)); }
@@ -94,7 +96,7 @@ public:
   Writer &exact(double number) {
     beforeValue();
     const std::streamsize precision = out_.precision(std::numeric_limits<double>::max_digits10);
-    out_ << number;
+    floating(number);
     out_.precision(precision);
     return *this;
   }
@@ -206,6 +208,14 @@ private:
     }
     put(text.substr(run));
     put('"');
+  }
+  // The one rule for a floating value: a finite one at the stream's
+  // precision, and null for an infinity or NaN, which JSON has no number for.
+  template <std::floating_point T> void floating(T number) {
+    if (std::isfinite(number))
+      out_ << number;
+    else
+      put("null");
   }
   // Punctuation, keys and strings go straight to the stream's buffer;
   // numbers go through the stream for its precision.

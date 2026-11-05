@@ -646,8 +646,9 @@ calibrate on representative held-out data before using decision thresholds.
 
 ## Status, readiness and metrics
 
-`GET /status` returns instance identity and the effective context limit as JSON.
-Proxy consumers can use these fields; additional fields may be added:
+`GET /status` returns instance identity and the effective context limit as JSON,
+in which a number that is not finite is `null`. Proxy consumers can use these
+fields; additional fields may be added:
 
 | Field | Meaning |
 | --- | --- |

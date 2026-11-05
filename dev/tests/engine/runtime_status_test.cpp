@@ -791,6 +791,16 @@ void testResourceWaitDiagnostics() {
               ticked.find("\"schema_version\":8") != std::string::npos,
           "the loop's longest tick, its stall budget or its ticks' host time is missing, or changed the "
           "status schema");
+  // A measurement that is not finite is null, and the rest of the document
+  // still reads.
+  for (const double unmeasured :
+       {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()}) {
+    const std::string json = statusOf(memoryPlan, {.resourceWait = wait, .loopMaxTickMilliseconds = unmeasured});
+    require(json.find("\"loop\":{\"max_tick_ms\":null,\"stall_budget_ms\":30000,") != std::string::npos &&
+                json.find(":nan") == std::string::npos && json.find(":-nan") == std::string::npos &&
+                json.find(":inf") == std::string::npos && json.find(":-inf") == std::string::npos,
+            "a loop tick that is not finite is not null: " + json);
+  }
 }
 
 // The weights' idle release, null with --idle-release off, whether they are

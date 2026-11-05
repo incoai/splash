@@ -7,7 +7,6 @@
 #include "model/Model.hpp"
 
 #include <algorithm>
-#include <cmath>
 #include <iterator>
 #include <string>
 #include <utility>
@@ -30,15 +29,11 @@ void writeRopeScaling(json::Writer &w, const model::RopeScaling &rope) {
   });
 }
 
-// idle_release_seconds is null with --idle-release off.
+// idle_release_seconds is infinite with --idle-release off, and so null.
 void writeWeights(json::Writer &w, const WeightsSnapshot &weights) {
   w.object([&] {
-    w.key("idle_release_seconds");
-    if (std::isinf(weights.idleReleaseSeconds))
-      w.null();
-    else
-      w.value(weights.idleReleaseSeconds);
-    w.field("released", weights.released)
+    w.field("idle_release_seconds", weights.idleReleaseSeconds)
+        .field("released", weights.released)
         .field("restoring", weights.restoring)
         .field("restores", weights.restores)
         .field("restore_failures", weights.restoreFailures);
