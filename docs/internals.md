@@ -693,11 +693,11 @@ up in one pass `gguf_decode_<format>_m<rows>_gate_up`, and
 leading inputs of wider rows), the register ones `gguf_decode_sg_<format>_l<lanes>_<e>`, and the
 experts `moe_expert_gguf_m<rows>_<e>` and `moe_expert_gguf_sg_<e>`, with gate and up in one pass
 `moe_expert_gguf_m<rows>_gate_up`; the fused projections run
-`gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode and, on Apple10, in
-prefill chunks of 33 to 64 rows (`gguf_decode_fused_m64`), and in longer prefill chunks one
-`gguf_prefill_<format>_a` per format over that format's segments. The norm, GDN,
-attention-gate and attention-gather variants that also write the register kernels' input
-table carry `table16` in their names. The epilogue kinds of both GGUF families are in
+`gguf_decode_fused_m<rows>` and `gguf_decode_sg_fused_l<lanes>` in decode and, on Apple10 and on
+Apple9 GPUs of 10 cores or fewer, in prefill chunks of 33 to 64 rows (`gguf_decode_fused_m64`),
+and in longer prefill chunks one `gguf_prefill_<format>_a` per format over that format's segments.
+The norm, GDN, attention-gate and attention-gather variants that also write the register kernels'
+input table carry `table16` in their names. The epilogue kinds of both GGUF families are in
 `kernels/common/gguf_tile.h`, the SiLU and sigmoid every kernel shares in
 `kernels/common/activation.h`, and the MMA helpers every register kernel uses, GGUF or fp32, in
 `kernels/common/sgmatrix.h`.

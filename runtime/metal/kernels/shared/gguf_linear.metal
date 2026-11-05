@@ -60,7 +60,7 @@ constant constexpr uint kPrefillStages = 2 * GGUF_TILE_COLUMNS * GGUF_PREFILL_ST
 // ---------------- decode dispatches over (64-column tiles, K partitions): two simdgroups of 32 columns per
 // threadgroup, every request lane in its tile, `splits` partitions of K (grid.y; kernels/common/split_reduce.h).
 // MPP computes 16-row fragments, so a tile holds 8, 16 or 32 rows, or 64 for a prefill chunk of 33 to 64 rows on
-// Apple10 (these kernels and the fused ones): a 3-lane step
+// Apple10 and on Apple9 GPUs of 10 cores or fewer (these kernels and the fused ones): a 3-lane step
 // runs the 32-row tile over the storage of four lanes, and a 1-lane step may run the 16-row tile over two
 // (LinearPlan::storageRows); the padding lane's rows are computed and discarded. Rows are independent, so every active
 // row is the bits of any other tile height (gguf-projection checks it); the 32-row tile at three lanes costs what it
