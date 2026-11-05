@@ -146,13 +146,7 @@ DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
                          const ops::ExecutionPlans &operators)
     : weights_(weights), backend_(backend), operators_(operators),
       selector_(weights.layout.vocabularySize),
-      contextKvProjections_(contextKvRows(backend, weights)) {
-  // The run drives the compiled draft variant's kernels, whose selector and
-  // checkpoint reader serve the shipped drafts' geometry; another compiled
-  // variant's run lands with them.
-  if (ops::draftVariant(weights.layout.attentionShape()).query_heads != SPLASH_DRAFT_QUERY_HEADS)
-    throw std::invalid_argument("this build's draft selector and checkpoint serve the shipped drafts' geometry");
-}
+      contextKvProjections_(contextKvRows(backend, weights)) {}
 
 void DFlashDraft::addSelection(
     metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,

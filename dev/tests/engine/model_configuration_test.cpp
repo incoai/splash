@@ -283,7 +283,7 @@ void testOneRulePerValue(const std::filesystem::path &fixtures) {
            {&SourceModel::draft, R"("num_attention_heads": 32)", R"("num_attention_heads": 16)",
             "draft config num_attention_heads mismatch: checkpoint 16, runtime 32"},
            {&SourceModel::draft, R"("selector_top_k": 16)", R"("selector_top_k": 8)",
-            "draft config dflash_config selector_top_k mismatch"},
+            "draft config dflash_config selector_top_k is below the 16 candidates the kernels keep"},
            {&SourceModel::draft, R"("selector_top_k": 16)",
             R"("selector_top_k": 16, "target_hidden_reduction": "stream_mean")",
             "draft config dflash_config target_hidden_reduction mismatch: checkpoint stream_mean, runtime none"},
@@ -950,8 +950,32 @@ void testRipple(const std::filesystem::path &fixtures) {
   };
   require(check(config, metadata, std::nullopt) == "Ripple-65B",
           "Ripple's configuration was not found to be its family");
-  rejects([&] { static_cast<void>(check(config, metadata, draft)); }, "draft config dflash_config selector_top_k",
-          "a Ripple draft the selector does not serve was accepted");
+  // The trained selector keeps more candidates than the kernels do, whose
+  // subset the proposal serves exactly; fewer than the kernels keep cannot
+  // select their list.
+  const test::TemporaryDirectory rippleRoot("splash-ripple-model");
+  test::writeFile(rippleRoot.path() / "model.json",
+                  R"({"version":1,"model":"community/fine-tune","target_format":"gguf","vision_format":"none"})");
+  test::writeFile(rippleRoot.path() / "config.json", config);
+  test::writeFile(rippleRoot.path() / "gguf-metadata.json", metadata);
+  std::filesystem::create_directory(rippleRoot.path() / "draft");
+  test::writeFile(rippleRoot.path() / "draft" / "config.json", draft);
+  const model::ModelDescriptor rippleDescriptor = model::inspectModelRoot(rippleRoot.path());
+  require(rippleDescriptor.valid() && rippleDescriptor.family() == "Ripple-65B" &&
+              rippleDescriptor.draft.targetLayerCount == 5 &&
+              rippleDescriptor.draft.targetLayers[0] == 1 &&
+              rippleDescriptor.draft.window == 4096 &&
+              rippleDescriptor.draft.queryHeads == 80,
+          "a Ripple model made another descriptor");
+  for (const uint32_t topK : {8u, 15u}) {
+    std::string truncated = draft;
+    const std::string from = R"("selector_top_k": 32)";
+    truncated.replace(truncated.find(from), from.size(),
+                      R"("selector_top_k": )" + std::to_string(topK));
+    rejects([&] { static_cast<void>(check(config, metadata, truncated)); },
+            "is below the 16 candidates the kernels keep",
+            "a Ripple draft of " + std::to_string(topK) + " candidates was accepted");
+  }
   const SourceModel ripple =
       SourceModel{R"({"version":1,"model":"community/fine-tune","target_format":"gguf","vision_format":"none"})",
                   config, draft};

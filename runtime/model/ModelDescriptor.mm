@@ -739,8 +739,16 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   requireNumbers(flash, "checkpoint", "draft config dflash_config",
                  {{"conv_group_size", SPLASH_DRAFT_CONVOLUTION_GROUP},
                   {"selector_rank", SPLASH_DRAFT_SELECTOR_RANK},
-                  {"selector_top_k", SPLASH_DRAFT_CANDIDATES},
                   {"mask_token_id", target.maskToken}});
+  // The proposal may keep fewer of the trained candidates than the config
+  // names: its softmax and the acceptance read the kept ones' list, so the
+  // rejection sampling stays exact over the truncated proposal, whose reach
+  // the acceptance rate pays for. Fewer than the kernels keep cannot select
+  // the kernels' list.
+  if (requireWhole(flash[@"selector_top_k"], "draft config dflash_config selector_top_k") <
+      SPLASH_DRAFT_CANDIDATES)
+    throw std::invalid_argument("draft config dflash_config selector_top_k is below the " +
+                                std::to_string(SPLASH_DRAFT_CANDIDATES) + " candidates the kernels keep");
   // The block it was trained to fill: the kernels' rows or more, of which a
   // cycle drafts the first (Ornith-1.5-122B's fills 16). Its weights have no
   // part of the block's length.
