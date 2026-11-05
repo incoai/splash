@@ -49,6 +49,19 @@ CLAIM_WAIT_MS = 30_000
 # counts as taken back, and a second take back within it of the first is an
 # oscillation: a store that changes this fast pays reads for nothing.
 STORE_HORIZON_S = 60
+# A churn request's first token waits at most for the prefill of the work
+# the scheduler may put ahead of it: the requests in flight when it was
+# sent, later arrivals for OVERTAKE_ROWS and its own prompt, each by its
+# tokens the cache did not hold. The scheduler lets at most three prefill
+# commands in a row serve later arrivals and not a waiting request (the
+# batch width, 4, less one), each of at most 8,192 rows (a group of four
+# 2,048-row chunks, the most a model's command holds).
+OVERTAKE_ROWS = 3 * 4 * 2048
+# A first token later than this many times that work's prefill time at the
+# run's own rate starved: of 247 churn runs on four Macs none waited more
+# than 1.93 times it, and a 226 s wait put into the 11-04 pressure run is
+# 2.35 times it or more.
+FIRST_TOKEN_MARGIN = 2
 THERMAL_HOT = ("serious", "critical")
 # A process the run did not start, among the top five by CPU at this share or
 # more, competes with the server and voids a timed comparison (not_quiet):
@@ -420,6 +433,39 @@ def store_churn(run: Run) -> dict:
     }
 
 
+def first_token_waits(run: Run) -> list[tuple[dict, float]]:
+    """Each answered request with the prefill time of the work ahead of it
+    (OVERTAKE_ROWS) at the run's own rate: the tokens its answered requests
+    prefilled (prompt less cached) over the time from the first one's send
+    to the last one's end."""
+    served = [r for r in run.done if r.get("prompt") and r.get("ttft") is not None]
+    if not served:
+        return []
+
+    def prefilled(record):
+        return record["prompt"] - (record.get("cached") or 0)
+
+    def client(record):
+        return record["tag"].split("-")[0]
+
+    span = max(r["t"] for r in served) - min(r["start"] for r in served)
+    rate = sum(prefilled(r) for r in served) / span
+    waits = []
+    for record in served:
+        # A churn client sends its next request once its last is answered,
+        # so its own requests are never in flight beside it, whatever the
+        # rounding of a send (0.1 s) against an answer (0.01 s) says.
+        in_flight = sum(
+            prefilled(other)
+            for other in served
+            if client(other) != client(record)
+            and other["start"] <= record["start"] < other["t"]
+        )
+        work = in_flight + OVERTAKE_ROWS + prefilled(record)
+        waits.append((record, work / rate))
+    return waits
+
+
 def check_run(
     run: Run,
     minutes: float | None = None,
@@ -428,8 +474,8 @@ def check_run(
 ) -> dict:
     """One run on its own: `invalid` reasons, `failures` and `notes`, among
     them why its machine was not quiet. Every run is judged on G8; a churn
-    run also on its load window, every client served, G4, G9 and the store
-    line."""
+    run also on its load window, every client served, G4, G9, the store
+    line and its first tokens' waits (FIRST_TOKEN_MARGIN)."""
     result = {
         "invalid": invalid(run, build, streamed),
         "failures": g8_failures(run),
@@ -457,6 +503,21 @@ def check_run(
             f"of an earlier one (oscillation)"
         )
     notes.append(f"store: {store}")
+    waits = first_token_waits(run)
+    if waits:
+        record, seconds = max(waits, key=lambda wait: wait[0]["ttft"] / wait[1])
+        notes.append(
+            f"first token: the longest wait {record['ttft'] / seconds:.2f} x the "
+            f"prefill time of the work ahead of it ({record['tag']}, "
+            f"{record['ttft']:g} s, {seconds:.0f} s)"
+        )
+    failures += [
+        f"first token: {record['tag']} waited {record['ttft']:g} s, past "
+        f"{FIRST_TOKEN_MARGIN} x {seconds:.0f} s, the prefill time of the work "
+        "ahead of it at the run's rate"
+        for record, seconds in waits
+        if record["ttft"] > FIRST_TOKEN_MARGIN * seconds
+    ]
     return result
 
 

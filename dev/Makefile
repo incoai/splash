@@ -204,9 +204,10 @@ endif
 # the serving benchmark's three churn clients for PRESSURE_MINUTES
 # (dev/benchmarks/serving/run.py), then the run checked on its own
 # (check.py run): the experts streamed from the start, and the gates of
-# docs/validate.md's Serving benchmark, G4, G8, G9, Store (no oscillation)
-# and Churn (its load window, every client served). 5 minutes: on the M5
-# Pro at 18G the 35B's churn runs complete at least 78 requests in 15.
+# docs/validate.md's Serving benchmark, G4, G8, G9, Store (no oscillation),
+# Churn (its load window, every client served) and First token (no
+# starvation). 5 minutes: on the M5 Pro at 18G the 35B's churn runs
+# complete at least 78 requests in 15.
 PRESSURE_ARGS ?= --max-memory 18G
 PRESSURE_MINUTES ?= 5
 PRESSURE_RESULTS = $(MODEL_RESULTS)/pressure

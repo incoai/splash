@@ -776,6 +776,109 @@ class CheckTests(unittest.TestCase):
                     any(f.startswith("G9") for f in check.check_run(run)["failures"])
                 )
 
+    def test_a_clients_own_last_request_is_not_in_flight(self):
+        # A send is kept to 0.1 s and an answer to 0.01 s, so w0's second
+        # request reads as sent at 90.0 s, before its first was answered at
+        # 90.04 s; the work ahead of it is still only the 24,576 rows of
+        # later arrivals and its own 9,000.
+        run = churn_run(
+            self.directory,
+            "own",
+            [
+                {
+                    "tag": "w0-r1",
+                    "start": 0.0,
+                    "t": 90.04,
+                    "ttft": 15.0,
+                    "prompt": 9000,
+                    "cached": 0,
+                },
+                {
+                    "tag": "w0-r2",
+                    "start": 90.0,
+                    "t": 180.0,
+                    "ttft": 15.0,
+                    "prompt": 9000,
+                    "cached": 0,
+                },
+            ],
+            [status(t) for t in range(0, 181, 60)],
+        )
+        waits = dict(
+            (record["tag"], seconds) for record, seconds in check.first_token_waits(run)
+        )
+        self.assertAlmostEqual(waits["w0-r2"], (24576 + 9000) / (18000 / 180.0))
+
+    def test_a_starved_first_token_fails(self):
+        # w0 and w1 each send ten cold 9,000-token prompts, one every 90 s,
+        # each answered after 15 s. w2 sends one at 0 s, then at 90 s, beside
+        # w0's and w1's in flight, a cold 9,000-token prompt or one of 18,000
+        # whose first 17,000 the cache holds. The run prefilled 198,000
+        # tokens in 900 s, 220 a second, or with the cache hit 190,000, 211 a
+        # second. The work ahead of w2's second request is the 18,000 in
+        # flight, 24,576 of later arrivals and its own 9,000, 234 s, or its
+        # own 1,000, 206 s: a first token after 450 s, 1.92 times 234 s, is
+        # slow, after 490 s, 2.09 times, starved, as 450 s is for the cache
+        # hit, 2.18 times 206 s.
+        def requests(ttft, prompt, cached):
+            return [
+                {
+                    "tag": f"w{w}-r{r}",
+                    "start": 90.0 * (r - 1),
+                    "t": 90.0 * r,
+                    "ttft": 15.0,
+                    "prompt": 9000,
+                    "cached": 0,
+                }
+                for w in (0, 1)
+                for r in range(1, 11)
+            ] + [
+                {
+                    "tag": "w2-r1",
+                    "start": 0.0,
+                    "t": 90.0,
+                    "ttft": 15.0,
+                    "prompt": 9000,
+                    "cached": 0,
+                },
+                {
+                    "tag": "w2-r2",
+                    "start": 90.0,
+                    "t": 150.0 + ttft,
+                    "ttft": ttft,
+                    "prompt": prompt,
+                    "cached": cached,
+                },
+            ]
+
+        for name, ttft, prompt, cached, ratio, seconds in (
+            ("slow", 450.0, 9000, 0, 1.92, 234),
+            ("starved", 490.0, 9000, 0, 2.09, 234),
+            ("cache hit", 450.0, 18000, 17000, 2.18, 206),
+        ):
+            with self.subTest(name):
+                run = churn_run(
+                    self.directory,
+                    name,
+                    requests(ttft, prompt, cached),
+                    [status(t) for t in range(0, 961, 60)],
+                )
+                result = check.check_run(run, minutes=15, build="b1")
+                self.assertIn(
+                    f"first token: the longest wait {ratio:.2f} x the prefill time "
+                    f"of the work ahead of it (w2-r2, {ttft:g} s, {seconds} s)",
+                    result["notes"],
+                )
+                self.assertEqual(
+                    [f for f in result["failures"] if f.startswith("first token")],
+                    []
+                    if name == "slow"
+                    else [
+                        f"first token: w2-r2 waited {ttft:g} s, past 2 x {seconds} s, "
+                        "the prefill time of the work ahead of it at the run's rate"
+                    ],
+                )
+
     def test_a_store_that_oscillates_fails(self):
         sizes = {0: 8, 60: 10, 80: 8, 100: 10, 120: 8, 960: 8}
         run = self.served("osc", samples=[store(t, s) for t, s in sizes.items()])
