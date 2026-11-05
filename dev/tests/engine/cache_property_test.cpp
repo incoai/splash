@@ -163,7 +163,8 @@ public:
     cache_.checkInvariants();
   }
 
-  // A claim's takes never free more than peek counted for its units, and
+  // A claim's takes never free more than peek counted for the units from
+  // the head of the order through each (VictimSource's contract), and
   // never take in-use or certain-reuse units its rights do not take. A unit
   // peek offers as needing no write starts none when taken; one that needs
   // a write but frees now (the state the idle staging buffer writes) starts

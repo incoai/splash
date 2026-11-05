@@ -691,18 +691,20 @@ public:
   // first. A state need's units are its states, one each.
   //
   // peek() changes nothing and counts each unit as VictimSource's contract
-  // asks, an upper bound of what its take frees: a phase's unit what its
-  // reclaims can free (reach), from the counts the pool and the KV cache
-  // keep, at a cost that does not grow with the cache, and none is given
-  // once that is nothing. take() makes one reclaim of the unit's phase, of
-  // the state alone in a phase of the staging buffer's write (the copied
-  // part of its chain, which its unit counts too, then frees with no write,
-  // in the first phase, which the ledger peeks again after a take), and
-  // reports what it freed: the bytes of the extents released now, and those
-  // it adds to the extents the landing pages complete beside the free ones
-  // (laterBytes, landingFill), less any of them a release took; the pages of
-  // the need's form free now, or for a claim that can wait landing; and the
-  // state buffers it gave up.
+  // asks, the units through it an upper bound of what its take frees (a
+  // take frees the free pages, and the extents they fill, first, which the
+  // units before it may count): a phase's unit what its reclaims can free
+  // (reach), from the counts the pool and the KV cache keep, at a cost that
+  // does not grow with the cache, and none is given once that is nothing.
+  // take() makes one reclaim of the unit's phase, of the state alone in a
+  // phase of the staging buffer's write (the copied part of its chain,
+  // which its unit counts too, then frees with no write, in the first
+  // phase, which the ledger peeks again after a take), and reports what it
+  // freed: the bytes of the extents released now, and those it adds to the
+  // extents the landing pages complete beside the free ones (laterBytes,
+  // landingFill), less any of them a release took; the pages of the need's
+  // form free now, or for a claim that can wait landing; and the state
+  // buffers it gave up.
   // A device need's reclaim that demotes a leaf starts the demotions of its
   // chain above it, child before parent, while the tier and the quota have
   // room (a waiting claim's chain lands in about ceil(pages/64) ticks rather
