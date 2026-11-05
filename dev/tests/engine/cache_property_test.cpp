@@ -364,8 +364,8 @@ private:
                     .mode = !windowed_ && chance(60) ? KvMode::Spill : KvMode::Resident};
     CacheLookup lookup = cache_.lookup(prompt(request), {});
     cache_.beginRequest(id, request.mode);
-    const uint32_t copied = lookup.state ? cache_.copiedBlocks(lookup.state->kvBlock()) : 0;
-    if (request.mode == KvMode::Spill && !cache_.commitSpill(id, kMaximumPages - copied)) {
+    const Cache::ChainCopies copies = lookup.state ? cache_.chainCopies(lookup.state->kvBlock()) : Cache::ChainCopies{};
+    if (request.mode == KvMode::Spill && !cache_.commitSpill(id, kMaximumPages - copies.copied, copies)) {
       cache_.endRequest(id);
       return;
     }

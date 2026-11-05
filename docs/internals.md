@@ -1403,15 +1403,31 @@ ends.
 **Admission** (`Engine::admitQueued`, `runtime/engine/Engine.cpp`). Admission
 walks the starts the scheduler wants this round in its lead order
 (`Scheduler::prefillAdmissionOrder`) and stops at one that is refused or backs
-off from a refusal: the wanted starts after it are held, not tried, so the
-lanes that finish leave their memory to it. A refused start the scheduler
-does not want waits for scheduling: it holds back nothing, its claim holds no
-room and its wait's limit stops; it keeps its wait's age and its refusal. A
-refusal of the SSD cache's quota holds back only Spill starts. Aging bounds
-how long younger prompts lead a refused start
-([below](#prefill-and-decode-scheduling)); while those admitted ahead of it
-work, its wait's limit restarts ([resource waits](#resource-waits)). A refused
-resume holds back the later resumes.
+off from a refusal: the wanted starts after it that compete for what it was
+refused are held, not tried, so the lanes that finish leave it what they free.
+Every start competes for memory; for the SSD cache's quota of active KV only
+one that would take some of it, a Spill start's commitment or the copies on
+the chain it restores that no lane holds yet (a copy counts once however many
+lanes hold its block), and a quota refusal holds back only those
+(`Engine::competesForQuota`). A Spill start's own check counts those copies
+beside its commitment (`Cache::chainCopies`), and so does its commitment
+(`Cache::commitSpill`); a copy a reclaim writes for a block of its chain
+before the restore holds it returns that block's page of the commitment. A
+Spill resume holds again the copies it let go when suspended, and needs room
+for them the same way: it waits while only the room is short of
+`held / pageTokens + 1` pages less the copies other requests hold, and ends at
+its length where the limit itself cannot hold them. Held copies plus
+commitments stay within the active limit on these paths, the Spill admission,
+commitment and resume; Resident restores and publications add held copies
+without a check, by design, and the newest Spill lane's commitment then gives
+way (`Cache::fitDiskLimit`).
+A refused start the scheduler does not want waits for scheduling: it holds
+back nothing, its claim holds no room and its wait's limit stops; it keeps its
+wait's age and its refusal. Aging bounds how long younger prompts lead a
+refused start ([below](#prefill-and-decode-scheduling)); while those admitted
+ahead of it that compete for what it was refused work, its wait's limit
+restarts ([resource waits](#resource-waits)). A refused resume holds back the
+later resumes.
 
 ### What a refused claim takes
 
@@ -1710,11 +1726,18 @@ still short, and at most for the 30 s resource wait; suspended requests then
 resume first, each within its own resource wait. A request of a strictly higher
 priority than every suspended request waits for neither. A resource wait's limit
 restarts whenever an earlier lane has work in flight: one submitted before the
-waiting request, or admitted before its latest refusal while it has no lane (at
-its start or resume, or its suspension), or before its first refusal as a lane
-in service. Such a lane holds memory the request waits for until it finishes:
-the shorter starts admission leads ahead of a refused start, which aging
-bounds, keep its wait open while they work. Other lanes do not extend the wait.
+waiting request, or one that competes for what the request was refused (any
+lane for memory, one that holds some of the SSD cache's quota, a Spill lane's
+commitment or copies of the blocks on its own pages, for that quota, as
+admission holds them back, [above](#memory-rules)) and was admitted before its
+latest refusal while it has no lane (at its start or resume, or its
+suspension), or before its first refusal as a lane in service. Such a lane
+holds what the request waits for until it finishes: the shorter starts
+admission leads ahead of a refused start, which aging bounds, keep its wait
+open while they work. Other lanes do not extend the wait. A lane holding
+copies on a waiting resume's own chain keeps that wait open too while it
+works, though its end leaves the resume needing room for those copies all the
+same: that extension lasts at most the lane's run.
 Readiness does not guarantee that a request-sized allocation fits. A request
 that cannot fit even alone, after every cached prefix was evicted and the expert
 store shrank to its floor, fails with 400 `capacity_exhausted`, naming a smaller

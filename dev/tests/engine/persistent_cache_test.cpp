@@ -1504,7 +1504,7 @@ void testCommittedPagesTakeTheSpilledChainOfAStateInRam() {
           "the second Spill request was not admitted");
   process.cache.publishCommittedBlocks(2, next, static_cast<uint32_t>(next.size()), {});
   require(process.cache.writeThrough() == 3 && !process.cache.stateResident(point) &&
-              !process.cache.copiedBlocks(dense) && process.tier.slots == 4,
+              !process.cache.chainCopies(dense).copied && process.tier.slots == 4,
           "a committed page did not take the spilled chain of a state in RAM, or took it first");
   process.tier.complete();
   static_cast<void>(process.cache.pollTransfers());
@@ -1560,7 +1560,7 @@ void testAPrefixWithoutOwnCopiesHoldsBackNoSpill() {
     tier.complete();
     static_cast<void>(cache.pollTransfers());
   }
-  require(status == PersistStatus::Durable && cache.copiedBlocks(point) == 8,
+  require(status == PersistStatus::Durable && cache.chainCopies(point).copied == 8,
           "the restore point did not persist its own blocks alone");
   // Its next turn spills the chain it restores: the pages past the dense
   // history and before the window whose copies are its own, seven, spill at
@@ -1568,9 +1568,10 @@ void testAPrefixWithoutOwnCopiesHoldsBackNoSpill() {
   std::vector<uint32_t> next = second;
   next.push_back(7);
   cache.beginRequest(3, KvMode::Spill);
-  require(cache.commitSpill(3, 13), "the next turn's commitment was refused");
   const CacheLookup found = cache.lookup(next, {});
-  require(found.state && cache.restoreRequest(3, found).granted(), "the next turn did not restore the chain");
+  require(found.state && cache.commitSpill(3, 13, cache.chainCopies(found.state->kvBlock())),
+          "the next turn's commitment was refused");
+  require(cache.restoreRequest(3, found).granted(), "the next turn did not restore the chain");
   require(cache.spillWritten(SpilledExtents::KeepRunway).granted(), "the spill was refused");
   require(std::ranges::count_if(test::indexBlocks(cache, 3), [](uint64_t block) { return block != 0; }) == 7,
           "the prefix waiting for its own copies held back the pages that had theirs");

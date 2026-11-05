@@ -210,10 +210,11 @@ void testAConvertedLaneResumesUnderTheSpillRules() {
     spill.engine.submit(Spilling::prompt(2, 2, 1, 1));
     spill.runUntil([&] { return spill.events.completedCount == 1; }, "the Normal request did not run");
     require(spill.model.suspensions == 1, "the converted lane was not suspended");
-    // Short: the seven pages its conversion copied and two slots hold 288
-    // tokens, 63 of output.
+    // Short: the seven pages its conversion copied, whose copies the quota
+    // counts again as the resume holds them, and two slots hold 288 tokens,
+    // 63 of output.
     if (!quotaHolds)
-      spill.budget->setActiveLimitBytes(2 * 100);
+      spill.budget->setActiveLimitBytes((7 + 2) * 100);
     spill.model.resumeDenied = false;
     spill.runUntil([&] { return spill.model.resumptions == 1; }, "the converted lane did not resume");
     const KvMode resumed = spill.engine.snapshot().activeRequests.front().kvMode;
@@ -596,9 +597,10 @@ void testShortQuotaBoundsWaitsOrRefusesASpillStart() {
   }
 }
 
-// A start waiting for the SSD cache's quota holds back only the Spill starts it leads: a later
-// Resident start it leads, which needs none of the quota, starts beside it.
-void testAQuotaWaitHoldsBackOnlySpillStarts() {
+// A start waiting for the SSD cache's quota holds back only the starts it leads that compete for
+// the quota (competesForQuota): a later Resident start it leads, whose chain has no unheld copies,
+// starts beside it.
+void testAQuotaWaitHoldsBackOnlyStartsCompetingForIt() {
   // The room beside the lanes holds 20 pages, so a projection past it spills;
   // one within a page stays Resident, and none fits the resident context
   // alone.
@@ -644,11 +646,12 @@ void testAQuotaWaitHoldsBackOnlySpillStarts() {
 }
 
 // A start refused the SSD cache's quota stays a quota refusal while a higher priority keeps it
-// waiting for scheduling: the pass its retry starts it, it holds back only the Spill starts it
-// leads, and a Resident one starts beside it.
+// waiting for scheduling: the pass its retry starts it, it holds back only the starts it leads
+// that compete for the quota (competesForQuota), and a Resident start whose chain has no unheld
+// copies starts beside it.
 void testADeclinedQuotaRefusalKeepsItsScope() {
-  // As in testAQuotaWaitHoldsBackOnlySpillStarts: the first request commits
-  // the whole quota and the second waits for it.
+  // As in testAQuotaWaitHoldsBackOnlyStartsCompetingForIt: the first
+  // request commits the whole quota and the second waits for it.
   Spilling spill(10, false, 0, KvCache::pageTokens, {4}, {}, {.limitBytes = 20 * 100});
   const auto submit = [&](uint64_t id, uint32_t tokens, uint32_t output,
                           RequestPriority priority = RequestPriority::Normal) {
@@ -681,6 +684,307 @@ void testADeclinedQuotaRefusalKeepsItsScope() {
   spill.runUntil([&] { return !tried.empty(); }, "nothing started once the higher priority ended");
   require(tried == std::vector<uint64_t>{2, 3} && spill.events.failedCount == 0,
           "a declined quota refusal held back a Resident start, or let a Spill start be tried");
+}
+
+// A start refused the SSD cache's quota waits only for the starts admitted ahead of it that
+// compete for the quota: a Resident start it does not hold back, admitted beside it, does not keep
+// its wait open, which expires at its limit while that start still works.
+void testAResidentStartDoesNotHoldAQuotaWaitOpen() {
+  // As in testAQuotaWaitHoldsBackOnlyStartsCompetingForIt: the first
+  // request commits the whole quota and the second waits for it.
+  Spilling spill(10, false, 0, KvCache::pageTokens, {4}, {}, {.limitBytes = 20 * 100});
+  const auto submit = [&](uint64_t id, uint32_t tokens, uint32_t output, RequestPriority priority) {
+    EngineRequest value = request(id, std::vector<uint32_t>(tokens, static_cast<uint32_t>(id)));
+    value.maxNewTokens = output;
+    value.priority = priority;
+    value.deadlineMilliseconds = 1e9;
+    spill.engine.submit(std::move(value));
+  };
+  // A second apart: the second's backoff is over at every pass, so its
+  // retries are refused beside the lanes admitted ahead of it.
+  const auto run = [&](const std::function<bool()> &done, const char *message) {
+    for (uint32_t step = 0; step < 1000 && !done(); ++step) {
+      static_cast<void>(spill.engine.tick(spill.now += 1000));
+      spill.tier.complete();
+    }
+    require(done(), message);
+  };
+  // The quota's holder runs below the others' priority: it does not run
+  // while they do.
+  submit(1, 33, 4000, RequestPriority::Background);
+  run([&] { return spill.events.outputs.contains(1); }, "the first request did not decode");
+  submit(2, 8, 4000, RequestPriority::Normal);
+  run([&] { return spill.engine.resourceWaitSnapshot(spill.now).diskQuota == 1; },
+      "the second request did not wait for the quota");
+  // A shorter Resident prompt leads the waiting one and starts beside it; it
+  // decodes for twice the wait's limit.
+  submit(3, 1, KvCache::pageTokens - 1, RequestPriority::Normal);
+  run([&] { return spill.events.outputs.contains(3); }, "the Resident start did not decode");
+  const double startedAt = spill.now;
+  const size_t held = spill.events.outputs.at(1).size();
+  run([&] { return spill.events.failedCount != 0 || spill.events.usage.contains(3); },
+      "neither the wait nor the Resident start ended");
+  require(spill.events.failures == std::vector<std::string>{"resource_timeout"} &&
+              spill.events.failureDetails.back().first.find("SSD cache's room for active KV") != std::string::npos &&
+              spill.events.failureDetails.back().second,
+          "a wait for the quota outlived its limit while a Resident start admitted beside it worked");
+  require(spill.now <= startedAt + kResourceWaitTimeoutMilliseconds && !spill.events.usage.contains(3) &&
+              spill.events.outputs.at(1).size() == held,
+          "the wait did not expire at its limit, or the quota's holder ran meanwhile");
+  spill.engine.cancel(1);
+  spill.engine.cancel(3);
+  spill.runUntilIdle();
+  require(spill.committedSlots() == 0, "the quota was not returned");
+}
+
+// A Resident start that restores a chain with copies holds them as active KV, which the quota counts:
+// admitted ahead of a Spill start refused the quota, it keeps that start's wait open while it works,
+// past the wait's limit, and the Spill start runs once it ends.
+void testALaneHoldingCopiesHoldsAQuotaWaitOpen() {
+  Spilling spill(12, false, 2'000, 0, {4}, {}, {.limitBytes = 2'000});
+  const auto mode = [&](uint64_t id) {
+    for (const ActiveRequestSnapshot &active : spill.engine.snapshot().activeRequests)
+      if (active.id == id)
+        return std::optional<KvMode>(active.kvMode);
+    return std::optional<KvMode>();
+  };
+  // The first request spills its 10 pages, whose copies stay cached.
+  spill.engine.submit(Spilling::prompt(1, 1, 10, 4'096));
+  spill.runUntilIdle();
+  // A Spill start and a Resident one that restores the first request's
+  // chain arrive together. The Resident one leads, and holds 10 of the 12
+  // slots of active KV while it decodes: the Spill start is refused the
+  // quota.
+  EngineRequest spilling = Spilling::prompt(2, 2, 4, 4'000);
+  spilling.deadlineMilliseconds = 1e9;
+  EngineRequest resident = Spilling::prompt(3, 1, 10, 60);
+  resident.deadlineMilliseconds = 1e9;
+  spill.engine.submit(std::move(spilling));
+  spill.engine.submit(std::move(resident));
+  const double submittedAt = spill.now;
+  std::optional<double> residentEnded;
+  bool waited = false;
+  for (uint32_t step = 0; step < 1000 && !spill.events.outputs.contains(2) && !spill.events.failedCount; ++step) {
+    static_cast<void>(spill.engine.tick(spill.now += 1000));
+    spill.tier.complete();
+    // Each lane counts the copies it holds as they land and leave.
+    spill.cache.checkInvariants();
+    if (mode(3) && spill.engine.resourceWaitSnapshot(spill.now).diskQuota == 1) {
+      waited = true;
+      require(mode(3) == KvMode::Resident && spill.cache.spillSnapshot().heldBytes >= 1'000,
+              "the Spill start did not wait beside a Resident lane holding its chain's copies");
+    }
+    if (!residentEnded && spill.events.usage.contains(3))
+      residentEnded = spill.now;
+  }
+  require(waited && spill.events.failedCount == 0 && spill.events.outputs.contains(2) && residentEnded &&
+              *residentEnded > submittedAt + kResourceWaitTimeoutMilliseconds,
+          "a quota wait expired while a lane holding copies of active KV worked");
+  require(spill.events.startIds == std::vector<uint64_t>{1, 3, 2} && mode(2) == KvMode::Spill,
+          "the Spill start did not run once the lane holding the copies ended");
+  spill.engine.cancel(2);
+  spill.runUntilIdle();
+  require(spill.committedSlots() == 0, "the quota was not returned");
+}
+
+// A Resident start that restores a chain with copies no request holds would take the quota they
+// count as once it held them: a quota refusal it follows holds it back, as it would a Spill
+// start, while a Resident start whose chain has no copies starts beside the refusal.
+void testAQuotaRefusalHoldsBackAStartRestoringUnheldCopies() {
+  // Active KV may take 12 of the 48 slots: cached copies keep the rest.
+  Spilling spill(48, false, 2'000, 0, {4}, {}, {.limitBytes = 2'000});
+  spill.budget->setActiveLimitBytes(12 * 100);
+  // Only Spill requests write copies: a Resident turn's chain stays without.
+  spill.tier.writeLimits[static_cast<size_t>(WriteClass::Persist)] = 0;
+  spill.tier.writeLimits[static_cast<size_t>(WriteClass::Reclaim)] = 0;
+  const auto submit = [&](uint64_t id, std::vector<uint32_t> tokens, uint32_t output) {
+    EngineRequest value = request(id, std::move(tokens));
+    value.maxNewTokens = output;
+    value.deadlineMilliseconds = 1e9;
+    spill.engine.submit(std::move(value));
+  };
+  const auto continued = [](std::vector<uint32_t> tokens, uint32_t token) {
+    tokens.insert(tokens.end(), KvCache::pageTokens, token);
+    return tokens;
+  };
+  const auto started = [&](uint64_t id) {
+    return std::ranges::find(spill.events.startIds, id) - spill.events.startIds.begin();
+  };
+  // A Spill turn leaves its chain cached with copies, a Resident one its
+  // chain without.
+  const std::vector<uint32_t> spilled(10 * KvCache::pageTokens + 1, 1);
+  const std::vector<uint32_t> resident(2 * KvCache::pageTokens + 1, 6);
+  submit(1, spilled, 4'096);
+  spill.runUntilIdle();
+  submit(6, resident, 1);
+  spill.runUntilIdle();
+  require(spill.cache.probe(spilled, {}).cachedTokens() >= 10 * KvCache::pageTokens &&
+              spill.cache.probe(resident, {}).cachedTokens() && spill.cache.spillSnapshot().heldBytes == 0,
+          "the turns' chains were not cached");
+  // A Spill lane commits the whole quota; a Spill start of one token waits
+  // for it, and leads every later start.
+  submit(4, std::vector<uint32_t>(KvCache::pageTokens + 1, 4), 4'000);
+  spill.runUntil([&] { return spill.events.outputs.contains(4); }, "the Spill lane did not decode");
+  submit(2, {2}, 700);
+  spill.runUntil([&] { return spill.engine.resourceWaitSnapshot(spill.now).diskQuota == 1; },
+                 "the Spill start did not wait for the quota");
+  // Two Resident starts continue the turns' chains: the first would hold
+  // the cached copies of its chain as active KV.
+  submit(3, continued(spilled, 3), 1);
+  submit(5, continued(resident, 5), 1);
+  for (int step = 0; step < 5; ++step) {
+    static_cast<void>(spill.engine.tick(spill.now++));
+    spill.tier.complete();
+    spill.cache.checkInvariants();
+  }
+  const ResourceWaitSnapshot waits = spill.engine.resourceWaitSnapshot(spill.now);
+  require(started(5) < started(2) && started(3) == std::ssize(spill.events.startIds) && waits.diskQuota == 1 &&
+              waits.heldBehindRefusal == 1,
+          "a quota refusal did not hold back the start restoring unheld copies alone");
+  // The quota grows: the Spill start starts, then the one it held back.
+  spill.budget->setActiveLimitBytes(48 * 100);
+  spill.runUntil([&] { return started(3) < std::ssize(spill.events.startIds); }, "the start held back did not start");
+  spill.cache.checkInvariants();
+  require(started(2) < started(3) && spill.events.failedCount == 0,
+          "the start held back did not start after the Spill start");
+  spill.engine.cancel(4);
+  spill.engine.cancel(2);
+  spill.runUntilIdle();
+  require(spill.events.failedCount == 0 && spill.committedSlots() == 0, "the quota was not returned");
+}
+
+// A Resident start whose chain's copies running lanes hold already takes none of the quota: the
+// quota counts a held copy once, however many lanes hold its block. A quota refusal it follows does
+// not hold it back, and it starts beside the refusal.
+void testAStartRestoringHeldCopiesStartsBesideAQuotaRefusal() {
+  Spilling spill(12, false, 2'000, 0, {4}, {}, {.limitBytes = 2'000});
+  const auto submit = [&](uint64_t id, std::vector<uint32_t> tokens, uint32_t output) {
+    EngineRequest value = request(id, std::move(tokens));
+    value.maxNewTokens = output;
+    value.deadlineMilliseconds = 1e9;
+    spill.engine.submit(std::move(value));
+  };
+  const auto started = [&](uint64_t id) {
+    return std::ranges::find(spill.events.startIds, id) != spill.events.startIds.end();
+  };
+  // A Spill turn leaves its chain cached with copies; a Resident lane
+  // restores it and holds 10 of the 12 slots of active KV while it decodes.
+  const std::vector<uint32_t> spilled(10 * KvCache::pageTokens + 1, 1);
+  submit(1, spilled, 4'096);
+  spill.runUntilIdle();
+  submit(3, spilled, 300);
+  spill.runUntil([&] { return spill.events.outputs.contains(3); }, "the Resident lane did not decode");
+  require(spill.cache.spillSnapshot().heldBytes == 1'000, "the Resident lane did not hold its chain's copies");
+  // A Spill start is refused the quota and leads every later start.
+  submit(2, std::vector<uint32_t>(4 * KvCache::pageTokens + 1, 2), 4'000);
+  spill.runUntil([&] { return spill.engine.resourceWaitSnapshot(spill.now).diskQuota == 1; },
+                 "the Spill start did not wait for the quota");
+  // A Resident start restores the same chain, and more of its own.
+  std::vector<uint32_t> continued = spilled;
+  continued.insert(continued.end(), 5 * KvCache::pageTokens, 4);
+  submit(4, std::move(continued), 1);
+  for (int step = 0; step < 5 && !started(4); ++step) {
+    static_cast<void>(spill.engine.tick(spill.now++));
+    spill.tier.complete();
+    spill.cache.checkInvariants();
+  }
+  const ResourceWaitSnapshot waits = spill.engine.resourceWaitSnapshot(spill.now);
+  require(started(4) && !started(2) && waits.diskQuota == 1 && !waits.heldBehindRefusal &&
+              spill.cache.spillSnapshot().heldBytes == 1'000,
+          "a quota refusal held back a start whose chain's copies lanes hold already");
+  for (const uint64_t id : {2, 3})
+    spill.engine.cancel(id);
+  spill.runUntilIdle();
+  require(spill.events.failedCount == 0 && spill.committedSlots() == 0, "the quota was not returned");
+}
+
+// A Spill start that restores a chain with copies no request holds takes them into the quota of
+// active KV as it holds them, beside its commitment: it starts only with room for both, its output
+// bounded to what the quota holds, and active KV stays within its limit, revoking no commitment.
+void testASpillStartCountsTheCopiesItRestores() {
+  // Active KV may take 12 of the 48 slots: cached copies keep the rest.
+  Spilling spill(48, false, 2'000, 0, {4}, {}, {.limitBytes = 2'000});
+  spill.budget->setActiveLimitBytes(12 * 100);
+  const auto submit = [&](uint64_t id, std::vector<uint32_t> tokens, uint32_t output) {
+    EngineRequest value = request(id, std::move(tokens));
+    value.maxNewTokens = output;
+    value.deadlineMilliseconds = 1e9;
+    spill.engine.submit(std::move(value));
+  };
+  // A Spill turn leaves its chain cached with 10 copies or more, which no
+  // request holds.
+  const std::vector<uint32_t> spilled(10 * KvCache::pageTokens + 1, 1);
+  submit(1, spilled, 4'096);
+  spill.runUntilIdle();
+  require(spill.cache.probe(spilled, {}).cachedTokens() >= 10 * KvCache::pageTokens &&
+              spill.cache.spillSnapshot().heldBytes == 0,
+          "the turn's chain was not cached");
+  // A Spill start continues it: its 10 copies and its commitment share the
+  // 12 slots.
+  std::vector<uint32_t> continued = spilled;
+  continued.insert(continued.end(), KvCache::pageTokens, 2);
+  submit(2, std::move(continued), 4'000);
+  spill.runUntil(
+      [&] {
+        const KvSpillSnapshot snapshot = spill.cache.spillSnapshot();
+        require(snapshot.heldBytes + snapshot.committedBytes <= snapshot.activeLimitBytes &&
+                    !snapshot.revokedCommitments,
+                "active KV passed its limit as the Spill start held the copies it restored");
+        return idle(spill.engine);
+      },
+      "the Spill start did not end");
+  require(spill.events.failedCount == 0 && spill.events.completedCount == 2 && spill.events.outputs.contains(2) &&
+              spill.committedSlots() == 0,
+          "the Spill start did not run within the quota");
+}
+
+// A start refused memory keeps the probe it was placed with while it backs off, and the cache may
+// take the chain that probe found meanwhile: a quota refusal it follows reads that chain only as
+// far as the cache still has it, and the start waits on.
+void testAQuotaRefusalReadsOnlyTheChainAStartKeeps() {
+  Spilling spill(10, false, 0, KvCache::pageTokens, {4}, {}, {.limitBytes = 20 * 100});
+  // No cached copy is written: a cached chain stays without copies.
+  spill.tier.writeLimits[static_cast<size_t>(WriteClass::Persist)] = 0;
+  spill.tier.writeLimits[static_cast<size_t>(WriteClass::Reclaim)] = 0;
+  const auto submit = [&](uint64_t id, std::vector<uint32_t> tokens, uint32_t output) {
+    EngineRequest value = request(id, std::move(tokens));
+    value.maxNewTokens = output;
+    value.deadlineMilliseconds = 1e9;
+    spill.engine.submit(std::move(value));
+  };
+  const std::vector<uint32_t> turn(KvCache::pageTokens + 1, 50);
+  // An earlier turn ends; its chain stays cached.
+  submit(5, turn, 1);
+  spill.runUntil([&] { return spill.events.usage.contains(5); }, "the earlier turn did not end");
+  require(spill.cache.probe(turn, {}).cachedTokens() != 0, "the earlier turn's chain was not cached");
+  // The first request commits the whole quota; the second waits for it.
+  submit(1, std::vector<uint32_t>(KvCache::pageTokens + 1, 1), 4'000);
+  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the first request did not decode");
+  submit(2, {2}, 4'000);
+  spill.runUntil([&] { return spill.engine.resourceWaitSnapshot(spill.now).diskQuota == 1; },
+                 "the second request did not wait for the quota");
+  // The earlier turn sent again: the host refuses its start memory.
+  spill.model.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+  spill.model.beginGrowthBlocked = [&] { return spill.model.lastBeginId == 3; };
+  submit(3, turn, 1);
+  spill.runUntil([&] { return spill.engine.resourceWaitSnapshot(spill.now).memory == 1; },
+                 "the resend was not refused memory");
+  // Reclaims take the chain its probe found.
+  for (int step = 0; step < 40 && spill.cache.lookup(turn, {}).kvBoundary; ++step) {
+    static_cast<void>(test::evictStep(spill.cache));
+    static_cast<void>(test::stateStep(spill.cache));
+  }
+  require(!spill.cache.lookup(turn, {}).kvBoundary, "the chain was not taken");
+  for (int step = 0; step < 5; ++step)
+    static_cast<void>(spill.engine.tick(spill.now++));
+  const ResourceWaitSnapshot waits = spill.engine.resourceWaitSnapshot(spill.now);
+  require(waits.memory == 1 && waits.diskQuota == 1 && spill.events.failedCount == 0,
+          "the starts did not wait on beside a chain the cache took");
+  spill.model.beginGrowthBlocked = {};
+  for (const uint64_t id : {1, 2, 3})
+    spill.engine.cancel(id);
+  spill.runUntilIdle();
+  require(spill.committedSlots() == 0, "the quota was not returned");
 }
 
 // A start that cannot spill, the tier closed or the quota short, starts Resident where its
@@ -1839,7 +2143,7 @@ void testAConversionLeavesNoLaneWithoutItsFloor() {
   spill.runUntil(
       [&] {
         return !spill.engine.commandInFlight() &&
-               spill.cache.copiedBlocks(spill.cache.blockAt(1, 4 * KvCache::pageTokens)) == 4 &&
+               spill.cache.chainCopies(spill.cache.blockAt(1, 4 * KvCache::pageTokens)).copied == 4 &&
                needsPage(2) && !needsPage(1);
       },
       "lane 2 did not come to need a page that lane 1 does not");
@@ -2429,8 +2733,16 @@ std::span<const test::TestCase> spillTests() {
       {"testLaneDemandCountsTheHotFloorALaneWaitsFor", testLaneDemandCountsTheHotFloorALaneWaitsFor},
       {"testAStartRefusedMemoryCountsNoConversion", testAStartRefusedMemoryCountsNoConversion},
       {"testShortQuotaBoundsWaitsOrRefusesASpillStart", testShortQuotaBoundsWaitsOrRefusesASpillStart},
-      {"testAQuotaWaitHoldsBackOnlySpillStarts", testAQuotaWaitHoldsBackOnlySpillStarts},
+      {"testAQuotaWaitHoldsBackOnlyStartsCompetingForIt", testAQuotaWaitHoldsBackOnlyStartsCompetingForIt},
       {"testADeclinedQuotaRefusalKeepsItsScope", testADeclinedQuotaRefusalKeepsItsScope},
+      {"testAResidentStartDoesNotHoldAQuotaWaitOpen", testAResidentStartDoesNotHoldAQuotaWaitOpen},
+      {"testALaneHoldingCopiesHoldsAQuotaWaitOpen", testALaneHoldingCopiesHoldsAQuotaWaitOpen},
+      {"testAQuotaRefusalHoldsBackAStartRestoringUnheldCopies",
+       testAQuotaRefusalHoldsBackAStartRestoringUnheldCopies},
+      {"testAQuotaRefusalReadsOnlyTheChainAStartKeeps", testAQuotaRefusalReadsOnlyTheChainAStartKeeps},
+      {"testAStartRestoringHeldCopiesStartsBesideAQuotaRefusal",
+       testAStartRestoringHeldCopiesStartsBesideAQuotaRefusal},
+      {"testASpillStartCountsTheCopiesItRestores", testASpillStartCountsTheCopiesItRestores},
       {"testAStartThatCannotSpillStartsResidentWithinTheResidentContext",
        testAStartThatCannotSpillStartsResidentWithinTheResidentContext},
       {"testWriteBudgetRefusalSaysWhenToRetry", testWriteBudgetRefusalSaysWhenToRetry},

@@ -570,7 +570,8 @@ void KvCache::setSlot(uint64_t blockId, std::shared_ptr<KvDiskSlot> slot) {
 
 void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot, kv::PageForm copyForm) {
   setForeignCopy(entry, false);
-  if (static_cast<bool>(entry.slot) != static_cast<bool>(slot)) {
+  const bool changed = static_cast<bool>(entry.slot) != static_cast<bool>(slot);
+  if (changed) {
     slot ? ++diskBlocks_ : --diskBlocks_;
     if (entry.held)
       slot ? ++heldCopies_ : --heldCopies_;
@@ -579,15 +580,21 @@ void KvCache::giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot, kv::P
     rewrites_ += std::exchange(entry.copied, true);
   entry.slot = std::move(slot);
   entry.copyForm = entry.slot ? copyForm : kv::PageForm::Full;
+  if (changed && copyChanged_)
+    copyChanged_(entry.id, entry.depth, entry.page, static_cast<bool>(entry.slot));
 }
 
 void KvCache::setForeignCopy(Block &entry, bool foreign) noexcept {
   if (entry.foreignCopy == foreign)
     return;
-  // Only a copy of what the page holds is active KV.
-  if (entry.held && entry.slot)
-    foreign ? --heldCopies_ : ++heldCopies_;
   entry.foreignCopy = foreign;
+  if (!entry.slot)
+    return;
+  // Only a copy of what the page holds is active KV.
+  if (entry.held)
+    foreign ? --heldCopies_ : ++heldCopies_;
+  if (copyChanged_)
+    copyChanged_(entry.id, entry.depth, entry.page, !foreign);
 }
 
 void KvCache::placeOnPage(Block &entry, uint32_t page) {

@@ -456,12 +456,26 @@ public:
     return spill_ ? diskBudget_->activeLimitBytes() : 0;
   }
   [[nodiscard]] uint64_t spillRoom() const noexcept;
+  // The blocks on the chain that ends at this block (none for 0) whose K/V
+  // has a copy, landed or being written (copied): pages of a Spill request
+  // that holds them need no commitment. Of those, the ones no request holds
+  // (unheld, takesQuota): a start that restores the chain holds them, and
+  // the quota of active KV counts them then (heldSlotBytes); the others it
+  // counts already.
+  struct ChainCopies final {
+    uint32_t copied;
+    uint32_t unheld;
+  };
+  [[nodiscard]] ChainCopies chainCopies(uint64_t block) const;
   // Commits quota for `pages` pages of a Spill request, which each page it
   // publishes then draws or returns (DiskBudget::commit); false, committing
-  // nothing, when spillRoom() cannot hold them. A tier that takes no writes
-  // is the spill gate's to refuse: a resume commits there too, and since no
-  // write draws its commitment, all of it goes back as the request ends.
-  [[nodiscard]] bool commitSpill(uint64_t requestId, uint32_t pages);
+  // nothing, when spillRoom() cannot hold them beside the unheld copies of
+  // the chain it restores, which it holds once it does (`copies`). A copy
+  // written for a block of that chain before the restore holds it returns
+  // that block's page (restoreRequest). A tier that takes no writes is the
+  // spill gate's to refuse: a resume commits there too, and since no write
+  // draws its commitment, all of it goes back as the request ends.
+  [[nodiscard]] bool commitSpill(uint64_t requestId, uint32_t pages, const ChainCopies &copies = {});
   // Turns a Resident request whose growth was denied into a Spill request:
   // checks the tier, the write budget and the room for `pages` pages,
   // commits them, starts write-through of its published blocks and moves
@@ -469,10 +483,16 @@ public:
   // allocates nothing; false, changing nothing, when spilling cannot relieve
   // it.
   [[nodiscard]] bool convertToSpill(uint64_t requestId, uint32_t pages);
-  // The blocks on the chain that ends at this block (none for 0) whose K/V
-  // has a copy, landed or being written: pages of a Spill request that
-  // holds them need no commitment.
-  [[nodiscard]] uint32_t copiedBlocks(uint64_t block) const;
+  // Whether a start that restores this chain would take some of the quota
+  // of active KV (spillRoom): a copy on it no request holds (takesQuota). A
+  // probe's chain may have changed since it was made: it reads the chain up
+  // to its first block no longer matchable, as refresh() does, and stops at
+  // the first such copy.
+  [[nodiscard]] bool restoreTakesQuota(std::span<const uint64_t> chain) const;
+  // Whether the request holds some of the quota of active KV: a Spill
+  // request's commitment, or a block on its own page with a copy
+  // (Request::heldCopies).
+  [[nodiscard]] bool holdsActiveKvQuota(uint64_t requestId) const;
   // Starts writing Spill requests' published pages that have no copy of
   // what they hold (KvCache::kvCopied), as the tier's share for them allows;
   // returns the writes started.
@@ -770,6 +790,14 @@ private:
     // and how far its blocks are known spilled or kept Full by another
     // holder (spillWritten).
     uint32_t committedPages = 0;
+    // The copies on the chain it restores that its commitment counted
+    // (commitSpill).
+    uint32_t committedCopies = 0;
+    // In a cache whose requests spill, its blocks on its own pages with a
+    // copy of their K/V (holdsCopy): the copies of active KV it holds
+    // (holdsActiveKvQuota). A block it keeps a page of its own beside, while
+    // a restore fills the block's (KvCache::insert), it does not hold.
+    uint32_t heldCopies = 0;
     uint64_t spillOrder = 0;
     std::deque<uint64_t> owedCopies;
     uint32_t spillScan = 0;
@@ -1294,8 +1322,14 @@ private:
     return tier_ ? uint64_t{kv_.heldCopies()} * tier_->slotBytes() : 0;
   }
   // A Spill request's commitment: locks quota for `pages` slots; false,
-  // committing nothing, when active KV's limit cannot hold them.
-  [[nodiscard]] bool commit(Request &active, uint32_t pages);
+  // committing nothing, when active KV's limit cannot hold them beside
+  // `unheld` copies it is about to hold.
+  [[nodiscard]] bool commit(Request &active, uint32_t pages, uint32_t unheld = 0);
+  // A copy no request holds yet (ChainCopies::unheld).
+  [[nodiscard]] bool takesQuota(uint64_t block) const;
+  // Whether the request holds the block at this index of its chain on its
+  // own page, with a copy of its K/V (Request::heldCopies).
+  [[nodiscard]] bool holdsCopy(const Request &active, uint32_t index) const;
   // A slot drawn for the request came back unwritten: it commits the slot
   // again, or, while active KV's limit cannot hold it, counts the
   // commitment revoked.

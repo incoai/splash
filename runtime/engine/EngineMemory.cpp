@@ -252,9 +252,9 @@ uint64_t Engine::chainEnd(const Request &active) const {
              : cache_.blockAt(id, held / KvCache::pageTokens * KvCache::pageTokens);
 }
 
-uint32_t Engine::spillPages(const Request &active, uint64_t chainEnd) const {
+uint32_t Engine::spillPages(const Request &active, uint32_t copied) const {
   const uint64_t pages = projectedTokens(active) / KvCache::pageTokens;
-  return static_cast<uint32_t>(pages - std::min<uint64_t>(pages, cache_.copiedBlocks(chainEnd)));
+  return static_cast<uint32_t>(pages - std::min<uint64_t>(pages, copied));
 }
 
 Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64_t chainEnd,
@@ -291,25 +291,29 @@ Engine::SpillAdmission Engine::admitSpill(Request &active, bool resuming, uint64
       return SpillAdmission::Settled;
     }
   }
+  // The copies on the chain it restores that no request holds count in the
+  // quota once it holds them, as its commitment does; the others count
+  // already (Cache::chainCopies).
+  const Cache::ChainCopies copies = cache_.chainCopies(chainEnd);
   const uint64_t room = cache_.spillRoom() / geometry.slotBytes;
-  if (room >= spillPages(active, chainEnd))
+  if (room >= uint64_t{spillPages(active, copies.copied)} + copies.unheld)
     return SpillAdmission::Commit;
   // Short of its projection, a start that fits in memory alone starts
   // Resident, as without the SSD cache, unless every request spills.
   if (!resuming && !config_.spill.always && residentInstead())
     return SpillAdmission::Resident;
   // Otherwise the quota bounds its output to the pages it holds, if they
-  // hold a token past the request's tokens; pages of the restored chain that
-  // have copies need no quota. A resume counts the anchor its model holds
-  // once it selected the first token (Request::suspendedWithAnchor), which
-  // the model decodes only with output left past it: it emits a last
-  // budgeted anchor as it selects it.
+  // hold a token past the request's tokens; pages of the restored chain
+  // whose copies the quota counts already need none of it. A resume counts
+  // the anchor its model holds once it selected the first token
+  // (Request::suspendedWithAnchor), which the model decodes only with output
+  // left past it: it emits a last budgeted anchor as it selects it.
   const uint64_t held = active.exactTokens.size() + (active.suspendedWithAnchor ? 1 : 0);
-  const uint64_t copied = cache_.copiedBlocks(chainEnd);
-  const uint64_t needed = held / KvCache::pageTokens + 1 - copied;
+  const uint64_t counted = copies.copied - copies.unheld;
+  const uint64_t needed = held / KvCache::pageTokens + 1 - counted;
   if (room >= needed) {
     active.outputLimit = static_cast<uint32_t>(std::min<uint64_t>(
-        active.outputLimit, (copied + room) * KvCache::pageTokens - active.promptTokens));
+        active.outputLimit, (counted + room) * KvCache::pageTokens - active.promptTokens));
     return SpillAdmission::Commit;
   }
   // What it lacks is other requests' active KV, the copies of the blocks
@@ -341,10 +345,18 @@ void Engine::waitForDiskQuota(Request &active, double now) {
   deferResourceRetry(active, now, {.diskQuota = true});
 }
 
+bool Engine::competesForQuota(const Request &active) const {
+  if (active.lane)
+    return cache_.holdsActiveKvQuota(active.request.id);
+  return (active.placement && *active.placement == KvMode::Spill) ||
+         (active.admissionProbe && !active.skipCache &&
+          cache_.restoreTakesQuota(active.admissionProbe->restoredChain()));
+}
+
 bool Engine::convertToSpill(Request &active) {
   if (!config_.spill.capable || active.kvMode != KvMode::Resident || passCommand_.holds(active.request.id))
     return false;
-  if (!cache_.convertToSpill(active.request.id, spillPages(active, chainEnd(active))))
+  if (!cache_.convertToSpill(active.request.id, spillPages(active, cache_.chainCopies(chainEnd(active)).copied)))
     return false;
   active.kvMode = KvMode::Spill;
   active.converted = true;
@@ -415,11 +427,11 @@ void Engine::deferResourceRetry(Request &active, double now,
   if (!wait.startedMilliseconds)
     wait.startedMilliseconds = now;
   // Waiting for a lane is not waiting for memory. Without a lane, refused at
-  // its start or resume or suspended, a request waits for every lane admitted
-  // before its latest refusal: those admission started ahead of it while it
-  // waited, as the scheduler led them, hold memory it waits for. A lane in
-  // service waits for those admitted before its first refusal; the starts
-  // admitted beside it do not.
+  // its start or resume or suspended, a request waits for the lanes admitted
+  // before its latest refusal that compete for what it was refused (tick):
+  // those admission started ahead of it while it waited, as the scheduler
+  // led them, hold what it waits for. A lane in service waits for those
+  // admitted before its first refusal; the starts admitted beside it do not.
   if (reason != StateFailure::ConcurrencyLimit && (!active.lane || !wait.admittedBefore))
     wait.admittedBefore = admissions_;
   noteRefusal(active, now, denial);
@@ -472,9 +484,10 @@ double Engine::resourceDeadline(const Request &active) const noexcept {
   if ((wait.pending && wait.epoch != resourceEpoch_) || wait.deadlineMilliseconds <= 0.0)
     return 0.0;
   // The limit restarts whenever a lane submitted before the request, or
-  // admitted before the refusal ResourceWait::admittedBefore records, works,
-  // however long that takes. Other lanes do not extend it: requests that
-  // keep arriving would otherwise hold it until the request's deadline.
+  // admitted before the refusal ResourceWait::admittedBefore records and
+  // competing for what it was refused, works, however long that takes. Other
+  // lanes do not extend it: requests that keep arriving would otherwise hold
+  // it until the request's deadline.
   return std::max(wait.deadlineMilliseconds,
                   wait.earlierLaneWorkMilliseconds + config_.resourceWaitTimeoutMilliseconds);
 }
@@ -837,7 +850,8 @@ std::vector<Victim> Engine::EngineVictims::conversions(const VictimQuery &query)
     return units;
   const SpillGeometry &geometry = engine.config_.spill.geometry;
   if (!geometry.slotBytes ||
-      engine.cache_.spillRoom() / geometry.slotBytes < engine.spillPages(active, engine.chainEnd(active)))
+      engine.cache_.spillRoom() / geometry.slotBytes <
+          engine.spillPages(active, engine.cache_.chainCopies(engine.chainEnd(active)).copied))
     return units;
   // The gate: the pages it would spill (Full pages no Resident request
   // holds) free Full - Index bytes each; less the first lane's hot block

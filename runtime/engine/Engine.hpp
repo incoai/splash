@@ -331,8 +331,11 @@ private:
     std::optional<double> startedMilliseconds;
     // The admissions counted at the request's latest refusal while it has no
     // lane (its start's, its resume's, its suspension), or at its first
-    // refusal in service: the lanes admitted up to then hold memory it waits
-    // for (deferResourceRetry). A wait for a lane does not record it.
+    // refusal in service: the lanes admitted up to then that compete for
+    // what it was refused, any for memory and those holding some of the SSD
+    // cache's quota for it (competesForQuota), hold what it waits for
+    // (deferResourceRetry).
+    // A wait for a lane does not record it.
     std::optional<uint64_t> admittedBefore;
     double deadlineMilliseconds = 0.0;
     // The latest tick at which a lane submitted before the request, or one
@@ -387,7 +390,8 @@ private:
     EngineRequest request;
     // The admissions counted when admit() last gave it a lane (admissions_).
     // Lanes admitted before a request's refusal that
-    // ResourceWait::admittedBefore records restart its wait's limit.
+    // ResourceWait::admittedBefore records, and that compete for what it was
+    // refused, restart its wait's limit.
     uint64_t admission = 0;
     std::optional<uint32_t> lane;
     uint32_t promptTokens = 0;
@@ -437,8 +441,9 @@ private:
     ClaimHandle claim;
     // The latest attempt to start it was refused memory, or the SSD cache's
     // quota of active KV. While the scheduler wants it, it holds back the
-    // starts the scheduler wants after it, and a suspended one the resumes
-    // after it (admitQueued). A pass that does not want it or a prefix wait
+    // starts the scheduler wants after it that compete for it
+    // (competesForQuota), and a suspended one the resumes after it
+    // (admitQueued). A pass that does not want it or a prefix wait
     // leaves it in place.
     bool refusedResources = false;
     // The request refused resources that the latest admission pass held it
@@ -570,6 +575,16 @@ private:
   [[nodiscard]] Request &request(uint64_t requestId);
   [[nodiscard]] bool admitQueued(double nowMilliseconds);
   [[nodiscard]] bool admit(Request &request, double nowMilliseconds);
+  // Whether the request competes for the SSD cache's quota of active KV
+  // (Cache::spillRoom): a lane while it holds some of it
+  // (Cache::holdsActiveKvQuota), a start if it would take some once it
+  // starts, as a Spill start's commitment or the copies no request holds
+  // yet on the chain it restores (Cache::restoreTakesQuota). Every request
+  // competes for memory. A refused start holds back the wanted
+  // starts after it that compete for what it was refused (admitQueued), and
+  // those admitted ahead of it that compete for it keep its wait open while
+  // they work (tick).
+  [[nodiscard]] bool competesForQuota(const Request &request) const;
   // The tokens the request's KV is projected to hold: those it holds and
   // the output it may still generate, at most kProjectedOutputTokens.
   [[nodiscard]] static uint64_t projectedTokens(const Request &request) noexcept;
@@ -610,10 +625,10 @@ private:
   [[nodiscard]] static uint64_t chainEnd(const CacheLookup &lookup) noexcept;
   [[nodiscard]] uint64_t chainEnd(const Request &request) const;
   // The full pages of a Spill request's projection that its commitment
-  // covers (Cache::commitSpill): all of them but the blocks of the chain
-  // ending at `chainEnd` that have a copy (Cache::copiedBlocks), whose
-  // pages it writes no more. Each of its other pages is written once.
-  [[nodiscard]] uint32_t spillPages(const Request &request, uint64_t chainEnd) const;
+  // covers (Cache::commitSpill): all of them but the `copied` blocks of the
+  // chain it holds that have a copy (Cache::chainCopies), whose pages it
+  // writes no more. Each of its other pages is written once.
+  [[nodiscard]] uint32_t spillPages(const Request &request, uint32_t copied) const;
   // What becomes of a start (or a resume, which keeps its mode) in Spill
   // mode that restores the chain ending at `chainEnd`. A fresh start needs
   // a tier that takes writes and a write budget for what Spill requests
@@ -641,8 +656,8 @@ private:
                                           double nowMilliseconds);
   // A start the SSD cache's quota of active KV refused while other requests'
   // active KV holds what it lacks: it waits for them to end, and holds back
-  // the Spill starts the scheduler wants after it (Request::
-  // refusedResources).
+  // the starts the scheduler wants after it that compete for the quota
+  // (competesForQuota, Request::refusedResources).
   void waitForDiskQuota(Request &request, double nowMilliseconds);
   // Whether the lane's history may gain Index pages between a command's
   // passes: in Spill mode, a prompt `processed` rows in reaches past its
@@ -1060,7 +1075,8 @@ private:
   // The wait limit tick() enforces, or zero while it enforces none: a
   // pending wait that has seen progress waits for its next attempt. The
   // limit restarts whenever a lane submitted before the request, or one
-  // ResourceWait::admittedBefore counts, has work in flight.
+  // ResourceWait::admittedBefore counts that competes for what it was
+  // refused, has work in flight.
   [[nodiscard]] double resourceDeadline(const Request &request) const noexcept;
   void signalResourceProgress() noexcept;
   void apply(const Pending &command, std::span<const ModelStepResult> results,

@@ -153,6 +153,12 @@ public:
   // (model::DiskBudget::commit). A copy of another command's K/V beside a
   // held page is a cached copy.
   [[nodiscard]] uint32_t heldCopies() const noexcept { return heldCopies_; }
+  // Called as a block gains or loses a copy of its own K/V (kvCopied), with
+  // the block's depth and page, so that the requests holding it on their
+  // own pages count theirs (Cache::holdsActiveKvQuota). Erasing a block
+  // calls none: a block that can be erased is on no request's chain.
+  using CopyChanged = std::function<void(uint64_t blockId, uint32_t depth, uint32_t page, bool copied)>;
+  void onCopyChanged(CopyChanged changed) { copyChanged_ = std::move(changed); }
   void touch(uint64_t blockId) noexcept;
 
   [[nodiscard]] Chain chain(uint64_t blockId) const;
@@ -418,6 +424,7 @@ private:
   uint32_t diskBlocks_ = 0;
   uint32_t indexBlocks_ = 0;
   uint32_t heldCopies_ = 0;
+  CopyChanged copyChanged_;
   uint64_t rewrites_ = 0;
   uint64_t upgrades_ = 0;
   uint32_t pinnedBlocks_ = 0;

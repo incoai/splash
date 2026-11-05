@@ -228,16 +228,22 @@ bool Engine::tick(double now) {
   // ahead wait for them (WriteBehind::run).
   syncClaims(now);
   progressed = writeBehind_.run(now, copyDemandBytes(), governor().claimWaiting()) || progressed;
-  // The earliest submitted and the earliest admitted of the lanes with work
-  // in flight.
+  // The earliest submitted of the lanes with work in flight, and the
+  // earliest admitted of them and, while a request waits for the SSD cache's
+  // quota, of those that compete for it (competesForQuota).
+  const bool quotaWaits = std::ranges::any_of(
+      requests_, [](const auto &entry) { return entry.second.resourceWait.diskQuota; });
   uint64_t earliestWorking = std::numeric_limits<uint64_t>::max();
   uint64_t earliestWorkingAdmission = std::numeric_limits<uint64_t>::max();
+  uint64_t earliestQuotaAdmission = std::numeric_limits<uint64_t>::max();
   if (pending_) {
     for (const BatchItem &item : pending_->plan.items) {
+      const Request &lane = request(item.requestId);
       earliestWorking =
           std::min(earliestWorking, scheduler_.submissionOrder(item.requestId));
-      earliestWorkingAdmission =
-          std::min(earliestWorkingAdmission, request(item.requestId).admission);
+      earliestWorkingAdmission = std::min(earliestWorkingAdmission, lane.admission);
+      if (quotaWaits && competesForQuota(lane))
+        earliestQuotaAdmission = std::min(earliestQuotaAdmission, lane.admission);
     }
   }
   const bool draining = drainingForRecovery();
@@ -259,13 +265,14 @@ bool Engine::tick(double now) {
     }
     // A lane submitted before the request, or admitted before the refusal
     // ResourceWait::admittedBefore records (a waiting start's latest, so the
-    // starts admission led ahead of it count), holds memory it may wait for
-    // until it finishes; while it works, the wait's limit restarts. Other
-    // lanes do not extend it: requests that keep arriving would otherwise
-    // hold it until its deadline.
-    const std::optional<uint64_t> &admittedBefore = active.resourceWait.admittedBefore;
+    // starts admission led ahead of it count) and competing for what it was
+    // refused, holds what it may wait for until it finishes; while it works,
+    // the wait's limit restarts. Other lanes do not extend it: requests that
+    // keep arriving would otherwise hold it until its deadline.
+    const ResourceWait &wait = active.resourceWait;
+    const uint64_t earliestAhead = wait.diskQuota ? earliestQuotaAdmission : earliestWorkingAdmission;
     if (scheduler_.submissionOrder(id) > earliestWorking ||
-        (admittedBefore && earliestWorkingAdmission <= *admittedBefore))
+        (wait.admittedBefore && earliestAhead <= *wait.admittedBefore))
       active.resourceWait.earlierLaneWorkMilliseconds = now;
     // A request waiting for the weights fails at its limit only once the
     // restore's attempt there is refused too (advanceWeights).
@@ -699,11 +706,11 @@ bool Engine::admitQueued(double now) {
     }
   // The wanted starts are tried in lead order, each once its backoff is over,
   // up to the first that stands refused or is refused: the wanted starts
-  // after it are held, not tried, in this pass, so what reclaim, finishing
-  // lanes and returned commitments free goes to it before the starts it
-  // leads. A refusal of the SSD cache's quota, which only a Spill start uses,
-  // holds back only Spill starts. A start waiting for a prefix holds back
-  // nothing.
+  // after it that compete for what it was refused are held, not tried, in
+  // this pass, so what reclaim, finishing lanes and returned commitments
+  // free goes to it before the starts it leads. Every start competes for
+  // memory; for the SSD cache's quota only those that will hold some of it
+  // (competesForQuota). A start waiting for a prefix holds back nothing.
   std::optional<uint64_t> refused;
   std::optional<uint64_t> refusedQuota;
   bool progressed = false;
@@ -713,8 +720,10 @@ bool Engine::admitQueued(double now) {
     // pass may have changed.
     const PrefillAdmission start{.requestId = id};
     placeCandidates({&start, 1});
-    if (const std::optional<uint64_t> behind =
-            !refused && *active.placement == KvMode::Spill ? refusedQuota : refused) {
+    std::optional<uint64_t> behind = refused;
+    if (!behind && refusedQuota && competesForQuota(active))
+      behind = refusedQuota;
+    if (behind) {
       queue(id);
       active.heldBehind = behind;
       continue;
@@ -976,9 +985,11 @@ bool Engine::admit(Request &active, double now) {
   if (droppedLease)
     lookup = cache_.lookup(modelRequest.prompt, promptIdentity(active.request));
   // The commitment covers the chain it restores too, once the lookup is
-  // final. Writes a reclaim started may have taken the quota admitSpill
+  // final, beside the copies on it the quota counts once the start holds
+  // them. Writes a reclaim started may have taken the quota admitSpill
   // found, or the chain found again may have fewer copies: the start waits.
-  if (commits && !cache_.commitSpill(requestId, spillPages(active, chainEnd(lookup)))) {
+  const Cache::ChainCopies copies = commits ? cache_.chainCopies(chainEnd(lookup)) : Cache::ChainCopies{};
+  if (commits && !cache_.commitSpill(requestId, spillPages(active, copies.copied), copies)) {
     vacateLane(active, resuming);
     waitForDiskQuota(active, now);
     return false;

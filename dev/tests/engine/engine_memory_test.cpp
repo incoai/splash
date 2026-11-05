@@ -1301,47 +1301,62 @@ void testAdmissionWaitsOutEarlierLanes() {
   }
 }
 
-// A lane submitted after a waiting request and admitted after its latest refusal does not extend its wait: the wait
-// fails at its limit, retryably, while that lane, which leads it, still runs.
-void testLaterLanesDoNotExtendAResourceWait() {
-  test::TestKvStorage storage(32, 4096, 4);
+// A lane in service refused memory waits only for the lanes admitted before its first refusal: a start admitted beside
+// it after that refusal does not extend its wait, however often the lane is refused again while that start runs. The
+// wait fails at its limit, retryably, while the start's command is still in flight.
+void testStartsAdmittedBesideALaneInServiceDoNotExtendItsWait() {
+  test::TestKvStorage storage(16, 4096, 4);
   KvPool pool(storage, 0);
-  engine::Cache resources(pool, nullptr, nullptr);
+  test::TestKvTier tier;
+  tier.transferLimit = 8;
+  tier.capacity = 8;
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
   Executor executor;
   executor.decodeFinishes = false;
-  // The host has memory for the later request's state, not the waiting one's.
-  executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
-  executor.beginGrowthBlocked = [&] { return executor.lastBeginId == 320; };
   Events events;
-  EngineConfig config = test::engineConfig();
-  // Shorter than the retry backoff: the limit runs out before the retry
-  // whose refusal would count the later lane.
-  config.resourceWaitTimeoutMilliseconds = 50.0;
-  engine::Engine engine(config, resources, executor, events);
+  engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
   guardReleases(storage, engine);
-  engine.submit(request(320, std::vector<uint32_t>(65, 320)));
-  static_cast<void>(engine.tick(1));
-  require(engine.resourceWaitSnapshot(1).memory == 1 && !executor.requests.contains(320),
-          "the first request did not wait for memory");
-  // A shorter prompt leads the waiting request and is not held back; the
-  // waiting one stays the next start the scheduler wants.
-  auto later = request(321, {321});
-  later.maxNewTokens = 1000;
-  engine.submit(std::move(later));
+  // Two pages free beside the cached blocks, and no extent more. The lane's
+  // prompt needs the pages their demotions return, which never land: it
+  // keeps its lane and waits for them.
+  cacheBlocksUnderDiskStates(cache, 6);
+  storage.growthBlocked = true;
+  EngineRequest lane = request(1, std::vector<uint32_t>(161, 7));
+  lane.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(lane));
   double now = 1;
-  while (!events.failedCount && now < 1000) {
+  static_cast<void>(engine.tick(now));
+  require(tier.demotions == 3 && executor.requests.contains(1) && executor.prefillRows == 0,
+          "the lane in service was not refused the pages on their way back");
+  // A start whose prompt continues the newest cached block, which no
+  // demotion took, outranks the lane by the tokens it has done: its claim
+  // takes the room the lane's waits for, and its state comes back from disk
+  // at once. It decodes beside the lane, which is retried, and refused,
+  // several times meanwhile.
+  executor.restoreControl->ready = true;
+  EngineRequest beside = request(2, std::vector<uint32_t>(33, 905));
+  beside.maxNewTokens = 100000;
+  beside.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(beside));
+  tickUntil(engine, now, [&] { return events.outputs.contains(2); }, "the start beside the lane did not decode");
+  const double decodedAt = now;
+  for (const double end = now + 3 * kResourceRetryBackoffMilliseconds; now < end;)
     static_cast<void>(engine.tick(now += 10));
-    require(executor.requests.contains(321), "the later lane did not run beside the wait");
-  }
-  require(now == 51 && events.failures == std::vector<std::string>{"resource_timeout"} &&
-              events.failureDetails.back().second && !events.completedCount,
-          "a lane submitted after a waiting request extended its wait");
-  require(events.failureDetails.back().first ==
-              "memory did not become available within the resource wait limit: "
-              "macOS is short of memory; close memory-heavy applications",
-          "a wait the host refused did not name the shortage");
-  engine.cancel(321);
-  for (const double end = now + 100; now < end && !idle(engine);)
+  require(executor.requests.contains(1) && !executor.prefillChunks[1] && executor.suspensions == 0 &&
+              events.failedCount == 0,
+          "the lane did not keep waiting in service beside the start");
+  // The start's next decode command stays in flight past the lane's limit.
+  executor.holdDecodeUntil = std::make_shared<std::atomic<bool>>(false);
+  while (!events.failedCount && now < decodedAt + 2 * kResourceWaitTimeoutMilliseconds)
+    static_cast<void>(engine.tick(now += 100));
+  require(events.failures == std::vector<std::string>{"resource_timeout"} && events.failureDetails.back().second &&
+              now <= decodedAt + kResourceWaitTimeoutMilliseconds + 100,
+          "a start admitted beside a lane in service after its refusal extended its wait");
+  require(engine.commandInFlight() && executor.requests.contains(2) && !events.completedCount,
+          "the start's command was not in flight as the wait expired");
+  *executor.holdDecodeUntil = true;
+  engine.cancel(2);
+  for (const double end = now + 1000; now < end && !idle(engine);)
     static_cast<void>(engine.tick(now += 10));
   require(idle(engine) && executor.requests.empty(), "the resource wait leaked a request");
 }
@@ -6249,7 +6264,8 @@ std::span<const test::TestCase> memoryTests() {
       {"testPausedPageShortageKeepsCachedStates", testPausedPageShortageKeepsCachedStates},
       {"testSingletonHostPressureWaitRecoversOrTerminates", testSingletonHostPressureWaitRecoversOrTerminates},
       {"testAdmissionWaitsOutEarlierLanes", testAdmissionWaitsOutEarlierLanes},
-      {"testLaterLanesDoNotExtendAResourceWait", testLaterLanesDoNotExtendAResourceWait},
+      {"testStartsAdmittedBesideALaneInServiceDoNotExtendItsWait",
+       testStartsAdmittedBesideALaneInServiceDoNotExtendItsWait},
       {"testLaneAdmittedBeforeARefusalHoldsTheWaitOpen", testLaneAdmittedBeforeARefusalHoldsTheWaitOpen},
       {"testStartsAdmittedAheadOfARefusedStartHoldItsWaitOpen",
        testStartsAdmittedAheadOfARefusedStartHoldItsWaitOpen},

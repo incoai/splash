@@ -55,6 +55,17 @@ Cache::Cache(KvPool &pool, KvTier *kvTier, std::shared_ptr<model::DiskBudget> di
   // A spillable layout's pages keep every layer (kv::Layout::slimmable).
   if (window_ && (!window_->windowPages || spill_))
     throw std::invalid_argument("a windowed cache keeps a window of pages, and its requests do not spill");
+  // A copy that lands, leaves or turns out another command's changes what
+  // the requests holding its block on their own pages hold of the quota
+  // (Request::heldCopies). A block sits at its depth in each holder's chain;
+  // a request's page and its block's move together (followMoves).
+  if (spill_)
+    kv_.onCopyChanged([this](uint64_t block, uint32_t depth, uint32_t page, bool copied) {
+      for (auto &[_, holder] : requests_)
+        if (depth <= holder.cachedBlocks.size() && holder.cachedBlocks[depth - 1] == block &&
+            holder.pages[depth - 1] == page)
+          copied ? ++holder.heldCopies : --holder.heldCopies;
+    });
 }
 
 CacheAdoption Cache::adopt(std::vector<PersistedKv> blocks, std::vector<PersistedState> states) {
@@ -445,6 +456,8 @@ uint32_t Cache::publishCommittedBlocks(uint64_t requestId,
       active.indexPages += pool_.form(inserted.physicalPage) == kv::PageForm::Index;
       swappedTokens += KvCache::pageTokens;
     }
+    if (spill_)
+      active.heldCopies += holdsCopy(active, logical);
     if (parent)
       kv_.releaseActive(parent);
     // A Spill request's page draws its commitment when it is written, or
@@ -1751,11 +1764,14 @@ uint64_t Cache::spillRoom() const noexcept {
   return limit > active ? limit - active : 0;
 }
 
-bool Cache::commitSpill(uint64_t requestId, uint32_t pages) {
+bool Cache::commitSpill(uint64_t requestId, uint32_t pages, const ChainCopies &copies) {
   Request &active = request(requestId);
   if (active.mode != KvMode::Spill)
     throw std::logic_error("only a Spill request commits quota");
-  return commit(active, pages);
+  if (!commit(active, pages, copies.unheld))
+    return false;
+  active.committedCopies = copies.copied;
+  return true;
 }
 
 bool Cache::convertToSpill(uint64_t requestId, uint32_t pages) {
@@ -1777,16 +1793,44 @@ bool Cache::convertToSpill(uint64_t requestId, uint32_t pages) {
   return true;
 }
 
-uint32_t Cache::copiedBlocks(uint64_t block) const {
-  if (!block)
-    return 0;
-  const KvCache::Chain chain = kv_.chain(block);
-  return static_cast<uint32_t>(std::count_if(chain.blocks.begin(), chain.blocks.end(),
-                                             [&](uint64_t id) { return kv_.kvCopied(id); }));
+bool Cache::takesQuota(uint64_t block) const { return kv_.kvCopied(block) && !kv_.held(block); }
+
+bool Cache::holdsCopy(const Request &active, uint32_t index) const {
+  const uint64_t block = active.cachedBlocks[index];
+  return kv_.page(block) == active.pages[index] && kv_.kvCopied(block);
 }
 
-bool Cache::commit(Request &active, uint32_t pages) {
-  if (pages && !diskBudget_->commit(uint64_t{pages} * tier_->slotBytes(), heldSlotBytes()))
+bool Cache::restoreTakesQuota(std::span<const uint64_t> chain) const {
+  if (!spill_)
+    return false;
+  for (const uint64_t block : chain) {
+    if (!kv_.matchable(block))
+      return false;
+    if (takesQuota(block))
+      return true;
+  }
+  return false;
+}
+
+bool Cache::holdsActiveKvQuota(uint64_t requestId) const {
+  const auto found = requests_.find(requestId);
+  return found != requests_.end() && (found->second.committedPages || found->second.heldCopies);
+}
+
+Cache::ChainCopies Cache::chainCopies(uint64_t block) const {
+  ChainCopies copies{};
+  if (!block)
+    return copies;
+  for (const uint64_t id : kv_.chain(block).blocks) {
+    copies.copied += kv_.kvCopied(id);
+    copies.unheld += takesQuota(id);
+  }
+  return copies;
+}
+
+bool Cache::commit(Request &active, uint32_t pages, uint32_t unheld) {
+  if ((pages || unheld) && !diskBudget_->commit(uint64_t{pages} * tier_->slotBytes(),
+                                    heldSlotBytes() + uint64_t{unheld} * tier_->slotBytes()))
     return false;
   active.committedPages += pages;
   return true;
@@ -2139,6 +2183,12 @@ void Cache::checkInvariants() const {
       }
     }
     committed += active.committedPages;
+    if (spill_) {
+      uint32_t heldCopies = 0;
+      for (uint32_t index = 0; index < active.cachedBlocks.size(); ++index)
+        heldCopies += holdsCopy(active, index);
+      check(heldCopies == active.heldCopies, "a request counts the blocks on its pages with a copy");
+    }
   }
   if (spill_)
     check(committed * tier_->slotBytes() == diskBudget_->committedBytes(),
@@ -2249,11 +2299,21 @@ TokenAdmission Cache::restoreRequest(uint64_t requestId, const CacheLookup &look
   }
   active.pages = std::move(chain.pages);
   active.cachedBlocks = std::move(chain.blocks);
+  if (spill_)
+    for (uint32_t index = 0; index < active.cachedBlocks.size(); ++index)
+      active.heldCopies += holdsCopy(active, index);
   pagesChanged(active, 0);
   // A Spill request's commitment holds a slot for each page without a copy
-  // (copiedBlocks).
-  if (spills)
+  // (chainCopies). A reclaim may have written copies for blocks of the
+  // chain since it committed, as allocate() runs one around this restore:
+  // their pages are written already, and their copies count as held now.
+  if (spills) {
+    const auto copied = static_cast<uint32_t>(
+        std::ranges::count_if(active.cachedBlocks, [&](uint64_t block) { return kv_.kvCopied(block); }));
+    if (copied > active.committedCopies)
+      returnCommitment(active, copied - active.committedCopies);
     oweCopies(active, active.cachedBlocks);
+  }
   if (tier_)
     tier_->submitRestores();
   return {};

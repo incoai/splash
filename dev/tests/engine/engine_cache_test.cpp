@@ -4757,6 +4757,142 @@ void testWriteThroughResumesBesideCopiesThatFillTheRoom() {
   spill.cache.endRequest(2);
 }
 
+// A Spill start commits quota for the pages of the chain it restores that have no copy. A reclaim
+// that writes one of them a copy before the restore holds it, as allocate() runs one around the
+// restore, leaves that page written: the restore returns its page of the commitment, and the copies
+// it holds and its commitment stay within active KV's limit.
+void testACopyWrittenBeforeTheRestoreReturnsItsCommitment() {
+  Spilling spill;
+  const std::vector<uint32_t> prompt = Spilling::prompt(1000, 4);
+  spill.start(1, prompt, 4, KvMode::Resident);
+  spill.publishState(spill.block(1, 3));
+  spill.cache.endRequest(1);
+  // The chain's last two blocks leave RAM for copies; the first two stay,
+  // without copies.
+  for (int step = 0; step < 50 && spill.cache.snapshot().pool.pagesPrefix > 2; ++step) {
+    static_cast<void>(test::evictStep(spill.cache));
+    spill.tier.complete();
+    static_cast<void>(spill.cache.pollTransfers());
+  }
+  CacheLookup lookup = spill.cache.lookup(prompt, {});
+  require(static_cast<bool>(lookup.state), "the chain's state was not found");
+  const uint64_t chainEnd = lookup.state->kvBlock();
+  const Cache::ChainCopies copies = spill.cache.chainCopies(chainEnd);
+  require(copies.copied == 2 && copies.unheld == 2, "the chain did not keep two blocks without copies");
+  // The limit holds exactly the start's commitment beside the copies it
+  // restores.
+  const uint32_t pages = 5 - copies.copied;
+  spill.budget->setActiveLimitBytes(uint64_t{pages + copies.unheld} * 100);
+  spill.cache.beginRequest(5, KvMode::Spill);
+  require(spill.cache.commitSpill(5, pages, copies), "the commitment was refused");
+  static_cast<void>(test::evictStep(spill.cache));
+  require(spill.cache.chainCopies(chainEnd).copied == 3, "the reclaim did not write a block of the chain");
+  require(admitRestore(spill.cache, 5, lookup).granted(), "the restore was refused");
+  const auto withinLimit = [&] {
+    const KvSpillSnapshot snapshot = spill.cache.spillSnapshot();
+    return snapshot.heldBytes == 300 && snapshot.committedBytes == 200 &&
+           snapshot.heldBytes + snapshot.committedBytes <= snapshot.activeLimitBytes;
+  };
+  require(withinLimit(), "the commitment still counted a page whose copy the restore holds");
+  spill.tier.complete();
+  static_cast<void>(spill.cache.pollTransfers());
+  require(withinLimit(), "active KV passed its limit once the restore landed");
+  spill.cache.checkInvariants();
+  lookup = {};
+  spill.cache.endRequest(5);
+  require(spill.budget->committedBytes() == 0, "the commitment was not returned");
+}
+
+// A writer that computes blocks another request is restoring keeps its own pages beside them
+// (KvCache::insert): the copies those blocks are read from are not its to hold, before the restore
+// lands, after it, and after the restorer ends.
+void testAWriterBesideARestoreHoldsNoCopyOfIt() {
+  Spilling spill;
+  const std::vector<uint32_t> prompt = Spilling::prompt(1000, 4);
+  spill.start(1, prompt, 4);
+  require(spill.cache.writeThrough() == 4, "the pages were not written through");
+  spill.tier.complete();
+  require(spill.cache.pollTransfers(), "the writes did not land");
+  spill.publishState(spill.block(1, 3));
+  spill.cache.endRequest(1);
+  spill.toDisk();
+  // The restorer's restore stays in flight.
+  spill.cache.beginRequest(2, KvMode::Resident);
+  CacheLookup lookup = spill.cache.lookup(prompt, {});
+  require(static_cast<bool>(lookup.state) && admitRestore(spill.cache, 2, lookup).granted() &&
+              spill.cache.holdsActiveKvQuota(2),
+          "the restorer did not hold the chain's copies");
+  // The writer computes the chain again beside it.
+  spill.cache.beginRequest(3, KvMode::Resident);
+  spill.grow(3, prompt, 4);
+  require(spill.cache.blockAt(3, 4 * KvCache::pageTokens) == spill.cache.blockAt(2, 4 * KvCache::pageTokens) &&
+              !spill.cache.holdsActiveKvQuota(3),
+          "a writer beside a restore held the copies it is restored from");
+  spill.cache.checkInvariants();
+  spill.tier.complete();
+  require(spill.cache.pollTransfers() && !spill.cache.holdsActiveKvQuota(3),
+          "a writer beside a restore held its copies once it landed");
+  spill.cache.checkInvariants();
+  lookup = {};
+  spill.cache.endRequest(2);
+  require(!spill.cache.holdsActiveKvQuota(3), "a writer held the copies once their restorer ended");
+  spill.cache.checkInvariants();
+  spill.cache.endRequest(3);
+}
+
+// A Spill start's commitment leaves room for the copies no request holds on the chain it restores,
+// which it holds once it does: a commitment past what the limit leaves beside them is refused, a
+// commitment of no page too when the limit cannot hold the copies alone.
+void testACommitmentLeavesRoomForTheCopiesItsRestoreHolds() {
+  Spilling spill;
+  const std::vector<uint32_t> prompt = Spilling::prompt(1000, 4);
+  spill.start(1, prompt, 4);
+  require(spill.cache.writeThrough() == 4, "the pages were not written through");
+  spill.tier.complete();
+  require(spill.cache.pollTransfers(), "the writes did not land");
+  spill.publishState(spill.block(1, 3));
+  spill.cache.endRequest(1);
+  const CacheLookup lookup = spill.cache.lookup(prompt, {});
+  require(static_cast<bool>(lookup.state), "the chain's state was not found");
+  const Cache::ChainCopies copies = spill.cache.chainCopies(lookup.state->kvBlock());
+  require(copies.unheld >= 2 && spill.cache.spillSnapshot().heldBytes == 0, "the chain kept no copies unheld");
+  spill.budget->setActiveLimitBytes(uint64_t{copies.unheld + 2} * 100);
+  spill.cache.beginRequest(5, KvMode::Spill);
+  require(!spill.cache.commitSpill(5, 3, copies) && spill.budget->committedBytes() == 0,
+          "a commitment took the room of the copies its restore holds");
+  require(spill.cache.commitSpill(5, 2, copies) && spill.budget->committedBytes() == 200,
+          "a commitment that fits beside the copies was refused");
+  spill.cache.endRequest(5);
+  spill.budget->setActiveLimitBytes(uint64_t{copies.unheld - 1} * 100);
+  spill.cache.beginRequest(6, KvMode::Spill);
+  require(!spill.cache.commitSpill(6, 0, copies) && spill.cache.commitSpill(6, 0),
+          "a commitment of no page held copies the limit cannot hold");
+  spill.cache.endRequest(6);
+}
+
+// A start's probe may hold a chain whose first block's read failed since: nothing past that block
+// matches any more, and the copies past it take no quota for the start, as a refreshed probe finds.
+void testARestoreReadsAChainOnlyAsFarAsItMatches() {
+  Spilling spill;
+  const std::vector<uint32_t> prompt = Spilling::prompt(1000, 4);
+  spill.start(1, prompt, 4);
+  require(spill.cache.writeThrough() == 4, "the pages were not written through");
+  spill.tier.complete();
+  require(spill.cache.pollTransfers(), "the writes did not land");
+  spill.publishState(spill.block(1, 3));
+  spill.cache.endRequest(1);
+  const CacheProbe probe = spill.cache.probe(prompt, {});
+  const std::vector<uint64_t> chain(probe.restoredChain().begin(), probe.restoredChain().end());
+  require(chain.size() == 4 && spill.cache.restoreTakesQuota(chain), "the chain's copies took no quota");
+  // A lookup keeps the chain in the graph while its first block's read
+  // fails.
+  CacheLookup lookup = spill.cache.lookup(prompt, {});
+  spill.cache.poisonCopy(chain.front());
+  require(spill.cache.chainCopies(chain.back()).unheld == 3 && !spill.cache.restoreTakesQuota(chain),
+          "a start's chain took quota for copies past a block that no longer matches");
+  lookup = {};
+}
+
 // A failed write-through recommits its slot and owes the copy again; pages past it spill once it
 // lands.
 void testFailedWritesKeepTheirCommitment() {
@@ -4935,7 +5071,7 @@ void testRecomputedBlocksSpillToCopiesOfTheirPages() {
   spill.start(2, prompt, 6, KvMode::Resident);
   const uint64_t chainEnd = spill.block(2, 5);
   require(spill.tier.writes.size() == written && spill.cache.snapshot().kvTier.diskBlocks == 6 &&
-              !spill.cache.copiedBlocks(chainEnd),
+              !spill.cache.chainCopies(chainEnd).copied,
           "a Resident request that computed a chain again wrote it, gave its copies up, or took them "
           "for copies of its pages");
   spill.cache.endRequest(2);
@@ -4947,7 +5083,7 @@ void testRecomputedBlocksSpillToCopiesOfTheirPages() {
   static_cast<void>(spill.cache.pollTransfers());
   require(spill.cache.spillWritten(SpilledExtents::KeepRunway).granted() &&
               spill.spilled(3) == std::vector<bool>{false, true, true, true, true, false, false} &&
-              spill.cache.copiedBlocks(chainEnd) == 6 && spill.cache.spillSnapshot().rewrites == 6 &&
+              spill.cache.chainCopies(chainEnd).copied == 6 && spill.cache.spillSnapshot().rewrites == 6 &&
               spill.cache.snapshot().kvTier.diskBlocks == 6,
           "the pages did not spill to the copies that replaced the old ones");
   spill.cache.checkInvariants();
@@ -6480,6 +6616,10 @@ int main() {
     testCommittedPagesTakeTheSpilledChainOfAStateInRam();
     testUnreadableCopyLeavesBeforeTheCommandThatReadIt();
     testCommitmentsLockQuotaUntilWritten();
+    testACopyWrittenBeforeTheRestoreReturnsItsCommitment();
+    testAWriterBesideARestoreHoldsNoCopyOfIt();
+    testACommitmentLeavesRoomForTheCopiesItsRestoreHolds();
+    testARestoreReadsAChainOnlyAsFarAsItMatches();
     testWriteThroughResumesBesideCopiesThatFillTheRoom();
     testFailedWritesKeepTheirCommitment();
     testPagesPastTheCommitmentCommitTheirSlots();
