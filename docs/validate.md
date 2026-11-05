@@ -15,13 +15,14 @@ tests under shader validation, and the Linear pipeline resource check without
 it, then `test-sanitizers-metal`. They include loading small synthetic MLX,
 GGUF and vision sources and the GGUF kernels on synthetic tensors. `make
 check-native-build` builds every native test, benchmark and tool and runs
-none. Hosted CI runs the CPU checks, `check-native-build`, the sanitizers and
-`check-app`. `make test-sanitizers` runs the CPU tests that start threads,
-the control plane's (`engine`, `native-engine-loop`, the cache, protocol and
-transport tests) among them, under AddressSanitizer with UndefinedBehavior
-and under ThreadSanitizer. `make test-sanitizers-metal` runs the Metal tests
-of the backend (`metal-backend`'s `behaviour` tests: its host-step runner
-shares each command's steps with the thread that encodes it) and of the
+none. Hosted CI runs the CPU checks, `check-native-build` and `check-app` in
+one job and `test-sanitizers` in another beside it. `make test-sanitizers`
+runs the CPU tests that start threads, the control plane's (`engine`,
+`native-engine-loop`, the cache, protocol and transport tests) among them,
+under AddressSanitizer with UndefinedBehavior and under ThreadSanitizer.
+`make test-sanitizers-metal` runs the Metal tests of the backend
+(`metal-backend`'s `behaviour` tests: its host-step runner shares each
+command's steps with the thread that encodes it) and of the
 components whose host steps share their state with the engine thread and the
 SSD readers (the hot block cache of spilled KV, the history stream and the
 expert store) under ThreadSanitizer, built with it in `build/metal-tsan`;
