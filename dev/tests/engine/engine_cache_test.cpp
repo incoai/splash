@@ -2880,6 +2880,26 @@ void testDemotionKeepsThePageUnderANewState() {
           "the prefix under the new state is not resident");
 }
 
+// A state in RAM sits on resident KV, which the counts of what a reclaim frees take for granted
+// (KvCache::pageReach): the cache's invariants reject a RAM copy on a block whose page has gone
+// to the SSD.
+void testAStateInRamSitsOnAPage() {
+  test::TestKvTier tier;
+  CacheFixture fixture(&tier);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control), false);
+  require(test::evictStep(fixture.cache).gave() && fixture.cache.pollTransfers(), "state was not demoted");
+  require(test::evictStep(fixture.cache).gave() && tier.demotions == 1, "the leaf's demotion did not start");
+  tier.complete();
+  require(fixture.cache.pollTransfers() && !fixture.cache.residentChainPages({&fixture.blocks[3], 1}),
+          "the leaf did not leave for the SSD");
+  fixture.cache.checkInvariants();
+  fixture.publish(3);
+  rejects([&] { fixture.cache.checkInvariants(); }, "a state in RAM sits on a block with a page",
+          "a state in RAM on a block without a page passed the cache's invariants");
+}
+
 // A state published in RAM on a block another request was restoring keeps its page when that
 // restorer is cancelled.
 void testCancelledRestoreKeepsThePageUnderANewState() {
@@ -6626,6 +6646,7 @@ int main() {
     testLookupKeepsADiskChainsResidentBoundaryWarm();
     testRestoreKeepsTheBlockItExtends();
     testDemotionKeepsThePageUnderANewState();
+    testAStateInRamSitsOnAPage();
     testCancelledRestoreKeepsThePageUnderANewState();
     testBusyTierPreservesDiskVictim();
     testCancelledRestoreStopsQueuedReads();

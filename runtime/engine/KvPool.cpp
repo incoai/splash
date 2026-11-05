@@ -192,6 +192,12 @@ KvPageMoveResult KvPool::movePages(std::span<const uint32_t> pages, kv::PageForm
   return {std::move(moves)};
 }
 
+void KvPool::observeActivity(std::function<void(uint32_t page)> observer) {
+  if (observer && activity_)
+    throw std::logic_error("KV pool page activity already has its observer");
+  activity_ = std::move(observer);
+}
+
 bool KvPool::pageActive(uint32_t page) const {
   return pages_.at(page).activeReferences != 0;
 }

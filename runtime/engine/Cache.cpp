@@ -2192,6 +2192,9 @@ void Cache::checkInvariants() const {
   const uint64_t point = states_.resumePoint();
   kv_.checkInvariants([this](uint64_t block) { return states_.onDisk(block); },
                       [&](uint64_t block) {
+                        // A state in RAM sits on resident KV (KvCache::pageReach).
+                        check(!states_.stateResident(block) || kv_.page(block) != KvCache::noPage,
+                              "a state in RAM sits on a block with a page");
                         const auto [keeps, needed, candidate] = states_.keeps(block);
                         const auto chains = wanted.find(block);
                         return KvCache::Marks{.stateKeeps = keeps,

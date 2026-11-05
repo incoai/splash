@@ -234,6 +234,11 @@ void testInputValidation() {
       "KV cache parent block is unknown",
       "nonresident parent was accepted");
   pool.releasePage(acquired.pages[0], false);
+  // The pool tells one cache of its pages' activity: a second cache on it
+  // would leave the first's counts behind.
+  CacheRecency otherRecency;
+  rejects([&] { KvCache second(pool, otherRecency); }, "already has its observer",
+          "a second KV cache on one pool was accepted");
 }
 
 void testCandidateOrderThroughChurn() {
@@ -979,8 +984,11 @@ void testSlimBlocksKeepWhatTheirCopiesHold() {
   cache.unholdPage(writer.pages[0]);
   cache.checkInvariants();
 
+  // Taken back after a restart, into a pool of its own.
+  test::TestKvStorage nextStorage(16, 100, 4, 0, 30);
+  KvPool nextPool(nextStorage, 4);
   CacheRecency later;
-  KvCache next(pool, later);
+  KvCache next(nextPool, later);
   require(next.adoptDiskBlock(40, 0, page(94), {}, std::make_shared<FakeSlot>(), 1, kv::PageForm::Slim) &&
               next.copyForm(40) == kv::PageForm::Slim,
           "a block taken back lost the form its copy holds");

@@ -1420,7 +1420,9 @@ private:
   [[nodiscard]] bool windowsPassed(uint32_t page, uint32_t index) const;
   // The pages of the cached blocks every window has passed, whose windowed
   // layers trimming takes, oldest first, the `most` oldest (trimWindows); and
-  // their count, which costs the requests' windows rather than the cache.
+  // their count, the trim candidates but those a window reads: it scans each
+  // running request's pages from its window's start (windowStart) to its
+  // last, a cost the running requests bound, not the cache.
   [[nodiscard]] std::vector<uint32_t> trimmablePages(size_t most) const;
   [[nodiscard]] uint32_t trimmableCount() const;
   // The Full pages trimWindows(false) moves to the Slim form as many free

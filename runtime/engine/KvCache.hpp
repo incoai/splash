@@ -252,7 +252,9 @@ public:
   // whether it needs the KV as it is: every state but a RAM copy a reclaim
   // may take without a disk copy, which leaves through a write (that makes
   // its chain needed) or with no copy; and whether it is a RAM copy a
-  // reclaim may take (StateCache::candidate). Without a state, none.
+  // reclaim may take (StateCache::candidate). Without a state, none. A RAM
+  // copy sits on a block with a page (Cache::checkInvariants), so a Writer
+  // or UsedWriter names a resident block.
   void setStateKeeps(uint64_t blockId, Keeps keeps, bool needed, bool candidate) noexcept;
   // The reasons at the block or below it: its page frees now for a walk
   // none of whose reasons they hold.
@@ -265,15 +267,16 @@ public:
   // Of each form, what a reclaim's walk that leaves the pages `mask` names
   // in place reaches: the resident pages that free now, none of `mask`'s
   // reasons at their block or below it (now); those that free too once the
-  // state at `written` (a Writer or UsedWriter; 0 for none) has left RAM
-  // through its write and needs its chain as a state on disk does
-  // (written). The chains of the states `kept`, each block and the blocks
-  // above it, free neither now nor once written. Every page a reclaim of
-  // the walk reaches at all, now or once the writes land (reachable): no
-  // Busy at it or below it, nor for an idle page (no write drains it) a
-  // chain reason `mask` names or a chain of `kept`, since a page a write
-  // drains frees as it lands, kept or not; and none above a write in
-  // `unwaited`, which no reclaim waits for.
+  // state at `written` (a Writer or UsedWriter, on a block with a page as
+  // every RAM copy is; 0 for none) has left RAM through its write and needs
+  // its chain as a state on disk does (written), up from it to the first
+  // block without a page. The chains of the states `kept`, each block and
+  // the blocks above it, free neither now nor once written. Every page a
+  // reclaim of the walk reaches at all, now or once the writes land
+  // (reachable): no Busy at it or below it, nor for an idle page (no write
+  // drains it) a chain reason `mask` names or a chain of `kept`, since a
+  // page a write drains frees as it lands, kept or not; and none above a
+  // write in `unwaited`, which no reclaim waits for.
   // The RAM copies a reclaim may take at the blocks that free now
   // (candidates). The cache keeps the counts by reason as blocks, states
   // and transfers change, so a reach costs the chains of `kept`, `unwaited`

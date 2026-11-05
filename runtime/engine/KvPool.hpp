@@ -166,8 +166,10 @@ public:
   // The one observer of pageActive: told of a page as a request's first
   // reference to it arrives or its last leaves, or as its references move
   // with its content (movePages, compactExtent), so that whoever keeps
-  // counts of what the pages hold follows them (KvCache). Null for none.
-  void observeActivity(std::function<void(uint32_t page)> observer) noexcept { activity_ = std::move(observer); }
+  // counts of what the pages hold follows them (KvCache). Null for none;
+  // std::logic_error for a second observer while one is set, whose counts
+  // would stop following.
+  void observeActivity(std::function<void(uint32_t page)> observer);
   // Between commands: gives each page, of another form, a page of form `to`
   // that takes what both hold (ExtentStorage::copyPages) and its references,
   // as compactExtent() moves them, and frees it; all of them or none. The
