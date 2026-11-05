@@ -88,22 +88,33 @@ SPLIT_NAME = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 
 
 def model_of(name):
-    """The model a GGUF file holds, by which a repository root's files group
-    into targets: its name without .gguf and, for a split GGUF's part, without
+    """The model a GGUF file holds, by which :VARIANT names a target: its
+    name without .gguf and, for a split GGUF's part, without
     -0000K-of-0000N."""
     match = SPLIT_NAME.search(name)
     return name[: match.start()] if match else name.removesuffix(".gguf")
 
 
+def target_of(name):
+    """The target a GGUF file is one of, by which a repository root's files
+    group into targets, remote and local alike: its model (model_of), and
+    whether it is a split GGUF's part. A whole file is a target of its own,
+    apart from any split parts of its model, such as the file they merge
+    into."""
+    return model_of(name), SPLIT_NAME.search(name) is not None
+
+
 def root_targets(files):
-    """The GGUF targets at a repository's root, model name (model_of) -> its
-    files in name order, which is a whole split GGUF's split order: one file,
-    or the parts of a split GGUF. Vision projectors are never targets."""
+    """The GGUF targets at a repository's root (target_of), each its model
+    name and its files in name order, which is a whole split GGUF's split
+    order: one file, or the parts of a split GGUF. They are in name order, a
+    whole file before the split GGUF of its name. Vision projectors are never
+    targets."""
     targets = {}
     for name in root_ggufs(files):
         if not projector_named(name):
-            targets.setdefault(model_of(name), []).append(name)
-    return targets
+            targets.setdefault(target_of(name), []).append(name)
+    return [(model, names) for (model, _), names in sorted(targets.items())]
 
 
 def target_files(names):
@@ -122,34 +133,45 @@ def select_gguf(files, variant):
     ending from several, which the caller reports. :VARIANT names the target
     whose name is the model name all of them share, then -VARIANT (X-Q4_K_M
     for Q4_K_M, not X-UD-Q4_K_M); failing that, the only target whose name
-    ends in -VARIANT. A repository of one target names no variant apart from
-    its model, so its one match needs no report. Without :VARIANT, the only
-    target. Anything else is an error listing the targets."""
+    ends in -VARIANT. A whole file and a split GGUF of one name hold one
+    model, as a merge and its parts do, and the name takes the whole file. A
+    repository of one target names no variant apart from its model, so its
+    one match needs no report. Without :VARIANT, the only target. Anything
+    else is an error listing the targets."""
     targets = root_targets(files)
     if variant is None:
         if len(targets) == 1:
-            [names] = targets.values()
+            [(_, names)] = targets
             return target_files(names), False
         choice = "select a GGUF with OWNER/REPO:VARIANT"
     else:
-        words = [model.split("-") for model in targets]
+        words = [model.split("-") for model, _ in targets]
         shared = len(os.path.commonprefix(words))
         exact = [
-            model
-            for model, own in zip(targets, words, strict=True)
+            target
+            for target, own in zip(targets, words, strict=True)
             if "-".join(own[shared:]).lower() == variant.lower()
         ]
-        if len(exact) == 1:
-            return target_files(targets[exact[0]]), False
+        if names := _named(exact):
+            return target_files(names), False
         suffix = "-" + variant.lower()
-        ending = [model for model in targets if model.lower().endswith(suffix)]
-        if len(ending) == 1:
-            return target_files(targets[ending[0]]), len(targets) > 1
+        ending = [t for t in targets if t[0].lower().endswith(suffix)]
+        if names := _named(ending):
+            return target_files(names), len(targets) > 1
         choice = "no single GGUF matches :" + variant
         if split := split_gguf(files, variant):
             return split, False
-    listed = ", ".join(targets) or "none"
+    listed = ", ".join(model for model, _ in targets) or "none"
     raise models.ModelError(f"{choice} (GGUF targets in the repository root: {listed})")
+
+
+def _named(matches):
+    """The files of the target :VARIANT names among matches, root targets
+    (root_targets) of the names it matches: the first, a whole file before
+    the split GGUF of its name, when they share one name; else None."""
+    if len({model for model, _ in matches}) == 1:
+        return matches[0][1]
+    return None
 
 
 def split_gguf(files, variant):

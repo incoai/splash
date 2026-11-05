@@ -141,6 +141,12 @@ class CachedTest(unittest.TestCase):
                             variant,
                         )[0],
                     )
+        # The parts' merge beside them takes the ID both are named by.
+        merged = root_split | {"m-Q2_0.gguf"}
+        self.assertEqual(
+            cached.candidates("owner/m-GGUF", merged, {}), ["owner/m-GGUF:Q2_0"]
+        )
+        self.assertEqual(upstream.select_gguf(merged, "Q2_0")[0], ["m-Q2_0.gguf"])
         # A suggested repository's cached files take its suggested IDs, and
         # the others their own.
         self.assertEqual(

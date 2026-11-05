@@ -309,6 +309,20 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(
             upstream.select_gguf(incomplete | {whole}, "Q4_K_M"), ([whole], False)
         )
+        # A whole file of the model beside its parts, such as their merge, is
+        # a target of its own, which its name selects before the parts.
+        merge = "Model-Q1_0.gguf"
+        for repository, expected in (
+            (files | {merge}, ([merge], True)),
+            (files | {merge, whole}, ([merge], False)),
+        ):
+            with self.subTest(files=sorted(repository)):
+                self.assertEqual(upstream.select_gguf(repository, "Q1_0"), expected)
+        with self.assertRaisesRegex(
+            models.ModelError,
+            r"\(GGUF targets in the repository root: Model-Q1_0, Model-Q1_0\)",
+        ):
+            upstream.select_gguf(files | {merge}, None)
 
     def test_architecture_is_checked_before_weight_downloads(self):
         # Another architecture, and fine-tunes of a supported one the engine

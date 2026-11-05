@@ -194,27 +194,26 @@ def _gguf_in(files):
             "GGUF file but vision projectors (named mmproj)"
         )
     if len(targets) > 1:
+        listed = ", ".join(model for model, _ in targets)
         raise ModelError(
-            f"it holds several GGUF targets ({', '.join(targets)}); pass the "
-            "target's file"
+            f"it holds several GGUF targets ({listed}); pass the target's file"
         )
-    [names] = targets.values()
+    [(_, names)] = targets
     return upstream.target_files(names)
 
 
 def _split_parts(target):
     """The files of the GGUF target, in split order: target alone, or every
-    part of the split GGUF it is one part of, beside it; a whole file of the
-    same model beside them, such as their merge, is no part."""
-    if not upstream.SPLIT_NAME.search(target.name):
+    part of the split GGUF it is one part of, beside it (upstream.target_of);
+    a whole file of the same model beside them, such as their merge, is a
+    target of its own."""
+    model, split = upstream.target_of(target.name)
+    if not split:
         return [target.name]
-    model = upstream.model_of(target.name)
     parts = [
         path.name
         for path in target.parent.iterdir()
-        if path.is_file()
-        and upstream.SPLIT_NAME.search(path.name)
-        and upstream.model_of(path.name) == model
+        if path.is_file() and upstream.target_of(path.name) == (model, True)
     ]
     return upstream.split_order(parts, f"the split GGUF {model} in {target.parent}")
 

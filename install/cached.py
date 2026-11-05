@@ -71,7 +71,7 @@ def candidates(name, files, suggested_models):
             targets.append((f"{name}:{folder}", upstream.split_gguf(files, folder)))
         except models.ModelError:
             pass  # not a whole split GGUF
-    for stem, parts in upstream.root_targets(files).items():
+    for stem, parts in upstream.root_targets(files):
         words = stem.split("-")
         shared = os.path.commonprefix([[w.lower() for w in words], model])
         variant = "-".join(words[max(len(shared), 1) :])

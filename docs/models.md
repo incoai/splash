@@ -140,14 +140,17 @@ an FP8 weight's F32 or BF16 `.weight_scale` is the tensor's `g` or, `[rows,
 ## GGUF targets
 
 `--model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` selects the repository's
-root-level `.gguf` file (a lower-case extension, as the native loader requires)
-for that variant: the file named with the model name its GGUFs share, then
-`-UD-Q4_K_M`, or else the only one whose name ends in `-UD-Q4_K_M`
-(`upstream.select_gguf`). Before any weight download, the engine's check
-plans the target from its header, which must list every tensor the loader
-reads, of its shape and of a type it accepts for that tensor; one error names
-each missing or unsupported tensor once, with the layers that have it
-(`ffn_gate_exps.weight (Q8_1) in 40 layers`). The types it accepts:
+root-level GGUF target for that variant, a `.gguf` file (a lower-case
+extension, as the native loader requires) or the parts of a split GGUF named
+by their model (`MODEL-00001-of-0000N.gguf ...`, `upstream.root_targets`): the
+target named with the model name its GGUFs share, then `-UD-Q4_K_M`, or else
+the only one whose name ends in `-UD-Q4_K_M` (`upstream.select_gguf`). A whole
+file beside split parts of its name, such as their merge, is a target of its
+own, which the name selects before the parts. Before any weight download, the
+engine's check plans the target from its header, which must list every tensor
+the loader reads, of its shape and of a type it accepts for that tensor; one
+error names each missing or unsupported tensor once, with the layers that
+have it (`ffn_gate_exps.weight (Q8_1) in 40 layers`). The types it accepts:
 
 - linears and experts: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1,
   Q5_0, Q5_1, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,
