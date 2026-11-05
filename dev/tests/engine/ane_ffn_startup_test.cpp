@@ -514,7 +514,8 @@ void testFailures() {
 // on it as on any Metal command of its steps (RuntimeResources::create): the start reports CommandMemory, which no
 // start retries, as for a warmup's command. Another process holds what the commands need, and a retry, in the
 // process or the server's relaunch, would take it from that process. So does a command of the load, the expert
-// store's fill. A command that failed otherwise fails its step as before.
+// store's fill. A command that failed otherwise is Internal at any step: the load's too, whose files the loader took
+// (it was Model, which the server never relaunches after). A load the loader refused is still Model.
 void testACommandOutOfMemoryIsCommandMemory() {
   using FailureKind = protocol::StartFailureKind;
   for (const bool setup : {false, true}) {
@@ -558,10 +559,15 @@ void testACommandOutOfMemoryIsCommandMemory() {
         RuntimeBootstrapError(RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                                     metal::MetalBackendError("Metal command 1 failed", outOfMemory)))
             .report();
-    require(startFailedEvent(report).kind == (outOfMemory ? FailureKind::CommandMemory : FailureKind::Model),
+    require(startFailedEvent(report).kind == (outOfMemory ? FailureKind::CommandMemory : FailureKind::Internal),
             std::string("a load whose command failed ") + (outOfMemory ? "for want of GPU memory" : "otherwise") +
                 " was not classed by it");
   }
+  const RuntimeBootstrapReport refused =
+      RuntimeBootstrapError(RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
+                                                  "the target's safetensors header is truncated"))
+          .report();
+  require(startFailedEvent(refused).kind == FailureKind::Model, "a load the loader refused was not Model");
 }
 
 // No share predicted to gain enough, or no chunk timed to, leaves the GPU alone and remembers that none does.

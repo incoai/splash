@@ -587,6 +587,7 @@ RuntimeResourcesError::RuntimeResourcesError(RuntimeResourceStage stage,
                                              const metal::MetalBackendError &error,
                                              std::string budgetDescription)
     : RuntimeResourcesError(stage, error.what(), std::move(budgetDescription)) {
+  commandFailed_ = true;
   commandOutOfMemory_ = error.outOfMemory();
 }
 

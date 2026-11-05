@@ -35,6 +35,7 @@ reportForResourceFailure(const RuntimeResourcesError &error) {
   report.message = error.what();
   report.budgetDescription = error.budgetDescription();
   report.shortfall = error.shortfall();
+  report.commandFailed = error.commandFailed();
   report.commandOutOfMemory = error.commandOutOfMemory();
   return report;
 }
@@ -134,8 +135,11 @@ protocol::ReadyEvent readyEventFor(const model::ModelDescriptor &model,
 protocol::StartFailedEvent startFailedEvent(const RuntimeBootstrapReport &report) {
   using Kind = protocol::StartFailureKind;
   Kind kind = Kind::Internal;
-  if (report.commandOutOfMemory)
-    kind = Kind::CommandMemory;
+  // A command that failed classes the start whatever its stage:
+  // CommandMemory for want of GPU memory, else Internal. Neither the model's
+  // files, a setting nor the budget refused it.
+  if (report.commandFailed)
+    kind = report.commandOutOfMemory ? Kind::CommandMemory : Kind::Internal;
   else if (report.shortfall)
     // A context refusal names the context its plan holds, at least one token.
     kind = report.shortfall->planContextTokens ? Kind::ContextBudget : Kind::MemoryBudget;
@@ -253,6 +257,7 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
            std::string(runtimeBootstrapStageName(stage)) +
                " threw: " + error.what());
     } catch (const metal::MetalBackendError &error) {
+      report.commandFailed = true;
       report.commandOutOfMemory = error.outOfMemory();
       fail(report, stage,
            std::string(runtimeBootstrapStageName(stage)) +

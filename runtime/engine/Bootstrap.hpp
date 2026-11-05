@@ -45,9 +45,10 @@ struct RuntimeBootstrapReport {
     // What a start refused for want of memory or context needed against what
     // it had: RuntimeResourcesError::shortfall, or the --max-context check.
     std::optional<protocol::StartShortfall> shortfall;
-    // A command of the start failed for want of GPU memory
-    // (metal::MetalBackendError::outOfMemory): a warmup's, or one of
-    // resource assembly (RuntimeResourcesError::commandOutOfMemory).
+    // A command of the start failed: a warmup's, or one of resource assembly
+    // (RuntimeResourcesError::commandFailed); and whether for want of GPU
+    // memory (metal::MetalBackendError::outOfMemory).
+    bool commandFailed = false;
     bool commandOutOfMemory = false;
 
     [[nodiscard]] std::string describe() const;

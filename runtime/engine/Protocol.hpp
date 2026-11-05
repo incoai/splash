@@ -369,7 +369,8 @@ struct StatusJsonEvent {
 // Why a start failed, for the supervisor's restart decision and the app's
 // words (server/protocol.py StartFailureKind).
 enum class StartFailureKind : uint8_t {
-  // A defect, or a failure the engine does not class.
+  // A defect, a start command that failed but not for want of GPU memory,
+  // or a failure the engine does not class.
   Internal = 0,
   // The host had too little free memory (RuntimeResourceFailure::HostCapacity).
   HostMemory = 1,
@@ -381,7 +382,8 @@ enum class StartFailureKind : uint8_t {
   ContextBudget = 4,
   // A setting the engine refuses.
   Configuration = 5,
-  // The model's files.
+  // The model's files, which the start cannot serve: a model root without
+  // them, or files the loader refuses.
   Model = 6,
   // This Mac cannot run Splash.
   Device = 7,

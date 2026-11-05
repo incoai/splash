@@ -233,10 +233,12 @@ public:
   shortfall() const noexcept {
     return shortfall_;
   }
-  // A Metal command of the step failed for want of GPU memory
-  // (metal::MetalBackendError::outOfMemory), as before any warmup the
-  // Neural Engine split's setup and calibration or the expert store's fill
-  // may: the start fails as CommandMemory, which it never retries.
+  // A Metal command of the step failed, as before any warmup the Neural
+  // Engine split's setup and calibration or the expert store's fill may: the
+  // start fails as Internal, whatever the step, or as CommandMemory, which it
+  // never retries, where the command failed for want of GPU memory
+  // (metal::MetalBackendError::outOfMemory).
+  [[nodiscard]] bool commandFailed() const noexcept { return commandFailed_; }
   [[nodiscard]] bool commandOutOfMemory() const noexcept { return commandOutOfMemory_; }
 
 private:
@@ -244,6 +246,7 @@ private:
   RuntimeResourceFailure failure_;
   std::string budgetDescription_;
   std::optional<protocol::StartShortfall> shortfall_;
+  bool commandFailed_ = false;
   bool commandOutOfMemory_ = false;
 };
 
