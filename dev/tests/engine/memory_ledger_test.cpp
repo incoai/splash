@@ -744,6 +744,22 @@ void testStateBuffersCountBeyondThoseThePoolKeeps() {
           "free() did not count the bytes of the state buffers the model's pool releases");
 }
 
+// A Floor claim is a host rule only: asking the ledger to take or count
+// units for one is a caller's error, not an empty take.
+void testAFloorClaimTakesNothing() {
+  MemoryLedger ledger;
+  TestSource cache("cache");
+  cache.units = {unit(1, kMiB)};
+  ledger.addSource(cache);
+  const ClaimSpec floor{.cls = ClaimClass::Floor};
+  test::rejects([&] { static_cast<void>(ledger.available(floor, {.bytes = kMiB}, 0, false)); },
+                "a Floor claim takes nothing", "available() counted units for a Floor claim");
+  const ClaimId claim = ledger.open(floor);
+  test::rejects([&] { static_cast<void>(ledger.free(claim, {.bytes = kMiB}, 0, false)); },
+                "a Floor claim takes nothing", "free() took units for a Floor claim");
+  require(cache.taken.empty(), "a Floor claim took a unit");
+}
+
 // What each claim class may take, from units of distinct sizes: the take table of free now, certain reuse,
 // conversion, pass command, pools and units in use.
 void testClassBoundsEligibility() {
@@ -772,7 +788,6 @@ void testClassBoundsEligibility() {
   };
   // 1 Ordinary, 2 InUse, 4 certain reuse, 8 a conversion, 16 the pass
   // command, 32 a pool unit, 64 a unit that costs only its rebuild.
-  require(counted({.cls = ClaimClass::Floor}) == 1 + 4, "the floor took more than Ordinary units");
   require(counted({.cls = ClaimClass::InService}) == 1 + 4 + 32 + 64, "in-service work took the wrong units");
   require(counted({.cls = ClaimClass::InService, .kvGrowth = true}) == 1 + 4 + 8 + 32 + 64,
           "a lane's KV growth did not take its conversion");
@@ -784,7 +799,7 @@ void testClassBoundsEligibility() {
   require(counted({.cls = ClaimClass::Start, .supersedes = true}) == 1 + 4 + 64,
           "a start took other than Ordinary units and those that cost only their rebuild");
   // Certain reuse here is the resume point: the walk keeps queued chains
-  // from a start, optional work and the floor (Cache::walkFor).
+  // from a start and optional work (Cache::walkFor).
   require(counted({.cls = ClaimClass::Optional, .reach = ReclaimClass::InUse, .supersedes = true}) == 1 + 4 + 64,
           "optional work converted, took InUse, the pass command or the store, or not the resume point");
   require(counted({.cls = ClaimClass::InService,
@@ -2080,6 +2095,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testUnitsKeyedByTheirPlaceAreTakenAsChosen", testUnitsKeyedByTheirPlaceAreTakenAsChosen},
       {"testStateBuffersCountBeyondThoseThePoolKeeps", testStateBuffersCountBeyondThoseThePoolKeeps},
       {"testClassBoundsEligibility", testClassBoundsEligibility},
+      {"testAFloorClaimTakesNothing", testAFloorClaimTakesNothing},
       {"testAHostRefusedNeedTakesOnlyWhatFreesNow", testAHostRefusedNeedTakesOnlyWhatFreesNow},
       {"testRoomHeldForHigherRanksMakesAWait", testRoomHeldForHigherRanksMakesAWait},
       {"testUnitsHeldForHigherRanksMakeAWait", testUnitsHeldForHigherRanksMakeAWait},

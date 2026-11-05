@@ -658,8 +658,8 @@ public:
   // claim that reaches InUse, states in use and the KV they restore through.
   // The units of certain reuse, the resume point and the wanted chains, stay
   // in their place, marked, for the classes that may take them (walkFor):
-  // in-service work and the host at critical pressure take both; a start,
-  // optional work and the floor the resume point only; growth and the host
+  // in-service work and the host at critical pressure take both; a start
+  // and optional work the resume point only; growth and the host
   // short of critical pressure neither. What is in use comes only to
   // in-service work that reaches it and to the host at critical pressure.
   //

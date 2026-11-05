@@ -384,9 +384,8 @@ std::array<uint32_t, 3> MemoryGovernor::heldPages(ClaimId claim) const {
 }
 
 FreeResult MemoryGovernor::free(ClaimId claim, const Need &need) {
-  const ClaimClass cls = hostClass(ledger_.claim(claim).spec);
   return ledger_.free(claim, need, roomBytes(), hostRule_.level() == MemoryPressure::Critical,
-                      cls == ClaimClass::Floor || cls == ClaimClass::InService);
+                      hostClass(ledger_.claim(claim).spec) == ClaimClass::InService);
 }
 
 uint64_t MemoryGovernor::available(const ClaimSpec &spec, const Need &need, const RestoredChains *kept) const {

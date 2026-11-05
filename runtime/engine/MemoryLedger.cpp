@@ -42,6 +42,13 @@ const char *outcomeName(FreeOutcome outcome) noexcept {
   return "short";
 }
 
+// A Floor claim takes nothing: the start and a weights restore pass only the
+// host's rule for it (HostRule::admits).
+void requireTakes(const ClaimSpec &spec) {
+  if (spec.cls == ClaimClass::Floor)
+    throw std::logic_error("a Floor claim takes nothing: the start and a weights restore pass only the host's rule");
+}
+
 } // namespace
 
 // What a claim lacks, in each measure that can meet it: device bytes beyond
@@ -331,7 +338,7 @@ public:
   // pass when it supersedes the command, the conversion of its own lane for
   // that lane's KV growth. Units in use for such a claim that reaches them,
   // and for the host at critical pressure. Certain reuse never for growth
-  // or the host below critical pressure; Start, Optional and Floor take the
+  // or the host below critical pressure; Start and Optional take the
   // newest resume point but never a queued chain, which their walk keeps
   // (Cache::walkFor).
   [[nodiscard]] bool mayTake(const Victim &victim) const {
@@ -580,6 +587,7 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
   const uint32_t id = claimId.value;
   ClaimState &claim = claims_.at(id);
   const ClaimSpec &spec = claim.spec;
+  requireTakes(spec);
   const VictimQuery query{.claim = &spec, .need = need, .critical = critical};
 
   FreeResult result{.nowBytes = takeUnsized(query)};
@@ -726,6 +734,7 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
 // victims, as free() counts them.
 uint64_t MemoryLedger::available(const ClaimSpec &spec, const Need &need, uint64_t freeBytes, bool critical,
                                  const RestoredChains *kept) const {
+  requireTakes(spec);
   const uint64_t enough = need.bytes;
   const bool host = spec.cls == ClaimClass::Host;
   const uint64_t held = host ? 0 : heldFor(spec, std::nullopt);

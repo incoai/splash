@@ -712,7 +712,7 @@ Cache::Walk Cache::walkFor(const VictimQuery &query) const {
   // its whole prefill (MemoryLedger's Order::mayTake has the same table): every
   // queued request's chain and the newest resume point for in-service work and
   // the host at critical pressure; the resume point but never a queued chain
-  // for a start, optional work and a weights restore, since a running lane
+  // for a start and optional work, since a running lane
   // beats a queued one but a new request does not; neither for growth and the
   // host below critical pressure. What is in use only in-service work that can
   // wait and reaches it, and the host at critical pressure. A need the host
@@ -723,8 +723,7 @@ Cache::Walk Cache::walkFor(const VictimQuery &query) const {
   const bool hostCritical = claim.cls == ClaimClass::Host && query.critical;
   const bool immediate = claim.timing == NeedTiming::Immediate || need.hostRefused;
   const bool queuedChains = claim.cls == ClaimClass::InService || hostCritical;
-  const bool resumePoint = queuedChains || claim.cls == ClaimClass::Start || claim.cls == ClaimClass::Optional ||
-                           claim.cls == ClaimClass::Floor;
+  const bool resumePoint = queuedChains || claim.cls == ClaimClass::Start || claim.cls == ClaimClass::Optional;
   const bool inUse =
       (claim.cls == ClaimClass::InService && !immediate && claim.reach == ReclaimClass::InUse) || hostCritical;
   walk.scope.upTo = inUse ? ReclaimClass::InUse : ReclaimClass::Ordinary;

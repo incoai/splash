@@ -1355,9 +1355,11 @@ Three rules say who takes what:
   critical pressure.
 - Units of certain reuse, the newest resume point and the chains that queued
   requests will restore, go to `InService` claims and to the host under
-  critical pressure, in the cache's order. `Start`, `Optional` and `Floor`
-  claims may take the resume point, never a queued request's chain; `Growth`
-  and the host short of critical pressure take neither.
+  critical pressure, in the cache's order. `Start` and `Optional` claims may
+  take the resume point, never a queued request's chain; `Growth` and the host
+  short of critical pressure take neither.
+- A `Floor` claim takes nothing: it is a rule of the host's only, and the
+  ledger refuses to take or count units for one.
 
 | Claimant | Cache that frees now | Cache that needs a write | Rebuilt caches | Pass command, own conversion | Pools above their floors | Resume point | Queued chains | In use |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -1365,7 +1367,6 @@ Three rules say who takes what:
 | `InService`, immediate | yes | no | yes | no | no | yes | yes | no |
 | `Start` | yes | yes | yes | no | no | yes | no | no |
 | `Optional` | yes | no | yes | no | no | yes | no | no |
-| `Floor` | yes | no | no | no | no | yes | no | no |
 | `Growth` | yes | no | no | no | no | no | no | no |
 | `Host` with a deficit | yes | yes | yes | no | no | no | no | no |
 | `Host` under critical pressure | yes | no | yes | no | yes | yes | yes | yes |

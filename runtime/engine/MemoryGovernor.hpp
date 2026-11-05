@@ -241,7 +241,7 @@ public:
   [[nodiscard]] std::array<uint32_t, 3> heldPages(ClaimId claim) const;
   // Frees what the claim lacks (MemoryLedger::free). A need the host refused
   // is met in place first, from the pages and state buffers already
-  // allocated; failing that, the retries of a Floor or InService claim, or
+  // allocated; failing that, the retries of an InService claim, or
   // of an Optional one its lane needs (ClaimSpec::laneNeeds), pass the host,
   // and another claim falls short.
   [[nodiscard]] FreeResult free(ClaimId claim, const Need &need);

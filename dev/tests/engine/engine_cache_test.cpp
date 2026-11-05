@@ -1251,7 +1251,7 @@ void testAWaitingClaimDemotesAWholeChainRunAtOnce() {
   cache.checkInvariants();
 }
 
-// Certain reuse per claim class: Start, Optional and Floor take the resume point but never a
+// Certain reuse per claim class: Start and Optional take the resume point but never a
 // queued chain; Growth takes neither; InService takes them oldest first.
 void testCertainReuseByClass() {
   struct Case final {
@@ -1262,7 +1262,6 @@ void testCertainReuseByClass() {
   };
   for (const Case each : {Case{{.cls = ClaimClass::Start}, true, true, false},
                           Case{{.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate}, true, true, false},
-                          Case{{.cls = ClaimClass::Floor}, true, true, false},
                           Case{{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate}, false, true, true},
                           Case{{.cls = ClaimClass::InService}, true, false, true}}) {
     Prefixes prefixes;

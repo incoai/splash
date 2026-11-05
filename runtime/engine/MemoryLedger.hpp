@@ -50,7 +50,9 @@ inline constexpr AccountId kFixedAccount{0};
 enum class AccountRole : uint8_t { Fixed, Kv, States, Pool };
 
 // Why an allocation is made: decides the host's rule (but for what a lane
-// needs, ClaimSpec::laneNeeds) and what free() may take.
+// needs, ClaimSpec::laneNeeds) and what free() may take. Floor (what the
+// start builds, a weights restore while requests wait) is a host rule only:
+// it takes nothing, so free() and available() refuse it.
 enum class ClaimClass : uint8_t { Floor, InService, Start, Optional, Growth, Host };
 // Whether the claimant can wait for memory a transfer returns.
 enum class NeedTiming : uint8_t { CanWait, Immediate };
@@ -237,8 +239,8 @@ struct ClaimState final {
   // limit, refused it.
   bool hostRefusedWaiting = false;
   // The host refused it after in-place units could not meet it: the
-  // allocation's retries pass the host with each of their reservations (a
-  // Floor or InService claim, or an Optional one its lane needs) until the
+  // allocation's retries pass the host with each of their reservations (an
+  // InService claim, or an Optional one its lane needs) until the
   // allocation ends (Engine::allocate), since nothing left in place would
   // meet it and waiting would stall the work in service. A growth pass also
   // sets it on a unit it admitted on its net change, so that allocation
