@@ -197,8 +197,13 @@ class Collected:
 
     @property
     def called(self):
-        """Whether the output's tool calls count as made: it cut none."""
-        return bool(self.tool_calls) and not self.cut_in_call
+        """Whether the output's tool calls count as made: the token limit did
+        not end the output, and it cut none."""
+        return (
+            bool(self.tool_calls)
+            and not self.cut_in_call
+            and self.result.reason != "length"
+        )
 
 
 class FrontendHandler(BaseHTTPRequestHandler):

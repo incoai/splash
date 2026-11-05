@@ -130,9 +130,9 @@ def stream(exchange, job, stream_options, *, chat):
 
 
 def finish_reason(result, called):
-    """OpenAI finish_reason: the output's whole tool calls count only when
-    the token limit did not end it."""
-    if called and result.reason != "length":
+    """OpenAI finish_reason: tool_calls when the output's tool calls count as
+    made (Collected.called)."""
+    if called:
         return "tool_calls"
     return result.reason
 

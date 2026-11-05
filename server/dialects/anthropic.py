@@ -644,9 +644,9 @@ def stream(exchange, job, *, omitted):
 
 
 def stop_reason(result, called, output_clamped_to_context):
-    """Anthropic's stop_reason: the output's whole tool calls count only when
-    the token limit did not end it."""
-    if called and result.reason != "length":
+    """Anthropic's stop_reason: tool_use when the output's tool calls count as
+    made (Collected.called)."""
+    if called:
         return "tool_use"
     if result.reason == "length":
         # Anthropic's reason when the context window, not max_tokens, ends
