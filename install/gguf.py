@@ -20,6 +20,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from server.chat_format import FLINT
+
 from . import models
 from .models import ModelError
 
@@ -406,6 +408,44 @@ def layer_pattern(metadata, arch, name):
 EXPERT_GATING_FUNCTIONS = {1: "softmax", 2: "sigmoid"}
 
 
+def flint_stop_tokens(metadata):
+    """The tokens that end a Flint turn: the header's
+    tokenizer.ggml.eog_token_ids where it states them; otherwise the IDs of
+    Flint's stop tokens (FLINT.stop_tokens), each a control token once in the
+    vocabulary, one of them the header's EOS. unsloth/flint-GGUF states the
+    list; other publishers' Flint GGUFs, of the same vocabulary, do not."""
+    key = "tokenizer.ggml.eog_token_ids"
+    if key in metadata.values:
+        stops = metadata.values[key]
+        if (
+            type(stops) is not list
+            or not stops
+            or any(type(token) is not int for token in stops)
+        ):
+            raise ModelError("invalid GGUF metadata: " + key)
+        return stops
+    tokens = metadata.require("tokenizer.ggml.tokens", list)
+    types = metadata.require("tokenizer.ggml.token_type", list)
+    stops = []
+    for text in FLINT.stop_tokens:
+        found = [index for index, token in enumerate(tokens) if token == text]
+        if (
+            len(found) != 1
+            or len(types) != len(tokens)
+            or types[found[0]] != CONTROL_TOKEN
+        ):
+            raise ModelError(
+                f"GGUF metadata states no {key}, and its vocabulary does not "
+                f"hold {text} once as a control token"
+            )
+        stops += found
+    if metadata.require("tokenizer.ggml.eos_token_id", int) not in stops:
+        raise ModelError(
+            f"GGUF metadata states no {key}, and its EOS is none of Flint's stop tokens"
+        )
+    return stops
+
+
 def flint_text_config(metadata, arch):
     """What Flint's config.json states beyond the sizes every architecture's
     does, from its header: the dense, routed and shared experts' FFN widths,
@@ -417,9 +457,7 @@ def flint_text_config(metadata, arch):
     gating = metadata.require(arch + ".expert_gating_func", int)
     if gating not in EXPERT_GATING_FUNCTIONS:
         raise ModelError(f"unsupported GGUF expert gating function: {gating}")
-    stops = metadata.require("tokenizer.ggml.eog_token_ids", list)
-    if not stops or any(type(token) is not int for token in stops):
-        raise ModelError("invalid GGUF metadata: tokenizer.ggml.eog_token_ids")
+    stops = flint_stop_tokens(metadata)
     sliding = layer_pattern(metadata, arch, "attention.sliding_window_pattern")
     rotated = layer_pattern(metadata, arch, "attention.rope_pattern")
     return {

@@ -202,10 +202,58 @@ class FlintGgufTests(unittest.TestCase):
             },
         )
 
+    def test_the_tokens_ending_a_turn_are_stated_or_derived(self):
+        # unsloth/flint-GGUF states tokenizer.ggml.eog_token_ids, and the
+        # config takes the list as it is.
+        stated = header_values() | {"tokenizer.ggml.eog_token_ids": [150001, 150005]}
+        config = gguf.model_config(self.metadata(stated))
+        self.assertEqual(config["eos_token_id"], [150001, 150005])
+        # lmstudio-community's, ggml-org's, bartowski's, mradermacher's and
+        # prithivMLmods' state none: the IDs of Flint's stop tokens in the
+        # vocabulary are unsloth's list.
+        values = header_values()
+        unsloth = values.pop("tokenizer.ggml.eog_token_ids")
+        config = gguf.model_config(self.metadata(values))
+        self.assertEqual(config["eos_token_id"], unsloth)
+
+    def test_a_header_without_the_list_or_flint_s_stop_tokens_is_refused(self):
+        def without_list(**changes):
+            values = header_values()
+            del values["tokenizer.ggml.eog_token_ids"]
+            tokens = values["tokenizer.ggml.tokens"] = list(
+                values["tokenizer.ggml.tokens"]
+            )
+            types = values["tokenizer.ggml.token_type"] = list(
+                values["tokenizer.ggml.token_type"]
+            )
+            if "rename" in changes:
+                tokens[changes["rename"]] = "<|renamed|>"
+            if "text" in changes:
+                types[changes["text"]] = USER_DEFINED
+            if "twice" in changes:
+                tokens[changes["twice"]] = "<|developer|>"
+            if "eos" in changes:
+                values["tokenizer.ggml.eos_token_id"] = changes["eos"]
+            return values
+
+        for changes, reason in (
+            ({"rename": 150018}, re.escape("hold <|developer|> once")),
+            ({"text": 150003}, re.escape("hold <|user|> once")),
+            ({"twice": 150019}, re.escape("hold <|developer|> once")),
+            ({"eos": 150000}, "its EOS is none of Flint's stop tokens"),
+        ):
+            with self.subTest(changes=changes):
+                with self.assertRaisesRegex(models.ModelError, reason):
+                    gguf.model_config(self.metadata(without_list(**changes)))
+
     def test_metadata_the_config_cannot_state_is_refused(self):
         for key, value, reason in (
-            ("tokenizer.ggml.eog_token_ids", None, "tokenizer.ggml.eog_token_ids"),
             ("tokenizer.ggml.eog_token_ids", [], "tokenizer.ggml.eog_token_ids"),
+            (
+                "tokenizer.ggml.eog_token_ids",
+                [150001.0],
+                "tokenizer.ggml.eog_token_ids",
+            ),
             (
                 "flint.attention.sliding_window_pattern",
                 [True] * (LAYERS - 1),
@@ -290,11 +338,15 @@ class FlintGgufTests(unittest.TestCase):
         )
 
     @staticmethod
-    def flint_gguf(path):
-        """A GGUF target of Flint's header and tensor table at path, and a
-        vision projector beside it."""
+    def flint_gguf(path, values=None):
+        """A GGUF target of Flint's header (values) and tensor table at path,
+        and a vision projector beside it."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        write_target(path, header_values(), tensor_table(families.named("Flint")))
+        write_target(
+            path,
+            header_values() if values is None else values,
+            tensor_table(families.named("Flint")),
+        )
         write_gguf(
             path.parent / "mmproj-F32.gguf",
             vision_fixture(),
@@ -332,6 +384,20 @@ class FlintGgufTests(unittest.TestCase):
         self.assertFalse((chosen.link / "vision").exists())
         self.assertEqual(fake.range_reads, [f"{repo}/{target}"])
         self.assertEqual(fake.downloads, [f"{repo}/{target}"])
+
+    def test_a_header_without_the_list_installs_as_flint(self):
+        # The engine's check holds the derived list to the family's.
+        root = self.root.resolve()
+        values = header_values()
+        del values["tokenizer.ggml.eog_token_ids"]
+        target = self.flint_gguf(root / "model" / "flint.gguf", values)
+        draft = draft_dir(root / "draft", families.named("Flint"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            link = local.prepare_local_model(target, draft, models_dir=root / "models")
+        record = assembly.verify(link, full=True)
+        self.assertEqual(record["family"], "Flint")
+        config = json.loads((link / "config.json").read_text())
+        self.assertEqual(config["eos_token_id"], [150001, 150003, 150005, 150018])
 
     def test_local_files_serve_text_only_and_take_no_projector(self):
         # Resolved, as prepare_local_model names the files it prepares.

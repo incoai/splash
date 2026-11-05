@@ -181,7 +181,9 @@ router (`router_score_function` from `expert_gating_func`, `norm_topk_prob`),
 `mlp_only_layers`, `sliding_window`, `layer_types` from
 `attention.sliding_window_pattern`, `no_rope_layer_indices` from
 `attention.rope_pattern`, and `eos_token_id` from
-`tokenizer.ggml.eog_token_ids`; the engine's check holds each to the family's,
+`tokenizer.ggml.eog_token_ids`, or, in a header without it (any but
+unsloth's), the IDs of Flint's stop tokens in its vocabulary, each a control
+token, one of them its EOS; the engine's check holds each to the family's,
 and the header's layer patterns to them. The token table must be of a format:
 RecursiveSI's int4 GGUF, whose table is F32, is refused before its download.
 
