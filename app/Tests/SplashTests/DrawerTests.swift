@@ -143,6 +143,18 @@ struct DrawerTests {
         #expect(runtime.environment["SPLASH_API_KEY"] == nil && runtime.environment["PYTHONNOUSERSITE"] == "1")
     }
 
+    /// A terminal runs the login shell the user database names; where it names none, the one
+    /// SHELL names, else zsh, each under its name as a login shell.
+    @Test func aTerminalRunsTheLoginShellOrElseSHELLOrZsh() {
+        let named = Shell.login("/bin/bash", environment: ["SHELL": "/bin/ksh"])
+        #expect(named.path == "/bin/bash" && named.arguments.isEmpty && named.name == "-bash")
+        let fromSHELL = Shell.login(nil, environment: ["SHELL": "/bin/ksh"])
+        #expect(fromSHELL.path == "/bin/ksh" && fromSHELL.name == "-ksh")
+        let zsh = Shell.login(nil, environment: [:])
+        #expect(zsh.path == "/bin/zsh" && zsh.name == "-zsh")
+        #expect(FileManager.default.isExecutableFile(atPath: Shell.login.path))
+    }
+
     /// Once the app has taken SIGTERM for itself, as it does at launch, what it starts, as the
     /// drawer's terminals start their shells, ends on SIGTERM.
     @Test func whatTheAppStartsEndsOnSIGTERM() async throws {

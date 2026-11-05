@@ -56,7 +56,14 @@ struct Shell {
     /// The user's login shell, as Terminal starts it, which completes the app's environment from
     /// the user's startup files.
     static var login: Shell {
-        let path = String(cString: getpwuid(getuid()).pointee.pw_shell)
+        let named = getpwuid(getuid())?.pointee.pw_shell.map { String(cString: $0) }
+        return login(named, environment: ProcessInfo.processInfo.environment)
+    }
+
+    /// The login shell at `path`, the one the user database names; where it names none, as when it
+    /// is damaged, the one `environment`'s SHELL names, else zsh, the system's default.
+    static func login(_ path: String?, environment: [String: String]) -> Shell {
+        let path = path ?? environment["SHELL"] ?? "/bin/zsh"
         return Shell(path: path, arguments: [], name: "-" + (path as NSString).lastPathComponent)
     }
 }
