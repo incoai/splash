@@ -982,7 +982,8 @@ private:
     bool keepIndexRunway = false;
     bool device = false;
     // A device need that lacks pages too: its reclaims take KV for those
-    // pages in place as well as for whole extents (Cache::formsInReach).
+    // pages in place as well as for whole extents (Cache::formsInReach,
+    // takeReclaim).
     bool inPlace = false;
     bool statesAreUnits = false;
     uint32_t pages = 0;
@@ -1206,10 +1207,10 @@ private:
   // first, as the extent they fill; then, while some form is in reach
   // (formsInReach), the walk's victims, its leaves that lead to such a form
   // alone (leadsToReach), until one is released, the landing pages fill one
-  // more, a need of pages (`inPlace`) has one more page of its form, or a
-  // state goes; otherwise a state (recycleState).
+  // more, a need of pages (Walk::inPlace) has one more page of its form, or
+  // a state goes; otherwise a state (recycleState).
   [[nodiscard]] ReclaimResult takeReclaim(const Walk &walk, const std::array<uint32_t, 3> &demotions,
-                                          uint64_t fillBefore, bool inPlace);
+                                          uint64_t fillBefore);
   // Frees the RAM of one resident KV leaf: through its disk copy when it has
   // one, by demotion when a state on it or below it depends on it, by
   // erasure otherwise, with any disk copies below it. Pending when the tier
@@ -1312,13 +1313,12 @@ private:
   // leave one. That counts the leaves that need a demotion too, which an
   // Immediate step passes over while the tier takes writes. A page written
   // through is none of them: its Spill request holds it, though it frees
-  // once its copy lands (pendingPages). For a need of pages (`inPlace`) the
-  // walk's form is in reach too while KV of it can leave past its free pages
-  // and the pages all demotions in flight bring, this take's included: each
-  // page that leaves meets the need in place, as reach() counts it, with no
-  // extent emptied.
-  [[nodiscard]] std::array<bool, 3> formsInReach(const Walk &walk, const std::array<uint32_t, 3> &demoting,
-                                                 bool inPlace) const;
+  // once its copy lands (pendingPages). For a need of pages (Walk::inPlace)
+  // the walk's form is in reach too while KV of it can leave past its free
+  // pages and the pages all demotions in flight bring, this take's
+  // included: each page that leaves meets the need in place, as reach()
+  // counts it, with no extent emptied.
+  [[nodiscard]] std::array<bool, 3> formsInReach(const Walk &walk, const std::array<uint32_t, 3> &demoting) const;
   // Evicting the resident leaf may lead to an extent of a form in `reach`
   // emptying: its page is of such a form, or the page of a block above it,
   // which may become a leaf once the leaf has gone, as a spilled chain's
