@@ -1141,6 +1141,63 @@ void testAFullTemporaryQuotaStillDemotesByReplacingItsOldestCopy() {
   require(prefixes.pool.freePageCount() == freePages + 1, "the leaf's page did not free once its copy landed");
 }
 
+// A take never stops at a leaf it can neither write nor drop: with the quota
+// full of copies it may not give up and no transfer in flight, a leaf whose
+// disk subtree needs it goes with that subtree, as with no tier, for a claim
+// that can wait. An Immediate claim passes over a leaf that needs a write and
+// counts it so: short of its need, it takes nothing.
+void testALeafWhoseWriteFindsNoSlotGoesWithItsSubtree() {
+  for (const ClaimSpec claim : {test::kInServiceGrowth,
+                                ClaimSpec{.cls = ClaimClass::InService, .timing = NeedTiming::Immediate}}) {
+    test::TestKvTier tier;
+    tier.capacity = 1;
+    test::TestKvStorage storage{4, 100, 1};
+    KvPool pool{storage, 0};
+    engine::Cache cache(pool, &tier, nullptr);
+    std::vector<uint32_t> chain(2 * KvCache::pageTokens + 1);
+    std::iota(chain.begin(), chain.end(), 1000);
+    cache.beginRequest(1);
+    require(admitTokens(cache, 1, 2 * KvCache::pageTokens).granted(), "the chain's pages were denied");
+    const uint64_t tail = test::publishBlocks(cache, 1, chain, 2 * KvCache::pageTokens);
+    cache.endRequest(1);
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    cache.publishCompositeState(tail, std::make_shared<TieredState>(control), false);
+    require(test::stateStep(cache).gave() && cache.pollTransfers() && !cache.stateResident(tail),
+            "the chain's state was not written");
+    demoteLeaves(cache, tier, 1);
+    // The tail's copies are the only ones of the chain a queued request
+    // restores: the full quota may give up neither.
+    cache.setWantedChains({cache.probe(chain, {}).restoredChain()});
+    const std::vector<uint32_t> other(KvCache::pageTokens + 1, 7);
+    cache.beginRequest(2);
+    require(admitTokens(cache, 2, KvCache::pageTokens).granted(), "the other prefix's page was denied");
+    static_cast<void>(test::publishBlocks(cache, 2, other, KvCache::pageTokens));
+    cache.endRequest(2);
+    cache.beginRequest(3);
+    require(admitTokens(cache, 3, uint64_t{pool.freePageCount()} * KvCache::pageTokens).granted() &&
+                pool.freePageCount() == 0 && tier.slots == tier.capacity,
+            "the fixture did not fill the pool and the quota");
+    const uint32_t demotions = tier.demotions;
+    const uint32_t cachedPages = cache.snapshot().pool.pagesPrefix;
+    const FreeResult freed = test::freeFromCache(cache, claim, {.pages = 2});
+    const uint32_t chainTokens = cache.probe(chain, {}).cachedTokens();
+    const uint32_t leftPages = cache.snapshot().pool.pagesPrefix;
+    const bool canWait = claim.timing == NeedTiming::CanWait;
+    require(canWait ? freed.outcome == FreeOutcome::Met && freed.pages == 2 && !chainTokens &&
+                          leftPages + 2 == cachedPages
+                    : freed.outcome == FreeOutcome::Short && !freed.pages && chainTokens && leftPages == cachedPages,
+            "a take stopped at a leaf no slot can take: timing " + std::to_string(static_cast<int>(claim.timing)) +
+                ", outcome " + std::to_string(static_cast<int>(freed.outcome)) + ", " +
+                std::to_string(freed.pages) + " pages, chain cached " + std::to_string(chainTokens) +
+                " tokens, cached pages " + std::to_string(cachedPages) + " -> " + std::to_string(leftPages));
+    require(tier.demotions == demotions, "a take wrote a leaf no slot can take");
+    cache.setWantedChains({});
+    cache.endRequest(3);
+    cache.checkInvariants();
+  }
+}
+
 // A waiting claim starts the demotions of the whole run up an idle chain,
 // up to what completes an extent, so it frees once those writes land, not
 // one page per landing. The chain fills three extents of four pages and ends in a
@@ -2225,7 +2282,8 @@ void testSpentWriteBudgetKeepsTheChainsOfWrittenStates() {
 }
 
 // A limit that cannot hold one slot makes no room: a leaf a written state
-// needs is not written, and nothing the tier holds is given up for it.
+// needs is not written, nothing the tier holds is given up for it, and it
+// goes as with no tier, with the copies below it that need it.
 void testLimitBelowASlotMakesNoRoom() {
   auto budget = std::make_shared<model::DiskBudget>(uint64_t{1} << 30);
   auto control = std::make_shared<TransferControl>();
@@ -2246,13 +2304,16 @@ void testLimitBelowASlotMakesNoRoom() {
   budget->setLimitBytes(tier.slotBytes() - 1);
   static_cast<void>(test::evictStep(fixture.cache));
   const CacheSnapshot held = fixture.cache.snapshot();
-  require(tier.demotions == 1 && held.kvTier.diskBlocks == 1 && control->slots == 1,
-          "a limit below a slot wrote a page, or gave copies up to make room");
+  require(tier.demotions == 1 && !held.kvTier.diskBlocks && !fixture.lookup(129).state,
+          "a limit below a slot wrote a page, or kept a leaf no write can take");
+  fixture.cache.checkInvariants();
 }
 
-// A leaf with disk-only children whose demotion is refused stays; it is never
-// erased under its children.
-void testParentOfDiskChildrenSurvivesRefusal() {
+// A leaf with disk-only children whose demotion cannot start, with nothing
+// in flight to wait for, goes with those children, as with no tier: it is
+// never erased under them, and the request has its pages rather than wait
+// for something that will never happen.
+void testParentGoesWithItsDiskChildrenWhenNoWriteCanStart() {
   test::TestKvTier tier;
   CacheFixture fixture(&tier, false, test::ampleDiskBudget());
   auto control = std::make_shared<TransferControl>();
@@ -2265,22 +2326,13 @@ void testParentOfDiskChildrenSurvivesRefusal() {
           "leaf was not written");
   tier.complete();
   require(fixture.cache.pollTransfers() && fixture.pool.freePageCount() == 1, "leaf did not land");
-  // With the tier unusable and nothing in flight the parent still stays: its
-  // disk subtree depends on it. The request is told it cannot have the pages
-  // rather than told to wait for something that will never happen.
   tier.transferLimit = 0;
   fixture.cache.beginRequest(2);
-  require(admitTokens(fixture.cache, 2, 64).failure == TokenAdmissionFailure::Denied &&
-              fixture.cache.snapshot().pool.pagesPrefix == 3 && tier.demotions == 1,
-          "the parent of a disk block was dropped, or the request was told to wait");
-  tier.transferLimit = 8;
-  require(admitTokens(fixture.cache, 2, 64).failure == TokenAdmissionFailure::Pending &&
-              tier.demotions == 2,
-          "the parent was not written once the tier had room");
-  tier.complete();
-  require(fixture.cache.pollTransfers() && admitTokens(fixture.cache, 2, 64).granted(),
-          "pages did not return to the request");
+  require(admitTokens(fixture.cache, 2, 64).granted() && tier.demotions == 1 &&
+              !fixture.cache.snapshot().kvTier.diskBlocks && !fixture.lookup(129).state,
+          "the parent of a disk block stayed with no write to wait for, or went without its subtree");
   fixture.cache.endRequest(2);
+  fixture.cache.checkInvariants();
 }
 
 // While one state write is in flight, a pressure pass keeps the next state
@@ -6124,7 +6176,7 @@ int main() {
     testWaitingCheckpointHoldsBackNothingElse();
     testFullTierStopsTheScan();
     testRestoresInFlightReturnNothingToAShortfall();
-    testParentOfDiskChildrenSurvivesRefusal();
+    testParentGoesWithItsDiskChildrenWhenNoWriteCanStart();
     testPendingPagesGateAllocation();
     testTransferFailures();
     testFailedRestoreDropsTheBlocksBelow();
@@ -6144,6 +6196,7 @@ int main() {
     testDiskQuotaKeepsTheOnlyCopyAQueuedRequestRestores();
     testCertainReuseByClass();
     testAFullTemporaryQuotaStillDemotesByReplacingItsOldestCopy();
+    testALeafWhoseWriteFindsNoSlotGoesWithItsSubtree();
     testAWaitingClaimDemotesAWholeChainRunAtOnce();
     testQuotaWithoutTheKvTier();
     testInvalidationDuringOffload();

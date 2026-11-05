@@ -1466,19 +1466,16 @@ Cache::LeafReclaim Cache::reclaimKvLeaf(uint64_t block, ReclaimTiming timing) {
   // The leaf is written for a state on it or below it, and disk copies below
   // that no state needs go with it. A writable tier means a demotion, whose
   // page returns only when the copy lands: the reclaim reached a leaf a copy
-  // ahead would have let go at once.
+  // ahead would have let go at once. A demotion that cannot start, with no
+  // slot to be had and nothing in flight to wait for (demoteKv), lets the
+  // leaf go as without a tier, with the disk subtree that needs it: a take
+  // never stops at a leaf it can neither write nor drop.
   if (kvNeededByState(block)) {
     if (timing == ReclaimTiming::Immediate && kvTierWritable())
       return LeafReclaim::Impossible;
     const LeafReclaim demotion = demoteKv(block);
     if (demotion != LeafReclaim::Impossible)
       return demotion;
-    // A leaf its disk subtree depends on stays in RAM while the tier may
-    // still write it: dropping it would orphan every copy below it. Once a
-    // file has stopped taking writes, the subtree goes with it, as without a
-    // tier, rather than holding the leaf's RAM until the server restarts.
-    if (kv_.stateBelow(block) && kvTierWritable())
-      return LeafReclaim::Impossible;
   }
   if (kv_.hasDiskChildren(block) && !dropDiskSubtree(block))
     return LeafReclaim::Impossible;

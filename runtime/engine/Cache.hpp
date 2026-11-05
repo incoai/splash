@@ -1122,9 +1122,10 @@ private:
   // Frees the RAM of one resident KV leaf: through its disk copy when it has
   // one, by demotion when a state on it or below it depends on it, by
   // erasure otherwise, with any disk copies below it. Pending when the tier
-  // cannot take it right now. A leaf that a disk subtree depends on is
-  // dropped only once a file stopped taking writes, together with that
-  // subtree. Immediate passes over a leaf that needs a demotion.
+  // cannot take it right now. A leaf whose demotion cannot start, and no
+  // transfer in flight will change that, is erased, together with the disk
+  // subtree that depends on it. Immediate passes over a leaf that needs a
+  // demotion.
   [[nodiscard]] LeafReclaim reclaimKvLeaf(uint64_t block, ReclaimTiming timing);
   [[nodiscard]] LeafReclaim demoteKv(uint64_t block);
   // Only a state restores a disk-only chain, through its own block and every

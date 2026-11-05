@@ -1296,7 +1296,10 @@ unit the claim's class may not take is skipped, not a stop:
    conversation (`Cache::writesState`). Any other state, such as one its
    conversation went on from or a checkpoint no request waits for, is
    dropped like a unit no tier can copy, with no SSD cache or one whose
-   files stopped taking writes.
+   files stopped taking writes. KV whose write finds no slot, with the quota
+   full, nothing in it the take may give up and no transfer in flight, goes the
+   same way once this stage reaches it, a leaf with the copies below it that
+   need it (`Cache::reclaimKvLeaf`).
 5. The prefill command between its passes, given up for work that supersedes
    it, then the claimant's own conversion to Spill (below).
 6. The pools' units above their floors: the expert store's chunks, the top
@@ -1998,9 +2001,10 @@ active KV, since a running lane goes before a queued one; and an ordinary
 state that finds no other room is dropped. A claim's take finds a write's slot
 the same way, through the one replacement order (`Cache::nextDiskReplacement`):
 a full quota gives up the copies it may for the write, and the claim waits for
-the write. Before reclaim takes a state in RAM, only a spilling request's page
-takes the spilled KV under it, the state first, once nothing else is left. A
-freed slot returns its quota at once and its blocks to the volume
+the write. With no slot that way and no transfer in flight, the KV goes as with
+no SSD cache (above). Before reclaim takes a state in RAM, only a spilling
+request's page takes the spilled KV under it, the state first, once nothing else
+is left. A freed slot returns its quota at once and its blocks to the volume
 (`F_PUNCHHOLE`) once its file's IO worker finishes the transfer it is in, so the
 two files together occupy about the live slots instead of each keeping its
 high-water mark; `/status` reports that as `disk.file_bytes` beside
