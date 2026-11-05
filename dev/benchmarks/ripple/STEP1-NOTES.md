@@ -170,3 +170,22 @@ reading is Ripple's own (readQwenAttention serves the Qwen fused three; the
 generic reader's mixer hook takes a family's reader, as its FFN hook does).
 The layout's packedFullWidth stays 22528 - the packed row the kernels see -
 and the fused read's width is the loader's business.
+
+## The server integration gap: the template's tags are text, not tokens
+
+Ripple's vocabulary (100352, OLMo/cl100k-style BPE) keeps none of the
+standard tags as dedicated tokens: THINK_START/THINK_END, TOOL_CALL_OPEN
+and the call's close are text its tokenizer splits into byte-level BPE
+tokens, as the release's tokenizer.json splits the template's own text.
+The server's thinking and tool-call machinery reads single token IDs
+(chat_format's think_end_id and call_open_id), which startup validates
+(constraints.validate_tokenizer) — a Ripple tokenizer fails that check.
+
+The engine is complete without them: the family's descriptor, layout,
+planner, loader and target stand, and the draft's subset proposal serves
+exactly. The server's integration needs the thinking and call detection to
+match the tags' text sequences across the token stream, which the
+output.py's pending machinery is shaped for but the chat format's
+single-token fields do not state. That is the remaining server work; until
+it lands, families.py stays without Ripple, so install does not open to a
+serve that would fail at startup.
