@@ -17,6 +17,7 @@
 #include <bit>
 #include <memory>
 #include <optional>
+#include <utility>
 
 using namespace gguf_fixtures;
 
@@ -767,7 +768,8 @@ void checkPleTable(const std::filesystem::path &directory) {
 // The dense target split in two as GGUF's split files store it, half
 // its tensors in each part, last part written first: findTargetGgufs takes
 // the parts in split order, past a file that is not a GGUF, and refuses
-// another GGUF beside them or parts of another count. The plan of the parts
+// another GGUF beside them, parts of another count, or parts of several
+// names, as the installer does (upstream.split_order). The plan of the parts
 // writes the whole file's images, each tensor read from the part that holds
 // it, at its offset in that part.
 void checkSplit(const std::filesystem::path &directory) {
@@ -805,6 +807,21 @@ void checkSplit(const std::filesystem::path &directory) {
   std::filesystem::rename(parts[1], split / "target-00002-of-00003.gguf");
   check(refused(), "findTargetGgufs refuses the parts of a split GGUF of another count");
   std::filesystem::rename(split / "target-00002-of-00003.gguf", parts[1]);
+  // Whether the other name sorts before the first part's or after it.
+  for (const auto &[other, listed] : {std::pair{"other", "other, target"}, std::pair{"tested", "target, tested"}}) {
+    const auto renamed = split / (std::string(other) + "-00002-of-00002.gguf");
+    std::filesystem::rename(parts[1], renamed);
+    std::string refusal;
+    try {
+      (void)model::findTargetGgufs(split);
+    } catch (const model::GgufError &error) {
+      refusal = error.what();
+    }
+    std::filesystem::rename(renamed, parts[1]);
+    check(refusal == "target directory mixes the parts of several split GGUFs (" + std::string(listed) +
+                         "); a split GGUF is the parts of one name, NAME-0000K-of-0000N.gguf: " + split.string(),
+          "findTargetGgufs refuses the parts of several names");
+  }
 
   // Both plans read their files, which stay open.
   const model::OpenGguf wholeGguf({whole}), splitGguf(model::findTargetGgufs(split));

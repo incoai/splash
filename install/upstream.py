@@ -237,16 +237,24 @@ def split_gguf(files, variant):
 
 
 def split_order(names, split):
-    """names, the files of one split GGUF, in split order: each named
-    NAME-0000K-of-0000N.gguf, and every part from 1 to N present once. split
-    names the split GGUF in a refusal."""
-    parts = {}
-    for name in names:
-        match = SPLIT_NAME.search(name)
+    """names, the files of one split GGUF, in split order: the parts of one
+    name, each NAME-0000K-of-0000N.gguf, every part from 1 to N present once.
+    The engine holds a target's files to the same rule (findTargetGgufs).
+    split names the split GGUF in a refusal."""
+    matches = {name: SPLIT_NAME.search(name) for name in names}
+    for name, match in matches.items():
         if not match:
             raise models.ModelError(
                 f"{name} is not one part of {split} (NAME-0000K-of-0000N.gguf)"
             )
+    if len(own := {model_of(Path(name).name) for name in names}) > 1:
+        raise models.ModelError(
+            f"{split} mixes the parts of several split GGUFs "
+            f"({', '.join(sorted(own))}); a split GGUF is the parts of one name, "
+            "NAME-0000K-of-0000N.gguf"
+        )
+    parts = {}
+    for name, match in matches.items():
         number = int(match.group(1))
         if number in parts:
             raise models.ModelError(

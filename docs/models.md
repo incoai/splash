@@ -197,8 +197,10 @@ token, one of them its EOS; the engine's check holds each to the family's,
 and the header's layer patterns to them. The token table must be of a format:
 RecursiveSI's int4 GGUF, whose table is F32, is refused before its download.
 
-Every part of a split GGUF, from 1 to N, must be present, at the root or in
-its folder (`upstream.split_order`). The parts install side by side in
+A split GGUF is the parts of one name, `NAME-0000K-of-0000N.gguf`: every part
+from 1 to N must be present, at the root or in its folder, and a folder that
+mixes the parts of several names is refused (`upstream.split_order`, and
+`findTargetGgufs` in the engine). The parts install side by side in
 `target/`, and the native loader reads them as one GGUF (`findTargetGgufs`,
 `OpenGguf`): the first part's metadata, whose `split.count` and
 `split.tensors.count` must describe the parts, and every part's tensors. The

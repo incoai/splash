@@ -266,12 +266,29 @@ class UpstreamTest(unittest.TestCase):
         # Two files of one part number are not one GGUF's parts.
         parts = {
             "BF16/Qwen3.8-27B-BF16-00002-of-00002.gguf",
-            "BF16/Qwen3.8-27B-BF16-copy-00001-of-00002.gguf",
+            "BF16/Qwen3.8-27B-BF16-00001-of-00003.gguf",
         }
         with self.assertRaisesRegex(
             models.ModelError, "are both part 1 of the split GGUF in BF16/"
         ):
             upstream.select_gguf(files | parts, "BF16")
+        # Nor are the parts of several names, in whichever order their names
+        # and numbers sort; the engine refuses them alike (findTargetGgufs).
+        for first, second in (("A", "B"), ("B", "A")):
+            parts = {
+                f"BF16/{first}-00001-of-00002.gguf",
+                f"BF16/{second}-00002-of-00002.gguf",
+            }
+            with (
+                self.subTest(parts=sorted(parts)),
+                self.assertRaisesRegex(
+                    models.ModelError,
+                    "^the split GGUF in BF16/ mixes the parts of several split "
+                    r"GGUFs \(A, B\); a split GGUF is the parts of one name, "
+                    r"NAME-0000K-of-0000N\.gguf$",
+                ),
+            ):
+                upstream.select_gguf(parts, "BF16")
         # A repository of one GGUF has no shared name to strip, and needs no
         # variant.
         for variant in ("UD-Q4_K_M", "Q4_K_M", None):
