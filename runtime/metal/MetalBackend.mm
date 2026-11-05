@@ -1458,17 +1458,30 @@ struct MetalBackend::Impl {
                 // The tables `encoder` already made resident, and whether for
                 // writing: a declaration lasts for the encoder.
                 std::vector<std::pair<const std::vector<MetalBuffer> *, bool>> declared;
+                // A command with dispatches that may overlap encodes
+                // concurrently and puts a buffer barrier before every other
+                // dispatch (ComputeDispatch::concurrentWithPrevious).
+                const bool concurrent = std::ranges::any_of(dispatches, [](const PreparedDispatch &d) {
+                    return d.source->concurrentWithPrevious;
+                });
+                bool encoded = false;
                 for (size_t index = 0; index < dispatches.size(); ++index) {
                     encodeSteps(index);
                     const PreparedDispatch &item = dispatches[index];
                     const ComputeDispatch &dispatch = *item.source;
                     if (!encoder) {
-                        encoder = [command computeCommandEncoder];
+                        encoder = concurrent
+                            ? [command computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
+                            : [command computeCommandEncoder];
                         if (!encoder) {
                             failEncoding("unable to create Metal compute encoder");
                         }
                         declared.clear();
+                        encoded = false;
                     }
+                    if (concurrent && encoded && !dispatch.concurrentWithPrevious)
+                        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    encoded = true;
                     [encoder setComputePipelineState:item.pipeline];
                     for (const BufferBinding &binding : dispatch.buffers) {
                         const MetalBuffer::Impl &buffer = *binding.buffer.impl_;

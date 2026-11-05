@@ -1377,6 +1377,42 @@ void indirectGridsRunTheWrittenGrid(MetalBackend &backend) {
     }
 }
 
+// Dispatches marked concurrentWithPrevious run on a concurrent encoder, and
+// every unmarked dispatch after them sees their writes (the buffer barrier
+// before it): add 1 to a and 2 to b side by side, copy a over b, then add 4
+// to b, three times in one command, and once more through CommandGraph.
+void concurrentDispatchesKeepLaterOrder(MetalBackend &backend) {
+    constexpr uint32_t kWords = 64, one = 1, two = 2, four = 4;
+    MetalBuffer a = sharedBuffer(backend, kWords * sizeof(uint32_t));
+    MetalBuffer b = sharedBuffer(backend, kWords * sizeof(uint32_t));
+    std::fill_n(static_cast<uint32_t *>(a.contents()), kWords, 0u);
+    std::fill_n(static_cast<uint32_t *>(b.contents()), kWords, 0u);
+    const auto add = [&](const MetalBuffer &buffer, const uint32_t &increment) {
+        return ComputeDispatch{"test_add_u32", {{0, buffer}},
+                               {{1, &kWords, sizeof(kWords)}, {2, &increment, sizeof(increment)}},
+                               {kWords, 1, 1}, {1, 1, 1}};
+    };
+    const ComputeDispatch copy{"test_copy_u32", {{0, a}, {1, b}}, {{2, &kWords, sizeof(kWords)}}, {kWords, 1, 1},
+                               {1, 1, 1}};
+    std::vector<ComputeDispatch> command;
+    for (int round = 0; round < 3; ++round) {
+        command.push_back(add(a, one));
+        command.push_back(add(b, two));
+        command.back().concurrentWithPrevious = true;
+        command.push_back(copy);
+        command.push_back(add(b, four));
+    }
+    (void)backend.submitCommandAsync(command).wait();
+    const auto *outA = static_cast<const uint32_t *>(a.contents());
+    const auto *outB = static_cast<const uint32_t *>(b.contents());
+    for (uint32_t word = 0; word < kWords; ++word)
+        require(outA[word] == 3 && outB[word] == 3 + 4,
+                "a dispatch after concurrent ones did not see their writes");
+    CommandGraph graph;
+    rejects([&] { graph.concurrentWithPrevious(); }, "concurrency needs a dispatch",
+            "an empty graph marked a dispatch concurrent");
+}
+
 // Released memory leaves the residency set and the accounting while the
 // buffer's views stay handles that no command may bind; a restore gives the
 // buffer memory again, which commands use as before. Only whole buffers with
@@ -2518,6 +2554,7 @@ void run(const std::string &metallibPath) {
 
     bindingRunsKeepOffsets(backend);
     indirectGridsRunTheWrittenGrid(backend);
+    concurrentDispatchesKeepLaterOrder(backend);
     require(capabilities.gpuCoreCount >= 1 && capabilities.gpuCoreCount <= 4096,
             "GPU core count was not read from the IORegistry");
     require(capabilities.meetsMinimumMacos(),
