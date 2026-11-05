@@ -55,12 +55,22 @@ struct QwenGdnWeights final {
 
 struct QwenAttentionWeights final {
   ops::Projection inputProjection;
+  // A mixer whose value projection reads its own mixed input (Ripple's value
+  // residual): the fused projection carries the queries, their gate and the
+  // keys alone, and this carries the value rows, which the mixed input
+  // projects through. Empty for a mixer whose fused projection carries the
+  // value rows with the queries'.
+  ops::Projection valueProjection;
   ops::NormWeights queryNorm;
   ops::NormWeights keyNorm;
   ops::Projection outputProjection;
   // The layer's learned sinks, an F32 per query head, of a geometry whose
   // attention adds them (ops::PrefillAttentionPlan::sinks); none otherwise.
   metal::MetalBuffer sinks{};
+
+  [[nodiscard]] bool splitsValue() const noexcept {
+    return valueProjection.outputSize != 0;
+  }
 };
 
 using QwenMixerWeights = std::variant<QwenGdnWeights, QwenAttentionWeights>;

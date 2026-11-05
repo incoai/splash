@@ -6,6 +6,24 @@
 
 namespace splash::model {
 
+// A Ripple mixer: its fused projection carries the queries, their gate and
+// the keys (packedFullWidth past the value rows), and its value projection
+// the value rows alone, which the mixed input projects through.
+QwenMixerWeights readRippleMixer(WeightFile &file, const BlockTargetFormat &format,
+                                 const QwenTargetDimensions &target, bool) {
+  QwenAttentionWeights attention;
+  attention.inputProjection =
+      format.fused(file, target.packedFullWidth - target.attentionKvHeads * target.attentionHeadDimension,
+                   target.hiddenSize, {"attn-q", "attn-k"});
+  attention.valueProjection =
+      format.projection(file, target.attentionWidth, target.hiddenSize, "attn-v");
+  attention.queryNorm = format.norm(file, target.attentionHeadDimension, "query-norm");
+  attention.keyNorm = format.norm(file, target.attentionHeadDimension, "key-norm");
+  attention.outputProjection =
+      format.projection(file, target.hiddenSize, target.attentionWidth, "attention-output");
+  return attention;
+}
+
 RippleWeights loadRippleWeights(metal::MetalBackend &backend, RippleLayout layout,
                                 const QwenTargetFiles &files) {
   // A block's FFN and what surrounds it, in its image's order: the
@@ -19,7 +37,7 @@ RippleWeights loadRippleWeights(metal::MetalBackend &backend, RippleLayout layou
   };
   return loadQwenTarget<RippleWeights>(
       backend, layout, files, [&](auto &loader, const BlockTargetFormat &format, const MoeExperts &) {
-        return readQwenTargetWeights<RippleWeights>(layout, loader, format, readFfn);
+        return readQwenTargetWeights<RippleWeights>(layout, loader, format, readFfn, readRippleMixer);
       });
 }
 
