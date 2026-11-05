@@ -535,6 +535,7 @@ TENSOR_TYPES = {
     21: "IQ3_S",
     22: "IQ2_S",
     23: "IQ4_XS",
+    26: "I32",
     29: "IQ1_M",
     30: "BF16",
     39: "MXFP4",
@@ -646,6 +647,23 @@ def fused_experts(moe_tensors):
         for name, types in moe_tensors.items()
         if name not in ("ffn_gate_exps.weight", "ffn_up_exps.weight")
     } | {"ffn_gate_up_exps.weight": FORMAT_TYPES}
+
+
+def ulmoe_experts(moe_tensors):
+    """A MoE layer's tensors where its routed experts are ULMoE W2 planes
+    (runtime/model/GgufImage.cpp Builder::ulmoeExperts): I32 codes and meta and F32 anchors of the gate/up and
+    down projections and the I32 gate/up input order, in place of the three
+    expert tensors."""
+    planes = {
+        f"{stem}.ulmoe_{part}": ({"F32"} if part == "anchors" else {"I32"})
+        for stem in ("ffn_gate_up_exps", "ffn_down_exps")
+        for part in ("codes", "meta", "anchors")
+    }
+    return {
+        name: types
+        for name, types in moe_tensors.items()
+        if name not in ("ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight")
+    } | planes | {"ffn_gate_up_exps.ulmoe_input_order": {"I32"}}
 
 
 # Qwen3.8-Flash-Next (qwen4exp): hyper-connections replace every norm, so a
@@ -797,6 +815,8 @@ def loaded_tensors(metadata):
             ffn = DENSE_TENSORS
         elif f"blk.{layer}.ffn_gate_up_exps.weight" in metadata.tensors:
             ffn = fused
+        elif f"blk.{layer}.ffn_gate_up_exps.ulmoe_codes" in metadata.tensors:
+            ffn = ulmoe_experts(architecture.moe_tensors)
         else:
             ffn = architecture.moe_tensors
         parts = architecture.layer_tensors | mixer | ffn
