@@ -865,9 +865,7 @@ Cache::WalkCursor Cache::cursorAfter(Unit unit, uint64_t block) const {
 
 void Cache::holdAfter(const Walk &walk, WalkCursor &cursor) const {
   using Phase = WalkCursor::Phase;
-  const auto waits = [&](uint64_t block) {
-    return !passesOver(walk, block) && states_.reclaimOutcome(block).pending;
-  };
+  const auto waits = [&](uint64_t block) { return stateReclaim(walk, block).when == StateReclaim::When::Later; };
   if (cursor.phase == Phase::Checkpoints && cursor.last == Unit::Checkpoint && waits(cursor.lastCandidate.id)) {
     cursor = WalkCursor{.phase = walk.scope.statesOnly ? Phase::Ordinary : Phase::DeadLeaves};
     return;
@@ -912,13 +910,19 @@ bool Cache::certainReuse(uint64_t block) const {
   return block == states_.resumePoint() || std::ranges::find(wanted_.states(), block) != wanted_.states().end();
 }
 
-bool Cache::passesOver(const Walk &walk, uint64_t block) const {
-  return states_.reclaimWrites(block) &&
-         (!walk.writes || (walk.timing == ReclaimTiming::Immediate && states_.writing()));
+Cache::StateReclaim Cache::stateReclaim(const Walk &walk, uint64_t block) const {
+  using When = StateReclaim::When;
+  const bool write = states_.reclaimWrites(block);
+  if (write && (!walk.writes || (walk.timing == ReclaimTiming::Immediate && states_.writing())))
+    return {When::PassedOver, true};
+  // As reclaim() goes: a write waits for the one in flight, a copy ahead
+  // keeps its state until it lands.
+  const StateEviction outcome = states_.reclaimOutcome(block);
+  return {outcome.pending ? When::Later : When::Now, write || outcome.pending};
 }
 
 StateEviction Cache::reclaimState(const Walk &walk, uint64_t block) {
-  if (passesOver(walk, block))
+  if (stateReclaim(walk, block).when == StateReclaim::When::PassedOver)
     return {};
   return states_.reclaim(block);
 }
@@ -974,21 +978,15 @@ uint64_t blockOfKey(uint64_t key) noexcept { return key & ((uint64_t{1} << kUnit
 
 } // namespace
 
-std::optional<engine::Victim> Cache::victimOf(const WalkUnit &unit) const {
+std::optional<engine::Victim> Cache::victimOf(const Walk &walk, const WalkUnit &unit) const {
   const uint64_t block = unit.candidate.id;
-  const StateEviction outcome = states_.reclaimOutcome(block);
-  if (!outcome.evicted && !outcome.pending)
-    return std::nullopt;
-  const bool inUse = unit.unit == Unit::UsedState;
-  engine::Victim victim{.key = unitKey(static_cast<uint8_t>(unit.unit), block),
-                        .stateBuffers = outcome.evicted ? 1u : 0u,
-                        // One whose write the idle staging buffer takes
-                        // frees now; one that waits for the write in flight
-                        // frees nothing yet.
-                        .write = outcome.pending || states_.reclaimWrites(block),
-                        .later = outcome.pending,
-                        .cls = inUse ? ReclaimClass::InUse : ReclaimClass::Ordinary};
-  return victim;
+  const StateReclaim reclaim = stateReclaim(walk, block);
+  const bool now = reclaim.when == StateReclaim::When::Now;
+  return engine::Victim{.key = unitKey(static_cast<uint8_t>(unit.unit), block),
+                        .stateBuffers = now ? 1u : 0u,
+                        .write = reclaim.write,
+                        .later = !now,
+                        .cls = unit.unit == Unit::UsedState ? ReclaimClass::InUse : ReclaimClass::Ordinary};
 }
 
 bool Cache::trims(const Walk &walk) const noexcept {
@@ -1246,7 +1244,7 @@ std::optional<engine::Victim> Cache::peek(const VictimQuery &query, const engine
     holdAfter(walk, cursor);
   }
   for (std::optional<WalkUnit> unit; (unit = nextStepUnit(walk, cursor));)
-    if (std::optional<engine::Victim> victim = victimOf(*unit))
+    if (std::optional<engine::Victim> victim = victimOf(walk, *unit))
       return victim;
   return std::nullopt;
 }
@@ -1497,9 +1495,9 @@ Cache::ReclaimResult Cache::recycleState(const Walk &walk) {
   states.scope.pagesOnly = false;
   WalkCursor cursor;
   while (const std::optional<WalkUnit> state = nextStepUnit(states, cursor)) {
-    if (passesOver(states, state->candidate.id))
+    const StateEviction eviction = reclaimState(states, state->candidate.id);
+    if (!eviction.evicted && !eviction.pending)
       continue;
-    const StateEviction eviction = states_.reclaim(state->candidate.id);
     return {.madeProgress = eviction.evicted, .pending = eviction.pending, .evictedState = eviction.evicted};
   }
   return {.pending = returns(states)};

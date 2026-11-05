@@ -940,7 +940,7 @@ private:
   // Its scope; how long it can wait for memory (ReclaimTiming); whether it
   // starts writes at all, which the reclaims of what frees with no write
   // (ReclaimPhase::Now) do not (writes); what it passes over then
-  // (passesOver);
+  // (stateReclaim);
   // what it keeps beside what is in use, the resume point and the restored
   // chains; the shortfall a transfer in flight must cover for a step that
   // finds nothing to report pending (returnsInFlight), any transfer without
@@ -1025,15 +1025,25 @@ private:
   // The state is of certain reuse beside what is in use: the resume point,
   // a wanted chain's state.
   [[nodiscard]] bool certainReuse(uint64_t block) const;
-  // The walk passes over the state at this block, which needs a write
-  // (StateCache::reclaimWrites) it does not start: it starts none, or it
-  // cannot wait and the write in flight holds the staging buffer.
-  [[nodiscard]] bool passesOver(const Walk &walk, uint64_t block) const;
-  // What peek() reports of a state unit the walk reaches, none when taking
-  // it frees nothing. Each state counts as its reclaim would go now: one
-  // whose write starts frees now, and once a take has started it the next
-  // state that needs a write waits for it, which peek then reports.
-  [[nodiscard]] std::optional<engine::Victim> victimOf(const WalkUnit &unit) const;
+  // What a walk does with the RAM copy of a state it reaches, the one rule
+  // every step and count of the walk follows (holdAfter, reclaimState,
+  // victimOf, reach through StateCache::reclaims, recycleState): passes it
+  // over when it needs a write (StateCache::reclaimWrites) the walk does not
+  // start, as the walk starts none or cannot wait while the write in flight
+  // holds the staging buffer; else frees it now, with no write or through
+  // the idle staging buffer's (`write`); else frees it once the write in
+  // flight lands (Later), or once its own copy ahead lands.
+  struct StateReclaim final {
+    enum class When : uint8_t { PassedOver, Now, Later };
+    When when = When::Now;
+    bool write = false;
+  };
+  [[nodiscard]] StateReclaim stateReclaim(const Walk &walk, uint64_t block) const;
+  // What peek() reports of a state unit the walk reaches (stateReclaim):
+  // what frees now gives its buffers; what the walk passes over or what
+  // waits for a write gives nothing yet, later, so that a claim that does
+  // not wait for writes passes over it.
+  [[nodiscard]] std::optional<engine::Victim> victimOf(const Walk &walk, const WalkUnit &unit) const;
   // The phases of a device or a page need's reclaims (Unit::Reclaim): of
   // the ordinary class, then of what is in use, each what frees with no
   // write, then the state whose write the idle staging buffer takes, which
