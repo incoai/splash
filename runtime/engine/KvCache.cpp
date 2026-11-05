@@ -448,17 +448,14 @@ KvCache::Keeps KvCache::keeps(uint64_t blockId) const { return block(blockId).ke
 
 bool KvCache::trimmable(uint64_t blockId) const { return orders(block(blockId)).trimmable; }
 
-void KvCache::setStateKeeps(uint64_t blockId, Keeps keeps, bool needed, bool candidate, bool inRam) noexcept {
+void KvCache::setStateMarks(uint64_t blockId, StateMarks state, bool inRam) noexcept {
   const auto found = blocks_.find(blockId);
   if (found == blocks_.end())
     std::terminate();
   Block &entry = found->second;
-  if (entry.stateKeeps == keeps && entry.stateNeeded == needed && entry.stateCandidate == candidate &&
-      entry.stateInRam == inRam)
+  if (entry.state == state && entry.stateInRam == inRam)
     return;
-  entry.stateKeeps = keeps;
-  entry.stateNeeded = needed;
-  entry.stateCandidate = candidate;
+  entry.state = state;
   entry.stateInRam = inRam;
   // Whether the state is in use, or in RAM, places the leaf too.
   placeLeaf(entry);
@@ -496,8 +493,8 @@ void KvCache::rekeep(Block &start) noexcept {
   for (Block *entry = &start;;) {
     const bool resident = entry->page != noPage;
     const bool active = resident && pool_.pageActive(entry->page);
-    const bool needed = entry->stateNeeded || entry->neededChildren;
-    Keeps here = entry->stateKeeps;
+    const bool needed = entry->state.needed || entry->neededChildren;
+    Keeps here = entry->state.keeps;
     if (resident && (entry->transfer == Transfer::Filling || entry->activeUsers || active ||
                      (entry->poisoned && !entry->residentChildren)))
       here |= busy;
@@ -517,7 +514,7 @@ void KvCache::rekeep(Block &start) noexcept {
     if (active)
       keeps &= static_cast<Keeps>(~kChainKeeps);
     entry->keepsHere = here;
-    const uint16_t candidate = resident && entry->stateCandidate ? keeps : noCount;
+    const uint16_t candidate = resident && entry->state.candidate ? keeps : noCount;
     if (candidate != entry->candidateCounted) {
       if (entry->candidateCounted != noCount)
         --candidateCounts_[entry->candidateCounted];
@@ -622,14 +619,14 @@ KvCache::PageReach KvCache::reachByRule(Keeps mask, std::span<const uint64_t> ke
     const bool keptChain = on(kept, id), aboveWrite = on(unwaited, id);
     const bool now = !(entry.keeps & mask) && !keptChain && !aboveWrite;
     reach.now[form] += now ? 1 : 0;
-    reach.candidates += now && entry.stateCandidate ? 1 : 0;
+    reach.candidates += now && entry.state.candidate ? 1 : 0;
     reach.reachable[form] += !(entry.keeps & (idle ? stays : busy)) && !(keptChain && idle) && !aboveWrite ? 1 : 0;
   }
   if (!written)
     return reach;
   // Once the written state has left RAM through its write: the reasons at
   // each block and below it, its own write gone.
-  const Keeps kind = block(written).stateKeeps & (keepBit(Keep::Writer) | keepBit(Keep::UsedWriter));
+  const Keeps kind = block(written).state.keeps & (keepBit(Keep::Writer) | keepBit(Keep::UsedWriter));
   const auto after = [&](const auto &self, uint64_t id) -> Keeps {
     const Block &entry = block(id);
     Keeps keeps = id == written ? static_cast<Keeps>(entry.keepsHere & ~kind) : entry.keepsHere;
@@ -696,7 +693,7 @@ KvCache::PageReach KvCache::countReach(Keeps mask, std::span<const uint64_t> kep
           --reach.reachable[form];
         if (!(entry.keeps & mask) && outOfNow.insert(id).second) {
           --reach.now[form];
-          reach.candidates -= entry.stateCandidate ? 1 : 0;
+          reach.candidates -= entry.state.candidate ? 1 : 0;
         }
       }
       id = entry.parent;
@@ -711,7 +708,7 @@ KvCache::PageReach KvCache::countReach(Keeps mask, std::span<const uint64_t> kep
   // Up the written state's chain while its blocks free once it has left RAM:
   // its write no longer keeps them, and it needs a block without a copy as
   // a state on disk does.
-  const Keeps kind = block(written).stateKeeps & (keepBit(Keep::Writer) | keepBit(Keep::UsedWriter));
+  const Keeps kind = block(written).state.keeps & (keepBit(Keep::Writer) | keepBit(Keep::UsedWriter));
   const auto kindIndex = static_cast<size_t>(kind == keepBit(Keep::Writer) ? Keep::Writer : Keep::UsedWriter);
   if (!kind || !(kind & mask))
     throw std::logic_error("the state a reach writes is no state its walk writes");
@@ -1115,7 +1112,7 @@ KvCache::Orders KvCache::orders(const Block &entry) const noexcept {
 KvCache::LeafKind KvCache::leafKind(const Block &entry) const noexcept {
   if (!entry.statesHere && !entry.statesBelow)
     return {.dead = true};
-  return {.inUse = (entry.stateKeeps & keepBit(Keep::Used)) || entry.statesInUseBelow,
+  return {.inUse = (entry.state.keeps & keepBit(Keep::Used)) || entry.statesInUseBelow,
           .stateInRam = entry.stateInRam,
           .copied = entry.slot != nullptr};
 }
@@ -1298,9 +1295,7 @@ void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &state
   std::array<uint32_t, size_t{3} << (kKeeps + 1)> counts{};
   std::array<uint32_t, size_t{1} << kKeeps> candidates{};
   for (const Block *entry : deepestFirst) {
-    check(!marks || marks(entry->id) == Marks{.stateKeeps = entry->stateKeeps,
-                                              .stateNeeded = entry->stateNeeded,
-                                              .stateCandidate = entry->stateCandidate,
+    check(!marks || marks(entry->id) == Marks{.state = entry->state,
                                               .stateInRam = entry->stateInRam,
                                               .wanted = entry->wanted,
                                               .resumePoint = entry->resumePoint},
@@ -1311,8 +1306,8 @@ void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &state
           "a block counts its children with each reason");
     const bool resident = entry->page != noPage;
     const bool active = resident && pool_.pageActive(entry->page);
-    const bool needed = entry->stateNeeded || below[kKeeps];
-    Keeps here = entry->stateKeeps;
+    const bool needed = entry->state.needed || below[kKeeps];
+    Keeps here = entry->state.keeps;
     if (resident && (entry->transfer == Transfer::Filling || entry->activeUsers || active ||
                      (entry->poisoned && !entry->residentChildren)))
       here |= keepBit(Keep::Busy);
@@ -1336,7 +1331,7 @@ void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &state
     check(entry->counted == counted, "a block counts under its form, reasons and idleness");
     if (resident)
       ++counts[counted];
-    const uint16_t candidate = resident && entry->stateCandidate ? keeps : noCount;
+    const uint16_t candidate = resident && entry->state.candidate ? keeps : noCount;
     check(entry->candidateCounted == candidate, "a block with a RAM copy a reclaim may take counts under its reasons");
     if (candidate != noCount)
       ++candidates[candidate];

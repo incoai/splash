@@ -10,7 +10,6 @@
 #include <memory>
 #include <optional>
 #include <span>
-#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -278,9 +277,9 @@ public:
   // walk's order up to the staged one, never every state.
   [[nodiscard]] uint64_t reclaimVisits() const noexcept { return reclaimVisits_; }
   // What the state at the block asks of its KV, and whether it is a RAM copy
-  // a reclaim may take (KvCache::setStateKeeps), as the cache's counts
+  // a reclaim may take (KvCache::setStateMarks), as the cache's counts
   // should name it: none without a state.
-  [[nodiscard]] std::tuple<KvCache::Keeps, bool, bool> keeps(uint64_t kvBlock) const noexcept;
+  [[nodiscard]] KvCache::StateMarks marks(uint64_t kvBlock) const noexcept;
   // What reclaim(kvBlock) of a reclaimable state does, doing nothing:
   // evicted or pending. A write the quota refuses drops the state, which
   // counts as evicted.
@@ -382,12 +381,12 @@ private:
   [[nodiscard]] std::optional<CompositeStateLease>
   acquireBlock(uint64_t kvBlock);
   // Places the entry in the orders its copies call for, and names what it
-  // asks of its KV (keeps), whether it has a RAM copy and the resume point to
+  // asks of its KV (marks), whether it has a RAM copy and the resume point to
   // the KV cache.
   void reindex(uint64_t kvBlock, Entry &entry) noexcept;
   // A RAM copy a reclaim may take: in the order of its class.
   [[nodiscard]] bool candidate(uint64_t kvBlock, const Entry &entry) const noexcept;
-  [[nodiscard]] std::tuple<KvCache::Keeps, bool, bool> keeps(uint64_t kvBlock, const Entry &entry) const noexcept;
+  [[nodiscard]] KvCache::StateMarks marks(uint64_t kvBlock, const Entry &entry) const noexcept;
   // Names the resume point to the KV cache once it moved.
   void markResumePoint() noexcept;
   void discardRam(Entry &entry) noexcept;

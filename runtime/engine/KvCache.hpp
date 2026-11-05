@@ -226,7 +226,7 @@ public:
   // the block is used, a request holds its page, a restore fills it, or it
   // is a poisoned leaf, which no reclaim reaches. Moving: a write drains its
   // page, which a reclaim reaches once the write lands. Uncopied: it has no copy and a
-  // state that needs its KV sits at it or below (setStateKeeps), which a
+  // state that needs its KV sits at it or below (setStateMarks), which a
   // writable tier writes before the page goes. Writer, UsedWriter: the
   // state at it is a RAM copy a reclaim may take that has no disk copy,
   // not in use or in use, which leaves RAM only through a write while the
@@ -247,16 +247,23 @@ public:
   static constexpr Keeps kChainKeeps =
       static_cast<Keeps>(1u << static_cast<unsigned>(Keep::Used) | 1u << static_cast<unsigned>(Keep::Wanted) |
                          1u << static_cast<unsigned>(Keep::ResumePoint));
-  // StateCache names, as it changes, what the state at the block asks of
-  // the KV it restores through: Writer or UsedWriter, Used, or none; and
-  // whether it needs the KV as it is: every state but a RAM copy a reclaim
-  // may take without a disk copy, which leaves through a write (that makes
-  // its chain needed) or with no copy; and whether it is a RAM copy a
-  // reclaim may take (StateCache::candidate); and whether it has a RAM copy
-  // (inRam), which a reclaim's walk takes before the leaf (LeafKind).
-  // Without a state, none. A RAM copy sits on a block with a page
+  // What the state at a block asks of the KV it restores through: its
+  // reasons, Writer or UsedWriter, Used, or none; whether it needs the KV
+  // as it is: every state but a RAM copy a reclaim may take without a disk
+  // copy, which leaves through a write (that makes its chain needed) or
+  // with no copy; and whether it is a RAM copy a reclaim may take
+  // (StateCache::candidate). Without a state, none.
+  struct StateMarks final {
+    Keeps keeps = 0;
+    bool needed = false;
+    bool candidate = false;
+    friend bool operator==(const StateMarks &, const StateMarks &) = default;
+  };
+  // StateCache names, as they change, the marks of the state at the block
+  // and whether it has a RAM copy (inRam), which a reclaim's walk takes
+  // before the leaf (LeafKind). A RAM copy sits on a block with a page
   // (Cache::checkInvariants), so a Writer or UsedWriter names a resident block.
-  void setStateKeeps(uint64_t blockId, Keeps keeps, bool needed, bool candidate, bool inRam) noexcept;
+  void setStateMarks(uint64_t blockId, StateMarks state, bool inRam) noexcept;
   // The reasons at the block or below it: its page frees now for a walk
   // none of whose reasons they hold.
   [[nodiscard]] Keeps keeps(uint64_t blockId) const;
@@ -406,12 +413,10 @@ public:
   [[nodiscard]] uint64_t upgrades() const noexcept { return upgrades_; }
   // Blocks a state's tail holds (countState).
   [[nodiscard]] uint32_t pinnedBlocks() const noexcept { return pinnedBlocks_; }
-  // What the cache was told of a block (setStateKeeps, countWanted,
+  // What the cache was told of a block (setStateMarks, countWanted,
   // moveResumePoint).
   struct Marks final {
-    Keeps stateKeeps = 0;
-    bool stateNeeded = false;
-    bool stateCandidate = false;
+    StateMarks state;
     bool stateInRam = false;
     uint32_t wanted = 0;
     bool resumePoint = false;
@@ -482,7 +487,7 @@ private:
     // With a window alone.
     RecencyOrder::Node trimNode;
     // What keeps its page, and those above it, in place (Keep): its state's
-    // reasons and whether that state needs its KV (setStateKeeps), the
+    // reasons and whether that state needs its KV (setStateMarks), the
     // waiting chains that end at it and whether it is the resume point;
     // from those and its own fields the reasons at it, and those at it or
     // below it with the children that have each, and whether a state that
@@ -490,9 +495,7 @@ private:
     // does. A resident block counts in keepCounts_ under its form, its
     // reasons and whether it is idle (no request holds it, no transfer
     // moves it): `counted` names where, noCount for none.
-    Keeps stateKeeps = 0;
-    bool stateNeeded = false;
-    bool stateCandidate = false;
+    StateMarks state;
     // No reason: whether the state has a RAM copy, which places a resident
     // leaf (LeafKind).
     bool stateInRam = false;

@@ -537,7 +537,8 @@ void testPageReachFollowsItsRule() {
         entry->needed = entry->state && !writer;
         entry->candidate = entry->state && resident(id) && (writer || pick(1));
         entry->ram = entry->candidate || (entry->state && pick(1));
-        cache.setStateKeeps(id, entry->keeps, entry->needed, entry->candidate, entry->ram);
+        cache.setStateMarks(id, {.keeps = entry->keeps, .needed = entry->needed, .candidate = entry->candidate},
+                            entry->ram);
       }
       break;
     case 8:
