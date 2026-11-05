@@ -94,7 +94,7 @@ struct ClaimSpec final {
   // asks for sooner: the KV past a prefill command's first state boundary,
   // which the lane's next command takes should this one end there. The host
   // judges it as the lane's InService growth (by the margin, not the band);
-  // refused, it takes the in-place units its class may take and passes the
+  // refused, it takes the in-place units its take rights take and passes the
   // margin once none meets the refusal (MemoryGovernor::free).
   bool laneNeeds = false;
 };
@@ -146,8 +146,8 @@ struct FreeResult final {
   }
 };
 
-// What taking a unit gives up besides its bytes, which the claim's class
-// decides whether it may: memory nothing needs now (a cached unit, a
+// What taking a unit gives up besides its bytes, which the claim's take
+// rights decide whether it may: memory nothing needs now (a cached unit, a
 // buffer), a Resident lane's KV in memory (its conversion to Spill), or the
 // command between its passes.
 enum class VictimKind : uint8_t { Memory, Conversion, PassCommand };
@@ -431,7 +431,7 @@ private:
   // model's pool, beyond the `before` ones counted already (setBufferBytes).
   [[nodiscard]] uint64_t bufferBytes(const VictimQuery &query, const Lacking &lack, uint32_t before,
                                      uint32_t added) const;
-  // The most the units the claim's class may take give it, counted in the
+  // The most the units the claim's rights take give it, counted in the
   // one order without taking any, up to the lack.
   [[nodiscard]] Run bound(const ClaimSpec &spec, const VictimQuery &query, const Lacking &lack) const;
   // Takes those units in that order, one at a time, until what they freed

@@ -1279,7 +1279,7 @@ claims ranked above it hold. The ledger first gives back what costs nothing,
 the idle state buffers. A claim that can wait then waits when what is landing
 meets its need: the transfers in flight and the copies its own lanes owe.
 Otherwise the ledger walks one fixed order, the same for every claimant. A
-unit the claim's class may not take is skipped, not a stop:
+unit the claim's rights (`TakeRights`) do not take is skipped, not a stop:
 
 1. Idle state buffers.
 2. The prefix cache's units that free memory now, in its one order

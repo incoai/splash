@@ -820,17 +820,18 @@ private:
   // use; a checkpoint, a junction or an ordinary state is Optional, within
   // what frees memory at once.
   [[nodiscard]] ClaimSpec stateClaim(const Request &request, StateClass kind, bool supersedes) const;
-  // The victims that are the engine's decisions, in this order: the model's idle state buffers, which cost nothing and are
-  // taken as they go (Model::releaseIdleBuffer, keeping one lane's short of
-  // critical pressure), of at least Model::idleBufferBytes of no evicted states; the command
-  // between its passes, for a claim whose work supersedes it, at no cost; the
-  // claimant's own lane's conversion to Spill, offered only for its KV growth
-  // (ClaimSpec::kvGrowth) while it decodes Resident, not ended and not
-  // between passes, on a target that can spill with the tier open and its
-  // quota holding the lane's pages, and only where the pages it would spill
-  // free, net of the first lane's hot block floor its decode then reads
-  // through, cover what the claim lacks. It frees its memory as its copies
-  // land. The command between its passes gives back the
+  // The victims that are the engine's decisions, in this order, each offered
+  // only as the claim's take rights allow: the model's idle state buffers,
+  // which cost nothing and are taken as they go (Model::releaseIdleBuffer),
+  // of at least Model::idleBufferBytes of no evicted states, keeping one
+  // lane's start unless the rights take every reserve; the command between
+  // its passes (TakeRights::passCommand), at no cost; the lane's conversion
+  // to Spill (TakeRights::convertLane) while it decodes Resident, not ended
+  // and not between passes, on a target that can spill with the tier open
+  // and its quota holding the lane's pages, and only where the pages it
+  // would spill free, net of the first lane's hot block floor its decode
+  // then reads through, cover what the claim lacks. It frees its memory as
+  // its copies land. The command between its passes gives back the
   // buffers of the states it would capture, which the model's pool releases
   // at once; its lanes that ended end after the plan is made again
   // (settleEndedBetweenPasses).
