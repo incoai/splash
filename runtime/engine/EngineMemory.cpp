@@ -894,12 +894,16 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
       return {FreeOutcome::Met, bytes};
     return {};
   case VictimKind::Conversion:
+    // Its Full pages as peek counted them, once their copies land.
     if (engine.convertToSpill(engine.request(victim.key)))
-      return {FreeOutcome::Pending, 0, victim.bytes};
+      return {.outcome = FreeOutcome::Pending,
+              .laterBytes = victim.bytes,
+              .pages = query.need.form == victim.form ? victim.pages : 0};
     return {};
   case VictimKind::PassCommand:
+    // The buffers its captures held.
     engine.takePassCommand();
-    return {FreeOutcome::Met, releaseIdle()};
+    return {.outcome = FreeOutcome::Met, .nowBytes = releaseIdle(), .stateBuffers = victim.stateBuffers};
   }
   return {};
 }

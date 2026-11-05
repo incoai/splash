@@ -1139,7 +1139,6 @@ std::optional<engine::Victim> Cache::reclaimUnit(const Walk &walk, ReclaimPhase 
                         .form = walk.form,
                         .stateBuffers = unit.states,
                         .later = later,
-                        .stepwise = true,
                         .cls = used ? ReclaimClass::InUse : ReclaimClass::Ordinary};
 }
 
@@ -1198,7 +1197,9 @@ FreeResult Cache::take(const VictimQuery &query, const engine::Victim &victim) {
     // Into free Slim pages alone, as peek counted them: the ledger takes
     // outside any allocation's scope, and the Slim runway refills where the
     // engine trims in one (Engine::prepare).
-    return trimWindows(false) ? met() : FreeResult{};
+    if (trimWindows(false))
+      return {.outcome = FreeOutcome::Met, .pages = victim.pages};
+    return {};
   case Unit::Reclaim: {
     // One reclaim of the unit's phase: a device need's memory reclaim
     // (takeReclaim), a page need's eviction, and in a windowed cache the

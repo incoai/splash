@@ -184,15 +184,18 @@ public:
       cache_.setWantedChains({wanted});
     }
     const bool wantedResident = !wanted.empty() && cache_.stateResident(wanted.back());
-    std::vector<engine::Victim> units;
+    // Each unit, with the one before it in the cache's order.
+    std::vector<std::pair<std::optional<engine::Victim>, engine::Victim>> units;
     uint64_t counted = 0;
     uint32_t countedPages = 0;
-    for (std::optional<engine::Victim> unit = cache_.peek(query, nullptr); unit; unit = cache_.peek(query, &*unit)) {
+    std::optional<engine::Victim> previous;
+    for (std::optional<engine::Victim> unit = cache_.peek(query, nullptr); unit;
+         previous = unit, unit = cache_.peek(query, &*previous)) {
       if (unit->later && immediate)
         continue;
       counted += unit->bytes;
       countedPages += unit->form == form ? unit->pages : 0;
-      units.push_back(*unit);
+      units.emplace_back(previous, *unit);
     }
     // The free pages of the form, and for a claim that can wait the landing ones.
     const auto pagesOf = [&] {
@@ -206,19 +209,21 @@ public:
     uint64_t freed = 0;
     uint64_t releasedNow = 0;
     uint32_t reportedPages = 0;
-    for (const engine::Victim &unit : units) {
-      // A stepwise unit's steps until one takes nothing, each a reclaim of
-      // a finite cache.
-      for (;;) {
+    for (const auto &[after, first] : units) {
+      // A unit's takes while the cache offers it again in its place, until
+      // one takes nothing: a reclaim phase goes a step at a time, each a
+      // reclaim of a finite cache.
+      for (std::optional<engine::Victim> unit = first; unit && unit->key == first.key;
+           unit = cache_.peek(query, after ? &*after : nullptr)) {
         const uint64_t before = pool_.allocatedBytes();
-        const FreeResult taken = cache_.take(query, unit);
+        const FreeResult taken = cache_.take(query, *unit);
         const uint64_t released = before - std::min(before, pool_.allocatedBytes());
         require(taken.nowBytes <= released, "a take released " + std::to_string(released) + " bytes, reported " +
                                                 std::to_string(taken.nowBytes));
         freed += taken.nowBytes + taken.laterBytes;
         releasedNow += released;
         reportedPages += taken.pages;
-        if (!unit.stepwise || !taken.gave())
+        if (!taken.gave())
           break;
         ++steps;
       }

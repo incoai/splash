@@ -335,19 +335,18 @@ public:
     }
   }
 
-  // The head's stage in the order: kWriteStage is the cache's units that
-  // free once a write lands, and from kCostlyStage on, a unit's loss costs
-  // work later (Run::costly).
-  static constexpr int kWriteStage = 2;
-  static constexpr int kCostlyStage = 3;
-  [[nodiscard]] static int stage(const Head &head) {
+  // The order's stages. What frees without a write comes first; from
+  // PassOrConversion on, a unit's loss costs work later (Run::costly), and a
+  // pending unit holds those stages back.
+  enum class Stage : uint8_t { FreeNow, Rebuild, NeedsWrite, PassOrConversion, StoreAboveFloor, InUse };
+  [[nodiscard]] static Stage stage(const Head &head) {
     if (head.pool)
-      return head.state.rebuildOnly ? 1 : 4;
+      return head.state.rebuildOnly ? Stage::Rebuild : Stage::StoreAboveFloor;
     if (head.victim->kind != VictimKind::Memory)
-      return kCostlyStage;
+      return Stage::PassOrConversion;
     if (head.victim->cls == ReclaimClass::InUse)
-      return 5;
-    return head.victim->later ? kWriteStage : 0;
+      return Stage::InUse;
+    return head.victim->later ? Stage::NeedsWrite : Stage::FreeNow;
   }
 
   // Moves past the head's unit, which stays in its source's order (or which
@@ -461,7 +460,7 @@ MemoryLedger::Run MemoryLedger::take(const VictimQuery &query, const Lacking &la
   Order order(*this, query);
   Run run{.freed = {.outcome = FreeOutcome::Met}};
   // A pending unit holds back the stages after the cache's writes.
-  int ceiling = std::numeric_limits<int>::max();
+  Order::Stage ceiling = Order::Stage::InUse;
   while (!lack.none() && !lack.covered(run.bytes, run.pages, run.buffers)) {
     Order::Head *best = nullptr;
     for (Order::Head &head : order.heads) {
@@ -490,17 +489,10 @@ MemoryLedger::Run MemoryLedger::take(const VictimQuery &query, const Lacking &la
       if (unit.later && unit.kind == VictimKind::Memory)
         run.uncopied = true;
     }
-    // A stepwise unit's step reports what it freed; a whole unit frees the
-    // pages and buffers peek gave.
-    const bool took = taken.gave();
-    if (took && !unit.stepwise) {
-      taken.pages = unit.form == lack.form ? unit.pages : 0;
-      taken.stateBuffers = unit.stateBuffers;
-    }
-    if (!took) {
+    if (!taken.gave()) {
       if (taken.outcome == FreeOutcome::Pending && query.rights.waitsForWrites) {
         run.pending = true;
-        ceiling = std::min(ceiling, std::max(Order::stage(*best), Order::kWriteStage));
+        ceiling = std::min(ceiling, std::max(Order::stage(*best), Order::Stage::NeedsWrite));
       }
       order.pass(*best);
       continue;
@@ -513,7 +505,7 @@ MemoryLedger::Run MemoryLedger::take(const VictimQuery &query, const Lacking &la
     run.bytes = plus(run.bytes, plus(plus(taken.nowBytes, taken.laterBytes), buffers));
     run.pages += taken.pages;
     run.buffers += taken.stateBuffers;
-    run.costly = run.costly || Order::stage(*best) >= Order::kCostlyStage;
+    run.costly = run.costly || Order::stage(*best) > Order::Stage::NeedsWrite;
     if (!run.took.empty() && run.took.back().source == best->source && run.took.back().pool == best->pool &&
         run.took.back().unit.key == unit.key)
       run.took.back().bytes = plus(run.took.back().bytes, plus(taken.nowBytes, taken.laterBytes));

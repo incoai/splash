@@ -135,8 +135,8 @@ struct FreeResult final {
   uint64_t nowBytes = 0;     // left memory now (extents, chunks, buffers)
   uint64_t laterBytes = 0;   // leave memory when transfers it started land
   // The free KV pages of the need's form it gave, now or as its transfers
-  // land, and the pooled state buffers it freed: a stepwise unit's step
-  // (Victim::stepwise), and free()'s units.
+  // land, and the pooled state buffers it freed: a source's take, and
+  // free()'s units.
   uint32_t pages = 0;
   uint32_t stateBuffers = 0;
 
@@ -163,10 +163,6 @@ struct Victim final {
   // false: a unit that costs nothing, taken before any count, whose
   // bytes are at least what peek gives (available() counts them)
   bool sized = true;
-  // Taken a step at a time (the cache's reclaims): each take makes one step
-  // and reports what it freed, pages and buffers too. Any other unit goes
-  // whole in one take, at the pages and buffers peek gave.
-  bool stepwise = false;
   ReclaimClass cls = ReclaimClass::Ordinary;
   VictimKind kind = VictimKind::Memory;
 };
@@ -226,7 +222,8 @@ struct VictimQuery final {
 // order with at most what taking it frees, never less: free() takes nothing
 // unless what it peeked covers the need. take takes the unit, or one step of
 // it where the source frees it a step at a time (the cache's reclaims), and
-// reports what that freed: Met, or Pending on the transfers it started, when
+// reports what that freed, the pages of the need's form and the state
+// buffers too: Met, or Pending on the transfers it started, when
 // it took something; else Pending while a transfer in flight holds the unit,
 // Short when nothing of it is left. A later unit's bytes include what goes
 // only once another of its transfers lands: take starts what can start now,

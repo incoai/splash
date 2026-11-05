@@ -68,21 +68,26 @@ public:
       ++unit;
     return unit == units.end() ? std::nullopt : std::optional<Victim>(*unit);
   }
-  FreeResult take(const VictimQuery &, const Victim &victim) override {
+  // A unit goes whole: its pages of the need's form and its state buffers.
+  FreeResult take(const VictimQuery &query, const Victim &victim) override {
     const auto unit = std::ranges::find(units, victim.key, &Victim::key);
     if (unit == units.end())
       throw std::logic_error("took a unit the source does not hold");
     taken.push_back(unit->key);
     const Victim gone = *unit;
     units.erase(unit);
+    FreeResult freed{.outcome = FreeOutcome::Met,
+                     .pages = gone.form == query.need.form ? gone.pages : 0,
+                     .stateBuffers = gone.stateBuffers};
     if (gone.later) {
       landing.push_back(gone);
-      return {.outcome = FreeOutcome::Met, .laterBytes = gone.bytes};
+      freed.laterBytes = gone.bytes;
+      return freed;
     }
-    const uint64_t bytes = gone.sized ? gone.bytes : unsizedBytes;
-    if (memory_ && bytes)
-      memory_->release(name_, bytes);
-    return {.outcome = FreeOutcome::Met, .nowBytes = bytes};
+    freed.nowBytes = gone.sized ? gone.bytes : unsizedBytes;
+    if (memory_ && freed.nowBytes)
+      memory_->release(name_, freed.nowBytes);
+    return freed;
   }
   // The units taken to land later free their memory. With
   // landsIntoExtents, as the cache's demotions do, a landing only empties
@@ -722,9 +727,9 @@ public:
   }
   FreeResult take(const VictimQuery &, const Victim &victim) override {
     taken.push_back(units.at(victim.key).first);
-    const uint64_t bytes = units[victim.key].second.bytes;
+    const Victim gone = units[victim.key].second;
     units.erase(units.begin() + static_cast<std::ptrdiff_t>(victim.key));
-    return {.outcome = FreeOutcome::Met, .nowBytes = bytes};
+    return {.outcome = FreeOutcome::Met, .nowBytes = gone.bytes, .stateBuffers = gone.stateBuffers};
   }
   std::vector<std::pair<uint64_t, Victim>> units;  // the test's name for each unit, and the unit
   std::vector<uint64_t> taken;
@@ -1118,9 +1123,10 @@ public:
   FreeResult take(const VictimQuery &, const Victim &victim) override {
     const auto unit = std::ranges::find(units, victim.key, &Victim::key);
     taken.push_back(unit->key);
-    pool_.idle += unit->stateBuffers;
+    const uint32_t buffers = unit->stateBuffers;
+    pool_.idle += buffers;
     units.erase(unit);
-    return {FreeOutcome::Met};
+    return {.outcome = FreeOutcome::Met, .stateBuffers = buffers};
   }
   std::vector<Victim> units;
   std::vector<uint64_t> taken;
