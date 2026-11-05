@@ -562,14 +562,11 @@ public:
     pools_[0] = experts;
     return experts ? std::span<model::ElasticPool *const>(pools_) : std::span<model::ElasticPool *const>();
   }
-  // The bytes reserveSpilledReads(id, need) would allocate now: a decode's
-  // floor unless held, a prefill's staging beyond what it holds.
-  uint64_t spilledReadShortfall(uint64_t id, model::SpilledReadNeed need) const override {
-    if (need.kind == WorkKind::Decode)
-      return spilledReadFloors.contains(id) ? 0 : spilledReadFloorBytes - std::min(spilledReadFloorBytes, staleHotBytes);
+  // A prefill's staging beyond what it holds.
+  uint64_t stagingShortfall(uint64_t id, uint32_t pages) const override {
     const auto staged = historyStaging.find(id);
     const uint32_t held = staged == historyStaging.end() ? 0 : staged->second;
-    return need.pages > held ? uint64_t{need.pages - held} * stagingPageBytes : 0;
+    return pages > held ? uint64_t{pages - held} * stagingPageBytes : 0;
   }
   // Each lane's floor is spilledReadFloorBytes, linear where the real cache
   // rounds to whole extents (model::KvBlockCache::lanesShortfallBytes); the
@@ -678,9 +675,12 @@ public:
     if (need.kind == WorkKind::Decode) {
       if (refusedSpilledReads.contains(id) || (spilledReadsRoom && !spilledReadsRoom(id)))
         return {.allocationFailure = spilledReadsRefusal};
-      if (!spilledReadFloors.contains(id))
-        if (const metal::AllocationResult result = allocateReads(id, spilledReadFloorBytes); !result)
+      if (!spilledReadFloors.contains(id)) {
+        const uint64_t stale = std::min(spilledReadFloorBytes, staleHotBytes);
+        if (const metal::AllocationResult result = allocateReads(id, spilledReadFloorBytes - stale); !result)
           return {.allocationFailure = result.failure};
+        staleHotBytes -= stale;
+      }
       spilledReadFloors.insert(id);
       return {.ok = true};
     }
@@ -949,8 +949,9 @@ public:
   FakeMemory *memory = nullptr;
   metal::AllocationAdmission admission;
   uint64_t spilledReadFloorBytes = 0, stagingPageBytes = 0;
-  // The hot block cache's extents past the floors, which a lane's floor
-  // takes before it allocates (a Spill lane that ended left them).
+  // The hot block cache's extents past the floors that no lane reads (a
+  // Spill lane that ended left them): a lane's floor takes them before it
+  // allocates, and no shortfall counts them, as a Start may take them.
   uint64_t staleHotBytes = 0;
   uint64_t heldStateBytes = 0;
   std::unordered_map<uint64_t, uint64_t> spilledReadBytes;

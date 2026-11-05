@@ -68,15 +68,16 @@ KvMode Engine::placement(const Request &active) const {
   if (tokens <= spill.denseTokens)
     return KvMode::Resident;
   // Spill never takes more than Resident: its peak is its floor and, while
-  // it prefills, the staging of its history, while it decodes, the hot
-  // block cache it reads through.
+  // it prefills, the staging of its history, while it decodes, its lane's
+  // floor of the hot block cache it reads through, priced as laneDemand
+  // prices a waiting lane's: extents no lane reads are rebuild-only memory
+  // a Resident start may take as well, so they count for neither.
   const SpillGeometry &geometry = spill.geometry;
   const uint64_t id = active.request.id;
   const auto pages = static_cast<uint32_t>((tokens + KvCache::pageTokens - 1) / KvCache::pageTokens);
   const uint64_t resident = geometry.residentBytes(tokens);
   const uint64_t peak = geometry.spillFloorBytes(tokens) +
-                        std::max(model_.spilledReadShortfall(id, {WorkKind::Prefill, pages}),
-                                 model_.spilledReadShortfall(id, {WorkKind::Decode, pages}));
+                        std::max(model_.stagingShortfall(id, pages), model_.hotFloorShortfall(std::span(&id, 1)));
   if (resident <= peak)
     return KvMode::Resident;
   // Its Resident KV beside what the lanes still grow into, from what a

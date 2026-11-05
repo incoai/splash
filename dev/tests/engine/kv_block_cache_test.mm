@@ -371,9 +371,9 @@ void growsAndReleases(MetalBackend &backend) {
   std::cout << "kv_block_cache_test: growth and release PASS\n";
 }
 
-// A lane's floor allocates what laneShortfallBytes() says it lacks, nothing
-// once the floors' extents hold it; lanes waiting together lack their floors
-// once (lanesShortfallBytes). Growth under a passed admission consults
+// A lane's floor allocates what lanesShortfallBytes(1) says one more lane
+// lacks, nothing once the floors' extents hold it; lanes waiting together
+// lack their floors once. Growth under a passed admission consults
 // it, not the cache's, and a refusal changes nothing. As an elastic pool
 // (model::HotBlocksPool): the lanes' floors are its floor and an extent its
 // unit, given back above the floors one at a time or all at once, counted
@@ -398,13 +398,12 @@ void growsAsAPool(MetalBackend &backend) {
   require(cache.lanesShortfallBytes(3) == 2 * extent && !cache.lanesShortfallBytes(0),
           "the floors of lanes waiting together were not counted once in whole extents");
   for (const uint32_t lane : {0u, 1u, 2u}) {
-    const uint64_t shortfall = cache.laneShortfallBytes(lane);
+    const uint64_t shortfall = cache.lanesShortfallBytes(1);
     allocated = 0;
-    require(shortfall == (lane == 2 ? 0 : extent) && shortfall == cache.laneShortfallBytes() &&
-                cache.reserveLane(lane).granted() && allocated == shortfall && !cache.laneShortfallBytes(lane),
+    require(shortfall == (lane == 2 ? 0 : extent) && cache.reserveLane(lane).granted() && allocated == shortfall,
             "lane " + std::to_string(lane) + "'s floor did not allocate its shortfall");
   }
-  require(cache.laneShortfallBytes() == extent, "a fourth lane's floor lacks no extent");
+  require(cache.lanesShortfallBytes(1) == extent, "a fourth lane's floor lacks no extent");
   model::HotBlocksPool pool(cache);
   model::PoolState state = pool.state();
   require(state.name == "hot_kv" && state.floorBytes == 2 * extent && state.currentBytes == 2 * extent &&
@@ -462,8 +461,9 @@ void growsAsAPool(MetalBackend &backend) {
   require(state.rebuildOnly && !state.floorBytes && state.releaseUnitBytes == extent,
           "the extents no lane reads are not a pool unit that costs only its rebuild");
   // A Start may take those extents, so a lane waiting for its floor lacks
-  // the whole floor, though its reserveLane() would allocate nothing now.
-  require(cache.lanesShortfallBytes(1) == extent && !cache.laneShortfallBytes(),
+  // the whole floor, though its reserveLane() allocates nothing now.
+  allocated = 0;
+  require(cache.lanesShortfallBytes(1) == extent && cache.reserveLane(0).granted() && !allocated,
           "a waiting lane's floor counted on extents a Start may take");
   require(!cache.floorBytes(0) && cache.floorBytes(1) == extent && cache.floorBytes(3) == 2 * extent,
           "the floors of 0, 1 and 3 lanes are not 0, 1 and 2 extents");
@@ -489,7 +489,8 @@ void aTargetAtTheFloorsIsRebuildOnly(MetalBackend &backend) {
   require(state.rebuildOnly && state.releaseUnitBytes == extent && state.floorBytes == extent &&
               cache.floorBytes(1) == extent,
           "the extent a released floor left at a target no larger is not rebuild-only");
-  require(cache.lanesShortfallBytes(1) == extent && !cache.laneShortfallBytes(),
+  require(cache.lanesShortfallBytes(1) == extent && cache.reserveLane(1).granted() &&
+              cache.stats().bytes == 2 * extent,
           "a waiting lane's floor counted on the extent a Start may take");
   std::cout << "kv_block_cache_test: a target at the floors PASS\n";
 }

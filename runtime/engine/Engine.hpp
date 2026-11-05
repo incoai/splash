@@ -595,11 +595,11 @@ private:
   // Where the KV of a request that starts now lives:
   // on a target that can spill, Spill only when its projection's Resident
   // KV is more than its Spill peak (its floor, and the larger of the staging
-  // its prompt's history takes and the hot block cache its decode reads
-  // through, Model::spilledReadShortfall), and memory for the Resident KV,
-  // less the pages in memory of the chain it restores (Cache::
-  // residentChainPages), beside every lane's projected growth
-  // (laneDemand) is not there for its start without the expert store,
+  // its prompt's history takes and its lane's hot block floor, priced as
+  // laneDemand prices it), and memory for the Resident KV, less the pages
+  // in memory of the chain it restores (Cache::residentChainPages), beside
+  // every lane's projected growth (laneDemand) is not there for its start
+  // without the expert store,
   // as the governor finds it keeping that chain (MemoryGovernor::available);
   // for every request under --kv-spill
   // always; Resident otherwise. Correctness never depends on it.

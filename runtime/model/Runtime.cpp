@@ -3341,24 +3341,19 @@ uint64_t Runtime::idleBufferBytes(uint32_t evictedStates, bool afterStart) const
 
 uint64_t Runtime::startStateBytes() const noexcept { return impl_->states.startBytes(); }
 
-// Also for a request the runtime has not begun or holds no lane for, as the
-// engine places a fresh start before it begins it: the staging is the
-// prompts', whichever request holds it, and a decode's floor is one more
-// lane's unless the request's lane holds it.
-uint64_t Runtime::spilledReadShortfall(uint64_t requestId, SpilledReadNeed need) const {
-  if (need.kind == WorkKind::Prefill)
-    return impl_->historyStream ? impl_->historyStream->shortfallBytes(need.pages) : 0;
-  if (!impl_->blockCache) return 0;
-  const auto found = impl_->requests.find(requestId);
-  return found != impl_->requests.end() && found->second.resident
-             ? impl_->blockCache->laneShortfallBytes(found->second.stateLane)
-             : impl_->blockCache->laneShortfallBytes();
+// The staging is the prompts', whichever request holds it, so also for a
+// request the runtime has not begun, as the engine places a fresh start
+// before it begins it.
+uint64_t Runtime::stagingShortfall(uint64_t, uint32_t pages) const {
+  return impl_->historyStream ? impl_->historyStream->shortfallBytes(pages) : 0;
 }
 
 uint64_t Runtime::hotFloorBytes(uint32_t lanes) const {
   return impl_->blockCache ? impl_->blockCache->floorBytes(lanes) : 0;
 }
 
+// A request the runtime has not begun waits for its floor too, as the
+// engine places a fresh start before it begins it.
 uint64_t Runtime::hotFloorShortfall(std::span<const uint64_t> requestIds) const {
   if (!impl_->blockCache) return 0;
   uint32_t waiting = 0;

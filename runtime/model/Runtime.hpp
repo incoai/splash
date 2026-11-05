@@ -54,7 +54,7 @@ public:
   [[nodiscard]] bool canSnapshotToDisk(bool inUse) const noexcept override;
   [[nodiscard]] std::unique_ptr<StateOffload>
   snapshotToDisk(uint64_t requestId, std::function<void()> completion) override;
-  [[nodiscard]] uint64_t spilledReadShortfall(uint64_t requestId, SpilledReadNeed need) const override;
+  [[nodiscard]] uint64_t stagingShortfall(uint64_t requestId, uint32_t pages) const override;
   [[nodiscard]] uint64_t hotFloorBytes(uint32_t lanes) const override;
   [[nodiscard]] uint64_t hotFloorShortfall(std::span<const uint64_t> requestIds) const override;
   [[nodiscard]] ModelMemoryAdmission reserveSpilledReads(uint64_t requestId, SpilledReadNeed need) override;

@@ -1604,16 +1604,20 @@ void testSpilledRuntimeBoundary(const char *metallibPath) {
   } needs[] = {{{.kind = WorkKind::Decode}, hot}, {{.kind = WorkKind::Prefill, .pages = 128}, staging}};
   // Through the model's interface, as the engine places and reserves them.
   model::Model &reads = *runtime;
+  const auto shortfallOf = [&](const model::SpilledReadNeed &need) {
+    return need.kind == WorkKind::Decode ? reads.hotFloorShortfall(std::span(&request.id, 1))
+                                         : reads.stagingShortfall(request.id, need.pages);
+  };
   std::array<uint64_t, 2> placed{};
   for (size_t index = 0; index < placed.size(); ++index)
-    placed[index] = reads.spilledReadShortfall(request.id, needs[index].need);
+    placed[index] = shortfallOf(needs[index].need);
   runtime->beginColdRequest(request, 0);
   for (size_t index = 0; index < placed.size(); ++index) {
     const auto &[need, pool] = needs[index];
-    const uint64_t shortfall = reads.spilledReadShortfall(request.id, need);
+    const uint64_t shortfall = shortfallOf(need);
     const uint64_t before = pool.state().currentBytes;
     require(shortfall && shortfall == placed[index] && reads.reserveSpilledReads(request.id, need).granted() &&
-                pool.state().currentBytes - before == shortfall && !reads.spilledReadShortfall(request.id, need),
+                pool.state().currentBytes - before == shortfall && !shortfallOf(need),
             std::string(need.kind == WorkKind::Decode ? "a lane's decode reads" : "a prompt's staging") +
                 " did not allocate the shortfall it named before and after the request began");
   }
@@ -1633,7 +1637,7 @@ void testSpilledRuntimeBoundary(const char *metallibPath) {
     if (suspends) runtime->suspend(other.id);
     else runtime->end(other.id);
     require(staging.state().currentBytes == held &&
-                !reads.spilledReadShortfall(request.id, {.kind = WorkKind::Prefill, .pages = 128}),
+                !reads.stagingShortfall(request.id, 128),
             std::string("a prompt's staging went with another prompt that reserved it and ") +
                 (suspends ? "was suspended" : "ended"));
   }

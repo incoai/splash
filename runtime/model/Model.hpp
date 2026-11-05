@@ -816,17 +816,20 @@ public:
   // buffers. Null when the governor refuses; the caller may release a cached
   // state and retry.
   [[nodiscard]] virtual std::shared_ptr<const CompositeState> snapshot(uint64_t requestId) = 0;
-  // The bytes reserveSpilledReads(requestId, need) would allocate now: zero
-  // when the request holds what it reserves or the model reads no spilled
-  // K/V, and by default.
-  [[nodiscard]] virtual uint64_t spilledReadShortfall(uint64_t, SpilledReadNeed) const { return 0; }
+  // The bytes a prefill's staging of `pages` pages of history would
+  // allocate now (reserveSpilledReads(requestId, {Prefill, pages})): zero
+  // when the staging holds them or the model reads no spilled K/V, and by
+  // default.
+  [[nodiscard]] virtual uint64_t stagingShortfall(uint64_t, uint32_t) const { return 0; }
   // The hot block cache's floor for `lanes` lanes decoding over Index pages,
   // in its whole extents (model::KvBlockCache::floorBytes): zero for none,
   // and for a model that reads no spilled K/V, as by default.
   [[nodiscard]] virtual uint64_t hotFloorBytes(uint32_t) const { return 0; }
   // The bytes the hot block cache's floors lack for every request of
   // `requestIds` whose lane holds none, counted once for them all
-  // (model::KvBlockCache::lanesShortfallBytes); zero by default.
+  // (model::KvBlockCache::lanesShortfallBytes): the decode side of
+  // reserveSpilledReads, where extents no lane reads count for none, as a
+  // start may take them. Zero by default.
   [[nodiscard]] virtual uint64_t hotFloorShortfall(std::span<const uint64_t>) const { return 0; }
   // Memory for the reads of a request's spilled K/V that `need` names, taken
   // between commands and held until it ends or is suspended; a model that

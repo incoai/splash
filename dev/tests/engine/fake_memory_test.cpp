@@ -239,7 +239,8 @@ void testTheStorageAllocatesThroughMemory() {
 }
 
 // The test model allocates lane buffers, state buffers, floors and staging through FakeMemory, reuses pooled
-// buffers first, and a refusal holds nothing.
+// buffers first, and a refusal holds nothing; a floor takes idle hot extents before it allocates, which its
+// shortfall still counts, as a start may take them.
 void testTheModelAllocatesThroughMemory() {
   FakeMemory memory(sixteen());
   metal::MetalBackend backend("");
@@ -261,16 +262,16 @@ void testTheModelAllocatesThroughMemory() {
   model.requests.at(1).position = 64;
   require(model.reserveState(1, 64, refusal) && memory.held("states") == 256 * kMiB + 64,
           "a state's buffers were not allocated");
-  require(model.spilledReadShortfall(1, {}) == 64 * kMiB &&
-              model.spilledReadShortfall(1, {.kind = WorkKind::Prefill, .pages = 10}) == 10 * kMiB,
-          "the shortfall is not what a reservation would allocate");
+  model.staleHotBytes = 16 * kMiB;
+  const uint64_t id = 1;
+  require(model.hotFloorShortfall(std::span(&id, 1)) == 64 * kMiB && model.stagingShortfall(1, 10) == 10 * kMiB,
+          "the shortfall is not the whole floor and staging");
   require(model.reserveSpilledReads(1, {}).granted() &&
               model.reserveSpilledReads(1, {.kind = WorkKind::Prefill, .pages = 10}).granted() &&
               model.reserveSpilledReads(1, {.kind = WorkKind::Prefill, .pages = 6}).granted() &&
-              memory.held("spilled_reads") == 74 * kMiB,
-          "the reads' memory was not allocated");
-  require(model.spilledReadShortfall(1, {}) == 0 &&
-              model.spilledReadShortfall(1, {.kind = WorkKind::Prefill, .pages = 12}) == 2 * kMiB,
+              memory.held("spilled_reads") == 58 * kMiB && !model.staleHotBytes,
+          "the reads' memory was not allocated past the idle extents");
+  require(model.hotFloorShortfall(std::span(&id, 1)) == 0 && model.stagingShortfall(1, 12) == 2 * kMiB,
           "held reads still fall short");
   model.end(1);
   require(memory.held("spilled_reads") == 0 && model.spilledReadBytes.empty() && model.pooledLaneBytes == 256 * kMiB,

@@ -330,16 +330,6 @@ ModelMemoryAdmission KvBlockCache::reserveLane(uint32_t stateLane) {
 
 bool KvBlockCache::holdsLane(uint32_t stateLane) const { return impl_->floors.at(stateLane); }
 
-uint64_t KvBlockCache::laneShortfallBytes(uint32_t stateLane) const {
-  return holdsLane(stateLane) ? 0 : laneShortfallBytes();
-}
-
-uint64_t KvBlockCache::laneShortfallBytes() const {
-  const Impl &impl = *impl_;
-  const uint32_t held = impl.floorExtents(impl.floorLanes() + 1);
-  return held > impl.extents ? uint64_t{held - impl.extents} * impl.pages.extentBytes() : 0;
-}
-
 bool KvBlockCache::readsAboveFloor() const noexcept {
   const Impl &impl = *impl_;
   return impl.floorLanes() && impl.targetExtents > impl.floorExtents(impl.floorLanes());

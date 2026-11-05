@@ -359,12 +359,11 @@ void testALongLaneConvertsItselfBesideAnother() {
 }
 
 // Pages a Resident lane shares count for no conversion: a 40K shared prefix blocks it, a 4K one
-// does not, also while stale hot block extents would hold the floor.
+// does not.
 void testASharedPrefixCountsForNoConversion() {
   for (const uint32_t shared : {1'250U, 125U}) {
     FlashNextLanes lanes;
     Spilling &spill = lanes.spill;
-    spill.model.staleHotBytes = spill.model.spilledReadFloorBytes;
     spill.engine.submit(Spilling::prompt(2, 1, shared, 600));
     spill.runUntil([&] { return spill.events.outputs.contains(2); }, "the sharing lane did not decode");
     std::vector<uint32_t> prompt(shared * KvCache::pageTokens, 1);
@@ -409,7 +408,6 @@ void testAShortOrPrefillingLaneDoesNotConvert() {
   for (const bool prefilling : {true, false}) {
     FlashNextLanes lanes;
     Spilling &spill = lanes.spill;
-    spill.model.staleHotBytes = spill.model.spilledReadFloorBytes;
     if (prefilling) {
       spill.model.spilledReadFloorBytes = 0;
       // A 64K prompt that starts Resident, as while the SSD cache takes no
@@ -2028,6 +2026,34 @@ void testPlacementNeverSpillsWhenSpillTakesMore() {
           "a prompt whose Spill footprint is no smaller than its Resident one spilled");
 }
 
+// Placement prices a Spill start's hot block floor in full, also while idle extents above the floors
+// would hold it, as a start may take those: a prompt whose Spill floor beside its hot floor takes more
+// than its Resident KV starts Resident in a room in which it spills without a hot floor.
+void testPlacementCountsTheHotFloorIdleExtentsWouldHold() {
+  struct Case final {
+    uint64_t floor, stale;
+    bool spills;
+  };
+  for (const Case &each : {Case{0, 0, true}, Case{1'000, 0, false}, Case{1'000, 1'000, false}}) {
+    Spilling spill(Spilling::Governed{}, 1024, false);
+    spill.model.spilledReadFloorBytes = each.floor;
+    spill.model.staleHotBytes = each.stale;
+    spill.limit(spill.held() + 1'500);
+    // Ten pages of prompt and ten of output.
+    spill.engine.submit(Spilling::prompt(1, 1, 9, 10 * KvCache::pageTokens));
+    spill.runUntil([&] { return std::ranges::find(spill.events.startIds, 1) != spill.events.startIds.end(); },
+                   "the prompt did not start");
+    const SpillRequestsSnapshot placed = spill.engine.snapshot().spill;
+    spill.limit(Spilling::kGovernedLimitBytes);
+    spill.runUntilIdle();
+    const std::string name = "a " + std::to_string(each.floor) + "-byte hot floor beside " +
+                             std::to_string(each.stale) + " idle bytes";
+    require(spill.events.failedCount == 0 && spill.events.completedCount == 1, "the prompt with " + name + " failed");
+    require(placed.spill == (each.spills ? 1U : 0U) && placed.resident == (each.spills ? 0U : 1U),
+            "the prompt with " + name + (each.spills ? " started Resident" : " spilled"));
+  }
+}
+
 // An admission that changes the ledger places the next candidate again: of two prompts that fit
 // one at a time, the second starts Spill.
 void testAnAdmissionPlacesTheNextCandidateAgain() {
@@ -2268,6 +2294,7 @@ std::span<const test::TestCase> spillTests() {
   static constexpr test::TestCase kTests[] = {
       {"testPlacementCountsNoExpertStore", testPlacementCountsNoExpertStore},
       {"testPlacementNeverSpillsWhenSpillTakesMore", testPlacementNeverSpillsWhenSpillTakesMore},
+      {"testPlacementCountsTheHotFloorIdleExtentsWouldHold", testPlacementCountsTheHotFloorIdleExtentsWouldHold},
       {"testAnAdmissionPlacesTheNextCandidateAgain", testAnAdmissionPlacesTheNextCandidateAgain},
       {"testPlacementCountsIdleStateBuffers", testPlacementCountsIdleStateBuffers},
       {"testPlacementCountsTheChainItRestoresInMemory", testPlacementCountsTheChainItRestoresInMemory},

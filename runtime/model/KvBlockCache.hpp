@@ -81,12 +81,6 @@ public:
   // Whether the lane holds its floor: reserveLane() granted it, and
   // releaseLane() has not given it back.
   [[nodiscard]] bool holdsLane(uint32_t stateLane) const;
-  // The bytes reserveLane(stateLane) would allocate now: zero while the lane
-  // holds its floor, else the floor of one more lane's.
-  [[nodiscard]] uint64_t laneShortfallBytes(uint32_t stateLane) const;
-  // The bytes the floor of one more lane would allocate now: zero while the
-  // floors' extents hold one more.
-  [[nodiscard]] uint64_t laneShortfallBytes() const;
   // Whether a lane reads cache above the floors: a lane holds a floor and
   // the target is past the floors. Else the extents above the floors cost
   // only their rebuild.
