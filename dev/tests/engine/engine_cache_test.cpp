@@ -6228,6 +6228,105 @@ void testReclaimCountsDoNotGrowWithTheCache() {
   }
 }
 
+// A take costs the leaves it tries, not the cache. In a cache of many conversations as in one of few, with a state
+// in use and a waiting request's chain, claims through the ledger are each given as many leaves (Cache::leafVisits)
+// and free the same: of a page and of an extent's bytes beside states that need a write, which go before their
+// leaves; once the states are on the SSD, of a page, in a page scan and not, that cannot wait for a write, beside a
+// newer copied chain and older chains without a copy; then beside a newer chain no state needs; and as the leaves
+// are demoted and the transfers land.
+void testTakesDoNotGrowWithTheCache() {
+  struct Take final {
+    uint64_t leaves = 0;
+    FreeResult freed;
+  };
+  const auto run = [](uint32_t conversations) {
+    test::TestKvStorage storage{conversations * 4 + 8, 100, 4};
+    storage.budgetPages = conversations * 4 + 8;
+    KvPool pool{storage, 4};
+    test::TestKvTier tier;
+    tier.capacity = conversations * 4;
+    engine::Cache cache(pool, &tier, nullptr);
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    control->capacity = conversations;
+    std::vector<uint64_t> last;
+    for (uint64_t id = 1; id <= conversations; ++id)
+      last.push_back(cacheConversation(cache, id, 4, std::make_shared<TieredState>(control)));
+    const StateUse use = cache.useState(last[1]);
+    std::vector<uint32_t> prompt(4 * KvCache::pageTokens + 1);
+    std::iota(prompt.begin(), prompt.end(), 1000 * conversations);
+    const CacheProbe waiting = cache.probe(prompt, {});
+    cache.setWantedChains({waiting.restoredChain()});
+    const ClaimSpec cannotWait{.cls = ClaimClass::InService, .reach = ReclaimClass::InUse,
+                               .timing = NeedTiming::Immediate};
+    std::vector<Take> takes;
+    const auto claim = [&](const ClaimSpec &spec, const Need &need) {
+      const uint64_t before = cache.leafVisits();
+      const FreeResult freed = test::freeFromCache(cache, spec, need);
+      takes.push_back({cache.leafVisits() - before, freed});
+      tier.complete();
+      static_cast<void>(cache.pollTransfers());
+      cache.checkInvariants();
+    };
+    claim(test::kInServiceGrowth, {.pages = 1});
+    claim(test::kInServiceGrowth, {.bytes = 1});
+    while (test::stateStep(cache, ReclaimClass::InUse).gave())
+      static_cast<void>(cache.pollTransfers());
+    for (PersistStatus status; (status = cache.persist(last[conversations - 2])) != PersistStatus::Durable;) {
+      require(status == PersistStatus::Started, "a newer chain was not copied ahead");
+      tier.complete();
+      static_cast<void>(cache.pollTransfers());
+    }
+    claim(cannotWait, {.pages = 1});
+    claim(test::kInServiceGrowth, {.hostRefused = true, .pages = 1});
+    cacheConversation(cache, conversations + 1, 4);
+    claim(cannotWait, {.pages = 1});
+    for (uint32_t round = 0; round < 4; ++round) {
+      claim(test::kInServiceGrowth, {.pages = 1});
+      claim(test::kInServiceGrowth, {.bytes = 1});
+    }
+    return takes;
+  };
+  const std::vector<Take> few = run(8);
+  const std::vector<Take> many = run(32);
+  uint64_t leaves = 0;
+  for (size_t index = 0; index < few.size(); ++index) {
+    require(few[index].leaves == many[index].leaves,
+            "take " + std::to_string(index) + " in a cache of 32 conversations was given " +
+                std::to_string(many[index].leaves) + " leaves, in one of 8 " + std::to_string(few[index].leaves));
+    require(few[index].freed.outcome == many[index].freed.outcome && few[index].freed.pages == many[index].freed.pages &&
+                few[index].freed.stateBuffers == many[index].freed.stateBuffers,
+            "the larger cache's take " + std::to_string(index) + " freed something else");
+    leaves += few[index].leaves;
+  }
+  require(leaves > 0, "no take was given a leaf");
+}
+
+// A resident leaf waits among the leaves of what is in use while a state below it, on the SSD at a block that left
+// RAM, is in use, and among the others again once the use ends (checkInvariants checks its kind).
+void testLeafFollowsTheUseOfAStateBelowIt() {
+  test::TestKvStorage storage{8, 100, 1};
+  KvPool pool{storage, 1};
+  test::TestKvTier tier;
+  engine::Cache cache(pool, &tier, nullptr);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  const uint64_t last = cacheConversation(cache, 1, 2, std::make_shared<TieredState>(control));
+  require(test::stateStep(cache).gave() && cache.pollTransfers(), "the state was not written to the SSD");
+  require(test::evictStep(cache).gave(), "the leaf under the state was not demoted");
+  tier.complete();
+  static_cast<void>(cache.pollTransfers());
+  require(!cache.residentChainPages({&last, 1}) && cache.snapshot().stateCache.entries == 1 &&
+              cache.snapshot().stateCache.diskBytes,
+          "the state's block did not leave RAM with its state on the SSD");
+  cache.checkInvariants();
+  {
+    const StateUse use = cache.useState(last);
+    cache.checkInvariants();
+  }
+  cache.checkInvariants();
+}
+
 // The pages a need's units count at most (peek), and those its takes free,
 // of the need's form, now or as the demotions they start land, taken one at
 // a time until one takes nothing.
@@ -6740,6 +6839,8 @@ int main() {
     testUnifiedRecencyAndReleasedByteAccounting();
     testFinishedRequestLeavesTailKvBeforeItsState();
     testReclaimCountsDoNotGrowWithTheCache();
+    testTakesDoNotGrowWithTheCache();
+    testLeafFollowsTheUseOfAStateBelowIt();
     testCompactionReturnsFreePagesBeforeEvicting();
     testCompactionFollowsOnlyTheMovedBlocks();
     testCompactionLeavesTheRunway();

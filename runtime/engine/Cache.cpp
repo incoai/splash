@@ -760,8 +760,9 @@ Cache::Walk Cache::walkFor(const VictimQuery &query) const {
   return walk;
 }
 
-std::optional<Cache::WalkUnit> Cache::nextUnit(const WalkScope &scope, WalkCursor &cursor) const {
+std::optional<Cache::WalkUnit> Cache::nextUnit(const Walk &walk, WalkCursor &cursor) const {
   using Phase = WalkCursor::Phase;
+  const WalkScope &scope = walk.scope;
   const auto give = [&](Unit unit, CacheEvictionCandidate candidate) {
     cursor.last = unit;
     cursor.lastCandidate = candidate;
@@ -791,11 +792,13 @@ std::optional<Cache::WalkUnit> Cache::nextUnit(const WalkScope &scope, WalkCurso
       moveOn(scope.statesOnly ? Phase::Ordinary : Phase::DeadLeaves);
       continue;
     case Phase::DeadLeaves:
+      // The leaves no state restores through: they save no prefill, and
+      // free their page with no IO.
       if (!cursor.started) {
-        cursor.leaf = oldestDeadKvLeaf(0);
+        cursor.leaf = kv_.leafCandidate({.dead = true}, 0);
         cursor.started = true;
       } else if (last == Unit::DeadLeaf) {
-        cursor.leaf = oldestDeadKvLeaf(cursor.lastCandidate.id);
+        cursor.leaf = kv_.leafCandidate({.dead = true}, cursor.lastCandidate.id);
       }
       if (cursor.leaf)
         return give(Unit::DeadLeaf, *cursor.leaf);
@@ -814,18 +817,27 @@ std::optional<Cache::WalkUnit> Cache::nextUnit(const WalkScope &scope, WalkCurso
       const auto stateAfter = [&](std::optional<CacheEvictionCandidate> after) {
         return inUse ? states_.inUseCandidate(after) : states_.ordinaryCandidate(after);
       };
+      // The leaves of the class a state restores through, those with the
+      // state in RAM in a page scan alone (the others take the state first),
+      // and of the rest only those with a copy while the walk cannot wait
+      // for a demotion (reclaimKvLeaf). A dead leaf goes, or stays, with the
+      // dead leaves.
+      const KvCache::LeafWalk leaves{
+          .inUse = inUse,
+          .withStateInRam = scope.pagesOnly,
+          .copiedOnly = kvTierWritable() && (walk.timing == ReclaimTiming::Immediate || cursor.demotionsHeld)};
       if (!cursor.started) {
         // A page scan takes a state only where it sits on the leaf that goes
         // next.
         if (!scope.pagesOnly)
           cursor.state = stateAfter(std::nullopt);
         if (!scope.statesOnly)
-          cursor.leaf = oldestKvLeaf(0, inUse, scope.pagesOnly);
+          cursor.leaf = kv_.leafCandidate(leaves, 0);
         cursor.started = true;
       } else if (last == state) {
         cursor.state = stateAfter(cursor.lastCandidate);
       } else if (last == leaf || last == leafState) {
-        cursor.leaf = oldestKvLeaf(cursor.lastCandidate.id, inUse, scope.pagesOnly);
+        cursor.leaf = kv_.leafCandidate(leaves, cursor.lastCandidate.id);
       }
       if (cursor.statesHeld)
         cursor.state.reset();
@@ -843,7 +855,7 @@ std::optional<Cache::WalkUnit> Cache::nextUnit(const WalkScope &scope, WalkCurso
 }
 
 std::optional<Cache::WalkUnit> Cache::nextStepUnit(const Walk &walk, WalkCursor &cursor) const {
-  for (std::optional<WalkUnit> unit; (unit = nextUnit(walk.scope, cursor));) {
+  for (std::optional<WalkUnit> unit; (unit = nextUnit(walk, cursor));) {
     if (!kept(*unit, walk))
       return unit;
   }
@@ -1441,17 +1453,14 @@ Cache::ReclaimResult Cache::evictOne(const Walk &walk, std::optional<std::array<
 std::optional<Cache::Victim> Cache::takeOldest(const Walk &walk, std::optional<std::array<bool, 3>> reach) {
   using Phase = WalkCursor::Phase;
   WalkCursor cursor;
-  ReclaimTiming timing = walk.timing;
-  for (Phase phase = cursor.phase; const std::optional<WalkUnit> unit = nextStepUnit(walk, cursor);) {
-    // The leaves of each class wait for the tier on their own.
-    if (cursor.phase != phase) {
-      phase = cursor.phase;
-      timing = walk.timing;
-    }
+  while (const std::optional<WalkUnit> unit = nextStepUnit(walk, cursor)) {
     const bool leaf = unit->unit == Unit::DeadLeaf || unit->unit == Unit::Leaf || unit->unit == Unit::UsedLeaf;
     if (leaf && reach && !leadsToReach(unit->candidate.id, *reach))
       continue;
-    const UnitTaken taken = takeUnit(walk, *unit, unit->unit == Unit::DeadLeaf ? walk.timing : timing);
+    // The leaves of each class wait for the tier on their own: a new phase
+    // starts with a fresh cursor.
+    const UnitTaken taken =
+        takeUnit(walk, *unit, cursor.demotionsHeld ? ReclaimTiming::Immediate : walk.timing);
     if (taken.taken)
       return Victim{leaf};
     if (!taken.pending)
@@ -1472,7 +1481,7 @@ std::optional<Cache::Victim> Cache::takeOldest(const Walk &walk, std::optional<s
     case Unit::UsedLeaf:
       // The tier takes no demotion until a transfer lands: the leaves that
       // need one wait with this one, and those whose page frees now go.
-      timing = ReclaimTiming::Immediate;
+      cursor.demotionsHeld = true;
       break;
     default:
       break;
@@ -1566,29 +1575,8 @@ Cache::ReclaimResult Cache::recycleState(const Walk &walk) {
   return {.pending = returns(states)};
 }
 
-std::optional<CacheEvictionCandidate> Cache::oldestDeadKvLeaf(uint64_t after) const {
-  while (auto candidate = kv_.evictionCandidate(after)) {
-    after = candidate->id;
-    if (!kvNeededByState(candidate->id))
-      return candidate;
-  }
-  return std::nullopt;
-}
-
-std::optional<CacheEvictionCandidate> Cache::oldestKvLeaf(uint64_t after, bool inUse,
-                                                          bool withRamState) const {
-  while (auto candidate = kv_.evictionCandidate(after)) {
-    after = candidate->id;
-    // A dead leaf goes, or stays, with the dead leaves (oldestDeadKvLeaf).
-    if (kvNeededByState(candidate->id) && (withRamState || !states_.stateResident(candidate->id)) &&
-        kvNeededByStateInUse(candidate->id) == inUse)
-      return candidate;
-  }
-  return std::nullopt;
-}
-
 Cache::LeafReclaim Cache::reclaimKvLeaf(uint64_t block, ReclaimTiming timing) {
-  // No state in RAM sits on the leaf (oldestKvLeaf): one went first, in the
+  // No state in RAM sits on the leaf (nextUnit): one went first, in the
   // order every victim goes in, or just before its leaf in a page scan. A
   // state already on disk costs nothing and stays while the leaf has a disk
   // copy.
@@ -2204,8 +2192,19 @@ void Cache::checkInvariants() const {
                         return KvCache::Marks{.stateKeeps = keeps,
                                               .stateNeeded = needed,
                                               .stateCandidate = candidate,
+                                              .stateInRam = states_.stateResident(block),
                                               .wanted = chains == wanted.end() ? 0 : chains->second,
                                               .resumePoint = block == point};
+                      },
+                      // A walk takes a resident leaf by what restores
+                      // through it, in use or not, the state at it in RAM,
+                      // its copy (nextUnit).
+                      [this](uint64_t block) {
+                        const bool needed = kvNeededByState(block);
+                        return KvCache::LeafKind{.dead = !needed,
+                                                 .inUse = needed && kvNeededByStateInUse(block),
+                                                 .stateInRam = needed && states_.stateResident(block),
+                                                 .copied = needed && kv_.slot(block) != nullptr};
                       });
   uint64_t committed = 0;
   for (const auto &[_, active] : requests_) {

@@ -252,10 +252,11 @@ public:
   // whether it needs the KV as it is: every state but a RAM copy a reclaim
   // may take without a disk copy, which leaves through a write (that makes
   // its chain needed) or with no copy; and whether it is a RAM copy a
-  // reclaim may take (StateCache::candidate). Without a state, none. A RAM
-  // copy sits on a block with a page (Cache::checkInvariants), so a Writer
-  // or UsedWriter names a resident block.
-  void setStateKeeps(uint64_t blockId, Keeps keeps, bool needed, bool candidate) noexcept;
+  // reclaim may take (StateCache::candidate); and whether it has a RAM copy
+  // (inRam), which a reclaim's walk takes before the leaf (LeafKind).
+  // Without a state, none. A RAM copy sits on a block with a page
+  // (Cache::checkInvariants), so a Writer or UsedWriter names a resident block.
+  void setStateKeeps(uint64_t blockId, Keeps keeps, bool needed, bool candidate, bool inRam) noexcept;
   // The reasons at the block or below it: its page frees now for a walk
   // none of whose reasons they hold.
   [[nodiscard]] Keeps keeps(uint64_t blockId) const;
@@ -335,10 +336,41 @@ public:
   // child, user, holder or transfer.
   void erasePoisonedLeaf(uint64_t blockId) noexcept;
 
-  // Oldest resident leaf (no resident children) that no request uses. Pass
-  // the previous candidate to continue the scan without a lookup.
+  // Oldest resident leaf (no resident children) that no request uses, of
+  // any kind (LeafKind). Pass the previous candidate to continue the scan.
   [[nodiscard]] std::optional<CacheEvictionCandidate>
   evictionCandidate(uint64_t after) const;
+  // What restores through a resident leaf, by which a reclaim's walk takes
+  // it (Cache::nextUnit): nothing, no state at it or below it (dead); else
+  // whether a state in use sits at it or below it, whether the state at the
+  // leaf has a RAM copy, which the walk takes before the leaf, and whether
+  // the leaf has a copy, so that its page frees with no write. A dead leaf's
+  // kind names nothing more. The resident leaves of each kind wait in an
+  // order of their own, which follows the states and copies as they change,
+  // so that a walk goes over the leaves it may take and no other.
+  struct LeafKind final {
+    bool dead = false;
+    bool inUse = false;
+    bool stateInRam = false;
+    bool copied = false;
+    friend bool operator==(const LeafKind &, const LeafKind &) = default;
+  };
+  // The leaves a walk goes over: the dead ones; or those a state in use
+  // restores through (inUse), or those another state does, with the state
+  // at the leaf in RAM too (withStateInRam), and of those whose state is
+  // not in RAM all, or only the copied ones (copiedOnly).
+  struct LeafWalk final {
+    bool dead = false;
+    bool inUse = false;
+    bool withStateInRam = false;
+    bool copiedOnly = false;
+  };
+  // The oldest resident leaf of the walk's kinds after `after` (0 for the
+  // first), from the orders of those kinds alone.
+  [[nodiscard]] std::optional<CacheEvictionCandidate> leafCandidate(const LeafWalk &walk, uint64_t after) const;
+  // The leaves leafCandidate() gave: a walk's work, which grows with the
+  // leaves it tries and not the cache.
+  [[nodiscard]] uint64_t leafVisits() const noexcept { return leafVisits_; }
   // Oldest holder of a disk copy to replace that no request reads (reindex):
   // with duplicate, a resident block whose copy is redundant; otherwise a
   // disk-only block without children. Pass the previous candidate to
@@ -380,6 +412,7 @@ public:
     Keeps stateKeeps = 0;
     bool stateNeeded = false;
     bool stateCandidate = false;
+    bool stateInRam = false;
     uint32_t wanted = 0;
     bool resumePoint = false;
     friend bool operator==(const Marks &, const Marks &) = default;
@@ -394,9 +427,11 @@ public:
   // the blocks' counts of them must match. Every block's reasons to stay
   // (Keep) and the counts of them follow its fields and its marks; a caller
   // that names each block's marks as they should be (`marks`) has them
-  // checked too.
+  // checked too, and one that names the kind a walk takes each resident
+  // leaf as (`walkKind`) has the leaves' orders checked against it.
   void checkInvariants(const std::function<bool(uint64_t blockId)> &stateOnDisk = {},
-                       const std::function<Marks(uint64_t blockId)> &marks = {}) const;
+                       const std::function<Marks(uint64_t blockId)> &marks = {},
+                       const std::function<LeafKind(uint64_t blockId)> &walkKind = {}) const;
 
 private:
   static constexpr uint16_t noCount = std::numeric_limits<uint16_t>::max();
@@ -440,6 +475,7 @@ private:
     // The tails of states, each counted once, that hold the block
     // (countState).
     uint32_t windowPins = 0;
+    // While a resident leaf, in the order of its kind (leaves_).
     RecencyOrder::Node ramNode;
     RecencyOrder::Node diskNode;
     RecencyOrder::Node unneededNode;
@@ -457,6 +493,9 @@ private:
     Keeps stateKeeps = 0;
     bool stateNeeded = false;
     bool stateCandidate = false;
+    // No reason: whether the state has a RAM copy, which places a resident
+    // leaf (LeafKind).
+    bool stateInRam = false;
     uint32_t wanted = 0;
     bool resumePoint = false;
     Keeps keepsHere = 0;
@@ -475,9 +514,10 @@ private:
                                  (idle ? 1u : 0u));
   }
 
-  // The orders a block waits in, as its fields stand.
+  // The orders a block waits in, as its fields stand: of the resident
+  // leaves, that of its kind (leafOrder).
   struct Orders final {
-    bool ramLeaf = false;
+    std::optional<size_t> leaf;
     bool duplicate = false;
     bool diskLeaf = false;
     bool unneeded = false;
@@ -486,9 +526,23 @@ private:
 
   [[nodiscard]] Block &block(uint64_t blockId);
   [[nodiscard]] const Block &block(uint64_t blockId) const;
+  // The order of the resident leaves of a kind: the dead ones', or one per
+  // combination of the others.
+  static constexpr size_t kLeafOrders = 9;
+  [[nodiscard]] static constexpr size_t leafOrder(const LeafKind &kind) noexcept {
+    return kind.dead ? 0
+                     : 1 + (size_t{kind.inUse} << 2 | size_t{kind.stateInRam} << 1 | size_t{kind.copied});
+  }
+  [[nodiscard]] LeafKind leafKind(const Block &entry) const noexcept;
   [[nodiscard]] Orders orders(const Block &entry) const noexcept;
   // Places the block in its orders.
   void reindex(Block &entry) noexcept;
+  // Moves a resident leaf to the order of its kind, as what restores through
+  // it changes; reindex() places it too.
+  void placeLeaf(Block &entry) noexcept;
+  // The oldest resident leaf after `after` (0 for the first) of the leaf
+  // orders whose bits `orders` sets.
+  [[nodiscard]] std::optional<CacheEvictionCandidate> oldestLeaf(uint32_t orders, uint64_t after) const;
   // Gives the block a copy, written from a page of the form, or none.
   void giveDiskCopy(Block &entry, std::shared_ptr<KvDiskSlot> slot,
                     kv::PageForm copyForm = kv::PageForm::Full);
@@ -533,7 +587,8 @@ private:
   // block hides those below it, so after a change a probe's chain stays
   // valid up to its first block that is no longer matchable.
   uint64_t generation_ = 1;
-  RecencyOrder ramLeaves_;
+  // The resident leaves by kind (leafOrder).
+  std::array<RecencyOrder, kLeafOrders> leaves_;
   RecencyOrder duplicates_;
   RecencyOrder diskLeaves_;
   RecencyOrder unneeded_;
@@ -556,6 +611,7 @@ private:
                                      uint64_t written) const;
   [[nodiscard]] PageReach reachByRule(Keeps mask, std::span<const uint64_t> kept, std::span<const uint64_t> unwaited,
                                       uint64_t written) const;
+  mutable uint64_t leafVisits_ = 0;
 };
 
 } // namespace splash::engine

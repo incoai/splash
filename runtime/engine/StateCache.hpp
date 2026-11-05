@@ -382,7 +382,8 @@ private:
   [[nodiscard]] std::optional<CompositeStateLease>
   acquireBlock(uint64_t kvBlock);
   // Places the entry in the orders its copies call for, and names what it
-  // asks of its KV (keeps) and the resume point to the KV cache.
+  // asks of its KV (keeps), whether it has a RAM copy and the resume point to
+  // the KV cache.
   void reindex(uint64_t kvBlock, Entry &entry) noexcept;
   // A RAM copy a reclaim may take: in the order of its class.
   [[nodiscard]] bool candidate(uint64_t kvBlock, const Entry &entry) const noexcept;

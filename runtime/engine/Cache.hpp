@@ -332,9 +332,9 @@ struct PersistedState final {
 // Owns active KV page leases, the content-addressed KV graph and cached
 // composite states. Physical recurrent-state cells remain model-owned.
 // A state in RAM always sits on a resident KV block: reclaim takes such a
-// block's state before its page (oldestKvLeaf skips it, and a page scan
-// takes the state a step before the leaf), and endRequest and pollTransfers
-// leave such a block its page.
+// block's state before its page (a walk's leaves leave it out, and a page
+// scan takes the state a step before the leaf: nextUnit), and endRequest and
+// pollTransfers leave such a block its page.
 class Cache final : public VictimSource {
 public:
   // The disk budget is the quota the states' file shares with the KV tier;
@@ -762,6 +762,9 @@ public:
   [[nodiscard]] uint64_t reachVisits() const noexcept {
     return kv_.reachVisits() + states_.reclaimVisits() + windowVisits_;
   }
+  // The resident leaves the takes' walks were given (KvCache::leafVisits):
+  // the leaves they tried, never the cache.
+  [[nodiscard]] uint64_t leafVisits() const noexcept { return kv_.leafVisits(); }
   [[nodiscard]] KvSpillSnapshot spillSnapshot() const;
   // Tests, between commands: std::logic_error unless the blocks, pages,
   // references and quota keep every invariant spilling relies on.
@@ -919,12 +922,15 @@ private:
   // the oldest first, and the unit it gave last, whose order moves past it
   // at the next step, once whatever was done with it is done, as a reclaim
   // step's scan does. A state that waits for the write in flight holds back
-  // the newer states of its phase (statesHeld).
+  // the newer states of its phase (statesHeld), and a leaf whose demotion
+  // waits for the tier the newer leaves of its phase that need one
+  // (demotionsHeld).
   struct WalkCursor final {
     enum class Phase : uint8_t { Checkpoints, DeadLeaves, Ordinary, InUse, Done };
     Phase phase = Phase::Checkpoints;
     bool started = false;
     bool statesHeld = false;
+    bool demotionsHeld = false;
     std::optional<CacheEvictionCandidate> state;
     std::optional<CacheEvictionCandidate> leaf;
     std::optional<Unit> last;
@@ -1015,8 +1021,14 @@ private:
   [[nodiscard]] Walk walkFor(const VictimQuery &query) const;
   // The walk's next unit, moving the cursor on: the checkpoints, the dead
   // leaves (not for states alone), the ordinary class's states and leaves by
-  // recency, then, up to InUse, what is in use. Nothing changes.
-  [[nodiscard]] std::optional<WalkUnit> nextUnit(const WalkScope &scope, WalkCursor &cursor) const;
+  // recency, then, up to InUse, what is in use. A walk that cannot wait for
+  // a demotion, from the start or once one waits for the tier
+  // (demotionsHeld), goes over only the leaves whose page frees with no
+  // write (reclaimKvLeaf): those with a copy, and in a page scan those under
+  // a state in RAM, which goes first. Each leaf comes from the orders of the
+  // leaves the walk goes over (KvCache::leafCandidate), so that a walk costs
+  // the units it gives, not the cache. Nothing changes.
+  [[nodiscard]] std::optional<WalkUnit> nextUnit(const Walk &walk, WalkCursor &cursor) const;
   // The next unit a step of the walk tries: past the units it keeps.
   [[nodiscard]] std::optional<WalkUnit> nextStepUnit(const Walk &walk, WalkCursor &cursor) const;
   // A cursor whose next unit is the one after this state unit of the walk
@@ -1196,15 +1208,6 @@ private:
   // state goes; otherwise a state (recycleState).
   [[nodiscard]] ReclaimResult takeReclaim(const Walk &walk, const std::array<uint32_t, 3> &demotions,
                                           uint64_t fillBefore, bool inPlace);
-  // Oldest resident KV leaf after `after` no state restores through: nothing
-  // sits on it or below it, so it saves no prefill, and it frees its page
-  // with no IO.
-  [[nodiscard]] std::optional<CacheEvictionCandidate> oldestDeadKvLeaf(uint64_t after) const;
-  // Oldest resident KV leaf after `after` that a state restores through, a
-  // state in use exactly when inUse, and whose state, if any, is not in RAM
-  // unless withRamState.
-  [[nodiscard]] std::optional<CacheEvictionCandidate>
-  oldestKvLeaf(uint64_t after, bool inUse, bool withRamState) const;
   // Frees the RAM of one resident KV leaf: through its disk copy when it has
   // one, by demotion when a state on it or below it depends on it, by
   // erasure otherwise, with any disk copies below it. Pending when the tier

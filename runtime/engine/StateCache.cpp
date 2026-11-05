@@ -609,7 +609,7 @@ StateEviction StateCache::erase(uint64_t kvBlock, bool retirement) noexcept {
   RecencyOrder::unlink(target.diskNode);
   RecencyOrder::unlink(target.writeNode);
   entries_.erase(found);
-  kv_.setStateKeeps(kvBlock, 0, false, false);
+  kv_.setStateKeeps(kvBlock, 0, false, false, false);
   markResumePoint();
   kv_.countState(kvBlock, false, inUse(kvBlock));
   if (disk)
@@ -761,7 +761,7 @@ void StateCache::reindex(uint64_t kvBlock, Entry &target) noexcept {
     (target.ram ? duplicates_ : used ? inUseOnDisk_ : diskOnly_)
         .link(target.diskNode, target.lastUsed, kvBlock);
   const auto [keeps, needed, reclaimable] = this->keeps(kvBlock, target);
-  kv_.setStateKeeps(kvBlock, keeps, needed, reclaimable);
+  kv_.setStateKeeps(kvBlock, keeps, needed, reclaimable, target.ram != nullptr);
   markResumePoint();
 }
 

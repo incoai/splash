@@ -366,8 +366,15 @@ void KvCache::countState(uint64_t blockId, bool added, bool inUse) noexcept {
   reindex(found->second);
   countAbove(blockId, [&](Block &entry) {
     added ? ++entry.statesBelow : --entry.statesBelow;
-    if (inUse)
+    // The first state below a leaf, or in use below it, or the last, changes
+    // its kind.
+    bool kindChanged = entry.statesBelow == (added ? 1u : 0u);
+    if (inUse) {
       added ? ++entry.statesInUseBelow : --entry.statesInUseBelow;
+      kindChanged = kindChanged || entry.statesInUseBelow == (added ? 1u : 0u);
+    }
+    if (kindChanged)
+      placeLeaf(entry);
   });
   // The state's tail, a bounded walk beside the counts above.
   uint64_t id = blockId;
@@ -389,6 +396,8 @@ void KvCache::countState(uint64_t blockId, bool added, bool inUse) noexcept {
 void KvCache::countStateInUse(uint64_t blockId, bool added) noexcept {
   countAbove(blockId, [&](Block &entry) {
     added ? ++entry.statesInUseBelow : --entry.statesInUseBelow;
+    if (entry.statesInUseBelow == (added ? 1u : 0u))
+      placeLeaf(entry);
   });
 }
 
@@ -439,16 +448,20 @@ KvCache::Keeps KvCache::keeps(uint64_t blockId) const { return block(blockId).ke
 
 bool KvCache::trimmable(uint64_t blockId) const { return orders(block(blockId)).trimmable; }
 
-void KvCache::setStateKeeps(uint64_t blockId, Keeps keeps, bool needed, bool candidate) noexcept {
+void KvCache::setStateKeeps(uint64_t blockId, Keeps keeps, bool needed, bool candidate, bool inRam) noexcept {
   const auto found = blocks_.find(blockId);
   if (found == blocks_.end())
     std::terminate();
   Block &entry = found->second;
-  if (entry.stateKeeps == keeps && entry.stateNeeded == needed && entry.stateCandidate == candidate)
+  if (entry.stateKeeps == keeps && entry.stateNeeded == needed && entry.stateCandidate == candidate &&
+      entry.stateInRam == inRam)
     return;
   entry.stateKeeps = keeps;
   entry.stateNeeded = needed;
   entry.stateCandidate = candidate;
+  entry.stateInRam = inRam;
+  // Whether the state is in use, or in RAM, places the leaf too.
+  placeLeaf(entry);
   rekeep(entry);
 }
 
@@ -943,11 +956,36 @@ void KvCache::poison(uint64_t blockId) {
   erasePoisonedLeaf(blockId);
 }
 
+std::optional<CacheEvictionCandidate> KvCache::oldestLeaf(uint32_t orders, uint64_t after) const {
+  const std::optional<CacheEvictionCandidate> last =
+      after ? std::optional(CacheEvictionCandidate{after, block(after).lastUsed}) : std::nullopt;
+  std::optional<CacheEvictionCandidate> oldest;
+  for (size_t order = 0; order < kLeafOrders; ++order) {
+    if (!(orders & 1u << order))
+      continue;
+    const RecencyOrder &leaves = leaves_[order];
+    const std::optional<CacheEvictionCandidate> candidate = last ? leaves.next(*last) : leaves.oldest();
+    if (candidate &&
+        (!oldest || std::pair{candidate->lastUsed, candidate->id} < std::pair{oldest->lastUsed, oldest->id}))
+      oldest = candidate;
+  }
+  return oldest;
+}
+
 std::optional<CacheEvictionCandidate>
 KvCache::evictionCandidate(uint64_t after) const {
-  if (!after)
-    return ramLeaves_.oldest();
-  return ramLeaves_.next({after, block(after).lastUsed});
+  return oldestLeaf((1u << kLeafOrders) - 1, after);
+}
+
+std::optional<CacheEvictionCandidate> KvCache::leafCandidate(const LeafWalk &walk, uint64_t after) const {
+  uint32_t orders = walk.dead ? 1u << leafOrder({.dead = true}) : 0;
+  for (const bool inRam : {false, true})
+    for (const bool copied : {false, true})
+      if (!walk.dead && (!inRam || walk.withStateInRam) && (inRam || copied || !walk.copiedOnly))
+        orders |= 1u << leafOrder({.inUse = walk.inUse, .stateInRam = inRam, .copied = copied});
+  const std::optional<CacheEvictionCandidate> oldest = oldestLeaf(orders, after);
+  leafVisits_ += oldest ? 1 : 0;
+  return oldest;
 }
 
 std::optional<CacheEvictionCandidate>
@@ -1043,16 +1081,16 @@ const KvCache::Block &KvCache::block(uint64_t blockId) const {
   return found->second;
 }
 
-// Resident leaves wait in one order, disk copies in another: redundant
-// copies of blocks whose page holds their K/V, Full or Slim, or the only
-// copies, of a spilled or disk-only block without children. In a persistent
-// cache the disk copies no state needs wait in a third as well: a redundant
-// one that no state on disk restores through, and the only one of a leaf
-// without a state. A block a request uses or holds, one in transfer, or a
-// poisoned one is in no order: quota never takes a copy active KV reads, nor
-// RAM reclaim a page a request holds. Active KV reads no copy of another
-// command's K/V, which waits as a redundant copy beside a page requests use
-// or hold.
+// Resident leaves wait in the order of their kind, disk copies in another:
+// redundant copies of blocks whose page holds their K/V, Full or Slim, or
+// the only copies, of a spilled or disk-only block without children. In a
+// persistent cache the disk copies no state needs wait in a third as well: a
+// redundant one that no state on disk restores through, and the only one of
+// a leaf without a state. A block a request uses or holds, one in transfer,
+// or a poisoned one is in no order: quota never takes a copy active KV
+// reads, nor RAM reclaim a page a request holds. Active KV reads no copy of
+// another command's K/V, which waits as a redundant copy beside a page
+// requests use or hold.
 KvCache::Orders KvCache::orders(const Block &entry) const noexcept {
   if (entry.transfer != Transfer::None || entry.poisoned)
     return {};
@@ -1060,7 +1098,8 @@ KvCache::Orders KvCache::orders(const Block &entry) const noexcept {
   const bool paged = entry.page != noPage;
   const bool holdsKv = paged && entry.form != kv::PageForm::Index;
   Orders result;
-  result.ramLeaf = paged && !entry.residentChildren && !used;
+  if (paged && !entry.residentChildren && !used)
+    result.leaf = leafOrder(leafKind(entry));
   result.trimmable = windowPages_ && paged && entry.form == kv::PageForm::Full && !entry.windowPins;
   if (!entry.slot || (used && !entry.foreignCopy))
     return result;
@@ -1070,14 +1109,29 @@ KvCache::Orders KvCache::orders(const Block &entry) const noexcept {
   return result;
 }
 
-void KvCache::reindex(Block &entry) noexcept {
+// A state at the leaf counts once StateCache counts its entry in
+// (statesHere): an entry that no longer holds a valid state stays only while
+// a lease pins it, which keeps the block in use, out of the leaves.
+KvCache::LeafKind KvCache::leafKind(const Block &entry) const noexcept {
+  if (!entry.statesHere && !entry.statesBelow)
+    return {.dead = true};
+  return {.inUse = (entry.stateKeeps & keepBit(Keep::Used)) || entry.statesInUseBelow,
+          .stateInRam = entry.stateInRam,
+          .copied = entry.slot != nullptr};
+}
+
+void KvCache::placeLeaf(Block &entry) noexcept {
   RecencyOrder::unlink(entry.ramNode);
+  if (const std::optional<size_t> leaf = orders(entry).leaf)
+    leaves_[*leaf].link(entry.ramNode, entry.lastUsed, entry.id);
+}
+
+void KvCache::reindex(Block &entry) noexcept {
+  placeLeaf(entry);
   RecencyOrder::unlink(entry.diskNode);
   RecencyOrder::unlink(entry.unneededNode);
   RecencyOrder::unlink(entry.trimNode);
   const Orders placed = orders(entry);
-  if (placed.ramLeaf)
-    ramLeaves_.link(entry.ramNode, entry.lastUsed, entry.id);
   if (placed.trimmable)
     trimmable_.link(entry.trimNode, entry.lastUsed, entry.id);
   if (placed.duplicate)
@@ -1090,7 +1144,8 @@ void KvCache::reindex(Block &entry) noexcept {
 }
 
 void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &stateOnDisk,
-                              const std::function<Marks(uint64_t blockId)> &marks) const {
+                              const std::function<Marks(uint64_t blockId)> &marks,
+                              const std::function<LeafKind(uint64_t blockId)> &walkKind) const {
   const auto check = [](bool holds, const char *what) {
     if (!holds)
       throw std::logic_error(std::string("KV cache invariant broken: ") + what);
@@ -1208,7 +1263,21 @@ void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &state
                          blocks_, [&](const auto &each) { return placed(orders(each.second)); })),
           what);
   };
-  checkOrder(ramLeaves_, [](const Orders &in) { return in.ramLeaf; }, "the order of resident leaves");
+  // Each resident leaf waits in the order of its kind, the one a walk takes
+  // it as, and no other block in any.
+  size_t leaves = 0;
+  for (size_t order = 0; order < kLeafOrders; ++order)
+    for (auto member = leaves_[order].oldest(); member; member = leaves_[order].next(*member), ++leaves) {
+      const auto found = blocks_.find(member->id);
+      check(found != blocks_.end() && found->second.lastUsed == member->lastUsed &&
+                orders(found->second).leaf == order,
+            "the order of the resident leaves of a kind");
+      check(!walkKind || walkKind(member->id) == leafKind(found->second),
+            "a resident leaf's kind is the one a walk takes it as");
+    }
+  check(leaves == static_cast<size_t>(std::ranges::count_if(
+                      blocks_, [&](const auto &each) { return orders(each.second).leaf.has_value(); })),
+        "the orders of the resident leaves hold every resident leaf");
   checkOrder(duplicates_, [](const Orders &in) { return in.duplicate; }, "the order of redundant copies");
   checkOrder(diskLeaves_, [](const Orders &in) { return in.diskLeaf; }, "the order of only copies");
   checkOrder(unneeded_, [](const Orders &in) { return in.unneeded; }, "the order of copies no state needs");
@@ -1232,6 +1301,7 @@ void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &state
     check(!marks || marks(entry->id) == Marks{.stateKeeps = entry->stateKeeps,
                                               .stateNeeded = entry->stateNeeded,
                                               .stateCandidate = entry->stateCandidate,
+                                              .stateInRam = entry->stateInRam,
                                               .wanted = entry->wanted,
                                               .resumePoint = entry->resumePoint},
           "a block's marks: what its state asks of its KV, the waiting chains that end at it, the resume point");

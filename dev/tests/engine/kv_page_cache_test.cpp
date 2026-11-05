@@ -438,6 +438,7 @@ void testPageReachFollowsItsRule() {
     KvCache::Keeps keeps = 0;
     bool needed = false;
     bool candidate = false;  // a RAM copy a reclaim may take
+    bool ram = false;        // the state has a RAM copy
     uint32_t wanted = 0;
   };
   std::vector<Reference> blocks(1);
@@ -535,7 +536,8 @@ void testPageReachFollowsItsRule() {
                                      : static_cast<KvCache::Keeps>(use ? bit(Keep::Used) : 0);
         entry->needed = entry->state && !writer;
         entry->candidate = entry->state && resident(id) && (writer || pick(1));
-        cache.setStateKeeps(id, entry->keeps, entry->needed, entry->candidate);
+        entry->ram = entry->candidate || (entry->state && pick(1));
+        cache.setStateKeeps(id, entry->keeps, entry->needed, entry->candidate, entry->ram);
       }
       break;
     case 8:
