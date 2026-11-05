@@ -22,7 +22,8 @@ model and its draft; each start loads the weights into memory
 ([Weight loading](internals.md#weight-loading)) and follows the model's revision
 ([Revisions](#revisions)). Splash packages, the prebuilt format of earlier
 releases, are no longer loaded ([Splash packages](models.md#splash-packages)). Public
-repositories need no login; private or gated ones need `HF_TOKEN` or `hf auth login`. Ctrl+C
+repositories need no login; private or gated ones need `HF_TOKEN` or `hf auth login`, and a gated
+one its terms accepted on its Hub page. Ctrl+C
 stops serving, and a second Ctrl+C stops the engine at once; stop before
 upgrading.
 

@@ -12,7 +12,11 @@ from types import SimpleNamespace
 from unittest import mock
 
 import httpx
-from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub.errors import (
+    HfHubHTTPError,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+)
 from huggingface_hub.hf_api import RepoSibling
 from tokenizers import pre_tokenizers
 
@@ -193,12 +197,26 @@ def selection(root, model=MODEL, **options):
     )
 
 
-def http_error(status):
+def http_error(status, kind=HfHubHTTPError, missing="Revision"):
+    """A Hub refusal of status, as huggingface_hub raises it: kind, by the
+    Hub's error code (RepositoryNotFoundError for a repository it does not
+    have, RevisionNotFoundError for a revision its repository lacks)."""
     request = httpx.Request("GET", "https://huggingface.co/api/models/owner/model")
-    return HfHubHTTPError(
-        f"{status} Client Error.\n\nRevision Not Found for url: {request.url}.",
+    return kind(
+        f"{status} Client Error.\n\n{missing} Not Found for url: {request.url}.",
         response=httpx.Response(status, request=request),
     )
+
+
+def missing_repository():
+    """The Hub's answer, to a signed-in request, for a repository it does not
+    have."""
+    return http_error(404, RepositoryNotFoundError, "Repository")
+
+
+def missing_revision():
+    """The Hub's answer for a revision a repository lacks."""
+    return http_error(404, RevisionNotFoundError)
 
 
 def listing(directory):
@@ -249,9 +267,11 @@ class FakeHub:
         commit = revision
         if not models.is_hex_digest(revision, 40):
             commit = self.branches.get((repo_id, revision or "main"))
+        if not (self.remote / repo_id).is_dir():
+            raise missing_repository()
         root = self.remote / repo_id / str(commit)
         if not root.is_dir():
-            raise http_error(404)
+            raise missing_revision()
         return SimpleNamespace(
             sha=commit,
             siblings=[

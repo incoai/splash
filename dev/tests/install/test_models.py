@@ -12,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from dev.tests.installer_fixtures import FakeHub, http_error
+from dev.tests.installer_fixtures import FakeHub, http_error, missing_repository
 from install import hub
 from install import models as installer
 from server import serve_options
@@ -169,7 +169,7 @@ class InstallerTest(unittest.TestCase):
         FakeHub(self, self.root / "hub")
         argv = ["--models", str(self.root), "--model", self.MODEL_ID, "prepare"]
         message = (
-            f"cannot resolve {self.MODEL_ID}: {hub.reason(http_error(404))}; "
+            f"cannot resolve {self.MODEL_ID}: {hub.reason(missing_repository())}; "
             "neither this installation nor the Hub cache records a commit for "
             "the default branch"
         )

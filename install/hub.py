@@ -82,16 +82,25 @@ def reason(error) -> str:
 def failure_kind(error) -> str | None:
     """What the app words a Hub or network failure by
     (models.ModelError.kind): no such repository, no connection or access
-    denied; None for any other, which the app shows by its message."""
+    denied; None for any other, which the app shows by its message, such as
+    a revision or file the repository lacks. A gated repository is access
+    denied, though huggingface_hub refuses it as a RepositoryNotFoundError
+    (GatedRepoError)."""
     import httpx
-    from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
+    from huggingface_hub.errors import (
+        GatedRepoError,
+        HfHubHTTPError,
+        RepositoryNotFoundError,
+    )
 
     status = (
         error.response.status_code
         if isinstance(error, HfHubHTTPError) and error.response is not None
         else None
     )
-    if isinstance(error, RepositoryNotFoundError) or status == 404:
+    if isinstance(error, GatedRepoError):
+        return "auth"
+    if isinstance(error, RepositoryNotFoundError):
         return "not_found"
     if status in (401, 403):
         return "auth"

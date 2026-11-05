@@ -359,9 +359,18 @@ class DownloadTest(unittest.TestCase):
 
 class FailureKindTest(unittest.TestCase):
     def test_hub_failures_carry_their_kind(self):
-        """A Hub or network failure says which, as the app words it."""
+        """A Hub or network failure says which, as the app words it. A gated
+        repository exists, though huggingface_hub refuses it as a
+        RepositoryNotFoundError, and a revision or file the Hub lacks is not
+        a missing repository: the message names it."""
         import httpx
-        from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
+        from huggingface_hub.errors import (
+            GatedRepoError,
+            HfHubHTTPError,
+            RemoteEntryNotFoundError,
+            RepositoryNotFoundError,
+            RevisionNotFoundError,
+        )
 
         request = httpx.Request("GET", f"https://huggingface.co/api/models/{REPO}")
 
@@ -370,7 +379,12 @@ class FailureKindTest(unittest.TestCase):
 
         for error, kind in (
             (refused(401, RepositoryNotFoundError), "not_found"),
-            (refused(404), "not_found"),
+            (refused(404, RepositoryNotFoundError), "not_found"),
+            (refused(401, GatedRepoError), "auth"),
+            (refused(403, GatedRepoError), "auth"),
+            (refused(404, RevisionNotFoundError), None),
+            (refused(404, RemoteEntryNotFoundError), None),
+            (refused(404), None),
             (refused(401), "auth"),
             (refused(403), "auth"),
             (httpx.ConnectError("no route", request=request), "offline"),

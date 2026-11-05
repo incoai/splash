@@ -31,6 +31,8 @@ from dev.tests.installer_fixtures import (
     fixture,
     http_error,
     listing,
+    missing_repository,
+    missing_revision,
     mlx_target,
     pins,
     selection,
@@ -1162,15 +1164,17 @@ class UpstreamTest(unittest.TestCase):
     def test_unreachable_hub_without_an_installation_is_the_error(self):
         """Classed as the Hub's failure is, which the app words: no such
         repository, which the Hub answers with 401 when anonymous, or no
-        connection."""
+        connection; a revision the repository lacks is named by the
+        message."""
         fake = fake_hub(self, self.cache)
         missing = RepositoryNotFoundError(
             "401 Client Error. Repository Not Found", response=http_error(401).response
         )
         offline = httpx.ConnectError("[Errno 8] nodename nor servname provided")
         for failure, kind in (
-            (http_error(404), "not_found"),
+            (missing_repository(), "not_found"),
             (missing, "not_found"),
+            (missing_revision(), None),
             (offline, "offline"),
         ):
             fake.failure = failure
