@@ -42,6 +42,12 @@ void PassCommand::start(const BatchPlan &plan, std::vector<ModelBatchItem> items
                         std::vector<std::vector<LaneCapture>> captures) {
   if (command_)
     throw std::logic_error("a command in passes started beside another");
+  for (ModelBatchItem &item : items) {
+    item.pageTable = {};
+    item.pageTableRevision = 0;
+    item.pageTableFirstChanged = 0;
+    item.pageSources.reset();
+  }
   command_ = Command{.progress = {.plan = plan},
                      .items = std::move(items),
                      .captures = std::move(captures)};

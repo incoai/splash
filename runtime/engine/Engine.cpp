@@ -31,6 +31,14 @@ constexpr std::string_view kDiskQuotaTimeoutMessage =
     "the SSD cache's room for active KV did not become available within the resource wait "
     "limit: other long requests hold it";
 
+// `item` reads the page table its lane's cut gave it (Cache::cutPageTable).
+void setPageTable(ModelBatchItem &item, PageTableView pageTable) {
+  item.pageTable = pageTable.pages;
+  item.pageTableRevision = pageTable.revision;
+  item.pageTableFirstChanged = pageTable.firstChanged;
+  item.pageSources = std::move(pageTable.sources);
+}
+
 } // namespace
 
 std::string resourceTimeoutMessage(metal::AllocationFailure failure) {
@@ -390,7 +398,7 @@ bool Engine::tick(double now) {
       // A command in passes keeps its items and their captures for its
       // later passes (prepare), and its progress for planning.
       if (plan->passes > 1 && !plan->pass)
-        passCommand_.start(*plan, items, captures);
+        passCommand_.start(*plan, std::move(items), captures);
       // The command reads the cached pages its lanes' blocks were swapped
       // for, and those a resume restored. Selecting a constrained request's
       // first token reads none, but the cycle after it does; only a first
@@ -1503,13 +1511,8 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
   // between commands rewrite them.
   if (plan.pass) {
     passCommand_.nextPass(items, captures);
-    for (ModelBatchItem &item : items) {
-      const PageTableView pageTable = cache_.cutPageTable(item.requestId);
-      item.pageTable = pageTable.pages;
-      item.pageTableRevision = pageTable.revision;
-      item.pageTableFirstChanged = pageTable.firstChanged;
-      item.pageSources = pageTable.sources;
-    }
+    for (ModelBatchItem &item : items)
+      setPageTable(item, cache_.cutPageTable(item.requestId));
     return Prepared::Runnable;
   }
   std::vector<BatchItem> admitted;
@@ -1662,11 +1665,7 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
     item.requestId = active.request.id;
     item.logicalPosition = prefill ? scheduled.promptOffset : active.exactTokens.size();
     item.tokenCount = scheduled.tokenCount;
-    const PageTableView pageTable = cache_.cutPageTable(active.request.id);
-    item.pageTable = pageTable.pages;
-    item.pageTableRevision = pageTable.revision;
-    item.pageTableFirstChanged = pageTable.firstChanged;
-    item.pageSources = pageTable.sources;
+    setPageTable(item, cache_.cutPageTable(active.request.id));
     if (prefill) {
       item.inputTokens =
           std::span<const uint32_t>(active.exactTokens)

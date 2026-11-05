@@ -37,11 +37,12 @@ public:
   [[nodiscard]] uint32_t captureBuffers() const noexcept;
 
   // Its first pass, `plan`, was submitted with these items and captures;
-  // only without a command.
+  // only without a command. It keeps the items without their page tables,
+  // which moves between its passes rewrite.
   void start(const BatchPlan &plan, std::vector<ModelBatchItem> items,
              std::vector<std::vector<LaneCapture>> captures);
-  // Its items and captures for its next pass; only their page tables may
-  // have changed, which the caller cuts again.
+  // Its items, without page tables, and captures for its next pass; the
+  // caller cuts each item's page table again.
   void nextPass(std::vector<ModelBatchItem> &items, std::vector<std::vector<LaneCapture>> &captures) const;
   // Its pass `plan` completed. The last ends it, its lanes that ended ending
   // with that pass's results, so it returns none; a pass before moves it to
