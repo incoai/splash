@@ -289,7 +289,8 @@ struct DispatchDraftCapturePlan final {
 // there.
 [[nodiscard]] DraftContextPlan
 planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
-                 std::span<const uint32_t> materializationBoundaries);
+                 std::span<const uint32_t> materializationBoundaries,
+                 uint32_t draftWindow);
 
 [[nodiscard]] DispatchDraftCapturePlan
 draftCaptureSpansForDispatch(const DraftContextPlan &plan,
@@ -611,7 +612,9 @@ struct ExecutionLimits final {
   static constexpr uint32_t draftQueryRows = 8;
   static constexpr uint32_t draftProposalTokens = 7;
   static constexpr uint32_t targetVerifyRows = 8;
-  static constexpr uint32_t draftContextTokens = 2048;
+  // The longest ring the compiled draft variants keep (metal/abi/DraftAttention.h):
+  // correctness reads a model's draft layout's window, engine sizing this.
+  static constexpr uint32_t draftWindowLimit = 4096;
   // The most target layers a DFlash2 draft reads (its target_layer_ids).
   static constexpr uint32_t maximumDraftTargetLayers = 8;
   static constexpr uint32_t speculativeScratchTokens = targetVerifyRows - 1;
@@ -816,6 +819,8 @@ public:
   // buffers, and the maximum when no number of states does (a buffer no
   // cached state holds, such as Qwen's draft rings).
   [[nodiscard]] virtual uint32_t statesToActivate() const noexcept { return 0; }
+  // The draft ring's slots the served model's draft keeps.
+  [[nodiscard]] virtual uint32_t draftWindow() const noexcept { return 0; }
   // The bytes reclaimIdleState(true, IdleMemory::Buffers), called until it
   // gives none, releases once the cache has let go of `evictedStates` more
   // cached states, whose buffers return to the pool: the pooled buffers

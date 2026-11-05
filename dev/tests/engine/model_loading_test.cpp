@@ -115,7 +115,7 @@ void testStartupCapabilities() {
                 ExecutionLimits::draftQueryRows == 8 &&
                 ExecutionLimits::draftProposalTokens == 7 &&
                 ExecutionLimits::targetVerifyRows == 8 &&
-                ExecutionLimits::draftContextTokens == 2048,
+                ExecutionLimits::draftWindowLimit == 4096,
             "DFlash execution contract changed");
 }
 

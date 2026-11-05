@@ -667,13 +667,63 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   if (architectures.count != 1 ||
       ![architectures[0] isEqual:@"DFlash2DraftModel"])
     throw std::invalid_argument("draft is not a DFlash2 model");
+  NSDictionary *flash =
+      requireObject(draft, @"dflash_config", "draft config dflash_config");
+  // The draft's attention geometry names the compiled draft variant whose
+  // kernels run it (metal/abi/DraftAttention.h): the one its five numbers
+  // are, and a config near one is refused by the first number that differs
+  // from it, as the sizes are; one near none is refused with the variants
+  // this build serves.
+  struct DraftGeometryKey final {
+    const char *key;
+    uint32_t SplashDraftVariant::*field;
+    NSDictionary *source;
+  };
+  const std::initializer_list<DraftGeometryKey> keys{
+      {"num_attention_heads", &SplashDraftVariant::query_heads, draft},
+      {"num_key_value_heads", &SplashDraftVariant::kv_heads, draft},
+      {"head_dim", &SplashDraftVariant::head_dimension, draft},
+      {"sliding_window", &SplashDraftVariant::window, draft},
+      {"conv_kernel_size", &SplashDraftVariant::convolution_taps, flash}};
+  const SplashDraftVariant *variant = nullptr;
+  size_t matched = 0;
+  std::string mismatch;
+  std::string supported;
+  for (const SplashDraftVariant &compiled : SPLASH_DRAFT_VARIANTS) {
+    size_t agreed = 0;
+    std::string difference;
+    for (const DraftGeometryKey &key : keys) {
+      const uint32_t found = requireWhole(key.source[@(key.key)], std::string("draft config ") + key.key);
+      if (found == compiled.*key.field) {
+        ++agreed;
+        continue;
+      }
+      if (difference.empty())
+        difference = std::string("draft config ") + key.key + " mismatch: checkpoint " +
+                     std::to_string(found) + ", runtime " + std::to_string(compiled.*key.field);
+    }
+    if (agreed == keys.size()) {
+      variant = &compiled;
+      break;
+    }
+    if (mismatch.empty() || agreed > matched) {
+      matched = agreed;
+      mismatch = difference;
+    }
+    supported += (supported.empty() ? "" : ", ") + std::to_string(compiled.query_heads) + " query heads over " +
+                 std::to_string(compiled.kv_heads) + " KV heads of " +
+                 std::to_string(compiled.head_dimension) + ", a ring of " +
+                 std::to_string(compiled.window) + " and " +
+                 std::to_string(compiled.convolution_taps) + "-tap convolutions";
+  }
+  if (!variant)
+    throw std::invalid_argument(mismatch.empty()
+                                    ? "draft config attention geometry is not a compiled draft variant (" +
+                                          supported + ")"
+                                    : mismatch);
   requireNumbers(draft, "checkpoint", "draft config",
                  {{"hidden_size", target.hiddenSize},
                   {"vocab_size", target.vocabularySize},
-                  {"num_attention_heads", SPLASH_DRAFT_QUERY_HEADS},
-                  {"num_key_value_heads", SPLASH_DRAFT_KV_HEADS},
-                  {"head_dim", SPLASH_DRAFT_HEAD_DIMENSION},
-                  {"sliding_window", ExecutionLimits::draftContextTokens},
                   {"rms_norm_eps", SPLASH_RMS_EPSILON}});
   requireBooleans(draft, "draft config",
                   {{"is_causal", false},
@@ -686,11 +736,8 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   requireEqual(requireString(rope, @"rope_type",
                              "draft config rope_parameters rope_type"),
                "default", "checkpoint", "draft config rope_parameters rope_type");
-  NSDictionary *flash =
-      requireObject(draft, @"dflash_config", "draft config dflash_config");
   requireNumbers(flash, "checkpoint", "draft config dflash_config",
                  {{"conv_group_size", SPLASH_DRAFT_CONVOLUTION_GROUP},
-                  {"conv_kernel_size", SPLASH_DRAFT_CONVOLUTION_TAPS},
                   {"selector_rank", SPLASH_DRAFT_SELECTOR_RANK},
                   {"selector_top_k", SPLASH_DRAFT_CANDIDATES},
                   {"mask_token_id", target.maskToken}});
@@ -723,7 +770,7 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
                   requireWhole(draft[@"num_hidden_layers"], "draft config num_hidden_layers"),
                   requireWhole(draft[@"intermediate_size"], "draft config intermediate_size"),
                   requireNumber(rope[@"rope_theta"], "draft config rope_parameters rope_theta").floatValue,
-                  targetLayers);
+                  targetLayers, *variant);
   return layout;
 }
 

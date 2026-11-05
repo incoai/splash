@@ -1046,14 +1046,15 @@ struct Runtime::Impl {
   // stays current if it was; decode commits leave it behind.
   static QwenLogicalLengths
   advanceDraftContext(const QwenLogicalLengths &previous, uint64_t targetTokens,
-                      uint64_t begin, uint64_t end, bool reset, bool windowed) {
+                      uint64_t begin, uint64_t end, bool reset, bool windowed,
+                      uint32_t draftWindow) {
     if (!reset && (!previous.draftLength || previous.draftEnd() != begin))
       throw std::logic_error("draft capture does not continue the draft ring");
     const uint64_t combined = (reset ? 0 : previous.draftLength) + (end - begin);
     QwenLogicalLengths next = previous;
     next.targetTokens = targetTokens;
     next.draftLength =
-        static_cast<uint32_t>(std::min<uint64_t>(combined, kDraftCacheStride));
+        static_cast<uint32_t>(std::min<uint64_t>(combined, draftWindow));
     next.draftBase = end - next.draftLength;
     if (windowed && (reset || previous.hasCurrentContextWindow()))
       next.windowEnd = end;
@@ -1449,7 +1450,8 @@ struct Runtime::Impl {
         if (span.absoluteBegin < capture.tokens)
           captured = advanceDraftContext(captured, capture.tokens, span.absoluteBegin,
                                          std::min(span.absoluteEnd, capture.tokens),
-                                         span.resetDraftState, true);
+                                         span.resetDraftState, true,
+                                         states.layout().draft.window);
       states.validateLengths(captured, true);
       result.push_back({reservation, static_cast<uint32_t>(capture.tokens - item.logicalPosition),
                         capture.tokens == end, captured});
@@ -1586,8 +1588,9 @@ struct Runtime::Impl {
         if (offset < item.tokenCount) {
           lengths.targetTokens = partEnd;
           for (const DispatchDraftCaptureSpan &span : sequence.captures)
-            lengths = advanceDraftContext(lengths, partEnd, span.absoluteBegin, span.absoluteEnd, span.resetDraftState,
-                                          true);
+            lengths = advanceDraftContext(lengths, partEnd, span.absoluteBegin, span.absoluteEnd,
+                                          span.resetDraftState, true,
+                                          states.layout().draft.window);
         }
       }
       if (nextCapture != item.stateCaptures.size())
@@ -1865,7 +1868,7 @@ struct Runtime::Impl {
     }
     const QwenLaneMetadata &metadata = states.metadata(entry.stateLane);
     if (metadata.lengths.targetTokens != item.logicalPosition ||
-        !metadata.lengths.hasCompleteDraftWindow(kDraftCacheStride)) {
+        !metadata.lengths.hasCompleteDraftWindow(states.layout().draft.window)) {
       throw std::logic_error("decode state length is not exact");
     }
     // The target reads the history before the pending token from the
@@ -2317,7 +2320,8 @@ struct Runtime::Impl {
           entry.stateLane,
           advanceDraftContext(states.metadata(entry.stateLane).lengths,
                               nextLength, items[lane].logicalPosition,
-                              nextLength, false, false));
+                              nextLength, false, false,
+                              states.layout().draft.window));
       entry.generatedTokens += laneResult.retained;
       commitSelected(entry, {targetTokens, laneResult.retained});
       entry.maskWords.clear();
@@ -2565,7 +2569,8 @@ void Runtime::beginColdRequest(const ModelRequest &request,
   try {
     setDraftContextPlan(
         request.id,
-        planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {}));
+        planDraftContext(0, static_cast<uint32_t>(request.prompt.size()), {},
+                         impl_->states.layout().draft.window));
   } catch (...) {
     end(request.id);
     throw;
@@ -2684,7 +2689,7 @@ void Runtime::finishRestore(uint64_t requestId, uint32_t restoredPrefixLength,
       impl_->states.metadata(entry.stateLane).lengths;
   if (lengths.targetTokens != restoredPrefixLength ||
       (restoreDraftState &&
-       !lengths.hasCompleteDraftWindow(kDraftCacheStride)) ||
+       !lengths.hasCompleteDraftWindow(impl_->states.layout().draft.window)) ||
       (!restoreDraftState && lengths.draftLength != 0)) {
     throw std::invalid_argument("prefix logical length does not match state");
   }
@@ -2874,7 +2879,8 @@ Runtime::prefillAsync(const BatchPlan &plan,
         lengths = Impl::advanceDraftContext(lengths, nextLength,
                                             capture.absoluteBegin,
                                             capture.absoluteEnd,
-                                            capture.resetDraftState, true);
+                                            capture.resetDraftState, true,
+                                            impl->states.layout().draft.window);
         impl->counters.draftContextRowsActive += capture.activeRows;
         impl->counters.draftContextRowsMaterialization +=
             capture.materializationRows;
@@ -3142,6 +3148,10 @@ uint32_t Runtime::prefillPasses() const noexcept {
   return impl_->model.expertStore() && !impl_->aneFfn ? impl_->geometry.target.layers : 1;
 }
 
+uint32_t Runtime::draftWindow() const noexcept {
+  return impl_->states.layout().draft.window;
+}
+
 uint32_t Runtime::statesToActivate() const noexcept {
   return impl_->states.statesToActivate();
 }
@@ -3397,7 +3407,7 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
                            lengths.targetTokens ==
                                1 + decoded[lane].outputTokens.size() -
                                    decoded[lane].outputTokensWithoutKv &&
-                           lengths.hasCompleteDraftWindow(kDraftCacheStride);
+                           lengths.hasCompleteDraftWindow(impl_->states.layout().draft.window);
     }
     if (!committedEveryLane) {
       throw std::runtime_error(
@@ -3451,10 +3461,11 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     beginColdRequest(request, 1);
     if (beginRestore(id, prefixTokens, cachedState, true, {}))
       throw std::logic_error("a resident state restore returned a read");
-    setDraftContextPlan(id, planDraftContext(prefixTokens, promptTokens, {}));
+    setDraftContextPlan(id, planDraftContext(prefixTokens, promptTokens, {},
+                                            impl_->states.layout().draft.window));
     const auto &restored = impl_->states.metadata(1).lengths;
     if (restored.targetTokens != prefixTokens ||
-        !restored.hasCompleteDraftWindow(kDraftCacheStride)) {
+        !restored.hasCompleteDraftWindow(impl_->states.layout().draft.window)) {
       throw std::runtime_error("prefix restore length mismatch");
     }
 
@@ -3485,7 +3496,7 @@ WarmupStepResult Runtime::warmupCompositeStateRestore() {
     wallSeconds += historicalDecodeWallSeconds;
     const auto &continued = impl_->states.metadata(1).lengths;
     if (decoded.size() != 1 || decoded[0].outputTokens.empty() ||
-        !continued.hasCompleteDraftWindow(kDraftCacheStride) ||
+        !continued.hasCompleteDraftWindow(impl_->states.layout().draft.window) ||
         continued.targetTokens <= promptTokens ||
         continued.targetTokens !=
             promptTokens + decoded[0].outputTokens.size() -

@@ -16,6 +16,9 @@ public:
   ~Runtime() override;
   void checkHealth() override;
   [[nodiscard]] uint32_t statesToActivate() const noexcept override;
+  // The draft ring's slots the served model's draft keeps (its compiled
+  // variant's window), which its context plans and length checks read.
+  [[nodiscard]] uint32_t draftWindow() const noexcept override;
   [[nodiscard]] uint64_t idleBufferBytes(uint32_t evictedStates) const noexcept override;
   [[nodiscard]] uint32_t prefillGroupRows(bool spills) const noexcept override;
   [[nodiscard]] uint32_t prefillPasses() const noexcept override;

@@ -37,8 +37,7 @@ static_assert(model::ExecutionLimits::draftProposalTokens ==
               SPLASH_DRAFT_PROPOSAL_TOKENS);
 static_assert(model::ExecutionLimits::targetVerifyRows ==
               SPLASH_TARGET_VERIFY_ROWS);
-static_assert(model::ExecutionLimits::draftContextTokens ==
-              SPLASH_DRAFT_SLIDING_WINDOW);
+static_assert(model::ExecutionLimits::draftWindowLimit == 4096);
 static_assert(model::ExecutionLimits::speculativeScratchTokens ==
               SPLASH_SPECULATIVE_SCRATCH_TOKENS);
 
