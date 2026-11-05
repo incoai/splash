@@ -863,9 +863,11 @@ Cache::WalkCursor Cache::cursorAfter(Unit unit, uint64_t block) const {
                     .lastCandidate = {block, states_.lastUsed(block)}};
 }
 
-void Cache::holdAfter(const Walk &walk, WalkCursor &cursor) const {
+void Cache::holdAfter(const Walk &walk, WalkCursor &cursor, uint64_t staged) const {
   using Phase = WalkCursor::Phase;
-  const auto waits = [&](uint64_t block) { return stateReclaim(walk, block).when == StateReclaim::When::Later; };
+  const auto waits = [&](uint64_t block) {
+    return stateReclaim(walk, block, staged).when == StateReclaim::When::Later;
+  };
   if (cursor.phase == Phase::Checkpoints && cursor.last == Unit::Checkpoint && waits(cursor.lastCandidate.id)) {
     cursor = WalkCursor{.phase = walk.scope.statesOnly ? Phase::Ordinary : Phase::DeadLeaves};
     return;
@@ -910,15 +912,30 @@ bool Cache::certainReuse(uint64_t block) const {
   return block == states_.resumePoint() || std::ranges::find(wanted_.states(), block) != wanted_.states().end();
 }
 
-Cache::StateReclaim Cache::stateReclaim(const Walk &walk, uint64_t block) const {
+Cache::StateReclaim Cache::stateReclaim(const Walk &walk, uint64_t block, uint64_t staged) const {
   using When = StateReclaim::When;
   const bool write = states_.reclaimWrites(block);
-  if (write && (!walk.writes || (walk.timing == ReclaimTiming::Immediate && states_.writing())))
+  const bool busy = states_.writing() || (staged && staged != block);
+  if (write && (!walk.writes || (walk.timing == ReclaimTiming::Immediate && busy)))
     return {When::PassedOver, true};
-  // As reclaim() goes: a write waits for the one in flight, a copy ahead
+  // As reclaim() goes: a write waits for the staging buffer, a copy ahead
   // keeps its state until it lands.
-  const StateEviction outcome = states_.reclaimOutcome(block);
-  return {outcome.pending ? When::Later : When::Now, write || outcome.pending};
+  const bool later = write ? busy : states_.reclaimOutcome(block).pending;
+  return {later ? When::Later : When::Now, write || later};
+}
+
+std::vector<uint64_t> Cache::keptStates(const Walk &walk) const {
+  std::vector<uint64_t> kept;
+  if (const uint64_t point = walk.keepResumePoint ? states_.resumePoint() : 0)
+    kept.push_back(point);
+  for (const RestoredChains *chains : {walk.restored, walk.reused})
+    if (chains)
+      kept.insert(kept.end(), chains->states().begin(), chains->states().end());
+  return kept;
+}
+
+uint64_t Cache::stagedState(const Walk &walk) const {
+  return states_.reclaims(walk.scope.upTo == ReclaimClass::InUse, keptStates(walk)).staged;
 }
 
 StateEviction Cache::reclaimState(const Walk &walk, uint64_t block) {
@@ -978,9 +995,9 @@ uint64_t blockOfKey(uint64_t key) noexcept { return key & ((uint64_t{1} << kUnit
 
 } // namespace
 
-std::optional<engine::Victim> Cache::victimOf(const Walk &walk, const WalkUnit &unit) const {
+std::optional<engine::Victim> Cache::victimOf(const Walk &walk, const WalkUnit &unit, uint64_t staged) const {
   const uint64_t block = unit.candidate.id;
-  const StateReclaim reclaim = stateReclaim(walk, block);
+  const StateReclaim reclaim = stateReclaim(walk, block, staged);
   const bool now = reclaim.when == StateReclaim::When::Now;
   return engine::Victim{.key = unitKey(static_cast<uint8_t>(unit.unit), block),
                         .stateBuffers = now ? 1u : 0u,
@@ -1040,12 +1057,7 @@ Cache::ReclaimReach Cache::reach(const Walk &walk, ReclaimClass upTo) const {
   // The states the walk keeps beside those in use, which it passes over:
   // the resume point and the states the chains it keeps restore from.
   const uint64_t point = walk.keepResumePoint ? states_.resumePoint() : 0;
-  std::vector<uint64_t> kept;
-  if (point)
-    kept.push_back(point);
-  for (const RestoredChains *chains : {walk.restored, walk.reused})
-    if (chains)
-      kept.insert(kept.end(), chains->states().begin(), chains->states().end());
+  const std::vector<uint64_t> kept = keptStates(walk);
   // The states the walk takes free now when they need no write; the first
   // that needs one while no write holds the staging buffer frees at once
   // (written); the others wait for that buffer.
@@ -1237,14 +1249,16 @@ std::optional<engine::Victim> Cache::peek(const VictimQuery &query, const engine
         return unit;
     return std::nullopt;
   }
-  // A state need's units, a state each.
+  // A state need's units, a state each, counted in the walk's order: the
+  // staging buffer takes the first that needs a write.
+  const uint64_t staged = stagedState(walk);
   WalkCursor cursor;
   if (after) {
     cursor = cursorAfter(afterUnit, blockOfKey(after->key));
-    holdAfter(walk, cursor);
+    holdAfter(walk, cursor, staged);
   }
   for (std::optional<WalkUnit> unit; (unit = nextStepUnit(walk, cursor));)
-    if (std::optional<engine::Victim> victim = victimOf(walk, *unit))
+    if (std::optional<engine::Victim> victim = victimOf(walk, *unit, staged))
       return victim;
   return std::nullopt;
 }

@@ -5935,6 +5935,29 @@ void testARefusedRequestWaitsForThePageOnItsWayBack() {
 // that write is in flight the next such state is offered in its place marked later: a claim that
 // cannot wait passes over it to the newer states, and one that can waits for it, holding them back.
 // A leaf that needs a demotion is offered in its place marked later too.
+// The staging buffer writes one state at a time, so a state need counts one state that needs a write as freeing
+// now, not every one: a claim of two buffers that two such states would give is short before it starts a write
+// it cannot use.
+void testAStateNeedCountsTheStagingBufferOnce() {
+  CacheFixture fixture;
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  control->capacity = 4;
+  fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control), false);
+  fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control), false);
+  const ClaimSpec claim{.cls = ClaimClass::InService, .timing = NeedTiming::Immediate};
+  const VictimQuery query = test::query(claim, {.stateBuffers = 2});
+  uint32_t now = 0;
+  for (std::optional<engine::Victim> victim = fixture.cache.peek(query, nullptr); victim;
+       victim = fixture.cache.peek(query, &*victim))
+    now += victim->later ? 0 : victim->stateBuffers;
+  require(now == 1, "the peeks counted " + std::to_string(now) + " states freeing now through one staging buffer");
+  require(test::freeFromCache(fixture.cache, claim, {.stateBuffers = 2}).outcome == FreeOutcome::Short &&
+              control->slots == 0 && fixture.cache.stateResident(fixture.blocks[0]) &&
+              fixture.cache.stateResident(fixture.blocks[1]),
+          "a claim the staging buffer cannot meet started a write it could not use");
+}
+
 void testImmediateWalksOfferWhatLandsLaterInItsPlace() {
   CacheFixture fixture;
   auto control = std::make_shared<TransferControl>();
@@ -5960,15 +5983,20 @@ void testImmediateWalksOfferWhatLandsLaterInItsPlace() {
     return left.key == right.key && left.write == right.write && left.later == right.later &&
            left.stateBuffers == right.stateBuffers && left.pages == right.pages;
   };
+  // The staging buffer writes one state at a time: the first that needs a
+  // write frees now through it, the next waits for it, which a claim that
+  // cannot wait passes over and one that can is held back behind.
   for (const ClaimClass cls : {ClaimClass::InService, ClaimClass::Growth}) {
     const std::vector<engine::Victim> atOnce = unitsOf(cls, NeedTiming::Immediate);
     require(atOnce.size() >= 3 && blockOf(atOnce[0]) == fixture.blocks[0] && atOnce[0].write &&
                 !atOnce[0].later && atOnce[0].stateBuffers == 1 && blockOf(atOnce[1]) == fixture.blocks[1] &&
-                atOnce[1].write && !atOnce[1].later && blockOf(atOnce[2]) == fixture.blocks[2] &&
-                !atOnce[2].write && !atOnce[2].later &&
-                std::ranges::equal(atOnce, unitsOf(cls, NeedTiming::CanWait), same),
-            "the states that need a write were not offered in their place as freeing now through the staging "
-            "buffer");
+                atOnce[1].write && atOnce[1].later && !atOnce[1].stateBuffers &&
+                blockOf(atOnce[2]) == fixture.blocks[2] && !atOnce[2].write && !atOnce[2].later,
+            "the first state that needs a write was not offered as freeing now through the staging buffer, or "
+            "the next as waiting for it");
+    const std::vector<engine::Victim> canWait = unitsOf(cls, NeedTiming::CanWait);
+    require(canWait.size() == 2 && same(canWait[0], atOnce[0]) && same(canWait[1], atOnce[1]),
+            "a claim that can wait was not held back behind the state that waits for the staging buffer");
   }
   const ClaimSpec cannotWait{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate};
   require(test::freeFromCache(fixture.cache, cannotWait, {.stateBuffers = 1}).outcome == FreeOutcome::Met &&
@@ -6701,6 +6729,7 @@ int main() {
     testDeviceNeedKeepsKvBesideTheIndexRunway();
     testDeviceNeedPassesOverLeavesOfFormsOutOfReach();
     testARefusedRequestWaitsForThePageOnItsWayBack();
+    testAStateNeedCountsTheStagingBufferOnce();
     testImmediateWalksOfferWhatLandsLaterInItsPlace();
     testImmediateDeviceWalkPassesOverWhatAWriteFrees();
     testDeviceWalkOffersTheStagedWriteAsAUnit();

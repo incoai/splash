@@ -124,6 +124,8 @@ public:
   // and of those offered as needing no write the same. Peek counts an upper
   // bound (VictimSource), so these are reported, not required.
   uint64_t exactUnits = 0, shortUnits = 0, exactNoWrite = 0, shortNoWrite = 0;
+  // Takes that freed more than the units from the head through theirs.
+  uint64_t overTakes = 0;
 
   // Every request ends, every transfer lands, and nothing leaks: the pool's
   // pages and the tier's slots belong to the cache's blocks alone.
@@ -203,37 +205,30 @@ public:
       cache_.setWantedChains({wanted});
     }
     const bool wantedResident = !wanted.empty() && cache_.stateResident(wanted.back());
-    // Each unit, with the one before it in the cache's order.
-    std::vector<std::pair<std::optional<engine::Victim>, engine::Victim>> units;
-    uint64_t counted = 0;
-    uint32_t countedPages = 0;
-    uint32_t countedBuffers = 0;
-    std::optional<engine::Victim> previous;
-    for (std::optional<engine::Victim> unit = cache_.peek(query, nullptr); unit;
-         previous = unit, unit = cache_.peek(query, &*previous)) {
-      require(!unit->later || unit->write, "a unit that frees once a write lands was not marked as needing one");
-      require(!unit->write || unit->later || unit->stateBuffers <= 1,
-              "a unit that frees now through a write counted more than the one state the staging buffer takes");
-      if (unit->later && immediate)
-        continue;
-      counted += unit->bytes;
-      countedPages += unit->form == form ? unit->pages : 0;
-      countedBuffers += unit->stateBuffers;
-      units.emplace_back(previous, *unit);
-    }
-    // The free pages of the form, and for a claim that can wait the landing ones.
-    const auto pagesOf = [&] {
-      return pool_.freePageCount(form) + (immediate ? 0 : cache_.demotedPages()[static_cast<size_t>(form)]);
+    // A unit's measure: bytes for a device need, pages of its form for a
+    // page need, buffers for a state need.
+    const auto measure = [&](const engine::Victim &unit) -> uint64_t {
+      return device ? unit.bytes : states ? unit.stateBuffers : unit.form == form ? unit.pages : 0;
     };
-    const uint32_t pagesBefore = pagesOf();
-    // A claim that can wait counts the extents landing pages complete beside
-    // the units, and a take may release one of them before they land.
-    const uint64_t landing = immediate ? 0 : cache_.returning().landingBytes;
-    // What the takes report, as the ledger sums it, and what left memory now.
-    uint64_t freed = 0;
-    uint64_t releasedNow = 0;
-    uint32_t reportedPages = 0;
-    uint32_t reportedBuffers = 0;
+    const auto gaveOf = [&](const FreeResult &taken) -> uint64_t {
+      return device ? taken.nowBytes + taken.laterBytes : states ? taken.stateBuffers : taken.pages;
+    };
+    // What the units from the head of the cache's order through `unit`
+    // count, as the ledger counts them (MemoryLedger::bound): a claim that
+    // does not wait for writes passes over what lands later.
+    const auto throughUnit = [&](const engine::Victim &unit) {
+      uint64_t sum = 0;
+      for (std::optional<engine::Victim> each = cache_.peek(query, nullptr); each; each = cache_.peek(query, &*each)) {
+        require(!each->later || each->write, "a unit that frees once a write lands was not marked as needing one");
+        require(!each->write || each->later || each->stateBuffers <= 1,
+                "a unit that frees now through a write counted more than the one state the staging buffer takes");
+        if (!(each->later && immediate))
+          sum += measure(*each);
+        if (each->key == unit.key)
+          break;
+      }
+      return sum;
+    };
     // What a take that gives something changes: the memory the pool holds,
     // its free, landing and cached pages, the states in RAM, the writes
     // started.
@@ -245,63 +240,72 @@ public:
                         snapshot.stateCache.entries,     snapshot.stateCache.bytes,
                         snapshot.stateCache.offloads,    tier_.demotions};
     };
-    for (const auto &[after, first] : units) {
-      // A unit's takes while the cache offers it again in its place, until
-      // one takes nothing: a reclaim phase goes a step at a time, each a
-      // reclaim of a finite cache.
-      uint64_t unitFreed = 0;
-      bool firstTake = true;
-      // As peek offers it now, after the takes of the units before it.
-      const std::optional<engine::Victim> fresh = cache_.peek(query, after ? &*after : nullptr);
-      // A claim that does not wait for writes passes over what lands later,
-      // as the ledger does.
-      if (!fresh || fresh->key != first.key || (fresh->later && immediate))
+    // Each unit's count when it was first offered, what its takes freed in
+    // the need's measure, and whether a take of it ended waiting.
+    struct Taken final {
+      uint64_t counted = 0;
+      uint64_t freed = 0;
+      bool write = false;
+    };
+    std::map<uint64_t, Taken> taken;
+    // The takes as the ledger takes (MemoryLedger::take): the first unit from
+    // the head of the order, again from the head after a take that gave
+    // something, the next one after a take that gave nothing; a claim that
+    // does not wait for writes passes over what lands later.
+    for (std::optional<engine::Victim> unit = cache_.peek(query, nullptr); unit;) {
+      if (unit->later && immediate) {
+        unit = cache_.peek(query, &*unit);
         continue;
-      for (std::optional<engine::Victim> unit = fresh; unit && unit->key == first.key;
-           unit = cache_.peek(query, after ? &*after : nullptr)) {
-        const auto unchanged = fingerprint();
-        const uint64_t before = pool_.allocatedBytes();
-        const uint64_t offloads = cache_.snapshot().stateCache.offloads;
-        const uint32_t demotions = tier_.demotions;
-        const FreeResult taken = cache_.take(query, *unit);
-        const uint64_t released = before - std::min(before, pool_.allocatedBytes());
-        require(taken.nowBytes <= released, "a take released " + std::to_string(released) + " bytes, reported " +
-                                                std::to_string(taken.nowBytes));
-        const uint64_t written = cache_.snapshot().stateCache.offloads - offloads;
-        require(unit->write || (!written && tier_.demotions == demotions),
-                "a take of a unit offered as needing no write started one");
-        require(!unit->write || unit->later || (written <= 1 && tier_.demotions == demotions),
-                "a take of a unit offered as freeing now through the staging buffer started more than its state's "
-                "write");
-        require(!states || !unit->later || !taken.gave(),
-                "a take of a state offered as freeing once a write lands gave something now");
-        freed += taken.nowBytes + taken.laterBytes;
-        releasedNow += released;
-        reportedPages += taken.pages;
-        reportedBuffers += taken.stateBuffers;
-        unitFreed += device ? taken.nowBytes + taken.laterBytes : states ? taken.stateBuffers : taken.pages;
-        // Progress: a take that says it gave something changed the cache,
-        // so the ledger's peek again from the head (MemoryLedger::take)
-        // never finds the same unit for ever.
-        require(!taken.gave() || fingerprint() != unchanged, "a take reported giving something and changed nothing");
-        // Progress: a unit peek offers is one its first take gives something
-        // of, or that waits for a transfer in flight; never a count of what
-        // the walk cannot reach.
-        require(!firstTake || taken.gave() || taken.outcome == FreeOutcome::Pending,
-                "a unit peek offered gave nothing and waited for nothing at its first take");
-        firstTake = false;
-        if (!taken.gave())
-          break;
-        ++steps;
       }
-      const uint64_t unitCounted = device ? fresh->bytes : states ? fresh->stateBuffers : fresh->pages;
-      const bool exact = unitFreed >= unitCounted;
+      const uint64_t through = throughUnit(*unit);
+      const bool firstTake = !taken.contains(unit->key);
+      Taken &record = taken[unit->key];
+      if (firstTake)
+        record = {.counted = measure(*unit), .write = unit->write};
+      const auto unchanged = fingerprint();
+      const uint64_t before = pool_.allocatedBytes();
+      const uint64_t offloads = cache_.snapshot().stateCache.offloads;
+      const uint32_t demotions = tier_.demotions;
+      const FreeResult result = cache_.take(query, *unit);
+      const uint64_t released = before - std::min(before, pool_.allocatedBytes());
+      require(result.nowBytes <= released, "a take released " + std::to_string(released) + " bytes, reported " +
+                                               std::to_string(result.nowBytes));
+      const uint64_t written = cache_.snapshot().stateCache.offloads - offloads;
+      require(unit->write || (!written && tier_.demotions == demotions),
+              "a take of a unit offered as needing no write started one");
+      require(!unit->write || unit->later || (written <= 1 && tier_.demotions == demotions),
+              "a take of a unit offered as freeing now through the staging buffer started more than its state's "
+              "write");
+      require(!states || !unit->later || !result.gave(),
+              "a take of a state offered as freeing once a write lands gave something now");
+      // Peek should never count less than its take frees: a take frees no
+      // more than the units from the head through it count, the units before
+      // it being what the take may free first (free pages, the extents they
+      // fill). Reported: a first phase's take of a claim that can wait still
+      // credits the landing its state evictions let free.
+      overTakes += gaveOf(result) > through;
+      record.freed += gaveOf(result);
+      // Progress: a take that says it gave something changed the cache, so
+      // the ledger's peek again from the head never finds the same unit for
+      // ever; and a unit peek offers is one its first take gives something
+      // of, or that waits for a transfer in flight, never a count of what
+      // the walk cannot reach.
+      require(!result.gave() || fingerprint() != unchanged, "a take reported giving something and changed nothing");
+      require(!firstTake || result.gave() || result.outcome == FreeOutcome::Pending,
+              "a unit peek offered gave nothing and waited for nothing at its first take");
+      if (result.gave()) {
+        ++steps;
+        unit = cache_.peek(query, nullptr);
+      } else {
+        unit = cache_.peek(query, &*unit);
+      }
+    }
+    for (const auto &[_, record] : taken) {
+      const bool exact = record.freed >= record.counted;
       ++(exact ? exactUnits : shortUnits);
-      if (!fresh->write)
+      if (!record.write)
         ++(exact ? exactNoWrite : shortNoWrite);
     }
-    const uint32_t pagesAfter = pagesOf();
-    const uint32_t freedPages = pagesAfter - std::min(pagesAfter, pagesBefore);
     for (const uint64_t block : inUse)
       require(query.rights.inUse || cache_.stateResident(block),
               "a claim that does not reach what is in use took a state in use");
@@ -309,16 +313,6 @@ public:
             "a claim that does not take what is of certain reuse took the state a waiting request restores");
     if (!wanted.empty())
       cache_.setWantedChains({});
-    // A device need counts bytes, a page need pages of its form, a state
-    // need buffers.
-    require(device   ? freed <= counted && releasedNow <= counted + landing
-            : states ? reportedBuffers <= countedBuffers
-                     : freedPages <= countedPages && reportedPages <= countedPages,
-            "the claim's takes freed more than peek counted: counted " + std::to_string(counted) + " bytes and " +
-                std::to_string(countedPages) + " pages, freed " + std::to_string(freed) + " bytes (" +
-                std::to_string(releasedNow) + " now) and " +
-                std::to_string(freedPages) + " pages (" + std::to_string(reportedPages) + " reported), " +
-                std::to_string(reportedBuffers) + " of " + std::to_string(countedBuffers) + " state buffers");
   }
 
 private:
@@ -561,7 +555,7 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
 // The same runs with random claims counted and taken (checkTake), again with requests using the states they resume
 // from.
 void testTakeNeverExceedsPeek(uint32_t plainSeeds, uint32_t windowedSeeds) {
-  uint64_t steps = 0, exact = 0, shortOf = 0, exactNoWrite = 0, shortNoWrite = 0;
+  uint64_t steps = 0, exact = 0, shortOf = 0, exactNoWrite = 0, shortNoWrite = 0, over = 0;
   const auto check = [&](uint32_t seed, bool windowed, bool usedStates) {
     Run run(seed, windowed, true, usedStates);
     try {
@@ -579,16 +573,17 @@ void testTakeNeverExceedsPeek(uint32_t plainSeeds, uint32_t windowedSeeds) {
     shortOf += run.shortUnits;
     exactNoWrite += run.exactNoWrite;
     shortNoWrite += run.shortNoWrite;
+    over += run.overTakes;
   };
   for (const bool usedStates : {false, true})
     for (const bool windowed : {false, true})
       for (uint32_t seed = 1; seed <= (windowed ? windowedSeeds : plainSeeds); ++seed)
         check(seed, windowed, usedStates);
   std::cout << "cache take runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds << " windowed; " << steps
-            << " reclaim steps, none freeing more than peek counted, each that gave something changing the cache, "
-            << "every offered unit's first take giving something or waiting; " << exact
-            << " units freed all peek counted, " << shortOf << " less (" << exactNoWrite << " and " << shortNoWrite
-            << " of those needing no write)\n";
+            << " reclaim steps taken as the ledger takes, each that gave something changing the cache, every offered "
+            << "unit's first take giving something or waiting; " << exact << " units freed all peek counted, "
+            << shortOf << " less (" << exactNoWrite << " and " << shortNoWrite << " of those needing no write); "
+            << over << " takes freed more than the units through theirs counted\n";
 }
 
 } // namespace
