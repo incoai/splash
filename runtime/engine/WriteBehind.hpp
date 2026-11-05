@@ -71,7 +71,8 @@ public:
   // (none unless a recent claim reached cache a copy would have let go at
   // once, else Engine::copyDemandBytes) exceeds what the cache's victims
   // that go at once, waiting for no write to land (the state the idle
-  // staging buffer writes among them), hold, plus what the copies ahead in
+  // staging buffer writes among them), hold, counted as the ledger counts
+  // them (an upper bound, VictimSource), plus what the copies ahead in
   // flight, those it started included, free once they land
   // (Cache::copyingAheadBytes). True when a point became durable or was
   // given up; a write it starts wakes the engine when it lands.

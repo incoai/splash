@@ -1324,6 +1324,14 @@ every source of units reads (`MemoryLedger::Order`, `Cache::walkFor`):
 | `Host` under critical pressure | yes | no | yes | no | yes | yes | yes | yes |
 | A need the host refused | in place | no | yes | no | no | as its class | as its class | no |
 
+The resume point is the newest ordinary state in RAM (`StateCache::resumePoint`),
+the one a conversation's next turn most likely resumes from. A claim of no
+certain reuse passes over it; one with it takes it in its recency order, and
+so does the host's pass under critical pressure. Every state a reclaim takes
+from RAM is written to the SSD cache first while the tier takes the write, so
+a resume point that goes keeps its SSD copy: its next turn starts with a
+restore read rather than a prefill.
+
 The engine's own optional work (the Index runway's refill with no Spill lane
 in service, trims with no lane in service) takes no unit at all
 (`TakeRights::units`): only the idle state buffers and what lands. The pass

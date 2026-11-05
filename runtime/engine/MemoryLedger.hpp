@@ -227,8 +227,14 @@ struct VictimQuery final {
 
 // A source of the units free() takes, on the engine thread between commands.
 // peek changes nothing and gives the unit after `after` in the source's
-// order with at most what taking it frees, never less: free() takes nothing
-// unless what it peeked covers the need. take takes the unit, or one step of
+// order, counted as an upper bound of what taking it frees: in no measure
+// (bytes now and later, pages of the need's form, state buffers) does take
+// free more than peek gave, though it may free less (a transfer in flight
+// holds part of the unit, a reclaim empties fewer extents than counted).
+// This is the one peek contract: free() counts with it (bound) and takes
+// nothing unless the count covers the need, the claim's retries taking what
+// a take fell short by, and every reader of peek relies on it alone (the
+// cache's units, WriteBehind::demanded). take takes the unit, or one step of
 // it where the source frees it a step at a time (the cache's reclaims), and
 // reports what that freed, the pages of the need's form and the state
 // buffers too: Met, or Pending on the transfers it started, when

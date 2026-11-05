@@ -274,15 +274,17 @@ enum class SpillGate : uint8_t { Open, TierClosed, WriteBudget };
 // leaves.
 enum class SpilledExtents : uint8_t { KeepRunway, Released };
 
-// Whether the caller can wait for memory a step leaves to come back.
-// CanWait (growth and pressure passes): a KV leaf a state needs is written
-// first, and its page returns when the copy lands; a state that needs a
-// write waits for the staging buffer while the one write in flight holds
-// it. Immediate (a state's buffers, taken between commands): only what
-// frees now goes. A leaf goes through its disk copy or erased; one that
-// needs a demotion is passed over. A state that needs a write goes only
-// through the idle staging buffer, whose copy frees its RAM at once; while
-// a write holds the buffer it is passed over.
+// Whether a walk can wait for memory its steps' writes return (Walk::timing):
+// a claim that waits for writes (TakeRights::waitsForWrites) walks CanWait,
+// any other Immediate, and so do the phases of a device or a page need's
+// reclaims but those that free as writes land (Cache::phaseWalk). CanWait: a
+// KV leaf a state needs is written first, and its page returns when the
+// copy lands; a state that needs a write waits for the staging buffer while
+// the one write in flight holds it. Immediate: only what frees now goes. A
+// leaf goes through its disk copy or erased; one that needs a demotion is
+// passed over. A state that needs a write goes only through the idle
+// staging buffer, whose copy frees its RAM at once; while a write holds the
+// buffer it is passed over.
 enum class ReclaimTiming : uint8_t { CanWait, Immediate };
 
 // The class of a state a command captures, which bounds what is taken for
@@ -688,18 +690,19 @@ public:
   // takes the other forms' empty extents and a windowed cache's trims
   // first. A state need's units are its states, one each.
   //
-  // peek() changes nothing: a phase's unit counts at most what its reclaims
-  // free (reach), from the counts the pool and the KV cache keep, at a cost
-  // that does not grow with the cache, and none is given once that is
-  // nothing. take() makes one reclaim of the unit's phase, of the state
-  // alone in a phase of the staging buffer's write (the copied part of its
-  // chain, which its unit counts too, then frees with no write, in the first
-  // phase, which the ledger peeks again after a take), and reports what it
-  // freed: the bytes of the extents released now, and those it adds to the
-  // extents the landing pages complete beside the free ones (laterBytes,
-  // landingFill), less any of them a release took; the pages of the need's
-  // form free now, or for a claim that can wait landing; and the state
-  // buffers it gave up.
+  // peek() changes nothing and counts each unit as VictimSource's contract
+  // asks, an upper bound of what its take frees: a phase's unit what its
+  // reclaims can free (reach), from the counts the pool and the KV cache
+  // keep, at a cost that does not grow with the cache, and none is given
+  // once that is nothing. take() makes one reclaim of the unit's phase, of
+  // the state alone in a phase of the staging buffer's write (the copied
+  // part of its chain, which its unit counts too, then frees with no write,
+  // in the first phase, which the ledger peeks again after a take), and
+  // reports what it freed: the bytes of the extents released now, and those
+  // it adds to the extents the landing pages complete beside the free ones
+  // (laterBytes, landingFill), less any of them a release took; the pages of
+  // the need's form free now, or for a claim that can wait landing; and the
+  // state buffers it gave up.
   // A device need's reclaim that demotes a leaf starts the demotions of its
   // chain above it, child before parent, while the tier and the quota have
   // room (a waiting claim's chain lands in about ceil(pages/64) ticks rather

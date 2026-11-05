@@ -43,9 +43,13 @@ bool WriteBehind::settle(PersistStatus status) {
 bool WriteBehind::copying() const noexcept { return cache_.persistent() || demandBytes_ != 0; }
 
 bool WriteBehind::demanded(uint64_t demandBytes) const {
-  // At most what the cache gives a claim that cannot wait now, which waits
-  // for no write to land, and what the copies ahead in flight let go once
-  // they land.
+  // What the cache gives a claim that cannot wait now, which waits for no
+  // write to land, and what the copies ahead in flight let go once they
+  // land. An upper bound, as peek counts (VictimSource), the count the
+  // ledger judges a claim by (MemoryLedger::bound): copies ahead are
+  // demanded where that count does not cover the claims ahead. A lower
+  // bound would copy ahead where the ledger takes what frees at once and
+  // reaches no uncopied cache.
   uint64_t covered = cache_.copyingAheadBytes();
   if (covered >= demandBytes)
     return false;
