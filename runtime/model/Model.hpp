@@ -319,7 +319,8 @@ struct BatchPlan final {
   // them and commits; the rows' work between lives in the model's prefill
   // memory, which no other prefill touches meanwhile, while other lanes'
   // decode commands run between passes. A command abandoned between its
-  // passes commits nothing of its rows (Scheduler::abandonPasses).
+  // passes commits nothing of its rows (PassCommand::yield,
+  // Scheduler::abandoned).
   uint32_t pass = 0;
   uint32_t passes = 1;
   uint32_t layer = 0;

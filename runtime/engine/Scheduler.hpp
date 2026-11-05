@@ -182,9 +182,10 @@ public:
   // Whether `plan` is a prefill plan other than the next pass of the command
   // between its passes, which is abandoned before it commits.
   [[nodiscard]] bool abandonsPasses(const BatchPlan &plan, const PlanInputs &in) const;
-  // Whether a start of `priority` abandons the command between its passes:
-  // a higher priority than the command's. The engine asks it for a start of
-  // that priority (Engine::admit, Engine::preemptBelow).
+  // Whether work of `priority` abandons the command between its passes: a
+  // higher priority than the command's. The engine asks it for a start
+  // (Engine::admit) and for a plan beside a lane of the command that ended
+  // (Engine::tick).
   [[nodiscard]] bool yieldsTo(RequestPriority priority, const PlanInputs &in) const;
   // The excluded lanes are those the plan was made without: blocked, not
   // passed over, so they lose nothing to it. A later pass must be the
