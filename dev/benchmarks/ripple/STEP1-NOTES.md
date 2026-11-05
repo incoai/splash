@@ -79,3 +79,33 @@ The value residual's mix lands beside it: the v projection's input staging
 reads the mixed row (sigma(lambda) * normed x + (1 - sigma(lambda)) * scaled
 embeddings), which the mixer's capture of the block's input rows already
 holds.
+
+## Step 2 design note: the value residual (for the target's forward)
+
+Ripple's block mixes its v input as
+`v_in = sigmoid(lambda) * attn_norm(x) + (1 - sigmoid(lambda)) * scaled_emb`,
+the scaled token embeddings the same rows every block mixes back in. The
+mixer's q, k and v run as one fused projection of one input, which cannot
+give v its own; the residual therefore splits algebraically:
+
+- the fused projection's v rows are scaled by sigmoid(lambda) at load, a
+  per-layer constant folded where the Qwen3.5 gate rows are already folded,
+  so the fused projection computes the first term for its v columns at no
+  runtime cost;
+- the second term is a per-layer projection of the scaled embedding rows
+  through the v rows alone, which the prepared weights hold contiguously as
+  the fused projection's last section (a view, no extra memory), weighted by
+  1 - sigmoid(lambda) from the block's lambda buffer; at decode that is a
+  1024x5120 GEMV per block, about half a percent of a cycle's weight reads;
+- the term adds to the fused projection's v columns where the attention's
+  q/k/v prepare stages them - the prepare kernels are per-geometry
+  instantiations already, and prefill's chunked rows take the same add.
+
+The scaled embeddings are the gather's output (the gather writes them
+scaled), which the block's capture already holds for the draft's taps.
+
+## Step 2 design note: the clamp (supersedes the earlier note's decode part)
+
+The decode epilogue's clamped variant reads the clamp from a uniform of the
+family's ffn_clamp_threshold; the prefill clamps the gate scratch between
+the passes as written before.
