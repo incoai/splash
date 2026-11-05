@@ -10,6 +10,7 @@
 #include "ops/RowCopy.hpp"
 
 #include <algorithm>
+#include <stdexcept>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -55,7 +56,14 @@ void QwenTargetGeometry::finish(std::span<const ops::BlockMoeWeights *const> moe
   std::array<uint64_t, GGUF_FMT_COUNT> weights{};
   std::array<uint32_t, GGUF_FMT_COUNT + 1> routers{};
   moeRegisterFormats = true;
+  // ULMoE blocks: every MoE block's routed experts, or none.
+  uint64_t ulmoe = 0;
   for (const ops::BlockMoeWeights *block : moeBlocks) {
+    if (block->ulmoe.present()) {
+      ++ulmoe;
+      ++routers[std::min<uint32_t>(block->router.formatId, GGUF_FMT_COUNT)];
+      continue;
+    }
     moeRegisterFormats &= registerTakes(*block);
     for (const ops::BlockExpertProjection *projection : {&block->gate, &block->up, &block->down})
       if (!projection->routed.isFloat())
@@ -64,6 +72,11 @@ void QwenTargetGeometry::finish(std::span<const ops::BlockMoeWeights *const> moe
   }
   const auto most = std::max_element(weights.begin(), weights.end());
   moeExpertFormat = *most ? uint32_t(most - weights.begin()) : GGUF_FMT_COUNT;
+  if (ulmoe) {
+    if (ulmoe != moeBlocks.size()) throw std::invalid_argument("ULMoE experts must fill every MoE block");
+    moeExpertFormat = QUANT_FMT_ULMOE_W2;
+    moeRegisterFormats = false;
+  }
   const auto router = std::max_element(routers.begin(), routers.end());
   moeRouterFormat = *router && router < routers.end() - 1 ? uint32_t(router - routers.begin())
                                                           : ops::QuantizedSegment::kFloat32;

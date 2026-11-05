@@ -1,5 +1,12 @@
 #include "model/QwenTargetLoader.hpp"
 #include "Checked.hpp"
+#include "model/GgufFile.hpp"
+#include "model/GgufImage.hpp"
+#include "model/WeightStore.hpp"
+
+#include <memory>
+#include <string>
+#include <vector>
 
 #include <utility>
 
@@ -62,6 +69,9 @@ MoeExperts openMoeExperts(metal::MetalBackend &backend, const QwenTargetFiles &f
       [&](const auto &source) {
         const auto &loader = source.get();
         MoeExperts result{.experts = target.experts};
+        if constexpr (requires { loader.file(); }) result.ulmoe = gguf::ulmoeExperts(loader.file());
+        if (result.ulmoe && loader.streamsExperts())
+          throw WeightStoreError("ULMoE experts load resident: run without expert memory");
         if (!loader.streamsExperts()) {
           result.resident = residentExpertSlots(backend, target.experts);
           return result;
@@ -77,7 +87,32 @@ ops::BlockMoeWeights readMoeBlock(WeightFile &file, const QwenTargetDimensions &
                                   uint32_t block) {
   ops::BlockMoeWeights ffn;
   ffn.router = readFloatSegment(file, "router");
-  if (!experts.store) {
+  if (experts.ulmoe) {
+    // ULMoE W2 planes (GgufImage.cpp Builder::ulmoeExperts), the residual inputs past `inputs` counted from the
+    // codes' macro groups.
+    const auto projection = [&](uint32_t columns, uint32_t inputs, std::string_view label) {
+      const std::string name(label);
+      RawTensor codes = readRawTensor(file, ggml::kI32, name + "-codes");
+      RawTensor meta = readRawTensor(file, ggml::kI32, name + "-meta");
+      RawTensor anchors = readRawTensor(file, ggml::kF32, name + "-anchors");
+      const uint32_t groups = codes.outputSize / target.experts;
+      if (codes.inputSize != 4 * columns || codes.outputSize != target.experts * groups ||
+          meta.inputSize != columns || meta.outputSize != codes.outputSize ||
+          uint64_t{anchors.outputSize} * anchors.inputSize != columns || groups * ULMOE_MACRO_GROUP < inputs)
+        throw WeightStoreError("ULMoE planes do not match the layout: " + name);
+      return ops::UlmoeExpertProjection{std::move(codes.rows), std::move(meta.rows), std::move(anchors.rows),
+                                        groups * ULMOE_MACRO_GROUP - inputs};
+    };
+    const uint32_t hidden = target.hiddenSize, width = target.expertIntermediateSize;
+    ffn.ulmoe.gateUp = projection(2 * width, hidden, "experts-gate-up");
+    ffn.ulmoe.down = projection(hidden, width, "experts-down");
+    RawTensor order = readRawTensor(file, ggml::kI32, "experts-input-order");
+    if (uint64_t{order.outputSize} * order.inputSize != hidden)
+      throw WeightStoreError("ULMoE input order does not match the layout");
+    ffn.ulmoe.inputOrder = std::move(order.rows);
+    ffn.slotTable = experts.resident;
+    ffn.slots = experts.experts;
+  } else if (!experts.store) {
     ffn.gate.routed = readQuantizedSegment(file, "experts-gate");
     ffn.up.routed = readQuantizedSegment(file, "experts-up");
     ffn.down.routed = readQuantizedSegment(file, "experts-down");

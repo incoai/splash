@@ -372,6 +372,17 @@ void centeredNorm(const uint8_t *values, uint64_t count, uint8_t *to) {
   }
 }
 
+// ULMoE code words (gguf::Conversion::UlmoeCodes): code i of a word from bit 2 (i / 2) + 16 (i % 2)
+// to bit 8 (i % 4) + 2 (i / 4).
+void restageUlmoeCodes(const uint8_t *from, uint64_t words, uint8_t *to) {
+  for (uint64_t w = 0; w < words; ++w) {
+    uint32_t in = 0, out = 0;
+    std::memcpy(&in, from + 4 * w, 4);
+    for (uint32_t i = 0; i < 16; ++i) out |= ((in >> (2 * (i / 2) + 16 * (i % 2))) & 3u) << (8 * (i % 4) + 2 * (i / 4));
+    std::memcpy(to + 4 * w, &out, 4);
+  }
+}
+
 uint64_t copiedBytes(const gguf::Copy &copy, uint64_t sourceBytes) {
   return gguf::convertedBytes(copy.source, copy.conversion, sourceBytes);
 }
@@ -416,6 +427,7 @@ void addCopyTasks(uint8_t *image, const gguf::Copy &copy,
           writeGdnDecay(staging.data(), count * width / (bfloat16 ? 2 : 4), bfloat16, to);
           break;
         }
+        case gguf::Conversion::UlmoeCodes: restageUlmoeCodes(staging.data(), count * width / 4, to); break;
         case gguf::Conversion::DequantizeToFloat32: // decoded on the GPU (writeDecoded)
         case gguf::Conversion::None: break;
         }

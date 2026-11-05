@@ -68,6 +68,9 @@ struct MoeShape final {
   // float tile (Linear::ggufFloatTile).
   uint32_t routerFormat = QuantizedSegment::kFloat32;
 
+  // Routed experts in the ULMoE W2 format (BlockMoeWeights::ulmoe), the shared expert and the
+  // router as GGUF.
+  [[nodiscard]] constexpr bool ulmoeExperts() const noexcept { return expertFormat == QUANT_FMT_ULMOE_W2; }
   [[nodiscard]] constexpr bool valid() const noexcept {
     // Experts the routing kernels' slots hold, of an intermediate width
     // that fills 64-column tiles, routed as a kernel compiles.
@@ -191,6 +194,26 @@ private:
   std::array<Routed, 3> routed_{}; // gate, up, down
 };
 
+// A ULMoE W2 routed-expert projection (metal/abi/MoE.h QUANT_FMT_ULMOE_W2): every expert's codes ([G][columns]
+// uint4, codes restaged byte-major) and meta ([G][columns] uint32), expert e's at e * G * columns entries,
+// G = (inputs + residualSize) / 64, and one fp32 anchor per column shared by the experts.
+struct UlmoeExpertProjection final {
+  metal::MetalBuffer codes;
+  metal::MetalBuffer meta;
+  metal::MetalBuffer anchors;
+  uint32_t residualSize = 0; // duplicated leading inputs stored after the inputs, a multiple of 64
+};
+
+// The routed experts of a ULMoE block: gate/up of 2 * intermediate columns (gate then up, in each
+// expert's intermediate order, which down's inputs share) over the hidden inputs in the block's salience order
+// (inputOrder: input k is the token's input inputOrder[k]), and down.
+struct UlmoeMoeExperts final {
+  UlmoeExpertProjection gateUp;
+  UlmoeExpertProjection down;
+  metal::MetalBuffer inputOrder;
+  [[nodiscard]] bool present() const noexcept { return static_cast<bool>(gateUp.codes); }
+};
+
 struct MoeScratch;
 struct MoeBuffers;
 class MoePlan;
@@ -218,6 +241,8 @@ struct BlockMoeWeights final {
   const MoeExpertStream *stream = nullptr;
   uint32_t streamBlock = 0;
   ExpertChunks chunks = {};
+  // MoeShape::ulmoeExperts() blocks: the routed experts, whose gate, up and down routed segments stay empty.
+  UlmoeMoeExperts ulmoe = {};
 };
 
 // The one chunk of a block whose routed segments hold all its `slots`
@@ -409,6 +434,8 @@ struct MoeConfig final {
   FloatTile ggufRouterTile = FloatTile::Simdgroup;
   // Int8 activations (MoeInt8), off by default; decode plans only.
   MoeInt8 int8 = {};
+  // ULMoE blocks: the int8 passes (int8 activations, W2A8) instead of the bf16 GEMV (--moe-int8).
+  bool ulmoeInt8 = false;
   bool operator==(const MoeConfig &) const = default;
 };
 

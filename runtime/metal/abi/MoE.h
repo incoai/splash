@@ -253,3 +253,44 @@ struct MoeCombineParams {
 
 static_assert(sizeof(MoeCombineParams) == 12,
               "MoE combine parameters are 12 bytes on both sides");
+
+// ULMoE W2 routed experts (kernels/shared/moe_ulmoe.metal, ops::UlmoeMoeExperts). Not a GGUF type,
+// so not a kQuantFormats row: a MoE block whose routed experts are ULMoE carries this id as MoeShape::expertFormat;
+// its shared expert stays GGUF and runs inside the ULMoE passes (column GEMV). Per expert and projection of N columns x (K + R) stored inputs (R residual
+// inputs repeat the first R): codes [G][N] uint4 (16 bytes: the 4 words of 16 inputs of a 64-input macro group, input
+// 4c + b of a word at bit 8b + 2c, restaged at load from the checkpoint's pair-permuted words) and meta [G][N] uint32
+// (bit 0 ladder index, bits 1-7 the integer macro scale m, bit 8 + j z_j - 1, bits 16 + 2j s_off_j of micro group j of
+// 8 inputs), G = (K + R) / 64, expert e at e * G * N; one fp32 anchor per column shared by the experts.
+// w = (q - z_j) * s_j * m * anchor, s_j = 2 + 2 * ladder + s_off_j.
+#define QUANT_FMT_ULMOE_W2 0x100u
+#define ULMOE_MACRO_GROUP 64u
+
+// One ULMoE pass over the grouped tiles: tile t's input block at byte t * input_tile_bytes of the input (bf16 rows of
+// input_size, or, for routed tiles on the int8 path, int8 rows of input_size followed by the 8 rows' fp32 scales),
+// its rows' outputs at row t * 8 + r of an output of output_size bf16 columns. The shared expert's tiles (expert
+// `experts`) read bf16 rows and the GGUF planes of shared_format0 for output columns below shared_split, of
+// shared_format1 (at column - shared_split) from it on.
+struct MoeUlmoeParams {
+  uint32_t input_size;
+  uint32_t residual_size;
+  uint32_t output_size;
+  uint32_t experts;
+  uint32_t input_tile_bytes;
+  uint32_t shared_split;
+  uint32_t shared_format0;
+  uint32_t shared_format1;
+};
+
+static_assert(sizeof(MoeUlmoeParams) == 32, "MoE ULMoE parameters are 32 bytes on both sides");
+
+// The ULMoE gather: moe_gather_rows with each routed tile's rows in the block's salience order (input k of a routed
+// row is input order[k] of its token), as bf16 rows or int8 rows with a fp32 scale per row; the shared expert's tiles
+// keep bf16 rows in model order.
+struct MoeUlmoeGatherParams {
+  uint32_t tile_rows;
+  uint32_t input_size;
+  uint32_t routes_per_row;
+  uint32_t experts;
+};
+
+static_assert(sizeof(MoeUlmoeGatherParams) == 16, "MoE ULMoE gather parameters are 16 bytes on both sides");

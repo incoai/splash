@@ -10,6 +10,7 @@
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <tuple>
 
 namespace splash::model::gguf {
 namespace {
@@ -39,6 +40,7 @@ uint32_t imageFormat(uint32_t type) { return type == ggml::kNVFP4 ? GGUF_FMT_NVF
 
 bool quantizedType(uint32_t type) { return imageFormat(type) != GGUF_FMT_COUNT; }
 bool floatType(uint32_t type) { return type == ggml::kF32; }
+bool int32Type(uint32_t type) { return type == ggml::kI32; }
 // The 16-bit float types: a norm of one widens to F32 (floatNorm), a
 // hyper-connection projection of one is prepared as Q8_0 (quantizedOrQ8_0),
 // and an alpha/beta pair of them is a float tensor (alphaBeta).
@@ -155,6 +157,10 @@ public:
   // expert's gate rows then its up rows, which the two take expert by expert;
   // then down, of `experts` * hidden rows, from ffn_down_exps.
   void routedExperts(const std::string &prefix, uint64_t experts, uint64_t width, uint64_t hidden) {
+    if (file_.find(prefix + "ffn_gate_up_exps.ulmoe_codes")) {
+      ulmoeExperts(prefix, experts, width, hidden);
+      return;
+    }
     const std::string fusedName = prefix + "ffn_gate_up_exps.weight";
     if (!file_.find(fusedName)) {
       expertTensor(prefix + "ffn_gate_exps.weight", experts * width, hidden);
@@ -177,6 +183,39 @@ public:
       }
     }
     expertTensor(prefix + "ffn_down_exps.weight", experts * hidden, width);
+  }
+
+  // A layer's ULMoE W2 routed experts (ops::UlmoeMoeExperts), copied as stored but for the code
+  // words' restage (Conversion::UlmoeCodes): gate/up codes I32 [experts][G][2 width][4], meta I32
+  // [experts][G][2 width], anchors F32 [2 width], down's of hidden columns over width inputs, G macro groups of 64
+  // inputs with the residual inputs (G * 64 - inputs, at most the inputs), then the gate/up input order I32 [hidden].
+  // They load with the layer: streamed experts take GGUF expert tensors.
+  void ulmoeExperts(const std::string &prefix, uint64_t experts, uint64_t width, uint64_t hidden) {
+    if (image_.streamsExperts()) {
+      problems_.push_back(prefix + "ffn_gate_up_exps.ulmoe_codes (ULMoE experts do not stream)");
+      return;
+    }
+    for (const auto &[stem, columns, inputs] : {std::tuple{prefix + "ffn_gate_up_exps.ulmoe", 2 * width, hidden},
+                                                std::tuple{prefix + "ffn_down_exps.ulmoe", hidden, width}}) {
+      const GgufTensor *codes = find(stem + "_codes", int32Type), *meta = find(stem + "_meta", int32Type);
+      const GgufTensor *anchors = find(stem + "_anchors", floatType);
+      if (!codes || !meta || !anchors) continue;
+      const uint64_t groups = codes->rows() / experts;
+      if (codes->columns() != 4 * columns || codes->rows() != experts * groups || groups * 64 < inputs ||
+          groups * 64 - inputs > inputs || meta->columns() != columns || meta->rows() != codes->rows() ||
+          anchors->elements() != columns)
+        throw GgufError("unexpected ULMoE shapes for " + stem);
+      const TensorRows rows = tensorRows(*codes, codes->rows(), codes->columns() * 4);
+      image_.descriptor(rows.type, codes->rows(), codes->columns(), {}, {rows.rows * rows.rowBytes, 0, 0},
+                        codes->name);
+      image_.copy(rows, Conversion::UlmoeCodes);
+      copiedRows(*meta, meta->columns() * 4);
+      copiedRows(*anchors, anchors->columns() * 4);
+    }
+    if (const GgufTensor *order = find(prefix + "ffn_gate_up_exps.ulmoe_input_order", int32Type)) {
+      if (order->elements() != hidden) throw GgufError("unexpected shape for " + order->name);
+      copiedRows(*order, order->columns() * 4);
+    }
   }
 
   // A layer's shared expert of `slices` slices of `width`, which the grouped
@@ -712,7 +751,7 @@ uint64_t convertedBytes(const TensorRows &source, Conversion conversion, uint64_
     if (format == GGUF_FMT_COUNT) throw GgufError("not a quantized tensor: " + source.name);
     return sourceBytes / kQuantFormats[format].block_bytes * kQuantFormats[format].block_elements * 4;
   }
-  case Conversion::None: break;
+  case Conversion::None: case Conversion::UlmoeCodes: break;
   }
   return sourceBytes;
 }
@@ -860,6 +899,8 @@ void requireMetadata(const GgufMetadata &metadata, std::string_view architecture
   }
   if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
 }
+
+bool ulmoeExperts(const GgufFile &file) { return file.find("blk.0.ffn_gate_up_exps.ulmoe_codes") != nullptr; }
 
 std::vector<Image> planImages(const GgufFile &file, std::string_view architecture,
                               const QwenTargetDimensions &geometry, PlanOptions options) {

@@ -119,7 +119,10 @@ struct Fill {
 // shared-expert scalar gate), or as the F32 1 + w of a BF16 RMSNorm weight w,
 // which a checkpoint stores 1 below the weight the norm multiplies by (exact
 // but where |w| < 2^-16 or |w| >= 2^24, which it may round once).
-enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32, Decay, DequantizeToFloat32, CenteredNorm };
+// UlmoeCodes: ULMoE code words restaged from the checkpoint's pair-permuted order (code i at bit
+// 2 (i / 2) + 16 (i % 2)) to the byte-major order the kernels decode (input 4c + b at bit 8b + 2c), same size.
+enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32, Decay, DequantizeToFloat32, CenteredNorm,
+                                  UlmoeCodes };
 // Rows written back to back, each value converted as `conversion` says.
 struct Copy {
   uint64_t destination = 0;
@@ -229,6 +232,7 @@ public:
   [[nodiscard]] Repack expertPlanes(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name);
   void expertRepack(Repack repack);
   [[nodiscard]] Image finish();
+  [[nodiscard]] bool streamsExperts() const noexcept { return streamExperts_; }
 
 private:
   Image image_;
@@ -265,5 +269,10 @@ void requireMetadata(const GgufMetadata &metadata, std::string_view architecture
 // type its image does not copy as stored, of another width or of a rotated
 // GGUF.
 [[nodiscard]] StreamedRows tableRows(const GgufFile &file, const std::string &name, uint64_t columns);
+
+// Whether the GGUF's routed experts are ULMoE W2 planes (blk.N.ffn_gate_up_exps.ulmoe_{codes,meta,
+// anchors,input_order} and blk.N.ffn_down_exps.ulmoe_{codes,meta,anchors}, I32 / F32, as the ULMoE converter writes
+// them) instead of GGUF expert tensors.
+[[nodiscard]] bool ulmoeExperts(const GgufFile &file);
 
 } // namespace splash::model::gguf
