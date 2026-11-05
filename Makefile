@@ -285,6 +285,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/engine/WriteBehind.cpp \
 	runtime/engine/Engine.cpp \
 	runtime/engine/EngineMemory.cpp \
+	runtime/engine/PassCommand.cpp \
 	runtime/engine/WeightResidency.cpp \
 	runtime/engine/MemoryGovernor.cpp \
 	runtime/engine/MemoryLedger.cpp \

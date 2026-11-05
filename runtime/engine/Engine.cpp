@@ -328,7 +328,7 @@ bool Engine::tick(double now) {
     settleEndedBetweenPasses();
     // Planning reads the lanes' shapes as they are now, before every plan.
     const std::vector<LaneShape> shapes = laneShapes();
-    const PlanInputs in{.excluded = excluded, .shapes = shapes, .passes = passProgress()};
+    const PlanInputs in{.excluded = excluded, .shapes = shapes, .passes = passCommand_.progress()};
     const std::optional<BatchPlan> plan = scheduler_.next(in);
     if (!plan)
       break;
@@ -340,13 +340,9 @@ bool Engine::tick(double now) {
     // the decode that follows each of its passes, or a lower one, its next
     // pass comes after that plan: the command goes on, its other lanes
     // keeping the passes they ran, and the lane ends at its last pass.
-    if (passCommand_ && !plan->pass &&
-        requests_.at(plan->items.front().requestId).request.priority <
-            requests_.at(passCommand_->items.front().requestId).request.priority &&
-        std::ranges::any_of(passCommand_->items, [&](const ModelBatchItem &item) {
-          return requests_.at(item.requestId).pendingEnd.has_value();
-        })) {
-      abandonPasses();
+    if (passCommand_.anyEnded() && !plan->pass &&
+        requests_.at(plan->items.front().requestId).request.priority < passCommand_.priority()) {
+      settleEnded(passCommand_.yield());
       sweepTerminal(now);
       return true;
     }
@@ -357,7 +353,7 @@ bool Engine::tick(double now) {
     const bool supersedes = scheduler_.abandonsPasses(*plan, in);
     passOver(*plan, excluded);
     std::vector<ModelBatchItem> items;
-    std::vector<std::vector<Capture>> captures;
+    std::vector<std::vector<LaneCapture>> captures;
     const size_t planned = excluded.size();
     const Prepared prepared = prepare(*plan, items, captures, excluded, supersedes, now);
     switch (prepared) {
@@ -365,8 +361,8 @@ bool Engine::tick(double now) {
       // Unless prepare gave the command up already: a claim for it took the
       // command (EngineVictims), or a lane yielded beside one of it that
       // ended (yieldsEndedLanes).
-      if (supersedes && passCommand_)
-        abandonPasses();
+      if (supersedes)
+        settleEnded(passCommand_.yield());
       tickHosts_.add(static_cast<uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(AwakeClock::now() - planning).count()));
       std::unique_ptr<ModelBatchTicket> ticket =
@@ -383,12 +379,11 @@ bool Engine::tick(double now) {
         if (std::ranges::find(refused, id) == refused.end())
           waiting.push_back(id);
       const std::vector<LaneShape> committed = laneShapes();
-      scheduler_.commit(*plan, {.excluded = waiting, .shapes = committed, .passes = passProgress()});
+      scheduler_.commit(*plan, {.excluded = waiting, .shapes = committed, .passes = passCommand_.progress()});
       // A command in passes keeps its items and their captures for its
       // later passes (prepare), and its progress for planning.
       if (plan->passes > 1 && !plan->pass)
-        passCommand_ = PassCommand{
-            .progress = {.plan = *plan}, .items = items, .captures = captures};
+        passCommand_.start(*plan, requests_.at(plan->items.front().requestId).request.priority, items, captures);
       // The command reads the cached pages its lanes' blocks were swapped
       // for, and those a resume restored. Selecting a constrained request's
       // first token reads none, but the cycle after it does; only a first
@@ -677,8 +672,8 @@ bool Engine::admitQueued(double now) {
     for (const auto &[id, active] : requests_)
       if (active.restore && !scheduler_.suspended(id))
         restoring.push_back({id, active.restore->lookup.resumeBoundary()});
-    wanted = scheduler_.prefillAdmissionOrder(candidates,
-                                              {.shapes = shapes, .passes = passProgress(), .restoring = restoring});
+    wanted = scheduler_.prefillAdmissionOrder(
+        candidates, {.shapes = shapes, .passes = passCommand_.progress(), .restoring = restoring});
   }
   bool startWaits = false;
   for (const PrefillAdmission &candidate : candidates)
@@ -870,7 +865,7 @@ bool Engine::admit(Request &active, double now) {
   // (ClaimSpec::supersedes).
   const std::vector<LaneShape> shapes = laneShapes();
   const bool supersedes =
-      scheduler_.yieldsTo(active.request.priority, {.shapes = shapes, .passes = passProgress()});
+      scheduler_.yieldsTo(active.request.priority, {.shapes = shapes, .passes = passCommand_.progress()});
   ModelRequest modelRequest = active.request.modelView();
   modelRequest.prompt = active.exactTokens;
   CacheLookup lookup =
@@ -1292,7 +1287,7 @@ void Engine::publishCommittedBlocks(Request &active, uint32_t committedTokens) {
 }
 
 void Engine::publishReachedStateBoundaries(
-    Request &active, uint32_t promptProcessed, std::span<const Capture> captures,
+    Request &active, uint32_t promptProcessed, std::span<const LaneCapture> captures,
     std::span<const std::shared_ptr<const CompositeState>> states, double now) {
   bool materialized = false;
   // The lane's draft state is complete at its progress when the command
@@ -1446,7 +1441,7 @@ void Engine::publishReachedStateBoundaries(
 }
 
 Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchItem> &items,
-                                 std::vector<std::vector<Capture>> &captures, std::vector<uint64_t> &excluded,
+                                 std::vector<std::vector<LaneCapture>> &captures, std::vector<uint64_t> &excluded,
                                  bool supersedes, double now) {
   const bool prefill = plan.kind == WorkKind::Prefill;
   const bool spill = config_.spill.capable;
@@ -1457,7 +1452,7 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
   std::vector<std::pair<KvMode, bool>> shapes;
   for (const BatchItem &item : plan.items)
     shapes.emplace_back(request(item.requestId).kvMode, cache_.holdsIndexPages(item.requestId));
-  const bool commandBetweenPasses = !plan.pass && passCommand_;
+  const bool commandBetweenPasses = !plan.pass && passCommand_.active();
   const auto reshaped = [&] {
     for (size_t index = 0; index < plan.items.size(); ++index) {
       const uint64_t id = plan.items[index].requestId;
@@ -1501,9 +1496,7 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
   // they need, and only their page tables may have changed, as moves
   // between commands rewrite them.
   if (plan.pass) {
-    if (!passCommand_)
-      throw std::logic_error("a prefill command's pass has no command");
-    items = passCommand_->items;
+    passCommand_.nextPass(items, captures);
     for (ModelBatchItem &item : items) {
       const PageTableView pageTable = cache_.cutPageTable(item.requestId);
       item.pageTable = pageTable.pages;
@@ -1511,7 +1504,6 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
       item.pageTableFirstChanged = pageTable.firstChanged;
       item.pageSources = pageTable.sources;
     }
-    captures = passCommand_->captures;
     return Prepared::Runnable;
   }
   std::vector<BatchItem> admitted;
@@ -1521,7 +1513,7 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
   // A claim that took the command between its passes (EngineVictims) leaves
   // a plan made beside it: planning starts again at once, the memory the
   // lanes were granted kept.
-  const auto commandTaken = [&] { return commandBetweenPasses && !passCommand_; };
+  const auto commandTaken = [&] { return commandBetweenPasses && !passCommand_.active(); };
   for (const BatchItem &scheduled : plan.items) {
     Request &active = request(scheduled.requestId);
     if (!active.lane)
@@ -1745,7 +1737,7 @@ uint32_t Engine::generatedTokens(const Request &active) noexcept {
 void Engine::apply(const Pending &command, std::span<const ModelStepResult> results,
                    double cycleMilliseconds, double now) {
   const BatchPlan &plan = command.plan;
-  const std::span<const std::vector<Capture>> captures = command.captures;
+  const std::span<const std::vector<LaneCapture>> captures = command.captures;
   const ModelBatchTicket &ticket = *command.ticket;
   if (results.size() != plan.items.size()) {
     throw std::logic_error("model result count changed");
@@ -1792,13 +1784,11 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
     if (!result.unreadableKvBlocks.empty()) {
       unreadable.insert(unreadable.end(), result.unreadableKvBlocks.begin(),
                         result.unreadableKvBlocks.end());
-      if (!active.pendingEnd)
-        active.pendingEnd = LaneEnd{LaneOutcome::KvUnreadable, std::string(kKvUnreadableMessage)};
+      deferEnd(active, {LaneOutcome::KvUnreadable, std::string(kKvUnreadableMessage)});
     } else if (!invalid.empty()) {
       if (active.unprovenState)
         cache_.invalidateState(*active.unprovenState);
-      if (!active.pendingEnd)
-        active.pendingEnd = LaneEnd{LaneOutcome::ModelResultInvalid, std::move(invalid)};
+      deferEnd(active, {LaneOutcome::ModelResultInvalid, std::move(invalid)});
     }
     // A lane that ended meanwhile stays in the command to its last pass.
     if (beforeLastPass) {
@@ -1829,7 +1819,7 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
       if (promptProcessed == active.replayTokens)
         active.replaying = false;
       // The model captured every state but one taken from the lane, last.
-      const std::vector<Capture> &reached = captures[index];
+      const std::vector<LaneCapture> &reached = captures[index];
       const bool fromLane = !reached.empty() && reached.back().fromLane;
       if (result.capturedStates.size() + fromLane != reached.size())
         throw std::logic_error("model returned mismatched captured states");
@@ -1942,16 +1932,8 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
         active.gapSince.prefillMilliseconds += wallMilliseconds;
       }
   scheduler_.complete(plan, schedulerResults, sample);
-  // The command's last pass ends it, and the lanes that ended between its
-  // passes with it (below); a pass before moves it to its next pass, which
-  // goes on unless none of its lanes is left.
-  if (plan.passes > 1 && !beforeLastPass) {
-    passCommand_.reset();
-  } else if (beforeLastPass) {
-    passCommand_->progress.plan = scheduler_.nextPass(passCommand_->progress.plan);
-    if (passesEnded())
-      abandonPasses();
-  }
+  if (plan.kind == WorkKind::Prefill && plan.passes > 1)
+    settleEnded(passCommand_.passCompleted(plan));
   events_.batchCompleted(plan.kind, plan.width(), inputTokens, outputTokens,
                          draftedTokens, acceptedDraftTokens, wallMilliseconds,
                          cycleMilliseconds);
@@ -1975,65 +1957,45 @@ bool Engine::inFlight(uint64_t id) const {
                      [id](const BatchItem &item) { return item.requestId == id; });
 }
 
-bool Engine::betweenPasses(uint64_t id) const {
-  return passCommand_ && std::ranges::any_of(passCommand_->items, [id](const ModelBatchItem &item) {
-           return item.requestId == id;
-         });
-}
-
-bool Engine::passesEnded() const {
-  return std::ranges::all_of(passCommand_->items, [&](const ModelBatchItem &item) {
-    return requests_.at(item.requestId).pendingEnd.has_value();
-  });
-}
-
 bool Engine::yieldsEndedLanes(const Request &lane) {
-  if (!betweenPasses(lane.request.id) ||
-      std::ranges::none_of(passCommand_->items, [&](const ModelBatchItem &item) {
-        return requests_.at(item.requestId).pendingEnd.has_value();
-      }))
+  if (!passCommand_.holds(lane.request.id) || !passCommand_.anyEnded())
     return false;
-  abandonPasses();
+  settleEnded(passCommand_.yield());
   return true;
-}
-
-void Engine::abandonPasses() {
-  std::vector<uint64_t> lanes;
-  for (const ModelBatchItem &item : passCommand_->items)
-    lanes.push_back(item.requestId);
-  takePassCommand();
-  for (const uint64_t id : lanes)
-    if (Request &lane = request(id); lane.pendingEnd)
-      settle(lane, *std::exchange(lane.pendingEnd, std::nullopt));
-}
-
-void Engine::takePassCommand() {
-  scheduler_.abandoned();
-  // Its items go with it, and with them the buffers of the states they would
-  // capture.
-  passCommand_.reset();
 }
 
 void Engine::settleEndedBetweenPasses() {
   for (auto &[id, active] : requests_)
-    if (active.pendingEnd && !active.finalized && !active.restore && !inFlight(id) && !betweenPasses(id))
+    if (active.pendingEnd && !active.finalized && !active.restore && !inFlight(id) && !passCommand_.holds(id))
       settle(active, *std::exchange(active.pendingEnd, std::nullopt));
+}
+
+void Engine::settleEnded(std::span<const uint64_t> lanes) {
+  for (const uint64_t id : lanes) {
+    Request &lane = request(id);
+    settle(lane, std::exchange(lane.pendingEnd, std::nullopt).value());
+  }
+}
+
+void Engine::deferEnd(Request &active, LaneEnd end) {
+  if (!active.pendingEnd)
+    active.pendingEnd = std::move(end);
 }
 
 void Engine::settle(Request &active, LaneEnd end) {
   if (active.finalized)
     return;
   const uint64_t id = active.request.id;
-  if (active.restore || inFlight(id) || betweenPasses(id)) {
-    if (!active.pendingEnd)
-      active.pendingEnd = std::move(end);
+  const bool running = inFlight(id);
+  if (active.restore || running || passCommand_.holds(id)) {
+    deferEnd(active, std::move(end));
     if (active.restore) {
       if (active.restore->ticket)
         active.restore->ticket->cancel();
-    } else if (inFlight(id)) {
-      pending_->ticket->abandonMask(id);
-    } else if (passesEnded()) {
-      abandonPasses();
+    } else {
+      if (running)
+        pending_->ticket->abandonMask(id);
+      settleEnded(passCommand_.laneEnded(id, running));
     }
     return;
   }
@@ -2097,8 +2059,8 @@ void Engine::finishFailure(Request &active, LaneEnd end) {
 
 void Engine::vacateLane(Request &active, bool keepContinuation) {
   const uint64_t id = active.request.id;
-  if (betweenPasses(id))
-    abandonPasses();
+  if (passCommand_.holds(id))
+    settleEnded(passCommand_.yield());
   discardPendingStateBoundaries(active);
   if (keepContinuation)
     model_.suspend(id);

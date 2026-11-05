@@ -6,6 +6,7 @@
 #include "TestKvPool.hpp"
 #include "TestRegistry.hpp"
 #include "engine/Engine.hpp"
+#include "engine/PassCommand.hpp"
 
 #include <algorithm>
 #include <array>
@@ -14,6 +15,7 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <set>
 #include <span>
 #include <string>
 #include <tuple>
@@ -34,6 +36,89 @@ using splash::test::tickUntil;
 namespace {
 
 using splash::test::require;
+
+// A command in three passes over lanes 1 and 2, the lanes in `ended` ended,
+// on a scheduler that counts the commands given up.
+class PassesOfTwo final {
+public:
+  PassesOfTwo() {
+    BatchPlan first{.kind = WorkKind::Prefill, .items = {{.requestId = 1}, {.requestId = 2}}};
+    first.passes = 3;
+    std::vector<ModelBatchItem> items(2);
+    items[0].requestId = 1;
+    items[1].requestId = 2;
+    command.start(first, RequestPriority::Normal, std::move(items), {{}, {}});
+  }
+  // The plan of its next pass.
+  [[nodiscard]] BatchPlan next() const { return command.progress()->plan; }
+  [[nodiscard]] uint64_t abandoned() const { return scheduler.snapshot().abandonedPassCommands; }
+
+  struct NoWork final : model::PrefillWorkSource {
+    [[nodiscard]] model::CommandWork prefillWork(std::span<const model::PrefillLane>, uint32_t,
+                                                 uint32_t) const override {
+      return {};
+    }
+  } work;
+  Scheduler scheduler{{.limits = {.commandRows = 2048, .layers = 3, .maximumPasses = 3}}, work};
+  std::set<uint64_t> ended;
+  PassCommand command{scheduler, [this](uint64_t id) { return ended.contains(id); }};
+};
+
+using Released = std::vector<uint64_t>;
+
+// A lane that ends while another goes on stays in the command, through its passes, until the command is given up.
+void testAPassCommandReleasesAnEndedLaneOnlyWhenGivenUp() {
+  PassesOfTwo passes;
+  passes.ended = {2};
+  const Released atEnd = passes.command.laneEnded(2, false);
+  const Released atPass = passes.command.passCompleted(passes.next());
+  require(atEnd.empty() && atPass.empty() && passes.command.holds(2) && passes.abandoned() == 0,
+          "a lane that ended beside one that goes on left its command before the command was given up");
+  require(passes.command.yield() == Released{2} && !passes.command.active() && passes.abandoned() == 1,
+          "the command given up did not release its lane that ended, alone");
+}
+
+// With no pass in flight, the end of its last lane gives the command up at once with every lane.
+void testAPassCommandWhoseLanesAllEndedIsGivenUp() {
+  PassesOfTwo passes;
+  passes.ended = {1};
+  const Released first = passes.command.laneEnded(1, false);
+  passes.ended = {1, 2};
+  require(first.empty() && passes.command.laneEnded(2, false) == Released{1, 2} && !passes.command.active() &&
+              passes.abandoned() == 1,
+          "the command whose lanes all ended between its passes was not given up with them");
+}
+
+// A lane that ends while a pass of its command runs waits for that pass: its completion gives the command up.
+void testALaneEndingWithAPassInFlightWaitsForThePass() {
+  PassesOfTwo passes;
+  passes.ended = {1, 2};
+  require(passes.command.laneEnded(2, true).empty() && passes.command.active() && passes.abandoned() == 0,
+          "the command was given up while a pass of it was in flight");
+  require(passes.command.passCompleted(passes.next()) == Released{1, 2} && !passes.command.active() &&
+              passes.abandoned() == 1,
+          "the pass's completion did not give up the command whose lanes all ended");
+}
+
+// The last pass ends the command and gives up nothing: the lanes that ended end with its results.
+void testTheLastPassReleasesNoLane() {
+  PassesOfTwo passes;
+  for (uint32_t pass = 1; pass < 3; ++pass)
+    require(passes.command.passCompleted(passes.next()).empty() && passes.next().pass == pass,
+            "a pass did not move the command to its next");
+  passes.ended = {1, 2};
+  require(passes.command.laneEnded(1, true).empty() && passes.command.passCompleted(passes.next()).empty() &&
+              !passes.command.active() && passes.abandoned() == 0,
+          "the last pass released lanes or gave its command up");
+}
+
+// Yielding without a command gives nothing up.
+void testYieldingNoPassCommandDoesNothing() {
+  PassesOfTwo passes;
+  static_cast<void>(passes.command.yield());
+  require(passes.command.yield().empty() && passes.abandoned() == 1,
+          "yielding no command gave something up");
+}
 
 // A prompt with images runs prefill groups as a text prompt does: an image
 // anywhere in a conversation leaves its long prompts' commands groups.
@@ -1177,6 +1262,11 @@ void testSpillPromptsTriedTogetherPrefillApart() {
 std::span<const test::TestCase> commandsTests() {
   static constexpr test::TestCase kTests[] = {
       {"testImagePromptsRunPrefillGroups", testImagePromptsRunPrefillGroups},
+      {"testAPassCommandReleasesAnEndedLaneOnlyWhenGivenUp", testAPassCommandReleasesAnEndedLaneOnlyWhenGivenUp},
+      {"testAPassCommandWhoseLanesAllEndedIsGivenUp", testAPassCommandWhoseLanesAllEndedIsGivenUp},
+      {"testALaneEndingWithAPassInFlightWaitsForThePass", testALaneEndingWithAPassInFlightWaitsForThePass},
+      {"testTheLastPassReleasesNoLane", testTheLastPassReleasesNoLane},
+      {"testYieldingNoPassCommandDoesNothing", testYieldingNoPassCommandDoesNothing},
       {"testTicketAdvancesOnTheEngineWakes", testTicketAdvancesOnTheEngineWakes},
       {"testPrefillPassesInterleaveDecodeAndEndAtACancel", testPrefillPassesInterleaveDecodeAndEndAtACancel},
       {"testShortPromptsShareACommandInPasses", testShortPromptsShareACommandInPasses},

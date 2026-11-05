@@ -342,7 +342,7 @@ void Engine::waitForDiskQuota(Request &active, double now) {
 }
 
 bool Engine::convertToSpill(Request &active) {
-  if (!config_.spill.capable || active.kvMode != KvMode::Resident || betweenPasses(active.request.id))
+  if (!config_.spill.capable || active.kvMode != KvMode::Resident || passCommand_.holds(active.request.id))
     return false;
   if (!cache_.convertToSpill(active.request.id, spillPages(active, chainEnd(active))))
     return false;
@@ -575,7 +575,7 @@ ReclaimClass Engine::growthClass(const Request &active) const {
 
 uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
                                  std::vector<StateCapture> &states,
-                                 std::vector<Capture> &captures, bool supersedes) {
+                                 std::vector<LaneCapture> &captures, bool supersedes) {
   const uint32_t start = item.promptOffset;
   // A request waiting for a prefix starts once the command that reaches its
   // state has ended.
@@ -829,7 +829,7 @@ std::vector<Victim> Engine::EngineVictims::conversions(const VictimQuery &query)
   const Request &active = found->second;
   if (!active.lane || active.restore || active.finalized || active.pendingEnd ||
       active.kvMode != KvMode::Resident || engine.scheduler_.phase(id) != Phase::Decode ||
-      engine.betweenPasses(id))
+      engine.passCommand_.holds(id))
     return units;
   const SpillGeometry &geometry = engine.config_.spill.geometry;
   if (!geometry.slotBytes ||
@@ -864,13 +864,9 @@ std::optional<Victim> Engine::EngineVictims::peek(const VictimQuery &query, cons
   // none in flight: the buffers its captures hold, counted as bytes for a
   // need of bytes. It costs that work nothing, so it comes before the
   // conversions, which cost their lanes the spilled reads.
-  if (after->kind == VictimKind::Memory && engine.passCommand_ && !engine.pending_ && query.rights.passCommand) {
-    uint32_t buffers = 0;
-    for (const ModelBatchItem &item : engine.passCommand_->items)
-      buffers += static_cast<uint32_t>(std::ranges::count_if(
-          item.stateCaptures, [](const StateCapture &capture) { return capture.reservation != nullptr; }));
-    return Victim{.stateBuffers = buffers, .kind = VictimKind::PassCommand};
-  }
+  if (after->kind == VictimKind::Memory && engine.passCommand_.active() && !engine.pending_ &&
+      query.rights.passCommand)
+    return Victim{.stateBuffers = engine.passCommand_.captureBuffers(), .kind = VictimKind::PassCommand};
   const std::vector<Victim> units = conversions(query);
   auto next = units.begin();
   if (after->kind == VictimKind::Conversion) {
@@ -909,8 +905,9 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
               .pages = query.need.form == victim.form ? victim.pages : 0};
     return {};
   case VictimKind::PassCommand:
-    // The buffers its captures held.
-    engine.takePassCommand();
+    // The buffers its captures held. Settling here would change the ledger
+    // inside its own free() (settleEndedBetweenPasses).
+    static_cast<void>(engine.passCommand_.yield());
     return {.outcome = FreeOutcome::Met, .nowBytes = releaseIdle(), .stateBuffers = victim.stateBuffers};
   }
   return {};

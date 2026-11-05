@@ -4,6 +4,7 @@
 #include "engine/Cache.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/MemoryPlan.hpp"
+#include "engine/PassCommand.hpp"
 #include "engine/Scheduler.hpp"
 #include "engine/Types.hpp"
 #include "engine/WeightResidency.hpp"
@@ -367,7 +368,6 @@ private:
     void reset() noexcept;
   };
 
-  struct Capture;
   struct Request final {
     struct StateBoundary final {
       uint32_t tokens = 0;
@@ -450,7 +450,7 @@ private:
     struct KeptCaptures final {
       uint32_t start = 0, end = 0;
       std::vector<StateCapture> states;
-      std::vector<Capture> captures;
+      std::vector<LaneCapture> captures;
     };
     std::optional<KeptCaptures> keptCaptures;
     // The prompt from submit on, then the committed output; request.prompt
@@ -505,7 +505,7 @@ private:
     bool finalized = false;
     // The outcome that ends this lane once the command or restore it is in
     // drains, or the command between its passes that holds it has run its
-    // last or is given up (abandonPasses); the first one stands.
+    // last or is given up (PassCommand); the first one stands (deferEnd).
     std::optional<LaneEnd> pendingEnd;
     // When the engine asked the server for this lane's token mask, until the
     // model takes one.
@@ -527,19 +527,6 @@ private:
     std::optional<Restore> restore;
   };
 
-  // A state boundary a prefill command captures
-  // (ModelBatchItem::stateCaptures), or the one it ends at whose state apply
-  // takes from the lane after it (fromLane).
-  struct Capture final {
-    uint32_t tokens = 0;
-    // Room for the state's buffers came from reclaiming cached memory; its
-    // publication counts as recycled (recycledStatePublications).
-    bool recycled = false;
-    // Its buffers were refused before the command while the lane held a
-    // checkpoint (reserveCapture): the command ends at it without capturing
-    // it.
-    bool fromLane = false;
-  };
   // The buffers reserveCapture() took for a boundary's capture, null when
   // refused, whether reclaiming cached memory made room for them, and
   // whether a refused state is taken from the lane after the command.
@@ -552,21 +539,11 @@ private:
     BatchPlan plan;
     // Each plan item's captures, in the order of its stateCaptures, then the
     // one taken from the lane, if any.
-    std::vector<std::vector<Capture>> captures;
+    std::vector<std::vector<LaneCapture>> captures;
     std::unique_ptr<ModelBatchTicket> ticket;
     // Where the engine's time for this command starts: the previous
     // command's retirement when the engine stayed busy, else its plan.
     double startedMilliseconds = 0.0;
-  };
-  // A prefill command between its passes (BatchPlan::passes), the one owner
-  // of it: its progress as planning reads it (PlanInputs::passes), its plan
-  // at its next pass, which each pass's completion advances; its items, with
-  // the states they capture, and their captures, which every pass runs and
-  // the last one commits.
-  struct PassCommand final {
-    PassProgress progress;
-    std::vector<ModelBatchItem> items;
-    std::vector<std::vector<Capture>> captures;
   };
   enum class Prepared : uint8_t {
     // Some lanes were admitted and the plan runs with them.
@@ -673,10 +650,6 @@ private:
   // (Request::pendingEnd), and each candidate's, from the placement found for
   // it in the memory's current state (placeCandidates).
   [[nodiscard]] std::vector<LaneShape> laneShapes(std::span<const PrefillAdmission> candidates = {}) const;
-  // The command between its passes as planning reads it, or none.
-  [[nodiscard]] const PassProgress *passProgress() const noexcept {
-    return passCommand_ ? &passCommand_->progress : nullptr;
-  }
   // Whether a resident Spill request's prompt goes on: its next commands
   // take Full pages that spill as their copies land.
   [[nodiscard]] bool spillingPrompt() const;
@@ -771,7 +744,7 @@ private:
   // buffers, taken from the lane now that the command has completed or
   // through the disk tier.
   void publishReachedStateBoundaries(
-      Request &request, uint32_t promptProcessed, std::span<const Capture> captures,
+      Request &request, uint32_t promptProcessed, std::span<const LaneCapture> captures,
       std::span<const std::shared_ptr<const CompositeState>> states, double nowMilliseconds);
   // Takes what the plan's lanes need to run it as planned, and returns
   // Runnable with its items and captures; or, when that changed what the
@@ -781,7 +754,7 @@ private:
   // supersedes the command between its passes (Scheduler::abandonsPasses),
   // whose claims may take it (ClaimSpec::supersedes).
   [[nodiscard]] Prepared prepare(const BatchPlan &plan, std::vector<ModelBatchItem> &items,
-                                 std::vector<std::vector<Capture>> &captures, std::vector<uint64_t> &excluded,
+                                 std::vector<std::vector<LaneCapture>> &captures, std::vector<uint64_t> &excluded,
                                  bool supersedes, double nowMilliseconds);
   // Reserves the buffers of the states a prefill lane's command reaches,
   // boundary by boundary, and the KV up to the next one; returns the rows
@@ -796,7 +769,7 @@ private:
   // it cuts the command there, and the rows past it run in a second command.
   [[nodiscard]] uint32_t reserveCaptures(Request &request, const BatchItem &item,
                                          std::vector<StateCapture> &states,
-                                         std::vector<Capture> &captures, bool supersedes);
+                                         std::vector<LaneCapture> &captures, bool supersedes);
   // Takes the buffers of the state of class `kind` the lane's command
   // captures at `tokens`: from the model's pool or one admission, then what
   // the ledger frees for its claim, but only while the lane holds no
@@ -832,8 +805,7 @@ private:
   // then reads through, cover what the claim lacks. It frees its memory as
   // its copies land. The command between its passes gives back the
   // buffers of the states it would capture, which the model's pool releases
-  // at once; its lanes that ended end before the next plan is made
-  // (settleEndedBetweenPasses).
+  // at once; its lanes that ended are left to settleEndedBetweenPasses.
   class EngineVictims final : public VictimSource {
   public:
     explicit EngineVictims(Engine &engine) noexcept : engine_(engine) {}
@@ -851,16 +823,15 @@ private:
   // ranked above its claim (MemoryLedger::heldPages); none before its claim
   // opens.
   [[nodiscard]] std::array<uint32_t, 3> heldPages(const Request &request) const;
-  // Gives up the command between its passes, none of whose passes is in
-  // flight: the states it would capture go back to the model's pool. Its
-  // lanes that ended stay to be settled.
-  void takePassCommand();
   // Settles every lane that ended (Request::pendingEnd) that no command in
-  // flight, restore or command between its passes holds any more. It runs
-  // before every plan, so a take that may not settle (a claim's, inside the
-  // ledger) leaves them here and no lane's end depends on who took the
-  // command.
+  // flight, restore or command between its passes holds any more: the lanes
+  // of a command something took without settling them. It runs before every
+  // plan, so a take that may not settle (a claim's, inside the ledger) leaves
+  // them here and no lane's end depends on who took the command.
   void settleEndedBetweenPasses();
+  // Settles those of `lanes`, a command between its passes gave up, that
+  // ended.
+  void settleEnded(std::span<const uint64_t> lanes);
   // The time to their first tokens of the requests that have not sent them:
   // holds(now) counts the time since the last tick
   // to what held each then; holderOf names what holds one as the engine is
@@ -934,11 +905,8 @@ private:
   // The resident lane in prefill or decode that yields first when every
   // lane's growth fails (the lowest rank), or nullptr without one. prepare()
   // gates that lane's growth and suspends that lane; preemptBelow() suspends
-  // it for a higher priority. A lane of the command between its passes
-  // beside one of it that ended gives that command up in its place, at every
-  // point a lane yields (yieldsEndedLanes). A start of a higher priority
-  // takes the command before that (EngineVictims); one of its priority or a
-  // lower one suspends no lane of it (preemptBelow).
+  // it for a higher priority. For a lane of the command between its passes,
+  // see yieldsEndedLanes, EngineVictims and preemptBelow.
   [[nodiscard]] const Request *laneToYield() const;
   [[nodiscard]] Request *laneToYield() {
     return const_cast<Request *>(std::as_const(*this).laneToYield());
@@ -1094,39 +1062,23 @@ private:
              double cycleMilliseconds, double nowMilliseconds);
   // Whether the command in flight holds the request's lane.
   [[nodiscard]] bool inFlight(uint64_t requestId) const;
-  // Whether the command between its passes holds the request's lane.
-  [[nodiscard]] bool betweenPasses(uint64_t requestId) const;
-  // Whether every lane of the command between its passes has ended
-  // (Request::pendingEnd): none is left for its passes to run for.
-  [[nodiscard]] bool passesEnded() const;
   // Where `lane`, the lane that would yield, is one of the command between
   // its passes beside a lane of it that ended, gives that command up in its
-  // place (abandonPasses), which ends the lanes that ended and gives back
-  // their lanes and memory and the command's captures, and returns true,
-  // for the caller to try again at its next attempt; a lane that ended is
-  // never suspended. Every point a lane yields asks it first.
+  // place, which ends the lanes that ended and gives back their lanes and
+  // memory and the command's captures, and returns true, for the caller to
+  // try again at its next attempt; a lane that ended is never suspended.
+  // Every point a lane yields asks it first.
   [[nodiscard]] bool yieldsEndedLanes(const Request &lane);
-  // Abandons the command between its passes, while none of its passes is in
-  // flight, though a command of other lanes may be: its lanes count its
-  // passes' time as waited (Scheduler::abandoned), the states it would
-  // capture go back to the model's pool, its lanes that ended meanwhile end
-  // now, and the others run its rows again in a later command, nothing of
-  // them committed. A command yields so, whole, to a plan that supersedes it
-  // (Scheduler::abandonsPasses): before one that holds a lane of it takes
-  // shape, and as any other runs, or sooner, where a claim for that work
-  // takes it (EngineVictims, takePassCommand), whose lanes that ended end
-  // before the next plan is made. So it does to the suspension of any of its
-  // lanes, in place of that suspension where a lane of it ended
-  // (yieldsEndedLanes), and once every lane of it has ended.
-  void abandonPasses();
+  // Records the outcome that ends the lane once the work that holds it
+  // drains (Request::pendingEnd); the first one stands.
+  static void deferEnd(Request &request, LaneEnd end);
   // Ends a request early. While its command or restore runs, the first end
   // waits there (the command's mask wait is abandoned, the restore's read
   // cancelled) and apply()/pollRestores() settle it once that work drains;
-  // so it does while the command between its passes holds it, until that
-  // command's last pass or until it is given up (abandonPasses), at once
-  // where every lane of it has ended. Otherwise the request ends now: Cancelled completes it, any other
-  // outcome fails it. A lane of either command ends at its deadline so
-  // (tick).
+  // so it does while the command between its passes holds it
+  // (PassCommand::laneEnded). Otherwise the request ends now:
+  // Cancelled completes it, any other outcome fails it. A lane of either
+  // command ends at its deadline so (tick).
   void settle(Request &request, LaneEnd end);
   [[nodiscard]] static LaneEnd deadlineEnd();
   [[nodiscard]] static LaneEnd capacityExhausted(std::string_view what,
@@ -1136,7 +1088,7 @@ private:
               std::span<const float> optionLogits);
   void finishFailure(Request &request, LaneEnd end);
   // Gives back what a lane holds: the command between its passes that
-  // holds it, abandoned (abandonPasses), its planned state boundaries, its
+  // holds it, given up, its planned state boundaries, its
   // state (keepContinuation keeps the model's host continuation of a
   // suspended request) and its KV leases. The caller signals progress
   // when the memory becomes available to waiting requests: a lane that
@@ -1186,7 +1138,7 @@ private:
   [[nodiscard]] bool belowRunnable(const Request &request) const;
   std::function<void()> completionNotifier_;
   std::optional<Pending> pending_;
-  std::optional<PassCommand> passCommand_;
+  PassCommand passCommand_{scheduler_, [this](uint64_t id) { return requests_.at(id).pendingEnd.has_value(); }};
   // When the latest command retired, until a tick finds nothing to do.
   std::optional<double> busySinceMilliseconds_;
   // The lanes admit() has obtained so far, including those it gave back when

@@ -167,7 +167,7 @@ public:
   }
   double step(double scale = 1.0) { return run(plan(), scale); }
   std::function<void(model::CommandSample &, const BatchPlan &)> sampled;
-  // Abandons the command between its passes, as Engine::abandonPasses does.
+  // Abandons the command between its passes, as PassCommand::yield does.
   void abandon() {
     scheduler.abandoned();
     passes.reset();

@@ -36,6 +36,7 @@ BACKEND_CONTROL_SOURCES := \
 	$(CACHE_SOURCES) \
 	runtime/engine/Engine.cpp \
 	runtime/engine/EngineMemory.cpp \
+	runtime/engine/PassCommand.cpp \
 	runtime/engine/WeightResidency.cpp
 NATIVE_RUNTIME_SOURCES := $(BACKEND_CONTROL_SOURCES) \
 	runtime/engine/Protocol.cpp \
