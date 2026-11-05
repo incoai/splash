@@ -147,7 +147,7 @@ class ArchitectureTests(unittest.TestCase):
                 for name, text, errors in (
                     (
                         "dialects/openai.py",
-                        "from ..api_shapes import stream_chunk\n",
+                        "from ..chat_messages import normalize_messages\n",
                         [],
                     ),
                     (
@@ -163,7 +163,10 @@ class ArchitectureTests(unittest.TestCase):
                     (
                         "dialects/openai.py",
                         "from server.dialects import anthropic\n",
-                        ["imports server.dialects without a relative import"],
+                        [
+                            "imports sibling dialect anthropic",
+                            "imports server.dialects without a relative import",
+                        ],
                     ),
                     # A subpackage's own name is its folder's, so a module
                     # may import the library a dialect is named after.
@@ -173,6 +176,37 @@ class ArchitectureTests(unittest.TestCase):
                         "output.py",
                         "from .dialects import openai\n",
                         ["imports upper serving layer dialects"],
+                    ),
+                    # Each API has one owner: no dialect imports another,
+                    # and the modules every dialect reaches import none.
+                    (
+                        "dialects/openai.py",
+                        "from .anthropic import ERRORS\n",
+                        ["imports sibling dialect anthropic"],
+                    ),
+                    (
+                        "dialects/openai.py",
+                        "from ..dialects import anthropic\n",
+                        ["imports sibling dialect anthropic"],
+                    ),
+                    (
+                        "dialects/openai.py",
+                        "from . import responses, scoring\n",
+                        [
+                            "imports sibling dialect responses",
+                            "imports sibling dialect scoring",
+                        ],
+                    ),
+                    ("dialects/__init__.py", "from . import anthropic, openai\n", []),
+                    (
+                        "frontend.py",
+                        "from .dialects import responses\n",
+                        ["imports upper serving layer dialects"],
+                    ),
+                    (
+                        "chat_messages.py",
+                        "from .frontend import Frontend\n",
+                        ["imports upper serving layer frontend"],
                     ),
                 ):
                     with self.subTest(name=name, text=text):
@@ -291,16 +325,23 @@ class ArchitectureTests(unittest.TestCase):
             # What a command makes resident: the memory its encoders use.
             allowed = root / "runtime/metal/MetalBackend.mm"
             allowed.parent.mkdir(parents=True)
-            allowed.write_text("[encoder useResources:resources count:count usage:usage];\n")
+            allowed.write_text(
+                "[encoder useResources:resources count:count usage:usage];\n"
+            )
             with mock.patch.object(check_architecture, "ROOT", root):
                 self.assertEqual(check_architecture.check(), [])
-                for text in ("[commands_ addResidencySet:addressed_];\n", "[command useResidencySet:set];\n"):
+                for text in (
+                    "[commands_ addResidencySet:addressed_];\n",
+                    "[command useResidencySet:set];\n",
+                ):
                     with self.subTest(text=text):
                         source = root / "runtime/metal/Residency.hpp"
                         source.write_text(text)
                         self.assertEqual(
                             check_architecture.check(),
-                            ["runtime/metal/Residency.hpp: attaches a residency set to a queue or command buffer"],
+                            [
+                                "runtime/metal/Residency.hpp: attaches a residency set to a queue or command buffer"
+                            ],
                         )
                         source.unlink()
 
@@ -316,7 +357,9 @@ class ArchitectureTests(unittest.TestCase):
                 source.write_text("entries.push_back(extent.gpuAddress());\n")
                 self.assertEqual(
                     check_architecture.check(),
-                    ["runtime/ops/BlockIndexer.cpp: writes a GPU address outside page storage"],
+                    [
+                        "runtime/ops/BlockIndexer.cpp: writes a GPU address outside page storage"
+                    ],
                 )
 
     def test_layers_depend_only_on_the_layers_below(self):

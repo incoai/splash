@@ -586,18 +586,48 @@ def imported_module(call: ast.Call) -> str | None:
     return None
 
 
+def absolute_module(name: str, package: str) -> str:
+    """The full name of a module that a module of package names, relatively
+    or not."""
+    level = len(name) - len(name.lstrip("."))
+    if not level:
+        return name
+    base = package.rsplit(".", level - 1)[0]
+    return f"{base}.{name[level:]}" if name[level:] else base
+
+
+def imported_modules(tree: ast.AST, package: str) -> set[str]:
+    """The full names of the modules a module of package imports. A name
+    imported from a module may be a submodule of it, so it counts as one."""
+    modules = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            base = absolute_module("." * node.level + (node.module or ""), package)
+            modules.add(base)
+            modules.update(f"{base}.{alias.name}" for alias in node.names)
+        elif isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.Call) and (module := imported_module(node)):
+            modules.add(absolute_module(module, package))
+    return modules
+
+
 def check_server_dependencies() -> list[str]:
     # Request bridges and model-output handling must not import HTTP, prompt
     # preparation or the dialects that render answers. The wire transport
     # stays independent of those adapters. The dialects (server/dialects)
-    # render a generation the handler collects, and reach the engine through
-    # nothing else.
-    upper = {"frontend", "api_shapes", "dialects"}
+    # read a request and render a generation the handler collects, and reach
+    # the engine through nothing else. Each API has one owner: a dialect
+    # imports no other dialect, and frontend and chat_messages, which every
+    # dialect reaches, import none.
+    upper = {"frontend", "chat_messages", "dialects"}
     forbidden = {
         "backend": upper,
         "constraints": {*upper, "backend", "output"},
         "output": {*upper, "backend", "constraints"},
         "runtime": {*upper, "backend", "constraints", "output"},
+        "frontend": {"dialects"},
+        "chat_messages": {"frontend", "dialects"},
         "dialects": {"frontend", "backend", "runtime"},
     }
     errors = []
@@ -607,22 +637,24 @@ def check_server_dependencies() -> list[str]:
         if layer == "server":
             continue
         blocked = {"server", *forbidden.get(layer, ())}
-        dependencies = set()
-        for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.ImportFrom):
-                if node.module is None or (node.module == "server" and not node.level):
-                    dependencies.update(alias.name for alias in node.names)
-                else:
-                    dependencies.add(node.module.removeprefix("server.").split(".")[0])
-            elif isinstance(node, ast.Import):
-                dependencies.update(
-                    alias.name.removeprefix("server.").split(".")[0]
-                    for alias in node.names
-                )
-            elif isinstance(node, ast.Call) and (module := imported_module(node)):
-                dependencies.add(
-                    module.lstrip(".").removeprefix("server.").split(".")[0]
-                )
+        package = ".".join(path.relative_to(ROOT).parent.parts)
+        modules = imported_modules(ast.parse(path.read_text()), package)
+        if layer == "dialects" and path.name != "__init__.py":
+            dialects = {
+                module.split(".")[2]
+                for module in modules
+                if module.startswith("server.dialects.")
+            }
+            errors.extend(
+                f"{relative(path)}: imports sibling dialect {name}"
+                for name in sorted(dialects)
+            )
+        # With server/ on the path a bare name imports a server module too.
+        dependencies = {
+            module.removeprefix("server.").split(".")[0]
+            for module in modules
+            if module != "server"
+        }
         for dependency in sorted(dependencies & blocked):
             errors.append(f"{relative(path)}: imports upper serving layer {dependency}")
     return errors
@@ -762,7 +794,9 @@ def check() -> list[str]:
         if SLEEP_COUNTING_CLOCK.search(text):
             errors.append(f"{name}: measures time on a clock that counts sleep")
         if ATTACHED_RESIDENCY_SET.search(text):
-            errors.append(f"{name}: attaches a residency set to a queue or command buffer")
+            errors.append(
+                f"{name}: attaches a residency set to a queue or command buffer"
+            )
         if (
             not name.startswith("runtime/metal/")
             and name not in GPU_ADDRESS_WRITERS
