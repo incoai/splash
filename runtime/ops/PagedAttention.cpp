@@ -62,6 +62,10 @@ constexpr std::array kCompiledAttention{
     CompiledAttention{32, 2, 256, false, true, false, 32, false, 0, "_kv2_g16", "_kv2_g8"},
     CompiledAttention{24, 2, 256, true, true, false, 32, false, 0, "_kv2_g12", "_kv2_vt"},
     CompiledAttention{32, 4, 128, false, false, true, 64, true, 512, "_kv4_g8_d128", "_kv4_d128"},
+    // Ripple's: 80 query heads over 8 KV heads of 128, gated, whose 64 of 80
+    // sliding layers read a window of the 1024 keys before a row and whose
+    // other 16 attend every key without RoPE.
+    CompiledAttention{80, 8, 128, false, true, false, 64, true, 1024, "_kv8_g10_d128_w1024", "_kv8_d128"},
 };
 
 // Whether a compiled geometry's pages are a layout's: its KV heads, head

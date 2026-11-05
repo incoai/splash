@@ -59,3 +59,23 @@ better than the shipped kernels, with the split-count knob free. The next step
 (step 2 of the plan) is the production integration: per-geometry
 instantiations in the production kernel sources, the draft-variant table on
 the host side, and the ring/context-window sizing for 4096.
+
+## Step 2 design note: the FFN clamp (for the target integration)
+
+Ripple's SwiGLU clamps its gate and up activations at 20 before the silu
+product. The FFN runs fused: prefill as three passes (gate, up-with-gate,
+down) whose epilogues the linear kernels own, and decode as one staged-pair
+kernel whose epilogue computes `bf16(up) * silu(bf16(gate))` directly from
+both accumulators. The clamp therefore lands as:
+
+- prefill: a small elementwise kernel clamping the gate scratch between the
+  gate pass and the up pass - no GEMM kernel changes;
+- decode: the staged-pair epilogue gains a clamped variant, the clamp value
+  read from a uniform, the shipped kernels' codegen untouched - the variant
+  selected by the projection's plan as the gate's is, and measured against
+  the unclamped one before it serves.
+
+The value residual's mix lands beside it: the v projection's input staging
+reads the mixed row (sigma(lambda) * normed x + (1 - sigma(lambda)) * scaled
+embeddings), which the mixer's capture of the block's input rows already
+holds.
