@@ -226,10 +226,11 @@ target the floors of a request whose KV is on the SSD
 target's routed experts load with their layers where that leaves KV its
 allowance, and otherwise stream through a store of all that the allowance and
 the PLE table's share leave ([streamed experts](#streamed-experts)); the PLE
-table loads where the rest holds it, and otherwise streams through a row cache
-of its share, at most the rows of every id a 128K-token prompt stages ([PLE
-table streaming](#ple-table-streaming)); KV and the states take what
-remains. The allowance is the KV of a context, in the fewest pages whose
+table too keeps the allowance first: it loads where the rest holds it beside
+the allowance, and otherwise streams through a row cache of what the allowance
+leaves, up to its share, at most the rows of every id a 128K-token prompt
+stages ([PLE table streaming](#ple-table-streaming)); KV and the states take
+what remains. The allowance is the KV of a context, in the fewest pages whose
 extents hold it as one request's KV capacity rounds them: a block-sparse
 target's first 64K tokens, kept in memory, or `--max-context` where that is
 less. A dense target's allowance is `--max-context`, so that its experts load

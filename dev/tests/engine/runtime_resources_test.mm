@@ -118,12 +118,13 @@ StreamedStart startStreamed(const RuntimeResourcesConfig &config, uint32_t reque
 }
 
 // The KV allowance an automatic start of `config` keeps beside the floors
-// before a streamable part loads whole or its store takes more than its
-// smallest: the first 64K tokens (the window where that is less) and their
-// speculative rows, in the fewest pages whose extents hold them as one
-// request's KV capacity rounds them (kvCapacityPagesFor), less the runway
-// among the floors. A part loads whole only where the budget holds its floors,
-// all of it and this allowance.
+// before a streamable part loads whole: the first 64K tokens (the window
+// where that is less) and their speculative rows, in the fewest pages whose
+// extents hold them as one request's KV capacity rounds them
+// (kvCapacityPagesFor), less the runway among the floors. A part loads whole
+// only where the budget holds its floors, all of it and this allowance. It is
+// not the allowance a store's growth above its smallest is priced with, which
+// in a windowed layout also keeps a streamed command's pages Full.
 uint64_t residentAllowanceBytes(const RuntimeResourcesConfig &config) {
   kv::Layout layout = config.model.targetKvLayout;
   layout.format = config.kvFormat;
@@ -345,7 +346,8 @@ void testVerifyRows(const char *metallibPath, RuntimeResourcesConfig moe) {
   const std::string_view budgeted = "Decode cycles verify the rows the verify budget chooses (--verify-rows auto, as "
                                     "moe-test is a MoE target): greedy and seeded outputs can differ from run to run.";
   requireStart(moe, budgeted, true, "a MoE target with resident experts did not budget its rows");
-  // A budget a byte short of the one that holds every expert streams them.
+  // A budget a byte short of the whole model's minimum, below the one that
+  // holds every expert and the KV allowance, streams them.
   moe.maximumMemoryBytes = startStreamed(moe).minimumRequired - 1;
   requireStart(moe, budgeted, true, "a MoE target whose experts stream did not budget its rows");
   moe.verifyRows = model::VerifyRows::All;

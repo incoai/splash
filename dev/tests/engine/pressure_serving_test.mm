@@ -8,11 +8,12 @@
 //
 // The target is the synthetic Qwen3.6-35B-A3B geometry (SyntheticModels.hpp
 // moeConfig, 128 routed experts a layer; HiSparse off): its automatic store
-// streams in several chunks under a budget a byte short of every expert (a
-// store --expert-memory sizes neither grows nor shrinks). The synthetic
-// Flash-Next (flashNextConfig) does not start here: its hidden state of 256
-// values has no hyper-connection norm kernel (HyperConnection.cpp, 2560
-// only), which a start's warm-up runs.
+// streams in several chunks under a budget a byte short of the whole model's
+// minimum, below the one that holds every expert, which adds the KV of the
+// first 64K tokens (a store --expert-memory sizes neither grows nor shrinks).
+// The synthetic Flash-Next (flashNextConfig) does not start here: its hidden
+// state of 256 values has no hyper-connection norm kernel
+// (HyperConnection.cpp, 2560 only), which a start's warm-up runs.
 
 #include "ProtocolPeer.hpp"
 #include "SyntheticModels.hpp"

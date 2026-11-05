@@ -1329,6 +1329,17 @@ takes no pool's units, rebuilt or above a floor. A `Floor` claim, the start's
 or a weights restore's, takes nothing: it is a class of the host's rule only
 (`MemoryGovernor::HostRule::admits`).
 
+**Whole or streamed** (`planParts` in
+`runtime/engine/StreamedMemoryPlan.cpp`). Under auto, a streamable part, the
+routed experts and then the PLE table, loads whole only where the budget
+leaves the floors, all of it and the KV allowance, and otherwise streams
+through what they leave; the experts leave the table's share too. The
+allowance is the KV of the first 64K tokens, or of the model's window where
+that is less, with their speculative rows, in the whole extents one request's
+capacity takes; `--max-context` replaces it where set, a spill-capable
+target's up to 64K. A larger budget therefore never serves a shorter context
+([memory and context](server.md#memory-and-context)).
+
 **Store floor and regrowth** (`planParts` in
 `runtime/engine/StreamedMemoryPlan.cpp`, `MemoryLedger::grow`). The expert
 store's floor is the whole store where the run can spill (a block-sparse
