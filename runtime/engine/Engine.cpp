@@ -951,7 +951,7 @@ bool Engine::admit(Request &active, double now) {
     modelRequest.restoredTokens = lookup.resumeBoundary();
     return resuming ? model_.resume(modelRequest) : model_.begin(modelRequest);
   };
-  auto state = allocate(begin, spec);
+  auto state = allocate(begin, spec, Refusal::Waits);
   // The request's own lease goes only when nothing else can free memory
   // (judge() says Fail: no other lane is resident, nothing is pending, the
   // host is not refusing). It then starts without the pin rather than wait
@@ -962,7 +962,7 @@ bool Engine::admit(Request &active, double now) {
       judge(state.denial, active.request.id) == Verdict::Fail) {
     lookup = {};
     droppedLease = true;
-    state = allocate(begin, spec);
+    state = allocate(begin, spec, Refusal::Waits);
   }
   if (!state.admission.granted()) {
     // Without a free lane the request waits for one; only memory it could
@@ -1008,7 +1008,8 @@ bool Engine::admit(Request &active, double now) {
   // a resident request its pages wait for the host.
   Allocation<TokenAdmission> kv;
   if (lookup.state)
-    kv = allocate([&] { return cache_.restoreRequest(requestId, lookup, heldPages(active)); }, spec);
+    kv = allocate([&] { return cache_.restoreRequest(requestId, lookup, heldPages(active)); }, spec,
+                  Refusal::Waits);
   const bool restoring =
       lookup.state && (!lookup.state->state()->residentBytes() ||
                        cache_.kvRestoreStatus(requestId) == KvRestoreStatus::Pending);
@@ -1024,7 +1025,7 @@ bool Engine::admit(Request &active, double now) {
                                                            : uint64_t{resumeBoundary} + 1;
     };
     kv = allocate([&] { return cache_.ensureTokens(requestId, workEnd(), resumeBoundary, heldPages(active)); },
-                  spec);
+                  spec, Refusal::Waits);
   }
   if (!kv.admission.granted()) {
     // The host continuation survives this failed admission. No recurrent
@@ -1191,7 +1192,7 @@ std::shared_ptr<const CompositeState> Engine::promotedCopy(Request &active, Stat
         state = restore.snapshot();
         return StateBuffers{.ok = state != nullptr};
       },
-      spec));
+      spec, Refusal::Settled));
   return state;
 }
 
@@ -1416,7 +1417,8 @@ void Engine::publishReachedStateBoundaries(
                                   checkpoint ? StateClass::Checkpoint
                                   : replay   ? StateClass::InUse
                                              : StateClass::Ordinary,
-                                  false))
+                                  false),
+                       Refusal::Settled)
                        .freed &&
                    state;
       }

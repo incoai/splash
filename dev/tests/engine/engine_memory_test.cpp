@@ -4422,6 +4422,40 @@ void testRecoveryDrainEndsWhenAResidentReleasesMemory() {
   }
 }
 
+// A state whose buffers are refused leaves no work waiting: once the host pause lifts, the drain ends and the
+// suspended request resumes, though a resident's replay point was refused during the drain.
+void testRefusedStateDoesNotHoldTheDrain() {
+  SuspendedBesideAMaskWait fixture(true);
+  engine::Engine &engine = fixture.engine;
+  Executor &executor = fixture.executor;
+  // While the pause holds, a resident of a higher priority than the
+  // suspended one starts, is refused the buffers of its replay point, at 64,
+  // with nothing to free for them, and waits for its mask.
+  fixture.storage.growthBlocked = false;
+  executor.deniedReservations = 100;
+  const uint32_t granted = executor.reservations;
+  auto refused = request(3, std::vector<uint32_t>(65, 3));
+  refused.priority = RequestPriority::Foreground;
+  refused.constraint = ConstraintMode::TokenMask;
+  refused.maxNewTokens = 2;
+  refused.deadlineMilliseconds = 100'000;
+  engine.submit(std::move(refused));
+  double now = 8;
+  tickUntil(engine, now, [&] { return fixture.events.maskRequests.size() == 2; },
+            "the higher priority did not reach its mask wait");
+  require(executor.reservations == granted && engine.snapshot().replayStatePublicationFailures == 1 &&
+              executor.requests.at(3).resident && engine.resourceWaitSnapshot(now).draining &&
+              executor.resumeAttempts == 0,
+          "the replay point was not refused during the drain");
+  executor.deniedReservations = 0;
+  fixture.host.pause(false);
+  tickUntil(engine, now, [&] { return executor.resumptions == 1; }, "the suspended request did not resume");
+  require(now < 120, "a refused state held the drain after the host pause lifted");
+  for (uint64_t id : {1, 2, 3})
+    engine.cancel(id);
+  tickUntil(engine, now, [&] { return idle(engine); }, "engine did not reach idle");
+}
+
 // A request of a higher priority than every suspended one starts at once, held by neither the drain nor the
 // suspended lanes.
 void testHigherPriorityArrivalIsNotHeldByRecovery() {
@@ -6434,6 +6468,7 @@ std::span<const test::TestCase> memoryTests() {
       {"testRecoveryDrainDoesNotConsumeResourceWaitBudget", testRecoveryDrainDoesNotConsumeResourceWaitBudget},
       {"testRecoveryDrainEndsWithItsCause", testRecoveryDrainEndsWithItsCause},
       {"testRecoveryDrainEndsWhenAResidentReleasesMemory", testRecoveryDrainEndsWhenAResidentReleasesMemory},
+      {"testRefusedStateDoesNotHoldTheDrain", testRefusedStateDoesNotHoldTheDrain},
       {"testHigherPriorityArrivalIsNotHeldByRecovery", testHigherPriorityArrivalIsNotHeldByRecovery},
       {"testForegroundArrivalPreemptsWhenLanesAreFull", testForegroundArrivalPreemptsWhenLanesAreFull},
       {"testPrefixWaiterTakesNoLaneUntilThePrefixLands", testPrefixWaiterTakesNoLaneUntilThePrefixLands},

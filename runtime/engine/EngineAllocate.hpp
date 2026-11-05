@@ -74,7 +74,7 @@ inline std::string pageShortfall(const TokenAdmission &admission) {
 }
 
 template <class Attempt>
-auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, bool frees)
+auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, Refusal refusal)
     -> Allocation<std::invoke_result_t<Attempt &>> {
   using Admission = std::invoke_result_t<Attempt &>;
   MemoryGovernor &governor = this->governor();
@@ -108,7 +108,7 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, bool frees)
   // then waits if the ledger's latest decision was to wait.
   std::vector<Need> met;
   const auto metBefore = [&](const Need &need) { return std::ranges::find(met, need) != met.end(); };
-  while (frees && memoryDenied(admission)) {
+  while (refusal != Refusal::SettledOnce && memoryDenied(admission)) {
     std::optional<Need> part;
     if constexpr (std::is_same_v<Admission, StateAdmission>) {
       const std::optional<uint32_t> states = model_.statesToActivate();
@@ -156,9 +156,8 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, bool frees)
       denial.form = admission.form;
     }
     // Memory on its way back ends the shortage without the residents, and a
-    // refused optional allocation only shortens a command or leaves memory
-    // for later.
-    if (memoryDenied(admission) && !denial.pending && spec.cls != ClaimClass::Optional)
+    // refusal its caller settles leaves no work waiting.
+    if (memoryDenied(admission) && !denial.pending && refusal == Refusal::Waits)
       allocationFailed_ = true;
   }
   // A grant leaves a request's wait as it was: it ends once the request is

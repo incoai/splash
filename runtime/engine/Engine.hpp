@@ -891,6 +891,15 @@ private:
     // The ledger took memory for it (FreeOutcome::Met) before an attempt.
     bool freed = false;
   };
+  // What a refused allocation leaves (allocate). Waits: the work it is for
+  // waits for the memory (a lane's start, its KV, its reads), so a refusal
+  // no memory on its way back ends is a failure the recovery drain waits
+  // out (allocationFailed_). Settled: the caller goes on without it, which
+  // records none: a command ends sooner, a state goes without RAM buffers,
+  // landed Spill pages stay Full or the Index runway short. SettledOnce: as
+  // Settled, in one attempt the ledger frees nothing for, the caller taking
+  // buffers it holds instead (its lane's, a checkpoint's).
+  enum class Refusal : uint8_t { Waits, Settled, SettledOnce };
   // Converts a Resident lane to Spill on a target whose KV can live on the
   // SSD cache (Cache::convertToSpill), committing its projection's pages
   // without a copy, the chain it holds or, at admission, the one it restores
@@ -944,12 +953,9 @@ private:
   // on its way back for leaves the denial pending, and the claim waiting:
   // the request waits. A request's allocations are its one claim's
   // (Request::claim), the engine's own (requestId 0) a claim of this
-  // allocation alone. A refused optional allocation, which only shortens a
-  // command or leaves memory for later, records no failure
-  // (allocationFailed_). Without `frees`, one attempt, whose refusal the
-  // caller settles another way.
+  // allocation alone. `refusal` says what a refusal leaves (Refusal).
   template <class Attempt>
-  [[nodiscard]] auto allocate(Attempt &&attempt, const ClaimSpec &spec, bool frees = true)
+  [[nodiscard]] auto allocate(Attempt &&attempt, const ClaimSpec &spec, Refusal refusal)
       -> Allocation<std::invoke_result_t<Attempt &>>;
   // A lane of a command refused memory as prepare() shapes it, and the KV
   // its command takes (workEndOf).
@@ -1174,9 +1180,10 @@ private:
   // The resource wait limit after the latest suspension; zero once passed
   // or when no request is suspended.
   double drainEndMilliseconds_ = 0.0;
-  // An allocation failed since the latest suspension or since a resident
-  // lane last released its memory, or the suspension itself met a limit
-  // that only freed memory lifts, unlike a host pause.
+  // An allocation work waits on (Refusal::Waits) failed since the latest
+  // suspension or since a resident lane last released its memory, or the
+  // suspension itself met a limit that only freed memory lifts, unlike a
+  // host pause.
   bool allocationFailed_ = false;
   // Counts what changes the memory a placement reads: what the ledger takes
   // for an allocation, a lane that starts (its projected growth) or ends,

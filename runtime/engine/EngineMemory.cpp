@@ -404,7 +404,8 @@ void Engine::spillLanded(bool controlPass) {
                              {.cls = needed ? ClaimClass::InService : ClaimClass::Optional,
                               .rank = needed ? rankOf(*needed) : ClaimRank{},
                               .timing = NeedTiming::Immediate,
-                              .priority = needed ? needed->request.priority : RequestPriority::Foreground}));
+                              .priority = needed ? needed->request.priority : RequestPriority::Foreground},
+                             Refusal::Settled));
 }
 
 void Engine::endAtLength(Request &active) {
@@ -501,7 +502,9 @@ std::optional<Engine::Denied> Engine::growLane(Request &active, uint64_t workEnd
   ClaimSpec spec = claimFor(active, ClaimClass::InService);
   spec.supersedes = plan.supersedes;
   spec.kvGrowth = true;
-  const auto kv = allocate([&] { return cache_.ensureTokens(id, workEnd, std::numeric_limits<uint64_t>::max(), heldPages(active)); }, spec);
+  const auto kv = allocate(
+      [&] { return cache_.ensureTokens(id, workEnd, std::numeric_limits<uint64_t>::max(), heldPages(active)); }, spec,
+      Refusal::Waits);
   if (kv.admission.granted())
     return std::nullopt;
   return Denied{id, workEnd, kv.denial, kv.admission, {}};
@@ -516,7 +519,7 @@ std::optional<Engine::Denied> Engine::reserveReads(Request &active, const BatchI
   const model::SpilledReadNeed need{plan.prefill ? WorkKind::Prefill : WorkKind::Decode, pages};
   ClaimSpec spec = claimFor(active, ClaimClass::InService);
   spec.supersedes = plan.supersedes;
-  const auto memory = allocate([&] { return model_.reserveSpilledReads(id, need); }, spec);
+  const auto memory = allocate([&] { return model_.reserveSpilledReads(id, need); }, spec, Refusal::Waits);
   if (memory.admission.granted())
     return std::nullopt;
   return Denied{id, workEndOf(active, scheduled, plan.prefill), memory.denial, std::nullopt,
@@ -621,7 +624,7 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
             buffers = model_.reserveState(active.request.id, tokens, refusal);
             return StateBuffers{.ok = buffers != nullptr, .allocationFailure = refusal};
           },
-          stateClaim(active, kind, supersedes), false));
+          stateClaim(active, kind, supersedes), Refusal::SettledOnce));
       if (buffers) {
         states.push_back({tokens, std::move(buffers)});
         captures.push_back({tokens});
@@ -675,7 +678,8 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
          .timing = NeedTiming::Immediate,
          .supersedes = supersedes,
          .priority = active.request.priority,
-         .laneNeeds = true});
+         .laneNeeds = true},
+        Refusal::Settled);
     if (!kv.admission.granted()) {
       if (passed)
         static_cast<void>(reserve(index));
@@ -728,7 +732,7 @@ Engine::Reservation Engine::reserveCapture(Request &active, StateClass kind, uin
     return StateBuffers{.ok = result.buffers != nullptr, .allocationFailure = refusal};
   };
   const ClaimSpec spec = stateClaim(active, kind, supersedes);
-  const auto taken = allocate(attempt, spec, !fromLane);
+  const auto taken = allocate(attempt, spec, fromLane ? Refusal::SettledOnce : Refusal::Settled);
   result.fromLane = !result.buffers && fromLane;
   result.recycled = result.buffers && taken.freed;
   return result;
