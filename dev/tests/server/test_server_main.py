@@ -13,15 +13,18 @@ from types import SimpleNamespace
 from unittest import mock
 
 from dev.tests.installer_fixtures import DENSE, MODEL, family_config
-from dev.tests.server_fixtures import engine_ready, main_args, unprepared_hold
+from dev.tests.server_fixtures import (
+    NO_THINKING_END,
+    engine_ready,
+    main_args,
+    unprepared_hold,
+)
 from install import families
 from server import diagnostics
 from server import protocol as native_wire
 from server import server as api
 from server.origins import ANY_ORIGIN
 
-# Templates whose probe found no close of thinking: the close alone ends it.
-NO_THINKING_END = {"return_value.select.return_value.thinking_end": None}
 # The goldens the app reads the server's records by.
 GOLDEN = Path(__file__).parent
 

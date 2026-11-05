@@ -850,6 +850,10 @@ class PassThroughConstraintFactory:
         return {}
 
 
+# Templates whose probe found no close of thinking: the close alone ends it.
+NO_THINKING_END = {"return_value.select.return_value.thinking_end": None}
+
+
 def main_args(**overrides):
     """Parsed command-line arguments for main() tests."""
     return SimpleNamespace(

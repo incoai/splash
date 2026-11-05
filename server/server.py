@@ -1179,7 +1179,8 @@ def _interrupt(_signum, _frame):
 
 
 def _stop_with(pid):
-    """Interrupts the server, as Ctrl+C does, once process `pid` has ended.
+    """Stops the server with SIGTERM once process `pid` has ended: one stop,
+    which a server already stopping ignores.
 
     The desktop app passes its own process ID as SPLASH_APP_PID, so a model
     it started gives its memory back when the app crashes, rather than at
@@ -1196,7 +1197,7 @@ def _stop_with(pid):
             fflags=select.KQ_NOTE_EXIT,
         )
         queue.control([exited], 1, None)
-        os.kill(os.getpid(), signal.SIGINT)
+        os.kill(os.getpid(), signal.SIGTERM)
 
     threading.Thread(target=watch, name="stop-with-app", daemon=True).start()
 
