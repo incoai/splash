@@ -232,11 +232,11 @@ table streaming](#ple-table-streaming)); KV and the states take what
 remains. The allowance is the KV of a context, in the fewest pages whose
 extents hold it as one request's KV capacity rounds them: a block-sparse
 target's first 64K tokens, kept in memory, or `--max-context` where that is
-less. A dense target keeps
-the plan it has without streaming: its allowance is `--max-context`, so that
-its experts load whole wherever that context fits beside them and stream to
-hold it where it does not, or else none, so its experts load wherever they
-fit; only once they stream does it keep the first 64K tokens too. Nothing in
+less. A dense target's allowance is `--max-context`, so that its experts load
+whole wherever that context fits beside them and stream to hold it where it
+does not, or else the first 64K tokens too: its experts load whole only where
+they leave that much context, so a larger budget never serves a shorter one.
+Nothing in
 the plan rests on the host's memory at the start: an automatic expert store's
 cap is all that the budget gives it, and it starts at its floor, the chunks
 above it released; the memory ledger grows it into the room the host leaves

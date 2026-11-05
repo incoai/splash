@@ -98,10 +98,10 @@ struct StreamedMemoryResult final {
 // most. The allowance is the KV of a context in the fewest pages whose whole
 // extents hold it, as one request's capacity rounds them (kvCapacityPagesFor):
 // a spill-capable target's first 64K tokens, or --max-context where that is
-// less; a dense target's --max-context, or none, so that its experts load
-// whole wherever the rest holds them, and the first 64K tokens once they
-// stream. Nothing rests on the host: the stores, the
-// floors, what loads whole and the context follow the engine's limit alone.
+// less; a dense target's --max-context, or else its first 64K tokens too, so
+// that its context never shrinks as the budget grows. Nothing rests on the
+// host: the stores, the floors, what loads whole and the context follow the
+// engine's limit alone.
 // The arenas are those of the parts that stream: where the plan with the
 // arenas of fewer parts streams more, it plans again with those. An
 // explicit size below all of a part replaces it: the part streams through a

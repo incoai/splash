@@ -686,6 +686,33 @@ void testDenseExplicitContextStreamsExperts() {
           "streaming experts did not keep exactly the first 64K tokens resident");
 }
 
+// The 35B's context never shrinks as the budget grows: its experts load
+// whole only where that leaves the first 64K tokens, and otherwise stream
+// and keep them. Budgets from 12 GiB to the M6's with UD-Q2_K_XL, and from
+// 20 GiB to the Studio's with UD-Q4_K_M, in steps of 16 MiB, cross from
+// streamed experts to whole ones.
+void testDense35BContextGrowsWithTheBudget() {
+  const std::tuple<Mac, Target, uint64_t> sweeps[] = {{kM6, k35BQ2, 12 * kGiB}, {kStudio, k35BQ4, 20 * kGiB}};
+  for (const auto &[mac, target, lowest] : sweeps) {
+    uint32_t previous = 0;
+    bool streams = false, whole = false;
+    for (uint64_t budget = lowest; budget <= hardBudget(mac); budget += 16 * kMiB) {
+      StreamedMemoryInputs inputs = target.inputs(mac);
+      inputs.hardBudgetBytes = budget;
+      const StreamedMemoryPlan plan = requirePlan(inputs);
+      const uint32_t context =
+          test::requireMemoryPlan(deviceOf(mac), target.profile(plan.expertBytes), budget).maximumContextTokens();
+      require(context >= 65'536 && context >= previous,
+              std::string("the 35B's context on the ") + mac.name + " fell to " + std::to_string(context) +
+                  " tokens at a budget of " + std::to_string(budget / kMiB) + " MiB");
+      previous = context;
+      (plan.expertBytes ? streams : whole) = true;
+    }
+    require(streams && whole,
+            std::string("the budgets on the ") + mac.name + " did not span both plans of the 35B's experts");
+  }
+}
+
 // The arenas are those of the parts that stream: each plan is the one made
 // with the arenas of what it streams, the routed experts' prefill groups and
 // the table's staging. Flash-Next with its experts loaded through a store of
@@ -1130,6 +1157,7 @@ int main() {
     testDense35BKeepsMainsPlan();
     testDenseExplicitContextKeepsMainsExperts();
     testDenseExplicitContextStreamsExperts();
+    testDense35BContextGrowsWithTheBudget();
     testArenasFollowWhatStreams();
     testOverridesAndRefusals();
     testSpillNeedsATierAndRoom();

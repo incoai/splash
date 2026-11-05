@@ -11,9 +11,9 @@
 namespace splash::engine {
 namespace {
 
-// The context a spill-capable target keeps resident before the streamed
-// stores take the rest of the budget, and a dense target too once its
-// experts stream: requests up to it never spill while they decode alone.
+// The context every target keeps resident: the streamed stores take the rest
+// of the budget, and load whole only where they leave it. Requests up to it
+// never spill while they decode alone.
 constexpr uint64_t kResidentAllowanceTokens = 65'536;
 // A Spill request's tail window: the pages before its open page that it
 // keeps Full. A decode selects about a tenth of its blocks in its last 64
@@ -214,15 +214,13 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
   // in the fewest pages whose whole extents hold its pages, of which the
   // floors hold the runway.
   int64_t rest = static_cast<int64_t>(in.hardBudgetBytes - floors);
-  // A spill-capable target keeps 64K tokens resident, or the requested
-  // context where that is less: more is KV no request can use.
+  // Every target keeps 64K tokens, or the requested context: a target that
+  // cannot spill holds all of it, and a spill-capable one no more than 64K,
+  // as more is KV no request can use.
   const auto allowance = [&](bool streaming) -> int64_t {
     const uint64_t cap = std::min<uint64_t>(in.windowTokens, kResidentAllowanceTokens);
     const uint64_t requested = in.requestedContextTokens;
-    uint64_t tokens = spill.enabled || streaming ? cap : 0;
-    if (requested)
-      tokens = spill.enabled ? std::min(cap, requested) : requested;
-    if (!tokens) return 0;
+    const uint64_t tokens = !requested ? cap : spill.enabled ? std::min(cap, requested) : requested;
     const uint64_t pages = pagesOf(kvTokens(tokens));
     uint64_t budget = pages;
     while (kvCapacityPagesFor(layout, budget) < pages) ++budget;
