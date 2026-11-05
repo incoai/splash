@@ -687,12 +687,12 @@ struct RippleGguf final {
     b.floatNorm(p + "attn_q_norm.weight", g.attentionHeadDimension);
     b.floatNorm(p + "attn_k_norm.weight", g.attentionHeadDimension);
     b.quantized(p + "attn_output.weight", g.hiddenSize, g.attentionWidth);
-    b.floatRows(p + "attn_vres_lambda.weight", 1, 1, false);
     b.floatNorm(p + "post_attention_norm.weight", g.hiddenSize);
+    b.floatRows(p + "attn_vres_lambda.weight", 1, 1, false);
     b.quantized(p + "ffn_gate.weight", g.intermediateSize, g.hiddenSize);
     b.quantized(p + "ffn_up.weight", g.intermediateSize, g.hiddenSize);
-    b.floatNorm(p + "ffn_norm.weight", g.hiddenSize);
     b.quantized(p + "ffn_down.weight", g.hiddenSize, g.intermediateSize);
+    b.floatNorm(p + "ffn_norm.weight", g.hiddenSize);
     b.floatNorm(p + "post_ffw_norm.weight", g.hiddenSize);
   }
 

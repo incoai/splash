@@ -108,8 +108,12 @@ struct GgufEmbedParams {
   uint32_t rows;
   uint32_t vocabulary;
   uint32_t hidden;
+  // What a gathered row is multiplied by as it is written: a family whose
+  // embeddings the square root of the hidden size scales (Ripple's) gathers
+  // them scaled, and every gather of its table does.
+  float scale;
 };
-static_assert(sizeof(GgufEmbedParams) == 12, "GGUF embedding parameters are 12 bytes on both sides");
+static_assert(sizeof(GgufEmbedParams) == 16, "GGUF embedding parameters are 16 bytes on both sides");
 // The formats whose native rows the embedding kernels gather, in bf16 as token
 // tables and in fp32 as the F32 values load-time widening writes
 // (kernels/shared/embedding.metal, gguf_embed_<kQuantFormats name> and

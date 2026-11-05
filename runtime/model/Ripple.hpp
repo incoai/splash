@@ -105,9 +105,12 @@ struct RippleLayerWeights final {
   ops::NormWeights inputNorm;
   QwenMixerWeights mixer;
   ops::NormWeights postAttentionNorm;
+  // The block's value-residual lambda, an F32 the mixer's v input mixes the
+  // scaled embeddings by (sigmoid(lambda) * normed x + the rest * scaled
+  // embeddings), as the kernels read it.
+  metal::MetalBuffer valueResidualLambda;
   RippleDenseFfnWeights ffn;
   ops::NormWeights postFfnNorm;
-  float valueResidualLambda = 0.0F;
 };
 
 using RippleWeights = QwenTargetWeights<RippleLayout, RippleLayerWeights>;

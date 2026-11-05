@@ -1,11 +1,26 @@
 #include "Ripple.hpp"
 
+#include "QwenTargetLoader.hpp"
+
 #include <stdexcept>
 
 namespace splash::model {
 
-RippleWeights loadRippleWeights(metal::MetalBackend &, RippleLayout layout, const QwenTargetFiles &) {
-  throw std::invalid_argument(std::string(layout.family) + "'s weight load is not in this build");
+RippleWeights loadRippleWeights(metal::MetalBackend &backend, RippleLayout layout,
+                                const QwenTargetFiles &files) {
+  // A block's FFN and what surrounds it, in its image's order: the
+  // value-residual lambda, the dense SwiGLU, and the norms after it.
+  const auto readFfn = [&](WeightFile &file, RippleLayerWeights &layer, const BlockTargetFormat &format, uint32_t) {
+    layer.valueResidualLambda = file.section(kFloat32Bytes, "value-residual-lambda");
+    layer.ffn.gate = format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-gate");
+    layer.ffn.up = format.projection(file, layout.intermediateSize, layout.hiddenSize, "mlp-up");
+    layer.ffn.down = format.projection(file, layout.hiddenSize, layout.intermediateSize, "mlp-down");
+    layer.postFfnNorm = format.norm(file, layout.hiddenSize, "post-ffn-norm");
+  };
+  return loadQwenTarget<RippleWeights>(
+      backend, layout, files, [&](auto &loader, const BlockTargetFormat &format, const MoeExperts &) {
+        return readQwenTargetWeights<RippleWeights>(layout, loader, format, readFfn);
+      });
 }
 
 std::unique_ptr<QwenTarget> makeQwenTarget(const RippleWeights &, const QwenTargetGeometry &,

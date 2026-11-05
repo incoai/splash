@@ -13,7 +13,7 @@ __attribute__((always_inline)) inline void gguf_embedding(device const uint *tok
   const uint row = index / p.hidden, dim = index % p.hidden;
   uint token = tokens[row]; token = token < p.vocabulary ? token : 0;
   device const uchar *block = table + (ulong(token) * (p.hidden / F::Weights) + dim / F::Weights) * F::Bytes;
-  output[index] = T(F::decode(block, dim));
+  output[index] = T(F::decode(block, dim) * p.scale);
 }
 
 #define GGUF_GATHER(Name, F, T) \
