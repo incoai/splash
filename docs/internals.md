@@ -993,7 +993,7 @@ offered. Each kind has a breaker of its own, which returns that kind to the
 GPU alone and leaves the rest split. Until a calibration is remembered the
 memory plan sets aside the most each kind may take, then the calibration's.
 On an M4 Pro with Qwen3.8-27B MLX 4-bit the first start calibrates in about
-60 s and takes 0.74 of the FFN and 0.75-0.80 of each projection kind.
+45 s and takes 0.74 of the FFN and 0.72-0.80 of each projection kind.
 `ane-ffn` checks every kind's split against the GPU alone, stacked inputs
 among them.
 
