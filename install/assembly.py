@@ -373,12 +373,14 @@ def is_held(assembly: Path) -> bool:
 def collect_garbage(models_root: Path):
     """Remove what no installation uses: assemblies that no selection links
     and no server holds, metadata entries the remaining assemblies do not
-    link, and staging an interrupted installation left. Call it under the
-    installation lock, where all of these are written."""
+    link, and staging an interrupted installation left. Each is a directory
+    (_directories): anything else there, such as the .DS_Store Finder
+    leaves, is not an installation's. Call it under the installation lock,
+    where all of these are written."""
     resolved, derived = models_root / ".resolved", models_root / ".metadata"
     linked = {link.resolve() for link in models.selection_links(models_root)}
     used = set()
-    for assembly in sorted(resolved.iterdir()) if resolved.is_dir() else ():
+    for assembly in _directories(resolved.glob("*")):
         if assembly not in linked and not is_held(assembly):
             shutil.rmtree(assembly)
             continue
@@ -391,8 +393,14 @@ def collect_garbage(models_root: Path):
             path = Path(entry.get("path", "")) if isinstance(entry, dict) else None
             if path and path.is_relative_to(derived):
                 used.add(path.relative_to(derived).parts[0])
-    for entry in sorted(derived.iterdir()) if derived.is_dir() else ():
+    for entry in _directories(derived.glob("*")):
         if entry.name not in used:
             shutil.rmtree(entry)
-    for stage in models_root.glob(f"*/{models.LINK_STAGING}*"):
+    for stage in _directories(models_root.glob(f"*/{models.LINK_STAGING}*")):
         shutil.rmtree(stage)
+
+
+def _directories(paths):
+    """The directories among paths, in name order: the entries and staging
+    installations write, which are never links."""
+    return sorted(p for p in paths if p.is_dir() and not p.is_symlink())

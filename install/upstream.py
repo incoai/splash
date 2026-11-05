@@ -743,8 +743,12 @@ def publish(models_root, link, record, files):
         ]
         published = assembly.build(models_root, record, files)
         models.link_selection(link, published)
+        # Published: what follows only frees space; its failures are warnings.
         hub.retire_other_pins(pins, replaced)
-        assembly.collect_garbage(models_root)
+        try:
+            assembly.collect_garbage(models_root)
+        except OSError as error:
+            models.warn(f"could not remove what no installation uses: {error}")
     return published
 
 

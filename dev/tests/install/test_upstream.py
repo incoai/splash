@@ -1133,6 +1133,50 @@ class UpstreamTest(unittest.TestCase):
         )
         assembly.verify(chosen.link)
 
+    def test_collection_removes_only_the_directories_installations_write(self):
+        # Finder leaves a .DS_Store in each folder it shows.
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        first = chosen.link.resolve()
+        others = [
+            chosen.models_root / ".resolved/.DS_Store",
+            chosen.models_root / ".metadata/.DS_Store",
+        ]
+        for path in others:
+            path.parent.mkdir(exist_ok=True)
+            path.write_bytes(b"\0\0\0\1Bud1")
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        _, warnings = self.prepare(chosen)
+        self.assertEqual(warnings, "")
+        self.assertEqual(
+            assembly.verify(chosen.link)["sources"]["target"]["revision"], "b" * 40
+        )
+        self.assertFalse(first.exists())
+        self.assertTrue(all(path.is_file() for path in others))
+
+    def test_what_collection_cannot_remove_leaves_the_update_published(self):
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        # An assembly nothing uses, with a folder this account cannot write.
+        locked = chosen.models_root / ".resolved" / ("0" * 64) / "locked"
+        locked.mkdir(parents=True)
+        (locked / "file").write_bytes(b"")
+        locked.chmod(0o555)
+        self.addCleanup(locked.chmod, 0o755)
+        fake.publish(MODEL, "b" * 40, lambda p: mlx_target(p, DENSE))
+        _, warnings = self.prepare(chosen)
+        self.assertRegex(
+            warnings,
+            "^Warning: could not remove what no installation uses: .*"
+            + re.escape(str(locked)),
+        )
+        self.assertNotIn("keeping the installed", warnings)
+        self.assertEqual(
+            assembly.verify(chosen.link)["sources"]["target"]["revision"], "b" * 40
+        )
+
     def test_unreachable_hub_starts_the_installed_assembly(self):
         fake = fake_hub(self, self.cache)
         chosen = selection(self.root)
