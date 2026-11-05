@@ -89,9 +89,12 @@ serve --help`; the API key reaches the server as `SPLASH_API_KEY`, from the
 Keychain, and nothing starts while the Keychain does not give it. The server
 stops as Ctrl+C stops it once the app has ended, by a crash too, since the app
 passes its process ID as `SPLASH_APP_PID`; the app's next launch stops one still
-running, by the process ID and start time it keeps. An older app kept the ID
-alone: that record is forgotten, and its server left running. It serves
-model files on this Mac the user adds with `splash serve --model local/NAME
+running, as it does a download, by the process ID and start time it keeps. An
+app before 1.6 kept the ID alone, and the server's port: the next launch stops
+that server if the ID still holds the port's lock, and that download if the ID
+still runs the download command above; it leaves any other process alone and
+forgets the record. It serves model files on this Mac
+the user adds with `splash serve --model local/NAME
 --model-dir PATH`, NAME being the file's or folder's name made a repository
 name, and at launch it runs `install/cached.py`. While a model runs, the Server
 shows its context limit, from `/v1/models`, and its `/status`: requests,

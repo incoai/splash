@@ -203,9 +203,15 @@ struct ChildRecord {
     }
 
     /// Stops the program kept, if it still runs, and forgets it once it has ended; one still
-    /// running stays kept, for the launch after. A record of the ID alone, as an older app kept
-    /// it, is forgotten, and its program left running.
-    func stopLeftover() async {
+    /// running stays kept, for the launch after. A record of the ID alone, as an app before 1.6
+    /// kept it, gives no start to tell its program from a later process given the ID: that
+    /// program is stopped only where `olderApps` shows the ID is still its own, and the record is
+    /// forgotten.
+    func stopLeftover(olderApps: (pid_t) -> Bool) async {
+        if let older = defaults.object(forKey: key) as? Int, let pid = pid_t(exactly: older) {
+            if olderApps(pid) { await stopProcessGroup(pid, with: stop, killAfter: killAfter) }
+            return forget()
+        }
         guard let kept = defaults.array(forKey: key) as? [Int], kept.count == 2,
               let pid = pid_t(exactly: kept[0])
         else { return forget() }
@@ -220,6 +226,26 @@ func processStart(_ pid: pid_t) -> Int? {
     let size = Int32(MemoryLayout<proc_bsdinfo>.size)
     guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
     return Int(info.pbi_start_tvsec) * 1_000_000 + Int(info.pbi_start_tvusec)
+}
+
+/// The arguments process `pid` started with, its program first, as the kernel keeps them; nil
+/// where no such process of this user runs.
+func processArguments(_ pid: pid_t) -> [String]? {
+    var name = [CTL_KERN, KERN_ARGMAX]
+    var largest: Int32 = 0
+    var size = MemoryLayout<Int32>.size
+    guard sysctl(&name, u_int(name.count), &largest, &size, nil, 0) == 0 else { return nil }
+    name = [CTL_KERN, KERN_PROCARGS2, pid]
+    var buffer = [UInt8](repeating: 0, count: Int(largest))
+    size = buffer.count
+    guard sysctl(&name, u_int(name.count), &buffer, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size
+    else { return nil }
+    // Their count, then the program's path and the 0s that pad it, then each argument and a 0.
+    let count = Int(buffer.withUnsafeBytes { $0.load(as: Int32.self) })
+    let arguments = buffer[MemoryLayout<Int32>.size..<size].split(separator: 0, omittingEmptySubsequences: false)
+        .dropFirst().drop(while: \.isEmpty).prefix(count)
+    guard arguments.count == count else { return nil }
+    return arguments.map { String(decoding: $0, as: UTF8.self) }
 }
 
 /// Stops the process group `pid` leads, as `ChildProcess.stop` does, when this app no longer

@@ -415,7 +415,7 @@ struct ChildRecordTests {
         let child = try ChildProcess(command: ["/bin/sleep", "60"], environment: [:], log: folder.appending(path: "child.log")) { _ in }
         #expect(child.started != nil)
         record.keep(child)
-        await record.stopLeftover()
+        await record.stopLeftover(olderApps: { _ in false })
         #expect(processStart(child.pid) == nil)
         #expect(defaults.object(forKey: record.key) == nil)
     }
@@ -430,13 +430,86 @@ struct ChildRecordTests {
         // Kept with another start: an earlier process that had the ID, or a record an older app
         // kept as the ID alone.
         defaults.set([Int(other.pid), try #require(other.started) - 1], forKey: record.key)
-        await record.stopLeftover()
+        await record.stopLeftover(olderApps: { _ in false })
         #expect(processStart(other.pid) != nil)
         #expect(defaults.object(forKey: record.key) == nil)
         defaults.set(Int(other.pid), forKey: record.key)
-        await record.stopLeftover()
+        await record.stopLeftover(olderApps: { _ in false })
         #expect(processStart(other.pid) != nil)
         #expect(defaults.object(forKey: record.key) == nil)
+    }
+
+    /// A server an app before 1.6 left running, which it kept as its ID alone beside its port, is
+    /// stopped where it still holds that port's lock under the ID; a process the ID names that
+    /// holds no such lock is left alone. Either way the record is forgotten.
+    @Test func aServerAnOlderAppLeftIsStoppedByItsPortLock() async throws {
+        let folder = Self.folder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let defaults = UserDefaults.kept(in: folder)
+        let runtime = Runtime(root: folder)
+        try FileManager.default.createDirectory(at: runtime.locks, withIntermediateDirectories: true)
+        let port = 8123
+        let lock = runtime.locks.appending(path: "serve-\(port).lock")
+        // The older server: the process that holds its port's lock and records its ID there.
+        let older = try ChildProcess(command: ["/usr/bin/lockf", "-k", lock.path, "/bin/sleep", "60"], environment: [:],
+                                     log: folder.appending(path: "older.log")) { _ in }
+        defer { older.stop(SIGKILL, killAfter: .zero) }
+        try await waitFor(FileManager.default.fileExists(atPath: lock.path), "the lock")
+        try Data("{\"pid\": \(older.pid)}".utf8).write(to: lock)
+        try await waitFor(runtime.serveLockHolder(port: port) == older.pid, "the lock's holder")
+        let other = try ChildProcess(command: ["/bin/sleep", "60"], environment: [:], log: folder.appending(path: "other.log")) { _ in }
+        defer { other.stop(SIGKILL, killAfter: .zero) }
+        let server = Server(runtime: runtime, log: URL(filePath: "/dev/null"), defaults: defaults)
+
+        defaults.set(Int(other.pid), forKey: Preference.serverPID)
+        defaults.set(port, forKey: Preference.olderServerPort)
+        await server.stopLeftover()
+        #expect(processStart(other.pid) != nil)
+        #expect(processStart(older.pid) != nil)
+        #expect(defaults.object(forKey: Preference.serverPID) == nil)
+
+        defaults.set(Int(older.pid), forKey: Preference.serverPID)
+        defaults.set(port, forKey: Preference.olderServerPort)
+        await server.stopLeftover()
+        #expect(processStart(older.pid) == nil)
+        #expect(processStart(other.pid) != nil)
+        #expect(defaults.object(forKey: Preference.serverPID) == nil)
+        #expect(defaults.object(forKey: Preference.olderServerPort) == nil)
+    }
+
+    /// A download an app before 1.6 left running, which it kept as its ID alone, is stopped where
+    /// the process the ID names still runs the installer as an app starts it; a process the ID
+    /// names that runs anything else is left alone. Either way the record is forgotten.
+    @Test func aDownloadAnOlderAppLeftIsStoppedByItsCommand() async throws {
+        let folder = Self.folder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let defaults = UserDefaults.kept(in: folder)
+        let runtime = Runtime(root: folder)
+        try FileManager.default.createDirectory(at: folder.appending(path: "install"), withIntermediateDirectories: true)
+        try "print('started')\nimport time\ntime.sleep(60)\n"
+            .write(to: folder.appending(path: "install/models.py"), atomically: true, encoding: .utf8)
+        // The older download: the runtime's installer as an app starts it, which here waits. The
+        // system's Python can start another program in its place, under the same ID and arguments.
+        let log = folder.appending(path: "older.log")
+        let older = try ChildProcess(command: ["/usr/bin/python3"] + runtime.installCommand("a/b").dropFirst(),
+                                     environment: ProcessInfo.processInfo.environment, log: log) { _ in }
+        defer { older.stop(SIGKILL, killAfter: .zero) }
+        try await waitFor((try? String(contentsOf: log, encoding: .utf8))?.hasSuffix("started\n") == true, "the installer")
+        let other = try ChildProcess(command: ["/bin/sleep", "60"], environment: [:], log: folder.appending(path: "other.log")) { _ in }
+        defer { other.stop(SIGKILL, killAfter: .zero) }
+        let installer = Installer(runtime: runtime, log: URL(filePath: "/dev/null"), defaults: defaults)
+
+        defaults.set(Int(other.pid), forKey: Preference.installerPID)
+        await installer.stopLeftover()
+        #expect(processStart(other.pid) != nil)
+        #expect(processStart(older.pid) != nil)
+        #expect(defaults.object(forKey: Preference.installerPID) == nil)
+
+        defaults.set(Int(older.pid), forKey: Preference.installerPID)
+        await installer.stopLeftover()
+        #expect(processStart(older.pid) == nil)
+        #expect(processStart(other.pid) != nil)
+        #expect(defaults.object(forKey: Preference.installerPID) == nil)
     }
 
     /// A leftover server stops by itself once its app has ended, as Ctrl+C stops it, and a second
@@ -478,7 +551,7 @@ struct ChildRecordTests {
         let member = try #require(pid_t(written.trimmingCharacters(in: .whitespacesAndNewlines)))
         record.keep(child)
         let stopping = ContinuousClock.now
-        await record.stopLeftover()
+        await record.stopLeftover(olderApps: { _ in false })
         let took = ContinuousClock.now - stopping
         #expect(processStart(child.pid) == nil)
         #expect(took >= killAfter && took < killAfter + .seconds(10))
@@ -501,7 +574,7 @@ struct ChildRecordTests {
         defer { child.stop(SIGKILL, killAfter: .zero) }
         try await waitFor((try? String(contentsOf: log, encoding: .utf8)) == "ready\n", "the start")
         record.keep(child)
-        await record.stopLeftover()
+        await record.stopLeftover(olderApps: { _ in false })
         #expect(processStart(child.pid) == nil)
         return try String(contentsOf: log, encoding: .utf8)
     }

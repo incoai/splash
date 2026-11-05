@@ -45,6 +45,17 @@ struct Runtime: Sendable {
         scriptCommand("install/models.py", ["--model", model, "prepare", "--json-progress"])
     }
 
+    /// Whether `pid` runs this runtime's installer as an app starts it (`installCommand`), for any
+    /// model, as the kernel keeps its arguments; `splash serve` runs it with others. Its program is
+    /// left out: an interpreter can start another in its place, under the same ID and arguments,
+    /// as a framework build of Python does.
+    func runsInstaller(_ pid: pid_t) -> Bool {
+        guard let arguments = processArguments(pid), let flag = arguments.firstIndex(of: "--model"),
+              flag + 1 < arguments.endIndex
+        else { return false }
+        return arguments.dropFirst() == installCommand(arguments[flag + 1]).dropFirst()
+    }
+
     /// The command line of the installer of the models the Hugging Face cache holds whole that
     /// Splash serves, without the Hub (`install/cached.py`).
     var cachedInstallCommand: [String] {

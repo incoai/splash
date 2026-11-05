@@ -18,6 +18,8 @@ enum Preference {
     /// them on the next launch should the app quit without stopping them.
     static let serverPID = "serverPID"
     static let installerPID = "installerPID"
+    /// The port of the server an app before 1.6 kept beside its ID alone (`Server.stopLeftover`).
+    static let olderServerPort = "serverPort"
 }
 
 /// How a model starts: `splash serve --model MODEL --port PORT --offline` and the launch options
