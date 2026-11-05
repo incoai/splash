@@ -39,36 +39,69 @@ class ThresholdTests(unittest.TestCase):
 
 
 class RestartPolicyTests(unittest.TestCase):
-    def test_short_lived_failures_back_off_without_stopping(self):
+    def test_the_sixth_short_lived_failure_in_a_row_stops(self):
+        """Short-lived failures in a row double the backoff, and the sixth,
+        whose wait would have reached the 60 s cap, stops the relaunches
+        (they went on every 60 s for good, each loading the weights again)."""
+        self.assertEqual(supervision.CRASH_LOOP_FAILURES, 6)
         policy = supervision.RestartPolicy()
         failure = supervision.EngineFailure("engine_unhealthy", "crashed", 1.0)
         self.assertEqual(
-            [policy.after(failure) for _ in range(7)],
-            [0.0, 5.0, 10.0, 20.0, 40.0, 60.0, 60.0],
+            [policy.after(failure) for _ in range(6)],
+            [0.0, 5.0, 10.0, 20.0, 40.0, None],
         )
-        # A failure after a full probation of service starts the streak anew.
+
+    def test_a_full_probation_of_service_starts_the_count_anew(self):
+        policy = supervision.RestartPolicy()
+        failure = supervision.EngineFailure("engine_unhealthy", "crashed", 1.0)
         served = supervision.EngineFailure("engine_unhealthy", "crashed", 60.0)
+        self.assertEqual(
+            [policy.after(failure) for _ in range(5)], [0.0, 5.0, 10.0, 20.0, 40.0]
+        )
         self.assertEqual(policy.after(served), 0.0)
-        self.assertEqual(policy.after(failure), 5.0)
+        self.assertEqual(
+            [policy.after(failure) for _ in range(6)],
+            [5.0, 10.0, 20.0, 40.0, 60.0, None],
+        )
 
     def test_the_backoff_stays_at_the_cap_however_long_failures_go_on(self):
-        """However long short-lived failures go on, the backoff stays at the
+        """However long a relaunch waits for memory, the backoff stays at the
         cap (from the 1026th in a row, at least 17 h of relaunches in, it no
         longer fit a float, and the policy raised: the server relaunched with
         no backoff, or never again)."""
         policy = supervision.RestartPolicy()
-        failure = supervision.EngineFailure("engine_unhealthy", "crashed", 1.0)
+        failure = start_failure(wire.StartFailureKind.HOST_MEMORY)
         delays = [policy.after(failure) for _ in range(2000)]
         self.assertEqual(set(delays[5:]), {60.0})
         served = supervision.EngineFailure("engine_unhealthy", "crashed", 60.0)
         self.assertEqual(policy.after(served), 0.0)
         self.assertEqual(policy.after(failure), 5.0)
 
-    def test_only_a_failure_a_relaunch_would_meet_again_stops(self):
+    def test_a_start_that_waited_for_memory_neither_counts_nor_clears(self):
+        """A relaunch refused memory is retried, every 60 s once the backoff
+        reached its cap, for as long as it is refused: it says nothing about
+        the engine, and the short-lived failures around it stay in a row."""
+        for kind in (
+            wire.StartFailureKind.HOST_MEMORY,
+            wire.StartFailureKind.DRIVER_ALLOCATION,
+            wire.StartFailureKind.MEMORY_BUDGET,
+            wire.StartFailureKind.CONTEXT_BUDGET,
+        ):
+            with self.subTest(kind=kind):
+                policy = supervision.RestartPolicy()
+                failure = supervision.EngineFailure("engine_unhealthy", "crashed", 1.0)
+                delays = [policy.after(failure) for _ in range(5)]
+                delays += [policy.after(start_failure(kind)) for _ in range(2000)]
+                self.assertEqual(delays[:5], [0.0, 5.0, 10.0, 20.0, 40.0])
+                self.assertEqual(set(delays[5:]), {60.0})
+                self.assertIsNone(policy.after(failure))
+
+    def test_only_a_failure_a_relaunch_would_meet_again_stops_at_once(self):
         for kind in (
             wire.StartFailureKind.CONFIGURATION,
             wire.StartFailureKind.DEVICE,
             wire.StartFailureKind.COMMAND_MEMORY,
+            wire.StartFailureKind.MODEL,
         ):
             with self.subTest(kind=kind):
                 self.assertIsNone(
@@ -83,7 +116,6 @@ class RestartPolicyTests(unittest.TestCase):
             wire.StartFailureKind.DRIVER_ALLOCATION,
             wire.StartFailureKind.MEMORY_BUDGET,
             wire.StartFailureKind.CONTEXT_BUDGET,
-            wire.StartFailureKind.MODEL,
             wire.StartFailureKind.INTERNAL,
         ):
             with self.subTest(kind=kind):

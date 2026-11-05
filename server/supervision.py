@@ -68,16 +68,39 @@ class Thresholds:
 THRESHOLDS = Thresholds.of(wire.SUPERVISION)
 
 # Start failures a relaunch would meet again whatever this Mac's memory or
-# disk: a setting the engine refuses, a Mac that cannot run Splash, and a
-# start whose commands another process's GPU memory starved, which a retry
-# would take from that process.
+# disk: a setting the engine refuses, a Mac that cannot run Splash, model
+# files it cannot serve, which every relaunch reads again, and a start whose
+# commands another process's GPU memory starved, which a retry would take
+# from that process.
 PERMANENT_START_FAILURES = frozenset(
     {
         wire.StartFailureKind.CONFIGURATION,
         wire.StartFailureKind.DEVICE,
+        wire.StartFailureKind.MODEL,
         wire.StartFailureKind.COMMAND_MEMORY,
     }
 )
+
+# Start failures for want of memory the host, Metal or the budget refused: a
+# relaunch waits for it as long as it is refused, and its failure says
+# nothing about the engine.
+MEMORY_START_FAILURES = frozenset(
+    {
+        wire.StartFailureKind.HOST_MEMORY,
+        wire.StartFailureKind.DRIVER_ALLOCATION,
+        wire.StartFailureKind.MEMORY_BUDGET,
+        wire.StartFailureKind.CONTEXT_BUDGET,
+    }
+)
+
+# How often the relaunch backoff doubles from BACKOFF_BASE_SECONDS before it
+# reaches its cap.
+BACKOFF_DOUBLINGS = math.ceil(math.log2(THRESHOLDS.backoff_cap / BACKOFF_BASE_SECONDS))
+# The short-lived failure in a row that stops the relaunches: the one whose
+# backoff would reach the cap (the first relaunches at once, the second
+# after BACKOFF_BASE_SECONDS). Relaunching an engine that has failed this
+# often within its probation, at the cap, would go on doing so.
+CRASH_LOOP_FAILURES = 2 + BACKOFF_DOUBLINGS
 
 # Engine failures a request it ran may have caused: a death by a fault signal,
 # and of an engine that exited on its own, an execution failure it reported
@@ -133,33 +156,52 @@ def request_caused(code: str, returncode: int | None) -> bool:
     return code in REQUEST_FAILURE_CODES
 
 
+def permanent(failure: EngineFailure) -> bool:
+    """Whether every relaunch would meet `failure` again: the engine's
+    executable is missing, or a start failure in PERMANENT_START_FAILURES."""
+    return failure.launch or (
+        failure.start is not None and failure.start.kind in PERMANENT_START_FAILURES
+    )
+
+
 class RestartPolicy:
     """When to relaunch a failed engine: at once after a failure that followed
     a full probation of service, then after a backoff that doubles with each
-    short-lived failure in a row, up to the cap, for as long as failures go
-    on. Never once the engine's executable is missing, or after a start
-    failure in PERMANENT_START_FAILURES."""
+    short-lived failure in a row, up to the cap. Never after a permanent
+    failure, nor at the CRASH_LOOP_FAILURES-th short-lived failure in a row.
+    A start that failed for want of memory (MEMORY_START_FAILURES) backs off
+    as any, and is relaunched for as long as it fails, but neither adds to
+    the failures in a row nor clears them."""
 
     def __init__(self):
         self.thresholds = THRESHOLDS
+        # Failures in a row since a full probation of service, which the
+        # backoff doubles by.
         self.streak = 0
+        # Of those, the short-lived ones a start's want of memory did not
+        # cause.
+        self.short_lived_failures = 0
 
     def after(self, failure: EngineFailure) -> float | None:
         """Seconds until the relaunch `failure` owes; None for none."""
-        if failure.launch or (
-            failure.start is not None and failure.start.kind in PERMANENT_START_FAILURES
-        ):
+        if permanent(failure):
             return None
         if failure.served_seconds >= self.thresholds.short_lived:
             self.streak = 0
+            self.short_lived_failures = 0
+        elif failure.start is None or failure.start.kind not in MEMORY_START_FAILURES:
+            self.short_lived_failures += 1
+            if self.short_lived_failures == CRASH_LOOP_FAILURES:
+                return None
         self.streak += 1
         if self.streak == 1:
             return 0.0
-        cap = self.thresholds.backoff_cap
         # Doubled until it reaches the cap and no further: doubled on, it no
         # longer fits a float from the 1026th failure in a row.
-        doublings = math.ceil(math.log2(cap / BACKOFF_BASE_SECONDS))
-        return min(cap, BACKOFF_BASE_SECONDS * 2 ** min(self.streak - 2, doublings))
+        return min(
+            self.thresholds.backoff_cap,
+            BACKOFF_BASE_SECONDS * 2 ** min(self.streak - 2, BACKOFF_DOUBLINGS),
+        )
 
 
 class Quarantine:

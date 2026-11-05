@@ -32,12 +32,17 @@ upgrading.
 An engine that fails is restarted at once. If it fails again within 60 s of
 starting, the next restart waits 5 s, and each such failure in a row after it
 doubles the wait, up to 60 s (failed restarts count); 60 s of service starts
-the count anew. Splash stops restarting only after a restart that would fail
-again whatever the Mac's memory: a setting the engine refuses, a Mac that
-cannot run Splash, a missing engine executable, or a start whose GPU commands
-another process's memory starved (another Splash server?), which a retry
-would take from that process. Requests then get 500 `engine_failed` until the
-server is restarted; its message names the crash trace when
+the count anew. Splash stops restarting at once after a failure every restart
+would meet again: a setting the engine refuses, a Mac that cannot run Splash,
+model files it cannot serve (missing, moved or corrupt), a missing engine
+executable, or a start whose GPU commands another process's memory starved
+(another Splash server?), which a retry would take from that process. A
+restart that failed for want of memory the Mac refused is retried, at most 60 s
+apart, for as long as it fails, and neither counts toward the six below nor
+starts them anew. For any other cause it stops after the sixth failure in a
+row, each within 60 s of starting. Once it stops, requests get 500
+`engine_failed` until the server is restarted; its message names the crash
+trace when
 `SPLASH_CRASH_TRACE=1` recorded one
 ([crash traces](internals.md#failures-and-crash-traces)). Meanwhile generation requests get
 503 `engine_recovering`, whose message names the last failure and whose

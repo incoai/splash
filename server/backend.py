@@ -417,20 +417,31 @@ class NativeBackend:
 
     def _stop_message(self, failure):
         """Why relaunching stopped after `failure`, and what to do."""
-        if (
-            failure.start is not None
-            and failure.start.kind is wire.StartFailureKind.COMMAND_MEMORY
-        ):
+        kind = failure.start.kind if failure.start is not None else None
+        if kind is wire.StartFailureKind.COMMAND_MEMORY:
             return (
                 "the engine's start ran out of GPU memory another process holds "
                 "(another Splash server?); Splash stopped restarting it. Quit that "
                 "process, then restart the Splash server."
             )
+        if kind is wire.StartFailureKind.MODEL:
+            return (
+                f"the model's files can no longer be served ({failure.message}); "
+                "Splash stopped restarting the engine. Restore or reinstall the "
+                "model, then restart the Splash server."
+            )
+        cause = (
+            failure.message
+            if supervision.permanent(failure)
+            else f"it failed {supervision.CRASH_LOOP_FAILURES} times in a row, each "
+            f"within {self.policy.thresholds.short_lived:.0f} s of starting "
+            f"({failure.message})"
+        )
         # The runtime writes an engine's crash trace before it reports that
         # engine's failure, to the listener or from wait_ready.
         trace = self.runtime.last_crash_trace
         return (
-            f"Splash stopped restarting the engine: {failure.message}. "
+            f"Splash stopped restarting the engine: {cause}. "
             + (
                 f"Crash trace: {trace}. "
                 if trace

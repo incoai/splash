@@ -128,10 +128,11 @@ class ServerRecoveryTests(HarnessTestCase):
                 self.assertEqual(runtime.startup_calls, 1)
                 self.assertEqual(runtime.requests, [])
 
-    def test_fast_failures_back_off_without_stopping(self):
-        """Short-lived failures in a row double the backoff up to the cap and
-        never stop the relaunches: the server serves again once the engine
-        does (three in a row stopped it for good)."""
+    def test_the_sixth_fast_failure_in_a_row_stops(self):
+        """Short-lived failures in a row double the backoff, and the sixth,
+        whose wait would have reached the cap, stops the relaunches: requests
+        get 500 engine_failed with its reason, which /status reports (they went
+        on every 60 s for good, each loading the weights again)."""
         runtime = RecoveringRuntime()
         harness = self.harness(runtime)
         backend = harness.backend
@@ -151,14 +152,33 @@ class ServerRecoveryTests(HarnessTestCase):
                     (refusal.status, refusal.code), (503, "engine_recovering")
                 )
                 self.relaunched(runtime, backend)
+            self.assertIsNone(backend.stop_reason)
+            runtime.fail(backend, served=1.0)
         self.assertEqual(runtime.startup_calls, 5)
-        self.assertIsNone(backend.stop_reason)
-        self.assertNotIn("Engine stopped", str(console.call_args_list))
-        self.assertIsNone(backend.refusal())
+        reason = backend.stop_reason
+        self.assertEqual(
+            reason,
+            "Splash stopped restarting the engine: it failed 6 times in a row, "
+            "each within 60 s of starting (native protocol reached EOF). "
+            "Set SPLASH_CRASH_TRACE=1 to record a crash trace. "
+            "Restart the Splash server after fixing the cause.",
+        )
+        self.assertEqual(
+            console.call_args_list[-1].args[0], f"Engine stopped · {reason}"
+        )
+        refusal = backend.refusal()
+        self.assertEqual(
+            (refusal.status, refusal.code, refusal.message),
+            (500, "engine_failed", reason),
+        )
         transport = json.loads(harness.request("GET", "/status")[2])["transport"]
-        self.assertFalse(transport["stopped"])
-        status, _, _ = harness.request("POST", "/v1/chat/completions", self.body())
-        self.assertEqual(status, 200)
+        self.assertTrue(transport["stopped"])
+        self.assertEqual(transport["error"], reason)
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", self.body()
+        )
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(payload)["error"]["code"], "engine_failed")
 
     def test_recovery_refusals_ask_for_the_time_a_relaunch_takes(self):
         # Until the next bound on the relaunched engine's start: as long after
@@ -355,6 +375,30 @@ class ServerRecoveryTests(HarnessTestCase):
             )
         )
         self.assertRegex(reason, "Crash trace|SPLASH_CRASH_TRACE")
+
+    def test_model_start_failure_on_relaunch_stops(self):
+        """A relaunch that finds the model's files it cannot serve is not
+        retried: every relaunch reads the same files (it was retried every
+        60 s for good)."""
+        reason, lines = self.stopped_by(
+            engine_runtime.EngineStartFailed(
+                wire.StartFailedEvent(
+                    wire.StartFailureKind.MODEL,
+                    wire.ShortfallBound.DEVICE_MEMORY,
+                    0,
+                    0,
+                    0,
+                    b"MODEL_DIRECTORY must name an existing directory",
+                )
+            )
+        )
+        self.assertEqual(
+            reason,
+            "the model's files can no longer be served (MODEL_DIRECTORY must name "
+            "an existing directory); Splash stopped restarting the engine. Restore "
+            "or reinstall the model, then restart the Splash server.",
+        )
+        self.assertEqual(lines[-1], f"Engine stopped · {reason}")
 
     def test_missing_executable_on_relaunch_stops(self):
         reason, _ = self.stopped_by(
@@ -626,6 +670,30 @@ class ServerRecoveryTests(HarnessTestCase):
         self.assertEqual(
             len(factory.processes[-1].stdin.messages(wire.RequestFrame)), sent
         )
+        self.assertEqual(self.outcome_of(backend, runtime, (4, 5))[0], "done")
+
+    def test_a_request_retried_through_failures_is_refused_before_they_stop(self):
+        """A request whose every run fails the engine, however often its client
+        retries it, is refused at its second failure, long before the failures
+        in a row would stop the relaunches."""
+        poison = (1, 2, 3)
+        crash = self.crash(b"engine_execution_failed")
+        factory, runtime, backend = self.quarantine_server(
+            lambda process, frame: (
+                crash if frame.prompt_tokens == poison else self.serve
+            )(process, frame)
+        )
+        outcomes = [
+            self.outcome_of(backend, runtime, poison)[1].code
+            for _ in range(supervision.CRASH_LOOP_FAILURES + 1)
+        ]
+        self.assertEqual(
+            outcomes,
+            ["runtime_unavailable"] * 2
+            + ["request_quarantined"] * (supervision.CRASH_LOOP_FAILURES - 1),
+        )
+        self.assertIsNone(backend.stop_reason)
+        self.assertEqual(len(factory.processes), 3)
         self.assertEqual(self.outcome_of(backend, runtime, (4, 5))[0], "done")
 
     def test_a_request_started_at_one_failure_is_served_after_the_relaunch(self):
