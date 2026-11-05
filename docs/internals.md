@@ -1396,8 +1396,9 @@ does not want waits for scheduling: it holds back nothing, its claim holds no
 room and its wait's limit stops; it keeps its wait's age and its refusal. A
 refusal of the SSD cache's quota holds back only Spill starts. Aging bounds
 how long younger prompts lead a refused start
-([below](#prefill-and-decode-scheduling)). A refused resume holds back the
-later resumes.
+([below](#prefill-and-decode-scheduling)); while those admitted ahead of it
+work, its wait's limit restarts ([resource waits](#resource-waits)). A refused
+resume holds back the later resumes.
 
 ### What a refused claim takes
 
@@ -1691,13 +1692,16 @@ still short, and at most for the 30 s resource wait; suspended requests then
 resume first, each within its own resource wait. A request of a strictly higher
 priority than every suspended request waits for neither. A resource wait's limit
 restarts whenever an earlier lane has work in flight: one submitted before the
-waiting request, or admitted before the request was first refused memory or
-suspended. Such a lane holds memory the request waits for until it finishes.
-Other lanes do not extend the wait. Readiness does not guarantee that a
-request-sized allocation fits. A request that cannot fit even alone, after every
-cached prefix was evicted and the expert store shrank to its floor, fails with
-400 `capacity_exhausted`, naming a smaller `--max-context`, or a larger
-`--max-memory` where one lowered the budget; retrying it fails the same way.
+waiting request, or admitted before its latest refusal while it has no lane (at
+its start or resume, or its suspension), or before its first refusal as a lane
+in service. Such a lane holds memory the request waits for until it finishes:
+the shorter starts admission leads ahead of a refused start, which aging
+bounds, keep its wait open while they work. Other lanes do not extend the wait.
+Readiness does not guarantee that a request-sized allocation fits. A request
+that cannot fit even alone, after every cached prefix was evicted and the expert
+store shrank to its floor, fails with 400 `capacity_exhausted`, naming a smaller
+`--max-context`, or a larger `--max-memory` where one lowered the budget;
+retrying it fails the same way.
 
 ## Sliding windows
 

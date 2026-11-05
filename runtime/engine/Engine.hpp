@@ -329,9 +329,10 @@ private:
     // What refused the memory at the latest attempt.
     metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
     std::optional<double> startedMilliseconds;
-    // The admissions counted when the request was first refused memory, and
-    // again when it is suspended: the lanes admitted up to then hold memory
-    // it waits for. A wait for a lane does not record it.
+    // The admissions counted at the request's latest refusal while it has no
+    // lane (its start's, its resume's, its suspension), or at its first
+    // refusal in service: the lanes admitted up to then hold memory it waits
+    // for (deferResourceRetry). A wait for a lane does not record it.
     std::optional<uint64_t> admittedBefore;
     double deadlineMilliseconds = 0.0;
     // The latest tick at which a lane submitted before the request, or one
@@ -385,8 +386,8 @@ private:
 
     EngineRequest request;
     // The admissions counted when admit() last gave it a lane (admissions_).
-    // Lanes admitted before a request was refused memory or suspended restart
-    // its wait's limit.
+    // Lanes admitted before a request's refusal that
+    // ResourceWait::admittedBefore records restart its wait's limit.
     uint64_t admission = 0;
     std::optional<uint32_t> lane;
     uint32_t promptTokens = 0;

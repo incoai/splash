@@ -1301,8 +1301,8 @@ void testAdmissionWaitsOutEarlierLanes() {
   }
 }
 
-// A lane submitted after a waiting request does not extend its wait: the wait fails at its limit, retryably, while
-// that lane, which leads it, still runs.
+// A lane submitted after a waiting request and admitted after its latest refusal does not extend its wait: the wait
+// fails at its limit, retryably, while that lane, which leads it, still runs.
 void testLaterLanesDoNotExtendAResourceWait() {
   test::TestKvStorage storage(32, 4096, 4);
   KvPool pool(storage, 0);
@@ -1314,8 +1314,8 @@ void testLaterLanesDoNotExtendAResourceWait() {
   executor.beginGrowthBlocked = [&] { return executor.lastBeginId == 320; };
   Events events;
   EngineConfig config = test::engineConfig();
-  // Shorter than the retry backoff: the limit runs out before the first
-  // retry, which a decoding higher priority would defer for scheduling.
+  // Shorter than the retry backoff: the limit runs out before the retry
+  // whose refusal would count the later lane.
   config.resourceWaitTimeoutMilliseconds = 50.0;
   engine::Engine engine(config, resources, executor, events);
   guardReleases(storage, engine);
@@ -1398,6 +1398,65 @@ void testLaneAdmittedBeforeARefusalHoldsTheWaitOpen() {
     require(now <= cancelledAt + 70 &&
                 events.failures == std::vector<std::string>{"resource_timeout"},
             "the wait did not expire once the lane admitted before it was gone");
+  }
+}
+
+// Shorter starts the scheduler leads ahead of a refused start, admitted after its first refusal, hold memory that wait
+// is for: it waits while they work, one after another, past its limit, and starts once their memory frees; with none
+// freed, its wait expires at its limit once they are gone.
+void testStartsAdmittedAheadOfARefusedStartHoldItsWaitOpen() {
+  for (const bool frees : {true, false}) {
+    test::TestKvStorage storage(64, 4096, 4);
+    KvPool pool(storage, 0);
+    engine::Cache resources(pool, nullptr, nullptr);
+    Executor executor;
+    executor.decodeFinishes = false;
+    // The host has no memory for the long prompt while the shorter ones run.
+    bool held = true;
+    executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
+    executor.beginGrowthBlocked = [&] { return executor.lastBeginId == 340 && (held || !frees); };
+    Events events;
+    EngineConfig config = test::engineConfig();
+    // Longer than the retry backoff: the refused start is tried again while
+    // the shorter ones run.
+    config.resourceWaitTimeoutMilliseconds = 300.0;
+    engine::Engine engine(config, resources, executor, events);
+    guardReleases(storage, engine);
+    double now = 1;
+    engine.submit(request(340, std::vector<uint32_t>(1025, 340)));
+    static_cast<void>(engine.tick(now));
+    require(engine.resourceWaitSnapshot(now).memory == 1 && !executor.requests.contains(340),
+            "the long prompt did not wait for memory");
+    // Each shorter prompt leads the refused one and starts beside its wait;
+    // the second takes over from the first.
+    for (const uint64_t id : {341, 342}) {
+      auto shorter = request(id, {static_cast<uint32_t>(id)});
+      shorter.maxNewTokens = 100000;
+      engine.submit(std::move(shorter));
+      tickUntil(engine, now, [&] { return executor.requests.contains(id); }, "a shorter prompt did not start");
+      if (id == 342)
+        engine.cancel(341);
+      for (const double end = now + 400; now < end;)
+        static_cast<void>(engine.tick(now += 10));
+    }
+    require(events.failedCount == 0 && !executor.requests.contains(340) &&
+                engine.resourceWaitSnapshot(now).memory == 1,
+            "a wait expired while the starts admitted ahead of it worked");
+    engine.cancel(342);
+    held = false;
+    const double cancelledAt = now;
+    while (!events.failedCount && !executor.requests.contains(340) && now < cancelledAt + 1000)
+      static_cast<void>(engine.tick(now += 10));
+    if (frees)
+      require(executor.requests.contains(340) && events.failedCount == 0,
+              "the refused start did not start once the memory freed");
+    else
+      require(now <= cancelledAt + 320 && events.failures == std::vector<std::string>{"resource_timeout"},
+              "the wait did not expire once the starts admitted ahead of it were gone");
+    engine.cancel(340);
+    for (const double end = now + 200; now < end && !idle(engine);)
+      static_cast<void>(engine.tick(now += 10));
+    require(idle(engine) && executor.requests.empty(), "the resource wait leaked a request");
   }
 }
 
@@ -6190,6 +6249,8 @@ std::span<const test::TestCase> memoryTests() {
       {"testAdmissionWaitsOutEarlierLanes", testAdmissionWaitsOutEarlierLanes},
       {"testLaterLanesDoNotExtendAResourceWait", testLaterLanesDoNotExtendAResourceWait},
       {"testLaneAdmittedBeforeARefusalHoldsTheWaitOpen", testLaneAdmittedBeforeARefusalHoldsTheWaitOpen},
+      {"testStartsAdmittedAheadOfARefusedStartHoldItsWaitOpen",
+       testStartsAdmittedAheadOfARefusedStartHoldItsWaitOpen},
       {"testKvPressureNarrowsTheRealBatch", testKvPressureNarrowsTheRealBatch},
       {"testKvGrowthReclaimsCachedStateWhenBudgetIsShared", testKvGrowthReclaimsCachedStateWhenBudgetIsShared},
       {"testWhatFreesNowKeepsALaneWaitingForTheRest", testWhatFreesNowKeepsALaneWaitingForTheRest},

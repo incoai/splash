@@ -414,9 +414,13 @@ void Engine::deferResourceRetry(Request &active, double now,
   auto &wait = active.resourceWait;
   if (!wait.startedMilliseconds)
     wait.startedMilliseconds = now;
-  // Waiting for a lane is not waiting for memory: the lanes that count are
-  // those admitted before the first refusal of memory.
-  if (!wait.admittedBefore && reason != StateFailure::ConcurrencyLimit)
+  // Waiting for a lane is not waiting for memory. Without a lane, refused at
+  // its start or resume or suspended, a request waits for every lane admitted
+  // before its latest refusal: those admission started ahead of it while it
+  // waited, as the scheduler led them, hold memory it waits for. A lane in
+  // service waits for those admitted before its first refusal; the starts
+  // admitted beside it do not.
+  if (reason != StateFailure::ConcurrencyLimit && (!active.lane || !wait.admittedBefore))
     wait.admittedBefore = admissions_;
   noteRefusal(active, now, denial);
   wait.reason = reason;
@@ -468,9 +472,9 @@ double Engine::resourceDeadline(const Request &active) const noexcept {
   if ((wait.pending && wait.epoch != resourceEpoch_) || wait.deadlineMilliseconds <= 0.0)
     return 0.0;
   // The limit restarts whenever a lane submitted before the request, or
-  // admitted before it was refused memory or suspended, works, however long
-  // that takes. Other lanes do not extend it: requests that keep arriving
-  // would otherwise hold it until the request's deadline.
+  // admitted before the refusal ResourceWait::admittedBefore records, works,
+  // however long that takes. Other lanes do not extend it: requests that
+  // keep arriving would otherwise hold it until the request's deadline.
   return std::max(wait.deadlineMilliseconds,
                   wait.earlierLaneWorkMilliseconds + config_.resourceWaitTimeoutMilliseconds);
 }
@@ -933,9 +937,6 @@ void Engine::suspendLane(Request &active, uint64_t workEnd, metal::AllocationFai
 void Engine::suspendForGrowth(Request &active, uint64_t workEnd,
                               metal::AllocationFailure failure, double now) {
   suspendLane(active, workEnd, failure, StateFailure::MemoryPressure, now);
-  // Without its lane it waits for the memory of every lane resident now,
-  // also those admitted while it waited to grow.
-  active.resourceWait.admittedBefore = admissions_;
   // Resident lanes drain before admission resumes. Growth the host refused
   // resumes when its pressure lifts; any other limit only once memory is
   // freed, so it counts as a failure the drain waits out.

@@ -249,11 +249,12 @@ bool Engine::tick(double now) {
       active.resourceWait.deadlineMilliseconds = 0.0;
       continue;
     }
-    // A lane submitted before the request, or admitted before it was refused
-    // memory or suspended, holds memory it may wait for until it finishes;
-    // while it works, the wait's limit restarts. Other lanes do not extend
-    // it: requests that keep arriving would otherwise hold it until its
-    // deadline.
+    // A lane submitted before the request, or admitted before the refusal
+    // ResourceWait::admittedBefore records (a waiting start's latest, so the
+    // starts admission led ahead of it count), holds memory it may wait for
+    // until it finishes; while it works, the wait's limit restarts. Other
+    // lanes do not extend it: requests that keep arriving would otherwise
+    // hold it until its deadline.
     const std::optional<uint64_t> &admittedBefore = active.resourceWait.admittedBefore;
     if (scheduler_.submissionOrder(id) > earliestWorking ||
         (admittedBefore && earliestWorkingAdmission <= *admittedBefore))
