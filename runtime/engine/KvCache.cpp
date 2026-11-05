@@ -486,35 +486,41 @@ void KvCache::moveResumePoint(uint64_t from, uint64_t to) noexcept {
   rekeep(found->second);
 }
 
+KvCache::Reasons KvCache::reasons(const Block &entry, const std::array<uint32_t, kKeeps> &children,
+                                  uint32_t neededChildren) const noexcept {
+  const bool resident = entry.page != noPage;
+  const bool active = resident && pool_.pageActive(entry.page);
+  Reasons result{.here = entry.state.keeps, .needed = entry.state.needed || neededChildren};
+  if (resident && (entry.transfer == Transfer::Filling || entry.activeUsers || active ||
+                   (entry.poisoned && !entry.residentChildren)))
+    result.here |= keepBit(Keep::Busy);
+  if (resident && entry.transfer == Transfer::Draining)
+    result.here |= keepBit(Keep::Moving);
+  if (resident && !entry.slot && result.needed)
+    result.here |= keepBit(Keep::Uncopied);
+  if (entry.wanted)
+    result.here |= keepBit(Keep::Wanted);
+  if (entry.resumePoint)
+    result.here |= keepBit(Keep::ResumePoint);
+  result.keeps = result.here;
+  for (size_t each = 0; each < kKeeps; ++each)
+    if (children[each])
+      result.keeps |= keepBit(static_cast<Keep>(each));
+  // The chains a reclaim keeps count no page from one a request holds up.
+  if (active)
+    result.keeps &= static_cast<Keeps>(~kChainKeeps);
+  if (resident) {
+    result.counted = keepCount(entry.form, result.keeps, !active && entry.transfer == Transfer::None);
+    if (entry.state.candidate)
+      result.candidate = result.keeps;
+  }
+  return result;
+}
+
 void KvCache::rekeep(Block &start) noexcept {
-  constexpr auto busy = keepBit(Keep::Busy);
-  constexpr auto moving = keepBit(Keep::Moving);
-  constexpr auto uncopied = keepBit(Keep::Uncopied);
   for (Block *entry = &start;;) {
-    const bool resident = entry->page != noPage;
-    const bool active = resident && pool_.pageActive(entry->page);
-    const bool needed = entry->state.needed || entry->neededChildren;
-    Keeps here = entry->state.keeps;
-    if (resident && (entry->transfer == Transfer::Filling || entry->activeUsers || active ||
-                     (entry->poisoned && !entry->residentChildren)))
-      here |= busy;
-    if (resident && entry->transfer == Transfer::Draining)
-      here |= moving;
-    if (resident && !entry->slot && needed)
-      here |= uncopied;
-    if (entry->wanted)
-      here |= keepBit(Keep::Wanted);
-    if (entry->resumePoint)
-      here |= keepBit(Keep::ResumePoint);
-    Keeps keeps = here;
-    for (size_t each = 0; each < kKeeps; ++each)
-      if (entry->keepChildren[each])
-        keeps |= keepBit(static_cast<Keep>(each));
-    // The chains a reclaim keeps count no page from one a request holds up.
-    if (active)
-      keeps &= static_cast<Keeps>(~kChainKeeps);
+    const auto [here, keeps, needed, counted, candidate] = reasons(*entry, entry->keepChildren, entry->neededChildren);
     entry->keepsHere = here;
-    const uint16_t candidate = resident && entry->state.candidate ? keeps : noCount;
     if (candidate != entry->candidateCounted) {
       if (entry->candidateCounted != noCount)
         --candidateCounts_[entry->candidateCounted];
@@ -522,8 +528,6 @@ void KvCache::rekeep(Block &start) noexcept {
         ++candidateCounts_[candidate];
       entry->candidateCounted = candidate;
     }
-    const uint16_t counted =
-        resident ? keepCount(entry->form, keeps, !active && entry->transfer == Transfer::None) : noCount;
     if (counted != entry->counted) {
       if (entry->counted != noCount)
         --keepCounts_[entry->counted];
@@ -1279,11 +1283,10 @@ void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &state
   checkOrder(diskLeaves_, [](const Orders &in) { return in.diskLeaf; }, "the order of only copies");
   checkOrder(unneeded_, [](const Orders &in) { return in.unneeded; }, "the order of copies no state needs");
   checkOrder(trimmable_, [](const Orders &in) { return in.trimmable; }, "the order of Full pages no tail holds");
-  // Each block's reasons to stay (Keep), recounted from the fields they
-  // follow, children before parents: whether a state that needs its KV
-  // sits at it or below; the reasons at it; those at it or below it, the
-  // chain reasons only up to a page a request holds; the children with
-  // each; and the resident blocks by form, reasons and idleness.
+  // Each block's reasons to stay (Keep), recounted children before parents
+  // by the rule rekeep keeps them by (reasons): the children with each
+  // reason and those below which a state needs its KV, the block's reasons
+  // from those, and the resident blocks by form, reasons and idleness.
   std::vector<const Block *> deepestFirst;
   deepestFirst.reserve(blocks_.size());
   for (const auto &[_, entry] : blocks_)
@@ -1291,7 +1294,11 @@ void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &state
   std::ranges::sort(deepestFirst, [](const Block *left, const Block *right) { return left->depth > right->depth; });
   // Of each block, its children with each reason and those below which a
   // state needs its KV.
-  std::unordered_map<uint64_t, std::array<uint32_t, kKeeps + 1>> withReason;
+  struct Children final {
+    std::array<uint32_t, kKeeps> keeps{};
+    uint32_t needed = 0;
+  };
+  std::unordered_map<uint64_t, Children> withReason;
   std::array<uint32_t, size_t{3} << (kKeeps + 1)> counts{};
   std::array<uint32_t, size_t{1} << kKeeps> candidates{};
   for (const Block *entry : deepestFirst) {
@@ -1300,46 +1307,23 @@ void KvCache::checkInvariants(const std::function<bool(uint64_t blockId)> &state
                                               .wanted = entry->wanted,
                                               .resumePoint = entry->resumePoint},
           "a block's marks: what its state asks of its KV, the waiting chains that end at it, the resume point");
-    const std::array<uint32_t, kKeeps + 1> below = withReason[entry->id];
-    check(std::equal(entry->keepChildren.begin(), entry->keepChildren.end(), below.begin()) &&
-              entry->neededChildren == below[kKeeps],
+    const Children below = withReason[entry->id];
+    check(entry->keepChildren == below.keeps && entry->neededChildren == below.needed,
           "a block counts its children with each reason");
-    const bool resident = entry->page != noPage;
-    const bool active = resident && pool_.pageActive(entry->page);
-    const bool needed = entry->state.needed || below[kKeeps];
-    Keeps here = entry->state.keeps;
-    if (resident && (entry->transfer == Transfer::Filling || entry->activeUsers || active ||
-                     (entry->poisoned && !entry->residentChildren)))
-      here |= keepBit(Keep::Busy);
-    if (resident && entry->transfer == Transfer::Draining)
-      here |= keepBit(Keep::Moving);
-    if (resident && !entry->slot && needed)
-      here |= keepBit(Keep::Uncopied);
-    if (entry->wanted)
-      here |= keepBit(Keep::Wanted);
-    if (entry->resumePoint)
-      here |= keepBit(Keep::ResumePoint);
-    Keeps keeps = here;
-    for (size_t each = 0; each < kKeeps; ++each)
-      keeps |= below[each] ? keepBit(static_cast<Keep>(each)) : 0;
-    if (active)
-      keeps &= static_cast<Keeps>(~kChainKeeps);
+    const auto [here, keeps, needed, counted, candidate] = reasons(*entry, below.keeps, below.needed);
     check(entry->keepsHere == here && entry->keeps == keeps && entry->needed == needed,
           "a block's reasons to stay, at it and below it, and whether a state there needs its KV");
-    const uint16_t counted =
-        resident ? keepCount(entry->form, keeps, !active && entry->transfer == Transfer::None) : noCount;
     check(entry->counted == counted, "a block counts under its form, reasons and idleness");
-    if (resident)
+    if (counted != noCount)
       ++counts[counted];
-    const uint16_t candidate = resident && entry->state.candidate ? keeps : noCount;
     check(entry->candidateCounted == candidate, "a block with a RAM copy a reclaim may take counts under its reasons");
     if (candidate != noCount)
       ++candidates[candidate];
     if (entry->parent) {
-      std::array<uint32_t, kKeeps + 1> &parent = withReason[entry->parent];
+      Children &parent = withReason[entry->parent];
       for (size_t each = 0; each < kKeeps; ++each)
-        parent[each] += (keeps & keepBit(static_cast<Keep>(each))) ? 1 : 0;
-      parent[kKeeps] += needed ? 1 : 0;
+        parent.keeps[each] += (keeps & keepBit(static_cast<Keep>(each))) ? 1 : 0;
+      parent.needed += needed ? 1 : 0;
     }
   }
   check(counts == keepCounts_, "the counts of resident blocks by form, reasons and idleness");

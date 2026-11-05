@@ -516,6 +516,23 @@ private:
     return static_cast<uint16_t>((static_cast<unsigned>(form) << (kKeeps + 1)) | (unsigned{keeps} << 1) |
                                  (idle ? 1u : 0u));
   }
+  // The one rule of a block's reasons to stay (Keep), from its fields, the
+  // counts of its children with each reason and of those below which a
+  // state needs its KV: the reasons at it (keepsHere); those at it or below
+  // it, the chain reasons only up to a page a request holds (keeps);
+  // whether a state that needs its KV sits at it or below (needed); and
+  // where a resident block counts in keepCounts_ (counted) and, with a RAM
+  // copy a reclaim may take, in candidateCounts_ (candidate), noCount for
+  // none. rekeep keeps the block by it, and checkInvariants recounts by it.
+  struct Reasons final {
+    Keeps here = 0;
+    Keeps keeps = 0;
+    bool needed = false;
+    uint16_t counted = noCount;
+    uint16_t candidate = noCount;
+  };
+  [[nodiscard]] Reasons reasons(const Block &entry, const std::array<uint32_t, kKeeps> &children,
+                                uint32_t neededChildren) const noexcept;
 
   // The orders a block waits in, as its fields stand: of the resident
   // leaves, that of its kind (leafOrder).
