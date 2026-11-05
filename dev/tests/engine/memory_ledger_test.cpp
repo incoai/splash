@@ -401,6 +401,22 @@ void testNestedScopesRestore() {
   ledger.close(above);
 }
 
+// A claim's id names it alone for the ledger's life: ids only grow, and are 64 bits wide, so a
+// long-running server never wraps onto a claim still open.
+void testClaimIdsNeverRepeat() {
+  require(std::numeric_limits<decltype(ClaimId::value)>::digits == 64, "claim ids are narrower than 64 bits");
+  MemoryLedger ledger;
+  const ClaimId kept = ledger.open(request(1, RequestPriority::Normal));
+  ClaimId last = kept;
+  for (int round = 0; round < 1000; ++round) {
+    const ClaimId next = ledger.open(request(2, RequestPriority::Normal));
+    require(next && next.value > last.value && !(next == kept), "a claim took an id given before");
+    ledger.close(next);
+    last = next;
+  }
+  require(ledger.claims().size() == 1 && ledger.claims().contains(kept.value), "the open claim lost its id");
+}
+
 // KV pages a waiting claim lacks are held, by form, against the claims ranked below it.
 void testHeldPagesFollowRank() {
   MemoryLedger ledger;
@@ -2244,6 +2260,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testWaitingClaimHoldsRoomForItsRank", testWaitingClaimHoldsRoomForItsRank},
       {"testShortClaimHoldsNothing", testShortClaimHoldsNothing},
       {"testNestedScopesRestore", testNestedScopesRestore},
+      {"testClaimIdsNeverRepeat", testClaimIdsNeverRepeat},
       {"testHeldPagesFollowRank", testHeldPagesFollowRank},
       {"testWaitingBytesHoldPagesOfEachForm", testWaitingBytesHoldPagesOfEachForm},
       {"testAMetNeedKeepsTheWaitAShortOneEndsIt", testAMetNeedKeepsTheWaitAShortOneEndsIt},

@@ -151,8 +151,6 @@ void MemoryLedger::setDecisionLog(std::function<void(std::string_view)> log) { l
 
 ClaimId MemoryLedger::open(const ClaimSpec &spec) {
   const ClaimId id{nextClaim_++};
-  if (!nextClaim_)
-    nextClaim_ = 1;
   claims_.emplace(id.value, ClaimState{.spec = spec});
   return id;
 }
@@ -186,7 +184,7 @@ void MemoryLedger::close(ClaimId claim) noexcept { claims_.erase(claim.value); }
 
 const ClaimState &MemoryLedger::claim(ClaimId claim) const { return claims_.at(claim.value); }
 
-uint64_t MemoryLedger::heldByClaims(const ClaimRank &rank, std::optional<uint32_t> self) const noexcept {
+uint64_t MemoryLedger::heldByClaims(const ClaimRank &rank, std::optional<uint64_t> self) const noexcept {
   uint64_t held = 0;
   for (const auto &[id, state] : claims_)
     if (state.waiting && (!self || id != *self) && state.spec.rank > rank)
@@ -194,7 +192,7 @@ uint64_t MemoryLedger::heldByClaims(const ClaimRank &rank, std::optional<uint32_
   return held;
 }
 
-uint64_t MemoryLedger::heldFor(const ClaimSpec &spec, std::optional<uint32_t> self) const noexcept {
+uint64_t MemoryLedger::heldFor(const ClaimSpec &spec, std::optional<uint64_t> self) const noexcept {
   // The host's claim is for memory the host lacks, which no room under the
   // engine's limit returns: nothing held there stands against it.
   if (spec.cls == ClaimClass::Host)
@@ -566,7 +564,7 @@ uint64_t MemoryLedger::takeUnsized(const VictimQuery &query) {
 // place keeps them). A claim that can wait, short only by the room waiting
 // claims ranked above it hold, waits as their holds end.
 FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBytes, bool critical, bool exempts) {
-  const uint32_t id = claimId.value;
+  const uint64_t id = claimId.value;
   ClaimState &claim = claims_.at(id);
   const ClaimSpec &spec = claim.spec;
   const VictimQuery query{.rights = takeRights(spec, need, critical, lanePriority_), .need = need};

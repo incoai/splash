@@ -99,8 +99,9 @@ struct ClaimSpec final {
   bool laneNeeds = false;
 };
 
+// Claims take ids from 1 up, never again: 64 bits never run out.
 struct ClaimId final {
-  uint32_t value = 0;
+  uint64_t value = 0;
   explicit operator bool() const noexcept { return value != 0; }
   friend bool operator==(ClaimId, ClaimId) = default;
 };
@@ -373,7 +374,7 @@ public:
   void close(ClaimId claim) noexcept;
   [[nodiscard]] const ClaimState &claim(ClaimId claim) const;
   // Every open claim by its id, for the checks of the ledger's relations.
-  [[nodiscard]] const std::map<uint32_t, ClaimState> &claims() const noexcept { return claims_; }
+  [[nodiscard]] const std::map<uint64_t, ClaimState> &claims() const noexcept { return claims_; }
   // What admission holds against an allocation in `claim`'s scope: waiting
   // claims ranked above it, and for a Growth claim the lanes' projected
   // growth.
@@ -429,9 +430,9 @@ private:
   class Order;
 
   // The needs of waiting claims ranked above `rank`.
-  [[nodiscard]] uint64_t heldByClaims(const ClaimRank &rank, std::optional<uint32_t> self) const noexcept;
+  [[nodiscard]] uint64_t heldByClaims(const ClaimRank &rank, std::optional<uint64_t> self) const noexcept;
   // What admission holds against `spec`'s claim (heldBytes).
-  [[nodiscard]] uint64_t heldFor(const ClaimSpec &spec, std::optional<uint32_t> self) const noexcept;
+  [[nodiscard]] uint64_t heldFor(const ClaimSpec &spec, std::optional<uint64_t> self) const noexcept;
   // Whether the pools hold off growing (grow): a request's claim waits for
   // memory, or its request to retry what the host refused it, and takes the
   // memory that appears. A claim of no request never holds it (requests
@@ -456,8 +457,8 @@ private:
 
   std::vector<Account> accounts_;
   std::vector<VictimSource *> sources_;
-  std::map<uint32_t, ClaimState> claims_;
-  uint32_t nextClaim_ = 1;
+  std::map<uint64_t, ClaimState> claims_;
+  uint64_t nextClaim_ = 1;
   std::function<Returning()> returning_;
   std::function<Returning(std::span<const uint64_t>)> returningFor_;
   std::function<uint64_t(uint32_t, bool)> bufferBytes_;
