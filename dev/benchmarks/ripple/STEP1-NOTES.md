@@ -225,3 +225,35 @@ engine's Runtime and through a CPU reference of the block graph, the logits
 compared. The Runtime's setup (the states, the KV pages, the scheduler) is
 the oracle test's infrastructure, whose Ripple case needs the tiny model's
 fixture and the family's oracle tokens.
+
+## The parity gate and what it caught
+
+The parity harness (ripple-parity) prefills the tiny model through the
+engine's real machinery — the loaded weights, the prefill arena, a paged
+K/V page, the target's dispatches and the head — and compares all four
+positions' logits with an fp64 reference that reads the fixture's GGUF
+itself and runs the pinned block graph. The gate is the pipeline's
+accumulated bf16 rounding, measured at about half a percent of a row's
+largest logit; the bound is 0.008 of the scale plus a floor. The worst
+delta measured: 0.71 on logits of magnitude 50-90.
+
+It caught two defects the per-kernel tests had missed:
+
+- The window's off-by-one. The port's SWA masks at p1 - p0 >= n_swa
+  (llama-hparams.h is_masked_swa, STANDARD), so a row attends the last
+  n_swa keys including its own — 1023 keys before it for Ripple's sliding
+  window of 1024. The kernels bake the keys before a row, and were
+  compiled with 1024. The prefill and verify split and reduce kernels and
+  the compiled entry now hold 1023. The draft's kernels take the window as
+  the total (draft.metal's row_start is query_position - (Window - 1)), so
+  the draft's 4096 is right as it is.
+- The geometry's q/k/v prepare and output-gate kernels were never
+  instantiated: the variants test exercised only the smaller geometry's
+  prepare, and the compiled entry had folded the window into its suffix,
+  which the prepare's name does not take. The suffix is the bare geometry;
+  splitSuffix builds the windowed split and reduce names.
+
+withPrefillArena hands its caller the whole prefill buffer set (the ANE
+FFN's timing and preparation take it apart as before), which the harness
+uses to reach the arena's RoPE tables, hidden ring and attention scratch
+without the Runtime.
