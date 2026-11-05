@@ -240,7 +240,8 @@ std::optional<SizeDifference> sizeDifference(NSDictionary *text, const QwenHybri
       {"hidden_size", target.hiddenSize},
       {"num_hidden_layers", target.layers},
       {"vocab_size", target.vocabularySize},
-      {"max_position_embeddings", target.nativeContextTokens},
+      {"max_position_embeddings",
+       target.configNativeContextTokens ? target.configNativeContextTokens : target.nativeContextTokens},
       {"num_attention_heads", target.attentionQueryHeads},
       {"num_key_value_heads", target.attentionKvHeads},
       {"head_dim", target.attentionHeadDimension}};
@@ -322,10 +323,10 @@ void requireWholes(NSArray *values, std::span<const uint32_t> expected, std::str
 }
 
 // The layers of `mask` among `layers`, a bit each, in order.
-std::vector<uint32_t> layersOf(uint64_t mask, uint32_t layers) {
+std::vector<uint32_t> layersOf(const kv::LayerMask &mask, uint32_t layers) {
   std::vector<uint32_t> result;
-  for (uint32_t layer = 0; layer < layers && layer < 64; ++layer)
-    if (mask >> layer & 1) result.push_back(layer);
+  for (uint32_t layer = 0; layer < layers; ++layer)
+    if (mask.test(layer)) result.push_back(layer);
   return result;
 }
 

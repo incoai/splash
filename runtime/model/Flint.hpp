@@ -36,10 +36,16 @@ namespace splash::model {
 // Flint's sliding layers, a bit per layer (every layer attends): those from
 // layer 2 to 47 but every fourth from layer 5 (5, 9, ..., 45), which with
 // layers 0, 1 and 48 attend every key, without RoPE.
-inline constexpr uint64_t kFlintSlidingLayers = [] {
-  uint64_t layers = 0;
+inline constexpr kv::LayerMask kFlintSlidingLayers = [] {
+  kv::LayerMask layers;
   for (uint32_t layer = 2; layer < 48; ++layer)
-    if (layer % 4 != 1) layers |= uint64_t{1} << layer;
+    if (layer % 4 != 1) layers.set(layer, true);
+  return layers;
+}();
+inline constexpr kv::LayerMask kFlintUnrotatedLayers = [] {
+  kv::LayerMask layers;
+  for (uint32_t layer = 0; layer < 49; ++layer)
+    if (!kFlintSlidingLayers.test(layer)) layers.set(layer, true);
   return layers;
 }();
 
@@ -68,7 +74,7 @@ struct FlintLayout final : QwenHybridLayout {
                           .rotaryTheta = 10'000.0F,
                           .slidingWindow = 513,
                           .slidingLayers = kFlintSlidingLayers,
-                          .unrotatedLayers = ~kFlintSlidingLayers & ((uint64_t{1} << 49) - 1),
+                          .unrotatedLayers = kFlintUnrotatedLayers,
                           .fullAttentionPeriod = 1,
                           .firstDraftMaskToken = 150019,
                           .lastDraftMaskToken = 150143,

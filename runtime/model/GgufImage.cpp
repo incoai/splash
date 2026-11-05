@@ -597,11 +597,11 @@ struct FlintGguf final {
   static void arrays(const GgufFile &file, const QwenTargetDimensions &g) {
     const std::string arch(architecture);
     std::string mismatched;
-    const auto pattern = [&](const char *key, uint64_t mask) {
+    const auto pattern = [&](const char *key, const kv::LayerMask &mask) {
       const auto values = file.numericArray(arch + "." + key);
       bool matches = values && values->size() == g.layers;
       for (uint32_t layer = 0; matches && layer < g.layers; ++layer)
-        matches = (*values)[layer] == double(layer < 64 && (mask >> layer & 1));
+        matches = (*values)[layer] == double(mask.test(layer));
       if (!matches) mismatched += (mismatched.empty() ? "" : ", ") + std::string(key);
     };
     // Every layer attends: a layer's bit is its attention layer's.
@@ -629,9 +629,49 @@ struct FlintGguf final {
 // Calls `use` with what the GGUFs of `architecture` hold: Qwen3.8-Flash-Next's
 // (Qwen4ExpGguf), Flint's (FlintGguf), or else the Qwen3.5 hybrid's
 // (HybridGguf).
+// Ripple's GGUFs (ricursive): the hybrid's mixer and FFN sections with a
+// norm after each FFN, the packed q holding the gate rows as the Qwen3.5's
+// own do, a value-residual lambda a block, and the 4+1 sliding pattern the
+// layout holds and the file's array states. Its planner is to land; the
+// metadata the installer checks and the arrays the planner reads are here.
+struct RippleGguf final {
+  static constexpr std::string_view architecture = "ricursive";
+
+  template <class Expect, class ExpectFloat>
+  static void metadata(const Expect &expect, const ExpectFloat &expectFloat, const QwenTargetDimensions &g) {
+    expect("attention.sliding_window", g.slidingWindow);
+    expectFloat("embedding_scale", g.embeddingScale);
+    expectFloat("swiglu_clamp", g.swigluClamp);
+  }
+
+  // The layer patterns the installer's copy of the scalar metadata leaves
+  // out: each layer's sliding window. One error names every mismatch.
+  static void arrays(const GgufFile &file, const QwenTargetDimensions &g) {
+    const std::string arch(architecture);
+    const auto values = file.numericArray(arch + ".attention.sliding_window_pattern");
+    bool matches = values && values->size() == g.layers;
+    for (uint32_t layer = 0; matches && layer < g.layers; ++layer)
+      matches = (*values)[layer] == double(g.slidingLayers.test(layer));
+    if (!matches)
+      throw GgufError("GGUF metadata does not match the target: attention.sliding_window_pattern");
+  }
+
+  static void layer(Builder &, const QwenTargetDimensions &, uint32_t) {
+    throw GgufError("the ricursive GGUF planner is not in this build");
+  }
+
+  static void head(Builder &, const QwenTargetDimensions &) {
+    throw GgufError("the ricursive GGUF planner is not in this build");
+  }
+
+  static void tables(const GgufFile &, const QwenTargetDimensions &, PlanOptions, std::vector<std::string> &,
+                     std::vector<Image> &) {}
+};
+
 template <class Use> decltype(auto) withFamily(std::string_view architecture, Use &&use) {
   if (architecture == Qwen4ExpGguf::architecture) return use(Qwen4ExpGguf{});
   if (architecture == FlintGguf::architecture) return use(FlintGguf{});
+  if (architecture == RippleGguf::architecture) return use(RippleGguf{});
   return use(HybridGguf{});
 }
 

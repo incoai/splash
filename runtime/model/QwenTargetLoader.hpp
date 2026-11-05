@@ -159,8 +159,8 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
            layout.attentionHeadDimension, layout.rotaryPairs, layout.fullAttentionPeriod))
     throw WeightStoreError("Qwen target layout contains a zero dimension");
   const uint32_t kvWidth = 2 * layout.attentionKvHeads * layout.attentionHeadDimension;
-  const auto attentionMask = [&](uint64_t mask) {
-    return layout.attentionLayerCount() >= 64 || !(mask >> layout.attentionLayerCount());
+  const auto attentionMask = [&](const kv::LayerMask &mask) {
+    return mask.above(layout.attentionLayerCount());
   };
   if (routingInconsistent ||
       (gdn ? layout.gdnValueHeads % layout.gdnKeyHeads ||

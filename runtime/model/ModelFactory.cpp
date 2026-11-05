@@ -59,6 +59,10 @@ TargetWeights readTarget(metal::MetalBackend &backend, const FlintLayout &layout
   return loadFlintWeights(backend, layout, files);
 }
 
+TargetWeights readTarget(metal::MetalBackend &backend, const RippleLayout &layout, const QwenTargetFiles &files) {
+  return loadRippleWeights(backend, layout, files);
+}
+
 } // namespace
 
 SparseRowStoreOptions streamedTableRows(const Qwen3_8Layout &) { return {}; }
@@ -66,6 +70,8 @@ SparseRowStoreOptions streamedTableRows(const Qwen3_8Layout &) { return {}; }
 SparseRowStoreOptions streamedTableRows(const Qwen3_6MoeLayout &) { return {}; }
 
 SparseRowStoreOptions streamedTableRows(const FlintLayout &) { return {}; }
+
+SparseRowStoreOptions streamedTableRows(const RippleLayout &) { return {}; }
 
 StreamedParts StreamedParts::loaded(const LoadedModel &model, bool kv) noexcept {
   const SparseRowStore *table = model.streamedTable();

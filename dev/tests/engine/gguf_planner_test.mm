@@ -815,8 +815,8 @@ model::QwenTargetDimensions flintGeometry() {
   g.rotaryPairs = 64;
   g.rotaryTheta = 1e4F;
   g.slidingWindow = 33;
-  g.slidingLayers = 0b0110;
-  g.unrotatedLayers = 0b1001;
+  g.slidingLayers = splash::kv::LayerMask{0b0110};
+  g.unrotatedLayers = splash::kv::LayerMask{0b1001};
   g.fullAttentionPeriod = 1;
   g.ffnKind = model::QwenFfnKind::SparseMoe;
   g.intermediateSize = 256;

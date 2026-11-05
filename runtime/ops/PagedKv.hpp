@@ -143,6 +143,46 @@ namespace detail {
 
 // Physical KV geometry: Page32, either BF16 or per-(token, head) symmetric INT8.
 // Layer and head counts vary by target.
+// A bit per attention layer, the layers a family's window and RoPE masks
+// name: sixty-four layers in a word, Ripple's eighty in two.
+struct LayerMask final {
+  uint64_t words[2] = {};
+
+  [[nodiscard]] constexpr bool test(uint32_t layer) const noexcept {
+    return layer < 64 ? (words[0] >> layer & 1)
+                      : layer < 128 ? (words[1] >> (layer - 64) & 1) : false;
+  }
+  constexpr void set(uint32_t layer, bool value) noexcept {
+    if (layer < 64) {
+      if (value) words[0] |= uint64_t{1} << layer;
+      else words[0] &= ~(uint64_t{1} << layer);
+    } else if (layer < 128) {
+      if (value) words[1] |= uint64_t{1} << (layer - 64);
+      else words[1] &= ~(uint64_t{1} << (layer - 64));
+    }
+  }
+  [[nodiscard]] constexpr uint32_t count() const noexcept {
+    return static_cast<uint32_t>(std::popcount(words[0]) + std::popcount(words[1]));
+  }
+  // The mask's bits before `layer`.
+  [[nodiscard]] constexpr uint32_t countBelow(uint32_t layer) const noexcept {
+    if (layer <= 64)
+      return static_cast<uint32_t>(
+          std::popcount(words[0] & (layer ? (uint64_t{1} << layer) - 1 : 0)));
+    return count() - static_cast<uint32_t>(std::popcount(
+               words[1] & ((layer < 128 ? uint64_t{1} << (layer - 64) : 0) - 1)));
+  }
+  // Whether the mask holds no bit at or above `layers`.
+  [[nodiscard]] constexpr bool above(uint32_t layers) const noexcept {
+    if (layers >= 128) return true;
+    if (layers >= 64) return !(words[1] >> (layers - 64));
+    return !(words[0] >> layers) && !words[1];
+  }
+  [[nodiscard]] constexpr bool empty() const noexcept { return !(words[0] | words[1]); }
+  [[nodiscard]] constexpr LayerMask operator~() const noexcept { return {~words[0], ~words[1]}; }
+  bool operator==(const LayerMask &) const = default;
+};
+
 struct Layout final {
   uint32_t attentionLayers = 0;
   uint32_t kvHeads = 0;
@@ -166,24 +206,22 @@ struct Layout final {
   // to p. windowedLayers holds a bit for each windowed attention layer, bit l
   // for the l-th; both are zero for a layout without a window.
   uint32_t windowTokens = 0;
-  uint64_t windowedLayers = 0;
+  LayerMask windowedLayers{};
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     return attentionLayers && kvHeads && headDimension && validFormat(format) &&
-           !windowTokens == !windowedLayers &&
-           (attentionLayers >= 64 || !(windowedLayers >> attentionLayers));
+           (!windowTokens) == windowedLayers.empty() && windowedLayers.above(attentionLayers);
   }
   [[nodiscard]] constexpr bool windowed(uint32_t layer) const noexcept {
-    return layer < 64 && (windowedLayers >> layer & 1);
+    return windowedLayers.test(layer);
   }
   // Where a layer's K/V region sits among a page's: the layers no window
   // bounds first, then the windowed ones, each in layer order, so that what
   // a row reads of a page every window has passed lies in its first
   // regions. Without a window a layer's region is the layer itself.
   [[nodiscard]] constexpr uint32_t region(uint32_t layer) const noexcept {
-    const uint64_t below = layer < 64 ? windowedLayers & ((uint64_t{1} << layer) - 1) : windowedLayers;
-    const auto windowedBelow = static_cast<uint32_t>(std::popcount(below));
-    const auto unwindowed = attentionLayers - static_cast<uint32_t>(std::popcount(windowedLayers));
+    const auto windowedBelow = windowedLayers.countBelow(layer);
+    const auto unwindowed = attentionLayers - windowedLayers.count();
     return windowed(layer) ? unwindowed + windowedBelow : layer - windowedBelow;
   }
   // The K/V regions a page of the form holds, the first ones of a Full
@@ -192,7 +230,7 @@ struct Layout final {
   [[nodiscard]] constexpr uint32_t regions(PageForm form) const noexcept {
     switch (form) {
     case PageForm::Full: return attentionLayers;
-    case PageForm::Slim: return attentionLayers - static_cast<uint32_t>(std::popcount(windowedLayers));
+    case PageForm::Slim: return attentionLayers - windowedLayers.count();
     case PageForm::Index: return 0;
     }
     return 0;
@@ -251,7 +289,7 @@ struct Layout final {
   // slots hold a page's spans in order (kv::SlotFormat version 0), of which
   // a Slim page's are the first; the block records of a spillable layout's
   // slots hold every layer's.
-  [[nodiscard]] constexpr bool slimmable() const noexcept { return windowedLayers && !spillable(); }
+  [[nodiscard]] constexpr bool slimmable() const noexcept { return !windowedLayers.empty() && !spillable(); }
 
   // An extent holds a whole number of these pages, so that every tensor
   // region starts 64 KiB-aligned. The INT8 scales are the tightest

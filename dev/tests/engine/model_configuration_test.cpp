@@ -882,7 +882,7 @@ void testFlint(const std::filesystem::path &fixtures) {
   // Its 35 sliding layers read a window of the 512 keys before a row's, its
   // 14 others every key, the 49 attention layers' K/V in one page.
   require(descriptor.targetKvLayout.attentionLayers == 49 && descriptor.targetKvLayout.windowTokens == 512 &&
-              std::popcount(descriptor.targetKvLayout.windowedLayers) == 35 && !descriptor.stateLayout.target.layers,
+              descriptor.targetKvLayout.windowedLayers.count() == 35 && !descriptor.stateLayout.target.layers,
           "Flint's KV and state layouts are not its layers'");
   const auto masked = [&](uint32_t token) {
     return flint.with(&SourceModel::draft, R"("mask_token_id": 150019)",

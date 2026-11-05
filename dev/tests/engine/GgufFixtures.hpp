@@ -565,8 +565,8 @@ inline std::vector<test_gguf::Key> metadata(const model::QwenTargetDimensions &g
     keys.push_back(test_gguf::float32Key(arch + ".expert_weights_scale", 1.0F));
     std::vector<bool> sliding, rotated;
     for (uint32_t layer = 0; layer < g.layers; ++layer) {
-      sliding.push_back(g.slidingLayers >> layer & 1);
-      rotated.push_back(!(g.unrotatedLayers >> layer & 1));
+      sliding.push_back(g.slidingLayers.test(layer));
+      rotated.push_back(!g.unrotatedLayers.test(layer));
     }
     keys.push_back(test_gguf::boolArrayKey(arch + ".attention.sliding_window_pattern", sliding));
     keys.push_back(test_gguf::boolArrayKey(arch + ".attention.rope_pattern", rotated));

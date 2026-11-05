@@ -531,8 +531,8 @@ void testPersistentCacheNamespace() {
   RuntimeCacheIdentity windowed = dense, otherWindow = dense, otherLayers = dense;
   windowed.kvLayout.windowTokens = otherLayers.kvLayout.windowTokens = 512;
   otherWindow.kvLayout.windowTokens = 1024;
-  windowed.kvLayout.windowedLayers = otherWindow.kvLayout.windowedLayers = 0b1100;
-  otherLayers.kvLayout.windowedLayers = 0b0110;
+  windowed.kvLayout.windowedLayers = otherWindow.kvLayout.windowedLayers = splash::kv::LayerMask{0b1100};
+  otherLayers.kvLayout.windowedLayers = splash::kv::LayerMask{0b0110};
   const std::string windowName = persistentCacheNamespace(windowed, model.stateLayout);
   require(windowName != name && persistentCacheNamespace(otherWindow, model.stateLayout) != windowName &&
               persistentCacheNamespace(otherLayers, model.stateLayout) != windowName,

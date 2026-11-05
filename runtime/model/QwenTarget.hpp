@@ -154,7 +154,7 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   // the RoPE of the target's pairs unless unrotatedLayers names it, and over
   // the window of kvLayout where that names it.
   [[nodiscard]] constexpr ops::AttentionVariant attentionVariant(uint32_t attention) const noexcept {
-    return {.rotated = attention >= 64 || !(unrotatedLayers >> attention & 1),
+    return {.rotated = !unrotatedLayers.test(attention),
             .windowTokens = kvLayout.windowed(attention) ? kvLayout.windowTokens : 0};
   }
   [[nodiscard]] constexpr std::span<const uint32_t>
