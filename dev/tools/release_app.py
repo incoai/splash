@@ -83,7 +83,7 @@ def parse_args(argv=None):
         "--notes",
         required=True,
         type=Path,
-        help="the release notes, in Markdown, outside the checkout (RELEASE_NOTES)",
+        help="the release notes, in Markdown (RELEASE_NOTES)",
     )
     parser.add_argument(
         "--sign",

@@ -35,10 +35,10 @@ dmg: install-environment all
 # NOTARY_PROFILE, a notarytool keychain profile, or NOTARY_KEY, an App Store
 # Connect API key's file, with NOTARY_KEY_ID and NOTARY_ISSUER, and stapled;
 # the command line's files package and package-bottle leave in dist/; the
-# appcast, with RELEASE_NOTES, a Markdown file outside the checkout, signed
-# with the release key from the login keychain or SPARKLE_KEY_FILE; and the
-# tap's formula and cask. DRY_RUN=1 signs ad hoc, prints what needs the
-# Developer ID or the notary service instead of running it, and writes
+# appcast, with RELEASE_NOTES, a Markdown file, signed with the release key
+# from the login keychain or SPARKLE_KEY_FILE; and the tap's formula and cask.
+# DRY_RUN=1 signs ad hoc, prints what needs the Developer ID or the notary
+# service instead of running it, and writes
 # dist/release/RELEASE_VERSION-dry-run.
 NOTARY_PROFILE ?=
 NOTARY_KEY ?=
