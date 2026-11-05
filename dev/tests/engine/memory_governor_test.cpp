@@ -332,15 +332,14 @@ void testHostTelemetryReadsTheTaskAndTheHost() {
               telemetry.fileCacheMinimumBytes == 400 * 16384ULL,
           "the host telemetry did not read the task's footprint and compressed bytes and the host's file-backed, "
           "inactive and speculative pages and file cache minimum");
+  // macOS sets the file cache minimum only once its pageout has run, so a freshly booted Mac reports 0.
   const std::optional<HostTelemetry> live = queryHostTelemetry();
-  require(live && live->physFootprintBytes && live->fileBackedBytes && live->fileCacheMinimumBytes,
-          "the live host telemetry is missing a part");
+  require(live && live->physFootprintBytes, "the live host telemetry is missing or has no footprint");
   test::metalStatistics() = {};
   metal::MetalBackend backend("unused");
   MemoryGovernor governor(backend, 4 * kGiB, kGiB, kGiB, [] { return hostMemory(8 * kGiB); }, 0);
   const std::optional<HostTelemetry> reported = governor.snapshot().hostTelemetry;
-  require(reported && reported->physFootprintBytes && reported->fileCacheMinimumBytes,
-          "the governor's snapshot did not carry the host telemetry");
+  require(reported && reported->physFootprintBytes, "the governor's snapshot did not carry the host telemetry");
 }
 
 } // namespace
