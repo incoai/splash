@@ -307,3 +307,119 @@ QUANT_FORMATS(GGUF_PREFILL_LEADING_INPUTS)
 #undef GGUF_SEGMENT_OF
 #undef GGUF_SEGMENTS
 #undef GGUF_SEGMENT
+
+// ---------------- int8-activation PQ2_0 decode tile (splash serve --decode-int8; ops/LinearGguf.cpp pq2W8Tile).
+// Rows = the plan's tile height: 8, or 16 for two lanes. Per simdgroup 32 columns, K = 32 steps, one int8 stage of
+// (q - 1) in {-1, 0, 1} built from the chunk words with shifts, masks and a bytewise bias: ((w >> 2e) & 0x03030303) +
+// 0x7F7F7F7F, then ^ 0x80808080 (bytes 0x7F..0x82, no carries). The activations are int8 rows in the matching order
+// (gguf_pq2w8_position) from gguf_rotate_a8. One K=32 int8 x int8 matmul2d per step accumulates in int32 over the
+// fold (FoldSteps = 4 steps, one PQ2_0 block of 128 inputs), |acc| <= 128 x 2 x 127, exact; then fa += float(acc) x
+// d[column] x a_scale[row][block]. fp32 partials and the split reduction as the staged tile; partitions walk in
+// lockstep.
+template <GgufEpilogue Ep, ushort FoldSteps, ushort Rows, class Out>
+inline void pq2w8_tile(device int8_t *x8, device const float *ascale, device uchar *w0, device uchar *meta,
+                       device Out *output, device coherent(device) float *partials, device atomic_uint *counter,
+                       device bfloat *aux, uint K, uint ablock, uint splits, uint split, uint out_stride, uint column0,
+                       uint origin, threadgroup int8_t *bst, threadgroup float *sx, uint lane, uint thread_index,
+                       threadgroup uint *arrival) {
+  constexpr ushort Cols = 32, KS = 32, CAP = 2 * Rows;
+  typedef FmtPQ20 F;
+  auto bt = tensor<threadgroup int8_t, dextents<int, 2>, tensor_inline>(bst, dextents<int, 2>{KS, Cols}, array<int, 2>{1, KS});
+  auto at = tensor<device int8_t, dextents<int, 2>, tensor_inline>(x8, dextents<int, 2>{int(K), Rows}, array<int, 2>{1, int(K)});
+  constexpr auto d32 = matmul2d_descriptor(Rows, Cols, KS, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<d32, execution_simdgroups<1>> op;
+  auto bs = bt.template slice<KS, Cols>(0, 0);
+  auto a0 = at.template slice<KS, Rows>(0, 0);
+  auto acc = op.template get_destination_cooperative_tensor<decltype(a0), decltype(bs), int>();
+  float fa[CAP]; ushort er[CAP], ec[CAP]; bool ev[CAP];
+#pragma unroll
+  for (ushort i = 0; i < CAP; ++i) {
+    fa[i] = 0.0f; er[i] = 0; ec[i] = 0; ev[i] = false;
+    if (i < acc.get_capacity()) {
+      acc[i] = 0;
+      if (acc.is_valid_element(i)) { const auto ix = acc.get_multidimensional_index(i); er[i] = ix[1]; ec[i] = ix[0]; ev[i] = true; }
+    }
+  }
+  const uint groups = K / 32, units = groups / F::MetaGroups, steps = groups / splits, s0 = split * steps, s1 = s0 + steps;
+  const uint nb = K / ablock;
+  const uint plane_tile = origin / QUANT_TILE_ROWS, plane_row = origin % QUANT_TILE_ROWS;
+  device uchar *tw0 = w0 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row + lane) * F::P0;
+  device uchar *tmeta = meta + (ulong(plane_tile) * units * QUANT_TILE_ROWS + plane_row + lane) * F::MetaBytes;
+  uint2 packed = *((device const uint2 *)(tw0 + ulong(s0) * QUANT_TILE_ROWS * F::P0));
+  threadgroup uint *dst = (threadgroup uint *)(bst + lane * KS);
+  for (uint step = s0; step < s1; ++step) {
+    if ((step & 3u) == 0)
+      sx[lane] = float(as_type<half>(*((device const ushort *)(tmeta + ulong(step >> 2) * QUANT_TILE_ROWS * F::MetaBytes))));
+#pragma unroll
+    for (ushort e = 0; e < 4; ++e) {
+      dst[e] = (((packed.x >> (2 * e)) & 0x03030303u) + 0x7F7F7F7Fu) ^ 0x80808080u;
+      dst[4 + e] = (((packed.y >> (2 * e)) & 0x03030303u) + 0x7F7F7F7Fu) ^ 0x80808080u;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (step + 1 < s1) packed = *((device const uint2 *)(tw0 + ulong(step + 1) * QUANT_TILE_ROWS * F::P0));
+    auto a_slice = at.template slice<KS, Rows>(step * KS, 0);
+    op.run(a_slice, bs, acc);
+    if ((step + 1) % FoldSteps == 0) {
+      const uint kb = (step * KS) / ablock;
+#pragma unroll
+      for (ushort i = 0; i < CAP; ++i)
+        if (i < acc.get_capacity()) { fa[i] = fma(float(acc[i]), sx[ec[i]] * ascale[er[i] * nb + kb], fa[i]); acc[i] = 0; }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (splits == 1) {
+#pragma unroll
+    for (ushort i = 0; i < CAP; ++i)
+      if (ev[i]) { const ulong o = ulong(er[i]) * out_stride + column0 + ec[i]; output[o] = gguf_epilogue<Ep, Out>(fa[i], aux, o); }
+    return;
+  }
+  const auto at_p = [&](uint s, uint row, uint column) { return (ulong(s) * Rows + row) * out_stride + column0 + column; };
+#pragma unroll
+  for (ushort i = 0; i < CAP; ++i) if (ev[i]) partials[at_p(split, er[i], ec[i])] = fa[i];
+  if (!split_arrive_last(counter, splits, thread_index, arrival)) return;
+#pragma unroll
+  for (ushort i = 0; i < CAP; ++i)
+    if (ev[i]) {
+      const ulong o = ulong(er[i]) * out_stride + column0 + ec[i];
+      const float v = split_sum(fa[i], split, splits, [&](uint s) { return partials[at_p(s, er[i], ec[i])]; });
+      output[o] = gguf_epilogue<Ep, Out>(v, aux, o);
+    }
+  split_release(counter, thread_index);
+}
+// Grid (column tiles of every segment, K partitions), two simdgroups; up to three PQ2_0 segments (fused input
+// projections; one segment with an epilogue). The scales follow the Rows int8 rows.
+template <GgufEpilogue Ep, ushort FoldSteps, ushort Rows, class Out>
+kernel void gguf_pq2w8(device uchar *a8 [[buffer(0)]], device uchar *w0a [[buffer(1)]], device uchar *ma [[buffer(2)]],
+                       device uchar *w0b [[buffer(3)]], device uchar *mb [[buffer(4)]], device uchar *w0c [[buffer(5)]],
+                       device uchar *mc [[buffer(6)]], device Out *output [[buffer(7)]],
+                       device coherent(device) float *partials [[buffer(8)]], device atomic_uint *counters [[buffer(9)]],
+                       device bfloat *aux [[buffer(10)]], constant GgufPq2W8Params &p [[buffer(11)]],
+                       uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+                       uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup int8_t stage[2 * 32 * 32];
+  threadgroup float sx[2 * 32];
+  threadgroup uint arrival;
+  const uint t0 = p.cols[0] / GGUF_TILE_COLUMNS, t1 = t0 + p.cols[1] / GGUF_TILE_COLUMNS;
+  const uint s = group.x < t0 ? 0 : group.x < t1 ? 1 : 2;
+  device uchar *w0 = s == 0 ? w0a : s == 1 ? w0b : w0c;
+  device uchar *meta = s == 0 ? ma : s == 1 ? mb : mc;
+  const uint local = group.x - (s == 0 ? 0 : s == 1 ? t0 : t1);
+  const uint origin = local * GGUF_TILE_COLUMNS + sg * GGUF_STAGED_COLUMNS, column0 = p.offset[s] + origin;
+  device uchar *x8 = a8 + p.a8_offset;
+  pq2w8_tile<Ep, FoldSteps, Rows, Out>((device int8_t *)x8, (device const float *)(x8 + ulong(Rows) * p.input_size), w0,
+                                       meta, output, partials, counters + p.offset[s] / GGUF_TILE_COLUMNS + local, aux,
+                                       p.input_size, p.ablock, p.splits, group.y, p.out_stride, column0, origin,
+                                       stage + sg * 1024, sx + sg * 32, lane, sg * 32 + lane, &arrival);
+}
+template <class Out>
+using GgufPq2W8Kernel = void(device uchar *, device uchar *, device uchar *, device uchar *, device uchar *, device uchar *,
+                             device uchar *, device Out *, device coherent(device) float *, device atomic_uint *,
+                             device bfloat *, constant GgufPq2W8Params &, uint2, uint, uint);
+#define GGUF_PQ2W8(name, R, ep, Ep, Fold, Out) \
+  template [[host_name(name #R "_" #ep)]] kernel GgufPq2W8Kernel<Out> gguf_pq2w8<Ep, Fold, R, Out>;
+#define GGUF_PQ2W8_ROWS(R)                                                                                            \
+  GGUF_PQ2W8("gguf_pq2w8_m", R, a, EpNone, 4, bfloat) GGUF_PQ2W8("gguf_pq2w8_m", R, r, EpResidual, 4, bfloat)       \
+  GGUF_PQ2W8("gguf_pq2w8_m", R, g, EpUpWithGate, 4, bfloat) GGUF_PQ2W8("gguf_pq2w8_m", R, a_f32, EpNone, 4, float)
+GGUF_PQ2W8_ROWS(8) GGUF_PQ2W8_ROWS(16)
+#undef GGUF_PQ2W8_ROWS
+#undef GGUF_PQ2W8

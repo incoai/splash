@@ -23,8 +23,8 @@ void include(Workspace &bound, const Workspace &required,
 
 } // namespace
 
-ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
-    : linear_(device), family_(gpuFamilyClass(device.appleGpuFamily)),
+ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, ExecutionOptions options)
+    : linear_(device, options.decodeInt8), family_(gpuFamilyClass(device.appleGpuFamily)), options_(options),
       gpuCores_(plannedGpuCores(device)) {}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(

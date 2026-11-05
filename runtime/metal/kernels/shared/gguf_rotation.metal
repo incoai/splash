@@ -77,3 +77,39 @@ kernel void gguf_embed_rotated_pq20(device const uint *tokens [[buffer(0)]], dev
     output[ulong(group.y) * p.hidden + column + j] = bfloat(values[j] * kRotationScale * float(signs[column + j]));
   }
 }
+
+// The int8 rows of the int8-activation PQ2_0 decode tile (metal/abi/Gguf.h GgufA8QuantParams; splash serve
+// --decode-int8): gguf_rotate's bf16 values H (D x), quantized per rotation block of a row with s = max |x| / 127
+// (fp32) and q = clamp(rint(x / s), -127, 127), written as int8 in the tile's stage order (gguf_pq2w8_position),
+// the scales after the p.rows int8 rows. No bf16 output. Grid (width / GGUF_ROTATION_BLOCK, rows).
+kernel void gguf_rotate_a8(device const bfloat *input [[buffer(0)]], device const char *signs [[buffer(1)]],
+                           device uchar *a8 [[buffer(2)]], constant GgufA8QuantParams &p [[buffer(3)]],
+                           uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float values[GGUF_ROTATION_BLOCK];
+  threadgroup float part[8];
+  const uint K = p.input_size, column = group.x * GGUF_ROTATION_BLOCK;
+  const ulong row = ulong(group.y) * K + column;
+  float4 v;
+  for (uint i = 0; i < 4; ++i) {
+    const uint j = tid + i * GGUF_ROTATION_THREADS;
+    v[i] = float(input[row + j]) * float(signs[column + j]);
+  }
+  rotation_butterflies(v, values, tid);
+  float4 x;
+  for (uint i = 0; i < 4; ++i) x[i] = float(bfloat(values[4 * tid + i] * kRotationScale));
+  float m = max(max(fabs(x.x), fabs(x.y)), max(fabs(x.z), fabs(x.w)));
+  m = simd_max(m);
+  if (lane == 0) part[sg] = m;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  m = part[0];
+  for (uint i = 1; i < 8; ++i) m = max(m, part[i]);
+  const float s = m / 127.0f;
+  device uchar *x8 = a8 + p.a8_offset;
+  for (uint i = 0; i < 4; ++i) {
+    const uint k = column + 4 * tid + i;
+    const float q = s > 0.0f ? clamp(rint(x[i] / s), -127.0f, 127.0f) : 0.0f;
+    x8[ulong(group.y) * K + (k & ~31u) + gguf_pq2w8_position(k & 31u)] = uchar(char(int(q)));
+  }
+  if (tid == 0) ((device float *)(x8 + ulong(p.rows) * K))[group.y * (K / GGUF_ROTATION_BLOCK) + group.x] = s;
+}

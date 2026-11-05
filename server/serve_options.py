@@ -715,6 +715,16 @@ SERVE_OPTIONS = (
         ),
     ),
     ServeOption(
+        "--decode-int8",
+        "requests",
+        dict(
+            action="store_true",
+            default=False,
+            help="on M5 and later, decode rotated PQ2_0 projections (Bonsai) in int8 "
+            "activations: faster, and outputs differ slightly (default: bf16)",
+        ),
+    ),
+    ServeOption(
         "--allow-idle-sleep",
         "requests",
         dict(

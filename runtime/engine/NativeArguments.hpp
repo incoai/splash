@@ -79,6 +79,9 @@ struct NativeArguments final {
   // --verify-rows auto|all: the rows of the draft's block a decode
   // cycle verifies (RuntimeResourcesConfig::verifyRows).
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // --decode-int8 on|off: whether Apple10 decode runs rotated PQ2_0 projections
+  // in int8 activations (ops::ExecutionOptions::decodeInt8).
+  bool decodeInt8 = false;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

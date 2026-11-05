@@ -739,6 +739,185 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
           ") within fp64, equal to the 128-row tiles");
 }
 
+// ---------------------------------------------------------------- int8-activation PQ2_0 decode
+// Linear(device, decodeInt8) (splash serve --decode-int8): on Apple10 a decode plan that stages a rotated PQ2_0
+// projection at 8 or 16 rows quantizes the rotated input to int8, one fp32 scale s = max |x| / 127 per row and
+// rotation block (gguf_rotate_a8), and runs the W-A8 tile (gguf_pq2w8_m*). Each int8 value then stands for its input
+// within s / 2, so every output must lie within the staged tile's bound of the fp64 product of the bf16 rotated rows
+// widened by the int8 term, sum over the row's blocks of s / 2 times the block's sum |w| (a8Bound), and the gate/up,
+// residual and fp32 destinations as the bf16 path's. One and two lanes, single tensors and three fused
+// segments, at K 5120 (one partition at one lane) and 17408 (two), with the plans' production scratch.
+
+// The unnormalized transform of one rotation block in fp32, stage by stage as gguf_rotate computes it.
+void rotationButterflies(float *v) {
+  for (uint32_t stride = 1; stride < GGUF_ROTATION_BLOCK; stride *= 2)
+    for (uint32_t a = 0; a < GGUF_ROTATION_BLOCK; ++a)
+      if (!(a & stride)) {
+        const float x = v[a], y = v[a + stride];
+        v[a] = x + y;
+        v[a + stride] = x - y;
+      }
+}
+// The bf16 rotated rows H (D x) / 32 the int8 rows quantize (bitwise gguf_rotate's, which gguf-rotation checks).
+std::vector<float> rotatedRows(const std::vector<float> &x, uint32_t rows, uint32_t K, const std::vector<int8_t> &signs) {
+  std::vector<float> out(uint64_t{rows} * K);
+  for (uint32_t r = 0; r < rows; ++r)
+    for (uint32_t b = 0; b < K; b += GGUF_ROTATION_BLOCK) {
+      float *v = out.data() + uint64_t{r} * K + b;
+      for (uint32_t i = 0; i < GGUF_ROTATION_BLOCK; ++i) v[i] = x[uint64_t{r} * K + b + i] * float(signs[b + i]);
+      rotationButterflies(v);
+      for (uint32_t i = 0; i < GGUF_ROTATION_BLOCK; ++i) v[i] = bf16(v[i] * (1.0f / 32.0f));
+    }
+  return out;
+}
+// The fp64 products of the rotated rows with each destination column's weights, and each one's int8 term: the
+// kernel's q = rint(x / s) is within 1/2 of x / s up to its division's rounding, so q s is within s / 2 (1 + 2^-12).
+struct A8Dots {
+  std::vector<Dot> dots;
+  std::vector<double> term;
+};
+A8Dots a8Products(const std::vector<const Tensor *> &parts, uint32_t columns, const std::vector<float> &xr,
+                  uint32_t rows) {
+  const uint32_t K = parts.front()->K, blocks = K / GGUF_ROTATION_BLOCK;
+  std::vector<double> scales(uint64_t{rows} * blocks);
+  for (uint32_t r = 0; r < rows; ++r)
+    for (uint32_t b = 0; b < blocks; ++b) {
+      float m = 0;
+      for (uint32_t i = 0; i < GGUF_ROTATION_BLOCK; ++i)
+        m = std::max(m, std::fabs(xr[uint64_t{r} * K + b * GGUF_ROTATION_BLOCK + i]));
+      scales[uint64_t{r} * blocks + b] = double(m / 127.0f) / 2 * (1 + 0x1p-12);
+    }
+  A8Dots out{products(parts, columns, xr, rows), std::vector<double>(uint64_t{rows} * columns)};
+  double *term = out.term.data();
+  const double *halfScales = scales.data();
+  uint32_t offset = 0;
+  for (const Tensor *t : parts) {
+    const Fmt f = t->format;
+    const uint8_t *native = t->native.data();
+    const uint32_t at = offset;
+    dispatch_apply(t->N, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t n) {
+      std::vector<float> w(K);
+      rowValues(f, native + n * rowBytes(f, K), K, w.data());
+      for (uint32_t b = 0; b < blocks; ++b) {
+        double sum = 0;
+        for (uint32_t i = 0; i < GGUF_ROTATION_BLOCK; ++i) sum += std::fabs(double(w[b * GGUF_ROTATION_BLOCK + i]));
+        for (uint32_t r = 0; r < rows; ++r) term[uint64_t{r} * columns + at + n] += halfScales[uint64_t{r} * blocks + b] * sum;
+      }
+    });
+    offset += t->N;
+  }
+  return out;
+}
+// A product's fp64 interval with the int8 term.
+Interval a8Bound(const Dot &d, double term) {
+  const double e = projectionBound(d, true) + term;
+  return {d.value - e, d.value + e};
+}
+
+void decodeInt8(MetalBackend &backend) {
+  if (backend.capabilities().appleGpuFamily < 10) {
+    section("int8-activation PQ2_0 decode: skipped (Apple10 only)");
+    return;
+  }
+  const Linear linear(backend.capabilities(), true);
+  uint32_t ran = 0, cases = 0;
+  double widest = 0;
+  for (const uint32_t K : {5120u, 17408u}) {
+    std::vector<int8_t> signs(K);
+    for (int8_t &s : signs) s = rng() & 1 ? 1 : -1;
+    MetalBuffer signBuffer = test::sharedBuffer(backend, K);
+    std::memcpy(signBuffer.contents(), signs.data(), K);
+    const Tensor up = tensor(backend, PQ20, 2048, K), gateTensor = tensor(backend, PQ20, 2048, K);
+    const Tensor a = tensor(backend, PQ20, 1024, K), b = tensor(backend, PQ20, 256, K), c = tensor(backend, PQ20, 256, K);
+    const std::vector<const Tensor *> single{&up}, fused{&a, &b, &c};
+    for (const bool f32 : {false, true})
+      for (const std::vector<const Tensor *> *parts : {&single, &fused})
+        for (const LinearEpilogue epilogue :
+             {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
+          for (const uint32_t lanes : {1u, 2u}) {
+            if (((parts == &fused || f32) && epilogue != LinearEpilogue::None) || (f32 && parts == &fused)) continue;
+            const uint32_t covered = segmentColumns(*parts), columns = covered + kPadding;
+            Projection p = projection(*parts, columns);
+            p.rotation.signs = signBuffer;
+            if (f32) p.destination = FloatOutput::Float32;
+            Projection gate = projection({&gateTensor}, gateTensor.N + kPadding);
+            gate.rotation.signs = signBuffer;
+            const Projection *gateProjection = epilogue == LinearEpilogue::GateUp ? &gate : nullptr;
+            const LinearWorkload w = decode({columns, K}, lanes, epilogue);
+            const LinearPlan plan = linear.plan(w, p, gateProjection);
+            const uint32_t rows = w.rows, storage = plan.storageRows();
+            const std::vector<float> x = activations(Inputs::Dense, rows, K);
+            const std::vector<float> auxiliary =
+                epilogue == LinearEpilogue::Residual ? residuals(storage, columns) : activations(Inputs::Dense, storage, columns);
+            const std::vector<uint16_t> aux = storageRows(auxiliary, columns, storage, storage);
+            const std::string label = std::string(parts == &fused ? "fused" : "pq2_0") + (f32 ? " fp32" : "") + " " +
+                                      epilogueName(epilogue) + " K=" + std::to_string(K) + " lanes=" +
+                                      std::to_string(lanes);
+            // The production scratch of the projection's decode plans, the rotated rows' included.
+            const LinearScratchSize size = linear.decodeScratchSize(p.shape());
+            const Guarded table(backend, size.input, 0), sums(backend, size.sums, 0), partials(backend, size.partials, 0),
+                counters(backend, size.counters, 0), rotated(backend, size.rotated, 0);
+            const Guarded input = bfloats(backend, storageRows(x, K, rows, storage)), residual = bfloats(backend, aux);
+            const Guarded output(backend, uint64_t{storage} * columns * (f32 ? 4 : 2), 0xFF),
+                gateScratch(backend, plan.gateScratchBytes(), 0xFF);
+            LinearBuffers bindings{.input = input.view,
+                                   .output = output.view,
+                                   .residual = epilogue == LinearEpilogue::Residual ? residual.view : MetalBuffer{},
+                                   .gateScratch = gateScratch.view,
+                                   .scratch = {table.view, sums.view, partials.view, counters.view, rotated.view}};
+            CommandGraph graph;
+            static_cast<void>(linear.add(graph, bindings, p, plan, gateProjection));
+            const bool int8 = std::any_of(graph.dispatches().begin(), graph.dispatches().end(), [](const ComputeDispatch &d) {
+              return d.pipelineName.starts_with("gguf_pq2w8_m");
+            });
+            ++cases;
+            if (!int8) continue;
+            ++ran;
+            static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+            const auto *count = static_cast<const uint32_t *>(counters.view.contents());
+            if (!table.intact() || !sums.intact() || !partials.intact() || !counters.intact() || !rotated.intact() ||
+                !input.intact() || !output.intact() || !gateScratch.intact() ||
+                !std::all_of(count, count + counters.bytes / 4, [](uint32_t v) { return v == 0; }))
+              fail(label + ": a counter is not reset or a write past a buffer");
+            const std::vector<float> xr = rotatedRows(x, rows, K, signs);
+            const A8Dots d = a8Products(*parts, columns, xr, rows);
+            const A8Dots g = epilogue == LinearEpilogue::GateUp ? a8Products({&gateTensor}, columns, xr, rows) : A8Dots{};
+            const std::vector<uint16_t> out = f32 ? std::vector<uint16_t>{} : output.halves();
+            const std::vector<uint16_t> gateOut = epilogue == LinearEpilogue::GateUp ? gateScratch.halves() : std::vector<uint16_t>{};
+            const auto *logits = static_cast<const float *>(output.view.contents());
+            uint64_t outside = 0;
+            for (uint32_t r = 0; r < rows; ++r)
+              for (uint32_t col = 0; col < columns; ++col) {
+                const uint64_t i = uint64_t{r} * columns + col;
+                if (col >= covered) {
+                  outside += f32 ? std::bit_cast<uint32_t>(logits[i]) != 0xFFFFFFFFu : out[i] != kUnwritten;
+                  continue;
+                }
+                const Interval want = a8Bound(d.dots[i], d.term[i]);
+                widest = std::max(widest, d.term[i] / std::max(d.dots[i].magnitude, 1e-30));
+                if (f32) {
+                  outside += !(std::isfinite(logits[i]) && logits[i] >= want.lo && logits[i] <= want.hi);
+                  continue;
+                }
+                switch (epilogue) {
+                  case LinearEpilogue::None: outside += !inside(out[i], want); break;
+                  case LinearEpilogue::Residual: outside += !inside(out[i], withResidual(want, bf16ToFloat(aux[i]))); break;
+                  case LinearEpilogue::UpWithGate: break;
+                  case LinearEpilogue::GateUp:
+                    outside += !inside(gateOut[i], a8Bound(g.dots[i], g.term[i]));
+                    outside += !inside(out[i], withGate(want, bf16ToFloat(gateOut[i])));
+                    break;
+                }
+              }
+            if (outside) fail(label + ": " + std::to_string(outside) + " values outside the int8 bound or padding written");
+          }
+  }
+  if (!ran) fail("int8-activation PQ2_0 decode: no plan ran the W-A8 tile");
+  section("int8-activation PQ2_0 decode: " + std::to_string(ran) + " of " + std::to_string(cases) +
+          " plans on the W-A8 tile (single, fused, gate/up, residual, fp32; 1-2 lanes; K 5120, 17408), "
+          "every value within fp64 plus the int8 term (at most " + std::to_string(widest) + " of sum |x w|)");
+}
+
 // ---------------------------------------------------------------- leading inputs
 // A view of the leading inputs of a projection's rows (Projection::leadingInputs), as the ANE FFN split runs down's GPU
 // share: its residual prefill (gguf_prefill_<format>_r_leading_inputs) equals bit for bit the residual prefill of
@@ -1076,6 +1255,7 @@ int main(int argc, char **argv) {
       fusedDecode(backend, linear, LinearTile::GgufStaged, true);
       for (const bool spread : {false, true}) oneGateUpPass(backend, linear, spread);
       prefill(backend, linear, 1024, tileFormats(LinearTile::GgufStaged));
+      decodeInt8(backend);
       leadingInputs(backend, linear);
       // The 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
       const SplitOperand out = splitOperand(backend, Q4K, {5120, 6144}, LinearEpilogue::Residual);

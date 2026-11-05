@@ -451,6 +451,21 @@ the M6. Prefill runs the staged kernels on both families: the 128-row prefill ti
 tile costs about as much for 33 rows as for 64; a fused projection's chunk runs its segments there in
 one dispatch, as decode does.
 
+With `splash serve --decode-int8` (`Linear`'s `decodeInt8`), Apple10 decode plans that stage a
+rotated PQ2_0 projection (Prism ML's Bonsai) at 8 or 16 rows run it in int8 activations:
+`gguf_rotate_a8` rotates the input as `gguf_rotate` does and writes each row as int8 with one fp32
+scale per rotation block of 1024 inputs (s = max |x| / 127), and the W-A8 tile
+(`gguf_pq2w8_m{8,16}_*` in `kernels/shared/gguf_linear.metal`) stages the codes as int8 (q - 1) and
+multiplies them with the rows in int8 `matmul2d`, exact in int32 over each 128-input block, then
+folds acc x d x s in fp32. The vocabulary head runs it too (`_a_f32`). One lane runs the 8-row tile
+at its own K split (two partitions past 5120 inputs, four for 16384 to 65535 columns, else one):
+the wave law prices bytes and waves, where this tile is bound by its chains' latency, and on the
+16-row tile it pays for the padding lane's int8 rows in full. On the 27B Bonsai a 12-core M6's
+decode cycle took 83.2 → 65.1 ms and a 10-core M5's 113.1 → 79.4 ms; decode-path perplexity over
+wikitext-2 rose 0.047% (145 windows of 2048 tokens, 16-core M5 Pro). The rotation spreads each
+block's values evenly, so int8 rows lose little; without it the same activations would need finer
+scales.
+
 Apple10's staged tile splits K across threadgroups, and runs a gate/up pair in one pass or two,
 by one wave law (`apple10Staged` in `runtime/ops/LinearGguf.cpp`), for decode steps and short
 prefill chunks alike: it takes the split (of at most eight partitions keeping 512 inputs each)

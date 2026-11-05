@@ -178,6 +178,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "auto" && value != "all")
         throw UsageError("--verify-rows requires auto or all");
       result.verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
+    } else if (option == "--decode-int8") {
+      if (value != "on" && value != "off")
+        throw UsageError("--decode-int8 requires on or off");
+      result.decodeInt8 = value == "on";
     } else if (option == "--relaunch-context") {
       relaunchContext = value;
     } else {
