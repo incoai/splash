@@ -207,16 +207,30 @@ def retire_other_pins(pins, replaced=()):
     """Remove the installation's pins beside pins, and beside replaced, its
     pins before these, which may be in repositories pins do not name. Call
     it only after publishing and verifying the installation these pin; other
-    installations own other folders."""
+    installations own other folders. replaced may name a cache by another
+    path than pins do, so pins are told apart as files (_file)."""
     try:
+        kept = {_file(ref) for ref in pins}
         for folder in {ref.parent for ref in (*pins, *replaced)}:
             for previous in folder.iterdir() if folder.is_dir() else ():
-                if previous not in pins and models.is_hex_digest(previous.name, 40):
+                if (
+                    models.is_hex_digest(previous.name, 40)
+                    and _file(previous) not in kept
+                ):
                     previous.unlink()
     except OSError as error:
         # Keeping an old pin uses cache space but cannot invalidate the
         # verified installation or its successfully retained current pin.
         models.warn(f"could not retire old Hub cache references: {error}")
+
+
+def _file(path):
+    """The entry at path, however the path spells it (through a symbolic link
+    to a folder, or in another case on a case-insensitive volume): its device
+    and inode. A symbolic link at path is itself, not the file it names, so
+    one that names nothing is no pin rather than an error."""
+    status = path.lstat()
+    return status.st_dev, status.st_ino
 
 
 def repair_pins(installation: Path, snapshots):

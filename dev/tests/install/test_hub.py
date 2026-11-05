@@ -357,6 +357,39 @@ class DownloadTest(unittest.TestCase):
         self.assertEqual([path.exists() for path in live], [False, False])
 
 
+class PinTest(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.cache = self.root / "hub"
+        self.installation = self.root / "models" / "model"
+
+    def snapshot(self, cache, commit):
+        return cache / hub.folder_name(REPO) / "snapshots" / commit
+
+    def test_retiring_keeps_the_new_pin_however_its_cache_is_spelled(self):
+        """The assembly a new one replaces may name the same Hub cache by
+        another path, here a symbolic link to it."""
+        alias = self.root / "alias"
+        alias.symlink_to(self.cache)
+        old = hub.pin(self.snapshot(self.cache, "b" * 40), REPO, self.installation)
+        new = hub.pin(self.snapshot(self.cache, COMMIT), REPO, self.installation)
+        hub.retire_other_pins(
+            [new], [hub.pinned(self.snapshot(alias, "b" * 40), self.installation)]
+        )
+        self.assertEqual([old.exists(), new.exists()], [False, True])
+
+    def test_retiring_removes_a_pin_name_that_links_nothing(self):
+        """A symbolic link named like a pin is not the new pin, even when the
+        file it named is gone."""
+        new = hub.pin(self.snapshot(self.cache, COMMIT), REPO, self.installation)
+        dangling = new.parent / ("b" * 40)
+        dangling.symlink_to(self.root / "removed")
+        hub.retire_other_pins([new])
+        self.assertEqual([os.path.lexists(dangling), new.exists()], [False, True])
+
+
 class FailureKindTest(unittest.TestCase):
     def test_hub_failures_carry_their_kind(self):
         """A Hub or network failure says which, as the app words it. A gated
