@@ -117,6 +117,25 @@ StreamedStart startStreamed(const RuntimeResourcesConfig &config, uint32_t reque
   return started;
 }
 
+// The KV allowance an automatic start of `config` keeps beside the floors
+// before a streamable part loads whole or its store takes more than its
+// smallest: the first 64K tokens (the window where that is less) and their
+// speculative rows, in the fewest pages whose extents hold them as one
+// request's KV capacity rounds them (kvCapacityPagesFor), less the runway
+// among the floors. A part loads whole only where the budget holds its floors,
+// all of it and this allowance.
+uint64_t residentAllowanceBytes(const RuntimeResourcesConfig &config) {
+  kv::Layout layout = config.model.targetKvLayout;
+  layout.format = config.kvFormat;
+  const uint64_t tokens = std::min<uint64_t>(config.model.capabilities.maximumContextTokens, 65'536) +
+                          model::ExecutionLimits::speculativeScratchTokens;
+  const uint64_t pages = (tokens + kv::kPageTokens - 1) / kv::kPageTokens;
+  uint64_t budget = pages;
+  while (kvCapacityPagesFor(layout, budget) < pages) ++budget;
+  return kvPagesBytes(layout, budget, kvWindowFloorPages(layout, 0), layout.extentPagesFor(budget)) -
+         kvRunwayPages(layout.minimumExtentPages()) * layout.bytesPerModelPage();
+}
+
 // The sizes a model's weights take, planned from its files before it loads,
 // are what it loads: the images without its routed experts and those with
 // all of them, and the smallest store, which holds a layer's experts and
@@ -211,10 +230,13 @@ void testAutomaticExpertMemory(RuntimeResourcesConfig config) {
                 start.context >= 65'536,
             message);
   };
-  // A byte short of the budget that holds every expert, which the plan
-  // without the arenas holds: whole, then through the store. The first
-  // load's experts do not count toward the peaks.
-  config.maximumMemoryBytes = whole.minimumRequired - 1;
+  // The budget that holds every expert: the floors, all of the experts and
+  // the KV kept resident (residentAllowanceBytes).
+  const uint64_t holdsEvery = whole.minimumRequired + residentAllowanceBytes(config);
+  // A byte short of it, which the plan without the arenas holds: whole, then
+  // through the store. The first load's experts do not count toward the
+  // peaks.
+  config.maximumMemoryBytes = holdsEvery - 1;
   const StreamedStart reloaded = startStreamed(config);
   streams(reloaded,
           "experts that fit beside everything but the arenas did not stream through the store the plan sizes");
@@ -228,7 +250,7 @@ void testAutomaticExpertMemory(RuntimeResourcesConfig config) {
   require(reloaded.memory.peakAllocatedBytes < firstLoad && reloaded.memory.devicePeakAllocatedBytes < firstLoad,
           "the backend's peaks counted the load the start discarded");
   // Short of that too: at the floor, then through the store.
-  config.maximumMemoryBytes = whole.minimumRequired - whole.arenaBytes - 1;
+  config.maximumMemoryBytes = holdsEvery - whole.arenaBytes - 1;
   streams(startStreamed(config),
           "routed experts memory cannot hold did not stream through the store the plan sizes");
 
@@ -236,7 +258,7 @@ void testAutomaticExpertMemory(RuntimeResourcesConfig config) {
   // the cache gives it up, and they load whole in one load.
   config.cacheDisk = {.automatic = true};
   config.diskVolume = reading(localVolume(500 * kGiB));
-  config.maximumMemoryBytes = whole.minimumRequired + config.model.stateLayout.cachedBytes() - 1;
+  config.maximumMemoryBytes = holdsEvery + config.model.stateLayout.cachedBytes() - 1;
   const StreamedStart yielded = startStreamed(config);
   require(!yielded.experts && !yielded.tier && yielded.loads == 1 &&
               yielded.log.find("SSD cache off: its " + std::to_string(config.model.stateLayout.cachedBytes() >> 20) +
@@ -1245,8 +1267,10 @@ void testTableShareHoldsAPromptsIds(const char *metallibPath) {
 
 // The PLE table's row cache is what the engine's limit gives it, whatever
 // the host spares as the engine starts: Flash-Next's fixture of a table three
-// times its row cache's working memory, under a limit that streams it above
-// its smallest, starts on a host with no spare room with the roomy host's row
+// times its row cache's working memory, under a limit that leaves half of
+// the table above its smallest beside the floors and the KV kept resident
+// (residentAllowanceBytes), which streams it through a row cache above its
+// smallest, starts on a host with no spare room with the roomy host's row
 // cache, context and budget of states and KV, nothing held back.
 void testTheTableIgnoresTheHostsSpareMemory(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-table-host");
@@ -1257,8 +1281,11 @@ void testTheTableIgnoresTheHostsSpareMemory(const char *metallibPath) {
   const StreamedStart whole = startStreamed(config);
   require(weights.tableMinimumBytes < weights.tableBytes && !whole.table,
           "the fixture's table does not stream above its smallest, or loads whole on a roomy limit");
-  config.maximumMemoryBytes = whole.minimumRequired - (weights.tableBytes - weights.tableMinimumBytes) / 2;
+  config.maximumMemoryBytes = whole.minimumRequired + residentAllowanceBytes(config) -
+                              (weights.tableBytes - weights.tableMinimumBytes) / 2;
   const StreamedStart roomy = startStreamed(config);
+  require(roomy.table > weights.tableMinimumBytes,
+          "a limit that leaves the table half of it above its smallest kept its row cache at its smallest");
   RuntimeResourcesConfig bounded = config;
   const uint64_t spareReserve =
       EngineMemoryPolicy::hostSpareReserveBytes(metal::probeDeviceCapabilities().physicalMemoryBytes);
@@ -1266,7 +1293,7 @@ void testTheTableIgnoresTheHostsSpareMemory(const char *metallibPath) {
     return std::optional<HostMemory>(HostMemory{64 * kGiB, spareReserve + kHostMarginBytes});
   };
   const StreamedStart held = startStreamed(bounded);
-  require(roomy.table > weights.tableMinimumBytes && held.table == roomy.table && !held.heldBack &&
+  require(held.table == roomy.table && !held.heldBack &&
               held.context == roomy.context && held.dynamicBudget == roomy.dynamicBudget,
           "a host with no spare room started the table below the row cache the limit gives it");
 }
