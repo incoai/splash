@@ -48,6 +48,12 @@ struct TransferControl {
   uint32_t capacity = 2;
   // The write budget the states' file shares with the KV tier, if any.
   std::shared_ptr<const model::DiskBudget> writeBudget;
+  // The states whose RAM copy went: their buffers are back in the model's
+  // pool, as a model state's are once its RAM copy goes.
+  uint32_t pooled = 0;
+  // What the model's pool releases once `states` more buffers return to it
+  // (MemoryLedger::setBufferBytes), at 100 bytes a state.
+  [[nodiscard]] uint64_t poolBytes(uint32_t states) const noexcept { return uint64_t{pooled + states} * 100; }
 };
 
 // A write the tier admits while the quota has a slot; its disk copy holds
@@ -58,7 +64,12 @@ class TieredState final : public CompositeState {
 public:
   TieredState(std::shared_ptr<TransferControl> control, bool disk = false)
       : control_(std::move(control)), disk_(disk) { if (disk_) ++control_->slots; }
-  ~TieredState() override { if (disk_) --control_->slots; }
+  ~TieredState() override {
+    if (disk_)
+      --control_->slots;
+    else
+      ++control_->pooled;
+  }
   uint64_t bytes() const noexcept override { return 100; }
   uint64_t residentBytes() const noexcept override { return disk_ ? 0 : bytes(); }
   bool canOffload(bool inUse) const noexcept override {
@@ -6285,7 +6296,7 @@ void testGrowthCountsNoStateThatWaitsForAWrite() {
   static_cast<void>(cache.releaseEmptyExtents(false));
   engine::MemoryLedger ledger;
   ledger.addSource(cache);
-  ledger.setBufferBytes([](uint32_t states, bool) { return uint64_t{states} * 100; });
+  ledger.setBufferBytes([&control](uint32_t states, bool) { return control->poolBytes(states); });
   const engine::ClaimId claim = ledger.open({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate});
   const FreeResult freed = ledger.free(claim, {.bytes = 200}, 0, false);
   ledger.close(claim);
@@ -6330,7 +6341,7 @@ void testStagedStateFreesItsCopiedChain() {
   static_cast<void>(cache.releaseEmptyExtents(false));
   engine::MemoryLedger ledger;
   ledger.addSource(cache);
-  ledger.setBufferBytes([](uint32_t states, bool) { return uint64_t{states} * 100; });
+  ledger.setBufferBytes([&control](uint32_t states, bool) { return control->poolBytes(states); });
   const engine::ClaimId claim = ledger.open({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate});
   // Both states' buffers and two of the chain's three extents, the third
   // the runway growth keeps.
