@@ -1515,25 +1515,53 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(pins(self.cache), installed)
         self.assertEqual(list(moved.iterdir()), [])
 
-    def test_a_moved_hub_cache_keeps_the_installation_an_update_needs(self):
+    def test_a_moved_hub_cache_updates_the_installation_from_its_links(self):
+        # An update assembles the installed target again from the snapshot
+        # the installation links, wherever HF_HUB_CACHE points now.
         fake = fake_hub(self, self.cache)
         chosen = selection(self.root)
         self.prepare(chosen)
-        installed = chosen.link.resolve()
         moved = self.root / "moved"
         moved.mkdir()
         fake.publish(DENSE.draft_repo, "e" * 40, lambda p: draft_dir(p, DENSE))
         fake.downloads.clear()
         with mock.patch("huggingface_hub.constants.HF_HUB_CACHE", str(moved)):
-            _, warnings = self.prepare(chosen)
+            output, warnings = self.prepare(chosen)
         self.assertIn(
-            f"Warning: keeping the installed {MODEL}@{'a' * 12}; cannot update it "
-            f"({DENSE.draft_repo} moved from {DRAFT_COMMIT[:12]} to {'e' * 12}): "
-            f"the Hub cache has no snapshot {'a' * 40} of {MODEL}",
-            warnings,
+            f"{DENSE.draft_repo} moved from {DRAFT_COMMIT[:12]} to {'e' * 12}", output
         )
-        self.assertEqual(chosen.link.resolve(), installed)
-        self.assertEqual(fake.downloads, [])
+        self.assertEqual(warnings, "")
+        record = assembly.verify(chosen.link)
+        self.assertEqual(record["sources"]["draft"]["revision"], "e" * 40)
+        self.assertEqual(
+            record["files"]["config.json"]["path"],
+            str(fake.snapshot(MODEL, "a" * 40) / "config.json"),
+        )
+        # Only the new draft is fetched.
+        self.assertTrue(
+            all(name.startswith(DENSE.draft_repo + "/") for name in fake.downloads)
+        )
+        self.assertEqual(list(moved.iterdir()), [])
+
+    def test_a_moved_hub_cache_keeps_the_installed_draft_from_its_links(self):
+        fake = fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        moved = self.root / "moved"
+        moved.mkdir()
+        fake.publish(DENSE.draft_repo, "e" * 40, lambda p: draft_dir(p, DENSE))
+        fake.download_failure = OSError(errno.ECONNRESET, "connection reset by peer")
+        with mock.patch("huggingface_hub.constants.HF_HUB_CACHE", str(moved)):
+            _, warnings = self.prepare(chosen)
+        self.assertEqual(
+            warnings,
+            f"Warning: cannot use the {DENSE.name} draft {DENSE.draft_repo}@"
+            f"{'e' * 12}; keeping the installed one: cannot fetch the {DENSE.name} "
+            f"draft: [Errno {errno.ECONNRESET}] connection reset by peer\n",
+        )
+        self.assertEqual(
+            assembly.verify(chosen.link)["sources"]["draft"]["revision"], DRAFT_COMMIT
+        )
         self.assertEqual(list(moved.iterdir()), [])
 
     def test_an_incompatible_draft_is_an_error_not_a_crash(self):

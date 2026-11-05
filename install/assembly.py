@@ -213,13 +213,16 @@ def _well_formed(record):
     )
 
 
-def pins(record):
-    """The Hub snapshot of each source an assembly links files from, with its
-    repository ID: the snapshots its installation pins. Each is found from a
-    linked file's path, not the cache location: HF_HUB_CACHE may name another
-    folder now than when the assembly was built."""
+def _snapshots(record):
+    """(repository ID, commit) of each Hub source an assembly links files
+    from -> the snapshot its files lie in. Each is found from a linked file's
+    path, not the cache location: HF_HUB_CACHE may name another folder now
+    than when the assembly was built."""
     sources = {
-        (hub.folder_name(source["repo"]), source["revision"]): source["repo"]
+        (hub.folder_name(source["repo"]), source["revision"]): (
+            source["repo"],
+            source["revision"],
+        )
         for source in record["sources"].values()
         if source["revision"] is not None
     }
@@ -228,8 +231,29 @@ def pins(record):
         path = hub.snapshot_of(entry["path"])
         key = path and (path.parent.parent.name, path.name)
         if key in sources:
-            snapshots[path] = sources[key]
-    return sorted(snapshots.items())
+            snapshots[sources[key]] = path
+    return snapshots
+
+
+def pins(record):
+    """The Hub snapshot of each source an assembly links files from
+    (_snapshots), with its repository ID: the snapshots its installation
+    pins."""
+    return sorted((path, repo) for (repo, _), path in _snapshots(record).items())
+
+
+def source(record, role):
+    """An assembly's source, "target" or "draft", read without the Hub from
+    what the assembly links: its local directory, or the snapshot its files
+    lie in (_snapshots), however the Hub cache is configured now."""
+    named = record["sources"][role]
+    repo, revision = named["repo"], named["revision"]
+    if revision is None:
+        return hub.Repository.local_directory(repo)
+    path = _snapshots(record).get((repo, revision))
+    if path is None:
+        raise models.ModelError(f"the installation links no file of {repo}@{revision}")
+    return hub.Repository.cached(repo, revision, path)
 
 
 def recorded(link: Path):

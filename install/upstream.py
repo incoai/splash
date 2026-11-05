@@ -571,14 +571,13 @@ def _start_installed(selection, target, installed):
     first when its draft moved or this release changes it (_changes). The
     draft's repository is asked only when the Hub answered for the target, so
     a commit revision holds its draft too. Only assembling it again reads the
-    Hub cache."""
+    Hub cache: the snapshots the installation links (assembly.source)."""
     if target.unreachable_reason:
         print(
             f"Could not reach the Hub ({target.unreachable_reason}); "
             f"using the installed {selection.repo_id}@{target.revision[:12]}.",
             flush=True,
         )
-    recorded = installed["sources"]["target"]
     family = families.named(installed["family"])
     draft = family and _resolve_draft(family, selection, installed, target)
     if draft and draft.unreachable_reason:
@@ -592,7 +591,7 @@ def _start_installed(selection, target, installed):
         with _keeping_installation(
             selection, installed, f"update it ({'; '.join(changes)})"
         ):
-            _install(selection, hub.Repository.recorded(recorded), installed, draft)
+            _install(selection, assembly.source(installed, "target"), installed, draft)
         return
     if (replaced := _retain_installed(selection)) is None:
         print(
@@ -603,7 +602,7 @@ def _start_installed(selection, target, installed):
     # A concurrent installation replaced or damaged the assembly after it was
     # verified: no verified installation is left to keep.
     print(f"Reinstalling {selection.model}: {replaced}", flush=True)
-    _install(selection, hub.Repository.recorded(recorded), installed, draft)
+    _install(selection, assembly.source(installed, "target"), installed, draft)
 
 
 def _install_commit(selection, target, installed):
@@ -838,7 +837,7 @@ def _draft(target, installed, draft):
                 f"cannot use the {family.name} draft {_at(draft)}; "
                 f"keeping the installed one: {error}"
             )
-    repo = hub.Repository.recorded(recorded)
+    repo = assembly.source(installed, "draft")
     return repo, draft_files(repo, target)
 
 

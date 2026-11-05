@@ -285,10 +285,13 @@ class Repository:
         return cls(name, None, set(paths), dict(paths))
 
     @classmethod
-    def cached(cls, name, commit, *, unreachable_reason=None, unreachable_kind=None):
-        """name at commit from its snapshot in the Hub cache, without the Hub;
-        only the files downloaded before are available."""
-        path = snapshot(name, commit)
+    def cached(
+        cls, name, commit, path=None, *, unreachable_reason=None, unreachable_kind=None
+    ):
+        """name at commit from its snapshot folder in a Hub cache, path, by
+        default HF_HUB_CACHE's, without the Hub; only the files downloaded
+        before are available."""
+        path = path or snapshot(name, commit)
         if not path.is_dir():
             raise models.ModelError(f"the Hub cache has no snapshot {commit} of {name}")
         paths = _paths(path)
@@ -300,13 +303,6 @@ class Repository:
             unreachable_reason=unreachable_reason,
             unreachable_kind=unreachable_kind,
         )
-
-    @classmethod
-    def recorded(cls, source):
-        """A source as an assembly record names it, without the Hub."""
-        if source["revision"] is None:
-            return cls.local_directory(source["repo"])
-        return cls.cached(source["repo"], source["revision"])
 
     @classmethod
     def resolve(

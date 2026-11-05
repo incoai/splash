@@ -134,9 +134,10 @@ environment, and a packaged runtime inside a signed app never gains
 
 - The installed commits: the assembly's links, sizes and times are checked and
   it starts. It is re-assembled first when the draft's repository moved or
-  this release changed the GGUF metadata adapter; if the new draft cannot be
-  fetched or is not the family's ([Drafts](models.md#drafts)), the installed one is
-  kept.
+  this release changed the GGUF metadata adapter, from the snapshots it links
+  (`assembly.source`), wherever `HF_HUB_CACHE` points now; if the new draft
+  cannot be fetched or is not the family's ([Drafts](models.md#drafts)), the
+  installed one is kept.
 - A new commit: only changed files are downloaded, and the new assembly
   replaces the installed one atomically once published.
 - No answer, or a new commit that cannot be installed: the installed assembly

@@ -896,7 +896,8 @@ HF_HUB_CACHE=/Volumes/Models/huggingface splash serve --model mlx-community/Qwen
 `HF_HUB_CACHE` selects the Hugging Face download cache. Alternatively, set
 `HF_HOME` to relocate the Hugging Face home directory, including its default
 `hub` cache. Model links stay in Splash's data directory; existing downloads
-are not moved.
+are not moved, and an installed model keeps reading its files where they are,
+also when a new draft has Splash assemble it again.
 
 ### Files Splash writes
 
