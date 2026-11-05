@@ -631,7 +631,7 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
   // A refusal of bytes the room covers once the units that cost nothing
   // went is met: the fit is tried again, whatever memory allocated could
   // meet of it in place.
-  if (!need.hostRefused && !lackingBytes && (need.bytes || (!lackingPages && !need.stateBuffers))) {
+  if (!need.hostRefused && !lackingBytes && (need.bytes || (!lackingPages && !need.lacksStateBuffers()))) {
     result.outcome = FreeOutcome::Met;
   } else if (waits(false)) {
     result.outcome = FreeOutcome::Pending;
@@ -649,8 +649,8 @@ FreeResult MemoryLedger::free(ClaimId claimId, const Need &need, uint64_t freeBy
         uncopiedReachedSeconds_ = nowSeconds_;
       FreeResult taken = run->freed;
       // The buffers its states freed leave the model's pool unless they met
-      // the need in place: a need of bytes beside buffers no state can give
-      // (Model::statesToActivate with no ring idle) is met by their bytes.
+      // the need in place, so a need of bytes beside an unheldStateBuffer is
+      // met by their bytes.
       const bool metInPlace = need.stateBuffers && run->buffers >= need.stateBuffers;
       if (bufferBytes(query, lack, 0, run->buffers) && !metInPlace)
         taken.nowBytes = plus(taken.nowBytes, takeUnsized(query));
@@ -888,6 +888,8 @@ void MemoryLedger::log(const ClaimSpec &spec, const Need &need, const Run *run, 
     line << ", " << need.pages << " pages";
   if (need.stateBuffers)
     line << ", " << need.stateBuffers << " state buffers";
+  if (need.unheldStateBuffer)
+    line << ", a state buffer no cached state holds";
   line << ": " << outcomeName(result.outcome);
   if (exempted)
     line << " past the host";

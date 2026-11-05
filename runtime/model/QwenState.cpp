@@ -399,10 +399,10 @@ uint64_t QwenStateStorage::bytes(BufferCounts buffers) const noexcept {
          uint64_t{buffers.windows} * layout_.draft.windowBytes();
 }
 
-uint32_t QwenStateStorage::statesToActivate() const noexcept {
+std::optional<uint32_t> QwenStateStorage::statesToActivate() const noexcept {
   const BufferCounts lacked = beyond(kLaneBuffers, idle());
   if (lacked.rings)
-    return std::numeric_limits<uint32_t>::max();
+    return std::nullopt;
   // A lane takes no cell when its cells have no bytes.
   return std::max(emptyCell_ ? 0 : lacked.cells, lacked.windows);
 }

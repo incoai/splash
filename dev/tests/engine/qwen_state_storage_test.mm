@@ -1151,9 +1151,8 @@ void run(const std::string &metallib) {
             "reclaimed buffers remain pooled");
     // No cached state holds rings: without idle rings no number of states
     // makes up a lane.
-    constexpr uint32_t kNoStatesSuffice = std::numeric_limits<uint32_t>::max();
     require(storage.actualAllocatedBytes() == 0 &&
-                storage.statesToActivate() == kNoStatesSuffice,
+                !storage.statesToActivate(),
             "reclaimed state cells remain accounted");
 
     // An activation asks the governor once for everything the pool lacks:
@@ -1161,7 +1160,7 @@ void run(const std::string &metallib) {
     admitNewAllocations = false;
     require(!storage.tryActivateLane(0, 505) && !storage.metadata(0).assigned() &&
                 storage.actualAllocatedBytes() == 0 &&
-                storage.statesToActivate() == kNoStatesSuffice,
+                !storage.statesToActivate(),
             "a denied activation allocated part of its lane");
     admitNewAllocations = true;
     uint32_t admitted = admissions;

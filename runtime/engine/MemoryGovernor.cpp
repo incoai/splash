@@ -367,13 +367,11 @@ uint64_t MemoryGovernor::roomBytes() const noexcept {
 }
 
 Need MemoryGovernor::need(ClaimId claim, const std::optional<Need> &inPlace) const {
-  Need need = ledger_.claim(claim).refusal;
-  if (inPlace) {
-    need.pages = inPlace->pages;
-    need.form = inPlace->form;
-    need.stateBuffers = inPlace->stateBuffers;
-    need.keptPages = inPlace->keptPages;
-  }
+  // A refusal records bytes only, so every other field is the caller's.
+  const Need &refused = ledger_.claim(claim).refusal;
+  Need need = inPlace.value_or(Need{});
+  need.bytes = refused.bytes;
+  need.hostRefused = refused.hostRefused;
   return need;
 }
 

@@ -2005,9 +2005,11 @@ void testWarningRegrowsOnlyWhatTheCacheFunds() {
 }
 
 // A bytes need beside buffers no state can give is met by the bytes of the states it evicts, which leave the
-// model's pool.
+// model's pool; its decision says it lacks such a buffer, not a count of them.
 void testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes() {
   MemoryLedger ledger;
+  std::vector<std::string> lines;
+  ledger.setDecisionLog([&](std::string_view line) { lines.emplace_back(line); });
   BufferPool pool(64 * kMiB);
   CachedStates cache(pool);
   cache.units.push_back({.key = 1, .stateBuffers = 1});
@@ -2015,11 +2017,28 @@ void testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes() {
   ledger.addSource(pool);
   ledger.setBufferBytes([](uint32_t states, bool) { return uint64_t{states} * 64 * kMiB; });
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal, ClaimClass::Start));
-  const FreeResult freed = ledger.free(
-      claim, {.bytes = 48 * kMiB, .stateBuffers = std::numeric_limits<uint32_t>::max()}, 0, false);
+  const FreeResult freed = ledger.free(claim, {.bytes = 48 * kMiB, .unheldStateBuffer = true}, 0, false);
   require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 64 * kMiB &&
               cache.taken == std::vector<uint64_t>{1} && !pool.idle,
           "the evicted state's buffers stayed in the pool for a need no state meets in place");
+  require(lines.size() == 1 && lines[0].find(", a state buffer no cached state holds") != std::string::npos &&
+              lines[0].find("4294967295") == std::string::npos,
+          "the decision did not say the need lacks a buffer no cached state holds: " +
+              (lines.empty() ? std::string() : lines[0]));
+}
+
+// A need of only a buffer no cached state holds reaches no cached state, so it asks no copies ahead.
+void testABufferNoStateHoldsReachesNoCachedState() {
+  MemoryLedger ledger;
+  BufferPool pool(64 * kMiB);
+  CachedStates cache(pool);
+  cache.units.push_back({.key = 1, .stateBuffers = 1, .later = true});
+  ledger.addSource(cache);
+  ledger.addSource(pool);
+  const ClaimId claim = ledger.open(request(1, RequestPriority::Normal, ClaimClass::Start));
+  const FreeResult freed = ledger.free(claim, {.hostRefused = true, .unheldStateBuffer = true}, 0, false);
+  require(freed.outcome == FreeOutcome::Short && cache.taken.empty() && !ledger.copyDemand(),
+          "a need no cached state meets reached an uncopied state and asked copies ahead");
 }
 
 // The pools grow before Ready by the host rule at the current pressure: a warning holds them at their floors.
@@ -2111,6 +2130,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testWarningRegrowsOnlyWhatTheCacheFunds", testWarningRegrowsOnlyWhatTheCacheFunds},
       {"testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes",
        testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes},
+      {"testABufferNoStateHoldsReachesNoCachedState", testABufferNoStateHoldsReachesNoCachedState},
       {"testStartGrowthFollowsThePressureNow", testStartGrowthFollowsThePressureNow},
   };
   return kTests;

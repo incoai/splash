@@ -745,7 +745,7 @@ Cache::Walk Cache::walkFor(const VictimQuery &query) const {
   walk.hostRefused = need.hostRefused;
   // A state that goes ends a unit for a need of its buffers, and of bytes,
   // which its buffers meet once they leave the model's pool.
-  walk.statesAreUnits = need.stateBuffers != 0 || (need.bytes && !need.hostRefused);
+  walk.statesAreUnits = need.lacksStateBuffers() || (need.bytes && !need.hostRefused);
   if (need.bytes && !need.hostRefused) {
     // Memory the engine's limit refused, whatever pages it was for: an
     // extent released covers it.
@@ -768,7 +768,7 @@ Cache::Walk Cache::walkFor(const VictimQuery &query) const {
     walk.form = need.form;
     walk.scope.pagesOnly = need.hostRefused;
     walk.refused = Shortfall{need.pages, need.form};
-  } else if (need.stateBuffers || need.hostRefused) {
+  } else if (need.lacksStateBuffers() || need.hostRefused) {
     walk.scope.statesOnly = true;
     walk.refused = Shortfall{};
   }

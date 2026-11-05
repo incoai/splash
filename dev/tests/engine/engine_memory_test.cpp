@@ -413,8 +413,10 @@ void testKvGrowthKeepsTheRingAWaitingLaneStartsFrom() {
   engine::Engine engine(host.connect({}), resources, executor, events);
   guardReleases(storage, engine);
   executor.pooledLaneBytes = kRing;
-  executor.statesLacked = [&]() -> uint32_t {
-    return executor.pooledLaneBytes ? 0 : std::numeric_limits<uint32_t>::max();
+  executor.statesLacked = [&]() -> std::optional<uint32_t> {
+    if (executor.pooledLaneBytes)
+      return 0;
+    return std::nullopt;
   };
   executor.beginGrowthBlocked = [&] {
     if (executor.pooledLaneBytes >= kRing) {
@@ -3419,7 +3421,8 @@ void testLaneAdmissionAndKvGrowthKeepThePooledLaneBuffers() {
 // Under the host pause a lane short of state buffers takes the oldest cached state only when the states in RAM can
 // cover what it lacks.
 void testPausedStateAdmissionReusesCachedStates() {
-  for (uint32_t lacked : {1U, 2U, std::numeric_limits<uint32_t>::max()}) {
+  for (const std::optional<uint32_t> lacked : {std::optional<uint32_t>{1}, std::optional<uint32_t>{2},
+                                               std::optional<uint32_t>{}}) {
     test::TestKvStorage storage(64, 4096, 4);
     KvPool pool(storage, 0);
     engine::Cache cache(pool, nullptr, nullptr);
@@ -3436,11 +3439,13 @@ void testPausedStateAdmissionReusesCachedStates() {
 
     host.pause(true);
     // Each state the cache gives up returns what the pool lacks of one.
-    executor.statesLacked = [&] {
+    executor.statesLacked = [&]() -> std::optional<uint32_t> {
+      if (!lacked)
+        return std::nullopt;
       const uint64_t given = cache.snapshot().stateCache.evictions - cached.evictions;
-      return lacked > given ? static_cast<uint32_t>(lacked - given) : 0;
+      return *lacked > given ? static_cast<uint32_t>(*lacked - given) : 0;
     };
-    executor.beginGrowthBlocked = [&] { return executor.statesLacked() != 0; };
+    executor.beginGrowthBlocked = [&] { return executor.statesLacked() != std::optional<uint32_t>{0}; };
     executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
     engine.submit(request(288, {288}));
     for (double now = 10; now < 20 && !idle(engine); ++now)

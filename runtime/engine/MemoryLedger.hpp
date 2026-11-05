@@ -102,22 +102,26 @@ struct ClaimId final {
 };
 
 // What a refused claim lacks. bytes and hostRefused come from the admission
-// refused inside its scope. The caller sets pages and stateBuffers for needs
-// met in place (TokenAdmission::additionalPages, Model::statesToActivate),
-// and for a KV need keptPages: the free pages of each other form its attempt
-// takes, which units taken for it keep as they keep `form`'s
-// (TokenAdmission::keptPages, Cache::walkFor). afterStart: a need that
-// counts a lane's start and the state it captures, which take their buffers
-// from the model's pool before any unit's return to it
-// (Model::startStateBytes).
+// refused inside its scope. The caller sets pages and the state buffers for
+// needs met in place (TokenAdmission::additionalPages,
+// Model::statesToActivate), and for a KV need keptPages: the free pages of
+// each other form its attempt takes, which units taken for it keep as they
+// keep `form`'s (TokenAdmission::keptPages, Cache::walkFor). A need of state
+// buffers is stateBuffers that cached states return to the model's pool, or
+// one no cached state holds (unheldStateBuffer), which their states meet only
+// by the bytes their buffers free. afterStart: a need that counts a lane's
+// start and the state it captures, which take their buffers from the model's
+// pool before any unit's return to it (Model::startStateBytes).
 struct Need final {
   uint64_t bytes = 0;
   bool hostRefused = false;
   uint32_t pages = 0;
   kv::PageForm form = kv::PageForm::Full;
   uint32_t stateBuffers = 0;
+  bool unheldStateBuffer = false;
   std::array<uint32_t, 3> keptPages{};
   bool afterStart = false;
+  [[nodiscard]] bool lacksStateBuffers() const noexcept { return stateBuffers || unheldStateBuffer; }
   friend bool operator==(const Need &, const Need &) = default;
 };
 

@@ -11,6 +11,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -278,8 +279,8 @@ public:
   // holds one GDN cell and one context window, a lane two cells (none of the
   // pool's when cells have no bytes), a window and the draft rings, which no
   // cached state holds: without idle rings no number of states makes up the
-  // lack.
-  [[nodiscard]] uint32_t statesToActivate() const noexcept;
+  // lack, and it gives no value.
+  [[nodiscard]] std::optional<uint32_t> statesToActivate() const noexcept;
   // What releaseOneIdle(true), called until it gives none, releases once
   // `evictedStates` more cached states have returned their cell and context
   // window to the pool (QwenBufferPool::give), at the layout's sizes, which

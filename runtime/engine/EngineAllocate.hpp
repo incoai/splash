@@ -109,12 +109,14 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, bool frees)
   const auto metBefore = [&](const Need &need) { return std::ranges::find(met, need) != met.end(); };
   while (frees && memoryDenied(admission)) {
     std::optional<Need> part;
-    if constexpr (std::is_same_v<Admission, StateAdmission>)
-      part = Need{.stateBuffers = model_.statesToActivate()};
-    else
+    if constexpr (std::is_same_v<Admission, StateAdmission>) {
+      const std::optional<uint32_t> states = model_.statesToActivate();
+      part = Need{.stateBuffers = states.value_or(0), .unheldStateBuffer = !states};
+    } else {
       part = inPlace(admission, governor.heldPages(claim.id));
+    }
     const Need need = governor.need(claim.id, part);
-    if ((!need.bytes && !need.hostRefused && !need.pages && !need.stateBuffers) ||
+    if ((!need.bytes && !need.hostRefused && !need.pages && !need.lacksStateBuffers()) ||
         (need.hostRefused && ledger.claim(claim.id).hostExempt) ||
         metBefore(need))
       break;

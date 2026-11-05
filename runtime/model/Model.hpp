@@ -851,9 +851,9 @@ public:
   snapshotToDisk(uint64_t, std::function<void()>) { return {}; }
   // The cached states whose eviction would return to the pool what a lane's
   // activation still has to allocate: zero when the pool holds a lane's
-  // buffers, and the maximum when no number of states does (a buffer no
-  // cached state holds, such as Qwen's draft rings).
-  [[nodiscard]] virtual uint32_t statesToActivate() const noexcept { return 0; }
+  // buffers, and no value when no number of states does (a buffer no cached
+  // state holds, such as Qwen's draft rings).
+  [[nodiscard]] virtual std::optional<uint32_t> statesToActivate() const noexcept { return 0; }
   // The bytes releaseIdleBuffer(true), called until it gives none, releases
   // once the cache has let go of `evictedStates` more cached states, whose
   // buffers return to the pool: the pooled buffers beyond those one lane

@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace splash::model {
@@ -15,7 +16,7 @@ public:
   explicit Runtime(RuntimeContext context);
   ~Runtime() override;
   void checkHealth() override;
-  [[nodiscard]] uint32_t statesToActivate() const noexcept override;
+  [[nodiscard]] std::optional<uint32_t> statesToActivate() const noexcept override;
   [[nodiscard]] uint64_t idleBufferBytes(uint32_t evictedStates, bool afterStart) const noexcept override;
   [[nodiscard]] uint64_t startStateBytes() const noexcept override;
   [[nodiscard]] CommandLimits commandLimits() const noexcept override;

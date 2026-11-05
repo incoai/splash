@@ -3331,7 +3331,7 @@ CommandWork Runtime::prefillWork(std::span<const PrefillLane> lanes, uint32_t fi
 
 std::span<ElasticPool *const> Runtime::pools() noexcept { return impl_->pools; }
 
-uint32_t Runtime::statesToActivate() const noexcept {
+std::optional<uint32_t> Runtime::statesToActivate() const noexcept {
   return impl_->states.statesToActivate();
 }
 

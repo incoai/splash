@@ -645,8 +645,8 @@ public:
     ++diskSnapshots;
     return std::make_unique<OffloadTicket>(stateTier);
   }
-  uint32_t statesToActivate() const noexcept override {
-    return statesLacked ? statesLacked() : 0;
+  std::optional<uint32_t> statesToActivate() const noexcept override {
+    return statesLacked ? statesLacked() : std::optional<uint32_t>{0};
   }
   // What a lane's start (takeLaneState) and the state it captures
   // (takeStateBuffers) allocate. Nothing without `memory`.
@@ -869,8 +869,8 @@ public:
   // The buffers of states the cache has let go of, and of reservations no
   // step sealed, until releaseIdleBuffer takes them into the pool.
   std::shared_ptr<uint64_t> evictedStateBytes = std::make_shared<uint64_t>(0);
-  // The cached states whose buffers the pool lacks for one activation.
-  std::function<uint32_t()> statesLacked;
+  // The cached states whose buffers the pool lacks for one activation (Model::statesToActivate).
+  std::function<std::optional<uint32_t>()> statesLacked;
   uint64_t reclaimedIdleStateBytes = 0;
   bool keptLane = false;
   // Called when a resident request gives its lane back.
