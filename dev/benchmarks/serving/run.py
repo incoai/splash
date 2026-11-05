@@ -13,7 +13,8 @@ It installs the model with the tree's own installer, offline, or takes
 between trees, so a build never runs under another tree's server) on a port
 nothing answers on; checks that /status names the server it started (pid) and
 the tree's own sources (build id); runs the scenario; stops the server with
-SIGINT; and writes beside the client's records:
+SIGINT, or SIGTERM and SIGKILL when it outlasts that; and writes beside the
+client's records:
 
 - LABEL.out: what ran, the checks, and DONE as its last line once all of it
   completed;
@@ -21,7 +22,8 @@ SIGINT; and writes beside the client's records:
   seconds and whether the binary had started on this machine before (a first
   start compiles Metal), host memory and pressure at start, ps snapshots at
   the start, middle and end of the scenario while the server serves, the pids
-  this run started, on the M5 Pro the idle and sleep-assertion samples
+  this run started, each server's stop (the signals it took and its exit
+  code), on the M5 Pro the idle and sleep-assertion samples
   (LABEL.idle.jsonl) that show whether the machine was in use, and for a run
   that did not complete why (error) and whose failure that was (failure:
   server or request for the server's own, client for a client's own, else
@@ -55,7 +57,7 @@ MACHINES = ("studio", "m5", "m6", "mini", "other")
 SCENARIOS = ("churn", "ttft", "serve1", "warm")
 READY_TIMEOUT_SECONDS = 900
 # A server that ignores SIGINT this long gets SIGTERM, then SIGKILL (a server
-# under memory pressure once ignored SIGINT).
+# under memory pressure once ignored SIGINT): G8 fails it.
 STOP_GRACE_SECONDS = 60
 # The M5 Pro is also used interactively: its idle time and sleep assertions are
 # sampled this often during a run.
@@ -359,7 +361,11 @@ class Server:
             *(int(pid) for pid in listed.split() if pid.isdigit()),
         }
 
-    def stop(self) -> str:
+    def stop(self) -> dict:
+        """Sends SIGINT, then SIGTERM and SIGKILL to a server that outlasts
+        each, until it exits. Returns the signals sent, none to a server that
+        had exited, and its exit code, None if it outlasted SIGKILL."""
+        signals = []
         for sent, grace in (
             (signal.SIGINT, STOP_GRACE_SECONDS),
             (signal.SIGTERM, 30),
@@ -368,14 +374,13 @@ class Server:
             if self.process.poll() is not None:
                 break
             self.process.send_signal(sent)
+            signals.append(sent.name)
             try:
                 self.process.wait(grace)
-                self.log.close()
-                return f"stopped by {sent.name}, exit {self.process.returncode}"
             except subprocess.TimeoutExpired:
-                continue
+                pass
         self.log.close()
-        return f"exited {self.process.returncode}"
+        return {"signals": signals, "exit": self.process.poll()}
 
 
 def install(args, out: Path) -> str:
@@ -599,7 +604,7 @@ def main(argv=None) -> int:
 
             threading.Thread(target=sample_idle, daemon=True).start()
         server_args = shlex.split(args.server_args)
-        parts = []
+        parts = meta["parts"] = []
         levels = args.levels if args.scenario == "ttft" else [None]
         for index, level in enumerate(levels):
             part = args.label if level is None else f"{args.label}-n{level}"
@@ -612,6 +617,8 @@ def main(argv=None) -> int:
                 out / f"{part}.server.log",
             )
             ours |= {server.process.pid}
+            record = {"label": part}
+            parts.append(record)
             try:
                 ready = server.wait_ready()
                 ours |= server.engine_pids()
@@ -619,7 +626,7 @@ def main(argv=None) -> int:
                 note(
                     f"{part} ready=yes spawn_to_ready_s={ready} pid={checks['pid']} build_id=ok"
                 )
-                parts.append({"label": part, "spawn_to_ready_s": ready, **checks})
+                record.update(spawn_to_ready_s=ready, **checks)
                 # The snapshots are taken while the server serves, so that
                 # its processes are among this run's.
                 if index == 0:
@@ -704,8 +711,11 @@ def main(argv=None) -> int:
                     "server",
                 ) from error
             finally:
-                note(f"{part} {server.stop()}")
-        meta["parts"] = parts
+                record["stop"] = stop = server.stop()
+                note(
+                    f"{part} stop: signals {', '.join(stop['signals']) or 'none'}, "
+                    f"exit {stop['exit']}"
+                )
         meta["first_start_spawn_to_ready_s"] = (
             parts[0]["spawn_to_ready_s"] if parts else None
         )

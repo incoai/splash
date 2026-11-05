@@ -4,6 +4,8 @@ import io
 import json
 import os
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -964,7 +966,7 @@ class RunTests(unittest.TestCase):
 
             def stop(self):
                 events.append("stop")
-                return "stopped by SIGINT, exit 0"
+                return {"signals": ["SIGINT"], "exit": 0}
 
         def snapshot(ours):
             events.append(frozenset(ours))
@@ -1037,7 +1039,7 @@ class RunTests(unittest.TestCase):
                 return {4242}
 
             def stop(self):
-                return "exited -9"
+                return {"signals": [], "exit": -9}
 
         def recorded(label, serve1):
             with tempfile.TemporaryDirectory() as directory:
@@ -1142,6 +1144,96 @@ class RunTests(unittest.TestCase):
             recorded("client", client_failed),
             (1, "client", "a churn client failed: ValueError: bug"),
         )
+
+    def test_a_server_must_stop_on_sigint_with_exit_0(self):
+        # The run records each server's stop, and G8 fails one that needed
+        # more than SIGINT or did not exit 0: here, a server that ignores
+        # SIGINT, stopped by SIGTERM.
+        children = {
+            "clean": "signal.signal(signal.SIGINT, lambda *_: sys.exit(0))",
+            "deaf": "signal.signal(signal.SIGINT, signal.SIG_IGN)",
+            "gone": "sys.exit(3)",
+        }
+        stops = {}
+        with tempfile.TemporaryDirectory() as directory:
+            for name, setup in children.items():
+                server = run.Server.__new__(run.Server)
+                server.log = (Path(directory) / f"{name}.log").open("w")
+                server.process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        f"import signal, sys, time; {setup}; print(1, flush=True); "
+                        "time.sleep(600)",
+                    ],
+                    stdout=subprocess.PIPE,
+                )
+                # Its handler is installed, or it exited.
+                if not server.process.stdout.readline():
+                    server.process.wait()
+                server.process.stdout.close()
+                with mock.patch.object(run, "STOP_GRACE_SECONDS", 1):
+                    stops[name] = server.stop()
+        self.assertEqual(
+            stops,
+            {
+                "clean": {"signals": ["SIGINT"], "exit": 0},
+                "deaf": {"signals": ["SIGINT", "SIGTERM"], "exit": -15},
+                "gone": {"signals": [], "exit": 3},
+            },
+        )
+
+        def stopped_by(stop):
+            class FakeServer:
+                def __init__(self, tree, root, model, port, server_args, log):
+                    self.process = mock.Mock(pid=4242, **{"poll.return_value": None})
+
+                def wait_ready(self):
+                    return 1.0
+
+                def engine_pids(self):
+                    return {4242}
+
+                def stop(self):
+                    return stop
+
+            return FakeServer
+
+        for name, failed in (("clean", False), ("deaf", True), ("gone", True)):
+            with self.subTest(name), tempfile.TemporaryDirectory() as directory:
+                tree = Path(directory)
+                (tree / "build").mkdir()
+                (tree / "build" / "splash").write_bytes(b"splash")
+                with (
+                    mock.patch.multiple(
+                        run,
+                        Server=stopped_by(stops[name]),
+                        ps_snapshot=lambda ours: {"at": 0.0, "rows": [], "therm": ""},
+                        port_answers=lambda port: False,
+                        tree_build_id=lambda tree: "src-1",
+                        host_memory=lambda: {},
+                        check_identity=lambda port, server, build_id: {
+                            "pid": 4242,
+                            "build_id": build_id,
+                            "thermal_state": "nominal",
+                        },
+                    ),
+                    mock.patch.object(run.clients, "run_serve1"),
+                ):
+                    code = run.main(
+                        [
+                            *("--tree", directory, "--machine", "other"),
+                            *("--model", "m", "--model-root", directory),
+                            *("--scenario", "serve1", "--label", "s"),
+                            *("--out", f"{directory}/out"),
+                        ]
+                    )
+                meta = json.loads((tree / "out" / "s.meta.json").read_text())
+                self.assertEqual(code, 0)
+                self.assertEqual(meta["parts"][0]["stop"], stops[name])
+                result = check.check_run(check.Run(tree / "out", "s"))
+                stopped = [f for f in result["failures"] if "did not stop" in f]
+                self.assertEqual(bool(stopped), failed, result)
 
     def test_gpu_utilization_reads_ioreg(self):
         line = (

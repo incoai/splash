@@ -55,7 +55,7 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
 | `test-performance-real` | the native decode, partial-prefix and short-prompt benchmark, or with `BASELINE` its ABBA comparison with that build, in which both builds' `weight-digests` take `WEIGHT_DIGESTS_ARGS` (`dev/benchmarks/backend_regression.py`) |
-| `test-pressure-real` | the installation on this checkout's own server under `PRESSURE_ARGS` (default `--max-memory 18G`), which must make it stream its routed experts, with the [serving benchmark](#serving-benchmark)'s three churn clients for `PRESSURE_MINUTES` (default 5), checked on its own by [`check.py run`](#serving-benchmark): every client served, G4, G8 and G9; results in `build/release/<model>/pressure` |
+| `test-pressure-real` | the installation on this checkout's own server under `PRESSURE_ARGS` (default `--max-memory 18G`), which must make it stream its routed experts, with the [serving benchmark](#serving-benchmark)'s three churn clients for `PRESSURE_MINUTES` (default 5), checked on its own by [`check.py run`](#serving-benchmark) on G4, G8, G9, Store and Churn (its load window and every client served); results in `build/release/<model>/pressure` |
 | `release-check` | one model on this Mac ([Release check](#release-check)) |
 
 `test-agent-real` and `test-release-real` first run the tests
@@ -356,13 +356,15 @@ fails or closes before the stream's `data: [DONE]`. It ends `serve1` and
 names the server it started (`instance.pid`) and the build of the tree's
 sources (`identity.cache.build_id` against the tree's own
 `dev/tools/build_identity.py check` with its Makefile's constants); runs the
-scenario; and stops the server with SIGINT, then SIGTERM. Beside the client's
+scenario; and stops the server with SIGINT, or, when it outlasts that, SIGTERM
+after 60 s and SIGKILL after 30 s more. Beside the client's
 `LABEL.events.jsonl` and `LABEL.status.jsonl` it writes `LABEL.out`, whose last
 line is `DONE` only once everything completed, `LABEL.meta.json` (binary
 SHA-256, build id, model, spawn-to-ready seconds and whether the binary had
 started on that Mac before, host memory and pressure, process snapshots at
 the start, middle and end of the scenario while the server serves, the pids
-the run started, and for a run that did not complete why and whose failure
+the run started, each server's stop, the signals it took and its exit code,
+and for a run that did not complete why and whose failure
 that was: the server's, which exited, was not ready in time, failed a
 request or, once ready, did not let the scenario end, a client's, which
 raised an exception of its own, or `run.py`'s refusal to measure) and on the
@@ -398,7 +400,7 @@ these do not excuse, notes them.
 | Gate | Rule |
 | --- | --- |
 | G4 | the client gaps between token events (chunks less than half the shortest decode command apart are one event's; an unanswered request counts its open gap, up to when the client stopped waiting): the largest at most 10 s, the p99 at most 5 s; every gap past 2.5 s is listed |
-| G8 | no engine restart, failed request (an HTTP error but `context_length_exceeded`, an error event in a stream the server had begun, a request of a failed TTFT round, or one `/status` counts in `requests.failed`), unanswered request, Metal failure or loop tick of 5 s or more, and no exit, late start or failed request that ended the run |
+| G8 | no engine restart, failed request (an HTTP error but `context_length_exceeded`, an error event in a stream the server had begun, a request of a failed TTFT round, or one `/status` counts in `requests.failed`), unanswered request, Metal failure or loop tick of 5 s or more, no exit, late start or failed request that ended the run, and every server stopped by SIGINT alone with exit 0 |
 | G9 | the memory accounts sum to `charged_bytes` in every sample, no claim waits 30 s, nothing is owed at the end |
 | Store | a regrown expert unit taken back within 60 s of its regrow is counted; a second such take back within 60 s of the one before is an oscillation and fails |
 | Churn | the run lasted its load window (`--minutes`) and every client completed a request |

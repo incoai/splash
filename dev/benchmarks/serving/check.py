@@ -41,6 +41,8 @@ GAP_REPORT_S = 2.5
 GAP_TARGET_S = 0.5
 # G8: supervision's GPU wait limit; a loop tick that long is a hang.
 MAX_TICK_MS = 5000
+# G8: a server stops on SIGINT, as on Ctrl+C, and exits 0 (run.Server.stop).
+CLEAN_STOP = {"signals": ["SIGINT"], "exit": 0}
 # G9: the engine's resource wait timeout; a claim waiting that long starves.
 CLAIM_WAIT_MS = 30_000
 # A regrown store unit taken back within this many seconds of its regrow
@@ -249,8 +251,8 @@ def not_quiet(run: Run) -> list[str]:
 def g8_failures(run: Run) -> list[str]:
     """G8, the server's own failures: an engine restart, a request it
     failed or left unanswered, a Metal failure, a loop tick past the GPU
-    wait limit, or an exit, a start not ready in time or a failed request
-    that ended the run."""
+    wait limit, an exit, a start not ready in time or a failed request that
+    ended the run, or a stop other than CLEAN_STOP."""
     failures = []
     restarts = [
         r
@@ -285,6 +287,14 @@ def g8_failures(run: Run) -> list[str]:
         failures.append(f"G8: loop.max_tick_ms {max(ticks):.0f}")
     if run.meta.get("failure") in SERVER_FAILURES:
         failures.append(f"G8: {run.meta.get('error')}")
+    for part in run.meta.get("parts", []):
+        stop = part.get("stop") or {}
+        if stop != CLEAN_STOP:
+            failures.append(
+                f"G8: the server of {part['label']} did not stop on SIGINT with "
+                f"exit 0: signals {', '.join(stop.get('signals') or []) or 'none'}, "
+                f"exit {stop.get('exit')}"
+            )
     return failures
 
 
