@@ -110,6 +110,10 @@ const ops::Projection &QwenTarget::vocabularyProjection() const noexcept {
   return weightsBase_.logitsProjection;
 }
 
+const ops::Projection &QwenTarget::draftVocabularyProjection() const noexcept {
+  return weightsBase_.draftLogitsProjection ? *weightsBase_.draftLogitsProjection : weightsBase_.logitsProjection;
+}
+
 uint32_t QwenTarget::decodeStorageLanes(uint32_t lanes) const {
   const uint32_t rows = lanes * kVerifyRows;
   uint32_t storageRows = rows;

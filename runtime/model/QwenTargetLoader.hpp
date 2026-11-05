@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -96,6 +97,15 @@ void readQwenTargetHead(Weights &result, const Layout &layout, Files &&files, co
     result.logitsProjection.destination = ops::FloatOutput::Float32;
     file.finish();
     result.files.push_back(file.record());
+  }
+  if constexpr (requires { files.draftHead(); }) {
+    if (std::optional<WeightFile> file = files.draftHead()) {
+      result.draftLogitsProjection =
+          format.projection(*file, layout.vocabularySize, layout.hiddenSize, "draft-logits");
+      result.draftLogitsProjection->destination = ops::FloatOutput::Float32;
+      file->finish();
+      result.files.push_back(file->record());
+    }
   }
   {
     WeightFile file = files.embedding();

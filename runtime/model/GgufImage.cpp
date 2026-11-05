@@ -870,6 +870,15 @@ std::vector<Image> planImages(const GgufFile &file, std::string_view architectur
   return images;
 }
 
+Image planDraftHeadImage(const GgufFile &file, const QwenTargetDimensions &geometry) {
+  if (file.rotation()) throw GgufError("a rotated draft head is not supported");
+  std::vector<std::string> problems;
+  Builder head(file, geometry, problems, "draft-head.bin", geometry.layers, 2);
+  head.quantized("output.weight", geometry.vocabularySize, geometry.hiddenSize);
+  if (!problems.empty()) throw GgufError("draft head GGUF tensor this build cannot load: " + problems.front());
+  return head.finish();
+}
+
 StreamedRows tableRows(const GgufFile &file, const std::string &name, uint64_t columns) {
   const GgufTensor &tensor = file.require(name);
   if (file.rotation()) throw GgufError("the tables of a rotated GGUF do not stream: " + name);

@@ -75,6 +75,9 @@ class SparseRowStore;
 // (model/SparseRowStore.hpp).
 struct QwenTargetWeightsBase {
   ops::Projection logitsProjection;
+  // A second head the DFlash draft's logits pass reads (SPLASH_DRAFT_HEAD); verify keeps
+  // logitsProjection.
+  std::optional<ops::Projection> draftLogitsProjection;
   ops::EmbeddingWeights tokenEmbedding;
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
@@ -418,6 +421,8 @@ template <class Weights>
     if (const ops::BlockMoeWeights *block = qwenMoeBlock(layer)) moeBlocks.push_back(block);
   }
   includeFamilyProjections(geometry, weights);
+  if constexpr (requires { weights.draftLogitsProjection; })
+    if (weights.draftLogitsProjection) geometry.include(*weights.draftLogitsProjection);
   geometry.finish(moeBlocks, weights.logitsProjection);
   return geometry;
 }
@@ -446,6 +451,9 @@ public:
 
   [[nodiscard]] const ops::Projection &
   vocabularyProjection() const noexcept;
+  // The head the draft's logits pass reads: the draft head when loaded, else vocabularyProjection().
+  [[nodiscard]] const ops::Projection &
+  draftVocabularyProjection() const noexcept;
   // Lanes of storage the tensors of a decode step of `lanes` lanes bind: a
   // linear tile may hold more rows than the step (LinearPlan::storageRows;
   // a three-lane GGUF step on the staged tile runs its 32-row tile over four

@@ -259,6 +259,10 @@ void requireMetadata(const GgufMetadata &metadata, std::string_view architecture
 [[nodiscard]] std::vector<Image> planImages(const GgufFile &file, std::string_view architecture,
                                             const QwenTargetDimensions &geometry, PlanOptions options = {});
 
+// The image of a draft-head GGUF's output.weight alone (SPLASH_DRAFT_HEAD), any quantized format of
+// the target head's shape, unrotated, which the DFlash draft's logits pass reads instead of the target's head.
+[[nodiscard]] Image planDraftHeadImage(const GgufFile &file, const QwenTargetDimensions &geometry);
+
 // Where the GGUF holds the rows of the tensor `name`, a table of `columns`
 // values a row whose image copies its native rows as stored (a family's
 // table), for reading them from the file. Throws GgufError for a tensor of a

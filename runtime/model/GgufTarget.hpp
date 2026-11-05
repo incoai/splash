@@ -51,6 +51,8 @@ public:
   [[nodiscard]] WeightFile layer(uint32_t index);
   [[nodiscard]] WeightFile head();
   [[nodiscard]] WeightFile embedding();
+  // The draft-only head of the GGUF SPLASH_DRAFT_HEAD names, none when unset (draft PR: how it is packaged is open).
+  [[nodiscard]] std::optional<WeightFile> draftHead();
   // The image of the table the family's GGUF holds after the embedding
   // (gguf::planImages: Qwen3.8-Flash-Next's PLE n-gram table), refused when
   // its rows stream.
@@ -86,12 +88,14 @@ private:
     ExpertStoreOptions experts;
   };
   [[nodiscard]] WeightFile open(size_t index);
+  [[nodiscard]] WeightFile open(const std::shared_ptr<Planned> &planned, size_t index);
   // The plan of the table's image, or null for a family without one.
   [[nodiscard]] const gguf::Image *tablePlan() const noexcept;
 
   metal::MetalBackend &backend_;
   WeightImages &images_;
   std::shared_ptr<Planned> planned_;
+  std::shared_ptr<Planned> draft_; // the draft head's GGUF and its one image
 };
 
 } // namespace splash::model

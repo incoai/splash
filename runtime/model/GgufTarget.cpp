@@ -2,6 +2,8 @@
 #include "model/GgufPreparation.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <regex>
 #include <span>
 #include <string>
@@ -41,6 +43,17 @@ GgufTargetLoader::GgufTargetLoader(metal::MetalBackend &backend, WeightImages &i
   planned_->firstMoeLayer = geometry.leadingDenseLayers;
   planned_->table = table;
   planned_->experts = experts;
+  if (const char *path = std::getenv("SPLASH_DRAFT_HEAD"); path && *path && std::string_view(path) != "0") {
+    draft_ = std::make_shared<Planned>(std::vector<std::filesystem::path>{path});
+    draft_->images.push_back(gguf::planDraftHeadImage(draft_->source.file(), geometry));
+    std::fprintf(stderr, "splash: draft head %s (%llu image bytes)\n", path,
+                 static_cast<unsigned long long>(draft_->images.back().bytes));
+  }
+}
+
+std::optional<WeightFile> GgufTargetLoader::draftHead() {
+  if (!draft_) return std::nullopt;
+  return open(draft_, 0);
 }
 
 StreamedBlocks GgufTargetLoader::streamedExperts() const {
@@ -77,10 +90,12 @@ std::optional<GgufTargetLoader::StreamedTable> GgufTargetLoader::streamTable() c
       {"target/" + plan->name, plan->magic, plan->layer, plan->type, plan->bytes, images_.contentIdentity()}};
 }
 
-WeightFile GgufTargetLoader::open(size_t index) {
-  const gguf::Image &plan = planned_->images[index];
+WeightFile GgufTargetLoader::open(size_t index) { return open(planned_, index); }
+
+WeightFile GgufTargetLoader::open(const std::shared_ptr<Planned> &source, size_t index) {
+  const gguf::Image &plan = source->images[index];
   return images_.load({"target/" + plan.name, plan.magic, plan.layer, plan.type, plan.bytes,
-                       [&backend = backend_, planned = planned_, index](std::span<uint8_t>,
+                       [&backend = backend_, planned = source, index](std::span<uint8_t>,
                                                                          const metal::MetalBuffer &buffer) {
                          writeGgufImage(backend, buffer, planned->images[index]);
                          planned->source.checkUnchanged();
