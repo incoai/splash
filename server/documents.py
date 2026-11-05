@@ -75,6 +75,7 @@ class RenderLimits:
     text_characters: int
     rendered_bytes: int
     request_bytes: int
+    request_pages: int
 
 
 # One bounded PDF worker runs at a time. A request decodes, hashes and looks
@@ -91,11 +92,12 @@ def _render(payload, budget):
     from .document_worker import render
 
     limits = RenderLimits(
-        min(MAX_PAGES, budget.remaining_pages),
+        MAX_PAGES,
         MAX_PAGE_PIXELS,
         MAX_TEXT_CHARACTERS,
         MAX_RENDERED_BYTES,
         budget.remaining_bytes,
+        budget.remaining_pages,
     )
     values = render(payload, asdict(limits), budget.remaining_time())
     pages = tuple(Page(**value) for value in values)
@@ -114,6 +116,7 @@ def render_pages(payload, budget, limits):
                 raise APIError(
                     400, f"PDF documents must contain 1–{limits.pages} pages"
                 )
+            budget.charge_pages(len(document))
             pages = []
             total_characters = total_bytes = 0
             for index in range(len(document)):

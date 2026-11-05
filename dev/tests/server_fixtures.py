@@ -1382,6 +1382,7 @@ def full_render_limits():
         documents.MAX_TEXT_CHARACTERS,
         documents.MAX_RENDERED_BYTES,
         documents.MAX_REQUEST_DOCUMENT_BYTES,
+        documents.MAX_PAGES,
     )
 
 

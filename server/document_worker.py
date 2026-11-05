@@ -310,7 +310,9 @@ def main():
     # On macOS RLIMIT_AS aliases the advisory RSS limit. The parent instead
     # measures resident/physical footprint and terminates an over-budget child.
     budget = DocumentBudget(
-        deadline=time.monotonic() + duration, remaining_bytes=limits.request_bytes
+        deadline=time.monotonic() + duration,
+        remaining_bytes=limits.request_bytes,
+        remaining_pages=limits.request_pages,
     )
     try:
         payload = sys.stdin.buffer.read(MAX_PDF_BYTES + 1)
