@@ -14,6 +14,7 @@
 #include <dispatch/dispatch.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -965,9 +966,6 @@ struct MetalBackend::Impl {
         std::vector<uint64_t> addresses;
         std::vector<MetalAllocation *> allocations;
         std::vector<const MetalBuffer::Impl *> reaching;
-        // The last encoder that declared the table for reading, and for
-        // reading and writing (EncoderResidency).
-        uint64_t declaredIn[2] = {};
     };
 
     // One dispatch of a command, validated and resolved to its pipeline.
@@ -979,8 +977,10 @@ struct MetalBackend::Impl {
         // The argument table entries its buffers take, one bit each.
         uint32_t bufferIndices = 0;
         __strong id<MTLComputePipelineState> pipeline = nil;
-        // Its address table, one of its command's tables; null without one.
-        PreparedTable *table = nullptr;
+        // The index of its address table among its command's tables, or
+        // kNoTable.
+        static constexpr size_t kNoTable = SIZE_MAX;
+        size_t table = kNoTable;
     };
 
     // A command as submission encodes it: its dispatches, their address
@@ -993,6 +993,18 @@ struct MetalBackend::Impl {
         std::vector<std::shared_ptr<MetalAllocation>> retainedAllocations;
     };
 
+    // What EncoderResidency keeps between the commands it serves: the count
+    // of the backend's encoders, and the last encoder that declared each of
+    // a command's address tables, by its index, for reading and for reading
+    // and writing. A stamp left by an earlier command holds an older
+    // encoder's number than any of a later one, so the stamps are kept, not
+    // cleared, and grow only to the most tables a command has had: a commit
+    // allocates none for them. Used only by the submitting thread.
+    struct EncoderStamps {
+        uint64_t encoders = 0;
+        std::vector<std::array<uint64_t, 2>> tables;
+    };
+
     // What an encoder makes resident for its dispatches (useResources), as
     // opposed to the residency set (Residency), which keeps memory wired
     // between commands. The rule: an encoder declares each buffer once per
@@ -1003,21 +1015,26 @@ struct MetalBackend::Impl {
     // (setTableReach), and in turn what the bytes of the views they name
     // reach, for reading and writing. Metal makes a buffer resident for
     // every usage an encoder declared. A buffer, a table or a reach is
-    // declared in an encoder when its stamp (declaredIn) holds the encoder's
-    // number, which counts the backend's encoders, so nothing is cleared
-    // between encoders. One serves a command and keeps nothing alive: the
-    // ticket keeps what its dispatches bind and list, the owner of a table
-    // what the table reaches.
+    // declared in an encoder when its stamp (declaredIn, EncoderStamps)
+    // holds the encoder's number, which counts the backend's encoders, so
+    // nothing is cleared between encoders. One serves a command and keeps
+    // nothing alive: the ticket keeps what its dispatches bind and list, the
+    // owner of a table what the table reaches; the command's prepared data
+    // stays as prepare() made it.
     class EncoderResidency final {
     public:
-        // `encoders` counts the backend's encoders over all its commands.
-        explicit EncoderResidency(uint64_t &encoders) : encoders_(encoders) {}
+        // `stamps` are the backend's; `tables` are the command's address
+        // tables.
+        EncoderResidency(EncoderStamps &stamps, std::span<const PreparedTable> tables)
+            : stamps_(stamps), tables_(tables) {
+            if (stamps.tables.size() < tables.size()) stamps.tables.resize(tables.size());
+        }
 
         // Declares for `encoder`, which follows the last one; the caller
         // holds it until it ends.
         void begin(id<MTLComputeCommandEncoder> encoder) {
             encoder_ = encoder;
-            current_ = ++encoders_;
+            current_ = ++stamps_.encoders;
         }
 
         // Declares what bytes [offsetBytes, offsetBytes + lengthBytes) of
@@ -1040,12 +1057,13 @@ struct MetalBackend::Impl {
             }
         }
 
-        // Declares the buffers of `table`, which a dispatch lists, and what
-        // they reach.
-        void listed(PreparedTable &table, bool writes) {
-            uint64_t &declared = table.declaredIn[writes];
+        // Declares the buffers of the command's table `index`, which a
+        // dispatch lists, and what they reach.
+        void listed(size_t index, bool writes) {
+            uint64_t &declared = stamps_.tables[index][writes];
             if (declared == current_) return;
             declared = current_;
+            const PreparedTable &table = tables_[index];
             use(table.allocations, writes);
             for (const MetalBuffer::Impl *view : table.reaching)
                 reach(*view->allocation, view->offsetBytes, view->lengthBytes);
@@ -1101,8 +1119,9 @@ struct MetalBackend::Impl {
                                  usage:writes ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead];
         }
 
-        uint64_t &encoders_;
+        EncoderStamps &stamps_;
         uint64_t current_ = 0;
+        std::span<const PreparedTable> tables_;
         __unsafe_unretained id<MTLComputeCommandEncoder> encoder_ = nil;
         // A deque, so a Reach stays where reach() holds it while the reaches
         // it follows are resolved.
@@ -1110,9 +1129,7 @@ struct MetalBackend::Impl {
         std::vector<__unsafe_unretained id<MTLResource>> pending_;
     };
 
-    // Counts the encoders of the backend's commands (EncoderResidency). Used
-    // only by the submitting thread.
-    uint64_t encoderSequence = 0;
+    EncoderStamps encoderStamps;
 
     std::function<void()> operationGuard;
 
@@ -1218,8 +1235,8 @@ struct MetalBackend::Impl {
         }
         PreparedCommand command;
         command.dispatches.reserve(dispatches.size());
-        // Room for a table per dispatch, so the tables stay where the
-        // dispatches point.
+        // A command has at most a table per dispatch: room for them all, so
+        // the tables are allocated once.
         command.tables.reserve(dispatches.size());
         size_t bindings = 0;
         for (const ComputeDispatch &dispatch : dispatches) {
@@ -1289,11 +1306,12 @@ struct MetalBackend::Impl {
                             << " addresses; a table holds 1 to " << kBytesArgumentLimit / sizeof(uint64_t);
                     throw MetalBackendError(message.str());
                 }
-                auto table = std::ranges::find(command.tables, source, &PreparedTable::source);
-                if (table == command.tables.end()) {
-                    table = command.tables.emplace(table);
-                    table->source = source;
-                    table->addresses.reserve(source->size());
+                const auto known = std::ranges::find(command.tables, source, &PreparedTable::source);
+                item.table = static_cast<size_t>(known - command.tables.begin());
+                if (known == command.tables.end()) {
+                    PreparedTable &table = command.tables.emplace_back();
+                    table.source = source;
+                    table.addresses.reserve(source->size());
                     for (size_t entry = 0; entry < source->size(); ++entry) {
                         const MetalBuffer &buffer = (*source)[entry];
                         if (!buffer.impl_) {
@@ -1312,14 +1330,13 @@ struct MetalBackend::Impl {
                             throw MetalBackendError(message.str());
                         }
                         MetalAllocation *allocation = buffer.impl_->allocation.get();
-                        table->addresses.push_back(allocation->buffer.gpuAddress + buffer.impl_->offsetBytes);
-                        if (std::ranges::find(table->allocations, allocation) == table->allocations.end())
-                            table->allocations.push_back(allocation);
-                        if (!allocation->reaches.empty()) table->reaching.push_back(buffer.impl_.get());
+                        table.addresses.push_back(allocation->buffer.gpuAddress + buffer.impl_->offsetBytes);
+                        if (std::ranges::find(table.allocations, allocation) == table.allocations.end())
+                            table.allocations.push_back(allocation);
+                        if (!allocation->reaches.empty()) table.reaching.push_back(buffer.impl_.get());
                     }
                     bindings += source->size();
                 }
-                item.table = &*table;
                 claim(dispatch.addresses.index);
             }
             // Metal reads an indirect grid's three counts at a multiple of 4
@@ -1544,9 +1561,11 @@ struct MetalBackend::Impl {
         return spin;
     }
 
-    // Encodes and commits prepared dispatches and the event steps between
-    // them; the ticket retains `retained` until it is consumed.
+    // Encodes and commits prepared dispatches, which index `tables`, and the
+    // event steps between them; the ticket retains `retained` until it is
+    // consumed.
     CommandTicket commit(std::span<const PreparedDispatch> dispatches,
+                         std::span<const PreparedTable> tables,
                          std::span<const EventStep> events,
                          std::vector<std::shared_ptr<MetalAllocation>> retained,
                          CommandCompletion completion) {
@@ -1636,7 +1655,7 @@ struct MetalBackend::Impl {
                 // keep the buffers alive.
                 __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
                 NSUInteger offsets[kBufferArgumentEntries];
-                EncoderResidency encoderResidency(encoderSequence);
+                EncoderResidency encoderResidency(encoderStamps, tables);
                 for (size_t index = 0; index < dispatches.size(); ++index) {
                     encodeSteps(index);
                     const PreparedDispatch &item = dispatches[index];
@@ -1670,10 +1689,11 @@ struct MetalBackend::Impl {
                                    length:binding.sizeBytes
                                   atIndex:binding.index];
                     }
-                    if (PreparedTable *table = item.table) {
-                        encoderResidency.listed(*table, dispatch.addresses.writes);
-                        [encoder setBytes:table->addresses.data()
-                                   length:table->addresses.size() * sizeof(uint64_t)
+                    if (item.table != PreparedDispatch::kNoTable) {
+                        encoderResidency.listed(item.table, dispatch.addresses.writes);
+                        const PreparedTable &table = tables[item.table];
+                        [encoder setBytes:table.addresses.data()
+                                   length:table.addresses.size() * sizeof(uint64_t)
                                   atIndex:dispatch.addresses.index];
                     }
                     const IndirectGrid &grid = dispatch.indirectThreadgroups;
@@ -1743,7 +1763,7 @@ struct MetalBackend::Impl {
                                  CommandCompletion completion) {
         if (std::ranges::any_of(events, [](const EventStep &step) { return step.kind != EventStep::Kind::Host; }))
             throw MetalBackendError("dispatch profiling does not replay event steps");
-        PreparedCommand command = prepare(dispatches);
+        const PreparedCommand command = prepare(dispatches);
         CommandTiming total;
         auto step = events.begin();
         const auto runSteps = [&](size_t before) {
@@ -1756,7 +1776,7 @@ struct MetalBackend::Impl {
             runSteps(index);
             const PreparedDispatch &item = command.dispatches[index];
             const CommandTiming timing =
-                commit({&item, 1}, {}, command.retainedAllocations, {}).wait();
+                commit({&item, 1}, command.tables, {}, command.retainedAllocations, {}).wait();
             dispatchProfile.push_back(
                 {item.source->pipelineName, timing.gpuSeconds});
             total.gpuSeconds += timing.gpuSeconds;
@@ -2187,7 +2207,7 @@ CommandTicket MetalBackend::submitCommandAsync(const Command &command,
         return impl_->submitProfiled(command.dispatches, command.events, std::move(completion));
 #endif
     Impl::PreparedCommand prepared = impl_->prepare(command.dispatches);
-    return impl_->commit(prepared.dispatches, command.events,
+    return impl_->commit(prepared.dispatches, prepared.tables, command.events,
                          std::move(prepared.retainedAllocations),
                          std::move(completion));
 }
