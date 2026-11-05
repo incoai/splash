@@ -137,6 +137,9 @@ private struct ConversationView: View {
                 Spacer()
             }
         }
+        // The composer moves, whole, between a new chat's middle and a conversation's foot, as the
+        // mark and the transcript fade.
+        .animation(Motion.settle, value: shown == nil)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(.background)
     }

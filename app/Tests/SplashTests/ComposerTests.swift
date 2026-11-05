@@ -46,6 +46,29 @@ struct ComposerTests {
         try await waitFor(window.firstResponder === composer)
     }
 
+    /// A new chat moves the composer from the conversation's foot to the middle in one animation:
+    /// its text view travels with its controls, rather than being there at once; with Reduce
+    /// Motion it is there at once.
+    @Test func aNewChatMovesTheWholeComposer() async throws {
+        let (state, window, folder) = try chat()
+        defer { window.orderOut(nil); try? FileManager.default.removeItem(at: folder) }
+        let field = try #require(try await focusedComposer(in: window).enclosingScrollView)
+        func height() -> CGFloat { field.convert(field.bounds, to: nil).minY }
+        Self.update(window)
+        let foot = height()
+        state.chats.newChat()
+        Self.update(window)
+        let start = height()
+        try await Task.sleep(for: .seconds(1))
+        let middle = height()
+        #expect(middle > foot + 100)
+        if Motion.reduced {
+            #expect(start == middle)
+        } else {
+            #expect(start < middle - 50)
+        }
+    }
+
     /// The ring of the composer's context and the Server button's download: its fraction filled in
     /// its tint from the top clockwise, the rest a faint track, as wide as asked.
     @Test func aRingFillsItsFractionClockwiseFromTheTop() throws {

@@ -8,7 +8,7 @@ import SwiftUI
 ///   coming into view; a SwiftUI hover highlight comes at once, the page's within `quick`;
 /// - `settle`, a change of state or shape: a disclosure, rows and sections coming and going, the
 ///   control bar's stage, the switch's pill, figures that change, the sidebar and the drawer
-///   sliding away and back;
+///   sliding away and back, the composer moving between a new chat and a conversation;
 /// - `glide`, travel: a scroll to the latest message or to options opened, the mark taking its
 ///   pose as a model becomes ready.
 ///
