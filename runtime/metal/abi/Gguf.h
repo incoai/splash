@@ -55,8 +55,11 @@ struct GgufPrefillParams {
   uint32_t rows;        // rows of the chunk
   uint32_t out_stride;  // columns of a destination row
   uint32_t out_offset;  // first destination column of this segment
+  // The clamped epilogue's threshold, infinity for an unclamped one (which
+  // never reads it).
+  float clamp;
 };
-static_assert(sizeof(GgufPrefillParams) == 16, "GGUF prefill parameters are 16 bytes on both sides");
+static_assert(sizeof(GgufPrefillParams) == 20, "GGUF prefill parameters are 20 bytes on both sides");
 // The residual prefill kernels over a view of the leading inputs of wider weight rows
 // (gguf_prefill_<format>_r_leading_inputs): each row of the planes holds plane_input_size inputs, of which the
 // projection reads the first prefill.input_size.
@@ -64,7 +67,7 @@ struct GgufPrefillLeadingParams {
   GgufPrefillParams prefill;
   uint32_t plane_input_size;
 };
-static_assert(sizeof(GgufPrefillLeadingParams) == 20,
+static_assert(sizeof(GgufPrefillLeadingParams) == 24,
               "GGUF leading-input prefill parameters are 20 bytes on both sides");
 // The plain prefill kernels (gguf_prefill_<format>_a): up to three column segments of the kernel's format in one
 // dispatch, tiles in segment order, as a fused decode dispatch takes them; a single tensor is one segment.
@@ -88,8 +91,10 @@ struct GgufDecodeParams {
   uint32_t out_stride;  // columns of a destination row
   uint32_t out_offset;  // first destination column of the tensor
   uint32_t spread;      // staged tile: 1 = each column tile starts its K walk at its own step, 0 = lockstep
+  // The clamped epilogue's threshold, infinity for an unclamped one.
+  float clamp;
 };
-static_assert(sizeof(GgufDecodeParams) == 20, "GGUF decode parameters are 20 bytes on both sides");
+static_assert(sizeof(GgufDecodeParams) == 24, "GGUF decode parameters are 24 bytes on both sides");
 
 // Decode of a fused projection: up to three column segments of any formats in
 // one dispatch, tiles in segment order.

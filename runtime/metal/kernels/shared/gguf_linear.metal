@@ -36,7 +36,8 @@ inline void gguf_store_sums(thread Acc &acc, uint splits, uint split, device coh
 template <class F, ushort RowsPerSG, ushort Simdgroups, ushort TileN, ushort KS, GgufEpilogue Ep = EpNone>
 inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta, device bfloat *output,
                     uint input_size, uint output_origin, uint rows, threadgroup half *stage, threadgroup half2 *tl,
-                    uint simd_lane, uint simd_group, uint out_stride, uint out_offset, device bfloat *aux = nullptr) {
+                    uint simd_lane, uint simd_group, uint out_stride, uint out_offset, device bfloat *aux = nullptr,
+                    float clamp = 0.0f) {
   const bool owns_rows = simd_group * RowsPerSG < rows;   // uniform per simdgroup
   device bfloat *rows_input = input + ulong(simd_group) * RowsPerSG * input_size;
   auto acc = staged_accumulator<RowsPerSG, TileN, KS>(rows_input, input_size, stage);
@@ -50,7 +51,7 @@ inline void gguf_prefill_tile(device bfloat *input, device uchar *w0, device uch
     if (!acc.is_valid_element(i)) continue;
     auto index = acc.get_multidimensional_index(i);
     const ulong o = (ulong(simd_group) * RowsPerSG + index[1]) * out_stride + out_offset + output_origin + index[0];
-    output[o] = gguf_epilogue<Ep>(acc[i], aux, o);
+    output[o] = gguf_epilogue<Ep>(acc[i], aux, o, clamp);
   }
 }
 
@@ -84,7 +85,7 @@ inline void gguf_decode_tile(device bfloat *input, device uchar *w0, device ucha
   gguf_store_sums<Rows>(acc, p.splits, group.y, partials, counters + p.out_offset / GGUF_TILE_COLUMNS + group.x, p.out_stride, column0,
                         simd_group * 32 + simd_lane, arrival, [&](uint row, uint column, float v) {
     const ulong o = ulong(row) * p.out_stride + column0 + column;
-    output[o] = gguf_epilogue<Ep, Out>(v, aux, o);
+    output[o] = gguf_epilogue<Ep, Out>(v, aux, o, p.clamp);
   });
 }
 // The staged decode kernels: grid (column tiles, K partitions), two simdgroups.
@@ -114,7 +115,8 @@ using GgufDecodeKernel = void(device bfloat *, device uchar *, device uchar *, d
 #define GGUF_DECODE_ROWS64(F, f, ep, Ep) GGUF_DECODE_ROWS(F, f, ep, Ep, bfloat) GGUF_DECODE(F, f, 64, ep, Ep, bfloat)
 #define GGUF_DECODE_FORMAT(F, f)                                                                                  \
   GGUF_DECODE_ROWS64(F, f, a, EpNone) GGUF_DECODE_ROWS(F, f, a_f32, EpNone, float)                                \
-  GGUF_DECODE_ROWS64(F, f, r, EpResidual) GGUF_DECODE_ROWS64(F, f, g, EpUpWithGate)
+  GGUF_DECODE_ROWS64(F, f, r, EpResidual) GGUF_DECODE_ROWS64(F, f, g, EpUpWithGate)                  \
+  GGUF_DECODE_ROWS64(F, f, c, EpClampedUpWithGate)
 QUANT_FORMATS(GGUF_DECODE_FORMAT)
 #undef GGUF_DECODE_FORMAT
 #undef GGUF_DECODE_ROWS64
@@ -269,10 +271,12 @@ GGUF_DECODE_FUSED(8) GGUF_DECODE_FUSED(16) GGUF_DECODE_FUSED(32) GGUF_DECODE_FUS
     gguf_prefill_tile<F, GGUF_PREFILL_SIMDGROUP_ROWS, GGUF_PREFILL_SIMDGROUPS, GGUF_TILE_COLUMNS, GGUF_PREFILL_STEP, Ep>(input + ulong(first) * p.input_size, w0, w1, meta,                    \
                                              output + ulong(first) * p.out_stride, p.input_size,                   \
                                              group.y * GGUF_TILE_COLUMNS, rows, stage, tl, simd_lane, simd_group,  \
-                                             p.out_stride, p.out_offset, aux + ulong(first) * p.out_stride);       \
+                                             p.out_stride, p.out_offset, aux + ulong(first) * p.out_stride,        \
+                                             p.clamp);                                                             \
   }
 #define GGUF_PREFILL_FORMAT(F, f) \
-  GGUF_PREFILL(F, f) GGUF_PREFILL_EPILOGUE(F, f, r, EpResidual) GGUF_PREFILL_EPILOGUE(F, f, g, EpUpWithGate)
+  GGUF_PREFILL(F, f) GGUF_PREFILL_EPILOGUE(F, f, r, EpResidual) GGUF_PREFILL_EPILOGUE(F, f, g, EpUpWithGate)  \
+  GGUF_PREFILL_EPILOGUE(F, f, c, EpClampedUpWithGate)
 QUANT_FORMATS(GGUF_PREFILL_FORMAT)
 #undef GGUF_PREFILL_FORMAT
 

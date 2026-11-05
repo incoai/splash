@@ -21,12 +21,13 @@ void validate(LinearWorkload w) {
     throw std::invalid_argument("invalid linear matrix");
   if (w.phase == LinearPhase::Prefill) {
     if (!w.rows || w.rows > SPLASH_PREFILL_TOKEN_BUDGET ||
-        w.epilogue == LinearEpilogue::GateUp)
+        (w.epilogue == LinearEpilogue::GateUp || w.epilogue == LinearEpilogue::ClampedGateUp))
       throw std::invalid_argument("invalid linear prefill workload");
   } else {
     if (!w.rows || w.rows % SPLASH_TARGET_VERIFY_ROWS ||
         w.rows > SPLASH_TARGET_VERIFY_ROWS * SPLASH_MAXIMUM_BATCH_WIDTH ||
-        w.epilogue == LinearEpilogue::UpWithGate)
+        w.epilogue == LinearEpilogue::UpWithGate ||
+        w.epilogue == LinearEpilogue::ClampedUpWithGate)
       throw std::invalid_argument("invalid linear decode workload");
   }
 }
@@ -124,7 +125,10 @@ uint64_t LinearPlan::gateScratchBytes() const noexcept {
   // Gate/up runs as a gate pass into the gate scratch and an up-with-gate
   // pass, but in one pass (LinearConfig::oneGateUpPass).
   const bool needed = workload_.epilogue == LinearEpilogue::UpWithGate ||
-                      (workload_.epilogue == LinearEpilogue::GateUp && !config_.oneGateUpPass);
+                      workload_.epilogue == LinearEpilogue::ClampedUpWithGate ||
+                      ((workload_.epilogue == LinearEpilogue::GateUp ||
+                        workload_.epilogue == LinearEpilogue::ClampedGateUp) &&
+                       !config_.oneGateUpPass);
   return needed ? uint64_t{storageRows()} * workload_.matrix.outputSize * 2 : 0;
 }
 
@@ -174,7 +178,8 @@ LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogu
 LinearScratchSize Linear::decodeScratchSize(ProjectionShape shape) const {
   LinearScratchSize bound;
   for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
-    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
+    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp,
+                                LinearEpilogue::ClampedGateUp})
       bound.include(
           ggufDecodeScratchSize(decode({shape.outputSize, shape.inputSize}, lanes, epilogue), shape.registerFormats));
   // Decode plans store at most every lane's rows.
@@ -187,7 +192,8 @@ LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
   // Prefill plans take split scratch only in chunks that run the staged tile,
   // of up to kMaximumStagedPrefillRows rows (LinearGguf.cpp).
   for (uint32_t rows = 1; rows <= kMaximumStagedPrefillRows; ++rows)
-    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
+    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate,
+                                LinearEpilogue::ClampedUpWithGate})
       bound.include(plan({{shape.outputSize, shape.inputSize}, rows, LinearPhase::Prefill, epilogue}).scratchSize());
   // Every prefill plan stores at most the token budget.
   static_assert(SPLASH_PREFILL_TOKEN_BUDGET % GGUF_PREFILL_ROWS == 0, "the prefill tiles cover the budget exactly");
@@ -204,7 +210,8 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
     const Projection &p, const LinearPlan &selected, const Projection *gate) const {
   const LinearWorkload w = selected.workload();
   const auto [n, k] = w.matrix;
-  if ((w.epilogue == LinearEpilogue::GateUp) != (gate != nullptr))
+  if ((w.epilogue == LinearEpilogue::GateUp || w.epilogue == LinearEpilogue::ClampedGateUp) !=
+      (gate != nullptr))
     throw std::invalid_argument("a gate/up plan takes a gate projection and no other plan does");
   requireLeadingInputs(selected, p);
   if (gate) requireLeadingInputs(selected, *gate);
