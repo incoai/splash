@@ -50,7 +50,7 @@ SERVER_FILES = (
     "frontend.py",
     "chat_templates.py",
     "diagnostics.py",
-    "api_shapes.py",
+    "chat_messages.py",
     "chat_format.py",
     "tool_schema.py",
     "tokenization.py",

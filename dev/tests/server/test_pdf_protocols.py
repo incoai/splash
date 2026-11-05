@@ -14,7 +14,7 @@ from dev.tests.server_fixtures import (
     pdf_bytes,
     render_pdf,
 )
-from server import api_shapes, documents
+from server import chat_messages, documents
 from server.dialects import responses as responses_dialect
 from server.errors import APIError
 
@@ -43,7 +43,7 @@ class PdfProtocolTests(unittest.TestCase):
     @staticmethod
     def render(messages, deadline=FOREVER):
         return documents.render_files(
-            api_shapes.normalize_messages(messages, vision=True),
+            chat_messages.normalize_messages(messages, vision=True),
             deadline=deadline,
             without_slot=nullcontext,
         )

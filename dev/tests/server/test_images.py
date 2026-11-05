@@ -30,7 +30,7 @@ from dev.tests.server_fixtures import (
     response_events,
     responses_body,
 )
-from server import api_shapes, documents, errors, images
+from server import chat_messages, documents, errors, images
 from server import frontend as request_frontend
 from server import protocol as native_wire
 from server import server as api
@@ -646,16 +646,16 @@ class ImageRequestTest(HarnessTestCase):
                 self.assertEqual(kinds[0], "image_url")
                 self.assertEqual(kinds[-1], "file")
                 with self.assertRaisesRegex(api.APIError, "^image input"):
-                    api_shapes.normalize_messages(messages, vision=False)
+                    chat_messages.normalize_messages(messages, vision=False)
                 with self.assertRaisesRegex(api.APIError, "^PDF input"):
-                    api_shapes.normalize_messages(
+                    chat_messages.normalize_messages(
                         [{"role": "user", "content": messages[0]["content"][1:]}],
                         vision=False,
                     )
         # The document's PDF renders after its title and context.
         self.assertEqual(
             documents.render_files(
-                api_shapes.normalize_messages(converted["anthropic"], vision=True),
+                chat_messages.normalize_messages(converted["anthropic"], vision=True),
                 deadline=FOREVER,
                 without_slot=nullcontext,
             )[0]["content"][1:],

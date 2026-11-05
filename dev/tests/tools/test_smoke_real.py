@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from dev.tests import smoke_real
-from server import api_shapes, chat_templates
+from server import chat_messages, chat_templates
 from server.errors import APIError
 
 VISION = ["text", "image", "pdf"]
@@ -44,7 +44,7 @@ def media(body):
 def refusal(modality, anthropic=False):
     """The body the server answers media with when it serves without vision."""
     try:
-        api_shapes._require_vision(modality, False)
+        chat_messages._require_vision(modality, False)
     except APIError as error:
         message = error.message
     if anthropic:
@@ -1187,7 +1187,7 @@ class SmokeRealTests(unittest.TestCase):
                 self.assertFalse(
                     smoke_real.language_only_refusal(200, document, modality)
                 )
-        self.assertIn(smoke_real.VISION_UNAVAILABLE, api_shapes.VISION_UNAVAILABLE)
+        self.assertIn(smoke_real.VISION_UNAVAILABLE, chat_messages.VISION_UNAVAILABLE)
         self.assertIn(
             smoke_real.LATER_SYSTEM_UNSUPPORTED, chat_templates.LATER_SYSTEM_UNSUPPORTED
         )

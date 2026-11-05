@@ -34,7 +34,7 @@ from server import documents, json_codec, runtime, schema_validation, tool_schem
 from server import frontend as request_frontend
 from server import protocol as wire
 from server import server as api
-from server.api_shapes import normalize_messages
+from server.chat_messages import normalize_messages
 from server.dialects import anthropic as anthropic_dialect
 from server.dialects import responses as responses_dialect
 from server.errors import APIError

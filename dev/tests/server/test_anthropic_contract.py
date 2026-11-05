@@ -24,7 +24,7 @@ from dev.tests.server_fixtures import (
 )
 from server import documents
 from server import frontend as request_frontend
-from server.api_shapes import normalize_messages
+from server.chat_messages import normalize_messages
 from server.dialects import anthropic as anthropic_dialect
 from server.errors import APIError
 from server.tool_schema import normalize_tools

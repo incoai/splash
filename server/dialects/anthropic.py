@@ -4,7 +4,7 @@ its answers, a message or its server-sent events, and its error shape."""
 from functools import partial
 
 from .. import json_codec, request_fields
-from ..api_shapes import field_value, image_part, media_content
+from ..chat_messages import field_value, image_part, media_content
 from ..documents import document_parts
 from ..errors import APIError, ContextLengthError, ErrorDialect
 from ..metrics import timings_dict

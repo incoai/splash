@@ -1,4 +1,6 @@
-"""HTTP routes, protocol responses and serving-process startup."""
+"""HTTP routing and serving-process startup. One table names each endpoint's
+handler; each API's handlers, request conversion and answers live in its
+module in dialects/."""
 
 import argparse
 import json

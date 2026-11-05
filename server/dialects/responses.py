@@ -9,7 +9,7 @@ from functools import partial
 
 from .. import json_codec, request_fields
 from .. import protocol as wire
-from ..api_shapes import image_part, media_content
+from ..chat_messages import image_part, media_content
 from ..errors import APIError
 from ..lru import LRUCache
 from ..metrics import timings_dict

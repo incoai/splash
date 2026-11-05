@@ -13,21 +13,28 @@
 - `install/`: launcher, client configuration and model installation.
 - `dev/`: maintained tests, benchmarks and build/release tools.
 
-Within `server/`, `server.py` owns HTTP routing and startup, collects each
-generation and guards its stream; `dialects/` writes each API's complete and
-streamed answer (`anthropic.py`, `responses.py`, `openai.py`) from what the
-handler collects. `connections.py` holds the HTTP ingress bounds and
-`errors.py` each API's error shape; `frontend.py` prepares requests and
-history; `backend.py` owns native request lifecycles. `dialects/scoring.py`
-owns /v1/judgments and /v1/systemone: their finite-choice prompts,
-validation, preparation and answers. `output.py` parses
+Within `server/`, `server.py` owns HTTP and startup: one route table that
+names each endpoint's handler and error shape, admission, body reading, and
+the collection of each generation and the guard of its stream. Each API has
+one module in `dialects/` that holds its whole contract: its routes'
+handlers, how its requests convert to Chat, its complete and streamed
+answers, its error shape and its state (`openai.py` for Chat and text
+completions, `anthropic.py` for Messages, `responses.py` for Responses and
+the responses it stores, `scoring.py` for /v1/judgments and /v1/systemone
+and their finite-choice prompts). `request_fields.py` reads the fields every
+API reads alike, `chat_messages.py` normalizes the Chat messages every API's
+request reaches, and `frontend.py` prepares a Chat body or a text completion
+as a job. `connections.py` holds the HTTP ingress bounds and `errors.py` the
+error shape of OpenAI's APIs, which also answers on paths of no API;
+`backend.py` owns native request lifecycles. `output.py` parses
 generated text as it arrives, one parser serving streamed and complete
 responses alike, in the family's chat format (`chat_format.py`), and
 `constraints.py` compiles token constraints. Messages and
 Responses build streamed and complete responses from the same block sequence;
 the one difference is a call cut by the token limit or a stop sequence, which a
 complete Messages response leaves out. `make architecture-check` prevents lower
-layers from importing the HTTP entry module, and keeps one import style in
+layers from importing the HTTP entry module and a dialect from importing
+another, and keeps one import style in
 `server/` and `install/`: a module imports its package's modules relatively.
 The server runs as `python -m server.server`; `install/launcher.py` and
 `install/models.py`, which run as scripts, import their siblings through a

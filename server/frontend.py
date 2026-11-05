@@ -14,9 +14,9 @@ from jinja2 import TemplateError
 from . import images as image_input
 from . import protocol as wire
 from . import request_fields
-from .api_shapes import normalize_messages, template_messages
 from .backend import Job, ReasoningRequest
 from .chat_format import REASONING_EFFORTS, THINK_END, THINK_START, TOOL_CALL_OPEN
+from .chat_messages import normalize_messages, template_messages
 from .chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
     RESERVED_TEMPLATE_KWARGS,

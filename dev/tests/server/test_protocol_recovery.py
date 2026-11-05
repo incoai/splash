@@ -9,7 +9,7 @@ from dev.tests.tool_output import argument_grammar, project
 from server import errors as api_errors
 from server import server as api
 from server import tool_schema
-from server.api_shapes import normalize_messages, template_messages
+from server.chat_messages import normalize_messages, template_messages
 from server.dialects import anthropic as anthropic_dialect
 from server.thinking import ThinkingCodec
 

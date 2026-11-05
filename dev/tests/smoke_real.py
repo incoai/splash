@@ -477,7 +477,7 @@ def run_images(port: int, model: str, nonce: str) -> None:
 
 
 # What a server without vision answers an image or PDF with
-# (server/api_shapes.py, VISION_UNAVAILABLE).
+# (server/chat_messages.py, VISION_UNAVAILABLE).
 VISION_UNAVAILABLE = "this model is serving without vision"
 LATER_SYSTEM_UNSUPPORTED = "does not accept system messages after the first message"
 # Where the chat template probe of /status says later system messages go.

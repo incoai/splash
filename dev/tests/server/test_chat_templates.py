@@ -10,7 +10,7 @@ from tokenizers import AddedToken, Tokenizer, decoders, models, pre_tokenizers, 
 from transformers import PreTrainedTokenizerFast
 
 from dev.tests import server_fixtures as fixtures
-from server import api_shapes, chat_templates
+from server import chat_messages, chat_templates
 from server import frontend as request_frontend
 from server.chat_format import QWEN, REASONING_EFFORTS
 from server.chat_templates import (
@@ -1083,7 +1083,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
 
 class LeadingSystemMergeTests(unittest.TestCase):
     def test_leading_system_and_developer_messages_merge_into_one(self):
-        merged = api_shapes.normalize_messages(
+        merged = chat_messages.normalize_messages(
             [
                 {"role": "system", "content": "One"},
                 {"role": "developer", "content": [{"type": "text", "text": "Two"}]},
@@ -1105,7 +1105,7 @@ class LeadingSystemMergeTests(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            api_shapes.normalize_messages(
+            chat_messages.normalize_messages(
                 [
                     {"role": "system", "content": "  Only  "},
                     {"role": "user", "content": "x"},
@@ -1137,7 +1137,7 @@ class LeadingSystemMergeTests(unittest.TestCase):
         for messages in (responses, anthropic):
             with self.subTest(messages=messages):
                 self.assertEqual(
-                    api_shapes.normalize_messages(messages, vision=True),
+                    chat_messages.normalize_messages(messages, vision=True),
                     [
                         {"role": "system", "content": "Base\n\nDeveloper"},
                         {"role": "user", "content": "Ask"},
