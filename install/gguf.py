@@ -173,9 +173,17 @@ FLINT_PATTERNS = (
 # Each GGUF tokenizer profile (tokenizer.ggml.pre) Splash derives a tokenizer
 # for: the patterns that split text, each isolating its matches, in order,
 # and whether text is NFC-normalized before them.
+# The dbrx profile, as Ripple's own tokenizer.json splits text before its
+# byte-level BPE: the splits the DBRX converter reused (llama-3's), isolated
+# and byte-level, without a normalizer.
+DBRX_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
 TOKENIZER_PROFILES = {
     "qwen35": ((QWEN35_PATTERN,), True),
     "flint": (FLINT_PATTERNS, False),
+    "dbrx": ((DBRX_PATTERN,), False),
 }
 # The GGUF token types (llama_token_type) a byte-level BPE vocabulary uses:
 # control tokens are special added tokens, user-defined ones added tokens
@@ -700,6 +708,47 @@ FLINT_MOE_TENSORS = {
     if name != "ffn_gate_inp_shexp.weight"
 }
 
+# Ripple (ricursive): four norms a block, its gate beside its queries, its
+# value-residual lambda, and a dense FFN of a whole width.
+RIPPLE_LAYER_TENSORS = {
+    "attn_norm.weight": NORM_TYPES,
+    "post_attention_norm.weight": NORM_TYPES,
+    "ffn_norm.weight": NORM_TYPES,
+    "post_ffw_norm.weight": NORM_TYPES,
+    "attn_vres_lambda.weight": F32,
+}
+RIPPLE_ATTENTION_TENSORS = {
+    "attn_q.weight": FORMAT_TYPES,
+    "attn_gate.weight": FORMAT_TYPES,
+    "attn_k.weight": FORMAT_TYPES,
+    "attn_v.weight": FORMAT_TYPES,
+    "attn_q_norm.weight": NORM_TYPES,
+    "attn_k_norm.weight": NORM_TYPES,
+    "attn_output.weight": FORMAT_TYPES,
+}
+
+
+def ripple_text_config(metadata, arch):
+    """What Ripple's config.json states beyond the sizes every architecture's
+    does, from its header: the FFN's width, the sliding window, the scale of
+    the token embeddings and the SwiGLU clamp, the RoPE base, the layers that
+    slide (attention.sliding_window_pattern) as the release's layer_types
+    names them, and the tokens that begin and pad a turn. The header states
+    one end-of-turn token, which the tokenizer's configuration carries."""
+    pattern = layer_pattern(metadata, arch, "attention.sliding_window_pattern")
+    return {
+        "intermediate_size": metadata.positive(arch + ".feed_forward_length"),
+        "sliding_window": metadata.positive(arch + ".attention.sliding_window"),
+        "embed_scale": metadata.require(arch + ".embedding_scale", float),
+        "ffn_clamp_threshold": metadata.require(arch + ".swiglu_clamp", float),
+        "rope_theta": metadata.require(arch + ".rope.freq_base", float),
+        "layer_types": [
+            "sliding_attention" if slides else "full_attention" for slides in pattern
+        ],
+        "bos_token_id": metadata.require("tokenizer.ggml.bos_token_id", int),
+        "pad_token_id": metadata.require("tokenizer.ggml.padding_token_id", int),
+    }
+
 
 @dataclass(frozen=True)
 class Architecture:
@@ -765,6 +814,16 @@ ARCHITECTURES = {
         hybrid=False,
         leading_dense=True,
         text_config=flint_text_config,
+        flat=True,
+    ),
+    "ricursive": Architecture(
+        "ricursive",
+        MODEL_TENSORS,
+        RIPPLE_LAYER_TENSORS,
+        moe=False,
+        attention_tensors=RIPPLE_ATTENTION_TENSORS,
+        hybrid=False,
+        text_config=ripple_text_config,
         flat=True,
     ),
 }
