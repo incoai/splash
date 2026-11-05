@@ -213,17 +213,61 @@ struct DrawerTests {
         try await waitFor(window.firstResponder === window)
     }
 
-    /// A log shows its last 512 KB, then what is written to it.
-    @Test func aLogShowsItsLast512KBThenWhatIsWritten() async throws {
-        let (folder, file) = try Self.log((1...50_000).map { String(format: "line %06d\n", $0) }.joined())
+    /// A log shows the lines that start in its last 512 KB, then what is written to it.
+    @Test func aLogShowsTheLinesOfItsLast512KBThenWhatIsWritten() async throws {
+        // 12 bytes a line: the last 512 KiB of 600,000 start inside line 6,310.
+        let (folder, file) = try Self.log((1...50_000).map(Self.line).joined())
         let window = Self.window(LogText(url: file))
         defer { Self.close(window); try? FileManager.default.removeItem(at: folder) }
         let text = try await Self.shownText(in: window)
-        let written = try Data(contentsOf: file)
-        #expect(written.count > 512 * 1024)
-        #expect(text.string == String(decoding: written.suffix(512 * 1024), as: UTF8.self))
+        #expect(text.string == (6_311...50_000).map(Self.line).joined())
         try Self.append("appended\n", to: file)
         try await waitFor(text.string.hasSuffix("line 050000\nappended\n"))
+    }
+
+    /// A character written in two parts, as a write can end inside one, shows whole.
+    @Test func aCharacterWrittenInTwoPartsShowsWhole() async throws {
+        let (folder, file) = try Self.log("first\n")
+        let window = Self.window(LogText(url: file))
+        defer { Self.close(window); try? FileManager.default.removeItem(at: folder) }
+        let text = try await Self.shownText(in: window)
+        let dot = Array("·".utf8)
+        try Self.append(Data("second\nStarted ".utf8) + dot.prefix(1), to: file)
+        try await waitFor(text.string.contains("second\n"))
+        try Self.append(Data(dot.dropFirst()) + Data(" a/b\n".utf8), to: file)
+        try await waitFor(text.string.hasSuffix(" a/b\n"))
+        #expect(text.string == "first\nsecond\nStarted · a/b\n")
+    }
+
+    /// A log read in parts gives whole lines, a character split between two reads whole, and the
+    /// bytes after the last newline last; read from inside it, its lines from its first newline.
+    @Test func aLogReadInPartsGivesWholeLines() {
+        let dot = Array("·".utf8)
+        var lines = LogLines()
+        #expect(lines.take(Data("a\nb".utf8) + dot.prefix(1)) == Data("a\n".utf8))
+        #expect(lines.take(Data(dot.dropFirst()) + Data("c\nd".utf8)) == Data("b·c\n".utf8))
+        #expect(lines.rest() == Data("d".utf8) && lines.rest().isEmpty)
+        var inside = LogLines(inside: true)
+        #expect(inside.take(Data("ne beg".utf8)).isEmpty)
+        #expect(inside.take(Data("un before\nnext\nla".utf8)) == Data("next\n".utf8))
+        #expect(inside.rest() == Data("la".utf8))
+    }
+
+    /// A log followed line by line, as the app follows the server's and the installer's, gives
+    /// each line once it ends, a character split between two writes whole, and no empty line;
+    /// finished, the last line too, though it lacks its newline.
+    @Test func aLogTailGivesEachLineOnceItEnds() async throws {
+        let (folder, file) = try Self.log("")
+        defer { try? FileManager.default.removeItem(at: folder) }
+        var lines: [String] = []
+        let tail = try #require(LogTail(file) { lines.append($0) })
+        let dot = Array("·".utf8)
+        try Self.append(Data("first\n\nStarted ".utf8) + dot.prefix(1), to: file)
+        try await waitFor(lines == ["first"])
+        try Self.append(Data(dot.dropFirst()) + Data(" a/b\nlast".utf8), to: file)
+        try await waitFor(lines.count == 2)
+        tail.finish()
+        #expect(lines == ["first", "Started · a/b", "last"])
     }
 
     /// A log written again from its start, emptied in place or replaced as each start replaces
@@ -315,10 +359,19 @@ struct DrawerTests {
         return (folder, file)
     }
 
+    /// Line `number` of a test's log, 12 bytes.
+    private static func line(_ number: Int) -> String {
+        String(format: "line %06d\n", number)
+    }
+
     private static func append(_ text: String, to file: URL) throws {
+        try append(Data(text.utf8), to: file)
+    }
+
+    private static func append(_ data: Data, to file: URL) throws {
         let handle = try FileHandle(forWritingTo: file)
         try handle.seekToEnd()
-        try handle.write(contentsOf: Data(text.utf8))
+        try handle.write(contentsOf: data)
         try handle.close()
     }
 

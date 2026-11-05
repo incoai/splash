@@ -115,13 +115,49 @@ final class ChildProcess: @unchecked Sendable {
     }
 }
 
+/// A log read as it grows, in whole lines, so that no read decodes part of a line or of a
+/// character: each read gives the lines it ends and keeps the bytes after its last newline for the
+/// next. Reads that start inside the log start after its first newline, where a line does.
+struct LogLines {
+    private var pending = Data()
+    /// Whether the bytes up to the next newline end a line begun before the reads.
+    private var midLine: Bool
+
+    /// `inside`: whether the reads start inside the log rather than at its start.
+    init(inside: Bool = false) {
+        midLine = inside
+    }
+
+    /// The whole lines `data` ends, each with its newline.
+    mutating func take(_ data: Data) -> Data {
+        pending.append(data)
+        if midLine {
+            guard let end = pending.firstIndex(of: 0x0A) else {
+                pending.removeAll()
+                return Data()
+            }
+            pending.removeSubrange(...end)
+            midLine = false
+        }
+        guard let end = pending.lastIndex(of: 0x0A) else { return Data() }
+        defer { pending.removeSubrange(...end) }
+        return pending[...end]
+    }
+
+    /// The bytes after the last newline: a last line that lacks its newline.
+    mutating func rest() -> Data {
+        defer { pending.removeAll() }
+        return pending
+    }
+}
+
 /// Follows a log file as it grows, one call per complete line, on the main queue.
 @MainActor
 final class LogTail {
     private let handle: FileHandle
     private let source: DispatchSourceFileSystemObject
     private let line: (String) -> Void
-    private var pending = Data()
+    private var lines = LogLines()
 
     init?(_ url: URL, line: @escaping (String) -> Void) {
         let descriptor = open(url.path, O_RDONLY | O_CLOEXEC)
@@ -139,19 +175,14 @@ final class LogTail {
     /// Reads what the file holds now, the last line too if it lacks its newline, and stops.
     func finish() {
         read()
-        if !pending.isEmpty { line(String(decoding: pending, as: UTF8.self)) }
-        pending.removeAll()
+        let last = lines.rest()
+        if !last.isEmpty { line(String(decoding: last, as: UTF8.self)) }
         source.cancel()
     }
 
     private func read() {
         guard let data = try? handle.readToEnd(), !data.isEmpty else { return }
-        pending.append(data)
-        while let end = pending.firstIndex(of: 0x0A) {
-            let text = String(decoding: pending[pending.startIndex..<end], as: UTF8.self)
-            pending.removeSubrange(pending.startIndex...end)
-            if !text.isEmpty { line(text) }
-        }
+        for text in lines.take(data).split(separator: 0x0A) { line(String(decoding: text, as: UTF8.self)) }
     }
 }
 

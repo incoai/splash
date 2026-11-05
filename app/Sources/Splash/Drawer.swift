@@ -324,9 +324,10 @@ private struct TerminalPane: View {
     }
 }
 
-/// A log file, read only, as it grows: its last 512 KB at first, then each line as it is written,
-/// kept in view while the end is; ⌘F finds in it. A file written again from its start, as the
-/// server's log is at each start, is read again from there.
+/// A log file, read only, as it grows, in whole lines (`LogLines`): those that start in its last
+/// 512 KB at first, then each line as it is written, kept in view while the end is; ⌘F finds in
+/// it. A file written again from its start, as the server's log is at each start, is read again
+/// from there.
 struct LogText: NSViewRepresentable {
     let url: URL
 
@@ -359,6 +360,7 @@ struct LogText: NSViewRepresentable {
         private var source: DispatchSourceFileSystemObject?
         private var handle: FileHandle?
         private var offset: UInt64 = 0
+        private var lines = LogLines()
         private weak var text: NSTextView?
         private var url: URL?
 
@@ -385,7 +387,11 @@ struct LogText: NSViewRepresentable {
             let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
             self.handle = handle
             let size = (try? handle.seekToEnd()) ?? 0
-            offset = size > 512 * 1024 ? size - 512 * 1024 : 0
+            // The lines that start in its last 512 KB: read from the byte before those, a newline
+            // where one starts with them.
+            let tail: UInt64 = 512 * 1024
+            offset = size > tail ? size - tail - 1 : 0
+            lines = LogLines(inside: size > tail)
             read(scrolling: true)
             let source = DispatchSource.makeFileSystemObjectSource(
                 fileDescriptor: handle.fileDescriptor, eventMask: [.extend, .write, .delete, .rename], queue: .main)
@@ -407,14 +413,17 @@ struct LogText: NSViewRepresentable {
             if size < offset {
                 // Written again from its start.
                 offset = 0
+                lines = LogLines()
                 storage.setAttributedString(NSAttributedString())
             }
             try? handle.seek(toOffset: offset)
             guard let data = try? handle.readToEnd(), !data.isEmpty else { return }
             offset += UInt64(data.count)
+            let added = lines.take(data)
+            guard !added.isEmpty else { return }
             let atEnd = (text.enclosingScrollView?.verticalScroller?.floatValue ?? 1) > 0.98
                 || text.visibleRect.maxY >= text.bounds.maxY - 4
-            storage.append(NSAttributedString(string: String(decoding: data, as: UTF8.self), attributes: [
+            storage.append(NSAttributedString(string: String(decoding: added, as: UTF8.self), attributes: [
                 .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
                 .foregroundColor: NSColor.labelColor,
             ]))
