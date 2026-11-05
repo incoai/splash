@@ -26,10 +26,10 @@ void Embedding::add(metal::CommandGraph &graph, metal::MetalBuffer tokens,
   requireBytes(output, uint64_t{rows} * table.inputSize * sizeof(uint16_t), "embedding output");
   const NativeRows &native = table.blocks();
   const QuantFormat &format = native.format();
-  // Every token's row of native blocks (kernels/shared/embedding.metal).
-  if (table.inputSize % format.block_elements) throw std::invalid_argument("native token rows take whole blocks");
-  requireBytes(native.rows, uint64_t{table.outputSize} * (table.inputSize / format.block_elements) * format.block_bytes,
-               "token table");
+  // Every token's row as stored, which the gather reads (kernels/shared/embedding.metal).
+  const uint64_t rowBytes = quant_stored_row_bytes(native.formatId, table.inputSize);
+  if (!rowBytes) throw std::invalid_argument("token rows take whole blocks of their format");
+  requireBytes(native.rows, uint64_t{table.outputSize} * rowBytes, "token table");
   const GgufEmbedParams params{rows, table.outputSize, table.inputSize};
   if (table.rotation) {
     // One threadgroup per rotation block of a row, which gathers the block

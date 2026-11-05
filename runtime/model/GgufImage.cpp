@@ -40,8 +40,9 @@ static_assert([] {
 // NVFP4's native rows from (TensorRows::ggufNvfp4RowBytes).
 uint32_t imageFormat(uint32_t type) { return type == ggml::kNVFP4 ? GGUF_FMT_NVFP4 : gguf_format_of(type); }
 
-// A type stored as a format's native rows, BF16 and F16 among them: the rows
-// projections multiply and the embedding kernels gather.
+// A type of a format, BF16 and F16 among them: repacked into the planes
+// projections multiply, or rows as stored (storedRowBytes), which the
+// embedding kernels gather.
 bool quantizedType(uint32_t type) { return imageFormat(type) != GGUF_FMT_COUNT; }
 bool floatType(uint32_t type) { return type == ggml::kF32; }
 // The 16-bit float types: a norm of one widens to F32 (floatNorm), a
@@ -58,6 +59,15 @@ bool normType(uint32_t type) { return floatType(type) || float16Type(type); }
 // A tensor the float projection runs in fp32 (floatTensor): F32, or BF16 as
 // stored.
 bool floatProjectionType(uint32_t type) { return floatType(type) || type == ggml::kBF16; }
+
+// The bytes of a row of a tensor as the image copies it: F32's values, or
+// its format's rows as stored (quant_stored_row_bytes), NVFP4's native rows
+// for llama.cpp's NVFP4 (Builder::tensorRows); 0 for a width that holds none.
+uint64_t storedRowBytes(const GgufTensor &tensor) {
+  return floatType(tensor.type) ? tensor.columns() * sizeof(float)
+                                : quant_stored_row_bytes(imageFormat(tensor.type), tensor.columns());
+}
+
 // A MoE router, which the float projection runs in fp32 as stored (router):
 // a float projection's type, or a quantized one but F16, whose native rows it
 // decodes.
@@ -313,13 +323,13 @@ public:
     if (const GgufTensor *tensor = floatVector(name, elements)) image_.copy(tensorRows(*tensor, 1, tensor->bytes));
   }
 
-  // Native token rows, gathered by the embedding kernel.
+  // Token rows as stored, gathered by the embedding kernel.
   void embeddingRows(const std::string &name) {
     const GgufTensor *tensor = find(name, quantizedType);
     if (!tensor) return;
     if (tensor->rows() != geometry_.vocabularySize || tensor->columns() != geometry_.hiddenSize)
       throw GgufError("unexpected shape for " + name);
-    copiedRows(*tensor, nativeRowBytes(*tensor));
+    copiedRows(*tensor, storedRowBytes(*tensor));
   }
 
   // An F32 or BF16 tensor [rows, columns] as stored, which the float
@@ -330,7 +340,7 @@ public:
     if (tensor->rows() != rows || tensor->columns() != columns)
       throw GgufError("expected an F32 or BF16 [" + std::to_string(rows) + ", " + std::to_string(columns) +
                       "] tensor: " + name);
-    copiedRows(*tensor, floatRowBytes(*tensor));
+    copiedRows(*tensor, storedRowBytes(*tensor));
   }
 
   // The MoE router [rows, columns] as stored, which the float projection runs
@@ -342,7 +352,7 @@ public:
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns)
       throw GgufError("expected a [" + std::to_string(rows) + ", " + std::to_string(columns) + "] router: " + name);
-    copiedRows(*tensor, floatProjectionType(tensor->type) ? floatRowBytes(*tensor) : nativeRowBytes(*tensor));
+    copiedRows(*tensor, storedRowBytes(*tensor));
   }
 
   // An F32, BF16 or Q8_0 tensor [rows, columns] as F32 rows: as stored, or
@@ -365,14 +375,15 @@ public:
                              : Conversion::None);
   }
 
-  // A table's native rows [rows, columns] in a GGUF format, after their
-  // descriptor (a family's table, which no projection reads), as stored but
-  // for GGUF's NVFP4 (tableRows).
+  // A table's rows [rows, columns] in a GGUF format, after their descriptor
+  // (a family's table, which no projection reads), as stored but for GGUF's
+  // NVFP4 (tableRows). An F16 table's values reach the model rounded to
+  // bf16, as the gather writes them.
   void nativeTable(const std::string &name, uint64_t columns) {
     const GgufTensor *tensor = find(name, quantizedType);
     if (!tensor) return;
     if (tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
-    copiedRows(*tensor, nativeRowBytes(*tensor));
+    copiedRows(*tensor, storedRowBytes(*tensor));
   }
 
   // Value heads of headRows rows from row `from` on, in grouped order.
@@ -434,16 +445,6 @@ private:
       rows.scale = {&file_.source(scale->file), scale->offset, scale->bytes, count / values};
     }
     return rows;
-  }
-
-  // The bytes of a row of a tensor's native blocks.
-  static uint64_t nativeRowBytes(const GgufTensor &tensor) {
-    return ggufRowBytes(kQuantFormats[imageFormat(tensor.type)], tensor.columns());
-  }
-  // The bytes of a row of an F32 or BF16 tensor's values as stored, never
-  // BF16's native rows: a row need not be whole blocks of 256 values.
-  static uint64_t floatRowBytes(const GgufTensor &tensor) {
-    return tensor.columns() * (tensor.type == ggml::kBF16 ? sizeof(uint16_t) : sizeof(float));
   }
 
   // A tensor's rows as the image holds them (tensorRows), rowBytes each,
@@ -926,13 +927,13 @@ std::vector<Image> planImages(const GgufFile &file, std::string_view architectur
 StreamedRows tableRows(const GgufFile &file, const std::string &name, uint64_t columns) {
   const GgufTensor &tensor = file.require(name);
   if (file.rotation()) throw GgufError("the tables of a rotated GGUF do not stream: " + name);
-  // A table's image holds its rows as stored (Builder::nativeTable,
-  // copiedRows), but for NVFP4's, which the writer rebuilds.
+  // A table's image holds its rows as stored (storedRowBytes), but for
+  // NVFP4's, which the writer rebuilds.
   if (!quantizedType(tensor.type) || tensor.type == ggml::kNVFP4)
     throw GgufError("a table of type " + ggmlTypeName(tensor.type) + " does not stream: " + name);
   if (tensor.columns() != columns || !tensor.rows()) throw GgufError("unexpected shape for " + name);
   const uint32_t format = imageFormat(tensor.type);
-  const uint64_t rowBytes = ggufRowBytes(kQuantFormats[format], tensor.columns());
+  const uint64_t rowBytes = storedRowBytes(tensor);
   if (!rowBytes || rowBytes > UINT32_MAX || tensor.rows() * rowBytes != tensor.bytes)
     throw GgufError("unexpected size for " + name);
   const WeightSource &source = file.source(tensor.file);

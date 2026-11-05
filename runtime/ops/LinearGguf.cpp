@@ -508,14 +508,11 @@ QuantizedSegment QuantizedSegment::rows(uint32_t formatId, uint32_t outputSize, 
     throw std::invalid_argument("rows take F32 or BF16 values or whole native blocks of a quantized GGUF format");
   return {std::move(rows), {}, {}, outputSize, inputSize, 0, formatId, Layout::Rows};
 }
-// F32 and BF16 values each their own; a quantized format's native blocks
-// (kernels/common/gguf_embedding_formats.h).
+// F32 values each their own, any other format's rows as stored; none of
+// F16, which the float projection does not run.
 uint64_t QuantizedSegment::rowBytes(uint32_t formatId, uint32_t inputSize) noexcept {
   if (formatId == kFloat32) return uint64_t{inputSize} * sizeof(float);
-  if (formatId == GGUF_FMT_BF16) return uint64_t{inputSize} * sizeof(uint16_t);
-  if (formatId >= GGUF_FMT_COUNT || formatId == GGUF_FMT_F16) return 0;
-  const QuantFormat &f = kQuantFormats[formatId];
-  return inputSize % f.block_elements ? 0 : uint64_t{inputSize} / f.block_elements * f.block_bytes;
+  return formatId == GGUF_FMT_F16 ? 0 : quant_stored_row_bytes(formatId, inputSize);
 }
 const QuantFormat &QuantizedSegment::format() const noexcept { return kQuantFormats[formatId]; }
 const char *QuantizedSegment::name() const noexcept { return formatId == kFloat32 ? "f32" : format().name; }

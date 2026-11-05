@@ -535,9 +535,9 @@ void checkRotation(const std::filesystem::path &directory) {
 }
 
 // The rows of a table that streams (gguf::tableRows), Flash-Next's PLE table
-// (--ple-memory): where the file holds them, as its image copies them;
-// refused for a type its image does not copy as stored and for another
-// width.
+// (--ple-memory): where the file holds them, as its image copies them, BF16's
+// and F16's 160 values as stored though no whole native block; refused for a
+// type its image does not copy as stored and for another width.
 void checkPleTableRows(const std::filesystem::path &directory) {
   const uint32_t columns = model::Qwen4ExpLayout{}.pleHeadDimension;
   std::mt19937 rng(7);
@@ -578,6 +578,12 @@ void checkPleTableRows(const std::filesystem::path &directory) {
   check(planned(kQ8_0, columns, 100, 170, rows, table).empty() && rows && rows->rowBytes == 170 &&
             rows->format == GGUF_FMT_Q80,
         "a Q8_0 PLE table streams as 170-byte rows");
+  for (const uint32_t type : {model::ggml::kBF16, model::ggml::kF16}) {
+    rows.reset();
+    check(planned(type, columns, 100, 320, rows, table).empty() && rows && rows->rowBytes == 320 &&
+              rows->format == gguf_format_of(type),
+          "a " + model::ggmlTypeName(type) + " PLE table streams as 320-byte rows");
+  }
   rows.reset();
   check(planned(0, columns, 10, uint64_t{columns} * 4, rows, table).find("does not stream") != std::string::npos,
         "an F32 PLE table does not stream");
@@ -686,7 +692,8 @@ void checkHyperConnections(const std::filesystem::path &directory) {
 // them, and every other image is the same. A table that does not stream,
 // GGUF's NVFP4, which the writer rebuilds, is refused by name where it
 // would, and loads in its image, which the weights' sizes fall back on
-// (model::streamableWeights). A GGUF that declares another PLE layer is
+// (model::streamableWeights). A BF16 or F16 table of Flash-Next's 160 values
+// loads and streams as stored. A GGUF that declares another PLE layer is
 // refused.
 void checkPleTable(const std::filesystem::path &directory) {
   const model::QwenTargetDimensions g = qwen4ExpGeometry();
@@ -735,6 +742,22 @@ void checkPleTable(const std::filesystem::path &directory) {
             refused.error->find("does not stream: per_layer_token_embd.weight") != std::string::npos,
         "planner loads an NVFP4 PLE table and refuses by name to stream it" +
             (whole.error ? ": " + *whole.error : std::string()));
+  model::QwenTargetDimensions flashNext = g;
+  flashNext.pleHeadDimension = 160;
+  for (const uint32_t type : {model::ggml::kBF16, model::ggml::kF16}) {
+    TensorTypes float16 = types;
+    float16["per_layer_token_embd.weight"] = type;
+    std::vector<Tensor> wideTensors = targetTensors(flashNext, float16);
+    writeGguf(path, wideTensors, flashNext);
+    const Plan copied = plan(path, flashNext), stream = plan(path, flashNext, {.streamTable = true});
+    const std::optional<model::gguf::StreamedRows> streamedRows =
+        stream.error ? std::nullopt : stream.images.back().streamedRows;
+    check(!copied.error && asStored(copyOf(copied.images.back(), "per_layer_token_embd.weight"),
+                                    tensorNamed(wideTensors, "per_layer_token_embd.weight").data) &&
+              streamedRows && streamedRows->rowBytes == 320 && streamedRows->format == gguf_format_of(type),
+          "planner loads and streams a " + model::ggmlTypeName(type) + " PLE table of 160 values as stored" +
+              (copied.error ? ": " + *copied.error : stream.error ? ": " + *stream.error : std::string()));
+  }
   model::QwenTargetDimensions other = g;
   other.pleLayer = 1;
   splash::test::writeFile(path, test_gguf::file(metadata(other), tensors));

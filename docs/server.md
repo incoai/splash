@@ -324,7 +324,9 @@ memory requirements also include the cache and Metal staging buffers. The
 rows each command gathers are read through a host cache with a SIZE-byte
 cache and working-memory reservation, auto's share of the budget: at most
 the rows of every id a 128K-token prompt stages, 2M rows, 237 MiB with
-IQ4_NL's 90-byte rows. The cache hits only rows read before, and a request
+IQ4_NL's 90-byte rows. A BF16 or F16 table streams as stored, 320 bytes a
+row (the gather rounds F16 values to bf16), so auto, which reserves rows by
+count, reserves about 1.9 times the bytes of a Q8_0 table. The cache hits only rows read before, and a request
 reads few distinct rows (a 128K-token prompt about 1.1M): caches from
 256 MiB, which no run filled, to 2 GiB hit as often, while each GiB more of
 the expert store makes a 24 GB Mac decode 11-23% faster, so the experts take

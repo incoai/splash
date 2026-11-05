@@ -345,7 +345,8 @@ std::filesystem::path writeGgufTensor(const std::filesystem::path &path,
 }
 
 // GGUF image readers hold a tensor to the sizes the layout expects, read F16
-// and BF16 token rows as their formats' native rows, read a quantized
+// and BF16 token rows as stored, also of Flash-Next's 160 PLE values, which
+// are no whole native block, read a quantized
 // tensor's native rows as a float segment only where one is read (the MoE
 // router), never as a projection, and a token gather writes only into
 // buffers holding its rows.
@@ -422,18 +423,18 @@ void testGgufImageLayout(MetalBackend &backend, const std::filesystem::path &roo
             (void)splash::model::readFloatSegment(file, "router");
         },
         "GGUF rows are inconsistent", "GGUF planes were read as a float segment");
-    // A GGUF's F16 and BF16 token rows read as the native rows of their formats.
+    // A GGUF's F16 and BF16 token rows read as their formats' rows as stored.
     for (const auto &[type, format] : {std::pair{splash::model::ggml::kF16, GGUF_FMT_F16},
-                                       std::pair{splash::model::ggml::kBF16, GGUF_FMT_BF16}}) {
-        WeightFile file = loaded(writeGgufTensor(root / ("embedding-" + std::to_string(type) + ".bin"),
-                                                 {.type = type,
-                                                  .outputSize = rows,
-                                                  .inputSize = columns,
-                                                  .plane0Bytes = uint64_t{rows} * columns * 2}));
-        const auto table = splash::model::readBlockEmbedding(file, rows, columns, "embedding");
-        file.finish();
-        require(table.blocks().formatId == format, "GGUF 16-bit embedding did not read as its format's rows");
-    }
+                                       std::pair{splash::model::ggml::kBF16, GGUF_FMT_BF16}})
+        for (const uint32_t width : {columns, 160u}) {
+            WeightFile file = loaded(writeGgufTensor(
+                root / ("embedding-" + std::to_string(type) + "-" + std::to_string(width) + ".bin"),
+                {.type = type, .outputSize = rows, .inputSize = width, .plane0Bytes = uint64_t{rows} * width * 2}));
+            const auto table = splash::model::readBlockEmbedding(file, rows, width, "embedding");
+            file.finish();
+            require(table.blocks().formatId == format,
+                    "GGUF 16-bit embedding did not read as its format's rows at " + std::to_string(width) + " values");
+        }
     WeightFile file = loaded(embedding);
     const auto table = splash::model::readBlockEmbedding(file, rows, columns, "embedding");
     file.finish();
