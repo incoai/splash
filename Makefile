@@ -263,6 +263,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/KvSlotFormat.cpp \
 	runtime/ops/RoPE.cpp \
 	runtime/ops/RowCopy.cpp \
+	runtime/ops/ValueMix.cpp \
 	runtime/ops/Sampling.cpp \
 	runtime/ops/Vision.cpp \
 	runtime/metal/DeviceCapabilities.cpp \
