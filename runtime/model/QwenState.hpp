@@ -280,14 +280,14 @@ public:
   // cached state holds: without idle rings no number of states makes up the
   // lack, and it gives no value.
   [[nodiscard]] std::optional<uint32_t> statesToActivate() const noexcept;
-  // What releaseOneIdle(true), called until it gives none, releases once
-  // `evictedStates` more cached states have returned their cell and context
-  // window to the pool (QwenBufferPool::give), at the layout's sizes, which
-  // each allocation covers: a lane keeps two cells, the draft rings and a
-  // window, and cells of no bytes count none. With `afterStart`, of the pool
-  // a lane's activation and a state reserved beside it leave once they took
-  // their buffers from it first (startBytes).
-  [[nodiscard]] uint64_t idleBytes(uint32_t evictedStates, bool afterStart) const noexcept;
+  // What releaseOneIdle(keepLane), called until it gives none, releases
+  // once `evictedStates` more cached states have returned their cell and
+  // context window to the pool (QwenBufferPool::give), at the layout's
+  // sizes, which each allocation covers: with keepLane a lane keeps two
+  // cells, the draft rings and a window, and cells of no bytes count none.
+  // With `afterStart`, of the pool a lane's activation and a state reserved
+  // beside it leave once they took their buffers from it first (startBytes).
+  [[nodiscard]] uint64_t idleBytes(uint32_t evictedStates, bool afterStart, bool keepLane) const noexcept;
   // What a lane's activation and a state reserved beside it allocate: their
   // buffers (kStartBuffers) that the idle pool lacks.
   [[nodiscard]] uint64_t startBytes() const noexcept;

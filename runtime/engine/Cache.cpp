@@ -662,7 +662,7 @@ Need Cache::growthNeed(uint32_t pages) const {
   const uint64_t extent = pool_.extentPages();
   const uint32_t free = pool_.freePageCount(full);
   const uint64_t beyond = pages - std::min(pages, free);
-  Need need{.bytes = (beyond + extent - 1) / extent * extent * pool_.bytesPerPage(full)};
+  Need need{.bytes = (beyond + extent - 1) / extent * extent * pool_.bytesPerPage(full), .kv = true};
   need.keptPages[static_cast<size_t>(full)] = std::min(pages, free);
   return need;
 }

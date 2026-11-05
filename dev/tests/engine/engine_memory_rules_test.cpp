@@ -872,6 +872,93 @@ void testALeftOutLaneHoldsRoomForTheLimitFromItsFirstWait() {
           "the left-out lane's claim held room " + std::to_string(lastHeld - waited) + " ms after it first waited");
 }
 
+// A lane alone in service grows into the pooled buffers a lane starts from once nothing else meets its KV: the memory
+// plan gives one lane the whole context beside its own state, not beside a second lane's.
+void testALoneLaneGrowsIntoThePooledLaneBuffers() {
+  constexpr uint64_t kPageBytes = 4096, kLane = 64 * 1024;
+  constexpr uint32_t kPages = 256;
+  test::EngineHarness harness(
+      {.pages = kPages, .memory = test::FakeMemory::Config{}, .limits = {.limitBytes = kLane + kPages * kPageBytes}});
+  harness.model.laneFootprintBytes = kLane;
+  // Request 1 runs beside request 2's first command and ends, leaving its
+  // lane's buffers in the pool; request 2's KV then needs them.
+  bool beside = false;
+  harness.model.beginObserver = [&] {
+    beside = beside || (harness.model.lastBeginId == 2 && harness.model.requests.contains(1));
+  };
+  for (const auto &[id, tokens] : {std::pair<uint64_t, uint32_t>{1, 40}, {2, 7800}}) {
+    EngineRequest value = harness.request(id, std::vector<uint32_t>(tokens, static_cast<uint32_t>(id)));
+    value.deadlineMilliseconds = 1e9;
+    harness.engine.submit(std::move(value));
+  }
+  harness.runUntilIdle();
+  require(beside, "request 2 did not start beside request 1");
+  require(harness.events.completedCount == 2 && harness.events.failedCount == 0,
+          "a lone lane whose context fits beside its own state failed: " +
+              std::to_string(harness.events.failedCount) + " failed, " +
+              std::to_string(harness.model.pooledLaneBytes) + " bytes of a lane's buffers kept in the pool");
+}
+
+// The budget of one lane and the whole KV, as the memory plan sizes it, and the page ids of that KV: a lane alone
+// at the whole context leaves its pages cached, with every extent allocated and the budget not reached. The next
+// request's pages are refused as the budget refuses them, and take those cached pages: both complete.
+void testTheRequestAfterAWholeContextLaneTakesItsCachedPages() {
+  constexpr uint64_t kPageBytes = 4096, kLane = 64 * 1024;
+  constexpr uint32_t kPages = 256, kExtentPages = 32;
+  test::EngineHarness harness({.pages = kPages,
+                               .extentPages = kExtentPages,
+                               .engine = {.maxContext = kPages * kv::kPageTokens - 7},
+                               .memory = test::FakeMemory::Config{},
+                               .limits = {.limitBytes = kLane + kPages * kPageBytes}});
+  harness.model.laneFootprintBytes = kLane;
+  uint64_t completed = 0;
+  for (const auto &[id, tokens] : {std::pair<uint64_t, uint32_t>{1, 8100}, {2, 2000}}) {
+    EngineRequest value = harness.request(id, std::vector<uint32_t>(tokens, static_cast<uint32_t>(id)));
+    value.deadlineMilliseconds = 1e12;
+    harness.engine.submit(std::move(value));
+    harness.runUntilIdle();
+    require(harness.events.completedCount == ++completed && harness.events.failedCount == 0,
+            "request " + std::to_string(id) + " did not complete: " + std::to_string(harness.events.failedCount) +
+                " failed");
+  }
+}
+
+// Eight requests near the whole context that share a prefix arrive at once under the budget of one lane and the
+// whole KV: each fits alone, so each completes, whatever extent and lane sizes and prefix.
+void testRequestsNearTheWholeContextOnASharedPrefixAllComplete() {
+  constexpr uint64_t kPageBytes = 4096;
+  constexpr uint32_t kPages = 256;
+  struct Shape final {
+    uint32_t extentPages;
+    uint64_t laneBytes;
+    uint32_t prefix;
+  };
+  for (const Shape shape : {Shape{32, 64 * 1024, 1024}, Shape{32, 300 * 1024, 2048}, Shape{4, 96 * 1024, 0},
+                            Shape{32, 0, 1024}}) {
+    test::EngineHarness harness({.pages = kPages,
+                                 .extentPages = shape.extentPages,
+                                 .engine = {.maxContext = kPages * kv::kPageTokens - 7},
+                                 .memory = test::FakeMemory::Config{},
+                                 .limits = {.limitBytes = shape.laneBytes + kPages * kPageBytes}});
+    harness.model.laneFootprintBytes = shape.laneBytes;
+    uint64_t id = 1;
+    for (const uint32_t tokens : {7800U, 3000U, 6000U, 8100U, 2000U, 7000U, 5000U, 7900U}) {
+      std::vector<uint32_t> prompt(tokens, 7);
+      for (uint32_t index = shape.prefix; index < tokens; ++index)
+        prompt[index] = static_cast<uint32_t>(1000 + id * 13 + index % 11);
+      EngineRequest value = harness.request(id++, std::move(prompt));
+      value.deadlineMilliseconds = 1e12;
+      harness.engine.submit(std::move(value));
+    }
+    harness.runUntilIdle();
+    require(harness.events.completedCount == 8 && harness.events.failedCount == 0,
+            "of eight requests that each fit alone (extents of " + std::to_string(shape.extentPages) +
+                " pages, a lane of " + std::to_string(shape.laneBytes) + " bytes, a prefix of " +
+                std::to_string(shape.prefix) + " tokens), " + std::to_string(harness.events.failedCount) +
+                " failed");
+  }
+}
+
 // A start refused memory that lands later holds no room on its claim from the pass in which the scheduler declines
 // it, while a prompt that leads it prefills. Wanted and refused again, its claim waits again, its wait's age kept from
 // its first refusal, within the resource wait limit from its first wait only.
@@ -1232,6 +1319,11 @@ std::span<const test::TestCase> rulesTests() {
        testALaneAPlanLeavesOutWaitsForItsCommandNotOnItsClaim},
       {"testALeftOutLaneHoldsRoomForTheLimitFromItsFirstWait", testALeftOutLaneHoldsRoomForTheLimitFromItsFirstWait},
       {"testADeclinedRefusalHoldsNoClaimRoom", testADeclinedRefusalHoldsNoClaimRoom},
+      {"testALoneLaneGrowsIntoThePooledLaneBuffers", testALoneLaneGrowsIntoThePooledLaneBuffers},
+      {"testTheRequestAfterAWholeContextLaneTakesItsCachedPages",
+       testTheRequestAfterAWholeContextLaneTakesItsCachedPages},
+      {"testRequestsNearTheWholeContextOnASharedPrefixAllComplete",
+       testRequestsNearTheWholeContextOnASharedPrefixAllComplete},
   };
   return kTests;
 }

@@ -863,18 +863,20 @@ public:
   // buffers, and no value when no number of states does (a buffer no cached
   // state holds, such as Qwen's draft rings).
   [[nodiscard]] virtual std::optional<uint32_t> statesToActivate() const noexcept { return 0; }
-  // The bytes releaseIdleBuffer(true), called until it gives none, releases
-  // once the cache has let go of `evictedStates` more cached states, whose
-  // buffers return to the pool: the pooled buffers beyond those one lane
-  // starts from, at the sizes their layout declares, which no allocation
-  // falls short of. With `afterStart`, of the pool a lane's start and the
-  // state it captures leave (startStateBytes): the evicted states refill the
-  // buffers they took from it before any of theirs frees memory. Zero where
-  // the model does not describe its pool, which counts on no more than it
-  // releases.
-  [[nodiscard]] virtual uint64_t idleBufferBytes(uint32_t evictedStates, bool afterStart) const noexcept {
+  // The bytes releaseIdleBuffer(keepLane), called until it gives none,
+  // releases once the cache has let go of `evictedStates` more cached states,
+  // whose buffers return to the pool: the pooled buffers, beyond those one
+  // lane starts from with keepLane, at the sizes their layout declares,
+  // which no allocation falls short of. With `afterStart`, of the pool a
+  // lane's start and the state it captures leave (startStateBytes): the
+  // evicted states refill the buffers they took from it before any of
+  // theirs frees memory. Zero where the model does not describe its pool,
+  // which counts on no more than it releases.
+  [[nodiscard]] virtual uint64_t idleBufferBytes(uint32_t evictedStates, bool afterStart,
+                                                 bool keepLane) const noexcept {
     static_cast<void>(evictedStates);
     static_cast<void>(afterStart);
+    static_cast<void>(keepLane);
     return 0;
   }
   // The state bytes a lane's start and the state it captures allocate: the

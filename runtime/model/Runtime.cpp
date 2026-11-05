@@ -3316,8 +3316,8 @@ std::optional<uint32_t> Runtime::statesToActivate() const noexcept {
   return impl_->states.statesToActivate();
 }
 
-uint64_t Runtime::idleBufferBytes(uint32_t evictedStates, bool afterStart) const noexcept {
-  return impl_->states.idleBytes(evictedStates, afterStart);
+uint64_t Runtime::idleBufferBytes(uint32_t evictedStates, bool afterStart, bool keepLane) const noexcept {
+  return impl_->states.idleBytes(evictedStates, afterStart, keepLane);
 }
 
 uint64_t Runtime::startStateBytes() const noexcept { return impl_->states.startBytes(); }

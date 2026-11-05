@@ -407,11 +407,11 @@ std::optional<uint32_t> QwenStateStorage::statesToActivate() const noexcept {
   return std::max(emptyCell_ ? 0 : lacked.cells, lacked.windows);
 }
 
-uint64_t QwenStateStorage::idleBytes(uint32_t evictedStates, bool afterStart) const noexcept {
+uint64_t QwenStateStorage::idleBytes(uint32_t evictedStates, bool afterStart, bool keepLane) const noexcept {
   BufferCounts pooled = afterStart ? beyond(idle(), kStartBuffers) : idle();
   pooled.cells += evictedStates * kStateBuffers.cells;
   pooled.windows += evictedStates * kStateBuffers.windows;
-  return bytes(beyond(pooled, kLaneBuffers));
+  return bytes(keepLane ? beyond(pooled, kLaneBuffers) : pooled);
 }
 
 uint64_t QwenStateStorage::startBytes() const noexcept { return bytes(beyond(kStartBuffers, idle())); }

@@ -877,7 +877,9 @@ std::optional<Victim> Engine::EngineVictims::peek(const VictimQuery &query, cons
   // pool releases short of critical pressure.
   const Engine &engine = engine_;
   if (!after)
-    return Victim{.bytes = engine.model_.idleBufferBytes(0, query.need.afterStart), .sized = false};
+    return Victim{.bytes = engine.model_.idleBufferBytes(0, query.need.afterStart, true), .sized = false};
+  if (after->kind == VictimKind::LaneStart)
+    return std::nullopt;
   // Then, for work that supersedes it, the command between its passes with
   // none in flight: the buffers its captures hold, counted as bytes for a
   // need of bytes. It costs that work nothing, so it comes before the
@@ -894,6 +896,9 @@ std::optional<Victim> Engine::EngineVictims::peek(const VictimQuery &query, cons
   }
   if (next != units.end())
     return *next;
+  // Last, the pooled buffers the next lane starts from.
+  if (query.rights.laneStart == TakeRights::LaneStart::Last)
+    return Victim{.kind = VictimKind::LaneStart};
   return std::nullopt;
 }
 
@@ -901,15 +906,15 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
   Engine &engine = engine_;
   if (engine.pending_)
     throw std::logic_error("the engine's victims taken while a command is in flight");
-  // The buffers one lane starts from stay unless the claim takes every
-  // reserve.
-  const bool keepLaneStart = query.rights.reserves != TakeRights::Reserves::All;
-  const auto releaseIdle = [&] {
+  // The buffers one lane starts from stay unless the claim takes them first,
+  // or takes them as the unit of their own.
+  const auto releaseIdle = [&](bool keepLane) {
     uint64_t bytes = 0;
-    while (const uint64_t buffer = engine.model_.releaseIdleBuffer(keepLaneStart))
+    while (const uint64_t buffer = engine.model_.releaseIdleBuffer(keepLane))
       bytes += buffer;
     return bytes;
   };
+  const bool keepLaneStart = query.rights.laneStart != TakeRights::LaneStart::First;
   switch (victim.kind) {
   case VictimKind::Memory:
     if (const uint64_t bytes = engine.model_.releaseIdleBuffer(keepLaneStart))
@@ -926,7 +931,13 @@ FreeResult Engine::EngineVictims::take(const VictimQuery &query, const Victim &v
     // The buffers its captures held. Settling here would change the ledger
     // inside its own free() (settleEndedBetweenPasses).
     static_cast<void>(engine.passCommand_.yield());
-    return {.outcome = FreeOutcome::Met, .nowBytes = releaseIdle(), .stateBuffers = victim.stateBuffers};
+    return {.outcome = FreeOutcome::Met,
+            .nowBytes = releaseIdle(keepLaneStart),
+            .stateBuffers = victim.stateBuffers};
+  case VictimKind::LaneStart:
+    if (const uint64_t bytes = releaseIdle(false))
+      return {FreeOutcome::Met, bytes};
+    return {};
   }
   return {};
 }

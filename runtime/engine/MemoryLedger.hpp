@@ -110,7 +110,8 @@ struct ClaimId final {
 // one no cached state holds (unheldStateBuffer), which their states meet only
 // by the bytes their buffers free. afterStart: a need that counts a lane's
 // start and the state it captures, which take their buffers from the model's
-// pool before any unit's return to it (Model::startStateBytes).
+// pool before any unit's return to it (Model::startStateBytes). kv: a need
+// of KV pages (a TokenAdmission's), whatever measure lacks them.
 struct Need final {
   uint64_t bytes = 0;
   bool hostRefused = false;
@@ -120,6 +121,7 @@ struct Need final {
   bool unheldStateBuffer = false;
   std::array<uint32_t, 3> keptPages{};
   bool afterStart = false;
+  bool kv = false;
   [[nodiscard]] bool lacksStateBuffers() const noexcept { return stateBuffers || unheldStateBuffer; }
   friend bool operator==(const Need &, const Need &) = default;
 };
@@ -143,9 +145,13 @@ struct FreeResult final {
 
 // What taking a unit gives up besides its bytes, which the claim's take
 // rights decide whether it may: memory nothing needs now (a cached unit, a
-// buffer), a Resident lane's KV in memory (its conversion to Spill), or the
-// command between its passes.
-enum class VictimKind : uint8_t { Memory, Conversion, PassCommand };
+// buffer), a Resident lane's KV in memory (its conversion to Spill), the
+// command between its passes, or the pooled state buffers the next lane
+// starts from (Model::releaseIdleBuffer without keeping a lane), which its
+// start then allocates again. Those count no bytes of their own: what the
+// model's pool releases without keeping them is counted through the pool
+// (setBufferBytes), with the buffers of the states taken before them.
+enum class VictimKind : uint8_t { Memory, Conversion, PassCommand, LaneStart };
 
 // One unit a source would give up, in the source's own order.
 struct Victim final {
@@ -179,9 +185,11 @@ struct TakeRights final {
   // the chains queued requests restore.
   enum class CertainReuse : uint8_t { None, ResumePoint, All };
   // The reserves kept for the work to come it may take: none, the empty
-  // extent the next request takes, or also the Index runway and the idle
-  // buffers one lane starts from.
+  // extent the next request takes, or also the Index runway.
   enum class Reserves : uint8_t { None, NextExtent, All };
+  // The pooled state buffers the next lane starts from: kept, taken last of
+  // all (VictimKind::LaneStart), or taken first with the idle buffers.
+  enum class LaneStart : uint8_t { Kept, Last, First };
   bool units = false;             // the sources' and pools' units at all: those that free now, and more below
   bool waitsForWrites = false;    // takes cache that frees only once its write lands
   bool waitsForLandings = false;  // waits for memory transfers return: the engine's limit refused it
@@ -192,6 +200,7 @@ struct TakeRights final {
   bool storeAboveFloor = false;   // the other pools' units above their floors
   bool passCommand = false;       // the command between passes its work supersedes
   uint64_t convertLane = 0;       // the request whose own lane may convert to Spill; 0: none
+  LaneStart laneStart = LaneStart::Kept;
 
   friend bool operator==(const TakeRights &, const TakeRights &) = default;
 };
@@ -209,7 +218,14 @@ struct TakeRights final {
 // critical pressure and never for landings, which its pass's target is net
 // of; at critical pressure it is Immediate but takes the store, certain
 // reuse and units in use. No pool unit for a claim below a lane in service,
-// since the pools serve every lane, and none for a pool's growth. A Floor
+// since the pools serve every lane, and none for a pool's growth. The pooled
+// buffers the next lane starts from go to in-service KV that can wait, last
+// of all: the memory plan sizes the context for one lane beside its own
+// state, not beside a next lane's buffers, so a lane alone reaches it, and a
+// lone restore takes its whole chain. Every other need keeps them: a need of
+// state buffers (a lane's start among them), which their release would only
+// make allocate again, and the model's other memory. At critical pressure
+// every claim takes them first, with every reserve. A Floor
 // claim takes nothing (logic_error). The engine's own optional work, an
 // Optional claim of no request (the Index runway's refill with no Spill lane
 // in service, trims with no lane in service), takes no unit: its rights are
@@ -354,11 +370,12 @@ public:
   void setReturning(std::function<Returning()> all,
                     std::function<Returning(std::span<const uint64_t> requestIds)> ofRequests);
   // The bytes the model's pool releases once `states` more state buffers
-  // return to it, of the pool a start leaves with `afterStart`
-  // (Model::idleBufferBytes): the pool as it stands, the buffers of a state
-  // taken already in it. A unit's buffers give a need of bytes what they
-  // add to what it released before the units taken for the claim.
-  void setBufferBytes(std::function<uint64_t(uint32_t states, bool afterStart)> bytes);
+  // return to it, of the pool a start leaves with `afterStart`, beyond the
+  // buffers one lane starts from with `keepLane` (Model::idleBufferBytes):
+  // the pool as it stands, the buffers of a state taken already in it. A
+  // unit's buffers give a need of bytes what they add to what it released
+  // before the units taken for the claim.
+  void setBufferBytes(std::function<uint64_t(uint32_t states, bool afterStart, bool keepLane)> bytes);
   // The bytes of a KV page of each kv::PageForm (Cache::bytesPerPage), in
   // which the bytes waiting claims hold are held as pages (heldPages).
   void setPageBytes(const std::array<uint64_t, 3> &bytes) noexcept;
@@ -447,9 +464,11 @@ private:
   // first).
   [[nodiscard]] bool holdsGrowth() const noexcept;
   // What the model's pool releases, for a need of bytes, once `states`
-  // more state buffers return to it (setBufferBytes): a run's buffers give
-  // what they add to what it released before the run.
-  [[nodiscard]] uint64_t pooledBytes(const VictimQuery &query, const Lacking &lack, uint32_t states) const;
+  // more state buffers return to it (setBufferBytes), keeping the buffers
+  // one lane starts from with `keepLane`: a run's buffers give what they add
+  // to what it released before the run.
+  [[nodiscard]] uint64_t pooledBytes(const VictimQuery &query, const Lacking &lack, uint32_t states,
+                                     bool keepLane = true) const;
   // The most the units the claim's rights take give it, counted in the
   // one order without taking any, up to the lack.
   [[nodiscard]] Run bound(const VictimQuery &query, const Lacking &lack) const;
@@ -469,7 +488,7 @@ private:
   uint64_t nextClaim_ = 1;
   std::function<Returning()> returning_;
   std::function<Returning(std::span<const uint64_t>)> returningFor_;
-  std::function<uint64_t(uint32_t, bool)> bufferBytes_;
+  std::function<uint64_t(uint32_t, bool, bool)> bufferBytes_;
   std::array<uint64_t, 3> pageBytes_{};
   uint64_t laneDemandBytes_ = 0;
   std::optional<RequestPriority> lanePriority_;

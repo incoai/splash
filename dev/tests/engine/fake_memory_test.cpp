@@ -313,8 +313,10 @@ void testEndedLanesLeaveOneLanesBuffersPooled() {
   require(memory.held("states") == kGiB, "four lanes do not hold their buffers");
   for (uint64_t id = 1; id <= 4; ++id)
     model.end(id);
-  require(model.idleBufferBytes(0, false) == 768 * kMiB,
-          "ended lanes' buffers beyond one lane's are not idle: " + std::to_string(model.idleBufferBytes(0, false)));
+  require(model.idleBufferBytes(0, false, true) == 768 * kMiB,
+          "ended lanes' buffers beyond one lane's are not idle: " +
+              std::to_string(model.idleBufferBytes(0, false, true)));
+  require(model.idleBufferBytes(0, false, false) == kGiB, "ended lanes' buffers without keeping a lane are not idle");
   require(model.releaseIdleBuffer(true) == 768 * kMiB &&
               memory.held("states") == 256 * kMiB && model.pooledLaneBytes == 256 * kMiB,
           "a reclaim that keeps the lane did not give back all but one lane's buffers");

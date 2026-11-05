@@ -816,7 +816,8 @@ private:
   // only as the claim's take rights allow: the model's idle state buffers,
   // which cost nothing and are taken as they go (Model::releaseIdleBuffer),
   // of at least Model::idleBufferBytes of no evicted states, keeping one
-  // lane's start unless the rights take every reserve; the command between
+  // lane's start unless the rights take it first (TakeRights::laneStart);
+  // the command between
   // its passes (TakeRights::passCommand), at no cost; the lane's conversion
   // to Spill (TakeRights::convertLane) while it decodes Resident, not ended
   // and not between passes, on a target that can spill with the tier open
@@ -826,6 +827,8 @@ private:
   // its copies land. The command between its passes gives back the
   // buffers of the states it would capture, which the model's pool releases
   // at once; its lanes that ended are left to settleEndedBetweenPasses.
+  // Last, for in-service KV (TakeRights::LaneStart::Last), the pooled
+  // buffers one lane starts from, all the pool keeps released.
   class EngineVictims final : public VictimSource {
   public:
     explicit EngineVictims(Engine &engine) noexcept : engine_(engine) {}

@@ -659,12 +659,13 @@ public:
       return 0;
     return laneTake().allocated + (stateReused() ? 0 : State().bytes());
   }
-  // The production model's pool releases the buffers beyond a lane's
-  // (QwenStateStorage::idleBytes); the fake's are those of the states the
-  // cache let go of and of `evictedStates` more (none under KeptState), less
-  // what refills a lane's footprint, of the pool a start leaves with
-  // `afterStart`. Nothing without `memory`.
-  uint64_t idleBufferBytes(uint32_t evictedStates, bool afterStart) const noexcept override {
+  // The production model's pool releases the buffers beyond a lane's with
+  // keepLane, else all of them (QwenStateStorage::idleBytes); the fake's are
+  // those of the states the cache let go of and of `evictedStates` more (none
+  // under KeptState), of the pool a start leaves with `afterStart`, less what
+  // refills a lane's footprint with keepLane, else with the footprint pooled.
+  // Nothing without `memory`.
+  uint64_t idleBufferBytes(uint32_t evictedStates, bool afterStart, bool keepLane) const noexcept override {
     if (!memory)
       return 0;
     const LaneTake lane = afterStart ? laneTake() : LaneTake{};
@@ -672,6 +673,8 @@ public:
     const uint64_t each = keptTier ? 0 : State().bytes();
     const uint64_t returned = *evictedStateBytes - (afterStart && stateReused() ? State().bytes() : 0) +
                               uint64_t{evictedStates} * each;
+    if (!keepLane)
+      return reclaimableIdleStateBytes - lane.idle + pooled + returned;
     const uint64_t refill = std::min(returned, laneFootprintBytes - std::min(laneFootprintBytes, pooled));
     return reclaimableIdleStateBytes - lane.idle + returned - refill;
   }

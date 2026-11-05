@@ -1287,7 +1287,8 @@ is the room above them).
 Every claim walks one order. A unit the claim's rights (`TakeRights`) do not
 take is skipped, not a stop:
 
-1. Idle state buffers.
+1. Idle state buffers beyond those the next lane starts from, and those
+   too under macOS's critical pressure.
 2. Cached units that free memory now (copied, dead or needing no write), in
    the cache's one order (`Cache::walkFor`).
 3. Caches the model rebuilds on use: the vision encoder's scratch, images'
@@ -1301,7 +1302,13 @@ take is skipped, not a stop:
 6. Pool units above their floors: the expert store's chunks, top chunk first,
    and the hot block cache's extents while a lane reads above its floor.
 7. Units another request uses.
-8. The engine: it waits for copies in flight that cover the need. Else, when
+8. The pooled state buffers the next lane starts from, whose start then
+   allocates them again, for in-service KV that can wait: the memory plan
+   sizes the context for one lane beside its own state, not beside a next
+   lane's buffers, so a lane alone reaches it and a lone restore takes its
+   whole chain. A need of state buffers and the model's other memory keep
+   them.
+9. The engine: it waits for copies in flight that cover the need. Else, when
    no lane's growth fits, the lane that yields first is suspended; while other
    lanes fit, a refused lane waits for them, resident. A lane alone that
    nothing meets fails with `capacity_exhausted` (`Engine::judge`).
@@ -1312,17 +1319,20 @@ step 4.
 **Who takes what**, derived in one function (`takeRights`) whose `TakeRights`
 every source of units reads (`MemoryLedger::Order`, `Cache::walkFor`):
 
-| Claimant | Cache that frees now | Cache that frees once its write lands | Rebuilt caches | Pass command, own conversion | Pools above their floors | Resume point | Queued chains | In use |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `InService`, can wait | yes | yes | yes | yes | yes | yes | yes | where it reaches them |
-| `InService`, immediate | yes | no | yes | no | no | yes | yes | no |
-| `Start` | yes | yes | yes | no | no | yes | no | no |
-| `Optional` of a request | yes | no | yes | no | no | yes | no | no |
-| `Optional` of the engine's own, of no request | no | no | no | no | no | no | no | no |
-| `Growth` | yes | no | no | no | no | no | no | no |
-| `Host` with a deficit | yes | yes | yes | no | no | no | no | no |
-| `Host` under critical pressure | yes | no | yes | no | yes | yes | yes | yes |
-| A need the host refused | in place | no | yes | no | no | as its class | as its class | no |
+| Claimant | Cache that frees now | Cache that frees once its write lands | Rebuilt caches | Pass command, own conversion | Pools above their floors | Resume point | Queued chains | In use | Next lane's buffers |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `InService`, can wait | yes | yes | yes | yes | yes | yes | yes | where it reaches them | last, for KV |
+| `InService`, immediate | yes | no | yes | no | no | yes | yes | no | no |
+| `Start` | yes | yes | yes | no | no | yes | no | no | no |
+| `Optional` of a request | yes | no | yes | no | no | yes | no | no | no |
+| `Optional` of the engine's own, of no request | no | no | no | no | no | no | no | no | no |
+| `Growth` | yes | no | no | no | no | no | no | no | no |
+| `Host` with a deficit | yes | yes | yes | no | no | no | no | no | no |
+| `Host` under critical pressure | yes | no | yes | no | yes | yes | yes | yes | first |
+| A need the host refused | in place | no | yes | no | no | as its class | as its class | no | no |
+
+Under critical pressure every claim that takes units takes the next lane's buffers
+first, with the idle ones.
 
 The resume point is the newest ordinary state in RAM (`StateCache::resumePoint`),
 the one a conversation's next turn most likely resumes from. A claim of no

@@ -3560,35 +3560,48 @@ void testBudgetDenialRetriesAfterRelease() {
   }
 }
 
-// A lane's admission and its KV growth keep the pooled buffers a lane starts from, except under critical pressure.
-void testLaneAdmissionAndKvGrowthKeepThePooledLaneBuffers() {
-  enum class Refused { State, Kv, KvCritical };
-  for (const Refused refused : {Refused::State, Refused::Kv, Refused::KvCritical}) {
+// A lane's start keeps the pooled buffers a lane starts from: a need of state buffers would only allocate them
+// again. Its KV the engine's limit refused takes them once nothing else meets it, and fits; under critical pressure
+// KV takes them first.
+void testAStartKeepsThePooledLaneBuffersItsKvTakesThemLast() {
+  constexpr uint64_t kExtent = 4 * 4096;
+  enum class Refused { State, KvAtTheLimit, KvCritical };
+  for (const Refused refused : {Refused::State, Refused::KvAtTheLimit, Refused::KvCritical}) {
     test::TestKvStorage storage(8, 4096, 4);
+    GovernedHost host;
+    if (refused == Refused::KvAtTheLimit)
+      host.through(storage);
     KvPool pool(storage, 0);
     engine::Cache cache(pool, nullptr, nullptr);
     Executor executor(1);
-    executor.pooledLaneBytes = 4096;
     Events events;
-    GovernedHost host;
     engine::Engine engine(host.connect({}), cache, executor, events);
     guardReleases(storage, engine);
+    // The pool holds an extent's worth of the buffers the next lane starts
+    // from, beside a lane that takes none.
+    host.bookStates(executor);
+    host.memory.hold("states", kExtent);
+    executor.heldStateBytes = kExtent;
+    executor.pooledLaneBytes = kExtent;
     if (refused == Refused::State) {
       executor.beginGrowthBlocked = [] { return true; };
       executor.beginAllocationFailure = metal::AllocationFailure::EngineBudget;
+    } else if (refused == Refused::KvAtTheLimit) {
+      reachTheLimit(host);
     } else {
       storage.growthBlocked = true;
-    }
-    if (refused == Refused::KvCritical)
       host.setPressure(MemoryPressure::Critical);
+    }
     engine.submit(request(286, {286}));
-    static_cast<void>(engine.tick(1));
-    require(idle(engine) &&
-                events.failures == std::vector<std::string>{"capacity_exhausted"} &&
-                (executor.pooledLaneBytes != 0) == (refused != Refused::KvCritical),
-            refused == Refused::State ? "a lane's admission released the pooled buffers it starts from"
-            : refused == Refused::Kv  ? "KV growth released the pooled buffers short of critical pressure"
-                                      : "KV growth kept the pooled buffers under critical pressure");
+    runUntilIdle(engine);
+    const bool completes = refused == Refused::KvAtTheLimit;
+    require(idle(engine) && (events.completedCount == 1) == completes &&
+                events.failures == (completes ? std::vector<std::string>{}
+                                              : std::vector<std::string>{"capacity_exhausted"}) &&
+                (executor.pooledLaneBytes == kExtent) == (refused == Refused::State),
+            refused == Refused::State ? "a lane's start released the pooled buffers it starts from"
+            : completes               ? "KV at the engine's limit kept the pooled buffers with nothing else to take"
+                                      : "KV kept the pooled buffers under critical pressure");
   }
 }
 
@@ -5896,6 +5909,58 @@ void testCopyAheadOfALeafHoldsARefusalBack() {
   }
 }
 
+// A lone request's prefix restore that only a cached state's buffers make room for takes them, though they refill the
+// buffers a next lane starts from: it restores its prefix rather than start cold.
+void testLoneRestoreTakesTheBuffersALaneStartsFrom() {
+  // An extent of four pages takes the bytes of a state's buffers, and so does
+  // a lane's footprint.
+  test::TestKvStorage storage(16, State().bytes() / 4, 4);
+  GovernedHost host;
+  host.through(storage);
+  KvPool pool(storage, 0);
+  test::TestKvTier tier;
+  tier.capacity = 8;
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
+  Executor executor(1);
+  executor.laneFootprintBytes = State().bytes();
+  Events events;
+  engine::Engine engine(host.connect({.maxContext = 102400}), cache, executor, events);
+  guardReleases(storage, engine);
+  host.bookStates(executor);
+  executor.restoreControl->ready = true;
+  // The prefix, four blocks, its KV and its state on the SSD.
+  const std::vector<uint32_t> prefix(129, 17);
+  {
+    const test::ClaimScope fixture(host.governor, ClaimClass::Floor);
+    cache.beginRequest(999);
+    require(cache.ensureTokens(999, 128).granted(), "fixture KV failed");
+    test::demoteState(cache, test::publishBlocks(cache, 999, prefix, 128));
+    cache.endRequest(999);
+    for (uint32_t written = 1; written <= 4; ++written) {
+      require(test::evictStep(cache).gave(), "KV block was not written");
+      tier.complete();
+      require(cache.pollTransfers(), "written block did not land");
+    }
+    require(test::releaseStep(cache).gave() && storage.allocatedPages() == 0 &&
+                cache.snapshot().kvTier.diskBlocks == 4,
+            "the prefix did not move to the SSD whole");
+  }
+  // Another conversation's state in RAM.
+  const std::vector<uint32_t> other(33, 23);
+  engine.submit(request(1, other));
+  runUntilIdle(engine);
+  require(cache.snapshot().stateCache.bytes != 0, "the other conversation's state is not in RAM");
+  // The engine's limit leaves the restore's five pages two extents only once
+  // that state's buffers left memory.
+  host.leaveRoom(0);
+  engine.submit(request(2, prefix));
+  double now = 1;
+  tickUntil(engine, now, [&] { tier.complete(); return idle(engine); }, "the request did not finish");
+  require(events.completedCount == 2 && events.failedCount == 0 && events.starts.size() == 2 &&
+              events.starts[1] == 128 && executor.prefillRows == 33 + 1,
+          "a lone restore that a cached state's buffers make room for started cold or failed");
+}
+
 // KV a prefill command takes past its first boundary, refused at the limit, takes neither the store nor what is in
 // use; the command ends at the boundary.
 void testCaptureKvPastABoundaryTakesNothingInUse() {
@@ -6218,6 +6283,7 @@ std::span<const test::TestCase> memoryTests() {
       {"testReplayPointCopiesCacheBeforeTheExpertStore", testReplayPointCopiesCacheBeforeTheExpertStore},
       {"testAHostRefusedReplayPointCutsNoCommand", testAHostRefusedReplayPointCutsNoCommand},
       {"testCopyAheadOfALeafHoldsARefusalBack", testCopyAheadOfALeafHoldsARefusalBack},
+      {"testLoneRestoreTakesTheBuffersALaneStartsFrom", testLoneRestoreTakesTheBuffersALaneStartsFrom},
       {"testCaptureKvPastABoundaryTakesNothingInUse", testCaptureKvPastABoundaryTakesNothingInUse},
       {"testCaptureKvPastTheMarginCutsNoCommand", testCaptureKvPastTheMarginCutsNoCommand},
       {"testReplayPointAdmittedInMarginBand", testReplayPointAdmittedInMarginBand},
@@ -6330,7 +6396,7 @@ std::span<const test::TestCase> memoryTests() {
       {"testRecoveryAdmitsFailedKvTargetBeforeReplaying", testRecoveryAdmitsFailedKvTargetBeforeReplaying},
       {"testFailedResumeRestoreKeepsTheKvTarget", testFailedResumeRestoreKeepsTheKvTarget},
       {"testBudgetDenialRetriesAfterRelease", testBudgetDenialRetriesAfterRelease},
-      {"testLaneAdmissionAndKvGrowthKeepThePooledLaneBuffers", testLaneAdmissionAndKvGrowthKeepThePooledLaneBuffers},
+      {"testAStartKeepsThePooledLaneBuffersItsKvTakesThemLast", testAStartKeepsThePooledLaneBuffersItsKvTakesThemLast},
       {"testPausedStateAdmissionReusesCachedStates", testPausedStateAdmissionReusesCachedStates},
       {"testDeniedGrowthAllocatesEachExtentOnce", testDeniedGrowthAllocatesEachExtentOnce},
       {"testControlPassRefusesACommandInFlight", testControlPassRefusesACommandInFlight},

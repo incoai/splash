@@ -6682,7 +6682,7 @@ void testGrowthCountsNoStateThatWaitsForAWrite() {
   static_cast<void>(cache.releaseEmptyExtents(false));
   engine::MemoryLedger ledger;
   ledger.addSource(cache);
-  ledger.setBufferBytes([&control](uint32_t states, bool) { return control->poolBytes(states); });
+  ledger.setBufferBytes([&control](uint32_t states, bool, bool) { return control->poolBytes(states); });
   const engine::ClaimId claim = ledger.open({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate});
   const FreeResult freed = ledger.free(claim, {.bytes = 200}, 0, false);
   ledger.close(claim);
@@ -6727,7 +6727,7 @@ void testStagedStateFreesItsCopiedChain() {
   static_cast<void>(cache.releaseEmptyExtents(false));
   engine::MemoryLedger ledger;
   ledger.addSource(cache);
-  ledger.setBufferBytes([&control](uint32_t states, bool) { return control->poolBytes(states); });
+  ledger.setBufferBytes([&control](uint32_t states, bool, bool) { return control->poolBytes(states); });
   const engine::ClaimId claim = ledger.open({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate});
   // Both states' buffers and two of the chain's three extents, the third
   // the runway growth keeps.
