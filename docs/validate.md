@@ -301,7 +301,9 @@ A change of the weight images' layout (`EXPECT_IMAGE_CHANGE=1`) makes
 dispatches in order with their GPU time. Its `--verify-rows all` verifies
 every row of a MoE target's cycles, as `backend-benchmark` does, so two
 builds' runs route the same experts; each width also reports its tokens per
-cycle and wall ms per token.
+cycle and wall ms per token, and prints its fused cycles in the order they
+ran and their mean: a greedy prompt runs the same cycles every time, so two
+builds compare cycle by cycle.
 
 To compare the model's numerics with another engine on the same weights,
 `make teacher-logits MODEL=... TEACHER_LOGITS_ARGS='TOKENS OUTPUT --window END:ROWS ...'`
