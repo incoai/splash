@@ -193,6 +193,11 @@ struct ComputeDispatch {
   DispatchSize threadsPerThreadgroup;
   IndirectGrid indirectThreadgroups = {};
   AddressTable addresses = {};
+  // May overlap the dispatches since the last one without this flag: no
+  // memory barrier before it (CommandGraph::concurrentWithPrevious). A
+  // command holding such a dispatch encodes concurrently, with a buffer
+  // barrier before every other dispatch; other commands encode serially.
+  bool concurrentWithPrevious = false;
 };
 
 // A host step's round trip on the host clock (AwakeClock, the time base of

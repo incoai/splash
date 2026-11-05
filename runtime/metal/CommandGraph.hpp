@@ -74,6 +74,14 @@ public:
                           writes};
   }
 
+  // Lets the last dispatch added overlap the ones since the last dispatch
+  // without this flag (ComputeDispatch::concurrentWithPrevious): it must
+  // neither read what they write nor write what they read or write.
+  void concurrentWithPrevious() {
+    if (dispatches_.empty()) throw std::logic_error("concurrency needs a dispatch");
+    dispatches_.back().concurrentWithPrevious = true;
+  }
+
   // Event steps after the dispatches added so far (EventStep): signal once
   // all earlier work has completed, or hold all later work until the event
   // reaches value.
