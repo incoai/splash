@@ -94,15 +94,24 @@ void testRunwayHoldHoldsTheRunway() {
             "a refused runway hold kept the pages it held before the refusal");
 }
 
-// Running out of page ids before the budget is a logic error and takes no page.
-void testIdExhaustionIsALogicError() {
+// Page ids that run out before the budget does refuse as the budget would, take no page and allocate nothing: an
+// acquisition, a move to another form and a runway.
+void testRunningOutOfPageIdsIsTheBudgetsRefusal() {
     TestKvStorage storage(8, 100, 4);
     KvPool pool(storage, 8);
-    rejects([&] { static_cast<void>(pool.acquirePages(9)); },
-            "KV page ids ran out before the memory budget did",
-            "running out of page ids was not a logic error");
-    require(pool.freePageCount() == 8 && pool.acquirePages(8).granted(),
-            "running out of page ids kept the pages it had taken");
+    const splash::engine::KvPageAcquisition acquired = pool.acquirePages(9);
+    require(!acquired.granted() && acquired.failure == AllocationFailure::EngineBudget && acquired.pages.empty() &&
+                pool.freePageCount() == 8,
+            "an acquisition past the last page id was not refused as the budget refuses, or kept pages");
+    const splash::engine::KvPageAcquisition held = pool.acquirePages(8);
+    require(held.granted(), "the pages within the ids were not handed out");
+    const std::vector<uint32_t> moving{held.pages[0]};
+    const splash::engine::KvPageMoveResult moved = pool.movePages(moving, PageForm::Index);
+    require(!moved.granted() && moved.failure == AllocationFailure::EngineBudget && moved.moves.empty(),
+            "a move past the last page id was not refused as the budget refuses");
+    require(pool.fillRunway(PageForm::Slim).failure == AllocationFailure::EngineBudget &&
+                storage.allocationAttempts == 2 && pool.snapshot().pagesAllocated == 8,
+            "a runway past the last page id was not refused, or allocated an extent");
 }
 
 // A refused extent denies the acquisition but keeps the extents it allocated for the retry.
@@ -786,7 +795,7 @@ int main() {
     try {
         testRunwayIsAllocatedThroughThePool();
         testRunwayHoldHoldsTheRunway();
-        testIdExhaustionIsALogicError();
+        testRunningOutOfPageIdsIsTheBudgetsRefusal();
         testFailedGrowthKeepsItsExtentsForTheRetry();
         testPressureReusesFreePagesAndDeniesGrowth();
         testPassReleasesEveryEmptyExtent();

@@ -1819,7 +1819,10 @@ its window's, the pages a command writes (a chunk, or a group of four where
 the routed experts stream) and one more (`kvWindowFloorPages`), in whole Full
 extents, and the pages of as many whole Slim extents as the rest holds, since an
 extent holds pages of one form; the pool's page ids cover the Slim pages the
-hard budget could hold. A Full shortfall takes trims first, then, while the Slim
+hard budget could hold. The budget can outlast the page ids: with every
+extent allocated the pool refuses a page as the budget does
+(`KvPool::growExtent`), and the claim's need of pages in place takes cached
+pages, which hold ids. A Full shortfall takes trims first, then, while the Slim
 pool has room for their tails, states, a checkpoint first, each followed by a
 trim of the tail it unpinned, while those trims free pages, before any KV leaf
 goes (`Cache::peek`, `Cache::take`). At the memory wall, where the Slim runway

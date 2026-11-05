@@ -80,14 +80,7 @@ KvPageAcquisition KvPool::takeFreePages(uint32_t count, kv::PageForm form, uint3
       selected.push_back(popFree(form));
       continue;
     }
-    // Page ids cover every extent the hard budget could hold, so the budget
-    // refuses growth before they run out.
-    const uint32_t extent = unallocatedExtent();
-    if (extent == noIndex) {
-      returnSelected();
-      throw std::logic_error("KV page ids ran out before the memory budget did");
-    }
-    const metal::AllocationResult allocated = allocateExtent(extent, form);
+    const metal::AllocationResult allocated = growExtent(form);
     if (!allocated) {
       // The extents this acquisition allocated stay, reclaimable: the
       // budget admitted them, and the retry that follows a reclaim takes
@@ -239,9 +232,13 @@ uint64_t KvPool::reclaimEmptyExtents(bool keepRunway, uint32_t limit, std::optio
 metal::AllocationResult KvPool::fillRunway(kv::PageForm form) {
   if (formRecord(form).reclaimableExtents.count)
     return {};
+  return growExtent(form);
+}
+
+metal::AllocationResult KvPool::growExtent(kv::PageForm form) {
   const uint32_t extent = unallocatedExtent();
   if (extent == noIndex)
-    throw std::logic_error("KV page ids ran out before the memory budget did");
+    return metal::AllocationFailure::EngineBudget;
   return allocateExtent(extent, form);
 }
 

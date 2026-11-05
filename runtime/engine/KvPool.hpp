@@ -305,8 +305,14 @@ private:
   [[nodiscard]] bool pageFree(uint32_t page) const;
   // The lowest extent that is not allocated; noIndex when all of them are.
   [[nodiscard]] uint32_t unallocatedExtent() const noexcept;
+  // Allocates an extent of the form at the lowest page ids no extent holds.
+  // The page ids are the KV capacity the memory plan sized, which the budget
+  // may outlast: with every extent allocated the pool refuses as the budget
+  // does, and the claim's need of pages in place takes cached pages, which
+  // hold ids (MemoryLedger::free).
+  [[nodiscard]] metal::AllocationResult growExtent(kv::PageForm form);
   // Takes `count` free pages of the form off the free lists, leaving `held`
-  // of them there, allocating extents of the form when they run out; with a
+  // of them there, growing extents of the form when they run out; with a
   // refusal, puts them back and returns none.
   [[nodiscard]] KvPageAcquisition takeFreePages(uint32_t count, kv::PageForm form, uint32_t held = 0);
   // Gives a page's references to the free page its content was copied to,
