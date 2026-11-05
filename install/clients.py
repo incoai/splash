@@ -464,9 +464,13 @@ def _write_pi_provider(path, provider, server, environment):
         providers = config.get("providers", {}) if isinstance(config, dict) else None
         if not isinstance(providers, dict):
             raise ClientError(invalid)
-        # Pi expands the variable for each request. The server's key is never
-        # saved, nor run as a command when it begins with "!".
-        api_key = "$SPLASH_API_KEY" if environment.get("SPLASH_API_KEY") else "local"
+        # Pi reads the key from its environment for each request; the server's
+        # key is never saved. Pi before 0.77 reads only a bare variable name,
+        # Pi 0.79.4 and later only "$NAME"; every version runs a value that
+        # begins with "!" in the shell and sends its output.
+        api_key = (
+            "!printenv SPLASH_API_KEY" if environment.get("SPLASH_API_KEY") else "local"
+        )
         # Pi accepts only text and image input; any other entry invalidates
         # the user's whole models.json.
         vision = "image" in server.input_modalities

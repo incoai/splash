@@ -35,6 +35,21 @@ def hermes_profile_create(argv, *, env, **options):
     return subprocess.CompletedProcess(argv, 0, "", "")
 
 
+def pi_command_output(value, env):
+    """What Pi sends for a models.json value that begins with "!": the
+    command's output in /bin/sh, trimmed; None when the command fails. Popen,
+    since the tests replace subprocess.run."""
+    with subprocess.Popen(
+        ["/bin/sh", "-c", value[1:]],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    ) as process:
+        output = process.stdout.read()
+    return output.strip() if process.returncode == 0 else None
+
+
 class ClientTests(unittest.TestCase):
     def setUp(self):
         # Pi's default models.json and the Hermes root are in the home
@@ -104,9 +119,17 @@ class ClientTests(unittest.TestCase):
                     self.assertEqual(env["SPLASH_API_KEY"], "test-server-key")
                     self.assertNotIn("test-server-key", self.pi_models.read_text())
                     config = json.loads(self.pi_models.read_text())
-                    self.assertEqual(
-                        config["providers"]["splash"]["apiKey"], "$SPLASH_API_KEY"
-                    )
+                    api_key = config["providers"]["splash"]["apiKey"]
+                    # Pi runs a value that begins with "!" in the shell and
+                    # sends its output, in every version: Pi before 0.79.4
+                    # reads a bare variable name, later versions "$NAME".
+                    self.assertTrue(api_key.startswith("!"), api_key)
+                    for key in ("test-server-key", "!test-$HOME 'key'"):
+                        self.assertEqual(
+                            pi_command_output(api_key, {"SPLASH_API_KEY": key}), key
+                        )
+                    # Without the variable it fails, and Pi sends no key.
+                    self.assertIsNone(pi_command_output(api_key, {}))
                 else:
                     # Hermes expands the profile's reference from its
                     # environment.
